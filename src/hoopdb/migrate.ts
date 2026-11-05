@@ -49,10 +49,28 @@ const WORKER_BOOTSTRAP = join(
   ROOT,
   "supabase/bootstrap/session_directory_search_worker.sql",
 );
+// The auth token verifier role (session_token_verifier): the same contract, its own
+// file. 20261101000100 verifies it and fails closed if absent (42704); it never creates it.
+const TOKEN_VERIFIER_BOOTSTRAP = join(
+  ROOT,
+  "supabase/bootstrap/session_token_verifier.sql",
+);
+// Phase 2 for the verifier role: its exact catalog shape (role spec, memberships,
+// schema USAGE, no table privilege, EXECUTE on exactly auth_session_verify).
+// Runs after every migration like WORKER_VERIFY; read-only and never ledgered.
+const TOKEN_VERIFIER_VERIFY = join(
+  ROOT,
+  "supabase/bootstrap/session_token_verifier_verify.sql",
+);
+// The session ingest roles (bulls96_session_ingest, _seeder): the same contract, its own
+// file. 20261102010000 verifies them and fails closed if absent (42704); it never creates them.
+const INGEST_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_ingest_roles.sql");
+const INGEST_ROLE_VERIFY = join(ROOT,"supabase/bootstrap/session_ingest_verify.sql");
 // Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any
 // role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
 // The one phase 2 source, shared with the live readiness gate (src/shared/db.ts).
 const WORKER_VERIFY = ROLE_VERIFY_SQL_PATH;
+const INGEST_SEED_VERIFY = join(ROOT,"supabase/bootstrap/session_ingest_seeder_verify.sql");
 const OURS = join(ROOT, "src/hoopdb/migrations");
 
 export const MIGRATION_LEDGER = "sessions.__96bulls_migrations";
@@ -236,6 +254,11 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
             name: "bootstrap:session_directory_search_worker",
             path: WORKER_BOOTSTRAP,
           },
+          {
+            name: "bootstrap:session_token_verifier",
+            path: TOKEN_VERIFIER_BOOTSTRAP,
+          },
+          { name: "bootstrap:session_ingest_roles", path: INGEST_BOOTSTRAP },
         ]
       : []),
     ...(await schemaSteps()),
@@ -245,6 +268,12 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
             name: "verify:session_directory_search_worker",
             path: WORKER_VERIFY,
           },
+          {
+            name: "verify:session_token_verifier",
+            path: TOKEN_VERIFIER_VERIFY,
+          },
+          {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
+          {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
         ]
       : []),
   ];
@@ -273,6 +302,9 @@ export async function generation(): Promise<string> {
     })),
     ...ours.map((f) => ({ name: `96bulls:${f}`, path: join(OURS, f) })),
     { name: "verify:session_directory_search_worker", path: WORKER_VERIFY },
+    { name: "verify:session_token_verifier", path: TOKEN_VERIFIER_VERIFY },
+    {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
+    {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
   ];
   const parts: string[][] = [];
   for (const s of steps)
@@ -298,6 +330,9 @@ export async function expectedSchema(): Promise<ExpectedSchema> {
 }
 
 /** The migrator's "pending first" write, under its advisory lock, before any step. */
+/** Attempts for one role-check transaction when it loses a deadlock (40P01). */
+export const ROLE_CHECK_DEADLOCK_ATTEMPTS = 3;
+
 export const MARKER_PENDING_SQL = `INSERT INTO ${ROLE_VALIDATION_TABLE} (name, generation, status) VALUES ($1, $2, 'pending')
        ON CONFLICT (name) DO UPDATE SET generation = EXCLUDED.generation, status = 'pending', updated_at = now()`;
 
@@ -314,6 +349,73 @@ export interface RunOptions {
   steps?: Step[];
   /** Test seam: runs after the last migration commit, before phase 2. */
   beforeVerify?: () => Promise<void>;
+  /** Release plan binding, checked under the migrator lock before writes. */
+  expectedLedgerSha256?: string;
+  /** External release gates rechecked under the migrator lock, before any write. */
+  beforeWrite?: () => Promise<void>;
+}
+
+/** Shared read-only preflight: release planning and apply enforce the same guards. */
+async function migrationPreflight(client: MigrationClient, profile: MigrationProfile, schema: Step[]) {
+  const ledger = await readLedger(client);
+  // A HoopDb built from the old vendored pin cannot be moved forward in place:
+  // upstream changed 20261025000600 after it was applied there. Say so plainly.
+  if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {
+    throw Object.assign(
+      new Error(
+        "96bulls: this HoopDb was built from the old vendored relayhistory-cloud pin; recreate it (local: `96bulls down <stage> --purge`, then `up`)",
+      ),
+      {
+        code: "legacy_schema",
+      },
+    );
+  }
+  const runtime = await runtimeRolePreflight(client, profile);
+  // Durable function boundary gate, every non-local mode: the selected control must be
+  // proven by the catalog. Only explicit local (Docker dev) mode is ungated.
+  if (profile.mode !== "local") {
+    const evidence = await functionBoundaryEvidence(
+      client,
+      profile.functionBoundary,
+      profile.mode,
+      profile.runtimeRole,
+    );
+    if (!evidence.satisfied)
+      throw profileError(
+        "function_boundary_unproven",
+        `no catalog-proven function boundary (HOOPDB_FUNCTION_BOUNDARY_MODE): ${JSON.stringify(evidence)}; see the runbook "Function boundary"`,
+      );
+  }
+  await cliHistoryPreflight(client, schema);
+  await sequencePreflight(client, schema, ledger);
+  return { ledger, runtime };
+}
+export function migrationLedgerSha256(ledger: Map<string, string>): string {
+  return createHash("sha256").update(JSON.stringify([...ledger].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest("hex");
+}
+/** Caller owns the READ ONLY transaction; never invokes bootstrap or schema SQL. */
+export async function inspectMigrations(client: MigrationClient, profile: MigrationProfile) {
+  if (profile.mode !== "supabase" || profile.shim || profile.bootstrap || !profile.verify)
+    throw profileError("release_profile", "release inspection requires Supabase, verifier enabled, shim/bootstrap disabled");
+  const steps = await schemaSteps();
+  const { ledger } = await migrationPreflight(client, profile, steps);
+  const acl = await sessionsFunctionAclPreview(client, profile.runtimeRole, steps.some(s => !ledger.has(s.name)));
+  if (acl.function_acl_drift_extra.length || acl.function_acl_missing_refused.length)
+    throw profileError("function_acl_drift", "release inspection refused ACL drift");
+  // Prerequisites only, no provisioning. Authoritative migration/phase-2 SQL still
+  // verifies the complete role contract, including memberships and effective grants.
+  const roles = (await client.query<{rolname:string; safe:boolean}>(
+    "SELECT rolname, NOT (rolcanlogin OR rolinherit OR rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication) AS safe FROM pg_roles WHERE rolname = ANY($1::text[])",
+    [["session_directory_search_worker", "session_token_verifier"]])).rows;
+  if (roles.length !== 2 || roles.some(r => !r.safe))
+    throw profileError("bootstrap_prerequisite", "operator-provisioned search/token bare roles absent or unsafe");
+  const inventory = [];
+  for (const step of steps) inventory.push({
+    name: step.name,
+    sha256: createHash("sha256").update(await readFile(step.path, "utf8")).digest("hex"),
+    pending: !ledger.has(step.name),
+  });
+  return { generation: await generation(), ledgerSha256: migrationLedgerSha256(ledger), inventory, acl };
 }
 
 /**
@@ -341,37 +443,11 @@ export async function runMigrations(
       (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
     );
     // Read-only preflight, all under the lock: nothing below writes until every check passes.
-    const ledger = await readLedger(client);
-    // A HoopDb built from the old vendored pin cannot be moved forward in place:
-    // upstream changed 20261025000600 after it was applied there. Say so plainly.
-    if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {
-      throw Object.assign(
-        new Error(
-          "96bulls: this HoopDb was built from the old vendored relayhistory-cloud pin; recreate it (local: `96bulls down <stage> --purge`, then `up`)",
-        ),
-        {
-          code: "legacy_schema",
-        },
-      );
-    }
-    const runtime = await runtimeRolePreflight(client, profile);
-    // Durable function boundary gate, every non-local mode: the selected control must be
-    // proven by the catalog. Only explicit local (Docker dev) mode is ungated.
-    if (profile.mode !== "local") {
-      const evidence = await functionBoundaryEvidence(
-        client,
-        profile.functionBoundary,
-        profile.mode,
-        profile.runtimeRole,
-      );
-      if (!evidence.satisfied)
-        throw profileError(
-          "function_boundary_unproven",
-          `no catalog-proven function boundary (HOOPDB_FUNCTION_BOUNDARY_MODE): ${JSON.stringify(evidence)}; see the runbook "Function boundary"`,
-        );
-    }
-    await cliHistoryPreflight(client, schema);
-    await sequencePreflight(client, schema, ledger);
+    const { ledger, runtime } = await migrationPreflight(client, profile, schema);
+    if (opts.expectedLedgerSha256 !== undefined &&
+        migrationLedgerSha256(ledger) !== opts.expectedLedgerSha256)
+      throw profileError("release_ledger_changed", "database ledger changed since the approved read-only plan");
+    if (opts.beforeWrite) await opts.beforeWrite();
     await client.query("CREATE SCHEMA IF NOT EXISTS sessions");
     await client.query(`CREATE TABLE IF NOT EXISTS ${MIGRATION_LEDGER} (
       name text PRIMARY KEY,
@@ -442,7 +518,14 @@ export async function runMigrations(
         profile.mode,
       ]);
     let postChecked = false;
-    for (const step of steps) {
+    // The validation marker flips to 'pass' once, after every phase-2 verifier
+    // has passed: only the last verify step does the UPDATE, so an earlier
+    // failure can never leave a half-checked generation marked pass.
+    const lastVerifyIndex = steps.reduce(
+      (acc, s, i) => (s.name.startsWith("verify:") ? i : acc),
+      -1,
+    );
+    for (const [stepIndex, step] of steps.entries()) {
       const sql = await readFile(step.path, "utf8");
       // The role checks (phase 1 bootstrap, phase 2 verify) run on every migrate, each in
       // its own transaction, and are never recorded in the ledger.
@@ -453,33 +536,45 @@ export async function runMigrations(
         const verify = step.name.startsWith("verify:");
         if (verify) postChecked = true;
         if (verify && opts.beforeVerify) await opts.beforeVerify();
-        await client.query("BEGIN");
-        try {
-          await bindDbMode();
-          if (verify) await hardenAndCheck();
-          await client.query(sql);
-          if (verify) {
-            const passed = await client.query(
-              `UPDATE ${ROLE_VALIDATION_TABLE} SET status = 'pass', updated_at = now()
-                WHERE name = $1 AND generation = $2 AND status = 'pending' RETURNING name`,
-              [ROLE_VALIDATION_NAME, gen],
-            );
-            if (passed.rows.length !== 1)
-              throw Object.assign(
-                new Error(
-                  "96bulls: role validation marker was not pending for this generation",
-                ),
-                { code: "marker_lost" },
+        // The hardening takes AccessExclusiveLock (CREATE POLICY) on live tables, so
+        // it can lose a deadlock to autovacuum (40P01, observed on the 462 release).
+        // The whole transaction rolls back, so a bounded retry is safe.
+        for (let attempt = 1; ; attempt++) {
+          await client.query("BEGIN");
+          try {
+            await bindDbMode();
+            if (verify) await hardenAndCheck();
+            await client.query(sql);
+            if (verify && stepIndex === lastVerifyIndex) {
+              const passed = await client.query(
+                `UPDATE ${ROLE_VALIDATION_TABLE} SET status = 'pass', updated_at = now()
+                  WHERE name = $1 AND generation = $2 AND status = 'pending' RETURNING name`,
+                [ROLE_VALIDATION_NAME, gen],
               );
+              if (passed.rows.length !== 1)
+                throw Object.assign(
+                  new Error(
+                    "96bulls: role validation marker was not pending for this generation",
+                  ),
+                  { code: "marker_lost" },
+                );
+            }
+            await client.query("COMMIT");
+            break;
+          } catch (err) {
+            await client.query("ROLLBACK");
+            const code = (err as { code?: string }).code;
+            if (code === "40P01" && attempt < ROLE_CHECK_DEADLOCK_ATTEMPTS) {
+              log.warn("role check deadlocked; retrying", { reason: step.name, attempt });
+              await new Promise((r) => setTimeout(r, attempt * 1000));
+              continue;
+            }
+            log.error("role check failed", {
+              reason: step.name,
+              error_code: code ?? "role_check_failed",
+            });
+            throw err;
           }
-          await client.query("COMMIT");
-        } catch (err) {
-          await client.query("ROLLBACK");
-          log.error("role check failed", {
-            reason: step.name,
-            error_code: (err as { code?: string }).code ?? "role_check_failed",
-          });
-          throw err;
         }
         log.info(verify ? "role validation passed" : "role check passed", {
           reason: verify ? gen : step.name,

@@ -118,7 +118,9 @@ manifest body.
     off) admits only migration-class tokens and never a generic RelayAuth
     bearer. `RELAYHISTORY_MIGRATION_GRANTS` lists the accepted
     `grantId=planDigest` pairs. The broad `ALLOW_INTERIM_RELAYAUTH_BEARER` is
-    off unless explicitly set to `true` (the local Docker stack sets it).
+    off unless explicitly set to `true` (the local Docker stack sets it). With
+    `RELAYHISTORY_ORIGIN` set, live couriers' origin-bound RelayAuth assertions
+    are verified without it.
   - **Routes:** only `POST /v1/pipeline/chunks`, `POST /v1/pipeline/manifests`
     and `GET /v1/pipeline/manifests/status` (anything else is 403
     `migration_assertion_route`).

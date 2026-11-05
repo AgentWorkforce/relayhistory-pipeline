@@ -30,6 +30,15 @@ export function liveObjectPrefix(keyRoot: string, g: Pick<LiveFencedGroup, "org_
   return `${orgPrefix(keyRoot, g.org_id)}/v1/ws=${component(g.workspace_id)}/m=${liveMachineId(g.workspace_id, g.origin_id, g.user_id)}/`;
 }
 
+/**
+ * The session ingest's staged batches for one (workspace, user, origin)
+ * (96BullSessions src/session-ingest/staging.ts): one object per batch wider
+ * than a Worker invocation, holding every session of that batch.
+ */
+export function liveStagedPrefix(keyRoot: string, g: Pick<LiveFencedGroup, "org_id" | "workspace_id" | "origin_id" | "user_id">): string {
+  return `${orgPrefix(keyRoot, g.org_id)}/live-batches/v1/ws=${component(g.workspace_id)}/m=${liveMachineId(g.workspace_id, g.origin_id, g.user_id)}/`;
+}
+
 /** `h=…/s=…` of every session directory under `prefix` with at least one object version. */
 export function liveSessionsIn(prefix: string, keys: readonly string[]): Set<string> {
   const out = new Set<string>();

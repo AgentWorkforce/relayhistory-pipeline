@@ -14,7 +14,6 @@ import { errorFields, log } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
-import { produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 
 export interface QueueRecord {
   messageId: string;
@@ -29,8 +28,6 @@ export interface ConsumerDeps {
   pointer: PointerDeps;
   /** Absent while the search index is switched off: only pointers are written. */
   search?: SearchIndexDeps;
-  /** Explicitly absent by default; independent Node artifact publication stage. */
-  replay?: ReplayProducerDeps;
   /**
    * Put a manifest back on the queue after a delay (SQS DelaySeconds): used when
    * another pass holds the session, so the event is neither lost nor failed.
@@ -128,21 +125,6 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           ...errorFields(error),
           duration_ms: Date.now() - started,
         });
-        for (const id of messageIds) failed.add(id);
-      }
-    }
-  }
-  if (deps.replay) {
-    for (const { scope, messageIds } of scopes.values()) {
-      if (messageIds.every(id => failed.has(id))) continue;
-      const started = Date.now();
-      try {
-        const result = await produceCanonicalReplay(scope, deps.replay);
-        log.info("canonical replay materialized", { stage: "replay-pages", org_id: scope.orgId, session_id: scope.sessionId,
-          ok: result.published, reason: result.reason, count: result.rows, objects: result.objects, duration_ms: Date.now()-started });
-      } catch (error) {
-        log.error("canonical replay publication failed", { stage: "replay-pages", org_id: scope.orgId, session_id: scope.sessionId,
-          ...errorFields(error), duration_ms: Date.now()-started });
         for (const id of messageIds) failed.add(id);
       }
     }

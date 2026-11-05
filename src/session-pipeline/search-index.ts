@@ -36,7 +36,6 @@
  *
  * Nothing here logs content; errors carry codes only.
  */
-import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../session-read-api/canonical-artifact.ts";
 import { readCanonicalScope } from "../session-read-api/canonical-projection.ts";
 export { manifestUserId, readManifestRecords, projectedToNeonRow } from "../session-read-api/canonical-projection.ts";
 import * as zlib from "node:zlib";
@@ -81,12 +80,11 @@ export interface SearchIndexLimits {
 }
 
 const DEFAULT_LIMITS: SearchIndexLimits = {
-  // This trusted Node path shares the producer source bound. Raw/projection
-  // copies still need measured execution capacity; this does not lift Worker
-  // limits or cover production cohorts above the explicit 256 MiB ceiling.
-  maxScopeBytes: ARTIFACT_MAX_SOURCE_BYTES,
-  maxScopeEvents: ARTIFACT_MAX_SOURCE_RECORDS,
-  maxRows: 1_000_000,
+  // Raw text is held several times over (strings, records, projected and index
+  // rows), and an out-of-memory kill fails the whole batch: stay well inside 3 GB.
+  maxScopeBytes: 64 * 1024 * 1024,
+  maxScopeEvents: 100_000,
+  maxRows: 500_000,
   insertBatch: 5_000,
 };
 
@@ -115,6 +113,9 @@ interface ScopeIdentity {
   tsMs: number;
   fingerprint: string;
 }
+
+/** Kinds projectRelayhistorySession always derives from exported delivery records (its ACTIVITY_KINDS). */
+export const S3_ACTIVITY_KINDS = ["history", "session_event", "tool_call", "file_edit", "trajectory"] as const;
 
 const SEP = "\u001f";
 const keyOf = (i: Pick<ScopeIdentity, "machineId" | "source" | "kind" | "eventId">) =>
@@ -288,9 +289,15 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if (!complete) await invalidateDirectoryEvents(tx, scope);
     if (complete) {
       const wanted = new Map(inWindow.map((r) => [keyOf({ machineId: r.machine_id, source: r.source, kind: r.kind, eventId: r.event_id }), r]));
+      // Only kinds this pass can regenerate from S3 are diffed. ClickHouse also holds rows of
+      // kinds the exported delivery stream never carries (e.g. tool_result/user/assistant from
+      // other ingest paths); absent from S3 is not "retracted" for those, so they are kept.
+      // Erasure (no live pointer, above) still removes every kind of the scope.
+      const regenerable = new Set<string>([...S3_ACTIVITY_KINDS, ...inWindow.map((r) => r.kind)]);
       for (const [key, list] of existing) {
         const current = wanted.get(key);
         for (const c of list) {
+          if (!regenerable.has(c.kind)) continue;
           if (!current || current.session_id !== c.sessionId || current.workspace_id !== c.workspaceId || tsMillis(`${current.ts.replace(" ", "T")}Z`) !== c.tsMs)
             deletes.push({ orgId: scope.orgId, sessionId: c.sessionId, identity: c } as PendingDelete);
         }

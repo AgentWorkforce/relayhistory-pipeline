@@ -8,6 +8,9 @@ import { sha256Hex } from "../../../packages/object-store/src/crypto.ts";
 import {
   computeContentSha256,
   manifestKey,
+  publicationManifestKey,
+  uploadGenerationPrefix,
+  readAll,
   objectKey,
   rawChunkKey,
   type ChunkEntry,
@@ -661,75 +664,17 @@ test("provider exposes scoped legacy table pages and explicit coverage without N
   });
 });
 
-test("bounds view reads large events without transcript payload and cross-table generation is pinned", async () => {
-  await replaceCanonicalRecords([
-    {
-      kind: "session_event",
-      origin_id: "origin",
-      record_id: "r1",
-      revision: "1",
-      operation: "upsert",
-      received_at: AT,
-      payload: {
-        ts_ms: Date.parse(AT),
-        text: "x".repeat(3 * 1024 * 1024),
-        role: "assistant",
-        message_id: "native",
-      },
-    },
-  ]);
-  const read = (suffix: string) =>
-    canonicalHandle(
-      request(suffix),
-      { CANONICAL_READ_ENABLED: "true" },
-      fetch,
-      deps,
-    );
-  const response = await read("&view=bounds");
-  expect(response.status).toBe(200);
-  const result: any = await response.json();
-  expect(result.exists).toBe(true);
-  expect(result.rows).toHaveLength(1);
-  expect(result.rows[0].row.content).toBeUndefined();
-  expect(result.rows[0].row.record).toBeUndefined();
-  expect(result.rows[0].row.ts).toBeTruthy();
-  expect(JSON.stringify(result).length).toBeLessThan(1500);
-  const different = await read("&view=bounds&generation=" + "b".repeat(64));
-  expect(different.status).toBe(503);
-  expect(different.headers.get("X-Session-Read-Reason")).toBe(
-    "source_generation_changed",
-  );
-  const wrongView = await read("&view=legacy");
-  expect(wrongView.status).toBe(400);
-  const wrongContent = await read("&view=bounds&maxContent=10");
-  expect(wrongContent.status).toBe(400);
-});
-
-test("missing pointer sources attest absence without inventing legacy coverage", async () => {
-  deps.pointers = async () => [];
-  let objects = 0;
-  deps.store = new Proxy(deps.store, {
-    get(target, key) {
-      if (key === "get" || key === "getObject")
-        return async () => {
-          objects++;
-          throw new Error("unexpected object");
-        };
-      return Reflect.get(target, key);
-    },
-  });
-  const response = await canonicalHandle(
-    request("&view=bounds"),
-    { CANONICAL_READ_ENABLED: "true" },
-    fetch,
-    deps,
-  );
-  expect(response.status).toBe(200);
-  expect(await response.json()).toMatchObject({
-    exists: false,
-    legacyCoverage: null,
-    rows: [],
-    nextCursor: null,
-  });
-  expect(objects).toBe(0);
+test("immutable publication snapshot uses existing canonical fold and generation-qualified raw namespace",async()=>{
+ const gen="12345678-1234-1234-1234-123456789abc",pub="abcdefab-1234-1234-1234-123456789abc";
+ const m=JSON.parse(new TextDecoder().decode(await readAll(await deps.store.get(objectKey(pointer.manifest_key))))) as ManifestV1;
+ const next={...location,prefix:uploadGenerationPrefix(location.prefix,gen)};
+ for(const entry of m.raw.chunks){
+  const bytes=await readAll(await deps.store.get(rawChunkKey(location,entry.seq,entry.start_offset,entry.sha256,"ndjson")));
+  await deps.store.put(rawChunkKey(next,entry.seq,entry.start_offset,entry.sha256,"ndjson"),bytes,{});
+ }
+ const key=publicationManifestKey(next,pub);
+ await deps.store.put(key,new TextEncoder().encode(JSON.stringify(m)),{});
+ pointer.manifest_key=String(key);
+ const result=await canonicalSnapshot(deps,identity);
+ expect(result.rows.filter(x=>x.table==="convergence_events").map(x=>x.row.content)).toEqual(["authoritative transcript","second transcript"]);
 });

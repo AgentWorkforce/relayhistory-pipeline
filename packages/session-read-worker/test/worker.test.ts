@@ -351,6 +351,43 @@ describe("reads through ClickHouse and Supabase", () => {
   });
 });
 
+describe("directory list and activity (P3b)", () => {
+  test("off the canary allowlist every workspace falls back; on it, 501 until migration 20261105029000 exists", async () => {
+    const t = tenant();
+    const bearer = await token(t);
+    const call = async (path: string, over: Partial<Env> = {}) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}${path}`, { headers: { authorization: `Bearer ${bearer}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const list = `/v1/sessions?workspace=${t.ws}`;
+    const activity = `/v1/sessions/activity?workspace=${t.ws}&since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z`;
+    for (const over of [{}, { READ_API_DIRECTORY_WORKSPACES: "" }, { READ_API_DIRECTORY_WORKSPACES: "ws-someone-else" }]) {
+      for (const path of [list, activity]) {
+        const r = await call(path, over);
+        expect(r.status).toBe(501);
+        expect((await body(r)).error.reason).toBe("directory_workspace_not_enabled");
+      }
+    }
+    for (const allow of [t.ws, `ws-other,${t.ws}`, "*"]) {
+      for (const path of [list, activity]) {
+        const r = await call(path, { READ_API_DIRECTORY_WORKSPACES: allow });
+        expect(r.status).toBe(501);
+        expect((await body(r)).error.reason).toBe("directory_not_migrated");
+      }
+    }
+    // Timing: the same allowlist, then the canonical S3 source (no raw-store secrets here).
+    const timing = `/v1/sessions/s-1/timing?workspace=${t.ws}&source=codex`;
+    const off = await call(timing);
+    expect(off.status).toBe(501);
+    expect((await body(off)).error.reason).toBe("timing_workspace_not_enabled");
+    const on = await call(timing, { READ_API_DIRECTORY_WORKSPACES: t.ws });
+    expect(on.status).toBe(501);
+    expect((await body(on)).error.reason).toBe("timing_not_configured");
+  });
+});
+
 describe("bulls96_read_api through Hyperdrive", () => {
   async function asRole<T>(work: (c: pg.Client) => Promise<T>): Promise<T> {
     const c = await connectPg(E.SUPABASE.connectionString);
@@ -382,7 +419,10 @@ describe("bulls96_read_api through Hyperdrive", () => {
     const a = tenant();
     await pointer(a, { session: "cols" });
     await asRole(async (c) => {
-      await expect(c.query("SELECT manifest_key FROM sessions.session_index LIMIT 1")).rejects.toMatchObject({ code: "42501" });
+      // The object-pointer columns (timing's canonical read) are granted; content and metadata are not.
+      await c.query("SELECT manifest_key, bucket, content_sha256, revision FROM sessions.session_index LIMIT 1");
+      await expect(c.query("SELECT title FROM sessions.session_index LIMIT 1")).rejects.toMatchObject({ code: "42501" });
+      await expect(c.query("SELECT model FROM sessions.session_index LIMIT 1")).rejects.toMatchObject({ code: "42501" });
       await expect(c.query("SELECT * FROM sessions.session_index LIMIT 1")).rejects.toMatchObject({ code: "42501" });
       await expect(c.query("UPDATE sessions.session_index SET deleted_at = now() WHERE session_id = 'cols'")).rejects.toMatchObject({ code: expect.stringMatching(/^(25006|42501)$/) });
     });

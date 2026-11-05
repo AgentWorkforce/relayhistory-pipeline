@@ -147,8 +147,8 @@ describe("configuration", () => {
   };
 
   test("defaults keep the search index and fan-out off", () => {
-    expect(lambdaEnv(base)).toMatchObject({ keyPrefix: "96bulls", searchEnabled: false, replayPagesEnabled: false, fanout: "off" });
-    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_REPLAY_PAGES_ENABLED: "1", PIPELINE_FANOUT: "postgres" })).toMatchObject({ searchEnabled: true, replayPagesEnabled: true, fanout: "postgres" });
+    expect(lambdaEnv(base)).toMatchObject({ keyPrefix: "96bulls", searchEnabled: false, fanout: "off" });
+    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", PIPELINE_FANOUT: "postgres" })).toMatchObject({ searchEnabled: true, fanout: "postgres" });
   });
 
   test("refuses the single-tenant layout and unknown fan-out", () => {

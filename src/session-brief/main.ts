@@ -6,13 +6,17 @@
 import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
 import { runWorker } from "../shared/worker.ts";
 import { log } from "../shared/log.ts";
-import { briefConfig, modelKey } from "./config.ts";
+import { briefConfig, modelFetch, modelKey, modelResponsesUrl } from "./config.ts";
 import { createAnalysisTransport } from "./engine/transport.ts";
 import { briefTick } from "./worker.ts";
 
 const config = briefConfig();
 const key = modelKey();
-const transport = key ? createAnalysisTransport({ apiKey: () => key }) : null;
+// OPENAI_BASE_URL is validated even with no key, so a bad value fails at startup.
+const fetchModel = modelFetch(modelResponsesUrl());
+const transport = key
+  ? createAnalysisTransport({ apiKey: () => key, ...(fetchModel ? { fetch: fetchModel } : {}) })
+  : null;
 log.info("session brief worker", {
   stage: "session-brief",
   ok: config.enabled,
