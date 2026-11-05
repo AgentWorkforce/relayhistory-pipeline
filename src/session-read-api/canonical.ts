@@ -4,6 +4,7 @@ import {isManifestRest} from "../../packages/object-store/src/index.ts";
  * object is read from an unverified JWT claim or caller-supplied object key.
  */
 import { canonicalLegacy } from "./canonical-legacy.ts";
+import { canonicalLiveTurns, mergeTurnRows } from "./canonical-turns.ts";
 import { createHash } from "node:crypto";
 import { readCanonicalScope, manifestUserId } from "./canonical-projection.ts";
 import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
@@ -194,9 +195,11 @@ export async function canonicalSnapshot(
   if (generation(fresh, identity) !== version)
     throw new CanonicalReadError("source_generation_changed");
   const legacy = canonicalLegacy(result.records, identity);
+  // Live relay session turns (canonical-turns.ts) replace the legacy row of the same key.
+  const live = canonicalLiveTurns(result.records, identity);
   return {
     generation: version,
     legacyCoverage: legacy.coverage,
-    rows: [...result.projectionRows, ...legacy.rows],
+    rows: [...result.projectionRows, ...mergeTurnRows(legacy.rows, live)],
   };
 }
