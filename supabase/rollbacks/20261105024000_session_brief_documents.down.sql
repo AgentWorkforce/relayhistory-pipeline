@@ -1,3 +1,4 @@
+-- Rollback for registry slot 20261105024000 (upstream #188: 20261103090000).
 -- Disable CH metadata search and publisher before this operator-only rollback.
 DROP TRIGGER session_brief_document_changed ON sessions.session_directory;
 DROP FUNCTION sessions.session_brief_document_authority(text,text[],text[]);

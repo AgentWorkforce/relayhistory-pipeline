@@ -1,5 +1,6 @@
 -- Provenance: renamed from PR #188's
--- 20261103090000_session_brief_documents.sql to preserve the composed ledger order.
+-- 20261103090000_session_brief_documents.sql; re-slotted to 20261105024000 by
+-- the window #2 registry after 20261105010000 while preserving relative order.
 -- Intentional composition delta: an empty workspace identity is valid, while a
 -- missing/JSON-null workspace remains invalid (see queue_session_brief_document).
 -- Dormant derived CH metadata publication. Directory text remains authoritative.

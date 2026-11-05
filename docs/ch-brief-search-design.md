@@ -1,8 +1,8 @@
 # Dormant ClickHouse brief/title/summary search
 
-Composed migration: `20261104060500_session_brief_documents.sql`; the original
+Composed migration: `20261105024000_session_brief_documents.sql`; the original
 `030900` reservation ordered it before its directory-event column dependency,
-so canonical-stack composition moved it after `040600`. This lane is dormant
+so canonical-stack composition moved it into the post-`050100` window. This lane is dormant
 and performs no production schema, credential, IAM or deployment actions.
 
 Effective directory metadata is authoritative: the existing session-brief stage projects scrubbed model title/description into `session_directory.title` and `short_summary`; pointer/projector updates and clear/erasure paths also converge there. A separate derived ClickHouse `session_brief_documents` table avoids synthetic transcript rows that the authoritative S3 reconcile would erase.
