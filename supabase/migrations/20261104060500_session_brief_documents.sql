@@ -1,3 +1,7 @@
+-- Provenance: renamed from PR #188's
+-- 20261103090000_session_brief_documents.sql to preserve the composed ledger order.
+-- Intentional composition delta: an empty workspace identity is valid, while a
+-- missing/JSON-null workspace remains invalid (see queue_session_brief_document).
 -- Dormant derived CH metadata publication. Directory text remains authoritative.
 -- No external writes, text search RPC, or direct reader/backend table grants.
 CREATE SEQUENCE sessions.session_brief_document_epoch_seq AS bigint NO CYCLE;
