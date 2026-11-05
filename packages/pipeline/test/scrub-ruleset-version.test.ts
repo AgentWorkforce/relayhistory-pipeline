@@ -29,7 +29,7 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Then the entropy fallback stopped firing after a `/`, `.` or `-` (paths, members,
   // branch names), and an unquoted value after a quoted key is taken only after a
   // one-word key and only when it looks generated (code and quoted prose are kept).
-  3: "93dfb3d90ae7b4efdccb8c2b1159ef759715841a90723ac814a5820cd9b893c3",
+  3: "ff258a1b63c98071a0cdbdcc1806f14fe7f24e9fc122da950ea72222b1cca5ef",
 };
 
 const read = (rel: string) =>

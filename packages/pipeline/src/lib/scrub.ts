@@ -106,9 +106,9 @@ function backslashesBefore(text: string, at: number): number {
  * forms, and a generated-looking unquoted value after a quoted one-word key
  * (`'token' => <generated>`). A quoted value ends at the matching closing quote: a
  * quote escaped once more than the opening one (an inner quote) does not end it, and
- * nor does one preceded by an escaped backslash. A value
- * with no closing quote on its line is redacted to the next whitespace. JSON literals and
- * numbers are kept, as are values already redacted and `op://` references.
+ * nor does one preceded by an escaped backslash. A value with no closing quote on its
+ * line is redacted to the next whitespace. JSON literals and numbers are kept, as are
+ * values already redacted and `op://` references.
  */
 function redactQuotedSecretValues(text: string): string {
   if (!/[:=]/.test(text)) return text;
