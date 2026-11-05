@@ -1512,13 +1512,19 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     expect(await names()).toContain(L);
     expect(await passed()).toBe(true);
-    // The named down, committed as the owner (not inside a test rollback).
+    // The named downs, committed as the owner (not inside a test rollback), newest first:
+    // 026000's down refuses while a later migration (20261105029000, P3b) is applied.
+    const P3B = "supabase/rollbacks/20261105029000_session_directory_read_api.down.sql";
+    expect(await failure(db.exec(readFileSync(join(root, "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql"), "utf8")))).not.toBeNull();
+    await db.exec(readFileSync(join(root, P3B), "utf8"));
+    expect(await names()).not.toContain("upstream:20261105029000_session_directory_read_api.sql");
     await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql"), "utf8"));
     expect(await names()).not.toContain(L);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBeNull();
     // The very next migrate reapplies 026000; the post-validation exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
     expect(await names()).toContain(L);
+    expect(await names()).toContain("upstream:20261105029000_session_directory_read_api.sql");
     expect(await passed()).toBe(true);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBe("sessions.ingest_history_switch");
     // And a no-op rerun stays clean.

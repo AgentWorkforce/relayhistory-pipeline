@@ -46,6 +46,7 @@ describe("unified sessions function-boundary generator", () => {
       "src/hoopdb/migrate-guards.ts", "src/hoopdb/sessions-function-acl.json",
       "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql",
       "supabase/bootstrap/session_directory_search_worker_verify.sql", "supabase/bootstrap/session_ingest_verify.sql",
+      "supabase/bootstrap/session_read_api_role_verify.sql",
       "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql",
     ]);
   });
