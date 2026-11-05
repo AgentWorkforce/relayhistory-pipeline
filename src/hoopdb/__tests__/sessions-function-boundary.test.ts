@@ -120,9 +120,16 @@ describe("unified sessions function-boundary generator", () => {
     await expect(generate(repo, LANES, [...VERIFIERS, VERIFIERS[0]!])).rejects.toThrow("is configured twice");
   });
 
-  test("the empty canonical-project-events slot is present and inert; read-api is filled (#236)", () => {
-    const slots = LANES.filter((l) => l.migration === null).map((l) => l.lane).sort();
-    expect(slots).toEqual(["canonical-project-events"]);
+  test("the empty canonical-project-events and canonical-feature-consumer slots are present and inert; read-api is filled (#236)", async () => {
+    const slots = LANES.filter((l) => l.migration === null);
+    expect(slots.map((l) => l.lane).sort()).toEqual(["canonical-feature-consumer", "canonical-project-events"]);
+    for (const l of slots) {
+      expect([Object.keys(l.functions).length, Object.keys(l.replaces).length, l.prefixes.length, l.grantSources.length]).toEqual([0, 0, 0, 0]);
+      expect(l.extraOutputs).toBeUndefined();
+    }
+    const summary = (await generate(repo, LANES, VERIFIERS)).summary.lanes;
+    for (const l of slots) expect(summary[l.lane]).toEqual({ functions: 0, replaces: 0, grants: 0 });
     expect(LANES.find((l) => l.lane === "read-api")?.migration).toBe("supabase/migrations/20261105029000_session_directory_read_api.sql");
+    expect(summary["read-api"]).toEqual({ functions: 3, replaces: 0, grants: 2 });
   });
 });
