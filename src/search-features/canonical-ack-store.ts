@@ -105,14 +105,19 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
       // contiguity check happens server-side in the production RPC; here the
       // chain rows are verified by the finish RPC (see finish_canonical_copy).
     }
+    // Finish CAS: the journal entry must still be current (its revision is
+    // the alloc high-water or a pending pair's member) AND the bindings
+    // unchanged — a superseded entry cannot finish.
     const { rows } = await this.db.query<{ n: number }>(
       `UPDATE ${ST} SET dirty=false` +
         ` WHERE entry_revision=$1 AND dirty=true` +
         ` AND source_authority=$2 AND profile_binding=$3` +
+        ` AND EXISTS (SELECT 1 FROM sessions.canonical_feature_journal j` +
+        `   WHERE j.revision=$1 AND j.image_key=$4 AND j.kind=$5)` +
         ` RETURNING 1 AS n`,
       [e.revision, JSON.stringify(input.sourceAuthority),
-        input.profileBinding]);
+        input.profileBinding, e.imageKey, e.kind]);
     if (!rows.length)
-      throw new Error("finish_cas: stale bindings or already finished");
+      throw new Error("finish_cas: stale bindings, superseded, or done");
   }
 }
