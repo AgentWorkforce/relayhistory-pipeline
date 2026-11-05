@@ -112,11 +112,16 @@ export class CanonicalJournalStore implements CanonicalJournalPort {
           JSON.stringify(entry.priorSourceAuthority), ptr]
       : ["publish", scope, entry.schemaGeneration, entry.imageKey,
           entry.sourceHash, "", JSON.stringify(entry.sourceAuthority), "", ptr];
+    // cols = [kind, scope, schema_generation, image_key, source_hash,
+    //         prior_keyset_hash, source_authority, prior_source_authority,
+    //         pointer_set]
     await this.db.query(
       "INSERT INTO sessions.canonical_feature_journal(" +
-        "revision,kind,scope,schema_generation,image_key,source_hash," +
-        " prior_keyset_hash,source_authority,prior_source_authority," +
-        " pointer_set) VALUES($1::bigint,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-      [entry.revision, ...cols]);
+        "revision,kind,org_id,workspace_id,scope,schema_generation," +
+        " image_key,source_hash,prior_keyset_hash,source_authority," +
+        " prior_source_authority,pointer_set)" +
+        " VALUES($1::bigint,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+      [entry.revision, cols[0], entry.scope.orgId, entry.scope.workspaceId,
+        ...cols.slice(1)]);
   }
 }

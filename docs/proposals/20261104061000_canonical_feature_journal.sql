@@ -5,6 +5,8 @@
 CREATE TABLE sessions.canonical_feature_journal (
   revision bigint PRIMARY KEY,             -- managed counter, seed > legacy
   kind text NOT NULL CHECK (kind IN ('seed','publish','retire')),
+  org_id text NOT NULL,                    -- per-org erasure sweep key
+  workspace_id text NOT NULL,              -- tenant-level sweep granularity
   scope jsonb NOT NULL,                    -- {orgId,workspaceId,harness,sessionId}
   schema_generation text NOT NULL,         -- same-generation CAS fence
   image_key text NOT NULL,                 -- publication image identity
@@ -21,3 +23,8 @@ CREATE TABLE sessions.canonical_feature_journal (
 -- last legacy feature clock — never overlapping a legacy-issued revision.
 CREATE INDEX canonical_feature_journal_kind_rev
   ON sessions.canonical_feature_journal (kind, revision);
+-- Per-org retention sweep: one retention job reads (org_id, recorded_at),
+-- expires rows through the reviewed erasure path, and retires the S3 pointer
+-- set — no dangling image/pointer references.
+CREATE INDEX canonical_feature_journal_org_time
+  ON sessions.canonical_feature_journal (org_id, recorded_at);

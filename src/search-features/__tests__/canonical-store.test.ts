@@ -26,11 +26,12 @@ const fakeDb = () => {
         .slice(0, Number(params[1])) as T[] };
     if (text.startsWith("INSERT")) {
       table.push({
-        revision: params[0], kind: params[1], scope: params[2],
-        schema_generation: params[3], image_key: params[4],
-        source_hash: params[5], prior_keyset_hash: params[6] ?? null,
-        source_authority: params[7], prior_source_authority: params[8],
-        pointer_set: params[9],
+        revision: params[0], kind: params[1], org_id: params[2],
+        workspace_id: params[3], scope: params[4],
+        schema_generation: params[5], image_key: params[6],
+        source_hash: params[7], prior_keyset_hash: params[8] ?? null,
+        source_authority: params[9], prior_source_authority: params[10],
+        pointer_set: params[11],
       });
       return { rows: [] as T[] };
     }
