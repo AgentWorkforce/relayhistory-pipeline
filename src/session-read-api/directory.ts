@@ -3,7 +3,7 @@
  * `GET /v1/sessions` (no `q`) and `GET /v1/sessions/activity` (no `q`).
  *
  * Calls sessions.list_session_directory_for / session_directory_activity_for
- * (supabase/migrations/20261105020000_session_directory_read_api.sql) as the
+ * (supabase/migrations/20261105029000_session_directory_read_api.sql) as the
  * `bulls96_read_api` role, inside the read API's own READ ONLY transaction with the
  * tenant bound from the verified RelayAuth assertion (liveness.ts TENANT_SETTINGS_SQL).
  * The functions pin the tenant to that binding; every returned row is rechecked here

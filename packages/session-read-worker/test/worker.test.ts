@@ -352,7 +352,7 @@ describe("reads through ClickHouse and Supabase", () => {
 });
 
 describe("directory list and activity (P3b)", () => {
-  test("off the canary allowlist every workspace falls back; on it, 501 until migration 20261105020000 exists", async () => {
+  test("off the canary allowlist every workspace falls back; on it, 501 until migration 20261105029000 exists", async () => {
     const t = tenant();
     const bearer = await token(t);
     const call = async (path: string, over: Partial<Env> = {}) => {
