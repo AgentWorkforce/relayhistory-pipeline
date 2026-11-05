@@ -50,6 +50,12 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: psql client
         run: psql --version
+      # Before the role proofs, which lock the superuser down. The suite creates
+      # and drops its own database, so it leaves nothing behind for them.
+      - name: SearchIndexAdapter conformance (postgres adapter, real server)
+        env:
+          SEARCH_CONFORMANCE_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: bun run --filter @96bulls/pipeline test test/search-index-postgres-real.test.ts
       - name: Prove auth upgrade, T0 bootstrap and switch-only membership
         env:
           PGPROOF_AUTH_UPGRADE_DISPOSABLE: "1"
@@ -71,10 +77,6 @@ jobs:
         run: |
           set -o pipefail
           bun scripts/pg-proof/role-proof.ts 2>&1 | tee pg-proof-pg${{ matrix.pg }}.log
-      - name: SearchIndexAdapter conformance (postgres adapter, real server)
-        env:
-          SEARCH_CONFORMANCE_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
-        run: bun run --filter @96bulls/pipeline test test/search-index-postgres-real.test.ts
       - name: Check the results file names this head and this server
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
