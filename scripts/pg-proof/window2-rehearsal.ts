@@ -153,7 +153,10 @@ ev("history-ledger-unchanged");
 const { TENANT, batch, record, scratchStore } = M.support;
 const fs = scratchStore();
 const rt = new pg.Client({ host: "127.0.0.1", port, user: "proof_admin", database: "postgres", password: "synthetic-owner-proof-only" }); await rt.connect();
-const run = async (s: string, p: unknown[] = []) => { await rt.query("BEGIN"); await rt.query("SET LOCAL ROLE bulls96_session_ingest"); try { const r = await rt.query(s, p); await rt.query("COMMIT"); return r as never; } catch (e) { await rt.query("ROLLBACK"); throw e; } };
+// Capture the database refusal before the production adapter deliberately
+// redacts SQL detail. This fixed, synthetic-only fixture has no customer input.
+let sqlFailure: { code: string; message: string } | undefined;
+const run = async (s: string, p: unknown[] = []) => { await rt.query("BEGIN"); await rt.query("SET LOCAL ROLE bulls96_session_ingest"); try { const r = await rt.query(s, p); await rt.query("COMMIT"); return r as never; } catch (e: any) { sqlFailure = { code: String(e?.code), message: String(e?.message) }; await rt.query("ROLLBACK"); throw e; } };
 const depsFor = (g: string) => ({ ledger: M.ledgerSql.sqlLedger(run, { acceptanceMode: "buffered", expectedGeneration: g }), acceptanceMode: "buffered" as const, target: { store: fs.store, keyRoot: "96bulls" } });
 await admin.query("SET ROLE postgres");
 await admin.query("INSERT INTO sessions.ingest_frozen_source_completeness(source_identity_sha256,control_epoch,privacy_baseline_sha256,org_count,record_rows,manifest_sha256,neon_snapshot) VALUES($1,$2,$3,0,0,$4,'{}')", [identity, epoch, baselineSha, "e".repeat(64)]);
@@ -161,12 +164,16 @@ await admin.query("RESET ROLE");
 const witness = async (raw: any) => { const p = await M.prepare.prepareDelivery(TENANT, raw);
   return (await run("SELECT sessions.ingest_frozen_source_witness($1::jsonb) AS r", [JSON.stringify({ kind: "batch", tenant: TENANT, originId: p.originId, batchId: p.batchId, batchDigest: p.batchDigest, originalRecordCount: raw.records.length,
     candidates: p.records.map((r: any, i: number) => ({ preparedOrd: i, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id, candidateDigest: r.digest, source: r.source, sessionId: r.session_id })) })]) as any).rows[0].r; };
-const attempt = async (g: string, id: string) => { const raw = await batch([record({ record_id: id })], { batch_id: id });
+const attempt = async (g: string, id: string) => { sqlFailure = undefined; const raw = await batch([record({ record_id: id })], { batch_id: id });
   try { const r = await M.deliver.deliverBatch({ ...depsFor(g), custody: await witness(raw) }, TENANT, raw); return { ok: true, ack: !!r.custodyAck }; }
-  catch (e: any) { return { ok: false, why: String(e?.message ?? e).slice(0, 160) }; } };
+  catch (e: any) { return { ok: false, why: String(e?.message ?? e).slice(0, 160), sqlFailure }; } };
 const oldWorker = await attempt(baseGeneration, "w2-old"), newWorkerBefore = await attempt(targetGeneration, "w2-new-before");
 ev("uploads-during-window", { oldWorker, newWorkerBefore });
-if (oldWorker.ok || newWorkerBefore.ok) throw Error("an upload was accepted before the rebind");
+const refusedFor = (result: Awaited<ReturnType<typeof attempt>>, message: string) =>
+  !result.ok && "sqlFailure" in result && result.sqlFailure?.code === "55000" && result.sqlFailure.message === message;
+if (!refusedFor(oldWorker, "session ingest: generation not ready") ||
+    !refusedFor(newWorkerBefore, "session ingest: current custody policy unavailable"))
+  throw Error("window2_expected_generation_policy_refusal");
 const rc = { query: (t: string, p?: unknown[]) => admin.query(t, p as never) as never };
 await admin.query("SET ROLE postgres");
 const dry = await M.rebind.rebindIngestGeneration(rc, { from: baseGeneration, to: targetGeneration, dryRun: true });
@@ -182,7 +189,7 @@ if (dry.admissionsRebound !== 974 || real.admissionsRebound !== 974 ||
 ev("generation-rebind", { dry, real, again, admissions: adm });
 const after = await attempt(targetGeneration, "w2-new-after"), oldAfter = await attempt(baseGeneration, "w2-old-after");
 ev("uploads-after-rebind", { newWorker: after, oldWorkerStillRefused: !oldAfter.ok });
-if (!after.ok || !("ack" in after) || !after.ack || oldAfter.ok) throw Error("window2_upload_expectations");
+if (!after.ok || !("ack" in after) || !after.ack || !refusedFor(oldAfter, "session ingest: generation not ready")) throw Error("window2_upload_expectations");
 fs.done(); await rt.end(); await admin.end();
 
 const result = { syntheticOnly: true, head: HEAD_SHA, base: BASE_SHA, baseGeneration, targetGeneration, passed: true, events };
