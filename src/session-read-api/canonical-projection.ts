@@ -64,8 +64,13 @@ interface SearchIndexLimits {
   maxScopeEvents: number;
   maxRows: number;
   insertBatch: number;
-  /** Read-artifact projection only; legacy CH writer does not construct display values. */
-  directoryValues?: boolean;
+  /**
+   * Read-artifact projection only; legacy CH writer does not construct display values.
+   * "required" (artifact producer): a directory_display_* refusal makes the projection
+   * incomplete with that reason code. "optional" (live raw read): the display values are
+   * omitted and the code is reported in `displayOmitted`; the read itself still succeeds.
+   */
+  directoryValues?: "required" | "optional";
 }
 const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
 const SEP = "\u001f";
@@ -259,6 +264,8 @@ export interface ScopeRead {
   catalog: DirectoryCatalog;
   directorySessionId: string | null;
   events: DirectoryEvents | null;
+  /** directory_display_* code when optional display values were omitted. */
+  displayOmitted?: string | null;
   sources: DirectoryEventInput["sources"];
 }
 
@@ -531,11 +538,21 @@ export async function readCanonicalScope(
   }
   // Both locators were selected from metadataByKey. Fetch only those rows:
   // display materialization never scans/copies the full transcript a second time.
-  const displayValues = limits.directoryValues && metadata
-    ? canonicalDirectoryValues({orgId:scope.orgId,workspaceId:scope.workspaceId},metadata,
+  let displayValues: ReturnType<typeof canonicalDirectoryValues> = [];
+  let displayOmitted: string | null = null;
+  if (limits.directoryValues && metadata) {
+    try {
+      displayValues = canonicalDirectoryValues({orgId:scope.orgId,workspaceId:scope.workspaceId},metadata,
         [...new Set([metadata.openingEvent,metadata.projectEvent].flatMap(event=>event ? [keyOf({machineId:event.machine_id,source:event.source,kind:event.kind,eventId:event.event_id})] : []))]
-          .map(key=>metadataByKey.get(key)!))
-    : [];
+          .map(key=>metadataByKey.get(key)!));
+    } catch (error) {
+      const code = error instanceof Error && /^directory_display_[a-z_]+$/.test(error.message) ? error.message : null;
+      if (!code) throw error;
+      reasons.push(code);
+      if (limits.directoryValues === "required") complete = false;
+      else displayOmitted = code;
+    }
+  }
   return {
     records: canonicalRecords,
     projectionRows: [
@@ -557,6 +574,7 @@ export async function readCanonicalScope(
     catalog: directoryCatalogFromProjection(catalogRows),
     directorySessionId: directoryIds.size === 1 ? [...directoryIds][0]! : null,
     events: metadata,
+    displayOmitted,
     sources: parts.map(({ manifest }) => ({
       manifestKey: manifestKeysByBody.get(manifest)!,
       revision: String(manifest.revision),

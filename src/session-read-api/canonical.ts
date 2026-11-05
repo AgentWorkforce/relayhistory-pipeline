@@ -119,16 +119,18 @@ export function canonicalSourceGeneration(
     .digest("hex");
 }
 export function canonicalSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity) {
-  return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS);
+  // Live raw read: a display-value refusal omits those rows instead of failing the read.
+  return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS, 500000, "optional");
 }
 /** Trusted Node producer only. Never called by the raw Worker request path. */
 export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, profile: NodeReadProfile = "standard") {
   const budget=nodeReadBudget(profile);
-  return snapshotWithLimits(deps, identity, budget.sourceBytes, budget.sourceRecords, ARTIFACT_MAX_SOURCE_POINTERS + 1,budget.projectedRows);
+  return snapshotWithLimits(deps, identity, budget.sourceBytes, budget.sourceRecords, ARTIFACT_MAX_SOURCE_POINTERS + 1,budget.projectedRows,"required");
 }
 async function snapshotWithLimits(
   deps: CanonicalDeps, identity: CanonicalIdentity,
-  maxScopeBytes: number, maxScopeEvents: number, maxPointersExclusive: number, maxRows=500000,
+  maxScopeBytes: number, maxScopeEvents: number, maxPointersExclusive: number, maxRows: number,
+  directoryValues: "required" | "optional",
 ) {
   const pointers = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive),
     version = canonicalSourceGeneration(pointers, identity);
@@ -201,7 +203,7 @@ async function snapshotWithLimits(
       maxScopeEvents,
       maxRows,
       insertBatch: 5000,
-      directoryValues: true,
+      directoryValues,
     },
     0,
     identity.sessionId,
@@ -217,5 +219,7 @@ async function snapshotWithLimits(
     exists: true,
     legacyCoverage: legacy.coverage,
     rows: [...result.projectionRows, ...legacy.rows],
+    /** Bounded directory_display_* code when display rows were omitted (raw read only). */
+    ...(result.displayOmitted ? { displayOmitted: result.displayOmitted } : {}),
   };
 }

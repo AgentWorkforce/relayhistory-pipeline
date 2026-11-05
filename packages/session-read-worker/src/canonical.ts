@@ -7,6 +7,7 @@ import { objectKey } from "../../object-store/src/index.ts";
 import { decompress } from "fzstd";
 import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
 import type { Bindings } from "../../pipeline/src/env.ts";
+import { logLine } from "../../../src/shared/log.ts";
 import {
   canonicalSnapshot,
   CanonicalReadError,
@@ -361,6 +362,9 @@ export async function canonicalHandle(
       canonicalSnapshot(deps, identity),
       deadline,
     ]);
+    // Display values are optional on the raw path: their refusal omits those rows only.
+    if ("displayOmitted" in snapshot && snapshot.displayOmitted && table === "session_directory_event_values")
+      console.error(logLine("warn", "canonical display values omitted", { service: "96bulls-session-read-worker", stage: "canonical-read", org_id: identity.orgId, workspace_id: identity.workspaceId, harness: identity.source, session_id: identity.sessionId, reason: snapshot.displayOmitted }));
     if (
       expectedGeneration !== null &&
       expectedGeneration !== snapshot.generation

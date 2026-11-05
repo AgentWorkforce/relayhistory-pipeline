@@ -751,3 +751,40 @@ test("missing pointer sources attest absence without inventing legacy coverage",
   });
   expect(objects).toBe(0);
 });
+import { canonicalProducerSnapshot, CanonicalReadError } from "../canonical.ts";
+test("a directory display refusal omits display rows on the live raw read but refuses the producer with a stable code", async () => {
+  const record = (cwd: string) => ({
+    kind: "session_event",
+    origin_id: "origin",
+    record_id: "r1",
+    revision: "1",
+    operation: "upsert",
+    received_at: AT,
+    payload: { ts_ms: Date.parse(AT), text: "opening prompt", role: "user", message_id: "msg-1", cwd },
+  });
+  const display = (rows: Array<{ table: string; row: Record<string, unknown> }>) =>
+    rows.filter((r) => r.table === "session_directory_event_values");
+  await replaceCanonicalRecords([record("/work/project")]);
+  const ok = await canonicalSnapshot(deps, identity);
+  expect(display(ok.rows).map((r) => r.row.project_id)).toContain("/work/project");
+  expect("displayOmitted" in ok).toBe(false);
+  // A >1 MiB project path makes the display value refuse (directory_display_bound).
+  await replaceCanonicalRecords([record("/" + "x".repeat(1024 * 1024))]);
+  const raw = await canonicalSnapshot(deps, identity);
+  expect(raw.exists).toBe(true);
+  expect(display(raw.rows)).toEqual([]);
+  expect(raw.rows.some((r) => r.table === "convergence_events")).toBe(true);
+  expect((raw as { displayOmitted?: string }).displayOmitted).toBe("directory_display_bound");
+  const lines: string[] = [], err = console.error;
+  console.error = (line: string) => void lines.push(line);
+  let response: Response;
+  try {
+    response = await canonicalHandle(request("&table=session_directory_event_values"), { CANONICAL_READ_ENABLED: "true" }, fetch, deps);
+  } finally { console.error = err; }
+  expect(response.status).toBe(200);
+  expect(((await response.json()) as any).rows).toEqual([]);
+  expect(lines.map((l) => JSON.parse(l))).toEqual([expect.objectContaining({ level: "warn", message: "canonical display values omitted", reason: "directory_display_bound", session_id: "sess:1" })]);
+  const refused = await canonicalProducerSnapshot(deps, identity).catch((e) => e);
+  expect(refused).toBeInstanceOf(CanonicalReadError);
+  expect(refused).toMatchObject({ reason: "canonical_projection_incomplete", details: ["directory_display_bound"] });
+});
