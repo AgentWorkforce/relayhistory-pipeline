@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { signV4 } from "../aws-json.ts";
 import { decodeS3Key, parseQueueBody, sequencerAfter } from "../s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
-import { handler, lambdaEnv, parseSecret } from "../lambda.ts";
+import { analysisDeps, analysisSourceReadonlyUrl, handler, lambdaEnv, parseSecret, runtimeFromSecret } from "../lambda.ts";
 import { searchIndexLimits, SEARCH_INDEX_DEFAULT_LIMITS, REPLAY_SEARCH_INDEX_LIMITS } from "../search-index.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
@@ -183,6 +183,14 @@ describe("configuration", () => {
     expect(() => lambdaEnv({ ...base, PIPELINE_FANOUT: "sqs" })).toThrow(/FANOUT/);
   });
 
+  test("adapter selection: unset is today's lambda + clickhouse; other runtimes or backends are refused", () => {
+    expect(() => lambdaEnv(base)).not.toThrow();
+    expect(() => lambdaEnv({ ...base, PIPELINE_RUNTIME: "lambda", SEARCH_INDEX_BACKEND: "clickhouse" })).not.toThrow();
+    expect(() => lambdaEnv({ ...base, PIPELINE_RUNTIME: "workers" })).toThrow(/PIPELINE_RUNTIME/);
+    expect(() => lambdaEnv({ ...base, SEARCH_INDEX_BACKEND: "opensearch" })).toThrow(/SEARCH_INDEX_BACKEND/);
+    expect(() => lambdaEnv({ ...base, SEARCH_INDEX_BACKEND: "nope" })).toThrow(/unknown/);
+  });
+
   test("secret shape is checked without echoing values", () => {
     expect(parseSecret(JSON.stringify({ hoopdb_url: "postgresql://u:p@h:5432/db" })).hoopdb_url).toContain("postgresql://");
     let message = "";
@@ -239,5 +247,38 @@ describe("brief schedule invocation", () => {
       else process.env.SESSION_BRIEF_ENABLED = saved.e;
       if (saved.r !== undefined) process.env.AWS_REGION = saved.r;
     }
+  });
+});
+
+test("analysis cache defaults off before runtime init and rejects invalid readonly source secret shape",async()=>{const saved=process.env.SESSION_ANALYSIS_CACHE_ENABLED;try{for(const value of [undefined,"0","true"]){if(value===undefined)delete process.env.SESSION_ANALYSIS_CACHE_ENABLED;else process.env.SESSION_ANALYSIS_CACHE_ENABLED=value;expect(await handler({analysisCache:true})).toEqual({ok:true});expect(await handler({analysisCacheReconcile:true})).toEqual({ok:true})}expect(()=>parseSecret(JSON.stringify({hoopdb_url:"postgres://fixture",analysis_source_readonly_url:"mysql://fixture"}))).not.toThrow();expect(()=>analysisSourceReadonlyUrl("mysql://fixture")).toThrow(/readonly_url/)}finally{if(saved===undefined)delete process.env.SESSION_ANALYSIS_CACHE_ENABLED;else process.env.SESSION_ANALYSIS_CACHE_ENABLED=saved}});
+
+describe("analysis source secret field is validated only in the analysis branch", () => {
+  const base = { AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "b", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs", SEARCH_INDEX_ENABLED: "1" };
+  const secret = (field: Record<string, unknown>) => JSON.stringify({ hoopdb_url: "postgres://u:p@127.0.0.1:1/db", clickhouse: { url: "https://ch.example", user: "u", password: "p", database: "d" }, ...field });
+  test("flag off + malformed field: search init succeeds and analysis stays unavailable", () => {
+    for (const field of [{ analysis_source_readonly_url: "mysql://hunter2" }, { analysis_source_readonly_url: 42 }, { analysis_source_readonly_url: "" }]) {
+      const rt = runtimeFromSecret(lambdaEnv(base), secret(field), "fixture-generation");
+      expect(rt.deps.search).toBeDefined();
+      expect(rt.analysis).toBeUndefined();
+      expect(() => analysisDeps(rt)).toThrow("analysis cache runtime unavailable");
+    }
+  });
+  test("flag on + missing or malformed field: only the analysis branch fails, search unaffected, no value echoed", () => {
+    const env = lambdaEnv({ ...base, SESSION_ANALYSIS_CACHE_ENABLED: "1" });
+    expect(env.analysisCacheEnabled).toBe(true);
+    for (const [field, error] of [[{}, /readonly source configuration.*missing/], [{ analysis_source_readonly_url: "mysql://hunter2" }, /must be a postgres URL/]] as const) {
+      const rt = runtimeFromSecret(env, secret(field), "fixture-generation");
+      expect(rt.deps.search).toBeDefined();
+      let message = "";
+      try { analysisDeps(rt); } catch (e) { message = (e as Error).message; }
+      expect(message).toMatch(error);
+      expect(message).not.toContain("hunter2");
+      expect(rt.analysis).toBeUndefined();
+      expect(rt.deps.search).toBeDefined();
+    }
+    const ok = runtimeFromSecret(env, secret({ analysis_source_readonly_url: "postgres://ro:p@127.0.0.1:1/db" }), "fixture-generation");
+    const deps = analysisDeps(ok);
+    expect(analysisDeps(ok)).toBe(deps);
+    expect(deps.db).toBe(ok.deps.pointer.db);
   });
 });
