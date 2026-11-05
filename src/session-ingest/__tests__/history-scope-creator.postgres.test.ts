@@ -286,7 +286,7 @@ test.skipIf(!url)("ACK vs control on a managed scope's owner: both commit (one w
   expect((await pool.query("SELECT ready FROM sessions.ingest_history_scope_current WHERE org_id=$1", [s.identity.orgId])).rows[0].ready).toBe(false);
 });
 
-test.skipIf(!url)("resume (set_live true) waits out a session_index writer that began while OFF; the backfill then sees its row", async () => {
+test.skipIf(!url)("resume (set_live true) refuses (55P03, nothing changed) while a session_index writer from the OFF period is in flight; a retry after it commits succeeds and the backfill sees its row", async () => {
   const s = await scope();
   const backfill = async () => { let c: unknown = null, n = 0; do { c = (await pool.query("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [c === null ? null : JSON.stringify(c)])).rows[0].c; n++; } while (c !== null && n < 100); };
   await pool.query("INSERT INTO sessions.ingest_receipt_seat_clock(singleton,control_epoch,source_identity_sha256,allocated_high_water,last_seat,baseline,initial_generation) VALUES(true,$1,$2,0,0,'{}'::jsonb,$3) ON CONFLICT DO NOTHING", [sha("seat-epoch"), sha("seat-src"), gen]);
@@ -297,12 +297,13 @@ test.skipIf(!url)("resume (set_live true) waits out a session_index writer that 
   try {
     await writer.query("BEGIN");
     await writer.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...s.row, revision: 5, content_sha256: "\\x" + "d".repeat(64) }])]);   // untracked, uncommitted
-    let resumed = false;
-    const resume = resumer.query("SELECT sessions.ingest_history_set_live(true)").then(() => { resumed = true; });
-    await new Promise((r) => setTimeout(r, 300));
-    expect(resumed).toBe(false);                                            // waiting on the OFF-era writer
+    const t0 = Date.now();
+    const first = await resumer.query("SELECT sessions.ingest_history_set_live(true)").then(() => "ok", (e: any) => e.code);
+    expect(first).toBe("55P03");                                            // never waits on the OFF-era writer
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect((await pool.query("SELECT live FROM sessions.ingest_history_switch")).rows[0].live).toBe(false);   // nothing changed
     await writer.query("COMMIT");
-    await resume;
+    await resumer.query("SELECT sessions.ingest_history_set_live(true)");   // the operator's retry
   } finally { writer.release(); resumer.release(); }
   const sw = (await pool.query("SELECT live,refs_complete FROM sessions.ingest_history_switch")).rows[0];
   expect(sw).toEqual({ live: true, refs_complete: false });
@@ -359,7 +360,7 @@ test.skipIf(!url)("prune vs reinsert, prune first: the backfill holds the stale 
   await pool.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
 });
 
-test.skipIf(!url)("resume vs a control holding session_index (ROW EXCLUSIVE) then wanting the seat clock: both commit, never 40P01", async () => {
+test.skipIf(!url)("resume vs a control holding session_index (ROW EXCLUSIVE) then wanting the seat clock: resume fails fast with 55P03, the control commits, a retry succeeds; never 40P01", async () => {
   const s = await scope();
   await pool.query("INSERT INTO sessions.ingest_receipt_seat_clock(singleton,control_epoch,source_identity_sha256,allocated_high_water,last_seat,baseline,initial_generation) VALUES(true,$1,$2,0,0,'{}'::jsonb,$3) ON CONFLICT DO NOTHING", [sha("seat-epoch"), sha("seat-src"), gen]);
   await pool.query("SELECT sessions.ingest_history_set_live(false)");
@@ -367,13 +368,45 @@ test.skipIf(!url)("resume vs a control holding session_index (ROW EXCLUSIVE) the
   try {
     await ctl.query("BEGIN");
     await ctl.query("UPDATE sessions.session_index SET indexed_at=now() WHERE org_id=$1", [s.identity.orgId]);   // 060000 retire-fence write
-    const resume = op.query("SELECT sessions.ingest_history_set_live(true)").then(() => "ok", (e: any) => e.code ?? e.message);
-    await new Promise((r) => setTimeout(r, 300));
-    const control = (async () => { await ctl.query("SELECT 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE"); await ctl.query("COMMIT"); return "ok"; })()
-      .catch(async (e: any) => { await ctl.query("ROLLBACK").catch(() => {}); return e.code ?? e.message; });
-    expect(await Promise.all([control, resume])).toEqual(["ok", "ok"]);
+    const resume = await op.query("SELECT sessions.ingest_history_set_live(true)").then(() => "ok", (e: any) => e.code ?? e.message);
+    expect(resume).toBe("55P03");
+    await ctl.query("SELECT 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE");   // free: resume released it
+    await ctl.query("COMMIT");
+    expect(await op.query("SELECT sessions.ingest_history_set_live(true)").then(() => "ok", (e: any) => e.code)).toBe("ok");
   } finally { ctl.release(); op.release(); }
   expect((await pool.query("SELECT live FROM sessions.ingest_history_switch")).rows[0].live).toBe(true);
+});
+
+test.skipIf(!url)("resume vs the lazy batch-claim order (seat clock, THEN a session_index UPDATE): resume waits for the seat clock, both commit, never 40P01", async () => {
+  const s = await scope();
+  await pool.query("INSERT INTO sessions.ingest_receipt_seat_clock(singleton,control_epoch,source_identity_sha256,allocated_high_water,last_seat,baseline,initial_generation) VALUES(true,$1,$2,0,0,'{}'::jsonb,$3) ON CONFLICT DO NOTHING", [sha("seat-epoch"), sha("seat-src"), gen]);
+  await pool.query("SELECT sessions.ingest_history_set_live(false)");
+  const claim = await pool.connect(), op = await pool.connect();
+  try {
+    await claim.query("BEGIN");
+    await claim.query("SELECT 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE");          // ingest_lazy_records 055000:333
+    const resume = op.query("SELECT sessions.ingest_history_set_live(true)").then(() => "ok", (e: any) => e.code ?? e.message);
+    await new Promise((r) => setTimeout(r, 300));                                                             // resume now queued on the seat clock
+    const claimed = (async () => {
+      await claim.query("UPDATE sessions.session_index SET indexed_at=now() WHERE org_id=$1", [s.identity.orgId]);   // retire-fence write (060000:466)
+      await claim.query("COMMIT"); return "ok";
+    })().catch(async (e: any) => { await claim.query("ROLLBACK").catch(() => {}); return e.code ?? e.message; });
+    expect(await Promise.all([claimed, resume])).toEqual(["ok", "ok"]);
+  } finally { claim.release(); op.release(); }
+  expect((await pool.query("SELECT live FROM sessions.ingest_history_switch")).rows[0].live).toBe(true);
+});
+
+test.skipIf(!url)("an already-live set_live(true) takes no lock (no-op returns while the seat clock is held)", async () => {
+  await pool.query("INSERT INTO sessions.ingest_receipt_seat_clock(singleton,control_epoch,source_identity_sha256,allocated_high_water,last_seat,baseline,initial_generation) VALUES(true,$1,$2,0,0,'{}'::jsonb,$3) ON CONFLICT DO NOTHING", [sha("seat-epoch"), sha("seat-src"), gen]);
+  const holder = await pool.connect();
+  try {
+    await holder.query("BEGIN");
+    await holder.query("SELECT 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE");
+    const t0 = Date.now();
+    expect((await pool.query("SELECT sessions.ingest_history_set_live(true) r")).rows[0].r).toEqual({ live: true, changed: false });
+    expect(Date.now() - t0).toBeLessThan(1000);
+    await holder.query("COMMIT");
+  } finally { holder.release(); }
 });
 
 test.skipIf(!url)("prune re-verifies under the row lock: a reinsert that commits after the candidate scan keeps its fresh ref", async () => {

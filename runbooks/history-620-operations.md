@@ -26,21 +26,32 @@ before any build row.
 ## Kill switch (usable at any time, including after installs)
 
 ```sql
-SET lock_timeout='5s';                           -- the function also sets 5s for its own body
+SET lock_timeout='5s';                           -- see the note below: the function's own 5s wins
 SELECT sessions.ingest_history_set_live(false);  -- off
 SELECT sessions.ingest_history_set_live(true);   -- on again
 ```
 
-Both calls fail fast with 55P03 (lock_not_available) when contended; nothing has changed, so retry.
+Both calls fail with 55P03 (lock_not_available) when contended; nothing has changed, so retry.
+`set_live(true)` takes the seat clock first and then `session_index` SHARE with **NOWAIT**. Main
+takes those two locks in both orders (the lazy batch claim: seat clock, then a `session_index` write;
+a lazy control: `session_index`, then the seat clock), so resume never waits for `session_index`. It
+fails at once with `history: session_index has an in-flight writer; nothing changed, retry
+ingest_history_set_live(true)` while any indexer write is uncommitted. Retry in a loop with a short
+pause until it succeeds. A call that asks for the state already in place returns `changed:false`
+without taking any lock.
+
+`lock_timeout` is a `SET` clause on `set_live` and `set_pointer_tracking`, so inside them it is always
+5s. It overrides a shorter (or longer) timeout set by the caller. The caller's own setting applies only
+to statements outside the function.
 
 - **Off:** every in-flight build is abandoned; every 620 trigger (ACK, control, directory,
   session_index) returns immediately; every read gate behaves as main; `ingest_history_scope_begin`
   and `ingest_history_scope_install` refuse with `history: 620 is switched off`. Pointer tracking stops
   too, so `refs_complete` is cleared and the inventory is no longer attested. All ledgers stay:
   scope versions, current rows, derived objects, the feature journal, outboxes and builds.
-- **On:** first takes a SHARE lock on `session_index` (before the seat clock, the same order as a lazy
-  control), which waits out every writer that began while off; it never restores `refs_complete`, so
-  rerun the full pointer backfill before any inventory work. Every in-flight build is abandoned again (one that raced the switch saw untracked changes),
+- **On:** takes the seat clock, then SHARE on `session_index` with NOWAIT. If a writer from the off
+  period is still uncommitted, it refuses with 55P03 and you retry. It never restores
+  `refs_complete`, so rerun the full pointer backfill before any inventory work. Every in-flight build is abandoned again (one that raced the switch saw untracked changes),
   and every installed scope is invalidated in the same transaction (ACKs and controls while off
   were not tracked), so its directory row is cleared and its next build re-derives it. This is five
   set-based statements over all installed scopes (`ingest_history_invalidate_installed`), not a
@@ -95,6 +106,9 @@ a quieter moment; nothing needs to be undone.
 ## Schema rollback (down) and reapply
 
 Use the down only when the kill switch is not enough, that is, before any authority was installed.
+
+Once `20261105029000` (P3b read API, #236) or any other later upstream migration has landed, the
+026000 down refuses until that later file has been rolled back first and its ledger row removed.
 
 The down **refuses** (nothing is dropped) when:
 - any plan, scope version, derived object or model-work function exists

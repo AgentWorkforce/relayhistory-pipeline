@@ -1922,8 +1922,8 @@ END $scopeinstall$;
 -- Owner-only operational switch. OFF: abandon every in-flight build, then every live hook and read gate
 -- is inert (main behavior) with all ledgers kept. ON (from off): every installed scope is invalidated
 -- (set-based), because ACKs/controls while off were not tracked; its next build re-derives it. Lock
--- order: (ON only) session_index SHARE, seat clock, switch row, build rows (sorted) - the control's
--- order (session_index, then seat clock); begin/install take the switch row before any build row.
+-- order: seat clock, switch row, (ON only) session_index SHARE NOWAIT, build rows (sorted); begin/install
+-- take the switch row before any build row.
 -- Set-based invalidation of EVERY installed scope (the resume path): the same effects as
 -- ingest_history_invalidate_scope, in five statements instead of one loop iteration per scope. Called only
 -- by ingest_history_set_live(true), which holds the seat clock (no ACK/control runs) and the switch row FOR
@@ -1956,15 +1956,26 @@ LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp SET lock_timeout='5
 DECLARE w sessions.ingest_history_switch%ROWTYPE;n bigint:=0;v_builds uuid[];
 BEGIN
  IF p_live IS NULL THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: switch value required';END IF;
- -- Resume FIRST takes SHARE on session_index, BEFORE the seat clock: a lazy selection-disable/reset
- -- control takes ROW EXCLUSIVE on session_index (060000 retire-fence trigger) and then the seat clock, so
- -- this is the same order (no 40P01). SHARE waits out every session_index writer that began while OFF;
- -- later writers see live=true and are tracked, exactly as arming does. The function's own lock_timeout
- -- (5s) makes a contended switch fail fast instead of queueing live traffic; just retry it.
- IF p_live THEN LOCK TABLE sessions.session_index IN SHARE MODE;END IF;
+ -- A no-op (already in the requested state) takes no lock at all.
+ IF(SELECT x.live FROM sessions.ingest_history_switch x WHERE x.singleton)IS NOT DISTINCT FROM p_live THEN
+  RETURN jsonb_build_object('live',p_live,'changed',false);END IF;
+ -- Seat clock FIRST, as every ACK and the lazy batch claim take it. Main takes the seat clock and the
+ -- session_index write lock in BOTH orders (the lazy batch claim: seat clock, then a session_index UPDATE
+ -- via the retire-fence trigger; a lazy selection-disable/reset control: session_index, then the seat
+ -- clock), so no blocking position for the SHARE lock below is cycle-free. Resume therefore never WAITS
+ -- for session_index: it takes SHARE with NOWAIT and, if any writer holds it, fails with a retryable
+ -- 55P03 (nothing changed). SHARE then guarantees no writer that began while OFF is still uncommitted;
+ -- later writers see live=true and are tracked. The function's lock_timeout (5s) bounds the seat clock wait.
  PERFORM 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE;
  SELECT *INTO STRICT w FROM sessions.ingest_history_switch WHERE singleton FOR UPDATE;
  IF w.live=p_live THEN RETURN jsonb_build_object('live',p_live,'changed',false);END IF;
+ IF p_live THEN
+  BEGIN
+   LOCK TABLE sessions.session_index IN SHARE MODE NOWAIT;
+  EXCEPTION WHEN lock_not_available THEN
+   RAISE EXCEPTION USING ERRCODE='55P03',MESSAGE='history: session_index has an in-flight writer; nothing changed, retry ingest_history_set_live(true)';
+  END;
+ END IF;
  -- Both transitions abandon every in-flight build: one begun before OFF, or one that raced the switch
  -- and captured while OFF, saw changes no trigger fenced. Its builder starts again.
  SELECT array_agg(build_id)INTO v_builds FROM sessions.ingest_history_scope_builds WHERE state IN('keys','captured');

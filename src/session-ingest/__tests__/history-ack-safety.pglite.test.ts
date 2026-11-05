@@ -423,3 +423,25 @@ test("resume -> reinsert / update / delete over STALE refs left by OFF: every wr
   await backfill();
   await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
 });
+
+test("reinsert onto a different carrier over a stale ref: the OLD carrier is rescanned too (NEW-key stale-ref repair)", async () => {
+  const backfill = async () => { let c: unknown = null, n = 0; do { c = (await db.query<any>("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [c === null ? null : JSON.stringify(c)])).rows[0].c; n++; } while (c !== null && n < 100); };
+  const s = await scope(["k1"]);
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill();
+  const old = (await db.query<any>("SELECT f.carrier_sha256 k,c.epoch::text e FROM sessions.ingest_history_pointer_refs f JOIN sessions.ingest_history_carriers c USING(carrier_sha256) WHERE f.org_id=$1", [s.identity.orgId])).rows[0];
+  await db.query("UPDATE sessions.ingest_history_carriers SET scan_complete=true WHERE carrier_sha256=$1", [old.k]);
+  await db.query("SELECT sessions.ingest_history_set_live(false)");
+  await db.query("DELETE FROM sessions.session_index WHERE org_id=$1", [s.identity.orgId]);              // untracked: stale ref -> old carrier
+  await db.query("SELECT sessions.ingest_history_set_live(true)");
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...s.row, bucket: "moved-bucket", revision: 2 }])]);   // reinsert on a NEW carrier
+  const ref = (await db.query<any>("SELECT carrier_sha256 k,pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [s.identity.orgId])).rows;
+  expect(ref.length).toBe(1);
+  expect(ref[0].k).not.toBe(old.k);
+  expect(ref[0].r).toBe("2");
+  const after = (await db.query<any>("SELECT epoch::text e,scan_complete FROM sessions.ingest_history_carriers WHERE carrier_sha256=$1", [old.k])).rows[0];
+  expect(BigInt(after.e)).toBeGreaterThan(BigInt(old.e));                                                  // the old carrier must be rescanned
+  expect(after.scan_complete).toBe(false);
+  await backfill();
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});
