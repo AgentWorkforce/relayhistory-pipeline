@@ -1,5 +1,5 @@
 /**
- * Canonical four-pool proof — real PG/CH fixture variant.
+ * Canonical two-pool producer proof — real PG/CH fixture variant.
  * Drives publish+retire journal entries through copyCanonicalEntry into the
  * owned fixture CH database, then SELECTs back the ReplacingMergeTree rows
  * and asserts version-ordered semantics (stale fenced, tombstones retire).
@@ -7,11 +7,14 @@
  */
 import pg from "pg";
 import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { createClickHouseClient } from "../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { eventFeatureSchemaStatements } from "../src/search-features/event-schema.ts";
 import { briefFeatureSchemaStatements } from "../src/search-features/brief-schema.ts";
 import { copyCanonicalEntry } from "../src/search-features/canonical-cycle.ts";
 import { CanonicalJournalStore } from "../src/search-features/canonical-journal.ts";
+import { canonicalImageKey } from "../src/search-features/canonical-image-key.ts";
+import type { CanonicalPageAckPort } from "../src/search-features/canonical-version.ts";
 import { featureVersion } from "../src/search-features/source.ts";
 
 const [p, c, out] = process.argv.slice(2);
@@ -59,11 +62,12 @@ const stamp = "2026-10-30T10:00:00.000000Z";
 const REV = "1000001";
 const HASH = createHash("sha256").update("canonical-image").digest("hex");
 const GENERATION = createHash("sha256").update("generation").digest("hex");
-const IMAGE_KEY = "org:s-1";
 const SCOPE = { orgId: "org", workspaceId: "ws", harness: "h",
   sessionId: "s-1", generation: GENERATION };
-const AUTH = { epoch: "1", fingerprint: HASH };
-const PTR = { hash: "p".repeat(64), count: 1 };
+const AUTHORITY_ID = "12345678-1234-1234-1234-123456789012";
+const IMAGE_KEY = canonicalImageKey(SCOPE, AUTHORITY_ID);
+const AUTH = { authorityId: AUTHORITY_ID, epoch: "1", fingerprint: HASH };
+const PTR = { authorityId: AUTHORITY_ID, hash: "c".repeat(64), count: "1" };
 const page = (rows: unknown[], cursor: string | null = null) => ({
   rows, cursor, source: IMAGE_KEY, pointerSetHash: PTR.hash,
   pageSha256: createHash("sha256").update(JSON.stringify(rows)).digest("hex") });
@@ -93,17 +97,22 @@ const imagePort = {
   imageDescriptor: async () => ({ imageKey: IMAGE_KEY, sourceHash: HASH,
     pointerSetHash: PTR.hash, complete: true }),
 };
-const acks = { ackPage: async () => {}, finish: async () => {} };
-for (const [revision, kind, prior] of [
-  [REV, "publish", null],
-  ["1000002", "retire", AUTH],
+const acks: CanonicalPageAckPort = {
+  begin: async () => "started",
+  ackPage: async () => {},
+  resumeCursor: async () => ({ state: "empty", cursor: null }),
+  finish: async () => {},
+};
+for (const [revision, kind] of [
+  [REV, "publish"],
+  ["1000002", "retire"],
 ] as const)
   await pool.query(
     "INSERT INTO sessions.canonical_feature_journal VALUES(" +
       "$1::bigint,$2,'org','ws',$3::jsonb,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb)",
     [revision, kind, JSON.stringify(SCOPE), GENERATION, IMAGE_KEY, HASH,
-      prior ? HASH : null, JSON.stringify(AUTH),
-      prior ? JSON.stringify(prior) : null, JSON.stringify(PTR)]);
+      kind === "retire" ? PTR.hash : null, JSON.stringify(AUTH),
+      null, JSON.stringify(PTR)]);
 const journal = await new CanonicalJournalStore({
   query: async <T>(text: string, params?: unknown[]) => ({
     rows: (await pool.query(text, params)).rows as T[],
@@ -113,10 +122,10 @@ if (journal.entries.length !== 2 || journal.hasMore)
   throw Error("journal read proof incomplete");
 const [publishEntry, retireEntry] = journal.entries;
 const pub = await copyCanonicalEntry(imagePort, acks, ch, { checkpoint: "0" },
-  publishEntry!);
+  publishEntry!, "canonical-two-pool-fixture");
 if (pub.kind !== "copied") throw Error("publish refused: " + pub.reason);
 const ret = await copyCanonicalEntry(imagePort, acks, ch,
-  { checkpoint: pub.checkpoint }, retireEntry!);
+  { checkpoint: pub.checkpoint }, retireEntry!, "canonical-two-pool-fixture");
 if (ret.kind !== "copied") throw Error("retire refused: " + ret.reason);
 const evRows = await ch.select<Record<string,unknown>>(
   "SELECT event_id,deleted,version,source_revision" +
@@ -133,5 +142,8 @@ ok(brRows.length === 1 && brRows[0]!.deleted === 1, "brief FINAL collapses to th
 ok(evRows.every((r) =>
     [featureVersion(REV), featureVersion("1000002")].includes(String(r.version))),
   "versions in managed space (live=1000001 tombstone=1000002)");
-console.log(JSON.stringify({ pass: true, events: evRows.length, briefs: brRows.length }));
+const evidence = { pass: true, scope: "synthetic-two-pool-producer",
+  events: evRows.length, briefs: brRows.length };
+writeFileSync(out, JSON.stringify(evidence, null, 2) + "\n", { flag: "wx" });
+console.log(JSON.stringify(evidence));
 await pool.end();

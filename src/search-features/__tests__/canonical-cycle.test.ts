@@ -1,27 +1,31 @@
+import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import { copyCanonicalEntry } from "../canonical-cycle.ts";
+import { canonicalImageKey } from "../canonical-image-key.ts";
 import type {
   CanonicalJournalEntry,
   CanonicalPageAckPort,
 } from "../canonical-version.ts";
 import { featureVersion } from "../source.ts";
-import { createHash } from "node:crypto";
 
-const HASH = "a".repeat(64);
-const SCOPE = { orgId: "org", workspaceId: "ws", harness: "h", sessionId: "s-1" };
-const AUTH = { epoch: "7", fingerprint: "f".repeat(64) };
-const PTR = { hash: "p".repeat(64), count: 1 };
+const HASH = "a".repeat(64), GEN = "e".repeat(64);
+const UID = "12345678-1234-1234-1234-123456789012";
+const SCOPE = { orgId: "org", workspaceId: "ws", harness: "h", sessionId: "s-1",
+  generation: GEN };
+const AUTH = { authorityId: UID, epoch: "7", fingerprint: HASH };
+const PTR = { authorityId: UID, hash: "c".repeat(64), count: "1" };
+const IMAGE = canonicalImageKey(SCOPE, UID);
 const REV = "1000001";
 const stamp = "2026-10-30T10:00:00.000000Z";
 
 const publish = (rev = REV): CanonicalJournalEntry => ({
-  kind: "publish", revision: rev, imageKey: "img-1",
-  schemaGeneration: "g1", sourceHash: HASH, scope: SCOPE,
+  kind: "publish", revision: rev, imageKey: IMAGE,
+  schemaGeneration: GEN, sourceHash: HASH, scope: SCOPE,
   sourceAuthority: AUTH, pointerSet: PTR,
 });
 const retire = (rev = "1000002"): CanonicalJournalEntry => ({
-  kind: "retire", revision: rev, imageKey: "img-1",
-  schemaGeneration: "g1", priorKeysetHash: HASH, scope: SCOPE,
+  kind: "retire", revision: rev, imageKey: IMAGE,
+  schemaGeneration: GEN, sourceHash: HASH, priorKeysetHash: PTR.hash, scope: SCOPE,
   priorSourceAuthority: AUTH, pointerSet: PTR,
 });
 const eventRow = {
@@ -38,9 +42,11 @@ const briefRow = {
   briefCompletedAt: stamp, embedding: null, embeddingModel: null,
   contentHash: "h",
 };
+const hashRows = (rows: unknown[]) =>
+  createHash("sha256").update(JSON.stringify(rows)).digest("hex");
 const page = (rows: unknown[], cursor: string | null = null) => ({
-  rows, cursor, source: "img-1", pointerSetHash: "p".repeat(64),
-  pageSha256: createHash("sha256").update(JSON.stringify(rows)).digest("hex"),
+  rows, cursor, source: IMAGE, pointerSetHash: PTR.hash,
+  pageSha256: hashRows(rows),
 });
 const images = (over: Partial<Record<string, unknown>> = {}) => ({
   imagePages: async (_e: CanonicalJournalEntry, kind: "event" | "brief", c: string | null) =>
@@ -52,8 +58,9 @@ const images = (over: Partial<Record<string, unknown>> = {}) => ({
         machineId: "m-1", kind: "session_event", eventId: "e-old", ts: stamp }] : [{
         orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" }], "done")
                : page([], null),
-  imageDescriptor: async () => ({ imageKey: "img-1", sourceHash: HASH,
-    pointerSetHash: "p".repeat(64), complete: true }),
+  imageDescriptor: async (e: CanonicalJournalEntry) => ({
+    imageKey: e.imageKey, sourceHash: HASH,
+    pointerSetHash: e.pointerSet.hash, complete: true }),
   ...over,
 });
 const fakeCH = () => {
@@ -69,6 +76,8 @@ const fakeAcks = () => {
   const a: CanonicalPageAckPort = {
     ackPage: async (i) => { acked.push(`${i.kind}:${i.cursor}`); },
     finish: async (i) => { finished.push(i); },
+    begin: async () => "started",
+    resumeCursor: async () => ({ state: "empty" as const, cursor: null }),
   };
   return { a, acked, finished };
 };
@@ -76,7 +85,7 @@ describe("canonical copy cycle (paged contract)", () => {
   test("publish drains all pages, acks each, finish CAS", async () => {
     const ch = fakeCH(), { a, acked, finished } = fakeAcks();
     const out = await copyCanonicalEntry(images(), a, ch,
-      { checkpoint: "0" }, publish());
+      { checkpoint: "0" }, publish(), "target-a");
     expect(out.kind).toBe("copied");
     expect(out.checkpoint).toBe(REV);
     const rows = ch.inserts.flat();
@@ -87,7 +96,7 @@ describe("canonical copy cycle (paged contract)", () => {
   test("retire pages prior keysets into tombstones", async () => {
     const ch = fakeCH(), { a } = fakeAcks();
     const out = await copyCanonicalEntry(images(), a, ch,
-      { checkpoint: "10" }, retire());
+      { checkpoint: "10" }, retire(), "target-a");
     expect(out.kind).toBe("copied");
     const rows = ch.inserts.flat();
     expect(rows.every((r) => r.deleted === 1)).toBe(true);
@@ -97,7 +106,7 @@ describe("canonical copy cycle (paged contract)", () => {
     const ch = fakeCH(), { a, acked } = fakeAcks();
     const out = await copyCanonicalEntry(images(), a, ch,
       { checkpoint: "10" },
-      { ...publish(), revision: "10" });
+      { ...publish(), revision: "10" }, "target-a");
     expect(out).toEqual({ kind: "refused", reason: "stale_revision" });
     expect(ch.inserts.length).toBe(0);
     expect(acked.length).toBe(0);
@@ -105,27 +114,36 @@ describe("canonical copy cycle (paged contract)", () => {
   test("changed descriptor refuses before any CH write", async () => {
     const ch = fakeCH(), { a, acked } = fakeAcks();
     const out = await copyCanonicalEntry(images({
-      imageDescriptor: async () => ({ imageKey: "img-1", sourceHash: HASH,
+      imageDescriptor: async () => ({ imageKey: IMAGE, sourceHash: HASH,
         pointerSetHash: "q".repeat(64), complete: true }),
-    }), a, ch, { checkpoint: "0" }, publish());
+    }), a, ch, { checkpoint: "0" }, publish(), "target-a");
     expect(out).toEqual({ kind: "refused", reason: "image_descriptor_changed" });
     expect(ch.inserts.length).toBe(0);
     expect(acked.length).toBe(0);
   });
-  test("changed page identity/hash and repeated cursor refuse", async () => {
+  test("changed page identity/hash and invalid cursor refuse", async () => {
     for (const bad of [
-      page([eventRow], "done"),
       { ...page([eventRow], "done"), source: "other" },
       { ...page([eventRow], "done"), pageSha256: "0".repeat(64) },
+      { ...page([eventRow], "done"), cursor: "" },
     ]) {
-      if (bad.source === "img-1" && bad.pageSha256 !== "0".repeat(64))
-        bad.cursor = "";
       const ch = fakeCH(), { a } = fakeAcks();
       const out = await copyCanonicalEntry(images({
         imagePages: async () => bad,
-      }), a, ch, { checkpoint: "0" }, publish());
+      }), a, ch, { checkpoint: "0" }, publish(), "target-a");
       expect(out).toEqual({ kind: "refused", reason: "image_page_changed" });
       expect(ch.inserts.length).toBe(0);
     }
+  });
+  test("retire refuses a descriptor from a different prior source", async () => {
+    const ch = fakeCH(), { a } = fakeAcks();
+    const out = await copyCanonicalEntry(images({
+      imageDescriptor: async (e: CanonicalJournalEntry) => ({
+        imageKey: e.imageKey, sourceHash: "b".repeat(64),
+        pointerSetHash: e.pointerSet.hash, complete: true,
+      }),
+    }), a, ch, { checkpoint: "0" }, retire(), "target-a");
+    expect(out).toEqual({ kind: "refused", reason: "image_descriptor_changed" });
+    expect(ch.inserts.length).toBe(0);
   });
 });

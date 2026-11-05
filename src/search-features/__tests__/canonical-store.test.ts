@@ -1,20 +1,25 @@
 import { describe, expect, test } from "bun:test";
 import { CanonicalJournalStore } from "../canonical-journal.ts";
+import { canonicalImageKey } from "../canonical-image-key.ts";
 
 const HASH = "a".repeat(64);
+const AUTHORITY_ID = "12345678-1234-1234-1234-123456789012";
+const SCOPE = { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s",
+  generation: HASH };
 const row = (revision: string, kind: "publish" | "retire" = "publish") => ({
   revision,
   kind,
-  scope: { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s",
-    generation: HASH },
+  org_id: SCOPE.orgId,
+  workspace_id: SCOPE.workspaceId,
+  scope: SCOPE,
   schema_generation: HASH,
-  image_key: "o:s",
+  image_key: canonicalImageKey(SCOPE, AUTHORITY_ID),
   source_hash: HASH,
   prior_keyset_hash: kind === "retire" ? "b".repeat(64) : null,
-  source_authority: { epoch: "1", fingerprint: HASH },
-  prior_source_authority: kind === "retire"
-    ? { epoch: "1", fingerprint: "b".repeat(64) } : null,
-  pointer_set: { hash: "c".repeat(64), count: "1" },
+  source_authority: { authorityId: AUTHORITY_ID, epoch: "1", fingerprint: HASH },
+  prior_source_authority: null,
+  pointer_set: { authorityId: AUTHORITY_ID,
+    hash: kind === "retire" ? "b".repeat(64) : "c".repeat(64), count: "1" },
 });
 const fakeDb = (table: ReturnType<typeof row>[]) => ({
   query: async <T>(_text: string, params: unknown[] = []) => ({
@@ -31,7 +36,7 @@ describe("canonical journal read store", () => {
       row("10"), row("20", "retire"),
     ])).entries("0", 10);
     expect(out.entries.map((entry) => entry.kind)).toEqual(["publish", "retire"]);
-    expect(out.entries[0]!.pointerSet.count).toBe(1);
+    expect(out.entries[0]!.pointerSet.count).toBe("1");
     expect(out.nextRevision).toBe("20");
     expect(out.hasMore).toBe(false);
   });
@@ -48,11 +53,12 @@ describe("canonical journal read store", () => {
 
   test("rejects invalid pages and untrusted journal shapes", async () => {
     const store = new CanonicalJournalStore(fakeDb([row("10")]));
-    await expect(store.entries("-1", 10)).rejects.toThrow("invalid_page");
-    await expect(store.entries("0", 0)).rejects.toThrow("invalid_page");
+    await expect(store.entries("-1", 10)).rejects.toThrow("journal_invalid_page");
+    await expect(store.entries("0", 0)).rejects.toThrow("journal_invalid_page");
     const invalid = row("10");
-    invalid.pointer_set = { hash: "not-a-hash", count: "1" };
+    invalid.pointer_set = { authorityId: AUTHORITY_ID,
+      hash: "not-a-hash", count: "1" };
     await expect(new CanonicalJournalStore(fakeDb([invalid])).entries("0", 10))
-      .rejects.toThrow("invalid_row");
+      .rejects.toThrow("journal_row_invalid");
   });
 });

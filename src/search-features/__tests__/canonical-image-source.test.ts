@@ -1,17 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { CanonicalImageSource } from "../canonical-image-source.ts";
+import { canonicalImageKey } from "../canonical-image-key.ts";
 import type { CanonicalJournalEntry } from "../canonical-version.ts";
 
-const SCOPE = { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s" };
-const AUTH = { epoch: "1", fingerprint: "a".repeat(64) };
-const PTR = { hash: "p".repeat(64), count: 2 };
+const GEN = "a".repeat(64), SOURCE = "b".repeat(64);
+const UID = "12345678-1234-1234-1234-123456789012";
+const SCOPE = { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s",
+  generation: GEN };
+const AUTH = { authorityId: UID, epoch: "1", fingerprint: SOURCE };
+const PTR = { authorityId: UID, hash: "c".repeat(64), count: "2" };
+const IMAGE = canonicalImageKey(SCOPE, UID);
 const entry = (kind: "publish" | "retire"): CanonicalJournalEntry =>
   kind === "publish"
-    ? { kind, revision: "10", imageKey: "img-1", schemaGeneration: "g",
-        sourceHash: "s".repeat(64), scope: SCOPE,
+    ? { kind, revision: "10", imageKey: IMAGE, schemaGeneration: GEN,
+        sourceHash: SOURCE, scope: SCOPE,
         sourceAuthority: AUTH, pointerSet: PTR }
-    : { kind, revision: "10", imageKey: "img-1", schemaGeneration: "g",
-        priorKeysetHash: "s".repeat(64), scope: SCOPE,
+    : { kind, revision: "10", imageKey: IMAGE, schemaGeneration: GEN,
+        sourceHash: SOURCE, priorKeysetHash: PTR.hash, scope: SCOPE,
         priorSourceAuthority: AUTH, pointerSet: PTR };
 const fakeMat = (pages: unknown[][]) => {
   let calls = 0;
@@ -24,7 +29,7 @@ const fakeMat = (pages: unknown[][]) => {
     priorKeys: async (_ik: string, _k: "event" | "brief", _c: string | null, _l: number) =>
       ({ rows: pages[0] ?? [], nextCursor: null }),
     descriptor: async (ik: string) => ({ imageKey: ik,
-      sourceHash: "s".repeat(64), pointerSetHash: PTR.hash, complete: true }),
+      sourceHash: SOURCE, pointerSetHash: PTR.hash, complete: true }),
   };
 };
 describe("canonical image source", () => {
@@ -49,7 +54,7 @@ describe("canonical image source", () => {
     const src = new CanonicalImageSource(fakeMat([]));
     const d = await src.imageDescriptor(entry("publish"));
     expect(d?.complete).toBe(true);
-    expect(d?.imageKey).toBe("img-1");
+    expect(d?.imageKey).toBe(IMAGE);
   });
   test("empty workspace remains a valid canonical identity", async () => {
     const src = new CanonicalImageSource(fakeMat([[{ workspaceId: "" }]]));

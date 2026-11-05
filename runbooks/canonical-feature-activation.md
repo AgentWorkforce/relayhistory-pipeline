@@ -25,7 +25,7 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 
 | ID | First-visible gate | Deliverable | Owner | Done evidence |
 | --- | --- | --- | --- | --- |
-| F1 | **REQUIRED** | Announced slim #230 (schema + production creator only), then restack #233 on its exact head | 620 creator agent; migration-completeness | Final base SHA; clean stacked diff; creator race suite |
+| F1 | **REQUIRED** | Announced slim #230 (schema + production creator only), then compose #233 on its exact merged head | 620 creator agent; migration-completeness | #230 head `6bce87c`, merged as main `233c62b`; creator/ACK/race reviews clear; #233 final diff still pending |
 | F2 | **REQUIRED** | Correct owner-only 610 ABI: explicit seed above drained legacy high-water; initial publish; atomic exact prior retirement then replacement publish; no raw pointer arrays in the journal | migration-completeness + supporter-cloud + 620 creator agent | Fresh and replacement transaction tests; missing-seed refusal; rollback emits no row; restricted-role ACL/rollback/sentinel checks |
 | F3 | **REQUIRED** | Publish new buffered uploads into ready canonical scopes and directory/replay authorities; drain only the bounded post-cutover catch-up for the canary scope | 620 creator agent (scope-build driver); bulls-migrator as production operator | Captured cutover high-water; zero unpublished/dirty rows for the selected scope; exact read hydration succeeds |
 | F4 | **REQUIRED** | Run a durable leased journal consumer with bounded 184 materialization, per-page ACKs, two-pool terminal finish CAS, retry/DLQ and metrics | migration-completeness + supporter-cloud | Restart/stale-worker tests; zero selected-scope journal backlog; immutable worker build identity |
@@ -49,33 +49,20 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 
 ## Publication authority
 
-- Merge and apply the 610/620 creator stack only in its planned generation
-  window. The owner-only journal append is composed into the final install CAS,
-  but schema presence alone is not activation.
-- Slim #230 at `a1ef796` is a hard hold despite its creator tests. Full-stack
-  probes show that 062000's native-slot triggers run on live ACKs while the
-  feature is nominally dormant: they can violate the directory short-summary
-  provenance constraint, blank legacy summaries before any 620 scope exists,
-  and return `40001` from a contended scope lock. Its rollback also refuses as
-  soon as the migration's own reconcile/required-scope rows exist. The 620
-  owner must keep legacy scopes behaviorally unchanged until a current 620
-  authority is installed, clear every summary provenance column atomically
-  when an active managed scope is invalidated, prevent invalidation contention
-  from failing ACKs, and supply a tested operational rollback that disables the
-  hooks without discarding retained authority/object obligations. Required
-  regressions: summarized live ACK, pre-install legacy summary write, contended
-  ACK/publication, active-scope invalidation, and rollback after queued work.
-- The creator-side replacement SQL at `0b359d6`/`d1f48fd` supersedes the broken
-  `8602ca9` proposal: an independent fresh PostgreSQL 17 run passed all seven
-  install races and the PGlite creator/610 suite passed 16/16. Composition is
-  still held on the consumer boundary. `dc44266` fixes the retire column,
-  read-only append and most shared types, but an actual PGlite JSONB row fails
-  because its decoder unconditionally parses already-decoded JSONB objects;
-  the public change port also still omits the prior pointer descriptor. It only
-  declares (but does not implement) idempotent `publishOnce`. The creator also
-  still needs disposition of exact source/scope key validation and same-
-  fingerprint self-retirement. The final pair must carry a verified descriptor
-  for each image without a visibility gap.
+- #230 head `6bce87c` is merged to main as `233c62b`; no Supabase migration was
+  applied. Its reviewed `20261105025000` writer and `20261105026000` install CAS
+  are the authority. They emit the `hs1` key, explicit authority ID, metadata-
+  only pointer set, ordered retire/publish pair, and refuse unseeded or
+  identical-content replacement. Apply them only in window #2.
+- #233 composes the cleared supporter consumer contract from `687e076`: parsed
+  and string JSONB both decode fail-closed, retire identity comes from
+  `source_authority`, publish prior fields are both-or-neither, and the
+  producer cannot append journal rows. The concrete TypeScript journal writer
+  remains retired; seed/allocation/CAS evidence comes from #230's SQL tests.
+- Durable page ACK/copy-state tables and `finish_canonical_copy` remain in
+  `docs/proposals/20261105025000_canonical_feature_journal.sql` until the
+  migration registry assigns their ledger slot. The code and synthetic PG17
+  proof do not authorize applying that proposal directly.
 - Define and rehearse the operator-only seed row. It must put the journal above
   the drained legacy feature high-water before any scope install or backfill;
   no data-plane identity may allocate or append revisions.
@@ -92,15 +79,18 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 
 ## Durable producer runtime
 
-- Add rollback, sentinel and restricted-role verification for the real 610
-  migration, including a producer read identity that cannot call the owner-only
-  wrapper or write the table directly.
+- The real 025000 writer has rollback, sentinel and restricted-role verification.
+  The producer identity can read journal/pointer pages but cannot call the
+  owner-only writer or mutate the journal. The companion ACK/finish DDL still
+  needs its registry-assigned migration, sentinel, rollback and ACL generation.
 - Supply the real bounded 184 materializer adapter for `rows`, `priorKeys` and
   the complete-image descriptor. Each page must retain the exact image,
   pointer-set and page hash checked by `copyCanonicalEntry`.
-- Implement the durable page-ack/terminal-finish store and a leased journal
-  consumer. Checkpoints advance only after both event and brief terminal pages,
-  current source CAS, and unchanged target/profile bindings.
+- `CanonicalPageAckStore` and the finish RPC contract implement revision-keyed,
+  immutable page chains, durable resume and two-pool terminal finish CAS. The
+  target binding requires a nonempty deployment `targetId` in addition to the
+  CH database/table identities. A supervised leased consumer, retry/DLQ and
+  metrics remain activation work; no package starts this runtime yet.
 - Implement the owner-only `publishOnce` backfill RPC behind the source port,
   then replace the JSONL-only helper with a durable resumable enumerator for the
   full corpus and catch-up. Replaying an image identity must return its existing
@@ -117,7 +107,10 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 - Publish and verify the exact source case-fold profile. Both event and brief
   pools must be complete, fresh, at the same observed revision and paired to
   the same source/target/profile identity before serving.
-- Complete the CH-only event-visibility subquery and four-pool reader wiring.
+- Canonical publication currently proves exactly two managed output pools:
+  event and semantic brief. Complete the directory-document pool, CH-only
+  event-visibility subquery and four-pool reader wiring before claiming reader
+  parity.
   Preserve all legacy filters, wildcard behavior, snapshot/cursor stability,
   deterministic ranking and exact hydration authority.
 - Provision the existing query-embedding provider/model binding. Canonical
