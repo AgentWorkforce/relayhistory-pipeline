@@ -77,6 +77,14 @@ jobs:
         run: |
           set -o pipefail
           bun scripts/pg-proof/role-proof.ts 2>&1 | tee pg-proof-pg${{ matrix.pg }}.log
+      - name: Canonical consumer lease proof (real PG, exact head)
+        env:
+          PGPROOF_SUPERUSER: postgres
+        run: |
+          set -o pipefail
+          bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |
+            tee consumer-lease-pg${{ matrix.pg }}.log
+          grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}.log
       - name: Check the results file names this head and this server
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
