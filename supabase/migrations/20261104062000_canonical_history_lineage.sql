@@ -1633,6 +1633,14 @@ BEGIN
  -- The fingerprint binds the snapshot that now names this authority as current and ready.
  v_fp:=encode(sha256(convert_to(sessions.session_replay_source_snapshot(b.org_id,b.workspace_id,b.harness,b.session_id)::text,'UTF8')),'hex');
  UPDATE sessions.ingest_history_scope_versions SET source_fingerprint=v_fp WHERE authority_id=v_id;
+ -- 610 compose point: the feature journal append is atomic with the pointer CAS above;
+ -- any later failure or rollback of this transaction emits nothing.
+ PERFORM sessions.canonical_feature_changed(
+  jsonb_build_object('orgId',b.org_id,'workspaceId',b.workspace_id,'harness',b.harness,'sessionId',b.session_id,'generation',b.generation),
+  jsonb_build_object('epoch',v_epoch::text,'fingerprint',v_fp),
+  CASE WHEN cur IS NULL THEN NULL ELSE(SELECT jsonb_build_object('epoch',pv.source_epoch::text,'fingerprint',pv.source_fingerprint)
+   FROM sessions.ingest_history_scope_versions pv WHERE pv.authority_id=cur)END,
+  jsonb_build_object('hash',v_ptr,'count',jsonb_array_length(coalesce(v_snapshot->'pointers','[]'::jsonb))::text));
  UPDATE sessions.ingest_history_scope_builds SET state='installed',installed_authority_id=v_id,updated_at=clock_timestamp()WHERE build_id=b.build_id;
  RETURN jsonb_build_object('installed',true,'authorityId',v_id,'retiredAuthorityId',cur,
   'source',jsonb_build_object('epoch',v_epoch::text,'fingerprint',v_fp),'maskSha256',m.sha256,'recordCount',m.record_count::text);

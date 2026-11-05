@@ -114,3 +114,43 @@ test("only the ingest role may run the creator", async () => {
   try { await expect(db.query("SELECT sessions.ingest_history_scope_begin($1::jsonb)", [JSON.stringify({ generation: gen, identity: s.identity })])).rejects.toThrow(); }
   finally { await db.exec("ROLLBACK"); }
 });
+
+const journal = async (org: string) => (await db.query<any>("SELECT kind,source_authority,prior_source_authority,pointer_set,schema_generation FROM sessions.canonical_feature_journal WHERE org_id=$1 ORDER BY revision", [org])).rows;
+
+test("610 compose: a successful install appends exactly one publish entry bound to its source", async () => {
+  const s = await scope(["k1"]), r = await install((await build(s, ["k1"])).b, s);
+  const rows = await journal(s.identity.orgId);
+  expect(rows.length).toBe(1);
+  expect(rows[0]).toMatchObject({ kind: "publish", source_authority: r.source, prior_source_authority: null, schema_generation: gen });
+  expect(rows[0].pointer_set.count).toBe("1");
+});
+
+test("610 compose: a replacement appends one retire entry carrying the prior source", async () => {
+  const s = await scope(["k1"]);
+  const first = await install((await build(s, ["k1"])).b, s);
+  const second = await install((await build(s, ["k1"])).b, s, "22222222-2222-2222-2222-222222222222");
+  const rows = await journal(s.identity.orgId);
+  expect(rows.map((x) => x.kind)).toEqual(["publish", "retire"]);
+  expect(rows[1].source_authority).toEqual(second.source);
+  expect(rows[1].prior_source_authority).toEqual(first.source);
+});
+
+test("610 compose: a refused install and a rolled-back install emit no journal entry", async () => {
+  const s = await scope(["k1"]), { b } = await build(s, ["k1"]);
+  await db.query("SELECT sessions.ingest_history_invalidate_scope($1,$2,$3,$4)", [s.identity.orgId, s.identity.workspaceId, "claude", s.identity.sessionId]);
+  await expect(install(b, s)).rejects.toThrow("scope source changed since capture");
+  expect((await journal(s.identity.orgId)).length).toBe(0);
+  const t = await scope(["k1"]), built = (await build(t, ["k1"])).b;
+  await db.exec("BEGIN; SET LOCAL ROLE bulls96_session_ingest");
+  await db.query("SELECT sessions.ingest_history_scope_install($1::jsonb)", [JSON.stringify({ generation: gen, buildId: built.buildId, leaseToken: built.leaseToken, maskSha256: t.mask.sha256, recordCount: t.mask.count, derivedAnchorKey: t.anchor("12345678-1234-1234-1234-123456789abc"), bucket: "creator-fixture", region: "us-east-1", keyRoot: "96bulls" })]);
+  await db.exec("ROLLBACK");
+  expect((await journal(t.identity.orgId)).length).toBe(0);
+  expect((await db.query("SELECT count(*)::int n FROM sessions.ingest_history_scope_current WHERE org_id=$1", [t.identity.orgId])).rows[0]!.n).toBe(0);
+});
+
+test("610 compose: no role may append to the journal directly", async () => {
+  for (const role of ["bulls96_session_ingest", "session_directory_search_worker", "service_role"]) {
+    await db.exec("BEGIN; SET LOCAL ROLE " + role);
+    try { await expect(db.query("SELECT sessions.canonical_feature_changed('{}','{}',NULL,'{}')")).rejects.toThrow(); } finally { await db.exec("ROLLBACK"); }
+  }
+});

@@ -13,7 +13,7 @@ beforeAll(async () => {
   if (!url) return;
   admin = new pg.Client({ connectionString: url }); await admin.connect(); name = "scope_creator_" + crypto.randomUUID().replaceAll("-", "");
   await admin.query("CREATE DATABASE " + name); const u = new URL(url); u.pathname = "/" + name;
-  pool = new pg.Pool({ connectionString: u.href, max: 6 });
+  pool = new pg.Pool({ connectionString: u.href, max: 16 });
   await pool.query(read("supabase/tests/supabase_shim.sql")); await pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");
   for (const f of ["session_directory_search_worker.sql", "session_token_verifier.sql", "session_ingest_roles.sql"]) await pool.query(read("supabase/bootstrap/" + f));
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await pool.query(read("supabase/migrations/" + f));
@@ -89,5 +89,19 @@ test.skipIf(!url)("parallel installs of the same captured build: exactly one win
     expect(results.filter((r) => r.status === "fulfilled").length).toBe(1);
     for (const r of results) if (r.status === "rejected") expect(String((r.reason as Error).message)).toMatch(/scope build lease lost|logical scope busy/);
     expect((await pool.query("SELECT count(*)::int n FROM sessions.ingest_history_scope_versions WHERE org_id=$1", [s.identity.orgId])).rows[0].n).toBe(1);
+    expect((await pool.query("SELECT count(*)::int n FROM sessions.canonical_feature_journal WHERE org_id=$1", [s.identity.orgId])).rows[0].n).toBe(1);
+  } finally { for (const c of cs) c.release(); }
+});
+
+test.skipIf(!url)("parallel installs of different scopes get distinct, gap-free journal revisions", async () => {
+  const scopes = await Promise.all([0, 1, 2, 3, 4, 5].map(() => scope()));
+  const builds = await Promise.all(scopes.map((s) => captured(s)));
+  const before = (await pool.query("SELECT coalesce(max(revision),0)::int m FROM sessions.canonical_feature_journal")).rows[0].m;
+  const cs = await Promise.all(scopes.map(() => pool.connect()));
+  try {
+    const results = await Promise.allSettled(cs.map((c, i) => asIngest(c, () => call(c, "ingest_history_scope_install", installArgs(builds[i], scopes[i])))));
+    expect(results.every((r) => r.status === "fulfilled")).toBe(true);
+    const revs = (await pool.query("SELECT revision::int r FROM sessions.canonical_feature_journal WHERE revision>$1 ORDER BY revision", [before])).rows.map((x) => x.r);
+    expect(revs).toEqual(Array.from({ length: 6 }, (_, i) => before + 1 + i));
   } finally { for (const c of cs) c.release(); }
 });

@@ -17,6 +17,9 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.canonical_feature_changed(jsonb,jsonb,jsonb,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.canonical_remote(text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -164,6 +167,20 @@
     ],
     "sessions.ingest_fence_pairs(jsonb)": [
       "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_frozen_source_policy()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_frozen_source_privacy(text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_frozen_source_receipt(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_frozen_source_witness(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.ingest_history_control_changed()": [
       "<owner>:EXECUTE"
@@ -447,6 +464,14 @@
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_set_session_uploads(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_source_control_begin(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_source_control_complete(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],

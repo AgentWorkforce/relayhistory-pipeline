@@ -383,6 +383,24 @@ describe("search index from S3", () => {
     expect(await indexSearchScope(scope, searchDeps(ch.ch, sb.transact))).toMatchObject({ inserted: 0, deleted: 0, complete: true });
   });
 
+  test("rows of kinds S3 never carries survive a complete pass; erasure still removes them", async () => {
+    const ch = fakeClickHouse();
+    let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "one")])];
+    const sb = fakeSupabase(() => keys);
+    await indexSearchScope(scope, searchDeps(ch.ch, sb.transact));
+    // A row written by another ingest path (Neon tail) in a kind the exported stream never carries.
+    const base = ch.final()[0]!;
+    ch.rows.push({ ...base, kind: "tool_result", event_id: "tail:tr1", fingerprint: "neon-x" });
+    // A stale activity-kind row S3 no longer has is still removed.
+    ch.rows.push({ ...base, event_id: "tail:stale", fingerprint: "neon-y" });
+    expect(await indexSearchScope(scope, searchDeps(ch.ch, sb.transact))).toMatchObject({ complete: true, deleted: 1 });
+    expect(ch.final().some((r) => r.kind === "tool_result" && r.event_id === "tail:tr1")).toBe(true);
+    expect(ch.final().some((r) => r.event_id === "tail:stale")).toBe(false);
+    keys = [];
+    expect(await indexSearchScope(scope, searchDeps(ch.ch, sb.transact))).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect(ch.final()).toHaveLength(0);
+  });
+
   test("a retracted record, an edit and an erasure propagate; an incomplete read never deletes", async () => {
     const t = (s: number) => Date.parse(`2026-11-01T10:00:0${s}Z`);
     let keys = [await writeSession("srv_bb", [event("r1", "1", t(1), "one"), event("r2", "1", t(2), "two")])];
