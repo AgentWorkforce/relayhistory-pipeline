@@ -28,6 +28,8 @@ beforeEach(async () => {
   pg = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await pg.exec(readF("supabase/tests/supabase_shim.sql"));
   await pg.exec(readF("supabase/bootstrap/session_directory_search_worker.sql"));
+  await pg.exec(readF("supabase/bootstrap/session_token_verifier.sql"));
+  await pg.exec(readF("supabase/bootstrap/session_ingest_roles.sql"));
   for (const f of readdirSync(join(repo, "supabase/migrations")).sort()) await pg.exec(readF(`supabase/migrations/${f}`));
   for (const f of readdirSync(join(repo, "src/hoopdb/migrations")).filter((x) => x.endsWith(".sql")).sort()) await pg.exec(readF(`src/hoopdb/migrations/${f}`));
 }, 120_000);

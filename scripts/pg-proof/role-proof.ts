@@ -68,6 +68,12 @@ const BOOT = join(
   ROOT,
   "supabase/bootstrap/session_directory_search_worker.sql",
 );
+const TOKEN_VERIFIER_BOOT = join(
+  ROOT,
+  "supabase/bootstrap/session_token_verifier.sql",
+);
+// The session ingest roles: privileged, cluster-wide, before migrate (20261102010000 verifies).
+const INGEST_BOOT = join(ROOT, "supabase/bootstrap/session_ingest_roles.sql");
 const RUNTIME_BOOT = join(ROOT, "supabase/bootstrap/hoopdb_runtime_role.sql");
 const SUPABASE_RUNTIME_BOOT = join(
   ROOT,
@@ -531,6 +537,7 @@ await check(
       "g6_cloud_owner",
     );
     const phase1 = psql("g6_cloud", ["-f", BOOT], "g6_cloud_owner");
+    psql("g6_cloud", ["-f", TOKEN_VERIFIER_BOOT], "g6_cloud_owner");
     const env = {
       ...Object.fromEntries(
         gcpHoopdbModeEnv("g6_cloud_rt", true).map((e) => [e.name, e.value]),
@@ -572,9 +579,17 @@ await check(
       targets.every(
         (role) => role.memberships === 0 && role.rolbypassrls === false,
       );
+    const err = (...runs: { ok?: boolean; out?: string }[]) => {
+      for (const r of runs)
+        if (r && r.ok === false) {
+          const line = r.out?.split("\n").find((l) => /ERROR|FATAL|error/i.test(l));
+          return ` detail=${(line ?? r.out?.split("\n")[0] ?? "").slice(0, 300)}`;
+        }
+      return "";
+    };
     return [
       ok,
-      `bootstrap=${boot.ok} phase1=${phase1.ok} rerun=${again.ok} migrate=${fmt(m)} verdict=${fmt(v)} seed=${seed} targets=${fmt(targets)}`,
+      `bootstrap=${boot.ok} phase1=${phase1.ok} rerun=${again.ok} migrate=${fmt(m)} verdict=${fmt(v)} seed=${seed} targets=${fmt(targets)}${err(boot, phase1, again)}`,
     ];
   },
 );
@@ -601,8 +616,15 @@ if (
   !psql("postgres", ["-f", join(ROOT, "supabase/tests/supabase_shim.sql")]).ok
 )
   throw new Error("shim setup failed");
+if (
+  !psql("postgres", ["-f", BOOT]).ok ||
+  !psql("postgres", ["-f", TOKEN_VERIFIER_BOOT]).ok
+)
+  throw new Error("role bootstrap failed");
 if (!psql("postgres", ["-f", BOOT]).ok)
   throw new Error("worker bootstrap failed");
+if (!psql("postgres", ["-f", INGEST_BOOT]).ok)
+  throw new Error("session ingest roles bootstrap failed");
 
 await fresh("g6_boot");
 await check(
@@ -817,6 +839,7 @@ await check(
       )
     ).rows[0].n;
     psql("postgres", ["-f", BOOT]);
+    psql("postgres", ["-f", TOKEN_VERIFIER_BOOT]);
     return [ok && short === 0, `${fmt(m)} short_summary_columns=${short}`];
   },
 );

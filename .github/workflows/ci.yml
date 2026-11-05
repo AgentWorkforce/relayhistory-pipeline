@@ -8,7 +8,7 @@ permissions:
 jobs:
   checks:
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    timeout-minutes: 40
     # A real ClickHouse for the session read API's query tests
     # (src/session-read-api/__tests__/page.clickhouse.test.ts), the version the
     # search proofs pin. Test-only credentials; no production data.

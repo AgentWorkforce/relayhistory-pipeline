@@ -114,6 +114,9 @@ interface ScopeIdentity {
   fingerprint: string;
 }
 
+/** Kinds projectRelayhistorySession always derives from exported delivery records (its ACTIVITY_KINDS). */
+export const S3_ACTIVITY_KINDS = ["history", "session_event", "tool_call", "file_edit", "trajectory"] as const;
+
 const SEP = "\u001f";
 const keyOf = (i: Pick<ScopeIdentity, "machineId" | "source" | "kind" | "eventId">) =>
   [i.machineId, i.source, i.kind, i.eventId].join(SEP);
@@ -286,9 +289,15 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if (!complete) await invalidateDirectoryEvents(tx, scope);
     if (complete) {
       const wanted = new Map(inWindow.map((r) => [keyOf({ machineId: r.machine_id, source: r.source, kind: r.kind, eventId: r.event_id }), r]));
+      // Only kinds this pass can regenerate from S3 are diffed. ClickHouse also holds rows of
+      // kinds the exported delivery stream never carries (e.g. tool_result/user/assistant from
+      // other ingest paths); absent from S3 is not "retracted" for those, so they are kept.
+      // Erasure (no live pointer, above) still removes every kind of the scope.
+      const regenerable = new Set<string>([...S3_ACTIVITY_KINDS, ...inWindow.map((r) => r.kind)]);
       for (const [key, list] of existing) {
         const current = wanted.get(key);
         for (const c of list) {
+          if (!regenerable.has(c.kind)) continue;
           if (!current || current.session_id !== c.sessionId || current.workspace_id !== c.workspaceId || tsMillis(`${current.ts.replace(" ", "T")}Z`) !== c.tsMs)
             deletes.push({ orgId: scope.orgId, sessionId: c.sessionId, identity: c } as PendingDelete);
         }

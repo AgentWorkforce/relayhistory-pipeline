@@ -7,6 +7,7 @@
  */
 import {
   pointerFields,
+  postgresPipelineQueue,
   type ManifestReader,
   type PipelineQueue,
   type RawPointer,
@@ -14,7 +15,8 @@ import {
   type StageMessage,
   type TraceContext,
 } from "../shared/vendor.ts";
-import type { HoopDb } from "../shared/db.ts";
+import type { HoopDb,Transact } from "../shared/db.ts";
+import {publicationEvidence,withPublicationAuthority}from "../shared/publication-authority.ts";
 import { ctxOf, enrichMessage, sessionExt } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { uuidv7 } from "../shared/ids.ts";
@@ -39,6 +41,8 @@ export interface IndexDeps {
   queue: PipelineQueue;
   /** The message being handled, so fan-out continues its trace and ids. */
   current: () => StageMessage | undefined;
+  /** Compiled schema identity and one short final metadata transaction. */
+  publication?:{schemaGeneration:string;transact:Transact};
   /**
    * Session briefs (src/session-brief): the wakeup debounce, or null when briefs are off.
    * Defaults to SESSION_BRIEF_ENABLED and its timings from env.
@@ -46,7 +50,9 @@ export interface IndexDeps {
   brief?: { idleSeconds: number; maxWaitSeconds: number } | null;
 }
 
-export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
+const ROW_IDENTITY=(p:{org_id:string;workspace_id:string;harness:string;session_id:string;machine_id:string})=>JSON.stringify([p.org_id,p.workspace_id,p.harness,p.session_id,p.machine_id]);
+export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {return sessionIndex(deps,false);}
+function sessionIndex(deps:IndexDeps,authorized:boolean):SessionPointerIndex{
   const fromEnv = briefConfig();
   const brief =
     deps.brief !== undefined ? deps.brief : fromEnv.enabled ? fromEnv : null;
@@ -99,6 +105,23 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
       const read = await deps.reader.read(pointer.manifestKey);
       if (!read) return { status: "skipped", reason: "manifest_missing" };
       const m = read.manifest;
+      if(!authorized&&deps.publication){
+        const config=deps.publication;
+        if(ROW_IDENTITY(pk)!==ROW_IDENTITY({org_id:ctx.orgId,workspace_id:m.session.workspace_id,harness:m.session.harness,session_id:m.session.session_id,machine_id:m.session.machine_id}))
+          throw Object.assign(Error("publication_pointer_identity"),{code:"publication_pointer_identity"});
+        const evidence=publicationEvidence(ctx.orgId,pointer.manifestKey,m,config.schemaGeneration);
+        // Hydration above; all later reads use the same immutable RAM manifest.
+        const cached:ManifestReader={provider:deps.reader.provider,bucket:deps.reader.bucket,async read(key){
+          if(key!==pointer.manifestKey)throw new Error("publication_cached_manifest_key");return read;
+        }};
+        const final=await withPublicationAuthority(config.transact,evidence,async tx=>{
+          const db={...deps.db,query:tx.query.bind(tx)}as HoopDb;
+          return sessionIndex({...deps,db,reader:cached,queue:postgresPipelineQueue(tx)},true).upsertRawPointer(pointer,ctx);
+        });
+        return final.current?final.value:{status:"skipped",reason:"publication_retired"};
+      }
+      if(!authorized&&pointer.manifestKey.includes('/upload-generations/'))
+        throw Object.assign(Error("publication_authority_unconfigured"),{code:"publication_authority_unconfigured"});
       const f = pointerFields(m);
       const ext = sessionExt(m);
       const canonical = canonicalManifestIdentity(m);

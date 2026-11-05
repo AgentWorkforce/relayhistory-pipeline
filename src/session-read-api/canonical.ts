@@ -1,3 +1,4 @@
+import {isManifestRest} from "../../packages/object-store/src/index.ts";
 /** Canonical S3 session projections, shared with the live S3 -> CH writer.
  * The successful claim-bound pointer RPC is the authentication boundary. No
  * object is read from an unverified JWT claim or caller-supplied object key.
@@ -170,7 +171,7 @@ export async function canonicalSnapshot(
           const at = parseSessionKey(key);
           if (
             !at ||
-            at.rest !== "manifest.json" ||
+            !isManifestRest(at.rest) ||
             !prefixAllowed(deps.prefix, at.prefix, identity.orgId)
           )
             throw new CanonicalReadError("prefix_mismatch");

@@ -8,6 +8,9 @@ import { sha256Hex } from "../../../packages/object-store/src/crypto.ts";
 import {
   computeContentSha256,
   manifestKey,
+  publicationManifestKey,
+  uploadGenerationPrefix,
+  readAll,
   objectKey,
   rawChunkKey,
   type ChunkEntry,
@@ -659,4 +662,19 @@ test("provider exposes scoped legacy table pages and explicit coverage without N
     table: "conversation_turns",
     row: { id: "id", content: "legacy body" },
   });
+});
+
+test("immutable publication snapshot uses existing canonical fold and generation-qualified raw namespace",async()=>{
+ const gen="12345678-1234-1234-1234-123456789abc",pub="abcdefab-1234-1234-1234-123456789abc";
+ const m=JSON.parse(new TextDecoder().decode(await readAll(await deps.store.get(objectKey(pointer.manifest_key))))) as ManifestV1;
+ const next={...location,prefix:uploadGenerationPrefix(location.prefix,gen)};
+ for(const entry of m.raw.chunks){
+  const bytes=await readAll(await deps.store.get(rawChunkKey(location,entry.seq,entry.start_offset,entry.sha256,"ndjson")));
+  await deps.store.put(rawChunkKey(next,entry.seq,entry.start_offset,entry.sha256,"ndjson"),bytes,{});
+ }
+ const key=publicationManifestKey(next,pub);
+ await deps.store.put(key,new TextEncoder().encode(JSON.stringify(m)),{});
+ pointer.manifest_key=String(key);
+ const result=await canonicalSnapshot(deps,identity);
+ expect(result.rows.filter(x=>x.table==="convergence_events").map(x=>x.row.content)).toEqual(["authoritative transcript","second transcript"]);
 });

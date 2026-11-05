@@ -1,8 +1,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import {
+  assertDestinationUrl,
+  type DestinationPolicy,
+} from "../shared/destination-url.ts";
 
 const execFileAsync = promisify(execFile);
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const MACHINE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 export interface BearerTokenProvider {
@@ -48,6 +51,8 @@ export interface RelayAuthAssertionConfig {
   machineId: string;
   sponsorId: string;
   apiKey: () => Promise<string>;
+  /** Transport policy for RELAYAUTH_URL and RELAYAUTH_HISTORY_ORIGIN. Default: https or loopback only. */
+  destinationPolicy?: DestinationPolicy;
   expiresInSeconds?: number;
   refreshSkewSeconds?: number;
   fetcher?: typeof fetch;
@@ -77,24 +82,17 @@ export class RelayAuthAssertionProvider implements BearerTokenProvider {
   #minting?: Promise<string>;
 
   constructor(cfg: RelayAuthAssertionConfig) {
-    const baseUrl = new URL(cfg.baseUrl);
-    const historyOrigin = new URL(cfg.historyOrigin);
-    if (
-      baseUrl.username ||
-      baseUrl.password ||
-      baseUrl.search ||
-      baseUrl.hash
-    ) {
+    const policy = cfg.destinationPolicy ?? { allowInClusterHttp: false };
+    assertDestinationUrl("RELAYAUTH_URL", cfg.baseUrl, policy);
+    // The audience binding stays an exact bare-origin match. The transport
+    // policy only decides which schemes/hosts may be named at all; it never
+    // derives or loosens the origin the assertion is bound to.
+    let historyOrigin: URL;
+    try {
+      historyOrigin = new URL(cfg.historyOrigin);
+    } catch {
       throw new Error(
-        "96bulls: RELAYAUTH_URL must not contain credentials, query or fragment",
-      );
-    }
-    if (
-      baseUrl.protocol !== "https:" &&
-      !(baseUrl.protocol === "http:" && LOOPBACK_HOSTS.has(baseUrl.hostname))
-    ) {
-      throw new Error(
-        "96bulls: RELAYAUTH_URL must use https (plain http is loopback-only)",
+        "96bulls: RELAYAUTH_HISTORY_ORIGIN must be an exact bare origin",
       );
     }
     if (
@@ -105,6 +103,9 @@ export class RelayAuthAssertionProvider implements BearerTokenProvider {
         "96bulls: RELAYAUTH_HISTORY_ORIGIN must be an exact bare origin",
       );
     }
+    assertDestinationUrl("RELAYAUTH_HISTORY_ORIGIN", cfg.historyOrigin, policy, {
+      allowPath: false,
+    });
     if (!MACHINE_ID.test(cfg.machineId) || cfg.machineId.startsWith("relay_"))
       throw new Error(
         "96bulls: MACHINE_ID must be 1-128 canonical ASCII characters",
@@ -211,6 +212,8 @@ export interface CloudSessionConfig {
   machineId: string;
   /** The enrolled user's Cloud credential. */
   cloudToken: () => Promise<string>;
+  /** Transport policy for CLOUD_URL. Default: https or loopback only. */
+  destinationPolicy?: DestinationPolicy;
   refreshSkewSeconds?: number;
   fetcher?: typeof fetch;
   now?: () => number;
@@ -232,18 +235,11 @@ export class CloudSessionAssertionProvider implements BearerTokenProvider {
   #minting?: Promise<string>;
 
   constructor(cfg: CloudSessionConfig) {
-    const base = new URL(cfg.baseUrl);
-    if (base.username || base.password || base.search || base.hash)
-      throw new Error(
-        "96bulls: CLOUD_URL must not contain credentials, query or fragment",
-      );
-    if (
-      base.protocol !== "https:" &&
-      !(base.protocol === "http:" && LOOPBACK_HOSTS.has(base.hostname))
-    )
-      throw new Error(
-        "96bulls: CLOUD_URL must use https (plain http is loopback-only)",
-      );
+    assertDestinationUrl(
+      "CLOUD_URL",
+      cfg.baseUrl,
+      cfg.destinationPolicy ?? { allowInClusterHttp: false },
+    );
     if (!cfg.machineId)
       throw new Error(
         "96bulls: a Cloud session needs MACHINE_ID, the claimed fleet node id",
