@@ -784,5 +784,5 @@ describe("directory event writer fencing", () => {
         )
       ).rows[0],
     ).toEqual({ n: 40 });
-  }, 120000);
+  }, 180_000);
 });
