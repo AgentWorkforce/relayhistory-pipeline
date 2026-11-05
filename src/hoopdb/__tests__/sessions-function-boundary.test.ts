@@ -119,8 +119,9 @@ describe("unified sessions function-boundary generator", () => {
     await expect(generate(repo, LANES, [...VERIFIERS, VERIFIERS[0]!])).rejects.toThrow("is configured twice");
   });
 
-  test("the empty read-api and canonical-project-events slots are present and inert", () => {
+  test("the empty canonical-project-events slot is present and inert; read-api is filled (#236)", () => {
     const slots = LANES.filter((l) => l.migration === null).map((l) => l.lane).sort();
-    expect(slots).toEqual(["canonical-project-events", "read-api"]);
+    expect(slots).toEqual(["canonical-project-events"]);
+    expect(LANES.find((l) => l.lane === "read-api")?.migration).toBe("supabase/migrations/20261105029000_session_directory_read_api.sql");
   });
 });
