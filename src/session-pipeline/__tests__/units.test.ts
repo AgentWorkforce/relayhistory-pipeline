@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { signV4 } from "../aws-json.ts";
 import { decodeS3Key, parseQueueBody, sequencerAfter } from "../s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
-import { analysisDeps, analysisSourceReadonlyUrl, handler, lambdaEnv, parseSecret, runtimeFromSecret, semanticCopyDeps } from "../lambda.ts";
+import { analysisDeps, analysisSourceReadonlyUrl, handler, lambdaEnv, parseSecret, runtimeFromSecret, semanticCopyDeps, semanticTickState } from "../lambda.ts";
 import { processBatch } from "../consumer.ts";
 import { semanticFailureReason } from "../../search-features/semantic-copy-job.ts";
 import { searchIndexLimits, SEARCH_INDEX_DEFAULT_LIMITS, REPLAY_SEARCH_INDEX_LIMITS } from "../search-index.ts";
@@ -351,5 +351,15 @@ describe("semantic copier config is validated only in the semantic-copy branch",
       else process.env.SESSION_SEMANTIC_COPY_ENABLED = saved.e;
       if (saved.r !== undefined) process.env.AWS_REGION = saved.r;
     }
+  });
+});
+
+describe("semanticTickState", () => {
+  const s = (failed: number, e: boolean, b: boolean, er: string, br: string) => semanticTickState({ failed, eventComplete: e, briefComplete: b, reasons: { event: er, brief: br } });
+  test("derives failed, complete, idle and continuation", () => {
+    expect(s(1, true, true, "idle", "idle")).toBe("failed");
+    expect(s(0, true, true, "idle", "idle")).toBe("complete");
+    expect(s(0, false, false, "idle", "complete")).toBe("idle");
+    expect(s(0, false, false, "idle", "paged")).toBe("continuation");
   });
 });

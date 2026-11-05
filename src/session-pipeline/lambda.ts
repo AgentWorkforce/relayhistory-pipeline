@@ -515,6 +515,13 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
   return { ...summary, link };
 }
 
+export function semanticTickState(stats:{failed:number;eventComplete:boolean;briefComplete:boolean;reasons:{event:string;brief:string}}):"failed"|"complete"|"idle"|"continuation"{
+  if(stats.failed>0)return "failed";
+  if(stats.eventComplete&&stats.briefComplete)return "complete";
+  const quiet=(r:string)=>r==="idle"||r==="complete";
+  return quiet(stats.reasons.event)&&quiet(stats.reasons.brief)?"idle":"continuation";
+}
+
 type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; analysisCache?:unknown; analysisCacheReconcile?:unknown; analysisCursor?:unknown; semanticCopy?:unknown; cursor?: string; since?: string; link?: number };
 
 export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok: boolean }> {
@@ -522,7 +529,7 @@ export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok:
     // Default off before secret lookup, connection pools or source access.
     if(process.env.SESSION_SEMANTIC_COPY_ENABLED!=="1")return {ok:true};
     const started=Date.now();try{const rt=await ready();const stats=await semanticCopyDeps(rt)();
-      log.info("semantic copy tick",{stage:"semantic-copy",count:stats.published,claimed:stats.pages,failed:stats.failed,ok:stats.failed===0,state:stats.eventComplete&&stats.briefComplete?"complete":"continuation",reason:`event:${stats.reasons.event};brief:${stats.reasons.brief}`,duration_ms:Date.now()-started});
+      log.info("semantic copy tick",{stage:"semantic-copy",count:stats.published,claimed:stats.pages,failed:stats.failed,ok:stats.failed===0,state:semanticTickState(stats),reason:`event:${stats.reasons.event};brief:${stats.reasons.brief}`,duration_ms:Date.now()-started});
       return {ok:stats.failed===0};
     }catch(error){log.error("semantic copy tick failed",{stage:"semantic-copy",...errorFields(error),reason:semanticFailureReason(error),duration_ms:Date.now()-started});return {ok:false};}
   }

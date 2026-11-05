@@ -94,8 +94,7 @@ export async function runSemanticCopyTick(deps: {
                 continue;
             }
             if (result.status === "idle") {
-                if (stats.reasons[kind] === "not_run")
-                    stats.reasons[kind] = "idle";
+                stats.reasons[kind] = "idle";
                 idle.add(kind);
                 continue;
             }
