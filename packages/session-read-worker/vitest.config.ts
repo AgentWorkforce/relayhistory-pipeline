@@ -30,6 +30,7 @@ export default defineConfig({
           SUPABASE: inject("pgReadUrl"),
           // Test-only: seeds pointer rows as the database owner.
           TEST_PG_ADMIN: inject("pgAdminUrl"),
+          TEST_INGEST_PG: inject("pgIngestUrl"),
         },
         bindings: {
           CLICKHOUSE_URL: inject("chUrl"),

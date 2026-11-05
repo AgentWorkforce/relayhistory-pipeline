@@ -189,6 +189,27 @@ describe("live (srv_) erasure", () => {
     await pg.close();
   });
 
+  test("the session ingest's staged batches of a tombstoned machine are erased after the redrive window (review Medium)", async () => {
+    const { pg, db } = await neon();
+    const store = createFsStore({ root: await tmp() });
+    const staged = `96bulls/org-1/live-batches/v1/ws=ws_1/m=${M}/b=${"a".repeat(32)}-${"b".repeat(16)}.staged.ndjson.zst`;
+    const marker = `96bulls/org-1/live-batches/v1/ws=ws_1/m=${M}/b=${"a".repeat(32)}.json`;
+    const otherMachine = `96bulls/org-1/live-batches/v1/ws=ws_1/m=${liveMachineId("ws/1", "origin-1", "user-2")}/b=${"c".repeat(32)}-${"d".repeat(16)}.staged.ndjson.zst`;
+    await put(store, [...WORKER_KEYS, POINTER, staged, marker, otherMachine]);
+    await tombstone(pg, GROUP);
+    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    // Within the window: the session goes at once, the staged batch waits (its fan-out may still be redriven).
+    const soon = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
+    await soon.sweep();
+    expect(await keys(store)).toEqual([marker, otherMachine, staged].sort());
+    // Past it (the session's own objects already gone): the tombstone is revisited for the staged batch.
+    const past = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, () => Date.now() + 49 * 60 * 60 * 1000, async () => {});
+    await past.sweep();
+    expect(await keys(store)).toEqual([marker, otherMachine].sort());
+    state.close();
+    await pg.close();
+  });
+
   test("a tombstone with no live pointer costs no session listing", async () => {
     const { pg, db } = await neon();
     const store = createFsStore({ root: await tmp() });
@@ -203,7 +224,8 @@ describe("live (srv_) erasure", () => {
     const state = new SyncState(join(await tmp(), "s.sqlite"));
     const job = new ErasureJob(db, state, counting, () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.sweep();
-    expect(calls).toEqual({ list: 2, dir: 0 });
+    // Once per (workspace, user, origin) and page: objects, pointers and the session ingest's staged batches.
+    expect(calls).toEqual({ list: 3, dir: 0 });
     state.close();
     await pg.close();
   });
