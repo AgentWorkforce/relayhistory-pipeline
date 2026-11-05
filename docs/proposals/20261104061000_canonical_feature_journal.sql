@@ -28,3 +28,19 @@ CREATE INDEX canonical_feature_journal_kind_rev
 -- set — no dangling image/pointer references.
 CREATE INDEX canonical_feature_journal_org_time
   ON sessions.canonical_feature_journal (org_id, recorded_at);
+
+-- Companion producer-side state (the consumer's own ledger — NOT the journal).
+CREATE TABLE sessions.canonical_feature_page_ack(
+  image_key text NOT NULL, pool text NOT NULL, cursor text NOT NULL,
+  page_sha256 text NOT NULL,
+  acked_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (image_key, pool, cursor));
+CREATE TABLE sessions.canonical_feature_copy_state(
+  image_key text PRIMARY KEY, entry_revision text NOT NULL,
+  terminal_event text, terminal_brief text,
+  source_authority jsonb, profile_binding text,
+  finished boolean NOT NULL DEFAULT false);
+REVOKE ALL ON sessions.canonical_feature_page_ack,
+  sessions.canonical_feature_copy_state
+  FROM PUBLIC,anon,authenticated,service_role,
+  bulls96_session_ingest,bulls96_session_ingest_seeder;
