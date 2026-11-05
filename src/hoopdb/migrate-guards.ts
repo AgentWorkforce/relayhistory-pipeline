@@ -168,16 +168,21 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.backfill_session_brief_documents(integer)",
   "sessions.canonical_remote(text)",
   "sessions.capture_session_replay_pages(text,text,text,text)",
+  "sessions.claim_search_feature_copy(text,text,text,uuid)",
   "sessions.claim_session_analysis_cache()",
   "sessions.claim_session_brief_documents(uuid,integer)",
   "sessions.claim_session_large_read(uuid,integer)",
   "sessions.clean_root_commit(text)",
+  "sessions.commit_search_feature_copy(text,text,uuid,bigint,text,jsonb,timestamp with time zone)",
   "sessions.discover_session_large_reads()",
   "sessions.enqueue_session_analysis_cache(text,text,text,text)",
   "sessions.enqueue_session_large_read(text,text,text,text)",
+  "sessions.finish_search_feature_copy(text,text,uuid,bigint,text,text)",
   "sessions.finish_session_analysis_cache(text,text,text,text,bigint,text,uuid,text)",
+  "sessions.heartbeat_search_feature_copy(text,text,uuid,bigint)",
   "sessions.heartbeat_session_analysis_cache(text,text,text,text,bigint,text,uuid)",
   "sessions.heartbeat_session_large_read(text,text,text,text,uuid)",
+  "sessions.initialize_search_feature_baseline(text,text,uuid,bigint,text,bigint)",
   "sessions.jwt_org_id()",
   "sessions.jwt_workspace_ids()",
   "sessions.legacy_remote(text)",
@@ -186,6 +191,7 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.publish_session_analysis_cache(text,text,text,text,bigint,text,timestamp with time zone,text,text,text,text,text,text,integer,uuid)",
   "sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)",
   "sessions.publish_session_replay_pages(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer)",
+  "sessions.register_search_feature_source(text,text,text,text,text)",
   "sessions.repo_backfill_report()",
   "sessions.repo_backfill_step(integer,text)",
   "sessions.repo_group(text,uuid)",
@@ -1088,7 +1094,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "6eb64b1e447a7e9f4fa469364b3231cfb3809ece32af637cfd0413442f1cfc3c";
+  "d909ed6d739b6685433f4aef2ed1cb5d73c145e80ba92e1145487c123f4fc503";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
