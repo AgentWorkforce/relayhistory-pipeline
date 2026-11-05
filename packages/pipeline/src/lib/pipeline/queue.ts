@@ -24,6 +24,8 @@ import {
   type StageQueueDeps,
 } from "./dlq.js";
 import { PipelineError } from "./errors.js";
+import { createWorkerRuntime, type WorkSource } from "../../runtime/workers.js";
+import type { PipelineWork, WorkItemIdentity, WorkOutcome } from "../../runtime/contracts.js";
 import { isQueuedStage, STAGE_REGISTRY, type QueuedStage } from "./registry.js";
 
 export interface SendOptions {
@@ -183,122 +185,175 @@ type ClaimedJob = {
   message: unknown;
 };
 
+/** A started stage delivery; the original message remains opaque to the runtime. */
+export interface PostgresStageWorkItem extends WorkItemIdentity {
+  readonly type: "stage-message";
+  readonly message: unknown;
+  readonly deadLetter: boolean;
+}
+
+export interface PostgresStageConsumer {
+  readonly source: WorkSource<PostgresStageWorkItem>;
+  readonly work: PipelineWork<PostgresStageWorkItem>;
+  /** Statistics for the last claim batch, including claims whose lease was lost. */
+  result(): PollResult;
+}
+
+const emptyPollResult = (): PollResult => ({ claimed: 0, acked: 0, retried: 0, exhausted: 0 });
+
 /**
- * Claims up to `batchSize` visible jobs for one stage and runs them through
- * `handleStageQueue` one at a time, counting an attempt only when a job starts,
- * applying each ack or retry before the next starts, and renewing the lease on
- * the jobs still waiting, so a batch never outlives its claims. Call it on an interval (or in a loop while
- * `claimed > 0`); it never waits for work.
+ * Adapts the existing fenced queue lifecycle to the portable worker runtime.
+ * Claiming does not count an attempt. `start` renews waiting claims and starts
+ * one delivery; settlement is fenced by that delivery's original lease token.
+ * Keep this source/work pair with one binding. Separate consumers may share SQL.
  */
-export async function pollPostgresStage(
-  options: PostgresConsumerOptions,
-): Promise<PollResult> {
+export function postgresStageConsumer(options: PostgresConsumerOptions): PostgresStageConsumer {
   const jobs = table(options);
   const { sql, stage } = options;
   const leaseSeconds = Math.max(1, Math.floor(options.leaseSeconds ?? 300));
-  const maxAttempts = Math.max(
-    1,
-    options.maxAttempts ?? STAGE_REGISTRY[stage].maxAttempts,
-  );
-  const leaseId = crypto.randomUUID();
-  // The claim only leases the jobs; an attempt is counted when each one
-  // starts (below), so jobs that wait behind one that crashes its consumer do
-  // not spend their attempts without ever reaching a handler.
-  const { rows: claimed } = await sql.query<{ id: string }>(
-    `WITH next AS (
-       SELECT id FROM ${jobs}
-        WHERE stage = $1 AND visible_at <= now()
-        ORDER BY visible_at, id
-        LIMIT $2
-        FOR UPDATE SKIP LOCKED
-     )
-     UPDATE ${jobs} AS j
-        SET visible_at = now() + make_interval(secs => $3::integer),
-            lease_id = $4::uuid
-       FROM next
-      WHERE j.id = next.id
-     RETURNING j.id::text AS id`,
-    [stage, Math.max(1, options.batchSize ?? 10), leaseSeconds, leaseId],
-  );
-  const result: PollResult = {
-    claimed: claimed.length,
-    acked: 0,
-    retried: 0,
-    exhausted: 0,
+  const maxAttempts = Math.max(1, options.maxAttempts ?? STAGE_REGISTRY[stage].maxAttempts);
+  type Batch = { leaseId: string; ids: string[]; result: PollResult };
+  type Claim = { batch: Batch; index: number; row?: ClaimedJob; fatal?: { error: unknown }; leaveLeased?: boolean };
+  // Lease authority belongs to the claim object, never a mutable job id or body.
+  const claims = new WeakMap<PostgresStageWorkItem, Claim>();
+  let lastResult = emptyPollResult();
+  const owned = (item: PostgresStageWorkItem): Claim => {
+    const claim = claims.get(item);
+    if (!claim) throw new PipelineError("invalid_stage_claim", "unknown stage claim", false);
+    return claim;
   };
-  for (const [index, { id }] of claimed.entries()) {
-    // Earlier jobs took time: extend the claim on the ones still waiting.
-    if (index + 1 < claimed.length)
-      await sql.query(
+  const source: WorkSource<PostgresStageWorkItem> = {
+    async claim(max) {
+      const leaseId = crypto.randomUUID();
+      const { rows } = await sql.query<{ id: string }>(
+        `WITH next AS (
+           SELECT id FROM ${jobs}
+            WHERE stage = $1 AND visible_at <= now()
+            ORDER BY visible_at, id
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+         )
+         UPDATE ${jobs} AS j
+            SET visible_at = now() + make_interval(secs => $3::integer),
+                lease_id = $4::uuid
+           FROM next
+          WHERE j.id = next.id
+         RETURNING j.id::text AS id`,
+        [stage, Math.max(1, max), leaseSeconds, leaseId],
+      );
+      lastResult = { ...emptyPollResult(), claimed: rows.length };
+      const batch: Batch = { leaseId, ids: rows.map(r => r.id), result: lastResult };
+      return rows.map((row, index) => {
+        // These placeholders are never delivered to PipelineWork: start loads
+        // the message and counts the actual attempt immediately before handling.
+        const item: PostgresStageWorkItem = { type: "stage-message", id: row.id, attempt: 0, message: undefined, deadLetter: false };
+        claims.set(item, { batch, index });
+        return item;
+      });
+    },
+    async start(item) {
+      const claim = owned(item);
+      const { batch, index } = claim;
+      if (index + 1 < batch.ids.length) await sql.query(
         `UPDATE ${jobs}
             SET visible_at = now() + make_interval(secs => $3::integer)
           WHERE id = ANY($1::bigint[]) AND lease_id = $2::uuid`,
-        [claimed.slice(index + 1).map((r) => r.id), leaseId, leaseSeconds],
+        [batch.ids.slice(index + 1), batch.leaseId, leaseSeconds],
       );
-    // Start it: count the attempt and renew its lease. A main-queue job that
-    // already had every delivery it is allowed (its consumer died or overran
-    // the lease without an outcome) starts as a DLQ delivery instead, so a job
-    // that kills its consumer still reaches quarantine. No row: the lease was
-    // lost meanwhile and the job is someone else's now.
-    const {
-      rows: [row],
-    } = await sql.query<ClaimedJob>(
-      `UPDATE ${jobs}
-          SET dlq = dlq OR attempts >= $4,
-              attempts = CASE WHEN NOT dlq AND attempts >= $4 THEN 1
-                              ELSE attempts + 1 END,
-              visible_at = now() + make_interval(secs => $3::integer)
-        WHERE id = $1::bigint AND lease_id = $2::uuid
-        RETURNING id::text AS id, dlq, attempts, message`,
-      [id, leaseId, leaseSeconds, maxAttempts],
-    );
-    if (!row) continue;
-    let outcome: { retry?: number } | undefined;
-    // Main-queue and DLQ deliveries keep their Cloudflare queue names.
-    await handleStageQueue(
-      {
-        queue: stageQueueName(stage, row.dlq ? "-dlq" : ""),
-        messages: [
-          {
-            body: row.message,
-            attempts: row.attempts,
-            ack: () => {
-              outcome ??= {};
-            },
-            retry: (retry?: { delaySeconds?: number }) => {
-              outcome ??= { retry: retry?.delaySeconds ?? 0 };
-            },
-          },
-        ],
-      },
-      options.deps,
-    );
-    // Neither ack nor retry: leave the lease to run out and redeliver.
-    if (!outcome) continue;
-    if (outcome.retry === undefined) {
-      await sql.query(
-        `DELETE FROM ${jobs} WHERE id = $1::bigint AND lease_id = $2::uuid`,
-        [row.id, leaseId],
+      const { rows: [row] } = await sql.query<ClaimedJob>(
+        `UPDATE ${jobs}
+            SET dlq = dlq OR attempts >= $4,
+                attempts = CASE WHEN NOT dlq AND attempts >= $4 THEN 1
+                                  ELSE attempts + 1 END,
+                visible_at = now() + make_interval(secs => $3::integer)
+          WHERE id = $1::bigint AND lease_id = $2::uuid
+          RETURNING id::text AS id, dlq, attempts, message`,
+        [batch.ids[index], batch.leaseId, leaseSeconds, maxAttempts],
       );
-      result.acked += 1;
-      continue;
-    }
-    const exhausted = !row.dlq && row.attempts >= maxAttempts;
-    // An exhausted job becomes a DLQ delivery right away, with its own
-    // attempt count; a DLQ delivery retries until quarantine succeeds.
-    await sql.query(
-      `UPDATE ${jobs}
-          SET visible_at = now() + make_interval(secs => $3::integer),
-              lease_id = NULL,
-              dlq = dlq OR $4::boolean,
-              attempts = CASE WHEN $4::boolean THEN 0 ELSE attempts END
-        WHERE id = $1::bigint AND lease_id = $2::uuid`,
-      [row.id, leaseId, exhausted ? 0 : Math.floor(outcome.retry), exhausted],
-    );
-    if (exhausted) result.exhausted += 1;
-    else result.retried += 1;
-  }
-  return result;
+      if (!row) return undefined;
+      claim.row = row;
+      const started: PostgresStageWorkItem = { type: "stage-message", id: row.id, attempt: row.attempts, message: row.message, deadLetter: row.dlq };
+      claims.set(started, claim);
+      return started;
+    },
+    async settle(item, outcome) {
+      const claim = owned(item);
+      if (claim.fatal) throw claim.fatal.error;
+      if (claim.leaveLeased) return;
+      const { row, batch } = claim;
+      if (!row) throw new PipelineError("invalid_stage_claim", "stage delivery was not started", false);
+      if (outcome.status === "done") {
+        const { rows } = await sql.query(`DELETE FROM ${jobs} WHERE id = $1::bigint AND lease_id = $2::uuid RETURNING id`, [row.id, batch.leaseId]);
+        batch.result.acked += rows.length;
+        return;
+      }
+      const exhausted = !row.dlq && (outcome.status === "dead" || row.attempts >= maxAttempts);
+      const delay = outcome.status === "retry" ? Math.floor(outcome.delaySeconds) : 0;
+      const { rows } = await sql.query(
+        `UPDATE ${jobs}
+            SET visible_at = now() + make_interval(secs => $3::integer),
+                lease_id = NULL,
+                dlq = dlq OR $4::boolean,
+                attempts = CASE WHEN $4::boolean THEN 0 ELSE attempts END
+          WHERE id = $1::bigint AND lease_id = $2::uuid
+          RETURNING id`,
+        [row.id, batch.leaseId, exhausted ? 0 : delay, exhausted],
+      );
+      if (!rows.length) return;
+      if (exhausted) batch.result.exhausted += 1;
+      else batch.result.retried += 1;
+    },
+  };
+  const work: PipelineWork<PostgresStageWorkItem> = {
+    schedules: [],
+    async handle(items) {
+      const outcomes = new Map<string, WorkOutcome>();
+      for (const item of items) {
+        if (item.type !== "stage-message") {
+          outcomes.set(item.id, { status: "dead", code: "unsupported_stage_work" });
+          continue;
+        }
+        const claim = owned(item);
+        const row = claim.row;
+        if (!row) throw new PipelineError("invalid_stage_claim", "stage delivery was not started", false);
+        let decision: { retry?: number } | undefined;
+        try {
+          await handleStageQueue({
+            queue: stageQueueName(stage, row.dlq ? "-dlq" : ""),
+            messages: [{
+              body: row.message,
+              attempts: row.attempts,
+              ack: () => { decision ??= {}; },
+              retry: (retry?: { delaySeconds?: number }) => { decision ??= { retry: retry?.delaySeconds ?? 0 }; },
+            }],
+          }, options.deps);
+        } catch (error) {
+          // Preserve the old poller's fatal infrastructure-error boundary:
+          // leave this and later claims leased, abort this batch, let recovery
+          // redeliver them. The generic runtime's fallback must not ack them.
+          claim.fatal = { error };
+          throw error;
+        }
+        if (!decision) {
+          claim.leaveLeased = true;
+          continue;
+        }
+        outcomes.set(item.id, decision.retry === undefined
+          ? { status: "done" }
+          : { status: "retry", delaySeconds: decision.retry, code: "stage_retry" });
+      }
+      return outcomes;
+    },
+  };
+  return { source, work, result: () => ({ ...lastResult }) };
+}
+
+/** Compatibility entry point: the portable worker runtime now drives each delivery. */
+export async function pollPostgresStage(options: PostgresConsumerOptions): Promise<PollResult> {
+  const consumer = postgresStageConsumer(options);
+  const binding = createWorkerRuntime({ source: consumer.source, batchSize: options.batchSize ?? 10 }).bind(consumer.work);
+  await binding.tick();
+  return consumer.result();
 }
 
 /** Everything sent, by stage; `drain` runs it through the real consumer. */

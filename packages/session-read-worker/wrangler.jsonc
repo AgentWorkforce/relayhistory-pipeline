@@ -44,6 +44,11 @@
     // Fail closed until the deploy workflow sets them: no origin = every /v1
     // request 401; no completeSince = every request 503.
     "READ_API_ORIGIN": "",
-    "READ_API_COMPLETE_SINCE": ""
+    "READ_API_COMPLETE_SINCE": "",
+    // The directory list/activity canary allowlist (P3b). Empty = every workspace gets
+    // 501 directory_workspace_not_enabled (Cloud keeps its current path); "*" = all;
+    // else comma-separated workspace ids. The deploy workflow sets it from
+    // vars.SESSION_READ_DIRECTORY_WORKSPACES (unset = empty).
+    "READ_API_DIRECTORY_WORKSPACES": ""
   }
 }

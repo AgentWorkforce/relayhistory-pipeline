@@ -36,14 +36,22 @@ import * as AWS from "@alchemy.run/aws";
 import * as Effect from "effect/Effect";
 import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
+import{derivedSchemaBuildPlugin}from "./derived-schema-build.ts";
 
 export interface SessionPipelineInputs {
   /** Turn the ClickHouse stage on (SEARCH_INDEX_ENABLED=1). Off: pointers only. */
   searchIndex?: boolean;
   /** Default off; source identity must match the immutable CH copier binding. */
   semanticCopy?: {enabled:boolean;sourceId:string};
-  /** Default off. Requires separately reviewed normalized-prefix write/KMS permission and publication migration. */
+  /** Default off. `true` is refused until the reviewed normalized-prefix PutObject/KMS grant and publication migration exist. */
   replayPages?: boolean;
+  /** Dormant full v1 analysis-cache worker; separate readonly source secret required. */
+  analysisCache?: boolean;
+  /**
+   * Default off. `true` is refused until the forget/reproject fix (migration 20261105031000)
+   * lands and is reviewed (docs/session-desktop-catalog.md); SESSION_DESKTOP_CATALOG_ENABLED stays "0".
+   */
+  desktopCatalog?: boolean;
   /** Lambda concurrency cap from the queue (2-10). Default 4. */
   maxConcurrency?: number;
   /** Reconcile cadence in minutes (15-120). Default 30; lookback is twice this. */
@@ -89,6 +97,7 @@ export const SESSION_BRIEF_RESOURCES = ["session-brief-schedule", "session-brief
 export const SESSION_SEMANTIC_COPY_RESOURCES=["session-semantic-copy-schedule","session-semantic-copy-permission"] as const;
 /** The brief tick runs this often. */
 export const BRIEF_SCHEDULE_MINUTES = 1;
+export const SESSION_ANALYSIS_CACHE_RESOURCES=["session-analysis-cache-schedule","session-analysis-cache-permission","session-analysis-reconcile-schedule","session-analysis-reconcile-permission"] as const;
 
 /** Function timeout; the queue's visibility timeout is six times this (AWS guidance for SQS sources). */
 export const FUNCTION_TIMEOUT_SECONDS = 300;
@@ -132,9 +141,17 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
+  if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
+  // The pipeline role has only s3:ListBucket/GetObject: enabling the stage now would fail every replay put.
+  if (v.replayPages === true) refuse("transcriptStore.sessionPipeline.replayPages requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet");
+  // Same gap for the analysis cache: publications are normalized-prefix S3 writes the role cannot make yet.
+  if (v.analysisCache === true) refuse("transcriptStore.sessionPipeline.analysisCache requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet");
+  if (v.desktopCatalog !== undefined && typeof v.desktopCatalog !== "boolean") refuse("transcriptStore.sessionPipeline.desktopCatalog must be a boolean");
+  // SEARCH_INDEX_ENABLED=1 must never activate the desktop catalog writer; its own flag waits on 031000.
+  if (v.desktopCatalog === true) refuse("transcriptStore.sessionPipeline.desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
@@ -282,6 +299,9 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_PIPELINE_QUEUE_URL: i.names.queueUrl,
     SEARCH_INDEX_ENABLED: i.p.searchIndex ? "1" : "0",
     SESSION_REPLAY_PAGES_ENABLED: i.p.replayPages ? "1" : "0",
+    SESSION_ANALYSIS_CACHE_ENABLED:i.p.analysisCache?"1":"0",
+    // Always "0" while desktopCatalog: true is refused; lifting that refusal is a reviewed PR.
+    SESSION_DESKTOP_CATALOG_ENABLED: "0",
     SESSION_SEMANTIC_COPY_ENABLED:i.p.semanticCopy?.enabled?"1":"0",
     SESSION_SEARCH_FEATURE_SOURCE_ID:i.p.semanticCopy?.sourceId??"",
     PIPELINE_FANOUT: "off",
@@ -325,7 +345,7 @@ export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { b
     env: sessionPipelineEnv({ stage: i.stage, bucket: i.bucket, names, p: i.p }),
     logging: { retention: "30 days" },
     functionUrl: false as const,
-    build: { tsconfig: "tsconfig.json" },
+    build: { tsconfig: "tsconfig.json",plugins:[derivedSchemaBuildPlugin()] },
   };
 }
 
@@ -334,7 +354,7 @@ export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { b
  * and brief rules, this account) and the function's own role (the reconcile chain),
  * all `lambda:InvokeFunction` only. Nothing public, no Function URL action.
  */
-export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; semanticRuleArn?:string; roleArn: string }) {
+export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; analysisRuleArn?:string; analysisReconcileRuleArn?:string; semanticRuleArn?:string; roleArn: string }) {
   return [
     {
       id: "session-reconcile-permission",
@@ -366,6 +386,8 @@ export function sessionPipelinePermissions(i: { accountId: string; functionName:
         sourceAccount: i.accountId,
       },
     },
+    ...(i.analysisReconcileRuleArn?[{id:"session-analysis-reconcile-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisReconcileRuleArn,sourceAccount:i.accountId}}]:[]),
+    ...(i.analysisRuleArn?[{id:"session-analysis-cache-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisRuleArn,sourceAccount:i.accountId}}]:[]),
     ...(i.semanticRuleArn?[{id:"session-semantic-copy-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.semanticRuleArn,sourceAccount:i.accountId}}]:[]),
   ] as const;
 }
@@ -383,6 +405,15 @@ export function briefScheduleProps(i: { names: SessionPipelineNames; functionArn
     targets: [{ Id: "session-pipeline", Arn: i.functionArn, Input: JSON.stringify({ brief: true }) }],
     tags: i.tags,
   };
+}
+
+/** Disabled by default; source definition alone does not enable a running rule. */
+export function analysisCacheScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
+ return {name:i.names.rule+"-analysis-cache",description:"96bulls bounded demand analysis-cache refresh",scheduleExpression:"rate(1 minute)",state:i.p.analysisCache?"ENABLED" as const:"DISABLED" as const,targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({analysisCache:true})}],tags:i.tags};
+}
+
+export function analysisReconcileScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
+ return {name:i.names.rule+"-analysis-backfill",description:"96bulls bounded analysis-cache source discovery",scheduleExpression:"rate(30 minutes)",state:i.p.analysisCache?"ENABLED" as const:"DISABLED" as const,targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({analysisCacheReconcile:true})}],tags:i.tags};
 }
 
 /** One bounded background feature tick; defaults disabled and carries no credentials. */
@@ -447,12 +478,16 @@ export const sessionPipelineWiring = (
       tags: i.tags("session-pipeline"),
     } as never);
     const briefRule = yield* AWS.EventBridge.Rule("session-brief-schedule", briefScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
+    const analysisRule=yield* AWS.EventBridge.Rule("session-analysis-cache-schedule",analysisCacheScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
+    const analysisReconcileRule=yield* AWS.EventBridge.Rule("session-analysis-reconcile-schedule",analysisReconcileScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
     const semanticRule=yield* AWS.EventBridge.Rule("session-semantic-copy-schedule",semanticCopyScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
     for (const { id, props } of sessionPipelinePermissions({
       accountId: i.accountId,
       functionName: i.fn.functionName as unknown as string,
       ruleArn: (rule as unknown as { ruleArn: string }).ruleArn,
       briefRuleArn: (briefRule as unknown as { ruleArn: string }).ruleArn,
+      analysisRuleArn:(analysisRule as unknown as {ruleArn:string}).ruleArn,
+      analysisReconcileRuleArn:(analysisReconcileRule as unknown as {ruleArn:string}).ruleArn,
       semanticRuleArn:(semanticRule as unknown as {ruleArn:string}).ruleArn,
       roleArn,
     }))

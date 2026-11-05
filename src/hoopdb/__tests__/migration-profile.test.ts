@@ -36,6 +36,8 @@ import {
 } from "../migration-sentinels.ts";
 import {
   expectedSchema,
+  inspectMigrations,
+  migrationLedgerSha256,
   migrate,
   migrationProfile,
   plan,
@@ -1162,6 +1164,18 @@ describe("per-step catalog sentinels", () => {
         "utf8",
       ),
     );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_token_verifier.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
+        "utf8",
+      ),
+    );
     for (let i = 0; i <= upTo; i++)
       await db.exec(readFileSync(steps[i]!.path, "utf8"));
     await db.exec(`CREATE SCHEMA IF NOT EXISTS sessions; CREATE TABLE sessions.__96bulls_migrations (
@@ -1204,6 +1218,18 @@ describe("per-step catalog sentinels", () => {
     await db.exec(
       readFileSync(
         join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_token_verifier.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
       ),
     );
@@ -1310,6 +1336,18 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await db.exec(
       readFileSync(
         join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_token_verifier.sql"),
+        "utf8",
+      ),
+    );
+    await db.exec(
+      readFileSync(
+        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
       ),
     );
@@ -1465,6 +1503,50 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   };
   const platformList = [...SUPABASE_PLATFORM_SUPERUSERS];
 
+  test("window-two down/reapply through the real migrator: later migrations refuse out-of-order rollback and the next run restores the gap-free prefix", async () => {
+    const db = await supabaseLike();
+    await db.exec(OWNER_FN_DEFAULT_REVOKE);
+    expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
+    const B = "upstream:20261105024000_session_brief_documents.sql";
+    const J = "upstream:20261105025000_canonical_feature_journal.sql";
+    const L = "upstream:20261105026000_canonical_history_lineage.sql";
+    const C = "upstream:20261105030000_canonical_feature_consumer_acks.sql";
+    const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
+    const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
+    const rollback = (name: string) =>
+      db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8"));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C]));
+    expect(await passed()).toBe(true);
+    const outOfOrder = await failure(
+      rollback("20261105024000_session_brief_documents.down.sql"),
+    );
+    expect(outOfOrder?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C]));
+    // Later lanes roll back first and remove their own ledger rows; only then
+    // can the next down preserve a gap-free applied prefix.
+    await rollback("20261105030000_canonical_feature_consumer_acks.down.sql");
+    expect(await names()).not.toContain(C);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBeNull();
+    await rollback("20261105026000_canonical_history_lineage.down.sql");
+    expect(await names()).not.toContain(L);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBeNull();
+    await rollback("20261105025000_canonical_feature_journal.down.sql");
+    expect(await names()).not.toContain(J);
+    await rollback("20261105024000_session_brief_documents.down.sql");
+    expect(await names()).not.toContain(B);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBeNull();
+    // The very next migrate reapplies 024000, 025000, 026000 and 030000; the post-validation
+    // exact-ACL check finds no drift.
+    expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C]));
+    expect(await passed()).toBe(true);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBe("sessions.session_brief_document_scopes");
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBe("sessions.ingest_history_switch");
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBe("sessions.canonical_feature_copy_state");
+    // And a no-op rerun stays clean.
+    expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
+  });
+
   test("Cloud SQL trust root: only Google's fixed cloudsqladmin SUPERUSER is excluded in cloudsql mode", async () => {
     expect(Object.isFrozen(CLOUDSQL_PLATFORM_SUPERUSERS)).toBe(true);
     expect([...CLOUDSQL_PLATFORM_SUPERUSERS]).toEqual(["cloudsqladmin"]);
@@ -1552,6 +1634,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
         "utf8",
       )}`,
+    );
+    // As the superuser (cluster roles), then back to the role the test continues as.
+    await db.exec(
+      `RESET ROLE; ${readFileSync(
+        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
+        "utf8",
+      )}; SET ROLE migration_owner;`,
     );
     const targets = await db.query<{
       rolname: string;
@@ -1801,6 +1890,26 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       verified: false,
     });
     expect(await snapshot(db)).toEqual({ ledger: null, marker: null });
+  });
+
+  test("release read-only plan preserves the populated ledger/marker and reuses checksum/ACL guards", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    await runMigrations(client(db), { profile: SUPA_ET });
+    const before = await snapshot(db);
+    await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const report = await inspectMigrations(client(db), SUPA_ET);
+    await db.exec("ROLLBACK");
+    expect(report.inventory.every(s => !s.pending)).toBe(true);
+    expect(report.inventory.length).toBeGreaterThan(20);
+    expect(report.ledgerSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(await snapshot(db)).toEqual(before);
+    // The inspection cannot turn ledger drift into an apparently successful plan.
+    await db.exec("UPDATE sessions.__96bulls_migrations SET sha256 = repeat('0',64) WHERE name = (SELECT min(name) FROM sessions.__96bulls_migrations)");
+    await db.exec("BEGIN READ ONLY");
+    const error = await failure(inspectMigrations(client(db), SUPA_ET));
+    await db.exec("ROLLBACK");
+    expect(error?.code).toBe("migration_changed");
   });
 
   test("event-trigger mode (supabase): the reviewed bootstrap passes a fresh full migrate; the trigger enforces the boundary afterwards", async () => {
@@ -2099,6 +2208,24 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
             "utf8",
           ),
         );
+        await db.exec(
+          readFileSync(
+            join(
+              root,
+              "supabase/bootstrap/session_token_verifier.sql",
+            ),
+            "utf8",
+          ),
+        );
+        await db.exec(
+          readFileSync(
+            join(
+              root,
+              "supabase/bootstrap/session_ingest_roles.sql",
+            ),
+            "utf8",
+          ),
+        );
         await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
         await db.exec(
           readFileSync(
@@ -2121,6 +2248,25 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               join(
                 root,
                 "supabase/bootstrap/session_directory_search_worker.sql",
+              ),
+              "utf8",
+            ),
+          );
+        if (mode === "cloudsql")
+          await db.exec(
+            readFileSync(
+              join(
+                root,
+                "supabase/bootstrap/session_token_verifier.sql",
+              ),
+              "utf8",
+            ),
+          );
+          await db.exec(
+            readFileSync(
+              join(
+                root,
+                "supabase/bootstrap/session_ingest_roles.sql",
               ),
               "utf8",
             ),
@@ -2533,5 +2679,129 @@ describe("every worker claim path runs the live gate first", () => {
     ran.length = 0;
     expect(await workerTick(io)).toEqual({ claimed: 0, gated: true });
     expect(ran).toEqual([]);
+  });
+});
+
+describe("session token verifier phase 2", () => {
+  const VERIFY = "supabase/bootstrap/session_token_verifier_verify.sql";
+
+  test("wired: a clean migrate passes the verifier phase 2; a table grant on auth_sessions (drift) is caught", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    // The phase-2 file itself passes on a clean migrate.
+    await db.exec(readFileSync(join(root, VERIFY), "utf8"));
+    // Drift: a table grant the approved shape refuses.
+    await db.exec(
+      "GRANT SELECT ON sessions.auth_sessions TO session_token_verifier",
+    );
+    await expect(
+      db.exec(readFileSync(join(root, VERIFY), "utf8")),
+    ).rejects.toThrow(/session token verifier is not in the approved shape/);
+    // Wired: the next migrate runs phase 2 and fails closed as well.
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error).not.toBeNull();
+  });
+
+  test("the live gate and the migrator see the same verifier set: table-grant drift closes schemaVerdict", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const expected = await expectedSchema();
+    expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: true });
+    await db.exec(
+      "GRANT SELECT ON sessions.auth_sessions TO session_token_verifier",
+    );
+    const closed = await schemaVerdict(expected, transact(db));
+    expect(closed.ok).toBe(false);
+  });
+
+  test("PG17+: a direct or PUBLIC MAINTAIN grant is effective drift, caught by phase 2", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const v = Number(
+      (await db.query<{ v: string }>("SELECT current_setting('server_version_num') AS v")).rows[0].v,
+    );
+    if (v < 170000) return; // MAINTAIN does not exist before PG17
+    const verify = () => db.exec(readFileSync(join(root, VERIFY), "utf8"));
+    // Direct grant to the role: fails closed.
+    await db.exec(
+      "GRANT MAINTAIN ON sessions.auth_sessions TO session_token_verifier",
+    );
+    await expect(verify()).rejects.toThrow(
+      /session token verifier is not in the approved shape/,
+    );
+    await db.exec(
+      "REVOKE MAINTAIN ON sessions.auth_sessions FROM session_token_verifier",
+    );
+    await verify(); // clean again
+    // The same grant via PUBLIC is effective drift too.
+    await db.exec("GRANT MAINTAIN ON sessions.auth_sessions TO PUBLIC");
+    await expect(verify()).rejects.toThrow(
+      /session token verifier is not in the approved shape/,
+    );
+  });
+});
+
+describe("S3 proof seeder phase 2",()=>{
+ const verify="supabase/bootstrap/session_ingest_seeder_verify.sql";
+ test("OID comparison survives visible sessions schema and effective column drift closes live gate",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  await db.exec("SET search_path=sessions,public");
+  await db.exec(readFileSync(join(root,verify),"utf8"));
+  const expected=await expectedSchema();
+  expect(await schemaVerdict(expected,transact(db))).toEqual({ok:true});
+  await db.exec("GRANT SELECT(id) ON sessions.ingest_seed_captures TO PUBLIC");
+  expect((await schemaVerdict(expected,transact(db))).ok).toBe(false);
+ });
+ test("seeder failure cannot leave PASS after the other two verifiers succeeded",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  await db.exec("GRANT SELECT ON sessions.ingest_seed_captures TO bulls96_session_ingest_seeder");
+  const error=await failure(runMigrations(client(db),{profile:LOCAL}));
+  expect(error).not.toBeNull();
+  expect((await db.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0]).toEqual({status:"pending"});
+ });
+});
+
+describe("buffered ingest phase2",()=>{
+ test("direct ingest-only column drift closes live gate while unrelated role verifiers remain valid",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  const expected=await expectedSchema();
+  expect(await schemaVerdict(expected,transact(db))).toEqual({ok:true});
+  await db.exec("GRANT SELECT(stage_key) ON sessions.ingest_stage_intents TO bulls96_session_ingest");
+  for(const file of ["session_directory_search_worker_verify.sql","session_token_verifier_verify.sql","session_ingest_seeder_verify.sql"])
+   await db.exec(readFileSync(join(root,"supabase/bootstrap",file),"utf8"));
+  expect((await schemaVerdict(expected,transact(db))).ok).toBe(false);
+ });
+ test("ingest failure after all other verifiers leaves the generation marker pending",async()=>{
+  const db=await fresh();
+  const error=await failure(runMigrations(client(db),{profile:LOCAL,beforeVerify:async()=>{
+   await db.exec("GRANT SELECT ON sessions.ingest_stage_intents TO bulls96_session_ingest");
+  }}));
+  expect(error).not.toBeNull();
+  expect((await db.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0]).toEqual({status:"pending"});
+ });
+});
+
+describe("release pre-write fences", () => {
+  test("a changed planned ledger refuses before the first persistent write", async () => {
+    const db = await fresh();
+    let invoked = false;
+    const error = await failure(runMigrations(client(db), {
+      profile: LOCAL, steps: [], expectedLedgerSha256: "0".repeat(64),
+      beforeWrite: async () => { invoked = true; },
+    }));
+    expect(error?.code).toBe("release_ledger_changed");
+    expect(invoked).toBe(false);
+    expect(await snapshot(db)).toEqual({ledger:null,marker:null});
+  });
+  test("a revoked live release gate refuses under the lock before schema/marker creation", async () => {
+    const db = await fresh();
+    let invoked = false;
+    const error = await failure(runMigrations(client(db), {
+      profile: LOCAL, steps: [], expectedLedgerSha256:migrationLedgerSha256(new Map()),
+      beforeWrite: async () => { invoked = true; throw Object.assign(new Error("refused"),{code:"live_release_refused"}); },
+    }));
+    expect(error?.code).toBe("live_release_refused");
+    expect(invoked).toBe(true);
+    expect(await snapshot(db)).toEqual({ledger:null,marker:null});
   });
 });

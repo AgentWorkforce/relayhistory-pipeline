@@ -36,7 +36,7 @@ export interface ArtifactReadDeps {
 }
 export interface ArtifactQuery {
   table: string;
-  view?: "raw" | "replay" | "bounds" | "legacy";
+  view?: "raw" | "replay" | "bounds" | "legacy" | "analysis";
   limit: number;
   order?: "asc" | "desc";
   cursor?: string | null;
@@ -141,6 +141,79 @@ function cursorDecode(v: string): unknown {
     return fail("cursor", 400);
   }
 }
+/** Exact bytes are bounded and authenticated before JSON parsing. Used by both
+ * canonical row graphs and the analysis-cache wrapper, never arbitrary caller keys. */
+export function assertArtifactReference(
+  ref: unknown,
+  prefix: string,
+  max = ARTIFACT_MAX_OBJECT_BYTES,
+): asserts ref is ArtifactRef {
+  if (
+    !obj(ref) ||
+    typeof ref.key !== "string" ||
+    !ref.key.startsWith(prefix) ||
+    ref.key === prefix ||
+    /[\\%?#\u0000-\u0020]/u.test(ref.key) ||
+    ref.key.split("/").some((p) => p === "." || p === "..") ||
+    !hash(ref.sha256) ||
+    !count(ref.bytes) ||
+    ref.bytes === 0 ||
+    ref.bytes > max
+  )
+    fail("artifact_reference");
+}
+export async function readArtifactBytes(
+  deps: Pick<ArtifactReadDeps, "read" | "signal">,
+  ref: ArtifactRef,
+  prefix: string,
+  max = ARTIFACT_MAX_OBJECT_BYTES,
+) {
+  assertArtifactReference(ref, prefix, max);
+  const signal = deps.signal;
+  if (signal.aborted) fail("deadline");
+  const stream = await deps.read(ref.key, deps.signal);
+  const reader = stream.getReader();
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => {
+      reject(new CanonicalReadError("deadline"));
+      void reader.cancel().catch(() => {});
+    };
+  });
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+  const chunks: Uint8Array[] = [];
+  let n = 0;
+  try {
+    for (;;) {
+      const chunk = await Promise.race([reader.read(), aborted]);
+      if (chunk.done) break;
+      n += chunk.value.byteLength;
+      if (n > ref.bytes || n > max) fail("artifact_byte_bound");
+      chunks.push(chunk.value);
+    }
+    if (n !== ref.bytes) fail("artifact_byte_bound");
+    const data = new Uint8Array(n);
+    let offset = 0;
+    for (const c of chunks) {
+      data.set(c, offset);
+      offset += c.byteLength;
+    }
+    if ((await sha256Hex(data)) !== ref.sha256) fail("artifact_digest");
+    return data;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+export async function readArtifactJson(
+  deps: Pick<ArtifactReadDeps, "read" | "signal">,
+  ref: ArtifactRef,
+  prefix: string,
+) {
+  return decode(await readArtifactBytes(deps, ref, prefix));
+}
 interface Cursor {
   version: 1;
   identity: ArtifactIdentity;
@@ -187,7 +260,7 @@ export async function canonicalArtifactPage(
     const view = query.view ?? "raw",
       order = query.order ?? "asc";
     if (
-      !["raw", "replay", "bounds", "legacy"].includes(view) ||
+      !["raw", "replay", "bounds", "legacy", "analysis"].includes(view) ||
       !["asc", "desc"].includes(order) ||
       !Number.isInteger(query.limit) ||
       query.limit < 1 ||
@@ -196,6 +269,10 @@ export async function canonicalArtifactPage(
         query.table !== "convergence_events") ||
       (view === "legacy" &&
         !["conversation_turns", "session_links", "session_outcomes"].includes(
+          query.table,
+        )) ||
+      (view === "analysis" &&
+        !["session_analysis_requests", "session_analyses"].includes(
           query.table,
         )) ||
       (query.maxContent !== undefined &&
@@ -230,7 +307,9 @@ export async function canonicalArtifactPage(
       };
     }
     const ack = lookup,
-      storageView: ArtifactView = view === "legacy" ? "raw" : view;
+      storageView: ArtifactView = ["legacy", "analysis"].includes(view)
+        ? "raw"
+        : (view as ArtifactView);
     if (query.generation && query.generation !== ack.generation)
       fail("source_generation_changed");
     if (
@@ -241,59 +320,17 @@ export async function canonicalArtifactPage(
       fail("cursor", 400);
     let fetched = 0;
     function checkedRef(ref: unknown, max: number): asserts ref is ArtifactRef {
-      if (
-        !obj(ref) ||
-        typeof ref.key !== "string" ||
-        !ref.key.startsWith(ack.prefix) ||
-        ref.key === ack.prefix ||
-        /[\\%?#\u0000-\u0020]/u.test(ref.key) ||
-        ref.key.split("/").some((p) => p === "." || p === "..") ||
-        !hash(ref.sha256) ||
-        !count(ref.bytes) ||
-        ref.bytes === 0 ||
-        ref.bytes > max
-      )
-        fail("artifact_reference");
+      assertArtifactReference(ref, ack.prefix, max);
     }
     async function bytes(ref: ArtifactRef, max = ARTIFACT_MAX_OBJECT_BYTES) {
       checkedRef(ref, max);
       if (++fetched > MAX_FETCHES) fail("artifact_fetch_bound");
-      if (signal.aborted) fail("deadline");
-      const stream = await deps.read(ref.key, signal);
-      const reader = stream.getReader();
-      let onAbort!: () => void;
-      const aborted = new Promise<never>((_, reject) => {
-        onAbort = () => {
-          reject(new CanonicalReadError("deadline"));
-          void reader.cancel().catch(() => {});
-        };
-      });
-      signal.addEventListener("abort", onAbort, { once: true });
-      if (signal.aborted) onAbort();
-      const chunks: Uint8Array[] = [];
-      let n = 0;
-      try {
-        for (;;) {
-          const chunk = await Promise.race([reader.read(), aborted]);
-          if (chunk.done) break;
-          n += chunk.value.byteLength;
-          if (n > ref.bytes || n > max) fail("artifact_byte_bound");
-          chunks.push(chunk.value);
-        }
-        if (n !== ref.bytes) fail("artifact_byte_bound");
-        const data = new Uint8Array(n);
-        let offset = 0;
-        for (const c of chunks) {
-          data.set(c, offset);
-          offset += c.byteLength;
-        }
-        if ((await sha256Hex(data)) !== ref.sha256) fail("artifact_digest");
-        return data;
-      } finally {
-        signal.removeEventListener("abort", onAbort);
-        void reader.cancel().catch(() => {});
-        reader.releaseLock();
-      }
+      return readArtifactBytes(
+        { read: (key, signal) => deps.read(key, signal), signal },
+        ref,
+        ack.prefix,
+        max,
+      );
     }
     const loaded = decode(await bytes(ack.index));
     if (
@@ -320,6 +357,15 @@ export async function canonicalArtifactPage(
           ))
     )
       fail("artifact_coverage");
+    // The producer materializes session_timing only when legacy turn coverage is
+    // known (replay-publication.ts). Without it the table is absent by design:
+    // answer like the timing route (501 timing_turns_unknown), never a retryable 503.
+    if (
+      query.table === "session_timing" &&
+      index.legacyCoverage === null &&
+      !Object.hasOwn(index.tables, "session_timing")
+    )
+      throw new CanonicalReadError("timing_turns_unknown", 501);
     const selected = obj(index.tables[query.table])
       ? index.tables[query.table][storageView]
       : undefined;
@@ -679,6 +725,22 @@ export async function canonicalArtifactPage(
           MAX_REPLY_BYTES - replyBytes - 4096
       )
         break;
+      // A rowJson blob is the exact UTF-8 bytes of JSON.stringify(row), so the
+      // encoded reply item is strictly larger. Refuse (first row) or stop
+      // (later rows) on the declared size before allocating or fetching any
+      // segment; the post-hydrate size checks below stay authoritative.
+      // Views with a MAX_ROW_BYTES first-row allowance (analysis snapshots are
+      // bounded by their own ANALYSIS_MAX_SNAPSHOT_BYTES budget) are exempt.
+      if (
+        !["replay", "legacy", "analysis"].includes(view) &&
+        obj(entry) &&
+        obj(entry.rowJson) &&
+        count(entry.rowJson.bytes) &&
+        entry.rowJson.bytes > MAX_REPLY_BYTES - replyBytes - 4096
+      ) {
+        if (rows.length) break;
+        fail("row_bound");
+      }
       const row = await hydrate(entry),
         item = { table: query.table, row },
         size = encoder.encode(JSON.stringify(item)).byteLength;
@@ -693,7 +755,7 @@ export async function canonicalArtifactPage(
       if (
         !rows.length &&
         size >
-          (["replay", "legacy"].includes(view)
+          (["replay", "legacy", "analysis"].includes(view)
             ? MAX_ROW_BYTES
             : MAX_REPLY_BYTES - 4096)
       )

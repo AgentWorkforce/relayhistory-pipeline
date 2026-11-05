@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "kind": "private-ingest-operator-v1",
+  "stage": "cf-sessions-prod",
+  "generatedAt": "2026-11-05T01:28:08.924Z",
+  "generation": "b3c80dac859533aac3c896f525967323c82fedf0dc3a5423fc81f4a49f54c546",
+  "source": {
+    "commit": "5b1c449bad637cc5a3fc4722bdf7b6b262665e49",
+    "host": "linuyc"
+  },
+  "target": {
+    "accountId": "f7232cb80f6fab86a95426302af243e4",
+    "stateScript": "alchemy-state-store-96bulls",
+    "stateUrl": "https://alchemy-state-store-96bulls.agent-workforce.workers.dev",
+    "stateVersion": 7,
+    "controlStateSha256": "42b573e101616c6e1459e4e118507e1833db9574f7ac434843626d531b33b1eb",
+    "nativeBindingsSha256": "835318099a93cbae7bfe25940f9be60d3c6b69495ca80b94b0c912187ead8345"
+  },
+  "inputs": {
+    "sha256": "199d79b542e8fee1a4c2ebbf06527cfb8b42a30fec64a580b4af72799b426055"
+  },
+  "outputs": {
+    "plan": {
+      "sha256": "aa59cca91f099943fb7f5bbc79d581f3515f9900139bf3957d414554e9b96192"
+    },
+    "detailed": {
+      "sha256": "ef466f11fe68d81931b213cf976d41185ea69bf0ebac87bee5866a27e7f97ff6"
+    }
+  },
+  "tools": {
+    "bun": "1.4.2",
+    "node": "v24.21.0",
+    "alchemy": "2.0.0-beta.84",
+    "cloudflare": "2.0.0-beta.84"
+  },
+  "execution": {
+    "updateStateStore": false,
+    "profile": "memory-only",
+    "stateCredentials": "memory-only",
+    "refresh": "forbidden"
+  }
+}

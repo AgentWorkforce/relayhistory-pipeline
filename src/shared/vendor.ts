@@ -19,6 +19,7 @@ export {
 export {
   postgresPipelineQueue,
   pollPostgresStage,
+  postgresStageConsumer,
   type PipelineQueue,
   type PollResult,
   type SqlExecutor,

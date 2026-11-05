@@ -12,6 +12,10 @@ The consumer hashes exact bytes before parsing each object; accepts only keys wi
 
 The backend cursor binds exact identity, source generation, index SHA, table, view, order, maxContent and ordinal. Source mutation or a different publication invalidates it. Event ordering uses the shared producer comparator, and each hydrated page checks returned adjacent rows. The8s Worker deadline cancels pending transport; RHC's existing12s outer budget remains.
 
+Raw-mode cursors and `generation` values are not portable to pages mode. The two modes use different generation semantics, and raw cursors are plain base64 while pages cursors carry the `artifact-v1:` prefix. After a `CANONICAL_READ_MODE` flip from raw to pages, a caller still holding raw-mode state gets `source_generation_changed`/503 for a stale `generation` or `cursor`/400 for a raw cursor; it never receives rows resumed from the wrong position. This is fail-closed by design, but activation must plan for it: callers must restart pagination from the first page and drop cached raw generations when the mode changes.
+
+`table=session_timing` in pages mode answers `501 unsupported_by_backend` with reason `timing_turns_unknown` (the timing route's refusal, not a retryable `artifact_view`/503) for an index with `legacyCoverage: null` and no `session_timing` table, until the producer publishes legacy turn coverage for that session.
+
 ## Offline verification
 
 Run the bounded synthetic graph and real workerd routing tests with `bun test src/session-read-api/__tests__/canonical-artifact-reader.test.ts` and package `test:canonical`. Removing object digest verification makes the prefix-content corruption control fail; disabling selected pages dispatch makes the workerd positive routing control fail.

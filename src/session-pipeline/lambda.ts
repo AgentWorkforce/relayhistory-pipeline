@@ -1,6 +1,6 @@
 import {createSemanticClickHouseClient} from "../search-features/semantic-copy-ch.ts";
 import {SemanticPostgresExecutor} from "../search-features/semantic-copy-postgres.ts";
-import { routeLargeRead } from "./large-read-worker.ts";
+import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
 /**
  * AWS Lambda entry for the sessions-prod session pipeline
  * (stacks/aws/session-pipeline.ts, runbooks/sessions-prod-session-pipeline.md).
@@ -24,6 +24,10 @@ import { routeLargeRead } from "./large-read-worker.ts";
  * rebuilds missing summaries when it does). SESSION_BRIEF_ENABLED=true arms brief
  * wakeups as sessions index and lets the brief schedule run; with no
  * `openai_api_key` a brief tick claims nothing (src/session-brief/config.ts).
+ * SESSION_DESKTOP_CATALOG_ENABLED=1 (only the literal "1"; default off) switches the
+ * search stage from the pre-#182 catalog writer to the complete desktop catalog writer
+ * (migration 20261105022000 columns); SEARCH_INDEX_ENABLED alone never does
+ * (docs/session-desktop-catalog.md, Activation blockers).
  */
 import pg from "pg";
 import {
@@ -45,19 +49,31 @@ import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
+import { searchIndexLimits } from "./search-index.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
+import {checkedAnalysisCursor,reconcileAnalysisPage} from "./analysis-reconcile.ts";
+import {analysisRefreshTick,enqueueAnalysisScope,type AnalysisRefreshDeps} from "./analysis-refresh.ts";
+import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.ts";
 import { briefTick } from "../session-brief/worker.ts";
+import{derivedSchemaAssets}from "./derived-schema.ts";
+import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import {runSemanticCopyTick} from "../search-features/semantic-copy-job.ts";
 import {semanticReadonlyPool,semanticFeatureReader,semanticMetadataPool} from "../search-features/semantic-copy-source-pool.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
+  /**
+   * Separate least-privilege READ ONLY legacy source, never exposed to Worker.
+   * Deliberately unchecked here: only the analysis branch validates it, and only
+   * when SESSION_ANALYSIS_CACHE_ENABLED=1, so a staged or malformed field can never
+   * stop the shared runtime that serves SQS/search invocations.
+   */
+  analysis_source_readonly_url?: unknown;
   clickhouse?: { url: string; user: string; password: string; database: string };
   openai_api_key?: string;
-  analysis_source_readonly_url?: string;
 }
 
 export interface LambdaEnv {
@@ -69,6 +85,9 @@ export interface LambdaEnv {
   searchEnabled: boolean;
   replayPagesEnabled: boolean;
   largeScopeHandoffEnabled?: boolean;
+  analysisCacheEnabled: boolean;
+  /** SESSION_DESKTOP_CATALOG_ENABLED=1: the search stage writes the complete desktop catalog; off (default): the pre-#182 writer. */
+  desktopCatalogEnabled: boolean;
   semanticCopyEnabled?: boolean;
   semanticSourceId?: string;
   fanout: "off" | "postgres";
@@ -84,6 +103,10 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
   };
   const fanout = env.PIPELINE_FANOUT ?? "off";
   if (fanout !== "off" && fanout !== "postgres") throw new Error("session pipeline: PIPELINE_FANOUT must be off or postgres");
+  // This entry point is the lambda runtime with the ClickHouse stage. Unset
+  // selection variables (today's stack) resolve to exactly that; anything else
+  // is a misconfiguration (docs/search-and-runtime-adapters.md).
+  validateAdapterEnv(env, { runtime: ["lambda"], runtimeDefault: "lambda", search: ["clickhouse"], searchDefault: "clickhouse" });
   if (env.PIPELINE_ORG_FROM_PREFIX !== "true") throw new Error("session pipeline: PIPELINE_ORG_FROM_PREFIX must be true (org-prefix layout)");
   return {
     region: need("AWS_REGION"),
@@ -94,6 +117,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     searchEnabled: env.SEARCH_INDEX_ENABLED === "1",
     replayPagesEnabled: env.SESSION_REPLAY_PAGES_ENABLED === "1",
     largeScopeHandoffEnabled: env.SESSION_LARGE_READ_HANDOFF_ENABLED === "1",
+    analysisCacheEnabled: env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
+    desktopCatalogEnabled: env.SESSION_DESKTOP_CATALOG_ENABLED === "1",
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
     fanout,
@@ -120,8 +145,19 @@ export function parseSecret(text: string): PipelineSecret {
   }
   if (v.openai_api_key !== undefined && (typeof v.openai_api_key !== "string" || !v.openai_api_key.trim()))
     throw new Error("session pipeline secret openai_api_key must be a non-empty string when present");
-  if(v.analysis_source_readonly_url!==undefined&&(typeof v.analysis_source_readonly_url!=="string"||!/^postgres(?:ql)?:\/\//u.test(v.analysis_source_readonly_url)))throw new Error("session pipeline secret readonly source URL invalid");
   return v as PipelineSecret;
+}
+
+/**
+ * Validate the readonly analysis source field. Called only from the analysis
+ * branch with the flag on; never echoes the value.
+ */
+export function analysisSourceReadonlyUrl(value: unknown): string {
+  if (value === undefined || value === null || value === "")
+    throw new Error("analysis cache enabled without readonly source configuration (secret analysis_source_readonly_url is missing)");
+  if (typeof value !== "string" || !/^postgres(ql)?:\/\//u.test(value))
+    throw new Error("session pipeline secret analysis_source_readonly_url must be a postgres URL");
+  return value;
 }
 
 /**
@@ -173,10 +209,15 @@ export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Prom
 /** A search pass that found its session busy runs again this much later. */
 export const BUSY_REQUEUE_DELAY_SECONDS = 60;
 
-interface Runtime {
+export interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
   brief: ReturnType<typeof briefTick>;
+  store: ReturnType<typeof createS3Store>;
+  /** Raw, unvalidated secret field; see analysisDeps(). */
+  analysisSourceUrl?: unknown;
+  /** Built on first analysis invocation with the flag on, never in shared init. */
+  analysis?: AnalysisRefreshDeps;
   semanticCopy?:()=>Promise<unknown>;
 }
 
@@ -184,6 +225,7 @@ let runtime: Promise<Runtime> | undefined;
 
 async function init(): Promise<Runtime> {
   const env = lambdaEnv();
+  const publicationSchema=await derivedSchemaAssets();
   const { SecretString } = await awsJsonCall<{ SecretString?: string }>({
     service: "secretsmanager",
     target: "secretsmanager.GetSecretValue",
@@ -192,7 +234,15 @@ async function init(): Promise<Runtime> {
     credentials: lambdaCredentials(),
   });
   if (!SecretString) throw new Error("session pipeline secret has no value yet");
-  const secret = parseSecret(SecretString);
+  return runtimeFromSecret(env, SecretString, publicationSchema.expected.generation);
+}
+
+/**
+ * The shared runtime for every invocation kind. Network-free: pools and clients
+ * connect lazily. The analysis source field is carried raw and not validated here.
+ */
+export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGeneration: string): Runtime {
+  const secret = parseSecret(secretText);
   const db = supabasePool(secret.hoopdb_url, env.dbPoolMax);
   const store = createS3Store({ bucket: env.bucket, region: env.region, credentials: async () => lambdaCredentials() });
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: env.bucket });
@@ -213,6 +263,9 @@ async function init(): Promise<Runtime> {
       orgs: prefixOrgResolver,
       allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
       fanout,
+      publication:{schemaGeneration,transact:work=>transaction(db,async tx=>{
+        await tx.query("SET LOCAL statement_timeout='5s';SET LOCAL lock_timeout='1s'");return work(tx);
+      })},
     },
     requeue: async (manifestKey) => {
       await awsJsonCall({
@@ -232,6 +285,11 @@ async function init(): Promise<Runtime> {
       store,
       ch: createClickHouseClient(secret.clickhouse),
       prefixFor: (orgId) => `${env.keyPrefix}/${orgId}`,
+      // Raised to the replay producer's source bound only when that stage is on.
+      limits: searchIndexLimits(env.replayPagesEnabled),
+      // Default off and separate from SEARCH_INDEX_ENABLED: off keeps the pre-#182 catalog
+      // writer; the desktop catalog writer waits on migration 20261105031000 (docs/session-desktop-catalog.md).
+      ...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}),
     };
   }
   if (env.replayPagesEnabled) {
@@ -239,7 +297,7 @@ async function init(): Promise<Runtime> {
     // Wiring code does not grant that permission or enable this default-off flag.
     deps.replay = { db, store, provider: "s3", bucket: env.bucket, prefix: bindings };
   }
-  if(env.largeScopeHandoffEnabled&&(env.searchEnabled||env.replayPagesEnabled))deps.large={route:scope=>routeLargeRead(db,scope)};
+  if(env.largeScopeHandoffEnabled&&(env.searchEnabled||env.replayPagesEnabled))deps.large={route:scope=>routeLargeRead(db,scope),jobState:scope=>largeReadJobState(db,scope)};
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
   const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
   const brief = briefTick({
@@ -252,10 +310,24 @@ async function init(): Promise<Runtime> {
   let semanticCopy:Runtime["semanticCopy"];
   if(env.semanticCopyEnabled){
     if(!secret.clickhouse||!secret.analysis_source_readonly_url||!env.semanticSourceId)throw new Error("semantic copier configuration incomplete");
-    const semanticDb=new SemanticPostgresExecutor(semanticMetadataPool(secret.hoopdb_url)),source=semanticFeatureReader(semanticReadonlyPool(secret.analysis_source_readonly_url)),ch=createSemanticClickHouseClient(secret.clickhouse),sourceId=env.semanticSourceId,endpoint=secret.clickhouse.url;
+    const semanticDb=new SemanticPostgresExecutor(semanticMetadataPool(secret.hoopdb_url)),source=semanticFeatureReader(semanticReadonlyPool(analysisSourceReadonlyUrl(secret.analysis_source_readonly_url))),ch=createSemanticClickHouseClient(secret.clickhouse),sourceId=env.semanticSourceId,endpoint=secret.clickhouse.url;
     semanticCopy=async()=>{const result=await runSemanticCopyTick({db:semanticDb,source,ch,sourceId,endpoint});if(result.failed)throw new Error("semantic copier kind failed");return result};
   }
-  return { env, deps, brief,semanticCopy };
+  return { env, deps, brief, store, analysisSourceUrl: secret.analysis_source_readonly_url, semanticCopy };
+}
+
+/**
+ * Analysis-only dependencies, validated and built on first use from the analysis
+ * branches. A missing or malformed source field fails only that invocation; the
+ * shared runtime (SQS/search/reconcile/brief) is unaffected and not invalidated.
+ */
+export function analysisDeps(rt: Runtime): AnalysisRefreshDeps {
+  if (!rt.env.analysisCacheEnabled) throw new Error("analysis cache runtime unavailable");
+  if (!rt.analysis) {
+    const url = analysisSourceReadonlyUrl(rt.analysisSourceUrl);
+    rt.analysis = { db: rt.deps.pointer.db, store: rt.store, source: readonlyAnalysisSource(readonlyAnalysisPool(url, code => log.error("analysis source pool error", { stage: "analysis-cache", error_code: code }))) };
+  }
+  return rt.analysis;
 }
 
 function ready(): Promise<Runtime> {
@@ -420,7 +492,7 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
   return { ...summary, link };
 }
 
-type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; semanticCopy?:unknown; cursor?: string; since?: string; link?: number };
+type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; analysisCache?:unknown; analysisCacheReconcile?:unknown; analysisCursor?:unknown; semanticCopy?:unknown; cursor?: string; since?: string; link?: number };
 
 export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok: boolean }> {
   if(event?.semanticCopy===true){
@@ -460,6 +532,27 @@ export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok:
       log.error("reconcile failed", { stage: "object-landed", ...errorFields(error), duration_ms: Date.now() - started });
       return { ok: false };
     }
+  }
+  if(event?.analysisCacheReconcile===true){
+    if(process.env.SESSION_ANALYSIS_CACHE_ENABLED!=="1")return {ok:true};
+    const started=Date.now();try{const rt=await ready();const analysis=analysisDeps(rt);
+      const page=await reconcileAnalysisPage({source:analysis.source,enqueue:identity=>enqueueAnalysisScope(analysis,identity)},{cursor:checkedAnalysisCursor(event.analysisCursor)});
+      if(page.nextCursor)await invokeAsync({region:rt.env.region,functionName:process.env.AWS_LAMBDA_FUNCTION_NAME??"",payload:JSON.stringify({analysisCacheReconcile:true,analysisCursor:page.nextCursor}),credentials:lambdaCredentials()});
+      log.info("analysis cache reconcile page",{stage:"analysis-cache",count:page.scanned,enqueued:page.accepted,skipped:page.unavailable,failed:page.invalidScope+page.refused,ok:page.unavailable===0&&page.invalidScope===0&&page.refused===0,reason:page.complete?"scan_complete":"continuation",duration_ms:Date.now()-started});return {ok:true};
+    }catch(error){log.error("analysis cache reconcile failed",{stage:"analysis-cache",...errorFields(error),duration_ms:Date.now()-started});throw new Error("analysis cache reconcile failed");}
+  }
+  if(event?.analysisCache===true){
+    // Default off before secret lookup, connection pools or object access.
+    if(process.env.SESSION_ANALYSIS_CACHE_ENABLED!=="1")return {ok:true};
+    const started=Date.now();try{const rt=await ready();const analysis=analysisDeps(rt);
+      const first=await analysisRefreshTick(analysis,{maxJobs:10,maxMs:24000});
+      // One-minute schedule, two bounded passes. Cadence remains a target until
+      // actual source/network/load execution is measured; leases make overlap safe.
+      if(Date.now()-started<30000)await new Promise(resolve=>setTimeout(resolve,30000-(Date.now()-started)));
+      const second=Date.now()-started<50000?await analysisRefreshTick(analysis,{maxJobs:10,maxMs:24000}):{claimed:0,published:0,failed:0,lost:0};
+      log.info("analysis cache refresh finished",{stage:"analysis-cache",count:first.published+second.published,failed:first.failed+second.failed+first.lost+second.lost,duration_ms:Date.now()-started});
+      return {ok:first.failed+second.failed+first.lost+second.lost===0};
+    }catch(error){log.error("analysis cache refresh failed",{stage:"analysis-cache",...errorFields(error),duration_ms:Date.now()-started});return {ok:false};}
   }
   if (event?.brief === true) {
     // Off: return before init, so a schedule left enabled by mistake reads no secret and opens no pool.

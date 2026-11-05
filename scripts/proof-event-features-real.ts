@@ -1,3 +1,4 @@
+import { proveFourPoolRoute } from "./proof-four-pool-route-real.ts";
 import { createHash } from "node:crypto";
 /** Owned disposable PG17/CH26 proof; no environment credentials/production targets. */
 import pg from "pg";
@@ -429,6 +430,21 @@ try {
     "UPDATE sessions.convergence_events SET content=$1,task_ref=$2::jsonb WHERE org_id='large-org' AND session_id='large-metadata'",
     [largeContent, JSON.stringify({ large: largeMetadata })],
   );
+  const largeTitle = "title ".repeat(200000) + "Needle late-title";
+  await event(
+    "large-title-2",
+    "p",
+    undefined,
+    undefined,
+    undefined,
+    "codex",
+    "ws",
+    "large-org",
+  );
+  await pool.query(
+    "UPDATE sessions.convergence_events SET task_title=$1 WHERE org_id='large-org'",
+    [largeTitle],
+  );
   const largeCopy = await copyEventFeaturePage({ db, ch }, moved.next, 200);
   const largeRows = await ch.select<any>(
     "SELECT lengthUTF8(content) content_chars,lengthUTF8(task_ref_text) metadata_chars,lower(hex(SHA256(JSONExtractString(task_ref_text,'large')))) metadata_hash FROM session_event_features FINAL WHERE org_id='large-org' AND session_id='large-metadata'",
@@ -446,6 +462,55 @@ try {
     published: largeCopy.published,
     ...largeRows[0],
   });
+  const largePools = clickHouseEventFeaturePools(connection, {
+    queryFold: fold,
+  });
+  const largeScope = {
+    ...scope,
+    tenant: { orgId: "large-org", workspaceId: "ws" },
+  };
+  const largeHits = await largePools.keyword(
+    largeScope,
+    "Needle",
+    new AbortController().signal,
+  );
+  assert(
+    largeHits.length === 2 && largeHits.every((r) => r.taskTitle === null),
+    "candidate pool retained large task titles",
+  );
+  const largeSnippets = await largePools.snippets(
+    largeScope.tenant,
+    largeHits,
+    new AbortController().signal,
+    scope.snapshot,
+  );
+  const { boundedSnippet } = await import(
+    rhc + "/packages/relayhistory/src/lib/session-search.ts"
+  );
+  assert(
+    largeSnippets.size === 2 &&
+      [...largeSnippets.values()].every((r) =>
+        boundedSnippet(r, "Needle")?.includes("Needle late-title"),
+      ),
+    "large late task-title literal snippet lost",
+  );
+  checks.push({
+    name: "narrow_event_candidates_and_sequential_full_late_title_snippets",
+    hits: largeHits.length,
+    snippets: largeSnippets.size,
+    titleChars: largeTitle.length,
+    transportMaxBytes: 2 * 1024 * 1024,
+  });
+  checks.push(
+    await proveFourPoolRoute({
+      rhc,
+      ch,
+      db,
+      profile,
+      eventState: largeCopy.next,
+      briefH: h,
+    }),
+  );
   const result = {
     collation: (
       await pool.query(

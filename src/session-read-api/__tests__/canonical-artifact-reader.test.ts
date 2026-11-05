@@ -367,6 +367,59 @@ test("refuses absent/stale publication without raw fallback", async () => {
   });
   expect(readKeys).toEqual([]);
 });
+test("session_timing absent because legacy turns are unknown is a non-retryable 501, not artifact_view", async () => {
+  const timingQuery = { table: "session_timing", view: "raw" as const, limit: 10 };
+  // Producer shape when legacy coverage is unknown: no session_timing table at all.
+  index.legacyCoverage = null;
+  await publish();
+  await expect(
+    canonicalArtifactPage(deps, identity, timingQuery),
+  ).rejects.toMatchObject({ reason: "timing_turns_unknown", status: 501 });
+  // Any other missing table keeps the integrity refusal.
+  delete (index.tables as Record<string, unknown>).session_markers;
+  await publish();
+  await expect(
+    canonicalArtifactPage(deps, identity, { ...timingQuery, table: "session_markers" }),
+  ).rejects.toMatchObject({ reason: "artifact_view", status: 503 });
+  // Known coverage but no session_timing table contradicts the producer: still artifact_view.
+  index.legacyCoverage = {
+    version: 1,
+    tables: ["conversation_turns", "session_links", "session_outcomes"],
+  };
+  await publish();
+  await expect(
+    canonicalArtifactPage(deps, identity, timingQuery),
+  ).rejects.toMatchObject({ reason: "artifact_view", status: 503 });
+  // Published with coverage: the materialized timing row is served.
+  const timingRow = {
+    org_id: identity.orgId,
+    workspace_id: identity.workspaceId,
+    source: identity.source,
+    session_id: identity.sessionId,
+    timing: { workMs: 5 },
+  };
+  const page = await put(
+    "timing-page.json",
+    encode({
+      version: 1,
+      kind: "row-page",
+      identity,
+      generation,
+      table: "session_timing",
+      view: "raw",
+      start: 0,
+      rows: [{ table: "session_timing", row: timingRow }],
+    }),
+    0,
+    1,
+    "page",
+  );
+  index.tables.session_timing = { raw: { count: 1, root: page } };
+  await publish();
+  const served = await canonicalArtifactPage(deps, identity, timingQuery);
+  expect(served.rows.map((r) => r.row)).toEqual([timingRow]);
+  expect(served.nextCursor).toBeNull();
+});
 test("validates every object digest before parsing or returning content", async () => {
   objects.set(
     prefix + "string-0.json",
@@ -521,4 +574,168 @@ test("refuses missing/misaligned timestamp bounds instead of an unbounded replay
     canonicalArtifactPage(deps, identity, query({ since: "2026-11-01" })),
   ).rejects.toMatchObject({ reason: "artifact_bounds" });
   expect(readKeys.some((k) => k.endsWith("page-1.json"))).toBe(false);
+});
+async function rawPage(rows: Array<Record<string, unknown>>) {
+  // Raw view: every row is stored as a segmented rowJson blob.
+  const entries: ArtifactEntry[] = [];
+  for (const [n, row] of rows.entries()) {
+    const blob = encode(row),
+      refs: ArtifactRangeRef[] = [];
+    for (let i = 0; i < blob.byteLength; i += 65536)
+      refs.push(
+        await put(
+          `raw-${n}-blob-${i}.json`,
+          blob.slice(i, i + 65536),
+          i,
+          Math.min(65536, blob.byteLength - i),
+          "segment",
+        ),
+      );
+    entries.push({
+      table: "convergence_events",
+      rowJson: {
+        codec: "json-utf8-segments-v1",
+        bytes: blob.byteLength,
+        sha256: await sha256Hex(blob),
+        root: await node(`raw-${n}-blob-node.json`, "bytes", refs),
+      },
+    });
+  }
+  const page = await put(
+    "raw-page.json",
+    encode({
+      version: 1,
+      kind: "row-page",
+      identity,
+      generation,
+      table: "convergence_events",
+      view: "raw",
+      start: 0,
+      rows: entries,
+    }),
+    0,
+    entries.length,
+    "page",
+  );
+  index.tables.convergence_events!.raw = { count: entries.length, root: page };
+  await publish();
+}
+const rawRow = (event: string, ts: string, content: string) => ({
+  source: "codex",
+  session_id: identity.sessionId,
+  event_id: event,
+  machine_id: "m",
+  kind: "tool_result",
+  ts,
+  content,
+});
+test("refuses an oversized raw first row from its declared size before reading any segment", async () => {
+  await rawPage([
+    rawRow("big", "2026-11-01T10:00:00.000001Z", "x".repeat(6 * 1024 * 1024)),
+  ]);
+  readKeys = [];
+  await expect(
+    canonicalArtifactPage(deps, identity, query({ view: "raw" })),
+  ).rejects.toMatchObject({ reason: "row_bound", status: 503 });
+  expect(readKeys.some((k) => k.includes("raw-page.json"))).toBe(true);
+  expect(readKeys.filter((k) => k.includes("-blob-"))).toEqual([]);
+});
+test("an analysis rowJson first row over the reply cap is read under its own snapshot budget, while a raw one is still refused unread", async () => {
+  // #181 serves analysis snapshots of up to 64 MiB through view "analysis"
+  // (stored as raw rowJson). The declared-size pre-check is for raw/bounds
+  // replies only; it must not refuse analysis rows before they are read.
+  const payload = "x".repeat(3 * 1024 * 1024),
+    row = {
+      org_id: identity.orgId,
+      workspace_id: identity.workspaceId,
+      source: "codex",
+      session_id: identity.sessionId,
+      ordinal: 0,
+      payload: { sessionId: identity.sessionId, body: payload },
+    },
+    blob = encode(row),
+    refs: ArtifactRangeRef[] = [];
+  for (let i = 0; i < blob.byteLength; i += 65536)
+    refs.push(
+      await put(
+        `analysis-0-blob-${i}.json`,
+        blob.slice(i, i + 65536),
+        i,
+        Math.min(65536, blob.byteLength - i),
+        "segment",
+      ),
+    );
+  const entry: ArtifactEntry = {
+    table: "session_analyses" as ArtifactEntry["table"],
+    rowJson: {
+      codec: "json-utf8-segments-v1",
+      bytes: blob.byteLength,
+      sha256: await sha256Hex(blob),
+      root: await node("analysis-0-blob-node.json", "bytes", refs),
+    },
+  };
+  const page = await put(
+    "analysis-page.json",
+    encode({
+      version: 1,
+      kind: "row-page",
+      identity,
+      generation,
+      table: "session_analyses",
+      view: "raw",
+      start: 0,
+      rows: [entry],
+    }),
+    0,
+    1,
+    "page",
+  );
+  (index.tables as Record<string, unknown>).session_analyses = {
+    raw: { count: 1, root: page },
+  };
+  await publish();
+  expect(blob.byteLength).toBeGreaterThan(3 * 1024 * 1024);
+  readKeys = [];
+  const result = await canonicalArtifactPage(
+    deps,
+    identity,
+    query({ table: "session_analyses", view: "analysis" }),
+  );
+  expect(result.rows).toHaveLength(1);
+  expect((result.rows[0]!.row.payload as { body: string }).body).toBe(payload);
+  expect(readKeys.filter((k) => k.includes("analysis-0-blob-")).length).toBe(
+    refs.length + 1,
+  );
+
+  await rawPage([
+    rawRow("big", "2026-11-01T10:00:00.000001Z", "x".repeat(3 * 1024 * 1024)),
+  ]);
+  readKeys = [];
+  await expect(
+    canonicalArtifactPage(deps, identity, query({ view: "raw" })),
+  ).rejects.toMatchObject({ reason: "row_bound", status: 503 });
+  expect(readKeys.filter((k) => k.includes("-blob-"))).toEqual([]);
+});
+test("stops before fetching a later raw row that cannot fit the reply", async () => {
+  await rawPage([
+    rawRow("small", "2026-11-01T10:00:00.000001Z", "ok"),
+    rawRow("big", "2026-11-01T10:00:00.000002Z", "x".repeat(6 * 1024 * 1024)),
+  ]);
+  readKeys = [];
+  const first = await canonicalArtifactPage(
+    deps,
+    identity,
+    query({ view: "raw", limit: 2 }),
+  );
+  expect(first.rows.map((x) => x.row.event_id)).toEqual(["small"]);
+  expect(first.nextCursor).toStartWith("artifact-v1:");
+  expect(readKeys.filter((k) => k.includes("raw-1-blob"))).toEqual([]);
+  await expect(
+    canonicalArtifactPage(
+      deps,
+      identity,
+      query({ view: "raw", limit: 2, cursor: first.nextCursor }),
+    ),
+  ).rejects.toMatchObject({ reason: "row_bound", status: 503 });
+  expect(readKeys.filter((k) => k.includes("raw-1-blob"))).toEqual([]);
 });

@@ -30,3 +30,34 @@ test('invalid discovery is refused and the pool is closed',async()=>{
  await expect(largeReadMain({SESSION_LARGE_READ_WORKER_ENABLED:'1'},f.factory)).rejects.toThrow('invalid discovery');
  expect(f.counts()).toEqual({scans:1,claims:0,closed:1});
 });
+
+test('a discovery error (54000 capacity) is logged by code and never blocks claiming queued jobs',async()=>{
+ let scans=0,claims=0,closed=0;const lines:any[]=[];
+ const capacity=Object.assign(new Error('replay capture: pointer capacity exceeded org_secret/ws_secret'),{code:'54000'});
+ const factory=()=>({deps:{db:{query:async(sql:string)=>{
+  if(sql.includes('discover_session_large_reads')){scans++;throw capacity}
+  if(sql.includes('claim_session_large_read')){claims++;return {rows:[{job:null}]}};
+  throw new Error('unexpected SQL');
+ }}} as unknown as LargeReadRuntime['deps'],close:async()=>{closed++}});
+ const err=process.stderr.write;
+ process.stderr.write=((chunk:any,...rest:any[])=>{for(const l of String(chunk).split('\n'))if(l.startsWith('{'))lines.push(JSON.parse(l));return true}) as any;
+ let result;try{result=await largeReadMain({SESSION_LARGE_READ_WORKER_ENABLED:'1'},factory).catch(e=>({rejected:e?.code}))}finally{process.stderr.write=err}
+ expect(result).toEqual({enabled:true,processed:0,published:0,failed:0,scanned:0,cycleComplete:false,discoveryFailures:2});
+ // Claimed after the failed first page; the second failing page stops the loop instead of spinning.
+ expect({scans,claims,closed}).toEqual({scans:2,claims:1,closed:1});
+ expect(lines).toHaveLength(2);
+ for(const l of lines){expect(l).toMatchObject({level:'error',message:'large worker discovery failed',stage:'large-read',error_code:'54000',reason:'replay_capacity_refused'});expect(JSON.stringify(l)).not.toContain('secret')}
+});
+test('an unclassified discovery error is logged and claims still run',async()=>{
+ let claims=0;const job={rows:[{job:null}]};
+ const factory=()=>({deps:{db:{query:async(sql:string)=>{
+  if(sql.includes('discover_session_large_reads'))throw Object.assign(new Error('ambiguous'),{code:'55000'});
+  if(sql.includes('claim_session_large_read')){claims++;return job}
+  throw new Error('unexpected SQL');
+ }}} as unknown as LargeReadRuntime['deps'],close:async()=>{}});
+ const err=process.stderr.write;const lines:any[]=[];
+ process.stderr.write=((chunk:any)=>{for(const l of String(chunk).split('\n'))if(l.startsWith('{'))lines.push(JSON.parse(l));return true}) as any;
+ let result;try{result=await largeReadMain({SESSION_LARGE_READ_WORKER_ENABLED:'1'},factory).catch(e=>({rejected:e?.code}))}finally{process.stderr.write=err}
+ expect(result).toMatchObject({enabled:true,discoveryFailures:2});
+ expect(claims).toBe(1);expect(lines[0]).toMatchObject({error_code:'55000',reason:'discovery_failed'});
+});

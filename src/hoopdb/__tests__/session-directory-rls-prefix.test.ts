@@ -33,6 +33,8 @@ async function database(): Promise<PGlite> {
   const db = new PGlite({ extensions: { auto_explain, btree_gin, pg_trgm } });
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
+  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
+  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
   }

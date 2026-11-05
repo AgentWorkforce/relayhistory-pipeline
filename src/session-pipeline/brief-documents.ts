@@ -65,7 +65,6 @@ function checked(value: unknown, nonce: string): Claim {
     if (typeof d[field] !== "string") return fail("claim_invalid");
   if (
     !d.orgId ||
-    !d.workspaceId ||
     !d.sessionId ||
     d.sessionId.length > 255 ||
     !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(d.source) ||

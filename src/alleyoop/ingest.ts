@@ -35,6 +35,10 @@ import { lockerStore } from "../shared/locker.ts";
 import { traceparentFor } from "../shared/ids.ts";
 import { integer, optional, required, vendorBindings } from "../shared/env.ts";
 import { liveDataPathVerdict } from "../shared/data-path.ts";
+import {
+  assertDestinationUrl,
+  destinationPolicy,
+} from "../shared/destination-url.ts";
 import { healthVerdict, type WorkerHealth } from "../shared/worker.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { initTelemetry, withSpan } from "../shared/telemetry.ts";
@@ -60,9 +64,14 @@ export interface IngestOverrides {
 
 /**
  * The production composition of the AlleyOop ingest. Auth (no bypass):
+ *  - With `RELAYHISTORY_ORIGIN` set (hosted and customer installs), RelayAuth's
+ *    origin-bound History assertion is verified (RS256 against
+ *    `RELAYAUTH_JWKS_URL`, exact issuer, sole audience = this origin, the
+ *    dedicated token class) and nothing else; no flag is needed.
  *  - `ALLOW_INTERIM_RELAYAUTH_BEARER` is OFF unless the environment sets it to
  *    exactly "true" (an explicit dev/test opt-in; the local Docker stack sets
- *    it). Off, a generic RelayAuth bearer is refused (401).
+ *    it). Off, a generic RelayAuth bearer is refused (401), and with no origin
+ *    every bearer is refused (401 auth_not_configured).
  *  - Migration assertions go through the dedicated verifier
  *    (`RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS=true`, default off), which
  *    admits only the migration class, under its full contract (signed pair,
@@ -101,7 +110,28 @@ async function firstClaimlessActivation(
   return new Date(rows[0]!.first_activation).toISOString();
 }
 
+/**
+ * Startup validation of the ingest's own destinations: the JWKS it trusts keys
+ * from and the origin assertions must be bound to. Same transport rule as the
+ * courier (src/shared/destination-url.ts, ALLOW_IN_CLUSTER_HTTP). The origin's
+ * audience comparison stays exact; only which URLs may be named is checked.
+ */
+export function assertIngestDestinations(env: NodeJS.ProcessEnv = process.env) {
+  const policy = destinationPolicy(env);
+  const jwksUrl = env.RELAYAUTH_JWKS_URL?.trim();
+  if (jwksUrl) assertDestinationUrl("RELAYAUTH_JWKS_URL", jwksUrl, policy);
+  const origin = env.RELAYHISTORY_ORIGIN?.trim();
+  if (origin) {
+    const url = assertDestinationUrl("RELAYHISTORY_ORIGIN", origin, policy, {
+      allowPath: false,
+    });
+    if (origin.replace(/\/$/, "").toLowerCase() !== url.origin)
+      throw new Error("96bulls: RELAYHISTORY_ORIGIN must be an exact bare origin");
+  }
+}
+
 export async function buildIngestApp(overrides: IngestOverrides = {}) {
+  assertIngestDestinations();
   const port = integer("INGEST_PORT", 8080);
   const jwks = process.env.JWKS_JSON
     ? (JSON.parse(process.env.JWKS_JSON) as Record<string, unknown>)

@@ -165,4 +165,4 @@ DO $acl$ DECLARE f text;r text;BEGIN
 END $acl$;
 GRANT EXECUTE ON FUNCTION sessions.register_search_feature_source(text,text,text,text,text),sessions.claim_search_feature_copy(text,text,text,uuid),
 sessions.initialize_search_feature_baseline(text,text,uuid,bigint,text,bigint),sessions.heartbeat_search_feature_copy(text,text,uuid,bigint),
-sessions.commit_search_feature_copy(text,text,uuid,bigint,text,jsonb,timestamp with time zone),sessions.finish_search_feature_copy(text,text,uuid,bigint,text,text) TO service_role;
+sessions.commit_search_feature_copy(text,text,uuid,bigint,text,jsonb,timestamptz),sessions.finish_search_feature_copy(text,text,uuid,bigint,text,text) TO service_role;

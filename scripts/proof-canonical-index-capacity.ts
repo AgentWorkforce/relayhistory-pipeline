@@ -5,7 +5,7 @@ import {execFileSync} from "node:child_process";
 import {objectKey,readAll,parseManifest,parseSessionKey,chunkKeys} from "../packages/object-store/src/index.ts";
 import {createFsStore,replayDatabase,addReplayPointer,REPLAY_FIXTURE_IDENTITY as identity} from "../src/session-pipeline/__tests__/replay-fixture.ts";
 import {projectSessionDirectory} from "../src/hoopdb/session-directory-projector.ts";
-import {indexSearchScope} from "../src/session-pipeline/search-index.ts";
+import {indexSearchScope,REPLAY_SEARCH_INDEX_LIMITS} from "../src/session-pipeline/search-index.ts";
 import {produceCanonicalReplay} from "../src/session-pipeline/replay-publication.ts";
 import {recordingReplayClickHouse} from "../src/session-pipeline/__tests__/replay-clickhouse-fixture.ts";
 const args=process.argv.slice(2),arg=(name:string)=>{const i=args.indexOf(name);return i<0?undefined:args[i+1]};
@@ -26,7 +26,7 @@ const scope={orgId:identity.orgId,workspaceId:identity.workspaceId,harness:ident
 const observed=recordingReplayClickHouse(),started=performance.now();let peakRss=process.memoryUsage().rss;const sampler=setInterval(()=>peakRss=Math.max(peakRss,process.memoryUsage().rss),100);
 try{
  const db=x.db,reader=(await import("../packages/pipeline/src/lib/pipeline/adapter.ts")).objectStoreManifestReader(store,{provider:"s3",bucket:"replay-fixture"});
- const result=await indexSearchScope(scope,{transact:work=>x.pg.transaction(async tx=>{await tx.exec("SET LOCAL statement_timeout='60s'");return work({query:<T>(sql:string,params?:unknown[])=>tx.query<T>(sql,params)})}),reader,store,ch:observed.ch,prefixFor:org=>`96bulls/${org}`});
+ const result=await indexSearchScope(scope,{transact:work=>x.pg.transaction(async tx=>{await tx.exec("SET LOCAL statement_timeout='60s'");return work({query:<T>(sql:string,params?:unknown[])=>tx.query<T>(sql,params)})}),reader,store,ch:observed.ch,prefixFor:org=>`96bulls/${org}`,limits:REPLAY_SEARCH_INDEX_LIMITS});
  const metadata=(await db.query<{event_count:string;event_projection_ready:boolean;event_projection_epoch:string;times:string;dirty:string}>(`SELECT event_count::text,event_projection_ready,event_projection_epoch::text,(SELECT count(*)::text FROM sessions.session_directory_event_times) times,(SELECT count(*)::text FROM sessions.session_directory_event_pending WHERE dirty) dirty FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4`,[identity.orgId,identity.workspaceId,identity.source,identity.sessionId])).rows[0]!;
  if(!result.complete||result.partial||Number(metadata.event_count)!==300001||!metadata.event_projection_ready||metadata.dirty!=="0"||observed.stats().rows!==300001||observed.stats().uniqueRows!==300001)throw Error("full Node index or actual metadata not ready");
  console.log(JSON.stringify({phase:"index_and_metadata_ready",result,metadata,ch:observed.stats()}));

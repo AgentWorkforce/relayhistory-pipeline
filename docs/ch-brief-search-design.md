@@ -1,10 +1,20 @@
 # Dormant ClickHouse brief/title/summary search
 
-Reserved migration: `20261103090000_session_brief_documents.sql` (root acknowledged 2026-11-03). This lane is draft-only and performs no production schema, credential, IAM or deployment actions.
+Composed migration: `20261105024000_session_brief_documents.sql`; the original
+`030900` reservation ordered it before its directory-event column dependency,
+so canonical-stack composition moved it into the post-`050100` window. This lane is dormant
+and performs no production schema, credential, IAM or deployment actions.
 
 Effective directory metadata is authoritative: the existing session-brief stage projects scrubbed model title/description into `session_directory.title` and `short_summary`; pointer/projector updates and clear/erasure paths also converge there. A separate derived ClickHouse `session_brief_documents` table avoids synthetic transcript rows that the authoritative S3 reconcile would erase.
 
-Every relevant directory change creates a per-canonical-identity document epoch and dirty outbox record, including a blank-text tombstone for deletion or the old identity on alias/source/workspace changes. Per-tenant watermark locking precedes epoch allocation, so metadata commit order cannot leave an unchanged high-water mark across a late older transaction. Immutable CH ordering is org/workspace/source/session; mutable text/project/activity are applied only after newest-version collapse. Higher-epoch tombstones prevent late older writes from resurrecting data.
+Applying the migration creates no scope or outbox rows. Its directory trigger
+first reads a singleton control row that defaults to `live=false`, then returns
+before constructing documents or taking a scope lock. The owner-only
+`sessions.set_session_brief_documents_live(boolean)` RPC takes a bounded
+directory-write fence, seeds the existing scope keys, and flips the control row
+in the same transaction. No runtime role can call it.
+
+Once explicitly enabled, every relevant directory change creates a per-canonical-identity document epoch and dirty outbox record, including a blank-text tombstone for deletion or the old identity on alias/source/workspace changes. Per-tenant watermark locking precedes epoch allocation, so metadata commit order cannot leave an unchanged high-water mark across a late older transaction. Immutable CH ordering is org/workspace/source/session; mutable text/project/activity are applied only after newest-version collapse. Higher-epoch tombstones prevent late older writes from resurrecting data.
 
 A controlled backend backfill keeps its cursor in SQL, never trusting a caller-supplied starting cursor; it exhausts every directory row in bounded pages. The publisher claims bounded document batches with a nonce/deadline, sends the actual CH HTTP codec, then CAS-acknowledges exactly the captured epoch/hash/lease. A newer mutation invalidates the claim. Uninitialized/dirty metadata blocks the brief pool, including scopes that would otherwise return zero candidates.
 

@@ -34,6 +34,10 @@ The same `b96e1:` cursors are issued and accepted. A cursor that the Lambda issu
 | `READ_API_COMPLETE_SINCE` | GitHub env var `SESSION_READ_COMPLETE_SINCE` | the same value as the Lambda's `sessionReadApi.completeSince` |
 | `RELAYAUTH_JWKS_URL`, `RELAYAUTH_ISSUER` | `wrangler.jsonc` vars | `https://api.relayauth.dev/.well-known/jwks.json` and `https://relayauth.dev`, as on the Lambda since #158. Never leave them unset: the verifier's fallback JWKS does not resolve, so every token would be refused with a 401 |
 
+| `READ_API_DIRECTORY_WORKSPACES` | GitHub env var `SESSION_READ_DIRECTORY_WORKSPACES` | the P3 canary allowlist (directory list/activity and session timing); unset = every P3 route answers 501 |
+| `PIPELINE_RAW_S3_BUCKET`, `_REGION`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` (+ optional `_ENDPOINT`, `_SSE`), `PIPELINE_KEY_PREFIX`, `PIPELINE_ORG_FROM_PREFIX` | Worker secrets / vars | session timing's canonical S3 read: a GetObject-only key on the raw bucket, the same key layout the session-pipeline Lambda writes. Unset = timing answers 501 `timing_not_configured` |
+| `READ_API_TIMING_ASSUME_NO_TURNS` | GitHub env var `SESSION_READ_TIMING_ASSUME_NO_TURNS` | `true` only for canary workspaces a read-only count showed have no Neon `conversation_turns` (see "Session timing" below); unset = such sessions answer 501 `timing_turns_unknown` |
+
 **Fail-closed defaults:**
 - With no origin, every `/v1` request gets a 401.
 - With a missing ClickHouse secret, a missing `completeSince` or a missing Hyperdrive binding, every request gets a 503.
@@ -122,6 +126,50 @@ The ClickHouse user and the Supabase role already exist: the Lambda uses them. S
     - The sessions-prod plan contract refuses deletes, so this needs its own reviewed change: a `session read api retire` phase that deletes exactly the three read-API resources, applied by the lead.
     - Until it lands, the Lambda is idle but still deployed.
     - Keep `src/session-read-api/lambda.ts` until then, so the rollback below stays possible.
+
+## Session timing (P3c)
+
+`GET /v1/sessions/:id/timing` is computed from the session's canonical S3 objects, never Neon or ClickHouse:
+
+1. the session's live pointer rows, read as `bulls96_read_api` (tenant-bound RLS) with the object-pointer columns `session_read_api_role.sql` grants;
+2. the manifests and chunks they name, digest-checked (`canonical.ts canonicalSnapshot`, the same 16 MiB / 100k-event bounds as `/v1/canonical`);
+3. the shared delivery projection (the port of Neon's delivery projection) and the timing port (`timing.ts`), which the parity suite holds equal to relayhistory's `session_timing_compute` v1.
+
+Every case it cannot answer exactly is a 501 Cloud falls back on: `timing_workspace_not_enabled`, `timing_not_configured`, `timing_no_pointers`, `timing_turns_unknown`, `timing_canonical_<reason>` (including `timing_canonical_deadline` after 3 s, below Cloud's 4 s timeout) and `timing_<input>`.
+
+Activation, in order (each step is the lead's):
+1. Apply the widened grant: rerun `supabase/bootstrap/session_read_api_role.sql`, then `session_read_api_role_verify.sql`. Rollback: `REVOKE SELECT (canonical_session_id, machine_id, canonical_machine_id, user_id, storage_provider, bucket, manifest_key, content_sha256, raw_format, revision) ON sessions.session_index FROM bulls96_read_api;` and the previous verify file.
+2. Give the Worker the raw-store secrets above (a GetObject-only key on the raw bucket prefix).
+3. Count the canary workspace's Neon `conversation_turns` read-only. If zero, set `SESSION_READ_TIMING_ASSUME_NO_TURNS=true`; otherwise leave it unset until the legacy turn export (docs/canonical-legacy-source.md) has run.
+4. Redeploy, then put the workspace on `SESSION_READ_DIRECTORY_WORKSPACES` (if it is not already).
+5. In Cloud, `SESSIONS_READ_96BULLS_ROUTES` adds `session_timing=shadow`; watch `[sessions-read-shadow] route=session_timing` for `equal`, `shadowStatus` and `shadowMs`, then `session_timing=on`.
+
+Expected shadow differences: Neon froze at the cutover, so a session with activity after it is more complete on S3 (`equal: false` there is not a regression). Compare sessions whose last activity predates the cutover.
+
+## Session turns and metadata (P3d)
+
+`GET /v1/sessions/:id/turns` and `/metadata` come from the same canonical S3 objects as timing, never Neon (`session-turns-source.ts`):
+- every harness scope holding a pointer for the session id (at most 4; with `source`, only that one), read with `canonicalSnapshot`;
+- its `conversation_turns` rows: the legacy export (`legacy_conversation_turn`) merged with live `conversation_turn` records from relayhistory `TURNS_WRITE_PATH=dual|forward` (`canonical-turns.ts`; a live record wins per (workspace, stored source, turn_index));
+- de-duplicated by Neon row id, ordered as relayhistory orders them, `ts` as a JS Date serializes.
+
+501s Cloud falls back on: `turns_workspace_not_enabled`, `turns_not_configured`, `org_scope` (no `workspace=`), `turns_no_pointers`, `turns_harness_bound`, `turns_unknown` (a scope without the export's coverage marker), `turns_truncated`, `turns_attribution`, `turns_canonical_<reason>` (including `_deadline` after 3 s). Erased sessions: `turns: []` and metadata 404, as relayhistory after erasure. A session with no turns: metadata 404 (Cloud falls back on any non-2xx in `on` mode).
+
+Activation, in order (each step is the lead's), after the timing steps 1, 2 and 4 above:
+1. Run the legacy turns export for the canary workspace (docs/canonical-legacy-source.md) and its verifier; without it every read is `turns_unknown`.
+2. In Cloud, `SESSIONS_READ_96BULLS_ROUTES` adds `session_turns=shadow,session_metadata=shadow`; watch `[sessions-read-shadow] route=session_turns` / `session_metadata` for `equal`, then `on`. Only callers that send `workspace=` reach 96Bulls (Cloud's dashboard replay does not yet).
+3. Expected shadow differences: a turn re-POSTed after `TURNS_WRITE_PATH=forward` carries the new request's row id (Neon keeps the first id); under `dual` ids match.
+
+Read-only checks (Neon, any time):
+```sql
+-- turns the canary workspace holds, and how many sessions
+SELECT count(*) AS turns, count(DISTINCT session_id) AS sessions, max(ts) AS newest
+  FROM sessions.conversation_turns WHERE org_id = :'org' AND workspace_id = :'ws';
+-- one session's rows in relayhistory's order (compare with the Worker's answer)
+SELECT id, source, turn_index, role, ts FROM sessions.conversation_turns
+ WHERE org_id = :'org' AND workspace_id = :'ws' AND session_id = :'session'
+ ORDER BY turn_index, workspace_id COLLATE "C", source COLLATE "C", id;
+```
 
 ## Rollback
 

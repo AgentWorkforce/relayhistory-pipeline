@@ -36,6 +36,10 @@ import {
   type SessionLocation,
 } from "../shared/vendor.ts";
 import { flag, integer, optional, required } from "../shared/env.ts";
+import {
+  assertDestinationUrl,
+  destinationPolicy,
+} from "../shared/destination-url.ts";
 import { mintToken } from "./auth.ts";
 import { feedOrigin, feedRanges, readFeedRecords } from "./feed-records.ts";
 import { hexTraceId, isUuidV7, spanId, uuidv7 } from "../shared/ids.ts";
@@ -179,14 +183,29 @@ export function configFromEnv(): CourierConfig {
   if (startMode !== "all" && startMode !== "new")
     throw new Error("96bulls: COURIER_START_MODE must be all or new");
   let token: BearerTokenProvider;
+  // ALLOW_IN_CLUSTER_HTTP: one policy for every destination below.
+  const policy = destinationPolicy();
   const cloudSession = !!process.env.CLOUD_URL;
   const relayAuthSession = !!process.env.RELAYAUTH_URL;
+  const ingestUrl = required("INGEST_URL").replace(/\/$/, "");
+  if (cloudSession || relayAuthSession) {
+    // A durable, machine-bound assertion rides on every upload: the ingest
+    // URL gets the same transport rule as the mint URL.
+    assertDestinationUrl("INGEST_URL", ingestUrl, policy);
+  } else {
+    // Local signing key / fixed token are local-only modes (Docker network
+    // names such as http://96bulls-ingest:8080); only the URL shape is checked.
+    assertDestinationUrl("INGEST_URL", ingestUrl, { allowInClusterHttp: false }, {
+      allowAnyHttpHost: true,
+    });
+  }
   if (cloudSession) {
     token = new CloudSessionAssertionProvider({
       baseUrl: required("CLOUD_URL"),
       workspaceId,
       machineId: required("MACHINE_ID"),
       cloudToken: secretCommand(required("CLOUD_TOKEN_COMMAND_JSON")),
+      destinationPolicy: policy,
     });
   } else if (relayAuthSession) {
     token = new RelayAuthAssertionProvider({
@@ -197,6 +216,7 @@ export function configFromEnv(): CourierConfig {
       machineId: required("MACHINE_ID"),
       sponsorId: userId,
       apiKey: secretCommand(required("RELAYAUTH_API_KEY_COMMAND_JSON")),
+      destinationPolicy: policy,
       expiresInSeconds: integer("RELAYAUTH_ASSERTION_TTL_SECONDS", 60),
       refreshSkewSeconds: integer(
         "RELAYAUTH_ASSERTION_REFRESH_SKEW_SECONDS",
@@ -238,7 +258,7 @@ export function configFromEnv(): CourierConfig {
       "COURIER_STATE",
       join(dirname(dbPath), ".alleyoop-courier.json"),
     ),
-    ingestUrl: required("INGEST_URL").replace(/\/$/, ""),
+    ingestUrl,
     token,
     orgId,
     workspaceId,

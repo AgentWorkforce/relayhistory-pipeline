@@ -289,3 +289,122 @@ describe("CloudSessionAssertionProvider", () => {
     ).toThrow(/credentials/);
   });
 });
+
+describe("in-cluster plain HTTP (ALLOW_IN_CLUSTER_HTTP)", () => {
+  const base = {
+    historyOrigin: "https://history.example",
+    orgId: "org",
+    workspaceId: "workspace",
+    machineId: "machine-a",
+    sponsorId: "user",
+    apiKey: async () => "rak_test_only_not_a_real_key",
+  };
+
+  test("a Service URL needs the explicit policy; the default refuses it", () => {
+    const baseUrl = "http://relayauth.relayauth.svc:8787";
+    expect(() => new RelayAuthAssertionProvider({ ...base, baseUrl })).toThrow(
+      /RELAYAUTH_URL must use https/,
+    );
+    expect(
+      () =>
+        new RelayAuthAssertionProvider({
+          ...base,
+          baseUrl,
+          destinationPolicy: { allowInClusterHttp: true },
+        }),
+    ).not.toThrow();
+  });
+
+  test("the mint goes to the in-cluster URL and binds the configured origin unchanged", async () => {
+    const seen: Array<{ url: string; body: { historyOrigin?: string } }> = [];
+    const provider = new RelayAuthAssertionProvider({
+      ...base,
+      baseUrl: "http://relayauth.relayauth.svc:8787/",
+      destinationPolicy: { allowInClusterHttp: true },
+      fetcher: async (url, init) => {
+        seen.push({ url: String(url), body: JSON.parse(String(init!.body)) });
+        return Response.json(
+          {
+            accessToken: "assertion",
+            accessTokenExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+            tokenType: "Bearer",
+          },
+          { status: 201 },
+        );
+      },
+    });
+    expect(await provider.get()).toBe("assertion");
+    expect(seen).toEqual([
+      {
+        url: "http://relayauth.relayauth.svc:8787/v1/tokens/relayhistory-assertion",
+        body: expect.objectContaining({ historyOrigin: "https://history.example" }),
+      },
+    ]);
+  });
+
+  test("the policy does not relax public hosts, IPs or the origin rule", () => {
+    const policy = { allowInClusterHttp: true };
+    for (const baseUrl of [
+      "http://relayauth.example.com",
+      "http://10.0.0.1",
+      "http://evil.svc.example.com",
+      "http://svc",
+    ])
+      expect(
+        () => new RelayAuthAssertionProvider({ ...base, baseUrl, destinationPolicy: policy }),
+      ).toThrow(/must use https/);
+    expect(
+      () =>
+        new RelayAuthAssertionProvider({
+          ...base,
+          baseUrl: "http://user:pass@relayauth.relayauth.svc",
+          destinationPolicy: policy,
+        }),
+    ).toThrow(/must not contain credentials/);
+    expect(
+      () =>
+        new RelayAuthAssertionProvider({
+          ...base,
+          baseUrl: "http://relayauth.relayauth.svc:8787",
+          historyOrigin: "http://history.example",
+          destinationPolicy: policy,
+        }),
+    ).toThrow(/RELAYAUTH_HISTORY_ORIGIN must use https/);
+    expect(
+      () =>
+        new RelayAuthAssertionProvider({
+          ...base,
+          baseUrl: "http://relayauth.relayauth.svc:8787",
+          historyOrigin: "https://history.example/",
+          destinationPolicy: policy,
+        }),
+    ).toThrow(/RELAYAUTH_HISTORY_ORIGIN must be an exact bare origin/);
+  });
+
+  test("CLOUD_URL follows the same rule", () => {
+    const cloud = {
+      workspaceId: "ws",
+      machineId: "machine-a",
+      cloudToken: async () => "cloud-test-only",
+    };
+    expect(
+      () => new CloudSessionAssertionProvider({ ...cloud, baseUrl: "http://cloud.cloud.svc:3000" }),
+    ).toThrow(/CLOUD_URL must use https/);
+    expect(
+      () =>
+        new CloudSessionAssertionProvider({
+          ...cloud,
+          baseUrl: "http://cloud.cloud.svc:3000",
+          destinationPolicy: { allowInClusterHttp: true },
+        }),
+    ).not.toThrow();
+    expect(
+      () =>
+        new CloudSessionAssertionProvider({
+          ...cloud,
+          baseUrl: "http://cloud.example.com",
+          destinationPolicy: { allowInClusterHttp: true },
+        }),
+    ).toThrow(/CLOUD_URL must use https/);
+  });
+});
