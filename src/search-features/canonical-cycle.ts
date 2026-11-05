@@ -189,9 +189,15 @@ export async function copyCanonicalEntry(
             entry.kind === "retire"
               ? (rows.rows as CanonicalBriefTombstone[]) : [], ev);
     if (produced.kind !== "rows") return produced;
+    // Post-await fences: an abort between boundaries performs zero later
+    // CH/ACK effects even if the blocked promise releases afterward.
+    if (signal?.aborted)
+      return { kind: "refused" as const, reason: "aborted" };
     await ch.insert(
       kind === "event" ? EVENT_FEATURES_TABLE : BRIEF_FEATURES_TABLE,
       produced.rows);
+    if (signal?.aborted)
+      return { kind: "refused" as const, reason: "aborted" };
     await acks.ackPage({
       entry, kind, cursor: request ?? "start",
       nextCursor: page.cursor, pageSha256: page.pageSha256,
@@ -240,6 +246,7 @@ export async function copyCanonicalEntry(
   if (signal?.aborted) return { kind: "refused", reason: "aborted" };
   if (guards?.beforeFinish && !(await guards.beforeFinish()))
     return { kind: "refused", reason: "lease_lost" };
+  if (signal?.aborted) return { kind: "refused", reason: "aborted" };
   // finish CAS: terminal descriptors + all page ACKs + still-current authority
   await acks.finish({
     entry, terminalEvent, terminalBrief,

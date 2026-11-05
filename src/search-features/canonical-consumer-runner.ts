@@ -63,20 +63,27 @@ export class CanonicalConsumerRunner {
     healthy: true, lastAt: null as string | null };
   private running = false;
   private stopped = false;
+  private readonly makeConsumer: () => CanonicalConsumer;
   constructor(
-    private readonly consumer: CanonicalConsumer,
+    consumer: CanonicalConsumer | (() => CanonicalConsumer),
     private readonly images: CanonicalImagePort,
     private readonly ch: ClickHouseClient,
     private readonly cfg: RuntimeConfig,
-  ) { validateRuntimeConfig(cfg); }
+  ) {
+    validateRuntimeConfig(cfg);
+    this.makeConsumer =
+      typeof consumer === "function" ? consumer : () => consumer;
+  }
 
   static make(
     db: SqlQuery, journal: CanonicalJournalStore,
     acks: CanonicalPageAckStore, images: CanonicalImagePort,
     ch: ClickHouseClient, cfg: RuntimeConfig,
   ): CanonicalConsumerRunner {
+    // Per-RUN fencing: each run() builds a consumer with a fresh nonce —
+    // a redeployed instance can never share the prior run's lease identity.
     return new CanonicalConsumerRunner(
-      new CanonicalConsumer(db, journal, acks,
+      () => new CanonicalConsumer(db, journal, acks,
         { ...cfg, ownerId: fencedOwner(cfg.ownerId) }),
       images, ch, cfg);
   }
@@ -108,7 +115,7 @@ export class CanonicalConsumerRunner {
                 [signal ?? new AbortController().signal,
                  AbortSignal.timeout(remaining)])
             : signal;
-          const r = await this.consumer.drain(
+          const r = await this.makeConsumer().drain(
             this.images, this.ch, bounded);
           this.stats = { ...this.stats, runs: this.stats.runs + 1,
             copied: this.stats.copied + r.copied,
