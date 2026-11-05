@@ -1,9 +1,11 @@
 /**
- * Local auth for the AlleyOop ingest API. The vendored middleware accepts an
- * RS256 JWT verified against a JWKS URL when `ALLOW_INTERIM_RELAYAUTH_BEARER`
- * is on. Locally, `96bulls up` mints a key pair, the ingest server publishes
- * the public key at `/.well-known/jwks.json`, and the courier gets a token.
- * Hosted and customer installs point `RELAYAUTH_JWKS_URL` at RelayAuth instead.
+ * Local auth for the AlleyOop ingest API. Locally (`ALLOW_INTERIM_RELAYAUTH_BEARER`
+ * on, no origin), the vendored middleware accepts an RS256 JWT verified against
+ * a JWKS URL: `96bulls up` mints a key pair, the ingest server publishes the
+ * public key at `/.well-known/jwks.json`, and the courier gets a token.
+ * Hosted and customer installs point `RELAYAUTH_JWKS_URL` at RelayAuth and set
+ * `RELAYHISTORY_ORIGIN`, which admits only RelayAuth's assertions minted for
+ * that origin, with the interim bearer off.
  */
 import {
   createPrivateKey,

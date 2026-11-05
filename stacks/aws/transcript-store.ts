@@ -49,6 +49,7 @@ import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hard
 import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 import {
+  SESSION_BRIEF_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
   assertSessionPipelineInputs,
   pipelineBucketStatements,
@@ -201,6 +202,8 @@ export type TranscriptStorePlanPhase =
   | "session pipeline update"
   | "session read api rollout"
   | "session read api update"
+  | "session brief rollout"
+  | "session brief update"
   | "repo tag rename";
 
 /**
@@ -264,6 +267,55 @@ function sessionPipelinePhase(operations: ReadonlyMap<string, string>): Transcri
   return undefined;
 }
 
+/**
+ * The brief schedule's own phases (session-pipeline.ts SESSION_BRIEF_RESOURCES). Rollout: its
+ * resources are created (all, or the rest after a partial apply). Update: only the rule
+ * changes in place (its state when `briefs.enabled` flips); the permission stays noop.
+ * In either, the rest of the plan is
+ * all noop, or exactly a session pipeline update (the function's env, plus the role-ARN
+ * cascade, checked by assertPipelineRoleCascadeDiff); the read API stays noop, or changes by
+ * exactly its code-only cascade (assertReadApiCodeOnlyCascade). Undefined
+ * when every brief resource is noop: the plan is then judged as before.
+ */
+function sessionBriefPhase(
+  operations: ReadonlyMap<string, string>,
+  detailedPlanText: string,
+  stateSnapshotText: string | undefined,
+  refuse: (why: string) => never,
+): TranscriptStorePlanPhase | undefined {
+  // Absent (a plan captured before briefs) or all noop: not a brief phase. expectedResources
+  // already refused a plan that lists some brief resources but not all.
+  const [schedule, permission] = SESSION_BRIEF_RESOURCES.map((r) => operations.get(r) ?? "noop");
+  const brief = [schedule, permission];
+  if (brief.every((a) => a === "noop")) return undefined;
+  const changes = () => [...operations].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ");
+  const phase: TranscriptStorePlanPhase | undefined =
+    brief.every((a) => a === "create" || a === "noop")
+      ? "session brief rollout"
+      : schedule === "update" && permission === "noop"
+        ? "session brief update"
+        : undefined;
+  // The EventBridge permission is create-once. Enabling or disabling briefs changes only
+  // the schedule state; an in-place permission edit could widen the invoking principal.
+  if (!phase) return refuse(`session brief resources have an unsafe action combination: ${changes()}`);
+  // The read API stays noop, except for the code-only cascade a shared-code change on main
+  // causes (assertReadApiCodeOnlyCascade): it is then judged on its own and left out of the rest.
+  const readApi = SESSION_READ_API_RESOURCES as readonly string[];
+  if (!readApi.every((r) => !operations.has(r) || operations.get(r) === "noop")) {
+    if (!readApiCodeOnlyShape(operations))
+      return refuse(`${phase}: the read api may not change in the same plan: ${changes()}`);
+    assertReadApiCodeOnlyCascade(detailedPlanText, stateSnapshotText, (why) => refuse(`${phase}: ${why}`));
+  }
+  const rest = new Map(
+    [...operations].filter(([r]) => !(SESSION_BRIEF_RESOURCES as readonly string[]).includes(r) && !readApi.includes(r)),
+  );
+  if ([...rest.values()].every((a) => a === "noop")) return phase;
+  if (sessionPipelinePhase(rest) !== "session pipeline update")
+    return refuse(`${phase}: the rest of the plan must be noop or a session pipeline update: ${changes()}`);
+  assertPipelineRoleCascadeDiff(rest, detailedPlanText, stateSnapshotText, refuse);
+  return phase;
+}
+
 const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; actions: Readonly<Record<string, "create" | "update">> }> = [
   { name: "initial", actions: Object.fromEntries(TRANSCRIPT_RESOURCES.map((resource) => [resource, "create"])) },
   { name: "principal-propagation recovery", actions: { transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" } },
@@ -291,15 +343,19 @@ export interface TranscriptStorePlanCapture {
 
 /**
  * The resources a plan must list: the store's resources, plus every pipeline resource
- * once any of them appears, plus every read API resource once any of those does.
+ * once any of them appears, plus every read API resource once any of those does, plus
+ * every brief resource once any of those does (and then the pipeline's too).
  */
 function expectedResources(names: Iterable<string>): readonly string[] {
   const list = [...names];
   const pipeline = new Set<string>(SESSION_PIPELINE_RESOURCES);
   const readApi = new Set<string>(SESSION_READ_API_RESOURCES);
+  const brief = new Set<string>(SESSION_BRIEF_RESOURCES);
+  const withBrief = list.some((n) => brief.has(n));
   return [
     ...TRANSCRIPT_RESOURCES,
-    ...(list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
+    ...(withBrief || list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
+    ...(withBrief ? SESSION_BRIEF_RESOURCES : []),
     ...(list.some((n) => readApi.has(n)) ? SESSION_READ_API_RESOURCES : []),
   ];
 }
@@ -380,6 +436,9 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
     assertRepoTagRenameDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
     return "repo tag rename";
   }
+  // The brief schedule changes alone, or with exactly a session pipeline update.
+  const briefPhase = sessionBriefPhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
+  if (briefPhase) return briefPhase;
   // The read API changes alone (or, in its rollout, with the pipeline's exact code-only cascade);
   // once it is all noop, the rest of the plan is judged as before.
   if (SESSION_READ_API_RESOURCES.some((r) => compact.operations.has(r))) {
@@ -470,63 +529,119 @@ function assertPipelineRoleCascadeDiff(
   const cascade = new Set<string>(["session-pipeline", ...updated]);
   const others = [...operations].filter(([r, a]) => a !== "noop" && !cascade.has(r)).map(([r, a]) => `${r}:${a}`);
   if (others.length) refuse(`session pipeline update: the role-ARN cascade comes with other changes: ${others.join(", ")}`);
-  const roleArn = stateSnapshotText === undefined ? undefined : pipelineRoleArnFromState(stateSnapshotText, refuse);
+  const roleArn = stateSnapshotText === undefined ? undefined : roleArnFromState(stateSnapshotText, "session-pipeline", "session pipeline update", refuse);
   const lines = detailedPlanText.split(/\r?\n/);
   const replaced = new Set<string>();
-  for (const resource of updated) {
-    const block = detailedBlock(lines, resource);
-    const marked = block.map((line) => /^  ([+-]) (.*)$/.exec(line));
-    let cascades = 0;
-    for (let i = 0; i < block.length; ) {
-      if (!marked[i]) {
-        i++;
-        continue;
-      }
-      let j = i;
-      while (j < block.length && marked[j]?.[1] === "-") j++;
-      let k = j;
-      while (k < block.length && marked[k]?.[1] === "+") k++;
-      const minus = marked.slice(i, j).map((m) => m![2]!);
-      const plus = marked.slice(j, k).map((m) => m![2]!);
-      if (minus.length === 0 || minus.length !== plus.length)
-        refuse(`session pipeline update: ${resource} adds or removes lines (${minus.length} - / ${plus.length} +), not only the role-ARN cascade`);
-      for (let n = 0; n < minus.length; n++) {
-        if (minus[n] === plus[n]) continue;
-        const old = ROLE_ARN_LINE.exec(minus[n]!);
-        if (!old || plus[n] !== `${old[1]}${KNOWN_AFTER_APPLY}`)
-          refuse(`session pipeline update: ${resource} changes ${JSON.stringify(minus[n]!.trim())} to ${JSON.stringify(plus[n]!.trim())}, not only the role-ARN cascade`);
-        if (roleArn !== undefined && old[2] !== roleArn)
-          refuse(`session pipeline update: ${resource} replaces ${old[2]}, which is not the session pipeline's role ${roleArn}`);
-        replaced.add(old[2]!);
-        cascades++;
-      }
-      i = k;
-    }
-    if (cascades === 0) refuse(`session pipeline update: ${resource} updates without the role-ARN cascade`);
-  }
-  const role = new RegExp(`^arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/[A-Za-z0-9_+=,.@-]+$`);
-  if (replaced.size !== 1 || ![...replaced].every((arn) => role.test(arn)))
-    refuse(`session pipeline update: the cascade must replace exactly one role ARN in ${TRANSCRIPT_ACCOUNT_ID}, found ${[...replaced].join(", ")}`);
+  for (const resource of updated)
+    for (const arn of roleArnCascade(lines, resource, roleArn, "session pipeline update", "the session pipeline's role", refuse)) replaced.add(arn);
+  assertOneAccountRole(replaced, "session pipeline update", refuse);
 }
 
-/** The session pipeline function's execution role ARN, as the capture's state snapshot records it. */
-function pipelineRoleArnFromState(stateSnapshotText: string, refuse: (why: string) => never): string {
+/**
+ * One updated resource's detailed block must be exactly the role-ARN cascade (see
+ * assertPipelineRoleCascadeDiff), at least once. Returns the role ARNs it replaces; each must be
+ * `roleArn` when the capture's state snapshot gives it.
+ */
+function roleArnCascade(
+  lines: readonly string[],
+  resource: string,
+  roleArn: string | undefined,
+  label: string,
+  roleName: string,
+  refuse: (why: string) => never,
+): Set<string> {
+  const block = detailedBlock(lines, resource);
+  const marked = block.map((line) => /^  ([+-]) (.*)$/.exec(line));
+  const replaced = new Set<string>();
+  let cascades = 0;
+  for (let i = 0; i < block.length; ) {
+    if (!marked[i]) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < block.length && marked[j]?.[1] === "-") j++;
+    let k = j;
+    while (k < block.length && marked[k]?.[1] === "+") k++;
+    const minus = marked.slice(i, j).map((m) => m![2]!);
+    const plus = marked.slice(j, k).map((m) => m![2]!);
+    if (minus.length === 0 || minus.length !== plus.length)
+      refuse(`${label}: ${resource} adds or removes lines (${minus.length} - / ${plus.length} +), not only the role-ARN cascade`);
+    for (let n = 0; n < minus.length; n++) {
+      if (minus[n] === plus[n]) continue;
+      const old = ROLE_ARN_LINE.exec(minus[n]!);
+      if (!old || plus[n] !== `${old[1]}${KNOWN_AFTER_APPLY}`)
+        refuse(`${label}: ${resource} changes ${JSON.stringify(minus[n]!.trim())} to ${JSON.stringify(plus[n]!.trim())}, not only the role-ARN cascade`);
+      if (roleArn !== undefined && old[2] !== roleArn)
+        refuse(`${label}: ${resource} replaces ${old[2]}, which is not ${roleName} ${roleArn}`);
+      replaced.add(old[2]!);
+      cascades++;
+    }
+    i = k;
+  }
+  if (cascades === 0) refuse(`${label}: ${resource} updates without the role-ARN cascade`);
+  return replaced;
+}
+
+function assertOneAccountRole(replaced: ReadonlySet<string>, label: string, refuse: (why: string) => never) {
+  const role = new RegExp(`^arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/[A-Za-z0-9_+=,.@-]+$`);
+  if (replaced.size !== 1 || ![...replaced].every((arn) => role.test(arn)))
+    refuse(`${label}: the cascade must replace exactly one role ARN in ${TRANSCRIPT_ACCOUNT_ID}, found ${[...replaced].join(", ")}`);
+}
+
+/**
+ * The read API's code-only shape: `session-read-api` updates, `session-read-api-secret` updates or
+ * is noop, and both alarms are noop. Nothing is created, so a first rollout never rides along.
+ */
+function readApiCodeOnlyShape(operations: ReadonlyMap<string, string>): boolean {
+  if (operations.get("session-read-api") !== "update") return false;
+  const secret = operations.get("session-read-api-secret") ?? "noop";
+  if (secret !== "update" && secret !== "noop") return false;
+  return SESSION_READ_API_RESOURCES.filter((r) => r !== "session-read-api" && r !== "session-read-api-secret").every(
+    (r) => (operations.get(r) ?? "noop") === "noop",
+  );
+}
+
+/**
+ * The read API's code-only cascade: shared code changed on main, so its bundle (and Alchemy's
+ * view of its role ARN) changes while none of its settings do. `session-read-api` must show
+ * exactly "no declared property changes", and a `session-read-api-secret` update must be exactly
+ * the role-ARN cascade for the read API's own role (from the state snapshot when there is one),
+ * never the pipeline's.
+ */
+function assertReadApiCodeOnlyCascade(detailedPlanText: string, stateSnapshotText: string | undefined, refuse: (why: string) => never) {
+  const label = "read api code-only update";
+  const lines = detailedPlanText.split(/\r?\n/);
+  const body = detailedBlock(lines, "session-read-api").map((l) => l.trim()).filter(Boolean);
+  if (body.length !== 1 || body[0] !== "no declared property changes")
+    refuse(`${label}: session-read-api may update only with no declared property changes`);
+  if (!lines.some((l) => l.trim() === "[session-read-api-secret] update")) return;
+  const roleArn = stateSnapshotText === undefined ? undefined : roleArnFromState(stateSnapshotText, "session-read-api", label, refuse);
+  const replaced = roleArnCascade(lines, "session-read-api-secret", roleArn, label, "the read api's role", refuse);
+  assertOneAccountRole(replaced, label, refuse);
+  const pipelineRole = stateSnapshotText === undefined ? undefined : roleArnFromState(stateSnapshotText, "session-pipeline", label, refuse);
+  if (pipelineRole !== undefined && replaced.has(pipelineRole))
+    refuse(`${label}: session-read-api-secret replaces the session pipeline's role`);
+}
+
+/** A function's execution role ARN, as the capture's state snapshot records it. */
+function roleArnFromState(stateSnapshotText: string, resource: string, label: string, refuse: (why: string) => never): string {
   let objects: Array<{ key: string; text: string }>;
   try {
     objects = (JSON.parse(stateSnapshotText) as { objects: Array<{ key: string; text: string }> }).objects;
   } catch {
-    return refuse("session pipeline update: state snapshot is not valid JSON");
+    return refuse(`${label}: state snapshot is not valid JSON`);
   }
-  const hits = (objects ?? []).filter((o) => o.key === `${alchemyStatePrefix(TRANSCRIPT_STAGE)}/session-pipeline.json`);
-  if (hits.length !== 1) refuse(`session pipeline update: state snapshot has ${hits.length} session-pipeline records`);
+  const hits = (objects ?? []).filter((o) => o.key === `${alchemyStatePrefix(TRANSCRIPT_STAGE)}/${resource}.json`);
+  if (hits.length !== 1) refuse(`${label}: state snapshot has ${hits.length} ${resource} records`);
   let fn: { status?: string; attr?: { roleArn?: unknown } };
   try {
     fn = JSON.parse(hits[0]!.text) as typeof fn;
   } catch {
-    return refuse("session pipeline update: the session-pipeline state record is not valid JSON");
+    return refuse(`${label}: the ${resource} state record is not valid JSON`);
   }
   if ((fn.status !== "created" && fn.status !== "updated") || typeof fn.attr?.roleArn !== "string" || !fn.attr.roleArn)
-    refuse("session pipeline update: session-pipeline is not created in state with a roleArn");
+    refuse(`${label}: ${resource} is not created in state with a roleArn`);
   return fn.attr!.roleArn as string;
 }
 
@@ -613,7 +728,7 @@ function assertRepoTagRenameDiff(
         }
         const principal = ROLE_ARN_LINE.exec(was);
         if (grant && pipelineUpdates && principal && now === principal[1] + KNOWN_AFTER_APPLY) {
-          if (stateSnapshotText !== undefined) stateRole ??= pipelineRoleArnFromState(stateSnapshotText, refuse);
+          if (stateSnapshotText !== undefined) stateRole ??= roleArnFromState(stateSnapshotText, "session-pipeline", "session pipeline update", refuse);
           if (stateRole !== undefined && principal[2] !== stateRole)
             why(`${resource} replaces ${principal[2]}, which is not the session pipeline's role ${stateRole}`);
           cascadeArns.add(principal[2]!);

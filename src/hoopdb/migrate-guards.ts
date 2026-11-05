@@ -107,6 +107,8 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_directory_resurrection_fences": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_directory_agents": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_directory_relationships": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory_event_times": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_directory_event_pending": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.manifest_readiness": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.export_deferred_sessions": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.claimless_uses": ["SELECT", "INSERT", "UPDATE"],
@@ -144,6 +146,8 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_directory_resurrection_fences",
   "sessions.session_directory_agents",
   "sessions.session_directory_relationships",
+  "sessions.session_directory_event_times",
+  "sessions.session_directory_event_pending",
   "sessions.manifest_readiness",
   "sessions.export_deferred_sessions",
   "sessions.claimless_uses",
@@ -178,7 +182,12 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)",
   "sessions.session_index_batch(jsonb)",
   "sessions.session_index_scrub_sticky()",
+  "sessions.session_publication_is_managed(text,text,text,text,text)",
+  "sessions.session_publication_lock(jsonb)",
+  "sessions.session_publication_probe(jsonb)",
+  "sessions.session_publication_register_object(jsonb)",
   "sessions.set_session_state(text,text,text,text,text,text,timestamp with time zone)",
+  "sessions.set_session_state_for_publication(text,text,text,text,text,text,bigint,text,timestamp with time zone,text)",
   "sessions.upsert_machine(text,text,text,text,text,text,timestamp with time zone)",
   "sessions.upsert_session_index(jsonb)",
 ] as const;
@@ -1061,7 +1070,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "52ff269fc6d1149ad6a92dd5b5dc1f0f1dc7d69fa538bbdef08a1579f667fe21";
+  "41359cbc4ef669435d885f2e3d7ef1f76ac6d95c82d858b40213c1c9ddd7a439";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

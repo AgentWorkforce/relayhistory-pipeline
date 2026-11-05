@@ -27,6 +27,8 @@ async function database(withRole = true): Promise<PGlite> {
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
+  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
+  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await db.exec(read(`supabase/migrations/${file}`));
   if (withRole) await db.exec(ROLE);
   return db;
@@ -126,6 +128,22 @@ describe("sqlLiveness as the role", () => {
       { source: "claude", sessionId: "gone" },
     ]);
     expect([...erased]).toEqual(["codex\u0000gone"]);
+  }, 60_000);
+
+  test("livePointerSessions: ids with a live pointer in this workspace, any harness", async () => {
+    const db = await database();
+    await pointer(db, { session: "live" });
+    await pointer(db, { session: "half", machine: "m-1", deleted: true });
+    await pointer(db, { session: "half", harness: "claude", machine: "m-2" });
+    await pointer(db, { session: "gone", deleted: true });
+    // Live elsewhere only: another workspace, another org.
+    await pointer(db, { ws: "ws-b", session: "other-ws" });
+    await pointer(db, { org: "org-b", session: "other-org" });
+    const liveness = sqlLiveness(poolTenantRunner(asRole(db)));
+    const ids = ["live", "half", "gone", "other-ws", "other-org", "absent"];
+    expect([...(await liveness.livePointerSessions("org-a", "ws-a", ids))].sort()).toEqual(["half", "live"]);
+    expect([...(await liveness.livePointerSessions("org-a", "ws-b", ids))]).toEqual(["other-ws"]);
+    expect([...(await liveness.livePointerSessions("org-a", "ws-a", []))]).toEqual([]);
   }, 60_000);
 
   test("sessionStart: earliest live created_at, pointer counts, optional harness", async () => {

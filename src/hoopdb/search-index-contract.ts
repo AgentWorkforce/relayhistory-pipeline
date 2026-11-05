@@ -379,7 +379,8 @@ export const SESSION_DIRECTORY_READINESS_RPC = {
 } as const;
 
 /**
- * The model-written brief for one logical session (20261102000000), for relayhistory-cloud's
+ * The model-written brief for one logical session (20261102000000; `state` from
+ * 20261102020000), for relayhistory-cloud's
  * GET /v1/sessions/:id/brief. Zero rows when the session has no live pointer.
  */
 export const SESSION_BRIEF_RPC = {
@@ -398,6 +399,7 @@ export const SESSION_BRIEF_RPC = {
     "stale",
     "title",
     "description",
+    "state",
     "revision",
     "current_revision",
     "prompt_version",
@@ -617,6 +619,25 @@ export const REQUIRED_SEARCH_INDEXES = [
       "on sessions.session_directory_machines",
       "(org_id, workspace_id, machine_id, last_activity_at desc, session_id desc, harness desc)",
     ],
+    requiresDirectoryProjection: true,
+  },
+  {
+    id: "event-activity-window",
+    indexName: "session_directory_event_times_window_idx",
+    tableName: "session_directory_event_times",
+    consumers: ["History exact no-query session activity"],
+    queryShape: "org + workspace + inclusive event timestamp window; distinct sessions per UTC day and harness",
+    definitionFragments: ["on sessions.session_directory_event_times", "(org_id, workspace_id, event_ts, harness, session_id)"],
+    requiresDirectoryProjection: true,
+  },
+  {
+    id: "project-name-exact-recent",
+    indexName: "session_directory_project_name_recent_idx",
+    tableName: "session_directory",
+    consumers: ["History exact recorded project-name session lookup"],
+    queryShape: "org + workspace + exact normalized project_name; event activity recency keyset across all harnesses",
+    definitionFragments: ["on sessions.session_directory", "(org_id, workspace_id, project_name, event_last_ts desc, session_id desc, harness desc)"],
+    expectedPredicate: "((deleted_at IS NULL) AND (project_name IS NOT NULL))",
     requiresDirectoryProjection: true,
   },
 ] as const satisfies readonly SearchIndexRequirement[];

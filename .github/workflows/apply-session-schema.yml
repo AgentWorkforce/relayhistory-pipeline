@@ -1,0 +1,112 @@
+name: guarded session schema release
+run-name: schema ${{ inputs.mode }} ${{ inputs.sha }}
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [plan, apply]
+        required: true
+      sha:
+        description: Exact current main commit (40 lowercase hex)
+        type: string
+        required: true
+      generation:
+        description: Exact migration --generation from this SHA (64 lowercase hex)
+        type: string
+        required: true
+      boundary:
+        description: Existing catalog-proven control; never installed by this workflow
+        type: choice
+        options: [event-trigger, global-default-revoke]
+        required: true
+      plan_run:
+        description: Apply only - successful plan run ID from this SHA (within 24 hours)
+        type: string
+        default: ""
+      approval:
+        description: "Apply only: APPLY pyamkrhoyszgzirqqffq <sha> <generation> PLAN <plan_run>"
+        type: string
+        default: ""
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+concurrency:
+  group: guarded-session-schema-production
+  cancel-in-progress: false
+env:
+  RELEASE_MODE: ${{ inputs.mode }}
+  RELEASE_SHA: ${{ inputs.sha }}
+  RELEASE_GENERATION: ${{ inputs.generation }}
+  RELEASE_BOUNDARY: ${{ inputs.boundary }}
+  RELEASE_PLAN_RUN: ${{ inputs.plan_run }}
+  RELEASE_APPROVAL: ${{ inputs.approval }}
+jobs:
+  # No environment here: a typo/missing environment must not auto-create an unprotected one.
+  prerequisite-gate:
+    if: github.repository == 'AgentWorkforce/sessions-pipeline' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Verify live main, environment protection and exact-head CI
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bun scripts/schema-release-github.ts
+          echo "environment=session-schema-production" >> "$GITHUB_OUTPUT"
+      - name: Verify generation before requesting environment approval
+        run: |
+          test "$(bun src/hoopdb/migrate.ts --generation)" = "$RELEASE_GENERATION"
+  database:
+    needs: prerequisite-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: ${{ needs.prerequisite-gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Verify actual human approval and recheck live gates
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/schema-release-github.ts --approved
+      - name: Download the prior plan, with exact workflow/run provenance already checked
+        if: inputs.mode == 'apply'
+        uses: actions/download-artifact@v4
+        with:
+          name: schema-release-plan
+          path: release-plan
+          repository: AgentWorkforce/sessions-pipeline
+          run-id: ${{ inputs.plan_run }}
+          github-token: ${{ github.token }}
+      - name: Read-only plan or approved apply (only step with database secret)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
+        run: bun scripts/schema-release-database.ts
+      - name: Publish non-secret read-only plan
+        if: inputs.mode == 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-release-plan
+          path: release-plan/plan.json
+          if-no-files-found: error
+          retention-days: 1

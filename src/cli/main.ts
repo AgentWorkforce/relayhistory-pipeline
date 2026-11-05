@@ -24,6 +24,7 @@ import { generateLocalKeys, mintToken } from "../alleyoop/auth.ts";
 import { seedConcourse } from "../concourse/seed.ts";
 import { planChildExitCode, planChildMustFailClosed } from "./plan-exit.ts";
 import { awsInvocation } from "./aws.ts";
+import { sandboxAlchemyEnv } from "./sandbox-credentials.ts";
 import { HOOPDB_NAME, HOOPDB_USER, NAMES, PORTS, SERVICES_CONTAINER_UID, TENANT, summaryKeyAccess, summaryKeyPath } from "../../stacks/local/topology.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -36,10 +37,10 @@ function die(message: string, code = 2): never {
   process.exit(code);
 }
 
-function sh(cmd: string, cmdArgs: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv; quiet?: boolean; allowFail?: boolean } = {}) {
+function sh(cmd: string, cmdArgs: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv; baseEnv?: NodeJS.ProcessEnv; quiet?: boolean; allowFail?: boolean } = {}) {
   const r = spawnSync(cmd, cmdArgs, {
     cwd: opts.cwd ?? ROOT,
-    env: { ...process.env, ...opts.env },
+    env: { ...(opts.baseEnv ?? process.env), ...opts.env },
     stdio: opts.quiet ? ["ignore", "pipe", "pipe"] : "inherit",
     encoding: "utf8",
   });
@@ -305,24 +306,34 @@ function status(stage: string) {
 
 async function aws(verb: "plan" | "up" | "down", stage: string) {
   let inv;
+  let baseEnv: NodeJS.ProcessEnv = process.env;
   try {
     inv = awsInvocation(verb, stage, process.env, { detailed: flags.has("--detailed") });
+    // aws-proof-sandbox: Alchemy reads only static env keys; resolve `pippen sandbox exec`'s
+    // profile once into the children's env, or refuse with the --static-credentials command.
+    baseEnv = sandboxAlchemyEnv(verb, stage, process.env, {
+      runAws: (a, env) => {
+        const r = spawnSync("aws", a, { cwd: ROOT, env, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }); // stdout (the credentials) is captured, never shown
+        if (r.error) throw r.error;
+        return { status: r.status, stdout: r.stdout ?? "" };
+      },
+    }) as NodeJS.ProcessEnv;
     if (verb === "plan" && flags.has("--capture")) {
       const { capturePlan } = await import("./aws-provenance-io.ts");
-      const rec = capturePlan(ROOT, stage, process.env);
+      const rec = capturePlan(ROOT, stage, baseEnv);
       console.log(`96bulls: captured ${rec.summary} for ${stage} at ${rec.source.commit} -> docs/plans/${stage}.provenance.json`);
       return;
     }
     if (verb === "up") {
       const { verifyCapturedPlan } = await import("./aws-provenance-io.ts");
-      const rec = verifyCapturedPlan(ROOT, stage);
+      const rec = verifyCapturedPlan(ROOT, stage, baseEnv);
       console.log(`96bulls: captured plan verified (${rec.summary}, source ${rec.source.commit.slice(0, 12)}, state ${rec.state.versionsDigest.slice(0, 12)})`);
     }
   } catch (err) {
     die((err as Error).message);
   }
   // Fail closed: any non-zero Alchemy status exits non-zero.
-  sh("bunx", inv.args, { env: inv.env });
+  sh("bunx", inv.args, { env: inv.env, baseEnv });
 }
 
 async function main() {

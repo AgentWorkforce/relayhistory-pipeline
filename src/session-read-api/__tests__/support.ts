@@ -71,12 +71,20 @@ export function row(r: RowInput) {
   };
 }
 
-/** In-memory pointer state: erased sessions and created_at per (source, session). */
+/**
+ * In-memory pointer state of one workspace: erased sessions and created_at per
+ * (source, session). A key in `createdAt` that is not erased is a live pointer.
+ */
 export function memoryLiveness(init: { erased?: SessionKey[]; createdAt?: Record<string, number> } = {}) {
   const erased = new Set((init.erased ?? []).map(keyOf));
   const createdAt = new Map(Object.entries(init.createdAt ?? {}));
-  const calls: { erased: SessionKey[][] } = { erased: [] };
+  const calls: { erased: SessionKey[][]; livePointerSessions: string[][] } = { erased: [], livePointerSessions: [] };
   const liveness: Liveness = {
+    async livePointerSessions(_org, _ws, sessionIds) {
+      calls.livePointerSessions.push(sessionIds);
+      const live = new Set([...createdAt.keys()].filter((k) => !erased.has(k)).map((k) => k.split("\u0000")[1]!));
+      return new Set(sessionIds.filter((id) => live.has(id)));
+    },
     async erased(_org, _ws, keys) {
       calls.erased.push(keys);
       return new Set(keys.map(keyOf).filter((k) => erased.has(k)));

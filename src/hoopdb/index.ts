@@ -7,6 +7,7 @@
  */
 import {
   pointerFields,
+  postgresPipelineQueue,
   type ManifestReader,
   type PipelineQueue,
   type RawPointer,
@@ -14,7 +15,8 @@ import {
   type StageMessage,
   type TraceContext,
 } from "../shared/vendor.ts";
-import type { HoopDb } from "../shared/db.ts";
+import type { HoopDb,Transact } from "../shared/db.ts";
+import {publicationEvidence,withPublicationAuthority}from "../shared/publication-authority.ts";
 import { ctxOf, enrichMessage, sessionExt } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { uuidv7 } from "../shared/ids.ts";
@@ -22,6 +24,10 @@ import { propagatePointerTombstone } from "./session-directory-summary.ts";
 import { projectSessionDirectory } from "./session-directory-projector.ts";
 import { briefConfig } from "../session-brief/config.ts";
 import { armWakeup } from "../session-brief/store.ts";
+import {
+  canonicalManifestIdentity,
+  manifestUserId,
+} from "../shared/manifest-identity.ts";
 
 export const FAN_OUT_STAGES = [
   "summary-short",
@@ -35,6 +41,8 @@ export interface IndexDeps {
   queue: PipelineQueue;
   /** The message being handled, so fan-out continues its trace and ids. */
   current: () => StageMessage | undefined;
+  /** Compiled schema identity and one short final metadata transaction. */
+  publication?:{schemaGeneration:string;transact:Transact};
   /**
    * Session briefs (src/session-brief): the wakeup debounce, or null when briefs are off.
    * Defaults to SESSION_BRIEF_ENABLED and its timings from env.
@@ -42,7 +50,9 @@ export interface IndexDeps {
   brief?: { idleSeconds: number; maxWaitSeconds: number } | null;
 }
 
-export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
+const ROW_IDENTITY=(p:{org_id:string;workspace_id:string;harness:string;session_id:string;machine_id:string})=>JSON.stringify([p.org_id,p.workspace_id,p.harness,p.session_id,p.machine_id]);
+export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {return sessionIndex(deps,false);}
+function sessionIndex(deps:IndexDeps,authorized:boolean):SessionPointerIndex{
   const fromEnv = briefConfig();
   const brief =
     deps.brief !== undefined ? deps.brief : fromEnv.enabled ? fromEnv : null;
@@ -95,14 +105,33 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
       const read = await deps.reader.read(pointer.manifestKey);
       if (!read) return { status: "skipped", reason: "manifest_missing" };
       const m = read.manifest;
+      if(!authorized&&deps.publication){
+        const config=deps.publication;
+        if(ROW_IDENTITY(pk)!==ROW_IDENTITY({org_id:ctx.orgId,workspace_id:m.session.workspace_id,harness:m.session.harness,session_id:m.session.session_id,machine_id:m.session.machine_id}))
+          throw Object.assign(Error("publication_pointer_identity"),{code:"publication_pointer_identity"});
+        const evidence=publicationEvidence(ctx.orgId,pointer.manifestKey,m,config.schemaGeneration);
+        // Hydration above; all later reads use the same immutable RAM manifest.
+        const cached:ManifestReader={provider:deps.reader.provider,bucket:deps.reader.bucket,async read(key){
+          if(key!==pointer.manifestKey)throw new Error("publication_cached_manifest_key");return read;
+        }};
+        const final=await withPublicationAuthority(config.transact,evidence,async tx=>{
+          const db={...deps.db,query:tx.query.bind(tx)}as HoopDb;
+          return sessionIndex({...deps,db,reader:cached,queue:postgresPipelineQueue(tx)},true).upsertRawPointer(pointer,ctx);
+        });
+        return final.current?final.value:{status:"skipped",reason:"publication_retired"};
+      }
+      if(!authorized&&pointer.manifestKey.includes('/upload-generations/'))
+        throw Object.assign(Error("publication_authority_unconfigured"),{code:"publication_authority_unconfigured"});
       const f = pointerFields(m);
       const ext = sessionExt(m);
+      const canonical = canonicalManifestIdentity(m);
       const ectx = ctx as unknown as {
         user_id?: string;
         session_uuid?: string;
       };
-      // Identity comes from the authenticated request (ctx), never from the manifest body.
-      // With no request identity (reconcile), keep whatever an authenticated upload recorded.
+      // Prefer identity from the authenticated request. Reconcile has no request identity,
+      // so retain the server-side value, then use only validated server-admitted manifest
+      // metadata. Never let the placeholder replace a real identity.
       const existing = (
         await deps.db.query<{
           session_uuid: string;
@@ -120,7 +149,14 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
           ],
         )
       ).rows[0];
-      const userId = ectx.user_id ?? existing?.user_id ?? "unknown";
+      const recordedUser =
+        existing?.user_id && existing.user_id !== "unknown"
+          ? existing.user_id
+          : undefined;
+      const requestUser =
+        ectx.user_id && ectx.user_id !== "unknown" ? ectx.user_id : undefined;
+      const realUserId = requestUser ?? recordedUser ?? manifestUserId(m);
+      const userId = realUserId ?? "unknown";
       const row = {
         ...pk,
         user_id: userId,
@@ -161,24 +197,6 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
         [JSON.stringify([row])],
       );
       const applied = rows[0]?.applied ?? false;
-      // Logical-session directory projection (idempotent; resurrects a tombstone only for
-      // a live pointer indexed after it, per the V1 precedence contract).
-      await projectSessionDirectory(deps.db, {
-        orgId: pk.org_id,
-        workspaceId: pk.workspace_id,
-        harness: pk.harness,
-        sessionId: pk.session_id,
-      });
-      const fanoutDone = existing
-        ? Number(existing.fanout_revision) >= f.manifestRevision
-        : false;
-      if (!applied && fanoutDone) {
-        log.info("session index unchanged", {
-          revision: f.manifestRevision,
-          reason: "stale_or_equal_revision",
-        });
-        return { status: "skipped", reason: "stale_revision" };
-      }
       // The customer-level id. Minted client-side; if an older client sent no
       // uuid we derive one here ONCE (reusing the stored one on later revisions) and say so.
       const sessionUuid =
@@ -203,11 +221,53 @@ export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {
           sessionUuid,
           source,
           ctx.orgId,
-          ectx.user_id ?? null,
+          realUserId ?? null,
           f.traceId,
           f.manifestRevision,
         ],
       );
+      // `upsert_session_index` is revision-fenced, so an equal-revision S3
+      // notification may have won the race with the authenticated manifest POST and
+      // stored `unknown`. Repair identity separately, but only while this physical row
+      // still names the manifest we just read; a newer pointer is never overwritten.
+      await deps.db.query(
+        `UPDATE sessions.session_index
+            SET user_id = CASE WHEN $7::text IS NULL THEN user_id ELSE $7 END,
+                canonical_session_id = $8,
+                canonical_machine_id = $9
+          WHERE org_id = $1 AND workspace_id = $2 AND harness = $3
+            AND session_id = $4 AND machine_id = $5
+            AND manifest_key = $6 AND deleted_at IS NULL`,
+        [
+          pk.org_id,
+          pk.workspace_id,
+          pk.harness,
+          pk.session_id,
+          pk.machine_id,
+          pointer.manifestKey,
+          realUserId ?? null,
+          canonical.sessionId,
+          canonical.machineId,
+        ],
+      );
+      // Logical-session directory projection (idempotent; resurrects a tombstone only for
+      // a live pointer indexed after it, per the V1 precedence contract).
+      await projectSessionDirectory(deps.db, {
+        orgId: pk.org_id,
+        workspaceId: pk.workspace_id,
+        harness: pk.harness,
+        sessionId: pk.session_id,
+      });
+      const fanoutDone = existing
+        ? Number(existing.fanout_revision) >= f.manifestRevision
+        : false;
+      if (!applied && fanoutDone) {
+        log.info("session index unchanged", {
+          revision: f.manifestRevision,
+          reason: "stale_or_equal_revision",
+        });
+        return { status: "skipped", reason: "stale_revision" };
+      }
       if (fanoutDone) return;
       // Fan out, then record it. A crash in between repeats the fan-out on retry
       // (consumers are idempotent by revision / content hash); nothing is lost.

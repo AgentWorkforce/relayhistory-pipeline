@@ -1,0 +1,111 @@
+name: deploy session-read-worker
+# Deploys the session read Worker (packages/session-read-worker) to the Agent
+# Workforce Cloudflare account. Manual only, from main, in the
+# `session-read-worker` environment (give it required reviewers); see
+# runbooks/sessions-prod-session-read-worker.md.
+#
+# Environment variables (not secrets; the deploy refuses to run without them):
+#   SESSION_READ_HYPERDRIVE_ID   the Hyperdrive config for bulls96_read_api (32 hex)
+#   SESSION_READ_SUPABASE_CA_ID   the uploaded Supabase Root 2021 CA certificate id
+#   SESSION_READ_ORIGIN          https://sessions-read.agentrelay.com (also Cloud's SESSIONS_READ_96BULLS_URL)
+#   SESSION_READ_COMPLETE_SINCE  ISO UTC timestamp ClickHouse is complete from, or "epoch"
+# Environment secret: CLOUDFLARE_API_TOKEN (Workers Scripts:Edit, Hyperdrive:Read).
+#
+# The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
+# are never handled here: they are set with `wrangler secret put` from 1Password
+# and survive deploys. This workflow checks that they exist, by name only.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: session-read-worker-production
+  cancel-in-progress: false
+jobs:
+  checks:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/session-read-worker-checks.yml
+    with:
+      ref: ${{ github.sha }}
+
+  deploy:
+    needs: checks
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    environment: session-read-worker
+    env:
+      CLOUDFLARE_ACCOUNT_ID: f7232cb80f6fab86a95426302af243e4
+      # CLOUDFLARE_API_TOKEN is given only to the steps that call Cloudflare,
+      # never to install (dependency scripts) or the input checks.
+      HYPERDRIVE_ID: ${{ vars.SESSION_READ_HYPERDRIVE_ID }}
+      EXPECTED_CA_ID: ${{ vars.SESSION_READ_SUPABASE_CA_ID }}
+      ORIGIN: ${{ vars.SESSION_READ_ORIGIN }}
+      COMPLETE_SINCE: ${{ vars.SESSION_READ_COMPLETE_SINCE }}
+    defaults:
+      run:
+        working-directory: packages/session-read-worker
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install (root + workspaces)
+        working-directory: .
+        run: bun install --frozen-lockfile
+      - name: Check the deploy inputs
+        env:
+          HAS_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && 'yes' || '' }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          test -n "$HAS_TOKEN" || fail "CLOUDFLARE_API_TOKEN is not set on the session-read-worker environment"
+          [[ "$HYPERDRIVE_ID" =~ ^[0-9a-f]{32}$ ]] && [ "$HYPERDRIVE_ID" != "00000000000000000000000000000000" ] || fail "SESSION_READ_HYPERDRIVE_ID must be the Hyperdrive config id (32 hex)"
+          test -n "$EXPECTED_CA_ID" || fail "SESSION_READ_SUPABASE_CA_ID must be the uploaded Supabase Root 2021 CA certificate id"
+          # The one approved custom-domain origin, exactly as Cloud mints the
+          # assertion audience (new URL(...).origin). workers.dev is disabled
+          # because same-account Worker fetches through it can fail with 1042.
+          test "$ORIGIN" = "https://sessions-read.agentrelay.com" || fail "SESSION_READ_ORIGIN must be https://sessions-read.agentrelay.com"
+          if [ "$COMPLETE_SINCE" != "epoch" ]; then
+            node -e 'const t=Date.parse(process.argv[1]);if(!/^\d{4}-\d{2}-\d{2}T/.test(process.argv[1])||Number.isNaN(t))process.exit(1)' "$COMPLETE_SINCE" || fail 'SESSION_READ_COMPLETE_SINCE must be an ISO UTC timestamp or "epoch"'
+          fi
+      - name: Check the live Hyperdrive safety contract
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -o pipefail
+          curl --fail --silent --show-error \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/hyperdrive/configs/$HYPERDRIVE_ID" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            | bun run scripts/check-hyperdrive-config.ts
+      - name: Render the deploy config (Hyperdrive id only)
+        run: |
+          grep -q '"id": "00000000000000000000000000000000"' wrangler.jsonc
+          sed 's/"id": "00000000000000000000000000000000"/"id": "'"$HYPERDRIVE_ID"'"/' wrangler.jsonc > wrangler.deploy.jsonc
+          grep -q "\"id\": \"$HYPERDRIVE_ID\"" wrangler.deploy.jsonc
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          bunx wrangler deploy --config wrangler.deploy.jsonc \
+            --var "READ_API_ORIGIN:$ORIGIN" \
+            --var "READ_API_COMPLETE_SINCE:$COMPLETE_SINCE" \
+            --message "96BullSessions ${GITHUB_SHA}"
+      - name: Check the Worker's secrets exist (names only)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          names="$(bunx wrangler secret list --config wrangler.deploy.jsonc --format json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).map(x=>x.name).sort().join(" ")))')"
+          for n in CLICKHOUSE_PASSWORD CLICKHOUSE_URL CLICKHOUSE_USER; do
+            case " $names " in *" $n "*) ;; *) echo "::error::Worker secret $n is not set; every read answers 503 until it is (runbook step 5)"; exit 1 ;; esac
+          done
+      - name: Smoke (health 200; an unauthenticated read 401)
+        run: |
+          curl --fail --silent --show-error --max-time 10 --retry 6 --retry-all-errors --retry-delay 5 "$ORIGIN/health" > /dev/null
+          code="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 "$ORIGIN/v1/events?workspace=x&q=y")"
+          test "$code" = "401" || { echo "::error::unauthenticated read returned $code, expected 401"; exit 1; }

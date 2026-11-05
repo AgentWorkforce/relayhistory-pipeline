@@ -7,7 +7,8 @@
  * They come from the delivered `session` and `relationship` records, which
  * sessions.session_index does not carry. `directoryCatalogFromProjection` reads them from
  * the rows `projectRelayhistorySession` (packages/pipeline relayhistory-projection.ts)
- * already builds, so the directory and relayhistory's session_catalog agree on one parse.
+ * already builds, so project id/key, repository, branch, agents, models and
+ * relationships use the same parse as relayhistory's session_catalog.
  *
  * Bounds match the migration's CHECKs and are applied here first. A local path is never
  * stored as a project key (`project_key_method = 'path'`, or a value that looks like an
@@ -31,6 +32,9 @@ export type DirectoryCatalog = {
   models: string[];
   projectKey: string | null;
   projectKeyMethod: string | null;
+  projectId: string | null;
+  gitRepo: string | null;
+  gitBranch: string | null;
   initialCommit: string | null;
   originator: string | null;
   agentVersion: string | null;
@@ -64,6 +68,24 @@ function looksLikeLocalPath(value: string): boolean {
   );
 }
 
+function catalogProjectId(row: Record<string, unknown>): string | null {
+  const key = bounded(row.project_key, 512);
+  const method = bounded(row.project_key_method, 64);
+  if (
+    key !== null &&
+    !["path", "path_fallback"].includes(method ?? "") &&
+    /^[^/~.\\:\s][^\\:\s]*\/[^\\:\s]+$/.test(key)
+  )
+    return /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\/[^/]+\/.+/s.test(key)
+      ? key.slice(key.indexOf("/") + 1)
+      : key;
+  for (const candidate of [row.project_id, row.project]) {
+    const value = bounded(candidate, 512);
+    if (value !== null && !looksLikeLocalPath(value)) return value;
+  }
+  return null;
+}
+
 /** lower(btrim(x)) as PostgreSQL computes it for the agent companion table. */
 export function normalizeDirectoryAgent(name: string): string {
   return name.trim().toLowerCase();
@@ -89,6 +111,9 @@ export function directoryCatalogFromProjection(
     models: [],
     projectKey: null,
     projectKeyMethod: null,
+    projectId: null,
+    gitRepo: null,
+    gitBranch: null,
     initialCommit: null,
     originator: null,
     agentVersion: null,
@@ -103,6 +128,9 @@ export function directoryCatalogFromProjection(
       catalog.projectKeyMethod =
         bounded(row.project_key_method, 64) ?? catalog.projectKeyMethod;
       catalog.projectKey = bounded(row.project_key, 512) ?? catalog.projectKey;
+      catalog.projectId = catalogProjectId(row) ?? catalog.projectId;
+      catalog.gitRepo = bounded(row.repo_url, 2048) ?? catalog.gitRepo;
+      catalog.gitBranch = bounded(row.git_branch, 512) ?? catalog.gitBranch;
       catalog.initialCommit =
         bounded(row.initial_commit, 64) ?? catalog.initialCommit;
       catalog.originator = bounded(row.originator, 200) ?? catalog.originator;
@@ -166,6 +194,9 @@ export async function writeDirectoryCatalog(
         models: input.models,
         project_key: input.projectKey,
         project_key_method: input.projectKeyMethod,
+        project_id: input.projectId,
+        repo_url: input.gitRepo,
+        git_branch: input.gitBranch,
         initial_commit: input.initialCommit,
         originator: input.originator,
         agent_version: input.agentVersion,
@@ -195,13 +226,17 @@ export async function writeDirectoryCatalog(
           SET agent_names = $5::text[], catalog_models = $6::text[],
               project_key = $7, project_key_method = $8, initial_commit = $9,
               originator = $10, agent_version = $11,
+              project_id = coalesce($12, d.project_id),
+              git_repo = coalesce($13, d.git_repo),
+              git_branch = coalesce($14, d.git_branch),
               -- The scalar agent the search RPC filters on: keep one already projected,
               -- else the first catalog agent, and rebuild the search document with it.
               agent_name = coalesce(d.agent_name, ($5::text[])[1]),
               agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))),
               search_text = sessions.session_directory_search_text(
-                d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]), d.project_id,
-                d.git_repo, d.git_branch, d.model, d.short_summary),
+                d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]),
+                coalesce($12, d.project_id), coalesce($13, d.git_repo),
+                coalesce($14, d.git_branch), d.model, d.short_summary),
               catalog_projected_at = now()
          FROM live AS l
         WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id
@@ -212,7 +247,7 @@ export async function writeDirectoryCatalog(
         USING live AS l
         WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id
           AND a.harness = l.harness AND a.session_id = l.session_id
-          AND NOT (a.agent_name_normalized = ANY ($12::text[]))
+          AND NOT (a.agent_name_normalized = ANY ($15::text[]))
      ), put_agents AS (
        INSERT INTO sessions.session_directory_agents
          (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at)
@@ -222,7 +257,7 @@ export async function writeDirectoryCatalog(
        DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at
      ), edges AS (
        SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child
-         FROM live AS l, unnest($13::text[], $14::text[]) AS e(uid, child)
+         FROM live AS l, unnest($16::text[], $17::text[]) AS e(uid, child)
         WHERE e.child IS NULL OR NOT EXISTS (
           SELECT 1 FROM sessions.session_directory AS c
            WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id
@@ -253,6 +288,9 @@ export async function writeDirectoryCatalog(
       catalog.initialCommit,
       catalog.originator,
       catalog.agentVersion,
+      catalog.projectId,
+      catalog.gitRepo,
+      catalog.gitBranch,
       catalog.agentNames.map(normalizeDirectoryAgent),
       catalog.relationships.map((edge) => edge.relationshipUid),
       catalog.relationships.map((edge) => edge.childSessionId),

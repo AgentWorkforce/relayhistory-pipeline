@@ -23,6 +23,7 @@ import type {
   ModelTransportResponse,
 } from "../engine/model.ts";
 import { briefConfig, type BriefConfig } from "../config.ts";
+import type { SessionSummaryState } from "../engine/summary-contract.ts";
 
 export const root = join(import.meta.dir, "../../..");
 export const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -35,6 +36,8 @@ export async function database(opts: { hoop?: boolean } = {}): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
+  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
+  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort())
     await db.exec(read(`supabase/migrations/${file}`));
   if (opts.hoop !== false)
@@ -293,7 +296,11 @@ export function mapReader(manifests: Map<string, ManifestV1>) {
 export class FakeModel implements AnalysisModelTransport {
   requests: ModelTransportRequest[] = [];
   next: Array<ModelTransportResponse | Error> = [];
-  reply = { title: "Fix the flaky queue test", description: "Diagnosed and fixed a race in the pipeline queue test by awaiting the lease renewal before asserting the ack count." };
+  reply: { title: string; description: string; state: SessionSummaryState } = {
+    title: "Fix the flaky queue test",
+    description: "Diagnosed a race in the pipeline queue test. Awaiting the lease renewal before asserting the ack count fixed it.",
+    state: "completed",
+  };
   async complete(request: ModelTransportRequest): Promise<ModelTransportResponse> {
     this.requests.push(request);
     const queued = this.next.shift();

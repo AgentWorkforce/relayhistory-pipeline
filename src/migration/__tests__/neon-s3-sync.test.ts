@@ -23,6 +23,7 @@ import {
   relayhistoryExportProvenance,
   type ObjectStore,
 } from "../../shared/vendor.ts";
+import { canonicalManifestIdentity } from "../../shared/manifest-identity.ts";
 import { chunksAreServerSealed } from "../../alleyoop/manifests.ts";
 import { SCRUB_RULESET_VERSION } from "../../shared/vendor.ts";
 import { buildSessionStream, type DeliveryRecord, type Queryable } from "../relayhistory-export.ts";
@@ -162,6 +163,10 @@ describe("format: the pipeline's own validators accept what the exporter writes"
       // Without the prefix (the old bug) the chunks are not found.
       expect(await chunksAreServerSealed({ store } as never, manifest, undefined)).toBe(false);
       expect(relayhistoryExportProvenance(manifest)).toEqual({ grantId: "neon-s3-sync", sourceUserId: "user-1" });
+      expect(canonicalManifestIdentity(manifest)).toEqual({
+        sessionId: "sess:with:colons-1",
+        machineId: expect.any(String),
+      });
       const read = await readRelayhistoryExport(manifest, store, (b) => new Uint8Array(zstdDecompressSync(b)), {
         prefix: loc.prefix,
       });

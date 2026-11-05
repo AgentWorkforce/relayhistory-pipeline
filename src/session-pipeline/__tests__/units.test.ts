@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { signV4 } from "../aws-json.ts";
 import { decodeS3Key, parseQueueBody, sequencerAfter } from "../s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
-import { lambdaEnv, parseSecret } from "../lambda.ts";
+import { handler, lambdaEnv, parseSecret } from "../lambda.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
@@ -168,5 +168,49 @@ describe("configuration", () => {
     expect(() => parseSecret(JSON.stringify({ hoopdb_url: "postgres://x", clickhouse: { url: "https://c", user: "u", password: "", database: "d" } }))).toThrow(
       /clickhouse.password/,
     );
+  });
+
+  test("openai_api_key is optional; when present it must be a non-empty string, and no error echoes it", () => {
+    expect(parseSecret(JSON.stringify({ hoopdb_url: "postgres://x" })).openai_api_key).toBeUndefined();
+    expect(parseSecret(JSON.stringify({ hoopdb_url: "postgres://x", openai_api_key: "sk-test-1" })).openai_api_key).toBe("sk-test-1");
+    for (const bad of ["", "   ", 42, null]) {
+      let message = "";
+      try {
+        parseSecret(JSON.stringify({ hoopdb_url: "postgres://x", openai_api_key: bad }));
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toBe("session pipeline secret openai_api_key must be a non-empty string when present");
+    }
+  });
+});
+
+describe("brief schedule invocation", () => {
+  test("with SESSION_BRIEF_ENABLED unset or not exactly true it returns before init: no env, secret or pool is needed", async () => {
+    const saved = process.env.SESSION_BRIEF_ENABLED;
+    try {
+      for (const value of [undefined, "false", "TRUE", "1"]) {
+        if (value === undefined) delete process.env.SESSION_BRIEF_ENABLED;
+        else process.env.SESSION_BRIEF_ENABLED = value;
+        // lambdaEnv() would throw here (no AWS_REGION, bucket or secret ARN): reaching init fails the test.
+        expect(await handler({ brief: true })).toEqual({ ok: true });
+      }
+    } finally {
+      if (saved === undefined) delete process.env.SESSION_BRIEF_ENABLED;
+      else process.env.SESSION_BRIEF_ENABLED = saved;
+    }
+  });
+
+  test("enabled, a failed init is logged and answered ok:false, never thrown", async () => {
+    const saved = { e: process.env.SESSION_BRIEF_ENABLED, r: process.env.AWS_REGION };
+    try {
+      process.env.SESSION_BRIEF_ENABLED = "true";
+      delete process.env.AWS_REGION;
+      expect(await handler({ brief: true })).toEqual({ ok: false });
+    } finally {
+      if (saved.e === undefined) delete process.env.SESSION_BRIEF_ENABLED;
+      else process.env.SESSION_BRIEF_ENABLED = saved.e;
+      if (saved.r !== undefined) process.env.AWS_REGION = saved.r;
+    }
   });
 });

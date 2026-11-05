@@ -36,6 +36,8 @@ async function database(options: { catalogReady?: boolean } = {}): Promise<PGlit
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
+  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
+  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
   }
@@ -604,7 +606,7 @@ describe("catalog writer and projector", () => {
 
   test("derives agents, models, project key and edges from projection rows; drops local paths", () => {
     const catalog = directoryCatalogFromProjection([
-      { table: "session_catalog", row: { models: ["o4", "gpt-5", "", 3], project_key: "github.com/acme/widgets", project_key_method: "git_remote", originator: "codex_cli", agent_version: "1.2.3" } },
+      { table: "session_catalog", row: { models: ["o4", "gpt-5", "", 3], project_key: "github.com/acme/widgets", project_key_method: "git_remote", repo_url: "git@github.com:acme/widgets.git", git_branch: "main", originator: "codex_cli", agent_version: "1.2.3" } },
       { table: "session_catalog_agents", row: { agent_name: "Helm-Chief" } },
       { table: "session_catalog_agents", row: { agent_name: "helm-chief " } },
       { table: "session_catalog_agents", row: { agent_name: "reviewer" } },
@@ -614,6 +616,9 @@ describe("catalog writer and projector", () => {
     expect(catalog.agentNames).toEqual(["helm-chief", "reviewer"]);
     expect(catalog.models).toEqual(["gpt-5", "o4"]);
     expect(catalog.projectKey).toBe("github.com/acme/widgets");
+    expect(catalog.projectId).toBe("acme/widgets");
+    expect(catalog.gitRepo).toBe("git@github.com:acme/widgets.git");
+    expect(catalog.gitBranch).toBe("main");
     expect(catalog.relationships).toEqual([
       { relationshipUid: "r1", childSessionId: "child-1" },
       { relationshipUid: "r2", childSessionId: null },
@@ -643,6 +648,9 @@ describe("catalog writer and projector", () => {
         models: ["o4"],
         projectKey: "github.com/acme/widgets",
         projectKeyMethod: "git_remote",
+        projectId: "acme/widgets",
+        gitRepo: "git@github.com:acme/widgets.git",
+        gitBranch: "main",
         initialCommit: null,
         originator: null,
         agentVersion: null,
@@ -655,6 +663,9 @@ describe("catalog writer and projector", () => {
     const rows = await list(db, { agent: "helm-chief" });
     expect(ids(rows)).toEqual(["s-1"]);
     expect(rows[0]!.models).toEqual(["gpt-5", "o4"]);
+    expect(rows[0]!.project_id).toBe("acme/widgets");
+    expect(rows[0]!.git_repo).toBe("git@github.com:acme/widgets.git");
+    expect(rows[0]!.git_branch).toBe("main");
     expect(rows[0]!.child_session_count).toBe(2);
     expect(ids(await list(db, { projectContains: "acme" }))).toEqual(["s-1"]);
     const child = (await list(db, {})).find((row) => row.session_id === "child-1")!;
@@ -686,6 +697,7 @@ describe("catalog writer and projector", () => {
     expect(
       (await writeDirectoryCatalog(db as never, key, {
         agentNames: ["x"], models: [], projectKey: null, projectKeyMethod: null,
+        projectId: null, gitRepo: null, gitBranch: null,
         initialCommit: null, originator: null, agentVersion: null, relationships: [],
       })).written,
     ).toBe(false);
@@ -693,6 +705,7 @@ describe("catalog writer and projector", () => {
 
   const EMPTY = {
     agentNames: [] as string[], models: [] as string[], projectKey: null, projectKeyMethod: null,
+    projectId: null, gitRepo: null, gitBranch: null,
     initialCommit: null, originator: null, agentVersion: null,
     relationships: [] as Array<{ relationshipUid: string; childSessionId: string | null }>,
   };
@@ -869,6 +882,8 @@ describe("migration up/down/up", () => {
   test("the down path removes exactly what the up added and the up reapplies", async () => {
     const db = await database();
     await seed(db, FIXTURE);
+    // Newer migrations depending on catalog columns must roll back first.
+    await db.exec(read("supabase/rollbacks/20261104021000_session_directory_event_metadata.down.sql"));
     await db.exec(DOWN);
     expect(
       (await db.query("SELECT to_regprocedure('sessions.list_session_directory(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer)') AS f")).rows,
@@ -877,6 +892,7 @@ describe("migration up/down/up", () => {
     // The directory rows themselves survive the down.
     expect((await db.query("SELECT count(*)::int AS n FROM sessions.session_directory")).rows).toEqual([{ n: 6 }]);
     await db.exec(UP);
+    await db.exec(read("supabase/migrations/20261104021000_session_directory_event_metadata.sql"));
     expect(ids(await list(db, {}))).toEqual(["s1", "s2", "s3", "s4"]);
   });
 });

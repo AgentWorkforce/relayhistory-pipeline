@@ -15,6 +15,8 @@ setDefaultTimeout(60_000);
 
 const UP = read("supabase/migrations/20261102000000_session_briefs.sql");
 const DOWN = read("supabase/rollbacks/20261102000000_session_briefs.down.sql");
+const STATE_UP = read("supabase/migrations/20261102020000_session_brief_state.sql");
+const STATE_DOWN = read("supabase/rollbacks/20261102020000_session_brief_state.down.sql");
 const VERIFY = read("supabase/bootstrap/session_directory_search_worker_verify.sql");
 
 const open: PGlite[] = [];
@@ -47,10 +49,60 @@ describe("session_briefs schema", () => {
   test("applies after the full chain, passes the Worker verify allowlist, and survives down then up", async () => {
     const pg = await db();
     await pg.exec(VERIFY);
+    await pg.exec(STATE_DOWN);
+    await pg.exec(VERIFY);
     await pg.exec(DOWN);
     expect((await pg.query("SELECT to_regclass('sessions.session_briefs') AS t")).rows[0]).toEqual({ t: null });
     await pg.exec(UP);
+    await pg.exec(STATE_UP);
     await pg.exec(VERIFY);
+  });
+
+  test("the state down path keeps v2 briefs and the Worker RPC, and the up restores state", async () => {
+    const pg = await db();
+    await readyBrief(pg);
+    await pg.exec(STATE_DOWN);
+    expect((await pg.query("SELECT title FROM sessions.session_briefs")).rows).toEqual([{ title: "Brief title" }]);
+    const without = (await pg.query("SELECT proretset FROM pg_proc WHERE oid = 'sessions.session_brief(text, text, text)'::regprocedure")).rows;
+    expect(without).toHaveLength(1);
+    await pg.exec(STATE_UP);
+    await pg.query("UPDATE sessions.session_briefs SET state = 'answered', prompt_version = 'session-summary-v3'");
+    expect((await pg.query("SELECT state FROM sessions.session_briefs")).rows).toEqual([{ state: "answered" }]);
+  });
+
+  test("the state down path removes already-generated v3 briefs so the up can reapply", async () => {
+    const pg = await db();
+    await pg.query(
+      `INSERT INTO sessions.session_briefs
+         (org_id, workspace_id, harness, session_id, status, revision, source_revisions,
+          source_fingerprint, title, description, state, brief_revision, brief_source_revisions,
+          brief_fingerprint, scrub_ruleset, scrub_version, prompt_version, engine_version, model,
+          message_count, shortened_messages, input_tokens, output_tokens, generated_at)
+       VALUES ($1, $2, $3, $4, 'ready', 1, jsonb_build_object('m-1', 1), repeat('a', 64),
+               'V3 brief title', 'Two sentences. Second one.', 'completed', 1, jsonb_build_object('m-1', 1),
+               repeat('a', 64), 'relayhistory-scrub', 1, 'session-summary-v3',
+               'session-summary-v3:96bulls-v1', 'gpt-5.6-luna', 3, 0, 10, 5, now())`,
+      [KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId],
+    );
+    await pg.exec(STATE_DOWN);
+    expect((await pg.query("SELECT count(*)::int AS n FROM sessions.session_briefs")).rows).toEqual([{ n: 0 }]);
+    await pg.exec(STATE_UP);
+  });
+
+  test("a state is one of the five, describes a brief, and is required after the v2 prompt", async () => {
+    const pg = await db();
+    await readyBrief(pg);
+    const set = (sql: string) => code(pg.query(`UPDATE sessions.session_briefs SET ${sql}`));
+    expect(await set(`state = 'done'`)).toBe("23514");
+    expect(await set(`prompt_version = 'session-summary-v3'`)).toBe("23514");
+    expect(await set(`state = 'blocked', prompt_version = 'session-summary-v3'`)).toBeUndefined();
+    // Clearing the text must clear the state too: the same clear passes once state is NULL.
+    const clear = `title = NULL, description = NULL, brief_revision = NULL, brief_source_revisions = NULL,
+                   brief_fingerprint = NULL, scrub_ruleset = NULL, scrub_version = NULL,
+                   prompt_version = NULL, engine_version = NULL, model = NULL, generated_at = NULL,
+                   status = 'quarantined', error = 'session_quarantined'`;
+    expect(await set(clear)).toBe("23514");
+    expect(await set(`${clear}, state = NULL`)).toBeUndefined();
   });
 
   test("the bounds of the brief contract are enforced by the database too", async () => {

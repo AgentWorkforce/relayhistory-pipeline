@@ -74,6 +74,9 @@ const BRIEFS_UP = read(`supabase/migrations/${BRIEFS}`);
 const BRIEFS_DOWN = read(
   `supabase/rollbacks/${BRIEFS.replace(/\.sql$/, ".down.sql")}`,
 );
+const EVENTS = "20261104021000_session_directory_event_metadata.sql";
+const EVENTS_UP = read(`supabase/migrations/${EVENTS}`);
+const EVENTS_DOWN = read(`supabase/rollbacks/${EVENTS.replace(/\.sql$/, ".down.sql")}`);
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;
 const TOKEN_ISSUER = "https://issuer.test/session-directory";
 const RPC_SIGNATURE = "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
@@ -92,6 +95,8 @@ async function database(prelude = ""): Promise<PGlite> {
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
+  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
+  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   if (prelude) await db.exec(prelude);
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
@@ -837,6 +842,9 @@ describe("migration role collision", () => {
   const BOOTSTRAP = read(
     "supabase/bootstrap/session_directory_search_worker.sql",
   );
+  const TOKEN_BOOTSTRAP = read(
+    "supabase/bootstrap/session_token_verifier.sql",
+  );
   /** The role exactly as the bootstrap makes it. */
   const SPEC = `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET statement_timeout = '2s';`;
   const failure = async (run: Promise<unknown>) =>
@@ -896,7 +904,9 @@ describe("migration role collision", () => {
   test("the bootstrap creates the role exactly to spec and is idempotent; the migration then applies and leaves no membership or ADMIN OPTION", async () => {
     const db = await beforeG6();
     await db.exec(BOOTSTRAP);
+    await db.exec(TOKEN_BOOTSTRAP);
     await db.exec(BOOTSTRAP);
+    await db.exec(TOKEN_BOOTSTRAP);
     const spec = async () =>
       (
         await db.query<Row>(
@@ -930,6 +940,7 @@ describe("migration role collision", () => {
     expect(await settings(db)).toEqual(timeout);
     // Bootstrap again after the migration: still a no-op that verifies.
     await db.exec(BOOTSTRAP);
+    await db.exec(TOKEN_BOOTSTRAP);
     expect(await memberships(db)).toEqual([]);
   });
 
@@ -1375,7 +1386,8 @@ describe("short_summary deletion propagation", () => {
     // Re-projected from the remaining live pointer (m2 has no title/project), keeping
     // the agent name, without the summary.
     expect(current?.machine_ids).toEqual(["m2"]);
-    expect(current?.search_text).toBe("Helm");
+    // Catalog-derived project identity survives a pointer whose scalar is null.
+    expect(current?.search_text).toBe("Helm proj-1");
     expect(
       await search(db, claims("org-a", ["ws-a"]), "ws-a", "heron"),
     ).toEqual([]);
@@ -1747,7 +1759,7 @@ describe("short_summary end to end through the pipeline", () => {
        UNION ALL SELECT 'm' FROM sessions.session_directory_machines WHERE session_id = 's-e2e'`,
         )
       ).rows.length;
-    expect(await members()).toBe(3); // one user ("unknown"), two machines
+    expect(await members()).toBe(2); // placeholders are not user memberships
     const a = claims("org-a", ["ws-e2e"]);
     expect(await search(db, a, "ws-e2e", "pelican")).toHaveLength(1);
 
@@ -2286,7 +2298,8 @@ describe("short_summary rollback", () => {
     const db = await database();
     await insertRow(db);
     await summarize(db, KEY, "pelican rollback check");
-    // Reverse migration order: briefs, then the list and expand phases, depend on G6's role.
+    // Reverse dependency order: event metadata also depends on G6 and the list/catalog phases.
+    await db.exec(EVENTS_DOWN);
     await db.exec(BRIEFS_DOWN);
     await db.exec(LIST_DOWN);
     await db.exec(EXPAND_DOWN);
@@ -2330,6 +2343,7 @@ describe("short_summary rollback", () => {
     await db.exec(EXPAND_UP);
     await db.exec(LIST_UP);
     await db.exec(BRIEFS_UP);
+    await db.exec(EVENTS_UP);
     await db.query(
       "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
       [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],
@@ -2403,11 +2417,13 @@ describe("Worker role validation in two phases", () => {
          'sessions.session_directory_readiness()',
          'sessions.list_session_directory(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
          'sessions.session_directory_activity(text,timestamp with time zone,timestamp with time zone)',
+         'sessions.list_session_directory_events(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer,text)',
+         'sessions.session_directory_event_activity(text,timestamp with time zone,timestamp with time zone)',
          'sessions.session_brief(text,text,text)']) AS fn ORDER BY 1`,
       [RPC_SIGNATURE],
     );
     expect(fns.rows).toEqual(approved.rows);
-    expect(fns.rows).toHaveLength(6);
+    expect(fns.rows).toHaveLength(8);
   });
 
   test("phase 2 ignores PUBLIC-derived EXECUTE: only aclitems naming the role count", async () => {

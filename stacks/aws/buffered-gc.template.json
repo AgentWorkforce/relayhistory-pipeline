@@ -1,0 +1,413 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "DORMANT permanent buffered GC, dedicated ingest login, no canonical S3 permissions. Deploy only in reviewed prod account/us-east-1.",
+  "Parameters": {
+    "EnableGc": {
+      "Type": "String",
+      "Default": "false",
+      "AllowedValues": [
+        "false",
+        "true"
+      ]
+    },
+    "FunctionName": {
+      "Type": "String",
+      "Default": "sessions-buffered-gc",
+      "AllowedPattern": "[A-Za-z0-9_-]{1,64}"
+    },
+    "BufferBucket": {
+      "Type": "String",
+      "AllowedPattern": "[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"
+    },
+    "KmsKeyArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws:kms:us-east-1:941433935742:key/[0-9a-f-]{36}"
+    },
+    "SecretArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws:secretsmanager:us-east-1:941433935742:secret:96bulls/[A-Za-z0-9_./-]+/buffered-gc-[A-Za-z0-9]{6}"
+    },
+    "ExpectedGeneration": {
+      "Type": "String",
+      "AllowedPattern": "[a-f0-9]{64}"
+    },
+    "CodeBucket": {
+      "Type": "String",
+      "MinLength": 3
+    },
+    "CodeKey": {
+      "Type": "String",
+      "MinLength": 1
+    },
+    "CodeVersion": {
+      "Type": "String",
+      "MinLength": 1
+    },
+    "ArtifactSha256": {
+      "Type": "String",
+      "AllowedPattern": "[a-f0-9]{64}",
+      "Description": "Operator must independently match immutable CodeVersion ZIP SHA; CloudFormation does not validate S3 SHA."
+    }
+  },
+  "Conditions": {
+    "Armed": {
+      "Fn::Equals": [
+        {
+          "Ref": "EnableGc"
+        },
+        "true"
+      ]
+    }
+  },
+  "Resources": {
+    "LogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${FunctionName}"
+        },
+        "RetentionInDays": 14
+      }
+    },
+    "Role": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "buffered-only",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:GetSecretValue"
+                  ],
+                  "Resource": {
+                    "Ref": "SecretArn"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject",
+                    "s3:DeleteObjectVersion"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/buffered-batches/v1/ws=*/m=srv_*/b=*.staged.ndjson.zst"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:PutObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/buffered-batches/v1/ws=*/m=srv_*/b=*.staged.ndjson.zst"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "s3:x-amz-server-side-encryption": "aws:kms",
+                      "s3:x-amz-server-side-encryption-aws-kms-key-id": {
+                        "Ref": "KmsKeyArn"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:ListBucketVersions"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${BufferBucket}"
+                  },
+                  "Condition": {
+                    "StringLike": {
+                      "s3:prefix": "96bulls/*/buffered-batches/v1/ws=*/m=srv_*/b=*.staged.ndjson.zst"
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "kms:Decrypt",
+                    "kms:GenerateDataKey"
+                  ],
+                  "Resource": {
+                    "Ref": "KmsKeyArn"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "kms:CallerAccount": "941433935742",
+                      "kms:ViaService": "s3.us-east-1.amazonaws.com"
+                    },
+                    "StringLike": {
+                      "kms:EncryptionContext:aws:s3:arn": {
+                        "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/buffered-batches/v1/ws=*/m=srv_*"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "LogGroup",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Sid": "NeverCanonicalObjects",
+                  "Effect": "Deny",
+                  "Action": [
+                    "s3:*"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/upload-generations/*"
+                  }
+                },
+                {
+                  "Sid": "NeverListCanonicalVersions",
+                  "Effect": "Deny",
+                  "Action": [
+                    "s3:ListBucketVersions"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${BufferBucket}"
+                  },
+                  "Condition": {
+                    "StringLike": {
+                      "s3:prefix": "96bulls/*/upload-generations/*"
+                    }
+                  }
+                },
+                {
+                  "Sid": "NeverCanonicalCryptography",
+                  "Effect": "Deny",
+                  "Action": [
+                    "kms:Decrypt",
+                    "kms:GenerateDataKey"
+                  ],
+                  "Resource": {
+                    "Ref": "KmsKeyArn"
+                  },
+                  "Condition": {
+                    "StringLike": {
+                      "kms:EncryptionContext:aws:s3:arn": {
+                        "Fn::Sub": "arn:aws:s3:::${BufferBucket}/96bulls/*/upload-generations/*"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "RoleName": "96bulls-sessions-prod-buffered-gc"
+      }
+    },
+    "Function": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "LogGroup",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "FunctionName"
+        },
+        "Runtime": "nodejs24.x",
+        "Architectures": [
+          "x86_64"
+        ],
+        "Handler": "index.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "Role",
+            "Arn"
+          ]
+        },
+        "MemorySize": 2048,
+        "Timeout": 60,
+        "ReservedConcurrentExecutions": 1,
+        "EphemeralStorage": {
+          "Size": 512
+        },
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          },
+          "S3ObjectVersion": {
+            "Ref": "CodeVersion"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "INGEST_GC_ENABLED": {
+              "Ref": "EnableGc"
+            },
+            "HOOPDB_DB_MODE": "supabase",
+            "INGEST_GC_BUCKET": {
+              "Ref": "BufferBucket"
+            },
+            "INGEST_GC_KMS_KEY_ARN": {
+              "Ref": "KmsKeyArn"
+            },
+            "INGEST_GC_SECRET_ARN": {
+              "Ref": "SecretArn"
+            },
+            "INGEST_GC_EXPECT_GENERATION": {
+              "Ref": "ExpectedGeneration"
+            },
+            "INGEST_GC_BATCH_LIMIT": "5",
+            "INGEST_GC_BUDGET_MS": "45000"
+          }
+        }
+      }
+    },
+    "Schedule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "ScheduleExpression": "rate(1 minute)",
+        "State": {
+          "Fn::If": [
+            "Armed",
+            "ENABLED",
+            "DISABLED"
+          ]
+        },
+        "Targets": [
+          {
+            "Id": "buffered-gc",
+            "Arn": {
+              "Fn::GetAtt": [
+                "Function",
+                "Arn"
+              ]
+            },
+            "RetryPolicy": {
+              "MaximumRetryAttempts": 0,
+              "MaximumEventAgeInSeconds": 60
+            }
+          }
+        ]
+      }
+    },
+    "Permission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "Function"
+        },
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "Schedule",
+            "Arn"
+          ]
+        },
+        "SourceAccount": "941433935742"
+      }
+    },
+    "AsyncConfig": {
+      "Type": "AWS::Lambda::EventInvokeConfig",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Function"
+        },
+        "Qualifier": "$LATEST",
+        "MaximumRetryAttempts": 0,
+        "MaximumEventAgeInSeconds": 60
+      }
+    },
+    "HealthyAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Armed permanent buffered GC must report completion every minute; investigate before admission.",
+        "Namespace": "96Bulls/BufferedGc",
+        "MetricName": "Healthy",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "FunctionName"
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 60,
+        "EvaluationPeriods": 3,
+        "DatapointsToAlarm": 2,
+        "Threshold": 1,
+        "ComparisonOperator": "LessThanThreshold",
+        "TreatMissingData": {
+          "Fn::If": [
+            "Armed",
+            "breaching",
+            "notBreaching"
+          ]
+        }
+      }
+    },
+    "ErrorsAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "FunctionName"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 0,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    }
+  },
+  "Outputs": {
+    "FunctionArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "Function",
+          "Arn"
+        ]
+      }
+    },
+    "ExpectedGeneration": {
+      "Value": {
+        "Ref": "ExpectedGeneration"
+      }
+    },
+    "ArtifactSha256": {
+      "Value": {
+        "Ref": "ArtifactSha256"
+      }
+    }
+  }
+}

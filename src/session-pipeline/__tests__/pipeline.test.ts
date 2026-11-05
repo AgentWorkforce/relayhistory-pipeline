@@ -73,8 +73,13 @@ afterEach(async () => {
 });
 
 /** Write one manifest (one chunk) for `machine` and return its key. */
-async function writeSession(machine: string, records: RelayhistoryStreamRecord[], revision = 1, opts: { scrubbed?: boolean } = {}) {
-  const location = loc(machine);
+async function writeSession(
+  machine: string,
+  records: RelayhistoryStreamRecord[],
+  revision = 1,
+  opts: { scrubbed?: boolean; extensions?: Record<string, unknown>; declaredRecords?:number|null; physicalSessionId?:string } = {},
+) {
+  const location = {...loc(machine),...(opts.physicalSessionId?{sessionId:opts.physicalSessionId}:{})};
   const source = new TextEncoder().encode(`${records.map((r) => JSON.stringify(r)).join("\n")}\n`);
   const stored = new Uint8Array(zstdCompressSync(source));
   const sha = await sha256Hex(source);
@@ -90,7 +95,7 @@ async function writeSession(machine: string, records: RelayhistoryStreamRecord[]
     stored_raw_bytes: source.byteLength,
     raw_sha256: sha,
     compression: "zstd",
-    records: records.length,
+    records: opts.declaredRecords===null?undefined:opts.declaredRecords??records.length,
   };
   await store.put(rawChunkKey(location, chunk.seq, 0, sha, "ndjson"), stored, {});
   const manifest: ManifestV1 = {
@@ -100,7 +105,7 @@ async function writeSession(machine: string, records: RelayhistoryStreamRecord[]
     revision,
     created_at: AT,
     updated_at: AT,
-    session: { workspace_id: scope.workspaceId, machine_id: machine, harness: scope.harness, session_id: scope.sessionId, started_at: AT },
+    session: { workspace_id: scope.workspaceId, machine_id: machine, harness: scope.harness, session_id: location.sessionId, started_at: AT },
     writer: { delivery_instance_id: machine, plugin_version: "test" },
     raw: {
       owner: machine,
@@ -118,7 +123,10 @@ async function writeSession(machine: string, records: RelayhistoryStreamRecord[]
       chunks: [chunk],
       ...(opts.scrubbed === false ? {} : { scrub: { ruleset: "relayhistory-scrub", version: 1 } }),
     },
-    extensions: { "96bulls": { user_id: "user_1" } },
+    extensions: {
+      "96bulls": { user_id: "user_1" },
+      ...(opts.extensions ?? {}),
+    },
   } as ManifestV1;
   const key = manifestKey(location);
   await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)), { contentType: "application/json" });
@@ -151,7 +159,7 @@ function fakeClickHouse() {
         const p = options!.params!;
         for (let i = rows.length - 1; i >= 0; i--) {
           const r = rows[i]!;
-          if (r.org_id === p.org && r.workspace_id === p.workspace && r.source === p.source && r.session_id === p.session) rows.splice(i, 1);
+          if (r.org_id === p.org && r.workspace_id === p.workspace && r.source === p.source && (r.session_id === p.session || r.session_id === p.canonical)) rows.splice(i, 1);
         }
         return;
       }
@@ -170,9 +178,9 @@ function fakeClickHouse() {
       if (query.includes("search_ingest_state")) return [] as T[];
       const p = options!.params!;
       return final()
-        .filter((r) => r.org_id === p.org && r.session_id === p.session && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from))
+        .filter((r) => r.org_id === p.org && (r.session_id === p.session || r.session_id === p.canonical) && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from))
         .slice(0, Number(p.limit))
-        .map((r) => ({ workspace_id: r.workspace_id, machine_id: r.machine_id, source: r.source, kind: r.kind, event_id: r.event_id, ts_ms: tsMs(r), fingerprint: r.fingerprint })) as T[];
+        .map((r) => ({ workspace_id: r.workspace_id, session_id:r.session_id, machine_id: r.machine_id, source: r.source, kind: r.kind, event_id: r.event_id, ts_ms: tsMs(r), fingerprint: r.fingerprint })) as T[];
     },
     async insert(table, batch) {
       if (table === SESSION_STATE_TABLE) {
@@ -188,14 +196,16 @@ function fakeClickHouse() {
 }
 
 /** Supabase as the indexer sees it: the live pointer keys of the scope, plus a call log. */
-function fakeSupabase(live: () => string[], busy: () => boolean = () => false) {
+function fakeSupabase(live: () => string[], busy: () => boolean = () => false, canonicalId:()=>string=()=>scope.sessionId) {
   const calls: string[] = [];
   const tx: SqlExecutor = {
     async query<R>(text: string) {
       calls.push(text.trim().replace(/\s+/g, " "));
       if (text.includes("pg_try_advisory_xact_lock")) return { rows: [{ ok: !busy() }] as R[] };
+      if (text.includes("event_projection_sources")) return { rows: [{ written: true }] as R[] };
       if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
-        return { rows: live().map((manifest_key) => ({ manifest_key })) as R[] };
+        return { rows: live().map((manifest_key) => ({ manifest_key, canonical_id:canonicalId() })) as R[] };
+      if(text.includes("AS canonical_id FROM sessions.session_index"))return {rows:[{canonical_id:canonicalId()}] as R[]};
       if (text.includes("upsert_session_index")) return { rows: [{ applied: true, revision: "1" }] as R[] };
       return { rows: [] as R[] };
     },
@@ -208,6 +218,149 @@ function searchDeps(ch: ClickHouseClient, transact: SearchIndexDeps["transact"],
 }
 
 describe("search index from S3", () => {
+  test("direct canonical machine identity survives physical key encoding",async()=>{
+    const machine="machine:1";
+    const key=await writeSession("machine_1",[event("e1","1",Date.parse(AT),"direct",{kind:"convergence_event",origin_id:"machine:"+machine,payload:{source:scope.harness,session_id:scope.sessionId,machine_id:machine,user_id:"user_1",event_id:"e1",kind:"prompt",ts:AT,content:"direct"}})],1,{extensions:{"96bulls":{user_id:"user_1",canonical_machine_id:machine}}});
+    const sb=fakeSupabase(()=>[key]),ch=fakeClickHouse();
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({complete:true,inserted:1});
+    expect(ch.final()[0]?.machine_id).toBe(machine);
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({complete:true,inserted:0,deleted:0});
+  });
+  test.each([null,0])("actual record counts enforce the scope bound when declared records is %s",async declaredRecords=>{
+    const key=await writeSession("srv_bb",[event("r1","1",Date.parse(AT),"one"),event("r2","1",Date.parse(AT),"two")],1,{declaredRecords});
+    const sb=fakeSupabase(()=>[key]),ch=fakeClickHouse();
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact,{maxScopeEvents:1}))).toMatchObject({complete:false,partial:true,reasons:["scope_too_large"],inserted:0});
+    expect(ch.final()).toHaveLength(0);
+  });
+
+  test("migrates encoded physical delivery IDs to public canonical IDs and reconciles/erases both exactly", async () => {
+    const ch=fakeClickHouse();
+    let keys=[await writeSession("srv_bb",[event("r1","1",Date.parse(AT),"canonical transcript")])];
+    let canonicalId=scope.sessionId;
+    const sb=fakeSupabase(()=>keys,()=>false,()=>canonicalId);
+    await indexSearchScope(scope,searchDeps(ch.ch,sb.transact));
+    expect(ch.final().map(r=>r.session_id)).toEqual([scope.sessionId]);
+    canonicalId="sess:1"; // layoutComponent("sess:1") === "sess_1"
+    keys=[await writeSession("srv_bb",[event("r1","1",Date.parse(AT),"canonical transcript")],2,{extensions:{"96bulls":{user_id:"user_1",canonical_session_id:canonicalId}}})];
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({inserted:1,deleted:1,complete:true});
+    expect(ch.final().filter(r=>r.session_id===canonicalId).map(r=>r.content)).toEqual(["canonical transcript"]);
+    expect(ch.final().filter(r=>r.session_id===scope.sessionId)).toHaveLength(0);
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({inserted:0,deleted:0,complete:true});
+    // A stale physical copy must be removed even when its canonical copy is current.
+    ch.rows.push({...ch.final()[0]!,session_id:scope.sessionId});
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({inserted:0,deleted:1,complete:true});
+    expect(ch.final()).toHaveLength(1);
+    keys=[];
+    expect(await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).toMatchObject({complete:true,reasons:["erased"]});
+    expect(ch.final()).toHaveLength(0);
+    expect(ch.state.filter(r=>r.session_id===canonicalId).at(-1)?.needs_full).toBe(0);
+    expect(ch.state.filter(r=>r.session_id===scope.sessionId).at(-1)?.needs_full).toBe(0);
+  });
+
+  test("writes complete canonical event metadata once across duplicate manifest copies", async () => {
+    const a = await writeSession("export", [
+      event("r1", "1", Date.parse(AT), "text"),
+    ]);
+    const b = await writeSession("live", [
+      event("r1", "1", Date.parse(AT), "text"),
+    ]);
+    const sb = fakeSupabase(() => [a, b]);
+    const ch = fakeClickHouse();
+    const writes: unknown[] = [];
+    const deps = {
+      ...searchDeps(ch.ch, sb.transact),
+      writeEvents: async (_tx: unknown, _key: unknown, input: unknown) => {
+        writes.push(input);
+        return { written: true };
+      },
+    };
+    expect(await indexSearchScope(scope, deps)).toMatchObject({
+      complete: true,
+    });
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({
+      events: {
+        eventCount: "1",
+        kinds: ["session_event"],
+        reasoningTokens: "0",
+      },
+      sources: [
+        { manifestKey: a, revision: "1" },
+        { manifestKey: b, revision: "1" },
+      ],
+    });
+    await store.delete(objectKey(b));
+    writes.length = 0;
+    expect(await indexSearchScope(scope, deps)).toMatchObject({
+      complete: false,
+    });
+    expect(writes).toHaveLength(0);
+  });
+  test("conflicting pointer aliases never bypass admitted canonical manifest identity", async () => {
+    const manifest = await writeSession("srv_bb", [event("r1","1",Date.parse(AT),"text")]);
+    const sb=fakeSupabase(()=>[manifest],undefined,()=>"unrelated-canonical");const ch=fakeClickHouse();
+    const writes:unknown[]=[];
+    const deps={...searchDeps(ch.ch,sb.transact),writeEvents:async(_db:unknown,_key:unknown,input:unknown)=>{writes.push(input);return {written:true};}};
+    expect(await indexSearchScope(scope,deps)).toMatchObject({complete:false});expect(writes).toHaveLength(0);
+  });
+  test("writes project/repository catalog only after a complete canonical scope projection", async () => {
+    const sessionRecord: RelayhistoryStreamRecord = {
+      kind: "session",
+      origin_id: "desktop-origin",
+      record_id: "session-1",
+      revision: "1",
+      operation: "upsert",
+      received_at: AT,
+      payload: {
+        project_key: "github.com/acme/widgets",
+        project_key_method: "git_remote",
+        repo_url: "git@github.com:acme/widgets.git",
+        git_branch: "main",
+        agent_name: "codex",
+        models_json: ["gpt-5"],
+      },
+    };
+    let keys = [
+      await writeSession("srv_bb", [sessionRecord], 1, {
+        extensions: {
+          "96bulls": {
+            user_id: "user_1",
+            canonical_session_id: "sess:1",
+          },
+        },
+      }),
+    ];
+    const ch = fakeClickHouse();
+    const sb = fakeSupabase(() => keys,undefined,()=>"sess:1");
+    const writes: Array<{
+      key: Parameters<NonNullable<SearchIndexDeps["writeCatalog"]>>[1];
+      catalog: Parameters<NonNullable<SearchIndexDeps["writeCatalog"]>>[2];
+    }> = [];
+    const deps: SearchIndexDeps = {
+      ...searchDeps(ch.ch, sb.transact),
+      writeCatalog: async (_db, key, catalog) => {
+        writes.push({ key, catalog });
+        return { written: true };
+      },
+    };
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true });
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({
+      key: { sessionId: "sess:1" },
+      catalog: {
+        projectKey: "github.com/acme/widgets",
+        projectId: "acme/widgets",
+        gitRepo: "git@github.com:acme/widgets.git",
+        gitBranch: "main",
+        agentNames: ["codex"],
+      },
+    });
+
+    keys = [...keys, manifestKey(loc("srv_missing"))];
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: false });
+    expect(writes).toHaveLength(1);
+  });
+
   test("two manifests carrying the same delivery records index each event once, by its Neon identity", async () => {
     const records = [event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "first"), event("r2", "1", Date.parse("2026-11-01T10:00:02Z"), "second")];
     const exporter = await writeSession("delivery_aa", records);
@@ -533,4 +686,43 @@ describe("reconcile", () => {
     expect(pages).toEqual([undefined, "1", "2", "3", "4", "5"].slice(0, pages.length));
     expect(second.pages).toBeGreaterThan(0);
   });
+});
+
+const canonical='sess:1';
+function aliasDb(liveA:()=>string[],siblings:()=>string[]){
+ const base=fakeSupabase(liveA,()=>false,()=>canonical);
+ const tx={...base.tx,async query(text:string,params?:unknown[]){
+  if(text.includes('FROM sessions.session_index')&&text.includes('deleted_at IS NULL')){
+   const selected=text.includes('p.session_id=$4')?liveA():siblings();
+   return{rows:selected.map(manifest_key=>({manifest_key,canonical_id:canonical,event_epoch:'0'}))};
+  }
+  return base.tx.query(text,params);
+ }};
+ return{tx,transact:async(work:any)=>work(tx)};
+}
+test('independent: valid same-physical two-machine group survives one machine removal',async()=>{
+ const a=await writeSession('machine_a',[event('ra','1',Date.parse(AT),'source A',{origin_id:'origin-a'})],1,{extensions:{'96bulls':{user_id:'user_1',canonical_session_id:canonical}}});
+ const b=await writeSession('machine_b',[event('rb','1',Date.parse(AT),'source B',{origin_id:'origin-b'})],1,{extensions:{'96bulls':{user_id:'user_1',canonical_session_id:canonical}}});
+ let keys=[a,b];const sb=fakeSupabase(()=>keys,()=>false,()=>canonical),ch=fakeClickHouse();
+ expect((await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).complete).toBe(true);
+ keys=[b];expect((await indexSearchScope(scope,searchDeps(ch.ch,sb.transact))).complete).toBe(true);
+ expect(ch.final().map(r=>r.content)).toEqual(['source B']);
+});
+test('independent: malformed stale physical alias reconcile must preserve valid canonical sibling',async()=>{
+ const b=await writeSession('machine_b',[event('rb','1',Date.parse(AT),'source B',{origin_id:'origin-b'})],1,{extensions:{'96bulls':{user_id:'user_1',canonical_session_id:canonical}}});
+ const seed=fakeSupabase(()=>[b],()=>false,()=>canonical),ch=fakeClickHouse();
+ expect((await indexSearchScope(scope,searchDeps(ch.ch,seed.transact))).complete).toBe(true);
+ const a=await writeSession('machine_a',[event('ra','1',Date.parse(AT),'source A',{origin_id:'origin-a'})],1,{physicalSessionId:'alias_a',extensions:{'96bulls':{user_id:'user_1',canonical_session_id:canonical}}});
+ const sb=aliasDb(()=>[a],()=>[a,b]);
+ const result=await indexSearchScope({...scope,sessionId:'alias_a'},searchDeps(ch.ch,sb.transact));
+ expect(result.complete).toBe(false);
+ expect(ch.final().map(r=>r.content)).toContain('source B');
+});
+test('independent: erased stale physical alias must preserve live canonical sibling',async()=>{
+ const b=await writeSession('machine_b',[event('rb','1',Date.parse(AT),'source B',{origin_id:'origin-b'})],1,{extensions:{'96bulls':{user_id:'user_1',canonical_session_id:canonical}}});
+ const seed=fakeSupabase(()=>[b],()=>false,()=>canonical),ch=fakeClickHouse();
+ expect((await indexSearchScope(scope,searchDeps(ch.ch,seed.transact))).complete).toBe(true);
+ const sb=aliasDb(()=>[],()=>[b]);
+ await indexSearchScope({...scope,sessionId:'alias_a'},searchDeps(ch.ch,sb.transact));
+ expect(ch.final().map(r=>r.content)).toContain('source B');
 });

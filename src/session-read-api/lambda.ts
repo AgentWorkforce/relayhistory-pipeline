@@ -20,7 +20,9 @@ import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts"
 import { SUPABASE_PROD_CA_2021 } from "../session-pipeline/supabase-ca.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi } from "./app.ts";
-import { relayAuthVerifier } from "./auth.ts";
+import { relayAuthVerifier, type AuthConfig } from "./auth.ts";
+import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
+import { parseCompleteSince } from "./config.ts";
 import { poolTenantRunner, sqlLiveness } from "./liveness.ts";
 
 export interface ReadApiSecret {
@@ -45,12 +47,18 @@ export function parseReadApiSecret(text: string): ReadApiSecret {
   return v as ReadApiSecret;
 }
 
-/** "epoch" → 0 (complete history); otherwise an ISO timestamp. Missing or junk refuses to start. */
-export function parseCompleteSince(raw: string | undefined): number {
-  if (raw === "epoch") return 0;
-  const t = raw ? Date.parse(raw) : Number.NaN;
-  if (Number.isNaN(t)) throw new Error('session read api: READ_API_COMPLETE_SINCE must be an ISO timestamp or "epoch"');
-  return t;
+export { parseCompleteSince };
+
+/**
+ * The verifier's destinations from env, validated with the shared transport
+ * rule. Unset JWKS/issuer fall back to the hosted RelayAuth defaults in
+ * packages/pipeline/src/env.ts; a self-host sets both.
+ */
+export function readApiAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig {
+  const policy = destinationPolicy(env);
+  const jwksUrl = env.RELAYAUTH_JWKS_URL?.trim() || undefined;
+  if (jwksUrl) assertDestinationUrl("RELAYAUTH_JWKS_URL", jwksUrl, policy);
+  return { origin: env.READ_API_ORIGIN || undefined, jwksUrl, issuer: env.RELAYAUTH_ISSUER };
 }
 
 type App = ReturnType<typeof createReadApi>;
@@ -82,7 +90,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env): Promise<App> {
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   return createReadApi({
-    verify: relayAuthVerifier({ origin: env.READ_API_ORIGIN || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL, issuer: env.RELAYAUTH_ISSUER }),
+    verify: relayAuthVerifier(readApiAuthConfig(env)),
     ch: createClickHouseClient(secret.clickhouse),
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
     completeSinceMs,

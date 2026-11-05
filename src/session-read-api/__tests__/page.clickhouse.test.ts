@@ -10,7 +10,7 @@ import type { ClickHouseClient } from "../../session-pipeline/vendor/search-inde
 import { decodeCursor } from "../cursor.ts";
 import { recordState } from "../../session-pipeline/search-index.ts";
 import { createReadApi } from "../app.ts";
-import { CONTENT_TRUNCATION_NOTE, TenantMismatchError, partialSessions, readEventPage, type PageDeps } from "../page.ts";
+import { CONTENT_TRUNCATION_NOTE, TenantMismatchError, partialSessions, partialSessionsInWorkspace, readEventPage, type PageDeps } from "../page.ts";
 import type { EventQuery } from "../queries.ts";
 import { CH_URL, freshClickHouse, memoryLiveness, row } from "./support.ts";
 
@@ -295,5 +295,76 @@ suite("readEventPage on ClickHouse", () => {
       expect(((await r.json()) as { error: { reason: string } }).error.reason).toBe("session_partial");
     }
     await recordState(ch, { orgId: "org-a", workspaceId: "ws-a", harness: "codex", sessionId: "nf" }, 10, 2, true, new Date("2026-10-14T13:00:00Z"));
+  });
+
+  test("a search is stopped only by partial sessions of its own workspace, attributed by row or live pointer", async () => {
+    await ch.command("SYSTEM STOP MERGES search_ingest_session_state");
+    const org = "org-w";
+    const scope = (sessionId: string, workspaceId = "ws-a") => ({ orgId: org, workspaceId, harness: "codex", sessionId });
+    const t = (h: number) => new Date(`2026-10-20T${String(h).padStart(2, "0")}:00:00Z`);
+    await insert([
+      row({ org, session: "w-ok", id: "ok-1", ts: "2026-10-20 10:00:00.000", content: "scoped needle ok" }),
+      row({ org, ws: "ws-b", session: "w-other", id: "other-1", ts: "2026-10-20 10:00:01.000", content: "scoped needle other" }),
+      row({ org, session: "w-here", id: "here-1", ts: "2026-10-20 10:00:02.000", content: "scoped needle here" }),
+    ]);
+    await recordState(ch, scope("w-ok"), 1, 1, true, t(1));
+    // Partial in ws-b (its rows are there), and partial with no row and no pointer in ws-a.
+    await recordState(ch, scope("w-other", "ws-b"), 2, 0, false, t(2));
+    await recordState(ch, scope("w-gone", "ws-b"), 1, 0, false, t(2));
+    const apiFor = (workspaceId: string, liveness: ReturnType<typeof memoryLiveness>["liveness"]) => {
+      const app = createReadApi({ verify: async () => ({ userId: "u-1", orgId: org, workspaceId, scopes: ["rth:read"] }), ch, liveness, completeSinceMs: 0 });
+      return async () => app.request(`/v1/events?workspace=${workspaceId}&q=scoped%20needle&limit=20`, { headers: { authorization: "Bearer t" } });
+    };
+    const ids = async (r: Response) => ((await r.json()) as { events: { eventId: string }[] }).events.map((e) => e.eventId);
+    const none = memoryLiveness();
+
+    // ws-a: the org has partial sessions, none of them ws-a's. Served, complete.
+    expect(await partialSessionsInWorkspace({ ch, liveness: none.liveness }, org, "ws-a")).toEqual({ sessions: [], overflow: false });
+    let r = await apiFor("ws-a", none.liveness)();
+    expect(r.status).toBe(200);
+    expect(await ids(r)).toEqual(["here-1", "ok-1"]);
+    // ws-b: w-other's rows are there, so its search falls back.
+    r = await apiFor("ws-b", memoryLiveness().liveness)();
+    expect(r.status).toBe(501);
+    expect(((await r.json()) as { error: { reason: string } }).error.reason).toBe("session_partial");
+
+    // A ws-a session whose every pass was partial has no row at all: its live pointer here attributes it.
+    await recordState(ch, scope("w-never"), 1, 0, false, t(3));
+    const pointed = memoryLiveness({ createdAt: { "codex\u0000w-never": t(0).getTime() } });
+    expect(await partialSessionsInWorkspace({ ch, liveness: pointed.liveness }, org, "ws-a")).toEqual({ sessions: ["w-never"], overflow: false });
+    expect(pointed.calls.livePointerSessions).toEqual([["w-gone", "w-never", "w-other"]]);
+    expect((await apiFor("ws-a", pointed.liveness)()).status).toBe(501);
+    // Erased here (every pointer tombstoned): nothing of it is served, nothing is owed.
+    const erasedHere = memoryLiveness({ createdAt: { "codex\u0000w-never": t(0).getTime() }, erased: [{ source: "codex", sessionId: "w-never" }] });
+    expect((await apiFor("ws-a", erasedHere.liveness)()).status).toBe(200);
+    await recordState(ch, scope("w-never"), 2, 1, true, t(4));
+
+    // w-here indexed earlier, then a partial pass: its row in ws-a decides, Supabase is not asked.
+    await recordState(ch, scope("w-here"), 3, 0, false, t(5));
+    const asked = memoryLiveness();
+    expect(await partialSessionsInWorkspace({ ch, liveness: asked.liveness }, org, "ws-a")).toEqual({ sessions: ["w-here"], overflow: false });
+    expect(asked.calls.livePointerSessions).toEqual([]);
+    r = await apiFor("ws-a", asked.liveness)();
+    expect(r.status).toBe(501);
+    expect(((await r.json()) as { error: { reason: string } }).error.reason).toBe("session_partial");
+    // Healed: served again.
+    await recordState(ch, scope("w-here"), 4, 1, true, t(6));
+    r = await apiFor("ws-a", none.liveness)();
+    expect(r.status).toBe(200);
+    expect(await ids(r)).toEqual(["here-1", "ok-1"]);
+  });
+
+  test("the same session id in two workspaces is partial for both", async () => {
+    const org = "org-dup";
+    await insert([
+      row({ org, ws: "ws-a", session: "dup", id: "d-a", ts: "2026-10-21 10:00:00.000" }),
+      row({ org, ws: "ws-b", session: "dup", id: "d-b", ts: "2026-10-21 10:00:00.000" }),
+    ]);
+    // The state table is keyed (org, session): a partial pass in ws-b marks the id partial for ws-a too.
+    await recordState(ch, { orgId: org, workspaceId: "ws-b", harness: "codex", sessionId: "dup" }, 1, 0, false, new Date("2026-10-21T11:00:00Z"));
+    const deps = { ch, liveness: memoryLiveness().liveness };
+    expect(await partialSessionsInWorkspace(deps, org, "ws-a")).toEqual({ sessions: ["dup"], overflow: false });
+    expect(await partialSessionsInWorkspace(deps, org, "ws-b")).toEqual({ sessions: ["dup"], overflow: false });
+    expect(await partialSessionsInWorkspace(deps, org, "ws-c")).toEqual({ sessions: [], overflow: false });
   });
 });

@@ -9,6 +9,8 @@
  *       session-events --(after maxReceiveCount)--> SQS session-events-dlq (14 days, alarmed)
  *       EventBridge rule (every reconcileMinutes) --> Lambda {"reconcile":true} --> session-events
  *       (a reconcile at its deadline invokes itself asynchronously with the listing cursor)
+ *       EventBridge rule (every minute, ENABLED only with briefs.enabled) --> Lambda {"brief":true}
+ *       (one session-brief tick: src/session-brief/worker.ts briefTick)
  *
  * The Lambda (src/session-pipeline/lambda.ts) runs the pipeline's own
  * object-landed + session-indexed handlers (Supabase `upsert_session_index`,
@@ -34,6 +36,7 @@ import * as AWS from "@alchemy.run/aws";
 import * as Effect from "effect/Effect";
 import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
+import{derivedSchemaBuildPlugin}from "./derived-schema-build.ts";
 
 export interface SessionPipelineInputs {
   /** Turn the ClickHouse stage on (SEARCH_INDEX_ENABLED=1). Off: pointers only. */
@@ -42,6 +45,22 @@ export interface SessionPipelineInputs {
   maxConcurrency?: number;
   /** Reconcile cadence in minutes (15-120). Default 30; lookback is twice this. */
   reconcileMinutes?: number;
+  /** Session briefs (src/session-brief). Absent or `enabled: false`: off. */
+  briefs?: SessionBriefInputs;
+}
+
+/**
+ * `enabled: true` sets SESSION_BRIEF_ENABLED=true on the pipeline function (indexing
+ * arms brief wakeups) and enables the brief schedule (each tick briefs due sessions).
+ * Model calls also need `openai_api_key` in the pipeline secret; without it the tick
+ * claims nothing. The caps default to src/session-brief/config.ts.
+ */
+export interface SessionBriefInputs {
+  enabled: boolean;
+  /** Distinct sessions briefed per org per UTC day (SESSION_BRIEF_BACKGROUND_DAILY_BUDGET). */
+  backgroundDailyBudget?: number;
+  /** Model attempts across all orgs per UTC day (SESSION_BRIEF_GLOBAL_DAILY_CAP). */
+  globalDailyCap?: number;
 }
 
 export const SESSION_PIPELINE_RESOURCES = [
@@ -57,6 +76,15 @@ export const SESSION_PIPELINE_RESOURCES = [
   "session-events-age-alarm",
   "session-pipeline-errors-alarm",
 ] as const;
+
+/**
+ * The brief schedule's resources. Listed apart from SESSION_PIPELINE_RESOURCES so plans
+ * captured before briefs existed still parse; once any appears, all must
+ * (transcript-store.ts expectedResources).
+ */
+export const SESSION_BRIEF_RESOURCES = ["session-brief-schedule", "session-brief-permission"] as const;
+/** The brief tick runs this often. */
+export const BRIEF_SCHEDULE_MINUTES = 1;
 
 /** Function timeout; the queue's visibility timeout is six times this (AWS guidance for SQS sources). */
 export const FUNCTION_TIMEOUT_SECONDS = 300;
@@ -75,6 +103,7 @@ export interface SessionPipelineNames {
   queueUrl: string;
   secret: string;
   rule: string;
+  briefRule: string;
 }
 
 export function sessionPipelineNames(stage: string, accountId: string, region: string): SessionPipelineNames {
@@ -88,6 +117,7 @@ export function sessionPipelineNames(stage: string, accountId: string, region: s
     queueUrl: `https://sqs.${region}.amazonaws.com/${accountId}/${n("session-events")}`,
     secret: `96bulls/${stage}/session-pipeline`,
     rule: n("session-reconcile"),
+    briefRule: n("session-brief"),
   };
 }
 
@@ -96,12 +126,25 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
     refuse("transcriptStore.sessionPipeline.reconcileMinutes must be an integer from 15 to 120");
+  if (v.briefs !== undefined) {
+    const b = v.briefs as Record<string, unknown> | null;
+    if (b === null || typeof b !== "object" || Array.isArray(b) || Object.getPrototypeOf(b) !== Object.prototype)
+      refuse("transcriptStore.sessionPipeline.briefs must be a plain object");
+    for (const k of Object.keys(b))
+      if (k !== "enabled" && k !== "backgroundDailyBudget" && k !== "globalDailyCap") refuse(`transcriptStore.sessionPipeline.briefs.${k} is not a known setting`);
+    if (typeof b.enabled !== "boolean") refuse("transcriptStore.sessionPipeline.briefs.enabled must be a boolean");
+    // The same bounds as src/session-brief/config.ts, so a value here is never silently clamped.
+    if (b.backgroundDailyBudget !== undefined && !(Number.isInteger(b.backgroundDailyBudget) && (b.backgroundDailyBudget as number) >= 0 && (b.backgroundDailyBudget as number) <= 1_000_000))
+      refuse("transcriptStore.sessionPipeline.briefs.backgroundDailyBudget must be an integer from 0 to 1000000");
+    if (b.globalDailyCap !== undefined && !(Number.isInteger(b.globalDailyCap) && (b.globalDailyCap as number) >= 0 && (b.globalDailyCap as number) <= 10_000_000))
+      refuse("transcriptStore.sessionPipeline.briefs.globalDailyCap must be an integer from 0 to 10000000");
+  }
 }
 
 /** The pipeline role reads session objects through S3 only, for objects under `96bulls/` (as the reader user). */
@@ -232,6 +275,9 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",
     NODE_OPTIONS: "--enable-source-maps",
+    SESSION_BRIEF_ENABLED: i.p.briefs?.enabled ? "true" : "false",
+    ...(i.p.briefs?.backgroundDailyBudget !== undefined ? { SESSION_BRIEF_BACKGROUND_DAILY_BUDGET: String(i.p.briefs.backgroundDailyBudget) } : {}),
+    ...(i.p.briefs?.globalDailyCap !== undefined ? { SESSION_BRIEF_GLOBAL_DAILY_CAP: String(i.p.briefs.globalDailyCap) } : {}),
   };
 }
 
@@ -266,16 +312,16 @@ export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { b
     env: sessionPipelineEnv({ stage: i.stage, bucket: i.bucket, names, p: i.p }),
     logging: { retention: "30 days" },
     functionUrl: false as const,
-    build: { tsconfig: "tsconfig.json" },
+    build: { tsconfig: "tsconfig.json",plugins:[derivedSchemaBuildPlugin()] },
   };
 }
 
 /**
- * Every resource-policy grant on the pipeline function: EventBridge (this rule,
- * this account) and the function's own role (the reconcile chain), both
- * `lambda:InvokeFunction` only. Nothing public, no Function URL action.
+ * Every resource-policy grant on the pipeline function: EventBridge (the reconcile
+ * and brief rules, this account) and the function's own role (the reconcile chain),
+ * all `lambda:InvokeFunction` only. Nothing public, no Function URL action.
  */
-export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; roleArn: string }) {
+export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; roleArn: string }) {
   return [
     {
       id: "session-reconcile-permission",
@@ -297,7 +343,32 @@ export function sessionPipelinePermissions(i: { accountId: string; functionName:
         principal: i.roleArn,
       },
     },
+    {
+      id: "session-brief-permission",
+      props: {
+        action: "lambda:InvokeFunction",
+        functionName: i.functionName,
+        principal: "events.amazonaws.com",
+        sourceArn: i.briefRuleArn,
+        sourceAccount: i.accountId,
+      },
+    },
   ] as const;
+}
+
+/**
+ * The brief schedule: DISABLED unless `briefs.enabled`, so nothing is invoked while briefs
+ * are off. The function also returns before any work unless SESSION_BRIEF_ENABLED is "true".
+ */
+export function briefScheduleProps(i: { names: SessionPipelineNames; functionArn: string; p: SessionPipelineInputs; tags: Record<string, string> }) {
+  return {
+    name: i.names.briefRule,
+    description: "96bulls session pipeline: one session-brief tick (due wakeups)",
+    scheduleExpression: `rate(${BRIEF_SCHEDULE_MINUTES} minute)`,
+    state: i.p.briefs?.enabled ? ("ENABLED" as const) : ("DISABLED" as const),
+    targets: [{ Id: "session-pipeline", Arn: i.functionArn, Input: JSON.stringify({ brief: true }) }],
+    tags: i.tags,
+  };
 }
 
 /** Step 1, before the transcripts key and bucket: the function (and so its role) must exist first. */
@@ -356,10 +427,12 @@ export const sessionPipelineWiring = (
       targets: [{ Id: "session-pipeline", Arn: i.fn.functionArn as unknown as string, Input: JSON.stringify({ reconcile: true }) }],
       tags: i.tags("session-pipeline"),
     } as never);
+    const briefRule = yield* AWS.EventBridge.Rule("session-brief-schedule", briefScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
     for (const { id, props } of sessionPipelinePermissions({
       accountId: i.accountId,
       functionName: i.fn.functionName as unknown as string,
       ruleArn: (rule as unknown as { ruleArn: string }).ruleArn,
+      briefRuleArn: (briefRule as unknown as { ruleArn: string }).ruleArn,
       roleArn,
     }))
       yield* AWS.Lambda.Permission(id, props as never);

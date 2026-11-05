@@ -631,20 +631,115 @@ function scrubRecordLine(line: string): string {
   return out;
 }
 
+// Ported from relayhistory-cloud #258 (df0eafe): one zstd frame workerd can always write.
 type ZstdCompress = (input: Uint8Array) => Uint8Array;
+
+const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
+/** RFC 8878 caps a block at 128 KiB. */
+const MAX_RAW_BLOCK = 128 * 1024;
+
+/**
+ * One standard zstd frame holding `input` in Raw (uncompressed) blocks (RFC
+ * 8878 §3.1.1): single segment, 4-byte content size, no checksum. Every zstd
+ * decoder reads it as one ordinary frame, so readers that decode only the
+ * first frame of a stream (Node's and workerd's `zstdDecompressSync` do, for
+ * some sizes) still get every byte. Used when compression cannot be trusted.
+ */
+export function rawZstdFrame(input: Uint8Array): Uint8Array {
+  if (input.byteLength > 0xffff_ffff)
+    throw new PipelineError("chunk_too_large", "chunk exceeds 4 GiB", false);
+  const blocks = Math.max(1, Math.ceil(input.byteLength / MAX_RAW_BLOCK));
+  const out = new Uint8Array(4 + 1 + 4 + blocks * 3 + input.byteLength);
+  out.set(ZSTD_MAGIC, 0);
+  // Frame_Header_Descriptor: FCS flag 2 (4 bytes), Single_Segment 1.
+  out[4] = 0xa0;
+  new DataView(out.buffer).setUint32(5, input.byteLength, true);
+  let o = 9;
+  for (let b = 0; b < blocks; b++) {
+    const start = b * MAX_RAW_BLOCK;
+    const size = Math.min(MAX_RAW_BLOCK, input.byteLength - start);
+    const last = b === blocks - 1 ? 1 : 0;
+    // Block_Header: Last_Block (bit 0), Block_Type Raw = 0 (bits 1-2), Block_Size (bits 3-23).
+    const header = last | (size << 3);
+    out[o] = header & 0xff;
+    out[o + 1] = (header >>> 8) & 0xff;
+    out[o + 2] = (header >>> 16) & 0xff;
+    o += 3;
+    out.set(input.subarray(start, start + size), o);
+    o += size;
+  }
+  return out;
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** workerd's `zstdCompressSync` fails past about 40 KiB of output (1.20260617). */
+const WORKERD =
+  typeof navigator !== "undefined" &&
+  navigator.userAgent === "Cloudflare-Workers";
+const WORKERD_MAX_COMPRESSED = 36 * 1024;
+const SAMPLE_BYTES = 64 * 1024;
+
 let zstd: Promise<ZstdCompress | null> | undefined;
 /**
- * `node:zlib`'s zstd encoder, when this runtime has one (Node 22.15+; a
- * Worker only with a zlib that carries zstd). Feature-detected, like the
- * request-body decoder, so a runtime without it fails one write, not the load.
+ * A zstd encoder that always produces one frame that decodes to `input`.
+ *
+ * `node:zlib`'s `zstdCompressSync` is tried first. workerd 1.20260617 throws
+ * `Error("Unexpected end of file")` from it once the compressed output passes
+ * about 40 KiB, and its streaming compressor fails at irregular sizes, so the
+ * output is verified by decompressing it. On any error or mismatch the input
+ * is stored in Raw blocks (`rawZstdFrame`): larger, never wrong. Splitting
+ * into several compressed frames was rejected: Node's and workerd's
+ * `zstdDecompressSync` silently return only the first frame for some inputs.
+ *
+ * Feature-detected, like the request-body decoder: without `node:zlib` zstd
+ * every chunk is stored raw.
  */
 function zstdEncoder(): Promise<ZstdCompress | null> {
   zstd ??= import("node:zlib").then(
-    (zlib) =>
-      typeof zlib.zstdCompressSync === "function"
-        ? (input) => new Uint8Array(zlib.zstdCompressSync(input))
-        : null,
-    () => null,
+    (zlib) => {
+      const compress =
+        typeof zlib.zstdCompressSync === "function"
+          ? zlib.zstdCompressSync
+          : null;
+      const decompress =
+        typeof zlib.zstdDecompressSync === "function"
+          ? zlib.zstdDecompressSync
+          : null;
+      return (input: Uint8Array) => {
+        if (compress && decompress) {
+          // In workerd a chunk whose compressed output would pass the
+          // compressor's limit ends up Raw anyway: predict it from the first
+          // SAMPLE_BYTES and skip the doomed full compress and verify.
+          if (WORKERD && input.byteLength > SAMPLE_BYTES) {
+            try {
+              const sample = compress(input.subarray(0, SAMPLE_BYTES));
+              const projected =
+                (sample.byteLength / SAMPLE_BYTES) * input.byteLength;
+              if (projected > WORKERD_MAX_COMPRESSED)
+                return rawZstdFrame(input);
+            } catch {
+              return rawZstdFrame(input);
+            }
+          }
+          try {
+            const packed = new Uint8Array(compress(input));
+            const back = decompress(packed, {
+              maxOutputLength: Math.max(1, input.byteLength),
+            });
+            if (sameBytes(new Uint8Array(back), input)) return packed;
+          } catch {
+            // Fall through to Raw blocks.
+          }
+        }
+        return rawZstdFrame(input);
+      };
+    },
+    () => (input: Uint8Array) => rawZstdFrame(input),
   );
   return zstd;
 }
