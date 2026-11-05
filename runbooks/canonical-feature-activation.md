@@ -55,9 +55,10 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 - The creator-side replacement SQL at `0b359d6`/`d1f48fd` supersedes the broken
   `8602ca9` proposal: an independent fresh PostgreSQL 17 run passed all seven
   install races and the PGlite creator/610 suite passed 16/16. Composition is
-  still held on the consumer boundary: `2eef4fc` decodes a retire authority
-  from `prior_source_authority` although 610 stores it in `source_authority`,
-  retains a silent no-op append and stale shared/client ABI types, and only
+  still held on the consumer boundary. `dc44266` fixes the retire column,
+  read-only append and most shared types, but an actual PGlite JSONB row fails
+  because its decoder unconditionally parses already-decoded JSONB objects;
+  the public change port also still omits the prior pointer descriptor. It only
   declares (but does not implement) idempotent `publishOnce`. The creator also
   still needs disposition of exact source/scope key validation and same-
   fingerprint self-retirement. The final pair must carry a verified descriptor
