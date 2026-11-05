@@ -361,6 +361,14 @@ it("raw mode keeps refusing table=session_timing with 400; only pages mode serve
     { pointers: forbidden } as never,
     f.deps,
   );
-  expect(response.status).not.toBe(400);
+  // The fixture index has legacyCoverage null and no session_timing table.
+  expect(response.status).toBe(501);
+  expect(response.headers.get("X-Session-Read-Reason")).toBe("timing_turns_unknown");
+  const body: any = await response.json();
+  expect(body.error).toEqual({
+    code: "unsupported_by_backend",
+    message: "not served by this backend: timing_turns_unknown",
+    reason: "timing_turns_unknown",
+  });
   expect(f.counts().claims).toBeGreaterThan(0);
 });

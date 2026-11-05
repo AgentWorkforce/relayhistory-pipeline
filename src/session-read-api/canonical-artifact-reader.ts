@@ -319,6 +319,15 @@ export async function canonicalArtifactPage(
           ))
     )
       fail("artifact_coverage");
+    // The producer materializes session_timing only when legacy turn coverage is
+    // known (replay-publication.ts). Without it the table is absent by design:
+    // answer like the timing route (501 timing_turns_unknown), never a retryable 503.
+    if (
+      query.table === "session_timing" &&
+      index.legacyCoverage === null &&
+      !Object.hasOwn(index.tables, "session_timing")
+    )
+      throw new CanonicalReadError("timing_turns_unknown", 501);
     const selected = obj(index.tables[query.table])
       ? index.tables[query.table][storageView]
       : undefined;
