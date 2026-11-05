@@ -16,14 +16,24 @@
  * Env (wrangler.jsonc vars, set by the deploy workflow): READ_API_ORIGIN (this
  * Worker's own origin, the only audience accepted; unset = every /v1 request
  * 401), READ_API_COMPLETE_SINCE (ISO timestamp or "epoch"; missing = 503),
- * CLICKHOUSE_DATABASE, and RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
+ * CLICKHOUSE_DATABASE, READ_API_DIRECTORY_WORKSPACES (the directory list/activity
+ * and timing canary allowlist; unset = none), READ_API_TIMING_ASSUME_NO_TURNS, and
+ * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve).
  */
 import pg from "pg";
+import { decompress } from "fzstd";
+import { canonicalAnalysisHandle } from "./analysis-cache.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
+import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
+import { canonicalSnapshot, CanonicalReadError } from "../../../src/session-read-api/canonical.ts";
+import { sqlCanonicalPointers } from "../../../src/session-read-api/session-timing-source.ts";
+import { sqlSessionHarnesses } from "../../../src/session-read-api/session-turns-source.ts";
+import type { TimingDeps, TurnsDeps } from "../../../src/session-read-api/app.ts";
 import { logLine, type Level } from "../../../src/shared/log.ts";
 import { createClickHouseClient, type ClickHouseClient, type RequestOptions } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
-import { createReadApi } from "../../../src/session-read-api/app.ts";
+import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-read-api/app.ts";
+import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
 import { relayAuthVerifier } from "../../../src/session-read-api/auth.ts";
 import { sqlLiveness, TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
@@ -36,6 +46,10 @@ export interface Env extends CanonicalEnv {
   CLICKHOUSE_DATABASE?: string;
   READ_API_ORIGIN?: string;
   READ_API_COMPLETE_SINCE?: string;
+  /** Directory list/activity and timing canary allowlist: unset = none, "*" = all, else comma-separated workspace ids. */
+  READ_API_DIRECTORY_WORKSPACES?: string;
+  /** "true": time a session without legacy turn evidence as having none (session-timing-source.ts). */
+  READ_API_TIMING_ASSUME_NO_TURNS?: string;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
 }
@@ -165,6 +179,7 @@ export interface Overrides {
 }
 
 export async function handle(request: Request, env: Env, ctx: ExecutionContext, overrides: Overrides = {}): Promise<Response> {
+  if (new URL(request.url).pathname.startsWith("/v1/canonical/analyses/")) return canonicalAnalysisHandle(request, env, overrides.fetcher);
   if (new URL(request.url).pathname.startsWith("/v1/canonical/")) return canonicalHandle(request, env, overrides.fetcher);
   // GET only, as the Lambda's Function URL adapter (HEAD is not a read the contract has).
   if (request.method !== "GET") return json(405, "method_not_allowed", "GET only", { allow: "GET" });
@@ -181,9 +196,13 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   }
   const tenant = requestTenantRunner(overrides.connect ?? hyperdriveClient(env.SUPABASE));
   const app = createReadApi({
+    timing: timingDeps(env, tenant.run, overrides.fetcher),
+    turns: turnsDeps(env, tenant.run, overrides.fetcher),
     verify: relayAuthVerifier({ origin: env.READ_API_ORIGIN?.trim() || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL?.trim() || undefined, issuer: env.RELAYAUTH_ISSUER?.trim() || undefined }),
     ch,
     liveness: sqlLiveness(tenant.run),
+    directory: sqlDirectory(tenant.run),
+    directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     completeSinceMs,
     log: (fields) => log("info", "session read", fields),
   });
@@ -192,6 +211,49 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   } finally {
     ctx.waitUntil(tenant.close());
   }
+}
+
+/**
+ * Session timing from canonical S3: pointers through the read role (tenant-bound), objects
+ * with the raw-store secrets the /v1/canonical route uses (PIPELINE_RAW_S3_*). Without
+ * those secrets the route answers 501 `timing_not_configured`.
+ */
+export function timingDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>[0], fetcher: typeof fetch = (input, init) => fetch(input, init)): TimingDeps | undefined {
+  if (!rawStoreFromEnv(env, fetcher)) return undefined;
+  const pointers = sqlCanonicalPointers(run);
+  return {
+    state: pointers.state,
+    assumeNoTurns: env.READ_API_TIMING_ASSUME_NO_TURNS?.trim() === "true",
+    async source(identity, signal) {
+      const bounded: typeof fetch = (input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal });
+      const raw = rawStoreFromEnv(env, bounded);
+      if (!raw) throw new CanonicalReadError("not_configured");
+      const snapshot = await canonicalSnapshot(
+        {
+          ...raw,
+          prefix: env,
+          pointers: pointers.pointers,
+          decompress: (bytes, max) => {
+            const output = decompress(bytes, new Uint8Array(max));
+            if (output.byteLength > max) throw new CanonicalReadError("chunk_bound");
+            return output;
+          },
+        },
+        identity,
+      );
+      return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage };
+    },
+  };
+}
+
+/**
+ * Relay session turns and metadata from canonical S3, on the same pointers and raw-store
+ * secrets as timing. Without the secrets the routes answer 501 `turns_not_configured`.
+ */
+export function turnsDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>[0], fetcher: typeof fetch = (input, init) => fetch(input, init)): TurnsDeps | undefined {
+  const timing = timingDeps(env, run, fetcher);
+  if (!timing) return undefined;
+  return { harnesses: sqlSessionHarnesses(run), source: timing.source };
 }
 
 export default {

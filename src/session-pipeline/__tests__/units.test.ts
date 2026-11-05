@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import { signV4 } from "../aws-json.ts";
 import { decodeS3Key, parseQueueBody, sequencerAfter } from "../s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
-import { handler, lambdaEnv, parseSecret } from "../lambda.ts";
+import { analysisDeps, analysisSourceReadonlyUrl, handler, lambdaEnv, parseSecret, runtimeFromSecret } from "../lambda.ts";
+import { searchIndexLimits, SEARCH_INDEX_DEFAULT_LIMITS, REPLAY_SEARCH_INDEX_LIMITS } from "../search-index.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
@@ -146,14 +147,48 @@ describe("configuration", () => {
     SESSION_PIPELINE_QUEUE_URL: "https://sqs",
   };
 
+  test("search index limits stay 64 MiB / 100k / 500k unless the replay stage is on", () => {
+    const original = { maxScopeBytes: 64 * 1024 * 1024, maxScopeEvents: 100_000, maxRows: 500_000, insertBatch: 5_000 };
+    expect({ ...SEARCH_INDEX_DEFAULT_LIMITS }).toEqual(original);
+    expect(searchIndexLimits(lambdaEnv(base).replayPagesEnabled)).toEqual(original);
+    expect(searchIndexLimits(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1" }).replayPagesEnabled)).toEqual(original);
+    expect(searchIndexLimits(lambdaEnv({ ...base, SESSION_REPLAY_PAGES_ENABLED: "true" }).replayPagesEnabled)).toEqual(original);
+    const raised = { maxScopeBytes: 256 * 1024 * 1024, maxScopeEvents: 1_000_000, maxRows: 1_000_000, insertBatch: 5_000 };
+    expect(searchIndexLimits(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_REPLAY_PAGES_ENABLED: "1" }).replayPagesEnabled)).toEqual(raised);
+    expect({ ...REPLAY_SEARCH_INDEX_LIMITS }).toEqual(raised);
+    // The lambda wires the search stage through this switch, never a raised constant.
+    const lambdaSource = readFileSync(here("../lambda.ts"), "utf8");
+    expect(lambdaSource).toContain("limits: searchIndexLimits(env.replayPagesEnabled),");
+    expect(lambdaSource).not.toContain("REPLAY_SEARCH_INDEX_LIMITS");
+  });
+
   test("defaults keep the search index and fan-out off", () => {
-    expect(lambdaEnv(base)).toMatchObject({ keyPrefix: "96bulls", searchEnabled: false, fanout: "off" });
-    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", PIPELINE_FANOUT: "postgres" })).toMatchObject({ searchEnabled: true, fanout: "postgres" });
+    expect(lambdaEnv(base)).toMatchObject({ keyPrefix: "96bulls", searchEnabled: false, replayPagesEnabled: false, fanout: "off" });
+    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_REPLAY_PAGES_ENABLED: "1", PIPELINE_FANOUT: "postgres" })).toMatchObject({ searchEnabled: true, replayPagesEnabled: true, fanout: "postgres" });
+  });
+
+  test("desktop catalog: only the literal \"1\" enables it; SEARCH_INDEX_ENABLED=1 alone never does", () => {
+    expect(lambdaEnv(base).desktopCatalogEnabled).toBe(false);
+    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1" })).toMatchObject({ searchEnabled: true, desktopCatalogEnabled: false });
+    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_DESKTOP_CATALOG_ENABLED: "1" })).toMatchObject({ searchEnabled: true, desktopCatalogEnabled: true });
+    for (const value of ["", "0", "true", "TRUE", "yes", "on", " 1", "1 ", "01", "2"])
+      expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_DESKTOP_CATALOG_ENABLED: value }).desktopCatalogEnabled).toBe(false);
+    // The search deps carry the switch only when it is on, so the off path's deps are unchanged.
+    const lambdaSource = readFileSync(here("../lambda.ts"), "utf8");
+    expect(lambdaSource).toContain("...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}),");
   });
 
   test("refuses the single-tenant layout and unknown fan-out", () => {
     expect(() => lambdaEnv({ ...base, PIPELINE_ORG_FROM_PREFIX: undefined })).toThrow(/ORG_FROM_PREFIX/);
     expect(() => lambdaEnv({ ...base, PIPELINE_FANOUT: "sqs" })).toThrow(/FANOUT/);
+  });
+
+  test("adapter selection: unset is today's lambda + clickhouse; other runtimes or backends are refused", () => {
+    expect(() => lambdaEnv(base)).not.toThrow();
+    expect(() => lambdaEnv({ ...base, PIPELINE_RUNTIME: "lambda", SEARCH_INDEX_BACKEND: "clickhouse" })).not.toThrow();
+    expect(() => lambdaEnv({ ...base, PIPELINE_RUNTIME: "workers" })).toThrow(/PIPELINE_RUNTIME/);
+    expect(() => lambdaEnv({ ...base, SEARCH_INDEX_BACKEND: "opensearch" })).toThrow(/SEARCH_INDEX_BACKEND/);
+    expect(() => lambdaEnv({ ...base, SEARCH_INDEX_BACKEND: "nope" })).toThrow(/unknown/);
   });
 
   test("secret shape is checked without echoing values", () => {
@@ -212,5 +247,38 @@ describe("brief schedule invocation", () => {
       else process.env.SESSION_BRIEF_ENABLED = saved.e;
       if (saved.r !== undefined) process.env.AWS_REGION = saved.r;
     }
+  });
+});
+
+test("analysis cache defaults off before runtime init and rejects invalid readonly source secret shape",async()=>{const saved=process.env.SESSION_ANALYSIS_CACHE_ENABLED;try{for(const value of [undefined,"0","true"]){if(value===undefined)delete process.env.SESSION_ANALYSIS_CACHE_ENABLED;else process.env.SESSION_ANALYSIS_CACHE_ENABLED=value;expect(await handler({analysisCache:true})).toEqual({ok:true});expect(await handler({analysisCacheReconcile:true})).toEqual({ok:true})}expect(()=>parseSecret(JSON.stringify({hoopdb_url:"postgres://fixture",analysis_source_readonly_url:"mysql://fixture"}))).not.toThrow();expect(()=>analysisSourceReadonlyUrl("mysql://fixture")).toThrow(/readonly_url/)}finally{if(saved===undefined)delete process.env.SESSION_ANALYSIS_CACHE_ENABLED;else process.env.SESSION_ANALYSIS_CACHE_ENABLED=saved}});
+
+describe("analysis source secret field is validated only in the analysis branch", () => {
+  const base = { AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "b", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs", SEARCH_INDEX_ENABLED: "1" };
+  const secret = (field: Record<string, unknown>) => JSON.stringify({ hoopdb_url: "postgres://u:p@127.0.0.1:1/db", clickhouse: { url: "https://ch.example", user: "u", password: "p", database: "d" }, ...field });
+  test("flag off + malformed field: search init succeeds and analysis stays unavailable", () => {
+    for (const field of [{ analysis_source_readonly_url: "mysql://hunter2" }, { analysis_source_readonly_url: 42 }, { analysis_source_readonly_url: "" }]) {
+      const rt = runtimeFromSecret(lambdaEnv(base), secret(field), "fixture-generation");
+      expect(rt.deps.search).toBeDefined();
+      expect(rt.analysis).toBeUndefined();
+      expect(() => analysisDeps(rt)).toThrow("analysis cache runtime unavailable");
+    }
+  });
+  test("flag on + missing or malformed field: only the analysis branch fails, search unaffected, no value echoed", () => {
+    const env = lambdaEnv({ ...base, SESSION_ANALYSIS_CACHE_ENABLED: "1" });
+    expect(env.analysisCacheEnabled).toBe(true);
+    for (const [field, error] of [[{}, /readonly source configuration.*missing/], [{ analysis_source_readonly_url: "mysql://hunter2" }, /must be a postgres URL/]] as const) {
+      const rt = runtimeFromSecret(env, secret(field), "fixture-generation");
+      expect(rt.deps.search).toBeDefined();
+      let message = "";
+      try { analysisDeps(rt); } catch (e) { message = (e as Error).message; }
+      expect(message).toMatch(error);
+      expect(message).not.toContain("hunter2");
+      expect(rt.analysis).toBeUndefined();
+      expect(rt.deps.search).toBeDefined();
+    }
+    const ok = runtimeFromSecret(env, secret({ analysis_source_readonly_url: "postgres://ro:p@127.0.0.1:1/db" }), "fixture-generation");
+    const deps = analysisDeps(ok);
+    expect(analysisDeps(ok)).toBe(deps);
+    expect(deps.db).toBe(ok.deps.pointer.db);
   });
 });

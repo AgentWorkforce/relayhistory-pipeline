@@ -36,6 +36,7 @@
  *
  * Nothing here logs content; errors carry codes only.
  */
+import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../session-read-api/canonical-artifact.ts";
 import { readCanonicalScope } from "../session-read-api/canonical-projection.ts";
 export { manifestUserId, readManifestRecords, projectedToNeonRow } from "../session-read-api/canonical-projection.ts";
 import * as zlib from "node:zlib";
@@ -47,7 +48,7 @@ import { tsMillis } from "./vendor/search-index/rows.ts";
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "./vendor/search-index/schema.ts";
 import { chNow, deleteRows, windowStart, type PendingDelete } from "./vendor/search-index/reconcile.ts";
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
-import { writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
+import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
 
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
@@ -63,7 +64,14 @@ export interface SearchIndexDeps {
   decompress?: (stored: Uint8Array, maxOutputLength: number) => Uint8Array;
   now?: () => Date;
   limits?: Partial<SearchIndexLimits>;
-  /** Test seam; production writes the catalog in the same Supabase transaction. */
+  /**
+   * SESSION_DESKTOP_CATALOG_ENABLED=1 only: write the complete desktop catalog (migration
+   * 20261105022000 columns). Absent or false: the pre-#182 catalog writer, exactly as before;
+   * SEARCH_INDEX_ENABLED alone never selects the desktop writer
+   * (docs/session-desktop-catalog.md, Activation blockers).
+   */
+  desktopCatalog?: boolean;
+  /** Test seam (replaces the writer `desktopCatalog` selects); production writes the catalog in the same Supabase transaction. */
   writeCatalog?: typeof writeDirectoryCatalog;
   writeEvents?: typeof writeDirectoryEvents;
 }
@@ -79,14 +87,33 @@ export interface SearchIndexLimits {
   insertBatch: number;
 }
 
-const DEFAULT_LIMITS: SearchIndexLimits = {
+/** The search stage's own limits: the default path, live with SEARCH_INDEX_ENABLED=1. */
+export const SEARCH_INDEX_DEFAULT_LIMITS: Readonly<SearchIndexLimits> = Object.freeze({
   // Raw text is held several times over (strings, records, projected and index
   // rows), and an out-of-memory kill fails the whole batch: stay well inside 3 GB.
   maxScopeBytes: 64 * 1024 * 1024,
   maxScopeEvents: 100_000,
   maxRows: 500_000,
   insertBatch: 5_000,
-};
+});
+
+/**
+ * Only with the replay stage (SESSION_REPLAY_PAGES_ENABLED=1): the index pass
+ * must cover the same source the replay producer reads, so it shares the
+ * producer's 256 MiB / 1M-record bound. This does not lift Worker limits or
+ * cover production cohorts above the 256 MiB ceiling, and it is not yet proven
+ * to fit the 3008 MiB Lambda (see docs/canonical-replay-pages.md).
+ */
+export const REPLAY_SEARCH_INDEX_LIMITS: Readonly<SearchIndexLimits> = Object.freeze({
+  maxScopeBytes: ARTIFACT_MAX_SOURCE_BYTES,
+  maxScopeEvents: ARTIFACT_MAX_SOURCE_RECORDS,
+  maxRows: 1_000_000,
+  insertBatch: 5_000,
+});
+
+export function searchIndexLimits(replayPagesEnabled: boolean): SearchIndexLimits {
+  return { ...(replayPagesEnabled ? REPLAY_SEARCH_INDEX_LIMITS : SEARCH_INDEX_DEFAULT_LIMITS) };
+}
 
 export interface SearchIndexResult {
   manifests: number;
@@ -214,7 +241,7 @@ async function livePointerSnapshot(tx: SqlExecutor, scope: SessionScope): Promis
 }
 
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
-  const limits = { ...DEFAULT_LIMITS, ...deps.limits };
+  const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
   return deps.transact(async (tx) => {
     // Non-blocking: a pass already running for this session is busy for as long
@@ -308,7 +335,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if(complete){
       const directoryKey={orgId:scope.orgId,workspaceId:scope.workspaceId,harness:scope.harness,sessionId:pointerSnapshot.canonicalId};
       const written=await (deps.writeEvents??writeDirectoryEvents)(tx,directoryKey,{sourceSessionId:scope.sessionId,expectedEpoch:pointerSnapshot.epoch,sources:s3.sources,events:s3.events});
-      if(written.written)await (deps.writeCatalog??writeDirectoryCatalog)(tx,directoryKey,s3.catalog);
+      if(written.written)await (deps.writeCatalog??directoryCatalogWriter(deps.desktopCatalog===true))(tx,directoryKey,s3.catalog);
       else {complete=false;s3.reasons.push("directory_event_sources_changed");await invalidateDirectoryEvents(tx,scope);}
     }
     // Only a complete pass makes the session current; any other leaves it owing one.

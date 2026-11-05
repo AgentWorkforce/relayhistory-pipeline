@@ -44,6 +44,12 @@ export interface ErasureConfig {
   progressEveryMs: number;
   /** Logged as a breach when the oldest queued erasure is older than this. */
   slaWarnMs: number;
+  /**
+   * Whether the existence guard also counts legacy-only evidence (conversation
+   * turns, links, outcomes). `S3X_ERASER_RECOGNIZES_LEGACY`; enable before the
+   * exporter's `S3X_INCLUDE_LEGACY_SOURCES`.
+   */
+  recognizeLegacy: boolean;
 }
 
 export const DEFAULT_ERASURE_CONFIG: ErasureConfig = {
@@ -52,6 +58,7 @@ export const DEFAULT_ERASURE_CONFIG: ErasureConfig = {
   idleSleepMs: 30 * 1000,
   progressEveryMs: 60 * 1000,
   slaWarnMs: 24 * 60 * 60 * 1000,
+  recognizeLegacy: false,
 };
 
 const SESSION_PREFIX = /^[^/]+\/[^/]+\/v1\/ws=[^/]+\/m=[^/]+\/h=[^/]+\/d=\d{4}\/\d{2}\/\d{2}\/s=[^/]+\/$/;
@@ -136,8 +143,9 @@ export class ErasureJob {
     if (!opts.dryRun) this.state.setMeta("erasure_sweep_done", String(id));
     let gone = 0;
     for (const g of this.state.vanishedExports(opts.dryRun ? -id : id, startedAt, !opts.dryRun)) {
-      // Confirm on Neon right before erasing: no rollup and no catalog row now.
-      if (await groupExistsInNeon(this.db, g.org_id, g.session_id)) continue;
+      // Confirm on Neon right before erasing: no rollup and no catalog row now
+      // (and, with recognizeLegacy, no legacy turn, link or outcome row).
+      if (await groupExistsInNeon(this.db, g.org_id, g.session_id, this.cfg.recognizeLegacy)) continue;
       gone += 1;
       if (!opts.dryRun) this.#queueGroup(g.org_id, g.session_id, g.keys, "gone_from_neon");
     }
