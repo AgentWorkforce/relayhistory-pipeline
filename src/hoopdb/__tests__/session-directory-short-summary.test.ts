@@ -2517,6 +2517,13 @@ describe("Worker role validation in two phases", () => {
       "approved RPC redefined: sessions.session_directory_pointers(text,text)",
     ],
     [
+      "a redefined brief-document authority RPC",
+      `CREATE FUNCTION sessions.session_brief_document_authority(p_workspace_id text)
+        RETURNS integer LANGUAGE sql AS 'SELECT 1';
+      GRANT EXECUTE ON FUNCTION sessions.session_brief_document_authority(text) TO ${WORKER}`,
+      "approved RPC redefined: sessions.session_brief_document_authority(text)",
+    ],
+    [
       "a revoked approved grant",
       `REVOKE EXECUTE ON FUNCTION sessions.session_directory_readiness() FROM ${WORKER}`,
       "missing EXECUTE on sessions.session_directory_readiness()",

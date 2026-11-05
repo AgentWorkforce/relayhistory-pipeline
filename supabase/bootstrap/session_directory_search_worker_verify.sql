@@ -167,7 +167,7 @@ BEGIN
   END LOOP;
   FOR v_row IN SELECT p.oid::regprocedure AS fn FROM pg_proc AS p
                 WHERE p.pronamespace = v_sessions
-                  AND p.proname IN ('search_session_directory', 'session_directory_pointers',
+                  AND p.proname IN ('session_brief_document_authority', 'search_session_directory', 'session_directory_pointers',
                                     'session_directory_readiness', 'list_session_directory',
                                     'session_directory_activity', 'session_directory_event_activity', 'list_session_directory_events', 'session_brief')
                   AND NOT (p.oid = ANY (v_fns)) LOOP
