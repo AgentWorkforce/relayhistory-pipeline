@@ -67,7 +67,11 @@ export interface SearchEventDocument extends SearchTenant, SearchPosition {
   readonly version: number;
 }
 
-export type SearchHit = Omit<SearchEventDocument, "fingerprint" | "version">;
+/**
+ * What a query returns: the read API's row shape. `taskRefId` (an index-only
+ * filter column) and `deliveryRecordId` are stored but not returned.
+ */
+export type SearchHit = Omit<SearchEventDocument, "fingerprint" | "version" | "taskRefId" | "deliveryRecordId">;
 
 /** A stored row's identity and fingerprint, as a reconcile scan returns it. */
 export interface SearchFingerprint extends SearchPosition {

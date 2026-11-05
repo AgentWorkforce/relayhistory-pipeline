@@ -157,12 +157,10 @@ function toHit(r: Row): SearchHit {
     projectId: r.project_id,
     taskTitle: r.task_title,
     taskRef: r.task_ref,
-    taskRefId: r.task_ref_id,
     tags: r.tags,
     filesTouched: r.files_touched,
     toolName: r.tool_name,
     toolStatus: r.tool_status,
-    deliveryRecordId: r.delivery_record_id,
     content: r.content,
   };
 }

@@ -213,11 +213,12 @@ export function searchIndexConformance(name: string, factory: () => Promise<Conf
         taskTitle: "Title",
         taskRef: '{"id":"T-1"}',
         taskRefId: "T-1",
+        deliveryRecordId: "rec-1",
       });
       await a.upsert([doc]);
       const tenant = { orgId: org, workspaceId: "ws-a" };
       const full = (await a.query({ tenant, order: "asc", limit: 1 })).hits[0]!;
-      const { fingerprint: _f, version: _v, ...expected } = doc;
+      const { fingerprint: _f, version: _v, taskRefId: _t, deliveryRecordId: _d, ...expected } = doc;
       expect(full).toEqual(expected);
       const cut = (await a.query({ tenant, order: "asc", limit: 1, maxContentChars: 4 })).hits[0]!;
       expect(cut.content).toBe("héll");
