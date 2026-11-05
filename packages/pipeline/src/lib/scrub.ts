@@ -103,9 +103,10 @@ function backslashesBefore(text: string, at: number): number {
  * Redact the value of every quoted secret key, keeping the key, the separator and the
  * value's quotes: `"password": "x"`, `\"password\": \"x\"` (a JSON document inside a
  * JSON string, such as a tool result), deeper escapings, single-quoted and backtick
- * forms, and an unquoted value after a quoted key (`'token' => abc`). The value ends at
- * the matching closing quote: a quote escaped once more than the opening one (an inner
- * quote) does not end it, and nor does one preceded by an escaped backslash. A value
+ * forms, and a generated-looking unquoted value after a quoted one-word key
+ * (`'token' => <generated>`). A quoted value ends at the matching closing quote: a
+ * quote escaped once more than the opening one (an inner quote) does not end it, and
+ * nor does one preceded by an escaped backslash. A value
  * with no closing quote on its line is redacted to the next whitespace. JSON literals and
  * numbers are kept, as are values already redacted and `op://` references.
  */
@@ -166,12 +167,18 @@ function redactQuotedSecretValues(text: string): string {
             : valueStart + ws;
       }
     } else {
-      if (bs > 0) continue;
+      // An unquoted value is taken only after a one-word key (no space: in
+      // `Error 401 "Invalid authentication token": please run …` the quotes hold
+      // prose) and only when it looks generated (`looksGenerated`), so code is kept:
+      // `case "token": return parseToken(input);`, `case 'auth': handleAuth(req)`.
+      // A short or word-like unquoted password after a quoted key is kept too.
+      if (bs > 0 || (m[3] as string).includes(" ")) continue;
       valueStart = end;
       const bare = /^[^\s"'`,;{}[\]\\]+/.exec(
         text.slice(end, end + MAX_QUOTED_VALUE),
       );
-      if (!bare || NON_SECRET_BARE.test(bare[0])) continue;
+      if (!bare || NON_SECRET_BARE.test(bare[0]) || !looksGenerated(bare[0]))
+        continue;
       valueEnd = end + bare[0].length;
     }
     const value = text.slice(valueStart, valueEnd);

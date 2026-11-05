@@ -27,8 +27,9 @@ const SCRUB_RULESETS: Record<number, string> = {
   // widened from 4096 to 8192, past the quoted rule's reach). Version 3 has sealed no
   // chunk: it is only on the unmerged #162 branch.
   // Then the entropy fallback stopped firing after a `/`, `.` or `-` (paths, members,
-  // branch names).
-  3: "5ed0e283977024c59f6e4fef3c51531b81358f1c95a1dc1bf449ccfcda1ec369",
+  // branch names), and an unquoted value after a quoted key is taken only after a
+  // one-word key and only when it looks generated (code and quoted prose are kept).
+  3: "93dfb3d90ae7b4efdccb8c2b1159ef759715841a90723ac814a5820cd9b893c3",
 };
 
 const read = (rel: string) =>
