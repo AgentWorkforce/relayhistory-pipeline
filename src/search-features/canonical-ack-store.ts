@@ -88,24 +88,33 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
    * An opaque cursor ORDER BY is not chain order — walk the actual edges. */
   async resumeCursor(
     entry: CanonicalJournalEntry, pool: "event" | "brief",
-  ): Promise<{ state: "empty" | "resume" | "complete";
-               cursor: string | null }> {
+  ): Promise<{ state: "empty" | "resume" | "complete" | "corrupt";
+               cursor: string | null; terminalSha256?: string }> {
     const { rows: chain } = await this.db.query<{
-      cursor: string; next_cursor: string | null }>(
-      `SELECT cursor,next_cursor FROM ${PAGE}` +
+      cursor: string; next_cursor: string | null; page_sha256: string }>(
+      `SELECT cursor,next_cursor,page_sha256 FROM ${PAGE}` +
         ` WHERE entry_revision=$1 AND pool=$2`,
       [entry.revision, pool]);
     if (!chain.length) return { state: "empty", cursor: null };
+    // Walk from 'start'; a complete walk must consume EVERY row — a leftover
+    // means a branch/disconnected component, which is corrupt.
     let cursor: string | null = "start";
     const seen = new Set<string>(["start"]);
+    let consumed = 0;
     for (;;) {
       const edge = chain.find((r) => r.cursor === cursor);
-      if (!edge)                        // a dangling edge: corrupt chain
-        return { state: "resume", cursor };
-      if (edge.next_cursor === null)    // reached the terminal
-        return { state: "complete", cursor: null };
+      if (!edge)                        // dangling next -> corrupt
+        return { state: "corrupt", cursor: null };
+      consumed++;
+      if (edge.next_cursor === null) {
+        // complete only when the walk consumed every row in the chain.
+        return consumed === chain.length
+          ? { state: "complete", cursor: null,
+              terminalSha256: edge.page_sha256 }
+          : { state: "corrupt", cursor: null };
+      }
       if (seen.has(edge.next_cursor))   // a cycle — corrupt
-        return { state: "resume", cursor };
+        return { state: "corrupt", cursor: null };
       seen.add(edge.next_cursor);
       cursor = edge.next_cursor;
     }

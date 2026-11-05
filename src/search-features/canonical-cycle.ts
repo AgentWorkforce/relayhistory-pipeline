@@ -131,11 +131,15 @@ export async function copyCanonicalEntry(
   };
   const sourceAuthority: CanonicalSourceAuthority =
     entry.kind === "publish" ? entry.sourceAuthority : entry.priorSourceAuthority;
-  // Begin freezes the entry bindings before any CH write; drift refuses.
-  await acks.begin(entry, sourceAuthority.fingerprint);
+  // Begin freezes the EXACT immutable bindings finish will prove —
+  // profileBinding and targetBinding must be identical at both ends.
+  const profileBinding = "builtin-fold";
+  const targetBinding = ev.imageKey;
+  await acks.begin(entry, profileBinding, targetBinding);
   // Resume derives from the durable chain; a complete pool is SKIPPED.
   const rs: Record<"event" | "brief",
-      { state: "empty" | "resume" | "complete"; cursor: string | null }> = {
+      { state: "empty" | "resume" | "complete" | "corrupt";
+        cursor: string | null; terminalSha256?: string }> = {
     event: await acks.resumeCursor(entry, "event"),
     brief: await acks.resumeCursor(entry, "brief"),
   };
@@ -174,7 +178,14 @@ export async function copyCanonicalEntry(
   };
   let total = 0, terminalEvent = "", terminalBrief = "";
   for (const kind of ["event", "brief"] as const) {
-    if (rs[kind].state === "complete") continue;   // already finished
+    if (rs[kind].state === "corrupt")
+      return { kind: "refused", reason: "corrupt_chain" };
+    if (rs[kind].state === "complete") {
+      // Already-finished pool: carry its durable terminal hash into finish.
+      if (kind === "event") terminalEvent = rs[kind].terminalSha256!;
+      else terminalBrief = rs[kind].terminalSha256!;
+      continue;
+    }
     const seen = new Set<string>();
     for await (const { page, request } of pageAll(images, entry, kind,
         entry.kind === "retire", rs[kind].cursor)) {
@@ -204,9 +215,7 @@ export async function copyCanonicalEntry(
   // finish CAS: terminal descriptors + all page ACKs + still-current authority
   await acks.finish({
     entry, terminalEvent, terminalBrief,
-    sourceAuthority,
-    profileBinding: "builtin-fold",
-    targetBinding: ev.imageKey,
+    sourceAuthority, profileBinding, targetBinding,
   });
   return { kind: "copied", checkpoint: entry.revision, rows: total };
 }

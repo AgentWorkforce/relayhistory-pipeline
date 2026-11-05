@@ -42,15 +42,25 @@ const jsonb = <T>(v: unknown): T => {
 const HS1 = /^hs1:[a-f0-9]{64}:[a-f0-9]{64}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HEX64 = /^[a-f0-9]{64}$/;
-/** Fail-closed row validation — every field shape checked, not just cast. */
+// Canonical positive integer — no zero, no leading zeros.
+const DEC = /^(0|[1-9][0-9]*)$/;
+/** Fail-closed row validation — every field + cross-bound shape checked. */
+const exactKeys = (o: unknown, keys: string[]): boolean =>
+  !!o && typeof o === "object" &&
+  new Set(Object.keys(o)).size === keys.length &&
+  keys.every((k) => k in (o as Record<string, unknown>));
 const validAuth = (a: CanonicalSourceAuthority | undefined) =>
-  !!a && UUID.test(a.authorityId) && /^[0-9]+$/.test(a.epoch) &&
+  !!a && exactKeys(a, ["authorityId", "epoch", "fingerprint"]) &&
+  UUID.test(a.authorityId) && DEC.test(a.epoch) &&
   HEX64.test(a.fingerprint);
 const validPtr = (p: CanonicalPointerSet | undefined) =>
-  !!p && UUID.test(p.authorityId) && HEX64.test(p.hash) &&
-  /^[0-9]+$/.test(p.count);
+  !!p && exactKeys(p, ["authorityId", "hash", "count"]) &&
+  UUID.test(p.authorityId) && HEX64.test(p.hash) &&
+  DEC.test(p.count);
 const validScope = (s: CanonicalScope | undefined) =>
-  !!s && typeof s.orgId === "string" && typeof s.workspaceId === "string" &&
+  !!s && exactKeys(s, ["orgId", "workspaceId", "harness", "sessionId",
+                       "generation"]) &&
+  typeof s.orgId === "string" && typeof s.workspaceId === "string" &&
   typeof s.harness === "string" && typeof s.sessionId === "string" &&
   HEX64.test(s.generation);
 const toEntry = (r: Row): CanonicalJournalEntry => {
@@ -61,12 +71,23 @@ const toEntry = (r: Row): CanonicalJournalEntry => {
   const pointerSet = jsonb<CanonicalPointerSet>(r.pointer_set);
   if (!validScope(scope) || !validPtr(pointerSet))
     throw new Error("journal_row_invalid");
+  if (!HEX64.test(r.source_hash) || !HEX64.test(r.schema_generation) ||
+      !DEC.test(String(r.revision)) ||
+      (r.prior_keyset_hash !== null && !HEX64.test(r.prior_keyset_hash)))
+    throw new Error("journal_row_invalid");
+  const hs1Auth = r.image_key.split(":")[3]!;
   if (r.kind === "retire") {
     const prior = jsonb<CanonicalSourceAuthority>(r.source_authority);
-    if (!validAuth(prior)) throw new Error("journal_row_invalid");
+    // Retire: the prior authority (in source_authority) must equal the hs1
+    // suffix AND the pointer set's authority — cross-bound identity.
+    if (!validAuth(prior) || prior.authorityId !== pointerSet.authorityId ||
+        prior.authorityId !== hs1Auth)
+      throw new Error("journal_row_invalid");
   } else {
     const src = jsonb<CanonicalSourceAuthority>(r.source_authority);
-    if (!validAuth(src)) throw new Error("journal_row_invalid");
+    if (!validAuth(src) || src.authorityId !== pointerSet.authorityId ||
+        src.authorityId !== hs1Auth)
+      throw new Error("journal_row_invalid");
     if (r.prior_source_authority &&
         !validAuth(jsonb<CanonicalSourceAuthority>(r.prior_source_authority)))
       throw new Error("journal_row_invalid");

@@ -96,8 +96,8 @@ export interface CanonicalPageAckPort {
   /** Durable resume: the verified next edge from the page chain. */
   resumeCursor(
     entry: CanonicalJournalEntry, pool: "event" | "brief",
-  ): Promise<{ state: "empty" | "resume" | "complete";
-               cursor: string | null }>;
+  ): Promise<{ state: "empty" | "resume" | "complete" | "corrupt";
+               cursor: string | null; terminalSha256?: string }>;
   /** finish CAS: both pool terminal descriptors + all page ACKs + current
    *  source authority + unchanged target/profile bindings. */
   finish(input: {
