@@ -17,20 +17,27 @@ const fakeDb = () => {
       return { rows: page.filter((p) => p.entry_revision === params[0] &&
         p.pool === params[1]) as T[] };
     if (text.includes("canonical_feature_copy_state") && text.startsWith("INSERT")) {
-      if (!state.some((s) => s.entry_revision === params[0]))
-        state.push({ entry_revision: params[0], kind: params[1],
-          image_key: params[2], source_authority: params[3],
-          pointer_set: params[4], profile_binding: params[5], dirty: true });
-      return { rows: [] as T[] };
+      if (state.some((s) => s.entry_revision === params[0]))
+        return { rows: [] as T[] };   // conflict -> no rows -> drift check
+      state.push({ entry_revision: params[0], kind: params[1],
+        image_key: params[2], source_authority: params[3],
+        pointer_set: params[4], profile_binding: params[5], dirty: true });
+      return { rows: [{ n: 1 } as T] };
     }
-    if (text.includes("canonical_feature_copy_state") && text.includes("UPDATE")) {
+    // emulate finish_canonical_copy RPC
+    if (text.includes("finish_canonical_copy")) {
       const s = state.find((r) => r.entry_revision === params[0]);
-      if (s && s.dirty && s.source_authority === params[1] &&
-          s.profile_binding === params[2]) {
-        s.dirty = false;
-        return { rows: [{ n: 1 } as T] };
-      }
-      return { rows: [] as T[] };
+      const ok = !!(s && s.dirty && s.source_authority === params[1] &&
+          s.profile_binding === params[2]);
+      if (ok) s!.dirty = false;
+      return { rows: [{ ok } as T] };
+    }
+    if (text.includes("canonical_feature_copy_state") && text.includes("SELECT")) {
+      const s = state.find((r) => r.entry_revision === params[0]);
+      return { rows: s
+        ? [{ source_authority: s.source_authority,
+             pointer_set: s.pointer_set,
+             profile_binding: s.profile_binding } as T] : [] };
     }
     return { rows: [] as T[] };
   };

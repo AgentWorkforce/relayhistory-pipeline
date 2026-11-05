@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import { copyCanonicalEntry } from "../canonical-cycle.ts";
 import type {
@@ -9,7 +10,7 @@ import { featureVersion } from "../source.ts";
 const HASH = "a".repeat(64);
 const SCOPE = { orgId: "org", workspaceId: "ws", harness: "h", sessionId: "s-1" };
 const AUTH = { epoch: "7", fingerprint: "f".repeat(64) };
-const PTR = { hash: "p".repeat(64), count: "1" };
+const PTR = { authorityId: "u", hash: "p".repeat(64), count: "1" };
 const REV = "1000001";
 const stamp = "2026-10-30T10:00:00.000000Z";
 
@@ -37,8 +38,11 @@ const briefRow = {
   briefCompletedAt: stamp, embedding: null, embeddingModel: null,
   contentHash: "h",
 };
+const hashRows = (rows: unknown[]) =>
+  createHash("sha256").update(JSON.stringify(rows)).digest("hex");
 const page = (rows: unknown[], cursor: string | null = null) => ({
-  rows, cursor, source: "img", pointerSetHash: "p".repeat(64), pageSha256: "x",
+  rows, cursor, source: "img-1", pointerSetHash: "p".repeat(64),
+  pageSha256: hashRows(rows),
 });
 const images = (over: Partial<Record<string, unknown>> = {}) => ({
   imagePages: async (_e: CanonicalJournalEntry, kind: "event" | "brief", c: string | null) =>
@@ -50,8 +54,9 @@ const images = (over: Partial<Record<string, unknown>> = {}) => ({
         machineId: "m-1", kind: "session_event", eventId: "e-old", ts: stamp }] : [{
         orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" }], "done")
                : page([], null),
-  imageDescriptor: async () => ({ imageKey: "img-1", sourceHash: HASH,
-    pointerSetHash: "p".repeat(64), complete: true }),
+  imageDescriptor: async (e: CanonicalJournalEntry) => ({
+    imageKey: e.imageKey, sourceHash: HASH,
+    pointerSetHash: e.pointerSet.hash, complete: true }),
   ...over,
 });
 const fakeCH = () => {
