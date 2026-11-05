@@ -522,3 +522,91 @@ test("refuses missing/misaligned timestamp bounds instead of an unbounded replay
   ).rejects.toMatchObject({ reason: "artifact_bounds" });
   expect(readKeys.some((k) => k.endsWith("page-1.json"))).toBe(false);
 });
+async function rawPage(rows: Array<Record<string, unknown>>) {
+  // Raw view: every row is stored as a segmented rowJson blob.
+  const entries: ArtifactEntry[] = [];
+  for (const [n, row] of rows.entries()) {
+    const blob = encode(row),
+      refs: ArtifactRangeRef[] = [];
+    for (let i = 0; i < blob.byteLength; i += 65536)
+      refs.push(
+        await put(
+          `raw-${n}-blob-${i}.json`,
+          blob.slice(i, i + 65536),
+          i,
+          Math.min(65536, blob.byteLength - i),
+          "segment",
+        ),
+      );
+    entries.push({
+      table: "convergence_events",
+      rowJson: {
+        codec: "json-utf8-segments-v1",
+        bytes: blob.byteLength,
+        sha256: await sha256Hex(blob),
+        root: await node(`raw-${n}-blob-node.json`, "bytes", refs),
+      },
+    });
+  }
+  const page = await put(
+    "raw-page.json",
+    encode({
+      version: 1,
+      kind: "row-page",
+      identity,
+      generation,
+      table: "convergence_events",
+      view: "raw",
+      start: 0,
+      rows: entries,
+    }),
+    0,
+    entries.length,
+    "page",
+  );
+  index.tables.convergence_events!.raw = { count: entries.length, root: page };
+  await publish();
+}
+const rawRow = (event: string, ts: string, content: string) => ({
+  source: "codex",
+  session_id: identity.sessionId,
+  event_id: event,
+  machine_id: "m",
+  kind: "tool_result",
+  ts,
+  content,
+});
+test("refuses an oversized raw first row from its declared size before reading any segment", async () => {
+  await rawPage([
+    rawRow("big", "2026-11-01T10:00:00.000001Z", "x".repeat(6 * 1024 * 1024)),
+  ]);
+  readKeys = [];
+  await expect(
+    canonicalArtifactPage(deps, identity, query({ view: "raw" })),
+  ).rejects.toMatchObject({ reason: "row_bound", status: 503 });
+  expect(readKeys.some((k) => k.includes("raw-page.json"))).toBe(true);
+  expect(readKeys.filter((k) => k.includes("-blob-"))).toEqual([]);
+});
+test("stops before fetching a later raw row that cannot fit the reply", async () => {
+  await rawPage([
+    rawRow("small", "2026-11-01T10:00:00.000001Z", "ok"),
+    rawRow("big", "2026-11-01T10:00:00.000002Z", "x".repeat(6 * 1024 * 1024)),
+  ]);
+  readKeys = [];
+  const first = await canonicalArtifactPage(
+    deps,
+    identity,
+    query({ view: "raw", limit: 2 }),
+  );
+  expect(first.rows.map((x) => x.row.event_id)).toEqual(["small"]);
+  expect(first.nextCursor).toStartWith("artifact-v1:");
+  expect(readKeys.filter((k) => k.includes("raw-1-blob"))).toEqual([]);
+  await expect(
+    canonicalArtifactPage(
+      deps,
+      identity,
+      query({ view: "raw", limit: 2, cursor: first.nextCursor }),
+    ),
+  ).rejects.toMatchObject({ reason: "row_bound", status: 503 });
+  expect(readKeys.filter((k) => k.includes("raw-1-blob"))).toEqual([]);
+});
