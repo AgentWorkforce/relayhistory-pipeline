@@ -393,3 +393,33 @@ test("disarm -> DELETE -> rearm: the full backfill prunes the dangling ref befor
   expect((await rpc("ingest_history_inventory_claim", { generation: gen, bucket: "dangle-bucket" })).ticket).not.toBeNull();
   await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
 });
+
+test("resume -> reinsert / update / delete over STALE refs left by OFF: every write repairs the ref (no 23505) before any rebackfill", async () => {
+  const backfill = async () => { let c: unknown = null, n = 0; do { c = (await db.query<any>("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [c === null ? null : JSON.stringify(c)])).rows[0].c; n++; } while (c !== null && n < 100); };
+  const refOf = async (org: string) => (await db.query<any>("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [org])).rows.map((x) => x.r);
+  const epochOf = async (org: string) => (await db.query<any>("SELECT c.epoch::text e FROM sessions.ingest_history_carriers c JOIN sessions.ingest_history_pointer_refs f USING(carrier_sha256) WHERE f.org_id=$1", [org])).rows[0]?.e;
+  const re = await scope(["k1"]), up = await scope(["k1"]), same = await scope(["k1"]), gone = await scope(["k1"]);
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill();
+  await db.query("SELECT sessions.ingest_history_set_live(false)");
+  await db.query("DELETE FROM sessions.session_index WHERE org_id=$1", [re.identity.orgId]);                                  // untracked delete
+  for (const [x, rev] of [[up, 2], [same, 2], [gone, 2]] as const)
+    await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...x.row, revision: rev, content_sha256: "\\x" + "b".repeat(64) }])]);   // untracked updates
+  await db.query("SELECT sessions.ingest_history_set_live(true)");
+  const before = await epochOf(re.identity.orgId);
+  // Reinsert of the deleted pointer: the stale ref at that key is replaced, not a PK violation.
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...re.row, revision: 2 }])]);
+  expect(await refOf(re.identity.orgId)).toEqual(["2"]);
+  expect(BigInt((await epochOf(re.identity.orgId))!)).toBeGreaterThan(BigInt(before!));      // carrier queued for rescan
+  // A tracked change over a stale ref repairs it.
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...up.row, revision: 3, content_sha256: "\\x" + "c".repeat(64) }])]);
+  expect(await refOf(up.identity.orgId)).toEqual(["3"]);
+  // A pointer-unchanged write over a stale ref still repairs it (no early return on a stale ref).
+  await db.query("UPDATE sessions.session_index SET indexed_at=now() WHERE org_id=$1", [same.identity.orgId]);
+  expect(await refOf(same.identity.orgId)).toEqual(["2"]);
+  // A tracked delete over a stale ref removes it.
+  await db.query("DELETE FROM sessions.session_index WHERE org_id=$1", [gone.identity.orgId]);
+  expect(await refOf(gone.identity.orgId)).toEqual([]);
+  await backfill();
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});

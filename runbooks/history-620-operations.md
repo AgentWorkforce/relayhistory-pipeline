@@ -57,6 +57,11 @@ nothing before History needs the inventory.
    pointer (an untracked delete). The final page sets `refs_complete`. `ingest_history_inventory_claim`
    refuses until then, and it also refuses a carrier that still has a dangling reference.
 
+Normal indexer writes resume immediately after arming or resume, before any backfill: a tracked
+insert, update or delete replaces whatever stale reference is left at its key from an untracked period
+(no unique violation) and queues every carrier involved for a rescan. The backfill is still what sets
+`refs_complete`.
+
 Disarming (`set_pointer_tracking(false)`) clears `refs_complete`. Re-arming requires a fresh full
 backfill pass, which rewrites any reference left stale while disarmed.
 

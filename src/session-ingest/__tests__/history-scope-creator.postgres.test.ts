@@ -310,3 +310,26 @@ test.skipIf(!url)("resume (set_live true) waits out a session_index writer that 
   expect((await pool.query("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [s.identity.orgId])).rows.map((x) => x.r)).toEqual(["5"]);
   await pool.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
 });
+
+test.skipIf(!url)("resume -> reinsert over a stale ref concurrent with a running backfill: both commit, no 23505, one current ref", async () => {
+  const s = await scope();
+  const backfill = async (c: pg.Pool | pg.PoolClient) => { let x: unknown = null, n = 0; do { x = (await c.query("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [x === null ? null : JSON.stringify(x)])).rows[0].c; n++; } while (x !== null && n < 100); };
+  await pool.query("INSERT INTO sessions.ingest_receipt_seat_clock(singleton,control_epoch,source_identity_sha256,allocated_high_water,last_seat,baseline,initial_generation) VALUES(true,$1,$2,0,0,'{}'::jsonb,$3) ON CONFLICT DO NOTHING", [sha("seat-epoch"), sha("seat-src"), gen]);
+  await pool.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill(pool);
+  await pool.query("SELECT sessions.ingest_history_set_live(false)");
+  await pool.query("DELETE FROM sessions.session_index WHERE org_id=$1", [s.identity.orgId]);
+  await pool.query("SELECT sessions.ingest_history_set_live(true)");
+  const writer = await pool.connect(), filler = await pool.connect();
+  try {
+    await writer.query("BEGIN");
+    await writer.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...s.row, revision: 7 }])]);       // replaces the stale ref, uncommitted
+    const fill = (async () => { await filler.query("BEGIN"); await backfill(filler); await filler.query("COMMIT"); return "ok"; })()
+      .catch(async (e: any) => { await filler.query("ROLLBACK").catch(() => {}); return e.code ?? e.message; });
+    await new Promise((r) => setTimeout(r, 300));
+    await writer.query("COMMIT");
+    expect(await fill).toBe("ok");
+  } finally { writer.release(); filler.release(); }
+  expect((await pool.query("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [s.identity.orgId])).rows.map((x) => x.r)).toEqual(["7"]);
+  await pool.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});

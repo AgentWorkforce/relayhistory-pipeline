@@ -112,40 +112,53 @@ LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $pointer$
 $pointer$;
 CREATE FUNCTION sessions.ingest_history_sync_pointer() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $sync$
-DECLARE r sessions.session_index%ROWTYPE;old_key text;v_root text;v_key text;v_pointer jsonb;v_known boolean;
+DECLARE r sessions.session_index%ROWTYPE;v_root text;v_key text;v_pointer jsonb;v_sha text;v_known boolean;cur sessions.ingest_history_pointer_refs%ROWTYPE;
 BEGIN
  -- Dormant until an operator arms pointer tracking (and never while the kill switch is off): the
  -- legacy indexer pays nothing. Disarming clears refs_complete, so a fresh backfill pass is required.
  IF NOT sessions.ingest_history_tracking()THEN IF TG_OP='DELETE'THEN RETURN OLD;END IF;RETURN NEW;END IF;
- IF TG_OP<>'INSERT' THEN
-  SELECT carrier_sha256 INTO old_key FROM sessions.ingest_history_pointer_refs
-   WHERE org_id=OLD.org_id AND workspace_id=OLD.workspace_id AND harness=OLD.harness AND session_id=OLD.session_id AND machine_id=OLD.machine_id;
+ -- A ref may be STALE here: left from a disarmed/OFF period (the row was deleted, reinserted or changed
+ -- untracked). Every path REPAIRS it, never errors: whatever ref exists at the OLD key and at the NEW key
+ -- is replaced, and every carrier it named is rescanned. The writer holds the session_index row lock and
+ -- the ref row lock it deletes, the same locks the backfill/prune take, so they serialize.
+ IF TG_OP<>'DELETE' AND NEW.manifest_key IS NOT NULL AND NEW.storage_provider IS NOT NULL AND NEW.bucket IS NOT NULL THEN
+  r:=NEW;
+  v_root:=sessions.ingest_history_root(r.manifest_key);
+  v_known:=v_root IS NOT NULL;v_root:=coalesce(v_root,r.manifest_key);
+  v_key:=encode(sha256(convert_to(jsonb_build_array(r.storage_provider,r.bucket,v_root)::text,'UTF8')),'hex');
+  v_pointer:=sessions.ingest_history_pointer(r);v_sha:=encode(sha256(convert_to(v_pointer::text,'UTF8')),'hex');
  END IF;
- IF TG_OP='UPDATE' AND sessions.ingest_history_pointer(OLD)=sessions.ingest_history_pointer(NEW) THEN RETURN NEW;END IF;
+ -- Unchanged pointer AND an exact current ref: nothing to do (the common indexer clock-only update).
+ IF TG_OP='UPDATE' AND sessions.ingest_history_pointer(OLD)=sessions.ingest_history_pointer(NEW)AND v_key IS NOT NULL THEN
+  SELECT *INTO cur FROM sessions.ingest_history_pointer_refs WHERE org_id=NEW.org_id AND workspace_id=NEW.workspace_id AND harness=NEW.harness
+   AND session_id=NEW.session_id AND machine_id=NEW.machine_id;
+  IF FOUND AND cur.carrier_sha256=v_key AND cur.pointer_sha256=v_sha THEN RETURN NEW;END IF;
+ END IF;
  IF TG_OP<>'INSERT' THEN
-  DELETE FROM sessions.ingest_history_pointer_refs WHERE org_id=OLD.org_id AND workspace_id=OLD.workspace_id
-   AND harness=OLD.harness AND session_id=OLD.session_id AND machine_id=OLD.machine_id;
+  WITH gone AS(DELETE FROM sessions.ingest_history_pointer_refs WHERE org_id=OLD.org_id AND workspace_id=OLD.workspace_id
+    AND harness=OLD.harness AND session_id=OLD.session_id AND machine_id=OLD.machine_id RETURNING carrier_sha256)
   UPDATE sessions.ingest_history_carriers SET epoch=nextval('sessions.ingest_history_inventory_epoch'),scan_complete=false
-   WHERE carrier_sha256=old_key;
+   WHERE carrier_sha256 IN(SELECT carrier_sha256 FROM gone);
  END IF;
  IF TG_OP='DELETE' THEN RETURN OLD;END IF;
- r:=NEW;
+ -- A stale ref already at the NEW key (an untracked delete then this reinsert, or a key change onto it).
+ WITH gone AS(DELETE FROM sessions.ingest_history_pointer_refs WHERE org_id=NEW.org_id AND workspace_id=NEW.workspace_id
+   AND harness=NEW.harness AND session_id=NEW.session_id AND machine_id=NEW.machine_id RETURNING carrier_sha256)
+ UPDATE sessions.ingest_history_carriers SET epoch=nextval('sessions.ingest_history_inventory_epoch'),scan_complete=false
+  WHERE carrier_sha256 IN(SELECT carrier_sha256 FROM gone);
  -- Keep tombstoned/nonpublic refs too; they can still carry physical authority.
  -- Unknown layouts are recorded as unscannable, not omitted or imposed as a new
  -- failure on the dormant legacy indexer. They block full inventory admission.
- IF r.manifest_key IS NULL OR r.storage_provider IS NULL OR r.bucket IS NULL THEN RETURN NEW;END IF;
- v_root:=sessions.ingest_history_root(r.manifest_key);
- v_known:=v_root IS NOT NULL;v_root:=coalesce(v_root,r.manifest_key);
- v_key:=encode(sha256(convert_to(jsonb_build_array(r.storage_provider,r.bucket,v_root)::text,'UTF8')),'hex');
- v_pointer:=sessions.ingest_history_pointer(r);
+ IF v_key IS NULL THEN RETURN NEW;END IF;
  INSERT INTO sessions.ingest_history_carriers(carrier_sha256,storage_provider,bucket,physical_root,layout_known)
  VALUES(v_key,r.storage_provider,r.bucket,v_root,v_known)
  ON CONFLICT(carrier_sha256)DO UPDATE SET epoch=nextval('sessions.ingest_history_inventory_epoch'),scan_complete=false
  WHERE sessions.ingest_history_carriers.storage_provider=excluded.storage_provider AND sessions.ingest_history_carriers.bucket=excluded.bucket
   AND sessions.ingest_history_carriers.physical_root=excluded.physical_root;
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: carrier hash collision';END IF;
- INSERT INTO sessions.ingest_history_pointer_refs VALUES(r.org_id,r.workspace_id,r.harness,r.session_id,r.machine_id,v_key,v_pointer,
-  encode(sha256(convert_to(v_pointer::text,'UTF8')),'hex'));
+ -- Upsert: a ref a concurrent backfill committed after the delete above is re-fenced, never a 23505.
+ INSERT INTO sessions.ingest_history_pointer_refs VALUES(r.org_id,r.workspace_id,r.harness,r.session_id,r.machine_id,v_key,v_pointer,v_sha)
+  ON CONFLICT(org_id,workspace_id,harness,session_id,machine_id)DO UPDATE SET carrier_sha256=excluded.carrier_sha256,pointer=excluded.pointer,pointer_sha256=excluded.pointer_sha256;
  RETURN NEW;
 END $sync$;
 CREATE TRIGGER ingest_history_pointer_sync AFTER INSERT OR UPDATE OR DELETE ON sessions.session_index
