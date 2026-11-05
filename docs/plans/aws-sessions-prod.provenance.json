@@ -1,50 +1,50 @@
 {
   "schema": 1,
   "stage": "aws-sessions-prod",
-  "generatedAt": "2026-11-02T18:57:30.532Z",
+  "generatedAt": "2026-11-05T09:07:36.029Z",
   "target": {
     "accountId": "941433935742",
     "region": "us-east-1",
     "callerArn": "arn:aws:sts::941433935742:assumed-role/AWSReservedSSO_AdministratorAccess_267543ee54f72723/khaliq@agentrelay.com"
   },
   "source": {
-    "commit": "f3ffdaffd415ed5e3a9a67dccf0e0f93692d2315",
-    "stackSourceSha256": "808df2590e7f5c8f4a8381286a7b52564385b72236fe6a5c375344473e3bbd08",
+    "commit": "246ae498fa3976f26e6332b257d4e682d2b2c54e",
+    "stackSourceSha256": "81a6006367cdb16c16803f684ad6447c27a6af47f8dca8b36223b39b8560cb8d",
     "clean": true
   },
   "inputs": {
-    "sha256": "b61afaced565f6fbc53acea917608aad9b2eb53a2658512f939b11e30bad68bf",
+    "sha256": "37c1754b4062b9937ebc50a115d2c80e4e85d96b9df17037a4817adc24c72445",
     "sanitizedPath": "docs/plans/aws-sessions-prod.inputs.sanitized.json",
-    "sanitizedSha256": "8cfbba5f32e9a2e55a1fdbbd89ebf2e8ca1765301c8a30d2120b98d55696b459"
+    "sanitizedSha256": "4e46a37d6c06afd1d61a8f8b31004569a08231d8ea7b9fbda939d1d6e07ada17"
   },
   "state": {
     "bucket": "alchemy-state-941433935742-us-east-1-an",
     "prefix": "96bulls/96bulls-aws/aws-sessions-prod/",
     "versioning": "Enabled",
     "method": "snapshot",
-    "objects": 29,
-    "snapshotSha256": "07f1fccaf1391c658b1daec85d7bb722b991c738e81ecc867201cf2aec326d90",
-    "versionsDigest": "a1ec26aa60dd85a24158eaf21f7321dbfaeac9ecdd4077a199a5bf93e176ad14",
-    "versionEntries": 193
+    "objects": 31,
+    "snapshotSha256": "a45dd3887cc5333b311f4af2febe41ffc850d0776e104938579991b0b4e93cd8",
+    "versionsDigest": "b8987291f8ee8bb7b539f9caed2eaa600a7a43d1c42cfabb70b644e5ded89a28",
+    "versionEntries": 216
   },
   "tools": {
     "alchemy": "2.0.0-beta.84",
     "@alchemy.run/aws": "2.0.0-beta.84",
     "@alchemy.run/kubernetes": "2.0.0-beta.84",
     "bun": "1.4.2",
-    "aws-cli": "aws-cli/2.36.46 Python/3.14.6 Linux/7.2.3-arch1-3 exe/x86_64.omarchy.4",
-    "helm": "v3.22.0+g144ca65"
+    "aws-cli": "aws-cli/2.34.4 Python/3.13.12 Darwin/25.6.0 source/arm64",
+    "helm": "v4.1.1+g5caf004"
   },
   "outputs": {
     "plan": {
       "path": "docs/plans/aws-sessions-prod.plan.txt",
-      "sha256": "06325bdefb567808c4f49211d482ae312f5f7ca63bf548add47bdb379a5f7013"
+      "sha256": "29c1de685594b7f78c6fe83ae5d105bdece9912c2b60e0775a732d73a67107ad"
     },
     "detailed": {
       "path": "docs/plans/aws-sessions-prod.plan.detailed.txt",
-      "sha256": "83a97eb5682d8cfc2e28afddf9e276902b8aaac90bcbff2c12dcc4238caf0321"
+      "sha256": "a66eb898b7f31cc8cae65d290a9b92ec98c0e3998232bc61d3e5be12aa937d2d"
     }
   },
-  "summary": "Plan: 2 to create, 8 to update",
+  "summary": "Plan: 6 to update",
   "note": "Planned against a read-only snapshot of the state (GETs pinned to version ids, in-memory Alchemy state): no state-bucket writes, no lease. The version listing (all versions and delete markers) was identical before and after. AWS provider reads only (Describe/List/Get). `96bulls up` re-checks everything before any change."
 }

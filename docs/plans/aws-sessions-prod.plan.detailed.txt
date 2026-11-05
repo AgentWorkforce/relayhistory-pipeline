@@ -4,35 +4,16 @@ Resolving stack services
 AWS: using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION) instead of the profile.
 Loading stack state
 Computing plan
-Plan ready (2.0s)
-Plan: 2 to create, 8 to update
+Plan ready (2.2s)
+Plan: 6 to update
 
 [access-logs] noop
 
 [budget] noop
 
-[session-brief-permission] create
-  properties:
-    action: lambda:InvokeFunction
-    functionName: 96bulls-aws-sessions-prod-session-pipeline
-    principal: events.amazonaws.com
-    sourceAccount: "941433935742"
-    sourceArn: (known after apply)
+[session-brief-permission] noop
 
-[session-brief-schedule] create
-  properties:
-    description: "96bulls session pipeline: one session-brief tick (due wakeups)"
-    name: 96bulls-aws-sessions-prod-session-brief
-    scheduleExpression: rate(1 minute)
-    state: DISABLED
-    tags:
-      96bulls:component: session-pipeline
-      96bulls:repo: AgentWorkforce/sessions-pipeline
-      96bulls:stack: aws-sessions-prod
-    targets:
-      - Arn: arn:aws:lambda:us-east-1:941433935742:function:96bulls-aws-sessions-prod-session-pipeline
-        Id: session-pipeline
-        Input: '{"brief":true}'
+[session-brief-schedule] noop
 
 [session-events] update
   properties:
@@ -138,8 +119,9 @@ Plan: 2 to create, 8 to update
       PIPELINE_ORG_FROM_PREFIX: "true"
       PIPELINE_RAW_S3_BUCKET: 96bulls-aws-sessions-prod-transcripts-941433935742
       PIPELINE_RECONCILE_LOOKBACK_MINUTES: "60"
-      SEARCH_INDEX_ENABLED: "0"
-  +     SESSION_BRIEF_ENABLED: "false"
+  -     SEARCH_INDEX_ENABLED: "0"
+  +     SEARCH_INDEX_ENABLED: "1"
+      SESSION_BRIEF_ENABLED: "false"
       SESSION_PIPELINE_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/941433935742/96bulls-aws-sessions-prod-session-events
       SESSION_PIPELINE_SECRET_ARN: 96bulls/aws-sessions-prod/session-pipeline
     functionName: 96bulls-aws-sessions-prod-session-pipeline
@@ -181,36 +163,11 @@ Plan: 2 to create, 8 to update
       96bulls:repo: AgentWorkforce/sessions-pipeline
       96bulls:stack: aws-sessions-prod
 
-[session-read-api] update
-  no declared property changes
+[session-read-api] noop
 
 [session-read-api-errors-alarm] noop
 
-[session-read-api-secret] update
-  properties:
-    description: "96bulls session read API: ClickHouse SELECT-only user and Supabase bulls96_read_api URL (JSON)"
-    name: 96bulls/aws-sessions-prod/session-read-api
-    recoveryWindowInDays: 7
-    resourcePolicy:
-  -     Statement:
-  -       - Action: secretsmanager:GetSecretValue
-  -         Effect: Allow
-  -         Principal:
-  -           AWS: arn:aws:iam::941433935742:role/96bulls-aws-session-read-api-aws-sessions-prod-q3tjk5c7wi43htnh
-  -         Resource: "*"
-  -         Sid: SessionReadApiReads
-  +     Statement:
-  +       - Action: secretsmanager:GetSecretValue
-  +         Effect: Allow
-  +         Principal:
-  +           AWS: (known after apply)
-  +         Resource: "*"
-  +         Sid: SessionReadApiReads
-      Version: 2012-10-17
-    tags:
-      96bulls:component: session-read-api
-      96bulls:repo: AgentWorkforce/sessions-pipeline
-      96bulls:stack: aws-sessions-prod
+[session-read-api-secret] noop
 
 [session-read-api-throttles-alarm] noop
 
@@ -602,5 +559,8 @@ Plan: 2 to create, 8 to update
       96bulls:stack: aws-sessions-prod
 
 [transcripts-key-alias] noop
-[33m[COULD_NOT_CLEAN_DIRECTORY] [0mCould not clean directory for output chunks: /home/khaliqgant/Projects/AgentWorkforce/sessions-pipeline-worktrees/brief-rollout-contract/.alchemy/bundles/96bulls-aws-aws-sessions-prod-session-pipeline. Reason: No such file or directory (os error 2)
+alchemy 2.0.0-beta.85 is available (you're on 2.0.0-beta.84). Run `bun add alchemy@2.0.0-beta.85` to upgrade.
+[33m[COULD_NOT_CLEAN_DIRECTORY] [0mCould not clean directory for output chunks: /Volumes/T7/Projects/AgentWorkforce/worktrees/96BullSessions/search-index-enable-20261105/.alchemy/bundles/96bulls-aws-aws-sessions-prod-session-read-api. Reason: No such file or directory (os error 2)
+
+[33m[COULD_NOT_CLEAN_DIRECTORY] [0mCould not clean directory for output chunks: /Volumes/T7/Projects/AgentWorkforce/worktrees/96BullSessions/search-index-enable-20261105/.alchemy/bundles/96bulls-aws-aws-sessions-prod-session-pipeline. Reason: No such file or directory (os error 2)
 

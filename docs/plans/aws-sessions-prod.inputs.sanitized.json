@@ -5,21 +5,22 @@
   "approval": {
     "decision": "approved",
     "by": "Khaliq Gant",
-    "date": "2026-11-02",
+    "date": "2026-11-05",
     "operations": [
       "deploy"
     ],
     "stage": "aws-sessions-prod",
     "accountId": "941433935742",
     "region": "us-east-1",
-    "quote": "Khaliq (to migration-finisher, 2026-11-02 ~09:35 PT): yes — deploy 53c60ed (#166) to aws-sessions-prod for the canonical-ID backfill; brief schedule created DISABLED"
+    "quote": "Khaliq (to bulls-migrator, 2026-11-04/05 PT): \"everything is pre approved\"; \"merge when ready, lets keep this moving\"; \"ok work through the night until this is fully done\". Scope: session pipeline update, searchIndex true + search-index kind guard (246ae49 on 566b086), to restore ClickHouse search ingest from S3.",
+    "capture": {}
   },
   "budgetUsd": 200,
   "budgetEmail": "aws-budgets@agentrelay.com",
   "transcriptStore": {
     "managementEvents": true,
     "sessionPipeline": {
-      "searchIndex": false
+      "searchIndex": true
     },
     "sessionReadApi": {
       "completeSince": "epoch",
