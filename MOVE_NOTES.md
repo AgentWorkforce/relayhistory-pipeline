@@ -400,7 +400,7 @@ New stand-ins the stack needs, beyond the #210/#211 diffs:
 | --- | --- | --- |
 | `packages/pipeline/src/auth/relayauth.ts` | relayhistory-cloud `main` @ 6f6d568 | verbatim plus a one-line provenance header; RS256 JWT verification against `RELAYAUTH_JWKS_URL` |
 | `packages/pipeline/src/auth/analytics-identity.ts` | same | verbatim plus provenance header (relayauth.ts depends on it) |
-| `packages/pipeline/src/middleware/auth.ts` `requireAuth` | written here | the RelayAuth JWT path only; upstream's opaque `rth_at_`/`rth_st_` path needs Neon and is refused with `unsupported_token` |
+| `packages/pipeline/src/middleware/auth.ts` `requireAuth` | written here | the RelayAuth JWT path only; upstream's opaque `rth_at_`/`rth_st_` path needs Neon and is refused with `unsupported_token`. With `RELAYHISTORY_ORIGIN` set and the interim bearer off, it admits RelayAuth's origin-bound History assertion directly (`verifyOriginBoundAssertion` in `auth/relayauth.ts`, a 96BullSessions addition): upstream admits the same token at `/v1/auth/cli/login` and exchanges it for an `rth_` session, which this repo cannot store |
 | `packages/pipeline/src/env.ts` | upstream `env.ts` | adds the `DEFAULT_RELAYAUTH_*` constants, the RelayAuth bindings, and `historyOrigin`/`sessionId`/`analyticsIdentity` on `AuthContext` |
 
 Not ported, on purpose: upstream `middleware/observability.ts` (needs the

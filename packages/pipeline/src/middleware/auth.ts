@@ -44,13 +44,17 @@ export function requireScope(scope: string) {
 /**
  * 96BullSessions `requireAuth`: the RelayAuth JWT path only (upstream also
  * resolves `rth_at_`/`rth_st_` tokens against Neon, which this repo does not
- * have). Enabled by `ALLOW_INTERIM_RELAYAUTH_BEARER=true`; verifies an RS256
- * JWT against `RELAYAUTH_JWKS_URL` and sets `auth` on the context.
+ * have). Verifies an RS256 JWT against `RELAYAUTH_JWKS_URL` and sets `auth` on
+ * the context: with `RELAYHISTORY_ORIGIN` set, only RelayAuth's assertions
+ * minted for that origin (and, behind their own flag, migration assertions);
+ * `ALLOW_INTERIM_RELAYAUTH_BEARER=true` (local dev only) admits any RelayAuth
+ * JWT.
  */
 import {
   IdentityError,
   verifyAgentRelayToken,
   verifyMigrationAssertion,
+  verifyOriginBoundAssertion,
 } from "../auth/relayauth.js";
 import {
   migrationKindAllowsRoute,
@@ -74,24 +78,33 @@ export const requireAuth = createMiddleware<AppEnv>(async (c, next) => {
       "unsupported_token",
       "opaque relayhistory tokens are not supported by this deployment",
     );
-  // As upstream: the broad interim bearer verifies any RelayAuth JWT; the
-  // dedicated, default-off RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS path
-  // admits only migration assertions, and a migration assertion needs that
-  // flag on either path (auth/relayauth.ts).
+  // As upstream: the broad interim bearer (dev only) verifies any RelayAuth
+  // JWT; the dedicated, default-off RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS
+  // path admits only migration assertions, and a migration assertion needs
+  // that flag on every path (auth/relayauth.ts).
+  // 96BullSessions: with RELAYHISTORY_ORIGIN set (hosted and customer
+  // installs), the interim bearer off admits RelayAuth's origin-bound History
+  // assertion class and nothing else (verifyOriginBoundAssertion); upstream
+  // admits the same token at its session exchange.
   const interim = c.env?.ALLOW_INTERIM_RELAYAUTH_BEARER === "true";
+  const originBound = !interim && !!c.env?.RELAYHISTORY_ORIGIN?.trim();
   const migrationOnly =
-    !interim && c.env?.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS === "true";
-  if (!interim && !migrationOnly)
+    !interim &&
+    !originBound &&
+    c.env?.RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS === "true";
+  if (!interim && !originBound && !migrationOnly)
     return deny(
       401,
       "auth_not_configured",
-      "bearer auth is not enabled (ALLOW_INTERIM_RELAYAUTH_BEARER)",
+      "bearer auth is not configured (set RELAYHISTORY_ORIGIN)",
     );
   let auth: AuthContext;
   try {
     auth = interim
       ? await verifyAgentRelayToken(token, c.env)
-      : await verifyMigrationAssertion(token, c.env);
+      : originBound
+        ? await verifyOriginBoundAssertion(token, c.env)
+        : await verifyMigrationAssertion(token, c.env);
   } catch (err) {
     if (err instanceof IdentityError) return deny(401, err.code, err.message);
     throw err;

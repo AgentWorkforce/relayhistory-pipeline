@@ -147,11 +147,23 @@ describe("the dedicated migration-assertion flag", () => {
 
   it("never admits a generic RelayAuth bearer through the dedicated path", async () => {
     const request = app();
-    // Only with the explicit interim opt-in does requireAuth verify a generic
-    // RelayAuth JWT at all (dev/tests; buildIngestApp defaults it off, see
-    // src/alleyoop/__tests__/ingest-auth.test.ts).
+    // Without an origin, only the explicit interim opt-in verifies a History
+    // assertion at all (dev/tests; buildIngestApp defaults it off, see
+    // src/alleyoop/__tests__/ingest-auth.test.ts). With an origin, the
+    // origin-bound path admits it (test/origin-bound-assertion-auth.test.ts).
     expect((await request("/v1/pipeline/manifests", relayhistoryToken())).status).toBe(200);
-    const refused = await request("/v1/pipeline/manifests", relayhistoryToken(), { ALLOW_INTERIM_RELAYAUTH_BEARER: undefined });
+    // Without an origin the shared audience verifies, so this reaches the
+    // migration path's class check and is refused there.
+    const now = Math.floor(Date.now() / 1000);
+    const generic = sign({
+      sub: "agent_relayhistory_assertion", org: ORG, wks: WORKSPACE, sponsorId: USER,
+      scopes: ["rth:read", "rth:sync"], token_type: "access", iss: ISSUER, aud: ["relayhistory"],
+      iat: now, exp: now + 60, meta: { tokenClass: "relayhistory_assertion" },
+    });
+    const refused = await request("/v1/pipeline/manifests", generic, {
+      ALLOW_INTERIM_RELAYAUTH_BEARER: undefined,
+      RELAYHISTORY_ORIGIN: undefined,
+    });
     expect(refused.status).toBe(401);
     expect(await code(refused)).toBe("invalid_token");
   });

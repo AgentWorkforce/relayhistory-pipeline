@@ -36,6 +36,7 @@ import * as AWS from "@alchemy.run/aws";
 import * as Effect from "effect/Effect";
 import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
+import{derivedSchemaBuildPlugin}from "./derived-schema-build.ts";
 
 export interface SessionPipelineInputs {
   /** Turn the ClickHouse stage on (SEARCH_INDEX_ENABLED=1). Off: pointers only. */
@@ -315,7 +316,7 @@ export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { b
     env: sessionPipelineEnv({ stage: i.stage, bucket: i.bucket, names, p: i.p }),
     logging: { retention: "30 days" },
     functionUrl: false as const,
-    build: { tsconfig: "tsconfig.json" },
+    build: { tsconfig: "tsconfig.json",plugins:[derivedSchemaBuildPlugin()] },
   };
 }
 

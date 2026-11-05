@@ -18,7 +18,8 @@ permissions:
   id-token: write
 jobs:
   publish:
-    if: ${{ github.actor == 'khaliqgant' && github.event.inputs.confirm == 'publish 96bulls-services to ecr' }}
+    # Publish only images built from main.
+    if: ${{ github.ref == 'refs/heads/main' && github.actor == 'khaliqgant' && github.event.inputs.confirm == 'publish 96bulls-services to ecr' }}
     environment: image-publish
     runs-on: ${{ vars.DEPLOY_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30

@@ -1,3 +1,7 @@
+-- Append-only release rename (registry v2); upstream provenance: 20261103040000_session_replay_pages.sql. Never applied under the upstream filename in this release.
+-- Fail fast instead of queueing live readers/writers behind a blocked DDL lock (migrate.ts applies
+-- each file in one transaction, so SET LOCAL lasts exactly as long as this file).
+SET LOCAL lock_timeout='5s';
 -- Dormant materialized canonical reads. Objects are written/verified by the Node
 -- producer first; publication is an exact source+epoch CAS. No reader table grant.
 CREATE INDEX session_index_replay_canonical_live ON sessions.session_index

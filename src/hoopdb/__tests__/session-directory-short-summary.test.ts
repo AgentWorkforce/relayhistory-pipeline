@@ -74,7 +74,7 @@ const BRIEFS_UP = read(`supabase/migrations/${BRIEFS}`);
 const BRIEFS_DOWN = read(
   `supabase/rollbacks/${BRIEFS.replace(/\.sql$/, ".down.sql")}`,
 );
-const EVENTS = "20261103010000_session_directory_event_metadata.sql";
+const EVENTS = "20261104021000_session_directory_event_metadata.sql";
 const EVENTS_UP = read(`supabase/migrations/${EVENTS}`);
 const EVENTS_DOWN = read(`supabase/rollbacks/${EVENTS.replace(/\.sql$/, ".down.sql")}`);
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;
@@ -99,6 +99,8 @@ async function database(prelude = ""): Promise<PGlite> {
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
+  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
+  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   if (prelude) await db.exec(prelude);
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
@@ -844,6 +846,9 @@ describe("migration role collision", () => {
   const BOOTSTRAP = read(
     "supabase/bootstrap/session_directory_search_worker.sql",
   );
+  const TOKEN_BOOTSTRAP = read(
+    "supabase/bootstrap/session_token_verifier.sql",
+  );
   /** The role exactly as the bootstrap makes it. */
   const SPEC = `CREATE ROLE ${WORKER} NOLOGIN NOINHERIT; ALTER ROLE ${WORKER} SET statement_timeout = '2s';`;
   const failure = async (run: Promise<unknown>) =>
@@ -903,7 +908,9 @@ describe("migration role collision", () => {
   test("the bootstrap creates the role exactly to spec and is idempotent; the migration then applies and leaves no membership or ADMIN OPTION", async () => {
     const db = await beforeG6();
     await db.exec(BOOTSTRAP);
+    await db.exec(TOKEN_BOOTSTRAP);
     await db.exec(BOOTSTRAP);
+    await db.exec(TOKEN_BOOTSTRAP);
     const spec = async () =>
       (
         await db.query<Row>(
@@ -937,6 +944,7 @@ describe("migration role collision", () => {
     expect(await settings(db)).toEqual(timeout);
     // Bootstrap again after the migration: still a no-op that verifies.
     await db.exec(BOOTSTRAP);
+    await db.exec(TOKEN_BOOTSTRAP);
     expect(await memberships(db)).toEqual([]);
   });
 
@@ -2297,6 +2305,7 @@ describe("short_summary rollback", () => {
     // Reverse dependency order: event metadata also depends on G6 and the list/catalog phases.
     for(const file of [...LATER_PHASES].reverse())await db.exec(read(`supabase/rollbacks/${file}`));
     await db.exec(EVENTS_DOWN);
+    await db.exec(read("supabase/rollbacks/20261102020000_session_brief_state.down.sql"));
     await db.exec(BRIEFS_DOWN);
     await db.exec(LIST_DOWN);
     await db.exec(EXPAND_DOWN);
@@ -2340,6 +2349,7 @@ describe("short_summary rollback", () => {
     await db.exec(EXPAND_UP);
     await db.exec(LIST_UP);
     await db.exec(BRIEFS_UP);
+    await db.exec(read("supabase/migrations/20261102020000_session_brief_state.sql"));
     await db.exec(EVENTS_UP);
     for(const file of LATER_PHASES)await db.exec(read(`supabase/migrations/${file.replace(/\.down\.sql$/,".sql")}`));
     await db.query(
@@ -2394,7 +2404,7 @@ describe("Worker role validation in two phases", () => {
       "sessions.session_directory_readiness()",
       "sessions.session_brief(text, text, text)",
     ])
-      expect(error?.message).toContain(`approved RPC missing: ${sig}`);
+      expect(error?.message).toContain(`approved RPC missing: ${sig.replace(/, /g, ",").replace(/\btimestamptz\b/g, "timestamp with time zone")}`);
     expect(error?.message).toContain("missing USAGE on schema sessions");
   });
 

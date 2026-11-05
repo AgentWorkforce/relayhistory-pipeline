@@ -331,3 +331,36 @@ it("HTTP timestamp window cursor cannot be reused with a changed window", async 
   );
   expect(changed.status).toBe(400);
 });
+it("raw mode keeps refusing table=session_timing with 400; only pages mode serves it", async () => {
+  const timing = new Request(
+    "https://read.test/v1/canonical/sessions/" +
+      encodeURIComponent(identity.sessionId) +
+      "?workspace=ws-a&source=codex&table=session_timing",
+    { headers: { authorization: "Bearer " + token } },
+  );
+  for (const env of [
+    { CANONICAL_READ_ENABLED: "true" },
+    { CANONICAL_READ_ENABLED: "true", CANONICAL_READ_MODE: "raw" },
+  ]) {
+    const f = await fixture();
+    const response = await canonicalHandle(
+      timing.clone(),
+      env,
+      forbidden,
+      { pointers: forbidden } as never,
+      f.deps,
+    );
+    expect(response.status).toBe(400);
+    expect(f.counts()).toEqual({ reads: 0, claims: 0 });
+  }
+  const f = await fixture();
+  const response = await canonicalHandle(
+    timing.clone(),
+    { CANONICAL_READ_ENABLED: "true", CANONICAL_READ_MODE: "pages" },
+    forbidden,
+    { pointers: forbidden } as never,
+    f.deps,
+  );
+  expect(response.status).not.toBe(400);
+  expect(f.counts().claims).toBeGreaterThan(0);
+});
