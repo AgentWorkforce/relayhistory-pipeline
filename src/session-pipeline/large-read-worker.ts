@@ -11,9 +11,21 @@ export interface LargeReadJob { identity:{orgId:string;workspaceId:string;source
 export interface LargeReadDeps { db:SqlExecutor;search:SearchIndexDeps;replay:ReplayProducerDeps;signal?:AbortSignal;heartbeatMs?:number }
 function scopeOf(j:LargeReadJob):SessionScope{return {orgId:j.identity.orgId,workspaceId:j.identity.workspaceId,harness:j.identity.source,sessionId:j.identity.sessionId}}
 const args=(s:SessionScope)=>[s.orgId,s.workspaceId,s.harness,s.sessionId];
-export async function routeLargeRead(db:SqlExecutor,s:SessionScope):Promise<boolean>{
- const r=(await db.query<{r:{delegated:boolean}}>("SELECT sessions.route_session_large_read($1,$2,$3,$4) r",args(s))).rows[0]?.r;
- if(!r||typeof r.delegated!=="boolean")throw new Error("large_handoff_invalid");return r.delegated;
+/** Route result; `identity` is the canonical job scope (jobs are keyed by canonical session id). */
+export interface LargeRoute { delegated:boolean;identity?:SessionScope }
+export async function routeLargeRead(db:SqlExecutor,s:SessionScope):Promise<LargeRoute>{
+ const r=(await db.query<{r:{delegated:boolean;identity?:Partial<LargeReadJob["identity"]>}}>("SELECT sessions.route_session_large_read($1,$2,$3,$4) r",args(s))).rows[0]?.r;
+ if(!r||typeof r.delegated!=="boolean")throw new Error("large_handoff_invalid");
+ const i=r.identity;
+ if(!r.delegated||typeof i?.sessionId!=="string"||!i.sessionId||i.orgId!==s.orgId||i.workspaceId!==s.workspaceId||i.source!==s.harness)return {delegated:r.delegated};
+ return {delegated:true,identity:{...s,sessionId:i.sessionId}};
+}
+export interface LargeJobState { state:string;attempts:number }
+/** One read of the job row behind a delegated route (flag-on path only). The SQL contract has
+ * no state in the route result; a `failed` job is never claimed again until the source changes. */
+export async function largeReadJobState(db:SqlExecutor,s:SessionScope):Promise<LargeJobState|null>{
+ const row=(await db.query<{state:string;attempts:number}>("SELECT state,attempts FROM sessions.session_large_read_jobs WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4",args(s))).rows[0];
+ return row?{state:row.state,attempts:Number(row.attempts)}:null;
 }
 export async function runLargeReadOnce(deps:LargeReadDeps):Promise<"idle"|"published"|"retry"|"lease_lost">{
  if(deps.signal?.aborted)return "idle";

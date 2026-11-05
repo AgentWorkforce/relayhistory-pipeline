@@ -8,6 +8,7 @@ import {objectKey} from "../../../packages/object-store/src/index.ts";
 import {objectStoreManifestReader,prefixAllowed,prefixOrgResolver} from "../../shared/vendor.ts";
 import {processBatch,type ConsumerDeps} from "../consumer.ts";
 import {droppedFanout} from "../pointer.ts";
+import {largeReadJobState,routeLargeRead} from "../large-read-worker.ts";
 import {replayDatabase,exportReplayFixture,createFsStore} from "./replay-fixture.ts";
 import {recordingReplayClickHouse} from "./replay-clickhouse-fixture.ts";
 const cleanup:Array<()=>Promise<unknown>>=[];
@@ -45,17 +46,18 @@ test("flag off: no deps.large, no routing call, search runs as before",async()=>
  expect((await f.x.db.query<{n:number}>("SELECT count(*)::int n FROM sessions.session_large_read_jobs")).rows[0]!.n).toBe(0);
 },60000);
 
-test("flag on + delegated: search skipped",async()=>{
- const f=await fixture();let routes=0;
- f.deps.large={route:async()=>{routes++;return true}};
+test("flag on + delegated: search skipped, job state read once and logged",async()=>{
+ const f=await fixture();let routes=0,states=0;
+ f.deps.large={route:async s=>{routes++;return {delegated:true,identity:{...s,sessionId:"canonical"}}},jobState:async s=>{states++;expect(s.sessionId).toBe("canonical");return {state:"queued",attempts:0}}};
  const r=await f.run();
- expect(r.failures).toEqual([]);expect(r.searched).toBe(false);expect(routes).toBe(1);
+ expect(r.failures).toEqual([]);expect(r.searched).toBe(false);expect({routes,states}).toEqual({routes:1,states:1});
+ expect(r.lines).toEqual([expect.objectContaining({level:"info",message:"large scope delegated",state:"queued",attempt:0})]);
 },60000);
 
-test("flag on + not delegated: search runs",async()=>{
- const f=await fixture();
- f.deps.large={route:async()=>false};
- expect(await f.run()).toMatchObject({failures:[],searched:true,lines:[]});
+test("flag on + not delegated: search runs and no job state is read",async()=>{
+ const f=await fixture();let states=0;
+ f.deps.large={route:async()=>({delegated:false}),jobState:async()=>{states++;return null}};
+ expect(await f.run()).toMatchObject({failures:[],searched:true,lines:[]});expect(states).toBe(0);
 },60000);
 
 test.each([
@@ -63,7 +65,7 @@ test.each([
  ["54000 metadata capacity",pgError("54000","replay capture: metadata capacity exceeded")],
 ])("flag on + capacity refusal (%s): logged, not failed, search runs",async(_name,error)=>{
  const f=await fixture();
- f.deps.large={route:async()=>{throw error}};
+ f.deps.large={route:async()=>{throw error},jobState:async()=>{throw new Error("must not be read")}};
  const r=await f.run();
  expect(r.failures).toEqual([]);expect(r.searched).toBe(true);
  expect(r.lines).toEqual([expect.objectContaining({level:"warn",message:"large scope handoff refused",reason:"replay_capacity_refused",error_code:"54000"})]);
@@ -81,3 +83,24 @@ test.each([
  expect(r.lines).toEqual([expect.objectContaining({level:"error",message:"large scope handoff failed"})]);
 },60000);
 
+test("flag on + job state read failure: still delegated, warned, batch succeeds",async()=>{
+ const f=await fixture();
+ f.deps.large={route:async()=>({delegated:true}),jobState:async()=>{throw pgError("42501","permission denied")}};
+ const r=await f.run();
+ expect(r).toMatchObject({failures:[],searched:false});
+ expect(r.lines).toEqual([expect.objectContaining({level:"warn",message:"large scope job state unavailable",error_code:"42501"})]);
+},60000);
+
+test("real route + real job state: a failed job is a logged gap, not silent",async()=>{
+ const f=await fixture();
+ f.deps.large={route:s=>routeLargeRead(f.x.db,s),jobState:s=>largeReadJobState(f.x.db,s)};
+ const first=await f.run();
+ expect(first).toMatchObject({failures:[],searched:false});
+ expect(first.lines).toEqual([expect.objectContaining({level:"info",message:"large scope delegated",state:"queued",attempt:0})]);
+ await f.x.pg.exec("UPDATE sessions.session_large_read_jobs SET state='failed',attempts=5,last_error='large_processing_failed'");
+ const again=await f.run();
+ // Same source: enqueue leaves the failed job as is, so the scope stays delegated and unindexed.
+ expect(again).toMatchObject({failures:[],searched:false});
+ expect(again.lines).toEqual([expect.objectContaining({level:"warn",message:"large scope job will not be processed",state:"failed",attempt:5,reason:"large_job_failed"})]);
+ for(const l of again.lines)expect(Object.keys(l).every(k=>!/text|content|payload/.test(k))).toBe(true);
+},60000);

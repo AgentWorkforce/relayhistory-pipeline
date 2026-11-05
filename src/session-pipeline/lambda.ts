@@ -1,4 +1,4 @@
-import { routeLargeRead } from "./large-read-worker.ts";
+import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
 /**
  * AWS Lambda entry for the sessions-prod session pipeline
  * (stacks/aws/session-pipeline.ts, runbooks/sessions-prod-session-pipeline.md).
@@ -236,7 +236,7 @@ async function init(): Promise<Runtime> {
     // Wiring code does not grant that permission or enable this default-off flag.
     deps.replay = { db, store, provider: "s3", bucket: env.bucket, prefix: bindings };
   }
-  if(env.largeScopeHandoffEnabled&&(env.searchEnabled||env.replayPagesEnabled))deps.large={route:scope=>routeLargeRead(db,scope)};
+  if(env.largeScopeHandoffEnabled&&(env.searchEnabled||env.replayPagesEnabled))deps.large={route:scope=>routeLargeRead(db,scope),jobState:scope=>largeReadJobState(db,scope)};
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
   const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
   const brief = briefTick({
