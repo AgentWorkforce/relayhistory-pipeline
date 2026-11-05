@@ -16,14 +16,16 @@
  * Env (wrangler.jsonc vars, set by the deploy workflow): READ_API_ORIGIN (this
  * Worker's own origin, the only audience accepted; unset = every /v1 request
  * 401), READ_API_COMPLETE_SINCE (ISO timestamp or "epoch"; missing = 503),
- * CLICKHOUSE_DATABASE, and RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
+ * CLICKHOUSE_DATABASE, READ_API_DIRECTORY_WORKSPACES (the directory list/activity
+ * canary allowlist; unset = none), and RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve).
  */
 import pg from "pg";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { logLine, type Level } from "../../../src/shared/log.ts";
 import { createClickHouseClient, type ClickHouseClient, type RequestOptions } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
-import { createReadApi } from "../../../src/session-read-api/app.ts";
+import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-read-api/app.ts";
+import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
 import { relayAuthVerifier } from "../../../src/session-read-api/auth.ts";
 import { sqlLiveness, TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
@@ -36,6 +38,8 @@ export interface Env extends CanonicalEnv {
   CLICKHOUSE_DATABASE?: string;
   READ_API_ORIGIN?: string;
   READ_API_COMPLETE_SINCE?: string;
+  /** Directory list/activity canary allowlist: unset = none, "*" = all, else comma-separated workspace ids. */
+  READ_API_DIRECTORY_WORKSPACES?: string;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
 }
@@ -184,6 +188,8 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     verify: relayAuthVerifier({ origin: env.READ_API_ORIGIN?.trim() || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL?.trim() || undefined, issuer: env.RELAYAUTH_ISSUER?.trim() || undefined }),
     ch,
     liveness: sqlLiveness(tenant.run),
+    directory: sqlDirectory(tenant.run),
+    directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     completeSinceMs,
     log: (fields) => log("info", "session read", fields),
   });

@@ -19,7 +19,8 @@ import { log } from "../shared/log.ts";
 import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts";
 import { SUPABASE_PROD_CA_2021 } from "../session-pipeline/supabase-ca.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
-import { createReadApi } from "./app.ts";
+import { createReadApi, parseDirectoryWorkspaces } from "./app.ts";
+import { sqlDirectory } from "./directory.ts";
 import { relayAuthVerifier, type AuthConfig } from "./auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
@@ -93,6 +94,8 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env): Promise<App> {
     verify: relayAuthVerifier(readApiAuthConfig(env)),
     ch: createClickHouseClient(secret.clickhouse),
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
+    directory: sqlDirectory(poolTenantRunner(pool as never)),
+    directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     completeSinceMs,
     log: (fields) => log.info("session read", fields),
   });

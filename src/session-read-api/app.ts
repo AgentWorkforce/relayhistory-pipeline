@@ -21,6 +21,18 @@
  *     `continuation` (CONTINUATION below): the rows from the floor up, and
  *     where the existing backend must continue strictly below it.
  *
+ * Directory routes (P3b, docs in src/session-read-api/directory.ts):
+ *   GET /v1/sessions                session list without `q`, from the Supabase directory
+ *   GET /v1/sessions/activity       sessions per UTC day without `q` (span semantics)
+ * Both answer 501 `directory_workspace_not_enabled` unless the token's workspace is on
+ * READ_API_DIRECTORY_WORKSPACES (the canary allowlist; unset = none), and 501
+ * `directory_not_migrated` until migration 20261105029000 is applied. Never Neon.
+ *   GET /v1/sessions/:id/timing, /v1/sessions/output, /v1/digest/daily and the turns
+ *   and metadata reads are registered and answer 501 with a reason naming the store
+ *   they still need: their relayhistory semantics read tables that neither ClickHouse
+ *   nor the directory holds yet (session_timing cache, commit links and outcomes,
+ *   conversation_turns, digest cache), and this backend never answers approximately.
+ *
  * Auth: a RelayAuth assertion JWT minted for THIS service's origin with scope
  * `rth:read` (verifyAgentRelayToken: RS256, JWKS, issuer, exact audience).
  * Org and workspace come only from the verified claims.
@@ -30,6 +42,15 @@ import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vend
 import { CursorError, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
+import {
+  DIRECTORY_LIST_MAX_LIMIT,
+  DirectoryError,
+  activityDays,
+  decodeListCursor,
+  directoryPage,
+  type Directory,
+  type DirectoryListArgs,
+} from "./directory.ts";
 
 export interface VerifiedIdentity {
   userId: string;
@@ -55,7 +76,30 @@ export interface ReadApiDeps {
   completeSinceMs: number;
   log?: (fields: Record<string, unknown>) => void;
   timeoutMs?: number;
+  /** The Supabase directory (list, activity); absent = those routes answer 501. */
+  directory?: Directory;
+  /** READ_API_DIRECTORY_WORKSPACES: workspaces the directory routes serve; "*" = all. Absent/empty = none. */
+  directoryWorkspaces?: ReadonlySet<string> | "*";
 }
+
+/** READ_API_DIRECTORY_WORKSPACES: unset or blank = none; "*" = every workspace; else comma-separated ids. */
+export function parseDirectoryWorkspaces(raw: string | undefined): ReadonlySet<string> | "*" {
+  const value = raw?.trim() ?? "";
+  if (value === "*") return "*";
+  return new Set(value.split(",").map((v) => v.trim()).filter(Boolean));
+}
+
+/** relayhistory routes/recall.ts limits for the session list and activity. */
+export const SESSIONS_DEFAULT_LIMIT = 50;
+export const SESSIONS_MAX_LIMIT = 500;
+export const MAX_SESSION_ACTIVITY_DAYS = 92;
+const MAX_LIST_SOURCES = 16;
+const MAX_LIST_USERS = 20;
+const MAX_LIST_ID_LENGTH = 255;
+const MAX_AGENT_LENGTH = 200;
+const HARNESS_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
+/** Session-list parameters the directory cannot answer: event or text questions. */
+const LIST_UNSUPPORTED_PARAMS = ["q", "search", "project", "noProject", "kind", "taskRef", "noTaskRef", "tag", "since", "until"];
 
 /** relayhistory lib/recall.ts limits. */
 export const EVENTS_DEFAULT_LIMIT = 200;
@@ -311,6 +355,128 @@ export function createReadApi(deps: ReadApiDeps) {
       return fail(c, error);
     }
   });
+
+  /** The canary allowlist, then the directory itself. */
+  function directoryFor(identity: VerifiedIdentity): Directory {
+    const allowed = deps.directoryWorkspaces;
+    if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported("directory_workspace_not_enabled");
+    if (!deps.directory) throw unsupported("directory_not_configured");
+    return deps.directory;
+  }
+
+  const directoryFail = (c: Context, error: unknown) => {
+    if (error instanceof DirectoryError) {
+      if (error.reason === "agent_filter_not_ready") return fail(c, unsupported("agent_filter_not_ready"));
+      if (error.reason === "tenant_mismatch") return fail(c, new TenantMismatchError());
+      // A row outside the cloud-client contract (e.g. a title over 90 characters): a first
+      // page falls back whole, as relayhistory's directory backend does; a cursor page
+      // cannot restart elsewhere, so it is a 503.
+      if (error.reason === "parse" && !single(c, "cursor")) return fail(c, unsupported("directory_row_out_of_contract"));
+      const correlationId = c.get("correlationId") as string;
+      log({ route: c.req.routePath, reason: `directory_${error.reason}`, status: 503, correlation_id: correlationId });
+      return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId }, 503);
+    }
+    return fail(c, error);
+  };
+
+  /** Repeated values, deduplicated and empty values dropped (relayhistory readSessionListFilters). */
+  const repeated = (c: Context, name: string) => [...new Set((c.req.queries(name) ?? []).filter(Boolean))];
+
+  app.get("/v1/sessions", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      // A workspace off the canary allowlist always falls back, whatever it asked.
+      const directory = directoryFor(identity);
+      for (const p of LIST_UNSUPPORTED_PARAMS) if (c.req.queries(p)?.length) throw unsupported(`param_${p}`);
+      const limit = clampLimit(single(c, "limit"), SESSIONS_DEFAULT_LIMIT, SESSIONS_MAX_LIMIT);
+      const args: DirectoryListArgs = { limit };
+      const sources = repeated(c, "source");
+      const notSources = repeated(c, "notSource");
+      for (const [name, values] of [["source", sources], ["notSource", notSources]] as const) {
+        if (values.length > MAX_LIST_SOURCES) throw bad(`${name} accepts at most ${MAX_LIST_SOURCES} values`);
+        if (values.some((v) => v.length > MAX_LIST_ID_LENGTH)) throw bad(`${name} must be ${MAX_LIST_ID_LENGTH} characters or fewer`);
+      }
+      const users = repeated(c, "user");
+      if (users.length > MAX_LIST_USERS) throw bad(`user accepts at most ${MAX_LIST_USERS} values`);
+      if (users.some((u) => u.length > MAX_LIST_ID_LENGTH)) throw bad(`user must be ${MAX_LIST_ID_LENGTH} characters or fewer`);
+      const agent = single(c, "agent")?.trim();
+      if (agent && agent.length > MAX_AGENT_LENGTH) throw bad(`agent must be ${MAX_AGENT_LENGTH} characters or fewer`);
+      const projectContains = single(c, "projectContains") || undefined;
+      if (projectContains && projectContains.trim().length > 200) throw bad("projectContains must be 200 characters or fewer");
+      const bounds: Record<"lastTsAfter" | "lastTsBefore" | "firstTsAfter" | "firstTsBefore", Date | undefined> = {
+        lastTsAfter: undefined, lastTsBefore: undefined, firstTsAfter: undefined, firstTsBefore: undefined,
+      };
+      for (const field of Object.keys(bounds) as Array<keyof typeof bounds>) {
+        const t = parseTime(single(c, field), field);
+        if (t !== undefined) bounds[field] = new Date(t);
+      }
+      if ((bounds.lastTsAfter && bounds.lastTsBefore && bounds.lastTsAfter > bounds.lastTsBefore) ||
+          (bounds.firstTsAfter && bounds.firstTsBefore && bounds.firstTsAfter > bounds.firstTsBefore))
+        throw bad("an *After bound must not be later than its *Before bound");
+      // What the directory cannot answer exactly stays with the current backend.
+      if (limit > DIRECTORY_LIST_MAX_LIMIT) throw unsupported("limit");
+      if ([...sources, ...notSources].some((v) => !HARNESS_NAME.test(v))) throw unsupported("source_format");
+      if (projectContains !== undefined && projectContains.trim() === "") throw unsupported("project_contains");
+      const cursor = decodeListCursor(single(c, "cursor"));
+      if (cursor === "foreign") throw new CursorError("foreign_cursor");
+      if (cursor === "invalid") throw new CursorError("invalid_cursor");
+      if (sources.length) args.sources = sources;
+      if (notSources.length) args.notSources = notSources;
+      if (users.length) args.userIds = users;
+      if (agent) args.agent = agent;
+      if (projectContains) args.projectContains = projectContains;
+      for (const [k, v] of Object.entries(bounds)) if (v) args[k as keyof typeof bounds] = v;
+      if (cursor) args.cursor = cursor;
+      const rows = await directory.list(identity.orgId, identity.workspaceId, args);
+      if (rows === null) throw unsupported("directory_not_migrated");
+      const page = directoryPage(rows, identity, limit);
+      return c.json({ sessions: page.sessions, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+    } catch (error) {
+      return directoryFail(c, error);
+    }
+  });
+
+  app.get("/v1/sessions/activity", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      const directory = directoryFor(identity);
+      const rawSince = single(c, "since");
+      const rawUntil = single(c, "until");
+      if (!rawSince || !rawUntil) throw bad("since and until are required");
+      const sinceMs = parseTime(rawSince, "since")!;
+      const untilMs = parseTime(rawUntil, "until")!;
+      if (untilMs < sinceMs) throw bad("until must not be earlier than since");
+      const since = new Date(sinceMs);
+      const until = new Date(untilMs);
+      const days = Math.round((Date.UTC(until.getUTCFullYear(), until.getUTCMonth(), until.getUTCDate()) - Date.UTC(since.getUTCFullYear(), since.getUTCMonth(), since.getUTCDate())) / 86_400_000) + 1;
+      if (days > MAX_SESSION_ACTIVITY_DAYS) throw bad(`since and until may span at most ${MAX_SESSION_ACTIVITY_DAYS} UTC days`);
+      const q = single(c, "q");
+      if (q && q.length > MAX_Q_CHARS) throw bad(`q must be ${MAX_Q_CHARS} characters or fewer`);
+      if (q) throw unsupported("param_q");
+      const rows = await directory.activity(identity.orgId, identity.workspaceId, since, until);
+      if (rows === null) throw unsupported("directory_not_migrated");
+      return c.json({ since: since.toISOString(), until: until.toISOString(), days: activityDays(rows, since, until), correlationId: c.get("correlationId") });
+    } catch (error) {
+      return directoryFail(c, error);
+    }
+  });
+
+  // Registered so their 501 names what they still need; see the header comment.
+  const notMigrated = (reason: string) => async (c: Context) => {
+    try {
+      attestWorkspace(c, c.get("identity") as VerifiedIdentity);
+      throw unsupported(reason);
+    } catch (error) {
+      return fail(c, error);
+    }
+  };
+  app.get("/v1/sessions/output", notMigrated("output_not_migrated"));
+  app.get("/v1/sessions/:sessionId/timing", notMigrated("timing_not_migrated"));
+  app.get("/v1/sessions/:sessionId/turns", notMigrated("turns_not_migrated"));
+  app.get("/v1/sessions/:sessionId/metadata", notMigrated("turns_not_migrated"));
+  app.get("/v1/digest/daily", notMigrated("digest_not_migrated"));
 
   app.notFound((c) => c.json({ error: { code: "unsupported_by_backend", message: "route not served by this backend", reason: "route" }, correlationId: c.get("correlationId") }, 501));
 
