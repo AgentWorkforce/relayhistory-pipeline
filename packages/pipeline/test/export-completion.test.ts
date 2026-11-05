@@ -46,6 +46,7 @@ beforeAll(async () => {
       "utf8",
     ),
   );
+  await pg.exec(readFileSync(supabase("bootstrap/session_history_model_worker.sql"),"utf8"));
   for (const file of readdirSync(supabase("migrations/")).sort())
     await pg.exec(readFileSync(supabase(`migrations/${file}`), "utf8"));
 });
