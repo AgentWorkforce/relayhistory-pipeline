@@ -6,7 +6,10 @@
  *
  * A fresh host: it creates its own role and instance profile
  * (layered-agent-sessions-pipeline-<stage>), which may read only the kit's two
- * shared parameters, and its own session and telemetry log groups. Its
+ * shared parameters, and its own session and telemetry log groups. The role
+ * carries the permissions boundary layered-agent-host-boundary-sessions-pipeline-<stage>,
+ * which layered-agents' human-deployed platform owns: this deploy can never give
+ * the host more than that, whatever agent.config.ts says. Its
  * network ids come from SSM under /relaycast-agent-host/<stage>/network/, the
  * existing agent-hosts VPC that relaycast-cloud's agent-host stack publishes.
  *

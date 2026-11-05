@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
-import { EC2_USER_DATA_ENCODED_LIMIT, decide, fileReader, hostRolePolicy, hostTemplate, networkParams, userDataBase64 } from "@agentworkforce/layered-agent";
+import { EC2_USER_DATA_ENCODED_LIMIT, decide, fileReader, hostBoundaryPolicy, hostRolePolicy, hostRoleProps, hostTemplate, networkParams, userDataBase64 } from "@agentworkforce/layered-agent";
 import agent from "../agent.config.ts";
 
 const AGENT_DIR = fileURLToPath(new URL("..", import.meta.url));
@@ -64,6 +64,14 @@ test("secrets: the host reads exactly the kit's two shared parameters and writes
     ],
   }]);
   assert.match(agent.envFile, /^EXPORT_SECRETS=$/m);
+});
+
+test("the host role carries the platform's permissions boundary (the deploy role may write it only under that boundary)", () => {
+  const props = hostRoleProps(agent, "500268966557");
+  assert.equal(props.permissionsBoundary, "arn:aws:iam::500268966557:policy/layered-agent-host-boundary-sessions-pipeline-dev");
+  for (const s of hostBoundaryPolicy(agent, "500268966557").Statement) {
+    for (const a of s.Action) assert.doesNotMatch(a, /^(iam|sts):|\*/, `${s.Sid}: ${a}`);
+  }
 });
 
 test(`user data: under ${USER_DATA_BUDGET} bytes encoded (EC2 caps it at ${EC2_USER_DATA_ENCODED_LIMIT}), every kit and lane file, no secret values`, () => {
