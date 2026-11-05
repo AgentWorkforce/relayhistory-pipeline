@@ -15,7 +15,7 @@ export interface ManifestIndexLine {
 /** The descriptor lookup — real authority/hash comes from the manifest. */
 export interface CanonicalDescriptor {
   imageKey: string; sourceHash: string; schemaGeneration: string;
-  epoch: string; fingerprint: string;
+  authorityId: string; epoch: string; fingerprint: string;
   pointerSetHash: string; pointerSetCount: number;
 }
 export type CanonicalDescriptorPort =
@@ -58,6 +58,7 @@ export async function* manifestIndexImages(
         schemaGeneration: d.schemaGeneration,
         epoch: d.epoch,
         fingerprint: d.fingerprint,
+        authorityId: d.authorityId,
         pointerSetHash: d.pointerSetHash,
         pointerSetCount: d.pointerSetCount,
       };

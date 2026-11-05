@@ -6,8 +6,7 @@
  * first entry so historical fills never collide with the legacy series.
  * Bounded: per-image enumeration, no bulk payload reads.
  */
-import type { SqlQuery } from "./canonical-journal.ts";
-import { CanonicalFeatureChanged } from "./canonical-feature-changed.ts";
+
 
 
 /** One image descriptor from the org→keys manifest index. */
@@ -15,6 +14,7 @@ export interface CanonicalBackfillImage {
   orgId: string; workspaceId: string; harness: string; sessionId: string;
   imageKey: string; sourceHash: string;
   schemaGeneration: string; epoch: string; fingerprint: string;
+  authorityId: string;
   pointerSetHash: string; pointerSetCount: number;
 }
 
@@ -32,25 +32,35 @@ export type CanonicalBackfillResult =
  * seed() refuses to move backwards, so a re-run of the same index idempotently
  * lands only new images.
  */
+/** Owner-only idempotent publish port for backfill — NOT the final-CAS
+ *  invoker (which is reserved for the 620 install path). Idempotent on
+ *  (scope, authorityId): a repeated call returns the existing revision. */
+export interface CanonicalPublishOnce {
+  publishOnce(input: {
+    scope: { orgId: string; workspaceId: string; harness: string;
+             sessionId: string; generation: string };
+    source: { authorityId: string; epoch: string; fingerprint: string };
+    pointerSet: { authorityId: string; hash: string; count: number };
+  }): Promise<string>;
+}
 export async function backfillFromIndex(
-  db: SqlQuery,
+  publish: CanonicalPublishOnce,
   images: CanonicalBackfillIndex,
   _seedAboveLegacy: string,
 ): Promise<CanonicalBackfillResult> {
-  // The invoker is the sole journal writer — one publish call per image.
-  const fn = new CanonicalFeatureChanged(db);
   let entries = 0, lastRevision = "", orgId = "";
   for await (const img of images) {
     orgId = img.orgId;
-    lastRevision = await fn.canonicalFeatureChanged({
+    lastRevision = await publish.publishOnce({
       scope: {
         orgId: img.orgId, workspaceId: img.workspaceId,
         harness: img.harness, sessionId: img.sessionId,
+        generation: img.schemaGeneration,
       },
       source: { epoch: img.epoch, fingerprint: img.fingerprint,
-                authorityId: img.imageKey },
-      priorSource: null,
-      pointerSet: { hash: img.pointerSetHash, count: img.pointerSetCount },
+                authorityId: img.authorityId },
+      pointerSet: { authorityId: img.authorityId,
+                    hash: img.pointerSetHash, count: img.pointerSetCount },
     });
     entries += 1;
   }
