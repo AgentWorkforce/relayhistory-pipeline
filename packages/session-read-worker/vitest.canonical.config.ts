@@ -27,6 +27,7 @@ export default defineConfig({
       "test/canonical.test.ts",
       "test/canonical-pages.test.ts",
       "test/analysis-cache.test.ts",
+      "test/analysis-rpc-args.test.ts",
     ],
     testTimeout: 30000,
   },
