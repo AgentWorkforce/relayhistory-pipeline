@@ -43,7 +43,9 @@ const supa = async () => {
   const login = parseCliLogin(execFileSync(CLI, ["db", "dump", "--linked", "--project-ref", REF, "--dry-run"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }));
   const c = new pg.Client({ host: HOST, port: 5432, database: "postgres", user: `cli_login_postgres.${REF}`, password: login.password,
     ssl: { ca: SUPABASE_PROD_CA_2021, rejectUnauthorized: true, servername: HOST }, options: "-c statement_timeout=60000 -c lock_timeout=5000", application_name: "p1-frozen-copy" });
-  login.password = ""; await c.connect(); await c.query("SET SESSION ROLE postgres"); return c;
+  login.password = "";
+  try { await c.connect(); await c.query("SET SESSION ROLE postgres"); return c; }
+  catch (error) { await c.end().catch(() => {}); throw error; }
 };
 
 // One row's canonical text: identical on both sides (built in JS from fetched values).
@@ -99,14 +101,17 @@ async function scan(c: pg.Client, sql: string, org: string, onPage: (rows: Recor
   }
 }
 
-async function copyOrg(org: string) {
-  const n = neon(); await n.connect(); const s = await supa();
+async function copyOrg(org: string, s: pg.Client, check: () => void) {
+  check();
+  const n = neon();
   try {
+    await n.connect();
     await n.query("BEGIN READ ONLY");
     const sealed = (await s.query("SELECT 1 FROM sessions.ingest_frozen_source_org_seals WHERE org_id=$1", [org])).rows.length;
     if (sealed) { log("org already sealed; skip", { org }); return; }
     let copied = 0;
     await scan(n, NEON_PAGE, org, async (rows) => {
+      check();
       const col = (k: string) => rows.map((r) => r[k] === null || r[k] === undefined ? null : String(r[k]));
       await s.query(`INSERT INTO sessions.ingest_frozen_source_records(${COLS.join(",")})
         SELECT * FROM unnest($1::text[],$2::text[],$3::text[],$4::text[],$5::text[],$6::bigint[],$7::text[],$8::text[],$9::text[],$10::text[],$11::text[],$12::text[],$13::bigint[],$14::bigint[])
@@ -115,6 +120,7 @@ async function copyOrg(org: string) {
     });
     let receipts = 0;
     await scanReceipts(n, NEON_RECEIPTS, org, async (rows) => {
+      check();
       const col = (k: string) => rows.map((r) => String(r[k]));
       await s.query(`INSERT INTO sessions.ingest_frozen_source_receipts(org_id,workspace_id,origin_id,batch_id,digest,receipt)
         SELECT a,b,c,d,e,f::jsonb FROM unnest($1::text[],$2::text[],$3::text[],$4::text[],$5::text[],$6::text[]) AS u(a,b,c,d,e,f) ON CONFLICT DO NOTHING`,
@@ -123,14 +129,15 @@ async function copyOrg(org: string) {
     });
     await n.query("ROLLBACK");
     log("org copied", { org, rows: copied, receipts });
-  } finally { await n.end().catch(() => {}); await s.end().catch(() => {}); }
+  } finally { await n.end().catch(() => {}); }
 }
 
 async function repairHead() {
   const key = { org: val("--org", ""), workspace: val("--workspace", ""), user: val("--user", "") };
   if (!key.org || !key.user || !args.includes("--workspace") || [key.org, key.workspace, key.user].some((v) => v.startsWith("--"))) { console.error("--repair-head needs --org, --workspace (may be empty string) and --user"); process.exit(64); }
-  const n = neon(); await n.connect();
+  const n = neon();
   try {
+    await n.connect();
     const s = await supa();
     try {
       const r = await repairControlHead(n, s, key, { dryRun: !flag("--execute") });
@@ -141,8 +148,9 @@ async function repairHead() {
 
 async function main() {
   if (mode === "repair-head") return repairHead();
-  const n = neon(); await n.connect();
+  const n = neon();
   try {
+    await n.connect();
     await n.query("BEGIN READ ONLY");
     const status = await frozenPhase(n);
     const all = ONLY ? [ONLY] : await orgs(n);
@@ -169,11 +177,21 @@ async function main() {
             [h.org_id, h.workspace_id, h.user_id, h.epoch, h.version, h.digest, h.kind, JSON.stringify(h.payload), h.pending, h.before_privacy === null ? null : JSON.stringify(h.before_privacy), h.privacy_version]);
         }
         log("privacy copied", { deletions: del.length, resets: rs.length, controlHeads: heads.length });
+        // CLI temporary-login refreshes invalidate prior passwords. Keep one
+        // authenticated owner connection for the entire job; pg.Client queues
+        // target statements while at most CONC source readers run concurrently.
+        const queue = [...all]; let done = 0, failure: unknown;
+        const check = () => { if (failure !== undefined) throw failure; };
+        await Promise.all(Array.from({ length: Math.max(1, CONC) }, async () => {
+          try {
+            for (let org = queue.shift(); org; org = queue.shift()) {
+              check(); await copyOrg(org, s, check);
+              done++; log("progress", { done, of: all.length });
+            }
+          } catch (error) { if (failure === undefined) failure = error ?? new Error("copy_worker_failed"); }
+        }));
+        if (failure !== undefined) throw failure;
       } finally { await s.end().catch(() => {}); }
-      const queue = [...all]; let done = 0;
-      await Promise.all(Array.from({ length: Math.max(1, CONC) }, async () => {
-        for (let org = queue.shift(); org; org = queue.shift()) { await copyOrg(org); done++; log("progress", { done, of: all.length }); }
-      }));
       return;
     }
     // --seal: verify every Neon org, then write org seals + the completeness seal in one transaction.
