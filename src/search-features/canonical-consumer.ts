@@ -51,7 +51,8 @@ export function validateConfig(cfg: ConsumerConfig): void {
   if (typeof cfg.ownerId !== "string" || !cfg.ownerId.length ||
       cfg.ownerId.length > 128) throw new Error("config_bad_owner");
   for (const [k, min, max] of [
-    ["leaseTtlMs", 1, 300000], ["maxRetries", 0, 10], ["pageSize", 1, 1000],
+    ["leaseTtlMs", 60000, 300000], ["maxRetries", 0, 10],
+    ["pageSize", 1, 1000],
   ] as const) {
     const v = cfg[k];
     if (!Number.isInteger(v) || v < min || v > max)
@@ -87,13 +88,14 @@ export class CanonicalConsumer {
   async acquireLease(): Promise<boolean> {
     if (!this.on) return false;
     const { rows } = await this.db.query<{ n: number }>(
-      `INSERT INTO ${LEASE}(partition,owner,heartbeat_at)` +
-        ` VALUES($1,$2,now()) ON CONFLICT (partition)` +
-        ` DO UPDATE SET owner=$2,heartbeat_at=now()` +
+      `INSERT INTO ${LEASE}(partition,owner,heartbeat_at,ttl_ms)` +
+        ` VALUES($1,$2,now(),$3) ON CONFLICT (partition)` +
+        ` DO UPDATE SET owner=$2,heartbeat_at=now(),ttl_ms=$3` +
         ` WHERE ${LEASE}.owner=$2` +
-        `    OR ${LEASE}.heartbeat_at < now() - make_interval(secs => $3)` +
+        `    OR ${LEASE}.heartbeat_at <` +
+        `       now() - (${LEASE}.ttl_ms || ' milliseconds')::interval` +
         ` RETURNING 1 AS n`,
-      [this.ensurePartition(), this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
+      [this.ensurePartition(), this.cfg.ownerId, this.cfg.leaseTtlMs]);
     return rows.length > 0;
   }
   /** Atomic renew-and-held: one statement checks THIS owner is still fresh
@@ -104,17 +106,11 @@ export class CanonicalConsumer {
     const { rows } = await this.db.query<{ n: number }>(
       `UPDATE ${LEASE} SET heartbeat_at=now()` +
         ` WHERE partition=$1 AND owner=$2` +
-        ` AND heartbeat_at >= now() - make_interval(secs => $3)` +
+        ` AND heartbeat_at >=` +
+        `  now() - (${LEASE}.ttl_ms || ' milliseconds')::interval` +
         ` RETURNING 1 AS n`,
-      [this.ensurePartition(), this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
+      [this.ensurePartition(), this.cfg.ownerId]);
     return rows.length > 0;
-  }
-  private leaseHeld() {
-    return this.db.query<{ n: number }>(
-      `SELECT 1 AS n FROM ${LEASE} WHERE partition=$1 AND owner=$2` +
-        ` AND heartbeat_at >= now() - make_interval(secs => $3)`,
-      [this.ensurePartition(), this.cfg.ownerId, this.cfg.leaseTtlMs / 1000])
-      .then((r) => r.rows.length > 0);
   }
   /** Durable partition checkpoint — CAS'd only after a real advance. */
   private async readCheckpoint(): Promise<string> {

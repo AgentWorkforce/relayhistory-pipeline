@@ -16,7 +16,12 @@ let failures = 0;
 const check = (n: string, ok: boolean) => {
   console.log(n, ok ? "PASS" : "FAIL"); if (!ok) failures++; };
 
-await db.query("DROP SCHEMA sessions CASCADE; CREATE SCHEMA sessions");
+// Safety gate: this proof drops/creates its schema — only run against an
+// explicitly disposable database, never a shared or real one.
+if (process.env.PROOF_DISPOSABLE !== "1")
+  throw new Error("refused: set PROOF_DISPOSABLE=1 on a disposable database");
+const SCHEMA = "sessions";
+await db.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE; CREATE SCHEMA ${SCHEMA}`);
 for (const r of ["anon", "authenticated", "service_role",
     "bulls96_session_ingest", "bulls96_session_ingest_seeder",
     "bulls96_canonical_feature_producer"])

@@ -80,6 +80,7 @@ jobs:
       - name: Canonical consumer lease proof (real PG, exact head)
         env:
           PGPROOF_SUPERUSER: postgres
+          PROOF_DISPOSABLE: "1"
         run: |
           set -o pipefail
           bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |

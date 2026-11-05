@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { CanonicalPageAckStore } from "../src/search-features/canonical-ack-store.ts";
 import { copyCanonicalEntry } from "../src/search-features/canonical-cycle.ts";
 const port = Number(process.argv[2] ?? 32770);
+if (port !== 32770) throw new Error("owned PG17 fixture port only");
 const SCHEMA = "sessions_proof";           // dedicated, never 'sessions'
 const db = new Pool({ host: "127.0.0.1", port, user: "postgres",
   password: "synthetic-feature-only", database: "postgres" });
@@ -23,8 +24,8 @@ for (const role of ["anon", "authenticated", "service_role",
   await db.query(
     `DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='${role}')` +
     ` THEN CREATE ROLE ${role} NOLOGIN; END IF; END $$;`);
-// Apply the REAL #230 025000 writer migration (vendored snapshot at
-// 5638186f32377c6ef86451d66bd5f50011ff2a2f) + the companion state DDL.
+// Apply the REAL merged #230 025000 writer migration (vendored snapshot at
+// 233c62b730251eb1bcad096b16f75cb8e67df6a1) + the companion state DDL.
 // Self-contained: read the vendored fixture, no shell/out-of-tree paths.
 const writer = readFileSync(
   "scripts/fixtures/230-writer-20261105025000.sql", "utf8")
@@ -33,7 +34,7 @@ const writer = readFileSync(
   .replaceAll("GRANT USAGE ON SCHEMA", `GRANT USAGE ON SCHEMA`);
 await db.query(writer);
 const ddl = readFileSync(
-  "docs/proposals/20261105025000_canonical_feature_journal.sql", "utf8")
+  "supabase/migrations/20261105030000_canonical_feature_consumer_acks.sql", "utf8")
   .replaceAll("sessions.", `${SCHEMA}.`);
 // Apply only the companion state + RPC parts (the writer owns the journal).
 const companion = ddl.match(
@@ -61,9 +62,35 @@ await db.query(`SELECT ${SCHEMA}.canonical_feature_journal_seed(100,$1)`, [A]);
 await db.query(`SELECT ${SCHEMA}.canonical_feature_changed($1,$2,$3,$4,$5)`,
   [JSON.stringify(SCOPE), JSON.stringify(AUTH), null,
    JSON.stringify(PTR), null]);
+// All consumer operations below use the actual restricted producer identity,
+// not the migration owner. Prove its positive and negative privilege boundary
+// before exercising the store.
+const producer = await db.connect();
+await producer.query(`SET ROLE bulls96_canonical_feature_producer`);
+const privileges = await producer.query(`SELECT
+  has_table_privilege(current_user,$1,'SELECT') AS journal_read,
+  has_table_privilege(current_user,$1,'INSERT') AS journal_write,
+  has_table_privilege(current_user,$2,'INSERT,SELECT') AS ack_rw,
+  has_table_privilege(current_user,$2,'UPDATE,DELETE') AS ack_mutate,
+  has_table_privilege(current_user,$3,'INSERT,SELECT') AS state_rw,
+  has_table_privilege(current_user,$3,'UPDATE,DELETE') AS state_mutate,
+  has_function_privilege(current_user,$4,'EXECUTE') AS writer_exec,
+  has_function_privilege(current_user,$5,'EXECUTE') AS finish_exec`, [
+  `${SCHEMA}.canonical_feature_journal`,
+  `${SCHEMA}.canonical_feature_page_ack`,
+  `${SCHEMA}.canonical_feature_copy_state`,
+  `${SCHEMA}.canonical_feature_changed(jsonb,jsonb,jsonb,jsonb,jsonb)`,
+  `${SCHEMA}.finish_canonical_copy(bigint,jsonb,text,text,text,text)`,
+]);
+const pv = privileges.rows[0]!;
+check("producer_acl",
+  pv.journal_read === true && pv.journal_write === false &&
+  pv.ack_rw === true && pv.ack_mutate === false &&
+  pv.state_rw === true && pv.state_mutate === false &&
+  pv.writer_exec === false && pv.finish_exec === true);
 import { CanonicalJournalStore } from "../src/search-features/canonical-journal.ts";
 const journal = new CanonicalJournalStore({ query: (t, p) =>
-  db.query(t.replaceAll("sessions.", `${SCHEMA}.`), p) });
+  producer.query(t.replaceAll("sessions.", `${SCHEMA}.`), p) });
 const { entries } = await journal.entries("100", 10);
 const entry = entries[0]!;
 if (!entry) throw new Error("journal_decoder_empty");
@@ -71,8 +98,17 @@ console.log("decoded", entry.kind, entry.revision, entry.imageKey.slice(0,30));
 // Real store over the composed schema (table names are sessions.* in the
 // store — alias it via search_path).
 const store = new CanonicalPageAckStore({ query: (t, p) =>
-  db.query(`SET search_path TO ${SCHEMA}`).then(() =>
-    db.query(t.replaceAll("sessions.", `${SCHEMA}.`), p)) });
+  producer.query(t.replaceAll("sessions.", `${SCHEMA}.`), p) });
+// A crash after one nonterminal page resumes at the durable next edge. It is
+// not mislabeled as a corrupt dangling chain.
+await store.begin(entry, "partial-profile", "partial-target");
+await store.ackPage({ entry, kind: "event", cursor: "start",
+  nextCursor: "page-2", pageSha256: "1".repeat(64) });
+const partial = await store.resumeCursor(entry, "event");
+check("partial_chain_resumes",
+  partial.state === "resume" && partial.cursor === "page-2");
+await db.query(`DELETE FROM ${SCHEMA}.canonical_feature_page_ack;
+  DELETE FROM ${SCHEMA}.canonical_feature_copy_state`);
 // Fake CH that counts writes + a minimal image source.
 let chWrites = 0;
 const ch = { database: "test_ch", insert: async () => { chWrites++; },
@@ -112,6 +148,14 @@ const dirty1 = await db.query(
   `SELECT dirty FROM ${SCHEMA}.canonical_feature_copy_state`)
   .then((r) => r.rows[0]?.dirty);
 check("dirty_false", dirty1 === false);
+// The ACK trigger takes the same state-row lock as finish and refuses once
+// complete. No late page can appear after the terminal chains were validated.
+let lateAckRefused = false;
+try {
+  await store.ackPage({ entry, kind: "event", cursor: "late",
+    nextCursor: null, pageSha256: "2".repeat(64) });
+} catch { lateAckRefused = true; }
+check("post_finish_ack_refused", lateAckRefused);
 // 2. Crash-after-finish: same entry, no checkpoint advance -> already done,
 //    no CH write, no image descriptor needed.
 chWrites = 0;
@@ -135,6 +179,33 @@ try {
     { checkpoint: "0" }, entry, "target-B");
 } catch (x) { threw = (x as Error).message; }
 check("different_target_refused", threw === "begin_drift");
+await producer.query("RESET ROLE");
+producer.release();
+// The named down removes exactly the restartable consumer-progress boundary;
+// applying the same migration again recreates it with the restricted grant.
+const down = readFileSync(
+  "supabase/rollbacks/20261105030000_canonical_feature_consumer_acks.down.sql",
+  "utf8").replaceAll("sessions.", `${SCHEMA}.`);
+await db.query(down);
+const removed = await db.query(`SELECT
+  to_regclass($1) IS NULL AS state_gone,
+  to_regprocedure($2) IS NULL AS finish_gone`, [
+  `${SCHEMA}.canonical_feature_copy_state`,
+  `${SCHEMA}.finish_canonical_copy(bigint,jsonb,text,text,text,text)`,
+]);
+await db.query(companion);
+const reapplied = await db.query(`SELECT
+  to_regclass($1) IS NOT NULL AS state_back,
+  has_function_privilege($2,$3,'EXECUTE') AS finish_granted`, [
+  `${SCHEMA}.canonical_feature_copy_state`,
+  "bulls96_canonical_feature_producer",
+  `${SCHEMA}.finish_canonical_copy(bigint,jsonb,text,text,text,text)`,
+]);
+check("down_reapply",
+  removed.rows[0]?.state_gone === true &&
+  removed.rows[0]?.finish_gone === true &&
+  reapplied.rows[0]?.state_back === true &&
+  reapplied.rows[0]?.finish_granted === true);
 await db.end();
 if (failures) { console.log(`${failures} FAILURES`); process.exit(1); }
 console.log("ALL PASS");

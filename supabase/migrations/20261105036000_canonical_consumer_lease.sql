@@ -7,7 +7,10 @@ CREATE TABLE sessions.canonical_feature_consumer_lease(
   partition text PRIMARY KEY
     CHECK (partition ~ '^[a-z0-9-]{4,64}$'),
   owner text NOT NULL CHECK (length(owner) BETWEEN 1 AND 128),
-  heartbeat_at timestamptz NOT NULL);
+  heartbeat_at timestamptz NOT NULL,
+  -- the lease's own TTL floor: a consumer cannot declare a shorter one
+  -- and seize a fresh lease; server enforces >=60s.
+  ttl_ms integer NOT NULL CHECK (ttl_ms >= 60000 AND ttl_ms <= 300000));
 CREATE TABLE sessions.canonical_feature_consumer_checkpoint(
   partition text PRIMARY KEY
     CHECK (partition ~ '^[a-z0-9-]{4,64}$'),

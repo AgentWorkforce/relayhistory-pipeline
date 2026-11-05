@@ -5,7 +5,7 @@ const A = "a".repeat(64);
 const CANARY = { orgId: "c4fae7b9-43a9-44e8-94d5-455aa579d67b",
   workspaceId: "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63" };
 const OTHER = { orgId: "other-org", workspaceId: "other-ws" };
-const CFG = { enabled: true, targetId: "t", ownerId: "me", leaseTtlMs: 30000,
+const CFG = { enabled: true, targetId: "t", ownerId: "me", leaseTtlMs: 60000,
   maxRetries: 2, pageSize: 100 };
 const fakeDb = () => {
   const lease: Record<string, unknown>[] = [];
@@ -16,7 +16,7 @@ const fakeDb = () => {
       const owned = lease.find((l) => l.partition === params[0]);
       if (!owned || owned.owner === params[1]) {
         if (!owned) lease.push({ partition: params[0], owner: params[1],
-          heartbeat_at: new Date() });
+          heartbeat_at: new Date(), ttl_ms: params[2] });
         return { rows: [{ n: 1 } as T] };
       }
       return { rows: [] as T[] };

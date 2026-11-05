@@ -60,9 +60,13 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
   producer cannot append journal rows. The concrete TypeScript journal writer
   remains retired; seed/allocation/CAS evidence comes from #230's SQL tests.
 - Durable page ACK/copy-state tables and `finish_canonical_copy` live in the
-  registry-assigned `20261105030000_canonical_feature_consumer_acks.sql`.
-  The migration is dormant metadata/schema: applying it does not start a
-  consumer or authorize traffic activation.
+  registry-assigned `20261105030000_canonical_feature_consumer_acks.sql`;
+  the leased consumer's own lease/checkpoint/dead-letter tables live in the
+  registry v3.1 `20261105036000_canonical_consumer_lease.sql` (provenance
+  proposal-only 031000->033000->036000). Both are dormant metadata/schema:
+  applying them does not start a consumer or authorize traffic activation.
+  The runtime itself is default-off (`enabled` gate) and scope-fenced to the
+  canary org/workspace only.
 - Brief-document publication in `20261105024000` is independently default-off.
   Applying the migration creates no scope/outbox rows. After the window is
   applied and before its bounded backfill, the database owner enables it with

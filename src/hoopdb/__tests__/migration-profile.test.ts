@@ -1511,6 +1511,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const J = "upstream:20261105025000_canonical_feature_journal.sql";
     const L = "upstream:20261105026000_canonical_history_lineage.sql";
     const C = "upstream:20261105030000_canonical_feature_consumer_acks.sql";
+    const D = "upstream:20261105036000_canonical_consumer_lease.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = (name: string) =>
@@ -1524,6 +1525,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, C]));
     // Later lanes roll back first and remove their own ledger rows; only then
     // can the next down preserve a gap-free applied prefix.
+    await rollback("20261105036000_canonical_consumer_lease.down.sql");
+    expect(await names()).not.toContain(D);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_consumer_lease')::text r")).rows[0]?.r).toBeNull();
     await rollback("20261105030000_canonical_feature_consumer_acks.down.sql");
     expect(await names()).not.toContain(C);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBeNull();
