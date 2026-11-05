@@ -19,6 +19,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import pg from "pg";
+import { SUPA_PAGE, SUPA_RECEIPTS, SUPA_CONTROL_HEADS } from "../src/migration/frozen-source-copy-queries.ts";
 import { parseCliLogin } from "./schema-release-owner-operator-plan.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
 import { repairControlHead } from "../src/hoopdb/frozen-control-head-repair.ts";
@@ -28,6 +29,11 @@ const args = process.argv.slice(2), flag = (k: string) => args.includes(k), val 
 const mode = flag("--plan") ? "plan" : flag("--copy") ? "copy" : flag("--seal") ? "seal" : flag("--repair-head") ? "repair-head" : "";
 if (!mode) { console.error("one of --plan | --copy | --seal | --repair-head"); process.exit(64); }
 const PAGE = Number(val("--page", "5000")), CONC = Number(val("--concurrency", "2")), MAX_PAGE_MS = Number(val("--max-page-ms", "4000")), ONLY = val("--org", "");
+// A subset must never become the global completeness seal.
+if (flag("--seal") && flag("--org")) {
+  console.error("--seal requires the complete source; --org is not allowed");
+  process.exit(64);
+}
 const { neonOwnerUrl } = JSON.parse(readFileSync(0, "utf8").split("\n")[0] || "{}");
 if (!/^postgresql:\/\/neondb_owner:.+ep-floral-pond-apkvat38/.test(neonOwnerUrl ?? "")) { console.error("neonOwnerUrl (production owner) required on stdin"); process.exit(64); }
 const log = (m: string, f: Record<string, unknown> = {}) => console.log(JSON.stringify({ at: new Date().toISOString(), m, ...f }));
@@ -53,14 +59,10 @@ const NEON_PAGE = `SELECT r.org_id,r.workspace_id,r.origin_id,r.record_id,r.revi
  LEFT JOIN LATERAL(SELECT x.accepted_seq FROM sessions.delivery_catalog_acceptance x WHERE x.org_id=r.org_id AND x.workspace_id=r.workspace_id AND x.origin_id=r.origin_id AND x.record_id=r.record_id LIMIT 1) k ON true
  WHERE r.org_id=$1 AND (r.workspace_id,r.origin_id,r.record_id) > ($2,$3,$4)
  ORDER BY r.workspace_id,r.origin_id,r.record_id LIMIT $5`;
-const SUPA_PAGE = `SELECT org_id,workspace_id,origin_id,record_id,revision_id,revision,digest,kind,source,session_id,operation,user_id,projection_accepted_seq,catalog_accepted_seq
- FROM sessions.ingest_frozen_source_records WHERE org_id=$1 AND (workspace_id,origin_id,record_id) > ($2,$3,$4)
- ORDER BY workspace_id COLLATE "C",origin_id COLLATE "C",record_id COLLATE "C" LIMIT $5`;
 
 const NEON_RECEIPTS = `SELECT org_id,workspace_id,origin_id,batch_id,digest,receipt::text AS receipt FROM sessions.delivery_receipts
  WHERE org_id=$1 AND (workspace_id,origin_id,batch_id) > ($2,$3,$4) ORDER BY workspace_id,origin_id,batch_id LIMIT $5`;
-const SUPA_RECEIPTS = `SELECT org_id,workspace_id,origin_id,batch_id,digest,receipt::text AS receipt FROM sessions.ingest_frozen_source_receipts
- WHERE org_id=$1 AND (workspace_id,origin_id,batch_id) > ($2,$3,$4) ORDER BY workspace_id COLLATE "C",origin_id COLLATE "C",batch_id COLLATE "C" LIMIT $5`;
+
 const receiptText = (r: Record<string, unknown>) => JSON.stringify([r.org_id, r.workspace_id, r.origin_id, r.batch_id, r.digest, r.receipt]);
 async function scanReceipts(c: pg.Client, sql: string, org: string, onPage: (rows: Record<string, unknown>[]) => Promise<void>) {
   let last = ["", "", ""];
@@ -202,7 +204,7 @@ async function main() {
       for (const d of (await s.query("SELECT org_id,workspace_id,user_id,origin_id,source,session_id FROM sessions.ingest_frozen_source_deletions")).rows) addDigest(privS, JSON.stringify(Object.values(d)));
       if (priv.n !== privS.n || priv.sum !== privS.sum) throw new Error("privacy copy mismatch");
       const nh = (await n.query("SELECT org_id,workspace_id,user_id,version::text v,digest,pending FROM sessions.delivery_cutover_control_heads ORDER BY 1,2,3")).rows;
-      const sh = (await s.query("SELECT org_id,workspace_id,user_id,version::text v,digest,pending FROM sessions.ingest_source_control_heads ORDER BY 1 COLLATE \"C\",2 COLLATE \"C\",3 COLLATE \"C\"")).rows;
+      const sh = (await s.query(SUPA_CONTROL_HEADS)).rows;
       const key = (r: any) => [r.org_id, r.workspace_id, r.user_id, r.v, r.digest, r.pending].join("|");
       if (JSON.stringify(nh.map(key).sort()) !== JSON.stringify(sh.map(key).sort())) throw new Error("control head mirror differs from Neon");
       const pol = (await s.query("SELECT source_identity_sha256,control_epoch,privacy_baseline_sha256 FROM sessions.ingest_lazy_policy WHERE singleton")).rows[0];
