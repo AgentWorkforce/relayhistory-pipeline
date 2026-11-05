@@ -119,9 +119,14 @@ export function canonicalSourceGeneration(
     )
     .digest("hex");
 }
-export function canonicalSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity) {
-  // Live raw read: a display-value refusal omits those rows instead of failing the read.
-  return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS, 500000, "optional");
+/**
+ * Live raw read (/canonical raw, timing, turns). Display values are projected only when the
+ * caller asks for them (`directoryValues: true`, i.e. table=session_directory_event_values);
+ * every other read does no display work and returns exactly the pre-#184 snapshot. When
+ * projected, a display-value refusal omits those rows (`displayOmitted`) instead of failing.
+ */
+export function canonicalSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, options: { directoryValues?: boolean } = {}) {
+  return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS, 500000, options.directoryValues === true ? "optional" : undefined);
 }
 /** Trusted Node producer only. Never called by the raw Worker request path. */
 export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, profile: NodeReadProfile = "standard") {
@@ -131,7 +136,7 @@ export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: Canonic
 async function snapshotWithLimits(
   deps: CanonicalDeps, identity: CanonicalIdentity,
   maxScopeBytes: number, maxScopeEvents: number, maxPointersExclusive: number, maxRows: number,
-  directoryValues: "required" | "optional",
+  directoryValues: "required" | "optional" | undefined,
 ) {
   const pointers = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive),
     version = canonicalSourceGeneration(pointers, identity);
@@ -204,7 +209,7 @@ async function snapshotWithLimits(
       maxScopeEvents,
       maxRows,
       insertBatch: 5000,
-      directoryValues,
+      ...(directoryValues ? { directoryValues } : {}),
     },
     0,
     identity.sessionId,
