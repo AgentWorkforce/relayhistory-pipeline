@@ -1,9 +1,9 @@
 # Search index and pipeline runtime adapters
 
-Scope: portable contracts, Postgres search, and a worker runtime. Existing
-services do not dispatch through these adapters yet. The only entry-point
-integration is a boot check that rejects unsupported selection variables.
-With those variables unset, existing service behavior is unchanged.
+Scope: portable contracts, Postgres search, and worker-runtime integration with
+the existing Postgres stage queue. Worker entry points bind each stage to the
+portable runtime while retaining readiness gates, trace context and side ticks.
+Search service routing and additional provider bindings remain separate work.
 
 Two seams are pluggable:
 
@@ -132,6 +132,37 @@ but it does not implement those bindings. In particular, the Sessions Terse
 runtime remains a stub in a separate draft; existing Relaycast/Relayfile actor
 profiles do not establish a working Sessions actor runtime.
 
+### Postgres stage delivery
+
+`postgresStageConsumer` bridges `sessions.pipeline_jobs` to a worker-runtime
+source and work handler. It carries the existing `StageMessage` in memory and
+reuses the existing stage handler, retry policy, event recorder and quarantine
+store. The queue schema and serialized message format stay the same.
+
+Claiming a batch leases rows without spending delivery attempts. Immediately
+before handling one row, the source renews the waiting rows and counts that
+delivery's attempt. Each acknowledgment or retry finishes before the next row
+starts. Every state change is fenced by the original lease token; a late
+consumer cannot acknowledge another consumer's claim. Settlement counters count
+only successful fenced writes.
+
+The generic runtime supports deployment-specific item types alongside schedules.
+Sources with a `start` hook use serial delivery and settlement; other sources
+retain batch handling. Concurrent `tick()` calls share one active iteration.
+The compatibility `pollPostgresStage` entry point also uses this runtime.
+
+On SIGTERM/SIGINT, workers stop starting new deliveries, finish the active
+delivery or side tick, and drain health requests before closing database and
+telemetry resources. An idle wait wakes immediately. Unstarted leased rows keep
+their attempt counts and become available when the lease expires; a new worker
+uses the same recovery path after a crash or forced termination. Allow enough
+termination grace for the slowest handler; handlers remain idempotent because
+delivery is at least once.
+
+Existing per-stage readiness checks and side-tick scheduling remain in the outer
+worker loop. A closed gate blocks later stage claims and the side tick. Periodic
+components retain their existing timing checks.
+
 ## Configuration
 
 | Variable | Recognized names | Current entry-point behavior |
@@ -141,9 +172,14 @@ profiles do not establish a working Sessions actor runtime.
 | `SEARCH_INDEX_POSTGRES_SCHEMA` | SQL identifier | `search_index` unless explicitly configured; validated when constructing the adapter |
 
 Empty or unset selection variables use each entry point's existing behavior.
-Unknown names and recognized but unsupported choices fail at boot. These checks
-validate the existing service path; they do not switch dispatch to the new
-adapters. A future entry point must explicitly declare any broader choices.
+Unknown names and recognized but unsupported choices fail at boot. Workers use
+the `workers` adapter over their existing stage queues; the Lambda service keeps
+its existing implementation. A future entry point must explicitly declare any
+broader choices.
+
+The existing worker settings keep their defaults: `WORKER_BATCH_SIZE=10`,
+`WORKER_IDLE_MS=1000`, and `WORKER_LEASE_SECONDS=300`. Keep the lease longer than
+the slowest delivery. No new deployment setting is required for this wiring.
 
 Secrets arrive through the caller's existing file-mounted secret/client
 mechanism. Registry construction, registration and name selection do not read
@@ -177,8 +213,11 @@ bun test src/shared src/session-pipeline
 The shared search suite exercises PGlite with pg_trgm and can run against a
 disposable PostgreSQL database using `SEARCH_CONFORMANCE_PG_URL`. CI runs that
 suite on PostgreSQL 15, 16 and 17 before the role-hardening proofs. The runtime
-suite checks delivery outcomes and scheduling against an in-memory work source.
+suite checks delivery outcomes, scheduling and overlapping ticks in memory. Stage
+queue integration tests use the real queue schema in PGlite to exercise delayed
+retry, dead letters, replay, stale leases, shutdown and restart recovery. Worker
+orchestration tests cover draining, idle cancellation and side-tick ordering.
 
 These checks cover adapter semantics and existing entry-point compatibility.
-Service routing, a deployed provider binding and customer image distribution
+Search routing, a deployed provider binding and customer image distribution
 need their own integration validation before those features are available.

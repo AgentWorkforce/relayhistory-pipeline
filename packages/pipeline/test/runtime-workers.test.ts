@@ -45,6 +45,34 @@ runtimeConformance("workers (in-memory queue)", async () => ({
 }));
 
 describe("worker runtime specifics", () => {
+  it("shares overlapping ticks and settles started items before beginning the next", async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const handling = new Promise<void>(resolve => { entered = resolve; });
+    type Item = { id: string; attempt: number; payload: number };
+    let claims = 0;
+    const source: WorkSource<Item> = {
+      async claim() { claims++; return [{ id: "one", attempt: 0, payload: 1 }, { id: "two", attempt: 0, payload: 2 }]; },
+      async start(item) { order.push(`start:${item.id}`); return { ...item, attempt: 1 }; },
+      async settle(item) { order.push(`settle:${item.id}`); },
+    };
+    const binding = createWorkerRuntime({ source }).bind({ schedules: [], async handle(items) {
+      const item = items[0]!;
+      order.push(`handle:${item.id}`);
+      if (item.id === "one") { entered(); await held; }
+      return new Map([[item.id, { status: "done" as const }]]);
+    } });
+    const first = binding.tick();
+    await handling;
+    const second = binding.tick();
+    expect(claims).toBe(1);
+    release();
+    expect(await Promise.all([first, second])).toEqual([2, 2]);
+    expect(order).toEqual(["start:one", "handle:one", "settle:one", "start:two", "handle:two", "settle:two"]);
+  });
+
   it("fires each schedule once per window and again in the next window", async () => {
     let t = 0;
     const fired: string[] = [];
