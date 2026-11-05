@@ -30,7 +30,7 @@ import { indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
-import { RECONCILE_DEADLINE_MS, reconcileRecent } from "../lambda.ts";
+import { RECONCILE_DEADLINE_MS, lambdaEnv, reconcileRecent } from "../lambda.ts";
 
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -303,7 +303,7 @@ describe("search index from S3", () => {
     const deps={...searchDeps(ch.ch,sb.transact),writeEvents:async(_db:unknown,_key:unknown,input:unknown)=>{writes.push(input);return {written:true};}};
     expect(await indexSearchScope(scope,deps)).toMatchObject({complete:false});expect(writes).toHaveLength(0);
   });
-  test("writes project/repository catalog only after a complete canonical scope projection", async () => {
+  test("with the desktop catalog flag on, writes project/repository catalog only after a complete canonical scope projection", async () => {
     const sessionRecord: RelayhistoryStreamRecord = {
       kind: "session",
       origin_id: "desktop-origin",
@@ -338,6 +338,7 @@ describe("search index from S3", () => {
     }> = [];
     const deps: SearchIndexDeps = {
       ...searchDeps(ch.ch, sb.transact),
+      desktopCatalog: true,
       writeCatalog: async (_db, key, catalog) => {
         writes.push({ key, catalog });
         return { written: true };
@@ -596,6 +597,63 @@ describe("SQS consumer", () => {
     };
     return { deps, sb };
   }
+
+  // SEARCH_INDEX_ENABLED=1 and SESSION_DESKTOP_CATALOG_ENABLED as lambda.ts wires them into the search deps.
+  function searchOnConsumer(ch: ClickHouseClient, live: () => string[], desktopCatalogEnv: string | undefined, writeCatalog?: SearchIndexDeps["writeCatalog"]) {
+    const { deps, sb } = consumer(ch, live);
+    const env = lambdaEnv({
+      AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "bucket", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true",
+      SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs", SEARCH_INDEX_ENABLED: "1",
+      ...(desktopCatalogEnv === undefined ? {} : { SESSION_DESKTOP_CATALOG_ENABLED: desktopCatalogEnv }),
+    });
+    expect(env.searchEnabled).toBe(true);
+    deps.search = { ...deps.search!, ...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}), ...(writeCatalog ? { writeCatalog } : {}) };
+    return { deps, sb };
+  }
+  const catalogQueries = (calls: string[]) => calls.filter((c) => c.includes("session_directory_agents") || c.includes("catalog_projected_at"));
+
+  test("desktop catalog: SEARCH_INDEX_ENABLED=1 with SESSION_DESKTOP_CATALOG_ENABLED unset indexes but never calls the catalog writer", async () => {
+    const key = await writeSession("srv_bb", [event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello")]);
+    for (const flag of [undefined, "0", "true"]) {
+      const ch = fakeClickHouse();
+      const spied: unknown[] = [];
+      const { deps, sb } = searchOnConsumer(ch.ch, () => [key], flag, async (_db, k) => {
+        spied.push(k);
+        return { written: true };
+      });
+      expect("desktopCatalog" in deps.search!).toBe(false);
+      expect((await processBatch([{ messageId: "m1", body: s3Put(key, "01") }], deps)).batchItemFailures).toEqual([]);
+      expect(ch.final().map((r) => r.content)).toEqual(["hello"]);
+      expect(ch.state.at(-1)?.needs_full).toBe(0);
+      expect(sb.calls.some((c) => c.includes("event_projection_sources"))).toBe(true);
+      expect(spied).toEqual([]);
+      expect(catalogQueries(sb.calls)).toEqual([]);
+    }
+    // The real writer (no seam) issues no catalog query either.
+    const ch = fakeClickHouse();
+    const { deps, sb } = searchOnConsumer(ch.ch, () => [key], undefined);
+    expect((await processBatch([{ messageId: "m2", body: s3Put(key, "02") }], deps)).batchItemFailures).toEqual([]);
+    expect(ch.final().map((r) => r.content)).toEqual(["hello"]);
+    expect(catalogQueries(sb.calls)).toEqual([]);
+  });
+
+  test("desktop catalog: SESSION_DESKTOP_CATALOG_ENABLED=1 calls the catalog writer after a complete pass", async () => {
+    const key = await writeSession("srv_bb", [event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello")]);
+    const ch = fakeClickHouse();
+    const spied: unknown[] = [];
+    const { deps } = searchOnConsumer(ch.ch, () => [key], "1", async (_db, k) => {
+      spied.push(k);
+      return { written: true };
+    });
+    expect(deps.search!.desktopCatalog).toBe(true);
+    expect((await processBatch([{ messageId: "m1", body: s3Put(key, "01") }], deps)).batchItemFailures).toEqual([]);
+    expect(ch.final().map((r) => r.content)).toEqual(["hello"]);
+    expect(spied).toEqual([{ orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: scope.sessionId }]);
+    // Without the seam the real writer reaches the database.
+    const real = searchOnConsumer(fakeClickHouse().ch, () => [key], "1");
+    expect((await processBatch([{ messageId: "m2", body: s3Put(key, "02") }], real.deps)).batchItemFailures).toEqual([]);
+    expect(catalogQueries(real.sb.calls)).toHaveLength(1);
+  });
 
   test("a manifest put upserts the pointer, then indexes its session; duplicates in a batch collapse", async () => {
     const key = await writeSession("srv_bb", [event("r1", "1", Date.parse("2026-11-01T10:00:01Z"), "hello")]);

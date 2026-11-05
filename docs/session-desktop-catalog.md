@@ -20,3 +20,9 @@ The catalog must not be served until these are resolved:
 2. **One bad session blocks the whole workspace indefinitely.** A single session with >500 outgoing edges, an over-long or control-character child label, or an invalid relationship id makes the whole workspace's catalog refuse with no bound on duration.
 3. **The writer has no epoch check of its own.** It relies on the single caller's `expectedEpoch` check in the same transaction; any other caller would bypass it.
 4. **>500 incoming parents returns a truncated success** rather than a refusal.
+
+### Writer switch: `SESSION_DESKTOP_CATALOG_ENABLED`
+
+The search stage (`src/session-pipeline/search-index.ts`) writes the catalog only when the session pipeline Lambda runs with `SESSION_DESKTOP_CATALOG_ENABLED=1` (only the literal `"1"`; unset or any other value is off, with no error). `SEARCH_INDEX_ENABLED=1` alone must never activate the writer: the search stage is live in production, and with this switch off it does what it did before #182 except that it skips the catalog write entirely (no catalog query, same results, partial states and failure handling).
+
+The stack (`stacks/aws/session-pipeline.ts`) always sets `SESSION_DESKTOP_CATALOG_ENABLED="0"` and refuses `transcriptStore.sessionPipeline.desktopCatalog: true` ("desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet"). Activation is: land and review the forget/reproject fix (follow-up migration 20261105031000, blocker 1 above), resolve or accept the other blockers, then lift the stack refusal and wire the env to the input in a reviewed PR, and only then flip the flag. Applying migrations and deploying still need the owner's separate approval.

@@ -64,7 +64,13 @@ export interface SearchIndexDeps {
   decompress?: (stored: Uint8Array, maxOutputLength: number) => Uint8Array;
   now?: () => Date;
   limits?: Partial<SearchIndexLimits>;
-  /** Test seam; production writes the catalog in the same Supabase transaction. */
+  /**
+   * SESSION_DESKTOP_CATALOG_ENABLED=1 only. Absent or false: no catalog write and no
+   * catalog query; SEARCH_INDEX_ENABLED alone never activates the writer
+   * (docs/session-desktop-catalog.md, Activation blockers).
+   */
+  desktopCatalog?: boolean;
+  /** Test seam; when `desktopCatalog` is on, the catalog is written in the same Supabase transaction. */
   writeCatalog?: typeof writeDirectoryCatalog;
   writeEvents?: typeof writeDirectoryEvents;
 }
@@ -328,7 +334,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if(complete){
       const directoryKey={orgId:scope.orgId,workspaceId:scope.workspaceId,harness:scope.harness,sessionId:pointerSnapshot.canonicalId};
       const written=await (deps.writeEvents??writeDirectoryEvents)(tx,directoryKey,{sourceSessionId:scope.sessionId,expectedEpoch:pointerSnapshot.epoch,sources:s3.sources,events:s3.events});
-      if(written.written)await (deps.writeCatalog??writeDirectoryCatalog)(tx,directoryKey,s3.catalog);
+      if(written.written){if(deps.desktopCatalog===true)await (deps.writeCatalog??writeDirectoryCatalog)(tx,directoryKey,s3.catalog);}
       else {complete=false;s3.reasons.push("directory_event_sources_changed");await invalidateDirectoryEvents(tx,scope);}
     }
     // Only a complete pass makes the session current; any other leaves it owing one.

@@ -20,6 +20,7 @@ import {
   sessionPipelinePermissions,
   sessionQueuePolicy,
   sessionSecretPolicy,
+  type SessionPipelineInputs,
 } from "../session-pipeline.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames } from "../transcript-store.ts";
 
@@ -100,6 +101,7 @@ describe("session pipeline: wiring", () => {
       SESSION_PIPELINE_SECRET_ARN: "96bulls/aws-sessions-prod/session-pipeline",
       SEARCH_INDEX_ENABLED: "0",
       SESSION_REPLAY_PAGES_ENABLED: "0",
+      SESSION_DESKTOP_CATALOG_ENABLED: "0",
       PIPELINE_FANOUT: "off",
       PIPELINE_RECONCILE_LOOKBACK_MINUTES: "60",
     });
@@ -206,6 +208,44 @@ describe("session pipeline: inputs", () => {
     expect(() => validate(withPipeline({ replayPages: false }))).not.toThrow(/sessionPipeline/);
     expect(() => validate(withPipeline({}))).not.toThrow(/sessionPipeline/);
     expect(() => validate(withPipeline({ replayPages: "true" }))).toThrow(/replayPages must be a boolean/);
+  });
+
+  it("desktopCatalog: true is refused until migration 20261105031000 and its review; false/absent keep working", () => {
+    expect(() => validate(withPipeline({ desktopCatalog: true }))).toThrow(
+      "desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet",
+    );
+    expect(() => validate(withPipeline({ searchIndex: true, desktopCatalog: true }))).toThrow(/desktopCatalog requires the forget\/reproject fix/);
+    expect(() => validate(withPipeline({ desktopCatalog: false }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ searchIndex: true, desktopCatalog: false }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({}))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ desktopCatalog: "true" }))).toThrow(/desktopCatalog must be a boolean/);
+    expect(() => validate(withPipeline({ desktopCatalog: 1 }))).toThrow(/desktopCatalog must be a boolean/);
+  });
+
+  it("desktop catalog env: SESSION_DESKTOP_CATALOG_ENABLED is \"0\" by default and in every deployed or example env; searchIndex never turns it on", () => {
+    const names = sessionPipelineNames(STAGE, ACCOUNT, REGION);
+    for (const sp of [{}, { searchIndex: true }, { searchIndex: true, desktopCatalog: false }, { searchIndex: true, replayPages: false, maxConcurrency: 4, reconcileMinutes: 30, briefs: { enabled: true } }])
+      expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names, p: sp }).SESSION_DESKTOP_CATALOG_ENABLED).toBe("0");
+    // Every committed stage input (deployed captures and examples) that carries a session pipeline.
+    const root = fileURLToPath(new URL("../../../", import.meta.url));
+    const files = [
+      ...readdirSync(`${root}docs/plans`).filter((f) => f.endsWith(".inputs.sanitized.json")).map((f) => `${root}docs/plans/${f}`),
+      ...readdirSync(`${root}stacks/aws/examples`).filter((f) => f.endsWith(".json")).map((f) => `${root}stacks/aws/examples/${f}`),
+    ];
+    let checked = 0;
+    for (const file of files) {
+      const inputs = JSON.parse(readFileSync(file, "utf8")) as { transcriptStore?: { sessionPipeline?: Record<string, unknown> } };
+      const sp = inputs.transcriptStore?.sessionPipeline;
+      if (sp === undefined) continue;
+      checked++;
+      expect(sp.desktopCatalog).not.toBe(true);
+      for (const deployed of [sp, { ...sp, searchIndex: true }])
+        expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names, p: deployed as SessionPipelineInputs }).SESSION_DESKTOP_CATALOG_ENABLED).toBe("0");
+    }
+    expect(checked).toBeGreaterThan(0);
+    // No committed file sets the switch to "1".
+    const plans = readdirSync(`${root}docs/plans`).map((f) => readFileSync(`${root}docs/plans/${f}`, "utf8"));
+    for (const text of plans) expect(text).not.toMatch(/SESSION_DESKTOP_CATALOG_ENABLED["']?\s*[:=]\s*["']?1/);
   });
 
   it("briefs: enabled is a required boolean, the caps are bounded integers, nothing else", () => {
