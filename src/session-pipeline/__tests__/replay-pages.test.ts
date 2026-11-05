@@ -45,3 +45,59 @@ test("actual multi-machine union honors per-origin revision, acceptance order an
 });
 
 test("actual materializer preserves public persisted-source order after canonical turn attribution",async()=>{const s=await storage(),small="00000000-0000-4000-8000-000000000001",large="ffffffff-ffff-4fff-8fff-ffffffffffff",turnRow=(id:string,stored:string)=>({table:"conversation_turns",row:{org_id:identity.orgId,workspace_id:identity.workspaceId,source:identity.source,session_id:identity.sessionId,id,legacy_stored_source:stored,turn_index:0,session_owner:"owner",content:"kept",role:"assistant",actor_name:"actor",actor_role:"assistant",metadata:{nativeCli:"claude"},ts:"2026-11-01T00:00:00.000001Z"}}),made=await materializeCanonicalArtifacts(s,{identity,source:{epoch:"1",fingerprint:"b".repeat(64)},generation:"d".repeat(64),prefix:"fixture/",rows:[turnRow(small,"z-label"),turnRow(large,"a-label")],legacyCoverage:null});const all=await entries(s,made.document,"conversation_turns");expect((await Promise.all(all.map(e=>row(s,e)))).map(r=>r.id)).toEqual([large,small]);expect((await Promise.all(all.map(e=>row(s,e)))).map(r=>r.legacy_stored_source)).toEqual(["a-label","z-label"])});
+async function consumerFixture(){
+ const x=await replayDatabase();dbs.push(x);const store=await storage();const source=await exportReplayFixture(store,x.db,3);
+ const {processBatch}=await import("../consumer.ts");const {droppedFanout}=await import("../pointer.ts");
+ const {objectStoreManifestReader,prefixOrgResolver,prefixAllowed}=await import("../../shared/vendor.ts");
+ const key=source.manifests[0]!.manifestKey,bindings={PIPELINE_KEY_PREFIX:"96bulls",PIPELINE_ORG_FROM_PREFIX:"true"};
+ const deps:any={pointer:{db:{...x.db,pool:undefined,end:async()=>{}},lock:async(_scope:any,work:any)=>work(),reader:objectStoreManifestReader(store,{provider:"s3",bucket:"replay-fixture"}),exists:async(k:any)=>(await store.head(objectKey(k)))!==undefined,orgs:prefixOrgResolver,allowPrefix:(p:any,o:any)=>prefixAllowed(bindings,p,o),fanout:droppedFanout}};
+ const wire=(over:{store?:ObjectStore;db?:any}={})=>{deps.replay={db:over.db??x.db,store:over.store??store,provider:"s3",bucket:"replay-fixture",prefix:bindings}};
+ const lines:any[]=[];
+ const run=async()=>{const out=process.stdout.write,err=process.stderr.write;const tap=(w:any,stream:NodeJS.WriteStream)=>(chunk:any,...rest:any[])=>{for(const l of String(chunk).split("\n"))if(l.startsWith("{"))try{const j=JSON.parse(l);if(j.stage==="replay-pages")lines.push(j)}catch{}return w.call(stream,chunk,...rest)};
+  process.stdout.write=tap(out,process.stdout) as any;process.stderr.write=tap(err,process.stderr) as any;
+  try{return await processBatch([{messageId:"fixture",body:JSON.stringify({reconcile:{key}})}],deps)}finally{process.stdout.write=out;process.stderr.write=err}};
+ const published=async()=>(await x.db.query<{n:number}>("SELECT count(*)::int n FROM sessions.session_replay_publications WHERE index_key IS NOT NULL")).rows[0]!.n;
+ return {x,store,wire,run,lines,published};
+}
+const isCapture=(sql:unknown)=>String(sql).includes("capture_session_replay_pages");
+test("replay lost source race is logged at info and does not fail the S3 message",async()=>{
+ const f=await consumerFixture();let bumped=false;
+ f.wire({store:new Proxy(f.store,{get(t:any,k){if(k==="put")return async(key:any,b:any,o:any)=>{if(!bumped&&String(key).includes("/normalized/")){bumped=true;await f.x.pg.exec("UPDATE sessions.session_index SET user_id='raced'")}return t.put(key,b,o)};const v=Reflect.get(t,k);return typeof v==="function"?v.bind(t):v}})});
+ expect(await f.run()).toEqual({batchItemFailures:[]});
+ expect(bumped).toBe(true);expect(await f.published()).toBe(0);
+ expect(f.lines).toEqual([expect.objectContaining({level:"info",reason:"replay_source_superseded",error_code:"artifact_source_changed",ok:false})]);
+});
+test("replay capacity refusals (SQLSTATE 54000, producer pointer bound) warn with a stable reason and are not retried",async()=>{
+ const f=await consumerFixture();
+ // The real capture raises 54000 above 10,000 pointers; raise the same SQLSTATE through PGlite without inserting them.
+ f.wire({db:{...f.x.db,query:(sql:any,params:any)=>isCapture(sql)?f.x.db.query("DO $$BEGIN RAISE EXCEPTION USING ERRCODE='54000',MESSAGE='replay capture: pointer capacity exceeded';END$$"):f.x.db.query(sql,params)}});
+ expect(await f.run()).toEqual({batchItemFailures:[]});
+ // The producer's own guard: a capture reporting more than ARTIFACT_MAX_SOURCE_POINTERS pointers.
+ f.wire({db:{...f.x.db,query:async(sql:any,params:any)=>{const r=await f.x.db.query<any>(sql,params);if(!isCapture(sql))return r;const c=r.rows[0].captured,p=c.snapshot.pointers[0];return {...r,rows:[{captured:{...c,snapshot:{...c.snapshot,pointers:Array.from({length:10001},()=>p)}}}]}}}});
+ expect(await f.run()).toEqual({batchItemFailures:[]});
+ expect(await f.published()).toBe(0);
+ expect(f.lines).toEqual([
+  expect.objectContaining({level:"warn",reason:"replay_capacity_refused",error_code:"54000"}),
+  expect.objectContaining({level:"warn",reason:"replay_capacity_refused",error_code:"artifact_capture_bound"}),
+ ]);
+});
+test("replay S3 AccessDenied stays a batch failure",async()=>{
+ const f=await consumerFixture();
+ f.wire({store:new Proxy(f.store,{get(t:any,k){if(k==="put")return async()=>{const e:any=new Error("AccessDenied");e.name="AccessDenied";e.code="AccessDenied";throw e};const v=Reflect.get(t,k);return typeof v==="function"?v.bind(t):v}})});
+ expect(await f.run()).toEqual({batchItemFailures:[{itemIdentifier:"fixture"}]});
+ expect(f.lines).toEqual([expect.objectContaining({level:"error",error_code:"AccessDenied"})]);
+});
+test("replay failure classification uses typed codes only",async()=>{
+ const {classifyReplayFailure}=await import("../replay-publication.ts");const {ArtifactBuildError}=await import("../replay-pages.ts");
+ const {CanonicalReadError}=await import("../../session-read-api/canonical.ts");const {CanonicalTimingError}=await import("../../session-read-api/canonical-timing.ts");
+ const pg=(code:string)=>Object.assign(new Error("x"),{code});
+ expect(classifyReplayFailure(new ArtifactBuildError("artifact_publish_cas_failed"))?.kind).toBe("superseded");
+ expect(classifyReplayFailure(new CanonicalReadError("source_generation_changed"))?.kind).toBe("superseded");
+ expect(classifyReplayFailure(new CanonicalReadError("canonical_projection_incomplete",503,["scope_too_large"]))).toMatchObject({kind:"capacity",code:"scope_too_large"});
+ expect(classifyReplayFailure(new CanonicalReadError("pointer_bound"))?.kind).toBe("capacity");
+ expect(classifyReplayFailure(new ArtifactBuildError("artifact_row_bound"))?.kind).toBe("capacity");
+ expect(classifyReplayFailure(new CanonicalTimingError("canonical timing timestamp invalid"))).toMatchObject({kind:"capacity",code:"canonical_timing_invalid"});
+ expect(classifyReplayFailure(pg("54000"))?.kind).toBe("capacity");
+ for(const e of [new CanonicalReadError("canonical_projection_incomplete",503,["manifest_missing"]),new CanonicalReadError("object_missing"),new ArtifactBuildError("artifact_write_verification_failed"),pg("40001"),pg("55000"),new Error("artifact_source_changed"),new Error("scope_too_large"),Object.assign(new Error("AccessDenied"),{name:"AccessDenied"})])
+  expect(classifyReplayFailure(e)).toBeNull();
+});

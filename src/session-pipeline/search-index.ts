@@ -80,15 +80,33 @@ export interface SearchIndexLimits {
   insertBatch: number;
 }
 
-const DEFAULT_LIMITS: SearchIndexLimits = {
-  // This trusted Node path shares the producer source bound. Raw/projection
-  // copies still need measured execution capacity; this does not lift Worker
-  // limits or cover production cohorts above the explicit 256 MiB ceiling.
+/** The search stage's own limits: the default path, live with SEARCH_INDEX_ENABLED=1. */
+export const SEARCH_INDEX_DEFAULT_LIMITS: Readonly<SearchIndexLimits> = Object.freeze({
+  // Raw text is held several times over (strings, records, projected and index
+  // rows), and an out-of-memory kill fails the whole batch: stay well inside 3 GB.
+  maxScopeBytes: 64 * 1024 * 1024,
+  maxScopeEvents: 100_000,
+  maxRows: 500_000,
+  insertBatch: 5_000,
+});
+
+/**
+ * Only with the replay stage (SESSION_REPLAY_PAGES_ENABLED=1): the index pass
+ * must cover the same source the replay producer reads, so it shares the
+ * producer's 256 MiB / 1M-record bound. This does not lift Worker limits or
+ * cover production cohorts above the 256 MiB ceiling, and it is not yet proven
+ * to fit the 3008 MiB Lambda (see docs/canonical-replay-pages.md).
+ */
+export const REPLAY_SEARCH_INDEX_LIMITS: Readonly<SearchIndexLimits> = Object.freeze({
   maxScopeBytes: ARTIFACT_MAX_SOURCE_BYTES,
   maxScopeEvents: ARTIFACT_MAX_SOURCE_RECORDS,
   maxRows: 1_000_000,
   insertBatch: 5_000,
-};
+});
+
+export function searchIndexLimits(replayPagesEnabled: boolean): SearchIndexLimits {
+  return { ...(replayPagesEnabled ? REPLAY_SEARCH_INDEX_LIMITS : SEARCH_INDEX_DEFAULT_LIMITS) };
+}
 
 export interface SearchIndexResult {
   manifests: number;
@@ -216,7 +234,7 @@ async function livePointerSnapshot(tx: SqlExecutor, scope: SessionScope): Promis
 }
 
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
-  const limits = { ...DEFAULT_LIMITS, ...deps.limits };
+  const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
   return deps.transact(async (tx) => {
     // Non-blocking: a pass already running for this session is busy for as long
