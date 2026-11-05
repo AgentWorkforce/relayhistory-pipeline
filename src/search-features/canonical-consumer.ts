@@ -103,6 +103,13 @@ export class CanonicalConsumer {
     return { copied, dead, checkpoint };
   }
 
+  /** The lease guard — false when this owner no longer holds the partition. */
+  private leaseHeld(partition = "0") {
+    return this.db.query<{ n: number }>(
+      `SELECT 1 AS n FROM ${LEASE} WHERE partition=$1 AND owner=$2`,
+      [partition, this.cfg.ownerId])
+      .then((r) => r.rows.length > 0);
+  }
   /** Bounded retries with backoff; a refusal after maxRetries dead-letters. */
   private async copyWithRetry(
     images: CanonicalImagePort, ch: ClickHouseClient,
@@ -113,7 +120,9 @@ export class CanonicalConsumer {
     for (let i = 0; i <= maxRetries; i++) {
       try {
         const r = await copyCanonicalEntry(
-          images, this.acks, ch, state, entry, this.cfg.targetId);
+          images, this.acks, ch, state, entry, this.cfg.targetId,
+          { beforeWrite: () => this.leaseHeld(),
+            beforeFinish: () => this.leaseHeld() });
         if (r.kind === "copied") return { kind: "copied" };
         if (i === maxRetries)
           return { kind: "dead", reason: (r as { reason: string }).reason };

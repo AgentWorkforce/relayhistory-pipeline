@@ -114,6 +114,10 @@ export async function copyCanonicalEntry(
   /** Stable, non-secret deployment identity — REQUIRED (no unsafe default).
    *  Two deployments sharing database/table names still differ. */
   targetId: string,
+  /** Lease/ownership gates — a lost lease stops the copy BEFORE the next
+   *  CH write and BEFORE finish, leaving restartable durable state. */
+  guards?: { beforeWrite?: () => Promise<boolean>;
+             beforeFinish?: () => Promise<boolean> },
 ): Promise<CanonicalCycleResult> {
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
@@ -206,6 +210,8 @@ export async function copyCanonicalEntry(
         entry.kind === "retire", rs[kind].cursor)) {
       // #233 fences: page source + pointer binding + recomputed hash +
       // well-shaped non-repeating cursor.
+      if (guards?.beforeWrite && !(await guards.beforeWrite()))
+        return { kind: "refused", reason: "lease_lost" };
       if (!Array.isArray(page.rows) || page.source !== entry.imageKey ||
           page.pointerSetHash !== entry.pointerSet.hash ||
           !hash(page.pageSha256) || page.pageSha256 !== hashRows(page.rows) ||
@@ -227,6 +233,8 @@ export async function copyCanonicalEntry(
       }
     }
   }
+  if (guards?.beforeFinish && !(await guards.beforeFinish()))
+    return { kind: "refused", reason: "lease_lost" };
   // finish CAS: terminal descriptors + all page ACKs + still-current authority
   await acks.finish({
     entry, terminalEvent, terminalBrief,

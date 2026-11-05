@@ -12,6 +12,10 @@ CREATE TABLE sessions.canonical_feature_consumer_dead_letter(
   reason text NOT NULL,
   attempts int NOT NULL DEFAULT 1,
   dead_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE sessions.canonical_feature_consumer_lease
+  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions.canonical_feature_consumer_dead_letter
+  ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.canonical_feature_consumer_lease,
   sessions.canonical_feature_consumer_dead_letter
   FROM PUBLIC,anon,authenticated,service_role,
@@ -20,3 +24,9 @@ GRANT INSERT,SELECT,UPDATE,DELETE ON
   sessions.canonical_feature_consumer_lease,
   sessions.canonical_feature_consumer_dead_letter
   TO bulls96_canonical_feature_producer;
+CREATE POLICY consumer_lease_producer
+  ON sessions.canonical_feature_consumer_lease
+  TO bulls96_canonical_feature_producer USING (true) WITH CHECK (true);
+CREATE POLICY consumer_dead_letter_producer
+  ON sessions.canonical_feature_consumer_dead_letter
+  TO bulls96_canonical_feature_producer USING (true) WITH CHECK (true);

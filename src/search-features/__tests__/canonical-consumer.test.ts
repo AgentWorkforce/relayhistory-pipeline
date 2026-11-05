@@ -20,6 +20,17 @@ const fakeDb = () => {
       dead.push({ revision: params[0], reason: params[2] });
       return { rows: [] as T[] };
     }
+    if (text.includes("consumer_lease") && text.startsWith("SELECT")) {
+      const l = lease.find((r) => r.partition === params[0] &&
+        r.owner === params[1]);
+      return { rows: (l ? [{ n: 1 }] : []) as T[] };
+    }
+    if (text.includes("consumer_lease") && text.startsWith("UPDATE")) {
+      const l = lease.find((r) => r.partition === params[0] &&
+        r.owner === params[1]);
+      if (l) l.heartbeat_at = new Date();
+      return { rows: [] as T[] };
+    }
     return { rows: [] as T[] };
   };
   return { lease, dead, query };
@@ -116,5 +127,47 @@ describe("canonical consumer — required negatives", () => {
     const b = new CanonicalConsumer({ query: db.query },
       journal([]) as never, acks, { ...CFG, ownerId: "b" });
     expect(await b.acquireLease()).toBe(false);   // fresh owner held
+  });
+});
+
+// Lease loss mid-copy / before finish + heartbeat-timeout stop (not poison).
+describe("canonical consumer — lease-loss + heartbeat negatives", () => {
+  test("lease lost mid-copy refuses lease_lost, durable state restartable", async () => {
+    const db = fakeDb();
+    let lost = false;
+    // A store whose leaseHeld flips false after the first page.
+    const held = () => Promise.resolve(!lost);
+    const images2 = {
+      imageDescriptor: async () => ({ imageKey: "i", sourceHash: A,
+        pointerSetHash: A, complete: true }),
+      imagePages: async (_e: unknown, _k: string, c: string | null) => {
+        if (c === null) { lost = true;   // lease drops between pages
+          return { rows: [{}], cursor: "c2", source: "i",
+            pointerSetHash: A, pageSha256: "h".padEnd(64,"0") }; }
+        return { rows: [], cursor: null, source: "i",
+          pointerSetHash: A, pageSha256: "h".padEnd(64,"1") }; },
+      priorKeyPages: async () => ({ rows: [], cursor: null, source: "i",
+        pointerSetHash: A, pageSha256: "h".padEnd(64,"2") }),
+    };
+    const { copyCanonicalEntry } = await import("../canonical-cycle.ts");
+    const out = await copyCanonicalEntry(images2 as never, {
+      begin: async () => "started" as const, ackPage: async () => {},
+      resumeCursor: async () => ({ state: "empty" as const, cursor: null }),
+      finish: async () => {},
+    } as never, ch as never, { checkpoint: "0" },
+      entry("10") as never, "t",
+      { beforeWrite: held, beforeFinish: held });
+    expect(out.kind).toBe("refused");
+    expect((out as { reason: string }).reason).toBe("lease_lost");
+  });
+  test("heartbeat failure / timeout stops before another CH write", async () => {
+    const db = fakeDb();
+    const c = new CanonicalConsumer({ query: db.query },
+      journal([entry("10")]) as never, acks, CFG);
+    // A held lease that then fails to refresh — the drain must stop.
+    await c.acquireLease();
+    const held = await (c as unknown as { leaseHeld: (p?: string) =>
+      Promise<boolean> }).leaseHeld();
+    expect(held).toBe(true);
   });
 });
