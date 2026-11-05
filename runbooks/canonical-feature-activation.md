@@ -63,6 +63,13 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
   registry-assigned `20261105030000_canonical_feature_consumer_acks.sql`.
   The migration is dormant metadata/schema: applying it does not start a
   consumer or authorize traffic activation.
+- Brief-document publication in `20261105024000` is independently default-off.
+  Applying the migration creates no scope/outbox rows. After the window is
+  applied and before its bounded backfill, the database owner enables it with
+  `SELECT sessions.set_session_brief_documents_live(true);`. The call takes a
+  bounded directory-write fence, seeds scope keys and flips the trigger live in
+  one transaction; a lock timeout leaves it off. Disable with the same owner-
+  only RPC using `false`. No runtime role has EXECUTE on this control.
 - Define and rehearse the operator-only seed row. It must put the journal above
   the drained legacy feature high-water before any scope install or backfill;
   no data-plane identity may allocate or append revisions.

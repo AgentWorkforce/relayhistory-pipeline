@@ -6,6 +6,11 @@
 -- Dormant derived CH metadata publication. Directory text remains authoritative.
 -- No external writes, text search RPC, or direct reader/backend table grants.
 CREATE SEQUENCE sessions.session_brief_document_epoch_seq AS bigint NO CYCLE;
+CREATE TABLE sessions.session_brief_document_control(
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ live boolean NOT NULL DEFAULT false
+);
+INSERT INTO sessions.session_brief_document_control(singleton,live) VALUES(true,false);
 CREATE TABLE sessions.session_brief_document_scopes(
  org_id text NOT NULL,workspace_id text NOT NULL,watermark bigint NOT NULL DEFAULT 0,
  initialized boolean NOT NULL DEFAULT false,cursor_source text,cursor_session text,
@@ -22,8 +27,28 @@ CREATE TABLE sessions.session_brief_document_outbox(
 CREATE INDEX session_brief_document_dirty ON sessions.session_brief_document_outbox(available_at,org_id,workspace_id,harness,session_id) WHERE epoch<>published_epoch;
 ALTER TABLE sessions.session_brief_document_scopes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.session_brief_document_outbox ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON sessions.session_brief_document_scopes,sessions.session_brief_document_outbox FROM PUBLIC,anon,authenticated,service_role;
+ALTER TABLE sessions.session_brief_document_control ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_brief_document_control,sessions.session_brief_document_scopes,sessions.session_brief_document_outbox FROM PUBLIC,anon,authenticated,service_role;
 REVOKE ALL ON SEQUENCE sessions.session_brief_document_epoch_seq FROM PUBLIC,anon,authenticated,service_role;
+
+CREATE FUNCTION sessions.set_session_brief_documents_live(p_live boolean)
+RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp SET lock_timeout='5s' AS $set_live$
+DECLARE v_live boolean;
+BEGIN
+ IF p_live IS NULL THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='brief documents: live must be boolean'; END IF;
+ SELECT live INTO v_live FROM sessions.session_brief_document_control WHERE singleton FOR UPDATE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='brief documents: control row missing'; END IF;
+ IF v_live=p_live THEN RETURN v_live; END IF;
+ -- Wait out directory writers before changing the trigger-visible state. On enable,
+ -- this also makes the scope-key snapshot and the live flip one atomic boundary.
+ LOCK TABLE sessions.session_directory IN SHARE MODE;
+ IF p_live THEN
+  INSERT INTO sessions.session_brief_document_scopes(org_id,workspace_id)
+  SELECT DISTINCT org_id,workspace_id FROM sessions.session_directory ON CONFLICT DO NOTHING;
+ END IF;
+ UPDATE sessions.session_brief_document_control SET live=p_live WHERE singleton;
+ RETURN p_live;
+END $set_live$;
 
 CREATE FUNCTION sessions.session_brief_document_json(p_row sessions.session_directory,p_erased boolean DEFAULT false)
 RETURNS jsonb LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $document$
@@ -58,6 +83,10 @@ CREATE FUNCTION sessions.session_brief_document_changed()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $changed$
 DECLARE before_doc jsonb;after_doc jsonb;v jsonb;docs jsonb:='[]'::jsonb;
 BEGIN
+ -- Applying this migration is deliberately dormant. This check must remain the
+ -- first operation: default-off directory writes take no shared scope-row lock,
+ -- allocate no epoch and create no derived publication state.
+ IF NOT coalesce((SELECT live FROM sessions.session_brief_document_control WHERE singleton),false) THEN RETURN NULL; END IF;
  IF TG_OP<>'INSERT' THEN before_doc:=sessions.session_brief_document_json(OLD,false); END IF;
  IF TG_OP<>'DELETE' THEN after_doc:=sessions.session_brief_document_json(NEW,false); END IF;
  IF TG_OP='DELETE' THEN docs:=jsonb_build_array(sessions.session_brief_document_json(OLD,true));
@@ -71,8 +100,6 @@ BEGIN
  RETURN NULL;
 END $changed$;
 CREATE TRIGGER session_brief_document_changed AFTER INSERT OR UPDATE OR DELETE ON sessions.session_directory FOR EACH ROW EXECUTE FUNCTION sessions.session_brief_document_changed();
--- Keys only. A separately enabled bounded publisher owns all text backfill.
-INSERT INTO sessions.session_brief_document_scopes(org_id,workspace_id) SELECT DISTINCT org_id,workspace_id FROM sessions.session_directory ON CONFLICT DO NOTHING;
 
 CREATE FUNCTION sessions.backfill_session_brief_documents(p_limit integer DEFAULT 200)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $backfill$
@@ -144,6 +171,6 @@ BEGIN
  RETURN QUERY SELECT o,p_workspace_id,coalesce(k.watermark,0)::text,coalesce(k.initialized,false),coalesce(k.initialized,false) AND NOT dirty,docs;
 END $authority$;
 
-REVOKE ALL ON FUNCTION sessions.session_brief_document_json(sessions.session_directory,boolean),sessions.queue_session_brief_document(jsonb),sessions.session_brief_document_changed(),sessions.backfill_session_brief_documents(integer),sessions.claim_session_brief_documents(uuid,integer),sessions.ack_session_brief_documents(uuid,jsonb),sessions.retry_session_brief_documents(uuid,text),sessions.session_brief_document_authority(text,text[],text[]) FROM PUBLIC,anon,authenticated,service_role;
+REVOKE ALL ON FUNCTION sessions.set_session_brief_documents_live(boolean),sessions.session_brief_document_json(sessions.session_directory,boolean),sessions.queue_session_brief_document(jsonb),sessions.session_brief_document_changed(),sessions.backfill_session_brief_documents(integer),sessions.claim_session_brief_documents(uuid,integer),sessions.ack_session_brief_documents(uuid,jsonb),sessions.retry_session_brief_documents(uuid,text),sessions.session_brief_document_authority(text,text[],text[]) FROM PUBLIC,anon,authenticated,service_role;
 GRANT EXECUTE ON FUNCTION sessions.backfill_session_brief_documents(integer),sessions.claim_session_brief_documents(uuid,integer),sessions.ack_session_brief_documents(uuid,jsonb),sessions.retry_session_brief_documents(uuid,text) TO service_role;
 GRANT EXECUTE ON FUNCTION sessions.session_brief_document_authority(text,text[],text[]) TO session_directory_search_worker;

@@ -26,6 +26,7 @@ async function fresh() {
     harness: i.source,
     sessionId: "large_replay",
   });
+  await x.db.query("SELECT sessions.set_session_brief_documents_live(true)");
   return x;
 }
 async function backfill(x: Awaited<ReturnType<typeof fresh>>, limit = 200) {
@@ -96,6 +97,59 @@ test("brief-document queue accepts an empty workspace but rejects a missing or n
       ]),
     ).rejects.toMatchObject({ code: "22023" });
   }
+});
+test("brief documents remain dormant until the owner activates publication", async () => {
+  const x = await replayDatabase();
+  open.push(x);
+  expect(
+    (
+      await x.db.query<{ live: boolean; scopes: number; outbox: number }>(
+        `SELECT c.live,
+          (SELECT count(*)::int FROM sessions.session_brief_document_scopes) scopes,
+          (SELECT count(*)::int FROM sessions.session_brief_document_outbox) outbox
+         FROM sessions.session_brief_document_control c WHERE c.singleton`,
+      )
+    ).rows[0],
+  ).toEqual({ live: false, scopes: 0, outbox: 0 });
+  await addReplayPointer(x.db, {
+    key: "96bulls/org_replay/v1/ws=ws_replay/m=machine_0/h=claude/d=2026/11/01/s=dormant/manifest.json",
+    digest: "d".repeat(64),
+    physicalSession: "dormant",
+    physicalMachine: "machine_0",
+    canonicalMachine: "machine:0",
+  });
+  await projectSessionDirectory(x.db, {
+    orgId: i.orgId,
+    workspaceId: i.workspaceId,
+    harness: i.source,
+    sessionId: "dormant",
+  });
+  await x.pg.exec("UPDATE sessions.session_directory SET title='dormant write'");
+  expect(
+    (
+      await x.db.query<{ scopes: number; outbox: number }>(
+        `SELECT
+          (SELECT count(*)::int FROM sessions.session_brief_document_scopes) scopes,
+          (SELECT count(*)::int FROM sessions.session_brief_document_outbox) outbox`,
+      )
+    ).rows[0],
+  ).toEqual({ scopes: 0, outbox: 0 });
+  await x.pg.exec("BEGIN; SET LOCAL ROLE service_role");
+  await expect(
+    x.pg.query("SELECT sessions.set_session_brief_documents_live(true)"),
+  ).rejects.toMatchObject({ code: "42501" });
+  await x.pg.exec("ROLLBACK");
+  await x.db.query("SELECT sessions.set_session_brief_documents_live(true)");
+  expect(
+    (
+      await x.db.query<{ live: boolean; scopes: number; outbox: number }>(
+        `SELECT c.live,
+          (SELECT count(*)::int FROM sessions.session_brief_document_scopes) scopes,
+          (SELECT count(*)::int FROM sessions.session_brief_document_outbox) outbox
+         FROM sessions.session_brief_document_control c WHERE c.singleton`,
+      )
+    ).rows[0],
+  ).toEqual({ live: true, scopes: 1, outbox: 0 });
 });
 test("relevant directory writes queue metadata once; publisher acknowledges exact epoch/hash", async () => {
   const x = await fresh();

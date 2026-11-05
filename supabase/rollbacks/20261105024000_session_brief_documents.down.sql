@@ -9,7 +9,9 @@ DROP FUNCTION sessions.backfill_session_brief_documents(integer);
 DROP FUNCTION sessions.session_brief_document_changed();
 DROP FUNCTION sessions.queue_session_brief_document(jsonb);
 DROP FUNCTION sessions.session_brief_document_json(sessions.session_directory,boolean);
+DROP FUNCTION sessions.set_session_brief_documents_live(boolean);
 DROP TABLE sessions.session_brief_document_outbox;
 DROP TABLE sessions.session_brief_document_scopes;
+DROP TABLE sessions.session_brief_document_control;
 DROP SEQUENCE sessions.session_brief_document_epoch_seq;
 -- Retain the CH derived table until separately authorized physical cleanup.
