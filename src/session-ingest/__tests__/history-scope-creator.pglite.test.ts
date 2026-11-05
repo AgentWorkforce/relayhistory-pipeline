@@ -30,6 +30,8 @@ beforeAll(async () => {
   for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await db.exec(read("supabase/migrations/" + f));
   await db.exec("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','" + gen + "','pass')");
+  // Operator seed above the drained legacy feature clock (H=1000): the journal refuses until it exists.
+  await db.query("SELECT sessions.canonical_feature_journal_seed(1000,$1)", [gen]);
 });
 afterAll(async () => { await db?.close(); });
 const run: any = { query: async (sql: string, args: unknown[]) => {
@@ -133,22 +135,99 @@ test("only the ingest role may run the creator", async () => {
 
 const journal = async (org: string) => (await db.query<any>("SELECT kind,source_authority,prior_source_authority,pointer_set,schema_generation FROM sessions.canonical_feature_journal WHERE org_id=$1 ORDER BY revision", [org])).rows;
 
-test("610 compose: a successful install appends exactly one publish entry bound to its source", async () => {
+const IMAGE = /^hs1:[a-f0-9]{64}:[a-f0-9]{64}:[0-9a-f-]{36}$/;
+const pointerPage = async (authorityId: string) => (await db.query<any>("SELECT pointer FROM sessions.ingest_history_scope_pointer_page($1::uuid,0,1000)", [authorityId])).rows.map((x) => x.pointer.manifest_key);
+const journalRows = async (org: string) => (await db.query<any>("SELECT revision::int r,kind,image_key,source_hash,source_authority,prior_source_authority,pointer_set,prior_keyset_hash,schema_generation FROM sessions.canonical_feature_journal WHERE org_id=$1 ORDER BY revision", [org])).rows;
+
+test("610 compose: a new scope appends exactly one publish(new image, new authority, bounded descriptor) recorded as the current revision", async () => {
   const s = await scope(["k1"]), r = await install((await build(s, ["k1"])).b, s);
-  const rows = await journal(s.identity.orgId);
+  const rows = await journalRows(s.identity.orgId);
   expect(rows.length).toBe(1);
-  expect(rows[0]).toMatchObject({ kind: "publish", source_authority: r.source, prior_source_authority: null, schema_generation: gen });
-  expect(rows[0].pointer_set.count).toBe("1");
+  expect(rows[0]).toMatchObject({ kind: "publish", source_authority: { ...r.source, authorityId: r.authorityId }, prior_source_authority: null, prior_keyset_hash: null, schema_generation: gen });
+  expect(rows[0].r).toBeGreaterThan(1000);
+  expect(rows[0].image_key).toMatch(IMAGE);
+  expect(rows[0].image_key.endsWith(":" + gen + ":" + r.authorityId)).toBe(true);
+  expect(Object.keys(rows[0].pointer_set).sort()).toEqual(["authorityId", "count", "hash"]);
+  expect(rows[0].pointer_set).toMatchObject({ authorityId: r.authorityId, count: "1" });
+  expect(r.featureRevision).toBe(String(rows[0].r));
+  const v = (await db.query<any>("SELECT feature_revision::int f,pointer_count,pointer_snapshot_sha256 h FROM sessions.ingest_history_scope_versions WHERE authority_id=$1", [r.authorityId])).rows[0];
+  expect(v).toEqual({ f: rows[0].r, pointer_count: 1, h: rows[0].pointer_set.hash });
+  expect(await pointerPage(r.authorityId)).toEqual([s.row.manifest_key]);
 });
 
-test("610 compose: a replacement appends one retire entry carrying the prior source", async () => {
+test("610 compose: a replacement appends retire(PRIOR image/authority/descriptor) THEN publish(NEW image/authority/descriptor)", async () => {
   const s = await scope(["k1"]);
   const first = await install((await build(s, ["k1"])).b, s);
+  // A second machine uploads: the replacement is installed over a DIFFERENT pointer inventory.
+  const second_row = { ...s.row, machine_id: "srv_second", manifest_key: s.row.manifest_key.replace("m=srv_origin", "m=srv_second") };
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([second_row])]);
   const second = await install((await build(s, ["k1"])).b, s, "22222222-2222-2222-2222-222222222222");
-  const rows = await journal(s.identity.orgId);
-  expect(rows.map((x) => x.kind)).toEqual(["publish", "retire"]);
-  expect(rows[1].source_authority).toEqual(second.source);
-  expect(rows[1].prior_source_authority).toEqual(first.source);
+  const rows = await journalRows(s.identity.orgId);
+  expect(rows.map((x) => x.kind)).toEqual(["publish", "retire", "publish"]);
+  const [pub1, retire, pub2] = rows;
+  expect(retire.r).toBe(pub1.r + 1); expect(pub2.r).toBe(retire.r + 1);
+  expect(retire.image_key).toBe(pub1.image_key);
+  expect(pub2.image_key).not.toBe(pub1.image_key);
+  expect(pub2.image_key).toMatch(IMAGE);
+  expect(retire.source_authority).toEqual({ ...first.source, authorityId: first.authorityId });
+  expect(retire.source_hash).toBe(first.source.fingerprint);
+  expect(retire.pointer_set).toEqual(pub1.pointer_set);
+  expect(retire.prior_keyset_hash).toBe(pub1.pointer_set.hash);
+  expect(pub2.source_authority).toEqual({ ...second.source, authorityId: second.authorityId });
+  expect(pub2.prior_source_authority).toEqual(retire.source_authority);
+  expect(pub2.pointer_set).toMatchObject({ authorityId: second.authorityId, count: "2" });
+  expect(pub2.pointer_set.hash).not.toBe(retire.pointer_set.hash);
+  // Exact PRIOR keys page from the frozen prior authority; the new authority has the new inventory.
+  expect(await pointerPage(retire.pointer_set.authorityId)).toEqual([s.row.manifest_key]);
+  expect((await pointerPage(second.authorityId)).sort()).toEqual([s.row.manifest_key, second_row.manifest_key].sort());
+  expect(second.featureRevision).toBe(String(pub2.r));
+  // The prior authority is frozen: its inventory and revision can no longer move.
+  await expect(db.query("UPDATE sessions.ingest_history_scope_versions SET pointer_count=pointer_count WHERE authority_id=$1", [first.authorityId])).resolves.toBeDefined();
+  await expect(db.query("UPDATE sessions.ingest_history_scope_versions SET feature_revision=feature_revision+100 WHERE authority_id=$1", [first.authorityId])).rejects.toThrow("frozen");
+  await expect(db.query("UPDATE sessions.ingest_history_scope_versions SET state='ready' WHERE authority_id=$1", [first.authorityId])).rejects.toThrow("frozen");
+});
+
+test("610 compose: a rolled-back replacement emits neither the retire nor the publish", async () => {
+  const s = await scope(["k1"]);
+  await install((await build(s, ["k1"])).b, s);
+  const built = (await build(s, ["k1"])).b;
+  await db.exec("BEGIN; SET LOCAL ROLE bulls96_session_ingest");
+  await db.query("SELECT sessions.ingest_history_scope_install($1::jsonb)", [JSON.stringify({ generation: gen, buildId: built.buildId, leaseToken: built.leaseToken, maskSha256: s.mask.sha256, recordCount: s.mask.count, derivedAnchorKey: s.anchor("33333333-3333-3333-3333-333333333333"), bucket: "creator-fixture", region: "us-east-1", keyRoot: "96bulls" })]);
+  await db.exec("ROLLBACK");
+  expect((await journalRows(s.identity.orgId)).map((x) => x.kind)).toEqual(["publish"]);
+});
+
+test("610 compose: an unseeded journal refuses the install (no MAX+1 from 1)", async () => {
+  const s = await scope(["k1"]), built = (await build(s, ["k1"])).b;
+  await db.exec("BEGIN");
+  try {
+    await db.query("DELETE FROM sessions.canonical_feature_journal WHERE kind='seed'");
+    await db.exec("SET LOCAL ROLE bulls96_session_ingest");
+    await expect(db.query("SELECT sessions.ingest_history_scope_install($1::jsonb)", [JSON.stringify({ generation: gen, buildId: built.buildId, leaseToken: built.leaseToken, maskSha256: s.mask.sha256, recordCount: s.mask.count, derivedAnchorKey: s.anchor("44444444-4444-4444-4444-444444444444"), bucket: "creator-fixture", region: "us-east-1", keyRoot: "96bulls" })])).rejects.toThrow("not seeded");
+  } finally { await db.exec("ROLLBACK"); }
+  await expect(db.query("SELECT sessions.canonical_feature_journal_seed(5,$1)", [gen])).rejects.toThrow("already seeded");
+});
+
+test("610 compose: the invoker refuses raw pointers, descriptors that miss the frozen authority, half priors and self-retire", async () => {
+  const s = await scope(["k1"]), r = await install((await build(s, ["k1"])).b, s);
+  const v = (await db.query<any>("SELECT pointer_snapshot_sha256 h,pointer_count::text c FROM sessions.ingest_history_scope_versions WHERE authority_id=$1", [r.authorityId])).rows[0];
+  const sc = JSON.stringify({ orgId: s.identity.orgId, workspaceId: s.identity.workspaceId, harness: "claude", sessionId: s.identity.sessionId, generation: gen });
+  const src = JSON.stringify({ ...r.source, authorityId: r.authorityId });
+  const ds = (o: object = {}) => JSON.stringify({ authorityId: r.authorityId, hash: v.h, count: v.c, ...o });
+  const call = (args: unknown[]) => db.query("SELECT sessions.canonical_feature_changed($1::jsonb,$2::jsonb,$3::jsonb,$4::jsonb,$5::jsonb)", args);
+  await db.exec("BEGIN");
+  try {
+    // Even the exact frozen descriptor cannot publish the same immutable image twice.
+    await db.exec("SAVEPOINT x"); await expect(call([sc, src, null, ds(), null])).rejects.toThrow("canonical_feature_journal_image_kind"); await db.exec("ROLLBACK TO SAVEPOINT x");
+    for (const bad of [
+      [sc, src, null, ds({ pointers: [] }), null],               // raw pointers are not part of the bounded shape
+      [sc, src, null, ds({ count: "2" }), null],                 // count misses the frozen inventory
+      [sc, src, null, ds({ hash: "c".repeat(64) }), null],       // hash misses the frozen inventory
+      [sc, src, null, ds({ count: "01" }), null],                // non-canonical count
+      [sc, src, src, ds(), null],                                // prior source without prior descriptor
+      [sc, src, src, ds(), ds()],                                // self-retire
+    ]) { await db.exec("SAVEPOINT x"); await expect(call(bad)).rejects.toThrow("canonical_feature_changed"); await db.exec("ROLLBACK TO SAVEPOINT x"); }
+  } finally { await db.exec("ROLLBACK"); }
 });
 
 test("610 compose: a refused install and a rolled-back install emit no journal entry", async () => {
@@ -167,6 +246,6 @@ test("610 compose: a refused install and a rolled-back install emit no journal e
 test("610 compose: no role may append to the journal directly", async () => {
   for (const role of ["bulls96_session_ingest", "session_directory_search_worker", "service_role"]) {
     await db.exec("BEGIN; SET LOCAL ROLE " + role);
-    try { await expect(db.query("SELECT sessions.canonical_feature_changed('{}','{}',NULL,'{}')")).rejects.toThrow(); } finally { await db.exec("ROLLBACK"); }
+    try { await expect(db.query("SELECT sessions.canonical_feature_changed('{}','{}',NULL,'{}',NULL)")).rejects.toThrow(); } finally { await db.exec("ROLLBACK"); }
   }
 });

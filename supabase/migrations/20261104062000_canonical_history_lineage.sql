@@ -668,6 +668,39 @@ LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $rows$
 $rows$;
 
 ALTER TABLE sessions.ingest_history_scope_versions ADD COLUMN pointer_snapshot_sha256 text NOT NULL CHECK(pointer_snapshot_sha256~'^[a-f0-9]{64}$');
+-- Exact pointer inventory this version was installed over: the 610 retire entry carries it so the
+-- producer can enumerate and delete exactly the PRIOR keys after a replacement.
+ALTER TABLE sessions.ingest_history_scope_versions ADD COLUMN pointer_snapshot jsonb NOT NULL CHECK(jsonb_typeof(pointer_snapshot)='array'),
+ ADD CONSTRAINT ingest_history_scope_versions_pointer_hash CHECK(pointer_snapshot_sha256=encode(sha256(convert_to(pointer_snapshot::text,'UTF8')),'hex')),
+ ADD COLUMN pointer_count integer NOT NULL CHECK(pointer_count BETWEEN 0 AND 100000),
+ ADD CONSTRAINT ingest_history_scope_versions_pointer_count CHECK(pointer_count=jsonb_array_length(pointer_snapshot)),
+ ADD COLUMN feature_revision bigint CHECK(feature_revision>0);
+CREATE UNIQUE INDEX ingest_history_scope_versions_feature_revision ON sessions.ingest_history_scope_versions(feature_revision)WHERE feature_revision IS NOT NULL;
+-- A version's identity and inventory are frozen once written; only lifecycle columns move, and
+-- the fingerprint/feature revision are bound exactly once (inside the installing transaction).
+CREATE FUNCTION sessions.ingest_history_scope_version_frozen()RETURNS trigger
+LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $frozen$
+BEGIN
+ IF NEW.authority_id<>OLD.authority_id OR NEW.org_id<>OLD.org_id OR NEW.workspace_id<>OLD.workspace_id OR NEW.harness<>OLD.harness
+  OR NEW.session_id<>OLD.session_id OR NEW.source_epoch<>OLD.source_epoch OR NEW.mask_sha256<>OLD.mask_sha256 OR NEW.record_count<>OLD.record_count
+  OR NEW.pointer_snapshot IS DISTINCT FROM OLD.pointer_snapshot OR NEW.pointer_snapshot_sha256<>OLD.pointer_snapshot_sha256 OR NEW.pointer_count<>OLD.pointer_count
+  OR(OLD.source_fingerprint IS NOT NULL AND NEW.source_fingerprint IS DISTINCT FROM OLD.source_fingerprint)
+  OR(OLD.feature_revision IS NOT NULL AND NEW.feature_revision IS DISTINCT FROM OLD.feature_revision)
+  OR(OLD.state='retired'AND NEW.state<>'retired')
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: scope version is frozen';END IF;
+ RETURN NEW;
+END $frozen$;
+CREATE TRIGGER ingest_history_scope_version_frozen BEFORE UPDATE ON sessions.ingest_history_scope_versions
+ FOR EACH ROW EXECUTE FUNCTION sessions.ingest_history_scope_version_frozen();
+REVOKE ALL ON FUNCTION sessions.ingest_history_scope_version_frozen()FROM PUBLIC;
+-- Producer-side exact-key enumeration: pages the frozen pointer inventory of one authority
+-- (retired or current). Owner-only until the producer's least-privilege read role is approved.
+CREATE FUNCTION sessions.ingest_history_scope_pointer_page(p_authority uuid,p_after integer,p_limit integer)
+RETURNS TABLE(ordinal integer,pointer jsonb)LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $page$
+ SELECT(e.n-1)::integer,e.v FROM sessions.ingest_history_scope_versions v CROSS JOIN LATERAL jsonb_array_elements(v.pointer_snapshot)WITH ORDINALITY e(v,n)
+ WHERE v.authority_id=p_authority AND p_after>=0 AND p_limit BETWEEN 1 AND 1000 AND e.n-1>=p_after ORDER BY e.n LIMIT p_limit
+$page$;
+REVOKE ALL ON FUNCTION sessions.ingest_history_scope_pointer_page(uuid,integer,integer)FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
 -- A source snapshot names the immutable mask root, not all million rows. Existing
 -- replay epoch/fingerprint remains the sole logical read/cache authority.
@@ -1587,6 +1620,7 @@ CREATE FUNCTION sessions.ingest_history_scope_install(p jsonb)RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $scopeinstall$
 DECLARE b sessions.ingest_history_scope_builds%ROWTYPE;m sessions.ingest_history_mask_pages%ROWTYPE;cur uuid;v_epoch bigint;v_req bigint;
  v_snapshot jsonb;v_ptr text;v_deleted timestamptz;v_id uuid:=gen_random_uuid();v_fp text;v_anchor text;v_root text;v_n bigint;
+ prior sessions.ingest_history_scope_versions%ROWTYPE;v_pointers jsonb;v_rev bigint;
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
  PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','buildId','leaseToken','maskSha256','recordCount','derivedAnchorKey','bucket','region','keyRoot']);
@@ -1607,7 +1641,8 @@ BEGIN
  SELECT request_version INTO v_req FROM sessions.ingest_history_required_scopes WHERE org_id=b.org_id AND workspace_id=b.workspace_id AND harness=b.harness AND session_id=b.session_id;
  SELECT deleted_at INTO v_deleted FROM sessions.session_directory WHERE org_id=b.org_id AND workspace_id=b.workspace_id AND harness=b.harness AND session_id=b.session_id;
  v_snapshot:=sessions.session_replay_source_snapshot(b.org_id,b.workspace_id,b.harness,b.session_id);
- v_ptr:=encode(sha256(convert_to(coalesce(v_snapshot->'pointers','[]'::jsonb)::text,'UTF8')),'hex');
+ v_pointers:=coalesce(v_snapshot->'pointers','[]'::jsonb);
+ v_ptr:=encode(sha256(convert_to(v_pointers::text,'UTF8')),'hex');
  IF cur IS DISTINCT FROM b.expected_authority_id OR v_epoch IS DISTINCT FROM b.base_epoch OR v_req IS DISTINCT FROM b.base_request_version
   OR v_ptr IS DISTINCT FROM b.pointer_snapshot_sha256 OR v_deleted IS NOT NULL
  THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='history: scope source changed since capture';END IF;
@@ -1621,9 +1656,15 @@ BEGIN
    SELECT 1 FROM sessions.ingest_history_scope_keys k WHERE k.org_id=b.org_id AND k.workspace_id=b.workspace_id AND k.record_id=r.record_id
     AND k.harness=b.harness AND k.session_id=b.session_id))
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: mask record not registered as a scope key';END IF;
+ -- Replacement: pin the PRIOR authority and its exact pointer inventory BEFORE the pointer CAS.
+ IF cur IS NOT NULL THEN
+  SELECT *INTO prior FROM sessions.ingest_history_scope_versions WHERE authority_id=cur FOR UPDATE;
+  IF NOT FOUND OR prior.state<>'ready'OR prior.source_fingerprint IS NULL THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: prior authority not retirable';END IF;
+ END IF;
  INSERT INTO sessions.ingest_history_scope_versions(authority_id,org_id,workspace_id,harness,session_id,source_epoch,source_fingerprint,mask_sha256,record_count,
-  derived_anchor_key,bucket,region,key_root,state,pointer_snapshot_sha256)
-  VALUES(v_id,b.org_id,b.workspace_id,b.harness,b.session_id,v_epoch,NULL,m.sha256,m.record_count,v_anchor,p->>'bucket',p->>'region',p->>'keyRoot','ready',v_ptr);
+  derived_anchor_key,bucket,region,key_root,state,pointer_snapshot_sha256,pointer_snapshot,pointer_count)
+  VALUES(v_id,b.org_id,b.workspace_id,b.harness,b.session_id,v_epoch,NULL,m.sha256,m.record_count,v_anchor,p->>'bucket',p->>'region',p->>'keyRoot','ready',v_ptr,v_pointers,jsonb_array_length(v_pointers));
  INSERT INTO sessions.ingest_history_scope_current AS c VALUES(b.org_id,b.workspace_id,b.harness,b.session_id,v_id,true)
   ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET authority_id=EXCLUDED.authority_id,ready=true;
  IF cur IS NOT NULL THEN
@@ -1635,14 +1676,23 @@ BEGIN
  UPDATE sessions.ingest_history_scope_versions SET source_fingerprint=v_fp WHERE authority_id=v_id;
  -- 610 compose point: the feature journal append is atomic with the pointer CAS above;
  -- any later failure or rollback of this transaction emits nothing.
- PERFORM sessions.canonical_feature_changed(
+ -- Replacement emits retire(prior authority, prior inventory) then publish(new authority, new
+ -- inventory): two consecutive revisions, both or neither.
+ SELECT sessions.canonical_feature_changed(
   jsonb_build_object('orgId',b.org_id,'workspaceId',b.workspace_id,'harness',b.harness,'sessionId',b.session_id,'generation',b.generation),
-  jsonb_build_object('epoch',v_epoch::text,'fingerprint',v_fp),
-  CASE WHEN cur IS NULL THEN NULL ELSE(SELECT jsonb_build_object('epoch',pv.source_epoch::text,'fingerprint',pv.source_fingerprint)
-   FROM sessions.ingest_history_scope_versions pv WHERE pv.authority_id=cur)END,
-  jsonb_build_object('hash',v_ptr,'count',jsonb_array_length(coalesce(v_snapshot->'pointers','[]'::jsonb))::text));
+  jsonb_build_object('authorityId',v_id::text,'epoch',v_epoch::text,'fingerprint',v_fp),
+  CASE WHEN cur IS NULL THEN NULL ELSE jsonb_build_object('authorityId',prior.authority_id::text,'epoch',prior.source_epoch::text,'fingerprint',prior.source_fingerprint)END,
+  jsonb_build_object('authorityId',v_id::text,'hash',v_ptr,'count',jsonb_array_length(v_pointers)::text),
+  CASE WHEN cur IS NULL THEN NULL ELSE jsonb_build_object('authorityId',prior.authority_id::text,'hash',prior.pointer_snapshot_sha256,'count',prior.pointer_count::text)END)
+  INTO v_rev;
+ -- The publish revision is the installed current revision.
+ UPDATE sessions.ingest_history_scope_versions SET feature_revision=v_rev WHERE authority_id=v_id;
  UPDATE sessions.ingest_history_scope_builds SET state='installed',installed_authority_id=v_id,updated_at=clock_timestamp()WHERE build_id=b.build_id;
  RETURN jsonb_build_object('installed',true,'authorityId',v_id,'retiredAuthorityId',cur,
-  'source',jsonb_build_object('epoch',v_epoch::text,'fingerprint',v_fp),'maskSha256',m.sha256,'recordCount',m.record_count::text);
+  'source',jsonb_build_object('epoch',v_epoch::text,'fingerprint',v_fp),'maskSha256',m.sha256,'recordCount',m.record_count::text,
+  'featureRevision',v_rev::text);
 END $scopeinstall$;
+-- CREATE FUNCTION grants EXECUTE to PUBLIC by default: close it before granting the ingest role.
+REVOKE ALL ON FUNCTION sessions.ingest_history_scope_build_locked(jsonb,text),sessions.ingest_history_scope_begin(jsonb),sessions.ingest_history_scope_build_keys(jsonb),
+ sessions.ingest_history_scope_capture(jsonb),sessions.ingest_history_scope_install(jsonb)FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest_seeder;
 GRANT EXECUTE ON FUNCTION sessions.ingest_history_scope_begin(jsonb),sessions.ingest_history_scope_build_keys(jsonb),sessions.ingest_history_scope_capture(jsonb),sessions.ingest_history_scope_install(jsonb)TO bulls96_session_ingest;

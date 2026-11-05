@@ -32,6 +32,7 @@ beforeAll(async () => {
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await pool.query(read("supabase/migrations/" + f));
   await pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now())");
   await pool.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status)VALUES('session_directory_search_worker',$1,'pass')", [gen]);
+  await pool.query("SELECT sessions.canonical_feature_journal_seed(1000,$1)", [gen]);
 });
 afterAll(async () => { if (!url) return; await pool?.end(); await admin.query("DROP DATABASE IF EXISTS " + name); await admin.end(); });
 async function asIngest<T>(c: pg.PoolClient, work: () => Promise<T>, commit = true): Promise<T> {
@@ -117,4 +118,43 @@ test.skipIf(!url)("parallel installs of different scopes get distinct, gap-free 
     const revs = (await pool.query("SELECT revision::int r FROM sessions.canonical_feature_journal WHERE revision>$1 ORDER BY revision", [before])).rows.map((x) => x.r);
     expect(revs).toEqual(Array.from({ length: 6 }, (_, i) => before + 1 + i));
   } finally { for (const c of cs) c.release(); }
+});
+
+const kinds = async (org: string) => (await pool.query("SELECT kind FROM sessions.canonical_feature_journal WHERE org_id=$1 ORDER BY revision", [org])).rows.map((x) => x.kind);
+const installNow = async (s: Awaited<ReturnType<typeof scope>>, g?: string) => { const b = await captured(s); const c = await pool.connect(); try { return await asIngest(c, () => call(c, "ingest_history_scope_install", installArgs(b, s, g))); } finally { c.release(); } };
+
+test.skipIf(!url)("an uncommitted replacement exposes neither half of the pair; commit exposes both, in order", async () => {
+  const s = await scope();
+  await installNow(s);
+  const b = await captured(s), c = await pool.connect();
+  try {
+    await c.query("BEGIN; SET LOCAL ROLE bulls96_session_ingest");
+    await call(c, "ingest_history_scope_install", installArgs(b, s, "22222222-2222-2222-2222-222222222222"));
+    expect(await kinds(s.identity.orgId)).toEqual(["publish"]);       // another session sees no partial pair
+    await c.query("COMMIT");
+  } finally { c.release(); }
+  expect(await kinds(s.identity.orgId)).toEqual(["publish", "retire", "publish"]);
+});
+
+test.skipIf(!url)("parallel installs of one replacement build: exactly one wins and exactly one retire/publish pair is written", async () => {
+  const s = await scope();
+  await installNow(s);
+  const b = await captured(s), cs = await Promise.all([0, 1, 2, 3].map(() => pool.connect()));
+  try {
+    const results = await Promise.allSettled(cs.map((c, i) => asIngest(c, () => call(c, "ingest_history_scope_install", installArgs(b, s, "3333333" + i + "-3333-3333-3333-333333333333")))));
+    expect(results.filter((r) => r.status === "fulfilled").length).toBe(1);
+  } finally { for (const c of cs) c.release(); }
+  expect(await kinds(s.identity.orgId)).toEqual(["publish", "retire", "publish"]);
+});
+
+test.skipIf(!url)("erase then re-enable: the stale build refuses with no rows; a fresh build replaces with one ordered pair", async () => {
+  const s = await scope();
+  await installNow(s);
+  const stale = await captured(s);
+  await pool.query("SELECT sessions.ingest_history_invalidate_scope($1,$2,$3,$4)", [s.identity.orgId, s.identity.workspaceId, "claude", s.identity.sessionId]);
+  const c = await pool.connect();
+  try { await expect(asIngest(c, () => call(c, "ingest_history_scope_install", installArgs(stale, s)))).rejects.toThrow(); } finally { c.release(); }
+  expect(await kinds(s.identity.orgId)).toEqual(["publish"]);
+  await installNow(s, "44444444-4444-4444-4444-444444444444");
+  expect(await kinds(s.identity.orgId)).toEqual(["publish", "retire", "publish"]);
 });

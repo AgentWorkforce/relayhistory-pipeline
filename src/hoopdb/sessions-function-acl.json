@@ -17,7 +17,19 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
-    "sessions.canonical_feature_changed(jsonb,jsonb,jsonb,jsonb)": [
+    "sessions.canonical_feature_changed(jsonb,jsonb,jsonb,jsonb,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_feature_image_key(jsonb,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_feature_journal_seed(bigint,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_feature_pointer_set_valid(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_feature_source_valid(jsonb)": [
       "<owner>:EXECUTE"
     ],
     "sessions.canonical_remote(text)": [
@@ -281,7 +293,13 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_history_scope_pointer_page(uuid,integer,integer)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_history_scope_required(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_scope_version_frozen()": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_history_source_current(jsonb,boolean)": [

@@ -9,6 +9,7 @@ END $rollback_guard$;
 DROP TRIGGER IF EXISTS ingest_history_pointer_sync ON sessions.session_index;
 DROP TRIGGER IF EXISTS ingest_history_native_insert ON sessions.ingest_lazy_native_slots;
 DROP TRIGGER IF EXISTS ingest_history_native_update ON sessions.ingest_lazy_native_slots;
+DROP TRIGGER IF EXISTS ingest_history_scope_version_frozen ON sessions.ingest_history_scope_versions;
 DROP TRIGGER IF EXISTS ingest_history_control_changed ON sessions.ingest_control_receipts;
 DROP TRIGGER IF EXISTS ingest_history_directory_state ON sessions.session_directory;
 CREATE OR REPLACE FUNCTION sessions.session_replay_source_snapshot(p_org text,p_workspace text,p_harness text,p_session text)
@@ -301,6 +302,8 @@ DROP FUNCTION IF EXISTS
  sessions.session_history_mask_page(jsonb),
  sessions.session_history_source_lock(jsonb),
  sessions.ingest_history_source_current(jsonb,boolean),
+ sessions.ingest_history_scope_pointer_page(uuid,integer,integer),
+ sessions.ingest_history_scope_version_frozen(),
  sessions.ingest_history_mask_rows(text,bigint,integer),
  sessions.ingest_history_mask_register(jsonb),
  sessions.ingest_history_scope_required(text,text,text,text),
