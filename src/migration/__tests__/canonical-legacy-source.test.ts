@@ -139,9 +139,14 @@ test("exports and reads actual legacy row plus explicit empty-table coverage thr
   });
 });
 
-test("erasure guard retains a legacy-only group even with no catalog or rollup", async () => {
-  expect(await groupExistsInNeon(db, "org_1", "sess:1")).toBe(true);
-  expect(await groupExistsInNeon(db, "other-org", "sess:1")).toBe(false);
+test("erasure guard ignores a legacy-only group unless legacy recognition is switched on", async () => {
+  expect(await groupExistsInNeon(db, "org_1", "sess:1")).toBe(false);
+  expect(await groupExistsInNeon(db, "org_1", "sess:1", false)).toBe(false);
+});
+
+test("erasure guard retains a legacy-only group with legacy recognition on, even with no catalog or rollup", async () => {
+  expect(await groupExistsInNeon(db, "org_1", "sess:1", true)).toBe(true);
+  expect(await groupExistsInNeon(db, "other-org", "sess:1", true)).toBe(false);
 });
 
 test("nonempty links and outcomes preserve exact source IDs, timestamp and metadata", async () => {

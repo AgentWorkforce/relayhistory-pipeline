@@ -2,11 +2,5 @@
   // The Node side of the tests: vitest config and globalSetup run in Node, not workerd.
   "extends": "./tsconfig.json",
   "compilerOptions": { "types": ["node"] },
-  "include": [
-    "vitest.config.ts",
-    "test/global-setup.ts",
-    "test/artifact-capacity-setup.ts",
-    "vitest.artifact-capacity.config.ts",
-    "scripts"
-  ]
+  "include": ["vitest.config.ts", "test/global-setup.ts", "scripts"]
 }

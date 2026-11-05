@@ -25,7 +25,19 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
-    "sessions.canonical_feature_changed(jsonb,jsonb,jsonb,jsonb)": [
+    "sessions.canonical_feature_changed(jsonb,jsonb,jsonb,jsonb,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_feature_image_key(jsonb,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_feature_journal_seed(bigint,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_feature_pointer_set_valid(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.canonical_feature_source_valid(jsonb)": [
       "<owner>:EXECUTE"
     ],
     "sessions.canonical_remote(text)": [
@@ -194,6 +206,9 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_history_active()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_history_control_changed()": [
       "<owner>:EXECUTE"
     ],
@@ -201,6 +216,12 @@
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_history_enqueue_graph(text,text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_fence_builds(uuid[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_invalidate_installed()": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_history_invalidate_scope(text,text,text,text)": [
@@ -228,6 +249,9 @@
     "sessions.ingest_history_inventory_refs(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_live()": [
+      "<owner>:EXECUTE"
     ],
     "sessions.ingest_history_mask_get(jsonb)": [
       "<owner>:EXECUTE",
@@ -268,6 +292,12 @@
     "sessions.ingest_history_pointer(sessions.session_index)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_history_pointer_ref_backfill(jsonb,integer)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_reconcile_backfill(text,integer)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_history_require_model_permit(jsonb)": [
       "<owner>:EXECUTE"
     ],
@@ -293,13 +323,32 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_history_scope_managed(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_scope_pointer_page(uuid,integer,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_canonical_feature_producer:EXECUTE"
+    ],
     "sessions.ingest_history_scope_required(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_scope_version_frozen()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_set_live(boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_set_pointer_tracking(boolean)": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_history_source_current(jsonb,boolean)": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_history_sync_pointer()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_tracking()": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_identifier(jsonb,boolean)": [

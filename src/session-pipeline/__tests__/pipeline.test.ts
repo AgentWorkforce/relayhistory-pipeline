@@ -202,7 +202,6 @@ function fakeSupabase(live: () => string[], busy: () => boolean = () => false, c
     async query<R>(text: string) {
       calls.push(text.trim().replace(/\s+/g, " "));
       if (text.includes("pg_try_advisory_xact_lock")) return { rows: [{ ok: !busy() }] as R[] };
-      if (text.includes(" AS managed")) return {rows:[{managed:false}]as R[]};
       if (text.includes("event_projection_sources")) return { rows: [{ written: true }] as R[] };
       if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
         return { rows: live().map((manifest_key) => ({ manifest_key, canonical_id:canonicalId() })) as R[] };

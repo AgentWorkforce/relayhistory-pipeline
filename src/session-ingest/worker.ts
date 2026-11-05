@@ -206,6 +206,7 @@ export default {
         inlineMaxSessions: settings.inlineMaxSessions,
         fanout: (messages) => env.INGEST_FANOUT!.sendBatch(messages.map((body) => ({ body }))),
       },
+      onboarding: { run },
     });
     try {
       return await app.fetch(request);

@@ -271,7 +271,7 @@ function eventTime(record: RelayhistoryStreamRecord): number {
 const LEGACY_RECORD_KINDS = new Set([
   "legacy_conversation_turn", "legacy_session_link", "legacy_session_outcome", "legacy_scope",
 ]);
-export const isLegacyRelayhistoryRecord = (record: Pick<RelayhistoryStreamRecord,"kind">) => LEGACY_RECORD_KINDS.has(record.kind);
+export const isLegacyRelayhistoryRecord = (record: RelayhistoryStreamRecord) => LEGACY_RECORD_KINDS.has(record.kind);
 function recordKey(record: RelayhistoryStreamRecord): string {
   return JSON.stringify(isLegacyRelayhistoryRecord(record)
     ? [record.origin_id, record.record_id, record.kind]
@@ -337,11 +337,11 @@ function receivedFirst(
  * lock carries an older stamp than the write it follows. Contenders without
  * `accepted_seq` are refused rather than guessed at.
  */
-export function newestRelayhistoryAcrossOrigins<T extends Pick<RelayhistoryStreamRecord,"kind"|"record_id"|"accepted_seq">>(
-  records: Iterable<T>,
-): T[] {
-  const out: T[] = [];
-  const contenders = new Map<string,T[]>();
+function newestAcrossOrigins(
+  records: Iterable<RelayhistoryStreamRecord>,
+): RelayhistoryStreamRecord[] {
+  const out: RelayhistoryStreamRecord[] = [];
+  const contenders = new Map<string, RelayhistoryStreamRecord[]>();
   for (const record of records) {
     // Server-exported legacy tables have independent primary-key domains and
     // no delivery acceptance ledger. Never make them contend with delivery IDs.
@@ -358,10 +358,10 @@ export function newestRelayhistoryAcrossOrigins<T extends Pick<RelayhistoryStrea
 }
 
 /** The later accepted of two contenders, by the source's ledger alone. */
-export function lastAccepted<T extends Pick<RelayhistoryStreamRecord,"accepted_seq">>(
-  left:T,
-  right:T,
-):T {
+export function lastAccepted(
+  left: RelayhistoryStreamRecord,
+  right: RelayhistoryStreamRecord,
+): RelayhistoryStreamRecord {
   if (left.accepted_seq === undefined || right.accepted_seq === undefined)
     fail(
       "relayhistory_acceptance_missing",
@@ -406,7 +406,7 @@ export function normalizeRelayhistoryRecords(
     const key = recordKey(record);
     latest.set(key, chooseRelayhistoryRevision(latest.get(key), record, sameRecord));
   }
-  return newestRelayhistoryAcrossOrigins(latest.values())
+  return newestAcrossOrigins(latest.values())
     .filter((record) => record.operation === "upsert" && record.payload !== null)
     .sort((left, right) => eventTime(left) - eventTime(right) ||
       compareText(left.origin_id, right.origin_id) || compareText(left.record_id, right.record_id));
@@ -771,9 +771,3 @@ export class RelayhistoryExportTransform implements SessionTransform {
     };
   }
 }
-
-
-// Shared exact JSON boundary for canonical artifacts and trusted Node model
-// consumers. These are the SAME raw parser/encoder; no PostgreSQL JSONB hash or
-// new normalization rule is introduced.
-export {parseExact as parseRelayhistoryJsonExact,encoded as encodeRelayhistoryJsonExact};

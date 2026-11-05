@@ -352,12 +352,11 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105024000_session_brief_documents.sql`          | table sessions.session_brief_document_outbox                                                                            |
 | `upstream:20261104022000_session_ingest_ledger.sql`            | table sessions.ingest_batches                                                                                           |
 | `upstream:20261104021000_session_directory_event_metadata.sql` | table sessions.session_directory_event_times |
-| `upstream:20261104056000_session_replay_pages.sql` | table sessions.session_replay_publications |
-| `upstream:20261104057000_session_large_read_jobs.sql` | table sessions.session_large_read_jobs |
-| `upstream:20261104058000_session_desktop_catalog.sql` | column sessions.session_directory.catalog_read_version |
-| `upstream:20261104059000_session_analysis_publications.sql` | table sessions.session_analysis_publications |
+| `upstream:20261105020000_session_replay_pages.sql` | table sessions.session_replay_publications |
+| `upstream:20261105021000_session_large_read_jobs.sql` | table sessions.session_large_read_jobs |
+| `upstream:20261105022000_session_desktop_catalog.sql` | column sessions.session_directory.catalog_read_version |
+| `upstream:20261105023000_session_analysis_publications.sql` | table sessions.session_analysis_publications |
 | `upstream:20261102020000_session_brief_state.sql`              | ALTER-only: column sessions.session_briefs.state                                                                        |
-| `upstream:20261104021000_session_directory_event_metadata.sql` | table sessions.session_directory_event_times                                                                            |
 | `upstream:20261104020000_auth_sessions.sql`                    | table sessions.auth_sessions                                                                                            |
 | `upstream:20261104020100_auth_session_verify.sql`              | table sessions.auth_token_verifier_policy                                                                               |
 | `upstream:20261104030000_ingest_fence_ownership.sql`           | table sessions.ingest_session_ownership                                                                                  |
@@ -369,8 +368,8 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261104055000_lazy_current_custody.sql` | table sessions.ingest_lazy_policy |
 | `upstream:20261104054000_ingest_custody_baseline.sql` | table sessions.ingest_custody_imports |
 | `upstream:20261104053000_ingest_first_ack_seats.sql` | table sessions.ingest_receipt_seat_clock |
-| `upstream:20261104061000_canonical_feature_journal.sql` | table sessions.canonical_feature_journal |
-| `upstream:20261104062000_canonical_history_lineage.sql` | table sessions.ingest_history_carriers |
+| `upstream:20261105025000_canonical_feature_journal.sql` | table sessions.canonical_feature_journal |
+| `upstream:20261105026000_canonical_history_lineage.sql` | table sessions.ingest_history_carriers |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
