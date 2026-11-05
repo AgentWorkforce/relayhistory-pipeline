@@ -29,18 +29,37 @@ CREATE INDEX canonical_feature_journal_kind_rev
 CREATE INDEX canonical_feature_journal_org_time
   ON sessions.canonical_feature_journal (org_id, recorded_at);
 
--- Companion producer-side state (the consumer's own ledger — NOT the journal).
+-- Companion producer-side state — REVISION-keyed page-chain ledger.
+-- A retire's image_key equals its prior publish's, so progress identity is
+-- the unique journal revision (kind+image bound), never image_key alone.
 CREATE TABLE sessions.canonical_feature_page_ack(
-  image_key text NOT NULL, pool text NOT NULL, cursor text NOT NULL,
-  page_sha256 text NOT NULL,
+  entry_revision bigint NOT NULL
+    REFERENCES sessions.canonical_feature_journal(revision),
+  kind text NOT NULL CHECK (kind IN ('publish','retire')),
+  pool text NOT NULL CHECK (pool IN ('event','brief')),
+  cursor text NOT NULL,
+  next_cursor text,                     -- NULL = terminal page
+  page_sha256 text NOT NULL CHECK (page_sha256 ~ '^[0-9a-f]{64}$'),
   acked_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (image_key, pool, cursor));
+  PRIMARY KEY (entry_revision, pool, cursor));
+-- Page state: one dirty row per journal entry; finish CAS binds the captured
+-- authority/profile and refuses on drift or a second finish.
 CREATE TABLE sessions.canonical_feature_copy_state(
-  image_key text PRIMARY KEY, entry_revision text NOT NULL,
-  terminal_event text, terminal_brief text,
-  source_authority jsonb, profile_binding text,
-  finished boolean NOT NULL DEFAULT false);
+  entry_revision bigint PRIMARY KEY
+    REFERENCES sessions.canonical_feature_journal(revision),
+  kind text NOT NULL CHECK (kind IN ('publish','retire')),
+  image_key text NOT NULL,
+  source_authority jsonb NOT NULL, pointer_set jsonb NOT NULL,
+  profile_binding text NOT NULL,
+  dirty boolean NOT NULL DEFAULT true);
 REVOKE ALL ON sessions.canonical_feature_page_ack,
   sessions.canonical_feature_copy_state
   FROM PUBLIC,anon,authenticated,service_role,
   bulls96_session_ingest,bulls96_session_ingest_seeder;
+-- Producer progress role: SELECT on journal, write ONLY the progress tables
+-- (never the journal or creator authority). OWNER-ONLY RPC boundary pending.
+GRANT SELECT ON sessions.canonical_feature_journal
+  TO bulls96_canonical_feature_producer;
+GRANT INSERT,SELECT,UPDATE(dirty) ON sessions.canonical_feature_page_ack,
+  sessions.canonical_feature_copy_state
+  TO bulls96_canonical_feature_producer;

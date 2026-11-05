@@ -2,63 +2,91 @@ import { describe, expect, test } from "bun:test";
 import { CanonicalPageAckStore } from "../canonical-ack-store.ts";
 
 const fakeDb = () => {
-  const ack: Record<string, unknown>[] = [];
+  const page: Record<string, unknown>[] = [];
   const state: Record<string, unknown>[] = [];
   const query = async <T>(text: string, params: unknown[] = []) => {
     if (text.includes("canonical_feature_page_ack") && text.startsWith("INSERT")) {
-      if (!ack.some((a) => a.cursor === params[2] && a.pool === params[1]))
-        ack.push({ image_key: params[0], pool: params[1], cursor: params[2],
-          page_sha256: params[3] });
-      return { rows: [] as T[] };
+      const dup = page.find((p) => p.entry_revision === params[0] &&
+        p.pool === params[2] && p.cursor === params[3]);
+      if (dup) return { rows: [] as T[] };
+      page.push({ entry_revision: params[0], kind: params[1], pool: params[2],
+        cursor: params[3], next_cursor: params[4], page_sha256: params[5] });
+      return { rows: [{ n: 1 } as T] };
     }
     if (text.includes("canonical_feature_page_ack"))
-      return { rows: ack.filter((a) => a.image_key === params[0] &&
-        a.pool === params[1]) as T[] };
-    if (text.includes("canonical_feature_copy_state") && text.startsWith("SELECT"))
-      return { rows: state.filter((s) => s.image_key === params[0])
-        .map((s) => ({ finished: s.finished })) as T[] };
-    if (text.includes("canonical_feature_copy_state") && text.includes("INSERT")) {
-      const existing = state.find((s) => s.image_key === params[0]);
-      if (!existing) {
-        state.push({ image_key: params[0], finished: true,
-          source_authority: params[4], profile_binding: params[5] });
+      return { rows: page.filter((p) => p.entry_revision === params[0] &&
+        p.pool === params[1]) as T[] };
+    if (text.includes("canonical_feature_copy_state") && text.startsWith("INSERT")) {
+      if (!state.some((s) => s.entry_revision === params[0]))
+        state.push({ entry_revision: params[0], kind: params[1],
+          image_key: params[2], source_authority: params[3],
+          pointer_set: params[4], profile_binding: params[5], dirty: true });
+      return { rows: [] as T[] };
+    }
+    if (text.includes("canonical_feature_copy_state") && text.includes("UPDATE")) {
+      const s = state.find((r) => r.entry_revision === params[0]);
+      if (s && s.dirty && s.source_authority === params[1] &&
+          s.profile_binding === params[2]) {
+        s.dirty = false;
         return { rows: [{ n: 1 } as T] };
       }
-      if (existing.finished || existing.source_authority !== params[4] ||
-          existing.profile_binding !== params[5])
-        return { rows: [] as T[] };   // CAS conflict
-      existing.finished = true;
-      return { rows: [{ n: 1 } as T] };
+      return { rows: [] as T[] };
     }
     return { rows: [] as T[] };
   };
-  return { ack, state, query };
+  return { page, state, query };
 };
-const entry = { kind: "publish" as const, revision: "10", imageKey: "i",
-  schemaGeneration: "g", sourceHash: "a".repeat(64),
-  scope: { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s",
-           generation: "a".repeat(64) },
-  sourceAuthority: { authorityId: "u", epoch: "1", fingerprint: "a".repeat(64) },
-  pointerSet: { authorityId: "u", hash: "p".repeat(64), count: "1" } };
 const AUTH = { authorityId: "u", epoch: "1", fingerprint: "a".repeat(64) };
-describe("canonical page ack store", () => {
-  test("ackPage idempotent + ackedCursors + resume", async () => {
+const PTR = { authorityId: "u", hash: "c".repeat(64), count: "1" };
+const SCOPE = { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s",
+  generation: "a".repeat(64) };
+const pub = (rev: string) => ({ kind: "publish" as const, revision: rev,
+  imageKey: "img", schemaGeneration: "g", sourceHash: "a".repeat(64),
+  scope: SCOPE, sourceAuthority: AUTH, pointerSet: PTR });
+const ret = (rev: string) => ({ kind: "retire" as const, revision: rev,
+  imageKey: "img", schemaGeneration: "g", sourceHash: "b".repeat(64),
+  priorKeysetHash: "c".repeat(64), scope: SCOPE,
+  priorSourceAuthority: AUTH, pointerSet: PTR });
+describe("revision-keyed page ack store", () => {
+  test("publish and retire on the SAME image key have disjoint progress", async () => {
     const db = fakeDb();
     const s = new CanonicalPageAckStore({ query: db.query });
-    await s.ackPage({ entry, kind: "event", cursor: "p1", pageSha256: "h1" });
-    await s.ackPage({ entry, kind: "event", cursor: "p1", pageSha256: "h1" }); // idempotent
-    await s.ackPage({ entry, kind: "brief", cursor: "b1", pageSha256: "h2" });
-    expect(await s.ackedCursors(entry, "event")).toEqual(["p1"]);
-    const r = await s.resume(entry);
-    expect(r.event).toBe("p1"); expect(r.brief).toBe("b1");
+    const p = pub("10"), r = ret("11");
+    await s.begin(p, "pb"); await s.begin(r, "pb");
+    await s.ackPage({ entry: p, kind: "event", cursor: "c1",
+      pageSha256: "h1".padEnd(64,"1"), nextCursor: "c2" });
+    await s.ackPage({ entry: r, kind: "event", cursor: "c1",
+      pageSha256: "h2".padEnd(64,"2"), nextCursor: null });
+    // same image key, different revisions — the chains do not collide
+    expect(db.page.filter((x) => x.entry_revision === "10").length).toBe(1);
+    expect(db.page.filter((x) => x.entry_revision === "11").length).toBe(1);
   });
-  test("finish CAS: first succeeds, repeat refuses, changed binding refuses", async () => {
+  test("ack replay is idempotent only when the page matches exactly", async () => {
     const db = fakeDb();
     const s = new CanonicalPageAckStore({ query: db.query });
-    await s.finish({ entry, terminalEvent: "te", terminalBrief: "tb",
+    const p = pub("10");
+    await s.begin(p, "pb");
+    await s.ackPage({ entry: p, kind: "event", cursor: "c1",
+      pageSha256: "h".padEnd(64,"1"), nextCursor: null });
+    // identical replay — no-op
+    await s.ackPage({ entry: p, kind: "event", cursor: "c1",
+      pageSha256: "h".padEnd(64,"1"), nextCursor: null });
+    expect(db.page.length).toBe(1);
+    // same cursor, different page hash — refuse
+    await expect(s.ackPage({ entry: p, kind: "event", cursor: "c1",
+      pageSha256: "h".padEnd(64,"9"), nextCursor: null }))
+      .rejects.toThrow("ack_mismatch");
+  });
+  test("finish CAS: binds authority+profile, refuses drift/second finish", async () => {
+    const db = fakeDb();
+    const s = new CanonicalPageAckStore({ query: db.query });
+    const p = pub("10");
+    await s.begin(p, "pb");
+    await s.finish({ entry: p, terminalEvent: "te", terminalBrief: "tb",
       sourceAuthority: AUTH, profileBinding: "pb" });
-    await expect(s.finish({ entry, terminalEvent: "te", terminalBrief: "tb",
+    // second finish — the row is no longer dirty
+    await expect(s.finish({ entry: p, terminalEvent: "te", terminalBrief: "tb",
       sourceAuthority: AUTH, profileBinding: "pb" }))
-      .rejects.toThrow("already_finished");
+      .rejects.toThrow("finish_cas");
   });
 });
