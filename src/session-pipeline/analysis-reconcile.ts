@@ -3,10 +3,16 @@
 import type {ArtifactIdentity} from "../session-read-api/canonical-artifact.ts";
 import type {ReadonlyAnalysisSource} from "./analysis-snapshot.ts";
 import {ANALYSIS_NAMESPACE_SOURCES_SQL} from "./analysis-scope.ts";
+import {log} from "../shared/log.ts";
+/** Stable reasons for a per-key refusal that is logged and skipped, never retried by the scan. */
+export type AnalysisReconcileRefusal="namespace_fanout_bound"|"enqueue_invalid_scope";
+/** Deterministic per-key refusals: 22023 from the demand function (non-canonical
+ * physical id, out-of-range scope). Anything else is transient and replays the cursor. */
+const refusedEnqueue=(error:unknown)=>(error as {code?:unknown}|null)?.code==="22023";
 export type AnalysisReconcileCursor=[string,string,string];
 export function checkedAnalysisCursor(value:unknown):AnalysisReconcileCursor|undefined{if(value===undefined)return undefined;if(!Array.isArray(value)||value.length!==3||value.some(v=>typeof v!=="string"||!v||v.length>512))throw new Error("analysis reconcile: invalid cursor");return value as AnalysisReconcileCursor}
 type Key={org_id:string;workspace_id:string;session_id:string};
-export async function reconcileAnalysisPage(deps:{source:ReadonlyAnalysisSource;enqueue:(identity:ArtifactIdentity)=>Promise<unknown>},options:{cursor?:AnalysisReconcileCursor;pageSize?:number;maxMs?:number;now?:()=>number}={}){
+export async function reconcileAnalysisPage(deps:{source:ReadonlyAnalysisSource;enqueue:(identity:ArtifactIdentity)=>Promise<unknown>;onRefused?:(reason:AnalysisReconcileRefusal,key:{orgId:string;workspaceId:string;sessionId:string;source?:string})=>void},options:{cursor?:AnalysisReconcileCursor;pageSize?:number;maxMs?:number;now?:()=>number}={}){
  const pageSize=options.pageSize??50;if(!Number.isInteger(pageSize)||pageSize<1||pageSize>100)throw new Error("analysis reconcile: invalid page size");const cursor=checkedAnalysisCursor(options.cursor);
  const now=options.now??Date.now,maxMs=options.maxMs??240000;if(!Number.isFinite(maxMs)||maxMs<1||maxMs>240000)throw new Error("analysis reconcile: invalid time budget");const stop=now()+maxMs;
  return deps.source.snapshot(async db=>{const {rows}=await db.query<Key>(`WITH candidates AS(
@@ -16,26 +22,30 @@ export async function reconcileAnalysisPage(deps:{source:ReadonlyAnalysisSource;
  AND length(org_id) BETWEEN 1 AND 512 AND btrim(org_id)<>'' AND length(workspace_id) BETWEEN 1 AND 512 AND btrim(workspace_id)<>'' AND length(session_id) BETWEEN 1 AND 512 AND btrim(session_id)<>''
  AND($1::text IS NULL OR(org_id COLLATE "C",workspace_id COLLATE "C",session_id COLLATE "C")>($1::text COLLATE "C",$2::text COLLATE "C",$3::text COLLATE "C"))
  ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",session_id COLLATE "C" LIMIT $4`,[...(cursor??[null,null,null]),pageSize+1]);
- let scanned=0,accepted=0,unavailable=0,invalidScope=0;
+ let scanned=0,accepted=0,unavailable=0,invalidScope=0,refused=0;
+ const refuse=deps.onRefused??((reason,key)=>log.warn("analysis reconcile key refused",{stage:"analysis-cache",reason,org_id:key.orgId,workspace_id:key.workspaceId,session_id:key.sessionId,harness:key.source}));
  let last:Key|undefined;
  for(const k of rows.slice(0,pageSize)){
   if(now()>=stop)break;
   const providers=(await db.query<{source:string}>(`SELECT source FROM (${ANALYSIS_NAMESPACE_SOURCES_SQL}) scoped ORDER BY source COLLATE "C" LIMIT 9`,[k.org_id,k.session_id,k.workspace_id])).rows.map(r=>r.source);
-  if(providers.length>8)throw new Error("analysis reconcile: namespace fanout bound");
+  // Refuse the whole key rather than acknowledge a truncated fanout; log and advance
+  // so one oversized key cannot block discovery of every key after it.
+  if(providers.length>8){refused++;refuse("namespace_fanout_bound",{orgId:k.org_id,workspaceId:k.workspace_id,sessionId:k.session_id});scanned++;last=k;continue}
   if(!providers.length)invalidScope++;
   for(const source of providers){
    if(!/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(source)){invalidScope++;continue}
    const scope:ArtifactIdentity={orgId:k.org_id,workspaceId:k.workspace_id,source,sessionId:k.session_id};
-   const ack=await deps.enqueue(scope) as {accepted?:unknown};
+   let ack:{accepted?:unknown};
+   try{ack=await deps.enqueue(scope) as {accepted?:unknown}}catch(error){if(!refusedEnqueue(error))throw error;refused++;refuse("enqueue_invalid_scope",{orgId:k.org_id,workspaceId:k.workspace_id,sessionId:k.session_id,source});continue}
    if(typeof ack?.accepted!=="boolean")throw new Error("analysis reconcile: invalid durable enqueue acknowledgement");
    if(ack.accepted)accepted++;else unavailable++;
   }
   // Advance only after this exact key is durably acknowledged or explicitly
-  // classified unavailable/invalid. Failures replay the same input cursor.
+  // classified unavailable/invalid/refused. Other failures replay the same input cursor.
   scanned++;last=k;
  }
  const hasMore=scanned<rows.length;
  if(hasMore&&!last)throw new Error("analysis reconcile: budget exhausted before progress");
- return {scanned,accepted,unavailable,invalidScope,nextCursor:hasMore&&last?[last.org_id,last.workspace_id,last.session_id] as AnalysisReconcileCursor:undefined,complete:!hasMore};
+ return {scanned,accepted,unavailable,invalidScope,refused,nextCursor:hasMore&&last?[last.org_id,last.workspace_id,last.session_id] as AnalysisReconcileCursor:undefined,complete:!hasMore};
  });
 }

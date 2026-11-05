@@ -499,7 +499,7 @@ export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok:
     const started=Date.now();try{const rt=await ready();const analysis=analysisDeps(rt);
       const page=await reconcileAnalysisPage({source:analysis.source,enqueue:identity=>enqueueAnalysisScope(analysis,identity)},{cursor:checkedAnalysisCursor(event.analysisCursor)});
       if(page.nextCursor)await invokeAsync({region:rt.env.region,functionName:process.env.AWS_LAMBDA_FUNCTION_NAME??"",payload:JSON.stringify({analysisCacheReconcile:true,analysisCursor:page.nextCursor}),credentials:lambdaCredentials()});
-      log.info("analysis cache reconcile page",{stage:"analysis-cache",count:page.scanned,enqueued:page.accepted,skipped:page.unavailable,failed:page.invalidScope,ok:page.unavailable===0&&page.invalidScope===0,reason:page.complete?"scan_complete":"continuation",duration_ms:Date.now()-started});return {ok:true};
+      log.info("analysis cache reconcile page",{stage:"analysis-cache",count:page.scanned,enqueued:page.accepted,skipped:page.unavailable,failed:page.invalidScope+page.refused,ok:page.unavailable===0&&page.invalidScope===0&&page.refused===0,reason:page.complete?"scan_complete":"continuation",duration_ms:Date.now()-started});return {ok:true};
     }catch(error){log.error("analysis cache reconcile failed",{stage:"analysis-cache",...errorFields(error),duration_ms:Date.now()-started});throw new Error("analysis cache reconcile failed");}
   }
   if(event?.analysisCache===true){
