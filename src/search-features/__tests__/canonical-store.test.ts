@@ -62,14 +62,15 @@ const fakeDb = () => {
 };
 const pub = (rev: string, key = HS1_KEY) => ({
   kind: "publish" as const, revision: rev, imageKey: key,
-  schemaGeneration: "d".repeat(64), sourceHash: "a".repeat(64),
+  schemaGeneration: "a".repeat(64), sourceHash: "a".repeat(64),
   scope: JSON.parse(SCOPE), sourceAuthority: JSON.parse(AUTH),
   pointerSet: JSON.parse(PTR),
 });
 const ret = (rev: string) => ({
   kind: "retire" as const, revision: rev, imageKey: HS1_KEY,
-  schemaGeneration: "d".repeat(64), sourceHash: "b".repeat(64),
-  priorKeysetHash: "c".repeat(64),
+  schemaGeneration: "a".repeat(64),
+  sourceHash: JSON.parse(AUTH).fingerprint,   // prior fingerprint
+  priorKeysetHash: JSON.parse(PTR).hash,      // == pointerSet.hash
   scope: JSON.parse(SCOPE), priorSourceAuthority: JSON.parse(AUTH),
   pointerSet: JSON.parse(PTR),
 });
@@ -86,7 +87,7 @@ describe("canonical journal store", () => {
     // PG/PGlite drivers return jsonb as parsed objects, not strings.
     const objRow = {
       revision: "10", kind: "publish", imageKey: HS1_KEY,
-      schemaGeneration: "d".repeat(64), sourceHash: "a".repeat(64),
+      schemaGeneration: "a".repeat(64), sourceHash: "a".repeat(64),
       scope: JSON.parse(SCOPE),               // OBJECT, not string
       sourceAuthority: JSON.parse(AUTH),      // OBJECT
       pointerSet: JSON.parse(PTR),            // OBJECT
@@ -96,7 +97,7 @@ describe("canonical journal store", () => {
     expect(out.entries[0]!.kind).toBe("publish");
     const retireObj = {
       revision: "20", kind: "retire", imageKey: HS1_KEY,
-      schemaGeneration: "d".repeat(64), sourceHash: "a".repeat(64),
+      schemaGeneration: "a".repeat(64), sourceHash: "a".repeat(64),
       priorKeysetHash: "c".repeat(64),
       scope: JSON.parse(SCOPE),
       priorSourceAuthority: JSON.parse(AUTH), // retire carries it in source_authority
@@ -123,7 +124,7 @@ describe("canonical journal store", () => {
     // prior_source_authority NULL.
     await db.query("INSERT INTO j VALUES($1)", [{
       revision: "10", kind: "retire", imageKey: HS1_KEY,
-      schemaGeneration: "d".repeat(64), sourceHash: "a".repeat(64),
+      schemaGeneration: "a".repeat(64), sourceHash: "a".repeat(64),
       priorKeysetHash: "c".repeat(64), scope: JSON.parse(SCOPE),
       priorSourceAuthority: JSON.parse(AUTH),
       pointerSet: JSON.parse(PTR) }]);

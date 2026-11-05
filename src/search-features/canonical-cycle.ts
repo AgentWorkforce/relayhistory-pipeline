@@ -131,11 +131,17 @@ export async function copyCanonicalEntry(
   };
   const sourceAuthority: CanonicalSourceAuthority =
     entry.kind === "publish" ? entry.sourceAuthority : entry.priorSourceAuthority;
-  // Begin freezes the EXACT immutable bindings finish will prove —
-  // profileBinding and targetBinding must be identical at both ends.
-  const profileBinding = "builtin-fold";
-  const targetBinding = ev.imageKey;
-  await acks.begin(entry, profileBinding, targetBinding);
+  // Bindings are the REAL identities — the versioned projection profile and
+  // the actual CH target (database + both tables + schema version), not the
+  // source image. A completed chain for a DIFFERENT target never passes.
+  const profileBinding = `builtin-fold@1:${ev.schemaGeneration}`;
+  const targetBinding =
+    `${ch.database}:${EVENT_FEATURES_TABLE}:${BRIEF_FEATURES_TABLE}:v1`;
+  const began = await acks.begin(entry, profileBinding, targetBinding);
+  if (began === "already_complete") {
+    // finish committed but the checkpoint never advanced — treat as done.
+    return { kind: "copied", checkpoint: entry.revision, rows: 0 };
+  }
   // Resume derives from the durable chain; a complete pool is SKIPPED.
   const rs: Record<"event" | "brief",
       { state: "empty" | "resume" | "complete" | "corrupt";

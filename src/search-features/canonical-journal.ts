@@ -42,8 +42,10 @@ const jsonb = <T>(v: unknown): T => {
 const HS1 = /^hs1:[a-f0-9]{64}:[a-f0-9]{64}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HEX64 = /^[a-f0-9]{64}$/;
-// Canonical positive integer — no zero, no leading zeros.
-const DEC = /^(0|[1-9][0-9]*)$/;
+// Canonical positive integer — nonzero, no leading zeros (epoch/revision).
+const DEC = /^[1-9][0-9]*$/;
+// Count may be zero — the ABI's nonnegative canonical form.
+const DEC0 = /^(0|[1-9][0-9]*)$/;
 /** Fail-closed row validation — every field + cross-bound shape checked. */
 const exactKeys = (o: unknown, keys: string[]): boolean =>
   !!o && typeof o === "object" &&
@@ -56,7 +58,7 @@ const validAuth = (a: CanonicalSourceAuthority | undefined) =>
 const validPtr = (p: CanonicalPointerSet | undefined) =>
   !!p && exactKeys(p, ["authorityId", "hash", "count"]) &&
   UUID.test(p.authorityId) && HEX64.test(p.hash) &&
-  DEC.test(p.count);
+  DEC0.test(p.count);
 const validScope = (s: CanonicalScope | undefined) =>
   !!s && exactKeys(s, ["orgId", "workspaceId", "harness", "sessionId",
                        "generation"]) &&
@@ -76,17 +78,32 @@ const toEntry = (r: Row): CanonicalJournalEntry => {
       (r.prior_keyset_hash !== null && !HEX64.test(r.prior_keyset_hash)))
     throw new Error("journal_row_invalid");
   const hs1Auth = r.image_key.split(":")[3]!;
+  const hs1Gen = r.image_key.split(":")[2]!;
+  // The hs1 generation segment must equal the scope generation AND the
+  // schema_generation column — a retargeted or miskeyed image refuses.
+  if (hs1Gen !== scope.generation || hs1Gen !== r.schema_generation)
+    throw new Error("journal_row_invalid");
   if (r.kind === "retire") {
     const prior = jsonb<CanonicalSourceAuthority>(r.source_authority);
-    // Retire: the prior authority (in source_authority) must equal the hs1
-    // suffix AND the pointer set's authority — cross-bound identity.
+    // Retire: prior identity in source_authority; prior_keyset_hash must be
+    // present and equal to the retired pointer set's hash;
+    // prior_source_authority must be NULL (the 610 CHECK shape).
     if (!validAuth(prior) || prior.authorityId !== pointerSet.authorityId ||
-        prior.authorityId !== hs1Auth)
+        prior.authorityId !== hs1Auth ||
+        r.prior_keyset_hash === null ||
+        r.prior_keyset_hash !== pointerSet.hash ||
+        r.prior_source_authority !== null ||
+        r.source_hash !== prior.fingerprint)
       throw new Error("journal_row_invalid");
   } else {
     const src = jsonb<CanonicalSourceAuthority>(r.source_authority);
+    // Publish: authority + hs1 + source_hash == fingerprint; prior fields
+    // both-or-neither (a replacement carries prior authority + keyset hash).
     if (!validAuth(src) || src.authorityId !== pointerSet.authorityId ||
-        src.authorityId !== hs1Auth)
+        src.authorityId !== hs1Auth ||
+        r.source_hash !== src.fingerprint ||
+        ((r.prior_keyset_hash === null) !==
+         (r.prior_source_authority === null)))
       throw new Error("journal_row_invalid");
     if (r.prior_source_authority &&
         !validAuth(jsonb<CanonicalSourceAuthority>(r.prior_source_authority)))

@@ -86,7 +86,8 @@ export interface CanonicalFeatureChangedPort {
 export interface CanonicalPageAckPort {
   /** Freeze the entry's bindings before the first CH write — drift refuses. */
   begin(entry: CanonicalJournalEntry, profileBinding: string,
-        targetBinding?: string): Promise<void>;
+        targetBinding?: string)
+      : Promise<"started" | "resumed" | "already_complete">;
   ackPage(input: {
     entry: CanonicalJournalEntry; kind: "event" | "brief";
     cursor: string;                 // the request cursor that produced this page

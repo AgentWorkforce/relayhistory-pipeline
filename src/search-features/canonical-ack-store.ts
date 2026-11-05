@@ -29,7 +29,8 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
    * refuses if they drifted.
    */
   async begin(entry: CanonicalJournalEntry, profileBinding: string,
-              targetBinding = "") {
+              targetBinding = "")
+      : Promise<"started" | "resumed" | "already_complete"> {
     // Drift refuses: a begin on an existing revision whose identity/bindings
     // changed is a conflict, never a silent accept.
     const auth = JSON.stringify(
@@ -43,15 +44,19 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
       [entry.revision, entry.kind, entry.imageKey, auth,
         JSON.stringify(entry.pointerSet), profileBinding, targetBinding]);
     if (!rows.length) {
-      // Compare in SQL via jsonb equality — not TS stringify (key-order).
-      const { rows: drift } = await this.db.query<{ ok: boolean }>(
+      // 3-state: exact+dirty=resume; exact+done=already_complete; else drift.
+      const { rows: st } = await this.db.query<{
+        exact: boolean; dirty: boolean }>(
         `SELECT source_authority=$2 AND pointer_set=$3 AND kind=$4` +
           ` AND image_key=$5 AND profile_binding=$6 AND target_binding=$7` +
-          ` AND dirty AS ok FROM ${ST} WHERE entry_revision=$1`,
+          ` AS exact, dirty FROM ${ST} WHERE entry_revision=$1`,
         [entry.revision, auth, JSON.stringify(entry.pointerSet),
           entry.kind, entry.imageKey, profileBinding, targetBinding]);
-      if (!drift.length || !drift[0]!.ok) throw new Error("begin_drift");
+      if (!st.length || !st[0]!.exact) throw new Error("begin_drift");
+      if (!st[0]!.dirty) return "already_complete" as const;
+      return "resumed" as const;
     }
+    return "started" as const;
   }
 
   /** Immutable page ACK — same page replays no-op; a mismatch refuses. */
