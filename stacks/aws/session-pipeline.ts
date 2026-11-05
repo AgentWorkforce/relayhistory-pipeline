@@ -41,7 +41,7 @@ import{derivedSchemaBuildPlugin}from "./derived-schema-build.ts";
 export interface SessionPipelineInputs {
   /** Turn the ClickHouse stage on (SEARCH_INDEX_ENABLED=1). Off: pointers only. */
   searchIndex?: boolean;
-  /** Default off. Requires separately reviewed normalized-prefix write/KMS permission and publication migration. */
+  /** Default off. `true` is refused until the reviewed normalized-prefix PutObject/KMS grant and publication migration exist. */
   replayPages?: boolean;
   /** Lambda concurrency cap from the queue (2-10). Default 4. */
   maxConcurrency?: number;
@@ -131,6 +131,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     if (k !== "searchIndex" && k !== "replayPages" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
+  // The pipeline role has only s3:ListBucket/GetObject: enabling the stage now would fail every replay put.
+  if (v.replayPages === true) refuse("transcriptStore.sessionPipeline.replayPages requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))

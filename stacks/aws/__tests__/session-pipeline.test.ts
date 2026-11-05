@@ -192,11 +192,20 @@ describe("session pipeline: inputs", () => {
     ({ ...example, transcriptStore: { ...example.transcriptStore, sessionPipeline } }) as unknown as AwsInputs & Record<string, unknown>;
   const validate = (i: AwsInputs & Record<string, unknown>) => assertTranscriptStoreInputs(STAGE, i);
   it("accepts the documented settings and refuses anything else", () => {
-    expect(() => validate(withPipeline({ searchIndex: true, replayPages: true, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ searchIndex: true, replayPages: false, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
     expect(() => validate(withPipeline({ queue: "x" }))).toThrow(/sessionPipeline.queue is not a known setting/);
     expect(() => validate(withPipeline({ maxConcurrency: 50 }))).toThrow(/maxConcurrency/);
     expect(() => validate(withPipeline({ reconcileMinutes: 1 }))).toThrow(/reconcileMinutes/);
     expect(() => validate(withPipeline([]))).toThrow(/plain object/);
+  });
+
+  it("replayPages: true is refused until the normalized-prefix write grant exists; false/absent keep working", () => {
+    expect(() => validate(withPipeline({ replayPages: true }))).toThrow(
+      "replayPages requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet",
+    );
+    expect(() => validate(withPipeline({ replayPages: false }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({}))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ replayPages: "true" }))).toThrow(/replayPages must be a boolean/);
   });
 
   it("briefs: enabled is a required boolean, the caps are bounded integers, nothing else", () => {
