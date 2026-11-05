@@ -55,8 +55,13 @@ import{derivedSchemaAssets}from "./derived-schema.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
-  /** Separate least-privilege READ ONLY legacy source, never exposed to Worker. */
-  analysis_source_readonly_url?: string;
+  /**
+   * Separate least-privilege READ ONLY legacy source, never exposed to Worker.
+   * Deliberately unchecked here: only the analysis branch validates it, and only
+   * when SESSION_ANALYSIS_CACHE_ENABLED=1, so a staged or malformed field can never
+   * stop the shared runtime that serves SQS/search invocations.
+   */
+  analysis_source_readonly_url?: unknown;
   clickhouse?: { url: string; user: string; password: string; database: string };
   openai_api_key?: string;
 }
@@ -110,7 +115,6 @@ export function parseSecret(text: string): PipelineSecret {
   const v = value as Partial<PipelineSecret> | null;
   if (!v || typeof v.hoopdb_url !== "string" || !/^postgres(ql)?:\/\//.test(v.hoopdb_url))
     throw new Error("session pipeline secret has no hoopdb_url");
-  if(v.analysis_source_readonly_url!==undefined&&(typeof v.analysis_source_readonly_url!=="string"||!/^postgres(ql)?:\/\//u.test(v.analysis_source_readonly_url)))throw new Error("session pipeline secret analysis_source_readonly_url must be a postgres URL");
   if (v.clickhouse !== undefined) {
     const c = v.clickhouse;
     for (const k of ["url", "user", "password", "database"] as const)
@@ -119,6 +123,18 @@ export function parseSecret(text: string): PipelineSecret {
   if (v.openai_api_key !== undefined && (typeof v.openai_api_key !== "string" || !v.openai_api_key.trim()))
     throw new Error("session pipeline secret openai_api_key must be a non-empty string when present");
   return v as PipelineSecret;
+}
+
+/**
+ * Validate the readonly analysis source field. Called only from the analysis
+ * branch with the flag on; never echoes the value.
+ */
+export function analysisSourceReadonlyUrl(value: unknown): string {
+  if (value === undefined || value === null || value === "")
+    throw new Error("analysis cache enabled without readonly source configuration (secret analysis_source_readonly_url is missing)");
+  if (typeof value !== "string" || !/^postgres(ql)?:\/\//u.test(value))
+    throw new Error("session pipeline secret analysis_source_readonly_url must be a postgres URL");
+  return value;
 }
 
 /**
@@ -170,10 +186,14 @@ async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Promise<T>)
 /** A search pass that found its session busy runs again this much later. */
 export const BUSY_REQUEUE_DELAY_SECONDS = 60;
 
-interface Runtime {
+export interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
   brief: ReturnType<typeof briefTick>;
+  store: ReturnType<typeof createS3Store>;
+  /** Raw, unvalidated secret field; see analysisDeps(). */
+  analysisSourceUrl?: unknown;
+  /** Built on first analysis invocation with the flag on, never in shared init. */
   analysis?: AnalysisRefreshDeps;
 }
 
@@ -190,7 +210,15 @@ async function init(): Promise<Runtime> {
     credentials: lambdaCredentials(),
   });
   if (!SecretString) throw new Error("session pipeline secret has no value yet");
-  const secret = parseSecret(SecretString);
+  return runtimeFromSecret(env, SecretString, publicationSchema.expected.generation);
+}
+
+/**
+ * The shared runtime for every invocation kind. Network-free: pools and clients
+ * connect lazily. The analysis source field is carried raw and not validated here.
+ */
+export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGeneration: string): Runtime {
+  const secret = parseSecret(secretText);
   const db = supabasePool(secret.hoopdb_url, env.dbPoolMax);
   const store = createS3Store({ bucket: env.bucket, region: env.region, credentials: async () => lambdaCredentials() });
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: env.bucket });
@@ -211,7 +239,7 @@ async function init(): Promise<Runtime> {
       orgs: prefixOrgResolver,
       allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
       fanout,
-      publication:{schemaGeneration:publicationSchema.expected.generation,transact:work=>transaction(db,async tx=>{
+      publication:{schemaGeneration,transact:work=>transaction(db,async tx=>{
         await tx.query("SET LOCAL statement_timeout='5s';SET LOCAL lock_timeout='1s'");return work(tx);
       })},
     },
@@ -251,9 +279,21 @@ async function init(): Promise<Runtime> {
     config: briefConfig(),
   });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
-  let analysis:AnalysisRefreshDeps|undefined;
-  if(env.analysisCacheEnabled){if(!secret.analysis_source_readonly_url)throw new Error("analysis cache enabled without readonly source configuration");analysis={db,store,source:readonlyAnalysisSource(readonlyAnalysisPool(secret.analysis_source_readonly_url,code=>log.error("analysis source pool error",{stage:"analysis-cache",error_code:code})))};}
-  return { env, deps, brief, analysis };
+  return { env, deps, brief, store, analysisSourceUrl: secret.analysis_source_readonly_url };
+}
+
+/**
+ * Analysis-only dependencies, validated and built on first use from the analysis
+ * branches. A missing or malformed source field fails only that invocation; the
+ * shared runtime (SQS/search/reconcile/brief) is unaffected and not invalidated.
+ */
+export function analysisDeps(rt: Runtime): AnalysisRefreshDeps {
+  if (!rt.env.analysisCacheEnabled) throw new Error("analysis cache runtime unavailable");
+  if (!rt.analysis) {
+    const url = analysisSourceReadonlyUrl(rt.analysisSourceUrl);
+    rt.analysis = { db: rt.deps.pointer.db, store: rt.store, source: readonlyAnalysisSource(readonlyAnalysisPool(url, code => log.error("analysis source pool error", { stage: "analysis-cache", error_code: code }))) };
+  }
+  return rt.analysis;
 }
 
 function ready(): Promise<Runtime> {
@@ -456,8 +496,8 @@ export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok:
   }
   if(event?.analysisCacheReconcile===true){
     if(process.env.SESSION_ANALYSIS_CACHE_ENABLED!=="1")return {ok:true};
-    const started=Date.now();try{const rt=await ready();if(!rt.analysis)throw new Error("analysis cache runtime unavailable");
-      const page=await reconcileAnalysisPage({source:rt.analysis.source,enqueue:identity=>enqueueAnalysisScope(rt.analysis!,identity)},{cursor:checkedAnalysisCursor(event.analysisCursor)});
+    const started=Date.now();try{const rt=await ready();const analysis=analysisDeps(rt);
+      const page=await reconcileAnalysisPage({source:analysis.source,enqueue:identity=>enqueueAnalysisScope(analysis,identity)},{cursor:checkedAnalysisCursor(event.analysisCursor)});
       if(page.nextCursor)await invokeAsync({region:rt.env.region,functionName:process.env.AWS_LAMBDA_FUNCTION_NAME??"",payload:JSON.stringify({analysisCacheReconcile:true,analysisCursor:page.nextCursor}),credentials:lambdaCredentials()});
       log.info("analysis cache reconcile page",{stage:"analysis-cache",count:page.scanned,enqueued:page.accepted,skipped:page.unavailable,failed:page.invalidScope,ok:page.unavailable===0&&page.invalidScope===0,reason:page.complete?"scan_complete":"continuation",duration_ms:Date.now()-started});return {ok:true};
     }catch(error){log.error("analysis cache reconcile failed",{stage:"analysis-cache",...errorFields(error),duration_ms:Date.now()-started});throw new Error("analysis cache reconcile failed");}
@@ -465,12 +505,12 @@ export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok:
   if(event?.analysisCache===true){
     // Default off before secret lookup, connection pools or object access.
     if(process.env.SESSION_ANALYSIS_CACHE_ENABLED!=="1")return {ok:true};
-    const started=Date.now();try{const rt=await ready();if(!rt.analysis)throw new Error("analysis cache runtime unavailable");
-      const first=await analysisRefreshTick(rt.analysis,{maxJobs:10,maxMs:24000});
+    const started=Date.now();try{const rt=await ready();const analysis=analysisDeps(rt);
+      const first=await analysisRefreshTick(analysis,{maxJobs:10,maxMs:24000});
       // One-minute schedule, two bounded passes. Cadence remains a target until
       // actual source/network/load execution is measured; leases make overlap safe.
       if(Date.now()-started<30000)await new Promise(resolve=>setTimeout(resolve,30000-(Date.now()-started)));
-      const second=Date.now()-started<50000?await analysisRefreshTick(rt.analysis,{maxJobs:10,maxMs:24000}):{claimed:0,published:0,failed:0,lost:0};
+      const second=Date.now()-started<50000?await analysisRefreshTick(analysis,{maxJobs:10,maxMs:24000}):{claimed:0,published:0,failed:0,lost:0};
       log.info("analysis cache refresh finished",{stage:"analysis-cache",count:first.published+second.published,failed:first.failed+second.failed+first.lost+second.lost,duration_ms:Date.now()-started});
       return {ok:first.failed+second.failed+first.lost+second.lost===0};
     }catch(error){log.error("analysis cache refresh failed",{stage:"analysis-cache",...errorFields(error),duration_ms:Date.now()-started});return {ok:false};}
