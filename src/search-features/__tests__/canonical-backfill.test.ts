@@ -18,14 +18,18 @@ const fakeDb = () => {
       return { rows: [{ revision: String(
         table.length ? Math.max(...table.map((r) => Number(r.revision))) + 1 : 1) } as T] };
     if (text.startsWith("INSERT")) {
-      if (params[1] === "seed") {
-        table.push({ revision: params[0], kind: "seed" });
-      } else {
-        table.push({ revision: params[0], kind: params[1],
-          org_id: params[2], scope: params[4], source_hash: params[7],
-          pointer_set: params[11] });
-      }
+      table.push({ revision: params[0], kind: "seed" });
       return { rows: [] as T[] };
+    }
+    if (text.includes("sessions.canonical_feature_changed")) {
+      const [scope, source, , pointerSet] =
+        params.map((p) => (p ? JSON.parse(p as string) : null));
+      const rev = String(Math.max(...table.map((r) => Number(r.revision ?? 0)), 100) + 1);
+      table.push({ revision: rev, kind: "publish",
+        scope: JSON.stringify(scope), org_id: scope.orgId,
+        source_hash: source.fingerprint,
+        pointer_set: JSON.stringify(pointerSet) });
+      return { rows: [{ rev } as T] };
     }
     return { rows: [] as T[] };
   };

@@ -6,12 +6,9 @@
  * first entry so historical fills never collide with the legacy series.
  * Bounded: per-image enumeration, no bulk payload reads.
  */
-import {
-  CanonicalJournalStore,
-  CanonicalVersionStore,
-  type SqlQuery,
-} from "./canonical-journal.ts";
-import type { CanonicalJournalEntry } from "./canonical-version.ts";
+import type { SqlQuery } from "./canonical-journal.ts";
+import { CanonicalFeatureChanged } from "./canonical-feature-changed.ts";
+
 
 /** One image descriptor from the org→keys manifest index. */
 export interface CanonicalBackfillImage {
@@ -38,28 +35,24 @@ export type CanonicalBackfillResult =
 export async function backfillFromIndex(
   db: SqlQuery,
   images: CanonicalBackfillIndex,
-  seedAboveLegacy: string,
+  _seedAboveLegacy: string,
 ): Promise<CanonicalBackfillResult> {
-  const versions = new CanonicalVersionStore(db);
-  const journal = new CanonicalJournalStore(db);
-  await versions.seed(seedAboveLegacy);
+  // The invoker is the sole journal writer — one publish call per image.
+  const fn = new CanonicalFeatureChanged(db);
   let entries = 0, lastRevision = "", orgId = "";
   for await (const img of images) {
     orgId = img.orgId;
-    const revision = await versions.next();
-    const entry: CanonicalJournalEntry = {
-      kind: "publish", revision, imageKey: img.imageKey,
-      schemaGeneration: img.schemaGeneration, sourceHash: img.sourceHash,
+    lastRevision = await fn.canonicalFeatureChanged({
       scope: {
         orgId: img.orgId, workspaceId: img.workspaceId,
         harness: img.harness, sessionId: img.sessionId,
       },
-      sourceAuthority: { epoch: img.epoch, fingerprint: img.fingerprint },
+      source: { epoch: img.epoch, fingerprint: img.fingerprint,
+                authorityId: img.imageKey },
+      priorSource: null,
       pointerSet: { hash: img.pointerSetHash, count: img.pointerSetCount },
-    };
-    await journal.append(entry, String(BigInt(revision) - 1n));
+    });
     entries += 1;
-    lastRevision = revision;
   }
   return { kind: "copied", orgId, entries, lastRevision };
 }

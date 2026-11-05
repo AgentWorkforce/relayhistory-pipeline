@@ -69,32 +69,11 @@ export class CanonicalVersionStore implements CanonicalVersionPort {
         " ORDER BY revision DESC LIMIT 1");
     return rows.length ? String(rows[0]!.revision) : null;
   }
-  async seed(aboveLegacyClock: string): Promise<void> {
-    const last = await this.last();
-    if (last !== null && BigInt(aboveLegacyClock) <= BigInt(last))
-      throw new Error("seed_below_last");
-    if (last === null)
-      await this.db.query(
-        "INSERT INTO sessions.canonical_feature_journal(" +
-          "revision,kind,org_id,workspace_id,scope,schema_generation," +
-          " image_key,source_hash,source_authority,pointer_set)" +
-          " VALUES($1,'seed','','','{}','','','{}','{}')" +
-          " ON CONFLICT (revision) DO NOTHING",
-        [aboveLegacyClock]);
+  async seed(_aboveLegacyClock: string): Promise<void> {
+    throw new Error("sole writer is the 620 _install invoker");
   }
   async next(): Promise<string> {
-    // Fail closed: no seed row means the counter was never initialized above
-    // the legacy clock — refusing beats silently allocating revision 1 in the
-    // legacy space.
-    const { rows: seeds } = await this.db.query<{ revision: string }>(
-      "SELECT 1::text AS revision FROM sessions.canonical_feature_journal" +
-        " WHERE kind = 'seed' LIMIT 1");
-    if (!seeds.length) throw new Error("unseeded");
-    // Allocation above every prior entry (seed + publish + retire).
-    const { rows } = await this.db.query<{ revision: string }>(
-      "SELECT COALESCE(MAX(revision),0)+1::text AS revision" +
-        " FROM sessions.canonical_feature_journal FOR UPDATE");
-    return rows[0]!.revision;
+    throw new Error("sole writer is the 620 _install invoker");
   }
 }
 export class CanonicalJournalStore implements CanonicalJournalPort {
@@ -118,27 +97,5 @@ export class CanonicalJournalStore implements CanonicalJournalPort {
   async append(entry: CanonicalJournalEntry, observed: string): Promise<void> {
     if (BigInt(entry.revision) <= BigInt(observed))
       throw new Error("stale_revision");
-    const scope = JSON.stringify(entry.scope);
-    const ptr = JSON.stringify(entry.pointerSet);
-    const cols = entry.kind === "retire"
-      ? ["retire", scope, entry.schemaGeneration, entry.imageKey,
-          entry.sourceHash, entry.priorKeysetHash, "",
-          JSON.stringify(entry.priorSourceAuthority), ptr]
-      : ["publish", scope, entry.schemaGeneration, entry.imageKey,
-          entry.sourceHash, entry.priorKeysetHash ?? "",
-          JSON.stringify(entry.sourceAuthority),
-          entry.priorSourceAuthority
-            ? JSON.stringify(entry.priorSourceAuthority) : "", ptr];
-    // cols = [kind, scope, schema_generation, image_key, source_hash,
-    //         prior_keyset_hash, source_authority, prior_source_authority,
-    //         pointer_set]
-    await this.db.query(
-      "INSERT INTO sessions.canonical_feature_journal(" +
-        "revision,kind,org_id,workspace_id,scope,schema_generation," +
-        " image_key,source_hash,prior_keyset_hash,source_authority," +
-        " prior_source_authority,pointer_set)" +
-        " VALUES($1::bigint,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
-      [entry.revision, cols[0], entry.scope.orgId, entry.scope.workspaceId,
-        ...cols.slice(1)]);
   }
 }
