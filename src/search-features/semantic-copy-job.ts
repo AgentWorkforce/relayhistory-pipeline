@@ -15,6 +15,13 @@ import { verifySemanticReadonlyRole } from "./semantic-copy-source-pool.ts";
 import { SemanticCopyStore, SemanticCopyError } from "./semantic-copy-store.ts";
 import { runSemanticCopyPage } from "./semantic-copy-runtime.ts";
 import { semanticSha256, semanticTargetHashInput, parseSemanticProfile, type SemanticFeatureKind } from "./semantic-copy-protocol.ts";
+/** A log-safe reason code for a per-kind failure: the error's own reason code when it
+ * has one, else a SQLSTATE, else its name. Never the message, a URL or other error text. */
+export function semanticFailureReason(error: unknown): string {
+    const e = error as { reason?: unknown; code?: unknown; name?: unknown } | null | undefined;
+    const code = typeof e?.reason === "string" ? e.reason : typeof e?.code === "string" && /^[0-9A-Z]{5}$/u.test(e.code) ? `sqlstate_${e.code}` : typeof e?.name === "string" ? e.name : "unknown";
+    return /^[A-Za-z0-9_]{1,64}$/u.test(code) ? code : "unclassified";
+}
 export async function runSemanticCopyTick(deps: {
     db: SemanticBoundedSql;
     source: SemanticBoundedSql;
@@ -57,7 +64,7 @@ export async function runSemanticCopyTick(deps: {
         const store = new SemanticCopyStore(metadata, deps.sourceId, FEATURE_SOURCE_AUTHORITY.identitySha256);
         await store.register(targetHash, profile.sourceHash, profileJson);
         const batches = { event: batch, brief: batch };
-        const stats = { pages: 0, published: 0, eventComplete: false, briefComplete: false, failed: 0 }, idle = new Set<SemanticFeatureKind>();
+        const stats = { pages: 0, published: 0, eventComplete: false, briefComplete: false, failed: 0, reasons: { event: "not_run", brief: "not_run" } as Record<SemanticFeatureKind, string> }, idle = new Set<SemanticFeatureKind>();
         for (let n = 0; n < maxPages && idle.size < 2; n++) {
             active();
             const kind: SemanticFeatureKind = n % 2 === 0 ? "event" : "brief";
@@ -80,12 +87,15 @@ export async function runSemanticCopyTick(deps: {
                         }
                     } } }, kind);
             }
-            catch {
+            catch (error) {
                 stats.failed++;
+                stats.reasons[kind] = semanticFailureReason(error);
                 idle.add(kind);
                 continue;
             }
             if (result.status === "idle") {
+                if (stats.reasons[kind] === "not_run")
+                    stats.reasons[kind] = "idle";
                 idle.add(kind);
                 continue;
             }
@@ -95,6 +105,7 @@ export async function runSemanticCopyTick(deps: {
                 stats.eventComplete = result.complete;
             else
                 stats.briefComplete = result.complete;
+            stats.reasons[kind] = result.complete ? "complete" : "continuation";
             if (result.complete)
                 idle.add(kind);
         }

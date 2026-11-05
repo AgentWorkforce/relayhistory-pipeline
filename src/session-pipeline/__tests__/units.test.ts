@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import { signV4 } from "../aws-json.ts";
 import { decodeS3Key, parseQueueBody, sequencerAfter } from "../s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
-import { analysisDeps, analysisSourceReadonlyUrl, handler, lambdaEnv, parseSecret, runtimeFromSecret } from "../lambda.ts";
+import { analysisDeps, analysisSourceReadonlyUrl, handler, lambdaEnv, parseSecret, runtimeFromSecret, semanticCopyDeps } from "../lambda.ts";
+import { processBatch } from "../consumer.ts";
+import { semanticFailureReason } from "../../search-features/semantic-copy-job.ts";
 import { searchIndexLimits, SEARCH_INDEX_DEFAULT_LIMITS, REPLAY_SEARCH_INDEX_LIMITS } from "../search-index.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
@@ -294,3 +296,60 @@ describe("analysis source secret field is validated only in the analysis branch"
   });
 });
 test("semantic copier default-off returns before runtime/secret initialization",async()=>{const previous=process.env.SESSION_SEMANTIC_COPY_ENABLED;try{delete process.env.SESSION_SEMANTIC_COPY_ENABLED;expect(await handler({semanticCopy:true})).toEqual({ok:true})}finally{if(previous===undefined)delete process.env.SESSION_SEMANTIC_COPY_ENABLED;else process.env.SESSION_SEMANTIC_COPY_ENABLED=previous}});
+
+describe("semantic copier config is validated only in the semantic-copy branch", () => {
+  const base = { AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "b", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs", SEARCH_INDEX_ENABLED: "1", SESSION_SEMANTIC_COPY_ENABLED: "1" };
+  const ch = { url: "https://ch.example", user: "u", password: "p", database: "d" };
+  const secret = (field: Record<string, unknown>) => JSON.stringify({ hoopdb_url: "postgres://u:p@127.0.0.1:1/db", ...field });
+  const good = { clickhouse: ch, analysis_source_readonly_url: "postgres://ro:p@127.0.0.1:1/db" };
+  test("flag on + incomplete or malformed config: shared init and SQS batches succeed, only the semantic branch fails with a reason code", async () => {
+    const cases: [Record<string, string>, Record<string, unknown>, string][] = [
+      // No clickhouse block is only parseable with search off.
+      [{ SEARCH_INDEX_ENABLED: "0" }, { analysis_source_readonly_url: good.analysis_source_readonly_url }, "config_incomplete"],
+      [{}, { clickhouse: ch }, "config_incomplete"],
+      [{ SESSION_SEARCH_FEATURE_SOURCE_ID: "" }, good, "config_incomplete"],
+      [{}, { clickhouse: ch, analysis_source_readonly_url: "mysql://hunter2" }, "config_invalid"],
+      [{}, { clickhouse: ch, analysis_source_readonly_url: "postgres://ro:hunter2@[bad" }, "config_invalid"],
+    ];
+    for (const [extra, field, reason] of cases) {
+      const env = lambdaEnv({ SESSION_SEARCH_FEATURE_SOURCE_ID: "legacy-main", ...base, ...extra });
+      expect(env.semanticCopyEnabled).toBe(true);
+      const rt = runtimeFromSecret(env, secret(field), "fixture-generation");
+      expect(rt.semanticCopy).toBeUndefined();
+      // The SQS path runs on this runtime: a test event is acked and an unreadable body goes to the DLQ, no copier involved.
+      expect(await processBatch([{ messageId: "m1", body: JSON.stringify({ Event: "s3:TestEvent" }) }, { messageId: "m2", body: "not json" }], rt.deps)).toEqual({ batchItemFailures: [{ itemIdentifier: "m2" }] });
+      let error: { message?: string; reason?: string } = {};
+      try { semanticCopyDeps(rt); } catch (e) { error = e as typeof error; }
+      expect(error.reason).toBe(reason);
+      expect(error.message).not.toContain("hunter2");
+      expect(rt.semanticCopy).toBeUndefined();
+    }
+    const ok = runtimeFromSecret(lambdaEnv({ ...base, SESSION_SEARCH_FEATURE_SOURCE_ID: "legacy-main" }), secret(good), "fixture-generation");
+    const copy = semanticCopyDeps(ok);
+    expect(semanticCopyDeps(ok)).toBe(copy);
+  });
+  test("per-kind failure reasons are codes, never error text", () => {
+    expect(semanticFailureReason(Object.assign(new Error("x"), { reason: "source_authority_unverified" }))).toBe("source_authority_unverified");
+    expect(semanticFailureReason(Object.assign(new Error("permission denied for postgres://ro:hunter2@h/db"), { code: "42501" }))).toBe("sqlstate_42501");
+    expect(semanticFailureReason(new TypeError("postgres://ro:hunter2@h/db cannot be parsed"))).toBe("TypeError");
+    expect(semanticFailureReason(Object.assign(new Error("x"), { reason: "postgres://ro:hunter2@h/db" }))).toBe("unclassified");
+    expect(semanticFailureReason(undefined)).toBe("unknown");
+  });
+  test("flag off: no semantic secret is carried and the copier is unavailable", () => {
+    const rt = runtimeFromSecret(lambdaEnv({ ...base, SESSION_SEMANTIC_COPY_ENABLED: "0" }), secret({ clickhouse: ch }), "fixture-generation");
+    expect(rt.semanticSecret).toBeUndefined();
+    expect(() => semanticCopyDeps(rt)).toThrow("semantic copier unavailable");
+  });
+  test("flag on, a failed tick is logged and answered ok:false, never thrown", async () => {
+    const saved = { e: process.env.SESSION_SEMANTIC_COPY_ENABLED, r: process.env.AWS_REGION };
+    try {
+      process.env.SESSION_SEMANTIC_COPY_ENABLED = "1";
+      delete process.env.AWS_REGION;
+      expect(await handler({ semanticCopy: true })).toEqual({ ok: false });
+    } finally {
+      if (saved.e === undefined) delete process.env.SESSION_SEMANTIC_COPY_ENABLED;
+      else process.env.SESSION_SEMANTIC_COPY_ENABLED = saved.e;
+      if (saved.r !== undefined) process.env.AWS_REGION = saved.r;
+    }
+  });
+});

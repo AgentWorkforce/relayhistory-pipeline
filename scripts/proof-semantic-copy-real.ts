@@ -1,6 +1,6 @@
 import {createSemanticClickHouseClient} from "../src/search-features/semantic-copy-ch.ts";
 import {SemanticPostgresExecutor} from "../src/search-features/semantic-copy-postgres.ts";
-/** Actual owned PG17 builtin + CH26 + durable100000 integration; synthetic only. */
+/** Actual owned PG17 builtin + CH26 + durable 20261105035000 integration; synthetic only. */
 import pg from "pg";
 import {SemanticCopyStore} from "../src/search-features/semantic-copy-store.ts";
 import {publishSemanticCopyProfile,publishSemanticCopyAuthority} from "../src/search-features/semantic-copy-publication.ts";
