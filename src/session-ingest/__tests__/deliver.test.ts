@@ -14,6 +14,7 @@ import { canonicalSnapshot, type CanonicalPointer } from "../../session-read-api
 import { MAX_REPLICA_MESSAGE_BYTES, type NeonReplicaMessage, type ReplicaSink } from "../replica.ts";
 import { DeliveryError, MAX_DELIVERY_BYTES } from "../vendor/delivery/delivery-contracts.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
+import { RECOVERY_CONTENT_TYPE, RECOVERY_PROTOCOL } from "../recovery-protocol.ts";
 import { LIVE_OWNER, NO_SESSION_HARNESS, liveMachineId } from "../writer.ts";
 import { MemoryLedger, SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
 
@@ -613,6 +614,33 @@ describe("the binding identity is signed (review Medium)", () => {
     const res = await keyless.fetch(new Request("https://x/v1/delivery/batches", { method: "POST", body, headers: signedHeaders(identity, "POST", "/v1/delivery/batches", enc(body)) }));
     expect([res.status, ((await res.json()) as { error: { code: string } }).error.code]).toEqual([401, "not_configured"]);
     void SIGNATURE_HEADER;
+  });
+
+  test("archive recovery requires the HMAC over its exact private body and buffered mode", async () => {
+    const { deps, ledger } = setup();
+    const raw = await batch([record({ record_id: "signed-recovery" })], { batch_id: "signed-recovery" });
+    const prepared = await prepareDelivery(TENANT, raw);
+    const sourceDigest = "d".repeat(64);
+    const custody = {
+      sourceDigest,
+      witness: {
+        version: 1 as const, issuer: "relayhistory-cloud" as const, sourceIdentitySha256: "c".repeat(64), controlEpoch: "e".repeat(64), privacyBaselineSha256: "a".repeat(64),
+        tenant: TENANT, originId: prepared.originId, batchId: prepared.batchId, batchDigest: prepared.batchDigest, sourceControlVersion: "0", pending: false, pendingControl: null,
+        privacyVersion: "0", originalRecordCount: raw.records.length, candidateCount: prepared.records.length,
+        records: prepared.records.map((r, preparedOrd) => ({ preparedOrd, processingRank: preparedOrd, candidateDigest: r.digest, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id, candidateFenced: false, currentFenced: false, current: null })),
+        privacy: { complete: true as const, deletions: [], resets: [] },
+      },
+    };
+    ledger.prepareBufferStage = async () => ({ stageToken: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    ledger.commitBuffered = async () => ({ version: 1, sourceDigest, sourceControlVersion: "0", privacySealed: true });
+    const body = JSON.stringify({ protocol: RECOVERY_PROTOCOL, prepared, custody });
+    const path = "/v1/delivery/recovery";
+    const headers = { "content-type": RECOVERY_CONTENT_TYPE, ...signedHeaders(identity, "POST", path, enc(body)) };
+    const buffered = createIngestApp({ deliver: { ...deps, acceptanceMode: "buffered" }, log: () => {}, signingKey: SIGNING_KEY });
+    expect((await buffered.fetch(new Request(`https://x${path}`, { method: "POST", body, headers }))).status).toBe(200);
+    expect((await buffered.fetch(new Request(`https://x${path}`, { method: "POST", body: body + " ", headers }))).status).toBe(401);
+    const canonical = createIngestApp({ deliver: deps, log: () => {}, signingKey: SIGNING_KEY });
+    expect((await canonical.fetch(new Request(`https://x${path}`, { method: "POST", body, headers }))).status).toBe(503);
   });
 });
 
