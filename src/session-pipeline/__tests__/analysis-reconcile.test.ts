@@ -27,3 +27,35 @@ test("a per-key 22023 enqueue refusal (physical legacy id, overlong id) is logge
  // A transient failure on the later key still throws and acknowledges nothing.
  await expect(reconcileAnalysisPage({source:f.source,enqueue:async i=>{if(i.sessionId==="zzz-later")throw Object.assign(Error("connection reset"),{code:"08006"});return enqueueAnalysisScope(target,i)},onRefused:()=>{}})).rejects.toThrow("connection reset");
 }finally{await target.pg.close()}});
+const pgError=(code:string,message:string)=>Object.assign(new Error(message),{code,severity:"ERROR"});
+test.each([
+ ["55000","replay capture: ambiguous canonical source","enqueue_ambiguous_source"],
+ ["54000","replay capture: pointer capacity exceeded","enqueue_capacity_exceeded"],
+ ["54000","replay capture: metadata capacity exceeded","enqueue_capacity_exceeded"],
+])("deterministic capture refusal %s %s is logged as %s, advances the cursor and later keys are still enqueued",async(code,message,reason)=>{const f=await fixture();await key(f,"a-refused",1);await key(f,"b-later",2);const seen:string[]=[],refusals:string[]=[];
+ const page=await reconcileAnalysisPage({source:f.source,enqueue:async i=>{seen.push(i.sessionId);if(i.sessionId==="a-refused")throw pgError(code,message);return {accepted:true}},onRefused:(r,k)=>refusals.push(`${r}:${k.orgId}:${k.workspaceId}:${k.source}:${k.sessionId}`)},{pageSize:2});
+ expect(refusals).toEqual([`${reason}:org:ws:claude:a-refused`]);expect(seen).toEqual(["a-refused","b-later"]);
+ expect(page).toMatchObject({scanned:2,accepted:1,refused:1,nextCursor:["org","ws","b-later"],complete:false});
+});
+test.each([
+ ["55000","replay capture: source epoch missing"],
+ ["55000","replay pages: ambiguous canonical identity"],
+ ["54000","history summary: pointer capacity exceeded"],
+ ["08006","replay capture: ambiguous canonical source"],
+ ["08006","connection reset"],
+])("non-deterministic or unqualified enqueue error %s %s aborts the scan without advancing the cursor",async(code,message)=>{const f=await fixture();await key(f,"a-transient",1);await key(f,"b-later",2);const seen:string[]=[],refusals:string[]=[];
+ await expect(reconcileAnalysisPage({source:f.source,enqueue:async i=>{seen.push(i.sessionId);if(i.sessionId==="a-transient")throw pgError(code,message);return {accepted:true}},onRefused:r=>refusals.push(r)},{pageSize:2})).rejects.toMatchObject({code,message});
+ expect(seen).toEqual(["a-transient"]);expect(refusals).toEqual([]);
+ // Retry revisits the same key: nothing was acknowledged past the failure.
+ const retry:string[]=[];const page=await reconcileAnalysisPage({source:f.source,enqueue:async i=>{retry.push(i.sessionId);return {accepted:true}}},{pageSize:1});expect(retry).toEqual(["a-transient"]);expect(page.nextCursor).toEqual(["org","ws","a-transient"]);
+});
+test("a real ambiguous canonical source from capture_session_replay_pages is refused as enqueue_ambiguous_source and the scan advances",async()=>{const f=await fixture(),target=await replayDatabase();try{const id=REPLAY_FIXTURE_IDENTITY;
+ // One physical session id recorded on two machines under two different canonical ids.
+ await addReplayPointer(target.db,{key:"96bulls/org_replay/v1/ws=ws_replay/m=m1/h=claude/d=2026-11-01/s=dup/manifest.json",digest:"a".repeat(64),physicalSession:"dup",physicalMachine:"m1",canonicalSession:"canon-one"});
+ await addReplayPointer(target.db,{key:"96bulls/org_replay/v1/ws=ws_replay/m=m2/h=claude/d=2026-11-01/s=dup/manifest.json",digest:"b".repeat(64),physicalSession:"dup",physicalMachine:"m2",canonicalSession:"canon-two"});
+ for(const sid of ["dup","zzz-later"]){await f.pg.query("INSERT INTO sessions.convergence_events VALUES($1,$2,$3,'claude')",[id.orgId,sid,id.workspaceId]);await f.pg.query("INSERT INTO sessions.session_analysis_requests VALUES(gen_random_uuid(),$1,$2,$3,'queued',NULL,NULL,NULL,now(),now())",[id.orgId,id.workspaceId,sid])}
+ await expect(enqueueAnalysisScope(target,{...id,sessionId:"dup"})).rejects.toMatchObject({code:"55000",message:"replay capture: ambiguous canonical source"});
+ const refusals:string[]=[],seen:string[]=[];
+ const page=await reconcileAnalysisPage({source:f.source,enqueue:async i=>{seen.push(i.sessionId);return enqueueAnalysisScope(target,i)},onRefused:(r,k)=>refusals.push(r+":"+k.sessionId)});
+ expect(refusals).toEqual(["enqueue_ambiguous_source:dup"]);expect(seen.filter(s=>s!=="session")).toEqual(["dup","zzz-later"]);expect(page).toMatchObject({complete:true,nextCursor:undefined});
+}finally{await target.pg.close()}});

@@ -5,10 +5,25 @@ import type {ReadonlyAnalysisSource} from "./analysis-snapshot.ts";
 import {ANALYSIS_NAMESPACE_SOURCES_SQL} from "./analysis-scope.ts";
 import {log} from "../shared/log.ts";
 /** Stable reasons for a per-key refusal that is logged and skipped, never retried by the scan. */
-export type AnalysisReconcileRefusal="namespace_fanout_bound"|"enqueue_invalid_scope";
-/** Deterministic per-key refusals: 22023 from the demand function (non-canonical
- * physical id, out-of-range scope). Anything else is transient and replays the cursor. */
-const refusedEnqueue=(error:unknown)=>(error as {code?:unknown}|null)?.code==="22023";
+export type AnalysisReconcileRefusal="namespace_fanout_bound"|"enqueue_invalid_scope"|"enqueue_ambiguous_source"|"enqueue_capacity_exceeded";
+/** Deterministic per-key refusals from the demand function and the
+ * capture_session_replay_pages call inside it (migration 20261105026000):
+ * 22023 (non-canonical physical id, out-of-range scope), 55000 "ambiguous canonical
+ * source", 54000 "pointer capacity exceeded" / "metadata capacity exceeded".
+ * Classification is code plus exact message prefix; anything else, including
+ * 55000 "source epoch missing" (may be transient), aborts and replays the cursor. */
+const REFUSED_ENQUEUE_MESSAGES:readonly [string,string,Exclude<AnalysisReconcileRefusal,"namespace_fanout_bound"|"enqueue_invalid_scope">][]=[
+ ["55000","replay capture: ambiguous canonical source","enqueue_ambiguous_source"],
+ ["54000","replay capture: pointer capacity exceeded","enqueue_capacity_exceeded"],
+ ["54000","replay capture: metadata capacity exceeded","enqueue_capacity_exceeded"],
+];
+export function refusedEnqueueReason(error:unknown):AnalysisReconcileRefusal|undefined{
+ const e=error as {code?:unknown;message?:unknown}|null;if(typeof e?.code!=="string")return undefined;
+ if(e.code==="22023")return "enqueue_invalid_scope";
+ if(typeof e.message!=="string")return undefined;
+ for(const [code,prefix,reason] of REFUSED_ENQUEUE_MESSAGES)if(e.code===code&&e.message.startsWith(prefix))return reason;
+ return undefined;
+}
 export type AnalysisReconcileCursor=[string,string,string];
 export function checkedAnalysisCursor(value:unknown):AnalysisReconcileCursor|undefined{if(value===undefined)return undefined;if(!Array.isArray(value)||value.length!==3||value.some(v=>typeof v!=="string"||!v||v.length>512))throw new Error("analysis reconcile: invalid cursor");return value as AnalysisReconcileCursor}
 type Key={org_id:string;workspace_id:string;session_id:string};
@@ -36,7 +51,7 @@ export async function reconcileAnalysisPage(deps:{source:ReadonlyAnalysisSource;
    if(!/^[a-z0-9][a-z0-9._-]{0,63}$/u.test(source)){invalidScope++;continue}
    const scope:ArtifactIdentity={orgId:k.org_id,workspaceId:k.workspace_id,source,sessionId:k.session_id};
    let ack:{accepted?:unknown};
-   try{ack=await deps.enqueue(scope) as {accepted?:unknown}}catch(error){if(!refusedEnqueue(error))throw error;refused++;refuse("enqueue_invalid_scope",{orgId:k.org_id,workspaceId:k.workspace_id,sessionId:k.session_id,source});continue}
+   try{ack=await deps.enqueue(scope) as {accepted?:unknown}}catch(error){const reason=refusedEnqueueReason(error);if(!reason)throw error;refused++;refuse(reason,{orgId:k.org_id,workspaceId:k.workspace_id,sessionId:k.session_id,source});continue}
    if(typeof ack?.accepted!=="boolean")throw new Error("analysis reconcile: invalid durable enqueue acknowledgement");
    if(ack.accepted)accepted++;else unavailable++;
   }
