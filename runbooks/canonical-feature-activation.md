@@ -28,6 +28,7 @@ Khaliq's separate explicit approval.
 | F7 | Serve the uploaded session from Supabase-backed list/detail/summary reads | bulls-migrator read-path lane + Cloud UI lane | Buffered upload visible in directory and exact session hydration; tenant/auth negative tests; rollback flag recorded |
 | F8 | Land canonical reader/visibility stack #179+ and route the canary scope only after readiness succeeds | canonical #179+ owner + migration-completeness | Legacy-filter parity, cursor stability, exact hydration authority and fail-closed dirty-state tests |
 | F9 | One-org canary: upload, read, keyword search, semantic search when a stored vector exists, replace, delete/tombstone, latency and rollback | bulls-migrator coordinates; all owners provide evidence | Timestamped request/results, FINAL rows, parity report, no dirty/backlog, rollback rehearsal |
+| F10 | Replace the Neon-trigger project feeds with durable canonical-publication events in Cloud's current queue ABI: brief completion `{eventId}` and session revision `{kind:"session.revised",eventId,generation}` with decimal-string generation | 620 publication owner + migration-completeness + P5b/Cloud project-events owner | Outbox commits with publication; Cloud resolves trusted event metadata from the new authority, admits once under duplicate delivery, generation-fences acknowledgements, recovers failed sends, and refreshes the canary project summary |
 
 ### Required later for broad migration
 
@@ -53,6 +54,13 @@ Khaliq's separate explicit approval.
 - Define and rehearse the operator-only seed row. It must put the journal above
   the drained legacy feature high-water before any scope install or backfill;
   no data-plane identity may allocate or append revisions.
+- Replace the Neon-trigger feeds from migrations 0034/0035/0048/0055/0062.
+  Canonical publication must durably create the session-revision and brief-
+  completion outbox records and publish only Cloud's current ID-only queue
+  messages. The event ID must resolve through the post-cutover authority; merely
+  sending a compatible JSON body while Cloud still reads the stopped Neon
+  outbox is not sufficient. Preserve coalescing, retry/release, generation-
+  fenced acknowledgement and tenant-attribution semantics.
 - Complete the physical retirement/reconciliation worker, including cleared
   buffered slots, legacy-only privacy controls, shared references and late PUT
   barriers. Search tombstones cannot substitute for source erasure.
