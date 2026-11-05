@@ -690,6 +690,19 @@ export function assertOperatorSnapshot(
               value.queue_name !== FANOUT_QUEUE)
           )
             refuse("native_binding_target");
+          // Existing no-op Queue bindings retain Alchemy's internal
+          // camelCase queue identity rather than upload API queue_name.
+          // Bind it to this plan's owned queue before normalizing it.
+          if (b.action === "noop") {
+            const attr = snapshot.native.resources["session-ingest-fanout"]?.state?.attr;
+            if (value.queueName !== FANOUT_QUEUE ||
+              typeof value.queueId !== "string" || !/^[0-9a-f]{32}$/u.test(value.queueId) ||
+              attr?.queueId !== value.queueId || attr?.queueName !== FANOUT_QUEUE ||
+              attr?.accountId !== input.sessionIngest.accountId)
+              refuse("native_binding_target");
+            delete value.queueName;
+            delete value.queueId;
+          }
           delete value.queue_name;
         }
         if (

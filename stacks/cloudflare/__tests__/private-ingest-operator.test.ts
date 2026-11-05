@@ -273,6 +273,30 @@ async function actualPlanProof(mode: "canonical" | "buffered") {
     expect(assertOperatorSnapshot(noopSnapshot, input)).toHaveLength(
       mode === "buffered" ? 15 : 13);
     const fanout = noopRows["session-ingest-fanout"];
+    const queueId = "9".repeat(32), queueName = "96bulls-session-ingest-fanout";
+    fanout.state.attr = { queueId, queueName, accountId: secrets.accountId };
+    const noopWorker = noopRows["session-ingest"];
+    const queueData = { type: "queue", name: "INGEST_FANOUT", queueId, queueName };
+    noopWorker.bindings = noopWorker.bindings.map((b: any) => b.sid !== "INGEST_FANOUT" ? b :
+      { ...b, action: "noop", data: { bindings: [queueData] } });
+    expect(assertOperatorSnapshot(noopSnapshot, input)).toHaveLength(
+      mode === "buffered" ? 15 : 13);
+    for (const delta of [{ queueName: "foreign" }, { queueId: "8".repeat(32) },
+      { queueId: undefined }, { queueName: undefined }, { shim: "foreign" }]) {
+      const rows = { ...noopRows, "session-ingest": { ...noopWorker,
+        bindings: noopWorker.bindings.map((b: any) => b.sid !== "INGEST_FANOUT" ? b :
+          { ...b, data: { bindings: [{ ...queueData, ...delta }] } }) } };
+      expect(() => assertOperatorSnapshot(
+        { ...native, native: { ...native.native, resources: rows } }, input))
+        .toThrow("native_binding_target");
+    }
+    for (const attr of [undefined, { ...fanout.state.attr, accountId: "8".repeat(32) }]) {
+      const rows = { ...noopRows, "session-ingest-fanout": {
+        ...fanout, state: { ...fanout.state, attr } } };
+      expect(() => assertOperatorSnapshot(
+        { ...native, native: { ...native.native, resources: rows } }, input))
+        .toThrow("native_binding_target");
+    }
     for (const status of ["creating", "updating", "deleted", undefined]) {
       const rows = { ...noopRows, "session-ingest-fanout": {
         ...fanout, state: { ...fanout.state, status } } };
