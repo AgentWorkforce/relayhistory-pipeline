@@ -10,6 +10,7 @@ import {orderedControl,orderedControlResult,type OrderedControl} from "./control
  *
  *   POST /v1/delivery/batches   rth:sync   one batch -> receipt (same shapes, same codes)
  *   GET  /v1/delivery/limits    rth:sync   DELIVERY_LIMITS + contentEncodings
+ *   POST /v1/turns/batches      rth:sync   relay session turns as records (turns.ts), same receipt
  *   GET  /healthz                          liveness only
  *
  * Every other route is `501 unsupported_by_backend`. Selection, reset and
@@ -36,9 +37,10 @@ import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
-import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES } from "./vendor/delivery/delivery-contracts.ts";
+import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
+import { parseTurnBatch } from "./turns.ts";
 import { heartbeatProgress, ProgressError, readConnection, recordHeartbeat, type Run as OnboardingRun } from "../history-db/onboarding.ts";
 
 export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl};
@@ -374,16 +376,18 @@ export function createIngestApp(deps: IngestAppDeps) {
 
   app.get("/v1/delivery/limits", (c) => c.json({ ...DELIVERY_LIMITS, contentEncodings: contentEncodings() }));
 
-  app.post("/v1/delivery/batches", async (c) => {
+  // One acceptance path for the public delivery shape and the private turns shape: the
+  // same custody (relayhistory witness, shadow, or frozen-supabase), claim, buffer and receipt.
+  const acceptBatch = async (c: Context<Env>, route: string, parse: (value: unknown, identity: IngestIdentity) => HistoryExportBatch) => {
     const started = Date.now();
     const identity = c.get("identity");
     const read: BodyRead = { bytes: 0, wireBytes: 0, encoding: "identity" };
-    const fields: Record<string, unknown> = { route: "delivery.batches", org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") };
+    const fields: Record<string, unknown> = { route, org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") };
     try {
-      const batch = parseDeliveryRequest(await jsonOf(c, read));
+      const batch = parse(await jsonOf(c, read), identity);
       const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
       if (!c.get("custody") && custodyMode === "frozen-supabase") c.set("custody", await frozenWitness(await batchWitnessInput(tenant, batch)));
-      else if (c.get("custody")) await shadow("delivery.batches", c.get("custody")!, () => batchWitnessInput(tenant, batch));
+      else if (c.get("custody")) await shadow(route, c.get("custody")!, () => batchWitnessInput(tenant, batch));
       const custody=c.get("custody");
       if(custody&&custody.witness.originalRecordCount!==batch.records.length)throw new IngestUnavailable("fence","custody_record_count");
       const result = await deliverBatch({...deps.deliver,...(custody?{custody}:{})}, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, batch);
@@ -402,7 +406,13 @@ export function createIngestApp(deps: IngestAppDeps) {
       });
       return failure(c, error);
     }
-  });
+  };
+
+  app.post("/v1/delivery/batches", (c) => acceptBatch(c, "delivery.batches", (value) => parseDeliveryRequest(value)));
+
+  // Relay session journal turns (relayhistory TURNS_WRITE_PATH=dual|forward): turns.ts.
+  // Same signed binding, rth:sync and custody as a batch; only the turn record shape.
+  app.post("/v1/turns/batches", (c) => acceptBatch(c, "turns.batches", parseTurnBatch));
 
   // Private archive replay. Unlike the public batch route, this accepts the
   // exact prepared values retained by the old Neon replica archive. It is

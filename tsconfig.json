@@ -47,7 +47,10 @@
     "scripts/sync-ingest-custody-boundary.ts",
     "scripts/sync-ingest-lazy-boundary.ts",
     "scripts/proof-lazy-current-custody.ts",
-    "scripts/build-lazy-custody-source-fixture.ts"
+    "scripts/build-lazy-custody-source-fixture.ts",
+    "scripts/sync-sessions-function-boundary.ts",
+    "scripts/sync-ingest-history-boundary.ts",
+    "scripts/sessions-function-boundary"
   ],
   "exclude": [
     "node_modules",
