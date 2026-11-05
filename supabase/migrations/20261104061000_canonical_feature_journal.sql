@@ -42,6 +42,11 @@ CREATE INDEX canonical_feature_journal_kind_rev ON sessions.canonical_feature_jo
 CREATE INDEX canonical_feature_journal_org_time ON sessions.canonical_feature_journal(org_id,recorded_at);
 ALTER TABLE sessions.canonical_feature_journal ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.canonical_feature_journal FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+-- Least-privilege producer read (bootstrap session_ingest_roles.sql creates the role NOLOGIN):
+-- SELECT only, through an explicit RLS policy; it validates every row it drains.
+GRANT USAGE ON SCHEMA sessions TO bulls96_canonical_feature_producer;
+GRANT SELECT ON sessions.canonical_feature_journal TO bulls96_canonical_feature_producer;
+CREATE POLICY canonical_feature_journal_producer_read ON sessions.canonical_feature_journal FOR SELECT TO bulls96_canonical_feature_producer USING(true);
 
 -- Bounded descriptor shape; its binding to the frozen authority is checked by the invoker.
 CREATE FUNCTION sessions.canonical_feature_pointer_set_valid(ps jsonb)RETURNS boolean
@@ -78,7 +83,8 @@ BEGIN
   OR(p_prior_source IS NULL)<>(p_prior_pointer_set IS NULL)
   OR(p_prior_source IS NOT NULL AND(NOT sessions.canonical_feature_source_valid(p_prior_source)
    OR NOT sessions.canonical_feature_pointer_set_valid(p_prior_pointer_set)OR p_prior_source->>'authorityId'=p_source->>'authorityId'
-   OR p_prior_pointer_set->>'authorityId'IS DISTINCT FROM p_prior_source->>'authorityId'))
+   OR p_prior_pointer_set->>'authorityId'IS DISTINCT FROM p_prior_source->>'authorityId'
+   OR p_prior_source->>'fingerprint'=p_source->>'fingerprint'))
   OR p_pointer_set->>'authorityId'IS DISTINCT FROM p_source->>'authorityId'
  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='canonical_feature_changed: invalid input';END IF;
  -- Each descriptor must be exactly the frozen inventory of its authority, in this scope.

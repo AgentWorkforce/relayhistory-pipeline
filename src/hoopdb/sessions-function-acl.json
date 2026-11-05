@@ -294,7 +294,8 @@
       "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.ingest_history_scope_pointer_page(uuid,integer,integer)": [
-      "<owner>:EXECUTE"
+      "<owner>:EXECUTE",
+      "bulls96_canonical_feature_producer:EXECUTE"
     ],
     "sessions.ingest_history_scope_required(text,text,text,text)": [
       "<owner>:EXECUTE"

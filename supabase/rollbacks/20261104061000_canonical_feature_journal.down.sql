@@ -5,3 +5,5 @@ DROP FUNCTION IF EXISTS sessions.canonical_feature_image_key(jsonb,text);
 DROP FUNCTION IF EXISTS sessions.canonical_feature_source_valid(jsonb);
 DROP FUNCTION IF EXISTS sessions.canonical_feature_pointer_set_valid(jsonb);
 DROP TABLE IF EXISTS sessions.canonical_feature_journal;
+DO $r$BEGIN IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_canonical_feature_producer')THEN
+ REVOKE USAGE ON SCHEMA sessions FROM bulls96_canonical_feature_producer;END IF;END$r$;

@@ -10,7 +10,7 @@ for(const m of sql.matchAll(/CREATE(?: OR REPLACE)? FUNCTION\s+(sessions\.\w+)\(
  defs.set(m[1]+"("+types+")",{secdef:/SECURITY DEFINER/i.test(m[3]!)});
 }
 const grants=new Map<string,string[]>();
-for(const m of sql.matchAll(/GRANT EXECUTE ON FUNCTION([\s\S]*?)TO\s+(bulls96_session_ingest|service_role|session_directory_search_worker)\s*;/gi))
+for(const m of sql.matchAll(/GRANT EXECUTE ON FUNCTION([\s\S]*?)TO\s+(bulls96_session_ingest|bulls96_canonical_feature_producer|service_role|session_directory_search_worker)\s*;/gi))
  for(const raw of m[1]!.replace(/\s+/g,"").split(/,(?=sessions\.)/)){
   const sig=raw.replace(/timestamptz/g,"timestamp with time zone");
   if(!defs.has(sig))throw Error("grant outside publication SQL authority: "+sig);

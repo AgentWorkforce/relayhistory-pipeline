@@ -701,6 +701,7 @@ RETURNS TABLE(ordinal integer,pointer jsonb)LANGUAGE sql STABLE SECURITY DEFINER
  WHERE v.authority_id=p_authority AND p_after>=0 AND p_limit BETWEEN 1 AND 1000 AND e.n-1>=p_after ORDER BY e.n LIMIT p_limit
 $page$;
 REVOKE ALL ON FUNCTION sessions.ingest_history_scope_pointer_page(uuid,integer,integer)FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+GRANT EXECUTE ON FUNCTION sessions.ingest_history_scope_pointer_page(uuid,integer,integer)TO bulls96_canonical_feature_producer;
 
 -- A source snapshot names the immutable mask root, not all million rows. Existing
 -- replay epoch/fingerprint remains the sole logical read/cache authority.
@@ -1572,6 +1573,15 @@ BEGIN
  RETURN jsonb_build_object('buildId',v_build,'leaseToken',v_lease,'expectedAuthorityId',cur);
 END $scopebegin$;
 
+-- The EXACT key set one build registered (its captured source/scope keys). The install refuses
+-- unless the mask record set equals it; rows go with the build (retention by the build's org/time).
+CREATE TABLE sessions.ingest_history_scope_build_records(
+ build_id uuid NOT NULL REFERENCES sessions.ingest_history_scope_builds ON DELETE CASCADE,record_id text NOT NULL,
+ PRIMARY KEY(build_id,record_id)
+);
+ALTER TABLE sessions.ingest_history_scope_build_records ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.ingest_history_scope_build_records FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
 CREATE FUNCTION sessions.ingest_history_scope_build_keys(p jsonb)RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $scopekeys$
 DECLARE b sessions.ingest_history_scope_builds%ROWTYPE;r jsonb;n bigint:=0;
@@ -1584,6 +1594,7 @@ BEGIN
   IF jsonb_typeof(r)IS DISTINCT FROM'string'OR char_length(r#>>'{}')NOT BETWEEN 1 AND 1024 OR octet_length(r#>>'{}')>4096 THEN
    RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: scope key identity';END IF;
   INSERT INTO sessions.ingest_history_scope_keys VALUES(b.org_id,b.workspace_id,r#>>'{}',b.harness,b.session_id)ON CONFLICT DO NOTHING;
+  INSERT INTO sessions.ingest_history_scope_build_records VALUES(b.build_id,r#>>'{}')ON CONFLICT DO NOTHING;
   n:=n+1;
  END LOOP;
  FOR r IN SELECT value FROM jsonb_array_elements(p->'owners')LOOP
@@ -1656,6 +1667,12 @@ BEGIN
    SELECT 1 FROM sessions.ingest_history_scope_keys k WHERE k.org_id=b.org_id AND k.workspace_id=b.workspace_id AND k.record_id=r.record_id
     AND k.harness=b.harness AND k.session_id=b.session_id))
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: mask record not registered as a scope key';END IF;
+ -- Exact set equality: the mask's distinct records are exactly the keys THIS build registered.
+ IF(SELECT count(DISTINCT r.record_id)FROM sessions.ingest_history_mask_rows(m.sha256,0,m.record_count::integer)r)<>m.record_count
+  OR(SELECT count(*)FROM sessions.ingest_history_scope_build_records br WHERE br.build_id=b.build_id)<>m.record_count
+  OR EXISTS(SELECT 1 FROM sessions.ingest_history_mask_rows(m.sha256,0,m.record_count::integer)r WHERE NOT EXISTS(
+   SELECT 1 FROM sessions.ingest_history_scope_build_records br WHERE br.build_id=b.build_id AND br.record_id=r.record_id))
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: mask record set does not equal the build key set';END IF;
  -- Replacement: pin the PRIOR authority and its exact pointer inventory BEFORE the pointer CAS.
  IF cur IS NOT NULL THEN
   SELECT *INTO prior FROM sessions.ingest_history_scope_versions WHERE authority_id=cur FOR UPDATE;
@@ -1674,6 +1691,8 @@ BEGIN
  -- The fingerprint binds the snapshot that now names this authority as current and ready.
  v_fp:=encode(sha256(convert_to(sessions.session_replay_source_snapshot(b.org_id,b.workspace_id,b.harness,b.session_id)::text,'UTF8')),'hex');
  UPDATE sessions.ingest_history_scope_versions SET source_fingerprint=v_fp WHERE authority_id=v_id;
+ IF cur IS NOT NULL AND v_fp=prior.source_fingerprint THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: replacement does not change the source fingerprint';END IF;
  -- 610 compose point: the feature journal append is atomic with the pointer CAS above;
  -- any later failure or rollback of this transaction emits nothing.
  -- Replacement emits retire(prior authority, prior inventory) then publish(new authority, new

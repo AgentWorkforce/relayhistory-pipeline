@@ -226,6 +226,8 @@ test("610 compose: the invoker refuses raw pointers, descriptors that miss the f
       [sc, src, null, ds({ count: "01" }), null],                // non-canonical count
       [sc, src, src, ds(), null],                                // prior source without prior descriptor
       [sc, src, src, ds(), ds()],                                // self-retire
+      // identical content under a NEW authority: no retire+publish of the same fingerprint
+      [sc, src, JSON.stringify({ ...r.source, authorityId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }), ds(), ds({ authorityId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" })],
     ]) { await db.exec("SAVEPOINT x"); await expect(call(bad)).rejects.toThrow("canonical_feature_changed"); await db.exec("ROLLBACK TO SAVEPOINT x"); }
   } finally { await db.exec("ROLLBACK"); }
 });
@@ -248,4 +250,35 @@ test("610 compose: no role may append to the journal directly", async () => {
     await db.exec("BEGIN; SET LOCAL ROLE " + role);
     try { await expect(db.query("SELECT sessions.canonical_feature_changed('{}','{}',NULL,'{}',NULL)")).rejects.toThrow(); } finally { await db.exec("ROLLBACK"); }
   }
+});
+
+test("exact key set: the install refuses when the build registered keys the mask does not carry", async () => {
+  const s = await scope(["k1"]);
+  const { b } = await build(s, ["k1", "k2"]);             // k2 registered by this build, absent from the mask
+  await expect(install(b, s)).rejects.toThrow("mask record set does not equal the build key set");
+  expect((await db.query("SELECT count(*)::int n FROM sessions.canonical_feature_journal WHERE org_id=$1", [s.identity.orgId])).rows[0]!.n).toBe(0);
+});
+
+test("exact key set: keys a PREVIOUS build registered do not count for this build", async () => {
+  const s = await scope(["k1", "k2"]);
+  await build(s, ["k1", "k2"]);                            // abandoned by the next begin
+  const { b } = await build(s, ["k1"]);                    // this build only registers k1
+  await expect(install(b, s)).rejects.toThrow("mask record set does not equal the build key set");
+});
+
+test("producer role: read-only journal + frozen pointer pages; no writer, seed or creator access", async () => {
+  const s = await scope(["k1"]), r = await install((await build(s, ["k1"])).b, s);
+  const as = async <T>(fn: () => Promise<T>) => { await db.exec("BEGIN; SET LOCAL ROLE bulls96_canonical_feature_producer"); try { return await fn(); } finally { await db.exec("ROLLBACK"); } };
+  expect(await as(async () => (await db.query<any>("SELECT count(*)::int n FROM sessions.canonical_feature_journal WHERE org_id=$1", [s.identity.orgId])).rows[0].n)).toBe(1);
+  expect(await as(async () => (await db.query<any>("SELECT pointer->>'manifest_key' k FROM sessions.ingest_history_scope_pointer_page($1::uuid,0,10)", [r.authorityId])).rows.map((x) => x.k))).toEqual([s.row.manifest_key]);
+  for (const sql of [
+    "INSERT INTO sessions.canonical_feature_journal(revision,kind,org_id,workspace_id,scope,schema_generation,image_key,source_hash,source_authority,pointer_set) VALUES(999999,'seed','','','{}','" + gen + "','seed','" + "0".repeat(64) + "','{}','{}')",
+    "DELETE FROM sessions.canonical_feature_journal",
+    "SELECT sessions.canonical_feature_changed('{}','{}',NULL,'{}',NULL)",
+    "SELECT sessions.canonical_feature_journal_seed(1,'" + gen + "')",
+    "SELECT sessions.ingest_history_scope_begin('{}')",
+    "SELECT * FROM sessions.ingest_history_scope_versions",
+  ]) await as(async () => { await expect(db.query(sql)).rejects.toThrow(/permission denied|must be/); });
+  const attrs = (await db.query<any>("SELECT rolcanlogin,rolinherit,rolbypassrls,rolsuper FROM pg_roles WHERE rolname='bulls96_canonical_feature_producer'")).rows[0];
+  expect(attrs).toEqual({ rolcanlogin: false, rolinherit: false, rolbypassrls: false, rolsuper: false });
 });

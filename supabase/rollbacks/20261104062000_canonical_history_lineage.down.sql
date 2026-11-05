@@ -324,6 +324,7 @@ DROP FUNCTION IF EXISTS
  sessions.ingest_history_pointer(sessions.session_index),
  sessions.ingest_history_root(text);
 DROP TABLE IF EXISTS
+ sessions.ingest_history_scope_build_records,
  sessions.ingest_history_scope_builds,
  sessions.ingest_history_graph_scan,
  sessions.ingest_history_privacy_outbox,
