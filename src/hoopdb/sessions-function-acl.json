@@ -673,6 +673,18 @@
     "sessions.session_briefs_forget()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_desktop_catalog_mark_parents()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_desktop_catalog_projected()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_desktop_catalog_reproject_page(text,text,text,text,integer)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_desktop_catalog_requeue_watchers()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_directory_activity(text,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
@@ -833,6 +845,9 @@
       "<owner>:EXECUTE"
     ],
     "sessions.set_session_brief_documents_live(boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.set_session_desktop_catalog_forget_tracking(boolean)": [
       "<owner>:EXECUTE"
     ],
     "sessions.set_session_state(text,text,text,text,text,text,timestamp with time zone)": [

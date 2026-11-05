@@ -23,13 +23,12 @@ export const OWNER_APPLY = {
   owner: "postgres",
   login: "cli_login_postgres",
   database: "postgres",
-  // Resume pin. The 462 apply (2026-11-05 00:49Z) committed all 13 planned
-  // migrations onto the 175cd1eb baseline, then its verify transaction lost a
-  // deadlock to autovacuum and rolled back, leaving readiness pending. A
-  // read-only proof showed the live ledger is exactly 175cd1eb plus those 13
-  // (matching checksums). Pinning the full ledger means a run can apply no
-  // schema; it only repeats the hardening, phase-2 verification and PASS.
-  ledger: "de0e2fa02ba662bbc1e0ec23e1f619100d3b7cd824e8d055b04c44076d452729",
+  // Window #2 starts from the verified Window #1 ledger (35 rows).
+  // Fresh read-only owner proof on 2026-11-05 20:05Z matched this exact
+  // digest. Reject earlier baselines rather than allowing migration gaps.
+  // This pin is not production apply approval; source, plan, capture and
+  // human approval bindings remain mandatory.
+  ledger: "3173f2df7f749fd79c340286f3284d91d8f5a8b988b7f1b1a11e01c3a3307641",
   protocol: "owner-schema-apply-v1",
   execution: "ssh-sf-frame-owner-schema-apply",
   maxAgeMs: 3600000,

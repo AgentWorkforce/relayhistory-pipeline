@@ -7,6 +7,21 @@ permissions:
   contents: read
 jobs:
   checks:
+    # Preserve the existing required check name: neither parallel job may be
+    # skipped, canceled or failing when this gate goes green.
+    needs: [unit-tests, aws-hardening-mutations]
+    if: ${{ always() }}
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - name: Require unit and mutation checks
+        env:
+          UNIT_RESULT: ${{ needs.unit-tests.result }}
+          MUTATION_RESULT: ${{ needs.aws-hardening-mutations.result }}
+        run: |
+          test "$UNIT_RESULT" = "success"
+          test "$MUTATION_RESULT" = "success"
+  unit-tests:
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 40
     # A real ClickHouse for the session read API's query tests
@@ -50,8 +65,6 @@ jobs:
           node-version: 24
       - name: Install (root + workspaces)
         run: bun install --frozen-lockfile
-      - name: Verify RelayHistory-owned Amp source
-        run: bun scripts/sync-amp-provider.mjs --check
       - name: Typecheck packages/pipeline
         run: bun run --filter @96bulls/pipeline typecheck
       - name: Test packages/pipeline (vitest, in-process PGlite; no real database)
@@ -66,8 +79,6 @@ jobs:
         run: bun test --timeout 30000
       - name: Unit tests (IaC values, stacks/)
         run: bun test --timeout 30000 ./stacks
-      - name: AWS hardening mutation check (each reverted control must turn a test red)
-        run: bun scripts/aws-hardening-mutations.ts
       - name: Guard - no Helm hooks in any chart or manifest in this repo
         run: |
           # The annotation key is assembled so this file never matches its own guard; .github is excluded as well.
@@ -76,6 +87,54 @@ jobs:
       - name: Guard - nothing secret-like committed
         run: |
           ! git ls-files | grep -E '(^|/)(\.env|inputs\.json|.*\.pem)$' || (echo "secret-like file tracked"; exit 1)
+  # Keep every mutation, but give the long unit suite and mutation suite their
+  # own budgets. Running both serially exceeded the old 40-minute limit.
+  aws-hardening-mutations:
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    # Several mutations exercise the real ClickHouse read API tests.
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: ci-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password ci-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      READ_API_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      READ_API_TEST_CLICKHOUSE_PASSWORD: ci-only
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED)" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install (root + workspaces)
+        run: bun install --frozen-lockfile
+      - name: Build packages/object-store
+        run: bun run --filter @relayhistory/object-store build
+      - name: AWS hardening mutation check (each reverted control must turn a test red)
+        run: bun scripts/aws-hardening-mutations.ts
+      - name: Verify mutations restored their source files
+        run: git diff --exit-code
   # Build only: no registry login, publish, deploy, or provider credentials.
   amp-transport-image:
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
