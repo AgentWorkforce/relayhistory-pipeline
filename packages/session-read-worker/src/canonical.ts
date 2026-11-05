@@ -277,9 +277,13 @@ export async function canonicalHandle(
     if (order !== "asc" && order !== "desc")
       throw new CanonicalReadError("parameter", 400);
     const mode = env.CANONICAL_READ_MODE ?? "raw";
+    // Raw mode has no timing projection: keep refusing session_timing (and
+    // windows) there; only the pages artifact serves them.
     if (
       mode !== "pages" &&
-      (url.searchParams.has("since") || url.searchParams.has("until"))
+      (url.searchParams.has("since") ||
+        url.searchParams.has("until") ||
+        table === "session_timing")
     )
       throw new CanonicalReadError("parameter", 400);
     if (mode !== "raw" && mode !== "pages")

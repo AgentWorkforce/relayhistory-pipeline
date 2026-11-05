@@ -12,6 +12,14 @@ export interface TimingIdentity {
   source: string;
   sessionId: string;
 }
+/** Source data the timing projection cannot interpret; retrying the same source never succeeds. */
+export class CanonicalTimingError extends Error {
+  readonly code = "canonical_timing_invalid";
+  constructor(message: string) {
+    super(message);
+    this.name = "CanonicalTimingError";
+  }
+}
 type Row = Record<string, unknown>;
 type Range = { start: bigint; end: bigint };
 type Interval = Range & { owner: string; bucket: "work" | "waiting" };
@@ -33,11 +41,11 @@ const nonempty = (v: unknown) => {
 export function timingMicros(value: unknown): bigint {
   if (value instanceof Date) value = value.toISOString();
   if (typeof value !== "string")
-    throw new Error("canonical timing timestamp invalid");
+    throw new CanonicalTimingError("canonical timing timestamp invalid");
   const ms = Date.parse(value),
     fraction = /\.(\d{1,6})(?:Z|[+-]\d\d(?::?\d\d)?)$/u.exec(value)?.[1] ?? "";
   if (!Number.isFinite(ms))
-    throw new Error("canonical timing timestamp invalid");
+    throw new CanonicalTimingError("canonical timing timestamp invalid");
   return BigInt(ms) * 1000n + BigInt(fraction.padEnd(6, "0").slice(3));
 }
 function iso(value: bigint | null) {
@@ -61,7 +69,7 @@ function duration(value: unknown): bigint | null {
     return BigInt(value);
   if (typeof value === "bigint") return value;
   if (typeof value === "string" && /^-?\d+$/u.test(value)) return BigInt(value);
-  throw new Error("canonical timing duration invalid");
+  throw new CanonicalTimingError("canonical timing duration invalid");
 }
 function merge(ranges: Range[]): Range[] {
   const sorted = ranges

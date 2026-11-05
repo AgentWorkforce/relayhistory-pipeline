@@ -679,6 +679,20 @@ export async function canonicalArtifactPage(
           MAX_REPLY_BYTES - replyBytes - 4096
       )
         break;
+      // A rowJson blob is the exact UTF-8 bytes of JSON.stringify(row), so the
+      // encoded reply item is strictly larger. Refuse (first row) or stop
+      // (later rows) on the declared size before allocating or fetching any
+      // segment; the post-hydrate size checks below stay authoritative.
+      if (
+        !["replay", "legacy"].includes(view) &&
+        obj(entry) &&
+        obj(entry.rowJson) &&
+        count(entry.rowJson.bytes) &&
+        entry.rowJson.bytes > MAX_REPLY_BYTES - replyBytes - 4096
+      ) {
+        if (rows.length) break;
+        fail("row_bound");
+      }
       const row = await hydrate(entry),
         item = { table: query.table, row },
         size = encoder.encode(JSON.stringify(item)).byteLength;

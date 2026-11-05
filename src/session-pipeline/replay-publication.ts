@@ -3,11 +3,11 @@ import type { NodeReadProfile } from "../session-read-api/node-read-profile.ts";
  * RPCs; the public claim RPC has the existing search-worker JWT policy. */
 import * as zlib from "node:zlib";
 import type { SqlExecutor } from "../../packages/pipeline/src/lib/pipeline/queue.ts";
-import { canonicalProducerSnapshot, canonicalSourceGeneration, type CanonicalPointer, type CanonicalIdentity } from "../session-read-api/canonical.ts";
+import { CanonicalReadError, canonicalProducerSnapshot, canonicalSourceGeneration, type CanonicalPointer, type CanonicalIdentity } from "../session-read-api/canonical.ts";
 import { ARTIFACT_MAX_SOURCE_POINTERS, type ArtifactSource, type ArtifactPublication } from "../session-read-api/canonical-artifact.ts";
 import type { ObjectStore } from "../../packages/object-store/src/index.ts";
 import type { SessionScope } from "./pointer.ts";
-import { canonicalTimingProjection } from "../session-read-api/canonical-timing.ts";
+import { CanonicalTimingError, canonicalTimingProjection } from "../session-read-api/canonical-timing.ts";
 import { artifactDigest, ArtifactBuildError, materializeCanonicalArtifacts } from "./replay-pages.ts";
 export interface ReplayCapture {
   exists: boolean; blocked: boolean; identity: CanonicalIdentity; source: ArtifactSource;
@@ -19,6 +19,38 @@ export interface ReplayProducerDeps {
   db: SqlExecutor; store: ObjectStore; provider: string; bucket: string;
   prefix: { PIPELINE_ORG_FROM_PREFIX?: string; PIPELINE_KEY_PREFIX?: string };
   decompress?: (bytes: Uint8Array, maxBytes: number) => Uint8Array;
+}
+/**
+ * A replay-stage throw that retrying the same message cannot fix.
+ * - superseded: the source moved on (lost source race or lost publication CAS);
+ *   the newer source write has its own S3 event, which re-runs the scope.
+ * - capacity: the scope exceeds a producer bound or a PostgreSQL capacity guard
+ *   (SQLSTATE 54000); the same source refuses the same way on every retry.
+ * Anything else (S3 AccessDenied, network, unexpected throws) is null and stays
+ * a batch failure. Classified by typed error and code only, never message text.
+ */
+export interface ReplayRefusal { kind: "superseded" | "capacity"; reason: "replay_source_superseded" | "replay_capacity_refused"; code: string }
+const SUPERSEDED_ARTIFACT_CODES = new Set(["artifact_source_changed", "artifact_publish_cas_failed"]);
+const CAPACITY_ARTIFACT_CODES = new Set(["artifact_capture_bound", "artifact_row_bound", "artifact_output_bound", "artifact_depth_bound"]);
+export function classifyReplayFailure(error: unknown): ReplayRefusal | null {
+  const superseded = (code: string): ReplayRefusal => ({ kind: "superseded", reason: "replay_source_superseded", code });
+  const capacity = (code: string): ReplayRefusal => ({ kind: "capacity", reason: "replay_capacity_refused", code });
+  if (error instanceof ArtifactBuildError) {
+    if (SUPERSEDED_ARTIFACT_CODES.has(error.code)) return superseded(error.code);
+    if (CAPACITY_ARTIFACT_CODES.has(error.code)) return capacity(error.code);
+    return null;
+  }
+  if (error instanceof CanonicalReadError) {
+    if (error.reason === "source_generation_changed") return superseded(error.reason);
+    // >ARTIFACT_MAX_SOURCE_POINTERS pointers, or >256 MiB / >1M records (projection "scope_too_large").
+    if (error.reason === "pointer_bound") return capacity(error.reason);
+    if (error.reason === "canonical_projection_incomplete" && error.details.includes("scope_too_large")) return capacity("scope_too_large");
+    return null;
+  }
+  if (error instanceof CanonicalTimingError) return capacity(error.code);
+  // node-postgres / PGlite surface SQLSTATE as `code` (e.g. replay capture pointer/metadata capacity).
+  if (error instanceof Error && (error as { code?: unknown }).code === "54000") return capacity("54000");
+  return null;
 }
 export interface ReplayProducerResult { published: boolean; reason?: "absent" | "source_blocked"; publication?: ArtifactPublication; rows?: number; objects?: number; bytes?: number }
 const fail = (code: string): never => { throw new ArtifactBuildError(code); };

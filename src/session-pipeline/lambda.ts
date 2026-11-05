@@ -43,6 +43,7 @@ import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
+import { searchIndexLimits } from "./search-index.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
@@ -226,6 +227,8 @@ async function init(): Promise<Runtime> {
       store,
       ch: createClickHouseClient(secret.clickhouse),
       prefixFor: (orgId) => `${env.keyPrefix}/${orgId}`,
+      // Raised to the replay producer's source bound only when that stage is on.
+      limits: searchIndexLimits(env.replayPagesEnabled),
     };
   }
   if (env.replayPagesEnabled) {
