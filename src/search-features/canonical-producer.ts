@@ -139,6 +139,7 @@ export function produceBriefFeatures(
   rows: CanonicalBriefRow[],
   tombstones: CanonicalBriefTombstone[],
   e: CanonicalImageEvidence,
+  retentionDays = 0,
 ): CanonicalProduceResult {
   try {
     return {
@@ -147,7 +148,7 @@ export function produceBriefFeatures(
         ...rows.map((r) => briefFeatureRow(briefSnapshot(r, e), e.revision)),
         ...tombstones.map((t) =>
           briefFeatureRow(briefTombstoneSnapshot(t, e), e.revision)),
-      ],
+      ].map((r) => ({ ...r, retention_days: retentionDays })),
     };
   } catch (err) {
     if (err instanceof EventFeatureError)
@@ -177,6 +178,7 @@ export function produceEventFeatures(
   rows: CanonicalEventRow[],
   tombstones: CanonicalTombstone[],
   e: CanonicalImageEvidence,
+  retentionDays = 0,
 ): CanonicalProduceResult {
   try {
     return {
@@ -185,7 +187,7 @@ export function produceEventFeatures(
         ...rows.map((r) => eventFeatureRow(eventSnapshot(r, e), e.revision)),
         ...tombstones.map((t) =>
           eventFeatureRow(tombstoneSnapshot(t, e), e.revision)),
-      ],
+      ].map((r) => ({ ...r, retention_days: retentionDays })),
     };
   } catch (err) {
     if (err instanceof EventFeatureError)

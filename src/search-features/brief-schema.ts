@@ -9,6 +9,12 @@ export function briefFeatureSchemaStatements(): string[] {
  brief_completed_at DateTime64(6,'UTC'),embedding Array(Float32),embedding_model Nullable(String),embedding_dim UInt32,content_hash String,
  INDEX title_text title_folded TYPE text(tokenizer=ngrams(3)),
  INDEX description_text description_folded TYPE text(tokenizer=ngrams(3))
-) ENGINE=ReplacingMergeTree(version) ORDER BY(org_id,workspace_id,source,session_id) SETTINGS index_granularity=1024`,
+,
+ retention_days UInt32 DEFAULT 0
+) ENGINE=ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(brief_completed_at)
+ORDER BY(org_id,workspace_id,source,session_id)
+TTL toDateTime(brief_completed_at) + toIntervalDay(retention_days) DELETE WHERE retention_days > 0
+SETTINGS index_granularity=1024`,
   ];
 }

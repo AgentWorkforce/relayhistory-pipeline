@@ -50,7 +50,7 @@ const legacyRef = (r: CanonicalEventRow) => ({
     eventId: r.eventId, ts: r.ts },
   revision: LEGACY_REV, sourceHash: HASH, deleted: false,
 });
-const AUTHORITY = ["version", "source_revision", "source_hash"];
+const AUTHORITY = ["version", "source_revision", "source_hash", "retention_days"];
 
 describe("canonical feature producer", () => {
   test("non-authority fields are byte-identical to the legacy copier row", () => {
@@ -125,6 +125,18 @@ describe("canonical feature producer", () => {
       if (!AUTHORITY.includes(k)) expect(c[k]).toEqual(legacy[k]);
     expect(c.version).toBe(featureVersion(CANON_REV));
     expect(c.source_revision).toBe(CANON_REV);
+  });
+  test("retention_days stamps onto produced rows, default 0 = keep forever", () => {
+    const out = produceEventFeatures([row()], [], ev, 90);
+    if (out.kind !== "rows") throw new Error(out.reason);
+    expect(out.rows[0]!.retention_days).toBe(90);
+    const keep = produceEventFeatures([row()], [], ev);
+    if (keep.kind !== "rows") throw new Error(keep.reason);
+    expect(keep.rows[0]!.retention_days).toBe(0);
+    const bout = produceBriefFeatures([], [{
+      orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" }], ev, 30);
+    if (bout.kind !== "rows") throw new Error(bout.reason);
+    expect(bout.rows[0]!.retention_days).toBe(30);
   });
   test("brief tombstone carries empty fields + epoch stamp", () => {
     const t: CanonicalBriefTombstone = {
