@@ -22,7 +22,9 @@ const read = fileReader(AGENT_DIR);
 const source = (name: string) => readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
 const repoFile = (name: string) => readFileSync(new URL(`../../${name}`, import.meta.url), "utf8").replace(/\r\n/g, "\n");
 /** Headroom under EC2's 25,600-byte cap, so the kit and prompt can grow. */
-const USER_DATA_BUDGET = 22_000;
+// EC2 caps user data at 25,600 bytes. Keep at least 2,000 of headroom, the
+// same rule the layered-agents module tests (relay workers add ~8 KB).
+const USER_DATA_BUDGET = 23_600;
 
 test("names: the module's defaults for a new agent, except the platform prefix (pinned in layered-agents infra too)", () => {
   assert.deepEqual(agent.names, {
@@ -90,7 +92,9 @@ test("the lead runs on Fable: the rendered lead unit starts Claude Code with --m
   const launch = script.split("\n").filter((l) => l.startsWith("ExecStart=/usr/bin/tmux new-session -d -s lead "));
   assert.equal(launch.length, 1);
   assert.match(launch[0]!, /"claude --model claude-fable-5-1 --dangerously-skip-permissions --append-system-prompt-file \/opt\/agent-host\/lead-prompt\.md /);
-  assert.equal([...script.matchAll(/claude --model (\S+)/g)].map((m) => m[1]).join(","), "claude-fable-5-1");
+  // Every hard-coded model id is Fable. (The worker launcher passes its model
+  // through "$model", which defaults to the lead's Fable; it is not a literal.)
+  assert.deepEqual([...new Set([...script.matchAll(/claude --model ([a-z0-9][\w.-]*)/g)].map((m) => m[1]))], ["claude-fable-5-1"]);
 });
 
 test("the env file sources cleanly in bash, with both repos and the relay identity", () => {
