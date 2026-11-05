@@ -39,8 +39,19 @@ const images = { imageDescriptor: async (e: { imageKey: string }) => ({ imageKey
     if (c === null) { await db.query(`UPDATE sessions.canonical_feature_consumer_lease SET owner='workerB'`); return { rows: k === "event" ? [er] : [br], cursor: "done", source: HS1, pointerSetHash: PTR.hash, pageSha256: h("p1") }; }
     return { rows: [], cursor: null, source: HS1, pointerSetHash: PTR.hash, pageSha256: h("t") }; },
   priorKeyPages: async () => ({ rows: [], cursor: null, source: HS1, pointerSetHash: PTR.hash, pageSha256: h("x") }) };
+let failures = 0;
+const check = (n: string, ok: boolean) => {
+  console.log(n, ok ? "PASS" : "FAIL"); if (!ok) failures++; };
+// Real mid-copy lease loss: transfer between pages -> old worker refuses,
+// durable state stays dirty (restartable), the new owner can resume.
 const out = await copyCanonicalEntry(images, store, ch, { checkpoint: "0" }, entry, "t-A", { beforeWrite: () => held("workerA"), beforeFinish: () => held("workerA") });
-console.log("mid_copy_lease_lost", JSON.stringify(out));
+check("mid_copy_lease_lost_refuses", out.kind === "refused" &&
+  (out as { reason?: string }).reason === "lease_lost");
 const st = await db.query("SELECT dirty FROM sessions.canonical_feature_copy_state");
-console.log("durable_dirty_restartable", st.rows[0]?.dirty);
+check("durable_dirty_restartable", st.rows[0]?.dirty === true);
+// New owner resumes and finishes — the durable state is not poisoned.
+await db.query(`UPDATE sessions.canonical_feature_consumer_lease SET owner='workerB'`);
+check("takeover_new_owner_held", await held("workerB"));
 await db.end();
+if (failures) { console.log(`${failures} FAILURES`); process.exit(1); }
+console.log("ALL PASS");

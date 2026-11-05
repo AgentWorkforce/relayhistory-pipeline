@@ -7,10 +7,14 @@ CREATE TABLE sessions.canonical_feature_consumer_lease(
   owner text NOT NULL,
   heartbeat_at timestamptz NOT NULL);
 CREATE TABLE sessions.canonical_feature_consumer_dead_letter(
-  entry_revision bigint PRIMARY KEY,
-  image_key text NOT NULL,
-  reason text NOT NULL,
-  attempts int NOT NULL DEFAULT 1,
+  entry_revision bigint PRIMARY KEY CHECK (entry_revision > 0),
+  image_key text NOT NULL
+    CHECK (image_key ~ '^hs1:[a-f0-9]{64}:[a-f0-9]{64}:.+$'),
+  -- stable bounded poison code, never a raw exception message
+  reason text NOT NULL
+    CHECK (reason IN ('row_invalid','image_page_changed',
+                      'image_descriptor_changed','row_bound')),
+  attempts int NOT NULL DEFAULT 1 CHECK (attempts > 0 AND attempts <= 100),
   dead_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE sessions.canonical_feature_consumer_lease
   ENABLE ROW LEVEL SECURITY;
@@ -20,9 +24,11 @@ REVOKE ALL ON sessions.canonical_feature_consumer_lease,
   sessions.canonical_feature_consumer_dead_letter
   FROM PUBLIC,anon,authenticated,service_role,
   bulls96_session_ingest,bulls96_session_ingest_seeder;
-GRANT INSERT,SELECT,UPDATE,DELETE ON
-  sessions.canonical_feature_consumer_lease,
-  sessions.canonical_feature_consumer_dead_letter
+-- Evidence is immutable: producer INSERTs+SELECTs dead letters but can never
+-- DELETE or UPDATE them; lease gets the mutable set it needs.
+GRANT INSERT,SELECT ON sessions.canonical_feature_consumer_dead_letter
+  TO bulls96_canonical_feature_producer;
+GRANT INSERT,SELECT,UPDATE ON sessions.canonical_feature_consumer_lease
   TO bulls96_canonical_feature_producer;
 CREATE POLICY consumer_lease_producer
   ON sessions.canonical_feature_consumer_lease

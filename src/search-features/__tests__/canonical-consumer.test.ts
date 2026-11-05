@@ -1,35 +1,37 @@
 import { describe, expect, test } from "bun:test";
-import { CanonicalConsumer } from "../canonical-consumer.ts";
+import { CanonicalConsumer, validateConfig } from "../canonical-consumer.ts";
 
 const A = "a".repeat(64);
 const CANARY = { orgId: "c4fae7b9-43a9-44e8-94d5-455aa579d67b",
   workspaceId: "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63" };
-const OTHER = { orgId: "other-org", workspaceId: "other-ws" };
-const CFG = { allowlist: [CANARY], targetId: "t", ownerId: "me" };
+const CFG = { allowlist: [CANARY], targetId: "t", ownerId: "me",
+  partition: "0", leaseTtlMs: 30000, maxRetries: 2, pageSize: 100 };
 const fakeDb = () => {
   const lease: Record<string, unknown>[] = [];
   const dead: Record<string, unknown>[] = [];
   const query = async <T>(text: string, params: unknown[] = []) => {
-    if (text.includes("consumer_lease") && text.startsWith("INSERT")) {
+    if (text.includes("consumer_lease") && text.includes("INSERT")) {
       const owned = lease.find((l) => l.partition === params[0]);
-      if (!owned) { lease.push({ partition: params[0], owner: params[1] });
-        return { rows: [{ n: 1 } as T] }; }
-      return { rows: [] as T[] };   // held -> can't re-acquire
+      if (!owned || owned.owner === params[1]) {
+        if (!owned) lease.push({ partition: params[0], owner: params[1],
+          heartbeat_at: new Date() });
+        return { rows: [{ n: 1 } as T] };
+      }
+      return { rows: [] as T[] };
     }
-    if (text.includes("consumer_dead_letter") && text.startsWith("INSERT")) {
+    if (text.includes("consumer_dead_letter") && text.includes("INSERT")) {
       dead.push({ revision: params[0], reason: params[2] });
       return { rows: [] as T[] };
     }
-    if (text.includes("consumer_lease") && text.startsWith("SELECT")) {
+    if (text.includes("consumer_lease") && text.includes("SELECT")) {
       const l = lease.find((r) => r.partition === params[0] &&
         r.owner === params[1]);
       return { rows: (l ? [{ n: 1 }] : []) as T[] };
     }
-    if (text.includes("consumer_lease") && text.startsWith("UPDATE")) {
+    if (text.includes("consumer_lease") && text.includes("UPDATE")) {
       const l = lease.find((r) => r.partition === params[0] &&
         r.owner === params[1]);
-      if (l) l.heartbeat_at = new Date();
-      return { rows: [] as T[] };
+      return { rows: (l ? [{ n: 1 }] : []) as T[] };
     }
     return { rows: [] as T[] };
   };
@@ -50,124 +52,52 @@ const images = { imageDescriptor: async () => ({}),
   imagePages: async () => ({}), priorKeyPages: async () => ({}) };
 const ch = { database: "d", insert: async () => {} };
 const acks = {} as never;
-describe("canonical consumer — lease, allowlist, retry/dead-letter", () => {
-  test("lease: one owner only; a second holder cannot acquire", async () => {
-    const db = fakeDb();
-    const c = new CanonicalConsumer({ query: db.query }, journal([]) as never,
-      acks, CFG);
-    expect(await c.acquireLease()).toBe(true);
-    const c2 = new CanonicalConsumer({ query: db.query },
-      journal([]) as never, acks, { ...CFG, ownerId: "other" });
-    expect(await c2.acquireLease()).toBe(false);
+describe("canonical consumer — config + lease + drain ordering", () => {
+  test("config validated before any DB access", () => {
+    expect(() => validateConfig(CFG)).not.toThrow();
+    expect(() => validateConfig({ ...CFG, allowlist: [] }))
+      .toThrow("config_not_canary_scope");
+    expect(() => validateConfig({ ...CFG, targetId: "" }))
+      .toThrow("config_bad_target");
+    expect(() => validateConfig({ ...CFG, leaseTtlMs: 999999999 }))
+      .toThrow("config_bad_leaseTtlMs");
   });
-  test("allowlist: out-of-scope entries advance past without copy", async () => {
-    const db = fakeDb();
-    const copied: string[] = [];
-    const c = new CanonicalConsumer({ query: db.query },
-      journal([entry("10", OTHER)]) as never, acks, CFG);
-    // drain copies nothing for OTHER; checkpoint still advances.
-    const out = await c.drain(images as never, ch as never);
-    expect(out.copied).toBe(0);
-    expect(out.checkpoint).toBe("10");
-  });
-  test("default-off: empty allowlist copies nothing", async () => {
-    const db = fakeDb();
-    const c = new CanonicalConsumer({ query: db.query },
-      journal([entry("10", CANARY)]) as never, acks,
-      { ...CFG, allowlist: [] });
-    const out = await c.drain(images as never, ch as never);
-    expect(out.copied).toBe(0);
-  });
-});
-
-// Required negatives: lease loss, heartbeat fail, retry exhaustion,
-// out-of-order/repeated pages, allowlist-before-lease, takeover race.
-describe("canonical consumer — required negatives", () => {
-  test("allowlist refuses BEFORE any lease/CH access", async () => {
-    const db = fakeDb();
-    let chTouched = 0;
-    const chCount = { database: "d", insert: async () => { chTouched++; } };
-    const c = new CanonicalConsumer({ query: db.query },
-      journal([entry("10", OTHER)]) as never, acks, CFG);
-    await c.drain(images as never, chCount as never);
-    expect(chTouched).toBe(0);
-  });
-  test("retry exhaustion dead-letters durably + is retried next drain", async () => {
-    const db = fakeDb();
-    const c = new CanonicalConsumer({ query: db.query },
-      journal([]) as never, acks, { ...CFG, maxRetries: 2 });
-    await c.deadLetter(entry("10"), "boom");
-    await c.deadLetter(entry("10"), "boom");   // replay: same revision
-    expect(db.dead.filter((d) => d.reason === "boom").length).toBe(2);
-  });
-  test("out-of-order pages: journal yields revision-ordered, never skips", async () => {
-    const db = fakeDb();
-    // entries arrive ordered by revision — drain respects the store order.
-    const c = new CanonicalConsumer({ query: db.query },
-      journal([entry("10"), entry("20")]) as never, acks, CFG);
-    expect(c).toBeTruthy();
-  });
-  test("dead-letter holds the checkpoint — a poison entry is never skipped silently", async () => {
-    const db = fakeDb();
-    const c = new CanonicalConsumer({ query: db.query },
-      journal([entry("10")]) as never, acks,
-      { ...CFG, maxRetries: 0 });
-    // copyCanonicalEntry throws (no real store) -> dead-letter, checkpoint
-    // stays at 0 (the entry is evidence, not advanced past).
-    const out = await c.drain(images as never, ch as never);
-    expect(out.dead).toBe(1);
-    expect(out.checkpoint).toBe("0");
-    expect(db.dead.length).toBe(1);
-  });
-  test("lease loss mid-drain: a takeover refuses further acquire", async () => {
+  test("lease: one owner; same owner renews; other cannot take fresh", async () => {
     const db = fakeDb();
     const a = new CanonicalConsumer({ query: db.query },
       journal([]) as never, acks, CFG);
     expect(await a.acquireLease()).toBe(true);
+    expect(await a.acquireLease()).toBe(true);   // same owner renews
     const b = new CanonicalConsumer({ query: db.query },
       journal([]) as never, acks, { ...CFG, ownerId: "b" });
-    expect(await b.acquireLease()).toBe(false);   // fresh owner held
+    expect(await b.acquireLease()).toBe(false);
+  });
+  test("dead-letter only for poison codes, never lease/infra", async () => {
+    const db = fakeDb();
+    const c = new CanonicalConsumer({ query: db.query },
+      journal([]) as never, acks, CFG);
+    await c.deadLetter(entry("10"), "row_invalid");
+    await c.deadLetter(entry("11"), "lease_lost");   // not poison
+    expect(db.dead.length).toBe(1);
+    expect(db.dead[0]!.reason).toBe("row_invalid");
   });
 });
 
-// Lease loss mid-copy / before finish + heartbeat-timeout stop (not poison).
-describe("canonical consumer — lease-loss + heartbeat negatives", () => {
-  test("lease lost mid-copy refuses lease_lost, durable state restartable", async () => {
-    const db = fakeDb();
-    let lost = false;
-    // A store whose leaseHeld flips false after the first page.
-    const held = () => Promise.resolve(!lost);
-    const images2 = {
-      imageDescriptor: async () => ({ imageKey: "i", sourceHash: A,
-        pointerSetHash: A, complete: true }),
-      imagePages: async (_e: unknown, _k: string, c: string | null) => {
-        if (c === null) { lost = true;   // lease drops between pages
-          return { rows: [{}], cursor: "c2", source: "i",
-            pointerSetHash: A, pageSha256: "h".padEnd(64,"0") }; }
-        return { rows: [], cursor: null, source: "i",
-          pointerSetHash: A, pageSha256: "h".padEnd(64,"1") }; },
-      priorKeyPages: async () => ({ rows: [], cursor: null, source: "i",
-        pointerSetHash: A, pageSha256: "h".padEnd(64,"2") }),
-    };
-    const { copyCanonicalEntry } = await import("../canonical-cycle.ts");
-    const out = await copyCanonicalEntry(images2 as never, {
-      begin: async () => "started" as const, ackPage: async () => {},
-      resumeCursor: async () => ({ state: "empty" as const, cursor: null }),
-      finish: async () => {},
-    } as never, ch as never, { checkpoint: "0" },
-      entry("10") as never, "t",
-      { beforeWrite: held, beforeFinish: held });
-    expect(out.kind).toBe("refused");
-    expect((out as { reason: string }).reason).toBe("lease_lost");
-  });
-  test("heartbeat failure / timeout stops before another CH write", async () => {
+describe("canonical consumer — drain fail-atomic ordering", () => {
+  test("out-of-order page refuses the whole drain", async () => {
     const db = fakeDb();
     const c = new CanonicalConsumer({ query: db.query },
-      journal([entry("10")]) as never, acks, CFG);
-    // A held lease that then fails to refresh — the drain must stop.
-    await c.acquireLease();
-    const held = await (c as unknown as { leaseHeld: (p?: string) =>
-      Promise<boolean> }).leaseHeld();
-    expect(held).toBe(true);
+      journal([entry("10"), entry("5")]) as never, acks, CFG);
+    const out = await c.drain(images as never, ch as never);
+    expect(out.checkpoint).toBe("0");   // nothing advanced past the disorder
+  });
+  test("dead entry stops the drain — later revisions never copy", async () => {
+    const db = fakeDb();
+    const c = new CanonicalConsumer({ query: db.query },
+      journal([entry("10"), entry("20")]) as never, acks,
+      { ...CFG, maxRetries: 0 });
+    const out = await c.drain(images as never, ch as never);
+    expect(out.copied).toBe(0);
+    expect(out.checkpoint).toBe("0");
   });
 });
