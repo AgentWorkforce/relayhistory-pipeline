@@ -9,9 +9,9 @@
  * into the platform's ack / retry / dead-letter mechanics:
  *
  *   workers   long-running pods polling the HoopDb queue; schedules in-process (OSS default)
- *   lambda    S3 -> SQS -> Lambda partial batch response; EventBridge schedules (cloud)
- *   cloudrun  GCS -> Pub/Sub push -> Cloud Run; Cloud Scheduler (cloud)
- *   terse     durable actors: one actor per session scope, alarms for schedules (cloud, stub)
+ *   lambda    possible S3 -> SQS -> Lambda binding with EventBridge schedules
+ *   cloudrun  possible GCS -> Pub/Sub -> Cloud Run binding with Cloud Scheduler
+ *   terse     planned per-session durable-actor binding (not implemented here)
  *
  * Delivery is at-least-once everywhere, so the handler must be idempotent and
  * serialize per session scope itself (advisory lock today) unless the runtime
@@ -47,7 +47,7 @@ export type WorkItem =
 
 export type WorkOutcome =
   | { readonly status: "done" }
-  /** Try again no sooner than delaySeconds (a busy scope, a transient backend error). */
+  /** Retry after a finite, nonnegative delay (a busy scope or transient backend error). */
   | { readonly status: "retry"; readonly delaySeconds: number; readonly code: string }
   /** Will never succeed (unparseable input): park it for an operator. */
   | { readonly status: "dead"; readonly code: string };
@@ -121,9 +121,15 @@ export async function settle(
   }
   for (const item of items) {
     const outcome = answered?.get(item.id);
+    const valid = outcome && (
+      outcome.status === "done" ||
+      (outcome.status === "dead" && typeof outcome.code === "string" && outcome.code.length > 0) ||
+      (outcome.status === "retry" && Number.isFinite(outcome.delaySeconds) && outcome.delaySeconds >= 0 &&
+        typeof outcome.code === "string" && outcome.code.length > 0)
+    );
     out.set(
       item.id,
-      outcome && ["done", "retry", "dead"].includes(outcome.status)
+      valid
         ? outcome
         : { status: "retry", delaySeconds: DEFAULT_RETRY_DELAY_SECONDS, code: answered ? "no_outcome" : "handler_threw" },
     );

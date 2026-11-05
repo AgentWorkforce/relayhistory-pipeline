@@ -4,12 +4,13 @@
  *
  * Same rules as the destination registry (../destinations/registry.ts): no
  * plugin discovery, no I/O, no credential reads. The OSS engine registers its
- * defaults (postgres search, worker-pod runtime); a composition such as
- * sessions-pipeline-cloud registers provider adapters (clickhouse,
- * opensearch, lambda, cloudrun, terse) before calling `select`.
+ * defaults (postgres search, worker-pod runtime); a composition explicitly
+ * registers any additional implementations before calling `create`.
+ * Provider implementation ownership is not selected by this registry.
  *
- * Selection happens once at boot and fails closed: an unknown or
- * unregistered name is a configuration error, never a silent fallback.
+ * Creation happens once at boot and fails closed: an unknown or unregistered
+ * name is a configuration error, never a silent fallback. `select` only
+ * validates a name against the entry point's declared supported choices.
  */
 
 export const SEARCH_INDEX_BACKENDS = ["postgres", "clickhouse", "opensearch"] as const;
@@ -112,7 +113,7 @@ export function validateAdapterEnv(
     entry.runtimeDefault ?? DEFAULT_PIPELINE_RUNTIME,
   );
   return {
-    search: search.select(env, entry.search ?? SEARCH_INDEX_BACKENDS),
+    search: search.select(env, entry.search ?? [entry.searchDefault ?? DEFAULT_SEARCH_INDEX_BACKEND]),
     runtime: runtime.select(env, entry.runtime),
   };
 }

@@ -25,6 +25,17 @@ describe("adapter selection", () => {
     ).toEqual({ search: "clickhouse", runtime: "lambda" });
   });
 
+  it("keeps worker boot selection on its implemented search backend", () => {
+    for (const backend of ["clickhouse", "opensearch"]) {
+      expect(() => validateAdapterEnv({ SEARCH_INDEX_BACKEND: backend }, { runtime: ["workers"] }))
+        .toThrow(/not allowed/);
+    }
+    // A future composition may explicitly advertise its own implemented backends.
+    expect(validateAdapterEnv({ SEARCH_INDEX_BACKEND: "opensearch" }, {
+      runtime: ["workers"], search: ["postgres", "opensearch"],
+    })).toEqual({ search: "opensearch", runtime: "workers" });
+  });
+
   it("creates only registered adapters and fails closed otherwise", () => {
     const registry = new AdapterRegistry<SearchIndexBackendName, { tag: string }, string>("SEARCH_INDEX_BACKEND", SEARCH_INDEX_BACKENDS, "postgres");
     registry.register({ name: "postgres", create: (c) => `pg:${c.tag}` });

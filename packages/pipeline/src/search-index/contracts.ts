@@ -5,8 +5,8 @@
  * (object storage + HoopDb pointers). Every adapter stores one row per event,
  * keyed by tenant + event identity + ts, and answers the read API's query
  * shape: tenant-scoped keyword/substring search with filters and an exact
- * keyset cursor. The semantics are the existing ClickHouse read path's
- * (src/session-read-api/queries.ts) and RelayHistory's Postgres path:
+ * keyset cursor. Portable matching is defined here and by `matchesQuery`,
+ * independently of a backend's locale-specific case matching:
  *
  *   q matches case-insensitively as a literal substring of the first
  *   CONTENT_PREFIX_CHARS characters of `content`, or of `taskTitle`.
@@ -227,6 +227,7 @@ export function assertDocument(doc: SearchEventDocument): void {
   assertPosition(doc);
   if (
     typeof doc.content !== "string" ||
+    typeof doc.taskTitle !== "string" ||
     typeof doc.fingerprint !== "string" ||
     !Number.isSafeInteger(doc.version) ||
     doc.version < 0 ||

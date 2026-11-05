@@ -1,9 +1,9 @@
 # Search index and pipeline runtime adapters
 
-Status: draft, 2026-11-05. Nothing here changes a running install. The
-contracts and OSS defaults are additive. The only wired change is a boot
-check that refuses a mis-set selection variable. With the variables unset,
-which is every current install, behavior is unchanged.
+Scope: portable contracts, Postgres search, and a worker runtime. Existing
+services do not dispatch through these adapters yet. The only entry-point
+integration is a boot check that rejects unsupported selection variables.
+With those variables unset, existing service behavior is unchanged.
 
 Two seams are pluggable:
 
@@ -17,35 +17,27 @@ Both follow the destination registry pattern (#207,
 no plugin discovery, and registration and selection do no I/O. Selection fails
 closed at boot.
 
-## Where each part lives
+## Included implementations
 
-Khaliq's direction: the provider adapters live in the `*-cloud` repo. This
-follows the default split in build-plans#1 (OSS engine, hosted composition).
-The split was proposed to `oss-cloud-split-codex` before any code was written.
+| Part | Path |
+| --- | --- |
+| Search contract, validation and query reference semantics | `packages/pipeline/src/search-index/contracts.ts` |
+| Backend-independent scope reconcile | `packages/pipeline/src/search-index/reconcile.ts` |
+| Postgres search using pg_trgm | `packages/pipeline/src/search-index/postgres.ts` |
+| Shared search conformance | `packages/pipeline/src/search-index/conformance.ts` |
+| Runtime contract and shared failure handling | `packages/pipeline/src/runtime/contracts.ts` |
+| Worker poll loop and in-process schedules | `packages/pipeline/src/runtime/workers.ts` |
+| Shared runtime conformance | `packages/pipeline/src/runtime/conformance.ts` |
+| Explicit registration and boot selection | `packages/pipeline/src/adapters/` |
 
-| Part | Repo | Path |
-| --- | --- | --- |
-| `SearchIndexAdapter` contract, validation, reference q semantics | sessions-pipeline (OSS) | `packages/pipeline/src/search-index/contracts.ts` |
-| Backend-independent scope reconcile (`planScopeReconcile`) | OSS | `packages/pipeline/src/search-index/reconcile.ts` |
-| **Postgres + pg_trgm adapter (default)** | OSS | `packages/pipeline/src/search-index/postgres.ts` |
-| Shared search conformance suite | OSS | `packages/pipeline/src/search-index/conformance.ts` |
-| `PipelineRuntimeAdapter` contract, `settle()` failure semantics | OSS | `packages/pipeline/src/runtime/contracts.ts` |
-| **Worker-pod runtime (default)** | OSS | `packages/pipeline/src/runtime/workers.ts` |
-| Shared runtime conformance suite | OSS | `packages/pipeline/src/runtime/conformance.ts` |
-| Selection (`SEARCH_INDEX_BACKEND`, `PIPELINE_RUNTIME`) and default registries | OSS | `packages/pipeline/src/adapters/` |
-| OpenSearch / Elasticsearch adapter (SigV4, basic, API key, none) | sessions-pipeline-cloud | `src/search/opensearch.ts` |
-| ClickHouse adapter (wraps the engine's vendored client and read queries) | -cloud | `src/search/clickhouse.ts` |
-| Lambda + SQS runtime | -cloud | `src/runtime/lambda.ts` |
-| Cloud Run + Pub/Sub runtime | -cloud | `src/runtime/cloudrun.ts` |
-| Terse durable-actors runtime (**stub**) | -cloud | `src/runtime/terse.ts`, `docs/runtime-terse.md` |
-| Registration of the provider adapters into the engine registries | -cloud | `src/register.ts` |
+The default registries contain only Postgres search and the worker runtime.
+Recognizing a provider name does not install that implementation. Creating an
+unregistered adapter fails. Each entry point declares the implementations it
+can run; future compositions must explicitly register and allow any additions.
 
-The -cloud repo consumes the engine at a pinned commit (`ENGINE_REF`), checked
-out into a git-ignored `.engine/`. It copies no engine source, and the
-ClickHouse adapter imports the engine's vendored code where it already is.
-Moving `src/session-pipeline/vendor/search-index/*` into -cloud is a separate,
-reviewed source move. Until then, the hosted Lambda keeps calling that code
-directly.
+OpenSearch, ClickHouse, Lambda, Cloud Run and Terse implementation ownership,
+distribution and service integration are separate follow-ups. This foundation
+does not select their repository placement or advertise them as Helm profiles.
 
 ## SearchIndexAdapter
 
@@ -71,9 +63,9 @@ each one against the reference oracle (`matchesQuery`):
   workspace moves, it becomes a new row, and reconcile deletes the old one.
 - **Search (`q`):** a case-insensitive *literal* substring of the first 4096
   code points of `content`, or of `taskTitle`. `%`, `_`, `*`, `?` and `\` have
-  no wildcard meaning. This is the ClickHouse read path's
-  `positionCaseInsensitiveUTF8` semantics. RelayHistory's recall path does not
-  escape `q`; this contract does.
+  no wildcard meaning. Text and the query use JavaScript `toLowerCase()` as
+  specified by `matchesQuery`, including its Unicode behavior; a backend's
+  native case matching must reproduce that result.
 - **Order and cursor:** page order is code-point (byte) order over the
   position tuple, ascending or descending. A cursor is the last position
   served. A page can come back short and still carry `next`; the ClickHouse
@@ -91,40 +83,20 @@ each one against the reference oracle (`matchesQuery`):
 Tenant ids must come from verified auth. The adapter filters on them; it does
 not authenticate them.
 
-### Implementations
+### Postgres implementation
 
-| Backend | Where | Text index | Auth | Notes |
-| --- | --- | --- | --- | --- |
-| `postgres` (default) | OSS | `pg_trgm` GIN on `left(content, 4096)` and `task_title`, the same expressions RelayHistory indexes | the DB role | Own schema (`search_index`, configurable), `COLLATE "C"` key columns, never `session_directory` (decision 0002). `ensureSchema` never creates the extension. Works on Cloud SQL and AlloyDB, which support `pg_trgm`. |
-| `clickhouse` | -cloud | the engine's `ngrams(3)` text index | user/password (secret) | Wraps the existing schema, migration, `deleteRows` and two-round-trip read queries. The schema needs a ClickHouse with the `text(tokenizer = ngrams(3), preprocessor = ...)` index: 26.3 passes, 25.10 rejects it. |
-| `opensearch` | -cloud | 3-gram tokenizer + lowercase on `content_prefix` and `task_title`; `match_phrase` over consecutive 3-grams is an exact substring match; q under 3 chars uses `wildcard` on a lowercase keyword subfield | SigV4 (`es`, `aoss`), basic, API key, none | Strict mapping, index template, `_bulk` with `external_gte` versions, `search_after` cursor, `_delete_by_query` plus a `_count` check for erasure. Serverless (`aoss`) has no external versioning or `refresh=wait_for`, so its capabilities say so. |
+Postgres uses pg_trgm GIN indexes on normalized content-prefix and title columns.
+Normalization applies the same lowercase operation as the query reference to the
+first 4096 code points of content and to the complete title. Literal `LIKE` under
+`COLLATE "C"` avoids database-locale differences for Unicode text.
+The derived index has its own schema (`search_index`, configurable); transcript
+text never goes in the metadata directory, `session_directory` (decision 0002).
+Key columns use `COLLATE "C"` to preserve cursor order. `ensureSchema` requires
+pg_trgm to be installed already and performs DDL only when explicitly called.
 
-### GCP search: decision
-
-The GCP equivalent of OpenSearch is **not a new adapter**:
-
-1. **Standard: `postgres` on Cloud SQL or AlloyDB.** `values-gcp.yaml`
-   already uses Cloud SQL for HoopDb, and both services support `pg_trgm`.
-   This adds no new service, so it is the GCP default, like the self-host
-   default.
-2. **Scale: `opensearch` against an Elasticsearch-API search cluster on GCP.**
-   That is either Elastic Cloud on Google Cloud (Marketplace, billed through
-   GCP; `OPENSEARCH_AUTH=apikey`) or self-managed OpenSearch on GKE through
-   the OpenSearch Kubernetes Operator (`basic` or `none` inside the VPC). The
-   adapter uses only APIs common to OpenSearch 2.x and Elasticsearch 8, and
-   it passes the same conformance suite on both (see Test evidence).
-
-Rejected:
-
-- **Vertex AI Search.** It is a semantic, document-level retrieval product.
-  It has no exact substring or 3-gram semantics and no keyset cursor in our
-  page order, its indexing is eventual, and erasure is not synchronous. It
-  cannot meet the contract. Treat it as a possible future semantic search
-  feature, not this index.
-- **BigQuery search indexes.** These are token-based, so they cannot do
-  arbitrary substring matching, and per-query latency and cost do not suit an
-  interactive read API.
-- **Firestore and Datastore.** They have no substring search.
+This adapter does not replace RelayHistory's existing transcript search path.
+Selecting which service owns self-host transcript queries, migrating any data,
+and routing requests through an adapter require a separate reviewed change.
 
 ## PipelineRuntimeAdapter
 
@@ -143,98 +115,70 @@ into the platform's ack, retry and dead-letter mechanics. Every runtime calls
 that throws retries the whole batch, and a missing or bogus outcome is retried.
 Delivery is at-least-once everywhere.
 
-| Runtime | Where | Trigger | Batch / partial | Retry delay | Schedules | Scope serialization | Dead |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `workers` (default) | OSS | poll (HoopDb queue claim) | n / yes | yes | in-process, one run per wall-clock window | advisory lock | queue table |
-| `lambda` | -cloud | S3 notification → SQS → Lambda | 10 / partial batch response | yes, re-sent with `DelaySeconds` (at most 900) when `requeue` is wired | EventBridge: `{"schedule":job}` plus the legacy `{"reconcile":true}` and `{"brief":true}` | advisory lock | SQS DLQ after `maxReceiveCount` |
-| `cloudrun` | -cloud | GCS notification → Pub/Sub push → Cloud Run | 1 / n/a | no: a nack falls back to the subscription's backoff | Cloud Scheduler `POST /schedule/<job>` | advisory lock | dead-letter topic (`maxDeliveryAttempts`), or an explicit publish |
-| `terse` (stub) | -cloud | ingress routes each manifest to a per-scope actor | 1 / yes | actor alarm | clock actor alarm | the actor | persisted actor state |
+The included `workers` runtime claims work from a caller-provided queue,
+settles each outcome independently, and fires schedules once per wall-clock
+window. The caller supplies the actual queue and idempotent work handler.
+Several replicas may run only when queue claims are leased and the work
+handler serializes each scope. Schedule handlers must be safe to run on more
+than one replica.
 
-The Lambda adapter reuses the engine's `parseQueueBody`. S3 test events,
-reconcile bodies, URL-encoded keys and delete events therefore behave exactly
-as in today's `src/session-pipeline/lambda.ts`. The Cloud Run adapter maps
-`OBJECT_FINALIZE` to a manifest that landed, `OBJECT_DELETE` and
-`OBJECT_ARCHIVE` to `deleted`, and ignores `OBJECT_METADATA_UPDATE`.
+`WorkSource.settle` acknowledges completed items, releases retries with their
+delay, and parks dead items. The worker binding has a `tick()` that runs one
+iteration for callers that own their loop and a `run(signal)` loop for standalone use. Idle
+waits release their abort listeners and stop promptly when signaled.
 
-Terse is accounted for in the interface. `scopeSerialization: "actor"`,
-`scheduler: "actor-alarm"` and `deadLetter: "actor-state"` exist for it. The
-design and the blocking network constraint are in
-sessions-pipeline-cloud `docs/runtime-terse.md`.
+The contract can represent platform queues, push delivery and durable actors,
+but it does not implement those bindings. In particular, the Sessions Terse
+runtime remains a stub in a separate draft; existing Relaycast/Relayfile actor
+profiles do not establish a working Sessions actor runtime.
 
 ## Configuration
 
-| Variable | Values | Default | Validated |
-| --- | --- | --- | --- |
-| `SEARCH_INDEX_BACKEND` | `postgres`, `clickhouse`, `opensearch` | `postgres` for workers; `clickhouse` for the Lambda entry | boot. Unknown names, names the entry cannot run, and unregistered names fail |
-| `PIPELINE_RUNTIME` | `workers`, `lambda`, `cloudrun`, `terse` | `workers`; `lambda` for the Lambda entry | boot |
-| `SEARCH_INDEX_POSTGRES_SCHEMA` | identifier | `search_index` | adapter construction |
-| `OPENSEARCH_ENDPOINT`, `OPENSEARCH_INDEX`, `OPENSEARCH_AUTH` (`sigv4`, `basic`, `apikey`, `none`), `OPENSEARCH_REGION`, `OPENSEARCH_SERVICE` (`es`, `aoss`), `OPENSEARCH_USERNAME` | | auth `sigv4`, index `sessions-transcript-events` | -cloud `openSearchConfigFromEnv` |
-
-Secrets (the OpenSearch password or API key, ClickHouse credentials) are
-never environment values. They reach the factory resolved from mounted files
-or the existing Secrets Manager secret. With SigV4, credentials come from the
-pod identity chain (EKS Pod Identity or IRSA), and no static key is used.
-
-Validation is wired into two places. `runWorker` (`src/shared/worker.ts`)
-accepts only the `workers` runtime. `lambdaEnv` (`src/session-pipeline/lambda.ts`)
-accepts only `lambda` + `clickhouse`. Neither entry dispatches through the
-adapters yet: moving `indexSearchScope` onto `SearchIndexAdapter` +
-`planScopeReconcile`, and the tick loops onto `createWorkerRuntime`, is the
-next reviewed step.
-
-## Capability matrix per cloud
-
-| | AWS | GCP | Any Kubernetes (self-host) |
-| --- | --- | --- | --- |
-| Search, standard | `postgres` on RDS/Aurora PG 17 | `postgres` on Cloud SQL or AlloyDB | `postgres` on CNPG (chart default) |
-| Search, scale | `opensearch` on Amazon OpenSearch Service (SigV4 `es`) or Serverless (`aoss`) | `opensearch` on Elastic Cloud on GCP (`apikey`) or OpenSearch on GKE (`basic`) | `opensearch` (operator), or `clickhouse` OSS |
-| Runtime | `lambda` (S3 → SQS → Lambda, EventBridge) or `workers` on EKS | `cloudrun` (GCS → Pub/Sub → Cloud Run, Cloud Scheduler) or `workers` on GKE | `workers` |
-| Terse | `terse` on EKS (durable-actors S3 backend, per-actor STS) | `terse` on GKE (GCS backend, CAB tokens) | `terse` with the durable-actors chart |
-
-## What Helm and Terraform need
-
-The Terraform modules in helm-charts `terraform/` (a separate lane) should
-expose these outputs, so an adapter's configuration is a direct mapping:
-
-| Module | Outputs the adapters read | Maps to |
+| Variable | Recognized names | Current entry-point behavior |
 | --- | --- | --- |
-| `aws/postgres` | `endpoint`, `port`, `database`, `runtime_role`, secret ARN | `HOOPDB_URL` (Secret); the postgres search uses the same database |
-| `aws/search` (OpenSearch) | `endpoint` (https, VPC), `domain_arn`, `region`, `index_prefix` (optional), an IAM policy ARN granting `es:ESHttpGet/Put/Post/Delete/Head` on `domain_arn/*` to the pipeline role | `OPENSEARCH_ENDPOINT`, `OPENSEARCH_REGION`, `OPENSEARCH_SERVICE=es`, `OPENSEARCH_AUTH=sigv4`; attach the policy to the Pod Identity / Lambda role |
-| `aws/functions` (Lambda + SQS) | `queue_url`, `queue_arn`, `dlq_arn`, `function_role_arn`, schedule rule names; the bucket notification on the manifest suffix | `SESSION_PIPELINE_QUEUE_URL`; `PIPELINE_RUNTIME=lambda`; `requeue` sends to `queue_url` |
-| `aws/object-storage` | `bucket`, `region`, KMS key ARN | `PIPELINE_RAW_S3_BUCKET` |
-| `gcp/postgres` (Cloud SQL) | `connection_name`, `database`, IAM user | `CLOUD_SQL_CONNECTION_NAME`, `HOOPDB_URL` |
-| `gcp/search` | `endpoint`; for Elastic Cloud, a Secret Manager secret id holding the API key; for OpenSearch on GKE, the Service DNS name and a basic-auth secret | `OPENSEARCH_ENDPOINT`, `OPENSEARCH_AUTH=apikey` or `basic` |
-| `gcp/functions` (Cloud Run + Pub/Sub) | `service_url`, `topic`, `push_subscription` (OIDC service account, dead-letter topic, `maxDeliveryAttempts`), Cloud Scheduler job names that target `/schedule/<job>`, the invoker service account | `PIPELINE_RUNTIME=cloudrun`; the GCS notification on the manifest prefix publishes to `topic` |
+| `SEARCH_INDEX_BACKEND` | `postgres`, `clickhouse`, `opensearch` | workers allow `postgres`; the existing Lambda entry allows `clickhouse` |
+| `PIPELINE_RUNTIME` | `workers`, `lambda`, `cloudrun`, `terse` | workers allow `workers`; the existing Lambda entry allows `lambda` |
+| `SEARCH_INDEX_POSTGRES_SCHEMA` | SQL identifier | `search_index` unless explicitly configured; validated when constructing the adapter |
 
-The Helm values that would follow are planned, not in this PR. The existing
-plan reserves `search.backend: postgres | clickhouse`. Adding `opensearch`
-needs:
+Empty or unset selection variables use each entry point's existing behavior.
+Unknown names and recognized but unsupported choices fail at boot. These checks
+validate the existing service path; they do not switch dispatch to the new
+adapters. A future entry point must explicitly declare any broader choices.
 
-- `search.backend: opensearch`;
-- `search.opensearch.{endpoint, index, auth, region, service, username}`;
-- `search.opensearch.existingSecret` and `search.opensearch.secretKeys`
-  (file-mounted, never inline);
-- a `worker.pipelineRuntime` value, `workers` only, because the chart runs
-  pods.
+Secrets arrive through the caller's existing file-mounted secret/client
+mechanism. Registry construction, registration and name selection do not read
+credentials or perform I/O.
 
-The chart renders those values into the environment variables above. Changing
-`search.backend` back to `postgres` is the rollback.
+## Future provider implementations and distribution
 
-## Test evidence
+The [OSS/cloud boundary](https://github.com/AgentWorkforce/build-plans/blob/52920781bb3c99ca0211b025df1b5d922cb2ebb3/proposals/2026-11-04-oss-cloud-split.md)
+requires Helm to consume versioned OSS artifacts and lists an OSS
+durable-actors/Terse profile. Reusable self-host OpenSearch and a real Terse
+runtime must fit that boundary or have an explicitly reviewed distribution
+exception before a customer profile can use them. Their placement decision
+remains separate from this foundation. Hosted deployment/account policy,
+managed credentials and private service composition belong in the hosted layer.
 
-Synthetic data only, local containers, 2026-11-05:
+Draft provider implementations currently use a private engine checkout during
+development. That is not a versioned consumer artifact or an approved customer
+image distribution path. No new Helm selection values, image pins, Terraform
+resources, migrations or service routing are provided here.
 
-- OSS: `bun run --filter @96bulls/pipeline test`. The search conformance
-  suite (11 cases) runs on PGlite + pg_trgm in every CI run. It ran locally
-  against real PostgreSQL 17 (`postgres:17` container), and CI's pg-proof job
-  runs it on 15, 16 and 17 (`SEARCH_CONFORMANCE_PG_URL`). The suite also has
-  the runtime conformance cases (7, workers) and registry tests. The root
-  `bun test src/session-pipeline/__tests__/units.test.ts` covers the Lambda
-  selection guard.
-- -cloud: `bun run test`. The search suite passed on OpenSearch 2.19.1,
-  Elasticsearch 8.17.0 and ClickHouse 26.3. The runtime suite passed for the
-  `lambda` and `cloudrun` runtimes, and SigV4 matches AWS's published test
-  vectors.
-- Not proven: a SigV4 request against a real Amazon OpenSearch domain (no
-  account access in this lane); OpenSearch Serverless; Elastic Cloud with an
-  API key; a deployed Cloud Run or Lambda binding.
+## Validation
+
+Run the package checks with the repository's pinned toolchain:
+
+```sh
+bun run --filter @96bulls/pipeline typecheck
+bun run --filter @96bulls/pipeline test
+bun test src/shared src/session-pipeline
+```
+
+The shared search suite exercises PGlite with pg_trgm and can run against a
+disposable PostgreSQL database using `SEARCH_CONFORMANCE_PG_URL`. CI runs that
+suite on PostgreSQL 15, 16 and 17 before the role-hardening proofs. The runtime
+suite checks delivery outcomes and scheduling against an in-memory work source.
+
+These checks cover adapter semantics and existing entry-point compatibility.
+Service routing, a deployed provider binding and customer image distribution
+need their own integration validation before those features are available.

@@ -22,9 +22,8 @@ export interface ScopeReconcilePlan {
   readonly deletes: readonly (SearchPosition & { readonly workspaceId: string })[];
 }
 
-const SEP = "\u001f";
 const identity = (r: { machineId: string; source: string; kind: string; eventId: string }) =>
-  [r.machineId, r.source, r.kind, r.eventId].join(SEP);
+  JSON.stringify([r.machineId, r.source, r.kind, r.eventId]);
 
 export function planScopeReconcile(
   desired: readonly SearchEventDocument[],

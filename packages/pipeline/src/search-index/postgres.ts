@@ -3,11 +3,11 @@
  *
  * The self-hosted default transcript search profile (helm-charts
  * docs/self-hosted-reference-architecture.md, "Standard (default)"): the
- * Postgres already in the stack, `pg_trgm` GIN indexes over the same
- * expressions RelayHistory indexes (`left(content, 4096)` and `task_title`),
- * exact ILIKE semantics with tenant filters. Unlike RelayHistory's recall
- * path, q is escaped, so `%` and `_` are literal (the contract's semantics,
- * which ClickHouse's positionCaseInsensitiveUTF8 also has).
+ * Postgres already in the stack, with `pg_trgm` GIN indexes over normalized
+ * content prefixes and titles. Text and queries use the contract's JavaScript
+ * lowercase operation before literal LIKE matching under COLLATE "C";
+ * database-locale ILIKE can disagree with that operation for Unicode text.
+ * q is escaped, so `%` and `_` are literal.
  *
  * The table is a derived, rebuildable index in its own schema
  * (`search_index` by default). It is NOT `sessions.session_directory`:
@@ -134,6 +134,8 @@ function toRecord(d: SearchEventDocument) {
     delivery_record_id: d.deliveryRecordId,
     content: d.content,
     content_bytes: new TextEncoder().encode(d.content).length,
+    content_prefix_folded: [...d.content].slice(0, CONTENT_PREFIX_CHARS).join("").toLowerCase(),
+    task_title_folded: d.taskTitle.toLowerCase(),
     fingerprint: d.fingerprint,
     version: d.version,
   };
@@ -165,7 +167,7 @@ function toHit(r: Row): SearchHit {
   };
 }
 
-/** Escape a literal for ILIKE ... ESCAPE '\'. */
+/** Escape a literal for LIKE ... ESCAPE '\'. */
 export function likeLiteral(q: string): string {
   return `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 }
@@ -228,14 +230,15 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
           tags text[] NOT NULL, files_touched text[] NOT NULL,
           tool_name text NOT NULL, tool_status text NOT NULL, delivery_record_id text NOT NULL,
           content text NOT NULL, content_bytes integer NOT NULL,
+          content_prefix_folded ${text}, task_title_folded ${text},
           fingerprint text NOT NULL, version bigint NOT NULL,
           indexed_at timestamptz NOT NULL DEFAULT now(),
           PRIMARY KEY (org_id, workspace_id, ${KEY})
         )`,
         `CREATE INDEX IF NOT EXISTS "${tableName}_session_idx" ON ${table} (org_id, workspace_id, session_id, ${KEY})`,
         `CREATE INDEX IF NOT EXISTS "${tableName}_scope_idx" ON ${table} (org_id, workspace_id, source, session_id)`,
-        `CREATE INDEX IF NOT EXISTS "${tableName}_content_trgm" ON ${table} USING gin (left(content, ${CONTENT_PREFIX_CHARS}) ${ops})`,
-        `CREATE INDEX IF NOT EXISTS "${tableName}_title_trgm" ON ${table} USING gin (task_title ${ops})`,
+        `CREATE INDEX IF NOT EXISTS "${tableName}_content_trgm" ON ${table} USING gin (content_prefix_folded ${ops})`,
+        `CREATE INDEX IF NOT EXISTS "${tableName}_title_trgm" ON ${table} USING gin (task_title_folded ${ops})`,
       ];
       for (const statement of statements) await run(statement, [], context);
     },
@@ -252,7 +255,7 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
         if (!held || held.version <= doc.version) newest.set(key, doc);
       }
       const records = [...newest.values()].map(toRecord);
-      const assign = [...COLUMNS.slice(8), "content", "content_bytes", "fingerprint", "version"]
+      const assign = [...COLUMNS.slice(8), "content", "content_bytes", "content_prefix_folded", "task_title_folded", "fingerprint", "version"]
         .map((c) => `${c} = excluded.${c}`)
         .join(", ");
       const rows = await run<{ n: string | number }>(
@@ -262,11 +265,12 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
              kind text, event_id text, type text, user_id text, actor_name text, actor_role text,
              subagent_id text, project_id text, task_title text, task_ref text, task_ref_id text,
              tags jsonb, files_touched jsonb, tool_name text, tool_status text, delivery_record_id text,
-             content text, content_bytes integer, fingerprint text, version bigint)
+             content text, content_bytes integer, content_prefix_folded text, task_title_folded text,
+             fingerprint text, version bigint)
          ), written AS (
-           INSERT INTO ${table} (${COLUMNS.join(", ")}, content, content_bytes, fingerprint, version, indexed_at)
+           INSERT INTO ${table} (${COLUMNS.join(", ")}, content, content_bytes, content_prefix_folded, task_title_folded, fingerprint, version, indexed_at)
            SELECT ${COLUMNS.map((c) => (c === "tags" || c === "files_touched" ? `ARRAY(SELECT jsonb_array_elements_text(${c}))` : c)).join(", ")},
-                  content, content_bytes, fingerprint, version, now()
+                  content, content_bytes, content_prefix_folded, task_title_folded, fingerprint, version, now()
              FROM input
            ON CONFLICT (org_id, workspace_id, ${KEY}) DO UPDATE SET ${assign}, indexed_at = now()
              WHERE ${table}.version <= excluded.version
@@ -365,9 +369,9 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
       if (query.sinceMs !== undefined) where.push(`ts_ms >= ${bind(query.sinceMs)}`);
       if (query.untilMs !== undefined) where.push(`ts_ms <= ${bind(query.untilMs)}`);
       if (query.q !== undefined) {
-        const needle = bind(likeLiteral(query.q));
+        const needle = bind(likeLiteral(query.q.toLowerCase()));
         where.push(
-          `(left(content, ${CONTENT_PREFIX_CHARS}) ILIKE ${needle} ESCAPE '\\' OR task_title ILIKE ${needle} ESCAPE '\\')`,
+          `(content_prefix_folded LIKE ${needle} ESCAPE '\\' OR task_title_folded LIKE ${needle} ESCAPE '\\')`,
         );
       }
       if (query.cursor !== undefined) {

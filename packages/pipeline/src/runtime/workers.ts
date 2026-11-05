@@ -43,8 +43,14 @@ export interface WorkerBinding {
 
 const defaultSleep = (ms: number, signal?: AbortSignal) =>
   new Promise<void>((resolve) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => (clearTimeout(t), resolve()), { once: true });
+    if (signal?.aborted) return resolve();
+    const finish = () => {
+      clearTimeout(t);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const t = setTimeout(finish, ms);
+    signal?.addEventListener("abort", finish, { once: true });
   });
 
 export function createWorkerRuntime(options: WorkerRuntimeOptions): PipelineRuntimeAdapter<WorkerBinding> {

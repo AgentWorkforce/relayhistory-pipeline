@@ -185,6 +185,22 @@ export function searchIndexConformance(name: string, factory: () => Promise<Conf
       expect(odd.map(key)).toEqual(docs.filter((d) => d.content.includes("odd")).sort(comparePositions).reverse().map(key));
     });
 
+    it("matches the reference case folding for Unicode content and titles", async () => {
+      const org = `org-${rand()}`;
+      const docs = [
+        syntheticDoc({ orgId: org, eventId: "unicode-i", content: "i" }),
+        syntheticDoc({ orgId: org, eventId: "unicode-dot", content: "İ" }),
+        syntheticDoc({ orgId: org, eventId: "unicode-sigma", content: "", taskTitle: "ΟΣ" }),
+      ];
+      await a.upsert(docs);
+      for (const q of ["İ", "i\u0307", "οσ", "ος"]) {
+        const page = await a.query({ tenant: { orgId: org, workspaceId: "ws-a" }, order: "asc", limit: 10, q });
+        expect(page.hits.map((hit) => hit.eventId).sort()).toEqual(
+          docs.filter((doc) => matchesQuery(doc, q)).map((doc) => doc.eventId).sort(),
+        );
+      }
+    });
+
     it("upserts idempotently and never lets an older version replace a newer row", async () => {
       const org = `org-${rand()}`;
       const tenant = { orgId: org, workspaceId: "ws-a" };

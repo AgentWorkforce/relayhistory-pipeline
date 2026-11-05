@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { getEventListeners } from "node:events";
 import { runtimeConformance, type Observed } from "../src/runtime/conformance.js";
 import {
   createWorkerRuntime,
@@ -79,6 +80,28 @@ describe("worker runtime specifics", () => {
     await expect(running).resolves.toBeUndefined();
   });
 
+  it("cleans up idle listeners and handles an abort while claiming work", async () => {
+    const controller = new AbortController();
+    let claims = 0;
+    let idleListeners = -1;
+    const source: WorkSource = {
+      async claim() {
+        if (++claims === 4) {
+          idleListeners = getEventListeners(controller.signal, "abort").length;
+          controller.abort();
+        }
+        return [];
+      },
+      async settle() {},
+    };
+    const binding = createWorkerRuntime({ source, idleMs: 1 }).bind({
+      schedules: [], handle: async () => new Map(),
+    });
+    await binding.run(controller.signal);
+    expect(idleListeners).toBe(0);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+  });
+
   it("settle() turns a bogus outcome into a retry", async () => {
     const item: WorkItem = { type: "manifest-landed", id: "x", key: "k", attempt: 1 };
     const out = await settle(
@@ -87,5 +110,19 @@ describe("worker runtime specifics", () => {
       { runtime: "test" },
     );
     expect(out.get("x")).toMatchObject({ status: "retry", code: "no_outcome" });
+  });
+
+  it.each([
+    { status: "retry", delaySeconds: NaN, code: "busy" },
+    { status: "retry", delaySeconds: Infinity, code: "busy" },
+    { status: "retry", delaySeconds: -1, code: "busy" },
+    { status: "retry", delaySeconds: 1 },
+    { status: "dead" },
+  ])("retries malformed outcomes with a safe finite delay: %j", async (invalid) => {
+    const item: WorkItem = { type: "manifest-landed", id: "x", key: "k", attempt: 1 };
+    const out = await settle({
+      schedules: [], handle: async () => new Map([[item.id, invalid as WorkOutcome]]),
+    }, [item], { runtime: "test" });
+    expect(out.get(item.id)).toEqual({ status: "retry", delaySeconds: 30, code: "no_outcome" });
   });
 });

@@ -1,7 +1,7 @@
 /**
  * Registries pre-loaded with the OSS defaults. A composition adds its own
- * factories (sessions-pipeline-cloud: clickhouse, opensearch, lambda,
- * cloudrun, terse) to the same registries before selecting.
+ * factories to the same registries before selecting. Provider implementation
+ * placement and customer distribution are separate reviewed changes.
  */
 import type { PipelineRuntimeAdapter } from "../runtime/contracts.js";
 import { createWorkerRuntime, type WorkSource } from "../runtime/workers.js";
