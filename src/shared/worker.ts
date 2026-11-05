@@ -34,6 +34,7 @@ import { initTelemetry, shutdownTelemetry, withSpan } from "./telemetry.ts";
 import { createServer } from "node:http";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedSchema } from "../hoopdb/migrate.ts";
+import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 
 export interface WorkerOptions {
   service: string;
@@ -296,6 +297,9 @@ export async function workerTick<S>(io: {
 }
 
 export async function runWorker(opts: WorkerOptions): Promise<never> {
+  // Fail closed on a mis-set adapter selection (docs/search-and-runtime-adapters.md).
+  // Unset (every current install) resolves to postgres + workers: no change.
+  validateAdapterEnv(process.env, { runtime: ["workers"] });
   process.env.OTEL_SERVICE_NAME ||= opts.service;
   initTelemetry(opts.service);
   const health: WorkerHealth = {

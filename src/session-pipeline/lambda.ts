@@ -56,6 +56,7 @@ import {analysisRefreshTick,enqueueAnalysisScope,type AnalysisRefreshDeps} from 
 import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.ts";
 import { briefTick } from "../session-brief/worker.ts";
 import{derivedSchemaAssets}from "./derived-schema.ts";
+import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
@@ -94,6 +95,10 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
   };
   const fanout = env.PIPELINE_FANOUT ?? "off";
   if (fanout !== "off" && fanout !== "postgres") throw new Error("session pipeline: PIPELINE_FANOUT must be off or postgres");
+  // This entry point is the lambda runtime with the ClickHouse stage. Unset
+  // selection variables (today's stack) resolve to exactly that; anything else
+  // is a misconfiguration (docs/search-and-runtime-adapters.md).
+  validateAdapterEnv(env, { runtime: ["lambda"], runtimeDefault: "lambda", search: ["clickhouse"], searchDefault: "clickhouse" });
   if (env.PIPELINE_ORG_FROM_PREFIX !== "true") throw new Error("session pipeline: PIPELINE_ORG_FROM_PREFIX must be true (org-prefix layout)");
   return {
     region: need("AWS_REGION"),
