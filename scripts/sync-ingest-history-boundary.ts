@@ -3,7 +3,7 @@ import {readFile,writeFile} from "node:fs/promises";
 import {createHash} from "node:crypto";
 const root=new URL("..",import.meta.url);
 const file=(p:string)=>new URL(p,root);
-const sql=await readFile(file("supabase/migrations/20261104062000_canonical_history_lineage.sql"),"utf8");
+const sql=await readFile(file("supabase/migrations/20261105026000_canonical_history_lineage.sql"),"utf8");
 const defs=new Map<string,{secdef:boolean}>();
 for(const m of sql.matchAll(/CREATE(?: OR REPLACE)? FUNCTION\s+(sessions\.\w+)\(([^)]*)\)([\s\S]*?)\s+AS\s+\$[a-z_]+\$/gi)){
  const types=m[2]!.trim()?m[2]!.split(",").map(p=>p.trim().replace(/\s+DEFAULT\s+[\s\S]*$/i,"").split(/\s+/).slice(1).join(" ").replace(/^timestamptz$/,"timestamp with time zone").replace(/^int$/,"integer")).join(","):"";
@@ -64,10 +64,10 @@ let workerVerify=await readFile(file("supabase/bootstrap/session_directory_searc
 if(!/v_approved text\[\] := ARRAY\[[\s\S]*?\];/.test(workerVerify))throw Error("History worker verifier source missing");
 workerVerify=workerVerify.replace(/v_approved text\[\] := ARRAY\[[\s\S]*?\];/,
  "v_approved text[] := ARRAY[\n"+Object.entries(acl.functions).filter(([,v])=>(v as string[]).includes("session_directory_search_worker:EXECUTE")).map(([k])=>k).sort().map(k=>" '"+k+"'").join(",\n")+"\n ];");
-const prior=await readFile(file("supabase/migrations/20261104056000_session_replay_pages.sql"),"utf8");
+const prior=await readFile(file("supabase/migrations/20261105020000_session_replay_pages.sql"),"utf8");
 const pointers=await readFile(file("supabase/migrations/20261102010000_session_directory_canonical_ids.sql"),"utf8");
 const briefs=await readFile(file("supabase/migrations/20261102020000_session_brief_state.sql"),"utf8");
-const large=await readFile(file("supabase/migrations/20261104057000_session_large_read_jobs.sql"),"utf8");
+const large=await readFile(file("supabase/migrations/20261105021000_session_large_read_jobs.sql"),"utf8");
 const ordinary=await readFile(file("supabase/migrations/20261104060000_ingest_canonical_publication.sql"),"utf8");
 const restore=["session_replay_source_snapshot","publish_session_replay_pages","session_publication_is_managed","claim_session_large_read","capture_session_replay_pages","session_brief","session_directory_pointers","session_directory_replay_pages"].map(name=>{
  const pattern=new RegExp("CREATE(?: OR REPLACE)? FUNCTION sessions\\."+name+"\\([\\s\\S]*?AS\\s+\\$([a-z_]+)\\$[\\s\\S]*?\\$\\1\\$;","i");
@@ -95,7 +95,7 @@ const down=[
 ].join("\n")+"\n";
 
 const outputs={
- "supabase/rollbacks/20261104062000_canonical_history_lineage.down.sql":down,
+ "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql":down,
  "src/hoopdb/sessions-function-acl.json":JSON.stringify(acl,null,2)+"\n",
  "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql":wrapper,
  "src/hoopdb/migrate-guards.ts":guards,

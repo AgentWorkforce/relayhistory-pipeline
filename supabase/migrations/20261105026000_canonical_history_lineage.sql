@@ -1,3 +1,4 @@
+-- Registry v2 name; upstream provenance: 20261104062000_canonical_history_lineage.sql (#230 draft, never applied under that name).
 -- Canonical History lineage. This source remains dormant until the full source
 -- frontier, logical consumers and permanent retirement transport are proven.
 --040600 remains provenance authority for generation object IO, not History moves.

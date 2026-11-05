@@ -1,3 +1,4 @@
+-- Registry v2 name; upstream provenance: 20261104061000_canonical_feature_journal.sql (#230 draft, never applied under that name).
 -- 610 canonical feature journal + owner-only invoker, composed with the 620 final install CAS
 -- (supporter-cloud's proposal on feat/canonical-feature-producer @ 4021f10: same 5-argument
 -- retire-then-publish contract). Metadata only: no payload, no transcript bytes.

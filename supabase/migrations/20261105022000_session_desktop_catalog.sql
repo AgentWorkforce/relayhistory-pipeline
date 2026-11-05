@@ -1,4 +1,4 @@
--- Append-only release rename; upstream provenance: 20261103050000_session_desktop_catalog.sql. Never applied under the upstream filename in this release.
+-- Append-only release rename (registry v2); upstream provenance: 20261103050000_session_desktop_catalog.sql. Never applied under the upstream filename in this release.
 -- Metadata only: full transcript/analysis bytes remain in canonical object storage.
 -- Existing rows default unready; controlled complete-source reprojection is required.
 ALTER TABLE sessions.session_directory
