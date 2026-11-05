@@ -209,6 +209,9 @@
     "sessions.ingest_history_fence_builds(uuid[])": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_history_invalidate_installed()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_history_invalidate_scope(text,text,text,text)": [
       "<owner>:EXECUTE"
     ],

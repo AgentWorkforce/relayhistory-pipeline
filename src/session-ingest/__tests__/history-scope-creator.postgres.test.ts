@@ -333,3 +333,73 @@ test.skipIf(!url)("resume -> reinsert over a stale ref concurrent with a running
   expect((await pool.query("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [s.identity.orgId])).rows.map((x) => x.r)).toEqual(["7"]);
   await pool.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
 });
+
+test.skipIf(!url)("prune vs reinsert, prune first: the backfill holds the stale ref, the reinsert waits, the fresh ref survives", async () => {
+  const s = await scope();
+  const backfill = async (c: pg.Pool | pg.PoolClient) => { let x: unknown = null, n = 0; do { x = (await c.query("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [x === null ? null : JSON.stringify(x)])).rows[0].c; n++; } while (x !== null && n < 100); };
+  await pool.query("INSERT INTO sessions.ingest_receipt_seat_clock(singleton,control_epoch,source_identity_sha256,allocated_high_water,last_seat,baseline,initial_generation) VALUES(true,$1,$2,0,0,'{}'::jsonb,$3) ON CONFLICT DO NOTHING", [sha("seat-epoch"), sha("seat-src"), gen]);
+  await pool.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill(pool);
+  await pool.query("SELECT sessions.ingest_history_set_live(false)");
+  await pool.query("DELETE FROM sessions.session_index WHERE org_id=$1", [s.identity.orgId]);
+  await pool.query("SELECT sessions.ingest_history_set_live(true)");
+  const filler = await pool.connect(), writer = await pool.connect();
+  try {
+    await filler.query("BEGIN");
+    await backfill(filler);                                                  // pruned the stale ref, uncommitted (holds it)
+    let written = false;
+    const write = (async () => { await writer.query("BEGIN"); await writer.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...s.row, revision: 8 }])]); await writer.query("COMMIT"); written = true; return "ok"; })()
+      .catch(async (e: any) => { await writer.query("ROLLBACK").catch(() => {}); return e.code ?? e.message; });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(written).toBe(false);                                             // waits on the pruned ref's row lock
+    await filler.query("COMMIT");
+    expect(await write).toBe("ok");
+  } finally { filler.release(); writer.release(); }
+  expect((await pool.query("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [s.identity.orgId])).rows.map((x) => x.r)).toEqual(["8"]);
+  await pool.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});
+
+test.skipIf(!url)("resume vs a control holding session_index (ROW EXCLUSIVE) then wanting the seat clock: both commit, never 40P01", async () => {
+  const s = await scope();
+  await pool.query("INSERT INTO sessions.ingest_receipt_seat_clock(singleton,control_epoch,source_identity_sha256,allocated_high_water,last_seat,baseline,initial_generation) VALUES(true,$1,$2,0,0,'{}'::jsonb,$3) ON CONFLICT DO NOTHING", [sha("seat-epoch"), sha("seat-src"), gen]);
+  await pool.query("SELECT sessions.ingest_history_set_live(false)");
+  const ctl = await pool.connect(), op = await pool.connect();
+  try {
+    await ctl.query("BEGIN");
+    await ctl.query("UPDATE sessions.session_index SET indexed_at=now() WHERE org_id=$1", [s.identity.orgId]);   // 060000 retire-fence write
+    const resume = op.query("SELECT sessions.ingest_history_set_live(true)").then(() => "ok", (e: any) => e.code ?? e.message);
+    await new Promise((r) => setTimeout(r, 300));
+    const control = (async () => { await ctl.query("SELECT 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE"); await ctl.query("COMMIT"); return "ok"; })()
+      .catch(async (e: any) => { await ctl.query("ROLLBACK").catch(() => {}); return e.code ?? e.message; });
+    expect(await Promise.all([control, resume])).toEqual(["ok", "ok"]);
+  } finally { ctl.release(); op.release(); }
+  expect((await pool.query("SELECT live FROM sessions.ingest_history_switch")).rows[0].live).toBe(true);
+});
+
+test.skipIf(!url)("prune re-verifies under the row lock: a reinsert that commits after the candidate scan keeps its fresh ref", async () => {
+  const [k1, k2] = [await scope(), await scope()].sort((a, b) => (a.identity.orgId < b.identity.orgId ? -1 : 1));
+  const backfill = async (c: pg.Pool | pg.PoolClient) => { let x: unknown = null, n = 0; do { x = (await c.query("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [x === null ? null : JSON.stringify(x)])).rows[0].c; n++; } while (x !== null && n < 100); };
+  const refOf = async (org: string) => (await pool.query("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [org])).rows.map((x) => x.r);
+  await pool.query("INSERT INTO sessions.ingest_receipt_seat_clock(singleton,control_epoch,source_identity_sha256,allocated_high_water,last_seat,baseline,initial_generation) VALUES(true,$1,$2,0,0,'{}'::jsonb,$3) ON CONFLICT DO NOTHING", [sha("seat-epoch"), sha("seat-src"), gen]);
+  await pool.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill(pool);
+  await pool.query("SELECT sessions.ingest_history_set_live(false)");
+  await pool.query("DELETE FROM sessions.session_index WHERE org_id=ANY($1)", [[k1.identity.orgId, k2.identity.orgId]]);   // both refs now stale
+  await pool.query("SELECT sessions.ingest_history_set_live(true)");
+  const a = await pool.connect(), filler = await pool.connect();
+  try {
+    await a.query("BEGIN");
+    await a.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...k1.row, revision: 4 }])]);    // holds K1's ref
+    // The prune scans BOTH stale refs as candidates, then blocks locking K1's.
+    const fill = (async () => { await filler.query("BEGIN"); await backfill(filler); await filler.query("COMMIT"); return "ok"; })()
+      .catch(async (e: any) => { await filler.query("ROLLBACK").catch(() => {}); return e.code ?? e.message; });
+    await new Promise((r) => setTimeout(r, 300));
+    // K2 is reinserted and COMMITTED after the candidate scan, before the prune reaches it.
+    await pool.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...k2.row, revision: 9 }])]);
+    await a.query("COMMIT");
+    expect(await fill).toBe("ok");
+  } finally { a.release(); filler.release(); }
+  expect(await refOf(k1.identity.orgId)).toEqual(["4"]);
+  expect(await refOf(k2.identity.orgId)).toEqual(["9"]);                   // not pruned from the old snapshot
+  await pool.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});

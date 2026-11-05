@@ -356,7 +356,6 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105022000_session_desktop_catalog.sql` | column sessions.session_directory.catalog_read_version |
 | `upstream:20261105023000_session_analysis_publications.sql` | table sessions.session_analysis_publications |
 | `upstream:20261102020000_session_brief_state.sql`              | ALTER-only: column sessions.session_briefs.state                                                                        |
-| `upstream:20261104021000_session_directory_event_metadata.sql` | table sessions.session_directory_event_times                                                                            |
 | `upstream:20261104020000_auth_sessions.sql`                    | table sessions.auth_sessions                                                                                            |
 | `upstream:20261104020100_auth_session_verify.sql`              | table sessions.auth_token_verifier_policy                                                                               |
 | `upstream:20261104030000_ingest_fence_ownership.sql`           | table sessions.ingest_session_ownership                                                                                  |

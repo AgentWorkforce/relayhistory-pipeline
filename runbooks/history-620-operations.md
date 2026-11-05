@@ -26,21 +26,25 @@ before any build row.
 ## Kill switch (usable at any time, including after installs)
 
 ```sql
+SET lock_timeout='5s';                           -- the function also sets 5s for its own body
 SELECT sessions.ingest_history_set_live(false);  -- off
 SELECT sessions.ingest_history_set_live(true);   -- on again
 ```
+
+Both calls fail fast with 55P03 (lock_not_available) when contended; nothing has changed, so retry.
 
 - **Off:** every in-flight build is abandoned; every 620 trigger (ACK, control, directory,
   session_index) returns immediately; every read gate behaves as main; `ingest_history_scope_begin`
   and `ingest_history_scope_install` refuse with `history: 620 is switched off`. Pointer tracking stops
   too, so `refs_complete` is cleared and the inventory is no longer attested. All ledgers stay:
   scope versions, current rows, derived objects, the feature journal, outboxes and builds.
-- **On:** takes a SHARE lock on `session_index`, which waits out every writer that began while off
-  (run it with a `lock_timeout`); it never restores `refs_complete`, so rerun the full pointer backfill
-  before any inventory work. Every in-flight build is abandoned again (one that raced the switch saw untracked changes),
+- **On:** first takes a SHARE lock on `session_index` (before the seat clock, the same order as a lazy
+  control), which waits out every writer that began while off; it never restores `refs_complete`, so
+  rerun the full pointer backfill before any inventory work. Every in-flight build is abandoned again (one that raced the switch saw untracked changes),
   and every installed scope is invalidated in the same transaction (ACKs and controls while off
-  were not tracked), so its directory row is cleared and its next build re-derives it. The cost is
-  one `ingest_history_invalidate_scope` per installed scope.
+  were not tracked), so its directory row is cleared and its next build re-derives it. This is five
+  set-based statements over all installed scopes (`ingest_history_invalidate_installed`), not a
+  per-scope loop; indexer writes wait for it behind the SHARE lock.
 
 ## Pointer-reference tracking
 
@@ -83,7 +87,10 @@ The 022000 partial index is still built inside the migration transaction, after 
 built under that ALTER's lock. Building it `CONCURRENTLY` needs a non-transactional step kind in
 `src/hoopdb/migrate.ts`, which this change does not add. Every `2026110502xxxx` file starts with
 `SET LOCAL lock_timeout='5s'`, so a blocked DDL lock fails the file (it rolls back whole) instead of
-queueing live traffic behind it.
+queueing live traffic behind it. A lock_timeout failure during apply rolls that file back and the
+migrator stops: the files before it stay applied, and the role-validation marker stays `pending` (the
+Worker gate stays closed) until a rerun of the migrator gets through and passes validation. Rerun it at
+a quieter moment; nothing needs to be undone.
 
 ## Schema rollback (down) and reapply
 

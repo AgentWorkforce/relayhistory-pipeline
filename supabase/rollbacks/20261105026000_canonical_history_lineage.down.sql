@@ -288,6 +288,7 @@ END $claim$;
 DROP FUNCTION IF EXISTS
  sessions.ingest_history_set_pointer_tracking(boolean),
  sessions.ingest_history_set_live(boolean),
+ sessions.ingest_history_invalidate_installed(),
  sessions.ingest_history_scope_install(jsonb),
  sessions.ingest_history_scope_capture(jsonb),
  sessions.ingest_history_scope_build_keys(jsonb),
