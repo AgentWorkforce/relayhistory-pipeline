@@ -56,3 +56,51 @@ describe("journal decoder — cross-field fail-closed negatives", () => {
     expect(dec({ ...base, kind: "update" }))
       .rejects.toThrow("journal_kind_invalid"));
 });
+
+// Retire + replacement rows: the 610 CHECK shape and cross-field fences.
+const PRIOR = { authorityId: "87654321-4321-4321-4321-210987654321",
+  epoch: "1", fingerprint: "b".repeat(64) };
+const PRIOR_PTR = { authorityId: PRIOR.authorityId,
+  hash: "d".repeat(64), count: "1" };
+const RET = {
+  revision: "9", kind: "retire", org_id: "o", workspace_id: "w",
+  scope: SCOPE, schema_generation: A,
+  image_key: canonicalImageKey(SCOPE, PRIOR.authorityId),
+  source_hash: PRIOR.fingerprint, prior_keyset_hash: PRIOR_PTR.hash,
+  source_authority: PRIOR, prior_source_authority: null,
+  pointer_set: PRIOR_PTR,
+};
+const REPL = {
+  ...base, revision: "10",
+  prior_keyset_hash: PRIOR_PTR.hash,
+  prior_source_authority: PRIOR,
+};
+describe("journal decoder — retire + replacement negatives", () => {
+  test("valid retire decodes", async () => {
+    const out = await dec(RET);
+    expect(out.entries[0]!.kind).toBe("retire");
+  });
+  test("valid replacement decodes", async () => {
+    const out = await dec(REPL);
+    expect(out.entries[0]!.kind).toBe("publish");
+  });
+  const neg = (name: string, row: Record<string, unknown>) =>
+    test(name, () =>
+      expect(dec(row)).rejects.toThrow("journal_row_invalid"));
+  neg("retire: NULL prior_keyset_hash",
+    { ...RET, prior_keyset_hash: null });
+  neg("retire: prior_keyset_hash != pointerSet.hash",
+    { ...RET, prior_keyset_hash: "e".repeat(64) });
+  neg("retire: non-NULL prior_source_authority",
+    { ...RET, prior_source_authority: PRIOR });
+  neg("retire: source_hash != prior fingerprint",
+    { ...RET, source_hash: A });
+  neg("retire: prior authority != pointer authority",
+    { ...RET, source_authority: AUTH });
+  neg("retire: prior authority != hs1 suffix",
+    { ...RET, image_key: HS1 });
+  neg("replacement: prior fingerprint == new",
+    { ...REPL, prior_source_authority: { ...PRIOR, fingerprint: A } });
+  neg("replacement: prior authority == new",
+    { ...REPL, prior_source_authority: AUTH });
+});

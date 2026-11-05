@@ -3,7 +3,6 @@
 import { Pool } from "pg";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { execSync } from "node:child_process";
 import { CanonicalPageAckStore } from "../src/search-features/canonical-ack-store.ts";
 import { copyCanonicalEntry } from "../src/search-features/canonical-cycle.ts";
 const port = Number(process.argv[2] ?? 32770);
@@ -16,12 +15,17 @@ const check = (name: string, cond: boolean) => {
   if (!cond) failures++;
 };
 await db.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE; CREATE SCHEMA ${SCHEMA}`);
-// Apply the REAL #230 025000 writer migration + the companion state DDL.
-const writer = execSync(
-  "cd ~/Projects/AgentWorkforce/sessions-pipeline && " +
-  "git show 226410e721beca5885082382094d1b38e3318c64:" +
-  "supabase/migrations/20261105025000_canonical_feature_journal.sql"
-).toString().replaceAll("sessions.", `${SCHEMA}.`);
+// The real DDL grants the producer role — create it so grants apply unmodified.
+await db.query(`CREATE ROLE bulls96_canonical_feature_producer NOLOGIN`)
+  .catch(() => {});
+// Apply the REAL #230 025000 writer migration (vendored snapshot at
+// 226410e721beca5885082382094d1b38e3318c64) + the companion state DDL.
+// Self-contained: read the vendored fixture, no shell/out-of-tree paths.
+const writer = readFileSync(
+  "scripts/fixtures/230-writer-20261105025000.sql", "utf8")
+  .replaceAll("sessions.", `${SCHEMA}.`)
+  .replaceAll("SCHEMA sessions", `SCHEMA ${SCHEMA}`)
+  .replaceAll("GRANT USAGE ON SCHEMA", `GRANT USAGE ON SCHEMA`);
 await db.query(writer);
 const ddl = readFileSync(
   "docs/proposals/20261105025000_canonical_feature_journal.sql", "utf8")
