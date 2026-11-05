@@ -1,0 +1,62 @@
+{
+  "consumerBase": "d15f7b6a214f3929dc6fa9c104c794860b6f9794",
+  "method": "Exact selected immutable same-repository Git file snapshots; no620/630/private DB modules",
+  "closureBase": "83617bc48e7f8a38f2929ae3d40e42d26e0bc0ff",
+  "emptyWorkspaceCarry": "58b3ecb167033b2847689feb77ec8d92673e0b89",
+  "workerDecoderTypeCarry": "d493df50db1fec40c960fda456484b67ea67e6ff",
+  "files": [
+    {
+      "path": "packages/object-store/src/index.ts",
+      "sha256": "de215624977e49f474eb78876e44537977c25fb2e21b8cb23c60244e4c02e7a0",
+      "gitBlob": "d0f936e70102c3fd241699453b821b7f5ffba004"
+    },
+    {
+      "path": "packages/object-store/src/layout.ts",
+      "sha256": "3a5ddce483c48eb6235bc7d37dc0afdbd99ec3abd7701f0d9784a2693c3b7009",
+      "gitBlob": "f249382ad063f6e57e787c155e7ff804a04876e3"
+    },
+    {
+      "path": "packages/object-store/src/manifest.ts",
+      "sha256": "62a1496154415b87c92e731ec54217c8b6ed7e065b133e23d5f93c3bf7047f68",
+      "gitBlob": "30cb7f6d8d250ad81072f75d50e6c40098060b48"
+    },
+    {
+      "path": "packages/pipeline/src/lib/pipeline/adapter.ts",
+      "sha256": "15cbb7c7df48a6d962813ef9a5fd401b5b2f095b34bf73ae4c44dec2742e00a8",
+      "gitBlob": "a03dd865d17aaf18be512bc4e404f40f1b5ee657"
+    },
+    {
+      "path": "packages/pipeline/src/lib/pipeline/object-layout.ts",
+      "sha256": "f55bb607f4aafd9bc09b3920790a32615cedd7bd8fc4b15ae43f42e3d714a383",
+      "gitBlob": "ce6c9afcfa0a2caacdae01886c5d5bd0667f35da"
+    },
+    {
+      "path": "src/bob-costas/summary-objects.ts",
+      "sha256": "bac429030a6cd8f28ce44acaaae394703a3ad0a30a76a016a00424cedff26e07",
+      "gitBlob": "fc3d8402b64158d04128be26d0fcedfc0959ee09"
+    },
+    {
+      "path": "src/shared/bounded-object-store.ts",
+      "sha256": "94fb7cd6a6ed29b2bb82c576f24e07726bf875b095be24537f494d9831cd9bcf",
+      "gitBlob": "d4fe6627ce97c11987342a577bfbc117c874e683"
+    },
+    {
+      "path": "src/shared/history-public-contract.ts",
+      "sha256": "4fdffd3f21fcda72be361d72e2eb141ceb221849f9915862871c9bd3f536ed03",
+      "gitBlob": "405a46547fdebcf6f2abc3f72ff15e15dab17539"
+    },
+    {
+      "path": "src/shared/history-summary-content.ts",
+      "sha256": "7b7149f566a504b99e579b5a22ecc1c677eb64f0d03972f0eae19bdedcf325ea",
+      "gitBlob": "900be48cab9348a90a483884c665ac8baa4aa4d0"
+    },
+    {
+      "path": "src/shared/history-summary-reader.ts",
+      "sha256": "1969497a504aade67811b42144a60d6e158ff27f4a2a379d31cbc85a5e9918ce",
+      "gitBlob": "d0930ac7913b059c4946b0d3f707f5c1efe42bad"
+    }
+  ],
+  "fixture": "packages/session-read-worker/test/fixtures/history-summary-v2/fixture.json",
+  "fixtureProducer": "09cc699627862c958510572152b416f5d873e769",
+  "runtimeKeyBinding": "UNCONFIGURED; explicit host injection required"
+}

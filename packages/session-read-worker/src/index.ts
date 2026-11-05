@@ -21,6 +21,8 @@
  */
 import pg from "pg";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
+import{canonicalHistorySummaryHandle,type HistorySummaryEnv}from"./history-summary.ts";
+import type{HistorySummaryReadKeyring}from"../../../src/shared/history-summary-reader.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { logLine, type Level } from "../../../src/shared/log.ts";
 import { createClickHouseClient, type ClickHouseClient, type RequestOptions } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
@@ -29,7 +31,7 @@ import { relayAuthVerifier } from "../../../src/session-read-api/auth.ts";
 import { sqlLiveness, TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
 
-export interface Env extends CanonicalEnv {
+export interface Env extends CanonicalEnv, HistorySummaryEnv {
   SUPABASE: Hyperdrive;
   CLICKHOUSE_URL?: string;
   CLICKHOUSE_USER?: string;
@@ -163,9 +165,12 @@ export interface Overrides {
   /** Tests: the pg client factory in place of Hyperdrive's. */
   connect?: () => Promise<pg.Client>;
   fetcher?: typeof fetch;
+  /** Explicit host-injected readonly key port; no default/env key fallback. */
+  summaryKeyring?:HistorySummaryReadKeyring;
 }
 
 export async function handle(request: Request, env: Env, ctx: ExecutionContext, overrides: Overrides = {}): Promise<Response> {
+  if(new URL(request.url).pathname.startsWith("/v1/canonical/summaries/"))return canonicalHistorySummaryHandle(request,env,overrides.fetcher,overrides.summaryKeyring);
   if (new URL(request.url).pathname.startsWith("/v1/canonical/analyses/")) return canonicalAnalysisHandle(request, env, overrides.fetcher);
   if (new URL(request.url).pathname.startsWith("/v1/canonical/")) return canonicalHandle(request, env, overrides.fetcher);
   // GET only, as the Lambda's Function URL adapter (HEAD is not a read the contract has).
@@ -196,8 +201,11 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   }
 }
 
-export default {
-  fetch(request, env, ctx) {
-    return handle(request, env, ctx);
-  },
-} satisfies ExportedHandler<Env>;
+/** Explicit backend composition point. The stock entrypoint passes no keyring
+ * and remains incapable of decrypting summaries until reviewed host wiring. */
+export function createSessionReadWorker(
+ backend:{summaryKeyring?:HistorySummaryReadKeyring}={},
+):ExportedHandler<Env>{
+ return{fetch(request,env,ctx){return handle(request,env,ctx,{summaryKeyring:backend.summaryKeyring})}};
+}
+export default createSessionReadWorker();

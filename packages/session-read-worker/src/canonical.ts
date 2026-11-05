@@ -1,3 +1,4 @@
+import { HISTORY_PUBLIC_SUMMARY_RPC } from "../../../src/shared/history-public-contract.ts";
 import {
   canonicalArtifactPage,
   type ArtifactReadDeps,
@@ -48,6 +49,7 @@ const tables = new Set([
 async function boundedJson(
   response: Response,
   signal: AbortSignal,
+  maxBytes = MAX_BODY,
 ): Promise<unknown> {
   const reader = response.body?.getReader();
   if (!reader) throw new CanonicalReadError("metadata_parse");
@@ -67,7 +69,7 @@ async function boundedJson(
       const chunk = await Promise.race([reader.read(), abort]);
       if (chunk.done) break;
       length += chunk.value.byteLength;
-      if (length > MAX_BODY) throw new CanonicalReadError("metadata_bound");
+      if (length > maxBytes) throw new CanonicalReadError("metadata_bound");
       chunks.push(chunk.value);
     }
     const bytes = new Uint8Array(length);
@@ -120,6 +122,7 @@ function canonicalMetadataReader(
   signal: AbortSignal,
   fetcher: typeof fetch = fetch,
   rpc = "session_directory_pointers",
+  extra?: { p_kind: "short" | "long" },
 ) {
   const base = env.CANONICAL_SUPABASE_URL,
     apiKey = env.CANONICAL_SUPABASE_API_KEY;
@@ -146,6 +149,7 @@ function canonicalMetadataReader(
         p_workspace_id: identity.workspaceId,
         p_harness: identity.source,
         p_session_id: identity.sessionId,
+        ...extra,
       }),
       signal,
     });
@@ -156,10 +160,26 @@ function canonicalMetadataReader(
         response.status === 401 || response.status === 403 ? 401 : 503,
       );
     }
-    return boundedJson(response, signal);
+    return boundedJson(response, signal, extra ? 256 * 1024 : MAX_BODY);
   };
 }
 export { tokenTenant as canonicalTokenTenant };
+export function canonicalHistorySummaryClaimReader(
+  env: CanonicalEnv,
+  token: string,
+  signal: AbortSignal,
+  kind: "short" | "long",
+  fetcher: typeof fetch = fetch,
+) {
+  return canonicalMetadataReader(
+    env,
+    token,
+    signal,
+    fetcher,
+    HISTORY_PUBLIC_SUMMARY_RPC,
+    { p_kind: kind },
+  );
+}
 export function canonicalClaimReader(
   env: CanonicalEnv,
   token: string,

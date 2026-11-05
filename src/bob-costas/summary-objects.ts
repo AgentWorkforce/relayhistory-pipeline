@@ -1,10 +1,10 @@
 // Ported from AgentWorkforce/relayhistory-cloud
 // packages/relayhistory/src/lib/pipeline/summary-objects.ts @ 73434047b6d7
-// (spec: docs/pipeline-summary-short.md). Body verbatim; only the imports differ
+// (spec: docs/pipeline-summary-short.md). The local deviations are the imports
 // (this repo's vendored pipeline and object store), plus `summaryObjectKey` and
 // `SummaryKind` copied from upstream object-layout.ts, a `BufferSource` alias
-// (this repo's tsconfig has no DOM lib), and one marked deviation in
-// writeSummaryObject (reuse only under the current key, for rotation).
+// (this repo's tsconfig has no DOM lib), current-key reuse for rotation,
+// reusable in-memory preparation, and actual byte bounds on reads/writes.
 // Keep in sync on upstream changes.
 /**
  * Summary objects in the bucket: the encrypted envelope at
@@ -22,18 +22,18 @@
  * (or create-only), so a late writer for an older revision never replaces a
  * newer summary. Nothing read or written here is logged.
  */
+import{PipelineError}from"../../packages/pipeline/src/lib/pipeline/errors.ts";
+import{readCapped}from"../../packages/pipeline/src/lib/pipeline/adapter.ts";
 import {
-  PipelineError,
   ObjectStoreError,
   isObjectStoreError,
   joinKey,
   objectKey,
-  readAll,
   sessionPrefix,
   type ObjectKey,
   type ObjectStore,
   type SessionLocation,
-} from "../shared/vendor.ts";
+} from "../../packages/object-store/src/index.ts";
 
 /**
  * From upstream `object-layout.ts` (same commit): the two summary kinds and
@@ -93,12 +93,15 @@ export interface WorkspaceIds {
  * each workspace's AES-256 key with a KMS or master key. Throw for a lookup
  * that failed; the stage retries.
  */
+export type SummaryReadStore=Pick<ObjectStore,"getObject">;
 export interface WorkspaceKeyring {
   /** The key new summaries are written under. */
   currentKey(ids: WorkspaceIds): Promise<{ keyId: string; key: CryptoKey }>;
   /** A key by id, to read what an older key wrote. */
   keyById(ids: WorkspaceIds, keyId: string): Promise<CryptoKey>;
 }
+
+export type WorkspaceKeyReader=Pick<WorkspaceKeyring,"keyById">;
 
 /**
  * The keyring until key custody is decided: it refuses, so no summary is ever
@@ -128,6 +131,8 @@ const MESSAGES = {
   summary_store_rejected: "the object store refused the summary object",
   summary_contended: "the summary object kept changing under the writer",
   summary_store_timeout: "the object store did not answer in time",
+  summary_too_large: "the summary exceeds its verified encrypted-object bound",
+  summary_prepared_invalid: "the prepared encrypted summary does not match its descriptor",
 } as const;
 
 export type SummaryObjectErrorCode = keyof typeof MESSAGES;
@@ -156,7 +161,58 @@ const MAX_WRITE_ATTEMPTS = 4;
 /** Deadline for each object store call, so a stalled store never holds the summary lock. */
 const DEFAULT_STORE_TIMEOUT_MS = 5_000;
 /** The largest summary envelope read back; a long summary is a few KiB. */
-const MAX_SUMMARY_OBJECT_BYTES = 1024 * 1024;
+export const MAX_SUMMARY_OBJECT_BYTES = 1024 * 1024;
+
+/** Exact encrypted bytes and registration descriptor, before any SQL/S3 work.
+ * Native's shared helper supplies the immutable publication/attempt-qualified
+ * key. This function grants no publication authority and performs no PUT. */
+export interface PreparedSummaryObject {
+  readonly key: string;
+  readonly sha256: string;
+  readonly bytes: number;
+  readonly keyId: string;
+  readonly body: Uint8Array;
+}
+
+export async function prepareSummaryObject(args: {
+  keyring: WorkspaceKeyring; ids: WorkspaceIds; key: string; record: SummaryRecord;
+}): Promise<PreparedSummaryObject> {
+  const key = String(objectKey(args.key));
+  const record = { ...args.record };
+  let current: { keyId: string; key: CryptoKey };
+  try { current = await args.keyring.currentKey(args.ids); }
+  catch (err) { throw err instanceof PipelineError ? err : fail("keyring_unavailable", true); }
+  const body = await seal(current, key, record);
+  return { key, keyId: current.keyId, body, sha256: await sha256Hex(body), bytes: body.byteLength };
+}
+
+/** Store only the exact registered bytes, immutably. Caller must register the
+ * descriptor through Native BEFORE this call. This function grants no authority.
+ * A retry under the same key can reuse identical bytes, never replace them.
+ */
+export async function putPreparedSummaryObject(args: {
+  store: ObjectStore; prepared: PreparedSummaryObject; storeTimeoutMs?: number;
+}): Promise<void> {
+  const { store } = args;
+  if (args.prepared.body.byteLength > MAX_SUMMARY_OBJECT_BYTES) throw fail("summary_prepared_invalid", false);
+  const prepared = { ...args.prepared, body: args.prepared.body.slice() };
+  if (prepared.bytes > MAX_SUMMARY_OBJECT_BYTES || prepared.bytes !== prepared.body.byteLength ||
+      await sha256Hex(prepared.body) !== prepared.sha256) throw fail("summary_prepared_invalid", false);
+  const key = objectKey(prepared.key);
+  const call = <T>(fn: () => Promise<T>) => withDeadline(fn, args.storeTimeoutMs);
+  try {
+    await call(() => store.put(key, prepared.body, { ifNoneMatch: true,
+      contentSha256: prepared.sha256, contentType: "application/json",
+      metadata: { [META_SUMMARY_KEY_ID]: prepared.keyId },
+    }));
+  } catch (err) {
+    if (isObjectStoreError(err, "precondition_failed") || isObjectStoreError(err, "already_exists")) {
+      if (await storedDigest(call, store, key) === prepared.sha256) return;
+      throw fail("summary_contended", true);
+    }
+    throw storeError(err);
+  }
+}
 
 /**
  * Write `record` to `key` for the session's current manifest.
@@ -272,7 +328,8 @@ async function storedDigest(
       await object.body.cancel().catch(() => undefined);
       return undefined;
     }
-    return await sha256Hex(await call(() => readAll(object.body)));
+    const body = await call(() => readCapped(object.body, MAX_SUMMARY_OBJECT_BYTES));
+    return body ? await sha256Hex(body) : undefined;
   } catch (err) {
     if (isObjectStoreError(err, "not_found")) return undefined;
     throw storeError(err);
@@ -346,6 +403,15 @@ export async function readSummaryObject(args: {
   kind: SummaryKind;
   revision: number;
 }): Promise<SummaryRecord | null> {
+  const encrypted = await readEncryptedSummary(args);
+  if (!encrypted) return null;
+  const record = await open(encrypted.key, encrypted.envelope, args.key, args.kind, args.revision);
+  return record && record.kind === args.kind && record.revision === args.revision ? record : null;
+}
+
+async function readEncryptedSummary(args: {
+  store: SummaryReadStore; keyring: WorkspaceKeyReader; ids: WorkspaceIds; key: string; sha256: string; bytes?:number; expectedKeyId?:string;
+}): Promise<{ envelope: Envelope; key: CryptoKey } | null> {
   let body: Uint8Array;
   try {
     const object = await args.store.getObject(objectKey(args.key));
@@ -353,14 +419,17 @@ export async function readSummaryObject(args: {
       await object.body.cancel().catch(() => undefined);
       return null;
     }
-    body = await readAll(object.body);
+    const bounded = await readCapped(object.body, MAX_SUMMARY_OBJECT_BYTES);
+    if (!bounded) return null;
+    body = bounded;
   } catch (err) {
     if (isObjectStoreError(err, "not_found")) return null;
     throw storeError(err);
   }
+  if(args.bytes!==undefined&&body.byteLength!==args.bytes)return null;
   if ((await sha256Hex(body)) !== args.sha256) return null;
   const envelope = parseEnvelope(body);
-  if (!envelope) return null;
+  if (!envelope || (args.expectedKeyId!==undefined&&envelope.key_id!==args.expectedKeyId)) return null;
   let key: CryptoKey;
   try {
     key = await args.keyring.keyById(args.ids, envelope.key_id);
@@ -369,13 +438,9 @@ export async function readSummaryObject(args: {
       ? err
       : fail("keyring_unavailable", true);
   }
-  const record = await open(key, envelope, args.key, args.kind, args.revision);
-  return record &&
-    record.kind === args.kind &&
-    record.revision === args.revision
-    ? record
-    : null;
+  return { envelope, key };
 }
+
 
 /** Associated data: the envelope only opens at its own key, kind and revision. */
 function aad(key: string, kind: SummaryKind, revision: number): Uint8Array {
@@ -387,15 +452,24 @@ async function seal(
   key: string,
   record: SummaryRecord,
 ): Promise<Uint8Array> {
+  return sealValue(current, record, aad(key, record.kind, record.revision));
+}
+
+async function sealValue(
+  current: { keyId: string; key: CryptoKey }, value: object, binding: Uint8Array,
+): Promise<Uint8Array> {
+  const plain = new TextEncoder().encode(JSON.stringify(value));
+
+  if (plain.byteLength > MAX_SUMMARY_OBJECT_BYTES) throw fail("summary_too_large", false);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt(
     {
       name: "AES-GCM",
       iv,
-      additionalData: aad(key, record.kind, record.revision) as BufferSource,
+      additionalData: binding as BufferSource,
     },
     current.key,
-    new TextEncoder().encode(JSON.stringify(record)) as BufferSource,
+    plain as BufferSource,
   );
   const envelope: Envelope = {
     v: SUMMARY_ENVELOPE_VERSION,
@@ -404,7 +478,9 @@ async function seal(
     iv: base64(iv),
     ct: base64(new Uint8Array(ct)),
   };
-  return new TextEncoder().encode(JSON.stringify(envelope));
+  const body = new TextEncoder().encode(JSON.stringify(envelope));
+  if (body.byteLength > MAX_SUMMARY_OBJECT_BYTES) throw fail("summary_too_large", false);
+  return body;
 }
 
 async function open(
@@ -414,17 +490,21 @@ async function open(
   kind: SummaryKind,
   revision: number,
 ): Promise<SummaryRecord | null> {
+  return await openValue(key, envelope, aad(objectKeyName, kind, revision)) as SummaryRecord | null;
+}
+
+async function openValue(key: CryptoKey, envelope: Envelope, binding: Uint8Array): Promise<unknown | null> {
   try {
     const plain = await crypto.subtle.decrypt(
       {
         name: "AES-GCM",
         iv: unbase64(envelope.iv) as BufferSource,
-        additionalData: aad(objectKeyName, kind, revision) as BufferSource,
+        additionalData: binding as BufferSource,
       },
       key,
       unbase64(envelope.ct) as BufferSource,
     );
-    return JSON.parse(new TextDecoder().decode(plain)) as SummaryRecord;
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(plain));
   } catch {
     // Wrong key, tampered bytes, or a different key/kind/revision.
     return null;
@@ -471,4 +551,33 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
   return Array.from(new Uint8Array(digest), (b) =>
     b.toString(16).padStart(2, "0"),
   ).join("");
+}
+
+
+/** Generic logical/slice envelope. binding is the caller's SHA of the complete
+ * captured-source tuple, purpose and work identity. This grants no SQL/S3 authority.
+ * The existing v1 record/AAD remains unchanged and cannot open this domain. */
+function logicalAad(key: string, binding: string): Uint8Array {
+  if (!/^[a-f0-9]{64}$/.test(binding)) throw fail("summary_prepared_invalid", false);
+  return new TextEncoder().encode(JSON.stringify(["bob-logical-envelope-v2", key, binding]));
+}
+export async function prepareBoundSummaryValue(args: {
+  keyring: WorkspaceKeyring; ids: WorkspaceIds; key: string; binding: string; value: Record<string, unknown>;
+}): Promise<PreparedSummaryObject> {
+  const key = String(objectKey(args.key)), binding = logicalAad(key, args.binding);
+  let current: { keyId: string; key: CryptoKey };
+  try { current = await args.keyring.currentKey(args.ids); }
+  catch (error) { throw error instanceof PipelineError ? error : fail("keyring_unavailable", true); }
+  const body = await sealValue(current, args.value, binding);
+  return { key, keyId: current.keyId, body, sha256: await sha256Hex(body), bytes: body.byteLength };
+}
+export async function readBoundSummaryValue(args: {
+  store: SummaryReadStore; keyring: WorkspaceKeyReader; ids: WorkspaceIds; key: string;
+  sha256: string; keyId: string; binding: string; bytes?:number;
+}): Promise<Record<string, unknown> | null> {
+  const binding = logicalAad(args.key, args.binding);
+  const encrypted = await readEncryptedSummary({...args,expectedKeyId:args.keyId});
+  if (!encrypted || encrypted.envelope.key_id !== args.keyId) return null;
+  const value = await openValue(encrypted.key, encrypted.envelope, binding);
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }

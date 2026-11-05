@@ -1,0 +1,138 @@
+{
+  "protocol": "owned-history-summary-crypto-fixture-v1",
+  "sourceHead": "09cc699627862c958510572152b416f5d873e769",
+  "sources": {
+    "src/bob-costas/full-model-artifacts.ts": "49125d4ea27fc82b8de62cff422bc11be0150f74015dc3c8375d51096eec5bd6",
+    "src/bob-costas/summary-objects.ts": "edaca6ae4d84cdfdc3c78f09c96ed62c1f6c04eaf8c80a8d9df0a096d94bdcc3",
+    "src/shared/history-source-authority.ts": "e41025dcb61bcab3861ae888cadcb6b26e2ccedf87f2e8f43423be76588f1f04",
+    "src/shared/keyring.ts": "855558a4921d70a90e16dc4e16e2ea81b2a1c9535a90829dfeeb6b8aa96feb37",
+    "packages/object-store/src/layout.ts": "3a5ddce483c48eb6235bc7d37dc0afdbd99ec3abd7701f0d9784a2693c3b7009"
+  },
+  "fixtureOnly": true,
+  "keyId": "reader-fixture",
+  "keyNote": "Synthetic only: test derives reader-fixture with 64 repetitions of hex d; no production secret or key material file.",
+  "claims": {
+    "short": {
+      "version": 1,
+      "kind": "short",
+      "exists": true,
+      "required": true,
+      "ready": true,
+      "identity": {
+        "orgId": "org_fixture",
+        "workspaceId": "00000000-0000-4000-8000-000000000001",
+        "source": "claude",
+        "sessionId": "native:summary-fixture"
+      },
+      "source": {
+        "epoch": "9007199254740993",
+        "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "authority": {
+        "authorityId": "12345678-1234-1234-1234-123456789abc",
+        "maskSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "recordCount": "2",
+        "derivedAnchorKey": "96bulls/org_fixture/upload-generations/g=12345678-1234-1234-1234-123456789abc/v1/ws=00000000-0000-4000-8000-000000000001/m=history_scope/h=claude/d=2026/11/01/s=logical/publications/12345678-1234-1234-1234-123456789abc/manifest.json",
+        "schemaGeneration": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "storage": {
+        "provider": "s3",
+        "bucket": "fixture-bucket",
+        "region": "us-east-1"
+      },
+      "pointer": {
+        "kind": "short",
+        "status": "ready",
+        "objectKey": "96bulls/org_fixture/upload-generations/g=12345678-1234-1234-1234-123456789abc/v1/ws=00000000-0000-4000-8000-000000000001/m=history_scope/h=claude/d=2026/11/01/s=logical/publications/12345678-1234-1234-1234-123456789abc/derived/summary-short/464b3ac8-c51c-410f-839d-60dabaa48174.bin",
+        "objectSha256": "2c7bc807adb5d17e04ca5af509b0495d9b60703091565f021139bd7e6946e88c",
+        "objectBytes": 1107,
+        "keyId": "hkdf1:reader-fixture",
+        "model": "fixture-model",
+        "builtAt": "2026-11-04T00:00:00.000Z"
+      },
+      "state": {
+        "state": "active",
+        "classifiedAt": "2026-11-04T00:00:00.000000Z"
+      }
+    },
+    "long": {
+      "version": 1,
+      "kind": "long",
+      "exists": true,
+      "required": true,
+      "ready": true,
+      "identity": {
+        "orgId": "org_fixture",
+        "workspaceId": "00000000-0000-4000-8000-000000000001",
+        "source": "claude",
+        "sessionId": "native:summary-fixture"
+      },
+      "source": {
+        "epoch": "9007199254740993",
+        "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "authority": {
+        "authorityId": "12345678-1234-1234-1234-123456789abc",
+        "maskSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "recordCount": "2",
+        "derivedAnchorKey": "96bulls/org_fixture/upload-generations/g=12345678-1234-1234-1234-123456789abc/v1/ws=00000000-0000-4000-8000-000000000001/m=history_scope/h=claude/d=2026/11/01/s=logical/publications/12345678-1234-1234-1234-123456789abc/manifest.json",
+        "schemaGeneration": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "storage": {
+        "provider": "s3",
+        "bucket": "fixture-bucket",
+        "region": "us-east-1"
+      },
+      "pointer": {
+        "kind": "long",
+        "status": "ready",
+        "objectKey": "96bulls/org_fixture/upload-generations/g=12345678-1234-1234-1234-123456789abc/v1/ws=00000000-0000-4000-8000-000000000001/m=history_scope/h=claude/d=2026/11/01/s=logical/publications/12345678-1234-1234-1234-123456789abc/derived/summary-long/d76b6f45-d204-486a-824a-1c9c67444252.bin",
+        "objectSha256": "e472c6b5bc232b608ba7cba54c821a2cb6c0d78bea06a8c28666a07788db05e9",
+        "objectBytes": 1251,
+        "keyId": "hkdf1:reader-fixture",
+        "model": "fixture-model",
+        "builtAt": "2026-11-04T00:00:00.000Z"
+      },
+      "state": {
+        "state": "active",
+        "classifiedAt": "2026-11-04T00:00:00.000000Z"
+      }
+    }
+  },
+  "objects": {
+    "96bulls/org_fixture/upload-generations/g=12345678-1234-1234-1234-123456789abc/v1/ws=00000000-0000-4000-8000-000000000001/m=history_scope/h=claude/d=2026/11/01/s=logical/publications/12345678-1234-1234-1234-123456789abc/derived/summary-short/464b3ac8-c51c-410f-839d-60dabaa48174.bin": {
+      "file": "short.cipher",
+      "sha256": "2c7bc807adb5d17e04ca5af509b0495d9b60703091565f021139bd7e6946e88c",
+      "bytes": 1107,
+      "meta": {
+        "key": "96bulls/org_fixture/upload-generations/g=12345678-1234-1234-1234-123456789abc/v1/ws=00000000-0000-4000-8000-000000000001/m=history_scope/h=claude/d=2026/11/01/s=logical/publications/12345678-1234-1234-1234-123456789abc/derived/summary-short/464b3ac8-c51c-410f-839d-60dabaa48174.bin",
+        "size": 1107,
+        "lastModified": "2026-11-05T00:35:12.615Z",
+        "version": {
+          "eTag": "\"a549164-65f7cab2bb454-453\""
+        },
+        "metadata": {
+          "summary-key-id": "hkdf1:reader-fixture",
+          "content-sha256": "2c7bc807adb5d17e04ca5af509b0495d9b60703091565f021139bd7e6946e88c"
+        }
+      }
+    },
+    "96bulls/org_fixture/upload-generations/g=12345678-1234-1234-1234-123456789abc/v1/ws=00000000-0000-4000-8000-000000000001/m=history_scope/h=claude/d=2026/11/01/s=logical/publications/12345678-1234-1234-1234-123456789abc/derived/summary-long/d76b6f45-d204-486a-824a-1c9c67444252.bin": {
+      "file": "long.cipher",
+      "sha256": "e472c6b5bc232b608ba7cba54c821a2cb6c0d78bea06a8c28666a07788db05e9",
+      "bytes": 1251,
+      "meta": {
+        "key": "96bulls/org_fixture/upload-generations/g=12345678-1234-1234-1234-123456789abc/v1/ws=00000000-0000-4000-8000-000000000001/m=history_scope/h=claude/d=2026/11/01/s=logical/publications/12345678-1234-1234-1234-123456789abc/derived/summary-long/d76b6f45-d204-486a-824a-1c9c67444252.bin",
+        "size": 1251,
+        "lastModified": "2026-11-05T00:35:12.619Z",
+        "version": {
+          "eTag": "\"a549179-65f7cab2bc3f4-4e3\""
+        },
+        "metadata": {
+          "summary-key-id": "hkdf1:reader-fixture",
+          "content-sha256": "e472c6b5bc232b608ba7cba54c821a2cb6c0d78bea06a8c28666a07788db05e9"
+        }
+      }
+    }
+  }
+}

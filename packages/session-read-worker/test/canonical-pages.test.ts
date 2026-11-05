@@ -331,3 +331,26 @@ it("HTTP timestamp window cursor cannot be reused with a changed window", async 
   );
   expect(changed.status).toBe(400);
 });
+it("a valid managed artifact with current:false refuses before objects or any raw pointer fallback", async () => {
+  const f = await fixture();
+  const ack = await f.deps.publication(identity, new AbortController().signal);
+  if (!ack || typeof ack !== "object" || Array.isArray(ack))
+    throw Error("fixture claim");
+  f.setAck({
+    ...ack,
+    current: false,
+    history: { version: 1, required: true, ready: false },
+  });
+  const response = await canonicalHandle(
+    request(),
+    { CANONICAL_READ_ENABLED: "true", CANONICAL_READ_MODE: "pages" },
+    forbidden,
+    { pointers: forbidden } as never,
+    f.deps,
+  );
+  expect(response.status).toBe(503);
+  expect(response.headers.get("X-Session-Read-Reason")).toBe(
+    "artifact_not_ready",
+  );
+  expect(f.counts()).toEqual({ reads: 0, claims: 2 });
+});

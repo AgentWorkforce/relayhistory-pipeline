@@ -7,6 +7,9 @@
  */
 export {
   ObjectStoreError,
+  isManifestRest,
+  isPublicationManifestRest,
+  parseUploadGenerationPrefix,
   RAW_FORMATS,
   chunkKeys,
   computeContentSha256,
