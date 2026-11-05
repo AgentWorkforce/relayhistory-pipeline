@@ -16,6 +16,7 @@ import {
   propagatePointerTombstone,
   writeShortSummary,
 } from "../session-directory-summary.ts";
+import { SCRUB_RULESET_VERSION } from "../../shared/vendor.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -295,7 +296,7 @@ describe("V1 projector precedence", () => {
         source: "bob-costas/extractive/v1",
         generatedAt: new Date("2026-10-01T12:30:00Z"),
       }),
-    ).toEqual({ written: true, scrubVersion: 2 });
+    ).toEqual({ written: true, scrubVersion: SCRUB_RULESET_VERSION });
     expect(
       (
         await db.query<{ short_summary: string }>(

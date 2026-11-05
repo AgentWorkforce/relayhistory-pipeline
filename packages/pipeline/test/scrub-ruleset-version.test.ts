@@ -23,7 +23,13 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Quoted secret keys at any JSON escaping depth, Cloudflare scannable tokens and
   // more provider prefixes, non-Bearer Authorization, and the entropy fallback next
   // to a secret name (2026-11-02 Cloudflare-token-in-transcript finding).
-  3: "4f9212e178e3b1536f234230c3997edc1e0f78d63821a5d34b659e0e07415cd3",
+  // Updated before release (#162 adversarial review: the segmenter's CUT_CONTEXT_CHARS
+  // widened from 4096 to 8192, past the quoted rule's reach). Version 3 has sealed no
+  // chunk: it is only on the unmerged #162 branch.
+  // Then the entropy fallback stopped firing after a `/`, `.` or `-` (paths, members,
+  // branch names), and an unquoted value after a quoted key is taken only after a
+  // one-word key and only when it looks generated (code and quoted prose are kept).
+  3: "ff258a1b63c98071a0cdbdcc1806f14fe7f24e9fc122da950ea72222b1cca5ef",
 };
 
 const read = (rel: string) =>

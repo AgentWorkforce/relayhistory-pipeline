@@ -213,8 +213,11 @@ class MachineStream {
         traceId: this.traceId,
       });
       // A chunk already stored under an older version of the same rule set is
-      // kept (identical source; versions only differ past the bound, which the
-      // older one refused); the manifest records the lowest version.
+      // kept (keys are create-only; the source is identical), and the manifest
+      // records the lowest version. Versions differ on ordinary content, not
+      // only past the bound (3 added rules that 1 and 2 lack), so a chunk kept
+      // at 1 or 2 may hold a secret the current rules catch. Re-sending the
+      // same source range does not rescrub it: the stored object is kept.
       if (sealed.scrub.ruleset !== SCRUB_RULESET || sealed.scrub.version > SCRUB_RULESET_VERSION)
         throw Object.assign(new Error("a stored chunk was sealed under another scrub rule set"), {
           code: "chunk_scrub_mismatch",
