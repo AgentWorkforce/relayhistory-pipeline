@@ -29,6 +29,9 @@ async function database(before?: string) {
   await db.query(
     "INSERT INTO sessions.session_directory_search_token_policy(issuer,audience) VALUES('https://issuer.test','session-directory-search')",
   );
+  // 20261105031000: the read RPC serves only with forget tracking on (owner switch, before seeding).
+  if (before === undefined)
+    await db.query("SELECT sessions.set_session_desktop_catalog_forget_tracking(true)");
   return db;
 }
 async function seed(
@@ -181,6 +184,7 @@ test("writer atomically publishes real review metadata and marks complete source
       sessionId: "session",
     },
     projected,
+    { expectedEpoch: "1" },
   );
   const value = await catalog(db);
   expect(value.children[0]).toMatchObject({
@@ -261,7 +265,7 @@ test("pre-#182 writer runs on a schema without 20261105022000; the #182 writer c
   expect(row).toEqual({ agent_names: ["codex"], catalog_models: ["gpt-model"], project_key: "github.com/acme/widgets", project_id: "acme/widgets", git_repo: "git@github.com:acme/widgets.git", git_branch: "main", agent_name: "codex", projected: true });
   expect((await db.query("SELECT relationship_uid,child_session_id FROM sessions.session_directory_relationships")).rows).toEqual([{ relationship_uid: "edge", child_session_id: "child" }]);
   expect((await db.query("SELECT agent_name FROM sessions.session_directory_agents")).rows).toEqual([{ agent_name: "codex" }]);
-  await expect(writeDirectoryCatalog(db as never, legacyKey, legacyCatalog())).rejects.toThrow();
+  await expect(writeDirectoryCatalog(db as never, legacyKey, legacyCatalog(), { expectedEpoch: "0" })).rejects.toThrow();
 });
 test("pre-#182 writer on the full schema leaves every 20261105022000 column untouched", async () => {
   const db = await database();
