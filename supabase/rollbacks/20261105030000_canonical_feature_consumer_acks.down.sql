@@ -2,6 +2,4 @@
 DROP FUNCTION IF EXISTS sessions.finish_canonical_copy(bigint,jsonb,text,text,text,text);
 DROP TABLE IF EXISTS sessions.canonical_feature_copy_state;
 DROP TABLE IF EXISTS sessions.canonical_feature_page_ack;
-DROP TABLE IF EXISTS sessions.canonical_feature_consumer_lease;
-DROP TABLE IF EXISTS sessions.canonical_feature_consumer_dead_letter;
 DROP FUNCTION IF EXISTS sessions.canonical_feature_page_ack_fence();
