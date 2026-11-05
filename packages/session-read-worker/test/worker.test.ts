@@ -352,7 +352,7 @@ describe("reads through ClickHouse and Supabase", () => {
 });
 
 describe("directory list and activity (P3b)", () => {
-  test("off the canary allowlist every workspace falls back; on it, 501 until migration 20261105029000 exists", async () => {
+  test("off the canary allowlist every workspace falls back; on it, the directory serves the tenant only", async () => {
     const t = tenant();
     const bearer = await token(t);
     const call = async (path: string, over: Partial<Env> = {}) => {
@@ -370,12 +370,27 @@ describe("directory list and activity (P3b)", () => {
         expect((await body(r)).error.reason).toBe("directory_workspace_not_enabled");
       }
     }
+    // With migration 20261105029000 applied (global-setup runs every migration).
+    await owner((c) =>
+      c.query(
+        `INSERT INTO sessions.session_directory (org_id, workspace_id, harness, session_id, created_at, last_activity_at, task_title)
+         VALUES ($1, $2, 'codex', 'd-1', '2026-10-01T05:00:00Z', '2026-10-01T06:00:00Z', 'Directory session')`,
+        [t.org, t.ws],
+      ),
+    );
     for (const allow of [t.ws, `ws-other,${t.ws}`, "*"]) {
-      for (const path of [list, activity]) {
-        const r = await call(path, { READ_API_DIRECTORY_WORKSPACES: allow });
-        expect(r.status).toBe(501);
-        expect((await body(r)).error.reason).toBe("directory_not_migrated");
-      }
+      const r = await call(list, { READ_API_DIRECTORY_WORKSPACES: allow });
+      expect(r.status).toBe(200);
+      expect(r.headers.get("x-relayhistory-workspace-id")).toBe(t.ws);
+      const b = await body(r);
+      expect(b.sessions.map((s: { sessionId: string }) => s.sessionId)).toEqual(["d-1"]);
+      expect(b.sessions[0]).toMatchObject({ source: "codex", taskTitle: "Directory session", summarySource: "task_title" });
+      const a = await call(activity, { READ_API_DIRECTORY_WORKSPACES: allow });
+      expect(a.status).toBe(200);
+      expect((await body(a)).days).toEqual([
+        { date: "2026-10-01", total: 1, bySource: { codex: 1 } },
+        { date: "2026-10-02", total: 0, bySource: {} },
+      ]);
     }
     // Timing: the same allowlist, then the canonical S3 source (no raw-store secrets here).
     const timing = `/v1/sessions/s-1/timing?workspace=${t.ws}&source=codex`;
@@ -385,6 +400,14 @@ describe("directory list and activity (P3b)", () => {
     const on = await call(timing, { READ_API_DIRECTORY_WORKSPACES: t.ws });
     expect(on.status).toBe(501);
     expect((await body(on)).error.reason).toBe("timing_not_configured");
+    // Another tenant's token never sees it.
+    const other = tenant();
+    const otherBearer = await token(other);
+    const ctx = createExecutionContext();
+    const r = await handle(new Request(`${ORIGIN}/v1/sessions?workspace=${other.ws}`, { headers: { authorization: `Bearer ${otherBearer}` } }), { ...E, READ_API_DIRECTORY_WORKSPACES: "*" }, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(r.status).toBe(200);
+    expect((await body(r)).sessions).toEqual([]);
   });
 });
 

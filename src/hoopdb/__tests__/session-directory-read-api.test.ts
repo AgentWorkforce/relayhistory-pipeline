@@ -14,7 +14,10 @@ import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { SESSION_DIRECTORY_SEARCH_RPC } from "../search-index-contract.ts";
-import { TENANT_SETTINGS_SQL } from "../../session-read-api/liveness.ts";
+import { TENANT_SETTINGS_SQL, poolTenantRunner } from "../../session-read-api/liveness.ts";
+import { createReadApi } from "../../session-read-api/app.ts";
+import { sqlDirectory } from "../../session-read-api/directory.ts";
+import { memoryLiveness } from "../../session-read-api/__tests__/support.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -322,5 +325,56 @@ describe("bulls96_read_api bare role: bootstrap before migrate, verified by the 
     expect((await db.query("SELECT count(*)::int AS n FROM sessions.session_directory")).rows).toEqual([{ n: 7 }]);
     await db.exec(read(MIGRATION));
     expect((await asReadApi(db, ["org-a", "ws-a"], () => listFor(db, {}))).map((r) => r.session_id)).toEqual(["s1", "s2", "s3", "s4"]);
+  }, 120_000);
+});
+
+describe("the read API end to end over the real functions (src/session-read-api/directory.ts)", () => {
+  test("GET /v1/sessions and /activity as bulls96_read_api: pages walk once through b96s1 cursors, tenant-bound", async () => {
+    const db = await database();
+    await seed(db, FIXTURE);
+    const statements: string[] = [];
+    const pool = {
+      async connect() {
+        await db.exec("SET ROLE bulls96_read_api");
+        return {
+          query: (text: string, p?: unknown[]) => {
+            statements.push(text);
+            return db.query(text, p as unknown[]) as Promise<{ rows: unknown[] }>;
+          },
+          release: () => void db.exec("RESET ROLE"),
+        };
+      },
+    };
+    const app = createReadApi({
+      verify: async () => ({ userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] }),
+      ch: {} as never,
+      liveness: memoryLiveness().liveness,
+      completeSinceMs: 0,
+      directory: sqlDirectory(poolTenantRunner(pool)),
+      directoryWorkspaces: new Set(["ws-a"]),
+    });
+    const get = async (path: string) => {
+      const r = await app.request(path, { headers: { authorization: "Bearer t" } });
+      return { status: r.status, body: (await r.json()) as Record<string, any> };
+    };
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    do {
+      const r = await get(`/v1/sessions?workspace=ws-a&limit=1${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      expect(r.status).toBe(200);
+      seen.push(...r.body.sessions.map((s: { sessionId: string }) => s.sessionId));
+      cursor = r.body.nextCursor;
+    } while (cursor);
+    expect(seen).toEqual(["s1", "s2", "s3", "s4"]);
+    const first = await get("/v1/sessions?workspace=ws-a&source=codex&user=u1");
+    expect(first.body.sessions.map((s: { sessionId: string }) => s.sessionId)).toEqual(["s1", "s3"]);
+    expect(first.body.sessions[0]).toMatchObject({ sessionId: "s1", source: "codex", title: "First", userIds: ["u1"] });
+    const activity = await get("/v1/sessions/activity?workspace=ws-a&since=2026-10-03T00:00:00Z&until=2026-10-04T23:59:59Z");
+    expect(activity.status).toBe(200);
+    expect(activity.body.days).toEqual([
+      { date: "2026-10-03", total: 4, bySource: { claude: 2, codex: 2 } },
+      { date: "2026-10-04", total: 2, bySource: { claude: 1, codex: 1 } },
+    ]);
+    expect(statements.filter((s) => s.startsWith("BEGIN")).every((s) => s === "BEGIN READ ONLY")).toBe(true);
   }, 120_000);
 });
