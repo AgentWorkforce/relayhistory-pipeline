@@ -1,7 +1,6 @@
--- Companion producer-progress proposal ONLY — DRAFT, not assigned a registry
--- slot. The canonical journal and owner-only writer already live in merged
--- migration 20261105025000; do not copy or redefine them here. Move this
--- companion DDL to the registry-assigned migration only after coordination.
+-- Canonical feature consumer progress. Registry slot assigned by the unified
+-- boundary generator in #242. The canonical journal and owner-only writer live
+-- in 20261105025000; this migration does not copy or redefine either one.
 -- Metadata-only: no payload storage or transcript bytes.
 
 -- Companion producer-side state — REVISION-keyed page-chain ledger.
@@ -36,7 +35,8 @@ REVOKE ALL ON sessions.canonical_feature_page_ack,
   FROM PUBLIC,anon,authenticated,service_role,
   bulls96_session_ingest,bulls96_session_ingest_seeder;
 -- Producer progress role: SELECT on journal, write ONLY the progress tables
--- (never the journal or creator authority). OWNER-ONLY RPC boundary pending.
+-- (never the journal or creator authority). The owner-defined finish RPC below
+-- is the only producer-executable mutation after initialization.
 GRANT SELECT ON sessions.canonical_feature_journal
   TO bulls96_canonical_feature_producer;
 GRANT INSERT,SELECT ON sessions.canonical_feature_page_ack

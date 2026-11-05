@@ -1503,24 +1503,31 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   };
   const platformList = [...SUPABASE_PLATFORM_SUPERUSERS];
 
-  test("620 down then reapply through the real migrator (supabase, global-default-revoke): the down commits, the next run reapplies 026000 with no function_acl_drift and the marker passes", async () => {
+  test("consumer then 620 down/reapply through the real migrator: serialized downs commit, the next run reapplies 026000 then 030000 with no function_acl_drift", async () => {
     const db = await supabaseLike();
     await db.exec(OWNER_FN_DEFAULT_REVOKE);
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
     const L = "upstream:20261105026000_canonical_history_lineage.sql";
+    const C = "upstream:20261105030000_canonical_feature_consumer_acks.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
-    expect(await names()).toContain(L);
+    expect(await names()).toEqual(expect.arrayContaining([L, C]));
     expect(await passed()).toBe(true);
-    // The named down, committed as the owner (not inside a test rollback).
+    // Later lanes roll back first and remove their own ledger row; only then
+    // can 026000's named down preserve the gap-free prefix.
+    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105030000_canonical_feature_consumer_acks.down.sql"), "utf8"));
+    expect(await names()).not.toContain(C);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBeNull();
     await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql"), "utf8"));
     expect(await names()).not.toContain(L);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBeNull();
-    // The very next migrate reapplies 026000; the post-validation exact-ACL check finds no drift.
+    // The very next migrate reapplies 026000 then 030000; the post-validation
+    // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toContain(L);
+    expect(await names()).toEqual(expect.arrayContaining([L, C]));
     expect(await passed()).toBe(true);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBe("sessions.ingest_history_switch");
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBe("sessions.canonical_feature_copy_state");
     // And a no-op rerun stays clean.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
   });

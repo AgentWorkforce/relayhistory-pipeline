@@ -88,6 +88,18 @@ test("actual staged publisher preserves exact epoch and Unicode fold before sour
     "9007199254740993",
   );
 });
+test("empty workspace remains a valid canonical identity", async () => {
+  const d = setup();
+  d.document.workspaceId = "";
+  expect(await publishBriefDocumentsOnce(d)).toEqual({
+    claimed: 1,
+    published: 1,
+    backfilled: 1,
+  });
+  expect(d.writes[0]![0]).toMatchObject({ workspace_id: "" });
+  expect(JSON.parse(d.calls.at(-1)!.params![1] as string)[0].workspaceId)
+    .toBe("");
+});
 test("tombstone deletes only scoped lower epochs and ACKs after cleanup", async () => {
   const d = setup(true);
   await publishBriefDocumentsOnce(d);

@@ -34,6 +34,9 @@
     "sessions.canonical_feature_journal_seed(bigint,text)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.canonical_feature_page_ack_fence()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.canonical_feature_pointer_set_valid(jsonb)": [
       "<owner>:EXECUTE"
     ],
@@ -78,6 +81,10 @@
     "sessions.enqueue_session_large_read(text,text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.finish_canonical_copy(bigint,jsonb,text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_canonical_feature_producer:EXECUTE"
     ],
     "sessions.finish_session_analysis_cache(text,text,text,text,bigint,text,uuid,text)": [
       "<owner>:EXECUTE",

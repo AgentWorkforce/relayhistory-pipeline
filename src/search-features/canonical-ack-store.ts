@@ -101,13 +101,14 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
         ` WHERE entry_revision=$1 AND pool=$2`,
       [entry.revision, pool]);
     if (!chain.length) return { state: "empty", cursor: null };
+    const byCursor = new Map(chain.map((edge) => [edge.cursor, edge]));
     // Walk from 'start'; a complete walk must consume EVERY row — a leftover
     // means a branch/disconnected component, which is corrupt.
     let cursor: string | null = "start";
     const seen = new Set<string>(["start"]);
     let consumed = 0;
     for (;;) {
-      const edge = chain.find((r) => r.cursor === cursor);
+      const edge = byCursor.get(cursor);
       if (!edge) {
         // The last ACK may point at the next page that had not been written
         // when the worker crashed. That is the durable resume cursor, not a

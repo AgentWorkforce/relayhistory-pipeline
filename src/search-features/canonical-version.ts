@@ -7,8 +7,8 @@
  * value before the copier is stopped/drained.
  *
  * Ownership: this file declares the runtime CONTRACT only. The 025000 SQL
- * writer owns seed/allocation/append. Producer progress DDL is held in a
- * proposal until the migration registry assigns its own ledger slot.
+ * writer owns seed/allocation/append; producer progress is isolated in the
+ * registry-assigned 030000 consumer migration.
  */
 
 /** Durable publication + retirement journal — the only valid input. */

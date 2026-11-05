@@ -59,10 +59,10 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
   `source_authority`, publish prior fields are both-or-neither, and the
   producer cannot append journal rows. The concrete TypeScript journal writer
   remains retired; seed/allocation/CAS evidence comes from #230's SQL tests.
-- Durable page ACK/copy-state tables and `finish_canonical_copy` remain in
-  `docs/proposals/20261105025000_canonical_feature_journal.sql` until the
-  migration registry assigns their ledger slot. The code and synthetic PG17
-  proof do not authorize applying that proposal directly.
+- Durable page ACK/copy-state tables and `finish_canonical_copy` live in the
+  registry-assigned `20261105030000_canonical_feature_consumer_acks.sql`.
+  The migration is dormant metadata/schema: applying it does not start a
+  consumer or authorize traffic activation.
 - Define and rehearse the operator-only seed row. It must put the journal above
   the drained legacy feature high-water before any scope install or backfill;
   no data-plane identity may allocate or append revisions.
@@ -82,7 +82,8 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 - The real 025000 writer has rollback, sentinel and restricted-role verification.
   The producer identity can read journal/pointer pages but cannot call the
   owner-only writer or mutate the journal. The companion ACK/finish DDL still
-  needs its registry-assigned migration, sentinel, rollback and ACL generation.
+  requires its own restricted-role probe before activation; its 030000 slot,
+  sentinel, rollback and generated ACL boundary are part of this composition.
 - Supply the real bounded 184 materializer adapter for `rows`, `priorKeys` and
   the complete-image descriptor. Each page must retain the exact image,
   pointer-set and page hash checked by `copyCanonicalEntry`.
