@@ -8,6 +8,7 @@
     "test/artifact-capacity-setup.ts",
     "vitest.artifact-capacity.config.ts",
     "vitest.analysis-cache.config.ts",
+    "vitest.analysis-empty.config.ts",
     "scripts"
   ]
 }
