@@ -52,6 +52,19 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 - Merge and apply the 610/620 creator stack only in its planned generation
   window. The owner-only journal append is composed into the final install CAS,
   but schema presence alone is not activation.
+- Slim #230 at `a1ef796` is a hard hold despite its creator tests. Full-stack
+  probes show that 062000's native-slot triggers run on live ACKs while the
+  feature is nominally dormant: they can violate the directory short-summary
+  provenance constraint, blank legacy summaries before any 620 scope exists,
+  and return `40001` from a contended scope lock. Its rollback also refuses as
+  soon as the migration's own reconcile/required-scope rows exist. The 620
+  owner must keep legacy scopes behaviorally unchanged until a current 620
+  authority is installed, clear every summary provenance column atomically
+  when an active managed scope is invalidated, prevent invalidation contention
+  from failing ACKs, and supply a tested operational rollback that disables the
+  hooks without discarding retained authority/object obligations. Required
+  regressions: summarized live ACK, pre-install legacy summary write, contended
+  ACK/publication, active-scope invalidation, and rollback after queued work.
 - The creator-side replacement SQL at `0b359d6`/`d1f48fd` supersedes the broken
   `8602ca9` proposal: an independent fresh PostgreSQL 17 run passed all seven
   install races and the PGlite creator/610 suite passed 16/16. Composition is
