@@ -111,9 +111,27 @@ export async function copyCanonicalEntry(
   ch: ClickHouseClient,
   state: CanonicalCycleState,
   entry: CanonicalJournalEntry,
+  /** Stable, non-secret deployment identity — the actual CH target's ID.
+   *  Two deployments sharing database/table names still differ. */
+  targetId?: string,
 ): Promise<CanonicalCycleResult> {
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
+  const sourceAuthority: CanonicalSourceAuthority =
+    entry.kind === "publish" ? entry.sourceAuthority : entry.priorSourceAuthority;
+  // Bindings are the REAL identities — the versioned projection profile and
+  // the actual CH target (database + both tables + schema version + the
+  // deployment's own target ID), not the source image.
+  const profileBinding = `builtin-fold@1:${entry.schemaGeneration}`;
+  const targetBinding =
+    `${targetId ?? "default"}:${ch.database}:` +
+    `${EVENT_FEATURES_TABLE}:${BRIEF_FEATURES_TABLE}:v1`;
+  // Durable state FIRST — a committed entry reports already_complete and
+  // advances the checkpoint without ever touching the source descriptor.
+  const began = await acks.begin(entry, profileBinding, targetBinding);
+  if (began === "already_complete") {
+    return { kind: "copied", checkpoint: entry.revision, rows: 0 };
+  }
   // #233 fences: the image descriptor must be complete and still match the
   // journal's image identity + pointer set + source hash.
   const descriptor = await images.imageDescriptor(entry);
@@ -129,19 +147,6 @@ export async function copyCanonicalEntry(
     sourceHash:
       entry.kind === "publish" ? entry.sourceHash : entry.priorKeysetHash,
   };
-  const sourceAuthority: CanonicalSourceAuthority =
-    entry.kind === "publish" ? entry.sourceAuthority : entry.priorSourceAuthority;
-  // Bindings are the REAL identities — the versioned projection profile and
-  // the actual CH target (database + both tables + schema version), not the
-  // source image. A completed chain for a DIFFERENT target never passes.
-  const profileBinding = `builtin-fold@1:${ev.schemaGeneration}`;
-  const targetBinding =
-    `${ch.database}:${EVENT_FEATURES_TABLE}:${BRIEF_FEATURES_TABLE}:v1`;
-  const began = await acks.begin(entry, profileBinding, targetBinding);
-  if (began === "already_complete") {
-    // finish committed but the checkpoint never advanced — treat as done.
-    return { kind: "copied", checkpoint: entry.revision, rows: 0 };
-  }
   // Resume derives from the durable chain; a complete pool is SKIPPED.
   const rs: Record<"event" | "brief",
       { state: "empty" | "resume" | "complete" | "corrupt";

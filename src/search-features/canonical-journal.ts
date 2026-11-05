@@ -7,6 +7,7 @@
  * Implements CanonicalVersionPort + CanonicalJournalPort over a write-capable
  * connection (SqlQuery-compatible). DDL is held: 040610 is a proposal only.
  */
+import { createHash } from "node:crypto";
 import type {
   CanonicalJournalEntry,
   CanonicalJournalPort,
@@ -23,6 +24,8 @@ export interface SqlQuery {
 type Row = {
   revision: string | number;
   kind: string;
+  org_id: string;
+  workspace_id: string;
   // jsonb columns: drivers return parsed objects, fixtures may give strings.
   scope: unknown;
   schema_generation: string;
@@ -42,10 +45,11 @@ const jsonb = <T>(v: unknown): T => {
 const HS1 = /^hs1:[a-f0-9]{64}:[a-f0-9]{64}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HEX64 = /^[a-f0-9]{64}$/;
-// Canonical positive integer — nonzero, no leading zeros (epoch/revision).
-const DEC = /^[1-9][0-9]*$/;
-// Count may be zero — the ABI's nonnegative canonical form.
-const DEC0 = /^(0|[1-9][0-9]*)$/;
+// Canonical positive integer — nonzero, no leading zeros, writer bounds:
+// epoch/revision at most 19 digits (bigint-safe).
+const DEC = /^[1-9][0-9]{0,18}$/;
+// Count may be zero, at most 6 digits (writer ABI bound).
+const DEC0 = /^(0|[1-9][0-9]{0,5})$/;
 /** Fail-closed row validation — every field + cross-bound shape checked. */
 const exactKeys = (o: unknown, keys: string[]): boolean =>
   !!o && typeof o === "object" &&
@@ -79,9 +83,13 @@ const toEntry = (r: Row): CanonicalJournalEntry => {
     throw new Error("journal_row_invalid");
   const hs1Auth = r.image_key.split(":")[3]!;
   const hs1Gen = r.image_key.split(":")[2]!;
-  // The hs1 generation segment must equal the scope generation AND the
-  // schema_generation column — a retargeted or miskeyed image refuses.
-  if (hs1Gen !== scope.generation || hs1Gen !== r.schema_generation)
+  const hs1Scope = r.image_key.split(":")[1]!;
+  // The hs1 scope digest recomputes from the scope's own identity — a
+  // misrouted tenant scope with a syntactically valid key refuses.
+  if (createHash("sha256")
+        .update(JSON.stringify(scope)).digest("hex") !== hs1Scope ||
+      hs1Gen !== scope.generation || hs1Gen !== r.schema_generation ||
+      r.org_id !== scope.orgId || r.workspace_id !== scope.workspaceId)
     throw new Error("journal_row_invalid");
   if (r.kind === "retire") {
     const prior = jsonb<CanonicalSourceAuthority>(r.source_authority);
@@ -105,9 +113,13 @@ const toEntry = (r: Row): CanonicalJournalEntry => {
         ((r.prior_keyset_hash === null) !==
          (r.prior_source_authority === null)))
       throw new Error("journal_row_invalid");
-    if (r.prior_source_authority &&
-        !validAuth(jsonb<CanonicalSourceAuthority>(r.prior_source_authority)))
-      throw new Error("journal_row_invalid");
+    if (r.prior_source_authority) {
+      const prior = jsonb<CanonicalSourceAuthority>(r.prior_source_authority);
+      if (!validAuth(prior) ||
+          prior.fingerprint === src.fingerprint ||
+          prior.authorityId === src.authorityId)
+        throw new Error("journal_row_invalid");
+    }
   }
   return r.kind === "retire"
     ? { kind: "retire", revision: String(r.revision),
@@ -156,9 +168,10 @@ export class CanonicalJournalStore implements CanonicalJournalPort {
   constructor(readonly db: SqlQuery) {}
   async entries(after: string, limit: number) {
     const { rows } = await this.db.query<Row>(
-      "SELECT revision,kind,scope,schema_generation,image_key,source_hash," +
-        " prior_keyset_hash,source_authority,prior_source_authority," +
-        " pointer_set FROM sessions.canonical_feature_journal" +
+      "SELECT revision,kind,org_id,workspace_id,scope,schema_generation," +
+        " image_key,source_hash,prior_keyset_hash,source_authority," +
+        " prior_source_authority,pointer_set" +
+        " FROM sessions.canonical_feature_journal" +
         " WHERE revision > $1::bigint AND kind <> 'seed'" +
         " ORDER BY revision LIMIT $2",
       [after, limit + 1]);
