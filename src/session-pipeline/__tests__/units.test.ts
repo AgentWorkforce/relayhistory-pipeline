@@ -167,6 +167,17 @@ describe("configuration", () => {
     expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_REPLAY_PAGES_ENABLED: "1", PIPELINE_FANOUT: "postgres" })).toMatchObject({ searchEnabled: true, replayPagesEnabled: true, fanout: "postgres" });
   });
 
+  test("desktop catalog: only the literal \"1\" enables it; SEARCH_INDEX_ENABLED=1 alone never does", () => {
+    expect(lambdaEnv(base).desktopCatalogEnabled).toBe(false);
+    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1" })).toMatchObject({ searchEnabled: true, desktopCatalogEnabled: false });
+    expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_DESKTOP_CATALOG_ENABLED: "1" })).toMatchObject({ searchEnabled: true, desktopCatalogEnabled: true });
+    for (const value of ["", "0", "true", "TRUE", "yes", "on", " 1", "1 ", "01", "2"])
+      expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_DESKTOP_CATALOG_ENABLED: value }).desktopCatalogEnabled).toBe(false);
+    // The search deps carry the switch only when it is on, so the off path's deps are unchanged.
+    const lambdaSource = readFileSync(here("../lambda.ts"), "utf8");
+    expect(lambdaSource).toContain("...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}),");
+  });
+
   test("refuses the single-tenant layout and unknown fan-out", () => {
     expect(() => lambdaEnv({ ...base, PIPELINE_ORG_FROM_PREFIX: undefined })).toThrow(/ORG_FROM_PREFIX/);
     expect(() => lambdaEnv({ ...base, PIPELINE_FANOUT: "sqs" })).toThrow(/FANOUT/);

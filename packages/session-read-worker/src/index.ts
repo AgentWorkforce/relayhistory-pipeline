@@ -27,7 +27,8 @@ import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
 import { canonicalSnapshot, CanonicalReadError } from "../../../src/session-read-api/canonical.ts";
 import { sqlCanonicalPointers } from "../../../src/session-read-api/session-timing-source.ts";
-import type { TimingDeps } from "../../../src/session-read-api/app.ts";
+import { sqlSessionHarnesses } from "../../../src/session-read-api/session-turns-source.ts";
+import type { TimingDeps, TurnsDeps } from "../../../src/session-read-api/app.ts";
 import { logLine, type Level } from "../../../src/shared/log.ts";
 import { createClickHouseClient, type ClickHouseClient, type RequestOptions } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-read-api/app.ts";
@@ -194,6 +195,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   const tenant = requestTenantRunner(overrides.connect ?? hyperdriveClient(env.SUPABASE));
   const app = createReadApi({
     timing: timingDeps(env, tenant.run, overrides.fetcher),
+    turns: turnsDeps(env, tenant.run, overrides.fetcher),
     verify: relayAuthVerifier({ origin: env.READ_API_ORIGIN?.trim() || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL?.trim() || undefined, issuer: env.RELAYAUTH_ISSUER?.trim() || undefined }),
     ch,
     liveness: sqlLiveness(tenant.run),
@@ -240,6 +242,16 @@ export function timingDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers
       return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage };
     },
   };
+}
+
+/**
+ * Relay session turns and metadata from canonical S3, on the same pointers and raw-store
+ * secrets as timing. Without the secrets the routes answer 501 `turns_not_configured`.
+ */
+export function turnsDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>[0], fetcher: typeof fetch = (input, init) => fetch(input, init)): TurnsDeps | undefined {
+  const timing = timingDeps(env, run, fetcher);
+  if (!timing) return undefined;
+  return { harnesses: sqlSessionHarnesses(run), source: timing.source };
 }
 
 export default {
