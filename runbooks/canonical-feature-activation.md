@@ -4,6 +4,42 @@ Applying the Supabase schema does not activate canonical ClickHouse search.
 The composed source remains dormant until every gate below has reviewed
 evidence. Do not enable a reader merely because tables or functions exist.
 
+## Owned delivery checklist
+
+The Friday target means a bounded canary org/workspace can receive a new
+post-cutover upload, publish it through the canonical scope, read it through the
+Supabase session path, and find it through the ClickHouse search path by
+2026-11-06. It does **not** mean broad traffic or a partially backfilled
+workspace: a selected search scope stays fail-closed until its baseline and
+catch-up are complete at one captured high-water. Every production apply,
+deployment, cloud-resource change and backend-flag change still requires
+Khaliq's separate explicit approval.
+
+### Required for the Friday canary
+
+| ID | Deliverable | Owner | Done evidence |
+| --- | --- | --- | --- |
+| F1 | Announced slim #230 (schema + production creator only), then restack #233 on its exact head | 620 creator agent; migration-completeness | Final base SHA; clean stacked diff; creator race suite |
+| F2 | Correct owner-only 610 ABI: explicit seed above drained legacy high-water; initial publish; atomic exact prior retirement then replacement publish; no raw pointer arrays in the journal | migration-completeness + supporter-cloud + 620 creator agent | Fresh and replacement transaction tests; missing-seed refusal; rollback emits no row; restricted-role ACL/rollback/sentinel checks |
+| F3 | Publish new buffered uploads into ready canonical scopes and directory/replay authorities; drain only the bounded post-cutover catch-up for the canary scope | 620 creator/publication owner + sessionspipelinegrok | Captured cutover high-water; zero unpublished/dirty rows for the selected scope; exact read hydration succeeds |
+| F4 | Run a durable leased journal consumer with bounded 184 materialization, per-page ACKs, two-pool terminal finish CAS, retry/DLQ and metrics | migration-completeness + supporter-cloud | Restart/stale-worker tests; zero selected-scope journal backlog; immutable worker build identity |
+| F5 | Install event, brief, directory-document, authority and profile tables with separate least-privilege writer/reader roles and existing secret bindings | migration-completeness + supporter-cloud; bulls-migrator as operator | Reviewed DDL/grants; endpoint/database/schema hashes; live restricted-role probes |
+| F6 | Complete only the selected scope's directory-document baseline and journal catch-up; never expose partial workspace results | migration-completeness + sessionspipelinegrok | Event, brief and directory pools at the same captured revision; readiness clean |
+| F7 | Serve the uploaded session from Supabase-backed list/detail/summary reads | bulls-migrator read-path lane + Cloud UI lane | Buffered upload visible in directory and exact session hydration; tenant/auth negative tests; rollback flag recorded |
+| F8 | Land canonical reader/visibility stack #179+ and route the canary scope only after readiness succeeds | canonical #179+ owner + migration-completeness | Legacy-filter parity, cursor stability, exact hydration authority and fail-closed dirty-state tests |
+| F9 | One-org canary: upload, read, keyword search, semantic search when a stored vector exists, replace, delete/tombstone, latency and rollback | bulls-migrator coordinates; all owners provide evidence | Timestamped request/results, FINAL rows, parity report, no dirty/backlog, rollback rehearsal |
+
+### Required later for broad migration
+
+| ID | Deliverable | Owner | Why it can follow the bounded canary |
+| --- | --- | --- | --- |
+| L1 | Dedupe and resume the full 61M corpus plus live catch-up using the existing S3 manifest index and pipeline backfill already running | sessionspipelinegrok + migration-completeness | The Friday canary uses a fully complete bounded scope; broad workspaces remain on the current reader |
+| L2 | Complete model-summary generation and its full backfill | model lane | New-upload read/search can use existing title, short summary and stored feature vectors without claiming full model coverage |
+| L3 | Finish physical A/B carrier retirement, shared-reference reconciliation, late-PUT barriers and end-to-end S3 erasure | 620 retirement owner + bulls-migrator | Search tombstones are required for the canary; broad source-retirement activation remains blocked until this is complete |
+| L4 | Prove the largest real images and all oversize cohorts on the high-memory/streaming path | 620 materializer owner + supporter-cloud | The canary must select a proven bounded scope; unsupported scopes remain fail-closed |
+| L5 | Configure per-org retention across Supabase, ClickHouse and S3, including journal retention | migration-completeness + retirement owner | No TTL or deletion policy is enabled merely to meet the canary date |
+| L6 | Backfill every directory document, enable embeddings/model bindings where required, complete broad UI rollout and retire the legacy reader only after parity | canonical #179+ owner + Cloud UI lane + model lane | Broad cutover requires complete coverage and rollback evidence, not just a successful canary |
+
 ## Publication authority
 
 - Merge and apply the 610/620 creator stack only in its planned generation
