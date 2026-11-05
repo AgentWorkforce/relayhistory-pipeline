@@ -82,10 +82,23 @@ test("a mask record that was never registered as a scope key cannot be installed
   expect((await db.query("SELECT count(*)::int n FROM sessions.ingest_history_scope_current WHERE org_id=$1", [s.identity.orgId])).rows[0]!.n).toBe(0);
 });
 
-test("invalidation between capture and install refuses the stale build", async () => {
+const invalidate = (s: { identity: { orgId: string; workspaceId: string; sessionId: string } }) => db.query("SELECT sessions.ingest_history_invalidate_scope($1,$2,$3,$4)", [s.identity.orgId, s.identity.workspaceId, "claude", s.identity.sessionId]);
+test("invalidation of an INSTALLED scope between capture and install refuses the stale replacement build", async () => {
+  const s = await scope(["k1"]);
+  await install((await build(s, ["k1"])).b, s);
+  const { b } = await build(s, ["k1"]);
+  await invalidate(s);
+  await expect(install(b, s, "22222222-2222-2222-2222-222222222222")).rejects.toThrow("scope source changed since capture");
+});
+
+test("invalidating a scope with NO installed authority is a no-op: no required scope, epoch advance or directory change", async () => {
   const s = await scope(["k1"]), { b } = await build(s, ["k1"]);
-  await db.query("SELECT sessions.ingest_history_invalidate_scope($1,$2,$3,$4)", [s.identity.orgId, s.identity.workspaceId, "claude", s.identity.sessionId]);
-  await expect(install(b, s)).rejects.toThrow("scope source changed since capture");
+  const epoch = async () => (await db.query<any>("SELECT epoch::text e FROM sessions.session_replay_publications WHERE org_id=$1", [s.identity.orgId])).rows[0].e;
+  const before = await epoch();
+  await invalidate(s);
+  expect(await epoch()).toBe(before);
+  expect((await db.query<any>("SELECT count(*)::int n FROM sessions.ingest_history_required_scopes WHERE org_id=$1", [s.identity.orgId])).rows[0].n).toBe(0);
+  expect((await install(b, s)).installed).toBe(true);
 });
 
 test("a pointer-set change between capture and install refuses", async () => {
@@ -109,15 +122,59 @@ test("an expired lease refuses at install", async () => {
   await expect(install(b, s)).rejects.toThrow("scope build lease lost");
 });
 
-test("reinstall retires the prior version and its live derived objects atomically", async () => {
+// A second machine uploads: the scope's frozen pointer inventory (and so its content) changes.
+const addMachine = async (s: Awaited<ReturnType<typeof scope>>, machine: string) => {
+  const row = { ...s.row, machine_id: machine, manifest_key: s.row.manifest_key.replace("m=srv_origin", "m=" + machine) };
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([row])]);
+  return row;
+};
+const derivedKey = (s: Awaited<ReturnType<typeof scope>>) => s.anchor("12345678-1234-1234-1234-123456789abc").replace("manifest.json", "derived/summary-short/11111111-1111-1111-1111-111111111111.bin");
+// Everything an install could move for one scope: current row, every version, derived objects, journal.
+const scopeState = async (org: string) => ({
+  current: (await db.query<any>("SELECT authority_id::text a,ready FROM sessions.ingest_history_scope_current WHERE org_id=$1", [org])).rows,
+  versions: (await db.query<any>("SELECT authority_id::text a,state,source_fingerprint f,content_fingerprint c,feature_revision::text r FROM sessions.ingest_history_scope_versions WHERE org_id=$1 ORDER BY created_at,authority_id", [org])).rows,
+  derived: (await db.query<any>("SELECT o.object_key k,o.cleanup_state s,o.row_version::text v FROM sessions.ingest_history_derived_objects o JOIN sessions.ingest_history_scope_versions v USING(authority_id) WHERE v.org_id=$1 ORDER BY o.object_key", [org])).rows,
+  journal: (await db.query<any>("SELECT revision::text r,kind FROM sessions.canonical_feature_journal WHERE org_id=$1 ORDER BY revision", [org])).rows,
+});
+
+test("reinstall over CHANGED content retires the prior version and its live derived objects atomically", async () => {
   const s = await scope(["k1"]);
   const first = await install((await build(s, ["k1"])).b, s);
-  await db.query("INSERT INTO sessions.ingest_history_derived_objects(object_key,authority_id,sha256,bytes) VALUES($1,$2,repeat('c',64),10)", [s.anchor("12345678-1234-1234-1234-123456789abc").replace("manifest.json", "derived/summary-short/11111111-1111-1111-1111-111111111111.bin"), first.authorityId]);
+  await db.query("INSERT INTO sessions.ingest_history_derived_objects(object_key,authority_id,sha256,bytes) VALUES($1,$2,repeat('c',64),10)", [derivedKey(s), first.authorityId]);
+  await addMachine(s, "srv_second");
   const second = await install((await build(s, ["k1"])).b, s, "22222222-2222-2222-2222-222222222222");
   expect(second.retiredAuthorityId).toBe(first.authorityId);
   expect((await db.query("SELECT state FROM sessions.ingest_history_scope_versions WHERE authority_id=$1", [first.authorityId])).rows[0]).toEqual({ state: "retired" });
   expect((await db.query("SELECT cleanup_state FROM sessions.ingest_history_derived_objects WHERE authority_id=$1", [first.authorityId])).rows[0]).toEqual({ cleanup_state: "retired" });
   expect((await db.query("SELECT authority_id::text FROM sessions.ingest_history_scope_current WHERE org_id=$1", [s.identity.orgId])).rows[0]).toEqual({ authority_id: second.authorityId });
+});
+
+test("identical-content replacement: install refuses and leaves the current row, versions, derived objects and journal unchanged", async () => {
+  const s = await scope(["k1"]);
+  const first = await install((await build(s, ["k1"])).b, s);
+  await db.query("INSERT INTO sessions.ingest_history_derived_objects(object_key,authority_id,sha256,bytes) VALUES($1,$2,repeat('c',64),10)", [derivedKey(s), first.authorityId]);
+  const before = await scopeState(s.identity.orgId);
+  expect(before.current).toEqual([{ a: first.authorityId, ready: true }]);
+  expect(before.derived).toEqual([{ k: derivedKey(s), s: "live", v: "1" }]);
+  expect(before.journal.map((x: any) => x.kind)).toEqual(["publish"]);
+  // Same session_index rows, same epoch, same mask: only the (new) authority would differ.
+  const { b } = await build(s, ["k1"]);
+  await expect(install(b, s, "22222222-2222-2222-2222-222222222222")).rejects.toThrow("history: replacement does not change the source content");
+  expect(await scopeState(s.identity.orgId)).toEqual(before);
+  expect((await db.query<any>("SELECT state FROM sessions.ingest_history_scope_builds WHERE build_id=$1", [b.buildId])).rows[0].state).toBe("captured");
+  // The authority-bound source fingerprints of distinct authorities always differ, so the content
+  // identity is what the guard compares: the refused content equals the installed one.
+  expect(before.versions[0].c).toMatch(/^[a-f0-9]{64}$/);
+  expect(before.versions[0].c).not.toBe(before.versions[0].f);
+});
+
+test("a replacement over the same pointers after a managed invalidation (new epoch) installs", async () => {
+  const s = await scope(["k1"]);
+  const first = await install((await build(s, ["k1"])).b, s);
+  await db.query("SELECT sessions.ingest_history_invalidate_scope($1,$2,$3,$4)", [s.identity.orgId, s.identity.workspaceId, "claude", s.identity.sessionId]);
+  const second = await install((await build(s, ["k1"])).b, s, "22222222-2222-2222-2222-222222222222");
+  expect(second.retiredAuthorityId).toBe(first.authorityId);
+  expect(BigInt(second.source.epoch)).toBeGreaterThan(BigInt(first.source.epoch));
 });
 
 test("a foreign-tenant mask root or an anchor outside the tenant prefix is refused", async () => {
@@ -190,6 +247,7 @@ test("610 compose: a replacement appends retire(PRIOR image/authority/descriptor
 test("610 compose: a rolled-back replacement emits neither the retire nor the publish", async () => {
   const s = await scope(["k1"]);
   await install((await build(s, ["k1"])).b, s);
+  await addMachine(s, "srv_second");                       // real content change: the replacement is legitimate
   const built = (await build(s, ["k1"])).b;
   await db.exec("BEGIN; SET LOCAL ROLE bulls96_session_ingest");
   await db.query("SELECT sessions.ingest_history_scope_install($1::jsonb)", [JSON.stringify({ generation: gen, buildId: built.buildId, leaseToken: built.leaseToken, maskSha256: s.mask.sha256, recordCount: s.mask.count, derivedAnchorKey: s.anchor("33333333-3333-3333-3333-333333333333"), bucket: "creator-fixture", region: "us-east-1", keyRoot: "96bulls" })]);
@@ -237,10 +295,12 @@ test("610 compose: the invoker refuses raw pointers, descriptors that miss the f
 });
 
 test("610 compose: a refused install and a rolled-back install emit no journal entry", async () => {
-  const s = await scope(["k1"]), { b } = await build(s, ["k1"]);
+  const s = await scope(["k1"]);
+  await install((await build(s, ["k1"])).b, s);
+  const { b } = await build(s, ["k1"]);
   await db.query("SELECT sessions.ingest_history_invalidate_scope($1,$2,$3,$4)", [s.identity.orgId, s.identity.workspaceId, "claude", s.identity.sessionId]);
-  await expect(install(b, s)).rejects.toThrow("scope source changed since capture");
-  expect((await journal(s.identity.orgId)).length).toBe(0);
+  await expect(install(b, s, "22222222-2222-2222-2222-222222222222")).rejects.toThrow("scope source changed since capture");
+  expect((await journal(s.identity.orgId)).map((x: any) => x.kind)).toEqual(["publish"]);
   const t = await scope(["k1"]), built = (await build(t, ["k1"])).b;
   await db.exec("BEGIN; SET LOCAL ROLE bulls96_session_ingest");
   await db.query("SELECT sessions.ingest_history_scope_install($1::jsonb)", [JSON.stringify({ generation: gen, buildId: built.buildId, leaseToken: built.leaseToken, maskSha256: t.mask.sha256, recordCount: t.mask.count, derivedAnchorKey: t.anchor("12345678-1234-1234-1234-123456789abc"), bucket: "creator-fixture", region: "us-east-1", keyRoot: "96bulls" })]);

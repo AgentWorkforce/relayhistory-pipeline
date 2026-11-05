@@ -1503,6 +1503,53 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   };
   const platformList = [...SUPABASE_PLATFORM_SUPERUSERS];
 
+  test("620 down then reapply through the real migrator (supabase, global-default-revoke): the down commits, the next run reapplies 026000 with no function_acl_drift and the marker passes", async () => {
+    const db = await supabaseLike();
+    await db.exec(OWNER_FN_DEFAULT_REVOKE);
+    expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
+    const L = "upstream:20261105026000_canonical_history_lineage.sql";
+    const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
+    const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
+    expect(await names()).toContain(L);
+    expect(await passed()).toBe(true);
+    // On a composed tree, later migrations must be rolled back first. Preserve
+    // the parent's out-of-order refusal, then exercise legal reverse order.
+    const later=(await names()).filter(n=>n.startsWith("upstream:")&&n>L).sort().reverse();
+    const down620=readFileSync(join(root,"supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql"),"utf8");
+    if(later.length)await expect(db.exec(down620)).rejects.toThrow("later migration is applied");
+    for(const name of later){
+      const filename=name.slice("upstream:".length).replace(/\.sql$/,".down.sql");
+      await db.exec(readFileSync(join(root,"supabase/rollbacks",filename),"utf8"));
+      if(name.endsWith("canonical_project_events.sql"))expect(await names()).not.toContain(name);
+      // Some older down files require explicit operator ledger removal.
+      await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1",[name]);
+    }
+    // The named down, committed as the owner (not inside a test rollback).
+    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql"), "utf8"));
+    expect(await names()).not.toContain(L);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBeNull();
+    // The very next migrate reapplies 026000; the post-validation exact-ACL check finds no drift.
+    expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
+    expect(await names()).toContain(L);
+    expect(await passed()).toBe(true);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBe("sessions.ingest_history_switch");
+    // And a no-op rerun stays clean.
+    expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
+  });
+
+  test("F10 schema down refuses later ledger entries and an enabled unused scope", async () => {
+    const db=await supabaseLike();await db.exec(OWNER_FN_DEFAULT_REVOKE);
+    expect(await failure(runMigrations(client(db),{profile:SUPA_A}))).toBeNull();
+    const down=readFileSync(join(root,"supabase/rollbacks/20261105027000_canonical_project_events.down.sql"),"utf8");
+    const later="upstream:20261105099000_review_future.sql";
+    await db.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)",[later,"f".repeat(64)]);
+    await expect(db.exec(down)).rejects.toThrow("later migration applied");
+    await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1",[later]);
+    await db.query("INSERT INTO sessions.canonical_project_event_scopes VALUES($1,$2,$3,true)",["c4fae7b9-43a9-44e8-94d5-455aa579d67b","1220c1dc-0ce5-45fe-8b67-e7bb57a2db63","a".repeat(64)]);
+    await expect(db.exec(down)).rejects.toThrow("retain durable events");
+    expect((await db.query<{r:string|null}>("SELECT to_regclass('sessions.canonical_project_events')::text r")).rows[0]?.r).toBe("sessions.canonical_project_events");
+  });
+
   test("Cloud SQL trust root: only Google's fixed cloudsqladmin SUPERUSER is excluded in cloudsql mode", async () => {
     expect(Object.isFrozen(CLOUDSQL_PLATFORM_SUPERUSERS)).toBe(true);
     expect([...CLOUDSQL_PLATFORM_SUPERUSERS]).toEqual(["cloudsqladmin"]);

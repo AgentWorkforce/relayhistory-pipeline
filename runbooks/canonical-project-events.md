@@ -11,11 +11,14 @@ tenant identity, raw.state-derived completion, or fabricated job ID is sent.
 
 ## Source installation and activation order
 
-1. Compose on corrected #230 (`226410e` or its announced successor). F10 owns
+1. Compose on the cleared #230 contract (`6bce87c`, merged on main), through the unified-generator #242 stack. F10 owns
    `20261105027000_canonical_project_events.sql`, after journal `05025000` and
    lineage `05026000`. It does not replace any 610/620 function. Regenerate
-   ACL/boundary/verifiers with `bun scripts/sync-ingest-history-boundary.ts` and
-   check with `--check`; never hand-edit generated ACLs. Record the final composed
+   ACL/boundary/verifiers and the F10 rollback with `bun scripts/sync-sessions-function-boundary.ts` and
+   check with `--check`; never hand-edit generated ACLs. The canonical-project-events
+   lane manifest owns exactly ten functions and six grants, with the actor
+   verifier configured in the shared verifiers file. The history script remains
+   a wrapper; it must not contain a separate F10 generator. Record the final composed
    `generation()` once; both runtimes must use that reviewed pin.
 2. Operator runs the existing phase-one role bootstrap before migrating. It adds
    bare `bulls96_project_events` NOLOGIN/NOINHERIT. The migration grants that actor
@@ -92,5 +95,7 @@ Operational rollback: disable the scoped publisher and Cloud flags and disable
 the exact scope row; retain the outbox and Cloud receipts. Never delete pending
 events, reset generation, or revert creator authority to force success. The schema
 down migration refuses any event rows or enabled scope and is only for an unused
-installation. It never drops the cluster role. Re-enable only with the same
+installation. It refuses a later applied upstream ledger step, so roll later
+steps back first. On legal schema removal it deletes only its own final ledger
+row, allowing normal migrate to reapply it. It never drops the cluster role. Re-enable only with the same
 reviewed generation/scope, or a newly composed and verified rollout.

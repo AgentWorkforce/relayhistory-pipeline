@@ -1,16 +1,27 @@
 -- Append-only release rename (registry v2); upstream provenance: 20261103050000_session_desktop_catalog.sql. Never applied under the upstream filename in this release.
+-- Fail fast instead of queueing live readers/writers behind a blocked DDL lock (migrate.ts applies
+-- each file in one transaction, so SET LOCAL lasts exactly as long as this file).
+SET LOCAL lock_timeout='5s';
 -- Metadata only: full transcript/analysis bytes remain in canonical object storage.
 -- Existing rows default unready; controlled complete-source reprojection is required.
+-- Constant defaults: no table rewrite. The CHECKs are added NOT VALID (enforced for every new or
+-- updated row; existing rows hold the default/NULL and satisfy them), so the ACCESS EXCLUSIVE lock is
+-- not held for a validation scan. An operator runs VALIDATE CONSTRAINT later (SHARE UPDATE EXCLUSIVE,
+-- readers and writers keep running); see runbooks/history-620-operations.md.
 ALTER TABLE sessions.session_directory
- ADD COLUMN catalog_read_version smallint NOT NULL DEFAULT 0 CHECK(catalog_read_version IN(0,1)),
+ ADD COLUMN catalog_read_version smallint NOT NULL DEFAULT 0,
  ADD COLUMN catalog_read_epoch bigint,
  ADD COLUMN catalog_read_projected_at timestamptz,
  ADD COLUMN catalog_models_complete boolean NOT NULL DEFAULT false,
- ADD COLUMN catalog_relationships_complete boolean NOT NULL DEFAULT false;
+ ADD COLUMN catalog_relationships_complete boolean NOT NULL DEFAULT false,
+ ADD CONSTRAINT session_directory_catalog_read_version_check CHECK(catalog_read_version IN(0,1))NOT VALID;
 ALTER TABLE sessions.session_directory_relationships
- ADD COLUMN child_model text CHECK(child_model IS NULL OR char_length(child_model)<=200),
- ADD COLUMN child_agent_name text CHECK(child_agent_name IS NULL OR char_length(child_agent_name)<=200),
- ADD COLUMN child_agent_type text CHECK(child_agent_type IS NULL OR char_length(child_agent_type)<=200);
+ ADD COLUMN child_model text,
+ ADD COLUMN child_agent_name text,
+ ADD COLUMN child_agent_type text,
+ ADD CONSTRAINT session_directory_relationships_child_model_check CHECK(child_model IS NULL OR char_length(child_model)<=200)NOT VALID,
+ ADD CONSTRAINT session_directory_relationships_child_agent_name_check CHECK(child_agent_name IS NULL OR char_length(child_agent_name)<=200)NOT VALID,
+ ADD CONSTRAINT session_directory_relationships_child_agent_type_check CHECK(child_agent_type IS NULL OR char_length(child_agent_type)<=200)NOT VALID;
 CREATE INDEX session_directory_catalog_read_pending_idx ON sessions.session_directory(org_id,workspace_id)
  WHERE deleted_at IS NULL AND (catalog_read_version<>1 OR catalog_read_epoch IS DISTINCT FROM event_projection_epoch OR catalog_read_projected_at IS DISTINCT FROM catalog_projected_at OR NOT catalog_relationships_complete);
 

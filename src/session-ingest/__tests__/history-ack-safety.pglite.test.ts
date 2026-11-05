@@ -20,7 +20,8 @@ async function registerMask(reg: (doc: unknown) => Promise<any>, orgId: string, 
 }
 setDefaultTimeout(60000);
 // 620 must be invisible to the live upload ACK and control paths while dormant, and only ever touch
-// MANAGED scopes (installed or with an in-flight build) once active. The writes below are exactly the
+// MANAGED scopes (an INSTALLED current authority) once active. A build in flight is not managed: a
+// live ACK only fences (abandons) it. The writes below are exactly the
 // statement-level writes ingest_lazy_ack_batch / slot initialization make on ingest_lazy_native_slots.
 const root = join(import.meta.dir, "../../.."), gen = "a".repeat(64);
 let db: PGlite;
@@ -94,6 +95,56 @@ test("dormant: the named operational rollback runs after live ACK activity", asy
   try { await db.exec(down); } finally { await db.exec("ROLLBACK"); }
 });
 
+const LEDGER = "upstream:20261105026000_canonical_history_lineage.sql";
+const downSql = () => readFileSync(join(root, "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql"), "utf8");
+const upSql = () => readFileSync(join(root, "supabase/migrations/20261105026000_canonical_history_lineage.sql"), "utf8");
+// The migrator's ledger (src/hoopdb/migrate.ts MIGRATION_LEDGER), as it stands with 026000 applied last.
+const seedLedger = () => db.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY,sha256 text NOT NULL,applied_at timestamptz NOT NULL DEFAULT now());" +
+  "INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES('upstream:20261105025000_canonical_feature_journal.sql','x'),('" + LEDGER + "','x') ON CONFLICT DO NOTHING");
+const ledgerNames = async () => (await db.query<any>("SELECT name FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:2026110502%' ORDER BY name")).rows.map((x) => x.name);
+
+test("down then reapply (dormant): the down drops its ledger row, the migration reapplies, and a live ACK still succeeds", async () => {
+  const s = await scope(["k1"]);
+  await summarize(s, "survives down/reapply");
+  await db.exec("BEGIN");
+  try {
+    await seedLedger();
+    await db.exec(downSql());
+    expect(await ledgerNames()).toEqual(["upstream:20261105025000_canonical_feature_journal.sql"]);   // next migrate reapplies 026000
+    expect((await db.query<any>("SELECT to_regclass('sessions.ingest_history_scope_builds') r")).rows[0].r).toBeNull();
+    await db.exec(upSql());                                                                          // what migrate.ts then runs
+    await db.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,'x')", [LEDGER]);
+    await ack(s, "k1");
+    expect(await dir(s)).toMatchObject({ short_summary: "survives down/reapply", r: "relayhistory-scrub" });
+  } finally { await db.exec("ROLLBACK"); }
+});
+
+test("rollback after queued work once active (build in flight + fenced ACK, nothing installed): the down runs and reapplies", async () => {
+  const s = await scope(["k1"]);
+  const { b } = await build(s, ["k1"]);                                   // committed: 620 is now ACTIVE (live lease)
+  await ack(s, "k1");                                                      // fenced, queued nothing legacy
+  expect((await db.query<any>("SELECT state FROM sessions.ingest_history_scope_builds WHERE build_id=$1", [b.buildId])).rows[0].state).toBe("abandoned");
+  await db.exec("BEGIN");
+  try {
+    await seedLedger();
+    await db.exec(downSql());
+    await db.exec(upSql());
+    await ack(s, "k1", 3);
+  } finally { await db.exec("ROLLBACK"); }
+});
+
+test("the down refuses (nothing dropped) when a later upstream migration is already applied", async () => {
+  await db.exec("BEGIN");
+  try {
+    await seedLedger();
+    await db.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES('upstream:20261105027000_later.sql','x')");
+    await db.exec("SAVEPOINT d");
+    await expect(db.exec(downSql())).rejects.toThrow("a later migration is applied");
+    await db.exec("ROLLBACK TO SAVEPOINT d");
+    expect((await db.query<any>("SELECT to_regclass('sessions.ingest_history_scope_builds') r")).rows[0].r).not.toBeNull();
+  } finally { await db.exec("ROLLBACK"); }
+});
+
 test("active: an unmanaged session keeps its summary through ACKs and summarizer writes", async () => {
   const managed = await scope(["m1"]);
   await install((await build(managed, ["m1"])).b, managed);              // 620 now active somewhere
@@ -119,9 +170,278 @@ test("managed: an ACK invalidates the installed scope and clears the summary WIT
   expect(await dir(s)).toMatchObject({ short_summary: null, r: null, v: null, src: null, g: null });
 });
 
-test("managed: an in-flight build is fenced by an ACK that changes a native winner", async () => {
+const epochOf = async (s: any) => (await db.query<any>("SELECT epoch::text e FROM sessions.session_replay_publications WHERE org_id=$1 AND session_id=$2", [s.identity.orgId, s.identity.sessionId])).rows[0]?.e ?? null;
+const classified = async (s: any) => (await db.query<any>("SELECT sessions.ingest_history_scope_managed($1,$2,'claude',$3) m,sessions.ingest_history_scope_required($1,$2,'claude',$3) r,sessions.session_publication_is_managed($1,$2,'claude',$3,'srv_origin') p",
+  [s.identity.orgId, s.identity.workspaceId, s.identity.sessionId])).rows[0];
+// The statement-level receipt insert ingest_apply_ordered_control makes for one ordered control.
+const insertControl = (org: string, ws: string, user: string, epoch: string, version: number) => db.query(
+  "INSERT INTO sessions.ingest_control_receipts(org_id,workspace_id,user_id,epoch,version,digest,kind,result,schema_generation) VALUES($1,$2,$3,$4,$5,$6,'selection','{}'::jsonb,$7)",
+  [org, ws, user, epoch, version, hex("ctl-digest:" + version), gen]);
+const buildState = async (b: any) => (await db.query<any>("SELECT state FROM sessions.ingest_history_scope_builds WHERE build_id=$1", [b.buildId])).rows[0].state;
+
+for (const [label, rec] of [["a registered key", "k1"], ["a new native seated in the scope", "k-new"]] as const)
+test("in flight (captured): an ACK on " + label + " only fences the build; legacy summary/provenance, epoch and classification are untouched", async () => {
   const s = await scope(["k1"]);
+  await summarize(s, "legacy summary before the ACK");
+  const before = await dir(s);
   const { b } = await build(s, ["k1"]);
+  const epoch = await epochOf(s);
+  expect(epoch).not.toBeNull();
+  // A captured build alone is not management: only an installed current authority is.
+  expect(await classified(s)).toEqual({ m: false, r: false, p: false });
+  await ack(s, rec);
+  // No managed conversion: directory row (state, summary and all four provenance columns) unchanged.
+  expect(await dir(s)).toEqual(before);
+  expect(await epochOf(s)).toBe(epoch);
+  expect(await classified(s)).toEqual({ m: false, r: false, p: false });
+  expect((await db.query<any>("SELECT count(*)::int n FROM sessions.ingest_history_required_scopes WHERE org_id=$1", [s.identity.orgId])).rows[0].n).toBe(0);
+  expect((await db.query<any>("SELECT count(*)::int n FROM sessions.ingest_history_reconcile_outbox o JOIN sessions.ingest_lazy_native_slots n ON n.key_sha256=o.native_key_sha256 WHERE n.org_id=$1", [s.identity.orgId])).rows[0].n).toBe(0);
+  // The legacy summarizer still writes (the directory BEFORE trigger stays inert for this session).
+  await summarize(s, "legacy summarizer after the ACK");
+  expect(await dir(s)).toMatchObject({ short_summary: "legacy summarizer after the ACK", r: "relayhistory-scrub", v: 1, src: "bob-costas/extractive/v1" });
+  expect((await dir(s)).g).not.toBeNull();
+  // The build is fenced: abandoned, and its install refuses without installing anything.
+  expect(await buildState(b)).toBe("abandoned");
+  await expect(install(b, s)).rejects.toThrow("scope build lease lost");
+  expect((await db.query<any>("SELECT count(*)::int n FROM sessions.ingest_history_scope_current WHERE org_id=$1", [s.identity.orgId])).rows[0].n).toBe(0);
+  expect((await db.query<any>("SELECT count(*)::int n FROM sessions.canonical_feature_journal WHERE org_id=$1", [s.identity.orgId])).rows[0].n).toBe(0);
+  expect(await dir(s)).toMatchObject({ short_summary: "legacy summarizer after the ACK" });
+});
+
+test("in flight (keys): an ACK on a registered key fences the build before capture; nothing legacy moves", async () => {
+  const s = await scope(["k1"]);
+  await summarize(s, "keys-phase summary");
+  const before = await dir(s);
+  const epoch = await epochOf(s);
+  const b = await rpc("ingest_history_scope_begin", { generation: gen, identity: s.identity });
+  await rpc("ingest_history_scope_build_keys", { generation: gen, buildId: b.buildId, leaseToken: b.leaseToken, recordIds: ["k1"], owners: [] });
   await ack(s, "k1");
-  await expect(install(b, s)).rejects.toThrow("scope source changed since capture");
+  expect(await dir(s)).toEqual(before);
+  expect(await epochOf(s)).toBe(epoch);                                   // the replay epoch never advanced
+  expect(await classified(s)).toEqual({ m: false, r: false, p: false });
+  expect(await buildState(b)).toBe("abandoned");
+  await expect(rpc("ingest_history_scope_capture", { generation: gen, buildId: b.buildId, leaseToken: b.leaseToken })).rejects.toThrow("scope build lease lost");
+  // A fresh build after the ACK installs normally.
+  const { b: again } = await build(s, ["k1"]);
+  expect((await install(again, s)).installed).toBe(true);
+});
+
+test("in flight: an ACK on an UNRELATED session does not fence the build", async () => {
+  const s = await scope(["k1"]), other = await scope(["z1"]);
+  const { b } = await build(s, ["k1"]);
+  await ack(other, "z1");
+  expect(await buildState(b)).toBe("captured");
+  expect((await install(b, s)).installed).toBe(true);
+});
+
+test("in flight: a control change for a captured owner fences the build without invalidating", async () => {
+  const s = await scope(["k1"]);
+  await summarize(s, "control-phase summary");
+  const before = await dir(s);
+  const b = await rpc("ingest_history_scope_begin", { generation: gen, identity: s.identity });
+  await rpc("ingest_history_scope_build_keys", { generation: gen, buildId: b.buildId, leaseToken: b.leaseToken, recordIds: ["k1"], owners: [{ userId: "u-ctl", controlEpoch: hex("ctl-epoch"), controlVersion: "1" }] });
+  await rpc("ingest_history_scope_capture", { generation: gen, buildId: b.buildId, leaseToken: b.leaseToken });
+  const epoch = await epochOf(s);
+  await insertControl(s.identity.orgId, s.identity.workspaceId, "u-ctl", hex("ctl-epoch"), 2);
+  expect(await buildState(b)).toBe("abandoned");
+  expect(await dir(s)).toEqual(before);
+  expect(await epochOf(s)).toBe(epoch);
+  expect(await classified(s)).toEqual({ m: false, r: false, p: false });
+  await expect(install(b, s)).rejects.toThrow("scope build lease lost");
+});
+
+test("leftover state from an UNINSTALLED build (expired lease, stray required-scope row) never gates legacy writes or reads", async () => {
+  const s = await scope(["k1"]);
+  await summarize(s, "leftover summary");
+  const b = await rpc("ingest_history_scope_begin", { generation: gen, identity: s.identity });
+  await rpc("ingest_history_scope_build_keys", { generation: gen, buildId: b.buildId, leaseToken: b.leaseToken, recordIds: ["k1"], owners: [] });
+  await db.query("UPDATE sessions.ingest_history_scope_builds SET lease_until=clock_timestamp()-interval'1 second' WHERE build_id=$1", [b.buildId]);   // crashed builder
+  // The leftover row an older revision of 620 could leave behind: a required scope with no installed authority.
+  await db.query("INSERT INTO sessions.ingest_history_required_scopes(org_id,workspace_id,harness,session_id) VALUES($1,$2,'claude',$3)", [s.identity.orgId, s.identity.workspaceId, s.identity.sessionId]);
+  const epoch = await epochOf(s), before = await dir(s);
+  await ack(s, "k1");
+  expect(await dir(s)).toEqual(before);
+  expect(await epochOf(s)).toBe(epoch);
+  expect(await classified(s)).toEqual({ m: false, r: false, p: false });
+  expect(await buildState(b)).toBe("keys");                               // an expired lease is not fenced (it can never install)
+  await summarize(s, "legacy summarizer still writes");
+  expect(await dir(s)).toMatchObject({ short_summary: "legacy summarizer still writes", r: "relayhistory-scrub", v: 1 });
+  // The source snapshot names no History authority for it, so replay/brief/large-read/summary gates stay legacy.
+  const snap = (await db.query<any>("SELECT sessions.session_replay_source_snapshot($1,$2,'claude',$3) s", [s.identity.orgId, s.identity.workspaceId, s.identity.sessionId])).rows[0].s;
+  expect(snap.history).toBeUndefined();
+  await db.query("DELETE FROM sessions.ingest_history_required_scopes WHERE org_id=$1", [s.identity.orgId]);
+});
+
+test("the down refuses once an authority is installed and points at the kill switch", async () => {
+  await db.exec("BEGIN");
+  try {
+    await db.exec("SAVEPOINT d");
+    await expect(db.exec(downSql())).rejects.toThrow("use sessions.ingest_history_set_live(false)");
+    await db.exec("ROLLBACK TO SAVEPOINT d");
+  } finally { await db.exec("ROLLBACK"); }
+});
+
+test("kill switch after install: OFF makes every hook and gate inert with ledgers kept; ON invalidates installed scopes", async () => {
+  const s = await scope(["k1"]);
+  await install((await build(s, ["k1"])).b, s);
+  const pending = await scope(["p1"]), { b: inflight } = await build(pending, ["p1"]);
+  const ledgers = async () => (await db.query<any>("SELECT (SELECT count(*)::int FROM sessions.ingest_history_scope_versions) v,(SELECT count(*)::int FROM sessions.ingest_history_scope_current) c,(SELECT count(*)::int FROM sessions.canonical_feature_journal) j")).rows[0];
+  const kept = await ledgers();
+  expect((await db.query<any>("SELECT sessions.ingest_history_set_live(false) r")).rows[0].r).toMatchObject({ live: false, changed: true });
+  expect(await buildState(inflight)).toBe("abandoned");
+  expect((await db.query<any>("SELECT sessions.ingest_history_active() a")).rows[0].a).toBe(false);
+  // The installed scope now behaves exactly as main: summarizer writes stick, ACKs move nothing.
+  await summarize(s, "written while 620 is off");
+  const epoch = await epochOf(s);
+  await ack(s, "k1", 7);
+  expect(await dir(s)).toMatchObject({ short_summary: "written while 620 is off", r: "relayhistory-scrub" });
+  expect(await epochOf(s)).toBe(epoch);
+  expect(await classified(s)).toEqual({ m: false, r: false, p: false });
+  expect(await ledgers()).toEqual(kept);
+  await expect(rpc("ingest_history_scope_begin", { generation: gen, identity: s.identity })).rejects.toThrow("620 is switched off");
+  // ON again: the untracked period is invalidated for every installed scope.
+  expect((await db.query<any>("SELECT sessions.ingest_history_set_live(true) r")).rows[0].r).toMatchObject({ live: true, changed: true });
+  expect(await dir(s)).toMatchObject({ state: "unknown", short_summary: null, r: null, v: null, src: null, g: null });
+  expect((await db.query<any>("SELECT ready FROM sessions.ingest_history_scope_current WHERE org_id=$1", [s.identity.orgId])).rows[0].ready).toBe(false);
+  expect(BigInt(await epochOf(s))).toBeGreaterThan(BigInt(epoch));
+  expect((await classified(s)).m).toBe(true);
+  for (const role of ["bulls96_session_ingest", "service_role", "session_directory_search_worker"]) {
+    await db.exec("BEGIN; SET LOCAL ROLE " + role);
+    try { await expect(db.query("SELECT sessions.ingest_history_set_live(false)")).rejects.toThrow(/permission denied/); } finally { await db.exec("ROLLBACK"); }
+  }
+});
+
+test("pointer tracking is dormant until armed; the backfill refuses unarmed, rewrites stale refs and completes the inventory gate", async () => {
+  const refs = async (org: string) => (await db.query<any>("SELECT pointer_sha256 FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [org])).rows.length;
+  const s = await scope(["k1"]);
+  expect(await refs(s.identity.orgId)).toBe(0);                           // the indexer write paid nothing
+  await expect(db.query("SELECT sessions.ingest_history_pointer_ref_backfill(NULL,10)")).rejects.toThrow("arm pointer tracking");
+  await expect(rpc("ingest_history_inventory_claim", { generation: gen, bucket: "creator-fixture" })).rejects.toThrow("not tracked and backfilled");
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  let cursor: unknown = null, pages = 0;
+  do { cursor = (await db.query<any>("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [cursor === null ? null : JSON.stringify(cursor)])).rows[0].c; pages++; } while (cursor !== null && pages < 100);
+  expect(cursor).toBeNull();
+  expect(await refs(s.identity.orgId)).toBe(1);
+  expect((await db.query<any>("SELECT refs_complete FROM sessions.ingest_history_switch")).rows[0].refs_complete).toBe(true);
+  // Armed: the trigger now maintains a changed pointer itself.
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...s.row, revision: 2, content_sha256: "\\x" + "b".repeat(64) }])]);
+  const after = (await db.query<any>("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [s.identity.orgId])).rows[0].r;
+  expect(after).toBe("2");
+  // Disarm: completeness drops; a re-arm needs a fresh pass, which rewrites the stale ref.
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...s.row, revision: 3, content_sha256: "\\x" + "c".repeat(64) }])]);
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  expect((await db.query<any>("SELECT refs_complete FROM sessions.ingest_history_switch")).rows[0].refs_complete).toBe(false);
+  cursor = null; pages = 0;
+  do { cursor = (await db.query<any>("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [cursor === null ? null : JSON.stringify(cursor)])).rows[0].c; pages++; } while (cursor !== null && pages < 100);
+  expect((await db.query<any>("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [s.identity.orgId])).rows[0].r).toBe("3");
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});
+
+test("kill -> write -> resume: the pointer attestation is dropped; inventory refuses until a fresh backfill repairs update, delete and insert", async () => {
+  const backfill = async () => { let c: unknown = null, n = 0; do { c = (await db.query<any>("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [c === null ? null : JSON.stringify(c)])).rows[0].c; n++; } while (c !== null && n < 100); };
+  const sw = async () => (await db.query<any>("SELECT live,pointer_tracking p,refs_complete c FROM sessions.ingest_history_switch")).rows[0];
+  const refOf = async (org: string) => (await db.query<any>("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [org])).rows.map((x) => x.r);
+  const claim = () => rpc("ingest_history_inventory_claim", { generation: gen, bucket: "kill-resume-none" });
+  const upd = await scope(["k1"]), del = await scope(["k1"]);
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill();
+  expect(await sw()).toEqual({ live: true, p: true, c: true });
+  expect(await refOf(upd.identity.orgId)).toEqual(["1"]);
+  expect(await refOf(del.identity.orgId)).toEqual(["1"]);
+  await db.query("SELECT sessions.ingest_history_set_live(false)");
+  expect(await sw()).toEqual({ live: false, p: true, c: false });             // OFF drops the attestation
+  // Untracked writes while OFF: an update, a delete and a brand-new pointer.
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...upd.row, revision: 2, content_sha256: "\\x" + "b".repeat(64) }])]);
+  await db.query("DELETE FROM sessions.session_index WHERE org_id=$1", [del.identity.orgId]);
+  const ins = await scope(["k1"]);
+  expect(await refOf(upd.identity.orgId)).toEqual(["1"]);                    // stale while OFF, as designed
+  expect(await refOf(del.identity.orgId)).toEqual(["1"]);
+  expect(await refOf(ins.identity.orgId)).toEqual([]);
+  await db.query("SELECT sessions.ingest_history_set_live(true)");
+  expect(await sw()).toEqual({ live: true, p: true, c: false });              // resume never restores it
+  await expect(claim()).rejects.toThrow("not tracked and backfilled");
+  await backfill();
+  expect(await sw()).toEqual({ live: true, p: true, c: true });
+  expect(await refOf(upd.identity.orgId)).toEqual(["2"]);
+  expect(await refOf(del.identity.orgId)).toEqual([]);                        // orphan removed
+  expect(await refOf(ins.identity.orgId)).toEqual(["1"]);
+  expect(await claim()).toEqual({ ticket: null });                            // admitted only now
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});
+
+test("disarm -> DELETE -> rearm: the full backfill prunes the dangling ref before attesting; a claim refuses a dangling ref", async () => {
+  const backfill = async () => { let c: unknown = null, n = 0; do { c = (await db.query<any>("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [c === null ? null : JSON.stringify(c)])).rows[0].c; n++; } while (c !== null && n < 100); };
+  const dangling = async () => (await db.query<any>("SELECT count(*)::int n FROM sessions.ingest_history_pointer_refs f WHERE NOT EXISTS(SELECT 1 FROM sessions.session_index i WHERE i.org_id=f.org_id AND i.workspace_id=f.workspace_id AND i.harness=f.harness AND i.session_id=f.session_id AND i.machine_id=f.machine_id)")).rows[0].n;
+  const s = await scope(["k1"]), keep = await scope(["k1"]);
+  for (const x of [s, keep]) await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...x.row, bucket: "dangle-bucket", revision: 2 }])]);
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill();
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+  await db.query("DELETE FROM sessions.session_index WHERE org_id=$1", [s.identity.orgId]);   // untracked delete
+  expect(await dangling()).toBe(1);
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill();
+  expect(await dangling()).toBe(0);
+  expect((await db.query<any>("SELECT refs_complete FROM sessions.ingest_history_switch")).rows[0].refs_complete).toBe(true);
+  // A dangling ref that still exists (planted here) is never admitted to a scan.
+  const carrier = (await db.query<any>("SELECT carrier_sha256 c FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [keep.identity.orgId])).rows[0].c;
+  await db.query("INSERT INTO sessions.ingest_history_pointer_refs VALUES($1,$2,'claude','ghost','srv_origin',$3,'{}'::jsonb,$4)", [keep.identity.orgId, keep.identity.workspaceId, carrier, "e".repeat(64)]);
+  await expect(rpc("ingest_history_inventory_claim", { generation: gen, bucket: "dangle-bucket" })).rejects.toThrow("dangling pointer references");
+  await backfill();                                                         // prunes it
+  expect(await dangling()).toBe(0);
+  expect((await rpc("ingest_history_inventory_claim", { generation: gen, bucket: "dangle-bucket" })).ticket).not.toBeNull();
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});
+
+test("resume -> reinsert / update / delete over STALE refs left by OFF: every write repairs the ref (no 23505) before any rebackfill", async () => {
+  const backfill = async () => { let c: unknown = null, n = 0; do { c = (await db.query<any>("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [c === null ? null : JSON.stringify(c)])).rows[0].c; n++; } while (c !== null && n < 100); };
+  const refOf = async (org: string) => (await db.query<any>("SELECT pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [org])).rows.map((x) => x.r);
+  const epochOf = async (org: string) => (await db.query<any>("SELECT c.epoch::text e FROM sessions.ingest_history_carriers c JOIN sessions.ingest_history_pointer_refs f USING(carrier_sha256) WHERE f.org_id=$1", [org])).rows[0]?.e;
+  const re = await scope(["k1"]), up = await scope(["k1"]), same = await scope(["k1"]), gone = await scope(["k1"]);
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill();
+  await db.query("SELECT sessions.ingest_history_set_live(false)");
+  await db.query("DELETE FROM sessions.session_index WHERE org_id=$1", [re.identity.orgId]);                                  // untracked delete
+  for (const [x, rev] of [[up, 2], [same, 2], [gone, 2]] as const)
+    await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...x.row, revision: rev, content_sha256: "\\x" + "b".repeat(64) }])]);   // untracked updates
+  await db.query("SELECT sessions.ingest_history_set_live(true)");
+  const before = await epochOf(re.identity.orgId);
+  // Reinsert of the deleted pointer: the stale ref at that key is replaced, not a PK violation.
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...re.row, revision: 2 }])]);
+  expect(await refOf(re.identity.orgId)).toEqual(["2"]);
+  expect(BigInt((await epochOf(re.identity.orgId))!)).toBeGreaterThan(BigInt(before!));      // carrier queued for rescan
+  // A tracked change over a stale ref repairs it.
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...up.row, revision: 3, content_sha256: "\\x" + "c".repeat(64) }])]);
+  expect(await refOf(up.identity.orgId)).toEqual(["3"]);
+  // A pointer-unchanged write over a stale ref still repairs it (no early return on a stale ref).
+  await db.query("UPDATE sessions.session_index SET indexed_at=now() WHERE org_id=$1", [same.identity.orgId]);
+  expect(await refOf(same.identity.orgId)).toEqual(["2"]);
+  // A tracked delete over a stale ref removes it.
+  await db.query("DELETE FROM sessions.session_index WHERE org_id=$1", [gone.identity.orgId]);
+  expect(await refOf(gone.identity.orgId)).toEqual([]);
+  await backfill();
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
+});
+
+test("reinsert onto a different carrier over a stale ref: the OLD carrier is rescanned too (NEW-key stale-ref repair)", async () => {
+  const backfill = async () => { let c: unknown = null, n = 0; do { c = (await db.query<any>("SELECT sessions.ingest_history_pointer_ref_backfill($1::jsonb,5000) c", [c === null ? null : JSON.stringify(c)])).rows[0].c; n++; } while (c !== null && n < 100); };
+  const s = await scope(["k1"]);
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(true)");
+  await backfill();
+  const old = (await db.query<any>("SELECT f.carrier_sha256 k,c.epoch::text e FROM sessions.ingest_history_pointer_refs f JOIN sessions.ingest_history_carriers c USING(carrier_sha256) WHERE f.org_id=$1", [s.identity.orgId])).rows[0];
+  await db.query("UPDATE sessions.ingest_history_carriers SET scan_complete=true WHERE carrier_sha256=$1", [old.k]);
+  await db.query("SELECT sessions.ingest_history_set_live(false)");
+  await db.query("DELETE FROM sessions.session_index WHERE org_id=$1", [s.identity.orgId]);              // untracked: stale ref -> old carrier
+  await db.query("SELECT sessions.ingest_history_set_live(true)");
+  await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...s.row, bucket: "moved-bucket", revision: 2 }])]);   // reinsert on a NEW carrier
+  const ref = (await db.query<any>("SELECT carrier_sha256 k,pointer->>'revision' r FROM sessions.ingest_history_pointer_refs WHERE org_id=$1", [s.identity.orgId])).rows;
+  expect(ref.length).toBe(1);
+  expect(ref[0].k).not.toBe(old.k);
+  expect(ref[0].r).toBe("2");
+  const after = (await db.query<any>("SELECT epoch::text e,scan_complete FROM sessions.ingest_history_carriers WHERE carrier_sha256=$1", [old.k])).rows[0];
+  expect(BigInt(after.e)).toBeGreaterThan(BigInt(old.e));                                                  // the old carrier must be rescanned
+  expect(after.scan_complete).toBe(false);
+  await backfill();
+  await db.query("SELECT sessions.ingest_history_set_pointer_tracking(false)");
 });

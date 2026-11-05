@@ -1,3 +1,4 @@
+SET LOCAL lock_timeout='5s';
 -- F10 standalone ingest-track outbox, registry v2 slot (initial proposal 040640).
 -- Depends on canonical_feature_journal + canonical_history_lineage (original
 -- 20261104061000/20261104062000, re-slotted 20261105025000/20261105026000).
