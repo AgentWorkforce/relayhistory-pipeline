@@ -96,8 +96,17 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
   const delegated=new Set<string>();
   if(deps.large&&(deps.search||deps.replay))for(const {scope,messageIds} of scopes.values()){
     if(messageIds.every(id=>failed.has(id)))continue;
+    const ids={org_id:scope.orgId,workspace_id:scope.workspaceId,harness:scope.harness,session_id:scope.sessionId};
     try{if(await deps.large.route(scope))delegated.add(scopeId(scope))}
-    catch(error){log.error("large scope handoff failed",{stage:"large-read",...errorFields(error)});for(const id of messageIds)failed.add(id)}
+    catch(error){
+      // route_session_large_read captures first, so it raises the same refusals as the replay
+      // stage (#179). A capacity/superseded refusal is not retryable here: log it and let search
+      // and replay apply their own limits. Anything else (e.g. 55000 durable handoff
+      // unavailable) fails the batch and is retried.
+      const refusal=classifyReplayFailure(error);
+      if(refusal){log.warn("large scope handoff refused",{stage:"large-read",...ids,...errorFields(error),reason:refusal.reason,error_code:refusal.code});continue}
+      log.error("large scope handoff failed",{stage:"large-read",...ids,...errorFields(error)});for(const id of messageIds)failed.add(id);
+    }
   }
   if (deps.search) {
     for (const { scope, messageIds, manifestKey } of scopes.values()) {
@@ -162,8 +171,9 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         if (refusal?.kind === "capacity") {
           // Oversize scopes go to the large-read path before search/replay run: deps.large
           // (route_session_large_read -> session_large_read_jobs, default off) delegates them
-          // above. A capacity refusal here is a scope that was not delegated (handoff off, or
-          // metadata under the route thresholds); it is logged, not retried.
+          // above. A capacity refusal here is a scope that was not delegated (handoff off,
+          // metadata under the route thresholds, or the route itself refused on capacity);
+          // it is logged, not retried.
           log.warn("canonical replay refused", { ...fields, reason: refusal.reason, error_code: refusal.code });
           continue;
         }
