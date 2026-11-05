@@ -1,3 +1,7 @@
+import {
+  resolvedPublicTurnSourceSql,
+  selectedPublicTurnPredicateSql,
+} from "../../shared/legacy-turn-source.ts";
 /** Optional legacy evidence export. No reads occur unless includeLegacySources is selected. */
 import {
   buildSessionStream,
@@ -58,15 +62,25 @@ export function withLegacySource(
       for (const spec of LEGACY_TABLES) {
         let after: string | undefined;
         for (;;) {
+          const selectedScope =
+            spec.table === "conversation_turns"
+              ? `t.org_id=$1 AND t.workspace_id=$2 AND t.session_id=$4 AND ${selectedPublicTurnPredicateSql("t", "$3")}`
+              : scope;
+          // The public source is attribution, while the original overloaded
+          // column remains explicit metadata. Content, IDs and turn fields stay exact.
+          const attribution =
+            spec.table === "conversation_turns"
+              ? ",'source',$3::text,'legacy_stored_source',t.source"
+              : "";
           const { rows } = await db.query<{
             key: string;
             payload_json: string;
             received_at: string;
             user_id: string | null;
           }>(
-            `SELECT ${spec.key}::text AS key,(to_jsonb(t)||jsonb_build_object('${spec.key}',${spec.key}::text))::text AS payload_json,
+            `SELECT ${spec.key}::text AS key,(to_jsonb(t)||jsonb_build_object('${spec.key}',${spec.key}::text${attribution}))::text AS payload_json,
       (${spec.time})::text AS received_at,${spec.user} AS user_id FROM sessions.${spec.table} t
-      WHERE ${scope} ${after === undefined ? "" : `AND ${spec.key}>$6::${spec.cast}`} ORDER BY ${spec.key} LIMIT $5`,
+      WHERE ${selectedScope} ${after === undefined ? "" : `AND ${spec.key}>$6::${spec.cast}`} ORDER BY ${spec.key} LIMIT $5`,
             [
               unit.orgId,
               unit.workspaceId,
@@ -139,10 +153,17 @@ export interface LegacyActivity extends GroupActivity {
   workspace_id: string;
   source: string;
 }
-const legacyUnion = LEGACY_TABLES.map(
-  (s) =>
-    `SELECT org_id,workspace_id,source,session_id,${s.time} AS ts FROM sessions.${s.table}`,
+const legacyUnion = LEGACY_TABLES.map((s) =>
+  s.table === "conversation_turns"
+    ? // Empty source is only an unbound coverage sentinel. It is rejected below
+      // before a unit/provider is created; it is never a default harness.
+      `SELECT t.org_id,t.workspace_id,COALESCE(${resolvedPublicTurnSourceSql("t")},'') AS source,t.session_id,t.ts FROM sessions.conversation_turns t`
+    : `SELECT org_id,workspace_id,source,session_id,${s.time} AS ts FROM sessions.${s.table}`,
 ).join(" UNION ALL ");
+function assertBound(rows: Array<{ source: string }>) {
+  if (rows.some((r) => typeof r.source !== "string" || !r.source))
+    throw new Error("legacy_source_unbound");
+}
 /** Includes turn/link/outcome-only groups that rollups/catalog discovery cannot see. */
 export async function legacyActivityPage(
   db: Queryable,
@@ -167,6 +188,7 @@ export async function legacyActivityPage(
         ]
       : [limit],
   );
+  assertBound(rows);
   return rows;
 }
 export async function includeLegacyUnits(
@@ -186,6 +208,7 @@ export async function includeLegacyUnits(
  FROM evidence WHERE org_id=$1 AND session_id=$2 GROUP BY workspace_id,source`,
     [orgId, sessionId],
   );
+  assertBound(rows);
   const result = new Map(
     units.map((u) => [JSON.stringify([u.workspaceId, u.source]), { ...u }]),
   );

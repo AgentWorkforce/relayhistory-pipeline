@@ -29,6 +29,11 @@ export { BaseStore, readAll, type Provider, type Expiring } from "./core.js";
 export {
   LAYOUT_VERSION,
   MANIFEST_FILE,
+  isManifestRest,
+  isPublicationManifestRest,
+  uploadGenerationPrefix,
+  parseUploadGenerationPrefix,
+  publicationManifestKey,
   RAW_FORMATS,
   machinePrefix,
   manifestKey,

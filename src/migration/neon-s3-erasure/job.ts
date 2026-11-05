@@ -19,10 +19,18 @@
 import type { Queryable } from "../relayhistory-export.ts";
 import { orgPrefix } from "../neon-s3-sync/export-session.ts";
 import { activityPage, catalogPage, fencedGroups, fencedLivePage, groupExistsInNeon, lockWaiters, type LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
-import { liveObjectPrefix, livePointerPrefix, liveSessionsIn, liveTargets } from "./live.ts";
+import { liveObjectPrefix, livePointerPrefix, liveSessionsIn, liveStagedPrefix, liveTargets } from "./live.ts";
 
 /** Clock-skew margin between this host and S3 `LastModified`. */
 export const LIVE_SKEW_MS = 2 * 60 * 1000;
+/**
+ * A staged batch (session ingest) holds several sessions, and its fan-out may
+ * still be retrying or waiting for a DLQ redrive (runbooks/session-ingest-rollout.md:
+ * redrive within 24 h). When a session of its (workspace, user, origin) is
+ * tombstoned, its staged objects older than this are erased; younger ones on a
+ * later sweep. The session's own manifests and chunks are erased at once, as before.
+ */
+export const STAGED_ERASE_AFTER_MS = 48 * 60 * 60 * 1000;
 
 const DOT_SEGMENT = /(^|\/)\.{1,2}(\/|$)/;
 import type { SyncState } from "../neon-s3-sync/state.ts";
@@ -36,6 +44,12 @@ export interface ErasureConfig {
   progressEveryMs: number;
   /** Logged as a breach when the oldest queued erasure is older than this. */
   slaWarnMs: number;
+  /**
+   * Whether the existence guard also counts legacy-only evidence (conversation
+   * turns, links, outcomes). `S3X_ERASER_RECOGNIZES_LEGACY`; enable before the
+   * exporter's `S3X_INCLUDE_LEGACY_SOURCES`.
+   */
+  recognizeLegacy: boolean;
 }
 
 export const DEFAULT_ERASURE_CONFIG: ErasureConfig = {
@@ -44,6 +58,7 @@ export const DEFAULT_ERASURE_CONFIG: ErasureConfig = {
   idleSleepMs: 30 * 1000,
   progressEveryMs: 60 * 1000,
   slaWarnMs: 24 * 60 * 60 * 1000,
+  recognizeLegacy: false,
 };
 
 const SESSION_PREFIX = /^[^/]+\/[^/]+\/v1\/ws=[^/]+\/m=[^/]+\/h=[^/]+\/d=\d{4}\/\d{2}\/\d{2}\/s=[^/]+\/$/;
@@ -128,8 +143,9 @@ export class ErasureJob {
     if (!opts.dryRun) this.state.setMeta("erasure_sweep_done", String(id));
     let gone = 0;
     for (const g of this.state.vanishedExports(opts.dryRun ? -id : id, startedAt, !opts.dryRun)) {
-      // Confirm on Neon right before erasing: no rollup and no catalog row now.
-      if (await groupExistsInNeon(this.db, g.org_id, g.session_id)) continue;
+      // Confirm on Neon right before erasing: no rollup and no catalog row now
+      // (and, with recognizeLegacy, no legacy turn, link or outcome row).
+      if (await groupExistsInNeon(this.db, g.org_id, g.session_id, this.cfg.recognizeLegacy)) continue;
       gone += 1;
       if (!opts.dryRun) this.#queueGroup(g.org_id, g.session_id, g.keys, "gone_from_neon");
     }
@@ -189,7 +205,7 @@ export class ErasureJob {
       // directories that hold any object, and the pointers. A tombstone is
       // visited while either remains, so neither a directory left by a
       // re-upload nor an orphaned pointer is ever skipped for good.
-      const listed = new Map<string, { dirs: Set<string>; pointers: Set<string> } | null>();
+      const listed = new Map<string, { dirs: Set<string>; pointers: Set<string>; staged: string[] } | null>();
       for (const g of rows) {
         if (this.stopped()) break;
         let t;
@@ -213,6 +229,8 @@ export class ErasureJob {
             seen = {
               dirs: liveSessionsIn(objects, await this.eraser.listKeys(objects)),
               pointers: new Set(await this.eraser.listKeys(pointerRoot)),
+              // The session ingest's staged batches: a tombstone is revisited while any remain.
+              staged: (await this.eraser.listKeys(liveStagedPrefix(this.cfg.keyRoot, g))).filter((k) => k.endsWith(".staged.ndjson.zst")),
             };
             listed.set(objects, seen);
           }
@@ -223,7 +241,7 @@ export class ErasureJob {
           continue;
         }
         const dirKey = `${t.base.slice(objects.length).replace(/\/$/, "")}/${t.sessionSegment}`;
-        if (!seen.dirs.has(dirKey) && !seen.pointers.has(t.pointerKey)) continue;
+        if (!seen.dirs.has(dirKey) && !seen.pointers.has(t.pointerKey) && seen.staged.length === 0) continue;
         groups += 1;
         if (dryRun) continue;
         try {
@@ -235,6 +253,17 @@ export class ErasureJob {
           );
           if (still.length === 0) continue; // re-enabled since the page was read
           const before = new Date(checkedAt - LIVE_SKEW_MS);
+          // The session ingest's staged copies of this (workspace, user, origin)'s batches,
+          // once past the fan-out redrive window. Shared by the group's tombstones: once a page.
+          const stagedBefore = new Date(checkedAt - STAGED_ERASE_AFTER_MS);
+          const stagedLeft: string[] = [];
+          for (const key of seen.staged) {
+            const st = await this.eraser.eraseObjectBefore(key, stagedBefore);
+            versions += st.deleted;
+            this.counters.liveVersionsDeleted += st.deleted;
+            if (st.kept > 0) stagedLeft.push(key);
+          }
+          seen.staged = stagedLeft;
           const dir = await this.eraser.eraseSessionAnyDate(t.base, t.sessionSegment, before);
           versions += dir.deleted;
           this.counters.liveVersionsDeleted += dir.deleted;

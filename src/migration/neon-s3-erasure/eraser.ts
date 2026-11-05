@@ -47,10 +47,17 @@ export interface S3EraserConfig {
   fetch?: typeof fetch;
 }
 
+export interface PreservedVersionEraser {
+  /** Keep the current non-delete barrier version; permanently remove only older versions. */
+  eraseObjectExcept(key: string, preservedVersionId: string): Promise<{ deleted: number; kept: number }>;
+}
+
 interface Version {
   key: string;
   versionId: string;
   lastModified?: number;
+  latest: boolean;
+  deleteMarker: boolean;
 }
 
 /** Split versions into those strictly older than `before` (erasable) and the rest (kept). */
@@ -64,7 +71,27 @@ function cut<T extends { lastModified?: number }>(list: T[], before?: Date): { e
 
 const coded = (code: string, message: string) => Object.assign(new Error(message), { code });
 
-export function createS3Eraser(cfg: S3EraserConfig): Eraser {
+// S3 inventory is destructive authority. The lightweight value extractor alone
+// cannot distinguish a complete document from truncated/malformed XML.
+function assertInventoryXml(xml: string): void {
+  const stack: string[] = []; let at = 0, roots = 0;
+  const tags = /<[^>]*>/g; let token: RegExpExecArray | null;
+  while ((token = tags.exec(xml))) {
+    const text = xml.slice(at, token.index);
+    if (text.includes("<") || (!stack.length && text.trim())) throw coded("erasure_inventory", "malformed version inventory");
+    const tag = token[0]; at = tags.lastIndex;
+    if (/^<\?xml\s[^?]*\?>$/.test(tag) && !roots && !stack.length) continue;
+    const close = /^<\/([A-Za-z_][\w:.-]*)\s*>$/.exec(tag);
+    if (close) { if (stack.pop() !== close[1]) throw coded("erasure_inventory", "unbalanced version inventory"); continue; }
+    const open = /^<([A-Za-z_][\w:.-]*)(?:\s+[A-Za-z_][\w:.-]*=(?:"[^"<>]*"|'[^'<>]*'))*\s*(\/?)>$/.exec(tag);
+    if (!open) throw coded("erasure_inventory", "malformed version inventory");
+    if (!stack.length && (++roots !== 1 || open[1] !== "ListVersionsResult")) throw coded("erasure_inventory", "unknown version inventory");
+    if (!open[2]) stack.push(open[1]!);
+  }
+  if (stack.length || roots !== 1 || xml.slice(at).trim()) throw coded("erasure_inventory", "incomplete version inventory");
+}
+
+export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser {
   const doFetch = cfg.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const url = (key = "") => {
     if (cfg.endpoint) {
@@ -83,8 +110,9 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser {
     return res;
   };
 
-  async function versions(prefix: string): Promise<Version[]> {
+  async function versions(prefix: string, strict = false): Promise<Version[]> {
     const out: Version[] = [];
+    const pages = new Set<string>();
     let keyMarker: string | undefined;
     let versionMarker: string | undefined;
     for (;;) {
@@ -94,19 +122,50 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser {
       u.searchParams.set("max-keys", "1000");
       if (keyMarker !== undefined) u.searchParams.set("key-marker", keyMarker);
       if (versionMarker !== undefined) u.searchParams.set("version-id-marker", versionMarker);
-      const xml = await (await request("GET", u)).text();
+      const response = await request("GET", u);
+      let xml: string;
+      if (!strict) xml = await response.text();
+      else {
+        const reader = response.body?.getReader(), chunks: Uint8Array[] = []; let size = 0;
+        try {
+          if (!reader) throw coded("erasure_inventory", "empty version inventory");
+          for (;;) {
+            const r = await reader.read(); if (r.done) break;
+            size += r.value.byteLength;
+            if (size > 16 * 1024 * 1024) throw coded("erasure_inventory", "version inventory byte bound");
+            chunks.push(r.value);
+          }
+          const body = new Uint8Array(size); let at = 0;
+          for (const chunk of chunks) { body.set(chunk, at); at += chunk.byteLength; }
+          try { xml = new TextDecoder("utf-8", { fatal: true }).decode(body); }
+          catch { throw coded("erasure_inventory", "version inventory encoding"); }
+        } finally { await reader?.cancel().catch(() => {}); reader?.releaseLock(); }
+      }
+      if (strict) assertInventoryXml(xml);
       for (const tag of ["Version", "DeleteMarker"])
         for (const el of xmlElements(xml, tag)) {
           const key = xmlText(el, "Key");
           const versionId = xmlText(el, "VersionId");
           const modified = Date.parse(xmlText(el, "LastModified") ?? "");
+          const latest = xmlText(el, "IsLatest");
+          if (strict && (!key || !versionId || /[\x00-\x1f\x7f]/u.test(versionId) || (latest !== "true" && latest !== "false")))
+            throw coded("erasure_inventory", "incomplete version entry");
           // xmlText already decodes entities; decoding again would mangle a literal `&amp;`.
           if (key !== undefined && versionId !== undefined)
-            out.push({ key, versionId, ...(Number.isFinite(modified) ? { lastModified: modified } : {}) });
+            out.push({ key, versionId, latest: xmlText(el, "IsLatest") === "true", deleteMarker: tag === "DeleteMarker", ...(Number.isFinite(modified) ? { lastModified: modified } : {}) });
         }
-      if (xmlText(xml, "IsTruncated") !== "true") return out;
+      const truncated = xmlText(xml, "IsTruncated");
+      if (strict && out.length > 10000) throw coded("erasure_inventory", "version inventory exceeds bound");
+      if (strict && truncated !== "true" && truncated !== "false") throw coded("erasure_inventory", "version pagination is unproven");
+      if (truncated !== "true") return out;
       keyMarker = xmlText(xml, "NextKeyMarker");
       versionMarker = xmlText(xml, "NextVersionIdMarker");
+      if (strict) {
+        const cursor = JSON.stringify([keyMarker, versionMarker]);
+        if (keyMarker === undefined || versionMarker === undefined || pages.has(cursor) || pages.size >= 100 || out.length > 10000)
+          throw coded("erasure_inventory", "version pagination is incomplete or unbounded");
+        pages.add(cursor);
+      }
       if (keyMarker === undefined) return out;
     }
   }
@@ -125,6 +184,20 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser {
   }
 
   return {
+    eraseObjectExcept: async (key, preservedVersionId) => {
+      if (!preservedVersionId || /[\x00-\x1f\x7f]/u.test(preservedVersionId))
+        throw coded("erasure_preserved_version", "a concrete preserved version is required");
+      const all = (await versions(key, true)).filter((v) => v.key === key);
+      const latest = all.filter((v) => v.latest);
+      if (latest.length !== 1 || latest[0]!.deleteMarker || latest[0]!.versionId !== preservedVersionId)
+        throw coded("erasure_barrier_not_current", "the preserved non-delete barrier must be current");
+      const erase = all.filter((v) => v.versionId !== preservedVersionId);
+      const deleted = await remove(erase);
+      const remaining = (await versions(key, true)).filter((v) => v.key === key);
+      if (remaining.length !== 1 || remaining[0]!.versionId !== preservedVersionId || !remaining[0]!.latest || remaining[0]!.deleteMarker)
+        throw coded("erasure_inventory_changed", "permanent erasure must leave only the verified current barrier");
+      return { deleted, kept: 1 };
+    },
     eraseObject: async (key) => remove((await versions(key)).filter((v) => v.key === key)),
     erasePrefix: async (prefix) => {
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
