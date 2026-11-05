@@ -41,6 +41,8 @@ export class CanonicalReadError extends Error {
   constructor(
     readonly reason: string,
     readonly status: 400 | 401 | 403 | 503 = 503,
+    /** Projection reason codes behind `canonical_projection_incomplete` (codes only). */
+    readonly details: readonly string[] = [],
   ) {
     super("Canonical session read refused");
     this.name = "CanonicalReadError";
@@ -202,7 +204,7 @@ async function snapshotWithLimits(
     identity.sessionId,
   );
   if (!result.complete || result.directorySessionId !== identity.sessionId)
-    throw new CanonicalReadError("canonical_projection_incomplete");
+    throw new CanonicalReadError("canonical_projection_incomplete", 503, result.reasons);
   const fresh = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive);
   if (canonicalSourceGeneration(fresh, identity) !== version)
     throw new CanonicalReadError("source_generation_changed");
