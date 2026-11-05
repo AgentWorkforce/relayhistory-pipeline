@@ -33,6 +33,9 @@ const tables = new Set([
   "session_relationships",
   "session_markers",
   "session_commit_links",
+  "conversation_turns",
+  "session_links",
+  "session_outcomes",
 ]);
 async function boundedJson(
   response: Response,
@@ -339,6 +342,7 @@ export async function canonicalHandle(
         source,
         sessionId,
         generation: snapshot.generation,
+        legacyCoverage: snapshot.legacyCoverage,
         rows,
         nextCursor:
           next < all.length

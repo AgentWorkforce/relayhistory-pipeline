@@ -8,6 +8,7 @@ import {
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import {
   normalizeRelayhistoryRecords,
+  isLegacyRelayhistoryRecord,
   parseRelayhistoryRecord,
   relayhistoryExportProvenance,
   type RelayhistoryStreamRecord,
@@ -242,6 +243,7 @@ export function projectedToNeonRow(
 }
 
 export interface ScopeRead {
+  records: RelayhistoryStreamRecord[];
   projectionRows: Array<{ table: string; row: Record<string, unknown> }>;
   rows: IndexRow[];
   manifests: number;
@@ -354,6 +356,7 @@ export async function readCanonicalScope(
       events: null,
       sources: [],
       projectionRows: [],
+      records: [],
     };
 
   let parsedRecords = 0;
@@ -382,6 +385,7 @@ export async function readCanonicalScope(
           events: null,
           sources: [],
           projectionRows: [],
+          records: [],
         };
       if (error instanceof PipelineError && error.retryable) throw error;
       complete = false;
@@ -393,9 +397,11 @@ export async function readCanonicalScope(
 
   // Fold every copy together; a conflicting copy (same revision, different
   // bytes) falls back to folding each manifest on its own, without deletes.
+  let canonicalRecords: RelayhistoryStreamRecord[] = [];
   let groups: { records: RelayhistoryStreamRecord[]; part: Part }[];
   try {
     const all = normalizeRelayhistoryRecords(parts.flatMap((p) => p.records));
+    canonicalRecords = all;
     const owner = new Map<string, Part>();
     for (const part of parts)
       for (const r of part.records)
@@ -433,7 +439,11 @@ export async function readCanonicalScope(
   const ownerByEvent = new Map<string, { userId: string; sessionId: string }>();
   for (const part of parts)
     for (const record of part.records) {
-      if (record.kind === CONVERGENCE_EVENT_KIND) continue;
+      if (
+        record.kind === CONVERGENCE_EVENT_KIND ||
+        isLegacyRelayhistoryRecord(record)
+      )
+        continue;
       const identity = JSON.stringify([
         deliveryMachine(scope.workspaceId, record.origin_id),
         record.record_id,
@@ -517,6 +527,7 @@ export async function readCanonicalScope(
     reasons.push("directory_event_metadata_invalid");
   }
   return {
+    records: canonicalRecords,
     projectionRows: [
       ...catalogRows,
       ...[...metadataByKey.values()].map(

@@ -268,8 +268,14 @@ function eventTime(record: RelayhistoryStreamRecord): number {
   return Date.parse(record.received_at);
 }
 
+const LEGACY_RECORD_KINDS = new Set([
+  "legacy_conversation_turn", "legacy_session_link", "legacy_session_outcome", "legacy_scope",
+]);
+export const isLegacyRelayhistoryRecord = (record: RelayhistoryStreamRecord) => LEGACY_RECORD_KINDS.has(record.kind);
 function recordKey(record: RelayhistoryStreamRecord): string {
-  return JSON.stringify([record.origin_id, record.record_id]);
+  return JSON.stringify(isLegacyRelayhistoryRecord(record)
+    ? [record.origin_id, record.record_id, record.kind]
+    : [record.origin_id, record.record_id]);
 }
 
 function compareText(left: string, right: string): number {
@@ -337,7 +343,9 @@ function newestAcrossOrigins(
   const out: RelayhistoryStreamRecord[] = [];
   const contenders = new Map<string, RelayhistoryStreamRecord[]>();
   for (const record of records) {
-    if (record.kind === CONVERGENCE_EVENT_KIND) {
+    // Server-exported legacy tables have independent primary-key domains and
+    // no delivery acceptance ledger. Never make them contend with delivery IDs.
+    if (record.kind === CONVERGENCE_EVENT_KIND || isLegacyRelayhistoryRecord(record)) {
       out.push(record);
       continue;
     }
