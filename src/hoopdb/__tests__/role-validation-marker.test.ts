@@ -587,3 +587,60 @@ describe("the live gate: the marker is never the sole authority", () => {
     );
   });
 });
+
+describe("role check deadlock retry (40P01)", () => {
+  /** Fails the first `failures` submissions of the first verify SQL with a deadlock. */
+  function deadlocking(db: PGlite, failures: number) {
+    const base = client(db);
+    let seen = 0;
+    return {
+      get attempts() { return seen; },
+      client: {
+        async query<R>(text: string, params?: unknown[]) {
+          if (text === VERIFY) {
+            seen += 1;
+            if (seen <= failures)
+              throw Object.assign(new Error("deadlock detected"), { code: "40P01" });
+          }
+          return base.query<R>(text, params);
+        },
+      } as MigrationClient,
+    };
+  }
+
+  test("a deadlocked verify transaction rolls back and the retry marks PASS", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const dl = deadlocking(db, 1);
+    const result = await runMigrations(dl.client, { profile: LOCAL });
+    expect(result.applied).toBe(0);
+    expect(dl.attempts).toBe(2);
+    expect(await marker(db)).toEqual([{ generation: await generation(), status: "pass" }]);
+  });
+
+  test("a persistent deadlock gives up after the bounded attempts and leaves the marker pending", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const dl = deadlocking(db, 99);
+    const caught = await failure(runMigrations(dl.client, { profile: LOCAL }));
+    expect(caught?.code).toBe("40P01");
+    expect(dl.attempts).toBe(3);
+    expect(await marker(db)).toEqual([{ generation: await generation(), status: "pending" }]);
+  });
+
+  test("a non-deadlock verify failure is not retried", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const base = client(db);
+    let seen = 0;
+    const c: MigrationClient = {
+      async query<R>(text: string, params?: unknown[]) {
+        if (text === VERIFY && ++seen) throw Object.assign(new Error("lock timeout"), { code: "55P03" });
+        return base.query<R>(text, params);
+      },
+    };
+    expect((await failure(runMigrations(c, { profile: LOCAL })))?.code).toBe("55P03");
+    expect(seen).toBe(1);
+    expect(await marker(db)).toEqual([{ generation: await generation(), status: "pending" }]);
+  });
+});

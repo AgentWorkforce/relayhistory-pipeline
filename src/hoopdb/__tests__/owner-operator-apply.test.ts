@@ -327,9 +327,9 @@ test("backend identity drift refuses the next canonical SQL before submission", 
   expect(x.calls.some((q) => q.includes("CREATE TABLE"))).toBe(false);
 });
 
-test("the first live apply ledger pin is the captured175 baseline", () => {
+test("the live apply ledger pin is the post-462 resume ledger (175 baseline + the 13)", () => {
   expect(A.ledger).toBe(
-    "175cd1eb198a8afc62576c7ebe5fd2bf06526b3222a94ee3c9b346e7b6a0d129",
+    "de0e2fa02ba662bbc1e0ec23e1f619100d3b7cd824e8d055b04c44076d452729",
   );
 });
 

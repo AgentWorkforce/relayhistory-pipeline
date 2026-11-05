@@ -330,6 +330,9 @@ export async function expectedSchema(): Promise<ExpectedSchema> {
 }
 
 /** The migrator's "pending first" write, under its advisory lock, before any step. */
+/** Attempts for one role-check transaction when it loses a deadlock (40P01). */
+export const ROLE_CHECK_DEADLOCK_ATTEMPTS = 3;
+
 export const MARKER_PENDING_SQL = `INSERT INTO ${ROLE_VALIDATION_TABLE} (name, generation, status) VALUES ($1, $2, 'pending')
        ON CONFLICT (name) DO UPDATE SET generation = EXCLUDED.generation, status = 'pending', updated_at = now()`;
 
@@ -533,33 +536,45 @@ export async function runMigrations(
         const verify = step.name.startsWith("verify:");
         if (verify) postChecked = true;
         if (verify && opts.beforeVerify) await opts.beforeVerify();
-        await client.query("BEGIN");
-        try {
-          await bindDbMode();
-          if (verify) await hardenAndCheck();
-          await client.query(sql);
-          if (verify && stepIndex === lastVerifyIndex) {
-            const passed = await client.query(
-              `UPDATE ${ROLE_VALIDATION_TABLE} SET status = 'pass', updated_at = now()
-                WHERE name = $1 AND generation = $2 AND status = 'pending' RETURNING name`,
-              [ROLE_VALIDATION_NAME, gen],
-            );
-            if (passed.rows.length !== 1)
-              throw Object.assign(
-                new Error(
-                  "96bulls: role validation marker was not pending for this generation",
-                ),
-                { code: "marker_lost" },
+        // The hardening takes AccessExclusiveLock (CREATE POLICY) on live tables, so
+        // it can lose a deadlock to autovacuum (40P01, observed on the 462 release).
+        // The whole transaction rolls back, so a bounded retry is safe.
+        for (let attempt = 1; ; attempt++) {
+          await client.query("BEGIN");
+          try {
+            await bindDbMode();
+            if (verify) await hardenAndCheck();
+            await client.query(sql);
+            if (verify && stepIndex === lastVerifyIndex) {
+              const passed = await client.query(
+                `UPDATE ${ROLE_VALIDATION_TABLE} SET status = 'pass', updated_at = now()
+                  WHERE name = $1 AND generation = $2 AND status = 'pending' RETURNING name`,
+                [ROLE_VALIDATION_NAME, gen],
               );
+              if (passed.rows.length !== 1)
+                throw Object.assign(
+                  new Error(
+                    "96bulls: role validation marker was not pending for this generation",
+                  ),
+                  { code: "marker_lost" },
+                );
+            }
+            await client.query("COMMIT");
+            break;
+          } catch (err) {
+            await client.query("ROLLBACK");
+            const code = (err as { code?: string }).code;
+            if (code === "40P01" && attempt < ROLE_CHECK_DEADLOCK_ATTEMPTS) {
+              log.warn("role check deadlocked; retrying", { reason: step.name, attempt });
+              await new Promise((r) => setTimeout(r, attempt * 1000));
+              continue;
+            }
+            log.error("role check failed", {
+              reason: step.name,
+              error_code: code ?? "role_check_failed",
+            });
+            throw err;
           }
-          await client.query("COMMIT");
-        } catch (err) {
-          await client.query("ROLLBACK");
-          log.error("role check failed", {
-            reason: step.name,
-            error_code: (err as { code?: string }).code ?? "role_check_failed",
-          });
-          throw err;
         }
         log.info(verify ? "role validation passed" : "role check passed", {
           reason: verify ? gen : step.name,
