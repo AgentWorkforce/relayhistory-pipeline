@@ -157,77 +157,106 @@ export class CanonicalConsumer {
    * are scope-skipped (checkpoint advances, zero image/CH access); a copied
    * entry advances the durable checkpoint; a hold or poison stops the drain.
    */
+  /** Bounded drain outcome — the runner distinguishes hold vs progress. */
   async drain(
     images: CanonicalImagePort, ch: ClickHouseClient,
+    signal?: AbortSignal,
   ): Promise<{ copied: number; dead: number; skipped: number;
-              checkpoint: string }> {
+              checkpoint: string;
+              status: "idle" | "no_lease" | "held" | "advanced" |
+                      "dead" | "aborted" }> {
+    const none = (status: "idle" | "no_lease" | "held" | "dead" |
+                          "aborted", checkpoint = "0") =>
+      ({ copied: 0, dead: 0, skipped: 0, checkpoint, status });
     // The explicit gate: disabled returns a constant — no partition
     // derivation, no lease, no journal, no CH, zero DB queries.
-    if (this.cfg.enabled !== true)
-      return { copied: 0, dead: 0, skipped: 0, checkpoint: "0" };
-    if (!(await this.acquireLease()))
-      return { copied: 0, dead: 0, skipped: 0,
-        checkpoint: await this.readCheckpoint() };
+    if (this.cfg.enabled !== true) return none("idle");
+    if (!(await this.acquireLease())) return none("no_lease");
     await this.seedCheckpoint();
     let copied = 0, dead = 0, skipped = 0;
     let checkpoint = await this.readCheckpoint();
     let lastSeen = checkpoint;
     for (;;) {
+      if (signal?.aborted) return { copied, dead, skipped, checkpoint,
+        status: "aborted" };
       const { entries, hasMore } =
         await this.journal.entries(checkpoint, this.cfg.pageSize);
       for (const entry of entries) {
+        if (signal?.aborted)
+          return { copied, dead, skipped, checkpoint, status: "aborted" };
         // Strict revision order — a non-increasing page is a violation.
         if (BigInt(entry.revision) <= BigInt(lastSeen))
-          return { copied, dead, skipped, checkpoint };
+          return { copied, dead, skipped, checkpoint, status: "held" };
         lastSeen = entry.revision;
         if (!inScope(entry)) {
           if (!(await this.advanceCheckpoint(entry.revision)))
-            return { copied, dead, skipped, checkpoint };
+            return { copied, dead, skipped, checkpoint, status: "held" };
           checkpoint = entry.revision;
           skipped++;
           continue;
         }
-        const r = await this.copyOnce(images, ch, checkpoint, entry);
+        const r = await this.copyOnce(images, ch, checkpoint, entry, signal);
+        if (r === "aborted")
+          return { copied, dead, skipped, checkpoint, status: "aborted" };
         if (r === "copied") {
           // Metrics count a copy only after the fenced CAS accepted it.
           if (!(await this.advanceCheckpoint(entry.revision)))
-            return { copied, dead, skipped, checkpoint };
+            return { copied, dead, skipped, checkpoint, status: "held" };
           copied++;
           checkpoint = entry.revision;
         } else {
           if (r !== "hold") {
             dead++;
             await this.deadLetter(entry, r);
+            return { copied, dead, skipped, checkpoint, status: "dead" };
           }
-          return { copied, dead, skipped, checkpoint };
+          return { copied, dead, skipped, checkpoint, status: "held" };
         }
         if (!(await this.heartbeat()))
-          return { copied, dead, skipped, checkpoint };
+          return { copied, dead, skipped, checkpoint, status: "held" };
       }
       if (!hasMore) break;
       checkpoint = lastSeen;
     }
-    return { copied, dead, skipped, checkpoint };
+    return { copied, dead, skipped, checkpoint,
+      status: copied > 0 || skipped > 0 ? "advanced" : "idle" };
   }
 
   /** One bounded attempt set; only a stable poison code -> dead. */
   private async copyOnce(
     images: CanonicalImagePort, ch: ClickHouseClient,
-    checkpoint: string, entry: CanonicalJournalEntry,
-  ): Promise<"copied" | "hold" | string> {
+    checkpoint: string, entry: CanonicalJournalEntry, signal?: AbortSignal,
+  ): Promise<"copied" | "hold" | "aborted" | string> {
+    // A write longer than the lease window is aborted: the page/finish guards
+    // renew the lease, but a hung op must not outlive the TTL and let a
+    // competing owner take over mid-write.
+    const writeBudget = Math.min(this.cfg.leaseTtlMs / 2, 5000);
+    const withTimeout = <T>(p: Promise<T>, sig?: AbortSignal) =>
+      Promise.race([
+        p,
+        new Promise<T>((_, rej) => {
+          const t = setTimeout(() => rej(new Error("write_timeout")),
+            writeBudget);
+          sig?.addEventListener("abort", () => {
+            clearTimeout(t); rej(new Error("aborted"));
+          }, { once: true });
+        }),
+      ]);
     for (let i = 0; i <= this.cfg.maxRetries; i++) {
+      if (signal?.aborted) return "aborted";
       try {
-        const r = await copyCanonicalEntry(
+        const r = await withTimeout(copyCanonicalEntry(
           images, this.acks, ch, { checkpoint }, entry, this.cfg.targetId,
           { beforeWrite: () => this.heartbeat(),
-            beforeFinish: () => this.heartbeat() });
+            beforeFinish: () => this.heartbeat() }), signal);
         if (r.kind === "copied") return "copied";
         const reason = (r as { reason: string }).reason;
         if (HOLD.has(reason)) return "hold";
         if (POISON[reason] && i === this.cfg.maxRetries)
           return reason;                        // exact stable poison code
         if (!POISON[reason]) return "hold";   // unknown -> hold, never poison
-      } catch {
+      } catch (e) {
+        if ((e as Error).message === "aborted") return "aborted";
         return "hold";                          // infra: retryable hold
       }
       await new Promise((r) => setTimeout(r, Math.min(50 * (i + 1), 500)));

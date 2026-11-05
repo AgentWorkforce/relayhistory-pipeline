@@ -159,10 +159,13 @@ describe("canonical consumer — poison map + renewal", () => {
     const db = fakeDb();
     const c = new CanonicalConsumer({ query: db.query },
       journal([]) as never, acks, CFG);
-    for (const code of ["reference_invalid", "tombstone_invalid",
-        "payload_invalid", "vector_invalid", "payload_bound",
-        "batch_invalid", "duplicate", "row_invalid", "corrupt_chain"])
-      await c.deadLetter(entry("1" + Math.random()), code);
+    const codes = ["reference_invalid", "tombstone_invalid",
+      "payload_invalid", "vector_invalid", "payload_bound",
+      "batch_invalid", "duplicate", "row_invalid", "corrupt_chain"];
+    codes.forEach((code, i) =>
+      void c.deadLetter(entry(String(1000 + i)), code));
+    await Promise.all(codes.map((code, i) =>
+      c.deadLetter(entry(String(1000 + i)), code)));
     expect(db.dead.length).toBe(9);
     // a hold/unknown code is NEVER persisted
     await c.deadLetter(entry("99"), "source_changed");
