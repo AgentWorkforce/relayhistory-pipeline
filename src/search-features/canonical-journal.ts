@@ -70,8 +70,10 @@ export class CanonicalVersionStore implements CanonicalVersionPort {
     if (last === null)
       await this.db.query(
         "INSERT INTO sessions.canonical_feature_journal(" +
-          "revision,kind,schema_generation,image_key,source_hash)" +
-          " VALUES($1,'seed','','','') ON CONFLICT (revision) DO NOTHING",
+          "revision,kind,org_id,workspace_id,scope,schema_generation," +
+          " image_key,source_hash,source_authority,pointer_set)" +
+          " VALUES($1,'seed','','','{}','','','{}','{}')" +
+          " ON CONFLICT (revision) DO NOTHING",
         [aboveLegacyClock]);
   }
   async next(): Promise<string> {
