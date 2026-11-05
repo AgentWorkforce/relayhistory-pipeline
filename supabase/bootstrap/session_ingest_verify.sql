@@ -15,6 +15,8 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_commit_buffered_batch(jsonb)',
  'sessions.ingest_commit_revisions(jsonb)',
  'sessions.ingest_fanout_fence(jsonb)',
+ 'sessions.ingest_frozen_source_receipt(jsonb)',
+ 'sessions.ingest_frozen_source_witness(jsonb)',
  'sessions.ingest_prepare_buffer_stage(jsonb)',
  'sessions.ingest_publication_abandon(jsonb)',
  'sessions.ingest_publication_candidates(jsonb)',
@@ -28,7 +30,9 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_publication_register_objects(jsonb)',
  'sessions.ingest_release_slot(jsonb)',
  'sessions.ingest_reset_uploaded_sessions(jsonb)',
- 'sessions.ingest_set_session_uploads(jsonb)'
+ 'sessions.ingest_set_session_uploads(jsonb)',
+ 'sessions.ingest_source_control_begin(jsonb)',
+ 'sessions.ingest_source_control_complete(jsonb)'
  ]::text[];
  v_oids oid[];
  v_table text:='SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'||

@@ -1,4 +1,6 @@
 import {validatedCustodyAck} from "./custody-ack.ts";
+import type { SourceControlHead } from "./ledger.ts";
+import type { CurrentCustodyPacket } from "./custody-protocol.ts";
 import {DeliveryError} from "./vendor/delivery/delivery-contracts.ts";
 import {orderedControl,orderedControlResult} from "./control-protocol.ts";
 import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
@@ -61,7 +63,11 @@ type LedgerFunction =
   | "ingest_set_session_uploads"
   | "ingest_reset_uploaded_sessions"
   | "ingest_fanout_fence"
-  | "ingest_commit_revisions";
+  | "ingest_commit_revisions"
+  | "ingest_frozen_source_witness"
+  | "ingest_source_control_begin"
+  | "ingest_source_control_complete"
+  | "ingest_frozen_source_receipt";
 
 async function call(run: SqlRun, fn: LedgerFunction, input: unknown): Promise<unknown> {
   let rows: Record<string, unknown>[];
@@ -169,7 +175,36 @@ export function parseClaimResult(r: Record<string, unknown>): ClaimResult {
 export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAcceptanceMode;expectedGeneration?:string } = {}): Ledger {
   if(options.acceptanceMode==="buffered"&&(typeof options.expectedGeneration!=="string"||!/^[a-f0-9]{64}$/.test(options.expectedGeneration)))throw new LedgerUnavailableError("ledger_generation_required");
   const buffered=(input:unknown)=>({...input as Record<string,unknown>,generation:options.expectedGeneration});
+  const hex64 = (v: unknown) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
   return {
+    async frozenWitness(input) {
+      if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
+      const r = (await call(run, "ingest_frozen_source_witness", input)) as Record<string, unknown>;
+      if (!isObject(r.witness) || !hex64(r.sourceDigest) || Object.keys(r).length !== 2) throw new LedgerUnavailableError("ledger_bad_result");
+      return r as unknown as CurrentCustodyPacket;
+    },
+    async frozenReceipt(input) {
+      if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
+      const r = (await call(run, "ingest_frozen_source_receipt", input)) as Record<string, unknown>;
+      if (r.stored === null) return null;
+      const s = r.stored as Record<string, unknown> | undefined;
+      if (!isObject(s) || !hex64(s.digest) || !isObject(s.receipt)) throw new LedgerUnavailableError("ledger_bad_result");
+      return { digest: s.digest as string, receipt: s.receipt as Record<string, unknown> };
+    },
+    async sourceControlBegin(input) {
+      if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
+      const r = (await call(run, "ingest_source_control_begin", input)) as Record<string, unknown>;
+      if (!hex64(r.epoch) || typeof r.version !== "string" || !/^[1-9][0-9]{0,18}$/.test(r.version) || !hex64(r.digest)
+        || (r.kind !== "selection" && r.kind !== "reset") || r.pending !== true || typeof r.apply !== "boolean")
+        throw new LedgerUnavailableError("ledger_bad_result");
+      return r as unknown as SourceControlHead;
+    },
+    async sourceControlComplete(input) {
+      if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
+      const r = (await call(run, "ingest_source_control_complete", input)) as Record<string, unknown>;
+      if (r.completed !== true || typeof r.superseded !== "boolean") throw new LedgerUnavailableError("ledger_bad_result");
+      return { completed: true, superseded: r.superseded };
+    },
     async applyOrderedControl(input) {
       if(options.acceptanceMode!=="buffered")throw new LedgerUnavailableError("ledger_mode_refused");
       const control=orderedControl(input.control);
