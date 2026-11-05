@@ -59,8 +59,14 @@ async function prepare(enabled: boolean, selectedOrg = org) {
       derivedAnchorKey: `96bulls/${selectedOrg}/upload-generations/g=${id}/v1/ws=${ws}/m=history_scope/h=claude/d=2026/11/01/s=${sessionId}/publications/${id}/manifest.json`, bucket: "fixture", region: "us-east-1", keyRoot: "96bulls" };
   };
   const install = async () => rpc("ingest_history_scope_install", installArgs(await build()));
-  const event = async () => (await db.query<any>("SELECT event_id::text,generation::text,authority_id::text,user_id,sent_at,acknowledged_at FROM sessions.canonical_project_events WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3", [selectedOrg, ws, sessionId])).rows[0];
-  return { identity, build, install, installArgs, event };
+  const event = async () => (await db.query<any>("SELECT event_id::text,generation::text,authority_id::text,source_epoch::text,source_fingerprint,user_id,sent_at,acknowledged_at FROM sessions.canonical_project_events WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3", [selectedOrg, ws, sessionId])).rows[0];
+  const replace = async () => {
+    // A replacement must represent new source content, not merely a new
+    // authority UUID. Keep this proof independent of #230 fingerprint bugs.
+    await db.query("SELECT sessions.upsert_session_index($1::jsonb)", [JSON.stringify([{ ...row, revision: 2, content_sha256: "\\x" + "b".repeat(64) }])]);
+    return install();
+  };
+  return { identity, build, install, replace, installArgs, event };
 }
 
 test("dormant scope emits no event, selected creator publication commits an attributed ID-only outbox event", async () => {
@@ -82,8 +88,10 @@ test("replacement coalesces one event identity; stale ACK and sent/release nonce
   const f = await prepare(true); await f.install(); const first = await f.event();
   const store = canonicalProjectEventStore({ query: ingest } as never, generation, scope);
   const claimed = (await store.claim({ schemaGeneration: generation, scope, limit: 50 })).find(c => c.event.eventId === first.event_id)!;
-  expect(claimed).toBeDefined(); await f.install(); const next = await f.event();
+  expect(claimed).toBeDefined(); await f.replace(); const next = await f.event();
   expect(next.event_id).toBe(first.event_id); expect(BigInt(next.generation)).toBeGreaterThan(BigInt(first.generation));
+  expect(BigInt(next.source_epoch)).toBeGreaterThan(BigInt(first.source_epoch));
+  expect(next.source_fingerprint).not.toBe(first.source_fingerprint);
   expect(await store.sent(claimed)).toBe(false); expect(await store.release(claimed)).toBe(false);
   expect(await eventRpc("ack", { eventId: first.event_id, generation: first.generation })).toEqual({ ok: false });
   expect((await f.event()).acknowledged_at).toBeNull();
