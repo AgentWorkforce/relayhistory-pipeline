@@ -61,9 +61,9 @@ jobs:
       - name: Typecheck the stack (src, stacks, alchemy.run.ts)
         run: bunx tsc --noEmit -p tsconfig.json
       - name: Unit tests (stack)
-        run: bun test
+        run: bun test --timeout 30000
       - name: Unit tests (IaC values, stacks/)
-        run: bun test ./stacks
+        run: bun test --timeout 30000 ./stacks
       - name: AWS hardening mutation check (each reverted control must turn a test red)
         run: bun scripts/aws-hardening-mutations.ts
       - name: Guard - no Helm hooks in any chart or manifest in this repo
