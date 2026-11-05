@@ -32,7 +32,11 @@ Apply holds the canonical session advisory lock, re-inspects the exact ledger/ca
 
 The adapter fences owner, role, database, schema owner and backend PID before/after canonical queries across their transactions; role-control SQL fails before submission. Rollback/unlock cleanup remains available after errors. The canonical migrator retains its own transaction, ledger, pending/PASS, ACL and verifier authority. Completion requires exact current generation/PASS, no pending inventory and current exact boundary. Failures return only a code; SQL messages/body/credentials are not logged.
 
-The175 pin authorizes only this starting ledger. A partial apply may commit earlier migrations and leave readiness pending; the old plan/approval then refuse. Recovery requires a new inspected ledger, separately reviewed exact pin/source and approval. This adapter never silently retries, imports history or advances a failed step.
+The175 pin authorized only that starting ledger. A partial apply may commit earlier migrations and leave readiness pending; the old plan/approval then refuse. Recovery requires a new inspected ledger, separately reviewed exact pin/source and approval. This adapter never imports history or advances a failed step.
+
+**What actually happened (2026-11-05).** The 462 apply committed all 13 planned migrations on the175 baseline, then its first verify transaction lost a deadlock (40P01) to autovacuum: `CREATE POLICY` on `session_directory_event_pending` waited for AccessExclusiveLock while `VACUUM ANALYZE` waited on the apply's transaction. The transaction rolled back and readiness stayed pending. A read-only proof showed the live ledger was exactly175 plus those 13, with matching checksums, so `OWNER_APPLY.ledger` is now pinned to that full ledger, `de0e2fa02ba662bbc1e0ec23e1f619100d3b7cd824e8d055b04c44076d452729` (8fa809b). With the full ledger pinned, a run can apply no schema; it only repeats the hardening, the phase-2 verification and PASS. The resume returned `owner_apply_verified` (0 applied, 33 skipped) at 01:18Z.
+
+**Bounded retry.** `runMigrations` now retries one bootstrap or verify transaction up to `ROLE_CHECK_DEADLOCK_ATTEMPTS` (3) times, on 40P01 only, after a full ROLLBACK, with a 1 s then 2 s backoff, logging `role check deadlocked; retrying`. Other errors (for example 55P03) are not retried. Schema migration transactions are never retried.
 
 ## Evidence and limits
 
