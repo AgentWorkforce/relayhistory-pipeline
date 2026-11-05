@@ -12,6 +12,7 @@ import {
   operatorStateUrl,
   assertOperatorSource,
   guardOperatorFetch,
+  OPERATOR_METADATA_MAX_BYTES,
   operatorCapture,
   verifyOperatorCapture,
   EXECUTION_EXCEPTION,
@@ -526,4 +527,17 @@ test("deployment transport refuses public URLs, foreign queue/state writes and c
     ),
   ).rejects.toThrow();
   expect(count).toBe(0);
+});
+
+test("queue metadata over 64 KiB is observed; over the 2 MiB bound it refuses", async () => {
+  const fanout = { queue_name: "96bulls-session-ingest-fanout", queue_id: "d".repeat(32) };
+  const filler = (n: number) => Array.from({ length: n }, (_, i) => ({ queue_name: "other-queue-" + i, queue_id: "e".repeat(32), pad: "x".repeat(200) }));
+  const listing = (rows: unknown[]) => async () => new Response(JSON.stringify({ success: true, result: rows }), { status: 200 });
+  const url = "https://api.cloudflare.com/client/v4/accounts/" + secrets.accountId + "/queues";
+  const big = [...filler(600), fanout];
+  expect(JSON.stringify(big).length).toBeGreaterThan(65536);
+  const ok = await guardOperatorFetch(secrets, "plan", listing(big) as never)(url);
+  expect(ok.status).toBe(200);
+  const huge = filler(Math.ceil(OPERATOR_METADATA_MAX_BYTES / 200) + 100);
+  await expect(guardOperatorFetch(secrets, "plan", listing(huge) as never)(url)).rejects.toThrow("metadata_bound");
 });

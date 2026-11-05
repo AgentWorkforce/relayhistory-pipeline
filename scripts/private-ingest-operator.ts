@@ -910,6 +910,10 @@ export async function retainedOperatorPlan(
     ),
   );
 }
+/** Metadata replies are bounded. The production account's unpaginated GET /queues
+ * listing exceeded the former 64 KiB bound (observed 2026-11-05), so this matches
+ * private-state-bootstrap's 2 MiB metadata bound; the 20 s deadline still applies. */
+export const OPERATOR_METADATA_MAX_BYTES = 2 * 1024 * 1024;
 async function operatorMetadata(response: Response): Promise<any> {
   const reader = response.body?.getReader();
   if (!reader) refuse("metadata_body");
@@ -930,7 +934,7 @@ async function operatorMetadata(response: Response): Promise<any> {
       const part = await Promise.race([reader.read(), cancelled]);
       if (part.done) break;
       bytes += part.value.byteLength;
-      if (bytes > 65536) refuse("metadata_bound");
+      if (bytes > OPERATOR_METADATA_MAX_BYTES) refuse("metadata_bound");
       parts.push(part.value);
     }
     const all = new Uint8Array(bytes);
