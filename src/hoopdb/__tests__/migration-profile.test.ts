@@ -36,6 +36,8 @@ import {
 } from "../migration-sentinels.ts";
 import {
   expectedSchema,
+  inspectMigrations,
+  migrationLedgerSha256,
   migrate,
   migrationProfile,
   plan,
@@ -1846,6 +1848,26 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await snapshot(db)).toEqual({ ledger: null, marker: null });
   });
 
+  test("release read-only plan preserves the populated ledger/marker and reuses checksum/ACL guards", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    await runMigrations(client(db), { profile: SUPA_ET });
+    const before = await snapshot(db);
+    await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const report = await inspectMigrations(client(db), SUPA_ET);
+    await db.exec("ROLLBACK");
+    expect(report.inventory.every(s => !s.pending)).toBe(true);
+    expect(report.inventory.length).toBeGreaterThan(20);
+    expect(report.ledgerSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(await snapshot(db)).toEqual(before);
+    // The inspection cannot turn ledger drift into an apparently successful plan.
+    await db.exec("UPDATE sessions.__96bulls_migrations SET sha256 = repeat('0',64) WHERE name = (SELECT min(name) FROM sessions.__96bulls_migrations)");
+    await db.exec("BEGIN READ ONLY");
+    const error = await failure(inspectMigrations(client(db), SUPA_ET));
+    await db.exec("ROLLBACK");
+    expect(error?.code).toBe("migration_changed");
+  });
+
   test("event-trigger mode (supabase): the reviewed bootstrap passes a fresh full migrate; the trigger enforces the boundary afterwards", async () => {
     const db = await supabaseLike();
     await db.exec(ET_BOOT);
@@ -2672,5 +2694,70 @@ describe("session token verifier phase 2", () => {
     await expect(verify()).rejects.toThrow(
       /session token verifier is not in the approved shape/,
     );
+  });
+});
+
+describe("S3 proof seeder phase 2",()=>{
+ const verify="supabase/bootstrap/session_ingest_seeder_verify.sql";
+ test("OID comparison survives visible sessions schema and effective column drift closes live gate",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  await db.exec("SET search_path=sessions,public");
+  await db.exec(readFileSync(join(root,verify),"utf8"));
+  const expected=await expectedSchema();
+  expect(await schemaVerdict(expected,transact(db))).toEqual({ok:true});
+  await db.exec("GRANT SELECT(id) ON sessions.ingest_seed_captures TO PUBLIC");
+  expect((await schemaVerdict(expected,transact(db))).ok).toBe(false);
+ });
+ test("seeder failure cannot leave PASS after the other two verifiers succeeded",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  await db.exec("GRANT SELECT ON sessions.ingest_seed_captures TO bulls96_session_ingest_seeder");
+  const error=await failure(runMigrations(client(db),{profile:LOCAL}));
+  expect(error).not.toBeNull();
+  expect((await db.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0]).toEqual({status:"pending"});
+ });
+});
+
+describe("buffered ingest phase2",()=>{
+ test("direct ingest-only column drift closes live gate while unrelated role verifiers remain valid",async()=>{
+  const db=await fresh();await runMigrations(client(db),{profile:LOCAL});
+  const expected=await expectedSchema();
+  expect(await schemaVerdict(expected,transact(db))).toEqual({ok:true});
+  await db.exec("GRANT SELECT(stage_key) ON sessions.ingest_stage_intents TO bulls96_session_ingest");
+  for(const file of ["session_directory_search_worker_verify.sql","session_token_verifier_verify.sql","session_ingest_seeder_verify.sql"])
+   await db.exec(readFileSync(join(root,"supabase/bootstrap",file),"utf8"));
+  expect((await schemaVerdict(expected,transact(db))).ok).toBe(false);
+ });
+ test("ingest failure after all other verifiers leaves the generation marker pending",async()=>{
+  const db=await fresh();
+  const error=await failure(runMigrations(client(db),{profile:LOCAL,beforeVerify:async()=>{
+   await db.exec("GRANT SELECT ON sessions.ingest_stage_intents TO bulls96_session_ingest");
+  }}));
+  expect(error).not.toBeNull();
+  expect((await db.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0]).toEqual({status:"pending"});
+ });
+});
+
+describe("release pre-write fences", () => {
+  test("a changed planned ledger refuses before the first persistent write", async () => {
+    const db = await fresh();
+    let invoked = false;
+    const error = await failure(runMigrations(client(db), {
+      profile: LOCAL, steps: [], expectedLedgerSha256: "0".repeat(64),
+      beforeWrite: async () => { invoked = true; },
+    }));
+    expect(error?.code).toBe("release_ledger_changed");
+    expect(invoked).toBe(false);
+    expect(await snapshot(db)).toEqual({ledger:null,marker:null});
+  });
+  test("a revoked live release gate refuses under the lock before schema/marker creation", async () => {
+    const db = await fresh();
+    let invoked = false;
+    const error = await failure(runMigrations(client(db), {
+      profile: LOCAL, steps: [], expectedLedgerSha256:migrationLedgerSha256(new Map()),
+      beforeWrite: async () => { invoked = true; throw Object.assign(new Error("refused"),{code:"live_release_refused"}); },
+    }));
+    expect(error?.code).toBe("live_release_refused");
+    expect(invoked).toBe(true);
+    expect(await snapshot(db)).toEqual({ledger:null,marker:null});
   });
 });

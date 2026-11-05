@@ -6,10 +6,11 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { gzipSync, zstdCompressSync, zstdDecompressSync } from "node:zlib";
-import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
+import { objectKey, readAll, type ManifestV1, type ObjectStore } from "../../shared/vendor.ts";
 import { MAX_SCRUB_CHARS } from "@rhc/lib/scrub.ts";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SIGNATURE_HEADER, SYNC_SCOPE } from "../app.ts";
 import { deliverBatch, IngestUnavailable } from "../deliver.ts";
+import { canonicalSnapshot, type CanonicalPointer } from "../../session-read-api/canonical.ts";
 import { MAX_REPLICA_MESSAGE_BYTES, type NeonReplicaMessage, type ReplicaSink } from "../replica.ts";
 import { DeliveryError, MAX_DELIVERY_BYTES } from "../vendor/delivery/delivery-contracts.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
@@ -50,7 +51,111 @@ async function chunks(store: ObjectStore): Promise<string[]> {
   return Promise.all(keys.map((k) => readText(store, k)));
 }
 
+async function onlyManifest(store: ObjectStore): Promise<{ key: string; manifest: ManifestV1 }> {
+  const manifests = (await listAll(store, "96bulls/org-a/v1")).filter((key) => key.endsWith("manifest.json"));
+  expect(manifests).toHaveLength(1);
+  const key = manifests[0]!;
+  return { key, manifest: JSON.parse(await readText(store, key)) as ManifestV1 };
+}
+
+function identityExtension(manifest: ManifestV1): Record<string, unknown> {
+  return manifest.extensions?.["96bulls"] as Record<string, unknown>;
+}
+
+async function putManifest(store: ObjectStore, key: string, manifest: ManifestV1): Promise<void> {
+  await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)), { contentType: "application/json" });
+}
+
+async function canonicalFromWrittenManifest(store: ObjectStore, key: string, manifest: ManifestV1, sessionId: string) {
+  const pointer: CanonicalPointer = {
+    org_id: TENANT.orgId,
+    workspace_id: TENANT.workspaceId,
+    harness: "claude",
+    session_id: sessionId,
+    machine_id: manifest.session.machine_id,
+    user_id: TENANT.userId,
+    storage_provider: "s3",
+    bucket: "test-bucket",
+    manifest_key: key,
+    content_sha256: manifest.raw.content_sha256,
+    raw_format: "ndjson",
+    revision: manifest.revision,
+    deleted_at: null,
+  };
+  return canonicalSnapshot(
+    {
+      store,
+      provider: "s3",
+      bucket: "test-bucket",
+      prefix: { PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true" },
+      pointers: async () => [pointer],
+      decompress: (bytes) => new Uint8Array(zstdDecompressSync(bytes)),
+    },
+    { orgId: TENANT.orgId, workspaceId: TENANT.workspaceId, source: "claude", sessionId },
+  );
+}
+
 describe("deliverBatch", () => {
+  test("binds the authenticated user to a fresh manifest and canonical pointer read", async () => {
+    const { store, deps } = setup();
+    await deliverBatch(deps, TENANT, await batch([record({ record_id: "identity-user" })]));
+    const { key, manifest } = await onlyManifest(store);
+
+    expect(identityExtension(manifest).user_id).toBe(TENANT.userId);
+    const snapshot = await canonicalFromWrittenManifest(store, key, manifest, "sess-1");
+    expect(snapshot.rows).toHaveLength(1);
+    expect(snapshot.rows[0]).toMatchObject({ row: { user_id: TENANT.userId, session_id: "sess-1" } });
+  });
+
+  test("round-trips a layout-encoded session id through the canonical pointer boundary", async () => {
+    const { store, deps } = setup();
+    await deliverBatch(deps, TENANT, await batch([record({ record_id: "identity-session", session_id: "sess:1" })]));
+    const { key, manifest } = await onlyManifest(store);
+
+    expect(manifest.session.session_id).toBe("sess_1");
+    expect(identityExtension(manifest).canonical_session_id).toBe("sess:1");
+    const snapshot = await canonicalFromWrittenManifest(store, key, manifest, "sess:1");
+    expect(snapshot.rows).toHaveLength(1);
+    expect(snapshot.rows[0]).toMatchObject({ row: { user_id: TENANT.userId, session_id: "sess:1" } });
+  });
+
+  test("preserves existing 96bulls metadata when appending another batch", async () => {
+    const { store, deps } = setup();
+    await deliverBatch(deps, TENANT, await batch([record({ record_id: "identity-first" })]));
+    const first = await onlyManifest(store);
+    first.manifest.extensions!["96bulls"] = { ...identityExtension(first.manifest), admitted_marker: { version: 7 } };
+    await putManifest(store, first.key, first.manifest);
+
+    await deliverBatch(deps, TENANT, await batch([record({ record_id: "identity-second" })], { batch_id: "identity-batch-2" }));
+    const updated = (await onlyManifest(store)).manifest;
+    expect(identityExtension(updated)).toMatchObject({
+      user_id: TENANT.userId,
+      canonical_session_id: "sess-1",
+      admitted_marker: { version: 7 },
+    });
+    expect(updated.raw.chunks).toHaveLength(2);
+  });
+
+  for (const [field, conflicting] of [["user_id", "another-user"], ["canonical_session_id", "another-session"]] as const) {
+    test(`refuses an existing manifest with conflicting ${field}`, async () => {
+      const { store, deps } = setup();
+      await deliverBatch(deps, TENANT, await batch([record({ record_id: `identity-${field}-first` })]));
+      const first = await onlyManifest(store);
+      first.manifest.extensions!["96bulls"] = { ...identityExtension(first.manifest), [field]: conflicting };
+      await putManifest(store, first.key, first.manifest);
+      const before = await chunks(store);
+
+      const error = await deliverBatch(
+        deps,
+        TENANT,
+        await batch([record({ record_id: `identity-${field}-second` })], { batch_id: `identity-${field}-batch-2` }),
+      ).catch((caught) => caught);
+      expect(error).toBeInstanceOf(IngestUnavailable);
+      expect(error).toMatchObject({ stage: "objects", cause_code: "manifest_identity_mismatch" });
+      expect(await chunks(store)).toEqual(before);
+    });
+  }
+
   test("lands the batch in the m=srv_ layout with relayhistory's receipt", async () => {
     const { store, ledger, deps } = setup();
     const b = await batch([record({ record_id: "e1" }), record({ record_id: "e2", revision: 3 })]);
@@ -438,7 +543,7 @@ describe("staging: a batch wider than one Worker invocation", () => {
     const now = new Date("2026-11-02T00:00:00Z");
     const { groups } = groupRecords(prepared.records, now);
     const target = { store, keyRoot: "96bulls", sleep: noSleep };
-    const key = await stageGroups(target, { batch_digest: prepared.batchDigest, received_at: now.toISOString(), org_id: "org-a", workspace_id: "ws-a", origin_id: "origin-1", user_id: "user-1" }, groups);
+    const key = await stageGroups(target, { claim_token:crypto.randomUUID(),batch_digest: prepared.batchDigest, received_at: now.toISOString(), org_id: "org-a", workspace_id: "ws-a", origin_id: "origin-1", user_id: "user-1" }, groups);
     for (const m of fanoutMessages(key, groups.length)) await fanout(target, m, (x) => new Uint8Array(zstdDecompressSync(x)));
     const manifests = (await listAll(store, "96bulls/org-a/v1")).filter((k) => k.endsWith("manifest.json"));
     expect(manifests).toHaveLength(2);

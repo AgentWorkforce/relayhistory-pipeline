@@ -1,3 +1,7 @@
+import {decodeCustodyEnvelope} from "./custody-wire.ts";
+import {validatedCustodyAck} from "./custody-ack.ts";
+import {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER,PRIVATE_CUSTODY_BYTES,type CurrentCustodyPacket} from "./custody-protocol.ts";
+import {orderedControl,orderedControlResult,type OrderedControl} from "./control-protocol.ts";
 /**
  * The 96Bulls session ingest: relayhistory's delivery write contract
  * (relayhistory-cloud packages/relayhistory/src/routes/delivery.ts), served
@@ -34,6 +38,8 @@ import { deliverBatch, IngestUnavailable, type DeliverDeps } from "./deliver.ts"
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES } from "./vendor/delivery/delivery-contracts.ts";
 import { parseDeliveryRequest, requireDeliveryAccount } from "./vendor/delivery/prepare.ts";
 
+export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl};
+
 export const SYNC_SCOPE = "rth:sync";
 export type ContentEncoding = "zstd" | "gzip";
 
@@ -60,7 +66,7 @@ export function signRequest(key: string, t: number, method: string, path: string
 
 /** The identity relayhistory verified and signed (`signRequest`). Refuses an unsigned, stale or altered request. */
 export function signedBindingIdentity(key: string | undefined, nowSeconds: () => number = () => Math.floor(Date.now() / 1000)) {
-  return (request: Request, body: Uint8Array): VerifiedIdentity => {
+  return (request: Request, body: Uint8Array): IngestIdentity => {
     if (!key) throw new AuthError(401, "not_configured", "the session ingest has no signing key");
     const identity = request.headers.get(IDENTITY_HEADER) ?? "";
     const m = /^t=(\d{1,12}),v1=([0-9a-f]{64})$/.exec(request.headers.get(SIGNATURE_HEADER) ?? "");
@@ -75,35 +81,37 @@ export function signedBindingIdentity(key: string | undefined, nowSeconds: () =>
 }
 
 /** The identity relayhistory verified, as it sends it: base64url JSON { userId, orgId, workspaceId, scopes }. */
-export function bindingIdentity(request: Request): VerifiedIdentity {
+export function bindingIdentity(request: Request): IngestIdentity {
   const raw = request.headers.get(IDENTITY_HEADER);
   if (!raw) throw new AuthError(401, "missing_authorization", "missing Authorization header");
-  let v: Partial<VerifiedIdentity> | null = null;
+  let v: Partial<IngestIdentity> | null = null;
   try {
-    v = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as Partial<VerifiedIdentity>;
+    v = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as Partial<IngestIdentity>;
   } catch {
     // fall through
   }
   const id = (x: unknown) => typeof x === "string" && x.length > 0 && x.length <= 512;
   if (!v || !id(v.userId) || !id(v.orgId) || typeof v.workspaceId !== "string" || !Array.isArray(v.scopes) || !v.scopes.every((s) => typeof s === "string"))
     throw new AuthError(401, "invalid_token", "invalid or expired token");
-  return { userId: v.userId!, orgId: v.orgId!, workspaceId: v.workspaceId, scopes: v.scopes };
+  let control:OrderedControl|undefined;
+  if("control" in v){try{control=orderedControl(v.control)}catch{throw new AuthError(401,"invalid_token","invalid or expired token")}}
+  return { userId: v.userId!, orgId: v.orgId!, workspaceId: v.workspaceId, scopes: v.scopes,...(control?{control}:{}) };
 }
 
-export function encodeIdentity(identity: VerifiedIdentity): string {
+export function encodeIdentity(identity: IngestIdentity): string {
   return Buffer.from(JSON.stringify(identity), "utf8").toString("base64url");
 }
 
 export interface IngestAppDeps {
   /** Default: `signedBindingIdentity(signingKey)`. */
-  identify?: (request: Request, body: Uint8Array) => VerifiedIdentity | Promise<VerifiedIdentity>;
+  identify?: (request: Request, body: Uint8Array) => IngestIdentity | Promise<IngestIdentity>;
   /** The shared HMAC key (Secrets Store). Unset with no `identify`: every request is 401 not_configured. */
   signingKey?: string;
   deliver: DeliverDeps;
   log?: (fields: Record<string, unknown>) => void;
 }
 
-type Env = { Variables: { correlationId: string; identity: VerifiedIdentity; body: Uint8Array } };
+type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined } };
 
 /** Node 24 always has zstd; published most preferred first, as relayhistory. */
 export function contentEncodings(): ContentEncoding[] {
@@ -201,8 +209,17 @@ function bufferedRequest(c: Context<Env>): Request {
   return new Request(c.req.raw.url, { method: c.req.raw.method, headers: c.req.raw.headers, body: c.get("body") });
 }
 
-async function jsonOf(c: Context<Env>): Promise<unknown> {
-  return boundedJson(bufferedRequest(c), { bytes: 0, wireBytes: 0, encoding: "identity" });
+async function jsonOf(c: Context<Env>,read:BodyRead={bytes:0,wireBytes:0,encoding:"identity"}): Promise<unknown> {
+  if(c.req.header("content-type")?.split(";")[0]?.trim()!==CURRENT_CUSTODY_CONTENT_TYPE)return boundedJson(bufferedRequest(c),read);
+  const decoded=decodeCustodyEnvelope(c.get("body"));c.set("custody",decoded.packet);
+  const headers=new Headers(c.req.raw.headers);headers.set("content-encoding",decoded.encoding);headers.delete("content-length");
+  return boundedJson(new Request(c.req.raw.url,{method:c.req.raw.method,headers,body:decoded.original}),read);
+}
+function custodyHeader(c:Context<Env>,ack:unknown){
+ const packet=c.get("custody");if(!packet)return;
+ const value=JSON.stringify(validatedCustodyAck(ack,packet));
+ if(Buffer.byteLength(value)>512)throw new IngestUnavailable("fence","custody_ack_invalid");
+ c.header(CURRENT_CUSTODY_ACK_HEADER,value);
 }
 
 const invalid = (message: string): never => {
@@ -260,7 +277,9 @@ export function createIngestApp(deps: IngestAppDeps) {
     // The body is read once, bounded by the wire cap, so the signature covers exactly what is parsed.
     let body: Uint8Array;
     try {
-      body = c.req.raw.body ? await readBounded(c.req.raw.body, MAX_DELIVERY_BYTES) : new Uint8Array();
+      const privateWire=c.req.header("content-type")?.split(";")[0]?.trim()===CURRENT_CUSTODY_CONTENT_TYPE;
+      if(privateWire&&(deps.deliver.acceptanceMode!=="buffered"||!["","identity"].includes(c.req.header("content-encoding")?.trim().toLowerCase()??"")))throw new IngestUnavailable("fence","custody_wire_unavailable");
+      body = c.req.raw.body ? await readBounded(c.req.raw.body, privateWire?PRIVATE_CUSTODY_BYTES:MAX_DELIVERY_BYTES) : new Uint8Array();
     } catch (error) {
       return failure(c, error);
     }
@@ -284,9 +303,12 @@ export function createIngestApp(deps: IngestAppDeps) {
     const read: BodyRead = { bytes: 0, wireBytes: 0, encoding: "identity" };
     const fields: Record<string, unknown> = { route: "delivery.batches", org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") };
     try {
-      const batch = parseDeliveryRequest(await boundedJson(bufferedRequest(c), read));
-      const result = await deliverBatch(deps.deliver, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, batch);
+      const batch = parseDeliveryRequest(await jsonOf(c, read));
+      const custody=c.get("custody");
+      if(custody&&custody.witness.originalRecordCount!==batch.records.length)throw new IngestUnavailable("fence","custody_record_count");
+      const result = await deliverBatch({...deps.deliver,...(custody?{custody}:{})}, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, batch);
       emit({ ...fields, outcome: result.outcome, count: result.stats.records, manifests: result.stats.manifests_written, deleted: result.stats.deleted_sessions, state: result.stats.replica, duration_ms: Date.now() - started, bytes_raw: read.bytes });
+      custodyHeader(c,result.custodyAck);
       return c.json({ ...result.receipt, limits: { ...result.receipt.limits, contentEncodings: contentEncodings() } });
     } catch (error) {
       const code = error instanceof DeliveryError ? error.code : "delivery_unavailable";
@@ -310,14 +332,21 @@ export function createIngestApp(deps: IngestAppDeps) {
     try {
       const input = parseSelection(await jsonOf(c));
       await requireDeliveryAccount(identity, input.account_id);
-      await deps.deliver.ledger.setSessionUploads({
+      const selection={
         tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId },
         originId: input.origin_id,
-        sessions: input.sessions.map((x) => [x.source, x.session_id]),
+        sessions: input.sessions.map((x):[string,string] => [x.source, x.session_id]),
         enabled: input.enabled,
-      });
-      emit({ route: "delivery.sessions.selection", outcome: input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
-      return c.json({ updated: true });
+      };
+      let controlAck;
+      const custody=c.get("custody");if(custody&&!identity.control)throw new IngestUnavailable("fence","control_unavailable");
+      if(identity.control){
+        if(identity.control.kind!=="selection"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
+        const result=orderedControlResult(await deps.deliver.ledger.applyOrderedControl({...selection,control:{...identity.control,kind:"selection"},...(custody?{custody}:{})}),identity.control);
+        controlAck=result.control;custodyHeader(c,result.custodyAck);
+      }else await deps.deliver.ledger.setSessionUploads(selection);
+      emit({ route: "delivery.sessions.selection", outcome: controlAck?"control_"+controlAck.outcome:input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
+      return c.json({ updated: true,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
       emit({ route: "delivery.sessions.selection", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
       return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
@@ -328,12 +357,16 @@ export function createIngestApp(deps: IngestAppDeps) {
     try {
       const input = parseReset(await jsonOf(c));
       await requireDeliveryAccount(identity, input.account_id);
-      const deleted = await deps.deliver.ledger.resetUploadedSessions(
-        { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId },
-        input.request_id,
-      );
-      emit({ route: "delivery.sessions.reset", outcome: "reset", org_id: identity.orgId, deleted });
-      return c.json({ reset: true, deleted });
+      const tenant={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
+      let deleted:number,controlAck;
+      const custody=c.get("custody");if(custody&&!identity.control)throw new IngestUnavailable("fence","control_unavailable");
+      if(identity.control){
+        if(identity.control.kind!=="reset"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
+        const result=orderedControlResult(await deps.deliver.ledger.applyOrderedControl({tenant,requestId:input.request_id,control:{...identity.control,kind:"reset"},...(custody?{custody}:{})}),identity.control);
+        deleted=result.deleted!;controlAck=result.control;custodyHeader(c,result.custodyAck);
+      }else deleted=await deps.deliver.ledger.resetUploadedSessions(tenant,input.request_id);
+      emit({ route: "delivery.sessions.reset", outcome: controlAck?"control_"+controlAck.outcome:"reset", org_id: identity.orgId, deleted });
+      return c.json({ reset: true, deleted,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
       emit({ route: "delivery.sessions.reset", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
       return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));

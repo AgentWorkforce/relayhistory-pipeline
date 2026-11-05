@@ -349,12 +349,19 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261101050000_session_directory_list.sql`           | table sessions.session_directory_agents                                                                                 |
 | `upstream:20261102000000_session_briefs.sql`                   | table sessions.session_briefs                                                                                           |
 | `upstream:20261102010000_session_directory_canonical_ids.sql`  | column sessions.session_index.canonical_session_id                                                                      |
-| `upstream:20261102010000_session_ingest_ledger.sql`            | table sessions.ingest_batches                                                                                           |
+| `upstream:20261104022000_session_ingest_ledger.sql`            | table sessions.ingest_batches                                                                                           |
 | `upstream:20261102020000_session_brief_state.sql`              | ALTER-only: column sessions.session_briefs.state                                                                        |
-| `upstream:20261103010000_session_directory_event_metadata.sql` | table sessions.session_directory_event_times                                                                            |
+| `upstream:20261104021000_session_directory_event_metadata.sql` | table sessions.session_directory_event_times                                                                            |
 | `upstream:20261104020000_auth_sessions.sql`                    | table sessions.auth_sessions                                                                                            |
 | `upstream:20261104020100_auth_session_verify.sql`              | table sessions.auth_token_verifier_policy                                                                               |
 | `upstream:20261104030000_ingest_fence_ownership.sql`           | table sessions.ingest_session_ownership                                                                                  |
+| `upstream:20261104040000_ingest_s3_proof_seed.sql` | table sessions.ingest_seed_captures |
+| `upstream:20261104050000_buffered_upload_receipts.sql` | table sessions.ingest_stage_intents |
+| `upstream:20261104051000_ingest_buffer_gc.sql` | column sessions.ingest_stage_intents.gc_lease_token |
+| `upstream:20261104052000_ordered_ingest_controls.sql` | column sessions.ingest_buffer_admission.control_epoch |
+| `upstream:20261104055000_lazy_current_custody.sql` | table sessions.ingest_lazy_policy |
+| `upstream:20261104054000_ingest_custody_baseline.sql` | table sessions.ingest_custody_imports |
+| `upstream:20261104053000_ingest_first_ack_seats.sql` | table sessions.ingest_receipt_seat_clock |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
 | `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |

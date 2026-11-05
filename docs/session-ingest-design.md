@@ -124,7 +124,7 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
 
 ## 3. Ledger (Supabase)
 
-Migration `supabase/migrations/20261102010000_session_ingest_ledger.sql`. It never creates or alters a role (review High 1: a CNPG / Cloud SQL migration owner has no CREATEROLE). `supabase/bootstrap/session_ingest_roles.sql` provisions both roles NOLOGIN before migrate (`src/hoopdb/migrate.ts` runs it as its bootstrap step, the runbook as `postgres` on Supabase); the migration verifies them and fails closed (42704 absent, 55000 elevated or a member). After migrate, `session_ingest_role.sql` makes the ingest role LOGIN with a 5 s statement timeout. Each function refuses any other caller, and no advisory lock is taken anywhere (a test asserts it).
+Migration `supabase/migrations/20261104022000_session_ingest_ledger.sql`. It never creates or alters a role (review High 1: a CNPG / Cloud SQL migration owner has no CREATEROLE). `supabase/bootstrap/session_ingest_roles.sql` provisions both roles NOLOGIN before migrate (`src/hoopdb/migrate.ts` runs it as its bootstrap step, the runbook as `postgres` on Supabase); the migration verifies them and fails closed (42704 absent, 55000 elevated or a member). After migrate, `session_ingest_role.sql` makes the ingest role LOGIN with a 5 s statement timeout. Each function refuses any other caller, and no advisory lock is taken anywhere (a test asserts it).
 
 - **`ingest_batches`** holds idempotency and receipts.
   - Same digest and committed: **replay**. The receipt is recomputed from the request, since it is content-addressed. The stored `receipt_id` is cross-checked, and a mismatch is a 503.

@@ -1,3 +1,5 @@
+import type {CurrentCustodyPacket,CurrentCustodyAck} from "./custody-protocol.ts";
+import {validatedCustodyAck} from "./custody-ack.ts";
 /**
  * `POST /v1/delivery/batches` without Neon: every accepted batch is in S3
  * before the response, and there is no fallback path.
@@ -43,10 +45,14 @@ import {
 import { prepareDelivery, type PreparedDelivery } from "./vendor/delivery/prepare.ts";
 import { batchMarkerKey, replicaMessage, sendReplica, stagedReplicaMessage, type ReplicaOutcome, type ReplicaSink } from "./replica.ts";
 import { IngestWriteError, assertTenantSegment, groupRecords, liveMachineId, writeBatchObjects, type WriteResult, type WriteTarget } from "./writer.ts";
-import { fanoutMessages, stageGroups, type FanoutMessage } from "./staging.ts";
+import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
+import { prepareBufferedStage, putBufferedStage, fanoutMessages, stageGroups, type FanoutMessage } from "./staging.ts";
 
 export interface DeliverDeps {
+  /** Verified private source packet, bound to this request only. */
+  custody?:CurrentCustodyPacket;
   ledger: Ledger;
+  acceptanceMode?: IngestAcceptanceMode;
   target: WriteTarget;
   replica?: ReplicaSink;
   now?: () => Date;
@@ -64,9 +70,10 @@ export interface DeliverDeps {
   fanout?: (messages: FanoutMessage[]) => Promise<void>;
 }
 
-export type DeliverOutcome = "accepted" | "accepted_staged" | "replay" | "replay_fast" | "accepted_all_deleted";
+export type DeliverOutcome = "accepted" | "accepted_buffered" | "accepted_staged" | "replay" | "replay_fast" | "accepted_all_deleted";
 
 export interface DeliverResult {
+  custodyAck?:CurrentCustodyAck;
   receipt: DeliveryReceipt;
   outcome: DeliverOutcome;
   /** Ids, counts and codes only: what the request log line may carry. */
@@ -145,6 +152,7 @@ export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batc
   const claim = await stage("claim", () =>
     deps.ledger.claim({
       tenant,
+      ...(deps.custody?{custody:deps.custody}:{}),
       originId: prepared.originId,
       batchId: prepared.batchId,
       batchDigest: prepared.batchDigest,
@@ -158,12 +166,12 @@ export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batc
   if (claim.kind === "replay") {
     // Content-addressed: the same digest recomputes the same receipt. A mismatch is corruption, never a 200.
     if (claim.receiptId !== prepared.receipt.receiptId) throw new IngestUnavailable("replay", "receipt_mismatch");
-    return { receipt: withLimits(prepared), outcome: "replay", stats: { ...base, timing_ms: timing } };
+    return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay", stats: { ...base, timing_ms: timing } };
   }
   if (claim.kind === "batch_conflict") throw batchIdConflict(prepared, claim.currentDigest);
   if (claim.kind === "revision_conflict") throw revisionConflict(prepared.originId, claim.conflicts, claim.count);
   if (claim.kind === "replay_fast")
-    return { receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
+    return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
 
   // The deletion filter (records of sessions the user deleted from this origin are
   // acknowledged, not stored) and the replay fast path (records already stored at or
@@ -174,7 +182,7 @@ export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batc
   prepared.records.forEach((r, i) => {
     if (!stale.has(i) && !(r.session_id && deleted.has(pair(r.source, r.session_id)))) keep.push(i);
   });
-  const work = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, { ...base, stale: stale.size }, timing, mark, now);
+  const work = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, claim.claimToken, { ...base, stale: stale.size }, timing, mark, now);
   if (!deps.slots) return work();
   const holder = (deps.requestId ?? (() => crypto.randomUUID()))();
   const slot = await stage("slot", () => deps.ledger.acquireSlot({ tenant, holder, ...deps.slots! }));
@@ -196,6 +204,7 @@ async function writeAndCommit(
   deleted: Set<string>,
   keep: number[],
   resets: number,
+  claimToken: string,
   base: Omit<DeliverResult["stats"], "timing_ms">,
   timing: Record<string, number>,
   mark: (name: string) => void,
@@ -207,13 +216,30 @@ async function writeAndCommit(
   let replicaOutcome: ReplicaOutcome = "off";
   const receivedAt = now();
   const grouped = keep.length > 0 ? groupRecords(keep.map((i) => prepared.records[i]!), receivedAt) : null;
+  if (deps.acceptanceMode === "buffered") {
+    if (!grouped || !deps.ledger.prepareBufferStage || !deps.ledger.commitBuffered || deps.replica?.mode && deps.replica.mode !== "off")
+      throw new IngestUnavailable("buffer", "buffer_not_configured");
+    const attempt = {tenant, originId:prepared.originId, batchId:prepared.batchId, batchDigest:prepared.batchDigest, claimToken};
+    const preparedStage = await stage("buffer_prepare", async () => prepareBufferedStage(deps.target.keyRoot,
+      {claim_token:claimToken,batch_digest:prepared.batchDigest,received_at:receivedAt.toISOString(),org_id:tenant.orgId,workspace_id:tenant.workspaceId,origin_id:prepared.originId,user_id:tenant.userId},
+      grouped.groups, grouped.index.map(indexes => indexes.map(i => keep[i]!))));
+    const intent = await stage("buffer_intent", () => deps.ledger.prepareBufferStage!({...attempt,...preparedStage.spec}));
+    mark("buffer_intent");
+    await stage("buffer_put", () => putBufferedStage(deps.target.store,preparedStage));
+    mark("buffer_put");
+    const ack=await stage("buffer_receipt", () => deps.ledger.commitBuffered!({...attempt,stageToken:intent.stageToken}));
+    let custodyAck:CurrentCustodyAck|undefined;
+    if(deps.custody){try{custodyAck=validatedCustodyAck(ack,deps.custody)}catch{throw new IngestUnavailable("buffer_receipt","custody_ack_missing")}}
+    mark("buffer_receipt");
+    return {custodyAck,receipt:withLimits(prepared),outcome:"accepted_buffered",stats:{...base,deleted_sessions:deleted.size,timing_ms:timing}};
+  }
   if (grouped && deps.inlineMaxSessions !== undefined && grouped.groups.length > deps.inlineMaxSessions) {
     // Too wide for this invocation: one staged object now, the sessions from the queue.
     if (!deps.fanout) throw new IngestUnavailable("staging", "fanout_not_configured");
     const key = await stage("staging", () =>
       stageGroups(
         deps.target,
-        { batch_digest: prepared.batchDigest, received_at: receivedAt.toISOString(), org_id: tenant.orgId, workspace_id: tenant.workspaceId, origin_id: prepared.originId, user_id: tenant.userId },
+        { claim_token: claimToken, batch_digest: prepared.batchDigest, received_at: receivedAt.toISOString(), org_id: tenant.orgId, workspace_id: tenant.workspaceId, origin_id: prepared.originId, user_id: tenant.userId },
         grouped.groups,
       ),
     );
@@ -253,6 +279,7 @@ async function writeAndCommit(
       originId: prepared.originId,
       batchId: prepared.batchId,
       batchDigest: prepared.batchDigest,
+      claimToken,
       sessions: writtenSessions,
       machineId,
       // A staged batch's revisions become stored only when the fan-out has written them

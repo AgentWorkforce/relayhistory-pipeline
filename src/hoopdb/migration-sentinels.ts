@@ -30,6 +30,11 @@ export interface Sentinel {
 }
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
+  "upstream:20261104055000_lazy_current_custody.sql": {evidence:"table sessions.ingest_lazy_policy",sql:relation("sessions.ingest_lazy_policy")},
+  "upstream:20261104054000_ingest_custody_baseline.sql": {evidence:"table sessions.ingest_custody_imports",sql:relation("sessions.ingest_custody_imports")},
+  "upstream:20261104053000_ingest_first_ack_seats.sql": {evidence:"table sessions.ingest_receipt_seat_clock",sql:relation("sessions.ingest_receipt_seat_clock")},
+  "upstream:20261104052000_ordered_ingest_controls.sql": {evidence:"column sessions.ingest_buffer_admission.control_epoch",sql:column("sessions.ingest_buffer_admission","control_epoch")},
+  "upstream:20261104051000_ingest_buffer_gc.sql": {evidence:"column sessions.ingest_stage_intents.gc_lease_token",sql:column("sessions.ingest_stage_intents","gc_lease_token")},
   "upstream:20261025000000_sessions_index.sql": {
     evidence: "table sessions.session_index",
     sql: relation("sessions.session_index"),
@@ -105,7 +110,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "ALTER-only: column sessions.session_index.canonical_session_id",
     sql: column("sessions.session_index", "canonical_session_id"),
   },
-  "upstream:20261102010000_session_ingest_ledger.sql": {
+  "upstream:20261104022000_session_ingest_ledger.sql": {
     evidence: "table sessions.ingest_batches",
     sql: relation("sessions.ingest_batches"),
   },
@@ -113,9 +118,18 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "ALTER-only: column sessions.session_briefs.state (session_brief replaced to return it)",
     sql: column("sessions.session_briefs", "state"),
   },
-  "upstream:20261103010000_session_directory_event_metadata.sql": {
+  "upstream:20261104021000_session_directory_event_metadata.sql": {
     evidence: "table sessions.session_directory_event_times",
     sql: relation("sessions.session_directory_event_times"),
+  },
+  "upstream:20261104030000_ingest_fence_ownership.sql": {
+    evidence: "table sessions.ingest_session_ownership",
+    sql: relation("sessions.ingest_session_ownership"),
+  },
+  "upstream:20261104040000_ingest_s3_proof_seed.sql": {evidence:"table sessions.ingest_seed_captures",sql:relation("sessions.ingest_seed_captures")},
+  "upstream:20261104050000_buffered_upload_receipts.sql": {
+    evidence: "table sessions.ingest_stage_intents",
+    sql: relation("sessions.ingest_stage_intents"),
   },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
