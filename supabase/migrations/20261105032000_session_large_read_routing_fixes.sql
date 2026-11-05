@@ -83,6 +83,11 @@ BEGIN
    -- Transient/server-wide failures (serialization, resources, operator intervention, system,
    -- internal, connection) are not a property of this scope: abort the page as before.
    IF left(v_state,2) IN('08','40','53','57','58','XX') THEN RAISE; END IF;
+   -- Transient per-scope conditions: 55P03 lock_not_available and capture's 55000 'source epoch
+   -- missing' (pointers ahead of their epoch row; retryable per replay-publication.ts). Skip the
+   -- scope for this page without counting an attempt or touching its scope_errors row; the rest
+   -- of class 55 stays a recorded refusal.
+   IF v_state='55P03' OR (v_state='55000' AND v_msg='replay capture: source epoch missing') THEN skipped:=skipped+1; CONTINUE; END IF;
    INSERT INTO sessions.session_large_read_scope_errors AS x(org_id,workspace_id,harness,session_id,state,sqlstate,message,attempts,available_at)
    VALUES(s.org_id,s.workspace_id,s.harness,s.canonical_id,'retrying',v_state,
     CASE WHEN length(v_msg)<=128 AND v_msg~'^(replay capture|large read): [a-z ]+$' THEN v_msg ELSE 'unclassified' END,
@@ -103,7 +108,7 @@ END $discover$;
 
 CREATE OR REPLACE FUNCTION sessions.claim_session_large_read(p_nonce uuid,p_lease_seconds integer DEFAULT 120)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $claim$
-DECLARE j sessions.session_large_read_jobs%ROWTYPE;c jsonb;v_state text;
+DECLARE j sessions.session_large_read_jobs%ROWTYPE;c jsonb;v_state text;v_msg text;
 BEGIN
  IF p_nonce IS NULL OR p_lease_seconds IS NULL OR p_lease_seconds NOT BETWEEN 30 AND 300 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='large read: invalid lease'; END IF;
  FOR j IN SELECT * FROM sessions.session_large_read_jobs WHERE
@@ -117,9 +122,17 @@ BEGIN
   BEGIN
    c:=sessions.capture_session_replay_pages(j.org_id,j.workspace_id,j.harness,j.session_id);
   EXCEPTION WHEN OTHERS THEN
-   GET STACKED DIAGNOSTICS v_state=RETURNED_SQLSTATE;
+   GET STACKED DIAGNOSTICS v_state=RETURNED_SQLSTATE,v_msg=MESSAGE_TEXT;
    IF left(v_state,2) IN('08','40','53','57','58','XX') THEN RAISE; END IF;
-   -- A per-job capture refusal (54000 capacity, 55000 ambiguous/epoch, ...) counts as an attempt
+   -- Transient per-job conditions (55P03 lock_not_available, capture's 55000 'source epoch
+   -- missing'): back off 30 s without counting an attempt or changing last_error, and move on.
+   IF v_state='55P03' OR (v_state='55000' AND v_msg='replay capture: source epoch missing') THEN
+    UPDATE sessions.session_large_read_jobs SET state='queued',available_at=clock_timestamp()+interval '30 seconds',
+     lease_nonce=NULL,lease_expires_at=NULL,updated_at=now()
+     WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
+    CONTINUE;
+   END IF;
+   -- A per-job capture refusal (54000 capacity, 55000 ambiguous source, ...) counts as an attempt
    -- with the retry backoff; the fifth fails the job. Bounded code only, never the message.
    UPDATE sessions.session_large_read_jobs SET state=CASE WHEN attempts+1>=5 THEN 'failed' ELSE 'queued' END,
     available_at=clock_timestamp()+interval '30 seconds',lease_nonce=NULL,lease_expires_at=NULL,attempts=attempts+1,

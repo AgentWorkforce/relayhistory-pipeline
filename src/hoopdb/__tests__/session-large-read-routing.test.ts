@@ -44,7 +44,22 @@ const boundary=async(x:X)=>(await x.pg.query<any>(`SELECT p.oid::regprocedure::t
  WHERE p.oid IN (${FNS.map(f=>`'${f}'::regprocedure`).join(",")}) ORDER BY 1`)).rows;
 const prosrc=async(x:X,fn:string)=>(await x.pg.query<{s:string}>(`SELECT prosrc s FROM pg_proc WHERE oid='${fn}'::regprocedure`)).rows[0]!.s;
 const body=(file:string,fn:string,tag:string)=>{const all=[...readFileSync(join(root,"supabase/migrations",file),"utf8").matchAll(new RegExp(`FUNCTION sessions\\.${fn}\\([^]*?AS \\$${tag}\\$([\\s\\S]*?)\\$${tag}\\$;`,"g"))];const m=all.at(-1);if(!m)throw Error(`${fn} missing in ${file}`);return m[1]!};
-const down=(x:X)=>x.pg.exec(readFileSync(join(root,`supabase/rollbacks/${FILE}.down.sql`),"utf8"));
+/** Wraps capture so public.capture_fault rows make it raise a chosen SQLSTATE/message per session. */
+const captureFault=(x:X)=>x.pg.exec(`CREATE TABLE public.capture_fault(session_id text PRIMARY KEY,code text NOT NULL,msg text NOT NULL);
+ ALTER FUNCTION sessions.capture_session_replay_pages(text,text,text,text) RENAME TO capture_session_replay_pages_real;
+ CREATE FUNCTION sessions.capture_session_replay_pages(p_org text,p_workspace text,p_harness text,p_session text) RETURNS jsonb LANGUAGE plpgsql AS $f$
+ DECLARE f public.capture_fault%ROWTYPE;
+ BEGIN SELECT * INTO f FROM public.capture_fault WHERE session_id=p_session;
+  IF FOUND THEN RAISE EXCEPTION USING ERRCODE=f.code,MESSAGE=f.msg; END IF;
+  RETURN sessions.capture_session_replay_pages_real(p_org,p_workspace,p_harness,p_session); END $f$;`);
+/** Transient per-scope conditions (M1/M2): skipped/deferred, never counted, never recorded. */
+const TRANSIENT_SCOPE=[["55000","replay capture: source epoch missing"],["55P03","lock not available"]] as const;
+const rollbacks=()=>readdirSync(join(root,"supabase/rollbacks")).filter(f=>f.endsWith(".down.sql")).sort();
+/** Roll back every later upstream lane first (descending), then 032000, as the gap-free ledger requires. */
+const down=async(x:X)=>{
+ for(const f of rollbacks().filter(f=>f>`${FILE}.down.sql`&&/^\d{14}_/.test(f)).reverse())await x.pg.exec(readFileSync(join(root,"supabase/rollbacks",f),"utf8"));
+ await x.pg.exec(readFileSync(join(root,`supabase/rollbacks/${FILE}.down.sql`),"utf8"));
+};
 const migrate=(x:X)=>runMigrations(x.db,{profile:{mode:"local",shim:true,bootstrap:true,verify:true,runtimeRole:"postgres"}});
 
 test("discovery: a 54000 scope is recorded and does not block later scopes or claims",async()=>{
@@ -88,13 +103,7 @@ test("discovery: bounded retry of the poisoned scope (30 s backoff, 5 attempts, 
 test("discovery: a recovered retrying scope clears its row; transient classes still abort the page; messages stay bounded",async()=>{
  const x=await fresh();
  for(const id of ["a-flaky","b-ok"])await addScope(x,id);
- await x.pg.exec(`CREATE TABLE public.capture_fault(session_id text PRIMARY KEY,code text NOT NULL,msg text NOT NULL);
- ALTER FUNCTION sessions.capture_session_replay_pages(text,text,text,text) RENAME TO capture_session_replay_pages_real;
- CREATE FUNCTION sessions.capture_session_replay_pages(p_org text,p_workspace text,p_harness text,p_session text) RETURNS jsonb LANGUAGE plpgsql AS $f$
- DECLARE f public.capture_fault%ROWTYPE;
- BEGIN SELECT * INTO f FROM public.capture_fault WHERE session_id=p_session;
-  IF FOUND THEN RAISE EXCEPTION USING ERRCODE=f.code,MESSAGE=f.msg; END IF;
-  RETURN sessions.capture_session_replay_pages_real(p_org,p_workspace,p_harness,p_session); END $f$;`);
+ await captureFault(x);
  // A row-data-bearing message is never stored.
  await x.pg.exec("INSERT INTO public.capture_fault VALUES('a-flaky','P0001','secret transcript text 42')");
  expect(await discover(x)).toMatchObject({scanned:2,changed:1,failed:1});
@@ -138,6 +147,70 @@ test("claim: a job whose scope now refuses capture is retried with backoff, then
  await due(x,"session_large_read_jobs");
  expect(await claim(x)).toBeNull();
  expect((await jobs(x))[0]).toMatchObject({state:"failed",attempts:5});
+},PGLITE_TEST_TIMEOUT*4);
+
+test("discovery: 55000 'source epoch missing' and 55P03 are transient: skipped, never counted, never recorded",async()=>{
+ const x=await fresh();
+ for(const id of ["a-epoch","b-lock","c-ok"])await addScope(x,id);
+ await captureFault(x);
+ await x.pg.query("INSERT INTO public.capture_fault VALUES('a-epoch',$1,$2),('b-lock',$3,$4)",TRANSIENT_SCOPE.flat());
+ // Well past the fifth-attempt budget: the page completes, c-ok is enqueued, nothing is recorded.
+ for(let n=0;n<7;n++){
+  expect(await discover(x)).toEqual({busy:false,scanned:3,changed:n===0?1:0,failed:0,skipped:2,cycleComplete:true});
+  expect(await errors(x)).toEqual([]);
+ }
+ expect((await jobs(x)).map(j=>j.session_id)).toEqual(["c-ok"]);
+ // An existing retrying row is left exactly as it was (no attempt, no state change, no backoff reset).
+ await x.pg.exec("UPDATE public.capture_fault SET code='54000',msg='replay capture: pointer capacity exceeded' WHERE session_id='a-epoch'");
+ expect(await discover(x)).toMatchObject({failed:1,skipped:1});
+ await x.pg.exec("UPDATE public.capture_fault SET code='55000',msg='replay capture: source epoch missing' WHERE session_id='a-epoch'");
+ for(let n=0;n<6;n++){
+  await due(x,"session_large_read_scope_errors");
+  const before=(await x.pg.query<any>("SELECT available_at::text a FROM sessions.session_large_read_scope_errors")).rows;
+  expect(await discover(x)).toMatchObject({failed:0,skipped:2});
+  expect(await errors(x)).toEqual([{session_id:"a-epoch",state:"retrying",sqlstate:"54000",message:"replay capture: pointer capacity exceeded",attempts:1}]);
+  expect((await x.pg.query<any>("SELECT available_at::text a FROM sessions.session_large_read_scope_errors")).rows).toEqual(before);
+ }
+ // Only the exact epoch message is transient: any other 55000 is still a counted refusal.
+ await x.pg.exec("UPDATE public.capture_fault SET msg='replay capture: ambiguous canonical source' WHERE session_id='a-epoch'");
+ expect(await discover(x)).toMatchObject({failed:1,skipped:1});
+ expect(await errors(x)).toEqual([expect.objectContaining({session_id:"a-epoch",sqlstate:"55000",attempts:2})]);
+ // Recovery: once capture succeeds both scopes are enqueued and the row is cleared.
+ await x.pg.exec("DELETE FROM public.capture_fault");
+ await due(x,"session_large_read_scope_errors");
+ expect(await discover(x)).toMatchObject({scanned:3,changed:2,failed:0,skipped:0});
+ expect(await errors(x)).toEqual([]);
+},PGLITE_TEST_TIMEOUT*4);
+
+test("claim: 55000 'source epoch missing' and 55P03 back off without counting an attempt and never fail the job",async()=>{
+ const x=await fresh();
+ for(const id of ["a-epoch","b-lock","c-ok"])await addScope(x,id);
+ expect(await discover(x)).toMatchObject({changed:3});
+ await captureFault(x);
+ await x.pg.query("INSERT INTO public.capture_fault VALUES('a-epoch',$1,$2),('b-lock',$3,$4)",TRANSIENT_SCOPE.flat());
+ // Transient jobs are passed over, c-ok is still claimed.
+ expect((await claim(x))?.identity?.sessionId).toBe("c-ok");
+ expect((await jobs(x)).slice(0,2)).toEqual([{session_id:"a-epoch",state:"queued",attempts:0,last_error:null},{session_id:"b-lock",state:"queued",attempts:0,last_error:null}]);
+ // Inside the backoff window they are not retried.
+ expect((await x.pg.query<{ok:boolean}>("SELECT bool_and(available_at>clock_timestamp()+interval '20 seconds') ok FROM sessions.session_large_read_jobs WHERE session_id<>'c-ok'")).rows[0]!.ok).toBe(true);
+ // Well past the fifth-attempt budget, including from an expired running lease: never counted, never failed.
+ await x.pg.exec("UPDATE sessions.session_large_read_jobs SET state='running',lease_nonce=gen_random_uuid(),lease_expires_at=clock_timestamp()-interval '1 second',attempts=1 WHERE session_id='b-lock'");
+ for(let n=0;n<7;n++){
+  await due(x,"session_large_read_jobs");
+  await x.pg.exec("UPDATE sessions.session_large_read_jobs SET lease_expires_at=clock_timestamp()+interval '2 minutes' WHERE session_id='c-ok'");
+  expect(await claim(x)).toBeNull();
+  expect((await jobs(x)).slice(0,2)).toEqual([{session_id:"a-epoch",state:"queued",attempts:0,last_error:null},{session_id:"b-lock",state:"queued",attempts:1,last_error:null}]);
+ }
+ expect(await errors(x)).toEqual([]);
+ // Only the exact epoch message is transient: any other 55000 counts as an attempt.
+ await x.pg.exec("UPDATE public.capture_fault SET msg='replay capture: ambiguous canonical source' WHERE session_id='a-epoch'");
+ await due(x,"session_large_read_jobs");
+ expect(await claim(x)).toBeNull();
+ expect((await jobs(x))[0]).toEqual({session_id:"a-epoch",state:"queued",attempts:1,last_error:"capture_55000"});
+ // Recovery: once capture succeeds the deferred job is claimed normally.
+ await x.pg.exec("DELETE FROM public.capture_fault WHERE session_id='b-lock'");
+ await due(x,"session_large_read_jobs");
+ expect((await claim(x))?.identity?.sessionId).toBe("b-lock");
 },PGLITE_TEST_TIMEOUT*4);
 
 test("route: 0/NULL counts are not delegated; a measured-large pointer still is",async()=>{
@@ -202,11 +275,19 @@ test("boundary: signatures, owner, SECURITY DEFINER, search_path and grants are 
 
 test("order: 032000 sorts and applies directly after 031000 and does not depend on its objects",async()=>{
  const x=await fresh();
+ // Contiguous around 032000 without assuming it is last: 030000, 031000, 032000 are adjacent and
+ // anything after it sorts after 032000 (later lanes such as 036000 may follow).
  const upstream=readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort();
- expect(upstream.at(-1)).toBe(`${FILE}.sql`);
- expect(upstream.slice(-3,-1)).toEqual(["20261105030000_canonical_feature_consumer_acks.sql","20261105031000_desktop_catalog_forget_reproject.sql"]);
+ const at=upstream.indexOf(`${FILE}.sql`);
+ expect(at).toBeGreaterThan(1);
+ expect(upstream.slice(at-2,at+1)).toEqual(["20261105030000_canonical_feature_consumer_acks.sql","20261105031000_desktop_catalog_forget_reproject.sql",`${FILE}.sql`]);
+ for(const later of upstream.slice(at+1))expect(later>`${FILE}.sql`&&!later.startsWith("20261105032000")).toBe(true);
  const ledger=(await x.pg.query<{name:string}>("SELECT name FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' ORDER BY applied_at,name COLLATE \"C\"")).rows.map(r=>r.name);
- expect(ledger.slice(-3)).toEqual(["upstream:20261105030000_canonical_feature_consumer_acks.sql","upstream:20261105031000_desktop_catalog_forget_reproject.sql",LEDGER]);
+ const li=ledger.indexOf(LEDGER);
+ expect(li).toBeGreaterThan(1);
+ expect(ledger.slice(li-2,li+1)).toEqual(["upstream:20261105030000_canonical_feature_consumer_acks.sql","upstream:20261105031000_desktop_catalog_forget_reproject.sql",LEDGER]);
+ // Every ledger row after 032000 is a later migration file, in file order.
+ expect(ledger.slice(li+1)).toEqual(upstream.slice(at+1).map(f=>`upstream:${f}`));
  const sql=readFileSync(join(root,"supabase/migrations",`${FILE}.sql`),"utf8")+readFileSync(join(root,`supabase/rollbacks/${FILE}.down.sql`),"utf8");
  for(const dep of ["031000","desktop_catalog"])expect(sql.includes(dep)).toBe(false);
  // No GRANT/REVOKE on any function: CREATE OR REPLACE keeps the original ACL.
@@ -232,7 +313,7 @@ test("down restores the previous bodies verbatim and the old behaviour; reapply 
  // Old behaviour: an unmeasured scope is delegated again.
  expect(await route(x,"unmeasured")).toMatchObject({delegated:true});
  await x.pg.exec("DELETE FROM sessions.session_large_read_jobs");
- // Reapply through the real migrator: only 032000 is applied, the fixes are back.
+ // Reapply through the real migrator: 032000 (and any later lane rolled back above) is applied, the fixes are back.
  await migrate(x);
  expect((await x.pg.query<{n:number}>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1",[LEDGER])).rows[0]!.n).toBe(1);
  expect(await route(x,"unmeasured")).toEqual({delegated:false});
