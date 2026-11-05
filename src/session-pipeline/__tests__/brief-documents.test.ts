@@ -151,6 +151,62 @@ test("brief documents remain dormant until the owner activates publication", asy
     ).rows[0],
   ).toEqual({ live: true, scopes: 1, outbox: 0 });
 });
+test("off-interval updates and deletions stay incomplete until a fresh bounded backfill", async () => {
+  const x = await fresh();
+  await backfill(x);
+  await ack(x, await claim(x));
+
+  expect(
+    (
+      await x.db.query<{ value: boolean }>(
+        "SELECT sessions.set_session_brief_documents_live(false) value",
+      )
+    ).rows[0]!.value,
+  ).toBe(false);
+  // Repeating either state is a true no-op, not another cursor reset.
+  expect(
+    (
+      await x.db.query<{ value: boolean }>(
+        "SELECT sessions.set_session_brief_documents_live(false) value",
+      )
+    ).rows[0]!.value,
+  ).toBe(false);
+  await expect(backfill(x)).rejects.toMatchObject({ code: "55000" });
+  await x.pg.exec(
+    "UPDATE sessions.session_directory SET title='changed while publication was off'",
+  );
+  expect(
+    (
+      await x.db.query<{ initialized: boolean }>(
+        "SELECT initialized FROM sessions.session_brief_document_scopes",
+      )
+    ).rows[0]!.initialized,
+  ).toBe(false);
+
+  await x.db.query("SELECT sessions.set_session_brief_documents_live(true)");
+  await x.db.query("SELECT sessions.set_session_brief_documents_live(true)");
+  expect((await backfill(x)).complete).toBe(true);
+  const changed = await claim(x);
+  expect(changed).toHaveLength(1);
+  expect(changed[0].document.title).toBe(
+    "changed while publication was off",
+  );
+  await ack(x, changed);
+
+  await x.db.query("SELECT sessions.set_session_brief_documents_live(false)");
+  await x.pg.exec("DELETE FROM sessions.session_directory");
+  await x.db.query("SELECT sessions.set_session_brief_documents_live(true)");
+  expect((await backfill(x)).complete).toBe(true);
+  const deleted = await claim(x);
+  expect(deleted).toHaveLength(1);
+  expect(deleted[0].document).toMatchObject({
+    deleted: true,
+    title: "",
+    summary: "",
+    projectId: "",
+    lastActivityAt: "1970-01-01T00:00:00.000000Z",
+  });
+});
 test("relevant directory writes queue metadata once; publisher acknowledges exact epoch/hash", async () => {
   const x = await fresh();
   const b = await backfill(x);
@@ -341,7 +397,18 @@ test("backfill cursor is server owned and exhausts bounded pages without losing 
   expect((await backfill(x, 1)).complete).toBe(false);
   expect((await backfill(x, 1)).complete).toBe(false);
   expect((await backfill(x, 1)).complete).toBe(true);
-  expect(await claim(x)).toHaveLength(3);
+  const initial = await claim(x);
+  expect(initial).toHaveLength(3);
+  await ack(x, initial);
+  await x.db.query("SELECT sessions.set_session_brief_documents_live(false)");
+  await x.pg.exec("DELETE FROM sessions.session_directory");
+  await x.db.query("SELECT sessions.set_session_brief_documents_live(true)");
+  expect((await backfill(x, 1)).complete).toBe(false);
+  expect((await backfill(x, 1)).complete).toBe(false);
+  expect((await backfill(x, 1)).complete).toBe(true);
+  const tombstones = await claim(x);
+  expect(tombstones).toHaveLength(3);
+  expect(tombstones.every((item) => item.document.deleted === true)).toBe(true);
 });
 test("expired document lease cannot be acknowledged from a held transaction", async () => {
   const x = await fresh();

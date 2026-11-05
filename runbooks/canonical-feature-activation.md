@@ -69,7 +69,11 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
   `SELECT sessions.set_session_brief_documents_live(true);`. The call takes a
   bounded directory-write fence, seeds scope keys and flips the trigger live in
   one transaction; a lock timeout leaves it off. Disable with the same owner-
-  only RPC using `false`. No runtime role has EXECUTE on this control.
+  only RPC using `false`. Either transition invalidates every scope cursor;
+  after re-enabling, run the bounded backfill to completion again so updates,
+  inserts and tombstones for deletes that happened while off are reconciled.
+  Authority remains incomplete until that finishes. No runtime role has
+  EXECUTE on this control.
 - Define and rehearse the operator-only seed row. It must put the journal above
   the drained legacy feature high-water before any scope install or backfill;
   no data-plane identity may allocate or append revisions.

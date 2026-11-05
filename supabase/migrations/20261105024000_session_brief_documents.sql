@@ -13,8 +13,8 @@ CREATE TABLE sessions.session_brief_document_control(
 INSERT INTO sessions.session_brief_document_control(singleton,live) VALUES(true,false);
 CREATE TABLE sessions.session_brief_document_scopes(
  org_id text NOT NULL,workspace_id text NOT NULL,watermark bigint NOT NULL DEFAULT 0,
- initialized boolean NOT NULL DEFAULT false,cursor_source text,cursor_session text,
- PRIMARY KEY(org_id,workspace_id),CHECK((cursor_source IS NULL)=(cursor_session IS NULL))
+ initialized boolean NOT NULL DEFAULT false,cursor_phase text NOT NULL DEFAULT 'live',cursor_source text,cursor_session text,
+ PRIMARY KEY(org_id,workspace_id),CHECK(cursor_phase IN('live','deleted')),CHECK((cursor_source IS NULL)=(cursor_session IS NULL))
 );
 CREATE TABLE sessions.session_brief_document_outbox(
  org_id text NOT NULL,workspace_id text NOT NULL,harness text NOT NULL,session_id text NOT NULL,
@@ -46,6 +46,11 @@ BEGIN
   INSERT INTO sessions.session_brief_document_scopes(org_id,workspace_id)
   SELECT DISTINCT org_id,workspace_id FROM sessions.session_directory ON CONFLICT DO NOTHING;
  END IF;
+ -- A disabled interval deliberately takes no per-row publication locks. Reset
+ -- every scope on either edge so authority is incomplete until a fresh scan has
+ -- reconciled updates, insertions and deletions that happened while disabled.
+ UPDATE sessions.session_brief_document_scopes
+ SET initialized=false,cursor_phase='live',cursor_source=NULL,cursor_session=NULL;
  UPDATE sessions.session_brief_document_control SET live=p_live WHERE singleton;
  RETURN p_live;
 END $set_live$;
@@ -103,18 +108,49 @@ CREATE TRIGGER session_brief_document_changed AFTER INSERT OR UPDATE OR DELETE O
 
 CREATE FUNCTION sessions.backfill_session_brief_documents(p_limit integer DEFAULT 200)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $backfill$
-DECLARE k sessions.session_brief_document_scopes%ROWTYPE;d sessions.session_directory%ROWTYPE;n integer:=0;more boolean:=false;last_source text;last_session text;
+DECLARE k sessions.session_brief_document_scopes%ROWTYPE;d sessions.session_directory%ROWTYPE;b sessions.session_brief_document_outbox%ROWTYPE;
+ n integer:=0;more boolean:=false;last_source text;last_session text;document jsonb;
 BEGIN
  IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 200 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='brief document: invalid batch'; END IF;
+ PERFORM 1 FROM sessions.session_brief_document_control WHERE singleton AND live FOR SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='brief document: publication is disabled'; END IF;
  SELECT * INTO k FROM sessions.session_brief_document_scopes WHERE NOT initialized ORDER BY org_id COLLATE "C",workspace_id COLLATE "C" LIMIT 1 FOR UPDATE SKIP LOCKED;
  IF NOT FOUND THEN RETURN jsonb_build_object('complete',true,'processed',0); END IF;
- FOR d IN SELECT * FROM sessions.session_directory x WHERE x.org_id=k.org_id AND x.workspace_id=k.workspace_id
- AND (k.cursor_source IS NULL OR (x.harness COLLATE "C",x.session_id COLLATE "C")>(k.cursor_source COLLATE "C",k.cursor_session COLLATE "C"))
- ORDER BY x.harness COLLATE "C",x.session_id COLLATE "C" LIMIT p_limit+1 LOOP
+ IF k.cursor_phase='live' THEN
+  FOR d IN SELECT * FROM sessions.session_directory x WHERE x.org_id=k.org_id AND x.workspace_id=k.workspace_id
+  AND (k.cursor_source IS NULL OR (x.harness COLLATE "C",x.session_id COLLATE "C")>(k.cursor_source COLLATE "C",k.cursor_session COLLATE "C"))
+  ORDER BY x.harness COLLATE "C",x.session_id COLLATE "C" LIMIT p_limit+1 LOOP
+   IF n=p_limit THEN more:=true;EXIT; END IF;
+   PERFORM sessions.queue_session_brief_document(sessions.session_brief_document_json(d,false));n:=n+1;last_source:=d.harness;last_session:=d.session_id;
+  END LOOP;
+  IF more THEN
+   UPDATE sessions.session_brief_document_scopes SET cursor_source=last_source,cursor_session=last_session
+   WHERE org_id=k.org_id AND workspace_id=k.workspace_id;
+   RETURN jsonb_build_object('orgId',k.org_id,'workspaceId',k.workspace_id,'complete',false,'processed',n);
+  END IF;
+  UPDATE sessions.session_brief_document_scopes SET cursor_phase='deleted',cursor_source=NULL,cursor_session=NULL
+  WHERE org_id=k.org_id AND workspace_id=k.workspace_id;
+  k.cursor_phase:='deleted';k.cursor_source:=NULL;k.cursor_session:=NULL;last_source:=NULL;last_session:=NULL;more:=false;
+ END IF;
+ -- Reconcile keys that existed in the prior published image but disappeared
+ -- while the trigger was disabled. Without this bounded second phase, a delete
+ -- during a kill-switch interval could leave an old CH document authoritative.
+ FOR b IN SELECT * FROM sessions.session_brief_document_outbox q
+ WHERE q.org_id=k.org_id AND q.workspace_id=k.workspace_id
+ AND (k.cursor_source IS NULL OR (q.harness COLLATE "C",q.session_id COLLATE "C")>(k.cursor_source COLLATE "C",k.cursor_session COLLATE "C"))
+ AND NOT EXISTS(SELECT 1 FROM sessions.session_directory x WHERE (x.org_id,x.workspace_id,x.harness,x.session_id)=(q.org_id,q.workspace_id,q.harness,q.session_id))
+ ORDER BY q.harness COLLATE "C",q.session_id COLLATE "C" LIMIT (p_limit-n)+1 LOOP
   IF n=p_limit THEN more:=true;EXIT; END IF;
-  PERFORM sessions.queue_session_brief_document(sessions.session_brief_document_json(d,false));n:=n+1;last_source:=d.harness;last_session:=d.session_id;
+  document:=b.document||jsonb_build_object('deleted',true,'title','','summary','','projectId','','lastActivityAt','1970-01-01T00:00:00.000000Z');
+  PERFORM sessions.queue_session_brief_document(document);n:=n+1;last_source:=b.harness;last_session:=b.session_id;
  END LOOP;
- UPDATE sessions.session_brief_document_scopes SET initialized=NOT more,cursor_source=coalesce(last_source,cursor_source),cursor_session=coalesce(last_session,cursor_session) WHERE org_id=k.org_id AND workspace_id=k.workspace_id;
+ IF more THEN
+  UPDATE sessions.session_brief_document_scopes SET cursor_phase='deleted',cursor_source=last_source,cursor_session=last_session
+  WHERE org_id=k.org_id AND workspace_id=k.workspace_id;
+ ELSE
+  UPDATE sessions.session_brief_document_scopes SET initialized=true,cursor_phase='live',cursor_source=NULL,cursor_session=NULL
+  WHERE org_id=k.org_id AND workspace_id=k.workspace_id;
+ END IF;
  RETURN jsonb_build_object('orgId',k.org_id,'workspaceId',k.workspace_id,'complete',NOT more,'processed',n);
 END $backfill$;
 CREATE FUNCTION sessions.claim_session_brief_documents(p_nonce uuid,p_limit integer DEFAULT 100)
