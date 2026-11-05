@@ -42,6 +42,13 @@ Apply the reviewed additive migration and exact ACL/boundary/role-verifier/gener
 
 The consumer's explicit page mode, deployed producer/consumer versions, complete replay/coverage, future legacy writer fence/redirection, new eraser-before-exporter ordering, obsolete-object reconciliation, full public adapter parity and the complete migration/ACL/bootstrap union remain separate activation gates. Rollback disables the page consumer and producer flags; immutable artifacts/publication metadata need not be deleted to stop traffic. No enablement is part of this change.
 
+## Activation blockers (not merge blockers)
+
+These do not block merging the dormant code. Each must be resolved, or explicitly accepted by the owner, before `replayPages`/`SESSION_REPLAY_PAGES_ENABLED` is enabled anywhere:
+
+1. **No cross-generation dedup or cleanup under one anchor hash.** Every source epoch bump writes a complete new artifact set under `<anchor-prefix>/normalized/read-projection-v1/<anchor-raw-sha>/<generation>/` (`src/session-pipeline/replay-publication.ts`, prefix construction). Objects are not shared across generations, and nothing deletes the superseded sets while the anchor's raw hash is unchanged. Exporter orphan cleanup removes them only after the anchor's raw hash changes. Storage therefore grows with every epoch bump of a session. A generation GC/retention plan is required.
+2. **Merged-session content outlives a sibling session's erasure.** A merged (canonical) session's artifacts, including content from other physical sessions in the union, are stored under the anchor session's `normalized/` prefix. When a non-anchor sibling is erased, its content stays in the existing artifact objects until the anchor's raw hash changes and old-prefix cleanup runs. Publication is invalidated at once (the source epoch moves), but the bytes remain. Erasure must reach these objects, by deleting or rewriting the affected generations, before activation.
+
 ## Offline proof
 
 The proof uses synthetic PGlite and a new empty local fs directory, with no service credentials:
