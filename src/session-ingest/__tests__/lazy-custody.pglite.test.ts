@@ -9,6 +9,7 @@ import {deliverBatch} from "../deliver.ts";
 import {prepareDelivery} from "../vendor/delivery/prepare.ts";
 import {createIngestApp} from "../app.ts";
 import {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER} from "../custody-protocol.ts";
+import {RECOVERY_CONTENT_TYPE,RECOVERY_PROTOCOL} from "../recovery-protocol.ts";
 import type {CurrentCustodyPacket,SourceCurrentRecord} from "../custody-protocol.ts";
 import {TENANT,batch,record,scratchStore} from "./support.ts";
 setDefaultTimeout(30000);
@@ -60,6 +61,45 @@ test("lazy old custody exact/changed/lower first-body decisions and actual recei
  expect(result.status).toBe(200);expect(JSON.parse(result.headers.get(CURRENT_CUSTODY_ACK_HEADER)!)).toEqual({version:1,sourceDigest:packet.sourceDigest,sourceControlVersion:"0",privacySealed:true});
  expect((await f.seats("http-new")).records[0].bodyAccepted).toBe(true);
  expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_record_revisions")).rows[0]!.n).toBe(0);
+});
+
+test("signed archive recovery preserves the exact prepared receipt and enters only the buffered path",async()=>{
+ const f=await fixture(),raw=await batch([record({record_id:"archived",payload:{text:"alice@example.com"}})],{batch_id:"archived-batch"});
+ const prepared=await prepareDelivery(TENANT,raw),custody=await f.packet(raw);
+ const envelope={protocol:RECOVERY_PROTOCOL,prepared,custody},body=JSON.stringify(envelope);
+ const app=createIngestApp({identify:()=>({...TENANT,scopes:["rth:sync"]}),deliver:f.deps,log:()=>{}});
+ const response=await app.request("/v1/delivery/recovery",{method:"POST",headers:{"content-type":RECOVERY_CONTENT_TYPE},body});
+ expect(response.status).toBe(200);
+ expect(await response.json()).toMatchObject(prepared.receipt);
+ expect(JSON.parse(response.headers.get(CURRENT_CUSTODY_ACK_HEADER)!)).toEqual({version:1,sourceDigest:custody.sourceDigest,sourceControlVersion:"0",privacySealed:true});
+ expect((await f.seats("archived-batch")).records[0].bodyAccepted).toBe(true);
+ expect((await f.db.query("SELECT publication_state FROM sessions.ingest_batches WHERE batch_id='archived-batch'")).rows[0]!.publication_state).toBe("buffered");
+});
+
+test("archive recovery fails closed on receipt, tenant, custody or mode changes before publication",async()=>{
+ const f=await fixture(),raw=await batch([record({record_id:"archive-refuse"})],{batch_id:"archive-refuse"});
+ const prepared=await prepareDelivery(TENANT,raw),custody=await f.packet(raw);
+ const app=createIngestApp({identify:()=>({...TENANT,scopes:["rth:sync"]}),deliver:f.deps,log:()=>{}});
+ const send=(value:unknown,type=RECOVERY_CONTENT_TYPE)=>app.request("/v1/delivery/recovery",{method:"POST",headers:{"content-type":type},body:JSON.stringify(value)});
+ const base={protocol:RECOVERY_PROTOCOL,prepared,custody};
+ expect((await send({...base,prepared:{...prepared,receipt:{...prepared.receipt,receiptId:"rhr_"+"f".repeat(64)}}})).status).toBe(400);
+ expect((await send({...base,custody:{...custody,witness:{...custody.witness,batchDigest:"e".repeat(64)}}})).status).toBe(400);
+ expect((await send(base,"application/json")).status).toBe(503);
+ const canonical=createIngestApp({identify:()=>({...TENANT,scopes:["rth:sync"]}),deliver:{...f.deps,acceptanceMode:undefined},log:()=>{}});
+ expect((await canonical.request("/v1/delivery/recovery",{method:"POST",headers:{"content-type":RECOVERY_CONTENT_TYPE},body:JSON.stringify(base)})).status).toBe(503);
+ expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_batches WHERE batch_id='archive-refuse'")).rows[0]!.n).toBe(0);
+});
+
+test("fully fenced archive recovery preserves the original receipt without writing a buffered object",async()=>{
+ const f=await fixture(),raw=await batch([record({record_id:"archive-fenced"})],{batch_id:"archive-fenced"});
+ await f.control("selection",{origin_id:"origin-1",sessions:[{source:"claude",session_id:"sess-1"}],enabled:false});
+ const original=await prepareDelivery(TENANT,raw),packet=await f.packet(raw,null,"1");
+ const prepared={...original,records:[]},witness={...packet.witness,candidateCount:0,records:[]};
+ const custody=await f.sign(witness),body=JSON.stringify({protocol:RECOVERY_PROTOCOL,prepared,custody});
+ const app=createIngestApp({identify:()=>({...TENANT,scopes:["rth:sync"]}),deliver:f.deps,log:()=>{}});
+ const response=await app.request("/v1/delivery/recovery",{method:"POST",headers:{"content-type":RECOVERY_CONTENT_TYPE},body});
+ expect(response.status).toBe(200);expect(await response.json()).toMatchObject(original.receipt);
+ expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_stage_intents WHERE batch_id='archive-fenced'")).rows[0]!.n).toBe(0);
 });
 
 test("old8/B ignored1/A then erase B permits fresh1/C without reloading stale original source custody",async()=>{
