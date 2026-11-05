@@ -1,8 +1,10 @@
 -- Generated from620 owned definitions + authoritative560 originals. Stop all620/630 workers first.
 -- Operational rollback retains installed authority/object ledgers; never forget late PUT obligations.
 DO $rollback_guard$ BEGIN
- IF EXISTS(SELECT 1 FROM sessions.ingest_history_plans)OR EXISTS(SELECT 1 FROM sessions.ingest_history_reconcile_outbox)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_history_privacy_outbox)OR EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes)OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_versions)
+-- Named operational rollback: allowed while no authority was ever installed (no plans, versions,
+-- derived objects or model work). Re-derivable queues (reconcile/privacy outbox, required scopes,
+-- in-flight builds) are discarded with the schema; installed authority always blocks.
+ IF EXISTS(SELECT 1 FROM sessions.ingest_history_plans)OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_versions)
   OR EXISTS(SELECT 1 FROM sessions.ingest_history_derived_objects)OR to_regprocedure('sessions.session_history_model_claim(jsonb)')IS NOT NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: retain authority/object ledgers; stop consumers for operational rollback';END IF;
 END $rollback_guard$;
@@ -307,7 +309,10 @@ DROP FUNCTION IF EXISTS
  sessions.ingest_history_mask_rows(text,bigint,integer),
  sessions.ingest_history_mask_register(jsonb),
  sessions.ingest_history_scope_required(text,text,text,text),
+ sessions.ingest_history_reconcile_backfill(text,integer),
  sessions.ingest_history_native_changed(),
+ sessions.ingest_history_scope_managed(text,text,text,text),
+ sessions.ingest_history_active(),
  sessions.ingest_history_plan_refs_page(jsonb),
  sessions.ingest_history_plan_carriers_page(jsonb),
  sessions.ingest_history_plan_heartbeat(jsonb),
@@ -320,6 +325,7 @@ DROP FUNCTION IF EXISTS
  sessions.ingest_history_inventory_refs(jsonb),
  sessions.ingest_history_inventory_locked(jsonb),
  sessions.ingest_history_inventory_claim(jsonb),
+ sessions.ingest_history_pointer_ref_backfill(jsonb,integer),
  sessions.ingest_history_sync_pointer(),
  sessions.ingest_history_pointer(sessions.session_index),
  sessions.ingest_history_root(text);

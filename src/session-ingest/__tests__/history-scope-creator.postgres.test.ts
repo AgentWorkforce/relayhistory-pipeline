@@ -158,3 +158,44 @@ test.skipIf(!url)("erase then re-enable: the stale build refuses with no rows; a
   await installNow(s, "44444444-4444-4444-4444-444444444444");
   expect(await kinds(s.identity.orgId)).toEqual(["publish", "retire", "publish"]);
 });
+
+// Exactly the ingest_lazy_native_slots writes the production ACK makes (slot init, then winner change).
+const sha = (x: string) => createHash("sha256").update(x).digest("hex");
+async function ackOn(c: pg.PoolClient | pg.Pool, s: Awaited<ReturnType<typeof scope>>, rec: string, revision = 1) {
+  const key = sha("slot:" + s.identity.orgId + ":" + rec);
+  await c.query("INSERT INTO sessions.ingest_lazy_native_slots(key_sha256,key_material,org_id,workspace_id,origin_id,record_id,source_identity_sha256,control_epoch,initialized_witness_sha256) VALUES($1,$2::jsonb,$3,$4,'srv_origin',$5,$6,$7,$8) ON CONFLICT DO NOTHING",
+    [key, JSON.stringify(["global-native-custody-v1", s.identity.orgId, s.identity.workspaceId, "srv_origin", rec]), s.identity.orgId, s.identity.workspaceId, rec, sha("src"), sha("ctl"), sha("wit")]);
+  await c.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage+1,current_owner='u1',current_source='claude',current_session=$2,current_revision=$3,current_digest=$4,current_reset_epoch=0,current_fence_epoch=0 WHERE key_sha256=$1",
+    [key, s.identity.sessionId, revision, sha("digest:" + revision)]);
+}
+
+test.skipIf(!url)("concurrent ACKs on one managed scope both commit: the second waits for the scope lock, never 40001", async () => {
+  const s = await scope();
+  await installNow(s);
+  const version = async () => (await pool.query("SELECT coalesce(max(request_version),0)::int v FROM sessions.ingest_history_required_scopes WHERE org_id=$1", [s.identity.orgId])).rows[0].v;
+  const before = await version();
+  const c1 = await pool.connect(), c2 = await pool.connect();
+  try {
+    await c1.query("BEGIN"); await ackOn(c1, s, "k1");                      // holds the scope lock, uncommitted
+    let done = false;
+    const second = (async () => { await c2.query("BEGIN"); await ackOn(c2, s, "k2"); await c2.query("COMMIT"); done = true; })();
+    await new Promise((r) => setTimeout(r, 300));
+    expect(done).toBe(false);                                                 // waiting, not failed
+    await c1.query("COMMIT");
+    await second;
+    expect(done).toBe(true);
+  } finally { c1.release(); c2.release(); }
+  expect(await version()).toBeGreaterThan(before + 1);                      // both ACKs invalidated the scope
+});
+
+test.skipIf(!url)("an install racing an uncommitted ACK fails fast (busy) and never blocks the ACK", async () => {
+  const s = await scope();
+  await installNow(s);
+  const b = await captured(s);
+  const c1 = await pool.connect(), c2 = await pool.connect();
+  try {
+    await c1.query("BEGIN"); await ackOn(c1, s, "k1");
+    await expect(asIngest(c2, () => call(c2, "ingest_history_scope_install", installArgs(b, s, "55555555-5555-5555-5555-555555555555")))).rejects.toThrow("logical scope busy");
+    await c1.query("COMMIT");
+  } finally { c1.release(); c2.release(); }
+});

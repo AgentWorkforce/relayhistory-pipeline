@@ -117,19 +117,30 @@ BEGIN
 END $sync$;
 CREATE TRIGGER ingest_history_pointer_sync AFTER INSERT OR UPDATE OR DELETE ON sessions.session_index
  FOR EACH ROW EXECUTE FUNCTION sessions.ingest_history_sync_pointer();
--- Seed the reference index without changing stored pointers or applied epochs.
-DO $initial_refs$
-DECLARE r sessions.session_index%ROWTYPE;v_root text;v_key text;v_pointer jsonb;v_known boolean;
+-- Seed the reference index without changing stored pointers or applied epochs. NOT run by the
+-- migration (a row-by-row loop under the sync trigger would hold session_index writers): an operator
+-- pages it, resumably, in bounded batches after deploy. Returns the next cursor, NULL when done.
+CREATE FUNCTION sessions.ingest_history_pointer_ref_backfill(p_after jsonb,p_limit integer)RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $initial_refs$
+DECLARE r sessions.session_index%ROWTYPE;v_root text;v_key text;v_pointer jsonb;v_known boolean;v_last jsonb;
 BEGIN
- FOR r IN SELECT * FROM sessions.session_index WHERE manifest_key IS NOT NULL AND storage_provider IS NOT NULL AND bucket IS NOT NULL LOOP
+ IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 5000 OR(p_after IS NOT NULL AND jsonb_typeof(p_after)<>'array')THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: pointer ref backfill bound';END IF;
+ FOR r IN SELECT * FROM sessions.session_index i WHERE i.manifest_key IS NOT NULL AND i.storage_provider IS NOT NULL AND i.bucket IS NOT NULL
+   AND(p_after IS NULL OR ROW(i.org_id,i.workspace_id,i.harness,i.session_id,i.machine_id)>ROW(p_after->>0,p_after->>1,p_after->>2,p_after->>3,p_after->>4))
+   ORDER BY i.org_id,i.workspace_id,i.harness,i.session_id,i.machine_id LIMIT p_limit LOOP
   v_root:=sessions.ingest_history_root(r.manifest_key);
   v_known:=v_root IS NOT NULL;v_root:=coalesce(v_root,r.manifest_key);
   v_key:=encode(sha256(convert_to(jsonb_build_array(r.storage_provider,r.bucket,v_root)::text,'UTF8')),'hex');
   v_pointer:=sessions.ingest_history_pointer(r);
   INSERT INTO sessions.ingest_history_carriers(carrier_sha256,storage_provider,bucket,physical_root,layout_known)VALUES(v_key,r.storage_provider,r.bucket,v_root,v_known)ON CONFLICT DO NOTHING;
-  INSERT INTO sessions.ingest_history_pointer_refs VALUES(r.org_id,r.workspace_id,r.harness,r.session_id,r.machine_id,v_key,v_pointer,encode(sha256(convert_to(v_pointer::text,'UTF8')),'hex'));
+  INSERT INTO sessions.ingest_history_pointer_refs VALUES(r.org_id,r.workspace_id,r.harness,r.session_id,r.machine_id,v_key,v_pointer,encode(sha256(convert_to(v_pointer::text,'UTF8')),'hex'))
+   ON CONFLICT DO NOTHING;
+  v_last:=jsonb_build_array(r.org_id,r.workspace_id,r.harness,r.session_id,r.machine_id);
  END LOOP;
+ RETURN v_last;
 END $initial_refs$;
+REVOKE ALL ON FUNCTION sessions.ingest_history_pointer_ref_backfill(jsonb,integer)FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
 CREATE FUNCTION sessions.ingest_history_inventory_claim(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $claim$
@@ -474,37 +485,53 @@ CREATE TABLE sessions.ingest_history_reconcile_outbox(
 CREATE INDEX ingest_history_reconcile_pending ON sessions.ingest_history_reconcile_outbox(requested_at,native_key_sha256)WHERE state<>'complete';
 ALTER TABLE sessions.ingest_history_reconcile_outbox ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.ingest_history_reconcile_outbox FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+-- 620 is ACTIVE only once a scope is installed or a build is in flight. Until then (dormant) every
+-- 620 trigger on the live ACK/control/directory paths returns immediately.
+CREATE FUNCTION sessions.ingest_history_active()RETURNS boolean
+LANGUAGE plpgsql STABLE SET search_path=pg_catalog,pg_temp AS $active$
+BEGIN
+ RETURN EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_builds WHERE state IN('keys','captured'));
+END $active$;
+-- A MANAGED scope has an installed version or an in-flight build. Only managed scopes are ever
+-- invalidated or gated; every other session keeps the main (#224/legacy) behavior unchanged.
+CREATE FUNCTION sessions.ingest_history_scope_managed(p_org text,p_ws text,p_harness text,p_session text)RETURNS boolean
+LANGUAGE plpgsql STABLE SET search_path=pg_catalog,pg_temp AS $managed_scope$
+BEGIN
+ RETURN EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current c WHERE c.org_id=p_org AND c.workspace_id=p_ws AND c.harness=p_harness AND c.session_id=p_session)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_builds b WHERE b.org_id=p_org AND b.workspace_id=p_ws AND b.harness=p_harness AND b.session_id=p_session
+   AND b.state IN('keys','captured'));
+END $managed_scope$;
+REVOKE ALL ON FUNCTION sessions.ingest_history_active(),sessions.ingest_history_scope_managed(text,text,text,text)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 CREATE FUNCTION sessions.ingest_history_native_changed()RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $changed$
 DECLARE v_scope record;
 BEGIN
- IF EXISTS(SELECT 1 FROM history_new n JOIN sessions.ingest_history_reconcile_outbox o ON o.native_key_sha256=n.key_sha256
-  WHERE o.source_identity_sha256<>n.source_identity_sha256 OR o.control_epoch<>n.control_epoch)THEN
-  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: native reconcile source changed';END IF;
- IF TG_OP='INSERT'THEN
-  INSERT INTO sessions.ingest_history_reconcile_outbox(native_key_sha256,requested_lineage,source_identity_sha256,control_epoch,current_owner)
-  SELECT key_sha256,lineage,source_identity_sha256,control_epoch,current_owner FROM history_new
-  ON CONFLICT(native_key_sha256)DO UPDATE SET requested_lineage=excluded.requested_lineage,request_version=sessions.ingest_history_reconcile_outbox.request_version+1,
-   current_owner=excluded.current_owner,state='pending',lease_token=NULL,lease_until=NULL,lease_generation=NULL,requested_at=clock_timestamp(),completed_at=NULL;
- ELSE
-  INSERT INTO sessions.ingest_history_reconcile_outbox(native_key_sha256,requested_lineage,source_identity_sha256,control_epoch,prior_owner,current_owner)
-  SELECT n.key_sha256,n.lineage,n.source_identity_sha256,n.control_epoch,o.current_owner,n.current_owner FROM history_new n JOIN history_old o USING(key_sha256)
-  WHERE ROW(o.lineage,o.current_owner,o.current_source,o.current_session,o.current_revision,o.current_digest,o.current_reset_epoch,o.current_fence_epoch,o.current_seat_key,o.current_legacy_key)
-   IS DISTINCT FROM ROW(n.lineage,n.current_owner,n.current_source,n.current_session,n.current_revision,n.current_digest,n.current_reset_epoch,n.current_fence_epoch,n.current_seat_key,n.current_legacy_key)
-  ON CONFLICT(native_key_sha256)DO UPDATE SET requested_lineage=excluded.requested_lineage,request_version=sessions.ingest_history_reconcile_outbox.request_version+1,
-   prior_owner=coalesce(excluded.prior_owner,sessions.ingest_history_reconcile_outbox.prior_owner),current_owner=excluded.current_owner,
-   state='pending',lease_token=NULL,lease_until=NULL,lease_generation=NULL,requested_at=clock_timestamp(),completed_at=NULL;
- END IF;
- -- A native winner can change without any physical pointer changing. Invalidate
- -- every previously registered logical consumer in this SAME ACK/control txn.
- -- Sorted nonblocking scope locks avoid USER->scope / scope->model deadlocks.
+ -- Dormant: the production ACK (ingest_lazy_ack_batch) is untouched.
+ IF NOT sessions.ingest_history_active()THEN RETURN NULL;END IF;
+ -- Reconcile requests only for natives that touch a managed scope (its key set or its current seat).
+ -- A changed source identity re-requests the native instead of aborting the ACK.
+ INSERT INTO sessions.ingest_history_reconcile_outbox(native_key_sha256,requested_lineage,source_identity_sha256,control_epoch,current_owner)
+ SELECT n.key_sha256,n.lineage,n.source_identity_sha256,n.control_epoch,n.current_owner FROM history_new n
+  WHERE(n.current_session IS NOT NULL AND sessions.ingest_history_scope_managed(n.org_id,n.workspace_id,n.current_source,n.current_session))
+   OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_keys k WHERE k.org_id=n.org_id AND k.workspace_id=n.workspace_id AND k.record_id=n.record_id
+    AND sessions.ingest_history_scope_managed(k.org_id,k.workspace_id,k.harness,k.session_id))
+ ON CONFLICT(native_key_sha256)DO UPDATE SET requested_lineage=excluded.requested_lineage,source_identity_sha256=excluded.source_identity_sha256,
+  control_epoch=excluded.control_epoch,request_version=sessions.ingest_history_reconcile_outbox.request_version+1,
+  prior_owner=CASE WHEN sessions.ingest_history_reconcile_outbox.current_owner IS DISTINCT FROM excluded.current_owner
+   THEN sessions.ingest_history_reconcile_outbox.current_owner ELSE sessions.ingest_history_reconcile_outbox.prior_owner END,
+  current_owner=excluded.current_owner,state='pending',lease_token=NULL,lease_until=NULL,lease_generation=NULL,requested_at=clock_timestamp(),completed_at=NULL;
+ -- A native winner can change without any physical pointer changing: invalidate every MANAGED
+ -- consumer in this same ACK/control transaction, in sorted order (waits, never 40001).
  FOR v_scope IN
   SELECT z.*FROM(
    SELECT k.org_id,k.workspace_id,k.harness,k.session_id FROM history_new n JOIN sessions.ingest_history_scope_keys k
     ON k.org_id=n.org_id AND k.workspace_id=n.workspace_id AND k.record_id=n.record_id
    UNION SELECT n.org_id,n.workspace_id,n.current_source,n.current_session FROM history_new n
     WHERE n.current_owner IS NOT NULL AND n.current_session IS NOT NULL
-  )z ORDER BY z.org_id COLLATE"C",z.workspace_id COLLATE"C",z.harness COLLATE"C",z.session_id COLLATE"C"
+  )z WHERE sessions.ingest_history_scope_managed(z.org_id,z.workspace_id,z.harness,z.session_id)
+  ORDER BY z.org_id COLLATE"C",z.workspace_id COLLATE"C",z.harness COLLATE"C",z.session_id COLLATE"C"
  LOOP
   PERFORM sessions.ingest_history_invalidate_scope(v_scope.org_id,v_scope.workspace_id,v_scope.harness,v_scope.session_id);
  END LOOP;
@@ -514,7 +541,8 @@ BEGIN
     FROM history_old o JOIN history_new n USING(key_sha256)WHERE o.current_owner IS NOT NULL AND o.current_session IS NOT NULL
      AND ROW(o.current_owner,o.current_source,o.current_session,o.current_revision,o.current_digest,o.lineage)
       IS DISTINCT FROM ROW(n.current_owner,n.current_source,n.current_session,n.current_revision,n.current_digest,n.lineage)
-  )z ORDER BY z.org_id COLLATE"C",z.workspace_id COLLATE"C",z.harness COLLATE"C",z.session_id COLLATE"C"
+  )z WHERE sessions.ingest_history_scope_managed(z.org_id,z.workspace_id,z.harness,z.session_id)
+  ORDER BY z.org_id COLLATE"C",z.workspace_id COLLATE"C",z.harness COLLATE"C",z.session_id COLLATE"C"
   LOOP PERFORM sessions.ingest_history_invalidate_scope(v_scope.org_id,v_scope.workspace_id,v_scope.harness,v_scope.session_id);END LOOP;
  END IF;
  RETURN NULL;
@@ -525,10 +553,22 @@ CREATE TRIGGER ingest_history_native_insert AFTER INSERT ON sessions.ingest_lazy
  REFERENCING NEW TABLE AS history_new FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_history_native_changed();
 CREATE TRIGGER ingest_history_native_update AFTER UPDATE ON sessions.ingest_lazy_native_slots
  REFERENCING OLD TABLE AS history_old NEW TABLE AS history_new FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_history_native_changed();
--- Install AFTER initial-buffer operation without losing controls that occurred
--- while620 was dormant/uninstalled. Cleared slots are deliberately included.
-INSERT INTO sessions.ingest_history_reconcile_outbox(native_key_sha256,requested_lineage,source_identity_sha256,control_epoch,current_owner)
- SELECT key_sha256,lineage,source_identity_sha256,control_epoch,current_owner FROM sessions.ingest_lazy_native_slots;
+-- Reconcile requests for slots written while 620 was dormant (cleared slots included) are NOT
+-- prefilled by the migration: an operator enqueues them, resumably and in bounded pages, when a
+-- legacy reconcile is scheduled. Returns the next cursor, NULL when done.
+CREATE FUNCTION sessions.ingest_history_reconcile_backfill(p_after text,p_limit integer)RETURNS text
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $reconcile_backfill$
+DECLARE v_last text;
+BEGIN
+ IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 10000 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: reconcile backfill bound';END IF;
+ WITH page AS(SELECT key_sha256,lineage,source_identity_sha256,control_epoch,current_owner FROM sessions.ingest_lazy_native_slots
+   WHERE p_after IS NULL OR key_sha256>p_after ORDER BY key_sha256 LIMIT p_limit),
+  ins AS(INSERT INTO sessions.ingest_history_reconcile_outbox(native_key_sha256,requested_lineage,source_identity_sha256,control_epoch,current_owner)
+   SELECT * FROM page ON CONFLICT DO NOTHING)
+ SELECT max(key_sha256)INTO v_last FROM page;
+ RETURN v_last;
+END $reconcile_backfill$;
+REVOKE ALL ON FUNCTION sessions.ingest_history_reconcile_backfill(text,integer)FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 REVOKE ALL ON FUNCTION sessions.ingest_history_native_changed()
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
@@ -1069,12 +1109,14 @@ REVOKE ALL ON sessions.ingest_history_scope_owners,sessions.ingest_history_priva
 CREATE FUNCTION sessions.ingest_history_invalidate_scope(p_org text,p_ws text,p_harness text,p_session text)RETURNS void
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $invalidate$
 BEGIN
- IF NOT pg_try_advisory_xact_lock(hashtextextended(concat_ws(chr(31),'96bulls:directory-events',p_org,p_ws,p_harness,p_session),0))THEN
-  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='history: logical scope busy';END IF;
+ -- Waits (bounded by the install's short critical section): every other holder of this key only
+ -- try-locks it, and the ACK path takes scope locks in sorted order, so this cannot deadlock.
+ PERFORM pg_advisory_xact_lock(hashtextextended(concat_ws(chr(31),'96bulls:directory-events',p_org,p_ws,p_harness,p_session),0));
  INSERT INTO sessions.ingest_history_required_scopes AS r(org_id,workspace_id,harness,session_id)VALUES(p_org,p_ws,p_harness,p_session)
   ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET request_version=r.request_version+1,requested_at=clock_timestamp();
  UPDATE sessions.ingest_history_scope_current SET ready=false WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_harness AND session_id=p_session;
- UPDATE sessions.session_directory SET state='unknown',short_summary=NULL,event_projection_ready=false,work_status=NULL,work_status_at=NULL WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_harness AND session_id=p_session AND(state<>'unknown'OR short_summary IS NOT NULL OR event_projection_ready OR work_status IS NOT NULL);
+ UPDATE sessions.session_directory SET state='unknown',short_summary=NULL,short_summary_scrub_ruleset=NULL,short_summary_scrub_version=NULL,
+  short_summary_source=NULL,short_summary_generated_at=NULL,event_projection_ready=false,work_status=NULL,work_status_at=NULL WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_harness AND session_id=p_session AND(state<>'unknown'OR short_summary IS NOT NULL OR event_projection_ready OR work_status IS NOT NULL);
  INSERT INTO sessions.session_replay_publications AS a(org_id,workspace_id,harness,session_id)VALUES(p_org,p_ws,p_harness,p_session)
   ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET epoch=nextval('sessions.session_replay_epoch_seq');
  UPDATE sessions.ingest_history_derived_objects o SET cleanup_state='retired',row_version=row_version+1 FROM sessions.ingest_history_scope_versions v
@@ -1084,14 +1126,17 @@ CREATE FUNCTION sessions.ingest_history_control_changed()RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $privacy$
 DECLARE r record;
 BEGIN
+ IF NOT sessions.ingest_history_active()THEN RETURN NULL;END IF;
  FOR r IN SELECT z.*FROM(
   SELECT DISTINCT o.org_id,o.workspace_id,o.harness,o.session_id FROM history_controls n JOIN sessions.ingest_history_scope_owners o
    ON o.org_id=n.org_id AND o.workspace_id=n.workspace_id AND o.user_id=n.user_id
-   WHERE n.epoch<>o.control_epoch OR n.version>o.control_version
+   WHERE(n.epoch<>o.control_epoch OR n.version>o.control_version)AND sessions.ingest_history_scope_managed(o.org_id,o.workspace_id,o.harness,o.session_id)
  )z ORDER BY z.org_id COLLATE"C",z.workspace_id COLLATE"C",z.harness COLLATE"C",z.session_id COLLATE"C"
  LOOP PERFORM sessions.ingest_history_invalidate_scope(r.org_id,r.workspace_id,r.harness,r.session_id);END LOOP;
  INSERT INTO sessions.ingest_history_privacy_outbox(org_id,workspace_id,user_id,control_epoch,control_version)
-  SELECT DISTINCT ON(org_id,workspace_id,user_id)org_id,workspace_id,user_id,epoch,version FROM history_controls ORDER BY org_id,workspace_id,user_id,version DESC
+  SELECT DISTINCT ON(c.org_id,c.workspace_id,c.user_id)c.org_id,c.workspace_id,c.user_id,c.epoch,c.version FROM history_controls c
+   WHERE EXISTS(SELECT 1 FROM sessions.ingest_history_scope_owners o WHERE o.org_id=c.org_id AND o.workspace_id=c.workspace_id AND o.user_id=c.user_id)
+   ORDER BY c.org_id,c.workspace_id,c.user_id,c.version DESC
  ON CONFLICT(org_id,workspace_id,user_id)DO UPDATE SET control_epoch=excluded.control_epoch,control_version=excluded.control_version,
   request_version=sessions.ingest_history_privacy_outbox.request_version+1,state='pending',lease_token=NULL,lease_until=NULL,lease_generation=NULL,requested_at=clock_timestamp(),completed_at=NULL;
  RETURN NULL;
@@ -1134,7 +1179,9 @@ BEGIN
  --171 callers cannot attest a logical mask. Until610 publishes an exact
  -- source-bound feature receipt, even a late physical repair stays unready.
  NEW.event_projection_ready:=false;NEW.work_status:=NULL;NEW.work_status_at:=NULL;
- NEW.short_summary:=NULL;NEW.state:=coalesce(assigned,'unknown');RETURN NEW;
+ NEW.short_summary:=NULL;NEW.short_summary_scrub_ruleset:=NULL;NEW.short_summary_scrub_version:=NULL;
+ NEW.short_summary_source:=NULL;NEW.short_summary_generated_at:=NULL;
+ NEW.state:=coalesce(assigned,'unknown');RETURN NEW;
 END $directory_state$;
 CREATE TRIGGER ingest_history_directory_state BEFORE INSERT OR UPDATE ON sessions.session_directory
  FOR EACH ROW EXECUTE FUNCTION sessions.ingest_history_directory_state();

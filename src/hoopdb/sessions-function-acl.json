@@ -194,6 +194,9 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_history_active()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_history_control_changed()": [
       "<owner>:EXECUTE"
     ],
@@ -268,6 +271,12 @@
     "sessions.ingest_history_pointer(sessions.session_index)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_history_pointer_ref_backfill(jsonb,integer)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_reconcile_backfill(text,integer)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_history_require_model_permit(jsonb)": [
       "<owner>:EXECUTE"
     ],
@@ -292,6 +301,9 @@
     "sessions.ingest_history_scope_install(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_scope_managed(text,text,text,text)": [
+      "<owner>:EXECUTE"
     ],
     "sessions.ingest_history_scope_pointer_page(uuid,integer,integer)": [
       "<owner>:EXECUTE",
