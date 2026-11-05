@@ -92,6 +92,22 @@ jobs:
           subject-name: ghcr.io/agentworkforce/96bulls-services
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+      # GitHub provenance identifies the workflow commit. Also bind the actual
+      # reviewed checkout when publication deliberately uses an older source.
+      - name: Attest reviewed image source
+        uses: actions/attest@ce27ba3b4a9a139d9a20a4a07d69fabb52f1e5bc # v2.4.0
+        with:
+          subject-name: ghcr.io/agentworkforce/96bulls-services
+          subject-digest: ${{ steps.build.outputs.digest }}
+          predicate-type: https://agentrelay.com/attestations/reviewed-image-source/v1
+          predicate: >-
+            {
+              "repository": "${{ github.server_url }}/${{ github.repository }}",
+              "source_sha": "${{ steps.source.outputs.sha }}",
+              "workflow_sha": "${{ github.sha }}",
+              "source_ref": "refs/heads/main"
+            }
+          push-to-registry: true
       - name: Digest
         run: |
           echo "ghcr.io/agentworkforce/96bulls-services@${{ steps.build.outputs.digest }}" | tee -a "$GITHUB_STEP_SUMMARY"
