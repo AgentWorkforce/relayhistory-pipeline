@@ -95,9 +95,10 @@ export class CanonicalConsumerRunner {
 
   /**
    * Bounded single-flight poll loop: refuses a concurrent run; abortable
-   * sleep; an abort signal is propagated into drain; the deadline bounds the
-   * whole run (each drain/copy op carries its own per-write timeout below
-   * the lease TTL, so a hung op cannot outlive ownership).
+   * sleep; the deadline+abort is COOPERATIVE — the signal is propagated
+   * in-band to drain/cycle/CH/PG, so a truly-stuck await (a hung query that
+   * never observes the signal) is not force-killed from the client, though
+   * the consumer's own per-write timeout bounds each copy op.
    */
   async run(signal?: AbortSignal): Promise<RuntimeHealth> {
     if (this.cfg.enabled !== true) return this.health();
@@ -105,6 +106,9 @@ export class CanonicalConsumerRunner {
     this.running = true;
     try {
       const deadline = Date.now() + this.cfg.deadlineMs;
+      // One consumer = one fenced owner for the WHOLE run — per-drain
+      // creation would re-race the lease every poll.
+      const consumer = this.makeConsumer();
       while (!this.stopped && !signal?.aborted && Date.now() < deadline) {
         try {
           // Remaining budget bounds THIS drain: external abort OR the run
@@ -115,7 +119,7 @@ export class CanonicalConsumerRunner {
                 [signal ?? new AbortController().signal,
                  AbortSignal.timeout(remaining)])
             : signal;
-          const r = await this.makeConsumer().drain(
+          const r = await consumer.drain(
             this.images, this.ch, bounded);
           this.stats = { ...this.stats, runs: this.stats.runs + 1,
             copied: this.stats.copied + r.copied,

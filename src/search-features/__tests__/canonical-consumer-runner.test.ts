@@ -109,3 +109,23 @@ describe("canonical consumer runner — deadline + fencing evidence", () => {
     expect(r.health().enabled).toBe(true);
   });
 });
+
+describe("canonical consumer runner — cooperative deadline proof", () => {
+  test("deadline aborts an observing drain within the bound", async () => {
+    const observing = { drain: async (_i: unknown, _c: unknown,
+        sig?: AbortSignal) => {
+      // A drain that observes the signal: abort resolves immediately.
+      await new Promise<void>((r) => {
+        sig?.addEventListener("abort", r, { once: true });
+        setTimeout(r, 60000);   // would hang without the signal
+      });
+      return { ...empty, status: "aborted" };
+    } };
+    const r = new CanonicalConsumerRunner(observing as never,
+      images as never, ch as never,
+      { ...CFG, pollIntervalMs: 50, deadlineMs: 200 });
+    const t0 = Date.now();
+    await r.run();
+    expect(Date.now() - t0).toBeLessThan(500);   // bounded, not 60s
+  });
+});
