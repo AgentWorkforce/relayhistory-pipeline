@@ -26,18 +26,19 @@ session's S3 stream, through the normal buffered path.
 | Mode | Neon | Ingest | Response | Reads |
 |---|---|---|---|---|
 | `neon` (default) | write | none | Neon's | Neon |
-| `dual` | write, authoritative | background (`waitUntil`) forward of the same rows, outcome logged as `turns forward`; skipped when Neon stored fewer rows than sent (its erasure fence dropped some) | Neon's, unchanged | Neon |
-| `forward` | none | required; one batch per ≤500 rows | 200 only after every batch's durable receipt, else 503 `turns_unavailable` | Neon (stale!) |
+| `dual` | write, authoritative | background (`waitUntil`) forward of what Neon holds after the write committed (read back by key: commit order, Neon's ids; fenced or erased keys never copied); a re-read after the ack logs `erased_during_forward` | Neon's, unchanged | Neon |
+| `forward` | none; reads Neon's erasure fence and drops what `accept_conversation_turns` would | required; one batch per ≤500 rows | 200 only after every batch's durable receipt (batch id, every revision id), else 503 `turns_unavailable`; refuses (`turn_fence_unavailable`) without a readable fence | Neon (stale!) |
 
 Under relayhistory custody (`DELIVERY_CUSTODY_SOURCE_MODE` unset), the forward still READS Neon (custody witness, cutover state), like a delivery batch. Only `frozen-supabase` takes Neon off it entirely.
 
 ## Activation gates
 `dual` can be turned on now (it changes no answer). `forward` must not be turned on until all of these are true:
 1. **Read-your-writes.** The SessionClient reads its write back from `GET /v1/sessions/:id/turns` immediately and retries into the next index when it is missing. That GET reads Neon today, so in `forward` mode every `writeTurn` fails (test: "forward: documents the activation gate"). Needs the read side (turns from S3 in the read Worker) AND a read path that sees buffered, not-yet-published stages, or a SessionClient change that tolerates eventual consistency.
-2. **Erasure fence parity.** Neon drops turns for sessions in `conversation_turn_fences` (any member's erasure). The ingest's deletion fences are per origin, so the synthetic origin is not covered. Needs a cross-origin session fence check on the turns route (a Supabase function; migration slot 20261105030000 is reserved for it) or proof the fences are empty for the canary orgs.
+2. **Erasure fence off Neon.** Neon drops turns for sessions in `conversation_turn_fences` (any member's erasure). relayhistory's `forward` reads that fence from Neon today, and refuses under frozen-supabase custody. The ingest's own deletion fences are per origin, so the synthetic origin is not covered. Removing the Neon read needs the fences copied to Supabase plus a cross-origin session fence check on this route (a Supabase function; migration slot 20261105030000 is reserved for it).
 3. **Custody.** `forward` with relayhistory custody still reads Neon; flip `frozen-supabase` first (docs/p1-frozen-source-custody.md).
-4. **Publication.** Records reach canonical images and directory pointers only when the publication drain runs. A turn-only relay session (the SessionClient's random UUID) then gets a `session_index` row and would appear in the directory list (Neon never listed them). The list must exclude turn-only images before publication is enabled for orgs using turns.
-5. **Backfill.** Historical rows come from the legacy export (`legacy_conversation_turn`, PR 2). Read-side merge rule: per (workspace, source, session, turn_index) a live `conversation_turn` wins over a legacy row. Once `dual` is on, never go back to `neon` without re-running the export for the affected sessions.
+4. **Erasure during a forward.** A `turns forward` line with `erased_during_forward: true` names a session whose copy reached the buffered stage after its erasure committed. Purge those copies before publication is enabled.
+5. **Publication.** Records reach canonical images and directory pointers only when the publication drain runs. A turn-only relay session (the SessionClient's random UUID) then gets a `session_index` row and would appear in the directory list (Neon never listed them). The list must exclude turn-only images before publication is enabled for orgs using turns.
+6. **Backfill.** Historical rows come from the legacy export (`legacy_conversation_turn`, PR 2). Read-side merge rule: per (workspace, source, session, turn_index) a live `conversation_turn` wins over a legacy row. Once `dual` is on, never go back to `neon` without re-running the export for the affected sessions.
 
 ## Rollback
 Unset `TURNS_WRITE_PATH` (live in seconds). Records already forwarded stay in the buffered stage and are inert until publication; Neon stays complete in `dual`.
