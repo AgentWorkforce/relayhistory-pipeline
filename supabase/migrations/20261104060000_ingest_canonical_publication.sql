@@ -180,7 +180,7 @@ CREATE FUNCTION sessions.ingest_publication_claim(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $claim$
 DECLARE s sessions.ingest_stage_intents%ROWTYPE;a sessions.ingest_claim_attempts%ROWTYPE;o sessions.ingest_buffer_outbox%ROWTYPE;
  f sessions.ingest_publication_frontiers%ROWTYPE;h sessions.ingest_publication_heads%ROWTYPE;g record;r record;
- v_org text;v_ws text;v_user text;v_keyroot text;v_snapshot jsonb;v_accepted jsonb;v_heads jsonb:='[]';v_ordinals jsonb;
+ v_org text;v_ws text;v_user text;v_keyroot text;v_snapshot jsonb;v_accepted jsonb;v_seats jsonb;v_heads jsonb:='[]';v_ordinals jsonb;
  v_attempt uuid:=gen_random_uuid();v_lease uuid:=gen_random_uuid();v_gen uuid;v_source text;v_session text;v_fence bigint;
  v_physws text;v_physsource text;v_physsession text;v_machine text;v_base jsonb;v_revision bigint;v_prefix text;v_pairs jsonb;
 BEGIN
@@ -215,15 +215,21 @@ BEGIN
  THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: stage needs privacy GC';END IF;
  SELECT * INTO STRICT a FROM sessions.ingest_claim_attempts WHERE claim_token=s.claim_token;
  v_snapshot:=sessions.ingest_publication_revision_snapshot(s.stage_token);
+ -- First durable ACK owns both the canonical order and the body decision.
+ -- Losing equal-revision aliases remain auditable in the seat snapshot but
+ -- can never enter an image, create a head, or poison a publication lease.
+ v_seats:=sessions.ingest_receipt_seats_for_stage(s.stage_token);
  IF EXISTS(SELECT 1 FROM jsonb_array_elements(a.records)x JOIN jsonb_array_elements(v_snapshot)q ON q->>'recordId'=x->>'record_id'
   WHERE (x->>'revision')::bigint>coalesce((q#>>'{stored,revision}')::bigint,0) AND q->'stored'<>'null'::jsonb
    AND (x->>'ord')::int IN(SELECT(y::text)::int FROM jsonb_array_elements(s.group_ordinals)gg CROSS JOIN LATERAL jsonb_array_elements(gg)y)
+   AND (x->>'ord')::int IN(SELECT(z->>'ord')::int FROM jsonb_array_elements(v_seats->'records')z WHERE (z->>'bodyAccepted')::boolean)
    AND NOT(x->>'session_id' IS NULL AND q#>>'{stored,session_id}' IS NULL)
    AND ROW(x->>'source',x->>'session_id') IS DISTINCT FROM ROW(q#>>'{stored,source}',q#>>'{stored,session_id}'))
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='publication: cross-scope record move requires reconciliation';END IF;
  SELECT coalesce(jsonb_agg((x->>'ord')::int ORDER BY (x->>'ord')::int),'[]') INTO v_accepted
  FROM jsonb_array_elements(a.records)x JOIN jsonb_array_elements(v_snapshot)q ON q->>'recordId'=x->>'record_id'
  WHERE (x->>'ord')::int IN(SELECT (y::text)::int FROM jsonb_array_elements(s.group_ordinals)gg CROSS JOIN LATERAL jsonb_array_elements(gg)y)
+  AND (x->>'ord')::int IN(SELECT(z->>'ord')::int FROM jsonb_array_elements(v_seats->'records')z WHERE (z->>'bodyAccepted')::boolean)
   AND (x->>'revision')::bigint>coalesce((q#>>'{stored,revision}')::bigint,0);
  -- Repeat the legacy in-batch first-peer conflict predicate on the complete
  -- newly admitted set; no publication can make an invalid subset canonical.
@@ -316,7 +322,7 @@ BEGIN
   'tenant',jsonb_build_object('orgId',s.org_id,'workspaceId',s.workspace_id,'userId',s.user_id),
   'originId',s.origin_id,'batchId',s.batch_id,'batchDigest',s.digest,'claimToken',s.claim_token,
   'stage',jsonb_build_object('key',s.stage_key,'sha256',s.stage_sha256,'bytes',s.stage_bytes,'groupOrdinals',s.group_ordinals),
-  'records',a.records,'acceptedOrdinals',v_accepted,'heads',v_heads);
+  'records',a.records,'acceptedOrdinals',v_accepted,'receiptSeats',v_seats,'heads',v_heads);
 END $claim$;
 
 CREATE FUNCTION sessions.ingest_publication_heartbeat(p jsonb) RETURNS jsonb

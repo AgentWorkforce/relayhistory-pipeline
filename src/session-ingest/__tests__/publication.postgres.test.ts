@@ -4,14 +4,16 @@ import pg from "pg";
 import {hoopDbSessionIndex}from "../../hoopdb/index.ts";
 import {inTransaction,type HoopDb}from "../../shared/db.ts";
 import {indexPointer,droppedFanout}from "../../session-pipeline/pointer.ts";
-import {objectStoreManifestReader,prefixOrgResolver,readAll,objectKey}from "../../shared/vendor.ts";
+import {objectStoreManifestReader,prefixOrgResolver,readAll,objectKey,parseSessionKey,rawChunkKey}from "../../shared/vendor.ts";
 import {readFileSync,readdirSync,mkdtempSync,rmSync} from "node:fs";
 import {join} from "node:path";
 import {tmpdir} from "node:os";
+import {zstdDecompressSync}from "node:zlib";
 import {createFsStore} from "../../../packages/object-store/src/fs.ts";
 import {sqlLedger} from "../ledger-sql.ts";
 import {deliverBatch} from "../deliver.ts";
 import {batch,record,TENANT} from "./support.ts";
+import {orderedFixtureLedger,initializeFixtureSeatClock}from "./ordered-support.ts";
 import {publicationRpc} from "../publication-rpc.ts";
 import {canonicalPublicationTick,publishBufferedStage} from "../publication-job.ts";
 import {layoutComponent} from "../../shared/layout-component.ts";
@@ -28,15 +30,16 @@ async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"}
  const pool=new pg.Pool({connectionString:u.href});const dir=mkdtempSync(join(tmpdir(),"publisher-"));
  clean.push(async()=>{await pool.end();await admin.query("DROP DATABASE "+name);await admin.end();rmSync(dir,{recursive:true,force:true});});
  await pool.query(read("supabase/tests/supabase_shim.sql"));await pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");
- for(const f of["session_directory_search_worker.sql","session_token_verifier.sql","session_ingest_roles.sql"])await pool.query(read("supabase/bootstrap/"+f));
+ for(const f of["session_directory_search_worker.sql","session_token_verifier.sql","session_ingest_roles.sql","session_history_model_worker.sql"])await pool.query(read("supabase/bootstrap/"+f));
  for(const f of readdirSync(join(root,"supabase/migrations")).sort())await pool.query(read("supabase/migrations/"+f));
  for(const f of readdirSync(join(root,"src/hoopdb/migrations")).sort())await pool.query(read("src/hoopdb/migrations/"+f));
  await pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now())");
  await pool.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status)VALUES('session_directory_search_worker',$1,'pass')",[GEN]);
- await pool.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,valid_until,schema_generation)VALUES($1,$2,$2,clock_timestamp()+interval'1 hour',$3)",[TENANT.orgId,"a".repeat(64),GEN]);
+ await pool.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until,control_epoch)VALUES($1,$2,$2,$3,clock_timestamp()+interval'1 hour',repeat('3',64))",[TENANT.orgId,"a".repeat(64),GEN]);
+ await initializeFixtureSeatClock(pool,GEN);
  if(frontier)await pool.query("INSERT INTO sessions.ingest_publication_frontiers VALUES($1,$2,$3,'origin-1',$4,$4,clock_timestamp()+interval'1 hour','synthetic','us-east-1','96bulls',$5)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,"b".repeat(64),GEN]);
  const run=async(t:string,p:unknown[])=>{const c=await pool.connect();try{await c.query("SET ROLE bulls96_session_ingest");return await c.query(t,p);}finally{await c.query("RESET ROLE");c.release();}};
- const ledger=sqlLedger(run,{acceptanceMode:"buffered",expectedGeneration:GEN});
+ const ledger=orderedFixtureLedger(sqlLedger(run,{acceptanceMode:"buffered",expectedGeneration:GEN}),pool);
  const store=createFsStore({root:dir}) as unknown as ObjectStore;
  await deliverBatch({ledger,target:{store,keyRoot:"96bulls"},acceptanceMode:"buffered"},TENANT,await batch(initialRecords));
  const stage=(await pool.query("SELECT active_stage_token token FROM sessions.ingest_buffer_outbox")).rows[0].token as string;
@@ -65,6 +68,9 @@ describe.skipIf(!url)("background publisher actual PostgreSQL admission",()=>{
   await d.pool.query("INSERT INTO sessions.ingest_seed_fence_baselines(org_id,workspace_id,user_id,fingerprint)VALUES($1,$2,$3,$4)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,"c".repeat(64)]);
   const ticket=await d.claim();
   expect(ticket.acceptedOrdinals).toEqual([0]);expect(ticket.heads).toHaveLength(1);
+  expect(ticket.receiptSeats.records).toHaveLength(1);
+  expect(ticket.receiptSeats.records[0]).toMatchObject({ord:0,bodyAccepted:true,candidateDigest:ticket.records[0].digest});
+  expect(ticket.receiptSeats.records[0].seat).toMatch(/^[1-9][0-9]*$/);
   expect(ticket.heads[0].prefix).toContain("/upload-generations/g=");expect(ticket.heads[0].revision).toBe("1");
   expect((await d.pool.query("SELECT publication_state FROM sessions.ingest_batches")).rows[0].publication_state).toBe("canonical");
   expect((await d.pool.query("SELECT closed_at IS NOT NULL yes FROM sessions.ingest_seed_fence_baselines")).rows[0].yes).toBe(true);
@@ -74,6 +80,16 @@ describe.skipIf(!url)("background publisher actual PostgreSQL admission",()=>{
  test("strict maxima refilter can drop every stale ordinal without creating an empty image",async()=>{
   const d=await fixture();await d.pool.query("INSERT INTO sessions.ingest_record_revisions(org_id,workspace_id,origin_id,record_id,revision,revision_id,digest,user_id,source,session_id)VALUES($1,$2,'origin-1','new-r1',7,'known-r7',$3,$4,'claude','sess-1')",[TENANT.orgId,TENANT.workspaceId,"d".repeat(64),TENANT.userId]);
   const ticket=await d.claim();expect(ticket.acceptedOrdinals).toEqual([]);expect(ticket.heads).toEqual([]);
+ },15000);
+ test("a later equal-revision first-ACK loser is excluded before heads or a host ticket can be poisoned",async()=>{
+  const winner=record({record_id:"shared-native",session_id:"session-A",payload:{text:"first body",ts_ms:1761955200000}});
+  const d=await fixture(true,[winner]);
+  const loser=record({record_id:"shared-native",source:"codex",session_id:"session-B",payload:{text:"later body",ts_ms:1761955200000}});
+  await deliverBatch({ledger:d.ledger,target:{store:d.store,keyRoot:"96bulls"},acceptanceMode:"buffered"},TENANT,await batch([loser],{batch_id:"losing-batch"}));
+  const stage=(await d.pool.query("SELECT active_stage_token token FROM sessions.ingest_buffer_outbox WHERE batch_id='losing-batch'")).rows[0].token;
+  const ticket=await d.call("ingest_publication_claim",{stageToken:stage,keyRoot:"96bulls",bucket:"synthetic",region:"us-east-1"});
+  expect(ticket.receiptSeats.records[0].bodyAccepted).toBe(false);
+  expect(ticket.acceptedOrdinals).toEqual([]);expect(ticket.heads).toEqual([]);
  },15000);
  test("changed source frontier or original privacy epoch refuses a borrowed heartbeat",async()=>{
   const d=await fixture();const t=await d.claim();
@@ -120,6 +136,11 @@ describe.skipIf(!url)("background publisher actual PostgreSQL admission",()=>{
   expect((await d.pool.query("SELECT count(*)::int n FROM sessions.pipeline_jobs WHERE stage='object-landed'")).rows[0].n).toBe(1);
   const p=(await d.pool.query("SELECT *FROM sessions.session_index")).rows[0];expect(p.manifest_key).toContain("/publications/");
   expect((await d.store.head(p.manifest_key)).size).toBeGreaterThan(0);
+  const manifest=(await objectStoreManifestReader(d.store,{provider:"s3",bucket:"synthetic"}).read(p.manifest_key))!.manifest;
+  const location=parseSessionKey(p.manifest_key)!;const chunk=manifest.raw.chunks.at(-1)!;
+  const stored=await readAll(await d.store.get(rawChunkKey(location,chunk.seq,chunk.start_offset,chunk.sha256,"ndjson")));
+  const published=JSON.parse(new TextDecoder().decode(zstdDecompressSync(stored)).trim());
+  expect(published.accepted_seq).toBe((await d.pool.query("SELECT s.seat::text FROM sessions.ingest_receipt_ord_seats o JOIN sessions.ingest_receipt_seats s ON s.key_sha256=o.key_sha256")).rows[0].seat);
   expect((await d.pool.query("SELECT state,active_stage_token FROM sessions.ingest_buffer_outbox")).rows[0]).toMatchObject({state:"erased",active_stage_token:null});
   expect((await d.pool.query("SELECT cleanup_state FROM sessions.ingest_stage_intents")).rows[0].cleanup_state).toBe("retired");
   expect((await d.pool.query("SELECT state FROM sessions.ingest_publication_attempts")).rows[0].state).toBe("published");
