@@ -47,6 +47,7 @@ import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
 import { briefTick } from "../session-brief/worker.ts";
+import{derivedSchemaAssets}from "./derived-schema.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
@@ -168,6 +169,7 @@ let runtime: Promise<Runtime> | undefined;
 
 async function init(): Promise<Runtime> {
   const env = lambdaEnv();
+  const publicationSchema=await derivedSchemaAssets();
   const { SecretString } = await awsJsonCall<{ SecretString?: string }>({
     service: "secretsmanager",
     target: "secretsmanager.GetSecretValue",
@@ -197,6 +199,9 @@ async function init(): Promise<Runtime> {
       orgs: prefixOrgResolver,
       allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
       fanout,
+      publication:{schemaGeneration:publicationSchema.expected.generation,transact:work=>transaction(db,async tx=>{
+        await tx.query("SET LOCAL statement_timeout='5s';SET LOCAL lock_timeout='1s'");return work(tx);
+      })},
     },
     requeue: async (manifestKey) => {
       await awsJsonCall({
