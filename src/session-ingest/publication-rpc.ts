@@ -2,6 +2,7 @@
  * Its pool/transport owns cancellation and SET LOCAL deadlines, never role settings.
  * Reuses the exact bounded PostgreSQL executor from191 recovery73c50a7.
  */
+import {parseReceiptSeatSnapshot,acceptedReceiptSeat}from "./publication-seats.ts";
 import {assertBufferedSpec}from "./buffered-gc.ts";
 import type {SemanticBoundedSql} from "../search-features/semantic-copy-postgres.ts";
 import type {PublicationRpc,PublicationTarget,PublicationTicket} from "./publication-protocol.ts";
@@ -26,9 +27,14 @@ function ticket(v:any,target:PublicationTarget):PublicationTicket{
    h.ordinals.some((i:any)=>!v.acceptedOrdinals.includes(i))||typeof h.revision!=="string"||!/^[1-9][0-9]*$/.test(h.revision)||
    !Number.isSafeInteger(Number(h.revision)))throw bad();
  }
+ let receiptSeats;
+ try{
+  receiptSeats=parseReceiptSeatSnapshot(v.receiptSeats,v.records,v.stage);
+  for(const h of v.heads)for(const ord of h.ordinals)acceptedReceiptSeat(receiptSeats,ord,{resetEpoch:h.resetEpoch,fenceEpoch:h.fenceEpoch});
+ }catch{throw bad();}
  const covered=v.heads.flatMap((h:any)=>h.ordinals).sort((a:number,b:number)=>a-b);
  if(JSON.stringify(covered)!==JSON.stringify(v.acceptedOrdinals))throw bad();
- return v;
+ return {...v,receiptSeats};
 }
 export function publicationRpc(db:SemanticBoundedSql,target:PublicationTarget,options:{now?:()=>number;queryTimeoutMs?:number}={}):PublicationRpc{
  if(!HEX.test(target.generation)||!target.bucket||!target.region||!target.keyRoot)throw bad();

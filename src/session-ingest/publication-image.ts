@@ -10,6 +10,7 @@ import {sealRawChunk} from "../../packages/pipeline/src/lib/pipeline/raw-chunks.
 import {readCapped,buildObjectLandedMessage} from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
 import {canonicalManifestIdentity,manifestUserId} from "../shared/manifest-identity.ts";
 import {nextManifest,lineTimeMs,admittedIdentity,LIVE_OWNER,derivedUuidV7} from "./writer.ts";
+import {acceptedReceiptSeat,injectReceiptSeat}from "./publication-seats.ts";
 import {fitLine} from "./oversize.ts";
 import type {PublicationHead,PublicationTicket,PublicationRpc,PublicationImageSpec,PublicationObjectSpec,PublicationTarget} from "./publication-protocol.ts";
 import type {DecodedBufferedStage} from "./staging.ts";
@@ -90,7 +91,11 @@ export async function preparePublicationImage(
  if(header.org_id!==ticket.tenant.orgId||header.workspace_id!==ticket.tenant.workspaceId||header.user_id!==ticket.tenant.userId||
   header.origin_id!==ticket.originId||header.claim_token!==ticket.claimToken||header.batch_digest!==ticket.batchDigest||
   !group||group.source!==head.source||group.sessionId!==head.sessionId||!ordinals)throw refused("publication_stage_identity_mismatch");
- const selected=new Set(head.ordinals),lines=group.lines.filter((_line,i)=>selected.has(ordinals[i]!)).map(fitLine);
+ const selected=new Set(head.ordinals),lines=group.lines.flatMap((line,i)=>{
+  const ord=ordinals[i]!;if(!selected.has(ord))return [];
+  const slot=acceptedReceiptSeat(ticket.receiptSeats,ord,{resetEpoch:head.resetEpoch,fenceEpoch:head.fenceEpoch});
+  return [injectReceiptSeat(fitLine(line),slot,ticket.originId)];
+ });
  if(lines.length!==head.ordinals.length)throw refused("publication_stage_ordinals_mismatch");
  const previous=await readPrevious(ticket,head,target,store,signal),prev=previous?.manifest??null;
  const received=new Date(header.received_at);

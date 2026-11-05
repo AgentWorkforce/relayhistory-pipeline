@@ -1,6 +1,10 @@
 import{test,expect}from'bun:test';
+import{zstdDecompressSync}from'node:zlib';
 import{parseReceiptSeatSnapshot,acceptedReceiptSeat,injectReceiptSeat}from'../publication-seats.ts';
+import{preparePublicationImage}from'../publication-image.ts';
+import{publicationRpc}from'../publication-rpc.ts';
 import{normalizeRelayhistoryRecords,parseRelayhistoryRecord}from'../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts';
+import{scratchStore}from'./support.ts';
 const HEX='a'.repeat(64),OTHER='b'.repeat(64),FLOOR='9007199254740993';
 const record={ord:0,source:'claude',session_id:'session:1',record_id:'native-r',revision_id:'revision-1',revision:1,digest:HEX};
 const stage={key:'unused',sha256:HEX,bytes:1,groupOrdinals:[[0]]};
@@ -61,4 +65,40 @@ test('losing scope alias captures the original winner seat and never promotes af
  expect(()=>injectReceiptSeat(line('origin-a','x'),falseSnap.slots.get(0)!,'origin-a')).toThrow('publication_seats_losing_body');
  const invalid=value();invalid.records[0]!.firstDigest=OTHER;
  expect(()=>parseReceiptSeatSnapshot(invalid,[record],stage)).toThrow('publication_seats_decision');
+});
+
+test('canonical image injects the immutable ACK seat before sealing raw bytes',async()=>{
+ const receiptSeats=parseReceiptSeatSnapshot(value(),[record],stage),scratch=scratchStore();
+ const generation='12345678-1234-1234-1234-123456789abc',attemptToken='abcdefab-1234-1234-1234-123456789abc';
+ const head={groupIndex:0,ordinals:[0],generation,prefix:`96bulls/org-a/upload-generations/g=${generation}`,headVersion:'1',revision:'1',
+  previousKey:null,previousRawSha256:null,basePointer:null,source:'claude',sessionId:'session:1',physicalWorkspace:'ws-a',physicalSource:'claude',
+  physicalSession:'session_1',machineId:'srv_fixture',fenceEpoch:'2',resetEpoch:'0'};
+ const ticket={schemaGeneration:HEX,attemptToken,leaseToken:'11111111-1111-1111-1111-111111111111',leaseUntil:'2026-11-05T00:05:00.000000Z',
+  stageToken:'22222222-2222-2222-2222-222222222222',stageVersion:'1',outboxVersion:'1',tenant:{orgId:'org-a',workspaceId:'ws-a',userId:'user-a'},
+  originId:'origin-a',batchId:'batch-a',batchDigest:HEX,claimToken:'33333333-3333-3333-3333-333333333333',stage,records:[record],receiptSeats,
+  acceptedOrdinals:[0],heads:[head]};
+ const decoded={header:{v:1 as const,publication_state:'buffered' as const,claim_token:ticket.claimToken,batch_digest:HEX,
+  received_at:'2026-11-04T01:00:00.000Z',org_id:'org-a',workspace_id:'ws-a',origin_id:'origin-a',user_id:'user-a',groups:[['claude','session:1'] as [string,string]]},
+  groups:[{source:'claude',sessionId:'session:1',lines:[line('origin-a','first ACK')]}],spec:stage};
+ try{
+  const image=await preparePublicationImage(ticket,head,decoded,{bucket:'fixture',region:'us-east-1',keyRoot:'96bulls',generation:HEX},scratch.store,new AbortController().signal);
+  const raw=JSON.parse(new TextDecoder().decode(zstdDecompressSync(image.newChunk.body)).trim());
+  expect(raw.accepted_seq).toBe('9007199254740994');
+  expect(raw.payload.text).toBe('first ACK');
+ }finally{scratch.done();}
+});
+
+test('publication RPC refuses missing, losing, or wrong-epoch ACK seat claims',async()=>{
+ const target={bucket:'fixture',region:'us-east-1',keyRoot:'96bulls',generation:HEX};
+ const response=()=>({schemaGeneration:HEX,attemptToken:'abcdefab-1234-1234-1234-123456789abc',leaseToken:'11111111-1111-1111-1111-111111111111',
+  leaseUntil:'2026-11-05T00:05:00.000000Z',claimToken:'33333333-3333-3333-3333-333333333333',stageToken:'22222222-2222-2222-2222-222222222222',
+  tenant:{orgId:'org-a',workspaceId:'ws-a',userId:'user-a'},originId:'origin-a',batchId:'batch-a',batchDigest:HEX,
+  stage:{...stage,key:'96bulls/org-a/buffered-batches/v1/ws=ws-a/m=srv_11111111111111111111111111111111/b=22222222222222222222222222222222-3333333333333333-44444444444444444444444444444444.staged.ndjson.zst'},records:[record],acceptedOrdinals:[0],receiptSeats:value(),
+  heads:[{groupIndex:0,ordinals:[0],generation:'12345678-1234-1234-1234-123456789abc',prefix:'96bulls/org-a/upload-generations/g=12345678-1234-1234-1234-123456789abc',
+   revision:'1',resetEpoch:'0',fenceEpoch:'2'}]});
+ const claim=async(result:any)=>publicationRpc({queryBounded:async()=>({rows:[{result}]})}as never,target).claim('22222222-2222-2222-2222-222222222222',new AbortController().signal);
+ await expect(claim(response())).resolves.toMatchObject({acceptedOrdinals:[0]});
+ for(const mutate of[(v:any)=>delete v.receiptSeats,(v:any)=>v.receiptSeats.records[0].bodyAccepted=false,(v:any)=>v.heads[0].fenceEpoch='3',(v:any)=>v.receiptSeats.records=[]]){
+  const v=response();mutate(v);await expect(claim(v)).rejects.toMatchObject({code:'publication_rpc_invalid'});
+ }
 });

@@ -1,5 +1,6 @@
 /** Internal publication protocol: metadata only; payload bytes remain in storage. */
 import type {BufferedStageSpec,BufferedClaimRecord} from "./buffered-protocol.ts";
+import type {ReceiptSeatSnapshot} from "./publication-seats.ts";
 import type {LedgerTenant} from "./ledger.ts";
 export interface PublicationHead {
  groupIndex:number;ordinals:number[];generation:string;prefix:string;headVersion:string;revision:string;
@@ -10,7 +11,7 @@ export interface PublicationHead {
 export interface PublicationTicket {
  schemaGeneration:string;attemptToken:string;leaseToken:string;leaseUntil:string;stageToken:string;stageVersion:string;outboxVersion:string;
  tenant:LedgerTenant;originId:string;batchId:string;batchDigest:string;claimToken:string;stage:BufferedStageSpec;
- records:BufferedClaimRecord[];acceptedOrdinals:number[];heads:PublicationHead[];
+ records:BufferedClaimRecord[];receiptSeats:ReceiptSeatSnapshot;acceptedOrdinals:number[];heads:PublicationHead[];
 }
 export interface PublicationTarget {bucket:string;region:string;keyRoot:string;generation:string}
 export interface PublicationObjectSpec {groupIndex:number;key:string;sha256:string;bytes:number;kind:"raw"|"manifest"}

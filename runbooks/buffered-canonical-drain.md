@@ -73,20 +73,27 @@ consumer configuration, least-privilege validation and complete E2E remain gates
 ## Checkpoint limits: do not enable this foundation alone
 
 This ordinary publisher checkpoint is a dormant source foundation. It is not a
-full-service or activation signoff. In particular, the receipt acceptance-seat
-append040530 and its Node materialization integration are required before any
-buffer admission or canonical enablement. Existing ordinary fixtures have one
-origin; they do not establish cross-origin acceptance parity. The shared fold
-requires authoritative accepted_seq for native records competing across origins.
-Those seats must come from first durable ACK, above both captured allocated Neon
-sequence frontiers, and never from a timestamp or drain order.
+full-service or activation signoff. The040530 receipt acceptance seats are now
+carried by the040600 claim, validated against the selected head epochs and
+injected as exact decimal strings before canonical raw bytes are sealed. The
+unit proof covers large values and hostile/missing seat claims; the actual-PG
+suite also checks the database seat in decompressed published bytes. This closes
+the ordinary publisher's materialization gap, but does not authorize buffer
+admission or canonical enablement. Production cross-origin concurrency and
+source-frontier evidence remain activation gates. The shared fold requires
+authoritative accepted_seq for native records competing across origins; those
+seats come from first durable ACK, above both captured allocated Neon sequence
+frontiers, never from a timestamp or drain order.
 
 History records can legitimately move between sessions (their native identity
 excludes session_id). This checkpoint holds cross-scope moves rather than leave
 an old-session ghost. General History movement needs an independently reviewed
 scope-reconciliation protocol across the canonical fold, artifact fingerprint,
 model final authority, search projection and retirement journal. A hold is not
-parity and is not permission to activate.
+parity and is not permission to activate. Any limited ordinary drain proposal
+must first measure and continuously expose the held cohort; it may not describe
+deferred cross-scope records as published or treat an unquantified hold as a
+complete visibility path.
 
 The standard Worker canonical snapshot still cannot fold a1.53GiB union. The
 large source must compose PR184 ac4f11489f92e5a8bcc40e357041387338279eac
