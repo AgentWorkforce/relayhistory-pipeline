@@ -21,14 +21,18 @@ import { createHash } from "node:crypto";
 /** The exact canary scope; the partition is DERIVED from it + the target. */
 const CANARY = { orgId: "c4fae7b9-43a9-44e8-94d5-455aa579d67b",
   workspaceId: "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63" };
-/** Stable producer poison codes — persisted dead-letter evidence. */
+/** Stable poison codes — the producer's deterministic refusals plus the
+ *  cycle's data-poison refusals. source_changed + anything else -> hold. */
 const POISON: Record<string, true> = {
+  reference_invalid: true, tombstone_invalid: true, payload_invalid: true,
+  vector_invalid: true, payload_bound: true, batch_invalid: true,
+  duplicate: true,
   row_invalid: true, row_bound: true, image_page_changed: true,
   image_descriptor_changed: true, corrupt_chain: true,
   page_bytes_bound: true, page_rows_bound: true,
 };
 const HOLD = new Set(["lease_lost", "heartbeat_failed", "db_timeout",
-  "stale_revision", "target_id_required"]);
+  "stale_revision", "target_id_required", "source_changed"]);
 
 export interface ConsumerConfig {
   /** REQUIRED explicit gate — false/unset means do not run anything. */
@@ -67,10 +71,16 @@ export class CanonicalConsumer {
     validateConfig(cfg);
     // The partition identity binds canary + target — a new deployment target
     // gets a disjoint lease + checkpoint, never reusing the old one.
-    this.partition = `c4fae7b9-1220c1dc-` +
-      createHash("sha256").update(cfg.targetId).digest("hex").slice(0, 16);
+    // Derived lazily: a disabled consumer never hashes or touches the DB.
+    this.partition = null as unknown as string;
   }
-  private readonly partition: string;
+  private partition: string;
+  private ensurePartition(): string {
+    this.partition ??= `c4fae7b9-1220c1dc-` +
+      createHash("sha256").update(this.cfg.targetId).digest("hex")
+        .slice(0, 32);
+    return this.partition;
+  }
 
   /** One atomic acquire/renew/takeover — the bound partition only. */
   async acquireLease(): Promise<boolean> {
@@ -81,7 +91,7 @@ export class CanonicalConsumer {
         ` WHERE ${LEASE}.owner=$2` +
         `    OR ${LEASE}.heartbeat_at < now() - make_interval(secs => $3)` +
         ` RETURNING 1 AS n`,
-      [this.partition, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
+      [this.ensurePartition(), this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
     return rows.length > 0;
   }
   /** Heartbeat — requires a still-fresh held lease; a stale owner cannot. */
@@ -91,20 +101,20 @@ export class CanonicalConsumer {
         ` WHERE partition=$1 AND owner=$2` +
         ` AND heartbeat_at >= now() - make_interval(secs => $3)` +
         ` RETURNING 1 AS n`,
-      [this.partition, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
+      [this.ensurePartition(), this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
     return rows.length > 0;
   }
   private leaseHeld() {
     return this.db.query<{ n: number }>(
       `SELECT 1 AS n FROM ${LEASE} WHERE partition=$1 AND owner=$2` +
         ` AND heartbeat_at >= now() - make_interval(secs => $3)`,
-      [this.partition, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000])
+      [this.ensurePartition(), this.cfg.ownerId, this.cfg.leaseTtlMs / 1000])
       .then((r) => r.rows.length > 0);
   }
   /** Durable partition checkpoint — CAS'd only after a real advance. */
   private async readCheckpoint(): Promise<string> {
     const { rows } = await this.db.query<{ rev: string | number }>(
-      `SELECT rev FROM ${CKPT} WHERE partition=$1`, [this.partition]);
+      `SELECT rev FROM ${CKPT} WHERE partition=$1`, [this.ensurePartition()]);
     return rows.length ? String(rows[0]!.rev) : "0";
   }
   /** Advance only while this owner still holds a fresh lease — a stale
@@ -117,22 +127,24 @@ export class CanonicalConsumer {
         `   WHERE partition=$1 AND owner=$3` +
         `   AND heartbeat_at >= now() - make_interval(secs => $4))` +
         ` RETURNING 1 AS n`,
-      [this.partition, rev, this.cfg.ownerId,
+      [this.ensurePartition(), rev, this.cfg.ownerId,
         this.cfg.leaseTtlMs / 1000]);
     return rows.length > 0;
   }
   private async seedCheckpoint(): Promise<void> {
     await this.db.query(
       `INSERT INTO ${CKPT}(partition,rev) VALUES($1,0)` +
-        ` ON CONFLICT (partition) DO NOTHING`, [this.partition]);
+        ` ON CONFLICT (partition) DO NOTHING`, [this.ensurePartition()]);
   }
   /** Dead-letter: stable poison code only; immutable (no update/delete). */
   async deadLetter(entry: CanonicalJournalEntry, code: string): Promise<void> {
     if (!POISON[code]) return;
     await this.db.query(
-      `INSERT INTO ${DEAD}(entry_revision,image_key,reason,attempts,dead_at)` +
-        ` VALUES($1,$2,$3,1,now()) ON CONFLICT (entry_revision) DO NOTHING`,
-      [entry.revision, entry.imageKey, code]);
+      `INSERT INTO ${DEAD}(entry_revision,partition,image_key,reason,` +
+        `attempts,dead_at)` +
+        ` VALUES($1,$2,$3,$4,1,now())` +
+        ` ON CONFLICT (entry_revision,partition) DO NOTHING`,
+      [entry.revision, this.ensurePartition(), entry.imageKey, code]);
   }
 
   /**
@@ -144,10 +156,10 @@ export class CanonicalConsumer {
     images: CanonicalImagePort, ch: ClickHouseClient,
   ): Promise<{ copied: number; dead: number; skipped: number;
               checkpoint: string }> {
-    // The explicit gate: disabled means no lease, journal, or CH access.
+    // The explicit gate: disabled returns a constant — no partition
+    // derivation, no lease, no journal, no CH, zero DB queries.
     if (this.cfg.enabled !== true)
-      return { copied: 0, dead: 0, skipped: 0,
-        checkpoint: await this.readCheckpoint() };
+      return { copied: 0, dead: 0, skipped: 0, checkpoint: "0" };
     if (!(await this.acquireLease()))
       return { copied: 0, dead: 0, skipped: 0,
         checkpoint: await this.readCheckpoint() };
@@ -172,9 +184,10 @@ export class CanonicalConsumer {
         }
         const r = await this.copyOnce(images, ch, checkpoint, entry);
         if (r === "copied") {
-          copied++;
+          // Metrics count a copy only after the fenced CAS accepted it.
           if (!(await this.advanceCheckpoint(entry.revision)))
             return { copied, dead, skipped, checkpoint };
+          copied++;
           checkpoint = entry.revision;
         } else {
           if (r !== "hold") {

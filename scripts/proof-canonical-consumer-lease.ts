@@ -4,6 +4,7 @@
 import { Pool } from "pg";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { copyCanonicalEntry } from "../src/search-features/canonical-cycle.ts";
 import { CanonicalConsumer } from "../src/search-features/canonical-consumer.ts";
 import { CanonicalJournalStore } from "../src/search-features/canonical-journal.ts";
 import { CanonicalPageAckStore } from "../src/search-features/canonical-ack-store.ts";
@@ -34,9 +35,11 @@ await db.query(`CREATE TABLE sessions.ingest_history_scope_versions(authority_id
 await db.query(`INSERT INTO sessions.ingest_history_scope_versions VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [UID, CANARY.orgId, CANARY.workspaceId, "h", "s", 1, A, PTR.hash, 1]);
 await db.query(`SELECT sessions.canonical_feature_journal_seed(100,$1)`, [A]);
 await db.query(`SELECT sessions.canonical_feature_changed($1,$2,$3,$4,$5)`, [JSON.stringify(SCOPE), JSON.stringify(AUTH), null, JSON.stringify(PTR), null]);
-// an out-of-scope entry the canary must scope-skip (different workspace)
-const OTHER_SCOPE = { ...SCOPE, workspaceId: "other-ws" };
+// An out-of-scope entry journaled by the real writer -> scope-skip proved.
+const OTHER = { orgId: "o2", workspaceId: "other-ws", harness: "h",
+  sessionId: "s", generation: A };
 await db.query(`INSERT INTO sessions.ingest_history_scope_versions VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [UID, "o2", "other-ws", "h", "s", 1, A, PTR.hash, 1]);
+await db.query(`SELECT sessions.canonical_feature_changed($1,$2,$3,$4,$5)`, [JSON.stringify(OTHER), JSON.stringify(AUTH), null, JSON.stringify(PTR), null]);
 
 const sql = { query: (t: string, p?: unknown[]) => db.query(t, p) };
 const journal = new CanonicalJournalStore(sql);
@@ -50,43 +53,80 @@ const br = { orgId: CANARY.orgId, workspaceId: CANARY.workspaceId, source: "h", 
 const pg = (rows: unknown[]) =>
   createHash("sha256").update(JSON.stringify(rows)).digest("hex");
 const images = { imageDescriptor: async (e: { imageKey: string }) => ({ imageKey: e.imageKey, sourceHash: A, pointerSetHash: PTR.hash, complete: true }),
-  imagePages: async (_e: unknown, k: string, c: string | null) => {
+  imagePages: async (e: { imageKey: string }, k: string, c: string | null) => {
+    if (TRANSFER_ON_FIRST_PAGE && c === null)
+      await db.query(`UPDATE sessions.canonical_feature_consumer_lease SET owner='workerB'`);
     if (c === null) { const rows = k === "event" ? [er] : [br];
-      return { rows, cursor: "done", source: HS1, pointerSetHash: PTR.hash,
-        pageSha256: pg(rows) }; }
-    return { rows: [] as unknown[], cursor: null, source: HS1,
+      return { rows, cursor: "done", source: e.imageKey,
+        pointerSetHash: PTR.hash, pageSha256: pg(rows) }; }
+    return { rows: [] as unknown[], cursor: null, source: e.imageKey,
       pointerSetHash: PTR.hash, pageSha256: pg([]) }; },
-  priorKeyPages: async () => { const rows: unknown[] = [];
-    return { rows, cursor: null, source: HS1, pointerSetHash: PTR.hash,
-      pageSha256: pg(rows) }; } };
+  priorKeyPages: async (e: { imageKey: string }) => {
+    const rows: unknown[] = [];
+    return { rows, cursor: null, source: e.imageKey,
+      pointerSetHash: PTR.hash, pageSha256: pg(rows) }; } };
 
+let TRANSFER_ON_FIRST_PAGE = false;
 const CFG = { enabled: true, targetId: "target-A", ownerId: "workerA",
   leaseTtlMs: 60000, maxRetries: 0, pageSize: 10 };
-// Disabled consumer: zero access.
-const off = new CanonicalConsumer(sql, journal, store, { ...CFG, enabled: false });
+// Disabled consumer: zero queries at all (count every DB call).
+let queries = 0;
+const counting = { query: (t: string, p?: unknown[]) => { queries++;
+  return db.query(t, p); } };
+const off = new CanonicalConsumer(counting, journal, store,
+  { ...CFG, enabled: false });
 const offOut = await off.drain(images, ch);
-const leaseBefore = await db.query("SELECT count(*) c FROM sessions.canonical_feature_consumer_lease");
-check("disabled_zero_lease", Number(leaseBefore.rows[0].c) === 0);
+check("disabled_zero_db_queries", queries === 0);
 check("disabled_zero_copied", offOut.copied === 0);
-// WorkerA drains the real journal — copies the canary entry.
-const a = new CanonicalConsumer(sql, journal, store, CFG);
+// WorkerA drains the real journal: copies rev101, scope-skips rev102.
+const a = new CanonicalConsumer(counting, journal, store, CFG);
 const out1 = await a.drain(images, ch);
 check("first_drain_copies", out1.copied === 1);
-check("checkpoint_advanced", out1.checkpoint === "101");
+check("scope_skip_out_of_scope", out1.skipped === 1);
+check("checkpoint_at_last", out1.checkpoint === "102");
 // WorkerB on the same target+partition cannot take the fresh lease.
-const b = new CanonicalConsumer(sql, journal, store, { ...CFG, ownerId: "workerB" });
+const b = new CanonicalConsumer(counting, journal, store,
+  { ...CFG, ownerId: "workerB" });
 const out2 = await b.drain(images, ch);
 check("fresh_lease_blocks_B", out2.copied === 0);
-// Expire A's heartbeat -> B takes over.
-await db.query(`UPDATE sessions.canonical_feature_consumer_lease SET heartbeat_at = now() - interval '2 hours'`);
+// MID-COPY takeover: reset, let A copy rev103 while B steals the lease
+// inside imagePages — A's beforeFinish guard refuses, state stays dirty.
+await db.query(`SELECT sessions.canonical_feature_changed($1,$2,$3,$4,$5)`,
+  [JSON.stringify({ ...SCOPE, generation: "b".repeat(64) }),
+   JSON.stringify(AUTH), null, JSON.stringify(PTR), null]);
+TRANSFER_ON_FIRST_PAGE = true;
+const outMid = await a.drain(images, ch);
+TRANSFER_ON_FIRST_PAGE = false;
+const st = await db.query(
+  "SELECT dirty FROM sessions.canonical_feature_copy_state" +
+  " WHERE entry_revision=(SELECT max(revision) FROM" +
+  " sessions.canonical_feature_journal)");
+check("mid_copy_hold_checkpoint_held",
+  outMid.copied === 0 && outMid.checkpoint === "102");
+check("mid_copy_durable_still_dirty", st.rows[0]?.dirty === true);
+// B (the new owner) resumes and finishes rev103.
 const out3 = await b.drain(images, ch);
-check("expired_takeover_B", out3.copied === 0 && Number(out3.checkpoint) >= 101);
-// Different target => disjoint partition: fresh checkpoint (not A's 101)
-// and begin_drift holds the copy — target binding refuses state reuse.
-const c2 = new CanonicalConsumer(sql, journal, store, { ...CFG, ownerId: "w2", targetId: "target-B" });
+console.log("out3", JSON.stringify(out3));
+console.log("out3",JSON.stringify(out3));
+check("takeover_B_finishes", out3.copied === 1 &&
+  out3.checkpoint === "103");
+// Different target => disjoint partition: fresh checkpoint, begin_drift holds.
+const c2 = new CanonicalConsumer(counting, journal, store,
+  { ...CFG, ownerId: "w2", targetId: "target-B" });
 const out4 = await c2.drain(images, ch);
 check("different_target_disjoint_partition",
   out4.copied === 0 && out4.checkpoint === "0");
+// Producer-role ACL: page_ack/lease/dead-letter are insert-select only.
+const prod = new Pool({ host: "127.0.0.1", port, user: "postgres",
+  password: "synthetic-feature-only", database: "postgres" });
+await prod.query("SET ROLE bulls96_canonical_feature_producer");
+const del = await prod.query(
+  `DELETE FROM sessions.canonical_feature_consumer_dead_letter`)
+  .catch((e: { code?: string }) => e);
+check("producer_dead_letter_delete_denied",
+  (del as { code?: string }).code === "42501");
+await prod.query("RESET ROLE");
+await prod.end();
 await db.end();
 if (failures) { console.log(`${failures} FAILURES`); process.exit(1); }
 console.log("ALL PASS");
