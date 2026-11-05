@@ -29,7 +29,10 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Then the entropy fallback stopped firing after a `/`, `.` or `-` (paths, members,
   // branch names), and an unquoted value after a quoted key is taken only after a
   // one-word key and only when it looks generated (code and quoted prose are kept).
-  3: "ff258a1b63c98071a0cdbdcc1806f14fe7f24e9fc122da950ea72222b1cca5ef",
+  // Then the literal-prefix rules stopped starting after a `-` inside a longer token
+  // (they cut SendGrid and other full-shape keys and leaked their start; a glued
+  // `word-sk-…` is taken later, whole), and the SendGrid rule moved ahead of them.
+  3: "d30f52154b6a189d763a97c2a026ab6c579bff80cbd4ed6af72304b84b73204e",
 };
 
 const read = (rel: string) =>

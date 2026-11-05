@@ -190,6 +190,41 @@ function redactQuotedSecretValues(text: string): string {
   return last === 0 ? text : out + text.slice(last);
 }
 
+/** The start of every literal-prefix rule (see the provider key prefixes). */
+const TOKEN_START = "(?<![A-Za-z0-9_-])";
+
+/**
+ * Each literal-prefix rule (those starting with `TOKEN_START`) for a prefix glued to a
+ * longer token by `-` (`word-sk-…`, `foo-ghp_…`, `id-glpat-…`), which the old `\b` start
+ * caught. The whole `-`-joined token is redacted, not only the prefixed part, so neither
+ * the start of a key it is glued to nor a second glued key after it is left behind. Run
+ * after every full-shape rule (SendGrid, GitLab, Slack, Capy, relay, JWT, Google), so a
+ * key whose body holds `-sk-…` is already redacted whole. A match starts only where a
+ * token starts and tries the literal prefix at each `-` in it, so it costs no more than
+ * the old `\b` start did. Built on first use from `SECRET_PATTERNS`, so the two lists
+ * cannot drift apart.
+ */
+let gluedPrefixRules: [RegExp, Replacement][] | undefined;
+function redactGluedPrefixes(text: string): string {
+  gluedPrefixRules ??= SECRET_PATTERNS.flatMap((rule): [RegExp, Replacement][] =>
+    typeof rule !== "function" && rule[0].source.startsWith(TOKEN_START)
+      ? [
+          [
+            new RegExp(
+              `${TOKEN_START}[A-Za-z0-9_-]*?-(?:${rule[0].source.slice(TOKEN_START.length)})[A-Za-z0-9_-]*`,
+              rule[0].flags,
+            ),
+            rule[1],
+          ],
+        ]
+      : [],
+  );
+  return gluedPrefixRules.reduce(
+    (out, [pattern, replacement]) => out.replace(pattern, replacement as any),
+    text,
+  );
+}
+
 /** Shannon entropy of `s` in bits per character. */
 function entropy(s: string): number {
   const counts = new Map<string, number>();
@@ -237,25 +272,33 @@ const SECRET_PATTERNS: Rule[] = [
     /\bBearer\s+[A-Za-z0-9._~+/=-]{15,}[A-Za-z0-9_~+/=-](?![A-Za-z0-9_~+/=-])/gi,
     `Bearer ${REDACTED}`,
   ],
+  // SendGrid API keys (`SG.` + 22 + `.` + 43). Ahead of the prefix rules below: either
+  // segment can start with or contain `sk-`/`ghp_`-like text, and a prefix rule run first
+  // would redact only that tail and leave the start of the key behind.
+  [/\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g, REDACTED],
   // Provider key prefixes. The hyphen form covers OpenAI-style `sk-…` (`sk-proj-…`) and
   // Anthropic `sk-ant-…`; the underscore form
   // covers Stripe-style `sk_live_…`/`sk_test_…` (and rk_/pk_) which the hyphen pattern misses.
-  [/\b(?:sk|rk|pk|ak)-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g, REDACTED],
-  [/\b(?:(?:sk|rk|pk)_(?:live|test)_|whsec_)[A-Za-z0-9]{10,}\b/g, REDACTED],
-  [/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g, REDACTED],
+  // These literal-prefix rules start at `(?<![A-Za-z0-9_-])`, not `\b`: `\b` also fires
+  // after a `-` inside a longer token, so `-sk-…`/`-ghp_…` in the body of a later
+  // full-shape key (GitLab, Slack, Capy, Google, a JWT) was redacted alone and the key's
+  // start leaked. The lookbehind is `\b` plus `-` (`_` and alphanumerics already fail
+  // `\b`); a prefix glued to a token by `-` (`word-sk-…`) is taken later instead, with
+  // the token it is glued to, by `redactGluedPrefixes` once the full-shape rules have run.
+  [/(?<![A-Za-z0-9_-])(?:sk|rk|pk|ak)-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])(?:(?:sk|rk|pk)_(?:live|test)_|whsec_)[A-Za-z0-9]{10,}\b/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])gh[pousr]_[A-Za-z0-9_]{20,}\b/g, REDACTED],
   // AWS access/secret-access key IDs (AKIA long-term, ASIA temporary).
-  [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, REDACTED],
   // GitHub fine-grained personal access tokens (`github_pat_…`); the classic and app
   // tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`) are the rule above.
-  [/\bgithub_pat_[A-Za-z0-9_]{22,}/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])github_pat_[A-Za-z0-9_]{22,}/g, REDACTED],
   // GitLab personal/project/group access tokens.
-  [/\bglpat-[A-Za-z0-9_-]{20,}/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20,}/g, REDACTED],
   // npm access tokens (`npm_` + 36).
-  [/\bnpm_[A-Za-z0-9]{36}\b/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])npm_[A-Za-z0-9]{36}\b/g, REDACTED],
   // Hugging Face user access tokens (`hf_` + 34 letters).
-  [/\bhf_[A-Za-z]{34}\b/g, REDACTED],
-  // SendGrid API keys (`SG.` + 22 + `.` + 43).
-  [/\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])hf_[A-Za-z]{34}\b/g, REDACTED],
   // Cloudflare scannable credentials: `cfk_` (Global API Key), `cfut_` (user API token)
   // and `cfat_` (account API token), each a 40-character alphanumeric body and an
   // 8-character hex CRC32 checksum (53 characters for `cfut_`/`cfat_`). The body is taken
@@ -263,9 +306,9 @@ const SECRET_PATTERNS: Rule[] = [
   // Legacy unprefixed Cloudflare credentials (37-hex Global API Keys, 40-character API
   // tokens) have no shape of their own and are caught next to their name instead:
   // `X-Auth-Key: …`, `CLOUDFLARE_API_TOKEN=…`, `"api_token": "…"`, `Bearer …`.
-  [/\bcf(?:k|ut|at)_[A-Za-z0-9]{40,}/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])cf(?:k|ut|at)_[A-Za-z0-9]{40,}/g, REDACTED],
   // Slack tokens (xoxb/xoxp/xoxa/xoxr/xoxs/xoxe-… and app-level xapp-…).
-  [/\b(?:xox[baprse]|xapp)-[A-Za-z0-9-]{10,}(?![A-Za-z0-9_-])/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])(?:xox[baprse]|xapp)-[A-Za-z0-9-]{10,}(?![A-Za-z0-9_-])/g, REDACTED],
   // Slack incoming webhook URLs carry their credential in the path; keep the host.
   [
     /(hooks\.slack\.com\/(?:services|workflows|triggers)\/)[A-Za-z0-9_/-]{8,}/g,
@@ -274,8 +317,8 @@ const SECRET_PATTERNS: Rule[] = [
   // Capy API keys (`capy_…`), Cursor/Grok Bot routine keys (`crsr_…`) and Agent Relay
   // tokens (`relay_ag_…`, `relay_pa_…`, `relay_ws_…`, `relay_id_…`). Capy and Grok Bot
   // transcripts are uploaded to history, and a turn that set up a routine can echo its key.
-  [/\b(?:capy|crsr)_[A-Za-z0-9_-]{16,}/g, REDACTED],
-  [/\brelay_(?:ag|pa|ws|id)_[A-Za-z0-9._-]{16,}/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])(?:capy|crsr)_[A-Za-z0-9_-]{16,}/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])relay_(?:ag|pa|ws|id)_[A-Za-z0-9._-]{16,}/g, REDACTED],
   // Capy automation webhook URLs carry their credential in the path: the URL itself is
   // the secret. Keep the host and route so the reference stays diagnosable. The last
   // character can't be a dot, so a sentence-ending period survives.
@@ -289,7 +332,7 @@ const SECRET_PATTERNS: Rule[] = [
   // there is no length cap a large token could slip past.
   [/[A-Za-z0-9_.-]{35,}/g, redactJwtsInRun],
   // Service-local relayhistory tokens. Distinct from URL userinfo / Bearer.
-  [/\brth_(?:at|rt|st)_[A-Za-z0-9_]{8,}\b/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])rth_(?:at|rt|st)_[A-Za-z0-9_]{8,}\b/g, REDACTED],
   // OAuth authorize URLs: keep host+path so "stuck at auth.openai.com/oauth/authorize"
   // remains diagnosable, redact the challenge/state/secret query values.
   [
@@ -297,7 +340,10 @@ const SECRET_PATTERNS: Rule[] = [
     `$1${REDACTED}`,
   ],
   // Google API keys (AIza + 35 chars).
-  [/\bAIza[0-9A-Za-z_-]{30,}(?![A-Za-z0-9_-])/g, REDACTED],
+  [/(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{30,}(?![A-Za-z0-9_-])/g, REDACTED],
+  // The literal-prefix rules again, for a prefix glued to a longer token by `-`. Last of
+  // the token rules: see `redactGluedPrefixes`.
+  redactGluedPrefixes,
   // Quoted secret keys in every JSON/YAML/Python form, at any escaping depth:
   // `"password": "…"`, `\"api_key\": \"…\"` (a JSON document inside a tool-result string),
   // `'token' => '…'`. The value is redacted, the key and quotes kept. See
