@@ -521,15 +521,24 @@ export async function canonicalHandle(
         : new CanonicalReadError("canonical_unavailable");
     return Response.json(
       {
-        error: {
-          code:
-            e.status === 400
-              ? "bad_request"
-              : e.status === 401
-                ? "unauthorized"
-                : "session_read_unavailable",
-          message: e.message,
-        },
+        // 501 matches the read API's unsupported_by_backend body: the caller
+        // falls back instead of retrying.
+        error:
+          e.status === 501
+            ? {
+                code: "unsupported_by_backend",
+                message: `not served by this backend: ${e.reason}`,
+                reason: e.reason,
+              }
+            : {
+                code:
+                  e.status === 400
+                    ? "bad_request"
+                    : e.status === 401
+                      ? "unauthorized"
+                      : "session_read_unavailable",
+                message: e.message,
+              },
         correlationId: id,
       },
       {

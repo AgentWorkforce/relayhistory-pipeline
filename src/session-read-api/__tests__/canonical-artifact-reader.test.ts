@@ -367,6 +367,59 @@ test("refuses absent/stale publication without raw fallback", async () => {
   });
   expect(readKeys).toEqual([]);
 });
+test("session_timing absent because legacy turns are unknown is a non-retryable 501, not artifact_view", async () => {
+  const timingQuery = { table: "session_timing", view: "raw" as const, limit: 10 };
+  // Producer shape when legacy coverage is unknown: no session_timing table at all.
+  index.legacyCoverage = null;
+  await publish();
+  await expect(
+    canonicalArtifactPage(deps, identity, timingQuery),
+  ).rejects.toMatchObject({ reason: "timing_turns_unknown", status: 501 });
+  // Any other missing table keeps the integrity refusal.
+  delete (index.tables as Record<string, unknown>).session_markers;
+  await publish();
+  await expect(
+    canonicalArtifactPage(deps, identity, { ...timingQuery, table: "session_markers" }),
+  ).rejects.toMatchObject({ reason: "artifact_view", status: 503 });
+  // Known coverage but no session_timing table contradicts the producer: still artifact_view.
+  index.legacyCoverage = {
+    version: 1,
+    tables: ["conversation_turns", "session_links", "session_outcomes"],
+  };
+  await publish();
+  await expect(
+    canonicalArtifactPage(deps, identity, timingQuery),
+  ).rejects.toMatchObject({ reason: "artifact_view", status: 503 });
+  // Published with coverage: the materialized timing row is served.
+  const timingRow = {
+    org_id: identity.orgId,
+    workspace_id: identity.workspaceId,
+    source: identity.source,
+    session_id: identity.sessionId,
+    timing: { workMs: 5 },
+  };
+  const page = await put(
+    "timing-page.json",
+    encode({
+      version: 1,
+      kind: "row-page",
+      identity,
+      generation,
+      table: "session_timing",
+      view: "raw",
+      start: 0,
+      rows: [{ table: "session_timing", row: timingRow }],
+    }),
+    0,
+    1,
+    "page",
+  );
+  index.tables.session_timing = { raw: { count: 1, root: page } };
+  await publish();
+  const served = await canonicalArtifactPage(deps, identity, timingQuery);
+  expect(served.rows.map((r) => r.row)).toEqual([timingRow]);
+  expect(served.nextCursor).toBeNull();
+});
 test("validates every object digest before parsing or returning content", async () => {
   objects.set(
     prefix + "string-0.json",
