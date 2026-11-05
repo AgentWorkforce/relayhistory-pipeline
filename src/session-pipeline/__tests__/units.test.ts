@@ -156,6 +156,14 @@ describe("configuration", () => {
     expect(() => lambdaEnv({ ...base, PIPELINE_FANOUT: "sqs" })).toThrow(/FANOUT/);
   });
 
+  test("adapter selection: unset is today's lambda + clickhouse; other runtimes or backends are refused", () => {
+    expect(() => lambdaEnv(base)).not.toThrow();
+    expect(() => lambdaEnv({ ...base, PIPELINE_RUNTIME: "lambda", SEARCH_INDEX_BACKEND: "clickhouse" })).not.toThrow();
+    expect(() => lambdaEnv({ ...base, PIPELINE_RUNTIME: "workers" })).toThrow(/PIPELINE_RUNTIME/);
+    expect(() => lambdaEnv({ ...base, SEARCH_INDEX_BACKEND: "opensearch" })).toThrow(/SEARCH_INDEX_BACKEND/);
+    expect(() => lambdaEnv({ ...base, SEARCH_INDEX_BACKEND: "nope" })).toThrow(/unknown/);
+  });
+
   test("secret shape is checked without echoing values", () => {
     expect(parseSecret(JSON.stringify({ hoopdb_url: "postgresql://u:p@h:5432/db" })).hoopdb_url).toContain("postgresql://");
     let message = "";

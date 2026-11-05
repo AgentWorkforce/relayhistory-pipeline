@@ -71,6 +71,10 @@ jobs:
         run: |
           set -o pipefail
           bun scripts/pg-proof/role-proof.ts 2>&1 | tee pg-proof-pg${{ matrix.pg }}.log
+      - name: SearchIndexAdapter conformance (postgres adapter, real server)
+        env:
+          SEARCH_CONFORMANCE_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: bun run --filter @96bulls/pipeline test test/search-index-postgres-real.test.ts
       - name: Check the results file names this head and this server
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
