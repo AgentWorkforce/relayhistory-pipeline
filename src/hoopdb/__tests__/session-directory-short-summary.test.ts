@@ -2305,6 +2305,7 @@ describe("short_summary rollback", () => {
     // Reverse dependency order: event metadata also depends on G6 and the list/catalog phases.
     for(const file of [...LATER_PHASES].reverse())await db.exec(read(`supabase/rollbacks/${file}`));
     await db.exec(EVENTS_DOWN);
+    await db.exec(read("supabase/rollbacks/20261102020000_session_brief_state.down.sql"));
     await db.exec(BRIEFS_DOWN);
     await db.exec(LIST_DOWN);
     await db.exec(EXPAND_DOWN);
@@ -2348,6 +2349,7 @@ describe("short_summary rollback", () => {
     await db.exec(EXPAND_UP);
     await db.exec(LIST_UP);
     await db.exec(BRIEFS_UP);
+    await db.exec(read("supabase/migrations/20261102020000_session_brief_state.sql"));
     await db.exec(EVENTS_UP);
     for(const file of LATER_PHASES)await db.exec(read(`supabase/migrations/${file.replace(/\.down\.sql$/,".sql")}`));
     await db.query(
@@ -2402,7 +2404,7 @@ describe("Worker role validation in two phases", () => {
       "sessions.session_directory_readiness()",
       "sessions.session_brief(text, text, text)",
     ])
-      expect(error?.message).toContain(`approved RPC missing: ${sig}`);
+      expect(error?.message).toContain(`approved RPC missing: ${sig.replace(/, /g, ",").replace(/\btimestamptz\b/g, "timestamp with time zone")}`);
     expect(error?.message).toContain("missing USAGE on schema sessions");
   });
 
