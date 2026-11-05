@@ -1,3 +1,4 @@
+import type { NodeReadProfile } from "../session-read-api/node-read-profile.ts";
 /** Capture/full-union hydration/immutable writes/CAS. All database calls use backend
  * RPCs; the public claim RPC has the existing search-worker JWT policy. */
 import * as zlib from "node:zlib";
@@ -13,6 +14,8 @@ export interface ReplayCapture {
   snapshot: { epoch: string; pointers: CanonicalPointer[]; [key: string]: unknown };
 }
 export interface ReplayProducerDeps {
+  profile?: NodeReadProfile;
+  publish?: (params: unknown[]) => Promise<boolean>;
   db: SqlExecutor; store: ObjectStore; provider: string; bucket: string;
   prefix: { PIPELINE_ORG_FROM_PREFIX?: string; PIPELINE_KEY_PREFIX?: string };
   decompress?: (bytes: Uint8Array, maxBytes: number) => Uint8Array;
@@ -47,7 +50,7 @@ export async function produceCanonicalReplay(scope: SessionScope, deps: ReplayPr
     store: deps.store, provider: deps.provider, bucket: deps.bucket, prefix: deps.prefix,
     pointers: current,
     decompress: deps.decompress ?? ((bytes,maxBytes) => new Uint8Array(zlib.zstdDecompressSync(bytes,{maxOutputLength:maxBytes}))),
-  }, identity);
+  }, identity, deps.profile);
   if (!snapshot.exists) fail("artifact_source_changed");
   const sourceGeneration = canonicalSourceGeneration(first.snapshot.pointers,identity);
   if (snapshot.generation !== sourceGeneration) fail("artifact_source_changed");
@@ -59,7 +62,7 @@ export async function produceCanonicalReplay(scope: SessionScope, deps: ReplayPr
   const prefix = `${anchor.manifest_key.slice(0,-"manifest.json".length)}normalized/read-projection-v1/${rawSha}/${generation}/`;
   const timing = canonicalTimingProjection(identity,snapshot.rows,snapshot.legacyCoverage !== null);
   const rows = timing ? [...snapshot.rows,timing] : snapshot.rows;
-  const made = await materializeCanonicalArtifacts(deps.store,{ identity,generation,source:first.source,prefix,rows,legacyCoverage:snapshot.legacyCoverage });
+  const made = await materializeCanonicalArtifacts(deps.store,{ identity,generation,source:first.source,prefix,rows,profile:deps.profile,legacyCoverage:snapshot.legacyCoverage });
   await current(); // Objects are verified, but stale work still must publish nothing.
   const params = [identity.orgId,identity.workspaceId,identity.source,identity.sessionId,first.source.epoch,first.source.fingerprint,JSON.stringify(first.snapshot),generation,sourceGeneration,prefix,made.index.key,made.index.sha256,made.index.bytes];
   const published = deps.publish ? await deps.publish(params) : (await deps.db.query<{published:boolean}>("SELECT sessions.publish_session_replay_pages($1,$2,$3,$4,$5::bigint,$6,$7::jsonb,$8,$9,$10,$11,$12,$13::integer) AS published",params)).rows[0]?.published;
