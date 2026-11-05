@@ -294,10 +294,12 @@ export function serveHealth(health: WorkerHealth, port: number) {
 /**
  * One worker tick: every claim path, gated. The live gate (gateOpen: ledger, marker,
  * phase 2 and the sessions-function boundary) runs before EACH stage's claim and before
- * the side tick; once it is closed, nothing further in the tick runs. Exported so a
+ * the side tick; shutdown is rechecked after each asynchronous gate. Once closed,
+ * nothing further in the tick runs. Exported so a
  * table-driven test can prove the order over every claim path.
  */
 export async function workerTick<S>(io: {
+  signal?: AbortSignal;
   stages: readonly S[];
   gate: () => Promise<boolean>;
   poll: (stage: S) => Promise<number>;
@@ -305,11 +307,13 @@ export async function workerTick<S>(io: {
 }): Promise<{ claimed: number; gated: boolean }> {
   let claimed = 0;
   for (const stage of io.stages) {
-    if (!(await io.gate())) return { claimed, gated: true };
+    if (io.signal?.aborted || !(await io.gate()) || io.signal?.aborted)
+      return { claimed, gated: true };
     claimed += await io.poll(stage);
   }
   if (io.tick) {
-    if (!(await io.gate())) return { claimed, gated: true };
+    if (io.signal?.aborted || !(await io.gate()) || io.signal?.aborted)
+      return { claimed, gated: true };
     await io.tick();
   }
   return { claimed, gated: false };
@@ -428,8 +432,9 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
         // by a crash is re-delivered when its lease (WORKER_LEASE_SECONDS) expires. While
         // the gate is closed the worker claims nothing.
         const r = await workerTick({
+          signal: controller.signal,
           stages: opts.stages,
-          gate: async () => !controller.signal.aborted && await gateOpen(health),
+          gate: () => gateOpen(health),
           poll: async (stage) => {
             try {
               const { consumer, binding } = stageBindings.get(stage)!;

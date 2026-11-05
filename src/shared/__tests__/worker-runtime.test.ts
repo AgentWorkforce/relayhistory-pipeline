@@ -3,6 +3,27 @@ import { runWorkerLoop, workerTick } from "../worker.ts";
 import { createWorkerRuntime, type WorkSource } from "@rhc/runtime/workers.ts";
 
 describe("stage worker orchestration", () => {
+  for (const stages of [["stage"], []]) {
+    test(`shutdown during readiness validation blocks ${stages.length ? "stage claims" : "side ticks"}`, async () => {
+      const controller = new AbortController();
+      let release!: () => void;
+      let entered!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const checking = new Promise<void>(resolve => { entered = resolve; });
+      const seen: string[] = [];
+      const running = workerTick({ signal: controller.signal, stages,
+        gate: async () => { entered(); await held; return true; },
+        poll: async stage => { seen.push(stage); return 1; },
+        tick: async () => { seen.push("side"); },
+      });
+      await checking;
+      controller.abort();
+      release();
+      expect(await running).toEqual({ claimed: 0, gated: true });
+      expect(seen).toEqual([]);
+    });
+  }
+
   test("shutdown drains a started delivery before cleanup and skips later stages and side ticks", async () => {
     const controller = new AbortController();
     const order: string[] = [];
