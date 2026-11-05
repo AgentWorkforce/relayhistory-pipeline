@@ -52,14 +52,16 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 - Merge and apply the 610/620 creator stack only in its planned generation
   window. The owner-only journal append is composed into the final install CAS,
   but schema presence alone is not activation.
-- Keep the replacement journal ABI on hold until its actual SQL passes the
-  PostgreSQL 17 contract suite. The 2026-11-05 audit of `8602ca9` found a valid
-  publish failing in `image_key` construction, the retire authority written to a
-  different column than the reader consumes, non-exact/NULL-unsafe JSON
-  validation, stale shared ABI types and a non-idempotent backfill calling the
-  live final-CAS RPC. It must durably order an exact prior-key retirement and
-  replacement publication, carrying a verified descriptor for each image,
-  without a visibility gap.
+- The creator-side replacement SQL at `0b359d6`/`d1f48fd` supersedes the broken
+  `8602ca9` proposal: an independent fresh PostgreSQL 17 run passed all seven
+  install races and the PGlite creator/610 suite passed 16/16. Composition is
+  still held on the consumer boundary: `2eef4fc` decodes a retire authority
+  from `prior_source_authority` although 610 stores it in `source_authority`,
+  retains a silent no-op append and stale shared/client ABI types, and only
+  declares (but does not implement) idempotent `publishOnce`. The creator also
+  still needs disposition of exact source/scope key validation and same-
+  fingerprint self-retirement. The final pair must carry a verified descriptor
+  for each image without a visibility gap.
 - Define and rehearse the operator-only seed row. It must put the journal above
   the drained legacy feature high-water before any scope install or backfill;
   no data-plane identity may allocate or append revisions.
