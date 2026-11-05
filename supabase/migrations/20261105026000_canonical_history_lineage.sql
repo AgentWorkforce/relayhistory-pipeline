@@ -1,4 +1,7 @@
 -- Registry v2 name; upstream provenance: 20261104062000_canonical_history_lineage.sql (#230 draft, never applied under that name).
+-- Fail fast instead of queueing live readers/writers behind a blocked DDL lock (migrate.ts applies
+-- each file in one transaction, so SET LOCAL lasts exactly as long as this file).
+SET LOCAL lock_timeout='5s';
 -- Canonical History lineage. This source remains dormant until the full source
 -- frontier, logical consumers and permanent retirement transport are proven.
 --040600 remains provenance authority for generation object IO, not History moves.
@@ -25,6 +28,32 @@ BEGIN
   'sessions.session_directory'::regclass,'sessions.session_replay_publications'::regclass)AND relowner<>me) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: original coherent creator required';END IF;
 END $creator$;
+
+-- OPERATIONAL KILL SWITCH (owner only; see runbooks/history-620-operations.md).
+-- live=false disables EVERY live 620 hook (ACK/control/directory/session_index triggers) and every 620
+-- read gate, so the database behaves exactly as main, while all ledgers (versions, derived objects,
+-- feature journal, outboxes, builds) are retained. pointer_tracking separately arms the session_index
+-- pointer-reference trigger; refs_complete is set only by a full ingest_history_pointer_ref_backfill
+-- pass made while tracking is armed, and the inventory refuses until then.
+CREATE TABLE sessions.ingest_history_switch(
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ live boolean NOT NULL DEFAULT true,pointer_tracking boolean NOT NULL DEFAULT false,refs_complete boolean NOT NULL DEFAULT false,
+ changed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ CHECK(pointer_tracking OR NOT refs_complete)
+);
+INSERT INTO sessions.ingest_history_switch DEFAULT VALUES;
+ALTER TABLE sessions.ingest_history_switch ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.ingest_history_switch FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+CREATE FUNCTION sessions.ingest_history_live()RETURNS boolean
+LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $live$
+ SELECT coalesce((SELECT w.live FROM sessions.ingest_history_switch w WHERE w.singleton),false)
+$live$;
+CREATE FUNCTION sessions.ingest_history_tracking()RETURNS boolean
+LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $tracking$
+ SELECT coalesce((SELECT w.live AND w.pointer_tracking FROM sessions.ingest_history_switch w WHERE w.singleton),false)
+$tracking$;
+REVOKE ALL ON FUNCTION sessions.ingest_history_live(),sessions.ingest_history_tracking()
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
 CREATE SEQUENCE sessions.ingest_history_inventory_epoch AS bigint NO CYCLE;
 CREATE TABLE sessions.ingest_history_carriers(
@@ -85,6 +114,9 @@ CREATE FUNCTION sessions.ingest_history_sync_pointer() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $sync$
 DECLARE r sessions.session_index%ROWTYPE;old_key text;v_root text;v_key text;v_pointer jsonb;v_known boolean;
 BEGIN
+ -- Dormant until an operator arms pointer tracking (and never while the kill switch is off): the
+ -- legacy indexer pays nothing. Disarming clears refs_complete, so a fresh backfill pass is required.
+ IF NOT sessions.ingest_history_tracking()THEN IF TG_OP='DELETE'THEN RETURN OLD;END IF;RETURN NEW;END IF;
  IF TG_OP<>'INSERT' THEN
   SELECT carrier_sha256 INTO old_key FROM sessions.ingest_history_pointer_refs
    WHERE org_id=OLD.org_id AND workspace_id=OLD.workspace_id AND harness=OLD.harness AND session_id=OLD.session_id AND machine_id=OLD.machine_id;
@@ -123,22 +155,45 @@ CREATE TRIGGER ingest_history_pointer_sync AFTER INSERT OR UPDATE OR DELETE ON s
 -- pages it, resumably, in bounded batches after deploy. Returns the next cursor, NULL when done.
 CREATE FUNCTION sessions.ingest_history_pointer_ref_backfill(p_after jsonb,p_limit integer)RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $initial_refs$
-DECLARE r sessions.session_index%ROWTYPE;v_root text;v_key text;v_pointer jsonb;v_known boolean;v_last jsonb;
+DECLARE r sessions.session_index%ROWTYPE;v_root text;v_key text;v_pointer jsonb;v_sha text;v_known boolean;v_last jsonb;old_ref sessions.ingest_history_pointer_refs%ROWTYPE;
 BEGIN
  IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 5000 OR(p_after IS NOT NULL AND jsonb_typeof(p_after)<>'array')THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: pointer ref backfill bound';END IF;
+ -- Only meaningful while the trigger maintains every later write; FOR SHARE keeps the switch armed
+ -- for this page (a concurrent disarm waits for it).
+ PERFORM 1 FROM sessions.ingest_history_switch WHERE singleton AND live AND pointer_tracking FOR SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: arm pointer tracking before the backfill';END IF;
+ -- Each row is LOCKED (FOR UPDATE) before its ref is written: a concurrent indexer UPDATE waits for this
+ -- page and its trigger then sees the committed ref (no 23505); a row the indexer already holds is waited
+ -- for, and its trigger has written the current ref by then.
  FOR r IN SELECT * FROM sessions.session_index i WHERE i.manifest_key IS NOT NULL AND i.storage_provider IS NOT NULL AND i.bucket IS NOT NULL
    AND(p_after IS NULL OR ROW(i.org_id,i.workspace_id,i.harness,i.session_id,i.machine_id)>ROW(p_after->>0,p_after->>1,p_after->>2,p_after->>3,p_after->>4))
-   ORDER BY i.org_id,i.workspace_id,i.harness,i.session_id,i.machine_id LIMIT p_limit LOOP
+   ORDER BY i.org_id,i.workspace_id,i.harness,i.session_id,i.machine_id LIMIT p_limit FOR UPDATE LOOP
+  v_last:=jsonb_build_array(r.org_id,r.workspace_id,r.harness,r.session_id,r.machine_id);
   v_root:=sessions.ingest_history_root(r.manifest_key);
   v_known:=v_root IS NOT NULL;v_root:=coalesce(v_root,r.manifest_key);
   v_key:=encode(sha256(convert_to(jsonb_build_array(r.storage_provider,r.bucket,v_root)::text,'UTF8')),'hex');
-  v_pointer:=sessions.ingest_history_pointer(r);
-  INSERT INTO sessions.ingest_history_carriers(carrier_sha256,storage_provider,bucket,physical_root,layout_known)VALUES(v_key,r.storage_provider,r.bucket,v_root,v_known)ON CONFLICT DO NOTHING;
-  INSERT INTO sessions.ingest_history_pointer_refs VALUES(r.org_id,r.workspace_id,r.harness,r.session_id,r.machine_id,v_key,v_pointer,encode(sha256(convert_to(v_pointer::text,'UTF8')),'hex'))
-   ON CONFLICT DO NOTHING;
-  v_last:=jsonb_build_array(r.org_id,r.workspace_id,r.harness,r.session_id,r.machine_id);
+  v_pointer:=sessions.ingest_history_pointer(r);v_sha:=encode(sha256(convert_to(v_pointer::text,'UTF8')),'hex');
+  SELECT *INTO old_ref FROM sessions.ingest_history_pointer_refs WHERE org_id=r.org_id AND workspace_id=r.workspace_id AND harness=r.harness AND session_id=r.session_id AND machine_id=r.machine_id;
+  CONTINUE WHEN FOUND AND old_ref.carrier_sha256=v_key AND old_ref.pointer_sha256=v_sha;
+  -- A ref left stale by a disarmed period is rewritten exactly as the trigger would (both carriers rescan).
+  IF FOUND THEN
+   DELETE FROM sessions.ingest_history_pointer_refs WHERE org_id=r.org_id AND workspace_id=r.workspace_id AND harness=r.harness AND session_id=r.session_id AND machine_id=r.machine_id;
+   UPDATE sessions.ingest_history_carriers SET epoch=nextval('sessions.ingest_history_inventory_epoch'),scan_complete=false WHERE carrier_sha256=old_ref.carrier_sha256;
+  END IF;
+  INSERT INTO sessions.ingest_history_carriers(carrier_sha256,storage_provider,bucket,physical_root,layout_known)VALUES(v_key,r.storage_provider,r.bucket,v_root,v_known)
+   ON CONFLICT(carrier_sha256)DO UPDATE SET epoch=nextval('sessions.ingest_history_inventory_epoch'),scan_complete=false
+   WHERE sessions.ingest_history_carriers.storage_provider=excluded.storage_provider AND sessions.ingest_history_carriers.bucket=excluded.bucket
+    AND sessions.ingest_history_carriers.physical_root=excluded.physical_root;
+  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: carrier hash collision';END IF;
+  INSERT INTO sessions.ingest_history_pointer_refs VALUES(r.org_id,r.workspace_id,r.harness,r.session_id,r.machine_id,v_key,v_pointer,v_sha);
  END LOOP;
+ -- A short page is the end of the key space: every row older than the arming is now covered.
+ IF v_last IS NULL OR(SELECT count(*)FROM sessions.session_index i WHERE i.manifest_key IS NOT NULL AND i.storage_provider IS NOT NULL AND i.bucket IS NOT NULL
+   AND ROW(i.org_id,i.workspace_id,i.harness,i.session_id,i.machine_id)>ROW(v_last->>0,v_last->>1,v_last->>2,v_last->>3,v_last->>4))=0 THEN
+  UPDATE sessions.ingest_history_switch SET refs_complete=true,changed_at=clock_timestamp()WHERE singleton AND NOT refs_complete;
+  RETURN NULL;
+ END IF;
  RETURN v_last;
 END $initial_refs$;
 REVOKE ALL ON FUNCTION sessions.ingest_history_pointer_ref_backfill(jsonb,integer)FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
@@ -148,6 +203,8 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS
 DECLARE c sessions.ingest_history_carriers%ROWTYPE;v_token uuid:=gen_random_uuid();v_lease uuid:=gen_random_uuid();v_count bigint;
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ IF NOT EXISTS(SELECT 1 FROM sessions.ingest_history_switch WHERE singleton AND live AND pointer_tracking AND refs_complete)THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: pointer references not tracked and backfilled';END IF;
  PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','bucket']);PERFORM sessions.ingest_require_generation(p->>'generation');
  IF jsonb_typeof(p->'bucket')IS DISTINCT FROM'string' OR octet_length(p->>'bucket')NOT BETWEEN 1 AND 255 THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: invalid inventory target';END IF;
@@ -486,31 +543,63 @@ CREATE TABLE sessions.ingest_history_reconcile_outbox(
 CREATE INDEX ingest_history_reconcile_pending ON sessions.ingest_history_reconcile_outbox(requested_at,native_key_sha256)WHERE state<>'complete';
 ALTER TABLE sessions.ingest_history_reconcile_outbox ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.ingest_history_reconcile_outbox FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
--- 620 is ACTIVE only once a scope is installed or a build is in flight. Until then (dormant) every
--- 620 trigger on the live ACK/control/directory paths returns immediately.
+-- 620 triggers run only while the kill switch is live AND a scope is installed or a build holds a LIVE
+-- lease. Otherwise (dormant, killed, or only crashed/expired/abandoned builds) every 620 trigger on the
+-- live ACK/control/directory paths returns immediately.
 CREATE FUNCTION sessions.ingest_history_active()RETURNS boolean
-LANGUAGE plpgsql STABLE SET search_path=pg_catalog,pg_temp AS $active$
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $active$
 BEGIN
- RETURN EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_builds WHERE state IN('keys','captured'));
+ RETURN sessions.ingest_history_live()AND(EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_builds WHERE state IN('keys','captured')AND lease_until>clock_timestamp()));
 END $active$;
--- A MANAGED scope has an installed version or an in-flight build. Only managed scopes are ever
--- invalidated or gated; every other session keeps the main (#224/legacy) behavior unchanged.
+-- A MANAGED scope has an INSTALLED current authority (and the kill switch is live); nothing else is
+-- managed. This is the ONE gate for every 620 effect on legacy state: invalidation, required_scopes,
+-- directory clears, replay-epoch advances, managed classification and every read gate. A build in
+-- flight, or a leftover/abandoned build, is NOT managed: a live change can only fence it (below), and
+-- every other session keeps the main (#224/legacy) behavior.
 CREATE FUNCTION sessions.ingest_history_scope_managed(p_org text,p_ws text,p_harness text,p_session text)RETURNS boolean
 LANGUAGE plpgsql STABLE SET search_path=pg_catalog,pg_temp AS $managed_scope$
 BEGIN
- RETURN EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current c WHERE c.org_id=p_org AND c.workspace_id=p_ws AND c.harness=p_harness AND c.session_id=p_session)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_builds b WHERE b.org_id=p_org AND b.workspace_id=p_ws AND b.harness=p_harness AND b.session_id=p_session
-   AND b.state IN('keys','captured'));
+ RETURN sessions.ingest_history_live()AND EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current c
+  WHERE c.org_id=p_org AND c.workspace_id=p_ws AND c.harness=p_harness AND c.session_id=p_session);
 END $managed_scope$;
-REVOKE ALL ON FUNCTION sessions.ingest_history_active(),sessions.ingest_history_scope_managed(text,text,text,text)
+-- Fence: abandon in-flight builds (keys/captured) so their install refuses ("lease lost") and the
+-- builder restarts from a fresh begin; the build's state is its fence version (keys -> captured ->
+-- installed | abandoned, never back). Rows are locked in build_id order (two concurrent ACKs cannot
+-- deadlock) and BEFORE any scope advisory lock or publication row is taken, so a fencing ACK never
+-- holds a lock a capture/install of the same build waits on. Touches only ingest_history_scope_builds:
+-- never the directory, required scopes, publications or any legacy table.
+CREATE FUNCTION sessions.ingest_history_fence_builds(p_builds uuid[])RETURNS void
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $fence$
+BEGIN
+ IF p_builds IS NULL OR cardinality(p_builds)=0 THEN RETURN;END IF;
+ PERFORM 1 FROM sessions.ingest_history_scope_builds WHERE build_id=ANY(p_builds)AND state IN('keys','captured')ORDER BY build_id FOR UPDATE;
+ UPDATE sessions.ingest_history_scope_builds SET state='abandoned',updated_at=clock_timestamp()
+  WHERE build_id=ANY(p_builds)AND state IN('keys','captured');
+END $fence$;
+REVOKE ALL ON FUNCTION sessions.ingest_history_active(),sessions.ingest_history_scope_managed(text,text,text,text),sessions.ingest_history_fence_builds(uuid[])
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 CREATE FUNCTION sessions.ingest_history_native_changed()RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $changed$
-DECLARE v_scope record;
+DECLARE v_scope record;v_builds uuid[];v_old uuid[];
 BEGIN
  -- Dormant: the production ACK (ingest_lazy_ack_batch) is untouched.
  IF NOT sessions.ingest_history_active()THEN RETURN NULL;END IF;
+ -- FIRST fence every in-flight build this statement touches: a native it registered as a key, or a
+ -- native seated (now, or before this UPDATE) in its scope. Fencing is the ONLY effect a build in
+ -- flight ever has on a live ACK: no invalidation, required scope, directory clear or epoch advance.
+ SELECT array_agg(DISTINCT b.build_id)INTO v_builds FROM sessions.ingest_history_scope_builds b WHERE b.state IN('keys','captured')AND b.lease_until>clock_timestamp()AND(
+  EXISTS(SELECT 1 FROM history_new n JOIN sessions.ingest_history_scope_build_records br ON br.record_id=n.record_id
+   WHERE br.build_id=b.build_id AND n.org_id=b.org_id AND n.workspace_id=b.workspace_id)
+  OR EXISTS(SELECT 1 FROM history_new n WHERE n.current_session IS NOT NULL AND n.org_id=b.org_id AND n.workspace_id=b.workspace_id
+   AND n.current_source=b.harness AND n.current_session=b.session_id));
+ IF TG_OP='UPDATE'THEN
+  SELECT array_agg(DISTINCT b.build_id)INTO v_old FROM sessions.ingest_history_scope_builds b WHERE b.state IN('keys','captured')AND b.lease_until>clock_timestamp()
+   AND EXISTS(SELECT 1 FROM history_old o WHERE o.current_session IS NOT NULL AND o.org_id=b.org_id AND o.workspace_id=b.workspace_id
+    AND o.current_source=b.harness AND o.current_session=b.session_id);
+  v_builds:=coalesce(v_builds,'{}')||coalesce(v_old,'{}');
+ END IF;
+ PERFORM sessions.ingest_history_fence_builds(v_builds);
  -- Reconcile requests only for natives that touch a managed scope (its key set or its current seat).
  -- A changed source identity re-requests the native instead of aborting the ACK.
  INSERT INTO sessions.ingest_history_reconcile_outbox(native_key_sha256,requested_lineage,source_identity_sha256,control_epoch,current_owner)
@@ -642,8 +731,10 @@ REVOKE ALL ON sessions.ingest_history_mask_pages,sessions.ingest_history_scope_v
 
 CREATE FUNCTION sessions.ingest_history_scope_required(p_org text,p_ws text,p_harness text,p_session text)RETURNS boolean
 LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $required$
- SELECT EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes r WHERE r.org_id=p_org AND r.workspace_id=p_ws AND r.harness=p_harness AND r.session_id=p_session)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current c WHERE c.org_id=p_org AND c.workspace_id=p_ws AND c.harness=p_harness AND c.session_id=p_session);
+ -- Installed authority only (same gate as ingest_history_scope_managed); a required_scopes row alone
+ -- (a leftover of any earlier state) never gates a read.
+ SELECT sessions.ingest_history_live()AND EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current c
+  WHERE c.org_id=p_org AND c.workspace_id=p_ws AND c.harness=p_harness AND c.session_id=p_session);
 $required$;
 REVOKE ALL ON FUNCTION sessions.ingest_history_scope_required(text,text,text,text)FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
@@ -715,7 +806,12 @@ ALTER TABLE sessions.ingest_history_scope_versions ADD COLUMN pointer_snapshot j
  ADD CONSTRAINT ingest_history_scope_versions_pointer_hash CHECK(pointer_snapshot_sha256=encode(sha256(convert_to(pointer_snapshot::text,'UTF8')),'hex')),
  ADD COLUMN pointer_count integer NOT NULL CHECK(pointer_count BETWEEN 0 AND 100000),
  ADD CONSTRAINT ingest_history_scope_versions_pointer_count CHECK(pointer_count=jsonb_array_length(pointer_snapshot)),
- ADD COLUMN feature_revision bigint CHECK(feature_revision>0);
+ ADD COLUMN feature_revision bigint CHECK(feature_revision>0),
+ -- AUTHORITY-INDEPENDENT content identity: sha256 of the source snapshot WITHOUT its history
+ -- (authorityId/ready/anchor) member, plus the mask root and record count. source_fingerprint names
+ -- the authority itself and so differs on every install; this one is equal exactly when a
+ -- replacement would republish the same content, which the install refuses.
+ ADD COLUMN content_fingerprint text NOT NULL CHECK(content_fingerprint~'^[a-f0-9]{64}$');
 CREATE UNIQUE INDEX ingest_history_scope_versions_feature_revision ON sessions.ingest_history_scope_versions(feature_revision)WHERE feature_revision IS NOT NULL;
 -- A version's identity and inventory are frozen once written; only lifecycle columns move, and
 -- the fingerprint/feature revision are bound exactly once (inside the installing transaction).
@@ -725,6 +821,7 @@ BEGIN
  IF NEW.authority_id<>OLD.authority_id OR NEW.org_id<>OLD.org_id OR NEW.workspace_id<>OLD.workspace_id OR NEW.harness<>OLD.harness
   OR NEW.session_id<>OLD.session_id OR NEW.source_epoch<>OLD.source_epoch OR NEW.mask_sha256<>OLD.mask_sha256 OR NEW.record_count<>OLD.record_count
   OR NEW.pointer_snapshot IS DISTINCT FROM OLD.pointer_snapshot OR NEW.pointer_snapshot_sha256<>OLD.pointer_snapshot_sha256 OR NEW.pointer_count<>OLD.pointer_count
+  OR NEW.content_fingerprint<>OLD.content_fingerprint
   OR(OLD.source_fingerprint IS NOT NULL AND NEW.source_fingerprint IS DISTINCT FROM OLD.source_fingerprint)
   OR(OLD.feature_revision IS NOT NULL AND NEW.feature_revision IS DISTINCT FROM OLD.feature_revision)
   OR(OLD.state='retired'AND NEW.state<>'retired')
@@ -770,9 +867,8 @@ RETURNS jsonb LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg
  ),'[]'::jsonb)) || coalesce((SELECT jsonb_build_object('history',jsonb_build_object('version',1,'required',true,'ready',c.ready AND v.source_epoch=a.epoch,
   'authorityId',v.authority_id,'maskSha256',v.mask_sha256,'recordCount',v.record_count::text,'derivedAnchorKey',v.derived_anchor_key))
   FROM sessions.ingest_history_scope_current c JOIN sessions.ingest_history_scope_versions v USING(authority_id)
-  WHERE c.org_id=p_org AND c.workspace_id=p_workspace AND c.harness=p_harness AND c.session_id=p_session),
-  (SELECT jsonb_build_object('history',jsonb_build_object('version',1,'required',true,'ready',false))
-    FROM sessions.ingest_history_required_scopes r WHERE r.org_id=p_org AND r.workspace_id=p_workspace AND r.harness=p_harness AND r.session_id=p_session),'{}'::jsonb) FROM sessions.session_replay_publications a
+  WHERE c.org_id=p_org AND c.workspace_id=p_workspace AND c.harness=p_harness AND c.session_id=p_session AND sessions.ingest_history_live()),
+  '{}'::jsonb) FROM sessions.session_replay_publications a
  WHERE a.org_id=p_org AND a.workspace_id=p_workspace AND a.harness=p_harness AND a.session_id=p_session;
 $snapshot$;
 
@@ -1110,6 +1206,8 @@ REVOKE ALL ON sessions.ingest_history_scope_owners,sessions.ingest_history_priva
 CREATE FUNCTION sessions.ingest_history_invalidate_scope(p_org text,p_ws text,p_harness text,p_session text)RETURNS void
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $invalidate$
 BEGIN
+ -- Only an INSTALLED authority is ever invalidated: nothing legacy moves for any other session.
+ IF NOT sessions.ingest_history_scope_managed(p_org,p_ws,p_harness,p_session)THEN RETURN;END IF;
  -- Waits (bounded by the install's short critical section): every other holder of this key only
  -- try-locks it, and the ACK path takes scope locks in sorted order, so this cannot deadlock.
  PERFORM pg_advisory_xact_lock(hashtextextended(concat_ws(chr(31),'96bulls:directory-events',p_org,p_ws,p_harness,p_session),0));
@@ -1125,9 +1223,26 @@ BEGIN
 END $invalidate$;
 CREATE FUNCTION sessions.ingest_history_control_changed()RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $privacy$
-DECLARE r record;
+DECLARE r record;v_builds uuid[];
 BEGIN
  IF NOT sessions.ingest_history_active()THEN RETURN NULL;END IF;
+ -- FIRST fence in-flight builds whose captured owner evidence this control change supersedes; a
+ -- build in flight is never invalidated (it is not managed).
+ SELECT array_agg(DISTINCT b.build_id)INTO v_builds FROM sessions.ingest_history_scope_builds b WHERE b.state IN('keys','captured')AND b.lease_until>clock_timestamp()
+  AND EXISTS(SELECT 1 FROM history_controls n JOIN sessions.ingest_history_scope_owners o
+   ON o.org_id=n.org_id AND o.workspace_id=n.workspace_id AND o.user_id=n.user_id
+   WHERE o.org_id=b.org_id AND o.workspace_id=b.workspace_id AND o.harness=b.harness AND o.session_id=b.session_id
+    AND(n.epoch<>o.control_epoch OR n.version>o.control_version));
+ -- Lock order is the ACK's everywhere: user fences (held by the control caller), THEN the receipt seat
+ -- clock, THEN build rows, THEN per-scope locks. The ACK takes the seat clock before its slot UPDATEs
+ -- reach scope locks, and ingest_lazy_clear takes it after this receipt INSERT; taking it here first
+ -- (only when there is 620 work) makes an ACK and a control of a scope owner wait, never 40P01.
+ IF v_builds IS NOT NULL OR EXISTS(SELECT 1 FROM history_controls n JOIN sessions.ingest_history_scope_owners o
+   ON o.org_id=n.org_id AND o.workspace_id=n.workspace_id AND o.user_id=n.user_id
+   WHERE(n.epoch<>o.control_epoch OR n.version>o.control_version)AND sessions.ingest_history_scope_managed(o.org_id,o.workspace_id,o.harness,o.session_id))THEN
+  PERFORM 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE;
+ END IF;
+ PERFORM sessions.ingest_history_fence_builds(v_builds);
  FOR r IN SELECT z.*FROM(
   SELECT DISTINCT o.org_id,o.workspace_id,o.harness,o.session_id FROM history_controls n JOIN sessions.ingest_history_scope_owners o
    ON o.org_id=n.org_id AND o.workspace_id=n.workspace_id AND o.user_id=n.user_id
@@ -1154,10 +1269,7 @@ CREATE OR REPLACE FUNCTION sessions.session_publication_is_managed(p_org text,p_
 RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $managed$
  SELECT EXISTS(SELECT 1 FROM sessions.ingest_publication_heads WHERE org_id=p_org AND workspace_id=p_ws
   AND physical_source=p_harness AND physical_session=p_session AND machine_id=p_machine)
- OR EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes r WHERE r.org_id=p_org AND r.workspace_id=p_ws AND r.harness=p_harness
-  AND(r.session_id=p_session OR r.session_id IN(SELECT coalesce(s.canonical_session_id,s.session_id)FROM sessions.session_index s
-    WHERE s.org_id=p_org AND s.workspace_id=p_ws AND s.harness=p_harness AND s.session_id=p_session AND s.machine_id=p_machine)))
- OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current c WHERE c.org_id=p_org AND c.workspace_id=p_ws AND c.harness=p_harness
+ OR sessions.ingest_history_live()AND EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current c WHERE c.org_id=p_org AND c.workspace_id=p_ws AND c.harness=p_harness
   AND(c.session_id=p_session OR c.session_id IN(SELECT coalesce(s.canonical_session_id,s.session_id)FROM sessions.session_index s
     WHERE s.org_id=p_org AND s.workspace_id=p_ws AND s.harness=p_harness AND s.session_id=p_session AND s.machine_id=p_machine)));
 $managed$;
@@ -1165,8 +1277,9 @@ CREATE FUNCTION sessions.ingest_history_directory_state()RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $directory_state$
 DECLARE assigned text;
 BEGIN
- IF NOT EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes r WHERE r.org_id=NEW.org_id AND r.workspace_id=NEW.workspace_id AND r.harness=NEW.harness AND r.session_id=NEW.session_id)
-  AND NOT EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current c WHERE c.org_id=NEW.org_id AND c.workspace_id=NEW.workspace_id AND c.harness=NEW.harness AND c.session_id=NEW.session_id)THEN RETURN NEW;END IF;
+ -- Installed authority only: every other row (including one with a leftover build or required-scope
+ -- row) keeps the legacy summarizer/classifier behavior unchanged.
+ IF NOT sessions.ingest_history_scope_managed(NEW.org_id,NEW.workspace_id,NEW.harness,NEW.session_id)THEN RETURN NEW;END IF;
  IF NEW.deleted_at IS NULL AND(TG_OP='INSERT'OR NEW.event_projection_epoch IS NOT DISTINCT FROM OLD.event_projection_epoch)THEN
   SELECT q.state INTO assigned FROM sessions.ingest_history_states q JOIN sessions.ingest_history_scope_current c
    ON c.org_id=q.org_id AND c.workspace_id=q.workspace_id AND c.harness=q.harness AND c.session_id=q.session_id AND c.authority_id=q.authority_id AND c.ready
@@ -1200,8 +1313,7 @@ BEGIN
  IF p_nonce IS NULL OR p_lease_seconds IS NULL OR p_lease_seconds NOT BETWEEN 30 AND 300 THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='large read: invalid lease'; END IF;
  FOR j IN SELECT * FROM sessions.session_large_read_jobs WHERE
  ((state='queued' AND available_at<=clock_timestamp()) OR (state='running' AND lease_expires_at<=clock_timestamp()))
- AND NOT EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes h WHERE h.org_id=session_large_read_jobs.org_id AND h.workspace_id=session_large_read_jobs.workspace_id AND h.harness=session_large_read_jobs.harness AND h.session_id=session_large_read_jobs.session_id)
- AND NOT EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current h WHERE h.org_id=session_large_read_jobs.org_id AND h.workspace_id=session_large_read_jobs.workspace_id AND h.harness=session_large_read_jobs.harness AND h.session_id=session_large_read_jobs.session_id)
+ AND NOT(sessions.ingest_history_live()AND EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current h WHERE h.org_id=session_large_read_jobs.org_id AND h.workspace_id=session_large_read_jobs.workspace_id AND h.harness=session_large_read_jobs.harness AND h.session_id=session_large_read_jobs.session_id))
  ORDER BY available_at,updated_at LIMIT 100 FOR UPDATE SKIP LOCKED LOOP
   IF j.attempts>=5 THEN
    UPDATE sessions.session_large_read_jobs SET state='failed',lease_nonce=NULL,lease_expires_at=NULL,last_error='attempts_exhausted',updated_at=now() WHERE org_id=j.org_id AND workspace_id=j.workspace_id AND harness=j.harness AND session_id=j.session_id;
@@ -1361,10 +1473,7 @@ BEGIN
   END IF;
   -- Raw revision equality cannot attest a globally moved record's brief.
   -- Preserve absent/unmanaged behavior; managed text requires qualified input.
-  IF EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes r WHERE r.org_id=v_org AND r.workspace_id=p_workspace_id AND r.harness=p_harness
-    AND(r.session_id=p_session_id OR r.session_id IN(SELECT coalesce(i.canonical_session_id,i.session_id)FROM sessions.session_index i
-      WHERE i.org_id=v_org AND i.workspace_id=p_workspace_id AND i.harness=p_harness AND i.session_id=p_session_id)))
-   OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current r WHERE r.org_id=v_org AND r.workspace_id=p_workspace_id AND r.harness=p_harness
+  IF sessions.ingest_history_live()AND EXISTS(SELECT 1 FROM sessions.ingest_history_scope_current r WHERE r.org_id=v_org AND r.workspace_id=p_workspace_id AND r.harness=p_harness
     AND(r.session_id=p_session_id OR r.session_id IN(SELECT coalesce(i.canonical_session_id,i.session_id)FROM sessions.session_index i
       WHERE i.org_id=v_org AND i.workspace_id=p_workspace_id AND i.harness=p_harness AND i.session_id=p_session_id)))THEN
    RAISE EXCEPTION USING ERRCODE='0A000',MESSAGE='history: qualified brief metadata not ready';END IF;
@@ -1434,7 +1543,7 @@ BEGIN
  IF octet_length(live::text)>8388608 THEN RAISE EXCEPTION USING ERRCODE='54000',MESSAGE='history summary: source metadata capacity exceeded';END IF;
  fp:=encode(sha256(convert_to(live::text,'UTF8')),'hex');
  required:=live#>>'{history,required}'IS NOT DISTINCT FROM'true'
-  OR EXISTS(SELECT 1 FROM sessions.ingest_history_required_scopes r WHERE r.org_id=org AND r.workspace_id=p_workspace_id AND r.harness=p_harness AND r.session_id=p_session_id);
+  OR sessions.ingest_history_scope_required(org,p_workspace_id,p_harness,p_session_id);
  present:=jsonb_array_length(live->'pointers')>0 AND jsonb_typeof(live->'directory')IS NOT DISTINCT FROM'object'AND live#>>'{directory,deleted_at}'IS NULL;
  IF required AND present THEN
   SELECT m.generation INTO generation FROM sessions.__96bulls_role_validation m WHERE m.name='session_directory_search_worker'AND m.status='pass'AND m.generation~'^[a-f0-9]{64}$';
@@ -1585,6 +1694,8 @@ CREATE TABLE sessions.ingest_history_scope_builds(
 );
 CREATE INDEX ingest_history_scope_builds_scope ON sessions.ingest_history_scope_builds(org_id,workspace_id,harness,session_id,created_at);
 CREATE INDEX ingest_history_scope_builds_retention ON sessions.ingest_history_scope_builds(org_id,created_at);
+-- The live ACK/control fence scans only in-flight builds (a handful), never the retained history.
+CREATE INDEX ingest_history_scope_builds_in_flight ON sessions.ingest_history_scope_builds(org_id,workspace_id,harness,session_id)WHERE state IN('keys','captured');
 ALTER TABLE sessions.ingest_history_scope_builds ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.ingest_history_scope_builds FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
@@ -1609,6 +1720,8 @@ DECLARE o text;w text;h text;sid text;cur uuid;v_build uuid:=gen_random_uuid();v
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','identity']);
  PERFORM sessions.ingest_require_generation(p->>'generation');
+ PERFORM 1 FROM sessions.ingest_history_switch WHERE singleton AND live FOR SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: 620 is switched off';END IF;
  PERFORM sessions.ingest_exact_keys(p->'identity',ARRAY['orgId','workspaceId','source','sessionId']);
  o:=sessions.ingest_identifier(p#>'{identity,orgId}',false);w:=sessions.ingest_identifier(p#>'{identity,workspaceId}',true);
  h:=sessions.ingest_identifier(p#>'{identity,source}',false);sid:=sessions.ingest_identifier(p#>'{identity,sessionId}',false);
@@ -1679,7 +1792,7 @@ CREATE FUNCTION sessions.ingest_history_scope_install(p jsonb)RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $scopeinstall$
 DECLARE b sessions.ingest_history_scope_builds%ROWTYPE;m sessions.ingest_history_mask_pages%ROWTYPE;cur uuid;v_epoch bigint;v_req bigint;
  v_snapshot jsonb;v_ptr text;v_deleted timestamptz;v_id uuid:=gen_random_uuid();v_fp text;v_anchor text;v_root text;v_n bigint;
- prior sessions.ingest_history_scope_versions%ROWTYPE;v_pointers jsonb;v_rev bigint;
+ prior sessions.ingest_history_scope_versions%ROWTYPE;v_pointers jsonb;v_rev bigint;v_content text;
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
  PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','buildId','leaseToken','maskSha256','recordCount','derivedAnchorKey','bucket','region','keyRoot']);
@@ -1688,6 +1801,10 @@ BEGIN
   OR EXISTS(SELECT 1 FROM unnest(ARRAY['derivedAnchorKey','bucket','region','keyRoot'])k WHERE jsonb_typeof(p->k)IS DISTINCT FROM'string'OR char_length(p->>k)NOT BETWEEN 1 AND 1024)
   OR p->>'keyRoot'!~'^[a-z0-9][a-z0-9-]{0,62}$'OR p->>'region'!~'^[a-z]{2}(-[a-z]+)+-[0-9]$'
  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: invalid scope install evidence';END IF;
+ -- Switch row (FOR SHARE) BEFORE the build row: the same order as ingest_history_set_live, so a
+ -- concurrent switch-off waits for this install (or this install refuses), never a deadlock.
+ PERFORM 1 FROM sessions.ingest_history_switch WHERE singleton AND live FOR SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: 620 is switched off';END IF;
  b:=sessions.ingest_history_scope_build_locked(p,'captured');
  v_anchor:=p->>'derivedAnchorKey';v_root:=(p->>'keyRoot')||'/'||b.org_id||'/';
  IF left(v_anchor,length(v_root))<>v_root OR right(v_anchor,length('/manifest.json'))<>'/manifest.json'OR v_anchor~'(^|/)[.]{1,2}(/|$)'OR v_anchor~'//'
@@ -1721,15 +1838,24 @@ BEGIN
   OR EXISTS(SELECT 1 FROM sessions.ingest_history_mask_rows(m.sha256,0,m.record_count::integer)r WHERE NOT EXISTS(
    SELECT 1 FROM sessions.ingest_history_scope_build_records br WHERE br.build_id=b.build_id AND br.record_id=r.record_id))
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: mask record set does not equal the build key set';END IF;
+ -- Authority-independent content identity, from the snapshot re-read under the scope lock BEFORE any
+ -- swap: the 'history' member (prior authorityId/ready/anchor) is dropped, so two installs over the
+ -- same epoch, directory, pending set, frozen pointer inventory and mask are equal.
+ v_content:=encode(sha256(convert_to(((v_snapshot-'history')||jsonb_build_object('mask',jsonb_build_object(
+  'sha256',m.sha256,'recordCount',m.record_count::text)))::text,'UTF8')),'hex');
  -- Replacement: pin the PRIOR authority and its exact pointer inventory BEFORE the pointer CAS.
  IF cur IS NOT NULL THEN
   SELECT *INTO prior FROM sessions.ingest_history_scope_versions WHERE authority_id=cur FOR UPDATE;
   IF NOT FOUND OR prior.state<>'ready'OR prior.source_fingerprint IS NULL THEN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: prior authority not retirable';END IF;
+  -- No identical-content replacement: refuse BEFORE anything moves (current row, versions,
+  -- derived objects and journal stay exactly as they are).
+  IF v_content=prior.content_fingerprint THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: replacement does not change the source content';END IF;
  END IF;
  INSERT INTO sessions.ingest_history_scope_versions(authority_id,org_id,workspace_id,harness,session_id,source_epoch,source_fingerprint,mask_sha256,record_count,
-  derived_anchor_key,bucket,region,key_root,state,pointer_snapshot_sha256,pointer_snapshot,pointer_count)
-  VALUES(v_id,b.org_id,b.workspace_id,b.harness,b.session_id,v_epoch,NULL,m.sha256,m.record_count,v_anchor,p->>'bucket',p->>'region',p->>'keyRoot','ready',v_ptr,v_pointers,jsonb_array_length(v_pointers));
+  derived_anchor_key,bucket,region,key_root,state,pointer_snapshot_sha256,pointer_snapshot,pointer_count,content_fingerprint)
+  VALUES(v_id,b.org_id,b.workspace_id,b.harness,b.session_id,v_epoch,NULL,m.sha256,m.record_count,v_anchor,p->>'bucket',p->>'region',p->>'keyRoot','ready',v_ptr,v_pointers,jsonb_array_length(v_pointers),v_content);
  INSERT INTO sessions.ingest_history_scope_current AS c VALUES(b.org_id,b.workspace_id,b.harness,b.session_id,v_id,true)
   ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET authority_id=EXCLUDED.authority_id,ready=true;
  IF cur IS NOT NULL THEN
@@ -1739,8 +1865,6 @@ BEGIN
  -- The fingerprint binds the snapshot that now names this authority as current and ready.
  v_fp:=encode(sha256(convert_to(sessions.session_replay_source_snapshot(b.org_id,b.workspace_id,b.harness,b.session_id)::text,'UTF8')),'hex');
  UPDATE sessions.ingest_history_scope_versions SET source_fingerprint=v_fp WHERE authority_id=v_id;
- IF cur IS NOT NULL AND v_fp=prior.source_fingerprint THEN
-  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: replacement does not change the source fingerprint';END IF;
  -- 610 compose point: the feature journal append is atomic with the pointer CAS above;
  -- any later failure or rollback of this transaction emits nothing.
  -- Replacement emits retire(prior authority, prior inventory) then publish(new authority, new
@@ -1759,6 +1883,50 @@ BEGIN
   'source',jsonb_build_object('epoch',v_epoch::text,'fingerprint',v_fp),'maskSha256',m.sha256,'recordCount',m.record_count::text,
   'featureRevision',v_rev::text);
 END $scopeinstall$;
+-- Owner-only operational switch. OFF: abandon every in-flight build, then every live hook and read gate
+-- is inert (main behavior) with all ledgers kept. ON (from off): every installed scope is invalidated,
+-- because ACKs/controls while off were not tracked; its next build re-derives it. Lock order: seat
+-- clock, switch row, build rows (sorted), scope locks (sorted) - the ACK's order; begin/install take
+-- the switch row before any build row.
+CREATE FUNCTION sessions.ingest_history_set_live(p_live boolean)RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $set_live$
+DECLARE w sessions.ingest_history_switch%ROWTYPE;r record;n bigint:=0;v_builds uuid[];
+BEGIN
+ IF p_live IS NULL THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: switch value required';END IF;
+ PERFORM 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE;
+ SELECT *INTO STRICT w FROM sessions.ingest_history_switch WHERE singleton FOR UPDATE;
+ IF w.live=p_live THEN RETURN jsonb_build_object('live',p_live,'changed',false);END IF;
+ -- Both transitions abandon every in-flight build: one begun before OFF, or one that raced the switch
+ -- and captured while OFF, saw changes no trigger fenced. Its builder starts again.
+ SELECT array_agg(build_id)INTO v_builds FROM sessions.ingest_history_scope_builds WHERE state IN('keys','captured');
+ PERFORM sessions.ingest_history_fence_builds(v_builds);
+ IF NOT p_live THEN
+  UPDATE sessions.ingest_history_switch SET live=false,changed_at=clock_timestamp()WHERE singleton;
+  RETURN jsonb_build_object('live',false,'changed',true,'abandonedBuilds',coalesce(cardinality(v_builds),0)::text);
+ END IF;
+ UPDATE sessions.ingest_history_switch SET live=true,changed_at=clock_timestamp()WHERE singleton;
+ FOR r IN SELECT org_id,workspace_id,harness,session_id FROM sessions.ingest_history_scope_current
+  ORDER BY org_id COLLATE"C",workspace_id COLLATE"C",harness COLLATE"C",session_id COLLATE"C" LOOP
+  PERFORM sessions.ingest_history_invalidate_scope(r.org_id,r.workspace_id,r.harness,r.session_id);n:=n+1;
+ END LOOP;
+ RETURN jsonb_build_object('live',true,'changed',true,'invalidatedScopes',n::text,'abandonedBuilds',coalesce(cardinality(v_builds),0)::text);
+END $set_live$;
+-- Owner-only: arm/disarm the session_index pointer-reference trigger. Disarming drops refs_complete
+-- (later writes are untracked); re-arming requires a fresh full ingest_history_pointer_ref_backfill pass.
+CREATE FUNCTION sessions.ingest_history_set_pointer_tracking(p_on boolean)RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $set_tracking$
+BEGIN
+ IF p_on IS NULL THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='history: switch value required';END IF;
+ -- Arming waits for every in-flight session_index writer (SHARE blocks new writers only until this
+ -- short transaction commits): a writer that began before the arm cannot commit an untracked row
+ -- after the backfill has passed its key. Run with a lock_timeout.
+ IF p_on THEN LOCK TABLE sessions.session_index IN SHARE MODE;END IF;
+ UPDATE sessions.ingest_history_switch SET pointer_tracking=p_on,refs_complete=CASE WHEN p_on THEN refs_complete ELSE false END,changed_at=clock_timestamp()
+  WHERE singleton AND pointer_tracking IS DISTINCT FROM p_on;
+ RETURN(SELECT jsonb_build_object('pointerTracking',pointer_tracking,'refsComplete',refs_complete)FROM sessions.ingest_history_switch WHERE singleton);
+END $set_tracking$;
+REVOKE ALL ON FUNCTION sessions.ingest_history_set_live(boolean),sessions.ingest_history_set_pointer_tracking(boolean)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 -- CREATE FUNCTION grants EXECUTE to PUBLIC by default: close it before granting the ingest role.
 REVOKE ALL ON FUNCTION sessions.ingest_history_scope_build_locked(jsonb,text),sessions.ingest_history_scope_begin(jsonb),sessions.ingest_history_scope_build_keys(jsonb),
  sessions.ingest_history_scope_capture(jsonb),sessions.ingest_history_scope_install(jsonb)FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest_seeder;

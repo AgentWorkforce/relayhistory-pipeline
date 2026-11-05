@@ -206,6 +206,9 @@
     "sessions.ingest_history_enqueue_graph(text,text,text,text,text)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_history_fence_builds(uuid[])": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_history_invalidate_scope(text,text,text,text)": [
       "<owner>:EXECUTE"
     ],
@@ -231,6 +234,9 @@
     "sessions.ingest_history_inventory_refs(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_history_live()": [
+      "<owner>:EXECUTE"
     ],
     "sessions.ingest_history_mask_get(jsonb)": [
       "<owner>:EXECUTE",
@@ -315,10 +321,19 @@
     "sessions.ingest_history_scope_version_frozen()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_history_set_live(boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_set_pointer_tracking(boolean)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_history_source_current(jsonb,boolean)": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_history_sync_pointer()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_history_tracking()": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_identifier(jsonb,boolean)": [

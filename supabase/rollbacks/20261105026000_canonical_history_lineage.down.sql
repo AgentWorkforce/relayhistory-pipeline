@@ -1,12 +1,18 @@
 -- Generated from620 owned definitions + authoritative560 originals. Stop all620/630 workers first.
 -- Operational rollback retains installed authority/object ledgers; never forget late PUT obligations.
-DO $rollback_guard$ BEGIN
+DO $rollback_guard$ DECLARE v_later boolean; BEGIN
 -- Named operational rollback: allowed while no authority was ever installed (no plans, versions,
 -- derived objects or model work). Re-derivable queues (reconcile/privacy outbox, required scopes,
 -- in-flight builds) are discarded with the schema; installed authority always blocks.
  IF EXISTS(SELECT 1 FROM sessions.ingest_history_plans)OR EXISTS(SELECT 1 FROM sessions.ingest_history_scope_versions)
   OR EXISTS(SELECT 1 FROM sessions.ingest_history_derived_objects)OR to_regprocedure('sessions.session_history_model_claim(jsonb)')IS NOT NULL
- THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: retain authority/object ledgers; stop consumers for operational rollback';END IF;
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: retain authority/object ledgers; use sessions.ingest_history_set_live(false)';END IF;
+-- The down removes this file's ledger row so the next migrate reapplies it (no function_acl_drift): only
+-- possible while it is the LAST applied upstream file, else sequencePreflight would see a ledger_gap.
+ IF to_regclass('sessions.__96bulls_migrations')IS NOT NULL THEN
+  EXECUTE 'SELECT EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE ''upstream:%'' AND name COLLATE "C">''upstream:20261105026000_canonical_history_lineage.sql'')'INTO v_later;
+  IF v_later THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='history: a later migration is applied; use sessions.ingest_history_set_live(false)';END IF;
+ END IF;
 END $rollback_guard$;
 DROP TRIGGER IF EXISTS ingest_history_pointer_sync ON sessions.session_index;
 DROP TRIGGER IF EXISTS ingest_history_native_insert ON sessions.ingest_lazy_native_slots;
@@ -280,6 +286,8 @@ BEGIN
    'index',jsonb_build_object('key',a.index_key,'sha256',a.index_sha256,'bytes',a.index_bytes)) ELSE '{}'::jsonb END;
 END $claim$;
 DROP FUNCTION IF EXISTS
+ sessions.ingest_history_set_pointer_tracking(boolean),
+ sessions.ingest_history_set_live(boolean),
  sessions.ingest_history_scope_install(jsonb),
  sessions.ingest_history_scope_capture(jsonb),
  sessions.ingest_history_scope_build_keys(jsonb),
@@ -311,6 +319,7 @@ DROP FUNCTION IF EXISTS
  sessions.ingest_history_scope_required(text,text,text,text),
  sessions.ingest_history_reconcile_backfill(text,integer),
  sessions.ingest_history_native_changed(),
+ sessions.ingest_history_fence_builds(uuid[]),
  sessions.ingest_history_scope_managed(text,text,text,text),
  sessions.ingest_history_active(),
  sessions.ingest_history_plan_refs_page(jsonb),
@@ -328,7 +337,9 @@ DROP FUNCTION IF EXISTS
  sessions.ingest_history_pointer_ref_backfill(jsonb,integer),
  sessions.ingest_history_sync_pointer(),
  sessions.ingest_history_pointer(sessions.session_index),
- sessions.ingest_history_root(text);
+ sessions.ingest_history_root(text),
+ sessions.ingest_history_tracking(),
+ sessions.ingest_history_live();
 DROP TABLE IF EXISTS
  sessions.ingest_history_scope_build_records,
  sessions.ingest_history_scope_builds,
@@ -351,6 +362,12 @@ DROP TABLE IF EXISTS
  sessions.ingest_history_scan_pages,
  sessions.ingest_history_scan_refs,
  sessions.ingest_history_pointer_refs,
- sessions.ingest_history_carriers;
+ sessions.ingest_history_carriers,
+ sessions.ingest_history_switch;
 DROP SEQUENCE IF EXISTS sessions.ingest_history_inventory_epoch;
 ALTER TABLE sessions.session_large_read_jobs DROP COLUMN history_generation;
+DO $ledger$ BEGIN
+ IF to_regclass('sessions.__96bulls_migrations')IS NOT NULL THEN
+  DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105026000_canonical_history_lineage.sql';
+ END IF;
+END $ledger$;

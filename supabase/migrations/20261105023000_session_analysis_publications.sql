@@ -1,4 +1,7 @@
 -- Append-only release rename (registry v2); upstream provenance: 20261103060000_session_analysis_publications.sql. Never applied under the upstream filename in this release.
+-- Fail fast instead of queueing live readers/writers behind a blocked DDL lock (migrate.ts applies
+-- each file in one transaction, so SET LOCAL lasts exactly as long as this file).
+SET LOCAL lock_timeout='5s';
 -- Immutable full v1 payloads live in object storage, not this pointer catalog.
 CREATE TABLE sessions.session_analysis_publications (
  org_id text NOT NULL,workspace_id text NOT NULL,harness text NOT NULL,session_id text NOT NULL,
