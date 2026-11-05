@@ -311,17 +311,17 @@ function sameRecord(
   left: RelayhistoryStreamRecord,
   right: RelayhistoryStreamRecord,
 ): boolean {
-  const content = ({
-    received_at: _at,
-    accepted_seq: _seq,
-    ...rest
-  }: RelayhistoryStreamRecord) => encoded(canonical(rest));
-  return content(left) === content(right);
+  return relayhistoryRevisionContent(left) === relayhistoryRevisionContent(right);
+}
+/** Exact same-revision content domain, shared by proof indexes without retaining payloads. */
+export function relayhistoryRevisionContent(record: RelayhistoryStreamRecord): string {
+  const { received_at: _at, accepted_seq: _seq, ...rest } = record;
+  return encoded(canonical(rest));
 }
 
 function receivedFirst(
-  left: RelayhistoryStreamRecord,
-  right: RelayhistoryStreamRecord,
+  left: RelayhistoryRevisionSeat,
+  right: RelayhistoryRevisionSeat,
 ): boolean {
   return (
     (Date.parse(left.received_at) - Date.parse(right.received_at) ||
@@ -370,6 +370,33 @@ export function lastAccepted(
   return BigInt(right.accepted_seq) > BigInt(left.accepted_seq) ? right : left;
 }
 
+export interface RelayhistoryRevisionSeat {
+  revision: string;
+  received_at: string;
+  accepted_seq?: string;
+}
+/**
+ * The authoritative per-origin revision fold. Evidence indexes may supply a
+ * cryptographic content comparison; projection supplies the exact content domain.
+ * Tombstones remain seats here: only projection removes them afterwards.
+ */
+export function chooseRelayhistoryRevision<T extends RelayhistoryRevisionSeat>(
+  previous: T | undefined,
+  record: T,
+  sameContent: (left: T, right: T) => boolean,
+): T {
+  if (!previous || BigInt(record.revision) > BigInt(previous.revision)) return record;
+  if (BigInt(record.revision) !== BigInt(previous.revision)) return previous;
+  if (!sameContent(record, previous))
+    fail("relayhistory_revision_conflict", "equal RelayHistory revisions contain different records");
+  if (record.accepted_seq !== undefined && previous.accepted_seq !== undefined &&
+      BigInt(record.accepted_seq) !== BigInt(previous.accepted_seq))
+    fail("relayhistory_acceptance_conflict", "copies of one RelayHistory record name different acceptance seats");
+  const first = receivedFirst(record, previous) ? record : previous;
+  const seq = record.accepted_seq ?? previous.accepted_seq;
+  return seq === undefined ? first : { ...first, accepted_seq: seq };
+}
+
 /** Latest live records, deterministic regardless of live/backfill arrival order. */
 export function normalizeRelayhistoryRecords(
   records: readonly RelayhistoryStreamRecord[],
@@ -377,45 +404,12 @@ export function normalizeRelayhistoryRecords(
   const latest = new Map<string, RelayhistoryStreamRecord>();
   for (const record of records) {
     const key = recordKey(record);
-    const previous = latest.get(key);
-    if (!previous || BigInt(record.revision) > BigInt(previous.revision)) {
-      latest.set(key, record);
-      continue;
-    }
-    if (BigInt(record.revision) !== BigInt(previous.revision)) continue;
-    if (!sameRecord(record, previous))
-      fail(
-        "relayhistory_revision_conflict",
-        "equal RelayHistory revisions contain different records",
-      );
-    // One record stored twice: the earlier copy wins whichever arrived first,
-    // so the output bytes do not depend on arrival order.
-    if (
-      record.accepted_seq !== undefined &&
-      previous.accepted_seq !== undefined &&
-      BigInt(record.accepted_seq) !== BigInt(previous.accepted_seq)
-    )
-      fail(
-        "relayhistory_acceptance_conflict",
-        "copies of one RelayHistory record name different acceptance seats",
-      );
-    const first = receivedFirst(record, previous) ? record : previous;
-    const seq = record.accepted_seq ?? previous.accepted_seq;
-    latest.set(
-      key,
-      seq === undefined ? first : { ...first, accepted_seq: seq },
-    );
+    latest.set(key, chooseRelayhistoryRevision(latest.get(key), record, sameRecord));
   }
   return newestAcrossOrigins(latest.values())
-    .filter(
-      (record) => record.operation === "upsert" && record.payload !== null,
-    )
-    .sort(
-      (left, right) =>
-        eventTime(left) - eventTime(right) ||
-        compareText(left.origin_id, right.origin_id) ||
-        compareText(left.record_id, right.record_id),
-    );
+    .filter((record) => record.operation === "upsert" && record.payload !== null)
+    .sort((left, right) => eventTime(left) - eventTime(right) ||
+      compareText(left.origin_id, right.origin_id) || compareText(left.record_id, right.record_id));
 }
 
 async function defaultDecompress(

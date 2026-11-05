@@ -1,4 +1,4 @@
-// Copied from AgentWorkforce/relayhistory-cloud packages/relayhistory/src/auth/relayauth.ts at 6f6d568849c483be8e3a2a5aaeba3da1d4b47de9 (96BullSessions stand-in; changes: an unknown kid refetches the JWKS, see getJwks; MOVE_NOTES.md; and the migration-assertion verifier ported from relayhistory-cloud feat/migration-assertion-ingest, see #43).
+// Copied from AgentWorkforce/relayhistory-cloud packages/relayhistory/src/auth/relayauth.ts at 6f6d568849c483be8e3a2a5aaeba3da1d4b47de9 (96BullSessions stand-in; changes: an unknown kid refetches the JWKS, see getJwks; verifyOriginBoundAssertion, see MOVE_NOTES.md; and the migration-assertion verifier ported from relayhistory-cloud feat/migration-assertion-ingest, see #43).
 import { analyticsFromVerifiedAssertion } from "./analytics-identity.js";
 import type { AuthContext, Bindings } from "../env.js";
 import {
@@ -208,6 +208,61 @@ export async function verifyMigrationAssertion(
     throw new IdentityError(
       "invalid_token",
       "only RelayAuth migration assertions are accepted on this path",
+    );
+  }
+  return auth;
+}
+
+/**
+ * 96BullSessions: the deployment path of a History with an origin
+ * (`RELAYHISTORY_ORIGIN`), on without the broad interim bearer. Upstream
+ * accepts the same token at `/v1/auth/cli/login` and exchanges it for an
+ * `rth_` session; the AlleyOop ingest has no session store, so the courier
+ * presents the assertion itself on every request.
+ *
+ * The full RelayAuth verification (RS256 against `RELAYAUTH_JWKS_URL`, exact
+ * issuer, expiry), then only RelayAuth's dedicated History assertion class
+ * (`sub` agent_relayhistory_assertion and `meta.tokenClass`
+ * relayhistory_assertion, which only `/v1/tokens/relayhistory-assertion`
+ * signs) whose sole audience is exactly this origin. The legacy shared
+ * audience is never admitted here, whatever
+ * `RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS` says. A migration assertion still
+ * needs its own default-off flag and passes its own contract.
+ */
+export async function verifyOriginBoundAssertion(
+  token: string,
+  env: Parameters<typeof verifyAgentRelayToken>[1],
+): Promise<AuthContext> {
+  const origin = configuredHistoryOrigin(env);
+  if (!origin) {
+    throw new IdentityError(
+      "invalid_claims",
+      "origin-bound assertions need RELAYHISTORY_ORIGIN",
+    );
+  }
+  const auth = await verifyAgentRelayToken(token, {
+    ...env,
+    RELAYHISTORY_ACCEPT_LEGACY_ASSERTIONS: "false",
+  });
+  if (auth.migration) {
+    // Reached only with RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS on
+    // (validateClaims), and origin-bound by its own audience rule.
+    if (!isMigrationAssertionClass(auth.claims)) {
+      throw new IdentityError(
+        "invalid_token",
+        "migration assertion class is malformed",
+      );
+    }
+    return auth;
+  }
+  if (
+    auth.historyOrigin !== origin ||
+    soleAudience(auth.claims.aud as JwtClaims["aud"]) !== origin ||
+    !isRelayhistoryAssertionClass(auth.claims)
+  ) {
+    throw new IdentityError(
+      "invalid_token",
+      "only RelayAuth assertions minted for this History's origin are accepted",
     );
   }
   return auth;

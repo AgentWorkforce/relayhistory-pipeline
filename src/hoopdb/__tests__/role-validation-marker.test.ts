@@ -50,6 +50,13 @@ const VERIFY = readFileSync(
   join(root, "supabase/bootstrap/session_directory_search_worker_verify.sql"),
   "utf8",
 );
+const TOKEN_VERIFY = readFileSync(
+  join(root, "supabase/bootstrap/session_token_verifier_verify.sql"),
+  "utf8",
+);
+
+const SEEDER_VERIFY = readFileSync(join(root,"supabase/bootstrap/session_ingest_seeder_verify.sql"),"utf8");
+const INGEST_VERIFY = readFileSync(join(root,"supabase/bootstrap/session_ingest_verify.sql"),"utf8");
 
 const open: PGlite[] = [];
 afterEach(async () => {
@@ -252,6 +259,7 @@ describe("Worker role validation marker", () => {
     // The external verifier's transaction (the mark_pass.sql contract, minus psql).
     await db.exec(`BEGIN; SELECT pg_advisory_xact_lock(961996, 1);
       ${VERIFY}
+      ${TOKEN_VERIFY}
       UPDATE ${ROLE_VALIDATION_TABLE} SET status = 'pass', updated_at = now()
        WHERE name = '${WORKER}' AND generation = '${await generation()}' AND status = 'pending';
       COMMIT;`);
@@ -401,9 +409,12 @@ describe("the live gate: the marker is never the sole authority", () => {
     );
     expect(seen[4]).toStartWith("SELECT generation, status FROM");
     expect(seen[5]).toBe(VERIFY);
-    expect(seen[6]).toBe(SESSIONS_FUNCTION_GATE_SQL); // the live sessions-function boundary
-    expect(seen[7]).toStartWith("SELECT generation, status FROM"); // the final read
-    expect(seen).toHaveLength(8);
+    expect(seen[6]).toBe(TOKEN_VERIFY);
+    expect(seen[7]).toBe(SEEDER_VERIFY);
+    expect(seen[8]).toBe(INGEST_VERIFY);
+    expect(seen[9]).toBe(SESSIONS_FUNCTION_GATE_SQL); // the live sessions-function boundary
+    expect(seen[10]).toStartWith("SELECT generation, status FROM"); // the final read
+    expect(seen).toHaveLength(11);
     // No advisory lock anywhere on the probe path.
     expect(seen.some((q) => /advisory/i.test(q))).toBe(false);
     // One source: the migrator's verify step and mark_pass.sql use the same file.
@@ -526,9 +537,15 @@ describe("the live gate: the marker is never the sole authority", () => {
       .map((l) =>
         l === "\\ir session_directory_search_worker_verify.sql"
           ? VERIFY
-          : l
-              .replace(":'generation'", `'${gen.replace(/'/g, "''")}'`)
-              .replace(":'db_mode'", "'local'"),
+          : l === "\\ir session_token_verifier_verify.sql"
+            ? TOKEN_VERIFY
+            : l === "\\ir session_ingest_seeder_verify.sql"
+              ? SEEDER_VERIFY
+              : l === "\\ir session_ingest_verify.sql"
+                ? INGEST_VERIFY
+                : l
+                .replace(":'generation'", `'${gen.replace(/'/g, "''")}'`)
+                .replace(":'db_mode'", "'local'"),
       )
       .join("\n");
   const runMarkPass = async (db: PGlite, gen: string) => {
@@ -568,5 +585,62 @@ describe("the live gate: the marker is never the sole authority", () => {
     expect((await runMarkPass(db, gen))?.message).toContain(
       "no pending role validation for generation",
     );
+  });
+});
+
+describe("role check deadlock retry (40P01)", () => {
+  /** Fails the first `failures` submissions of the first verify SQL with a deadlock. */
+  function deadlocking(db: PGlite, failures: number) {
+    const base = client(db);
+    let seen = 0;
+    return {
+      get attempts() { return seen; },
+      client: {
+        async query<R>(text: string, params?: unknown[]) {
+          if (text === VERIFY) {
+            seen += 1;
+            if (seen <= failures)
+              throw Object.assign(new Error("deadlock detected"), { code: "40P01" });
+          }
+          return base.query<R>(text, params);
+        },
+      } as MigrationClient,
+    };
+  }
+
+  test("a deadlocked verify transaction rolls back and the retry marks PASS", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const dl = deadlocking(db, 1);
+    const result = await runMigrations(dl.client, { profile: LOCAL });
+    expect(result.applied).toBe(0);
+    expect(dl.attempts).toBe(2);
+    expect(await marker(db)).toEqual([{ generation: await generation(), status: "pass" }]);
+  });
+
+  test("a persistent deadlock gives up after the bounded attempts and leaves the marker pending", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const dl = deadlocking(db, 99);
+    const caught = await failure(runMigrations(dl.client, { profile: LOCAL }));
+    expect(caught?.code).toBe("40P01");
+    expect(dl.attempts).toBe(3);
+    expect(await marker(db)).toEqual([{ generation: await generation(), status: "pending" }]);
+  });
+
+  test("a non-deadlock verify failure is not retried", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const base = client(db);
+    let seen = 0;
+    const c: MigrationClient = {
+      async query<R>(text: string, params?: unknown[]) {
+        if (text === VERIFY && ++seen) throw Object.assign(new Error("lock timeout"), { code: "55P03" });
+        return base.query<R>(text, params);
+      },
+    };
+    expect((await failure(runMigrations(c, { profile: LOCAL })))?.code).toBe("55P03");
+    expect(seen).toBe(1);
+    expect(await marker(db)).toEqual([{ generation: await generation(), status: "pending" }]);
   });
 });

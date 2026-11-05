@@ -1,6 +1,6 @@
 # Complete event metadata and exact project-name lookup
 
-Migration `20261103010000_session_directory_event_metadata.sql` is additive.
+Migration `20261104021000_session_directory_event_metadata.sql` is additive.
 Nothing in this change applies it or activates a reader. Old list/activity RPCs
 remain available. Deploy the reviewed function-boundary bootstrap before the
 migration, then pipeline code, controlled replay, and strict consumers last.

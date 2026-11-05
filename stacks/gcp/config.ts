@@ -1026,10 +1026,9 @@ export function bulls96ReleaseValues(
       tenant: { orgId: i.tenantOrgId, workspaceId: "default" },
       extraEnv: [
         ...dataEnv(),
-        // This enables the RelayAuth JWT verifier, not the legacy audience:
-        // RELAYHISTORY_ORIGIN below makes the verifier accept only the
-        // dedicated origin-bound assertion class by default.
-        { name: "ALLOW_INTERIM_RELAYAUTH_BEARER", value: "true" },
+        // RELAYHISTORY_ORIGIN alone turns on the RelayAuth verifier for the
+        // dedicated origin-bound assertion class only; the broad interim
+        // bearer stays off (local dev only).
         { name: "RELAYHISTORY_ORIGIN", value: i.relayhistoryOrigin },
         ...claimlessWindowEnv(i.claimlessWindow),
       ],

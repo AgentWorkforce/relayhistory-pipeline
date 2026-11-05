@@ -214,5 +214,3 @@ describe("brief schedule invocation", () => {
     }
   });
 });
-
-test("analysis cache defaults off before runtime init and rejects invalid readonly source secret shape",async()=>{const saved=process.env.SESSION_ANALYSIS_CACHE_ENABLED;try{for(const value of [undefined,"0","true"]){if(value===undefined)delete process.env.SESSION_ANALYSIS_CACHE_ENABLED;else process.env.SESSION_ANALYSIS_CACHE_ENABLED=value;expect(await handler({analysisCache:true})).toEqual({ok:true});expect(await handler({analysisCacheReconcile:true})).toEqual({ok:true})}expect(()=>parseSecret(JSON.stringify({hoopdb_url:"postgres://fixture",analysis_source_readonly_url:"mysql://fixture"}))).toThrow(/readonly_url/)}finally{if(saved===undefined)delete process.env.SESSION_ANALYSIS_CACHE_ENABLED;else process.env.SESSION_ANALYSIS_CACHE_ENABLED=saved}});

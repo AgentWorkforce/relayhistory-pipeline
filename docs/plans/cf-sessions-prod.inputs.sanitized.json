@@ -1,0 +1,12 @@
+{
+  "sessionIngest": {
+    "accountId": "f7232cb80f6fab86a95426302af243e4",
+    "acceptanceMode": "buffered",
+    "expectedGeneration": "d2569f3498e6b66302aef514a04711304e2ee263b2e413f7488f8d142a8958f0",
+    "hyperdriveId": "0fcc0265e96f43a39976b5aa4263f4a6",
+    "secretsStoreId": "59e0dcc52f0a4bd7863730548299fb2f",
+    "kmsKeyArn": "arn:aws:kms:us-east-1:941433935742:key/c74376a5-f6ff-4ef0-9a26-543c940094ba",
+    "inlineMaxSessions": 0,
+    "replicaMode": "off"
+  }
+}
