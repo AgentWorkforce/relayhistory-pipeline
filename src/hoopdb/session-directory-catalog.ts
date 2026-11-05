@@ -30,10 +30,23 @@ export type DirectoryRelationship = {
   childAgentType?: string | null;
 };
 
+/** Why a derived catalog is not complete (metadata only; never a value from the source). */
+export type DirectoryCatalogIncompleteReason =
+  | "models_not_array"
+  | "models_non_string"
+  | "model_rejected"
+  | "models_over_limit"
+  | "relationship_uid_invalid"
+  | "relationship_metadata_invalid"
+  | "relationship_metadata_missing"
+  | "relationships_over_limit";
+
 export type DirectoryCatalog = {
   metadataVersion?: 1;
   modelsComplete?: boolean;
   relationshipsComplete?: boolean;
+  /** Sorted, deduplicated reasons behind a false modelsComplete/relationshipsComplete. */
+  incompleteReasons?: DirectoryCatalogIncompleteReason[];
   agentNames: string[];
   models: string[];
   projectKey: string | null;
@@ -135,9 +148,23 @@ export function directoryCatalogFromProjection(
   const agents = new Map<string, string>();
   const modelSet = new Set<string>();
   const edges = new Map<string, DirectoryRelationship>();
+  const reasons = new Set<DirectoryCatalogIncompleteReason>();
+  const modelsIncomplete = (reason: DirectoryCatalogIncompleteReason) => {
+    catalog.modelsComplete = false;
+    reasons.add(reason);
+  };
+  const relationshipsIncomplete = (reason: DirectoryCatalogIncompleteReason) => {
+    catalog.relationshipsComplete = false;
+    reasons.add(reason);
+  };
   for (const { table, row } of rows) {
     if (table === "session_catalog") {
       for (const model of models(row.models)) modelSet.add(model);
+      // A missing or unparseable models value (null), or any other non-array, is not a
+      // known-empty model list (#182 contextual review, finding 4).
+      if (!Array.isArray(row.models)) modelsIncomplete("models_not_array");
+      else if (row.models.some((value) => typeof value !== "string"))
+        modelsIncomplete("models_non_string");
       if (
         Array.isArray(row.models) &&
         row.models.some(
@@ -147,7 +174,7 @@ export function directoryCatalogFromProjection(
             bounded(value, 200) !== value,
         )
       )
-        catalog.modelsComplete = false;
+        modelsIncomplete("model_rejected");
       catalog.projectKeyMethod =
         bounded(row.project_key_method, 64) ?? catalog.projectKeyMethod;
       catalog.projectKey = bounded(row.project_key, 512) ?? catalog.projectKey;
@@ -165,7 +192,7 @@ export function directoryCatalogFromProjection(
     } else if (table === "session_relationships") {
       const uid = bounded(row.relationship_uid, 255);
       if (!uid) {
-        catalog.relationshipsComplete = false;
+        relationshipsIncomplete("relationship_uid_invalid");
         continue;
       }
       const edge: DirectoryRelationship = {
@@ -188,9 +215,9 @@ export function directoryCatalogFromProjection(
             edge[key] = value;
           else {
             edge[key] = null;
-            catalog.relationshipsComplete = false;
+            relationshipsIncomplete("relationship_metadata_invalid");
           }
-        } else catalog.relationshipsComplete = false;
+        } else relationshipsIncomplete("relationship_metadata_missing");
       }
       edges.set(uid, edge);
     }
@@ -205,9 +232,10 @@ export function directoryCatalogFromProjection(
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([, name]) => name)
     .slice(0, MAX_DIRECTORY_AGENTS);
-  if (modelSet.size > MAX_DIRECTORY_MODELS) catalog.modelsComplete = false;
+  if (modelSet.size > MAX_DIRECTORY_MODELS) modelsIncomplete("models_over_limit");
   if (edges.size > MAX_DIRECTORY_RELATIONSHIPS)
-    catalog.relationshipsComplete = false;
+    relationshipsIncomplete("relationships_over_limit");
+  if (reasons.size) catalog.incompleteReasons = [...reasons].sort();
   catalog.models = [...modelSet].sort().slice(0, MAX_DIRECTORY_MODELS);
   catalog.relationships = [...edges.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
@@ -232,12 +260,29 @@ export function directoryCatalogFromProjection(
  * them in step afterwards. An edge naming a child whose directory row is a tombstone is
  * not written, so a re-delivered parent cannot reintroduce an erased child's id. (A child
  * whose row was hard-deleted is indistinguishable from one not uploaded yet.)
+ *
+ * Writer epoch (adversarial review of #182, Low 3): the live row is written only while its
+ * `event_projection_epoch` still equals `options.expectedEpoch`, the epoch the caller's source
+ * read was fenced on. A stale writer writes nothing and returns `{ written: false,
+ * staleEpoch: true }`; it never overwrites a newer projection.
+ *
+ * Forget tracking (migration 20261105031000): every named child row is locked FOR SHARE in
+ * session-id order after the parent row, so a concurrent tombstone or restore of a child
+ * either committed before this statement read it, or waits for this transaction and then
+ * re-queues this parent. When an edge is dropped because its child is a tombstone the row
+ * records `catalog_forgotten_child_edges`, which keeps the parent on the watch list: restoring
+ * or purging a tombstone in its (org, workspace, harness) makes it pending reprojection again.
+ * Requires 20261105022000 and 20261105031000 applied.
  */
 export async function writeDirectoryCatalog(
   db: SqlExecutor,
   key: SessionDirectoryKey,
   input: DirectoryCatalog,
-): Promise<{ written: boolean }> {
+  options: { expectedEpoch: string },
+): Promise<{ written: boolean; staleEpoch?: true }> {
+  const expectedEpoch = options?.expectedEpoch;
+  if (typeof expectedEpoch !== "string" || !/^(0|[1-9][0-9]{0,18})$/.test(expectedEpoch))
+    throw new Error("directory_catalog_epoch_invalid");
   // Re-derive through the same bounds, so a caller cannot bypass them.
   const catalog = directoryCatalogFromProjection([
     {
@@ -269,13 +314,20 @@ export async function writeDirectoryCatalog(
       },
     })),
   ]);
-  const { rows } = await db.query<{ written: boolean }>(
+  const { rows } = await db.query<{ written: boolean; stale_epoch: boolean }>(
     `WITH live AS MATERIALIZED (
        SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at, d.event_projection_epoch
          FROM sessions.session_directory AS d
         WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
-          AND d.deleted_at IS NULL
+          AND d.deleted_at IS NULL AND d.event_projection_epoch = $24::bigint
         FOR UPDATE
+     ), children AS MATERIALIZED (
+       SELECT c.session_id, c.deleted_at IS NOT NULL AS gone
+         FROM sessions.session_directory AS c, live AS l
+        WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id AND c.harness = l.harness
+          AND c.session_id = ANY ($17::text[]) AND c.session_id <> l.session_id
+        ORDER BY c.session_id
+        FOR SHARE OF c
      ), updated AS (
        UPDATE sessions.session_directory AS d
           SET agent_names = $5::text[], catalog_models = $6::text[],
@@ -294,7 +346,8 @@ export async function writeDirectoryCatalog(
                 coalesce($14, d.git_branch), d.model, d.short_summary),
               catalog_projected_at = now(), catalog_read_projected_at = now(),
               catalog_read_version=$21::smallint,catalog_read_epoch=l.event_projection_epoch,
-              catalog_models_complete=$22::boolean,catalog_relationships_complete=$23::boolean
+              catalog_models_complete=$22::boolean,catalog_relationships_complete=$23::boolean,
+              catalog_forgotten_child_edges = EXISTS (SELECT 1 FROM children AS k WHERE k.gone)
          FROM live AS l
         WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id
           AND d.harness = l.harness AND d.session_id = l.session_id
@@ -316,9 +369,7 @@ export async function writeDirectoryCatalog(
        SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child, e.model, e.name, e.agent_type
          FROM live AS l, unnest($16::text[], $17::text[], $18::text[], $19::text[], $20::text[]) AS e(uid, child, model, name, agent_type)
         WHERE e.child IS NULL OR NOT EXISTS (
-          SELECT 1 FROM sessions.session_directory AS c
-           WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id
-             AND c.harness = l.harness AND c.session_id = e.child AND c.deleted_at IS NOT NULL)
+          SELECT 1 FROM children AS k WHERE k.session_id = e.child AND k.gone)
      ), drop_edges AS (
        DELETE FROM sessions.session_directory_relationships AS r
         USING live AS l
@@ -333,7 +384,11 @@ export async function writeDirectoryCatalog(
        DO UPDATE SET child_session_id = excluded.child_session_id,child_model=excluded.child_model,
          child_agent_name=excluded.child_agent_name,child_agent_type=excluded.child_agent_type
      )
-     SELECT EXISTS (SELECT 1 FROM updated) AS written`,
+     SELECT EXISTS (SELECT 1 FROM updated) AS written,
+            NOT EXISTS (SELECT 1 FROM live) AND EXISTS (
+              SELECT 1 FROM sessions.session_directory AS x
+               WHERE x.org_id = $1 AND x.workspace_id = $2 AND x.harness = $3 AND x.session_id = $4
+                 AND x.deleted_at IS NULL AND x.event_projection_epoch <> $24::bigint) AS stale_epoch`,
     [
       key.orgId,
       key.workspaceId,
@@ -362,8 +417,10 @@ export async function writeDirectoryCatalog(
       input.metadataVersion === 1 &&
         input.relationshipsComplete === true &&
         catalog.relationshipsComplete === true,
+      expectedEpoch,
     ],
   );
+  if (rows[0]?.stale_epoch === true) return { written: false, staleEpoch: true };
   return { written: rows[0]?.written === true };
 }
 
