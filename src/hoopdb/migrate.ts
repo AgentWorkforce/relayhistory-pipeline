@@ -66,6 +66,10 @@ const TOKEN_VERIFIER_VERIFY = join(
 // file. 20261102010000 verifies them and fails closed if absent (42704); it never creates them.
 const INGEST_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_ingest_roles.sql");
 const INGEST_ROLE_VERIFY = join(ROOT,"supabase/bootstrap/session_ingest_verify.sql");
+// The session read API role (bulls96_read_api), bare: the same contract, its own file.
+// 20261105029000 verifies it and fails closed if absent (42704); it never creates it.
+// session_read_api_role.sql (after migrate, operator) keeps LOGIN, settings and RLS.
+const READ_API_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_read_api_roles.sql");
 // Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any
 // role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
 // The one phase 2 source, shared with the live readiness gate (src/shared/db.ts).
@@ -259,6 +263,7 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
             path: TOKEN_VERIFIER_BOOTSTRAP,
           },
           { name: "bootstrap:session_ingest_roles", path: INGEST_BOOTSTRAP },
+          { name: "bootstrap:session_read_api_roles", path: READ_API_BOOTSTRAP },
         ]
       : []),
     ...(await schemaSteps()),

@@ -546,6 +546,10 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.lock_repo_catalog(text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -641,6 +645,10 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.session_directory_analysis_cache(text,text,text)": [
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
@@ -691,6 +699,9 @@
     "sessions.session_directory_project_text(text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.session_directory_read_api_scope(text)": [
+      "<owner>:EXECUTE"
     ],
     "sessions.session_directory_readiness()": [
       "<owner>:EXECUTE",

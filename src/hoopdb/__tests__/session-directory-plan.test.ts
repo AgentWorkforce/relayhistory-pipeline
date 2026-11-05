@@ -61,6 +61,7 @@ async function database(): Promise<PGlite> {
   await db.exec(bootstrap);
   await db.exec(tokenBootstrap);
   await db.exec(readFileSync(join(import.meta.dir, "../../../supabase/bootstrap/session_ingest_roles.sql"), "utf8"));
+  await db.exec(readFileSync(join(import.meta.dir, "../../../supabase/bootstrap/session_read_api_roles.sql"), "utf8"));
   await db.exec(`
     CREATE SCHEMA sessions;
     CREATE FUNCTION sessions.jwt_org_id() RETURNS text LANGUAGE sql STABLE AS $$
@@ -95,6 +96,7 @@ async function fullDatabase(): Promise<PGlite> {
   await db.exec(bootstrap);
   await db.exec(tokenBootstrap);
   await db.exec(readFileSync(join(import.meta.dir, "../../../supabase/bootstrap/session_ingest_roles.sql"), "utf8"));
+  await db.exec(readFileSync(join(import.meta.dir, "../../../supabase/bootstrap/session_read_api_roles.sql"), "utf8"));
   const root = join(import.meta.dir, "../../../supabase/migrations");
   for (const file of readdirSync(root).filter(file => file.endsWith(".sql")).sort())
     await db.exec(readFileSync(join(root, file), "utf8"));

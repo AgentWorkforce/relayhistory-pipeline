@@ -19,6 +19,14 @@ export const VERIFIERS: readonly VerifierTarget[] = [
     pattern: /v_approved text\[\] := ARRAY\[[\s\S]*?\];/,
     render: (sigs) => "v_approved text[] := ARRAY[\n" + quoted(sigs) + "\n ];",
   },
+  {
+    // The read API role may EXECUTE no sessions SECURITY DEFINER function but these (allowed,
+    // not required, so the verifier also passes before 20261105029000 is applied).
+    role: "bulls96_read_api",
+    path: "supabase/bootstrap/session_read_api_role_verify.sql",
+    pattern: /AND p\.oid::regprocedure::text NOT IN \([\s\S]*?\)\n  LOOP/,
+    render: (sigs) => "AND p.oid::regprocedure::text NOT IN (\n" + sigs.map((k) => "         '" + k + "'").join(",\n") + ")\n  LOOP",
+  },
   // SLOT (#237): bulls96_project_events -> supabase/bootstrap/canonical_project_events_verify.sql, e.g.
   // { role: "bulls96_project_events", path: "supabase/bootstrap/canonical_project_events_verify.sql",
   //   template: "supabase/bootstrap/session_ingest_verify.sql", pattern: <the v_allowed pattern>, render: <same>,

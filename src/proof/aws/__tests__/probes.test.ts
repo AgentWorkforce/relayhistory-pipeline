@@ -117,6 +117,7 @@ describe("after every supabase migration", () => {
     await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
     await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
     await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
+    await db.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
     for (const f of files) await db.exec(read(`supabase/migrations/${f}`));
     const s = await state(db);
     expect(s.search_rpc_present).toBe(defined);

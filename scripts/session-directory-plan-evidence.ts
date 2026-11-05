@@ -86,7 +86,7 @@ async function evidence(adminUrl: string) {
       readFileSync(
         join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
-      ),
+      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
     );
     for (const f of readdirSync(join(root, "supabase/migrations")).sort()) {
       await c.query(readFileSync(join(root, "supabase/migrations", f), "utf8"));

@@ -17,7 +17,7 @@ async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(db);
  const read=(path:string)=>readFileSync(join(root,path),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const name of ["session_directory_search_worker","session_token_verifier","session_ingest_roles"])
+ for(const name of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles"])
   await db.exec(read("supabase/bootstrap/"+name+".sql"));
  for(const name of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())
   await db.exec(read("supabase/migrations/"+name));

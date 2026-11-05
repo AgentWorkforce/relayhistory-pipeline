@@ -364,6 +364,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261104051000_ingest_buffer_gc.sql` | column sessions.ingest_stage_intents.gc_lease_token |
 | `upstream:20261104052000_ordered_ingest_controls.sql` | column sessions.ingest_buffer_admission.control_epoch |
 | `upstream:20261105010000_frozen_source_custody.sql` | table sessions.ingest_frozen_source_completeness |
+| `upstream:20261105029000_session_directory_read_api.sql` | function sessions.list_session_directory_for |
 | `upstream:20261104055000_lazy_current_custody.sql` | table sessions.ingest_lazy_policy |
 | `upstream:20261104054000_ingest_custody_baseline.sql` | table sessions.ingest_custody_imports |
 | `upstream:20261104053000_ingest_first_ack_seats.sql` | table sessions.ingest_receipt_seat_clock |
