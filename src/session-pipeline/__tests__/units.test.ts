@@ -167,6 +167,17 @@ describe("configuration", () => {
     expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_REPLAY_PAGES_ENABLED: "1", PIPELINE_FANOUT: "postgres" })).toMatchObject({ searchEnabled: true, replayPagesEnabled: true, fanout: "postgres" });
   });
 
+  test("large-scope handoff stays off unless SESSION_LARGE_READ_HANDOFF_ENABLED is exactly 1", () => {
+    expect(lambdaEnv(base).largeScopeHandoffEnabled).toBe(false);
+    for (const v of ["0", "", "true", "yes", " 1"])
+      expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SESSION_LARGE_READ_HANDOFF_ENABLED: v }).largeScopeHandoffEnabled).toBe(false);
+    expect(lambdaEnv({ ...base, SESSION_LARGE_READ_HANDOFF_ENABLED: "1" }).largeScopeHandoffEnabled).toBe(true);
+    // deps.large (the only routing call) is wired behind that switch alone: flag off, no route.
+    const lambdaSource = readFileSync(here("../lambda.ts"), "utf8");
+    expect(lambdaSource).toContain("if(env.largeScopeHandoffEnabled&&(env.searchEnabled||env.replayPagesEnabled))deps.large=");
+    expect(lambdaSource.match(/deps\.large\s*=/g)).toHaveLength(1);
+  });
+
   test("refuses the single-tenant layout and unknown fan-out", () => {
     expect(() => lambdaEnv({ ...base, PIPELINE_ORG_FROM_PREFIX: undefined })).toThrow(/ORG_FROM_PREFIX/);
     expect(() => lambdaEnv({ ...base, PIPELINE_FANOUT: "sqs" })).toThrow(/FANOUT/);

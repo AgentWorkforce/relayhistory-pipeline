@@ -108,6 +108,13 @@ describe("session pipeline: wiring", () => {
     expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { replayPages: true } }).SESSION_REPLAY_PAGES_ENABLED).toBe("1");
   });
 
+  it("the stack never switches on the large-read handoff or worker", () => {
+    for (const p0 of [{}, { searchIndex: true, replayPages: true }]) {
+      const env = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: p0 });
+      expect(Object.keys(env).filter((k) => k.startsWith("SESSION_LARGE_READ_"))).toEqual([]);
+    }
+  });
+
   it("briefs start off: SESSION_BRIEF_ENABLED=false and the schedule DISABLED; enabled sets both, and the caps only when given", () => {
     const off = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: {} });
     expect(off.SESSION_BRIEF_ENABLED).toBe("false");

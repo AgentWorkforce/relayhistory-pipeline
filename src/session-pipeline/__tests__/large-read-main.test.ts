@@ -41,7 +41,7 @@ test('a discovery error (54000 capacity) is logged by code and never blocks clai
  }}} as unknown as LargeReadRuntime['deps'],close:async()=>{closed++}});
  const err=process.stderr.write;
  process.stderr.write=((chunk:any,...rest:any[])=>{for(const l of String(chunk).split('\n'))if(l.startsWith('{'))lines.push(JSON.parse(l));return true}) as any;
- let result;try{result=await largeReadMain({SESSION_LARGE_READ_WORKER_ENABLED:'1'},factory)}finally{process.stderr.write=err}
+ let result;try{result=await largeReadMain({SESSION_LARGE_READ_WORKER_ENABLED:'1'},factory).catch(e=>({rejected:e?.code}))}finally{process.stderr.write=err}
  expect(result).toEqual({enabled:true,processed:0,published:0,failed:0,scanned:0,cycleComplete:false,discoveryFailures:2});
  // Claimed after the failed first page; the second failing page stops the loop instead of spinning.
  expect({scans,claims,closed}).toEqual({scans:2,claims:1,closed:1});
@@ -57,6 +57,7 @@ test('an unclassified discovery error is logged and claims still run',async()=>{
  }}} as unknown as LargeReadRuntime['deps'],close:async()=>{}});
  const err=process.stderr.write;const lines:any[]=[];
  process.stderr.write=((chunk:any)=>{for(const l of String(chunk).split('\n'))if(l.startsWith('{'))lines.push(JSON.parse(l));return true}) as any;
- try{expect(await largeReadMain({SESSION_LARGE_READ_WORKER_ENABLED:'1'},factory)).toMatchObject({enabled:true,discoveryFailures:2})}finally{process.stderr.write=err}
+ let result;try{result=await largeReadMain({SESSION_LARGE_READ_WORKER_ENABLED:'1'},factory).catch(e=>({rejected:e?.code}))}finally{process.stderr.write=err}
+ expect(result).toMatchObject({enabled:true,discoveryFailures:2});
  expect(claims).toBe(1);expect(lines[0]).toMatchObject({error_code:'55000',reason:'discovery_failed'});
 });

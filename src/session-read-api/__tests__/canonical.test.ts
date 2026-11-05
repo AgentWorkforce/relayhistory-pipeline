@@ -770,10 +770,10 @@ test("a directory display refusal omits display rows on the live raw read but re
   expect("displayOmitted" in ok).toBe(false);
   // A >1 MiB project path makes the display value refuse (directory_display_bound).
   await replaceCanonicalRecords([record("/" + "x".repeat(1024 * 1024))]);
-  const raw = await canonicalSnapshot(deps, identity);
-  expect(raw.exists).toBe(true);
+  const raw: any = await canonicalSnapshot(deps, identity).catch((e) => ({ rejected: e?.reason, details: e?.details }));
+  expect(raw).toMatchObject({ exists: true });
   expect(display(raw.rows)).toEqual([]);
-  expect(raw.rows.some((r) => r.table === "convergence_events")).toBe(true);
+  expect(raw.rows.some((r: { table: string }) => r.table === "convergence_events")).toBe(true);
   expect((raw as { displayOmitted?: string }).displayOmitted).toBe("directory_display_bound");
   const lines: string[] = [], err = console.error;
   console.error = (line: string) => void lines.push(line);
