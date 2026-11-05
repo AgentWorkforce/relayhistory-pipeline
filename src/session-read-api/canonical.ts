@@ -41,7 +41,7 @@ export interface CanonicalPointer {
 export class CanonicalReadError extends Error {
   constructor(
     readonly reason: string,
-    readonly status: 400 | 401 | 403 | 503 = 503,
+    readonly status: 400 | 401 | 403 | 501 | 503 = 503,
     /** Projection reason codes behind `canonical_projection_incomplete` (codes only). */
     readonly details: readonly string[] = [],
   ) {

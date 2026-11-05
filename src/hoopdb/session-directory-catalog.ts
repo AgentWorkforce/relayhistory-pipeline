@@ -366,3 +366,140 @@ export async function writeDirectoryCatalog(
   );
   return { written: rows[0]?.written === true };
 }
+
+/**
+ * The pre-#182 catalog writer (0c12036, unchanged until a49219d^1), kept for the search
+ * stage while SESSION_DESKTOP_CATALOG_ENABLED is off. Same columns, values and query
+ * shape as before #182: agent names, models, project key and method, initial commit,
+ * originator, agent version, project id, repo, branch, the scalar agent and search text,
+ * catalog_projected_at, agent rows, and parent -> child edges (uid and child id only).
+ * It writes none of migration 20261105022000's columns (no child_* edge metadata, no
+ * catalog_read_*, no completeness flags). Values are re-derived through the same bounds
+ * as `writeDirectoryCatalog`; the extra fields the current derivation adds are ignored.
+ */
+export async function writeLegacyDirectoryCatalog(
+  db: SqlExecutor,
+  key: SessionDirectoryKey,
+  input: DirectoryCatalog,
+): Promise<{ written: boolean }> {
+  // Re-derive through the same bounds, so a caller cannot bypass them.
+  const catalog = directoryCatalogFromProjection([
+    {
+      table: "session_catalog",
+      row: {
+        models: input.models,
+        project_key: input.projectKey,
+        project_key_method: input.projectKeyMethod,
+        project_id: input.projectId,
+        repo_url: input.gitRepo,
+        git_branch: input.gitBranch,
+        initial_commit: input.initialCommit,
+        originator: input.originator,
+        agent_version: input.agentVersion,
+      },
+    },
+    ...input.agentNames.map((agent_name) => ({
+      table: "session_catalog_agents",
+      row: { agent_name },
+    })),
+    ...input.relationships.map((edge) => ({
+      table: "session_relationships",
+      row: {
+        relationship_uid: edge.relationshipUid,
+        child_session_id: edge.childSessionId,
+      },
+    })),
+  ]);
+  const { rows } = await db.query<{ written: boolean }>(
+    `WITH live AS MATERIALIZED (
+       SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at
+         FROM sessions.session_directory AS d
+        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+          AND d.deleted_at IS NULL
+        FOR UPDATE
+     ), updated AS (
+       UPDATE sessions.session_directory AS d
+          SET agent_names = $5::text[], catalog_models = $6::text[],
+              project_key = $7, project_key_method = $8, initial_commit = $9,
+              originator = $10, agent_version = $11,
+              project_id = coalesce($12, d.project_id),
+              git_repo = coalesce($13, d.git_repo),
+              git_branch = coalesce($14, d.git_branch),
+              -- The scalar agent the search RPC filters on: keep one already projected,
+              -- else the first catalog agent, and rebuild the search document with it.
+              agent_name = coalesce(d.agent_name, ($5::text[])[1]),
+              agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))),
+              search_text = sessions.session_directory_search_text(
+                d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]),
+                coalesce($12, d.project_id), coalesce($13, d.git_repo),
+                coalesce($14, d.git_branch), d.model, d.short_summary),
+              catalog_projected_at = now()
+         FROM live AS l
+        WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id
+          AND d.harness = l.harness AND d.session_id = l.session_id
+       RETURNING d.org_id
+     ), drop_agents AS (
+       DELETE FROM sessions.session_directory_agents AS a
+        USING live AS l
+        WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id
+          AND a.harness = l.harness AND a.session_id = l.session_id
+          AND NOT (a.agent_name_normalized = ANY ($15::text[]))
+     ), put_agents AS (
+       INSERT INTO sessions.session_directory_agents
+         (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at)
+       SELECT l.org_id, l.workspace_id, l.harness, l.session_id, x.name, lower(btrim(x.name)), l.last_activity_at
+         FROM live AS l, unnest($5::text[]) AS x(name)
+       ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized)
+       DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at
+     ), edges AS (
+       SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child
+         FROM live AS l, unnest($16::text[], $17::text[]) AS e(uid, child)
+        WHERE e.child IS NULL OR NOT EXISTS (
+          SELECT 1 FROM sessions.session_directory AS c
+           WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id
+             AND c.harness = l.harness AND c.session_id = e.child AND c.deleted_at IS NOT NULL)
+     ), drop_edges AS (
+       DELETE FROM sessions.session_directory_relationships AS r
+        USING live AS l
+        WHERE r.org_id = l.org_id AND r.workspace_id = l.workspace_id
+          AND r.harness = l.harness AND r.parent_session_id = l.session_id
+          AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e))
+     ), put_edges AS (
+       INSERT INTO sessions.session_directory_relationships
+         (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id)
+       SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child FROM edges AS e
+       ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid)
+       DO UPDATE SET child_session_id = excluded.child_session_id
+     )
+     SELECT EXISTS (SELECT 1 FROM updated) AS written`,
+    [
+      key.orgId,
+      key.workspaceId,
+      key.harness,
+      key.sessionId,
+      catalog.agentNames,
+      catalog.models,
+      catalog.projectKey,
+      catalog.projectKeyMethod,
+      catalog.initialCommit,
+      catalog.originator,
+      catalog.agentVersion,
+      catalog.projectId,
+      catalog.gitRepo,
+      catalog.gitBranch,
+      catalog.agentNames.map(normalizeDirectoryAgent),
+      catalog.relationships.map((edge) => edge.relationshipUid),
+      catalog.relationships.map((edge) => edge.childSessionId),
+    ],
+  );
+  return { written: rows[0]?.written === true };
+}
+
+/**
+ * The catalog writer the search stage uses: the 20261105022000 desktop catalog writer only
+ * with SESSION_DESKTOP_CATALOG_ENABLED=1, otherwise the pre-#182 writer.
+ * SEARCH_INDEX_ENABLED alone never selects the desktop writer.
+ */
+export function directoryCatalogWriter(desktopCatalog: boolean): typeof writeDirectoryCatalog {
+  return desktopCatalog === true ? writeDirectoryCatalog : writeLegacyDirectoryCatalog;
+}
