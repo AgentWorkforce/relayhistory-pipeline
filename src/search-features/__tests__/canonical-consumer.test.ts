@@ -5,7 +5,7 @@ const A = "a".repeat(64);
 const CANARY = { orgId: "c4fae7b9-43a9-44e8-94d5-455aa579d67b",
   workspaceId: "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63" };
 const OTHER = { orgId: "other-org", workspaceId: "other-ws" };
-const CFG = { targetId: "t", ownerId: "me", leaseTtlMs: 30000,
+const CFG = { enabled: true, targetId: "t", ownerId: "me", leaseTtlMs: 30000,
   maxRetries: 2, pageSize: 100 };
 const fakeDb = () => {
   const lease: Record<string, unknown>[] = [];
@@ -31,10 +31,19 @@ const fakeDb = () => {
       return { rows: (c ? [{ rev: c.rev }] : []) as T[] };
     }
     if (text.includes("consumer_checkpoint") && text.includes("INSERT")) {
+      // seedCheckpoint: VALUES($1,0) ON CONFLICT DO NOTHING
+      if (!ckpt.some((r) => r.partition === params[0]))
+        ckpt.push({ partition: params[0], rev: "0" });
+      return { rows: [] as T[] };
+    }
+    if (text.includes("consumer_checkpoint") && text.includes("UPDATE")) {
+      // advanceCheckpoint: UPDATE ... AND rev < $2 AND held fresh lease
       const c = ckpt.find((r) => r.partition === params[0]);
-      if (!c || Number(c.rev) < Number(params[1])) {
-        if (!c) ckpt.push({ partition: params[0], rev: params[1] });
-        else c.rev = params[1];
+      const l = lease.find((r) => r.partition === params[0] &&
+        r.owner === params[2]);
+      if (c && Number(c.rev) < Number(params[1]) && l) {
+        c.rev = params[1];
+        return { rows: [{ n: 1 } as T] };
       }
       return { rows: [] as T[] };
     }
@@ -102,5 +111,42 @@ describe("canonical consumer — scope fence + config + fail-atomic", () => {
     const out = await c.drain(images as never, ch as never);
     expect(out.copied).toBe(0);
     expect(out.checkpoint).toBe("0");
+  });
+});
+
+describe("canonical consumer — enabled gate + target/partition split", () => {
+  test("disabled: zero lease/journal/CH access", async () => {
+    const db = fakeDb();
+    let jTouched = 0, chTouched = 0;
+    const j = { entries: async () => { jTouched++;
+      return { entries: [], nextRevision: "0", hasMore: false }; } };
+    const c = new CanonicalConsumer({ query: db.query }, j as never, acks,
+      { ...CFG, enabled: false });
+    const out = await c.drain(images as never,
+      { database: "d", insert: async () => { chTouched++; } } as never);
+    expect(db.lease.length).toBe(0);
+    expect(jTouched).toBe(0);
+    expect(out.copied).toBe(0);
+    expect(chTouched).toBe(0);
+  });
+  test("different targets get disjoint lease+checkpoint partitions", async () => {
+    const db = fakeDb();
+    const a = new CanonicalConsumer({ query: db.query },
+      journal([]) as never, acks, { ...CFG, targetId: "target-A" });
+    const b = new CanonicalConsumer({ query: db.query },
+      journal([]) as never, acks, { ...CFG, targetId: "target-B" });
+    expect(await a.acquireLease()).toBe(true);
+    expect(await b.acquireLease()).toBe(true);   // different partition: both hold
+    expect(db.lease.length).toBe(2);
+    expect(db.lease[0]!.partition).not.toBe(db.lease[1]!.partition);
+  });
+  test("strict order: a non-increasing page holds the whole drain", async () => {
+    const db = fakeDb();
+    // revision 10 then a repeat — the store yields ordered pages, but a
+    // non-increasing row is a violation and stops everything.
+    const c = new CanonicalConsumer({ query: db.query },
+      journal([entry("10", OTHER), entry("10", OTHER)]) as never, acks, CFG);
+    const out = await c.drain(images as never, ch as never);
+    expect(out.checkpoint).toBe("10");   // first accepted, repeat held
   });
 });

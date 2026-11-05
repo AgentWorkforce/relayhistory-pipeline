@@ -17,17 +17,22 @@ import type { ClickHouseClient } from "../session-pipeline/vendor/search-index/c
 const LEASE = "sessions.canonical_feature_consumer_lease";
 const DEAD = "sessions.canonical_feature_consumer_dead_letter";
 const CKPT = "sessions.canonical_feature_consumer_checkpoint";
-/** The exact canary scope AND its single bound partition name. */
+import { createHash } from "node:crypto";
+/** The exact canary scope; the partition is DERIVED from it + the target. */
 const CANARY = { orgId: "c4fae7b9-43a9-44e8-94d5-455aa579d67b",
   workspaceId: "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63" };
-const PARTITION = "c4fae7b9-1220c1dc-0";
+/** Stable producer poison codes — persisted dead-letter evidence. */
 const POISON: Record<string, true> = {
-  row_invalid: true, image_page_changed: true,
-  image_descriptor_changed: true, row_bound: true,
+  row_invalid: true, row_bound: true, image_page_changed: true,
+  image_descriptor_changed: true, corrupt_chain: true,
+  page_bytes_bound: true, page_rows_bound: true,
 };
-const HOLD = new Set(["lease_lost", "heartbeat_failed", "db_timeout"]);
+const HOLD = new Set(["lease_lost", "heartbeat_failed", "db_timeout",
+  "stale_revision", "target_id_required"]);
 
 export interface ConsumerConfig {
+  /** REQUIRED explicit gate — false/unset means do not run anything. */
+  enabled: boolean;
   targetId: string;
   ownerId: string;
   leaseTtlMs: number;
@@ -36,6 +41,7 @@ export interface ConsumerConfig {
 }
 /** Fail-closed: exact canary scope, the bound partition, bounded knobs. */
 export function validateConfig(cfg: ConsumerConfig): void {
+  if (cfg.enabled !== true) return;      // off is a valid config (no access)
   if (typeof cfg.targetId !== "string" || !cfg.targetId.length ||
       cfg.targetId.length > 256) throw new Error("config_bad_target");
   if (typeof cfg.ownerId !== "string" || !cfg.ownerId.length ||
@@ -57,7 +63,14 @@ export class CanonicalConsumer {
     readonly journal: CanonicalJournalStore,
     readonly acks: CanonicalPageAckStore,
     readonly cfg: ConsumerConfig,
-  ) { validateConfig(cfg); }
+  ) {
+    validateConfig(cfg);
+    // The partition identity binds canary + target — a new deployment target
+    // gets a disjoint lease + checkpoint, never reusing the old one.
+    this.partition = `c4fae7b9-1220c1dc-` +
+      createHash("sha256").update(cfg.targetId).digest("hex").slice(0, 16);
+  }
+  private readonly partition: string;
 
   /** One atomic acquire/renew/takeover — the bound partition only. */
   async acquireLease(): Promise<boolean> {
@@ -68,7 +81,7 @@ export class CanonicalConsumer {
         ` WHERE ${LEASE}.owner=$2` +
         `    OR ${LEASE}.heartbeat_at < now() - make_interval(secs => $3)` +
         ` RETURNING 1 AS n`,
-      [PARTITION, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
+      [this.partition, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
     return rows.length > 0;
   }
   /** Heartbeat — requires a still-fresh held lease; a stale owner cannot. */
@@ -78,28 +91,40 @@ export class CanonicalConsumer {
         ` WHERE partition=$1 AND owner=$2` +
         ` AND heartbeat_at >= now() - make_interval(secs => $3)` +
         ` RETURNING 1 AS n`,
-      [PARTITION, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
+      [this.partition, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000]);
     return rows.length > 0;
   }
   private leaseHeld() {
     return this.db.query<{ n: number }>(
       `SELECT 1 AS n FROM ${LEASE} WHERE partition=$1 AND owner=$2` +
         ` AND heartbeat_at >= now() - make_interval(secs => $3)`,
-      [PARTITION, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000])
+      [this.partition, this.cfg.ownerId, this.cfg.leaseTtlMs / 1000])
       .then((r) => r.rows.length > 0);
   }
   /** Durable partition checkpoint — CAS'd only after a real advance. */
   private async readCheckpoint(): Promise<string> {
     const { rows } = await this.db.query<{ rev: string | number }>(
-      `SELECT rev FROM ${CKPT} WHERE partition=$1`, [PARTITION]);
+      `SELECT rev FROM ${CKPT} WHERE partition=$1`, [this.partition]);
     return rows.length ? String(rows[0]!.rev) : "0";
   }
-  private async advanceCheckpoint(rev: string): Promise<void> {
+  /** Advance only while this owner still holds a fresh lease — a stale
+   *  worker cannot move the shared checkpoint after takeover. */
+  private async advanceCheckpoint(rev: string): Promise<boolean> {
+    const { rows } = await this.db.query<{ n: number }>(
+      `UPDATE ${CKPT} SET rev=$2::bigint WHERE partition=$1` +
+        ` AND rev < $2::bigint` +
+        ` AND EXISTS (SELECT 1 FROM ${LEASE}` +
+        `   WHERE partition=$1 AND owner=$3` +
+        `   AND heartbeat_at >= now() - make_interval(secs => $4))` +
+        ` RETURNING 1 AS n`,
+      [this.partition, rev, this.cfg.ownerId,
+        this.cfg.leaseTtlMs / 1000]);
+    return rows.length > 0;
+  }
+  private async seedCheckpoint(): Promise<void> {
     await this.db.query(
-      `INSERT INTO ${CKPT}(partition,rev) VALUES($1,$2::bigint)` +
-        ` ON CONFLICT (partition) DO UPDATE SET rev=$2::bigint` +
-        ` WHERE ${CKPT}.rev < $2::bigint`,
-      [PARTITION, rev]);
+      `INSERT INTO ${CKPT}(partition,rev) VALUES($1,0)` +
+        ` ON CONFLICT (partition) DO NOTHING`, [this.partition]);
   }
   /** Dead-letter: stable poison code only; immutable (no update/delete). */
   async deadLetter(entry: CanonicalJournalEntry, code: string): Promise<void> {
@@ -119,37 +144,50 @@ export class CanonicalConsumer {
     images: CanonicalImagePort, ch: ClickHouseClient,
   ): Promise<{ copied: number; dead: number; skipped: number;
               checkpoint: string }> {
+    // The explicit gate: disabled means no lease, journal, or CH access.
+    if (this.cfg.enabled !== true)
+      return { copied: 0, dead: 0, skipped: 0,
+        checkpoint: await this.readCheckpoint() };
     if (!(await this.acquireLease()))
       return { copied: 0, dead: 0, skipped: 0,
         checkpoint: await this.readCheckpoint() };
+    await this.seedCheckpoint();
     let copied = 0, dead = 0, skipped = 0;
     let checkpoint = await this.readCheckpoint();
+    let lastSeen = checkpoint;
     for (;;) {
       const { entries, hasMore } =
         await this.journal.entries(checkpoint, this.cfg.pageSize);
       for (const entry of entries) {
-        if (BigInt(entry.revision) <= BigInt(checkpoint))
-          continue;                       // already consumed
-        if (!inScope(entry)) {            // scope-skipped: never touches CH
+        // Strict revision order — a non-increasing page is a violation.
+        if (BigInt(entry.revision) <= BigInt(lastSeen))
+          return { copied, dead, skipped, checkpoint };
+        lastSeen = entry.revision;
+        if (!inScope(entry)) {
+          if (!(await this.advanceCheckpoint(entry.revision)))
+            return { copied, dead, skipped, checkpoint };
           checkpoint = entry.revision;
-          await this.advanceCheckpoint(checkpoint);
           skipped++;
           continue;
         }
         const r = await this.copyOnce(images, ch, checkpoint, entry);
         if (r === "copied") {
           copied++;
+          if (!(await this.advanceCheckpoint(entry.revision)))
+            return { copied, dead, skipped, checkpoint };
           checkpoint = entry.revision;
-          await this.advanceCheckpoint(checkpoint);
         } else {
-          if (r === "dead") { dead++; await this.deadLetter(entry, "row_invalid"); }
+          if (r !== "hold") {
+            dead++;
+            await this.deadLetter(entry, r);
+          }
           return { copied, dead, skipped, checkpoint };
         }
         if (!(await this.heartbeat()))
           return { copied, dead, skipped, checkpoint };
       }
       if (!hasMore) break;
-      checkpoint = entries[entries.length - 1]!.revision;
+      checkpoint = lastSeen;
     }
     return { copied, dead, skipped, checkpoint };
   }
@@ -158,7 +196,7 @@ export class CanonicalConsumer {
   private async copyOnce(
     images: CanonicalImagePort, ch: ClickHouseClient,
     checkpoint: string, entry: CanonicalJournalEntry,
-  ): Promise<"copied" | "dead" | "hold"> {
+  ): Promise<"copied" | "hold" | string> {
     for (let i = 0; i <= this.cfg.maxRetries; i++) {
       try {
         const r = await copyCanonicalEntry(
@@ -168,7 +206,8 @@ export class CanonicalConsumer {
         if (r.kind === "copied") return "copied";
         const reason = (r as { reason: string }).reason;
         if (HOLD.has(reason)) return "hold";
-        if (POISON[reason] && i === this.cfg.maxRetries) return "dead";
+        if (POISON[reason] && i === this.cfg.maxRetries)
+          return reason;                        // exact stable poison code
         if (!POISON[reason]) return "hold";   // unknown -> hold, never poison
       } catch {
         return "hold";                          // infra: retryable hold
