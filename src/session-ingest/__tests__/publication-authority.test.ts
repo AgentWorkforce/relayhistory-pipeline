@@ -2,7 +2,7 @@
 import {test,expect} from "bun:test";
 import {probePublication,withPublicationAuthority,type PublicationEvidence} from "../../shared/publication-authority.ts";
 import type {Transact} from "../../shared/db.ts";
-const evidence:PublicationEvidence={orgId:"org",workspaceId:"ws",harness:"claude",sessionId:"s",machineId:"srv_m",manifestKey:"key",revision:"1"};
+const evidence:PublicationEvidence={orgId:"org",workspaceId:"ws",harness:"claude",sessionId:"s",machineId:"srv_m",manifestKey:"key",revision:"1",schemaGeneration:"a".repeat(64)};
 const generation="12345678-1234-1234-1234-123456789abc";
 test("stale managed result never invokes final metadata callback",async()=>{
  let writes=0,commits=0;
@@ -21,4 +21,3 @@ test("missing or contradictory authority refuses instead of treating absent regi
   const db={query:async()=>({rows:[{result}]})};await expect(probePublication(db as never,evidence)).rejects.toMatchObject({code:"publication_authority_invalid"});
  }
 });
-

@@ -97,4 +97,3 @@ export async function canonicalPublicationTick(deps:PublicationJobDeps,options:P
  }
  return {enabled:true as const,examined:candidates.length,published,deferred,eligibleSessions};
 }
-

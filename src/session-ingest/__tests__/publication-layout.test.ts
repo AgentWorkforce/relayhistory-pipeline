@@ -40,4 +40,3 @@ describe("immutable upload publication layout",()=>{
   expect(buildObjectLandedMessage({landed:{key:unqualified},orgId:"org-a",manifest:fixture}).status).toBe("ignored");
  });
 });
-

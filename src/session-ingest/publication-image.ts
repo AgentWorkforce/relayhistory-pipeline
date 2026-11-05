@@ -173,4 +173,3 @@ export async function writePublicationImage(
  if(built.status!=="enqueue")throw refused("publication_notification_invalid");
  return built.message;
 }
-

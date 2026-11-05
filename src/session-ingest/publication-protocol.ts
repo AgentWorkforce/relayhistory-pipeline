@@ -28,4 +28,3 @@ export interface PublicationRpc {
  publish(ticket:PublicationTicket,messages:unknown[],signal:AbortSignal):Promise<{published:true;replay:boolean;images:number;records:number;eligibleSessions:number}>;
  abandon(ticket:PublicationTicket,signal:AbortSignal):Promise<void>;
 }
-

@@ -59,4 +59,3 @@ export function publicationRpc(db:SemanticBoundedSql,target:PublicationTarget,op
   async abandon(t,signal){if(typeof(await call("abandon",attempt(t),signal)).abandoned!=="boolean")throw bad();}
  };
 }
-

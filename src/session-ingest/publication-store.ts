@@ -45,4 +45,3 @@ export function boundedPublicationStore(store:ObjectStore,signal:AbortSignal):Ob
   return (...args:unknown[])=>race(async()=>Reflect.apply(value,target,args),signal);
  }});
 }
-
