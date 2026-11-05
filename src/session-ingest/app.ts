@@ -34,9 +34,10 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
-import { deliverBatch, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES } from "./vendor/delivery/delivery-contracts.ts";
 import { parseDeliveryRequest, requireDeliveryAccount } from "./vendor/delivery/prepare.ts";
+import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
 
 export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl};
 
@@ -277,7 +278,8 @@ export function createIngestApp(deps: IngestAppDeps) {
     // The body is read once, bounded by the wire cap, so the signature covers exactly what is parsed.
     let body: Uint8Array;
     try {
-      const privateWire=c.req.header("content-type")?.split(";")[0]?.trim()===CURRENT_CUSTODY_CONTENT_TYPE;
+      const contentType=c.req.header("content-type")?.split(";")[0]?.trim();
+      const privateWire=contentType===CURRENT_CUSTODY_CONTENT_TYPE||contentType===RECOVERY_CONTENT_TYPE;
       if(privateWire&&(deps.deliver.acceptanceMode!=="buffered"||!["","identity"].includes(c.req.header("content-encoding")?.trim().toLowerCase()??"")))throw new IngestUnavailable("fence","custody_wire_unavailable");
       body = c.req.raw.body ? await readBounded(c.req.raw.body, privateWire?PRIVATE_CUSTODY_BYTES:MAX_DELIVERY_BYTES) : new Uint8Array();
     } catch (error) {
@@ -320,6 +322,31 @@ export function createIngestApp(deps: IngestAppDeps) {
         duration_ms: Date.now() - started,
         bytes_raw: read.bytes,
       });
+      return failure(c, error);
+    }
+  });
+
+  // Private archive replay. Unlike the public batch route, this accepts the
+  // exact prepared values retained by the old Neon replica archive. It is
+  // available only while the receiver is in buffered mode and requires both
+  // the normal exact-body HMAC and fresh current-source custody.
+  app.post("/v1/delivery/recovery", async (c) => {
+    const started = Date.now();
+    const identity = c.get("identity");
+    const fields: Record<string, unknown> = { route: "delivery.recovery", org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") };
+    try {
+      if (deps.deliver.acceptanceMode !== "buffered" || c.req.header("content-type")?.split(";")[0]?.trim() !== RECOVERY_CONTENT_TYPE)
+        throw new IngestUnavailable("recovery", "recovery_wire_unavailable");
+      const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
+      const { prepared, custody } = await decodeRecoveryEnvelope(c.get("body"), tenant);
+      c.set("custody", custody);
+      const result = await deliverPrepared({ ...deps.deliver, custody }, tenant, prepared);
+      emit({ ...fields, outcome: result.outcome, count: result.stats.records, manifests: result.stats.manifests_written, deleted: result.stats.deleted_sessions, state: result.stats.replica, duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
+      custodyHeader(c, result.custodyAck);
+      return c.json({ ...result.receipt, limits: { ...result.receipt.limits, contentEncodings: contentEncodings() } });
+    } catch (error) {
+      const code = error instanceof DeliveryError ? error.code : "delivery_unavailable";
+      emit({ ...fields, outcome: code, ...(error instanceof IngestUnavailable ? { stage: error.stage, error_code: error.cause_code } : {}), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
       return failure(c, error);
     }
   });

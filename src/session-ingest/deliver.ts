@@ -136,17 +136,35 @@ async function stage<T>(name: string, work: () => Promise<T>): Promise<T> {
 }
 
 export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batch: HistoryExportBatch): Promise<DeliverResult> {
+  const started = Date.now();
+  // 403 delivery_account_mismatch, 413 delivery_too_large, exactly as relayhistory.
+  const prepared = await prepareDelivery({ orgId: tenant.orgId, workspaceId: tenant.workspaceId }, batch);
+  return deliverPreparedCore(deps, tenant, prepared, started, "prepare");
+}
+
+/**
+ * Lands an already-prepared relayhistory delivery through the same claim, fence,
+ * stale-record, buffered-write and receipt path as a live public batch.
+ *
+ * This is intentionally a narrow internal boundary. Callers must authenticate
+ * and validate the prepared object (including its original receipt and current
+ * source custody) before invoking it; the public route continues through
+ * `prepareDelivery` above.
+ */
+export async function deliverPrepared(deps: DeliverDeps, tenant: LedgerTenant, prepared: PreparedDelivery): Promise<DeliverResult> {
+  return deliverPreparedCore(deps, tenant, prepared, Date.now(), "precheck");
+}
+
+async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prepared: PreparedDelivery, started: number, firstTiming: "prepare" | "precheck"): Promise<DeliverResult> {
   const now = deps.now ?? (() => new Date());
   const timing: Record<string, number> = {};
-  let t = Date.now();
+  let t = started;
   const mark = (name: string) => {
     timing[name] = Date.now() - t;
     t = Date.now();
   };
-  // 403 delivery_account_mismatch, 413 delivery_too_large, exactly as relayhistory.
-  const prepared = await prepareDelivery({ orgId: tenant.orgId, workspaceId: tenant.workspaceId }, batch);
   await stage("precheck", async () => assertTenantSegment(deps.target.keyRoot, tenant.orgId));
-  mark("prepare");
+  mark(firstTiming);
 
   const sessions = [...new Map(prepared.records.filter((r) => r.session_id).map((r) => [pair(r.source, r.session_id), [r.source, r.session_id!] as [string, string]])).values()];
   const claim = await stage("claim", () =>
