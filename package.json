@@ -37,7 +37,8 @@
     "migration:neon-s3-sync": "bun run src/migration/neon-s3-sync/main.ts",
     "migration:neon-s3-erasure": "bun run src/migration/neon-s3-erasure/main.ts",
     "e2e:selfhost": "bun run e2e/selfhost/run.ts",
-    "e2e:pipeline": "bun run e2e/pipeline/run.ts"
+    "e2e:pipeline": "bun run e2e/pipeline/run.ts",
+    "migration:legacy-export": "bun run src/migration/legacy-export/main.ts"
   },
   "dependencies": {
     "@96bulls/pipeline": "workspace:*",
