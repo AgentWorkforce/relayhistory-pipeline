@@ -226,9 +226,13 @@ test("610 compose: the invoker refuses raw pointers, descriptors that miss the f
       [sc, src, null, ds({ count: "01" }), null],                // non-canonical count
       [sc, src, src, ds(), null],                                // prior source without prior descriptor
       [sc, src, src, ds(), ds()],                                // self-retire
-      // identical content under a NEW authority: no retire+publish of the same fingerprint
-      [sc, src, JSON.stringify({ ...r.source, authorityId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }), ds(), ds({ authorityId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" })],
     ]) { await db.exec("SAVEPOINT x"); await expect(call(bad)).rejects.toThrow("canonical_feature_changed"); await db.exec("ROLLBACK TO SAVEPOINT x"); }
+    // Identical content under a NEW authority is refused by the ABI itself ("invalid input"), before any
+    // frozen-authority lookup: no retire+publish of the same fingerprint.
+    const other = JSON.stringify({ ...r.source, authorityId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" });
+    await db.exec("SAVEPOINT x");
+    await expect(call([sc, src, other, ds(), ds({ authorityId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" })])).rejects.toThrow("canonical_feature_changed: invalid input");
+    await db.exec("ROLLBACK TO SAVEPOINT x");
   } finally { await db.exec("ROLLBACK"); }
 });
 
@@ -281,4 +285,12 @@ test("producer role: read-only journal + frozen pointer pages; no writer, seed o
   ]) await as(async () => { await expect(db.query(sql)).rejects.toThrow(/permission denied|must be/); });
   const attrs = (await db.query<any>("SELECT rolcanlogin,rolinherit,rolbypassrls,rolsuper FROM pg_roles WHERE rolname='bulls96_canonical_feature_producer'")).rows[0];
   expect(attrs).toEqual({ rolcanlogin: false, rolinherit: false, rolbypassrls: false, rolsuper: false });
+});
+
+test("no role outside the ingest Worker holds EXECUTE on the creator (default PUBLIC grant revoked)", async () => {
+  const fns = ["ingest_history_scope_build_locked(jsonb,text)", "ingest_history_scope_begin(jsonb)", "ingest_history_scope_build_keys(jsonb)", "ingest_history_scope_capture(jsonb)", "ingest_history_scope_install(jsonb)"];
+  for (const role of ["anon", "authenticated", "service_role", "session_directory_search_worker", "bulls96_session_ingest_seeder", "bulls96_canonical_feature_producer"])
+    for (const fn of fns)
+      expect((await db.query<any>("SELECT has_function_privilege($1,$2,'EXECUTE') ok", [role, "sessions." + fn])).rows[0].ok).toBe(false);
+  for (const fn of fns.slice(1)) expect((await db.query<any>("SELECT has_function_privilege('bulls96_session_ingest',$1,'EXECUTE') ok", ["sessions." + fn])).rows[0].ok).toBe(true);
 });
