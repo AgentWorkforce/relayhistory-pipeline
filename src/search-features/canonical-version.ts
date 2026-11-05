@@ -84,6 +84,9 @@ export interface CanonicalFeatureChangedPort {
 
 /** Per-page acknowledgment — idempotent restart-safe progress. */
 export interface CanonicalPageAckPort {
+  /** Freeze the entry's bindings before the first CH write — drift refuses. */
+  begin(entry: CanonicalJournalEntry, profileBinding: string,
+        targetBinding?: string): Promise<void>;
   ackPage(input: {
     entry: CanonicalJournalEntry; kind: "event" | "brief";
     cursor: string;                 // the request cursor that produced this page
@@ -102,6 +105,7 @@ export interface CanonicalPageAckPort {
     terminalEvent: string; terminalBrief: string;
     sourceAuthority: CanonicalSourceAuthority;
     profileBinding: string;
+    targetBinding: string;
   }): Promise<void>;
 }
 

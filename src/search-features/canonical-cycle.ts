@@ -112,11 +112,6 @@ export async function copyCanonicalEntry(
   state: CanonicalCycleState,
   entry: CanonicalJournalEntry,
 ): Promise<CanonicalCycleResult> {
-  // Resume derives from the durable chain, not a caller-supplied cursor.
-  const resume = {
-    event: (await acks.resumeCursor(entry, "event")).cursor,
-    brief: (await acks.resumeCursor(entry, "brief")).cursor,
-  };
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
   // #233 fences: the image descriptor must be complete and still match the
@@ -136,6 +131,14 @@ export async function copyCanonicalEntry(
   };
   const sourceAuthority: CanonicalSourceAuthority =
     entry.kind === "publish" ? entry.sourceAuthority : entry.priorSourceAuthority;
+  // Begin freezes the entry bindings before any CH write; drift refuses.
+  await acks.begin(entry, sourceAuthority.fingerprint);
+  // Resume derives from the durable chain; a complete pool is SKIPPED.
+  const rs: Record<"event" | "brief",
+      { state: "empty" | "resume" | "complete"; cursor: string | null }> = {
+    event: await acks.resumeCursor(entry, "event"),
+    brief: await acks.resumeCursor(entry, "brief"),
+  };
   const insertOnePage = async (
     kind: "event" | "brief", page: CanonicalImagePage,
     request: string | null,
@@ -171,9 +174,10 @@ export async function copyCanonicalEntry(
   };
   let total = 0, terminalEvent = "", terminalBrief = "";
   for (const kind of ["event", "brief"] as const) {
+    if (rs[kind].state === "complete") continue;   // already finished
     const seen = new Set<string>();
     for await (const { page, request } of pageAll(images, entry, kind,
-        entry.kind === "retire", resume[kind])) {
+        entry.kind === "retire", rs[kind].cursor)) {
       // #233 fences: page source + pointer binding + recomputed hash +
       // well-shaped non-repeating cursor.
       if (!Array.isArray(page.rows) || page.source !== entry.imageKey ||
@@ -189,15 +193,20 @@ export async function copyCanonicalEntry(
       const r = await insertOnePage(kind, page, request);
       if (r.kind === "refused") return r;
       total += r.rows.length;
+      // The terminal page (cursor null) supplies the real terminal hash the
+      // finish RPC binds — not a placeholder.
+      if (page.cursor === null) {
+        if (kind === "event") terminalEvent = page.pageSha256;
+        else terminalBrief = page.pageSha256;
+      }
     }
-    if (kind === "event") terminalEvent = "terminal";
-    else terminalBrief = "terminal";
   }
   // finish CAS: terminal descriptors + all page ACKs + still-current authority
   await acks.finish({
     entry, terminalEvent, terminalBrief,
     sourceAuthority,
     profileBinding: "builtin-fold",
+    targetBinding: ev.imageKey,
   });
   return { kind: "copied", checkpoint: entry.revision, rows: total };
 }

@@ -28,7 +28,8 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
    * The bindings (source/pointer/target/profile) are frozen at init — finish
    * refuses if they drifted.
    */
-  async begin(entry: CanonicalJournalEntry, profileBinding: string) {
+  async begin(entry: CanonicalJournalEntry, profileBinding: string,
+              targetBinding = "") {
     // Drift refuses: a begin on an existing revision whose identity/bindings
     // changed is a conflict, never a silent accept.
     const auth = JSON.stringify(
@@ -36,18 +37,19 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
         : entry.priorSourceAuthority);
     const { rows } = await this.db.query<{ n: number }>(
       `INSERT INTO ${ST}(entry_revision,kind,image_key,source_authority,` +
-        ` pointer_set,profile_binding,dirty) VALUES($1,$2,$3,$4,$5,$6,true)` +
+        ` pointer_set,profile_binding,target_binding,dirty)` +
+        ` VALUES($1,$2,$3,$4,$5,$6,$7,true)` +
         ` ON CONFLICT (entry_revision) DO NOTHING RETURNING 1 AS n`,
       [entry.revision, entry.kind, entry.imageKey, auth,
-        JSON.stringify(entry.pointerSet), profileBinding]);
+        JSON.stringify(entry.pointerSet), profileBinding, targetBinding]);
     if (!rows.length) {
       // Compare in SQL via jsonb equality — not TS stringify (key-order).
       const { rows: drift } = await this.db.query<{ ok: boolean }>(
         `SELECT source_authority=$2 AND pointer_set=$3 AND kind=$4` +
-          ` AND image_key=$5 AND profile_binding=$6 AS ok` +
-          ` FROM ${ST} WHERE entry_revision=$1`,
+          ` AND image_key=$5 AND profile_binding=$6 AND target_binding=$7` +
+          ` AND dirty AS ok FROM ${ST} WHERE entry_revision=$1`,
         [entry.revision, auth, JSON.stringify(entry.pointerSet),
-          entry.kind, entry.imageKey, profileBinding]);
+          entry.kind, entry.imageKey, profileBinding, targetBinding]);
       if (!drift.length || !drift[0]!.ok) throw new Error("begin_drift");
     }
   }

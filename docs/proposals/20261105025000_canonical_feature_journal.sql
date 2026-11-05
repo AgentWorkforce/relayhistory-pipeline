@@ -145,8 +145,8 @@ BEGIN
   RETURN true;
 END;
 $finish$;
-REVOKE ALL ON FUNCTION sessions.finish_canonical_copy(bigint,jsonb,text)
+REVOKE ALL ON FUNCTION sessions.finish_canonical_copy(bigint,jsonb,text,text,text,text)
   FROM PUBLIC,anon,authenticated,service_role,
   bulls96_session_ingest,bulls96_session_ingest_seeder;
-GRANT EXECUTE ON FUNCTION sessions.finish_canonical_copy(bigint,jsonb,text)
+GRANT EXECUTE ON FUNCTION sessions.finish_canonical_copy(bigint,jsonb,text,text,text,text)
   TO bulls96_canonical_feature_producer;

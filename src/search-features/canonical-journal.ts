@@ -40,12 +40,37 @@ const jsonb = <T>(v: unknown): T => {
   throw new Error("journal_row_invalid");
 };
 const HS1 = /^hs1:[a-f0-9]{64}:[a-f0-9]{64}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const HEX64 = /^[a-f0-9]{64}$/;
+/** Fail-closed row validation — every field shape checked, not just cast. */
+const validAuth = (a: CanonicalSourceAuthority | undefined) =>
+  !!a && UUID.test(a.authorityId) && /^[0-9]+$/.test(a.epoch) &&
+  HEX64.test(a.fingerprint);
+const validPtr = (p: CanonicalPointerSet | undefined) =>
+  !!p && UUID.test(p.authorityId) && HEX64.test(p.hash) &&
+  /^[0-9]+$/.test(p.count);
+const validScope = (s: CanonicalScope | undefined) =>
+  !!s && typeof s.orgId === "string" && typeof s.workspaceId === "string" &&
+  typeof s.harness === "string" && typeof s.sessionId === "string" &&
+  HEX64.test(s.generation);
 const toEntry = (r: Row): CanonicalJournalEntry => {
   if (r.kind !== "publish" && r.kind !== "retire")
     throw new Error("journal_kind_invalid");
   if (!HS1.test(r.image_key)) throw new Error("journal_image_key_invalid");
   const scope = jsonb<CanonicalScope>(r.scope);
   const pointerSet = jsonb<CanonicalPointerSet>(r.pointer_set);
+  if (!validScope(scope) || !validPtr(pointerSet))
+    throw new Error("journal_row_invalid");
+  if (r.kind === "retire") {
+    const prior = jsonb<CanonicalSourceAuthority>(r.source_authority);
+    if (!validAuth(prior)) throw new Error("journal_row_invalid");
+  } else {
+    const src = jsonb<CanonicalSourceAuthority>(r.source_authority);
+    if (!validAuth(src)) throw new Error("journal_row_invalid");
+    if (r.prior_source_authority &&
+        !validAuth(jsonb<CanonicalSourceAuthority>(r.prior_source_authority)))
+      throw new Error("journal_row_invalid");
+  }
   return r.kind === "retire"
     ? { kind: "retire", revision: String(r.revision),
         imageKey: r.image_key, schemaGeneration: r.schema_generation,
@@ -98,12 +123,13 @@ export class CanonicalJournalStore implements CanonicalJournalPort {
         " pointer_set FROM sessions.canonical_feature_journal" +
         " WHERE revision > $1::bigint AND kind <> 'seed'" +
         " ORDER BY revision LIMIT $2",
-      [after, limit]);
-    const entries = rows.map(toEntry);
+      [after, limit + 1]);
+    const hasMore = rows.length > limit;
+    const entries = rows.slice(0, limit).map(toEntry);
     return {
       entries,
       nextRevision: entries.length ? entries[entries.length - 1]!.revision : after,
-      hasMore: rows.length === limit,
+      hasMore,
     };
   }
   /** Sole writer is the 620 _install invoker — never a no-op. */
