@@ -40,3 +40,19 @@ describe("adapter selection", () => {
     expect(PIPELINE_RUNTIMES).toEqual(["workers", "lambda", "cloudrun", "terse"]);
   });
 });
+
+import { PGlite } from "@electric-sql/pglite";
+import { createPipelineRuntimeRegistry, createSearchIndexRegistry } from "../src/adapters/defaults.js";
+import type { SqlClient } from "../src/search-index/postgres.js";
+
+describe("OSS default registries", () => {
+  it("create postgres search and the worker runtime from an empty env", async () => {
+    const db = new PGlite();
+    const search = createSearchIndexRegistry().create({}, { env: {}, sql: db as unknown as SqlClient });
+    expect(search.backend).toBe("postgres");
+    const runtime = createPipelineRuntimeRegistry().create({}, { env: {}, source: { claim: async () => [], settle: async () => {} } });
+    expect(runtime.kind).toBe("workers");
+    expect(() => createSearchIndexRegistry().create({ SEARCH_INDEX_BACKEND: "opensearch" }, { env: {} })).toThrow(/not registered/);
+    await db.close();
+  });
+});

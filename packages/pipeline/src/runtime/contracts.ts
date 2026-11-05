@@ -25,8 +25,14 @@ export type WorkItem =
       readonly id: string;
       /** Object key of the landed manifest. */
       readonly key: string;
+      readonly bucket?: string;
       /** Ordering token when the platform has one (S3 sequencer, GCS generation). */
       readonly sequencer?: string;
+      readonly etag?: string;
+      /** Backend object version (S3 versionId, GCS generation). */
+      readonly version?: string;
+      /** The object was deleted (erasure): there is nothing to read. */
+      readonly deleted?: boolean;
       /** 1 on first delivery. */
       readonly attempt: number;
     }
