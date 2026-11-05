@@ -39,12 +39,15 @@ import { deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } fr
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES } from "./vendor/delivery/delivery-contracts.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
+import { heartbeatProgress, ProgressError, readConnection, recordHeartbeat, type Run as OnboardingRun } from "../history-db/onboarding.ts";
 
 export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl};
 
 export const SYNC_SCOPE = "rth:sync";
 export type ContentEncoding = "zstd" | "gzip";
 
+/** relayhistory-cloud's read scope; only the onboarding status read accepts it here. */
+export const READ_SCOPE = "rth:read";
 export const IDENTITY_HEADER = "x-relay-ingest-identity";
 export const SIGNATURE_HEADER = "x-relay-ingest-signature";
 /** How old (or how far ahead) a signature may be. */
@@ -110,6 +113,8 @@ export interface IngestAppDeps {
   /** The shared HMAC key (Secrets Store). Unset with no `identify`: every request is 401 not_configured. */
   signingKey?: string;
   deliver: DeliverDeps;
+  /** P5b G2: the onboarding heartbeat on history.probe_connections. Unset: those routes answer 503. */
+  onboarding?: { run: OnboardingRun };
   log?: (fields: Record<string, unknown>) => void;
   /**
    * P1 custody source (INGEST_CUSTODY_SOURCE). "relayhistory" (default): only the signed Neon witness
@@ -325,8 +330,46 @@ export function createIngestApp(deps: IngestAppDeps) {
       emit({ route: "auth", outcome: "error", error_code: "identity_failed" });
       return c.json(errorBody(c, "invalid_token", "invalid or expired token"), 401);
     }
-    if (!c.get("identity").scopes.includes(SYNC_SCOPE)) return c.json(errorBody(c, "forbidden", `missing required scope: ${SYNC_SCOPE}`), 403);
+    // The onboarding status read is the only rth:read route here; everything else needs rth:sync.
+    const scope = c.req.method === "GET" && new URL(c.req.url).pathname === "/v1/onboarding/connection" ? READ_SCOPE : SYNC_SCOPE;
+    if (!c.get("identity").scopes.includes(scope)) return c.json(errorBody(c, "forbidden", `missing required scope: ${scope}`), 403);
     await next();
+  });
+
+  // P5b G2: relayhistory-cloud's onboarding heartbeat (same validation and response), stored
+  // in history.probe_connections. relayhistory forwards here when ONBOARDING_BACKEND=ingest.
+  app.post("/v1/onboarding/heartbeat", async (c) => {
+    const identity = c.get("identity");
+    if (!deps.onboarding) return c.json(errorBody(c, "not_configured", "onboarding is not configured"), 503);
+    if (!identity.workspaceId) return c.json({ error: "Workspace required" }, 403);
+    let parsed;
+    try {
+      parsed = heartbeatProgress(c.get("body"));
+    } catch (error) {
+      if (error instanceof ProgressError || error instanceof SyntaxError) return c.json({ error: "Invalid progress" }, 400);
+      throw error;
+    }
+    if ("tooLarge" in parsed) return c.json({ error: "Progress too large" }, 413);
+    try {
+      const lastSeenAt = await recordHeartbeat(deps.onboarding.run, identity, parsed.progress);
+      emit({ route: "onboarding.heartbeat", outcome: "ok", org_id: identity.orgId });
+      return c.json({ connected: true, lastSeenAt });
+    } catch (error) {
+      emit({ route: "onboarding.heartbeat", outcome: "error", error_code: (error as { code?: string }).code ?? "onboarding_failed" });
+      return c.json(errorBody(c, "onboarding_unavailable", "onboarding is temporarily unavailable"), 503);
+    }
+  });
+
+  app.get("/v1/onboarding/connection", async (c) => {
+    const identity = c.get("identity");
+    if (!deps.onboarding) return c.json(errorBody(c, "not_configured", "onboarding is not configured"), 503);
+    if (!identity.workspaceId) return c.json({ error: "Workspace required" }, 403);
+    try {
+      return c.json(await readConnection(deps.onboarding.run, identity));
+    } catch (error) {
+      emit({ route: "onboarding.connection", outcome: "error", error_code: (error as { code?: string }).code ?? "onboarding_failed" });
+      return c.json(errorBody(c, "onboarding_unavailable", "onboarding is temporarily unavailable"), 503);
+    }
   });
 
   app.get("/v1/delivery/limits", (c) => c.json({ ...DELIVERY_LIMITS, contentEncodings: contentEncodings() }));
