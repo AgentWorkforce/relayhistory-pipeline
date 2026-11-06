@@ -89,7 +89,7 @@ END $authority_lock$;
 REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_lock(boolean)
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
--- Statement guard: once 'active', only the authority functions (which SET bulls96.privacy_authority_writer)
+-- Statement guard: once 'active', only the authority functions (which set bulls96.privacy_authority_writer)
 -- may write heads or frozen privacy/records. Statement level, so the 66M-row records table pays nothing per row.
 CREATE FUNCTION sessions.ingest_privacy_authority_guard() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $authority_guard$
@@ -190,10 +190,13 @@ REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_fence(jsonb)
 -- The snapshot must be the one Neon hashed (recomputed here), stable (the operator reads it twice >= settle apart
 -- while fenced), and contain no pending head. Mirror heads may only be missing or older than Neon's; anything else refuses.
 CREATE FUNCTION sessions.ingest_privacy_authority_activate(p jsonb) RETURNS jsonb
-LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp SET bulls96.privacy_authority_writer='authority' AS $authority_activate$
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp AS $authority_activate$
 DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;a sessions.ingest_privacy_authority%ROWTYPE;e jsonb;m sessions.ingest_source_control_heads%ROWTYPE;
  v_h jsonb;v_d jsonb;v_r jsonb;v_fp text;v_after jsonb;v_ins_d bigint;v_del_d bigint;v_ins_r bigint;v_del_r bigint;v_heads_written bigint:=0;v_last bigint;
 BEGIN
+ -- The writer marker the statement guard checks: transaction-local, set here (a function-level SET of a custom
+ -- parameter needs superuser on PG15+) and cleared before every normal return. It is not a trust boundary.
+ PERFORM set_config('bulls96.privacy_authority_writer','authority',true);
  PERFORM sessions.ingest_exact_keys(p,ARRAY['controlEpoch','neonFingerprintSha256','heads','deletions','resets','neonOwned']);
  PERFORM sessions.ingest_exact_keys(p->'neonOwned',ARRAY['rows','sha256']);
  PERFORM sessions.ingest_privacy_authority_lock(true);
@@ -300,6 +303,7 @@ BEGIN
  IF v_after->>'fingerprintSha256' IS DISTINCT FROM v_fp THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: activation did not reach the neon fingerprint';END IF;
  UPDATE sessions.ingest_privacy_authority SET state='active',neon_fingerprint_sha256=v_fp,activated_at=clock_timestamp() WHERE singleton;
+ PERFORM set_config('bulls96.privacy_authority_writer','',true);
  RETURN jsonb_build_object('state','active','fingerprintSha256',v_fp,'headsWritten',v_heads_written,
   'deletionsInserted',v_ins_d,'deletionsRemoved',v_del_d,'resetsInserted',v_ins_r,'resetsRemoved',v_del_r);
 END $authority_activate$;
@@ -380,10 +384,13 @@ REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_apply(text,text,text,te
 -- reset_uploaded_sessions_cutover_v1, with Supabase as the authority. Same digest, version, PRE and
 -- pending rules as Neon and the mirror, so the unchanged ingest fence accepts the control unchanged.
 CREATE FUNCTION sessions.ingest_privacy_authority_begin(p jsonb) RETURNS jsonb
-LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp SET bulls96.privacy_authority_writer='authority' AS $authority_begin$
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $authority_begin$
 DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;h sessions.ingest_source_control_heads%ROWTYPE;
  v_org text;v_ws text;v_user text;v_kind text;v_epoch text;v_payload jsonb;d text;fresh boolean;v_deleted bigint;s jsonb;
 BEGIN
+ -- The writer marker the statement guard checks: transaction-local, set here (a function-level SET of a custom
+ -- parameter needs superuser on PG15+) and cleared before every normal return. It is not a trust boundary.
+ PERFORM set_config('bulls96.privacy_authority_writer','authority',true);
  PERFORM sessions.ingest_exact_keys(p,ARRAY['epoch','tenant','kind','payload']);
  PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
  v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
@@ -422,6 +429,7 @@ BEGIN
   IF h.pending THEN
    IF h.digest IS DISTINCT FROM d OR h.kind IS DISTINCT FROM v_kind THEN
     RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: control pending';END IF;
+   PERFORM set_config('bulls96.privacy_authority_writer','',true);
    RETURN jsonb_build_object('epoch',h.epoch,'version',h.version::text,'digest',h.digest,'kind',h.kind,'pending',true,
     'deleted',h.deleted::text,'apply',false);
   END IF;
@@ -434,16 +442,20 @@ BEGIN
  IF v_kind='reset' THEN
   UPDATE sessions.ingest_source_control_heads SET deleted=v_deleted WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
  END IF;
+ PERFORM set_config('bulls96.privacy_authority_writer','',true);
  RETURN jsonb_build_object('epoch',h.epoch,'version',h.version::text,'digest',h.digest,'kind',h.kind,'pending',true,
   'deleted',v_deleted::text,'apply',true);
 END $authority_begin$;
 
 -- Supabase-first completion, after the ingest fence acknowledged the same {version,digest}.
 CREATE FUNCTION sessions.ingest_privacy_authority_complete(p jsonb) RETURNS jsonb
-LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp SET bulls96.privacy_authority_writer='authority' AS $authority_complete$
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $authority_complete$
 DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;h sessions.ingest_source_control_heads%ROWTYPE;
  v_org text;v_ws text;v_user text;v_version bigint;v_outcome text;
 BEGIN
+ -- The writer marker the statement guard checks: transaction-local, set here (a function-level SET of a custom
+ -- parameter needs superuser on PG15+) and cleared before every normal return. It is not a trust boundary.
+ PERFORM set_config('bulls96.privacy_authority_writer','authority',true);
  PERFORM sessions.ingest_exact_keys(p,ARRAY['epoch','tenant','version','digest','kind','outcome']);
  PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
  v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
@@ -461,11 +473,12 @@ BEGIN
  IF h.epoch IS DISTINCT FROM p->>'epoch' OR v_version>h.version THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control';END IF;
  -- A later head exists only after this intent completed; never clear the newer pending one.
- IF v_version<h.version THEN RETURN jsonb_build_object('completed',true,'superseded',true);END IF;
+ IF v_version<h.version THEN PERFORM set_config('bulls96.privacy_authority_writer','',true);RETURN jsonb_build_object('completed',true,'superseded',true);END IF;
  IF v_outcome NOT IN('applied','replay') OR h.digest IS DISTINCT FROM p->>'digest' OR h.kind IS DISTINCT FROM p->>'kind' THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control';END IF;
  UPDATE sessions.ingest_source_control_heads SET pending=false,updated_at=clock_timestamp()
   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
+ PERFORM set_config('bulls96.privacy_authority_writer','',true);
  RETURN jsonb_build_object('completed',true,'superseded',false);
 END $authority_complete$;
 REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_begin(jsonb),sessions.ingest_privacy_authority_complete(jsonb)
