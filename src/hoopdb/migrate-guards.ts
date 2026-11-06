@@ -121,6 +121,10 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_briefs": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_brief_wakeups": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_brief_attempts": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  // 20261105047000: portable search completeness state and derived content index,
+  // written on the runtime transaction that holds the directory row lock (H1).
+  "sessions.search_projection_state": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.search_transcript_events": ["SELECT", "INSERT", "UPDATE", "DELETE"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const RUNTIME_APPLICATION_SEQUENCES = [
@@ -160,6 +164,8 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_briefs",
   "sessions.session_brief_wakeups",
   "sessions.session_brief_attempts",
+  "sessions.search_projection_state",
+  "sessions.search_transcript_events",
 ] as const;
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [
