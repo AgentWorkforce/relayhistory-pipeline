@@ -23,9 +23,6 @@ BEGIN
   END IF;
 END
 $rollback_guard$;
-DROP POLICY session_directory_portable_read_api ON sessions.session_directory;
-REVOKE SELECT (org_id, workspace_id, harness, session_id, event_projection_epoch, event_projection_ready)
-  ON sessions.session_directory FROM bulls96_read_api;
 DROP TABLE sessions.search_transcript_events;
 DROP TABLE sessions.search_projection_state;
 DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105047000_portable_search_storage.sql';

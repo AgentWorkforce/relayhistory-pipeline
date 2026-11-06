@@ -1,6 +1,7 @@
 -- Portable (self-host) search storage: the ledgered, guard-compatible home of the
 -- Postgres search index and its content-free completeness state (PR #280 SQL-owner
--- findings H1, M1-M4). Registry slot 20261105047000 (layered-sessions-pipeline).
+-- findings H1, M1-M4). Registry slot 20261105047000 (layered-sessions-pipeline, confirmed;
+-- lands after 040000-046000 in numeric order).
 --
 -- Why here and not in an operator-created `search_index` schema:
 --   * H1. The portable writer runs on the existing hoopdb_url runtime pool, inside the
@@ -20,11 +21,14 @@
 --     ACL, RLS/FORCE, triggers and the exact policy set; the Lambda assemblies run it.
 --   * M2. The names are fixed. The portable composition refuses SEARCH_INDEX_POSTGRES_SCHEMA.
 --   * M3/M4. bulls96_read_api (verified by 20261105034000; never created or altered here)
---     receives column SELECT only, and tenant-bound FOR SELECT policies on both tables and
---     on the session_directory identity/epoch/readiness columns that the completeness
---     query joins. The read API runs both its completeness and its index queries inside
---     the TenantRunner READ ONLY transaction that binds bulls96_read.org_id/workspace_id
---     (session_read_api_role.sql). session_read_api_role_verify.sql accepts exactly these.
+--     receives column SELECT only, and tenant-bound FOR SELECT policies, on these two new
+--     tables only. The read API runs its index and state queries inside the TenantRunner
+--     READ ONLY transaction that binds bulls96_read.org_id/workspace_id.
+--     Deliberately NOT here: any grant or policy on sessions.session_directory and any
+--     change to session_read_api_role_verify.sql. Those are live production read-API
+--     surface (034000 / cutover verifiers) and ship in a separate slice reviewed by the
+--     migration lead. Until then the portable completeness query is refused for the read
+--     role (permission denied -> unavailable), which fails closed.
 --
 -- FORCE ROW LEVEL SECURITY: the migration owner has no policy here, so even an owner
 -- connection sees and writes nothing (and the Lambda assemblies refuse owner, superuser
@@ -159,18 +163,12 @@ GRANT SELECT (org_id, workspace_id, ts_ms, session_id, source, machine_id, kind,
               task_ref, task_ref_id, tags, files_touched, tool_name, tool_status,
               delivery_record_id, content, content_prefix_folded, task_title_folded)
   ON sessions.search_transcript_events TO bulls96_read_api;
-GRANT SELECT (org_id, workspace_id, harness, session_id, event_projection_epoch, event_projection_ready)
-  ON sessions.session_directory TO bulls96_read_api;
 
 CREATE POLICY search_projection_state_read_api ON sessions.search_projection_state
   AS PERMISSIVE FOR SELECT TO bulls96_read_api
   USING (org_id = current_setting('bulls96_read.org_id', true)
          AND workspace_id = current_setting('bulls96_read.workspace_id', true));
 CREATE POLICY search_transcript_events_read_api ON sessions.search_transcript_events
-  AS PERMISSIVE FOR SELECT TO bulls96_read_api
-  USING (org_id = current_setting('bulls96_read.org_id', true)
-         AND workspace_id = current_setting('bulls96_read.workspace_id', true));
-CREATE POLICY session_directory_portable_read_api ON sessions.session_directory
   AS PERMISSIVE FOR SELECT TO bulls96_read_api
   USING (org_id = current_setting('bulls96_read.org_id', true)
          AND workspace_id = current_setting('bulls96_read.workspace_id', true));
