@@ -30,7 +30,7 @@ async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"}
  const pool=new pg.Pool({connectionString:u.href});const dir=mkdtempSync(join(tmpdir(),"publisher-"));
  clean.push(async()=>{await pool.end();await admin.query("DROP DATABASE "+name);await admin.end();rmSync(dir,{recursive:true,force:true});});
  await pool.query(read("supabase/tests/supabase_shim.sql"));await pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");
- for(const f of["session_directory_search_worker.sql","session_token_verifier.sql","session_ingest_roles.sql","session_history_model_worker.sql"])await pool.query(read("supabase/bootstrap/"+f));
+ for(const f of["session_directory_search_worker.sql","session_token_verifier.sql","session_ingest_roles.sql","session_read_api_roles.sql"])await pool.query(read("supabase/bootstrap/"+f));
  for(const f of readdirSync(join(root,"supabase/migrations")).sort())await pool.query(read("supabase/migrations/"+f));
  for(const f of readdirSync(join(root,"src/hoopdb/migrations")).sort())await pool.query(read("src/hoopdb/migrations/"+f));
  await pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now())");

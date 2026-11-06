@@ -4,6 +4,9 @@
 DO $verify$
 DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_setting('hoopdb.db_mode',true),'');
  v_allowed text[] := ARRAY[
+ 'sessions.canonical_project_events_claim_v1(jsonb)',
+ 'sessions.canonical_project_events_release_v1(jsonb)',
+ 'sessions.canonical_project_events_sent_v1(jsonb)',
  'sessions.ingest_acquire_slot(jsonb)',
  'sessions.ingest_buffer_gc_claim(jsonb)',
  'sessions.ingest_buffer_gc_finish(jsonb)',

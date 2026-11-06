@@ -24,6 +24,7 @@
   "budgetUsd": 200,
   "budgetEmail": "aws-budgets@agentrelay.com",
   "transcriptStore": {
+    "bufferedGcRoleArn": "<exact separately managed GC role ARN in this account; required to retain active GC access>",
     "managementEvents": true
   }
 }

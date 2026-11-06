@@ -10,6 +10,7 @@
 --                                            LOGIN after migrate by session_ingest_role.sql)
 --             bulls96_canonical_feature_producer  the 610 producer: read-only on the canonical
 --                                            feature journal and the frozen pointer pages
+--             bulls96_project_events         canonical metadata read/pending/ack only
 --             bulls96_session_ingest_seeder  the revision seed (granted to an operator
 --                                            login for scripts/session-ingest-seed.ts)
 --   attrs     NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
@@ -32,7 +33,7 @@ DECLARE
   v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
   v_version int := current_setting('server_version_num')::int;
 BEGIN
-  FOREACH v_name IN ARRAY ARRAY['bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer'] LOOP
+  FOREACH v_name IN ARRAY ARRAY['bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_project_events'] LOOP
     SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
     IF NOT FOUND THEN
       SELECT rolsuper, rolcreaterole INTO v_me FROM pg_roles WHERE rolname = current_user;

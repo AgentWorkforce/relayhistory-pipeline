@@ -5,6 +5,10 @@ Both dispatcher and rerun initiator must be Khaliq. It requires main, the
 confirmation phrase and the image-publish environment. Code integration approval
 alone does not authorize publication or deployment.
 
+Both jobs use the repository's configured `CI_LINUX_RUNNER`, falling back to
+`ubuntu-latest`, matching the existing production session-read Worker deploy.
+The owner-only main dispatch and image-publish environment still gate execution.
+
 The full lowercase source_sha must belong to current original main. Its latest
 official main/push CI run and every effective job must pass. The read-only
 preflight checks every job page and latest attempt, never an older green run.

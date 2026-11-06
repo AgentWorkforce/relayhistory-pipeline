@@ -81,6 +81,7 @@ export default async function setup(project: TestProject) {
   // The disposable database replays the ingest ledger too; provision its
   // restricted roles through the same privileged bootstrap used by migrate.
   await db.query(read("supabase/bootstrap/session_ingest_roles.sql"));
+  await db.query(read("supabase/bootstrap/session_read_api_roles.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await db.query(read(`supabase/migrations/${file}`));
   await db.query(sql("supabase/bootstrap/session_read_api_role.sql"));
   // Roles are cluster-wide: the password is per run, so a stale one never logs in.

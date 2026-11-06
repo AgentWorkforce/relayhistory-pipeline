@@ -43,11 +43,12 @@ def copy_image(env, run=subprocess.run, auth_context=memory_auth):
                "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"}
     child_env = {key: value for key, value in env.items() if key in allowed}
     with auth_context(actor, token) as (descriptor, path):
-        options = {"check": True, "pass_fds": (descriptor,), "env": child_env}
+        options = {"check": True, "pass_fds": (descriptor,), "env": child_env,
+                   "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
         run(["skopeo", "copy", "--all", "--preserve-digests", "--authfile", path,
              f"oci-archive:{root / 'services.oci.tar'}", target], **options)
         result = run(["skopeo", "inspect", "--raw", "--authfile", path, target],
-                     stdout=subprocess.PIPE, **options)
+                     **options)
         if not isinstance(result.stdout, bytes) or "sha256:" + hashlib.sha256(result.stdout).hexdigest() != digest:
             raise RuntimeError("Registry index does not match the signed digest")
     return digest
