@@ -27,7 +27,7 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
 
 | # | Action | Reversible? |
 | --- | --- | --- |
-| A1 | Create the Supabase credentials for `sessions` (`pyamkrhoyszgzirqqffq`): a schema-owner role for migrations and a runtime role for the Worker (owner of, or `BYPASSRLS` on, `sessions.machines`), both in 1Password `96Bulls-prod`; plus a read-only Neon role for copy and verify | yes (drop roles) |
+| A1 | Create the Supabase credentials for `sessions` (`<supabase-project>`): a schema-owner role for migrations and a runtime role for the Worker (owner of, or `BYPASSRLS` on, `sessions.machines`), both in 1Password `96Bulls-prod`; plus a read-only Neon role for copy and verify | yes (drop roles) |
 |    | Read-only check on Supabase before A3: `SELECT current_user, has_parameter_privilege(current_user, 'session_replication_role', 'SET')`. The T0 copy set (`--mode=mirror`) does **not** need it: it lands through the live triggers and refuses any table whose enabled triggers are not reviewed guards (`GUARD_TRIGGERS`) or that is in a foreign key. Only `--mode=backfill` needs it, and that step is superseded by the S3 export (decision 0002) | — |
 |    | Read-only check: `SELECT datcollate, datctype, version() FROM pg_database WHERE datname = current_database()` on Neon and Supabase. If the collation differs, add `COLLATE "C"` to the verifier's text-key ranges and re-check that prefix-search plans use their indexes | — |
 | A2 | Size the Supabase compute and disk for the eventual ~486 GiB plus growth | yes |
@@ -51,7 +51,7 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
    ```sh
    scripts/sb db push            # 96Bulls supabase/migrations (wrapper; never a saved login)
    # relayhistory-cloud, with DATABASE_MIGRATIONS_URL/DATABASE_URL set to Supabase:
-   SUPABASE_PROJECT_REF=pyamkrhoyszgzirqqffq node scripts/check-database-target.mjs
+   SUPABASE_PROJECT_REF=<supabase-project> node scripts/check-database-target.mjs
    (cd packages/relayhistory && RELAYHISTORY_LEGACY_RETRACT_INDEX=1 node scripts/apply-neon-migration.mjs)
    node packages/relayhistory/scripts/rollout-delivery-projection.mjs
    node packages/relayhistory/scripts/rollout-session-rollups.mjs
@@ -86,9 +86,9 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
    # dry run first (read-only), then the same command with the guard:
    bun run migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines --chunk-size=1000
    bun run migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines --chunk-size=1000 \
-     --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq > /secure/t0/precopy.json
+     --execute --expect-supabase-ref=<supabase-project> > /secure/t0/precopy.json
    # every Supabase sequence >= Neon's + 1,000,000 (never-used ones from their start)
-   bun run migration:sequence-fence --apply --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq
+   bun run migration:sequence-fence --apply --execute --expect-supabase-ref=<supabase-project>
    ```
 5. **[A5] Deploy the gate and the driver.** The phase stays `neon`. Check that
    `GET /v1/internal/cutover/phase` returns `neon`, and that health, upload and
@@ -117,12 +117,12 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
    function, which catches the `SECURITY DEFINER` writers. Reads and stable
    functions keep working, and Cloud's `public` schema is untouched.
 10. **Catch up:** run
-    `migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq`
+    `migration:copy --mode=mirror --tables=$COPY_SET --keep-target-only=machines --execute --expect-supabase-ref=<supabase-project>`
     again.
     Then re-apply and re-check the sequence fence against Neon's final values
     (Supabase has taken no writes yet, so raising is safe), and re-run the
     schema gate:
-    `bun run migration:sequence-fence --apply --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq`
+    `bun run migration:sequence-fence --apply --execute --expect-supabase-ref=<supabase-project>`
     must report `passed: true`.
     **On any failure, abort:** apply `.restore` from `/secure/t0/neon-fence.json`
     on Neon, then move the phase `holding → neon`. The HoldLog replays to Neon.
@@ -156,7 +156,7 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     # catalog-derived tables (the copier refuses them; step 13b rebuilds them)
     bun run migration:copy --mode=backfill --tables=<legacy tables> \
       --chunk-size=500 --checkpoint=/secure/t0/backfill.json \
-      --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq
+      --execute --expect-supabase-ref=<supabase-project>
     ```
     The backfill never brings back what users deleted on Supabase after T0. It
     skips rows matching a `deleted_upload_sessions` tombstone, and all history
@@ -170,7 +170,7 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     transactions):
     ```sh
     bun run migration:rebuild --since=<T0 ISO timestamp> --batch=200 \
-      --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq
+      --execute --expect-supabase-ref=<supabase-project>
     ```
     It marks every session with an event at or after T0 in
     `session_rollup_dirty` and `onboarding_rollup_dirty`. Their deferred
@@ -184,7 +184,7 @@ export RELAYHISTORY_SOURCE_URL BULLS_TARGET_URL
     reproject every key from all records:
     ```sh
     bun run migration:reproject --batch=500 \
-      --execute --expect-supabase-ref=pyamkrhoyszgzirqqffq
+      --execute --expect-supabase-ref=<supabase-project>
     ```
     It covers every live upsert's catalog key plus the key of every existing
     derived row. Each page is one transaction, under the workspace's
@@ -225,7 +225,7 @@ target equalled the source's: copies, not trigger output.
   # dry run first, then with the guard
   SUPABASE_SOURCE_URL=... NEON_TARGET_URL=... bun run migration:reverse \
     --since=<T0 ISO> --tables=<legacy tables> --execute \
-    --expect-supabase-ref=pyamkrhoyszgzirqqffq --expect-neon-host=<neon endpoint host>
+    --expect-supabase-ref=<supabase-project> --expect-neon-host=<neon endpoint host>
   ```
   1. It replays on Neon the deletions Supabase recorded after T0.
   2. It upserts every row written since T0, Supabase winning.

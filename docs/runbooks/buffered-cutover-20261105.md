@@ -13,13 +13,13 @@ then "ok GO" for the hold.
 
 | Piece | Value |
 |---|---|
-| relayhistory-api | relayhistory-cloud main `e6bf926` (#299), runtime binding `relayhistory_app_runtime` (pooled host `ep-floral-pond-apkvat38-pooler…`), `DELIVERY_INGEST` service binding to `96bulls-session-ingest` |
+| relayhistory-api | relayhistory-cloud main `e6bf926` (#299), runtime binding `relayhistory_app_runtime` (pooled host `<neon-endpoint>-pooler…`), `DELIVERY_INGEST` service binding to `96bulls-session-ingest` |
 | `DELIVERY_CUTOVER` | `{"version":1,"mode":"ingest","epoch":"17e73957…1a86","privacyBaselineSha256":"c2d68710…083f"}` |
 | `DELIVERY_FORWARD` | `{"mode":"on","percent":100,"onUnreachable":"503"}` |
 | `DELIVERY_CUSTODY_SOURCE` | hostname as above, `sourceIdentitySha256` `7891c819…acc4` |
 | Ingest Worker | `96bulls-session-ingest` from this repo `5b1c449`: buffered, expected generation `d2569f34`, inline 0, replica off, Hyperdrive `0fcc0265…` (session pooler 5432) |
-| Neon (`divine-snow-84812652` / `br-damp-mud-apbr6ifp`) | 0078 installed; cutover phase `active` |
-| Supabase (`pyamkrhoyszgzirqqffq`) | readiness PASS for `d2569f34`; lazy-current policy; 965 orgs admitted, `valid_until` 2026-12-05T05:49:28Z |
+| Neon (`<neon-project-id>` / `<neon-branch-id>`) | 0078 installed; cutover phase `active` |
+| Supabase (`<supabase-project>`) | readiness PASS for `d2569f34`; lazy-current policy; 965 orgs admitted, `valid_until` 2026-12-05T05:49:28Z |
 | Buffered GC | stack `SessionsBufferedGc` armed and healthy; retention contract `7b2b3b82…31fe` |
 
 ## Timeline (UTC)
