@@ -73,8 +73,17 @@ describe("SESSIONS_NEON_EXIT=true refuses every ingest Neon edge at settings tim
     expect([res.status, ((await res.json()) as { error: { code: string } }).error.code]).toEqual([503, "not_configured"]);
     // The fan-out consumer refuses the same way: retried later, never processed.
     const retried: number[] = [];
-    await worker.queue({ messages: [{ body: { kind: "ingest-fanout" }, ack: () => { throw new Error("must not ack"); }, retry: (o) => retried.push(o?.delaySeconds ?? 0) }] }, env);
+    const errorLines: string[] = [];
+    const realWrite = process.stderr.write;
+    process.stderr.write = ((chunk: string | Uint8Array) => { errorLines.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    try {
+      await worker.queue({ messages: [{ body: { kind: "ingest-fanout" }, ack: () => { throw new Error("must not ack"); }, retry: (o) => retried.push(o?.delaySeconds ?? 0) }] }, env);
+    } finally {
+      process.stderr.write = realWrite;
+    }
     expect(retried).toEqual([300]);
+    const refusedLog = errorLines.map((line) => JSON.parse(line) as { message: string; error_code?: string }).find((line) => line.message === "session ingest settings invalid");
+    expect(refusedLog?.error_code).toBe("neon_exit_refused");
     expect(calls).toEqual([]);
     expect(fetchCalls).toEqual([]);
   });

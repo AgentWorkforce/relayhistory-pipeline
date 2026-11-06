@@ -205,6 +205,11 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: (
   });
 }
 
+/** A malformed setting or a Neon-exit refusal: a code, never the setting's value. */
+function logSettingsInvalid(error: unknown): void {
+  log.error("session ingest settings invalid", { error_code: error instanceof NeonExitRefusal ? error.code : "settings_invalid" });
+}
+
 const NOT_CONFIGURED = () =>
   Response.json({ error: { code: "not_configured", message: "the session ingest is not configured yet" }, correlationId: "" }, { status: 503, headers: { "retry-after": "60" } });
 
@@ -217,7 +222,7 @@ export default {
       settings = await ingestSettings(env);
     } catch (error) {
       // A malformed setting: relayhistory's envelope, retryable, never a bare 500.
-      log.error("session ingest settings invalid", { error_code: error instanceof NeonExitRefusal ? error.code : "settings_invalid" });
+      logSettingsInvalid(error);
       return NOT_CONFIGURED();
     }
     if (!settings) return NOT_CONFIGURED();
@@ -246,7 +251,7 @@ export default {
    * minutes per attempt instead of walking to the DLQ in seconds.
    */
   async queue(batch: { messages: { body: unknown; ack(): void; retry(o?: { delaySeconds?: number }): void }[] }, env: IngestWorkerEnv): Promise<void> {
-    const settings = await ingestSettings(env).catch(() => null);
+    const settings = await ingestSettings(env).catch((error: unknown) => { logSettingsInvalid(error); return null; });
     if (settings?.acceptanceMode === "buffered") {
       for (const message of batch.messages) message.retry({delaySeconds:300});
       log.info("session ingest fanout refused", {reason:"buffered_publication_refused"});
