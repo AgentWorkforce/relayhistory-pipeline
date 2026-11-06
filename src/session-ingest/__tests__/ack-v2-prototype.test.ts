@@ -199,6 +199,14 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
     ["wrong lineage","lineage=lineage+1"],["wrong source identity","source_identity_sha256=repeat('e',64)"],["wrong control epoch","control_epoch=repeat('e',64)"],
     ["seat in no vector","current_seat=current_seat+1000000"]];
    for(const [name,set] of bad)await expectCode(upd(set,x.key_sha256),/55000|binding refused|23514|23503/).catch(e=>{throw Error(name+": "+e)});
+   // the same binding negatives against a test-only validator copy WITHOUT the transition state machine:
+   // each must still be refused by the BINDING itself (review M1: the state machine would otherwise shadow them)
+   {const vd=(await f.db.query("SELECT pg_get_functiondef('sessions.ack_slot_validate()'::regprocedure) d")).rows[0].d as string;
+    const a0=vd.indexOf(" IF TG_OP='UPDATE' THEN"),a1=vd.indexOf(" ELSIF EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL",a0);expect(a0>0&&a1>a0).toBe(true);
+    const orig=vd;await f.db.exec(vd.slice(0,a0)+" IF TG_OP='UPDATE' THEN NULL;\n"+vd.slice(a1));
+    for(const [name,set] of bad.filter(([n])=>!/source identity|control epoch/.test(n)))
+     await expectCode(upd(set,x.key_sha256),"binding refused").catch(e=>{throw Error("isolated binding, "+name+": "+e)});
+    await f.db.exec(orig)}
    // multi-row statement mixing valid and invalid refuses entirely
    await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage+(CASE WHEN key_sha256=$1 THEN 1 ELSE 0 END) WHERE key_sha256 IN($1,$2)",[x.key_sha256,y.key_sha256]),/binding refused|slot regression refused|coverage mismatch/);
    // valid no-op multi-row update passes
@@ -228,7 +236,7 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    // isolate the final-winner BINDING from the no-regression rule (which also refuses any earlier seat): run the same
    // update against a test-only validator copy whose regression block is removed; the binding alone must still refuse
    const vd=(await f.db.query("SELECT pg_get_functiondef('sessions.ack_slot_validate()'::regprocedure) d")).rows[0].d as string;
-   const a0=vd.indexOf(" IF TG_OP='UPDATE' THEN"),a1=vd.indexOf(" ELSIF EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL) THEN");
+   const a0=vd.indexOf(" IF TG_OP='UPDATE' THEN"),a1=vd.indexOf(" ELSIF EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL",a0);
    expect(a0>0&&a1>a0).toBe(true);
    await f.db.exec(vd.slice(0,a0)+" IF TG_OP='UPDATE' THEN NULL;\n"+vd.slice(a1));
    await expectCode(f.db.query(`UPDATE sessions.ingest_lazy_native_slots SET current_seat=$1,lineage=$2,current_revision=$3,current_digest=$4 WHERE record_id='R'`,
@@ -290,6 +298,13 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    ];
    for(const [name,set,rid] of neg){const usesKey=set.includes("$1");
     await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET "+set+" WHERE record_id='"+rid+"'",usesKey?[legacyKey]:[]),/slot regression refused|binding refused|23514/).catch(e=>{throw Error(name+": "+e)})}
+   expect(await snap()).toEqual(before);
+   // K accepts are bound (review v9-H1): a forged K pointer is refused even with lineage+1 and a higher seat
+   const kRow=(await f.db.query("SELECT current_seat_key k,lineage::text l FROM sessions.ingest_lazy_native_slots WHERE record_id='K'")).rows[0];
+   const otherSeat=(await f.db.query("SELECT key_sha256 k FROM sessions.ingest_receipt_seats WHERE key_sha256<>$1 ORDER BY seat DESC LIMIT 1",[kRow.k])).rows[0].k; // L's not-accepted seat (other record)
+   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET current_seat_key=$1,lineage=lineage+1 WHERE record_id='K'",[otherSeat]),"slot regression refused");
+   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage+1000,current_revision=current_revision+1 WHERE record_id='K'"),"slot regression refused");
+   expect(await snap()).toEqual(before);
    // unowned -> legacy, and unowned lineage drift
    await f.control("selection",{origin_id:"origin-1",sessions:[{source:"claude",session_id:"s"}],enabled:false});   // lazy_clear positive: K,L?,S,U -> U (+1)
    const cleared=(await f.db.query("SELECT count(*)::int n FROM sessions.ingest_lazy_native_slots WHERE current_owner IS NULL")).rows[0].n;expect(cleared).toBeGreaterThan(0);
@@ -297,7 +312,13 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    const mid=await snap();
    await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET current_owner='user-1',current_legacy_key=$1 WHERE record_id=$2",[legacyKey,u]),/slot regression refused|23514/);
    await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage+1 WHERE record_id=$1",[u]),"slot regression refused");
-   expect(await snap()).toEqual(mid);void before;
+   expect(await snap()).toEqual(mid);
+   // erasure resurrection: after lazy_clear, re-point the cleared K slot at its pre-clear v1 seat with its old custody, lineage+1
+   const kc=(await f.db.query("SELECT current_owner o FROM sessions.ingest_lazy_native_slots WHERE record_id='K'")).rows[0];
+   if(kc.o===null){const s0=(await f.db.query("SELECT key_sha256,key_material,first_digest,source,session_id,fence_epoch FROM sessions.ingest_receipt_seats WHERE key_sha256=$1",[kRow.k])).rows[0];
+    await expectCode(f.db.query(`UPDATE sessions.ingest_lazy_native_slots SET current_owner='user-1',current_seat_key=$1,current_revision=1,current_digest=$2,current_source=$3,current_session=$4,
+      current_reset_epoch=0,current_fence_epoch=$5,lineage=lineage+1 WHERE record_id='K'`,[s0.key_sha256,s0.first_digest,s0.source,s0.session_id,s0.fence_epoch]),"slot regression refused")}
+   expect(kc.o).toBeNull();
   }finally{await f.close()}
  });
 
@@ -309,6 +330,9 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    await f.db.query("SELECT sessions.ingest_ack_format_set('v1')");
    await f.send("a2",[record({record_id:"A",revision:1,session_id:"s"})]);   // stale: v1r compat alias of the v2 seat
    expect((await f.db.query("SELECT count(*)::int n FROM sessions.ingest_receipt_seats WHERE compat_vector_claim IS NOT NULL")).rows[0].n).toBe(1);
+   // S/K -> K pointing at a compat alias is refused (compat rows are never a K winner)
+   const cmp=(await f.db.query("SELECT key_sha256 k FROM sessions.ingest_receipt_seats WHERE compat_vector_claim IS NOT NULL")).rows[0].k;
+   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET current_seat=NULL,current_seat_key=$1,lineage=lineage+1 WHERE record_id='A'",[cmp]),/slot regression refused|23514/);
    for(const role of ["origin","replica"]){await f.db.exec("SET session_replication_role="+role);
     await expectCode(f.db.query("UPDATE sessions.ingest_receipt_seats SET first_digest=repeat('0',64) WHERE compat_vector_claim IS NOT NULL"),"append-only");
     await expectCode(f.db.query("UPDATE sessions.ingest_receipt_seats SET first_digest=repeat('0',64) WHERE compat_vector_claim IS NULL"),"append-only");

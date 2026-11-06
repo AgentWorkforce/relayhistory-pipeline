@@ -58,7 +58,7 @@ CREATE FUNCTION sessions.ack_clock_sha() RETURNS bytea LANGUAGE sql STABLE AS $$
 CREATE FUNCTION sessions.ack_require_rank_permutation(p_ranks jsonb,p_n int) RETURNS void LANGUAGE plpgsql IMMUTABLE AS $$
 BEGIN
  IF jsonb_typeof(p_ranks) IS DISTINCT FROM 'array' OR jsonb_array_length(p_ranks)<>p_n
-  OR EXISTS(SELECT 1 FROM jsonb_array_elements(p_ranks) r WHERE jsonb_typeof(r)<>'number' OR r::text!~'^(0|[1-9][0-9]{0,2})$' OR r::text::int>=p_n)
+  OR EXISTS(SELECT 1 FROM jsonb_array_elements(p_ranks) r WHERE CASE WHEN jsonb_typeof(r)<>'number' OR r::text!~'^(0|[1-9][0-9]{0,2})$' THEN true ELSE r::text::int>=p_n END)
   OR (SELECT count(DISTINCT r::text) FROM jsonb_array_elements(p_ranks) r)<>p_n THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: processing ranks are not a permutation';END IF;
 END $$;
@@ -180,6 +180,9 @@ BEGIN
   IF e.o_claim=p_claim AND (e.own_key IS DISTINCT FROM e.o_key OR (q_km[array_position(q_ord,e.o_ord)]->>7) IS DISTINCT FROM (e.km->>7)
    OR e.fd IS DISTINCT FROM q_cd[array_position(q_ord,e.o_ord)]) THEN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: in-claim reuse key mismatch';END IF;
+  IF e.o_claim=p_claim AND EXISTS(SELECT 1 FROM generate_series(array_position(ords,e.o_ord)+1,e.idx::int-1) gs(gk)
+    WHERE (a_f[gs.gk]&1)=1 AND (q_km[gs.gk]->>7)=(e.km->>7)) THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: in-claim reuse must name the latest prior accept';END IF;
   nret:=nret+1;
   idx:=e.idx;ord:=e.ord;accepted:=(e.flags&1)=1;allocated:=(e.flags&2)=2;reused:=(e.flags&4)=4;lineage:=e.lineage;
   seat:=CASE WHEN allocated THEN v.seat_lo+(e.off-1) ELSE e.o_seat END;owner_kind:=e.o_kind;owner_claim:=e.o_claim;owner_ord:=e.o_ord;
@@ -243,7 +246,7 @@ BEGIN PERFORM sessions.ack_require_rc();
  ELSIF f<>2 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: claim already has another format';END IF;
  RETURN NEW;END $$;
 CREATE TRIGGER ack_guard_vector BEFORE INSERT OR UPDATE OR DELETE ON sessions.ingest_ack_vectors FOR EACH ROW EXECUTE FUNCTION sessions.ack_guard_vector();
-CREATE FUNCTION sessions.ack_refuse_truncate() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION sessions.ack_refuse_truncate() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $$
 BEGIN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: truncate refused';END $$;
 CREATE TRIGGER ack_vector_truncate BEFORE TRUNCATE ON sessions.ingest_ack_vectors FOR EACH STATEMENT EXECUTE FUNCTION sessions.ack_refuse_truncate();
 -- write-once discriminator + hashed-field immutability after stamping (§9.1, §12.2.4)
@@ -253,7 +256,7 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: stamped attempt is immutable';END IF;
  RETURN NEW;END $$;
 CREATE TRIGGER ack_attempt_immutable BEFORE UPDATE ON sessions.ingest_claim_attempts FOR EACH ROW EXECUTE FUNCTION sessions.ack_attempt_immutable();
-CREATE FUNCTION sessions.ack_clock_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION sessions.ack_clock_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $$
 BEGIN
  IF ROW(NEW.control_epoch,NEW.source_identity_sha256,NEW.baseline->>'sourceProofSha256',NEW.initial_generation,NEW.allocated_high_water)
   IS DISTINCT FROM ROW(OLD.control_epoch,OLD.source_identity_sha256,OLD.baseline->>'sourceProofSha256',OLD.initial_generation,OLD.allocated_high_water) THEN
@@ -271,6 +274,7 @@ ALTER TABLE sessions.ingest_lazy_native_slots VALIDATE CONSTRAINT ack_slot_point
 CREATE FUNCTION sessions.ack_slot_validate() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $val$
 DECLARE c sessions.ingest_receipt_seat_clock%ROWTYPE;pol sessions.ingest_lazy_policy%ROWTYPE;m sessions.ingest_ack_format%ROWTYPE;v_bad bigint;
 BEGIN
+ SELECT * INTO STRICT c FROM sessions.ingest_receipt_seat_clock WHERE singleton;
  IF TG_OP='UPDATE' THEN
   -- Pointer/owner transition state machine (v9 §15.10), for EVERY updated slot row. States:
   --   U unowned (owner NULL, no pointer) | L legacy (current_legacy_key) | K v1 seat key | S v2 seat
@@ -288,17 +292,27 @@ BEGIN
         o.current_seat,o.current_seat_key,o.current_legacy_key) IS NOT DISTINCT FROM
     ROW(nr.current_owner,nr.current_source,nr.current_session,nr.current_revision,nr.current_digest,nr.current_reset_epoch,nr.current_fence_epoch,
         nr.current_seat,nr.current_seat_key,nr.current_legacy_key) same,
-    num_nonnulls(nr.current_source,nr.current_session,nr.current_revision,nr.current_digest,nr.current_reset_epoch,nr.current_fence_epoch)=0 clear_shape
+    num_nonnulls(nr.current_source,nr.current_session,nr.current_revision,nr.current_digest,nr.current_reset_epoch,nr.current_fence_epoch)=0 clear_shape,
+    -- K accept: the receipt seat is a FRESH (above the committed clock; v1/v1r advance the clock only after their loop),
+    -- non-compat seat whose key material binds this slot's tenant/owner/record and every custody field (v9 review H1)
+    (sn.key_sha256 IS NOT NULL AND sn.compat_vector_claim IS NULL AND sn.seat>c.last_seat
+     AND sn.key_material->>1=c.control_epoch AND sn.key_material->>2=c.source_identity_sha256
+     AND sn.key_material->>3=nr.org_id AND sn.key_material->>4=nr.workspace_id AND sn.key_material->>5=nr.current_owner
+     AND sn.key_material->>6=nr.origin_id AND sn.key_material->>7=nr.record_id AND sn.key_material->>8=nr.current_revision::text
+     AND sn.key_material->>9=nr.current_reset_epoch::text AND sn.key_material->>10 IS NOT DISTINCT FROM nr.current_source
+     AND sn.key_material->>11 IS NOT DISTINCT FROM nr.current_session AND sn.first_digest=nr.current_digest
+     AND sn.fence_epoch=nr.current_fence_epoch AND nr.source_identity_sha256=c.source_identity_sha256 AND nr.control_epoch=c.control_epoch) k_bound
    FROM nr JOIN orows o ON o.key_sha256=nr.key_sha256
    LEFT JOIN sessions.ingest_receipt_seats sn ON sn.key_sha256=nr.current_seat_key
    LEFT JOIN sessions.ingest_receipt_seats so ON so.key_sha256=o.current_seat_key)
   SELECT count(*) INTO v_bad FROM t WHERE NOT(
        (same AND nl=ol)
-    OR (NOT same AND g IN('K','S') AND (oo IS NULL OR oo=no) AND nl>ol AND (os IS NULL OR ns>os))
+    OR (NOT same AND g='S' AND (oo IS NULL OR oo=no) AND nl>ol AND (os IS NULL OR ns>os))        -- S is bound to its final winner below
+    OR (NOT same AND g='K' AND (oo IS NULL OR oo=no) AND nl=ol+1 AND (os IS NULL OR ns>os) AND k_bound)
     OR (NOT same AND f IN('L','K','S') AND g='U' AND clear_shape AND nl=ol+1));
   IF v_bad>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot regression refused';END IF;
- ELSIF EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL) THEN
-  -- slots are created only by lazy_records (unowned or legacy); a v2 seat is only ever installed by UPDATE
+ ELSIF EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL OR current_seat_key IS NOT NULL OR lineage<>0) THEN
+  -- slots are created only by lazy_records: unowned or legacy, lineage 0; seats are only ever installed by UPDATE
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot insert with a v2 seat refused';
  END IF;
  IF NOT EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL) THEN RETURN NULL;END IF;
@@ -326,11 +340,11 @@ BEGIN
  IF v_bad>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot current seat binding refused';END IF;
  RETURN NULL;
 END $val$;
-CREATE FUNCTION sessions.ack_slot_identity() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION sessions.ack_slot_identity() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $$
 BEGIN
  IF TG_OP IN('DELETE','TRUNCATE') THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: native slots are never deleted';END IF;
- IF ROW(NEW.key_sha256,NEW.org_id,NEW.workspace_id,NEW.origin_id,NEW.record_id,NEW.key_material) IS DISTINCT FROM
-    ROW(OLD.key_sha256,OLD.org_id,OLD.workspace_id,OLD.origin_id,OLD.record_id,OLD.key_material) THEN
+ IF ROW(NEW.key_sha256,NEW.org_id,NEW.workspace_id,NEW.origin_id,NEW.record_id,NEW.key_material,NEW.source_identity_sha256,NEW.control_epoch,NEW.initialized_witness_sha256,NEW.initialized_at) IS DISTINCT FROM
+    ROW(OLD.key_sha256,OLD.org_id,OLD.workspace_id,OLD.origin_id,OLD.record_id,OLD.key_material,OLD.source_identity_sha256,OLD.control_epoch,OLD.initialized_witness_sha256,OLD.initialized_at) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: native slot identity is immutable';END IF;
  RETURN NEW;END $$;
 CREATE TRIGGER ack_slot_identity BEFORE UPDATE OR DELETE ON sessions.ingest_lazy_native_slots FOR EACH ROW EXECUTE FUNCTION sessions.ack_slot_identity();
@@ -490,6 +504,7 @@ BEGIN
   OR a.batch_id<>t.batch_id OR a.digest<>t.digest OR a.reset_epoch<>t.reset_epoch
   OR jsonb_array_length(a.source_processing_ranks)<>jsonb_array_length(a.records) THEN
   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: original candidate order changed';END IF;
+ PERFORM sessions.ack_require_rank_permutation(a.source_processing_ranks,jsonb_array_length(a.records));   -- [v1r change 3]
  FOR r IN SELECT q.* FROM sessions.ingest_receipt_seat_records(t.claim_token,t.group_ordinals) q
   ORDER BY (a.source_processing_ranks->>q.ord)::integer LOOP
   IF a.source_processing_ranks->>r.ord IS NULL THEN
@@ -738,7 +753,7 @@ DO $rv$DECLARE f record;BEGIN
  LOOP EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder',f.sig);END LOOP;END$rv$;
 
 -- ---------- receipt evidence is append-only (review v9 MAJOR 3): no UPDATE / DELETE / TRUNCATE ----------
-CREATE FUNCTION sessions.ack_receipt_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION sessions.ack_receipt_immutable() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $$
 BEGIN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: receipt evidence is append-only';END $$;
 CREATE TRIGGER ack_receipt_seats_immutable BEFORE UPDATE OR DELETE ON sessions.ingest_receipt_seats FOR EACH ROW EXECUTE FUNCTION sessions.ack_receipt_immutable();
 CREATE TRIGGER ack_receipt_seats_truncate BEFORE TRUNCATE ON sessions.ingest_receipt_seats FOR EACH STATEMENT EXECUTE FUNCTION sessions.ack_receipt_immutable();
