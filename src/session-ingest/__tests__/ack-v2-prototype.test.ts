@@ -200,7 +200,7 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
     ["seat in no vector","current_seat=current_seat+1000000"]];
    for(const [name,set] of bad)await expectCode(upd(set,x.key_sha256),/55000|binding refused|23514|23503/).catch(e=>{throw Error(name+": "+e)});
    // multi-row statement mixing valid and invalid refuses entirely
-   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage+(CASE WHEN key_sha256=$1 THEN 1 ELSE 0 END) WHERE key_sha256 IN($1,$2)",[x.key_sha256,y.key_sha256]),"binding refused");
+   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage+(CASE WHEN key_sha256=$1 THEN 1 ELSE 0 END) WHERE key_sha256 IN($1,$2)",[x.key_sha256,y.key_sha256]),/binding refused|slot regression refused|coverage mismatch/);
    // valid no-op multi-row update passes
    await f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage WHERE key_sha256 IN($1,$2)",[x.key_sha256,y.key_sha256]);
    // seat at or below cutover is refused even if it would otherwise bind (set cutover above it)
@@ -264,6 +264,72 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
   }finally{await f.close()}
  });
 
+ test("P10b transition state machine (review v9 HIGH 2): forbidden edges refuse, nothing changes",async()=>{
+  const f=await fixture(kind,"bridge-v1");try{
+   const L=record({record_id:"L",revision:5,session_id:"s"});
+   await f.send("k0",[record({record_id:"K",session_id:"s"})]);                                   // K: v1 seat key
+   await f.send("l0",[record({record_id:"L",revision:1,session_id:"s"})],{L:await meta(L)});      // L: legacy (not accepted)
+   const legacyKey=(await f.db.query("SELECT current_legacy_key k FROM sessions.ingest_lazy_native_slots WHERE record_id='L'")).rows[0].k;
+   expect(legacyKey).not.toBeNull();
+   await f.db.query("SELECT sessions.ingest_ack_format_set('v2')");
+   await f.send("s0",[record({record_id:"S",session_id:"s"})]);                                   // S: v2 seat
+   await f.send("u0",[record({record_id:"U",session_id:"s"})]);
+   const snap=async()=>(await f.db.query("SELECT record_id,(to_jsonb(n)-'current_seat'-'lineage')::text j,current_seat::text s,lineage::text l FROM sessions.ingest_lazy_native_slots n ORDER BY 1")).rows;
+   const before=await snap();
+   const neg:[string,string,string][]=[
+    ["v2 -> legacy (same lineage)","current_seat=NULL,current_legacy_key=$1","S"],
+    ["v2 -> legacy (lineage+1)","current_seat=NULL,current_legacy_key=$1,lineage=lineage+1","S"],
+    ["v1 -> legacy","current_seat_key=NULL,current_legacy_key=$1","K"],
+    ["clear without lineage bump","current_owner=NULL,current_source=NULL,current_session=NULL,current_revision=NULL,current_digest=NULL,current_reset_epoch=NULL,current_fence_epoch=NULL,current_seat=NULL","S"],
+    ["clear with lineage+2","current_owner=NULL,current_source=NULL,current_session=NULL,current_revision=NULL,current_digest=NULL,current_reset_epoch=NULL,current_fence_epoch=NULL,current_seat=NULL,lineage=lineage+2","S"],
+    ["clear leaving residual custody fields","current_owner=NULL,current_seat=NULL,lineage=lineage+1","S"],
+    ["direct owner transfer (v2)","current_owner='user-9'","S"],
+    ["direct owner transfer (v1)","current_owner='user-9'","K"],
+    ["legacy owner transfer","current_owner='user-9'","L"],
+    ["lineage change without custody change","lineage=lineage+1","S"],
+   ];
+   for(const [name,set,rid] of neg){const usesKey=set.includes("$1");
+    await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET "+set+" WHERE record_id='"+rid+"'",usesKey?[legacyKey]:[]),/slot regression refused|binding refused|23514/).catch(e=>{throw Error(name+": "+e)})}
+   // unowned -> legacy, and unowned lineage drift
+   await f.control("selection",{origin_id:"origin-1",sessions:[{source:"claude",session_id:"s"}],enabled:false});   // lazy_clear positive: K,L?,S,U -> U (+1)
+   const cleared=(await f.db.query("SELECT count(*)::int n FROM sessions.ingest_lazy_native_slots WHERE current_owner IS NULL")).rows[0].n;expect(cleared).toBeGreaterThan(0);
+   const u=(await f.db.query("SELECT record_id FROM sessions.ingest_lazy_native_slots WHERE current_owner IS NULL LIMIT 1")).rows[0].record_id;
+   const mid=await snap();
+   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET current_owner='user-1',current_legacy_key=$1 WHERE record_id=$2",[legacyKey,u]),/slot regression refused|23514/);
+   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage+1 WHERE record_id=$1",[u]),"slot regression refused");
+   expect(await snap()).toEqual(mid);void before;
+  }finally{await f.close()}
+ });
+
+ test("receipt evidence is append-only (review v9 MAJOR 3), also under session_replication_role=replica",async()=>{
+  const f=await fixture(kind,"bridge-v1");try{
+   await f.send("a0",[record({record_id:"A",session_id:"s"})]);
+   await f.db.query("SELECT sessions.ingest_ack_format_set('v2')");
+   await f.send("a1",[record({record_id:"A",revision:2,session_id:"s"})]);
+   await f.db.query("SELECT sessions.ingest_ack_format_set('v1')");
+   await f.send("a2",[record({record_id:"A",revision:1,session_id:"s"})]);   // stale: v1r compat alias of the v2 seat
+   expect((await f.db.query("SELECT count(*)::int n FROM sessions.ingest_receipt_seats WHERE compat_vector_claim IS NOT NULL")).rows[0].n).toBe(1);
+   for(const role of ["origin","replica"]){await f.db.exec("SET session_replication_role="+role);
+    await expectCode(f.db.query("UPDATE sessions.ingest_receipt_seats SET first_digest=repeat('0',64) WHERE compat_vector_claim IS NOT NULL"),"append-only");
+    await expectCode(f.db.query("UPDATE sessions.ingest_receipt_seats SET first_digest=repeat('0',64) WHERE compat_vector_claim IS NULL"),"append-only");
+    await expectCode(f.db.query("DELETE FROM sessions.ingest_receipt_seats"),"append-only");
+    await expectCode(f.db.query("TRUNCATE sessions.ingest_receipt_seats CASCADE"),"append-only");
+    await expectCode(f.db.query("UPDATE sessions.ingest_lazy_ack_decisions SET body_accepted=NOT body_accepted"),"append-only");
+    await expectCode(f.db.query("DELETE FROM sessions.ingest_lazy_ack_decisions"),"append-only");
+    await expectCode(f.db.query("TRUNCATE sessions.ingest_lazy_ack_decisions CASCADE"),"append-only")}
+   await f.db.exec("SET session_replication_role=origin");
+  }finally{await f.close()}
+ });
+
+ test("processing ranks must be a total order: SQL proof at claim (witness) and in the v2 writer/decoder",async()=>{
+  const f=await fixture(kind,"bridge-v2");try{
+   for(const bad of ['[0,0]','[1,2]','[0]','[0,"1"]','[0,-1]','{}'])
+    await expectCode(f.db.query("SELECT sessions.ack_require_rank_permutation($1::jsonb,2)",[bad]),"not a permutation").catch(e=>{throw Error(bad+": "+e)});
+   await f.db.query("SELECT sessions.ack_require_rank_permutation('[1,0]'::jsonb,2)");
+   await expectCode(f.send("dup",[record({record_id:"x",session_id:"s"}),record({record_id:"y",session_id:"s"})],{},TENANT,undefined as any,[0,0] as any),"rank coverage",f);
+  }finally{await f.close()}
+ });
+
  test("P10b writer coverage fault injection: omitted, extra and wrong-tuple updates roll back the whole ACK",async()=>{
   const src=readFileSync(join(root,FIXTURE),"utf8");
   const v2=src.slice(src.indexOf("CREATE FUNCTION sessions.ingest_lazy_ack_batch_v2"),src.indexOf("END $v2$;")+9).replace("CREATE FUNCTION","CREATE OR REPLACE FUNCTION");
@@ -281,7 +347,7 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
     await f.send("pre",[record({record_id:"bystander",session_id:"s"})]);
     expect(v2.includes(a)).toBe(true);await f.db.exec(v2.replace(a,b));
     const before=(await f.db.query("SELECT (SELECT count(*) FROM sessions.ingest_ack_vectors)::int v,(SELECT last_seat::text FROM sessions.ingest_receipt_seat_clock) s")).rows[0];
-    await expectCode(f.send("hit",[record({record_id:"m1",session_id:"s"}),record({record_id:"m1",revision:2,session_id:"s"}),record({record_id:"m2",session_id:"s"})]),/coverage mismatch|binding refused/,f).catch(e=>{throw Error(name+": "+e)});
+    await expectCode(f.send("hit",[record({record_id:"m1",session_id:"s"}),record({record_id:"m1",revision:2,session_id:"s"}),record({record_id:"m2",session_id:"s"})]),/coverage mismatch|binding refused|slot regression refused/,f).catch(e=>{throw Error(name+": "+e)});
     const after=(await f.db.query("SELECT (SELECT count(*) FROM sessions.ingest_ack_vectors)::int v,(SELECT last_seat::text FROM sessions.ingest_receipt_seat_clock) s")).rows[0];
     expect(after).toEqual(before);
    }finally{await f.close()}
@@ -333,12 +399,12 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
   const f=await fixture(kind,"bridge-v2");try{
    await f.send("rp",[record({record_id:"q1",session_id:"s"}),record({record_id:"q1",revision:2,session_id:"s"})]);
    await f.db.exec("SET session_replication_role=replica");
-   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET current_revision=current_revision+1 WHERE record_id='q1'"),"binding refused");
+   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET current_revision=current_revision+1 WHERE record_id='q1'"),/binding refused|slot regression refused|coverage mismatch/);
    await expectCode(f.db.query("DELETE FROM sessions.ingest_ack_vectors"),"immutable");
    await expectCode(f.db.query("INSERT INTO sessions.ingest_receipt_seats(key_sha256,key_material,seat,first_digest,source,session_id,fence_epoch) VALUES(repeat('1',64),'[]',1,repeat('2',64),'claude','s',0)"),"refused in mode v2");
    await f.db.exec("SET session_replication_role=origin");
    const tg=(await f.db.query("SELECT tgname,tgenabled FROM pg_trigger WHERE tgname LIKE 'ack_%' AND NOT tgisinternal ORDER BY 1")).rows;
-   expect(tg.every((r:any)=>r.tgenabled==="A")).toBe(true);expect(tg.length).toBe(12);
+   expect(tg.every((r:any)=>r.tgenabled==="A")).toBe(true);expect(tg.length).toBe(16);
   }finally{await f.close()}
  });
 
@@ -381,6 +447,22 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    expect(rows.length).toBe(2);
    for(const r of rows){expect(attemptSha(r)).toBe(r.sql);expect(r.stored).toBe(r.sql)}
   }finally{await f.close()}
+ });
+
+ test("P14 max seat (review v9 HIGH 1): format flips at last_seat=2^63-1 in both directions, terminal-era zero-allocation ACKs, exhaustion",async()=>{
+  for(const start of ["bridge-v2","bridge-v1"] as Mode[]){
+   const f=await fixture(kind,start,{highWater:"9223372036854775805"});try{
+    await f.send("x1",[record({record_id:"a",session_id:"s"}),record({record_id:"b",session_id:"s"})]);   // allocates ...806, ...807 (= 2^63-1)
+    expect((await f.db.query("SELECT last_seat::text s FROM sessions.ingest_receipt_seat_clock")).rows[0].s).toBe("9223372036854775807");
+    for(const to of start==="bridge-v2"?["v1","v2","v1"]:["v2","v1","v2"]){
+     await f.db.query("SELECT sessions.ingest_ack_format_set($1)",[to]);                    // must not overflow
+     await f.send("z"+to+Math.random().toString(36).slice(2,6),[record({record_id:"a",session_id:"s"})]);   // stale re-send: zero allocation
+     await expectCode(f.send("n"+to+Math.random().toString(36).slice(2,6),[record({record_id:"fresh-"+to+Math.random().toString(36).slice(2,6),session_id:"s"})]),"ACK seats exhausted",f);
+    }
+    const eras=(await f.db.query("SELECT mode,first_seat::text fs FROM sessions.ingest_ack_format_epochs ORDER BY epoch")).rows;
+    expect(eras.at(-1).fs).toBe("9223372036854775808");                                     // empty terminal era boundary
+   }finally{await f.close()}
+  }
  });
 
  test("P14 max seat: allocation ending exactly at 2^63-1 is allowed (no narrowing), next refuses exhausted; zero-allocation at max",async()=>{
