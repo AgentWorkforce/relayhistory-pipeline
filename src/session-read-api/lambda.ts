@@ -17,7 +17,9 @@
 import pg from "pg";
 import { log } from "../shared/log.ts";
 import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts";
-import { SUPABASE_PROD_CA_2021 } from "../session-pipeline/supabase-ca.ts";
+import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
+import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
+import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces } from "./app.ts";
 import { sqlDirectory } from "./directory.ts";
@@ -27,12 +29,13 @@ import { parseCompleteSince } from "./config.ts";
 import { poolTenantRunner, sqlLiveness } from "./liveness.ts";
 
 export interface ReadApiSecret {
-  clickhouse: { url: string; user: string; password: string; database: string };
+  clickhouse?: { url: string; user: string; password: string; database: string };
   supabase_url: string;
+  search?: unknown;
 }
 
 /** Parse and check the secret's shape. Never echoes a value. */
-export function parseReadApiSecret(text: string): ReadApiSecret {
+export function parseReadApiSecret(text: string, requireClickHouse = true): ReadApiSecret {
   let value: unknown;
   try {
     value = JSON.parse(text);
@@ -43,7 +46,7 @@ export function parseReadApiSecret(text: string): ReadApiSecret {
   if (!v || typeof v.supabase_url !== "string" || !/^postgres(ql)?:\/\//.test(v.supabase_url))
     throw new Error("session read api secret has no supabase_url");
   const c = v.clickhouse;
-  for (const k of ["url", "user", "password", "database"] as const)
+  if (requireClickHouse || c !== undefined) for (const k of ["url", "user", "password", "database"] as const)
     if (!c || typeof c[k] !== "string" || !c[k]) throw new Error(`session read api secret clickhouse.${k} is missing`);
   return v as ReadApiSecret;
 }
@@ -63,13 +66,18 @@ export function readApiAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthCon
 }
 
 type App = ReturnType<typeof createReadApi>;
-let appPromise: Promise<App> | undefined;
 
-async function buildApp(env: NodeJS.ProcessEnv = process.env): Promise<App> {
+function searchBackend(env: NodeJS.ProcessEnv, composition?: SearchComposition) {
+  return validateAdapterEnv(env, { runtime: ["lambda"], runtimeDefault: "lambda", search: ["clickhouse", ...(composition?.registry.registered().filter(name => name !== "clickhouse") ?? [])], searchDefault: "clickhouse" }).search;
+}
+
+async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition): Promise<App> {
   const region = env.AWS_REGION;
   const secretArn = env.SESSION_READ_API_SECRET_ARN;
   if (!region || !secretArn) throw new Error("session read api: AWS_REGION and SESSION_READ_API_SECRET_ARN are required");
-  const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
+  parseCompleteSince(env.READ_API_COMPLETE_SINCE);
+  postgresTlsOptions(env);
+  searchBackend(env, composition); // reject unsupported selections before secret lookup
   const { SecretString } = await awsJsonCall<{ SecretString?: string }>({
     service: "secretsmanager",
     target: "secretsmanager.GetSecretValue",
@@ -78,27 +86,39 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env): Promise<App> {
     credentials: lambdaCredentials(),
   });
   if (!SecretString) throw new Error("session read api secret has no value yet");
-  const secret = parseReadApiSecret(SecretString);
-  const url = new URL(secret.supabase_url);
-  for (const k of ["sslmode", "sslrootcert", "sslcert", "sslkey", "ssl"]) url.searchParams.delete(k);
+  return (await readAppFromSecret(SecretString, env, composition)).app;
+}
+
+/** The same service assembly used by the Lambda loader, without credential
+ * discovery. A reviewed artifact composition can provide registered adapters. */
+export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition): Promise<{ app: App; close(): Promise<void> }> {
+  const backend = searchBackend(env, composition);
+  const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
+  const tls = postgresTlsOptions(env);
+  const secret = parseReadApiSecret(secretText, backend === "clickhouse");
   const pool = new pg.Pool({
-    connectionString: url.toString(),
+    connectionString: postgresConnectionString(secret.supabase_url),
     max: 2,
     application_name: "96bulls-session-read-api",
-    ssl: { ca: SUPABASE_PROD_CA_2021, rejectUnauthorized: true },
+    ssl: tls,
     idleTimeoutMillis: 60_000,
     connectionTimeoutMillis: 2_000,
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
-  return createReadApi({
+  try {
+  const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", poolTenantRunner(pool as never));
+  if (adapter && await adapter.state.fromMs(new Date()) > completeSinceMs) throw new Error("read history floor is below search coverage");
+  const app = createReadApi({
     verify: relayAuthVerifier(readApiAuthConfig(env)),
-    ch: createClickHouseClient(secret.clickhouse),
+    ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
     directory: sqlDirectory(poolTenantRunner(pool as never)),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     completeSinceMs,
     log: (fields) => log.info("session read", fields),
   });
+  return { app, close: () => pool.end() };
+  } catch (error) { await pool.end(); throw error; }
 }
 
 export interface FunctionUrlEvent {
@@ -131,10 +151,12 @@ export async function handleUrlEvent(app: { fetch(req: Request): Response | Prom
   return { statusCode: response.status, headers: out, body: await response.text() };
 }
 
-export async function handler(event: FunctionUrlEvent): Promise<FunctionUrlResult> {
+export function createReadApiLambdaHandler(composition?: SearchComposition) {
+let appPromise: Promise<App> | undefined;
+return async function readApiHandler(event: FunctionUrlEvent): Promise<FunctionUrlResult> {
   let app: Awaited<NonNullable<typeof appPromise>>;
   try {
-    appPromise ??= buildApp();
+    appPromise ??= buildApp(process.env, composition);
     app = await appPromise;
   } catch (error) {
     // A failed init is retried on the next request rather than cached forever.
@@ -144,4 +166,7 @@ export async function handler(event: FunctionUrlEvent): Promise<FunctionUrlResul
   }
   // Route errors are answered inside the app (Hono); a throw here is not an init failure.
   return await handleUrlEvent(app, event);
+};
 }
+
+export const handler = createReadApiLambdaHandler();

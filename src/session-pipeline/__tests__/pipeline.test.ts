@@ -31,6 +31,12 @@ import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
 import { RECONCILE_DEADLINE_MS, lambdaEnv, reconcileRecent } from "../lambda.ts";
+import { PGlite } from "@electric-sql/pglite";
+import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
+import { createSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
+import { composeSearchService } from "../../shared/search-composition.ts";
+import { createReadApi, AuthError } from "../../session-read-api/app.ts";
+import type { SearchProjectionState } from "../search-adapter.ts";
 
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -216,6 +222,63 @@ function fakeSupabase(live: () => string[], busy: () => boolean = () => false, c
 function searchDeps(ch: ClickHouseClient, transact: SearchIndexDeps["transact"], limits?: SearchIndexDeps["limits"]): SearchIndexDeps {
   return { transact, reader, store, ch, prefixFor: (org) => `96bulls/${org}`, now: () => NOW, ...(limits ? { limits } : {}) };
 }
+
+test("registered Postgres projection serves the actual read API, fences stale writes, refuses partials and erases only its tenant", async () => {
+  const db = new PGlite({ extensions: { pg_trgm } });
+  await db.exec("CREATE EXTENSION pg_trgm");
+  let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "İstanbul hello"), event("r2", "1", Date.parse(AT) + 1, "hello two")])];
+  const sb = fakeSupabase(() => keys);
+  let complete = false, at = NOW;
+  const state: SearchProjectionState = {
+    async fromMs() { return 0; },
+    async record(tx, actual, value) { expect(tx).toBe(sb.tx); expect(actual).toEqual(scope); complete = value.complete; },
+    async partials(tenant) { expect(tenant).toEqual({ orgId: scope.orgId, workspaceId: scope.workspaceId }); return { sessions: complete ? [] : [scope.sessionId], overflow: false }; },
+  };
+  const registry = createSearchIndexRegistry();
+  const adapter = composeSearchService({ registry, state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer");
+  const index = adapter.index;
+  await index.ensureSchema(); // explicit test bootstrap, never service startup
+  const deps: SearchIndexDeps = { transact: sb.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => at };
+  const tenant = { orgId: scope.orgId, workspaceId: scope.workspaceId };
+  const query = () => index.query({ tenant, order: "asc", limit: 100 });
+  const app = createReadApi({ adapter, completeSinceMs: 0,
+    verify: async token => { if (token !== "fixture") throw new AuthError(401, "invalid_token", "invalid token"); return { ...tenant, userId: "user_1", scopes: ["rth:read"] }; },
+    liveness: { async erased() { return new Set(); }, async sessionStart() { return { pointers: 1, live: 1, createdAtMs: Date.parse(AT) }; }, async livePointerSessions(_o, _w, ids) { return new Set(ids); } },
+  });
+  const get = (path: string, auth = true) => app.request(path, { headers: auth ? { authorization: "Bearer fixture" } : {} });
+  try {
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 2 });
+    expect((await query()).hits).toHaveLength(2);
+    expect((await get(`/v1/events?workspace=${scope.workspaceId}&q=hello`, false)).status).toBe(401);
+    expect((await get("/v1/events?workspace=other&q=hello")).status).toBe(403);
+    const first = await get(`/v1/sessions/${scope.sessionId}/events?workspace=${scope.workspaceId}&limit=1`);
+    expect(first.status).toBe(200);
+    const page = await first.json() as any;
+    expect(page.events).toHaveLength(1); expect(page.nextCursor).toBeString();
+    const second = await get(`/v1/sessions/${scope.sessionId}/events?workspace=${scope.workspaceId}&limit=1&cursor=${encodeURIComponent(page.nextCursor)}`);
+    expect((await second.json() as any).events[0].eventId).not.toBe(page.events[0].eventId);
+    const search = await get(`/v1/events?workspace=${scope.workspaceId}&q=${encodeURIComponent("i̇stanbul")}&limit=10&org=other`);
+    expect(search.status).toBe(200); expect((await search.json() as any).events).toHaveLength(1);
+    const stored = await index.scanFingerprints({ ...tenant, source: scope.harness, sessionIds: [scope.sessionId] }, { fromMs: 0, limit: 100 });
+    const original = (await query()).hits[0]!;
+    await index.upsert([{ ...original, fingerprint: "newer", version: NOW.getTime() + 1, content: "newer", taskRefId: "", deliveryRecordId: "" }]);
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: false, inserted: 0, deleted: 0, reasons: ["search_version_conflict"] });
+    expect((await get(`/v1/events?workspace=${scope.workspaceId}&q=hello`)).status).toBe(501);
+    expect((await index.scanFingerprints({ ...tenant, source: scope.harness, sessionIds: [scope.sessionId] }, { fromMs: 0, limit: 100 })).rows).toHaveLength(stored.rows.length);
+    at = new Date(NOW.getTime() + 2);
+    keys = [await writeSession("srv_bb", [event("r1", "2", Date.parse(AT), "hello edited")], 2)];
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 1, deleted: 1 });
+    const current = (await query()).hits[0]!;
+    await index.upsert([{ ...current, workspaceId: "other", fingerprint: "other", version: at.getTime(), taskRefId: "", deliveryRecordId: "" }]);
+    keys = [await writeSession("srv_bb", [event("r1", "3", Date.parse(AT), "not scrubbed")], 3, { scrubbed: false })];
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: false, deleted: 0 });
+    expect((await query()).hits).toHaveLength(1);
+    keys = [];
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect((await query()).hits).toHaveLength(0);
+    expect((await index.query({ tenant: { ...tenant, workspaceId: "other" }, order: "asc", limit: 100 })).hits).toHaveLength(1);
+  } finally { await db.close(); }
+}, 30_000);
 
 describe("search index from S3", () => {
   test("direct canonical machine identity survives physical key encoding",async()=>{
