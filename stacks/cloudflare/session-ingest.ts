@@ -88,6 +88,8 @@ export interface SessionIngestInputs {
   acceptanceMode?: "canonical" | "buffered";
   /** P1 custody source; omit for the relayhistory (Neon) witness. shadow compares, frozen-supabase serves. */
   custodySource?: "shadow" | "frozen-supabase";
+  /** C3 privacy authority; omit for Neon. "supabase" requires custodySource frozen-supabase (and the owner-activated Supabase authority). */
+  privacyAuthority?: "supabase";
   /** Exact final composed migrator generation(), required only for buffered acceptance. */
   expectedGeneration?: string;
   /** The Hyperdrive config the lead created (Supabase transaction pooler, bulls96_session_ingest). */
@@ -122,7 +124,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "expectedGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -197,6 +199,7 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
   // 48 sessions is the Worker's subrequest budget per batch (relayhistory MAX_LIVE_SESSIONS).
   if (v.acceptanceMode !== undefined && v.acceptanceMode !== "canonical" && v.acceptanceMode !== "buffered") refuse("sessionIngest.acceptanceMode must be canonical or buffered");
   if (v.custodySource !== undefined && (!(v.custodySource === "shadow" || v.custodySource === "frozen-supabase") || v.acceptanceMode !== "buffered")) refuse("sessionIngest.custodySource must be shadow or frozen-supabase, in buffered mode only (omit for relayhistory)");
+  if (v.privacyAuthority !== undefined && (v.privacyAuthority !== "supabase" || v.custodySource !== "frozen-supabase")) refuse("sessionIngest.privacyAuthority must be supabase, with custodySource frozen-supabase only (omit for neon)");
   bufferedGeneration(v, refuse);
   int("inlineMaxSessions", v.acceptanceMode === "buffered" ? 0 : 1, 48);
   if (v.acceptanceMode === "buffered" && (v.inlineMaxSessions !== 0 || (v.replicaMode ?? "off") !== "off")) refuse("buffered acceptance requires explicit inlineMaxSessions 0 and replicaMode off");
@@ -233,6 +236,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     INGEST_REPLICA_MODE: p.replicaMode ?? "off",
     ...(p.acceptanceMode === "buffered" ? { INGEST_ACCEPTANCE_MODE: "buffered", INGEST_EXPECT_GENERATION: expectedGeneration! } : {}),
     ...(p.custodySource ? { INGEST_CUSTODY_SOURCE: p.custodySource } : {}),
+    ...(p.privacyAuthority ? { INGEST_PRIVACY_AUTHORITY: p.privacyAuthority } : {}),
     ...inboxAuthorityVars(p.authority, (why) => { throw new Error(why); }),
   };
 }

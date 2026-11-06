@@ -1,0 +1,499 @@
+-- C3: Supabase-first privacy authority for selection/reset (zero-Neon checklist C3/E3).
+--
+-- MIGRATION SLOT: TBD. This file is deliberately NOT under supabase/migrations: no slot was assigned
+-- by the registry owner (layered-sessions-pipeline) yet, and slot numbers are never invented. Once a
+-- slot is assigned, move it to supabase/migrations/<slot>_ingest_privacy_authority.sql and
+-- supabase/pending/ingest_privacy_authority.down.sql to supabase/rollbacks/<slot>_ingest_privacy_authority.down.sql.
+-- Tests apply it on top of the full migration stack (src/session-ingest/__tests__/privacy-authority-support.ts).
+--
+-- Before this change Neon is the privacy authority in every RHC mode, frozen-supabase included: the
+-- Supabase mirror (20261105010000) only wraps Neon's begin/apply/complete. This adds a second,
+-- default-off authority in which the Supabase head and the frozen privacy tables are written first
+-- and are authoritative, and Neon is not written at all:
+--
+--   absent row  : Neon is the authority (today). Nothing below changes behaviour.
+--   'fenced'    : owner-set. The legacy mirror begin (RHC mirror/frozen-supabase modes) refuses BEFORE
+--                 Neon, so no new control reaches Neon; in-flight mirrored controls may still complete.
+--                 The authority begin refuses too. Controls answer 503; uploads are unaffected.
+--   'active'    : owner-set by ingest_privacy_authority_activate, which first makes the Supabase heads and
+--                 frozen privacy byte-equal to a stable Neon snapshot (bound by a Neon-computed fingerprint)
+--                 and proves every head equals the target's own control receipts. From then on only
+--                 ingest_privacy_authority_begin/complete (RHC DELIVERY_CUSTODY_SOURCE_MODE=supabase-authority)
+--                 can change heads or frozen privacy; every legacy writer (mirror begin/complete, the #260/#261
+--                 parity/handoff tools, frozen-source-copy --copy) is refused by a statement guard.
+--
+-- The authority begin applies to the frozen tables exactly what Neon's set_session_uploads /
+-- reset_uploaded_sessions would have applied to delivery_records / deleted_upload_sessions / session_resets,
+-- in the same transaction as the head (Neon's set_session_uploads_cutover_v1 shape). The frozen witness
+-- therefore keeps answering what the Neon witness would have answered, and the transcript eraser (E3)
+-- reads ingest_frozen_source_deletions exactly where it read Neon's deleted_upload_sessions.
+--
+-- One-way after the first authority control: Neon's heads and privacy are then behind. ingest_privacy_authority_release
+-- returns to Neon authority only while no authority control has happened (fingerprint unchanged since activation).
+DO $authority_creator$
+DECLARE me oid;
+BEGIN
+ SELECT oid INTO STRICT me FROM pg_roles WHERE rolname=current_user;
+ IF EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+   WHERE n.nspname='sessions' AND c.relname IN('ingest_source_control_heads','ingest_frozen_source_deletions',
+    'ingest_frozen_source_resets','ingest_frozen_source_records') AND c.relowner<>me)
+  OR EXISTS(SELECT 1 FROM pg_proc WHERE oid IN('sessions.ingest_source_control_begin(jsonb)'::regprocedure,
+    'sessions.ingest_source_control_complete(jsonb)'::regprocedure) AND proowner<>me) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: privacy authority requires original creator';END IF;
+END $authority_creator$;
+
+-- Neon's head carries the reset count a pending replay answers; the mirror head now carries it too.
+ALTER TABLE sessions.ingest_source_control_heads ADD COLUMN deleted bigint CHECK(deleted IS NULL OR deleted>=0);
+
+CREATE TABLE sessions.ingest_privacy_authority(
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ state text NOT NULL CHECK(state IN('fenced','active')),
+ control_epoch text NOT NULL CHECK(control_epoch~'^[0-9a-f]{64}$'),
+ neon_fingerprint_sha256 text CHECK(neon_fingerprint_sha256~'^[0-9a-f]{64}$'),
+ fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),activated_at timestamptz,
+ CHECK((state='fenced' AND neon_fingerprint_sha256 IS NULL AND activated_at IS NULL)
+  OR (state='active' AND neon_fingerprint_sha256 IS NOT NULL AND activated_at IS NOT NULL))
+);
+ALTER TABLE sessions.ingest_privacy_authority ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.ingest_privacy_authority
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+-- Every authority transition and every control that touches heads/frozen privacy serializes on this key:
+-- begin/complete take it shared, fence/activate/release exclusive. Each check of the authority row runs
+-- AFTER the lock (READ COMMITTED: a new snapshot per statement), so no begin can pass a check made
+-- before a transition committed.
+CREATE FUNCTION sessions.ingest_privacy_authority_lock(p_exclusive boolean) RETURNS void
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp AS $authority_lock$
+BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: privacy authority requires read committed';END IF;
+ IF p_exclusive THEN PERFORM pg_advisory_xact_lock(1919249529,96);
+ ELSE PERFORM pg_advisory_xact_lock_shared(1919249529,96);END IF;
+END $authority_lock$;
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_lock(boolean)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+-- Statement guard: once 'active', only the authority functions (which SET bulls96.privacy_authority_writer)
+-- may write heads or frozen privacy/records. Statement level, so the 66M-row records table pays nothing per row.
+CREATE FUNCTION sessions.ingest_privacy_authority_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $authority_guard$
+BEGIN
+ IF coalesce(current_setting('bulls96.privacy_authority_writer',true),'')<>'authority'
+  AND EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority WHERE state='active') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: privacy authority is supabase; legacy writer refused';END IF;
+ RETURN NULL;
+END $authority_guard$;
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_guard()
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+CREATE TRIGGER ingest_privacy_authority_guard BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sessions.ingest_source_control_heads
+ FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_privacy_authority_guard();
+CREATE TRIGGER ingest_privacy_authority_guard BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sessions.ingest_frozen_source_deletions
+ FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_privacy_authority_guard();
+CREATE TRIGGER ingest_privacy_authority_guard BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sessions.ingest_frozen_source_resets
+ FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_privacy_authority_guard();
+CREATE TRIGGER ingest_privacy_authority_guard BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sessions.ingest_frozen_source_records
+ FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_privacy_authority_guard();
+
+-- The privacy fingerprint. NEON_PRIVACY_FINGERPRINT_SQL (src/migration/privacy-authority-handoff.ts) runs the
+-- same expression on Neon over delivery_cutover_control_heads / deleted_upload_sessions / session_resets;
+-- both sides are PostgreSQL jsonb text with every order pinned to COLLATE "C", so equal state gives equal bytes.
+CREATE FUNCTION sessions.ingest_privacy_authority_packet(p_heads jsonb,p_deletions jsonb,p_resets jsonb) RETURNS text
+LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $authority_packet$
+ SELECT encode(sha256(convert_to(jsonb_build_array('privacy-authority-v1',p_heads,p_deletions,p_resets)::text,'UTF8')),'hex')
+$authority_packet$;
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_packet(jsonb,jsonb,jsonb)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+CREATE FUNCTION sessions.ingest_privacy_authority_state() RETURNS jsonb
+LANGUAGE plpgsql STABLE SET search_path=pg_catalog,sessions,pg_temp AS $authority_state$
+DECLARE h jsonb;d jsonb;r jsonb;nh bigint;nd bigint;nr bigint;np bigint;a sessions.ingest_privacy_authority%ROWTYPE;
+BEGIN
+ SELECT count(*),count(*) FILTER(WHERE pending) INTO nh,np FROM sessions.ingest_source_control_heads;
+ SELECT count(*) INTO nd FROM sessions.ingest_frozen_source_deletions;
+ SELECT count(*) INTO nr FROM sessions.ingest_frozen_source_resets;
+ IF nh>100000 OR nd>200000 OR nr>100000 THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: privacy state too large for a fingerprint';END IF;
+ SELECT coalesce(jsonb_agg(jsonb_build_array(org_id,workspace_id,user_id,epoch,version::text,digest,kind,pending,deleted::text)
+  ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C"),'[]'::jsonb) INTO h FROM sessions.ingest_source_control_heads;
+ SELECT coalesce(jsonb_agg(jsonb_build_array(org_id,workspace_id,user_id,origin_id,source,session_id)
+  ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C",origin_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"),'[]'::jsonb)
+  INTO d FROM sessions.ingest_frozen_source_deletions;
+ SELECT coalesce(jsonb_agg(jsonb_build_array(org_id,workspace_id,user_id,request_id,deleted::text)
+  ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C",request_id COLLATE "C"),'[]'::jsonb)
+  INTO r FROM sessions.ingest_frozen_source_resets;
+ SELECT * INTO a FROM sessions.ingest_privacy_authority WHERE singleton;
+ RETURN jsonb_build_object('authority',CASE WHEN a.state IS NULL THEN 'neon' ELSE a.state END,
+  'fingerprintSha256',sessions.ingest_privacy_authority_packet(h,d,r),'heads',nh,'pendingHeads',np,'deletions',nd,'resets',nr,
+  'activatedFingerprintSha256',a.neon_fingerprint_sha256);
+END $authority_state$;
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_state()
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+-- Owner: close the legacy (Neon-first) control path. Requires the sealed copy and the live policy epoch.
+CREATE FUNCTION sessions.ingest_privacy_authority_fence(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp AS $authority_fence$
+DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;a sessions.ingest_privacy_authority%ROWTYPE;
+BEGIN
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['controlEpoch']);
+ PERFORM sessions.ingest_privacy_authority_lock(true);
+ pol:=sessions.ingest_frozen_source_policy();
+ IF p->>'controlEpoch' IS DISTINCT FROM pol.control_epoch THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: privacy authority epoch mismatch';END IF;
+ SELECT * INTO a FROM sessions.ingest_privacy_authority WHERE singleton FOR UPDATE;
+ IF FOUND THEN
+  IF a.state='fenced' AND a.control_epoch=pol.control_epoch THEN RETURN jsonb_build_object('state','fenced','changed',false);END IF;
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: privacy authority already active';
+ END IF;
+ INSERT INTO sessions.ingest_privacy_authority(state,control_epoch) VALUES('fenced',pol.control_epoch);
+ RETURN jsonb_build_object('state','fenced','changed',true);
+END $authority_fence$;
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_fence(jsonb)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+-- Owner: make Supabase exactly the given Neon snapshot, prove it against the target receipts, then activate.
+-- p: {controlEpoch, neonFingerprintSha256, heads[{orgId,workspaceId,userId,epoch,version,digest,kind,pending,deleted,payload,privacyVersion}],
+--     deletions[[org,ws,user,origin,source,session]], resets[[org,ws,user,request,deleted]]}
+-- The snapshot must be the one Neon hashed (recomputed here), stable (the operator reads it twice >= settle apart
+-- while fenced), and contain no pending head. Mirror heads may only be missing or older than Neon's; anything else refuses.
+CREATE FUNCTION sessions.ingest_privacy_authority_activate(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp SET bulls96.privacy_authority_writer='authority' AS $authority_activate$
+DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;a sessions.ingest_privacy_authority%ROWTYPE;e jsonb;m sessions.ingest_source_control_heads%ROWTYPE;
+ v_h jsonb;v_d jsonb;v_r jsonb;v_fp text;v_after jsonb;v_ins_d bigint;v_del_d bigint;v_ins_r bigint;v_del_r bigint;v_heads_written bigint:=0;v_last bigint;
+BEGIN
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['controlEpoch','neonFingerprintSha256','heads','deletions','resets']);
+ PERFORM sessions.ingest_privacy_authority_lock(true);
+ pol:=sessions.ingest_frozen_source_policy();
+ SELECT * INTO a FROM sessions.ingest_privacy_authority WHERE singleton FOR UPDATE;
+ IF NOT FOUND OR a.state<>'fenced' OR a.control_epoch<>pol.control_epoch OR p->>'controlEpoch' IS DISTINCT FROM pol.control_epoch THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: privacy authority not fenced';END IF;
+ -- The authority apply deletes a user's frozen records by session (selection) or by user (reset): without this
+ -- index (built CONCURRENTLY by ingest_privacy_authority_index.sql) each would scan a whole origin or org.
+ IF NOT EXISTS(SELECT 1 FROM pg_index i WHERE i.indexrelid=to_regclass('sessions.ingest_frozen_source_records_user_session')
+   AND i.indrelid='sessions.ingest_frozen_source_records'::regclass AND i.indisvalid AND i.indisready) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: user session index missing or invalid';END IF;
+ IF jsonb_typeof(p->'heads')<>'array' OR jsonb_typeof(p->'deletions')<>'array' OR jsonb_typeof(p->'resets')<>'array'
+  OR jsonb_array_length(p->'heads')>100000 OR jsonb_array_length(p->'deletions')>200000 OR jsonb_array_length(p->'resets')>100000 THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid privacy snapshot';END IF;
+ IF EXISTS(SELECT 1 FROM sessions.ingest_source_control_heads WHERE pending) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: mirror control pending';END IF;
+ -- Validate and canonicalize the snapshot rows, then recompute the fingerprint Neon computed.
+ CREATE TEMP TABLE pa_heads ON COMMIT DROP AS SELECT
+   sessions.ingest_identifier(x->'orgId',false) AS org_id,sessions.ingest_identifier(x->'workspaceId',true) AS workspace_id,
+   sessions.ingest_identifier(x->'userId',false) AS user_id,sessions.ingest_digest(x->'epoch') AS epoch,
+   CASE WHEN jsonb_typeof(x->'version')='string' AND x->>'version'~'^[1-9][0-9]{0,18}$' THEN (x->>'version')::bigint END AS version,
+   sessions.ingest_digest(x->'digest') AS digest,x->>'kind' AS kind,x->'pending' AS pending,
+   CASE WHEN x->'deleted'='null'::jsonb THEN NULL WHEN jsonb_typeof(x->'deleted')='string' AND x->>'deleted'~'^(0|[1-9][0-9]{0,18})$' THEN (x->>'deleted')::bigint
+    ELSE -1 END AS deleted,
+   x->'payload' AS payload,
+   CASE WHEN jsonb_typeof(x->'privacyVersion')='string' AND x->>'privacyVersion'~'^(0|[1-9][0-9]{0,18})$' THEN (x->>'privacyVersion')::bigint END AS privacy_version
+  FROM jsonb_array_elements(p->'heads') q(x);
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(p->'heads') q(x) WHERE jsonb_typeof(x)<>'object' OR
+   ARRAY(SELECT k FROM jsonb_object_keys(x) k ORDER BY k COLLATE "C") IS DISTINCT FROM
+   ARRAY['deleted','digest','epoch','kind','orgId','payload','pending','privacyVersion','userId','version','workspaceId']::text[])
+  OR EXISTS(SELECT 1 FROM pg_temp.pa_heads WHERE version IS NULL OR privacy_version IS NULL OR kind IS NULL OR kind NOT IN('selection','reset')
+   OR pending IS DISTINCT FROM 'false'::jsonb OR deleted=-1 OR epoch<>pol.control_epoch OR payload IS NULL OR jsonb_typeof(payload)<>'object'
+   OR encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',epoch,org_id,workspace_id,user_id,kind,payload)::text,'UTF8')),'hex')<>digest)
+  OR (SELECT count(*) FROM pg_temp.pa_heads)<>(SELECT count(DISTINCT (org_id,workspace_id,user_id)) FROM pg_temp.pa_heads) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid or pending neon head in snapshot';END IF;
+ CREATE TEMP TABLE pa_del ON COMMIT DROP AS SELECT DISTINCT
+   sessions.ingest_identifier(x->0,false) AS org_id,sessions.ingest_identifier(x->1,true) AS workspace_id,sessions.ingest_identifier(x->2,false) AS user_id,
+   sessions.ingest_identifier(x->3,false) AS origin_id,sessions.ingest_identifier(x->4,false) AS source,sessions.ingest_identifier(x->5,false) AS session_id
+  FROM jsonb_array_elements(p->'deletions') q(x);
+ CREATE TEMP TABLE pa_res ON COMMIT DROP AS SELECT
+   sessions.ingest_identifier(x->0,false) AS org_id,sessions.ingest_identifier(x->1,true) AS workspace_id,sessions.ingest_identifier(x->2,false) AS user_id,
+   sessions.ingest_identifier(x->3,false) AS request_id,
+   CASE WHEN jsonb_typeof(x->4)='string' AND x->>4~'^(0|[1-9][0-9]{0,18})$' THEN (x->>4)::bigint END AS deleted
+  FROM jsonb_array_elements(p->'resets') q(x);
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(p->'deletions') q(x) WHERE jsonb_typeof(x)<>'array' OR jsonb_array_length(x)<>6)
+  OR EXISTS(SELECT 1 FROM jsonb_array_elements(p->'resets') q(x) WHERE jsonb_typeof(x)<>'array' OR jsonb_array_length(x)<>5)
+  OR (SELECT count(*) FROM pg_temp.pa_del)<>jsonb_array_length(p->'deletions')
+  OR EXISTS(SELECT 1 FROM pg_temp.pa_res WHERE deleted IS NULL)
+  OR (SELECT count(*) FROM pg_temp.pa_res)<>(SELECT count(DISTINCT (org_id,workspace_id,user_id,request_id)) FROM pg_temp.pa_res) THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid privacy snapshot';END IF;
+ SELECT coalesce(jsonb_agg(jsonb_build_array(org_id,workspace_id,user_id,epoch,version::text,digest,kind,false,deleted::text)
+  ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C"),'[]'::jsonb) INTO v_h FROM pg_temp.pa_heads;
+ SELECT coalesce(jsonb_agg(jsonb_build_array(org_id,workspace_id,user_id,origin_id,source,session_id)
+  ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C",origin_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"),'[]'::jsonb) INTO v_d FROM pg_temp.pa_del;
+ SELECT coalesce(jsonb_agg(jsonb_build_array(org_id,workspace_id,user_id,request_id,deleted::text)
+  ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C",request_id COLLATE "C"),'[]'::jsonb) INTO v_r FROM pg_temp.pa_res;
+ v_fp:=sessions.ingest_privacy_authority_packet(v_h,v_d,v_r);
+ IF v_fp IS DISTINCT FROM sessions.ingest_digest(p->'neonFingerprintSha256') THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='frozen source: snapshot is not the neon fingerprint';END IF;
+ -- Heads: a mirror head may be missing or strictly older (a qualified repair); never newer or a different same-version head.
+ FOR m IN SELECT * FROM sessions.ingest_source_control_heads h WHERE NOT EXISTS(SELECT 1 FROM pg_temp.pa_heads n
+   WHERE n.org_id=h.org_id AND n.workspace_id=h.workspace_id AND n.user_id=h.user_id) LOOP
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: mirror head without a neon head';
+ END LOOP;
+ FOR e IN SELECT to_jsonb(n) FROM pg_temp.pa_heads n LOOP
+  SELECT * INTO m FROM sessions.ingest_source_control_heads WHERE org_id=e->>'org_id' AND workspace_id=e->>'workspace_id' AND user_id=e->>'user_id' FOR UPDATE;
+  IF FOUND THEN
+   IF m.epoch<>e->>'epoch' OR m.version>(e->>'version')::bigint
+    OR (m.version=(e->>'version')::bigint AND (m.digest<>e->>'digest' OR m.kind<>e->>'kind')) THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: mirror head diverges from neon';END IF;
+   IF m.version<(e->>'version')::bigint OR m.deleted IS DISTINCT FROM (e->>'deleted')::bigint THEN
+    UPDATE sessions.ingest_source_control_heads SET version=(e->>'version')::bigint,digest=e->>'digest',kind=e->>'kind',payload=e->'payload',
+     pending=false,before_privacy=NULL,privacy_version=(e->>'privacy_version')::bigint,deleted=(e->>'deleted')::bigint,updated_at=clock_timestamp()
+     WHERE org_id=m.org_id AND workspace_id=m.workspace_id AND user_id=m.user_id;
+    v_heads_written:=v_heads_written+1;
+   END IF;
+  ELSE
+   INSERT INTO sessions.ingest_source_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending,before_privacy,privacy_version,deleted)
+    VALUES(e->>'org_id',e->>'workspace_id',e->>'user_id',e->>'epoch',(e->>'version')::bigint,e->>'digest',e->>'kind',e->'payload',false,NULL,
+     (e->>'privacy_version')::bigint,(e->>'deleted')::bigint);
+   v_heads_written:=v_heads_written+1;
+  END IF;
+ END LOOP;
+ -- The target applied every Neon control through the mandatory ingest fence: its receipts must end exactly at each head.
+ IF EXISTS(SELECT 1 FROM pg_temp.pa_heads n WHERE (SELECT max(r.version) FROM sessions.ingest_control_receipts r WHERE r.org_id=n.org_id
+    AND r.workspace_id=n.workspace_id AND r.user_id=n.user_id AND r.epoch=n.epoch) IS DISTINCT FROM n.version
+   OR NOT EXISTS(SELECT 1 FROM sessions.ingest_control_receipts r WHERE r.org_id=n.org_id AND r.workspace_id=n.workspace_id
+    AND r.user_id=n.user_id AND r.epoch=n.epoch AND r.version=n.version AND r.digest=n.digest AND r.kind=n.kind))
+  OR EXISTS(SELECT 1 FROM sessions.ingest_control_receipts r WHERE r.epoch=pol.control_epoch AND NOT EXISTS(SELECT 1 FROM pg_temp.pa_heads n
+    WHERE n.org_id=r.org_id AND n.workspace_id=r.workspace_id AND n.user_id=r.user_id)) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: neon heads do not match the target control receipts';END IF;
+ -- Privacy: exactly the snapshot.
+ WITH x AS(DELETE FROM sessions.ingest_frozen_source_deletions d WHERE NOT EXISTS(SELECT 1 FROM pg_temp.pa_del n WHERE (n.org_id,n.workspace_id,n.user_id,n.origin_id,n.source,n.session_id)
+   =(d.org_id,d.workspace_id,d.user_id,d.origin_id,d.source,d.session_id)) RETURNING 1) SELECT count(*) INTO v_del_d FROM x;
+ WITH x AS(INSERT INTO sessions.ingest_frozen_source_deletions SELECT * FROM pg_temp.pa_del ON CONFLICT DO NOTHING RETURNING 1) SELECT count(*) INTO v_ins_d FROM x;
+ WITH x AS(DELETE FROM sessions.ingest_frozen_source_resets d WHERE NOT EXISTS(SELECT 1 FROM pg_temp.pa_res n WHERE (n.org_id,n.workspace_id,n.user_id,n.request_id,n.deleted)
+   =(d.org_id,d.workspace_id,d.user_id,d.request_id,d.deleted)) RETURNING 1) SELECT count(*) INTO v_del_r FROM x;
+ WITH x AS(INSERT INTO sessions.ingest_frozen_source_resets SELECT * FROM pg_temp.pa_res ON CONFLICT DO NOTHING RETURNING 1) SELECT count(*) INTO v_ins_r FROM x;
+ v_after:=sessions.ingest_privacy_authority_state();
+ IF v_after->>'fingerprintSha256' IS DISTINCT FROM v_fp THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: activation did not reach the neon fingerprint';END IF;
+ UPDATE sessions.ingest_privacy_authority SET state='active',neon_fingerprint_sha256=v_fp,activated_at=clock_timestamp() WHERE singleton;
+ RETURN jsonb_build_object('state','active','fingerprintSha256',v_fp,'headsWritten',v_heads_written,
+  'deletionsInserted',v_ins_d,'deletionsRemoved',v_del_d,'resetsInserted',v_ins_r,'resetsRemoved',v_del_r);
+END $authority_activate$;
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_activate(jsonb)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+-- Owner: return to Neon authority. From 'fenced' always; from 'active' only while nothing changed since activation
+-- (Neon is then still exactly equal). After the first authority control this refuses: the switch is one-way.
+CREATE FUNCTION sessions.ingest_privacy_authority_release(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp AS $authority_release$
+DECLARE a sessions.ingest_privacy_authority%ROWTYPE;s jsonb;
+BEGIN
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['controlEpoch']);
+ PERFORM sessions.ingest_privacy_authority_lock(true);
+ SELECT * INTO a FROM sessions.ingest_privacy_authority WHERE singleton FOR UPDATE;
+ IF NOT FOUND THEN RETURN jsonb_build_object('authority','neon','changed',false);END IF;
+ IF a.control_epoch IS DISTINCT FROM p->>'controlEpoch' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: privacy authority epoch mismatch';END IF;
+ IF a.state='active' THEN
+  s:=sessions.ingest_privacy_authority_state();
+  IF s->>'fingerprintSha256' IS DISTINCT FROM a.neon_fingerprint_sha256 OR (s->>'pendingHeads')::bigint<>0 THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: supabase authority diverged from neon; release refused';END IF;
+ END IF;
+ DELETE FROM sessions.ingest_privacy_authority WHERE singleton;
+ RETURN jsonb_build_object('authority','neon','changed',true,'from',a.state);
+END $authority_release$;
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_release(jsonb)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+-- Neon's set_session_uploads / reset_uploaded_sessions, over the frozen copy. Called only inside the authority begin.
+CREATE FUNCTION sessions.ingest_privacy_authority_apply(p_org text,p_ws text,p_user text,p_kind text,p_payload jsonb) RETURNS bigint
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp AS $authority_apply$
+DECLARE v_origin text;v_enabled boolean;item jsonb;v_total bigint;v_request text;
+BEGIN
+ IF coalesce(current_setting('bulls96.privacy_authority_writer',true),'')<>'authority' THEN
+  RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='frozen source: authority apply outside the authority begin';END IF;
+ IF p_kind='selection' THEN
+  v_origin:=p_payload->>'origin_id';v_enabled:=(p_payload->>'enabled')::boolean;
+  FOR item IN SELECT value FROM jsonb_array_elements(p_payload->'sessions') LOOP
+   IF v_enabled THEN
+    DELETE FROM sessions.ingest_frozen_source_deletions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user
+     AND origin_id=v_origin AND source=item->>'source' AND session_id=item->>'session_id';
+   ELSE
+    INSERT INTO sessions.ingest_frozen_source_deletions VALUES(p_org,p_ws,p_user,v_origin,item->>'source',item->>'session_id') ON CONFLICT DO NOTHING;
+    DELETE FROM sessions.ingest_frozen_source_records WHERE org_id=p_org AND workspace_id=p_ws AND origin_id=v_origin AND user_id=p_user
+     AND source=item->>'source' AND session_id=item->>'session_id';
+   END IF;
+  END LOOP;
+  RETURN NULL;
+ END IF;
+ v_request:=p_payload->>'request_id';
+ SELECT deleted INTO v_total FROM sessions.ingest_frozen_source_resets WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND request_id=v_request;
+ IF FOUND THEN RETURN v_total;END IF;
+ -- Owned sessions = the user's frozen delivery records with a session (Neon: owned_uploaded_session_identities over
+ -- delivery_records). Neon's uploaded_support_identities is not in the frozen copy: see the activation census.
+ SELECT count(*) INTO v_total FROM(SELECT DISTINCT source,session_id FROM sessions.ingest_frozen_source_records
+  WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL)s;
+ INSERT INTO sessions.ingest_frozen_source_deletions
+  SELECT DISTINCT p_org,p_ws,p_user,origin_id,source,session_id FROM sessions.ingest_frozen_source_records
+  WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL ON CONFLICT DO NOTHING;
+ DELETE FROM sessions.ingest_frozen_source_records WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL;
+ INSERT INTO sessions.ingest_frozen_source_resets VALUES(p_org,p_ws,p_user,v_request,v_total);
+ RETURN v_total;
+END $authority_apply$;
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_apply(text,text,text,text,jsonb)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+-- Supabase-first begin: Neon's begin_delivery_cutover_control_v1 + set_session_uploads_cutover_v1 /
+-- reset_uploaded_sessions_cutover_v1, with Supabase as the authority. Same digest, version, PRE and
+-- pending rules as Neon and the mirror, so the unchanged ingest fence accepts the control unchanged.
+CREATE FUNCTION sessions.ingest_privacy_authority_begin(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp SET bulls96.privacy_authority_writer='authority' AS $authority_begin$
+DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;h sessions.ingest_source_control_heads%ROWTYPE;
+ v_org text;v_ws text;v_user text;v_kind text;v_epoch text;v_payload jsonb;d text;fresh boolean;v_deleted bigint;s jsonb;
+BEGIN
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['epoch','tenant','kind','payload']);
+ PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
+ v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p#>'{tenant,userId}',false);v_kind:=p->>'kind';v_epoch:=p->>'epoch';v_payload:=p->'payload';
+ IF v_kind IS NULL OR v_kind NOT IN('selection','reset') OR jsonb_typeof(v_payload) IS DISTINCT FROM 'object' OR octet_length(v_payload::text)>2113536 THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid control';END IF;
+ IF v_kind='selection' THEN
+  PERFORM sessions.ingest_exact_keys(v_payload,ARRAY['origin_id','sessions','enabled']);
+  PERFORM sessions.ingest_identifier(v_payload->'origin_id',false);
+  IF jsonb_typeof(v_payload->'enabled') IS DISTINCT FROM 'boolean' OR jsonb_typeof(v_payload->'sessions') IS DISTINCT FROM 'array'
+   OR jsonb_array_length(v_payload->'sessions') NOT BETWEEN 1 AND 2048 THEN
+   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid selection';END IF;
+  FOR s IN SELECT value FROM jsonb_array_elements(v_payload->'sessions') LOOP
+   PERFORM sessions.ingest_exact_keys(s,ARRAY['source','session_id']);
+   PERFORM sessions.ingest_identifier(s->'source',false);PERFORM sessions.ingest_identifier(s->'session_id',false);
+  END LOOP;
+ ELSE
+  PERFORM sessions.ingest_exact_keys(v_payload,ARRAY['request_id']);PERFORM sessions.ingest_identifier(v_payload->'request_id',false);
+ END IF;
+ PERFORM sessions.ingest_privacy_authority_lock(false);
+ pol:=sessions.ingest_frozen_source_policy();
+ IF NOT EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority WHERE state='active' AND control_epoch=pol.control_epoch) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: supabase privacy authority not active';END IF;
+ IF v_epoch IS DISTINCT FROM pol.control_epoch THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control epoch';END IF;
+ d:=encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',v_epoch,v_org,v_ws,v_user,v_kind,v_payload)::text,'UTF8')),'hex');
+ INSERT INTO sessions.ingest_source_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending)
+  VALUES(v_org,v_ws,v_user,v_epoch,1,d,v_kind,v_payload,true) ON CONFLICT DO NOTHING RETURNING true INTO fresh;
+ SELECT * INTO STRICT h FROM sessions.ingest_source_control_heads WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user FOR UPDATE;
+ IF coalesce(fresh,false) THEN
+  -- PRE before the apply below can change it (Neon persists PRE before selection/reset create fences).
+  UPDATE sessions.ingest_source_control_heads SET before_privacy=sessions.ingest_frozen_source_privacy(v_org,v_ws,v_user),privacy_version=0
+   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user RETURNING * INTO h;
+ END IF;
+ IF h.epoch IS DISTINCT FROM v_epoch THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control epoch';END IF;
+ IF NOT coalesce(fresh,false) THEN
+  IF h.pending THEN
+   IF h.digest IS DISTINCT FROM d OR h.kind IS DISTINCT FROM v_kind THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: control pending';END IF;
+   RETURN jsonb_build_object('epoch',h.epoch,'version',h.version::text,'digest',h.digest,'kind',h.kind,'pending',true,
+    'deleted',h.deleted::text,'apply',false);
+  END IF;
+  IF h.version=9223372036854775807 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: control version exhausted';END IF;
+  UPDATE sessions.ingest_source_control_heads SET version=h.version+1,digest=d,kind=v_kind,payload=v_payload,pending=true,
+   before_privacy=NULL,privacy_version=h.version,deleted=NULL,updated_at=clock_timestamp()
+   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user RETURNING * INTO h;
+ END IF;
+ v_deleted:=sessions.ingest_privacy_authority_apply(v_org,v_ws,v_user,v_kind,v_payload);
+ IF v_kind='reset' THEN
+  UPDATE sessions.ingest_source_control_heads SET deleted=v_deleted WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
+ END IF;
+ RETURN jsonb_build_object('epoch',h.epoch,'version',h.version::text,'digest',h.digest,'kind',h.kind,'pending',true,
+  'deleted',v_deleted::text,'apply',true);
+END $authority_begin$;
+
+-- Supabase-first completion, after the ingest fence acknowledged the same {version,digest}.
+CREATE FUNCTION sessions.ingest_privacy_authority_complete(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp SET bulls96.privacy_authority_writer='authority' AS $authority_complete$
+DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;h sessions.ingest_source_control_heads%ROWTYPE;
+ v_org text;v_ws text;v_user text;v_version bigint;v_outcome text;
+BEGIN
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['epoch','tenant','version','digest','kind','outcome']);
+ PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
+ v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p#>'{tenant,userId}',false);v_outcome:=p->>'outcome';
+ IF jsonb_typeof(p->'version') IS DISTINCT FROM 'string' OR p->>'version'!~'^[1-9][0-9]{0,18}$' THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid control';END IF;
+ v_version:=(p->>'version')::bigint;
+ PERFORM sessions.ingest_privacy_authority_lock(false);
+ pol:=sessions.ingest_frozen_source_policy();
+ IF NOT EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority WHERE state='active' AND control_epoch=pol.control_epoch) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: supabase privacy authority not active';END IF;
+ IF p->>'epoch' IS DISTINCT FROM pol.control_epoch OR v_outcome IS NULL OR v_outcome NOT IN('applied','replay','stale') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: control held';END IF;
+ SELECT * INTO STRICT h FROM sessions.ingest_source_control_heads WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user FOR UPDATE;
+ IF h.epoch IS DISTINCT FROM p->>'epoch' OR v_version>h.version THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control';END IF;
+ -- A later head exists only after this intent completed; never clear the newer pending one.
+ IF v_version<h.version THEN RETURN jsonb_build_object('completed',true,'superseded',true);END IF;
+ IF v_outcome NOT IN('applied','replay') OR h.digest IS DISTINCT FROM p->>'digest' OR h.kind IS DISTINCT FROM p->>'kind' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control';END IF;
+ UPDATE sessions.ingest_source_control_heads SET pending=false,updated_at=clock_timestamp()
+  WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
+ RETURN jsonb_build_object('completed',true,'superseded',false);
+END $authority_complete$;
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_begin(jsonb),sessions.ingest_privacy_authority_complete(jsonb)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest_seeder;
+GRANT EXECUTE ON FUNCTION sessions.ingest_privacy_authority_begin(jsonb),sessions.ingest_privacy_authority_complete(jsonb) TO bulls96_session_ingest;
+
+-- The legacy (Neon-first) mirror begin, unchanged except that it refuses as soon as the authority leaves Neon.
+-- RHC calls it BEFORE Neon, so a refusal leaves Neon untouched (the H-2 straggler cannot create a divergent head).
+CREATE OR REPLACE FUNCTION sessions.ingest_source_control_begin(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $control_begin$
+DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;h sessions.ingest_source_control_heads%ROWTYPE;
+ v_org text;v_ws text;v_user text;v_kind text;v_epoch text;d text;fresh boolean;
+BEGIN
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['epoch','tenant','kind','payload']);
+ PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
+ v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p#>'{tenant,userId}',false);v_kind:=p->>'kind';v_epoch:=p->>'epoch';
+ IF v_kind IS NULL OR v_kind NOT IN('selection','reset') OR p->'payload' IS NULL OR jsonb_typeof(p->'payload')='null'
+  OR octet_length((p->'payload')::text)>2113536 THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid control';END IF;
+ PERFORM sessions.ingest_privacy_authority_lock(false);
+ IF EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: privacy authority moved; legacy control refused';END IF;
+ pol:=sessions.ingest_frozen_source_policy();
+ IF v_epoch IS DISTINCT FROM pol.control_epoch THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control epoch';END IF;
+ d:=encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',v_epoch,v_org,v_ws,v_user,v_kind,p->'payload')::text,'UTF8')),'hex');
+ INSERT INTO sessions.ingest_source_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending)
+  VALUES(v_org,v_ws,v_user,v_epoch,1,d,v_kind,p->'payload',true) ON CONFLICT DO NOTHING RETURNING true INTO fresh;
+ SELECT * INTO STRICT h FROM sessions.ingest_source_control_heads WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user FOR UPDATE;
+ IF coalesce(fresh,false) THEN
+  UPDATE sessions.ingest_source_control_heads SET before_privacy=sessions.ingest_frozen_source_privacy(v_org,v_ws,v_user),privacy_version=0
+   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user RETURNING * INTO h;
+ END IF;
+ IF h.epoch IS DISTINCT FROM v_epoch THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control epoch';END IF;
+ IF NOT coalesce(fresh,false) THEN
+  IF h.pending THEN
+   IF h.digest IS DISTINCT FROM d OR h.kind IS DISTINCT FROM v_kind THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: control pending';END IF;
+   RETURN jsonb_build_object('epoch',h.epoch,'version',h.version::text,'digest',h.digest,'kind',h.kind,'pending',true,'apply',false);
+  END IF;
+  IF h.version=9223372036854775807 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: control version exhausted';END IF;
+  UPDATE sessions.ingest_source_control_heads SET version=h.version+1,digest=d,kind=v_kind,payload=p->'payload',pending=true,
+   before_privacy=NULL,privacy_version=h.version,updated_at=clock_timestamp()
+   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user RETURNING * INTO h;
+ END IF;
+ RETURN jsonb_build_object('epoch',h.epoch,'version',h.version::text,'digest',h.digest,'kind',h.kind,'pending',true,'apply',true);
+END $control_begin$;
+
+-- The legacy mirror completion takes the same shared lock, so it serializes with activation (which requires
+-- no pending head). While fenced it still completes in-flight stragglers; once active it refuses.
+CREATE OR REPLACE FUNCTION sessions.ingest_source_control_complete(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $control_complete$
+DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;h sessions.ingest_source_control_heads%ROWTYPE;
+ v_org text;v_ws text;v_user text;v_version bigint;v_outcome text;
+BEGIN
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['epoch','tenant','version','digest','kind','outcome']);
+ PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
+ v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p#>'{tenant,userId}',false);v_outcome:=p->>'outcome';
+ IF p->>'version'!~'^[1-9][0-9]{0,18}$' THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid control';END IF;
+ v_version:=(p->>'version')::bigint;
+ PERFORM sessions.ingest_privacy_authority_lock(false);
+ -- Explicit, not only the statement guard: the guard's session setting is not a trust boundary.
+ IF EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority WHERE state='active') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: privacy authority moved; legacy control refused';END IF;
+ pol:=sessions.ingest_frozen_source_policy();
+ IF p->>'epoch' IS DISTINCT FROM pol.control_epoch OR v_outcome IS NULL OR v_outcome NOT IN('applied','replay','stale') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: control held';END IF;
+ SELECT * INTO STRICT h FROM sessions.ingest_source_control_heads WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user FOR UPDATE;
+ IF h.epoch IS DISTINCT FROM p->>'epoch' OR v_version>h.version THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control';END IF;
+ IF v_version<h.version THEN RETURN jsonb_build_object('completed',true,'superseded',true);END IF;
+ IF v_outcome NOT IN('applied','replay') OR h.digest IS DISTINCT FROM p->>'digest' OR h.kind IS DISTINCT FROM p->>'kind' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control';END IF;
+ UPDATE sessions.ingest_source_control_heads SET pending=false,updated_at=clock_timestamp()
+  WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
+ RETURN jsonb_build_object('completed',true,'superseded',false);
+END $control_complete$;
