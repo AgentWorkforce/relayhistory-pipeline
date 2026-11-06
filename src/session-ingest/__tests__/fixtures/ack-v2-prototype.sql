@@ -312,12 +312,12 @@ BEGIN
    FROM nr JOIN orows o ON o.key_sha256=nr.key_sha256
    LEFT JOIN sessions.ingest_receipt_seats sn ON sn.key_sha256=nr.current_seat_key
    LEFT JOIN sessions.ingest_receipt_seats so ON so.key_sha256=o.current_seat_key)
-  SELECT count(*) INTO v_bad FROM t WHERE NOT(
+  SELECT count(*) INTO v_bad FROM t WHERE (
        (same AND nl=ol)
     OR (NOT same AND g='S' AND (oo IS NULL OR oo=no) AND nl>ol AND (os IS NULL OR ns>os))        -- S is bound to its final winner below
     OR (NOT same AND g='K' AND (oo IS NULL OR oo=no) AND nl=ol+1 AND (os IS NULL OR ns>os) AND k_bound
         AND (oo IS NULL OR nr_rev>o_rev))
-    OR (NOT same AND f IN('L','K','S') AND g='U' AND clear_shape AND nl=ol+1));
+    OR (NOT same AND f IN('L','K','S') AND g='U' AND clear_shape AND nl=ol+1)) IS NOT TRUE;   -- NULL refuses
   IF v_bad>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot regression refused';END IF;
  ELSIF EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL OR current_seat_key IS NOT NULL OR lineage<>0) THEN
   -- slots are created only by lazy_records: unowned or legacy, lineage 0; seats are only ever installed by UPDATE
@@ -794,7 +794,13 @@ BEGIN
    AND d.native_key_sha256=n.key_sha256 AND d.native_lineage=n.lineage AND d.first_digest=n.current_digest AND d.candidate_digest=n.current_digest
    AND d.reset_epoch=n.current_reset_epoch AND d.fence_epoch=n.current_fence_epoch
    AND a.org_id=n.org_id AND a.workspace_id=n.workspace_id AND a.user_id=n.current_owner AND a.origin_id=n.origin_id
-   AND d.candidate_key_sha256=encode(sha256(convert_to(s.key_material::text,'UTF8')),'hex');
+   AND d.candidate_key_sha256=encode(sha256(convert_to(s.key_material::text,'UTF8')),'hex')
+   AND d.generation=a.schema_generation AND d.source_control_version=a.source_control_version
+   AND d.source_witness_sha256=a.source_witness_sha256 AND d.reset_epoch=a.reset_epoch
+   AND EXISTS(SELECT 1 FROM jsonb_array_elements(a.records) x WHERE (x->>'ord')::int=d.ord AND x->>'record_id'=n.record_id
+    AND (x->>'revision')::bigint=n.current_revision AND x->>'digest'=n.current_digest)
+   AND EXISTS(SELECT 1 FROM sessions.ingest_batches b WHERE b.org_id=a.org_id AND b.workspace_id=a.workspace_id AND b.origin_id=a.origin_id
+    AND b.batch_id=a.batch_id AND b.digest=a.digest AND b.user_id=a.user_id AND b.state='committed' AND b.buffer_receipt_kind='staged');
  IF v_ok<>1 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: K winner has no accepted v1 decision';END IF;
  RETURN NULL;
 END $kp$;
@@ -820,3 +826,20 @@ CREATE CONSTRAINT TRIGGER ack_vector_provenance AFTER INSERT ON sessions.ingest_
 ALTER TABLE sessions.ingest_lazy_native_slots ENABLE ALWAYS TRIGGER ack_k_provenance;
 ALTER TABLE sessions.ingest_ack_vectors ENABLE ALWAYS TRIGGER ack_vector_provenance;
 REVOKE ALL ON FUNCTION sessions.ack_k_provenance(),sessions.ack_vector_provenance() FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+-- every non-compat receipt seat (winner or not) must be <= the committed clock at commit (review: stale-on-legacy
+-- seats allocate without a slot update; a writer skipping the clock advance would strand a future UNIQUE(seat) collision)
+CREATE FUNCTION sessions.ack_seat_provenance() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $sp$
+DECLARE v_last bigint;
+BEGIN
+ IF NEW.compat_vector_claim IS NOT NULL THEN RETURN NULL;END IF;
+ SELECT last_seat INTO STRICT v_last FROM sessions.ingest_receipt_seat_clock WHERE singleton;
+ IF NEW.seat>v_last THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: receipt seat ahead of the committed clock';END IF;
+ RETURN NULL;
+END $sp$;
+CREATE CONSTRAINT TRIGGER ack_seat_provenance AFTER INSERT ON sessions.ingest_receipt_seats
+ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sessions.ack_seat_provenance();
+ALTER TABLE sessions.ingest_receipt_seats ENABLE ALWAYS TRIGGER ack_seat_provenance;
+REVOKE ALL ON FUNCTION sessions.ack_seat_provenance() FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+-- provenance lookup by seat key (review M2: avoid a full decisions scan per K winner at COMMIT)
+CREATE INDEX ingest_lazy_ack_decisions_seat_key_idx ON sessions.ingest_lazy_ack_decisions(seat_key_sha256);

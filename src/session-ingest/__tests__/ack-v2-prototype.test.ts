@@ -322,51 +322,82 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
   }finally{await f.close()}
  });
 
- test("K-edge binding, single-cause negatives against a fresh self-consistent receipt seat (second review MAJORs)",async()=>{
+ test("K-edge binding + SQL receipt provenance: single-cause negatives, commit-time refusals, positive control",async()=>{
   const f=await fixture(kind,"bridge-v1");try{
-   await f.send("k1",[record({record_id:"K",session_id:"s"})]);
-   const k=(await f.db.query("SELECT n.current_seat_key,n.lineage::text lineage,s.key_material,s.seat::text seat FROM sessions.ingest_lazy_native_slots n JOIN sessions.ingest_receipt_seats s ON s.key_sha256=n.current_seat_key WHERE n.record_id='K'")).rows[0];
-   const forge=async(rev:string,rid="K",digest="a".repeat(64))=>{const km=[...k.key_material];km[8]=rev;km[7]=rid;
-    const r=(await f.db.query(`WITH x AS(SELECT $1::jsonb km,(SELECT last_seat+3+$2::int FROM sessions.ingest_receipt_seat_clock) seat)
-     INSERT INTO sessions.ingest_receipt_seats(key_sha256,key_material,seat,first_digest,source,session_id,fence_epoch)
-     SELECT encode(sha256(convert_to(jsonb_build_array('lazy-ack-seat-v1',encode(sha256(convert_to(km::text,'UTF8')),'hex'),seat::text)::text,'UTF8')),'hex'),km,seat,$3,'claude','s',0 FROM x
-     RETURNING key_sha256`,[JSON.stringify(km),Math.floor(Math.random()*1000),digest])).rows[0];return r.key_sha256 as string};
-   const good=await forge("2");
-   const base={key:good,rev:"2",digest:"a".repeat(64),owner:"user-1",source:"claude",session:"s",reset:"0",fence:"0",lin:String(Number(k.lineage)+1)};
-   const upd=(o:any)=>f.db.query(`UPDATE sessions.ingest_lazy_native_slots SET current_seat_key=$1,current_revision=$2,current_digest=$3,current_owner=$4,current_source=$5,current_session=$6,
-     current_reset_epoch=$7,current_fence_epoch=$8,lineage=$9 WHERE record_id='K'`,[o.key,o.rev,o.digest,o.owner,o.source,o.session,o.reset,o.fence,o.lin]);
-   const single:[string,any][]=[["revision",{rev:"3"}],["digest",{digest:"b".repeat(64)}],["owner",{owner:"user-9"}],["source",{source:"codex"}],["session",{session:"other"}],
-    ["session NULL",{session:null}],["reset epoch",{reset:"1"}],["fence epoch",{fence:"1"}],["lineage +2",{lin:String(Number(k.lineage)+2)}],["lineage unchanged",{lin:k.lineage}]];
-   for(const [name,d] of single)await expectCode(upd({...base,...d}),"slot regression refused").catch(e=>{throw Error("K single-cause "+name+": "+e)});
-   await expectCode(upd({...base,key:await forge("2","OTHER")}),"slot regression refused");                 // another record's fresh seat
-   await expectCode(upd({...base,key:await forge("1"),rev:"1"}),"slot regression refused");                  // fresh self-consistent seat, revision not increasing
-   // PROVENANCE (addendum 6a09d424): the former pinned positive is now REFUSED at commit: a receipt-only winner with no
-   // accepted decision, ahead of the committed clock
+   await f.send("k1",[record({record_id:"K",session_id:"s"})]);                                    // slot K at rev1 (real v1 accept)
+   await f.send("k9",[record({record_id:"K9",session_id:"s"})]);
+   await f.send("u2",[record({record_id:"W",session_id:"s"})],{},T2);
+   const otherClaim=(await f.db.query("SELECT claim_token::text t FROM sessions.ingest_claim_attempts WHERE batch_id='u2'")).rows[0].t;
+   const otherKey=(await f.db.query("SELECT key_sha256 k FROM sessions.ingest_lazy_native_slots WHERE record_id='K9'")).rows[0].k;
+   // two REAL claims carrying K rev2 whose ACK is a test-only no-op (claim + batch commit; no seat/slot/decision/clock change)
+   const v1=(await f.db.query("SELECT pg_get_functiondef('sessions.ingest_lazy_ack_batch_v1(jsonb)'::regprocedure) d")).rows[0].d as string;
+   const loopAt="  IF a.source_processing_ranks->>r.ord IS NULL THEN";expect(v1.includes(loopAt)).toBe(true);
+   await f.db.exec(v1.replace(loopAt,"  CONTINUE;\n"+loopAt));
+   await f.send("kx",[record({record_id:"K",revision:2,session_id:"s"})]);
+   await f.send("ky",[record({record_id:"K",revision:2,session_id:"s"})]);
+   await f.db.exec(v1);                                                                            // restore the real v1 body
+   const claimOf=async(b:string)=>(await f.db.query(`SELECT a.*,q.key_material km,q.candidate_digest cd,q.key_sha256 ck FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_stage_intents t USING(claim_token)
+     CROSS JOIN LATERAL sessions.ingest_receipt_seat_records(a.claim_token,t.group_ordinals) q WHERE a.batch_id=$1`,[b])).rows[0];
+   const kx=await claimOf("kx"),ky=await claimOf("ky");
+   const k=(await f.db.query("SELECT key_sha256,lineage::text lineage FROM sessions.ingest_lazy_native_slots WHERE record_id='K'")).rows[0];
    const snap=async()=>(await f.db.query("SELECT to_jsonb(n)::text j FROM sessions.ingest_lazy_native_slots n WHERE record_id='K'")).rows[0].j;
    const before=await snap();
-   await expectCode(upd(base),/ahead of the committed clock|no accepted v1 decision/);
+   const tx=async(fn:()=>Promise<void>)=>{await f.db.exec("BEGIN");try{await fn();await f.db.exec("COMMIT")}catch(e){await f.db.exec("ROLLBACK").catch(()=>{});throw e}};
+   let seatNo="";
+   const forge=async(o:{km?:any,badKey?:boolean,digest?:string}={})=>{const km=o.km??kx.km;
+    const r=(await f.db.query(`WITH x AS(SELECT $1::jsonb km,(SELECT last_seat+1 FROM sessions.ingest_receipt_seat_clock) seat)
+     INSERT INTO sessions.ingest_receipt_seats(key_sha256,key_material,seat,first_digest,source,session_id,fence_epoch)
+     SELECT CASE WHEN $3 THEN repeat('7',64) ELSE encode(sha256(convert_to(jsonb_build_array('lazy-ack-seat-v1',encode(sha256(convert_to(km::text,'UTF8')),'hex'),seat::text)::text,'UTF8')),'hex') END,
+      km,seat,$2,'claude','s',0 FROM x RETURNING key_sha256,seat::text`,[JSON.stringify(km),o.digest??kx.cd,!!o.badKey])).rows[0];seatNo=r.seat;return r.key_sha256 as string};
+   const base={rev:"2",digest:kx.cd,owner:"user-1",source:"claude",session:"s",reset:"0",fence:"0",lin:String(Number(k.lineage)+1)};
+   const upd=(o:any)=>f.db.query(`UPDATE sessions.ingest_lazy_native_slots SET current_seat_key=$1,current_revision=$2,current_digest=$3,current_owner=$4,current_source=$5,current_session=$6,
+     current_reset_epoch=$7,current_fence_epoch=$8,lineage=$9 WHERE record_id='K'`,[o.key,o.rev,o.digest,o.owner,o.source,o.session,o.reset,o.fence,o.lin]);
+   const insDec=async(key:string,c:any,over:any={})=>{const d={claim_token:c.claim_token,ord:0,native_key_sha256:k.key_sha256,native_lineage:Number(k.lineage)+1,candidate_key_sha256:c.ck,
+     candidate_digest:c.cd,first_digest:c.cd,body_accepted:true,seat_key_sha256:key,reset_epoch:c.reset_epoch,fence_epoch:0,generation:c.schema_generation,
+     source_control_version:c.source_control_version,source_witness_sha256:c.source_witness_sha256,...over};
+    await f.db.query(`INSERT INTO sessions.ingest_lazy_ack_decisions(claim_token,ord,native_key_sha256,native_lineage,candidate_key_sha256,candidate_digest,first_digest,body_accepted,seat_key_sha256,
+      reset_epoch,fence_epoch,generation,source_control_version,source_witness_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+     [d.claim_token,d.ord,d.native_key_sha256,d.native_lineage,d.candidate_key_sha256,d.candidate_digest,d.first_digest,d.body_accepted,d.seat_key_sha256,d.reset_epoch,d.fence_epoch,d.generation,d.source_control_version,d.source_witness_sha256])};
+   const advance=()=>f.db.query("UPDATE sessions.ingest_receipt_seat_clock SET last_seat=$1",[seatNo]);
+   const kmWith=(i:number,v:any)=>{const m=[...kx.km];m[i]=v;return m};
+   // (A) immediate K-edge negatives: exactly one field differs from a fresh, self-consistent receipt of the real claim kx
+   for(const [name,d] of [["revision",{rev:"3"}],["digest",{digest:"b".repeat(64)}],["owner",{owner:"user-9"}],["source",{source:"codex"}],["session",{session:"other"}],
+     ["session NULL",{session:null}],["reset epoch",{reset:"1"}],["fence epoch",{fence:"1"}],["lineage +2",{lin:String(Number(k.lineage)+2)}],["lineage unchanged",{lin:k.lineage}]] as [string,any][])
+    await expectCode(tx(async()=>{const key=await forge();await upd({...base,key,...d})}),"slot regression refused").catch(e=>{throw Error("K edge "+name+": "+e)});
+   for(const [name,o,rev] of [["another record",{km:kmWith(7,"OTHER")},"2"],["revision not increasing",{km:kmWith(8,"1")},"1"],["seat-key derivation",{badKey:true},"2"],
+     ["tag",{km:kmWith(0,"buffer-legacy-replay-reference-v1")},"2"],["length 12",{km:kx.km.slice(0,12)},"2"],["scope epoch",{km:kmWith(12,"9")},"2"]] as [string,any,string][])
+    await expectCode(tx(async()=>{const key=await forge(o);await upd({...base,key,rev})}),"slot regression refused").catch(e=>{throw Error("K edge "+name+": "+e)});
+   // (B) commit-time provenance: receipt-only (the former pinned positive), and a bound decision without the clock advance
+   await expectCode(tx(async()=>{const key=await forge();await upd({...base,key})}),"ahead of the committed clock");
+   await expectCode(tx(async()=>{const key=await forge();await upd({...base,key});await insDec(key,kx)}),"ahead of the committed clock");
+   // (C) decision binding with the clock advanced: one field differs from the real claim kx -> refused only by the binding
+   for(const [name,c,over] of [["not accepted",kx,{body_accepted:false}],["lineage",kx,{native_lineage:Number(k.lineage)+5}],["candidate digest",kx,{candidate_digest:"b".repeat(64)}],
+     ["first digest",kx,{first_digest:"b".repeat(64)}],["reset epoch",kx,{reset_epoch:Number(kx.reset_epoch)+1}],["fence epoch",kx,{fence_epoch:1}],
+     ["native key (real other slot)",kx,{native_key_sha256:otherKey}],["candidate key",kx,{candidate_key_sha256:"8".repeat(64)}],["generation",kx,{generation:"e".repeat(64)}],
+     ["source control version",kx,{source_control_version:Number(kx.source_control_version)+7}],["witness",kx,{source_witness_sha256:"f".repeat(64)}],
+     // (inherently multi-cause: another user's claim can never carry user-1's record — the claim path refuses it with P0W01)
+     ["another user's claim",{...kx,claim_token:otherClaim},{ord:1}],["ord not carrying this record",kx,{ord:5}]] as [string,any,any][])
+    await expectCode(tx(async()=>{const key=await forge();await upd({...base,key});await insDec(key,c,over);await advance()}),"no accepted v1 decision").catch(e=>{throw Error("decision "+name+": "+e)});
+   // two matching accepted decisions (two real claims carrying the same candidate)
+   await expectCode(tx(async()=>{const key=await forge();await upd({...base,key});await insDec(key,kx);await insDec(key,ky);await advance()}),"no accepted v1 decision");
    expect(await snap()).toBe(before);
-   // a forged decision row for that seat, clock NOT advanced: still ahead of the clock (future collision)
-   const forgedSeat=(await f.db.query("SELECT seat::text s FROM sessions.ingest_receipt_seats WHERE key_sha256=$1",[good])).rows[0].s;
-   const dec=(await f.db.query("SELECT * FROM sessions.ingest_lazy_ack_decisions WHERE native_key_sha256=(SELECT key_sha256 FROM sessions.ingest_lazy_native_slots WHERE record_id='K')")).rows[0];
-   const forgeTx=async(over:any,advance:boolean)=>{await f.db.exec("BEGIN");try{
-     await upd(base);   // writer order: seat (already inserted) -> slot update -> decision -> clock advance -> commit
-     const d={...dec,ord:1+Math.floor(Math.random()*400),seat_key_sha256:good,native_lineage:Number(k.lineage)+1,candidate_digest:"a".repeat(64),first_digest:"a".repeat(64),body_accepted:true,
-      candidate_key_sha256:(await f.db.query("SELECT encode(sha256(convert_to(key_material::text,'UTF8')),'hex') h FROM sessions.ingest_receipt_seats WHERE key_sha256=$1",[good])).rows[0].h,...over};
-     await f.db.query(`INSERT INTO sessions.ingest_lazy_ack_decisions(claim_token,ord,native_key_sha256,native_lineage,candidate_key_sha256,candidate_digest,first_digest,body_accepted,seat_key_sha256,
-       reset_epoch,fence_epoch,generation,source_control_version,source_witness_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-      [d.claim_token,d.ord,d.native_key_sha256,d.native_lineage,d.candidate_key_sha256,d.candidate_digest,d.first_digest,d.body_accepted,d.seat_key_sha256,d.reset_epoch,d.fence_epoch,d.generation,d.source_control_version,d.source_witness_sha256]);
-     if(advance)await f.db.query("UPDATE sessions.ingest_receipt_seat_clock SET last_seat=$1",[forgedSeat]);
-     await f.db.exec("COMMIT")}catch(e){await f.db.exec("ROLLBACK").catch(()=>{});throw e}};
-   await expectCode(forgeTx({},false),"ahead of the committed clock");
-   // per-field decision mismatches with the clock advanced: each refused at commit ONLY because the decision binding fails
-   for(const [name,over] of [["not accepted",{body_accepted:false}],["lineage",{native_lineage:Number(k.lineage)+5}],["digest",{candidate_digest:"b".repeat(64),first_digest:"b".repeat(64)}],
-     ["reset epoch",{reset_epoch:1}],["fence epoch",{fence_epoch:1}],["native key",{native_key_sha256:"9".repeat(64)}],["candidate key",{candidate_key_sha256:"8".repeat(64)}]] as [string,any][])
-    await expectCode(forgeTx(over,true),/no accepted v1 decision|23503/).catch(e=>{throw Error("decision mismatch "+name+": "+e)});
-   expect(await snap()).toBe(before);
-   // after every refusal nothing leaked: a normal ACK allocates the next seat without colliding
-   await f.send("k2",[record({record_id:"K",revision:2,session_id:"s"})]);
+   // (D) positive control: the complete protocol for the real claim kx (seat + slot + one bound accepted decision + clock) commits
+   await tx(async()=>{const key=await forge();await upd({...base,key});await insDec(key,kx);await advance()});
    expect((await f.db.query("SELECT current_revision::text r FROM sessions.ingest_lazy_native_slots WHERE record_id='K'")).rows[0].r).toBe("2");
+   // (E) nothing leaked from any refusal: a normal ACK allocates the next seat without a UNIQUE collision
+   await f.send("k3",[record({record_id:"K",revision:3,session_id:"s"})]);
+   expect((await f.db.query("SELECT current_revision::text r FROM sessions.ingest_lazy_native_slots WHERE record_id='K'")).rows[0].r).toBe("3");
+  }finally{await f.close()}
+ });
+
+ test("provenance writer fault: stale candidate on a legacy slot (seat allocated, no slot update) without the clock advance is refused",async()=>{
+  const f=await fixture(kind,"bridge-v1");try{
+   const L=record({record_id:"L",revision:5,session_id:"s"});
+   const d=(await f.db.query("SELECT pg_get_functiondef('sessions.ingest_lazy_ack_batch_v1(jsonb)'::regprocedure) d")).rows[0].d as string;
+   const at=" UPDATE sessions.ingest_receipt_seat_clock SET last_seat=v_last WHERE singleton;";expect(d.includes(at)).toBe(true);
+   await f.db.exec(d.replace(at," NULL;"));
+   await expectCode(f.send("leg",[record({record_id:"L",revision:1,session_id:"s"})],{L:await meta(L)}),"receipt seat ahead of the committed clock",f);
+   expect((await f.db.query("SELECT count(*)::int n FROM sessions.ingest_receipt_seats")).rows[0].n).toBe(0);
   }finally{await f.close()}
  });
 
@@ -488,7 +519,7 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    await expectCode(f.db.query("INSERT INTO sessions.ingest_receipt_seats(key_sha256,key_material,seat,first_digest,source,session_id,fence_epoch) VALUES(repeat('1',64),'[]',1,repeat('2',64),'claude','s',0)"),"refused in mode v2");
    await f.db.exec("SET session_replication_role=origin");
    const tg=(await f.db.query("SELECT tgname,tgenabled FROM pg_trigger WHERE tgname LIKE 'ack_%' AND NOT tgisinternal ORDER BY 1")).rows;
-   expect(tg.every((r:any)=>r.tgenabled==="A")).toBe(true);expect(tg.length).toBe(18);
+   expect(tg.every((r:any)=>r.tgenabled==="A")).toBe(true);expect(tg.length).toBe(19);
   }finally{await f.close()}
  });
 
