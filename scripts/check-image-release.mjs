@@ -31,6 +31,38 @@ export function verifyAncestry(sourceSha, run = execFileSync) {
   } catch { refuse("source is not a commit on current main"); }
 }
 
+async function effectiveJobs(base, run, sourceSha, getJSON) {
+  // Failed-jobs-only reruns carry successful jobs from earlier attempts. Read
+  // every execution and retain each named job's newest attempt; an old success
+  // must never hide a failed retry. CI job names must be unambiguous.
+  const seenIds = new Set();
+  const executions = new Set();
+  const latestByName = new Map();
+  let total;
+  for (let page = 1; ; page++) {
+    const data = await getJSON(`${base}/runs/${run.id}/jobs?filter=all&per_page=100&page=${page}`);
+    if (!Number.isSafeInteger(data.total_count) || data.total_count < 1 || data.total_count > 10_000 ||
+        (total !== undefined && data.total_count !== total) || !Array.isArray(data.jobs) ||
+        !data.jobs.length || data.jobs.length > 100) refuse("source CI job metadata is incomplete or changing");
+    total = data.total_count;
+    for (const job of data.jobs) {
+      if (!Number.isSafeInteger(job.id) || job.id < 1 || seenIds.has(job.id) || job.run_id !== run.id ||
+          job.head_sha !== sourceSha || typeof job.name !== "string" || !job.name.trim() ||
+          !Number.isSafeInteger(job.run_attempt) || job.run_attempt < 1 || job.run_attempt > run.run_attempt) {
+        refuse("invalid source CI job identity");
+      }
+      const key = JSON.stringify([job.name, job.run_attempt]);
+      if (executions.has(key)) refuse("ambiguous source CI job names");
+      seenIds.add(job.id);
+      executions.add(key);
+      const previous = latestByName.get(job.name);
+      if (!previous || job.run_attempt > previous.run_attempt) latestByName.set(job.name, job);
+    }
+    if (seenIds.size > total) refuse("source CI job metadata is incomplete or changing");
+    if (seenIds.size === total) return [...latestByName.values()];
+  }
+}
+
 export async function verifySourceCI(sourceSha, getJSON) {
   if (!SHA.test(sourceSha)) refuse("full source SHA required");
   const base = `/repos/${REPOSITORY}/actions`;
@@ -46,10 +78,9 @@ export async function verifySourceCI(sourceSha, getJSON) {
   const latest = matching.reduce((a, b) => a.id > b.id ? a : b);
   if (latest.status !== "completed" || latest.conclusion !== "success" ||
       !Number.isSafeInteger(latest.run_attempt) || latest.run_attempt < 1) refuse("latest source CI is not successful");
-  const jobs = await getJSON(`${base}/runs/${latest.id}/attempts/${latest.run_attempt}/jobs?per_page=100`);
-  if (!Array.isArray(jobs.jobs) || jobs.total_count !== jobs.jobs.length || !jobs.jobs.length ||
-      !jobs.jobs.every(job => job.head_sha === sourceSha && job.status === "completed" && job.conclusion === "success") ||
-      !jobs.jobs.some(job => job.name === "checks")) refuse("source CI jobs are incomplete or unsuccessful");
+  const jobs = await effectiveJobs(base, latest, sourceSha, getJSON);
+  if (!jobs.every(job => job.status === "completed" && job.conclusion === "success") ||
+      !jobs.some(job => job.name === "checks")) refuse("source CI jobs are incomplete or unsuccessful");
   const refreshed = await getJSON(runsPath);
   if (!Array.isArray(refreshed.workflow_runs)) refuse("source CI changed during validation");
   const refreshedMatching = refreshed.workflow_runs.filter(run => run.head_sha === sourceSha &&

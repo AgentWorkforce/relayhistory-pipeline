@@ -9,7 +9,9 @@ Set `source_sha` to the approved full lowercase public commit SHA. It must
 belong to current `main`, and its latest official main/push CI run and every job
 must be successful. The preflight reads metadata with a read-only token and
 fails before the registry/OIDC job if the source, CI, dispatcher or approval
-reference is invalid. It rechecks the CI attempt after reading its jobs.
+reference is invalid. It reads all job pages and validates the newest execution
+of each named job, including successful jobs carried across partial reruns. An
+old success cannot hide a failed retry. It rechecks the CI attempt afterward.
 
 The input is required: tags, branch names, abbreviated SHAs and internal-history
 commits are refused. Only `sha-<source_sha>` is published. This publisher never

@@ -6,7 +6,7 @@ import { githubJSON, REPOSITORY, validateRequest, verifyAncestry, verifySourceCI
 const sha = "a".repeat(40);
 const env = () => ({ GITHUB_REPOSITORY: REPOSITORY, GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_REF: "refs/heads/main", GITHUB_ACTOR: "khaliqgant", GITHUB_TRIGGERING_ACTOR: "khaliqgant", GITHUB_WORKFLOW_REF: `${REPOSITORY}/.github/workflows/publish-image.yml@refs/heads/main`, GITHUB_SHA: "b".repeat(40), SOURCE_SHA: sha, CONFIRM: "publish 96bulls-services", APPROVAL_NOTE: "Approved in operator chat" });
 const run = () => ({ id: 123, run_attempt: 1, head_sha: sha, head_branch: "main", event: "push", repository: { full_name: REPOSITORY }, head_repository: { full_name: REPOSITORY }, status: "completed", conclusion: "success" });
-const jobs = () => ({ total_count: 1, jobs: [{ name: "checks", head_sha: sha, status: "completed", conclusion: "success" }] });
+const jobs = () => ({ total_count: 1, jobs: [{ id: 1, run_id: 123, run_attempt: 1, name: "checks", head_sha: sha, status: "completed", conclusion: "success" }] });
 const api = (runs = [run()], jobData = jobs()) => async (path: string) => path.includes("/workflows/") ? { workflow_runs: runs } : path.includes("/jobs?") ? jobData : runs.reduce((a, b) => a.id > b.id ? a : b);
 test("accepts an explicit owner/main/source release with a public approval reference", () => expect(validateRequest(env())).toEqual({ sourceSha: sha, workflowSha: "b".repeat(40), note: "Approved in operator chat" }));
 test("refuses publication from the duplicate import even under the same owner", () => {
@@ -42,6 +42,44 @@ for (const patch of [{ name: "other" }, { head_sha: "c".repeat(40) }, { status: 
   test(`refuses unverified job ${JSON.stringify(patch)}`, async () => { await expect(verifySourceCI(sha, api([run()], { total_count: 1, jobs: [{ ...jobs().jobs[0], ...patch }] }))).rejects.toThrow(); });
 }
 test("refuses incomplete job pagination", async () => { await expect(verifySourceCI(sha, api([run()], { ...jobs(), total_count: 2 }))).rejects.toThrow(); });
+test("accepts a successful worker-only rerun with the required gate carried from attempt one", async () => {
+ const latest = { ...run(), run_attempt: 2 };
+ const worker = { ...jobs().jobs[0], id: 2, name: "session-read-worker / worker", conclusion: "failure" };
+ const data = { total_count: 3, jobs: [jobs().jobs[0], worker, { ...worker, id: 3, run_attempt: 2, conclusion: "success" }] };
+ const paths: string[] = [];
+ const get = async (path: string) => { paths.push(path); return api([latest], data)(path); };
+ expect(await verifySourceCI(sha, get)).toBe(123);
+ expect(paths).toContain(`/repos/${REPOSITORY}/actions/runs/123/jobs?filter=all&per_page=100&page=1`);
+ expect(paths.some(path => path.includes("/attempts/"))).toBe(false);
+});
+for (const conclusion of ["failure", "cancelled", "skipped"]) test(`an old successful gate cannot hide its ${conclusion} retry`, async () => {
+ const latest = { ...run(), run_attempt: 2 };
+ const data = { total_count: 2, jobs: [{ ...jobs().jobs[0], id: 2, run_attempt: 2, conclusion }, jobs().jobs[0]] };
+ await expect(verifySourceCI(sha, api([latest], data))).rejects.toThrow("incomplete or unsuccessful");
+});
+for (const patch of [{ id: 0 }, { run_id: 124 }, { run_attempt: 0 }, { run_attempt: 2 }, { name: " " }]) test(`refuses invalid job identity ${JSON.stringify(patch)}`, async () => {
+ await expect(verifySourceCI(sha, api([run()], { total_count: 1, jobs: [{ ...jobs().jobs[0], ...patch }] }))).rejects.toThrow("job identity");
+});
+test("refuses ambiguous same-name jobs within one attempt", async () => {
+ await expect(verifySourceCI(sha, api([run()], { total_count: 2, jobs: [jobs().jobs[0], { ...jobs().jobs[0], id: 2 }] }))).rejects.toThrow("ambiguous");
+});
+for (const failingPage of [false, true]) test(`validates a required gate on page two, failingPage=${failingPage}`, async () => {
+ const first = Array.from({ length: 100 }, (_, i) => ({ ...jobs().jobs[0], id: i + 2, name: `job-${i}` }));
+ const paths: string[] = [];
+ const get = async (path: string) => {
+  paths.push(path);
+  if (path.includes("/jobs?")) return { total_count: 101, jobs: path.endsWith("page=1") ? first : [{ ...jobs().jobs[0], conclusion: failingPage ? "failure" : "success" }] };
+  return api()(path);
+ };
+ if (failingPage) await expect(verifySourceCI(sha, get)).rejects.toThrow("incomplete or unsuccessful");
+ else expect(await verifySourceCI(sha, get)).toBe(123);
+ expect(paths.filter(path => path.includes("/jobs?"))).toHaveLength(2);
+});
+for (const secondPage of [{ total_count: 3, jobs: [{ ...jobs().jobs[0], id: 2, name: "other" }] }, { total_count: 2, jobs: [] }]) test(`refuses incomplete/changing later job page ${JSON.stringify(secondPage)}`, async () => {
+ let pages = 0;
+ const get = async (path: string) => path.includes("/jobs?") ? ++pages === 1 ? { ...jobs(), total_count: 2 } : secondPage : api()(path);
+ await expect(verifySourceCI(sha, get)).rejects.toThrow("incomplete or changing");
+});
 test("GitHub metadata errors fail closed without reflecting response bodies", async () => { const get = githubJSON("test-only", async () => new Response("private diagnostic", { status: 403 })); let message = ""; try { await get("/repos/test"); } catch(error) { message = (error as Error).message; }
  expect(message).toBe("Image release refused: GitHub metadata HTTP 403"); expect(message).not.toContain("private diagnostic"); });
 test("rejects malformed API JSON", async () => { const get = githubJSON("test-only", async () => new Response("not json")); await expect(get("/repos/test")).rejects.toThrow("invalid GitHub metadata"); });
