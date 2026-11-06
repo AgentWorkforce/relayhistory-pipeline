@@ -26,6 +26,17 @@ const CODE = /^[a-z0-9_]{1,64}$/u;
 const MAX_STAGES = 8;
 const MAX_STAGE_BYTES = 16 * 1024 * 1024;
 const MAX_IO_BYTES = 256 * 1024 * 1024;
+const HOLD_REASONS = new Set<unknown>([
+  "outside_canary_tenant",
+  "frontier_not_ready",
+  "owner_plan_conflict",
+]);
+const PLAN_VETO_REASONS = new Set([
+  "publication_canary_cross_scope_eligible",
+  "publication_canary_inspection_invalid",
+  "publication_canary_inspection_mismatch",
+  "publication_canary_plan_refused",
+]);
 
 export interface PublicationCanaryTenant {
   orgId: string;
@@ -157,13 +168,25 @@ const safeId = (value: unknown): value is string =>
   !/[\x00-\x1f/\\]/u.test(value);
 const sameTenant = (a: PublicationCanaryTenant, b: PublicationCanaryTenant) =>
   a.orgId === b.orgId && a.workspaceId === b.workspaceId;
-const sameStage = (a: PublicationCanaryStage, b: PublicationCanaryStage) =>
-  a.stageToken === b.stageToken &&
-  sameTenant(a.tenant, b.tenant) &&
-  a.userId === b.userId &&
-  a.originId === b.originId &&
-  a.sha256 === b.sha256 &&
-  a.bytes === b.bytes;
+const sameStage = (value: unknown, b: PublicationCanaryStage) => {
+  if (!value || typeof value !== "object") return false;
+  const a = value as Partial<PublicationCanaryStage>;
+  return Boolean(
+    a.tenant &&
+      a.stageToken === b.stageToken &&
+      sameTenant(a.tenant, b.tenant) &&
+      a.userId === b.userId &&
+      a.originId === b.originId &&
+      a.sha256 === b.sha256 &&
+      a.bytes === b.bytes,
+  );
+};
+const validInspectionDecision = (inspection: PublicationCanaryInspection) =>
+  inspection.decision === "eligible"
+    ? inspection.holdReason === undefined
+    : inspection.decision === "hold" && HOLD_REASONS.has(inspection.holdReason);
+const isPlanVeto = (outcome: PublicationCanaryOutcome) =>
+  outcome.status === "refused" && PLAN_VETO_REASONS.has(outcome.reason);
 const sameBinding = (a: PublicationCanaryBinding, b: PublicationCanaryBinding) =>
   a.planId === b.planId &&
   a.ownerId === b.ownerId &&
@@ -448,7 +471,15 @@ export async function runPublicationCanary(
   ]);
   const inspections = new Map<string, PublicationCanaryInspection>();
   const outcomes = new Map(existing);
-  let planRefused = false;
+  // A triggering refusal is durable before the remaining plan veto outcomes
+  // are written. Restore the veto after a crash in that exact interval.
+  const persistedPlanRefused = [...existing.values()].some(isPlanVeto);
+  if (
+    persistedPlanRefused &&
+    [...existing.values()].some((outcome) => outcome.status === "published")
+  )
+    throw refuse("publication_canary_outcome_invalid");
+  let planRefused = persistedPlanRefused;
   try {
     // Inspect every stage before the first claim: cross-scope work can never be
     // hidden behind an earlier in-scope failure.
@@ -462,13 +493,32 @@ export async function runPublicationCanary(
         stageToken: stage.stageToken,
         evidenceDigest: "0".repeat(64),
       };
-      const inspected = await deps.authority.inspect(partial, signal);
-      if (!HEX.test(inspected.evidenceDigest) || !sameStage(inspected.stage, stage)) {
+      const value: unknown = await deps.authority.inspect(partial, signal);
+      if (
+        !value ||
+        typeof value !== "object" ||
+        typeof (value as PublicationCanaryInspection).evidenceDigest !== "string" ||
+        !HEX.test((value as PublicationCanaryInspection).evidenceDigest) ||
+        !sameStage((value as PublicationCanaryInspection).stage, stage)
+      ) {
         const outcome: PublicationCanaryOutcome = {
           stageToken: stage.stageToken,
           status: "refused",
           tenant: stage.tenant,
           reason: "publication_canary_inspection_mismatch",
+        };
+        await deps.outcomes.record(planDigest, outcome);
+        outcomes.set(stage.stageToken, outcome);
+        planRefused = true;
+        continue;
+      }
+      const inspected = value as PublicationCanaryInspection;
+      if (!validInspectionDecision(inspected)) {
+        const outcome: PublicationCanaryOutcome = {
+          stageToken: stage.stageToken,
+          status: "refused",
+          tenant: stage.tenant,
+          reason: "publication_canary_inspection_invalid",
         };
         await deps.outcomes.record(planDigest, outcome);
         outcomes.set(stage.stageToken, outcome);
@@ -500,12 +550,23 @@ export async function runPublicationCanary(
         continue;
       }
       if (inspected.decision === "hold") {
-        if (!inspected.holdReason || inspected.holdReason === "outside_canary_tenant")
-          throw refuse("publication_canary_inspection_invalid");
+        const holdReason = inspected.holdReason;
+        if (!holdReason || holdReason === "outside_canary_tenant") {
+          const outcome: PublicationCanaryOutcome = {
+            stageToken: stage.stageToken,
+            status: "refused",
+            tenant: stage.tenant,
+            reason: "publication_canary_inspection_invalid",
+          };
+          await deps.outcomes.record(planDigest, outcome);
+          outcomes.set(stage.stageToken, outcome);
+          planRefused = true;
+          continue;
+        }
         const outcome: PublicationCanaryOutcome = {
           stageToken: stage.stageToken,
           status: "held",
-          reason: inspected.holdReason,
+          reason: holdReason,
           tenant: stage.tenant,
           evidenceDigest: inspected.evidenceDigest,
         };
@@ -513,8 +574,6 @@ export async function runPublicationCanary(
         outcomes.set(stage.stageToken, outcome);
         continue;
       }
-      if (inspected.holdReason !== undefined)
-        throw refuse("publication_canary_inspection_invalid");
       inspections.set(stage.stageToken, inspected);
     }
 

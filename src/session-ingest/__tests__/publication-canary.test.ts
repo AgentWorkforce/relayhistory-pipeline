@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { open as openFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ObjectStore } from "../../../packages/object-store/src/index.ts";
@@ -220,6 +221,104 @@ test("refuses an authority that marks cross-scope work eligible and never claims
   });
 });
 
+test("a durable cross-scope refusal permanently vetoes claims after an exact crash and resume", async () => {
+  const f = fixture({ crossEligible: true });
+  const p = plan([OUT, IN]);
+  const record = f.outcomes.record.bind(f.outcomes);
+  f.outcomes.record = async (digest, outcome) => {
+    await record(digest, outcome);
+    if (outcome.reason === "publication_canary_cross_scope_eligible")
+      throw Error("simulated crash after durable plan veto");
+  };
+  await expect(
+    runPublicationCanary(p, {
+      authority: f.authority,
+      rpc: f.rpc,
+      store: () => f.raw,
+      outcomes: f.outcomes,
+    }),
+  ).rejects.toThrow("simulated crash");
+  expect([...f.outcomes.rows]).toEqual([
+    [
+      OUT.stageToken,
+      expect.objectContaining({
+        reason: "publication_canary_cross_scope_eligible",
+      }),
+    ],
+  ]);
+
+  f.outcomes.record = record;
+  f.calls.length = 0;
+  const resumed = await runPublicationCanary(p, {
+    authority: f.authority,
+    rpc: f.rpc,
+    store: () => f.raw,
+    outcomes: f.outcomes,
+  });
+  expect(resumed).toMatchObject({
+    published: 0,
+    held: 0,
+    refused: 2,
+    complete: true,
+  });
+  expect(f.calls).toEqual([`inspect:${IN.stageToken}`]);
+  expect(f.outcomes.rows.get(IN.stageToken)).toMatchObject({
+    status: "refused",
+    reason: "publication_canary_plan_refused",
+  });
+});
+
+test("a persisted plan veto cannot coexist with a published outcome", async () => {
+  const f = fixture();
+  const p = plan([OUT, IN]);
+  f.outcomes.plan = publicationCanaryPlanDigest(p);
+  f.outcomes.rows.set(OUT.stageToken, {
+    stageToken: OUT.stageToken,
+    status: "refused",
+    tenant: OUT.tenant,
+    reason: "publication_canary_cross_scope_eligible",
+  });
+  f.outcomes.rows.set(IN.stageToken, {
+    stageToken: IN.stageToken,
+    status: "published",
+    tenant: IN.tenant,
+    records: 1,
+    images: 1,
+    eligibleSessions: 1,
+    replay: false,
+    io: { reads: 1, readBytes: 1, puts: 1, putBytes: 1 },
+  });
+  await expect(
+    runPublicationCanary(p, {
+      authority: f.authority,
+      rpc: f.rpc,
+      store: () => f.raw,
+      outcomes: f.outcomes,
+    }),
+  ).rejects.toThrow("publication_canary_outcome_invalid");
+  expect(f.calls).toEqual([]);
+});
+
+test("an unknown inspection decision is durably refused before claim", async () => {
+  const f = fixture();
+  f.authority.inspect = async (input) => {
+    f.calls.push(`inspect:${input.stageToken}`);
+    return { stage: IN, evidenceDigest: IN.sha256, decision: "unknown" } as never;
+  };
+  const result = await runPublicationCanary(plan([IN]), {
+    authority: f.authority,
+    rpc: f.rpc,
+    store: () => f.raw,
+    outcomes: f.outcomes,
+  });
+  expect(result).toMatchObject({ published: 0, refused: 1, complete: true });
+  expect(f.calls).toEqual([`inspect:${IN.stageToken}`]);
+  expect(f.outcomes.rows.get(IN.stageToken)).toMatchObject({
+    status: "refused",
+    reason: "publication_canary_inspection_invalid",
+  });
+});
+
 test("abandons a mismatched trusted ticket before constructing a store or reading bytes", async () => {
   const f = fixture({ mismatchTicket: true });
   let stores = 0;
@@ -315,6 +414,93 @@ test("fsync ledger resumes exact outcomes, locks concurrent runners and refuses 
     appendFileSync(path, "torn");
     await expect(openPublicationCanaryOutcomeFile(path)).rejects.toThrow("publication_canary_outcome_torn");
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fsync ledger completes short writes and never accepts a partial write followed by error", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "publication-canary-short-write-"));
+  const prototypeHandle = await openFile(join(dir, "prototype"), "w+");
+  const prototype = Object.getPrototypeOf(prototypeHandle) as {
+    write: (...args: any[]) => Promise<{ bytesWritten: number; buffer: unknown }>;
+  };
+  await prototypeHandle.close();
+  const originalWrite = prototype.write;
+  const p = plan([OUT]);
+  const digest = publicationCanaryPlanDigest(p);
+  try {
+    const completePath = join(dir, "complete.ndjson");
+    const complete = await openPublicationCanaryOutcomeFile(completePath);
+    prototype.write = async function (
+      buffer: Buffer,
+      offset = 0,
+      length = buffer.byteLength - offset,
+      position?: number | null,
+    ) {
+      return originalWrite.call(
+        this,
+        buffer,
+        offset,
+        Math.max(1, Math.floor(length / 2)),
+        position,
+      );
+    };
+    await complete.begin(digest, p);
+    await complete.finish(digest, {
+      planDigest: digest,
+      planned: 1,
+      published: 0,
+      held: 0,
+      refused: 1,
+      complete: true,
+    });
+    prototype.write = originalWrite;
+    await complete.close();
+    expect(
+      readFileSync(completePath, "utf8").split("\n").filter(Boolean),
+    ).toHaveLength(2);
+    const reopened = await openPublicationCanaryOutcomeFile(completePath);
+    await reopened.begin(digest, p);
+    await reopened.close();
+
+    const failedPath = join(dir, "failed.ndjson");
+    const failed = await openPublicationCanaryOutcomeFile(failedPath);
+    let writes = 0;
+    prototype.write = async function (
+      buffer: Buffer,
+      offset = 0,
+      length = buffer.byteLength - offset,
+      position?: number | null,
+    ) {
+      writes++;
+      if (writes === 2) throw Error("simulated write failure");
+      return originalWrite.call(
+        this,
+        buffer,
+        offset,
+        Math.max(1, Math.floor(length / 2)),
+        position,
+      );
+    };
+    await expect(failed.begin(digest, p)).rejects.toThrow("simulated write failure");
+    await expect(
+      failed.finish(digest, {
+        planDigest: digest,
+        planned: 1,
+        published: 0,
+        held: 0,
+        refused: 1,
+        complete: true,
+      }),
+    ).rejects.toThrow("publication_canary_outcome_plan_conflict");
+    prototype.write = originalWrite;
+    await failed.close();
+    expect(readFileSync(failedPath, "utf8").endsWith("\n")).toBe(false);
+    await expect(openPublicationCanaryOutcomeFile(failedPath)).rejects.toThrow(
+      "publication_canary_outcome_torn",
+    );
+  } finally {
+    prototype.write = originalWrite;
     rmSync(dir, { recursive: true, force: true });
   }
 });

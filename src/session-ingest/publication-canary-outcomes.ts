@@ -153,7 +153,19 @@ export async function openPublicationCanaryOutcomeFile(
         payload,
       };
       const line: LedgerLine = { ...unsigned, sha256: hashLine(unsigned) };
-      await file.write(JSON.stringify(line) + "\n");
+      const encoded = Buffer.from(JSON.stringify(line) + "\n", "utf8");
+      let offset = 0;
+      while (offset < encoded.byteLength) {
+        const remaining = encoded.byteLength - offset;
+        const { bytesWritten } = await file.write(encoded, offset, remaining);
+        if (
+          !Number.isSafeInteger(bytesWritten) ||
+          bytesWritten <= 0 ||
+          bytesWritten > remaining
+        )
+          throw fail("publication_canary_outcome_write");
+        offset += bytesWritten;
+      }
       await file.sync();
       lines.push(line);
     };
