@@ -335,10 +335,11 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    await f.db.exec(v1.replace(loopAt,"  CONTINUE;\n"+loopAt));
    await f.send("kx",[record({record_id:"K",revision:2,session_id:"s"})]);
    await f.send("ky",[record({record_id:"K",revision:2,session_id:"s"})]);
+   await f.send("kz",[record({record_id:"Z",revision:1,session_id:"s"})]);                       // same user, committed, ord 0 carries record Z
    await f.db.exec(v1);                                                                            // restore the real v1 body
    const claimOf=async(b:string)=>(await f.db.query(`SELECT a.*,q.key_material km,q.candidate_digest cd,q.key_sha256 ck FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_stage_intents t USING(claim_token)
      CROSS JOIN LATERAL sessions.ingest_receipt_seat_records(a.claim_token,t.group_ordinals) q WHERE a.batch_id=$1`,[b])).rows[0];
-   const kx=await claimOf("kx"),ky=await claimOf("ky");
+   const kx=await claimOf("kx"),ky=await claimOf("ky"),kz=await claimOf("kz");
    const k=(await f.db.query("SELECT key_sha256,lineage::text lineage FROM sessions.ingest_lazy_native_slots WHERE record_id='K'")).rows[0];
    const snap=async()=>(await f.db.query("SELECT to_jsonb(n)::text j FROM sessions.ingest_lazy_native_slots n WHERE record_id='K'")).rows[0].j;
    const before=await snap();
@@ -365,18 +366,22 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
      ["session NULL",{session:null}],["reset epoch",{reset:"1"}],["fence epoch",{fence:"1"}],["lineage +2",{lin:String(Number(k.lineage)+2)}],["lineage unchanged",{lin:k.lineage}]] as [string,any][])
     await expectCode(tx(async()=>{const key=await forge();await upd({...base,key,...d})}),"slot regression refused").catch(e=>{throw Error("K edge "+name+": "+e)});
    for(const [name,o,rev] of [["another record",{km:kmWith(7,"OTHER")},"2"],["revision not increasing",{km:kmWith(8,"1")},"1"],["seat-key derivation",{badKey:true},"2"],
-     ["tag",{km:kmWith(0,"buffer-legacy-replay-reference-v1")},"2"],["length 12",{km:kx.km.slice(0,12)},"2"],["scope epoch",{km:kmWith(12,"9")},"2"]] as [string,any,string][])
+     ["tag",{km:kmWith(0,"buffer-legacy-replay-reference-v1")},"2"],["length 14 (all 13 positions still valid)",{km:[...kx.km,"extra"]},"2"],["scope epoch",{km:kmWith(12,"9")},"2"]] as [string,any,string][])
     await expectCode(tx(async()=>{const key=await forge(o);await upd({...base,key,rev})}),"slot regression refused").catch(e=>{throw Error("K edge "+name+": "+e)});
    // (B) commit-time provenance: receipt-only (the former pinned positive), and a bound decision without the clock advance
-   await expectCode(tx(async()=>{const key=await forge();await upd({...base,key})}),"ahead of the committed clock");
-   await expectCode(tx(async()=>{const key=await forge();await upd({...base,key});await insDec(key,kx)}),"ahead of the committed clock");
+   // deferred events fire in queue order: the receipt-seat check (seat INSERT) refuses first; the K-winner clock/era branch
+   // is defence in depth (reachable only if the clock moved backwards)
+   await expectCode(tx(async()=>{const key=await forge();await upd({...base,key})}),"receipt seat ahead of the committed clock");
+   await expectCode(tx(async()=>{const key=await forge();await upd({...base,key});await insDec(key,kx)}),"receipt seat ahead of the committed clock");
    // (C) decision binding with the clock advanced: one field differs from the real claim kx -> refused only by the binding
    for(const [name,c,over] of [["not accepted",kx,{body_accepted:false}],["lineage",kx,{native_lineage:Number(k.lineage)+5}],["candidate digest",kx,{candidate_digest:"b".repeat(64)}],
      ["first digest",kx,{first_digest:"b".repeat(64)}],["reset epoch",kx,{reset_epoch:Number(kx.reset_epoch)+1}],["fence epoch",kx,{fence_epoch:1}],
      ["native key (real other slot)",kx,{native_key_sha256:otherKey}],["candidate key",kx,{candidate_key_sha256:"8".repeat(64)}],["generation",kx,{generation:"e".repeat(64)}],
      ["source control version",kx,{source_control_version:Number(kx.source_control_version)+7}],["witness",kx,{source_witness_sha256:"f".repeat(64)}],
      // (inherently multi-cause: another user's claim can never carry user-1's record — the claim path refuses it with P0W01)
-     ["another user's claim",{...kx,claim_token:otherClaim},{ord:1}],["ord not carrying this record",kx,{ord:5}]] as [string,any,any][])
+     ["another user's claim",{...kx,claim_token:otherClaim},{ord:1}],["ord not carrying this record",kx,{ord:5}],
+     ["real ord carrying another record (same user, committed claim kz)",{...kx,claim_token:kz.claim_token,schema_generation:kz.schema_generation,source_control_version:kz.source_control_version,
+       source_witness_sha256:kz.source_witness_sha256,reset_epoch:kz.reset_epoch},{}]] as [string,any,any][])
     await expectCode(tx(async()=>{const key=await forge();await upd({...base,key});await insDec(key,c,over);await advance()}),"no accepted v1 decision").catch(e=>{throw Error("decision "+name+": "+e)});
    // two matching accepted decisions (two real claims carrying the same candidate)
    await expectCode(tx(async()=>{const key=await forge();await upd({...base,key});await insDec(key,kx);await insDec(key,ky);await advance()}),"no accepted v1 decision");
