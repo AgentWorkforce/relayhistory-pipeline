@@ -4,6 +4,7 @@ import { analysisSourceReadonlyUrl, parseSecret } from "../session-pipeline/lamb
 import {createSemanticClickHouseClient as createClickHouseClient} from "./semantic-copy-ch.ts";
 import { semanticReadonlyPool, semanticFeatureReader,semanticMetadataPool } from "./semantic-copy-source-pool.ts";
 import { runSemanticCopyTick } from "./semantic-copy-job.ts";
+import { assertNoNeonEdge, neonExitProfile } from "../shared/neon-exit.ts";
 export async function semanticCopyMain(env: NodeJS.ProcessEnv = process.env, factory = () => {
     const sourceId = env.SESSION_SEARCH_FEATURE_SOURCE_ID;
     if (!sourceId)
@@ -15,7 +16,7 @@ export async function semanticCopyMain(env: NodeJS.ProcessEnv = process.env, fac
     process.once("SIGTERM", abort);
     process.once("SIGINT", abort);
     return { run: () => runSemanticCopyTick({ db, source, ch, sourceId, endpoint: secret.clickhouse!.url, signal: controller.signal }), close: async () => { process.removeListener("SIGTERM", abort); process.removeListener("SIGINT", abort); await Promise.allSettled([metadataPool.end(), sourcePool.end()]); } };
-}) { if (env.SESSION_SEMANTIC_COPY_ENABLED !== "1")
+}) { assertNoNeonEdge(neonExitProfile(env), "the semantic copier", { "SESSION_SEMANTIC_COPY_ENABLED=1": env.SESSION_SEMANTIC_COPY_ENABLED === "1" }); if (env.SESSION_SEMANTIC_COPY_ENABLED !== "1")
     return { enabled: false }; const r = factory(); try {
     return { enabled: true, ...await r.run() };
 }
