@@ -3,7 +3,7 @@
  * (AGENTS.md "nothing credential-like on disk"; 1Password is the system of record). The caller pipes one
  * JSON object, e.g. `op read ... | jq ... | bun run <job>`; nothing is echoed or logged.
  */
-import { readFileSync, fstatSync } from "node:fs";
+import { createReadStream, fstatSync } from "node:fs";
 
 /** Environment names that would put a credential, or a path to one, outside RAM. Any of them refuses. */
 export const FORBIDDEN_CREDENTIAL_ENV = [
@@ -50,12 +50,65 @@ export function parseCredentialDocument(text: string, required: readonly string[
   return doc;
 }
 
-/** Read fd 0 once. Refuses a terminal (a typed secret would echo) and a regular file (that is a file on disk). */
-export function readStdinCredentials(required: readonly string[], allowed: readonly string[] = required, fd = 0): Record<string, unknown> {
+/** Default bounds: a slow 1Password approval may precede the first byte, but once bytes flow they must keep flowing. */
+export const STDIN_TOTAL_DEADLINE_MS = 300_000;
+export const STDIN_IDLE_AFTER_FIRST_BYTE_MS = 5_000;
+
+export interface StdinReadOptions {
+  fd?: number;
+  maxBytes?: number;
+  /** No-progress bound once the first byte has arrived. */
+  idleMs?: number;
+  /** Overall bound, including the wait for the first byte. */
+  totalMs?: number;
+}
+
+/**
+ * Read one bounded credential document from a pipe or socket (fd 0 by default), incrementally: it refuses as soon as
+ * more than `maxBytes` arrive (never reading to EOF first), on no progress for `idleMs` after the first byte, and after
+ * `totalMs` overall. A terminal (a typed secret would echo) and a regular file (a credential on disk) are refused; there
+ * is no file fallback. Values never appear in errors.
+ */
+export async function readStdinCredentials(required: readonly string[], allowed: readonly string[] = required, opts: StdinReadOptions = {}): Promise<Record<string, unknown>> {
+  const fd = opts.fd ?? 0;
+  const max = opts.maxBytes ?? MAX_STDIN_CREDENTIAL_BYTES;
+  const idleMs = opts.idleMs ?? STDIN_IDLE_AFTER_FIRST_BYTE_MS;
+  const totalMs = opts.totalMs ?? STDIN_TOTAL_DEADLINE_MS;
   const st = fstatSync(fd);
   if (st.isCharacterDevice()) throw new CredentialRefusal("credentials_stdin_is_a_terminal");
   if (st.isFile()) throw new CredentialRefusal("credentials_stdin_is_a_file");
-  return parseCredentialDocument(readFileSync(fd, "utf8"), required, allowed);
+  const bytes = await new Promise<Buffer>((resolve, reject) => {
+    const stream = createReadStream("", { fd, autoClose: false, highWaterMark: 4096 });
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    let idle: ReturnType<typeof setTimeout> | undefined;
+    const finish = (error?: CredentialRefusal) => {
+      if (done) return;
+      done = true;
+      clearTimeout(total);
+      if (idle) clearTimeout(idle);
+      stream.removeAllListeners("data");
+      stream.pause();
+      stream.destroy();
+      if (error) {
+        chunks.length = 0;
+        reject(error);
+      } else resolve(Buffer.concat(chunks, size));
+    };
+    const total = setTimeout(() => finish(new CredentialRefusal("credentials_stdin_deadline")), totalMs);
+    stream.on("data", (chunk: Buffer | string) => {
+      const b = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      size += b.length;
+      if (size > max) return finish(new CredentialRefusal("credentials_too_large"));
+      chunks.push(b);
+      if (idle) clearTimeout(idle);
+      idle = setTimeout(() => finish(new CredentialRefusal("credentials_stdin_idle_timeout")), idleMs);
+    });
+    stream.on("end", () => finish());
+    stream.on("error", () => finish(new CredentialRefusal("credentials_stdin_read_failed")));
+  });
+  return parseCredentialDocument(bytes.toString("utf8"), required, allowed);
 }
 
 export function postgresUrl(v: unknown, name: string): string {

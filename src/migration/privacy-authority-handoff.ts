@@ -94,11 +94,33 @@ const KEY_C = "(org_id COLLATE \"C\",workspace_id COLLATE \"C\",user_id COLLATE 
  * the page's key range that Neon does not have, and finally every row past Neon's last key. Run it while fenced so Neon
  * cannot change underneath; activation then refuses unless both digests are equal. Neon is only read.
  */
-export async function syncOwned(neon: Queryable, supa: Queryable, opts: { pageRows?: number } = {}): Promise<{ rows: number; inserted: number; removed: number }> {
+export async function syncOwned(
+  neon: Queryable,
+  supa: Queryable,
+  opts: { pageRows?: number; hooks?: { beforePageCommit?: (page: number) => Promise<void> } } = {},
+): Promise<{ rows: number; inserted: number; removed: number }> {
   const page = opts.pageRows ?? 5000;
   if (!Number.isInteger(page) || page < 1 || page > 20000) throw new HandoffRefusal("invalid_page_rows");
+  // One sync at a time: an overlapping run's older Neon cursor could undo a newer run's pages. Session-level, held for
+  // the whole run (each page additionally serializes with activation through the guard's authority lock).
+  const got = (await supa.query<{ ok: boolean }>("SELECT pg_try_advisory_lock(1919249529,97) AS ok")).rows[0]?.ok;
+  if (got !== true) throw new HandoffRefusal("sync_owned_in_progress");
+  try {
+    return await syncOwnedLocked(neon, supa, page, opts.hooks?.beforePageCommit);
+  } finally {
+    await supa.query("SELECT pg_advisory_unlock(1919249529,97)").catch(() => undefined);
+  }
+}
+
+async function syncOwnedLocked(
+  neon: Queryable,
+  supa: Queryable,
+  page: number,
+  beforePageCommit?: (page: number) => Promise<void>,
+): Promise<{ rows: number; inserted: number; removed: number }> {
   const s = await readSupabaseState(supa);
   if (s.authority === "active") throw new HandoffRefusal("supabase_authority_active");
+  let pages = 0;
   let rows = 0, inserted = 0, removed = 0;
   let after: OwnedRow | null = null;
   const applyPage = async (batch: OwnedRow[], last: boolean) => {
@@ -122,6 +144,8 @@ export async function syncOwned(neon: Queryable, supa: Queryable, opts: { pageRo
              WHERE (r.org_id,r.workspace_id,r.user_id,r.origin_id,r.source,r.session_id)=(s.org_id,s.workspace_id,s.user_id,s.origin_id,s.source,s.session_id))
            RETURNING 1) SELECT count(*)::text AS n FROM x`, params);
       removed += Number(del.rows[0]?.n ?? 0);
+      pages += 1;
+      if (beforePageCommit) await beforePageCommit(pages);
       await supa.query("COMMIT");
     } catch (error) {
       await supa.query("ROLLBACK").catch(() => undefined);
@@ -309,5 +333,11 @@ export async function activate(
   if (activated.state !== "active" || activated.fingerprintSha256 !== b.fingerprint) throw new HandoffRefusal("activation_result_invalid");
   const c = await readNeonSnapshot(neon, opts.epoch);
   const ownedAfter = await readNeonOwnedDigest(neon);
-  return { activated, neonFingerprint: b.fingerprint, neonStableAfter: c.fingerprint === b.fingerprint && ownedAfter.sha256 === owned.sha256 };
+  // Defense in depth: the committed Supabase copy must still be exactly what activation bound.
+  const supaOwnedAfter = await readSupabaseOwnedDigest(supa);
+  return {
+    activated,
+    neonFingerprint: b.fingerprint,
+    neonStableAfter: c.fingerprint === b.fingerprint && ownedAfter.sha256 === owned.sha256 && supaOwnedAfter.sha256 === owned.sha256 && supaOwnedAfter.rows === owned.rows,
+  };
 }

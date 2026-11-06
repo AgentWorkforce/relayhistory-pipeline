@@ -72,7 +72,7 @@ export async function main() {
   const execute = flag("execute");
   refuseCredentialEnv();
   const kind = authorityKind(env("S3X_PRIVACY_AUTHORITY"));
-  const creds = readStdinCredentials(execute ? ["databaseUrl", "eraser"] : ["databaseUrl"], ["databaseUrl", "eraser"]);
+  const creds = await readStdinCredentials(execute ? ["databaseUrl", "eraser"] : ["databaseUrl"], ["databaseUrl", "eraser"]);
   const url = authorityUrl(kind, creds.databaseUrl);
   const eraser = eraserFor(execute, creds.eraser === undefined ? undefined : s3Credentials(creds.eraser, "eraser"));
   delete creds.databaseUrl;

@@ -94,6 +94,16 @@ REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_lock(boolean)
 CREATE FUNCTION sessions.ingest_privacy_authority_guard() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $authority_guard$
 BEGIN
+ -- Every writer of a guarded table joins the authority lock (shared; activation and every transition hold it
+ -- exclusively) BEFORE it checks the state, and the check runs after the lock (a new READ COMMITTED snapshot):
+ --  * a writer already in flight holds activation off until it commits, so activation sees its effect;
+ --  * a writer queued behind activation sees the committed 'active' state and refuses.
+ -- Holding it to commit is what makes an uncommitted owned-copy page visible to activation (independent review P2).
+ PERFORM pg_advisory_xact_lock_shared(1919249529,96);
+ -- The owned-session copy is written only by sync-owned pages (READ COMMITTED) and the authority apply. Any other
+ -- isolation could act on a snapshot older than a just-committed activation, so it is refused outright.
+ IF TG_TABLE_NAME='ingest_frozen_source_owned_sessions' AND current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: owned sessions are written only in read committed';END IF;
  IF coalesce(current_setting('bulls96.privacy_authority_writer',true),'')<>'authority'
   AND EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority WHERE state='active') THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: privacy authority is supabase; legacy writer refused';END IF;
