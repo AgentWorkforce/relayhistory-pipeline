@@ -89,6 +89,8 @@ jobs:
       - name: Guard - nothing secret-like committed
         run: |
           ! git ls-files | grep -E '(^|/)(\.env|inputs\.json|.*\.pem)$' || (echo "secret-like file tracked"; exit 1)
+      - name: Guard - no production deployment identifiers in engine source (src, packages, scripts)
+        run: bun scripts/check-engine-identifiers.ts
   # Keep every mutation, but give the long unit suite and mutation suite their
   # own budgets. Running both serially exceeded the old 40-minute limit.
   aws-hardening-mutations:

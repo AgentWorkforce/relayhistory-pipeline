@@ -9,28 +9,37 @@ import {SemanticPostgresExecutor} from "../search-features/semantic-copy-postgre
 import {derivedSchemaAssets,type DerivedSchemaAssets} from "../session-pipeline/derived-schema.ts";
 import {awsJsonCall,lambdaCredentials} from "../session-pipeline/aws-json.ts";
 import {SUPABASE_PROD_CA_2021} from "../session-pipeline/supabase-ca.ts";
+import {deployTargetValue,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF} from "../shared/deploy-target.ts";
 import {bufferedGcTick,sqlBufferedGcLedger,BufferedGcError} from "./buffered-gc.ts";
-export interface GcJobConfig {region:"us-east-1";bucket:string;kmsKeyArn:string;secretArn:string;expectedGeneration:string;limit:number;budgetMs:number}
+export interface GcJobConfig {region:"us-east-1";accountId:string;supabaseProjectRef:string;bucket:string;kmsKeyArn:string;secretArn:string;expectedGeneration:string;limit:number;budgetMs:number}
 function no(code:string):never{throw new BufferedGcError(code)}
 export function gcJobConfig(env:NodeJS.ProcessEnv):GcJobConfig{
  const need=(name:string)=>{const v=env[name];if(!v)no("config_required");return v};
  if(env.AWS_REGION!=="us-east-1"||env.HOOPDB_DB_MODE!=="supabase")no("target_required");
  const bucket=need("INGEST_GC_BUCKET"),kmsKeyArn=need("INGEST_GC_KMS_KEY_ARN"),secretArn=need("INGEST_GC_SECRET_ARN");
- if(!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)||!/^arn:aws:kms:us-east-1:941433935742:key\/[0-9a-f-]{36}$/.test(kmsKeyArn)||
-  !/^arn:aws:secretsmanager:us-east-1:941433935742:secret:96bulls\/[A-Za-z0-9_./-]+\/buffered-gc-[A-Za-z0-9]{6}$/.test(secretArn))no("target_invalid");
+ const {accountId,supabaseProjectRef}=gcTargetConfig(env,{account:"INGEST_GC_AWS_ACCOUNT_ID",supabaseRef:"INGEST_GC_SUPABASE_PROJECT_REF"});
+ if(!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)||!new RegExp(`^arn:aws:kms:us-east-1:${accountId}:key/[0-9a-f-]{36}$`).test(kmsKeyArn)||
+  !new RegExp(`^arn:aws:secretsmanager:us-east-1:${accountId}:secret:96bulls/[A-Za-z0-9_./-]+/buffered-gc-[A-Za-z0-9]{6}$`).test(secretArn))no("target_invalid");
  const expectedGeneration=need("INGEST_GC_EXPECT_GENERATION");
  if(!/^[a-f0-9]{64}$/.test(expectedGeneration))no("generation_required");
  const limit=Number(env.INGEST_GC_BATCH_LIMIT??"5"),budgetMs=Number(env.INGEST_GC_BUDGET_MS??"45000");
  if(!Number.isInteger(limit)||limit<1||limit>20||!Number.isInteger(budgetMs)||budgetMs<5000||budgetMs>50000)no("budget_invalid");
- return{region:"us-east-1",bucket,kmsKeyArn,secretArn,expectedGeneration,limit,budgetMs};
+ return{region:"us-east-1",accountId,supabaseProjectRef,bucket,kmsKeyArn,secretArn,expectedGeneration,limit,budgetMs};
 }
-/** Dedicated login only. URL SSL options cannot weaken pinned CA/hostname checks. */
-export function gcPoolConfig(text:string):pg.PoolConfig{
+/** Deployment identity: explicit operator configuration with no default target. */
+export function gcTargetConfig(env:NodeJS.ProcessEnv,names:{account:string;supabaseRef:string}):{accountId:string;supabaseProjectRef:string}{
+ const fail=(reason:"required"|"invalid"):never=>no(reason==="required"?"config_required":"target_invalid");
+ return{accountId:deployTargetValue(env,names.account,AWS_ACCOUNT_ID,fail),supabaseProjectRef:deployTargetValue(env,names.supabaseRef,SUPABASE_PROJECT_REF,fail)};
+}
+/** Dedicated login only. URL SSL options cannot weaken pinned CA/hostname checks.
+ * `supabaseProjectRef` comes from validated operator config (gcTargetConfig). */
+export function gcPoolConfig(text:string,supabaseProjectRef:string):pg.PoolConfig{
+ if(!SUPABASE_PROJECT_REF.test(supabaseProjectRef))no("target_invalid");
  let v:unknown;try{v=JSON.parse(text)}catch{no("secret_invalid")}
  if(!v||typeof v!=="object"||Array.isArray(v)||Object.keys(v).join(",")!=="hoopdb_url"||typeof(v as any).hoopdb_url!=="string")no("secret_invalid");
  let u:URL;try{u=new URL((v as any).hoopdb_url)}catch{no("database_target")}
  if(!["postgres:","postgresql:"].includes(u.protocol)||u.hostname!=="aws-0-us-east-1.pooler.supabase.com"||
-  u.port!=="5432"||u.pathname!=="/postgres"||decodeURIComponent(u.username)!=="bulls96_session_ingest.pyamkrhoyszgzirqqffq"||!u.password||u.hash)no("database_target");
+  u.port!=="5432"||u.pathname!=="/postgres"||decodeURIComponent(u.username)!=="bulls96_session_ingest."+supabaseProjectRef||!u.password||u.hash)no("database_target");
  for(const[k,x]of u.searchParams)if(!((k==="sslmode"&&["require","verify-full"].includes(x))||(k==="channel_binding"&&x==="require")))no("database_options");
  return{host:u.hostname,port:5432,database:"postgres",user:decodeURIComponent(u.username),password:decodeURIComponent(u.password),
   ssl:{ca:SUPABASE_PROD_CA_2021,rejectUnauthorized:true,servername:u.hostname},max:2,connectionTimeoutMillis:1000,
@@ -77,7 +86,7 @@ export async function runBufferedGcJob(env:NodeJS.ProcessEnv,overrides:GcJobOver
    if(!r.SecretString)no("secret_empty");return r.SecretString;
   })();
   controller.signal.throwIfAborted();
-  pool=(overrides.pool??(c=>new pg.Pool(c)))(gcPoolConfig(secret));pool.on("error",()=>{});
+  pool=(overrides.pool??(c=>new pg.Pool(c)))(gcPoolConfig(secret,config.supabaseProjectRef));pool.on("error",()=>{});
   const sql=new SemanticPostgresExecutor(pool),read=new SemanticPostgresExecutor(pool,true);
   const context=()=>({signal:controller.signal,deadline:Math.min(deadline,Date.now()+1800)});
   const who=(await read.queryBounded<{me:string;session:string}>("SELECT current_user AS me,session_user AS session",[],context())).rows[0];

@@ -4,36 +4,12 @@ import pg from "pg";
 import { generation, inspectMigrations, migrationProfile } from "../src/hoopdb/migrate.ts";
 import { functionBoundaryEvidence } from "../src/hoopdb/migrate-guards.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
+import { parseCliLogin as parseSupabaseCliLogin } from "../src/shared/supabase-cli-login.ts";
 const PROJECT = "pyamkrhoyszgzirqqffq";
 const CLI = "/home/khaliqgant/.local/bin/supabase";
 function refuse(code: string): never { throw Object.assign(new Error(code), { code }); }
 /** Data parser only. Never execute or source the shell script printed by the CLI. */
-export function parseCliLogin(script: string): { password: string } {
-  if (Buffer.byteLength(script) > 65536) refuse("cli_reply_limit");
-  const fields = new Map<string, string>();
-  for (const raw of script.split("\n")) {
-    const match = /^(?:export )?(PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE)=(.*)$/u.exec(raw.trim());
-    if (!match) continue;
-    const key = match[1]!, encoded = match[2]!.trim();
-    if (fields.has(key)) refuse("cli_duplicate_field");
-    let value: string;
-    if (encoded.startsWith('"')) {
-      try { value = JSON.parse(encoded); } catch { return refuse("cli_field_parse"); }
-    } else if (encoded.startsWith("'")) {
-      if (!/^'[^']*'$/u.test(encoded)) refuse("cli_field_parse");
-      value = encoded.slice(1, -1);
-    } else {
-      if (!/^[A-Za-z0-9_./:+-]+$/u.test(encoded)) refuse("cli_field_parse");
-      value = encoded;
-    }
-    if (typeof value !== "string" || /[\x00-\x1f\x7f]/u.test(value)) refuse("cli_field_parse");
-    fields.set(key, value);
-  }
-  if (fields.size !== 5 || fields.get("PGHOST") !== `db.${PROJECT}.supabase.co` || fields.get("PGPORT") !== "5432" || fields.get("PGUSER") !== "cli_login_postgres" || fields.get("PGDATABASE") !== "postgres") refuse("cli_target_pin");
-  const password = fields.get("PGPASSWORD")!;
-  if (password.length < 16 || /redact|your-password|\*\*\*/iu.test(password)) refuse("cli_credential_unavailable");
-  return { password };
-}
+export function parseCliLogin(script: string): { password: string } { return parseSupabaseCliLogin(script, PROJECT); }
 export function ownerPlanInputs(env: NodeJS.ProcessEnv, argv: string[]) {
   if (env.OPERATOR_MODE !== "plan" || argv.length !== 2) refuse("operator_plan_only");
   const sha = env.OPERATOR_SOURCE_SHA, digest = env.OPERATOR_GENERATION;
