@@ -1,0 +1,180 @@
+-- Reverse of ingest_lazy_source_tables (slot TBD): the 20261104055000 definitions, verbatim.
+CREATE OR REPLACE FUNCTION sessions.ingest_lazy_user(p_w jsonb,p_kind text,p_control jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lazy_user$
+DECLARE v_org text;v_ws text;v_user text;v_epoch text;v_source text;v_first boolean;v_last bigint;v_version bigint;v_privacy_version bigint;
+ s sessions.ingest_lazy_user_seals%ROWTYPE;b sessions.ingest_seed_fence_baselines%ROWTYPE;v_privacy jsonb;v_d jsonb;v_r jsonb;v_fp text;k record;v_exists boolean;
+BEGIN
+ v_org:=sessions.ingest_identifier(p_w#>'{tenant,orgId}',false);v_ws:=sessions.ingest_identifier(p_w#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p_w#>'{tenant,userId}',false);v_epoch:=sessions.ingest_digest(p_w->'controlEpoch');
+ v_source:=sessions.ingest_digest(p_w->'sourceIdentitySha256');
+ IF jsonb_typeof(p_w->'sourceControlVersion') IS DISTINCT FROM 'string' OR p_w->>'sourceControlVersion'!~'^(0|[1-9][0-9]{0,18})$'
+  OR jsonb_typeof(p_w->'privacyVersion') IS DISTINCT FROM 'string' OR p_w->>'privacyVersion'!~'^(0|[1-9][0-9]{0,18})$' THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: witness version shape';END IF;
+ v_version:=(p_w->>'sourceControlVersion')::bigint;v_privacy_version:=(p_w->>'privacyVersion')::bigint;
+ INSERT INTO sessions.ingest_fence_owners VALUES(v_org,v_ws,v_user) ON CONFLICT DO NOTHING RETURNING true INTO v_first;
+ PERFORM sessions.ingest_lock_fences(v_org,v_ws,v_user);
+ SELECT coalesce(max(version),0) INTO v_last FROM sessions.ingest_control_receipts
+  WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user AND epoch=v_epoch;
+ IF p_kind='batch' THEN
+  IF p_w->'pending' IS DISTINCT FROM 'false'::jsonb OR p_w->'pendingControl' IS DISTINCT FROM 'null'::jsonb
+   OR v_version<>v_last OR v_privacy_version<>v_version THEN
+   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: source control version changed';END IF;
+ ELSE
+  IF p_w->'pending' IS DISTINCT FROM 'true'::jsonb OR p_w->'pendingControl' IS DISTINCT FROM p_control
+   OR p_control->>'epoch' IS DISTINCT FROM v_epoch OR p_control->>'kind' IS DISTINCT FROM p_kind
+   OR p_control->>'version' IS DISTINCT FROM v_version::text OR v_version=0 OR v_privacy_version<>v_version-1 THEN
+   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: pending source control mismatch';END IF;
+  IF v_last<v_version THEN
+   IF v_last=9223372036854775807 OR v_last+1<>v_version THEN
+    RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: source control gap';END IF;
+  ELSE
+   PERFORM 1 FROM sessions.ingest_control_receipts WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user
+    AND epoch=v_epoch AND version=v_version AND kind=p_kind AND digest=p_control->>'digest';
+   IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: source control replay mismatch';END IF;
+  END IF;
+ END IF;
+ SELECT * INTO s FROM sessions.ingest_lazy_user_seals WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
+ IF FOUND THEN
+  SELECT * INTO b FROM sessions.ingest_seed_fence_baselines WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
+  IF NOT FOUND OR s.source_identity_sha256<>v_source OR s.control_epoch<>v_epoch OR s.privacy_fingerprint<>b.fingerprint THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: existing user privacy authority changed';END IF;
+  RETURN jsonb_build_object('privacySealed',true,'created',false,'targetVersion',v_last::text);
+ END IF;
+ -- An already-completed source control implies a previously sealed target.
+ -- Lost authority cannot silently become a fresh user merely because rows vanished.
+ IF v_first IS DISTINCT FROM true OR v_last<>0 OR v_privacy_version<>0 THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: unsealed user authority cannot be adopted';END IF;
+ FOR k IN SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+  WHERE n.nspname='sessions' AND c.relkind='r' AND (c.relname LIKE 'ingest_%' OR c.relname LIKE 'upload_%')
+   AND c.relname<>'ingest_fence_owners'
+   AND NOT EXISTS(SELECT 1 FROM unnest(ARRAY['org_id','workspace_id','user_id']) col
+    WHERE NOT EXISTS(SELECT 1 FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attname=col AND a.attnum>0 AND NOT a.attisdropped))
+ LOOP
+  EXECUTE format('SELECT EXISTS(SELECT 1 FROM sessions.%I WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3)',k.relname)
+   INTO v_exists USING v_org,v_ws,v_user;
+  IF v_exists THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: prior user authority requires reviewed recovery';END IF;
+ END LOOP;
+ v_privacy:=p_w->'privacy';
+ PERFORM sessions.ingest_exact_keys(v_privacy,ARRAY['complete','deletions','resets']);
+ IF v_privacy->'complete' IS DISTINCT FROM 'true'::jsonb OR octet_length(v_privacy::text)>524288
+  OR jsonb_typeof(v_privacy->'deletions') IS DISTINCT FROM 'array' OR jsonb_typeof(v_privacy->'resets') IS DISTINCT FROM 'array'
+  OR jsonb_array_length(v_privacy->'deletions')+jsonb_array_length(v_privacy->'resets')>5000 THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: complete bounded cold privacy required';END IF;
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(v_privacy->'deletions') q(e) WHERE CASE WHEN jsonb_typeof(e)<>'object' THEN true ELSE
+  ARRAY(SELECT x FROM jsonb_object_keys(e)x ORDER BY x COLLATE "C") IS DISTINCT FROM ARRAY['origin_id','session_id','source']::text[] END)
+ OR EXISTS(SELECT 1 FROM jsonb_array_elements(v_privacy->'resets')q(e) WHERE CASE WHEN jsonb_typeof(e)<>'object' THEN true ELSE
+  ARRAY(SELECT x FROM jsonb_object_keys(e)x ORDER BY x COLLATE "C") IS DISTINCT FROM ARRAY['deleted','request_id']::text[]
+  OR jsonb_typeof(e->'deleted') IS DISTINCT FROM 'string' OR e->>'deleted'!~'^(0|[1-9][0-9]{0,18})$' END)
+ THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid cold privacy metadata';END IF;
+ SELECT coalesce(jsonb_agg(x ORDER BY x::text COLLATE "C"),'[]') INTO v_d FROM(
+  SELECT DISTINCT jsonb_build_object('origin_id',sessions.ingest_identifier(e->'origin_id',false),
+   'source',sessions.ingest_identifier(e->'source',false),'session_id',sessions.ingest_identifier(e->'session_id',false)) x
+  FROM jsonb_array_elements(v_privacy->'deletions')q(e))q;
+ SELECT coalesce(jsonb_agg(x ORDER BY x::text COLLATE "C"),'[]') INTO v_r FROM(
+  SELECT DISTINCT jsonb_build_object('request_id',sessions.ingest_identifier(e->'request_id',false),'deleted',(e->>'deleted')::bigint) x
+  FROM jsonb_array_elements(v_privacy->'resets')q(e))q;
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(v_r)x GROUP BY x->>'request_id' HAVING count(*)>1) THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: conflicting reset metadata';END IF;
+ v_fp:=encode(sha256(convert_to(jsonb_build_array('neon-fence-baseline-v1',v_org,v_ws,v_user,v_d,v_r)::text,'UTF8')),'hex');
+ INSERT INTO sessions.ingest_fence_versions(org_id,workspace_id,user_id,origin_id,source,session_id,epoch)
+  SELECT v_org,v_ws,v_user,x.origin_id,x.source,x.session_id,1 FROM jsonb_to_recordset(v_d)x(origin_id text,source text,session_id text);
+ INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id)
+  SELECT v_org,v_ws,v_user,x.origin_id,x.source,x.session_id FROM jsonb_to_recordset(v_d)x(origin_id text,source text,session_id text);
+ INSERT INTO sessions.upload_resets(org_id,workspace_id,user_id,request_id,deleted)
+  SELECT v_org,v_ws,v_user,x.request_id,x.deleted FROM jsonb_to_recordset(v_r)x(request_id text,deleted bigint);
+ INSERT INTO sessions.ingest_seed_fence_baselines(org_id,workspace_id,user_id,fingerprint,imported_at)
+  VALUES(v_org,v_ws,v_user,v_fp,clock_timestamp());
+ INSERT INTO sessions.ingest_lazy_user_seals(org_id,workspace_id,user_id,source_identity_sha256,control_epoch,privacy_fingerprint,initial_privacy_version)
+  VALUES(v_org,v_ws,v_user,v_source,v_epoch,v_fp,v_privacy_version);
+ RETURN jsonb_build_object('privacySealed',true,'created',true,'targetVersion',v_last::text);
+END $lazy_user$;
+
+CREATE OR REPLACE FUNCTION sessions.ingest_lazy_begin(p jsonb,p_kind text) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lazy_begin$
+DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;c sessions.ingest_receipt_seat_clock%ROWTYPE;
+ v_gen text;v_packet jsonb;w jsonb;v_org text;v_ws text;v_user text;v_new boolean;v_exists boolean;k record;
+ v_records jsonb;v_count integer;v_seen integer;v_ack jsonb;
+BEGIN
+ IF p_kind NOT IN('batch','selection','reset') OR p_kind IS NULL THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid witness operation';END IF;
+ v_gen:=sessions.ingest_digest(p->'generation');PERFORM sessions.ingest_require_generation(v_gen);
+ SELECT * INTO STRICT pol FROM sessions.ingest_lazy_policy WHERE singleton FOR SHARE;
+ SELECT * INTO STRICT c FROM sessions.ingest_receipt_seat_clock WHERE singleton;
+ IF pol.generation<>v_gen OR pol.valid_until<=clock_timestamp() OR pol.source_identity_sha256<>c.source_identity_sha256
+  OR pol.control_epoch<>c.control_epoch OR pol.source_proof_sha256 IS DISTINCT FROM c.baseline->>'sourceProofSha256' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: current custody policy unavailable';END IF;
+ v_packet:=p->'custody';PERFORM sessions.ingest_exact_keys(v_packet,ARRAY['witness','sourceDigest']);w:=v_packet->'witness';
+ PERFORM sessions.ingest_exact_keys(w,ARRAY['version','issuer','sourceIdentitySha256','controlEpoch','privacyBaselineSha256',
+  'tenant','originId','batchId','batchDigest','sourceControlVersion','pending','pendingControl','privacyVersion',
+  'originalRecordCount','candidateCount','records','privacy']);
+ IF encode(sha256(convert_to(w::text,'UTF8')),'hex')<>sessions.ingest_digest(v_packet->'sourceDigest')
+  OR w->'version' IS DISTINCT FROM '1'::jsonb OR w->>'issuer' IS DISTINCT FROM pol.issuer
+  OR w->>'sourceIdentitySha256' IS DISTINCT FROM pol.source_identity_sha256 OR w->>'controlEpoch' IS DISTINCT FROM pol.control_epoch
+  OR w->>'privacyBaselineSha256' IS DISTINCT FROM pol.privacy_baseline_sha256 OR w->'tenant' IS DISTINCT FROM p->'tenant' THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: source witness identity mismatch';END IF;
+ PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
+ v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p#>'{tenant,userId}',false);
+ IF jsonb_typeof(w->'records') IS DISTINCT FROM 'array' OR octet_length((w->'records')::text)>4194304
+  OR jsonb_typeof(w->'candidateCount') IS DISTINCT FROM 'number' OR w->>'candidateCount'!~'^(0|[1-9][0-9]{0,2})$'
+  OR jsonb_typeof(w->'originalRecordCount') IS DISTINCT FROM 'number' OR w->>'originalRecordCount'!~'^(0|[1-9][0-9]{0,2})$'
+  OR (w->>'candidateCount')::integer>500 OR (w->>'originalRecordCount')::integer>500
+  OR (w->>'candidateCount')::integer>(w->>'originalRecordCount')::integer
+  OR jsonb_array_length(w->'records')<>(w->>'candidateCount')::integer THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: source witness record bound';END IF;
+ IF p_kind='batch' THEN
+  v_records:=sessions.ingest_records(p->'records');v_count:=jsonb_array_length(v_records);
+  IF w->>'originId' IS DISTINCT FROM p->>'originId' OR w->>'batchId' IS DISTINCT FROM p->>'batchId'
+   OR w->>'batchDigest' IS DISTINCT FROM p->>'batchDigest' OR v_count<>(w->>'candidateCount')::integer THEN
+   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: source witness batch mismatch';END IF;
+  IF EXISTS(SELECT 1 FROM jsonb_array_elements(w->'records')q(e) WHERE CASE WHEN jsonb_typeof(e)<>'object' THEN true ELSE
+   ARRAY(SELECT x FROM jsonb_object_keys(e)x ORDER BY x COLLATE "C") IS DISTINCT FROM
+    ARRAY['candidateDigest','candidateFenced','current','currentFenced','preparedOrd','processingRank','recordId','revision','revisionId']::text[]
+   OR jsonb_typeof(e->'preparedOrd') IS DISTINCT FROM 'number' OR e->>'preparedOrd'!~'^(0|[1-9][0-9]{0,2})$'
+   OR jsonb_typeof(e->'processingRank') IS DISTINCT FROM 'number' OR e->>'processingRank'!~'^(0|[1-9][0-9]{0,2})$'
+   OR jsonb_typeof(e->'candidateFenced') IS DISTINCT FROM 'boolean' OR jsonb_typeof(e->'currentFenced') IS DISTINCT FROM 'boolean'
+   OR jsonb_typeof(e->'current') NOT IN('object','null') END)
+  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: source witness record shape';END IF;
+  IF EXISTS(SELECT 1 FROM jsonb_array_elements(w->'records')q(e)
+   WHERE (e->>'preparedOrd')::integer>=v_count OR (e->>'processingRank')::integer>=v_count)
+   OR (SELECT count(DISTINCT e->>'preparedOrd') FROM jsonb_array_elements(w->'records')q(e))<>v_count
+   OR (SELECT count(DISTINCT e->>'processingRank') FROM jsonb_array_elements(w->'records')q(e))<>v_count THEN
+   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: source witness rank coverage';END IF;
+  SELECT count(*)::integer INTO v_seen FROM jsonb_array_elements(w->'records')q(e)
+   JOIN jsonb_to_recordset(v_records)r(ord integer,record_id text,revision bigint,revision_id text,digest text,session_id text)
+   ON r.ord=(e->>'preparedOrd')::integer AND r.record_id=e->>'recordId' AND r.revision::text=e->>'revision'
+    AND r.revision_id=e->>'revisionId' AND r.digest=e->>'candidateDigest'
+   WHERE NOT((e->>'candidateFenced')::boolean AND r.session_id IS NULL);
+  IF v_seen<>v_count THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: source candidate metadata mismatch';END IF;
+ ELSE
+  IF w->'batchId' IS DISTINCT FROM 'null'::jsonb OR w->'batchDigest' IS DISTINCT FROM 'null'::jsonb
+   OR w->'originalRecordCount' IS DISTINCT FROM '0'::jsonb OR w->'candidateCount' IS DISTINCT FROM '0'::jsonb
+   OR w->'records' IS DISTINCT FROM '[]'::jsonb
+   OR (p_kind='reset' AND w->'originId' IS DISTINCT FROM 'null'::jsonb)
+   OR (p_kind='selection' AND w->>'originId' IS DISTINCT FROM p->>'originId') THEN
+   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: source control witness shape';END IF;
+ END IF;
+ -- The trusted source context permits provisioning, not a claim of empty org
+ -- history. Retained closed admissions are never reopened by a runtime request.
+ INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until,control_epoch)
+ VALUES(v_org,pol.privacy_baseline_sha256,pol.retention_contract_sha256,v_gen,pol.valid_until,pol.control_epoch)
+ ON CONFLICT DO NOTHING RETURNING true INTO v_new;
+ PERFORM 1 FROM sessions.ingest_buffer_admission WHERE org_id=v_org AND privacy_baseline_sha256=pol.privacy_baseline_sha256
+  AND retention_contract_sha256=pol.retention_contract_sha256 AND schema_generation=v_gen AND control_epoch=pol.control_epoch
+  AND valid_until>clock_timestamp() FOR SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: retained org admission closed or conflicting';END IF;
+ IF v_new IS TRUE THEN
+  FOR k IN SELECT t.relname FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
+   WHERE n.nspname='sessions' AND t.relkind='r' AND(t.relname LIKE 'ingest_%' OR t.relname LIKE 'upload_%')
+    AND t.relname<>'ingest_buffer_admission'
+    AND EXISTS(SELECT 1 FROM pg_attribute a WHERE a.attrelid=t.oid AND a.attname='org_id' AND a.attnum>0 AND NOT a.attisdropped)
+  LOOP
+   EXECUTE format('SELECT EXISTS(SELECT 1 FROM sessions.%I WHERE org_id=$1)',k.relname) INTO v_exists USING v_org;
+   IF v_exists THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: unbound prior org authority requires recovery';END IF;
+  END LOOP;
+ END IF;
+ v_ack:=sessions.ingest_lazy_user(w,p_kind,p->'control');
+ PERFORM sessions.ingest_require_generation(v_gen);
+ IF pol.valid_until<=clock_timestamp() THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: policy expired during operation';END IF;
+ RETURN v_ack;
+END $lazy_begin$;
