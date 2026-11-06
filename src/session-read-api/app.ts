@@ -26,7 +26,7 @@
  *   GET /v1/sessions/activity       sessions per UTC day without `q` (span semantics)
  * Both answer 501 `directory_workspace_not_enabled` unless the token's workspace is on
  * READ_API_DIRECTORY_WORKSPACES (the canary allowlist; unset = none), and 501
- * `directory_not_migrated` until migration 20261105029000 is applied. Never Neon.
+ * `directory_not_migrated` until migration 20261105034000 is applied. Never Neon.
  *   GET /v1/sessions/:id/timing     recorded timing from the session's canonical S3 objects
  *                                   (session-timing-source.ts, timing.ts), same allowlist.
  *   GET /v1/sessions/:id/turns      the relay session journal from canonical S3 (legacy

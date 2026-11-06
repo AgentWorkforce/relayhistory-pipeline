@@ -10,6 +10,8 @@ import { dirname, join } from "node:path";
 import { generate, ACL_PATH, type Reader } from "../../../scripts/sessions-function-boundary/generate.ts";
 import { LANES } from "../../../scripts/sessions-function-boundary/lanes/index.ts";
 import { ingestHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-history.ts";
+import { bufferedGcSingleCandidate } from "../../../scripts/sessions-function-boundary/lanes/buffered-gc-single-candidate.ts";
+import { createHash } from "node:crypto";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
 import { run } from "../../../scripts/sync-sessions-function-boundary.ts";
@@ -44,10 +46,33 @@ describe("unified sessions function-boundary generator", () => {
     expect(c.outputs).toEqual(a.outputs);
     expect(Object.keys(a.outputs).sort()).toEqual([
       "src/hoopdb/migrate-guards.ts", "src/hoopdb/sessions-function-acl.json",
+      "supabase/bootstrap/canonical_project_events_verify.sql",
       "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql",
       "supabase/bootstrap/session_directory_search_worker_verify.sql", "supabase/bootstrap/session_ingest_verify.sql",
+      "supabase/bootstrap/session_read_api_role_verify.sql",
       "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql",
+      "supabase/rollbacks/20261105033000_canonical_project_events.down.sql",
+      "supabase/rollbacks/20261105039000_buffered_gc_single_candidate.down.sql",
     ]);
+  });
+
+  test("the GC replacement changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {
+    const withGc = await generate(repo, LANES, VERIFIERS);
+    const withoutGc = await generate(repo, LANES.filter((l) => l !== bufferedGcSingleCandidate), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105039000_buffered_gc_single_candidate.down.sql";
+    for (const [path, value] of Object.entries(withoutGc.outputs)) expect(withGc.outputs[path]).toBe(value);
+    expect(withGc.summary.lanes["buffered-gc-single-candidate"]).toEqual({ functions: 0, replaces: 1, grants: 0 });
+    const down = withGc.outputs[downPath]!;
+    const source = readFileSync(join(root, bufferedGcSingleCandidate.migration!), "utf8");
+    expect(down).toContain(createHash("sha256").update(source).digest("hex"));
+    const originalPath = bufferedGcSingleCandidate.replaces["sessions.ingest_buffer_gc_claim(jsonb)"]!.original;
+    const original = readFileSync(join(root, originalPath), "utf8").match(/CREATE OR REPLACE FUNCTION sessions\.ingest_buffer_gc_claim\(p jsonb\)[\s\S]*?END \$claim\$;/)![0];
+    expect(down).toContain(original);
+    expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(original));
+    expect(down).toContain("pg_advisory_xact_lock(961996,1)");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
   });
 
   test("--check catches drift in every generated artifact and writes nothing; a write run repairs it", async () => {
@@ -119,15 +144,20 @@ describe("unified sessions function-boundary generator", () => {
     await expect(generate(repo, LANES, [...VERIFIERS, VERIFIERS[0]!])).rejects.toThrow("is configured twice");
   });
 
-  test("the remaining empty read-api and canonical-project-events slots are inert; the consumer slot is filled", async () => {
+  test("required lanes are present and filled, including project events 033000 and read API 034000", async () => {
     const slots = LANES.filter((l) => l.migration === null);
-    expect(slots.map((l) => l.lane).sort()).toEqual(["canonical-project-events", "read-api"]);
+    expect(slots.map((l) => l.lane).sort()).toEqual([]);
+    expect(LANES.map((l) => l.lane)).toEqual(expect.arrayContaining(["ingest-history", "read-api", "canonical-project-events", "canonical-feature-consumer"]));
     for (const l of slots) {
       expect([Object.keys(l.functions).length, Object.keys(l.replaces).length, l.prefixes.length, l.grantSources.length]).toEqual([0, 0, 0, 0]);
       expect(l.extraOutputs).toBeUndefined();
     }
     const summary = (await generate(repo, LANES, VERIFIERS)).summary.lanes;
     for (const l of slots) expect(summary[l.lane]).toEqual({ functions: 0, replaces: 0, grants: 0 });
+    expect(LANES.find((l) => l.lane === "read-api")?.migration).toBe("supabase/migrations/20261105034000_session_directory_read_api.sql");
+    expect(summary["canonical-project-events"]).toEqual({ functions: 10, replaces: 0, grants: 6 });
+    expect(LANES.find((l) => l.lane === "canonical-project-events")?.migration).toBe("supabase/migrations/20261105033000_canonical_project_events.sql");
+    expect(summary["read-api"]).toEqual({ functions: 3, replaces: 0, grants: 2 });
     expect(summary["canonical-feature-consumer"]).toEqual({ functions: 2, replaces: 0, grants: 1 });
   });
 });

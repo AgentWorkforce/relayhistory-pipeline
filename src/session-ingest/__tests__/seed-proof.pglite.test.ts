@@ -27,7 +27,7 @@ const args={org_id:TENANT.orgId,workspace_id:TENANT.workspaceId,source:"claude",
 async function fixture(baseline=true,oldOperation:"upsert"|"delete"="upsert"){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});cleanups.push(()=>db.close());
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const role of ["session_directory_search_worker","session_token_verifier","session_ingest_roles"])
+ for(const role of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles"])
   await db.exec(read("supabase/bootstrap/"+role+".sql"));
  for(const file of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())
   await db.exec(read("supabase/migrations/"+file));

@@ -83,6 +83,8 @@ await admin.query("RESET ROLE");
 ev("live-shape-seeded", { policy: G1, admissions: 965 });
 
 // ---- 2. W1: the real owner-apply flow from THIS checkout ----
+// New target prerequisites come from this checkout, never the historical base.
+await admin.query(await readFile(root + "/supabase/bootstrap/session_read_api_roles.sql", "utf8"));
 const pin = { sha: HEAD_SHA, generation: G2 };
 const wrapper = await M.op.wrapperSource();
 let w1: any;
