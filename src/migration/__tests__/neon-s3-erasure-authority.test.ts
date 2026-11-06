@@ -1,6 +1,6 @@
 /**
  * E3: the transcript eraser repointed to the C3 Supabase privacy authority, and credentials only via stdin.
- * The Supabase side is the real migration stack plus supabase/pending/ingest_privacy_authority.sql (PGlite).
+ * The Supabase side is the real migration stack plus supabase/migrations/20261105041000_ingest_privacy_authority.sql (PGlite).
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";

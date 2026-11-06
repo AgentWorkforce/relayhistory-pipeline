@@ -1,4 +1,6 @@
--- C3 post-apply job (NON-TRANSACTIONAL; run after ingest_privacy_authority.sql, before activation).
+-- C3 post-apply operator job (NON-TRANSACTIONAL; never inside a migration: migrate.ts wraps every migration in
+-- BEGIN/COMMIT and CONCURRENTLY would fail 25001). Run after migration 20261105041000, before activation, and only
+-- under an explicit apply OK.
 -- The Supabase-authority apply deletes one user's frozen records per selected session, or all of them on a
 -- reset (Neon semantics). The primary key (org, workspace, origin, record) cannot serve "this user's session",
 -- so without this index each control would scan a whole origin/org of the ~66M-row frozen copy.

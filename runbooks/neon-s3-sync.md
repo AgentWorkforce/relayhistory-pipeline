@@ -96,7 +96,7 @@ presence sweep) or `supabase` (zero-Neon checklist C3/E3; `databaseUrl` is a
 Supabase direct or session-pooler URL; reads `ingest_frozen_source_deletions`,
 has no presence sweep, and erases nothing unless
 `sessions.ingest_privacy_authority` is `active`). Switch it only after the C3
-activation (supabase/pending/ingest_privacy_authority.sql) and the RHC
+activation (migration 20261105041000_ingest_privacy_authority) and the RHC
 `supabase-authority` flip; restarting in `supabase` before activation only
 logs `sweep refused: privacy authority not ready`.
 

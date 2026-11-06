@@ -1,5 +1,5 @@
 /**
- * C3 fixtures: the full Supabase migration stack plus supabase/pending/ingest_privacy_authority.sql (slot TBD),
+ * C3 fixtures: the full Supabase migration stack (040000 lazy source tables, 041000 privacy authority) plus the post-apply index job,
  * and a minimal "Neon" with relayhistory's exact privacy tables (0038 / 0039 / 0078 DDL).
  */
 import { PGlite } from "@electric-sql/pglite";
@@ -15,11 +15,11 @@ import { TENANT, scratchStore } from "./support.ts";
 
 export const ROOT = join(import.meta.dir, "../../..");
 export const generation = "a".repeat(64), epoch = "3".repeat(64), identity = "c".repeat(64), baseline = "a".repeat(64);
-export const PENDING_SQL = "supabase/pending/ingest_privacy_authority.sql";
+export const PENDING_SQL = "supabase/migrations/20261105041000_ingest_privacy_authority.sql";
 /** Independent prerequisite fix (also needed by mirror/frozen-supabase without C3). */
 export const LAZY_SOURCE_SQL = "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql";
 /** C3 post-apply index job (non-transactional in production). */
-export const INDEX_SQL = "supabase/pending/ingest_privacy_authority_index.sql";
+export const INDEX_SQL = "scripts/ops/c3-privacy-authority/ingest_privacy_authority_index.sql";
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
 
 export async function authorityFixture(opts: { pending?: boolean; lazyFix?: boolean; index?: boolean } = {}) {
@@ -28,9 +28,12 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
   // lazyFix:false reproduces the pre-040000 state (that migration skipped; it touches nothing later ones depend on).
-  for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort())
-    if (opts.lazyFix !== false || "supabase/migrations/" + f !== LAZY_SOURCE_SQL) await db.exec(read("supabase/migrations/" + f));
-  if (opts.pending !== false) await db.exec(read(PENDING_SQL));
+  // pending:false / lazyFix:false reproduce the state without 041000 / 040000 (each skipped; nothing later depends on them).
+  for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
+    const path = "supabase/migrations/" + f;
+    if ((opts.lazyFix === false && path === LAZY_SOURCE_SQL) || (opts.pending === false && path === PENDING_SQL)) continue;
+    await db.exec(read(path));
+  }
   if (opts.pending !== false && opts.index !== false) await db.exec(read(INDEX_SQL));
   await db.exec("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','" + generation + "','pass')");
   const owner = async (name: string, p: unknown) => (await db.query("SELECT sessions." + name + "($1::jsonb) AS r", [JSON.stringify(p)])).rows[0] as { r: any };

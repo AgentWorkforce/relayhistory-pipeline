@@ -30,6 +30,7 @@ export interface Sentinel {
 }
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
+  "upstream:20261105041000_ingest_privacy_authority.sql": { evidence: "table sessions.ingest_privacy_authority", sql: relation("sessions.ingest_privacy_authority") },
   "upstream:20261105040000_ingest_lazy_source_tables.sql": {
     evidence: "replacement: lazy-current adoption checks exclude the source-side tables",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_user(jsonb,text,jsonb)') AND prosrc LIKE '%ingest_source_control_heads%') AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_begin(jsonb,text)') AND prosrc LIKE '%ingest_source_control_heads%') AS applied",
