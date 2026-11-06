@@ -10,7 +10,8 @@ import { sqlLedger } from "../ledger-sql.ts";
 import { deliverBatch } from "../deliver.ts";
 import { prepareDelivery, deliveryAccount } from "../vendor/delivery/prepare.ts";
 import { TENANT, batch, record, scratchStore } from "./support.ts";
-import { epoch, generation, identity, baseline, INDEX_SQL } from "./privacy-authority-support.ts";
+import { epoch, generation, identity, baseline, INDEX_SQL, fakeNeonDdl } from "./privacy-authority-support.ts";
+import { activate, census, fence, syncOwned } from "../../migration/privacy-authority-handoff.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 const root = join(import.meta.dir, "../../..");
@@ -59,8 +60,23 @@ async function database() {
   };
   /** Activation with an empty Neon (no heads, deletions or resets): the fingerprint of three empty arrays. */
   const emptyNeon = async () => (await pool.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0].f as string;
-  const activateEmpty = async (c: pg.ClientBase | pg.Pool = pool) => owner("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: await emptyNeon(), heads: [], deletions: [], resets: [] }, c);
-  return { pool, conn, owner, ingestLedger, activateEmpty };
+  const emptyOwned = async () => (await pool.query("SELECT sessions.ingest_privacy_authority_owned_digest() AS d")).rows[0].d;
+  const activateEmpty = async (c: pg.ClientBase | pg.Pool = pool) => owner("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: await emptyNeon(), heads: [], deletions: [], resets: [], neonOwned: await emptyOwned() }, c);
+  /** A second synthetic database standing in for Neon (relayhistory's privacy and owned-identity tables). */
+  const neon = async () => {
+    const nn = name + "_neon";
+    await admin.query("CREATE DATABASE " + nn);
+    const u = new URL(url!);
+    u.pathname = "/" + nn;
+    const npool = new pg.Pool({ connectionString: u.href, max: 2 });
+    cleanup.push(async () => {
+      await npool.end();
+      await admin.query("DROP DATABASE " + nn + " WITH (FORCE)");
+    });
+    await npool.query(fakeNeonDdl());
+    return npool;
+  };
+  return { pool, conn, owner, ingestLedger, activateEmpty, neon };
 }
 
 /** Resolves once `pid` is waiting on a lock (proves the race is real, not sequential). */
@@ -181,5 +197,33 @@ describe.skipIf(!url)("C3 privacy authority on actual PostgreSQL", () => {
     const ok = await deliverBatch({ ...deps, custody: fresh }, TENANT, raw);
     expect(ok.stats.deleted_sessions).toBe(1);
     expect(await deliveryAccount(TENANT)).toBe(raw.account_id);
+  });
+
+  test("reset coverage on real PG: sync-owned copies Neon's exact owned set (digest byte-equal), activation binds it, reset fences it", async () => {
+    const d = await database();
+    const neon = await d.neon();
+    const nc = await neon.connect();
+    const sc = await d.conn();
+    try {
+      const q = (c: pg.PoolClient) => ({ query: async (t: string, p?: unknown[]) => ({ rows: (await c.query(t, p as never)).rows }) });
+      const m = (await nc.query("SELECT 'delivery:'||md5(jsonb_build_array($1::text,'o1')::text) AS m", [TENANT.workspaceId])).rows[0].m;
+      await nc.query("INSERT INTO sessions.uploaded_support_identities VALUES($1,$2,'o1','r1',$3,'claude','ONLY-IDENTITY'),($1,$2,'o1','r9','user-2','claude','OTHER')", [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
+      await nc.query("INSERT INTO sessions.delivery_records VALUES($1,$2,'o1','r2',$3,'claude',NULL,'delete')", [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
+      await nc.query("INSERT INTO sessions.neighborhood_claims VALUES('c1',$1,$2::jsonb)", [TENANT.orgId, JSON.stringify([{ machineId: m, source: "claude", eventId: m + ":r2", sessionId: "FROM-CLAIM" }])]);
+      await fence(q(sc), epoch);
+      expect(await syncOwned(q(nc), q(sc), { pageRows: 2 })).toEqual({ rows: 3, inserted: 3, removed: 0 });
+      const c = await census(q(nc), q(sc), epoch);
+      expect(c.ownedEqual).toBe(true);
+      expect(c.supabase.owned).toEqual(c.neon.owned);
+      expect((await activate(q(nc), q(sc), { epoch, expectNeonFingerprint: c.neon.fingerprint, settleMs: 0 })).activated.state).toBe("active");
+      const a = await d.conn("ingest");
+      const head = await call(a, "ingest_privacy_authority_begin", { epoch, tenant: TENANT, kind: "reset", payload: { request_id: "cover" } });
+      expect(head).toMatchObject({ deleted: "2", apply: true });
+      expect((await d.pool.query("SELECT session_id FROM sessions.ingest_frozen_source_deletions ORDER BY 1")).rows.map((r) => r.session_id)).toEqual(["FROM-CLAIM", "ONLY-IDENTITY"]);
+      // Neon was only read.
+      expect((await nc.query("SELECT count(*)::int AS n FROM sessions.deleted_upload_sessions")).rows[0].n).toBe(0);
+    } finally {
+      nc.release();
+    }
   });
 });

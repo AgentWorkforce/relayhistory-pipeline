@@ -1,7 +1,10 @@
 /**
  * C3: hand the privacy authority for selection/reset from Neon to Supabase (supabase/migrations/20261105041000_ingest_privacy_authority.sql).
  *
- *   census   READ-ONLY on both sides: Neon's privacy fingerprint vs Supabase's (heads, deletions, resets), aggregate counts.
+ *   census   READ-ONLY on both sides: Neon's privacy fingerprint vs Supabase's (heads, deletions, resets), and Neon's
+ *            owned-session digest vs the Supabase owned copy (reset coverage), aggregate counts.
+ *   sync-owned Supabase owner write (never once active): stream Neon's owned identities (exactly what Neon's reset would
+ *            fence: owned_uploaded_session_identities for every user) and make the Supabase copy exactly that set.
  *   fence    Supabase owner write: the legacy Neon-first mirror begin refuses from now on (controls 503 BEFORE Neon).
  *   activate Supabase owner write, while fenced: two identical Neon snapshots >= settle apart with no pending head,
  *            then ONE Supabase transaction makes heads/frozen privacy exactly that snapshot (bound by the
@@ -38,6 +41,112 @@ SELECT (SELECT s FROM st) AS cutover,
  (SELECT v FROM dp) AS deletions,(SELECT v FROM rp) AS resets,
  (SELECT count(*) FROM h)::int AS head_count,(SELECT count(*) FILTER (WHERE pending) FROM h)::int AS pending_count,
  (SELECT count(*) FROM d)::int AS deletion_count,(SELECT count(*) FROM r)::int AS reset_count`;
+
+/**
+ * Neon's sessions.owned_uploaded_session_identities() (relayhistory 0038) for EVERY user at once: the support identities
+ * with a session, plus session ids recovered from null-session delete tombstones through neighborhood_claims. This is
+ * exactly the set Neon's reset fences; the Supabase authority's reset must never cover less.
+ */
+export const NEON_OWNED_SESSIONS_SQL = `
+SELECT org_id,workspace_id,user_id,origin_id,source,session_id FROM (
+ SELECT org_id,workspace_id,user_id,origin_id,source,session_id FROM sessions.uploaded_support_identities WHERE session_id IS NOT NULL
+ UNION
+ SELECT r.org_id,r.workspace_id,r.user_id,r.origin_id,r.source,k->>'sessionId'
+   FROM sessions.delivery_records r JOIN sessions.neighborhood_claims c ON c.org_id=r.org_id
+   CROSS JOIN LATERAL jsonb_array_elements(c.support_event_ids) k
+  WHERE r.session_id IS NULL AND r.operation='delete'
+    AND k->>'machineId'='delivery:' || md5(jsonb_build_array(r.workspace_id,r.origin_id)::text)
+    AND k->>'source'=r.source
+    AND k->>'eventId'='delivery:' || md5(jsonb_build_array(r.workspace_id,r.origin_id)::text) || ':' || r.record_id
+    AND length(k->>'sessionId') BETWEEN 1 AND 512
+) o`;
+const OWNED_ORDER = `org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C",origin_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"`;
+/** The same digest text as sessions.ingest_privacy_authority_owned_digest(), over Neon's owned identities. */
+export const NEON_OWNED_SESSIONS_DIGEST_SQL = `WITH o AS (${NEON_OWNED_SESSIONS_SQL})
+SELECT count(*)::text AS rows,encode(sha256(convert_to(coalesce(string_agg(jsonb_build_array(org_id,workspace_id,user_id,origin_id,source,session_id)::text,E'\\n'
+ ORDER BY ${OWNED_ORDER}),''),'UTF8')),'hex') AS sha256 FROM o`;
+export interface OwnedDigest { rows: string; sha256: string }
+
+export async function readNeonOwnedDigest(neon: Queryable): Promise<OwnedDigest> {
+  return inReadOnly(neon, async () => {
+    const r = (await neon.query<OwnedDigest>(NEON_OWNED_SESSIONS_DIGEST_SQL)).rows[0];
+    if (!r || !/^(0|[1-9][0-9]*)$/.test(r.rows) || !HEX64.test(r.sha256)) throw new HandoffRefusal("neon_owned_digest_invalid");
+    if (Number(r.rows) > 5_000_000) throw new HandoffRefusal("neon_owned_sessions_too_large");
+    return { rows: r.rows, sha256: r.sha256 };
+  });
+}
+
+export async function readSupabaseOwnedDigest(supa: Queryable): Promise<OwnedDigest> {
+  return inReadOnly(supa, async () => {
+    const r = (await supa.query<{ d: OwnedDigest }>("SELECT sessions.ingest_privacy_authority_owned_digest() AS d")).rows[0]?.d;
+    if (!r || !HEX64.test(r.sha256)) throw new HandoffRefusal("supabase_owned_digest_invalid");
+    return r;
+  });
+}
+
+type OwnedRow = { org_id: string; workspace_id: string; user_id: string; origin_id: string; source: string; session_id: string };
+const OWNED_COLS = "org_id,workspace_id,user_id,origin_id,source,session_id";
+const KEY_C = "(org_id COLLATE \"C\",workspace_id COLLATE \"C\",user_id COLLATE \"C\",origin_id COLLATE \"C\",source COLLATE \"C\",session_id COLLATE \"C\")";
+
+/**
+ * Make the Supabase owned copy exactly Neon's owned identities. One Neon REPEATABLE READ READ ONLY cursor streams the
+ * set in C order; each page is applied in its own Supabase transaction: insert the page, delete every Supabase row in
+ * the page's key range that Neon does not have, and finally every row past Neon's last key. Run it while fenced so Neon
+ * cannot change underneath; activation then refuses unless both digests are equal. Neon is only read.
+ */
+export async function syncOwned(neon: Queryable, supa: Queryable, opts: { pageRows?: number } = {}): Promise<{ rows: number; inserted: number; removed: number }> {
+  const page = opts.pageRows ?? 5000;
+  if (!Number.isInteger(page) || page < 1 || page > 20000) throw new HandoffRefusal("invalid_page_rows");
+  const s = await readSupabaseState(supa);
+  if (s.authority === "active") throw new HandoffRefusal("supabase_authority_active");
+  let rows = 0, inserted = 0, removed = 0;
+  let after: OwnedRow | null = null;
+  const applyPage = async (batch: OwnedRow[], last: boolean) => {
+    await supa.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+    try {
+      const doc = JSON.stringify(batch);
+      const ins = await supa.query<{ n: string }>(
+        `WITH x AS (INSERT INTO sessions.ingest_frozen_source_owned_sessions(${OWNED_COLS})
+           SELECT ${OWNED_COLS} FROM jsonb_to_recordset($1::jsonb) AS r(org_id text,workspace_id text,user_id text,origin_id text,source text,session_id text)
+           ON CONFLICT DO NOTHING RETURNING 1) SELECT count(*)::text AS n FROM x`, [doc]);
+      inserted += Number(ins.rows[0]?.n ?? 0);
+      const lo = after ? [after.org_id, after.workspace_id, after.user_id, after.origin_id, after.source, after.session_id] : null;
+      const hi = batch.length ? batch[batch.length - 1]! : null;
+      const conds: string[] = [];
+      const params: unknown[] = [doc];
+      if (lo) { params.push(...lo); conds.push(`${KEY_C} > ($2,$3,$4,$5,$6,$7)`); }
+      if (hi && !last) { const b = params.length; params.push(hi.org_id, hi.workspace_id, hi.user_id, hi.origin_id, hi.source, hi.session_id); conds.push(`${KEY_C} <= ($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6})`); }
+      const del = await supa.query<{ n: string }>(
+        `WITH x AS (DELETE FROM sessions.ingest_frozen_source_owned_sessions s WHERE ${conds.length ? conds.join(" AND ") : "true"}
+           AND NOT EXISTS (SELECT 1 FROM jsonb_to_recordset($1::jsonb) AS r(org_id text,workspace_id text,user_id text,origin_id text,source text,session_id text)
+             WHERE (r.org_id,r.workspace_id,r.user_id,r.origin_id,r.source,r.session_id)=(s.org_id,s.workspace_id,s.user_id,s.origin_id,s.source,s.session_id))
+           RETURNING 1) SELECT count(*)::text AS n FROM x`, params);
+      removed += Number(del.rows[0]?.n ?? 0);
+      await supa.query("COMMIT");
+    } catch (error) {
+      await supa.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
+  };
+  await neon.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  try {
+    await neon.query(`DECLARE c3_owned NO SCROLL CURSOR FOR ${NEON_OWNED_SESSIONS_SQL} ORDER BY ${OWNED_ORDER}`);
+    for (;;) {
+      const batch = (await neon.query<OwnedRow>(`FETCH ${page} FROM c3_owned`)).rows;
+      rows += batch.length;
+      if (rows > 5_000_000) throw new HandoffRefusal("neon_owned_sessions_too_large");
+      const last = batch.length < page;
+      await applyPage(batch, last);
+      if (last) break;
+      after = batch[batch.length - 1]!;
+    }
+    await neon.query("COMMIT");
+  } catch (error) {
+    await neon.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  }
+  return { rows, inserted, removed };
+}
 
 /** Bounds: the whole privacy state is tiny today (heads 0, deletions 8, resets 0); refuse anything implausible. */
 export const SNAPSHOT_LIMITS = { heads: 100_000, deletions: 200_000, resets: 100_000 } as const;
@@ -132,15 +241,23 @@ async function ownerCall(supa: Queryable, fn: string, p: unknown): Promise<Recor
 }
 
 export interface Census {
-  neon: { fingerprint: string; counts: NeonPrivacySnapshot["counts"] };
-  supabase: SupabaseAuthorityState;
+  neon: { fingerprint: string; counts: NeonPrivacySnapshot["counts"]; owned: OwnedDigest };
+  supabase: SupabaseAuthorityState & { owned: OwnedDigest };
   equal: boolean;
+  ownedEqual: boolean;
 }
 
 export async function census(neon: Queryable, supa: Queryable, epoch: string): Promise<Census> {
   const n = await readNeonSnapshot(neon, epoch);
+  const no = await readNeonOwnedDigest(neon);
   const s = await readSupabaseState(supa);
-  return { neon: { fingerprint: n.fingerprint, counts: n.counts }, supabase: s, equal: n.fingerprint === s.fingerprintSha256 };
+  const so = await readSupabaseOwnedDigest(supa);
+  return {
+    neon: { fingerprint: n.fingerprint, counts: n.counts, owned: no },
+    supabase: { ...s, owned: so },
+    equal: n.fingerprint === s.fingerprintSha256,
+    ownedEqual: no.rows === so.rows && no.sha256 === so.sha256,
+  };
 }
 
 export async function fence(supa: Queryable, epoch: string) {
@@ -179,14 +296,18 @@ export async function activate(
   await sleep(opts.settleMs);
   const b = await readNeonSnapshot(neon, opts.epoch);
   if (b.fingerprint !== a.fingerprint) throw new HandoffRefusal("neon_not_stable");
+  // Reset coverage: Neon's owned identities (exactly what Neon's reset fences). The SQL refuses unless the Supabase copy equals it.
+  const owned = await readNeonOwnedDigest(neon);
   const activated = await ownerCall(supa, "ingest_privacy_authority_activate", {
     controlEpoch: opts.epoch,
     neonFingerprintSha256: b.fingerprint,
     heads: b.heads,
     deletions: b.deletions,
     resets: b.resets,
+    neonOwned: owned,
   });
   if (activated.state !== "active" || activated.fingerprintSha256 !== b.fingerprint) throw new HandoffRefusal("activation_result_invalid");
   const c = await readNeonSnapshot(neon, opts.epoch);
-  return { activated, neonFingerprint: b.fingerprint, neonStableAfter: c.fingerprint === b.fingerprint };
+  const ownedAfter = await readNeonOwnedDigest(neon);
+  return { activated, neonFingerprint: b.fingerprint, neonStableAfter: c.fingerprint === b.fingerprint && ownedAfter.sha256 === owned.sha256 };
 }

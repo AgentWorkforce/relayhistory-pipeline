@@ -12,7 +12,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105041000_ingest_privacy_authority.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105041000_ingest_privacy_authority.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'fa698013ad5496d3153706f96a146997e3d6eec1acaeef029f26f8e38ec97b0e'
+ IF NOT FOUND OR v_sha<>'43175f94f431fa33ecde4f30c42f907b8b9d60e857281d39e2c1e228e31649ea'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: own applied checksum required';END IF;
  PERFORM pg_advisory_xact_lock(1919249529,96); -- the authority lock: no begin/transition in flight
  IF EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority)
@@ -24,6 +24,7 @@ DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_source_control_he
 DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_deletions;
 DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_resets;
 DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_records;
+DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_owned_sessions;
 DROP FUNCTION sessions.ingest_privacy_authority_begin(jsonb);
 DROP FUNCTION sessions.ingest_privacy_authority_complete(jsonb);
 DROP FUNCTION sessions.ingest_privacy_authority_apply(text,text,text,text,jsonb);
@@ -31,6 +32,7 @@ DROP FUNCTION sessions.ingest_privacy_authority_release(jsonb);
 DROP FUNCTION sessions.ingest_privacy_authority_activate(jsonb);
 DROP FUNCTION sessions.ingest_privacy_authority_fence(jsonb);
 DROP FUNCTION sessions.ingest_privacy_authority_state();
+DROP FUNCTION sessions.ingest_privacy_authority_owned_digest();
 DROP FUNCTION sessions.ingest_privacy_authority_packet(jsonb,jsonb,jsonb);
 DROP FUNCTION sessions.ingest_privacy_authority_guard();
 -- The legacy mirror begin/complete exactly as 20261105010000 created them (they call the lock function: restore first).
@@ -96,8 +98,9 @@ BEGIN
 END $control_complete$;
 DROP FUNCTION sessions.ingest_privacy_authority_lock(boolean);
 DROP TABLE sessions.ingest_privacy_authority;
+DROP TABLE sessions.ingest_frozen_source_owned_sessions;
 ALTER TABLE sessions.ingest_source_control_heads DROP COLUMN deleted;
 -- The post-apply index job's index, if it was built (scripts/ops/c3-privacy-authority/ingest_privacy_authority_index.sql).
 DROP INDEX IF EXISTS sessions.ingest_frozen_source_records_user_session;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105041000_ingest_privacy_authority.sql' AND sha256='fa698013ad5496d3153706f96a146997e3d6eec1acaeef029f26f8e38ec97b0e';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105041000_ingest_privacy_authority.sql' AND sha256='43175f94f431fa33ecde4f30c42f907b8b9d60e857281d39e2c1e228e31649ea';
 COMMIT;

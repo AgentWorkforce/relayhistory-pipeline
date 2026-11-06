@@ -47,6 +47,20 @@ END $authority_creator$;
 -- Neon's head carries the reset count a pending replay answers; the mirror head now carries it too.
 ALTER TABLE sessions.ingest_source_control_heads ADD COLUMN deleted bigint CHECK(deleted IS NULL OR deleted>=0);
 
+-- Neon's reset fences every session sessions.owned_uploaded_session_identities() returns: the user's
+-- uploaded_support_identities (session_id NOT NULL) plus session ids recovered from null-session delete tombstones
+-- through neighborhood_claims. The frozen delivery records alone do not cover that set, so the authority keeps an
+-- exact copy of it (synced from Neon by scripts/privacy-authority-handoff.ts sync-owned, bound into activation by
+-- a Neon-computed digest), and reset/selection maintain it exactly as Neon maintains uploaded_support_identities.
+CREATE TABLE sessions.ingest_frozen_source_owned_sessions(
+ org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,origin_id text NOT NULL,
+ source text NOT NULL,session_id text NOT NULL,
+ PRIMARY KEY(org_id,workspace_id,user_id,origin_id,source,session_id)
+);
+ALTER TABLE sessions.ingest_frozen_source_owned_sessions ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.ingest_frozen_source_owned_sessions
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
 CREATE TABLE sessions.ingest_privacy_authority(
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  state text NOT NULL CHECK(state IN('fenced','active')),
@@ -95,6 +109,24 @@ CREATE TRIGGER ingest_privacy_authority_guard BEFORE INSERT OR UPDATE OR DELETE 
  FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_privacy_authority_guard();
 CREATE TRIGGER ingest_privacy_authority_guard BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sessions.ingest_frozen_source_records
  FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_privacy_authority_guard();
+CREATE TRIGGER ingest_privacy_authority_guard BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sessions.ingest_frozen_source_owned_sessions
+ FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_privacy_authority_guard();
+
+-- The owned-session digest. NEON_OWNED_SESSIONS_DIGEST_SQL (src/migration/privacy-authority-handoff.ts) computes the
+-- same text over Neon's owned identities; equal sets give equal bytes (every order COLLATE "C").
+CREATE FUNCTION sessions.ingest_privacy_authority_owned_digest() RETURNS jsonb
+LANGUAGE plpgsql STABLE SET search_path=pg_catalog,sessions,pg_temp AS $authority_owned_digest$
+DECLARE n bigint;d text;
+BEGIN
+ SELECT count(*) INTO n FROM sessions.ingest_frozen_source_owned_sessions;
+ IF n>5000000 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: owned sessions too large for a digest';END IF;
+ SELECT encode(sha256(convert_to(coalesce(string_agg(jsonb_build_array(org_id,workspace_id,user_id,origin_id,source,session_id)::text,E'\n'
+   ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C",origin_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"),''),'UTF8')),'hex')
+  INTO d FROM sessions.ingest_frozen_source_owned_sessions;
+ RETURN jsonb_build_object('rows',n::text,'sha256',d);
+END $authority_owned_digest$;
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_owned_digest()
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
 -- The privacy fingerprint. NEON_PRIVACY_FINGERPRINT_SQL (src/migration/privacy-authority-handoff.ts) runs the
 -- same expression on Neon over delivery_cutover_control_heads / deleted_upload_sessions / session_resets;
@@ -162,7 +194,8 @@ LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp SET bulls9
 DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;a sessions.ingest_privacy_authority%ROWTYPE;e jsonb;m sessions.ingest_source_control_heads%ROWTYPE;
  v_h jsonb;v_d jsonb;v_r jsonb;v_fp text;v_after jsonb;v_ins_d bigint;v_del_d bigint;v_ins_r bigint;v_del_r bigint;v_heads_written bigint:=0;v_last bigint;
 BEGIN
- PERFORM sessions.ingest_exact_keys(p,ARRAY['controlEpoch','neonFingerprintSha256','heads','deletions','resets']);
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['controlEpoch','neonFingerprintSha256','heads','deletions','resets','neonOwned']);
+ PERFORM sessions.ingest_exact_keys(p->'neonOwned',ARRAY['rows','sha256']);
  PERFORM sessions.ingest_privacy_authority_lock(true);
  pol:=sessions.ingest_frozen_source_policy();
  SELECT * INTO a FROM sessions.ingest_privacy_authority WHERE singleton FOR UPDATE;
@@ -260,6 +293,9 @@ BEGIN
  WITH x AS(DELETE FROM sessions.ingest_frozen_source_resets d WHERE NOT EXISTS(SELECT 1 FROM pg_temp.pa_res n WHERE (n.org_id,n.workspace_id,n.user_id,n.request_id,n.deleted)
    =(d.org_id,d.workspace_id,d.user_id,d.request_id,d.deleted)) RETURNING 1) SELECT count(*) INTO v_del_r FROM x;
  WITH x AS(INSERT INTO sessions.ingest_frozen_source_resets SELECT * FROM pg_temp.pa_res ON CONFLICT DO NOTHING RETURNING 1) SELECT count(*) INTO v_ins_r FROM x;
+ -- Reset coverage: the owned-session copy must be exactly Neon's owned identities (synced while fenced).
+ IF sessions.ingest_privacy_authority_owned_digest() IS DISTINCT FROM jsonb_build_object('rows',p#>>'{neonOwned,rows}','sha256',p#>>'{neonOwned,sha256}') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: owned sessions differ from neon; sync-owned first';END IF;
  v_after:=sessions.ingest_privacy_authority_state();
  IF v_after->>'fingerprintSha256' IS DISTINCT FROM v_fp THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: activation did not reach the neon fingerprint';END IF;
@@ -310,6 +346,9 @@ BEGIN
     INSERT INTO sessions.ingest_frozen_source_deletions VALUES(p_org,p_ws,p_user,v_origin,item->>'source',item->>'session_id') ON CONFLICT DO NOTHING;
     DELETE FROM sessions.ingest_frozen_source_records WHERE org_id=p_org AND workspace_id=p_ws AND origin_id=v_origin AND user_id=p_user
      AND source=item->>'source' AND session_id=item->>'session_id';
+    -- Neon's disable deletes the uploaded_support_identities of the session: so does the owned copy.
+    DELETE FROM sessions.ingest_frozen_source_owned_sessions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user
+     AND origin_id=v_origin AND source=item->>'source' AND session_id=item->>'session_id';
    END IF;
   END LOOP;
   RETURN NULL;
@@ -317,14 +356,20 @@ BEGIN
  v_request:=p_payload->>'request_id';
  SELECT deleted INTO v_total FROM sessions.ingest_frozen_source_resets WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND request_id=v_request;
  IF FOUND THEN RETURN v_total;END IF;
- -- Owned sessions = the user's frozen delivery records with a session (Neon: owned_uploaded_session_identities over
- -- delivery_records). Neon's uploaded_support_identities is not in the frozen copy: see the activation census.
- SELECT count(*) INTO v_total FROM(SELECT DISTINCT source,session_id FROM sessions.ingest_frozen_source_records
-  WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL)s;
+ -- Owned sessions: Neon's owned_uploaded_session_identities (the exact owned copy, synced and digest-bound at
+ -- activation) UNION the user's frozen delivery records with a session (a superset, never narrower than Neon).
+ -- The count is Neon's: distinct (source, session_id) of the owned identities; the union only adds fences.
+ CREATE TEMP TABLE pa_owned ON COMMIT DROP AS
+  SELECT origin_id,source,session_id FROM sessions.ingest_frozen_source_owned_sessions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user
+  UNION
+  SELECT origin_id,source,session_id FROM sessions.ingest_frozen_source_records WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL;
+ SELECT count(*) INTO v_total FROM(SELECT DISTINCT source,session_id FROM sessions.ingest_frozen_source_owned_sessions
+  WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)s;
  INSERT INTO sessions.ingest_frozen_source_deletions
-  SELECT DISTINCT p_org,p_ws,p_user,origin_id,source,session_id FROM sessions.ingest_frozen_source_records
-  WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL ON CONFLICT DO NOTHING;
+  SELECT p_org,p_ws,p_user,o.origin_id,o.source,o.session_id FROM pg_temp.pa_owned o ON CONFLICT DO NOTHING;
  DELETE FROM sessions.ingest_frozen_source_records WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL;
+ DELETE FROM sessions.ingest_frozen_source_owned_sessions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user;
+ DROP TABLE pg_temp.pa_owned;
  INSERT INTO sessions.ingest_frozen_source_resets VALUES(p_org,p_ws,p_user,v_request,v_total);
  RETURN v_total;
 END $authority_apply$;

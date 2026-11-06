@@ -68,8 +68,8 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
 }
 
 /** relayhistory's exact privacy tables (0038 deleted_upload_sessions, 0039 session_resets, 0078 control heads). */
-export async function fakeNeon() {
-  const pg = new PGlite();
+/** relayhistory's privacy tables and the owned-identity sources, for a fake "Neon" (PGlite or a real PG database). */
+export function fakeNeonDdl(): string {
   const v38 = read("vendor/relayhistory-cloud/migrations/0038_session_upload_deletion.sql");
   const v39 = read("vendor/relayhistory-cloud/migrations/0039_session_reset.sql");
   const ddl = (src: string, table: string) => {
@@ -77,7 +77,7 @@ export async function fakeNeon() {
     if (!m) throw new Error(`vendored migration no longer creates ${table}`);
     return m;
   };
-  await pg.exec(`CREATE SCHEMA sessions; ${ddl(v38, "deleted_upload_sessions")} ${ddl(v39, "session_resets")}
+  return `CREATE SCHEMA sessions; ${ddl(v38, "deleted_upload_sessions")} ${ddl(v39, "session_resets")}
     -- relayhistory 0078, verbatim.
     CREATE TABLE sessions.delivery_cutover_control_heads (
       org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,
@@ -88,10 +88,21 @@ export async function fakeNeon() {
       before_privacy jsonb,privacy_version bigint NOT NULL DEFAULT 0 CHECK(privacy_version>=0),updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
       PRIMARY KEY(org_id,workspace_id,user_id)
     );
+    -- The tables Neon's owned_uploaded_session_identities() reads (0038 shapes, the columns it uses).
+    CREATE TABLE sessions.uploaded_support_identities(org_id text NOT NULL,workspace_id text NOT NULL,origin_id text NOT NULL,record_id text NOT NULL,
+      user_id text NOT NULL,source text NOT NULL,session_id text,PRIMARY KEY(org_id,workspace_id,origin_id,record_id));
+    CREATE TABLE sessions.delivery_records(org_id text NOT NULL,workspace_id text NOT NULL,origin_id text NOT NULL,record_id text NOT NULL,
+      user_id text,source text,session_id text,operation text,PRIMARY KEY(org_id,workspace_id,origin_id,record_id));
+    CREATE TABLE sessions.neighborhood_claims(id text PRIMARY KEY,org_id text NOT NULL,support_event_ids jsonb NOT NULL DEFAULT '[]');
     CREATE TABLE sessions.delivery_cutover_state(singleton boolean PRIMARY KEY, phase text, epoch text);
     INSERT INTO sessions.delivery_cutover_state VALUES(true,'active','${epoch}');
     CREATE FUNCTION sessions.delivery_cutover_status() RETURNS jsonb LANGUAGE sql STABLE AS
-      $$ SELECT jsonb_build_object('version',1,'phase',phase,'epoch',epoch) FROM sessions.delivery_cutover_state $$;`);
+      $$ SELECT jsonb_build_object('version',1,'phase',phase,'epoch',epoch) FROM sessions.delivery_cutover_state $$;`;
+}
+
+export async function fakeNeon() {
+  const pg = new PGlite();
+  await pg.exec(fakeNeonDdl());
   const queryable: Queryable = { query: async (text, params) => (params?.length ? pg.query(text, params as never) : pg.query(text)) as never };
   const digest = async (kind: string, tenant: typeof TENANT, payload: unknown) =>
     ((await pg.query("SELECT encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',$1::text,$2::text,$3::text,$4::text,$5::text,$6::jsonb)::text,'UTF8')),'hex') AS d",

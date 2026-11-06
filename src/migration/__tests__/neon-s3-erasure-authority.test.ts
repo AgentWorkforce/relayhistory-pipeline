@@ -110,7 +110,8 @@ async function world() {
   const activate = async () => {
     await f.ownerRpc("ingest_privacy_authority_fence", { controlEpoch: epoch });
     const fp = (await f.db.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0] as { f: string };
-    await f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [] });
+    const owned = (await f.ownerRpc("ingest_privacy_authority_owned_digest")).r;
+    await f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [], neonOwned: owned });
   };
   return { f, store, state, job, keys, logs, activate };
 }

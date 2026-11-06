@@ -8,7 +8,7 @@ import { createIngestApp } from "../app.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { deliveryAccount } from "../vendor/delivery/prepare.ts";
 import { CURRENT_CUSTODY_CONTENT_TYPE } from "../custody-protocol.ts";
-import { activate, census, fence, release, readNeonSnapshot, HandoffRefusal } from "../../migration/privacy-authority-handoff.ts";
+import { activate, census, fence, release, readNeonSnapshot, syncOwned, HandoffRefusal } from "../../migration/privacy-authority-handoff.ts";
 import { TENANT, batch, record } from "./support.ts";
 import { authorityFixture, epoch, err, fakeNeon } from "./privacy-authority-support.ts";
 
@@ -63,6 +63,7 @@ async function mirrorControl(f: F, kind: "selection" | "reset", payload: any) {
 
 async function activateFrom(f: F, n: Awaited<ReturnType<typeof fakeNeon>>) {
   await fence(f.queryable, epoch);
+  await syncOwned(n.queryable, f.queryable);
   const c = await census(n.queryable, f.queryable, epoch);
   return activate(n.queryable, f.queryable, { epoch, expectNeonFingerprint: c.neon.fingerprint, settleMs: 0 });
 }
@@ -141,7 +142,7 @@ test("activation refusals: unbound or unstable snapshot, pending heads, divergen
   expect((await f.ownerRpc("ingest_privacy_authority_state")).r.authority).toBe("fenced");
   // The SQL binds the rows to the fingerprint itself (a tampered snapshot refuses).
   const snap = await readNeonSnapshot(n.queryable, epoch);
-  expect(await err(f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: snap.fingerprint, heads: [], deletions: [], resets: snap.resets }))).toContain("not the neon fingerprint");
+  expect(await err(f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: snap.fingerprint, heads: [], deletions: [], resets: snap.resets, neonOwned: (await f.ownerRpc("ingest_privacy_authority_owned_digest")).r }))).toContain("not the neon fingerprint");
   // A pending Neon head refuses.
   await n.pg.query("DELETE FROM sessions.deleted_upload_sessions");
   await n.head(TENANT, 1, "reset", { request_id: "p" }, { pending: true });
@@ -266,6 +267,8 @@ test("reset under Supabase authority: fences every owned frozen session, counts 
   for (const [rid, sid] of [["r1", "A"], ["r2", "A"], ["r3", "B"]]) {
     const p = (await prepareDelivery(TENANT, await batch([record({ record_id: rid!, session_id: sid! })]))).records[0]!;
     await f.db.query("INSERT INTO sessions.ingest_frozen_source_records VALUES($1,$2,$3,$4,$5,1,$6,$7,$8,$9,'upsert',$10,NULL,NULL)", [TENANT.orgId, TENANT.workspaceId, o, rid, p.revision_id, p.digest, p.kind, p.source, sid, TENANT.userId]);
+    // Neon keeps a support identity per uploaded record (synced into the owned copy at activation).
+    await n.pg.query("INSERT INTO sessions.uploaded_support_identities VALUES($1,$2,$3,$4,$5,'claude',$6)", [TENANT.orgId, TENANT.workspaceId, o, rid, TENANT.userId, sid]);
   }
   // Another user's record in the same origin is untouched.
   const q = (await prepareDelivery(TENANT, await batch([record({ record_id: "other", session_id: "A" })]))).records[0]!;
@@ -334,4 +337,72 @@ test("the authority lock refuses a non-read-committed transaction", async () => 
     await f.db.exec("ROLLBACK");
   }
   expect(HandoffRefusal).toBeDefined();
+});
+
+/**
+ * Reset coverage (no narrowing): Neon's reset fences every session owned_uploaded_session_identities() returns,
+ * including sessions known only through uploaded_support_identities and session ids recovered from null-session
+ * delete tombstones via neighborhood_claims. The Supabase authority's reset must fence at least that set.
+ */
+async function ownedWorld() {
+  const f = await setup();
+  const n = await fakeNeon();
+  open.push(n.close);
+  const o = await origin();
+  const ws = TENANT.workspaceId, machine = async () => ((await n.pg.query("SELECT 'delivery:'||md5(jsonb_build_array($1::text,$2::text)::text) AS m", [ws, o])).rows[0] as any).m as string;
+  const m = await machine();
+  // (a) a support identity whose frozen delivery record is gone (no frozen record carries this session);
+  await n.pg.query("INSERT INTO sessions.uploaded_support_identities VALUES($1,$2,$3,'r-a',$4,'claude','ONLY-IDENTITY')", [TENANT.orgId, ws, o, TENANT.userId]);
+  // (b) a null-session delete tombstone whose session is recovered through a claim's support event;
+  await n.pg.query("INSERT INTO sessions.delivery_records VALUES($1,$2,$3,'r-b',$4,'claude',NULL,'delete')", [TENANT.orgId, ws, o, TENANT.userId]);
+  await n.pg.query("INSERT INTO sessions.neighborhood_claims VALUES('c1',$1,$2::jsonb)", [TENANT.orgId, JSON.stringify([{ machineId: m, source: "claude", eventId: m + ":r-b", sessionId: "FROM-CLAIM" }])]);
+  // (c) another user's identity in the same origin (must stay untouched by this user's reset).
+  await n.pg.query("INSERT INTO sessions.uploaded_support_identities VALUES($1,$2,$3,'r-c','user-2','claude','OTHER-USER')", [TENANT.orgId, ws, o]);
+  return { f, n, o };
+}
+
+test("reset coverage: activation refuses until the owned copy is exactly Neon's; sync-owned makes it exact (and prunes)", async () => {
+  const { f, n } = await ownedWorld();
+  await fence(f.queryable, epoch);
+  // A stale extra row in the copy, and the two missing Neon rows.
+  await f.db.query("INSERT INTO sessions.ingest_frozen_source_owned_sessions VALUES('org-z','ws','u','o','claude','stale')");
+  const c = await census(n.queryable, f.queryable, epoch);
+  expect(c.ownedEqual).toBe(false);
+  expect(c.neon.owned.rows).toBe("3");
+  expect(await err(activate(n.queryable, f.queryable, { epoch, expectNeonFingerprint: c.neon.fingerprint, settleMs: 0 }))).toContain("owned sessions differ from neon");
+  expect(await syncOwned(n.queryable, f.queryable, { pageRows: 1 })).toEqual({ rows: 3, inserted: 3, removed: 1 });
+  const c2 = await census(n.queryable, f.queryable, epoch);
+  expect(c2.ownedEqual).toBe(true);
+  expect(c2.supabase.owned).toEqual(c2.neon.owned);
+  expect(await syncOwned(n.queryable, f.queryable)).toEqual({ rows: 3, inserted: 0, removed: 0 });
+  expect((await activate(n.queryable, f.queryable, { epoch, expectNeonFingerprint: c2.neon.fingerprint, settleMs: 0 })).activated.state).toBe("active");
+  // Once active the copy is the authority: sync-owned refuses, and so does any direct write.
+  expect(await err(syncOwned(n.queryable, f.queryable))).toContain("supabase_authority_active");
+  expect(await err(f.db.query("DELETE FROM sessions.ingest_frozen_source_owned_sessions"))).toContain("legacy writer refused");
+});
+
+test("reset coverage: a Supabase-authority reset fences identity-only and claim-recovered sessions, counts like Neon, leaves other users", async () => {
+  const { f, n } = await ownedWorld();
+  await fence(f.queryable, epoch);
+  await syncOwned(n.queryable, f.queryable);
+  const c = await census(n.queryable, f.queryable, epoch);
+  await activate(n.queryable, f.queryable, { epoch, expectNeonFingerprint: c.neon.fingerprint, settleMs: 0 });
+  const head = await f.rpc("ingest_privacy_authority_begin", { epoch, tenant: TENANT, kind: "reset", payload: { request_id: "cover" } });
+  // Neon's count: distinct (source, session_id) of the user's owned identities = 2.
+  expect(head).toMatchObject({ deleted: "2", apply: true });
+  expect(await frozenDeleted(f, "ONLY-IDENTITY")).toBe(1);
+  expect(await frozenDeleted(f, "FROM-CLAIM")).toBe(1);
+  expect(((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_deletions WHERE user_id='user-2'")).rows[0] as any).n).toBe(0);
+  expect((await f.db.query("SELECT user_id,session_id FROM sessions.ingest_frozen_source_owned_sessions")).rows).toEqual([{ user_id: "user-2", session_id: "OTHER-USER" }]);
+});
+
+test("reset coverage: a disable removes the session's owned identity (as Neon deletes uploaded_support_identities)", async () => {
+  const { f, n, o } = await ownedWorld();
+  await fence(f.queryable, epoch);
+  await syncOwned(n.queryable, f.queryable);
+  const c = await census(n.queryable, f.queryable, epoch);
+  await activate(n.queryable, f.queryable, { epoch, expectNeonFingerprint: c.neon.fingerprint, settleMs: 0 });
+  await authorityControl(f, "selection", { origin_id: o, sessions: [{ source: "claude", session_id: "ONLY-IDENTITY" }], enabled: false });
+  expect(await frozenDeleted(f, "ONLY-IDENTITY")).toBe(1);
+  expect(((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_owned_sessions WHERE session_id='ONLY-IDENTITY'")).rows[0] as any).n).toBe(0);
 });
