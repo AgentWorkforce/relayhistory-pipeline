@@ -1516,11 +1516,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const S = "upstream:20261105035000_semantic_copy_state.sql";
     const E = "upstream:20261105036000_canonical_consumer_lease.sql";
     const F = "upstream:20261105037000_session_directory_document_pool.sql";
+    const G = "upstream:20261105039000_buffered_gc_single_candidate.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
-    const rollback = (name: string) =>
-      db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8"));
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
+    const rollback = async (name: string) => {
+      try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
+      catch (error) { await db.exec("ROLLBACK"); throw error; }
+    };
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E, F, G]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -1556,6 +1559,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // Later lanes roll back first and remove their own ledger rows; only then
     // can the next down preserve a gap-free applied prefix.
+    expect((await failure(rollback("20261105037000_session_directory_document_pool.down.sql")))?.code).toBe("55000");
+    await rollback("20261105039000_buffered_gc_single_candidate.down.sql");
+    expect(await names()).not.toContain(G);
+    expect(await passed()).toBe(false);
     await rollback("20261105037000_session_directory_document_pool.down.sql");
     expect(await names()).not.toContain(F);
     await rollback("20261105036000_canonical_consumer_lease.down.sql");
@@ -1590,7 +1597,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 032000, 035000 and
     // 036000; the post-validation exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E, F, G]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
