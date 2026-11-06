@@ -15,7 +15,7 @@ async function fixture(initialized=true){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());
  const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
+ for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
  for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.exec(read("supabase/migrations/"+f));
  await db.exec("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','"+gen+"','pass')");
  await db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest_seeder");

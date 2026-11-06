@@ -17,7 +17,7 @@ permissions:
 jobs:
   preflight:
     if: ${{ github.ref == 'refs/heads/main' && github.actor == 'khaliqgant' && github.triggering_actor == 'khaliqgant' && inputs.confirm == 'publish 96bulls-services' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -47,7 +47,7 @@ jobs:
     needs: preflight
     if: ${{ needs.preflight.result == 'success' && github.ref == 'refs/heads/main' && github.actor == 'khaliqgant' && github.triggering_actor == 'khaliqgant' && inputs.confirm == 'publish 96bulls-services' }}
     environment: image-publish
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 40
     permissions:
       contents: read

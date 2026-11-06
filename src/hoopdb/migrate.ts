@@ -65,7 +65,12 @@ const TOKEN_VERIFIER_VERIFY = join(
 // The session ingest roles (bulls96_session_ingest, _seeder): the same contract, its own
 // file. 20261102010000 verifies them and fails closed if absent (42704); it never creates them.
 const INGEST_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_ingest_roles.sql");
+const PROJECT_EVENTS_VERIFY = join(ROOT,"supabase/bootstrap/canonical_project_events_verify.sql");
 const INGEST_ROLE_VERIFY = join(ROOT,"supabase/bootstrap/session_ingest_verify.sql");
+// The session read API role (bulls96_read_api), bare: the same contract, its own file.
+// 20261105034000 verifies it and fails closed if absent (42704); it never creates it.
+// session_read_api_role.sql (after migrate, operator) keeps LOGIN, settings and RLS.
+const READ_API_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_read_api_roles.sql");
 // Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any
 // role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
 // The one phase 2 source, shared with the live readiness gate (src/shared/db.ts).
@@ -288,6 +293,7 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
             path: TOKEN_VERIFIER_BOOTSTRAP,
           },
           { name: "bootstrap:session_ingest_roles", path: INGEST_BOOTSTRAP },
+          { name: "bootstrap:session_read_api_roles", path: READ_API_BOOTSTRAP },
         ]
       : []),
     ...(await schemaSteps()),
@@ -303,6 +309,7 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
           },
           {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
           {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
+          {name:"verify:canonical_project_events",path:PROJECT_EVENTS_VERIFY},
         ]
       : []),
   ];
@@ -334,6 +341,7 @@ export async function generation(): Promise<string> {
     { name: "verify:session_token_verifier", path: TOKEN_VERIFIER_VERIFY },
     {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
     {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
+    {name:"verify:canonical_project_events",path:PROJECT_EVENTS_VERIFY},
   ];
   const parts: string[][] = [];
   for (const s of steps)

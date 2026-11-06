@@ -5,6 +5,44 @@ The S3 bucket that RelayHistory transcript content lands in, in the
 `stacks/aws/transcript-store.ts`. Tests: `stacks/aws/__tests__/transcript-store.test.ts`
 and the `transcripts:` entries in `scripts/aws-hardening-mutations.ts`.
 
+## Preserve the separately managed buffered GC grant
+
+The transcript store owns the complete bucket and CMK policy documents. A manual
+resource-policy repair is insufficient continuity: a later Alchemy reconciliation,
+including a Lambda role-ARN cascade, replaces those documents with their declared
+contents. Before another production stack deployment, persist the exact existing
+GC role ARN as `transcriptStore.bufferedGcRoleArn` in the private
+`.96bulls/aws-sessions-prod/aws-inputs.json`. This is a nonsecret ARN, not a key or
+credential. The production validator and direct stage entry refuse a missing,
+wildcard, cross-account, user or assumed-role value. There is no default principal
+and no automatic grant-removal switch. Non-GC pure policy helpers keep their
+previous behavior when the optional GC argument is absent.
+
+`stacks/aws/buffered-gc-policy.ts` declares the reviewed resource-policy scope:
+GC may use the CMK only via this account's regional S3 service and buffered object
+context; bucket policy permits the identity-policy version-delete grant only on
+full buffered-stage keys. GC cannot plain-delete its barrier, delete elsewhere,
+access canonical objects, list canonical versions or use canonical cryptography.
+Explicit canonical denies are required because IAM `*` also matches `/` and a
+nested canonical family can be named `buffered-batches`. Existing eraser, writer,
+reader and pipeline statements remain in place. The GC Lambda and role remain
+owned by their separate CloudFormation stack; this input creates neither.
+
+The private input is part of the existing capture digest and approval binding.
+Capture and review a fresh plan after integrating the source and binding the ARN.
+The existing exact plan contract remains enforced: do not widen its role-cascade
+exception or edit plaintext Alchemy state to make a policy-adoption diff pass.
+If initial adoption produces more than the already allowed cascade, keep deployment
+held for a separately reviewed, exact policy-adoption phase. Check both declared
+policy documents and live readback before any broader deployment. A GC code-only
+update through its independent stack does not reconcile transcript-store policies.
+
+Offline coverage compares the GC statements with a sanitized approved policy
+fixture, preserves existing principals, exercises actual stage wiring with mocked
+providers, and tests nested canonical wildcard collisions. Mutation cases use
+`bun scripts/aws-hardening-mutations.ts --only "buffered GC continuity"`.
+This continuity change does not fix a SQL claim timeout or prove retention health.
+
 Sources: decision 0001 (production AWS is S3 only), the migration plan
 (`docs/relayhistory-supabase-migration-plan.md` on #90: S5, S6, P9, K-2, K-33,
 K-45, section 6 regional boundaries).

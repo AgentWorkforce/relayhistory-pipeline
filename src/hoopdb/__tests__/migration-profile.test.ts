@@ -1267,7 +1267,7 @@ describe("per-step catalog sentinels", () => {
       readFileSync(
         join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
-      ),
+      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
     );
     for (let i = 0; i <= upTo; i++)
       await db.exec(readFileSync(steps[i]!.path, "utf8"));
@@ -1324,7 +1324,7 @@ describe("per-step catalog sentinels", () => {
       readFileSync(
         join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
-      ),
+      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
     );
     for (const st of steps) {
       expect(await sentinel(db, st.name), `${st.name} before`).toBe(false);
@@ -1442,7 +1442,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       readFileSync(
         join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
-      ),
+      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
     );
     await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
     return db;
@@ -1606,21 +1606,33 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const C = "upstream:20261105030000_canonical_feature_consumer_acks.sql";
     const D = "upstream:20261105031000_desktop_catalog_forget_reproject.sql";
     const K = "upstream:20261105032000_session_large_read_routing_fixes.sql";
+    const P = "upstream:20261105033000_canonical_project_events.sql";
     const S = "upstream:20261105035000_semantic_copy_state.sql";
     const E = "upstream:20261105036000_canonical_consumer_lease.sql";
     const F = "upstream:20261105037000_session_directory_document_pool.sql";
+    const R = "upstream:20261105034000_session_directory_read_api.sql";
+    const T = "upstream:20261105038000_claim_attempt_records_retirement.sql";
+    const G = "upstream:20261105039000_buffered_gc_single_candidate.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
-    const rollback = (name: string) =>
-      db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8"));
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
+    const rollback = async (name: string) => {
+      try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
+      catch (error) { await db.exec("ROLLBACK"); throw error; }
+    };
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
-    // 036000 is the latest lane: 035000, 032000, 031000 and 030000 all refuse while it is applied.
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G]));
+    // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
+    expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(R);
+    // 033000 cannot be removed under 034000 or any later ledgered step.
+    expect((await failure(rollback("20261105033000_canonical_project_events.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(P);
+    // Later lanes remain applied: 035000, 032000, 031000 and 030000 all refuse while it is applied.
     expect((await failure(rollback("20261105035000_semantic_copy_state.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105031000_desktop_catalog_forget_reproject.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105030000_canonical_feature_consumer_acks.down.sql")))?.code).toBe("55000");
@@ -1648,7 +1660,22 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // Later lanes roll back first and remove their own ledger rows; only then
-    // can the next down preserve a gap-free applied prefix.
+    // Roll back the complete039/038 suffix in descending order before earlier lanes.
+    expect((await failure(rollback("20261105038000_claim_attempt_records_retirement.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(T);
+    await rollback("20261105039000_buffered_gc_single_candidate.down.sql");
+    expect(await names()).not.toContain(G);
+    expect(await passed()).toBe(false);
+    // can the next down preserve a gap-free applied prefix. 038000 is the latest lane:
+    // 037000 and 036000 refuse while it is applied.
+    expect(await names()).toEqual(expect.arrayContaining([F, T]));
+    expect((await failure(rollback("20261105037000_session_directory_document_pool.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(F);
+    expect((await failure(rollback("20261105036000_canonical_consumer_lease.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.canonical_feature_consumer_lease")).toBe("sessions.canonical_feature_consumer_lease");
+    await rollback("20261105038000_claim_attempt_records_retirement.down.sql");
+    expect(await names()).not.toContain(T);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_attribute WHERE attrelid='sessions.ingest_claim_attempts'::regclass AND attname LIKE 'records\\_%' AND NOT attisdropped")).rows[0]?.n).toBe(0);
     await rollback("20261105037000_session_directory_document_pool.down.sql");
     expect(await names()).not.toContain(F);
     await rollback("20261105036000_canonical_consumer_lease.down.sql");
@@ -1660,6 +1687,17 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105035000_semantic_copy_state.down.sql");
     expect(await names()).not.toContain(S);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.search_feature_copy_state')::text r")).rows[0]?.r).toBeNull();
+    // 034000 (P3b) is now the latest lane: 032000 refuses until it rolls back (strictly descending).
+    expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
+    await rollback("20261105034000_session_directory_read_api.down.sql");
+    expect(await names()).not.toContain(R);
+    expect((await db.query<{ f: string | null }>("SELECT to_regprocedure('sessions.session_directory_activity_for(text,timestamptz,timestamptz)')::text f")).rows[0]?.f).toBeNull();
+    // With 034000 gone, 033000 is still a later lane; 032000 must keep refusing.
+    expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
+    await rollback("20261105033000_canonical_project_events.down.sql");
+    expect(await names()).not.toContain(P);
+    expect(await relation("sessions.canonical_project_events")).toBeNull();
+    expect(await relation("sessions.canonical_project_event_scopes")).toBeNull();
     await rollback("20261105032000_session_large_read_routing_fixes.down.sql");
     expect(await names()).not.toContain(K);
     expect(await relation("sessions.session_large_read_scope_errors")).toBeNull();
@@ -1680,10 +1718,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105024000_session_brief_documents.down.sql");
     expect(await names()).not.toContain(B);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBeNull();
-    // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 032000, 035000 and
-    // 036000; the post-validation exact-ACL check finds no drift.
+    // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 032000, 033000 (F10), 034000 (P3b),
+    // 035000 through039000; the post-validation exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
@@ -1833,13 +1871,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         "utf8",
       )}`,
     );
-    // As the superuser (cluster roles), then back to the role the test continues as.
-    await db.exec(
-      `RESET ROLE; ${readFileSync(
-        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
-        "utf8",
-      )}; SET ROLE migration_owner;`,
-    );
+    // No superuser role bootstrap may fill a missing Cloud SQL prerequisite here.
     const targets = await db.query<{
       rolname: string;
       rolcanlogin: boolean;
@@ -1851,10 +1883,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(4);
+    expect(targets.rows).toHaveLength(10);
+    expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
+    const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
+    const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);
+    expect(targets.rows.map(r => r.rolname).sort()).toEqual([...prerequisites].sort());
     expect(targets.rows).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -1867,6 +1903,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
           rolinherit: false,
           memberships: 0,
         }),
+        expect.objectContaining({
+          rolname: "bulls96_read_api",
+          rolcanlogin: false,
+          rolinherit: false,
+          rolbypassrls: false,
+          memberships: 0,
+        }),
       ]),
     );
     expect(
@@ -1874,6 +1917,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         `SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_cloudsql_role_seed'`,
       ),
     ).toMatchObject({ rows: [] });
+    // The added prerequisite shares the existing fail-closed, never-repair contract.
+    await db.exec("RESET ROLE; ALTER ROLE bulls96_read_api INHERIT; SET ROLE migration_owner");
+    expect((await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"), "utf8"))))?.code).toBe("55000");
+    expect((await db.query<{ rolinherit: boolean }>("SELECT rolinherit FROM pg_roles WHERE rolname='bulls96_read_api'")).rows[0]?.rolinherit).toBe(true);
   });
 
   test("platform trust root: supabase_admin as a superuser with no safe default is excluded in supabase mode (listed with its attributes); the same catalog fails without the exclusion (selfhosted)", async () => {
@@ -2424,6 +2471,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
             "utf8",
           ),
         );
+        await db.exec(
+          readFileSync(
+            join(
+              root,
+              "supabase/bootstrap/session_read_api_roles.sql",
+            ),
+            "utf8",
+          ),
+        );
         await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
         await db.exec(
           readFileSync(
@@ -2465,6 +2521,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               join(
                 root,
                 "supabase/bootstrap/session_ingest_roles.sql",
+              ),
+              "utf8",
+            ),
+          );
+          await db.exec(
+            readFileSync(
+              join(
+                root,
+                "supabase/bootstrap/session_read_api_roles.sql",
               ),
               "utf8",
             ),

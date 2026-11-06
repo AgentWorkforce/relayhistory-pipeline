@@ -48,6 +48,8 @@ export const COMPATIBILITY_FLAGS = ["nodejs_compat"] as const;
 export const TRANSCRIPT_BUCKET = "96bulls-aws-sessions-prod-transcripts-941433935742";
 export const TRANSCRIPT_REGION = "us-east-1";
 export const KEY_ROOT = "96bulls";
+export const INBOX_AUTHORITY_MODE = "authority-v1" as const;
+export const INBOX_CANDIDATE_KEY_ROOT = "96bulls/upload-inbox/v1";
 export const FANOUT_QUEUE = "96bulls-session-ingest-fanout";
 export const FANOUT_DLQ = "96bulls-session-ingest-fanout-dlq";
 /** One batch's fan-out per invocation; retried with backoff, then dead-lettered. */
@@ -68,6 +70,16 @@ export const SESSION_INGEST_RESOURCES = [
 ] as const;
 
 export type ReplicaMode = "off" | "queue";
+
+export interface InboxAuthorityDeploymentInputs {
+  mode: typeof INBOX_AUTHORITY_MODE;
+  /** Immutable authority head/snapshot root. Candidate bodies use INBOX_CANDIDATE_KEY_ROOT instead. */
+  keyRoot: string;
+  expectedGeneration: string;
+  expectedControlEpoch: string;
+  expectedAuthEpoch: string;
+  expectedSourceIdentitySha256: string;
+}
 
 export interface SessionIngestInputs {
   /** The relayhistory Cloudflare account (the service binding needs both Workers in one account). */
@@ -93,12 +105,70 @@ export interface SessionIngestInputs {
   replicaMode?: ReplicaMode;
   /** relayhistory's existing Neon replica queue (producer binding only). Required with replicaMode `queue`. */
   neonReplicaQueue?: string;
+  /** Default-off S3 inbox authority. Presence is an all-or-nothing managed selection. */
+  authority?: InboxAuthorityDeploymentInputs;
 }
 
 const HEX32 = /^[0-9a-f]{32}$/;
+const HEX64 = /^[0-9a-f]{64}$/;
 const KEY_ARN = /^arn:aws:kms:us-east-1:941433935742:key\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const REPLICA_QUEUE = /^relayhistory-neon-replica(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?$/;
-const KEYS = ["custodySource", "expectedGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue"];
+const AUTHORITY_KEYS = ["mode", "keyRoot", "expectedGeneration", "expectedControlEpoch", "expectedAuthEpoch", "expectedSourceIdentitySha256"] as const;
+const AUTHORITY_ENV_KEYS = [
+  "INGEST_AUTHORITY_MODE",
+  "INGEST_AUTHORITY_KEY_ROOT",
+  "INGEST_AUTHORITY_EXPECT_GENERATION",
+  "INGEST_AUTHORITY_EXPECT_CONTROL_EPOCH",
+  "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
+  "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
+] as const;
+const KEYS = ["custodySource", "expectedGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority"];
+
+function validAuthorityKeyRoot(value: unknown): value is string {
+  if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
+  const parts = value.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) return false;
+  return !(
+    value === INBOX_CANDIDATE_KEY_ROOT ||
+    value.startsWith(`${INBOX_CANDIDATE_KEY_ROOT}/`) ||
+    INBOX_CANDIDATE_KEY_ROOT.startsWith(`${value}/`)
+  );
+}
+
+function inboxAuthority(
+  value: unknown,
+  refuse: (why: string) => never,
+): InboxAuthorityDeploymentInputs | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype)
+    refuse("sessionIngest.authority must be a plain object");
+  const authority = value as Record<string, unknown>;
+  for (const key of Object.keys(authority))
+    if (!(AUTHORITY_KEYS as readonly string[]).includes(key)) refuse(`sessionIngest.authority.${key} is not a known setting`);
+  for (const key of AUTHORITY_KEYS)
+    if (!(key in authority)) refuse(`sessionIngest.authority.${key} is required when authority mode is selected`);
+  if (authority.mode !== INBOX_AUTHORITY_MODE)
+    refuse(`sessionIngest.authority.mode must be exactly ${INBOX_AUTHORITY_MODE}`);
+  if (!validAuthorityKeyRoot(authority.keyRoot))
+    refuse(`sessionIngest.authority.keyRoot must be an isolated 96bulls/ root distinct from ${INBOX_CANDIDATE_KEY_ROOT}`);
+  for (const key of ["expectedGeneration", "expectedControlEpoch", "expectedAuthEpoch", "expectedSourceIdentitySha256"] as const)
+    if (typeof authority[key] !== "string" || !HEX64.test(authority[key] as string))
+      refuse(`sessionIngest.authority.${key} must be a 64-character lowercase hex digest`);
+  return authority as unknown as InboxAuthorityDeploymentInputs;
+}
+
+function inboxAuthorityVars(authority: unknown, refuse: (why: string) => never): Record<string, string> {
+  const selected = inboxAuthority(authority, refuse);
+  if (!selected) return {};
+  return {
+    INGEST_AUTHORITY_MODE: selected.mode,
+    INGEST_AUTHORITY_KEY_ROOT: selected.keyRoot,
+    INGEST_AUTHORITY_EXPECT_GENERATION: selected.expectedGeneration,
+    INGEST_AUTHORITY_EXPECT_CONTROL_EPOCH: selected.expectedControlEpoch,
+    INGEST_AUTHORITY_EXPECT_AUTH_EPOCH: selected.expectedAuthEpoch,
+    INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY: selected.expectedSourceIdentitySha256,
+  };
+}
 
 /** Same validator for source admission and direct declaration/render callers. */
 function bufferedGeneration(p: { acceptanceMode?: unknown; expectedGeneration?: unknown }, refuse: (why: string) => never): string | undefined {
@@ -136,6 +206,7 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
     refuse("sessionIngest.neonReplicaQueue must be relayhistory's Neon replica queue (relayhistory-neon-replica[-<suffix>])");
   if (v.replicaMode === "queue" && v.neonReplicaQueue === undefined) refuse('sessionIngest.replicaMode "queue" needs neonReplicaQueue');
   if (v.replicaMode !== "queue" && v.neonReplicaQueue !== undefined) refuse('sessionIngest.neonReplicaQueue is bound only with replicaMode "queue"');
+  inboxAuthority(v.authority, refuse);
 }
 
 /** A producer binding to a queue this stack does not own (no state row: never created, changed or deleted here). */
@@ -162,6 +233,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     INGEST_REPLICA_MODE: p.replicaMode ?? "off",
     ...(p.acceptanceMode === "buffered" ? { INGEST_ACCEPTANCE_MODE: "buffered", INGEST_EXPECT_GENERATION: expectedGeneration! } : {}),
     ...(p.custodySource ? { INGEST_CUSTODY_SOURCE: p.custodySource } : {}),
+    ...inboxAuthorityVars(p.authority, (why) => { throw new Error(why); }),
   };
 }
 
@@ -234,6 +306,20 @@ export function assertNoSecretLiterals(env: Record<string, unknown>, refuse: (wh
     if (typeof v === "object" && v !== null && "value" in v) refuse(`env ${k} carries a value`);
   }
   for (const k of ["S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "INGEST_SIGNING_KEY"]) if (!(k in env)) refuse(`env ${k} is missing (Secrets Store binding)`);
+  const authorityNames = Object.keys(env).filter((key) => key.startsWith("INGEST_AUTHORITY_"));
+  for (const key of authorityNames)
+    if (!(AUTHORITY_ENV_KEYS as readonly string[]).includes(key)) refuse(`env ${key} is not a known inbox authority binding`);
+  if (authorityNames.length > 0) {
+    for (const key of AUTHORITY_ENV_KEYS) if (!(key in env)) refuse(`env ${key} is missing from the selected inbox authority bindings`);
+    inboxAuthority({
+      mode: env.INGEST_AUTHORITY_MODE,
+      keyRoot: env.INGEST_AUTHORITY_KEY_ROOT,
+      expectedGeneration: env.INGEST_AUTHORITY_EXPECT_GENERATION,
+      expectedControlEpoch: env.INGEST_AUTHORITY_EXPECT_CONTROL_EPOCH,
+      expectedAuthEpoch: env.INGEST_AUTHORITY_EXPECT_AUTH_EPOCH,
+      expectedSourceIdentitySha256: env.INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY,
+    }, refuse);
+  }
 }
 
 export function fanoutConsumerSettings() {
