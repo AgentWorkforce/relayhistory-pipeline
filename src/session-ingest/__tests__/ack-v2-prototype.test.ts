@@ -208,11 +208,13 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
   const src=readFileSync(join(root,FIXTURE),"utf8");
   const v2=src.slice(src.indexOf("CREATE FUNCTION sessions.ingest_lazy_ack_batch_v2"),src.indexOf("END $v2$;")+9).replace("CREATE FUNCTION","CREATE OR REPLACE FUNCTION");
   const faults:[string,string,string][]=[
-   ["omit one accepted entry","FROM want w WHERE n.key_sha256=w.native_key RETURNING","FROM want w WHERE n.key_sha256=w.native_key AND w.idx<>(SELECT min(idx) FROM want) RETURNING"],
-   ["extra unrelated slot","FROM want w WHERE n.key_sha256=w.native_key RETURNING","FROM want w WHERE n.key_sha256=w.native_key OR (n.record_id='bystander' AND w.idx=(SELECT min(idx) FROM want)) RETURNING"],
+   ["omit one final winner","FROM want w WHERE n.key_sha256=w.native_key RETURNING","FROM want w WHERE n.key_sha256=w.native_key AND w.native_key<>(SELECT min(native_key) FROM want) RETURNING"],
+   ["extra unrelated slot","FROM want w WHERE n.key_sha256=w.native_key RETURNING","FROM want w WHERE n.key_sha256=w.native_key OR (n.record_id='bystander' AND w.native_key=(SELECT min(native_key) FROM want)) RETURNING"],
    ["wrong lineage","SET lineage=w.lineage,","SET lineage=w.lineage+1,"],
-   ["wrong seat","current_seat=w.seat,","current_seat=w.seat+(CASE WHEN w.idx=(SELECT max(idx) FROM want) THEN 1000 ELSE 0 END),"],
-   ["non-final accepted entry chosen","ORDER BY native_key,idx DESC","ORDER BY native_key,idx ASC"],
+   ["wrong seat","current_seat=w.seat,","current_seat=w.seat+(CASE WHEN w.native_key=(SELECT max(native_key) FROM want) THEN 1000 ELSE 0 END),"],
+   ["writer installs the earlier accepted entry (overlay keeps the first winner)",
+    "    prev[j]:=(r.key_material->>8)::bigint;pdig[j]:=r.candidate_digest;plin[j]:=v_lin;pseat[j]:=v_seat;pord[j]:=r.ord;",
+    "    IF prev[j] IS NULL THEN prev[j]:=(r.key_material->>8)::bigint;pdig[j]:=r.candidate_digest;plin[j]:=v_lin;pseat[j]:=v_seat;pord[j]:=r.ord;END IF;"],
   ];
   for(const [name,a,b] of faults){
    const f=await fixture(kind,"bridge-v2");try{

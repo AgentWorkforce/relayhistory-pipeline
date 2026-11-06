@@ -83,7 +83,7 @@ RETURNS TABLE(idx int,ord int,accepted boolean,allocated boolean,reused boolean,
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $dec$
 DECLARE v sessions.ingest_ack_vectors%ROWTYPE;a sessions.ingest_claim_attempts%ROWTYPE;t sessions.ingest_stage_intents%ROWTYPE;
  b bytea;pos int;len int;i int;f int;lin bigint;off bigint;sh int;x int;k int:=0;o_seat bigint;o_kind int;o_key text;o_claim uuid;o_ord int;fd text;
-j int;ords int[]:='{}';e record;a_f int[]:='{}';a_lin bigint[]:='{}';a_off bigint[]:='{}';a_os bigint[]:='{}';a_ok int[]:='{}';a_key text[]:='{}';a_oc uuid[]:='{}';a_oo int[]:='{}';a_fd text[]:='{}';
+ j int;ords int[]:='{}';e record;q_ord int[];q_key text[];q_km jsonb[];q_cd text[];q_re bigint[];q_fe bigint[];a_f int[]:='{}';a_lin bigint[]:='{}';a_off bigint[]:='{}';a_os bigint[]:='{}';a_ok int[]:='{}';a_key text[]:='{}';a_oc uuid[]:='{}';a_oo int[]:='{}';a_fd text[]:='{}';
 BEGIN
  SELECT * INTO v FROM sessions.ingest_ack_vectors WHERE claim_token=p_claim;
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: vector missing';END IF;
@@ -146,14 +146,17 @@ BEGIN
  IF k<>v.allocated_count THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: allocated count';END IF;
  -- exact ord set AND exact effective v1 visit order (source_processing_ranks of the immutable attempt): idx is the
  -- v1 processing order, so final_winners selected by idx are the v1 winners (§15)
- IF (SELECT array_agg(q.ord ORDER BY (a.source_processing_ranks->>q.ord)::int) FROM sessions.ingest_receipt_seat_records(p_claim,t.group_ordinals) q)
-  IS DISTINCT FROM ords THEN
+ SELECT array_agg(q.ord ORDER BY (a.source_processing_ranks->>q.ord)::int),array_agg(q.key_sha256 ORDER BY (a.source_processing_ranks->>q.ord)::int),
+  array_agg(q.key_material ORDER BY (a.source_processing_ranks->>q.ord)::int),array_agg(q.candidate_digest ORDER BY (a.source_processing_ranks->>q.ord)::int),
+  array_agg(q.reset_epoch ORDER BY (a.source_processing_ranks->>q.ord)::int),array_agg(q.fence_epoch ORDER BY (a.source_processing_ranks->>q.ord)::int)
+  INTO q_ord,q_key,q_km,q_cd,q_re,q_fe FROM sessions.ingest_receipt_seat_records(p_claim,t.group_ordinals) q;   -- the ONLY call (profiled hot spot)
+ IF q_ord IS DISTINCT FROM ords THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: entry order is not the processing order';END IF;
- FOR e IN SELECT d.*,q.key_sha256 ck,q.key_material km,q.candidate_digest cd,q.reset_epoch re,q.fence_epoch fe,
-   CASE WHEN d.o_claim=p_claim THEN encode(sha256(convert_to(jsonb_build_array('lazy-ack-seat-v1',q2.key_sha256,d.o_seat::text)::text,'UTF8')),'hex') END own_key
+ -- entry i and seat-record i are the same ord (order check above), so they align by position
+ FOR e IN SELECT d.*,q.ck,q.km,q.cd,q.re,q.fe,
+   CASE WHEN d.o_claim=p_claim THEN encode(sha256(convert_to(jsonb_build_array('lazy-ack-seat-v1',q_key[array_position(q_ord,d.o_ord)],d.o_seat::text)::text,'UTF8')),'hex') END own_key
   FROM unnest(ords,a_f,a_lin,a_off,a_os,a_ok,a_key,a_oc,a_oo,a_fd) WITH ORDINALITY d(ord,flags,lineage,off,o_seat,o_kind,o_key,o_claim,o_ord,fd,idx)
-  JOIN sessions.ingest_receipt_seat_records(p_claim,t.group_ordinals) q ON q.ord=d.ord
-  LEFT JOIN sessions.ingest_receipt_seat_records(p_claim,t.group_ordinals) q2 ON q2.ord=d.o_ord AND d.o_claim=p_claim ORDER BY d.idx LOOP
+  JOIN unnest(q_ord,q_key,q_km,q_cd,q_re,q_fe) WITH ORDINALITY q(ord,ck,km,cd,re,fe,qi) ON q.qi=d.idx AND q.ord=d.ord ORDER BY d.idx LOOP
   IF e.o_claim=p_claim AND e.own_key IS DISTINCT FROM e.o_key THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: in-claim reuse key mismatch';END IF;
   idx:=e.idx;ord:=e.ord;accepted:=(e.flags&1)=1;allocated:=(e.flags&2)=2;reused:=(e.flags&4)=4;lineage:=e.lineage;
   seat:=CASE WHEN allocated THEN v.seat_lo+(e.off-1) ELSE e.o_seat END;owner_kind:=e.o_kind;owner_claim:=e.o_claim;owner_ord:=e.o_ord;
@@ -292,6 +295,7 @@ DECLARE c sessions.ingest_receipt_seat_clock%ROWTYPE;a sessions.ingest_claim_att
  v_alloc int:=0;v_n int:=0;v_ent bytea:=''::bytea;v_flags int;v_vec bytea;
  v_want bigint;v_want_d bigint;v_upd bigint;v_upd_d bigint;v_mis bigint;v_kind int;v_okey text;v_oclaim uuid;v_oord int;
  pk text[]:='{}';prev bigint[]:='{}';pdig text[]:='{}';plin bigint[]:='{}';pseat bigint[]:='{}';pord int[]:='{}';pskey text[]:='{}';j int;
+ psrc text[]:='{}';psess text[]:='{}';pre bigint[]:='{}';pfe bigint[]:='{}';
 BEGIN
  PERFORM sessions.ingest_lazy_guard(p->>'org_id');
  PERFORM sessions.ingest_lock_fences(p->>'org_id',p->>'workspace_id',p->>'user_id');
@@ -358,6 +362,7 @@ BEGIN
     v_lin:=slot.lineage+1;
     IF j IS NULL THEN pk:=pk||v_key;j:=cardinality(pk);END IF;
     prev[j]:=(r.key_material->>8)::bigint;pdig[j]:=r.candidate_digest;plin[j]:=v_lin;pseat[j]:=v_seat;pord[j]:=r.ord;
+    psrc[j]:=r.key_material->>10;psess[j]:=r.key_material->>11;pre[j]:=r.reset_epoch;pfe[j]:=r.fence_epoch;
     pskey[j]:=encode(sha256(convert_to(jsonb_build_array('lazy-ack-seat-v1',r.key_sha256,v_seat::text)::text,'UTF8')),'hex');
    ELSE v_lin:=slot.lineage;END IF;
   END IF;
@@ -373,8 +378,10 @@ BEGIN
  VALUES(a.claim_token,t.stage_token,1,v_n,v_alloc,v_before,CASE WHEN v_alloc>0 THEN v_before+1 END,CASE WHEN v_alloc>0 THEN v_last END,
   sessions.ack_attempt_sha(a),sessions.ack_clock_sha(),v_vec,sha256(v_vec));
  -- one set-based slot UPDATE + exact coverage (§13.1 as amended by v9 §15): final_winners = last accepted entry per native key in vector idx order.
- WITH dec AS MATERIALIZED(SELECT * FROM sessions.ingest_ack_entries(a.claim_token)),
- want AS MATERIALIZED(SELECT DISTINCT ON(native_key) * FROM dec WHERE accepted AND allocated ORDER BY native_key,idx DESC),
+ -- writer-side final_winners come from the writer's own visit-order overlay (last accepted entry per native key);
+ -- the AFTER STATEMENT validator independently re-derives them from the stored vector bytes (two derivations).
+ WITH want AS MATERIALIZED(SELECT x.native_key,x.seat,x.lineage,x.revision,x.candidate_digest,x.source,x.session_id,x.reset_epoch,x.fence_epoch
+   FROM unnest(pk,pseat,plin,prev,pdig,psrc,psess,pre,pfe) x(native_key,seat,lineage,revision,candidate_digest,source,session_id,reset_epoch,fence_epoch)),
  upd AS(UPDATE sessions.ingest_lazy_native_slots n SET lineage=w.lineage,current_owner=a.user_id,current_seat=w.seat,current_seat_key=NULL,
    current_legacy_key=NULL,current_revision=w.revision,current_digest=w.candidate_digest,current_source=w.source,current_session=w.session_id,
    current_reset_epoch=w.reset_epoch,current_fence_epoch=w.fence_epoch
