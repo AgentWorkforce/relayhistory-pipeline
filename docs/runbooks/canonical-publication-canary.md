@@ -50,6 +50,60 @@ The proof script creates an isolated temporary binding table only inside its
 throwaway database. That table is not a migration or a proposed production
 fallback.
 
+### Guarded RPC proposal and existing 040600 guarantees
+
+The actual PostgreSQL suite now includes the test-only proposal
+`src/session-ingest/__tests__/fixtures/publication-canary-guard.sql`. It is not
+in a migration directory and must never be applied to a real database. The
+proposal exists to make the missing interface and its ACL/race behavior
+reviewable before the registry assigns a migration slot.
+
+The existing `ingest_publication_claim` already does substantial atomic work.
+As `bulls96_session_ingest`, it takes the user privacy-fence lock, then locks
+the durable batch receipt, stage intent and active outbox, takes a share lock on
+the exact user/origin frontier row, rechecks current admission/privacy/GC state,
+snapshots record maxima and heads, and creates the attempt and head leases in
+one transaction. Later heartbeat, prepare and publish calls compare that
+frontier snapshot and the original privacy/head/stage authority. Those checks
+must remain unchanged.
+
+It does not accept an expected operator, plan digest, inspected stage evidence
+or Frontier A plan/evidence hashes, and it cannot persist their binding before
+its first side effect. The managed role intentionally has no `SELECT` on the
+RLS metadata tables. Consequently, an owner preflight followed by ordinary
+claim is neither a valid production adapter nor an atomic plan-bound claim.
+
+The test-only proposal adds three elements:
+
+1. A narrow managed-role inspection RPC returns only bounded stage, outbox,
+   privacy, target and frontier metadata plus one digest. It never returns
+   transcript or record bodies and does not lease or mutate work.
+2. Frontier seeding persists the exact Frontier A capture, plan and evidence
+   hashes beside an exact copy of the 040600 row fields. Inspection is held if
+   the attestation and frontier row differ.
+3. A guarded claim preserves 040600's lock order, compares the complete
+   inspected object, inserts the exact owner/plan/stage/frontier binding, then
+   invokes ordinary claim in the same transaction. Any mismatch or nested
+   failure rolls everything back. Exact retries return the same unexpired
+   ticket; a different owner or plan conflicts. The fixture revokes direct
+   ordinary-claim execution from the managed role so the guard cannot be
+   bypassed.
+
+The negative proof uses the actual non-owner managed role. It verifies direct
+table reads and ordinary claims are denied, forged evidence creates no binding,
+attempt, head or canonical batch transition, and a concurrent frontier update
+waits behind the guarded transaction. Once the transaction commits, the update
+causes the existing heartbeat frontier-snapshot check to reject the lease.
+
+A production version still requires coordinated ownership of frontier seeding,
+final table/function names, exact complete-prefix ACL and boundary manifests,
+and a registry-assigned migration. It cannot be added to the existing W2 prefix
+or applied without a separately rehearsed window and explicit human approval.
+In particular, revoking ordinary claim from `bulls96_session_ingest` affects
+every current caller of that shared role. Production must either route all such
+callers through an equivalent guard or obtain a registry-reviewed narrower
+managed principal; application convention alone cannot enforce this boundary.
+
 The deployable entry also needs the shared runtime factory being coordinated in
 #271. Export the existing runtime construction as a narrow factory and have the
 canary entry use it unchanged. It must retain the existing managed secret,
@@ -158,6 +212,10 @@ Before any live canary, require all of the following as fresh evidence:
 - a separately approved History route selection with ClickHouse public events
   unchanged;
 - independent privacy/erasure review and an operator observing the run.
+
+In particular, source code and port-level proofs do not close the currently
+absent frontier capture, trusted frontier seed, guarded-RPC migration,
+deployment, IAM/KMS, independent eraser or selected History-reader gates.
 
 Any refusal, stale evidence, budget breach, incomplete outcome, unexpected
 cross-scope eligibility, generation drift, pointer race, privacy transition or
