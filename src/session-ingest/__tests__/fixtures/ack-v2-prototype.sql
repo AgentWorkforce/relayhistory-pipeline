@@ -685,7 +685,11 @@ UPDATE sessions.ingest_ack_format SET released_at=clock_timestamp();
 CREATE FUNCTION sessions.ingest_ack_drain_count() RETURNS bigint LANGUAGE sql STABLE AS $$
  SELECT count(*) FROM pg_stat_activity s, sessions.ingest_ack_format f
  WHERE f.singleton AND s.datname=current_database() AND s.pid<>pg_backend_pid() AND s.backend_type='client backend'
-  AND (s.state IS NULL OR (s.state<>'idle' AND s.xact_start IS NULL) OR s.xact_start<f.released_at) $$;
+  -- old = its transaction (or, in the instant before xact_start is published, its current statement) began before the
+  -- bridge release; a backend reporting no state is unresolvable unless it connected after the release (found by P1 at 643dc529)
+  AND ((s.state IS NULL AND s.backend_start<f.released_at)
+    OR (s.state IS NOT NULL AND s.state<>'idle' AND coalesce(s.xact_start,s.query_start) IS NULL)
+    OR coalesce(s.xact_start,s.query_start)<f.released_at AND s.state<>'idle') $$;
 
 CREATE FUNCTION sessions.ingest_ack_format_set(p_mode text) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $set$
