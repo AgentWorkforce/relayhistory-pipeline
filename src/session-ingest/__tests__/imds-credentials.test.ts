@@ -1,6 +1,6 @@
 import{test,expect}from'bun:test';
 import{imdsCredentials,type ImdsIdentity}from'../../shared/imds-credentials.ts';
-const identity:ImdsIdentity={instanceId:'i-070f91abb67aa60de',accountId:'941433935742',region:'us-east-1',instanceProfileArn:'arn:aws:iam::941433935742:instance-profile/owned-fixture-profile',roleName:'owned-fixture-role'};
+const identity:ImdsIdentity={instanceId:'i-0123456789abcdef0',accountId:'111122223333',region:'us-east-1',instanceProfileArn:'arn:aws:iam::111122223333:instance-profile/owned-fixture-profile',roleName:'owned-fixture-role'};
 function fixture(change?:(path:string,value:any)=>any){let now=1762243200000;const calls:{path:string;init:RequestInit}[]=[];
  const fetcher=(async(input:any,init:RequestInit)=>{const u=new URL(String(input));expect(u.origin).toBe('http://169.254.169.254');expect(init.redirect).toBe('error');expect(init.signal).toBeDefined();calls.push({path:u.pathname,init});
   if(u.pathname==='/latest/api/token'){expect(init.method).toBe('PUT');expect((init.headers as any)['X-aws-ec2-metadata-token-ttl-seconds']).toBe('300');return new Response('owned-token');}

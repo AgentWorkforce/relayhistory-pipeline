@@ -320,3 +320,28 @@ describe("external-dns image", () => {
     expect(ingress).toContain("image: externalDnsImageValues(),");
   });
 });
+
+// Exercise the emitted operator-block statement against requests, including encodings.
+it("only an explicitly enabled exact POST Amp endpoint bypasses the operator block", () => {
+  function matches(statement: any, method: string, path: string): boolean {
+    if (statement.AndStatement) return statement.AndStatement.Statements.every((part: any) => matches(part, method, path));
+    if (statement.NotStatement) return !matches(statement.NotStatement.Statement, method, path);
+    const byte = statement.ByteMatchStatement;
+    let value = byte.FieldToMatch.Method ? method : path;
+    for (const t of byte.TextTransformations) {
+      if (t.Type === "URL_DECODE") value = decodeURIComponent(value);
+      if (t.Type === "LOWERCASE") value = value.toLowerCase();
+    }
+    return byte.PositionalConstraint === "EXACTLY" ? value === byte.SearchString : value.startsWith(byte.SearchString);
+  }
+  const block = (enabled = false) => ingestWafRules(2000, enabled).find((rule) => rule.Name === "block-operator-routes")!.Statement;
+  expect(matches(block(), "POST", "/v1/internal/amp/operation")).toBe(true);
+  expect(matches(block(true), "POST", "/v1/internal/amp/operation")).toBe(false);
+  for (const [method, path] of [
+    ["GET", "/v1/internal/amp/operation"], ["POST", "/v1/internal/replay"], ["POST", "/v1/internal/amp/operation/extra"],
+    ["POST", "/v1/internal/AMP/operation"], ["POST", "/v1/%69nternal/amp/operation"],
+  ]) expect(matches(block(true), method!, path!)).toBe(true);
+  expect(ingestWafRules(2000, true).slice(0, 4)).toEqual(ingestWafRules(2000).slice(0, 4));
+  expect(ingressExposure({ ampTransportEnabled: true })).toMatchObject({ ampTransportEnabled: true });
+  expect(() => ingressExposure({ ampTransportEnabled: "true" as never })).toThrow(/boolean/);
+});

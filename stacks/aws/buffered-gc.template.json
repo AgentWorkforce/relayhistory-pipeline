@@ -31,6 +31,16 @@
       "Type": "String",
       "AllowedPattern": "[a-f0-9]{64}"
     },
+    "AwsAccountId": {
+      "Type": "String",
+      "AllowedPattern": "[0-9]{12}",
+      "Description": "Required, no default: the account the job must run in. Passed as INGEST_GC_AWS_ACCOUNT_ID; the job refuses KMS/secret ARNs outside it."
+    },
+    "SupabaseProjectRef": {
+      "Type": "String",
+      "AllowedPattern": "[a-z0-9]{20}",
+      "Description": "Required, no default: the Supabase project ref. Passed as INGEST_GC_SUPABASE_PROJECT_REF; the job accepts only the bulls96_session_ingest.<ref> login."
+    },
     "CodeBucket": {
       "Type": "String",
       "MinLength": 3
@@ -276,6 +286,12 @@
             },
             "INGEST_GC_EXPECT_GENERATION": {
               "Ref": "ExpectedGeneration"
+            },
+            "INGEST_GC_AWS_ACCOUNT_ID": {
+              "Ref": "AwsAccountId"
+            },
+            "INGEST_GC_SUPABASE_PROJECT_REF": {
+              "Ref": "SupabaseProjectRef"
             },
             "INGEST_GC_BATCH_LIMIT": "5",
             "INGEST_GC_BUDGET_MS": "45000"

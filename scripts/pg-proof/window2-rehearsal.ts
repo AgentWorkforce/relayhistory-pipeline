@@ -63,7 +63,7 @@ if (v.me !== "proof_admin" || v.v < 170000 || v.v >= 180000) throw Error("owned_
 const readB = (p: string) => readFile(base + "/" + p, "utf8");
 await admin.query("DROP SCHEMA IF EXISTS hoopdb_boundary CASCADE;DROP SCHEMA IF EXISTS sessions CASCADE;DROP SCHEMA IF EXISTS history CASCADE;GRANT CREATE ON DATABASE postgres TO postgres;ALTER ROLE postgres SUPERUSER;SET ROLE postgres;CREATE SCHEMA sessions;GRANT CREATE ON SCHEMA public TO postgres;REVOKE TEMPORARY ON DATABASE postgres FROM PUBLIC;ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;");
 await admin.query(await readB("supabase/tests/supabase_shim.sql"));
-for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await admin.query(await readB(`supabase/bootstrap/${f}.sql`));
+for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles"]) await admin.query(await readB(`supabase/bootstrap/${f}.sql`));
 await admin.query("DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_runtime') THEN CREATE ROLE bulls96_runtime LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION; END IF; END $$");
 await admin.query("CREATE EXTENSION IF NOT EXISTS vector;CREATE EXTENSION IF NOT EXISTS pg_trgm;CREATE EXTENSION IF NOT EXISTS btree_gin;");
 await admin.query((await readB("supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql")).split("\n").filter((l) => !l.startsWith("\\")).join("\n").replaceAll(":'runtime_role'", "'bulls96_runtime'"));

@@ -478,6 +478,8 @@ for (const r of [
   "ops_admin",
   "g6_cloud_owner",
   "g6_cloud_rt",
+  "bulls96_read_api",
+  "bulls96_canonical_feature_producer",
   "cloudsqladmin",
   "cloudsqlsuperuser",
   "bulls96_cloudsql_role_seed",
@@ -551,14 +553,19 @@ await check(
       ["-f", CLOUDSQL_ROLES_BOOT],
       "g6_cloud_owner",
     );
+    await sql("g6_cloud", "ALTER ROLE bulls96_read_api INHERIT");
+    const hostileReadApi = psql("g6_cloud", ["-v", "VERBOSITY=verbose", "-f", CLOUDSQL_ROLES_BOOT], "g6_cloud_owner");
+    const hostileReadApiPreserved = (await sql("g6_cloud", "SELECT rolinherit FROM pg_roles WHERE rolname='bulls96_read_api'")).rows[0]?.rolinherit === true;
+    await sql("g6_cloud", "ALTER ROLE bulls96_read_api NOINHERIT");
     const targets = (
       await sql(
         "g6_cloud",
-        `SELECT role.rolname, role.rolbypassrls,
+        `SELECT role.rolname, role.rolbypassrls, role.rolcanlogin, role.rolinherit,
+                role.rolsuper, role.rolcreaterole, role.rolcreatedb, role.rolreplication,
                 (SELECT count(*)::int FROM pg_auth_members membership
                   WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
            FROM pg_roles role
-          WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker')
+          WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api')
           ORDER BY 1`,
       )
     ).rows;
@@ -573,12 +580,14 @@ await check(
       boot.ok &&
       phase1.ok &&
       again.ok &&
+      !hostileReadApi.ok && hostileReadApi.out.includes("55000") && hostileReadApiPreserved &&
       m.exit === 0 &&
       v.ok &&
       seed === 0 &&
-      targets.length === 4 &&
+      targets.length === 9 &&
       targets.every(
-        (role) => role.memberships === 0 && role.rolbypassrls === false,
+        (role) => role.memberships === 0 &&
+          ['rolbypassrls', 'rolcanlogin', 'rolinherit', 'rolsuper', 'rolcreaterole', 'rolcreatedb', 'rolreplication'].every((attr) => role[attr] === false),
       );
     const err = (...runs: { ok?: boolean; out?: string }[]) => {
       for (const r of runs)
@@ -590,7 +599,7 @@ await check(
     };
     return [
       ok,
-      `bootstrap=${boot.ok} phase1=${phase1.ok} rerun=${again.ok} migrate=${fmt(m)} verdict=${fmt(v)} seed=${seed} targets=${fmt(targets)}${err(boot, phase1, again)}`,
+      `bootstrap=${boot.ok} phase1=${phase1.ok} rerun=${again.ok} hostileReadApiRefused=${!hostileReadApi.ok} hostileReadApiPreserved=${hostileReadApiPreserved} migrate=${fmt(m)} verdict=${fmt(v)} seed=${seed} targets=${fmt(targets)}${err(boot, phase1, again)}`,
     ];
   },
 );
@@ -601,6 +610,8 @@ if (MAJOR >= 17) {
     "service_role",
     "authenticated",
     "anon",
+    "bulls96_read_api",
+    "bulls96_canonical_feature_producer",
     "g6_cloud_rt",
     "g6_cloud_owner",
     "cloudsqladmin",

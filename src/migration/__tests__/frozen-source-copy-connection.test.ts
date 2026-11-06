@@ -3,10 +3,12 @@ import {spawnSync} from "node:child_process";
 import {fileURLToPath} from "node:url";
 const script=fileURLToPath(new URL("../../../scripts/frozen-source-copy.ts",import.meta.url));
 const preload=fileURLToPath(new URL("./fixtures/frozen-copy-preload.ts",import.meta.url));
-function run(fail?:string, undefinedFailure=false, connectFailure?:string) {
+// Synthetic Supabase ref; it matches the preload's fake CLI login host.
+const REF="abcdefghijklmnopqrst";
+function run(fail?:string, undefinedFailure=false, connectFailure?:string, ref:string|null=REF) {
  const result=spawnSync(process.execPath,["--preload",preload,script,"--copy","--concurrency","2"],{
   input:JSON.stringify({neonOwnerUrl:"postgresql://neondb_owner:synthetic-not-authorized@ep-floral-pond-apkvat38.synthetic.invalid/neondb"})+"\n",
-  encoding:"utf8",timeout:10000,env:{PATH:process.env.PATH,SUPABASE_CLI:"/synthetic-supabase-refuse-network",...(fail?{FROZEN_COPY_TEST_FAIL:fail}:{}),...(undefinedFailure?{FROZEN_COPY_TEST_UNDEFINED:"1"}:{}),...(connectFailure?{FROZEN_COPY_TEST_CONNECT:connectFailure}:{})},
+  encoding:"utf8",timeout:10000,env:{PATH:process.env.PATH,SUPABASE_CLI:"/synthetic-supabase-refuse-network",...(ref===null?{}:{SUPABASE_PROJECT_REF:ref}),...(fail?{FROZEN_COPY_TEST_FAIL:fail}:{}),...(undefinedFailure?{FROZEN_COPY_TEST_UNDEFINED:"1"}:{}),...(connectFailure?{FROZEN_COPY_TEST_CONNECT:connectFailure}:{})},
  });
  const proof=result.stdout.split("\n").filter(x=>x.startsWith("{")).map(x=>JSON.parse(x)).find(x=>x.syntheticCopyProof)?.syntheticCopyProof;
  return {result,proof};
@@ -49,4 +51,17 @@ for (const side of ["source","target"]) test(`a failed ${side} connection closes
  expect(proof.targetClosed).toBe(1);
  expect(proof.closedWhileWorkersActive).toBe(false);
  expect(proof.allNeoClosed).toBe(true);
+});
+
+test("the Supabase project ref is required configuration: unset or mismatched refuses before any login is used",()=>{
+ const unset=run(undefined,false,undefined,null);
+ expect(unset.result.status).toBe(1);
+ expect(unset.result.stdout).toContain("supabase_project_ref_required");
+ expect(unset.proof.logins).toBe(0);
+ expect(unset.proof.records).toEqual([]);
+ const other=run(undefined,false,undefined,"zyxwvutsrqponmlkjihg");
+ expect(other.result.status).toBe(1);
+ expect(other.result.stdout).toContain("cli_target_pin");
+ expect(other.proof.records).toEqual([]);
+ expect(other.result.stdout).not.toContain("synthetic-cli-password");
 });

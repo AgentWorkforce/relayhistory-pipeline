@@ -1702,13 +1702,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         "utf8",
       )}`,
     );
-    // As the superuser (cluster roles), then back to the role the test continues as.
-    await db.exec(
-      `RESET ROLE; ${readFileSync(
-        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
-        "utf8",
-      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8")}; SET ROLE migration_owner;`,
-    );
+    // No superuser role bootstrap may fill a missing Cloud SQL prerequisite here.
     const targets = await db.query<{
       rolname: string;
       rolcanlogin: boolean;
@@ -1720,10 +1714,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(4);
+    expect(targets.rows).toHaveLength(9);
+    expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
+    const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
+    const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);
+    expect(targets.rows.map(r => r.rolname).sort()).toEqual([...prerequisites].sort());
     expect(targets.rows).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -1736,6 +1734,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
           rolinherit: false,
           memberships: 0,
         }),
+        expect.objectContaining({
+          rolname: "bulls96_read_api",
+          rolcanlogin: false,
+          rolinherit: false,
+          rolbypassrls: false,
+          memberships: 0,
+        }),
       ]),
     );
     expect(
@@ -1743,6 +1748,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         `SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_cloudsql_role_seed'`,
       ),
     ).toMatchObject({ rows: [] });
+    // The added prerequisite shares the existing fail-closed, never-repair contract.
+    await db.exec("RESET ROLE; ALTER ROLE bulls96_read_api INHERIT; SET ROLE migration_owner");
+    expect((await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"), "utf8"))))?.code).toBe("55000");
+    expect((await db.query<{ rolinherit: boolean }>("SELECT rolinherit FROM pg_roles WHERE rolname='bulls96_read_api'")).rows[0]?.rolinherit).toBe(true);
   });
 
   test("platform trust root: supabase_admin as a superuser with no safe default is excluded in supabase mode (listed with its attributes); the same catalog fails without the exclusion (selfhosted)", async () => {

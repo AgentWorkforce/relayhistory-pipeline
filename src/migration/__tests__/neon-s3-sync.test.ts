@@ -1170,7 +1170,7 @@ describe("SSE-KMS key id (sessions-prod bucket policy)", () => {
   test("every put names aws:kms and the key ARN, signed", async () => {
     const { createS3Store } = await import("../../shared/vendor.ts");
     const seen: Headers[] = [];
-    const key = "arn:aws:kms:us-east-1:941433935742:key/c74376a5-f6ff-4ef0-9a26-543c940094ba";
+    const key = "arn:aws:kms:us-east-1:111122223333:key/11111111-2222-4333-8444-555555555555";
     const store = createS3Store({
       bucket: "b",
       region: "us-east-1",

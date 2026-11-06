@@ -89,6 +89,8 @@ jobs:
       - name: Guard - nothing secret-like committed
         run: |
           ! git ls-files | grep -E '(^|/)(\.env|inputs\.json|.*\.pem)$' || (echo "secret-like file tracked"; exit 1)
+      - name: Guard - no production deployment identifiers in engine source (src, packages, scripts)
+        run: bun scripts/check-engine-identifiers.ts
   # Keep every mutation, but give the long unit suite and mutation suite their
   # own budgets. Running both serially exceeded the old 40-minute limit.
   aws-hardening-mutations:
@@ -137,6 +139,19 @@ jobs:
         run: bun scripts/aws-hardening-mutations.ts
       - name: Verify mutations restored their source files
         run: git diff --exit-code
+  # Build only: no registry login, publish, deploy, or provider credentials.
+  amp-transport-image:
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Build the pinned CLI into the service image
+        run: docker build --file docker/services.Dockerfile --tag amp-transport-ci .
+      - name: Verify process isolation in the Linux image without network access
+        run: docker run --rm --network none --entrypoint bun amp-transport-ci test src/amp
   # The session read Worker (packages/session-read-worker), in workerd.
   session-read-worker:
     uses: ./.github/workflows/session-read-worker-checks.yml

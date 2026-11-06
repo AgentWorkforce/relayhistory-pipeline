@@ -36,6 +36,7 @@ const ROLE = `arn:aws:iam::${ACCOUNT}:role/session-pipeline-role`;
 const t = transcriptNames(STAGE, ACCOUNT);
 const p = sessionPipelineNames(STAGE, ACCOUNT, REGION);
 const example = JSON.parse(readFileSync(fileURLToPath(new URL("../examples/aws-sessions-prod.inputs.example.json", import.meta.url)), "utf8")) as AwsInputs;
+example.transcriptStore!.bufferedGcRoleArn = `arn:aws:iam::${ACCOUNT}:role/test-buffered-gc`;
 
 describe("session pipeline: grants", () => {
   it("the role may only decrypt via S3, for objects under 96bulls/ in this bucket", () => {

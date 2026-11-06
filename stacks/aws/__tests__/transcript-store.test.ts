@@ -559,6 +559,7 @@ describe("transcript store: inputs", () => {
   const filled = (patch: (i: AwsInputs & Record<string, unknown>) => void = () => {}) => {
     const i = structuredClone(example) as AwsInputs & Record<string, unknown>;
     delete i.$comment;
+    i.transcriptStore!.bufferedGcRoleArn = `arn:aws:iam::${ACCOUNT}:role/test-buffered-gc`;
     i.approval = { ...i.approval!, decision: "approved", date: "2026-10-31", quote: "let's start the production s3 work now", capture: { provenanceSha256: "a".repeat(64), planSha256: "b".repeat(64), inputsSha256: "c".repeat(64), sourceCommit: "d".repeat(40) } };
     patch(i);
     return i;

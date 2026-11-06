@@ -2,10 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { CanonicalConsumer, validateConfig } from "../canonical-consumer.ts";
 
 const A = "a".repeat(64);
-const CANARY = { orgId: "c4fae7b9-43a9-44e8-94d5-455aa579d67b",
-  workspaceId: "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63" };
+const CANARY = { orgId: "10000000-0000-4000-8000-000000000001",
+  workspaceId: "20000000-0000-4000-8000-000000000002" };
 const OTHER = { orgId: "other-org", workspaceId: "other-ws" };
-const CFG = { enabled: true, targetId: "t", ownerId: "me", leaseTtlMs: 60000,
+const CFG = { enabled: true, scope: CANARY, partitionScheme: "legacy-prefix-v1" as const, targetId: "t", ownerId: "me", leaseTtlMs: 60000,
   maxRetries: 2, pageSize: 100 };
 const fakeDb = () => {
   const lease: Record<string, unknown>[] = [];
@@ -191,4 +191,101 @@ describe("canonical consumer — poison map + renewal", () => {
     await c.deadLetter(entry("1"), "row_invalid");
     expect(db.lease.length + db.dead.length).toBe(0);
   });
+});
+
+
+describe("canonical consumer — explicit tenant and partition continuity", () => {
+  test("enabled configuration refuses missing/wildcard tenants and scheme before access", () => {
+    let queries = 0;
+    const db = { query: async () => { queries++; return { rows: [] }; } };
+    for (const cfg of [
+      { ...CFG, scope: undefined },
+      { ...CFG, scope: { ...CANARY, orgId: "*" } },
+      { ...CFG, scope: { ...CANARY, workspaceId: "" } },
+      { ...CFG, scope: { ...CANARY, workspaceId: " ws " } },
+      { ...CFG, partitionScheme: undefined },
+    ]) expect(() => new CanonicalConsumer(db, journal([]) as never, acks, cfg))
+      .toThrow("config_bad_");
+    expect(queries).toBe(0);
+  });
+  test("disabled without scope/scheme stays zero-access across every public operation", async () => {
+    let touched = 0;
+    const db = { query: async () => { touched++; return { rows: [] }; } };
+    const c = new CanonicalConsumer(db, { entries: async () => {
+      touched++; throw new Error("unexpected_journal");
+    } } as never, acks, { ...CFG, enabled: false,
+      scope: undefined, partitionScheme: undefined });
+    expect(await c.acquireLease()).toBe(false);
+    expect(await c.heartbeat()).toBe(false);
+    await c.deadLetter(entry("1"), "row_invalid");
+    expect((await c.drain(images as never, ch as never)).status).toBe("idle");
+    expect(touched).toBe(0);
+  });
+  test("legacy scheme resumes the exact existing partition checkpoint", async () => {
+    const db = fakeDb();
+    const partition = "10000000-20000000-e3b98a4da31a127d4bde6e43033f66ba";
+    db.ckpt.push({ partition, rev: "42" });
+    const c = new CanonicalConsumer(db, journal([]) as never, acks, CFG);
+    const out = await c.drain(images as never, ch as never);
+    expect(out.checkpoint).toBe("42");
+    expect(db.ckpt).toEqual([{ partition, rev: "42" }]);
+    expect(db.lease[0]!.partition).toBe(partition);
+    await c.deadLetter(entry("43"), "row_invalid");
+    expect(db.dead[0]!.partition).toBe(partition);
+  });
+  test("full-scope scheme separates tenants even with identical UUID prefixes", async () => {
+    const db = fakeDb();
+    for (const scope of [CANARY,
+      { ...CANARY, workspaceId: "20000000-0000-4000-8000-000000000003" },
+      { ...CANARY, orgId: "10000000-0000-4000-8000-000000000003" }]) {
+      const c = new CanonicalConsumer(db, journal([]) as never, acks,
+        { ...CFG, partitionScheme: "scope-v1", scope });
+      expect(await c.acquireLease()).toBe(true);
+    }
+    expect(db.lease).toHaveLength(3);
+    expect(new Set(db.lease.map((row) => row.partition)).size).toBe(3);
+    for (const row of db.lease)
+      expect(row.partition).toMatch(/^[a-z0-9-]{4,64}$/);
+  });
+  test("organization and workspace each enforce a zero-image scope fence", async () => {
+    for (const scope of [{ ...CANARY, orgId: "other-org" },
+      { ...CANARY, workspaceId: "other-workspace" }]) {
+      let imageReads = 0, inserts = 0;
+      const c = new CanonicalConsumer(fakeDb(), journal([entry("1", scope)]) as never,
+        acks, { ...CFG, partitionScheme: "scope-v1" });
+      const out = await c.drain({ imageDescriptor: async () => {
+        imageReads++; throw new Error("unexpected_image");
+      } } as never, { database: "d", insert: async () => { inserts++; } });
+      expect(out.skipped).toBe(1);
+      expect(imageReads).toBe(0);
+      expect(inserts).toBe(0);
+    }
+  });
+  test("caller mutation cannot change a constructed consumer's tenant/target", async () => {
+    const db = fakeDb();
+    const cfg = { ...CFG, scope: { ...CANARY } };
+    const c = new CanonicalConsumer(db, journal([]) as never, acks, cfg);
+    cfg.scope.orgId = "other-org";
+    cfg.targetId = "other-target";
+    expect(c.cfg.scope).toEqual(CANARY);
+    expect(c.cfg.targetId).toBe("t");
+    await c.acquireLease();
+    expect(db.lease[0]!.partition)
+      .toBe("10000000-20000000-e3b98a4da31a127d4bde6e43033f66ba");
+  });
+});
+
+
+test("full-scope partitions bind target and exclude a competing owner", async () => {
+  const db = fakeDb();
+  const a = new CanonicalConsumer(db, journal([]) as never, acks,
+    { ...CFG, partitionScheme: "scope-v1" });
+  const same = new CanonicalConsumer(db, journal([]) as never, acks,
+    { ...CFG, partitionScheme: "scope-v1", ownerId: "competing-owner" });
+  const other = new CanonicalConsumer(db, journal([]) as never, acks,
+    { ...CFG, partitionScheme: "scope-v1", targetId: "other-target" });
+  expect(await a.acquireLease()).toBe(true);
+  expect(await same.acquireLease()).toBe(false);
+  expect(await other.acquireLease()).toBe(true);
+  expect(db.lease).toHaveLength(2);
 });
