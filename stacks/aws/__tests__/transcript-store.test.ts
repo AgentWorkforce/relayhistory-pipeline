@@ -9,7 +9,13 @@ import { NON_DESTROYABLE } from "../deploy-guard.ts";
 import { isProductionLike, trailKeyPolicy } from "../hardening.ts";
 import { validateAwsInputs, type AwsInputs } from "../inputs.ts";
 import { TENANT_KEY_BASE } from "../tenants.ts";
-import { SESSION_PIPELINE_RESOURCES } from "../session-pipeline.ts";
+import { SESSION_READ_API_RESOURCES } from "../session-read-api.ts";
+import {
+  SESSION_ANALYSIS_CACHE_RESOURCES,
+  SESSION_BRIEF_RESOURCES,
+  SESSION_PIPELINE_RESOURCES,
+  SESSION_SEMANTIC_COPY_RESOURCES,
+} from "../session-pipeline.ts";
 import {
   ABORT_INCOMPLETE_UPLOAD_DAYS,
   ERASURE_SLA_HOURS,
@@ -610,6 +616,30 @@ describe("transcript store: deploy plan contract", () => {
     }, undefined, SESSION_PIPELINE_RESOURCES);
     const mixedFull = withNativeInboxPolicyDiff(mixed);
     expect(() => check(mixed, mixedFull, provenance(mixed, mixedFull))).toThrow(/session pipeline rollout, update or post-apply phase/);
+  });
+
+  it("reaches the srv-writer inbox phase when deployed read-api and schedule resources are also noop", () => {
+    const deployedContext = [
+      ...SESSION_PIPELINE_RESOURCES,
+      ...SESSION_READ_API_RESOURCES,
+      ...SESSION_BRIEF_RESOURCES,
+      ...SESSION_ANALYSIS_CACHE_RESOURCES,
+      ...SESSION_SEMANTIC_COPY_RESOURCES,
+    ];
+    const compact = plan({ "transcript-srv-writer": "update" }, undefined, deployedContext);
+    const full = withNativeInboxPolicyDiff(compact);
+    expect(check(compact, full, provenance(compact, full))).toBe("srv-writer inbox policy update");
+
+    for (const changedResource of [
+      SESSION_READ_API_RESOURCES[0],
+      SESSION_BRIEF_RESOURCES[0],
+      SESSION_ANALYSIS_CACHE_RESOURCES[0],
+      SESSION_SEMANTIC_COPY_RESOURCES[0],
+    ]) {
+      const mixed = plan({ "transcript-srv-writer": "update", [changedResource]: "update" }, undefined, deployedContext);
+      const mixedFull = withNativeInboxPolicyDiff(mixed);
+      expect(() => check(mixed, mixedFull, provenance(mixed, mixedFull))).toThrow(/session read api|session brief|session analysis cache|semantic copy/);
+    }
   });
 
   // Alchemy persisted the failed update: the plan shows no property change, the state holds the pending props.
