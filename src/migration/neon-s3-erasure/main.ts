@@ -1,21 +1,32 @@
 /**
  * `neon-s3-erasure` CLI: the transcript bucket's only deleter.
  *
- *   bun run migration:neon-s3-erasure [--execute] [--once]
+ *   <credentials JSON> | bun run migration:neon-s3-erasure [--execute] [--once]
  *
- * Holds only the eraser key (`S3X_ERASER_CREDS_FILE`, 1Password item
- * "sessions-prod transcript eraser"); refuses a writer key. Without
- * `--execute` it sweeps and reports what it would erase, deleting nothing.
- * Shares the exporter's watermark (`S3X_STATE`) on the same host.
+ * Credentials come ONLY through stdin, held in RAM (zero-Neon checklist E3; AGENTS.md: nothing credential-like
+ * on disk). One JSON object:
+ *   {"databaseUrl": "<read-only-capable URL of the privacy authority>",
+ *    "eraser": {"accessKeyId": "...", "secretAccessKey": "...", "sessionToken": "..."}}   // eraser: --execute only
+ * from 1Password items "sessions-prod transcript eraser" and the authority's database login. The former
+ * NEON_URL_FILE / NEON_URL / S3X_ERASER_CREDS_FILE (and any AWS_* credential variable) now refuse to start.
+ * A terminal or a regular file on stdin refuses too.
  *
- *   NEON_URL_FILE, S3X_STATE, S3X_BUCKET, S3X_EXPECT_BUCKET, S3X_REGION, S3X_ENDPOINT, S3X_KEY_ROOT,
- *   S3X_ERASER_RECOGNIZES_LEGACY ("true" keeps legacy-only groups; default false)
+ * Without `--execute` it sweeps and reports what it would erase, deleting nothing. Shares the exporter's
+ * watermark (`S3X_STATE`) on the same host.
+ *
+ *   S3X_PRIVACY_AUTHORITY  "neon" (default): databaseUrl is a direct Neon URL; reads deleted_upload_sessions.
+ *                          "supabase" (C3): databaseUrl is a Supabase session/direct URL; reads
+ *                          ingest_frozen_source_deletions, and erases nothing unless the Supabase privacy
+ *                          authority is active. Neon is not connected at all.
+ *   S3X_STATE, S3X_BUCKET, S3X_EXPECT_BUCKET, S3X_REGION, S3X_ENDPOINT, S3X_KEY_ROOT,
+ *   S3X_ERASER_RECOGNIZES_LEGACY ("true" keeps legacy-only groups; default false; neon only)
  */
-import { readFileSync } from "node:fs";
 import type { Queryable } from "../relayhistory-export.ts";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode } from "../neon-s3-sync/sync.ts";
+import { postgresUrl, readStdinCredentials, refuseCredentialEnv, s3Credentials, type S3Credentials } from "../stdin-credentials.ts";
+import { neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
 import { createS3Eraser, type Eraser } from "./eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "./job.ts";
 
@@ -25,8 +36,7 @@ function log(fields: Record<string, unknown>) {
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), service: "neon-s3-erasure", ...fields })}\n`);
 }
 
-function eraserFromEnv(execute: boolean): Eraser {
-  if (env("S3X_CREDS_FILE") || env("AWS_ACCESS_KEY_ID")) throw new Error("the erasure job must not be given the writer key");
+export function eraserFor(execute: boolean, creds: S3Credentials | undefined, e: (k: string, d?: string) => string | undefined = env): Eraser {
   if (!execute)
     return {
       eraseObject: async () => 0,
@@ -35,31 +45,41 @@ function eraserFromEnv(execute: boolean): Eraser {
       eraseObjectBefore: async () => ({ deleted: 0, kept: 0 }),
       listKeys: async () => [],
     };
-  const bucket = env("S3X_BUCKET");
-  if (!bucket || env("S3X_EXPECT_BUCKET") !== bucket) throw new Error("S3X_BUCKET must equal S3X_EXPECT_BUCKET (write guard)");
-  const file = env("S3X_ERASER_CREDS_FILE");
-  if (!file) throw new Error("S3X_ERASER_CREDS_FILE is required with --execute");
-  const c = JSON.parse(readFileSync(file, "utf8")) as Record<string, string>;
-  if (!c.accessKeyId || !c.secretAccessKey) throw new Error("the eraser credentials file lacks accessKeyId/secretAccessKey");
-  const endpoint = env("S3X_ENDPOINT");
-  return createS3Eraser({
-    bucket,
-    region: env("S3X_REGION", "us-east-1")!,
-    ...(endpoint ? { endpoint } : {}),
-    credentials: { accessKeyId: c.accessKeyId, secretAccessKey: c.secretAccessKey, ...(c.sessionToken ? { sessionToken: c.sessionToken } : {}) },
-  });
+  const bucket = e("S3X_BUCKET");
+  if (!bucket || e("S3X_EXPECT_BUCKET") !== bucket) throw new Error("S3X_BUCKET must equal S3X_EXPECT_BUCKET (write guard)");
+  if (!creds) throw new Error("stdin eraser credentials are required with --execute");
+  const endpoint = e("S3X_ENDPOINT");
+  return createS3Eraser({ bucket, region: e("S3X_REGION", "us-east-1")!, ...(endpoint ? { endpoint } : {}), credentials: creds });
+}
+
+export function authorityKind(raw: string | undefined): ErasureAuthorityKind {
+  const v = raw?.trim() || "neon";
+  if (v !== "neon" && v !== "supabase") throw new Error("S3X_PRIVACY_AUTHORITY must be neon or supabase");
+  return v;
+}
+
+/** The authority database URL, refused when it cannot hold this job's session-level read-only settings. */
+export function authorityUrl(kind: ErasureAuthorityKind, raw: unknown): string {
+  const url = postgresUrl(raw, "databaseUrl");
+  const u = new URL(url);
+  if (kind === "neon" && /-pooler\./.test(u.hostname)) throw new Error("use a direct (unpooled) Neon URL");
+  // Supabase's transaction pooler (6543) does not keep session settings such as default_transaction_read_only.
+  if (kind === "supabase" && u.port === "6543") throw new Error("use a Supabase direct or session-pooler URL, not the transaction pooler");
+  return url;
 }
 
 export async function main() {
   const execute = flag("execute");
-  const urlFile = env("NEON_URL_FILE");
-  const url = urlFile ? readFileSync(urlFile, "utf8").trim() : env("NEON_URL");
-  if (!url) throw new Error("NEON_URL_FILE (or NEON_URL) is required");
-  if (/-pooler\./.test(new URL(url).hostname)) throw new Error("use a direct (unpooled) Neon URL");
-  const eraser = eraserFromEnv(execute);
+  refuseCredentialEnv();
+  const kind = authorityKind(env("S3X_PRIVACY_AUTHORITY"));
+  const creds = readStdinCredentials(execute ? ["databaseUrl", "eraser"] : ["databaseUrl"], ["databaseUrl", "eraser"]);
+  const url = authorityUrl(kind, creds.databaseUrl);
+  const eraser = eraserFor(execute, creds.eraser === undefined ? undefined : s3Credentials(creds.eraser, "eraser"));
+  delete creds.databaseUrl;
+  delete creds.eraser;
   const state = new SyncState(env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!);
   const { default: pg } = await import("pg");
-  const client = new pg.Client({ connectionString: url, application_name: "96bulls-neon-s3-erasure" });
+  const client = new pg.Client({ connectionString: url, application_name: `96bulls-${kind}-s3-erasure` });
   await client.connect();
   let stop = false;
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => void (stop = true));
@@ -70,8 +90,9 @@ export async function main() {
       keyRoot: env("S3X_KEY_ROOT", "96bulls")!,
       recognizeLegacy: env("S3X_ERASER_RECOGNIZES_LEGACY", "false") === "true",
     };
-    const job = new ErasureJob(db, state, eraser, log, cfg, Date.now, undefined, () => stop);
-    log({ message: "start", execute, recognize_legacy: cfg.recognizeLegacy });
+    const authority = kind === "supabase" ? supabaseAuthority(db) : neonAuthority(db);
+    const job = new ErasureJob(authority, state, eraser, log, cfg, Date.now, undefined, () => stop);
+    log({ message: "start", execute, authority: kind, recognize_legacy: cfg.recognizeLegacy });
     // A dry run changes nothing: it sweeps and reports what it would erase.
     if (!execute) {
       await job.sweep({ dryRun: true });

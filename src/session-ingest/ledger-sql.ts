@@ -1,5 +1,5 @@
 import {validatedCustodyAck} from "./custody-ack.ts";
-import type { SourceControlHead } from "./ledger.ts";
+import type { PrivacyAuthorityHead, SourceControlHead } from "./ledger.ts";
 import type { CurrentCustodyPacket } from "./custody-protocol.ts";
 import {DeliveryError} from "./vendor/delivery/delivery-contracts.ts";
 import {orderedControl,orderedControlResult} from "./control-protocol.ts";
@@ -67,6 +67,8 @@ type LedgerFunction =
   | "ingest_frozen_source_witness"
   | "ingest_source_control_begin"
   | "ingest_source_control_complete"
+  | "ingest_privacy_authority_begin"
+  | "ingest_privacy_authority_complete"
   | "ingest_frozen_source_receipt";
 
 async function call(run: SqlRun, fn: LedgerFunction, input: unknown): Promise<unknown> {
@@ -202,6 +204,23 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
     async sourceControlComplete(input) {
       if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
       const r = (await call(run, "ingest_source_control_complete", input)) as Record<string, unknown>;
+      if (r.completed !== true || typeof r.superseded !== "boolean") throw new LedgerUnavailableError("ledger_bad_result");
+      return { completed: true, superseded: r.superseded };
+    },
+    async privacyAuthorityBegin(input) {
+      if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
+      const r = (await call(run, "ingest_privacy_authority_begin", input)) as Record<string, unknown>;
+      if (!hex64(r.epoch) || typeof r.version !== "string" || !/^[1-9][0-9]{0,18}$/.test(r.version) || !hex64(r.digest)
+        || (r.kind !== "selection" && r.kind !== "reset") || r.pending !== true || typeof r.apply !== "boolean"
+        || !(r.deleted === null || (typeof r.deleted === "string" && /^(0|[1-9][0-9]{0,18})$/.test(r.deleted)))
+        || (r.kind === "selection" && r.deleted !== null) || (r.kind === "reset" && r.deleted === null)
+        || Object.keys(r).length !== 7)
+        throw new LedgerUnavailableError("ledger_bad_result");
+      return r as unknown as PrivacyAuthorityHead;
+    },
+    async privacyAuthorityComplete(input) {
+      if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
+      const r = (await call(run, "ingest_privacy_authority_complete", input)) as Record<string, unknown>;
       if (r.completed !== true || typeof r.superseded !== "boolean") throw new LedgerUnavailableError("ledger_bad_result");
       return { completed: true, superseded: r.superseded };
     },
