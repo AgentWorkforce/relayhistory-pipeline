@@ -1516,6 +1516,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const S = "upstream:20261105035000_semantic_copy_state.sql";
     const E = "upstream:20261105036000_canonical_consumer_lease.sql";
     const F = "upstream:20261105037000_session_directory_document_pool.sql";
+    const R = "upstream:20261105038000_claim_attempt_records_retirement.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = (name: string) =>
@@ -1555,7 +1556,16 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // Later lanes roll back first and remove their own ledger rows; only then
-    // can the next down preserve a gap-free applied prefix.
+    // can the next down preserve a gap-free applied prefix. 038000 is the latest lane:
+    // 037000 and 036000 refuse while it is applied.
+    expect(await names()).toEqual(expect.arrayContaining([F, R]));
+    expect((await failure(rollback("20261105037000_session_directory_document_pool.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(F);
+    expect((await failure(rollback("20261105036000_canonical_consumer_lease.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.canonical_feature_consumer_lease")).toBe("sessions.canonical_feature_consumer_lease");
+    await rollback("20261105038000_claim_attempt_records_retirement.down.sql");
+    expect(await names()).not.toContain(R);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_attribute WHERE attrelid='sessions.ingest_claim_attempts'::regclass AND attname LIKE 'records\\_%' AND NOT attisdropped")).rows[0]?.n).toBe(0);
     await rollback("20261105037000_session_directory_document_pool.down.sql");
     expect(await names()).not.toContain(F);
     await rollback("20261105036000_canonical_consumer_lease.down.sql");
