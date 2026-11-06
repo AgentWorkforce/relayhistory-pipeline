@@ -27,7 +27,7 @@ function fakeLedger(script:Array<BufferedGcTicket[]|Error>){
 const deps=(ledger:BufferedGcLedger,erased:string[]=[])=>({ledger,store:barrierStore(),keyRoot:"96bulls" as const,
  eraser:{eraseObjectExcept:async(k:string,v:string)=>{erased.push(k+"@"+v)}} as any});
 
-test("tick issues one single-ticket claim per slot; per-tick ticket bound and coverage are unchanged",async()=>{
+test("tick issues one single-ticket claim per slot and preserves the per-tick ticket bound",async()=>{
  const f=fakeLedger([[],[cleanupTicket(1)],[],[cleanupTicket(2)],[]]),erased:string[]=[];
  expect(await bufferedGcTick(deps(f.ledger,erased),5)).toEqual({examined:2,finished:2,deferred:0});
  expect(f.calls).toEqual([1,1,1,1,1]);
