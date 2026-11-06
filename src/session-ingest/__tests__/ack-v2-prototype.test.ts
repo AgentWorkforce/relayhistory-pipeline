@@ -418,6 +418,21 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
   }
  });
 
+ test("vector provenance binds the ACK stage to its own claim: a same-batch cloned claim cannot adopt another claim's stage (review 7e646cf2)",async()=>{
+  const f=await fixture(kind,"bridge-v2");try{
+   await f.send("va",[record({record_id:"V",session_id:"s"})]);
+   const a=(await f.db.query("SELECT a.claim_token::text c,t.stage_token::text st FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_stage_intents t USING(claim_token) WHERE a.batch_id='va'")).rows[0];
+   const before=(await f.db.query("SELECT (SELECT count(*) FROM sessions.ingest_ack_vectors)::int v,(SELECT count(*) FROM sessions.ingest_claim_attempts)::int c")).rows[0];
+   await expectCode((async()=>{await f.db.exec("BEGIN");try{
+     const b=(await f.db.query(`INSERT INTO sessions.ingest_claim_attempts SELECT (jsonb_populate_record(x,jsonb_build_object('claim_token',gen_random_uuid(),'ack_format',NULL))).*
+       FROM sessions.ingest_claim_attempts x WHERE x.claim_token=$1 RETURNING claim_token::text c`,[a.c])).rows[0].c;
+     await f.db.query(`INSERT INTO sessions.ingest_ack_vectors(claim_token,ack_stage_token,format_version,n,allocated_count,clock_before,seat_lo,seat_hi,attempt_sha256,clock_identity_sha256,vec,vec_sha256)
+       SELECT $1,$2,1,1,0,(SELECT last_seat FROM sessions.ingest_receipt_seat_clock),NULL,NULL,sha256('x'),sha256('y'),'\x010100010000',sha256('\x010100010000')`,[b,a.st]);
+     await f.db.exec("COMMIT")}catch(e){await f.db.exec("ROLLBACK").catch(()=>{});throw e}})(),"vector without a committed receipt");
+   expect((await f.db.query("SELECT (SELECT count(*) FROM sessions.ingest_ack_vectors)::int v,(SELECT count(*) FROM sessions.ingest_claim_attempts)::int c")).rows[0]).toEqual(before);
+  }finally{await f.close()}
+ });
+
  test("receipt evidence is append-only (review v9 MAJOR 3), also under session_replication_role=replica",async()=>{
   const f=await fixture(kind,"bridge-v1");try{
    await f.send("a0",[record({record_id:"A",session_id:"s"})]);

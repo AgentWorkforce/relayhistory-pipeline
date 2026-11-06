@@ -814,9 +814,17 @@ BEGIN
  SELECT last_seat INTO STRICT v_last FROM sessions.ingest_receipt_seat_clock WHERE singleton;
  IF (NEW.allocated_count>0 AND NEW.seat_hi>v_last) OR NEW.clock_before>v_last THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: vector ahead of the committed clock';END IF;
- IF NOT EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_batches b ON b.org_id=a.org_id AND b.workspace_id=a.workspace_id
+ -- full identity binding (review 7e646cf2): the ACK stage belongs to THIS claim, is the original acknowledged live stage,
+ -- shares the claim's batch identity, and is the outbox's active stage for that same batch
+ IF NOT EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts a
+  JOIN sessions.ingest_stage_intents t ON t.stage_token=NEW.ack_stage_token AND t.claim_token=NEW.claim_token AND t.claim_token=a.claim_token
+   AND t.org_id=a.org_id AND t.workspace_id=a.workspace_id AND t.user_id=a.user_id AND t.origin_id=a.origin_id
+   AND t.batch_id=a.batch_id AND t.digest=a.digest AND t.reset_epoch=a.reset_epoch AND t.parent_stage_token IS NULL
+   AND t.receipt_state='acknowledged'
+  JOIN sessions.ingest_batches b ON b.org_id=a.org_id AND b.workspace_id=a.workspace_id
    AND b.origin_id=a.origin_id AND b.batch_id=a.batch_id AND b.digest=a.digest AND b.user_id=a.user_id
   JOIN sessions.ingest_buffer_outbox o ON o.org_id=a.org_id AND o.workspace_id=a.workspace_id AND o.origin_id=a.origin_id AND o.batch_id=a.batch_id
+   AND o.user_id=a.user_id AND o.digest=a.digest
   WHERE a.claim_token=NEW.claim_token AND b.state='committed' AND b.buffer_receipt_kind='staged' AND o.active_stage_token=NEW.ack_stage_token) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: vector without a committed receipt';END IF;
  RETURN NULL;
