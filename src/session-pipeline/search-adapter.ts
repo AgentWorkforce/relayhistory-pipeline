@@ -3,15 +3,23 @@
  * canonical read complete. No storage, clients or schema are created here. */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { assertPosition, type SearchIndexAdapter, type SearchEventDocument, type SearchTenant, type SearchFingerprint } from "@rhc/search-index/contracts.ts";
-import type { SessionScope } from "./pointer.ts";
 import type { IndexRow } from "./vendor/search-index/rows.ts";
+
+/** Minimal public service scope. Importing pointer.ts here would pull its
+ * Node-only database/bootstrap graph into the shared Cloudflare read API. */
+export interface SearchProjectionScope {
+  orgId: string;
+  workspaceId: string;
+  harness: string;
+  sessionId: string;
+}
 
 export interface SearchProjectionState {
   /** Inclusive coverage floor, also bound into the read API's history floor. */
   fromMs(at: Date): Promise<number>;
   /** Record only after projection and metadata writes finish; use the caller's
    * scope-locked transaction when the state is in the metadata database. */
-  record(tx: SqlExecutor, scope: SessionScope, value: { revision: number; rows: number; complete: boolean; at: Date; canonicalSessionId: string }): Promise<void>;
+  record(tx: SqlExecutor, scope: SearchProjectionScope, value: { revision: number; rows: number; complete: boolean; at: Date; canonicalSessionId: string }): Promise<void>;
   /** Must include unknown/missing projection state for live pointer scopes,
    * including a first failed pass that wrote no index rows. Tenant is verified.
    * Return cap+1 rows or overflow; never silently truncate a completeness check. */
@@ -48,15 +56,15 @@ export function searchDocument(row: IndexRow): SearchEventDocument {
 
 export interface SearchProjectionIo {
   fromMs(at: Date): Promise<number>;
-  scan(scope: SessionScope, canonicalId: string, fromMs: number, limit: number): Promise<{ rows: readonly SearchFingerprint[]; truncated: boolean }>;
-  upsert(rows: readonly IndexRow[], scope: SessionScope, canonicalId: string): Promise<number>;
-  remove(scope: SessionScope, positions: readonly SearchFingerprint[]): Promise<number>;
-  erase(scope: SessionScope, canonicalId: string): Promise<void>;
-  record(scope: SessionScope, revision: number, rows: number, complete: boolean, at: Date, canonicalId: string): Promise<void>;
+  scan(scope: SearchProjectionScope, canonicalId: string, fromMs: number, limit: number): Promise<{ rows: readonly SearchFingerprint[]; truncated: boolean }>;
+  upsert(rows: readonly IndexRow[], scope: SearchProjectionScope, canonicalId: string): Promise<number>;
+  remove(scope: SearchProjectionScope, positions: readonly SearchFingerprint[]): Promise<number>;
+  erase(scope: SearchProjectionScope, canonicalId: string): Promise<void>;
+  record(scope: SearchProjectionScope, revision: number, rows: number, complete: boolean, at: Date, canonicalId: string): Promise<void>;
 }
 
 export function adapterProjectionIo(binding: SearchServiceBinding, tx: SqlExecutor): SearchProjectionIo {
-  const scopeFor = (scope: SessionScope, canonicalId: string) => ({ orgId: scope.orgId, workspaceId: scope.workspaceId, source: scope.harness, sessionIds: [...new Set([scope.sessionId, canonicalId])] });
+  const scopeFor = (scope: SearchProjectionScope, canonicalId: string) => ({ orgId: scope.orgId, workspaceId: scope.workspaceId, source: scope.harness, sessionIds: [...new Set([scope.sessionId, canonicalId])] });
   return {
     async fromMs(at) {
       const value = await binding.state.fromMs(at);
