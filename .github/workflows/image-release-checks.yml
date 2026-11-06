@@ -3,20 +3,26 @@ on:
   pull_request:
     paths:
       - ".github/workflows/publish-image.yml"
+      - ".github/workflows/copy-amp-image.yml"
       - ".github/workflows/image-release-checks.yml"
       - "scripts/check-image-release.mjs"
       - "scripts/image-release-provenance.mjs"
       - "scripts/copy-reviewed-image.py"
+      - "scripts/prepare-amp-image-copy.mjs"
+      - "scripts/copy-amp-image.py"
       - "src/shared/__tests__/image*"
       - "docs/services-image-release.md"
   push:
     branches: [main]
     paths:
       - ".github/workflows/publish-image.yml"
+      - ".github/workflows/copy-amp-image.yml"
       - ".github/workflows/image-release-checks.yml"
       - "scripts/check-image-release.mjs"
       - "scripts/image-release-provenance.mjs"
       - "scripts/copy-reviewed-image.py"
+      - "scripts/prepare-amp-image-copy.mjs"
+      - "scripts/copy-amp-image.py"
       - "src/shared/__tests__/image*"
       - "docs/services-image-release.md"
 permissions:
@@ -42,4 +48,5 @@ jobs:
         run: |
           node --check scripts/check-image-release.mjs
           node --check scripts/image-release-provenance.mjs
-          bun test ./src/shared/__tests__/image-release.test.ts ./src/shared/__tests__/image-provenance.test.ts ./src/shared/__tests__/image-copy.test.ts
+          node --check scripts/prepare-amp-image-copy.mjs
+          bun test ./src/shared/__tests__/image-release.test.ts ./src/shared/__tests__/image-provenance.test.ts ./src/shared/__tests__/image-copy.test.ts ./src/shared/__tests__/image-amp-copy.test.ts ./src/shared/__tests__/image-amp-memory-copy.test.ts

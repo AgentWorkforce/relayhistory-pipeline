@@ -1,0 +1,63 @@
+import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { REPOSITORY, githubJSON, verifyAncestry, verifySourceCI } from "./check-image-release.mjs";
+import { IMAGE, verifyRelease } from "./image-release-provenance.mjs";
+const fail = reason => { throw new Error(`Amp image copy refused: ${reason}`); };
+const sha = value => typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
+const id = value => typeof value === "string" && /^[1-9][0-9]{0,14}$/.test(value);
+export function validateCopyRequest(e) {
+  if (e.GITHUB_REPOSITORY !== REPOSITORY || e.GITHUB_EVENT_NAME !== "workflow_dispatch" ||
+      e.GITHUB_REF !== "refs/heads/main" || e.GITHUB_ACTOR !== "khaliqgant" ||
+      e.GITHUB_TRIGGERING_ACTOR !== "khaliqgant" || e.CONFIRM !== "copy reviewed Amp image" ||
+      e.GITHUB_WORKFLOW_REF !== `${REPOSITORY}/.github/workflows/copy-amp-image.yml@refs/heads/main` ||
+      !sha(e.GITHUB_SHA)) fail("manual owner/main workflow identity required");
+  if (!sha(e.SOURCE_SHA) || !id(e.PUBLISH_RUN_ID) ||
+      !/^sha256:[a-f0-9]{64}$/.test(e.IMAGE_DIGEST ?? "") ||
+      !/^[a-f0-9]{32}$/.test(e.CLOUDFLARE_ACCOUNT_ID ?? "") || /^0+$/.test(e.CLOUDFLARE_ACCOUNT_ID))
+    fail("exact approved source, signed image, publication and target account required");
+}
+export function validatePublication(e, receipt, run) {
+  validateCopyRequest(e);
+  if (receipt.repository !== `https://github.com/${REPOSITORY}` ||
+      receipt.source_sha !== e.SOURCE_SHA || receipt.image !== `${IMAGE}@${e.IMAGE_DIGEST}` ||
+      receipt.source_ref !== "refs/heads/main" || receipt.attestation_backend !== "sigstore" ||
+      !sha(receipt.workflow_sha) || !id(receipt.ci_run_id) || receipt.publish_run_id !== e.PUBLISH_RUN_ID ||
+      !id(receipt.publish_run_attempt)) fail("publication receipt does not match approval");
+  if (!Number.isSafeInteger(run.id) || String(run.id) !== e.PUBLISH_RUN_ID ||
+      run.status !== "completed" || run.conclusion !== "success" || run.event !== "workflow_dispatch" ||
+      run.head_branch !== "main" || run.path !== ".github/workflows/publish-image.yml" ||
+      run.head_sha !== receipt.workflow_sha || String(run.run_attempt) !== receipt.publish_run_attempt ||
+      run.repository?.full_name !== REPOSITORY || run.head_repository?.full_name !== REPOSITORY ||
+      run.actor?.login !== "khaliqgant" || run.triggering_actor?.login !== "khaliqgant")
+    fail("successful canonical owner publication identity required");
+}
+async function main() {
+  const e = process.env; validateCopyRequest(e);
+  if (!e.ARTIFACT_DIR) fail("artifact directory required");
+  const receiptPath = join(e.ARTIFACT_DIR, "release-receipt.json");
+  if (statSync(receiptPath).size > 65536) fail("oversized publication receipt");
+  const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+  const get = githubJSON(e.GH_TOKEN);
+  const run = await get(`/repos/${REPOSITORY}/actions/runs/${e.PUBLISH_RUN_ID}`);
+  validatePublication(e, receipt, run);
+  verifyAncestry(e.SOURCE_SHA); verifyAncestry(receipt.workflow_sha);
+  const currentCI = await verifySourceCI(e.SOURCE_SHA, get);
+  if (String(currentCI) !== receipt.ci_run_id) fail("source CI changed after signing");
+  verifyRelease({ SOURCE_SHA: e.SOURCE_SHA, WORKFLOW_SHA: receipt.workflow_sha,
+    SOURCE_CI_RUN: receipt.ci_run_id, PUBLISH_RUN_ID: e.PUBLISH_RUN_ID,
+    PUBLISH_RUN_ATTEMPT: receipt.publish_run_attempt, IMAGE_DIGEST: e.IMAGE_DIGEST }, e.ARTIFACT_DIR);
+  const index = JSON.parse(readFileSync(join(e.ARTIFACT_DIR, "services-index.json"), "utf8"));
+  const native = index.manifests.filter(m => m.platform?.os === "linux" && m.platform?.architecture === "amd64");
+  if (native.length !== 1 || !/^sha256:[a-f0-9]{64}$/.test(native[0].digest ?? ""))
+    fail("one verified native amd64 manifest required");
+  const plan = { source_sha: e.SOURCE_SHA, signed_index_digest: e.IMAGE_DIGEST,
+    linux_amd64_digest: native[0].digest, account_id: e.CLOUDFLARE_ACCOUNT_ID,
+    publication_run_id: e.PUBLISH_RUN_ID, publication_workflow_sha: receipt.workflow_sha,
+    source_ci_run_id: receipt.ci_run_id, copy_workflow_sha: e.GITHUB_SHA };
+  writeFileSync(join(e.ARTIFACT_DIR, "amp-copy-plan.json"), JSON.stringify(plan, null, 2) + "\n");
+  console.log(`Verified reviewed native image ${native[0].digest} from publication ${e.PUBLISH_RUN_ID}`);
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(() => { console.error("Amp copy provenance validation failed"); process.exitCode = 1; });
+}
