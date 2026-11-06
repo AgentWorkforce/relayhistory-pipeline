@@ -45,7 +45,9 @@ export async function gateway(
   try {
     // No retry: a lost response may follow a successful native submission.
     const answer = await forward(new Request(request.url, {
-      method: "POST", headers: request.headers, body: Buffer.concat(chunks),
+      method: "POST", headers: {
+        Authorization: request.headers.get("Authorization")!, "Content-Type": "application/json",
+      }, body: Buffer.concat(chunks),
     }));
     const headers = new Headers(answer.headers);
     headers.set("Cache-Control", "no-store");

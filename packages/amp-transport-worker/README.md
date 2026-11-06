@@ -38,17 +38,19 @@ CI, image-publish environment, attestation and registry gates in
 3. Generate one production transport token in the `96Bulls-prod` 1Password vault.
    Set the same value as this Worker's `AMP_TRANSPORT_TOKEN` and Cloud's linked
    `AmpTransportToken`. Pass values via stdin/environment, never a file or argv.
-4. Render the deploy config using the verified Cloudflare digest and approved
-   full image source SHA, then deploy the reviewed Worker:
+4. Supply the verified production account as `CLOUDFLARE_ACCOUNT_ID` and the
+   approved custom domain as `AMP_TRANSPORT_HOSTNAME`. Render the deploy config
+   using the verified Cloudflare digest and approved full image source SHA,
+   then deploy the reviewed Worker:
 
    ```sh
-   bun scripts/render-config.ts registry.cloudflare.com/f7232cb80f6fab86a95426302af243e4/96bulls-services@sha256:<verified-digest> <approved-source-sha>
+   bun scripts/render-config.ts registry.cloudflare.com/$CLOUDFLARE_ACCOUNT_ID/96bulls-services@sha256:<verified-digest> <approved-source-sha>
    wrangler deploy --config wrangler.generated.json
    ```
 
    The generated config is ignored and contains only public deployment metadata.
    The template deliberately has no usable image. The renderer validates shape
-   and account, not attestation: the verification in steps 1–2 remains required.
+   and consistency with the supplied account, not attestation: the verification in steps 1–2 remains required.
 5. Verify unauthenticated/oversized/other-path requests cannot run native work.
    Run read-only discovery/export with the owner's Amp key through the actual
    Cloud client. Then set `AMP_TRANSPORT_ORIGIN` to the custom HTTPS origin and

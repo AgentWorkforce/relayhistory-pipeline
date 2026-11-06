@@ -6,8 +6,16 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["@cloudflare/workers-types", "node"],
+    "types": [
+      "@cloudflare/workers-types",
+      "node"
+    ],
     "allowImportingTsExtensions": true
   },
-  "include": ["src/index.ts", "src/gateway.ts", "src/native-server.ts"]
+  "include": [
+    "src/index.ts",
+    "src/gateway.ts",
+    "src/native-server.ts",
+    "scripts/render-config.ts"
+  ]
 }

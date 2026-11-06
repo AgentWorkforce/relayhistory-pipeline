@@ -28,7 +28,10 @@ jobs:
       - run: bun run --filter @96bulls/amp-transport-worker test
       - name: Compile only; no image pull, registry credentials or deployment
         working-directory: packages/amp-transport-worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: "00000000000000000000000000000000"
+          AMP_TRANSPORT_HOSTNAME: amp-transport.example.com
         run: |
           set -eu
-          bun scripts/render-config.ts registry.cloudflare.com/f7232cb80f6fab86a95426302af243e4/96bulls-services@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0000000000000000000000000000000000000000
+          bun scripts/render-config.ts registry.cloudflare.com/00000000000000000000000000000000/96bulls-services@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0000000000000000000000000000000000000000
           bunx --no-install wrangler deploy --config wrangler.generated.json --dry-run --containers-rollout none --outdir dist

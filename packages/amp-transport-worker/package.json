@@ -6,10 +6,12 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test ./src/gateway.test.ts ./src/native-server.test.ts",
+    "test": "bun test ./src/gateway.test.ts ./src/native-server.test.ts ./scripts/render-config.test.ts",
     "render-config": "bun scripts/render-config.ts"
   },
-  "dependencies": { "@cloudflare/containers": "0.3.7" },
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "4.20260621.1",
     "@types/bun": "latest",

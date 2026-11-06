@@ -46,13 +46,15 @@ test("an oversized stream is cancelled before container acquisition", async () =
 });
 
 test("the exact bounded body reaches the native service once", async () => {
-  const input = request();
+  const input = request({ headers: { ...headers, "cf-container-target-port": "9999", "X-Unrelated": "discard" } });
   const original = await input.clone().text();
   let forwards = 0;
   const result = await gateway(input, token, async bounded => {
     forwards++;
     expect(await bounded.text()).toBe(original);
     expect(bounded.headers.get("Authorization")).toBe(headers.Authorization);
+    expect(bounded.headers.get("cf-container-target-port")).toBeNull();
+    expect(bounded.headers.get("X-Unrelated")).toBeNull();
     return new Response('{"ok":true,"value":"provider result"}', {
       headers: { "Content-Type": "application/json" },
     });
