@@ -807,15 +807,16 @@ BEGIN
     AND (x->>'revision')::bigint=n.current_revision AND x->>'digest'=n.current_digest)
    AND EXISTS(SELECT 1 FROM sessions.ingest_batches b WHERE b.org_id=a.org_id AND b.workspace_id=a.workspace_id AND b.origin_id=a.origin_id
     AND b.batch_id=a.batch_id AND b.digest=a.digest AND b.user_id=a.user_id AND b.state='committed' AND b.buffer_receipt_kind='staged')
-   -- the claim owns the batch's ORIGINAL stage (no parent, acknowledged, full identity), and that stage is the root of the
-   -- outbox's current stage chain (GC may have replaced it with a child) or the outbox is erased; a cloned claim owns no stage
+   -- the claim owns the batch's ORIGINAL stage (no parent, acknowledged, full identity), and the outbox's current stage is
+   -- that stage or one of its GC descendants (same claim token), or the outbox is erased; a cloned claim owns no stage
    AND EXISTS(SELECT 1 FROM sessions.ingest_stage_intents t JOIN sessions.ingest_buffer_outbox o ON o.org_id=a.org_id AND o.workspace_id=a.workspace_id
      AND o.origin_id=a.origin_id AND o.batch_id=a.batch_id AND o.user_id=a.user_id AND o.digest=a.digest
     LEFT JOIN sessions.ingest_stage_intents c ON c.stage_token=o.active_stage_token
     WHERE t.claim_token=a.claim_token AND t.parent_stage_token IS NULL AND t.receipt_state='acknowledged'
      AND t.org_id=a.org_id AND t.workspace_id=a.workspace_id AND t.user_id=a.user_id AND t.origin_id=a.origin_id
      AND t.batch_id=a.batch_id AND t.digest=a.digest AND t.reset_epoch=a.reset_epoch
-     AND (o.state='erased' OR o.active_stage_token=t.stage_token OR c.parent_stage_token=t.stage_token));
+     -- any GC descendant keeps the claim token (gc prepare copies it; swap refuses a different one), so this holds at any depth
+     AND (o.state='erased' OR o.active_stage_token=t.stage_token OR c.claim_token=a.claim_token));
  IF v_ok<>1 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: K winner has no accepted v1 decision';END IF;
  RETURN NULL;
 END $kp$;
