@@ -18,3 +18,16 @@ test("operator deployment values are required and cannot silently use another ac
     { hostname: "bad..example.com" }, { hostname: "transport.example.com:443" } ])
     expect(() => deploymentConfig(template, { ...approved, ...change })).toThrow();
 });
+
+test("the production template supplies an explicit valid container application name", async () => {
+  const production = await Bun.file(new URL("../wrangler.template.json", import.meta.url)).json();
+  const config = deploymentConfig(production, approved);
+  expect(config.name).toBe("96bulls-amp-transport");
+  expect(config.containers[0]).toMatchObject({
+    name: "amp-transport", class_name: "AmpTransport", instance_type: "basic", max_instances: 1,
+  });
+  // Containers reject application names beginning with a digit, even though
+  // the Worker name may begin with one. Do not inherit the Worker name.
+  expect(config.containers[0].name).toMatch(/^[a-z][a-z0-9-]*$/);
+  expect(config.containers[0].image).toBe(approved.image);
+});

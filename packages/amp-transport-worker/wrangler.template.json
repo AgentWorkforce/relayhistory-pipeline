@@ -16,6 +16,7 @@
   ],
   "containers": [
     {
+      "name": "amp-transport",
       "class_name": "AmpTransport",
       "image": "__APPROVED_IMAGE_DIGEST_REQUIRED__",
       "instance_type": "basic",
