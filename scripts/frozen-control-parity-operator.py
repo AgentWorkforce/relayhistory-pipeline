@@ -15,7 +15,7 @@ after the remote run, read with a GET through the existing approved Wrangler OAu
 import datetime, json, pathlib, re, shlex, subprocess, sys, time, urllib.request
 from urllib.parse import urlsplit, unquote
 
-ROOT = "/home/khaliqgant/Projects/AgentWorkforce/sessions-pipeline-worktrees/control-parity-seed-5ada92b"
+ROOT = "/home/khaliqgant/Projects/AgentWorkforce/sessions-pipeline-worktrees/control-handoff-optionb-3d6edb0"
 BUN = "/home/khaliqgant/.local/share/mise/installs/bun/1.4.2/bin/bun"
 NEONCTL = ["/opt/homebrew/bin/neonctl", "connection-string", "br-damp-mud-apbr6ifp", "--project-id", "divine-snow-84812652",
            "--role-name", "neondb_owner", "--database-name", "neondb"]
