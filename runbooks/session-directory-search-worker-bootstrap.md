@@ -234,7 +234,7 @@ violation is named:
   baseline. Local, selfhosted and cloudsql still refuse every effective TEMPORARY grant.
   This is compatibility, not a
   service requirement: no service creates temporary objects or relies on runtime
-  `search_path`; see `docs/evidence/runtime-temp-usage.md`.
+  `search_path` (the runtime temp-usage audit is not kept in the repository).
 - **Approved, and nothing else:** `USAGE` on schema `sessions`; read-only migration
   ledger/marker access; `CONNECT`; and the immutable application table, identity-sequence,
   callable-function and RLS-policy allowlists in `src/hoopdb/migrate-guards.ts`. The

@@ -31,7 +31,7 @@ copy-everything-then-switch runbook (linuyc, uncommitted
   `docs/relayhistory-t0-write-hold.md`.
 - **The 485.6 GiB copy leaves the deadline.** Only the empty schema, indexes
   and the sequence fence have to exist on Supabase before T0.
-- **Target database:** Supabase `sessions` (`pyamkrhoyszgzirqqffq`). AWS is S3
+- **Target database:** Supabase `sessions` (`<supabase-project>`). AWS is S3
   only. Aurora/EKS are self-host proof and stay off this path.
 - **API:** the existing Cloudflare Worker. A driver seam swaps its Neon HTTP
   driver (`packages/relayhistory/src/db/client.ts`) for node-postgres over

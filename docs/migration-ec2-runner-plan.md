@@ -1,6 +1,6 @@
 # Temporary EC2 migration compute
 
-Pippen owns the account lifecycle; sessions-pipeline owns this compute template. Use the existing sessions-prod workload account941433935742 inus-east-1. Production session data must not be placed in a disposable Pippen sandbox. The template is independent of the existing pipeline Lambda and application routing.
+Pippen owns the account lifecycle; sessions-pipeline owns this compute template. Use the existing sessions-prod workload account <account-id> inus-east-1. Production session data must not be placed in a disposable Pippen sandbox. The template is independent of the existing pipeline Lambda and application routing.
 
 ## Resources and sizing
 
