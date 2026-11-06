@@ -105,15 +105,15 @@ describe("GET /v1/sessions/:id/analysis", () => {
 });
 
 describe("POST /v1/sessions/:id/analysis", () => {
-  test("needs rth:write and the admission principal", async () => {
+  test("needs rth:sync and the admission principal", async () => {
     expect((await api().call("POST")).status).toBe(403);
-    const r = await api({ scopes: ["rth:read", "rth:write"] }).call("POST");
+    const r = await api({ scopes: ["rth:read", "rth:sync"] }).call("POST");
     expect([r.status, (await json(r)).error.reason]).toEqual([501, "analysis_admission_not_configured"]);
   });
 
   test("relayhistory's outcome map", async () => {
     const at = (outcome: any) =>
-      api({ scopes: ["rth:read", "rth:write"], analysis: { admit: async () => outcome } }).call("POST");
+      api({ scopes: ["rth:read", "rth:sync"], analysis: { admit: async () => outcome } }).call("POST");
     const ok = await at({ outcome: "accepted", request: REQ });
     expect([ok.status, (await json(ok)).request]).toEqual([202, REQ]);
     expect((await at({ outcome: "not_found" })).status).toBe(404);

@@ -39,7 +39,7 @@
  *
  *   GET  /v1/sessions/:id/analysis  relayhistory's session analysis (lane F1) from migration
  *   POST /v1/sessions/:id/analysis  20261105046000 and its S3 result objects; same allowlist;
- *                                   POST needs `rth:write` and the admission principal.
+ *                                   POST needs `rth:sync` and the admission principal.
  *
  * Auth: a RelayAuth assertion JWT minted for THIS service's origin with scope
  * `rth:read` (verifyAgentRelayToken: RS256, JWKS, issuer, exact audience).
@@ -679,7 +679,7 @@ export function createReadApi(deps: ReadApiDeps) {
   /**
    * GET / POST /v1/sessions/:id/analysis (lane F1): relayhistory's session analysis
    * contract from migration 20261105046000 and the analysis result objects, never Neon.
-   * Same canary allowlist. POST additionally needs the `rth:write` scope and the separate
+   * Same canary allowlist. POST additionally needs the `rth:sync` scope (relayhistory's) and the separate
    * admission principal (deps.analysis.admit); without it POST is 501
    * `analysis_admission_not_configured`. A missing or altered result object is a 503.
    */
@@ -720,8 +720,9 @@ export function createReadApi(deps: ReadApiDeps) {
     try {
       const identity = c.get("identity");
       const { analysis, sessionId } = analysisSession(c, identity);
-      if (!identity.scopes.includes("rth:write"))
-        return c.json({ error: { code: "forbidden", message: "missing required scope: rth:write" }, correlationId: c.get("correlationId") }, 403);
+      // relayhistory routes/session-analysis.ts:174-177: POST needs rth:read and rth:sync.
+      if (!identity.scopes.includes("rth:sync"))
+        return c.json({ error: { code: "forbidden", message: "missing required scope: rth:sync" }, correlationId: c.get("correlationId") }, 403);
       if (!analysis.admit) throw unsupported("analysis_admission_not_configured");
       const out = admitResponse(await analysis.admit(identity, sessionId));
       if (out.retryAfter) c.header("Retry-After", out.retryAfter);
