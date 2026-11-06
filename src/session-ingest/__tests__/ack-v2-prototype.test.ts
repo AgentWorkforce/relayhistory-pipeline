@@ -340,11 +340,46 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    for(const [name,d] of single)await expectCode(upd({...base,...d}),"slot regression refused").catch(e=>{throw Error("K single-cause "+name+": "+e)});
    await expectCode(upd({...base,key:await forge("2","OTHER")}),"slot regression refused");                 // another record's fresh seat
    await expectCode(upd({...base,key:await forge("1"),rev:"1"}),"slot regression refused");                  // fresh self-consistent seat, revision not increasing
-   // RESIDUAL (documented, not a defect of the binding): a fully self-consistent receipt INSERTED by the table owner is accepted;
-   // receipt provenance rests on owner-only INSERT, exactly as in v1 (which has no validator at all).
-   await upd(base);
-   expect((await f.db.query("SELECT current_seat_key k FROM sessions.ingest_lazy_native_slots WHERE record_id='K'")).rows[0].k).toBe(good);
+   // PROVENANCE (addendum 6a09d424): the former pinned positive is now REFUSED at commit: a receipt-only winner with no
+   // accepted decision, ahead of the committed clock
+   const snap=async()=>(await f.db.query("SELECT to_jsonb(n)::text j FROM sessions.ingest_lazy_native_slots n WHERE record_id='K'")).rows[0].j;
+   const before=await snap();
+   await expectCode(upd(base),/ahead of the committed clock|no accepted v1 decision/);
+   expect(await snap()).toBe(before);
+   // a forged decision row for that seat, clock NOT advanced: still ahead of the clock (future collision)
+   const forgedSeat=(await f.db.query("SELECT seat::text s FROM sessions.ingest_receipt_seats WHERE key_sha256=$1",[good])).rows[0].s;
+   const dec=(await f.db.query("SELECT * FROM sessions.ingest_lazy_ack_decisions WHERE native_key_sha256=(SELECT key_sha256 FROM sessions.ingest_lazy_native_slots WHERE record_id='K')")).rows[0];
+   const forgeTx=async(over:any,advance:boolean)=>{await f.db.exec("BEGIN");try{
+     await upd(base);   // writer order: seat (already inserted) -> slot update -> decision -> clock advance -> commit
+     const d={...dec,ord:1+Math.floor(Math.random()*400),seat_key_sha256:good,native_lineage:Number(k.lineage)+1,candidate_digest:"a".repeat(64),first_digest:"a".repeat(64),body_accepted:true,
+      candidate_key_sha256:(await f.db.query("SELECT encode(sha256(convert_to(key_material::text,'UTF8')),'hex') h FROM sessions.ingest_receipt_seats WHERE key_sha256=$1",[good])).rows[0].h,...over};
+     await f.db.query(`INSERT INTO sessions.ingest_lazy_ack_decisions(claim_token,ord,native_key_sha256,native_lineage,candidate_key_sha256,candidate_digest,first_digest,body_accepted,seat_key_sha256,
+       reset_epoch,fence_epoch,generation,source_control_version,source_witness_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+      [d.claim_token,d.ord,d.native_key_sha256,d.native_lineage,d.candidate_key_sha256,d.candidate_digest,d.first_digest,d.body_accepted,d.seat_key_sha256,d.reset_epoch,d.fence_epoch,d.generation,d.source_control_version,d.source_witness_sha256]);
+     if(advance)await f.db.query("UPDATE sessions.ingest_receipt_seat_clock SET last_seat=$1",[forgedSeat]);
+     await f.db.exec("COMMIT")}catch(e){await f.db.exec("ROLLBACK").catch(()=>{});throw e}};
+   await expectCode(forgeTx({},false),"ahead of the committed clock");
+   // per-field decision mismatches with the clock advanced: each refused at commit ONLY because the decision binding fails
+   for(const [name,over] of [["not accepted",{body_accepted:false}],["lineage",{native_lineage:Number(k.lineage)+5}],["digest",{candidate_digest:"b".repeat(64),first_digest:"b".repeat(64)}],
+     ["reset epoch",{reset_epoch:1}],["fence epoch",{fence_epoch:1}],["native key",{native_key_sha256:"9".repeat(64)}],["candidate key",{candidate_key_sha256:"8".repeat(64)}]] as [string,any][])
+    await expectCode(forgeTx(over,true),/no accepted v1 decision|23503/).catch(e=>{throw Error("decision mismatch "+name+": "+e)});
+   expect(await snap()).toBe(before);
+   // after every refusal nothing leaked: a normal ACK allocates the next seat without colliding
+   await f.send("k2",[record({record_id:"K",revision:2,session_id:"s"})]);
+   expect((await f.db.query("SELECT current_revision::text r FROM sessions.ingest_lazy_native_slots WHERE record_id='K'")).rows[0].r).toBe("2");
   }finally{await f.close()}
+ });
+
+ test("provenance writer faults: a v1 or v2 writer that skips the clock advance cannot commit a winner",async()=>{
+  for(const [mode,fn] of [["bridge-v1","sessions.ingest_lazy_ack_batch_v1(jsonb)"],["bridge-v2","sessions.ingest_lazy_ack_batch_v2(jsonb)"]] as [Mode,string][]){
+   const f=await fixture(kind,mode);try{
+    const d=(await f.db.query("SELECT pg_get_functiondef($1::regprocedure) d",[fn])).rows[0].d as string;
+    const at=" UPDATE sessions.ingest_receipt_seat_clock SET last_seat=v_last WHERE singleton;";expect(d.includes(at)).toBe(true);
+    await f.db.exec(d.replace(at," NULL;"));
+    await expectCode(f.send("fault",[record({record_id:"z",session_id:"s"})]),/ahead of the committed clock/,f).catch(e=>{throw Error(mode+": "+e)});
+    expect((await f.db.query("SELECT count(*)::int n FROM sessions.ingest_batches WHERE batch_id='fault' AND state='committed'")).rows[0].n).toBe(0);
+   }finally{await f.close()}
+  }
  });
 
  test("receipt evidence is append-only (review v9 MAJOR 3), also under session_replication_role=replica",async()=>{
@@ -453,7 +488,7 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    await expectCode(f.db.query("INSERT INTO sessions.ingest_receipt_seats(key_sha256,key_material,seat,first_digest,source,session_id,fence_epoch) VALUES(repeat('1',64),'[]',1,repeat('2',64),'claude','s',0)"),"refused in mode v2");
    await f.db.exec("SET session_replication_role=origin");
    const tg=(await f.db.query("SELECT tgname,tgenabled FROM pg_trigger WHERE tgname LIKE 'ack_%' AND NOT tgisinternal ORDER BY 1")).rows;
-   expect(tg.every((r:any)=>r.tgenabled==="A")).toBe(true);expect(tg.length).toBe(16);
+   expect(tg.every((r:any)=>r.tgenabled==="A")).toBe(true);expect(tg.length).toBe(18);
   }finally{await f.close()}
  });
 

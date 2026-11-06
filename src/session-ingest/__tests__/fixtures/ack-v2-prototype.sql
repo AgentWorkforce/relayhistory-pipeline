@@ -772,3 +772,49 @@ ALTER TABLE sessions.ingest_receipt_seats ENABLE ALWAYS TRIGGER ack_receipt_seat
 ALTER TABLE sessions.ingest_lazy_ack_decisions ENABLE ALWAYS TRIGGER ack_decisions_immutable;
 ALTER TABLE sessions.ingest_lazy_ack_decisions ENABLE ALWAYS TRIGGER ack_decisions_truncate;
 REVOKE ALL ON FUNCTION sessions.ack_receipt_immutable() FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+-- ---------- receipt provenance enforced in SQL (migration-completeness addendum 6a09d424) ----------
+-- Commit-time (DEFERRABLE INITIALLY DEFERRED) because the real v1/v1r writers keep their order:
+-- seat insert -> slot update -> decision insert -> clock advance (lazy:665/673/678/688).
+-- A committed K winner must have exactly ONE body_accepted v1 decision bound to claim/tenant/owner/native key/
+-- seat/lineage/digest/epochs, and its seat must be <= the committed clock in a v1 era (no winner ahead of the clock).
+CREATE FUNCTION sessions.ack_k_provenance() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $kp$
+DECLARE n sessions.ingest_lazy_native_slots%ROWTYPE;s sessions.ingest_receipt_seats%ROWTYPE;v_last bigint;v_ok int;
+BEGIN
+ SELECT * INTO n FROM sessions.ingest_lazy_native_slots WHERE key_sha256=NEW.key_sha256;   -- the state AT COMMIT
+ IF NOT FOUND OR n.current_seat_key IS NULL THEN RETURN NULL;END IF;
+ SELECT * INTO STRICT s FROM sessions.ingest_receipt_seats WHERE key_sha256=n.current_seat_key;
+ SELECT last_seat INTO STRICT v_last FROM sessions.ingest_receipt_seat_clock WHERE singleton;
+ IF s.compat_vector_claim IS NOT NULL OR s.seat>v_last OR sessions.ack_seat_era(s.seat) IS DISTINCT FROM 'v1' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: K winner ahead of the committed clock or outside a v1 era';END IF;
+ SELECT count(*) INTO v_ok FROM sessions.ingest_lazy_ack_decisions d JOIN sessions.ingest_claim_attempts a USING(claim_token)
+  WHERE d.seat_key_sha256=n.current_seat_key AND d.body_accepted AND a.ack_format=1
+   AND d.native_key_sha256=n.key_sha256 AND d.native_lineage=n.lineage AND d.first_digest=n.current_digest AND d.candidate_digest=n.current_digest
+   AND d.reset_epoch=n.current_reset_epoch AND d.fence_epoch=n.current_fence_epoch
+   AND a.org_id=n.org_id AND a.workspace_id=n.workspace_id AND a.user_id=n.current_owner AND a.origin_id=n.origin_id
+   AND d.candidate_key_sha256=encode(sha256(convert_to(s.key_material::text,'UTF8')),'hex');
+ IF v_ok<>1 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: K winner has no accepted v1 decision';END IF;
+ RETURN NULL;
+END $kp$;
+CREATE CONSTRAINT TRIGGER ack_k_provenance AFTER UPDATE ON sessions.ingest_lazy_native_slots
+ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.current_seat_key IS NOT NULL) EXECUTE FUNCTION sessions.ack_k_provenance();
+-- Same provenance for v2 vectors: at commit the range is <= the committed clock and the batch is committed with
+-- this ACK stage active (an owner-inserted vector without the clock advance / receipt cannot become authority).
+CREATE FUNCTION sessions.ack_vector_provenance() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $vp$
+DECLARE v_last bigint;
+BEGIN
+ SELECT last_seat INTO STRICT v_last FROM sessions.ingest_receipt_seat_clock WHERE singleton;
+ IF (NEW.allocated_count>0 AND NEW.seat_hi>v_last) OR NEW.clock_before>v_last THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: vector ahead of the committed clock';END IF;
+ IF NOT EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_batches b ON b.org_id=a.org_id AND b.workspace_id=a.workspace_id
+   AND b.origin_id=a.origin_id AND b.batch_id=a.batch_id AND b.digest=a.digest AND b.user_id=a.user_id
+  JOIN sessions.ingest_buffer_outbox o ON o.org_id=a.org_id AND o.workspace_id=a.workspace_id AND o.origin_id=a.origin_id AND o.batch_id=a.batch_id
+  WHERE a.claim_token=NEW.claim_token AND b.state='committed' AND b.buffer_receipt_kind='staged' AND o.active_stage_token=NEW.ack_stage_token) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: vector without a committed receipt';END IF;
+ RETURN NULL;
+END $vp$;
+CREATE CONSTRAINT TRIGGER ack_vector_provenance AFTER INSERT ON sessions.ingest_ack_vectors
+ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION sessions.ack_vector_provenance();
+ALTER TABLE sessions.ingest_lazy_native_slots ENABLE ALWAYS TRIGGER ack_k_provenance;
+ALTER TABLE sessions.ingest_ack_vectors ENABLE ALWAYS TRIGGER ack_vector_provenance;
+REVOKE ALL ON FUNCTION sessions.ack_k_provenance(),sessions.ack_vector_provenance() FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
