@@ -1,112 +1,95 @@
 # Releasing the services image
 
-Use the manual `publish-image` workflow after the operator approves the source
-commit and publication. Both the original dispatcher and any rerun initiator
-must be Khaliq. The workflow also requires the `main` ref, the confirmation
-phrase and the `image-publish` environment. Approval to merge code does not authorize publication.
+Use manual `publish-image` after Khaliq approves the source commit and publication.
+Both dispatcher and rerun initiator must be Khaliq. It requires main, the
+confirmation phrase and the image-publish environment. Code integration approval
+alone does not authorize publication or deployment.
 
-Set `source_sha` to the approved full lowercase public commit SHA. It must
-belong to current `main`, and its latest official main/push CI run and every job
-must be successful. The preflight reads metadata with a read-only token and
-fails before the registry/OIDC job if the source, CI, dispatcher or approval
-reference is invalid. It reads all job pages and validates the newest execution
-of each named job, including successful jobs carried across partial reruns. An
-old success cannot hide a failed retry. It rechecks the CI attempt afterward.
+The full lowercase source_sha must belong to current original main. Its latest
+official main/push CI run and every effective job must pass. The read-only
+preflight checks every job page and latest attempt, never an older green run.
+Private ancestry fetch authenticates only that process; no checkout credential
+is saved to git configuration. CI is rechecked after environment approval,
+before signing, before registry copy, and after registry verification.
 
-The input is required: tags, branch names, abbreviated SHAs and commits outside
-current `main` history are refused. Only `sha-<source_sha>` is published. This
-publisher never moves `main` or `latest`. Supply a short,
-single-line, non-sensitive approval reference; it becomes public image metadata.
+Only sha-<source_sha> is published to ghcr.io/agentworkforce/96bulls-services.
+The publisher never moves main or latest. The single-line, non-sensitive approval
+reference becomes image metadata. Preserve this repository's existing package
+Actions access; a denied push is a permission failure to resolve with its owner.
 
-The target remains `ghcr.io/agentworkforce/96bulls-services`. Preserve this
-repository's existing Actions access to that package. Package access
-and package/repository association are separate settings; do not assume public
-pull access authorizes a workflow to push. A denied publish is a permission
-failure to resolve with the package owner, not a reason to use another token or
-disable release gates.
+## Provenance for private repositories
 
-After environment approval, the publisher rechecks CI and builds amd64/arm64
-into a local OCI archive with SBOM and max-mode BuildKit provenance. It rechecks
-CI immediately before copying that exact index with Skopeo, verifies the registry
-digest, and rechecks CI again before signing. A newer CI run or attempt found
-during validation is refused. These are point-in-time checks, not an atomic lock
-on future CI activity.
+The canonical repository can remain private. GitHub artifact attestations are
+unavailable for private repositories on this plan, so the publisher uses pinned
+Cosign, GitHub Actions OIDC, public Sigstore/Fulcio certificates and Rekor proofs.
+It creates no long-lived signing key and does not make source/history public.
+Certificate and release metadata (repository, workflow, source/CI identifiers,
+artifact digest) are public in transparency infrastructure. Approval notes must
+contain no sensitive information.
 
-The publisher signs two statements for the published digest:
+The job builds amd64/arm64 into a local OCI archive with SBOM and max-mode
+BuildKit provenance. It extracts the exact index by the builder's output digest,
+checks its bytes/platforms, and signs two in-toto statements before registry writes:
 
-- GitHub build provenance identifies the workflow and its commit.
-- `https://agentrelay.com/attestations/reviewed-image-source/v1` records the
-  checked-out `source_sha`, its repository, its verified membership on `main`,
-  the `workflow_sha`, and the successful `ci_run_id`. These commits can differ for a pinned release.
+- SLSA v1 provenance binds source, immutable workflow revision, image repository,
+  source dependency and publication invocation.
+- https://agentrelay.com/attestations/reviewed-image-source/v1 binds the exact
+  source, workflow, main ref, successful source CI run and image digest.
+
+Both bundles must pass Cosign verification of the exact GitHub issuer, workflow
+identity, repository, main ref, workflow SHA, manual trigger and subject digest.
+The claim checker also requires the approved source, CI and invocation. JSON
+parsing alone does not establish trust. Any failed signing/verification stops
+before copying the OCI archive with Skopeo. The copied registry index must match
+the signed digest; final CI must still identify the signed source run. These are
+point-in-time checks, not an atomic lock on future CI activity. Registry auth
+is held in a sealed Linux anonymous-memory descriptor, inherited by Skopeo. No
+registry credential file or credential argument is created; no disk fallback
+is available when the memory descriptor is unsupported.
 
 ## Verify a release
 
-After both attestations succeed, the workflow uploads `release-receipt.json` as
-the `release-receipt` artifact and writes the image/source/workflow/CI identifiers
-to its summary. List publication runs, then inspect the successful run for the
-approved dispatch. Set `publish_run_id` to that run's numeric ID (also shown in
-its Actions URL, `/actions/runs/<id>`) before downloading its receipt:
+After successful signing, registry verification and final CI, the release-receipt
+artifact contains release-receipt.json, services-index.json,
+build-provenance.sigstore.json and reviewed-source.sigstore.json. These are public
+verification material/metadata, without a private signing key, provider key or
+source code. Find the approved dispatch and download its artifact:
 
 ```sh
-gh run list --repo AgentWorkforce/sessions-pipeline \
-  --workflow publish-image.yml --event workflow_dispatch \
-  --json databaseId,headSha,status,conclusion,url
-publish_run_id='<reviewed successful publication run ID>'
+gh run list --repo AgentWorkforce/sessions-pipeline --workflow publish-image.yml \
+  --event workflow_dispatch --json databaseId,headSha,status,conclusion,url
 gh run view "$publish_run_id" --repo AgentWorkforce/sessions-pipeline
 gh run download "$publish_run_id" --repo AgentWorkforce/sessions-pipeline \
-  --name release-receipt
+  --name release-receipt --dir "$receipt_dir"
 ```
 
-Review the receipt's `image` digest, `source_sha`, `workflow_sha`, `ci_run_id` and
-publication run identity against the approved source and the run's actual
-`head_sha`. Set `image`, `source_sha`, `workflow_sha` and `ci_run_id` from those reviewed
-values. The registry must be accessible to the OCI client used by `gh`.
-
-Verify both trusted statements before promoting the image. Run this block as
-one Bash script so any failed verification stops the process:
+Check image/source/workflow/CI identities against the approved source and actual
+run metadata. Set image, source_sha, workflow_sha, ci_run_id, publish_run_id and
+publish_run_attempt to those reviewed values. Use the trusted verification
+script and pinned Cosign 3.1.4. Run this as one Bash script, so failure stops
+promotion:
 
 ```bash
 set -euo pipefail
-gh attestation verify "oci://$image" \
-  --repo AgentWorkforce/sessions-pipeline \
-  --signer-workflow AgentWorkforce/sessions-pipeline/.github/workflows/publish-image.yml \
-  --signer-digest "$workflow_sha" --source-ref refs/heads/main
-
-gh attestation verify "oci://$image" \
-  --repo AgentWorkforce/sessions-pipeline \
-  --signer-workflow AgentWorkforce/sessions-pipeline/.github/workflows/publish-image.yml \
-  --signer-digest "$workflow_sha" --source-ref refs/heads/main \
-  --predicate-type https://agentrelay.com/attestations/reviewed-image-source/v1 \
-  --format json > source-verification.json
-
-jq -e --arg source "$source_sha" --arg workflow "$workflow_sha" --arg ci "$ci_run_id" '
-  any(.[]; .verificationResult.statement.predicate |
-    .repository == "https://github.com/AgentWorkforce/sessions-pipeline" and
-    .source_ref == "refs/heads/main" and
-    .source_sha == $source and .workflow_sha == $workflow and .ci_run_id == $ci)
-' source-verification.json
+export ARTIFACT_DIR="$receipt_dir"
+export IMAGE_DIGEST="${image##*@}"
+test "$image" = "ghcr.io/agentworkforce/96bulls-services@$IMAGE_DIGEST"
+export SOURCE_SHA="$source_sha" WORKFLOW_SHA="$workflow_sha" SOURCE_CI_RUN="$ci_run_id"
+export PUBLISH_RUN_ID="$publish_run_id" PUBLISH_RUN_ATTEMPT="$publish_run_attempt"
+node scripts/image-release-provenance.mjs verify
 ```
 
-GitHub's certificate source digest describes the workflow run's source, so do
-not substitute the image's older `source_sha` for `workflow_sha` when checking
-the signer. Source metadata is a claim made by the trusted workflow; the
-signed statement does not replace reviewing that workflow's checkout and
-ancestry checks.
-
-Inspect both platform manifests and their SBOMs, then smoke-test the published
-digest. Pin that digest in deployment configuration. Publication alone does
-not upgrade a Helm release or apply database migrations.
+This verifies the actual index and both signed bundles without private-package
+pull credentials. Independently inspect both platform manifests/SBOMs, verify
+copied registry bytes against that digest and smoke-test the image. Pin the
+verified digest for deployment. Publication alone applies no deployment or
+migration. workflow_sha identifies the signer; source_sha identifies the image
+checkout. Those commits can differ. A matching label/tag, green job or parsed
+predicate alone does not prove identity.
 
 ## Canonical repository
 
-Release from `AgentWorkforce/sessions-pipeline`, preserving its repository identity
-and history. The separate `sessions-pipeline-oss` import has unrelated Git history;
-its commits are not eligible release sources for this repository. Select an
-approved original-main commit with successful CI instead.
-
-The existing package already grants this repository Actions access. Do not grant
-access to the duplicate import or change package visibility to publish here.
-GitHub artifact attestations require the repository to be public on the current
-plan; complete the original repository's public-readiness work before dispatch.
-Keep hosted deployment continuity, schema-release pins and migration history
-unchanged during that transition. Code integration does not dispatch a release.
+Publish from AgentWorkforce/sessions-pipeline, preserving identity/history.
+The sessions-pipeline-oss import has unrelated history and cannot supply its
+release source. Preserve hosted deployment, schema-release and migration pins.
+Repository visibility stays a separate owner decision; this path needs no change.

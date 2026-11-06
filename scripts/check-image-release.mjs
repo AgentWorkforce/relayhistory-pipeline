@@ -21,9 +21,16 @@ export function validateRequest(env) {
   return { sourceSha: env.SOURCE_SHA, workflowSha: env.GITHUB_SHA, note: note.trim() };
 }
 
-export function verifyAncestry(sourceSha, run = execFileSync) {
+export function verifyAncestry(sourceSha, run = execFileSync, token = process.env.GH_TOKEN) {
   if (!SHA.test(sourceSha)) refuse("full source SHA required");
-  try { run("git", ["fetch", "--no-tags", "origin", "main"], { stdio: "pipe" }); }
+  // Checkout intentionally persists no credentials. Authenticate this one fetch
+  // through process configuration, never argv, a credential file or git config.
+  const fetchOptions = { stdio: "pipe", ...(token ? { env: {
+    ...process.env, GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+    GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
+  } } : {}) };
+  try { run("git", ["fetch", "--no-tags", "origin", "main"], fetchOptions); }
   catch { refuse("cannot fetch current main"); }
   try {
     run("git", ["cat-file", "-e", `${sourceSha}^{commit}`], { stdio: "pipe" });
@@ -108,10 +115,16 @@ export function githubJSON(token, fetcher = fetch) {
   };
 }
 
+export function assertExpectedCI(ciRun, expected) {
+  if (expected !== undefined && (!/^[1-9][0-9]*$/.test(expected) || String(ciRun) !== expected))
+    refuse("source CI run changed after signing");
+}
+
 async function main() {
   const request = validateRequest(process.env);
   verifyAncestry(request.sourceSha);
   const ciRun = await verifySourceCI(request.sourceSha, githubJSON(process.env.GH_TOKEN));
+  assertExpectedCI(ciRun, process.env.EXPECTED_CI_RUN);
   if (!process.env.GITHUB_OUTPUT) refuse("workflow output missing");
   appendFileSync(process.env.GITHUB_OUTPUT, `sha=${request.sourceSha}\nci_run_id=${ciRun}\napproval_note=${request.note}\n`);
   console.log(`Approved source ${request.sourceSha}; successful main CI run ${ciRun}.`);
