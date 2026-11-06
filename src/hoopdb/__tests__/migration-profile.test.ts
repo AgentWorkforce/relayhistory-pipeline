@@ -15,6 +15,8 @@ import { schemaVerdict, type Transact } from "../../shared/db.ts";
 import {
   CLOUDSQL_PLATFORM_SUPERUSERS,
   functionBoundaryEvidence,
+  isRdsCreatorEdge,
+  RDS_PLATFORM_SUPERUSERS,
   isSupabaseCreatorEdge,
   isSupabasePublicTemp,
   isRuntimeWorkloadEdge,
@@ -115,7 +117,7 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
     ["no mode", { ...base, HOOPDB_SUPABASE_SHIM: "true" }, "db_mode_invalid"],
     [
       "an unknown mode",
-      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_SUPABASE_SHIM: "true" },
+      { ...base, HOOPDB_DB_MODE: "aurora", HOOPDB_SUPABASE_SHIM: "true" },
       "db_mode_invalid",
     ],
     [
@@ -142,6 +144,31 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
       "cloudsql without an explicit shim choice",
       { ...base, HOOPDB_DB_MODE: "cloudsql" },
       "shim_unset",
+    ],
+    [
+      "rds with the shim forced on",
+      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_SUPABASE_SHIM: "true" },
+      "shim_forbidden",
+    ],
+    [
+      "rds with the generic bootstrap forced on",
+      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_ROLE_BOOTSTRAP: "true" },
+      "bootstrap_forbidden",
+    ],
+    [
+      "rds with a workload role",
+      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_RUNTIME_WORKLOAD_ROLE: "app_login" },
+      "db_profile_invalid",
+    ],
+    [
+      "rds with the event-trigger boundary",
+      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_FUNCTION_BOUNDARY_MODE: "event-trigger" },
+      "function_boundary_mode_unsupported",
+    ],
+    [
+      "rds without an explicit runtime login choice",
+      { HOOPDB_DB_MODE: "rds", HOOPDB_RUNTIME_ROLE: "hoop_runtime" },
+      "runtime_role_login_unset",
     ],
     [
       "a non-boolean flag",
@@ -210,6 +237,24 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
       bootstrap: false,
       functionBoundary: "global-default-revoke",
     });
+    // rds: never the shim nor the generic bootstrap, with or without an explicit "false".
+    for (const shim of [{}, { HOOPDB_SUPABASE_SHIM: "false" }])
+      expect(
+        migrationProfile({
+          ...base,
+          ...shim,
+          HOOPDB_DB_MODE: "rds",
+          HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+        }),
+      ).toEqual({
+        mode: "rds",
+        shim: false,
+        bootstrap: false,
+        verify: true,
+        runtimeRole: "hoop_runtime",
+        runtimeLogin: true,
+        functionBoundary: "global-default-revoke",
+      });
   });
 
   test("migrate() refuses supabase+shim before opening any connection", async () => {
@@ -230,6 +275,17 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
       for (const k of Object.keys(process.env))
         if (!(k in saved)) delete process.env[k];
       Object.assign(process.env, saved);
+    }
+  });
+
+  test("readiness binds the explicit rds database mode", async () => {
+    const saved = process.env.HOOPDB_DB_MODE;
+    try {
+      process.env.HOOPDB_DB_MODE = "rds";
+      expect(await expectedSchema()).toMatchObject({ dbMode: "rds" });
+    } finally {
+      if (saved === undefined) delete process.env.HOOPDB_DB_MODE;
+      else process.env.HOOPDB_DB_MODE = saved;
     }
   });
 
@@ -764,6 +820,43 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       expect(isSupabaseCreatorEdge(cfg, 170011, { ...edge, ...mutation })).toBe(
         false,
       );
+  });
+
+  test("RDS PG16+ creator-edge predicate is bound to rds mode, the connected owner and rdsadmin", () => {
+    const cfg = { mode: "rds" as const };
+    const edge = {
+      rolname: "rds_master",
+      grantor: "rdsadmin",
+      grantor_super: true,
+      admin_option: true,
+      inherit_option: false,
+      set_option: false,
+    };
+    expect(isRdsCreatorEdge(cfg, 170011, edge, "rds_master")).toBe(true);
+    for (const mode of ["local", "selfhosted", "cloudsql", "supabase"] as const)
+      expect(isRdsCreatorEdge({ mode }, 170011, edge, "rds_master")).toBe(false);
+    expect(isRdsCreatorEdge(cfg, 150019, edge, "rds_master")).toBe(false);
+    expect(isRdsCreatorEdge(cfg, 170011, edge, "someone_else")).toBe(false);
+    for (const mutation of [
+      { rolname: "other_rds_superuser_member" },
+      { grantor: "rds_master" },
+      { grantor: "supabase_admin" },
+      { grantor_super: false },
+      { admin_option: false },
+      { inherit_option: true },
+      { set_option: true },
+    ])
+      expect(
+        isRdsCreatorEdge(cfg, 170011, { ...edge, ...mutation }, "rds_master"),
+      ).toBe(false);
+    // The Supabase predicate never matches in rds mode, and vice versa.
+    expect(
+      isSupabaseCreatorEdge(cfg, 170011, {
+        ...edge,
+        rolname: "postgres",
+        grantor: "supabase_admin",
+      }),
+    ).toBe(false);
   });
 
   test("runtime workload edge is exact, inheriting and granted only by the hosted creator or a superuser", () => {
@@ -1680,6 +1773,53 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         function_default_exact: false,
       }),
     );
+  });
+
+  test("RDS trust root: only AWS's fixed rdsadmin SUPERUSER is excluded, only in rds mode", async () => {
+    expect(Object.isFrozen(RDS_PLATFORM_SUPERUSERS)).toBe(true);
+    expect([...RDS_PLATFORM_SUPERUSERS]).toEqual(["rdsadmin"]);
+    const db = await supabaseLike();
+    await db.exec(
+      `${OWNER_FN_DEFAULT_REVOKE}; CREATE ROLE rdsadmin SUPERUSER NOLOGIN; CREATE ROLE rds_lookalike SUPERUSER NOLOGIN`,
+    );
+    const rds = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "rds",
+    );
+    // A second superuser stays covered, even with an RDS-like name.
+    expect(rds.satisfied).toBe(false);
+    expect(rds.excluded_platform_superusers.map((e) => e.role)).toEqual([
+      "rdsadmin",
+    ]);
+    expect(rds.sessions_create_roles).toContainEqual(
+      expect.objectContaining({ role: "rds_lookalike", function_default_exact: false }),
+    );
+    await db.exec("DROP ROLE rds_lookalike");
+    expect(
+      (await functionBoundaryEvidence(client(db), "global-default-revoke", "rds"))
+        .satisfied,
+    ).toBe(true);
+    for (const mode of ["selfhosted", "cloudsql", "supabase"] as const) {
+      const other = await functionBoundaryEvidence(
+        client(db),
+        "global-default-revoke",
+        mode,
+      );
+      expect(other.satisfied).toBe(false);
+      expect(other.excluded_platform_superusers.map((e) => e.role)).not.toContain(
+        "rdsadmin",
+      );
+    }
+    // The fixed name excluded only while it is SUPERUSER.
+    await db.exec("CREATE SCHEMA IF NOT EXISTS sessions; ALTER ROLE rdsadmin NOSUPERUSER; GRANT CREATE ON SCHEMA sessions TO rdsadmin");
+    const demoted = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "rds",
+    );
+    expect(demoted.excluded_platform_superusers).toEqual([]);
+    expect(demoted.satisfied).toBe(false);
   });
 
   test("Cloud SQL owner and migration-role bootstraps produce catalog-proven, membership-free state", async () => {

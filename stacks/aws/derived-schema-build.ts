@@ -35,7 +35,7 @@ Object.freeze(assets.verifiers); Object.freeze(assets);
 export async function derivedSchemaAssets() {
   const dbMode = process.env.HOOPDB_DB_MODE;
   return { expected: { ...assets.expected,
-    ...(["local", "selfhosted", "cloudsql", "supabase"].includes(dbMode ?? "") ? { dbMode } : {}) },
+    ...(["local", "selfhosted", "cloudsql", "supabase", "rds"].includes(dbMode ?? "") ? { dbMode } : {}) },
     verifiers: assets.verifiers };
 }
 `;
