@@ -141,7 +141,7 @@ jobs:
         run: git diff --exit-code
   # Build only: no registry login, publish, deploy, or provider credentials.
   amp-transport-image:
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
