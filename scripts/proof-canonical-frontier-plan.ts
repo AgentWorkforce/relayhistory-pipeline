@@ -64,6 +64,7 @@ const result = {
     postgresSource: "toy authority/maxima schema with fixed synthetic seed-capture callback",
     proven: "verified manifest/chunk bytes, sealed index membership, signed versioning and bounded toy read-only scan",
   },
+  qualification: "actual PG17 transaction + actual manifest/chunk/MinIO bytes; fixed seed RPC response and synthetic source schema; not production closure or actual migrated ingest_seed_scope_capture proof",
   test: "src/session-ingest/__tests__/frontier-plan.postgres.test.ts",
   status: test.status,
   stdout: test.stdout.trim(),

@@ -42,6 +42,7 @@ export interface FrontierTarget {
 export interface FrontierAuthority {
   sourceIdentitySha256: string | null;
   sourceGenerationSha256: string | null;
+  /** 40-hex authority head. The legacy adapter derives it from the authority digest; it is not a deployment commit. */
   sourceHead: string | null;
   controlEpoch: string | null;
   privacyBaselineSha256: string | null;
@@ -63,6 +64,8 @@ export interface FrontierScanEvidence {
   pageLimit: number;
   maxPages: number;
   pagesRead: number;
+  /** Rows returned by each actual query; the final query must return zero. */
+  pageItemCounts: number[];
   itemCount: number;
   byteCount: number;
   checkpointCount: number;
@@ -103,11 +106,16 @@ export interface FrontierRecordMaximum {
   revision: string | null;
   revisionId: string | null;
   digest: string | null;
+  kind: string | null;
   source: string | null;
   sessionId: string | null;
   operation: "upsert" | "delete" | null;
   authority: "seed-proof" | "receipt-seat" | null;
   exportRootSha256: string | null;
+  /** Hash carried from the verified object-byte record domain (semantic hash for seed proof). */
+  exportContentSha256: string | null;
+  /** Recomputable binding of native identity, object root, namespace and verified content evidence. */
+  exportEvidenceSha256: string | null;
 }
 
 export interface FrontierReceiptDecision {
@@ -128,6 +136,8 @@ export interface FrontierOriginCapture {
   opening: FrontierAuthority;
   closing: FrontierAuthority;
   sourceRecordCount: number | null;
+  /** Actual ordered privacy rows read (deletions + resets), excluding authority. */
+  privacyRowCount: number | null;
   scans: FrontierScanEvidence[];
   exportRoots: FrontierExportRoot[];
   recordMaxima: FrontierRecordMaximum[];
@@ -250,6 +260,24 @@ export function frontierExportRecordsSha256(records: FrontierExportMember[]): st
     textOrder(frontierCanonicalJson([identityKey(a.tenant), a.recordId]), frontierCanonicalJson([identityKey(b.tenant), b.recordId]))));
 }
 
+export function frontierRecordExportEvidenceSha256(record: FrontierRecordMaximum): string {
+  return frontierSha256({
+    protocol: "frontier-export-record-evidence-v1",
+    tenant: record.tenant,
+    recordId: record.recordId,
+    revision: record.revision,
+    revisionId: record.revisionId,
+    digest: record.digest,
+    kind: record.kind,
+    source: record.source,
+    sessionId: record.sessionId,
+    operation: record.operation,
+    authority: record.authority,
+    exportRootSha256: record.exportRootSha256,
+    exportContentSha256: record.exportContentSha256,
+  });
+}
+
 export function frontierScanItems(kind: FrontierScanKind, value: CanonicalFrontierCapture | FrontierOriginCapture): unknown {
   if (kind === "origin-inventory") {
     if (!("expectedOrigins" in value)) throw new Error("frontier_inventory_scope");
@@ -266,6 +294,7 @@ export function frontierScanItemsSha256(kind: FrontierScanKind, value: Canonical
   return frontierSha256(frontierScanItems(kind, value));
 }
 function frontierScanItemCount(kind: FrontierScanKind, value: CanonicalFrontierCapture | FrontierOriginCapture): number {
+  if (kind === "privacy-controls" && "privacyRowCount" in value) return value.privacyRowCount ?? -1;
   const items = frontierScanItems(kind, value);
   return Array.isArray(items) ? items.length : 1;
 }
@@ -315,8 +344,8 @@ function validateScan(scan: FrontierScanEvidence, expectedKind: FrontierScanKind
   if (!scan || scan.kind !== expectedKind || scan.adapter !== REQUIRED_ADAPTERS[expectedKind]) finding(findings, "capture_invalid", `${path}.adapter`);
   if (!HEX64.test(scan?.querySha256 ?? "") || !HEX64.test(scan?.snapshotSha256 ?? "") || !HEX64.test(scan?.pageChainSha256 ?? "")) finding(findings, "unknown_legacy_fact", `${path}.provenance`);
   if (!validTime(scan?.startedAt) || !validTime(scan?.finishedAt) || Date.parse(scan.startedAt) > Date.parse(scan.finishedAt) || Date.parse(scan.startedAt) < captureStartedAt || Date.parse(scan.finishedAt) > capturedAt) finding(findings, "capture_invalid", `${path}.time`);
-  if (!nonNegative(scan?.itemCount) || !nonNegative(scan?.byteCount) || !nonNegative(scan?.checkpointCount) || !Number.isSafeInteger(scan?.pageLimit) || scan.pageLimit < 1 || scan.pageLimit > 10_000 || !Number.isSafeInteger(scan?.maxPages) || scan.maxPages < 1 || scan.maxPages > 1_000_000 || !Number.isSafeInteger(scan?.pagesRead) || scan.pagesRead < 1 || scan.pagesRead > scan.maxPages) finding(findings, "capture_invalid", `${path}.bounds`);
-  else if (scan.pagesRead !== Math.ceil(scan.itemCount / scan.pageLimit) + 1 || scan.checkpointCount !== Math.max(0, scan.pagesRead - 1)) finding(findings, "scan_incomplete", `${path}.pageClosure`);
+  if (!nonNegative(scan?.itemCount) || !nonNegative(scan?.byteCount) || !nonNegative(scan?.checkpointCount) || !Number.isSafeInteger(scan?.pageLimit) || scan.pageLimit < 1 || scan.pageLimit > 10_000 || !Number.isSafeInteger(scan?.maxPages) || scan.maxPages < 1 || scan.maxPages > 1_000_000 || !Number.isSafeInteger(scan?.pagesRead) || scan.pagesRead < 1 || scan.pagesRead > scan.maxPages || !Array.isArray(scan?.pageItemCounts)) finding(findings, "capture_invalid", `${path}.bounds`);
+  else if (scan.pageItemCounts.length !== scan.pagesRead || scan.pageItemCounts.at(-1) !== 0 || scan.pageItemCounts.slice(0, -1).some(count => !Number.isSafeInteger(count) || count < 1 || count > scan.pageLimit) || scan.pageItemCounts.reduce((sum, count) => sum + count, 0) !== scan.itemCount || scan.checkpointCount !== scan.pageItemCounts.filter(count => count > 0).length) finding(findings, "scan_incomplete", `${path}.pageClosure`);
   if (scan?.complete !== true || scan?.terminalCursor !== null) finding(findings, "scan_incomplete", `${path}.terminalCursor`);
   if (validTime(scan?.finishedAt) && (capturedAt - Date.parse(scan.finishedAt) > FRONTIER_MAX_AGE_SECONDS * 1000 || Date.parse(scan.finishedAt) > capturedAt + 30_000)) finding(findings, "scan_stale", `${path}.finishedAt`);
   if (scan?.itemsSha256 !== expectedItemsSha256) finding(findings, "scan_hash_mismatch", `${path}.itemsSha256`);
@@ -396,6 +425,7 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
       if (origin.opening.controlEpoch !== origin.closing.controlEpoch || origin.opening.privacyBaselineSha256 !== origin.closing.privacyBaselineSha256 || origin.opening.privacyVersion !== origin.closing.privacyVersion) finding(findings, "privacy_changed", `${path}.closing.privacy`);
     }
     if (!nonNegative(origin.sourceRecordCount)) finding(findings, "unknown_legacy_fact", `${path}.sourceRecordCount`);
+    if (!nonNegative(origin.privacyRowCount)) finding(findings, "unknown_legacy_fact", `${path}.privacyRowCount`);
 
     const byKind = new Map<FrontierScanKind, FrontierScanEvidence>();
     for (const scan of origin.scans ?? []) {
@@ -413,7 +443,13 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
     for (const [rootIndex, root] of sorted(origin.exportRoots ?? [], exportOrder).entries()) {
       const rootPath = `${path}.exportRoots[${rootIndex}]`;
       if (!exactTenant(root.tenant, tenant)) finding(findings, "tenant_mismatch", `${rootPath}.tenant`);
-      if (root.provider !== "s3" || !["legacy-export", "buffered-stage"].includes(root.kind) || root.versioning !== "Enabled" || root.inventoryComplete !== true || !validText(root.versionId, 1024) || root.versionId === "null" || !HEX64.test(root.contentSha256) || !validDecimal(root.manifestRevision, false) || !nonNegative(root.recordCount) || !validText(root.bucket, 255) || !validText(root.keyRoot, 1024) || !validText(root.manifestKey, 1024) || !validId(root.source) || !validId(root.sessionId) || !validId(root.machineId) || !(root.manifestKey === root.keyRoot || root.manifestKey.startsWith(`${root.keyRoot}/`))) finding(findings, "export_not_immutable", rootPath);
+      const rootParts = typeof root.keyRoot === "string" ? root.keyRoot.split("/") : [];
+      const manifestParts = typeof root.manifestKey === "string" ? root.manifestKey.split("/") : [];
+      const bufferedKeyRoot = `${capture.target.keyRoot}/${tenant.orgId}/buffered-batches`;
+      const namespaceBound = root.kind === "legacy-export"
+        ? root.keyRoot === `${capture.target.keyRoot}/${tenant.orgId}`
+        : root.keyRoot === bufferedKeyRoot || root.keyRoot.startsWith(`${bufferedKeyRoot}/`);
+      if (root.provider !== "s3" || !["legacy-export", "buffered-stage"].includes(root.kind) || root.versioning !== "Enabled" || root.inventoryComplete !== true || !validText(root.versionId, 1024) || root.versionId === "null" || !HEX64.test(root.contentSha256) || !validDecimal(root.manifestRevision, false) || !nonNegative(root.recordCount) || !/^[a-z0-9][a-z0-9.-]{1,253}[a-z0-9]$/.test(root.bucket ?? "") || !validText(root.keyRoot, 1024) || root.keyRoot.startsWith("/") || root.keyRoot.endsWith("/") || rootParts.some(part => part === "" || part === "." || part === "..") || !validText(root.manifestKey, 1024) || manifestParts.some(part => part === "" || part === "." || part === "..") || !namespaceBound || !validId(root.source) || !validId(root.sessionId) || !validId(root.machineId) || !(root.manifestKey === root.keyRoot || root.manifestKey.startsWith(`${root.keyRoot}/`))) finding(findings, "export_not_immutable", rootPath);
       const digest = frontierExportRootSha256(root);
       if (rootHashes.has(digest)) finding(findings, "record_conflict", `${rootPath}.duplicate`);
       if (!exportBindings.has(digest)) finding(findings, "export_binding_missing", `${rootPath}.binding`);
@@ -428,17 +464,19 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
     for (const [recordIndex, record] of maxima.entries()) {
       const recordPath = `${path}.recordMaxima[${recordIndex}]`;
       if (!exactTenant(record.tenant, tenant)) finding(findings, "tenant_mismatch", `${recordPath}.tenant`);
-      if (!validId(record.recordId) || !validDecimal(record.revision, false) || !validId(record.revisionId) || !HEX64.test(record.digest ?? "") || !validId(record.source) || (record.sessionId !== null && !validId(record.sessionId)) || !["upsert", "delete"].includes(record.operation ?? "") || !["seed-proof", "receipt-seat"].includes(record.authority ?? "") || !HEX64.test(record.exportRootSha256 ?? "")) finding(findings, "unknown_legacy_fact", recordPath);
+      if (!validId(record.recordId) || !validDecimal(record.revision, false) || !validId(record.revisionId) || !HEX64.test(record.digest ?? "") || !validId(record.kind) || !validId(record.source) || (record.sessionId !== null && !validId(record.sessionId)) || !["upsert", "delete"].includes(record.operation ?? "") || !["seed-proof", "receipt-seat"].includes(record.authority ?? "") || !HEX64.test(record.exportRootSha256 ?? "") || !HEX64.test(record.exportContentSha256 ?? "") || !HEX64.test(record.exportEvidenceSha256 ?? "") || record.exportEvidenceSha256 !== frontierRecordExportEvidenceSha256(record)) finding(findings, "unknown_legacy_fact", recordPath);
       if (maximaById.has(record.recordId)) finding(findings, "record_conflict", `${recordPath}.recordId`);
       maximaById.set(record.recordId, record);
       const root = rootHashes.get(record.exportRootSha256 ?? "");
       if (!root) finding(findings, "record_coverage_incomplete", `${recordPath}.exportRootSha256`);
       else {
-        coveredByRoot.set(record.exportRootSha256!, (coveredByRoot.get(record.exportRootSha256!) ?? 0) + 1);
         const members = recordsByRoot.get(record.exportRootSha256!) ?? [];
         members.push(record); recordsByRoot.set(record.exportRootSha256!, members);
-        if (record.source !== root.source || record.sessionId !== root.sessionId)
-          finding(findings, "record_coverage_incomplete", `${recordPath}.rootNamespace`);
+        const expectedSource = record.sessionId === null ? "_none" : record.source;
+        const expectedSession = record.sessionId === null ? "_origin" : record.sessionId;
+        const expectedKind = record.authority === "seed-proof" ? "legacy-export" : "buffered-stage";
+        if (root.source !== expectedSource || root.sessionId !== expectedSession || root.kind !== expectedKind) finding(findings, "record_coverage_incomplete", `${recordPath}.exportRootNamespace`);
+        coveredByRoot.set(record.exportRootSha256!, (coveredByRoot.get(record.exportRootSha256!) ?? 0) + 1);
       }
     }
     if (origin.sourceRecordCount !== maxima.length) finding(findings, "record_coverage_incomplete", `${path}.sourceRecordCount`);
@@ -451,8 +489,9 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
 
     const decisions = sorted(origin.receiptDecisions ?? [], decisionOrder);
     const accepted = new Map<string, FrontierReceiptDecision>();
-    const seats = new Map<string, string>();
     const decisionKeys = new Set<string>();
+    const seatByRecord = new Map<string, string>();
+    const recordBySeat = new Map<string, string>();
     for (const [decisionIndex, decision] of decisions.entries()) {
       const decisionPath = `${path}.receiptDecisions[${decisionIndex}]`;
       if (!exactTenant(decision.tenant, tenant)) finding(findings, "tenant_mismatch", `${decisionPath}.tenant`);
@@ -460,11 +499,12 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
       const decisionKey = frontierCanonicalJson([decision.recordId, decision.revision, decision.revisionId, decision.candidateDigest]);
       if (decisionKeys.has(decisionKey)) finding(findings, "receipt_decision_conflict", `${decisionPath}.duplicate`);
       decisionKeys.add(decisionKey);
-      const priorSeat = seats.get(decision.recordId);
-      if (priorSeat !== undefined && priorSeat !== decision.seat) finding(findings, "receipt_decision_conflict", `${decisionPath}.seat`);
-      else seats.set(decision.recordId, decision.seat);
       const maximum = maximaById.get(decision.recordId);
       if (!maximum || maximum.authority !== "receipt-seat" || decision.revision !== maximum.revision || decision.firstDigest !== maximum.digest) finding(findings, "receipt_decision_conflict", `${decisionPath}.maximum`);
+      const priorSeat = seatByRecord.get(decision.recordId);
+      const priorRecord = recordBySeat.get(decision.seat);
+      if ((priorSeat !== undefined && priorSeat !== decision.seat) || (priorRecord !== undefined && priorRecord !== decision.recordId)) finding(findings, "receipt_decision_conflict", `${decisionPath}.seat`);
+      else { seatByRecord.set(decision.recordId, decision.seat); recordBySeat.set(decision.seat, decision.recordId); }
       if (decision.bodyAccepted) {
         if (decision.candidateDigest !== decision.firstDigest || accepted.has(decision.recordId)) finding(findings, "receipt_decision_conflict", `${decisionPath}.bodyAccepted`);
         accepted.set(decision.recordId, decision);
@@ -492,6 +532,7 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
       protocol: FRONTIER_CAPTURE_PROTOCOL,
       scope: tenant,
       sourceRecordCount: origin.sourceRecordCount,
+      privacyRowCount: origin.privacyRowCount,
       recordMaxima: maxima,
       receiptDecisions: decisions,
     };

@@ -12,7 +12,7 @@ import { signRequest } from "../../packages/object-store/src/sigv4.ts";
 import { sha256Hex } from "../../packages/object-store/src/crypto.ts";
 import type { FrontierExportBinding, FrontierExportRoot, FrontierTenant } from "./frontier-plan.ts";
 import { frontierExportRecordsSha256, frontierExportRootSha256, frontierSha256 } from "./frontier-plan.ts";
-import { SeedProofIndex, type ProofDeps, type SeedEvidence, type SeedPointer } from "./seed-proof.ts";
+import { SeedProofIndex, type ProofDeps, type SeedEvidence, type SeedPointer, type SeedProofBudget } from "./seed-proof.ts";
 import type { SeedSql } from "./seed.ts";
 
 const HEX40 = /^[a-f0-9]{40}$/;
@@ -43,6 +43,8 @@ export interface S3FrontierVersioningConfig {
   credentials: AwsCredentials;
   /** Path-style endpoint override, for example MinIO. */
   endpoint?: string;
+  /** Test-only path-style endpoint; must resolve to literal loopback. */
+  allowFixtureEndpoint?: boolean;
   fetch?: typeof fetch;
   maxBytes?: number;
   /** Synthetic credentials only; production HTTP endpoints are forbidden. */
@@ -56,8 +58,8 @@ export function createS3FrontierVersioningReader(config: S3FrontierVersioningCon
   if (!/^[a-z0-9-]{1,63}$/.test(config.region)) fail("frontier_versioning_region");
   const endpoint = config.endpoint === undefined ? undefined : new URL(config.endpoint);
   const loopback = endpoint && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
-  if (endpoint && (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash ||
-      (endpoint.protocol === "http:" && (!config.allowInsecureLoopbackFixture || !loopback))))
+  const fixtureEndpoint = config.allowFixtureEndpoint === true || config.allowInsecureLoopbackFixture === true;
+  if (endpoint && (!fixtureEndpoint || !["http:", "https:"].includes(endpoint.protocol) || !loopback || endpoint.username || endpoint.password || endpoint.search || endpoint.hash))
     fail("frontier_versioning_endpoint");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024) fail("frontier_versioning_bound");
   return {
@@ -115,10 +117,12 @@ export interface CaptureSeedScopeExportInput {
   keyRoot: string;
   /** Caller-owned local SQLite path. No source or destination write occurs. */
   cachePath: string;
-  kind?: FrontierExportRoot["kind"];
   maxRecords: number;
   maxEvidenceBytes: number;
-  deadlineMs: number;
+  /** Preferred wall-clock bound. `maxDurationMs` is retained for the capture CLI. */
+  deadlineMs?: number;
+  maxDurationMs?: number;
+  kind?: FrontierExportRoot["kind"];
 }
 
 export interface SeedScopeExportEvidence {
@@ -167,14 +171,15 @@ export async function captureSeedScopeExportEvidence(
   if (![tenant.orgId, tenant.workspaceId, tenant.userId, tenant.originId, input.source, input.sessionId].every(value => validIdentity(value, value === tenant.workspaceId)) ||
       !HEX64.test(input.generation) || !HEX40.test(input.sourceHead) || !validIdentity(input.keyRoot) ||
       input.keyRoot.split("/").some(part => part === "." || part === "..") || !validIdentity(input.cachePath) ||
-      !Number.isSafeInteger(input.maxRecords) || input.maxRecords < 0 || input.maxRecords > 10_000_000 ||
-      !Number.isSafeInteger(input.maxEvidenceBytes) || input.maxEvidenceBytes < 1 || input.maxEvidenceBytes > 256 * 1024 * 1024 ||
-      !Number.isSafeInteger(input.deadlineMs) || input.deadlineMs < 1 || input.deadlineMs > 60 * 60 * 1000 ||
       (input.kind !== undefined && input.kind !== "legacy-export" && input.kind !== "buffered-stage")) fail("frontier_seed_identity");
+  const maxRecords = input.maxRecords;
+  const maxEvidenceBytes = input.maxEvidenceBytes;
+  const durations = [input.deadlineMs, input.maxDurationMs].filter((value): value is number => value !== undefined);
+  const maxDurationMs = durations.length ? Math.min(...durations) : undefined;
+  if (!Number.isSafeInteger(maxRecords) || maxRecords < 0 || maxRecords > 10_000_000 || !Number.isSafeInteger(maxEvidenceBytes) || maxEvidenceBytes < 1 || maxEvidenceBytes > 256 * 1024 * 1024 || !Number.isSafeInteger(maxDurationMs) || maxDurationMs! < 1 || maxDurationMs! > 60 * 60 * 1000) fail("frontier_seed_bound");
   if (deps.provider !== "s3" || deps.reader.provider !== "s3" || deps.reader.bucket !== deps.bucket) fail("frontier_seed_store_identity");
-
-  const deadlineAt = Date.now() + input.deadlineMs;
-  const checkDeadline = () => { if (Date.now() >= deadlineAt) fail("frontier_seed_deadline"); };
+  const budget: SeedProofBudget = { records: 0, evidenceBytes: 0, maxRecords, maxEvidenceBytes, deadlineAtMs: Date.now() + maxDurationMs! };
+  const checkDeadline = (): void => { if (Date.now() >= budget.deadlineAtMs) fail("frontier_seed_deadline"); };
   const rpc = async (): Promise<SeedScopeCapture> => {
     checkDeadline();
     const params = { org_id: tenant.orgId, workspace_id: tenant.workspaceId, source: input.source, session_id: input.sessionId, generation: input.generation, mode: "preview" };
@@ -190,6 +195,7 @@ export async function captureSeedScopeExportEvidence(
   checkDeadline();
   if (openingVersioning !== "Enabled") fail("frontier_seed_bucket_unversioned");
   const opening = await rpc();
+  checkDeadline();
   const versions = new Map<string, string>();
   const capturingReader: ManifestReader = {
     provider: deps.reader.provider,
@@ -208,13 +214,9 @@ export async function captureSeedScopeExportEvidence(
   const index = new SeedProofIndex(input.cachePath, tenant.orgId, input.sourceHead);
   try {
     index.restartVerification();
-    let visitedRecords = 0;
-    const guard = {
-      check: checkDeadline,
-      record() { checkDeadline(); if (++visitedRecords > input.maxRecords) fail("frontier_seed_record_bound"); },
-    };
-    for (const pointer of opening.pointers) await index.addPointer(pointer, { ...deps, reader: capturingReader }, guard);
+    for (const pointer of opening.pointers) await index.addPointer(pointer, { ...deps, reader: capturingReader }, budget);
     const closing = await rpc();
+    checkDeadline();
     if (closing.fingerprint !== opening.fingerprint || closing.source_epoch !== opening.source_epoch) fail("frontier_seed_source_changed");
     const sealed = index.seal(closing.pointers);
     if (sealed.non_delivery_pointers !== 0 || sealed.unseeded_records !== 0) fail("frontier_seed_unknown_records");
@@ -225,21 +227,23 @@ export async function captureSeedScopeExportEvidence(
 
     const pointers = new Map(opening.pointers.map(pointer => [String(pointer.capture.pointer_id), pointer]));
     const byPointer = new Map(opening.pointers.map(pointer => [String(pointer.capture.pointer_id), [] as SeedEvidence[]]));
-    let evidenceBytes = 0;
     let enumeratedRecords = 0;
+    let enumeratedBytes = 0;
     for (const batch of index.evidenceBatches()) for (const record of batch.records) {
       checkDeadline();
       enumeratedRecords++;
-      evidenceBytes += Buffer.byteLength(JSON.stringify(record));
-      if (evidenceBytes > input.maxEvidenceBytes) fail("frontier_seed_evidence_bound");
+      enumeratedBytes += Buffer.byteLength(JSON.stringify(record));
+      if (enumeratedRecords > maxRecords || enumeratedBytes > maxEvidenceBytes) fail("frontier_seed_bound");
       if (record.org_id !== tenant.orgId || record.workspace_id !== tenant.workspaceId || record.user_id !== tenant.userId || record.origin_id !== tenant.originId) continue;
       const records = byPointer.get(record.pointer_id) ?? [];
       records.push(record);
       byPointer.set(record.pointer_id, records);
     }
+    if (enumeratedRecords !== sealed.records) fail("frontier_seed_terminal_coverage");
     const roots: FrontierExportRoot[] = [];
     const bindings: FrontierExportBinding[] = [];
     const evidenceRecords: Array<{ evidence: SeedEvidence; exportRootSha256: string }> = [];
+    let outputEvidenceBytes = 0;
     for (const pointerId of [...byPointer.keys()].sort()) {
       checkDeadline();
       const pointer = pointers.get(pointerId);
@@ -264,7 +268,12 @@ export async function captureSeedScopeExportEvidence(
           sessionId: evidence.session_id, operation: evidence.operation,
         }))),
       });
-      for (const evidence of records) evidenceRecords.push({ evidence, exportRootSha256: rootSha256 });
+      for (const evidence of records) {
+        const item = { evidence, exportRootSha256: rootSha256 };
+        outputEvidenceBytes += Buffer.byteLength(JSON.stringify(item));
+        if (evidenceRecords.length >= maxRecords || outputEvidenceBytes > maxEvidenceBytes || Date.now() > budget.deadlineAtMs) fail("frontier_seed_bound");
+        evidenceRecords.push(item);
+      }
     }
     roots.sort((a, b) => a.manifestKey < b.manifestKey ? -1 : a.manifestKey > b.manifestKey ? 1 : (a.versionId! < b.versionId! ? -1 : a.versionId! > b.versionId! ? 1 : 0));
     evidenceRecords.sort((a, b) => a.evidence.record_id < b.evidence.record_id ? -1 : a.evidence.record_id > b.evidence.record_id ? 1 : 0);
@@ -278,7 +287,7 @@ export async function captureSeedScopeExportEvidence(
       versioningOpeningSha256, versioningClosingSha256,
     };
     checkDeadline();
-    if (Buffer.byteLength(JSON.stringify(result)) > input.maxEvidenceBytes) fail("frontier_seed_evidence_bound");
+    if (Buffer.byteLength(JSON.stringify(result)) > maxEvidenceBytes) fail("frontier_seed_evidence_bound");
     checkDeadline();
     return result;
   } finally {
