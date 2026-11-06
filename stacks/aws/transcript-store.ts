@@ -83,6 +83,7 @@ export const TRANSCRIPT_STAGE = "aws-sessions-prod";
 export const TRANSCRIPT_ACCOUNT_ID = "941433935742";
 export const TRANSCRIPT_PARTITION = "aws";
 export const ACCESS_LOG_PREFIX = "s3-access/transcripts/";
+export const INBOX_CANDIDATE_KEY_ROOT = "96bulls/upload-inbox/v1";
 
 export interface TranscriptStoreInputs {
   /** Exact, separately managed GC role. Required for this production stage: omission must never revoke active GC access. */
@@ -94,6 +95,8 @@ export interface TranscriptStoreInputs {
   managementEvents?: boolean;
   /** Optional role allowed to decrypt/re-encrypt CloudTrail log files. Omit for no trail-log read path. */
   auditPrincipalArn?: string;
+  /** Default-off immutable inbox authority root. Omit to preserve the existing srv-writer policy exactly. */
+  inboxAuthorityKeyRoot?: string;
   /**
    * The session pipeline (session-pipeline.ts): S3 manifest events -> SQS -> Lambda -> Supabase
    * pointer + ClickHouse index. Omit for the store alone.
@@ -143,15 +146,38 @@ export function transcriptNames(stage: string, accountId: string): TranscriptNam
 
 export const userArn = (accountId: string, path: string, name: string) => `arn:aws:iam::${accountId}:user${path}${name}`;
 
+function validInboxAuthorityKeyRoot(value: unknown): value is string {
+  if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
+  const parts = value.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) return false;
+  return !(
+    value === INBOX_CANDIDATE_KEY_ROOT ||
+    value.startsWith(`${INBOX_CANDIDATE_KEY_ROOT}/`) ||
+    INBOX_CANDIDATE_KEY_ROOT.startsWith(`${value}/`)
+  );
+}
+
+function assertInboxAuthorityKeyRoot(value: unknown, refuse: (why: string) => never): asserts value is string | undefined {
+  if (value !== undefined && !validInboxAuthorityKeyRoot(value))
+    refuse(`transcriptStore.inboxAuthorityKeyRoot must be an isolated 96bulls/ root distinct from ${INBOX_CANDIDATE_KEY_ROOT}`);
+}
+
 /** Every session object, in every org: `<bucket>/96bulls/*\/v1/*<tail>`. */
 const sessionObjects = (bucketArn: string, tail: string) => `${bucketArn}/${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/*${tail}`;
 const allObjects = (bucketArn: string) => `${bucketArn}/${TENANT_KEY_BASE}/*`;
 /** The relayhistory-api Worker's live writer: server-side machines (`m=srv_<hash>`) and the live prefixes, in every org. */
-export const srvWriterObjects = (bucketArn: string) => [
-  `${bucketArn}/${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/ws=*/m=srv_*`,
-  `${bucketArn}/${TENANT_KEY_BASE}/*/live-sessions/*`,
-  `${bucketArn}/${TENANT_KEY_BASE}/*/live-batches/*`,
-];
+export const srvWriterObjects = (bucketArn: string, inboxAuthorityKeyRoot?: string) => {
+  assertInboxAuthorityKeyRoot(inboxAuthorityKeyRoot, (why) => { throw new Error(why); });
+  return [
+    `${bucketArn}/${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/ws=*/m=srv_*`,
+    `${bucketArn}/${TENANT_KEY_BASE}/*/live-sessions/*`,
+    `${bucketArn}/${TENANT_KEY_BASE}/*/live-batches/*`,
+    ...(inboxAuthorityKeyRoot ? [
+      `${bucketArn}/${inboxAuthorityKeyRoot}/*`,
+      `${bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
+    ] : []),
+  ];
+};
 
 /**
  * Inputs a transcript-store stage must not carry: it is S3 only (decision 0001),
@@ -178,8 +204,9 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
   assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
+  assertInboxAuthorityKeyRoot(store.inboxAuthorityKeyRoot, refuse);
   if (store.sessionPipeline !== undefined) assertSessionPipelineInputs(store.sessionPipeline, refuse);
   if (store.sessionReadApi !== undefined) assertSessionReadApiInputs(store.sessionReadApi, refuse);
   if (store.managementEvents !== undefined && typeof store.managementEvents !== "boolean") refuse("transcriptStore.managementEvents must be a boolean");
@@ -203,6 +230,7 @@ export type TranscriptStorePlanPhase =
   | "post-merge policy remediation"
   | "srv-writer addition"
   | "srv-writer propagation recovery"
+  | "srv-writer inbox policy update"
   | "post-apply"
   | "session pipeline rollout"
   | "session pipeline update"
@@ -399,6 +427,9 @@ const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; ac
   // KMS refused the key policy because the new principal had not propagated. Only the key policy update
   // that adds the srv-writer's statement is accepted (assertSrvWriterRecoveryDiff).
   { name: "srv-writer propagation recovery", actions: { "transcripts-key": "update" } },
+  // Default-off inbox authority activation changes only the existing srv-writer's inline policy.
+  // The detailed plan must add exactly the two reviewed object roots to both Get and Put.
+  { name: "srv-writer inbox policy update", actions: { "transcript-srv-writer": "update" } },
   { name: "post-apply", actions: {} },
 ];
 
@@ -552,9 +583,10 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   );
   if (!phase) {
     const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
-    return refuse(`action set does not match initial, recovery, exact two-policy remediation, srv-writer addition, srv-writer recovery, or post-apply phase: ${changes.join(", ") || "(none)"}`);
+    return refuse(`action set does not match initial, recovery, exact two-policy remediation, srv-writer addition/recovery/inbox-policy update, or post-apply phase: ${changes.join(", ") || "(none)"}`);
   }
   if (phase.name === "srv-writer propagation recovery") assertSrvWriterRecoveryDiff(capture.detailedPlanText, capture.stateSnapshotText, refuse);
+  if (phase.name === "srv-writer inbox policy update") assertSrvWriterInboxPolicyDiff(capture.detailedPlanText, refuse);
   return phase.name;
 }
 
@@ -577,6 +609,37 @@ function detailedBlock(lines: readonly string[], resource: string): string[] {
   const rest = lines.slice(start + 1);
   const end = rest.findIndex((line) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(line));
   return end < 0 ? rest : rest.slice(0, end);
+}
+
+/**
+ * The one permitted srv-writer policy expansion. The rendered diff must add the
+ * same reviewed authority and candidate object ARNs once to Get and once to
+ * Put, without removing or changing any other property/action/condition.
+ */
+function assertSrvWriterInboxPolicyDiff(detailedPlanText: string, refuse: (why: string) => never): void {
+  const label = "srv-writer inbox policy update";
+  const marked = detailedBlock(detailedPlanText.split(/\r?\n/), "transcript-srv-writer")
+    .map((line) => /^  ([+-]) (.*)$/.exec(line))
+    .filter((match): match is RegExpExecArray => match !== null);
+  const removed = marked.filter((match) => match[1] === "-").map((match) => match[2]!.trim());
+  const added = marked.filter((match) => match[1] === "+").map((match) => match[2]!.trim());
+  if (removed.length !== 0) refuse(`${label}: the policy update removes or changes existing lines`);
+  if (added.length !== 4) refuse(`${label}: expected exactly four added resource lines, found ${added.length}`);
+
+  const bucketArn = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID).bucketArn;
+  const candidate = `- ${bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`;
+  if (added.filter((line) => line === candidate).length !== 2)
+    refuse(`${label}: the fixed candidate resource must be added exactly to Get and Put`);
+  const authority = added.filter((line) => line !== candidate);
+  if (authority.length !== 2 || authority[0] !== authority[1])
+    refuse(`${label}: one exact authority resource must be added to Get and Put`);
+  const prefix = `- ${bucketArn}/`;
+  const line = authority[0] ?? "";
+  if (!line.startsWith(prefix) || !line.endsWith("/*"))
+    refuse(`${label}: the authority resource must be an object ARN in the transcripts bucket`);
+  const keyRoot = line.slice(prefix.length, -2);
+  if (!validInboxAuthorityKeyRoot(keyRoot))
+    refuse(`${label}: the authority resource is not an isolated reviewed key root`);
 }
 
 /** Whether the detailed plan's `session-pipeline` update block is exactly "no declared property changes". */
@@ -1094,8 +1157,8 @@ export function transcriptWriterPolicy(bucketArn: string) {
  * to S3 in this region. ListBucket on the bucket (missing keys must 404, see
  * below); no delete, no old versions, no bucket changes.
  */
-export function transcriptSrvWriterPolicy(i: { bucketArn: string; accountId: string; region: string; keyAlias: string }) {
-  const objects = srvWriterObjects(i.bucketArn);
+export function transcriptSrvWriterPolicy(i: { bucketArn: string; accountId: string; region: string; keyAlias: string; inboxAuthorityKeyRoot?: string }) {
+  const objects = srvWriterObjects(i.bucketArn, i.inboxAuthorityKeyRoot);
   return {
     Version: "2012-10-17" as const,
     Statement: [
@@ -1203,6 +1266,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
     // Defense in depth for direct callers: refuse before declaring the first resource.
     if (i.stage === TRANSCRIPT_STAGE || i.transcriptStore.bufferedGcRoleArn !== undefined)
       assertBufferedGcRoleArn(i.transcriptStore.bufferedGcRoleArn, i.accountId);
+    assertInboxAuthorityKeyRoot(i.transcriptStore.inboxAuthorityKeyRoot, (why) => { throw new Error(why); });
     const n = transcriptNames(i.stage, i.accountId);
     const eraserArn = userArn(i.accountId, n.userPath, n.eraser);
     const user = (id: string, userName: string, purpose: string, policy: object) =>
@@ -1221,7 +1285,13 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       "transcript-srv-writer",
       n.srvWriter,
       "relayhistory-api-worker-writes-live-transcripts",
-      transcriptSrvWriterPolicy({ bucketArn: n.bucketArn, accountId: i.accountId, region: i.region, keyAlias: n.keyAlias }),
+      transcriptSrvWriterPolicy({
+        bucketArn: n.bucketArn,
+        accountId: i.accountId,
+        region: i.region,
+        keyAlias: n.keyAlias,
+        inboxAuthorityKeyRoot: i.transcriptStore.inboxAuthorityKeyRoot,
+      }),
     );
 
     // CloudTrail into its own bucket and key, as in the baseline (hardening.ts trailKeyPolicy).
