@@ -101,14 +101,35 @@ export async function syncOwned(
 ): Promise<{ rows: number; inserted: number; removed: number }> {
   const page = opts.pageRows ?? 5000;
   if (!Number.isInteger(page) || page < 1 || page > 20000) throw new HandoffRefusal("invalid_page_rows");
-  // One sync at a time: an overlapping run's older Neon cursor could undo a newer run's pages. Session-level, held for
-  // the whole run (each page additionally serializes with activation through the guard's authority lock).
-  const got = (await supa.query<{ ok: boolean }>("SELECT pg_try_advisory_lock(1919249529,97) AS ok")).rows[0]?.ok;
-  if (got !== true) throw new HandoffRefusal("sync_owned_in_progress");
+  // One sync at a time: an overlapping run's older Neon cursor could undo a newer run's pages. A SESSION lock held for
+  // the whole run (each page additionally serializes with activation through the guard's authority lock). Session
+  // locks need session affinity, which a transaction pooler breaks (another client can be handed this backend, where
+  // the lock is reentrant; an unlock can land elsewhere). So the backend is pinned by pid: the lock is taken only on
+  // the backend that just proved it does not already hold it, every page checks the pid before writing, and the
+  // unlock runs only on that backend. Any mismatch refuses (sync_session_reassigned).
+  const probe = (await supa.query<{ pid: number; held: boolean }>(
+    "SELECT pg_backend_pid() AS pid, EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=1919249529 AND objid=97 AND objsubid=2 AND pid=pg_backend_pid() AND granted) AS held",
+  )).rows[0];
+  if (!probe || typeof probe.pid !== "number") throw new HandoffRefusal("sync_session_unknown");
+  if (probe.held) throw new HandoffRefusal("sync_owned_in_progress");
+  const pid = probe.pid;
+  const got = (await supa.query<{ ok: boolean | null; pid: number }>(
+    "SELECT CASE WHEN pg_backend_pid()=$1::int THEN pg_try_advisory_lock(1919249529,97) END AS ok, pg_backend_pid() AS pid", [pid],
+  )).rows[0];
+  if (!got || got.pid !== pid || got.ok === null) throw new HandoffRefusal("sync_session_reassigned");
+  if (got.ok !== true) throw new HandoffRefusal("sync_owned_in_progress");
+  let failure: unknown;
   try {
-    return await syncOwnedLocked(neon, supa, page, opts.hooks?.beforePageCommit);
+    return await syncOwnedLocked(neon, supa, page, pid, opts.hooks?.beforePageCommit);
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    await supa.query("SELECT pg_advisory_unlock(1919249529,97)").catch(() => undefined);
+    const un = await supa.query<{ ok: boolean | null; pid: number }>(
+      "SELECT CASE WHEN pg_backend_pid()=$1::int THEN pg_advisory_unlock(1919249529,97) END AS ok, pg_backend_pid() AS pid", [pid],
+    ).then((r) => r.rows[0], () => undefined);
+    // An unlock that did not run on the locking backend leaves the lock to that session's end: report it, never hide it.
+    if (failure === undefined && (!un || un.pid !== pid || un.ok !== true)) throw new HandoffRefusal("sync_session_reassigned");
   }
 }
 
@@ -116,6 +137,7 @@ async function syncOwnedLocked(
   neon: Queryable,
   supa: Queryable,
   page: number,
+  pid: number,
   beforePageCommit?: (page: number) => Promise<void>,
 ): Promise<{ rows: number; inserted: number; removed: number }> {
   const s = await readSupabaseState(supa);
@@ -126,6 +148,9 @@ async function syncOwnedLocked(
   const applyPage = async (batch: OwnedRow[], last: boolean) => {
     await supa.query("BEGIN ISOLATION LEVEL READ COMMITTED");
     try {
+      // Session affinity: the page must run on the backend that holds the sync lock, before any write.
+      const here = (await supa.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]?.pid;
+      if (here !== pid) throw new HandoffRefusal("sync_session_reassigned");
       const doc = JSON.stringify(batch);
       const ins = await supa.query<{ n: string }>(
         `WITH x AS (INSERT INTO sessions.ingest_frozen_source_owned_sessions(${OWNED_COLS})

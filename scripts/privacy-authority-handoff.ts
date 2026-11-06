@@ -8,12 +8,15 @@
  *   <creds> | bun run scripts/privacy-authority-handoff.ts release  --epoch <hex64>
  *
  * stdin (RAM only, never a file or env): {"neonUrl": "<read-only-capable Neon URL>", "supabaseUrl": "<Supabase owner URL>"}
+ * Both must be DEDICATED direct or session-mode connections (session settings, a session advisory lock and one
+ * cursor must stay on one backend). Known transaction poolers (Supabase :6543, pgbouncer=true, Neon -pooler hosts)
+ * are refused before any connection; sync-owned also verifies its backend pid at runtime.
  * (`release` and `fence` need only supabaseUrl). Output: one JSON line, aggregate only.
  * Exit: 0 done / parity · 3 census differs · 1 refused or failed · 64 usage.
  */
 import pg from "pg";
 import { activate, census, fence, release, syncOwned, HandoffRefusal } from "../src/migration/privacy-authority-handoff.ts";
-import { postgresUrl, readStdinCredentials, refuseCredentialEnv, CredentialRefusal } from "../src/migration/stdin-credentials.ts";
+import { readStdinCredentials, refuseCredentialEnv, sessionAffinityUrl, CredentialRefusal } from "../src/migration/stdin-credentials.ts";
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const out = (fields: Record<string, unknown>) => process.stdout.write(JSON.stringify({ at: new Date().toISOString(), tool: "privacy-authority-handoff", ...fields }) + "\n");
@@ -45,9 +48,12 @@ async function main(): Promise<number> {
   const creds = await readStdinCredentials(needsNeon ? ["neonUrl", "supabaseUrl"] : ["supabaseUrl"], ["neonUrl", "supabaseUrl"]);
   const clients: pg.Client[] = [];
   try {
-    const supa = await connect(postgresUrl(creds.supabaseUrl, "supabaseUrl"), "c3-privacy-authority-handoff", cmd === "census");
+    // Both URLs are checked before EITHER connection is opened.
+    const supabaseUrl = sessionAffinityUrl(creds.supabaseUrl, "supabaseUrl", "supabase");
+    const neonUrl = needsNeon ? sessionAffinityUrl(creds.neonUrl, "neonUrl", "neon") : undefined;
+    const supa = await connect(supabaseUrl, "c3-privacy-authority-handoff", cmd === "census");
     clients.push(supa);
-    const neon = needsNeon ? await connect(postgresUrl(creds.neonUrl, "neonUrl"), "c3-privacy-authority-handoff-ro", true) : undefined;
+    const neon = neonUrl ? await connect(neonUrl, "c3-privacy-authority-handoff-ro", true) : undefined;
     if (neon) clients.push(neon);
     delete creds.neonUrl;
     delete creds.supabaseUrl;
