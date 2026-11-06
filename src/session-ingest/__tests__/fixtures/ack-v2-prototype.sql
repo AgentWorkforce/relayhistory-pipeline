@@ -180,6 +180,9 @@ BEGIN
   IF e.o_claim=p_claim AND (e.own_key IS DISTINCT FROM e.o_key OR (q_km[array_position(q_ord,e.o_ord)]->>7) IS DISTINCT FROM (e.km->>7)
    OR e.fd IS DISTINCT FROM q_cd[array_position(q_ord,e.o_ord)]) THEN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: in-claim reuse key mismatch';END IF;
+  IF (e.flags&4)=4 AND (e.o_claim IS DISTINCT FROM p_claim) AND EXISTS(SELECT 1 FROM generate_series(1,e.idx::int-1) gs(gk)
+    WHERE (a_f[gs.gk]&1)=1 AND (q_km[gs.gk]->>7)=(e.km->>7)) THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: reuse must name the latest prior in-claim accept';END IF;
   IF e.o_claim=p_claim AND EXISTS(SELECT 1 FROM generate_series(array_position(ords,e.o_ord)+1,e.idx::int-1) gs(gk)
     WHERE (a_f[gs.gk]&1)=1 AND (q_km[gs.gk]->>7)=(e.km->>7)) THEN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: in-claim reuse must name the latest prior accept';END IF;
@@ -295,7 +298,11 @@ BEGIN
     num_nonnulls(nr.current_source,nr.current_session,nr.current_revision,nr.current_digest,nr.current_reset_epoch,nr.current_fence_epoch)=0 clear_shape,
     -- K accept: the receipt seat is a FRESH (above the committed clock; v1/v1r advance the clock only after their loop),
     -- non-compat seat whose key material binds this slot's tenant/owner/record and every custody field (v9 review H1)
+    o.current_revision o_rev,nr.current_revision nr_rev,
     (sn.key_sha256 IS NOT NULL AND sn.compat_vector_claim IS NULL AND sn.seat>c.last_seat
+     AND sn.key_material->>0='buffer-first-ack-seat-v1' AND sn.key_material->>12=nr.current_fence_epoch::text
+     AND jsonb_array_length(sn.key_material)=13
+     AND sn.key_sha256=encode(sha256(convert_to(jsonb_build_array('lazy-ack-seat-v1',encode(sha256(convert_to(sn.key_material::text,'UTF8')),'hex'),sn.seat::text)::text,'UTF8')),'hex')
      AND sn.key_material->>1=c.control_epoch AND sn.key_material->>2=c.source_identity_sha256
      AND sn.key_material->>3=nr.org_id AND sn.key_material->>4=nr.workspace_id AND sn.key_material->>5=nr.current_owner
      AND sn.key_material->>6=nr.origin_id AND sn.key_material->>7=nr.record_id AND sn.key_material->>8=nr.current_revision::text
@@ -308,7 +315,8 @@ BEGIN
   SELECT count(*) INTO v_bad FROM t WHERE NOT(
        (same AND nl=ol)
     OR (NOT same AND g='S' AND (oo IS NULL OR oo=no) AND nl>ol AND (os IS NULL OR ns>os))        -- S is bound to its final winner below
-    OR (NOT same AND g='K' AND (oo IS NULL OR oo=no) AND nl=ol+1 AND (os IS NULL OR ns>os) AND k_bound)
+    OR (NOT same AND g='K' AND (oo IS NULL OR oo=no) AND nl=ol+1 AND (os IS NULL OR ns>os) AND k_bound
+        AND (oo IS NULL OR nr_rev>o_rev))
     OR (NOT same AND f IN('L','K','S') AND g='U' AND clear_shape AND nl=ol+1));
   IF v_bad>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot regression refused';END IF;
  ELSIF EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL OR current_seat_key IS NOT NULL OR lineage<>0) THEN

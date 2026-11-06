@@ -322,6 +322,31 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
   }finally{await f.close()}
  });
 
+ test("K-edge binding, single-cause negatives against a fresh self-consistent receipt seat (second review MAJORs)",async()=>{
+  const f=await fixture(kind,"bridge-v1");try{
+   await f.send("k1",[record({record_id:"K",session_id:"s"})]);
+   const k=(await f.db.query("SELECT n.current_seat_key,n.lineage::text lineage,s.key_material,s.seat::text seat FROM sessions.ingest_lazy_native_slots n JOIN sessions.ingest_receipt_seats s ON s.key_sha256=n.current_seat_key WHERE n.record_id='K'")).rows[0];
+   const forge=async(rev:string,rid="K",digest="a".repeat(64))=>{const km=[...k.key_material];km[8]=rev;km[7]=rid;
+    const r=(await f.db.query(`WITH x AS(SELECT $1::jsonb km,(SELECT last_seat+3+$2::int FROM sessions.ingest_receipt_seat_clock) seat)
+     INSERT INTO sessions.ingest_receipt_seats(key_sha256,key_material,seat,first_digest,source,session_id,fence_epoch)
+     SELECT encode(sha256(convert_to(jsonb_build_array('lazy-ack-seat-v1',encode(sha256(convert_to(km::text,'UTF8')),'hex'),seat::text)::text,'UTF8')),'hex'),km,seat,$3,'claude','s',0 FROM x
+     RETURNING key_sha256`,[JSON.stringify(km),Math.floor(Math.random()*1000),digest])).rows[0];return r.key_sha256 as string};
+   const good=await forge("2");
+   const base={key:good,rev:"2",digest:"a".repeat(64),owner:"user-1",source:"claude",session:"s",reset:"0",fence:"0",lin:String(Number(k.lineage)+1)};
+   const upd=(o:any)=>f.db.query(`UPDATE sessions.ingest_lazy_native_slots SET current_seat_key=$1,current_revision=$2,current_digest=$3,current_owner=$4,current_source=$5,current_session=$6,
+     current_reset_epoch=$7,current_fence_epoch=$8,lineage=$9 WHERE record_id='K'`,[o.key,o.rev,o.digest,o.owner,o.source,o.session,o.reset,o.fence,o.lin]);
+   const single:[string,any][]=[["revision",{rev:"3"}],["digest",{digest:"b".repeat(64)}],["owner",{owner:"user-9"}],["source",{source:"codex"}],["session",{session:"other"}],
+    ["session NULL",{session:null}],["reset epoch",{reset:"1"}],["fence epoch",{fence:"1"}],["lineage +2",{lin:String(Number(k.lineage)+2)}],["lineage unchanged",{lin:k.lineage}]];
+   for(const [name,d] of single)await expectCode(upd({...base,...d}),"slot regression refused").catch(e=>{throw Error("K single-cause "+name+": "+e)});
+   await expectCode(upd({...base,key:await forge("2","OTHER")}),"slot regression refused");                 // another record's fresh seat
+   await expectCode(upd({...base,key:await forge("1"),rev:"1"}),"slot regression refused");                  // fresh self-consistent seat, revision not increasing
+   // RESIDUAL (documented, not a defect of the binding): a fully self-consistent receipt INSERTED by the table owner is accepted;
+   // receipt provenance rests on owner-only INSERT, exactly as in v1 (which has no validator at all).
+   await upd(base);
+   expect((await f.db.query("SELECT current_seat_key k FROM sessions.ingest_lazy_native_slots WHERE record_id='K'")).rows[0].k).toBe(good);
+  }finally{await f.close()}
+ });
+
  test("receipt evidence is append-only (review v9 MAJOR 3), also under session_replication_role=replica",async()=>{
   const f=await fixture(kind,"bridge-v1");try{
    await f.send("a0",[record({record_id:"A",session_id:"s"})]);
