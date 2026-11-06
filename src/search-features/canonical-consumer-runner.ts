@@ -64,13 +64,16 @@ export class CanonicalConsumerRunner {
   private running = false;
   private stopped = false;
   private readonly makeConsumer: () => CanonicalConsumer;
+  private readonly cfg: RuntimeConfig;
   constructor(
     consumer: CanonicalConsumer | (() => CanonicalConsumer),
     private readonly images: CanonicalImagePort,
     private readonly ch: ClickHouseClient,
-    private readonly cfg: RuntimeConfig,
+    cfg: RuntimeConfig,
   ) {
     validateRuntimeConfig(cfg);
+    this.cfg = Object.freeze({ ...cfg,
+      scope: cfg.scope && Object.freeze({ ...cfg.scope }) });
     this.makeConsumer =
       typeof consumer === "function" ? consumer : () => consumer;
   }
@@ -80,6 +83,10 @@ export class CanonicalConsumerRunner {
     acks: CanonicalPageAckStore, images: CanonicalImagePort,
     ch: ClickHouseClient, cfg: RuntimeConfig,
   ): CanonicalConsumerRunner {
+    // Bind the factory to a snapshot too; later caller mutation cannot change
+    // a future run's tenant, target or explicit enablement gate.
+    cfg = Object.freeze({ ...cfg,
+      scope: cfg.scope && Object.freeze({ ...cfg.scope }) });
     // Per-RUN fencing: each run() builds a consumer with a fresh nonce —
     // a redeployed instance can never share the prior run's lease identity.
     return new CanonicalConsumerRunner(

@@ -168,7 +168,9 @@ jobs:
         env:
           PROOF_DISPOSABLE: "1"
         run: |
-          set -o pipefail
-          bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |
-            tee consumer-lease-pg${{ matrix.pg }}.log
-          grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}.log
+          set -euo pipefail
+          for scheme in legacy-prefix-v1 scope-v1; do
+            PROOF_PARTITION_SCHEME="$scheme" bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |
+              tee consumer-lease-pg${{ matrix.pg }}-$scheme.log
+            grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}-$scheme.log
+          done
