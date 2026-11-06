@@ -37,6 +37,10 @@
  *   facts, session_outcomes, the digest narrative cache), and this backend never
  *   answers approximately.
  *
+ *   GET  /v1/sessions/:id/analysis  relayhistory's session analysis (lane F1) from migration
+ *   POST /v1/sessions/:id/analysis  20261105046000 and its S3 result objects; same allowlist;
+ *                                   POST needs `rth:write` and the admission principal.
+ *
  * Auth: a RelayAuth assertion JWT minted for THIS service's origin with scope
  * `rth:read` (verifyAgentRelayToken: RS256, JWKS, issuer, exact audience).
  * Org and workspace come only from the verified claims.
@@ -47,6 +51,8 @@ import { CursorError, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
 import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
+import { AnalysisReadError, admitResponse, assembleAnalyses, type AdmitRpc, type BriefLookup, type ReadRpc } from "../session-analysis/read.ts";
+import type { StoredAnalysisResult } from "../session-analysis/processor.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
@@ -92,6 +98,19 @@ export interface ReadApiDeps {
   timing?: TimingDeps;
   /** Relay session turns and metadata from canonical S3 (session-turns-source.ts); absent = 501 `turns_not_configured`. */
   turns?: TurnsDeps;
+  /** Session analysis (lane F1, migration 20261105046000); absent = 501 `analysis_not_configured`. */
+  analysis?: AnalysisDeps;
+}
+
+export interface AnalysisDeps {
+  /** sessions.analysis_read_v1 as the read role, tenant-bound. */
+  read(identity: VerifiedIdentity, sessionId: string): Promise<ReadRpc>;
+  /** sessions.analysis_request_v1 as the separate admission principal; absent = POST 501. */
+  admit?(identity: VerifiedIdentity, sessionId: string): Promise<AdmitRpc>;
+  /** Read and verify one result object (session-analysis/results.ts readAnalysisResult). */
+  result(ref: StoredAnalysisResult): Promise<unknown>;
+  /** The native brief half (session_briefs, lane F2); absent = analyses carry no `brief`. */
+  brief?(identity: VerifiedIdentity, sessionId: string): BriefLookup;
 }
 
 export interface TurnsDeps {
@@ -389,7 +408,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "analysis"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -656,6 +675,61 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   });
   app.get("/v1/digest/daily", notMigrated("digest_not_migrated"));
+
+  /**
+   * GET / POST /v1/sessions/:id/analysis (lane F1): relayhistory's session analysis
+   * contract from migration 20261105046000 and the analysis result objects, never Neon.
+   * Same canary allowlist. POST additionally needs the `rth:write` scope and the separate
+   * admission principal (deps.analysis.admit); without it POST is 501
+   * `analysis_admission_not_configured`. A missing or altered result object is a 503.
+   */
+  const analysisSession = (c: Context, identity: VerifiedIdentity) => {
+    attestWorkspace(c, identity);
+    requireCanary(identity, "analysis");
+    if (!deps.analysis) throw unsupported("analysis_not_configured");
+    const sessionId = c.req.param("sessionId");
+    if (!sessionId || sessionId.length > MAX_ID_CHARS) throw bad("sessionId is not valid");
+    const source = single(c, "source");
+    if (source !== undefined && source.length > MAX_ID_CHARS) throw bad("source is not valid");
+    return { analysis: deps.analysis, sessionId };
+  };
+  const notFound = (c: Context) =>
+    c.json({ error: { code: "not_found", message: "Session not found" }, correlationId: c.get("correlationId") }, 404);
+
+  app.get("/v1/sessions/:sessionId/analysis", async (c) => {
+    try {
+      const identity = c.get("identity");
+      const { analysis, sessionId } = analysisSession(c, identity);
+      const rpc = await analysis.read(identity, sessionId);
+      if (rpc.outcome !== "ok" || rpc.sessionId !== sessionId) return notFound(c);
+      const body = await assembleAnalyses(rpc, {
+        result: (ref) => analysis.result(ref),
+        ...(analysis.brief ? { brief: analysis.brief(identity, sessionId) } : {}),
+      });
+      return c.json({ ...body, correlationId: c.get("correlationId") });
+    } catch (error) {
+      if (error instanceof AnalysisReadError || (error as { name?: string })?.name === "AnalysisResultError") {
+        log({ route: c.req.routePath, reason: (error as Error).message, status: 503, correlation_id: c.get("correlationId") });
+        return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId: c.get("correlationId") }, 503);
+      }
+      return fail(c, error);
+    }
+  });
+
+  app.post("/v1/sessions/:sessionId/analysis", async (c) => {
+    try {
+      const identity = c.get("identity");
+      const { analysis, sessionId } = analysisSession(c, identity);
+      if (!identity.scopes.includes("rth:write"))
+        return c.json({ error: { code: "forbidden", message: "missing required scope: rth:write" }, correlationId: c.get("correlationId") }, 403);
+      if (!analysis.admit) throw unsupported("analysis_admission_not_configured");
+      const out = admitResponse(await analysis.admit(identity, sessionId));
+      if (out.retryAfter) c.header("Retry-After", out.retryAfter);
+      return c.json({ ...out.body, correlationId: c.get("correlationId") }, out.status);
+    } catch (error) {
+      return fail(c, error);
+    }
+  });
 
   app.notFound((c) => c.json({ error: { code: "unsupported_by_backend", message: "route not served by this backend", reason: "route" }, correlationId: c.get("correlationId") }, 501));
 
