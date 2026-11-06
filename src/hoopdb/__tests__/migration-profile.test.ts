@@ -1515,6 +1515,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const K = "upstream:20261105032000_session_large_read_routing_fixes.sql";
     const S = "upstream:20261105035000_semantic_copy_state.sql";
     const E = "upstream:20261105036000_canonical_consumer_lease.sql";
+    const F = "upstream:20261105037000_session_directory_document_pool.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = (name: string) =>
