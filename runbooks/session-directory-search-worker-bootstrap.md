@@ -713,7 +713,7 @@ catalog shows that shape (`rds_profile_unproven`).
 **Order, as the migration owner, connected to the HoopDb database:**
 
 1. `rds_owner_function_default_revoke.sql`: the owner's exact global function default.
-2. `rds_migration_roles.sql`: the eight fixed NOLOGIN roles through a disposable CREATEROLE
+2. `rds_migration_roles.sql`: the ten fixed NOLOGIN roles (the Cloud SQL set) through a disposable CREATEROLE
    trampoline, so they are membership-free (by design, afterwards only `rdsadmin` can alter
    or drop them).
 3. `hoopdb_runtime_role_rds.sql -v migration_owner=<owner> -v runtime_role=<role>
@@ -721,8 +721,8 @@ catalog shows that shape (`rds_profile_unproven`).
    granted, in one transaction. Then set its password from the secret manager (never on
    disk).
 4. The phase 1 verifiers `session_directory_search_worker.sql`,
-   `session_token_verifier.sql`, `session_ingest_roles.sql` (here they only verify the
-   existing roles).
+   `session_token_verifier.sql`, `session_ingest_roles.sql`, `session_read_api_roles.sql`
+   (here they only verify the existing roles).
 5. The migrator: `HOOPDB_DB_MODE=rds`, `HOOPDB_SUPABASE_SHIM=false` (or unset),
    `HOOPDB_ROLE_BOOTSTRAP` unset, `HOOPDB_RUNTIME_ROLE=<role>`,
    `HOOPDB_RUNTIME_ROLE_LOGIN=true`, `HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke`.
@@ -748,6 +748,11 @@ mode uses `global-default-revoke`).
   needs `rds_iam` membership, which the allowlist refuses.
 - `pg_trgm` and `btree_gin` are creatable by the master on the target version.
 - Snapshot restore and major-version upgrade keep the role graph so steps 1-5 rerun clean.
+- Post-migrate activation scripts that `ALTER ROLE` a fixed role to LOGIN
+  (`session_ingest_role.sql`, `session_read_api_role.sql`,
+  `canonical_project_events_role.sql`) cannot run as the master on trampoline-created
+  roles (no ADMIN; 42501). Those LOGIN roles need a reviewed RDS path before activation
+  (same structural question as Cloud SQL); migrate and readiness do not depend on them.
 
 ## CNPG (self-hosted HoopDb)
 

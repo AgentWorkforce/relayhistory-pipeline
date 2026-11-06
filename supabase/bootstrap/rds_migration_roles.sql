@@ -10,9 +10,9 @@
 -- service_role cannot be created at all without BYPASSRLS.
 -- https://www.postgresql.org/docs/17/role-attributes.html
 --
--- Use a disposable CREATEROLE trampoline instead: it creates the eight fixed NOLOGIN
--- roles (the three of session_ingest_roles.sql included: 20261104022000 verifies them
--- and 20261105025000 grants bulls96_canonical_feature_producer; neither creates a role), then the migration owner drops the trampoline. DROP ROLE removes the
+-- Use a disposable CREATEROLE trampoline instead: it creates the ten fixed NOLOGIN
+-- roles, the same set as cloudsql_migration_roles.sql (ingest, canonical producer,
+-- project-events and read API included; their migrations only verify roles), then the migration owner drops the trampoline. DROP ROLE removes the
 -- trampoline's automatic memberships, leaving every target membership-free, so the
 -- existing strict verifiers and historical migration guards pass unchanged. The
 -- trampoline and every target are created in this one transaction, so any refusal rolls
@@ -69,7 +69,9 @@ BEGIN
     'session_token_verifier'::name,
     'bulls96_session_ingest'::name,
     'bulls96_session_ingest_seeder'::name,
-    'bulls96_canonical_feature_producer'::name
+    'bulls96_canonical_feature_producer'::name,
+    'bulls96_read_api'::name,
+    'bulls96_project_events'::name
   ] LOOP
     SELECT * INTO v_row FROM pg_roles WHERE rolname = v_role;
     IF NOT FOUND THEN
@@ -150,6 +152,14 @@ BEGIN
       CREATE ROLE bulls96_canonical_feature_producer
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_read_api') THEN
+      CREATE ROLE bulls96_read_api
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_project_events') THEN
+      CREATE ROLE bulls96_project_events
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
     RESET ROLE;
     DROP ROLE bulls96_rds_role_seed;
   END IF;
@@ -163,7 +173,7 @@ BEGIN
        'anon', 'authenticated', 'service_role', 'session_directory_search_worker',
        'session_token_verifier',
        'bulls96_session_ingest', 'bulls96_session_ingest_seeder',
-       'bulls96_canonical_feature_producer'
+       'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events'
      )
   ) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',

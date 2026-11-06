@@ -45,11 +45,12 @@ const PHASE1 = [
   B("session_directory_search_worker.sql"),
   B("session_token_verifier.sql"),
   B("session_ingest_roles.sql"),
+  B("session_read_api_roles.sql"),
 ];
 const FIXED = [
   "anon", "authenticated", "service_role", "session_directory_search_worker",
   "session_token_verifier", "bulls96_session_ingest", "bulls96_session_ingest_seeder",
-  "bulls96_canonical_feature_producer",
+  "bulls96_canonical_feature_producer", "bulls96_read_api", "bulls96_project_events",
 ];
 const RDS_ENV = {
   HOOPDB_DB_MODE: "rds",
@@ -212,7 +213,8 @@ await check("rds profile: owner bootstraps, full migrate, PASS marker, runtime r
   const b = boot();
   const m = migrate(RDS_ENV);
   const v = await verdict(RT);
-  const fixed = (await sql(DB, `SELECT r.rolname, r.rolbypassrls, r.rolcanlogin,
+  const fixed = (await sql(DB, `SELECT r.rolname, r.rolbypassrls, r.rolcanlogin, r.rolinherit,
+      (r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication) AS elevated,
       (SELECT count(*)::int FROM pg_auth_members m WHERE m.roleid = r.oid OR m.member = r.oid) AS memberships
       FROM pg_roles r WHERE r.rolname = ANY(ARRAY['${FIXED.join("','")}']) ORDER BY 1`)).rows;
   const rtEdges = await edges(RT);
@@ -221,7 +223,7 @@ await check("rds profile: owner bootstraps, full migrate, PASS marker, runtime r
   const seed = (await sql(DB, "SELECT count(*)::int AS n FROM pg_roles WHERE rolname = 'bulls96_rds_role_seed'")).rows[0].n;
   const ok =
     b.ok && m.exit === 0 && v.ok && marker?.status === "pass" && marker.generation === gen && seed === 0 &&
-    fixed.length === FIXED.length && fixed.every((r) => r.memberships === 0 && !r.rolbypassrls && !r.rolcanlogin) &&
+    fixed.length === FIXED.length && fixed.every((r) => r.memberships === 0 && !r.rolbypassrls && !r.rolcanlogin && !r.rolinherit && !r.elevated) &&
     rtEdges.length === 1 &&
     fmt(rtEdges[0]) === fmt({ member: MASTER, grantor: "rdsadmin", grantor_oid: 10, admin: true, inherit: false, set: false });
   const err = [b.fn, b.roles, b.rt, ...b.phase1].find((r) => !r.ok)?.out.split("\n").find((l) => /ERROR/.test(l)) ?? "";
@@ -333,6 +335,27 @@ await check("drift refused: a runtime role created by a different rds_superuser 
   await sql(DB, "DROP ROLE g7_rds_rt_other", OTHER);
   return [bootRt.sqlstate === "55000" && m.exit !== 0 && m.code === "runtime_role_unsafe", `bootstrap=${bootRt.sqlstate} migrate=${fmt(m)}`];
 });
+
+for (const role of ["bulls96_read_api", "bulls96_project_events"]) {
+  await check(`drift refused: ${role} with INHERIT, or with a member, is refused by rds_migration_roles.sql and left as found`, async () => {
+    await sql(DB, `ALTER ROLE ${role} INHERIT`);
+    const inherit = psql(DB, ["-f", ROLES_BOOT]);
+    const inheritKept = (await sql(DB, `SELECT rolinherit FROM pg_roles WHERE rolname = '${role}'`)).rows[0]?.rolinherit === true;
+    const inheritMigrate = role === "bulls96_project_events" ? migrate(RDS_ENV) : undefined;
+    await sql(DB, `ALTER ROLE ${role} NOINHERIT`);
+    await sql(DB, `GRANT ${role} TO ${OTHER}`);
+    const member = psql(DB, ["-f", ROLES_BOOT]);
+    const memberMigrate = role === "bulls96_project_events" ? migrate(RDS_ENV) : undefined;
+    await sql(DB, `REVOKE ${role} FROM ${OTHER}`);
+    const restored = psql(DB, ["-f", ROLES_BOOT]);
+    const after = migrate(RDS_ENV);
+    const v = await verdict(RT);
+    const migrateRefused = (m?: ReturnType<typeof migrate>) => m === undefined || (m.exit !== 0 && m.code === "55000");
+    const ok = inherit.sqlstate === "55000" && inheritKept && member.sqlstate === "55000" &&
+      migrateRefused(inheritMigrate) && migrateRefused(memberMigrate) && restored.ok && after.exit === 0 && v.ok;
+    return [ok, fmt({ inherit: inherit.sqlstate, inheritKept, member: member.sqlstate, inheritMigrate, memberMigrate, restored: restored.ok, after, verdict: v })];
+  });
+}
 
 // ---------------------------------------------------------------------------
 // 5. Bootstrap negative paths.
