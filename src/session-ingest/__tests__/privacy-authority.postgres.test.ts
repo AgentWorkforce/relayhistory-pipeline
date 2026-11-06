@@ -38,7 +38,7 @@ async function database() {
   await pool.query("CREATE SCHEMA sessions");
   await pool.query(sql("supabase/tests/supabase_shim.sql"));
   await pool.query("CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin");
-  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles"]) await pool.query(sql("supabase/bootstrap/" + f + ".sql"));
+  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await pool.query(sql("supabase/bootstrap/" + f + ".sql"));
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await pool.query(sql("supabase/migrations/" + f));
   await pool.query(sql(LAZY_SOURCE_SQL));
   await pool.query(sql(PENDING_SQL));
