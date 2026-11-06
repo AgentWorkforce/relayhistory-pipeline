@@ -27,7 +27,8 @@ export async function dispatchRegisteredLambda(adapter: PipelineRuntimeAdapter, 
   const caps = adapter.capabilities();
   if (adapter.kind !== "lambda" || caps.kind !== "lambda" || caps.trigger !== "push" || !caps.partialBatchFailure || caps.scopeSerialization !== "advisory-lock") throw new Error("Lambda runtime composition incompatible");
   const flags = Object.entries(SCHEDULES).filter(([, key]) => event[key] === true);
-  if (Array.isArray(event.Records) && (flags.length || event.schedule) || flags.length > 1) throw new Error("Lambda invocation ambiguous");
+  if (Array.isArray(event.Records) && (flags.length || event.schedule) || flags.length > 1 ||
+      event.schedule !== undefined && flags.length === 1 && event.schedule !== flags[0]![0]) throw new Error("Lambda invocation ambiguous");
   const job = event.schedule ?? flags[0]?.[0];
   if (!Array.isArray(event.Records) && (!job || !Object.hasOwn(SCHEDULES, job))) return invoke(event);
   const work: PipelineWork = {

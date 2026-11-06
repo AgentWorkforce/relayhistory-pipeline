@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { dispatchRegisteredLambda, type PipelineLambdaEvent } from "../lambda-runtime.ts";
 import { parseQueueBody } from "../s3-events.ts";
 import { settle, scheduleItem, type PipelineRuntimeAdapter, type WorkItem } from "@rhc/runtime/contracts.ts";
+import { createPipelineLambdaHandler } from "../lambda.ts";
 
 /** Test-only platform driver. Provider conformance remains separate evidence. */
 const runtime = (items: readonly WorkItem[], schedule = false): PipelineRuntimeAdapter => ({
@@ -42,5 +43,57 @@ test("an incompatible binding or malformed ack cannot acknowledge input", async 
   const event = { Records: [{ messageId: "a", body: "input" }] };
   for (const binding of [{ handler: async () => undefined }, { handler: async () => ({ batchItemFailures: [{ itemIdentifier: "other" }] }) }, {}]) {
     await expect(dispatchRegisteredLambda({ ...runtime([]), bind: () => binding }, event, async () => ({ ok: true }))).rejects.toThrow();
+  }
+});
+
+const schedules = [
+  ["reconcile", "reconcile"], ["brief", "brief"],
+  ["analysis-cache", "analysisCache"], ["analysis-cache-reconcile", "analysisCacheReconcile"],
+  ["semantic-copy", "semanticCopy"],
+] as const;
+
+test("conflicting named schedules and legacy flags refuse before binding or invoking", async () => {
+  for (const [job] of schedules) for (const [other, flag] of schedules) {
+    if (job === other) continue;
+    let bound = 0, invoked = 0;
+    const base = runtime([scheduleItem(job, 1)], true);
+    const adapter = { ...base, bind(work) { bound++; return base.bind(work); } } satisfies PipelineRuntimeAdapter;
+    await expect(dispatchRegisteredLambda(adapter, { schedule: job, [flag]: true }, async () => { invoked++; return { ok: true }; })).rejects.toThrow("ambiguous");
+    expect({ bound, invoked }).toEqual({ bound: 0, invoked: 0 });
+  }
+});
+
+test("all schedule forms forward exactly one matching flag and continuation data", async () => {
+  for (const [job, flag] of schedules) for (const form of ["named", "flag", "matching"] as const) {
+    const continuation = { cursor: "opaque", since: "2026-11-01T00:00:00Z", link: 3, analysisCursor: { fixture: true } };
+    const event = { ...continuation, ...(form !== "flag" ? { schedule: job } : {}), ...(form !== "named" ? { [flag]: true } : {}) };
+    let invoked = 0;
+    expect(await dispatchRegisteredLambda(runtime([scheduleItem(job, 1)], true), event, async input => {
+      invoked++;
+      expect(input).toMatchObject(continuation);
+      expect(input.schedule).toBeUndefined();
+      expect(schedules.filter(([, key]) => input[key] === true).map(([name]) => name)).toEqual([job]);
+      return { ok: true };
+    })).toEqual({ ok: true });
+    expect(invoked).toBe(1);
+  }
+});
+
+test("the public composed handler refuses a wrong-job envelope before runtime loading", async () => {
+  const previous = process.env.PIPELINE_RUNTIME;
+  process.env.PIPELINE_RUNTIME = "lambda";
+  let bound = 0, loaded = 0;
+  const base = runtime([scheduleItem("brief", 1)], true);
+  const adapter = { ...base, bind(work) { bound++; return base.bind(work); } } satisfies PipelineRuntimeAdapter;
+  const handler = createPipelineLambdaHandler({
+    runtime: { create: () => adapter } as never,
+    loadRuntime: async () => { loaded++; throw new Error("must not load a service"); },
+  });
+  try {
+    await expect(handler({ schedule: "brief", reconcile: true })).rejects.toThrow("Lambda runtime schedule failed");
+    expect({ bound, loaded }).toEqual({ bound: 0, loaded: 0 });
+  } finally {
+    if (previous === undefined) delete process.env.PIPELINE_RUNTIME;
+    else process.env.PIPELINE_RUNTIME = previous;
   }
 });
