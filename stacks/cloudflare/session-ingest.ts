@@ -174,6 +174,8 @@ export function sessionIngestWorkerProps(p: SessionIngestInputs, bindings: { HYP
   return {
     name: SESSION_INGEST_WORKER,
     main: "src/session-ingest/worker.ts",
+    // worker.ts is a plain Cloudflare Fetch/Queue module, not an Alchemy Effect entrypoint.
+    isExternal: true as const,
     compatibility: { date: COMPATIBILITY_DATE, flags: [...COMPATIBILITY_FLAGS] },
     // Smart placement runs the Worker near what it calls most (S3 and Supabase,
     // both us-east-1), not near relayhistory's edge PoP: one service-binding hop
@@ -205,6 +207,7 @@ export type SessionIngestWorkerProps = ReturnType<typeof sessionIngestWorkerProp
  */
 export function assertPrivateWorker(props: Record<string, unknown>, refuse: (why: string) => never): void {
   if (props.name !== SESSION_INGEST_WORKER) refuse(`the ingest Worker must be named ${SESSION_INGEST_WORKER} (relayhistory binds it by name)`);
+  if (props.isExternal !== true) refuse("the ingest Worker must be packaged as the plain external Fetch/Queue module (isExternal: true)");
   if (props.workersDev !== false) refuse("workers.dev must be disabled (workersDev: false): the only way in is relayhistory's service binding");
   if (!Array.isArray(props.routes) || props.routes.length !== 0) refuse("the ingest Worker must have no routes");
   if (props.domain !== null) refuse("the ingest Worker must have no custom domain (domain: null detaches any)");

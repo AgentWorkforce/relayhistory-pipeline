@@ -40,6 +40,7 @@ describe("session ingest worker: reachable only through relayhistory's service b
     expect(p.routes).toEqual([]);
     expect(p.domain).toBeNull();
     expect(p.main).toBe("src/session-ingest/worker.ts");
+    expect(p.isExternal).toBe(true);
   });
 
   it("refuses any public surface", () => {
@@ -58,6 +59,11 @@ describe("session ingest worker: reachable only through relayhistory's service b
       { name: "other" },
     ];
     for (const b of bad) expect(() => assertPrivateWorker({ ...props(), ...b }, refuse)).toThrow();
+  });
+
+  it("requires plain external-module packaging", () => {
+    for (const isExternal of [false, undefined])
+      expect(() => assertPrivateWorker({ ...props(), isExternal }, refuse)).toThrow(/plain external Fetch\/Queue module/);
   });
 
   it("needs nodejs_compat, the pinned date and smart placement", () => {
