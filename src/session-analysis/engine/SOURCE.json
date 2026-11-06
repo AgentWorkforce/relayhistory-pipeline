@@ -1,0 +1,69 @@
+{
+  "repository": "https://github.com/AgentWorkforce/relayhistory-cloud",
+  "commit": "c7de216335a1633b80314c3fd0000a48da9ff29d",
+  "path": "packages/relayhistory/src/lib/session-analysis",
+  "upstream_provenance": "engine/PROVENANCE.md there: ported from AgentWorkforce/skip 07a16203 (full analysis prompt/contract v2.4)",
+  "analysis_prompt_sha256": "a743a93d40727f68e51e508a5325aa46ee9e8d1304d24c196f5d2a4357121626",
+  "shared_with_session_brief": [
+    "summary-contract.ts",
+    "summary-prompt.ts",
+    "summary-input.ts",
+    "normalized-history.ts",
+    "transport.ts"
+  ],
+  "not_vendored": {
+    "session-analysis-eval.ts": "offline evaluation helper; no runtime consumer",
+    "index.ts": "barrel; explicit imports instead"
+  },
+  "note": "Change upstream first; re-vendor and update the hashes in the same change. src/session-analysis/__tests__/engine-provenance.test.ts checks the local hashes, verbatim files against upstream, and the analysis prompt hash.",
+  "files": {
+    "analysis-contract.ts": {
+      "upstream": "engine/analysis-contract.ts",
+      "upstream_sha256": "8d7c27ca9296d49203b24d0b5e5cdd76787aa1935f7abd0a8ca3ea280982a8c9",
+      "sha256": "d8d85cc6757176cd143eabfc342817d7d5286d02d9d752550cfec71c4b67166b",
+      "adaptation": "import specifiers only (@relayhistory/cloud-client/contract -> ./session-analysis-result.ts)"
+    },
+    "analysis-evidence.ts": {
+      "upstream": "engine/analysis-evidence.ts",
+      "upstream_sha256": "51b24942d839e96354530e45193a635dd21d8534ffdcde3be176ad2fdf0dcb38",
+      "sha256": "e50bbd47f138317a0d7a95e628e7feaaa7c063f1c30f7df5561cbe03e07a0fad",
+      "adaptation": "import specifiers only (.ts extensions)"
+    },
+    "analysis-prompt.ts": {
+      "upstream": "engine/analysis-prompt.ts",
+      "upstream_sha256": "fd3a49560026c5f52f69f829e43966d1d67904071e0122d77200d85ada5e8f29",
+      "sha256": "fd3a49560026c5f52f69f829e43966d1d67904071e0122d77200d85ada5e8f29",
+      "adaptation": "verbatim"
+    },
+    "model.ts": {
+      "upstream": "engine/model.ts",
+      "upstream_sha256": "81053457b793c84b6ea8450b2d1191f36b36aee3f8ccf9070d1f571bd0f0466f",
+      "sha256": "db6005a494910174b7571535c3aab615c0720e20f90031c1d312d6eb30e6c259",
+      "adaptation": "import specifiers only (.ts extensions; summary-contract/summary-prompt from ../../session-brief/engine, the already-vendored byte-identical copies)"
+    },
+    "session-evidence.ts": {
+      "upstream": "engine/session-evidence.ts",
+      "upstream_sha256": "33d52b570c8e8307e61ed12ae49f58a74345fb696d8bfc6a873d612deec203d1",
+      "sha256": "4b0a40dde303eeef6ef4e32a0b2788dcd2665282eb31813a15599bd016a10901",
+      "adaptation": "import specifiers only (.ts extensions; normalized-history from ../../session-brief/engine)"
+    },
+    "session-metrics.ts": {
+      "upstream": "engine/session-metrics.ts",
+      "upstream_sha256": "7bc68e7a9c622ec4c804f34d786349ec293d9ce071679ec8d4c18c7bfb960c3f",
+      "sha256": "a1b2ce610bd42314bca3f90684bc224477b27e2aa1c71a9edec7ead7f4a2dc7c",
+      "adaptation": "import specifiers only (.ts extensions; normalized-history from ../../session-brief/engine)"
+    },
+    "snapshot.ts": {
+      "upstream": "engine/snapshot.ts",
+      "upstream_sha256": "b0d7745340c94b25fbc80d62a45661d596fad2e0b093df1a7f741547cf6e4622",
+      "sha256": "fd54135e07e3619fc100fa23d345dc8853f330e5306651eea6406bf4679b764f",
+      "adaptation": "import specifiers only (.ts extensions; @relayhistory/cloud-client/contract -> ./session-analysis-result.ts)"
+    },
+    "session-analysis-result.ts": {
+      "upstream": "packages/cloud-client/src/contract/session-analysis-result.ts (repository root relative)",
+      "upstream_sha256": "4acd55a2fc7b926a722b2f6a2837632018e0879f0f3bd81663ed0660d856be63",
+      "sha256": "4acd55a2fc7b926a722b2f6a2837632018e0879f0f3bd81663ed0660d856be63",
+      "adaptation": "verbatim"
+    }
+  }
+}
