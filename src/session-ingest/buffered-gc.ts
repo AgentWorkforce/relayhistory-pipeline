@@ -139,16 +139,13 @@ export async function collectBufferedTicket(t: BufferedGcTicket, deps: BufferedG
   await deps.eraser.eraseObjectExcept(t.key, version);
   return await deps.ledger.finish(t, version) ? 'finished' : 'deferred';
 }
-/** One SQL claim RPC per ticket. ingest_buffer_gc_claim scans up to 4*limit
- * candidates and does per-candidate retention work (original-record
- * normalization, ACK-decision/native-slot joins) inside ONE statement that the
- * job bounds with its per-operation statement_timeout. A claim(limit) that times
- * out rolls back every candidate's gc_checked_at rotation, so the same heavy
- * head of the queue is re-scanned, and times out, on every run. claim(1) scans
- * at most four candidates and commits its rotation, so every run makes durable
- * progress. Per-tick candidate coverage (4*limit) and the ticket bound (limit)
- * are unchanged. A failed claim still fails the tick: no claim error is
- * swallowed, and collect errors keep their existing deferral rules. */
+/** One SQL claim RPC per loop iteration; each successful RPC commits separately.
+ * The current 039 claim fully evaluates at most one candidate and returns at
+ * most one ticket, after up to four nonblocking acquisition probes. Healthy
+ * candidates also end that claim after their durable checked rotation. Thus a
+ * five-call tick checks at most five healthy objects; persistent busy heads can
+ * prevent progress. Claim failures still fail the tick, preserving earlier RPC
+ * commits; collection errors keep their existing deferral rules. */
 export async function bufferedGcTick(deps: BufferedGcDeps, limit = 10) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) no('claim_limit');
   let examined = 0, finished = 0, deferred = 0;

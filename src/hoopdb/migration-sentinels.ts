@@ -31,6 +31,10 @@ export interface Sentinel {
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105034000_session_directory_read_api.sql": {evidence:"function sessions.list_session_directory_for",sql:fn("sessions","list_session_directory_for")},
+  "upstream:20261105039000_buffered_gc_single_candidate.sql": {
+    evidence: "replacement: GC claim has its single-candidate advisory admission domain",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_buffer_gc_claim(jsonb)') AND prosecdef AND prosrc LIKE '%96bulls:buffer-gc-user-v1%') AS applied",
+  },
   "upstream:20261105024000_session_brief_documents.sql": { evidence: "table sessions.session_brief_document_outbox", sql: relation("sessions.session_brief_document_outbox") },
   "upstream:20261105025000_canonical_feature_journal.sql": { evidence: "table sessions.canonical_feature_journal", sql: relation("sessions.canonical_feature_journal") },
   "upstream:20261105026000_canonical_history_lineage.sql": { evidence: "table sessions.ingest_history_carriers", sql: relation("sessions.ingest_history_carriers") },
@@ -170,6 +174,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
 
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */
 export const NON_CREATE_STEPS = [
+  "upstream:20261105039000_buffered_gc_single_candidate.sql",
   "upstream:20261025000300_upsert_keep_on_null.sql",
   "upstream:20261030000000_relayhistory_machines_compat.sql",
   "upstream:20261102010000_session_directory_canonical_ids.sql",

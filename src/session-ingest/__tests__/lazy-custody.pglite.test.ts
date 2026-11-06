@@ -117,17 +117,24 @@ test("committed NULL-session custody survives reset; no-op enable preserves curr
  const raw=await batch(records,{batch_id:"mixed-A"});await deliverBatch({...f.deps,custody:await f.packet(raw)},TENANT,raw);
  await f.send("move-B",record({record_id:"moving",session_id:"B",revision:2}));
  await f.control("selection",{origin_id:"origin-1",sessions:[{source:"claude",session_id:"B"}],enabled:false});
- const tickets=(await f.gc("claim",{limit:10})).tickets;
+ // Both retention decisions remain required;039 commits each on its own RPC.
+ const claimBoth=async()=>{
+  const tickets:any[]=[];
+  for(let i=0;i<2;i++)tickets.push(...(await f.gc("claim",{limit:1})).tickets);
+  expect(tickets).toHaveLength(2);expect(new Set(tickets.map(t=>t.stageToken)).size).toBe(2);
+  return tickets;
+ };
+ const tickets=await claimBoth();
  expect(tickets.find((t:any)=>t.groupOrdinals.flat().length===3).keepOrdinals).toEqual([1,2]);
  expect(tickets.find((t:any)=>t.groupOrdinals.flat().length===3).keepGroupIndexes.length).toBeGreaterThan(0);
  expect(tickets.find((t:any)=>t.groupOrdinals.flat().length===1).keepOrdinals).toEqual([]);
  await f.control("selection",{origin_id:"origin-1",sessions:[{source:"claude",session_id:"A"}],enabled:true});
  await f.db.exec("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1 second'");
- const enabled=(await f.gc("claim",{limit:10})).tickets.find((t:any)=>t.groupOrdinals.flat().length===3);
+ const enabled=(await claimBoth()).find((t:any)=>t.groupOrdinals.flat().length===3);
  expect(enabled.keepOrdinals).toEqual([1,2]);
  await f.control("reset",{request_id:"reset-real"});
  await f.db.exec("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1 second'");
- const reset=(await f.gc("claim",{limit:10})).tickets.find((t:any)=>t.groupOrdinals.flat().length===3);
+ const reset=(await claimBoth()).find((t:any)=>t.groupOrdinals.flat().length===3);
  expect(reset.keepOrdinals).toEqual([2]);
  await f.send("lower-null",record({record_id:"null",session_id:null,revision:1}),null,"3");
  expect((await f.seats("lower-null")).records[0].bodyAccepted).toBe(false);
