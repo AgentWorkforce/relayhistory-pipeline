@@ -148,7 +148,10 @@ activation note.
   retained `projectRelayhistorySession`, `directoryCatalogFromProjection`,
   `writeDirectoryCatalog` and desktop-catalog re-projection driver,
   verification, activation and rollback). A private hosted copy is mentioned
-  as optional context only.
+  as optional context only. Revision 2 removed the snapshot/restore recipe from that section after
+  the boundary review: tombstone, erasure, reset, fence and epoch state is never
+  rolled back by this document, and recovery beyond re-running the
+  re-projection is conditional on a schema-owner-reviewed operator procedure.
 
 No `package.json` script, tsconfig entry, import, Dockerfile, workflow step,
 bundle list or `scripts/check-*` allowlist referenced a removed path. The removed

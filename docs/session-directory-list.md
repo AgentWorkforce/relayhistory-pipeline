@@ -122,6 +122,7 @@ history in object storage.
 - never write from a partial, missing, unscrubbed, conflicting, unreadable or
   over-limit read: record the reason and leave the row unchanged;
 - never leave two live directory rows for the same logical session;
+- never roll back tombstone, erasure, reset, fence or epoch state;
 - never mark the catalog rollout complete before the verification below passes;
 - never write Neon.
 
@@ -131,12 +132,18 @@ history in object storage.
    `writeDirectoryCatalog` requires (20261105022000 and 20261105031000)
    applied, the migration ledger is green, and function grants match
    `src/hoopdb/sessions-function-acl.json`.
-2. Take a recoverable snapshot of `sessions.session_directory`, its companion
-   tables (`session_directory_agents`, `session_directory_users`,
+2. Record, as evidence outside the database, the row counts of
+   `sessions.session_directory`, its companion tables
+   (`session_directory_agents`, `session_directory_users`,
    `session_directory_machines`, `session_directory_relationships`,
    `session_directory_resurrection_fences`) and both rollout tables
-   (`session_directory_rollout`, `session_directory_catalog_rollout`). Record
-   the row counts and a snapshot reference outside the database.
+   (`session_directory_rollout`, `session_directory_catalog_rollout`),
+   together with the current `event_projection_epoch` values. These tables are
+   never restored from a snapshot by this procedure: tombstones and
+   resurrection fences are monotonic history (migration 20261031001000: a
+   later tombstone only raises a fence, `record_fences` keeps the greatest
+   revision, and only erasure removes them with the row), so overwriting them
+   with earlier rows could bring a deleted session back.
 3. Hold the directory projector queue for the rebuild window so its work can be
    replayed afterwards. Do not pause canonical object-storage writes.
 4. Dry run, read only: for every live session key, build the catalog as in
@@ -189,12 +196,17 @@ harness-sliced reports and require:
 `session_directory_catalog_rollout.completed_at` (above) and then change
 `LIST_BACKEND`.
 
-**Rollback.** Before activation: stop the projectors, restore the snapshot
-tables, replay the held queue work, and keep the list on Neon. After
-activation: return `LIST_BACKEND` to Neon first, keep the mismatch evidence,
-restore the derived tables from the snapshot, check counts and grants, then
-replay the pointer events since the snapshot. Never mutate Neon during
-rollback.
+**Recovery.** This procedure has no snapshot restore. Before activation, a
+wrong or incomplete re-projection is corrected by re-running step 1 for the
+affected keys: `writeDirectoryCatalog` rewrites only derived catalog fields,
+under the row lock and the expected epoch, and writes nothing for a row that a
+tombstone has claimed. After activation, first return `LIST_BACKEND` to Neon
+and keep the mismatch evidence, then correct derived fields the same way. Any
+recovery that would change tombstone, erasure, reset, fence or epoch state is
+outside this document and needs a schema-owner-reviewed operator procedure,
+backed by isolated tests that delete or reset after a snapshot and replay late
+pointer events, proving that nothing deleted comes back. Never mutate Neon
+during recovery.
 
 A hosted operator copy of this plan, with deployment-specific details, is kept
 privately. It is optional context and is not needed to follow this section.
