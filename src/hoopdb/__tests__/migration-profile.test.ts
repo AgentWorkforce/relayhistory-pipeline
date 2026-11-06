@@ -1555,6 +1555,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // Later lanes roll back first and remove their own ledger rows; only then
     // can the next down preserve a gap-free applied prefix.
+    await rollback("20261105037000_session_directory_document_pool.down.sql");
+    expect(await names()).not.toContain(F);
     await rollback("20261105036000_canonical_consumer_lease.down.sql");
     expect(await names()).not.toContain(E);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_consumer_lease')::text r")).rows[0]?.r).toBeNull();

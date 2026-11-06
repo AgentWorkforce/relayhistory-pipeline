@@ -12,6 +12,10 @@ import type {
   CanonicalEventRow,
   CanonicalTombstone,
 } from "./canonical-producer.ts";
+import type {
+  CanonicalDocumentRow,
+  CanonicalDocumentTombstone,
+} from "./document-producer.ts";
 
 export const CANONICAL_PAGE_MAX_ROWS = 1000;
 export const CANONICAL_PAGE_MAX_BYTES = 16 * 1024 * 1024;
@@ -135,4 +139,42 @@ export function projectBriefTombstone(
       !string(v.workspaceId))
     return { kind: "refused", reason: "row_invalid" };
   return { kind: "row", row: v as unknown as CanonicalBriefTombstone };
+}
+/** Project one opaque image document row into the document-pool input. */
+export function projectDocumentRow(
+  v: unknown,
+): { kind: "row"; row: CanonicalDocumentRow } | { kind: "refused"; reason: string } {
+  if (!required(v)) return { kind: "refused", reason: "row_invalid" };
+  const f = [
+    "orgId", "source", "sessionId", "title", "summary",
+    "titleFolded", "summaryFolded",
+  ];
+  if (!f.every((k) => text(v[k])) || !string(v.workspaceId) ||
+      !nullableText(v.projectId) ||
+      !stamp.test(v.lastActivityAt as string))
+    return { kind: "refused", reason: "row_invalid" };
+  if (Buffer.byteLength(JSON.stringify(v), "utf8") > 128 * 1024)
+    return { kind: "refused", reason: "row_bound" };
+  return {
+    kind: "row",
+    row: {
+      orgId: v.orgId as string, workspaceId: v.workspaceId as string,
+      source: v.source as string, sessionId: v.sessionId as string,
+      title: v.title as string, summary: v.summary as string,
+      titleFolded: v.titleFolded as string,
+      summaryFolded: v.summaryFolded as string,
+      projectId: v.projectId as string | null,
+      lastActivityAt: v.lastActivityAt as string,
+    },
+  };
+}
+/** Prior-image document keyset entries retire exactly. */
+export function projectDocumentTombstone(
+  v: unknown,
+): { kind: "row"; row: CanonicalDocumentTombstone } | { kind: "refused"; reason: string } {
+  if (!required(v)) return { kind: "refused", reason: "row_invalid" };
+  if (!["orgId", "source", "sessionId"].every((k) => text(v[k])) ||
+      !string(v.workspaceId))
+    return { kind: "refused", reason: "row_invalid" };
+  return { kind: "row", row: v as unknown as CanonicalDocumentTombstone };
 }

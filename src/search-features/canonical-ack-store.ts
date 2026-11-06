@@ -61,7 +61,7 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
 
   /** Immutable page ACK — same page replays no-op; a mismatch refuses. */
   async ackPage(input: {
-    entry: CanonicalJournalEntry; kind: "event" | "brief";
+    entry: CanonicalJournalEntry; kind: "event" | "brief" | "document";
     cursor: string; pageSha256: string;
     nextCursor: string | null;   // null = terminal page
   }): Promise<void> {
@@ -92,7 +92,7 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
    * explicit states: no-progress | mid-chain cursor | complete.
    * An opaque cursor ORDER BY is not chain order — walk the actual edges. */
   async resumeCursor(
-    entry: CanonicalJournalEntry, pool: "event" | "brief",
+    entry: CanonicalJournalEntry, pool: "event" | "brief" | "document",
   ): Promise<{ state: "empty" | "resume" | "complete" | "corrupt";
                cursor: string | null; terminalSha256?: string }> {
     const { rows: chain } = await this.db.query<{
@@ -135,7 +135,7 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
 
   /** All ACKed pages for a revision/pool, in insertion order (the chain). */
   async pageChain(
-    entry: CanonicalJournalEntry, pool: "event" | "brief",
+    entry: CanonicalJournalEntry, pool: "event" | "brief" | "document",
   ): Promise<{ cursor: string; nextCursor: string | null;
                pageSha256: string }[]> {
     const { rows } = await this.db.query<{
@@ -157,6 +157,7 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
   async finish(input: {
     entry: CanonicalJournalEntry;
     terminalEvent: string; terminalBrief: string;
+    terminalDocument?: string;
     sourceAuthority: { authorityId: string; epoch: string; fingerprint: string };
     profileBinding: string;
     targetBinding: string;
@@ -165,11 +166,19 @@ export class CanonicalPageAckStore implements CanonicalPageAckPort {
     // The CAS proof lives in the owner-side RPC: it locks the state row,
     // matches the exact journal entry + bindings, and verifies both
     // start-anchored chains before flipping dirty->complete.
-    const { rows } = await this.db.query<{ ok: boolean }>(
-      `SELECT sessions.finish_canonical_copy($1,$2,$3,$4,$5,$6) AS ok`,
-      [e.revision, JSON.stringify(input.sourceAuthority),
-        input.profileBinding, input.terminalEvent, input.terminalBrief,
-        input.targetBinding]);
+    // Three pools need the v3 RPC (037000); a two-pool cycle still uses the
+    // signed-off 030000 two-terminal function.
+    const { rows } = input.terminalDocument === undefined
+      ? await this.db.query<{ ok: boolean }>(
+          `SELECT sessions.finish_canonical_copy($1,$2,$3,$4,$5,$6) AS ok`,
+          [e.revision, JSON.stringify(input.sourceAuthority),
+            input.profileBinding, input.terminalEvent,
+            input.terminalBrief, input.targetBinding])
+      : await this.db.query<{ ok: boolean }>(
+          `SELECT sessions.canonical_feature_document_finish($1,$2,$3,$4,$5,$6,$7) AS ok`,
+          [e.revision, JSON.stringify(input.sourceAuthority),
+            input.profileBinding, input.terminalEvent, input.terminalBrief,
+            input.terminalDocument, input.targetBinding]);
     if (!rows[0]?.ok)
       throw new Error("finish_cas: stale bindings, broken chain, or done");
   }
