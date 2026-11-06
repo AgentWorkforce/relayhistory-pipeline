@@ -568,14 +568,20 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
     }
   }
   const withPipeline = SESSION_PIPELINE_RESOURCES.some((r) => compact.operations.has(r));
-  const pipelineAllNoop = SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop");
-  if (withPipeline && !pipelineAllNoop) {
+  const changes = [...compact.operations].filter(([, action]) => action !== "noop");
+  if (withPipeline && changes.length === 1 && changes[0]![0] === "transcript-srv-writer" && changes[0]![1] === "update") {
+    assertSrvWriterInboxPolicyDiff(capture.detailedPlanText, refuse);
+    return "srv-writer inbox policy update";
+  }
+  if (withPipeline) {
+    if (SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") && TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === "noop"))
+      return "post-apply";
     const pipelinePhase = sessionPipelinePhase(compact.operations);
     if (pipelinePhase === "session pipeline update")
       assertPipelineRoleCascadeDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
     if (pipelinePhase) return pipelinePhase;
-    const changes = [...compact.operations].filter(([, action]) => action !== "noop").map(([resource, action]) => `${resource}:${action}`);
-    return refuse(`action set does not match the session pipeline rollout, update or post-apply phase: ${changes.join(", ") || "(none)"}`);
+    const describedChanges = changes.map(([resource, action]) => `${resource}:${action}`);
+    return refuse(`action set does not match the session pipeline rollout, update or post-apply phase: ${describedChanges.join(", ") || "(none)"}`);
   }
   const phase = TRANSCRIPT_PLAN_PHASES.find((candidate) =>
     TRANSCRIPT_RESOURCES.every((resource) => compact.operations.get(resource) === (candidate.actions[resource] ?? "noop")),

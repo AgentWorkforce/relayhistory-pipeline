@@ -642,6 +642,19 @@ describe("transcript store: deploy plan contract", () => {
     }
   });
 
+  it("does not reopen transcript-only legacy phases that the original pipeline dispatch refuses", () => {
+    const legacyPhases = [
+      Object.fromEntries(resources.map((resource) => [resource, "create"])),
+      { transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" },
+      { "trail-key": "update", "trail-logs": "update" },
+      { "transcript-srv-writer": "create", "transcripts-key": "update" },
+    ];
+    for (const actions of legacyPhases) {
+      const compact = plan(actions, undefined, SESSION_PIPELINE_RESOURCES);
+      expect(() => check(compact)).toThrow(/session pipeline rollout, update or post-apply phase/);
+    }
+  });
+
   // Alchemy persisted the failed update: the plan shows no property change, the state holds the pending props.
   const SRV = `arn:aws:iam::${ACCOUNT}:user/96bulls/96bulls-aws-sessions-prod-transcript-srv-writer`;
   const stmt = (Sid: string, AWS = `arn:aws:iam::${ACCOUNT}:root`) => ({ Sid, Effect: "Allow", Principal: { AWS }, Action: ["kms:Decrypt"], Resource: "*" });
