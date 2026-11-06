@@ -624,69 +624,109 @@ function assertSrvWriterInboxPolicyDiff(detailedPlanText: string, refuse: (why: 
     const change = /^  ([+-]) (.*)$/.exec(line);
     return change ? { index, kind: change[1]!, payload: change[2]! } : undefined;
   }).filter((entry): entry is { index: number; kind: string; payload: string } => entry !== undefined);
-  const removed = marked.filter(({ kind }) => kind === "-").map(({ payload }) => payload.trim());
-  const added = marked.filter(({ kind }) => kind === "+");
-  if (removed.length !== 0) refuse(`${label}: the policy update removes or changes existing lines`);
-  if (added.length !== 4) refuse(`${label}: expected exactly four added resource lines, found ${added.length}`);
+  const oldLines = marked.filter(({ kind }) => kind === "-").map(({ payload }) => payload);
+  const newLines = marked.filter(({ kind }) => kind === "+").map(({ payload }) => payload);
+  if (oldLines.length === 0 || newLines.length === 0)
+    refuse(`${label}: expected Alchemy's native old/new policy statement diff`);
 
-  const sidLines = block.map((line, index) => {
-    const sid = /^(\s*)-\s+Sid:\s+([A-Za-z][A-Za-z0-9]*)\s*$/.exec(line);
-    return sid ? { index, indent: sid[1]!.length, sid: sid[2]! } : undefined;
-  }).filter((entry): entry is { index: number; indent: number; sid: string } => entry !== undefined);
-  const statementIndent = Math.min(...sidLines.map(({ indent: width }) => width));
-  if (!Number.isFinite(statementIndent)) refuse(`${label}: detailed policy has no statement context`);
-  const statements = sidLines.filter(({ indent: width }) => width === statementIndent);
-  if (new Set(statements.map(({ sid }) => sid)).size !== statements.length)
-    refuse(`${label}: policy statement Sids must be unique`);
-  if (sidLines.some(({ indent: width }) => width !== statementIndent))
-    refuse(`${label}: nested Sid fields are not valid policy statement context`);
+  type StatementLine = { index: number; value: string };
+  type StatementShape = {
+    sid: string;
+    effect: string;
+    actions: string[];
+    resources: StatementLine[];
+  };
+  const parseStatements = (lines: string[], side: "old" | "new"): StatementShape[] => {
+    const starts = lines.map((line, index) => {
+      const action = /^(\s*)-\s+Action:\s*$/.exec(line);
+      return action ? { index, indent: action[1]!.length } : undefined;
+    }).filter((entry): entry is { index: number; indent: number } => entry !== undefined);
+    const statementIndent = Math.min(...starts.map(({ indent: width }) => width));
+    if (!Number.isFinite(statementIndent)) refuse(`${label}: ${side} policy has no native Statement array`);
+    if (starts.some(({ indent: width }) => width !== statementIndent))
+      refuse(`${label}: ${side} policy has a nested Action masquerading as a statement`);
+    const propertyIndent = statementIndent + 2;
+    const statements = starts.map((start, ordinal): StatementShape => {
+      const end = starts[ordinal + 1]?.index ?? lines.length;
+      const body = lines.slice(start.index, end).map((line, offset) => ({ line, index: start.index + offset }));
+      const direct = (pattern: RegExp) => body.filter(({ line }) => indent(line) === propertyIndent && pattern.test(line));
+      const sidFields = body.filter(({ line }) => /^\s*Sid:\s+/.test(line));
+      if (sidFields.some(({ line }) => indent(line) !== propertyIndent))
+        refuse(`${label}: ${side} policy has a nested Sid field`);
+      const sids = direct(/^\s*Sid:\s+([A-Za-z][A-Za-z0-9]*)\s*$/);
+      if (sids.length !== 1) refuse(`${label}: ${side} statement must have exactly one direct Sid`);
+      const sid = /^\s*Sid:\s+([A-Za-z][A-Za-z0-9]*)\s*$/.exec(sids[0]!.line)![1]!;
+      const effects = direct(/^\s*Effect:\s+(Allow|Deny)\s*$/);
+      if (effects.length !== 1) refuse(`${label}: ${side} ${sid} must have exactly one direct Effect`);
+      const effect = /^\s*Effect:\s+(Allow|Deny)\s*$/.exec(effects[0]!.line)![1]!;
+      const actionEndOffset = lines.slice(start.index + 1, end).findIndex((line) => indent(line) <= propertyIndent);
+      const actionEnd = actionEndOffset < 0 ? end : start.index + 1 + actionEndOffset;
+      const actions = lines.slice(start.index + 1, actionEnd)
+        .filter((line) => indent(line) === propertyIndent + 2)
+        .map((line) => /^\s*-\s+(\S+)\s*$/.exec(line)?.[1])
+        .filter((value): value is string => value !== undefined);
+      if (actions.length === 0) refuse(`${label}: ${side} ${sid} has no direct Action values`);
+      const resources = direct(/^\s*Resource:\s*$/);
+      if (resources.length !== 1) refuse(`${label}: ${side} ${sid} must have exactly one direct Resource`);
+      const resourceStart = resources[0]!.index;
+      const resourceEndOffset = lines.slice(resourceStart + 1, end).findIndex((line) => indent(line) <= propertyIndent);
+      const resourceEnd = resourceEndOffset < 0 ? end : resourceStart + 1 + resourceEndOffset;
+      const resourceValues = lines.slice(resourceStart + 1, resourceEnd).map((line, offset) => ({ line, index: resourceStart + 1 + offset }))
+        .filter(({ line }) => indent(line) === propertyIndent + 2)
+        .map(({ line, index }) => ({ index, value: /^\s*-\s+(\S+)\s*$/.exec(line)?.[1] }))
+        .filter((entry): entry is StatementLine => entry.value !== undefined);
+      if (resourceValues.length === 0) refuse(`${label}: ${side} ${sid} has no direct Resource values`);
+      return { sid, effect, actions, resources: resourceValues };
+    });
+    if (new Set(statements.map(({ sid }) => sid)).size !== statements.length)
+      refuse(`${label}: ${side} policy statement Sids must be unique`);
+    return statements;
+  };
+
+  const oldStatements = parseStatements(oldLines, "old");
+  const newStatements = parseStatements(newLines, "new");
+  const one = (statements: StatementShape[], sid: string, side: "old" | "new") => {
+    const matches = statements.filter((statement) => statement.sid === sid);
+    if (matches.length !== 1) refuse(`${label}: expected exactly one ${side} ${sid} statement`);
+    return matches[0]!;
+  };
 
   const bucketArn = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID).bucketArn;
-  const candidate = `- ${bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`;
-  const statementResources = (sid: string, action: string): string[] => {
-    const matches = statements.filter((statement) => statement.sid === sid);
-    if (matches.length !== 1) refuse(`${label}: expected exactly one ${sid} statement`);
-    const statement = matches[0]!;
-    const next = statements.find(({ index }) => index > statement.index);
-    const end = next?.index ?? block.length;
-    const propertyIndent = statementIndent + 2;
-    const direct = (pattern: RegExp) => block.slice(statement.index + 1, end)
-      .map((line, offset) => ({ line, index: statement.index + 1 + offset }))
-      .filter(({ line }) => indent(line) === propertyIndent && pattern.test(line));
-    const effects = direct(/^\s*Effect:\s+(\S+)\s*$/);
-    if (effects.length !== 1 || !/^\s*Effect:\s+Allow\s*$/.test(effects[0]!.line))
-      refuse(`${label}: ${sid} must have exactly Effect Allow`);
-    const actions = direct(/^\s*Action:\s*$/);
-    if (actions.length !== 1) refuse(`${label}: ${sid} must have exactly one Action field`);
-    const actionStart = actions[0]!.index;
-    const actionEndOffset = block.slice(actionStart + 1, end).findIndex((line) => !/^\s*$/.test(line) && !/^  [+-] /.test(line) && indent(line) <= propertyIndent);
-    const actionEnd = actionEndOffset < 0 ? end : actionStart + 1 + actionEndOffset;
-    const actionValues = block.slice(actionStart + 1, actionEnd)
-      .filter((line) => indent(line) === propertyIndent + 2)
-      .map((line) => /^\s*-\s+(\S+)\s*$/.exec(line)?.[1])
-      .filter((value): value is string => value !== undefined);
-    if (actionValues.length !== 1 || actionValues[0] !== action)
-      refuse(`${label}: ${sid} must have exactly action ${action}`);
-    const resources = direct(/^\s*Resource:\s*$/);
-    if (resources.length !== 1) refuse(`${label}: ${sid} must have exactly one Resource field`);
-    const resourceStart = resources[0]!.index;
-    const resourceEndOffset = block.slice(resourceStart + 1, end).findIndex((line) => !/^\s*$/.test(line) && !/^  [+-] /.test(line) && indent(line) <= propertyIndent);
-    const resourceEnd = resourceEndOffset < 0 ? end : resourceStart + 1 + resourceEndOffset;
-    return added.filter(({ index, payload }) =>
-      index > resourceStart && index < resourceEnd && indent(payload) === propertyIndent + 4
-    ).map(({ payload }) => payload.trim());
+  const baseline = srvWriterObjects(bucketArn);
+  const addedResourceIndexes = new Set<number>();
+  let authority: string | undefined;
+  const verifyTarget = (sid: string, action: string) => {
+    const oldStatement = one(oldStatements, sid, "old");
+    const newStatement = one(newStatements, sid, "new");
+    if (oldStatement.effect !== "Allow" || newStatement.effect !== "Allow")
+      refuse(`${label}: ${sid} must remain Effect Allow`);
+    if (oldStatement.actions.length !== 1 || oldStatement.actions[0] !== action || newStatement.actions.length !== 1 || newStatement.actions[0] !== action)
+      refuse(`${label}: ${sid} must remain exactly action ${action}`);
+    const oldResources = oldStatement.resources.map(({ value }) => value);
+    const newResources = newStatement.resources.map(({ value }) => value);
+    if (JSON.stringify(oldResources) !== JSON.stringify(baseline))
+      refuse(`${label}: old ${sid} resources do not match the dormant srv-writer baseline`);
+    if (newResources.length !== baseline.length + 2 || JSON.stringify(newResources.slice(0, baseline.length)) !== JSON.stringify(baseline))
+      refuse(`${label}: new ${sid} must append exactly authority and candidate resources`);
+    const nextAuthority = newResources[baseline.length]!;
+    const candidate = newResources[baseline.length + 1]!;
+    if (candidate !== `${bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`)
+      refuse(`${label}: ${sid} must append the fixed candidate resource last`);
+    if (authority !== undefined && authority !== nextAuthority)
+      refuse(`${label}: read and write must append the same authority resource`);
+    authority = nextAuthority;
+    addedResourceIndexes.add(newStatement.resources[baseline.length]!.index);
+    addedResourceIndexes.add(newStatement.resources[baseline.length + 1]!.index);
   };
-  const read = statementResources("ReadLiveObjects", "s3:GetObject");
-  const write = statementResources("WriteLiveObjectsSseKmsOnly", "s3:PutObject");
-  if (read.length !== 2 || write.length !== 2 || read.length + write.length !== added.length)
-    refuse(`${label}: authority and candidate resources must be direct additions to ReadLiveObjects and WriteLiveObjectsSseKmsOnly Resource fields`);
-  if (read.filter((line) => line === candidate).length !== 1 || write.filter((line) => line === candidate).length !== 1)
-    refuse(`${label}: the fixed candidate resource must be added exactly once to Get and once to Put`);
-  const authority = [...read.filter((line) => line !== candidate), ...write.filter((line) => line !== candidate)];
-  if (authority.length !== 2 || authority[0] !== authority[1])
-    refuse(`${label}: one exact authority resource must be added to both Get and Put`);
-  const prefix = `- ${bucketArn}/`;
-  const line = authority[0] ?? "";
+  verifyTarget("ReadLiveObjects", "s3:GetObject");
+  verifyTarget("WriteLiveObjectsSseKmsOnly", "s3:PutObject");
+  if (addedResourceIndexes.size !== 4)
+    refuse(`${label}: expected exactly four appended resource lines`);
+  const newWithoutAdditions = newLines.filter((_, index) => !addedResourceIndexes.has(index));
+  if (JSON.stringify(newWithoutAdditions) !== JSON.stringify(oldLines))
+    refuse(`${label}: the policy changes more than the four reviewed Resource additions`);
+  const prefix = `${bucketArn}/`;
+  const line = authority ?? "";
   if (!line.startsWith(prefix) || !line.endsWith("/*"))
     refuse(`${label}: the authority resource must be an object ARN in the transcripts bucket`);
   const keyRoot = line.slice(prefix.length, -2);

@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { formatDeclaredPropertyYaml } from "alchemy/Cli/PropertyDiff";
 import * as Effect from "effect/Effect";
 import { manifestKey, rawChunkKey, type SessionLocation } from "../../../packages/object-store/src/layout.ts";
 import { NON_DESTROYABLE } from "../deploy-guard.ts";
@@ -479,24 +480,38 @@ describe("transcript store: deploy plan contract", () => {
   ].join("\n");
   const withKeyDiff = (compact: string, diff: string) =>
     detailed(compact).replace("  [transcripts-key] update", `  [transcripts-key] update\n${diff}`);
-  const inboxStatement = (sid: string, action: string, additions: string[], parent: "Resource" | "Condition" = "Resource") => [
-    `        - Sid: ${sid}`,
-    `          Effect: Allow`,
-    `          Action:`,
-    `            - ${action}`,
-    `          Resource:`,
-    ...(parent === "Condition" ? [`          Condition:`, `            StringEquals:`] : []),
-    ...additions.map((resource) => parent === "Resource" ? `  +               - ${resource}` : `  +                   - ${resource}`),
-  ].join("\n");
-  const withInboxPolicyDiff = (compact: string, authorityRoot = AUTHORITY_ROOT, additions: string[] = [
-    `${n.bucketArn}/${authorityRoot}/*`,
-    `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
-    `${n.bucketArn}/${authorityRoot}/*`,
-    `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
-  ]) => detailed(compact).replace(
-    "  [transcript-srv-writer] update",
-    `  [transcript-srv-writer] update\n${inboxStatement("ReadLiveObjects", "s3:GetObject", additions.slice(0, 2))}\n${inboxStatement("WriteLiveObjectsSseKmsOnly", "s3:PutObject", additions.slice(2))}`,
-  );
+  type PolicyStatementFixture = { Sid: string; Effect: string; Action: string[]; Resource: string[]; Condition?: Record<string, unknown> };
+  type PolicyFixture = { Version: string; Statement: PolicyStatementFixture[] };
+  const inboxPolicy = (authorityRoot?: string) => transcriptSrvWriterPolicy({
+    bucketArn: n.bucketArn,
+    accountId: ACCOUNT,
+    region: REGION,
+    keyAlias: n.keyAlias,
+    inboxAuthorityKeyRoot: authorityRoot,
+  }) as unknown as PolicyFixture;
+  const policyStatement = (policy: PolicyFixture, sid: string) => policy.Statement.find((statement) => statement.Sid === sid)!;
+  const withNativeInboxPolicyDiff = (
+    compact: string,
+    authorityRoot = AUTHORITY_ROOT,
+    mutate?: (oldPolicy: PolicyFixture, newPolicy: PolicyFixture) => void,
+  ) => {
+    const oldPolicy = structuredClone(inboxPolicy());
+    const newPolicy = structuredClone(inboxPolicy(authorityRoot));
+    // The real helper deliberately reuses one Resource array for read/write;
+    // detach fixture arrays so one causal mutation cannot change two statements.
+    for (const policy of [oldPolicy, newPolicy])
+      policy.Statement = policy.Statement.map((statement) => ({
+        ...statement,
+        Action: [...statement.Action],
+        Resource: [...statement.Resource],
+        ...(statement.Condition ? { Condition: structuredClone(statement.Condition) } : {}),
+      }));
+    mutate?.(oldPolicy, newPolicy);
+    const document = formatDeclaredPropertyYaml({ policy: oldPolicy }, { policy: newPolicy }, "update");
+    if (!document) throw new Error("native inbox policy fixture unexpectedly has no diff");
+    const rendered = document.lines.map((line) => `  ${line}`).join("\n");
+    return detailed(compact).replace("  [transcript-srv-writer] update", `  [transcript-srv-writer] update\n${rendered}`);
+  };
   const LIVE = ["AccountAdministersKey", "WriterEncryptsAndReadsViaS3", "ReaderDecryptsViaS3"];
   const PLANNED = ["AccountAdministersKey", "WriterEncryptsAndReadsViaS3", "SrvWriterEncryptsAndReadsViaS3", "ReaderDecryptsViaS3"];
 
@@ -527,51 +542,58 @@ describe("transcript store: deploy plan contract", () => {
 
   it("accepts only the exact dormant-to-enabled srv-writer inbox policy expansion", () => {
     const compact = plan({ "transcript-srv-writer": "update" });
-    const full = withInboxPolicyDiff(compact);
+    const full = withNativeInboxPolicyDiff(compact);
     expect(check(compact, full, provenance(compact, full))).toBe("srv-writer inbox policy update");
-    const resources = [
+    const additions = [
       `${n.bucketArn}/${AUTHORITY_ROOT}/*`,
       `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
       `${n.bucketArn}/${AUTHORITY_ROOT}/*`,
       `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
     ];
-    const allUnder = (sid: string, action: string) => detailed(compact).replace(
-      "  [transcript-srv-writer] update",
-      `  [transcript-srv-writer] update\n${inboxStatement(sid, action, resources)}`,
-    );
-    const wrongAction = withInboxPolicyDiff(compact).replace("            - s3:GetObject", "            - kms:Decrypt");
-    const nestedCondition = detailed(compact).replace(
-      "  [transcript-srv-writer] update",
-      `  [transcript-srv-writer] update\n${inboxStatement("ReadLiveObjects", "s3:GetObject", resources.slice(0, 2), "Condition")}\n${inboxStatement("WriteLiveObjectsSseKmsOnly", "s3:PutObject", resources.slice(2), "Condition")}`,
-    );
-    const repeatedReadSid = detailed(compact).replace(
-      "  [transcript-srv-writer] update",
-      `  [transcript-srv-writer] update\n${inboxStatement("ReadLiveObjects", "s3:GetObject", resources.slice(0, 2))}\n${inboxStatement("ReadLiveObjects", "s3:GetObject", resources.slice(2))}`,
-    );
-    const nestedSidInjection = withInboxPolicyDiff(compact).replace(
-      "          Resource:\n  +",
-      "          Resource:\n            - Sid: WriteLiveObjectsSseKmsOnly\n  +",
-    );
     for (const bad of [
-      withInboxPolicyDiff(compact, AUTHORITY_ROOT, [`${n.bucketArn}/${AUTHORITY_ROOT}/*`, `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`]),
-      withInboxPolicyDiff(compact, AUTHORITY_ROOT, [
-        `${n.bucketArn}/${AUTHORITY_ROOT}/*`,
-        `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
-        `${n.bucketArn}/96bulls/other-authority/v1/*`,
-        `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
-      ]),
-      withInboxPolicyDiff(compact, "96bulls/upload-inbox"),
-      withInboxPolicyDiff(compact).replace("  +               - ", "  -               - "),
-      withInboxPolicyDiff(compact).replace(
-        `  +               - ${n.bucketArn}/${AUTHORITY_ROOT}/*`,
-        `  +               - ${n.bucketArn}/${AUTHORITY_ROOT}/*\n  +       - s3:DeleteObject`,
-      ),
-      allUnder("ReadLiveObjects", "s3:GetObject"),
-      allUnder("UseTranscriptKeyViaS3", "kms:Decrypt"),
-      wrongAction,
-      nestedCondition,
-      repeatedReadSid,
-      nestedSidInjection,
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Resource.splice(-2);
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        const resources = policyStatement(next, "WriteLiveObjectsSseKmsOnly").Resource;
+        resources[resources.length - 2] = `${n.bucketArn}/96bulls/other-authority/v1/*`;
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        for (const sid of ["ReadLiveObjects", "WriteLiveObjectsSseKmsOnly"]) {
+          const resources = policyStatement(next, sid).Resource;
+          resources[resources.length - 2] = `${n.bucketArn}/96bulls/upload-inbox/*`;
+        }
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        policyStatement(next, "ReadLiveObjects").Action.push("s3:DeleteObject");
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Resource.splice(-2);
+        policyStatement(next, "ReadLiveObjects").Resource.push(...additions.slice(2));
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        policyStatement(next, "ReadLiveObjects").Resource.splice(-2);
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Resource.splice(-2);
+        policyStatement(next, "UseTranscriptKeyViaS3").Resource.push(...additions);
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (old, next) => {
+        policyStatement(old, "ReadLiveObjects").Action = ["kms:Decrypt"];
+        policyStatement(next, "ReadLiveObjects").Action = ["kms:Decrypt"];
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        policyStatement(next, "ReadLiveObjects").Resource.splice(-2);
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Resource.splice(-2);
+        policyStatement(next, "ReadLiveObjects").Condition = { StringEquals: { Injected: additions.slice(0, 2) } };
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Condition = { Injected: additions.slice(2) };
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (old, next) => {
+        policyStatement(old, "WriteLiveObjectsSseKmsOnly").Sid = "ReadLiveObjects";
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Sid = "ReadLiveObjects";
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (old, next) => {
+        policyStatement(old, "ReadLiveObjects").Condition = { StringEquals: { Sid: "WriteLiveObjectsSseKmsOnly" } };
+        policyStatement(next, "ReadLiveObjects").Condition = { StringEquals: { Sid: "WriteLiveObjectsSseKmsOnly" } };
+      }),
     ])
       expect(() => check(compact, bad, provenance(compact, bad))).toThrow(/srv-writer inbox policy update/);
   });
