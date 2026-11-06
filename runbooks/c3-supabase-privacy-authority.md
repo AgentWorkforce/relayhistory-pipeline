@@ -45,6 +45,17 @@ and the eraser reads the frozen deletions exactly where it read Neon's `deleted_
 JSON object on stdin, piped from 1Password, never a file: `{"neonUrl": <Neon owner URL, used read-only>, "supabaseUrl": <Supabase owner URL>}`.
 `EPOCH` = the live `DELIVERY_CUTOVER` epoch.
 
+**Session affinity (required).** Both URLs must be dedicated direct or session-mode connections, never a transaction
+pooler: `sync-owned` holds a session advisory lock and a single Neon cursor, and Neon reads rely on a session-level
+`default_transaction_read_only`. The CLI refuses known transaction-pooler inputs before connecting (Supabase port
+`6543`, any `pgbouncer=true`, a Neon `-pooler.` host). That is a blocklist, not a proof: a URL's text cannot show
+that it is session-mode, so use the Supabase direct host (`db.<ref>.supabase.co:5432`) or the session pooler on
+`5432`, and the Neon unpooled endpoint. As a runtime backstop `sync-owned` pins its backend by pid. It takes the lock
+only on the backend that proved it does not already hold it, checks the pid in every page transaction before
+writing, and unlocks only on that backend. Any mismatch stops with `sync_session_reassigned`. If that happens, the
+lock may stay held on the original backend until that session ends: rerun on a dedicated connection. Never run two
+`sync-owned` processes at once; the second refuses with `sync_owned_in_progress`.
+
 1. **Census (READ-ONLY):** `<creds> | $OP census --epoch $EPOCH`. Expect `supabase.authority: "neon"`,
    `neon.counts.pending: 0`. Record `neon.fingerprint`. `equal` may be false (the frozen deletions drift from Neon
    after the seal; activation reconciles exactly). STOP if `neon.counts` are implausible or the call refuses.

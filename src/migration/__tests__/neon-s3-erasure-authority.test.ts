@@ -76,6 +76,46 @@ describe("bounded stdin reads on a real pipe (independent review P2)", () => {
   }, 30_000);
 });
 
+/** Runs the real handoff CLI with `creds` on a real stdin pipe; resolves with its one JSON line, exit code and duration. */
+function handoffCli(args: string[], creds: unknown): Promise<{ out: Record<string, unknown>; code: number | null; ms: number }> {
+  const started = Date.now();
+  const cli = new URL("../../../scripts/privacy-authority-handoff.ts", import.meta.url).pathname;
+  return new Promise((resolve, reject) => {
+    const env = { ...process.env };
+    for (const k of FORBIDDEN_CREDENTIAL_ENV) delete env[k];
+    const child = spawn(process.execPath, [cli, ...args], { stdio: ["pipe", "pipe", "inherit"], env });
+    let text = "";
+    child.stdout.on("data", (b) => (text += b));
+    child.on("error", reject);
+    child.on("exit", (code) => resolve({ out: JSON.parse(text.trim().split("\n").at(-1) || "{}"), code, ms: Date.now() - started }));
+    child.stdin.end(JSON.stringify(creds));
+  });
+}
+
+describe("handoff CLI: transaction-pooler inputs refused before any connection (independent review P2)", () => {
+  const EPOCH = "3".repeat(64);
+  // Ports 1 and 9 on loopback: nothing listens, so ANY connection attempt would surface as a connect error instead.
+  const directNeon = "postgres://ro@127.0.0.1:9/neondb";
+  for (const [name, supabaseUrl] of [
+    ["Supabase transaction pooler port 6543", "postgres://postgres.ref:synthetic@127.0.0.1:6543/postgres"],
+    ["pgbouncer=true", "postgres://postgres:synthetic@127.0.0.1:1/postgres?pgbouncer=true"],
+  ] as const)
+    for (const cmd of ["sync-owned", "census", "fence", "activate", "release"])
+      test(`${cmd}: ${name} is refused pre-connect`, async () => {
+        const r = await handoffCli([cmd, "--epoch", EPOCH, ...(cmd === "activate" ? ["--expect-neon", "a".repeat(64), "--settle-seconds", "30"] : [])], { neonUrl: directNeon, supabaseUrl });
+        expect([r.code, r.out.m, r.out.refused]).toEqual([1, "STOPPED", "supabase_url_transaction_pooler"]);
+      }, 30_000);
+  test("a Neon pooler host is refused pre-connect (session-level read-only settings would not stick)", async () => {
+    const r = await handoffCli(["sync-owned", "--epoch", EPOCH], { neonUrl: "postgres://ro@ep-x-pooler.us-east-2.aws.neon.tech:9/neondb", supabaseUrl: "postgres://postgres@127.0.0.1:1/postgres" });
+    expect([r.code, r.out.refused]).toEqual([1, "neon_url_pooler"]);
+  }, 30_000);
+  test("control: a direct URL passes the check and then fails only on the (unreachable) connection", async () => {
+    const r = await handoffCli(["fence", "--epoch", EPOCH], { supabaseUrl: "postgres://postgres@127.0.0.1:1/postgres" });
+    expect(r.code).toBe(1);
+    expect(r.out.refused).not.toBe("supabase_url_transaction_pooler");
+  }, 30_000);
+});
+
 describe("credentials only through stdin (RAM)", () => {
   test("every on-disk or environment credential name refuses to start, by name only", () => {
     for (const k of FORBIDDEN_CREDENTIAL_ENV) expect(code(() => refuseCredentialEnv({ [k]: "" }))).toBe(`credential_env_refused.${k}`);
@@ -109,8 +149,10 @@ describe("credentials only through stdin (RAM)", () => {
     expect(authorityKind(undefined)).toBe("neon");
     expect(authorityKind("supabase")).toBe("supabase");
     expect(code(() => authorityKind("both"))).toContain("must be neon or supabase");
-    expect(code(() => authorityUrl("neon", "postgres://u@ep-x-pooler.us-east-2.aws.neon.tech/db"))).toContain("direct (unpooled)");
-    expect(code(() => authorityUrl("supabase", "postgres://u@aws-0.pooler.supabase.com:6543/postgres"))).toContain("transaction pooler");
+    expect(code(() => authorityUrl("neon", "postgres://u@ep-x-pooler.us-east-2.aws.neon.tech/db"))).toBe("database_url_pooler");
+    expect(code(() => authorityUrl("supabase", "postgres://u@aws-0.pooler.supabase.com:6543/postgres"))).toBe("database_url_transaction_pooler");
+    expect(code(() => authorityUrl("supabase", "postgres://u@db.ref.supabase.co:5432/postgres?pgbouncer=true"))).toBe("database_url_transaction_pooler");
+    expect(code(() => authorityUrl("neon", "postgres://u@ep-x.us-east-2.aws.neon.tech:6543/db"))).toBe("database_url_transaction_pooler");
     expect(authorityUrl("supabase", "postgres://u@aws-0.pooler.supabase.com:5432/postgres")).toContain(":5432");
     expect(code(() => authorityUrl("supabase", "https://example.com"))).toBe("credentials_invalid.databaseUrl");
     const e = (m: Record<string, string>) => (k: string, d?: string) => m[k] ?? d;

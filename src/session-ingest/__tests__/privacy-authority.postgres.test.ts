@@ -315,4 +315,83 @@ describe.skipIf(!url)("C3 privacy authority on actual PostgreSQL", () => {
       nc.release();
     }
   }, 30_000);
+
+  /**
+   * A transaction-pooler stand-in over real backends: outside a transaction each statement goes to the next backend in
+   * turn; BEGIN..COMMIT/ROLLBACK stays on one backend (what PgBouncer transaction mode does).
+   */
+  function pooler(backends: pg.PoolClient[]) {
+    let next = 0;
+    let pinned: pg.PoolClient | undefined;
+    return {
+      query: async (t: string, p?: unknown[]) => {
+        const c = pinned ?? backends[next++ % backends.length]!;
+        if (/^\s*BEGIN/i.test(t)) pinned = c;
+        const r = await c.query(t, p as never);
+        if (/^\s*(COMMIT|ROLLBACK)/i.test(t)) pinned = undefined;
+        return { rows: r.rows };
+      },
+    };
+  }
+  const syncLocks = async (d: Awaited<ReturnType<typeof database>>) =>
+    (await d.pool.query("SELECT count(*)::int AS n FROM pg_locks WHERE locktype='advisory' AND classid=1919249529 AND objid=97 AND granted")).rows[0].n as number;
+
+  test("P2 session affinity: a sync whose session is reassigned between statements refuses before writing a page", async () => {
+    const d = await database();
+    const neon = await d.neon();
+    const nc = await neon.connect();
+    try {
+      await d.owner("ingest_privacy_authority_fence", { controlEpoch: epoch });
+      await nc.query("INSERT INTO sessions.uploaded_support_identities VALUES($1,$2,'o1','r1',$3,'claude','X')", [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
+      const A = await d.conn(), B = await d.conn();
+      const q = { query: async (t: string, p?: unknown[]) => ({ rows: (await nc.query(t, p as never)).rows }) };
+      const r = await settle(syncOwned(q, pooler([A, B])));
+      expect((r as { e?: string }).e).toContain("sync_session_reassigned");
+      // The guarded acquire never took the lock on a backend other than the one it checked: nothing leaks.
+      expect(await syncLocks(d)).toBe(0);
+      expect((await d.pool.query("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_owned_sessions")).rows[0].n).toBe(0);
+    } finally {
+      nc.release();
+    }
+  }, 30_000);
+
+  test("P2 session affinity: a backend handed to a second operator mid-sync cannot let both syncs enter", async () => {
+    const d = await database();
+    const neon = await d.neon();
+    const n1 = await neon.connect(), n2 = await neon.connect();
+    try {
+      await d.owner("ingest_privacy_authority_fence", { controlEpoch: epoch });
+      for (const sid of ["S1", "S2"])
+        await n1.query("INSERT INTO sessions.uploaded_support_identities VALUES($1,$2,'o1',$3,$4,'claude',$3)", [TENANT.orgId, TENANT.workspaceId, sid, TENANT.userId]);
+      const A = await d.conn();
+      // Run 1 keeps backend A (its lock lives there) and pauses BETWEEN pages, so A is idle;
+      // the pooler then hands the same A to run 2, where the session lock is reentrant.
+      const shared = pooler([A]);
+      let release!: () => void;
+      const paused = new Promise<void>((r) => (release = r));
+      let reached!: () => void;
+      const between = new Promise<void>((r) => (reached = r));
+      // Run 1's view of the pooler: after its first page COMMIT (A idle, lock still held on A), it stalls.
+      let commits = 0;
+      const run1View = {
+        query: async (t: string, p?: unknown[]) => {
+          const r = await shared.query(t, p);
+          if (/^\s*COMMIT/i.test(t) && ++commits === 1) { reached(); await paused; }
+          return r;
+        },
+      };
+      const q = (c: pg.PoolClient) => ({ query: async (t: string, p?: unknown[]) => ({ rows: (await c.query(t, p as never)).rows }) });
+      const run1 = settle(syncOwned(q(n1), run1View, { pageRows: 1 }));
+      await between;
+      const run2 = await settle(syncOwned(q(n2), shared));
+      expect((run2 as { e?: string }).e).toContain("sync_owned_in_progress");
+      release();
+      expect(await run1).toMatchObject({ ok: true });
+      expect(await syncLocks(d)).toBe(0);
+      expect((await d.pool.query("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_owned_sessions")).rows[0].n).toBe(2);
+    } finally {
+      n1.release();
+      n2.release();
+    }
+  }, 30_000);
 });

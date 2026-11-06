@@ -123,6 +123,22 @@ export function postgresUrl(v: unknown, name: string): string {
   return v;
 }
 
+/**
+ * A URL for a job that needs SESSION affinity (session-level settings, a session advisory lock, one cursor).
+ * Known transaction-pooler inputs are refused BEFORE any connection: Supabase's transaction pooler (port 6543),
+ * any `pgbouncer=true` URL, and a Neon `-pooler.` host. This rejects known poolers only; it cannot prove from
+ * the text that an arbitrary URL is session-mode. The operator contract (runbook) is a dedicated direct or
+ * session-mode connection, and the jobs additionally verify backend affinity at runtime.
+ */
+export function sessionAffinityUrl(v: unknown, name: string, provider: "supabase" | "neon"): string {
+  const url = postgresUrl(v, name);
+  const u = new URL(url);
+  const prefix = name.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase()); // supabaseUrl -> supabase_url
+  if (provider === "neon" && /-pooler\./.test(u.hostname)) throw new CredentialRefusal(`${prefix}_pooler`);
+  if (u.port === "6543" || /^(true|1)$/i.test(u.searchParams.get("pgbouncer") ?? "")) throw new CredentialRefusal(`${prefix}_transaction_pooler`);
+  return url;
+}
+
 export interface S3Credentials {
   accessKeyId: string;
   secretAccessKey: string;
