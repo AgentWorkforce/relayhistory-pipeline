@@ -207,6 +207,21 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_claim_attempt_records_candidates(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_claim_attempt_records_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_claim_attempt_records_key(text,text,text,timestamp with time zone,uuid,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_claim_attempt_records_retire(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_claim_attempt_records_terminal(uuid)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_claim_batch(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
@@ -598,6 +613,9 @@
     "sessions.ingest_source_control_complete(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_stage_intent_retired_attempt_guard()": [
+      "<owner>:EXECUTE"
     ],
     "sessions.initialize_search_feature_baseline(text,text,uuid,bigint,text,bigint)": [
       "<owner>:EXECUTE",
