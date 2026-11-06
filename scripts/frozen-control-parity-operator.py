@@ -79,8 +79,12 @@ def source_mode():
 
 
 def remote_command(head, args):
+    # Exact head; no tracked, untracked or ignored file other than the dependency trees; no .env* anywhere; bun never loads one.
     return ("cd " + shlex.quote(ROOT) + " && test \"$(git rev-parse HEAD)\" = " + shlex.quote(head)
-            + " && git diff --quiet HEAD && " + BUN + " scripts/frozen-control-parity.ts " + shlex.join(args))
+            + " && git diff --quiet HEAD"
+            + " && test -z \"$(git status --porcelain --untracked-files=all --ignored=matching | grep -v -E '^!! (packages/[^/]+/)?node_modules/$')\""
+            + " && test -z \"$(find . -name node_modules -prune -o -name '.env*' -print)\""
+            + " && env -u SUPABASE_CLI " + BUN + " --no-env-file scripts/frozen-control-parity.ts " + shlex.join(args))
 
 
 def main():
@@ -95,7 +99,9 @@ def main():
     if u.hostname != NEON_HOST or u.username != "neondb_owner" or not u.password:
         raise SystemExit("Neon endpoint pin mismatch; refusing")
     secrets = [s for s in (url, u.password, unquote(u.password)) if s]
-    log = pathlib.Path(__file__).with_name("control-parity-" + mode + ".log")
+    run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    # One file per run: evidence is always bound to the run that produced it, never "the last line of a shared log".
+    log = pathlib.Path(__file__).with_name("control-parity-" + mode + "-" + run_id + ".jsonl")
     started = time.monotonic()
     with log.open("a") as out:
         def emit(line):
@@ -104,7 +110,8 @@ def main():
             print(line, end="", flush=True)
             out.write(line)
             out.flush()
-        emit(json.dumps({"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "operator": "start", "mode": mode, "head": head}) + "\n")
+        emit(json.dumps({"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "operator": "start", "mode": mode, "head": head,
+                         "runId": run_id, "log": str(log)}) + "\n")
         p = subprocess.Popen(["ssh", "sf-frame", remote_command(head, args)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True)
         p.stdin.write(json.dumps({"neonOwnerUrl": url}) + "\n")

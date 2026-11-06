@@ -16,7 +16,9 @@
  *        then the exact-sync plan (pending heads included). Run only with the fence closed (mirror ON, unsealed).
  *   bun scripts/frozen-control-parity.ts --handoff-sync --expect-plan <planSha256> [--settle-seconds N]
  *        exact sync under the fence; see src/migration/frozen-control-handoff.ts for the proof and refusals.
- * Exit codes: 0 ok and full parity; 3 ok but HELD categories remain (operator decision); 1 refused/failed; 64 usage.
+ * Exit codes: census 0 = full parity, 3 = writes planned or HELD/blocked (read the JSON); apply 0 = committed AND full parity
+ * afterwards, 1 = refused, failed, or anything short of full parity afterwards (a `committed` line says whether writes landed);
+ * 64 usage.
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -26,7 +28,7 @@ import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
 import { applySeedRepair, census, OPERATOR_APP, ParityRefusal } from "../src/migration/frozen-control-parity.ts";
 import { handoffCensus, handoffSync } from "../src/migration/frozen-control-handoff.ts";
 
-const REF = "pyamkrhoyszgzirqqffq", HOST = "aws-0-us-east-1.pooler.supabase.com", CLI = process.env.SUPABASE_CLI ?? "/home/khaliqgant/.local/bin/supabase";
+const REF = "pyamkrhoyszgzirqqffq", HOST = "aws-0-us-east-1.pooler.supabase.com", CLI = "/home/khaliqgant/.local/bin/supabase"; // fixed: never steerable from the environment
 const args = process.argv.slice(2);
 const usage = (): never => { console.error("usage: --census [--seed-pending-missing] | --apply --expect-plan <sha256> [--seed-pending-missing] | --handoff-census [--settle-seconds N] | --handoff-sync --expect-plan <sha256> [--settle-seconds N]"); process.exit(64); };
 const MODES = ["--census", "--apply", "--handoff-census", "--handoff-sync"] as const;
@@ -67,6 +69,7 @@ async function supa(readOnly: boolean) {
   } catch (error) { await c.end().catch(() => {}); throw error; }
 }
 
+let committed = false;
 async function main() {
   const n = await neon();
   try {
@@ -87,14 +90,15 @@ async function main() {
         log("census", { census: c });
         return c.parity.held || c.plan.writes ? 3 : 0;
       }
-      const r = await applySeedRepair(n, s, expect, opts);
+      const r = await applySeedRepair(n, s, expect, opts, { onCommitted: (c) => { committed = true; log("committed", c); } });
       log("applied", { seeded: r.seeded, repairs: r.repairs, after: r.after });
-      return Object.keys(r.repairs.refused).length || r.after.parity.held || r.after.plan.writes ? 3 : 0;
+      const a = r.after;
+      return a.parity.held || a.plan.writes || a.plan.blocked.length || !a.parity.privacyParity || !a.parity.sealHeadParity ? 1 : 0;
     } finally { await s.end().catch(() => {}); }
   } finally { await n.end().catch(() => {}); }
 }
 main().then((code) => { process.exitCode = code; }, (e) => {
   // Never print messages: pg error details can carry key values. Refusal code or SQLSTATE only.
   const code = e instanceof ParityRefusal ? e.code : typeof e?.code === "string" && /^[0-9A-Z]{5}$/u.test(e.code) ? "sqlstate_" + e.code : "failed";
-  log("STOPPED", { code }); process.exitCode = 1;
+  log("STOPPED", { code, committed }); process.exitCode = 1;
 });

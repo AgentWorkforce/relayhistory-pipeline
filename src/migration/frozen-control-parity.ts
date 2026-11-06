@@ -15,16 +15,19 @@
  * is re-encoded through JS numbers). It never updates or deletes an existing row. Missing heads are
  * seeded only when Neon's head is completed (not pending) and in the live policy epoch, unless the
  * operator explicitly asks for copy-mode pending seeding. Existing heads are changed only through the
- * reviewed repairControlHead (both sides completed, same epoch, Neon strictly newer). Everything else
- * is counted as HELD and left for an operator decision.
+ * reviewed repairControlHead rules (both sides completed, same epoch, Neon strictly newer), applied as a compare-and-set to
+ * EXACTLY the planned Neon version/digest inside the same locked transaction (byte-exact jsonb, unlike the JS round trip in
+ * frozen-control-head-repair.ts). Everything else is counted as HELD; any HELD item blocks the apply.
  *
  * Fail closed: Neon must be phase=active with the same epoch/baseline as the live Supabase policy; no
- * frozen-copy session may be connected; the apply runs under an advisory lock plus table locks, re-reads
- * both sides and refuses unless the recomputed plan hash equals the reviewed dry-run hash; every insert
- * must land exactly once and is re-verified before COMMIT. A rerun after success plans zero writes.
+ * frozen-copy session may be connected; the apply runs under an advisory lock plus table locks (mirror tables SHARE ROW
+ * EXCLUSIVE; seal and policy tables SHARE, so a seal or policy change cannot commit underneath it), re-reads both sides,
+ * refuses unless the recomputed plan hash (which covers HELD counts and set hashes) equals the reviewed dry-run hash, and
+ * requires a FRESH Neon read under the lock, before and again after the writes, to equal the planned Neon snapshot. Every
+ * write must land exactly once and is re-verified before COMMIT. A rerun after success plans zero writes.
  */
 import { createHash } from "node:crypto";
-import { repairControlHead, type HeadKey, type Queryable } from "../hoopdb/frozen-control-head-repair.ts";
+import type { HeadKey, Queryable } from "../hoopdb/frozen-control-head-repair.ts";
 
 export interface Head {
   org_id: string; workspace_id: string; user_id: string; epoch: string; version: string; digest: string;
@@ -195,24 +198,30 @@ export function compare(src: SourceState, mir: MirrorState, opts: ParityOptions 
   else if (!epochMatches || !baselineMatches) plan.blocked.push("policy_mismatch");
   if (mir.sealed && (plan.deletions.length || plan.resets.length)) plan.blocked.push("privacy_seed_after_seal");
 
-  const sortKey = <T>(rows: T[], f: (r: T) => string) => rows.map(f).sort();
-  plan.sha256 = sha(JSON.stringify({
-    v: 1, epoch: src.status.epoch, baseline: src.status.privacyBaselineSha256, policy: pol, sealed: mir.sealed, seedPendingMissing: !!opts.seedPendingMissing,
-    deletions: sortKey(plan.deletions, delKey), resets: sortKey(plan.resets, (r) => JSON.stringify([resetKey(r), r.deleted])),
-    heads: sortKey(plan.heads, headFull), repairs: plan.repairs.map((r) => JSON.stringify(r)).sort(), blocked: plan.blocked,
-  }));
-
   const held = counts.equalVersionDigestFieldsDiffer + counts.pendingStateDiffers + counts.missingOtherEpoch + counts.staleNeonNewerPending
     + counts.staleOtherEpoch + counts.epochMismatch + counts.mirrorNewer + counts.sameVersionDigestDiffers + counts.extra
     + (opts.seedPendingMissing ? 0 : counts.missingPending) + delExtra + rExtra + rConflict;
+  if (held) plan.blocked.push("held_items_present");
   const nonEqualHeads = HEAD_CATEGORIES.filter((c) => c !== "equal" && c !== "equalVersionDigestFieldsDiffer").reduce((a, c) => a + counts[c], 0);
+  const sets = {
+    neonHeads: setSha(src.heads.map(headCore)), mirrorHeads: setSha(mir.heads.map(headCore)),
+    neonDeletions: setSha([...nd.keys()]), mirrorDeletions: setSha([...md.keys()]),
+    neonResets: setSha(src.resets.map((r) => JSON.stringify([resetKey(r), r.deleted]))), mirrorResets: setSha(mir.resets.map((r) => JSON.stringify([resetKey(r), r.deleted]))),
+  };
+  const sortKey = <T>(rows: T[], f: (r: T) => string) => rows.map(f).sort();
+  // Binds the write set AND everything the operator reviewed: every category count, HELD total and all six set hashes.
+  plan.sha256 = sha(JSON.stringify({
+    v: 2, epoch: src.status.epoch, baseline: src.status.privacyBaselineSha256, policy: pol, sealed: mir.sealed, seedPendingMissing: !!opts.seedPendingMissing,
+    deletions: sortKey(plan.deletions, delKey), resets: sortKey(plan.resets, (r) => JSON.stringify([resetKey(r), r.deleted])),
+    heads: sortKey(plan.heads, headFull), repairs: plan.repairs.map((r) => JSON.stringify(r)).sort(), blocked: plan.blocked,
+    counts, privacy: [delMissing, delExtra, rMissing, rExtra, rConflict], held, sets,
+  }));
   const census: Census = {
     version: 1,
     policy: { neonPhase: src.status.phase, supabasePolicyPresent: !!pol, epochMatches, baselineMatches, sealed: mir.sealed },
-    heads: { ...counts, neon: nh.size, mirror: mh.size, neonCoreSetSha256: setSha(src.heads.map(headCore)), mirrorCoreSetSha256: setSha(mir.heads.map(headCore)) },
-    deletions: { neon: nd.size, mirror: md.size, missing: delMissing, extra: delExtra, neonSetSha256: setSha([...nd.keys()]), mirrorSetSha256: setSha([...md.keys()]) },
-    resets: { neon: nr.size, mirror: mr.size, missing: rMissing, extra: rExtra, conflicting: rConflict,
-      neonSetSha256: setSha(src.resets.map((r) => JSON.stringify([resetKey(r), r.deleted]))), mirrorSetSha256: setSha(mir.resets.map((r) => JSON.stringify([resetKey(r), r.deleted]))) },
+    heads: { ...counts, neon: nh.size, mirror: mh.size, neonCoreSetSha256: sets.neonHeads, mirrorCoreSetSha256: sets.mirrorHeads },
+    deletions: { neon: nd.size, mirror: md.size, missing: delMissing, extra: delExtra, neonSetSha256: sets.neonDeletions, mirrorSetSha256: sets.mirrorDeletions },
+    resets: { neon: nr.size, mirror: mr.size, missing: rMissing, extra: rExtra, conflicting: rConflict, neonSetSha256: sets.neonResets, mirrorSetSha256: sets.mirrorResets },
     parity: { sealHeadParity: nonEqualHeads === 0, privacyParity: delMissing + delExtra + rMissing + rExtra + rConflict === 0, held },
     plan: { seedDeletions: plan.deletions.length, seedResets: plan.resets.length, seedHeads: plan.heads.length, seedHeadsPending,
       repairHeads: plan.repairs.length, writes: plan.deletions.length + plan.resets.length + plan.heads.length + plan.repairs.length,
@@ -233,24 +242,35 @@ export interface ApplyResult {
   seeded: { deletions: number; resets: number; heads: number }; repairs: { repaired: number; already: number; refused: Record<string, number> };
   after: Census;
 }
+/** Hash of the complete Neon privacy/control state, status included (aggregate only). */
+export const sourceFingerprint = (s: SourceState) => sha(JSON.stringify([s.status, setSha(s.heads.map(headFull)), setSha(s.deletions.map(delKey)),
+  setSha(s.resets.map((r) => JSON.stringify([resetKey(r), r.deleted])))]));
 
-/** Seed-only + qualified repair, bound to the reviewed dry-run planSha256. */
-export async function applySeedRepair(neon: Queryable, supa: Queryable, expectPlanSha256: string, opts: ParityOptions = {}): Promise<ApplyResult> {
+/**
+ * Seed-only + qualified repair, bound to the reviewed dry-run planSha256. Seeds and repairs commit together in ONE locked
+ * transaction. `onCommitted` fires immediately after COMMIT, so a later failure (the closing census) cannot hide that writes landed.
+ */
+export async function applySeedRepair(neon: Queryable, supa: Queryable, expectPlanSha256: string, opts: ParityOptions = {},
+  hooks: { onCommitted?: (r: { seeded: ApplyResult["seeded"]; repaired: number }) => void } = {}): Promise<ApplyResult> {
   if (!HEX64.test(expectPlanSha256)) refuse("expect_plan_invalid");
-  const src = await readSource(neon, opts);
-  let plan: Plan;
+  const src = await readSource(neon, opts), planned = sourceFingerprint(src);
+  let plan: Plan, repairedCount = 0;
   await supa.query("BEGIN");
   try {
     await supa.query("SET LOCAL lock_timeout='5s'");
     await supa.query("SET LOCAL statement_timeout='120s'");
     if ((await supa.query<any>(LOCK_KEY)).rows[0]?.ok !== true) refuse("parity_operator_busy");
     if ((await supa.query<any>(COPY_ACTIVE_SQL)).rows[0]?.n !== 0) refuse("frozen_copy_session_active");
-    // Serialise against mirror begin/complete and any copy seed for the short life of this transaction.
+    // Serialise against mirror begin/complete and any copy seed for the short life of this transaction...
     await supa.query("LOCK TABLE sessions.ingest_source_control_heads,sessions.ingest_frozen_source_deletions,sessions.ingest_frozen_source_resets IN SHARE ROW EXCLUSIVE MODE");
+    // ...and hold `sealed` and the live policy still, so privacy_seed_after_seal and the epoch checks are not a TOCTOU.
+    await supa.query("LOCK TABLE sessions.ingest_frozen_source_completeness,sessions.ingest_lazy_policy IN SHARE MODE");
     const mir = await readMirror(supa, opts);
     ({ plan } = compare(src, mir, opts));
     if (plan.blocked.length) refuse(plan.blocked[0]!);
     if (plan.sha256 !== expectPlanSha256) refuse("plan_changed_rerun_census");
+    // Fresh Neon read UNDER the lock: every seed and repair below targets exactly this planned Neon state.
+    if (sourceFingerprint(await readSource(neon, opts)) !== planned) refuse("neon_changed_since_plan");
 
     if (plan.deletions.length) {
       const col = (k: keyof Deletion) => plan.deletions.map((d) => d[k]);
@@ -272,26 +292,32 @@ export async function applySeedRepair(neon: Queryable, supa: Queryable, expectPl
         [h.org_id, h.workspace_id, h.user_id, h.epoch, h.version, h.digest, h.kind, h.payload, h.pending, h.before_privacy, h.privacy_version]);
       if (r.rows.length !== 1) refuse("seed_postcondition_heads");
     }
-    // Re-verify inside the transaction: every seeded row now equals its Neon source byte for byte.
+    // Qualified repair (repairControlHead's rules, already enforced by compare: both completed, same epoch == policy, Neon
+    // strictly newer) as a CAS from the planned mirror head to EXACTLY the planned Neon head, never "whatever Neon has now".
+    const nh = byKey(src.heads, headKey);
+    const repaired: Head[] = [];
+    for (const r of plan.repairs) {
+      const n = nh.get(JSON.stringify([r.key.org, r.key.workspace, r.key.user]))!;
+      if (n.version !== r.neon[0] || n.digest !== r.neon[1] || n.pending) refuse("repair_plan_inconsistent");
+      const u = await supa.query(`UPDATE sessions.ingest_source_control_heads SET epoch=$4,version=$5::bigint,digest=$6,kind=$7,payload=$8::jsonb,pending=false,
+          before_privacy=$9::jsonb,privacy_version=$10::bigint,updated_at=clock_timestamp()
+        WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 AND epoch=$4 AND version=$11::bigint AND digest=$12 AND NOT pending RETURNING 1 AS x`,
+        [n.org_id, n.workspace_id, n.user_id, n.epoch, n.version, n.digest, n.kind, n.payload, n.before_privacy, n.privacy_version, r.mirror[0], r.mirror[1]]);
+      if (u.rows.length !== 1) refuse("repair_postcondition");
+      repaired.push(n);
+    }
+    // Re-verify inside the transaction: every seeded/repaired row now equals its planned Neon source byte for byte.
     const after = await readMirror(supa, opts);
     const ah = byKey(after.heads, headKey), ad = byKey(after.deletions, delKey), ar = byKey(after.resets, resetKey);
-    for (const h of plan.heads) { const m = ah.get(headKey(h)); if (!m || headFull(m) !== headFull(h)) refuse("seed_verify_heads"); }
+    for (const h of [...plan.heads, ...repaired]) { const m = ah.get(headKey(h)); if (!m || headFull(m) !== headFull(h)) refuse("seed_verify_heads"); }
     for (const d of plan.deletions) if (!ad.has(delKey(d))) refuse("seed_verify_deletions");
     for (const r of plan.resets) if (ar.get(resetKey(r))?.deleted !== r.deleted) refuse("seed_verify_resets");
+    // And Neon still is the planned state (heads AND privacy) at the end: no control committed during the apply.
+    if (sourceFingerprint(await readSource(neon, opts)) !== planned) refuse("neon_changed_during_apply");
     await supa.query("COMMIT");
+    repairedCount = repaired.length;
   } catch (e) { await supa.query("ROLLBACK").catch(() => {}); throw e; }
-
-  // Qualified repair through the reviewed helper: it re-reads Neon READ ONLY and re-checks the mirror under
-  // a row lock with a version/digest compare-and-set, so a head that moved since the plan refuses or is "already".
-  const repairs = { repaired: 0, already: 0, refused: {} as Record<string, number> };
-  for (const r of plan.repairs) {
-    try {
-      const out = await repairControlHead(neon, supa, r.key, { dryRun: false });
-      repairs[out.outcome === "already" ? "already" : "repaired"]++;
-    } catch (e) {
-      const code = typeof (e as any)?.code === "string" ? (e as any).code : "repair_failed";
-      repairs.refused[code] = (repairs.refused[code] ?? 0) + 1;
-    }
-  }
-  return { seeded: { deletions: plan.deletions.length, resets: plan.resets.length, heads: plan.heads.length }, repairs, after: await census(neon, supa, opts) };
+  const seeded = { deletions: plan.deletions.length, resets: plan.resets.length, heads: plan.heads.length };
+  hooks.onCommitted?.({ seeded, repaired: repairedCount });
+  return { seeded, repairs: { repaired: repairedCount, already: 0, refused: {} }, after: await census(neon, supa, opts) };
 }

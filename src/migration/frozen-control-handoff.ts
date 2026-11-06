@@ -37,7 +37,7 @@
  */
 import type { Queryable } from "../hoopdb/frozen-control-head-repair.ts";
 import {
-  byKey, COPY_ACTIVE_SQL, compare, delKey, headFull, headKey, LOCK_KEY, readMirror, readSource, refuse, resetKey, setSha, sha, HEX64,
+  byKey, COPY_ACTIVE_SQL, compare, delKey, headFull, headKey, LOCK_KEY, readMirror, readSource, refuse, resetKey, setSha, sha, sourceFingerprint, HEX64,
   type Census, type Deletion, type Head, type MirrorState, type ParityOptions, type Reset, type SourceState,
 } from "./frozen-control-parity.ts";
 
@@ -55,8 +55,8 @@ export interface HandoffCensus {
 }
 
 const resetLine = (r: Reset) => JSON.stringify([resetKey(r), r.deleted]);
-/** Hash of the complete Neon privacy/control state, status included. Aggregate only. */
-export const neonFingerprint = (s: SourceState) => sha(JSON.stringify([s.status, setSha(s.heads.map(headFull)), setSha(s.deletions.map(delKey)), setSha(s.resets.map(resetLine))]));
+/** Hash of the complete Neon privacy/control state, status included (the same fingerprint the #260 apply binds). */
+export const neonFingerprint = sourceFingerprint;
 const tenantOf = (r: { org_id: string; workspace_id: string; user_id: string }) => headKey(r);
 
 /** Pure: the exact-sync plan that makes the mirror equal Neon, or the reasons it must not run. */
@@ -154,7 +154,7 @@ export async function handoffSync(neon: Queryable, supa: Queryable, expectPlanSh
     if ((await supa.query<any>(COPY_ACTIVE_SQL)).rows[0]?.n !== 0) refuse("frozen_copy_session_active");
     await supa.query("LOCK TABLE sessions.ingest_source_control_heads,sessions.ingest_frozen_source_deletions,sessions.ingest_frozen_source_resets IN SHARE ROW EXCLUSIVE MODE");
     // The seal row is what opens the fence; hold it still for the life of this transaction.
-    await supa.query("LOCK TABLE sessions.ingest_frozen_source_completeness IN SHARE MODE");
+    await supa.query("LOCK TABLE sessions.ingest_frozen_source_completeness,sessions.ingest_lazy_policy IN SHARE MODE");
     const mir = await readMirror(supa, opts);
     const plan = handoffPlan(src, mir);
     if (plan.blocked.length) refuse(plan.blocked[0]!);
