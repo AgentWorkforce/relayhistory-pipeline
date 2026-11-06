@@ -386,6 +386,12 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    // two matching accepted decisions (two real claims carrying the same candidate)
    await expectCode(tx(async()=>{const key=await forge();await upd({...base,key});await insDec(key,kx);await insDec(key,ky);await advance()}),"no accepted v1 decision");
    expect(await snap()).toBe(before);
+   // (C') a CLONE of the real claim kx (same batch, copied records, NULL format) owns no stage: refused (review of d0239414)
+   await expectCode(tx(async()=>{const clone=(await f.db.query(`INSERT INTO sessions.ingest_claim_attempts SELECT (jsonb_populate_record(x,jsonb_build_object('claim_token',gen_random_uuid(),'ack_format',NULL))).*
+     FROM sessions.ingest_claim_attempts x WHERE x.claim_token=$1 RETURNING claim_token::text c`,[kx.claim_token])).rows[0].c;
+     const key=await forge();await upd({...base,key});await insDec(key,{...kx,claim_token:clone});await advance()}),"no accepted v1 decision");
+   // the clock never moves backwards (K "ahead of the clock" branch stays defence in depth)
+   await expectCode(f.db.query("UPDATE sessions.ingest_receipt_seat_clock SET last_seat=last_seat-1"),"never moves backwards");
    // (D) positive control: the complete protocol for the real claim kx (seat + slot + one bound accepted decision + clock) commits
    await tx(async()=>{const key=await forge();await upd({...base,key});await insDec(key,kx);await advance()});
    expect((await f.db.query("SELECT current_revision::text r FROM sessions.ingest_lazy_native_slots WHERE record_id='K'")).rows[0].r).toBe("2");

@@ -34,7 +34,7 @@ CREATE FUNCTION sessions.ack_seat_era(p_seat bigint) RETURNS text LANGUAGE sql S
 $$ SELECT mode FROM sessions.ingest_ack_format_epochs WHERE first_seat<=p_seat::numeric ORDER BY first_seat DESC,epoch DESC LIMIT 1 $$;
 
 -- ---------- parent discriminator (§9.1) ----------
-ALTER TABLE sessions.ingest_claim_attempts ADD COLUMN ack_format smallint CHECK(ack_format IN(1,2));
+ALTER TABLE sessions.ingest_claim_attempts ADD COLUMN ack_format smallint CHECK(ack_format IN(0,1,2));   -- 0 = legacy, no ACK rows
 
 -- ---------- canonical preimages (§9.4) ----------
 CREATE FUNCTION sessions.ack_f(p_tag int,p bytea) RETURNS bytea LANGUAGE sql IMMUTABLE AS
@@ -263,7 +263,9 @@ CREATE FUNCTION sessions.ack_clock_immutable() RETURNS trigger LANGUAGE plpgsql 
 BEGIN
  IF ROW(NEW.control_epoch,NEW.source_identity_sha256,NEW.baseline->>'sourceProofSha256',NEW.initial_generation,NEW.allocated_high_water)
   IS DISTINCT FROM ROW(OLD.control_epoch,OLD.source_identity_sha256,OLD.baseline->>'sourceProofSha256',OLD.initial_generation,OLD.allocated_high_water) THEN
-  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: clock identity is immutable';END IF;RETURN NEW;END $$;
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: clock identity is immutable';END IF;
+ IF NEW.last_seat<OLD.last_seat THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: seat clock never moves backwards';END IF;
+ RETURN NEW;END $$;
 CREATE TRIGGER ack_clock_immutable BEFORE UPDATE ON sessions.ingest_receipt_seat_clock FOR EACH ROW EXECUTE FUNCTION sessions.ack_clock_immutable();
 
 -- ---------- slots: fourth pointer + three-pointer invariant (§9.2) ----------
@@ -595,7 +597,7 @@ BEGIN
  SELECT * INTO STRICT t FROM sessions.ingest_stage_intents WHERE stage_token=p_stage;
  SELECT * INTO STRICT a FROM sessions.ingest_claim_attempts WHERE claim_token=t.claim_token;
  IF a.ack_format IS NULL THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: unstamped acknowledged claim';END IF;
- IF a.ack_format=1 THEN RETURN sessions.ingest_lazy_stage_seats_v1(p_stage);END IF;
+ IF a.ack_format IN(0,1) THEN RETURN sessions.ingest_lazy_stage_seats_v1(p_stage);END IF;
  SELECT * INTO STRICT c FROM sessions.ingest_receipt_seat_clock WHERE singleton;
  PERFORM sessions.ingest_lazy_guard(t.org_id);
  IF t.receipt_state<>'acknowledged' OR t.cleanup_state<>'live' OR NOT EXISTS(
@@ -674,6 +676,10 @@ END $lazy_clear$;
 -- ---------- stamp history, then the owner flip (§9.1, §8.1, §9.3) ----------
 UPDATE sessions.ingest_claim_attempts a SET ack_format=1
  WHERE EXISTS(SELECT 1 FROM sessions.ingest_lazy_ack_decisions d WHERE d.claim_token=a.claim_token) AND a.ack_format IS NULL;
+-- committed claims with no ACK rows can never acquire a format later (review of d0239414): stamp them legacy (0)
+UPDATE sessions.ingest_claim_attempts a SET ack_format=0
+ WHERE a.ack_format IS NULL AND EXISTS(SELECT 1 FROM sessions.ingest_batches b WHERE b.org_id=a.org_id AND b.workspace_id=a.workspace_id
+  AND b.origin_id=a.origin_id AND b.batch_id=a.batch_id AND b.digest=a.digest AND b.state='committed');
 UPDATE sessions.ingest_ack_format SET released_at=clock_timestamp();
 
 CREATE FUNCTION sessions.ingest_ack_drain_count() RETURNS bigint LANGUAGE sql STABLE AS $$
@@ -800,7 +806,16 @@ BEGIN
    AND EXISTS(SELECT 1 FROM jsonb_array_elements(a.records) x WHERE (x->>'ord')::int=d.ord AND x->>'record_id'=n.record_id
     AND (x->>'revision')::bigint=n.current_revision AND x->>'digest'=n.current_digest)
    AND EXISTS(SELECT 1 FROM sessions.ingest_batches b WHERE b.org_id=a.org_id AND b.workspace_id=a.workspace_id AND b.origin_id=a.origin_id
-    AND b.batch_id=a.batch_id AND b.digest=a.digest AND b.user_id=a.user_id AND b.state='committed' AND b.buffer_receipt_kind='staged');
+    AND b.batch_id=a.batch_id AND b.digest=a.digest AND b.user_id=a.user_id AND b.state='committed' AND b.buffer_receipt_kind='staged')
+   -- the claim owns the batch's ORIGINAL stage (no parent, acknowledged, full identity), and that stage is the root of the
+   -- outbox's current stage chain (GC may have replaced it with a child) or the outbox is erased; a cloned claim owns no stage
+   AND EXISTS(SELECT 1 FROM sessions.ingest_stage_intents t JOIN sessions.ingest_buffer_outbox o ON o.org_id=a.org_id AND o.workspace_id=a.workspace_id
+     AND o.origin_id=a.origin_id AND o.batch_id=a.batch_id AND o.user_id=a.user_id AND o.digest=a.digest
+    LEFT JOIN sessions.ingest_stage_intents c ON c.stage_token=o.active_stage_token
+    WHERE t.claim_token=a.claim_token AND t.parent_stage_token IS NULL AND t.receipt_state='acknowledged'
+     AND t.org_id=a.org_id AND t.workspace_id=a.workspace_id AND t.user_id=a.user_id AND t.origin_id=a.origin_id
+     AND t.batch_id=a.batch_id AND t.digest=a.digest AND t.reset_epoch=a.reset_epoch
+     AND (o.state='erased' OR o.active_stage_token=t.stage_token OR c.parent_stage_token=t.stage_token));
  IF v_ok<>1 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: K winner has no accepted v1 decision';END IF;
  RETURN NULL;
 END $kp$;
