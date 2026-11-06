@@ -1,6 +1,6 @@
 # Canonical publication frontier plan
 
-Status: read-only evidence evaluator and offline rehearsal. It does not scan production, insert `sessions.ingest_publication_frontiers`, claim a stage, publish an object, enable a worker, or authorize rollout.
+Status: read-only evidence evaluator, production-reviewable capture runner, and offline rehearsal. No production capture was invoked by this change. It does not insert `sessions.ingest_publication_frontiers`, claim a stage, publish an object, enable a worker, or authorize rollout.
 
 ## Contract
 
@@ -24,16 +24,31 @@ The publication worker must require `status: "ready"` and exact equality between
 
 ## Evidence capture protocol
 
-A reviewed read-only probe should construct the JSON capture; this repository does not include a database URL, owner SQL, credential flag, or live scan entry point. The capture order is:
+`src/session-ingest/frontier-capture-source.ts` and `scripts/capture-canonical-frontier.ts` implement the reviewed read-only capture path. The runner accepts credentials only in capped stdin JSON. Database URLs and object credentials are rejected on argv, are never written to the capture, and are not printed on error. Its cache and output parent must be owner-only directories; output is create-only mode `0600`. The S3 principal must be limited to object reads/listing and bucket-versioning reads, and the runner wraps its store in a port whose write/delete methods always refuse. There is no owner SQL, insert, apply, claim, or publication mode.
 
-1. Read the complete origin inventory with a fixed keyset query and one page past the final row. Record the reviewed query SHA, source snapshot SHA, page/cursor-chain SHA, configured bounds, item/byte counts, and terminal `null` cursor.
-2. For each exact user/origin, read the opening source identity, generation, source commit, control epoch, privacy baseline, and privacy version. Unknown legacy values remain `null`, which produces `unknown_legacy_fact`.
-3. Read every current record maximum with a bounded resumable keyset scan. An absent destination revision row is not evidence of an empty legacy source. `sourceRecordCount` must equal the maxima count.
-4. Use `captureSeedScopeExportEvidence` from `frontier-plan-source.ts` for export evidence. It issues only the fixed preview RPC, takes two authoritative scope captures, runs every captured pointer through `SeedProofIndex`, derives the target origin's root counts from the sealed per-record index, and records the manifest version returned by the exact GET whose bytes were verified. `createS3FrontierVersioningReader` performs bounded signed `GetBucketVersioning` reads before and after the capture. The adapter refuses source changes, absent versions, non-delivery/unseeded records, foreign roots, and disabled/unknown/changing versioning. It has no caller-supplied completeness, count, version-ID, or versioning booleans.
-5. Read ordered deletion/reset control state and the complete first-ACK receipt-seat decisions. A losing equal-revision candidate stays auditable; two accepted bodies for one native record hold.
-6. Repeat the authority read after all PostgreSQL and S3 work. Any source, generation, control, privacy, or scan-state change invalidates the entire origin. Re-run from the opening inventory; do not patch a stale capture.
+The source connection must be a dedicated `NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS` role with only `USAGE` on the source schema and `SELECT`/`EXECUTE` on the enumerated relations, sequences, and functions. Capture uses `REPEATABLE READ READ ONLY`, bounded statement/lock timeouts, UTC, fixed parameterized queries, and a validated schema identifier. The capture order is:
 
-Each category has its own fixed adapter version. A complete scan requires `complete=true`, `terminalCursor=null`, a valid page-chain hash, and matching opening/closing state hashes. All item hashes are recomputed by the planner using canonical key-sorted JSON. The whole capture is content addressed by `captureId`; mutation after capture holds.
+1. Read the complete origin inventory with a fixed keyset query and an explicit empty terminal page. Record every actual page count, reviewed query SHA, transaction snapshot SHA, page-chain SHA, configured bounds, item/byte counts, and terminal `null` cursor. Any ownerless origin, reset-only user, or control-only user refuses capture instead of being hidden.
+2. Read the opening source authority: database/role/collation facts, exact relation and sequence OIDs, hashes of the five critical source functions, ordered control heads, cutover epoch, privacy baseline, and transaction snapshot. `sourceHead` is the first 40 hex characters of this source-authority digest; it is deliberately not represented as a deployment Git commit. If a deployment commit is an operational gate, verify it independently.
+3. For each exact user/origin, read every current record maximum and its projection/catalog acceptance sequence with a bounded ordered keyset scan and explicit empty terminal page. An absent destination revision row is not evidence of an empty legacy source. `sourceRecordCount` must equal the maxima count.
+4. Use `captureSeedScopeExportEvidence` from `frontier-plan-source.ts` for export evidence. It issues only the fixed preview RPC, takes two authoritative scope captures, runs every captured pointer through `SeedProofIndex`, derives the target origin's root counts from the sealed per-record index, and records the manifest version returned by the exact GET whose bytes were verified. `createS3FrontierVersioningReader` performs bounded signed `GetBucketVersioning` reads before and after the capture. The runner repeats this full proof for every required scope and requires the two passes to be byte-for-byte identical before taking the closing legacy-source scan; the final scan provenance binds both seed snapshots and signed versioning-read digests. The adapter refuses source changes, absent versions, non-delivery/unseeded records, foreign roots, and disabled/unknown/changing versioning. It has no caller-supplied completeness, count, version-ID, or versioning booleans.
+5. Read all ordered deletion/reset rows and bind each user’s exact control-head version. Every production attestation also requires a complete receipt-seat scan, including proof that it is empty when no receipt seats are in scope; a legacy maximum proved directly from immutable seed bytes never licenses an invented empty scan. A losing equal-revision receipt candidate stays auditable; two accepted bodies for one native record hold.
+6. After all seed and S3 proof work, repeat the complete bounded source inventory, maxima, privacy, and authority capture in new read-only transactions. Reconciliation requires exact ordered content and page-count equality, binds both transaction snapshots and both page chains, and takes each origin’s closing privacy version from the second capture. Any source, generation, control, privacy, record, or scan-state change refuses the run. Re-run from the opening inventory; do not patch a stale capture.
+
+Each category has its own fixed adapter version. A complete scan requires `complete=true`, `terminalCursor=null`, a final zero in `pageItemCounts`, exact item-count closure, a valid page-chain hash, and matching opening/closing state hashes. Export composition requires a unique byte-proved record with the exact native record ID, revision, kind, source, session, and operation; revision ID, delivery digest, and acceptance sequences remain bound to the source maximum and its raw page-chain evidence because the scrubbed export stream deliberately does not retain those fields. All item hashes are recomputed by the planner using canonical key-sorted JSON. The whole capture is content addressed by `captureId`; mutation after capture holds.
+
+### Reviewed live-capable runner
+
+The operator supplies a single stdin JSON document with protocol `canonical-frontier-readonly-capture-runner-v1`, `sourceDatabaseUrl`, `seedDatabaseUrl`, exact `scope`, reviewed `target`, source-object coordinates/credentials, and numeric `pageLimit`, `maxPages`, `maxScopes`, `maxOrigins`, and `maxBytes` bounds. The only argv values are absolute local `--output` and `--cache-dir` paths. Generate the document directly from the approved credential broker into the process; do not save it or place secrets in environment files or shell history:
+
+```sh
+approved-credential-broker emit canonical-frontier-readonly-capture-runner-v1 |
+  bun scripts/capture-canonical-frontier.ts \
+    --output /private/review/frontier-capture.json \
+    --cache-dir /private/review/frontier-cache
+```
+
+Exit `0` means the captured evidence evaluated `ready`, exit `2` means a durable hold was written, and exit `1` means capture refused. The runner logs only protocol, status, capture ID, and output path. The present runner intentionally emits no receipt scan: the seeder role is explicitly revoked from `ingest_receipt_seats_for_stage` and the private receipt/stage tables. It therefore remains `hold/scan_incomplete` for production rather than claiming that no receipt records exist. Closing that last gate requires a separately reviewed restricted read API/role or trusted publication-claim evidence; owner credentials and an asserted empty scan are not acceptable. A production invocation remains a separately reviewed operator action.
 
 ## Offline dry run
 
@@ -62,9 +77,9 @@ Exit `0` is a deterministic ready plan, exit `2` is an actionable hold, and exit
 
 ## Offline evidence
 
-Focused Bun coverage includes missing/stale/incomplete evidence, source and privacy races, wrong tenant, immutable-version refusal, record coverage, competing equal-revision bodies, full coverage, CLI refusal of `--apply`, and idempotency. Source-adapter coverage additionally verifies two preview captures, full byte proof, derived root counts, same-response versions, signed versioning reads, malformed/oversized S3 responses, source races, absent versions, and bucket-status changes.
+Focused Bun coverage includes missing/stale/incomplete evidence, explicit final-page closure, source and privacy races, wrong tenant, immutable-version refusal, record coverage, competing equal-revision bodies, full coverage, CLI refusal of `--apply`, stdin-only capture configuration, and idempotency. Source-adapter coverage additionally verifies two preview captures, full byte proof, exact native record/revision lineage, derived root counts, same-response versions, signed versioning reads, malformed/oversized S3 responses, source races, absent versions, and bucket-status changes.
 
-The disposable proof uses the owned loopback PostgreSQL 17 and versioned MinIO fixtures. It creates and drops an owned synthetic schema, writes only a unique synthetic S3 prefix using the actual manifest writer, runs the source adapter over verified manifest/chunk bytes and two preview captures, reads bucket versioning through the signed S3 adapter, records the non-null same-response manifest version, and performs a bounded `REPEATABLE READ READ ONLY` record scan:
+The disposable proof uses the owned loopback PostgreSQL 17 and versioned MinIO fixtures. It creates and drops an owned synthetic source schema and a dedicated restricted read role, writes only a unique synthetic S3 prefix using the actual manifest writer, runs the source adapter over verified manifest/chunk bytes and two preview captures, reads bucket versioning through the signed S3 adapter, records the non-null same-response manifest version, and performs the full fixed-query capture with bounded `REPEATABLE READ READ ONLY` scans and terminal empty pages:
 
 ```sh
 FRONTIER_DISPOSABLE=1 \
@@ -76,12 +91,13 @@ The recorded result artifact reports the exact PostgreSQL version, commit/dirty 
 
 ## Remaining production gates
 
-The lead/operator still needs a separately reviewed bounded read-only probe and exact production evidence for:
+The lead/operator still needs a separately reviewed invocation of the provided bounded read-only runner and exact production evidence for:
 
 - the complete one-org origin inventory (the measured 469 origins and 10,001 sentinels are samples, not closure);
-- authoritative legacy source identity/generation/commit and every record maximum;
+- authoritative legacy source identity/generation and every record maximum; independently verify the deployed source commit if that is a release gate;
 - strict `seed-s3` byte proof for every export root, including non-null immutable AWS version IDs;
 - opening/closing deletion, reset, control-epoch, privacy-baseline, receipt-seat, and source-state equality;
+- an actual complete receipt-seat/stage-root adapter using a least-privilege read capability (or reviewed publication-claim evidence); the current seeder capability cannot provide it;
 - exact schema generation and destination bucket/region/key root;
 - independent review of the resulting local capture and candidate rows;
 - a separately authorized owner-write mechanism, if one is later approved. This change intentionally provides none.

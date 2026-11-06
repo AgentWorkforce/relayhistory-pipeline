@@ -42,6 +42,7 @@ export interface FrontierTarget {
 export interface FrontierAuthority {
   sourceIdentitySha256: string | null;
   sourceGenerationSha256: string | null;
+  /** 40-hex authority head. The legacy adapter derives it from the authority digest; it is not a deployment commit. */
   sourceHead: string | null;
   controlEpoch: string | null;
   privacyBaselineSha256: string | null;
@@ -63,6 +64,8 @@ export interface FrontierScanEvidence {
   pageLimit: number;
   maxPages: number;
   pagesRead: number;
+  /** Rows returned by each actual query; the final query must return zero. */
+  pageItemCounts: number[];
   itemCount: number;
   byteCount: number;
   checkpointCount: number;
@@ -123,6 +126,8 @@ export interface FrontierOriginCapture {
   opening: FrontierAuthority;
   closing: FrontierAuthority;
   sourceRecordCount: number | null;
+  /** Actual ordered privacy rows read (deletions + resets), excluding authority. */
+  privacyRowCount: number | null;
   scans: FrontierScanEvidence[];
   exportRoots: FrontierExportRoot[];
   recordMaxima: FrontierRecordMaximum[];
@@ -245,6 +250,7 @@ export function frontierScanItemsSha256(kind: FrontierScanKind, value: Canonical
   return frontierSha256(frontierScanItems(kind, value));
 }
 function frontierScanItemCount(kind: FrontierScanKind, value: CanonicalFrontierCapture | FrontierOriginCapture): number {
+  if (kind === "privacy-controls" && "privacyRowCount" in value) return value.privacyRowCount ?? -1;
   const items = frontierScanItems(kind, value);
   return Array.isArray(items) ? items.length : 1;
 }
@@ -294,8 +300,8 @@ function validateScan(scan: FrontierScanEvidence, expectedKind: FrontierScanKind
   if (!scan || scan.kind !== expectedKind || scan.adapter !== REQUIRED_ADAPTERS[expectedKind]) finding(findings, "capture_invalid", `${path}.adapter`);
   if (!HEX64.test(scan?.querySha256 ?? "") || !HEX64.test(scan?.snapshotSha256 ?? "") || !HEX64.test(scan?.pageChainSha256 ?? "")) finding(findings, "unknown_legacy_fact", `${path}.provenance`);
   if (!validTime(scan?.startedAt) || !validTime(scan?.finishedAt) || Date.parse(scan.startedAt) > Date.parse(scan.finishedAt) || Date.parse(scan.startedAt) < captureStartedAt || Date.parse(scan.finishedAt) > capturedAt) finding(findings, "capture_invalid", `${path}.time`);
-  if (!nonNegative(scan?.itemCount) || !nonNegative(scan?.byteCount) || !nonNegative(scan?.checkpointCount) || !Number.isSafeInteger(scan?.pageLimit) || scan.pageLimit < 1 || scan.pageLimit > 10_000 || !Number.isSafeInteger(scan?.maxPages) || scan.maxPages < 1 || scan.maxPages > 1_000_000 || !Number.isSafeInteger(scan?.pagesRead) || scan.pagesRead < 1 || scan.pagesRead > scan.maxPages) finding(findings, "capture_invalid", `${path}.bounds`);
-  else if (scan.pagesRead !== Math.ceil(scan.itemCount / scan.pageLimit) + 1 || scan.checkpointCount !== Math.max(0, scan.pagesRead - 1)) finding(findings, "scan_incomplete", `${path}.pageClosure`);
+  if (!nonNegative(scan?.itemCount) || !nonNegative(scan?.byteCount) || !nonNegative(scan?.checkpointCount) || !Number.isSafeInteger(scan?.pageLimit) || scan.pageLimit < 1 || scan.pageLimit > 10_000 || !Number.isSafeInteger(scan?.maxPages) || scan.maxPages < 1 || scan.maxPages > 1_000_000 || !Number.isSafeInteger(scan?.pagesRead) || scan.pagesRead < 1 || scan.pagesRead > scan.maxPages || !Array.isArray(scan?.pageItemCounts)) finding(findings, "capture_invalid", `${path}.bounds`);
+  else if (scan.pageItemCounts.length !== scan.pagesRead || scan.pageItemCounts.at(-1) !== 0 || scan.pageItemCounts.slice(0, -1).some(count => !Number.isSafeInteger(count) || count < 1 || count > scan.pageLimit) || scan.pageItemCounts.reduce((sum, count) => sum + count, 0) !== scan.itemCount || scan.checkpointCount !== scan.pageItemCounts.filter(count => count > 0).length) finding(findings, "scan_incomplete", `${path}.pageClosure`);
   if (scan?.complete !== true || scan?.terminalCursor !== null) finding(findings, "scan_incomplete", `${path}.terminalCursor`);
   if (validTime(scan?.finishedAt) && (capturedAt - Date.parse(scan.finishedAt) > FRONTIER_MAX_AGE_SECONDS * 1000 || Date.parse(scan.finishedAt) > capturedAt + 30_000)) finding(findings, "scan_stale", `${path}.finishedAt`);
   if (scan?.itemsSha256 !== expectedItemsSha256) finding(findings, "scan_hash_mismatch", `${path}.itemsSha256`);
@@ -360,6 +366,7 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
       if (origin.opening.controlEpoch !== origin.closing.controlEpoch || origin.opening.privacyBaselineSha256 !== origin.closing.privacyBaselineSha256 || origin.opening.privacyVersion !== origin.closing.privacyVersion) finding(findings, "privacy_changed", `${path}.closing.privacy`);
     }
     if (!nonNegative(origin.sourceRecordCount)) finding(findings, "unknown_legacy_fact", `${path}.sourceRecordCount`);
+    if (!nonNegative(origin.privacyRowCount)) finding(findings, "unknown_legacy_fact", `${path}.privacyRowCount`);
 
     const byKind = new Map<FrontierScanKind, FrontierScanEvidence>();
     for (const scan of origin.scans ?? []) {
@@ -433,6 +440,7 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
       protocol: FRONTIER_CAPTURE_PROTOCOL,
       scope: tenant,
       sourceRecordCount: origin.sourceRecordCount,
+      privacyRowCount: origin.privacyRowCount,
       recordMaxima: maxima,
       receiptDecisions: decisions,
     };

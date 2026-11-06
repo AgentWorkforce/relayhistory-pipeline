@@ -39,6 +39,7 @@ const adapters: Record<FrontierScanKind, string> = {
 };
 
 function scan(kind: FrontierScanKind, itemCount: number, itemsSha256: string, state = frontierSha256(authority)): FrontierScanEvidence {
+  const pageItemCounts = itemCount === 0 ? [0] : [itemCount, 0];
   return {
     kind,
     adapter: adapters[kind],
@@ -48,10 +49,11 @@ function scan(kind: FrontierScanKind, itemCount: number, itemsSha256: string, st
     finishedAt: "2026-11-06T04:00:03.000Z",
     pageLimit: 100,
     maxPages: 1000,
-    pagesRead: 2,
+    pagesRead: pageItemCounts.length,
+    pageItemCounts,
     itemCount,
     byteCount: 4096,
-    checkpointCount: 1,
+    checkpointCount: pageItemCounts.filter(count => count > 0).length,
     pageChainSha256: H(`page-chain:${kind}`),
     itemsSha256,
     openingStateSha256: state,
@@ -84,7 +86,7 @@ function readyCapture(): CanonicalFrontierCapture {
   const historicalDigest = frontierExportRootSha256(historicalRoot);
   const bufferedDigest = frontierExportRootSha256(bufferedRoot);
   const origin: FrontierOriginCapture = {
-    tenant: { ...tenant }, opening: { ...authority }, closing: { ...authority }, sourceRecordCount: 2,
+    tenant: { ...tenant }, opening: { ...authority }, closing: { ...authority }, sourceRecordCount: 2, privacyRowCount: 1,
     scans: [], exportRoots: [bufferedRoot, historicalRoot],
     recordMaxima: [
       { tenant: { ...tenant }, recordId: "legacy-record", revision: "9", revisionId: "legacy-revision-9", digest: H("legacy-body"), source: "claude", sessionId: "legacy-session", operation: "upsert", authority: "seed-proof", exportRootSha256: historicalDigest },
@@ -123,6 +125,9 @@ function refreshOriginHashes(capture: CanonicalFrontierCapture): void {
     scanEvidence.itemCount = scanEvidence.kind === "privacy-controls" ? 1 :
       scanEvidence.kind === "record-maxima" ? origin.recordMaxima.length :
       scanEvidence.kind === "export-roots" ? origin.exportRoots.length : origin.receiptDecisions.length;
+    scanEvidence.pageItemCounts = scanEvidence.itemCount === 0 ? [0] : [scanEvidence.itemCount, 0];
+    scanEvidence.pagesRead = scanEvidence.pageItemCounts.length;
+    scanEvidence.checkpointCount = scanEvidence.pageItemCounts.filter(count => count > 0).length;
   }
 }
 
@@ -201,6 +206,20 @@ describe("canonical frontier read-only planner", () => {
     expect(evaluateCanonicalFrontier(capture, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["scan_hash_mismatch"]) });
   });
 
+  test("omitted terminal page, origin, root, maximum, or receipt seat always refuses", () => {
+    const cases: Array<[string, (capture: CanonicalFrontierCapture) => void, string]> = [
+      ["page", capture => { capture.inventoryScan.pageItemCounts.pop(); capture.inventoryScan.pagesRead--; }, "scan_incomplete"],
+      ["origin", capture => { capture.origins = []; }, "origin_coverage_incomplete"],
+      ["root", capture => { capture.origins[0]!.exportRoots = []; refreshOriginHashes(capture); }, "record_coverage_incomplete"],
+      ["maximum", capture => { capture.origins[0]!.recordMaxima.pop(); refreshOriginHashes(capture); }, "record_coverage_incomplete"],
+      ["seat", capture => { capture.origins[0]!.receiptDecisions = []; refreshOriginHashes(capture); }, "receipt_decision_conflict"],
+    ];
+    for (const [, mutate, reason] of cases) {
+      const capture = readyCapture(); mutate(capture); reseal(capture);
+      expect(evaluateCanonicalFrontier(capture, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining([reason]) });
+    }
+  });
+
   test("malformed nested JSON and prototype-named keys hold without crashing or changing canonical hashes", () => {
     const malformed = readyCapture() as unknown as { captureId: string; origins: Array<{ tenant: null }> };
     malformed.origins[0]!.tenant = null;
@@ -221,6 +240,20 @@ describe("canonical frontier read-only planner", () => {
       const refused = spawnSync(process.execPath, [script, "--evidence", evidence, "--now", NOW.toISOString(), "--apply"], { encoding: "utf8" });
       expect(refused.status).toBe(1);
       expect(JSON.parse(refused.stderr)).toMatchObject({ status: "error", code: "frontier_plan_usage" });
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test("live-capable capture runner accepts credentials only through bounded stdin", () => {
+    const directory = mkdtempSync(join(tmpdir(), "frontier-capture-cli-"));
+    try {
+      const script = join(import.meta.dir, "../../../scripts/capture-canonical-frontier.ts");
+      const argvSecret = spawnSync(process.execPath, [script, "--source-url", "postgresql://user:secret@example.invalid/db"], { encoding: "utf8", input: "{}" });
+      expect(argvSecret.status).toBe(1);
+      expect(JSON.parse(argvSecret.stderr)).toMatchObject({ code: "frontier_capture_usage" });
+      expect(argvSecret.stderr).not.toContain("secret");
+      const malformed = spawnSync(process.execPath, [script, "--output", join(directory, "capture.json"), "--cache-dir", join(directory, "cache")], { encoding: "utf8", input: JSON.stringify({ protocol: "fixture" }) });
+      expect(malformed.status).toBe(1);
+      expect(JSON.parse(malformed.stderr)).toMatchObject({ code: "frontier_capture_config_shape" });
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 });

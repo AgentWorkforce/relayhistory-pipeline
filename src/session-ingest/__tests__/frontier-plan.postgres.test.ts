@@ -9,6 +9,7 @@ import { writeBatchObjects } from "../writer.ts";
 import { prepareDelivery, deliveryAccount } from "../vendor/delivery/prepare.ts";
 import { DELIVERY_MAPPING_VERSION, type HistoryExportBatch } from "../vendor/delivery/delivery-contracts.ts";
 import { captureSeedScopeExportEvidence, createS3FrontierVersioningReader } from "../frontier-plan-source.ts";
+import { captureLegacyFrontierSource, composeCanonicalFrontierCapture, reconcileLegacyFrontierClosure } from "../frontier-capture-source.ts";
 import {
   FRONTIER_CAPTURE_PROTOCOL,
   evaluateCanonicalFrontier,
@@ -42,6 +43,7 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
     const pool = new pg.Pool({ connectionString: url!, max: 3, application_name: "frontier-plan-proof" });
     const suffix = crypto.randomUUID().replaceAll("-", "");
     const schema = `frontier_${suffix}`;
+    const readerRole = `frontier_reader_${suffix}`;
     const tenant = { orgId: `frontier-${suffix.slice(0, 12)}`, workspaceId: "workspace-fixture", userId: "user-fixture", originId: "origin-fixture" };
     const keyRoot = `frontierproof${suffix.slice(0, 8)}`;
     const cacheDirectory = mkdtempSync(join(tmpdir(), "frontier-pg-source-"));
@@ -84,6 +86,58 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
       const root = evidence.roots[0]!;
       const manifestVersion = root.versionId!;
       const record = prepared.records[0]!;
+      await pool.query(`
+        CREATE SEQUENCE ${schema}.delivery_projection_acceptance_seq;
+        CREATE SEQUENCE ${schema}.delivery_catalog_acceptance_seq;
+        CREATE TABLE ${schema}.delivery_origins(org_id text,workspace_id text,origin_id text,PRIMARY KEY(org_id,workspace_id,origin_id));
+        CREATE TABLE ${schema}.delivery_records(org_id text,workspace_id text,origin_id text,record_id text,revision_id text,revision bigint,digest text,kind text,source text,session_id text,operation text,user_id text,PRIMARY KEY(org_id,workspace_id,origin_id,record_id));
+        CREATE TABLE ${schema}.delivery_projection_acceptance(org_id text,workspace_id text,origin_id text,record_id text,accepted_seq bigint,PRIMARY KEY(org_id,workspace_id,origin_id,record_id));
+        CREATE TABLE ${schema}.delivery_catalog_acceptance(org_id text,workspace_id text,origin_id text,record_id text,accepted_seq bigint,PRIMARY KEY(org_id,workspace_id,origin_id,record_id));
+        CREATE TABLE ${schema}.deleted_upload_sessions(org_id text,workspace_id text,user_id text,origin_id text,source text,session_id text);
+        CREATE TABLE ${schema}.session_resets(org_id text,workspace_id text,user_id text,request_id text,deleted bigint);
+        CREATE TABLE ${schema}.delivery_cutover_state(phase text,epoch text,privacy_baseline_sha256 text);
+        CREATE TABLE ${schema}.delivery_cutover_control_heads(org_id text,workspace_id text,user_id text,epoch text,version bigint,digest text,pending boolean);
+        CREATE FUNCTION ${schema}.delivery_cutover_status() RETURNS jsonb LANGUAGE sql AS $$SELECT jsonb_build_object('phase',phase,'epoch',epoch,'privacyBaselineSha256',privacy_baseline_sha256) FROM ${schema}.delivery_cutover_state LIMIT 1$$;
+        CREATE FUNCTION ${schema}.snapshot_delivery_cutover_privacy_v1() RETURNS void LANGUAGE sql AS $$SELECT$$;
+        CREATE FUNCTION ${schema}.guard_delivery_cutover_v1() RETURNS void LANGUAGE sql AS $$SELECT$$;
+        CREATE FUNCTION ${schema}.record_delivery_projection_acceptance() RETURNS void LANGUAGE sql AS $$SELECT$$;
+        CREATE FUNCTION ${schema}.project_delivery_catalog() RETURNS void LANGUAGE sql AS $$SELECT$$;
+      `);
+      await pool.query(`INSERT INTO ${schema}.delivery_cutover_state VALUES('active',$1,$2)`, [H("pg-control"), H("pg-privacy")]);
+      await pool.query(`INSERT INTO ${schema}.delivery_origins VALUES($1,$2,$3)`, [tenant.orgId, tenant.workspaceId, tenant.originId]);
+      await pool.query(`INSERT INTO ${schema}.delivery_records VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [tenant.orgId, tenant.workspaceId, tenant.originId, record.record_id, record.revision_id, record.revision, record.digest, record.kind, record.source, record.session_id, record.operation, tenant.userId]);
+      await pool.query(`INSERT INTO ${schema}.delivery_projection_acceptance VALUES($1,$2,$3,$4,41)`, [tenant.orgId, tenant.workspaceId, tenant.originId, record.record_id]);
+      await pool.query(`INSERT INTO ${schema}.delivery_cutover_control_heads VALUES($1,$2,$3,$4,19,$5,false)`, [tenant.orgId, tenant.workspaceId, tenant.userId, H("pg-control"), H("control-head")]);
+      await pool.query(`CREATE ROLE ${readerRole} NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+        GRANT USAGE ON SCHEMA ${schema} TO ${readerRole}; GRANT SELECT ON ALL TABLES IN SCHEMA ${schema} TO ${readerRole};
+        GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${schema} TO ${readerRole}; GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ${schema} TO ${readerRole}`);
+      const captureSource = async (fixedClock = false) => {
+        const client = await pool.connect();
+        try { await client.query(`SET ROLE ${readerRole}`); return await captureLegacyFrontierSource(client, { orgId: tenant.orgId, workspaceId: tenant.workspaceId }, { schema, pageLimit: 1, ...(fixedClock ? { now: () => new Date("2026-11-06T04:00:02.000Z") } : {}) }); }
+        finally { await client.query("RESET ROLE").catch(() => {}); client.release(); }
+      };
+      const source = await captureSource(true);
+      expect(source.inventoryScan.pageItemCounts).toEqual([1, 0]);
+      expect(source.origins[0]!.recordScan.pageItemCounts).toEqual([1, 0]);
+      const closedSource = reconcileLegacyFrontierClosure(source, await captureSource(true));
+      expect(closedSource.origins[0]!.recordScan.pageChainSha256).not.toBe(source.origins[0]!.recordScan.pageChainSha256);
+      expect(() => composeCanonicalFrontierCapture(closedSource, { bucket: "canonical-target", region: "us-east-1", keyRoot: "96bulls", schemaGeneration: H("fixture-generation") }, [])).toThrow("frontier_capture_export_lineage");
+      const actualCapture = composeCanonicalFrontierCapture(closedSource, { bucket: "canonical-target", region: "us-east-1", keyRoot: "96bulls", schemaGeneration: H("fixture-generation") }, [evidence]);
+      expect(actualCapture.origins[0]!.scans.some(scan => scan.kind === "receipt-decisions")).toBe(false);
+      expect(evaluateCanonicalFrontier(actualCapture, { now: new Date("2026-11-06T04:00:05.000Z") })).toMatchObject({ status: "hold", reasons: ["scan_incomplete"], missingEvidence: ["capture.origins[0].scans.receipt-decisions"] });
+      await pool.query(`UPDATE ${schema}.delivery_records SET digest=$1`, [H("changed-between-source-scans")]);
+      const changedSource = await captureSource(true);
+      expect(() => reconcileLegacyFrontierClosure(source, changedSource)).toThrow("frontier_capture_source_changed");
+      await pool.query(`UPDATE ${schema}.delivery_records SET digest=$1`, [record.digest]);
+      await pool.query(`INSERT INTO ${schema}.delivery_origins VALUES($1,$2,'owner-unknown-origin')`, [tenant.orgId, tenant.workspaceId]);
+      await expect(captureSource()).rejects.toMatchObject({ code: "frontier_capture_origin_owner_unknown" });
+      await pool.query(`DELETE FROM ${schema}.delivery_origins WHERE origin_id='owner-unknown-origin'`);
+      await pool.query(`INSERT INTO ${schema}.session_resets VALUES($1,$2,'owner-unknown-user','reset-1',1)`, [tenant.orgId, tenant.workspaceId]);
+      await expect(captureSource()).rejects.toMatchObject({ code: "frontier_capture_origin_owner_unknown" });
+      await pool.query(`DELETE FROM ${schema}.session_resets WHERE user_id='owner-unknown-user'`);
+      await pool.query(`UPDATE ${schema}.delivery_cutover_control_heads SET pending=true`);
+      await expect(captureSource()).rejects.toMatchObject({ code: "frontier_capture_control" });
+      await pool.query(`UPDATE ${schema}.delivery_cutover_control_heads SET pending=false`);
       await pool.query(`INSERT INTO ${schema}.records VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, [tenant.orgId, tenant.workspaceId, tenant.userId, tenant.originId, record.record_id, record.revision, record.revision_id, record.digest, record.source, record.session_id, record.operation]);
 
       const readAuthority = async (): Promise<FrontierAuthority> => {
@@ -93,7 +147,7 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
       const makeScan = (kind: FrontierScanKind, items: unknown, opening: FrontierAuthority, closing: FrontierAuthority, snapshot: string, pagesRead = 2): FrontierScanEvidence => ({
         kind, adapter: adapters[kind], querySha256: H(`reviewed-query:${kind}`), snapshotSha256: H(snapshot),
         startedAt: "2026-11-06T04:00:00.000Z", finishedAt: "2026-11-06T04:00:03.000Z",
-        pageLimit: 1, maxPages: 100, pagesRead, itemCount: Array.isArray(items) ? items.length : 1,
+        pageLimit: 1, maxPages: 100, pagesRead, pageItemCounts: pagesRead === 1 ? [0] : [...Array(pagesRead - 1).fill(1), 0], itemCount: Array.isArray(items) ? items.length : 1,
         byteCount: Buffer.byteLength(JSON.stringify(items)), checkpointCount: Math.max(0, pagesRead - 1),
         pageChainSha256: frontierSha256({ kind, pagesRead, items }), itemsSha256: frontierSha256(items),
         openingStateSha256: frontierSha256(opening), closingStateSha256: frontierSha256(closing), terminalCursor: null, complete: true,
@@ -124,7 +178,7 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
           source: String(row.source), sessionId: row.session_id === null ? null : String(row.session_id), operation: row.operation as "upsert" | "delete",
           authority: "seed-proof" as const, exportRootSha256: frontierExportRootSha256(root),
         }));
-        const origin: FrontierOriginCapture = { tenant: { ...tenant }, opening, closing, sourceRecordCount: rows.length, scans: [], exportRoots: [root], recordMaxima: maxima, receiptDecisions: [] };
+        const origin: FrontierOriginCapture = { tenant: { ...tenant }, opening, closing, sourceRecordCount: rows.length, privacyRowCount: 1, scans: [], exportRoots: [root], recordMaxima: maxima, receiptDecisions: [] };
         origin.scans = [
           makeScan("record-maxima", [...maxima], opening, closing, snapshot),
           makeScan("export-roots", [root], opening, closing, `s3:${manifestVersion}`),
@@ -174,7 +228,7 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
       ];
       const receiptScan = overlap.origins[0]!.scans.find(scan => scan.kind === "receipt-decisions")!;
       overlap.origins[0]!.scans.find(scan => scan.kind === "record-maxima")!.itemsSha256 = frontierScanItemsSha256("record-maxima", overlap.origins[0]!);
-      receiptScan.itemCount = 2; receiptScan.pagesRead = 3; receiptScan.checkpointCount = 2;
+      receiptScan.itemCount = 2; receiptScan.pagesRead = 3; receiptScan.pageItemCounts = [1, 1, 0]; receiptScan.checkpointCount = 2;
       receiptScan.itemsSha256 = frontierScanItemsSha256("receipt-decisions", overlap.origins[0]!);
       overlap.captureId = frontierCaptureId(overlap);
       expect(evaluateCanonicalFrontier(overlap, { now })).toMatchObject({ status: "ready" });
@@ -195,6 +249,7 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
       expect(evaluateCanonicalFrontier(foreign, { now })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["tenant_mismatch"]) });
     } finally {
       await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
+      await pool.query(`DROP ROLE IF EXISTS ${readerRole}`).catch(() => {});
       await pool.end();
       rmSync(cacheDirectory, { recursive: true, force: true });
     }
