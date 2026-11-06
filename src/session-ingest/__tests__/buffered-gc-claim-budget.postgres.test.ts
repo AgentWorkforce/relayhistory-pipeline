@@ -30,7 +30,7 @@ describe.skipIf(!url)("buffered GC claim budget on a large lazy-current backlog"
   // Job-shaped pool: dedicated ingest role, connect<=1s, bounded executor below.
   gcPool=new pg.Pool({connectionString:target.href,max:2,connectionTimeoutMillis:1000,options:"-c role=bulls96_session_ingest"});
   await pool.query(text("supabase/tests/supabase_shim.sql"));await pool.query("CREATE EXTENSION pg_trgm; CREATE EXTENSION btree_gin");
-  for(const f of ["session_directory_search_worker.sql","session_token_verifier.sql","session_ingest_roles.sql"])await pool.query(text("supabase/bootstrap/"+f));
+  for(const f of ["session_directory_search_worker.sql","session_token_verifier.sql","session_ingest_roles.sql","session_read_api_roles.sql"])await pool.query(text("supabase/bootstrap/"+f));
   for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await pool.query(text("supabase/migrations/"+f));
   await pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text)");
   await pool.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status) VALUES('session_directory_search_worker',$1,'pass') ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,status='pass'",[generation]);
