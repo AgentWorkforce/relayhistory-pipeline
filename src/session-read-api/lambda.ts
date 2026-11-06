@@ -96,13 +96,25 @@ export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessE
   const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   const tls = postgresTlsOptions(env);
   const secret = parseReadApiSecret(secretText, backend === "clickhouse");
+  const connectionString = new URL(postgresConnectionString(secret.supabase_url));
+  // pg lets URL parameters override pool configuration. A client-side query
+  // timer does not cancel SQL, and neither URL nor ambient PGOPTIONS may
+  // disable this reader's server-side bound. TLS/target sanitization stays in
+  // postgresConnectionString; options from the URL are already removed there.
+  for (const key of [...connectionString.searchParams.keys()])
+    if (["statement_timeout", "query_timeout"].includes(key.toLowerCase())) connectionString.searchParams.delete(key);
   const pool = new pg.Pool({
-    connectionString: postgresConnectionString(secret.supabase_url),
+    connectionString: connectionString.toString(),
     max: 2,
     application_name: "96bulls-session-read-api",
     ssl: tls,
     idleTimeoutMillis: 60_000,
     connectionTimeoutMillis: 2_000,
+    // Covers index queries and tenant completeness/liveness/directory SQL on
+    // this pool. Queued work may outlive the HTTP deadline: these are limits
+    // on acquisition and each server statement, not AbortSignal cancellation.
+    statement_timeout: 2_000, // Matches the existing reader-role bootstrap bound.
+    options: "-c statement_timeout=2000", // Nonempty: pg otherwise uses PGOPTIONS.
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   try {
