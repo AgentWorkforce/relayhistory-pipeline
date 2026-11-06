@@ -3,6 +3,7 @@
 # (packages/pipeline, packages/object-store); no vendored sources are needed.
 FROM oven/bun:1.4.2-slim AS base
 WORKDIR /app
+COPY LICENSE NOTICE ./
 COPY package.json bun.lock tsconfig.json ./
 COPY packages/pipeline/package.json packages/pipeline/
 COPY packages/object-store/package.json packages/object-store/
