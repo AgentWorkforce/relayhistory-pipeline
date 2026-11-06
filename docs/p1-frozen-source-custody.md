@@ -18,7 +18,7 @@ The ingest Worker reads `INGEST_CUSTODY_SOURCE` (stack input `sessionIngest.cust
 The new migration changes `generation()`. That generation is pinned in the ingest Worker (`INGEST_EXPECT_GENERATION`), the buffered GC (`INGEST_GC_EXPECT_GENERATION`), `ingest_lazy_policy.generation` and every `ingest_buffer_admission.schema_generation`. Uploads refuse until all of them match. In one window:
 1. **Owner-apply** the release (schema-release owner-apply path). Readiness goes PASS for the new generation G2. From here uploads refuse, generation not ready, until step 3.
 2. **Redeploy** `96bulls-session-ingest` with `INGEST_EXPECT_GENERATION=G2` (private-ingest operator) AND the buffered GC Lambda with `INGEST_GC_EXPECT_GENERATION=G2`.
-3. **Rebind**: `bun scripts/ingest-generation-rebind.ts --from G1 --to G2` (dry run, then `--execute`). That's one transaction under the migrator lock: the policy via `ingest_lazy_policy_set` (identity unchanged), then every admission row. It's idempotent.
+3. **Rebind**: the hosted operator rebind CLI (moved to the private companion repo sessions-pipeline-cloud, `hosted-ops/`) with `--from G1 --to G2` (dry run, then `--execute`). That's one transaction under the migrator lock: the policy via `ingest_lazy_policy_set` (identity unchanged), then every admission row. It's idempotent.
 4. **Verify** uploads reopen (2xx rate back), and no `generation not ready`.
 
 The whole sequence is rehearsed in `frozen-custody.pglite.test.ts` ("rehearsed generation window").

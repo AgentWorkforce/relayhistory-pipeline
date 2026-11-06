@@ -34,8 +34,9 @@ absolute paths, `~`, drive letters, UNC paths and `file:` paths.
 The S3 search-index pass calls `writeDirectoryCatalog` after every complete
 logical-session read. A partial, missing, unscrubbed, conflicting, over-limit,
 or ClickHouse-truncated pass never clears or updates catalog fields. Historical
-sessions still need the controlled re-projection in
-`docs/activation/session-directory-parity-reprojection.md`. Until that backfill
+sessions still need the controlled re-projection described in the hosted
+activation notes (moved to the private companion repo sessions-pipeline-cloud,
+`hosted-ops/`). Until that backfill
 runs, old catalog fields and parent/child links may be empty, and the list
 **refuses `p_agent`** with `0A000 agent_filter_not_ready` instead of answering
 an empty list. relayhistory-cloud falls back to Neon on that error. An operator
