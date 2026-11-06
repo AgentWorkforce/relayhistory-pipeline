@@ -2,7 +2,7 @@
  * state is a separate explicit binding: an index alone cannot declare a partial
  * canonical read complete. No storage, clients or schema are created here. */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
-import { assertPosition, type SearchIndexAdapter, type SearchEventDocument, type SearchTenant, type SearchFingerprint } from "@rhc/search-index/contracts.ts";
+import { assertPosition, MAX_UPSERT_BATCH, type SearchIndexAdapter, type SearchEventDocument, type SearchTenant, type SearchFingerprint } from "@rhc/search-index/contracts.ts";
 import type { IndexRow } from "./vendor/search-index/rows.ts";
 
 /** Minimal public service scope. Importing pointer.ts here would pull its
@@ -87,8 +87,17 @@ export function adapterProjectionIo(binding: SearchServiceBinding, tx: SqlExecut
       return written;
     },
     async remove(scope, positions) {
-      const { deleted } = await binding.index.deleteEvents({ orgId: scope.orgId, workspaceId: scope.workspaceId }, positions);
-      if (!Number.isInteger(deleted) || deleted < 0 || deleted > positions.length) throw new Error("search delete result invalid");
+      let deleted = 0;
+      // The public Postgres adapter bounds exact-position deletion like upsert.
+      // Calls may commit separately; propagate failures so only a complete pass
+      // records completeness, and a retry rescans the remaining positions.
+      for (let i = 0; i < positions.length; i += MAX_UPSERT_BATCH) {
+        const batch = positions.slice(i, i + MAX_UPSERT_BATCH);
+        const result = await binding.index.deleteEvents({ orgId: scope.orgId, workspaceId: scope.workspaceId }, batch);
+        if (!result || !Number.isSafeInteger(result.deleted) || result.deleted < 0 || result.deleted > batch.length) throw new Error("search delete result invalid");
+        deleted += result.deleted;
+      }
+      if (!Number.isSafeInteger(deleted) || deleted > positions.length) throw new Error("search delete result invalid");
       return deleted;
     },
     erase: (scope, canonicalId) => binding.index.eraseScope(scopeFor(scope, canonicalId)),

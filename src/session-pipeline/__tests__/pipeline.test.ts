@@ -280,6 +280,71 @@ test("registered Postgres projection serves the actual read API, fences stale wr
   } finally { await db.close(); }
 }, 30_000);
 
+for (const failure of ["none", "throw", "invalid count"] as const) {
+  test(`portable reconciliation batches 5001 stale positions with second-batch failure: ${failure}`, async () => {
+    const db = new PGlite({ extensions: { pg_trgm } });
+    await db.exec("CREATE EXTENSION pg_trgm");
+    const keys = [await writeSession("srv_bb", [event("current", "1", Date.parse(AT), "current")])];
+    const sb = fakeSupabase(() => keys);
+    const records: boolean[] = [];
+    let metadataWrites = 0;
+    const state: SearchProjectionState = {
+      async fromMs() { return 0; },
+      async record(_tx, _scope, value) { records.push(value.complete); },
+      async partials() { return { sessions: records.at(-1) === true ? [] : [scope.sessionId], overflow: false }; },
+    };
+    const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer");
+    const tenant = { orgId: scope.orgId, workspaceId: scope.workspaceId };
+    const deps: SearchIndexDeps = {
+      transact: sb.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW,
+      async writeEvents() { metadataWrites++; return { written: true }; },
+      async writeCatalog() { return { written: true }; },
+    };
+    try {
+      await adapter.index.ensureSchema(); // in-process test database only
+      expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 1 });
+      const current = (await adapter.index.query({ tenant, order: "asc", limit: 1 })).hits[0]!;
+      const stale = Array.from({ length: 5001 }, (_, i) => ({ ...current, eventId: `stale-${i}`, fingerprint: `stale-${i}`, version: NOW.getTime(), taskRefId: "", deliveryRecordId: "" }));
+      await adapter.index.upsert(stale.slice(0, 5000));
+      await adapter.index.upsert(stale.slice(5000));
+      records.length = 0;
+      metadataWrites = 0;
+      const deleteEvents = adapter.index.deleteEvents.bind(adapter.index);
+      const sizes: number[] = [];
+      adapter.index.deleteEvents = async (actualTenant, positions) => {
+        expect(actualTenant).toEqual(tenant);
+        sizes.push(positions.length);
+        if (sizes.length === 2 && failure === "throw") throw new Error("second batch failed");
+        const result = await deleteEvents(actualTenant, positions);
+        if (sizes.length === 2 && failure === "invalid count") return { deleted: positions.length + 1 };
+        return result;
+      };
+      const scan = () => adapter.index.scanFingerprints({ ...tenant, source: scope.harness, sessionIds: [scope.sessionId] }, { fromMs: 0, limit: 10_000 });
+      if (failure === "none") {
+        expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 0, deleted: 5001 });
+        expect(sizes).toEqual([5000, 1]);
+        expect(records).toEqual([true]);
+        expect(metadataWrites).toBe(1);
+        expect((await scan()).rows.map(row => row.eventId)).toEqual([current.eventId]);
+        return;
+      }
+      await expect(indexSearchScope(scope, deps)).rejects.toThrow(failure === "throw" ? "second batch failed" : "search delete result invalid");
+      expect(sizes).toEqual([5000, 1]);
+      // Index calls may commit independently of metadata. A failed later batch
+      // must never advance completeness; a fresh retry rescans what remains.
+      expect(records).toEqual([]);
+      expect(metadataWrites).toBe(0);
+      expect(await state.partials(tenant, { limit: 10 })).toEqual({ sessions: [scope.sessionId], overflow: false });
+      expect((await scan()).rows).toHaveLength(failure === "throw" ? 2 : 1);
+      expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 0, deleted: failure === "throw" ? 1 : 0 });
+      expect(sizes).toEqual(failure === "throw" ? [5000, 1, 1] : [5000, 1]);
+      expect(records).toEqual([true]);
+      expect(metadataWrites).toBe(1);
+      expect((await scan()).rows.map(row => row.eventId)).toEqual([current.eventId]);
+    } finally { await db.close(); }
+  }, 30_000);
+}
+
 describe("search index from S3", () => {
   test("direct canonical machine identity survives physical key encoding",async()=>{
     const machine="machine:1";
