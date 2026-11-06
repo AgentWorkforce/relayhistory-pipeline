@@ -44,10 +44,12 @@ describe("unified sessions function-boundary generator", () => {
     expect(c.outputs).toEqual(a.outputs);
     expect(Object.keys(a.outputs).sort()).toEqual([
       "src/hoopdb/migrate-guards.ts", "src/hoopdb/sessions-function-acl.json",
+      "supabase/bootstrap/canonical_project_events_verify.sql",
       "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql",
       "supabase/bootstrap/session_directory_search_worker_verify.sql", "supabase/bootstrap/session_ingest_verify.sql",
       "supabase/bootstrap/session_read_api_role_verify.sql",
       "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql",
+      "supabase/rollbacks/20261105033000_canonical_project_events.down.sql",
     ]);
   });
 
@@ -120,9 +122,10 @@ describe("unified sessions function-boundary generator", () => {
     await expect(generate(repo, LANES, [...VERIFIERS, VERIFIERS[0]!])).rejects.toThrow("is configured twice");
   });
 
-  test("the remaining empty canonical-project-events slot is inert; read-api (#236) and the consumer slot are filled", async () => {
+  test("required lanes are present and filled, including project events 033000 and read API 034000", async () => {
     const slots = LANES.filter((l) => l.migration === null);
-    expect(slots.map((l) => l.lane).sort()).toEqual(["canonical-project-events"]);
+    expect(slots.map((l) => l.lane).sort()).toEqual([]);
+    expect(LANES.map((l) => l.lane)).toEqual(expect.arrayContaining(["ingest-history", "read-api", "canonical-project-events", "canonical-feature-consumer"]));
     for (const l of slots) {
       expect([Object.keys(l.functions).length, Object.keys(l.replaces).length, l.prefixes.length, l.grantSources.length]).toEqual([0, 0, 0, 0]);
       expect(l.extraOutputs).toBeUndefined();
@@ -130,6 +133,8 @@ describe("unified sessions function-boundary generator", () => {
     const summary = (await generate(repo, LANES, VERIFIERS)).summary.lanes;
     for (const l of slots) expect(summary[l.lane]).toEqual({ functions: 0, replaces: 0, grants: 0 });
     expect(LANES.find((l) => l.lane === "read-api")?.migration).toBe("supabase/migrations/20261105034000_session_directory_read_api.sql");
+    expect(summary["canonical-project-events"]).toEqual({ functions: 10, replaces: 0, grants: 6 });
+    expect(LANES.find((l) => l.lane === "canonical-project-events")?.migration).toBe("supabase/migrations/20261105033000_canonical_project_events.sql");
     expect(summary["read-api"]).toEqual({ functions: 3, replaces: 0, grants: 2 });
     expect(summary["canonical-feature-consumer"]).toEqual({ functions: 2, replaces: 0, grants: 1 });
   });

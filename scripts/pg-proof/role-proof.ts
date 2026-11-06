@@ -479,6 +479,7 @@ for (const r of [
   "g6_cloud_owner",
   "g6_cloud_rt",
   "bulls96_read_api",
+  "bulls96_project_events",
   "bulls96_canonical_feature_producer",
   "cloudsqladmin",
   "cloudsqlsuperuser",
@@ -557,6 +558,10 @@ await check(
     const hostileReadApi = psql("g6_cloud", ["-v", "VERBOSITY=verbose", "-f", CLOUDSQL_ROLES_BOOT], "g6_cloud_owner");
     const hostileReadApiPreserved = (await sql("g6_cloud", "SELECT rolinherit FROM pg_roles WHERE rolname='bulls96_read_api'")).rows[0]?.rolinherit === true;
     await sql("g6_cloud", "ALTER ROLE bulls96_read_api NOINHERIT");
+    await sql("g6_cloud", "ALTER ROLE bulls96_project_events INHERIT");
+    const hostileProjectEvents = psql("g6_cloud", ["-v", "VERBOSITY=verbose", "-f", CLOUDSQL_ROLES_BOOT], "g6_cloud_owner");
+    const hostileProjectEventsPreserved = (await sql("g6_cloud", "SELECT rolinherit FROM pg_roles WHERE rolname='bulls96_project_events'")).rows[0]?.rolinherit === true;
+    await sql("g6_cloud", "ALTER ROLE bulls96_project_events NOINHERIT");
     const targets = (
       await sql(
         "g6_cloud",
@@ -565,7 +570,7 @@ await check(
                 (SELECT count(*)::int FROM pg_auth_members membership
                   WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
            FROM pg_roles role
-          WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api')
+          WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events')
           ORDER BY 1`,
       )
     ).rows;
@@ -581,10 +586,11 @@ await check(
       phase1.ok &&
       again.ok &&
       !hostileReadApi.ok && hostileReadApi.out.includes("55000") && hostileReadApiPreserved &&
+      !hostileProjectEvents.ok && hostileProjectEvents.out.includes("55000") && hostileProjectEventsPreserved &&
       m.exit === 0 &&
       v.ok &&
       seed === 0 &&
-      targets.length === 9 &&
+      targets.length === 10 &&
       targets.every(
         (role) => role.memberships === 0 &&
           ['rolbypassrls', 'rolcanlogin', 'rolinherit', 'rolsuper', 'rolcreaterole', 'rolcreatedb', 'rolreplication'].every((attr) => role[attr] === false),
@@ -599,7 +605,7 @@ await check(
     };
     return [
       ok,
-      `bootstrap=${boot.ok} phase1=${phase1.ok} rerun=${again.ok} hostileReadApiRefused=${!hostileReadApi.ok} hostileReadApiPreserved=${hostileReadApiPreserved} migrate=${fmt(m)} verdict=${fmt(v)} seed=${seed} targets=${fmt(targets)}${err(boot, phase1, again)}`,
+      `bootstrap=${boot.ok} phase1=${phase1.ok} rerun=${again.ok} hostileReadApiRefused=${!hostileReadApi.ok} hostileReadApiPreserved=${hostileReadApiPreserved} hostileProjectEventsRefused=${!hostileProjectEvents.ok} hostileProjectEventsPreserved=${hostileProjectEventsPreserved} migrate=${fmt(m)} verdict=${fmt(v)} seed=${seed} targets=${fmt(targets)}${err(boot, phase1, again)}`,
     ];
   },
 );
@@ -611,6 +617,7 @@ if (MAJOR >= 17) {
     "authenticated",
     "anon",
     "bulls96_read_api",
+    "bulls96_project_events",
     "bulls96_canonical_feature_producer",
     "g6_cloud_rt",
     "g6_cloud_owner",

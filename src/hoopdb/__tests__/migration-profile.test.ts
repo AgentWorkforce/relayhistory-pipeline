@@ -1513,6 +1513,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const C = "upstream:20261105030000_canonical_feature_consumer_acks.sql";
     const D = "upstream:20261105031000_desktop_catalog_forget_reproject.sql";
     const K = "upstream:20261105032000_session_large_read_routing_fixes.sql";
+    const P = "upstream:20261105033000_canonical_project_events.sql";
     const S = "upstream:20261105035000_semantic_copy_state.sql";
     const E = "upstream:20261105036000_canonical_consumer_lease.sql";
     const F = "upstream:20261105037000_session_directory_document_pool.sql";
@@ -1521,16 +1522,19 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = (name: string) =>
       db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8"));
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, P, S, E]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, P, S, E]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
+    // 033000 cannot be removed under 034000 or any later ledgered step.
+    expect((await failure(rollback("20261105033000_canonical_project_events.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(P);
     // 036000 is the latest lane: 035000, 032000, 031000 and 030000 all refuse while it is applied.
     expect((await failure(rollback("20261105035000_semantic_copy_state.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105031000_desktop_catalog_forget_reproject.down.sql")))?.code).toBe("55000");
@@ -1576,6 +1580,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105034000_session_directory_read_api.down.sql");
     expect(await names()).not.toContain(R);
     expect((await db.query<{ f: string | null }>("SELECT to_regprocedure('sessions.session_directory_activity_for(text,timestamptz,timestamptz)')::text f")).rows[0]?.f).toBeNull();
+    // With 034000 gone, 033000 is still a later lane; 032000 must keep refusing.
+    expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
+    await rollback("20261105033000_canonical_project_events.down.sql");
+    expect(await names()).not.toContain(P);
+    expect(await relation("sessions.canonical_project_events")).toBeNull();
+    expect(await relation("sessions.canonical_project_event_scopes")).toBeNull();
     await rollback("20261105032000_session_large_read_routing_fixes.down.sql");
     expect(await names()).not.toContain(K);
     expect(await relation("sessions.session_large_read_scope_errors")).toBeNull();
@@ -1596,10 +1606,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105024000_session_brief_documents.down.sql");
     expect(await names()).not.toContain(B);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBeNull();
-    // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 032000, 034000 (P3b),
+    // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 032000, 033000 (F10), 034000 (P3b),
     // 035000 and 036000; the post-validation exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, S, E]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
@@ -1714,10 +1724,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(9);
+    expect(targets.rows).toHaveLength(10);
     expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
     const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
     const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);
