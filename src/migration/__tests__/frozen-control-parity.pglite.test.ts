@@ -131,9 +131,9 @@ test("held categories are counted and never written", async () => {
     sameVersionDigestDiffers: 1, extra: 1, pendingStateDiffers: 1, staleQualified: 0, missingSeedable: 0 });
   expect(c.resets.conflicting).toBe(1); expect(c.deletions.extra).toBe(1);
   expect(c.parity.held).toBe(11); expect(c.parity.sealHeadParity).toBe(false);
-  expect(c.plan.writes).toBe(0);
+  expect(c.plan.writes).toBe(0); expect(c.plan.blocked).toEqual(["held_items_present"]);
   const before = await f.snapshot();
-  await applySeedRepair(f.neon, f.supa, c.plan.planSha256);
+  expect(await err(applySeedRepair(f.neon, f.supa, c.plan.planSha256))).toBe("held_items_present");
   expect(await f.snapshot()).toBe(before);
   const out = JSON.stringify(c);
   for (const u of users) expect(out).not.toContain(`"${u}"`);
@@ -145,7 +145,8 @@ test("copy-mode pending seeding only with the explicit flag, and it changes the 
   const plain = await census(f.neon, f.supa), flagged = await census(f.neon, f.supa, { seedPendingMissing: true });
   expect(plain.plan.seedHeads).toBe(0); expect(flagged.plan).toMatchObject({ seedHeads: 1, seedHeadsPending: 1 });
   expect(plain.plan.planSha256).not.toBe(flagged.plan.planSha256);
-  expect(await err(applySeedRepair(f.neon, f.supa, flagged.plan.planSha256))).toBe("plan_changed_rerun_census");
+  expect(plain.plan.blocked).toEqual(["held_items_present"]);             // a pending missing head is HELD by default
+  expect(await err(applySeedRepair(f.neon, f.supa, flagged.plan.planSha256))).toBe("held_items_present");
   await applySeedRepair(f.neon, f.supa, flagged.plan.planSha256, { seedPendingMissing: true });
   expect((await f.supa.query<any>("SELECT pending FROM sessions.ingest_source_control_heads")).rows[0].pending).toBe(true);
 });
@@ -163,7 +164,7 @@ test("refuses without writing: drift after dry run, bad hash, policy mismatch, i
   const busy: Queryable = { query: (s: string, p?: unknown[]) => s === COPY_ACTIVE_SQL ? Promise.resolve({ rows: [{ n: 1 }] as any }) : f.supa.query(s, p) };
   expect(await err(applySeedRepair(f.neon, busy, c.plan.planSha256))).toBe("frozen_copy_session_active");
   await f.supa.query("UPDATE sessions.ingest_lazy_policy SET control_epoch=$1", [OTHER]);
-  expect((await census(f.neon, f.supa)).plan.blocked).toEqual(["policy_mismatch"]);
+  expect((await census(f.neon, f.supa)).plan.blocked[0]).toBe("policy_mismatch");
   expect(await err(applySeedRepair(f.neon, f.supa, c.plan.planSha256))).toBe("policy_mismatch");
   await f.supa.query("UPDATE sessions.ingest_lazy_policy SET control_epoch=$1", [EPOCH]);
   await f.supa.query("INSERT INTO sessions.ingest_frozen_source_completeness(source_identity_sha256,control_epoch,privacy_baseline_sha256,org_count,record_rows,manifest_sha256,neon_snapshot) VALUES($1,$2,$3,0,0,$4,'{}')", [IDENT, EPOCH, BASE, d("e")]);
@@ -190,18 +191,17 @@ test("a head that appears between plan and insert rolls the whole seed back", as
   expect(await f.snapshot()).toBe(before);
 });
 
-test("a stale head that moves after the plan is refused by the reviewed repair, not overwritten", async () => {
+test("a stale head that moves after the plan is refused under the lock, not overwritten", async () => {
   const f = await fixtures();
   await f.mhead(USER, "1", d("1")); await f.nhead(USER, "3", d("3"));
   const c = await census(f.neon, f.supa);
-  // Neon's head goes pending after the dry run but before repair (a new control began on Neon).
-  let flipped = false;
+  // Neon's head goes pending after the apply's first read (a new control began on Neon).
+  let reads = 0;
   const neon: Queryable = { query: async (s: string, p?: unknown[]) => {
-    if (!flipped && s === "BEGIN READ ONLY") { flipped = true; await f.nhead(USER, "4", d("4"), { pending: true }); }
+    if (s.startsWith("BEGIN ISOLATION LEVEL REPEATABLE READ") && ++reads === 2) await f.nhead(USER, "4", d("4"), { pending: true });
     return f.neon.query(s, p);
   } };
-  const r = await applySeedRepair(neon, f.supa, c.plan.planSha256);
-  expect(r.repairs).toEqual({ repaired: 0, already: 0, refused: { neon_head_pending: 1 } });
+  expect(await err(applySeedRepair(neon, f.supa, c.plan.planSha256))).toBe("neon_changed_since_plan");
   expect((await f.supa.query<any>("SELECT version::text v FROM sessions.ingest_source_control_heads")).rows[0].v).toBe("1");
 });
 
