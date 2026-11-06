@@ -144,6 +144,8 @@ describe("supabase privacy authority as the eraser's source", () => {
     const w = await world();
     const p = { org_id: "org-1", workspace_id: "ws/1", origin_id: "origin-1", record_id: "r1", user_id: "user-1", source: "claude", session_id: "sess:1" };
     await w.f.db.query("INSERT INTO sessions.ingest_frozen_source_records(org_id,workspace_id,origin_id,record_id,user_id,source,session_id,operation) VALUES($1,$2,$3,$4,$5,$6,$7,'upsert')", Object.values(p));
+    // Neon's support identity for that record (the owned copy activation binds; Neon's reset counts these).
+    await w.f.db.query("INSERT INTO sessions.ingest_frozen_source_owned_sessions VALUES('org-1','ws/1','user-1','origin-1','claude','sess:1')");
     await w.activate();
     const exported = "96bulls/org-1/v1/ws=ws_1/m=delivery_x/h=claude/d=2026/10/30/s=sess_1/manifest.json";
     w.state.seeRevisions(1, [{ org_id: "org-1", session_id: "sess:1", revision: "1" }]);
