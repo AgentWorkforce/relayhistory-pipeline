@@ -6,7 +6,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createClickHouseClient, type ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import { schemaStatements } from "../vendor/search-index/schema.ts";
-import { EVENT_FACTS_TABLE, OUTPUT_FACTS_TABLE, outputFactsSchemaStatements } from "../output-facts-schema.ts";
+import { EVENT_FACTS_TABLE, OUTPUT_FACTS_STATE_TABLE, OUTPUT_FACTS_TABLE, outputFactsSchemaStatements } from "../output-facts-schema.ts";
 
 const CH_URL = process.env.READ_API_TEST_CLICKHOUSE_URL;
 const CH_USER = process.env.READ_API_TEST_CLICKHOUSE_USER ?? "default";
@@ -14,8 +14,8 @@ const CH_PASSWORD = process.env.READ_API_TEST_CLICKHOUSE_PASSWORD ?? "";
 
 describe("output facts DDL shape", () => {
   const statements = outputFactsSchemaStatements();
-  test("two idempotent tables, monthly partitions, ReplacingMergeTree(version), tenant-first keys", () => {
-    expect(statements).toHaveLength(2);
+  test("two idempotent fact tables, monthly partitions, ReplacingMergeTree(version), tenant-first keys", () => {
+    expect(statements).toHaveLength(4);
     for (const [i, table] of [EVENT_FACTS_TABLE, OUTPUT_FACTS_TABLE].entries()) {
       const s = statements[i]!;
       expect(s.startsWith(`CREATE TABLE IF NOT EXISTS ${table}\n`)).toBe(true);
@@ -25,6 +25,16 @@ describe("output facts DDL shape", () => {
       expect(s).toContain("DateTime64(6, 'UTC')");
       expect(s).toMatch(/retention_days\s+UInt16 DEFAULT 0/);
     }
+  });
+  test("the workspace watermark table is tenant-keyed and carries no content", () => {
+    const s = statements[2]!;
+    expect(s.startsWith(`CREATE TABLE IF NOT EXISTS ${OUTPUT_FACTS_STATE_TABLE}\n`)).toBe(true);
+    expect(s).toContain("ORDER BY (org_id, workspace_id)");
+    expect(s).toContain("ENGINE = ReplacingMergeTree(version)");
+  });
+  test("both fact tables carry row_id for identity deletes", () => {
+    for (const s of statements.slice(0, 2)) expect(s).toMatch(/row_id\s+String/);
+    expect(statements[1]).toMatch(/scope_source\s+LowCardinality\(String\)/);
   });
   test("no TTL is active: the only TTL text is a comment", () => {
     for (const s of statements)

@@ -834,3 +834,40 @@ test('independent: erased stale physical alias must preserve live canonical sibl
  await indexSearchScope({...scope,sessionId:'alias_a'},searchDeps(ch.ch,sb.transact));
  expect(ch.final().map(r=>r.content)).toContain('source B');
 });
+
+// SEARCH_INDEX_OUTPUT_FACTS: the same pass writes the Output facts; erasure removes them.
+const OUTPUT_CH_URL = process.env.READ_API_TEST_CLICKHOUSE_URL;
+(OUTPUT_CH_URL ? describe : describe.skip)("search index with outputFacts on a real ClickHouse", () => {
+  test("facts follow the pass (insert once, idempotent re-pass) and erasure; off writes none", async () => {
+    const { freshClickHouse } = await import("../../session-read-api/__tests__/support.ts");
+    const { outputFactsSchemaStatements, OUTPUT_FACTS_TABLE, EVENT_FACTS_TABLE } = await import("../output-facts-schema.ts");
+    const { readSessionOutput } = await import("../../session-read-api/output-query.ts");
+    const ch = await freshClickHouse();
+    try {
+      for (const s of outputFactsSchemaStatements()) await ch.command(s);
+      const count = async (t: string) => Number((await ch.select<{ n: string }>(`SELECT count() AS n FROM ${t} FINAL`))[0]!.n);
+      let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "first answer"), event("r2", "1", Date.parse(AT) + 1000, "second answer")])];
+      const sb = fakeSupabase(() => keys);
+      // Off: transcript_events only.
+      expect(await indexSearchScope(scope, searchDeps(ch, sb.transact))).toMatchObject({ complete: true, inserted: 2 });
+      expect(await count(EVENT_FACTS_TABLE) + await count(OUTPUT_FACTS_TABLE)).toBe(0);
+      const on = { ...searchDeps(ch, sb.transact), outputFacts: true };
+      const first = await indexSearchScope(scope, on);
+      expect(first).toMatchObject({ complete: true, outputFacts: { inserted: 4, deleted: 0 } });
+      expect(await indexSearchScope(scope, on)).toMatchObject({ complete: true, outputFacts: { inserted: 0, deleted: 0 } });
+      expect(await readSessionOutput(ch, { orgId: scope.orgId, workspaceIds: [scope.workspaceId] })).toMatchObject({ agentMessages: 2, commits: 0 });
+      const facts = async () => (await ch.select<{ complete: number }>("SELECT complete FROM output_facts_session_state FINAL")).map((r) => Number(r.complete));
+      expect(await facts()).toEqual([1]);
+      // A partial read records the facts as owed, separately from search's needs_full.
+      expect(await indexSearchScope(scope, { ...on, limits: { maxScopeEvents: 1 } })).toMatchObject({ complete: false, partial: true });
+      expect(await facts()).toEqual([0]);
+      expect(await indexSearchScope(scope, on)).toMatchObject({ complete: true, outputFacts: { complete: true } });
+      expect(await facts()).toEqual([1]);
+      keys = [];
+      expect(await indexSearchScope(scope, on)).toMatchObject({ complete: true, reasons: ["erased"] });
+      expect(await count(EVENT_FACTS_TABLE) + await count(OUTPUT_FACTS_TABLE)).toBe(0);
+    } finally {
+      await ch.drop();
+    }
+  }, 120_000);
+});

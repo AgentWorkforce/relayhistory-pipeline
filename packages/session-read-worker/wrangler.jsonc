@@ -49,6 +49,9 @@
     // 501 directory_workspace_not_enabled (Cloud keeps its current path); "*" = all;
     // else comma-separated workspace ids. The deploy workflow sets it from
     // vars.SESSION_READ_DIRECTORY_WORKSPACES (unset = empty).
-    "READ_API_DIRECTORY_WORKSPACES": ""
+    "READ_API_DIRECTORY_WORKSPACES": "",
+    // "1" serves GET /v1/sessions/output from the ClickHouse output facts (needs the
+    // owner-applied output-facts DDL and the backfill watermark). Empty = 501.
+    "READ_API_OUTPUT_ENABLED": ""
   }
 }

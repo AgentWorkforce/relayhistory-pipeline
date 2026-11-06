@@ -50,6 +50,7 @@ import { chNow, deleteRows, windowStart, type PendingDelete } from "./vendor/sea
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
 import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
+import { eraseOutputFacts, outputFactsFromScope, reconcileOutputFacts, recordOutputFactsState, type OutputFactsScope } from "./output-facts.ts";
 
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
 
@@ -74,6 +75,16 @@ export interface SearchIndexDeps {
   /** Test seam (replaces the writer `desktopCatalog` selects); production writes the catalog in the same Supabase transaction. */
   writeCatalog?: typeof writeDirectoryCatalog;
   writeEvents?: typeof writeDirectoryEvents;
+  /**
+   * SEARCH_INDEX_OUTPUT_FACTS=1 only: also reconcile `transcript_event_facts` and
+   * `session_output_facts` (output-facts.ts) in this pass, under the same lock.
+   * Needs the owner-applied output-facts DDL. Every pass records the scope's facts
+   * state (complete or not) in `output_facts_session_state`, separate from the search
+   * state, so the Output route answers 501 for an inexact scope rather than a stale
+   * count, and a facts problem never marks the session `needs_full` for search.
+   * Absent or false: no fact table is touched.
+   */
+  outputFacts?: boolean;
 }
 
 export interface SearchIndexLimits {
@@ -128,6 +139,8 @@ export interface SearchIndexResult {
   busy?: boolean;
   /** Too large to index whole: no rows written, its index state marked partial. */
   partial?: boolean;
+  /** Present only with `outputFacts`: fact rows inserted and deleted, and whether they are exact. */
+  outputFacts?: { inserted: number; deleted: number; complete: boolean; reasons: string[] };
 }
 
 interface ScopeIdentity {
@@ -286,6 +299,11 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
           timeoutMs: 120_000,
         },
       );
+      if (deps.outputFacts) {
+        const fScope = factsScope(scope, pointerSnapshot.canonicalId);
+        await eraseOutputFacts(deps.ch, fScope);
+        await recordOutputFactsState(deps.ch, fScope, true, at);
+      }
       await recordState(deps.ch,scope,0,0,true,at,pointerSnapshot.canonicalId);
       await completeErasedDirectoryEvents(tx,scope);
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
@@ -295,6 +313,8 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
       await invalidateDirectoryEvents(tx,scope);
       await recordState(deps.ch,scope,s3.revision,0,false,at,pointerSnapshot.canonicalId);
+      // The facts are not rewritten from a partial read: they now owe a pass too.
+      if (deps.outputFacts) await recordOutputFactsState(deps.ch, factsScope(scope, pointerSnapshot.canonicalId), false, at);
       return {manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]};
     }
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
@@ -338,6 +358,16 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       if(written.written)await (deps.writeCatalog??directoryCatalogWriter(deps.desktopCatalog===true))(tx,directoryKey,s3.catalog,{expectedEpoch:pointerSnapshot.epoch});
       else {complete=false;s3.reasons.push("directory_event_sources_changed");await invalidateDirectoryEvents(tx,scope);}
     }
+    let outputFacts: SearchIndexResult["outputFacts"];
+    if (deps.outputFacts) {
+      // The whole scope (not the transcript window), from the same validated read. An
+      // incomplete pass inserts what it read and deletes nothing.
+      const fScope = factsScope(scope, pointerSnapshot.canonicalId);
+      const facts = outputFactsFromScope(fScope, { projectionRows: s3.projectionRows, records: s3.records, complete }, version);
+      const r = await reconcileOutputFacts(deps.ch, fScope, facts, { maxRows: limits.maxRows, insertBatch: limits.insertBatch });
+      outputFacts = { inserted: r.inserted, deleted: r.deleted, complete: r.complete, reasons: r.reasons };
+      await recordOutputFactsState(deps.ch, fScope, r.complete, at);
+    }
     // Only a complete pass makes the session current; any other leaves it owing one.
     await recordState(deps.ch, scope, s3.revision, inWindow.length, complete, at, pointerSnapshot.canonicalId);
     return {
@@ -347,6 +377,17 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       deleted: deletes.length,
       complete,
       reasons: truncated ? [...s3.reasons, "clickhouse_truncated"] : s3.reasons,
+      ...(outputFacts ? { outputFacts } : {}),
     };
   });
+}
+
+function factsScope(scope: SessionScope, canonicalId: string): OutputFactsScope {
+  return {
+    orgId: scope.orgId,
+    workspaceId: scope.workspaceId,
+    harness: scope.harness,
+    sessionIds: [...new Set([scope.sessionId, canonicalId])],
+    canonicalId,
+  };
 }

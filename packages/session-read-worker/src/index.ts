@@ -17,7 +17,9 @@
  * Worker's own origin, the only audience accepted; unset = every /v1 request
  * 401), READ_API_COMPLETE_SINCE (ISO timestamp or "epoch"; missing = 503),
  * CLICKHOUSE_DATABASE, READ_API_DIRECTORY_WORKSPACES (the directory list/activity
- * and timing canary allowlist; unset = none), READ_API_TIMING_ASSUME_NO_TURNS, and
+ * and timing canary allowlist; unset = none), READ_API_TIMING_ASSUME_NO_TURNS,
+ * READ_API_OUTPUT_ENABLED ("1" only: GET /v1/sessions/output from the ClickHouse facts,
+ * which needs the owner-applied output-facts DDL; default off = 501), and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve).
  */
@@ -50,6 +52,8 @@ export interface Env extends CanonicalEnv {
   READ_API_DIRECTORY_WORKSPACES?: string;
   /** "true": time a session without legacy turn evidence as having none (session-timing-source.ts). */
   READ_API_TIMING_ASSUME_NO_TURNS?: string;
+  /** "1": serve GET /v1/sessions/output from the ClickHouse facts; anything else = 501 output_not_configured. */
+  READ_API_OUTPUT_ENABLED?: string;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
 }
@@ -203,6 +207,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     liveness: sqlLiveness(tenant.run),
     directory: sqlDirectory(tenant.run),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
+    ...(env.READ_API_OUTPUT_ENABLED?.trim() === "1" ? { output: { enabled: true as const } } : {}),
     completeSinceMs,
     log: (fields) => log("info", "session read", fields),
   });

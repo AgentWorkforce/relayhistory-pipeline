@@ -1,6 +1,10 @@
 # Output and the daily digest off Neon (design, P4)
 
-Status: design plus a dormant DDL skeleton (`src/session-pipeline/output-facts-schema.ts`). Nothing here is applied, deployed or wired: no producer writes the tables, and the read Worker still answers both routes 501 (`output_not_migrated`, `digest_not_migrated`, registered in `src/session-read-api/app.ts`).
+Status (lane F4, 2026-11-06):
+- **Output is implemented and default-off.** The producer is `src/session-pipeline/output-facts.ts`, which `indexSearchScope` calls only with Lambda `SEARCH_INDEX_OUTPUT_FACTS=1`. The query module is `src/session-read-api/output-query.ts`. The route `GET /v1/sessions/output` is served by the read Worker only with `READ_API_OUTPUT_ENABLED=1`.
+- The DDL (`output-facts-schema.ts`, schema version 2) is **not applied**. Applying it is an owner step that needs Khaliq's OK.
+- Parity: `src/session-pipeline/__tests__/output-facts-parity.test.ts` runs relayhistory's own `getSessionOutput` SQL on Postgres against the facts on ClickHouse, for every window and filter shape.
+- The digest still answers 501 `digest_not_migrated` (lane F4 PR B).
 
 Sources read: relayhistory-cloud `c7de2163` (`lib/session-output.ts`, `lib/digest.ts`, `lib/narrative.ts`, `lib/rollups.ts`, `lib/ingest.ts`, migrations 0003/0018/0021/0073); sessions-pipeline main (`vendor/search-index/schema.ts`, `session-pipeline/search-index.ts`, `packages/pipeline/.../relayhistory-projection.ts`, `session-read-api`); Cloud trunk (`packages/web/lib/sessions-read-96bulls.ts`, `app/api/v1/workspaces/[workspaceId]/sessions/output/route.ts`, `dashboard/_components/session-output.tsx`, `lib/skip/history.ts`).
 
@@ -111,21 +115,29 @@ SELECT count(), sum(added), sum(removed), countIf(added IS NULL OR removed IS NU
 - The digest aggregates are straight `GROUP BY`s over `transcript_event_facts FINAL` with the day's half-open window. `count(distinct coalesce(project_id, chr(1)))` becomes `uniqExact(ifNull(project_id, '\x01'))`, and likewise for the `\x02` pair.
 - Outcomes: the day's (source, session) set from event facts, then `outcome` facts grouped by session with `max(reverted)`.
 
-## 3. Producer (the next PR, not this one)
+## 3. Producer (implemented: `output-facts.ts`)
 `session-pipeline/search-index.ts` already reconciles one session scope from S3 into `transcript_events` under the Supabase advisory lock. The plan is to extend that same pass, so the three tables can never disagree about a scope:
 1. From the projected events, emit one `transcript_event_facts` row per event. The fields come from `projectRelayhistorySession` (model, provider, tokens, cost, project, task_ref, files_touched), and `branch` is derived exactly as `branchSql`.
 2. Emit `message` facts with the qualification and the COALESCE id. Emit `commit` facts from the projection's `session_commit_links` rows and from tool results: port the regex and the call-uniqueness check from `session-output.ts`, using the scope's tool calls.
 3. From the scope's `legacy_session_outcome` records (PR 2 export), emit `outcome` facts and `origin='outcome'` commit facts. From `legacy_conversation_turn` records and PR 1 live turn records, emit `legacy_turn_message` facts.
 4. Reconcile by fingerprint as for transcript_events: insert what's new or changed, delete what S3 no longer has, and on erasure delete the whole scope. An incomplete read never deletes.
 
+As built:
+- Identity deletes go by `row_id`, the sha256 of the identity.
+- `session_output_facts.scope_source` carries the harness, so that a legacy turn whose stored `source` differs is still erased with its scope.
+- Facts cover the whole scope, not the transcript_events window.
+- Every pass with the flag on records the scope in `output_facts_session_state` (complete or not). That table is separate from the search `needs_full`, so a facts problem never degrades transcript search. The Output route answers 501 `output_session_partial` while any session of the workspace is incomplete there or `needs_full`, so it never serves a stale count.
+- Turning `SEARCH_INDEX_OUTPUT_FACTS` off again stops fact erasure. Before doing so, turn the Output route off and drop or truncate the fact tables. The upload-erasure path (C3/#289) must also purge both fact tables.
+
 `session_outcomes` dedup across exported copies: the Neon key is `(org, workspace, source, session, commit_sha)`, and the export carries the row as it stands (strongest method already applied), so the indexer needs no merge rule. `row_key` = the sha.
 
 ## 4. Read Worker routes
 The dormant stubs keep their 501s until each condition holds. Both routes stay behind `READ_API_DIRECTORY_WORKSPACES` (501 `*_workspace_not_enabled` off the allowlist) with the P3b workspace attestation and strict-contract response.
 
-- **`/v1/sessions/output`**:
-  - 501 `output_not_configured` without ClickHouse;
-  - 501 `output_backfill_incomplete` until the workspace's facts are marked complete (a `search_ingest_state`-style watermark per workspace, written by the backfill);
+- **`/v1/sessions/output`** (implemented):
+  - 501 `output_workspace_not_enabled` off `READ_API_DIRECTORY_WORKSPACES` (`*` = all);
+  - 501 `output_not_configured` without `READ_API_OUTPUT_ENABLED=1`;
+  - 501 `output_backfill_incomplete` until the workspace has a row in `output_facts_workspace_state`. The operator backfill writes that row once every scope of the workspace has been re-read with the flag on; the read path never writes it;
   - 501 `output_session_partial` if any in-range session is `needs_full`;
   - then the two queries in 2.4;
   - same 400s as relayhistory: `workspace is required`, `since and until are required exactly once`, `Invalid output date range`.

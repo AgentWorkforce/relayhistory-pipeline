@@ -31,11 +31,11 @@
  *                                   (session-timing-source.ts, timing.ts), same allowlist.
  *   GET /v1/sessions/:id/turns      the relay session journal from canonical S3 (legacy
  *   GET /v1/sessions/:id/metadata   export + live turns: session-turns-source.ts), same allowlist.
- *   GET /v1/sessions/output and /v1/digest/daily are registered and answer 501 with a
- *   reason naming the store they still need: their relayhistory semantics read tables
- *   that neither ClickHouse, S3 nor the directory holds yet (per-message and commit
- *   facts, session_outcomes, the digest narrative cache), and this backend never
- *   answers approximately.
+ *   GET /v1/sessions/output         Output from the ClickHouse facts (output-query.ts), off unless
+ *                                   READ_API_OUTPUT_ENABLED=1 (deps.output), same allowlist; 501
+ *                                   until the workspace's backfill watermark exists.
+ *   GET /v1/digest/daily is registered and answers 501 with a reason naming the store it
+ *   still needs (the digest narrative cache), and this backend never answers approximately.
  *
  * Auth: a RelayAuth assertion JWT minted for THIS service's origin with scope
  * `rth:read` (verifyAgentRelayToken: RS256, JWKS, issuer, exact audience).
@@ -50,6 +50,8 @@ import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
+import { incompleteOutputSessions, outputCompleteSince, readSessionOutput } from "./output-query.ts";
+import { READ_SETTINGS } from "./queries.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
   DirectoryError,
@@ -92,6 +94,11 @@ export interface ReadApiDeps {
   timing?: TimingDeps;
   /** Relay session turns and metadata from canonical S3 (session-turns-source.ts); absent = 501 `turns_not_configured`. */
   turns?: TurnsDeps;
+  /**
+   * READ_API_OUTPUT_ENABLED=1: serve GET /v1/sessions/output from the ClickHouse facts
+   * (output-query.ts) with `ch`. Absent = 501 `output_not_configured`.
+   */
+  output?: { enabled: true };
 }
 
 export interface TurnsDeps {
@@ -389,7 +396,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "output"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -572,7 +579,45 @@ export function createReadApi(deps: ReadApiDeps) {
       return fail(c, error);
     }
   };
-  app.get("/v1/sessions/output", notMigrated("output_not_migrated"));
+  /**
+   * GET /v1/sessions/output (relayhistory routes/recall.ts + lib/session-output.ts): the
+   * workspace's agent messages and unique commits in [since, until] (inclusive), from the
+   * ClickHouse facts (output-query.ts), never Neon. The 400s are relayhistory's, in its
+   * order. Then the canary allowlist, and a 501 for every case not answerable exactly:
+   *   output_not_configured      READ_API_OUTPUT_ENABLED is off
+   *   output_backfill_incomplete no backfill watermark for the workspace yet
+   *   output_session_partial     a session of the workspace has inexact facts (facts state), or is
+   *                              `needs_full` for search (its facts were not rewritten)
+   */
+  app.get("/v1/sessions/output", async (c) => {
+    try {
+      const identity = c.get("identity");
+      if (!c.req.queries("workspace")?.length) throw bad("workspace is required");
+      attestWorkspace(c, identity);
+      const rawSince = c.req.query("since");
+      const rawUntil = c.req.query("until");
+      if (!rawSince || !rawUntil || c.req.queries("since")?.length !== 1 || c.req.queries("until")?.length !== 1)
+        throw bad("since and until are required exactly once");
+      const since = new Date(rawSince);
+      const until = new Date(rawUntil);
+      const day = 86_400_000;
+      if (!Number.isFinite(since.getTime()) || !Number.isFinite(until.getTime()) || until < since ||
+          Math.max(0, Math.floor(until.getTime() / day) - Math.floor(since.getTime() / day) + 1) > 366)
+        throw bad("Invalid output date range");
+      requireCanary(identity, "output");
+      if (!deps.output) throw unsupported("output_not_configured");
+      const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
+      if (!(await outputCompleteSince(deps.ch, identity.orgId, identity.workspaceId, opts))) throw unsupported("output_backfill_incomplete");
+      const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
+      if (partials.overflow || partials.sessions.length > 0) throw unsupported("output_session_partial");
+      if ((await incompleteOutputSessions(deps.ch, identity.orgId, identity.workspaceId, opts)) > 0) throw unsupported("output_session_partial");
+      const output = await readSessionOutput(deps.ch, { orgId: identity.orgId, workspaceIds: [identity.workspaceId] }, { since, until }, opts);
+      log({ route: c.req.routePath, reason: "output_served", correlation_id: c.get("correlationId") });
+      return c.json({ since: since.toISOString(), until: until.toISOString(), output, correlationId: c.get("correlationId") });
+    } catch (error) {
+      return fail(c, error);
+    }
+  });
 
   /**
    * GET /v1/sessions/:id/turns and /metadata (relayhistory routes/turns.ts): the relay
