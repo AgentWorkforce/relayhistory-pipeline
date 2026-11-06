@@ -3,9 +3,14 @@
  * sessions.ingest_frozen_source_* (owner-only), then verify per org and seal.
  *
  * Usage (stdin: ONE JSON line {"neonOwnerUrl": "..."}; Supabase owner = the CLI temp login, SET ROLE postgres):
- *   bun scripts/frozen-source-copy.ts --plan                   read-only: per-org Neon row counts, no writes
+ *   bun scripts/frozen-source-copy.ts --plan [--estimate-only]  read-only: per-org Neon row counts (by ordinal), no writes
  *   bun scripts/frozen-source-copy.ts --copy [--org X] [--concurrency 2] [--page 5000] [--max-page-ms 4000]
  *   bun scripts/frozen-source-copy.ts --seal                   verify every org (Neon vs Supabase digest) and write the seal
+ *   bun scripts/frozen-source-copy.ts --seal --workers N       the same verification and seal with N (1-8) read-only Neon workers and a
+ *                                                              source-stability fence (src/migration/frozen-source-seal.ts)
+ *   bun scripts/frozen-source-copy.ts --time-leg (--orgs I,J | --row-cap N) [--workers N] [--max-seconds 600]
+ *                                                              read-only: time the seal's Neon and Supabase legs on a bounded subset;
+ *                                                              aggregate-only output (orgs are ordinals from --plan)
  *   bun scripts/frozen-source-copy.ts --repair-head --org O --workspace W --user U [--execute]
  *                                                              re-seed ONE stale mirror control head from Neon (dry run by default;
  *                                                              src/hoopdb/frozen-control-head-repair.ts has the refusal rules)
@@ -23,17 +28,34 @@ import { SUPA_PAGE, SUPA_RECEIPTS, SUPA_CONTROL_HEADS } from "../src/migration/f
 import { parseCliLogin } from "./schema-release-owner-operator-plan.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
 import { repairControlHead } from "../src/hoopdb/frozen-control-head-repair.ts";
+import { sealParallel, timeLegs, planCounts, parseWorkers, selectOrdinals, safeError, SealRefusal } from "../src/migration/frozen-source-seal.ts";
 
 const REF = "pyamkrhoyszgzirqqffq", HOST = "aws-0-us-east-1.pooler.supabase.com", CLI = process.env.SUPABASE_CLI ?? "/home/khaliqgant/.local/bin/supabase";
 const args = process.argv.slice(2), flag = (k: string) => args.includes(k), val = (k: string, d: string) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1]! : d; };
-const mode = flag("--plan") ? "plan" : flag("--copy") ? "copy" : flag("--seal") ? "seal" : flag("--repair-head") ? "repair-head" : "";
-if (!mode) { console.error("one of --plan | --copy | --seal | --repair-head"); process.exit(64); }
+const modes = ["--plan", "--copy", "--seal", "--repair-head", "--time-leg"].filter(flag);
+if (modes.length !== 1) { console.error("exactly one of --plan | --copy | --seal | --repair-head | --time-leg"); process.exit(64); }
+const mode = modes[0]!.slice(2);
 const PAGE = Number(val("--page", "5000")), CONC = Number(val("--concurrency", "2")), MAX_PAGE_MS = Number(val("--max-page-ms", "4000")), ONLY = val("--org", "");
 // A subset must never become the global completeness seal.
 if (flag("--seal") && flag("--org")) {
   console.error("--seal requires the complete source; --org is not allowed");
   process.exit(64);
 }
+// Validated before stdin is read: no credential is touched by a malformed request.
+let WORKERS = 0, TIMER_ORDINALS = "", ROW_CAP: number | undefined, MAX_SECONDS = 600;
+try {
+  if (flag("--workers")) {
+    if (mode !== "seal" && mode !== "time-leg") throw new SealRefusal("invalid_workers", "--workers is only for --seal or --time-leg");
+    WORKERS = parseWorkers(val("--workers", ""));
+  }
+  if (mode === "time-leg") {
+    if (flag("--org")) throw new SealRefusal("invalid_subset", "--time-leg selects orgs by --orgs ordinal, never by identifier");
+    if (!flag("--orgs") && !flag("--row-cap")) throw new SealRefusal("unbounded_timer", "--time-leg needs --orgs or --row-cap");
+    if (flag("--orgs")) { TIMER_ORDINALS = val("--orgs", ""); if (!/^[0-9]+(,[0-9]+)*$/.test(TIMER_ORDINALS)) throw new SealRefusal("invalid_ordinals"); }
+    if (flag("--row-cap")) { const raw = val("--row-cap", ""); if (!/^[1-9][0-9]{0,9}$/.test(raw)) throw new SealRefusal("invalid_row_cap"); ROW_CAP = Number(raw); }
+    if (flag("--max-seconds")) { const raw = val("--max-seconds", ""); if (!/^[1-9][0-9]{0,3}$/.test(raw) || Number(raw) > 3600) throw new SealRefusal("invalid_max_seconds"); MAX_SECONDS = Number(raw); }
+  }
+} catch (error) { console.error(String((error as Error).message)); process.exit(64); }
 const { neonOwnerUrl } = JSON.parse(readFileSync(0, "utf8").split("\n")[0] || "{}");
 if (!/^postgresql:\/\/neondb_owner:.+ep-floral-pond-apkvat38/.test(neonOwnerUrl ?? "")) { console.error("neonOwnerUrl (production owner) required on stdin"); process.exit(64); }
 const log = (m: string, f: Record<string, unknown> = {}) => console.log(JSON.stringify({ at: new Date().toISOString(), m, ...f }));
@@ -132,6 +154,13 @@ async function copyOrg(org: string, s: pg.Client, check: () => void) {
   } finally { await n.end().catch(() => {}); }
 }
 
+// One more read-only Neon session per seal/timer worker; the Neon URL is static, so no login race.
+const neonReader = async () => {
+  const c = neon();
+  try { await c.connect(); await c.query("SET default_transaction_read_only = on"); return c; }
+  catch (error) { await c.end().catch(() => {}); throw error; }
+};
+
 async function repairHead() {
   const key = { org: val("--org", ""), workspace: val("--workspace", ""), user: val("--user", "") };
   if (!key.org || !key.user || !args.includes("--workspace") || [key.org, key.workspace, key.user].some((v) => v.startsWith("--"))) { console.error("--repair-head needs --org, --workspace (may be empty string) and --user"); process.exit(64); }
@@ -157,6 +186,21 @@ async function main() {
     if (mode === "plan") {
       const est = (await n.query("SELECT reltuples::bigint AS n FROM pg_class WHERE oid='sessions.delivery_records'::regclass")).rows[0].n;
       log("plan", { phase: status.phase, epoch: status.epoch, orgs: all.length, estimatedRecords: String(est) });
+      if (flag("--estimate-only")) return;
+      // Exact per-org counts, inside the same READ ONLY transaction. Orgs are ordinals in the
+      // C-ordered list (the --time-leg --orgs selector); no identifiers are printed.
+      const counts = await planCounts(n, all, 50000, (o) => log("plan org", o));
+      log("plan counts", counts.summary);
+      return;
+    }
+    if (mode === "time-leg") {
+      const subset = TIMER_ORDINALS ? selectOrdinals(all, TIMER_ORDINALS) : all;
+      await n.query("ROLLBACK");
+      const s = await supa();
+      try {
+        const report = await timeLegs({ target: s, openSource: neonReader, orgs: subset, workers: WORKERS || 1, page: PAGE, maxPageMs: MAX_PAGE_MS, rowCap: ROW_CAP, maxSeconds: MAX_SECONDS });
+        log("time-leg", { orgsSelected: subset.length, page: PAGE, ...report });
+      } finally { await s.end().catch(() => {}); }
       return;
     }
     await n.query("ROLLBACK");
@@ -191,6 +235,15 @@ async function main() {
           } catch (error) { if (failure === undefined) failure = error ?? new Error("copy_worker_failed"); }
         }));
         if (failure !== undefined) throw failure;
+      } finally { await s.end().catch(() => {}); }
+      return;
+    }
+    if (mode === "seal" && WORKERS) {
+      const s = await supa();
+      try {
+        const r = await sealParallel({ main: n, target: s, openSource: neonReader, orgs: all, status, workers: WORKERS, page: PAGE, maxPageMs: MAX_PAGE_MS,
+          onEvent: (e) => { if (e.kind === "org-verified") log("progress", { done: e.done, of: e.of, rows: e.rows }); else if (e.kind === "fence-opened") log("fence opened", { orgs: e.orgs, controlHeadOrgs: e.heads, workers: WORKERS }); } });
+        log("sealed", { orgs: r.orgs, manifestSha: r.manifestSha, records: r.recordRows, workers: WORKERS });
       } finally { await s.end().catch(() => {}); }
       return;
     }
@@ -239,4 +292,5 @@ async function main() {
     } finally { await s.end().catch(() => {}); }
   } finally { await n.end().catch(() => {}); }
 }
-main().catch((e) => { log("STOPPED", { why: String(e?.message ?? e).slice(0, 300) }); process.exitCode = 1; });
+// The timer's output is aggregate-only, including on failure.
+main().catch((e) => { log("STOPPED", { why: mode === "time-leg" ? safeError(e) : String(e?.message ?? e).slice(0, 300) }); process.exitCode = 1; });
