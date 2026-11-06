@@ -14,7 +14,7 @@ END $$;
 CREATE TABLE sessions.ingest_ack_format(
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  epoch bigint NOT NULL DEFAULT 0, mode text NOT NULL DEFAULT 'v1' CHECK(mode IN('v1','v2')),
- cutover_seat bigint, released_at timestamptz NOT NULL DEFAULT clock_timestamp(), changed_at timestamptz);
+ cutover_seat bigint, released_at timestamptz, install_xid bigint NOT NULL DEFAULT txid_current(), changed_at timestamptz);
 INSERT INTO sessions.ingest_ack_format(singleton) VALUES(true);
 -- format eras: every seat number belongs to exactly one era (first_seat..next era's first_seat-1); P2/T6c rollback support
 CREATE TABLE sessions.ingest_ack_format_epochs(epoch bigint PRIMARY KEY,mode text NOT NULL CHECK(mode IN('v1','v2')),first_seat numeric NOT NULL CHECK(first_seat>=0 AND first_seat<=9223372036854775808),
@@ -680,16 +680,32 @@ UPDATE sessions.ingest_claim_attempts a SET ack_format=1
 UPDATE sessions.ingest_claim_attempts a SET ack_format=0
  WHERE a.ack_format IS NULL AND EXISTS(SELECT 1 FROM sessions.ingest_batches b WHERE b.org_id=a.org_id AND b.workspace_id=a.workspace_id
   AND b.origin_id=a.origin_id AND b.batch_id=a.batch_id AND b.digest=a.digest AND b.state='committed');
-UPDATE sessions.ingest_ack_format SET released_at=clock_timestamp();
+-- released_at is stamped only AFTER the bridge install has committed (review of 0babaa95: a mid-install stamp would let a
+-- transaction that starts before COMMIT run the old body yet look newer than the release). Separate owner call.
+CREATE FUNCTION sessions.ingest_ack_mark_released() RETURNS timestamptz LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $mr$
+DECLARE m sessions.ingest_ack_format%ROWTYPE;
+BEGIN
+ SELECT * INTO STRICT m FROM sessions.ingest_ack_format WHERE singleton FOR UPDATE;
+ IF txid_status(m.install_xid) IS DISTINCT FROM 'committed' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: bridge install not yet committed';END IF;
+ IF m.released_at IS NULL THEN UPDATE sessions.ingest_ack_format SET released_at=clock_timestamp() WHERE singleton;END IF;
+ RETURN (SELECT released_at FROM sessions.ingest_ack_format WHERE singleton);
+END $mr$;
 
 CREATE FUNCTION sessions.ingest_ack_drain_count() RETURNS bigint LANGUAGE sql STABLE AS $$
  SELECT count(*) FROM pg_stat_activity s, sessions.ingest_ack_format f
  WHERE f.singleton AND s.datname=current_database() AND s.pid<>pg_backend_pid() AND s.backend_type='client backend'
-  -- old = its transaction (or, in the instant before xact_start is published, its current statement) began before the
-  -- bridge release; a backend reporting no state is unresolvable unless it connected after the release (found by P1 at 643dc529)
-  AND ((s.state IS NULL AND s.backend_start<f.released_at)
-    OR (s.state IS NOT NULL AND s.state<>'idle' AND coalesce(s.xact_start,s.query_start) IS NULL)
-    OR coalesce(s.xact_start,s.query_start)<f.released_at AND s.state<>'idle') $$;
+  -- count a backend as possibly running an old body when:
+  --  * it reports no state and did not connect after the release (still starting, or unknown)
+  --  * it is mid-transaction/statement and its start is unknown, EXCEPT the instant where a fresh statement reports
+  --    'active'/'fastpath function call' before xact_start is published (then query_start is its transaction start)
+  --  * its transaction (or, for that instant, its statement) began before the release
+  --  'idle' (no transaction) and 'idle in transaction (aborted)' (can execute nothing until ROLLBACK) are excluded.
+  AND f.released_at IS NOT NULL
+  AND ((s.state IS NULL AND coalesce(s.backend_start<f.released_at,true))
+    OR (s.state NOT IN('idle','idle in transaction (aborted)') AND (
+         (s.xact_start IS NULL AND (s.state NOT IN('active','fastpath function call') OR s.query_start IS NULL))
+      OR (CASE WHEN s.xact_start IS NULL THEN s.query_start ELSE s.xact_start END)<f.released_at))) $$;
 
 CREATE FUNCTION sessions.ingest_ack_format_set(p_mode text) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $set$
@@ -700,6 +716,7 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: drain requires pg_read_all_stats';END IF;
  SELECT * INTO STRICT c FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE;   -- same lock every seat writer takes
  SELECT * INTO STRICT m FROM sessions.ingest_ack_format WHERE singleton FOR UPDATE;
+ IF m.released_at IS NULL THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: bridge release not stamped after install commit';END IF;
  IF sessions.ingest_ack_drain_count()<>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: bridge drain incomplete';END IF;
  IF p_mode='v2' THEN
   IF EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_stage_intents t ON t.claim_token=a.claim_token
@@ -767,7 +784,7 @@ DO $rv$DECLARE f record;BEGIN
  FOR f IN SELECT p.oid::regprocedure sig FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
   WHERE n.nspname='sessions' AND (p.proname LIKE 'ack\_%' OR p.proname IN('ingest_ack_entries','ingest_ack_seat_owner','ingest_ack_format_set','ingest_ack_drain_count',
    'ingest_lazy_ack_batch','ingest_lazy_ack_batch_v1','ingest_lazy_ack_batch_v1r','ingest_lazy_ack_batch_v2','ingest_lazy_stage_seats','ingest_lazy_stage_seats_v1',
-   'ingest_buffer_gc_ordinals','ingest_buffer_gc_ordinals_v1','ingest_lazy_clear'))
+   'ingest_buffer_gc_ordinals','ingest_buffer_gc_ordinals_v1','ingest_lazy_clear','ingest_ack_mark_released'))
  LOOP EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder',f.sig);END LOOP;END$rv$;
 
 -- ---------- receipt evidence is append-only (review v9 MAJOR 3): no UPDATE / DELETE / TRUNCATE ----------

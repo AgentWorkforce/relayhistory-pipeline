@@ -549,6 +549,20 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
   }finally{await f.close()}
  });
 
+ test("bridge release is stamped only after the install transaction committed; flip refuses without it (review of 0babaa95)",async()=>{
+  const f=await fixture(kind,"bridge-v1");try{
+   await f.db.exec("BEGIN");
+   await f.db.query("UPDATE sessions.ingest_ack_format SET released_at=NULL,install_xid=txid_current()");   // simulate an install in this txn
+   await expectCode(f.db.query("SELECT sessions.ingest_ack_mark_released()"),"bridge install not yet committed");
+   await f.db.exec("ROLLBACK");
+   await f.db.query("UPDATE sessions.ingest_ack_format SET released_at=NULL,install_xid=txid_current()");     // committed install, not yet stamped
+   await expectCode(f.db.query("SELECT sessions.ingest_ack_format_set('v2')"),"bridge release not stamped");
+   await f.db.query("SELECT sessions.ingest_ack_mark_released()");
+   await f.db.query("SELECT sessions.ingest_ack_format_set('v2')");
+   expect((await f.db.query("SELECT mode FROM sessions.ingest_ack_format")).rows[0].mode).toBe("v2");
+  }finally{await f.close()}
+ });
+
  test("P11 isolation: RR/SERIALIZABLE refused for flip, ACK bridge and readers",async()=>{
   const f=await fixture(kind,"bridge-v1");try{
    for(const lvl of ["REPEATABLE READ","SERIALIZABLE"]){

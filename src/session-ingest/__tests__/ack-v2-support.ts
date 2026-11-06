@@ -46,7 +46,7 @@ export async function fixture(kind:"pglite"|"pg",mode:Mode,opts:{highWater?:stri
  await owner("ingest_lazy_policy_set",{baselineMode:"lazy-current",generation,sourceIdentitySha256:IDENT,controlEpoch:epoch,privacyBaselineSha256:"a".repeat(64),retentionContractSha256:"b".repeat(64),sourceProofSha256:"d".repeat(64),validUntil:new Date(Date.now()+3600000).toISOString(),issuer:"relayhistory-cloud"});
  await owner("ingest_receipt_seat_initialize",{protocol:"delivery-acceptance-floor-v1",controlEpoch:epoch,capturedAt:"2026-11-04T00:00:00.000000Z",sourceSequences:["sessions.delivery_catalog_acceptance_seq","sessions.delivery_projection_acceptance_seq"].map((sequenceRegclass,i)=>({sequenceRegclass,sequenceOid:String(i+1),allocatedHighWater:hw,isCalled:true,incrementBy:"1",cycle:false})),allocatedHighWater:hw,generation,sourceIdentitySha256:IDENT,sourceProofSha256:"d".repeat(64)});
  if(opts.beforeFixture)await opts.beforeFixture((db as any).url);
- if(mode!=="baseline")await db.exec(read(FIXTURE));
+ if(mode!=="baseline"){await db.exec(read(FIXTURE));await db.query("SELECT sessions.ingest_ack_mark_released()")}   // separate txn, after the install committed
  if(mode==="bridge-v2")await db.query("SELECT sessions.ingest_ack_format_set('v2')");
  const run=async(s:string,p:unknown[]=[])=>{await db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest");try{const r=await db.query(s,p);await db.exec("COMMIT");return r as never}catch(e:any){lastSql=String(e?.code??"")+" "+String(e?.message??e);await db.exec("ROLLBACK");throw e}};
  const lastSqlError=()=>{const v=lastSql;lastSql=null;return v};
