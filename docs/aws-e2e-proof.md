@@ -1,9 +1,9 @@
 # AWS self-host E2E proof (harness and runbook)
 
 This harness proves the self-hosted 96Bulls deployment end to end on one
-isolated AWS stage: account `500268966557`, EKS cluster `96bulls-aws-proof`,
+isolated AWS stage: account `<proof-account-id>`, EKS cluster `96bulls-aws-proof`,
 or, with `--target pippen-sandbox`, the Pippen Tools sandbox of agent
-`aws-proof` (account `361835732085`, EKS cluster `96bulls-aws-proof-sandbox`;
+`aws-proof` (account `<sandbox-account-id>`, EKS cluster `96bulls-aws-proof-sandbox`;
 see [Pippen sandbox target](#pippen-sandbox-target)).
 It has not been run against AWS. Nothing in this repository has created the
 proof stage. The only local run so far was a read-only `fresh-install` against
@@ -31,13 +31,13 @@ the environment can add a third target or widen either one.
 
 | | `--target proof` (default) | `--target pippen-sandbox` |
 | --- | --- | --- |
-| Account | `500268966557` (beside aws-sessions-dev) | `361835732085` (Sandbox OU, 96Bulls org) |
+| Account | `<proof-account-id>` (beside aws-sessions-dev) | `<sandbox-account-id>` (Sandbox OU, 96Bulls org) |
 | Region | `us-west-2` | `us-west-2` |
 | Stage / cluster | `aws-proof` / `96bulls-aws-proof` | `aws-proof-sandbox` / `96bulls-aws-proof-sandbox` |
-| Caller | any principal in the account | exactly `arn:aws:sts::361835732085:assumed-role/agent-session/agent-<session_id>`, `<session_id>` from `--pippen-session` (required); post-destroy: any session of the recreated `agent-session` role in `361835732085` |
+| Caller | any principal in the account | exactly `arn:aws:sts::<sandbox-account-id>:assumed-role/agent-session/agent-<session_id>`, `<session_id>` from `--pippen-session` (required); post-destroy: any session of the recreated `agent-session` role in `<sandbox-account-id>` |
 | Host | `proof-sessions.agentrelay.com` | `proof-sandbox-sessions.agentrelay.com` |
-| Buckets | `96bulls-aws-proof-{locker,hoopdb-backups}-500268966557` | `pippen-sbx-96bulls-aws-proof-sandbox-{locker,backups}-361835732085` (the pippen-sbx- prefix is what pippen-sweeper may delete; `backups`, since `hoopdb-backups` with the prefix is 64 characters, over S3's 63) |
-| Stage plan | `docs/plans/aws-proof.*` | `docs/plans/aws-proof-sandbox.*`, must carry `pippenSandbox`, never `accountShared` |
+| Buckets | `96bulls-aws-proof-{locker,hoopdb-backups}-<proof-account-id>` | `pippen-sbx-96bulls-aws-proof-sandbox-{locker,backups}-<sandbox-account-id>` (the pippen-sbx- prefix is what pippen-sweeper may delete; `backups`, since `hoopdb-backups` with the prefix is 64 characters, over S3's 63) |
+| Stage plan | `docs/plans/aws-proof.*` (local capture, not committed) | `docs/plans/aws-proof-sandbox.*` (local capture, not committed), must carry `pippenSandbox`, never `accountShared` |
 | Inputs | `.96bulls/aws-proof/inputs.json` | `.96bulls/aws-proof-sandbox/inputs.json` |
 | Teardown | `bin/96bulls down aws-proof` | Ingress and DNS first, harness phase 1, `bin/96bulls down aws-proof-sandbox`, then `pippen sandbox down aws-proof` (the sweep of record; steps 4-11 below) |
 
@@ -48,7 +48,7 @@ the stage plan and the prior report. The sandbox adds one more: before the
 cluster is described, and again before every step, the caller's
 `sts get-caller-identity` ARN must be exactly the pippen agent-session role
 session of the current lease,
-`arn:aws:sts::361835732085:assumed-role/agent-session/agent-<session_id>`
+`arn:aws:sts::<sandbox-account-id>:assumed-role/agent-session/agent-<session_id>`
 (`wrong_caller` otherwise). `<session_id>` is the lease UUID shown as
 `session_id` by `pippen sandbox status aws-proof` after `up`. Pass it as
 `--pippen-session <session_id>`. It is not secret, it can only narrow the
@@ -107,7 +107,7 @@ replaces every inherited `AWS_*` variable and keeps the rest, so the
 pippen sandbox up aws-proof
 pippen sandbox status aws-proof            # session_id
 export NINETY_SIX_BULLS_PIPPEN_SESSION=<session_id>
-export NINETY_SIX_BULLS_CONFIRM_ACCOUNT=361835732085   # AWS_REGION comes from exec
+export NINETY_SIX_BULLS_CONFIRM_ACCOUNT=<sandbox-account-id>   # AWS_REGION comes from exec
 
 # 1. Capture the plan (Alchemy: static, < 1 h). Review docs/plans/aws-proof-sandbox.*.
 pippen sandbox exec aws-proof --static-credentials -- bin/96bulls plan aws-proof-sandbox --capture
@@ -170,7 +170,7 @@ pippen sandbox down aws-proof
 ```
 
 The post-destroy check (step 10) accepts any session of the
-`agent-session` role in `361835732085`, because the session name differs
+`agent-session` role in `<sandbox-account-id>`, because the session name differs
 per session; live steps still need the pinned caller above. Besides the
 checks in [teardown](#11-teardown), it lists resources tagged
 `96bulls:stack=aws-proof-sandbox`, `alchemy::stage=aws-proof-sandbox` and
@@ -201,10 +201,11 @@ run on the proof target refuses to start unless the captured Stage A
 create-only plan from #75 is present and verifies:
 
 - `docs/plans/aws-proof.provenance.json`, `aws-proof.plan.txt` and
-  `aws-proof.inputs.sanitized.json` must all be present.
+  `aws-proof.inputs.sanitized.json` must all be present (captures are generated
+  locally with `96bulls plan aws-proof --capture` and are not committed).
 - Each file's SHA-256 must equal the one recorded in the provenance file.
 - The provenance must be captured from a clean commit, for stage `aws-proof`,
-  account `500268966557` and region `us-west-2`.
+  account `<proof-account-id>` and region `us-west-2`.
 - The plan must create `96bulls-aws-proof`.
 - The inputs must name `proof-sessions.agentrelay.com` and pin the services and
   Relaycast image digests.
@@ -282,10 +283,10 @@ credential_process for the length of the lease; every other pin above stays.
 Refused on the sandbox: any other profile (ambient `default`, saved or SSO),
 `AWS_DEFAULT_PROFILE`, static keys mixed with a profile, a shared credentials
 file other than `/dev/null`, and a `PIPPEN_SANDBOX_SESSION_ID` other than
-`--pippen-session` (or a `PIPPEN_SANDBOX_ACCOUNT_ID` other than 361835732085).
+`--pippen-session` (or a `PIPPEN_SANDBOX_ACCOUNT_ID` other than <sandbox-account-id>).
 `pippen sandbox exec --static-credentials` (explicit keys) works as before. The
 caller must still be exactly
-`arn:aws:sts::361835732085:assumed-role/agent-session/agent-<--pippen-session>`.
+`arn:aws:sts::<sandbox-account-id>:assumed-role/agent-session/agent-<--pippen-session>`.
 The proof (sessions-dev) target is unchanged: explicit keys only.
 The stack (`stacks/aws/sandbox-rules.ts`) applies the same lease check:
 `PIPPEN_SANDBOX_SESSION_ID`, when set, must equal
@@ -296,15 +297,15 @@ before every step. It has no override. Any non-dry run against AWS needs all of
 the following:
 
 - `--confirm-live` on the command line;
-- `aws sts get-caller-identity` returns the account `500268966557` (on
-  `--target pippen-sandbox`: `361835732085`, and the ARN is exactly
-  `arn:aws:sts::361835732085:assumed-role/agent-session/agent-<--pippen-session>`). The
+- `aws sts get-caller-identity` returns the account `<proof-account-id>` (on
+  `--target pippen-sandbox`: `<sandbox-account-id>`, and the ARN is exactly
+  `arn:aws:sts::<sandbox-account-id>:assumed-role/agent-session/agent-<--pippen-session>`). The
   harness checks the observed identity, not a configured value;
 - the cluster name is exactly `96bulls-aws-proof`, and the region of every EKS
   ARN (the kube context's cluster entry and the context name itself) is
   `us-west-2`;
 - the kube context points at
-  `arn:aws:eks:<region>:500268966557:cluster/96bulls-aws-proof`;
+  `arn:aws:eks:<region>:<proof-account-id>:cluster/96bulls-aws-proof`;
 - no name is production-shaped. A name containing `prod`, `production`,
   `sessions-dev`, `hosted` or `live` as a segment is refused.
 
@@ -315,12 +316,12 @@ Changing a target means a reviewed code change to `fence.ts`.
 
 | Target | Allowed value |
 | --- | --- |
-| account and region | `500268966557`, `us-west-2` |
-| kube context | `arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-proof` |
+| account and region | `<proof-account-id>`, `us-west-2` |
+| kube context | `arn:aws:eks:us-west-2:<proof-account-id>:cluster/96bulls-aws-proof` |
 | PostgREST (V1 search, #73) | `96bulls/session-directory-postgrest:3000` |
 | probe images | `PROOF_PROBE_IMAGES` (Stage A services image) |
 | ingest host and origin | `proof-sessions.agentrelay.com`, `https://proof-sessions.agentrelay.com` |
-| buckets | `96bulls-aws-proof-locker-500268966557`, `96bulls-aws-proof-hoopdb-backups-500268966557` |
+| buckets | `96bulls-aws-proof-locker-<proof-account-id>`, `96bulls-aws-proof-hoopdb-backups-<proof-account-id>` |
 | release and chart repo | `96bulls`, `https://AgentWorkforce.github.io/helm-charts` |
 | namespaces | `96bulls`, `relayauth`, `relaycast`, `cnpg-system` |
 | namespaces a delete may name | `96bulls`, `relaycast` |
@@ -365,7 +366,7 @@ The fence applies twice:
     - helm must start with `--kube-context` and the same ARN; only `helm show
       values` of the AgentWorkforce charts is exempt.
     - Every aws call must carry exactly `--region us-west-2`. Every ARN must
-      name account `500268966557` and region `us-west-2`.
+      name account `<proof-account-id>` and region `us-west-2`.
     - These are always refused: `-A`, `--all-namespaces`, `--kubeconfig`,
       `--server`, `--token`, `--as`, `--user`, `--cluster`, `--dbname`,
       `--profile`, `--endpoint-url`.
@@ -434,11 +435,11 @@ run, the stage needs:
 
 1. `.96bulls/aws-proof/aws-inputs.json` with the proof account and Khaliq's
    clearance, then `bin/96bulls up aws-proof`. This creates the account
-   baseline (KMS, the versioned Locker bucket `96bulls-aws-proof-locker-500268966557`,
+   baseline (KMS, the versioned Locker bucket `96bulls-aws-proof-locker-<proof-account-id>`,
    CloudTrail, ECR, the deployer role) and EKS with the `96bulls` umbrella chart.
 2. In-cluster HoopDb through CloudNativePG, with `hoopdb.cluster.instances >= 2`
    (failover needs a replica; the chart default is 1) and
-   `hoopdb.cluster.backup.barmanObjectStore` pointing at `96bulls-aws-proof-hoopdb-backups-500268966557` (the
+   `hoopdb.cluster.backup.barmanObjectStore` pointing at `96bulls-aws-proof-hoopdb-backups-<proof-account-id>` (the
    chart default has backups off).
 3. The session directory migrations from #38/#48 applied to that HoopDb
    (`sessions.session_directory.short_summary` and
@@ -491,7 +492,7 @@ redacted excerpt) and every step it planned or ran.
 
 The table lists every command, grouped by check. `R` marks a read. `M*` marks a
 mutating step that needs Khaliq's OK. `<ctx>` stands for `--context
-arn:aws:eks:us-west-2:500268966557:cluster/96bulls-aws-proof`.
+arn:aws:eks:us-west-2:<proof-account-id>:cluster/96bulls-aws-proof`.
 
 ### 1. fresh-install
 
@@ -537,7 +538,7 @@ execution time.
 | R | `kubectl <ctx> -n 96bulls get clusters.postgresql.cnpg.io hoopdb -o jsonpath={.status.currentPrimary}` | CNPG |
 | R | `kubectl <ctx> -n 96bulls exec -i <primary> -c postgres -- psql -d hoopdb -X -At -v ON_ERROR_STOP=1 -f -`, with the SQL on stdin: index rows, stage times, directory rows | HoopDb (read) |
 | R | the same psql call running `BEGIN READ ONLY; SET LOCAL ROLE session_directory_search_worker; set_config('request.jwt.claims', <tenant>) … sessions.search_session_directory(...) … ROLLBACK` | HoopDb (read) |
-| R | `aws s3api list-objects-v2 --bucket 96bulls-aws-proof-locker-500268966557 --prefix v1/ws=<ws>/m=<run machine>/` | Locker (keys only) |
+| R | `aws s3api list-objects-v2 --bucket 96bulls-aws-proof-locker-<proof-account-id> --prefix v1/ws=<ws>/m=<run machine>/` | Locker (keys only) |
 
 ### 3. public-ingress
 
@@ -819,7 +820,7 @@ The teardown runs in two phases:
      No resource tagged `96bulls:stack=aws-proof` may remain; a KMS key in
      `PendingDeletion` is the expected end state. Both proof buckets must
      answer `head-bucket` 404; on the sandbox target so must the stage's own
-     Alchemy state bucket `pippen-sbx-alchemy-state-361835732085-us-west-2-an`
+     Alchemy state bucket `pippen-sbx-alchemy-state-<sandbox-account-id>-us-west-2-an`
      (docs/aws-stage.md, deleted by `pippen sandbox down` with every version).
      On the sandbox target the stage tag is
      `96bulls:stack=aws-proof-sandbox`, and nothing tagged
@@ -848,7 +849,7 @@ trusted:
 - It must be a single unmerged live phase whose run id, timestamp, mode and
   check list match the report.
 - Its target must be exactly the immutable proof target: stage `aws-proof`,
-  cluster `96bulls-aws-proof`, the proof context, account `500268966557` and
+  cluster `96bulls-aws-proof`, the proof context, account `<proof-account-id>` and
   region `us-west-2`. Matching the current run is not enough.
 - A carried `pass` or `unsupported` result must have executed: at least one
   step, and every step `ran`. A planned-only result never counts toward a PASS,
@@ -896,7 +897,7 @@ teardown run, produces one report whose verdict covers both.
 - `bin/96bulls down aws-proof`.
 - For the Pippen sandbox target: `pippen sandbox up aws-proof` (both times),
   `bin/96bulls up aws-proof-sandbox`, and both `pippen sandbox down aws-proof`.
-  The ECR pull grant for `361835732085` was approved and applied on
+  The ECR pull grant for `<sandbox-account-id>` was approved and applied on
   2026-11-01. It is kept by `ecr.pullAccounts` in the aws-sessions-dev inputs
   (docs/aws-stage.md).
 

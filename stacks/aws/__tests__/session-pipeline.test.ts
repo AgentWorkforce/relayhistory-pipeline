@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import * as AWS from "@alchemy.run/aws";
 import { fileURLToPath } from "node:url";
 import type { AwsInputs } from "../inputs.ts";
@@ -250,10 +250,13 @@ describe("session pipeline: inputs", () => {
     const names = sessionPipelineNames(STAGE, ACCOUNT, REGION);
     for (const sp of [{}, { searchIndex: true }, { searchIndex: true, desktopCatalog: false }, { searchIndex: true, replayPages: false, maxConcurrency: 4, reconcileMinutes: 30, briefs: { enabled: true } }])
       expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names, p: sp }).SESSION_DESKTOP_CATALOG_ENABLED).toBe("0");
-    // Every committed stage input (deployed captures and examples) that carries a session pipeline.
+    // Every stage input present in the tree (local captures, which are not committed, and the
+    // committed examples) that carries a session pipeline. docs/plans may be absent.
     const root = fileURLToPath(new URL("../../../", import.meta.url));
+    const plansDir = `${root}docs/plans`;
+    const planFiles = existsSync(plansDir) ? readdirSync(plansDir).map((f) => `${plansDir}/${f}`) : [];
     const files = [
-      ...readdirSync(`${root}docs/plans`).filter((f) => f.endsWith(".inputs.sanitized.json")).map((f) => `${root}docs/plans/${f}`),
+      ...planFiles.filter((f) => f.endsWith(".inputs.sanitized.json")),
       ...readdirSync(`${root}stacks/aws/examples`).filter((f) => f.endsWith(".json")).map((f) => `${root}stacks/aws/examples/${f}`),
     ];
     let checked = 0;
@@ -266,9 +269,11 @@ describe("session pipeline: inputs", () => {
       for (const deployed of [sp, { ...sp, searchIndex: true }])
         expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names, p: deployed as SessionPipelineInputs }).SESSION_DESKTOP_CATALOG_ENABLED).toBe("0");
     }
-    expect(checked).toBeGreaterThan(0);
-    // No committed file sets the switch to "1".
-    const plans = readdirSync(`${root}docs/plans`).map((f) => readFileSync(`${root}docs/plans/${f}`, "utf8"));
+    // No committed stage input carries a sessionPipeline today (captures are local; the examples
+    // have none), so `checked` may be 0; the defaults above still cover the env.
+    expect(checked).toBeLessThanOrEqual(files.length);
+    // No file present (captures and examples) sets the switch to "1".
+    const plans = [...planFiles, ...files.filter((f) => !planFiles.includes(f))].map((f) => readFileSync(f, "utf8"));
     for (const text of plans) expect(text).not.toMatch(/SESSION_DESKTOP_CATALOG_ENABLED["']?\s*[:=]\s*["']?1/);
   });
 

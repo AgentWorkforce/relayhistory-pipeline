@@ -2,7 +2,7 @@
 
 Read-only evidence that relayhistory's legacy out-of-transaction writers have stopped. It covers relayhistory-cloud `docs/buffered-delivery-cutover.md`: "Prerequisite that this source CANNOT establish" and "Historical S3 batch marker bridge".
 
-Run it from the Mini. The wrapper builds credentials in RAM (neonctl owner URL, wrangler OAuth token, the sessions-prod SSO export) and pipes them on stdin:
+Run it from the Mini with `NEON_PROJECT_ID`, `NEON_BRANCH_ID` and `SESSIONS_PROD_ACCOUNT_ID` set (the wrapper forwards the account id to the script); both refuse to run without them. The wrapper builds credentials in RAM (neonctl owner URL, wrangler OAuth token, the sessions-prod SSO export) and pipes them on stdin:
 
 ```
 python3 -I drain-proof-creds.py                                                 # pre-hold baseline (every gate FAILs by design)

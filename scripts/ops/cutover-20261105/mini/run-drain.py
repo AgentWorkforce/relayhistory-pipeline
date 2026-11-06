@@ -1,8 +1,10 @@
 # Mac side orchestrator: pause the replica queue, run the SF drain+apply, ALWAYS resume the queue.
-import json, subprocess, sys
-NEON = ["--project-id", "divine-snow-84812652", "--database-name", "neondb"]
+import json, os, subprocess, sys
+NEON_PROJECT_ID = os.environ.get("NEON_PROJECT_ID") or sys.exit("NEON_PROJECT_ID required")
+NEON_BRANCH_ID = os.environ.get("NEON_BRANCH_ID") or sys.exit("NEON_BRANCH_ID required")
+NEON = ["--project-id", NEON_PROJECT_ID, "--database-name", "neondb"]
 def url(role):
-    out = subprocess.run(["neonctl", "connection-string", "br-damp-mud-apbr6ifp", *NEON, "--role-name", role],
+    out = subprocess.run(["neonctl", "connection-string", NEON_BRANCH_ID, *NEON, "--role-name", role],
                          capture_output=True, text=True, check=True).stdout.strip().splitlines()[-1].strip()
     if not out.startswith(f"postgresql://{role}:"): sys.exit("bad url shape for " + role)
     return out
