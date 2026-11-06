@@ -18,8 +18,13 @@ async function expectCode(p:Promise<unknown>,c:string|RegExp,f?:F){let err:any=n
  *  revisions, cross-claim reuse, selection clear, cross-user refusal, reset, a zero-allocation claim and GC readers. */
 const GEN="a".repeat(64);
 /** strip per-run random identifiers (uuids, leases, timestamps) so outputs compare across independent databases */
-const norm=(v:any):any=>Array.isArray(v)?v.map(norm):v&&typeof v==="object"?Object.fromEntries(Object.entries(v).filter(([k])=>!/token|lease|attempt|until|expires|_at$|At$|generation_id|^initialized_at$/i.test(k)).map(([k,x])=>[k,norm(x)]))
- :typeof v==="string"&&/^[0-9a-f]{8}-[0-9a-f]{4}-/.test(v)?"<uuid>":v;
+const UUID=/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
+const norm=(v:any):any=>Array.isArray(v)?v.map(norm):v&&typeof v==="object"?Object.fromEntries(Object.entries(v)
+  .filter(([k])=>!/token|lease|attempt|until|expires|_at$|At$|generation_id|^initialized_at$/i.test(k))
+  // the stage object's S3 key and byte hash derive from the random claim token (per-run), not from the ledger format
+  .filter(([k])=>!("groupOrdinals" in v&&(k==="key"||k==="sha256")))
+  .map(([k,x])=>[k,norm(x)]))
+ :typeof v==="string"?v.replace(UUID,"<uuid>"):v;
 async function scenario(f:F,flips:Record<string,"v1"|"v2">={}){
  const out:any[]=[];
  const step=async(name:string,fn:()=>Promise<unknown>)=>{if(flips[name])await f.db.query("SELECT sessions.ingest_ack_format_set($1)",[flips[name]]);try{const r:any=await fn();out.push([name,"ok",r?.kind??r?.status??null])}catch(e){out.push([name,"err",code(e,f)])}};
@@ -45,7 +50,7 @@ async function scenario(f:F,flips:Record<string,"v1"|"v2">={}){
  for(const r of stages){try{const j=(await f.db.query("SELECT sessions.ingest_history_native_snapshot($1)::text j",[r.st])).rows[0].j;out.push(["hist",r.batch_id,norm(JSON.parse(j))])}
   catch(e:any){out.push(["hist",r.batch_id,"err",e.message])}}
  await f.db.query("INSERT INTO sessions.ingest_publication_frontiers VALUES($1,$2,$3,'origin-1',$4,$4,clock_timestamp()+interval'1 hour','synthetic','us-east-1','96bulls',$5)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,"b".repeat(64),GEN]);
- for(const r of stages){try{const res:any=await f.db.query("BEGIN;SET LOCAL ROLE bulls96_session_ingest").then(()=>f.db.query("SELECT sessions.ingest_publication_claim($1::jsonb) r",[JSON.stringify({stageToken:r.st,keyRoot:"96bulls",bucket:"synthetic",region:"us-east-1",generation:GEN})]));
+ for(const r of stages){try{const res:any=await f.db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest").then(()=>f.db.query("SELECT sessions.ingest_publication_claim($1::jsonb) r",[JSON.stringify({stageToken:r.st,keyRoot:"96bulls",bucket:"synthetic",region:"us-east-1",generation:GEN})]));
    await f.db.exec("COMMIT");out.push(["pub",r.batch_id,norm(res.rows[0].r)])}catch(e:any){await f.db.exec("ROLLBACK").catch(()=>{});out.push(["pub",r.batch_id,"err",e.message])}}
  return out;
 }
@@ -68,6 +73,28 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
   expect(seatRows.some((r:any)=>r.bodyAccepted===false)).toBe(true);
  });
 
+ test("P4 non-vacuous: 620 snapshot and a real publication claim succeed on clean stages and are byte-equal v1 vs (v1→v2 cutover)",async()=>{
+  const runP4=async(m:Mode,flip:boolean)=>{const f=await fixture(kind,m);const out:any[]=[];try{
+   await f.send("p1",[record({record_id:"a",session_id:"s1"}),record({record_id:"b",session_id:"s1"})]);
+   if(flip)await f.db.query("SELECT sessions.ingest_ack_format_set('v2')");
+   await f.send("p2",[record({record_id:"c",session_id:"s2"}),record({record_id:"d",session_id:"s2"}),record({record_id:"d",revision:2,session_id:"s2"})]);
+   await f.send("p3",[record({record_id:"e",session_id:"s3"}),record({record_id:"b",revision:2,session_id:"s1"})]);
+   await f.db.query("INSERT INTO sessions.ingest_publication_frontiers VALUES($1,$2,$3,'origin-1',$4,$4,clock_timestamp()+interval'1 hour','synthetic','us-east-1','96bulls',$5)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,"b".repeat(64),GEN]);
+   for(const b of ["p1","p2","p3"]){const st=(await f.db.query("SELECT active_stage_token::text st FROM sessions.ingest_buffer_outbox WHERE batch_id=$1",[b])).rows[0].st;
+    try{out.push(["hist",b,norm(JSON.parse((await f.db.query("SELECT sessions.ingest_history_native_snapshot($1)::text j",[st])).rows[0].j))])}catch(e:any){out.push(["hist",b,"err",e.message])}
+    try{await f.db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest");const r=await f.db.query("SELECT sessions.ingest_publication_claim($1::jsonb) r",[JSON.stringify({stageToken:st,keyRoot:"96bulls",bucket:"synthetic",region:"us-east-1",generation:GEN})]);
+     await f.db.exec("COMMIT");out.push(["pub",b,norm(r.rows[0].r)])}catch(e:any){await f.db.exec("ROLLBACK").catch(()=>{});out.push(["pub",b,"err",e.message])}}
+   return out}finally{await f.close()}};
+  const v1=await runP4("baseline",false),v2=await runP4("bridge-v1",true);
+  for(let i=0;i<v1.length;i++)if(JSON.stringify(v1[i])!==JSON.stringify(v2[i]))console.log("P4 DIFF",i,JSON.stringify(v1[i]).slice(0,1500),"\n  v2:",JSON.stringify(v2[i]).slice(0,1500));
+  console.log("P4",JSON.stringify(v1.map(x=>[x[0],x[1],x[2]==="err"?"err: "+x[3]:"ok"])));
+  expect(v2).toEqual(v1);
+  // non-vacuous: all three 620 snapshots and two independent publication claims (one v1-format, one v2-format stage) succeed;
+  // p3 shares p1's session head, so its claim is legitimately refused identically in both formats
+  for(const b of ["p1","p2","p3"])expect(v1.find(x=>x[0]==="hist"&&x[1]===b)![2]).not.toBe("err");
+  for(const b of ["p1","p2"])expect(v1.find(x=>x[0]==="pub"&&x[1]===b)![2]).not.toBe("err");
+ });
+
  test("P2/T6c rollback: v1 → v2 → v1 (dual-aware writer) → v2 … over the same keys ≡ all-v1",async()=>{
   const base=await fixture(kind,"baseline");let ref:any[];try{ref=await scenario(base)}finally{await base.close()}
   const f=await fixture(kind,"bridge-v1");try{
@@ -76,7 +103,7 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    const compat=(await f.db.query("SELECT count(*)::int n FROM sessions.ingest_receipt_seats WHERE compat_vector_claim IS NOT NULL")).rows[0].n;
    const fmts=(await f.db.query("SELECT ack_format,count(*)::int n FROM sessions.ingest_claim_attempts WHERE ack_format IS NOT NULL GROUP BY 1 ORDER BY 1")).rows;
    console.log("T6c eras",JSON.stringify(eras),"compat aliases",compat,"formats",JSON.stringify(fmts));
-   expect(eras).toEqual(["v1","v2","v1","v2","v1","v2"]);expect(fmts.length).toBe(2);
+   expect(eras).toEqual(["v1","v2","v1","v2","v1","v2"]);expect(fmts.length).toBe(2);expect(compat).toBeGreaterThan(0);
    expect(got).toEqual(ref!);
   }finally{await f.close()}
  });
@@ -177,8 +204,11 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    // valid no-op multi-row update passes
    await f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage WHERE key_sha256 IN($1,$2)",[x.key_sha256,y.key_sha256]);
    // seat at or below cutover is refused even if it would otherwise bind (set cutover above it)
-   await f.db.query("INSERT INTO sessions.ingest_ack_format_epochs(epoch,mode,first_seat) VALUES(999,'v1',$1)",[x.current_seat]);
-   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage WHERE key_sha256=$1",[x.key_sha256]),"binding refused");
+   // the era table that gates the validator is append-only and bound to the format row + clock (review M2)
+   await expectCode(f.db.query("INSERT INTO sessions.ingest_ack_format_epochs(epoch,mode,first_seat) VALUES(999,'v1',$1)",[x.current_seat]),"format era must match");
+   await expectCode(f.db.query("UPDATE sessions.ingest_ack_format_epochs SET mode='v1'"),"append-only");
+   await expectCode(f.db.query("DELETE FROM sessions.ingest_ack_format_epochs"),"append-only");
+   await expectCode(f.db.query("TRUNCATE sessions.ingest_ack_format_epochs"),"append-only");
    expect(L.current_legacy_key).not.toBeNull();
   }finally{await f.close()}
  });
@@ -195,12 +225,42 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    await expectCode(f.db.query(`UPDATE sessions.ingest_lazy_native_slots SET current_seat=$1,lineage=$2,current_revision=$3,current_digest=$4,current_source=$5,
      current_session=$6,current_reset_epoch=$7,current_fence_epoch=$8 WHERE record_id='R'`,[first.seat,first.lineage,first.revision,first.candidate_digest,first.source,first.session_id,first.reset_epoch,first.fence_epoch]),"55000");
    expect(await snap()).toEqual(before);
-   // isolate the final-winner binding from the no-regression rule: earlier entry's seat/fields but the current lineage
-   await expectCode(f.db.query(`UPDATE sessions.ingest_lazy_native_slots SET current_seat=$1,current_revision=$2,current_digest=$3 WHERE record_id='R'`,
-     [first.seat,first.revision,first.candidate_digest]),"binding refused");
+   // isolate the final-winner BINDING from the no-regression rule (which also refuses any earlier seat): run the same
+   // update against a test-only validator copy whose regression block is removed; the binding alone must still refuse
+   const vd=(await f.db.query("SELECT pg_get_functiondef('sessions.ack_slot_validate()'::regprocedure) d")).rows[0].d as string;
+   const a0=vd.indexOf(" IF TG_OP='UPDATE' THEN"),a1=vd.indexOf(" ELSIF EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL) THEN");
+   expect(a0>0&&a1>a0).toBe(true);
+   await f.db.exec(vd.slice(0,a0)+" IF TG_OP='UPDATE' THEN NULL;\n"+vd.slice(a1));
+   await expectCode(f.db.query(`UPDATE sessions.ingest_lazy_native_slots SET current_seat=$1,lineage=$2,current_revision=$3,current_digest=$4 WHERE record_id='R'`,
+     [first.seat,first.lineage,first.revision,first.candidate_digest]),"binding refused");
    expect(await snap()).toEqual(before);
    // and the slot's own (final) values pass unchanged
    await f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage WHERE record_id='R'");
+  }finally{await f.close()}
+ });
+
+ test("P10b no regression (review M1): cross-claim winner, v2->v1 pointer, DELETE, identity change, INSERT with a v2 seat",async()=>{
+  const f=await fixture(kind,"bridge-v1");try{
+   await f.send("c0",[record({record_id:"R",revision:1,session_id:"s"})]);                     // v1 seat (key), lineage 1
+   const v1key=(await f.db.query("SELECT current_seat_key k FROM sessions.ingest_lazy_native_slots WHERE record_id='R'")).rows[0].k;
+   await f.db.query("SELECT sessions.ingest_ack_format_set('v2')");
+   await f.send("c1",[record({record_id:"R",revision:2,session_id:"s"})]);                     // v2 winner, lineage 2
+   await f.send("c2",[record({record_id:"R",revision:3,session_id:"s"})]);                     // v2 winner, lineage 3
+   const c1=(await f.db.query("SELECT e.seat::text seat,e.lineage::text lineage,e.revision::text revision,e.candidate_digest,e.source,e.session_id,e.reset_epoch::text re,e.fence_epoch::text fe FROM sessions.ingest_ack_vectors v JOIN sessions.ingest_claim_attempts a USING(claim_token),LATERAL sessions.ingest_ack_entries(v.claim_token) e WHERE a.batch_id='c1'")).rows[0];
+   const snap=async()=>(await f.db.query("SELECT (to_jsonb(n)-'current_seat'-'lineage')::text j,current_seat::text s,lineage::text l FROM sessions.ingest_lazy_native_slots n WHERE record_id='R'")).rows[0];
+   const before=await snap();
+   // earlier CLAIM's final winner, every field matching it (incl. its lineage): binding alone would pass; no-regression refuses
+   await expectCode(f.db.query(`UPDATE sessions.ingest_lazy_native_slots SET current_seat=$1,lineage=$2,current_revision=$3,current_digest=$4,current_source=$5,current_session=$6,
+    current_reset_epoch=$7,current_fence_epoch=$8 WHERE record_id='R'`,[c1.seat,c1.lineage,c1.revision,c1.candidate_digest,c1.source,c1.session_id,c1.re,c1.fe]),"slot regression refused");
+   // v2 -> older v1 pointer, keeping lineage: effective seat moves backwards
+   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET current_seat=NULL,current_seat_key=$1 WHERE record_id='R'",[v1key]),"slot regression refused");
+   // v2 -> older v1 pointer with its lower lineage
+   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET current_seat=NULL,current_seat_key=$1,lineage=1 WHERE record_id='R'",[v1key]),"slot regression refused");
+   await expectCode(f.db.query("DELETE FROM sessions.ingest_lazy_native_slots WHERE record_id='R'"),"never deleted");
+   await expectCode(f.db.query("TRUNCATE sessions.ingest_lazy_native_slots CASCADE"),"never deleted");
+   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET key_sha256=repeat('9',64) WHERE record_id='R'"),"identity is immutable");
+   await expectCode(f.db.query(`INSERT INTO sessions.ingest_lazy_native_slots SELECT (jsonb_populate_record(n,jsonb_build_object('key_sha256',repeat('8',64),'record_id','R2'))).* FROM sessions.ingest_lazy_native_slots n WHERE record_id='R'`),"insert with a v2 seat refused");
+   expect(await snap()).toEqual(before);
   }finally{await f.close()}
  });
 
@@ -263,7 +323,7 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    const before=(await f.db.query("SELECT (SELECT last_seat::text FROM sessions.ingest_receipt_seat_clock) s,(SELECT count(*) FROM sessions.ingest_ack_vectors)::int v")).rows[0];
    if(kind==="pglite"){await expectCode(f.send("rr",[record({record_id:"z",session_id:"s"})]),"READ COMMITTED required",f);await f.db.exec("SET default_transaction_isolation='read committed'")}
    else{const pg=(await import("pg")).default;const c=new pg.Client({connectionString:f.url});await c.connect();
-    try{await expectCode(f.senderOn(c,undefined,iso)("rr",[record({record_id:"z",session_id:"s"})]),/55000|READ COMMITTED required|delivery_unavailable/)}finally{await c.end()}}
+    try{await expectCode(f.senderOn(c,undefined,iso)("rr",[record({record_id:"z",session_id:"s"})]),"READ COMMITTED required",f)}finally{await c.end()}}
    const after=(await f.db.query("SELECT (SELECT last_seat::text FROM sessions.ingest_receipt_seat_clock) s,(SELECT count(*) FROM sessions.ingest_ack_vectors)::int v,(SELECT count(*) FROM sessions.ingest_batches WHERE batch_id='rr' AND state='committed')::int c")).rows[0];
    expect({s:after.s,v:after.v}).toEqual(before);expect(after.c).toBe(0);
   }finally{await f.close()}}
@@ -278,7 +338,7 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    await expectCode(f.db.query("INSERT INTO sessions.ingest_receipt_seats(key_sha256,key_material,seat,first_digest,source,session_id,fence_epoch) VALUES(repeat('1',64),'[]',1,repeat('2',64),'claude','s',0)"),"refused in mode v2");
    await f.db.exec("SET session_replication_role=origin");
    const tg=(await f.db.query("SELECT tgname,tgenabled FROM pg_trigger WHERE tgname LIKE 'ack_%' AND NOT tgisinternal ORDER BY 1")).rows;
-   expect(tg.every((r:any)=>r.tgenabled==="A")).toBe(true);expect(tg.length).toBe(8);
+   expect(tg.every((r:any)=>r.tgenabled==="A")).toBe(true);expect(tg.length).toBe(12);
   }finally{await f.close()}
  });
 

@@ -13,6 +13,7 @@
 import {test,expect,setDefaultTimeout} from "bun:test";
 import pg from "pg";
 import {randomBytes} from "node:crypto";
+import {loadavg,cpus} from "node:os";
 import {fixture,record,type F,type Mode} from "./ack-v2-support.ts";
 setDefaultTimeout(14400000);
 const url=process.env.ACK_V2_TEST_PG_URL;
@@ -81,7 +82,7 @@ test.skipIf(!url)("P7 lock-hold (queued observer) and total ACK latency, v1 vs v
  const res:any={params:{RUNS,HOLD,ROLLBACK,CAL,TOTAL,WARM,recordsPerClaim:REC,writers:4},runs:[]};
  const all:Record<string,Record<string,number[]>>={};
  for(let run=0;run<RUNS;run++)for(const m of (run%2? ["bridge-v2","bridge-v1"]:["bridge-v1","bridge-v2"]) as Mode[]){
-  const f=await fixture("pg",m);ids=0;pool.length=0;revs.clear();
+  const loadStart=loadavg();const f=await fixture("pg",m);ids=0;pool.length=0;revs.clear();
   const fmt=m==="bridge-v1"?"v1":"v2"; // both use the same bridge + barrier path; only the format differs
   await install(f);
   const a=await client(f.url!),ctl=await client(f.url!),obs=await client(f.url!),ws=await Promise.all([0,1,2,3].map(()=>client(f.url!)));
@@ -97,7 +98,7 @@ test.skipIf(!url)("P7 lock-hold (queued observer) and total ACK latency, v1 vs v
    await Promise.all(ws.map((c,w)=>(async()=>{const send=f.senderOn(c,(sql,ms,ok)=>{if(sql.includes("ingest_commit_buffered_batch")&&ok)total.push(ms*1000)});
     for(let i=0;i<per;i++)await send(`t${w}-${i}`,claimRecords(R))})()));
    const cor=(xs:number[])=>xs.map(x=>Math.max(0,x-calMed));
-   const row={run,format:fmt,calibrationUs:stats(cal),holdCommitUs:stats(cor(hold)),holdRollbackUs:stats(cor(rb)),barrierUs:stats(bar),totalCommitUs:stats(total)};
+   const row={run,format:fmt,host:{cpus:cpus().length,loadStart,loadEnd:loadavg()},calibrationUs:stats(cal),holdCommitUs:stats(cor(hold)),holdRollbackUs:stats(cor(rb)),barrierUs:stats(bar),totalCommitUs:stats(total)};
    res.runs.push(row);console.log("P7 run",JSON.stringify(row));
    for(const [k,v] of Object.entries({holdCommit:cor(hold),holdRollback:cor(rb),total})){(all[fmt]??={})[k]=[...((all[fmt]??{})[k]??[]),...v]}
   }finally{for(const c of [a,ctl,obs,...ws])await c.end().catch(()=>{});await f.close()}
@@ -110,6 +111,6 @@ test.skipIf(!url)("P7 lock-hold (queued observer) and total ACK latency, v1 vs v
  const med=(f:string)=>res.runs.filter((r:any)=>r.format===f).map((r:any)=>r.holdCommitUs.p50);
  const cv=(xs:number[])=>{const m=xs.reduce((a,b)=>a+b,0)/xs.length;return Math.sqrt(xs.reduce((a,b)=>a+(b-m)**2,0)/xs.length)/m};
  res.v1MedianCV=+cv(med("v1")).toFixed(3);res.validRun=res.v1MedianCV<=0.15;res.gate=gate;
- res.specCompliant=HOLD>=5000&&RUNS>=3;
+ res.specCompliant=HOLD*RUNS>=5000&&TOTAL*RUNS>=5000&&RUNS>=3;res.samplesPerFormat={holdCommit:HOLD*RUNS,holdRollback:ROLLBACK*RUNS,calibration:CAL*RUNS,total:Math.ceil(TOTAL/4)*4*RUNS};
  console.log("P7 RESULT "+JSON.stringify(res));
 });

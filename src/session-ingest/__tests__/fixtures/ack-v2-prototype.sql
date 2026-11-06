@@ -19,7 +19,17 @@ INSERT INTO sessions.ingest_ack_format(singleton) VALUES(true);
 -- format eras: every seat number belongs to exactly one era (first_seat..next era's first_seat-1); P2/T6c rollback support
 CREATE TABLE sessions.ingest_ack_format_epochs(epoch bigint PRIMARY KEY,mode text NOT NULL CHECK(mode IN('v1','v2')),first_seat bigint NOT NULL,
  changed_at timestamptz NOT NULL DEFAULT clock_timestamp());
-INSERT INTO sessions.ingest_ack_format_epochs VALUES(0,'v1',0);
+INSERT INTO sessions.ingest_ack_format_epochs VALUES(0,'v1',0);   -- genesis (before the guard exists)
+CREATE FUNCTION sessions.ack_era_guard() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $$
+DECLARE m sessions.ingest_ack_format%ROWTYPE;v_last bigint;v_prev bigint;
+BEGIN
+ IF TG_OP<>'INSERT' THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: format eras are append-only';END IF;
+ SELECT * INTO STRICT m FROM sessions.ingest_ack_format WHERE singleton;
+ SELECT last_seat INTO STRICT v_last FROM sessions.ingest_receipt_seat_clock WHERE singleton;
+ SELECT max(first_seat) INTO v_prev FROM sessions.ingest_ack_format_epochs;
+ IF NEW.epoch<>m.epoch OR NEW.mode<>m.mode OR NEW.first_seat<>v_last+1 OR (v_prev IS NOT NULL AND NEW.first_seat<v_prev) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: format era must match the format row and clock';END IF;
+ RETURN NEW;END $$;
 CREATE FUNCTION sessions.ack_seat_era(p_seat bigint) RETURNS text LANGUAGE sql STABLE AS
 $$ SELECT mode FROM sessions.ingest_ack_format_epochs WHERE first_seat<=p_seat ORDER BY first_seat DESC,epoch DESC LIMIT 1 $$;
 
@@ -83,7 +93,7 @@ RETURNS TABLE(idx int,ord int,accepted boolean,allocated boolean,reused boolean,
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $dec$
 DECLARE v sessions.ingest_ack_vectors%ROWTYPE;a sessions.ingest_claim_attempts%ROWTYPE;t sessions.ingest_stage_intents%ROWTYPE;
  b bytea;pos int;len int;i int;f int;lin bigint;off bigint;sh int;x int;k int:=0;o_seat bigint;o_kind int;o_key text;o_claim uuid;o_ord int;fd text;
- j int;ords int[]:='{}';e record;q_ord int[];q_key text[];q_km jsonb[];q_cd text[];q_re bigint[];q_fe bigint[];a_f int[]:='{}';a_lin bigint[]:='{}';a_off bigint[]:='{}';a_os bigint[]:='{}';a_ok int[]:='{}';a_key text[]:='{}';a_oc uuid[]:='{}';a_oo int[]:='{}';a_fd text[]:='{}';
+ j int;nret int:=0;ords int[]:='{}';e record;q_ord int[];q_key text[];q_km jsonb[];q_cd text[];q_re bigint[];q_fe bigint[];a_f int[]:='{}';a_lin bigint[]:='{}';a_off bigint[]:='{}';a_os bigint[]:='{}';a_ok int[]:='{}';a_key text[]:='{}';a_oc uuid[]:='{}';a_oo int[]:='{}';a_fd text[]:='{}';
 BEGIN
  SELECT * INTO v FROM sessions.ingest_ack_vectors WHERE claim_token=p_claim;
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: vector missing';END IF;
@@ -157,7 +167,10 @@ BEGIN
    CASE WHEN d.o_claim=p_claim THEN encode(sha256(convert_to(jsonb_build_array('lazy-ack-seat-v1',q_key[array_position(q_ord,d.o_ord)],d.o_seat::text)::text,'UTF8')),'hex') END own_key
   FROM unnest(ords,a_f,a_lin,a_off,a_os,a_ok,a_key,a_oc,a_oo,a_fd) WITH ORDINALITY d(ord,flags,lineage,off,o_seat,o_kind,o_key,o_claim,o_ord,fd,idx)
   JOIN unnest(q_ord,q_key,q_km,q_cd,q_re,q_fe) WITH ORDINALITY q(ord,ck,km,cd,re,fe,qi) ON q.qi=d.idx AND q.ord=d.ord ORDER BY d.idx LOOP
-  IF e.o_claim=p_claim AND e.own_key IS DISTINCT FROM e.o_key THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: in-claim reuse key mismatch';END IF;
+  IF e.o_claim=p_claim AND (e.own_key IS DISTINCT FROM e.o_key OR (q_km[array_position(q_ord,e.o_ord)]->>7) IS DISTINCT FROM (e.km->>7)
+   OR e.fd IS DISTINCT FROM q_cd[array_position(q_ord,e.o_ord)]) THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: in-claim reuse key mismatch';END IF;
+  nret:=nret+1;
   idx:=e.idx;ord:=e.ord;accepted:=(e.flags&1)=1;allocated:=(e.flags&2)=2;reused:=(e.flags&4)=4;lineage:=e.lineage;
   seat:=CASE WHEN allocated THEN v.seat_lo+(e.off-1) ELSE e.o_seat END;owner_kind:=e.o_kind;owner_claim:=e.o_claim;owner_ord:=e.o_ord;
   candidate_key:=e.ck;key_material:=e.km;candidate_digest:=e.cd;reset_epoch:=e.re;fence_epoch:=e.fe;
@@ -167,6 +180,7 @@ BEGIN
   native_key:=encode(sha256(convert_to(jsonb_build_array('global-native-custody-v1',a.org_id,a.workspace_id,a.origin_id,e.km->>7)::text,'UTF8')),'hex');
   RETURN NEXT;
  END LOOP;
+ IF nret<>v.n THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: decoded row count';END IF;
 END $dec$;
 
 -- Owner of a seat number: v2 vector entry (exactly one, allocated). §11.2 caller requires accepted.
@@ -191,7 +205,8 @@ BEGIN PERFORM sessions.ack_require_rc();
  IF NEW.compat_vector_claim IS NOT NULL THEN  -- compat alias must equal an existing v2 accepted allocation exactly
   SELECT * INTO ow FROM sessions.ingest_ack_seat_owner(NEW.seat);
   IF NOT FOUND OR ow.claim_token<>NEW.compat_vector_claim OR NOT ow.accepted OR NOT ow.allocated OR ow.seat_key<>NEW.key_sha256
-   OR ow.first_digest<>NEW.first_digest OR ow.key_material IS DISTINCT FROM NEW.key_material THEN
+   OR ow.first_digest<>NEW.first_digest OR ow.key_material IS DISTINCT FROM NEW.key_material
+   OR ow.source IS DISTINCT FROM NEW.source OR ow.session_id IS DISTINCT FROM NEW.session_id OR ow.fence_epoch IS DISTINCT FROM NEW.fence_epoch THEN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: compat seat must alias an accepted v2 allocation';END IF;
  ELSIF sessions.ack_seat_era(NEW.seat)<>'v1' THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: v1 seat outside a v1 era';END IF;
@@ -246,6 +261,19 @@ ALTER TABLE sessions.ingest_lazy_native_slots VALIDATE CONSTRAINT ack_slot_point
 CREATE FUNCTION sessions.ack_slot_validate() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $val$
 DECLARE c sessions.ingest_receipt_seat_clock%ROWTYPE;pol sessions.ingest_lazy_policy%ROWTYPE;m sessions.ingest_ack_format%ROWTYPE;v_bad bigint;
 BEGIN
+ IF TG_OP='UPDATE' THEN  -- no regression, for EVERY update (also v2 -> v1 pointer moves): lineage never decreases and the
+  -- effective seat (v2 current_seat or the seat behind a v1 current_seat_key) never moves backwards for the same owner
+  SELECT count(*) INTO v_bad FROM nr JOIN orows o ON o.key_sha256=nr.key_sha256
+   LEFT JOIN sessions.ingest_receipt_seats sn ON sn.key_sha256=nr.current_seat_key
+   LEFT JOIN sessions.ingest_receipt_seats so ON so.key_sha256=o.current_seat_key
+   WHERE nr.lineage<o.lineage OR (nr.current_owner IS NOT DISTINCT FROM o.current_owner
+    AND coalesce(nr.current_seat,sn.seat) IS NOT NULL AND coalesce(o.current_seat,so.seat) IS NOT NULL
+    AND coalesce(nr.current_seat,sn.seat)<coalesce(o.current_seat,so.seat));
+  IF v_bad>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot regression refused';END IF;
+ ELSIF EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL) THEN
+  -- slots are created only by lazy_records (unowned or legacy); a v2 seat is only ever installed by UPDATE
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot insert with a v2 seat refused';
+ END IF;
  IF NOT EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL) THEN RETURN NULL;END IF;
  SELECT * INTO STRICT c FROM sessions.ingest_receipt_seat_clock WHERE singleton;
  SELECT * INTO STRICT pol FROM sessions.ingest_lazy_policy WHERE singleton;
@@ -269,13 +297,17 @@ BEGIN
   OR pol.source_identity_sha256<>c.source_identity_sha256 OR pol.control_epoch<>c.control_epoch
   OR sessions.ack_seat_era(ch.current_seat) IS DISTINCT FROM 'v2';
  IF v_bad>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot current seat binding refused';END IF;
- IF TG_OP='UPDATE' THEN  -- no regression across claims either: lineage never decreases; a v2 seat never moves backwards
-  SELECT count(*) INTO v_bad FROM nr JOIN orows o ON o.key_sha256=nr.key_sha256
-   WHERE nr.lineage<o.lineage OR (nr.current_seat IS NOT NULL AND o.current_seat IS NOT NULL AND nr.current_seat<o.current_seat);
-  IF v_bad>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot regression refused';END IF;
- END IF;
  RETURN NULL;
 END $val$;
+CREATE FUNCTION sessions.ack_slot_identity() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF TG_OP IN('DELETE','TRUNCATE') THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: native slots are never deleted';END IF;
+ IF ROW(NEW.key_sha256,NEW.org_id,NEW.workspace_id,NEW.origin_id,NEW.record_id,NEW.key_material) IS DISTINCT FROM
+    ROW(OLD.key_sha256,OLD.org_id,OLD.workspace_id,OLD.origin_id,OLD.record_id,OLD.key_material) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: native slot identity is immutable';END IF;
+ RETURN NEW;END $$;
+CREATE TRIGGER ack_slot_identity BEFORE UPDATE OR DELETE ON sessions.ingest_lazy_native_slots FOR EACH ROW EXECUTE FUNCTION sessions.ack_slot_identity();
+CREATE TRIGGER ack_slot_truncate BEFORE TRUNCATE ON sessions.ingest_lazy_native_slots FOR EACH STATEMENT EXECUTE FUNCTION sessions.ack_slot_identity();
 CREATE TRIGGER ack_slot_validate_ins AFTER INSERT ON sessions.ingest_lazy_native_slots REFERENCING NEW TABLE AS nr
  FOR EACH STATEMENT EXECUTE FUNCTION sessions.ack_slot_validate();
 CREATE TRIGGER ack_slot_validate_upd AFTER UPDATE ON sessions.ingest_lazy_native_slots REFERENCING OLD TABLE AS orows NEW TABLE AS nr
@@ -660,3 +692,19 @@ ALTER TABLE sessions.ingest_claim_attempts ENABLE ALWAYS TRIGGER ack_attempt_imm
 ALTER TABLE sessions.ingest_receipt_seat_clock ENABLE ALWAYS TRIGGER ack_clock_immutable;
 ALTER TABLE sessions.ingest_lazy_native_slots ENABLE ALWAYS TRIGGER ack_slot_validate_ins;
 ALTER TABLE sessions.ingest_lazy_native_slots ENABLE ALWAYS TRIGGER ack_slot_validate_upd;
+
+CREATE TRIGGER ack_era_guard BEFORE INSERT OR UPDATE OR DELETE ON sessions.ingest_ack_format_epochs FOR EACH ROW EXECUTE FUNCTION sessions.ack_era_guard();
+CREATE TRIGGER ack_era_truncate BEFORE TRUNCATE ON sessions.ingest_ack_format_epochs FOR EACH STATEMENT EXECUTE FUNCTION sessions.ack_era_guard();
+ALTER TABLE sessions.ingest_ack_format_epochs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions.ingest_ack_format_epochs ENABLE ALWAYS TRIGGER ack_era_guard;
+ALTER TABLE sessions.ingest_ack_format_epochs ENABLE ALWAYS TRIGGER ack_era_truncate;
+ALTER TABLE sessions.ingest_lazy_native_slots ENABLE ALWAYS TRIGGER ack_slot_identity;
+ALTER TABLE sessions.ingest_lazy_native_slots ENABLE ALWAYS TRIGGER ack_slot_truncate;
+REVOKE ALL ON sessions.ingest_ack_format_epochs FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+-- defence in depth (minor 3): no direct EXECUTE on any prototype function for app roles
+DO $rv$DECLARE f record;BEGIN
+ FOR f IN SELECT p.oid::regprocedure sig FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+  WHERE n.nspname='sessions' AND (p.proname LIKE 'ack\_%' OR p.proname IN('ingest_ack_entries','ingest_ack_seat_owner','ingest_ack_format_set','ingest_ack_drain_count',
+   'ingest_lazy_ack_batch','ingest_lazy_ack_batch_v1','ingest_lazy_ack_batch_v1r','ingest_lazy_ack_batch_v2','ingest_lazy_stage_seats','ingest_lazy_stage_seats_v1',
+   'ingest_buffer_gc_ordinals','ingest_buffer_gc_ordinals_v1','ingest_lazy_clear'))
+ LOOP EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder',f.sig);END LOOP;END$rv$;

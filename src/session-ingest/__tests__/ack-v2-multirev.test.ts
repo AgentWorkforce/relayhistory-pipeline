@@ -33,7 +33,8 @@ const CASES:Record<string,Step[]>={
  "equal revision, different revision_id, same digest":[f=>f.send("c1",[R(1),R(1,{revision_id:"R:alt"})])],
  "equal revision, same revision_id, different digest":[f=>f.send("c1",[R(1),R(1,{payload:{text:"other"}})])],
  "equal revision, different revision_id and digest (twin)":[f=>f.send("c1",[R(1),R(1,{revision_id:"R:alt",payload:{text:"other"}})])],
- "aliases: same record in two sessions":[f=>f.send("c1",[R(1,{session_id:"sess-A"}),R(2,{session_id:"sess-B"}),R(2,{session_id:"sess-C",revision_id:"R:c"})])],
+ "aliases: same record across three sessions (increasing revisions)":[f=>f.send("c1",[R(1,{session_id:"sess-A"}),R(2,{session_id:"sess-B"}),R(3,{session_id:"sess-C"})])],
+ "aliases: equal revision in two sessions (twin conflict, refused)":[f=>f.send("c1",[R(1,{session_id:"sess-A"}),R(2,{session_id:"sess-B"}),R(2,{session_id:"sess-C",revision_id:"R:c"})])],
  "legacy source current then several revisions":[async f=>f.send("c1",[R(1),R(5),R(7)],{R:await meta(R(5,{payload:{text:"legacy"}}))})],
  "cross-user negative after multi-revision":[f=>f.send("c1",[R(1),R(2)]),f=>f.send("c2",[R(3),R(4)],{},T2)],
  "reset between multi-revision claims":[f=>f.send("c1",[R(4),R(5)]),f=>f.control("reset",{request_id:"rq"}),f=>f.send("c2",[R(1),R(2)])],
@@ -56,6 +57,9 @@ for(const kind of backends)describe("multi-revision on "+kind,()=>{
   const v1=await run(kind,"baseline",steps),v2=await run(kind,"bridge-v2",steps);
   expect(v2).toEqual(v1);
   const dec=v1.find(x=>x[0]==="decisions")![1] as any[];
+  // non-vacuous: every case except the expected-refusal ones produced real decisions and readable seats
+  if(!/twin|refused|same digest$|different revision_id, same digest/.test(name)){expect(dec.length).toBeGreaterThan(0);
+   expect(v1.filter(x=>x[0]==="seats"&&x[2]!=="err").length).toBeGreaterThan(0)}
   console.log(name,"|",JSON.stringify(v1.filter(x=>typeof x[0]==="number")),"| decisions",JSON.stringify(dec.map(d=>[d[0],d[2],d[3],d[5]])));
  });
 });

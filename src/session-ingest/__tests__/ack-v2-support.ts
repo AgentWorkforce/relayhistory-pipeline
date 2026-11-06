@@ -48,17 +48,17 @@ export async function fixture(kind:"pglite"|"pg",mode:Mode,opts:{highWater?:stri
  if(opts.beforeFixture)await opts.beforeFixture((db as any).url);
  if(mode!=="baseline")await db.exec(read(FIXTURE));
  if(mode==="bridge-v2")await db.query("SELECT sessions.ingest_ack_format_set('v2')");
- let lastSql:string|null=null;
  const run=async(s:string,p:unknown[]=[])=>{await db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest");try{const r=await db.query(s,p);await db.exec("COMMIT");return r as never}catch(e:any){lastSql=String(e?.code??"")+" "+String(e?.message??e);await db.exec("ROLLBACK");throw e}};
  const lastSqlError=()=>{const v=lastSql;lastSql=null;return v};
  const ledger=sqlLedger(run,{acceptanceMode:"buffered",expectedGeneration:generation});
  const fs=scratchStore();const deps={ledger,acceptanceMode:"buffered" as const,target:{store:fs.store,keyRoot:"96bulls"}};
  const sign=async(witness:any):Promise<CurrentCustodyPacket>=>{const r=await db.query("SELECT encode(sha256(convert_to($1::jsonb::text,'UTF8')),'hex') AS d",[JSON.stringify(witness)]);return{witness,sourceDigest:r.rows[0]!.d as string}};
  async function version(tenant=TENANT){return String(BigInt((await db.query("SELECT coalesce(max(version),0)::text AS n FROM sessions.ingest_control_receipts WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",[tenant.orgId,tenant.workspaceId,tenant.userId])).rows[0]!.n as string))}
+ let lastSql:string|null=null;
  /** A sender bound to its own connection (for concurrency tests). */
  function senderOn(q:{query(s:string,p?:unknown[]):Promise<any>},onTx?:(sql:string,ms:number,ok:boolean)=>void,iso?:string){
   const r2=async(s:string,p:unknown[]=[])=>{const t0=performance.now();await q.query(iso?"BEGIN ISOLATION LEVEL "+iso:"BEGIN");await q.query("SET LOCAL ROLE bulls96_session_ingest");
-   try{const r=await q.query(s,p);await q.query("COMMIT");onTx?.(s,performance.now()-t0,true);return r as never}catch(e){await q.query("ROLLBACK");onTx?.(s,performance.now()-t0,false);throw e}};
+   try{const r=await q.query(s,p);await q.query("COMMIT");onTx?.(s,performance.now()-t0,true);return r as never}catch(e:any){lastSql=String(e?.code??"")+" "+String(e?.message??e);await q.query("ROLLBACK");onTx?.(s,performance.now()-t0,false);throw e}};
   const l2=sqlLedger(r2,{acceptanceMode:"buffered",expectedGeneration:generation});
   return(id:string,records:any[],current:Record<string,SourceCurrentRecord|null>={},tenant=TENANT,ranks?:number[])=>send(id,records,current,tenant,{...deps,ledger:l2},ranks);
  }

@@ -28,7 +28,7 @@ async function instrument(f:F){
  await f.db.exec(v1);
  let val=await def(f,"sessions.ack_slot_validate()");
  val=patch(val,[["IF NOT EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL) THEN RETURN NULL;END IF;","IF NOT EXISTS(SELECT 1 FROM nr WHERE current_seat IS NOT NULL) THEN RETURN NULL;END IF;"+mark("val_s")],
-  [" IF TG_OP='UPDATE' THEN"," "+mark("val_bound")+" IF TG_OP='UPDATE' THEN"]]);
+  [" IF v_bad>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot current seat binding refused';END IF;"," IF v_bad>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot current seat binding refused';END IF;"+mark("val_bound")]]);
  val=patchLast(val," RETURN NULL;\nEND"," "+mark("val_e")+" RETURN NULL;\nEND");
  await f.db.exec(val);
  let dec=await def(f,"sessions.ingest_ack_entries(uuid)");
