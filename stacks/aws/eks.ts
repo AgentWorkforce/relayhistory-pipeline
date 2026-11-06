@@ -477,7 +477,7 @@ export const eksStage = (i: EksStageInputs) =>
           servicePort: 8080,
           cloudflareTokenSecret: i.ingress.cloudflareTokenSecret,
           ...(i.ingress.certValidation ? { certValidation: i.ingress.certValidation } : {}),
-          exposure: { ...(i.ingress.scheme ? { scheme: i.ingress.scheme } : {}), ...(i.ingress.rateLimitPer5Min !== undefined ? { rateLimitPer5Min: i.ingress.rateLimitPer5Min } : {}) },
+          exposure: { ...(i.ingress.scheme ? { scheme: i.ingress.scheme } : {}), ...(i.ingress.rateLimitPer5Min !== undefined ? { rateLimitPer5Min: i.ingress.rateLimitPer5Min } : {}), ...(i.ingress.ampTransportEnabled !== undefined ? { ampTransportEnabled: i.ingress.ampTransportEnabled } : {}) },
           ...(i.pippenSandbox ? { pippenSandbox: true } : {}),
           tags: i.tags,
         })

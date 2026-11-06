@@ -310,6 +310,8 @@ export interface IngestExposureInput {
   scheme?: IngestScheme;
   /** Requests per source IP per 5 minutes before WAF blocks (WAF minimum 10). */
   rateLimitPer5Min?: number;
+  /** Explicitly expose only the dedicated-token POST Amp endpoint; default disabled. */
+  ampTransportEnabled?: boolean;
 }
 
 export const DEFAULT_INGEST_RATE_LIMIT = 2000;
@@ -340,8 +342,10 @@ export function ingressExposure(i: IngestExposureInput) {
   const rateLimit = i.rateLimitPer5Min ?? DEFAULT_INGEST_RATE_LIMIT;
   if (!Number.isInteger(rateLimit) || rateLimit < 10 || rateLimit > 2_000_000_000)
     throw new Error(`96bulls: eks.ingress.rateLimitPer5Min must be an integer of at least 10, got ${JSON.stringify(i.rateLimitPer5Min)}. Nothing was created.`);
+  if (i.ampTransportEnabled !== undefined && typeof i.ampTransportEnabled !== "boolean")
+    throw new Error("96bulls: eks.ingress.ampTransportEnabled must be a boolean. Nothing was created.");
   // The internet-facing class keeps its existing name, so applying this to a live stage does not replace its ALB.
-  return { scheme, className: scheme === "internal" ? "alb-internal" : "alb-public", rateLimit };
+  return { scheme, className: scheme === "internal" ? "alb-internal" : "alb-public", rateLimit, ...(i.ampTransportEnabled ? { ampTransportEnabled: true as const } : {}) };
 }
 
 const visibility = (name: string) => ({ SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: name });
@@ -382,7 +386,17 @@ export function ingestWafIdentity(stage: string) {
   };
 }
 
-export function ingestWafRules(rateLimit: number) {
+export function ingestWafRules(rateLimit: number, ampTransportEnabled = false) {
+  const operatorPaths = {
+    ByteMatchStatement: {
+      FieldToMatch: { UriPath: {} }, PositionalConstraint: "STARTS_WITH", SearchString: "/v1/internal/",
+      TextTransformations: [{ Priority: 0, Type: "URL_DECODE" }, { Priority: 1, Type: "LOWERCASE" }],
+    },
+  };
+  const ampPost = { AndStatement: { Statements: [
+    { ByteMatchStatement: { FieldToMatch: { UriPath: {} }, PositionalConstraint: "EXACTLY", SearchString: "/v1/internal/amp/operation", TextTransformations: [{ Priority: 0, Type: "NONE" }] } },
+    { ByteMatchStatement: { FieldToMatch: { Method: {} }, PositionalConstraint: "EXACTLY", SearchString: "POST", TextTransformations: [{ Priority: 0, Type: "NONE" }] } },
+  ] } };
   return [
     managed("AWSManagedRulesAmazonIpReputationList", 0),
     managed("AWSManagedRulesKnownBadInputsRuleSet", 1, [...INGEST_WAF_BODY_RULES_COUNTED.AWSManagedRulesKnownBadInputsRuleSet]),
@@ -398,14 +412,9 @@ export function ingestWafRules(rateLimit: number) {
       // Dead-letter list/replay are operator-only (PIPELINE_OPS_SECRET); reach them through port-forward.
       Name: "block-operator-routes",
       Priority: 4,
-      Statement: {
-        ByteMatchStatement: {
-          FieldToMatch: { UriPath: {} },
-          PositionalConstraint: "STARTS_WITH",
-          SearchString: "/v1/internal/",
-          TextTransformations: [{ Priority: 0, Type: "URL_DECODE" }, { Priority: 1, Type: "LOWERCASE" }],
-        },
-      },
+      Statement: ampTransportEnabled
+        ? { AndStatement: { Statements: [operatorPaths, { NotStatement: { Statement: ampPost } }] } }
+        : operatorPaths,
       Action: { Block: {} },
       VisibilityConfig: visibility("block-operator-routes"),
     },

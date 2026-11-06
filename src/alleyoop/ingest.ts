@@ -381,6 +381,7 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
   // Authentication, the tenant org allowlist, the origin rule and the live-write machine
   // gate, in that order, before any /v1 route (routes.ts; tested route by route).
   mountIngestApi(app, { courierManifests, pipeline }, new Hono<AppEnv>(), {
+    ampTransportToken: () => process.env.AMP_TRANSPORT_TOKEN,
     relayhistoryOrigin: env.RELAYHISTORY_ORIGIN,
     allowedOrgIds: allowedOrgIdsFromEnv(process.env.TENANT_ORG_IDS),
   });
@@ -411,7 +412,17 @@ export async function serve() {
     void (async () => {
       try {
         const chunks: Buffer[] = [];
-        for await (const chunk of req) chunks.push(chunk as Buffer);
+        let bodyBytes = 0;
+        const ampTransport = new URL(req.url ?? "/", "http://localhost").pathname === "/v1/internal/amp/operation";
+        for await (const chunk of req) {
+          bodyBytes += (chunk as Buffer).byteLength;
+          if (ampTransport && bodyBytes > 100 * 1024) {
+            res.writeHead(413, { "content-type": "application/json", "cache-control": "no-store" });
+            res.end(JSON.stringify({ error: { code: "request_too_large" } }));
+            return;
+          }
+          chunks.push(chunk as Buffer);
+        }
         const headers = new Headers();
         for (const [k, v] of Object.entries(req.headers)) {
           if (v === undefined) continue;
