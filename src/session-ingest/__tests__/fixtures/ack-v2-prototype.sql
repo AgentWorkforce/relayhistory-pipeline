@@ -774,11 +774,13 @@ ALTER TABLE sessions.ingest_lazy_ack_decisions ENABLE ALWAYS TRIGGER ack_decisio
 REVOKE ALL ON FUNCTION sessions.ack_receipt_immutable() FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
 -- ---------- receipt provenance enforced in SQL (migration-completeness addendum 6a09d424) ----------
+-- SECURITY DEFINER: deferred constraint triggers fire at COMMIT, outside the SECURITY DEFINER RPC, as the session role
+-- (bulls96_session_ingest), which cannot read the ledger tables; argument-less, pinned search_path, owner-only.
 -- Commit-time (DEFERRABLE INITIALLY DEFERRED) because the real v1/v1r writers keep their order:
 -- seat insert -> slot update -> decision insert -> clock advance (lazy:665/673/678/688).
 -- A committed K winner must have exactly ONE body_accepted v1 decision bound to claim/tenant/owner/native key/
 -- seat/lineage/digest/epochs, and its seat must be <= the committed clock in a v1 era (no winner ahead of the clock).
-CREATE FUNCTION sessions.ack_k_provenance() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $kp$
+CREATE FUNCTION sessions.ack_k_provenance() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $kp$
 DECLARE n sessions.ingest_lazy_native_slots%ROWTYPE;s sessions.ingest_receipt_seats%ROWTYPE;v_last bigint;v_ok int;
 BEGIN
  SELECT * INTO n FROM sessions.ingest_lazy_native_slots WHERE key_sha256=NEW.key_sha256;   -- the state AT COMMIT
@@ -800,7 +802,7 @@ CREATE CONSTRAINT TRIGGER ack_k_provenance AFTER UPDATE ON sessions.ingest_lazy_
  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.current_seat_key IS NOT NULL) EXECUTE FUNCTION sessions.ack_k_provenance();
 -- Same provenance for v2 vectors: at commit the range is <= the committed clock and the batch is committed with
 -- this ACK stage active (an owner-inserted vector without the clock advance / receipt cannot become authority).
-CREATE FUNCTION sessions.ack_vector_provenance() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $vp$
+CREATE FUNCTION sessions.ack_vector_provenance() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $vp$
 DECLARE v_last bigint;
 BEGIN
  SELECT last_seat INTO STRICT v_last FROM sessions.ingest_receipt_seat_clock WHERE singleton;
