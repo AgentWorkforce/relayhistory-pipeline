@@ -14,6 +14,13 @@ import {
 } from "../../packages/object-store/src/index.ts";
 import { publishBufferedStage } from "./publication-job.ts";
 import { parsePublicationTicket } from "./publication-rpc.ts";
+import {
+  FRONTIER_PLAN_PROTOCOL,
+  frontierSha256,
+  type CanonicalFrontierRow,
+  type FrontierReadiness,
+  type FrontierReady,
+} from "./frontier-plan.ts";
 import type {
   PublicationRpc,
   PublicationTarget,
@@ -33,6 +40,7 @@ const HOLD_REASONS = new Set<unknown>([
 ]);
 const PLAN_VETO_REASONS = new Set([
   "publication_canary_cross_scope_eligible",
+  "publication_canary_frontier_mismatch",
   "publication_canary_inspection_invalid",
   "publication_canary_inspection_mismatch",
   "publication_canary_plan_refused",
@@ -82,6 +90,19 @@ export interface PublicationCanaryInspection {
   evidenceDigest: string;
   decision: "eligible" | "hold";
   holdReason?: PublicationCanaryHoldReason;
+  frontier: FrontierReadiness;
+}
+export interface PublicationCanaryInspectionRequest {
+  planId: string;
+  ownerId: string;
+  planDigest: string;
+  stageToken: string;
+}
+export interface PublicationCanaryFrontierBinding {
+  captureId: string;
+  evidenceSha256: string;
+  planSha256: string;
+  row: CanonicalFrontierRow;
 }
 export interface PublicationCanaryBinding {
   planId: string;
@@ -89,11 +110,12 @@ export interface PublicationCanaryBinding {
   planDigest: string;
   stageToken: string;
   evidenceDigest: string;
+  frontier: PublicationCanaryFrontierBinding;
 }
 export interface PublicationCanaryAuthority {
   /** Read-only and complete: it must not lease/claim the stage. */
   inspect(
-    input: PublicationCanaryBinding,
+    input: PublicationCanaryInspectionRequest,
     signal: AbortSignal,
   ): Promise<PublicationCanaryInspection>;
   /** Atomically rechecks inspection evidence and binds owner+plan before claim. */
@@ -125,6 +147,7 @@ export type PublicationCanaryOutcome =
       eligibleSessions: number;
       replay: boolean;
       io: PublicationCanaryIo;
+      frontier: PublicationCanaryFrontierBinding;
     }
   | {
       stageToken: string;
@@ -182,17 +205,28 @@ const sameStage = (value: unknown, b: PublicationCanaryStage) => {
   );
 };
 const validInspectionDecision = (inspection: PublicationCanaryInspection) =>
-  inspection.decision === "eligible"
+  validFrontierEnvelope(inspection.frontier) &&
+  (inspection.decision === "eligible"
     ? inspection.holdReason === undefined
-    : inspection.decision === "hold" && HOLD_REASONS.has(inspection.holdReason);
+    : inspection.decision === "hold" && HOLD_REASONS.has(inspection.holdReason));
 const isPlanVeto = (outcome: PublicationCanaryOutcome) =>
   outcome.status === "refused" && PLAN_VETO_REASONS.has(outcome.reason);
-const sameBinding = (a: PublicationCanaryBinding, b: PublicationCanaryBinding) =>
-  a.planId === b.planId &&
-  a.ownerId === b.ownerId &&
-  a.planDigest === b.planDigest &&
-  a.stageToken === b.stageToken &&
-  a.evidenceDigest === b.evidenceDigest;
+const sameBinding = (value: unknown, b: PublicationCanaryBinding) => {
+  if (!value || typeof value !== "object") return false;
+  const a = value as Partial<PublicationCanaryBinding>;
+  return Boolean(
+    a.frontier &&
+      a.planId === b.planId &&
+      a.ownerId === b.ownerId &&
+      a.planDigest === b.planDigest &&
+      a.stageToken === b.stageToken &&
+      a.evidenceDigest === b.evidenceDigest &&
+      a.frontier.captureId === b.frontier.captureId &&
+      a.frontier.evidenceSha256 === b.frontier.evidenceSha256 &&
+      a.frontier.planSha256 === b.frontier.planSha256 &&
+      canonicalFrontierRowEqual(a.frontier.row, b.frontier.row),
+  );
+};
 const targetEqual = (a: PublicationTarget, b: PublicationTarget) =>
   a.bucket === b.bucket &&
   a.region === b.region &&
@@ -200,6 +234,154 @@ const targetEqual = (a: PublicationTarget, b: PublicationTarget) =>
   a.generation === b.generation;
 const boundedInt = (n: unknown, min: number, max: number) =>
   Number.isSafeInteger(n) && Number(n) >= min && Number(n) <= max;
+
+function validFrontierEnvelope(value: unknown): value is FrontierReadiness {
+  if (!value || typeof value !== "object") return false;
+  const frontier = value as Partial<FrontierReadiness>;
+  if (
+    frontier.protocol !== FRONTIER_PLAN_PROTOCOL ||
+    !["hold", "ready"].includes(String(frontier.status))
+  )
+    return false;
+  if (frontier.status === "hold")
+    return (
+      (frontier.captureId === null ||
+        (typeof frontier.captureId === "string" && HEX.test(frontier.captureId))) &&
+      Array.isArray(frontier.reasons) &&
+      frontier.reasons.length > 0 &&
+      Array.isArray(frontier.missingEvidence) &&
+      frontier.missingEvidence.length > 0
+    );
+  const ready = frontier as Partial<FrontierReady>;
+  return (
+    typeof ready.captureId === "string" &&
+    HEX.test(ready.captureId) &&
+    typeof ready.evidenceSha256 === "string" &&
+    HEX.test(ready.evidenceSha256) &&
+    typeof ready.planSha256 === "string" &&
+    HEX.test(ready.planSha256) &&
+    Array.isArray(ready.frontiers)
+  );
+}
+
+const canonicalFrontierRowEqual = (
+  a: unknown,
+  b: CanonicalFrontierRow,
+) => {
+  if (!a || typeof a !== "object") return false;
+  const row = a as Partial<CanonicalFrontierRow>;
+  return (
+    row.org_id === b.org_id &&
+    row.workspace_id === b.workspace_id &&
+    row.user_id === b.user_id &&
+    row.origin_id === b.origin_id &&
+    row.source_frontier_sha256 === b.source_frontier_sha256 &&
+    row.record_maxima_sha256 === b.record_maxima_sha256 &&
+    row.valid_until === b.valid_until &&
+    row.target_bucket === b.target_bucket &&
+    row.target_region === b.target_region &&
+    row.key_root === b.key_root &&
+    row.schema_generation === b.schema_generation
+  );
+};
+
+function frontierBinding(
+  value: unknown,
+  stage: PublicationCanaryStage,
+  plan: PublicationCanaryPlan,
+  now: number,
+): PublicationCanaryFrontierBinding | undefined {
+  if (!validFrontierEnvelope(value) || value.status !== "ready") return undefined;
+  const { planSha256, ...unsigned } = value;
+  try {
+    if (frontierSha256(unsigned) !== planSha256) return undefined;
+  } catch {
+    return undefined;
+  }
+  if (
+    !value.scope ||
+    !value.target ||
+    !sameTenant(value.scope, plan.tenant) ||
+    value.target.bucket !== plan.target.bucket ||
+    value.target.region !== plan.target.region ||
+    value.target.keyRoot !== plan.target.keyRoot ||
+    value.target.schemaGeneration !== plan.target.generation ||
+    !Number.isFinite(Date.parse(value.validUntil)) ||
+    Date.parse(value.validUntil) <= now
+  )
+    return undefined;
+  const identities = new Set<string>();
+  let matched: CanonicalFrontierRow | undefined;
+  for (const candidate of value.frontiers) {
+    const row = candidate as Partial<CanonicalFrontierRow>;
+    if (
+      !row ||
+      typeof row !== "object" ||
+      row.org_id !== value.scope.orgId ||
+      row.workspace_id !== value.scope.workspaceId ||
+      !safeId(row.user_id) ||
+      !safeId(row.origin_id) ||
+      typeof row.source_frontier_sha256 !== "string" ||
+      !HEX.test(row.source_frontier_sha256) ||
+      typeof row.record_maxima_sha256 !== "string" ||
+      !HEX.test(row.record_maxima_sha256) ||
+      row.valid_until !== value.validUntil ||
+      row.target_bucket !== value.target.bucket ||
+      row.target_region !== value.target.region ||
+      row.key_root !== value.target.keyRoot ||
+      row.schema_generation !== value.target.schemaGeneration
+    )
+      return undefined;
+    const identity = `${row.user_id}\0${row.origin_id}`;
+    if (identities.has(identity)) return undefined;
+    identities.add(identity);
+    if (row.user_id === stage.userId && row.origin_id === stage.originId)
+      matched = row as CanonicalFrontierRow;
+  }
+  if (!matched) return undefined;
+  return {
+    captureId: value.captureId,
+    evidenceSha256: value.evidenceSha256,
+    planSha256: value.planSha256,
+    row: matched,
+  };
+}
+
+function persistedFrontierMatches(
+  value: unknown,
+  stage: PublicationCanaryStage,
+  plan: PublicationCanaryPlan,
+): boolean {
+  if (!value || typeof value !== "object") return false;
+  const frontier = value as Partial<PublicationCanaryFrontierBinding>;
+  if (
+    typeof frontier.captureId !== "string" ||
+    !HEX.test(frontier.captureId) ||
+    typeof frontier.evidenceSha256 !== "string" ||
+    !HEX.test(frontier.evidenceSha256) ||
+    typeof frontier.planSha256 !== "string" ||
+    !HEX.test(frontier.planSha256) ||
+    !frontier.row
+  )
+    return false;
+  const row = frontier.row;
+  return (
+    row.org_id === stage.tenant.orgId &&
+    row.workspace_id === stage.tenant.workspaceId &&
+    row.user_id === stage.userId &&
+    row.origin_id === stage.originId &&
+    typeof row.source_frontier_sha256 === "string" &&
+    HEX.test(row.source_frontier_sha256) &&
+    typeof row.record_maxima_sha256 === "string" &&
+    HEX.test(row.record_maxima_sha256) &&
+    typeof row.valid_until === "string" &&
+    Number.isFinite(Date.parse(row.valid_until)) &&
+    row.target_bucket === plan.target.bucket &&
+    row.target_region === plan.target.region &&
+    row.key_root === plan.target.keyRoot &&
+    row.schema_generation === plan.target.generation
+  );
+}
 
 function sessionKeyMatches(
   key: unknown,
@@ -458,7 +640,9 @@ export async function runPublicationCanary(
       !stage ||
       outcome.stageToken !== stageToken ||
       !sameTenant(outcome.tenant, stage.tenant) ||
-      !["held", "published", "refused"].includes(outcome.status)
+      !["held", "published", "refused"].includes(outcome.status) ||
+      (outcome.status === "published" &&
+        !persistedFrontierMatches(outcome.frontier, stage, plan))
     )
       throw refuse("publication_canary_outcome_invalid");
   }
@@ -470,6 +654,7 @@ export async function runPublicationCanary(
     ...(deps.signal ? [deps.signal] : []),
   ]);
   const inspections = new Map<string, PublicationCanaryInspection>();
+  const frontierBindings = new Map<string, PublicationCanaryFrontierBinding>();
   const outcomes = new Map(existing);
   // A triggering refusal is durable before the remaining plan veto outcomes
   // are written. Restore the veto after a crash in that exact interval.
@@ -486,12 +671,11 @@ export async function runPublicationCanary(
     for (const stage of plan.stages) {
       signal.throwIfAborted();
       if (outcomes.has(stage.stageToken)) continue;
-      const partial: PublicationCanaryBinding = {
+      const partial: PublicationCanaryInspectionRequest = {
         planId: plan.planId,
         ownerId: plan.ownerId,
         planDigest,
         stageToken: stage.stageToken,
-        evidenceDigest: "0".repeat(64),
       };
       const value: unknown = await deps.authority.inspect(partial, signal);
       if (
@@ -577,6 +761,29 @@ export async function runPublicationCanary(
       inspections.set(stage.stageToken, inspected);
     }
 
+    if (!planRefused) {
+      const checkedAt = now();
+      for (const stage of plan.stages) {
+        if (outcomes.has(stage.stageToken)) continue;
+        const inspected = inspections.get(stage.stageToken);
+        if (!inspected) continue;
+        const frontier = frontierBinding(inspected.frontier, stage, plan, checkedAt);
+        if (frontier) {
+          frontierBindings.set(stage.stageToken, frontier);
+          continue;
+        }
+        const outcome: PublicationCanaryOutcome = {
+          stageToken: stage.stageToken,
+          status: "refused",
+          tenant: stage.tenant,
+          reason: "publication_canary_frontier_mismatch",
+        };
+        await deps.outcomes.record(planDigest, outcome);
+        outcomes.set(stage.stageToken, outcome);
+        planRefused = true;
+      }
+    }
+
     if (planRefused) {
       for (const stage of plan.stages) {
         if (outcomes.has(stage.stageToken)) continue;
@@ -596,12 +803,15 @@ export async function runPublicationCanary(
       if (outcomes.has(stage.stageToken)) continue;
       const inspected = inspections.get(stage.stageToken);
       if (!inspected) throw refuse("publication_canary_inspection_missing");
+      const frontier = frontierBindings.get(stage.stageToken);
+      if (!frontier) throw refuse("publication_canary_frontier_mismatch");
       const binding: PublicationCanaryBinding = {
         planId: plan.planId,
         ownerId: plan.ownerId,
         planDigest,
         stageToken: stage.stageToken,
         evidenceDigest: inspected.evidenceDigest,
+        frontier,
       };
       let claimed: Awaited<ReturnType<PublicationCanaryAuthority["claim"]>> | undefined;
       let io: PublicationCanaryIo | undefined;
@@ -644,6 +854,7 @@ export async function runPublicationCanary(
           eligibleSessions: result.eligibleSessions,
           replay: result.replay,
           io,
+          frontier,
         };
         await deps.outcomes.record(planDigest, outcome);
         outcomes.set(stage.stageToken, outcome);

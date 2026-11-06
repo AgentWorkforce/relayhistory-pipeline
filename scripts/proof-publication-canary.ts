@@ -18,6 +18,7 @@ import { publishBufferedStage } from "../src/session-ingest/publication-job.ts";
 import { publicationGcLedger, collectPublicationObject } from "../src/session-ingest/publication-gc.ts";
 import { runPublicationCanary, publicationCanaryPlanDigest, type PublicationCanaryAuthority, type PublicationCanaryPlan, type PublicationCanaryStage } from "../src/session-ingest/publication-canary.ts";
 import { openPublicationCanaryOutcomeFile } from "../src/session-ingest/publication-canary-outcomes.ts";
+import { FRONTIER_PLAN_PROTOCOL, frontierSha256, type CanonicalFrontierRow, type FrontierReadiness } from "../src/session-ingest/frontier-plan.ts";
 import { produceCanonicalReplay } from "../src/session-pipeline/replay-publication.ts";
 import { canonicalArtifactPage } from "../src/session-read-api/canonical-artifact-reader.ts";
 import { readCanonicalHistoryPage, type CanonicalHistoryAdapterConfig } from "../src/session-read-api/canonical-history-adapter.ts";
@@ -139,31 +140,49 @@ try {
     stages: [inStage, heldStage],
   };
   const planDigest = publicationCanaryPlanDigest(plan);
-  await owner.query("CREATE TABLE sessions.proof_publication_canary_bindings(plan_id uuid,owner_id text,plan_digest text,stage_token uuid UNIQUE,evidence_digest text,created_at timestamptz DEFAULT clock_timestamp())");
+  await owner.query("CREATE TABLE sessions.proof_publication_canary_bindings(plan_id uuid,owner_id text,plan_digest text,stage_token uuid UNIQUE,evidence_digest text,frontier_plan_sha256 text,frontier_evidence_sha256 text,created_at timestamptz DEFAULT clock_timestamp())");
+  const frontierFromRow = (row: Record<string, unknown>): FrontierReadiness => {
+    const validUntil = (row.valid_until as Date).toISOString();
+    const frontier: CanonicalFrontierRow = {
+      org_id: String(row.org_id), workspace_id: String(row.workspace_id), user_id: String(row.user_id), origin_id: String(row.origin_id),
+      source_frontier_sha256: String(row.source_frontier_sha256), record_maxima_sha256: String(row.record_maxima_sha256), valid_until: validUntil,
+      target_bucket: String(row.target_bucket), target_region: String(row.target_region), key_root: String(row.key_root), schema_generation: String(row.schema_generation),
+    };
+    const captureId = frontierSha256({ protocol: "offline-publication-canary-frontier-proof-v1", frontier });
+    const evidenceSha256 = frontierSha256({ captureId, frontier });
+    const base = {
+      protocol: FRONTIER_PLAN_PROTOCOL, status: "ready" as const, captureId, evidenceSha256,
+      scope: { orgId: frontier.org_id, workspaceId: frontier.workspace_id },
+      target: { bucket: frontier.target_bucket, region: frontier.target_region, keyRoot: frontier.key_root, schemaGeneration: frontier.schema_generation },
+      validUntil, frontiers: [frontier],
+    };
+    return { ...base, planSha256: frontierSha256(base) };
+  };
   const inspectStage = async (token: string) => {
-    const found = await owner.query("SELECT stage_token::text,org_id,workspace_id,user_id,origin_id,stage_sha256,stage_bytes::int FROM sessions.ingest_stage_intents WHERE stage_token=$1", [token]);
+    const found = await owner.query("SELECT s.stage_token::text,s.org_id,s.workspace_id,s.user_id,s.origin_id,s.stage_sha256,s.stage_bytes::int,f.source_frontier_sha256,f.record_maxima_sha256,f.valid_until,f.target_bucket,f.target_region,f.key_root,f.schema_generation FROM sessions.ingest_stage_intents s JOIN sessions.ingest_publication_frontiers f USING(org_id,workspace_id,user_id,origin_id) WHERE s.stage_token=$1", [token]);
     yes(found.rows.length === 1, "inspection_missing");
     const row = found.rows[0];
     const value: PublicationCanaryStage = { stageToken: row.stage_token, tenant: { orgId: row.org_id, workspaceId: row.workspace_id }, userId: row.user_id, originId: row.origin_id, sha256: row.stage_sha256, bytes: row.stage_bytes };
-    return { value, digest: createHash("sha256").update(JSON.stringify(value)).digest("hex") };
+    return { value, digest: createHash("sha256").update(JSON.stringify(value)).digest("hex"), frontier: frontierFromRow(row) };
   };
   const authority: PublicationCanaryAuthority = {
     async inspect(input, signal) {
       signal.throwIfAborted();
       const found = await inspectStage(input.stageToken);
       const inside = found.value.tenant.orgId === plan.tenant.orgId && found.value.tenant.workspaceId === plan.tenant.workspaceId;
-      return { stage: found.value, evidenceDigest: found.digest, decision: inside ? "eligible" : "hold", ...(!inside ? { holdReason: "outside_canary_tenant" as const } : {}) };
+      return { stage: found.value, evidenceDigest: found.digest, frontier: found.frontier, decision: inside ? "eligible" : "hold", ...(!inside ? { holdReason: "outside_canary_tenant" as const } : {}) };
     },
     async claim(input, signal) {
       signal.throwIfAborted();
       try {
         await owner.query("BEGIN");
-        const locked = await owner.query("SELECT stage_token::text,org_id,workspace_id,user_id,origin_id,stage_sha256,stage_bytes::int FROM sessions.ingest_stage_intents WHERE stage_token=$1 FOR SHARE", [input.stageToken]);
+        const locked = await owner.query("SELECT s.stage_token::text,s.org_id,s.workspace_id,s.user_id,s.origin_id,s.stage_sha256,s.stage_bytes::int,f.source_frontier_sha256,f.record_maxima_sha256,f.valid_until,f.target_bucket,f.target_region,f.key_root,f.schema_generation FROM sessions.ingest_stage_intents s JOIN sessions.ingest_publication_frontiers f USING(org_id,workspace_id,user_id,origin_id) WHERE s.stage_token=$1 FOR SHARE OF s,f", [input.stageToken]);
         yes(locked.rows.length === 1, "claim_missing");
         const row = locked.rows[0], value: PublicationCanaryStage = { stageToken: row.stage_token, tenant: { orgId: row.org_id, workspaceId: row.workspace_id }, userId: row.user_id, originId: row.origin_id, sha256: row.stage_sha256, bytes: row.stage_bytes };
         const digest = createHash("sha256").update(JSON.stringify(value)).digest("hex");
-        yes(input.planId === plan.planId && input.ownerId === plan.ownerId && input.planDigest === planDigest && digest === input.evidenceDigest, "claim_binding");
-        await owner.query("INSERT INTO sessions.proof_publication_canary_bindings(plan_id,owner_id,plan_digest,stage_token,evidence_digest)VALUES($1,$2,$3,$4,$5)", [input.planId, input.ownerId, input.planDigest, input.stageToken, input.evidenceDigest]);
+        const currentFrontier = frontierFromRow(row);
+        yes(currentFrontier.status === "ready" && input.planId === plan.planId && input.ownerId === plan.ownerId && input.planDigest === planDigest && digest === input.evidenceDigest && input.frontier.captureId === currentFrontier.captureId && input.frontier.evidenceSha256 === currentFrontier.evidenceSha256 && input.frontier.planSha256 === currentFrontier.planSha256 && JSON.stringify(input.frontier.row) === JSON.stringify(currentFrontier.frontiers[0]), "claim_binding");
+        await owner.query("INSERT INTO sessions.proof_publication_canary_bindings(plan_id,owner_id,plan_digest,stage_token,evidence_digest,frontier_plan_sha256,frontier_evidence_sha256)VALUES($1,$2,$3,$4,$5,$6,$7)", [input.planId, input.ownerId, input.planDigest, input.stageToken, input.evidenceDigest,input.frontier.planSha256,input.frontier.evidenceSha256]);
         await owner.query("SET LOCAL ROLE bulls96_session_ingest");
         const claimed = await owner.query("SELECT sessions.ingest_publication_claim($1::jsonb) result", [JSON.stringify({ stageToken: input.stageToken, keyRoot: target.keyRoot, bucket: target.bucket, region: target.region, generation: target.generation })]);
         await owner.query("RESET ROLE");
@@ -178,9 +197,11 @@ try {
     yes(summary.published === 1 && summary.held === 1 && summary.refused === 0, "canary_summary");
     const pointer = (await owner.query("SELECT * FROM sessions.session_index WHERE org_id=$1 AND deleted_at IS NULL", [tenantA.orgId])).rows[0];
     yes(pointer?.manifest_key.includes("/publications/"), "publication_pointer");
+    const binding = (await owner.query("SELECT frontier_plan_sha256,frontier_evidence_sha256 FROM sessions.proof_publication_canary_bindings WHERE stage_token=$1", [inStage.stageToken])).rows[0];
+    yes(binding?.frontier_plan_sha256 && binding?.frontier_evidence_sha256, "frontier_binding_missing");
     const held = (await owner.query("SELECT state,active_stage_token IS NOT NULL active FROM sessions.ingest_buffer_outbox WHERE org_id=$1", [tenantB.orgId])).rows[0];
     yes(held.state === "buffered" && held.active, "held_stage_mutated");
-    return { planDigest, pointer: pointer.manifest_key, heldStage: heldStage.stageToken };
+    return { planDigest, frontierPlanSha256: binding.frontier_plan_sha256, frontierEvidenceSha256: binding.frontier_evidence_sha256, pointer: pointer.manifest_key, heldStage: heldStage.stageToken };
   });
   const scope = { orgId: tenantA.orgId, workspaceId: tenantA.workspaceId, harness: "claude", sessionId: "session-1" };
   await check("pointer -> directory projector -> replay CAS -> artifact reader -> History adapter", async () => {

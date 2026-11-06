@@ -9,12 +9,14 @@ import {
   publicationCanaryPlanDigest,
   runPublicationCanary,
   type PublicationCanaryAuthority,
+  type PublicationCanaryBinding,
   type PublicationCanaryOutcome,
   type PublicationCanaryOutcomeStore,
   type PublicationCanaryPlan,
   type PublicationCanaryStage,
 } from "../publication-canary.ts";
 import { openPublicationCanaryOutcomeFile } from "../publication-canary-outcomes.ts";
+import { frontierSha256, type FrontierReadiness } from "../frontier-plan.ts";
 import type {
   PublicationRpc,
   PublicationTicket,
@@ -36,6 +38,12 @@ const OUT = {
   sha256: "b".repeat(64),
   bytes: 256,
 } satisfies PublicationCanaryStage;
+const TARGET = {
+  bucket: "fixture-bucket",
+  region: "us-east-1",
+  keyRoot: "96bulls",
+  generation: "c".repeat(64),
+};
 const plan = (stages = [IN, OUT]): PublicationCanaryPlan => {
   const at = Date.now();
   return {
@@ -45,12 +53,7 @@ const plan = (stages = [IN, OUT]): PublicationCanaryPlan => {
     createdAt: new Date(at - 1000).toISOString(),
     expiresAt: new Date(at + 60_000).toISOString(),
     tenant: IN.tenant,
-    target: {
-      bucket: "fixture-bucket",
-      region: "us-east-1",
-      keyRoot: "96bulls",
-      generation: "c".repeat(64),
-    },
+    target: TARGET,
     limits: {
       maxStages: 2,
       maxRecordsPerStage: 10,
@@ -63,6 +66,54 @@ const plan = (stages = [IN, OUT]): PublicationCanaryPlan => {
       maxPutBytes: 1024,
     },
     stages,
+  };
+};
+const readyFrontier = (stage: PublicationCanaryStage): FrontierReadiness => {
+  const validUntil = new Date(Date.now() + 60_000).toISOString();
+  const base = {
+    protocol: "canonical-publication-frontier-plan-v1",
+    status: "ready",
+    captureId: "6".repeat(64),
+    evidenceSha256: "7".repeat(64),
+    scope: stage.tenant,
+    target: {
+      bucket: TARGET.bucket,
+      region: TARGET.region,
+      keyRoot: TARGET.keyRoot,
+      schemaGeneration: TARGET.generation,
+    },
+    validUntil,
+    frontiers: [
+      {
+        org_id: stage.tenant.orgId,
+        workspace_id: stage.tenant.workspaceId,
+        user_id: stage.userId,
+        origin_id: stage.originId,
+        source_frontier_sha256: "9".repeat(64),
+        record_maxima_sha256: "a".repeat(64),
+        valid_until: validUntil,
+        target_bucket: TARGET.bucket,
+        target_region: TARGET.region,
+        key_root: TARGET.keyRoot,
+        schema_generation: TARGET.generation,
+      },
+    ],
+  };
+  return { ...base, planSha256: frontierSha256(base) };
+};
+const rehashReady = (frontier: FrontierReadiness): FrontierReadiness => {
+  if (frontier.status !== "ready") return frontier;
+  const { planSha256: _prior, ...base } = frontier;
+  return { ...base, planSha256: frontierSha256(base) };
+};
+const boundFrontier = (stage: PublicationCanaryStage) => {
+  const frontier = readyFrontier(stage);
+  if (frontier.status !== "ready") throw Error("fixture_ready");
+  return {
+    captureId: frontier.captureId,
+    evidenceSha256: frontier.evidenceSha256,
+    planSha256: frontier.planSha256,
+    row: frontier.frontiers[0]!,
   };
 };
 function ticket(stage = IN): PublicationTicket {
@@ -121,6 +172,7 @@ class MemoryOutcomes implements PublicationCanaryOutcomeStore {
 }
 function fixture(options: { mismatchTicket?: boolean; crossEligible?: boolean } = {}) {
   const calls: string[] = [];
+  const bindings: PublicationCanaryBinding[] = [];
   const outcomes = new MemoryOutcomes();
   const rpc: PublicationRpc = {
     candidates: async () => [],
@@ -154,6 +206,7 @@ function fixture(options: { mismatchTicket?: boolean; crossEligible?: boolean } 
       return {
         stage,
         evidenceDigest: stage.sha256,
+        frontier: readyFrontier(stage),
         decision:
           stage === OUT && !options.crossEligible ? "hold" : "eligible",
         ...(stage === OUT && !options.crossEligible
@@ -163,6 +216,7 @@ function fixture(options: { mismatchTicket?: boolean; crossEligible?: boolean } 
     },
     async claim(input) {
       calls.push(`claim:${input.stageToken}`);
+      bindings.push(input);
       return {
         binding: input,
         ticket: options.mismatchTicket
@@ -172,7 +226,7 @@ function fixture(options: { mismatchTicket?: boolean; crossEligible?: boolean } 
     },
   };
   const raw = { backend: "fs" } as ObjectStore;
-  return { calls, outcomes, rpc, authority, raw };
+  return { calls, bindings, outcomes, rpc, authority, raw };
 }
 
 test("inspects the complete plan before claim, publishes only exact scope, and exposes cross-scope hold", async () => {
@@ -191,6 +245,21 @@ test("inspects the complete plan before claim, publishes only exact scope, and e
     `claim:${IN.stageToken}`,
   ]);
   expect(f.calls).not.toContain(`claim:${OUT.stageToken}`);
+  expect(f.bindings[0]?.frontier).toMatchObject({
+    captureId: "6".repeat(64),
+    evidenceSha256: "7".repeat(64),
+    planSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    row: {
+      org_id: IN.tenant.orgId,
+      workspace_id: IN.tenant.workspaceId,
+      user_id: IN.userId,
+      origin_id: IN.originId,
+      target_bucket: TARGET.bucket,
+      target_region: TARGET.region,
+      key_root: TARGET.keyRoot,
+      schema_generation: TARGET.generation,
+    },
+  });
   expect(f.outcomes.rows.get(OUT.stageToken)).toMatchObject({
     status: "held",
     reason: "outside_canary_tenant",
@@ -287,7 +356,33 @@ test("a persisted plan veto cannot coexist with a published outcome", async () =
     eligibleSessions: 1,
     replay: false,
     io: { reads: 1, readBytes: 1, puts: 1, putBytes: 1 },
+    frontier: boundFrontier(IN),
   });
+  await expect(
+    runPublicationCanary(p, {
+      authority: f.authority,
+      rpc: f.rpc,
+      store: () => f.raw,
+      outcomes: f.outcomes,
+    }),
+  ).rejects.toThrow("publication_canary_outcome_invalid");
+  expect(f.calls).toEqual([]);
+});
+
+test("a legacy published outcome without READY provenance cannot resume", async () => {
+  const f = fixture();
+  const p = plan([IN]);
+  f.outcomes.plan = publicationCanaryPlanDigest(p);
+  f.outcomes.rows.set(IN.stageToken, {
+    stageToken: IN.stageToken,
+    status: "published",
+    tenant: IN.tenant,
+    records: 1,
+    images: 1,
+    eligibleSessions: 1,
+    replay: false,
+    io: { reads: 1, readBytes: 1, puts: 1, putBytes: 1 },
+  } as never);
   await expect(
     runPublicationCanary(p, {
       authority: f.authority,
@@ -303,7 +398,12 @@ test("an unknown inspection decision is durably refused before claim", async () 
   const f = fixture();
   f.authority.inspect = async (input) => {
     f.calls.push(`inspect:${input.stageToken}`);
-    return { stage: IN, evidenceDigest: IN.sha256, decision: "unknown" } as never;
+    return {
+      stage: IN,
+      evidenceDigest: IN.sha256,
+      frontier: readyFrontier(IN),
+      decision: "unknown",
+    } as never;
   };
   const result = await runPublicationCanary(plan([IN]), {
     authority: f.authority,
@@ -317,6 +417,61 @@ test("an unknown inspection decision is durably refused before claim", async () 
     status: "refused",
     reason: "publication_canary_inspection_invalid",
   });
+});
+
+test("a HOLD or mismatched READY frontier can never reach claim", async () => {
+  const cases: Array<(frontier: FrontierReadiness) => FrontierReadiness> = [
+    () => ({
+      protocol: "canonical-publication-frontier-plan-v1",
+      status: "hold",
+      captureId: null,
+      reasons: ["unknown_legacy_fact"],
+      missingEvidence: ["origins[0].recordMaxima"],
+    }),
+    (frontier) => {
+      if (frontier.status !== "ready") throw Error("fixture_ready");
+      return rehashReady({
+        ...frontier,
+        frontiers: [{ ...frontier.frontiers[0]!, user_id: "other-user" }],
+      });
+    },
+    (frontier) => {
+      if (frontier.status !== "ready") throw Error("fixture_ready");
+      return { ...frontier, scope: undefined as never };
+    },
+    (frontier) => {
+      if (frontier.status !== "ready") throw Error("fixture_ready");
+      return rehashReady({
+        ...frontier,
+        target: { ...frontier.target, schemaGeneration: "d".repeat(64) },
+        frontiers: [
+          {
+            ...frontier.frontiers[0]!,
+            schema_generation: "d".repeat(64),
+          },
+        ],
+      });
+    },
+  ];
+  for (const change of cases) {
+    const f = fixture();
+    const inspect = f.authority.inspect.bind(f.authority);
+    f.authority.inspect = async (input, signal) => {
+      const result = await inspect(input, signal);
+      return { ...result, frontier: change(result.frontier) };
+    };
+    const result = await runPublicationCanary(plan([IN]), {
+      authority: f.authority,
+      rpc: f.rpc,
+      store: () => f.raw,
+      outcomes: f.outcomes,
+    });
+    expect(result).toMatchObject({ published: 0, refused: 1, complete: true });
+    expect(f.calls.some((call) => call.startsWith("claim:"))).toBe(false);
+    expect(f.outcomes.rows.get(IN.stageToken)).toMatchObject({
+      reason: "publication_canary_frontier_mismatch",
+    });
+  }
 });
 
 test("abandons a mismatched trusted ticket before constructing a store or reading bytes", async () => {
@@ -333,6 +488,23 @@ test("abandons a mismatched trusted ticket before constructing a store or readin
   });
   expect(result.refused).toBe(1);
   expect(stores).toBe(0);
+  expect(f.calls).toContain("abandon");
+  expect(f.calls).not.toContain("publish");
+});
+
+test("abandons a ticket whose returned frontier binding is malformed", async () => {
+  const f = fixture();
+  f.authority.claim = async (input) => ({
+    binding: { ...input, frontier: undefined } as never,
+    ticket: ticket(IN),
+  });
+  const result = await runPublicationCanary(plan([IN]), {
+    authority: f.authority,
+    rpc: f.rpc,
+    store: () => f.raw,
+    outcomes: f.outcomes,
+  });
+  expect(result.refused).toBe(1);
   expect(f.calls).toContain("abandon");
   expect(f.calls).not.toContain("publish");
 });

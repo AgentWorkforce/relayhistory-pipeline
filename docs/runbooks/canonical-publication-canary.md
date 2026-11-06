@@ -14,9 +14,14 @@ inspects the entire plan before its first claim. An out-of-scope stage must be
 returned as an explicit `outside_canary_tenant` hold; an authority that calls
 it eligible is refused, vetoes every claim in that plan, and is never claimed.
 
-Every in-scope claim must atomically recheck the inspected evidence and bind the
-exact `(owner_id, plan_id, plan_digest, stage_token, evidence_digest)` tuple
-before returning the ordinary trusted publication ticket. The wrapper runs the
+Every in-scope claim requires Frontier A `status: "ready"` and one exact
+`CanonicalFrontierRow` matching the signed stage's org/workspace/user/origin,
+destination and schema generation. It must atomically recheck the inspected
+evidence and bind the exact owner, canary plan, stage, capture, Frontier A
+evidence/plan hashes and 040600 row before returning the ordinary trusted
+publication ticket. A HOLD, missing row, duplicate identity, stale validity or
+scope/target/generation mismatch vetoes the plan; no missing source or maxima
+fact is synthesized. The wrapper runs the
 existing publisher and its source/head/pointer CAS. It reuses the normal RPC
 ticket parser, then independently checks org/workspace/user/origin, stage,
 generation, stage key, head prefixes and plan counts. The object-store view can
@@ -27,7 +32,9 @@ success.
 
 Outcomes are appended to a SHA-256-chained, fsync-backed metadata ledger. The
 ledger is single-writer, rejects symlinks, torn tails, changed plans and changed
-outcomes, and leaves a stale lock as an operator-visible hold. Production must
+outcomes, and leaves a stale lock as an operator-visible hold. Published
+outcomes persist the exact READY binding; a legacy published outcome without
+that provenance cannot resume. Production must
 mount the ledger on durable storage; an ephemeral task filesystem is not an
 accepted source of completion evidence. Restarting the same plan resumes only
 its exact durable outcomes.
@@ -38,7 +45,8 @@ Do not build or run a production entry until the frontier owner supplies a
 reviewed authority implementation of `PublicationCanaryAuthority`:
 
 1. `inspect` is read-only and returns the trusted stage tenant/hash/bytes,
-   eligibility or explicit hold, and a digest over the evidence used.
+   eligibility or explicit hold, a digest over the evidence used, and the
+   typed `FrontierReadiness` produced from the reviewed Frontier A capture.
 2. `claim` locks and rechecks the same evidence, proves the unexpired exact
    owner/plan binding, persists that binding, and claims the stage in the same
    transaction.
