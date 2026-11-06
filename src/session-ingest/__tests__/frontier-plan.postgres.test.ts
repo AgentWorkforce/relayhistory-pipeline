@@ -15,6 +15,7 @@ import {
   evaluateCanonicalFrontier,
   frontierCaptureId,
   frontierExportRootSha256,
+  frontierRecordExportEvidenceSha256,
   frontierScanItemsSha256,
   frontierSha256,
   type CanonicalFrontierCapture,
@@ -51,7 +52,7 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
     try {
       await pool.query(`CREATE SCHEMA ${schema}`);
       await pool.query(`CREATE TABLE ${schema}.authority(source_identity text NOT NULL,source_generation text NOT NULL,source_head text NOT NULL,control_epoch text NOT NULL,privacy_baseline text NOT NULL,privacy_version bigint NOT NULL)`);
-      await pool.query(`CREATE TABLE ${schema}.records(org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,origin_id text NOT NULL,record_id text NOT NULL,revision bigint NOT NULL,revision_id text NOT NULL,digest text NOT NULL,source text NOT NULL,session_id text,operation text NOT NULL,PRIMARY KEY(org_id,workspace_id,origin_id,record_id))`);
+      await pool.query(`CREATE TABLE ${schema}.records(org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,origin_id text NOT NULL,record_id text NOT NULL,revision bigint NOT NULL,revision_id text NOT NULL,digest text NOT NULL,kind text NOT NULL,source text NOT NULL,session_id text,operation text NOT NULL,PRIMARY KEY(org_id,workspace_id,origin_id,record_id))`);
       const baseAuthority: FrontierAuthority = { sourceIdentitySha256: H("pg-source-identity"), sourceGenerationSha256: H("pg-source-generation"), sourceHead: "b".repeat(40), controlEpoch: H("pg-control"), privacyBaselineSha256: H("pg-privacy"), privacyVersion: "19" };
       await pool.query(`INSERT INTO ${schema}.authority VALUES($1,$2,$3,$4,$5,19)`, [baseAuthority.sourceIdentitySha256, baseAuthority.sourceGenerationSha256, baseAuthority.sourceHead, baseAuthority.controlEpoch, baseAuthority.privacyBaselineSha256]);
 
@@ -78,7 +79,7 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
         { async query() { return { rows: [{ r: seedCapture }] } as never; } },
         { store, reader: manifestReader, bucket: bucket!, provider: "s3", prefixFor: org => `${keyRoot}/${org}`,
           decompress: (bytes, max) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: max })) },
-        createS3FrontierVersioningReader({ endpoint: endpoint!, region: "us-east-1", credentials: { accessKeyId: accessKeyId!, secretAccessKey: secretAccessKey! } }),
+        createS3FrontierVersioningReader({ endpoint: endpoint!, allowFixtureEndpoint: true, region: "us-east-1", credentials: { accessKeyId: accessKeyId!, secretAccessKey: secretAccessKey! } }),
         { tenant, generation: "a".repeat(64), sourceHead: "b".repeat(40), source: pointer.harness, sessionId: pointer.session_id,
           keyRoot: `${keyRoot}/${tenant.orgId}`, cachePath: join(cacheDirectory, "frontier.sqlite") },
       );
@@ -121,8 +122,8 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
       expect(source.origins[0]!.recordScan.pageItemCounts).toEqual([1, 0]);
       const closedSource = reconcileLegacyFrontierClosure(source, await captureSource(true));
       expect(closedSource.origins[0]!.recordScan.pageChainSha256).not.toBe(source.origins[0]!.recordScan.pageChainSha256);
-      expect(() => composeCanonicalFrontierCapture(closedSource, { bucket: "canonical-target", region: "us-east-1", keyRoot: "96bulls", schemaGeneration: H("fixture-generation") }, [])).toThrow("frontier_capture_export_lineage");
-      const actualCapture = composeCanonicalFrontierCapture(closedSource, { bucket: "canonical-target", region: "us-east-1", keyRoot: "96bulls", schemaGeneration: H("fixture-generation") }, [evidence]);
+      expect(() => composeCanonicalFrontierCapture(closedSource, { bucket: "canonical-target", region: "us-east-1", keyRoot, schemaGeneration: H("fixture-generation") }, [])).toThrow("frontier_capture_export_lineage");
+      const actualCapture = composeCanonicalFrontierCapture(closedSource, { bucket: "canonical-target", region: "us-east-1", keyRoot, schemaGeneration: H("fixture-generation") }, [evidence]);
       expect(actualCapture.origins[0]!.scans.some(scan => scan.kind === "receipt-decisions")).toBe(false);
       expect(evaluateCanonicalFrontier(actualCapture, { now: new Date("2026-11-06T04:00:05.000Z") })).toMatchObject({ status: "hold", reasons: ["scan_incomplete"], missingEvidence: ["capture.origins[0].scans.receipt-decisions"] });
       await pool.query(`UPDATE ${schema}.delivery_records SET digest=$1`, [H("changed-between-source-scans")]);
@@ -138,7 +139,7 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
       await pool.query(`UPDATE ${schema}.delivery_cutover_control_heads SET pending=true`);
       await expect(captureSource()).rejects.toMatchObject({ code: "frontier_capture_control" });
       await pool.query(`UPDATE ${schema}.delivery_cutover_control_heads SET pending=false`);
-      await pool.query(`INSERT INTO ${schema}.records VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, [tenant.orgId, tenant.workspaceId, tenant.userId, tenant.originId, record.record_id, record.revision, record.revision_id, record.digest, record.source, record.session_id, record.operation]);
+      await pool.query(`INSERT INTO ${schema}.records VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [tenant.orgId, tenant.workspaceId, tenant.userId, tenant.originId, record.record_id, record.revision, record.revision_id, record.digest, record.kind, record.source, record.session_id, record.operation]);
 
       const readAuthority = async (): Promise<FrontierAuthority> => {
         const row = (await pool.query(`SELECT source_identity,source_generation,source_head,control_epoch,privacy_baseline,privacy_version::text FROM ${schema}.authority`)).rows[0];
@@ -161,7 +162,7 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
           snapshot = (await client.query("SELECT txid_current_snapshot()::text snapshot")).rows[0].snapshot;
           let after = "", pages = 0;
           for (;;) {
-            const page = (await client.query(`SELECT org_id,workspace_id,user_id,origin_id,record_id,revision::text,revision_id,digest,source,session_id,operation FROM ${schema}.records WHERE record_id>$1 ORDER BY record_id COLLATE \"C\" LIMIT 1`, [after])).rows;
+            const page = (await client.query(`SELECT org_id,workspace_id,user_id,origin_id,record_id,revision::text,revision_id,digest,kind,source,session_id,operation FROM ${schema}.records WHERE record_id>$1 ORDER BY record_id COLLATE \"C\" LIMIT 1`, [after])).rows;
             pages++;
             if (!page.length) break;
             rows.push(...page); after = page.at(-1)!.record_id;
@@ -173,11 +174,15 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
         finally { client.release(); }
         if (between) await between();
         const closing = await readAuthority();
-        const maxima = rows.map(row => ({
-          tenant: { ...tenant }, recordId: String(row.record_id), revision: String(row.revision), revisionId: String(row.revision_id), digest: String(row.digest),
-          source: String(row.source), sessionId: row.session_id === null ? null : String(row.session_id), operation: row.operation as "upsert" | "delete",
-          authority: "seed-proof" as const, exportRootSha256: frontierExportRootSha256(root),
-        }));
+        const maxima = rows.map(row => {
+          const maximum = {
+            tenant: { ...tenant }, recordId: String(row.record_id), revision: String(row.revision), revisionId: String(row.revision_id), digest: String(row.digest),
+            kind: String(row.kind), source: String(row.source), sessionId: row.session_id === null ? null : String(row.session_id), operation: row.operation as "upsert" | "delete",
+            authority: "seed-proof" as const, exportRootSha256: frontierExportRootSha256(root), exportContentSha256: evidence.records[0]!.evidence.semantic_sha256, exportEvidenceSha256: null as string | null,
+          };
+          maximum.exportEvidenceSha256 = frontierRecordExportEvidenceSha256(maximum);
+          return maximum;
+        });
         const origin: FrontierOriginCapture = { tenant: { ...tenant }, opening, closing, sourceRecordCount: rows.length, privacyRowCount: 1, scans: [], exportRoots: [root], recordMaxima: maxima, receiptDecisions: [] };
         origin.scans = [
           makeScan("record-maxima", [...maxima], opening, closing, snapshot),
@@ -187,7 +192,7 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
         ];
         const value: CanonicalFrontierCapture = {
           protocol: FRONTIER_CAPTURE_PROTOCOL, captureId: "0".repeat(64), startedAt: "2026-11-06T04:00:00.000Z", capturedAt: "2026-11-06T04:00:04.000Z",
-          scope: { orgId: tenant.orgId, workspaceId: tenant.workspaceId }, target: { bucket: "canonical-target", region: "us-east-1", keyRoot: "96bulls", schemaGeneration: H("fixture-generation") },
+          scope: { orgId: tenant.orgId, workspaceId: tenant.workspaceId }, target: { bucket: "canonical-target", region: "us-east-1", keyRoot, schemaGeneration: H("fixture-generation") },
           expectedOrigins: [{ userId: tenant.userId, originId: tenant.originId }], inventoryScan: {} as FrontierScanEvidence, origins: [origin],
         };
         const inventoryOpening = frontierSha256(value.origins.map(item => ({ tenant: item.tenant, authority: item.opening })));
@@ -222,12 +227,19 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
 
       const overlap = structuredClone(full);
       const maximum = overlap.origins[0]!.recordMaxima[0]!; maximum.authority = "receipt-seat";
+      const overlapRoot = overlap.origins[0]!.exportRoots[0]!;
+      overlapRoot.kind = "buffered-stage";
+      overlapRoot.keyRoot = `${overlap.target.keyRoot}/${tenant.orgId}/buffered-batches`;
+      overlapRoot.manifestKey = `${overlapRoot.keyRoot}/stage-fixture.json.zst`;
+      maximum.exportRootSha256 = frontierExportRootSha256(overlapRoot);
+      maximum.exportEvidenceSha256 = frontierRecordExportEvidenceSha256(maximum);
       overlap.origins[0]!.receiptDecisions = [
         { tenant: { ...tenant }, recordId: maximum.recordId, revision: maximum.revision!, revisionId: maximum.revisionId!, source: maximum.source!, sessionId: maximum.sessionId, seat: "41", bodyAccepted: true, candidateDigest: maximum.digest!, firstDigest: maximum.digest! },
         { tenant: { ...tenant }, recordId: maximum.recordId, revision: maximum.revision!, revisionId: "losing-revision", source: "codex", sessionId: "overlap-session", seat: "41", bodyAccepted: false, candidateDigest: H("losing-body"), firstDigest: maximum.digest! },
       ];
       const receiptScan = overlap.origins[0]!.scans.find(scan => scan.kind === "receipt-decisions")!;
       overlap.origins[0]!.scans.find(scan => scan.kind === "record-maxima")!.itemsSha256 = frontierScanItemsSha256("record-maxima", overlap.origins[0]!);
+      overlap.origins[0]!.scans.find(scan => scan.kind === "export-roots")!.itemsSha256 = frontierScanItemsSha256("export-roots", overlap.origins[0]!);
       receiptScan.itemCount = 2; receiptScan.pagesRead = 3; receiptScan.pageItemCounts = [1, 1, 0]; receiptScan.checkpointCount = 2;
       receiptScan.itemsSha256 = frontierScanItemsSha256("receipt-decisions", overlap.origins[0]!);
       overlap.captureId = frontierCaptureId(overlap);

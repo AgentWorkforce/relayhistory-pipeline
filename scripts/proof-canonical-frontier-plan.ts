@@ -58,6 +58,7 @@ const result = {
   runtime: { engine: process.versions.bun ? "bun" : "node", version: process.versions.bun ?? process.version, nodeCompatibility: process.version },
   postgres: serverVersion,
   objectStore: "owned loopback MinIO with signed bucket-versioning read and same-response manifest version",
+  qualification: "actual PG17 transaction + actual manifest/chunk/MinIO bytes; fixed seed RPC response and synthetic source schema; not production closure or actual migrated ingest_seed_scope_capture proof",
   test: "src/session-ingest/__tests__/frontier-plan.postgres.test.ts",
   status: test.status,
   stdout: test.stdout.trim(),

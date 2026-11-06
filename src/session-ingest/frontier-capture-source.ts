@@ -14,6 +14,7 @@ import {
   frontierCaptureId,
   frontierCanonicalJson,
   frontierScanItemsSha256,
+  frontierRecordExportEvidenceSha256,
   frontierSha256,
 } from "./frontier-plan.ts";
 import type { SeedScopeExportEvidence } from "./frontier-plan-source.ts";
@@ -376,8 +377,11 @@ export function composeCanonicalFrontierCapture(source: LegacyFrontierSourceCapt
     const maxima: FrontierRecordMaximum[] = origin.records.map(record => {
       const matches = recordEvidence.filter(item => item.evidence.org_id === record.tenant.orgId && item.evidence.workspace_id === record.tenant.workspaceId && item.evidence.user_id === record.tenant.userId && item.evidence.origin_id === record.tenant.originId && item.evidence.record_id === record.recordId && item.evidence.revision === record.revision && item.evidence.kind === record.kind && item.evidence.source === record.source && item.evidence.session_id === record.sessionId && item.evidence.operation === record.operation);
       if (matches.length !== 1) fail("frontier_capture_export_lineage");
-      return { tenant: record.tenant, recordId: record.recordId, revision: record.revision, revisionId: record.revisionId, digest: record.digest,
-        source: record.source, sessionId: record.sessionId, operation: record.operation, authority: "seed-proof", exportRootSha256: matches[0]!.exportRootSha256 };
+      const maximum: FrontierRecordMaximum = { tenant: record.tenant, recordId: record.recordId, revision: record.revision, revisionId: record.revisionId, digest: record.digest,
+        kind: record.kind, source: record.source, sessionId: record.sessionId, operation: record.operation, authority: "seed-proof", exportRootSha256: matches[0]!.exportRootSha256,
+        exportContentSha256: matches[0]!.evidence.semantic_sha256, exportEvidenceSha256: null };
+      maximum.exportEvidenceSha256 = frontierRecordExportEvidenceSha256(maximum);
+      return maximum;
     });
     if (recordEvidence.length !== maxima.length || roots.reduce((n, root) => n + root.recordCount, 0) !== maxima.length) fail("frontier_capture_export_coverage");
     const exportCounts = closureCounts(roots.length);

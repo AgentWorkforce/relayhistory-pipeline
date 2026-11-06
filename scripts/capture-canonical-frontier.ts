@@ -42,7 +42,7 @@ interface Config {
   scope: { orgId: string; workspaceId: string };
   target: { bucket: string; region: string; keyRoot: string; schemaGeneration: string };
   sourceObjects: { bucket: string; region: string; keyRoot: string; endpoint?: string; accessKeyId: string; secretAccessKey: string };
-  bounds: { pageLimit: number; maxPages: number; maxScopes: number; maxOrigins: number; maxBytes: number };
+  bounds: { pageLimit: number; maxPages: number; maxScopes: number; maxOrigins: number; maxRecords: number; maxBytes: number; maxDurationMs: number };
 }
 
 function config(value: unknown): Config {
@@ -50,7 +50,7 @@ function config(value: unknown): Config {
       !object(value.scope) || !object(value.target) || !object(value.sourceObjects) || !object(value.bounds)) refuse("frontier_capture_config_shape");
   if (!exactKeys(value.scope, ["orgId", "workspaceId"]) || !exactKeys(value.target, ["bucket", "region", "keyRoot", "schemaGeneration"]) ||
       ![["bucket", "region", "keyRoot", "accessKeyId", "secretAccessKey"], ["bucket", "region", "keyRoot", "endpoint", "accessKeyId", "secretAccessKey"]].some(keys => exactKeys(value.sourceObjects as Record<string, unknown>, keys)) ||
-      !exactKeys(value.bounds, ["pageLimit", "maxPages", "maxScopes", "maxOrigins", "maxBytes"])) refuse("frontier_capture_config_shape");
+      !exactKeys(value.bounds, ["pageLimit", "maxPages", "maxScopes", "maxOrigins", "maxRecords", "maxBytes", "maxDurationMs"])) refuse("frontier_capture_config_shape");
   const v = value as unknown as Config;
   if (![v.sourceDatabaseUrl, v.seedDatabaseUrl].every(item => text(item, 8192)) || !text(v.scope.orgId, 512) || typeof v.scope.workspaceId !== "string" || Buffer.byteLength(v.scope.workspaceId) > 512 || CONTROL.test(v.scope.workspaceId) ||
       !text(v.target.bucket, 255) || !text(v.target.region, 63) || !text(v.target.keyRoot, 63) || !HEX64.test(v.target.schemaGeneration) ||
@@ -58,14 +58,16 @@ function config(value: unknown): Config {
       (v.sourceObjects.endpoint !== undefined && !text(v.sourceObjects.endpoint, 2048)) || !IDENT.test(v.sourceObjects.keyRoot) || v.sourceObjects.keyRoot.startsWith("/") || v.sourceObjects.keyRoot.endsWith("/") || v.sourceObjects.keyRoot.split("/").some(part => part === "" || part === "." || part === "..") ||
       !Number.isSafeInteger(v.bounds.pageLimit) || v.bounds.pageLimit < 1 || v.bounds.pageLimit > 1000 || !Number.isSafeInteger(v.bounds.maxPages) || v.bounds.maxPages < 1 || v.bounds.maxPages > 1_000_000 ||
       !Number.isSafeInteger(v.bounds.maxScopes) || v.bounds.maxScopes < 1 || v.bounds.maxScopes > 100_000 || !Number.isSafeInteger(v.bounds.maxOrigins) || v.bounds.maxOrigins < 1 || v.bounds.maxOrigins > 100_000 ||
-      !Number.isSafeInteger(v.bounds.maxBytes) || v.bounds.maxBytes < 1024 || v.bounds.maxBytes > 1024 * 1024 * 1024) refuse("frontier_capture_config_value");
+      !Number.isSafeInteger(v.bounds.maxRecords) || v.bounds.maxRecords < 1 || v.bounds.maxRecords > 10_000_000 || !Number.isSafeInteger(v.bounds.maxBytes) || v.bounds.maxBytes < 1024 || v.bounds.maxBytes > 1024 * 1024 * 1024 ||
+      !Number.isSafeInteger(v.bounds.maxDurationMs) || v.bounds.maxDurationMs < 1 || v.bounds.maxDurationMs > 300_000) refuse("frontier_capture_config_value");
   for (const url of [v.sourceDatabaseUrl, v.seedDatabaseUrl]) {
     const parsed = new URL(url); if (!["postgres:", "postgresql:"].includes(parsed.protocol) || !parsed.hostname || parsed.hash) refuse("frontier_capture_database_url");
   }
   if (v.sourceObjects.endpoint !== undefined) {
     const endpoint = new URL(v.sourceObjects.endpoint);
-    if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) refuse("frontier_capture_object_endpoint");
+    if (!["http:", "https:"].includes(endpoint.protocol) || !["127.0.0.1", "[::1]", "localhost"].includes(endpoint.hostname) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) refuse("frontier_capture_object_endpoint");
   }
+  if (v.sourceObjects.keyRoot !== v.target.keyRoot) refuse("frontier_capture_key_root_mismatch");
   return v;
 }
 
@@ -151,7 +153,7 @@ try {
     credentials: { accessKeyId: input.sourceObjects.accessKeyId, secretAccessKey: input.sourceObjects.secretAccessKey } }));
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: input.sourceObjects.bucket });
   const versioning = createS3FrontierVersioningReader({ endpoint: input.sourceObjects.endpoint, region: input.sourceObjects.region,
-    credentials: { accessKeyId: input.sourceObjects.accessKeyId, secretAccessKey: input.sourceObjects.secretAccessKey } });
+    ...(input.sourceObjects.endpoint ? { allowFixtureEndpoint: true } : {}), credentials: { accessKeyId: input.sourceObjects.accessKeyId, secretAccessKey: input.sourceObjects.secretAccessKey } });
   const requests: Array<{ origin: (typeof sourceOpening.origins)[number]; group: { source: string; sessionId: string }; cachePath: string }> = [];
   for (const origin of sourceOpening.origins) {
     const required = new Map(origin.records.map(record => [frontierCanonicalJson([record.source, record.sessionId]), { source: record.source, sessionId: record.sessionId }]));
@@ -166,7 +168,8 @@ try {
     for (const request of requests) captured.push(await captureSeedScopeExportEvidence(seedSql, { store, reader, bucket: input.sourceObjects.bucket, provider: "s3",
         prefixFor: org => `${input.sourceObjects.keyRoot}/${org}`, decompress: (bytes, max) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: max })) }, versioning,
       { tenant: request.origin.tenant, generation: input.target.schemaGeneration, sourceHead: request.origin.opening.sourceHead!, source: request.group.source, sessionId: request.group.sessionId,
-        keyRoot: `${input.sourceObjects.keyRoot}/${input.scope.orgId}`, cachePath: request.cachePath }));
+        keyRoot: `${input.sourceObjects.keyRoot}/${input.scope.orgId}`, cachePath: request.cachePath,
+        maxRecords: input.bounds.maxRecords, maxEvidenceBytes: input.bounds.maxBytes, maxDurationMs: input.bounds.maxDurationMs }));
     return captured;
   };
   const exportOpening = await captureExports();

@@ -8,11 +8,13 @@ import {
   evaluateCanonicalFrontier,
   frontierCaptureId,
   frontierExportRootSha256,
+  frontierRecordExportEvidenceSha256,
   frontierScanItemsSha256,
   frontierSha256,
   type CanonicalFrontierCapture,
   type FrontierAuthority,
   type FrontierOriginCapture,
+  type FrontierRecordMaximum,
   type FrontierScanEvidence,
   type FrontierScanKind,
 } from "../frontier-plan.ts";
@@ -71,7 +73,7 @@ function reseal(capture: CanonicalFrontierCapture): CanonicalFrontierCapture {
 function readyCapture(): CanonicalFrontierCapture {
   const historicalRoot = {
     tenant: { ...tenant }, kind: "legacy-export" as const, provider: "s3" as const,
-    bucket: "source-versioned", keyRoot: "exports/org-canary", manifestKey: "exports/org-canary/legacy/manifest.json",
+    bucket: "source-versioned", keyRoot: "96bulls/org-canary", manifestKey: "96bulls/org-canary/legacy/manifest.json",
     source: "claude", sessionId: "legacy-session", machineId: "legacy-machine",
     versionId: "v-legacy-1", manifestRevision: "11", contentSha256: H("legacy-object"), recordCount: 1,
     inventoryComplete: true, versioning: "Enabled" as const,
@@ -85,13 +87,14 @@ function readyCapture(): CanonicalFrontierCapture {
   };
   const historicalDigest = frontierExportRootSha256(historicalRoot);
   const bufferedDigest = frontierExportRootSha256(bufferedRoot);
+  const legacyMaximum: FrontierRecordMaximum = { tenant: { ...tenant }, recordId: "legacy-record", revision: "9", revisionId: "legacy-revision-9", digest: H("legacy-body"), kind: "session_event", source: "claude", sessionId: "legacy-session", operation: "upsert", authority: "seed-proof", exportRootSha256: historicalDigest, exportContentSha256: H("legacy-export-content"), exportEvidenceSha256: null };
+  legacyMaximum.exportEvidenceSha256 = frontierRecordExportEvidenceSha256(legacyMaximum);
+  const bufferedMaximum: FrontierRecordMaximum = { tenant: { ...tenant }, recordId: "shared-record", revision: "3", revisionId: "winner-revision", digest: H("winner-body"), kind: "session_event", source: "claude", sessionId: "session-A", operation: "upsert", authority: "receipt-seat", exportRootSha256: bufferedDigest, exportContentSha256: H("winner-body"), exportEvidenceSha256: null };
+  bufferedMaximum.exportEvidenceSha256 = frontierRecordExportEvidenceSha256(bufferedMaximum);
   const origin: FrontierOriginCapture = {
     tenant: { ...tenant }, opening: { ...authority }, closing: { ...authority }, sourceRecordCount: 2, privacyRowCount: 1,
     scans: [], exportRoots: [bufferedRoot, historicalRoot],
-    recordMaxima: [
-      { tenant: { ...tenant }, recordId: "legacy-record", revision: "9", revisionId: "legacy-revision-9", digest: H("legacy-body"), source: "claude", sessionId: "legacy-session", operation: "upsert", authority: "seed-proof", exportRootSha256: historicalDigest },
-      { tenant: { ...tenant }, recordId: "shared-record", revision: "3", revisionId: "winner-revision", digest: H("winner-body"), source: "claude", sessionId: "session-A", operation: "upsert", authority: "receipt-seat", exportRootSha256: bufferedDigest },
-    ],
+    recordMaxima: [legacyMaximum, bufferedMaximum],
     receiptDecisions: [
       { tenant: { ...tenant }, recordId: "shared-record", revision: "3", revisionId: "loser-revision", source: "codex", sessionId: "session-B", seat: "201", bodyAccepted: false, candidateDigest: H("loser-body"), firstDigest: H("winner-body") },
       { tenant: { ...tenant }, recordId: "shared-record", revision: "3", revisionId: "winner-revision", source: "claude", sessionId: "session-A", seat: "201", bodyAccepted: true, candidateDigest: H("winner-body"), firstDigest: H("winner-body") },
@@ -216,6 +219,35 @@ describe("canonical frontier read-only planner", () => {
     ];
     for (const [, mutate, reason] of cases) {
       const capture = readyCapture(); mutate(capture); reseal(capture);
+      expect(evaluateCanonicalFrontier(capture, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining([reason]) });
+    }
+  });
+
+  test("resealed self-consistent root and seat fabrications never become ready", () => {
+    const cases: Array<[(capture: CanonicalFrontierCapture) => void, string]> = [
+      [capture => { capture.origins[0]!.exportRoots[0]!.versionId = "null"; }, "export_not_immutable"],
+      [capture => {
+        const origin = capture.origins[0]!, root = origin.exportRoots.find(item => item.kind === "legacy-export")!;
+        root.source = "unrelated"; root.sessionId = "unrelated-session";
+        const maximum = origin.recordMaxima.find(item => item.authority === "seed-proof")!;
+        maximum.exportRootSha256 = frontierExportRootSha256(root); maximum.exportEvidenceSha256 = frontierRecordExportEvidenceSha256(maximum);
+      }, "record_coverage_incomplete"],
+      [capture => {
+        const origin = capture.origins[0]!, root = origin.exportRoots.find(item => item.kind === "legacy-export")!;
+        root.keyRoot = "exports/foreign-org"; root.manifestKey = "exports/foreign-org/legacy/manifest.json";
+        const maximum = origin.recordMaxima.find(item => item.authority === "seed-proof")!;
+        maximum.exportRootSha256 = frontierExportRootSha256(root); maximum.exportEvidenceSha256 = frontierRecordExportEvidenceSha256(maximum);
+      }, "export_not_immutable"],
+      [capture => {
+        const origin = capture.origins[0]!, root = origin.exportRoots.find(item => item.kind === "buffered-stage")!;
+        root.keyRoot = "96bulls/org-canary/buffered-batches-foreign"; root.manifestKey = `${root.keyRoot}/stage.json.zst`;
+        const maximum = origin.recordMaxima.find(item => item.authority === "receipt-seat")!;
+        maximum.exportRootSha256 = frontierExportRootSha256(root); maximum.exportEvidenceSha256 = frontierRecordExportEvidenceSha256(maximum);
+      }, "export_not_immutable"],
+      [capture => { capture.origins[0]!.receiptDecisions.find(item => !item.bodyAccepted)!.seat = "999"; }, "receipt_decision_conflict"],
+    ];
+    for (const [mutate, reason] of cases) {
+      const capture = readyCapture(); mutate(capture); refreshOriginHashes(capture); reseal(capture);
       expect(evaluateCanonicalFrontier(capture, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining([reason]) });
     }
   });
