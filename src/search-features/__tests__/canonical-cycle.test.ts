@@ -94,7 +94,8 @@ describe("canonical copy cycle (paged contract)", () => {
   test("publish drains all pages, acks each, finish CAS", async () => {
     const ch = fakeCH(), { a, acked, finished } = fakeAcks();
     const out = await copyCanonicalEntry(images(), a, ch,
-      { checkpoint: "0" }, publish(), "target-a");
+      { checkpoint: "0" }, publish(), "target-a",
+      undefined, undefined, true);          // documentPool on -> three pools
     expect(out.kind).toBe("copied");
     expect(out.checkpoint).toBe(REV);
     const rows = ch.inserts.flat();
@@ -156,3 +157,12 @@ describe("canonical copy cycle (paged contract)", () => {
     expect(ch.inserts.length).toBe(0);
   });
 });
+  test("documentPool off keeps the exact two-pool path (030000 RPC)", async () => {
+    const ch = fakeCH(), { a, acked, finished } = fakeAcks();
+    const out = await copyCanonicalEntry(images(), a, ch,
+      { checkpoint: "0" }, publish(), "target-a");   // default off
+    expect(out.kind).toBe("copied");
+    expect(acked.length).toBe(4);       // event+brief only, two pages each
+    expect(acked.every((x) => x.kind !== "document")).toBe(true);
+    expect(finished[0]?.terminalDocument).toBeUndefined();
+  });

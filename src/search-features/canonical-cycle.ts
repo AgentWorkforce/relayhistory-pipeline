@@ -129,6 +129,11 @@ export async function copyCanonicalEntry(
   /** Genuine cancellation: checked at every side-effecting boundary so a
    *  timed-out/aborted op performs zero later CH/ACK/finish effects. */
   signal?: AbortSignal,
+  /** Third (directory-document) pool — default OFF: when false the copy is
+   *  the exact signed-off two-pool path (030000 RPC, event+brief only), the
+   *  materializer's document family is never touched, and terminalDocument
+   *  is undefined. Requires 037000 when true. */
+  documentPool = false,
 ): Promise<CanonicalCycleResult> {
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
@@ -167,12 +172,17 @@ export async function copyCanonicalEntry(
       entry.kind === "publish" ? entry.sourceHash : entry.priorKeysetHash,
   };
   // Resume derives from the durable chain; a complete pool is SKIPPED.
+  const pools = documentPool
+    ? (["event", "brief", "document"] as const)
+    : (["event", "brief"] as const);
   const rs: Record<"event" | "brief" | "document",
       { state: "empty" | "resume" | "complete" | "corrupt";
         cursor: string | null; terminalSha256?: string }> = {
     event: await acks.resumeCursor(entry, "event"),
     brief: await acks.resumeCursor(entry, "brief"),
-    document: await acks.resumeCursor(entry, "document"),
+    document: documentPool
+      ? await acks.resumeCursor(entry, "document")
+      : { state: "empty", cursor: null },
   };
   const insertOnePage = async (
     kind: "event" | "brief" | "document", page: CanonicalImagePage,
@@ -229,7 +239,7 @@ export async function copyCanonicalEntry(
   };
   let total = 0, terminalEvent = "", terminalBrief = "",
       terminalDocument = "";
-  for (const kind of ["event", "brief", "document"] as const) {
+  for (const kind of pools) {
     if (rs[kind].state === "corrupt")
       return { kind: "refused", reason: "corrupt_chain" };
     if (rs[kind].state === "complete") {
@@ -277,7 +287,8 @@ export async function copyCanonicalEntry(
   if (signal?.aborted) return { kind: "refused", reason: "aborted" };
   // finish CAS: terminal descriptors + all page ACKs + still-current authority
   await acks.finish({
-    entry, terminalEvent, terminalBrief, terminalDocument,
+    entry, terminalEvent, terminalBrief,
+    terminalDocument: documentPool ? terminalDocument : undefined,
     sourceAuthority, profileBinding, targetBinding,
   });
   return { kind: "copied", checkpoint: entry.revision, rows: total };

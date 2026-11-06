@@ -70,13 +70,15 @@ const HS1 = "hs1:" + h(["history-scope-v1", CANARY.orgId, CANARY.workspaceId, "h
 const TS = "2026-01-01T00:00:00.000000Z";
 const er = { orgId: CANARY.orgId, workspaceId: CANARY.workspaceId, source: "h", sessionId: "s", machineId: "m", kind: "session_event", eventId: "e1", ts: TS, ingestedAt: TS, userId: "u", actorName: null, actorRole: null, projectId: null, projectFolded: null, taskTitle: null, taskTitleFolded: null, content: null, contentFolded: null, embedding: null, embeddingModel: null, contentHash: null, taskRefText: "r", taskRefTextFolded: "r" };
 const br = { orgId: CANARY.orgId, workspaceId: CANARY.workspaceId, source: "h", sessionId: "s", title: "t", description: "d", titleFolded: "t", descriptionFolded: "d", briefCompletedAt: TS, embedding: null, embeddingModel: null, contentHash: "h" };
+const dr = { orgId: CANARY.orgId, workspaceId: CANARY.workspaceId, source: "h", sessionId: "s", title: "doc", summary: "d", titleFolded: "doc", summaryFolded: "d", projectId: null, lastActivityAt: TS };
 const pg = (rows: unknown[]) =>
   createHash("sha256").update(JSON.stringify(rows)).digest("hex");
 const images = { imageDescriptor: async (e: { imageKey: string }) => ({ imageKey: e.imageKey, sourceHash: A, pointerSetHash: PTR.hash, complete: true }),
   imagePages: async (e: { imageKey: string }, k: string, c: string | null) => {
     if (TRANSFER_ON_FIRST_PAGE && c === null)
       await db.query(`UPDATE sessions.canonical_feature_consumer_lease SET owner='workerB'`);
-    if (c === null) { const rows = k === "event" ? [er] : [br];
+    if (c === null) { const rows = k === "event" ? [er]
+        : k === "brief" ? [br] : [dr];
       return { rows, cursor: "done", source: e.imageKey,
         pointerSetHash: PTR.hash, pageSha256: pg(rows) }; }
     return { rows: [] as unknown[], cursor: null, source: e.imageKey,
@@ -134,6 +136,33 @@ const c2 = new CanonicalConsumer(counting, journal, store,
 const out4 = await c2.drain(images, ch);
 check("different_target_disjoint_partition",
   out4.copied === 0 && out4.checkpoint === "0");
+// 037000 on-case: the third pool drains + the three-terminal finish runs.
+await db.query(readFileSync(
+  "supabase/migrations/20261105037000_session_directory_document_pool.sql",
+  "utf8"));
+// B still holds the canary lease; expire it so the doc-pool owner takes over.
+await db.query(
+  `UPDATE sessions.canonical_feature_consumer_lease` +
+  ` SET heartbeat_at=now() - interval '2 hours'`);
+const cDoc = new CanonicalConsumer(counting, journal, store,
+  { ...CFG, ownerId: "wdoc", documentPool: true });
+const outDoc = await cDoc.drain(images, ch);
+const docAcks = await db.query(
+  "SELECT count(*)::int n FROM sessions.canonical_feature_page_ack" +
+  " WHERE pool='document'");
+check("document_pool_drains_and_finishes",
+  outDoc.copied === 0 && outDoc.checkpoint === "103" &&
+  docAcks.rows[0]?.n === 0);
+// A doc-pool cycle on a FRESH revision copies + acks + finishes all three.
+const DOCSCOPE = { ...SCOPE, generation: "d".repeat(64) };
+await db.query(`INSERT INTO sessions.ingest_history_scope_versions VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [UID, CANARY.orgId, CANARY.workspaceId, "h", "doc-scope", 2, A, PTR.hash, 1]);
+await db.query(`SELECT sessions.canonical_feature_changed($1,$2,$3,$4,$5)`, [JSON.stringify({ ...DOCSCOPE, sessionId: "doc-scope" }), JSON.stringify({ ...AUTH, epoch: "2" }), null, JSON.stringify(PTR), null]);
+const outDoc2 = await cDoc.drain(images, ch);
+const docAcks2 = await db.query(
+  "SELECT count(*)::int n FROM sessions.canonical_feature_page_ack" +
+  " WHERE pool='document'");
+check("document_pool_copies_third_pool",
+  docAcks2.rows[0]?.n > 0);
 // Producer-role ACL: dead-letter is insert-select only.
 const del = await prod.query(
   `DELETE FROM sessions.canonical_feature_consumer_dead_letter`)
