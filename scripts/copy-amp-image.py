@@ -75,7 +75,8 @@ def copy_image(env, run=subprocess.run, auth=memory_auth, clock=time.time):
     target = f"docker://{repo}:sha-{plan['source_sha']}"
     layout = root / "approved-native"
     with auth(env["GITHUB_ACTOR"], env["GH_TOKEN"], env["CF_REGISTRY_TOKEN"]) as (fd, path):
-        options = {"check": True, "pass_fds": (fd,), "env": child_env}
+        options = {"check": True, "pass_fds": (fd,), "env": child_env,
+                   "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
         run(["skopeo", "copy", "--preserve-digests", "--authfile", path,
              f"docker://ghcr.io/agentworkforce/96bulls-services@{native}",
              f"oci:{layout}:approved"], timeout=300, **options)
@@ -83,7 +84,7 @@ def copy_image(env, run=subprocess.run, auth=memory_auth, clock=time.time):
         if "sha256:" + hashlib.sha256(raw).hexdigest() != native:
             raise RuntimeError("Source OCI manifest differs from the signed native descriptor")
         config = run(["skopeo", "inspect", "--config", f"oci:{layout}:approved"],
-                     stdout=subprocess.PIPE, timeout=30, **options)
+                     timeout=30, **options)
         config = json.loads(config.stdout)
         if config.get("os") != "linux" or config.get("architecture") != "amd64":
             raise RuntimeError("Native image platform differs from its verified descriptor")
@@ -92,7 +93,7 @@ def copy_image(env, run=subprocess.run, auth=memory_auth, clock=time.time):
              "--authfile", path, f"oci:{layout}:approved", target], timeout=600, **options)
         for reference in [target, f"docker://{repo}@{native}"]:
             result = run(["skopeo", "inspect", "--raw", "--authfile", path, reference],
-                         stdout=subprocess.PIPE, timeout=60, **options)
+                         timeout=60, **options)
             if not isinstance(result.stdout, bytes) or "sha256:" + hashlib.sha256(result.stdout).hexdigest() != native:
                 raise RuntimeError("Destination manifest differs from the signed native descriptor")
     return {**plan, "cloudflare_image": f"{repo}@{native}", "registry_credential_expires_at": expiry}

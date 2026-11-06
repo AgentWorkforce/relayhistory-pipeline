@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -55,6 +56,17 @@ class AmpImageCopyTests(unittest.TestCase):
         self.assertEqual(self.calls,[])
         with self.assertRaises(RuntimeError): module.copy_image(self.env,self.fake_run,self.auth,lambda:4500)
         self.assertEqual(self.calls,[])
+    def test_failing_registry_client_keeps_capability_url_out_of_inherited_logs(self):
+        sensitive="https://registry.example/upload?credential=fixture-private-upload-capability"
+        def failed(args,**options):
+            self.assertEqual(options.get("stdout"),subprocess.PIPE)
+            self.assertEqual(options.get("stderr"),subprocess.PIPE)
+            return subprocess.run([sys.executable,"-c","import sys; print("+repr(sensitive)+"); print("+repr(sensitive)+",file=sys.stderr); sys.exit(17)"],
+                                  check=True,stdout=options.get("stdout"),stderr=options.get("stderr"),env=options["env"])
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            module.copy_image(self.env,failed,self.auth,lambda:1000)
+        self.assertIn(sensitive.encode(),caught.exception.stdout)
+        self.assertIn(sensitive.encode(),caught.exception.stderr)
     @unittest.skipUnless(hasattr(os,"memfd_create"),"requires Linux copy runner")
     def test_actual_auth_descriptor_has_both_hosts_is_sealed_and_closes(self):
         import fcntl
