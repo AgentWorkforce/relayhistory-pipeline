@@ -34,7 +34,7 @@ async function instrument(f:F){
  let dec=await def(f,"sessions.ingest_ack_entries(uuid)");
  dec=patch(dec,[[" b:=v.vec;len:=octet_length(b);"," "+mark("dec_s")+" b:=v.vec;len:=octet_length(b);"],[" IF a.ack_format IS DISTINCT FROM 2"," "+mark("dec_hashed")+" IF a.ack_format IS DISTINCT FROM 2"],
   [" IF pos<>len THEN"," "+mark("dec_parsed")+" IF pos<>len THEN"]]);
- dec=patchLast(dec," END LOOP;\nEND"," END LOOP;"+mark("dec_e")+"\nEND");
+ dec=patchLast(dec," IF nret<>v.n THEN"," "+mark("dec_e")+" IF nret<>v.n THEN");
  await f.db.exec(dec);
 }
 let ids=0;const pool:string[]=[];const revs=new Map<string,number>();let seed=11>>>0;const R=()=>{seed=(seed*1664525+1013904223)>>>0;return seed/4294967296};
