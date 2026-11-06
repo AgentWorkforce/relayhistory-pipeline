@@ -7,8 +7,12 @@ uses the existing sf-frame CLI temporary login inside the TS process, as frozen-
 
   python3 -I frozen-control-parity-operator.py --head <40-hex> census [--seed-pending-missing]
   python3 -I frozen-control-parity-operator.py --head <40-hex> apply <planSha256> [--seed-pending-missing]
+  python3 -I frozen-control-parity-operator.py --head <40-hex> handoff-census [--settle-seconds N]
+  python3 -I frozen-control-parity-operator.py --head <40-hex> handoff-sync <planSha256> [--settle-seconds N]
+Handoff modes require the live relayhistory-api binding DELIVERY_CUSTODY_SOURCE_MODE=mirror (the fence) before AND
+after the remote run, read with a GET through the existing approved Wrangler OAuth account (as watch-copy-v2.py).
 """
-import datetime, json, pathlib, re, shlex, subprocess, sys, time
+import datetime, json, pathlib, re, shlex, subprocess, sys, time, urllib.request
 from urllib.parse import urlsplit, unquote
 
 ROOT = "/home/khaliqgant/Projects/AgentWorkforce/sessions-pipeline-worktrees/control-parity-seed-5ada92b"
@@ -18,20 +22,60 @@ NEONCTL = ["/opt/homebrew/bin/neonctl", "connection-string", "br-damp-mud-apbr6i
 NEON_HOST = "ep-floral-pond-apkvat38.c-7.us-east-1.aws.neon.tech"
 
 
+USAGE = "usage: --head <40-hex> census|apply <planSha256> [--seed-pending-missing] | handoff-census|handoff-sync <planSha256> [--settle-seconds N]"
+ACCOUNT = "f7232cb80f6fab86a95426302af243e4"
+
+
 def parse(argv):
     a = list(argv)
     if len(a) < 3 or a[0] != "--head" or not re.fullmatch(r"[0-9a-f]{40}", a[1]):
-        raise SystemExit("usage: --head <40-hex> census|apply <planSha256> [--seed-pending-missing]")
+        raise SystemExit(USAGE)
     head, rest = a[1], a[2:]
     pending = "--seed-pending-missing" in rest
     rest = [x for x in rest if x != "--seed-pending-missing"]
+    settle = []
+    if "--settle-seconds" in rest:
+        i = rest.index("--settle-seconds")
+        if i + 1 >= len(rest) or not re.fullmatch(r"[0-9]{2,3}", rest[i + 1]) or not 60 <= int(rest[i + 1]) <= 900:
+            raise SystemExit(USAGE)
+        settle = ["--settle-seconds", rest[i + 1]]
+        rest = rest[:i] + rest[i + 2:]
     if rest == ["census"]:
         args = ["--census"]
     elif len(rest) == 2 and rest[0] == "apply" and re.fullmatch(r"[0-9a-f]{64}", rest[1]):
         args = ["--apply", "--expect-plan", rest[1]]
+    elif rest == ["handoff-census"]:
+        args = ["--handoff-census"]
+    elif len(rest) == 2 and rest[0] == "handoff-sync" and re.fullmatch(r"[0-9a-f]{64}", rest[1]):
+        args = ["--handoff-sync", "--expect-plan", rest[1]]
     else:
-        raise SystemExit("usage: --head <40-hex> census|apply <planSha256> [--seed-pending-missing]")
-    return head, rest[0], args + (["--seed-pending-missing"] if pending else [])
+        raise SystemExit(USAGE)
+    handoff = rest[0].startswith("handoff")
+    if (settle and not handoff) or (pending and handoff):
+        raise SystemExit(USAGE)
+    return head, rest[0], args + settle + (["--seed-pending-missing"] if pending else [])
+
+
+def source_mode():
+    """Read-only GET of the live relayhistory-api binding; approved native Wrangler OAuth only, no fallback."""
+    r = subprocess.run(["/opt/homebrew/bin/wrangler", "auth", "token", "--json"], capture_output=True, text=True, timeout=20)
+    if r.returncode:
+        raise SystemExit("wrangler login unavailable; diagnostic output withheld")
+    token = json.loads(r.stdout).get("token")
+    if not isinstance(token, str) or not 10 < len(token) < 8192:
+        raise SystemExit("wrangler login unavailable")
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **kw):
+            raise SystemExit("source probe redirect refused")
+    url = "https://api.cloudflare.com/client/v4/accounts/" + ACCOUNT + "/workers/scripts/relayhistory-api/settings"
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+    with urllib.request.build_opener(NoRedirect).open(req, timeout=20) as response:
+        value = json.load(response)
+    found = [b for b in (value.get("result") or {}).get("bindings") or [] if b.get("name") == "DELIVERY_CUSTODY_SOURCE_MODE"]
+    if value.get("success") is not True or len(found) != 1 or found[0].get("type") != "plain_text":
+        return None
+    return found[0].get("text")
 
 
 def remote_command(head, args):
@@ -41,6 +85,8 @@ def remote_command(head, args):
 
 def main():
     head, mode, args = parse(sys.argv[1:])
+    if mode.startswith("handoff") and source_mode() != "mirror":
+        raise SystemExit("fence not closed: relayhistory-api DELIVERY_CUSTODY_SOURCE_MODE is not mirror; refusing handoff")
     r = subprocess.run(NEONCTL, capture_output=True, text=True, timeout=60)
     if r.returncode:
         raise SystemExit("Neon credential retrieval failed; diagnostic output withheld")
@@ -71,6 +117,9 @@ def main():
             p.terminate(); p.wait(); raise
         emit(json.dumps({"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "operator": "end", "mode": mode,
                          "seconds": round(time.monotonic() - started, 3), "exit": code}) + "\n")
+        if mode.startswith("handoff") and source_mode() != "mirror":
+            emit(json.dumps({"operator": "FENCE_LOST", "action": "STOP: mirror mode changed during the handoff; result is not evidence"}) + "\n")
+            return 1
     return code
 
 

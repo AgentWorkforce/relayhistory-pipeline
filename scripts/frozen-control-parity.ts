@@ -11,6 +11,11 @@
  *        re-reads both sides under lock, refuses unless the plan hash is unchanged, seeds missing privacy rows
  *        and qualified missing heads exactly, then repairs qualified stale heads. Prints aggregate only.
  * Output never contains identifiers, payloads or credentials; errors print a refusal code or SQLSTATE only.
+ *   bun scripts/frozen-control-parity.ts --handoff-census [--settle-seconds N]
+ *        OPTION B dry run, read-only: two Neon snapshots N s apart (default 120, 60..900) must be identical,
+ *        then the exact-sync plan (pending heads included). Run only with the fence closed (mirror ON, unsealed).
+ *   bun scripts/frozen-control-parity.ts --handoff-sync --expect-plan <planSha256> [--settle-seconds N]
+ *        exact sync under the fence; see src/migration/frozen-control-handoff.ts for the proof and refusals.
  * Exit codes: 0 ok and full parity; 3 ok but HELD categories remain (operator decision); 1 refused/failed; 64 usage.
  */
 import { execFileSync } from "node:child_process";
@@ -19,17 +24,24 @@ import pg from "pg";
 import { parseCliLogin } from "./schema-release-owner-operator-plan.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
 import { applySeedRepair, census, OPERATOR_APP, ParityRefusal } from "../src/migration/frozen-control-parity.ts";
+import { handoffCensus, handoffSync } from "../src/migration/frozen-control-handoff.ts";
 
 const REF = "pyamkrhoyszgzirqqffq", HOST = "aws-0-us-east-1.pooler.supabase.com", CLI = process.env.SUPABASE_CLI ?? "/home/khaliqgant/.local/bin/supabase";
 const args = process.argv.slice(2);
-const usage = (): never => { console.error("usage: --census [--seed-pending-missing] | --apply --expect-plan <sha256> [--seed-pending-missing]"); process.exit(64); };
-const known = new Set(["--census", "--apply", "--expect-plan", "--seed-pending-missing"]);
-const mode = args.includes("--census") ? "census" : args.includes("--apply") ? "apply" : usage();
-if (args.includes("--census") && args.includes("--apply")) usage();
+const usage = (): never => { console.error("usage: --census [--seed-pending-missing] | --apply --expect-plan <sha256> [--seed-pending-missing] | --handoff-census [--settle-seconds N] | --handoff-sync --expect-plan <sha256> [--settle-seconds N]"); process.exit(64); };
+const MODES = ["--census", "--apply", "--handoff-census", "--handoff-sync"] as const;
+const known = new Set<string>([...MODES, "--expect-plan", "--seed-pending-missing", "--settle-seconds"]);
+const picked = MODES.filter((m) => args.includes(m));
+if (picked.length !== 1) usage();
+const mode = picked[0]!.slice(2) as "census" | "apply" | "handoff-census" | "handoff-sync";
 const ei = args.indexOf("--expect-plan"), expect = ei >= 0 ? args[ei + 1] ?? "" : "";
-if (args.some((a, i) => !known.has(a) && !(i === ei + 1 && ei >= 0))) usage();
-if (mode === "apply" ? !/^[0-9a-f]{64}$/u.test(expect) : ei >= 0) usage();
-const opts = { seedPendingMissing: args.includes("--seed-pending-missing") };
+const si = args.indexOf("--settle-seconds"), settleRaw = si >= 0 ? args[si + 1] ?? "" : "120";
+if (args.some((a, i) => !known.has(a) && !(ei >= 0 && i === ei + 1) && !(si >= 0 && i === si + 1))) usage();
+const needsPlan = mode === "apply" || mode === "handoff-sync", handoff = mode.startsWith("handoff");
+if (needsPlan ? !/^[0-9a-f]{64}$/u.test(expect) : ei >= 0) usage();
+if (!/^[0-9]{2,3}$/u.test(settleRaw) || Number(settleRaw) < 60 || Number(settleRaw) > 900 || (si >= 0 && !handoff)) usage();
+if (handoff && args.includes("--seed-pending-missing")) usage();
+const opts = { seedPendingMissing: args.includes("--seed-pending-missing"), settleMs: Number(settleRaw) * 1000 };
 
 // Usage is validated before any credential is read.
 const { neonOwnerUrl } = JSON.parse(readFileSync(0, "utf8").split("\n")[0] || "{}");
@@ -58,8 +70,18 @@ async function supa(readOnly: boolean) {
 async function main() {
   const n = await neon();
   try {
-    const s = await supa(mode === "census");
+    const s = await supa(mode === "census" || mode === "handoff-census");
     try {
+      if (mode === "handoff-census") {
+        const c = await handoffCensus(n, s, opts);
+        log("handoff census", { handoff: c });
+        return c.stable && c.exactParity && !c.handoff.writes && !c.handoff.blocked.length ? 0 : 3;
+      }
+      if (mode === "handoff-sync") {
+        const c = await handoffSync(n, s, expect, opts);
+        log("handoff synced", { handoff: c });
+        return c.exactParity && !c.handoff.writes ? 0 : 3;
+      }
       if (mode === "census") {
         const c = await census(n, s, opts);
         log("census", { census: c });

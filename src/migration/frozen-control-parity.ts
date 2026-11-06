@@ -40,16 +40,16 @@ export interface ParityOptions { seedPendingMissing?: boolean; maxRows?: number 
 export class ParityRefusal extends Error {
   constructor(readonly code: string) { super("control parity: " + code); }
 }
-const refuse = (code: string): never => { throw new ParityRefusal(code); };
-const HEX64 = /^[0-9a-f]{64}$/u;
+export const refuse = (code: string): never => { throw new ParityRefusal(code); };
+export const HEX64 = /^[0-9a-f]{64}$/u;
 const MAX_ROWS = 500_000;
 export const OPERATOR_APP = "p1-frozen-control-parity";
 // Every frozen-source-copy owner connection uses application_name p1-frozen-copy (scripts/frozen-source-copy.ts).
 export const COPY_ACTIVE_SQL = "SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name LIKE 'p1-frozen-copy%' AND pid<>pg_backend_pid()";
-const LOCK_KEY = "SELECT pg_try_advisory_xact_lock(hashtextextended('p1-frozen-control-parity',0)) AS ok";
+export const LOCK_KEY = "SELECT pg_try_advisory_xact_lock(hashtextextended('p1-frozen-control-parity',0)) AS ok";
 
 const HEAD_COLS = "org_id,workspace_id,user_id,epoch,version::text AS version,digest,kind,payload::text AS payload,pending,before_privacy::text AS before_privacy,privacy_version::text AS privacy_version";
-const DEL_COLS = "org_id,workspace_id,user_id,origin_id,source,session_id";
+export const DEL_COLS = "org_id,workspace_id,user_id,origin_id,source,session_id";
 const RESET_COLS = "org_id,workspace_id,user_id,request_id,deleted::text AS deleted";
 export const NEON_SQL = {
   status: "SELECT sessions.delivery_cutover_status() AS s",
@@ -106,14 +106,14 @@ export async function readMirror(supa: Queryable, opts: ParityOptions = {}): Pro
 }
 
 // JSON arrays make keys unambiguous (no separator collisions with arbitrary identifier text).
-const headKey = (h: { org_id: string; workspace_id: string; user_id: string }) => JSON.stringify([h.org_id, h.workspace_id, h.user_id]);
-const delKey = (d: Deletion) => JSON.stringify([d.org_id, d.workspace_id, d.user_id, d.origin_id, d.source, d.session_id]);
-const resetKey = (r: Reset) => JSON.stringify([r.org_id, r.workspace_id, r.user_id, r.request_id]);
+export const headKey = (h: { org_id: string; workspace_id: string; user_id: string }) => JSON.stringify([h.org_id, h.workspace_id, h.user_id]);
+export const delKey = (d: Deletion) => JSON.stringify([d.org_id, d.workspace_id, d.user_id, d.origin_id, d.source, d.session_id]);
+export const resetKey = (r: Reset) => JSON.stringify([r.org_id, r.workspace_id, r.user_id, r.request_id]);
 const headCore = (h: Head) => JSON.stringify([headKey(h), h.version, h.digest, h.pending]); // exactly what --seal compares
-const headFull = (h: Head) => JSON.stringify([headKey(h), h.epoch, h.version, h.digest, h.kind, h.payload, h.pending, h.before_privacy, h.privacy_version]);
-const sha = (s: string) => createHash("sha256").update(s).digest("hex");
-const setSha = (lines: string[]) => sha([...lines].sort().join("\n"));
-const byKey = <T>(rows: T[], key: (r: T) => string) => {
+export const headFull = (h: Head) => JSON.stringify([headKey(h), h.epoch, h.version, h.digest, h.kind, h.payload, h.pending, h.before_privacy, h.privacy_version]);
+export const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+export const setSha = (lines: string[]) => sha([...lines].sort().join("\n"));
+export const byKey = <T>(rows: T[], key: (r: T) => string) => {
   const m = new Map<string, T>();
   for (const r of rows) { const k = key(r); if (m.has(k)) refuse("duplicate_key_in_read"); m.set(k, r); }
   return m;
