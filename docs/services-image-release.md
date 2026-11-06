@@ -13,13 +13,13 @@ reference is invalid. It reads all job pages and validates the newest execution
 of each named job, including successful jobs carried across partial reruns. An
 old success cannot hide a failed retry. It rechecks the CI attempt afterward.
 
-The input is required: tags, branch names, abbreviated SHAs and internal-history
-commits are refused. Only `sha-<source_sha>` is published. This publisher never
-moves `main` or `latest` across the separate source histories. Supply a short,
+The input is required: tags, branch names, abbreviated SHAs and commits outside
+current `main` history are refused. Only `sha-<source_sha>` is published. This
+publisher never moves `main` or `latest`. Supply a short,
 single-line, non-sensitive approval reference; it becomes public image metadata.
 
-The target remains `ghcr.io/agentworkforce/96bulls-services`. The new public
-repository needs Actions write access to that existing package. Package access
+The target remains `ghcr.io/agentworkforce/96bulls-services`. Preserve this
+repository's existing Actions access to that package. Package access
 and package/repository association are separate settings; do not assume public
 pull access authorizes a workflow to push. A denied publish is a permission
 failure to resolve with the package owner, not a reason to use another token or
