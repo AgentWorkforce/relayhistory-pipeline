@@ -11,6 +11,7 @@ import { zstdDecompressSync } from "node:zlib";
 import pg from "pg";
 import { generation } from "../src/hoopdb/migrate.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
+import { deployTargetValue, SUPABASE_PROJECT_REF } from "../src/shared/deploy-target.ts";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { objectStoreManifestReader } from "../packages/pipeline/src/lib/pipeline/adapter.ts";
 import { seedFences, type SeedSql } from "../src/session-ingest/seed.ts";
@@ -26,9 +27,11 @@ const parseUrl=(text:string)=>{
  try{return new URL(text)}catch{return fail("seed_connection")}
 };
 function supaClient(){
+ // The Supabase project is explicit operator configuration with no default target.
+ const ref=deployTargetValue(process.env,"SEED_EXPECT_SUPABASE_REF",SUPABASE_PROJECT_REF,()=>fail("seed_supabase_ref_pin"));
  const u=parseUrl(fd("SUPABASE_SEED_URL_FILE"));
  if(!["postgresql:","postgres:"].includes(u.protocol)||u.hostname!=="aws-0-us-east-1.pooler.supabase.com"||
-   u.port!=="5432"||u.pathname!=="/postgres"||decodeURIComponent(u.username)!=="relayhistory_owner.pyamkrhoyszgzirqqffq"||!u.password||u.hash)
+   u.port!=="5432"||u.pathname!=="/postgres"||decodeURIComponent(u.username)!=="relayhistory_owner."+ref||!u.password||u.hash)
   fail("seed_connection");
  for(const[k,v]of u.searchParams)if(!((k==="sslmode"&&["require","verify-full"].includes(v))||(k==="channel_binding"&&v==="require")))fail("seed_connection_options");
  return new pg.Pool({max:4,host:u.hostname,port:5432,database:"postgres",user:decodeURIComponent(u.username),password:decodeURIComponent(u.password),

@@ -20,11 +20,13 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import pg from "pg";
 import { SUPA_PAGE, SUPA_RECEIPTS, SUPA_CONTROL_HEADS } from "../src/migration/frozen-source-copy-queries.ts";
-import { parseCliLogin } from "./schema-release-owner-operator-plan.ts";
+import { parseCliLogin } from "../src/shared/supabase-cli-login.ts";
+import { requiredSupabaseProjectRef } from "../src/shared/deploy-target.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
 import { repairControlHead } from "../src/hoopdb/frozen-control-head-repair.ts";
 
-const REF = "pyamkrhoyszgzirqqffq", HOST = "aws-0-us-east-1.pooler.supabase.com", CLI = process.env.SUPABASE_CLI ?? "/home/khaliqgant/.local/bin/supabase";
+// The Supabase project is explicit operator configuration (SUPABASE_PROJECT_REF), read only when connecting.
+const HOST = "aws-0-us-east-1.pooler.supabase.com", CLI = process.env.SUPABASE_CLI ?? "/home/khaliqgant/.local/bin/supabase";
 const args = process.argv.slice(2), flag = (k: string) => args.includes(k), val = (k: string, d: string) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1]! : d; };
 const mode = flag("--plan") ? "plan" : flag("--copy") ? "copy" : flag("--seal") ? "seal" : flag("--repair-head") ? "repair-head" : "";
 if (!mode) { console.error("one of --plan | --copy | --seal | --repair-head"); process.exit(64); }
@@ -40,7 +42,8 @@ const log = (m: string, f: Record<string, unknown> = {}) => console.log(JSON.str
 
 const neon = () => { const c = new pg.Client({ connectionString: neonOwnerUrl, ssl: { rejectUnauthorized: true }, application_name: "p1-frozen-copy-readonly", statement_timeout: 30000 }); return c; };
 const supa = async () => {
-  const login = parseCliLogin(execFileSync(CLI, ["db", "dump", "--linked", "--project-ref", REF, "--dry-run"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }));
+  const REF = requiredSupabaseProjectRef(process.env);
+  const login = parseCliLogin(execFileSync(CLI, ["db", "dump", "--linked", "--project-ref", REF, "--dry-run"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }), REF);
   const c = new pg.Client({ host: HOST, port: 5432, database: "postgres", user: `cli_login_postgres.${REF}`, password: login.password,
     ssl: { ca: SUPABASE_PROD_CA_2021, rejectUnauthorized: true, servername: HOST }, options: "-c statement_timeout=60000 -c lock_timeout=5000", application_name: "p1-frozen-copy" });
   login.password = "";
