@@ -17,7 +17,7 @@ export const ROOT = join(import.meta.dir, "../../..");
 export const generation = "a".repeat(64), epoch = "3".repeat(64), identity = "c".repeat(64), baseline = "a".repeat(64);
 export const PENDING_SQL = "supabase/pending/ingest_privacy_authority.sql";
 /** Independent prerequisite fix (also needed by mirror/frozen-supabase without C3). */
-export const LAZY_SOURCE_SQL = "supabase/pending/ingest_lazy_source_tables.sql";
+export const LAZY_SOURCE_SQL = "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql";
 /** C3 post-apply index job (non-transactional in production). */
 export const INDEX_SQL = "supabase/pending/ingest_privacy_authority_index.sql";
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
@@ -27,8 +27,9 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   const closers: Array<() => unknown> = [() => db.close()];
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
-  for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await db.exec(read("supabase/migrations/" + f));
-  if (opts.lazyFix !== false) await db.exec(read(LAZY_SOURCE_SQL));
+  // lazyFix:false reproduces the pre-040000 state (that migration skipped; it touches nothing later ones depend on).
+  for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort())
+    if (opts.lazyFix !== false || "supabase/migrations/" + f !== LAZY_SOURCE_SQL) await db.exec(read("supabase/migrations/" + f));
   if (opts.pending !== false) await db.exec(read(PENDING_SQL));
   if (opts.pending !== false && opts.index !== false) await db.exec(read(INDEX_SQL));
   await db.exec("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','" + generation + "','pass')");

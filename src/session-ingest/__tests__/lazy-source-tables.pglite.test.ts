@@ -1,5 +1,5 @@
 /**
- * Lazy-current adoption must ignore SOURCE-side tables (supabase/pending/ingest_lazy_source_tables.sql, slot TBD).
+ * Lazy-current adoption must ignore SOURCE-side tables (supabase/migrations/20261105040000_ingest_lazy_source_tables.sql).
  * Before the fix, the Supabase-first mirror head (written before the ingest fence) and the frozen Neon copy both
  * look like "prior target authority" to ingest_lazy_user / ingest_lazy_begin, so mirror-mode controls and
  * frozen-supabase uploads of affected users fail closed forever.
@@ -32,7 +32,7 @@ test("without the exclusion a mirror head blocks the user's first fence forever,
   expect((await createIngestApp({ identify: () => ({ ...u2, scopes: ["rth:sync"] }), deliver: f.deps, log: () => {}, custodySource: "frozen-supabase" })
     .request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ protocolVersion: 1, batch: raw }) })).status).toBe(503);
   // With the fix both succeed.
-  await f.db.exec(await Bun.file(new URL("../../../supabase/pending/ingest_lazy_source_tables.sql", import.meta.url)).text());
+  await f.db.exec(await Bun.file(new URL("../../../supabase/migrations/20261105040000_ingest_lazy_source_tables.sql", import.meta.url)).text());
   expect((await apply()).control).toMatchObject({ version: "1", outcome: "applied" });
   expect((await createIngestApp({ identify: () => ({ ...u2, scopes: ["rth:sync"] }), deliver: f.deps, log: () => {}, custodySource: "frozen-supabase" })
     .request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ protocolVersion: 1, batch: raw }) })).status).toBe(200);

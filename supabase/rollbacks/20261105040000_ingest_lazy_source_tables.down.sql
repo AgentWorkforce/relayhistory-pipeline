@@ -1,4 +1,20 @@
--- Reverse of ingest_lazy_source_tables (slot TBD): the 20261104055000 definitions, verbatim.
+-- Generated: restore the exact 055000 lazy-current adoption checks; owner/ACL stay unchanged.
+-- Explicit transaction: guard, marker fence, replacement and ledger removal are atomic.
+-- On an error the caller must ROLLBACK (or disconnect); nothing is committed.
+BEGIN;
+SELECT pg_advisory_xact_lock(961996,1); -- same namespace as the real migrator
+DO $rollback_guard$ DECLARE v_sha text; BEGIN
+ IF to_regclass('sessions.__96bulls_migrations')IS NULL OR to_regclass('sessions.__96bulls_role_validation')IS NULL
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy source tables: migration ledger/marker required';END IF;
+ LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
+ IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105040000_ingest_lazy_source_tables.sql')
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy source tables: a later migration is applied; roll it back first';END IF;
+ SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105040000_ingest_lazy_source_tables.sql' FOR UPDATE;
+ IF NOT FOUND OR v_sha<>'4dfa078533721cc6b36f69b7e56c7aa6072284c21e6de825e982bfc961affd3d'
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy source tables: own applied checksum required';END IF;
+ UPDATE sessions.__96bulls_role_validation SET status='pending',updated_at=clock_timestamp() WHERE name='session_directory_search_worker';
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy source tables: validation marker required';END IF;
+END $rollback_guard$;
 CREATE OR REPLACE FUNCTION sessions.ingest_lazy_user(p_w jsonb,p_kind text,p_control jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lazy_user$
 DECLARE v_org text;v_ws text;v_user text;v_epoch text;v_source text;v_first boolean;v_last bigint;v_version bigint;v_privacy_version bigint;
@@ -88,7 +104,6 @@ BEGIN
   VALUES(v_org,v_ws,v_user,v_source,v_epoch,v_fp,v_privacy_version);
  RETURN jsonb_build_object('privacySealed',true,'created',true,'targetVersion',v_last::text);
 END $lazy_user$;
-
 CREATE OR REPLACE FUNCTION sessions.ingest_lazy_begin(p jsonb,p_kind text) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lazy_begin$
 DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;c sessions.ingest_receipt_seat_clock%ROWTYPE;
@@ -178,3 +193,5 @@ BEGIN
  IF pol.valid_until<=clock_timestamp() THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: policy expired during operation';END IF;
  RETURN v_ack;
 END $lazy_begin$;
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105040000_ingest_lazy_source_tables.sql' AND sha256='4dfa078533721cc6b36f69b7e56c7aa6072284c21e6de825e982bfc961affd3d';
+COMMIT;
