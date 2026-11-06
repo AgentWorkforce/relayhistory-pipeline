@@ -55,6 +55,7 @@ import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
 import type { PipelineRuntimeRegistry } from "@rhc/adapters/defaults.ts";
 import { dispatchRegisteredLambda, type PipelineLambdaEvent } from "./lambda-runtime.ts";
+import { writerTransactionSql } from "./transaction-sql.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
 import {checkedAnalysisCursor,reconcileAnalysisPage} from "./analysis-reconcile.ts";
@@ -302,9 +303,12 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     const portable = env.searchBackend && env.searchBackend !== "clickhouse";
     if (portable && !composition) throw new Error("search service composition is not registered");
     if (!portable && !secret.clickhouse) throw new Error("SEARCH_INDEX_ENABLED=1 but the secret has no clickhouse block");
-    const binding = portable ? composeSearchService(composition!, { env: { ...env.adapterEnv, SEARCH_INDEX_BACKEND: env.searchBackend }, sql: db, secrets: searchSecret(secret.search) }, "writer") : undefined;
+    // Portable SQL joins the pass's metadata transaction. External indexes
+    // retain their own service-native commit/rollback semantics.
+    const writerSql = portable ? writerTransactionSql(db) : undefined;
+    const binding = portable ? composeSearchService(composition!, { env: { ...env.adapterEnv, SEARCH_INDEX_BACKEND: env.searchBackend }, sql: writerSql!.sql, secrets: searchSecret(secret.search) }, "writer") : undefined;
     deps.search = {
-      transact: (work) => transaction(db, work),
+      transact: (work) => transaction(db, tx => writerSql ? writerSql.run(tx, () => work(tx)) : work(tx)),
       reader,
       store,
       ...(binding ? { adapter: binding } : { ch: createClickHouseClient(secret.clickhouse!) }),
