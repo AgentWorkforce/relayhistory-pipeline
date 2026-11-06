@@ -10,7 +10,7 @@ import {derivedSchemaAssets,type DerivedSchemaAssets} from "../session-pipeline/
 import {awsJsonCall,lambdaCredentials} from "../session-pipeline/aws-json.ts";
 import {SUPABASE_PROD_CA_2021} from "../session-pipeline/supabase-ca.ts";
 import {deployTargetValue,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF} from "../shared/deploy-target.ts";
-import {bufferedGcTick,sqlBufferedGcLedger,BufferedGcError} from "./buffered-gc.ts";
+import {bufferedGcTick,sqlBufferedGcLedger,BufferedGcError,BufferedGcDiagnostics} from "./buffered-gc.ts";
 export interface GcJobConfig {region:"us-east-1";accountId:string;supabaseProjectRef:string;bucket:string;kmsKeyArn:string;secretArn:string;expectedGeneration:string;limit:number;budgetMs:number}
 function no(code:string):never{throw new BufferedGcError(code)}
 export function gcJobConfig(env:NodeJS.ProcessEnv):GcJobConfig{
@@ -67,8 +67,12 @@ export interface GcJobOverrides{
  fetcher?:typeof fetch;
 }
 /** Test factories can point at owned PG/MinIO; production entry supplies none. */
-export async function runBufferedGcJob(env:NodeJS.ProcessEnv,overrides:GcJobOverrides={}){
- const config=gcJobConfig(env),assets=await(overrides.assets??derivedSchemaAssets)();
+export async function runBufferedGcJob(env:NodeJS.ProcessEnv,overrides:GcJobOverrides={},diagnostics=new BufferedGcDiagnostics()){
+ diagnostics.phase("config");
+ try{
+ const config=gcJobConfig(env);
+ diagnostics.phase("assets");
+ const assets=await(overrides.assets??derivedSchemaAssets)();
  if(assets.expected.generation!==config.expectedGeneration||!assets.expected.names.length||
   Object.values(assets.verifiers).length!==4||Object.values(assets.verifiers).some(s=>typeof s!=="string"||!s.trim()))no("compiled_generation_mismatch");
  const deadline=Date.now()+config.budgetMs,controller=new AbortController(),timer=setTimeout(()=>controller.abort(),config.budgetMs);
@@ -80,27 +84,40 @@ export async function runBufferedGcJob(env:NodeJS.ProcessEnv,overrides:GcJobOver
  let pool:pg.Pool|undefined;
  try{
   const credentials=()=>{const c=lambdaCredentials();if(!/^ASIA[A-Z0-9]{16}$/.test(c.accessKeyId)||!c.sessionToken)no("managed_credentials_required");return c};
+  diagnostics.phase("secret");
   const secret=overrides.secret?await overrides.secret(config,boundedFetch):await(async()=>{
    const r=await awsJsonCall<{SecretString?:string}>({service:"secretsmanager",target:"secretsmanager.GetSecretValue",region:config.region,
     body:{SecretId:config.secretArn},credentials:credentials(),fetcher:boundedFetch,timeoutMs:Math.min(5000,config.budgetMs)});
    if(!r.SecretString)no("secret_empty");return r.SecretString;
   })();
   controller.signal.throwIfAborted();
+  diagnostics.phase("pool");
   pool=(overrides.pool??(c=>new pg.Pool(c)))(gcPoolConfig(secret,config.supabaseProjectRef));pool.on("error",()=>{});
   const sql=new SemanticPostgresExecutor(pool),read=new SemanticPostgresExecutor(pool,true);
   const context=()=>({signal:controller.signal,deadline:Math.min(deadline,Date.now()+1800)});
+  diagnostics.phase("role_check");
   const who=(await read.queryBounded<{me:string;session:string}>("SELECT current_user AS me,session_user AS session",[],context())).rows[0];
   if(who?.me!=="bulls96_session_ingest"||who.session!=="bulls96_session_ingest")no("database_role");
+  diagnostics.phase("readiness");
   await read.queryBounded("SET LOCAL hoopdb.db_mode='supabase';"+Object.values(assets.verifiers).join("\n"),[],context());
+  diagnostics.phase("store_setup");
   const rawStore=(overrides.store??createS3Store)({bucket:config.bucket,region:config.region,credentials:async()=>credentials(),
    serverSideEncryption:"aws:kms",sseKmsKeyId:config.kmsKeyArn,fetch:boundedFetch});
   const eraser=(overrides.eraser??createS3Eraser)({bucket:config.bucket,region:config.region,credentials:credentials(),fetch:boundedFetch});
+  diagnostics.phase("tick");
   const result=await bufferedGcTick({keyRoot:"96bulls",store:scopedGcStore(rawStore),
    eraser:{eraseObjectExcept:async(key,version)=>{if(!bufferedKeyAllowed(key))no("eraser_scope");controller.signal.throwIfAborted();return eraser.eraseObjectExcept(key,version)}},
-   ledger:sqlBufferedGcLedger({query:(s,p)=>sql.queryBounded(s,p,context())},config.expectedGeneration)},config.limit);
+   ledger:sqlBufferedGcLedger({query:(s,p)=>sql.queryBounded(s,p,context())},config.expectedGeneration,diagnostics),diagnostics},config.limit);
+  diagnostics.phase("tick");
   controller.signal.throwIfAborted();return result;
+ }catch(error){
+  diagnostics.capture(error);throw error;
  }finally{
+  diagnostics.phase("cleanup");
   controller.abort();clearTimeout(timer);
   if(pool)await pool.end();
+ }
+ }catch(error){
+  diagnostics.capture(error);throw error;
  }
 }
