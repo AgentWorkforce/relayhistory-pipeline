@@ -18,15 +18,18 @@ async function waitFor(q:pg.Client,pid:number,kind:"advisory"|"any"){for(let i=0
 
 export async function invariants(q:{query(s:string):Promise<{rows:any[]}>}){
  const r=(await q.query(`WITH fmt AS(SELECT * FROM sessions.ingest_ack_format WHERE singleton),
-  v1 AS(SELECT seat FROM sessions.ingest_receipt_seats),
+  v1 AS(SELECT seat FROM sessions.ingest_receipt_seats WHERE compat_vector_claim IS NULL),
   v2 AS(SELECT generate_series(seat_lo,seat_hi) seat FROM sessions.ingest_ack_vectors WHERE allocated_count>0),
   s AS(SELECT seat FROM v1 UNION ALL SELECT seat FROM v2),c AS(SELECT * FROM sessions.ingest_receipt_seat_clock WHERE singleton)
   SELECT (SELECT count(*) FROM s)::text total,(SELECT count(DISTINCT seat) FROM s)::text distinct_seats,
    (SELECT (last_seat-allocated_high_water)::text FROM c) clock_span,
    (SELECT coalesce(min(seat),0)::text FROM s) mn,(SELECT (allocated_high_water+1)::text FROM c) hw1,
    (SELECT coalesce(max(seat),0)::text FROM s) mx,(SELECT last_seat::text FROM c) last,
-   (SELECT count(*) FROM v1,fmt WHERE fmt.mode='v2' AND v1.seat>fmt.cutover_seat)::int v1_above_cutover,
-   (SELECT count(*) FROM sessions.ingest_ack_vectors v,fmt WHERE v.allocated_count>0 AND v.seat_lo<=fmt.cutover_seat)::int v2_at_or_below_cutover,
+   (SELECT count(*) FROM v1 WHERE sessions.ack_seat_era(v1.seat)<>'v1')::int v1_seat_outside_v1_era,
+   (SELECT count(*) FROM sessions.ingest_ack_vectors v WHERE v.allocated_count>0 AND (sessions.ack_seat_era(v.seat_lo)<>'v2' OR sessions.ack_seat_era(v.seat_hi)<>'v2'
+     OR EXISTS(SELECT 1 FROM sessions.ingest_ack_format_epochs e WHERE e.first_seat>v.seat_lo AND e.first_seat<=v.seat_hi)))::int v2_range_outside_one_v2_era,
+   (SELECT count(*) FROM sessions.ingest_receipt_seats x WHERE x.compat_vector_claim IS NOT NULL AND NOT EXISTS(SELECT 1 FROM sessions.ingest_ack_seat_owner(x.seat) o
+     WHERE o.accepted AND o.allocated AND o.seat_key=x.key_sha256 AND o.claim_token=x.compat_vector_claim))::int bad_compat_alias,
    (SELECT count(*) FROM sessions.ingest_claim_attempts a WHERE EXISTS(SELECT 1 FROM sessions.ingest_lazy_ack_decisions d WHERE d.claim_token=a.claim_token)
      AND EXISTS(SELECT 1 FROM sessions.ingest_ack_vectors v WHERE v.claim_token=a.claim_token))::int both_formats,
    (SELECT count(*) FROM sessions.ingest_claim_attempts a WHERE EXISTS(SELECT 1 FROM sessions.ingest_lazy_ack_decisions d WHERE d.claim_token=a.claim_token) AND a.ack_format IS DISTINCT FROM 1)::int v1_unstamped,
@@ -36,7 +39,7 @@ export async function invariants(q:{query(s:string):Promise<{rows:any[]}>}){
      JOIN sessions.ingest_stage_intents t ON t.claim_token=a.claim_token WHERE a.batch_id=b.batch_id AND a.ack_format IS NOT NULL))::int committed_without_format`)).rows[0];
  expect(r.total).toBe(r.distinct_seats);expect(r.total).toBe(r.clock_span);
  if(r.total!=="0"){expect(r.mn).toBe(r.hw1);expect(r.mx).toBe(r.last)}
- for(const k of ["v1_above_cutover","v2_at_or_below_cutover","both_formats","v1_unstamped","v2_unstamped","orphan_v1_seats","committed_without_format"])expect([k,r[k]]).toEqual([k,0]);
+ for(const k of ["v1_seat_outside_v1_era","v2_range_outside_one_v2_era","bad_compat_alias","both_formats","v1_unstamped","v2_unstamped","orphan_v1_seats","committed_without_format"])expect([k,r[k]]).toEqual([k,0]);
  // every live stage remains readable by both readers (decoder + bindings run)
  const st=(await q.query("SELECT o.batch_id,sessions.ingest_receipt_seats_for_stage(o.active_stage_token) s,sessions.ingest_buffer_gc_ordinals(o.active_stage_token) g FROM sessions.ingest_buffer_outbox o WHERE o.state='buffered'")).rows;
  return{...r,stages:st.length};
@@ -56,8 +59,8 @@ async function installOldBody(f:F,where:"before-clock"|"after-seat"){
 }
 
 describe.skipIf(!url)("ack v2 prototype interleavings on real PG17",()=>{
- test(`P1 randomized cutover under concurrent real-path ACKs (${N} iterations)`,async()=>{
-  const stats={iterations:0,sendsOk:0,sendsErr:0,errs:{} as Record<string,number>};
+ test(`P1+P2 randomized cutover and rollback under concurrent real-path ACKs (${N} iterations)`,async()=>{
+  const stats:any={iterations:0,sendsOk:0,sendsErr:0,errs:{} as Record<string,number>};
   for(let it=0;it<N;it++){
    const f=await fixture("pg","bridge-v1");const cs=await Promise.all([0,1,2,3].map(()=>client(f.url!)));
    try{
@@ -65,9 +68,10 @@ describe.skipIf(!url)("ack v2 prototype interleavings on real PG17",()=>{
     const work=senders.map((send,w)=>(async()=>{for(let b=0;b<4;b++){
      const recs=Array.from({length:3+((it+w+b)%5)},(_,i)=>record({record_id:"k"+((w*7+b*3+i)%12),revision:1+((it+w+b+i)%3),session_id:"s"+(i%2)}));
      try{await send(`i${it}-w${w}-b${b}`,recs);stats.sendsOk++}catch(e:any){stats.sendsErr++;const k=String(e?.cause_code??e?.code);stats.errs[k]=(stats.errs[k]??0)+1}}})());
-    const flip=(async()=>{await sleep(Math.floor(Math.random()*60));await f.db.query("SELECT sessions.ingest_ack_format_set('v2')")})();
-    await Promise.all([...work,flip]);
-    expect((await f.db.query("SELECT mode FROM sessions.ingest_ack_format")).rows[0].mode).toBe("v2");
+    const flips=1+Math.floor(Math.random()*3);   // v2, then possibly v1 (rollback), then v2 again
+    const flip=(async()=>{for(let k=0;k<flips;k++){await sleep(Math.floor(Math.random()*60));await f.db.query("SELECT sessions.ingest_ack_format_set($1)",[k%2?"v1":"v2"])}})();
+    await Promise.all([...work,flip]);stats.flips=(stats.flips??0)+flips;
+    expect((await f.db.query("SELECT mode FROM sessions.ingest_ack_format")).rows[0].mode).toBe(flips%2?"v2":"v1");
     await invariants(f.db);stats.iterations++;
    }finally{for(const c of cs)await c.end();await f.close()}
   }
@@ -106,6 +110,42 @@ describe.skipIf(!url)("ack v2 prototype interleavings on real PG17",()=>{
    }finally{for(const c of [ctl,a,flipper])await c.end().catch(()=>{});await f.close()}
   }
   console.log("P9b",where,JSON.stringify(out));
+ });
+
+ for(const where of ["after-clock","before-clock"] as const)test(`P2 paused v2 writer (${where}) vs rollback flip to v1 (${N} iterations)`,async()=>{
+  const out={iterations:0,v2Committed:0,v2Refused:0};
+  for(let it=0;it<N;it++){
+   const f=await fixture("pg","bridge-v2");const ctl=await client(f.url!),a=await client(f.url!),flipper=await client(f.url!);
+   try{
+    const def=(await f.db.query("SELECT pg_get_functiondef('sessions.ingest_lazy_ack_batch_v2(jsonb)'::regprocedure) d")).rows[0].d as string;
+    const pause="PERFORM pg_advisory_lock(4242002);PERFORM pg_advisory_unlock(4242002);";
+    const at=" SELECT * INTO STRICT c FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE;v_last:=c.last_seat;v_before:=v_last;";
+    if(!def.includes(at))throw Error("v2 injection point");
+    await f.db.exec(def.replace("sessions.ingest_lazy_ack_batch_v2(","sessions.ackv2test_paused_v2(").replace(at,where==="before-clock"?" "+pause+at:at+pause));
+    const bridge=(await f.db.query("SELECT pg_get_functiondef('sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure) d")).rows[0].d as string;
+    await f.db.exec(bridge.replace("BEGIN\n PERFORM sessions.ack_require_rc();","BEGIN\n IF current_setting('ackv2test.paused_v2',true)='1' THEN PERFORM sessions.ackv2test_paused_v2(p);RETURN;END IF;\n PERFORM sessions.ack_require_rc();"));
+    await f.send("warm",[record({record_id:"w"+it,session_id:"s"})]);
+    await ctl.query("SELECT pg_advisory_lock(4242002)");await a.query("SET ackv2test.paused_v2='1'");
+    const apid=(await a.query("SELECT pg_backend_pid() p")).rows[0].p;
+    const sendA=f.senderOn(a)("v2body",[record({record_id:"o1",session_id:"s"}),record({record_id:"o1",revision:2,session_id:"s"})]).then(()=>"committed",(e:any)=>"refused:"+String(e?.cause_code??e));
+    await waitFor(ctl,apid,"advisory");
+    const fpid=(await flipper.query("SELECT pg_backend_pid() p")).rows[0].p;
+    const flip=flipper.query("SELECT sessions.ingest_ack_format_set('v1')").then(()=>"flipped",(e:any)=>"flip-failed:"+e.message);
+    if(where==="after-clock")await waitFor(ctl,fpid,"any");else expect(await flip).toBe("flipped");
+    await ctl.query("SELECT pg_advisory_unlock(4242002)");
+    const ra=await sendA;expect(await flip).toBe("flipped");
+    if(where==="after-clock"){expect(ra).toBe("committed");out.v2Committed++;
+     expect((await f.db.query("SELECT a.ack_format FROM sessions.ingest_claim_attempts a WHERE batch_id='v2body'")).rows.map(r=>r.ack_format)).toContain(2)}
+    else{expect(ra).toMatch(/^refused/);out.v2Refused++;
+     await a.query("RESET ackv2test.paused_v2");await f.senderOn(a)("v2body",[record({record_id:"o1",session_id:"s"}),record({record_id:"o1",revision:2,session_id:"s"})]);
+     expect((await f.db.query("SELECT a.ack_format FROM sessions.ingest_claim_attempts a WHERE batch_id='v2body' AND a.ack_format=1")).rows.length).toBe(1)}
+    await f.send("after",[record({record_id:"o1",revision:3,session_id:"s"}),record({record_id:"w"+it,session_id:"s"})]); // v1r reuses/aliases v2 seats
+    await invariants(f.db);
+    expect((await f.db.query("SELECT count(*)::int n FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database())")).rows[0].n).toBe(0);
+    out.iterations++;
+   }finally{for(const c of [ctl,a,flipper])await c.end().catch(()=>{});await f.close()}
+  }
+  console.log("P2",where,JSON.stringify(out));
  });
 
  test("P12 drain: an older open transaction (superuser and non-superuser login) blocks the flip; privilege required",async()=>{

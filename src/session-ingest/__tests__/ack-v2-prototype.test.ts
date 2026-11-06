@@ -6,7 +6,7 @@
 import {describe,test,expect,setDefaultTimeout} from "bun:test";
 import {readFileSync} from "node:fs";
 import {join} from "node:path";
-import {fixture,record,meta,TENANT,attemptSha,root,FIXTURE,type F,type Mode} from "./ack-v2-support.ts";
+import {fixture,record,meta,TENANT,attemptSha,clockSha,root,FIXTURE,type F,type Mode} from "./ack-v2-support.ts";
 setDefaultTimeout(600000);
 const backends=(process.env.ACK_V2_BACKENDS??"pglite").split(",") as ("pglite"|"pg")[];
 const T2={orgId:TENANT.orgId,workspaceId:TENANT.workspaceId,userId:"user-2"};
@@ -16,9 +16,13 @@ async function expectCode(p:Promise<unknown>,c:string|RegExp,f?:F){let err:any=n
 
 /** One deterministic history exercising accept, stale reuse, legacy custody (equal/lower/higher), in-batch twin
  *  revisions, cross-claim reuse, selection clear, cross-user refusal, reset, a zero-allocation claim and GC readers. */
-async function scenario(f:F){
+const GEN="a".repeat(64);
+/** strip per-run random identifiers (uuids, leases, timestamps) so outputs compare across independent databases */
+const norm=(v:any):any=>Array.isArray(v)?v.map(norm):v&&typeof v==="object"?Object.fromEntries(Object.entries(v).filter(([k])=>!/token|lease|attempt|until|expires|_at$|At$|generation_id|^initialized_at$/i.test(k)).map(([k,x])=>[k,norm(x)]))
+ :typeof v==="string"&&/^[0-9a-f]{8}-[0-9a-f]{4}-/.test(v)?"<uuid>":v;
+async function scenario(f:F,flips:Record<string,"v1"|"v2">={}){
  const out:any[]=[];
- const step=async(name:string,fn:()=>Promise<unknown>)=>{try{const r:any=await fn();out.push([name,"ok",r?.kind??r?.status??null])}catch(e){out.push([name,"err",code(e,f)])}};
+ const step=async(name:string,fn:()=>Promise<unknown>)=>{if(flips[name])await f.db.query("SELECT sessions.ingest_ack_format_set($1)",[flips[name]]);try{const r:any=await fn();out.push([name,"ok",r?.kind??r?.status??null])}catch(e){out.push([name,"err",code(e,f)])}};
  const old=record({record_id:"old",revision:8,session_id:"sess-L"}),old2=record({record_id:"old2",revision:5,session_id:"sess-L"}),old3=record({record_id:"old3",revision:2,session_id:"sess-L"});
  await step("b1",()=>f.send("b1",[...[1,2,3,4,5].map(i=>record({record_id:"r"+i,session_id:"sess-A"})),record({record_id:"r9",session_id:"sess-B"})]));
  await step("b2",()=>f.send("b2",[record({record_id:"r1",revision:2,session_id:"sess-A"}),record({record_id:"r2",session_id:"sess-A"}),record({record_id:"r6",session_id:"sess-A"})]));
@@ -36,6 +40,13 @@ async function scenario(f:F){
  for(const b of ["b1","b2","b3","b4","b5","b6","b8","b9","b10"]){try{out.push(["seats",b,await f.seats(b)])}catch(e){out.push(["seats",b,"err",code(e)])}}
  try{out.push(["gc",await f.gcOrdinals()])}catch(e){out.push(["gc","err",code(e)])}
  out.push(["slots",await f.slots()]);
+ // P4: 620 whole-row native snapshot (byte-compatible projection) and a real publication claim, per live stage
+ const stages=(await f.db.query("SELECT o.batch_id,o.active_stage_token::text st FROM sessions.ingest_buffer_outbox o WHERE o.state='buffered' ORDER BY 1")).rows;
+ for(const r of stages){try{const j=(await f.db.query("SELECT sessions.ingest_history_native_snapshot($1)::text j",[r.st])).rows[0].j;out.push(["hist",r.batch_id,norm(JSON.parse(j))])}
+  catch(e:any){out.push(["hist",r.batch_id,"err",e.message])}}
+ await f.db.query("INSERT INTO sessions.ingest_publication_frontiers VALUES($1,$2,$3,'origin-1',$4,$4,clock_timestamp()+interval'1 hour','synthetic','us-east-1','96bulls',$5)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,"b".repeat(64),GEN]);
+ for(const r of stages){try{const res:any=await f.db.query("BEGIN;SET LOCAL ROLE bulls96_session_ingest").then(()=>f.db.query("SELECT sessions.ingest_publication_claim($1::jsonb) r",[JSON.stringify({stageToken:r.st,keyRoot:"96bulls",bucket:"synthetic",region:"us-east-1",generation:GEN})]));
+   await f.db.exec("COMMIT");out.push(["pub",r.batch_id,norm(res.rows[0].r)])}catch(e:any){await f.db.exec("ROLLBACK").catch(()=>{});out.push(["pub",r.batch_id,"err",e.message])}}
  return out;
 }
 
@@ -57,6 +68,19 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
   expect(seatRows.some((r:any)=>r.bodyAccepted===false)).toBe(true);
  });
 
+ test("P2/T6c rollback: v1 → v2 → v1 (dual-aware writer) → v2 … over the same keys ≡ all-v1",async()=>{
+  const base=await fixture(kind,"baseline");let ref:any[];try{ref=await scenario(base)}finally{await base.close()}
+  const f=await fixture(kind,"bridge-v1");try{
+   const got=await scenario(f,{b2:"v2",b5:"v1",b6:"v2",b8:"v1","b10-again":"v2"});
+   const eras=(await f.db.query("SELECT mode FROM sessions.ingest_ack_format_epochs ORDER BY epoch")).rows.map(r=>r.mode);
+   const compat=(await f.db.query("SELECT count(*)::int n FROM sessions.ingest_receipt_seats WHERE compat_vector_claim IS NOT NULL")).rows[0].n;
+   const fmts=(await f.db.query("SELECT ack_format,count(*)::int n FROM sessions.ingest_claim_attempts WHERE ack_format IS NOT NULL GROUP BY 1 ORDER BY 1")).rows;
+   console.log("T6c eras",JSON.stringify(eras),"compat aliases",compat,"formats",JSON.stringify(fmts));
+   expect(eras).toEqual(["v1","v2","v1","v2","v1","v2"]);expect(fmts.length).toBe(2);
+   expect(got).toEqual(ref!);
+  }finally{await f.close()}
+ });
+
  test("P3 decoder fuzz: every corruption refuses 55000",async()=>{
   const f=await fixture(kind,"bridge-v2");try{
    await f.send("fz",[record({record_id:"a",session_id:"s"}),record({record_id:"b",session_id:"s"})]);
@@ -71,7 +95,7 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
     ["truncated",base.claim_token,B.slice(0,-2)],["trailing",base.claim_token,B+"00"],["version",base.claim_token,"02"+B.slice(2)],["kind",base.claim_token,B.slice(0,2)+"02"+B.slice(4)],
     ["n",base.claim_token,B.slice(0,4)+"0003"+B.slice(8)],["alloc",base.claim_token,B.slice(0,8)+"0001"+B.slice(12)],
     ["reserved-flag",base.claim_token,B.slice(0,16)+"0b"+B.slice(18)],["flags-none",base.claim_token,B.slice(0,16)+"00"+B.slice(18)],
-    ["accepted-reused",base.claim_token,B.slice(0,16)+"05"+B.slice(18)],["dup-ord",base.claim_token,B.slice(0,22)+B.slice(12,16)+B.slice(26)],
+    ["accepted-reused",base.claim_token,B.slice(0,16)+"05"+B.slice(18)],["dup-ord",base.claim_token,B.slice(0,22)+B.slice(12,16)+B.slice(26)],["entry-order-not-processing-order",base.claim_token,B.slice(0,12)+B.slice(22,26)+B.slice(16,22)+B.slice(12,16)+B.slice(26)],
     ["noncanonical-varint",base.claim_token,B.slice(0,18)+"8100"+B.slice(20)],["offset",base.claim_token,B.slice(0,20)+"02"+B.slice(22)],
     ["hash-mismatch",base.claim_token,B.slice(0,-2)+(B.endsWith("00")?"01":"00"),false],
     ["reuse-truncated",reuse.claim_token,R.slice(0,-4)],["reuse-kind",reuse.claim_token,R.slice(0,36)+"07"+R.slice(38)],["reuse-seat-zero",reuse.claim_token,R.slice(0,20)+"0000000000000000"+R.slice(36)],
@@ -114,8 +138,12 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    await expectCode(f.db.query("UPDATE sessions.ingest_claim_attempts SET records=records||'[]' , batch_id=batch_id||'' , digest=repeat('9',64) WHERE claim_token=$1",[post.claim_token]),"immutable");
    // clock identity immutable
    await expectCode(f.db.query("UPDATE sessions.ingest_receipt_seat_clock SET allocated_high_water=allocated_high_water+1"),"immutable");
-   // prototype limit: rollback writer not implemented => refuse
-   await expectCode(f.db.query("SELECT sessions.ingest_ack_format_set('v1')"),"rollback writer not implemented");
+   // rollback is implemented (P2/T6c): flipping back to v1 now succeeds and later v1-format ACKs work
+   await f.db.query("SELECT sessions.ingest_ack_format_set('v1')");
+   await f.send("back",[record({record_id:"p2",session_id:"s"})]);   // stale re-send: aliases the v2 seat via a compat row
+   expect((await f.db.query("SELECT count(*)::int n FROM sessions.ingest_receipt_seats WHERE compat_vector_claim IS NOT NULL")).rows[0].n).toBe(1);
+   // a forged compat alias (wrong key for the seat) is refused
+   await expectCode(f.db.query("INSERT INTO sessions.ingest_receipt_seats(key_sha256,key_material,seat,first_digest,source,session_id,fence_epoch,compat_vector_claim) SELECT repeat('7',64),key_material,seat+0,first_digest,source,session_id,fence_epoch,compat_vector_claim FROM sessions.ingest_receipt_seats WHERE compat_vector_claim IS NOT NULL"),/compat seat must alias|23505/);
    // readers still serve both formats
    expect((await f.seats("pre")).records.length).toBe(1);expect((await f.seats("post")).records.length).toBe(1);
   }finally{await f.close()}
@@ -149,9 +177,30 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    // valid no-op multi-row update passes
    await f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage WHERE key_sha256 IN($1,$2)",[x.key_sha256,y.key_sha256]);
    // seat at or below cutover is refused even if it would otherwise bind (set cutover above it)
-   await f.db.query("UPDATE sessions.ingest_ack_format SET cutover_seat=$1",[x.current_seat]);
+   await f.db.query("INSERT INTO sessions.ingest_ack_format_epochs(epoch,mode,first_seat) VALUES(999,'v1',$1)",[x.current_seat]);
    await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage WHERE key_sha256=$1",[x.key_sha256]),"binding refused");
    expect(L.current_legacy_key).not.toBeNull();
+  }finally{await f.close()}
+ });
+
+ test("P10b final-winner rule: earlier accepted entry of the same vector cannot be installed (manual, all fields matching)",async()=>{
+  const f=await fixture(kind,"bridge-v2");try{
+   await f.send("fw",[record({record_id:"R",revision:1,session_id:"s"}),record({record_id:"R",revision:2,session_id:"s"}),record({record_id:"Q",session_id:"s"})]);
+   const e=(await f.db.query("SELECT e.idx,e.accepted,e.allocated,e.seat::text seat,e.lineage::text lineage,e.revision::text revision,e.candidate_digest,e.source,e.session_id,e.reset_epoch::text reset_epoch,e.fence_epoch::text fence_epoch FROM sessions.ingest_ack_vectors v JOIN sessions.ingest_claim_attempts a USING(claim_token),LATERAL sessions.ingest_ack_entries(v.claim_token) e WHERE a.batch_id='fw' AND e.record_id='R' ORDER BY e.idx")).rows;
+   expect(e.map((x:any)=>[x.accepted,x.allocated])).toEqual([[true,true],[true,true]]);   // two accepted entries, one native key: legitimate
+   const snap=async()=>(await f.db.query("SELECT (to_jsonb(n)-'current_seat'-'lineage')::text j,current_seat::text seat,lineage::text lin FROM sessions.ingest_lazy_native_slots n WHERE record_id='R'")).rows[0];
+   const before=await snap();
+   expect(before.seat).toBe(String(e[1].seat));                                             // slot = final winner
+   const first=e[0];
+   await expectCode(f.db.query(`UPDATE sessions.ingest_lazy_native_slots SET current_seat=$1,lineage=$2,current_revision=$3,current_digest=$4,current_source=$5,
+     current_session=$6,current_reset_epoch=$7,current_fence_epoch=$8 WHERE record_id='R'`,[first.seat,first.lineage,first.revision,first.candidate_digest,first.source,first.session_id,first.reset_epoch,first.fence_epoch]),"55000");
+   expect(await snap()).toEqual(before);
+   // isolate the final-winner binding from the no-regression rule: earlier entry's seat/fields but the current lineage
+   await expectCode(f.db.query(`UPDATE sessions.ingest_lazy_native_slots SET current_seat=$1,current_revision=$2,current_digest=$3 WHERE record_id='R'`,
+     [first.seat,first.revision,first.candidate_digest]),"binding refused");
+   expect(await snap()).toEqual(before);
+   // and the slot's own (final) values pass unchanged
+   await f.db.query("UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage WHERE record_id='R'");
   }finally{await f.close()}
  });
 
@@ -163,17 +212,72 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
    ["extra unrelated slot","FROM want w WHERE n.key_sha256=w.native_key RETURNING","FROM want w WHERE n.key_sha256=w.native_key OR (n.record_id='bystander' AND w.idx=(SELECT min(idx) FROM want)) RETURNING"],
    ["wrong lineage","SET lineage=w.lineage,","SET lineage=w.lineage+1,"],
    ["wrong seat","current_seat=w.seat,","current_seat=w.seat+(CASE WHEN w.idx=(SELECT max(idx) FROM want) THEN 1000 ELSE 0 END),"],
+   ["non-final accepted entry chosen","ORDER BY native_key,idx DESC","ORDER BY native_key,idx ASC"],
   ];
   for(const [name,a,b] of faults){
    const f=await fixture(kind,"bridge-v2");try{
     await f.send("pre",[record({record_id:"bystander",session_id:"s"})]);
     expect(v2.includes(a)).toBe(true);await f.db.exec(v2.replace(a,b));
     const before=(await f.db.query("SELECT (SELECT count(*) FROM sessions.ingest_ack_vectors)::int v,(SELECT last_seat::text FROM sessions.ingest_receipt_seat_clock) s")).rows[0];
-    await expectCode(f.send("hit",[record({record_id:"m1",session_id:"s"}),record({record_id:"m2",session_id:"s"})]),/coverage mismatch|binding refused/,f).catch(e=>{throw Error(name+": "+e)});
+    await expectCode(f.send("hit",[record({record_id:"m1",session_id:"s"}),record({record_id:"m1",revision:2,session_id:"s"}),record({record_id:"m2",session_id:"s"})]),/coverage mismatch|binding refused/,f).catch(e=>{throw Error(name+": "+e)});
     const after=(await f.db.query("SELECT (SELECT count(*) FROM sessions.ingest_ack_vectors)::int v,(SELECT last_seat::text FROM sessions.ingest_receipt_seat_clock) s")).rows[0];
     expect(after).toEqual(before);
    }finally{await f.close()}
   }
+ });
+
+ test("P6 replacement map: range overlap and FK RESTRICT refusals",async()=>{
+  const f=await fixture(kind,"bridge-v2");try{
+   await f.send("o1",[record({record_id:"a",session_id:"s"}),record({record_id:"b",session_id:"s"})]);
+   await f.send("o2",[record({record_id:"c",session_id:"s"})]);
+   const v=(await f.db.query("SELECT v.*,a.batch_id FROM sessions.ingest_ack_vectors v JOIN sessions.ingest_claim_attempts a USING(claim_token) ORDER BY seat_lo")).rows;
+   await f.db.exec("ALTER TABLE sessions.ingest_ack_vectors DISABLE TRIGGER ack_guard_vector");
+   // overlapping seat range on a second vector row (guard disabled to reach the constraint itself)
+   await expectCode(f.db.query("UPDATE sessions.ingest_ack_vectors SET seat_lo=$1::bigint,seat_hi=$1::bigint,clock_before=$1::bigint-1 WHERE claim_token=$2",[v[0].seat_lo,v[1].claim_token]),/23P01|exclusion|ack_vectors_numrange/);
+   await expectCode(f.db.query("UPDATE sessions.ingest_ack_vectors SET seat_hi=seat_hi+1 WHERE claim_token=$1",[v[1].claim_token]),/23514|check/i);  // range length bound to count
+   await expectCode(f.db.query("UPDATE sessions.ingest_ack_vectors SET seat_lo=seat_lo+1 WHERE claim_token=$1",[v[1].claim_token]),/23514|check/i);  // seat_lo = clock_before+1
+   await f.db.exec("ALTER TABLE sessions.ingest_ack_vectors ENABLE TRIGGER ack_guard_vector");
+   // FK RESTRICT: neither the claim nor the ACK stage of a vector can be deleted
+   await f.db.exec("ALTER TABLE sessions.ingest_claim_attempts DISABLE TRIGGER USER");
+   await expectCode(f.db.query("DELETE FROM sessions.ingest_claim_attempts WHERE claim_token=$1",[v[0].claim_token]),/23503|foreign key/i);
+   await expectCode(f.db.query("DELETE FROM sessions.ingest_stage_intents WHERE stage_token=$1",[v[0].ack_stage_token]),/23503|foreign key/i);
+   expect((await f.db.query("SELECT count(*)::int n FROM sessions.ingest_ack_vectors")).rows[0].n).toBe(2);
+  }finally{await f.close()}
+ });
+
+ test("T6b pinned: a revision_conflict claim records no ownership/attempt rows, identically in v1 and v2",async()=>{
+  const res:any[]=[];
+  for(const m of ["baseline","bridge-v2"] as Mode[]){const f=await fixture(kind,m);try{
+   let e:any=null;try{await f.send("tw",[record({record_id:"T",session_id:"sx"}),record({record_id:"T",revision_id:"T:alt",payload:{text:"other"},session_id:"sx"})])}catch(x){e=x}
+   res.push([m,e?.code,(await f.db.query("SELECT (SELECT count(*) FROM sessions.ingest_session_ownership WHERE session_id='sx')::int own,(SELECT count(*) FROM sessions.ingest_claim_attempts WHERE batch_id='tw')::int att,(SELECT count(*) FROM sessions.ingest_batches WHERE batch_id='tw')::int bat,(SELECT count(*) FROM sessions.ingest_lazy_native_slots WHERE record_id='T')::int slots")).rows[0]]);
+  }finally{await f.close()}}
+  console.log("T6b",JSON.stringify(res));expect(res[1].slice(1)).toEqual(res[0].slice(1));
+  expect(res[0][2].own).toBe(0);expect(res[0][2].att).toBe(0);  // the current protocol gap (§8.3), pinned
+ });
+
+ test("P11 full ACK negative: a whole delivery whose ACK transaction runs at REPEATABLE READ / SERIALIZABLE refuses and changes nothing",async()=>{
+  for(const iso of ["REPEATABLE READ","SERIALIZABLE"]){const f=await fixture(kind,"bridge-v2");try{
+   if(kind==="pglite"){await f.db.exec("SET default_transaction_isolation='"+iso.toLowerCase()+"'")}
+   const before=(await f.db.query("SELECT (SELECT last_seat::text FROM sessions.ingest_receipt_seat_clock) s,(SELECT count(*) FROM sessions.ingest_ack_vectors)::int v")).rows[0];
+   if(kind==="pglite"){await expectCode(f.send("rr",[record({record_id:"z",session_id:"s"})]),"READ COMMITTED required",f);await f.db.exec("SET default_transaction_isolation='read committed'")}
+   else{const pg=(await import("pg")).default;const c=new pg.Client({connectionString:f.url});await c.connect();
+    try{await expectCode(f.senderOn(c,undefined,iso)("rr",[record({record_id:"z",session_id:"s"})]),/55000|READ COMMITTED required|delivery_unavailable/)}finally{await c.end()}}
+   const after=(await f.db.query("SELECT (SELECT last_seat::text FROM sessions.ingest_receipt_seat_clock) s,(SELECT count(*) FROM sessions.ingest_ack_vectors)::int v,(SELECT count(*) FROM sessions.ingest_batches WHERE batch_id='rr' AND state='committed')::int c")).rows[0];
+   expect({s:after.s,v:after.v}).toEqual(before);expect(after.c).toBe(0);
+  }finally{await f.close()}}
+ });
+
+ test("P10c (container only): session_replication_role=replica does not skip guards or the validator (ENABLE ALWAYS)",async()=>{
+  const f=await fixture(kind,"bridge-v2");try{
+   await f.send("rp",[record({record_id:"q1",session_id:"s"}),record({record_id:"q1",revision:2,session_id:"s"})]);
+   await f.db.exec("SET session_replication_role=replica");
+   await expectCode(f.db.query("UPDATE sessions.ingest_lazy_native_slots SET current_revision=current_revision+1 WHERE record_id='q1'"),"binding refused");
+   await expectCode(f.db.query("DELETE FROM sessions.ingest_ack_vectors"),"immutable");
+   await expectCode(f.db.query("INSERT INTO sessions.ingest_receipt_seats(key_sha256,key_material,seat,first_digest,source,session_id,fence_epoch) VALUES(repeat('1',64),'[]',1,repeat('2',64),'claude','s',0)"),"refused in mode v2");
+   await f.db.exec("SET session_replication_role=origin");
+   const tg=(await f.db.query("SELECT tgname,tgenabled FROM pg_trigger WHERE tgname LIKE 'ack_%' AND NOT tgisinternal ORDER BY 1")).rows;
+   expect(tg.every((r:any)=>r.tgenabled==="A")).toBe(true);expect(tg.length).toBe(8);
+  }finally{await f.close()}
  });
 
  test("P11 isolation: RR/SERIALIZABLE refused for flip, ACK bridge and readers",async()=>{
@@ -187,8 +291,26 @@ for(const kind of backends)describe("ack v2 prototype on "+kind,()=>{
   }finally{await f.close()}
  });
 
- test("P13 golden vectors: TypeScript preimage ≡ SQL preimage for real claim rows",async()=>{
+ test("P13 golden vectors: ≥12 attempt preimages (real + synthetic edge rows) and the clock TS twin",async()=>{
   const f=await fixture(kind,"bridge-v2");try{
+   // synthetic edge rows through the SQL function on an explicit composite (no table write)
+   const edge=[
+    {claim_token:"00000000-0000-0000-0000-000000000000",org_id:"o",workspace_id:"",user_id:"u",origin_id:"x",batch_id:"b",digest:"0".repeat(64),reset_epoch:"0",schema_generation:null,source_control_version:null,source_identity_sha256:null,source_witness_sha256:null,records:"[]",epochs:"[]",source_processing_ranks:null},
+    {claim_token:"ffffffff-ffff-ffff-ffff-ffffffffffff",org_id:"Σİ😀",workspace_id:"ws",user_id:"ü",origin_id:"ö",batch_id:"批",digest:"f".repeat(64),reset_epoch:"9223372036854775807",schema_generation:"a".repeat(64),source_control_version:"9223372036854775807",source_identity_sha256:"c".repeat(64),source_witness_sha256:"d".repeat(64),records:'[{"a": 1}]',epochs:"[]",source_processing_ranks:"[0]"},
+    {claim_token:"12345678-1234-1234-1234-123456789abc",org_id:"o",workspace_id:"w",user_id:"u",origin_id:"x",batch_id:"b",digest:"1".repeat(64),reset_epoch:"-1",schema_generation:"",source_control_version:"0",source_identity_sha256:"",source_witness_sha256:"",records:'{"z": [1, 2], "a": "x"}',epochs:'[{"epoch": 0}]',source_processing_ranks:"[]"},
+   ];
+   for(const ed of edge)for(const recInput of [ed.records,ed.records.replace(/"a": 1/,'"a":1')]){   // reordered/whitespace JSON input must give identical bytes
+    const r=(await f.db.query(`SELECT encode(sessions.ack_attempt_sha(p),'hex') sql,p.records::text records,p.epochs::text epochs,p.source_processing_ranks::text source_processing_ranks
+     FROM jsonb_populate_record(NULL::sessions.ingest_claim_attempts,$1::jsonb) p`,[JSON.stringify({...ed,records:JSON.parse(recInput),epochs:JSON.parse(ed.epochs),source_processing_ranks:ed.source_processing_ranks===null?null:JSON.parse(ed.source_processing_ranks)})])).rows[0];
+    expect(attemptSha({...ed,records:r.records,epochs:r.epochs,source_processing_ranks:r.source_processing_ranks})).toBe(r.sql)}
+   const clocks=[{control_epoch:"3".repeat(64),source_identity_sha256:"c".repeat(64),proof:"d".repeat(64),initial_generation:"a".repeat(64),allocated_high_water:"9007199254740993"},
+    {control_epoch:"0".repeat(64),source_identity_sha256:"1".repeat(64),proof:null,initial_generation:"2".repeat(64),allocated_high_water:"0"},
+    {control_epoch:"f".repeat(64),source_identity_sha256:"e".repeat(64),proof:"Σ",initial_generation:"b".repeat(64),allocated_high_water:"9223372036854775806"}];
+   for(const c of clocks){const r=(await f.db.query(`SELECT encode(sessions.ack_clock_sha_of(x),'hex') h FROM jsonb_populate_record(NULL::sessions.ingest_receipt_seat_clock,$1::jsonb) x`,
+    [JSON.stringify({control_epoch:c.control_epoch,source_identity_sha256:c.source_identity_sha256,initial_generation:c.initial_generation,allocated_high_water:c.allocated_high_water,baseline:c.proof===null?{}:{sourceProofSha256:c.proof}})])).rows[0];
+    expect(clockSha(c)).toBe(r.h)}
+   const live=(await f.db.query("SELECT encode(sessions.ack_clock_sha(),'hex') h,control_epoch,source_identity_sha256,baseline->>'sourceProofSha256' proof,initial_generation,allocated_high_water::text FROM sessions.ingest_receipt_seat_clock")).rows[0];
+   expect(clockSha(live)).toBe(live.h);
    await f.send("g1",[record({record_id:"Σİ😀",session_id:"s"}),record({record_id:"plain",session_id:null as any})]);
    await f.send("g2",[record({record_id:"plain",revision:2,session_id:null as any})]);
    const rows=(await f.db.query(`SELECT a.claim_token::text,a.org_id,a.workspace_id,a.user_id,a.origin_id,a.batch_id,a.digest,a.reset_epoch::text,a.schema_generation,

@@ -16,6 +16,12 @@ CREATE TABLE sessions.ingest_ack_format(
  epoch bigint NOT NULL DEFAULT 0, mode text NOT NULL DEFAULT 'v1' CHECK(mode IN('v1','v2')),
  cutover_seat bigint, released_at timestamptz NOT NULL DEFAULT clock_timestamp(), changed_at timestamptz);
 INSERT INTO sessions.ingest_ack_format(singleton) VALUES(true);
+-- format eras: every seat number belongs to exactly one era (first_seat..next era's first_seat-1); P2/T6c rollback support
+CREATE TABLE sessions.ingest_ack_format_epochs(epoch bigint PRIMARY KEY,mode text NOT NULL CHECK(mode IN('v1','v2')),first_seat bigint NOT NULL,
+ changed_at timestamptz NOT NULL DEFAULT clock_timestamp());
+INSERT INTO sessions.ingest_ack_format_epochs VALUES(0,'v1',0);
+CREATE FUNCTION sessions.ack_seat_era(p_seat bigint) RETURNS text LANGUAGE sql STABLE AS
+$$ SELECT mode FROM sessions.ingest_ack_format_epochs WHERE first_seat<=p_seat ORDER BY first_seat DESC,epoch DESC LIMIT 1 $$;
 
 -- ---------- parent discriminator (§9.1) ----------
 ALTER TABLE sessions.ingest_claim_attempts ADD COLUMN ack_format smallint CHECK(ack_format IN(1,2));
@@ -77,7 +83,7 @@ RETURNS TABLE(idx int,ord int,accepted boolean,allocated boolean,reused boolean,
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $dec$
 DECLARE v sessions.ingest_ack_vectors%ROWTYPE;a sessions.ingest_claim_attempts%ROWTYPE;t sessions.ingest_stage_intents%ROWTYPE;
  b bytea;pos int;len int;i int;f int;lin bigint;off bigint;sh int;x int;k int:=0;o_seat bigint;o_kind int;o_key text;o_claim uuid;o_ord int;fd text;
- ords int[]:='{}';e record;a_f int[]:='{}';a_lin bigint[]:='{}';a_off bigint[]:='{}';a_os bigint[]:='{}';a_ok int[]:='{}';a_key text[]:='{}';a_oc uuid[]:='{}';a_oo int[]:='{}';a_fd text[]:='{}';
+j int;ords int[]:='{}';e record;a_f int[]:='{}';a_lin bigint[]:='{}';a_off bigint[]:='{}';a_os bigint[]:='{}';a_ok int[]:='{}';a_key text[]:='{}';a_oc uuid[]:='{}';a_oo int[]:='{}';a_fd text[]:='{}';
 BEGIN
  SELECT * INTO v FROM sessions.ingest_ack_vectors WHERE claim_token=p_claim;
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: vector missing';END IF;
@@ -116,12 +122,20 @@ BEGIN
    o_seat:=('x'||encode(substring(b FROM pos+1 FOR 8),'hex'))::bit(64)::bigint;pos:=pos+8;
    o_kind:=get_byte(b,pos);pos:=pos+1;
    o_key:=encode(substring(b FROM pos+1 FOR 32),'hex');pos:=pos+32;
-   IF o_seat<1 OR o_kind NOT IN(1,2) OR (v.allocated_count>0 AND o_seat>=v.seat_lo) OR (v.allocated_count=0 AND o_seat>v.clock_before) THEN
-    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: reused seat bounds';END IF;
+   IF o_seat<1 OR o_kind NOT IN(1,2) THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: reused seat bounds';END IF;
    IF o_kind=2 THEN
     IF pos+18>len THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: truncated owner';END IF;
     o_claim:=encode(substring(b FROM pos+1 FOR 16),'hex')::uuid;pos:=pos+16;o_ord:=get_byte(b,pos)<<8|get_byte(b,pos+1);pos:=pos+2;
    END IF;
+   IF o_kind=2 AND o_claim=p_claim THEN
+    -- in-claim reuse (v1 in-loop overlay): must name an EARLIER entry of this vector that allocated this seat and was accepted
+    IF NOT (o_ord=ANY(ords[1:i-1])) OR v.allocated_count=0 OR o_seat<v.seat_lo OR o_seat>v.seat_hi THEN
+     RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: in-claim reuse must name an earlier allocation';END IF;
+    j:=array_position(ords,o_ord);
+    IF (a_f[j]&3)<>3 OR v.seat_lo+(a_off[j]-1)<>o_seat THEN
+     RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: in-claim reuse must name an earlier accepted allocation';END IF;
+   ELSIF (v.allocated_count>0 AND o_seat>=v.seat_lo) OR (v.allocated_count=0 AND o_seat>v.clock_before) THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: reused seat bounds';END IF;
   END IF;
   IF (f&1)=0 THEN
    IF pos+32>len THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: truncated digest';END IF;
@@ -130,13 +144,17 @@ BEGIN
  END LOOP;
  IF pos<>len THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: trailing bytes';END IF;
  IF k<>v.allocated_count THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: allocated count';END IF;
- -- exact ord set of the ACK stage (§8.2.3)
- IF (SELECT array_agg(q.ord ORDER BY q.ord) FROM sessions.ingest_receipt_seat_records(p_claim,t.group_ordinals) q)
-  IS DISTINCT FROM (SELECT array_agg(u ORDER BY u) FROM unnest(ords) u) THEN
-  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: ord set';END IF;
- FOR e IN SELECT d.*,q.key_sha256 ck,q.key_material km,q.candidate_digest cd,q.reset_epoch re,q.fence_epoch fe
+ -- exact ord set AND exact effective v1 visit order (source_processing_ranks of the immutable attempt): idx is the
+ -- v1 processing order, so final_winners selected by idx are the v1 winners (§15)
+ IF (SELECT array_agg(q.ord ORDER BY (a.source_processing_ranks->>q.ord)::int) FROM sessions.ingest_receipt_seat_records(p_claim,t.group_ordinals) q)
+  IS DISTINCT FROM ords THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: entry order is not the processing order';END IF;
+ FOR e IN SELECT d.*,q.key_sha256 ck,q.key_material km,q.candidate_digest cd,q.reset_epoch re,q.fence_epoch fe,
+   CASE WHEN d.o_claim=p_claim THEN encode(sha256(convert_to(jsonb_build_array('lazy-ack-seat-v1',q2.key_sha256,d.o_seat::text)::text,'UTF8')),'hex') END own_key
   FROM unnest(ords,a_f,a_lin,a_off,a_os,a_ok,a_key,a_oc,a_oo,a_fd) WITH ORDINALITY d(ord,flags,lineage,off,o_seat,o_kind,o_key,o_claim,o_ord,fd,idx)
-  JOIN sessions.ingest_receipt_seat_records(p_claim,t.group_ordinals) q ON q.ord=d.ord ORDER BY d.idx LOOP
+  JOIN sessions.ingest_receipt_seat_records(p_claim,t.group_ordinals) q ON q.ord=d.ord
+  LEFT JOIN sessions.ingest_receipt_seat_records(p_claim,t.group_ordinals) q2 ON q2.ord=d.o_ord AND d.o_claim=p_claim ORDER BY d.idx LOOP
+  IF e.o_claim=p_claim AND e.own_key IS DISTINCT FROM e.o_key THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: in-claim reuse key mismatch';END IF;
   idx:=e.idx;ord:=e.ord;accepted:=(e.flags&1)=1;allocated:=(e.flags&2)=2;reused:=(e.flags&4)=4;lineage:=e.lineage;
   seat:=CASE WHEN allocated THEN v.seat_lo+(e.off-1) ELSE e.o_seat END;owner_kind:=e.o_kind;owner_claim:=e.o_claim;owner_ord:=e.o_ord;
   candidate_key:=e.ck;key_material:=e.km;candidate_digest:=e.cd;reset_epoch:=e.re;fence_epoch:=e.fe;
@@ -150,21 +168,31 @@ END $dec$;
 
 -- Owner of a seat number: v2 vector entry (exactly one, allocated). §11.2 caller requires accepted.
 CREATE FUNCTION sessions.ingest_ack_seat_owner(p_seat bigint)
-RETURNS TABLE(claim_token uuid,ord int,accepted boolean,allocated boolean,seat_key text,first_digest text)
+RETURNS TABLE(claim_token uuid,ord int,accepted boolean,allocated boolean,seat_key text,first_digest text,key_material jsonb,source text,session_id text,fence_epoch bigint)
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $$
 DECLARE v_claim uuid;v_n int;
 BEGIN
  SELECT count(*),min(x.claim_token::text)::uuid INTO v_n,v_claim FROM sessions.ingest_ack_vectors x
   WHERE x.allocated_count>0 AND numrange(x.seat_lo,x.seat_hi,'[]')@>p_seat::numeric;
  IF v_n<>1 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: seat owner not unique';END IF;
- RETURN QUERY SELECT v_claim,e.ord,e.accepted,e.allocated,e.seat_key,e.first_digest FROM sessions.ingest_ack_entries(v_claim) e WHERE e.allocated AND e.seat=p_seat;
+ RETURN QUERY SELECT v_claim,e.ord,e.accepted,e.allocated,e.seat_key,e.first_digest,e.key_material,e.source,e.session_id,e.fence_epoch FROM sessions.ingest_ack_entries(v_claim) e WHERE e.allocated AND e.seat=p_seat;
 END $$;
 
 -- ---------- guards (§12.1) ----------
 CREATE FUNCTION sessions.ack_mode() RETURNS text LANGUAGE sql VOLATILE AS $$ SELECT mode FROM sessions.ingest_ack_format WHERE singleton FOR SHARE $$;
+ALTER TABLE sessions.ingest_receipt_seats ADD COLUMN compat_vector_claim uuid REFERENCES sessions.ingest_claim_attempts(claim_token);
 CREATE FUNCTION sessions.ack_guard_seat() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $$
+DECLARE ow record;
 BEGIN PERFORM sessions.ack_require_rc();
- IF sessions.ack_mode()='v2' THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: v1 seat insert refused in mode v2';END IF;RETURN NEW;END $$;
+ IF sessions.ack_mode()='v2' THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: v1 seat insert refused in mode v2';END IF;
+ IF NEW.compat_vector_claim IS NOT NULL THEN  -- compat alias must equal an existing v2 accepted allocation exactly
+  SELECT * INTO ow FROM sessions.ingest_ack_seat_owner(NEW.seat);
+  IF NOT FOUND OR ow.claim_token<>NEW.compat_vector_claim OR NOT ow.accepted OR NOT ow.allocated OR ow.seat_key<>NEW.key_sha256
+   OR ow.first_digest<>NEW.first_digest OR ow.key_material IS DISTINCT FROM NEW.key_material THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: compat seat must alias an accepted v2 allocation';END IF;
+ ELSIF sessions.ack_seat_era(NEW.seat)<>'v1' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: v1 seat outside a v1 era';END IF;
+ RETURN NEW;END $$;
 CREATE TRIGGER ack_guard_seat BEFORE INSERT ON sessions.ingest_receipt_seats FOR EACH ROW EXECUTE FUNCTION sessions.ack_guard_seat();
 CREATE FUNCTION sessions.ack_guard_decision() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $$
 DECLARE f smallint;
@@ -180,7 +208,7 @@ DECLARE f smallint;m sessions.ingest_ack_format%ROWTYPE;
 BEGIN PERFORM sessions.ack_require_rc();
  IF TG_OP<>'INSERT' THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: vectors are immutable';END IF;
  SELECT * INTO STRICT m FROM sessions.ingest_ack_format WHERE singleton FOR SHARE;
- IF m.mode<>'v2' OR (NEW.allocated_count>0 AND NEW.seat_lo<=m.cutover_seat) THEN
+ IF m.mode<>'v2' OR (NEW.allocated_count>0 AND (NEW.seat_lo<=m.cutover_seat OR sessions.ack_seat_era(NEW.seat_lo)<>'v2')) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: vector insert refused outside mode v2';END IF;
  SELECT ack_format INTO f FROM sessions.ingest_claim_attempts WHERE claim_token=NEW.claim_token FOR UPDATE;
  IF f IS NULL THEN UPDATE sessions.ingest_claim_attempts SET ack_format=2 WHERE claim_token=NEW.claim_token;
@@ -222,8 +250,11 @@ BEGIN
  WITH ch AS MATERIALIZED(SELECT * FROM nr WHERE current_seat IS NOT NULL),
  own AS MATERIALIZED(SELECT DISTINCT v.claim_token FROM ch JOIN sessions.ingest_ack_vectors v
    ON v.allocated_count>0 AND numrange(v.seat_lo,v.seat_hi,'[]')@>ch.current_seat::numeric),
- ent AS MATERIALIZED(SELECT o.claim_token AS ct,e.* FROM own o CROSS JOIN LATERAL sessions.ingest_ack_entries(o.claim_token) e)
- SELECT count(*) INTO v_bad FROM ch LEFT JOIN ent e ON e.allocated AND e.seat=ch.current_seat
+ ent AS MATERIALIZED(SELECT o.claim_token AS ct,e.* FROM own o CROSS JOIN LATERAL sessions.ingest_ack_entries(o.claim_token) e),
+ -- final_winners: per owning vector and native key, the accepted+allocated entry with the greatest vector idx
+ -- (immutable entry order = executed v1 processing order). Only a final winner may be a slot's current seat.
+ fw AS MATERIALIZED(SELECT DISTINCT ON(ct,native_key) * FROM ent WHERE accepted AND allocated ORDER BY ct,native_key,idx DESC)
+ SELECT count(*) INTO v_bad FROM ch LEFT JOIN fw e ON e.seat=ch.current_seat
   LEFT JOIN sessions.ingest_claim_attempts a ON a.claim_token=e.ct
  WHERE e.idx IS NULL OR NOT e.accepted OR e.native_key<>ch.key_sha256
   OR a.org_id<>ch.org_id OR a.workspace_id<>ch.workspace_id OR a.origin_id<>ch.origin_id OR e.record_id<>ch.record_id
@@ -233,13 +264,18 @@ BEGIN
   OR e.fence_epoch IS DISTINCT FROM ch.current_fence_epoch OR e.lineage IS DISTINCT FROM ch.lineage
   OR ch.source_identity_sha256<>c.source_identity_sha256 OR ch.control_epoch<>c.control_epoch
   OR pol.source_identity_sha256<>c.source_identity_sha256 OR pol.control_epoch<>c.control_epoch
-  OR m.cutover_seat IS NULL OR ch.current_seat<=m.cutover_seat;
+  OR sessions.ack_seat_era(ch.current_seat) IS DISTINCT FROM 'v2';
  IF v_bad>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot current seat binding refused';END IF;
+ IF TG_OP='UPDATE' THEN  -- no regression across claims either: lineage never decreases; a v2 seat never moves backwards
+  SELECT count(*) INTO v_bad FROM nr JOIN orows o ON o.key_sha256=nr.key_sha256
+   WHERE nr.lineage<o.lineage OR (nr.current_seat IS NOT NULL AND o.current_seat IS NOT NULL AND nr.current_seat<o.current_seat);
+  IF v_bad>0 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: slot regression refused';END IF;
+ END IF;
  RETURN NULL;
 END $val$;
 CREATE TRIGGER ack_slot_validate_ins AFTER INSERT ON sessions.ingest_lazy_native_slots REFERENCING NEW TABLE AS nr
  FOR EACH STATEMENT EXECUTE FUNCTION sessions.ack_slot_validate();
-CREATE TRIGGER ack_slot_validate_upd AFTER UPDATE ON sessions.ingest_lazy_native_slots REFERENCING NEW TABLE AS nr
+CREATE TRIGGER ack_slot_validate_upd AFTER UPDATE ON sessions.ingest_lazy_native_slots REFERENCING OLD TABLE AS orows NEW TABLE AS nr
  FOR EACH STATEMENT EXECUTE FUNCTION sessions.ack_slot_validate();
 
 -- ---------- bridge: keep the v1 bodies under new names; dispatch after the clock lock (§8.1) ----------
@@ -336,16 +372,20 @@ BEGIN
   attempt_sha256,clock_identity_sha256,vec,vec_sha256)
  VALUES(a.claim_token,t.stage_token,1,v_n,v_alloc,v_before,CASE WHEN v_alloc>0 THEN v_before+1 END,CASE WHEN v_alloc>0 THEN v_last END,
   sessions.ack_attempt_sha(a),sessions.ack_clock_sha(),v_vec,sha256(v_vec));
- -- one set-based slot UPDATE + exact coverage (§13.1). Final accepted entry per native key (v5 refinement, see evidence).
+ -- one set-based slot UPDATE + exact coverage (§13.1 as amended by v9 §15): final_winners = last accepted entry per native key in vector idx order.
  WITH dec AS MATERIALIZED(SELECT * FROM sessions.ingest_ack_entries(a.claim_token)),
  want AS MATERIALIZED(SELECT DISTINCT ON(native_key) * FROM dec WHERE accepted AND allocated ORDER BY native_key,idx DESC),
  upd AS(UPDATE sessions.ingest_lazy_native_slots n SET lineage=w.lineage,current_owner=a.user_id,current_seat=w.seat,current_seat_key=NULL,
    current_legacy_key=NULL,current_revision=w.revision,current_digest=w.candidate_digest,current_source=w.source,current_session=w.session_id,
    current_reset_epoch=w.reset_epoch,current_fence_epoch=w.fence_epoch
-  FROM want w WHERE n.key_sha256=w.native_key RETURNING n.key_sha256,n.current_seat,n.lineage)
+  FROM want w WHERE n.key_sha256=w.native_key RETURNING n.key_sha256,n.current_seat,n.lineage,n.current_owner,n.current_revision,n.current_digest,
+   n.current_source,n.current_session,n.current_reset_epoch,n.current_fence_epoch)
  SELECT (SELECT count(*) FROM want),(SELECT count(DISTINCT native_key) FROM want),(SELECT count(*) FROM upd),
   (SELECT count(DISTINCT key_sha256) FROM upd),
   (SELECT count(*) FROM upd u FULL JOIN want w ON u.key_sha256=w.native_key AND u.current_seat=w.seat AND u.lineage=w.lineage
+    AND u.current_owner=a.user_id AND u.current_revision=w.revision AND u.current_digest=w.candidate_digest
+    AND u.current_source IS NOT DISTINCT FROM w.source AND u.current_session IS NOT DISTINCT FROM w.session_id
+    AND u.current_reset_epoch=w.reset_epoch AND u.current_fence_epoch=w.fence_epoch
     WHERE u.key_sha256 IS NULL OR w.native_key IS NULL)
  INTO v_want,v_want_d,v_upd,v_upd_d,v_mis;
  IF v_want<>v_want_d OR v_upd<>v_upd_d OR v_upd<>v_want OR v_mis<>0 THEN
@@ -355,6 +395,94 @@ BEGIN
  PERFORM sessions.ingest_lazy_attempt(t.claim_token);
 END $v2$;
 
+-- P2/T6c dual-aware v1-format rollback writer: the original v1 body (lazy:616-693) with exactly the [v1r change N] edits.
+CREATE FUNCTION sessions.ingest_lazy_ack_batch_v1r(p jsonb) RETURNS void
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $v1r$
+DECLARE c sessions.ingest_receipt_seat_clock%ROWTYPE;a sessions.ingest_claim_attempts%ROWTYPE;
+ t sessions.ingest_stage_intents%ROWTYPE;slot sessions.ingest_lazy_native_slots%ROWTYPE;s sessions.ingest_receipt_seats%ROWTYPE;
+ d sessions.ingest_lazy_ack_decisions%ROWTYPE;r record;ow record;v_last bigint;v_key text;v_material jsonb;v_accept boolean;v_first text;v_new_lineage bigint;
+BEGIN
+ PERFORM sessions.ingest_lazy_guard(p->>'org_id');
+ PERFORM sessions.ingest_lock_fences(p->>'org_id',p->>'workspace_id',p->>'user_id');
+ PERFORM 1 FROM sessions.ingest_lazy_user_seals u JOIN sessions.ingest_seed_fence_baselines b USING(org_id,workspace_id,user_id)
+  WHERE u.org_id=p->>'org_id' AND u.workspace_id=p->>'workspace_id' AND u.user_id=p->>'user_id' AND u.privacy_fingerprint=b.fingerprint;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: real user seal required before any receipt';END IF;
+ SELECT * INTO STRICT c FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE;v_last:=c.last_seat;
+ IF p->>'buffer_receipt_kind'='suppressed' THEN RETURN;END IF;
+ IF p->>'buffer_receipt_kind' IS DISTINCT FROM 'staged' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: unexpected receipt authority';END IF;
+ SELECT i.* INTO t FROM sessions.ingest_buffer_outbox o JOIN sessions.ingest_stage_intents i ON i.stage_token=o.active_stage_token
+  WHERE o.org_id=p->>'org_id' AND o.workspace_id=p->>'workspace_id' AND o.user_id=p->>'user_id' AND o.origin_id=p->>'origin_id'
+   AND o.batch_id=p->>'batch_id' AND o.digest=p->>'digest' AND o.state='buffered' FOR UPDATE OF i;
+ IF NOT FOUND OR t.parent_stage_token IS NOT NULL OR t.receipt_state<>'acknowledged' OR t.cleanup_state<>'live'
+  OR t.expires_at<=clock_timestamp() THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: current original stage required';END IF;
+ PERFORM sessions.ingest_lazy_attempt(t.claim_token);
+ SELECT * INTO STRICT a FROM sessions.ingest_claim_attempts WHERE claim_token=t.claim_token;
+ IF a.org_id<>t.org_id OR a.workspace_id<>t.workspace_id OR a.user_id<>t.user_id OR a.origin_id<>t.origin_id
+  OR a.batch_id<>t.batch_id OR a.digest<>t.digest OR a.reset_epoch<>t.reset_epoch
+  OR jsonb_array_length(a.source_processing_ranks)<>jsonb_array_length(a.records) THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: original candidate order changed';END IF;
+ FOR r IN SELECT q.* FROM sessions.ingest_receipt_seat_records(t.claim_token,t.group_ordinals) q
+  ORDER BY (a.source_processing_ranks->>q.ord)::integer LOOP
+  IF a.source_processing_ranks->>r.ord IS NULL THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: source processing rank missing';END IF;
+  v_material:=jsonb_build_array('global-native-custody-v1',a.org_id,a.workspace_id,a.origin_id,r.key_material->>7);
+  v_key:=encode(sha256(convert_to(v_material::text,'UTF8')),'hex');
+  SELECT * INTO slot FROM sessions.ingest_lazy_native_slots WHERE key_sha256=v_key FOR UPDATE;
+  IF NOT FOUND OR slot.key_material IS DISTINCT FROM v_material OR slot.source_identity_sha256<>c.source_identity_sha256
+   OR slot.control_epoch<>c.control_epoch THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: initialized native custody slot required';END IF;
+  IF slot.current_owner IS NOT NULL AND slot.current_owner<>a.user_id THEN
+   RAISE EXCEPTION USING ERRCODE='P0W01',MESSAGE='session ingest: native key currently belongs to another user';END IF;
+  v_accept:=slot.current_owner IS NULL OR slot.current_revision<(r.key_material->>8)::bigint;
+  v_first:=CASE WHEN v_accept THEN r.candidate_digest ELSE slot.current_digest END;
+  -- Every ignored old-source candidate receives a real target order reference;
+  -- it never fabricates the source row's publication seat.
+  IF NOT v_accept AND (slot.current_seat_key IS NOT NULL OR slot.current_seat IS NOT NULL) THEN   -- [v1r change 1]
+   IF slot.current_seat_key IS NULL THEN
+    SELECT * INTO ow FROM sessions.ingest_ack_seat_owner(slot.current_seat);
+    IF NOT FOUND OR NOT ow.accepted OR NOT ow.allocated THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: current custody seat drift';END IF;
+    INSERT INTO sessions.ingest_receipt_seats(key_sha256,key_material,seat,first_digest,source,session_id,fence_epoch,compat_vector_claim)
+     VALUES(ow.seat_key,ow.key_material,slot.current_seat,ow.first_digest,ow.source,ow.session_id,ow.fence_epoch,ow.claim_token) ON CONFLICT(key_sha256) DO NOTHING;
+    SELECT * INTO STRICT s FROM sessions.ingest_receipt_seats WHERE key_sha256=ow.seat_key;
+   ELSE
+   SELECT * INTO STRICT s FROM sessions.ingest_receipt_seats WHERE key_sha256=slot.current_seat_key;
+   END IF;
+   IF s.first_digest<>v_first THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: current custody seat drift';END IF;
+  ELSE
+   IF v_last=9223372036854775807 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: ACK seats exhausted';END IF;
+   v_last:=v_last+1;
+   INSERT INTO sessions.ingest_receipt_seats(key_sha256,key_material,seat,first_digest,source,session_id,fence_epoch)
+   VALUES(encode(sha256(convert_to(jsonb_build_array('lazy-ack-seat-v1',r.key_sha256,v_last::text)::text,'UTF8')),'hex'),
+    r.key_material,v_last,v_first,r.key_material->>10,r.key_material->>11,r.fence_epoch) RETURNING * INTO s;
+  END IF;
+  v_new_lineage:=slot.lineage;
+  IF v_accept THEN
+   IF slot.lineage=9223372036854775807 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: native lineage exhausted';END IF;
+   v_new_lineage:=slot.lineage+1;
+   UPDATE sessions.ingest_lazy_native_slots SET lineage=v_new_lineage,current_owner=a.user_id,
+    current_source=r.key_material->>10,current_session=r.key_material->>11,current_revision=(r.key_material->>8)::bigint,
+    current_digest=r.candidate_digest,current_reset_epoch=r.reset_epoch,current_fence_epoch=r.fence_epoch,
+    current_seat_key=s.key_sha256,current_legacy_key=NULL,current_seat=NULL WHERE key_sha256=v_key;   -- [v1r change 2]
+  END IF;
+  INSERT INTO sessions.ingest_lazy_ack_decisions(claim_token,ord,native_key_sha256,native_lineage,candidate_key_sha256,candidate_digest,
+   first_digest,body_accepted,seat_key_sha256,reset_epoch,fence_epoch,generation,source_control_version,source_witness_sha256)
+  VALUES(t.claim_token,r.ord,v_key,v_new_lineage,r.key_sha256,r.candidate_digest,v_first,v_accept,s.key_sha256,r.reset_epoch,r.fence_epoch,
+   a.schema_generation,a.source_control_version,a.source_witness_sha256) ON CONFLICT DO NOTHING;
+  SELECT * INTO STRICT d FROM sessions.ingest_lazy_ack_decisions WHERE claim_token=t.claim_token AND ord=r.ord;
+  IF d.native_key_sha256<>v_key OR d.native_lineage<>v_new_lineage OR d.candidate_key_sha256<>r.key_sha256 OR d.candidate_digest<>r.candidate_digest
+   OR d.first_digest<>v_first OR d.body_accepted<>v_accept OR d.seat_key_sha256<>s.key_sha256 OR d.reset_epoch<>r.reset_epoch OR d.fence_epoch<>r.fence_epoch
+   OR d.generation<>a.schema_generation OR d.source_control_version<>a.source_control_version OR d.source_witness_sha256<>a.source_witness_sha256 THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: immutable ACK decision adoption refused';END IF;
+ END LOOP;
+ UPDATE sessions.ingest_receipt_seat_clock SET last_seat=v_last WHERE singleton;
+ IF t.expires_at<=clock_timestamp() THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: stage expired while assigning seats';END IF;
+ PERFORM sessions.ingest_lazy_attempt(t.claim_token);
+END $v1r$;
+REVOKE ALL ON FUNCTION sessions.ingest_lazy_ack_batch_v1r(jsonb)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
 CREATE FUNCTION sessions.ingest_lazy_ack_batch(p jsonb) RETURNS void
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $bridge$
 BEGIN
@@ -362,7 +490,9 @@ BEGIN
  PERFORM sessions.ingest_lazy_guard(p->>'org_id');
  PERFORM sessions.ingest_lock_fences(p->>'org_id',p->>'workspace_id',p->>'user_id');
  PERFORM 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE;
- IF sessions.ack_mode()='v2' THEN PERFORM sessions.ingest_lazy_ack_batch_v2(p);ELSE PERFORM sessions.ingest_lazy_ack_batch_v1(p);END IF;
+ IF sessions.ack_mode()='v2' THEN PERFORM sessions.ingest_lazy_ack_batch_v2(p);
+ ELSIF EXISTS(SELECT 1 FROM sessions.ingest_ack_format_epochs WHERE mode='v2') THEN PERFORM sessions.ingest_lazy_ack_batch_v1r(p);
+ ELSE PERFORM sessions.ingest_lazy_ack_batch_v1(p);END IF;
 END $bridge$;
 
 -- readers dispatch on the per-claim discriminator only (§9.1)
@@ -475,11 +605,51 @@ BEGIN
   IF EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_stage_intents t ON t.claim_token=a.claim_token
    WHERE t.receipt_state='acknowledged' AND a.ack_format IS NULL AND EXISTS(SELECT 1 FROM sessions.ingest_lazy_ack_decisions d WHERE d.claim_token=a.claim_token)) THEN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: unstamped acknowledged claim';END IF;
-  UPDATE sessions.ingest_ack_format SET mode='v2',epoch=epoch+1,cutover_seat=coalesce(cutover_seat,c.last_seat),changed_at=clock_timestamp() WHERE singleton;
+  IF m.mode='v2' THEN RETURN (SELECT to_jsonb(f) FROM sessions.ingest_ack_format f WHERE singleton);END IF;
+  UPDATE sessions.ingest_ack_format SET mode='v2',epoch=epoch+1,cutover_seat=c.last_seat,changed_at=clock_timestamp() WHERE singleton;
+  INSERT INTO sessions.ingest_ack_format_epochs(epoch,mode,first_seat) SELECT epoch,'v2',c.last_seat+1 FROM sessions.ingest_ack_format WHERE singleton;
  ELSIF p_mode='v1' THEN
-  -- PROTOTYPE LIMIT: the dual-aware v1 rollback writer (design §7/§8.1) is not implemented; refuse once vectors exist.
-  IF EXISTS(SELECT 1 FROM sessions.ingest_ack_vectors) THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='ack v2: rollback writer not implemented in prototype';END IF;
+  IF m.mode='v1' THEN RETURN (SELECT to_jsonb(f) FROM sessions.ingest_ack_format f WHERE singleton);END IF;
+  -- rollback: the dual-aware v1-format writer (ingest_lazy_ack_batch_v1r) takes over for every later ACK
   UPDATE sessions.ingest_ack_format SET mode='v1',epoch=epoch+1,changed_at=clock_timestamp() WHERE singleton;
+  INSERT INTO sessions.ingest_ack_format_epochs(epoch,mode,first_seat) SELECT epoch,'v1',c.last_seat+1 FROM sessions.ingest_ack_format WHERE singleton;
  ELSE RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='ack v2: mode';END IF;
  RETURN (SELECT to_jsonb(f) FROM sessions.ingest_ack_format f WHERE singleton);
 END $set$;
+
+-- ---------- P4 / §9.9: 620 whole-row snapshot stays byte-compatible (prototype stand-in for the forward compat migration) ----------
+-- v1-shaped projection: drop current_seat; a v2 seat is presented as the v1 seat key v1 would have produced
+-- (same derivation sha256(['lazy-ack-seat-v1',candidate_key,seat]), taken from the owning vector entry).
+CREATE FUNCTION sessions.ack_slot_v1_projection(n sessions.ingest_lazy_native_slots) RETURNS jsonb LANGUAGE sql VOLATILE AS $$
+ SELECT (to_jsonb(n)-'current_seat')||CASE WHEN n.current_seat IS NULL THEN '{}'::jsonb
+  ELSE jsonb_build_object('current_seat_key',(SELECT o.seat_key FROM sessions.ingest_ack_seat_owner(n.current_seat) o)) END $$;
+CREATE OR REPLACE FUNCTION sessions.ingest_history_native_snapshot(p_stage uuid)RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $native$
+DECLARE s sessions.ingest_stage_intents%ROWTYPE;a sessions.ingest_claim_attempts%ROWTYPE;v jsonb;v_expected bigint;v_wanted bigint;
+BEGIN
+ SELECT *INTO STRICT s FROM sessions.ingest_stage_intents WHERE stage_token=p_stage;
+ SELECT *INTO STRICT a FROM sessions.ingest_claim_attempts WHERE claim_token=s.claim_token;
+ WITH keep AS MATERIALIZED(SELECT DISTINCT(o::text)::integer ord FROM jsonb_array_elements(s.group_ordinals)g CROSS JOIN LATERAL jsonb_array_elements(g)o),wanted AS MATERIALIZED(
+  SELECT DISTINCT x->>'record_id' record_id,encode(sha256(convert_to(jsonb_build_array('global-native-custody-v1',a.org_id,a.workspace_id,a.origin_id,x->>'record_id')::text,'UTF8')),'hex') key
+  FROM jsonb_array_elements(a.records)x JOIN keep k ON k.ord=(x->>'ord')::integer
+ )SELECT coalesce(jsonb_agg(jsonb_build_object('recordId',w.record_id,'slot',sessions.ack_slot_v1_projection(n))ORDER BY w.record_id COLLATE"C"),'[]'),count(*),(SELECT count(*)FROM wanted)
+ INTO v,v_expected,v_wanted FROM wanted w JOIN sessions.ingest_lazy_native_slots n ON n.key_sha256=w.key AND n.org_id=a.org_id
+  AND n.workspace_id=a.workspace_id AND n.origin_id=a.origin_id AND n.record_id=w.record_id AND n.current_owner=a.user_id;
+ IF v_expected=0 OR v_expected<>v_wanted THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='history: no current qualified native custody';END IF;
+ RETURN v;
+END $native$;
+
+-- clock preimage over an explicit row (TS golden twin, P13)
+CREATE FUNCTION sessions.ack_clock_sha_of(c sessions.ingest_receipt_seat_clock) RETURNS bytea LANGUAGE sql IMMUTABLE AS $$
+ SELECT sha256(convert_to('96bulls/ack-clock/v1','UTF8')||'\x00'::bytea||sessions.ack_ft(c.control_epoch)||sessions.ack_ft(c.source_identity_sha256)
+  ||sessions.ack_ft(c.baseline->>'sourceProofSha256')||sessions.ack_ft(c.initial_generation)||sessions.ack_fi(c.allocated_high_water)) $$;
+
+-- ---------- P10c hardening: replica-mode (session_replication_role=replica) must not skip guards/validator ----------
+ALTER TABLE sessions.ingest_receipt_seats ENABLE ALWAYS TRIGGER ack_guard_seat;
+ALTER TABLE sessions.ingest_lazy_ack_decisions ENABLE ALWAYS TRIGGER ack_guard_decision;
+ALTER TABLE sessions.ingest_ack_vectors ENABLE ALWAYS TRIGGER ack_guard_vector;
+ALTER TABLE sessions.ingest_ack_vectors ENABLE ALWAYS TRIGGER ack_vector_truncate;
+ALTER TABLE sessions.ingest_claim_attempts ENABLE ALWAYS TRIGGER ack_attempt_immutable;
+ALTER TABLE sessions.ingest_receipt_seat_clock ENABLE ALWAYS TRIGGER ack_clock_immutable;
+ALTER TABLE sessions.ingest_lazy_native_slots ENABLE ALWAYS TRIGGER ack_slot_validate_ins;
+ALTER TABLE sessions.ingest_lazy_native_slots ENABLE ALWAYS TRIGGER ack_slot_validate_upd;

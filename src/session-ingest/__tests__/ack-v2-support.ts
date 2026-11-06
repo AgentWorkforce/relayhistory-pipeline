@@ -56,17 +56,17 @@ export async function fixture(kind:"pglite"|"pg",mode:Mode,opts:{highWater?:stri
  const sign=async(witness:any):Promise<CurrentCustodyPacket>=>{const r=await db.query("SELECT encode(sha256(convert_to($1::jsonb::text,'UTF8')),'hex') AS d",[JSON.stringify(witness)]);return{witness,sourceDigest:r.rows[0]!.d as string}};
  async function version(tenant=TENANT){return String(BigInt((await db.query("SELECT coalesce(max(version),0)::text AS n FROM sessions.ingest_control_receipts WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",[tenant.orgId,tenant.workspaceId,tenant.userId])).rows[0]!.n as string))}
  /** A sender bound to its own connection (for concurrency tests). */
- function senderOn(q:{query(s:string,p?:unknown[]):Promise<any>},onTx?:(sql:string,ms:number,ok:boolean)=>void){
-  const r2=async(s:string,p:unknown[]=[])=>{const t0=performance.now();await q.query("BEGIN");await q.query("SET LOCAL ROLE bulls96_session_ingest");
+ function senderOn(q:{query(s:string,p?:unknown[]):Promise<any>},onTx?:(sql:string,ms:number,ok:boolean)=>void,iso?:string){
+  const r2=async(s:string,p:unknown[]=[])=>{const t0=performance.now();await q.query(iso?"BEGIN ISOLATION LEVEL "+iso:"BEGIN");await q.query("SET LOCAL ROLE bulls96_session_ingest");
    try{const r=await q.query(s,p);await q.query("COMMIT");onTx?.(s,performance.now()-t0,true);return r as never}catch(e){await q.query("ROLLBACK");onTx?.(s,performance.now()-t0,false);throw e}};
   const l2=sqlLedger(r2,{acceptanceMode:"buffered",expectedGeneration:generation});
-  return(id:string,records:any[],current:Record<string,SourceCurrentRecord|null>={},tenant=TENANT)=>send(id,records,current,tenant,{...deps,ledger:l2});
+  return(id:string,records:any[],current:Record<string,SourceCurrentRecord|null>={},tenant=TENANT,ranks?:number[])=>send(id,records,current,tenant,{...deps,ledger:l2},ranks);
  }
  /** Send one batch of many records; `current` maps record_id -> source current metadata (legacy custody). */
- async function send(id:string,records:any[],current:Record<string,SourceCurrentRecord|null>={},tenant=TENANT,via=deps){
+ async function send(id:string,records:any[],current:Record<string,SourceCurrentRecord|null>={},tenant=TENANT,via=deps,ranks?:number[]|"witness"){
   const raw=await batch(records,{batch_id:id,account_id:await deliveryAccount(tenant)});const p=await prepareDelivery(tenant,raw);const v=await version(tenant);
   const witness:any={version:1,issuer:"relayhistory-cloud",sourceIdentitySha256:IDENT,controlEpoch:epoch,privacyBaselineSha256:"a".repeat(64),tenant,originId:p.originId,batchId:p.batchId,batchDigest:p.batchDigest,sourceControlVersion:v,pending:false,pendingControl:null,privacyVersion:v,originalRecordCount:raw.records.length,candidateCount:p.records.length,
-   records:p.records.map((r,i)=>({preparedOrd:i,processingRank:i,candidateDigest:r.digest,recordId:r.record_id,revision:String(r.revision),revisionId:r.revision_id,candidateFenced:false,currentFenced:false,current:current[r.record_id]??null})),privacy:v==="0"?{complete:true,deletions:[],resets:[]}:null};
+   records:p.records.map((r,i)=>({preparedOrd:i,processingRank:rankOf(p.records,i,ranks),candidateDigest:r.digest,recordId:r.record_id,revision:String(r.revision),revisionId:r.revision_id,candidateFenced:false,currentFenced:false,current:current[r.record_id]??null})),privacy:v==="0"?{complete:true,deletions:[],resets:[]}:null};
   return deliverBatch({...via,custody:await sign(witness)},tenant,raw);
  }
  async function control(kind:"selection"|"reset",payload:any,tenant=TENANT){
@@ -87,6 +87,11 @@ export async function fixture(kind:"pglite"|"pg",mode:Mode,opts:{highWater?:stri
  return{db,owner,ledger,deps,send,senderOn,control,seats,gcOrdinals,slots,close,sign,lastSqlError,url:(db as any).url as string|undefined};
 }
 export type F=Awaited<ReturnType<typeof fixture>>;
+/** processing rank: default prepared order; an explicit permutation; or "witness" = the frozen witness rule
+ *  (record_id COLLATE "C", revision, revision_id), as ingest_frozen_source_witness ranks candidates. */
+function rankOf(recs:any[],i:number,ranks?:number[]|"witness"){if(!ranks)return i;if(Array.isArray(ranks))return ranks[i]!;
+ const order=recs.map((r,j)=>j).sort((a,b)=>{const x=recs[a],y=recs[b];const c=(s:string,t:string)=>Buffer.compare(Buffer.from(s),Buffer.from(t));
+  return c(x.record_id,y.record_id)||(Number(x.revision)-Number(y.revision))||c(x.revision_id,y.revision_id)});return order.indexOf(i)}
 export {TENANT,record};
 export async function meta(rec:any,tenant=TENANT):Promise<SourceCurrentRecord>{const p=await prepareDelivery(tenant,await batch([rec],{account_id:await deliveryAccount(tenant)})),r=p.records[0]!;
  return{userId:tenant.userId,revision:String(r.revision),digest:r.digest,revisionId:r.revision_id,kind:r.kind,source:r.source,sessionId:r.session_id,operation:r.operation,catalogAcceptedSeq:null,projectionAcceptedSeq:"17"} as SourceCurrentRecord}
@@ -97,4 +102,5 @@ export const ft=(s:string|null)=>preimageField(1,s===null?null:Buffer.from(s,"ut
 export const fi=(n:string|null)=>{if(n===null)return preimageField(2,null);const b=Buffer.alloc(8);b.writeBigInt64BE(BigInt(n));return preimageField(2,b)};
 export const fu=(u:string)=>preimageField(3,Buffer.from(u.replaceAll("-",""),"hex"));
 export const fj=(pgJsonText:string|null)=>preimageField(4,pgJsonText===null?null:Buffer.from(pgJsonText,"utf8"));
+export function clockSha(c:any){return createHash("sha256").update(Buffer.concat([Buffer.from("96bulls/ack-clock/v1\0","utf8"),ft(c.control_epoch),ft(c.source_identity_sha256),ft(c.proof),ft(c.initial_generation),fi(c.allocated_high_water)])).digest("hex")}
 export function attemptSha(a:any){return createHash("sha256").update(Buffer.concat([Buffer.from("96bulls/ack-attempt/v1\0","utf8"),fu(a.claim_token),ft(a.org_id),ft(a.workspace_id),ft(a.user_id),ft(a.origin_id),ft(a.batch_id),ft(a.digest),fi(a.reset_epoch),ft(a.schema_generation),fi(a.source_control_version),ft(a.source_identity_sha256),ft(a.source_witness_sha256),fj(a.records),fj(a.epochs),fj(a.source_processing_ranks)])).digest("hex")}
