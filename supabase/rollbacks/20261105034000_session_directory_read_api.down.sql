@@ -9,7 +9,8 @@
 -- applied upstream file (else sequencePreflight would see a ledger gap): refused (55000)
 -- otherwise.
 
-BEGIN;
+-- No explicit BEGIN/COMMIT, as in the sibling window downs: the guard runs first and refuses
+-- before anything is dropped (run it as one transaction, e.g. psql -1 -v ON_ERROR_STOP=1).
 DO $rollback_guard$ DECLARE v_later boolean; BEGIN
  IF to_regclass('sessions.__96bulls_migrations') IS NOT NULL THEN
   EXECUTE 'SELECT EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE ''upstream:%'' AND name COLLATE "C" > ''upstream:20261105034000_session_directory_read_api.sql'')' INTO v_later;
@@ -26,4 +27,3 @@ DO $ledger$ BEGIN
   DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105034000_session_directory_read_api.sql';
  END IF;
 END $ledger$;
-COMMIT;
