@@ -618,21 +618,32 @@ function detailedBlock(lines: readonly string[], resource: string): string[] {
  */
 function assertSrvWriterInboxPolicyDiff(detailedPlanText: string, refuse: (why: string) => never): void {
   const label = "srv-writer inbox policy update";
-  const marked = detailedBlock(detailedPlanText.split(/\r?\n/), "transcript-srv-writer")
-    .map((line) => /^  ([+-]) (.*)$/.exec(line))
-    .filter((match): match is RegExpExecArray => match !== null);
-  const removed = marked.filter((match) => match[1] === "-").map((match) => match[2]!.trim());
-  const added = marked.filter((match) => match[1] === "+").map((match) => match[2]!.trim());
+  const block = detailedBlock(detailedPlanText.split(/\r?\n/), "transcript-srv-writer");
+  let statementSid: string | undefined;
+  const marked = block
+    .map((line) => {
+      const sid = /^\s*(?:-\s+)?Sid:\s+(\S+)\s*$/.exec(line);
+      if (sid) statementSid = sid[1];
+      const change = /^  ([+-]) (.*)$/.exec(line);
+      return change ? { change, statementSid } : undefined;
+    })
+    .filter((entry): entry is { change: RegExpExecArray; statementSid: string | undefined } => entry !== undefined);
+  const removed = marked.filter(({ change }) => change[1] === "-").map(({ change }) => change[2]!.trim());
+  const added = marked.filter(({ change }) => change[1] === "+").map(({ change, statementSid: sid }) => ({ line: change[2]!.trim(), sid }));
   if (removed.length !== 0) refuse(`${label}: the policy update removes or changes existing lines`);
   if (added.length !== 4) refuse(`${label}: expected exactly four added resource lines, found ${added.length}`);
 
   const bucketArn = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID).bucketArn;
   const candidate = `- ${bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`;
-  if (added.filter((line) => line === candidate).length !== 2)
-    refuse(`${label}: the fixed candidate resource must be added exactly to Get and Put`);
-  const authority = added.filter((line) => line !== candidate);
+  const read = added.filter(({ sid }) => sid === "ReadLiveObjects").map(({ line }) => line);
+  const write = added.filter(({ sid }) => sid === "WriteLiveObjectsSseKmsOnly").map(({ line }) => line);
+  if (read.length !== 2 || write.length !== 2)
+    refuse(`${label}: authority and candidate resources must each be added once under ReadLiveObjects and WriteLiveObjectsSseKmsOnly`);
+  if (read.filter((line) => line === candidate).length !== 1 || write.filter((line) => line === candidate).length !== 1)
+    refuse(`${label}: the fixed candidate resource must be added exactly once to Get and once to Put`);
+  const authority = [...read.filter((line) => line !== candidate), ...write.filter((line) => line !== candidate)];
   if (authority.length !== 2 || authority[0] !== authority[1])
-    refuse(`${label}: one exact authority resource must be added to Get and Put`);
+    refuse(`${label}: one exact authority resource must be added to both Get and Put`);
   const prefix = `- ${bucketArn}/`;
   const line = authority[0] ?? "";
   if (!line.startsWith(prefix) || !line.endsWith("/*"))

@@ -479,6 +479,13 @@ describe("transcript store: deploy plan contract", () => {
   ].join("\n");
   const withKeyDiff = (compact: string, diff: string) =>
     detailed(compact).replace("  [transcripts-key] update", `  [transcripts-key] update\n${diff}`);
+  const inboxStatement = (sid: string, action: string, additions: string[]) => [
+    `        - Sid: ${sid}`,
+    `          Action:`,
+    `            - ${action}`,
+    `          Resource:`,
+    ...additions.map((resource) => `  +               - ${resource}`),
+  ].join("\n");
   const withInboxPolicyDiff = (compact: string, authorityRoot = AUTHORITY_ROOT, additions: string[] = [
     `${n.bucketArn}/${authorityRoot}/*`,
     `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
@@ -486,7 +493,7 @@ describe("transcript store: deploy plan contract", () => {
     `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
   ]) => detailed(compact).replace(
     "  [transcript-srv-writer] update",
-    `  [transcript-srv-writer] update\n${additions.map((resource) => `  +               - ${resource}`).join("\n")}`,
+    `  [transcript-srv-writer] update\n${inboxStatement("ReadLiveObjects", "s3:GetObject", additions.slice(0, 2))}\n${inboxStatement("WriteLiveObjectsSseKmsOnly", "s3:PutObject", additions.slice(2))}`,
   );
   const LIVE = ["AccountAdministersKey", "WriterEncryptsAndReadsViaS3", "ReaderDecryptsViaS3"];
   const PLANNED = ["AccountAdministersKey", "WriterEncryptsAndReadsViaS3", "SrvWriterEncryptsAndReadsViaS3", "ReaderDecryptsViaS3"];
@@ -520,6 +527,16 @@ describe("transcript store: deploy plan contract", () => {
     const compact = plan({ "transcript-srv-writer": "update" });
     const full = withInboxPolicyDiff(compact);
     expect(check(compact, full, provenance(compact, full))).toBe("srv-writer inbox policy update");
+    const resources = [
+      `${n.bucketArn}/${AUTHORITY_ROOT}/*`,
+      `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
+      `${n.bucketArn}/${AUTHORITY_ROOT}/*`,
+      `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
+    ];
+    const allUnder = (sid: string, action: string) => detailed(compact).replace(
+      "  [transcript-srv-writer] update",
+      `  [transcript-srv-writer] update\n${inboxStatement(sid, action, resources)}`,
+    );
     for (const bad of [
       withInboxPolicyDiff(compact, AUTHORITY_ROOT, [`${n.bucketArn}/${AUTHORITY_ROOT}/*`, `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`]),
       withInboxPolicyDiff(compact, AUTHORITY_ROOT, [
@@ -534,6 +551,8 @@ describe("transcript store: deploy plan contract", () => {
         `  +               - ${n.bucketArn}/${AUTHORITY_ROOT}/*`,
         `  +               - ${n.bucketArn}/${AUTHORITY_ROOT}/*\n  +       - s3:DeleteObject`,
       ),
+      allUnder("ReadLiveObjects", "s3:GetObject"),
+      allUnder("UseTranscriptKeyViaS3", "kms:Decrypt"),
     ])
       expect(() => check(compact, bad, provenance(compact, bad))).toThrow(/srv-writer inbox policy update/);
   });
