@@ -3,6 +3,7 @@
  *
  *   <creds> | bun run scripts/privacy-authority-handoff.ts census   --epoch <hex64>
  *   <creds> | bun run scripts/privacy-authority-handoff.ts fence    --epoch <hex64>
+ *   <creds> | bun run scripts/privacy-authority-handoff.ts sync-owned --epoch <hex64>   (needs neonUrl too; run while fenced)
  *   <creds> | bun run scripts/privacy-authority-handoff.ts activate --epoch <hex64> --expect-neon <fingerprint> [--settle-seconds 120]
  *   <creds> | bun run scripts/privacy-authority-handoff.ts release  --epoch <hex64>
  *
@@ -11,7 +12,7 @@
  * Exit: 0 done / parity · 3 census differs · 1 refused or failed · 64 usage.
  */
 import pg from "pg";
-import { activate, census, fence, release, HandoffRefusal } from "../src/migration/privacy-authority-handoff.ts";
+import { activate, census, fence, release, syncOwned, HandoffRefusal } from "../src/migration/privacy-authority-handoff.ts";
 import { postgresUrl, readStdinCredentials, refuseCredentialEnv, CredentialRefusal } from "../src/migration/stdin-credentials.ts";
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -35,12 +36,12 @@ async function connect(url: string, app: string, readOnly: boolean) {
 async function main(): Promise<number> {
   const cmd = process.argv[2];
   const epoch = arg("epoch");
-  if (!cmd || !["census", "fence", "activate", "release"].includes(cmd) || !epoch || !HEX64.test(epoch)) {
+  if (!cmd || !["census", "fence", "sync-owned", "activate", "release"].includes(cmd) || !epoch || !HEX64.test(epoch)) {
     out({ refused: "usage" });
     return 64;
   }
   refuseCredentialEnv();
-  const needsNeon = cmd === "census" || cmd === "activate";
+  const needsNeon = cmd === "census" || cmd === "activate" || cmd === "sync-owned";
   const creds = readStdinCredentials(needsNeon ? ["neonUrl", "supabaseUrl"] : ["supabaseUrl"], ["neonUrl", "supabaseUrl"]);
   const clients: pg.Client[] = [];
   try {
@@ -53,10 +54,14 @@ async function main(): Promise<number> {
     if (cmd === "census") {
       const c = await census(neon!, supa, epoch);
       out({ m: "census", ...c });
-      return c.equal ? 0 : 3;
+      return c.equal && c.ownedEqual ? 0 : 3;
     }
     if (cmd === "fence") {
       out({ m: "fenced", ...(await fence(supa, epoch)) });
+      return 0;
+    }
+    if (cmd === "sync-owned") {
+      out({ m: "owned_synced", ...(await syncOwned(neon!, supa)) });
       return 0;
     }
     if (cmd === "release") {
