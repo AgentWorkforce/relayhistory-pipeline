@@ -12,7 +12,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105041000_ingest_privacy_authority.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105041000_ingest_privacy_authority.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'e60b513c359f51d557c5bb737c0b939818ec361ab62979646e52b4ec9093e3c6'
+ IF NOT FOUND OR v_sha<>'23df7434c7fc5dab7ddfea9577df94f900354c54fc5fd9a984056603590709e5'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: own applied checksum required';END IF;
  PERFORM pg_advisory_xact_lock(1919249529,96); -- the authority lock: no begin/transition in flight
  IF EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority)
@@ -102,5 +102,5 @@ DROP TABLE sessions.ingest_frozen_source_owned_sessions;
 ALTER TABLE sessions.ingest_source_control_heads DROP COLUMN deleted;
 -- The post-apply index job's index, if it was built (scripts/ops/c3-privacy-authority/ingest_privacy_authority_index.sql).
 DROP INDEX IF EXISTS sessions.ingest_frozen_source_records_user_session;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105041000_ingest_privacy_authority.sql' AND sha256='e60b513c359f51d557c5bb737c0b939818ec361ab62979646e52b4ec9093e3c6';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105041000_ingest_privacy_authority.sql' AND sha256='23df7434c7fc5dab7ddfea9577df94f900354c54fc5fd9a984056603590709e5';
 COMMIT;

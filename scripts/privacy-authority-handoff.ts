@@ -42,7 +42,7 @@ async function main(): Promise<number> {
   }
   refuseCredentialEnv();
   const needsNeon = cmd === "census" || cmd === "activate" || cmd === "sync-owned";
-  const creds = readStdinCredentials(needsNeon ? ["neonUrl", "supabaseUrl"] : ["supabaseUrl"], ["neonUrl", "supabaseUrl"]);
+  const creds = await readStdinCredentials(needsNeon ? ["neonUrl", "supabaseUrl"] : ["supabaseUrl"], ["neonUrl", "supabaseUrl"]);
   const clients: pg.Client[] = [];
   try {
     const supa = await connect(postgresUrl(creds.supabaseUrl, "supabaseUrl"), "c3-privacy-authority-handoff", cmd === "census");

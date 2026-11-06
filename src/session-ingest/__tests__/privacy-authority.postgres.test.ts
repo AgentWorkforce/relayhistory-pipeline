@@ -68,7 +68,7 @@ async function database() {
     await admin.query("CREATE DATABASE " + nn);
     const u = new URL(url!);
     u.pathname = "/" + nn;
-    const npool = new pg.Pool({ connectionString: u.href, max: 2 });
+    const npool = new pg.Pool({ connectionString: u.href, max: 4 });
     cleanup.push(async () => {
       await npool.end();
       await admin.query("DROP DATABASE " + nn + " WITH (FORCE)");
@@ -81,7 +81,7 @@ async function database() {
 
 /** Resolves once `pid` is waiting on a lock (proves the race is real, not sequential). */
 async function waiting(pool: pg.Pool, pid: number) {
-  for (let i = 0; i < 200; i++) {
+  for (let i = 0; i < 120; i++) {
     const r = await pool.query("SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1", [pid]);
     if (r.rows[0]?.wait_event_type === "Lock") return;
     await new Promise((r) => setTimeout(r, 25));
@@ -226,4 +226,93 @@ describe.skipIf(!url)("C3 privacy authority on actual PostgreSQL", () => {
       nc.release();
     }
   });
+
+  /** A fenced authority whose owned copy holds X, and the activation that binds exactly {X}. */
+  async function ownedRace(d: Awaited<ReturnType<typeof database>>) {
+    await d.owner("ingest_privacy_authority_fence", { controlEpoch: epoch });
+    await d.pool.query("INSERT INTO sessions.ingest_frozen_source_owned_sessions VALUES($1,$2,$3,'o1','claude','X')", [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
+    const owned = (await d.pool.query("SELECT sessions.ingest_privacy_authority_owned_digest() AS d")).rows[0].d;
+    const fp = (await d.pool.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0].f;
+    const activation = { controlEpoch: epoch, neonFingerprintSha256: fp, heads: [], deletions: [], resets: [], neonOwned: owned };
+    const ownedX = async () => (await d.pool.query("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_owned_sessions WHERE session_id='X'")).rows[0].n as number;
+    const state = async () => (await d.pool.query("SELECT state FROM sessions.ingest_privacy_authority")).rows[0]?.state as string | undefined;
+    return { activation, ownedX, state };
+  }
+  const pid = (c: pg.PoolClient) => (c as unknown as { processID: number }).processID;
+
+  test("P2 race, page first: an uncommitted owned-copy DELETE holds activation off; activation then refuses the stale digest", async () => {
+    const d = await database();
+    const r = await ownedRace(d);
+    const page = await d.conn();
+    await page.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+    await page.query("DELETE FROM sessions.ingest_frozen_source_owned_sessions WHERE session_id='X'");
+    const o = await d.conn();
+    const act = settle(call(o, "ingest_privacy_authority_activate", r.activation));
+    await waiting(d.pool, pid(o));
+    await page.query("COMMIT");
+    expect(((await act) as { e?: string }).e).toContain("owned sessions differ from neon");
+    expect(await r.state()).toBe("fenced");
+  }, 30_000);
+
+  test("P2 race, activation first: a page queued behind activation refuses after it commits; the owned set stays complete", async () => {
+    const d = await database();
+    const r = await ownedRace(d);
+    const o = await d.conn();
+    await o.query("BEGIN");
+    await call(o, "ingest_privacy_authority_activate", r.activation);
+    const page = await d.conn();
+    const del = settle(page.query("DELETE FROM sessions.ingest_frozen_source_owned_sessions WHERE session_id='X'"));
+    await waiting(d.pool, pid(page));
+    await o.query("COMMIT");
+    expect(((await del) as { e?: string }).e).toContain("legacy writer refused");
+    expect(await r.state()).toBe("active");
+    expect(await r.ownedX()).toBe(1);
+  }, 30_000);
+
+  test("P2 race: an owned-copy write in REPEATABLE READ (a snapshot that could predate activation) is refused", async () => {
+    const d = await database();
+    await ownedRace(d);
+    const page = await d.conn();
+    await page.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+    const r = await settle(page.query("DELETE FROM sessions.ingest_frozen_source_owned_sessions WHERE session_id='X'"));
+    await page.query("ROLLBACK");
+    expect((r as { e?: string }).e).toContain("read committed");
+  }, 30_000);
+
+  test("P2 race, stale concurrent syncs: a second sync refuses while one runs; a stale sync result makes activation refuse", async () => {
+    const d = await database();
+    const neon = await d.neon();
+    const nc = await neon.connect();
+    const s1 = await d.conn();
+    const s2 = await d.conn();
+    const q = (c: pg.PoolClient) => ({ query: async (t: string, p?: unknown[]) => ({ rows: (await c.query(t, p as never)).rows }) });
+    const extra: pg.PoolClient[] = [];
+    try {
+      await d.owner("ingest_privacy_authority_fence", { controlEpoch: epoch });
+      // Run 1 opens its Neon cursor on an empty owned set and pauses before its (only) page commits.
+      let release!: () => void;
+      const paused = new Promise<void>((r) => (release = r));
+      let reached!: () => void;
+      const atPage = new Promise<void>((r) => (reached = r));
+      const nc1 = await neon.connect();
+      extra.push(nc1);
+      const run1 = syncOwned(q(nc1), q(s1), { hooks: { beforePageCommit: async () => { reached(); await paused; } } } as never);
+      await atPage;
+      // Neon gains X; a second sync would copy it, but must refuse while run 1 is in progress.
+      await nc.query("INSERT INTO sessions.uploaded_support_identities VALUES($1,$2,'o1','r1',$3,'claude','X')", [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
+      const nc2 = await neon.connect();
+      extra.push(nc2);
+      const run2 = await settle(syncOwned(q(nc2), q(s2)));
+      expect((run2 as { e?: string }).e).toContain("sync_owned_in_progress");
+      release();
+      await run1;
+      // Run 1's result is stale (no X): activation against the current Neon refuses.
+      const c = await census(q(nc), q(s2), epoch);
+      expect(c.ownedEqual).toBe(false);
+      expect(((await settle(activate(q(nc), q(s2), { epoch, expectNeonFingerprint: c.neon.fingerprint, settleMs: 0 }))) as { e?: string }).e).toContain("owned sessions differ from neon");
+    } finally {
+      for (const c of extra) c.release(true);
+      nc.release();
+    }
+  }, 30_000);
 });

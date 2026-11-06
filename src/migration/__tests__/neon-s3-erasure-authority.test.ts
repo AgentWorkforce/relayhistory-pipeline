@@ -5,6 +5,7 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { openSync, closeSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
@@ -34,6 +35,47 @@ const code = (fn: () => unknown) => {
   }
 };
 
+/** Runs the probe with its stdin connected to a real OS pipe from `producer` (a shell command). */
+function probe(producer: string): Promise<{ out: { ok: boolean; code?: string; ms: number }; wallMs: number }> {
+  const started = Date.now();
+  const script = new URL("./fixtures/stdin-reader-probe.ts", import.meta.url).pathname;
+  return new Promise((resolve, reject) => {
+    const child = spawn("sh", ["-c", `${producer} | "${process.execPath}" "${script}"`], { stdio: ["ignore", "pipe", "inherit"] });
+    let text = "";
+    child.stdout.on("data", (b) => (text += b));
+    child.on("error", reject);
+    // The probe prints and exits on its own; the producer may still be sleeping, so resolve on the probe's line.
+    const tick = setInterval(() => {
+      if (text.includes("\n")) {
+        clearInterval(tick);
+        child.kill("SIGKILL");
+        resolve({ out: JSON.parse(text.trim().split("\n")[0]!), wallMs: Date.now() - started });
+      }
+    }, 20);
+  });
+}
+
+describe("bounded stdin reads on a real pipe (independent review P2)", () => {
+  test("65,537 bytes on a pipe kept open refuse at once, without waiting for EOF", async () => {
+    const r = await probe(`(head -c 65537 /dev/zero | tr '\\000' ' '; sleep 30)`);
+    expect(r.out).toMatchObject({ ok: false, code: "credentials_too_large" });
+    expect(r.wallMs).toBeLessThan(10_000);
+  }, 30_000);
+  test("a producer that stalls mid-document is refused on the no-progress timeout, not at EOF", async () => {
+    const r = await probe(`(printf '{"data'; sleep 40)`);
+    expect(r.out).toMatchObject({ ok: false, code: "credentials_stdin_idle_timeout" });
+    expect(r.wallMs).toBeLessThan(20_000);
+  }, 60_000);
+  test("exactly 65,536 bytes are accepted; one more byte is refused", async () => {
+    const doc = '{"databaseUrl":"postgres://synthetic@localhost/x"}';
+    const pad = 65_536 - doc.length;
+    const ok = await probe(`(printf '%s' '${doc}'; head -c ${pad} /dev/zero | tr '\\000' ' ')`);
+    expect(ok.out).toMatchObject({ ok: true, keys: ["databaseUrl"] });
+    const over = await probe(`(printf '%s' '${doc}'; head -c ${pad + 1} /dev/zero | tr '\\000' ' ')`);
+    expect(over.out).toMatchObject({ ok: false, code: "credentials_too_large" });
+  }, 30_000);
+});
+
 describe("credentials only through stdin (RAM)", () => {
   test("every on-disk or environment credential name refuses to start, by name only", () => {
     for (const k of FORBIDDEN_CREDENTIAL_ENV) expect(code(() => refuseCredentialEnv({ [k]: "" }))).toBe(`credential_env_refused.${k}`);
@@ -57,7 +99,7 @@ describe("credentials only through stdin (RAM)", () => {
     await writeFile(f, JSON.stringify({ databaseUrl: "postgres://synthetic@localhost/x" }));
     const fd = openSync(f, "r");
     try {
-      expect(code(() => readStdinCredentials(["databaseUrl"], ["databaseUrl"], fd))).toBe("credentials_stdin_is_a_file");
+      expect(await readStdinCredentials(["databaseUrl"], ["databaseUrl"], { fd }).then(() => null, (e) => e.code)).toBe("credentials_stdin_is_a_file");
     } finally {
       closeSync(fd);
     }
