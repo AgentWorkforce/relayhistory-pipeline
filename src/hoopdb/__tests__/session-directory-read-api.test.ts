@@ -1,5 +1,5 @@
 /**
- * The read API's tenant-setting directory functions (20261105029000):
+ * The read API's tenant-setting directory functions (20261105034000):
  * sessions.list_session_directory_for and sessions.session_directory_activity_for, run AS
  * bulls96_read_api with the tenant bound the way the read Worker binds it
  * (TENANT_SETTINGS_SQL inside BEGIN READ ONLY). They must answer exactly what the
@@ -23,8 +23,8 @@ const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 /** psql meta-commands (\set) are not SQL. */
 const sql = (path: string) => read(path).split("\n").filter((l) => !l.startsWith("\\")).join("\n");
-const MIGRATION = "supabase/migrations/20261105029000_session_directory_read_api.sql";
-const DOWN = "supabase/rollbacks/20261105029000_session_directory_read_api.down.sql";
+const MIGRATION = "supabase/migrations/20261105034000_session_directory_read_api.sql";
+const DOWN = "supabase/rollbacks/20261105034000_session_directory_read_api.down.sql";
 const BOOTSTRAP = "supabase/bootstrap/session_read_api_roles.sql";
 const ROLE = sql("supabase/bootstrap/session_read_api_role.sql");
 const VERIFY = sql("supabase/bootstrap/session_read_api_role_verify.sql");

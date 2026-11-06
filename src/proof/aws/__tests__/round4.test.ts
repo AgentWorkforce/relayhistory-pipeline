@@ -200,8 +200,8 @@ describe("(c) the harness binds to the captured Stage A create-only plan", () =>
     } finally {
       console.error = orig;
     }
-    // Without docs/plans/aws-proof.* (main) the provenance is missing; with #75's committed
-    // capture of an update plan it is not create-only. Either way: refused before any AWS call.
+    // Without docs/plans/aws-proof.* (captures are local, not committed) the provenance is missing;
+    // with a local capture of an update plan it is not create-only. Either way: refused before any AWS call.
     expect(errs.join("\n")).toMatch(/refusing: stage plan (provenance .* is missing|is not create-only)/);
   });
 });

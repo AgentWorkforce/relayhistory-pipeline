@@ -74,6 +74,11 @@ const BRIEFS_UP = read(`supabase/migrations/${BRIEFS}`);
 const BRIEFS_DOWN = read(
   `supabase/rollbacks/${BRIEFS.replace(/\.sql$/, ".down.sql")}`,
 );
+const BRIEF_STATE = "20261102020000_session_brief_state.sql";
+const BRIEF_STATE_UP = read(`supabase/migrations/${BRIEF_STATE}`);
+const BRIEF_STATE_DOWN = read(
+  `supabase/rollbacks/${BRIEF_STATE.replace(/\.sql$/, ".down.sql")}`,
+);
 const EVENTS = "20261104021000_session_directory_event_metadata.sql";
 const EVENTS_UP = read(`supabase/migrations/${EVENTS}`);
 const EVENTS_DOWN = read(`supabase/rollbacks/${EVENTS.replace(/\.sql$/, ".down.sql")}`);
@@ -2306,7 +2311,7 @@ describe("short_summary rollback", () => {
     // Reverse dependency order: event metadata also depends on G6 and the list/catalog phases.
     for(const file of [...LATER_PHASES].reverse())await db.exec(read(`supabase/rollbacks/${file}`));
     await db.exec(EVENTS_DOWN);
-    await db.exec(read("supabase/rollbacks/20261102020000_session_brief_state.down.sql"));
+    await db.exec(BRIEF_STATE_DOWN);
     await db.exec(BRIEFS_DOWN);
     await db.exec(LIST_DOWN);
     await db.exec(EXPAND_DOWN);
@@ -2350,7 +2355,7 @@ describe("short_summary rollback", () => {
     await db.exec(EXPAND_UP);
     await db.exec(LIST_UP);
     await db.exec(BRIEFS_UP);
-    await db.exec(read("supabase/migrations/20261102020000_session_brief_state.sql"));
+    await db.exec(BRIEF_STATE_UP);
     await db.exec(EVENTS_UP);
     for(const file of LATER_PHASES)await db.exec(read(`supabase/migrations/${file.replace(/\.down\.sql$/,".sql")}`));
     await db.query(
@@ -2399,13 +2404,14 @@ describe("Worker role validation in two phases", () => {
     const error = await outcome(db, PHASE2);
     expect(error?.code).toBe("55000");
     expect(error?.message).toContain(PHASE2_PREFIX);
-    for (const sig of [
-      RPC_SIGNATURE,
-      "sessions.session_directory_pointers(text, text, text)",
-      "sessions.session_directory_readiness()",
-      "sessions.session_brief(text, text, text)",
-    ])
-      expect(error?.message).toContain(`approved RPC missing: ${sig.replace(/, /g, ",").replace(/\btimestamptz\b/g, "timestamp with time zone")}`);
+    const manifest = JSON.parse(
+      read("src/hoopdb/sessions-function-acl.json"),
+    ) as { functions: Record<string, string[]> };
+    const workerSignatures = Object.entries(manifest.functions)
+      .filter(([, acl]) => acl.includes(`${WORKER}:EXECUTE`))
+      .map(([signature]) => signature);
+    for (const sig of workerSignatures)
+      expect(error?.message).toContain(`approved RPC missing: ${sig}`);
     expect(error?.message).toContain("missing USAGE on schema sessions");
   });
 
@@ -2510,6 +2516,13 @@ describe("Worker role validation in two phases", () => {
         RETURNS integer LANGUAGE sql AS 'SELECT 1';
       GRANT EXECUTE ON FUNCTION sessions.session_directory_pointers(text, text) TO ${WORKER}`,
       "approved RPC redefined: sessions.session_directory_pointers(text,text)",
+    ],
+    [
+      "a redefined brief-document authority RPC",
+      `CREATE FUNCTION sessions.session_brief_document_authority(p_workspace_id text)
+        RETURNS integer LANGUAGE sql AS 'SELECT 1';
+      GRANT EXECUTE ON FUNCTION sessions.session_brief_document_authority(text) TO ${WORKER}`,
+      "approved RPC redefined: sessions.session_brief_document_authority(text)",
     ],
     [
       "a revoked approved grant",

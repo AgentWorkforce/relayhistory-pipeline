@@ -5,7 +5,7 @@
  * host, and a database named `g6_plan_evidence` is dropped and recreated there.
  *
  *   bun scripts/session-directory-plan-evidence.ts postgres://postgres@127.0.0.1:55415/postgres \
- *     postgres://postgres@127.0.0.1:55432/postgres > docs/evidence/session-directory-plans.md
+ *     postgres://postgres@127.0.0.1:55432/postgres > session-directory-plans.md   # local only; not committed
  *
  * Applies supabase/tests/supabase_shim.sql and every supabase/migrations file, seeds
  * synthetic multi-tenant data, then records, for each server:

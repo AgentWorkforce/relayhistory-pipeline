@@ -20,6 +20,21 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Updated before release (K-1, K-2: key-block segmentation fixes). Version 2 had
   // sealed no chunk: it was only ever on the unmerged #108 branch, and images build from main.
   2: "417d545e6b79b1100e206e7a6add66f24819868b2606e9ca2c45c09be9644ee2",
+  // Quoted secret keys at any JSON escaping depth, Cloudflare scannable tokens and
+  // more provider prefixes, non-Bearer Authorization, and the entropy fallback next
+  // to a secret name (2026-11-02 Cloudflare-token-in-transcript finding).
+  // Updated before release (#162 adversarial review: the segmenter's CUT_CONTEXT_CHARS
+  // widened from 4096 to 8192, past the quoted rule's reach). Version 3 has sealed no
+  // chunk: it is only on the unmerged #162 branch.
+  // Then the entropy fallback stopped firing after a `/`, `.` or `-` (paths, members,
+  // branch names), and an unquoted value after a quoted key is taken only after a
+  // one-word key and only when it looks generated (code and quoted prose are kept).
+  // Then the literal-prefix rules stopped starting after a `-` inside a longer token
+  // (they cut SendGrid and other full-shape keys and leaked their start; a glued
+  // `word-sk-…` is taken later, whole), and the SendGrid rule moved ahead of them.
+  // Then the glued-prefix pass tries the relay_ rule first (its body may hold a `.`), so
+  // `build-relay_…-sk-….tail` is no longer split at the `.` by the `sk-` rule.
+  3: "e7607073a3afca3db6b015945f0b5fab256202f355b740f515987ec162bf3076",
 };
 
 const read = (rel: string) =>

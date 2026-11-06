@@ -370,7 +370,7 @@ describe("directory list and activity (P3b)", () => {
         expect((await body(r)).error.reason).toBe("directory_workspace_not_enabled");
       }
     }
-    // With migration 20261105029000 applied (global-setup runs every migration).
+    // With migration 20261105034000 applied (global-setup runs every migration).
     await owner((c) =>
       c.query(
         `INSERT INTO sessions.session_directory (org_id, workspace_id, harness, session_id, created_at, last_activity_at, task_title)

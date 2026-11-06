@@ -1,7 +1,7 @@
 # 96Bulls session ingest: design (2026-11-01)
 
 **Goal:** take the session **write** path off relayhistory-cloud's Neon.
-- S3 (sessions-prod, 941433935742, us-east-1) is the record, and Supabase holds the ledger.
+- S3 (sessions-prod, <account-id>, us-east-1) is the record, and Supabase holds the ledger.
 - Neon is an optional, asynchronous replica for the transition only.
 - The 96Bulls pipeline (S3 notification → SQS → Lambda, #121) indexes from S3 as today.
 

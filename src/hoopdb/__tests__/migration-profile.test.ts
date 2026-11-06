@@ -1503,30 +1503,113 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   };
   const platformList = [...SUPABASE_PLATFORM_SUPERUSERS];
 
-  test("620 down then reapply through the real migrator (supabase, global-default-revoke): the down commits, the next run reapplies 026000 with no function_acl_drift and the marker passes", async () => {
+  test("window-two down/reapply through the real migrator: later migrations refuse out-of-order rollback and the next run restores the gap-free prefix", async () => {
     const db = await supabaseLike();
     await db.exec(OWNER_FN_DEFAULT_REVOKE);
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
+    const B = "upstream:20261105024000_session_brief_documents.sql";
+    const J = "upstream:20261105025000_canonical_feature_journal.sql";
     const L = "upstream:20261105026000_canonical_history_lineage.sql";
+    const C = "upstream:20261105030000_canonical_feature_consumer_acks.sql";
+    const D = "upstream:20261105031000_desktop_catalog_forget_reproject.sql";
+    const K = "upstream:20261105032000_session_large_read_routing_fixes.sql";
+    const S = "upstream:20261105035000_semantic_copy_state.sql";
+    const E = "upstream:20261105036000_canonical_consumer_lease.sql";
+    const F = "upstream:20261105037000_session_directory_document_pool.sql";
+    const R = "upstream:20261105034000_session_directory_read_api.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
-    expect(await names()).toContain(L);
+    const rollback = (name: string) =>
+      db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8"));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
     expect(await passed()).toBe(true);
-    // The named downs, committed as the owner (not inside a test rollback), newest first:
-    // 026000's down refuses while a later migration (20261105029000, P3b) is applied.
-    const P3B = "supabase/rollbacks/20261105029000_session_directory_read_api.down.sql";
-    expect(await failure(db.exec(readFileSync(join(root, "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql"), "utf8")))).not.toBeNull();
-    await db.exec(readFileSync(join(root, P3B), "utf8"));
-    expect(await names()).not.toContain("upstream:20261105029000_session_directory_read_api.sql");
-    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql"), "utf8"));
+    const outOfOrder = await failure(
+      rollback("20261105024000_session_brief_documents.down.sql"),
+    );
+    expect(outOfOrder?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
+    // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
+    expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(R);
+    // 036000 is the latest lane: 035000, 032000, 031000 and 030000 all refuse while it is applied.
+    expect((await failure(rollback("20261105035000_semantic_copy_state.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105031000_desktop_catalog_forget_reproject.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105030000_canonical_feature_consumer_acks.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([C, D, K, S, E]));
+    const relation = async (name: string) =>
+      (await db.query<{ r: string | null }>("SELECT to_regclass($1)::text r", [name])).rows[0]?.r ?? null;
+    const catalogRpc = async () =>
+      (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.session_directory_desktop_catalog(text,text,text)'::regprocedure")).rows[0]!.s;
+    const routeRpc = async () =>
+      (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.route_session_large_read(text,text,text,text)'::regprocedure")).rows[0]!.s;
+    // 030000 cannot roll back under 031000/032000/035000/036000; 031000 cannot roll back under 032000;
+    // 032000 cannot roll back under 035000/036000 or any later ledgered step.
+    expect((await failure(rollback("20261105030000_canonical_feature_consumer_acks.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.canonical_feature_copy_state")).toBe("sessions.canonical_feature_copy_state");
+    expect((await failure(rollback("20261105031000_desktop_catalog_forget_reproject.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
+    expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
+    const LATER = "upstream:20261105099000_rollback_guard_probe.sql";
+    await db.query(
+      "INSERT INTO sessions.__96bulls_migrations SELECT (jsonb_populate_record(NULL::sessions.__96bulls_migrations, to_jsonb(m) || jsonb_build_object('name', $2::text))).* FROM sessions.__96bulls_migrations m WHERE m.name = $1",
+      [K, LATER],
+    );
+    expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
+    await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
+    // Later lanes roll back first and remove their own ledger rows; only then
+    // can the next down preserve a gap-free applied prefix.
+    await rollback("20261105037000_session_directory_document_pool.down.sql");
+    expect(await names()).not.toContain(F);
+    await rollback("20261105036000_canonical_consumer_lease.down.sql");
+    expect(await names()).not.toContain(E);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_consumer_lease')::text r")).rows[0]?.r).toBeNull();
+    // With 036000 gone, 035000 is still a later ledgered lane: 032000 keeps refusing until it rolls back.
+    expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
+    await rollback("20261105035000_semantic_copy_state.down.sql");
+    expect(await names()).not.toContain(S);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.search_feature_copy_state')::text r")).rows[0]?.r).toBeNull();
+    // 034000 (P3b) is now the latest lane: 032000 refuses until it rolls back (strictly descending).
+    expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
+    await rollback("20261105034000_session_directory_read_api.down.sql");
+    expect(await names()).not.toContain(R);
+    expect((await db.query<{ f: string | null }>("SELECT to_regprocedure('sessions.session_directory_activity_for(text,timestamptz,timestamptz)')::text f")).rows[0]?.f).toBeNull();
+    await rollback("20261105032000_session_large_read_routing_fixes.down.sql");
+    expect(await names()).not.toContain(K);
+    expect(await relation("sessions.session_large_read_scope_errors")).toBeNull();
+    expect(await routeRpc()).toContain("unknown_count");
+    await rollback("20261105031000_desktop_catalog_forget_reproject.down.sql");
+    expect(await names()).not.toContain(D);
+    expect(await relation("sessions.session_desktop_catalog_reproject")).toBeNull();
+    expect(await relation("sessions.session_desktop_catalog_control")).toBeNull();
+    expect(await catalogRpc()).not.toContain("forget_tracking");
+    await rollback("20261105030000_canonical_feature_consumer_acks.down.sql");
+    expect(await names()).not.toContain(C);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBeNull();
+    await rollback("20261105026000_canonical_history_lineage.down.sql");
     expect(await names()).not.toContain(L);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBeNull();
-    // The very next migrate reapplies 026000; the post-validation exact-ACL check finds no drift.
+    await rollback("20261105025000_canonical_feature_journal.down.sql");
+    expect(await names()).not.toContain(J);
+    await rollback("20261105024000_session_brief_documents.down.sql");
+    expect(await names()).not.toContain(B);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBeNull();
+    // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 032000, 034000 (P3b),
+    // 035000 and 036000; the post-validation exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toContain(L);
-    expect(await names()).toContain("upstream:20261105029000_session_directory_read_api.sql");
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, S, E]));
+    expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
+    expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
+    expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
+    expect(await routeRpc()).not.toContain("unknown_count");
     expect(await passed()).toBe(true);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_consumer_lease')::text r")).rows[0]?.r).toBe("sessions.canonical_feature_consumer_lease");
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBe("sessions.session_brief_document_scopes");
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_history_switch')::text r")).rows[0]?.r).toBe("sessions.ingest_history_switch");
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.canonical_feature_copy_state')::text r")).rows[0]?.r).toBe("sessions.canonical_feature_copy_state");
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.search_feature_copy_state')::text r")).rows[0]?.r).toBe("sessions.search_feature_copy_state");
     // And a no-op rerun stays clean.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
   });

@@ -50,6 +50,8 @@ import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 import {
   SESSION_BRIEF_RESOURCES,
+  SESSION_ANALYSIS_CACHE_RESOURCES,
+  SESSION_SEMANTIC_COPY_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
   assertSessionPipelineInputs,
   pipelineBucketStatements,
@@ -204,6 +206,10 @@ export type TranscriptStorePlanPhase =
   | "session read api update"
   | "session brief rollout"
   | "session brief update"
+  | "session analysis cache rollout"
+  | "session analysis cache update"
+  | "session semantic copy rollout"
+  | "session semantic copy update"
   | "repo tag rename";
 
 /**
@@ -288,6 +294,7 @@ function sessionBriefPhase(
   const [schedule, permission] = SESSION_BRIEF_RESOURCES.map((r) => operations.get(r) ?? "noop");
   const brief = [schedule, permission];
   if (brief.every((a) => a === "noop")) return undefined;
+  if(SESSION_ANALYSIS_CACHE_RESOURCES.some(r=>operations.has(r)&&operations.get(r)!=="noop"))return refuse("session brief and analysis cache schedules require separate reviewed phases");
   const changes = () => [...operations].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ");
   const phase: TranscriptStorePlanPhase | undefined =
     brief.every((a) => a === "create" || a === "noop")
@@ -314,6 +321,66 @@ function sessionBriefPhase(
     return refuse(`${phase}: the rest of the plan must be noop or a session pipeline update: ${changes()}`);
   assertPipelineRoleCascadeDiff(rest, detailedPlanText, stateSnapshotText, refuse);
   return phase;
+}
+
+function sessionAnalysisCachePhase(
+  operations: ReadonlyMap<string, string>,
+  detailedPlanText: string,
+  stateSnapshotText: string | undefined,
+  refuse: (why: string) => never,
+): TranscriptStorePlanPhase | undefined {
+  // Absent (a plan captured before briefs) or all noop: not an analysis cache phase. expectedResources
+  // already refused a plan that lists some analysis cache resources but not all.
+  const [schedule, permission,reconcileSchedule,reconcilePermission] = SESSION_ANALYSIS_CACHE_RESOURCES.map((r) => operations.get(r) ?? "noop");
+  const brief = [schedule, permission,reconcileSchedule,reconcilePermission];
+  if (brief.every((a) => a === "noop")) return undefined;
+  if(SESSION_BRIEF_RESOURCES.some(r=>operations.has(r)&&operations.get(r)!=="noop"))return refuse("brief and analysis cache schedules require separate reviewed phases");
+  const changes = () => [...operations].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ");
+  const analysisPhase: TranscriptStorePlanPhase | undefined =
+    brief.every((a) => a === "create" || a === "noop")
+      ? "session analysis cache rollout"
+      : permission === "noop" && reconcilePermission === "noop" && [schedule,reconcileSchedule].every(a=>a==="update"||a==="noop") && [schedule,reconcileSchedule].some(a=>a==="update")
+        ? "session analysis cache update"
+        : undefined;
+  // The EventBridge permission is create-once. Enabling or disabling briefs changes only
+  // the schedule state; an in-place permission edit could widen the invoking principal.
+  if (!analysisPhase) return refuse(`session analysis cache resources have an unsafe action combination: ${changes()}`);
+  // The read API stays noop, except for the code-only cascade a shared-code change on main
+  // causes (assertReadApiCodeOnlyCascade): it is then judged on its own and left out of the analysisRest.
+  const analysisReadApi = SESSION_READ_API_RESOURCES as readonly string[];
+  if (!analysisReadApi.every((r) => !operations.has(r) || operations.get(r) === "noop")) {
+    if (!readApiCodeOnlyShape(operations))
+      return refuse(`${analysisPhase}: the read api may not change in the same plan: ${changes()}`);
+    assertReadApiCodeOnlyCascade(detailedPlanText, stateSnapshotText, (why) => refuse(`${analysisPhase}: ${why}`));
+  }
+  const analysisRest = new Map(
+    [...operations].filter(([r]) => !(SESSION_ANALYSIS_CACHE_RESOURCES as readonly string[]).includes(r) && !analysisReadApi.includes(r)),
+  );
+  if ([...analysisRest.values()].every((a) => a === "noop")) return analysisPhase;
+  if (sessionPipelinePhase(analysisRest) !== "session pipeline update")
+    return refuse(`${analysisPhase}: the analysisRest of the plan must be noop or a session pipeline update: ${changes()}`);
+  assertPipelineRoleCascadeDiff(analysisRest, detailedPlanText, stateSnapshotText, refuse);
+  return analysisPhase;
+}
+
+/** The copier schedule is a separately reviewed phase, never a mixed rollout. */
+function sessionSemanticCopyPhase(operations:ReadonlyMap<string,string>,detailedPlanText:string,stateSnapshotText:string|undefined,refuse:(why:string)=>never):TranscriptStorePlanPhase|undefined{
+ const [semanticSchedule,semanticPermission]=SESSION_SEMANTIC_COPY_RESOURCES.map(r=>operations.get(r)??"noop");
+ if(semanticSchedule==="noop"&&semanticPermission==="noop")return undefined;
+ const semanticPhase:TranscriptStorePlanPhase|undefined=[semanticSchedule,semanticPermission].every(a=>a==="create"||a==="noop")?"session semantic copy rollout":semanticSchedule==="update"&&semanticPermission==="noop"?"session semantic copy update":undefined;
+ if(!semanticPhase)return refuse("semantic copy resources have an unsafe action combination");
+ const allowed=new Set<string>([...SESSION_SEMANTIC_COPY_RESOURCES,...SESSION_PIPELINE_RESOURCES,...ROLE_GRANT_RESOURCES,...SESSION_READ_API_RESOURCES]);
+ if([...operations].some(([r,a])=>a!=="noop"&&!allowed.has(r)))return refuse("semantic copy requires a separate reviewed phase");
+ const semanticReadApi=SESSION_READ_API_RESOURCES as readonly string[];
+ if(!semanticReadApi.every(r=>!operations.has(r)||operations.get(r)==="noop")){
+  if(!readApiCodeOnlyShape(operations))return refuse("semantic copy: read api may not change in same plan");
+  assertReadApiCodeOnlyCascade(detailedPlanText,stateSnapshotText,why=>refuse("semantic copy: "+why));
+ }
+ const semanticRest=new Map([...operations].filter(([r])=>!(SESSION_SEMANTIC_COPY_RESOURCES as readonly string[]).includes(r)&&!semanticReadApi.includes(r)));
+ if([...semanticRest.values()].every(a=>a==="noop"))return semanticPhase;
+ if(sessionPipelinePhase(semanticRest)!=="session pipeline update")return refuse("semantic copy: rest must be noop or session pipeline update");
+ assertPipelineRoleCascadeDiff(semanticRest,detailedPlanText,stateSnapshotText,refuse);
+ return semanticPhase;
 }
 
 const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; actions: Readonly<Record<string, "create" | "update">> }> = [
@@ -352,10 +419,14 @@ function expectedResources(names: Iterable<string>): readonly string[] {
   const readApi = new Set<string>(SESSION_READ_API_RESOURCES);
   const brief = new Set<string>(SESSION_BRIEF_RESOURCES);
   const withBrief = list.some((n) => brief.has(n));
+  const analysis=new Set<string>(SESSION_ANALYSIS_CACHE_RESOURCES);const withAnalysis=list.some(n=>analysis.has(n));
+  const withSemantic=list.some(n=>(SESSION_SEMANTIC_COPY_RESOURCES as readonly string[]).includes(n));
   return [
     ...TRANSCRIPT_RESOURCES,
-    ...(withBrief || list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
+    ...(withBrief || withAnalysis || withSemantic || list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
     ...(withBrief ? SESSION_BRIEF_RESOURCES : []),
+    ...(withAnalysis ? SESSION_ANALYSIS_CACHE_RESOURCES : []),
+    ...(withSemantic?SESSION_SEMANTIC_COPY_RESOURCES:[]),
     ...(list.some((n) => readApi.has(n)) ? SESSION_READ_API_RESOURCES : []),
   ];
 }
@@ -437,7 +508,11 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
     return "repo tag rename";
   }
   // The brief schedule changes alone, or with exactly a session pipeline update.
+  const semanticPhase=sessionSemanticCopyPhase(compact.operations,capture.detailedPlanText,capture.stateSnapshotText,refuse);
+  if(semanticPhase)return semanticPhase;
   const briefPhase = sessionBriefPhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
+  const analysisPhase=sessionAnalysisCachePhase(compact.operations,capture.detailedPlanText,capture.stateSnapshotText,refuse);
+  if(analysisPhase)return analysisPhase;
   if (briefPhase) return briefPhase;
   // The read API changes alone (or, in its rollout, with the pipeline's exact code-only cascade);
   // once it is all noop, the rest of the plan is judged as before.

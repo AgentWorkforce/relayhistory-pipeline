@@ -1,6 +1,6 @@
 /**
  * Lane: read-api (P3b read API directory functions, #236).
- * supabase/migrations/20261105029000_session_directory_read_api.sql owns three functions:
+ * supabase/migrations/20261105034000_session_directory_read_api.sql owns three functions:
  *   session_directory_read_api_scope   tenant pin; not SECURITY DEFINER; owner-only EXECUTE
  *   list_session_directory_for         SECURITY DEFINER; EXECUTE to bulls96_read_api
  *   session_directory_activity_for     SECURITY DEFINER; EXECUTE to bulls96_read_api
@@ -9,7 +9,7 @@
  */
 import type { LaneManifest } from "../types.ts";
 
-const MIGRATION = "supabase/migrations/20261105029000_session_directory_read_api.sql";
+const MIGRATION = "supabase/migrations/20261105034000_session_directory_read_api.sql";
 const T = "timestamp with time zone";
 
 export const readApi: LaneManifest = {

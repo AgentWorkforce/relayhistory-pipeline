@@ -3,7 +3,7 @@
  * Supabase directory, the canary allowlist, the 501 contract (never Neon), parameter
  * validation as relayhistory's, the row mapping and cursors, and the not-yet-migrated
  * routes. sqlDirectory itself is exercised against PGlite: without migration
- * 20261105029000 it answers null (501 directory_not_migrated), never an empty page.
+ * 20261105034000 it answers null (501 directory_not_migrated), never an empty page.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
@@ -287,13 +287,13 @@ describe("GET /v1/sessions/activity from the directory", () => {
 });
 
 describe("routes not yet migrated answer 501 with the store they need", () => {
-  test("output, turns, metadata, digest (and timing without its canonical source)", async () => {
+  test("output, digest, and timing/turns/metadata without their canonical source", async () => {
     const { get } = api({ directory: stubDirectory().directory });
     for (const [path, reason] of [
       ["/v1/sessions/s-1/timing?workspace=ws-a&source=codex", "timing_not_configured"],
       ["/v1/sessions/output?workspace=ws-a&since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z", "output_not_migrated"],
-      ["/v1/sessions/s-1/turns?workspace=ws-a", "turns_not_migrated"],
-      ["/v1/sessions/s-1/metadata?workspace=ws-a", "turns_not_migrated"],
+      ["/v1/sessions/s-1/turns?workspace=ws-a", "turns_not_configured"],
+      ["/v1/sessions/s-1/metadata?workspace=ws-a", "turns_not_configured"],
       ["/v1/digest/daily?workspace=ws-a&date=2026-10-01", "digest_not_migrated"],
     ] as const) {
       const r = await get(path);
@@ -343,7 +343,7 @@ describe("mapping and cursors", () => {
   });
 });
 
-describe("sqlDirectory against Supabase without migration 20261105029000", () => {
+describe("sqlDirectory against Supabase without migration 20261105034000", () => {
   const open: PGlite[] = [];
   afterEach(async () => {
     await Promise.all(open.splice(0).map((db) => db.close()));
@@ -357,7 +357,7 @@ describe("sqlDirectory against Supabase without migration 20261105029000", () =>
     await db.exec(read("supabase/tests/supabase_shim.sql"));
     for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read(`supabase/bootstrap/${f}.sql`));
     for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
-      if (file.startsWith("20261105029000")) continue;
+      if (file.startsWith("20261105034000")) continue;
       await db.exec(read(`supabase/migrations/${file}`));
     }
     await db.exec(read("supabase/bootstrap/session_read_api_role.sql").split("\n").filter((l) => !l.startsWith("\\")).join("\n"));

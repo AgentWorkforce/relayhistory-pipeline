@@ -70,6 +70,7 @@ DECLARE
  'sessions.request_session_analysis_cache(text,text,text)',
  'sessions.search_session_directory(text,text,text,text,text,boolean,text,text,text,text,text,timestamp with time zone,timestamp with time zone,text,timestamp with time zone,text,text,text,integer)',
  'sessions.session_brief(text,text,text)',
+ 'sessions.session_brief_document_authority(text,text[],text[])',
  'sessions.session_directory_activity(text,timestamp with time zone,timestamp with time zone)',
  'sessions.session_directory_analysis_cache(text,text,text)',
  'sessions.session_directory_desktop_catalog(text,text,text)',
@@ -166,7 +167,7 @@ BEGIN
   END LOOP;
   FOR v_row IN SELECT p.oid::regprocedure AS fn FROM pg_proc AS p
                 WHERE p.pronamespace = v_sessions
-                  AND p.proname IN ('search_session_directory', 'session_directory_pointers',
+                  AND p.proname IN ('session_brief_document_authority', 'search_session_directory', 'session_directory_pointers',
                                     'session_directory_readiness', 'list_session_directory',
                                     'session_directory_activity', 'session_directory_event_activity', 'list_session_directory_events', 'session_brief')
                   AND NOT (p.oid = ANY (v_fns)) LOOP

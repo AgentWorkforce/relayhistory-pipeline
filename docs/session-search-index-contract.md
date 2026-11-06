@@ -182,7 +182,8 @@ Prefix lookup is served only by `sessions.search_session_directory`
 `AgentPrefixRequiresRpcError` (`directAgentPrefix`), raised before any SQL, and there is
 no direct prefix query. Under RLS the direct path could not bound a broad prefix: its
 bounds and LIKE recheck are estimated as independent, and PostgreSQL 15 and 17 chose a
-Seq Scan of the whole tenant (`docs/evidence/session-directory-plans.md`).
+Seq Scan of the whole tenant (local evidence from `scripts/session-directory-plan-evidence.ts`;
+not committed).
 
 In the RPC, a prefix needs at least three meaningful characters (`22023` otherwise).
 Before the page runs, the RPC counts the prefix's candidates, stopping after 5,001:

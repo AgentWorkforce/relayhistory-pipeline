@@ -1,6 +1,13 @@
+import {
+  canonicalArtifactPage,
+  type ArtifactReadDeps,
+} from "../../../src/session-read-api/canonical-artifact-reader.ts";
+import { compareArtifactEventRows } from "../../../src/session-read-api/canonical-artifact.ts";
+import { objectKey } from "../../object-store/src/index.ts";
 import { decompress } from "fzstd";
 import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
 import type { Bindings } from "../../pipeline/src/env.ts";
+import { logLine } from "../../../src/shared/log.ts";
 import {
   canonicalSnapshot,
   CanonicalReadError,
@@ -22,6 +29,7 @@ export type CanonicalEnv = Pick<
   | "PIPELINE_KEY_PREFIX"
 > & {
   CANONICAL_READ_ENABLED?: string;
+  CANONICAL_READ_MODE?: "raw" | "pages" | string;
   CANONICAL_SUPABASE_URL?: string;
   CANONICAL_SUPABASE_API_KEY?: string;
 };
@@ -36,6 +44,8 @@ const tables = new Set([
   "conversation_turns",
   "session_links",
   "session_outcomes",
+  "session_timing",
+  "session_directory_event_values",
 ]);
 async function boundedJson(
   response: Response,
@@ -106,11 +116,32 @@ function tokenTenant(
     throw new CanonicalReadError("authorization", 401);
   }
 }
-export function canonicalPointerReader(
+/** PostgREST resolves RPCs by argument NAME, so the body keys must match each SQL
+ * signature exactly. request_session_analysis_cache(p_workspace,p_harness,p_session)
+ * (20261105023000_session_analysis_publications.sql) is the only claim RPC without the
+ * _id suffix; every other one here takes (p_workspace_id,p_harness,p_session_id). */
+export function canonicalRpcBody(
+  rpc: string,
+  identity: Pick<CanonicalIdentity, "workspaceId" | "source" | "sessionId">,
+): Record<string, string> {
+  return rpc === "request_session_analysis_cache"
+    ? {
+        p_workspace: identity.workspaceId,
+        p_harness: identity.source,
+        p_session: identity.sessionId,
+      }
+    : {
+        p_workspace_id: identity.workspaceId,
+        p_harness: identity.source,
+        p_session_id: identity.sessionId,
+      };
+}
+function canonicalMetadataReader(
   env: CanonicalEnv,
   token: string,
   signal: AbortSignal,
   fetcher: typeof fetch = fetch,
+  rpc = "session_directory_pointers",
 ) {
   const base = env.CANONICAL_SUPABASE_URL,
     apiKey = env.CANONICAL_SUPABASE_API_KEY;
@@ -120,11 +151,10 @@ export function canonicalPointerReader(
     throw new CanonicalReadError("not_configured");
   const root = url.pathname.replace(/\/+$/u, "");
   url.pathname =
-    (root.endsWith("/rest/v1") ? root : root + "/rest/v1") +
-    "/rpc/session_directory_pointers";
+    (root.endsWith("/rest/v1") ? root : root + "/rest/v1") + "/rpc/" + rpc;
   url.search = "";
   url.hash = "";
-  return async (identity: CanonicalIdentity): Promise<CanonicalPointer[]> => {
+  return async (identity: CanonicalIdentity): Promise<unknown> => {
     const response = await fetcher(url, {
       method: "POST",
       redirect: "error",
@@ -134,11 +164,7 @@ export function canonicalPointerReader(
         "content-profile": "sessions",
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        p_workspace_id: identity.workspaceId,
-        p_harness: identity.source,
-        p_session_id: identity.sessionId,
-      }),
+      body: JSON.stringify(canonicalRpcBody(rpc, identity)),
       signal,
     });
     if (!response.ok) {
@@ -148,16 +174,52 @@ export function canonicalPointerReader(
         response.status === 401 || response.status === 403 ? 401 : 503,
       );
     }
-    const value = await boundedJson(response, signal);
+    return boundedJson(response, signal);
+  };
+}
+export { tokenTenant as canonicalTokenTenant };
+export function canonicalClaimReader(
+  env: CanonicalEnv,
+  token: string,
+  signal: AbortSignal,
+  rpc: "session_directory_analysis_cache" | "request_session_analysis_cache",
+  fetcher: typeof fetch = fetch,
+) {
+  return canonicalMetadataReader(env, token, signal, fetcher, rpc);
+}
+export function canonicalPointerReader(
+  env: CanonicalEnv,
+  token: string,
+  signal: AbortSignal,
+  fetcher: typeof fetch = fetch,
+) {
+  const read = canonicalMetadataReader(env, token, signal, fetcher);
+  return async (identity: CanonicalIdentity): Promise<CanonicalPointer[]> => {
+    const value = await read(identity);
     if (!Array.isArray(value)) throw new CanonicalReadError("metadata_parse");
     return value as CanonicalPointer[];
   };
+}
+export function canonicalPublicationReader(
+  env: CanonicalEnv,
+  token: string,
+  signal: AbortSignal,
+  fetcher: typeof fetch = fetch,
+) {
+  return canonicalMetadataReader(
+    env,
+    token,
+    signal,
+    fetcher,
+    "session_directory_replay_pages",
+  );
 }
 export async function canonicalHandle(
   request: Request,
   env: CanonicalEnv,
   fetcher: typeof fetch = fetch,
   override?: CanonicalDeps,
+  artifactOverride?: ArtifactReadDeps,
 ): Promise<Response> {
   const id = crypto.randomUUID();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -180,6 +242,9 @@ export async function canonicalHandle(
           "order",
           "view",
           "maxContent",
+          "generation",
+          "since",
+          "until",
         ].includes(key) ||
         url.searchParams.getAll(key).length !== 1
       )
@@ -212,6 +277,97 @@ export async function canonicalHandle(
         ...init,
         signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal,
       });
+    const expectedGeneration = url.searchParams.get("generation");
+    if (
+      expectedGeneration !== null &&
+      !/^[0-9a-f]{64}$/u.test(expectedGeneration)
+    )
+      throw new CanonicalReadError("parameter", 400);
+    const view = url.searchParams.get("view") ?? "raw";
+    const rawMax = url.searchParams.get("maxContent"),
+      maxContent = rawMax === null ? undefined : Number(rawMax);
+    if (
+      (view !== "replay" && maxContent !== undefined) ||
+      !["raw", "replay", "bounds", "legacy"].includes(view) ||
+      (["replay", "bounds"].includes(view) && table !== "convergence_events") ||
+      (view === "legacy" &&
+        !["conversation_turns", "session_links", "session_outcomes"].includes(
+          table,
+        )) ||
+      (maxContent !== undefined &&
+        (!Number.isFinite(maxContent) ||
+          maxContent <= 0 ||
+          Math.trunc(maxContent) !== maxContent))
+    )
+      throw new CanonicalReadError("parameter", 400);
+    const order = url.searchParams.get("order") ?? "asc";
+    if (order !== "asc" && order !== "desc")
+      throw new CanonicalReadError("parameter", 400);
+    const mode = env.CANONICAL_READ_MODE ?? "raw";
+    // Raw mode has no timing projection: keep refusing session_timing (and
+    // windows) there; only the pages artifact serves them.
+    if (
+      mode !== "pages" &&
+      (url.searchParams.has("since") ||
+        url.searchParams.has("until") ||
+        table === "session_timing")
+    )
+      throw new CanonicalReadError("parameter", 400);
+    if (mode !== "raw" && mode !== "pages")
+      throw new CanonicalReadError("not_configured");
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new CanonicalReadError("deadline"));
+      }, 8000);
+    });
+    if (mode === "pages") {
+      let artifactDeps = artifactOverride;
+      if (!artifactDeps) {
+        const raw = rawStoreFromEnv(env, boundedFetch);
+        if (!raw) throw new CanonicalReadError("not_configured");
+        artifactDeps = {
+          signal,
+          publication: canonicalPublicationReader(
+            env,
+            bearer,
+            signal,
+            boundedFetch,
+          ),
+          read: async (key) => (await raw.store.getObject(objectKey(key))).body,
+        };
+      }
+      const page = await Promise.race([
+        canonicalArtifactPage({ ...artifactDeps, signal }, identity, {
+          table,
+          view: view as "raw" | "replay" | "bounds" | "legacy",
+          limit,
+          order,
+          cursor: url.searchParams.get("cursor"),
+          maxContent,
+          generation: expectedGeneration,
+          since: url.searchParams.get("since") ?? undefined,
+          until: url.searchParams.get("until") ?? undefined,
+        }),
+        deadline,
+      ]);
+      return Response.json(
+        {
+          orgId: identity.orgId,
+          workspaceId: workspace,
+          source,
+          sessionId,
+          ...page,
+          correlationId: id,
+        },
+        {
+          headers: {
+            "X-Relayhistory-Workspace-Id": workspace,
+            "Cache-Control": "private, no-store",
+          },
+        },
+      );
+    }
     let deps = override;
     if (!deps) {
       const raw = rawStoreFromEnv(env, boundedFetch);
@@ -228,32 +384,19 @@ export async function canonicalHandle(
         },
       };
     }
-    const deadline = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        controller.abort();
-        reject(new CanonicalReadError("deadline"));
-      }, 8000);
-    });
     const snapshot = await Promise.race([
-      canonicalSnapshot(deps, identity),
+      // Display values only for the table that returns them; every other table reads as before.
+      canonicalSnapshot(deps, identity, { directoryValues: table === "session_directory_event_values" }),
       deadline,
     ]);
-    const view = url.searchParams.get("view") ?? "raw";
-    const rawMax = url.searchParams.get("maxContent"),
-      maxContent = rawMax === null ? undefined : Number(rawMax);
+    // Requested display values are optional on the raw path: their refusal omits those rows only.
+    if ("displayOmitted" in snapshot && snapshot.displayOmitted && table === "session_directory_event_values")
+      console.error(logLine("warn", "canonical display values omitted", { service: "96bulls-session-read-worker", stage: "canonical-read", org_id: identity.orgId, workspace_id: identity.workspaceId, harness: identity.source, session_id: identity.sessionId, reason: snapshot.displayOmitted }));
     if (
-      (view === "raw" && maxContent !== undefined) ||
-      !["raw", "replay"].includes(view) ||
-      (view === "replay" && table !== "convergence_events") ||
-      (maxContent !== undefined &&
-        (!Number.isFinite(maxContent) ||
-          maxContent <= 0 ||
-          Math.trunc(maxContent) !== maxContent))
+      expectedGeneration !== null &&
+      expectedGeneration !== snapshot.generation
     )
-      throw new CanonicalReadError("parameter", 400);
-    const order = url.searchParams.get("order") ?? "asc";
-    if (order !== "asc" && order !== "desc")
-      throw new CanonicalReadError("parameter", 400);
+      throw new CanonicalReadError("source_generation_changed");
     let offset = 0;
     const cursor = url.searchParams.get("cursor");
     if (cursor) {
@@ -277,6 +420,22 @@ export async function canonicalHandle(
     const all = snapshot.rows
       .filter((row) => row.table === table)
       .map((item) => {
+        if (view === "bounds")
+          return {
+            ...item,
+            row: Object.fromEntries(
+              [
+                "org_id",
+                "workspace_id",
+                "source",
+                "session_id",
+                "event_id",
+                "machine_id",
+                "kind",
+                "ts",
+              ].map((k) => [k, item.row[k]]),
+            ),
+          };
         if (view !== "replay") return item;
         const { record, ...row } = item.row;
         const payload =
@@ -307,19 +466,10 @@ export async function canonicalHandle(
         };
       });
     if (table === "convergence_events")
-      all.sort((a, b) => {
-        for (const field of ["ts", "event_id", "machine_id", "kind"]) {
-          const left = String(a.row[field]),
-            right = String(b.row[field]);
-          const diff =
-            field === "ts"
-              ? left.length - right.length ||
-                (left < right ? -1 : left > right ? 1 : 0)
-              : Buffer.compare(Buffer.from(left), Buffer.from(right));
-          if (diff) return order === "asc" ? diff : -diff;
-        }
-        return 0;
-      });
+      all.sort(
+        (a, b) =>
+          (order === "asc" ? 1 : -1) * compareArtifactEventRows(a.row, b.row),
+      );
     if (offset > all.length) throw new CanonicalReadError("cursor", 400);
     const rows = [];
     let bytes = 0;
@@ -328,7 +478,10 @@ export async function canonicalHandle(
       if (bytes + size > MAX_BODY - 4096 && rows.length) break;
       if (
         !rows.length &&
-        size > (view === "replay" ? 64 * 1024 * 1024 : MAX_BODY - 4096)
+        size >
+          (["replay", "legacy"].includes(view)
+            ? 64 * 1024 * 1024
+            : MAX_BODY - 4096)
       )
         throw new CanonicalReadError("row_bound");
       rows.push(row);
@@ -342,6 +495,7 @@ export async function canonicalHandle(
         source,
         sessionId,
         generation: snapshot.generation,
+        exists: snapshot.exists,
         legacyCoverage: snapshot.legacyCoverage,
         rows,
         nextCursor:
@@ -373,15 +527,24 @@ export async function canonicalHandle(
         : new CanonicalReadError("canonical_unavailable");
     return Response.json(
       {
-        error: {
-          code:
-            e.status === 400
-              ? "bad_request"
-              : e.status === 401
-                ? "unauthorized"
-                : "session_read_unavailable",
-          message: e.message,
-        },
+        // 501 matches the read API's unsupported_by_backend body: the caller
+        // falls back instead of retrying.
+        error:
+          e.status === 501
+            ? {
+                code: "unsupported_by_backend",
+                message: `not served by this backend: ${e.reason}`,
+                reason: e.reason,
+              }
+            : {
+                code:
+                  e.status === 400
+                    ? "bad_request"
+                    : e.status === 401
+                      ? "unauthorized"
+                      : "session_read_unavailable",
+                message: e.message,
+              },
         correlationId: id,
       },
       {

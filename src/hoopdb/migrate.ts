@@ -67,7 +67,7 @@ const TOKEN_VERIFIER_VERIFY = join(
 const INGEST_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_ingest_roles.sql");
 const INGEST_ROLE_VERIFY = join(ROOT,"supabase/bootstrap/session_ingest_verify.sql");
 // The session read API role (bulls96_read_api), bare: the same contract, its own file.
-// 20261105029000 verifies it and fails closed if absent (42704); it never creates it.
+// 20261105034000 verifies it and fails closed if absent (42704); it never creates it.
 // session_read_api_role.sql (after migrate, operator) keeps LOGIN, settings and RLS.
 const READ_API_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_read_api_roles.sql");
 // Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any

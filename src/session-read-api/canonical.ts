@@ -1,9 +1,12 @@
 import {isManifestRest} from "../../packages/object-store/src/index.ts";
+import { nodeReadBudget, type NodeReadProfile } from "./node-read-profile.ts";
 /** Canonical S3 session projections, shared with the live S3 -> CH writer.
  * The successful claim-bound pointer RPC is the authentication boundary. No
  * object is read from an unverified JWT claim or caller-supplied object key.
  */
+import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS, ARTIFACT_MAX_SOURCE_POINTERS } from "./canonical-artifact.ts";
 import { canonicalLegacy } from "./canonical-legacy.ts";
+import { canonicalLiveTurns, mergeTurnRows } from "./canonical-turns.ts";
 import { createHash } from "node:crypto";
 import { readCanonicalScope, manifestUserId } from "./canonical-projection.ts";
 import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
@@ -31,13 +34,17 @@ export interface CanonicalPointer {
   manifest_key: string;
   content_sha256: string;
   raw_format: string;
+  /** Available to the Node catalog capture; legacy compact pointer RPC omits it. */
+  manifest_etag?: string | null;
   revision: number | string;
   deleted_at: null;
 }
 export class CanonicalReadError extends Error {
   constructor(
     readonly reason: string,
-    readonly status: 400 | 401 | 403 | 503 = 503,
+    readonly status: 400 | 401 | 403 | 501 | 503 = 503,
+    /** Projection reason codes behind `canonical_projection_incomplete` (codes only). */
+    readonly details: readonly string[] = [],
   ) {
     super("Canonical session read refused");
     this.name = "CanonicalReadError";
@@ -58,8 +65,9 @@ function checked(
   pointers: CanonicalPointer[],
   identity: CanonicalIdentity,
   deps: CanonicalDeps,
+  maxPointersExclusive = MAX_POINTERS,
 ): CanonicalPointer[] {
-  if (!Array.isArray(pointers) || pointers.length >= MAX_POINTERS)
+  if (!Array.isArray(pointers) || pointers.length >= maxPointersExclusive)
     throw new CanonicalReadError("pointer_bound");
   const seen = new Set<string>();
   for (const p of pointers) {
@@ -87,7 +95,7 @@ function checked(
   }
   return pointers;
 }
-function generation(
+export function canonicalSourceGeneration(
   pointers: CanonicalPointer[],
   identity: CanonicalIdentity,
 ): string {
@@ -111,15 +119,31 @@ function generation(
     )
     .digest("hex");
 }
-export async function canonicalSnapshot(
-  deps: CanonicalDeps,
-  identity: CanonicalIdentity,
+/**
+ * Live raw read (/canonical raw, timing, turns). Display values are projected only when the
+ * caller asks for them (`directoryValues: true`, i.e. table=session_directory_event_values);
+ * every other read does no display work and returns exactly the pre-#184 snapshot. When
+ * projected, a display-value refusal omits those rows (`displayOmitted`) instead of failing.
+ */
+export function canonicalSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, options: { directoryValues?: boolean } = {}) {
+  return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS, 500000, options.directoryValues === true ? "optional" : undefined);
+}
+/** Trusted Node producer only. Never called by the raw Worker request path. */
+export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, profile: NodeReadProfile = "standard") {
+  const budget=nodeReadBudget(profile);
+  return snapshotWithLimits(deps, identity, budget.sourceBytes, budget.sourceRecords, ARTIFACT_MAX_SOURCE_POINTERS + 1,budget.projectedRows,"required");
+}
+async function snapshotWithLimits(
+  deps: CanonicalDeps, identity: CanonicalIdentity,
+  maxScopeBytes: number, maxScopeEvents: number, maxPointersExclusive: number, maxRows: number,
+  directoryValues: "required" | "optional" | undefined,
 ) {
-  const pointers = checked(await deps.pointers(identity), identity, deps),
-    version = generation(pointers, identity);
+  const pointers = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive),
+    version = canonicalSourceGeneration(pointers, identity);
   if (!pointers.length)
     return {
       generation: version,
+      exists: false,
       legacyCoverage: null,
       rows: [] as Array<{ table: string; row: Record<string, unknown> }>,
     };
@@ -158,6 +182,7 @@ export async function canonicalSnapshot(
           // content_sha256 is the RAW CHUNK HASH CHAIN, not SHA256(manifest bytes).
           if (
             m.raw.content_sha256 !== digest(p.content_sha256) ||
+            (p.manifest_etag != null && read.etag !== p.manifest_etag) ||
             manifestUserId(m) !== p.user_id ||
             String(m.revision) !== String(p.revision) ||
             canonical.sessionId !== p.session_id ||
@@ -180,23 +205,29 @@ export async function canonicalSnapshot(
       },
     },
     {
-      maxScopeBytes: CANONICAL_SCOPE_BYTES,
-      maxScopeEvents: 100000,
-      maxRows: 500000,
+      maxScopeBytes,
+      maxScopeEvents,
+      maxRows,
       insertBatch: 5000,
+      ...(directoryValues ? { directoryValues } : {}),
     },
     0,
     identity.sessionId,
   );
   if (!result.complete || result.directorySessionId !== identity.sessionId)
-    throw new CanonicalReadError("canonical_projection_incomplete");
-  const fresh = checked(await deps.pointers(identity), identity, deps);
-  if (generation(fresh, identity) !== version)
+    throw new CanonicalReadError("canonical_projection_incomplete", 503, result.reasons);
+  const fresh = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive);
+  if (canonicalSourceGeneration(fresh, identity) !== version)
     throw new CanonicalReadError("source_generation_changed");
   const legacy = canonicalLegacy(result.records, identity);
+  // Live relay session turns (canonical-turns.ts) replace the legacy row of the same key.
+  const live = canonicalLiveTurns(result.records, identity);
   return {
     generation: version,
+    exists: true,
     legacyCoverage: legacy.coverage,
-    rows: [...result.projectionRows, ...legacy.rows],
+    rows: [...result.projectionRows, ...mergeTurnRows(legacy.rows, live)],
+    /** Bounded directory_display_* code when display rows were omitted (raw read only). */
+    ...(result.displayOmitted ? { displayOmitted: result.displayOmitted } : {}),
   };
 }

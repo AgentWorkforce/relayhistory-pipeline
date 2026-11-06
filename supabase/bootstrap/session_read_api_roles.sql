@@ -1,6 +1,6 @@
 -- Phase 1: privileged bootstrap for the session read API role. Before migrate.
 --
--- The migration supabase/migrations/20261105029000_session_directory_read_api.sql
+-- The migration supabase/migrations/20261105034000_session_directory_read_api.sql
 -- grants EXECUTE on the read API's tenant-setting directory functions
 -- (sessions.list_session_directory_for, sessions.session_directory_activity_for) to
 -- bulls96_read_api, and src/hoopdb/sessions-function-acl.json lists that grant, so the

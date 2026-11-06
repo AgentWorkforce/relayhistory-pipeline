@@ -12,7 +12,7 @@ permissions:
 jobs:
   real-postgres:
     name: real PostgreSQL ${{ matrix.pg }}
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -50,6 +50,12 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: psql client
         run: psql --version
+      # Before the role proofs, which lock the superuser down. The suite creates
+      # and drops its own database, so it leaves nothing behind for them.
+      - name: SearchIndexAdapter conformance (postgres adapter, real server)
+        env:
+          SEARCH_CONFORMANCE_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: bun run --filter @96bulls/pipeline test test/search-index-postgres-real.test.ts
       - name: Prove auth upgrade, T0 bootstrap and switch-only membership
         env:
           PGPROOF_AUTH_UPGRADE_DISPOSABLE: "1"
@@ -91,3 +97,78 @@ jobs:
             pg-proof-pg${{ matrix.pg }}.log
             auth-upgrade-pg${{ matrix.pg }}.json
             auth-upgrade-pg${{ matrix.pg }}.log
+
+  brief-postgres:
+    name: brief publication PostgreSQL ${{ matrix.pg }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          # Disposable container: trust auth means no credential exists anywhere.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED), PostgreSQL ${{ matrix.pg }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Prove default-off brief publication does not serialize directory writers
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: bun test src/session-pipeline/__tests__/brief-documents.postgres.test.ts
+  consumer-lease:
+    name: canonical consumer lease proof (PG ${{ matrix.pg }})
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      # Fresh superuser container: the proof creates/drops its own database.
+      - name: Canonical consumer lease proof (own database)
+        env:
+          PROOF_DISPOSABLE: "1"
+        run: |
+          set -o pipefail
+          bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |
+            tee consumer-lease-pg${{ matrix.pg }}.log
+          grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}.log

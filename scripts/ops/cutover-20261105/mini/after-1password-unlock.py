@@ -12,14 +12,14 @@ stops on the first failure. Uploads keep running on the legacy path throughout (
   5. Dispatch Deploy Production on main (dormant 299 Worker + DELIVERY_INGEST discovery + new DB binding)
      and wait for it.
 Rollback for 3 if the new binding misbehaves: NEON_APP_DATABASE_URL back to app_blue
-(`neonctl connection-string br-damp-mud-apbr6ifp --project-id divine-snow-84812652 --role-name app_blue
+(`neonctl connection-string $NEON_BRANCH_ID --project-id $NEON_PROJECT_ID --role-name app_blue
 --database-name neondb --pooled`), then redeploy.
 """
 import json, os, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 R = "AgentWorkforce/relayhistory-cloud"
 APP_ITEM, HMAC_ITEM = "oxvgx7xbu2d4j62th6iiudt4oe", "p5blz5rzkoexubwtrstatxos3y"
-HOST = "ep-floral-pond-apkvat38-pooler.c-7.us-east-1.aws.neon.tech"  # pooled, like the live app_blue binding
+HOST = os.environ.get("NEON_RUNTIME_HOST") or sys.exit("NEON_RUNTIME_HOST required (pooled, like the live app_blue binding)")
 def sh(*a, input=None, check=True):
     r = subprocess.run(list(a), input=input, capture_output=True, text=True)
     if check and r.returncode != 0:

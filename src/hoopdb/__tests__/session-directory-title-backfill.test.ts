@@ -15,6 +15,7 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { sessionReadOnly } from "../../migration/neon-s3-sync/neon-reader.ts";
 import { layoutComponent } from "../../shared/layout-component.ts";
 import { projectSessionDirectory } from "../session-directory-projector.ts";
+import { PGLITE_TEST_TIMEOUT } from "../../session-pipeline/__tests__/replay-fixture.ts";
 import {
   backfillDirectoryTitles,
   directoryTitle,
@@ -26,7 +27,7 @@ const read = (path: string) => readFileSync(join(root, path), "utf8");
 const open: PGlite[] = [];
 afterEach(async () => {
   await Promise.all(open.splice(0).map((db) => db.close()));
-});
+}, PGLITE_TEST_TIMEOUT);
 
 async function supabase(): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
@@ -121,7 +122,7 @@ describe("session directory task-title backfill", () => {
     expect(s1?.search_text).toContain("newest");
     expect((await row(s, "s2"))?.task_title).toBeNull();
     expect((await row(s, "s3"))?.task_title).toBeNull();
-  });
+  }, PGLITE_TEST_TIMEOUT);
 
   test("equal timestamps pick the greater title, as the rollup does", async () => {
     const [n, s] = await Promise.all([neon(), supabase()]);
@@ -132,7 +133,7 @@ describe("session directory task-title backfill", () => {
     await directory(s, [{ id: "s1" }]);
     await backfillDirectoryTitles((await readOnlyNeon(n)).client, s, { apply: true, ...quiet });
     expect((await row(s, "s1"))?.task_title).toBe("beta");
-  });
+  }, PGLITE_TEST_TIMEOUT);
 
   test("never overwrites, skips tombstones and event-projected rows, and keeps tenants apart", async () => {
     const [n, s] = await Promise.all([neon(), supabase()]);
@@ -155,7 +156,7 @@ describe("session directory task-title backfill", () => {
     expect((await row(s, "gone"))?.task_title).toBeNull();
     expect((await row(s, "evented"))?.task_title).toBeNull();
     expect((await row(s, "other"))?.task_title).toBeNull();
-  });
+  }, PGLITE_TEST_TIMEOUT);
 
   test("matches the directory's layout-encoded keys and the legacy physical session id", async () => {
     const [n, s] = await Promise.all([neon(), supabase()]);
@@ -172,7 +173,7 @@ describe("session directory task-title backfill", () => {
     expect(result.filled).toBe(2);
     expect((await row(s, rawId))?.task_title).toBe("canonical");
     expect((await row(s, layoutComponent("legacy/id")))?.task_title).toBe("legacy");
-  });
+  }, PGLITE_TEST_TIMEOUT);
 
   test("plan writes nothing and reports what apply then fills; a rerun is a no-op", async () => {
     const [n, s] = await Promise.all([neon(), supabase()]);
@@ -188,7 +189,7 @@ describe("session directory task-title backfill", () => {
     expect(rerun.filled).toBe(0);
     const replan = await backfillDirectoryTitles((await readOnlyNeon(n)).client, s, { apply: false, ...quiet });
     expect(replan.filled).toBe(0);
-  });
+  }, PGLITE_TEST_TIMEOUT);
 
   test("plan runs the Supabase side in a READ ONLY transaction", async () => {
     const [n, s] = await Promise.all([neon(), supabase()]);
@@ -199,7 +200,7 @@ describe("session directory task-title backfill", () => {
     await backfillDirectoryTitles((await readOnlyNeon(n)).client, spy, { apply: false, ...quiet });
     expect(seen[0]).toBe("BEGIN READ ONLY");
     expect(seen.some((q) => q.startsWith("UPDATE"))).toBe(false);
-  });
+  }, PGLITE_TEST_TIMEOUT);
 
   test("Neon is read only: every page is a READ ONLY transaction in a read-only session, and nothing writes", async () => {
     const [n, s] = await Promise.all([neon(), supabase()]);
@@ -213,7 +214,7 @@ describe("session directory task-title backfill", () => {
     // The session the CLI sets up refuses writes outright.
     await expect(client.query("INSERT INTO sessions.session_rollups (org_id, session_id, workspace_id, source, first_ts, last_ts) VALUES ('o','s','w','x',now(),now())"))
       .rejects.toMatchObject({ code: "25006" });
-  });
+  }, PGLITE_TEST_TIMEOUT);
 
   test("a later pointer projection keeps the backfilled task_title and owns title", async () => {
     const [n, s] = await Promise.all([neon(), supabase()]);
@@ -240,7 +241,7 @@ describe("session directory task-title backfill", () => {
     const after = await row(s, "s1");
     expect(after).toMatchObject({ title: "pointer two", task_title: "from neon" });
     expect(after?.search_text).toContain("from neon");
-  });
+  }, PGLITE_TEST_TIMEOUT);
 
   test("--after-org resumes strictly after an org; maxPages bounds a canary run", async () => {
     const [n, s] = await Promise.all([neon(), supabase()]);
@@ -252,12 +253,12 @@ describe("session directory task-title backfill", () => {
     expect(resumed).toMatchObject({ sessions: 1, filled: 1, lastOrg: "org-c" });
     const titles = (await s.query<{ task_title: string | null }>("SELECT task_title FROM sessions.session_directory ORDER BY org_id")).rows.map((r) => r.task_title);
     expect(titles).toEqual(["org-a", null, "org-c"]);
-  });
+  }, PGLITE_TEST_TIMEOUT);
 
   test("directoryTitle trims, skips empty, and refuses (never truncates) over 200 characters", () => {
     expect(directoryTitle("  a  ")).toEqual({ title: "a" });
     expect(directoryTitle(null)).toEqual({ skip: "empty" });
     expect(directoryTitle("é".repeat(200))).toEqual({ title: "é".repeat(200) });
     expect(directoryTitle("é".repeat(201))).toEqual({ skip: "too_long" });
-  });
+  }, PGLITE_TEST_TIMEOUT);
 });

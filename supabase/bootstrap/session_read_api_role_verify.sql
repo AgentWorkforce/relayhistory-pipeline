@@ -3,7 +3,7 @@
 -- attributes, no memberships, exactly the approved column SELECT on session_index and
 -- schema USAGE as its effective privileges in schema sessions, EXECUTE on no sessions
 -- SECURITY DEFINER function but the two tenant-setting directory reads of
--- 20261105029000 (sessions.list_session_directory_for, session_directory_activity_for;
+-- 20261105034000 (sessions.list_session_directory_for, session_directory_activity_for;
 -- allowed, not required, so this also passes before that migration), and the
 -- tenant-bound RLS policy on session_index.
 \set ON_ERROR_STOP 1

@@ -26,15 +26,16 @@
  *   GET /v1/sessions/activity       sessions per UTC day without `q` (span semantics)
  * Both answer 501 `directory_workspace_not_enabled` unless the token's workspace is on
  * READ_API_DIRECTORY_WORKSPACES (the canary allowlist; unset = none), and 501
- * `directory_not_migrated` until migration 20261105029000 is applied. Never Neon.
+ * `directory_not_migrated` until migration 20261105034000 is applied. Never Neon.
  *   GET /v1/sessions/:id/timing     recorded timing from the session's canonical S3 objects
  *                                   (session-timing-source.ts, timing.ts), same allowlist.
- *   GET /v1/sessions/output, /v1/digest/daily and the turns and metadata reads are
- *   registered and answer 501 with a reason naming the store they still need: their
- *   relayhistory semantics read tables that neither ClickHouse, S3 nor the directory
- *   holds yet (per-message and commit facts, session_outcomes, conversation_turns and
- *   its live writer, the digest narrative cache), and this backend never answers
- *   approximately.
+ *   GET /v1/sessions/:id/turns      the relay session journal from canonical S3 (legacy
+ *   GET /v1/sessions/:id/metadata   export + live turns: session-turns-source.ts), same allowlist.
+ *   GET /v1/sessions/output and /v1/digest/daily are registered and answer 501 with a
+ *   reason naming the store they still need: their relayhistory semantics read tables
+ *   that neither ClickHouse, S3 nor the directory holds yet (per-message and commit
+ *   facts, session_outcomes, the digest narrative cache), and this backend never
+ *   answers approximately.
  *
  * Auth: a RelayAuth assertion JWT minted for THIS service's origin with scope
  * `rth:read` (verifyAgentRelayToken: RS256, JWKS, issuer, exact audience).
@@ -48,6 +49,7 @@ import type { EventQuery } from "./queries.ts";
 import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
+import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
   DirectoryError,
@@ -88,6 +90,17 @@ export interface ReadApiDeps {
   directoryWorkspaces?: ReadonlySet<string> | "*";
   /** Session timing from canonical S3 (session-timing-source.ts); absent = 501 `timing_not_configured`. */
   timing?: TimingDeps;
+  /** Relay session turns and metadata from canonical S3 (session-turns-source.ts); absent = 501 `turns_not_configured`. */
+  turns?: TurnsDeps;
+}
+
+export interface TurnsDeps {
+  /** Harnesses holding a pointer for the session id, with live/total counts (tenant-bound, read role). */
+  harnesses(scope: { orgId: string; workspaceId: string; sessionId: string }): Promise<HarnessState[]>;
+  /** One harness scope's canonical rows; `signal` aborts its object reads at the deadline. */
+  source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows>;
+  /** Below Cloud's 4 s read timeout. Default 3000. */
+  deadlineMs?: number;
 }
 
 export interface TimingDeps {
@@ -376,7 +389,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -560,8 +573,88 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   };
   app.get("/v1/sessions/output", notMigrated("output_not_migrated"));
-  app.get("/v1/sessions/:sessionId/turns", notMigrated("turns_not_migrated"));
-  app.get("/v1/sessions/:sessionId/metadata", notMigrated("turns_not_migrated"));
+
+  /**
+   * GET /v1/sessions/:id/turns and /metadata (relayhistory routes/turns.ts): the relay
+   * session journal from canonical S3 (session-turns-source.ts), never Neon. Same canary
+   * allowlist. `source` is optional, as relayhistory's (its first value; empty = none).
+   * Every case not answerable exactly is a 501 Cloud falls back on:
+   *   turns_no_pointers           no Supabase pointer (Neon may still hold the turns)
+   *   turns_harness_bound         more harness scopes than one read may open
+   *   turns_unknown               a scope without the legacy export's coverage marker
+   *   turns_truncated             an exported string the export had to cut
+   *   turns_attribution           a live untagged turn whose source needs Neon's events
+   *   turns_canonical_<r>         the canonical read refused (bounds, digests, deadline)
+   * Erased (every pointer tombstoned): no turns, and metadata's 404, as relayhistory
+   * answers after erasure purged the rows (0074).
+   */
+  const sessionTurns = async (c: Context, identity: VerifiedIdentity) => {
+    attestWorkspace(c, identity);
+    requireCanary(identity, "turns");
+    const turns = deps.turns;
+    if (!turns) throw unsupported("turns_not_configured");
+    const sessionId = c.req.param("sessionId");
+    if (!sessionId || sessionId.length > MAX_ID_CHARS) throw unsupported("turns_session_id");
+    const source = c.req.query("source") || undefined;
+    if (source !== undefined && source.length > MAX_ID_CHARS) throw unsupported("turns_source");
+    const scope = { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId };
+    const states = await turns.harnesses(scope);
+    if (states.length > MAX_TURN_HARNESSES) throw unsupported("turns_harness_bound");
+    const selected = source === undefined ? states : states.filter((h) => h.harness === source);
+    if (!selected.some((h) => h.pointers > 0)) throw unsupported("turns_no_pointers");
+    const live = selected.filter((h) => h.live > 0);
+    if (live.length === 0) return { rows: [] as Record<string, unknown>[], erased: true };
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const snapshots = await Promise.race([
+        Promise.all(live.map(async (h) => ({ harness: h.harness, snapshot: await turns.source({ ...scope, source: h.harness }, controller.signal) }))),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new CanonicalReadError("deadline"));
+            controller.abort();
+          }, turns.deadlineMs ?? 3000);
+        }),
+      ]);
+      return { rows: turnRows(scope, snapshots, source), erased: false };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const turnsFail = (c: Context, error: unknown) => {
+    if (error instanceof CanonicalReadError) return fail(c, unsupported(`turns_canonical_${error.reason}`));
+    if (error instanceof TurnsInputError) return fail(c, unsupported(error.reason.startsWith("turns_") ? error.reason : `turns_${error.reason}`));
+    // A malformed canonical row (canonical-legacy.ts / canonical-turns.ts) is not answerable exactly.
+    if (error instanceof Error && /^canonical (legacy evidence|live turn) invalid$/u.test(error.message)) return fail(c, unsupported("turns_canonical_invalid"));
+    return fail(c, error);
+  };
+
+  app.get("/v1/sessions/:sessionId/turns", async (c) => {
+    try {
+      const identity = c.get("identity");
+      const { rows, erased } = await sessionTurns(c, identity);
+      const body = { sessionId: c.req.param("sessionId"), turns: turnsResponse(rows), correlationId: c.get("correlationId") };
+      log({ route: c.req.routePath, reason: erased ? "turns_erased" : "turns_served", turns: body.turns.length, correlation_id: c.get("correlationId") });
+      return c.json(body);
+    } catch (error) {
+      return turnsFail(c, error);
+    }
+  });
+
+  app.get("/v1/sessions/:sessionId/metadata", async (c) => {
+    try {
+      const identity = c.get("identity");
+      const sessionId = c.req.param("sessionId");
+      const { rows, erased } = await sessionTurns(c, identity);
+      const metadata = metadataResponse(rows);
+      log({ route: c.req.routePath, reason: erased ? "metadata_erased" : metadata ? "metadata_served" : "metadata_none", correlation_id: c.get("correlationId") });
+      if (!metadata)
+        return c.json({ error: { code: "not_found", message: `No conversation turns found for session ${sessionId}` }, correlationId: c.get("correlationId") }, 404);
+      return c.json(metadata);
+    } catch (error) {
+      return turnsFail(c, error);
+    }
+  });
   app.get("/v1/digest/daily", notMigrated("digest_not_migrated"));
 
   app.notFound((c) => c.json({ error: { code: "unsupported_by_backend", message: "route not served by this backend", reason: "route" }, correlationId: c.get("correlationId") }, 501));

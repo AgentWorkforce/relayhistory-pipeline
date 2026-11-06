@@ -15,7 +15,11 @@ const ACC = "f7232cb80f6fab86a95426302af243e4";
 const WORKER = "relayhistory-api";
 const REPLICA_Q = "b2e92a0b2b984803b71cc3e02f32fac1";
 const REPLICA_DLQ = "91960f439c4d4509af3af968440091bc";
-const BUCKET = "96bulls-aws-sessions-prod-transcripts-941433935742";
+const fail = (m) => { console.error(m); process.exit(64); };
+// The sessions-prod account id comes from the environment (never committed); refuse without it.
+const ACCOUNT = process.env.SESSIONS_PROD_ACCOUNT_ID ?? fail("SESSIONS_PROD_ACCOUNT_ID required");
+if (!/^[0-9]{12}$/.test(ACCOUNT)) fail("SESSIONS_PROD_ACCOUNT_ID must be a 12-digit AWS account id");
+const BUCKET = "96bulls-aws-sessions-prod-transcripts-" + ACCOUNT;
 const REGION = "us-east-1";
 const KEY_ROOT = "96bulls"; // WRITE_PATH_KEY_ROOT is unset on relayhistory-api, so the default applies
 // Old s3_first request wall budget (S3_FIRST_REQUEST_BUDGET_MS=60s) + its 90 s Neon fallback + waitUntil slack.

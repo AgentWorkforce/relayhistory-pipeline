@@ -25,6 +25,7 @@ import {
 } from "../../shared/vendor.ts";
 import { canonicalManifestIdentity } from "../../shared/manifest-identity.ts";
 import { chunksAreServerSealed } from "../../alleyoop/manifests.ts";
+import { SCRUB_RULESET_VERSION } from "../../shared/vendor.ts";
 import { buildSessionStream, type DeliveryRecord, type Queryable } from "../relayhistory-export.ts";
 import { erasableByExporter, exportUnit, orgPrefix, writeOnly, type ExportTarget } from "../neon-s3-sync/export-session.ts";
 import { storeEraser } from "../neon-s3-erasure/eraser.ts";
@@ -242,7 +243,7 @@ describe("scrub rule set 2: long strings stored whole", () => {
     const r = await exportUnit(target(store), unit("org-a"), fixedSource([rec("tool_call", "origin-a", "t", { output: long })]));
     const key = r.manifests[0]!.manifestKey;
     const m = await parseManifest(await readText(store, key), key);
-    expect(m.raw.scrub).toEqual({ ruleset: "relayhistory-scrub", version: 2 });
+    expect(m.raw.scrub).toEqual({ ruleset: "relayhistory-scrub", version: SCRUB_RULESET_VERSION });
     expect(r.manifests[0]!.truncatedStrings).toBe(0);
     const read = await readRelayhistoryExport(m, store, (b) => new Uint8Array(zstdDecompressSync(b)), { prefix: "96bulls/org-a" });
     const out = (read[0]!.payload as { output: string }).output;
@@ -281,7 +282,7 @@ describe("a session spanning the scrub rule set 1 -> 2 deploy", () => {
       put: (k, b, o) => {
         if (String(k).endsWith("manifest.json"))
           b = new TextEncoder().encode(
-            new TextDecoder().decode(b).replace('"scrub":{"ruleset":"relayhistory-scrub","version":2}', '"scrub":{"ruleset":"relayhistory-scrub","version":1}'),
+            new TextDecoder().decode(b).replace(`"scrub":{"ruleset":"relayhistory-scrub","version":${SCRUB_RULESET_VERSION}}`, '"scrub":{"ruleset":"relayhistory-scrub","version":1}'),
           );
         const md = o?.metadata?.["scrub-version"] ? { ...o.metadata, "scrub-version": "1" } : o?.metadata;
         return inner.put(k, b, { ...o, ...(md ? { metadata: md } : {}) });

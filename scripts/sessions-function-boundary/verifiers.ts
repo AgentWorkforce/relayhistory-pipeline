@@ -21,7 +21,7 @@ export const VERIFIERS: readonly VerifierTarget[] = [
   },
   {
     // The read API role may EXECUTE no sessions SECURITY DEFINER function but these (allowed,
-    // not required, so the verifier also passes before 20261105029000 is applied).
+    // not required, so the verifier also passes before 20261105034000 is applied).
     role: "bulls96_read_api",
     path: "supabase/bootstrap/session_read_api_role_verify.sql",
     pattern: /AND p\.oid::regprocedure::text NOT IN \([\s\S]*?\)\n  LOOP/,

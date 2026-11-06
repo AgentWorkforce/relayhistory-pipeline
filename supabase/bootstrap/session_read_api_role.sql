@@ -7,7 +7,7 @@
 -- sessions.session_directory_pointers). So this role may read the id/time and
 -- object-pointer columns of the pointer table and nothing else: no content, no
 -- titles, no metadata, no other table, no writes. Its one function grant is made
--- by migration 20261105029000 (EXECUTE on sessions.list_session_directory_for /
+-- by migration 20261105034000 (EXECUTE on sessions.list_session_directory_for /
 -- session_directory_activity_for, the directory list and activity pinned to the
 -- same tenant settings), not here.
 --

@@ -27,9 +27,15 @@ const DIR = process.env.HOME + "/relay-briefs/bulls-resume-20261104/" + (process
 const REHEARSAL = process.argv.includes("--rehearsal");
 const REH_ENDPOINT = REHEARSAL ? process.argv[process.argv.indexOf("--rehearsal") + 1] : undefined;
 const REH_DB = REHEARSAL ? process.argv[process.argv.indexOf("--rehearsal") + 2] : undefined;
-if (REHEARSAL && (!REH_ENDPOINT?.startsWith("ep-") || REH_ENDPOINT.startsWith("ep-floral-pond-apkvat38") || !/^rehearsal_target_[0-9]+$/.test(REH_DB ?? ""))) { console.error("bad --rehearsal args"); process.exit(64); }
-const PROD_NEON_ENDPOINT = REHEARSAL ? REH_ENDPOINT! : "ep-floral-pond-apkvat38";
-const NEON = { project: "divine-snow-84812652", branch: "br-damp-mud-apbr6ifp" };
+// Production Neon identifiers come from the environment (never committed); the runner refuses without them.
+const fail = (m: string): never => { console.error(m); process.exit(64); };
+const PROD_ENDPOINT = process.env.NEON_ENDPOINT ?? fail("NEON_ENDPOINT required (production Neon endpoint id, ep-...)");
+const NEON_PROJECT_ID = process.env.NEON_PROJECT_ID ?? fail("NEON_PROJECT_ID required");
+const NEON_BRANCH_ID = process.env.NEON_BRANCH_ID ?? fail("NEON_BRANCH_ID required");
+if (!PROD_ENDPOINT.startsWith("ep-")) fail("NEON_ENDPOINT must be an ep-... endpoint id");
+if (REHEARSAL && (!REH_ENDPOINT?.startsWith("ep-") || REH_ENDPOINT.startsWith(PROD_ENDPOINT) || !/^rehearsal_target_[0-9]+$/.test(REH_DB ?? ""))) { console.error("bad --rehearsal args"); process.exit(64); }
+const PROD_NEON_ENDPOINT = REHEARSAL ? REH_ENDPOINT! : PROD_ENDPOINT;
+const NEON = { project: NEON_PROJECT_ID, branch: NEON_BRANCH_ID };
 const SUPA = { project: "pyamkrhoyszgzirqqffq", host: "aws-0-us-east-1.pooler.supabase.com" };
 const GENERATION = "d2569f3498e6b66302aef514a04711304e2ee263b2e413f7488f8d142a8958f0";
 const RHC_MAIN = "e6bf92647ff6d326d67f108dc13fa8e6649f549a";

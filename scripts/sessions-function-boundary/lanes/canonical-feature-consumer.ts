@@ -1,20 +1,22 @@
-/**
- * Lane: canonical-feature-consumer (610 consumer ACKs).
- * EMPTY SLOT, filled by migration-completeness when #233 restacks onto this generator: set `migration`
- * to supabase/migrations/20261105030000_canonical_feature_consumer_acks.sql, list every function it
- * defines with its SECURITY DEFINER flag, and declare its grant source with the producer role ONLY
- * (`roles: ["bulls96_canonical_feature_producer"]`, per supporter-cloud's signed-off 687e076).
- * The generator then refuses any other grantee in that file. Its prefixes must not overlap
- * ingest-history's (sessions.ingest_history_ / session_history_ / session_directory_history_).
- */
+/** Lane: canonical-feature-consumer progress and finish CAS (#233). */
 import type { LaneManifest } from "../types.ts";
+
+const MIGRATION = "supabase/migrations/20261105030000_canonical_feature_consumer_acks.sql";
 
 export const canonicalFeatureConsumer: LaneManifest = {
   lane: "canonical-feature-consumer",
   owner: "#233 (migration-completeness)",
-  migration: null,
-  prefixes: [],
-  grantSources: [],
-  functions: {},
+  migration: MIGRATION,
+  prefixes: ["sessions.canonical_feature_page_ack_", "sessions.finish_canonical_"],
+  grantSources: [
+    { path: MIGRATION, roles: ["bulls96_canonical_feature_producer"] },
+  ],
+  functions: {
+    "sessions.canonical_feature_page_ack_fence()": { secdef: true, grants: [] },
+    "sessions.finish_canonical_copy(bigint,jsonb,text,text,text,text)": {
+      secdef: true,
+      grants: ["bulls96_canonical_feature_producer"],
+    },
+  },
   replaces: {},
 };
