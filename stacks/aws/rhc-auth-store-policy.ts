@@ -116,7 +116,7 @@ export function buildRhcAuthStorePlan(value: unknown) {
     { Sid: "OwnerUsesAuthKeyViaS3", Effect: "Allow", Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: [i.kmsKeyArn], Condition: via },
   ]);
   const bucketPolicy = policy<Record<string, unknown>>([
-    { Sid: "EHasNoCAuthAccess", Effect: "Deny", Principal: { AWS: i.ePrincipalArn }, Action: ["s3:GetObject", "s3:PutObject", "s3:ListBucket", ...denyActions], Resource: [i.bucketArn, `${i.bucketArn}/*`] },
+    { Sid: "EHasNoCAuthAccess", Effect: "Deny", Principal: { AWS: i.ePrincipalArn }, Action: ["s3:*"], Resource: [i.bucketArn, `${i.bucketArn}/*`] },
     { Sid: "RequireTls", Effect: "Deny", Principal: "*", Action: ["s3:GetObject", "s3:PutObject", "s3:ListBucket"], Resource: [i.bucketArn, `${i.bucketArn}/*`], Condition: { Bool: { "aws:SecureTransport": "false" } } },
     { Sid: "RequireExplicitKms", Effect: "Deny", Principal: "*", Action: ["s3:PutObject"], Resource: [`${i.bucketArn}/*`], Condition: { StringNotEquals: { "s3:x-amz-server-side-encryption": "aws:kms" } } },
     { Sid: "RequireExactKmsKey", Effect: "Deny", Principal: "*", Action: ["s3:PutObject"], Resource: [`${i.bucketArn}/*`], Condition: { StringNotEquals: { "s3:x-amz-server-side-encryption-aws-kms-key-id": i.kmsKeyArn } } },

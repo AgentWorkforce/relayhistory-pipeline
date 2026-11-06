@@ -82,6 +82,26 @@ describe("C auth offline policy proposal", () => {
     expect(effects(p.policies.bucketPolicy.Statement, "s3:PutObject", object, {})).toContain("Deny");
     expect(effects(p.policies.bucketPolicy.Statement, "s3:GetObject", object, { "aws:SecureTransport": "false" })).toContain("Deny");
   });
+  test("E's exact principal is denied every C-bucket action despite an accidental broad grant", () => {
+    const i = input(), p = buildRhcAuthStorePlan(i), ss = p.policies.bucketPolicy.Statement;
+    const broadGrant = { Effect: "Allow", Action: ["s3:*"], Resource: ["*"] };
+    const requests = [
+      ["s3:GetBucketPolicy", i.bucketArn], ["s3:PutBucketCORS", i.bucketArn],
+      ["s3:GetObjectAcl", p.keyFamilies.seal], ["s3:GetObject", p.keyFamilies.seal],
+      ["s3:PutObject", p.keyFamilies.mutable[0]!.replaceAll("*", "a")],
+      ["s3:ListBucket", i.bucketArn], ["s3:DeleteObjectVersion", p.keyFamilies.seal],
+    ];
+    const ctx = request(i.ePrincipalArn, i.kmsKeyArn);
+    for (const [action, resource] of requests) {
+      expect(permitted([broadGrant, ...ss], action!, resource!, ctx)).toBe(false);
+      // Removing precisely the E denial restores these otherwise-valid broad grants.
+      expect(permitted([broadGrant, ...ss.filter(s => s.Sid !== "EHasNoCAuthAccess")], action!, resource!, ctx)).toBe(true);
+    }
+    for (const principal of [i.runtimePrincipalArn, i.ownerBootstrapPrincipalArn, i.keyAdminPrincipalArn])
+      expect(effects(ss, "s3:GetBucketPolicy", i.bucketArn, request(principal, i.kmsKeyArn))).not.toContain("Deny");
+    for (const resource of [i.eBucketArn, i.transcriptBucketArn, `${i.bucketArn}-sibling`, `${i.bucketArn}-sibling/object`])
+      expect(effects(ss, "s3:GetBucketPolicy", resource, ctx)).not.toContain("Deny");
+  });
   test("KMS is exact-key, exact-account, regional S3 and object-context; admins receive no crypto grant", () => {
     const i = input(), p = buildRhcAuthStorePlan(i), ctx = { "aws:PrincipalArn": i.runtimePrincipalArn, "kms:ViaService": `s3.${region}.amazonaws.com`, "kms:CallerAccount": account, "kms:EncryptionContext:aws:s3:arn": `${i.bucketArn}/${i.keyRoot}/sessions/cli/o/id.json` };
     for (const a of ["kms:GenerateDataKey", "kms:Decrypt"]) {
@@ -91,7 +111,11 @@ describe("C auth offline policy proposal", () => {
       expect(permitted(p.policies.kmsKeyPolicy.Statement, a, i.kmsKeyArn, { ...ctx, "aws:PrincipalArn": i.keyAdminPrincipalArn })).toBe(false);
       expect(permitted(p.policies.kmsKeyPolicy.Statement, a, i.kmsKeyArn, { ...ctx, "aws:PrincipalArn": i.ePrincipalArn })).toBe(false);
     }
-    for (const policy of Object.values(p.policies)) for (const statement of policy.Statement) for (const action of array(statement.Action)) expect(action).not.toMatch(/[*?]/);
+    for (const [name, policy] of Object.entries(p.policies)) for (const statement of policy.Statement) {
+      if (name === "bucketPolicy" && statement.Sid === "EHasNoCAuthAccess") {
+        expect(statement).toEqual({ Sid: "EHasNoCAuthAccess", Effect: "Deny", Principal: { AWS: i.ePrincipalArn }, Action: ["s3:*"], Resource: [i.bucketArn, `${i.bucketArn}/*`] });
+      } else for (const action of array(statement.Action)) expect(action).not.toMatch(/[*?]/);
+    }
     expect(p.resources.bucket).toMatchObject({ bucketKeyEnabled: false, lifecycleRules: [], objectLockEnabled: false });
     // DeleteBucketOwnershipControls API is authorized by PutBucketOwnershipControls, not a new IAM verb.
     const denied = p.policies.runtimePolicy.Statement.find(s => s.Sid === "NoAuthHistoryDeletionOrAdministration")!;
