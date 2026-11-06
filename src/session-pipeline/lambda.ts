@@ -62,6 +62,7 @@ import{derivedSchemaAssets}from "./derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import {runSemanticCopyTick,semanticFailureReason} from "../search-features/semantic-copy-job.ts";
 import {semanticReadonlyPool,semanticFeatureReader,semanticMetadataPool} from "../search-features/semantic-copy-source-pool.ts";
+import {assertNoNeonEdge,neonExitProfile} from "../shared/neon-exit.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
@@ -90,6 +91,8 @@ export interface LambdaEnv {
   desktopCatalogEnabled: boolean;
   semanticCopyEnabled?: boolean;
   semanticSourceId?: string;
+  /** SESSIONS_NEON_EXIT=true: the legacy readonly source (analysis_source_readonly_url) is never carried or built. */
+  neonExit?: boolean;
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
   dbPoolMax: number;
@@ -108,6 +111,12 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
   // is a misconfiguration (docs/search-and-runtime-adapters.md).
   validateAdapterEnv(env, { runtime: ["lambda"], runtimeDefault: "lambda", search: ["clickhouse"], searchDefault: "clickhouse" });
   if (env.PIPELINE_ORG_FROM_PREFIX !== "true") throw new Error("session pipeline: PIPELINE_ORG_FROM_PREFIX must be true (org-prefix layout)");
+  // Both read the legacy readonly source, which has no non-Neon replacement; no host check substitutes.
+  const neonExit = neonExitProfile(env);
+  assertNoNeonEdge(neonExit, "the session pipeline", {
+    "SESSION_ANALYSIS_CACHE_ENABLED=1": env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
+    "SESSION_SEMANTIC_COPY_ENABLED=1": env.SESSION_SEMANTIC_COPY_ENABLED === "1",
+  });
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -121,6 +130,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     desktopCatalogEnabled: env.SESSION_DESKTOP_CATALOG_ENABLED === "1",
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
+    ...(neonExit.enabled ? { neonExit: true } : {}),
     fanout,
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
@@ -314,7 +324,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
   // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
   const semanticSecret = env.semanticCopyEnabled ? { hoopdbUrl: secret.hoopdb_url, clickhouse: secret.clickhouse, sourceUrl: secret.analysis_source_readonly_url } : undefined;
-  return { env, deps, brief, store, analysisSourceUrl: secret.analysis_source_readonly_url, semanticSecret };
+  // Neon-exit: the readonly source URL is dropped here, so no later branch can build its pool.
+  return { env, deps, brief, store, analysisSourceUrl: env.neonExit ? undefined : secret.analysis_source_readonly_url, semanticSecret };
 }
 
 /**
