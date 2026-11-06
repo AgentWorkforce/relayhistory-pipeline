@@ -32,7 +32,7 @@
  * Encryption: one dedicated CMK for the bucket with S3 Bucket Keys OFF, so every
  * object gets its own data key whose encryption context is the object's ARN
  * (`aws:s3:arn`, which carries `96bulls/<org>/v1/ws=<workspace>/`). The key
- * policy only lets the named users use the key through S3, for objects under
+ * policy lets the named users and configured pipeline/GC roles use the key through S3, for objects under
  * `96bulls/`, and every Decrypt/GenerateDataKey lands in CloudTrail with the
  * object ARN, i.e. per-workspace attribution, not tenant cryptographic isolation.
  * All objects are still protected by one shared CMK. Per-workspace CMKs are not used:
@@ -48,6 +48,7 @@ import { sha256, type Provenance } from "../../src/cli/plan-provenance.ts";
 import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hardening.ts";
 import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
+import { assertBufferedGcRoleArn, bufferedGcBucketStatements, bufferedGcKeyStatements } from "./buffered-gc-policy.ts";
 import {
   SESSION_BRIEF_RESOURCES,
   SESSION_ANALYSIS_CACHE_RESOURCES,
@@ -84,6 +85,8 @@ export const TRANSCRIPT_PARTITION = "aws";
 export const ACCESS_LOG_PREFIX = "s3-access/transcripts/";
 
 export interface TranscriptStoreInputs {
+  /** Exact, separately managed GC role. Required for this production stage: omission must never revoke active GC access. */
+  bufferedGcRoleArn?: string;
   /**
    * Log management events too (default true). Set false only when another trail
    * in the account already logs them (a second copy is billed).
@@ -175,7 +178,8 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "sessionPipeline" && k !== "sessionReadApi") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
+  assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
   if (store.sessionPipeline !== undefined) assertSessionPipelineInputs(store.sessionPipeline, refuse);
   if (store.sessionReadApi !== undefined) assertSessionReadApiInputs(store.sessionReadApi, refuse);
   if (store.managementEvents !== undefined && typeof store.managementEvents !== "boolean") refuse("transcriptStore.managementEvents must be a boolean");
@@ -928,12 +932,14 @@ export function trailLifecycleRules() {
 
 /**
  * Bucket policy for the transcripts bucket (statements only, as AWS.S3.Bucket takes them):
- * TLS (1.2+) only; only the eraser deletes objects or versions; a PUT that sends
+ * TLS (1.2+) only; the eraser deletes objects/versions and configured GC may delete
+ * buffered versions only, preserving its current barrier. A PUT that sends
  * any encryption header other than SSE-KMS naming this bucket's key is refused,
  * including `aws:kms` without a key id (S3 would use `aws/s3`). SSE-C is blocked
  * separately by the encryption configuration.
  */
-export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string }) {
+export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string }) {
+  if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId ?? "");
   return [
     ...denyInsecureTransport(i.bucketArn),
     {
@@ -950,7 +956,7 @@ export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; e
       Principal: "*",
       Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
       Resource: [`${i.bucketArn}/*`],
-      Condition: { ArnNotEquals: { "aws:PrincipalArn": i.eraserArn } },
+      Condition: { ArnNotEquals: { "aws:PrincipalArn": i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn } },
     },
     {
       Sid: "DenyOtherEncryption",
@@ -972,6 +978,7 @@ export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; e
       Resource: [`${i.bucketArn}/*`],
       Condition: { Null: { "s3:x-amz-server-side-encryption": "false" }, StringNotEqualsIfExists: { "s3:x-amz-server-side-encryption-aws-kms-key-id": i.keyArn } },
     },
+    ...(i.bufferedGcRoleArn ? bufferedGcBucketStatements({ accountId: i.accountId!, bucketArn: i.bucketArn, roleArn: i.bufferedGcRoleArn }) : []),
   ];
 }
 
@@ -1016,13 +1023,15 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
 
 /**
  * The transcripts CMK's policy. The account root administers the key and cannot
- * use it (no `kms:*`). Only the writer, the srv-writer and the reader may use it, only through S3 in
+ * use it (no `kms:*`). The writer, srv-writer, reader and configured pipeline may use it only through S3 in
  * this region, only from this account, and only for objects under `96bulls/` in
  * this bucket (the S3 encryption context, per object since bucket keys are off).
- * The eraser and every operator role have no use of it: deleting needs no key,
+ * Configured GC has the separately bounded buffered-object grant and explicit canonical deny.
+ * The eraser and every other operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string }) {
+  if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId);
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
     StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${TENANT_KEY_BASE}/*` },
@@ -1035,6 +1044,7 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
       { Sid: "SrvWriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.srvWriterArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: via },
       { Sid: "ReaderDecryptsViaS3", Effect: "Allow" as const, Principal: { AWS: i.readerArn }, Action: ["kms:Decrypt"], Resource: "*", Condition: via },
       ...(i.pipelineRoleArn ? [pipelineKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.pipelineRoleArn })] : []),
+      ...(i.bufferedGcRoleArn ? bufferedGcKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.bufferedGcRoleArn }) : []),
     ],
   };
 }
@@ -1190,6 +1200,9 @@ export interface TranscriptStageInputs {
 /** Declares the transcript store. Production stages are never destroyed (deploy-guard NON_DESTROYABLE). */
 export const transcriptStoreStage = (i: TranscriptStageInputs) =>
   Effect.gen(function* () {
+    // Defense in depth for direct callers: refuse before declaring the first resource.
+    if (i.stage === TRANSCRIPT_STAGE || i.transcriptStore.bufferedGcRoleArn !== undefined)
+      assertBufferedGcRoleArn(i.transcriptStore.bufferedGcRoleArn, i.accountId);
     const n = transcriptNames(i.stage, i.accountId);
     const eraserArn = userArn(i.accountId, n.userPath, n.eraser);
     const user = (id: string, userName: string, purpose: string, policy: object) =>
@@ -1261,6 +1274,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         writerArn: writer.userArn as unknown as string,
         srvWriterArn: srvWriter.userArn as unknown as string,
         readerArn: reader.userArn as unknown as string,
+        bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn,
         ...(pipelineRoleArn ? { pipelineRoleArn } : {}),
       }) as never,
       // Also orders the key after the trail: the trail audits its use from the first call, and the
@@ -1290,7 +1304,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       publicAccessBlock: PUBLIC_ACCESS_BLOCK,
       objectOwnership: "BucketOwnerEnforced",
       policy: [
-        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn }),
+        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn }),
         ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn }) : []),
       ] as never,
       lifecycleRules: transcriptLifecycleRules() as never,
