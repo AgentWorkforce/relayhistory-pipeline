@@ -635,8 +635,16 @@ test("fsync ledger completes short writes and never accepts a partial write foll
     await reopened.begin(digest, p);
     await reopened.close();
 
-    const failedPath = join(dir, "failed.ndjson");
+    const failedPath = join(dir, "failed-after-begin.ndjson");
     const failed = await openPublicationCanaryOutcomeFile(failedPath);
+    await failed.begin(digest, p);
+    const failedOutcome: PublicationCanaryOutcome = {
+      stageToken: OUT.stageToken,
+      status: "held",
+      reason: "outside_canary_tenant",
+      tenant: OUT.tenant,
+      evidenceDigest: OUT.sha256,
+    };
     let writes = 0;
     prototype.write = async function (
       buffer: Buffer,
@@ -654,7 +662,10 @@ test("fsync ledger completes short writes and never accepts a partial write foll
         position,
       );
     };
-    await expect(failed.begin(digest, p)).rejects.toThrow("simulated write failure");
+    await expect(failed.record(digest, failedOutcome)).rejects.toThrow("simulated write failure");
+    prototype.write = originalWrite;
+    await expect(failed.begin(digest, p)).rejects.toThrow("publication_canary_outcome_poisoned");
+    await expect(failed.record(digest, failedOutcome)).rejects.toThrow("publication_canary_outcome_poisoned");
     await expect(
       failed.finish(digest, {
         planDigest: digest,
@@ -664,8 +675,7 @@ test("fsync ledger completes short writes and never accepts a partial write foll
         refused: 1,
         complete: true,
       }),
-    ).rejects.toThrow("publication_canary_outcome_plan_conflict");
-    prototype.write = originalWrite;
+    ).rejects.toThrow("publication_canary_outcome_poisoned");
     await failed.close();
     expect(readFileSync(failedPath, "utf8").endsWith("\n")).toBe(false);
     await expect(openPublicationCanaryOutcomeFile(failedPath)).rejects.toThrow(

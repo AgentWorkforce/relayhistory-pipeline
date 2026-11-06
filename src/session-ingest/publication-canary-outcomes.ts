@@ -135,6 +135,7 @@ export async function openPublicationCanaryOutcomeFile(
     let finished: PublicationCanarySummary | undefined = lines.find(
       (line) => line.payload.kind === "finish",
     )?.payload.summary;
+    let poisoned = false;
     const outcomes = new Map<string, PublicationCanaryOutcome>();
     for (const line of lines) {
       const outcome = line.payload.outcome;
@@ -144,34 +145,45 @@ export async function openPublicationCanaryOutcomeFile(
         throw fail("publication_canary_outcome_conflict");
       outcomes.set(outcome.stageToken, outcome);
     }
-    const append = async (payload: LedgerPayload) => {
+    const assertWritable = () => {
       if (!file || closed) throw fail("publication_canary_outcome_closed");
-      const unsigned = {
-        version: 1 as const,
-        sequence: lines.length,
-        previousSha256: lines.at(-1)?.sha256 ?? "0".repeat(64),
-        payload,
-      };
-      const line: LedgerLine = { ...unsigned, sha256: hashLine(unsigned) };
-      const encoded = Buffer.from(JSON.stringify(line) + "\n", "utf8");
-      let offset = 0;
-      while (offset < encoded.byteLength) {
-        const remaining = encoded.byteLength - offset;
-        const { bytesWritten } = await file.write(encoded, offset, remaining);
-        if (
-          !Number.isSafeInteger(bytesWritten) ||
-          bytesWritten <= 0 ||
-          bytesWritten > remaining
-        )
-          throw fail("publication_canary_outcome_write");
-        offset += bytesWritten;
+      if (poisoned) throw fail("publication_canary_outcome_poisoned");
+      return file;
+    };
+    const append = async (payload: LedgerPayload) => {
+      const writable = assertWritable();
+      try {
+        const unsigned = {
+          version: 1 as const,
+          sequence: lines.length,
+          previousSha256: lines.at(-1)?.sha256 ?? "0".repeat(64),
+          payload,
+        };
+        const line: LedgerLine = { ...unsigned, sha256: hashLine(unsigned) };
+        const encoded = Buffer.from(JSON.stringify(line) + "\n", "utf8");
+        let offset = 0;
+        while (offset < encoded.byteLength) {
+          const remaining = encoded.byteLength - offset;
+          const { bytesWritten } = await writable.write(encoded, offset, remaining);
+          if (
+            !Number.isSafeInteger(bytesWritten) ||
+            bytesWritten <= 0 ||
+            bytesWritten > remaining
+          )
+            throw fail("publication_canary_outcome_write");
+          offset += bytesWritten;
+        }
+        await writable.sync();
+        lines.push(line);
+      } catch (error) {
+        poisoned = true;
+        throw error;
       }
-      await file.sync();
-      lines.push(line);
     };
     return {
       path,
       async begin(planDigest, plan) {
+        assertWritable();
         if (begun) {
           if (
             begun.planDigest !== planDigest ||
@@ -194,6 +206,7 @@ export async function openPublicationCanaryOutcomeFile(
         return new Map(outcomes);
       },
       async record(planDigest, outcome) {
+        assertWritable();
         if (begun?.planDigest !== planDigest || finished)
           throw fail("publication_canary_outcome_state");
         const prior = outcomes.get(outcome.stageToken);
@@ -206,6 +219,7 @@ export async function openPublicationCanaryOutcomeFile(
         outcomes.set(outcome.stageToken, outcome);
       },
       async finish(planDigest, summary) {
+        assertWritable();
         if (begun?.planDigest !== planDigest)
           throw fail("publication_canary_outcome_plan_conflict");
         if (finished) {
