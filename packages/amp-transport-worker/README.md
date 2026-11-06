@@ -68,3 +68,26 @@ bytes. Do not replay an ambiguous injection or erase acknowledged evidence.
 static container entrypoint in a local Bun process with no database credentials.
 Wrangler's dry run compiles the Worker and validates its resource configuration;
 it does not prove container provisioning, live ingress or native CLI access.
+
+### Copy through the trusted Actions runner
+
+When an operator connection cannot upload large registry layers, dispatch
+`Copy reviewed Amp image` from `main`. Supply the successful publication run,
+its approved source SHA and signed OCI index digest, the approved target account,
+and the exact confirmation `copy reviewed Amp image`. The existing
+`image-publish` environment holds only a short-lived
+`AMP_CLOUDFLARE_REGISTRY_TOKEN` for this copy; mint a pull/push credential from
+the operator's 1Password-backed Cloudflare access, request 30 minutes, dispatch
+promptly, and remove the GitHub secret after the run. No long-lived Cloudflare
+API key is given to the workflow.
+
+The job verifies the successful owner publication, both Sigstore attestations,
+source/workflow ancestry and the exact source's current CI before any registry
+write. It snapshots the signed index's linux/amd64 child into a local OCI layout,
+checks its digest and platform, then copies it without rebuilding. Authentication
+uses sealed Linux anonymous memory; token values never enter files or argv.
+It refuses a registry token with less than 15 minutes remaining before upload,
+verifies both destination tag and immutable digest, rechecks the source proof,
+and uploads only a public `amp-copy-receipt` artifact. Use its immutable
+`cloudflare_image` in the deployment steps above. This copies release bytes;
+it does not deploy the Worker or run on each sync/message.
