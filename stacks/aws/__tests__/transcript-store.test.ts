@@ -479,12 +479,14 @@ describe("transcript store: deploy plan contract", () => {
   ].join("\n");
   const withKeyDiff = (compact: string, diff: string) =>
     detailed(compact).replace("  [transcripts-key] update", `  [transcripts-key] update\n${diff}`);
-  const inboxStatement = (sid: string, action: string, additions: string[]) => [
+  const inboxStatement = (sid: string, action: string, additions: string[], parent: "Resource" | "Condition" = "Resource") => [
     `        - Sid: ${sid}`,
+    `          Effect: Allow`,
     `          Action:`,
     `            - ${action}`,
     `          Resource:`,
-    ...additions.map((resource) => `  +               - ${resource}`),
+    ...(parent === "Condition" ? [`          Condition:`, `            StringEquals:`] : []),
+    ...additions.map((resource) => parent === "Resource" ? `  +               - ${resource}` : `  +                   - ${resource}`),
   ].join("\n");
   const withInboxPolicyDiff = (compact: string, authorityRoot = AUTHORITY_ROOT, additions: string[] = [
     `${n.bucketArn}/${authorityRoot}/*`,
@@ -537,6 +539,19 @@ describe("transcript store: deploy plan contract", () => {
       "  [transcript-srv-writer] update",
       `  [transcript-srv-writer] update\n${inboxStatement(sid, action, resources)}`,
     );
+    const wrongAction = withInboxPolicyDiff(compact).replace("            - s3:GetObject", "            - kms:Decrypt");
+    const nestedCondition = detailed(compact).replace(
+      "  [transcript-srv-writer] update",
+      `  [transcript-srv-writer] update\n${inboxStatement("ReadLiveObjects", "s3:GetObject", resources.slice(0, 2), "Condition")}\n${inboxStatement("WriteLiveObjectsSseKmsOnly", "s3:PutObject", resources.slice(2), "Condition")}`,
+    );
+    const repeatedReadSid = detailed(compact).replace(
+      "  [transcript-srv-writer] update",
+      `  [transcript-srv-writer] update\n${inboxStatement("ReadLiveObjects", "s3:GetObject", resources.slice(0, 2))}\n${inboxStatement("ReadLiveObjects", "s3:GetObject", resources.slice(2))}`,
+    );
+    const nestedSidInjection = withInboxPolicyDiff(compact).replace(
+      "          Resource:\n  +",
+      "          Resource:\n            - Sid: WriteLiveObjectsSseKmsOnly\n  +",
+    );
     for (const bad of [
       withInboxPolicyDiff(compact, AUTHORITY_ROOT, [`${n.bucketArn}/${AUTHORITY_ROOT}/*`, `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`]),
       withInboxPolicyDiff(compact, AUTHORITY_ROOT, [
@@ -553,6 +568,10 @@ describe("transcript store: deploy plan contract", () => {
       ),
       allUnder("ReadLiveObjects", "s3:GetObject"),
       allUnder("UseTranscriptKeyViaS3", "kms:Decrypt"),
+      wrongAction,
+      nestedCondition,
+      repeatedReadSid,
+      nestedSidInjection,
     ])
       expect(() => check(compact, bad, provenance(compact, bad))).toThrow(/srv-writer inbox policy update/);
   });

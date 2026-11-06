@@ -619,26 +619,67 @@ function detailedBlock(lines: readonly string[], resource: string): string[] {
 function assertSrvWriterInboxPolicyDiff(detailedPlanText: string, refuse: (why: string) => never): void {
   const label = "srv-writer inbox policy update";
   const block = detailedBlock(detailedPlanText.split(/\r?\n/), "transcript-srv-writer");
-  let statementSid: string | undefined;
-  const marked = block
-    .map((line) => {
-      const sid = /^\s*(?:-\s+)?Sid:\s+(\S+)\s*$/.exec(line);
-      if (sid) statementSid = sid[1];
-      const change = /^  ([+-]) (.*)$/.exec(line);
-      return change ? { change, statementSid } : undefined;
-    })
-    .filter((entry): entry is { change: RegExpExecArray; statementSid: string | undefined } => entry !== undefined);
-  const removed = marked.filter(({ change }) => change[1] === "-").map(({ change }) => change[2]!.trim());
-  const added = marked.filter(({ change }) => change[1] === "+").map(({ change, statementSid: sid }) => ({ line: change[2]!.trim(), sid }));
+  const indent = (line: string) => line.search(/\S|$/);
+  const marked = block.map((line, index) => {
+    const change = /^  ([+-]) (.*)$/.exec(line);
+    return change ? { index, kind: change[1]!, payload: change[2]! } : undefined;
+  }).filter((entry): entry is { index: number; kind: string; payload: string } => entry !== undefined);
+  const removed = marked.filter(({ kind }) => kind === "-").map(({ payload }) => payload.trim());
+  const added = marked.filter(({ kind }) => kind === "+");
   if (removed.length !== 0) refuse(`${label}: the policy update removes or changes existing lines`);
   if (added.length !== 4) refuse(`${label}: expected exactly four added resource lines, found ${added.length}`);
 
+  const sidLines = block.map((line, index) => {
+    const sid = /^(\s*)-\s+Sid:\s+([A-Za-z][A-Za-z0-9]*)\s*$/.exec(line);
+    return sid ? { index, indent: sid[1]!.length, sid: sid[2]! } : undefined;
+  }).filter((entry): entry is { index: number; indent: number; sid: string } => entry !== undefined);
+  const statementIndent = Math.min(...sidLines.map(({ indent: width }) => width));
+  if (!Number.isFinite(statementIndent)) refuse(`${label}: detailed policy has no statement context`);
+  const statements = sidLines.filter(({ indent: width }) => width === statementIndent);
+  if (new Set(statements.map(({ sid }) => sid)).size !== statements.length)
+    refuse(`${label}: policy statement Sids must be unique`);
+  if (sidLines.some(({ indent: width }) => width !== statementIndent))
+    refuse(`${label}: nested Sid fields are not valid policy statement context`);
+
   const bucketArn = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID).bucketArn;
   const candidate = `- ${bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`;
-  const read = added.filter(({ sid }) => sid === "ReadLiveObjects").map(({ line }) => line);
-  const write = added.filter(({ sid }) => sid === "WriteLiveObjectsSseKmsOnly").map(({ line }) => line);
-  if (read.length !== 2 || write.length !== 2)
-    refuse(`${label}: authority and candidate resources must each be added once under ReadLiveObjects and WriteLiveObjectsSseKmsOnly`);
+  const statementResources = (sid: string, action: string): string[] => {
+    const matches = statements.filter((statement) => statement.sid === sid);
+    if (matches.length !== 1) refuse(`${label}: expected exactly one ${sid} statement`);
+    const statement = matches[0]!;
+    const next = statements.find(({ index }) => index > statement.index);
+    const end = next?.index ?? block.length;
+    const propertyIndent = statementIndent + 2;
+    const direct = (pattern: RegExp) => block.slice(statement.index + 1, end)
+      .map((line, offset) => ({ line, index: statement.index + 1 + offset }))
+      .filter(({ line }) => indent(line) === propertyIndent && pattern.test(line));
+    const effects = direct(/^\s*Effect:\s+(\S+)\s*$/);
+    if (effects.length !== 1 || !/^\s*Effect:\s+Allow\s*$/.test(effects[0]!.line))
+      refuse(`${label}: ${sid} must have exactly Effect Allow`);
+    const actions = direct(/^\s*Action:\s*$/);
+    if (actions.length !== 1) refuse(`${label}: ${sid} must have exactly one Action field`);
+    const actionStart = actions[0]!.index;
+    const actionEndOffset = block.slice(actionStart + 1, end).findIndex((line) => !/^\s*$/.test(line) && !/^  [+-] /.test(line) && indent(line) <= propertyIndent);
+    const actionEnd = actionEndOffset < 0 ? end : actionStart + 1 + actionEndOffset;
+    const actionValues = block.slice(actionStart + 1, actionEnd)
+      .filter((line) => indent(line) === propertyIndent + 2)
+      .map((line) => /^\s*-\s+(\S+)\s*$/.exec(line)?.[1])
+      .filter((value): value is string => value !== undefined);
+    if (actionValues.length !== 1 || actionValues[0] !== action)
+      refuse(`${label}: ${sid} must have exactly action ${action}`);
+    const resources = direct(/^\s*Resource:\s*$/);
+    if (resources.length !== 1) refuse(`${label}: ${sid} must have exactly one Resource field`);
+    const resourceStart = resources[0]!.index;
+    const resourceEndOffset = block.slice(resourceStart + 1, end).findIndex((line) => !/^\s*$/.test(line) && !/^  [+-] /.test(line) && indent(line) <= propertyIndent);
+    const resourceEnd = resourceEndOffset < 0 ? end : resourceStart + 1 + resourceEndOffset;
+    return added.filter(({ index, payload }) =>
+      index > resourceStart && index < resourceEnd && indent(payload) === propertyIndent + 4
+    ).map(({ payload }) => payload.trim());
+  };
+  const read = statementResources("ReadLiveObjects", "s3:GetObject");
+  const write = statementResources("WriteLiveObjectsSseKmsOnly", "s3:PutObject");
+  if (read.length !== 2 || write.length !== 2 || read.length + write.length !== added.length)
+    refuse(`${label}: authority and candidate resources must be direct additions to ReadLiveObjects and WriteLiveObjectsSseKmsOnly Resource fields`);
   if (read.filter((line) => line === candidate).length !== 1 || write.filter((line) => line === candidate).length !== 1)
     refuse(`${label}: the fixed candidate resource must be added exactly once to Get and once to Put`);
   const authority = [...read.filter((line) => line !== candidate), ...write.filter((line) => line !== candidate)];
