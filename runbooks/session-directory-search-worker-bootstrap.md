@@ -175,13 +175,13 @@ never infers anything from the hostname. An invalid profile writes nothing anywh
 
 | Variable                        | Contract                                                                                                                                                                                                                                                                                                          |
 | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `HOOPDB_DB_MODE`                | required, no default: `local` (Docker stack), `selfhosted` (operator-controlled Postgres), `cloudsql` (Google Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                                                         |
-| `HOOPDB_SUPABASE_SHIM`          | `local`, `selfhosted` and `cloudsql`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project.                                                            |
-| `HOOPDB_ROLE_BOOTSTRAP`         | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                                                                                                      |
+| `HOOPDB_DB_MODE`                | required, no default: `local` (Docker stack), `selfhosted` (operator-controlled Postgres), `cloudsql` (Google Cloud SQL), `supabase` or `rds` (Amazon RDS for PostgreSQL, not Aurora). Anything else: `db_mode_invalid`.                                                                                                                                         |
+| `HOOPDB_SUPABASE_SHIM`          | `local`, `selfhosted` and `cloudsql`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase` and `rds`: only unset or `false`. `true` is refused (`shim_forbidden`): `supabase_shim.sql` must never run on a Supabase project, and on RDS it cannot (BYPASSRLS).                                                            |
+| `HOOPDB_ROLE_BOOTSTRAP`         | defaults to the shim choice. In `supabase` and `rds` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                                                                                                      |
 | `HOOPDB_RUNTIME_ROLE`           | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                                                                                                |
-| `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql` and `supabase` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                                                            |
-| `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION).                                                                                                                                                                                                                         |
-| `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted`, `cloudsql` and `supabase`: `global-default-revoke`, or `event-trigger` (supabase only; refused elsewhere with `function_boundary_mode_unsupported`). The catalog must prove the selected control, see "Function boundary". The old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
+| `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql`, `supabase` and `rds` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                                                            |
+| `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION). Refused in `rds` (`db_profile_invalid`): its grantor would be the non-superuser master.                                                                                                                                                                                                                         |
+| `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted`, `cloudsql`, `supabase` and `rds`: `global-default-revoke`, or `event-trigger` (supabase only; refused elsewhere with `function_boundary_mode_unsupported`). The catalog must prove the selected control, see "Function boundary". The old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
 
 **Runtime role: dedicated, exact least privilege.** It is checked under the migrator's
 advisory lock before any write (before the ledger and marker tables are created, before
@@ -208,6 +208,12 @@ phase 2 can mark PASS.
     migrator then verifies the resulting LOGIN-only role and its exact
     database/schema/object privileges. Its password and URL are stored in 1Password and
     supplied only through the runtime Secret.
+  - `rds`: `supabase/bootstrap/hoopdb_runtime_role_rds.sql`, run as the master with an
+    explicit `-v migration_owner=`. The master creates the LOGIN role directly so it can
+    still set and rotate its password; on PG16+ the exact unavoidable creator edge
+    (member = the connected migration owner, grantor = SUPERUSER `rdsadmin`, ADMIN true,
+    INHERIT and SET false) is accepted only in `rds` mode (`isRdsCreatorEdge`). See
+    "Amazon RDS for PostgreSQL".
   - `supabase`: pre-provisioned by an operator and verified by the migrator. On PG16+
     the exact unavoidable `postgres` creator edge is accepted only when its grantor is
     the frozen superuser `supabase_admin`, ADMIN is true, INHERIT and SET are false, no
@@ -506,6 +512,11 @@ config fails closed.
     Worker membership-free. The Cloud SQL `service_role` is NOBYPASSRLS and exists only
     to satisfy shared migration grants; the GCP runtime never connects as it. The
     canonical verifier then proves the Worker role and grants.
+  - **Amazon RDS for PostgreSQL (`rds` mode):** the same shape with AWS's internal
+    `rdsadmin` as the trust root (`RDS_PLATFORM_SUPERUSERS`, exactly `rdsadmin`, only
+    while SUPERUSER, never the owner). The master runs
+    `rds_owner_function_default_revoke.sql`. Every other CREATE-capable role, any second
+    superuser and any other `rds_superuser` member stay covered. Aurora is not covered.
 - **Exact default ACL:** the migration owner's `pg_default_acl` row with
   `defaclnamespace = 0` and `defaclobjtype = 'f'` must normalize to EXACTLY
   `{<self>:EXECUTE}`: owner EXECUTE, no grant option, no other grantee. Merely "PUBLIC
@@ -680,6 +691,59 @@ courier claim no queue work.
 global default revoke has no blast radius outside HoopDb. That needs an ownership transfer
 of live objects, so it is out of scope for #99. The schema-specific event trigger above is
 the reviewed alternative for Supabase. Tracked in #98.
+
+## Amazon RDS for PostgreSQL (`rds` mode)
+
+RDS for PostgreSQL 16+ only (proven against an emulation on PostgreSQL 17). **Aurora is a
+separate variant and is NOT covered** (`aurora` is `db_mode_invalid`). The master user is a
+CREATEROLE/CREATEDB member of `rds_superuser`, not a superuser; the only superuser is AWS's
+internal `rdsadmin`, the bootstrap superuser. The generic bootstraps refuse that master
+(42501), the shim cannot create its BYPASSRLS `service_role`, the master cannot alter
+`rdsadmin`'s default privileges, and the Cloud SQL files refuse the missing Cloud SQL roles.
+
+**Contract.** The migration owner is the master (or another CREATEROLE `rds_superuser`
+member, used consistently), owns the HoopDb database, and is the connection of every step
+below and of the migrator. In rds mode the migrator refuses before any write unless the
+catalog shows that shape (`rds_profile_unproven`).
+
+**Order, as the migration owner, connected to the HoopDb database:**
+
+1. `rds_owner_function_default_revoke.sql`: the owner's exact global function default.
+2. `rds_migration_roles.sql`: the eight fixed NOLOGIN roles through a disposable CREATEROLE
+   trampoline, so they are membership-free (by design, afterwards only `rdsadmin` can alter
+   or drop them).
+3. `hoopdb_runtime_role_rds.sql -v migration_owner=<owner> -v runtime_role=<role>
+   -v runtime_login=true`: the runtime LOGIN role, PUBLIC TEMPORARY revoked, CONNECT
+   granted, in one transaction. Then set its password from the secret manager (never on
+   disk).
+4. The phase 1 verifiers `session_directory_search_worker.sql`,
+   `session_token_verifier.sql`, `session_ingest_roles.sql` (here they only verify the
+   existing roles).
+5. The migrator: `HOOPDB_DB_MODE=rds`, `HOOPDB_SUPABASE_SHIM=false` (or unset),
+   `HOOPDB_ROLE_BOOTSTRAP` unset, `HOOPDB_RUNTIME_ROLE=<role>`,
+   `HOOPDB_RUNTIME_ROLE_LOGIN=true`, `HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke`.
+   Generation, ledger, sequence, checksum, exact-ACL and phase 2 checks are unchanged.
+
+**Proof:** `scripts/pg-proof/rds-profile-proof.ts` (CI job `rds-emulated-postgres`), against
+a disposable PostgreSQL 17 whose bootstrap superuser is named `rdsadmin`. Emulation limits:
+no `rds.*` parameters or parameter groups, no RDS extension allow-list, no IAM
+authentication, no RDS-specific catalog hooks, and vanilla PostgreSQL refuses
+`CREATE EVENT TRIGGER` to `rds_superuser` members where RDS allows it (irrelevant here: rds
+mode uses `global-default-revoke`).
+
+**Live RDS gates still needed (the emulation claims none of them):**
+
+- `SELECT oid, rolname, rolsuper FROM pg_roles WHERE oid = 10` is `rdsadmin`, SUPERUSER,
+  and `rdsadmin` is the recorded grantor of the master's PG16+ creator edges.
+- The master's attributes and memberships (`rds_superuser`, no SUPERUSER, CREATEROLE), that
+  the master owns the Terraform-created database, and that `rdsadmin` is the only SUPERUSER.
+- Steps 1-5 pass on the target engine version and parameter group, and the canonical
+  readiness gate passes as the runtime role over TLS.
+- Rotating the runtime password as the master (and through Secrets Manager rotation, if
+  used) keeps the exact creator edge. IAM database authentication is NOT supported: it
+  needs `rds_iam` membership, which the allowlist refuses.
+- `pg_trgm` and `btree_gin` are creatable by the master on the target version.
+- Snapshot restore and major-version upgrade keep the role graph so steps 1-5 rerun clean.
 
 ## CNPG (self-hosted HoopDb)
 

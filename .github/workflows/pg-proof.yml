@@ -98,6 +98,63 @@ jobs:
             auth-upgrade-pg${{ matrix.pg }}.json
             auth-upgrade-pg${{ matrix.pg }}.log
 
+  rds-emulated-postgres:
+    # The managed-RDS HoopDb profile (HOOPDB_DB_MODE=rds) on a disposable PostgreSQL 17
+    # whose bootstrap superuser is named rdsadmin, so PostgreSQL's automatic PG16+
+    # creator edges carry rdsadmin as grantor, as on RDS. An emulation, not RDS: the
+    # live RDS gates are listed in the bootstrap runbook.
+    name: managed-RDS profile (emulated, PostgreSQL 17)
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          # Disposable container: trust auth means no credential exists anywhere.
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_USER: rdsadmin
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rdsadmin -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Prove the rds profile, its drift refusals and its mode binding
+        env:
+          PGPROOF_HOST: 127.0.0.1
+          PGPROOF_PORT: "5432"
+          PGPROOF_SUPERUSER: rdsadmin
+          PGPROOF_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          PGPROOF_OUT: rds-profile-proof.json
+        run: |
+          set -o pipefail
+          bun scripts/pg-proof/rds-profile-proof.ts 2>&1 | tee rds-profile-proof.log
+      - name: Check the results file names this head
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          jq -e --arg head "$EXPECTED" \
+            '.head == $head and .pg_major == 17 and .bootstrap_superuser == "rdsadmin" and .failed == 0 and .passed >= 16 and (.cases | all(.pass))' rds-profile-proof.json
+          jq -r '"\(.passed) passed, \(.failed) failed on PostgreSQL \(.pg_version) (rds emulation) at \(.head)"' rds-profile-proof.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rds-profile-proof
+          path: |
+            rds-profile-proof.json
+            rds-profile-proof.log
+
   brief-postgres:
     name: brief publication PostgreSQL ${{ matrix.pg }}
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
