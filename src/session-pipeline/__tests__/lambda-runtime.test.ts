@@ -52,6 +52,57 @@ const schedules = [
   ["semantic-copy", "semanticCopy"],
 ] as const;
 
+const invalidSchedules: unknown[] = ["unknown", "", " ", "RECONCILE", "__proto__", null, false, 0, [], {}, ["brief"]];
+
+test("explicit invalid schedules refuse before binding or invoking, including queue envelopes", async () => {
+  for (const schedule of invalidSchedules) for (const Records of [undefined, [{ messageId: "a", body: "input" }]]) {
+    let bound = 0, invoked = 0;
+    const base = runtime([]);
+    const adapter = { ...base, bind(work) { bound++; return base.bind(work); } } satisfies PipelineRuntimeAdapter;
+    const event = { schedule, ...(Records ? { Records } : {}) } as PipelineLambdaEvent;
+    await expect(dispatchRegisteredLambda(adapter, event, async () => { invoked++; return { ok: false }; })).rejects.toThrow("schedule");
+    expect({ bound, invoked }).toEqual({ bound: 0, invoked: 0 });
+  }
+});
+
+test("absent or undefined schedules retain the no-selector legacy fallback", async () => {
+  for (const event of [{}, { schedule: undefined }]) {
+    let bound = 0, invoked = 0;
+    const base = runtime([]);
+    const adapter = { ...base, bind(work) { bound++; return base.bind(work); } } satisfies PipelineRuntimeAdapter;
+    expect(await dispatchRegisteredLambda(adapter, event, async input => {
+      invoked++;
+      expect(input).toBe(event);
+      return { ok: false };
+    })).toEqual({ ok: false });
+    expect({ bound, invoked }).toEqual({ bound: 0, invoked: 1 });
+  }
+});
+
+test("the public composed handler rejects invalid schedules without loading and preserves queue failures", async () => {
+  const previous = process.env.PIPELINE_RUNTIME;
+  process.env.PIPELINE_RUNTIME = "lambda";
+  let bound = 0, loaded = 0;
+  const base = runtime([]);
+  const adapter = { ...base, bind(work) { bound++; return base.bind(work); } } satisfies PipelineRuntimeAdapter;
+  const handler = createPipelineLambdaHandler({
+    runtime: { create: () => adapter } as never,
+    loadRuntime: async () => { loaded++; throw new Error("must not load a service"); },
+  });
+  try {
+    for (const schedule of invalidSchedules) {
+      await expect(handler({ schedule } as PipelineLambdaEvent)).rejects.toThrow("Lambda runtime schedule failed");
+      expect(await handler({ schedule, Records: [{ messageId: "a", body: "input" }] } as PipelineLambdaEvent)).toEqual({ batchItemFailures: [{ itemIdentifier: "a" }] });
+      expect({ bound, loaded }).toEqual({ bound: 0, loaded: 0 });
+    }
+    for (const event of [{}, { schedule: undefined }]) expect(await handler(event)).toEqual({ ok: false });
+    expect({ bound, loaded }).toEqual({ bound: 0, loaded: 0 });
+  } finally {
+    if (previous === undefined) delete process.env.PIPELINE_RUNTIME;
+    else process.env.PIPELINE_RUNTIME = previous;
+  }
+});
+
 test("conflicting named schedules and legacy flags refuse before binding or invoking", async () => {
   for (const [job] of schedules) for (const [other, flag] of schedules) {
     if (job === other) continue;

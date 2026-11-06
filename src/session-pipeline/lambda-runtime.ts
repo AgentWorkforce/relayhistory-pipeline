@@ -26,6 +26,7 @@ function queueBody(item: Extract<WorkItem, { type: "manifest-landed" }>): string
 export async function dispatchRegisteredLambda(adapter: PipelineRuntimeAdapter, event: PipelineLambdaEvent, invoke: PipelineInvoker): Promise<BatchResponse | { ok: boolean }> {
   const caps = adapter.capabilities();
   if (adapter.kind !== "lambda" || caps.kind !== "lambda" || caps.trigger !== "push" || !caps.partialBatchFailure || caps.scopeSerialization !== "advisory-lock") throw new Error("Lambda runtime composition incompatible");
+  if (event.schedule !== undefined && (typeof event.schedule !== "string" || !Object.hasOwn(SCHEDULES, event.schedule))) throw new Error("Lambda invocation schedule invalid");
   const flags = Object.entries(SCHEDULES).filter(([, key]) => event[key] === true);
   if (Array.isArray(event.Records) && (flags.length || event.schedule) || flags.length > 1 ||
       event.schedule !== undefined && flags.length === 1 && event.schedule !== flags[0]![0]) throw new Error("Lambda invocation ambiguous");
