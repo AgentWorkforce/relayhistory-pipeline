@@ -15,9 +15,17 @@ import {
   boundPage,
   projectBriefRow,
   projectBriefTombstone,
+  projectDocumentRow,
+  projectDocumentTombstone,
   projectEventRow,
   projectTombstone,
 } from "./canonical-image.ts";
+import { DOCUMENT_FEATURES_TABLE } from "./document-schema.ts";
+import {
+  produceDocumentFeatures,
+  type CanonicalDocumentRow,
+  type CanonicalDocumentTombstone,
+} from "./document-producer.ts";
 import {
   produceBriefFeatures,
   produceEventFeatures,
@@ -45,10 +53,10 @@ export interface CanonicalImagePage {
 /** The paged image/prior-keyset port — bounded, never a whole image at once. */
 export interface CanonicalImagePort {
   imagePages(
-    entry: CanonicalJournalEntry, kind: "event" | "brief", cursor: string | null,
+    entry: CanonicalJournalEntry, kind: "event" | "brief" | "document", cursor: string | null,
   ): Promise<CanonicalImagePage>;
   priorKeyPages(
-    entry: CanonicalJournalEntry, kind: "event" | "brief", cursor: string | null,
+    entry: CanonicalJournalEntry, kind: "event" | "brief" | "document", cursor: string | null,
   ): Promise<CanonicalImagePage>;
   /** A verified complete-image descriptor — a null first page is a valid
    *  empty pool ONLY when this exists. */
@@ -85,7 +93,7 @@ const hash = (v: unknown): v is string =>
 async function* pageAll(
   port: CanonicalImagePort,
   entry: CanonicalJournalEntry,
-  kind: "event" | "brief",
+  kind: "event" | "brief" | "document",
   prior: boolean,
   resumeCursor: string | null = null,
 ): AsyncGenerator<{ page: CanonicalImagePage; request: string | null },
@@ -121,6 +129,11 @@ export async function copyCanonicalEntry(
   /** Genuine cancellation: checked at every side-effecting boundary so a
    *  timed-out/aborted op performs zero later CH/ACK/finish effects. */
   signal?: AbortSignal,
+  /** Third (directory-document) pool — default OFF: when false the copy is
+   *  the exact signed-off two-pool path (030000 RPC, event+brief only), the
+   *  materializer's document family is never touched, and terminalDocument
+   *  is undefined. Requires 037000 when true. */
+  documentPool = false,
 ): Promise<CanonicalCycleResult> {
   if (BigInt(entry.revision) <= BigInt(state.checkpoint))
     return { kind: "refused", reason: "stale_revision" };
@@ -159,22 +172,34 @@ export async function copyCanonicalEntry(
       entry.kind === "publish" ? entry.sourceHash : entry.priorKeysetHash,
   };
   // Resume derives from the durable chain; a complete pool is SKIPPED.
-  const rs: Record<"event" | "brief",
+  const pools = documentPool
+    ? (["event", "brief", "document"] as const)
+    : (["event", "brief"] as const);
+  const rs: Record<"event" | "brief" | "document",
       { state: "empty" | "resume" | "complete" | "corrupt";
         cursor: string | null; terminalSha256?: string }> = {
     event: await acks.resumeCursor(entry, "event"),
     brief: await acks.resumeCursor(entry, "brief"),
+    document: documentPool
+      ? await acks.resumeCursor(entry, "document")
+      : { state: "empty", cursor: null },
   };
   const insertOnePage = async (
-    kind: "event" | "brief", page: CanonicalImagePage,
+    kind: "event" | "brief" | "document", page: CanonicalImagePage,
     request: string | null,
   ) => {
     const rows =
       kind === "event"
         ? projectAll<CanonicalEventRow | CanonicalTombstone>(page.rows,
             entry.kind === "publish" ? projectEventRow : projectTombstone)
-        : projectAll<CanonicalBriefRow | CanonicalBriefTombstone>(page.rows,
-            entry.kind === "publish" ? projectBriefRow : projectBriefTombstone);
+        : kind === "brief"
+          ? projectAll<CanonicalBriefRow | CanonicalBriefTombstone>(page.rows,
+              entry.kind === "publish"
+                ? projectBriefRow : projectBriefTombstone)
+          : projectAll<CanonicalDocumentRow | CanonicalDocumentTombstone>(
+              page.rows,
+              entry.kind === "publish"
+                ? projectDocumentRow : projectDocumentTombstone);
     if (rows.kind !== "rows") return rows;
     const produced: CanonicalProduceResult =
       kind === "event"
@@ -183,18 +208,26 @@ export async function copyCanonicalEntry(
               ? (rows.rows as CanonicalEventRow[]) : [],
             entry.kind === "retire"
               ? (rows.rows as CanonicalTombstone[]) : [], ev)
-        : produceBriefFeatures(
-            entry.kind === "publish"
-              ? (rows.rows as CanonicalBriefRow[]) : [],
-            entry.kind === "retire"
-              ? (rows.rows as CanonicalBriefTombstone[]) : [], ev);
+        : kind === "brief"
+          ? produceBriefFeatures(
+              entry.kind === "publish"
+                ? (rows.rows as CanonicalBriefRow[]) : [],
+              entry.kind === "retire"
+                ? (rows.rows as CanonicalBriefTombstone[]) : [], ev)
+          : produceDocumentFeatures(
+              entry.kind === "publish"
+                ? (rows.rows as CanonicalDocumentRow[]) : [],
+              entry.kind === "retire"
+                ? (rows.rows as CanonicalDocumentTombstone[]) : [], ev);
     if (produced.kind !== "rows") return produced;
     // Post-await fences: an abort between boundaries performs zero later
     // CH/ACK effects even if the blocked promise releases afterward.
     if (signal?.aborted)
       return { kind: "refused" as const, reason: "aborted" };
     await ch.insert(
-      kind === "event" ? EVENT_FEATURES_TABLE : BRIEF_FEATURES_TABLE,
+      kind === "event" ? EVENT_FEATURES_TABLE
+        : kind === "brief" ? BRIEF_FEATURES_TABLE
+        : DOCUMENT_FEATURES_TABLE,
       produced.rows);
     if (signal?.aborted)
       return { kind: "refused" as const, reason: "aborted" };
@@ -204,14 +237,16 @@ export async function copyCanonicalEntry(
     });
     return produced;
   };
-  let total = 0, terminalEvent = "", terminalBrief = "";
-  for (const kind of ["event", "brief"] as const) {
+  let total = 0, terminalEvent = "", terminalBrief = "",
+      terminalDocument = "";
+  for (const kind of pools) {
     if (rs[kind].state === "corrupt")
       return { kind: "refused", reason: "corrupt_chain" };
     if (rs[kind].state === "complete") {
       // Already-finished pool: carry its durable terminal hash into finish.
       if (kind === "event") terminalEvent = rs[kind].terminalSha256!;
-      else terminalBrief = rs[kind].terminalSha256!;
+      else if (kind === "brief") terminalBrief = rs[kind].terminalSha256!;
+      else terminalDocument = rs[kind].terminalSha256!;
       continue;
     }
     const seen = new Set<string>();
@@ -239,7 +274,8 @@ export async function copyCanonicalEntry(
       // finish RPC binds — not a placeholder.
       if (page.cursor === null) {
         if (kind === "event") terminalEvent = page.pageSha256;
-        else terminalBrief = page.pageSha256;
+        else if (kind === "brief") terminalBrief = page.pageSha256;
+        else terminalDocument = page.pageSha256;
       }
     }
   }
@@ -252,6 +288,7 @@ export async function copyCanonicalEntry(
   // finish CAS: terminal descriptors + all page ACKs + still-current authority
   await acks.finish({
     entry, terminalEvent, terminalBrief,
+    terminalDocument: documentPool ? terminalDocument : undefined,
     sourceAuthority, profileBinding, targetBinding,
   });
   return { kind: "copied", checkpoint: entry.revision, rows: total };

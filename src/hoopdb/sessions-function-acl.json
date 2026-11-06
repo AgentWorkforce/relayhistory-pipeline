@@ -28,6 +28,10 @@
     "sessions.canonical_feature_changed(jsonb,jsonb,jsonb,jsonb,jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.canonical_feature_document_finish(bigint,jsonb,text,text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_canonical_feature_producer:EXECUTE"
+    ],
     "sessions.canonical_feature_image_key(jsonb,text)": [
       "<owner>:EXECUTE"
     ],
