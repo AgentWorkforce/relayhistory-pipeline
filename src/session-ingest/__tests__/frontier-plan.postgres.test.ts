@@ -14,6 +14,7 @@ import {
   FRONTIER_CAPTURE_PROTOCOL,
   evaluateCanonicalFrontier,
   frontierCaptureId,
+  frontierExportRecordsSha256,
   frontierExportRootSha256,
   frontierRecordExportEvidenceSha256,
   frontierScanItemsSha256,
@@ -243,12 +244,13 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
       receiptScan.itemCount = 2; receiptScan.pagesRead = 3; receiptScan.pageItemCounts = [1, 1, 0]; receiptScan.checkpointCount = 2;
       receiptScan.itemsSha256 = frontierScanItemsSha256("receipt-decisions", overlap.origins[0]!);
       overlap.captureId = frontierCaptureId(overlap);
-      expect(evaluateCanonicalFrontier(overlap, { now, exportBindings: evidence.bindings })).toMatchObject({ status: "ready" });
+      const overlapBindings = [{ exportRootSha256: maximum.exportRootSha256!, recordsSha256: frontierExportRecordsSha256([maximum]) }];
+      expect(evaluateCanonicalFrontier(overlap, { now, exportBindings: overlapBindings })).toMatchObject({ status: "ready" });
       overlap.origins[0]!.receiptDecisions[1]!.bodyAccepted = true;
       overlap.origins[0]!.receiptDecisions[1]!.firstDigest = overlap.origins[0]!.receiptDecisions[1]!.candidateDigest;
       receiptScan.itemsSha256 = frontierScanItemsSha256("receipt-decisions", overlap.origins[0]!);
       overlap.captureId = frontierCaptureId(overlap);
-      expect(evaluateCanonicalFrontier(overlap, { now, exportBindings: evidence.bindings })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["receipt_decision_conflict"]) });
+      expect(evaluateCanonicalFrontier(overlap, { now, exportBindings: overlapBindings })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["receipt_decision_conflict"]) });
 
       const raced = await capture(async () => { await pool.query(`UPDATE ${schema}.authority SET privacy_version=20`); });
       expect(evaluateCanonicalFrontier(raced, { now, exportBindings: evidence.bindings })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["source_race", "privacy_changed"]) });
