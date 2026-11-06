@@ -36,6 +36,8 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_history_scope_capture(jsonb)',
  'sessions.ingest_history_scope_install(jsonb)',
  'sessions.ingest_prepare_buffer_stage(jsonb)',
+ 'sessions.ingest_privacy_authority_begin(jsonb)',
+ 'sessions.ingest_privacy_authority_complete(jsonb)',
  'sessions.ingest_publication_abandon(jsonb)',
  'sessions.ingest_publication_candidates(jsonb)',
  'sessions.ingest_publication_claim(jsonb)',

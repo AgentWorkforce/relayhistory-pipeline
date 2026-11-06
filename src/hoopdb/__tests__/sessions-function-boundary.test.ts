@@ -12,6 +12,7 @@ import { LANES } from "../../../scripts/sessions-function-boundary/lanes/index.t
 import { ingestHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-history.ts";
 import { bufferedGcSingleCandidate } from "../../../scripts/sessions-function-boundary/lanes/buffered-gc-single-candidate.ts";
 import { lazySourceTables, originalBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-source-tables.ts";
+import { privacyAuthority, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
 import { createHash } from "node:crypto";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
@@ -55,6 +56,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105033000_canonical_project_events.down.sql",
       "supabase/rollbacks/20261105039000_buffered_gc_single_candidate.down.sql",
       "supabase/rollbacks/20261105040000_ingest_lazy_source_tables.down.sql",
+      "supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql",
     ]);
   });
 
@@ -91,6 +93,23 @@ describe("unified sessions function-boundary generator", () => {
     }
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("041000 privacy authority: exactly two ingest-callable SECDEF functions; the rollback restores the 010000 mirror verbatim behind its guards", async () => {
+    const g = await generate(repo, LANES, VERIFIERS);
+    expect(g.summary.lanes["privacy-authority"]).toEqual({ functions: 10, replaces: 2, grants: 2 });
+    const acl = JSON.parse(g.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    const granted = Object.entries(acl).filter(([k, v]) => k.startsWith("sessions.ingest_privacy_authority_") && v.some((x) => x.startsWith("bulls96_session_ingest"))).map(([k]) => k).sort();
+    expect(granted).toEqual(["sessions.ingest_privacy_authority_begin(jsonb)", "sessions.ingest_privacy_authority_complete(jsonb)"]);
+    const down = g.outputs["supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql"]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, privacyAuthority.migration!), "utf8")).digest("hex"));
+    for (const body of originalMirrorBodies(readFileSync(join(root, "supabase/migrations/20261105010000_frozen_source_custody.sql"), "utf8"))) {
+      expect(down).toContain(body);
+      expect(down.indexOf(body)).toBeLessThan(down.indexOf("DROP FUNCTION sessions.ingest_privacy_authority_lock(boolean);"));
+    }
+    expect(down.indexOf("release to neon first")).toBeLessThan(down.indexOf("DROP TRIGGER"));
+    expect(down).toContain("a later migration is applied");
     expect(down.trim().endsWith("COMMIT;")).toBe(true);
   });
 

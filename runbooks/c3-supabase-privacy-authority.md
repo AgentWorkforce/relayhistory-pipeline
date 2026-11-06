@@ -11,9 +11,9 @@ fourth, default-off mode in which Neon is not called at all:
 
 | Layer | Change | Default |
 |---|---|---|
-| Supabase | `supabase/pending/ingest_privacy_authority.sql` (slot TBD): authority row `fenced`/`active`, owner fence/activate/release, `ingest_privacy_authority_begin/complete`, statement guard on heads and frozen tables, legacy mirror begin/complete refuse once the authority leaves Neon | no row = Neon authority, nothing changes |
-| Supabase | `supabase/pending/ingest_privacy_authority_index.sql`: `CREATE INDEX CONCURRENTLY` on frozen records `(org, ws, user, source, session)` | post-apply job; activation refuses without it |
-| Supabase | `supabase/pending/ingest_lazy_source_tables.sql` (slot TBD, **independent, needed earlier**): lazy-current adoption checks ignore source-side tables | fixes a live blocker for mirror and frozen-supabase (below) |
+| Supabase | migration `20261105041000_ingest_privacy_authority` (slot 041000): authority row `fenced`/`active`, owner fence/activate/release, `ingest_privacy_authority_begin/complete`, statement guard on heads and frozen tables, legacy mirror begin/complete refuse once the authority leaves Neon | no row = Neon authority, nothing changes |
+| Supabase | `scripts/ops/c3-privacy-authority/ingest_privacy_authority_index.sql`: `CREATE INDEX CONCURRENTLY` on frozen records `(org, ws, user, source, session)` | non-transactional post-apply operator job (no slot: the migrator's transaction would fail it with 25001); explicit apply OK only; activation refuses without it |
+| Supabase | migration `20261105040000_ingest_lazy_source_tables` (slot 040000, **independent, needed earlier**): lazy-current adoption checks ignore source-side tables | fixes a live blocker for mirror and frozen-supabase (below) |
 | Ingest Worker | `INGEST_PRIVACY_AUTHORITY=supabase` (needs `INGEST_CUSTODY_SOURCE=frozen-supabase`): `/v1/custody/authority/{begin,complete}` open, legacy mirror routes and every relayhistory-built (Neon) custody envelope refused | `neon` |
 | relayhistory-api | `DELIVERY_CUSTODY_SOURCE_MODE=supabase-authority`: uploads as frozen-supabase; selection/reset = authority begin, ordered fence with the ingest-built frozen witness, authority complete | unset |
 | Eraser (E3) | `S3X_PRIVACY_AUTHORITY=supabase`: reads `ingest_frozen_source_deletions`, no Neon presence sweep, erases nothing unless the authority is `active`; credentials only on stdin | `neon` |
@@ -26,8 +26,9 @@ and the eraser reads the frozen deletions exactly where it read Neon's `deleted_
 
 ## Preconditions (all READ-ONLY checks; STOP if any fails)
 
-1. Both pending SQL files have registry slots and were applied in a reviewed window (with the function-boundary
-   manifest updated; see "Migration integration"), and the index job finished with a valid index.
+1. Migrations 040000 and 041000 were applied in a reviewed window, and the index job
+   (`scripts/ops/c3-privacy-authority/ingest_privacy_authority_index.sql`, run outside any transaction under an explicit
+   apply OK) finished with a valid index.
 2. The frozen copy is sealed (`ingest_frozen_source_completeness` row matches the live policy) and the ingest runs
    `INGEST_CUSTODY_SOURCE=frozen-supabase` with a clean shadow history (C1 done).
 3. relayhistory-api is on `mirror` or `frozen-supabase` at **100%** of isolates (`wrangler deployments list`),
@@ -77,14 +78,13 @@ JSON object on stdin, piped from 1Password, never a file: `{"neonUrl": <Neon own
   Reverting relayhistory to `mirror`/`frozen-supabase` only makes controls 503 (fail closed, no divergence).
   Going back to Neon would need a separately reviewed Neon write of the Supabase heads and privacy.
 
-## Migration integration (when slots are assigned)
+## Migration integration (done)
 
-- Move `ingest_lazy_source_tables.sql` and `ingest_privacy_authority.sql` into `supabase/migrations/<slot>_...`
-  and the `.down.sql` files into `supabase/rollbacks/`, adding the usual later-migration guard and ledger cleanup.
-- Register the new functions in `src/hoopdb/sessions-function-acl.json` and the boundary wrapper (pattern:
-  `scripts/sync-ingest-frozen-boundary.ts`): owner-only `ingest_privacy_authority_{lock,guard,packet,state,fence,activate,release,apply}`;
-  `ingest_privacy_authority_{begin,complete}` = owner + `bulls96_session_ingest` EXECUTE, SECURITY DEFINER.
-- The index file stays a separate non-transactional post-apply job.
+- 040000 and 041000 are registered lanes (`scripts/sessions-function-boundary/lanes/{lazy-source-tables,privacy-authority}.ts`):
+  the generator derives the ACL manifest, boundary SECDEF set, verifiers and both checksum-bound, later-migration-guarded
+  rollbacks (`supabase/rollbacks/2026110504{0,1}000_*.down.sql`). 041000's rollback also refuses while an authority row exists.
+- `ingest_privacy_authority_{begin,complete}` are the only new ingest-callable (SECURITY DEFINER) functions; the rest are owner-only.
+- The index stays a separate non-transactional operator job.
 
 ## Known gaps
 

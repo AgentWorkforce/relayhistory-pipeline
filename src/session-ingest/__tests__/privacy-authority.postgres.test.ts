@@ -10,7 +10,7 @@ import { sqlLedger } from "../ledger-sql.ts";
 import { deliverBatch } from "../deliver.ts";
 import { prepareDelivery, deliveryAccount } from "../vendor/delivery/prepare.ts";
 import { TENANT, batch, record, scratchStore } from "./support.ts";
-import { epoch, generation, identity, baseline, INDEX_SQL, LAZY_SOURCE_SQL, PENDING_SQL } from "./privacy-authority-support.ts";
+import { epoch, generation, identity, baseline, INDEX_SQL } from "./privacy-authority-support.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 const root = join(import.meta.dir, "../../..");
@@ -40,8 +40,6 @@ async function database() {
   await pool.query("CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin");
   for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await pool.query(sql("supabase/bootstrap/" + f + ".sql"));
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await pool.query(sql("supabase/migrations/" + f));
-  await pool.query(sql(LAZY_SOURCE_SQL));
-  await pool.query(sql(PENDING_SQL));
   await pool.query(sql(INDEX_SQL));
   await pool.query("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','" + generation + "','pass')");
   const owner = async (fn: string, p: unknown, c: pg.ClientBase | pg.Pool = pool) => (await c.query("SELECT sessions." + fn + "($1::jsonb) AS r", [JSON.stringify(p)])).rows[0].r;

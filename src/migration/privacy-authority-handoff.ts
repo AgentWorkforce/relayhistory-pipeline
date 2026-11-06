@@ -1,5 +1,5 @@
 /**
- * C3: hand the privacy authority for selection/reset from Neon to Supabase (supabase/pending/ingest_privacy_authority.sql).
+ * C3: hand the privacy authority for selection/reset from Neon to Supabase (supabase/migrations/20261105041000_ingest_privacy_authority.sql).
  *
  *   census   READ-ONLY on both sides: Neon's privacy fingerprint vs Supabase's (heads, deletions, resets), aggregate counts.
  *   fence    Supabase owner write: the legacy Neon-first mirror begin refuses from now on (controls 503 BEFORE Neon).

@@ -472,6 +472,38 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_privacy_authority_activate(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_apply(text,text,text,text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_begin(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_complete(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_fence(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_lock(boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_packet(jsonb,jsonb,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_release(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_state()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_publication_abandon(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

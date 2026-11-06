@@ -1,27 +1,39 @@
--- Reverse of ingest_privacy_authority (MIGRATION SLOT TBD; see the up file). Only valid while Neon is the
--- privacy authority (no sessions.ingest_privacy_authority row): once Supabase was active, heads and frozen
--- privacy may be ahead of Neon and dropping the authority would silently hand privacy back to a stale Neon.
--- When the slot is assigned, add the usual later-migration guard and the __96bulls_migrations ledger cleanup.
-DO $rollback_guard$
-BEGIN
- IF to_regclass('sessions.ingest_privacy_authority') IS NOT NULL
-  AND EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority) THEN
-  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: release to neon first (ingest_privacy_authority_release)';END IF;
+-- Generated: reverse 041000. Only while Neon is the privacy authority (no sessions.ingest_privacy_authority row):
+-- once Supabase was active its heads/frozen privacy may be ahead of Neon, so dropping the authority would hand
+-- privacy back to a stale Neon. Release first (sessions.ingest_privacy_authority_release).
+-- Explicit transaction: guards, marker fence, restore and ledger removal are atomic.
+-- On an error the caller must ROLLBACK (or disconnect); nothing is committed.
+BEGIN;
+SELECT pg_advisory_xact_lock(961996,1); -- same namespace as the real migrator
+DO $rollback_guard$ DECLARE v_sha text; BEGIN
+ IF to_regclass('sessions.__96bulls_migrations')IS NULL OR to_regclass('sessions.__96bulls_role_validation')IS NULL
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: migration ledger/marker required';END IF;
+ LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
+ IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105041000_ingest_privacy_authority.sql')
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: a later migration is applied; roll it back first';END IF;
+ SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105041000_ingest_privacy_authority.sql' FOR UPDATE;
+ IF NOT FOUND OR v_sha<>'fa698013ad5496d3153706f96a146997e3d6eec1acaeef029f26f8e38ec97b0e'
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: own applied checksum required';END IF;
+ PERFORM pg_advisory_xact_lock(1919249529,96); -- the authority lock: no begin/transition in flight
+ IF EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority)
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: release to neon first (ingest_privacy_authority_release)';END IF;
+ UPDATE sessions.__96bulls_role_validation SET status='pending',updated_at=clock_timestamp() WHERE name='session_directory_search_worker';
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: validation marker required';END IF;
 END $rollback_guard$;
-DROP TRIGGER IF EXISTS ingest_privacy_authority_guard ON sessions.ingest_source_control_heads;
-DROP TRIGGER IF EXISTS ingest_privacy_authority_guard ON sessions.ingest_frozen_source_deletions;
-DROP TRIGGER IF EXISTS ingest_privacy_authority_guard ON sessions.ingest_frozen_source_resets;
-DROP TRIGGER IF EXISTS ingest_privacy_authority_guard ON sessions.ingest_frozen_source_records;
-DROP FUNCTION IF EXISTS sessions.ingest_privacy_authority_begin(jsonb);
-DROP FUNCTION IF EXISTS sessions.ingest_privacy_authority_complete(jsonb);
-DROP FUNCTION IF EXISTS sessions.ingest_privacy_authority_apply(text,text,text,text,jsonb);
-DROP FUNCTION IF EXISTS sessions.ingest_privacy_authority_release(jsonb);
-DROP FUNCTION IF EXISTS sessions.ingest_privacy_authority_activate(jsonb);
-DROP FUNCTION IF EXISTS sessions.ingest_privacy_authority_fence(jsonb);
-DROP FUNCTION IF EXISTS sessions.ingest_privacy_authority_state();
-DROP FUNCTION IF EXISTS sessions.ingest_privacy_authority_packet(jsonb,jsonb,jsonb);
-DROP FUNCTION IF EXISTS sessions.ingest_privacy_authority_guard();
--- The legacy begin/complete as created by 20261105010000 (verbatim below); they reference the lock function, so restore them first.
+DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_source_control_heads;
+DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_deletions;
+DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_resets;
+DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_records;
+DROP FUNCTION sessions.ingest_privacy_authority_begin(jsonb);
+DROP FUNCTION sessions.ingest_privacy_authority_complete(jsonb);
+DROP FUNCTION sessions.ingest_privacy_authority_apply(text,text,text,text,jsonb);
+DROP FUNCTION sessions.ingest_privacy_authority_release(jsonb);
+DROP FUNCTION sessions.ingest_privacy_authority_activate(jsonb);
+DROP FUNCTION sessions.ingest_privacy_authority_fence(jsonb);
+DROP FUNCTION sessions.ingest_privacy_authority_state();
+DROP FUNCTION sessions.ingest_privacy_authority_packet(jsonb,jsonb,jsonb);
+DROP FUNCTION sessions.ingest_privacy_authority_guard();
+-- The legacy mirror begin/complete exactly as 20261105010000 created them (they call the lock function: restore first).
 CREATE OR REPLACE FUNCTION sessions.ingest_source_control_begin(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $control_begin$
 DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;h sessions.ingest_source_control_heads%ROWTYPE;
@@ -82,7 +94,10 @@ BEGIN
   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
  RETURN jsonb_build_object('completed',true,'superseded',false);
 END $control_complete$;
+DROP FUNCTION sessions.ingest_privacy_authority_lock(boolean);
+DROP TABLE sessions.ingest_privacy_authority;
+ALTER TABLE sessions.ingest_source_control_heads DROP COLUMN deleted;
+-- The post-apply index job's index, if it was built (scripts/ops/c3-privacy-authority/ingest_privacy_authority_index.sql).
 DROP INDEX IF EXISTS sessions.ingest_frozen_source_records_user_session;
-DROP FUNCTION IF EXISTS sessions.ingest_privacy_authority_lock(boolean);
-DROP TABLE IF EXISTS sessions.ingest_privacy_authority;
-ALTER TABLE sessions.ingest_source_control_heads DROP COLUMN IF EXISTS deleted;
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105041000_ingest_privacy_authority.sql' AND sha256='fa698013ad5496d3153706f96a146997e3d6eec1acaeef029f26f8e38ec97b0e';
+COMMIT;

@@ -1,5 +1,5 @@
 /**
- * C3: Supabase-first privacy authority (supabase/pending/ingest_privacy_authority.sql, slot TBD), through the real
+ * C3: Supabase-first privacy authority (supabase/migrations/20261105041000_ingest_privacy_authority.sql), through the real
  * migration stack, the unchanged ingest fence and lazy-current target, and the handoff module against a Neon with
  * relayhistory's exact privacy tables. Real-PG races are in privacy-authority.postgres.test.ts.
  */
@@ -168,7 +168,7 @@ test("activation refuses until the frozen user/session index exists (no whole-or
   const n = await fakeNeon();
   open.push(n.close);
   expect(await err(activateFrom(f, n))).toContain("user session index missing");
-  await f.db.exec(await Bun.file(new URL("../../../supabase/pending/ingest_privacy_authority_index.sql", import.meta.url)).text());
+  await f.db.exec(await Bun.file(new URL("../../../scripts/ops/c3-privacy-authority/ingest_privacy_authority_index.sql", import.meta.url)).text());
   const c = await census(n.queryable, f.queryable, epoch);
   expect((await activate(n.queryable, f.queryable, { epoch, expectNeonFingerprint: c.neon.fingerprint, settleMs: 0 })).activated.state).toBe("active");
 });
