@@ -20,16 +20,18 @@ switch.
   `966e923736a9c2305b9b0881ade9d75035a1d96f`
   (`hosted-ops/preserve-manifest.csv`)
 
-The map has 65 `move` rows. 46 are removed here, 16 are deliberately held, and
-3 that the map flags `needs_reconciliation=true` are restored and held pending
-a named-owner resolution (see below).
+The map has 65 `move` rows. 16 are removed here, 30 are retained on the
+operator's decision pending a rehearsed replacement, 16 are deliberately held,
+and 3 that the map flags `needs_reconciliation=true` are restored and held
+pending a named-owner resolution (see below).
 
-## Removed paths (46)
+## Removed paths (16)
 
 For each path below, the git blob at this branch's base, the map's `blob`, the
 preservation manifest's `source_blob` and the blob at the manifest's
 `destination_path` in the preservation head were verified identical before
-removal (46 of 46 matched).
+removal (16 of 16 matched; the original 46-of-46 check covered these 16
+too).
 
 - `docs/activation/session-directory-parity-reprojection.md`
 - `docs/activation/supabase-g6-session-directory-activation.md`
@@ -39,6 +41,27 @@ removal (46 of 46 matched).
 - `docs/private-state-bootstrap.md`
 - `docs/supabase-owner-operator-apply.md`
 - `docs/supabase-owner-operator-plan.md`
+- `scripts/ops/search-ingest-20261105/README.md`
+- `scripts/ops/search-ingest-20261105/backfill-enqueue.py`
+- `scripts/ops/search-ingest-20261105/backfill-keys.ts`
+- `scripts/ops/search-ingest-20261105/ch-freshness.py`
+- `scripts/ops/search-ingest-20261105/ch-kinds.py`
+- `scripts/ops/search-ingest-20261105/ch-trajectory-sessions.py`
+- `scripts/state-bootstrap-broker.py`
+- `scripts/test_state_bootstrap_broker.py`
+
+## Retained cutover helpers (30), operator gate b
+
+These 30 `scripts/ops/cutover-20261105/` paths were removed in `3845890c` and
+restored byte-identical from `main` in `765d4174`. The migration lead (operator
+of the cutover runbook) decided on 2026-11-06 (relay message
+244405780180996096) to retain the whole set until the replacement in the
+private companion (`AgentWorkforce/sessions-pipeline-cloud#5`) has been
+rehearsed. The companion copies and manifest rows stand unchanged as that
+rehearsal target. The paths stay public and are not a deletion candidate in
+this PR; a later PR removes them only after the rehearsal is recorded and with
+the owner's own removal approval.
+
 - `scripts/ops/cutover-20261105/custody-capture.ts`
 - `scripts/ops/cutover-20261105/cutover-ceremony.README.md`
 - `scripts/ops/cutover-20261105/cutover-ceremony.ts`
@@ -69,14 +92,6 @@ removal (46 of 46 matched).
 - `scripts/ops/cutover-20261105/neon-slow.ts`
 - `scripts/ops/cutover-20261105/neon-top.ts`
 - `scripts/ops/cutover-20261105/neon-who.ts`
-- `scripts/ops/search-ingest-20261105/README.md`
-- `scripts/ops/search-ingest-20261105/backfill-enqueue.py`
-- `scripts/ops/search-ingest-20261105/backfill-keys.ts`
-- `scripts/ops/search-ingest-20261105/ch-freshness.py`
-- `scripts/ops/search-ingest-20261105/ch-kinds.py`
-- `scripts/ops/search-ingest-20261105/ch-trajectory-sessions.py`
-- `scripts/state-bootstrap-broker.py`
-- `scripts/test_state_bootstrap_broker.py`
 
 ## Held paths (16), unchanged and byte-identical
 
@@ -103,9 +118,10 @@ active until then):
 - `.github/workflows/publish-image-ar.yml`
 - `.github/workflows/publish-image-ecr.yml`
 
-The held `docs/runbooks/buffered-cutover-20261105.md` still names scripts from
-the removed `scripts/ops/cutover-20261105/` directory. It is left untouched
-because it is held; those scripts are preserved in the private companion.
+The runbook's references to `scripts/ops/cutover-20261105/` in the held
+`docs/runbooks/buffered-cutover-20261105.md` now resolve again because that
+directory is retained (see "Retained cutover helpers"). The runbook stays
+untouched.
 
 ## Restored needs_reconciliation rows (3), held pending a named owner
 
@@ -125,11 +141,11 @@ deletion set.
 
 ## Open operator gate
 
-- The held, historical ("as run") `docs/runbooks/buffered-cutover-20261105.md`
-  names ceremony, drain and admission helpers from the removed
-  `scripts/ops/cutover-20261105/` directory. It is not edited. Pending:
-  migration-handover-agent to confirm the pinned replacement/source and
-  rehearsal, or name paths to keep.
+- Resolved, gate b: answered 2026-11-06 by migration-handover-agent. Retain
+  the full cutover helper set until the replacement is rehearsed; the 3
+  restored rows stay; the ownership review remains open.
+- Still open: named owners for the 3 restored rows (spc issue #4) and the
+  companion rehearsal.
 
 ## Consumer edits
 
@@ -190,10 +206,12 @@ longer equals the map's blob and needs a refresh before it is ever moved.
    clearance. The `scripts/ops/` prefix entry is left in place: it is a
    directory prefix rather than an exact removed path.
 3. `src/shared/__tests__/engine-identifiers-guard.test.ts` keeps the fixture
-   string `scripts/ops/cutover-20261105/members.ts` (a removed path) to exercise
-   prefix matching; it is a string literal and reads no file.
-4. The held runbook `docs/runbooks/buffered-cutover-20261105.md` keeps stale
-   references to removed helpers (see "Open operator gate").
+   string `scripts/ops/cutover-20261105/members.ts`, which now names a retained
+   path; it exercises prefix matching, is a string literal and still reads no
+   file.
+4. The held runbook `docs/runbooks/buffered-cutover-20261105.md` is untouched;
+   its references to `scripts/ops/cutover-20261105/` resolve because those
+   helpers are retained (see "Retained cutover helpers").
 
 ## Rollback
 
