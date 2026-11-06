@@ -5,6 +5,16 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.analysis_read_v1(text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.analysis_request_json_v1(sessions.session_analysis_requests_v2)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.analysis_request_v1(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.applied_repo_evidence(jsonb,jsonb)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -746,6 +756,9 @@
       "session_directory_search_worker:EXECUTE"
     ],
     "sessions.session_analysis_cache_demand(text,text,text,text,boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_analysis_v2_forget()": [
       "<owner>:EXECUTE"
     ],
     "sessions.session_brief(text,text,text)": [

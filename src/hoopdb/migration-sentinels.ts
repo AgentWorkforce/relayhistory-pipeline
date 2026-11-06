@@ -31,6 +31,7 @@ export interface Sentinel {
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105034000_session_directory_read_api.sql": {evidence:"function sessions.list_session_directory_for",sql:fn("sessions","list_session_directory_for")},
+  "upstream:20261105046000_analysis_jobs.sql": { evidence: "table sessions.session_analysis_jobs_v2", sql: relation("sessions.session_analysis_jobs_v2") },
   "upstream:20261105039000_buffered_gc_single_candidate.sql": {
     evidence: "replacement: GC claim has its single-candidate advisory admission domain",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_buffer_gc_claim(jsonb)') AND prosecdef AND prosrc LIKE '%96bulls:buffer-gc-user-v1%') AS applied",
