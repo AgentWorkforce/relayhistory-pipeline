@@ -10,6 +10,9 @@ import { CanonicalJournalStore } from "../src/search-features/canonical-journal.
 import { CanonicalPageAckStore } from "../src/search-features/canonical-ack-store.ts";
 
 const port = Number(process.argv[2] ?? 32770);
+const partitionScheme = process.env.PROOF_PARTITION_SCHEME ?? "legacy-prefix-v1";
+if (partitionScheme !== "legacy-prefix-v1" && partitionScheme !== "scope-v1")
+  throw new Error("refused: unknown proof partition scheme");
 // Guard: only ever run against a loopback disposable fixture — real check.
 if (process.env.PROOF_DISPOSABLE !== "1")
   throw new Error("refused: set PROOF_DISPOSABLE=1 on a disposable database");
@@ -38,8 +41,8 @@ await db.query(readFileSync("supabase/migrations/20261105030000_canonical_featur
 await db.query(readFileSync("supabase/migrations/20261105036000_canonical_consumer_lease.sql", "utf8"));
 
 const A = "a".repeat(64), UID = "12345678-1234-1234-1234-123456789012";
-const CANARY = { orgId: "c4fae7b9-43a9-44e8-94d5-455aa579d67b",
-  workspaceId: "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63" };
+const CANARY = { orgId: "10000000-0000-4000-8000-000000000001",
+  workspaceId: "20000000-0000-4000-8000-000000000002" };
 const SCOPE = { ...CANARY, harness: "h", sessionId: "s", generation: A };
 const AUTH = { authorityId: UID, epoch: "1", fingerprint: A };
 const PTR = { authorityId: UID, hash: "c".repeat(64), count: "1" };
@@ -89,7 +92,7 @@ const images = { imageDescriptor: async (e: { imageKey: string }) => ({ imageKey
       pointerSetHash: PTR.hash, pageSha256: pg(rows) }; } };
 
 let TRANSFER_ON_FIRST_PAGE = false;
-const CFG = { enabled: true, targetId: "target-A", ownerId: "workerA",
+const CFG = { enabled: true, scope: CANARY, partitionScheme, targetId: "target-A", ownerId: "workerA",
   leaseTtlMs: 60000, maxRetries: 0, pageSize: 10 };
 // Disabled consumer: zero queries at all (count every DB call).
 let queries = 0;
