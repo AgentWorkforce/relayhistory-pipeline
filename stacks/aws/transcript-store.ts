@@ -568,9 +568,8 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
     }
   }
   const withPipeline = SESSION_PIPELINE_RESOURCES.some((r) => compact.operations.has(r));
-  if (withPipeline) {
-    if (SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop") && TRANSCRIPT_RESOURCES.every((r) => compact.operations.get(r) === "noop"))
-      return "post-apply";
+  const pipelineAllNoop = SESSION_PIPELINE_RESOURCES.every((r) => compact.operations.get(r) === "noop");
+  if (withPipeline && !pipelineAllNoop) {
     const pipelinePhase = sessionPipelinePhase(compact.operations);
     if (pipelinePhase === "session pipeline update")
       assertPipelineRoleCascadeDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);

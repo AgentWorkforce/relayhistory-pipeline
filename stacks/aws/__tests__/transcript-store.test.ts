@@ -9,6 +9,7 @@ import { NON_DESTROYABLE } from "../deploy-guard.ts";
 import { isProductionLike, trailKeyPolicy } from "../hardening.ts";
 import { validateAwsInputs, type AwsInputs } from "../inputs.ts";
 import { TENANT_KEY_BASE } from "../tenants.ts";
+import { SESSION_PIPELINE_RESOURCES } from "../session-pipeline.ts";
 import {
   ABORT_INCOMPLETE_UPLOAD_DAYS,
   ERASURE_SLA_HOURS,
@@ -436,11 +437,11 @@ describe("transcript store: deploy plan contract", () => {
     "transcripts-key", "transcripts-key-alias",
   ];
   const h = (text: string) => createHash("sha256").update(text).digest("hex");
-  const plan = (actions: Record<string, string>, summary?: string) => {
+  const plan = (actions: Record<string, string>, summary?: string, extraResources: readonly string[] = []) => {
     const counts = new Map<string, number>();
     for (const action of Object.values(actions)) counts.set(action, (counts.get(action) ?? 0) + 1);
     const inferred = counts.size ? `Plan: ${[...counts].map(([action, count]) => `${count} to ${action}`).join(", ")}` : "Plan: 0 changes";
-    return `${summary ?? inferred}\n${resources.map((r) => `[${r}] ${actions[r] ?? "noop"}`).join("\n")}\n`;
+    return `${summary ?? inferred}\n${[...resources, ...extraResources].map((r) => `[${r}] ${actions[r] ?? "noop"}`).join("\n")}\n`;
   };
   const detailed = (compact: string) => compact.split("\n").map((line) => line.startsWith("[") ? `  ${line}` : line).join("\n");
   const provenance = (compact: string, full = detailed(compact), patch: Record<string, unknown> = {}) => JSON.stringify({
@@ -596,6 +597,19 @@ describe("transcript store: deploy plan contract", () => {
       }),
     ])
       expect(() => check(compact, bad, provenance(compact, bad))).toThrow(/srv-writer inbox policy update/);
+  });
+
+  it("reaches the srv-writer inbox phase when every deployed pipeline resource is present as noop", () => {
+    const compact = plan({ "transcript-srv-writer": "update" }, undefined, SESSION_PIPELINE_RESOURCES);
+    const full = withNativeInboxPolicyDiff(compact);
+    expect(check(compact, full, provenance(compact, full))).toBe("srv-writer inbox policy update");
+
+    const mixed = plan({
+      "transcript-srv-writer": "update",
+      [SESSION_PIPELINE_RESOURCES[0]]: "update",
+    }, undefined, SESSION_PIPELINE_RESOURCES);
+    const mixedFull = withNativeInboxPolicyDiff(mixed);
+    expect(() => check(mixed, mixedFull, provenance(mixed, mixedFull))).toThrow(/session pipeline rollout, update or post-apply phase/);
   });
 
   // Alchemy persisted the failed update: the plan shows no property change, the state holds the pending props.
