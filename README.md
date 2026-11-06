@@ -152,3 +152,5 @@ and refuses to run against an unexpected account or project. The local stage
 needs no cloud credentials. `.96bulls/` holds local
 secrets (mode 600) and is gitignored; `.alchemy/` holds state in plaintext and
 is gitignored.
+
+Image release and verification: [services image release guide](docs/services-image-release.md).

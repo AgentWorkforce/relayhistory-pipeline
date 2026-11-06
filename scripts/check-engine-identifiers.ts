@@ -31,7 +31,6 @@ export const PENDING_MOVE: readonly { path: string; lane: "workflow-bound" | "pr
   { path: "scripts/schema-release-owner-operator-plan.ts", lane: "workflow-bound" },
   { path: "src/hoopdb/__tests__/schema-release-owner-operator-plan.test.ts", lane: "workflow-bound" },
   { path: "src/hoopdb/owner-operator-apply.ts", lane: "private-ops" },
-  { path: "scripts/sessions-prod-bucket-notification.sh", lane: "private-ops" },
   { path: "scripts/ops/", lane: "private-ops" },
   { path: "packages/session-read-worker/", lane: "private-ops" },
 ];

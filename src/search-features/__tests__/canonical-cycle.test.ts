@@ -48,14 +48,23 @@ const page = (rows: unknown[], cursor: string | null = null) => ({
   rows, cursor, source: IMAGE, pointerSetHash: PTR.hash,
   pageSha256: hashRows(rows),
 });
+const docRow = {
+  orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1",
+  title: "Doc", summary: "D", titleFolded: "doc", summaryFolded: "d",
+  projectId: null, lastActivityAt: stamp,
+};
 const images = (over: Partial<Record<string, unknown>> = {}) => ({
-  imagePages: async (_e: CanonicalJournalEntry, kind: "event" | "brief", c: string | null) =>
-    c === null ? page(kind === "event" ? [eventRow] : [briefRow], "done")
+  imagePages: async (_e: CanonicalJournalEntry, kind: "event" | "brief" | "document", c: string | null) =>
+    c === null ? page(kind === "event" ? [eventRow]
+        : kind === "brief" ? [briefRow] : [docRow], "done")
                : page([], null),
-  priorKeyPages: async (_e: CanonicalJournalEntry, kind: "event" | "brief", c: string | null) =>
+  priorKeyPages: async (_e: CanonicalJournalEntry, kind: "event" | "brief" | "document", c: string | null) =>
     c === null ? page(kind === "event" ? [{
         orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1",
-        machineId: "m-1", kind: "session_event", eventId: "e-old", ts: stamp }] : [{
+        machineId: "m-1", kind: "session_event", eventId: "e-old", ts: stamp }]
+        : kind === "brief" ? [{
+        orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" }]
+        : [{
         orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" }], "done")
                : page([], null),
   imageDescriptor: async (e: CanonicalJournalEntry) => ({
@@ -85,12 +94,13 @@ describe("canonical copy cycle (paged contract)", () => {
   test("publish drains all pages, acks each, finish CAS", async () => {
     const ch = fakeCH(), { a, acked, finished } = fakeAcks();
     const out = await copyCanonicalEntry(images(), a, ch,
-      { checkpoint: "0" }, publish(), "target-a");
+      { checkpoint: "0" }, publish(), "target-a",
+      undefined, undefined, true);          // documentPool on -> three pools
     expect(out.kind).toBe("copied");
     expect(out.checkpoint).toBe(REV);
     const rows = ch.inserts.flat();
     expect(rows.every((r) => r.version === featureVersion(REV))).toBe(true);
-    expect(acked.length).toBe(4);       // two pages per pool (content + terminal)
+    expect(acked.length).toBe(6);       // two pages per pool (content + terminal), three pools
     expect(finished.length).toBe(1);
   });
   test("retire pages prior keysets into tombstones", async () => {
@@ -147,3 +157,12 @@ describe("canonical copy cycle (paged contract)", () => {
     expect(ch.inserts.length).toBe(0);
   });
 });
+  test("documentPool off keeps the exact two-pool path (030000 RPC)", async () => {
+    const ch = fakeCH(), { a, acked, finished } = fakeAcks();
+    const out = await copyCanonicalEntry(images(), a, ch,
+      { checkpoint: "0" }, publish(), "target-a");   // default off
+    expect(out.kind).toBe("copied");
+    expect(acked.length).toBe(4);       // event+brief only, two pages each
+    expect(acked.every((x) => x.kind !== "document")).toBe(true);
+    expect(finished[0]?.terminalDocument).toBeUndefined();
+  });

@@ -24,7 +24,7 @@ Detached Node24 default-off and armed portable-job proofs exercise the generated
 bundle; the latter uses owned PostgreSQL/MinIO factories, not AWS credentials or
 production resources. A test factory does not prove AWS IAM or cloud networking.
 
-Before any deployment, an operator must verify account941433935742/us-east-1,
+Before any deployment, an operator must verify account <account-id>/us-east-1,
 match the immutable S3 artifact ObjectVersion and ZIP SHA to the reviewed manifest,
 and independently review the exact template change set. The template records
 ArtifactSha256 but CloudFormation does not verify it. Never treat a parameter
@@ -33,8 +33,8 @@ value as proof of uploaded bytes. No deploy command is authorized by this docume
 ## Database and generation
 
 The one secret is JSON with exactly `hoopdb_url`. It must use session pooler
-`aws-0-us-east-1.pooler.supabase.com:5432/postgres`, project pyamkrhoyszgzirqqffq,
-and dedicated `bulls96_session_ingest.pyamkrhoyszgzirqqffq` login. The runtime pins
+`aws-0-us-east-1.pooler.supabase.com:5432/postgres`, project <supabase-project>,
+and dedicated `bulls96_session_ingest.<supabase-project>` login. The runtime pins
 CA/hostname, rejects arbitrary URL options and owner credentials, and verifies both
 current_user/session_user. Pool max2; connect<=1s; operation statement/lock<=1.8s;
 global job budget45s/default, <=50s. Cancellation uses the reviewed job-owned

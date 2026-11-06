@@ -73,14 +73,14 @@ export interface CanonicalPageAckPort {
         targetBinding: string)
       : Promise<"started" | "resumed" | "already_complete">;
   ackPage(input: {
-    entry: CanonicalJournalEntry; kind: "event" | "brief";
+    entry: CanonicalJournalEntry; kind: "event" | "brief" | "document";
     cursor: string;                 // the request cursor that produced this page
     nextCursor: string | null;      // the following page's cursor (null=terminal)
     pageSha256: string;
   }): Promise<void>;
   /** Durable resume: the verified next edge from the page chain. */
   resumeCursor(
-    entry: CanonicalJournalEntry, pool: "event" | "brief",
+    entry: CanonicalJournalEntry, pool: "event" | "brief" | "document",
   ): Promise<{ state: "empty" | "resume" | "complete" | "corrupt";
                cursor: string | null; terminalSha256?: string }>;
   /** finish CAS: both pool terminal descriptors + all page ACKs + current
@@ -88,6 +88,9 @@ export interface CanonicalPageAckPort {
   finish(input: {
     entry: CanonicalJournalEntry;
     terminalEvent: string; terminalBrief: string;
+    /** Third pool terminal — present iff the copy ran the document pool
+     *  (requires the 037000 three-terminal finish RPC). */
+    terminalDocument?: string;
     sourceAuthority: CanonicalSourceAuthority;
     profileBinding: string;
     targetBinding: string;

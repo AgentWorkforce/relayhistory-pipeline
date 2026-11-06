@@ -12,12 +12,14 @@
 #   NINETY_SIX_BULLS_CONFIRM_STAGE=aws-sessions-prod \
 #     scripts/sessions-prod-bucket-notification.sh --remove # rollback: stop notifications (sets an empty configuration)
 #
-# Needs AWS_PROFILE=sessions-prod (or exported credentials) for account 941433935742.
+# Needs SESSIONS_PROD_ACCOUNT_ID (the sessions-prod account id; the script refuses
+# without it) and AWS_PROFILE=sessions-prod (or exported credentials) for that account.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 STAGE=aws-sessions-prod
-ACCOUNT=941433935742
+ACCOUNT="${SESSIONS_PROD_ACCOUNT_ID:?SESSIONS_PROD_ACCOUNT_ID required (the sessions-prod AWS account id)}"
+if ! [[ "$ACCOUNT" =~ ^[0-9]{12}$ ]]; then echo "refused: SESSIONS_PROD_ACCOUNT_ID must be a 12-digit AWS account id" >&2; exit 2; fi
 REGION=us-east-1
 BUCKET="96bulls-${STAGE}-transcripts-${ACCOUNT}"
 mode="${1:---print}"

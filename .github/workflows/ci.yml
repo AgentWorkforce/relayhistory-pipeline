@@ -11,7 +11,7 @@ jobs:
     # skipped, canceled or failing when this gate goes green.
     needs: [unit-tests, aws-hardening-mutations]
     if: ${{ always() }}
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Require unit and mutation checks
@@ -22,8 +22,10 @@ jobs:
           test "$UNIT_RESULT" = "success"
           test "$MUTATION_RESULT" = "success"
   unit-tests:
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 40
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    # The serial PGlite suite outgrew 40 minutes on GitHub-hosted runners.
+    # Preserve every test and the 30-second per-test limit below.
+    timeout-minutes: 90
     # A real ClickHouse for the session read API's query tests
     # (src/session-read-api/__tests__/page.clickhouse.test.ts), the version the
     # search proofs pin. Test-only credentials; no production data.
@@ -92,7 +94,7 @@ jobs:
   # Keep every mutation, but give the long unit suite and mutation suite their
   # own budgets. Running both serially exceeded the old 40-minute limit.
   aws-hardening-mutations:
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     # Several mutations exercise the real ClickHouse read API tests.
     services:

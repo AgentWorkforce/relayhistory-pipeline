@@ -39,7 +39,7 @@ afterEach(async () => {
 });
 
 describe("guard", () => {
-  const SUPA = "postgres://postgres:x@db.abcdefghijklmnopqrst.supabase.co:5432/postgres";
+  const SUPA = "postgres://postgres:x@db.zzzzfakeprojectrefzz.supabase.co:5432/postgres";
   const NEON = "postgres://owner:x@ep-a-1.us-east-1.aws.neon.tech/neondb";
   it("writes only from the named Supabase project to the named Neon host", () => {
     expect(reverseWriteMode({ sourceUrl: SUPA, targetUrl: NEON, execute: false })).toBe("dry-run");
@@ -48,7 +48,7 @@ describe("guard", () => {
         sourceUrl: SUPA,
         targetUrl: NEON,
         execute: true,
-        expectSupabaseRef: "abcdefghijklmnopqrst",
+        expectSupabaseRef: "zzzzfakeprojectrefzz",
         expectNeonHost: "ep-a-1.us-east-1.aws.neon.tech",
       }),
     ).toBe("execute");
@@ -62,7 +62,7 @@ describe("guard", () => {
           sourceUrl,
           targetUrl,
           execute: true,
-          expectSupabaseRef: "abcdefghijklmnopqrst",
+          expectSupabaseRef: "zzzzfakeprojectrefzz",
           expectNeonHost: host,
         }),
       ).toThrow("refusing to write");

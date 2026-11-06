@@ -1,10 +1,10 @@
 # supabase/migrations
 
 **Status (2026-11-02):** these migrations are applied to **production Supabase**
-(`pyamkrhoyszgzirqqffq`) through `src/hoopdb/migrate.ts`, the only migration authority. The
+(`<supabase-project>`) through `src/hoopdb/migrate.ts`, the only migration authority. The
 generation there is `eff8b3be…`, with 18/18 ledger rows in `sessions.__96bulls_migrations`, the
-readiness marker at `pass`, and `HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger`. The record is
-`docs/activation/supabase-incremental-upgrade-1d99ccc8-to-eff8b3be.md` §10. Never apply them with
+readiness marker at `pass`, and `HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger`. The operator record of that upgrade
+is not kept in the repository. Never apply them with
 `supabase db push`: the migrator refuses a mixed authority (`mixed_migration_authority`). Any
 further apply to a real database needs Khaliq's OK under AGENTS.md.
 

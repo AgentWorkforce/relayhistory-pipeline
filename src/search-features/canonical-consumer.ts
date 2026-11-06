@@ -42,6 +42,8 @@ export interface ConsumerConfig {
   leaseTtlMs: number;
   maxRetries: number;
   pageSize: number;
+  /** Third (document) pool — default OFF keeps the 030000 two-pool path. */
+  documentPool?: boolean;
 }
 /** Fail-closed: exact canary scope, the bound partition, bounded knobs. */
 export function validateConfig(cfg: ConsumerConfig): void {
@@ -242,7 +244,8 @@ export class CanonicalConsumer {
         const r = await copyCanonicalEntry(
           images, this.acks, ch, { checkpoint }, entry, this.cfg.targetId,
           { beforeWrite: () => this.heartbeat(),
-            beforeFinish: () => this.heartbeat() }, ctl.signal);
+            beforeFinish: () => this.heartbeat() }, ctl.signal,
+          this.cfg.documentPool === true);
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
         if (ctl.signal.aborted) return "aborted";
