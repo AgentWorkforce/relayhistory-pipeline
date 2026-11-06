@@ -38,6 +38,120 @@ const { neonOwnerUrl } = JSON.parse(readFileSync(0, "utf8").split("\n")[0] || "{
 if (!/^postgresql:\/\/neondb_owner:.+ep-floral-pond-apkvat38/.test(neonOwnerUrl ?? "")) { console.error("neonOwnerUrl (production owner) required on stdin"); process.exit(64); }
 const log = (m: string, f: Record<string, unknown> = {}) => console.log(JSON.stringify({ at: new Date().toISOString(), m, ...f }));
 
+type CopyStream = "record" | "receipt";
+const METRIC_INTERVAL_MS = 15000;
+const metricStarted = performance.now();
+let lastMetricAt = metricStarted, setupFinished = false;
+const metrics = {
+  setupMs: 0,
+  orgsStarted: 0,
+  orgsCompleted: 0,
+  recordPages: 0,
+  recordRowsRead: 0,
+  recordRowsAttempted: 0,
+  recordRowsInserted: 0,
+  recordRowsConflicted: 0,
+  recordSourceQueryMs: 0,
+  recordSourceQueryMaxMs: 0,
+  recordTargetClientMs: 0,
+  recordTargetClientMaxMs: 0,
+  receiptPages: 0,
+  receiptRowsRead: 0,
+  receiptRowsAttempted: 0,
+  receiptRowsInserted: 0,
+  receiptRowsConflicted: 0,
+  receiptSourceQueryMs: 0,
+  receiptTargetClientMs: 0,
+  targetPending: 0,
+  targetPendingMax: 0,
+  backoffEvents: 0,
+  backoffMs: 0,
+};
+const elapsed = (since: number) => Math.max(0, performance.now() - since);
+const metricNumber = (n: number) => Math.round(n);
+function emitMetrics(final = false) {
+  if (mode !== "copy") return;
+  const now = performance.now();
+  if (!setupFinished) metrics.setupMs = elapsed(metricStarted);
+  if (!final && now - lastMetricAt < METRIC_INTERVAL_MS) return;
+  lastMetricAt = now;
+  log(final ? "copy_metrics_final" : "copy_metrics", {
+    elapsedMs: metricNumber(now - metricStarted),
+    setupMs: metricNumber(metrics.setupMs),
+    orgsStarted: metrics.orgsStarted,
+    orgsCompleted: metrics.orgsCompleted,
+    recordPages: metrics.recordPages,
+    recordRowsRead: metrics.recordRowsRead,
+    recordRowsAttempted: metrics.recordRowsAttempted,
+    recordRowsInserted: metrics.recordRowsInserted,
+    recordRowsConflicted: metrics.recordRowsConflicted,
+    recordSourceQueryMs: metricNumber(metrics.recordSourceQueryMs),
+    recordSourceQueryMaxMs: metricNumber(metrics.recordSourceQueryMaxMs),
+    recordTargetClientMs: metricNumber(metrics.recordTargetClientMs),
+    recordTargetClientMaxMs: metricNumber(metrics.recordTargetClientMaxMs),
+    receiptPages: metrics.receiptPages,
+    receiptRowsRead: metrics.receiptRowsRead,
+    receiptRowsAttempted: metrics.receiptRowsAttempted,
+    receiptRowsInserted: metrics.receiptRowsInserted,
+    receiptRowsConflicted: metrics.receiptRowsConflicted,
+    receiptSourceQueryMs: metricNumber(metrics.receiptSourceQueryMs),
+    receiptTargetClientMs: metricNumber(metrics.receiptTargetClientMs),
+    targetPending: metrics.targetPending,
+    targetPendingMax: metrics.targetPendingMax,
+    backoffEvents: metrics.backoffEvents,
+    backoffMs: metricNumber(metrics.backoffMs),
+  });
+}
+function sourceTiming(stream: CopyStream, ms: number, rows: number) {
+  if (stream === "record") {
+    metrics.recordSourceQueryMs += ms;
+    metrics.recordSourceQueryMaxMs = Math.max(metrics.recordSourceQueryMaxMs, ms);
+    if (rows) { metrics.recordPages++; metrics.recordRowsRead += rows; }
+  } else {
+    metrics.receiptSourceQueryMs += ms;
+    if (rows) { metrics.receiptPages++; metrics.receiptRowsRead += rows; }
+  }
+}
+async function timedSourceRows(stream: CopyStream, run: () => Promise<{ rows: Record<string, unknown>[] }>) {
+  const started = performance.now();
+  let count = 0;
+  try {
+    const result = await run();
+    count = result.rows.length;
+    return result.rows;
+  } finally { sourceTiming(stream, elapsed(started), count); }
+}
+async function targetTiming<T>(stream: CopyStream, run: () => Promise<T>): Promise<T> {
+  metrics.targetPending++;
+  metrics.targetPendingMax = Math.max(metrics.targetPendingMax, metrics.targetPending);
+  const started = performance.now();
+  try { return await run(); }
+  finally {
+    const ms = elapsed(started);
+    if (stream === "record") {
+      metrics.recordTargetClientMs += ms;
+      metrics.recordTargetClientMaxMs = Math.max(metrics.recordTargetClientMaxMs, ms);
+    } else metrics.receiptTargetClientMs += ms;
+    metrics.targetPending--;
+  }
+}
+function insertedRows(rowCount: number | null, attempted: number) {
+  if (rowCount === null || !Number.isSafeInteger(rowCount) || rowCount < 0 || rowCount > attempted)
+    throw new Error("copy target returned an invalid inserted-row count");
+  return rowCount;
+}
+async function measuredBackoff(t: number) {
+  const ms = Date.now() - t;
+  if (ms > MAX_PAGE_MS) {
+    const wait = Math.min(ms, 15000);
+    const started = performance.now();
+    metrics.backoffEvents++;
+    await new Promise((r) => setTimeout(r, wait));
+    metrics.backoffMs += elapsed(started);
+  }
+  emitMetrics();
+}
+
 const neon = () => { const c = new pg.Client({ connectionString: neonOwnerUrl, ssl: { rejectUnauthorized: true }, application_name: "p1-frozen-copy-readonly", statement_timeout: 30000 }); return c; };
 const supa = async () => {
   const login = parseCliLogin(execFileSync(CLI, ["db", "dump", "--linked", "--project-ref", REF, "--dry-run"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }));
@@ -66,15 +180,18 @@ const NEON_RECEIPTS = `SELECT org_id,workspace_id,origin_id,batch_id,digest,rece
  WHERE org_id=$1 AND (workspace_id,origin_id,batch_id) > ($2,$3,$4) ORDER BY workspace_id,origin_id,batch_id LIMIT $5`;
 
 const receiptText = (r: Record<string, unknown>) => JSON.stringify([r.org_id, r.workspace_id, r.origin_id, r.batch_id, r.digest, r.receipt]);
-async function scanReceipts(c: pg.Client, sql: string, org: string, onPage: (rows: Record<string, unknown>[]) => Promise<void>) {
+async function scanReceipts(c: pg.Client, sql: string, org: string, onPage: (rows: Record<string, unknown>[]) => Promise<void>, measured = false) {
   let last = ["", "", ""];
   for (;;) {
     const t = Date.now();
-    const rows = (await c.query(sql, [org, ...last, Math.min(PAGE, 1000)])).rows;
+    const rows = measured
+      ? await timedSourceRows("receipt", () => c.query(sql, [org, ...last, Math.min(PAGE, 1000)]))
+      : (await c.query(sql, [org, ...last, Math.min(PAGE, 1000)])).rows;
     if (!rows.length) return;
     await onPage(rows);
     const tail = rows[rows.length - 1]!; last = [tail.workspace_id, tail.origin_id, tail.batch_id];
-    const ms = Date.now() - t; if (ms > MAX_PAGE_MS) await new Promise((r) => setTimeout(r, Math.min(ms, 15000)));
+    if (measured) await measuredBackoff(t);
+    else { const ms = Date.now() - t; if (ms > MAX_PAGE_MS) await new Promise((r) => setTimeout(r, Math.min(ms, 15000))); }
     if (rows.length < Math.min(PAGE, 1000)) return;
   }
 }
@@ -88,15 +205,18 @@ async function orgs(n: pg.Client): Promise<string[]> {
   return (await n.query("SELECT org_id FROM (SELECT DISTINCT org_id FROM sessions.delivery_origins) q ORDER BY org_id COLLATE \"C\"")).rows.map((r) => r.org_id as string);
 }
 
-async function scan(c: pg.Client, sql: string, org: string, onPage: (rows: Record<string, unknown>[]) => Promise<void>) {
+async function scan(c: pg.Client, sql: string, org: string, onPage: (rows: Record<string, unknown>[]) => Promise<void>, measured = false) {
   let last = ["", "", ""];
   for (;;) {
     const t = Date.now();
-    const rows = (await c.query(sql, [org, ...last, PAGE])).rows;
+    const rows = measured
+      ? await timedSourceRows("record", () => c.query(sql, [org, ...last, PAGE]))
+      : (await c.query(sql, [org, ...last, PAGE])).rows;
     if (!rows.length) return;
     await onPage(rows);
     const tail = rows[rows.length - 1]!; last = [tail.workspace_id, tail.origin_id, tail.record_id];
-    const ms = Date.now() - t; if (ms > MAX_PAGE_MS) await new Promise((r) => setTimeout(r, Math.min(ms, 15000)));
+    if (measured) await measuredBackoff(t);
+    else { const ms = Date.now() - t; if (ms > MAX_PAGE_MS) await new Promise((r) => setTimeout(r, Math.min(ms, 15000))); }
     if (rows.length < PAGE) return;
   }
 }
@@ -108,27 +228,37 @@ async function copyOrg(org: string, s: pg.Client, check: () => void) {
     await n.connect();
     await n.query("BEGIN READ ONLY");
     const sealed = (await s.query("SELECT 1 FROM sessions.ingest_frozen_source_org_seals WHERE org_id=$1", [org])).rows.length;
-    if (sealed) { log("org already sealed; skip", { org }); return; }
+    if (sealed) { log("org already sealed; skip"); return; }
     let copied = 0;
     await scan(n, NEON_PAGE, org, async (rows) => {
       check();
       const col = (k: string) => rows.map((r) => r[k] === null || r[k] === undefined ? null : String(r[k]));
-      await s.query(`INSERT INTO sessions.ingest_frozen_source_records(${COLS.join(",")})
+      const result = await targetTiming("record", () => s.query(`INSERT INTO sessions.ingest_frozen_source_records(${COLS.join(",")})
         SELECT * FROM unnest($1::text[],$2::text[],$3::text[],$4::text[],$5::text[],$6::bigint[],$7::text[],$8::text[],$9::text[],$10::text[],$11::text[],$12::text[],$13::bigint[],$14::bigint[])
-        ON CONFLICT DO NOTHING`, COLS.map(col));
+        ON CONFLICT DO NOTHING`, COLS.map(col)));
+      // Publish only validated outcomes so attempted = inserted + conflicted remains exact.
+      const inserted = insertedRows(result.rowCount, rows.length);
+      metrics.recordRowsAttempted += rows.length;
+      metrics.recordRowsInserted += inserted;
+      metrics.recordRowsConflicted += rows.length - inserted;
       copied += rows.length;
-    });
+    }, true);
     let receipts = 0;
     await scanReceipts(n, NEON_RECEIPTS, org, async (rows) => {
       check();
       const col = (k: string) => rows.map((r) => String(r[k]));
-      await s.query(`INSERT INTO sessions.ingest_frozen_source_receipts(org_id,workspace_id,origin_id,batch_id,digest,receipt)
+      const result = await targetTiming("receipt", () => s.query(`INSERT INTO sessions.ingest_frozen_source_receipts(org_id,workspace_id,origin_id,batch_id,digest,receipt)
         SELECT a,b,c,d,e,f::jsonb FROM unnest($1::text[],$2::text[],$3::text[],$4::text[],$5::text[],$6::text[]) AS u(a,b,c,d,e,f) ON CONFLICT DO NOTHING`,
-        ["org_id", "workspace_id", "origin_id", "batch_id", "digest", "receipt"].map(col));
+        ["org_id", "workspace_id", "origin_id", "batch_id", "digest", "receipt"].map(col)));
+      // Publish only validated outcomes so attempted = inserted + conflicted remains exact.
+      const inserted = insertedRows(result.rowCount, rows.length);
+      metrics.receiptRowsAttempted += rows.length;
+      metrics.receiptRowsInserted += inserted;
+      metrics.receiptRowsConflicted += rows.length - inserted;
       receipts += rows.length;
-    });
+    }, true);
     await n.query("ROLLBACK");
-    log("org copied", { org, rows: copied, receipts });
+    log("org copied", { rows: copied, receipts });
   } finally { await n.end().catch(() => {}); }
 }
 
@@ -177,6 +307,7 @@ async function main() {
             [h.org_id, h.workspace_id, h.user_id, h.epoch, h.version, h.digest, h.kind, JSON.stringify(h.payload), h.pending, h.before_privacy === null ? null : JSON.stringify(h.before_privacy), h.privacy_version]);
         }
         log("privacy copied", { deletions: del.length, resets: rs.length, controlHeads: heads.length });
+        metrics.setupMs = elapsed(metricStarted); setupFinished = true;
         // CLI temporary-login refreshes invalidate prior passwords. Keep one
         // authenticated owner connection for the entire job; pg.Client queues
         // target statements while at most CONC source readers run concurrently.
@@ -185,7 +316,8 @@ async function main() {
         await Promise.all(Array.from({ length: Math.max(1, CONC) }, async () => {
           try {
             for (let org = queue.shift(); org; org = queue.shift()) {
-              check(); await copyOrg(org, s, check);
+              check(); metrics.orgsStarted++; await copyOrg(org, s, check);
+              metrics.orgsCompleted++;
               done++; log("progress", { done, of: all.length });
             }
           } catch (error) { if (failure === undefined) failure = error ?? new Error("copy_worker_failed"); }
@@ -239,4 +371,4 @@ async function main() {
     } finally { await s.end().catch(() => {}); }
   } finally { await n.end().catch(() => {}); }
 }
-main().catch((e) => { log("STOPPED", { why: String(e?.message ?? e).slice(0, 300) }); process.exitCode = 1; });
+main().then(() => emitMetrics(true)).catch((e) => { emitMetrics(true); log("STOPPED", { why: String(e?.message ?? e).slice(0, 300) }); process.exitCode = 1; });
