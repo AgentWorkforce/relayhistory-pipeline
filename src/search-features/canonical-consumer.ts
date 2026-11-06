@@ -1,8 +1,8 @@
 /**
  * Supervised leased consumer: durable runtime between the canonical journal
- * and the event+brief pools. Scoped to the exact canary tenant (the journal
+ * and the event+brief pools. Scoped to an explicitly configured tenant (the journal
  * read is fenced — an out-of-scope entry never reaches a descriptor or a CH
- * write); ONE bound partition per canary+target; heartbeat'd lease with a
+ * write); ONE bound partition per tenant+target; heartbeat'd lease with a
  * still-fresh TTL (a stale owner cannot resurrect); durable partition
  * checkpoint CAS'd only after a copied or scope-skipped revision; dead-letter
  * persists only stable poison codes (lease/infra/unknown refuse -> hold).
@@ -18,9 +18,6 @@ const LEASE = "sessions.canonical_feature_consumer_lease";
 const DEAD = "sessions.canonical_feature_consumer_dead_letter";
 const CKPT = "sessions.canonical_feature_consumer_checkpoint";
 import { createHash } from "node:crypto";
-/** The exact canary scope; the partition is DERIVED from it + the target. */
-const CANARY = { orgId: "c4fae7b9-43a9-44e8-94d5-455aa579d67b",
-  workspaceId: "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63" };
 /** Stable poison codes — the producer's deterministic refusals plus the
  *  cycle's data-poison refusals. source_changed + anything else -> hold. */
 const POISON: Record<string, true> = {
@@ -37,15 +34,32 @@ const HOLD = new Set(["lease_lost", "heartbeat_failed", "db_timeout",
 export interface ConsumerConfig {
   /** REQUIRED explicit gate — false/unset means do not run anything. */
   enabled: boolean;
+  /** Required when enabled; never inferred from journal contents. */
+  scope?: Readonly<{ orgId: string; workspaceId: string }>;
+  /** Explicit so existing checkpoints never silently change identity. */
+  partitionScheme?: "scope-v1" | "legacy-prefix-v1";
   targetId: string;
   ownerId: string;
   leaseTtlMs: number;
   maxRetries: number;
   pageSize: number;
 }
-/** Fail-closed: exact canary scope, the bound partition, bounded knobs. */
+/** Fail-closed: explicit tenant scope, bound partition and bounded knobs. */
 export function validateConfig(cfg: ConsumerConfig): void {
   if (cfg.enabled !== true) return;      // off is a valid config (no access)
+  const validId = (v: unknown): v is string => typeof v === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(v);
+  if (!cfg.scope || !validId(cfg.scope.orgId) ||
+      !validId(cfg.scope.workspaceId)) throw new Error("config_bad_scope");
+  if (cfg.partitionScheme !== "scope-v1" &&
+      cfg.partitionScheme !== "legacy-prefix-v1")
+    throw new Error("config_bad_partitionScheme");
+  // The legacy representation uses UUID prefixes; refuse truncation of
+  // arbitrary identifiers into a different existing checkpoint namespace.
+  const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+  if (cfg.partitionScheme === "legacy-prefix-v1" &&
+      (!uuid.test(cfg.scope.orgId) || !uuid.test(cfg.scope.workspaceId)))
+    throw new Error("config_bad_legacy_scope");
   if (typeof cfg.targetId !== "string" || !cfg.targetId.length ||
       cfg.targetId.length > 256) throw new Error("config_bad_target");
   if (typeof cfg.ownerId !== "string" || !cfg.ownerId.length ||
@@ -59,28 +73,43 @@ export function validateConfig(cfg: ConsumerConfig): void {
       throw new Error(`config_bad_${k}`);
   }
 }
-const inScope = (e: CanonicalJournalEntry) =>
-  e.scope.orgId === CANARY.orgId && e.scope.workspaceId === CANARY.workspaceId;
 
 export class CanonicalConsumer {
+  readonly cfg: ConsumerConfig;
   constructor(
     readonly db: SqlQuery,
     readonly journal: CanonicalJournalStore,
     readonly acks: CanonicalPageAckStore,
-    readonly cfg: ConsumerConfig,
+    cfg: ConsumerConfig,
   ) {
     validateConfig(cfg);
-    // The partition identity binds canary + target — a new deployment target
+    // Snapshot the tenant and target together: mutating the caller's config
+    // after construction cannot move a cached checkpoint to another tenant.
+    this.cfg = cfg.enabled === true
+      ? Object.freeze({ ...cfg, scope: Object.freeze({ ...cfg.scope! }) })
+      : Object.freeze({ ...cfg });
+    // The partition identity binds tenant + target — a new deployment target
     // gets a disjoint lease + checkpoint, never reusing the old one.
     // Derived lazily: a disabled consumer never hashes or touches the DB.
-    this.partition = null as unknown as string;
   }
-  private partition: string;
+  private partition: string | null = null;
   private ensurePartition(): string {
-    this.partition ??= `c4fae7b9-1220c1dc-` +
-      createHash("sha256").update(this.cfg.targetId).digest("hex")
-        .slice(0, 32);
+    if (this.partition === null) {
+      const scope = this.cfg.scope!;
+      this.partition = this.cfg.partitionScheme === "legacy-prefix-v1"
+        ? `${scope.orgId.slice(0, 8)}-${scope.workspaceId.slice(0, 8)}-` +
+          createHash("sha256").update(this.cfg.targetId).digest("hex").slice(0, 32)
+        : "v1-" + createHash("sha256").update(JSON.stringify([
+          "canonical-consumer-scope-v1", scope.orgId, scope.workspaceId,
+          this.cfg.targetId,
+        ])).digest("hex").slice(0, 60);
+    }
     return this.partition;
+  }
+
+  private inScope(e: CanonicalJournalEntry): boolean {
+    return e.scope.orgId === this.cfg.scope!.orgId &&
+      e.scope.workspaceId === this.cfg.scope!.workspaceId;
   }
 
   private get on(): boolean { return this.cfg.enabled === true; }
@@ -186,7 +215,7 @@ export class CanonicalConsumer {
         if (BigInt(entry.revision) <= BigInt(lastSeen))
           return { copied, dead, skipped, checkpoint, status: "held" };
         lastSeen = entry.revision;
-        if (!inScope(entry)) {
+        if (!this.inScope(entry)) {
           if (!(await this.advanceCheckpoint(entry.revision)))
             return { copied, dead, skipped, checkpoint, status: "held" };
           checkpoint = entry.revision;
