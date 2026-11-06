@@ -34,15 +34,14 @@ absolute paths, `~`, drive letters, UNC paths and `file:` paths.
 The S3 search-index pass calls `writeDirectoryCatalog` after every complete
 logical-session read. A partial, missing, unscrubbed, conflicting, over-limit,
 or ClickHouse-truncated pass never clears or updates catalog fields. Historical
-sessions still need the controlled re-projection described in the hosted
-activation notes (moved to the private companion repo sessions-pipeline-cloud,
-`hosted-ops/`). Until that backfill
-runs, old catalog fields and parent/child links may be empty, and the list
-**refuses `p_agent`** with `0A000 agent_filter_not_ready` instead of answering
-an empty list. relayhistory-cloud falls back to Neon on that error. An operator
-unlocks it with
+sessions still need the controlled re-projection described in "Backfill"
+below. Until that backfill runs and is verified, old catalog fields and
+parent/child links may be empty, and the list **refuses `p_agent`** with
+`0A000 agent_filter_not_ready` instead of answering an empty list.
+relayhistory-cloud falls back to Neon on that error. An operator unlocks it
+with
 `UPDATE sessions.session_directory_catalog_rollout SET completed_at = now()`
-once the backfill is complete.
+only after the "Backfill" verification passes.
 
 `writeDirectoryCatalog` is one statement. It locks the live directory row
 (`FOR UPDATE`) and joins every write to that lock, so a tombstone either
@@ -103,18 +102,102 @@ never picks it.
 ## Backfill
 
 After the migration, existing rows have empty catalog columns and no agent or
-relationship rows. Two paths are possible, and each is an operator step that
-needs Khaliq's OK, like any write to a real database:
+relationship rows. The backfill is a controlled re-projection of those derived
+fields. It is an operator step that needs Khaliq's OK, like any write to a real
+database; this section describes the procedure and does not authorize it. Keep
+relayhistory-cloud on Neon, or in `shadow` mode for the agent and catalog
+fields, until the activation step below.
 
-1. Replay `writeDirectoryCatalog` from a complete projection of each session's
-   canonical raw objects in object storage, one call per session.
+The canonical raw objects in object storage are the content source of truth.
+Neon is a read-only fallback, used only for sessions that have no complete
+history in object storage.
+
+**Invariants.** The run must:
+
+- never write `unknown` as a directory user; leave the user set empty when no
+  trusted user source exists;
+- never store a local path as a project key or project id
+  (`writeDirectoryCatalog` re-derives its input through
+  `directoryCatalogFromProjection`, which enforces this);
+- never write from a partial, missing, unscrubbed, conflicting, unreadable or
+  over-limit read: record the reason and leave the row unchanged;
+- never leave two live directory rows for the same logical session;
+- never mark the catalog rollout complete before the verification below passes;
+- never write Neon.
+
+**Before.**
+
+1. Confirm the target database has this migration and the later migrations
+   `writeDirectoryCatalog` requires (20261105022000 and 20261105031000)
+   applied, the migration ledger is green, and function grants match
+   `src/hoopdb/sessions-function-acl.json`.
+2. Take a recoverable snapshot of `sessions.session_directory`, its companion
+   tables (`session_directory_agents`, `session_directory_users`,
+   `session_directory_machines`, `session_directory_relationships`,
+   `session_directory_resurrection_fences`) and both rollout tables
+   (`session_directory_rollout`, `session_directory_catalog_rollout`). Record
+   the row counts and a snapshot reference outside the database.
+3. Hold the directory projector queue for the rebuild window so its work can be
+   replayed afterwards. Do not pause canonical object-storage writes.
+4. Dry run, read only: for every live session key, build the catalog as in
+   path 1 below without writing, and report how many would be written and how
+   many are incomplete, by reason. Stop on any identity conflict; resolve those
+   rows explicitly rather than choosing a winner.
+
+**Re-projection.** Process stable `(org_id, workspace_id, harness, session_id)`
+keyset batches. Write each logical session in its own transaction and keep an
+external checkpoint with counts.
+
+1. Default path: read every live manifest and verified raw chunk of the
+   session, project the complete record set with `projectRelayhistorySession`
+   (`packages/pipeline`), build the catalog with
+   `directoryCatalogFromProjection`, and call
+   `writeDirectoryCatalog(tx, key, catalog, { expectedEpoch })` with the epoch
+   read for that key. This is the same call the S3 search-index pass makes
+   (`src/session-pipeline/search-index.ts`). A `{ written: false }` result (a
+   stale epoch) is left for a later batch, never forced.
 2. For sessions that only Neon knows, copy from Neon `sessions.session_catalog`,
    `session_catalog_agents` and `session_relationships` (read-only role) into
    `writeDirectoryCatalog` inputs. Neon keeps one agent per session (0058
    primary key).
+3. Desktop-catalog parents that migration 20261105031000 marks pending are
+   drained with the bounded, resumable driver in
+   `src/hoopdb/session-desktop-catalog-reproject.ts` (schema owner connection
+   only).
 
-Until the backfill is done, relayhistory-cloud should stay in `shadow` mode for
-the agent and catalog fields.
+Rate-limit batches by database latency, lock wait, queue age and error rate.
+Stop on any collision, unexpected deletion, dead-letter growth, sustained lock
+pressure or rising mismatch rate, and resume only from the last committed
+checkpoint.
+
+**Verify.** After replaying the held projector work, produce tenant- and
+harness-sliced reports and require:
+
+- no duplicate logical sessions and no `unknown` directory user;
+- every directory machine maps to exactly one live pointer;
+- project id, project key, repository, branch, agent and user filters match
+  Neon for at least 95% of page-1 sessions, with every remaining mismatch
+  classified;
+- `src/hoopdb/__tests__/session-directory-list.test.ts` passes for the deployed
+  code;
+- pagination has no repeats, skips or cursor loops, and queue, dead-letter and
+  query-plan gates stay green;
+- at least 48 hours of list traffic in shadow, comparing keys, ordering,
+  filters and hydrated fields with Neon.
+
+**Activate.** Only after every check passes, and with approval, set
+`session_directory_catalog_rollout.completed_at` (above) and then change
+`LIST_BACKEND`.
+
+**Rollback.** Before activation: stop the projectors, restore the snapshot
+tables, replay the held queue work, and keep the list on Neon. After
+activation: return `LIST_BACKEND` to Neon first, keep the mismatch evidence,
+restore the derived tables from the snapshot, check counts and grants, then
+replay the pointer events since the snapshot. Never mutate Neon during
+rollback.
+
+A hosted operator copy of this plan, with deployment-specific details, is kept
+privately. It is optional context and is not needed to follow this section.
 
 ## Gaps, not in this migration
 

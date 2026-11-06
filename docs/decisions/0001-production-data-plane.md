@@ -12,8 +12,7 @@ including this decision, in that session.
 ## Decision
 
 - **Production database:** Supabase. HoopDb in hosted production is a Supabase
-  project in the org the 96Bulls team owns (access notes moved to the private companion
-  repo sessions-pipeline-cloud, `hosted-ops/`).
+  project in the org the 96Bulls team owns (`docs/supabase-access.md`).
 - **Production AWS:** S3 only. Locker (object storage) is the only AWS service
   in the hosted production data plane.
 - **EKS, Aurora and every other AWS resource** exist only to prove the
