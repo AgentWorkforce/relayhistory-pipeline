@@ -57,7 +57,7 @@ const result = {
   dirty: !!execFileSync("git", ["status", "--porcelain"], { encoding: "utf8" }).trim(),
   runtime: { engine: process.versions.bun ? "bun" : "node", version: process.versions.bun ?? process.version, nodeCompatibility: process.version },
   postgres: serverVersion,
-  objectStore: "owned loopback MinIO with non-null manifest version inventory",
+  objectStore: "owned loopback MinIO with signed bucket-versioning read and same-response manifest version",
   test: "src/session-ingest/__tests__/frontier-plan.postgres.test.ts",
   status: test.status,
   stdout: test.stdout.trim(),

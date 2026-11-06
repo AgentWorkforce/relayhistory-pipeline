@@ -29,7 +29,7 @@ A reviewed read-only probe should construct the JSON capture; this repository do
 1. Read the complete origin inventory with a fixed keyset query and one page past the final row. Record the reviewed query SHA, source snapshot SHA, page/cursor-chain SHA, configured bounds, item/byte counts, and terminal `null` cursor.
 2. For each exact user/origin, read the opening source identity, generation, source commit, control epoch, privacy baseline, and privacy version. Unknown legacy values remain `null`, which produces `unknown_legacy_fact`.
 3. Read every current record maximum with a bounded resumable keyset scan. An absent destination revision row is not evidence of an empty legacy source. `sourceRecordCount` must equal the maxima count.
-4. Reuse `seed.ts`, `seed-s3.ts`, `SeedProofIndex`, and the existing object-store manifest reader for export evidence. The helper `frontierExportRootFromSeedPointer` maps the existing strict `SeedPointer`; it requires the separately observed origin, complete record count, and non-null object version. The strict second pointer capture and byte verification remain authoritative. Do not replace them with a session boolean, `HEAD`, or sampled manifest count.
+4. Use `captureSeedScopeExportEvidence` from `frontier-plan-source.ts` for export evidence. It issues only the fixed preview RPC, takes two authoritative scope captures, runs every captured pointer through `SeedProofIndex`, derives the target origin's root counts from the sealed per-record index, and records the manifest version returned by the exact GET whose bytes were verified. `createS3FrontierVersioningReader` performs bounded signed `GetBucketVersioning` reads before and after the capture. The adapter refuses source changes, absent versions, non-delivery/unseeded records, foreign roots, and disabled/unknown/changing versioning. It has no caller-supplied completeness, count, version-ID, or versioning booleans.
 5. Read ordered deletion/reset control state and the complete first-ACK receipt-seat decisions. A losing equal-revision candidate stays auditable; two accepted bodies for one native record hold.
 6. Repeat the authority read after all PostgreSQL and S3 work. Any source, generation, control, privacy, or scan-state change invalidates the entire origin. Re-run from the opening inventory; do not patch a stale capture.
 
@@ -62,9 +62,9 @@ Exit `0` is a deterministic ready plan, exit `2` is an actionable hold, and exit
 
 ## Offline evidence
 
-Focused Bun coverage includes missing/stale/incomplete evidence, source and privacy races, wrong tenant, immutable-version refusal, record coverage, competing equal-revision bodies, full coverage, CLI refusal of `--apply`, and idempotency.
+Focused Bun coverage includes missing/stale/incomplete evidence, source and privacy races, wrong tenant, immutable-version refusal, record coverage, competing equal-revision bodies, full coverage, CLI refusal of `--apply`, and idempotency. Source-adapter coverage additionally verifies two preview captures, full byte proof, derived root counts, same-response versions, signed versioning reads, malformed/oversized S3 responses, source races, absent versions, and bucket-status changes.
 
-The disposable proof uses the owned loopback PostgreSQL 17 and versioned MinIO fixtures. It creates and drops an owned synthetic schema, writes only a unique synthetic S3 prefix using the actual manifest writer, reads it with the actual manifest reader, maps the actual seed pointer, inventories a non-null object version, and performs a bounded `REPEATABLE READ READ ONLY` record scan:
+The disposable proof uses the owned loopback PostgreSQL 17 and versioned MinIO fixtures. It creates and drops an owned synthetic schema, writes only a unique synthetic S3 prefix using the actual manifest writer, runs the source adapter over verified manifest/chunk bytes and two preview captures, reads bucket versioning through the signed S3 adapter, records the non-null same-response manifest version, and performs a bounded `REPEATABLE READ READ ONLY` record scan:
 
 ```sh
 FRONTIER_DISPOSABLE=1 \
@@ -72,7 +72,7 @@ FRONTIER_PROOF_OUT=/home/khaliqgant/relay-briefs/canonical-frontier-plan-2026110
 bun scripts/proof-canonical-frontier-plan.ts
 ```
 
-Recorded result: PostgreSQL `170011`, one real fixture test passed with thirteen assertions. This proves the offline protocol path only. It does not prove the current production source inventory, source freshness, AWS bucket versioning/KMS/IAM, S3 object coverage, production privacy closure, destination readiness, worker deployment, or consumer visibility.
+The recorded result artifact reports the exact PostgreSQL version, commit/dirty state, test count, and assertions. This proves the offline protocol path only. It does not prove the current production source inventory, source freshness, AWS bucket versioning/KMS/IAM, S3 object coverage, production privacy closure, destination readiness, worker deployment, or consumer visibility.
 
 ## Remaining production gates
 

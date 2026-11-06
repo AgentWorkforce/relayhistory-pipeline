@@ -1,17 +1,18 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { zstdDecompressSync } from "node:zlib";
 import pg from "pg";
 import { createS3Store, objectStoreManifestReader } from "../../shared/vendor.ts";
-import { signRequest } from "../../../packages/object-store/src/sigv4.ts";
-import { sha256Hex } from "../../../packages/object-store/src/crypto.ts";
-import { xmlElements, xmlText } from "../../../packages/object-store/src/xml.ts";
 import { writeBatchObjects } from "../writer.ts";
 import { prepareDelivery, deliveryAccount } from "../vendor/delivery/prepare.ts";
 import { DELIVERY_MAPPING_VERSION, type HistoryExportBatch } from "../vendor/delivery/delivery-contracts.ts";
+import { captureSeedScopeExportEvidence, createS3FrontierVersioningReader } from "../frontier-plan-source.ts";
 import {
   FRONTIER_CAPTURE_PROTOCOL,
   evaluateCanonicalFrontier,
   frontierCaptureId,
-  frontierExportRootFromSeedPointer,
   frontierExportRootSha256,
   frontierScanItemsSha256,
   frontierSha256,
@@ -43,19 +44,8 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
     const schema = `frontier_${suffix}`;
     const tenant = { orgId: `frontier-${suffix.slice(0, 12)}`, workspaceId: "workspace-fixture", userId: "user-fixture", originId: "origin-fixture" };
     const keyRoot = `frontierproof${suffix.slice(0, 8)}`;
+    const cacheDirectory = mkdtempSync(join(tmpdir(), "frontier-pg-source-"));
     const store = createS3Store({ endpoint: endpoint!, bucket: bucket!, region: "us-east-1", credentials: { accessKeyId: accessKeyId!, secretAccessKey: secretAccessKey! } });
-    const latestVersion = async (key: string): Promise<string> => {
-      const target = new URL(`${endpoint}/${bucket}?versions=&prefix=${encodeURIComponent(key)}`);
-      const headers = new Headers();
-      await signRequest({ method: "GET", url: target, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: "us-east-1", credentials: { accessKeyId: accessKeyId!, secretAccessKey: secretAccessKey! } });
-      const response = await fetch(target, { headers, signal: AbortSignal.timeout(5000) });
-      if (!response.ok) throw new Error(`fixture_versions_${response.status}`);
-      const xml = await response.text();
-      const version = xmlElements(xml, "Version").find(item => xmlText(item, "Key") === key && xmlText(item, "IsLatest") === "true");
-      const value = version ? xmlText(version, "VersionId") : undefined;
-      if (!value || value === "null") throw new Error("fixture_version_missing");
-      return value;
-    };
     try {
       await pool.query(`CREATE SCHEMA ${schema}`);
       await pool.query(`CREATE TABLE ${schema}.authority(source_identity text NOT NULL,source_generation text NOT NULL,source_head text NOT NULL,control_epoch text NOT NULL,privacy_baseline text NOT NULL,privacy_version bigint NOT NULL)`);
@@ -72,16 +62,27 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
       const prepared = await prepareDelivery(tenant, batch);
       const written = await writeBatchObjects({ store, keyRoot, now: () => new Date("2026-11-06T04:00:00.000Z"), sleep: async () => {}, random: () => 0 }, { ...tenant, originId: tenant.originId, batchDigest: prepared.batchDigest, records: prepared.records });
       const manifest = written.manifests[0]!;
-      const manifestVersion = await latestVersion(manifest.key);
-      const read = await objectStoreManifestReader(store, { provider: "s3", bucket }).read(manifest.key);
+      const manifestReader = objectStoreManifestReader(store, { provider: "s3", bucket });
+      const read = await manifestReader.read(manifest.key);
       expect(read?.manifest.raw.content_sha256).toBe(manifest.manifest.raw.content_sha256);
       const pointer: SeedPointer = {
         org_id: tenant.orgId, workspace_id: tenant.workspaceId, user_id: tenant.userId, harness: "claude", session_id: "session-one",
         machine_id: written.machineId, bucket: bucket!, storage_provider: "s3", manifest_key: manifest.key,
         revision: String(manifest.manifest.revision), content_sha256: manifest.manifest.raw.content_sha256, raw_format: manifest.manifest.raw.format,
-        capture: { pointer_id: H("fixture-pointer"), object_version: manifestVersion },
+        capture: { pointer_id: H("fixture-pointer"), scope_sha256: H("fixture-scope"), reset_epoch: "0", fence_versions: {} },
       };
-      const root = frontierExportRootFromSeedPointer(pointer, { originId: tenant.originId, keyRoot: `${keyRoot}/${tenant.orgId}`, versionId: manifestVersion, recordCount: 1, inventoryComplete: true, versioning: "Enabled" });
+      const seedCapture = { protocol: 1 as const, capture_id: null, expires_at: null, fingerprint: H("fixture-capture"), source_epoch: "3", pointers: [pointer] };
+      const evidence = await captureSeedScopeExportEvidence(
+        { async query() { return { rows: [{ r: seedCapture }] } as never; } },
+        { store, reader: manifestReader, bucket: bucket!, provider: "s3", prefixFor: org => `${keyRoot}/${org}`,
+          decompress: (bytes, max) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: max })) },
+        createS3FrontierVersioningReader({ endpoint: endpoint!, region: "us-east-1", credentials: { accessKeyId: accessKeyId!, secretAccessKey: secretAccessKey! } }),
+        { tenant, generation: "a".repeat(64), sourceHead: "b".repeat(40), source: pointer.harness, sessionId: pointer.session_id,
+          keyRoot: `${keyRoot}/${tenant.orgId}`, cachePath: join(cacheDirectory, "frontier.sqlite") },
+      );
+      expect(evidence).toMatchObject({ pointerCount: 1, recordCount: 1, roots: [{ versioning: "Enabled", inventoryComplete: true }] });
+      const root = evidence.roots[0]!;
+      const manifestVersion = root.versionId!;
       const record = prepared.records[0]!;
       await pool.query(`INSERT INTO ${schema}.records VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, [tenant.orgId, tenant.workspaceId, tenant.userId, tenant.originId, record.record_id, record.revision, record.revision_id, record.digest, record.source, record.session_id, record.operation]);
 
@@ -195,6 +196,7 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
     } finally {
       await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
       await pool.end();
+      rmSync(cacheDirectory, { recursive: true, force: true });
     }
   }, 30_000);
 });

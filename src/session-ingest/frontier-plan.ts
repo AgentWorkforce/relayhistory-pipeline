@@ -7,7 +7,6 @@
  * never turns a sample, an absent row, or an unknown legacy fact into truth.
  */
 import { createHash } from "node:crypto";
-import type { SeedPointer } from "./seed-proof.ts";
 
 export const FRONTIER_CAPTURE_PROTOCOL = "canonical-publication-frontier-capture-v1" as const;
 export const FRONTIER_PLAN_PROTOCOL = "canonical-publication-frontier-plan-v1" as const;
@@ -228,35 +227,6 @@ export const frontierCaptureId = (capture: CanonicalFrontierCapture): string => 
 
 export function frontierExportRootSha256(root: FrontierExportRoot): string {
   return frontierSha256(root);
-}
-
-/** Maps the existing strict seed-pointer identity; it does not invent origin or object-version facts. */
-export function frontierExportRootFromSeedPointer(pointer: SeedPointer, evidence: {
-  originId: string;
-  keyRoot: string;
-  versionId: string;
-  recordCount: number;
-  inventoryComplete: true;
-  versioning: "Enabled";
-  kind?: FrontierExportRoot["kind"];
-}): FrontierExportRoot {
-  return {
-    tenant: { orgId: pointer.org_id, workspaceId: pointer.workspace_id, userId: pointer.user_id, originId: evidence.originId },
-    kind: evidence.kind ?? "legacy-export",
-    provider: "s3",
-    bucket: pointer.bucket,
-    keyRoot: evidence.keyRoot,
-    manifestKey: pointer.manifest_key,
-    source: pointer.harness,
-    sessionId: pointer.session_id,
-    machineId: pointer.machine_id,
-    versionId: evidence.versionId,
-    manifestRevision: pointer.revision,
-    contentSha256: pointer.content_sha256,
-    recordCount: evidence.recordCount,
-    inventoryComplete: evidence.inventoryComplete,
-    versioning: evidence.versioning,
-  };
 }
 
 export function frontierScanItems(kind: FrontierScanKind, value: CanonicalFrontierCapture | FrontierOriginCapture): unknown {
