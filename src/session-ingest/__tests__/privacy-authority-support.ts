@@ -26,7 +26,7 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   const closers: Array<() => unknown> = [() => db.close()];
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
+  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
   for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await db.exec(read("supabase/migrations/" + f));
   if (opts.lazyFix !== false) await db.exec(read(LAZY_SOURCE_SQL));
   if (opts.pending !== false) await db.exec(read(PENDING_SQL));
