@@ -34,12 +34,12 @@ export interface CanonicalProjectedEvent {
 export interface CanonicalMaterializer {
   /** Bounded rows for one image scope + kind, after the cursor. */
   rows(
-    imageKey: string, kind: "event" | "brief", cursor: string | null,
+    imageKey: string, kind: "event" | "brief" | "document", cursor: string | null,
     limit: number,
   ): Promise<{ rows: CanonicalProjectedEvent[]; nextCursor: string | null }>;
   /** Exact prior keyset for retirement (keyed rows, same bounded contract). */
   priorKeys(
-    imageKey: string, kind: "event" | "brief", cursor: string | null,
+    imageKey: string, kind: "event" | "brief" | "document", cursor: string | null,
     limit: number,
   ): Promise<{ rows: unknown[]; nextCursor: string | null }>;
   /** Complete-image descriptor: pointer set + source authority, complete flag. */
@@ -60,7 +60,7 @@ const pageHash = (rows: unknown[]): string =>
 export class CanonicalImageSource implements CanonicalImagePort {
   constructor(readonly mat: CanonicalMaterializer) {}
   async imagePages(
-    entry: CanonicalJournalEntry, kind: "event" | "brief",
+    entry: CanonicalJournalEntry, kind: "event" | "brief" | "document",
     cursor: string | null,
   ): Promise<CanonicalImagePage> {
     const { rows, nextCursor } = await this.mat.rows(
@@ -72,7 +72,7 @@ export class CanonicalImageSource implements CanonicalImagePort {
     };
   }
   async priorKeyPages(
-    entry: CanonicalJournalEntry, kind: "event" | "brief",
+    entry: CanonicalJournalEntry, kind: "event" | "brief" | "document",
     cursor: string | null,
   ): Promise<CanonicalImagePage> {
     const { rows, nextCursor } = await this.mat.priorKeys(

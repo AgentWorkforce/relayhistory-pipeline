@@ -17,14 +17,18 @@ B=/home/khaliqgant/.local/share/mise/installs/bun/1.4.2/bin/bun
 <stdin> | $B ~/relay-briefs/bulls-resume-20261104/cutover-ceremony.ts --admit-new-orgs
 ```
 
+The runner and its `mini/` wrappers take the production Neon identifiers from the environment and refuse to run
+without them: `NEON_ENDPOINT` (endpoint id, `<neon-endpoint>`), `NEON_PROJECT_ID`, `NEON_BRANCH_ID`, and for the
+wrappers that build the runtime URL `NEON_RUNTIME_HOST` (the pooled hostname). None of these values are committed.
+
 stdin is ONE JSON line, RAM only:
-`{"neonOwnerUrl":"postgresql://neondb_owner:…@ep-floral-pond-apkvat38…/neondb","neonRuntimeUrl":"postgresql://relayhistory_app_runtime:…@<host>/neondb"}`
+`{"neonOwnerUrl":"postgresql://neondb_owner:…@<neon-endpoint>…/neondb","neonRuntimeUrl":"postgresql://relayhistory_app_runtime:…@<host>/neondb"}`
 
 ## Inputs and credentials
 
 | input | source | 1Password? |
 |---|---|---|
-| Neon owner URL (`neondb_owner`, production endpoint `ep-floral-pond-apkvat38`) | `neonctl connection-string br-damp-mud-apbr6ifp --project-id divine-snow-84812652 --role-name neondb_owner --database-name neondb` | no |
+| Neon owner URL (`neondb_owner`, production endpoint `<neon-endpoint>`) | `neonctl connection-string <neon-branch-id> --project-id <neon-project-id> --role-name neondb_owner --database-name neondb` | no |
 | Neon runtime URL (`relayhistory_app_runtime`) | password in 1P item `oxvgx7xbu2d4j62th6iiudt4oe` field `app_password` | **yes** |
 | `--runtime-host` | EXACTLY the hostname that will be in `NEON_APP_DATABASE_URL` (the custody identity hashes it) | no |
 | `--retention-sha` | the GC lane's retention contract SHA once it is `ARMED_HEALTHY` (never the DORMANT one) | via the GC arm (needs 1P) |

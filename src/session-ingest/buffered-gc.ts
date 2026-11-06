@@ -139,11 +139,26 @@ export async function collectBufferedTicket(t: BufferedGcTicket, deps: BufferedG
   await deps.eraser.eraseObjectExcept(t.key, version);
   return await deps.ledger.finish(t, version) ? 'finished' : 'deferred';
 }
+/** One SQL claim RPC per ticket. ingest_buffer_gc_claim scans up to 4*limit
+ * candidates and does per-candidate retention work (original-record
+ * normalization, ACK-decision/native-slot joins) inside ONE statement that the
+ * job bounds with its per-operation statement_timeout. A claim(limit) that times
+ * out rolls back every candidate's gc_checked_at rotation, so the same heavy
+ * head of the queue is re-scanned, and times out, on every run. claim(1) scans
+ * at most four candidates and commits its rotation, so every run makes durable
+ * progress. Per-tick candidate coverage (4*limit) and the ticket bound (limit)
+ * are unchanged. A failed claim still fails the tick: no claim error is
+ * swallowed, and collect errors keep their existing deferral rules. */
 export async function bufferedGcTick(deps: BufferedGcDeps, limit = 10) {
-  const tickets = await deps.ledger.claim(limit); let finished = 0, deferred = 0;
-  for (const t of tickets) {
-    try { if (await collectBufferedTicket(t, deps) === 'finished') finished++; else deferred++; }
-    catch (e) { if (e instanceof BufferedGcError && ['sql_40001', 'sql_55P03', 'sql_57014'].includes(e.code)) deferred++; else throw e; }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) no('claim_limit');
+  let examined = 0, finished = 0, deferred = 0;
+  for (let call = 0; call < limit; call++) {
+    const tickets = await deps.ledger.claim(1);
+    examined += tickets.length;
+    for (const t of tickets) {
+      try { if (await collectBufferedTicket(t, deps) === 'finished') finished++; else deferred++; }
+      catch (e) { if (e instanceof BufferedGcError && ['sql_40001', 'sql_55P03', 'sql_57014'].includes(e.code)) deferred++; else throw e; }
+    }
   }
-  return { examined: tickets.length, finished, deferred };
+  return { examined, finished, deferred };
 }

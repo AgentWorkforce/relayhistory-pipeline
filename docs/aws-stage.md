@@ -10,9 +10,9 @@ That proof is local-only and does not clear this AWS stage or change the
 production Supabase and AWS S3 boundary.
 
 The proof harness for an isolated self-host E2E on this account
-(`aws-proof`, account 500268966557) is in [AWS self-host E2E proof](aws-e2e-proof.md).
+(`aws-proof`, account <proof-account-id>) is in [AWS self-host E2E proof](aws-e2e-proof.md).
 It can also target the Pippen Tools sandbox of agent `aws-proof` (stage
-`aws-proof-sandbox`, account 361835732085; see
+`aws-proof-sandbox`, account <sandbox-account-id>; see
 [Proof stage in a Pippen sandbox](#proof-stage-in-a-pippen-sandbox-aws-proof-sandbox)).
 It defaults to a dry run and has not been run against AWS.
 
@@ -86,10 +86,10 @@ principal `arn:aws:iam::<id>:root`, with exactly `ecr:BatchGetImage`,
 `ecr:GetDownloadUrlForLayer`, `ecr:BatchCheckLayerAvailability` and
 `ecr:DescribeImages` (read-only image metadata: the pulling stage's image
 check, `verifyServicesImage`, reads the pinned digest's tags). The
-Pippen sandbox `361835732085` gets the Sid `PippenSandboxAwsProofPull`; any
+Pippen sandbox `<sandbox-account-id>` gets the Sid `PippenSandboxAwsProofPull`; any
 other account gets `CrossAccountPull<id>`. The stage refuses an entry that is
 not a 12-digit id (no wildcards or ARNs), a duplicate, its own account, the
-production account `941433935742`, and a stage that owns no repository
+production account `<prod-account-id>`, and a stage that owns no repository
 (`accountShared`, the transcript store). Absent or `[]` means no policy, which
 is the behavior before this input existed.
 
@@ -101,7 +101,7 @@ change merges. So **before the next
 `bin/96bulls up aws-sessions-dev`, its inputs must carry**:
 
 ```json
-"ecr": { "pullAccounts": ["361835732085"] }
+"ecr": { "pullAccounts": ["<sandbox-account-id>"] }
 ```
 
 Without it, that `up` deletes the grant and the sandbox can no longer pull the
@@ -265,7 +265,7 @@ summary and rebuilds each as an encrypted object.
 ## Production transcript store (`aws-sessions-prod`)
 
 Production AWS is S3 only (decision 0001). The `aws-sessions-prod` stage in
-`sessions-prod` (`941433935742`, `us-east-1`) sets `transcriptStore` in its
+`sessions-prod` (`<prod-account-id>`, `us-east-1`) sets `transcriptStore` in its
 inputs and declares only the transcript bucket, its CMK, access logs,
 CloudTrail with S3 data events, a budget and four IAM users (writer, reader,
 eraser, srv-writer for the relayhistory-api live writer), none of the baseline above (`stacks/aws/transcript-store.ts`). Design,
@@ -595,7 +595,7 @@ the first apply, create its Secrets from 1Password as for sessions-dev
 
 Khaliq, 2026-11-01: run the EKS proof in a Pippen Tools sandbox so that
 teardown is a verified sweep rather than a hand-checked `down`. The sandbox is
-the one for agent `aws-proof`: account `361835732085`, region `us-west-2`, in
+the one for agent `aws-proof`: account `<sandbox-account-id>`, region `us-west-2`, in
 the Sandbox OU of the 96Bulls org (management account `904260146565`).
 
 The stage `aws-proof-sandbox` (cluster `96bulls-aws-proof-sandbox`) and that
@@ -603,7 +603,7 @@ account are pinned to each other (`stacks/aws/sandbox-rules.ts`
 `PIPPEN_PROOF_SANDBOX`, enforced by `assertPippenProofSandbox` in
 `stacks/aws/inputs.ts`):
 
-- the stage runs only in `361835732085`/`us-west-2`, and that account hosts no
+- the stage runs only in `<sandbox-account-id>`/`us-west-2`, and that account hosts no
   other stage;
 - `pippenSandbox.permissionsBoundaryArn` is required and must be a policy in
   that account; every role the stage creates carries it, and every resource
@@ -611,12 +611,12 @@ account are pinned to each other (`stacks/aws/sandbox-rules.ts`
 - `accountShared` is refused: the sandbox is a fresh account, so the stage
   creates its own ECR repository but no GitHub OIDC provider or publisher role.
   The services image is pulled by digest from the sessions-dev repository
-  (`eks.imageRepository`). Khaliq approved read-only pull for `361835732085`
+  (`eks.imageRepository`). Khaliq approved read-only pull for `<sandbox-account-id>`
   on 2026-11-01, and it is applied live as that repository's policy; see
   [Cross-account pull](#cross-account-pull-ecrpullaccounts);
 - before declaring anything, in every mode, the stack checks that
   `aws sts get-caller-identity` is exactly
-  `arn:aws:sts::361835732085:assumed-role/agent-session/agent-<session_id>`,
+  `arn:aws:sts::<sandbox-account-id>:assumed-role/agent-session/agent-<session_id>`,
   the pippen agent-session role session of the current lease. Credentials
   come only from that role. `<session_id>` is the lease UUID that
   `pippen sandbox status aws-proof` shows after `up`. Export it as
@@ -679,7 +679,7 @@ replaces every inherited `AWS_*` variable and keeps the rest, so the
 pippen sandbox up aws-proof
 pippen sandbox status aws-proof            # session_id
 export NINETY_SIX_BULLS_PIPPEN_SESSION=<session_id>
-export NINETY_SIX_BULLS_CONFIRM_ACCOUNT=361835732085   # AWS_REGION comes from exec
+export NINETY_SIX_BULLS_CONFIRM_ACCOUNT=<sandbox-account-id>   # AWS_REGION comes from exec
 
 # 1. Capture the plan (Alchemy: static, < 1 h). Review docs/plans/aws-proof-sandbox.*.
 pippen sandbox exec aws-proof --static-credentials -- bin/96bulls plan aws-proof-sandbox --capture
@@ -773,17 +773,17 @@ proof stages) and changes only what the pippen agent-session boundary and
   EBS volumes (StorageClass `tagSpecification_1`) that Auto Mode creates
   from Kubernetes objects. EC2 instances Auto Mode launches are untagged and
   terminated by EKS with the cluster;
-- the S3 buckets are named `pippen-sbx-96bulls-aws-proof-sandbox-{locker,trail,alb-logs}-361835732085`
-  (and the proof's HoopDb backup bucket `pippen-sbx-96bulls-aws-proof-sandbox-backups-361835732085`;
+- the S3 buckets are named `pippen-sbx-96bulls-aws-proof-sandbox-{locker,trail,alb-logs}-<sandbox-account-id>`
+  (and the proof's HoopDb backup bucket `pippen-sbx-96bulls-aws-proof-sandbox-backups-<sandbox-account-id>`;
   every one is a valid S3 name, tested):
   `pippen-sweeper` may delete only `pippen-sbx-*` buckets (S3 deletes cannot be
   tag-conditioned);
 - no GitHub OIDC provider or deployer role (unchanged);
 - the Alchemy state is not in the account's default store
-  `alchemy-state-361835732085-us-west-2-an`, which `pippen-sweeper` is denied
+  `alchemy-state-<sandbox-account-id>-us-west-2-an`, which `pippen-sweeper` is denied
   deleting (`NeverDeleteBucketsThatMustSurvive` covers `alchemy-state-*`) and
   which would outlive the sweep while it reports clean. It is in
-  `pippen-sbx-alchemy-state-361835732085-us-west-2-an`
+  `pippen-sbx-alchemy-state-<sandbox-account-id>-us-west-2-an`
   (`stacks/aws/state-bucket.ts`): the `pippen-sbx-` prefix, Alchemy's
   account-regional `<prefix>-<account>-<region>-an` form, tagged
   `pippen:sandbox=true` in the CreateBucket call itself (no untagged window),
@@ -859,7 +859,7 @@ The stack itself refuses, before declaring anything and whatever started it
 Credentials stay in environment variables, exported from the SSO session:
 
 ```sh
-export AWS_REGION=us-west-2 NINETY_SIX_BULLS_CONFIRM_ACCOUNT=500268966557
+export AWS_REGION=us-west-2 NINETY_SIX_BULLS_CONFIRM_ACCOUNT=<proof-account-id>
 eval "$(aws configure export-credentials --profile sessions-dev --format env)"
 bin/96bulls plan aws-proof [--detailed]                       # read only
 bin/96bulls plan aws-proof --capture                          # writes docs/plans/aws-proof.*
@@ -868,7 +868,8 @@ NINETY_SIX_BULLS_CONFIRM_DESTROY=aws-proof bin/96bulls down aws-proof   # rollba
 ```
 
 **Captured plans.** `plan --capture` writes the plan, the `--detailed` plan,
-sanitized inputs and `<stage>.provenance.json` to `docs/plans/`. The record
+sanitized inputs and `<stage>.provenance.json` to `docs/plans/` (generated locally;
+captures are not committed to the repository). The record
 holds the commit and a sha256 of the committed stack source (stacks, src,
 packages, supabase, package.json, bun.lock, versions.lock.json, tsconfig.json;
 capture refuses uncommitted changes there), the inputs file sha256, the STS

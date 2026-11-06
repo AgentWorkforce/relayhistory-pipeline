@@ -146,8 +146,8 @@ INGEST_PUBLICATION_GC_LIMIT. Values are operator inputs, never invocation payloa
 The dedicated Supabase login/host/project and TLS CA checks reuse gcPoolConfig.
 No owner login, static access key, SSO token or Neon connection is accepted.
 
-Credentials are temporary IMDSv2 credentials on pinned host i-070f91abb67aa60de,
-account941433935742/us-east-1, exact reviewed role/profile. Token PUT and every
+Credentials are temporary IMDSv2 credentials on pinned host <instance-id>,
+account <account-id>/us-east-1, exact reviewed role/profile. Token PUT and every
 GET have deadlines/body caps; default transport connects directly to the fixed
 link-local address, bypassing environment/global-fetch proxies, and has no
 IMDSv1 fallback. Identity is reverified at least every5minutes and credentials

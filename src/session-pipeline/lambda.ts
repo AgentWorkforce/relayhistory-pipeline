@@ -1,3 +1,5 @@
+import {createSemanticClickHouseClient} from "../search-features/semantic-copy-ch.ts";
+import {SemanticPostgresExecutor} from "../search-features/semantic-copy-postgres.ts";
 import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
 /**
  * AWS Lambda entry for the sessions-prod session pipeline
@@ -58,6 +60,8 @@ import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.t
 import { briefTick } from "../session-brief/worker.ts";
 import{derivedSchemaAssets}from "./derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
+import {runSemanticCopyTick,semanticFailureReason} from "../search-features/semantic-copy-job.ts";
+import {semanticReadonlyPool,semanticFeatureReader,semanticMetadataPool} from "../search-features/semantic-copy-source-pool.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
@@ -84,6 +88,8 @@ export interface LambdaEnv {
   analysisCacheEnabled: boolean;
   /** SESSION_DESKTOP_CATALOG_ENABLED=1: the search stage writes the complete desktop catalog; off (default): the pre-#182 writer. */
   desktopCatalogEnabled: boolean;
+  semanticCopyEnabled?: boolean;
+  semanticSourceId?: string;
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
   dbPoolMax: number;
@@ -113,6 +119,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     largeScopeHandoffEnabled: env.SESSION_LARGE_READ_HANDOFF_ENABLED === "1",
     analysisCacheEnabled: env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
     desktopCatalogEnabled: env.SESSION_DESKTOP_CATALOG_ENABLED === "1",
+    semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
+    semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
     fanout,
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
@@ -210,7 +218,13 @@ export interface Runtime {
   analysisSourceUrl?: unknown;
   /** Built on first analysis invocation with the flag on, never in shared init. */
   analysis?: AnalysisRefreshDeps;
+  /** Raw secret fields for the semantic copier, carried only with its flag on; see semanticCopyDeps(). */
+  semanticSecret?: { hoopdbUrl: string; clickhouse?: PipelineSecret["clickhouse"]; sourceUrl?: unknown };
+  /** Built on first semantic-copy invocation with the flag on, never in shared init. */
+  semanticCopy?: () => Promise<SemanticCopyStats>;
 }
+
+type SemanticCopyStats = Awaited<ReturnType<typeof runSemanticCopyTick>>;
 
 let runtime: Promise<Runtime> | undefined;
 
@@ -298,7 +312,31 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     config: briefConfig(),
   });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
-  return { env, deps, brief, store, analysisSourceUrl: secret.analysis_source_readonly_url };
+  // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
+  const semanticSecret = env.semanticCopyEnabled ? { hoopdbUrl: secret.hoopdb_url, clickhouse: secret.clickhouse, sourceUrl: secret.analysis_source_readonly_url } : undefined;
+  return { env, deps, brief, store, analysisSourceUrl: secret.analysis_source_readonly_url, semanticSecret };
+}
+
+/**
+ * The semantic copier, validated and built on first use from the semantic-copy
+ * branch. Incomplete or malformed config fails only that invocation; the shared
+ * runtime (SQS/search/reconcile/brief) is unaffected and not invalidated.
+ */
+export function semanticCopyDeps(rt: Runtime): () => Promise<SemanticCopyStats> {
+  if (!rt.env.semanticCopyEnabled || !rt.semanticSecret) throw new Error("semantic copier unavailable");
+  if (!rt.semanticCopy) {
+    const { hoopdbUrl, clickhouse, sourceUrl } = rt.semanticSecret, sourceId = rt.env.semanticSourceId;
+    // Reason codes only: URL parse errors can carry the URL, so their text is never surfaced.
+    if (!clickhouse || !sourceUrl || !sourceId) throw Object.assign(new Error("semantic copier configuration incomplete"), { reason: "config_incomplete" });
+    let source: SemanticPostgresExecutor, db: SemanticPostgresExecutor;
+    try {
+      source = semanticFeatureReader(semanticReadonlyPool(analysisSourceReadonlyUrl(sourceUrl)));
+      db = new SemanticPostgresExecutor(semanticMetadataPool(hoopdbUrl));
+    } catch { throw Object.assign(new Error("semantic copier configuration invalid"), { reason: "config_invalid" }); }
+    const ch = createSemanticClickHouseClient(clickhouse), endpoint = clickhouse.url;
+    rt.semanticCopy = () => runSemanticCopyTick({ db, source, ch, sourceId, endpoint });
+  }
+  return rt.semanticCopy;
 }
 
 /**
@@ -477,9 +515,24 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
   return { ...summary, link };
 }
 
-type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; analysisCache?:unknown; analysisCacheReconcile?:unknown; analysisCursor?:unknown; cursor?: string; since?: string; link?: number };
+export function semanticTickState(stats:{failed:number;eventComplete:boolean;briefComplete:boolean;reasons:{event:string;brief:string}}):"failed"|"complete"|"idle"|"continuation"{
+  if(stats.failed>0)return "failed";
+  if(stats.eventComplete&&stats.briefComplete)return "complete";
+  const quiet=(r:string)=>r==="idle"||r==="complete";
+  return quiet(stats.reasons.event)&&quiet(stats.reasons.brief)?"idle":"continuation";
+}
+
+type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; analysisCache?:unknown; analysisCacheReconcile?:unknown; analysisCursor?:unknown; semanticCopy?:unknown; cursor?: string; since?: string; link?: number };
 
 export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok: boolean }> {
+  if(event?.semanticCopy===true){
+    // Default off before secret lookup, connection pools or source access.
+    if(process.env.SESSION_SEMANTIC_COPY_ENABLED!=="1")return {ok:true};
+    const started=Date.now();try{const rt=await ready();const stats=await semanticCopyDeps(rt)();
+      log.info("semantic copy tick",{stage:"semantic-copy",count:stats.published,claimed:stats.pages,failed:stats.failed,ok:stats.failed===0,state:semanticTickState(stats),reason:`event:${stats.reasons.event};brief:${stats.reasons.brief}`,duration_ms:Date.now()-started});
+      return {ok:stats.failed===0};
+    }catch(error){log.error("semantic copy tick failed",{stage:"semantic-copy",...errorFields(error),reason:semanticFailureReason(error),duration_ms:Date.now()-started});return {ok:false};}
+  }
   if (Array.isArray(event?.Records)) {
     let rt: Runtime;
     try {

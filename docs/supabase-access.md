@@ -1,9 +1,9 @@
 # Supabase access
 
 **Status (2026-11-02).** The HoopDb schema is live on the production project
-`pyamkrhoyszgzirqqffq`. Operators applied it with `src/hoopdb/migrate.ts` as `postgres`,
-credentials from 1Password, TLS `verify-full` (see
-`docs/activation/supabase-incremental-upgrade-1d99ccc8-to-eff8b3be.md`). The provisioner and IaC
+`<supabase-project>`. Operators applied it with `src/hoopdb/migrate.ts` as `postgres`,
+credentials from 1Password, TLS `verify-full` (the per-upgrade operator record is not kept in
+the repository). The provisioner and IaC
 path described below is still a proposal: no provisioner token or Alchemy Supabase resource has
 been created.
 

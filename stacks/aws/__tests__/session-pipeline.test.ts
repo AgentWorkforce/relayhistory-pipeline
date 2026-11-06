@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import * as AWS from "@alchemy.run/aws";
 import { fileURLToPath } from "node:url";
 import type { AwsInputs } from "../inputs.ts";
@@ -11,6 +11,8 @@ import {
   SESSION_ANALYSIS_CACHE_RESOURCES,
   analysisCacheScheduleProps,
   analysisReconcileScheduleProps,
+  SESSION_SEMANTIC_COPY_RESOURCES,
+  semanticCopyScheduleProps,
   SESSION_PIPELINE_RESOURCES,
   VISIBILITY_TIMEOUT_SECONDS,
   briefScheduleProps,
@@ -248,10 +250,13 @@ describe("session pipeline: inputs", () => {
     const names = sessionPipelineNames(STAGE, ACCOUNT, REGION);
     for (const sp of [{}, { searchIndex: true }, { searchIndex: true, desktopCatalog: false }, { searchIndex: true, replayPages: false, maxConcurrency: 4, reconcileMinutes: 30, briefs: { enabled: true } }])
       expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names, p: sp }).SESSION_DESKTOP_CATALOG_ENABLED).toBe("0");
-    // Every committed stage input (deployed captures and examples) that carries a session pipeline.
+    // Every stage input present in the tree (local captures, which are not committed, and the
+    // committed examples) that carries a session pipeline. docs/plans may be absent.
     const root = fileURLToPath(new URL("../../../", import.meta.url));
+    const plansDir = `${root}docs/plans`;
+    const planFiles = existsSync(plansDir) ? readdirSync(plansDir).map((f) => `${plansDir}/${f}`) : [];
     const files = [
-      ...readdirSync(`${root}docs/plans`).filter((f) => f.endsWith(".inputs.sanitized.json")).map((f) => `${root}docs/plans/${f}`),
+      ...planFiles.filter((f) => f.endsWith(".inputs.sanitized.json")),
       ...readdirSync(`${root}stacks/aws/examples`).filter((f) => f.endsWith(".json")).map((f) => `${root}stacks/aws/examples/${f}`),
     ];
     let checked = 0;
@@ -264,9 +269,11 @@ describe("session pipeline: inputs", () => {
       for (const deployed of [sp, { ...sp, searchIndex: true }])
         expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names, p: deployed as SessionPipelineInputs }).SESSION_DESKTOP_CATALOG_ENABLED).toBe("0");
     }
-    expect(checked).toBeGreaterThan(0);
-    // No committed file sets the switch to "1".
-    const plans = readdirSync(`${root}docs/plans`).map((f) => readFileSync(`${root}docs/plans/${f}`, "utf8"));
+    // No committed stage input carries a sessionPipeline today (captures are local; the examples
+    // have none), so `checked` may be 0; the defaults above still cover the env.
+    expect(checked).toBeLessThanOrEqual(files.length);
+    // No file present (captures and examples) sets the switch to "1".
+    const plans = [...planFiles, ...files.filter((f) => !planFiles.includes(f))].map((f) => readFileSync(f, "utf8"));
     for (const text of plans) expect(text).not.toMatch(/SESSION_DESKTOP_CATALOG_ENABLED["']?\s*[:=]\s*["']?1/);
   });
 
@@ -341,6 +348,28 @@ describe("session pipeline: deploy plan contract", () => {
   it("analysis schedule is dormant and its invoke permission is bound to the exact rule/account",()=>{const input={names:p,functionArn:"arn:lambda",p:{},tags:{}};expect(analysisCacheScheduleProps(input)).toMatchObject({state:"DISABLED",scheduleExpression:"rate(1 minute)",targets:[{Input:JSON.stringify({analysisCache:true})}]});expect(analysisCacheScheduleProps({...input,p:{analysisCache:true}}).state).toBe("ENABLED");expect(analysisReconcileScheduleProps(input)).toMatchObject({state:"DISABLED",scheduleExpression:"rate(30 minutes)",targets:[{Input:JSON.stringify({analysisCacheReconcile:true})}]});const grants=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:`arn:aws:events:${REGION}:${ACCOUNT}:rule/${p.rule}`,briefRuleArn:"brief",analysisRuleArn:"exact-analysis-rule",roleArn:ROLE});expect(grants.at(-1)!.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn:"exact-analysis-rule",sourceAccount:ACCOUNT});const both=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:`arn:aws:events:${REGION}:${ACCOUNT}:rule/${p.rule}`,briefRuleArn:"brief",analysisRuleArn:"exact-analysis-rule",analysisReconcileRuleArn:"exact-reconcile-rule",roleArn:ROLE});for(const [id,sourceArn] of [["session-analysis-cache-permission","exact-analysis-rule"],["session-analysis-reconcile-permission","exact-reconcile-rule"]])expect(both.find(g=>g.id===id)!.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn,sourceAccount:ACCOUNT})});
   it("analysis phase requires both resources and refuses permission widening, mixed schedules and unrelated writes",()=>{const creates=Object.fromEntries(SESSION_ANALYSIS_CACHE_RESOURCES.map(r=>[r,"create"]));expect(check(plan(creates,withAnalysis))).toBe("session analysis cache rollout");expect(check(plan({"session-analysis-cache-schedule":"update"},withAnalysis))).toBe("session analysis cache update");for(const permission of ["session-analysis-cache-permission","session-analysis-reconcile-permission"])expect(()=>check(plan({[permission]:"update"},withAnalysis))).toThrow(/unsafe action combination/);expect(()=>check(plan(creates,[...all,"session-analysis-cache-schedule"]))).toThrow(/missing resource session-analysis-cache-permission/);expect(()=>check(plan({...creates,trail:"update"},withAnalysis))).toThrow(/must be noop or a session pipeline update/);expect(()=>check(plan({...creates,"session-brief-schedule":"update"},[...withAnalysis,...SESSION_BRIEF_RESOURCES]))).toThrow(/separate reviewed phases/);for(const action of ["delete","replace"])expect(()=>check(plan({"session-analysis-cache-schedule":action},withAnalysis))).toThrow(/forbidden action/)});
   it("analysis phases refuse unproven role and read-api cascades",()=>{const creates=Object.fromEntries(SESSION_ANALYSIS_CACHE_RESOURCES.map(r=>[r,"create"]));expect(()=>check(plan({...creates,"session-pipeline":"update",transcripts:"update"},withAnalysis))).toThrow(/transcripts updates without the role-ARN cascade/);const withApi=[...withAnalysis,"session-read-api","session-read-api-secret","session-read-api-errors-alarm","session-read-api-throttles-alarm"];expect(()=>check(plan({...creates,"session-read-api":"update"},withApi))).toThrow(/session-read-api may update only with no declared property changes/);expect(()=>check(plan({...creates,"session-read-api-errors-alarm":"update"},withApi))).toThrow(/read api may not change/)});
+  const withSemantic=[...all,...SESSION_SEMANTIC_COPY_RESOURCES];
+  it("semantic copier defaults disabled with exact rule/account invoke permission",()=>{
+    expect(semanticCopyScheduleProps({names:p,functionArn:"fn",p:{},tags:{}})).toMatchObject({state:"DISABLED",scheduleExpression:"rate(1 minute)",targets:[{Input:JSON.stringify({semanticCopy:true})}]});
+    expect(sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:{}})).toMatchObject({SESSION_SEMANTIC_COPY_ENABLED:"0",SESSION_SEARCH_FEATURE_SOURCE_ID:""});
+    const enabled={semanticCopy:{enabled:true,sourceId:"reviewed-source"}};
+    expect(semanticCopyScheduleProps({names:p,functionArn:"fn",p:enabled,tags:{}}).state).toBe("ENABLED");
+    const permission=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:"old",briefRuleArn:"brief",semanticRuleArn:"exact-semantic-rule",roleArn:ROLE}).at(-1)!;
+    expect(permission.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn:"exact-semantic-rule",sourceAccount:ACCOUNT});
+  });
+  it("semantic phase keeps permission create-only and refuses mixed schedules, unrelated changes and unproven cascades",()=>{
+    const creates=Object.fromEntries(SESSION_SEMANTIC_COPY_RESOURCES.map(r=>[r,"create"]));expect(check(plan(creates,withSemantic))).toBe("session semantic copy rollout");
+    expect(check(plan({"session-semantic-copy-schedule":"update"},withSemantic))).toBe("session semantic copy update");
+    expect(()=>check(plan({"session-semantic-copy-permission":"update"},withSemantic))).toThrow(/unsafe action combination/);
+    expect(()=>check(plan(creates,[...all,"session-semantic-copy-schedule"]))).toThrow(/missing resource session-semantic-copy-permission/);
+    for(const action of ["delete","replace"])expect(()=>check(plan({"session-semantic-copy-schedule":action},withSemantic))).toThrow(/forbidden action/);
+    expect(()=>check(plan({...creates,trail:"update"},withSemantic))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-brief-schedule":"update"},[...withSemantic,...SESSION_BRIEF_RESOURCES]))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-pipeline":"update",transcripts:"update"},withSemantic))).toThrow(/without the role-ARN cascade/);
+    const withApi=[...withSemantic,"session-read-api","session-read-api-secret","session-read-api-errors-alarm","session-read-api-throttles-alarm"];
+    expect(()=>check(plan({...creates,"session-read-api":"update"},withApi))).toThrow(/only with no declared property changes/);
+  });
+
   const withBrief = [...all, ...SESSION_BRIEF_RESOURCES];
   const briefCreates = Object.fromEntries(SESSION_BRIEF_RESOURCES.map((r) => [r, "create"]));
 

@@ -136,8 +136,8 @@ rotation, force fresh reads with
    rollout) and apply again.
 4. **Secret value** (above).
 5. **Notification.** Run
-   `NINETY_SIX_BULLS_CONFIRM_STAGE=aws-sessions-prod scripts/sessions-prod-bucket-notification.sh --apply`,
-   then `--check`. S3 sends one `s3:TestEvent`, which the Lambda ignores.
+   `SESSIONS_PROD_ACCOUNT_ID=<prod-account-id> NINETY_SIX_BULLS_CONFIRM_STAGE=aws-sessions-prod scripts/sessions-prod-bucket-notification.sh --apply`,
+   then `--check` (the script refuses without `SESSIONS_PROD_ACCOUNT_ID`). S3 sends one `s3:TestEvent`, which the Lambda ignores.
 6. **Verify the pointer stage.** In CloudWatch Logs
    `/aws/lambda/96bulls-aws-sessions-prod-session-pipeline`, look for
    `pointer indexed` lines and for no `pointer index failed`. The DLQ should
@@ -231,7 +231,8 @@ controls them:
 
 1. **Retire the catch-up loop** (STOP, no restart). Its `b47c1e6` projector
    overwrites brief titles in `session_directory`
-   (docs/activation/supabase-upgrade-eff8b3be-to-5ed11913.md, U6a).
+   (recorded in the eff8b3be-to-5ed11913 upgrade, U6a; that operator record is not
+   kept in the repository).
 2. **Ship the code off.** Capture and apply this code with `briefs` absent. The
    contract accepts it only as **session brief rollout**: the two brief
    resources are `create`, and the rest is all `noop` or exactly a session
@@ -278,7 +279,7 @@ rename**, and only on its own:
 | What | How |
 | --- | --- |
 | Stop everything, keep messages | `aws lambda update-event-source-mapping --uuid <uuid> --no-enabled` (messages wait in SQS for 4 days) |
-| Stop new events | `scripts/sessions-prod-bucket-notification.sh --remove` (the reconcile still runs: disable the rule with `aws events disable-rule --name 96bulls-aws-sessions-prod-session-reconcile`) |
+| Stop new events | `SESSIONS_PROD_ACCOUNT_ID=<prod-account-id> NINETY_SIX_BULLS_CONFIRM_STAGE=aws-sessions-prod scripts/sessions-prod-bucket-notification.sh --remove` (the reconcile still runs: disable the rule with `aws events disable-rule --name 96bulls-aws-sessions-prod-session-reconcile`) |
 | ClickHouse back to the Neon tail | `searchIndex: false` (capture and apply, an update), then `SEARCH_INGEST_ENABLED=1` on the Worker |
 | Remove the pipeline | Revert, then do a reviewed capture. The contract refuses deletes, so removing the pipeline needs its own contract change and approval. |
 

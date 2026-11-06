@@ -234,7 +234,7 @@ violation is named:
   baseline. Local, selfhosted and cloudsql still refuse every effective TEMPORARY grant.
   This is compatibility, not a
   service requirement: no service creates temporary objects or relies on runtime
-  `search_path`; see `docs/evidence/runtime-temp-usage.md`.
+  `search_path` (the runtime temp-usage audit is not kept in the repository).
 - **Approved, and nothing else:** `USAGE` on schema `sessions`; read-only migration
   ledger/marker access; `CONNECT`; and the immutable application table, identity-sequence,
   callable-function and RLS-policy allowlists in `src/hoopdb/migrate-guards.ts`. The
@@ -372,7 +372,10 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105026000_canonical_history_lineage.sql` | table sessions.ingest_history_carriers |
 | `upstream:20261105030000_canonical_feature_consumer_acks.sql` | table sessions.canonical_feature_copy_state |
 | `upstream:20261105031000_desktop_catalog_forget_reproject.sql` | table sessions.session_desktop_catalog_reproject |
+| `upstream:20261105032000_session_large_read_routing_fixes.sql` | table sessions.session_large_read_scope_errors |
+| `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
+| `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |

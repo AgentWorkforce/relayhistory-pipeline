@@ -17,3 +17,7 @@ Acceptance evidence:
 - Run after supplying the isolated RHC checkout: bun scripts/proof-event-features-real.ts <RHC-checkout>3277032771 <relay-briefs/ch-event-feature-proof-20261103...>. The emitted proof records exact source/provider metadata and checks; it does not establish production coverage or throughput.
 
 The28M-row full baseline and source journal catchup, current live writer coverage, role privileges, CH grants/schema, actual runtime load/latency and independent exact-head review/CI remain operator gates. The legacy source does not prove S3-only forwarded ingest; see RHC docs/ch-four-pool-search.md.
+
+## Directory-document features (third pool)
+
+documentFeatureSchemaStatements() defines session_document_features — the directory-document projection pool (per-session title/summary fold + project identity + last activity). Operator applies the DDL before documentPool=true on the consumer; a missing table makes the copy hold (refused, restartable), never poison the entry. The pool is default-off: when documentPool is false the copy is the exact signed-off two-pool event+brief path on the 030000 finish RPC. When on, the three-terminal canonical_feature_document_finish (037000) requires one terminal page per pool before finish CAS. The target hash covers all three table/schema identities.

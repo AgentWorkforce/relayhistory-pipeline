@@ -154,3 +154,5 @@ secrets (mode 600) and is gitignored; `.alchemy/` holds state in plaintext and
 is gitignored.
 
 Amp provider commands reuse the ingest process host; see [persistent Amp transport](docs/amp-transport.md) for setup and the Cloud ownership boundary.
+
+Image release and verification: [services image release guide](docs/services-image-release.md).

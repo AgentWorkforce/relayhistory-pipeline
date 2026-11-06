@@ -24,7 +24,7 @@ Detached Node24 default-off and armed portable-job proofs exercise the generated
 bundle; the latter uses owned PostgreSQL/MinIO factories, not AWS credentials or
 production resources. A test factory does not prove AWS IAM or cloud networking.
 
-Before any deployment, an operator must verify account941433935742/us-east-1,
+Before any deployment, an operator must verify account <account-id>/us-east-1,
 match the immutable S3 artifact ObjectVersion and ZIP SHA to the reviewed manifest,
 and independently review the exact template change set. The template records
 ArtifactSha256 but CloudFormation does not verify it. Never treat a parameter
@@ -33,8 +33,8 @@ value as proof of uploaded bytes. No deploy command is authorized by this docume
 ## Database and generation
 
 The one secret is JSON with exactly `hoopdb_url`. It must use session pooler
-`aws-0-us-east-1.pooler.supabase.com:5432/postgres`, project pyamkrhoyszgzirqqffq,
-and dedicated `bulls96_session_ingest.pyamkrhoyszgzirqqffq` login. The runtime pins
+`aws-0-us-east-1.pooler.supabase.com:5432/postgres`, project <supabase-project>,
+and dedicated `bulls96_session_ingest.<supabase-project>` login. The runtime pins
 CA/hostname, rejects arbitrary URL options and owner credentials, and verifies both
 current_user/session_user. Pool max2; connect<=1s; operation statement/lock<=1.8s;
 global job budget45s/default, <=50s. Cancellation uses the reviewed job-owned
@@ -113,6 +113,10 @@ The reviewed template fixes RoleName to `96bulls-sessions-prod-buffered-gc` so e
 The operator proposal preserves existing principals/statements, denies this GC role any deletion outside buffered storage and all plain DeleteObject, and grants data cryptography only via S3/account/object-prefix context. Re-read and compare exact semantic preimage hashes before applying; stop on drift. Create the default-off role first; do not enable/admit while policies or transport proof are missing. AWS Access Analyzer accepted the v3 KMS policy without findings; the v3 bucket policy has the documented shorter-prefix warning on the specific canonical-prefix deny. CloudFormation validate-template accepted the named-role template. These checks do not establish effective live permission.
 
 The existing transcript-store K-45 objective is immediate logical deletion and physical purge within 48 hours; it does not impose a waiting canary. The owned capacity case now creates 20 acknowledged batches with 500 records/groups each through the actual producer, then checks the default claim scans all 20 inside its 1.8 second metadata budget. Root measured 305 ms on owned PostgreSQL17/Node24/MinIO (106 S3 requests across 14 groups, about 299 MiB peak RSS). This does not prove production latency, sustained arrival capacity or the physical purge objective. Review actual backlog/throughput and retain active GC while admission closes.
+
+### Claim timeout correction (2026-11-05)
+
+From about 06Z on 2026-11-05 the production function failed every run with `buffered_gc_sql_57014`. The `sql_` prefix comes only from the SQL ledger, and `bufferedGcTick` defers collect-phase `sql_57014`, so the error that escaped was the claim RPC. `ingest_buffer_gc_claim` scans `4*limit` candidates (20 at the template's limit of 5). For each candidate it does the full retention computation in one statement: two original-record normalizations of up to 500 records, plus the ACK-decision and native-slot joins. The job caps that statement at 1.8 s. A healthy backlog of 500-record batches costs about 25 ms per candidate on owned PG17, about 490 ms for 20. That cost grows linearly with the candidate count and slower hosts multiply it. The timeout also rolls back every `gc_checked_at` rotation, so the next run rescans the same head of the queue and fails again. The tick now makes `limit` single-ticket claims. Each claim scans at most four candidates and commits its rotation. Per-tick coverage (`4*limit` candidates), the ticket bound, lease semantics and SQL are unchanged, and any claim error still fails the tick. This change has no schema change, so it does not change the compiled generation. `buffered-gc-claim-budget.postgres.test.ts` reproduces the stuck `claim(5)` against the actual lazy-current producer and shows that the tick makes progress under the same bounded executor and budget.
 
 Ordered dual-control epoch/version/digest contract: [ordered-ingest-controls.md](ordered-ingest-controls.md).
 

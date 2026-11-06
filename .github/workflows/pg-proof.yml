@@ -12,7 +12,7 @@ permissions:
 jobs:
   real-postgres:
     name: real PostgreSQL ${{ matrix.pg }}
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -100,7 +100,7 @@ jobs:
 
   brief-postgres:
     name: brief publication PostgreSQL ${{ matrix.pg }}
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -141,7 +141,7 @@ jobs:
         run: bun test src/session-pipeline/__tests__/brief-documents.postgres.test.ts
   consumer-lease:
     name: canonical consumer lease proof (PG ${{ matrix.pg }})
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -168,7 +168,9 @@ jobs:
         env:
           PROOF_DISPOSABLE: "1"
         run: |
-          set -o pipefail
-          bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |
-            tee consumer-lease-pg${{ matrix.pg }}.log
-          grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}.log
+          set -euo pipefail
+          for scheme in legacy-prefix-v1 scope-v1; do
+            PROOF_PARTITION_SCHEME="$scheme" bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |
+              tee consumer-lease-pg${{ matrix.pg }}-$scheme.log
+            grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}-$scheme.log
+          done
