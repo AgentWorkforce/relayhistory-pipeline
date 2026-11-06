@@ -1,0 +1,20 @@
+{
+  "name": "96bulls-amp-transport",
+  "account_id": "f7232cb80f6fab86a95426302af243e4",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "amp-transport.agentrelay.com", "custom_domain": true }],
+  "containers": [{
+    "class_name": "AmpTransport",
+    "image": "__APPROVED_IMAGE_DIGEST_REQUIRED__",
+    "instance_type": "basic",
+    "max_instances": 1
+  }],
+  "durable_objects": {
+    "bindings": [{ "name": "AMP_TRANSPORT", "class_name": "AmpTransport" }]
+  },
+  "exports": { "AmpTransport": { "type": "durable-object", "storage": "sqlite" } }
+}
