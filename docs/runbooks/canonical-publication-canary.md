@@ -8,21 +8,22 @@ frontier write, or read-path switch.
 
 The canary admits one exact organization/workspace and a complete plan of at
 most eight stage tokens. The plan fixes its owner, expiry (at most 24 hours),
-schema generation, object target, stage hashes and byte counts, and record,
-session, time, request and byte budgets. `publication-canary.ts` inspects the
-entire plan before its first claim. An out-of-scope stage must be returned as an
-explicit `outside_canary_tenant` hold; an authority that calls it eligible is
-refused, vetoes every claim in that plan, and is never claimed.
+schema generation, object target, stage user/origin/hash/byte evidence, and
+record, session, time, request and byte budgets. `publication-canary.ts`
+inspects the entire plan before its first claim. An out-of-scope stage must be
+returned as an explicit `outside_canary_tenant` hold; an authority that calls
+it eligible is refused, vetoes every claim in that plan, and is never claimed.
 
 Every in-scope claim must atomically recheck the inspected evidence and bind the
 exact `(owner_id, plan_id, plan_digest, stage_token, evidence_digest)` tuple
 before returning the ordinary trusted publication ticket. The wrapper runs the
 existing publisher and its source/head/pointer CAS. It reuses the normal RPC
-ticket parser, then independently checks tenant, stage, generation, stage key,
-head prefixes and plan counts. The object-store view can read only the exact
-stage and attested prior-session namespaces, write only the attested workspace
-paths in ticket-authorized generations, and cannot list, delete or presign. Any
-limit or trust mismatch is a refusal, never a truncated success.
+ticket parser, then independently checks org/workspace/user/origin, stage,
+generation, stage key, head prefixes and plan counts. The object-store view can
+read only the exact stage and attested prior-session namespaces, write only the
+attested workspace paths in ticket-authorized generations, and cannot list,
+delete or presign. Any limit or trust mismatch is a refusal, never a truncated
+success.
 
 Outcomes are appended to a SHA-256-chained, fsync-backed metadata ledger. The
 ledger is single-writer, rejects symlinks, torn tails, changed plans and changed

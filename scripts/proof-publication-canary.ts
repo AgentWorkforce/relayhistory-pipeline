@@ -125,8 +125,8 @@ try {
     };
     const result = await deliverBatch({ ledger, target: { store, keyRoot: "96bulls" }, acceptanceMode: "buffered" }, tenant, batch);
     yes(result.outcome === "accepted_buffered", "buffered_ack");
-    const found = await owner.query("SELECT s.stage_token::text,stage_sha256,stage_bytes::int FROM sessions.ingest_stage_intents s JOIN sessions.ingest_buffer_outbox o ON o.active_stage_token=s.stage_token WHERE o.org_id=$1 AND o.batch_id=$2", [tenant.orgId, batch.batch_id]);
-    return { stageToken: found.rows[0].stage_token, tenant: { orgId: tenant.orgId, workspaceId: tenant.workspaceId }, sha256: found.rows[0].stage_sha256, bytes: found.rows[0].stage_bytes } satisfies PublicationCanaryStage;
+    const found = await owner.query("SELECT s.stage_token::text,s.user_id,s.origin_id,stage_sha256,stage_bytes::int FROM sessions.ingest_stage_intents s JOIN sessions.ingest_buffer_outbox o ON o.active_stage_token=s.stage_token WHERE o.org_id=$1 AND o.batch_id=$2", [tenant.orgId, batch.batch_id]);
+    return { stageToken: found.rows[0].stage_token, tenant: { orgId: tenant.orgId, workspaceId: tenant.workspaceId }, userId: found.rows[0].user_id, originId: found.rows[0].origin_id, sha256: found.rows[0].stage_sha256, bytes: found.rows[0].stage_bytes } satisfies PublicationCanaryStage;
   }
   await admit(tenantA); await admit(tenantB);
   await initializeFixtureSeatClock(owner as never, expected);
@@ -141,10 +141,10 @@ try {
   const planDigest = publicationCanaryPlanDigest(plan);
   await owner.query("CREATE TABLE sessions.proof_publication_canary_bindings(plan_id uuid,owner_id text,plan_digest text,stage_token uuid UNIQUE,evidence_digest text,created_at timestamptz DEFAULT clock_timestamp())");
   const inspectStage = async (token: string) => {
-    const found = await owner.query("SELECT stage_token::text,org_id,workspace_id,stage_sha256,stage_bytes::int FROM sessions.ingest_stage_intents WHERE stage_token=$1", [token]);
+    const found = await owner.query("SELECT stage_token::text,org_id,workspace_id,user_id,origin_id,stage_sha256,stage_bytes::int FROM sessions.ingest_stage_intents WHERE stage_token=$1", [token]);
     yes(found.rows.length === 1, "inspection_missing");
     const row = found.rows[0];
-    const value: PublicationCanaryStage = { stageToken: row.stage_token, tenant: { orgId: row.org_id, workspaceId: row.workspace_id }, sha256: row.stage_sha256, bytes: row.stage_bytes };
+    const value: PublicationCanaryStage = { stageToken: row.stage_token, tenant: { orgId: row.org_id, workspaceId: row.workspace_id }, userId: row.user_id, originId: row.origin_id, sha256: row.stage_sha256, bytes: row.stage_bytes };
     return { value, digest: createHash("sha256").update(JSON.stringify(value)).digest("hex") };
   };
   const authority: PublicationCanaryAuthority = {
@@ -158,9 +158,9 @@ try {
       signal.throwIfAborted();
       try {
         await owner.query("BEGIN");
-        const locked = await owner.query("SELECT stage_token::text,org_id,workspace_id,stage_sha256,stage_bytes::int FROM sessions.ingest_stage_intents WHERE stage_token=$1 FOR SHARE", [input.stageToken]);
+        const locked = await owner.query("SELECT stage_token::text,org_id,workspace_id,user_id,origin_id,stage_sha256,stage_bytes::int FROM sessions.ingest_stage_intents WHERE stage_token=$1 FOR SHARE", [input.stageToken]);
         yes(locked.rows.length === 1, "claim_missing");
-        const row = locked.rows[0], value: PublicationCanaryStage = { stageToken: row.stage_token, tenant: { orgId: row.org_id, workspaceId: row.workspace_id }, sha256: row.stage_sha256, bytes: row.stage_bytes };
+        const row = locked.rows[0], value: PublicationCanaryStage = { stageToken: row.stage_token, tenant: { orgId: row.org_id, workspaceId: row.workspace_id }, userId: row.user_id, originId: row.origin_id, sha256: row.stage_sha256, bytes: row.stage_bytes };
         const digest = createHash("sha256").update(JSON.stringify(value)).digest("hex");
         yes(input.planId === plan.planId && input.ownerId === plan.ownerId && input.planDigest === planDigest && digest === input.evidenceDigest, "claim_binding");
         await owner.query("INSERT INTO sessions.proof_publication_canary_bindings(plan_id,owner_id,plan_digest,stage_token,evidence_digest)VALUES($1,$2,$3,$4,$5)", [input.planId, input.ownerId, input.planDigest, input.stageToken, input.evidenceDigest]);

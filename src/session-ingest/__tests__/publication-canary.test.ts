@@ -22,12 +22,16 @@ import type {
 const IN = {
   stageToken: "11111111-1111-1111-1111-111111111111",
   tenant: { orgId: "org-a", workspaceId: "ws-a" },
+  userId: "user-a",
+  originId: "origin-a",
   sha256: "a".repeat(64),
   bytes: 128,
 } satisfies PublicationCanaryStage;
 const OUT = {
   stageToken: "22222222-2222-2222-2222-222222222222",
   tenant: { orgId: "org-b", workspaceId: "ws-b" },
+  userId: "user-b",
+  originId: "origin-b",
   sha256: "b".repeat(64),
   bytes: 256,
 } satisfies PublicationCanaryStage;
@@ -70,8 +74,8 @@ function ticket(stage = IN): PublicationTicket {
     stageToken: stage.stageToken,
     stageVersion: "1",
     outboxVersion: "1",
-    tenant: { ...stage.tenant, userId: "user-a" },
-    originId: "origin-a",
+    tenant: { ...stage.tenant, userId: stage.userId },
+    originId: stage.originId,
     batchId: "batch-a",
     batchDigest: "d".repeat(64),
     claimToken: "55555555-5555-5555-5555-555555555555",
@@ -232,6 +236,30 @@ test("abandons a mismatched trusted ticket before constructing a store or readin
   expect(stores).toBe(0);
   expect(f.calls).toContain("abandon");
   expect(f.calls).not.toContain("publish");
+});
+
+test("refuses a trusted ticket with a different user or origin before object access", async () => {
+  const valid = ticket(IN);
+  for (const changed of [
+    { ...valid, tenant: { ...valid.tenant, userId: "other-user" } },
+    { ...valid, originId: "other-origin" },
+  ]) {
+    const f = fixture();
+    f.authority.claim = async (input) => ({ binding: input, ticket: changed });
+    let stores = 0;
+    const result = await runPublicationCanary(plan([IN]), {
+      authority: f.authority,
+      rpc: f.rpc,
+      store: () => {
+        stores++;
+        return f.raw;
+      },
+      outcomes: f.outcomes,
+    });
+    expect(result.refused).toBe(1);
+    expect(stores).toBe(0);
+    expect(f.calls).toContain("abandon");
+  }
 });
 
 test("a durable prior outcome resumes without another inspect or claim", async () => {

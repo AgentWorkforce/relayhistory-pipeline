@@ -34,6 +34,8 @@ export interface PublicationCanaryTenant {
 export interface PublicationCanaryStage {
   stageToken: string;
   tenant: PublicationCanaryTenant;
+  userId: string;
+  originId: string;
   sha256: string;
   bytes: number;
 }
@@ -158,6 +160,8 @@ const sameTenant = (a: PublicationCanaryTenant, b: PublicationCanaryTenant) =>
 const sameStage = (a: PublicationCanaryStage, b: PublicationCanaryStage) =>
   a.stageToken === b.stageToken &&
   sameTenant(a.tenant, b.tenant) &&
+  a.userId === b.userId &&
+  a.originId === b.originId &&
   a.sha256 === b.sha256 &&
   a.bytes === b.bytes;
 const sameBinding = (a: PublicationCanaryBinding, b: PublicationCanaryBinding) =>
@@ -242,6 +246,8 @@ export function assertPublicationCanaryPlan(
       seen.has(stage.stageToken) ||
       !safeId(stage.tenant?.orgId) ||
       !safeId(stage.tenant?.workspaceId) ||
+      !safeId(stage.userId) ||
+      !safeId(stage.originId) ||
       !HEX.test(stage.sha256) ||
       !boundedInt(stage.bytes, 1, MAX_STAGE_BYTES)
     )
@@ -283,6 +289,8 @@ function ticketMatches(
     ticket.stage.bytes === stage.bytes &&
     sameTenant(ticket.tenant, plan.tenant) &&
     sameTenant(ticket.tenant, stage.tenant) &&
+    ticket.tenant.userId === stage.userId &&
+    ticket.originId === stage.originId &&
     ticket.records.length <= plan.limits.maxRecordsPerStage &&
     ticket.heads.length <= plan.limits.maxSessionsPerStage &&
     ticket.stage.key.startsWith(
