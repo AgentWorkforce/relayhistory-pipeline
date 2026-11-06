@@ -92,6 +92,11 @@ export interface FrontierExportRoot {
   versioning: "Enabled" | "Disabled" | "Unknown";
 }
 
+export interface FrontierExportBinding {
+  exportRootSha256: string;
+  recordsSha256: string;
+}
+
 export interface FrontierRecordMaximum {
   tenant: FrontierTenant;
   recordId: string;
@@ -169,6 +174,7 @@ export type FrontierHoldReason =
   | "tenant_mismatch"
   | "unknown_legacy_fact"
   | "export_not_immutable"
+  | "export_binding_missing"
   | "record_coverage_incomplete"
   | "record_conflict"
   | "receipt_decision_conflict";
@@ -227,6 +233,21 @@ export const frontierCaptureId = (capture: CanonicalFrontierCapture): string => 
 
 export function frontierExportRootSha256(root: FrontierExportRoot): string {
   return frontierSha256(root);
+}
+
+type FrontierExportMember = Pick<FrontierRecordMaximum,
+  "tenant" | "recordId" | "revision" | "source" | "sessionId" | "operation">;
+export function frontierExportRecordsSha256(records: FrontierExportMember[]): string {
+  const projected = records.map(record => ({
+    tenant: record.tenant,
+    recordId: record.recordId,
+    revision: record.revision,
+    source: record.source,
+    sessionId: record.sessionId,
+    operation: record.operation,
+  }));
+  return frontierSha256(sorted(projected, (a, b) =>
+    textOrder(frontierCanonicalJson([identityKey(a.tenant), a.recordId]), frontierCanonicalJson([identityKey(b.tenant), b.recordId]))));
 }
 
 export function frontierScanItems(kind: FrontierScanKind, value: CanonicalFrontierCapture | FrontierOriginCapture): unknown {
@@ -325,7 +346,13 @@ function hold(captureId: string | null, findings: Findings): FrontierHold {
   };
 }
 
-function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, options: { now?: Date } = {}): FrontierReadiness {
+export interface EvaluateCanonicalFrontierOptions {
+  now?: Date;
+  /** Trusted output of the verified root adapter; never copied from capture JSON. */
+  exportBindings?: FrontierExportBinding[];
+}
+
+function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, options: EvaluateCanonicalFrontierOptions = {}): FrontierReadiness {
   const findings: Findings = { reasons: new Set(), missing: new Set() };
   if (!captureShape(capture)) {
     finding(findings, "capture_invalid", "capture.shape");
@@ -337,6 +364,15 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
   const validUntilMs = capturedAt + FRONTIER_MAX_AGE_SECONDS * 1000;
   if (!Number.isFinite(now) || now < capturedAt - 30_000 || now >= validUntilMs || capturedAt - captureStartedAt > FRONTIER_MAX_AGE_SECONDS * 1000) finding(findings, "capture_stale", "capture.capturedAt");
   if (capture.captureId !== frontierCaptureId(capture)) finding(findings, "scan_hash_mismatch", "capture.captureId");
+  const exportBindings = new Map<string, FrontierExportBinding>();
+  for (const [index, binding] of (options.exportBindings ?? []).entries()) {
+    if (!HEX64.test(binding?.exportRootSha256 ?? "") || !HEX64.test(binding?.recordsSha256 ?? "") || exportBindings.has(binding.exportRootSha256)) {
+      finding(findings, "export_binding_missing", `exportBindings[${index}]`);
+      continue;
+    }
+    exportBindings.set(binding.exportRootSha256, binding);
+  }
+  const usedBindings = new Set<string>();
 
   const expected = sorted(capture.expectedOrigins, originIdentityOrder);
   if (new Set(expected.map(frontierCanonicalJson)).size !== expected.length || expected.some(o => !validId(o.userId) || !validId(o.originId))) finding(findings, "capture_invalid", "capture.expectedOrigins");
@@ -377,29 +413,45 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
     for (const [rootIndex, root] of sorted(origin.exportRoots ?? [], exportOrder).entries()) {
       const rootPath = `${path}.exportRoots[${rootIndex}]`;
       if (!exactTenant(root.tenant, tenant)) finding(findings, "tenant_mismatch", `${rootPath}.tenant`);
-      if (root.provider !== "s3" || !["legacy-export", "buffered-stage"].includes(root.kind) || root.versioning !== "Enabled" || root.inventoryComplete !== true || !validText(root.versionId, 1024) || !HEX64.test(root.contentSha256) || !validDecimal(root.manifestRevision, false) || !nonNegative(root.recordCount) || !validText(root.bucket, 255) || !validText(root.keyRoot, 1024) || !validText(root.manifestKey, 1024) || !validId(root.source) || !validId(root.sessionId) || !validId(root.machineId) || !(root.manifestKey === root.keyRoot || root.manifestKey.startsWith(`${root.keyRoot}/`))) finding(findings, "export_not_immutable", rootPath);
+      if (root.provider !== "s3" || !["legacy-export", "buffered-stage"].includes(root.kind) || root.versioning !== "Enabled" || root.inventoryComplete !== true || !validText(root.versionId, 1024) || root.versionId === "null" || !HEX64.test(root.contentSha256) || !validDecimal(root.manifestRevision, false) || !nonNegative(root.recordCount) || !validText(root.bucket, 255) || !validText(root.keyRoot, 1024) || !validText(root.manifestKey, 1024) || !validId(root.source) || !validId(root.sessionId) || !validId(root.machineId) || !(root.manifestKey === root.keyRoot || root.manifestKey.startsWith(`${root.keyRoot}/`))) finding(findings, "export_not_immutable", rootPath);
       const digest = frontierExportRootSha256(root);
       if (rootHashes.has(digest)) finding(findings, "record_conflict", `${rootPath}.duplicate`);
+      if (!exportBindings.has(digest)) finding(findings, "export_binding_missing", `${rootPath}.binding`);
+      else usedBindings.add(digest);
       rootHashes.set(digest, root);
     }
 
     const maxima = sorted(origin.recordMaxima ?? [], recordOrder);
     const maximaById = new Map<string, FrontierRecordMaximum>();
     const coveredByRoot = new Map<string, number>();
+    const recordsByRoot = new Map<string, FrontierRecordMaximum[]>();
     for (const [recordIndex, record] of maxima.entries()) {
       const recordPath = `${path}.recordMaxima[${recordIndex}]`;
       if (!exactTenant(record.tenant, tenant)) finding(findings, "tenant_mismatch", `${recordPath}.tenant`);
       if (!validId(record.recordId) || !validDecimal(record.revision, false) || !validId(record.revisionId) || !HEX64.test(record.digest ?? "") || !validId(record.source) || (record.sessionId !== null && !validId(record.sessionId)) || !["upsert", "delete"].includes(record.operation ?? "") || !["seed-proof", "receipt-seat"].includes(record.authority ?? "") || !HEX64.test(record.exportRootSha256 ?? "")) finding(findings, "unknown_legacy_fact", recordPath);
       if (maximaById.has(record.recordId)) finding(findings, "record_conflict", `${recordPath}.recordId`);
       maximaById.set(record.recordId, record);
-      if (!rootHashes.has(record.exportRootSha256 ?? "")) finding(findings, "record_coverage_incomplete", `${recordPath}.exportRootSha256`);
-      else coveredByRoot.set(record.exportRootSha256!, (coveredByRoot.get(record.exportRootSha256!) ?? 0) + 1);
+      const root = rootHashes.get(record.exportRootSha256 ?? "");
+      if (!root) finding(findings, "record_coverage_incomplete", `${recordPath}.exportRootSha256`);
+      else {
+        coveredByRoot.set(record.exportRootSha256!, (coveredByRoot.get(record.exportRootSha256!) ?? 0) + 1);
+        const members = recordsByRoot.get(record.exportRootSha256!) ?? [];
+        members.push(record); recordsByRoot.set(record.exportRootSha256!, members);
+        if (record.source !== root.source || record.sessionId !== root.sessionId)
+          finding(findings, "record_coverage_incomplete", `${recordPath}.rootNamespace`);
+      }
     }
     if (origin.sourceRecordCount !== maxima.length) finding(findings, "record_coverage_incomplete", `${path}.sourceRecordCount`);
-    for (const [rootDigest, root] of rootHashes) if ((coveredByRoot.get(rootDigest) ?? 0) !== root.recordCount) finding(findings, "record_coverage_incomplete", `${path}.exportRoots.${root.manifestKey}.recordCount`);
+    for (const [rootDigest, root] of rootHashes) {
+      if ((coveredByRoot.get(rootDigest) ?? 0) !== root.recordCount) finding(findings, "record_coverage_incomplete", `${path}.exportRoots.${root.manifestKey}.recordCount`);
+      const binding = exportBindings.get(rootDigest);
+      if (binding && binding.recordsSha256 !== frontierExportRecordsSha256(recordsByRoot.get(rootDigest) ?? []))
+        finding(findings, "record_coverage_incomplete", `${path}.exportRoots.${root.manifestKey}.recordsSha256`);
+    }
 
     const decisions = sorted(origin.receiptDecisions ?? [], decisionOrder);
     const accepted = new Map<string, FrontierReceiptDecision>();
+    const seats = new Map<string, string>();
     const decisionKeys = new Set<string>();
     for (const [decisionIndex, decision] of decisions.entries()) {
       const decisionPath = `${path}.receiptDecisions[${decisionIndex}]`;
@@ -408,6 +460,9 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
       const decisionKey = frontierCanonicalJson([decision.recordId, decision.revision, decision.revisionId, decision.candidateDigest]);
       if (decisionKeys.has(decisionKey)) finding(findings, "receipt_decision_conflict", `${decisionPath}.duplicate`);
       decisionKeys.add(decisionKey);
+      const priorSeat = seats.get(decision.recordId);
+      if (priorSeat !== undefined && priorSeat !== decision.seat) finding(findings, "receipt_decision_conflict", `${decisionPath}.seat`);
+      else seats.set(decision.recordId, decision.seat);
       const maximum = maximaById.get(decision.recordId);
       if (!maximum || maximum.authority !== "receipt-seat" || decision.revision !== maximum.revision || decision.firstDigest !== maximum.digest) finding(findings, "receipt_decision_conflict", `${decisionPath}.maximum`);
       if (decision.bodyAccepted) {
@@ -428,6 +483,10 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
       authority: origin.closing,
       scans: sorted(origin.scans ?? [], (a, b) => textOrder(a.kind, b.kind)),
       exportRoots: sorted(origin.exportRoots ?? [], exportOrder),
+      exportBindings: [...rootHashes.keys()].sort().flatMap(digest => {
+        const binding = exportBindings.get(digest);
+        return binding ? [binding] : [];
+      }),
     };
     const recordFrontier = {
       protocol: FRONTIER_CAPTURE_PROTOCOL,
@@ -451,8 +510,11 @@ function evaluateCanonicalFrontierUnsafe(capture: CanonicalFrontierCapture, opti
     });
   }
 
+  for (const digest of exportBindings.keys()) if (!usedBindings.has(digest)) finding(findings, "export_binding_missing", `exportBindings.${digest}`);
+
   if (findings.reasons.size) return hold(capture.captureId, findings);
-  const evidenceSha256 = frontierSha256(capture);
+  const orderedBindings = [...exportBindings.values()].sort((a, b) => textOrder(a.exportRootSha256, b.exportRootSha256));
+  const evidenceSha256 = frontierSha256({ capture, exportBindings: orderedBindings });
   const base = {
     protocol: FRONTIER_PLAN_PROTOCOL,
     status: "ready" as const,
@@ -471,7 +533,7 @@ function originsAuthority(origins: FrontierOriginCapture[], edge: "opening" | "c
 }
 
 /** Malformed untrusted JSON is a deterministic hold, never an evaluator crash. */
-export function evaluateCanonicalFrontier(capture: CanonicalFrontierCapture, options: { now?: Date } = {}): FrontierReadiness {
+export function evaluateCanonicalFrontier(capture: CanonicalFrontierCapture, options: EvaluateCanonicalFrontierOptions = {}): FrontierReadiness {
   try { return evaluateCanonicalFrontierUnsafe(capture, options); }
   catch {
     const findings: Findings = { reasons: new Set(["capture_invalid"]), missing: new Set(["capture.shape"]) };

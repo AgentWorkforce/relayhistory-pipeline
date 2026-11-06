@@ -76,9 +76,9 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
         { async query() { return { rows: [{ r: seedCapture }] } as never; } },
         { store, reader: manifestReader, bucket: bucket!, provider: "s3", prefixFor: org => `${keyRoot}/${org}`,
           decompress: (bytes, max) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: max })) },
-        createS3FrontierVersioningReader({ endpoint: endpoint!, region: "us-east-1", credentials: { accessKeyId: accessKeyId!, secretAccessKey: secretAccessKey! } }),
+        createS3FrontierVersioningReader({ endpoint: endpoint!, allowInsecureLoopbackFixture: true, region: "us-east-1", credentials: { accessKeyId: accessKeyId!, secretAccessKey: secretAccessKey! } }),
         { tenant, generation: "a".repeat(64), sourceHead: "b".repeat(40), source: pointer.harness, sessionId: pointer.session_id,
-          keyRoot: `${keyRoot}/${tenant.orgId}`, cachePath: join(cacheDirectory, "frontier.sqlite") },
+          keyRoot: `${keyRoot}/${tenant.orgId}`, cachePath: join(cacheDirectory, "frontier.sqlite"), maxRecords: 100, maxEvidenceBytes: 1024 * 1024, deadlineMs: 20_000 },
       );
       expect(evidence).toMatchObject({ pointerCount: 1, recordCount: 1, roots: [{ versioning: "Enabled", inventoryComplete: true }] });
       const root = evidence.roots[0]!;
@@ -149,22 +149,22 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
 
       const full = await capture();
       const now = new Date("2026-11-06T04:00:05.000Z");
-      const first = evaluateCanonicalFrontier(full, { now });
-      const retry = evaluateCanonicalFrontier(structuredClone(full), { now });
+      const first = evaluateCanonicalFrontier(full, { now, exportBindings: evidence.bindings });
+      const retry = evaluateCanonicalFrontier(structuredClone(full), { now, exportBindings: evidence.bindings });
       expect(first).toEqual(retry);
       expect(first).toMatchObject({ status: "ready", frontiers: [{ org_id: tenant.orgId, origin_id: tenant.originId }] });
-      expect(evaluateCanonicalFrontier(full, { now: new Date("2026-11-06T04:20:00.000Z") })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["capture_stale"]) });
+      expect(evaluateCanonicalFrontier(full, { now: new Date("2026-11-06T04:20:00.000Z"), exportBindings: evidence.bindings })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["capture_stale"]) });
 
       const incomplete = structuredClone(full);
       incomplete.origins[0]!.scans[0]!.complete = false; incomplete.origins[0]!.scans[0]!.terminalCursor = "bounded-stop";
       incomplete.captureId = frontierCaptureId(incomplete);
-      expect(evaluateCanonicalFrontier(incomplete, { now })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["scan_incomplete"]) });
+      expect(evaluateCanonicalFrontier(incomplete, { now, exportBindings: evidence.bindings })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["scan_incomplete"]) });
 
       const unknown = structuredClone(full);
       unknown.origins[0]!.recordMaxima[0]!.revision = null;
       unknown.origins[0]!.scans.find(scan => scan.kind === "record-maxima")!.itemsSha256 = frontierScanItemsSha256("record-maxima", unknown.origins[0]!);
       unknown.captureId = frontierCaptureId(unknown);
-      expect(evaluateCanonicalFrontier(unknown, { now })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["unknown_legacy_fact"]) });
+      expect(evaluateCanonicalFrontier(unknown, { now, exportBindings: evidence.bindings })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["unknown_legacy_fact"]) });
 
       const overlap = structuredClone(full);
       const maximum = overlap.origins[0]!.recordMaxima[0]!; maximum.authority = "receipt-seat";
@@ -177,22 +177,22 @@ describe.skipIf(!enabled)("frontier capture on real PostgreSQL 17 and versioned 
       receiptScan.itemCount = 2; receiptScan.pagesRead = 3; receiptScan.checkpointCount = 2;
       receiptScan.itemsSha256 = frontierScanItemsSha256("receipt-decisions", overlap.origins[0]!);
       overlap.captureId = frontierCaptureId(overlap);
-      expect(evaluateCanonicalFrontier(overlap, { now })).toMatchObject({ status: "ready" });
+      expect(evaluateCanonicalFrontier(overlap, { now, exportBindings: evidence.bindings })).toMatchObject({ status: "ready" });
       overlap.origins[0]!.receiptDecisions[1]!.bodyAccepted = true;
       overlap.origins[0]!.receiptDecisions[1]!.firstDigest = overlap.origins[0]!.receiptDecisions[1]!.candidateDigest;
       receiptScan.itemsSha256 = frontierScanItemsSha256("receipt-decisions", overlap.origins[0]!);
       overlap.captureId = frontierCaptureId(overlap);
-      expect(evaluateCanonicalFrontier(overlap, { now })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["receipt_decision_conflict"]) });
+      expect(evaluateCanonicalFrontier(overlap, { now, exportBindings: evidence.bindings })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["receipt_decision_conflict"]) });
 
       const raced = await capture(async () => { await pool.query(`UPDATE ${schema}.authority SET privacy_version=20`); });
-      expect(evaluateCanonicalFrontier(raced, { now })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["source_race", "privacy_changed"]) });
+      expect(evaluateCanonicalFrontier(raced, { now, exportBindings: evidence.bindings })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["source_race", "privacy_changed"]) });
       await pool.query(`UPDATE ${schema}.authority SET privacy_version=19`);
 
       const foreign = await capture();
       foreign.origins[0]!.exportRoots[0]!.tenant.workspaceId = "foreign-workspace";
       foreign.origins[0]!.scans.find(scan => scan.kind === "export-roots")!.itemsSha256 = frontierScanItemsSha256("export-roots", foreign.origins[0]!);
       foreign.captureId = frontierCaptureId(foreign);
-      expect(evaluateCanonicalFrontier(foreign, { now })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["tenant_mismatch"]) });
+      expect(evaluateCanonicalFrontier(foreign, { now, exportBindings: evidence.bindings })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["tenant_mismatch"]) });
     } finally {
       await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
       await pool.end();

@@ -7,11 +7,13 @@ import {
   FRONTIER_CAPTURE_PROTOCOL,
   evaluateCanonicalFrontier,
   frontierCaptureId,
+  frontierExportRecordsSha256,
   frontierExportRootSha256,
   frontierScanItemsSha256,
   frontierSha256,
   type CanonicalFrontierCapture,
   type FrontierAuthority,
+  type FrontierExportBinding,
   type FrontierOriginCapture,
   type FrontierScanEvidence,
   type FrontierScanKind,
@@ -126,11 +128,21 @@ function refreshOriginHashes(capture: CanonicalFrontierCapture): void {
   }
 }
 
+function bindingsFor(capture: CanonicalFrontierCapture): FrontierExportBinding[] {
+  return capture.origins.flatMap(origin => origin.exportRoots.map(root => {
+    const exportRootSha256 = frontierExportRootSha256(root);
+    const records = origin.recordMaxima.filter(record => record.exportRootSha256 === exportRootSha256);
+    return { exportRootSha256, recordsSha256: frontierExportRecordsSha256(records) };
+  }));
+}
+const evaluate = (capture: CanonicalFrontierCapture, now = NOW, exportBindings = bindingsFor(capture)) =>
+  evaluateCanonicalFrontier(capture, { now, exportBindings });
+
 describe("canonical frontier read-only planner", () => {
   test("full immutable coverage produces deterministic 040600 rows and accepts a losing equal-revision body", () => {
     const capture = readyCapture();
-    const one = evaluateCanonicalFrontier(capture, { now: NOW });
-    const two = evaluateCanonicalFrontier(structuredClone(capture), { now: NOW });
+    const one = evaluate(capture);
+    const two = evaluate(structuredClone(capture));
     expect(one).toEqual(two);
     expect(one.status).toBe("ready");
     if (one.status !== "ready") throw new Error("expected ready");
@@ -147,29 +159,29 @@ describe("canonical frontier read-only planner", () => {
     incomplete.origins[0]!.scans[0]!.complete = false;
     incomplete.origins[0]!.scans[0]!.terminalCursor = "more-rows";
     reseal(incomplete);
-    expect(evaluateCanonicalFrontier(incomplete, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["scan_incomplete"]) });
+    expect(evaluate(incomplete)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["scan_incomplete"]) });
 
     const unknown = readyCapture();
     unknown.origins[0]!.recordMaxima[0]!.revision = null;
     refreshOriginHashes(unknown); reseal(unknown);
-    expect(evaluateCanonicalFrontier(unknown, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["unknown_legacy_fact"]) });
+    expect(evaluate(unknown)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["unknown_legacy_fact"]) });
 
     const stale = readyCapture();
-    expect(evaluateCanonicalFrontier(stale, { now: new Date("2026-11-06T04:20:00.000Z") })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["capture_stale"]) });
+    expect(evaluate(stale, new Date("2026-11-06T04:20:00.000Z"))).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["capture_stale"]) });
   });
 
   test("source races and privacy-control changes invalidate the entire origin", () => {
     const capture = readyCapture();
     capture.origins[0]!.closing.privacyVersion = "20";
     refreshOriginHashes(capture); reseal(capture);
-    expect(evaluateCanonicalFrontier(capture, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["privacy_changed", "source_race"]) });
+    expect(evaluate(capture)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["privacy_changed", "source_race"]) });
   });
 
   test("wrong-tenant roots and records cannot be borrowed", () => {
     const capture = readyCapture();
     capture.origins[0]!.exportRoots[0]!.tenant.workspaceId = "foreign-workspace";
     refreshOriginHashes(capture); reseal(capture);
-    expect(evaluateCanonicalFrontier(capture, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["tenant_mismatch"]) });
+    expect(evaluate(capture)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["tenant_mismatch"]) });
   });
 
   test("two accepted bodies for one native record hold while a single loser remains auditable", () => {
@@ -177,7 +189,7 @@ describe("canonical frontier read-only planner", () => {
     capture.origins[0]!.receiptDecisions[0]!.bodyAccepted = true;
     capture.origins[0]!.receiptDecisions[0]!.firstDigest = capture.origins[0]!.receiptDecisions[0]!.candidateDigest;
     refreshOriginHashes(capture); reseal(capture);
-    expect(evaluateCanonicalFrontier(capture, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["receipt_decision_conflict"]) });
+    expect(evaluate(capture)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["receipt_decision_conflict"]) });
   });
 
   test("unversioned exports and incomplete record/root coverage hold", () => {
@@ -187,18 +199,56 @@ describe("canonical frontier read-only planner", () => {
     unversioned.origins[0]!.recordMaxima[1]!.exportRootSha256 = frontierExportRootSha256(unversioned.origins[0]!.exportRoots[0]!);
     expect(oldDigest).not.toBe(unversioned.origins[0]!.recordMaxima[1]!.exportRootSha256);
     refreshOriginHashes(unversioned); reseal(unversioned);
-    expect(evaluateCanonicalFrontier(unversioned, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["export_not_immutable"]) });
+    expect(evaluate(unversioned)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["export_not_immutable"]) });
 
     const missing = readyCapture();
     missing.origins[0]!.sourceRecordCount = 3;
     refreshOriginHashes(missing); reseal(missing);
-    expect(evaluateCanonicalFrontier(missing, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["record_coverage_incomplete"]) });
+    expect(evaluate(missing)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["record_coverage_incomplete"]) });
+  });
+
+  test("resealed immutable-root and receipt fabrications remain HOLD", () => {
+    const literalNull = readyCapture();
+    literalNull.origins[0]!.exportRoots[0]!.versionId = "null";
+    const oldNullRoot = literalNull.origins[0]!.recordMaxima[1]!.exportRootSha256;
+    literalNull.origins[0]!.recordMaxima[1]!.exportRootSha256 = frontierExportRootSha256(literalNull.origins[0]!.exportRoots[0]!);
+    expect(oldNullRoot).not.toBe(literalNull.origins[0]!.recordMaxima[1]!.exportRootSha256);
+    refreshOriginHashes(literalNull); reseal(literalNull);
+    expect(evaluate(literalNull)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["export_not_immutable"]) });
+
+    const wrongSession = readyCapture();
+    wrongSession.origins[0]!.exportRoots[1]!.source = "codex";
+    wrongSession.origins[0]!.exportRoots[1]!.sessionId = "unrelated-session";
+    wrongSession.origins[0]!.recordMaxima[0]!.exportRootSha256 = frontierExportRootSha256(wrongSession.origins[0]!.exportRoots[1]!);
+    refreshOriginHashes(wrongSession); reseal(wrongSession);
+    expect(evaluate(wrongSession)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["record_coverage_incomplete"]) });
+
+    const foreignNamespace = readyCapture();
+    const trustedBindings = bindingsFor(foreignNamespace);
+    foreignNamespace.origins[0]!.exportRoots[1]!.keyRoot = "exports/foreign-org";
+    foreignNamespace.origins[0]!.exportRoots[1]!.manifestKey = "exports/foreign-org/legacy/manifest.json";
+    foreignNamespace.origins[0]!.recordMaxima[0]!.exportRootSha256 = frontierExportRootSha256(foreignNamespace.origins[0]!.exportRoots[1]!);
+    refreshOriginHashes(foreignNamespace); reseal(foreignNamespace);
+    expect(evaluate(foreignNamespace, NOW, trustedBindings)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["export_binding_missing"]) });
+
+    const seatConflict = readyCapture();
+    seatConflict.origins[0]!.receiptDecisions[0]!.seat = "999";
+    refreshOriginHashes(seatConflict); reseal(seatConflict);
+    expect(evaluate(seatConflict)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["receipt_decision_conflict"]) });
+  });
+
+  test("capture JSON without trusted export bindings is never READY", () => {
+    const capture = readyCapture();
+    expect(evaluateCanonicalFrontier(capture, { now: NOW })).toMatchObject({
+      status: "hold",
+      reasons: expect.arrayContaining(["export_binding_missing"]),
+    });
   });
 
   test("capture content hash prevents post-capture mutation", () => {
     const capture = readyCapture();
     capture.target.bucket = "mutated-after-capture";
-    expect(evaluateCanonicalFrontier(capture, { now: NOW })).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["scan_hash_mismatch"]) });
+    expect(evaluate(capture)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["scan_hash_mismatch"]) });
   });
 
   test("malformed nested JSON and prototype-named keys hold without crashing or changing canonical hashes", () => {
@@ -213,7 +263,8 @@ describe("canonical frontier read-only planner", () => {
     const directory = mkdtempSync(join(tmpdir(), "frontier-cli-"));
     try {
       const evidence = join(directory, "capture.json");
-      writeFileSync(evidence, JSON.stringify(readyCapture()));
+      const capture = readyCapture();
+      writeFileSync(evidence, JSON.stringify({ capture, exportBindings: bindingsFor(capture) }));
       const script = join(import.meta.dir, "../../../scripts/canonical-frontier-plan.ts");
       const ready = spawnSync(process.execPath, [script, "--evidence", evidence, "--now", NOW.toISOString()], { encoding: "utf8" });
       expect(ready.status).toBe(0);

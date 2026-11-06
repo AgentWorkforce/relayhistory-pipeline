@@ -4,10 +4,17 @@ Status: read-only evidence evaluator and offline rehearsal. It does not scan pro
 
 ## Contract
 
-`src/session-ingest/frontier-plan.ts` consumes `canonical-publication-frontier-capture-v1` and returns a discriminated `FrontierReadiness`:
+`src/session-ingest/frontier-plan.ts` consumes `canonical-publication-frontier-capture-v1` plus the source adapter's out-of-band `FrontierExportBinding` values and returns a discriminated `FrontierReadiness`:
 
 - `status: "hold"` has stable reason codes and JSON evidence paths. A hold is the only answer for sampled, stale, unknown, changing, cross-tenant, unversioned, or incomplete evidence.
 - `status: "ready"` has one exact `CanonicalFrontierRow` per fully covered `(org, workspace, user, origin)`, plus `evidenceSha256` and `planSha256`. These are candidate plan rows, not insert authority.
+
+A resealed JSON capture is not sufficient for READY. Every immutable root needs
+the exact root hash and verified record-membership hash returned by the byte
+adapter. The evaluator checks root source/session against every linked maximum,
+rejects duplicate or absent bindings and literal S3 `"null"` versions, and
+requires all receipt contenders for a native record to share one immutable
+seat. The binding set is included in `evidenceSha256`.
 
 The row mapping is exact:
 
@@ -29,7 +36,7 @@ A reviewed read-only probe should construct the JSON capture; this repository do
 1. Read the complete origin inventory with a fixed keyset query and one page past the final row. Record the reviewed query SHA, source snapshot SHA, page/cursor-chain SHA, configured bounds, item/byte counts, and terminal `null` cursor.
 2. For each exact user/origin, read the opening source identity, generation, source commit, control epoch, privacy baseline, and privacy version. Unknown legacy values remain `null`, which produces `unknown_legacy_fact`.
 3. Read every current record maximum with a bounded resumable keyset scan. An absent destination revision row is not evidence of an empty legacy source. `sourceRecordCount` must equal the maxima count.
-4. Use `captureSeedScopeExportEvidence` from `frontier-plan-source.ts` for export evidence. It issues only the fixed preview RPC, takes two authoritative scope captures, runs every captured pointer through `SeedProofIndex`, derives the target origin's root counts from the sealed per-record index, and records the manifest version returned by the exact GET whose bytes were verified. `createS3FrontierVersioningReader` performs bounded signed `GetBucketVersioning` reads before and after the capture. The adapter refuses source changes, absent versions, non-delivery/unseeded records, foreign roots, and disabled/unknown/changing versioning. It has no caller-supplied completeness, count, version-ID, or versioning booleans.
+4. Use `captureSeedScopeExportEvidence` from `frontier-plan-source.ts` for export evidence. It issues only the fixed preview RPC, takes two authoritative scope captures, runs every captured pointer through `SeedProofIndex`, derives the target origin's root counts and membership bindings from the complete sealed per-record index, and records the manifest version returned by the exact GET whose bytes were verified. Import ACK progress is ignored for evidence enumeration. Explicit record, evidence-byte and deadline bounds fail closed. `createS3FrontierVersioningReader` performs bounded signed `GetBucketVersioning` reads before and after the capture; production is HTTPS-only, while HTTP requires an explicit loopback-fixture flag, and redirects or response-identity changes refuse. The adapter refuses source changes, absent versions, non-delivery/unseeded records, foreign roots, and disabled/unknown/changing versioning. It has no caller-supplied completeness, count, version-ID, or versioning booleans.
 5. Read ordered deletion/reset control state and the complete first-ACK receipt-seat decisions. A losing equal-revision candidate stays auditable; two accepted bodies for one native record hold.
 6. Repeat the authority read after all PostgreSQL and S3 work. Any source, generation, control, privacy, or scan-state change invalidates the entire origin. Re-run from the opening inventory; do not patch a stale capture.
 
@@ -41,7 +48,7 @@ The CLI accepts only a local JSON evidence file and an explicit clock. It has no
 
 ```sh
 bun scripts/canonical-frontier-plan.ts \
-  --evidence /absolute/path/to/reviewed-capture.json \
+  --evidence /absolute/path/to/reviewed-evidence-bundle.json \
   --now 2026-11-06T04:00:05.000Z
 ```
 
@@ -57,6 +64,7 @@ Exit `0` is a deterministic ready plan, exit `2` is an actionable hold, and exit
 | `source_race`, `privacy_changed` | Discard the capture and restart after the source/control state stabilizes. |
 | `tenant_mismatch` | Correct the scoped adapter or source ownership evidence; never borrow another workspace/user's root. |
 | `export_not_immutable` | Prove versioning and exact object version/content identity through the existing seed/manifest path. |
+| `export_binding_missing` | Re-run the verified byte adapter; capture JSON cannot supply or reconstruct a trusted root binding. |
 | `record_coverage_incomplete` | Reconcile complete source maxima to immutable roots; sampled counts and absent rows are insufficient. |
 | `record_conflict`, `receipt_decision_conflict` | Resolve native identity/first-ACK authority; no last-writer or timestamp fallback is permitted. |
 
@@ -72,7 +80,7 @@ FRONTIER_PROOF_OUT=/home/khaliqgant/relay-briefs/canonical-frontier-plan-2026110
 bun scripts/proof-canonical-frontier-plan.ts
 ```
 
-The recorded result artifact reports the exact PostgreSQL version, commit/dirty state, test count, and assertions. This proves the offline protocol path only. It does not prove the current production source inventory, source freshness, AWS bucket versioning/KMS/IAM, S3 object coverage, production privacy closure, destination readiness, worker deployment, or consumer visibility.
+The recorded result artifact reports the exact PostgreSQL version, commit/dirty state, test count, assertions, and an explicit proof qualification. The current fixture applies neither the repository migrations nor the actual managed-role `sessions.ingest_seed_scope_capture` RPC: its SQL callback returns a fixed synthetic capture and its PostgreSQL authority/maxima tables are toy schemas. It does exercise actual manifest/chunk bytes, the sealed index, signed MinIO versioning, membership bindings and a bounded toy `REPEATABLE READ READ ONLY` scan. It therefore proves only that offline protocol path. It does not prove the real seed RPC, current production source inventory, source freshness, AWS bucket versioning/KMS/IAM, S3 object coverage, production privacy closure, destination readiness, worker deployment, or consumer visibility.
 
 ## Remaining production gates
 

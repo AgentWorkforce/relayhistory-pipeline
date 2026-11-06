@@ -10,8 +10,8 @@ import type { ManifestRead, ManifestReader } from "../../packages/pipeline/src/l
 import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
 import { signRequest } from "../../packages/object-store/src/sigv4.ts";
 import { sha256Hex } from "../../packages/object-store/src/crypto.ts";
-import type { FrontierExportRoot, FrontierTenant } from "./frontier-plan.ts";
-import { frontierExportRootSha256, frontierSha256 } from "./frontier-plan.ts";
+import type { FrontierExportBinding, FrontierExportRoot, FrontierTenant } from "./frontier-plan.ts";
+import { frontierExportRecordsSha256, frontierExportRootSha256, frontierSha256 } from "./frontier-plan.ts";
 import { SeedProofIndex, type ProofDeps, type SeedEvidence, type SeedPointer } from "./seed-proof.ts";
 import type { SeedSql } from "./seed.ts";
 
@@ -45,6 +45,8 @@ export interface S3FrontierVersioningConfig {
   endpoint?: string;
   fetch?: typeof fetch;
   maxBytes?: number;
+  /** Synthetic credentials only; production HTTP endpoints are forbidden. */
+  allowInsecureLoopbackFixture?: boolean;
 }
 
 /** Signed, bounded, read-only GetBucketVersioning adapter. */
@@ -53,7 +55,9 @@ export function createS3FrontierVersioningReader(config: S3FrontierVersioningCon
   const maxBytes = config.maxBytes ?? 64 * 1024;
   if (!/^[a-z0-9-]{1,63}$/.test(config.region)) fail("frontier_versioning_region");
   const endpoint = config.endpoint === undefined ? undefined : new URL(config.endpoint);
-  if (endpoint && (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash))
+  const loopback = endpoint && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
+  if (endpoint && (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash ||
+      (endpoint.protocol === "http:" && (!config.allowInsecureLoopbackFixture || !loopback))))
     fail("frontier_versioning_endpoint");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024) fail("frontier_versioning_bound");
   return {
@@ -65,7 +69,8 @@ export function createS3FrontierVersioningReader(config: S3FrontierVersioningCon
       url.searchParams.set("versioning", "");
       const headers = new Headers();
       await signRequest({ method: "GET", url, headers, payloadSha256: await sha256Hex(new Uint8Array()), region: config.region, credentials: config.credentials });
-      const response = await doFetch(url, { method: "GET", headers, signal: AbortSignal.timeout(10_000) });
+      const response = await doFetch(url, { method: "GET", headers, redirect: "error", signal: AbortSignal.timeout(10_000) });
+      if (response.redirected || (response.url && response.url !== url.toString())) fail("frontier_versioning_identity");
       if (!response.ok) fail(`frontier_versioning_http_${response.status}`);
       const body = response.body;
       if (body === null) fail("frontier_versioning_body");
@@ -111,10 +116,14 @@ export interface CaptureSeedScopeExportInput {
   /** Caller-owned local SQLite path. No source or destination write occurs. */
   cachePath: string;
   kind?: FrontierExportRoot["kind"];
+  maxRecords: number;
+  maxEvidenceBytes: number;
+  deadlineMs: number;
 }
 
 export interface SeedScopeExportEvidence {
   roots: FrontierExportRoot[];
+  bindings: FrontierExportBinding[];
   records: Array<{ evidence: SeedEvidence; exportRootSha256: string }>;
   sourceEpoch: string;
   scopeFingerprint: string;
@@ -158,19 +167,27 @@ export async function captureSeedScopeExportEvidence(
   if (![tenant.orgId, tenant.workspaceId, tenant.userId, tenant.originId, input.source, input.sessionId].every(value => validIdentity(value, value === tenant.workspaceId)) ||
       !HEX64.test(input.generation) || !HEX40.test(input.sourceHead) || !validIdentity(input.keyRoot) ||
       input.keyRoot.split("/").some(part => part === "." || part === "..") || !validIdentity(input.cachePath) ||
+      !Number.isSafeInteger(input.maxRecords) || input.maxRecords < 0 || input.maxRecords > 10_000_000 ||
+      !Number.isSafeInteger(input.maxEvidenceBytes) || input.maxEvidenceBytes < 1 || input.maxEvidenceBytes > 256 * 1024 * 1024 ||
+      !Number.isSafeInteger(input.deadlineMs) || input.deadlineMs < 1 || input.deadlineMs > 60 * 60 * 1000 ||
       (input.kind !== undefined && input.kind !== "legacy-export" && input.kind !== "buffered-stage")) fail("frontier_seed_identity");
   if (deps.provider !== "s3" || deps.reader.provider !== "s3" || deps.reader.bucket !== deps.bucket) fail("frontier_seed_store_identity");
 
+  const deadlineAt = Date.now() + input.deadlineMs;
+  const checkDeadline = () => { if (Date.now() >= deadlineAt) fail("frontier_seed_deadline"); };
   const rpc = async (): Promise<SeedScopeCapture> => {
+    checkDeadline();
     const params = { org_id: tenant.orgId, workspace_id: tenant.workspaceId, source: input.source, session_id: input.sessionId, generation: input.generation, mode: "preview" };
     const result = await sql.query<{ r: SeedScopeCapture }>("SELECT sessions.ingest_seed_scope_capture($1::jsonb) AS r", [JSON.stringify(params)]);
     const capture = result.rows[0]?.r;
     if (!capture || result.rows.length !== 1) fail("frontier_seed_rpc_shape");
-    validateCapture(capture, input);
+    checkDeadline(); validateCapture(capture, input);
     return capture;
   };
 
+  checkDeadline();
   const openingVersioning = await versioning.read(deps.bucket);
+  checkDeadline();
   if (openingVersioning !== "Enabled") fail("frontier_seed_bucket_unversioned");
   const opening = await rpc();
   const versions = new Map<string, string>();
@@ -191,25 +208,40 @@ export async function captureSeedScopeExportEvidence(
   const index = new SeedProofIndex(input.cachePath, tenant.orgId, input.sourceHead);
   try {
     index.restartVerification();
-    for (const pointer of opening.pointers) await index.addPointer(pointer, { ...deps, reader: capturingReader });
+    let visitedRecords = 0;
+    const guard = {
+      check: checkDeadline,
+      record() { checkDeadline(); if (++visitedRecords > input.maxRecords) fail("frontier_seed_record_bound"); },
+    };
+    for (const pointer of opening.pointers) await index.addPointer(pointer, { ...deps, reader: capturingReader }, guard);
     const closing = await rpc();
     if (closing.fingerprint !== opening.fingerprint || closing.source_epoch !== opening.source_epoch) fail("frontier_seed_source_changed");
     const sealed = index.seal(closing.pointers);
     if (sealed.non_delivery_pointers !== 0 || sealed.unseeded_records !== 0) fail("frontier_seed_unknown_records");
+    checkDeadline();
     const closingVersioning = await versioning.read(deps.bucket);
+    checkDeadline();
     if (closingVersioning !== "Enabled") fail("frontier_seed_bucket_changed");
 
     const pointers = new Map(opening.pointers.map(pointer => [String(pointer.capture.pointer_id), pointer]));
-    const byPointer = new Map<string, SeedEvidence[]>();
-    for (const batch of index.batches()) for (const record of batch.records) {
+    const byPointer = new Map(opening.pointers.map(pointer => [String(pointer.capture.pointer_id), [] as SeedEvidence[]]));
+    let evidenceBytes = 0;
+    let enumeratedRecords = 0;
+    for (const batch of index.evidenceBatches()) for (const record of batch.records) {
+      checkDeadline();
+      enumeratedRecords++;
+      evidenceBytes += Buffer.byteLength(JSON.stringify(record));
+      if (evidenceBytes > input.maxEvidenceBytes) fail("frontier_seed_evidence_bound");
       if (record.org_id !== tenant.orgId || record.workspace_id !== tenant.workspaceId || record.user_id !== tenant.userId || record.origin_id !== tenant.originId) continue;
       const records = byPointer.get(record.pointer_id) ?? [];
       records.push(record);
       byPointer.set(record.pointer_id, records);
     }
     const roots: FrontierExportRoot[] = [];
+    const bindings: FrontierExportBinding[] = [];
     const evidenceRecords: Array<{ evidence: SeedEvidence; exportRootSha256: string }> = [];
     for (const pointerId of [...byPointer.keys()].sort()) {
+      checkDeadline();
       const pointer = pointers.get(pointerId);
       const records = byPointer.get(pointerId)!;
       if (pointer === undefined) fail("frontier_seed_root_identity");
@@ -224,18 +256,31 @@ export async function captureSeedScopeExportEvidence(
       };
       const rootSha256 = frontierExportRootSha256(root);
       roots.push(root);
+      bindings.push({
+        exportRootSha256: rootSha256,
+        recordsSha256: frontierExportRecordsSha256(records.map(evidence => ({
+          tenant: { orgId: evidence.org_id, workspaceId: evidence.workspace_id, userId: evidence.user_id, originId: evidence.origin_id },
+          recordId: evidence.record_id, revision: evidence.revision, source: evidence.source,
+          sessionId: evidence.session_id, operation: evidence.operation,
+        }))),
+      });
       for (const evidence of records) evidenceRecords.push({ evidence, exportRootSha256: rootSha256 });
     }
     roots.sort((a, b) => a.manifestKey < b.manifestKey ? -1 : a.manifestKey > b.manifestKey ? 1 : (a.versionId! < b.versionId! ? -1 : a.versionId! > b.versionId! ? 1 : 0));
     evidenceRecords.sort((a, b) => a.evidence.record_id < b.evidence.record_id ? -1 : a.evidence.record_id > b.evidence.record_id ? 1 : 0);
+    if (enumeratedRecords !== sealed.records || roots.length !== sealed.pointers) fail("frontier_seed_record_closure");
     const versioningOpeningSha256 = frontierSha256({ bucket: deps.bucket, status: openingVersioning });
     const versioningClosingSha256 = frontierSha256({ bucket: deps.bucket, status: closingVersioning });
-    return {
-      roots, records: evidenceRecords, sourceEpoch: opening.source_epoch, scopeFingerprint: opening.fingerprint,
+    const result: SeedScopeExportEvidence = {
+      roots, bindings, records: evidenceRecords, sourceEpoch: opening.source_epoch, scopeFingerprint: opening.fingerprint,
       snapshotSha256: frontierSha256({ protocol: 1, seedSnapshotSha256: sealed.snapshot_sha256, scopeFingerprint: opening.fingerprint, sourceEpoch: opening.source_epoch, versions: [...versions].sort() }),
       pointerCount: sealed.pointers, recordCount: evidenceRecords.length,
       versioningOpeningSha256, versioningClosingSha256,
     };
+    checkDeadline();
+    if (Buffer.byteLength(JSON.stringify(result)) > input.maxEvidenceBytes) fail("frontier_seed_evidence_bound");
+    checkDeadline();
+    return result;
   } finally {
     index.close();
   }

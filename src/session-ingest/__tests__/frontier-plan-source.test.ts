@@ -12,7 +12,7 @@ import {
   createS3FrontierVersioningReader,
   type FrontierBucketVersioningReader,
 } from "../frontier-plan-source.ts";
-import type { ProofDeps, SeedPointer } from "../seed-proof.ts";
+import { SeedProofIndex, type ProofDeps, type SeedPointer } from "../seed-proof.ts";
 import type { SeedSql } from "../seed.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { writeBatchObjects } from "../writer.ts";
@@ -67,6 +67,7 @@ async function fixture() {
     tenant: { orgId: TENANT.orgId, workspaceId: TENANT.workspaceId, userId: TENANT.userId, originId: prepared.originId },
     generation: "a".repeat(64), sourceHead: "b".repeat(40), source: pointer.harness, sessionId: pointer.session_id,
     keyRoot: `96bulls/${TENANT.orgId}`, cachePath: join(directory, "frontier.sqlite"),
+    maxRecords: 10, maxEvidenceBytes: 1024 * 1024, deadlineMs: 10_000,
   };
   return { ...fs, directory, deps, pointer, capture, calls, get rpcCount() { return rpcCount; }, sql, versioning, versioningCalls, input };
 }
@@ -81,10 +82,49 @@ describe("frontier seed source evidence", () => {
     }] });
     expect(evidence.records[0]).toMatchObject({ evidence: { record_id: "record-frontier", pointer_id: f.pointer.capture.pointer_id } });
     expect(evidence.records[0]!.exportRootSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(evidence.bindings).toEqual([{
+      exportRootSha256: evidence.records[0]!.exportRootSha256,
+      recordsSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    }]);
     expect(evidence.snapshotSha256).toMatch(/^[a-f0-9]{64}$/);
     expect(f.calls).toHaveLength(2);
     expect(f.calls.every(call => JSON.parse(((call as { params: string[] }).params[0]!)).mode === "preview")).toBe(true);
     expect(f.versioningCalls).toEqual(["fixture-versioned", "fixture-versioned"]);
+  });
+
+  test("bounds records, evidence bytes and deadline and ignores import ACK progress", async () => {
+    const bounded = await fixture();
+    await expect(captureSeedScopeExportEvidence(bounded.sql, bounded.deps, bounded.versioning, { ...bounded.input, maxRecords: 0 }))
+      .rejects.toMatchObject({ code: "frontier_seed_record_bound" });
+
+    const bytes = await fixture();
+    await expect(captureSeedScopeExportEvidence(bytes.sql, bytes.deps, bytes.versioning, { ...bytes.input, maxEvidenceBytes: 1 }))
+      .rejects.toMatchObject({ code: "frontier_seed_evidence_bound" });
+
+    const expired = await fixture();
+    const reader = expired.deps.reader;
+    expired.deps.reader = { ...reader, async read(key) { await new Promise(resolve => setTimeout(resolve, 5)); return reader.read(key); } };
+    await expect(captureSeedScopeExportEvidence(expired.sql, expired.deps, expired.versioning, { ...expired.input, deadlineMs: 1 }))
+      .rejects.toMatchObject({ code: "frontier_seed_deadline" });
+
+    const versioningExpired = await fixture();
+    versioningExpired.versioning.read = async () => {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      return "Enabled";
+    };
+    await expect(captureSeedScopeExportEvidence(versioningExpired.sql, versioningExpired.deps, versioningExpired.versioning, { ...versioningExpired.input, deadlineMs: 1 }))
+      .rejects.toMatchObject({ code: "frontier_seed_deadline" });
+
+    const resumed = await fixture();
+    const first = await captureSeedScopeExportEvidence(resumed.sql, resumed.deps, resumed.versioning, resumed.input);
+    const index = new SeedProofIndex(resumed.input.cachePath, resumed.input.tenant.orgId, resumed.input.sourceHead);
+    const batch = [...index.evidenceBatches()][0]!;
+    index.acknowledged(batch.batch_sha256, batch.records.length);
+    index.close();
+    const second = await captureSeedScopeExportEvidence(resumed.sql, resumed.deps, resumed.versioning, resumed.input);
+    expect(second).toMatchObject({ pointerCount: first.pointerCount, recordCount: first.recordCount });
+    expect(second.records).toHaveLength(1);
+    expect(second.roots).toHaveLength(1);
   });
 
   test("source mutation, absent versions, and bucket changes fail closed", async () => {
@@ -116,7 +156,7 @@ describe("signed S3 versioning source", () => {
       '<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>',
     ];
     const seen: Array<{ url: string; authorization: string | null }> = [];
-    const reader = createS3FrontierVersioningReader({ region: "us-east-1", endpoint: "http://minio.invalid", credentials, fetch: (async (input, init) => {
+    const reader = createS3FrontierVersioningReader({ region: "us-east-1", endpoint: "http://127.0.0.1:9000", allowInsecureLoopbackFixture: true, credentials, fetch: (async (input, init) => {
       seen.push({ url: String(input), authorization: new Headers(init?.headers).get("authorization") });
       return new Response(bodies.shift(), { status: 200 });
     }) as typeof fetch });
@@ -131,9 +171,25 @@ describe("signed S3 versioning source", () => {
       "<VersioningConfiguration><Status>Enabled</Status><Status>Suspended</Status></VersioningConfiguration>",
       `<VersioningConfiguration><Status>Enabled</Status>${" ".repeat(200)}</VersioningConfiguration>`,
     ]) {
-      const reader = createS3FrontierVersioningReader({ region: "us-east-1", endpoint: "http://minio.invalid", credentials, maxBytes: 128,
+      const reader = createS3FrontierVersioningReader({ region: "us-east-1", endpoint: "http://127.0.0.1:9000", allowInsecureLoopbackFixture: true, credentials, maxBytes: 128,
         fetch: (async () => new Response(body, { status: 200 })) as typeof fetch });
       await expect(reader.read("fixture-bucket")).rejects.toMatchObject({ code: expect.stringContaining("frontier_versioning_") });
+    }
+  });
+
+  test("refuses insecure non-loopback endpoints, redirects and HTTPS identity changes", async () => {
+    expect(() => createS3FrontierVersioningReader({ region: "us-east-1", endpoint: "http://minio.invalid", credentials }))
+      .toThrow("frontier_versioning_endpoint");
+    for (const changed of ["redirected", "identity"] as const) {
+      const reader = createS3FrontierVersioningReader({
+        region: "us-east-1", endpoint: "https://minio.example.test", credentials,
+        fetch: (async () => {
+          const response = new Response("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>", { status: 200 });
+          Object.defineProperty(response, changed === "redirected" ? "redirected" : "url", { value: changed === "redirected" ? true : "https://other.example.test/fixture-bucket?versioning=" });
+          return response;
+        }) as typeof fetch,
+      });
+      await expect(reader.read("fixture-bucket")).rejects.toMatchObject({ code: "frontier_versioning_identity" });
     }
   });
 });

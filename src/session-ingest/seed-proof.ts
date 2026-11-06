@@ -37,6 +37,10 @@ export interface ProofDeps {
   prefixFor(orgId: string): string;
   decompress(stored: Uint8Array, maxBytes: number): Uint8Array;
 }
+export interface SeedProofVisitGuard {
+  check(): void;
+  record(): void;
+}
 const identity = (p: SeedPointer) => JSON.stringify([
   p.org_id,p.workspace_id,p.user_id,p.harness,p.session_id,p.machine_id,p.bucket,
   p.storage_provider,p.manifest_key,p.revision,p.content_sha256,p.capture,
@@ -84,7 +88,8 @@ export class SeedProofIndex {
     const winner = chooseRelayhistoryRevision(previous,evidence,(a,b)=>a.semantic_sha256===b.semantic_sha256);
     this.putRecord.run(key,ns,JSON.stringify(winner));
   }
-  async addPointer(pointer:SeedPointer,deps:ProofDeps) {
+  async addPointer(pointer:SeedPointer,deps:ProofDeps,guard?:SeedProofVisitGuard) {
+    guard?.check();
     if (this.state() !== "building") fail("seed_index_not_building");
     if (pointer.org_id !== this.orgId || pointer.bucket !== deps.bucket ||
         pointer.storage_provider !== deps.provider || !["ndjson","jsonl","sqlite-rows"].includes(pointer.raw_format) ||
@@ -100,6 +105,7 @@ export class SeedProofIndex {
     let transaction=false;
     try {
       const read=await deps.reader.read(pointer.manifest_key);
+      guard?.check();
       if (!read) fail("seed_manifest_missing");
       const manifest=read!.manifest, canonical=canonicalManifestIdentity(manifest);
       const at=parseSessionKey(pointer.manifest_key);
@@ -131,6 +137,7 @@ export class SeedProofIndex {
       let count=0,unseeded=0;
       this.db.exec("BEGIN"); transaction=true;
       for await (const record of streamManifestRecords(manifest,deps.store,deps.prefixFor(pointer.org_id),deps.decompress)) {
+        guard?.record();
         if (legacyOwner && liveMachineId(pointer.workspace_id,record.origin_id,pointer.user_id)!==manifest.session.machine_id)
           fail("seed_manifest_owner");
         count++;
@@ -189,6 +196,22 @@ export class SeedProofIndex {
       const batch_sha256=hash(JSON.stringify(batch));
       if(!this.db.prepare("SELECT 1 FROM progress WHERE batch_sha=?").get(batch_sha256))
         yield { ...batch,batch_sha256 };
+      after=rows.at(-1)!.key;
+    }
+  }
+  /** Complete sealed evidence for read-only proof; import ACK progress is irrelevant. */
+  *evidenceBatches(limit=1000) {
+    if(this.state()!=="sealed" || !Number.isSafeInteger(limit) || limit<1 || limit>1000)fail("seed_index_not_sealed");
+    const snapshot=(this.db.prepare("SELECT value FROM meta WHERE key='snapshot'").get() as {value:string}).value;
+    let after="";
+    for(;;) {
+      const rows=this.db.prepare("SELECT key,evidence FROM records WHERE key>? ORDER BY key LIMIT ?").all(after,limit) as {key:string;evidence:string}[];
+      if(!rows.length)break;
+      const records=rows.map(r=>JSON.parse(r.evidence) as SeedEvidence);
+      const pointerIds=[...new Set(records.map(r=>r.pointer_id))].sort();
+      const pointers=pointerIds.map(id=>JSON.parse((this.db.prepare("SELECT metadata FROM pointers WHERE id=? AND state='complete'").get(id) as {metadata:string}).metadata) as SeedPointer);
+      const batch={protocol:SEED_PROOF_PROTOCOL,snapshot_sha256:snapshot,source_head:this.sourceHead,pointer_ids:pointerIds,pointers,records};
+      yield { ...batch,batch_sha256:hash(JSON.stringify(batch)) };
       after=rows.at(-1)!.key;
     }
   }
