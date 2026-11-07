@@ -17,9 +17,17 @@
  * Values only travel as bound parameters; no result or transcript text is written here.
  */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
-import { createHash } from "node:crypto";
 import type { ObjectStore } from "../../packages/object-store/src/index.ts";
-import type { EraseBudget, EraseCheckpoint, ListedVersion, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
+import type { EraseBudget, EraseCheckpoint, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
+import {
+  nextSweepDelayMs,
+  reconcileObligation,
+  type ObligationAuthority,
+  type ObligationReason,
+  type ObligationStore,
+  type ObligationWriter,
+  type WriteObligation,
+} from "../migration/neon-s3-erasure/write-obligation.ts";
 import type { AnalysisJob, AnalysisJobStore } from "./processor.ts";
 import { analysisResultKey, analysisResultPrefix, putAnalysisResult } from "./results.ts";
 
@@ -125,7 +133,8 @@ RETURNING id`;
  */
 const SWEEP_SQL = `
 SELECT t.result_key, t.reason, t.org_id, t.workspace_id, t.session_id, t.job_id::text AS job_id, t.generation,
-       t.writer_token::text AS writer_token, t.erase_checkpoint, t.stray_found
+       t.writer_token::text AS writer_token, t.erase_checkpoint, t.sweeps,
+       EXISTS (SELECT 1 FROM sessions.session_analysis_ticket_strays AS s WHERE s.result_key = t.result_key) AS stray_found
   FROM sessions.session_analysis_result_tickets AS t
  WHERE t.created_at < now() - make_interval(secs => $1::integer)
    AND (t.lease_expires_at IS NULL OR t.lease_expires_at <= now())
@@ -180,7 +189,7 @@ export function postgresAnalysisJobStore(deps: AnalysisJobStoreDeps): AnalysisJo
       } catch (error) {
         // Aborted, timed out, lost response or a failed read-back: the PUT may have committed
         // (even after any grace). The pending-write ticket becomes 'unknown' for the sweeper.
-        if (job) await deps.db.query(MARK_UNKNOWN_SQL, [key, job.id, job.leaseToken]);
+        if (job) await analysisObligationWriter.markUnknown(deps.db, key, workerIdentity(job));
         throw error;
       }
     },
@@ -209,41 +218,114 @@ export function postgresAnalysisJobStore(deps: AnalysisJobStoreDeps): AnalysisJo
   };
 }
 
-/** Re-sweep backoff for an unresolved ticket: 1, 2, 4 ... minutes, at most a day. */
-const RESWEEP_SQL = `
-UPDATE sessions.session_analysis_result_tickets
-   SET sweeps = sweeps + 1, erase_checkpoint = NULL, stray_found = $2,
-       next_sweep_at = now() + LEAST(interval '1 day', interval '1 minute' * power(2, LEAST(sweeps, 11)))
- WHERE result_key = $1`;
+/** The worker's obligation identity: the job and its lease token (the ticket's writer). */
+export const workerIdentity = (job: Pick<AnalysisJob, "id" | "leaseToken">): readonly unknown[] => [job.id, job.leaseToken];
 
-/** The ticket as the sweep authorized it, re-read before every page's deletes. */
+/**
+ * F1's ObligationWriter (write-obligation.ts) over session_analysis_result_tickets. The worker's
+ * record and publish are the fenced CTEs RESERVE_SQL / COMPLETE_SQL (record inside the job-lease
+ * + source-revision transaction; publish records result_version_id and retires the ticket in the
+ * completion statement); the backfill's are its writer/generation/purge-fenced ticket and job
+ * inserts. These methods are the same contract for callers outside those statements.
+ * identity = [job id, writer token].
+ */
+export const analysisObligationWriter: ObligationWriter<SqlExecutor> = {
+  async record(tx, key, identity) {
+    const [jobId, writer] = identity as [string, string];
+    await tx.query(
+      `INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, writer_token)
+       SELECT $1, j.id, j.org_id, j.workspace_id, j.session_id, 'publishing', $3::uuid FROM sessions.session_analysis_jobs_v2 AS j WHERE j.id = $2::uuid
+       ON CONFLICT (result_key) DO NOTHING`,
+      [key, jobId, writer],
+    );
+  },
+  async markUnknown(tx, key, identity) {
+    const [jobId, writer] = identity as [string, string];
+    await tx.query(MARK_UNKNOWN_SQL, [key, jobId, writer]);
+  },
+  async publish(tx, key, identity, versionId) {
+    const [jobId, writer] = identity as [string, string];
+    await tx.query(
+      `WITH owned AS (
+         UPDATE sessions.session_analysis_jobs_v2 SET result_version_id = $4 WHERE id = $2::uuid AND result_s3_key = $1 RETURNING id
+       ), gone AS (
+         DELETE FROM sessions.session_analysis_result_tickets
+          WHERE result_key = $1 AND job_id = $2::uuid AND writer_token = $3::uuid AND EXISTS (SELECT 1 FROM owned) RETURNING result_key
+       )
+       DELETE FROM sessions.session_analysis_ticket_strays WHERE result_key IN (SELECT result_key FROM gone)`,
+      [key, jobId, writer, versionId],
+    );
+  },
+};
+
+/** One ticket's authority: reason, identity, and the versions completed jobs own at its key. */
 const TICKET_AUTHORITY_SQL = `
-SELECT t.reason, t.job_id::text AS job_id,
+SELECT t.reason, t.job_id::text AS job_id, t.writer_token::text AS writer_token,
        ARRAY(SELECT j.result_version_id FROM sessions.session_analysis_jobs_v2 AS j
               WHERE j.result_s3_key = t.result_key AND j.status = 'completed' AND j.result_version_id IS NOT NULL
               ORDER BY 1) AS owned,
        (SELECT count(*) FROM sessions.session_analysis_jobs_v2 AS j
-         WHERE j.result_s3_key = t.result_key AND j.status = 'completed')::int AS owners
+         WHERE j.result_s3_key = t.result_key AND j.status = 'completed' AND j.result_version_id IS NULL)::int AS without_version
   FROM sessions.session_analysis_result_tickets AS t WHERE t.result_key = $1`;
 
+interface TicketRow {
+  result_key: string; reason: ObligationReason; org_id: string; workspace_id: string; session_id: string; job_id: string;
+  generation: string | null; writer_token: string | null; erase_checkpoint: EraseCheckpoint | null; sweeps: number; stray_found: boolean;
+}
+const ticketIdentity = (t: Pick<TicketRow, "org_id" | "workspace_id" | "session_id" | "job_id" | "generation" | "writer_token">) =>
+  ["analysis-result-ticket", t.org_id, t.workspace_id, t.session_id, t.job_id, t.generation, t.writer_token] as const;
+
 /**
- * Sweep the result tickets through the ONE shared strict, paged, resumable eraser
- * (src/migration/neon-s3-erasure/eraser.ts eraseStep / verifyErased).
- *   Every ticket: the key's versions that no published job owns (by exact version id) are
- *     erased, in bounded steps; the checkpoint is persisted on the ticket, bound to the bucket,
- *     the key's prefix and a scope digest (operation, tenant/session, key, job, reason,
- *     generation, writer and the owned versions), and authority is re-read before every page's
- *     deletes. A published owner's version is never selected.
- *   forgotten (outcome known): retired only after a FRESH strict verifyErased shows zero
- *     unowned versions.
- *   unknown / stale publishing (the PUT may have committed, late or with a lost response):
- *     retired only when an unowned object version WAS found and erased (the write is accounted
- *     for) AND a fresh strict verifyErased shows zero; otherwise kept and rescheduled. No
- *     timer or grace is treated as a commit bound.
- *   An owner whose exact version is unrecorded (an unversioned store) cannot be told apart
- *     from a stray: nothing is erased and the ticket is rescheduled.
- * A failed step keeps the ticket and its last checkpoint (and records whether an unowned write
- * was already found); other tickets still sweep. Returns the tickets retired.
+ * F1's ObligationStore (write-obligation.ts) for one locked ticket. `tx` holds the ticket row
+ * (FOR UPDATE); `durable` commits on its own: markStray writes session_analysis_ticket_strays
+ * (no lock on the ticket row) so the evidence is durable before the page's deletes even if the
+ * sweep transaction later rolls back.
+ */
+function ticketObligationStore(tx: SqlExecutor, durable: SqlExecutor, t: TicketRow): ObligationStore {
+  return {
+    async load(): Promise<ObligationAuthority | null> {
+      const row = (await tx.query<{ reason: ObligationReason; job_id: string; writer_token: string | null; owned: string[] | null; without_version: number }>(
+        TICKET_AUTHORITY_SQL, [t.result_key],
+      )).rows[0];
+      if (!row) return null;
+      return {
+        reason: row.reason,
+        identity: ticketIdentity({ ...t, job_id: row.job_id, writer_token: row.writer_token }),
+        ownedVersions: row.owned ?? [],
+        ownersWithoutVersion: Number(row.without_version),
+      };
+    },
+    async markStray() {
+      await durable.query("INSERT INTO sessions.session_analysis_ticket_strays (result_key) VALUES ($1) ON CONFLICT DO NOTHING", [t.result_key]);
+    },
+    async saveCheckpoint(checkpoint) {
+      await tx.query("UPDATE sessions.session_analysis_result_tickets SET erase_checkpoint = $2::jsonb WHERE result_key = $1", [t.result_key, JSON.stringify(checkpoint)]);
+    },
+    async reschedule(strayFound) {
+      if (strayFound) await tx.query("INSERT INTO sessions.session_analysis_ticket_strays (result_key) VALUES ($1) ON CONFLICT DO NOTHING", [t.result_key]);
+      await tx.query(
+        `UPDATE sessions.session_analysis_result_tickets
+            SET sweeps = sweeps + 1, erase_checkpoint = NULL, next_sweep_at = now() + $2::double precision * interval '1 millisecond'
+          WHERE result_key = $1`,
+        [t.result_key, nextSweepDelayMs(Number(t.sweeps))],
+      );
+    },
+    async retire() {
+      await tx.query("DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1", [t.result_key]);
+      await tx.query("DELETE FROM sessions.session_analysis_ticket_strays WHERE result_key = $1", [t.result_key]);
+    },
+  };
+}
+
+/**
+ * Sweep the result tickets: each ticket is one durable write obligation, reconciled by THE
+ * shared implementation (src/migration/neon-s3-erasure/write-obligation.ts reconcileObligation,
+ * over the shared strict paged eraser). Successor-safe (versions completed jobs own are never
+ * selected), checkpointed per ticket, authority re-read before every page's deletes, durable
+ * stray evidence, and the shared completion predicate (forgotten: a fresh strict zero
+ * inventory of unowned versions; unknown/publishing: additionally the write accounted for, by a
+ * found stray or by ownership). A clean sweep only reschedules; a failed step keeps the ticket,
+ * its checkpoint and its stray evidence, and the sweep continues. Returns the tickets retired.
  */
 export async function sweepAnalysisTickets(
   store: ObjectStore,
@@ -253,6 +335,8 @@ export async function sweepAnalysisTickets(
     transact: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
     /** REQUIRED: the shared paged eraser (createS3Eraser / storeEraser). No plain-delete fallback. */
     eraser: PagedEraser;
+    /** Commits on its own (the worker's pool): durable stray evidence. Default: the sweep transaction. */
+    durable?: SqlExecutor;
     /** Per-ticket budget for one step (the eraser's hard ceilings still apply). */
     budget?: EraseBudget;
     /** A ticket's step failed (it stays, with its last checkpoint); the sweep continues. */
@@ -262,64 +346,24 @@ export async function sweepAnalysisTickets(
   if (typeof options?.eraser?.eraseStep !== "function" || typeof options.eraser.verifyErased !== "function")
     throw new Error("analysis_sweep_eraser_required");
   void store;
-  const eraser = options.eraser;
   return options.transact(async (tx) => {
-    const { rows } = await tx.query<{
-      result_key: string; reason: string; org_id: string; workspace_id: string; session_id: string; job_id: string;
-      generation: string | null; writer_token: string | null; erase_checkpoint: EraseCheckpoint | null; stray_found: boolean;
-    }>(SWEEP_SQL, [options.graceSeconds ?? TICKET_GRACE_SECONDS, options.limit ?? 50]);
+    const { rows } = await tx.query<TicketRow>(SWEEP_SQL, [options.graceSeconds ?? TICKET_GRACE_SECONDS, options.limit ?? 50]);
     let retired = 0;
     for (const t of rows) {
-      const key = t.result_key;
-      const authority = async () => (await tx.query<{ reason: string; job_id: string; owned: string[] | null; owners: number }>(TICKET_AUTHORITY_SQL, [key])).rows[0];
-      const first = await authority();
-      if (!first) continue;
-      const owned = [...(first.owned ?? [])].sort();
-      if (Number(first.owners) > owned.length) {
-        await tx.query(RESWEEP_SQL, [key, t.stray_found]);
-        continue;
-      }
-      const ownedSet = new Set(owned);
-      const prefix = key.slice(0, key.lastIndexOf("/") + 1);
-      const scope = createHash("sha256")
-        .update(JSON.stringify(["analysis-result-ticket-sweep", t.org_id, t.workspace_id, t.session_id, key, t.job_id, first.reason, t.generation, t.writer_token, owned]))
-        .digest("hex");
-      const authorize = async () => {
-        const now = await authority();
-        if (!now || now.reason !== first.reason || now.job_id !== first.job_id || JSON.stringify([...(now.owned ?? [])].sort()) !== JSON.stringify(owned))
-          throw new Error("analysis_sweep_authority_changed");
+      const obligation: WriteObligation = {
+        key: t.result_key,
+        reason: t.reason,
+        identity: ticketIdentity(t),
+        checkpoint: t.erase_checkpoint,
+        strayFound: t.stray_found === true,
       };
-      const unowned = (v: ListedVersion) => v.key === key && !ownedSet.has(v.versionId);
-      let strayFound = t.stray_found;
-      const select = (v: ListedVersion) => {
-        const pick = unowned(v);
-        if (pick && !v.deleteMarker) strayFound = true;
-        return pick;
-      };
-      const checkpoint = t.erase_checkpoint && t.erase_checkpoint.scope === scope ? t.erase_checkpoint : null;
-      let step: Awaited<ReturnType<PagedEraser["eraseStep"]>>;
       try {
-        step = await eraser.eraseStep(prefix, { scope, checkpoint, select, authorize, ...(options.budget ? { budget: options.budget } : {}) });
+        const outcome = await reconcileObligation(options.eraser, ticketObligationStore(tx, options.durable ?? tx, t), obligation, {
+          ...(options.budget ? { budget: options.budget } : {}),
+        });
+        if (outcome === "retired") retired += 1;
       } catch (error) {
-        // A failed step (a lost DELETE ack, a strict-inventory refusal, changed authority): the
-        // ticket and its last checkpoint stay, and the evidence that an unowned write was found
-        // is kept DURABLY (a lost ack must not erase the proof the unknown write existed).
-        await tx.query("UPDATE sessions.session_analysis_result_tickets SET stray_found = $2 WHERE result_key = $1", [key, strayFound]);
-        options.onError?.(key, error);
-        continue;
-      }
-      if (step.status === "incomplete") {
-        await tx.query("UPDATE sessions.session_analysis_result_tickets SET erase_checkpoint = $2::jsonb, stray_found = $3 WHERE result_key = $1", [
-          key, JSON.stringify(step.checkpoint), strayFound,
-        ]);
-        continue;
-      }
-      const proof = await eraser.verifyErased(prefix, { select: unowned, authorize, ...(options.budget ? { budget: options.budget } : {}) });
-      if (proof.status === "erased" && (first.reason === "forgotten" || strayFound)) {
-        await tx.query("DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1", [key]);
-        retired += 1;
-      } else {
-        await tx.query(RESWEEP_SQL, [key, strayFound]);
+        options.onError?.(t.result_key, error);
       }
     }
     return retired;

@@ -412,7 +412,7 @@ describe("runtime role: required, existing, SELECT only", () => {
               AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
         )
       ).rows[0]?.n,
-    ).toBe(33); // 30 + lane F1's three analysis tables (20261105046000)
+    ).toBe(34); // 30 + lane F1's four analysis tables (20261105046000, incl. the ticket strays)
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
