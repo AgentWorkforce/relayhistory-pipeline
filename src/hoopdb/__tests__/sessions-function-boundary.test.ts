@@ -12,7 +12,7 @@ import { LANES } from "../../../scripts/sessions-function-boundary/lanes/index.t
 import { ingestHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-history.ts";
 import { bufferedGcSingleCandidate } from "../../../scripts/sessions-function-boundary/lanes/buffered-gc-single-candidate.ts";
 import { lazySourceTables, originalBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-source-tables.ts";
-import { privacyAuthority, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
+import { privacyAuthority, originalLazyBodies, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
 import { createHash } from "node:crypto";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
@@ -97,9 +97,9 @@ describe("unified sessions function-boundary generator", () => {
     expect(down.trim().endsWith("COMMIT;")).toBe(true);
   });
 
-  test("041000 privacy authority: exactly two ingest-callable SECDEF functions; the rollback restores the 010000 mirror verbatim behind its guards", async () => {
+  test("041000 privacy authority: exactly two ingest-callable SECDEF functions; the rollback restores the 010000 mirror and the 040000 lazy bodies verbatim behind its guards", async () => {
     const g = await generate(repo, LANES, VERIFIERS);
-    expect(g.summary.lanes["privacy-authority"]).toEqual({ functions: 17, replaces: 2, grants: 6 });
+    expect(g.summary.lanes["privacy-authority"]).toEqual({ functions: 17, replaces: 4, grants: 6 });
     const acl = JSON.parse(g.outputs[ACL_PATH]!).functions as Record<string, string[]>;
     const granted = Object.entries(acl).filter(([k, v]) => k.startsWith("sessions.ingest_privacy_authority_") && v.some((x) => x.startsWith("bulls96_session_ingest"))).map(([k]) => k).sort();
     expect(granted).toEqual(["sessions.ingest_privacy_authority_begin(jsonb)", "sessions.ingest_privacy_authority_complete(jsonb)"]);
@@ -109,6 +109,17 @@ describe("unified sessions function-boundary generator", () => {
       expect(down).toContain(body);
       expect(down.indexOf(body)).toBeLessThan(down.indexOf("DROP FUNCTION sessions.ingest_privacy_authority_lock(boolean);"));
     }
+    // The 040000 lazy-current bodies (prefix exclusion) are restored EXACTLY, not 055000's.
+    const lazy = originalLazyBodies(readFileSync(join(root, "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql"), "utf8"));
+    expect(lazy.length).toBe(2);
+    for (const body of lazy) {
+      expect(body).toContain("NOT LIKE 'ingest\\_frozen\\_source\\_%'");
+      expect(down).toContain(body);
+    }
+    expect(down).not.toContain("NOT IN('ingest_frozen_source_records'");
+    const up = readFileSync(join(root, privacyAuthority.migration!), "utf8");
+    expect(up.match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
+    expect(up).not.toContain("NOT LIKE 'ingest\\_frozen");
     expect(down.indexOf("release to neon first")).toBeLessThan(down.indexOf("DROP TRIGGER"));
     expect(down).toContain("a later migration is applied");
     expect(down.trim().endsWith("COMMIT;")).toBe(true);

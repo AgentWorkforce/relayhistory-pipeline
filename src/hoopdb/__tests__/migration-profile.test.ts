@@ -1548,6 +1548,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toEqual(expect.arrayContaining([C, D, K, S, E]));
     const relation = async (name: string) =>
       (await db.query<{ r: string | null }>("SELECT to_regclass($1)::text r", [name])).rows[0]?.r ?? null;
+    const lazySrc = async () =>
+      (await db.query<{ s: string }>("SELECT string_agg(prosrc, '' ORDER BY oid) s FROM pg_proc WHERE oid IN ('sessions.ingest_lazy_user(jsonb,text,jsonb)'::regprocedure, 'sessions.ingest_lazy_begin(jsonb,text)'::regprocedure)")).rows[0]!.s;
     const catalogRpc = async () =>
       (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.session_directory_desktop_catalog(text,text,text)'::regprocedure")).rows[0]!.s;
     const routeRpc = async () =>
@@ -1577,8 +1579,19 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105041000_ingest_privacy_authority.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(Y);
     await db.query("DELETE FROM sessions.ingest_privacy_authority");
+    // 041000's own down refuses while any later upstream migration is ledgered.
+    await db.query(
+      "INSERT INTO sessions.__96bulls_migrations SELECT (jsonb_populate_record(NULL::sessions.__96bulls_migrations, to_jsonb(m) || jsonb_build_object('name', $2::text))).* FROM sessions.__96bulls_migrations m WHERE m.name = $1",
+      [Y, "upstream:20261105041500_later_fixture.sql"],
+    );
+    expect((await failure(rollback("20261105041000_ingest_privacy_authority.down.sql")))?.code).toBe("55000");
+    await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", ["upstream:20261105041500_later_fixture.sql"]);
+    expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
     await rollback("20261105041000_ingest_privacy_authority.down.sql");
     expect(await names()).not.toContain(Y);
+    // The 041000 down restores the EXACT 040000 lazy bodies (prefix exclusion), not 055000's.
+    expect((await lazySrc()).split("NOT LIKE 'ingest\\_frozen\\_source\\_%'").length).toBe(3);
+    expect(await lazySrc()).not.toContain("NOT IN('ingest_frozen_source_records'");
     expect(await relation("sessions.ingest_privacy_authority")).toBeNull();
     // 040000 is the latest lane: 039000 refuses while it is applied.
     expect((await failure(rollback("20261105039000_buffered_gc_single_candidate.down.sql")))?.code).toBe("55000");
@@ -1647,6 +1660,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // 035000 through 039000, 040000 (lazy source tables) and 041000 (privacy authority); the post-validation
     // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
+    // Up again: 041000's exact source-table list is back in both lazy functions.
+    expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");

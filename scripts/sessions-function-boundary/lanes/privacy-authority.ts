@@ -1,9 +1,11 @@
-/** Lane (slot 041000): C3 Supabase-first privacy authority. New owner/ingest functions + the legacy mirror begin/complete replaced. */
+/** Lane (slot 041000): C3 Supabase-first privacy authority. New owner/ingest functions + the legacy mirror begin/complete and the 040000 lazy-current checks replaced. */
 import { createHash } from "node:crypto";
 import type { LaneContext, LaneManifest } from "../types.ts";
 
 const MIGRATION = "supabase/migrations/20261105041000_ingest_privacy_authority.sql";
 const ORIGINAL = "supabase/migrations/20261105010000_frozen_source_custody.sql";
+/** 041000 replaces the 040000 lazy-current bodies (exact source-table list); its rollback restores them exactly. */
+const LAZY_ORIGINAL = "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql";
 const ROLLBACK = "supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql";
 const NAME = "upstream:20261105041000_ingest_privacy_authority.sql";
 const INGEST = "bulls96_session_ingest";
@@ -21,8 +23,21 @@ export function originalMirrorBodies(source: string): string[] {
   });
 }
 
+/** The exact 040000 lazy-current bodies (already CREATE OR REPLACE there; owner/ACL stay unchanged). */
+export function originalLazyBodies(source: string): string[] {
+  return [
+    /CREATE OR REPLACE FUNCTION sessions\.ingest_lazy_user\(p_w jsonb,p_kind text,p_control jsonb\)[\s\S]*?\$lazy_user\$;/,
+    /CREATE OR REPLACE FUNCTION sessions\.ingest_lazy_begin\(p jsonb,p_kind text\)[\s\S]*?\$lazy_begin\$;/,
+  ].map((re) => {
+    const m = source.match(re);
+    if (!m) throw Error("privacy authority rollback: exact prior 040000 lazy body missing");
+    return m[0];
+  });
+}
+
 async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
   const bodies = originalMirrorBodies(await ctx.read(ORIGINAL));
+  const lazy = originalLazyBodies(await ctx.read(LAZY_ORIGINAL));
   const checksum = createHash("sha256").update(ctx.sql).digest("hex");
   return { [ROLLBACK]: [
     "-- Generated: reverse 041000. Only while Neon is the privacy authority (no sessions.ingest_privacy_authority row):",
@@ -71,6 +86,8 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
     "DROP FUNCTION sessions.ingest_privacy_authority_guard();",
     "-- The legacy mirror begin/complete exactly as 20261105010000 created them (they call the lock function: restore first).",
     ...bodies,
+    "-- The lazy-current adoption checks exactly as 20261105040000 left them (prefix exclusion).",
+    ...lazy,
     "DROP FUNCTION sessions.ingest_privacy_authority_lock(boolean);",
     "DROP TABLE sessions.ingest_privacy_authority;",
     "DROP TABLE sessions.ingest_frozen_source_owned_sessions;",
@@ -111,6 +128,8 @@ export const privacyAuthority: LaneManifest = {
   replaces: {
     "sessions.ingest_source_control_begin(jsonb)": { secdef: true, original: ORIGINAL },
     "sessions.ingest_source_control_complete(jsonb)": { secdef: true, original: ORIGINAL },
+    "sessions.ingest_lazy_user(jsonb,text,jsonb)": { secdef: false, original: LAZY_ORIGINAL },
+    "sessions.ingest_lazy_begin(jsonb,text)": { secdef: false, original: LAZY_ORIGINAL },
   },
   extraOutputs: rollback,
 };
