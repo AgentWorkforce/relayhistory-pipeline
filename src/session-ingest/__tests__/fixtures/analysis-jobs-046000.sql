@@ -1,5 +1,5 @@
 -- Test fixture: sessions-pipeline #292 (lane F1) supabase/migrations/20261105046000_analysis_jobs.sql, VERBATIM at
--- b608ea3b (workspace-scoped purge_session_analysis_for_owned in both forms). The C3 authority must call these exact functions.
+-- b608ea3b (workspace-scoped purge_session_analysis_for_owned in both forms). source-sha256: 6470915303b5ad87f6552ee4059b00d20f543d07e3445d940c17212ab73bae4b
 -- Registry slot 046000 (lane F1, session ANALYSIS panel off Neon). The full-analysis
 -- request/job lifecycle that relayhistory ran on Neon (sessions.session_analysis_requests,
 -- sessions.session_analysis_jobs; RHC migrations 0015, 0016, 0024, 0031, 0043, 0062), owned

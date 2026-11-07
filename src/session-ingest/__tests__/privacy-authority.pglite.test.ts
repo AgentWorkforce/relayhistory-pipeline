@@ -574,3 +574,27 @@ test("buffered: a reset user's stages jump the GC queue (examined in the very ne
   expect(w.holding("C3-LATE-SECRET")).toEqual([]);
   for (let i = 0; i < 6; i++) expect(w.holding(`OTHER-${i}`).length).toBe(1);
 });
+
+/**
+ * Registry guard: the analysis fixture is a COPY of #292's 046000 migration, which keeps changing. Drift fails loudly:
+ * once 046000 is in the tree, the fixture's two purge_session_analysis_for_owned definitions must equal it byte for
+ * byte; until then the fixture body must still hash to the source-sha256 its header pins (the reviewed #292 commit).
+ */
+test("analysis fixture: the purge definitions match #292's 046000 source byte for byte (or the pinned source hash)", async () => {
+  const { createHash } = await import("node:crypto");
+  const { existsSync, readFileSync } = await import("node:fs");
+  const fixture = readFileSync(new URL("./fixtures/analysis-jobs-046000.sql", import.meta.url), "utf8");
+  const header = fixture.split("\n").slice(0, 2).join("\n");
+  const body = fixture.split("\n").slice(2).join("\n");
+  const pinned = /source-sha256: ([0-9a-f]{64})/.exec(header)?.[1];
+  expect(pinned).toBeDefined();
+  expect(createHash("sha256").update(body).digest("hex")).toBe(pinned!);
+  const defs = (sql: string) => [
+    /CREATE FUNCTION sessions\.purge_session_analysis_for_owned\(p_org text, p_workspace text, p_user text, p_sessions jsonb\)[\s\S]*?\$purge_owned\$;/,
+    /CREATE FUNCTION sessions\.purge_session_analysis_for_owned\(p_org text, p_workspace text, p_user text\)[\s\S]*?\$purge_owned_all\$;/,
+  ].map((re) => re.exec(sql)?.[0]);
+  const mine = defs(body);
+  expect(mine.every((d) => typeof d === "string")).toBe(true);
+  const source = new URL("../../../supabase/migrations/20261105046000_analysis_jobs.sql", import.meta.url);
+  if (existsSync(source)) expect(mine).toEqual(defs(readFileSync(source, "utf8")));
+});
