@@ -7,7 +7,8 @@
  *   ... --execute --expect-supabase-ref=<ref>   (or --expect-target-host=<host> for a rehearsal)
  *       writes (target-guard.ts); the live run is the lead's, with the user's OK
  *   ... --verify
- *       read-only parity: every Cloud-visible Neon title against the title SP serves
+ *       read-only parity: every Cloud-visible Neon title against the title SP serves, with
+ *       the read path's resolution; exit 2 when any is missing or different
  *
  * Env, injected at run time (e.g. `op run`; never a file on disk):
  *   NEON_BRIEF_TITLES_SOURCE_URL   Neon (relayhistory_readonly) or the frozen copy; the
@@ -21,7 +22,7 @@ import { readFileSync } from "node:fs";
 import pg from "pg";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
 import { guardFromArgv } from "../target-guard.ts";
-import { extractNeon, loadBackfill, verifyBackfill, type NeonBriefRow } from "./backfill.ts";
+import { extractNeon, loadBackfill, verifyBackfill, verifyPassed, type NeonBriefRow } from "./backfill.ts";
 
 const env = (k: string) => process.env[k]?.trim() || undefined;
 const arg = (name: string) => process.argv.find((v) => v.startsWith(`--${name}=`))?.slice(name.length + 3);
@@ -57,7 +58,10 @@ export async function main(argv = process.argv): Promise<void> {
     if (verify) {
       await client.query("SET default_transaction_read_only = on");
       await client.query("SET statement_timeout = 20000");
-      process.stdout.write(`${JSON.stringify({ verify: await verifyBackfill(client, src.rows) })}\n`);
+      const report = await verifyBackfill(client, src.rows);
+      process.stdout.write(`${JSON.stringify({ verify: report, passed: verifyPassed(report) })}\n`);
+      // Any Cloud-visible Neon title SP would not serve exactly fails the run.
+      if (!verifyPassed(report)) process.exitCode = 2;
       return;
     }
     process.stdout.write(`${JSON.stringify({ backfill: await loadBackfill(client, src.rows, mode) })}\n`);

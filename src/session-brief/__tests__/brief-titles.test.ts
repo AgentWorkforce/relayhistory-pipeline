@@ -15,6 +15,7 @@ import {
   backfillFingerprint,
   loadBackfill,
   verifyBackfill,
+  verifyPassed,
   type NeonBriefRow,
 } from "../../migration/neon-brief-titles/backfill.ts";
 
@@ -180,6 +181,8 @@ describe("sessions.session_brief_titles_for", () => {
     // A logical (canonical) id resolves to its physical session's brief.
     await pg.query("UPDATE sessions.session_index SET canonical_session_id = 'logical-1' WHERE org_id='org-a' AND session_id='s-1'");
     expect((await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "logical-1"]])))[0]).toMatchObject({ session_id: "logical-1", title: "First" });
+    // The physical id of an encoded pointer is not a RelayHistory id: it resolves to nothing.
+    expect(await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"]]))).toEqual([]);
     // A tombstoned pointer removes the brief (forget trigger) and so the title.
     await pg.query("UPDATE sessions.session_index SET deleted_at = now() WHERE org_id='org-a' AND session_id='s-1'");
     expect(await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"], ["claude", "logical-1"]]))).toEqual([]);
@@ -238,6 +241,7 @@ describe("Neon backfill load (fixtures)", () => {
     await pointer(pg);
     await pointer(pg, { key: { ...KEY, sessionId: "s-2" } });
     await pointer(pg, { key: { ...KEY, sessionId: "s-3" } });
+    for (const id of ["s-6", "s-7", "s-8"]) await pointer(pg, { key: { ...KEY, sessionId: id } });
     await pg.query("UPDATE sessions.session_index SET deleted_at = now() WHERE session_id = 's-3'");
     const fixture = [
       neon(),
@@ -255,26 +259,73 @@ describe("Neon backfill load (fixtures)", () => {
     expect(dry).toMatchObject({
       mode: "dry-run",
       candidates: 10,
-      outcomes: { inserted: 2, updated: 0, skipped_native: 0, skipped_quarantined: 0, skipped_no_pointer: 2 },
-      skipped: { title_blank: 1, title_invalid: 1, description_invalid: 1, state_invalid: 1, generated_at_invalid: 1, key_invalid: 1 },
+      outcomes: { inserted: 5, updated: 0, skipped_native: 0, skipped_quarantined: 0, skipped_no_pointer: 2 },
+      // Only what Cloud would not show, or SP cannot key, is skipped (parity).
+      skipped: { title_blank: 1, generated_at_invalid: 1, key_invalid: 1 },
     });
     expect((await pg.query("SELECT 1 FROM sessions.session_briefs")).rows).toHaveLength(0);
     const exec = await loadBackfill(target(pg), fixture, "execute");
     expect(exec.outcomes).toEqual(dry.outcomes);
     expect(await row(pg, { ...KEY, sessionId: "s-2" })).toMatchObject({ origin: "neon_backfill", state: null, prompt_version: "session-summary-v1", title: "Legacy v1" });
+    // Titles Cloud shows survive even when the rest of the Neon brief is not representable.
+    expect(await row(pg, { ...KEY, sessionId: "s-6" })).toMatchObject({ title: "line\nbreak", origin: "neon_backfill" });
+    expect(await row(pg, { ...KEY, sessionId: "s-7" })).toMatchObject({ title: "Neon title", description: null, origin: "neon_backfill" });
+    expect(await row(pg, { ...KEY, sessionId: "s-8" })).toMatchObject({ title: "Neon title", state: null });
     // The directory title is not touched by the backfill.
     expect((await pg.query<{ title: string }>("SELECT title FROM sessions.session_directory WHERE session_id = 's-1'")).rows[0]?.title).toBe("pointer title");
     const again = await loadBackfill(target(pg), fixture, "execute");
-    expect(again.outcomes).toMatchObject({ inserted: 0, updated: 2 });
+    expect(again.outcomes).toMatchObject({ inserted: 0, updated: 5 });
     const v = await verifyBackfill(target(pg), fixture);
-    // s-1 and s-2 equal; s-3 (erased), s-4 (no pointer) and the invalid ones are missing; s-5 is blank (not compared).
-    expect(v).toMatchObject({ candidates: 10, compared: 9, equal: 2, different: 0, native: 0, missing: 7 });
+    // s-3 (erased), s-4 (no pointer), s-9 and s-10 (unkeyable) are missing; s-5 is blank (not compared).
+    expect(v).toMatchObject({ candidates: 10, compared: 9, equal: 5, different: 0, native: 0, missing: 4 });
+    expect(verifyPassed(v)).toBe(false);
     // Served through the read API function exactly as Neon's Cloud-visible (trimmed) titles.
     const served = await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"], ["claude", "s-2"], ["claude", "s-3"]]));
     expect(served.map((r) => [r.session_id, r.title, r.origin])).toEqual([["s-1", "Neon title", "neon_backfill"], ["s-2", "Legacy v1", "neon_backfill"]]);
     // A tampered SP title is a reported difference, never silently equal.
     await pg.query("UPDATE sessions.session_briefs SET title = 'Tampered' WHERE session_id = 's-1'");
     expect((await verifyBackfill(target(pg), fixture)).different).toBe(1);
+  });
+
+  test("an object-layout-encoded pointer gets its Neon title (resolution through canonical_session_id)", async () => {
+    const pg = await db();
+    // RelayHistory id sess/abc, stored on the encoded physical pointer sess_abc.
+    await pointer(pg, { key: { ...KEY, sessionId: "sess_abc" } });
+    await pg.query("UPDATE sessions.session_index SET canonical_session_id = 'sess/abc' WHERE session_id = 'sess_abc'");
+    const fixture = [neon({ session_id: "sess/abc", title: "Fix login" })];
+    expect((await loadBackfill(target(pg), fixture, "execute")).outcomes).toMatchObject({ inserted: 1, skipped_no_pointer: 0 });
+    expect(await row(pg, { ...KEY, sessionId: "sess_abc" })).toMatchObject({ title: "Fix login", origin: "neon_backfill" });
+    // Served after cutover under the id Cloud keys...
+    const served = await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "sess/abc"], ["claude", "sess_abc"]]));
+    expect(served.map((r) => [r.session_id, r.title])).toEqual([["sess/abc", "Fix login"]]);
+    // ...and verify agrees.
+    const v = await verifyBackfill(target(pg), fixture);
+    expect(v).toMatchObject({ equal: 1, missing: 0, different: 0 });
+    expect(verifyPassed(v)).toBe(true);
+  });
+
+  test("a native brief on any physical sibling wins over a newer backfilled one", async () => {
+    const pg = await db();
+    for (const id of ["sess_a", "sess_b"]) await pointer(pg, { key: { ...KEY, sessionId: id } });
+    await pg.query("UPDATE sessions.session_index SET canonical_session_id = 'L-1' WHERE session_id IN ('sess_a', 'sess_b')");
+    await recordBrief(hoopDb(pg), { ...KEY, sessionId: "sess_a" }, { "m-1": 1 }, { status: "ready", text: text({ title: "Current native", generatedAt: new Date("2026-10-01T00:00:00Z") }) });
+    // The backfill writes every physical sibling it can; sess_a keeps its native title.
+    expect((await loadBackfill(target(pg), [neon({ session_id: "L-1", title: "Stale Neon", generated_at: "2026-10-30T00:00:00Z" })], "execute")).outcomes.inserted).toBe(1);
+    expect(await row(pg, { ...KEY, sessionId: "sess_b" })).toMatchObject({ title: "Stale Neon", origin: "neon_backfill" });
+    const served = await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "L-1"]]));
+    expect(served.map((r) => r.title)).toEqual(["Current native"]);
+    const v = await verifyBackfill(target(pg), [neon({ session_id: "L-1", title: "Stale Neon" })]);
+    expect(v).toMatchObject({ native: 1, missing: 0, different: 0 });
+  });
+
+  test("a whitespace-only title is never served and does not hide a sibling's title", async () => {
+    const pg = await db();
+    for (const id of ["sess_a", "sess_b"]) await pointer(pg, { key: { ...KEY, sessionId: id } });
+    await pg.query("UPDATE sessions.session_index SET canonical_session_id = 'L-2' WHERE session_id IN ('sess_a', 'sess_b')");
+    await recordBrief(hoopDb(pg), { ...KEY, sessionId: "sess_a" }, { "m-1": 1 }, { status: "ready", text: text({ title: "   ", generatedAt: new Date("2026-11-02T00:00:00Z") }) });
+    await recordBrief(hoopDb(pg), { ...KEY, sessionId: "sess_b" }, { "m-1": 1 }, { status: "ready", text: text({ title: "  Older real  ", generatedAt: new Date("2026-10-01T00:00:00Z") }) });
+    const served = await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "L-2"], ["claude", "sess_a"]]));
+    expect(served.map((r) => [r.session_id, r.title])).toEqual([["L-2", "Older real"]]);
   });
 
   test("a fixture that repeats a key is refused before any write", async () => {

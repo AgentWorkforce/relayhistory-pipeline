@@ -111,20 +111,31 @@ describe("GET /v1/sessions/titles", () => {
     expect(calls).toHaveLength(1);
   });
 
-  test("a row outside the request, the tenant or the title bound is never served", async () => {
+  test("a row outside the request or the tenant fails the read", async () => {
     for (const [rows, status] of [
       [[row({ org_id: "org-b" })], 500],
       [[row({ workspace_id: "ws-b" })], 500],
       [[row({ session_id: "s-other" })], 503],
       [[row(), row()], 503],
-      [[row({ title: "x".repeat(91) })], 503],
-      [[row({ title: "two\nlines" })], 503],
-      [[row({ title: "" })], 503],
     ] as Array<[BriefTitleRow[], number]>) {
       const r = await api({ titles: stub({ rows }).titles }).get(q("claude:s-1"));
       expect(r.status).toBe(status);
-      expect(JSON.stringify(await body(r))).not.toContain("x".repeat(91));
     }
+  });
+
+  test("a blank or over-long title drops only that key; titles are trimmed", async () => {
+    const rows = [
+      row({ session_id: "s-1", title: "   " }),
+      row({ session_id: "s-2", title: "x".repeat(91) }),
+      row({ session_id: "s-3", title: "  Fix login  " }),
+      row({ session_id: "s-4", title: "two\nlines" }),
+    ];
+    const r = await api({ titles: stub({ rows }).titles }).get(q("claude:s-1", "claude:s-2", "claude:s-3", "claude:s-4"));
+    expect(r.status).toBe(200);
+    expect((await body(r)).titles).toEqual([
+      { source: "claude", sessionId: "s-3", title: "Fix login" },
+      { source: "claude", sessionId: "s-4", title: "two\nlines" },
+    ]);
   });
 
   test("database refusals and failures are non-2xx, never an empty 200", async () => {

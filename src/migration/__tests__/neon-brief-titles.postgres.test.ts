@@ -57,7 +57,7 @@ CREATE TABLE sessions.session_analysis_requests (
   id uuid PRIMARY KEY, org_id text NOT NULL, workspace_id text NOT NULL, session_id text NOT NULL,
   status text NOT NULL, brief_job_id uuid, created_at timestamptz NOT NULL);`;
 
-type Job = { org: string; ws: string; src: string; session: string; title: unknown; status?: string; reqStatus?: string; evidence?: string[]; at: string; kind?: string; state?: string | null; prompt?: string };
+type Job = { org: string; ws: string; src: string; session: string; title: unknown; status?: string; reqStatus?: string; evidence?: string[]; at: string; kind?: string; state?: string | null; prompt?: string; description?: string };
 const JOBS: Job[] = [
   { org: "org-a", ws: "ws-a", src: "claude", session: "s-1", title: "  Older title ", at: "2026-10-01T00:00:00Z" },
   { org: "org-a", ws: "ws-a", src: "claude", session: "s-1", title: " Latest title ", at: "2026-10-02T00:00:00Z" },
@@ -72,9 +72,14 @@ const JOBS: Job[] = [
   { org: "org-a", ws: "ws-a", src: "claude", session: "s-7", title: "Native wins", at: "2026-10-02T00:00:00Z" },
   { org: "org-a", ws: "ws-b", src: "claude", session: "s-1", title: "Other workspace", evidence: ["ws-b"], at: "2026-10-02T00:00:00Z" },
   { org: "org-b", ws: "ws-a", src: "claude", session: "s-1", title: "Other org", at: "2026-10-02T00:00:00Z" },
+  // RelayHistory id sess/abc lives on the object-layout-encoded SP pointer sess_abc.
+  { org: "org-a", ws: "ws-a", src: "claude", session: "sess/abc", title: "Fix login", at: "2026-10-02T00:00:00Z" },
+  // A title Cloud shows whose description is empty: carried as a title-only legacy brief.
+  { org: "org-a", ws: "ws-a", src: "claude", session: "s-8", title: "Title only", description: "", at: "2026-10-02T00:00:00Z" },
 ];
-/** SP sessions with a live pointer (s-6 has none). */
-const POINTERS: Array<[string, string, string, string]> = [
+/** SP sessions with a live pointer (s-6 has none): [org, ws, harness, physical id, canonical id?]. */
+const POINTERS: Array<[string, string, string, string, string?]> = [
+  ["org-a", "ws-a", "claude", "sess_abc", "sess/abc"], ["org-a", "ws-a", "claude", "s-8"],
   ["org-a", "ws-a", "claude", "s-1"], ["org-a", "ws-a", "codex", "s-1"], ["org-a", "ws-a", "claude", "s-2"],
   ["org-a", "ws-a", "claude", "s-3"], ["org-a", "ws-a", "claude", "s-4"], ["org-a", "ws-a", "claude", "s-5"],
   ["org-a", "ws-a", "claude", "s-7"], ["org-a", "ws-b", "claude", "s-1"], ["org-b", "ws-a", "claude", "s-1"],
@@ -129,14 +134,15 @@ describe.skipIf(!url)("owned PG17: F2 brief-title backfill rehearsal", () => {
     const assets = await derivedSchemaAssets();
     expect(assets.expected.names).toContain("upstream:20261105043000_brief_titles.sql");
     expect(await schemaVerdict({ ...assets.expected, dbMode: "local" }, transact)).toEqual({ ok: true });
-    for (const [org, ws, harness, session] of POINTERS)
+    for (const [org, ws, harness, session, canonical] of POINTERS)
       await target.query(
         `INSERT INTO sessions.session_index
            (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
-            storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, title)
+            storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, title,
+            canonical_session_id)
          VALUES ($1, $2, $3, $4, 'm-1', 'u-1', now(), now(), 'fs', 'bucket', $5,
-                 decode(repeat('ab', 32), 'hex'), 'jsonl', '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1, 'pointer title')`,
-        [org, ws, harness, session, `manifest/${org}/${ws}/${harness}/${session}`]);
+                 decode(repeat('ab', 32), 'hex'), 'jsonl', '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1, 'pointer title', $6)`,
+        [org, ws, harness, session, `manifest/${org}/${ws}/${harness}/${session}`, canonical ?? null]);
     // s-7 already has a native brief: the backfill must not replace it.
     await target.query(
       `INSERT INTO sessions.session_briefs (org_id, workspace_id, harness, session_id, status, revision, source_revisions,
@@ -150,7 +156,7 @@ describe.skipIf(!url)("owned PG17: F2 brief-title backfill rehearsal", () => {
       await neon.query(
         `INSERT INTO sessions.session_analysis_jobs VALUES ($1,$2,$3,$4,$5,'session-summary-v3','gpt-5.6-luna',$6,$7,$8,$9,$10)`,
         [id, j.org, j.ws, j.session, j.src, JSON.stringify({ evidenceWorkspaceIds: j.evidence ?? [j.ws] }), j.status ?? "completed", j.kind ?? "brief",
-         JSON.stringify({ title: j.title, description: "A description.", ...(j.state === null ? {} : { state: j.state ?? "completed" }), promptVersion: j.prompt ?? "session-summary-v3", generatedAt: j.at, backend: { model: "gpt-5.6-luna", inputTokens: 10, outputTokens: 2 } }),
+         JSON.stringify({ title: j.title, description: j.description ?? "A description.", ...(j.state === null ? {} : { state: j.state ?? "completed" }), promptVersion: j.prompt ?? "session-summary-v3", generatedAt: j.at, backend: { model: "gpt-5.6-luna", inputTokens: 10, outputTokens: 2 } }),
          j.at]);
       await neon.query("INSERT INTO sessions.session_analysis_requests VALUES ($1,$2,$3,$4,$5,$1,$6)", [id, j.org, j.ws, j.session, j.reqStatus ?? "resolved", j.at]);
     }
@@ -165,8 +171,8 @@ describe.skipIf(!url)("owned PG17: F2 brief-title backfill rehearsal", () => {
     const dry = await cli([]);
     expect(dry.exit).toBe(0);
     expect(dry.out.backfill).toMatchObject({
-      mode: "dry-run", candidates: 8, skipped: { title_blank: 1 },
-      outcomes: { inserted: 5, updated: 0, skipped_native: 1, skipped_quarantined: 0, skipped_no_pointer: 1 },
+      mode: "dry-run", candidates: 10, skipped: { title_blank: 1 },
+      outcomes: { inserted: 7, updated: 0, skipped_native: 1, skipped_quarantined: 0, skipped_no_pointer: 1 },
     });
     expect((await target.query("SELECT count(*)::int AS n FROM sessions.session_briefs")).rows[0].n).toBe(1);
     // Nothing printed is content.
@@ -201,21 +207,26 @@ describe.skipIf(!url)("owned PG17: F2 brief-title backfill rehearsal", () => {
         compared += 1;
       }
     }
-    expect(compared).toBe(8);
+    expect(compared).toBe(10);
+    // The encoded pointer serves its Neon title under the id Cloud keys.
+    expect((await servedTitles("org-a", "ws-a", [["claude", "sess/abc"]])).get(JSON.stringify(["claude", "sess/abc"]))).toBe("Fix login");
+    expect((await servedTitles("org-a", "ws-a", [["claude", "s-8"]])).get(JSON.stringify(["claude", "s-8"]))).toBe("Title only");
     expect((await servedTitles("org-a", "ws-a", [["claude", "s-1"]])).get(JSON.stringify(["claude", "s-1"]))).toBe("Latest title");
 
     const verify = await cli(["--verify"]);
-    expect(verify.exit).toBe(0);
-    expect(verify.out.verify).toMatchObject({ candidates: 8, compared: 7, equal: 5, native: 1, missing: 1, different: 0 });
+    // s-6 (no SP pointer) is a Cloud-visible title SP cannot serve: the run fails (exit 2).
+    expect(verify.exit).toBe(2);
+    expect(verify.out.passed).toBe(false);
+    expect(verify.out.verify).toMatchObject({ candidates: 10, compared: 9, equal: 7, native: 1, missing: 1, different: 0 });
     expect(verify.out.verify.samples.missing).toEqual([["org-a", "ws-a", "claude", "s-6"]]);
     expect((await cli(["--verify", "--execute"])).exit).toBe(1);
 
     const again = await cli(["--execute", "--expect-target-host=127.0.0.1"]);
-    expect(again.out.backfill.outcomes).toMatchObject({ inserted: 0, updated: 5, skipped_native: 1 });
+    expect(again.out.backfill.outcomes).toMatchObject({ inserted: 0, updated: 7, skipped_native: 1 });
     // The read role verifier still passes with the backfilled rows and the new function.
     await target.query(text("supabase/bootstrap/session_read_api_role_verify.sql"));
     const rows = (await target.query("SELECT origin, count(*)::int AS n FROM sessions.session_briefs GROUP BY 1 ORDER BY 1")).rows;
-    expect(rows).toEqual([{ origin: "native", n: 1 }, { origin: "neon_backfill", n: 5 }]);
+    expect(rows).toEqual([{ origin: "native", n: 1 }, { origin: "neon_backfill", n: 7 }]);
   }, 120000);
 
   test("guarded down refuses while backfilled rows remain; after deleting them, down and up are clean", async () => {

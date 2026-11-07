@@ -9,6 +9,18 @@
  * with evidenceWorkspaceIds exactly [workspace]. Cloud shows `btrim(result.title)` when it is
  * non-blank; the same value is carried here.
  *
+ * Key resolution, the same as sessions.session_brief_titles_for (the read path): the Neon
+ * session id is the RelayHistory (logical) id, coalesce(canonical_session_id, session_id) of a
+ * live SP pointer. An object-layout-encoded pointer (physical `sess_abc` for `sess/abc`)
+ * carries it in canonical_session_id; the brief is written on the physical session id.
+ *
+ * Parity: every title Cloud shows is carried (Cloud shows any non-blank trimmed title). Only
+ * the title has to be valid (1-90 characters: relayhistory's brief schema maxLength); the
+ * rest is best effort, and a backfilled row may have no description or state, a line break
+ * in the title, or placeholder prompt/model labels ('neon-unknown' / 'unknown') when Neon's
+ * are not representable. Skipped, and so reported missing by --verify: a blank title (Cloud
+ * shows none either, not compared), a key that is not a harness name, and a title over 90.
+ *
  * Target rules (LOAD_SQL), all in the statement, so a concurrent native brief always wins:
  *   - only where the session has a live pointer, locked FOR SHARE until COMMIT (as the
  *     native writer does), so an erasure either waits for this write (and its forget
@@ -45,6 +57,7 @@ export const NEON_SELECT_SQL = `SELECT DISTINCT ON (request.org_id, job.workspac
        job.summary_model_version,
        job.result->>'generatedAt' AS generated_at,
        to_char(job.completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS completed_at,
+       to_char(request.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS requested_at,
        job.result->>'messageCount' AS message_count,
        job.result->>'shortenedMessages' AS shortened_messages,
        job.result#>>'{backend,inputTokens}' AS input_tokens,
@@ -74,6 +87,8 @@ export interface NeonBriefRow {
   summary_model_version: string | null;
   generated_at: string | null;
   completed_at: string | null;
+  /** request.created_at: NOT NULL in Neon, the last generated_at fallback. */
+  requested_at?: string | null;
   message_count: string | null;
   shortened_messages: string | null;
   input_tokens: string | null;
@@ -88,7 +103,7 @@ export interface BackfillRow {
   session_id: string;
   legacy_job_id: string;
   title: string;
-  description: string;
+  description: string | null;
   state: string | null;
   prompt_version: string;
   model: string;
@@ -100,15 +115,11 @@ export interface BackfillRow {
   fingerprint: string;
 }
 
-export type SkipReason =
-  | "title_blank"
-  | "title_invalid"
-  | "description_invalid"
-  | "state_invalid"
-  | "prompt_version_invalid"
-  | "model_invalid"
-  | "generated_at_invalid"
-  | "key_invalid";
+export type SkipReason = "title_blank" | "title_too_long" | "generated_at_invalid" | "key_invalid";
+
+/** Placeholder labels for a backfilled brief whose Neon prompt or model is not representable. */
+export const UNKNOWN_PROMPT_VERSION = "neon-unknown";
+export const UNKNOWN_MODEL = "unknown";
 
 const HARNESS = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 const VERSION = /^[a-z0-9][a-z0-9._:-]{0,63}$/u;
@@ -140,16 +151,12 @@ export function toBackfillRow(n: NeonBriefRow): { row: BackfillRow } | { skip: S
     return { skip: "key_invalid" };
   const title = cloudTitle(n.title);
   if (title === null) return { skip: "title_blank" };
-  if (title.length > 90 || LINE_BREAK.test(title)) return { skip: "title_invalid" };
+  if (title.length > 90) return { skip: "title_too_long" };
   const description = typeof n.description === "string" ? n.description.trim() : "";
-  if (!description || description.length > 320 || LINE_BREAK.test(description)) return { skip: "description_invalid" };
-  const state = n.state === null || n.state === "" ? null : n.state;
-  if (state !== null && !STATES.has(state)) return { skip: "state_invalid" };
-  const prompt = n.prompt_version ?? n.summary_version;
-  if (!prompt || !VERSION.test(prompt)) return { skip: "prompt_version_invalid" };
-  const model = n.model ?? n.summary_model_version;
-  if (!model || !MODEL.test(model)) return { skip: "model_invalid" };
-  const at = [n.generated_at, n.completed_at].find((v) => typeof v === "string" && Number.isFinite(Date.parse(v)));
+  const state = n.state !== null && STATES.has(n.state) ? n.state : null;
+  const prompt = [n.prompt_version, n.summary_version].find((v) => typeof v === "string" && VERSION.test(v)) ?? UNKNOWN_PROMPT_VERSION;
+  const model = [n.model, n.summary_model_version].find((v) => typeof v === "string" && MODEL.test(v)) ?? UNKNOWN_MODEL;
+  const at = [n.generated_at, n.completed_at, n.requested_at].find((v) => typeof v === "string" && Number.isFinite(Date.parse(v)));
   if (!at) return { skip: "generated_at_invalid" };
   return {
     row: {
@@ -159,7 +166,8 @@ export function toBackfillRow(n: NeonBriefRow): { row: BackfillRow } | { skip: S
       session_id: n.session_id,
       legacy_job_id: n.job_id,
       title,
-      description,
+      // Kept only within the native bounds; otherwise a title-only legacy brief.
+      description: description && description.length <= 320 && !LINE_BREAK.test(description) ? description : null,
       state,
       prompt_version: prompt,
       model,
@@ -185,22 +193,27 @@ export const LOAD_SQL = `WITH input AS (
     generated_at timestamptz, message_count integer, shortened_messages integer,
     input_tokens bigint, output_tokens bigint, fingerprint text)
 ), locked AS (
-  -- Every live pointer of the batch's sessions, held until COMMIT (FOR SHARE cannot carry
-  -- DISTINCT, so the de-duplication is the next step).
-  SELECT p.org_id, p.workspace_id, p.harness, p.session_id
+  -- Every live pointer resolving to an input's RelayHistory id (unencoded: session_id with no
+  -- canonical id; encoded: canonical_session_id), held until COMMIT. FOR SHARE cannot carry
+  -- DISTINCT, so the de-duplication is the next step.
+  SELECT p.org_id, p.workspace_id, p.harness, p.session_id AS physical_id, i.session_id AS history_id
     FROM sessions.session_index AS p
-    JOIN input AS i ON p.org_id = i.org_id AND p.workspace_id = i.workspace_id
-                   AND p.harness = i.harness AND p.session_id = i.session_id
+    JOIN input AS i ON p.org_id = i.org_id AND p.workspace_id = i.workspace_id AND p.harness = i.harness
+                   AND ((p.session_id = i.session_id AND p.canonical_session_id IS NULL)
+                        OR p.canonical_session_id = i.session_id)
    WHERE p.deleted_at IS NULL
      FOR SHARE OF p
-), live AS (
-  SELECT DISTINCT org_id, workspace_id, harness, session_id FROM locked
+), targets AS (
+  -- One writer per physical session (a physical id resolves to one RelayHistory id; if mixed
+  -- pointers ever disagree, the lowest id wins deterministically and the other is skipped).
+  SELECT DISTINCT ON (org_id, workspace_id, harness, physical_id) org_id, workspace_id, harness, physical_id, history_id
+    FROM locked ORDER BY org_id, workspace_id, harness, physical_id, history_id
 ), existing AS (
-  SELECT b.org_id, b.workspace_id, b.harness, b.session_id, b.title IS NOT NULL AS titled,
-         b.origin, b.status
+  SELECT b.org_id, b.workspace_id, b.harness, b.session_id AS physical_id,
+         b.title IS NOT NULL AS titled, b.status
     FROM sessions.session_briefs AS b
-    JOIN input AS i ON b.org_id = i.org_id AND b.workspace_id = i.workspace_id
-                   AND b.harness = i.harness AND b.session_id = i.session_id
+    JOIN targets AS t ON b.org_id = t.org_id AND b.workspace_id = t.workspace_id
+                     AND b.harness = t.harness AND b.session_id = t.physical_id
 ), written AS (
   INSERT INTO sessions.session_briefs AS b
     (org_id, workspace_id, harness, session_id, status, revision, source_revisions,
@@ -208,13 +221,14 @@ export const LOAD_SQL = `WITH input AS (
      scrub_ruleset, scrub_version, prompt_version, engine_version, model, message_count,
      shortened_messages, input_tokens, output_tokens, generated_at, legacy_job_id,
      attempted_at, updated_at)
-  SELECT i.org_id, i.workspace_id, i.harness, i.session_id, 'ready', 0, '{}'::jsonb,
+  SELECT t.org_id, t.workspace_id, t.harness, t.physical_id, 'ready', 0, '{}'::jsonb,
          i.title, i.description, i.state, 0, '{}'::jsonb, i.fingerprint,
          '${BACKFILL_SCRUB_RULESET}', 1, i.prompt_version, '${BACKFILL_ENGINE_VERSION}', i.model,
          i.message_count, i.shortened_messages, i.input_tokens, i.output_tokens,
          i.generated_at, i.legacy_job_id, now(), now()
     FROM input AS i
-    JOIN live AS l USING (org_id, workspace_id, harness, session_id)
+    JOIN targets AS t ON t.org_id = i.org_id AND t.workspace_id = i.workspace_id
+                     AND t.harness = i.harness AND t.history_id = i.session_id
   ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET
     title = excluded.title, description = excluded.description, state = excluded.state,
     brief_revision = excluded.brief_revision,
@@ -227,17 +241,28 @@ export const LOAD_SQL = `WITH input AS (
     generated_at = excluded.generated_at, legacy_job_id = excluded.legacy_job_id,
     updated_at = now()
   WHERE (b.title IS NULL AND b.status <> 'quarantined') OR b.origin = 'neon_backfill'
-  RETURNING b.org_id, b.workspace_id, b.harness, b.session_id
+  RETURNING b.org_id, b.workspace_id, b.harness, b.session_id AS physical_id
+), per_input AS (
+  SELECT i.org_id, i.workspace_id, i.harness, i.session_id,
+         bool_or(w.physical_id IS NOT NULL) AS any_write,
+         bool_or(w.physical_id IS NOT NULL AND e.physical_id IS NULL) AS any_insert,
+         bool_or(t.physical_id IS NOT NULL) AS any_live,
+         bool_or(e.status = 'quarantined' AND NOT e.titled) AS any_quarantine
+    FROM input AS i
+    LEFT JOIN targets AS t ON t.org_id = i.org_id AND t.workspace_id = i.workspace_id
+                          AND t.harness = i.harness AND t.history_id = i.session_id
+    LEFT JOIN existing AS e ON e.org_id = t.org_id AND e.workspace_id = t.workspace_id
+                           AND e.harness = t.harness AND e.physical_id = t.physical_id
+    LEFT JOIN written AS w ON w.org_id = t.org_id AND w.workspace_id = t.workspace_id
+                          AND w.harness = t.harness AND w.physical_id = t.physical_id
+   GROUP BY i.org_id, i.workspace_id, i.harness, i.session_id
 )
-SELECT i.org_id, i.workspace_id, i.harness, i.session_id,
-       CASE WHEN w.session_id IS NOT NULL THEN CASE WHEN e.session_id IS NULL THEN 'inserted' ELSE 'updated' END
-            WHEN l.session_id IS NULL THEN 'skipped_no_pointer'
-            WHEN e.status = 'quarantined' AND NOT e.titled THEN 'skipped_quarantined'
+SELECT org_id, workspace_id, harness, session_id,
+       CASE WHEN any_write THEN CASE WHEN any_insert THEN 'inserted' ELSE 'updated' END
+            WHEN NOT any_live THEN 'skipped_no_pointer'
+            WHEN any_quarantine THEN 'skipped_quarantined'
             ELSE 'skipped_native' END AS outcome
-  FROM input AS i
-  LEFT JOIN live AS l USING (org_id, workspace_id, harness, session_id)
-  LEFT JOIN existing AS e USING (org_id, workspace_id, harness, session_id)
-  LEFT JOIN written AS w USING (org_id, workspace_id, harness, session_id)`;
+  FROM per_input`;
 
 export type LoadOutcome = "inserted" | "updated" | "skipped_native" | "skipped_quarantined" | "skipped_no_pointer";
 
@@ -298,15 +323,36 @@ export async function loadBackfill(target: TargetClient, source: readonly NeonBr
   return report;
 }
 
-/** The SP title Cloud would be served for one Neon candidate key (session_brief_titles_for's exact-id rule). */
-export const VERIFY_SQL = `SELECT i.org_id, i.workspace_id, i.harness, i.session_id, b.title, b.origin
+/**
+ * The title SP serves for each Neon candidate key: sessions.session_brief_titles_for's exact
+ * resolution and preference (logical id through canonical_session_id; native first, then
+ * newest; trimmed, never blank), without its role guard (verify runs as the owner, READ ONLY).
+ */
+export const VERIFY_SQL = `SELECT i.org_id, i.workspace_id, i.harness, i.session_id, hit.title, hit.origin
   FROM jsonb_to_recordset($1::jsonb) AS i(org_id text, workspace_id text, harness text, session_id text)
-  LEFT JOIN sessions.session_briefs AS b
-    ON b.org_id = i.org_id AND b.workspace_id = i.workspace_id AND b.harness = i.harness
-   AND b.session_id = i.session_id AND b.title IS NOT NULL
-   AND EXISTS (SELECT 1 FROM sessions.session_index AS p
-                WHERE p.org_id = b.org_id AND p.workspace_id = b.workspace_id
-                  AND p.harness = b.harness AND p.session_id = b.session_id AND p.deleted_at IS NULL)`;
+  LEFT JOIN LATERAL (
+    SELECT btrim(b.title) AS title, b.origin
+      FROM (
+        SELECT p.session_id FROM sessions.session_index AS p
+         WHERE p.org_id = i.org_id AND p.workspace_id = i.workspace_id AND p.harness = i.harness
+           AND p.session_id = i.session_id AND p.canonical_session_id IS NULL AND p.deleted_at IS NULL
+        UNION
+        SELECT p.session_id FROM sessions.session_index AS p
+         WHERE p.org_id = i.org_id AND p.workspace_id = i.workspace_id AND p.harness = i.harness
+           AND p.canonical_session_id = i.session_id AND p.deleted_at IS NULL
+      ) AS c
+      JOIN sessions.session_briefs AS b
+        ON b.org_id = i.org_id AND b.workspace_id = i.workspace_id AND b.harness = i.harness
+       AND b.session_id = c.session_id
+     WHERE b.title IS NOT NULL AND btrim(b.title) <> ''
+     ORDER BY (b.origin = 'native') DESC, b.generated_at DESC, b.session_id
+     LIMIT 1
+  ) AS hit ON true`;
+
+/** Parity holds only with nothing missing and nothing different. */
+export function verifyPassed(r: VerifyReport): boolean {
+  return r.missing === 0 && r.different === 0;
+}
 
 export interface VerifyReport {
   candidates: number;

@@ -77,8 +77,10 @@ export function sqlBriefTitles(run: TenantRunner): BriefTitles {
 }
 
 /**
- * The response entries: rows rechecked against the tenant and the requested keys, and
- * bounded like the list's title. A key with no row has no title (a known null).
+ * The response entries: rows rechecked against the tenant and the requested keys (a row
+ * outside either fails the read). Per title: trimmed, and dropped (that key has no title)
+ * when blank or over the list's 90-character bound, so one bad title never fails the page.
+ * A backfilled title may hold a line break (20261105043000); it is served as stored.
  */
 export function briefTitleEntries(
   rows: readonly BriefTitleRow[],
@@ -93,9 +95,9 @@ export function briefTitleEntries(
     const key = JSON.stringify([row.harness, row.session_id]);
     if (!wanted.has(key) || seen.has(key)) throw new BriefTitlesError("parse");
     seen.add(key);
-    if (typeof row.title !== "string" || row.title.length < 1 || row.title.length > BRIEF_TITLE_MAX_CHARS || /[\r\n]/u.test(row.title))
-      throw new BriefTitlesError("parse");
-    out.push({ source: row.harness, sessionId: row.session_id, title: row.title });
+    const title = typeof row.title === "string" ? row.title.trim() : "";
+    if (!title || title.length > BRIEF_TITLE_MAX_CHARS) continue;
+    out.push({ source: row.harness, sessionId: row.session_id, title });
   }
   return out;
 }

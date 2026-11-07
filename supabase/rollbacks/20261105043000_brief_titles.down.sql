@@ -1,6 +1,7 @@
 -- Down path for supabase/migrations/20261105043000_brief_titles.sql.
 -- Drops session_brief_titles_for, the provenance trigger and its function, and the two
--- columns, and restores 20261102020000's session_briefs_state_text. Revert the code first:
+-- columns, and restores 20261102000000's session_briefs_title_check and
+-- session_briefs_text_provenance and 20261102020000's session_briefs_state_text. Revert the code first:
 -- the read API's GET /v1/sessions/titles answers 501 brief_titles_not_migrated once the
 -- function is gone. Exercised by src/session-brief/__tests__/brief-titles.test.ts (up,
 -- down, up). Code only: running it against a hosted database needs the user's OK.
@@ -28,6 +29,22 @@ END $rollback_guard$;
 DROP FUNCTION IF EXISTS sessions.session_brief_titles_for(text, text[], text[]);
 DROP TRIGGER IF EXISTS session_briefs_provenance ON sessions.session_briefs;
 DROP FUNCTION IF EXISTS sessions.session_briefs_provenance();
+ALTER TABLE sessions.session_briefs DROP CONSTRAINT IF EXISTS session_briefs_text_provenance;
+ALTER TABLE sessions.session_briefs ADD CONSTRAINT session_briefs_text_provenance CHECK (
+  (title IS NULL) = (description IS NULL) AND
+  (title IS NULL) = (brief_revision IS NULL) AND
+  (title IS NULL) = (brief_source_revisions IS NULL) AND
+  (title IS NULL) = (brief_fingerprint IS NULL) AND
+  (title IS NULL) = (scrub_ruleset IS NULL) AND
+  (title IS NULL) = (scrub_version IS NULL) AND
+  (title IS NULL) = (prompt_version IS NULL) AND
+  (title IS NULL) = (engine_version IS NULL) AND
+  (title IS NULL) = (model IS NULL) AND
+  (title IS NULL) = (generated_at IS NULL)
+);
+ALTER TABLE sessions.session_briefs DROP CONSTRAINT IF EXISTS session_briefs_title_check;
+ALTER TABLE sessions.session_briefs ADD CONSTRAINT session_briefs_title_check CHECK (
+  char_length(title) BETWEEN 1 AND 90 AND title !~ '[\r\n]');
 ALTER TABLE sessions.session_briefs DROP CONSTRAINT IF EXISTS session_briefs_state_text;
 ALTER TABLE sessions.session_briefs ADD CONSTRAINT session_briefs_state_text CHECK (
   (title IS NOT NULL OR state IS NULL) AND
