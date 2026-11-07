@@ -69,11 +69,11 @@ recovers a lost wakeup. Retention-ready: rows carry `org_id` plus `built_at`.
 
 ## Activation order (lead, each step with Khaliq's OK)
 
-1. Land 044000 only after #288 (040000), #289 (041000) and the lower slots, in numeric order.
+1. Land 044000 only after 043000 (#295) and the lower slots, in numeric order.
    Apply it in a reviewed migration window. Regenerate the boundary first:
    `bun scripts/sync-sessions-function-boundary.ts --check`. The F10 actor verifier now also
-   allows `session_pr_evidence_read_v1`. Re-run `canonical_project_events_verify.sql` after
-   migrating.
+   allows `session_pr_evidence_read_v1`, and the ingest verifier covers the worker RPCs. Re-run
+   both `canonical_project_events_verify.sql` and `session_ingest_verify.sql` after migrating.
 2. Deploy the worker with `SESSION_PR_EVIDENCE_ENABLED=false`. Then set it to true. It still
    claims nothing until step 3.
 3. `INSERT INTO sessions.session_pr_evidence_settings(enabled) VALUES (true);`. New publishes
