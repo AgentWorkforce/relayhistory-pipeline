@@ -543,6 +543,37 @@ describe("bounded, resumable reservation retirement (dogpatch 5548 P2)", () => {
     expect(count(r.st, "SELECT count(*) AS n FROM erase_reservations")).toBe(1_499);
   });
 
+  test("a reservation added AFTER the proof's generation stays reserved (never retired against the older proof)", async () => {
+    const r = await reserved(10);
+    const hw = r.st.reservationHighWater(D);
+    const late = { key: `${D}late.zst`, versionId: "v-late" };
+    expect(r.st.reserveErase(D, r.st.obligationRev(D), "S", [late]).ok).toBe(true); // concurrent, after the proof
+    while (!r.st.retireReservationsPage(D, "S", undefined, () => true, 1000, hw).done);
+    expect(r.st.reservationsAt(late.key)).toEqual(["v-late"]);
+    expect(r.st.erasedAt(late.key)).toEqual([]);
+    expect(count(r.st, "SELECT count(*) AS n FROM erased_versions")).toBe(10);
+  });
+
+  test("job level: a reservation made concurrently DURING the proof's inventory (same scope) stays reserved after completion", async () => {
+    const w = await world(20);
+    const scope = eraseScope(["queued-prefix", "supabase", "org-1", PREFIX, "fenced", Date.parse("2026-11-07T00:00:00Z") - 1000, "lease:" + PREFIX]);
+    const late = { key: `${PREFIX}raw/late.ndjson.zst`, versionId: "v-late-concurrent" };
+    let emptyLists = 0;
+    w.s.rewrite = (_call, xml) => {
+      // The first empty listing is the fresh verification (one page erased everything, no relist), taken AFTER the
+      // proof generation was captured: a concurrent reservation lands right then.
+      if (w.s.count(PREFIX) === 0 && ++emptyLists === 1) expect(w.st.reserveErase(PREFIX, w.st.obligationRev(PREFIX), scope, [late]).ok).toBe(true);
+      return xml;
+    };
+    await w.j.drain();
+    expect(emptyLists).toBeGreaterThanOrEqual(1);
+    // The writer-side change after the load refuses this run (compare-and-set on the prefix revision) before any
+    // retirement; the concurrent reservation stays reserved and out of the erased history, and the item stays queued.
+    expect(w.st.reservationsAt(late.key)).toEqual(["v-late-concurrent"]);
+    expect(w.st.erasedAt(late.key)).toEqual([]);
+    expect(w.queued()).toEqual([PREFIX]);
+  });
+
   test("job level: a prefix whose reservations span several retirement pages still completes, and every proven-absent version is in the history", async () => {
     const w = await world(2_500);
     await w.j.drain();

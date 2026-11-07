@@ -174,6 +174,9 @@ export class ErasureJob {
       return { status: "incomplete", deleted: step.deleted, remaining: -1 };
     }
     this.state.clearEraseCheckpoint(scope);
+    // The reservation generation the proof below covers: captured BEFORE the inventory, so every reservation it can
+    // retire existed when the inventory was taken (one added later stays reserved).
+    const proofSeq = this.state.reservationHighWater(prefix);
     // A fresh strict COMPLETE inventory: which exact versions are present per key.
     // `present`: object versions (the invocation evidence); `listed`: EVERY listed entry INCLUDING delete markers (the
     // absence proof: a marker still listed is present, never "erased").
@@ -222,7 +225,9 @@ export class ErasureJob {
     const absent = (key: string, versionId: string) => keyFilter(key) && !(listed.get(key)?.has(versionId) ?? false);
     const deadline = this.now() + ERASE_STEP_DEADLINE_MS;
     for (;;) {
-      const page = this.state.retireReservationsPage(prefix, scope, exactKey, absent);
+      // Authority re-checked before EVERY page (async, outside the page's transaction; no network await inside it).
+      await authorize();
+      const page = this.state.retireReservationsPage(prefix, scope, exactKey, absent, 1000, proofSeq);
       if (page.done) break;
       if (this.now() >= deadline) {
         this.counters.resumable += 1;

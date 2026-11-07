@@ -573,16 +573,18 @@ export class SyncState {
    * (key, version_id) order after the DURABLE cursor (`retire_cursor:<scope>`), so a crash resumes instead of
    * rescanning; the cursor is cleared when the scan is complete.
    */
-  retireReservationsPage(prefix: string, scope: string, exactKey: string | undefined, absent: (key: string, versionId: string) => boolean, limit = 1000):
-    { retired: number; done: boolean } {
+  retireReservationsPage(prefix: string, scope: string, exactKey: string | undefined, absent: (key: string, versionId: string) => boolean, limit = 1000,
+    maxSeq = Number.MAX_SAFE_INTEGER): { retired: number; done: boolean } {
     let out = { retired: 0, done: false };
     this.#tx(() => {
       const ck = `retire_cursor:${scope}`;
       const cur = JSON.parse(this.meta(ck) ?? "null") as [string, string] | null;
       const after = cur ? "AND (key > ? OR (key = ? AND version_id > ?))" : "";
       const where = exactKey !== undefined ? "key = ?" : SyncState.#under;
-      const params: (string | number | Uint8Array)[] = [...(exactKey !== undefined ? [exactKey] : SyncState.#u(prefix)), scope, ...(cur ? [cur[0], cur[0], cur[1]] : []), limit];
-      const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${where} AND scope = ? ${after} ORDER BY key, version_id LIMIT ?`).all(...params) as { key: string; version_id: string }[];
+      // Bound to the PROOF's generation: only reservations at or below the high-water seq captured when the proof completed
+      // (a reservation added later was not covered by that proof and stays reserved).
+      const params: (string | number | Uint8Array)[] = [...(exactKey !== undefined ? [exactKey] : SyncState.#u(prefix)), scope, maxSeq, ...(cur ? [cur[0], cur[0], cur[1]] : []), limit];
+      const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${where} AND scope = ? AND seq <= ? ${after} ORDER BY key, version_id LIMIT ?`).all(...params) as { key: string; version_id: string }[];
       const hist = this.db.prepare("INSERT OR IGNORE INTO erased_versions (key, version_id, at) VALUES (?, ?, ?)");
       const del = this.db.prepare("DELETE FROM erase_reservations WHERE key = ? AND version_id = ?");
       let retired = 0;
@@ -603,6 +605,10 @@ export class SyncState {
   retireReservations(prefix: string, absent: (key: string, versionId: string) => boolean, scope?: string) {
     const scopes = scope !== undefined ? [scope] : (this.db.prepare(`SELECT DISTINCT scope FROM erase_reservations WHERE ${SyncState.#under}`).all(...SyncState.#u(prefix)) as { scope: string }[]).map((r) => r.scope);
     for (const sc of scopes) while (!this.retireReservationsPage(prefix, sc, undefined, absent).done);
+  }
+  /** The reservations' high-water seq under a prefix (the generation a completed proof covers). */
+  reservationHighWater(prefix: string): number {
+    return Number((this.db.prepare(`SELECT coalesce(max(seq), 0) AS n FROM erase_reservations WHERE ${SyncState.#under}`).get(...SyncState.#u(prefix)) as { n: number }).n);
   }
   /** The durable retirement cursor of a scope (tests / audits). */
   retireCursor(scope: string): [string, string] | null {
