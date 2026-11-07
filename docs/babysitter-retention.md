@@ -31,7 +31,7 @@ The pipeline does not project or serve these kinds, and the Neon→S3 exporter n
      - **Only the ACCEPTED candidate is served**: the registering claim's batch is committed AND that exact body was accepted (the immutable lazy ACK decision `ingest_lazy_ack_decisions` with the candidate digest and `body_accepted`, or the committed `ingest_record_revisions` row with the same revision, revision id, digest and user). An ACK-refused attempt can neither appear nor displace the accepted winner's original line.
      - **Babysitter-kind deletes** become PERMANENT payload-free tombstone rows with no bucket and no object; they outlive every payload, so `include_deleted` keeps Neon's delete row. Only a privacy fence (disable or reset) removes them: hidden at once, purged by the sweeper in bounded steps (C3).
      - Upsert rows are hidden the moment their bucket is fenced or expired, and are deleted with the bucket's erase.
-   - **Write obligations** (`sessions.babysitter_write_obligations` / `_invocations`, the shared `write-obligation.ts` contract): register records, BEFORE the PUT, one DISPATCHED invocation per bucket object (the claim token) with the object body's expected ETag. Each PUT runs under an enforced wall deadline; its definite outcome (acked with its own version id, or refused) is recorded; an unknown outcome stays dispatched and fails the request.
+   - **Write obligations** (`sessions.babysitter_write_obligations` / `_invocations`, the shared `write-obligation.ts` contract): register records, BEFORE the PUT, one DISPATCHED invocation per bucket object (the claim token). Each PUT runs under an enforced wall deadline (`boundedPut`); its definite outcome (acked with its own version id, or refused) is recorded by `ingest_babysitter_retention_written`; an unknown outcome stays dispatched and fails the request. There is NO content attribution: an ETag (content identity, absent as an MD5 under SSE-KMS) never resolves an invocation.
    - **What this guarantees:** a bucket holds only Babysitter lines, and no session chunk, staged object, buffered stage or canonical generation ever holds the payload. No mixed object is ever registered or erased.
    - **What stays unchanged:** the SQL prepare, publication, seats and custody, which compare SQL metadata only, and the revision fence.
    - **Reset epoch:** it is part of the key, so a write after a user reset always opens a new bucket. A reset never erases post-reset evidence.
@@ -98,13 +98,17 @@ The pipeline does not project or serve these kinds, and the Neon→S3 exporter n
      - **A run that ends on its budget** persists a content-free checkpoint through `complete(progress)`, and the bucket stays pending. The checkpoint is bound to the bucket, the generation, both epochs and `write_seq`. Anything else (a new registration, a generation, a stale scope) is refused and the run restarts from the top.
      - **Resume points:** a run resumes at a completed-key boundary, so a deleted marker version cannot strand the cursor. A provider 400 on an in-key marker restarts at that boundary.
      - **Erased needs proof.** A bucket is `erased` only after a full traversal, a fresh strict zero-version inventory under the fence, `write_seq` unchanged, AND every write obligation of the bucket complete (`write-obligation.ts`):
-       - an invocation resolves only on its OWN terminal evidence: refused, or its acked / attributed exact version absent from a fresh strict complete inventory;
-       - a version found at an unresolved invocation's key whose ETag matches is attributed to it (durable, compare-and-set) BEFORE the bucket-wide delete, so a late commit is caught and erased;
-       - an unknown invocation with nothing attributed stays **UNRESOLVED indefinitely** (lead ruling, shared-unknown-put-nonterminal): the bucket stays tracked and is re-swept on a bounded backoff (1, 2, 4 ... minutes, capped at a day, so a stuck key costs one listing a day). It is never marked erased by a timeout, a hold-off, `write_seq` or any number of zero inventories, and there is no credential-rotation or bucket-policy shortcut.
+       - an invocation resolves only on its OWN terminal evidence recorded by its writer: refused, or acked with its own version id and that exact version absent from a fresh strict complete inventory (per key, in exact-key mode);
+       - before ANY delete, every doomed version of a key with an obligation is RESERVED (`babysitter_write_reservations`, a compare-and-set under the key row's lock, `ObligationStore.reserve`), so a publisher and the erase can never both win; a late commit is erased as cleanup but resolves nothing;
+       - a dispatched (unknown) invocation stays **UNRESOLVED indefinitely** (lead ruling, shared-unknown-put-nonterminal): the bucket stays tracked and is re-swept on a bounded backoff (1, 2, 4 ... minutes, capped at a day, so a stuck key costs one listing a day). It is never marked erased by a timeout, a hold-off, `write_seq` or any number of zero inventories, and there is no credential-rotation or bucket-policy shortcut.
        Versions found behind the cursor restart the traversal; nothing is erased-by-assumption.
      - **Crash or lost acknowledgement** at any step reuses the last persisted checkpoint; deletes by version are idempotent.
    - It logs counts and codes only.
    - **Erase/write fence:** a PUT happens only inside its own request, right after its registration (which records its invocation). Registration is refused while a lease holds, a bucket is claimable only 15 minutes after its last registration, and no erase starts near the lease end. These narrow the races; they do NOT prove a dispatched PUT cannot commit later, which is why the obligations above gate `erased`.
+
+## The strict shared eraser and the existing E3 job (lead ruling C3)
+
+The canonical eraser's strict inventory validation and bounded legacy listing ship **unflagged**, as destructive-operation safety hardening. They apply to the existing E3 calls **even with every Babysitter flag off**; see `runbooks/neon-s3-sync.md` ("Strict inventory: fail closed"). A >10k whole-inventory workload is REFUSED, not erased: that is accepted as safety, and it does not extend erasure coverage or the SLA.
 
 ## Operator order
 
@@ -137,6 +141,7 @@ Each step is the production lead's, with Khaliq's OK for the window, deploys and
 - Without the flag it answers 501. Other kinds also answer 501: this backend serves only the Babysitter kinds.
 
 **Contract** (Neon's `listDelivery`):
+- `X-RelayHistory-Expected-Account` is checked FIRST, before any database or S3 access, against the verified token's account (`relayhistory:` + sha256 of `[orgId, workspaceId]`, Neon's `deliveryAccount`): a missing or mismatched header is Neon's **403 `delivery_account_mismatch`**, "Delivery account does not match authenticated tenant";
 - filters `kind`, `source`, `session_id`, `include_deleted`, `cursor`, `limit` (1..100); unknown or repeated filters are 400;
 - **Neon's native order:** (origin_id, record_id) in C collation, with the cursor position (origin_id, record_id) bound to the filter scope;
 - **bounded page work, no materialization:**
@@ -161,12 +166,12 @@ Each step is the production lead's, with Khaliq's OK for the window, deploys and
 - **Bucket identity binds the claim's epochs.** It includes the session **fence epoch** taken from the claim attempt's snapshot (`ingest_claim_attempts.epochs`), plus the reset epoch. The fence epoch increments on every disable and survives re-enable (`ingest_fence_versions`).
 - **SQL issues the ref** and refuses (40001) a registration whose claimed session is fenced now. That includes a disable followed by a re-enable since the claim. So a pre-disable write never lands under a post-enable key.
 - **A fenced bucket stays fenced** (hidden and erasable) after a re-enable. New writes after the re-enable go to a **new** bucket that stays live.
-- **The erase deletes exactly a snapshot:**
-  1. list the bucket's object versions;
-  2. the **erase fence** (`ingest_babysitter_retention_fence`) checks that the lease is still held, with 30 s to spare, under the **current schema generation**;
-  3. delete exactly those versions.
-  Registration is refused while the lease holds, so the snapshot holds only pre-lease objects. A version written afterwards is never deleted, however late the deletes run.
-- Tests: disable → logical delete → re-enable (still hidden) → sweep → new writes kept and readable, pre-disable erased; a claim taken before a disable refused even after re-enable; a late writer survives the snapshot erase.
+- **The erase is a paged, strict, resumable directory erase** (`eraser.ts` `eraseStep` / `verifyErased`, the shared 9fef0acd tuple):
+  1. each bounded run lists the bucket's own directory in strict pages; the **erase fence** (`ingest_babysitter_retention_fence`: the lease is still held, with 30 s to spare, under the **current schema generation**) is re-checked before EVERY page's deletes;
+  2. every doomed version of a key with an obligation is reserved first, then exactly the listed versions are deleted by version id;
+  3. a run that ends on its budget persists a checkpoint; `erased` needs a fresh strict zero inventory AND every write obligation complete.
+  Registration is refused while the lease holds; a bucket registered again after the erase reopens and is swept again.
+- Tests: disable → logical delete → re-enable (still hidden) → sweep → new writes kept and readable, pre-disable erased; a claim taken before a disable refused even after re-enable; a lost PUT response keeps the bucket tracked and a late commit is erased as cleanup.
 
 ## Generation fence
 

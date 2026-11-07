@@ -51,6 +51,8 @@ CREATE TABLE sessions.babysitter_retention_settings(
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  enabled boolean NOT NULL DEFAULT false,
  dry_run boolean NOT NULL DEFAULT true,
+ -- The privacy purge's keyset cursor over the permanent tombstones (bounded work per claim).
+ purge_after jsonb CHECK(purge_after IS NULL OR (jsonb_typeof(purge_after)='array' AND jsonb_array_length(purge_after)=6)),
  updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 INSERT INTO sessions.babysitter_retention_settings(singleton,enabled,dry_run) VALUES(true,false,true);
@@ -138,8 +140,8 @@ CREATE TABLE sessions.babysitter_evidence_index(
 CREATE INDEX babysitter_evidence_index_page_idx ON sessions.babysitter_evidence_index
  (org_id,workspace_id,kind,origin_id COLLATE "C",record_id COLLATE "C",revision DESC,registered_at DESC,claim_token);
 CREATE INDEX babysitter_evidence_index_bucket_idx ON sessions.babysitter_evidence_index(org_id,workspace_id,machine_id,object_ref) WHERE machine_id IS NOT NULL;
--- The privacy purge of permanent tombstones (fenced identities), deletes only.
-CREATE INDEX babysitter_evidence_index_tombstone_idx ON sessions.babysitter_evidence_index(org_id,workspace_id,user_id) WHERE operation='delete';
+-- The privacy purge's bounded keyset scan over the permanent tombstones (deletes only).
+CREATE INDEX babysitter_evidence_index_tombstone_idx ON sessions.babysitter_evidence_index(org_id,workspace_id,origin_id,record_id,revision,claim_token) WHERE operation='delete';
 
 -- Durable unresolved-write obligations (the shared src/migration/neon-s3-erasure/write-obligation.ts
 -- contract): one row per bucket object KEY (its compare-and-set row version, resume checkpoint and
@@ -438,12 +440,27 @@ BEGIN
  SELECT * INTO STRICT s FROM sessions.babysitter_retention_settings WHERE singleton FOR SHARE;
  IF NOT s.enabled THEN RETURN jsonb_build_object('enabled',false,'dryRun',s.dry_run,'objects','[]'::jsonb);END IF;
  -- Privacy (C3): permanent tombstones of a fenced identity (disable/reset since their claim) are
- -- purged in bounded steps; they were hidden from the reader the moment the fence committed.
+ -- purged in bounded steps; they were hidden from the reader the moment the fence committed. Each
+ -- claim scans at most 1000 tombstones after a persisted keyset cursor (wrapping at the end), so the
+ -- work stays bounded however many tombstones accumulate.
  IF NOT s.dry_run THEN
-  WITH gone AS (DELETE FROM sessions.babysitter_evidence_index i WHERE i.ctid IN (SELECT x.ctid FROM sessions.babysitter_evidence_index x
-    WHERE x.operation='delete' AND sessions.babysitter_evidence_fenced(x.org_id,x.workspace_id,x.user_id,x.origin_id,x.source,x.session_id,x.fence_epoch,x.reset_epoch)
-    LIMIT 500) RETURNING 1)
+  CREATE TEMP TABLE IF NOT EXISTS babysitter_purge_window(org_id text,workspace_id text,origin_id text,record_id text,revision bigint,claim_token uuid,fenced boolean) ON COMMIT DROP;
+  DELETE FROM babysitter_purge_window;
+  INSERT INTO babysitter_purge_window
+   SELECT x.org_id,x.workspace_id,x.origin_id,x.record_id,x.revision,x.claim_token,
+    sessions.babysitter_evidence_fenced(x.org_id,x.workspace_id,x.user_id,x.origin_id,x.source,x.session_id,x.fence_epoch,x.reset_epoch)
+   FROM sessions.babysitter_evidence_index x
+   WHERE x.operation='delete' AND (s.purge_after IS NULL OR (x.org_id,x.workspace_id,x.origin_id,x.record_id,x.revision,x.claim_token)>
+     (s.purge_after->>0,s.purge_after->>1,s.purge_after->>2,s.purge_after->>3,(s.purge_after->>4)::bigint,(s.purge_after->>5)::uuid))
+   ORDER BY x.org_id,x.workspace_id,x.origin_id,x.record_id,x.revision,x.claim_token LIMIT 1000;
+  WITH gone AS (DELETE FROM sessions.babysitter_evidence_index i USING babysitter_purge_window w
+    WHERE w.fenced AND i.operation='delete' AND i.org_id=w.org_id AND i.workspace_id=w.workspace_id AND i.origin_id=w.origin_id
+     AND i.record_id=w.record_id AND i.revision=w.revision AND i.claim_token=w.claim_token RETURNING 1)
   SELECT count(*) INTO v_purged FROM gone;
+  UPDATE sessions.babysitter_retention_settings SET purge_after=(SELECT CASE WHEN count(*)<1000 THEN NULL ELSE
+    (SELECT jsonb_build_array(w.org_id,w.workspace_id,w.origin_id,w.record_id,w.revision::text,w.claim_token::text) FROM babysitter_purge_window w
+     ORDER BY w.org_id DESC,w.workspace_id DESC,w.origin_id DESC,w.record_id DESC,w.revision DESC,w.claim_token DESC LIMIT 1) END FROM babysitter_purge_window)
+   WHERE singleton;
   IF v_purged>0 THEN INSERT INTO sessions.babysitter_retention_audit(action,versions) VALUES('purged',v_purged);END IF;
  END IF;
  FOR q IN SELECT * FROM sessions.babysitter_retention_objects o
@@ -652,7 +669,8 @@ BEGIN
    SELECT w.org_id,w.workspace_id,w.machine_id,w.object_ref,w.object_name,x FROM jsonb_array_elements_text(p->'versions') x
   ON CONFLICT DO NOTHING;
  ELSIF v_act='checkpoint' THEN
-  IF p->'checkpoint'='null'::jsonb OR right(p->'checkpoint'->>'prefix',length('/s='||q.object_ref||'/raw/'))<>'/s='||q.object_ref||'/raw/' THEN
+  IF p->'checkpoint'='null'::jsonb OR right(p->'checkpoint'->>'prefix',length('/s='||q.object_ref||'/raw/'))<>'/s='||q.object_ref||'/raw/'
+   OR strpos(p->'checkpoint'->>'prefix','/m='||q.machine_id||'/h=_babysitter/')=0 THEN
    RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter retention: obligation checkpoint is for another directory';END IF;
   UPDATE sessions.babysitter_write_obligations o SET erase_checkpoint=p->'checkpoint',rev=v_rev WHERE o.org_id=w.org_id AND o.workspace_id=w.workspace_id
    AND o.machine_id=w.machine_id AND o.object_ref=w.object_ref AND o.object_name=w.object_name;
@@ -661,7 +679,9 @@ BEGIN
   -- Clears exactly these invocations; the sweeper calls it only on each one's own terminal evidence.
   SELECT ARRAY(SELECT x::uuid FROM jsonb_array_elements_text(p->'invocations') x) INTO v_ids;
   DELETE FROM sessions.babysitter_write_invocations i WHERE i.org_id=w.org_id AND i.workspace_id=w.workspace_id AND i.machine_id=w.machine_id
-   AND i.object_ref=w.object_ref AND i.object_name=w.object_name AND i.invocation_id=ANY(v_ids);
+   AND i.object_ref=w.object_ref AND i.object_name=w.object_name AND i.invocation_id=ANY(v_ids)
+   -- never a dispatched one: it has no terminal outcome of its own (write-obligation.ts)
+   AND i.outcome IN('acked','refused');
  ELSIF v_act='reschedule' THEN
   UPDATE sessions.babysitter_write_obligations o SET sweeps=o.sweeps+1,erase_checkpoint=NULL,rev=v_rev,
    next_sweep_at=clock_timestamp()+LEAST(interval '1 day',interval '1 minute'*power(2,LEAST(o.sweeps,11)))

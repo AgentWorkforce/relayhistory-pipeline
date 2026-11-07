@@ -579,7 +579,7 @@ export async function babysitterRetentionTick(deps: TickDeps): Promise<TickResul
       const scope = eraseScope(o, deps.generation);
       const authorize = async () => { if (!(await deps.ledger.fence(o.leaseToken))) throw new RetentionRefused("fence_refused"); };
       // The bucket's durable write obligations: one per object key, with every PUT invocation
-      // dispatched at it (recorded by register BEFORE the PUT, with the body's expected ETag).
+      // dispatched at it (recorded by register BEFORE the PUT; no ETag: content is not identity).
       const listed = await deps.ledger.obligations(o.leaseToken, { action: "list" });
       if (!listed.ok) { count("fence_refused"); result.lease_lost += 1; continue; }
       const raw = `${targets.prefix}raw/`;

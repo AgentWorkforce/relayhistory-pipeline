@@ -222,6 +222,22 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     expect((await pool.query("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name=$1", [NAME])).rows[0].n).toBe(1);
   }, 120000);
 
+  test("M1: rollback refuses (55000) while a delete-only batch's permanent tombstone exists, though no bucket was ever registered", async () => {
+    const t = { orgId: "org-m1", workspaceId: "ws-m1", userId: "u-m1" };
+    const claim = await seedClaim(t, ["m1-sess"]);
+    const out = await register(t, [], claim, generation, [{ bucket: null, originId: ORIGIN, recordId: "m1-r", revision: "2", revisionId: "m1-r:2", digest: dig("m1-r:2"),
+      operation: "delete", kind: "turn_receipt", source: "claude", sessionId: "m1-sess", line: null, expiresAtMs: null }]);
+    expect(out.objects).toEqual([]);
+    expect((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_retention_objects WHERE org_id=$1", [t.orgId])).rows[0].n).toBe(0);
+    expect((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_evidence_index WHERE org_id=$1 AND operation='delete'", [t.orgId])).rows[0].n).toBe(1);
+    // Causal: NO bucket exists anywhere yet (this runs before any test registers one) and no erase is
+    // audited, so only the tombstone (index) / obligation clauses can refuse.
+    expect((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_retention_objects")).rows[0].n).toBe(0);
+    expect(await code(pool.query(readFileSync(join(root, ROLLBACK), "utf8")))).toBe("55000");
+    expect((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_evidence_index WHERE org_id=$1", [t.orgId])).rows[0].n).toBe(1);
+    expect(readFileSync(join(root, ROLLBACK), "utf8")).toContain("EXISTS(SELECT 1 FROM sessions.babysitter_evidence_index)");
+  });
+
   // Runs before any test writes raw privacy rows for the org (the lazy-custody baseline would refuse).
   test("buffered acceptance end to end on real SQL: bucket registered, the SQL-accepted stage holds only stubs", async () => {
     const scratch = scratchStore();

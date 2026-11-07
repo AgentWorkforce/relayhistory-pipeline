@@ -101,7 +101,7 @@ export function poolConfig(dbUrl: unknown, allowLoopback: boolean): pg.PoolConfi
   };
 }
 
-/** Every statement the phase may send (the role can EXECUTE only the two RPCs as well). */
+/** Every statement the phase may send (the role can EXECUTE only its four RPCs: claim, fence, obligation, complete). */
 export const ALLOWED_SQL: ReadonlySet<string> = new Set([
   "SELECT current_user::text AS c",
   "SELECT sessions.ingest_babysitter_retention_claim($1::jsonb) AS result",
