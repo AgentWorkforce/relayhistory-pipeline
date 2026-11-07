@@ -57,13 +57,19 @@ async function rejects(p: Promise<unknown>, code: string, detail?: string) {
 
 describe("opensearch adapter request shapes", () => {
   it("upserts through _bulk with external_gte versions and refresh=wait_for, newest version per key", async () => {
-    const { calls, fetch } = fake(() => json(200, { errors: true, items: [{ index: { status: 201 } }, { index: { status: 409, error: { type: "version_conflict_engine_exception" } } }] }));
+    const { calls, fetch } = fake((c) =>
+      c.url.includes("/_mget")
+        ? json(200, { docs: [{ _id: "x", found: true }] })
+        : json(200, { errors: true, items: [{ index: { status: 201 } }, { index: { status: 409, error: { type: "version_conflict_engine_exception" } } }] }),
+    );
     const a = createOpenSearchSearchIndex({ url: BASE, fetch });
     const d1 = syntheticDoc({ orgId: "org-a", eventId: "e1", version: 5, content: "Hello WORLD" });
     const d2 = syntheticDoc({ orgId: "org-a", eventId: "e2", version: 2 });
     const result = await a.upsert([{ ...d1, version: 3 }, d1, d2]);
     expect(result).toEqual({ written: 1 }); // the 409 (a newer stored row) is not written
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.url).toBe(`${BASE}/${INDEX}/_mget?realtime=true&_source=false`);
+    expect(JSON.parse(calls[1]!.body!)).toEqual({ ids: [await documentId(d2, d2)] });
     const call = calls[0]!;
     expect(call.method).toBe("POST");
     expect(call.url).toBe(`${BASE}/_bulk?refresh=wait_for`);
@@ -76,6 +82,51 @@ describe("opensearch adapter request shapes", () => {
     expect(lines[2].index.version).toBe(2);
     // Every stored field is mapped explicitly (dynamic: strict).
     expect(Object.keys(lines[1]).sort()).toEqual(Object.keys(OPENSEARCH_MAPPINGS.properties).sort());
+  });
+
+  it("re-writes a key whose conflict is a delete tombstone after a refresh, as postgres re-inserts a deleted row", async () => {
+    let bulks = 0;
+    const { calls, fetch } = fake((c) => {
+      if (c.url.includes("/_mget")) return json(200, { docs: [{ found: false }] });
+      if (c.url.endsWith("/_refresh")) return json(200, { _shards: { failed: 0 } });
+      bulks += 1;
+      return json(200, { items: [bulks < 3 ? { index: { status: 409, error: { type: "version_conflict_engine_exception" } } } : { index: { status: 201 } }] });
+    });
+    const waits: number[] = [];
+    const sleep = async (ms: number) => void waits.push(ms);
+    const doc = syntheticDoc({ orgId: "o", version: 1 });
+    expect(await createOpenSearchSearchIndex({ url: BASE, fetch, sleep }).upsert([doc])).toEqual({ written: 1 });
+    expect(calls.map((c) => c.url.slice(BASE.length))).toEqual([
+      "/_bulk?refresh=wait_for",
+      `/${INDEX}/_mget?realtime=true&_source=false`,
+      `/${INDEX}/_refresh`,
+      "/_bulk?refresh=wait_for",
+      `/${INDEX}/_mget?realtime=true&_source=false`,
+      `/${INDEX}/_refresh`,
+      "/_bulk?refresh=wait_for",
+    ]);
+    expect(waits).toEqual([250, 250]);
+  });
+
+  it("fails retryably when a tombstone outlives the retries, and stops on abort", async () => {
+    const responder = (c: Call) =>
+      c.url.includes("/_mget")
+        ? json(200, { docs: [{ found: false }] })
+        : c.url.endsWith("/_refresh")
+          ? json(200, {})
+          : json(200, { items: [{ index: { status: 409, error: { type: "version_conflict_engine_exception" } } }] });
+    const sleep = async () => {};
+    const e = await rejects(
+      createOpenSearchSearchIndex({ url: BASE, fetch: fake(responder).fetch, sleep }).upsert([syntheticDoc({ orgId: "o" })]),
+      "unavailable",
+      "deleted_key_conflict",
+    );
+    expect(e.retryable).toBe(true);
+    const controller = new AbortController();
+    const { calls, fetch } = fake(responder);
+    const aborting = async () => controller.abort();
+    await rejects(createOpenSearchSearchIndex({ url: BASE, fetch, sleep: aborting }).upsert([syntheticDoc({ orgId: "o" })], { signal: controller.signal }), "aborted");
+    expect(calls).toHaveLength(2); // bulk + mget; nothing after the abort
   });
 
   it("raises bounded errors for failed bulk items, retryable for 429/5xx", async () => {

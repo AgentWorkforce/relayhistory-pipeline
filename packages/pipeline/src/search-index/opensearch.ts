@@ -72,6 +72,8 @@ export interface OpenSearchSearchIndexConfig {
   readonly requestTimeoutMs?: number;
   /** Injected for tests; defaults to the global fetch. */
   readonly fetch?: FetchLike;
+  /** Injected for tests; waits between deleted-key write retries. */
+  readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 export const DEFAULT_OPENSEARCH_INDEX_PREFIX = "relayhistory";
@@ -85,6 +87,28 @@ const SCAN_PAGE = 5000;
 /** Bulk request body bound (bytes); well under the default http.max_content_length of 100mb. */
 const BULK_BYTES = 8 * 1024 * 1024;
 const ERASE_ATTEMPTS = 5;
+/**
+ * Waits before re-writing a key whose only conflict is a delete tombstone.
+ * The engine prunes a tombstone on a refresh once it is older than
+ * gc_deletes (0s) on its coarse clock (thread_pool.estimated_time_interval,
+ * 200ms by default), so a write right after a delete still conflicts.
+ */
+const TOMBSTONE_RETRY_DELAYS_MS = [250, 250, 500, 1000, 2000];
+
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new SearchIndexError("aborted"));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new SearchIndexError("aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 // The folded-q bound the window arithmetic relies on (İ lowercases to two code points).
 if (2 * MAX_QUERY_CHARS > WINDOW - STRIDE + 1) throw new Error("opensearch window too small for MAX_QUERY_CHARS");
@@ -450,38 +474,65 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
         const held = newest.get(key);
         if (!held || held.version <= doc.version) newest.set(key, doc);
       }
-      const lines: string[] = [];
+      const entries: { id: string; line: string }[] = [];
       for (const doc of newest.values()) {
-        const action = { index: { _index: index, _id: await documentId(doc, doc), version: doc.version, version_type: "external_gte" } };
-        lines.push(`${JSON.stringify(action)}\n${JSON.stringify(toSource(doc))}\n`);
+        const id = await documentId(doc, doc);
+        const action = { index: { _index: index, _id: id, version: doc.version, version_type: "external_gte" } };
+        entries.push({ id, line: `${JSON.stringify(action)}\n${JSON.stringify(toSource(doc))}\n` });
       }
       let written = 0;
-      let batch = "";
-      let batchBytes = 0;
-      const flush = async () => {
-        if (!batch) return;
-        const reply = await request("POST", "_bulk?refresh=wait_for", undefined, context, { ndjson: batch });
-        batch = "";
-        batchBytes = 0;
+      /** One _bulk call; returns the lines that hit a version conflict. */
+      const bulk = async (batch: { id: string; line: string }[]) => {
+        const reply = await request("POST", "_bulk?refresh=wait_for", undefined, context, { ndjson: batch.map((b) => b.line).join("") });
         const items = (reply.body as { items?: { index?: { status?: unknown; error?: { type?: unknown } } }[] } | undefined)?.items;
-        if (!Array.isArray(items)) invalidReply();
+        if (!Array.isArray(items) || items.length !== batch.length) invalidReply();
         let failure: number | undefined;
-        for (const item of items) {
+        const conflicts: { id: string; line: string }[] = [];
+        items.forEach((item, i) => {
           const status = item?.index?.status;
           if (typeof status !== "number") invalidReply();
           if (status >= 200 && status < 300) written += 1;
-          else if (status === 409 && item.index!.error?.type === "version_conflict_engine_exception") continue; // a newer row is stored
+          else if (status === 409 && item.index!.error?.type === "version_conflict_engine_exception") conflicts.push(batch[i]!);
           else failure = failure === undefined || retryableStatus(status) ? status : failure;
-        }
+        });
         if (failure !== undefined) throw new SearchIndexError("unavailable", retryableStatus(failure), `bulk_item_${failure}`);
+        return conflicts;
       };
-      for (const line of lines) {
-        const bytes = new TextEncoder().encode(line).length;
-        if (batch && batchBytes + bytes > BULK_BYTES) await flush();
-        batch += line;
+      /** The conflicts with no live document: the conflict is a delete tombstone, not a newer row. */
+      const deletedOnly = async (conflicts: { id: string; line: string }[]) => {
+        if (conflicts.length === 0) return conflicts;
+        const reply = await request("POST", `${index}/_mget?realtime=true&_source=false`, { ids: conflicts.map((c) => c.id) }, context);
+        const found = (reply.body as { docs?: { found?: unknown }[] } | undefined)?.docs;
+        if (!Array.isArray(found) || found.length !== conflicts.length) invalidReply();
+        return conflicts.filter((_, i) => found[i]?.found === false);
+      };
+      const flush = async (batch: { id: string; line: string }[]) => {
+        if (batch.length === 0) return;
+        // A 409 against a live row means a newer version is stored: not written.
+        // A 409 against a delete tombstone is retried until the tombstone is
+        // pruned, as postgres re-inserts a deleted row at any version.
+        let pending = await deletedOnly(await bulk(batch));
+        for (const delay of TOMBSTONE_RETRY_DELAYS_MS) {
+          if (pending.length === 0) return;
+          await (config.sleep ?? abortableSleep)(delay, context?.signal);
+          await request("POST", `${index}/_refresh`, undefined, context);
+          pending = await deletedOnly(await bulk(pending));
+        }
+        if (pending.length > 0) throw new SearchIndexError("unavailable", true, "deleted_key_conflict");
+      };
+      let batch: { id: string; line: string }[] = [];
+      let batchBytes = 0;
+      for (const entry of entries) {
+        const bytes = new TextEncoder().encode(entry.line).length;
+        if (batch.length > 0 && batchBytes + bytes > BULK_BYTES) {
+          await flush(batch);
+          batch = [];
+          batchBytes = 0;
+        }
+        batch.push(entry);
         batchBytes += bytes;
       }
-      await flush();
+      await flush(batch);
       return { written };
     },
 

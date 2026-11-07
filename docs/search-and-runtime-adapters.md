@@ -110,6 +110,12 @@ dialect.
 - Upserts are `_bulk?refresh=wait_for` with `version_type=external_gte`, so a
   newer stored version wins and reads see writes on return. `index.gc_deletes`
   is `0s`, so a deleted key can be rewritten at any version, as in Postgres.
+  The engine only drops a delete tombstone on a refresh after its coarse clock
+  (200 ms) ticks, so a write that conflicts with no live document (checked by
+  `_mget`) is retried after `_refresh` for up to about 4 s, then fails
+  retryably with `deleted_key_conflict`. A basic-auth user therefore needs
+  read, write, `_delete_by_query`, `_mget` and `_refresh` on the index, plus
+  index creation and mapping updates for `ensureSchema`.
 - `deleteEvents` and `eraseScope` are `_delete_by_query?refresh=true&conflicts=proceed`
   under the tenant filter; an erase repeats while version conflicts remain and
   fails rather than reporting partial erasure.
