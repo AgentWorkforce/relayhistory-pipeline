@@ -4,9 +4,12 @@ import { syntheticDoc } from "../src/search-index/conformance.js";
 import { SearchIndexError, matchesQuery } from "../src/search-index/contracts.js";
 import {
   OPENSEARCH_MAPPINGS,
+  Q_CONTAINS_SCRIPT,
+  WILDCARD_MAX_LITERAL_BYTES,
   createOpenSearchSearchIndex,
   documentId,
   foldedWindows,
+  qFilter,
   wildcardLiteral,
   type FetchLike,
 } from "../src/search-index/opensearch.js";
@@ -224,6 +227,50 @@ describe("opensearch adapter request shapes", () => {
     expect(body._source).not.toContain("fingerprint");
   });
 
+  it("sends a folded q of up to WILDCARD_MAX_LITERAL_BYTES as wildcards and a longer one as a params-bound script", async () => {
+    const { calls, fetch } = fake(() => json(200, { timed_out: false, _shards: { failed: 0 }, hits: { hits: [] } }));
+    const a = createOpenSearchSearchIndex({ url: BASE, fetch });
+    const qClause = async (q: string) => {
+      await a.query({ tenant, q, sessionId: "s", order: "asc", limit: 5 });
+      const body = JSON.parse(calls.at(-1)!.body!);
+      expect(Object.keys(body.query.bool)).toEqual(["filter"]);
+      expect(body.query.bool.filter.slice(0, 2)).toEqual([{ term: { org_id: "org-a" } }, { term: { workspace_id: "ws-a" } }]);
+      return body.query.bool.filter.at(-1);
+    };
+    const wildcard = (value: string) => ({
+      bool: {
+        should: [{ wildcard: { content_prefix_folded: { value } } }, { wildcard: { task_title_folded: { value } } }],
+        minimum_should_match: 1,
+      },
+    });
+    expect(WILDCARD_MAX_LITERAL_BYTES).toBe(64);
+    // Short, and exactly at the bound (64 one-byte and 16 four-byte code points).
+    expect(await qClause("Hello")).toEqual(wildcard("*hello*"));
+    expect(await qClause("A".repeat(64))).toEqual(wildcard(`*${"a".repeat(64)}*`));
+    expect(await qClause("😀".repeat(16))).toEqual(wildcard(`*${"😀".repeat(16)}*`));
+    // One byte over, and the three repetitive / maximally folded 500-character inputs.
+    const long: [string, string][] = [
+      ["a".repeat(65), "a".repeat(65)],
+      ["a".repeat(500), "a".repeat(500)],
+      ["İ".repeat(500), "i\u0307".repeat(500)],
+      ["ab".repeat(250), "ab".repeat(250)],
+      // Wildcard metacharacters stay literal (no escaping on the script path).
+      [`${"x".repeat(70)}*?\\%_`, `${"x".repeat(70)}*?\\%_`],
+    ];
+    for (const [q, folded] of long) {
+      expect(q.toLowerCase()).toBe(folded);
+      const clause = await qClause(q);
+      expect(clause).toEqual({ script: { script: { lang: "painless", source: Q_CONTAINS_SCRIPT, params: { q: folded } } } });
+      expect(clause.script.script.source).not.toContain(folded.slice(0, 20));
+    }
+    expect([...Q_CONTAINS_SCRIPT.matchAll(/params\.q/g)]).toHaveLength(2);
+    expect(Q_CONTAINS_SCRIPT).toContain("doc['content_prefix_folded']");
+    expect(Q_CONTAINS_SCRIPT).toContain("doc['task_title_folded']");
+    // The script reads doc values, so both folded fields must keep them.
+    expect(OPENSEARCH_MAPPINGS.properties.content_prefix_folded).toEqual({ type: "keyword" });
+    expect(OPENSEARCH_MAPPINGS.properties.task_title_folded).toEqual({ type: "keyword" });
+  });
+
   it("refuses partial search results instead of paging with gaps", async () => {
     const a = createOpenSearchSearchIndex({ url: BASE, fetch: fake(() => json(200, { timed_out: false, _shards: { failed: 1 }, hits: { hits: [] } })).fetch });
     await rejects(a.query({ tenant, order: "asc", limit: 5 }), "unavailable", "partial_results");
@@ -274,6 +321,27 @@ describe("opensearch adapter transport errors", () => {
       expect(e.retryable).toBe(retryable);
       expect(e.message).not.toMatch(/secret|quoted/);
     }
+  });
+
+  it("carries the server's error type names, never its reason, on an HTTP error", async () => {
+    const q = "a".repeat(500);
+    const body = {
+      error: {
+        root_cause: [{ type: "too_complex_to_determinize_exception", reason: `Determinizing automaton would exceed limit: *${q}*` }],
+        type: "illegal_argument_exception",
+        reason: `failed to create query: *${q}*`,
+        caused_by: { type: "too_complex_to_determinize_exception", reason: `Determinizing *${q}* would require more than 10000 effort` },
+      },
+      status: 400,
+    };
+    const a = createOpenSearchSearchIndex({ url: BASE, fetch: fake(() => json(400, body)).fetch });
+    const e = await rejects(a.query({ tenant, q: "secret query", order: "asc", limit: 1 }), "unavailable", "http_400:illegal_argument_exception:too_complex_to_determinize_exception");
+    expect(e.retryable).toBe(false);
+    expect(e.message).toBe("search index: unavailable (http_400:illegal_argument_exception:too_complex_to_determinize_exception)");
+    expect(e.message).not.toMatch(/Determiniz|failed to create|effort|aaaa|secret/);
+    // A type name that is not a plain identifier is dropped, not echoed.
+    const odd = createOpenSearchSearchIndex({ url: BASE, fetch: fake(() => json(500, { error: { type: "Has spaces: content", caused_by: { type: "x".repeat(200) } } })).fetch });
+    await rejects(odd.query({ tenant, order: "asc", limit: 1 }), "unavailable", "http_500");
   });
 
   it("maps network failure, timeout and caller abort", async () => {
@@ -497,5 +565,26 @@ describe("opensearch q folding", () => {
       );
     }
     expect(wildcardLiteral("a*b?c\\d%_")).toBe("*a\\*b\\?c\\\\d%_*");
+  });
+
+  it("the script path's contains over window values equals matchesQuery for the repetitive inputs", () => {
+    const runs = `${"a".repeat(600)} ${"İ".repeat(600)} ${"ab".repeat(300)}`;
+    const docs = [
+      syntheticDoc({ orgId: "org-a", eventId: "rep-short", content: "", taskTitle: runs }),
+      syntheticDoc({ orgId: "org-a", eventId: "rep-long", content: "", taskTitle: `${"x".repeat(3800)}${runs}` }),
+      syntheticDoc({ orgId: "org-a", eventId: "rep-near", content: `${"a".repeat(499)}b${"İ".repeat(499)}b${"ab".repeat(249)}`, taskTitle: "" }),
+    ];
+    // rep-long's runs start past the first window boundary: its title has two windows.
+    expect(foldedWindows(docs[1]!.taskTitle.toLowerCase()).length).toBeGreaterThan(1);
+    for (const q of ["a".repeat(500), "İ".repeat(500), "ab".repeat(250)]) {
+      const folded = q.toLowerCase();
+      expect(qFilter(folded)).toHaveProperty("script");
+      for (const d of docs) {
+        // What Q_CONTAINS_SCRIPT evaluates: any value of either field contains params.q.
+        const values = [...foldedWindows([...d.content].slice(0, 4096).join("").toLowerCase()), ...foldedWindows(d.taskTitle.toLowerCase())];
+        expect(values.some((v) => v.includes(folded)), `${d.eventId} / ${q.slice(0, 2)}`).toBe(matchesQuery(d, q));
+      }
+      expect(docs.filter((d) => matchesQuery(d, q)).map((d) => d.eventId).sort()).toEqual(["rep-long", "rep-short"]);
+    }
   });
 });

@@ -18,11 +18,14 @@
  * lowercase of the content prefix (first CONTENT_PREFIX_CHARS code points) and
  * of the task title is stored as overlapping keyword windows, and q (lowercased
  * the same way) is a `wildcard` `*literal*` query with `*`, `?` and `\`
- * escaped. Any folded q (at most 2 * MAX_QUERY_CHARS code points) fits wholly
- * inside one window, so a match equals `matchesQuery`.
+ * escaped, or, for a folded literal longer than WILDCARD_MAX_LITERAL_BYTES, a
+ * params-bound painless `contains` over the same window values (see
+ * qFilter). Any folded q (at most 2 * MAX_QUERY_CHARS code points) fits wholly
+ * inside one window, so a match equals `matchesQuery` on either path.
  *
- * Errors carry bounded codes only (`http_<status>`, `timeout`, `network`),
- * never response bodies, which can quote document content.
+ * Errors carry bounded codes only (`http_<status>`, `timeout`, `network`, and
+ * for an HTTP error the server's `error.type` / `error.caused_by.type` names),
+ * never response bodies or `reason` text, which can quote document content or q.
  */
 import {
   CONTENT_PREFIX_CHARS,
@@ -147,8 +150,9 @@ export const OPENSEARCH_MAPPINGS = Object.freeze({
     delivery_record_id: stored,
     content: stored,
     content_bytes: { type: "long", index: false },
-    content_prefix_folded: { type: "keyword", doc_values: false },
-    task_title_folded: { type: "keyword", doc_values: false },
+    // doc_values: the long-q script filter reads the window values from doc values.
+    content_prefix_folded: { type: "keyword" },
+    task_title_folded: { type: "keyword" },
     fingerprint: stored,
     version: { type: "long", index: false },
   },
@@ -198,6 +202,67 @@ export function foldedWindows(folded: string): string[] {
 /** A literal for a wildcard query: `*`, `?` and `\` are escaped. */
 export function wildcardLiteral(q: string): string {
   return `*${q.replace(/[\\*?]/g, (c) => `\\${c}`)}*`;
+}
+
+/**
+ * Longest folded q (UTF-8 bytes) sent as a `wildcard`; anything longer uses
+ * the script filter. Lucene compiles `*L*` to a code-point automaton, converts
+ * it to UTF-8 bytes and determinizes it by subset construction under
+ * Operations.DEFAULT_DETERMINIZE_WORK_LIMIT = 10,000 (exceeding it is
+ * TooComplexToDeterminizeException, an HTTP 400 on both products). The worst
+ * L is a period-1 byte run (`aaaa...`): with B literal bytes, the DFA state
+ * after a partial match of k bytes holds the loop state plus k + 1 literal
+ * positions, and the trailing `*` repeats that chain once more after a full
+ * match, so the work (the sum of subset sizes, Lucene 9's effort measure, and
+ * an upper bound on the DFA state count, the older one) is about
+ * 2 * sum_{k=0..B} (k + 1) = (B + 1)(B + 2), plus at most ~4 UTF-8 loop
+ * states per subset: 2 * (B + 1) * 4. Periodic or multi-byte literals (`abab`,
+ * `İİ` folded to `i\u0307i\u0307`) keep about k / period + 1 positions per
+ * subset, so they cost less per byte. For B = 64: 65 * 66 + 2 * 65 * 4 =
+ * 4,290 + 520 = 4,810 <= 10,000 / 2, a 2x margin against the limit read as
+ * 10,000 work units (Lucene 9 actually budgets 10x that effort; not relied on).
+ * At B = 500 (`a` x 500) the same estimate is ~250,000: the CI failure.
+ */
+export const WILDCARD_MAX_LITERAL_BYTES = 64;
+
+/** Fixed script source: q only ever travels as params.q, never in the source. */
+export const Q_CONTAINS_SCRIPT =
+  "for (def v : doc['content_prefix_folded']) { if (v.contains(params.q)) { return true; } } " +
+  "for (def v : doc['task_title_folded']) { if (v.contains(params.q)) { return true; } } " +
+  "return false;";
+
+/**
+ * The q filter clause for an already folded q. Short literals: a `wildcard`
+ * per field. Long literals: one `script` filter doing String.contains over
+ * every window value of both fields (Java `contains` and JS `includes` both
+ * compare UTF-16 code units, and each window value is a whole code-point
+ * run, so this equals the wildcard / `matchesQuery`). The script needs no
+ * index or cluster setting beyond defaults (inline painless allowed, doc
+ * values on the two fields) and compiles once: its source never varies.
+ */
+export function qFilter(folded: string): Record<string, unknown> {
+  if (new TextEncoder().encode(folded).length <= WILDCARD_MAX_LITERAL_BYTES) {
+    const value = wildcardLiteral(folded);
+    return {
+      bool: {
+        should: [{ wildcard: { content_prefix_folded: { value } } }, { wildcard: { task_title_folded: { value } } }],
+        minimum_should_match: 1,
+      },
+    };
+  }
+  return { script: { script: { lang: "painless", source: Q_CONTAINS_SCRIPT, params: { q: folded } } } };
+}
+
+const ERROR_TYPE = /^[a-z][a-z0-9_.]{0,99}$/;
+
+/** `http_<status>` plus the server's error type names (never `reason`, which can quote q or content). */
+function httpDetail(status: number, body: unknown): string {
+  const error = (body as { error?: unknown } | undefined)?.error;
+  if (!error || typeof error !== "object") return `http_${status}`;
+  const named = (v: unknown) => (typeof v === "string" && ERROR_TYPE.test(v) ? v : undefined);
+  const type = named((error as { type?: unknown }).type);
+  const cause = named((error as { caused_by?: { type?: unknown } }).caused_by?.type);
+  return [`http_${status}`, type, cause].filter((x) => x !== undefined).join(":");
 }
 
 function toSource(d: SearchEventDocument) {
@@ -403,7 +468,7 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
     if ((status >= 200 && status < 300) || options.accept?.includes(status)) return { status, headers: response.headers, body: parsed };
     const type = (parsed as { error?: { type?: unknown } } | undefined)?.error?.type;
     if (status === 404 && (type === "index_not_found_exception" || method === "HEAD")) throw new SearchIndexError("schema_missing");
-    throw new SearchIndexError("unavailable", retryableStatus(status), `http_${status}`);
+    throw new SearchIndexError("unavailable", retryableStatus(status), httpDetail(status, parsed));
   }
 
   function invalidReply(): never {
@@ -438,7 +503,8 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
   const capabilities: SearchIndexCapabilities = Object.freeze({
     backend: "opensearch",
     filters: Object.freeze(["session", "source", "kind", "project", "since", "until"] as const),
-    // A leading-wildcard query walks the folded terms for every q length.
+    // No q length is an indexed lookup: a short q walks the folded terms (leading
+    // wildcard), a long one is a per-candidate script filter.
     minIndexedQueryChars: Number.MAX_SAFE_INTEGER,
     readAfterWrite: "immediate",
     synchronousErasure: true,
@@ -637,15 +703,9 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
         });
       }
       if (query.q !== undefined) {
-        const value = wildcardLiteral(query.q.toLowerCase());
-        // q is one more filter clause: a bool with two `should` alternatives
-        // nested INSIDE `filter`, so it can only narrow the tenant's rows.
-        filter.push({
-          bool: {
-            should: [{ wildcard: { content_prefix_folded: { value } } }, { wildcard: { task_title_folded: { value } } }],
-            minimum_should_match: 1,
-          },
-        });
+        // q is one more filter clause (a bool of two `should` wildcards, or a
+        // script) nested INSIDE `filter`, so it can only narrow the tenant's rows.
+        filter.push(qFilter(query.q.toLowerCase()));
       }
       const c = query.cursor;
       const sources = await search(

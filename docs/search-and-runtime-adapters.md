@@ -118,12 +118,38 @@ dialect.
   a 500-character `q` containing one `İ` at four window boundaries of a 9,000-character
   title; `'a'.repeat(500)`; and the maximal folded `'İ'.repeat(500)` and `'ab'.repeat(250)`,
   within one window and past the first window boundary. Each is compared with
-  `matchesQuery`. The repetitive and maximal cases are new and have not yet been
-  proven on a real server; that proof is the `opensearch-proof` CI job. Until it
-  passes on both dialects, treat Lucene's wildcard automaton limits
-  (`too_complex_to_determinize`, which maps to a non-retryable `http_400`) as
-  unverified for these inputs.
-- Cost: `q` is a leading-wildcard query, so each search enumerates the whole
+  `matchesQuery`, plus a repetitive `q` exactly at and one byte past the
+  wildcard bound below. The real-server proof is the `opensearch-proof` CI job.
+- Long-literal fallback: a folded `q` longer than 64 UTF-8 bytes
+  (`WILDCARD_MAX_LITERAL_BYTES`) is not sent as a `wildcard`. Lucene
+  determinizes the `*literal*` automaton under a fixed work limit (10,000), and
+  a repetitive literal such as `'a'.repeat(500)` or `'İ'.repeat(500)` costs
+  roughly the square of its length, so both products reject it with HTTP 400
+  (`too_complex_to_determinize_exception`). The adapter's source comment has the
+  arithmetic for the bound (worst case about 4,800 units at 64 bytes, a 2x
+  margin). Past the bound, `q` is one painless `script` filter that runs
+  `String.contains` over every window value of the two folded fields. `q` is
+  passed as `params.q`, and the script source is fixed, so it compiles once
+  and `q` never becomes code. This is exact (the same windows, and Java and
+  JavaScript both compare UTF-16 code units). It needs doc values on
+  `content_prefix_folded` and `task_title_folded`, which the mapping now enables,
+  and no other index or cluster setting: inline painless is on by default on
+  both products. An index created with the earlier `doc_values: false` mapping
+  fails `ensureSchema` with `mapping_conflict` and has to be recreated. The doc
+  values store the folded windows a second time on disk. Cost: a
+  script filter runs once per candidate document that has already passed the
+  tenant, session, source, kind, project and time filters (Lucene checks it
+  last, as a two-phase check). So its cost grows with the tenant's matching
+  rows, not with the whole index, but every candidate pays a JVM string scan of
+  up to about 4,096 characters per window. A cluster that sets
+  `search.allow_expensive_queries: false` rejects both the leading-wildcard
+  path and the script path.
+- Errors: a 4xx/5xx reply surfaces as `http_<status>`, followed by the server's
+  `error.type` and `error.caused_by.type` names when it sends them (for example
+  `http_400:illegal_argument_exception:too_complex_to_determinize_exception`).
+  The server's `reason` text is never included, because it can quote `q` or
+  content.
+- Cost: a short `q` (the wildcard path) is a leading-wildcard query, so each search enumerates the whole
   folded-term dictionary of every shard it hits. The tenant `filter` does not
   narrow that walk, so the cost grows with the whole index, not the tenant,
   and one tenant's long queries (each up to the request timeout) slow search

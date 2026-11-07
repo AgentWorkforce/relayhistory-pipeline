@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { searchIndexConformance, syntheticDoc } from "../src/search-index/conformance.js";
 import { matchesQuery, positionOf, type SearchIndexAdapter } from "../src/search-index/contracts.js";
-import { createOpenSearchSearchIndex, type OpenSearchDialect } from "../src/search-index/opensearch.js";
+import { WILDCARD_MAX_LITERAL_BYTES, createOpenSearchSearchIndex, type OpenSearchDialect } from "../src/search-index/opensearch.js";
 
 // Real OpenSearch / Elasticsearch run of the shared suite. Skipped unless
 // SEARCH_INDEX_OPENSEARCH_TEST_URL names a disposable, unauthenticated server
@@ -89,6 +89,27 @@ if (!url) {
         expect(expected, `${name} oracle`).toEqual(["rep-long", "rep-short"]);
         const hits = (await a.query({ tenant, q, order: "asc", limit: 10 })).hits.map((h) => h.eventId).sort();
         expect(hits, name).toEqual(expected);
+      }
+    }, 60_000);
+
+    // The wildcard / script switch: a repetitive literal exactly at
+    // WILDCARD_MAX_LITERAL_BYTES must still compile as a wildcard on the real
+    // engine, and one byte more takes the script path; both match the oracle.
+    it("matches repetitive q at and just past the wildcard byte bound like the oracle", async () => {
+      const org = `org-${Date.now().toString(36)}-bound`;
+      const tenant = { orgId: org, workspaceId: "ws-a" };
+      const n = WILDCARD_MAX_LITERAL_BYTES;
+      const docs = [
+        syntheticDoc({ orgId: org, eventId: "b-a", content: `x${"a".repeat(n + 1)}y`, taskTitle: "" }),
+        syntheticDoc({ orgId: org, eventId: "b-emoji", content: "", taskTitle: `${"x".repeat(5000)}${"😀".repeat(n / 4 + 1)}` }),
+        syntheticDoc({ orgId: org, eventId: "b-near", content: `${"a".repeat(n - 1)}b${"😀".repeat(n / 4 - 1)}`, taskTitle: "" }),
+      ];
+      expect(await a.upsert(docs)).toEqual({ written: docs.length });
+      for (const q of ["a".repeat(n), "A".repeat(n + 1), "😀".repeat(n / 4), "😀".repeat(n / 4 + 1)]) {
+        const expected = docs.filter((d) => matchesQuery(d, q)).map((d) => d.eventId).sort();
+        expect(expected.length, `${q.length} oracle`).toBe(1);
+        const hits = (await a.query({ tenant, q, order: "asc", limit: 10 })).hits.map((h) => h.eventId).sort();
+        expect(hits, `${q.slice(0, 2)} x ${[...q].length}`).toEqual(expected);
       }
     }, 60_000);
 
