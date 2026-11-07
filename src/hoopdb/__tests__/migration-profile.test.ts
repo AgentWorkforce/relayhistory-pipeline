@@ -1666,6 +1666,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // 047000 (portable search state) is later: 039000 refuses until it is rolled back.
     const PS = "upstream:20261105047000_portable_search_storage.sql";
     expect((await failure(rollback("20261105039000_buffered_gc_single_candidate.down.sql")))?.code).toBe("55000");
+    // 048000 (reader contract) is later still: 047000 refuses until 048000 is rolled back.
+    expect((await failure(rollback("20261105047000_portable_search_storage.down.sql")))?.code).toBe("55000");
+    await rollback("20261105048000_portable_search_reader_contract.down.sql");
+    expect(await names()).not.toContain("upstream:20261105048000_portable_search_reader_contract.sql");
     await rollback("20261105047000_portable_search_storage.down.sql");
     expect(await names()).not.toContain(PS);
     expect(await relation("sessions.search_projection_state")).toBeNull();

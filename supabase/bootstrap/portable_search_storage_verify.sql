@@ -19,8 +19,9 @@
 -- identity, an operator explicitly. Unset or unknown refuses. The policy and the grant
 -- must both name exactly that role. Only db_mode 'local' with the owner as runtime (the
 -- Docker dev owner-run profile) accepts no runtime grant or policy.
--- No reader surface is accepted here: a bulls96_read_api grant or policy on this table
--- fails until the separately reviewed reader-contract slot extends this file.
+-- Reader surface: none before 20261105048000; after it is ledgered, exactly bulls96_read_api
+-- column SELECT on the nine completeness columns and the exact tenant policy
+-- search_projection_state_read_api (reader role bound by name, never inferred).
 -- Read-only; any role that can read the catalogs can run it. It is a phase-2 step of
 -- src/hoopdb/migrate.ts (so PASS requires it), and has no psql meta-commands. Operator:
 --   psql -v ON_ERROR_STOP=1 -X -d <db> -c "BEGIN" \
@@ -35,6 +36,11 @@ DECLARE
   v_expected oid;
   v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
   v_owner_run boolean := false;
+  -- 20261105048000 reader contract: all-or-nothing (see the body).
+  v_portable boolean := false;
+  v_reader oid := (SELECT oid FROM pg_roles WHERE rolname = 'bulls96_read_api');
+  v_reader_cols constant text[] := ARRAY['backend_id', 'canonical_session_id', 'complete', 'coverage_from_ms', 'org_id', 'session_id', 'source', 'source_epoch', 'workspace_id'];
+  v_tenant_qual constant text := '((org_id = current_setting(''bulls96_read.org_id''::text, true)) AND (workspace_id = current_setting(''bulls96_read.workspace_id''::text, true)))';
   v_problems text[] := ARRAY[]::text[];
   v_row record;
   v_cols text;
@@ -43,6 +49,12 @@ DECLARE
     'org_id:text:t,revision:bigint:t,row_count:bigint:t,session_id:text:t,source:text:t,'
     'source_epoch:bigint:t,updated_at:timestamp with time zone:t,workspace_id:text:t';
 BEGIN
+  -- All-or-nothing: 048000 is present iff either of its two policies exists; then its
+  -- complete exact surface is required, otherwise any part of it is refused. Independent of
+  -- the ledger (test fixtures apply migrations without one) and of search_path.
+  v_portable := EXISTS (SELECT 1 FROM pg_policy
+                         WHERE (polname = 'search_projection_state_read_api' AND polrelid = to_regclass('sessions.search_projection_state'))
+                            OR (polname = 'session_directory_portable_read_api' AND polrelid = to_regclass('sessions.session_directory')));
   IF v_rel IS NULL THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = 'portable search storage: sessions.search_projection_state is missing (migrate 20261105047000 first)';
@@ -79,8 +91,22 @@ BEGIN
   IF v_cols IS DISTINCT FROM v_expected_cols THEN
     v_problems := array_append(v_problems, format('column set differs: %s', v_cols));
   END IF;
-  IF EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = v_rel AND a.attnum > 0 AND a.attacl IS NOT NULL) THEN
-    v_problems := array_append(v_problems, 'a column ACL is present'::text);
+  -- Column ACL: only bulls96_read_api SELECT on exactly the reader columns, only after 048000.
+  FOR v_row IN
+    SELECT a.attname::text AS col, x.grantee, x.privilege_type, x.is_grantable
+      FROM pg_attribute a, aclexplode(a.attacl) x
+     WHERE a.attrelid = v_rel AND a.attnum > 0 AND a.attacl IS NOT NULL
+  LOOP
+    IF NOT (v_portable AND v_row.grantee = v_reader AND v_row.privilege_type = 'SELECT'
+            AND NOT v_row.is_grantable AND v_row.col = ANY(v_reader_cols)) THEN
+      v_problems := array_append(v_problems, format('a column ACL is present: %s on %s to %s', v_row.privilege_type, v_row.col,
+        CASE WHEN v_row.grantee = 0 THEN 'PUBLIC' ELSE v_row.grantee::regrole::text END));
+    END IF;
+  END LOOP;
+  IF v_portable AND (v_reader IS NULL OR EXISTS (
+       SELECT 1 FROM unnest(v_reader_cols) c(col)
+        WHERE NOT has_column_privilege(v_reader, v_rel, c.col, 'SELECT'))) THEN
+    v_problems := array_append(v_problems, 'reader column SELECT is missing'::text);
   END IF;
   IF EXISTS (SELECT 1 FROM pg_attrdef d WHERE d.adrelid = v_rel) THEN
     v_problems := array_append(v_problems, 'a column default is present'::text);
@@ -152,10 +178,16 @@ BEGIN
        AND v_row.polroles[1] = v_expected AND NOT v_owner_run
        AND v_row.q = 'true' AND v_row.c = 'true' AND v_runtime IS NULL THEN
       v_runtime := v_row.polroles[1];
+    ELSIF v_portable AND v_row.polname = 'search_projection_state_read_api' AND v_row.polpermissive
+          AND v_row.polcmd = 'r' AND v_row.polroles = ARRAY[v_reader] AND v_row.q = v_tenant_qual AND v_row.c IS NULL THEN
+      NULL; -- the 048000 reader policy, exactly
     ELSE
       v_problems := array_append(v_problems, format('unapproved policy %s', v_row.polname));
     END IF;
   END LOOP;
+  IF v_portable AND NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = v_rel AND polname = 'search_projection_state_read_api') THEN
+    v_problems := array_append(v_problems, 'policy search_projection_state_read_api is missing'::text);
+  END IF;
   IF v_owner_run THEN
     NULL; -- local owner-run: no runtime grant or policy exists or is accepted
   ELSIF v_runtime IS NULL THEN

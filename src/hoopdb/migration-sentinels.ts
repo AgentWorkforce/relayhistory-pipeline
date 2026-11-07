@@ -154,6 +154,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   },
   "upstream:20261105033000_canonical_project_events.sql": { evidence: "table sessions.canonical_project_events", sql: relation("sessions.canonical_project_events") },
   "upstream:20261105047000_portable_search_storage.sql": { evidence: "table sessions.search_projection_state", sql: relation("sessions.search_projection_state") },
+  "upstream:20261105048000_portable_search_reader_contract.sql": {
+    evidence: "policy search_projection_state_read_api on sessions.search_projection_state",
+    sql: "SELECT EXISTS (SELECT 1 FROM pg_policy WHERE polname = 'search_projection_state_read_api' AND polrelid = to_regclass('sessions.search_projection_state')) AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

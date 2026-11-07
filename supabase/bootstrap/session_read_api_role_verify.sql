@@ -5,7 +5,10 @@
 -- SECURITY DEFINER function but the two tenant-setting directory reads of
 -- 20261105034000 (sessions.list_session_directory_for, session_directory_activity_for;
 -- allowed, not required, so this also passes before that migration), and the
--- tenant-bound RLS policy on session_index.
+-- tenant-bound RLS policy on session_index. When migration 20261105048000 (portable
+-- search reader contract) is present (either of its policies exists), it requires exactly its column SELECT on
+-- sessions.search_projection_state (9 columns) and sessions.session_directory (6
+-- columns) and its two exact tenant FOR SELECT policies; before that, both are refused.
 \set ON_ERROR_STOP 1
 DO $verify$
 DECLARE
@@ -13,7 +16,19 @@ DECLARE
   v_problems text[] := ARRAY[]::text[];
   v_row record;
   v_qual text;
+  -- 20261105048000 (portable search reader contract): all-or-nothing (see the body).
+  v_portable boolean := false;
+  v_portable_cols constant jsonb := jsonb_build_object(
+    'sessions.search_projection_state', jsonb_build_array('backend_id', 'canonical_session_id', 'complete', 'coverage_from_ms', 'org_id', 'session_id', 'source', 'source_epoch', 'workspace_id'),
+    'sessions.session_directory', jsonb_build_array('event_projection_epoch', 'event_projection_ready', 'harness', 'org_id', 'session_id', 'workspace_id'));
+  v_tenant_qual constant text := '((org_id = current_setting(''bulls96_read.org_id''::text, true)) AND (workspace_id = current_setting(''bulls96_read.workspace_id''::text, true)))';
 BEGIN
+  -- All-or-nothing: 048000 is present iff either of its two policies exists; then its
+  -- complete exact surface is required, otherwise any part of it is refused. Independent of
+  -- the ledger (test fixtures apply migrations without one) and of search_path.
+  v_portable := EXISTS (SELECT 1 FROM pg_policy
+                         WHERE (polname = 'search_projection_state_read_api' AND polrelid = to_regclass('sessions.search_projection_state'))
+                            OR (polname = 'session_directory_portable_read_api' AND polrelid = to_regclass('sessions.session_directory')));
   SELECT * INTO v_role FROM pg_roles WHERE rolname = 'bulls96_read_api';
   IF NOT FOUND THEN
     RAISE EXCEPTION 'session read api role: bulls96_read_api does not exist';
@@ -49,10 +64,25 @@ BEGIN
     ELSIF v_row.rel = 'sessions.session_index' THEN
       IF v_row.sel THEN v_problems := array_append(v_problems, ('whole-table SELECT on sessions.session_index')::text); END IF;
       IF NOT v_row.col_sel THEN v_problems := array_append(v_problems, ('no column SELECT on sessions.session_index')::text); END IF;
+    ELSIF v_portable AND v_portable_cols ? v_row.rel THEN
+      IF v_row.sel THEN v_problems := array_append(v_problems, (format('whole-table SELECT on %s', v_row.rel))::text); END IF;
     ELSIF v_row.sel OR v_row.col_sel THEN
       v_problems := array_append(v_problems, (format('SELECT on %s', v_row.rel))::text);
     END IF;
   END LOOP;
+  -- Exact column sets of the portable reader contract (only when 048000 is applied).
+  IF v_portable THEN
+    FOR v_row IN
+      SELECT t.rel, a.attname, has_column_privilege(v_role.oid, t.rel::regclass, a.attnum, 'SELECT') AS sel
+        FROM jsonb_object_keys(v_portable_cols) AS t(rel)
+        JOIN pg_attribute a ON a.attrelid = to_regclass(t.rel) AND a.attnum > 0 AND NOT a.attisdropped
+    LOOP
+      IF v_row.sel <> (v_portable_cols -> v_row.rel) ? v_row.attname::text THEN
+        v_problems := array_append(v_problems, (format('%s column %s: SELECT is %s', v_row.rel, v_row.attname,
+          CASE WHEN v_row.sel THEN 'granted' ELSE 'missing' END))::text);
+      END IF;
+    END LOOP;
+  END IF;
   FOR v_row IN
     SELECT a.attname,
            has_column_privilege(v_role.oid, 'sessions.session_index'::regclass, a.attnum, 'SELECT') AS sel
@@ -93,11 +123,29 @@ BEGIN
     v_problems := array_append(v_problems, ('policy session_index_read_api is not bound to the tenant settings')::text);
   END IF;
   FOR v_row IN
-    SELECT p.polrelid::regclass::text AS rel, p.polname FROM pg_policy p
+    SELECT p.polrelid, p.polname, p.polpermissive, p.polcmd, p.polroles,
+           pg_get_expr(p.polqual, p.polrelid) AS q, p.polwithcheck IS NULL AS nocheck
+      FROM pg_policy p
      WHERE v_role.oid = ANY(p.polroles) AND p.polname <> 'session_index_read_api'
   LOOP
-    v_problems := array_append(v_problems, (format('unapproved policy %s on %s', v_row.polname, v_row.rel))::text);
+    -- Relation identity by OID, never by search_path-dependent regclass rendering.
+    IF v_portable AND v_row.polpermissive AND v_row.polcmd = 'r' AND v_row.polroles = ARRAY[v_role.oid]
+       AND v_row.nocheck AND v_row.q = v_tenant_qual
+       AND ((v_row.polname = 'search_projection_state_read_api' AND v_row.polrelid = to_regclass('sessions.search_projection_state'))
+         OR (v_row.polname = 'session_directory_portable_read_api' AND v_row.polrelid = to_regclass('sessions.session_directory'))) THEN
+      NULL;
+    ELSE
+      v_problems := array_append(v_problems, (format('unapproved policy %s on %s', v_row.polname, v_row.polrelid::regclass))::text);
+    END IF;
   END LOOP;
+  IF v_portable THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polname = 'search_projection_state_read_api' AND polrelid = to_regclass('sessions.search_projection_state')) THEN
+      v_problems := array_append(v_problems, ('policy search_projection_state_read_api is missing')::text);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polname = 'session_directory_portable_read_api' AND polrelid = to_regclass('sessions.session_directory')) THEN
+      v_problems := array_append(v_problems, ('policy session_directory_portable_read_api is missing')::text);
+    END IF;
+  END IF;
 
   IF cardinality(v_problems) > 0 THEN
     RAISE EXCEPTION 'session read api role is not in the approved shape: %', array_to_string(v_problems, '; ');

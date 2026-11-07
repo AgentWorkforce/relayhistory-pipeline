@@ -15,6 +15,8 @@ import { RUNTIME_APPLICATION_POLICY, RUNTIME_APPLICATION_TABLE_PRIVILEGES } from
 
 const root = (p: string) => fileURLToPath(new URL(`../../../${p}`, import.meta.url));
 const MIGRATION = readFileSync(root("supabase/migrations/20261105047000_portable_search_storage.sql"), "utf8");
+const READER = readFileSync(root("supabase/migrations/20261105048000_portable_search_reader_contract.sql"), "utf8");
+const READER_DOWN = readFileSync(root("supabase/rollbacks/20261105048000_portable_search_reader_contract.down.sql"), "utf8");
 // psql meta-commands are not SQL.
 const VERIFY = readFileSync(root("supabase/bootstrap/portable_search_storage_verify.sql"), "utf8").replace(/^\\.*$/gm, "");
 
@@ -178,3 +180,75 @@ test("ledgered composition refuses env-selected schemas and the Postgres content
   }
   expect(reservedSearchSchema("search_index")).toBe(false);
 });
+
+/** 047000 plus the 048000 reader contract, ledgered, with the session_index read grant
+ * and tenant policy that supabase/bootstrap/session_read_api_role.sql installs. */
+async function readerFixture() {
+  const db = await fixture();
+  await as(db, "mig_owner", () => db.exec(`
+    CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY, status text, updated_at timestamptz);
+    INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','pass',now());
+    INSERT INTO sessions.__96bulls_migrations VALUES('upstream:20261105047000_portable_search_storage.sql','x');
+    ALTER TABLE sessions.session_index ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE sessions.session_directory ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT (org_id, workspace_id, harness, session_id, canonical_session_id, deleted_at) ON sessions.session_index TO bulls96_read_api;
+    CREATE POLICY session_index_read_api ON sessions.session_index AS PERMISSIVE FOR SELECT TO bulls96_read_api
+      USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true));
+    CREATE POLICY owner_all ON sessions.session_directory TO rt USING (true) WITH CHECK (true);`));
+  await as(db, "mig_owner", () => db.exec(READER));
+  await as(db, "mig_owner", () => db.exec("INSERT INTO sessions.__96bulls_migrations VALUES('upstream:20261105048000_portable_search_reader_contract.sql','x')"));
+  return db;
+}
+
+const tenantReader = (db: PGlite) => (org: string, workspace: string, work: (tx: never) => Promise<unknown>) =>
+  db.transaction(async (tx) => {
+    await tx.exec("SET LOCAL ROLE bulls96_read_api");
+    await tx.query("SELECT set_config('bulls96_read.org_id',$1,true),set_config('bulls96_read.workspace_id',$2,true)", [org, workspace]);
+    return work(tx as never);
+  }) as never;
+
+test("048000 reader contract: tenant-bound completeness through the real read role; cross-tenant rows invisible", async () => {
+  const db = await readerFixture();
+  await verify(db); // storage verifier accepts exactly the reader surface once 048000 is ledgered
+  await db.exec(`INSERT INTO sessions.session_index VALUES('org-a','ws-a','codex','s1',NULL,NULL),('org-b','ws-a','codex','s1',NULL,NULL);
+    INSERT INTO sessions.session_directory VALUES('org-a','ws-a','codex','s1',7,true),('org-b','ws-a','codex','s1',7,true);`);
+  const writer = ledgeredSearchState({ backendId: "opensearch-v1", fromMs: 0 });
+  await as(db, "rt", () => db.transaction(tx => writer.record(tx, scope, value(true))));
+  const reader = ledgeredSearchState({ backendId: "opensearch-v1", fromMs: 0, reader: tenantReader(db) });
+  await as(db, "bulls96_read_api", () => admitPortableConnection(db, "reader"));
+  expect(await reader.partials({ orgId: "org-a", workspaceId: "ws-a" }, { limit: 10 })).toEqual({ sessions: [], overflow: false });
+  // org-b has a directory row but no state: incomplete, and org-a's state is invisible to it.
+  expect(await reader.partials({ orgId: "org-b", workspaceId: "ws-a" }, { limit: 10 })).toEqual({ sessions: ["s1"], overflow: false });
+  const seen = await tenantReader(db)("org-b", "ws-a", (tx: any) => tx.query("SELECT org_id FROM sessions.search_projection_state")) as { rows: unknown[] };
+  expect(seen.rows).toEqual([]);
+  const dir = await tenantReader(db)("org-b", "ws-a", (tx: any) => tx.query("SELECT org_id FROM sessions.session_directory")) as { rows: { org_id: string }[] };
+  expect(dir.rows.map(r => r.org_id)).toEqual(["org-b"]);
+  // Columns outside the contract stay refused.
+  await expect(tenantReader(db)("org-a", "ws-a", (tx: any) => tx.query("SELECT revision FROM sessions.search_projection_state"))).rejects.toThrow(/permission denied/);
+  // The read role cannot write.
+  await expect(tenantReader(db)("org-a", "ws-a", (tx: any) => tx.query("DELETE FROM sessions.search_projection_state"))).rejects.toThrow(/permission denied/);
+}, 120_000);
+
+test("048000 storage verifier drift: extra or whole-table reader grant, loosened reader policy, reader surface without the ledger row", async () => {
+  const drifts: [string, RegExp][] = [
+    ["GRANT SELECT (revision) ON sessions.search_projection_state TO bulls96_read_api", /column ACL is present: SELECT on revision/],
+    ["GRANT SELECT ON sessions.search_projection_state TO bulls96_read_api", /ACL: SELECT granted to bulls96_read_api/],
+    ["DROP POLICY search_projection_state_read_api ON sessions.search_projection_state; CREATE POLICY search_projection_state_read_api ON sessions.search_projection_state FOR SELECT TO bulls96_read_api USING (true)", /unapproved policy search_projection_state_read_api/],
+    // Partial surface: grants without the policies are refused (all-or-nothing).
+    ["DROP POLICY search_projection_state_read_api ON sessions.search_projection_state; DROP POLICY session_directory_portable_read_api ON sessions.session_directory", /column ACL is present/],
+    ["REVOKE SELECT (complete) ON sessions.search_projection_state FROM bulls96_read_api", /reader column SELECT is missing/],
+  ];
+  for (const [drift, message] of drifts) {
+    const db = await readerFixture();
+    await as(db, "mig_owner", () => db.exec(drift));
+    await expect(verify(db)).rejects.toThrow(message);
+    await db.close(); open.pop();
+  }
+}, 240_000);
+
+test("048000 rollback removes exactly its surface and the reader fails closed again", async () => {
+  const db = await readerFixture();
+  await as(db, "mig_owner", () => db.exec(READER_DOWN));
+  await verify(db); // back to the 047000-only shape
+  await expect(tenantReader(db)("org-a", "ws-a", (tx: any) => tx.query("SELECT 1 FROM sessions.search_projection_state"))).rejects.toThrow(/permission denied/);
+}, 120_000);
