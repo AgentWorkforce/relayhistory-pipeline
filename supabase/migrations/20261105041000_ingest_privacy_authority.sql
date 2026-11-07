@@ -516,6 +516,13 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control';END IF;
  UPDATE sessions.ingest_source_control_heads SET pending=false,updated_at=clock_timestamp()
   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
+ -- Buffered (staged, not yet published) copies: the ordered fence has now written the target's upload_deletions and
+ -- reset epoch, so the buffered GC will redact them (ingest_buffer_gc_ordinals keeps nothing fenced) and remove their
+ -- prior versions. Move this user's stages to the head of the GC queue, so they are examined next rather than after
+ -- the whole round-robin (here, not at begin: the fence must have landed first, or a healthy check would re-queue them).
+ UPDATE sessions.ingest_stage_intents SET gc_checked_at='-infinity'
+  WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user AND cleanup_state<>'redacted'
+   AND (h.kind='reset' OR (h.payload->>'enabled')='false' AND origin_id=h.payload->>'origin_id');
  PERFORM set_config('bulls96.privacy_authority_writer','',true);
  RETURN jsonb_build_object('completed',true,'superseded',false);
 END $authority_complete$;

@@ -512,3 +512,62 @@ test("analysis purge (real #292 function): a disable purges only the listed sess
   await authorityControl(w.f, "selection", { origin_id: w.o, sessions: [{ source: "claude", session_id: "S1" }], enabled: true });
   expect(await w.jobs()).toEqual([`${TENANT.workspaceId}/S1`, "ws-b/S1"]);
 });
+
+/**
+ * Buffered/staged copies (coordinator follow-up): a batch staged under buffered-batches/ and reset BEFORE promotion
+ * must leave no version of its content: the real buffered GC (claim -> redaction barrier -> erase every other version)
+ * over a versioned store, driven by the target fences the authority reset produces.
+ */
+async function bufferedWorld() {
+  const { VersionedMemoryStore } = await import("./versioned-store.ts");
+  const { sqlBufferedGcLedger, bufferedGcTick } = await import("../buffered-gc.ts");
+  const store = new VersionedMemoryStore();
+  const f = await authorityFixture({ store: store as never });
+  open.push(f.close);
+  await f.seal();
+  const n = await fakeNeon();
+  open.push(n.close);
+  await activateFrom(f as F, n);
+  const gc = (limit: number) => bufferedGcTick({ ledger: sqlBufferedGcLedger({ query: (s, p) => f.run(s, p as unknown[]) as never }, "a".repeat(64)), store: store as never, eraser: store.eraser(), keyRoot: "96bulls" }, limit);
+  const upload = async (tenant: typeof TENANT, sid: string, batchId: string, text: string) => {
+    const a = createIngestApp({ identify: () => ({ ...tenant, scopes: ["rth:sync"] }), deliver: f.deps, log: () => {}, custodySource: "frozen-supabase", privacyAuthority: "supabase" });
+    const r = await a.request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ protocolVersion: 1, batch: await batch([record({ record_id: batchId + "-r", session_id: sid, payload: { text, ts_ms: 1_761_955_200_000 } })], { batch_id: batchId, account_id: await deliveryAccount(tenant) }) }) });
+    if (r.status !== 200) throw new Error("upload " + r.status + " " + (await r.text()));
+  };
+  const { zstdDecompressSync } = await import("node:zlib");
+  /** Every stored version under buffered-batches/ whose (decompressed) bytes contain `text`. */
+  const holding = (text: string) => store.versions("96bulls/").filter((v) => v.key.includes("/buffered-batches/") && v.body).filter((v) => {
+    const raw = Buffer.from(v.body!);
+    let plain = raw;
+    try { plain = zstdDecompressSync(raw); } catch {}
+    return plain.includes(text);
+  });
+  return { f, store, gc, upload, holding };
+}
+
+test("buffered: a batch staged and reset before promotion leaves no version of its content (real GC, versioned store)", async () => {
+  const w = await bufferedWorld();
+  await w.upload(TENANT, "STAGED", "b-staged", "C3-STAGED-SECRET");
+  expect(w.holding("C3-STAGED-SECRET").length).toBe(1);
+  // Healthy and unreset: the GC keeps it.
+  await w.gc(5);
+  expect(w.holding("C3-STAGED-SECRET").length).toBe(1);
+  await authorityControl(w.f as F, "reset", { request_id: "staged-reset" });
+  const r = await w.gc(5);
+  expect(r.finished).toBeGreaterThanOrEqual(1);
+  expect(w.holding("C3-STAGED-SECRET")).toEqual([]);
+  expect(((await w.f.db.query("SELECT cleanup_state FROM sessions.ingest_stage_intents WHERE batch_id='b-staged'")).rows[0] as any).cleanup_state).toBe("redacted");
+});
+
+test("buffered: a reset user's stages jump the GC queue (examined in the very next claim, ahead of older healthy stages)", async () => {
+  const w = await bufferedWorld();
+  const other = { ...TENANT, userId: "user-2" };
+  for (let i = 0; i < 6; i++) await w.upload(other, `O${i}`, `b-other-${i}`, `OTHER-${i}`);
+  await w.upload(TENANT, "LATE", "b-late", "C3-LATE-SECRET");
+  await authorityControl(w.f as F, "reset", { request_id: "late-reset" });
+  // One single-candidate claim: it must be the reset user's stage, not the oldest healthy one.
+  await w.gc(1);
+  expect(w.holding("C3-LATE-SECRET")).toEqual([]);
+  for (let i = 0; i < 6; i++) expect(w.holding(`OTHER-${i}`).length).toBe(1);
+});
