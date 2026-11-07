@@ -8,7 +8,10 @@ import type { PGlite } from "@electric-sql/pglite";
 import { database, hoopDb, pointer, KEY } from "../../session-brief/__tests__/harness.ts";
 import { postgresAnalysisJobStore, sweepAnalysisTickets } from "../store.ts";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
-import { objectKey } from "../../../packages/object-store/src/index.ts";
+import { objectKey, type ObjectStore } from "../../../packages/object-store/src/index.ts";
+import { createHash } from "node:crypto";
+import { storeEraser } from "../../migration/neon-s3-erasure/eraser.ts";
+import { FakeS3Versions } from "../../migration/__tests__/fake-s3-versions.ts";
 import { analysisResultKey, analysisResultPrefix, encodeAnalysisResult } from "../results.ts";
 import type { AnalysisJob, AnalysisJobOutput } from "../processor.ts";
 import { mkdtempSync } from "node:fs";
@@ -45,12 +48,6 @@ async function request(session = KEY.sessionId, workspace = KEY.workspaceId, org
 }
 
 const results = () => createFsStore({ root: mkdtempSync(join(tmpdir(), "analysis-jobs-")) });
-/** The unversioned fs store's every-version erase (a versioned bucket uses createS3Eraser). */
-const fsErase = (store: ReturnType<typeof results>) => async (key: string) => {
-  const had = (await store.head(objectKey(key))) !== undefined;
-  await store.delete(objectKey(key));
-  return had ? 1 : 0;
-};
 const ANCHOR = "org-a/ws-a/m-1/claude/2026-10-29/s-1/manifest.json";
 const jobStore = (store = results()) =>
   postgresAnalysisJobStore({ db: hoopDb(pg), store, anchorManifestKey: async () => ANCHOR });
@@ -416,7 +413,7 @@ describe("P0-2 erase-safe publication", () => {
     expect((await objects.head(objectKey(out.key!)))).toBeDefined();
     const tickets = (await pg.query<Json>("SELECT result_key, reason FROM sessions.session_analysis_result_tickets")).rows;
     expect(tickets).toEqual([{ result_key: out.key, reason: "publishing" }]);
-    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject: fsErase(objects) })).toBe(1);
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraser: storeEraser(objects) })).toBe(1);
     expect(await objects.head(objectKey(out.key!))).toBeUndefined();
     expect((await pg.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
   });
@@ -449,20 +446,18 @@ describe("P0-2 erase-safe publication", () => {
       await pg.query("UPDATE sessions.session_index SET deleted_at = now()");
     });
     expect(out.stage).toBe("lost");
-    // A versioned bucket: a plain delete leaves a noncurrent version.
-    const versions = new Map<string, number>([[out.key!, 2]]);
-    let stubborn = true;
-    const eraseObject = async (key: string) => {
-      const n = versions.get(key) ?? 0;
-      if (stubborn) return n; // the first sweep "deletes" nothing: versions remain
-      versions.set(key, 0);
-      return n;
-    };
-    await expect(sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject })).rejects.toThrow("analysis_sweep_versions_remain");
+    // A versioned bucket (the shared fake): the write plus a noncurrent version of it; the lost
+    // publication's pending-write ticket is swept by exact version through the shared eraser.
+    const s3 = new FakeS3Versions();
+    s3.put(out.key!); s3.put(out.key!);
+    let lose = true;
+    s3.onDelete = () => (lose ? ((lose = false), "lose") : undefined); // the first DELETE's ack is lost
+    const errors: unknown[] = [];
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraser: s3.eraser(), onError: (_k, e) => errors.push(e) })).toBe(0);
+    expect(errors).toHaveLength(1);
     expect((await pg.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(1);
-    stubborn = false;
-    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject })).toBe(1);
-    expect(versions.get(out.key!)).toBe(0);
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraser: s3.eraser() })).toBe(1);
+    expect(s3.count(out.key!)).toBe(0);
     expect((await pg.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
   });
 
@@ -472,9 +467,12 @@ describe("P0-2 erase-safe publication", () => {
        VALUES ('k/leased', gen_random_uuid(), $1, $2, $3, 'publishing', now() - interval '1 day', now() + interval '5 minutes')`,
       [KEY.orgId, KEY.workspaceId, KEY.sessionId],
     );
-    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx, eraseObject: fsErase(results()) })).toBe(0);
+    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx, eraser: storeEraser(results()) })).toBe(0);
     await pg.query("UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() - interval '1 second'");
-    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx, eraseObject: fsErase(results()) })).toBe(1);
+    // Expired: swept, but nothing was found, so a pending write of unknown outcome is kept and
+    // rescheduled (never retired on a timer).
+    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx, eraser: storeEraser(results()) })).toBe(0);
+    expect((await pg.query("SELECT reason, sweeps FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ reason: "publishing", sweeps: 1 }]);
   });
 
   test("P1-a: the worker's database half never re-reads a manifest", async () => {
@@ -495,11 +493,11 @@ describe("P0-2 erase-safe publication", () => {
     const store = jobStore(objects);
     const out = await publish(store, (await store.claim({ leaseSeconds: 600 }))!);
     expect(out.stage).toBe("completed");
-    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject: fsErase(objects) })).toBe(0);
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraser: storeEraser(objects) })).toBe(0);
     expect(await objects.head(objectKey(out.key!))).toBeDefined();
     await pg.query("UPDATE sessions.session_index SET deleted_at = now()");
     expect((await pg.query<Json>("SELECT reason FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ reason: "forgotten" }]);
-    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject: fsErase(objects) })).toBe(1);
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraser: storeEraser(objects) })).toBe(1);
     expect(await objects.head(objectKey(out.key!))).toBeUndefined();
   });
 });
@@ -662,7 +660,7 @@ describe("C3 purge (purge_session_analysis_for_owned): read + admission fences, 
       source text NOT NULL,session_id text NOT NULL,PRIMARY KEY(org_id,workspace_id,user_id,origin_id,source,session_id))`);
     await pg.query("INSERT INTO sessions.ingest_frozen_source_owned_sessions VALUES ($1, $2, $3, 'origin', 'claude', $4)", [org, ws, user, session]);
   };
-  const purge = (user = "u-owner") => pg.query("SELECT sessions.purge_session_analysis_for_owned($1, $2)", [KEY.orgId, user]);
+  const purge = (user = "u-owner") => pg.query("SELECT sessions.purge_session_analysis_for_owned($1, $2, $3)", [KEY.orgId, KEY.workspaceId, user]);
 
   test("reads hide and admission refuses at once; an in-flight job can neither reserve nor complete; a fresh upload reopens", async () => {
     await ownedSet();
@@ -691,9 +689,10 @@ describe("C3 purge (purge_session_analysis_for_owned): read + admission fences, 
     expect(await store.reserve(inflight, out, { sha256, bytes: bytes.length })).toBeNull();
     expect((await pg.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
     // Every result key is ticketed for the every-version eraser.
-    const tickets = (await pg.query<{ reason: string }>("SELECT reason FROM sessions.session_analysis_result_tickets")).rows;
-    expect(tickets.length).toBeGreaterThanOrEqual(2);
-    expect(tickets.every((t) => t.reason === "forgotten")).toBe(true);
+    // The published result is 'forgotten'; the in-flight write's outcome is 'unknown'.
+    const tickets = (await pg.query<{ k: string; reason: string }>("SELECT result_key k, reason FROM sessions.session_analysis_result_tickets ORDER BY reason")).rows;
+    expect(tickets.map((t) => t.reason)).toEqual(["forgotten", "unknown"]);
+    expect(tickets.find((t) => t.reason === "unknown")!.k).toBe(key);
     // A fresh upload after the purge (a new pointer) reopens admission.
     await pointer(pg, { machine: "m-new" });
     expect((await request()).outcome).toBe("accepted");
@@ -705,7 +704,7 @@ describe("C3 purge (purge_session_analysis_for_owned): read + admission fences, 
     await request();
     expect((await publish(store, (await store.claim({ leaseSeconds: 600 }))!)).stage).toBe("completed");
     await purge("u-owner"); // u-owner owns nothing here
-    await pg.query("SELECT sessions.purge_session_analysis_for_owned('org-other', 'u-other')");
+    await pg.query("SELECT sessions.purge_session_analysis_for_owned('org-other', $1, 'u-other')", [KEY.workspaceId]);
     expect((await readAs()).analyses).toHaveLength(1);
     expect((await pg.query("SELECT 1 FROM sessions.session_analysis_purge_fences")).rows).toEqual([{ "?column?": 1 }]);
     expect((await pg.query<{ o: string }>("SELECT org_id o FROM sessions.session_analysis_purge_fences")).rows).toEqual([{ o: "org-other" }]);
@@ -718,25 +717,171 @@ describe("C3 purge (purge_session_analysis_for_owned): read + admission fences, 
     await request();
     const { key } = await publish(store, (await store.claim({ leaseSeconds: 600 }))!);
     // A versioned bucket: the object plus one older version of it.
-    const versions = new Map<string, number>([[key!, 2]]);
-    let failures = 1;
-    const eraseObject = async (k: string) => {
-      if (failures-- > 0) throw new Error("S3 503");
-      const n = versions.get(k) ?? 0;
-      versions.delete(k);
-      await objects.delete(objectKey(k));
-      return n;
-    };
+    const s3 = new FakeS3Versions();
+    s3.put(key!); s3.put(key!);
+    let fail = true;
+    s3.onDelete = () => (fail ? ((fail = false), "lose") : undefined);
     await purge();
-    await expect(sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject })).rejects.toThrow("S3 503");
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraser: s3.eraser() })).toBe(0);
     expect((await pg.query("SELECT result_key FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ result_key: key }]);
-    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject })).toBe(1);
-    expect(versions.get(key!) ?? 0).toBe(0);
-    expect(await objects.head(objectKey(key!))).toBeUndefined();
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraser: s3.eraser() })).toBe(1);
+    expect(s3.count(key!)).toBe(0);
     expect((await pg.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
   });
 
   test("the sweeper refuses to run without the every-version eraser", async () => {
     await expect(sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx } as never)).rejects.toThrow("analysis_sweep_eraser_required");
+    await expect(sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx, eraser: { eraseStep: async () => ({}) } } as never)).rejects.toThrow("analysis_sweep_eraser_required");
+  });
+});
+
+describe("durable unknown-PUT recovery through the shared paged eraser: an aborted PUT's outcome is unknown; no timer is a commit bound", () => {
+  /** The shared versioned S3 fake for versions, an fs store for the bytes the read-back needs. */
+  function versioned(base = results()) {
+    const s3 = new FakeS3Versions();
+    const commit = async (key: string, bytes: Uint8Array) => {
+      const id = s3.put(key);
+      await base.delete(objectKey(key));
+      await base.put(objectKey(key), bytes, {});
+      return id;
+    };
+    return { base, s3, commit, ids: (k: string) => (s3.keys.get(k) ?? []).map((v) => v.id) };
+  }
+  /** The fs store's methods (a class instance does not spread) with `put` replaced. */
+  const withPut = (base: ObjectStore, put: ObjectStore["put"]): ObjectStore => ({
+    backend: base.backend, head: (k) => base.head(k), get: (k, r) => base.get(k, r), getObject: (k, r) => base.getObject(k, r),
+    list: (p, c) => base.list(p, c), presignGet: (k, t) => base.presignGet(k, t), delete: (k) => base.delete(k), put,
+  });
+  const created = (key: unknown, body: unknown, id: string) => ({
+    key: key as never, version: { version: id }, contentSha256: createHash("sha256").update(body as Uint8Array).digest("hex"), size: (body as Uint8Array).length, created: true,
+  });
+  const sweep = (v: ReturnType<typeof versioned>, budget?: { versions?: number }) =>
+    sweepAnalysisTickets(v.base, { graceSeconds: 0, transact: tx, eraser: v.s3.eraser(), ...(budget ? { budget } : {}) });
+  const ticket = async () =>
+    (await pg.query<{ k: string; reason: string; sweeps: number }>("SELECT result_key k, reason, sweeps FROM sessions.session_analysis_result_tickets")).rows;
+
+  async function reserved(store: ObjectStore) {
+    const js = postgresAnalysisJobStore({ db: hoopDb(pg), store, anchorManifestKey: async () => ANCHOR, putTimeoutMs: 50 });
+    await request();
+    const job = (await js.claim({ leaseSeconds: 600 }))!;
+    const out = output();
+    const { bytes, sha256 } = encodeAnalysisResult(out.result);
+    const key = (await js.reserve(job, out, { sha256, bytes: bytes.length }))!;
+    return { js, job, out, bytes, sha256, key };
+  }
+
+  test("(a) LOST RESPONSE: the PUT committed but its response (and version id) was lost -> 'unknown'; the sweep finds the stray by strict listing, erases it, verifies zero, retires", async () => {
+    const v = versioned();
+    const lossy = withPut(v.base, async (key, body) => { await v.commit(String(key), body as Uint8Array); throw new Error("socket hang up"); });
+    const { js, job, bytes, sha256, key } = await reserved(lossy);
+    await expect(js.put(key, bytes, sha256, job)).rejects.toThrow("socket hang up");
+    expect(await ticket()).toEqual([{ k: key, reason: "unknown", sweeps: 0 }]);
+    expect(v.ids(key)).toHaveLength(1);
+    expect(await sweep(v)).toBe(1);
+    expect(v.ids(key)).toEqual([]);
+    expect(await ticket()).toEqual([]);
+  });
+
+  test("(b) AFTER-GRACE commit: a clean sweep never retires the unknown ticket; the late commit is found and erased on a re-sweep", async () => {
+    const v = versioned();
+    let late: (() => Promise<string>) | null = null;
+    const aborting = withPut(v.base, (key, body, opts) => new Promise((_, reject) => {
+      late = () => v.commit(String(key), body as Uint8Array); // the provider commits it LATER
+      opts?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    }));
+    const { js, job, bytes, sha256, key } = await reserved(aborting);
+    await expect(js.put(key, bytes, sha256, job)).rejects.toThrow("analysis_put_timeout");
+    await pg.query("UPDATE sessions.session_analysis_result_tickets SET created_at = now() - interval '7 days'");
+    expect(await sweep(v)).toBe(0); // a strict zero inventory, but nothing accounted for: kept
+    expect(await ticket()).toEqual([{ k: key, reason: "unknown", sweeps: 1 }]);
+    expect(await sweep(v)).toBe(0); // not due yet (backoff)
+    await late!();
+    expect(v.ids(key)).toHaveLength(1);
+    await pg.query("UPDATE sessions.session_analysis_result_tickets SET next_sweep_at = now() - interval '1 second'");
+    expect(await sweep(v)).toBe(1);
+    expect(v.ids(key)).toEqual([]);
+    expect(await ticket()).toEqual([]);
+  });
+
+  test("successor-safe: a published job's exact version at the key is never selected; only the unowned stray is erased", async () => {
+    const v = versioned();
+    const store = withPut(v.base, async (key, body) => created(key, body, await v.commit(String(key), body as Uint8Array)));
+    const { js, job, out, bytes, sha256, key } = await reserved(store);
+    const put = await js.put(key, bytes, sha256, job);
+    expect(await js.complete({ job, output: out, stored: { key, sha256, bytes: bytes.length, ...(put && put.versionId ? { versionId: put.versionId } : {}) } })).toBe(true);
+    const owned = (await pg.query<{ v: string }>("SELECT result_version_id v FROM sessions.session_analysis_jobs_v2 WHERE id = $1", [job.id])).rows[0]!.v;
+    expect(v.ids(key)).toEqual([owned]);
+    // An earlier writer's PUT of the same key, outcome unknown, lands later as a second version.
+    const stray = await v.commit(key, bytes);
+    await pg.query(`INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, created_at)
+      VALUES ($1, $2::uuid, $3, $4, $5, 'unknown', now() - interval '1 day')`, [key, job.id, KEY.orgId, KEY.workspaceId, KEY.sessionId]);
+    expect(await sweep(v)).toBe(1);
+    expect(v.ids(key)).toEqual([owned]);
+    expect(v.s3.deletes).toEqual([`${key}@${stray}`]);
+    expect((await readAs()).analyses).toHaveLength(1);
+  });
+
+  test("ticket survival: the exact delete's ack is lost once -> the unknown ticket survives; the next sweep resolves it", async () => {
+    const v = versioned();
+    const lossy = withPut(v.base, async (key, body) => { await v.commit(String(key), body as Uint8Array); throw new Error("ECONNRESET"); });
+    const { js, job, bytes, sha256, key } = await reserved(lossy);
+    await expect(js.put(key, bytes, sha256, job)).rejects.toThrow("ECONNRESET");
+    let lose = true;
+    v.s3.onDelete = () => (lose ? ((lose = false), "lose") : undefined);
+    expect(await sweep(v)).toBe(0); // the step failed: the ticket survives, the found stray is recorded
+    expect(await ticket()).toEqual([{ k: key, reason: "unknown", sweeps: 0 }]);
+    expect((await pg.query<{ f: boolean }>("SELECT stray_found f FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ f: true }]);
+    expect(await sweep(v)).toBe(1);
+    expect(v.ids(key)).toEqual([]);
+    expect(await ticket()).toEqual([]);
+  });
+
+  test(">10k versions: a budget-exhausted step persists the bound checkpoint; a crash keeps it; the resumed sweep completes, verifies zero, retires", async () => {
+    const v = versioned();
+    await request();
+    const key = analysisResultKey(analysisResultPrefix(ANCHOR), "11111111-1111-4111-8111-111111111111", "a".repeat(64));
+    for (let i = 0; i < 10_050; i += 1) v.s3.put(key);
+    await pg.query(`INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, created_at)
+      VALUES ($1, gen_random_uuid(), $2, $3, $4, 'forgotten', now() - interval '1 day')`, [key, KEY.orgId, KEY.workspaceId, KEY.sessionId]);
+    // Step 1: the eraser's 10k ceiling -> incomplete; the checkpoint is persisted on the ticket.
+    expect(await sweep(v)).toBe(0);
+    const cp = (await pg.query<{ c: { scope: string; prefix: string } | null }>("SELECT erase_checkpoint c FROM sessions.session_analysis_result_tickets")).rows[0]!.c;
+    expect(cp?.prefix).toBe(key.slice(0, key.lastIndexOf("/") + 1));
+    expect(v.s3.count(key)).toBeLessThan(10_050);
+    // A crash mid-step (a lost delete ack): the step fails, the persisted checkpoint stays.
+    let lose = true;
+    v.s3.onDelete = () => (lose ? ((lose = false), "lose") : undefined);
+    expect(await sweep(v)).toBe(0);
+    expect((await pg.query<{ c: unknown }>("SELECT erase_checkpoint c FROM sessions.session_analysis_result_tickets")).rows[0]!.c).toEqual(cp);
+    // Resumed: completes, a fresh strict verifyErased shows zero, retired.
+    let retired = 0;
+    for (let i = 0; i < 4 && !retired; i += 1) retired = await sweep(v);
+    expect(retired).toBe(1);
+    expect(v.s3.count(key)).toBe(0);
+    expect(await ticket()).toEqual([]);
+  });
+
+  test("a checkpoint bound to another scope is never adopted (the sweep restarts from the start)", async () => {
+    const v = versioned();
+    await request();
+    const key = analysisResultKey(analysisResultPrefix(ANCHOR), "22222222-2222-4222-8222-222222222222", "b".repeat(64));
+    v.s3.put(key);
+    const foreign = { v: 1, bucket: "b", prefix: key.slice(0, key.lastIndexOf("/") + 1), scope: "f".repeat(64), afterKey: key, inKey: null };
+    await pg.query(`INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, created_at, erase_checkpoint)
+      VALUES ($1, gen_random_uuid(), $2, $3, $4, 'forgotten', now() - interval '1 day', $5::jsonb)`, [key, KEY.orgId, KEY.workspaceId, KEY.sessionId, JSON.stringify(foreign)]);
+    expect(await sweep(v)).toBe(1); // a foreign afterKey=key would have skipped it
+    expect(v.s3.count(key)).toBe(0);
+  });
+
+  test("a successful PUT + publish retires the pending-write ticket in the publishing transaction and records the owned version", async () => {
+    const v = versioned();
+    const store = withPut(v.base, async (key, body) => created(key, body, await v.commit(String(key), body as Uint8Array)));
+    const { js, job, out, bytes, sha256, key } = await reserved(store);
+    expect((await pg.query<{ w: string; g: string }>("SELECT writer_token::text w, generation g FROM sessions.session_analysis_result_tickets")).rows)
+      .toEqual([{ w: job.leaseToken, g: job.sourceRevision }]);
+    const put = await js.put(key, bytes, sha256, job);
+    expect(await js.complete({ job, output: out, stored: { key, sha256, bytes: bytes.length, ...(put && put.versionId ? { versionId: put.versionId } : {}) } })).toBe(true);
+    expect(await ticket()).toEqual([]);
+    expect((await pg.query<{ v: string }>("SELECT result_version_id v FROM sessions.session_analysis_jobs_v2 WHERE id = $1", [job.id])).rows[0]!.v).toBe(v.ids(key)[0]);
   });
 });

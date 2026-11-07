@@ -353,9 +353,13 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     },
     transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
     transact: (work) => transaction(db, work),
-    // The bucket is versioned: the sweeper erases every version of an orphan result key.
-    eraseObject: (key) =>
-      createS3Eraser({ bucket: env.bucket, region: env.region, credentials: lambdaCredentials() }).eraseObject(key),
+    // The bucket is versioned: the sweeper erases, by exact version id and in resumable strict
+    // pages, every version of a ticketed result key that no published job owns.
+    // Built per call so each step signs with the current Lambda credentials.
+    eraser: {
+      eraseStep: (prefix, opts) => createS3Eraser({ bucket: env.bucket, region: env.region, credentials: lambdaCredentials() }).eraseStep(prefix, opts),
+      verifyErased: (prefix, opts) => createS3Eraser({ bucket: env.bucket, region: env.region, credentials: lambdaCredentials() }).verifyErased(prefix, opts),
+    },
   });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
   // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
