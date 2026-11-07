@@ -188,6 +188,42 @@ BEGIN
   IF v_portable AND NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = v_rel AND polname = 'search_projection_state_read_api') THEN
     v_problems := array_append(v_problems, 'policy search_projection_state_read_api is missing'::text);
   END IF;
+  -- The directory half of the 048000 reader contract, checked here too so every route
+  -- that runs this verifier (phase 2, mark_pass, writer admission) covers it.
+  IF v_portable THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_policy p
+                    WHERE p.polname = 'session_directory_portable_read_api' AND p.polrelid = to_regclass('sessions.session_directory')
+                      AND p.polpermissive AND p.polcmd = 'r' AND p.polroles = ARRAY[v_reader]
+                      AND p.polwithcheck IS NULL AND pg_get_expr(p.polqual, p.polrelid) = v_tenant_qual) THEN
+      v_problems := array_append(v_problems, 'directory policy session_directory_portable_read_api is missing or not exact'::text);
+    END IF;
+    FOR v_row IN
+      SELECT p.polname FROM pg_policy p
+       WHERE p.polrelid = to_regclass('sessions.session_directory')
+         AND (0 = ANY(p.polroles) OR v_reader = ANY(p.polroles))
+         AND p.polname <> 'session_directory_portable_read_api'
+    LOOP
+      v_problems := array_append(v_problems, format('unapproved directory policy %s applies to PUBLIC or the reader', v_row.polname));
+    END LOOP;
+    -- No GRANT OPTION anywhere in the reader's column grants on the two relations.
+    IF EXISTS (SELECT 1 FROM pg_attribute a, aclexplode(a.attacl) x
+                WHERE a.attrelid IN (to_regclass('sessions.session_directory'), to_regclass('sessions.search_projection_state'))
+                  AND a.attnum > 0 AND a.attacl IS NOT NULL AND x.grantee = v_reader AND x.is_grantable) THEN
+      v_problems := array_append(v_problems, ('reader column SELECT WITH GRANT OPTION on the portable relations')::text);
+    END IF;
+    IF NOT coalesce((SELECT relrowsecurity FROM pg_class WHERE oid = to_regclass('sessions.session_directory')), false) THEN
+      v_problems := array_append(v_problems, 'RLS is off on sessions.session_directory'::text);
+    END IF;
+    IF v_reader IS NULL OR has_table_privilege(v_reader, 'sessions.session_directory', 'SELECT') THEN
+      v_problems := array_append(v_problems, 'reader has whole-table SELECT on sessions.session_directory (or is missing)'::text);
+    ELSIF EXISTS (
+      SELECT 1 FROM pg_attribute a
+       WHERE a.attrelid = 'sessions.session_directory'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+         AND has_column_privilege(v_reader, a.attrelid, a.attnum, 'SELECT')
+             <> (a.attname::text = ANY(ARRAY['org_id', 'workspace_id', 'harness', 'session_id', 'event_projection_epoch', 'event_projection_ready']))) THEN
+      v_problems := array_append(v_problems, 'reader directory column SELECT differs from the six contract columns'::text);
+    END IF;
+  END IF;
   IF v_owner_run THEN
     NULL; -- local owner-run: no runtime grant or policy exists or is accepted
   ELSIF v_runtime IS NULL THEN

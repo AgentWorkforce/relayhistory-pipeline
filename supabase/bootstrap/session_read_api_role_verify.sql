@@ -126,7 +126,12 @@ BEGIN
     SELECT p.polrelid, p.polname, p.polpermissive, p.polcmd, p.polroles,
            pg_get_expr(p.polqual, p.polrelid) AS q, p.polwithcheck IS NULL AS nocheck
       FROM pg_policy p
-     WHERE v_role.oid = ANY(p.polroles) AND p.polname <> 'session_index_read_api'
+     WHERE (v_role.oid = ANY(p.polroles)
+            -- Once 048000 is present the read role reads these two relations directly, so a
+            -- policy applying to PUBLIC there applies to it too: include, never filter out.
+            OR (v_portable AND 0 = ANY(p.polroles)
+                AND p.polrelid IN (to_regclass('sessions.session_directory'), to_regclass('sessions.search_projection_state'))))
+       AND NOT (p.polname = 'session_index_read_api' AND p.polrelid = 'sessions.session_index'::regclass)
   LOOP
     -- Relation identity by OID, never by search_path-dependent regclass rendering.
     IF v_portable AND v_row.polpermissive AND v_row.polcmd = 'r' AND v_row.polroles = ARRAY[v_role.oid]
@@ -139,11 +144,33 @@ BEGIN
     END IF;
   END LOOP;
   IF v_portable THEN
-    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polname = 'search_projection_state_read_api' AND polrelid = to_regclass('sessions.search_projection_state')) THEN
-      v_problems := array_append(v_problems, ('policy search_projection_state_read_api is missing')::text);
+    -- Exact, not merely present by name: PERMISSIVE FOR SELECT TO the read role only, the
+    -- tenant qual, no WITH CHECK.
+    FOR v_row IN
+      SELECT x.name, x.rel, EXISTS (
+               SELECT 1 FROM pg_policy p
+                WHERE p.polname = x.name AND p.polrelid = to_regclass(x.rel)
+                  AND p.polpermissive AND p.polcmd = 'r' AND p.polroles = ARRAY[v_role.oid]
+                  AND p.polwithcheck IS NULL AND pg_get_expr(p.polqual, p.polrelid) = v_tenant_qual) AS ok
+        FROM (VALUES ('search_projection_state_read_api', 'sessions.search_projection_state'),
+                     ('session_directory_portable_read_api', 'sessions.session_directory')) AS x(name, rel)
+    LOOP
+      IF NOT v_row.ok THEN
+        v_problems := array_append(v_problems, (format('policy %s on %s is missing or not exactly FOR SELECT TO bulls96_read_api on the tenant settings', v_row.name, v_row.rel))::text);
+      END IF;
+    END LOOP;
+    -- No GRANT OPTION anywhere in the reader's column grants on the two relations.
+    IF EXISTS (SELECT 1 FROM pg_attribute a, aclexplode(a.attacl) x
+                WHERE a.attrelid IN (to_regclass('sessions.session_directory'), to_regclass('sessions.search_projection_state'))
+                  AND a.attnum > 0 AND a.attacl IS NOT NULL AND x.grantee = v_role.oid AND x.is_grantable) THEN
+      v_problems := array_append(v_problems, ('reader column SELECT WITH GRANT OPTION on the portable relations')::text);
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polname = 'session_directory_portable_read_api' AND polrelid = to_regclass('sessions.session_directory')) THEN
-      v_problems := array_append(v_problems, ('policy session_directory_portable_read_api is missing')::text);
+    -- Row security must be on wherever the read role now reads directly.
+    IF NOT coalesce((SELECT relrowsecurity FROM pg_class WHERE oid = to_regclass('sessions.session_directory')), false) THEN
+      v_problems := array_append(v_problems, ('RLS is off on sessions.session_directory')::text);
+    END IF;
+    IF NOT coalesce((SELECT relrowsecurity AND relforcerowsecurity FROM pg_class WHERE oid = to_regclass('sessions.search_projection_state')), false) THEN
+      v_problems := array_append(v_problems, ('RLS is off or not FORCEd on sessions.search_projection_state')::text);
     END IF;
   END IF;
 
