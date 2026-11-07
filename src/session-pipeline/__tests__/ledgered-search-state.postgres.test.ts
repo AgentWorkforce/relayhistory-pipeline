@@ -84,6 +84,9 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     await t.migrate();
     const marker = (await t.owner.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows;
     expect(marker.map(r => r.status)).toEqual(["pass"]);
+    // The post-migrate read-role activation, as production runs it (USAGE on sessions,
+    // session_index columns/policy, LOGIN). Owned disposable cluster only.
+    await t.owner.query(readFileSync(join(root, "supabase/bootstrap/session_read_api_role.sql"), "utf8").split("\n").filter(l => !l.startsWith("\\")).join("\n"));
     expect(await runtimeRoleViolations(t.owner as never, { mode: "local", role: t.rt, login: true }, { ledger: "sessions.__96bulls_migrations", marker: "sessions.__96bulls_role_validation" }, "post")).toEqual([]);
     await verifyAs(t.owner, t.rt);
     // The writer is its own LOGIN connection: no owner, superuser or SET ROLE.
