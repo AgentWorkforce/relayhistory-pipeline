@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,9 +10,10 @@ import { objectKey, readAll, type ManifestV1 } from "../../shared/vendor.ts";
 import {
   captureSeedScopeExportEvidence,
   createS3FrontierVersioningReader,
+  FrontierSourceEvidenceError,
   type FrontierBucketVersioningReader,
 } from "../frontier-plan-source.ts";
-import { SeedProofIndex, type ProofDeps, type SeedPointer } from "../seed-proof.ts";
+import { SeedProofError, SeedProofIndex, type ProofDeps, type SeedPointer } from "../seed-proof.ts";
 import type { SeedSql } from "../seed.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { writeBatchObjects } from "../writer.ts";
@@ -21,6 +22,26 @@ import { TENANT, batch, record, scratchStore } from "./support.ts";
 const cleanup: Array<() => void> = [];
 afterEach(() => cleanup.splice(0).forEach(close => close()));
 const sha = (value: string) => createHash("sha256").update(value).digest("hex");
+
+/**
+ * Both layers read Date.now(): captureSeedScopeExportEvidence's checkDeadline
+ * (frontier_seed_deadline) runs before/after every await, and
+ * SeedProofIndex.addPointer refuses at entry (seed_proof_bound) and after the
+ * manifest read (seed_proof_deadline). Real sleeps race these checks, so the
+ * deadline cases freeze the wall clock and advance it only inside the
+ * dependency whose layer the case targets. Each case restores its clock;
+ * afterEach restores it again if an assertion threw first.
+ */
+function frozenClock() {
+  let now = Date.now();
+  const spy = spyOn(Date, "now").mockImplementation(() => now);
+  cleanup.push(() => spy.mockRestore());
+  return { advance(ms: number) { now += ms; }, restore() { spy.mockRestore(); } };
+}
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
+  try { await promise; } catch (error) { return error; }
+  throw new Error("expected rejection");
+}
 
 async function fixture() {
   const fs = scratchStore(); cleanup.push(fs.done);
@@ -101,19 +122,26 @@ describe("frontier seed source evidence", () => {
     await expect(captureSeedScopeExportEvidence(bytes.sql, bytes.deps, bytes.versioning, { ...bytes.input, maxEvidenceBytes: 1 }))
       .rejects.toMatchObject({ code: "seed_proof_bound" });
 
+    // Deadline expires during the manifest read: the outer checks before it
+    // pass, so the seed-proof reader's post-read check is the layer that fires.
     const expired = await fixture();
     const reader = expired.deps.reader;
-    expired.deps.reader = { ...reader, async read(key) { await new Promise(resolve => setTimeout(resolve, 5)); return reader.read(key); } };
-    await expect(captureSeedScopeExportEvidence(expired.sql, expired.deps, expired.versioning, { ...expired.input, deadlineMs: 1 }))
-      .rejects.toMatchObject({ code: "seed_proof_deadline" });
+    const expiredClock = frozenClock();
+    expired.deps.reader = { ...reader, async read(key) { expiredClock.advance(5); return reader.read(key); } };
+    const expiredError = await rejection(captureSeedScopeExportEvidence(expired.sql, expired.deps, expired.versioning, { ...expired.input, deadlineMs: 1 }));
+    expect(expiredError).toBeInstanceOf(SeedProofError);
+    expect(expiredError).toMatchObject({ code: "seed_proof_deadline" });
+    expiredClock.restore();
 
+    // Deadline expires during the opening versioning read: the frontier
+    // source's own checkDeadline fires before any seed-proof work starts.
     const versioningExpired = await fixture();
-    versioningExpired.versioning.read = async () => {
-      await new Promise(resolve => setTimeout(resolve, 5));
-      return "Enabled";
-    };
-    await expect(captureSeedScopeExportEvidence(versioningExpired.sql, versioningExpired.deps, versioningExpired.versioning, { ...versioningExpired.input, deadlineMs: 1 }))
-      .rejects.toMatchObject({ code: "frontier_seed_deadline" });
+    const versioningClock = frozenClock();
+    versioningExpired.versioning.read = async () => { versioningClock.advance(5); return "Enabled"; };
+    const versioningError = await rejection(captureSeedScopeExportEvidence(versioningExpired.sql, versioningExpired.deps, versioningExpired.versioning, { ...versioningExpired.input, deadlineMs: 1 }));
+    expect(versioningError).toBeInstanceOf(FrontierSourceEvidenceError);
+    expect(versioningError).toMatchObject({ code: "frontier_seed_deadline" });
+    versioningClock.restore();
 
     const resumed = await fixture();
     const first = await captureSeedScopeExportEvidence(resumed.sql, resumed.deps, resumed.versioning, resumed.input);
@@ -163,11 +191,16 @@ describe("frontier seed source evidence", () => {
     await expect(captureSeedScopeExportEvidence(bytes.sql, bytes.deps, bytes.versioning, { ...bytes.input, maxEvidenceBytes: 1 }))
       .rejects.toMatchObject({ code: "seed_proof_bound" });
 
+    // Same layer as above via the CLI's maxDurationMs: the clock only moves
+    // inside the manifest read, so addPointer's entry check cannot pre-empt it.
     const deadline = await fixture();
     const reader = deadline.deps.reader;
-    deadline.deps.reader = { ...reader, async read(key) { await new Promise(resolve => setTimeout(resolve, 5)); return reader.read(key); } };
-    await expect(captureSeedScopeExportEvidence(deadline.sql, deadline.deps, deadline.versioning, { ...deadline.input, maxDurationMs: 1 }))
-      .rejects.toMatchObject({ code: "seed_proof_deadline" });
+    const clock = frozenClock();
+    deadline.deps.reader = { ...reader, async read(key) { clock.advance(5); return reader.read(key); } };
+    const deadlineError = await rejection(captureSeedScopeExportEvidence(deadline.sql, deadline.deps, deadline.versioning, { ...deadline.input, maxDurationMs: 1 }));
+    expect(deadlineError).toBeInstanceOf(SeedProofError);
+    expect(deadlineError).toMatchObject({ code: "seed_proof_deadline" });
+    clock.restore();
   });
 });
 
