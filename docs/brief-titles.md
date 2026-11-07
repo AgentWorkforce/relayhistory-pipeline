@@ -39,9 +39,12 @@ Cloud's session list shows each session's cached model-written brief title. Toda
 
 ## Containment: backfilled titles stay out of the directory and search
 
-- A backfilled title is served **only** through `session_brief_titles_for`.
+- A backfilled title has **two readers**, and neither is the directory:
+  - `session_brief_titles_for`: Cloud's session list, gated by `READ_API_BRIEF_TITLES_WORKSPACES`;
+  - **`sessions.session_brief()`** (20261102000000, last replaced in 026000): relayhistory-cloud's `GET /v1/sessions/:id/brief`, granted to `session_directory_search_worker`. After a backfill it returns the Neon title (line breaks included) as `stale`, with a NULL description and state and `engine_version 'neon-backfill:v1'`. Before `--execute`, this response shape needs the Cloud brief-endpoint owner's acceptance, or containment in `session_brief()`. That decision belongs to the migration lead.
 - The directory projector (`src/hoopdb/session-directory-projector.ts`) reads native brief titles only. It filters on `engine_version NOT LIKE 'neon-backfill:%'`, which also works before 043000 adds `origin`.
 - So a Neon title never reaches `session_directory.title`, `search_text`, `list_session_directory_for`, or the brief-document/search publication built from the directory row.
+- The runtime writer role could set the reserved `neon-backfill:` prefix itself (finding A5). That would only widen the legacy-row CHECKs for that row, and the row would stay out of the directory like any backfilled one. Accepted; no owner-role pin.
 - Proof: `src/hoopdb/__tests__/session-directory-brief-provenance.test.ts`. It covers native precedence and the pointer fallback, ordinary and line-break negatives, a causal run of the unfiltered pre-fix SQL, and pre-043000 projection.
 
 ## Freshness
@@ -69,4 +72,4 @@ Delete those rows deliberately first. The down then restores the exact prior CHE
 
 ## Relationship to `runbooks/analysis-title-cache.md`
 
-That runbook covers the analysis-cache path (Neon→S3 snapshots, served through relayhistory-cloud). F2 does not use it: titles come from `session_briefs` on Supabase, read directly by Cloud.
+That runbook covers the analysis-cache title path. This repo's read Worker serves it (`packages/session-read-worker/src/analysis-cache.ts`, `view=title`) from Neon→S3 analysis snapshots, behind its own default-off flags. F2 **coexists** with it and does not supersede it: F2's titles come from `session_briefs` on Supabase through `GET /v1/sessions/titles`. Cloud picks one backend per list read (`CLOUD_BRIEF_TITLES_BACKEND`).

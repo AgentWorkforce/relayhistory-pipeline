@@ -610,8 +610,8 @@ export function createReadApi(deps: ReadApiDeps) {
    * Cached brief titles for the session list (feature F2): `workspace=<the token's>` and 1 to
    * 100 repeated `key=<source>:<sessionId>` (the source is a harness name, which has no
    * colon, so the first colon splits). 100 keys of up to 255-character ids can exceed a
- * front-door URL limit (414 before auth); callers keep each URL bounded (Cloud's client
- * splits batches at 8,000 characters). Answers `{ titles: [{ source, sessionId, title }] }`:
+   * front-door URL limit (414 before auth); callers keep each URL bounded (Cloud's client
+   * splits batches at 8,000 characters). Answers `{ titles: [{ source, sessionId, title }] }`:
    * a requested session with no entry has no title (none generated or backfilled, or erased).
    * It never enqueues generation. A failure is a non-2xx, never an empty 200, so a caller can
    * tell "unavailable" from "no title".

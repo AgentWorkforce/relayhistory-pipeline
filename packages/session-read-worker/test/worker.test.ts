@@ -354,7 +354,28 @@ describe("reads through ClickHouse and Supabase", () => {
 describe("directory list and activity (P3b)", () => {
   test("brief titles: off unless READ_API_BRIEF_TITLES_WORKSPACES names the workspace; on, the tenant's titles only", async () => {
     const t = tenant();
+    const other = tenant();
     const bearer = await token(t);
+    // The same (codex, t-1) key holds a brief in this tenant and in a foreign one.
+    for (const [org, ws, title] of [[t.org, t.ws, "Tenant title"], [other.org, other.ws, "Foreign title"]] as const)
+      await owner(async (c) => {
+        await c.query(
+          `INSERT INTO sessions.session_index
+             (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
+              storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, title)
+           VALUES ($1, $2, 'codex', 't-1', 'm-1', 'u-1', now(), now(), 'fs', 'bucket', $3,
+                   decode(repeat('ab', 32), 'hex'), 'jsonl', '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1, 'pointer title')`,
+          [org, ws, `manifest/${org}/${ws}/t-1`],
+        );
+        await c.query(
+          `INSERT INTO sessions.session_briefs (org_id, workspace_id, harness, session_id, status, revision, source_revisions,
+             title, description, state, brief_revision, brief_source_revisions, brief_fingerprint, scrub_ruleset, scrub_version,
+             prompt_version, engine_version, model, generated_at)
+           VALUES ($1, $2, 'codex', 't-1', 'ready', 1, '{"m-1":1}', $3, 'A description.', 'completed', 1, '{"m-1":1}',
+                   repeat('e', 64), 'relayhistory-scrub', 1, 'session-summary-v3', 'session-brief-v3', 'gpt-5.6-luna', now())`,
+          [org, ws, title],
+        );
+      });
     const call = async (over: Partial<Env> = {}) => {
       const ctx = createExecutionContext();
       const r = await handle(new Request(`${ORIGIN}/v1/sessions/titles?workspace=${t.ws}&key=codex:t-1`, { headers: { authorization: `Bearer ${bearer}` } }), { ...E, ...over }, ctx);
@@ -366,12 +387,13 @@ describe("directory list and activity (P3b)", () => {
       expect(r.status).toBe(501);
       expect((await body(r)).error.reason).toBe("brief_titles_workspace_not_enabled");
     }
-    // With migration 20261105043000 applied (global-setup runs every migration): no brief yet.
+    // With migration 20261105043000 applied (global-setup runs every migration): only this
+    // tenant's brief title, never the foreign tenant's for the same key.
     for (const allow of [t.ws, `ws-other,${t.ws}`, "*"]) {
       const r = await call({ READ_API_BRIEF_TITLES_WORKSPACES: allow });
       expect(r.status).toBe(200);
       expect(r.headers.get("x-relayhistory-workspace-id")).toBe(t.ws);
-      expect((await body(r)).titles).toEqual([]);
+      expect((await body(r)).titles).toEqual([{ source: "codex", sessionId: "t-1", title: "Tenant title" }]);
     }
   });
 

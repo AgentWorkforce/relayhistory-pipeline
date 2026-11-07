@@ -1,9 +1,10 @@
 /**
  * The directory projector reads NATIVE brief titles only (F2 containment, registry finding A1).
  * A Neon-backfilled brief (20261105043000, engine_version 'neon-backfill:*', origin
- * 'neon_backfill') is served solely to Cloud's session list through
- * sessions.session_brief_titles_for; it must never reach session_directory.title,
- * search_text, or the brief-document publication built from the directory row.
+ * 'neon_backfill') must never reach session_directory.title, search_text, or the
+ * brief-document publication built from the directory row. (Its readers are
+ * sessions.session_brief_titles_for and sessions.session_brief(); this file proves only the
+ * directory/publication containment.)
  *
  * Proved through the real projector (projectSessionDirectory) and the real document
  * consumer (sessions.session_brief_document_json), on PGlite:
@@ -15,7 +16,8 @@
  *     projects. The predicate reads engine_version, which exists from 20261102000000.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
@@ -108,8 +110,11 @@ describe("directory projection reads native brief titles only (after 043000)", (
     const source = readFileSync(join(root, "src/hoopdb/session-directory-projector.ts"), "utf8");
     const predicate = " AND engine_version NOT LIKE 'neon-backfill:%'";
     expect(source.split(predicate).length).toBe(2);
-    // The same module, same directory (so its imports resolve), with only the predicate removed.
-    const unfilteredPath = join(root, "src/hoopdb/.unfiltered-projector.test-only.ts");
+    // The same module with only the predicate removed, written to a temp dir (never the source
+    // tree). Its two imports are type-only, so it needs no module resolution there.
+    expect(source.match(/^import (?!type )/gm)).toBeNull();
+    const dir = mkdtempSync(join(tmpdir(), "f2-unfiltered-projector-"));
+    const unfilteredPath = join(dir, "session-directory-projector.ts");
     writeFileSync(unfilteredPath, source.replace(predicate, ""));
     try {
       const unfiltered = (await import(unfilteredPath)) as { projectSessionDirectory: typeof projectSessionDirectory };
@@ -124,7 +129,7 @@ describe("directory projection reads native brief titles only (after 043000)", (
         expect((await published(pg)).title).toBe("Pointer title");
       }
     } finally {
-      rmSync(unfilteredPath, { force: true });
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
