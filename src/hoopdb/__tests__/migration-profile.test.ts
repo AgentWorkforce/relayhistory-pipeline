@@ -2975,7 +2975,7 @@ describe("lane F1 (20261105046000) under the dedicated runtime role", () => {
     await store.put(key, bytes, sha256);
     expect(await store.complete({ job, output, stored: { key, sha256, bytes: bytes.length } })).toBe(true);
     await db.query("UPDATE sessions.session_index SET deleted_at = now()");
-    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: (work) => work(runtime as never), eraseObject: async (k) => { const had = (await objects.head(objectKey(k))) !== undefined; await objects.delete(objectKey(k)); return had ? 1 : 0; } })).toBe(1);
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: (work) => work(runtime as never), eraser: (await import("../../migration/neon-s3-erasure/eraser.ts")).storeEraser(objects) })).toBe(1);
     // P0-b: the never-in-Neon proof is callable as the runtime role (SECURITY DEFINER) without
     // the runtime role reading the frozen custody tables itself.
     expect((await runtime.query<{ f: boolean }>("SELECT sessions.session_analysis_neon_free('o', 'w', 's') AS f")).rows[0]!.f).toBe(false);

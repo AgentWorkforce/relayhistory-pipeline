@@ -98,11 +98,16 @@ export async function putAnalysisResult(
   bytes: Uint8Array,
   digest: string,
   timeoutMs = ANALYSIS_PUT_TIMEOUT_MS,
-): Promise<void> {
-  await boundedPut(store, key, bytes, digest, timeoutMs);
-  const read = await readAll(await store.get(objectKey(key)));
+): Promise<{ versionId?: string }> {
+  const ack = await boundedPut(store, key, bytes, digest, timeoutMs);
+  const got = await store.getObject(objectKey(key));
+  const read = await readAll(got.body);
   if (read.length !== bytes.length || sha256(read) !== digest)
     throw new AnalysisResultError("analysis_write_verification_failed", true);
+  // The version the publication owns: the one this PUT created, else the current one it found
+  // identical (create-only), as the verified read reports it.
+  const versionId = ack.versionId ?? got.meta.version.version;
+  return versionId ? { versionId } : {};
 }
 
 /** Create-only write, then a read-back that must match byte for byte. */

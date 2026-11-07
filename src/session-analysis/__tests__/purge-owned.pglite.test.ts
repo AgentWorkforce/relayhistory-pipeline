@@ -67,43 +67,48 @@ async function world() {
   return { db, k };
 }
 
-test("reset: the whole owned set (owned sessions + delivery records) is purged and its result keys ticketed; others untouched", async () => {
+test("reset: the workspace's owned set (owned sessions + delivery records) is purged and its result keys ticketed; another workspace and others untouched", async () => {
   const { db, k } = await world();
-  expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','user-1') n")).rows[0]!.n).toBe(3);
-  expect(await jobs(db)).toEqual(["org-a/ws-1/S4", "org-a/ws-9/S1", "org-b/ws-1/S1"]);
-  expect(await requests(db)).toBe(3);
-  expect(await tickets(db)).toEqual([k.s1, k.s2, k.s3].sort().map((key) => ({ k: key, reason: "forgotten" })));
+  expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','ws-1','user-1') n")).rows[0]!.n).toBe(2);
+  // A reset in ws-1 leaves the same user's ws-2 analysis intact (C3 resets are per workspace).
+  expect(await jobs(db)).toEqual(["org-a/ws-1/S4", "org-a/ws-2/S2", "org-a/ws-9/S1", "org-b/ws-1/S1"]);
+  expect(await requests(db)).toBe(4);
+  expect(await tickets(db)).toEqual([k.s1, k.s3].sort().map((key) => ({ k: key, reason: "forgotten" })));
   expect(k.otherUser && k.otherOrg && k.notOwned).toBeTruthy();
   // Idempotent.
-  expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','user-1') n")).rows[0]!.n).toBe(0);
+  expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','ws-1','user-1') n")).rows[0]!.n).toBe(0);
+  // Then the ws-2 reset purges only ws-2.
+  expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','ws-2','user-1') n")).rows[0]!.n).toBe(1);
+  expect(await jobs(db)).toEqual(["org-a/ws-1/S4", "org-a/ws-9/S1", "org-b/ws-1/S1"]);
 });
 
 test("disable: only the listed (source, session) in the user's owned set; a listed session another user owns is untouched", async () => {
   const { db, k } = await world();
   const listed = JSON.stringify([{ source: "claude", session_id: "S1" }, { source: "codex", session_id: "NOT-OWNED" }, { source: "codex", session_id: "S1" }]);
-  expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','user-1',$1::jsonb) n", [listed])).rows[0]!.n).toBe(1);
+  expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','ws-1','user-1',$1::jsonb) n", [listed])).rows[0]!.n).toBe(1);
   expect(await jobs(db)).toEqual(["org-a/ws-1/S3", "org-a/ws-1/S4", "org-a/ws-2/S2", "org-a/ws-9/S1", "org-b/ws-1/S1"]);
   expect(await tickets(db)).toEqual([{ k: k.s1, reason: "forgotten" }]);
   // An empty list purges nothing.
-  expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','user-1','[]'::jsonb) n")).rows[0]!.n).toBe(0);
+  expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','ws-1','user-1','[]'::jsonb) n")).rows[0]!.n).toBe(0);
 });
 
-test("a publishing ticket for a purged key becomes a lease-free 'forgotten' ticket (the backfill fence then erases)", async () => {
+test("a publishing ticket for a purged key becomes a lease-free 'unknown' ticket (its PUT outcome is not known)", async () => {
   const { db, k } = await world();
   await db.query("INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, lease_expires_at) SELECT result_s3_key, id, org_id, workspace_id, session_id, 'publishing', now() + interval '10 minutes' FROM sessions.session_analysis_jobs_v2 WHERE result_s3_key = $1", [k.s1]);
-  await db.query("SELECT sessions.purge_session_analysis_for_owned('org-a','user-1')");
+  await db.query("SELECT sessions.purge_session_analysis_for_owned('org-a','ws-1','user-1')");
   const t = (await db.query<{ reason: string; lease: unknown }>("SELECT reason, lease_expires_at lease FROM sessions.session_analysis_result_tickets WHERE result_key = $1", [k.s1])).rows;
-  expect(t).toEqual([{ reason: "forgotten", lease: null }]);
+  expect(t).toEqual([{ reason: "unknown", lease: null }]);
 });
 
 test("bad input is refused; without lane A's tables it is a no-op; EXECUTE is owner-only", async () => {
   const db = (pg = await database());
   await backfilled(db, "org-a", "ws-1", "S1");
-  expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','user-1') n")).rows[0]!.n).toBe(0);
+  expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','ws-1','user-1') n")).rows[0]!.n).toBe(0);
   expect(await jobs(db)).toEqual(["org-a/ws-1/S1"]);
-  for (const bad of ["SELECT sessions.purge_session_analysis_for_owned('', 'u')", "SELECT sessions.purge_session_analysis_for_owned('o', NULL)",
-    `SELECT sessions.purge_session_analysis_for_owned('o','u','{"source":"claude"}'::jsonb)`,
-    `SELECT sessions.purge_session_analysis_for_owned('o','u','[{"source":"claude"}]'::jsonb)`]) {
+  for (const bad of ["SELECT sessions.purge_session_analysis_for_owned('', 'w', 'u')", "SELECT sessions.purge_session_analysis_for_owned('o', 'w', NULL)",
+    "SELECT sessions.purge_session_analysis_for_owned('o', '', 'u')",
+    `SELECT sessions.purge_session_analysis_for_owned('o','w','u','{"source":"claude"}'::jsonb)`,
+    `SELECT sessions.purge_session_analysis_for_owned('o','w','u','[{"source":"claude"}]'::jsonb)`]) {
     await expect(db.query(bad)).rejects.toThrow("purge_session_analysis_for_owned");
   }
   const grants = (await db.query<{ g: string }>(`
@@ -137,15 +142,15 @@ test("caller pin: every SECURITY DEFINER in 046000 refuses a role it does not se
     await db.exec(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN CREATE ROLE ${role}; END IF; END $$`);
   await db.exec(`GRANT USAGE ON SCHEMA sessions TO intruder, bulls96_session_ingest, service_role, bulls96_read_api, bulls96_analysis_admit;
     GRANT EXECUTE ON FUNCTION sessions.session_analysis_neon_free(text,text,text) TO intruder, bulls96_read_api, bulls96_analysis_admit;
-    GRANT EXECUTE ON FUNCTION sessions.purge_session_analysis_for_owned(text,text) TO intruder, bulls96_session_ingest, service_role;
-    GRANT EXECUTE ON FUNCTION sessions.purge_session_analysis_for_owned(text,text,jsonb) TO intruder, bulls96_session_ingest`);
+    GRANT EXECUTE ON FUNCTION sessions.purge_session_analysis_for_owned(text,text,text) TO intruder, bulls96_session_ingest, service_role;
+    GRANT EXECUTE ON FUNCTION sessions.purge_session_analysis_for_owned(text,text,text,jsonb) TO intruder, bulls96_session_ingest`);
   const free = "SELECT sessions.session_analysis_neon_free('org-a','ws-1','S1')";
   expect(await as(db, "intruder", free)).toContain("caller is not a role this function serves");
   for (const ok of ["service_role", "bulls96_read_api", "bulls96_analysis_admit"]) expect(await as(db, ok, free)).toBe("ok");
-  const purge = "SELECT sessions.purge_session_analysis_for_owned('org-a','user-1')";
+  const purge = "SELECT sessions.purge_session_analysis_for_owned('org-a','ws-1','user-1')";
   expect(await as(db, "intruder", purge)).toContain("caller is not a role this function serves");
   expect(await as(db, "service_role", purge)).toContain("caller is not a role this function serves");
-  expect(await as(db, "intruder", "SELECT sessions.purge_session_analysis_for_owned('org-a','user-1','[]'::jsonb)")).toContain("caller is not");
+  expect(await as(db, "intruder", "SELECT sessions.purge_session_analysis_for_owned('org-a','ws-1','user-1','[]'::jsonb)")).toContain("caller is not");
   // The ingest role only inside the authority begin (its writer GUC).
   expect(await as(db, "bulls96_session_ingest", purge)).toContain("outside the privacy authority");
   expect(await as(db, "bulls96_session_ingest", purge, "SELECT set_config('bulls96.privacy_authority_writer','authority',true)")).toBe("ok");
