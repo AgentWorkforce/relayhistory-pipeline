@@ -36,6 +36,9 @@ CREATE TABLE sessions.ingest_acquisition_switch(          -- dormant: install re
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  install_enabled boolean NOT NULL DEFAULT false,changed_at timestamptz NOT NULL DEFAULT clock_timestamp());
 INSERT INTO sessions.ingest_acquisition_switch DEFAULT VALUES;
+CREATE TABLE sessions.ingest_acquisition_enrollment_gate( -- §4.8 interlock row; never deleted
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),generation bigint NOT NULL DEFAULT 0 CHECK(generation>=0));
+INSERT INTO sessions.ingest_acquisition_enrollment_gate DEFAULT VALUES;
 CREATE TABLE sessions.ingest_acquisition_enrollment(      -- protected (org,ws,source); absent = main behavior
  org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,
  state text NOT NULL CHECK(state IN('enrolling','enrolled')),PRIMARY KEY(org_id,workspace_id,source),
@@ -77,6 +80,10 @@ CREATE TABLE sessions.ingest_acquisition_revoked_grants(  -- revoke-before-insta
  owner_epoch bigint NOT NULL CHECK(owner_epoch>0),owner_kind text NOT NULL CHECK(owner_kind IN('cloud','native')),
  binding_uuid uuid,installation_id uuid,revision bigint NOT NULL CHECK(revision>0),
  evidence_sha256 text NOT NULL CHECK(evidence_sha256~'^[0-9a-f]{64}$'));
+CREATE TABLE sessions.ingest_acquisition_revoked_lineages( -- §4.9 binding-lineage fence; immutable
+ org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
+ owner_kind text NOT NULL CHECK(owner_kind IN('cloud','native')),lineage_id uuid NOT NULL, -- binding_uuid|installation_id
+ revision bigint NOT NULL CHECK(revision>0),PRIMARY KEY(org_id,workspace_id,source,session_id,owner_kind,lineage_id));
 CREATE TABLE sessions.ingest_acquisition_operations(      -- idempotency ledger (install/revoke/rebind)
  operation_uuid uuid PRIMARY KEY,kind text NOT NULL CHECK(kind IN('install','revoke','rebind')),
  org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
@@ -154,9 +161,11 @@ with `SET search_path=pg_catalog,pg_temp`. Install, revoke and rebind keys are e
 3. Require an `enrolled` enrollment row, read with `FOR SHARE NOWAIT`.
 4. Take the exclusive acquisition try-lock.
 5. Take `LP` exclusive, read the owner row `FOR UPDATE`, then repeat step 2 so a just-committed twin replays.
-6. Check revisions: `operationUuid` in `ingest_acquisition_revoked_grants` or `p.revision <= tombstone_revision` →
-   `revoked_before_install`; else `p.revision <= revision` → `stale_revision`; `expectedRevision` ≠ the current
-   revision (0 if absent) or `revision` ≠ `expectedRevision + 1` → `revision_cas_lost`.
+6. Check revisions: `operationUuid` in `ingest_acquisition_revoked_grants`, its `(ownerKind,
+   bindingUuid|installationId)` in `ingest_acquisition_revoked_lineages` for this session (§4.9) or `p.revision <=
+   tombstone_revision` → `revoked_before_install`; else `p.revision <= revision` → `stale_revision`;
+   `expectedRevision` ≠ the current revision (0 if absent) or `revision` ≠ `expectedRevision + 1` →
+   `revision_cas_lost`.
 7. Check the predecessor (§4.3): `unknown` → `owner_unknown`; `active`/`draining` → `handover_not_ready`;
    `expectedOwnerEpoch` and `expectedPredecessorGrantId` must equal the current epoch and the latest grant (0 and
    null when absent), else `predecessor_mismatch`.
@@ -174,8 +183,9 @@ with `SET search_path=pg_catalog,pg_temp`. Install, revoke and rebind keys are e
    owner and grant become `draining` and revision = tombstone = `p.revision`. An already `draining`/`released` or
    superseded grant returns `superseded` unchanged.
 3. Otherwise (revoke-before-install) insert the target into `ingest_acquisition_revoked_grants`, owner row untouched
-   (`revoked_pending`); that `operationUuid`'s install later refuses `revoked_before_install`. A revoke never affects
-   another binding, kind or epoch; a Cloud key for a native target, or vice versa, is `not_authorized`.
+   (`revoked_pending`); that `operationUuid`'s install later refuses `revoked_before_install`. Both paths also insert
+   the target's lineage into `ingest_acquisition_revoked_lineages` (`ON CONFLICT DO NOTHING`, §4.9). A revoke never
+   affects another binding, kind or epoch; a Cloud key for a native target, or vice versa, is `not_authorized`.
 
 **Error contract.** The message is the stable code, prefixed `acquisition: `.
 
@@ -214,9 +224,8 @@ grant. SQL does not verify Ed25519; a bare role call without verified evidence i
 **Precondition P1 (not an open question).** A native user plus caller-supplied `origin_id` is not installation proof.
 No source may be enrolled, and no protected `droid` admission may ship, until the native issuer delivers a
 per-installation `installation_id` and `G` only to that installation, Desktop persists both across a local reset and
-presents `G` (§5.1). That issuer does not exist; the History CLI-login exchange (or a sibling route authenticated by
-the same Cloud-signed assertion) is a *candidate* only (Q2). Native admission then runs exactly the Cloud grant
-check; unenrolled sources keep current behaviour.
+presents `G` (§5.1). Its shape and owner are decided (Q2); it is not built, which blocks activation, not this
+contract. Native admission then runs exactly the Cloud grant check; unenrolled sources keep current behaviour.
 
 **4.2 Cross-database consistency is by committed intent, not a distributed transaction.** Before any remote call the
 issuer commits an intent row: the operation, scope, revision and CAS expectations, `grant_sha256`, the encrypted `G`,
@@ -233,19 +242,19 @@ after a durable receipt is the pipeline's job (§7).
 **4.3 An unrelated grant cannot seize a session.** §4.1 authorization prevents it: an unrelated installation holds no
 assertion naming this SID and predecessor. Predecessor CAS (§3 step 7) only orders authorized requests.
 
-**4.4 An empty owner table is not proof of absence.** `enroll_begin` sets `enrolling` and records
-`pg_current_xact_id()`; admission and the pointer guard (§5.5) then treat the source as enrolled. `enroll_complete`
-refuses `55000 enrollment_not_quiescent` while any older transaction is open (`pg_snapshot_xmin`), so no unguarded
-legacy write commits after the backfill. It backfills an `unknown` row for every `(source, session_id)` in the step-8
-tables, `session_index` and the live heads/pointers of that physical source, records `backfill_sha256` over the
-sorted keys and sets `enrolled`. For an enrolled source, admission treats no owner row, `unknown`, `released` and
-`draining` as not-ready, never free; native upload resumes only through an authorized install (§4.1).
+**4.4 An empty owner table is not proof of absence.** `enroll_begin` sets `enrolling` under the §4.8 interlock;
+admission and the pointer guard (§5.5) then treat the source as enrolled. `enroll_complete` runs only on a committed
+`enrolling` row, so every writer is guarded or already committed (§4.8); it backfills an `unknown` row for every
+`(source, session_id)` in the step-8 tables, `session_index` and the live heads/pointers of that physical source,
+records `backfill_sha256` over the sorted keys and sets `enrolled`. For an enrolled source, admission treats no owner
+row, `unknown`, `released` and `draining` as not-ready, never free; native upload resumes only through an authorized
+install (§4.1).
 
 **4.5 Lock graph (one order, used at every hook).** Authority rows precede USER, BATCH and INTENT
 (M:20261104050000:56; M:20261104052000:53); the user fence is `ingest_lock_fences` (M:20261104030000:26-33). Order:
 `L0` authority rows `FOR SHARE` → `L1` user fence → `L2` batch → `L3` stage intent → `L4` outbox → `L5` publication
-pointer try-lock and head → `LA` → `LP` → owner row. `LA` (a hook's leaf): enrollment row `FOR SHARE NOWAIT`, then
-`pg_try_advisory_xact_lock_shared(hashtextextended(concat_ws(chr(31),
+pointer try-lock and head → `LE` (§4.8) → `LA` → `LP` → owner row. `LA` (a hook's leaf): enrollment row `FOR SHARE
+NOWAIT`, then `pg_try_advisory_xact_lock_shared(hashtextextended(concat_ws(chr(31),
 '96bulls:acquisition',org,ws,source,session),0))` per session in `(source, session_id) COLLATE "C"` order
 (M:20261104030000:96). `LP`: the same try-lock over
 `'96bulls:acquisition-physical',org,ws,physical_source,physical_session`, after `LA`. Hooks read owner rows under
@@ -279,6 +288,40 @@ publication-claim or guard refusal (publish `40001`, M:20261104060000:720) comes
   `handover_not_ready`, no v1 path. Same user, other installation: `42501 not_owner`. Workspaces never contend.
 - Enrolled-source records without `session_id` get `22023 session_required`, never exempt; §5.6 lists them with
   `sessionId` `""` for Desktop to hold.
+
+**4.8 Enrollment interlock.** Numeric XID ordering (`pg_current_xact_id`, `pg_snapshot_xmin`) is never used for
+visibility: a lower XID can commit later, and a snapshot can predate the XID its transaction allocates later. The
+barrier is the row lock on `ingest_acquisition_enrollment_gate` plus a fresh read:
+- `LE` (writers): every hook that consults enrollment (`_admit`, the §5.2 recheck, publication claim and publish, and
+  the pointer guard for every live write before its non-`srv_` early return) first runs `SELECT generation FROM
+  sessions.ingest_acquisition_enrollment_gate FOR SHARE NOWAIT` as its own statement and only then reads
+  `ingest_acquisition_enrollment` in a later statement, never from an earlier result. `55P03` → `40001 session_busy`
+  in every hook, the guard included (an error, never a silent skip: the source may be unenrolled). Under READ
+  COMMITTED the later statement of these VOLATILE functions takes a new snapshot after the lock, so it sees any
+  committed enrollment. Under REPEATABLE READ or SERIALIZABLE, `FOR SHARE` on a gate row updated by a transaction
+  that committed after the writer's snapshot raises `40001` (could not serialize: concurrent update), so a retained
+  snapshot never passes with a stale enrollment view.
+- `enroll_begin` (owner-run): `SET LOCAL lock_timeout` (expiry → `55000 enrollment_not_quiescent`), then `UPDATE
+  ... SET generation=generation+1` as its first lock, which waits until every `LE` holder has committed or aborted,
+  then inserts `enrolling` and commits. It holds nothing else, and writers never wait on `LE`, so no cycle exists.
+- Schedule (a), writer starts during an uncommitted begin: its `LE` fails `NOWAIT` (busy, retried after the commit,
+  then guarded); if it locked `LE` first, begin waits for its commit, so its pointer is committed before `enrolling`
+  and `enroll_complete`'s backfill sees it. Schedule (b), pre-enrollment REPEATABLE READ snapshot with a later XID:
+  if it locked `LE` before begin, as (a); otherwise begin committed after its snapshot and its `LE` raises `40001`,
+  and the retry sees `enrolling`.
+- Cost: one shared row lock per hooked write (a multixact under concurrency); unenrolled sources see only that lock
+  and, during an `enroll_begin`, a retryable busy.
+
+**4.9 Binding-lineage fence (option (i)).** A revoke fences its target's lineage, `(org, ws, source, session, owner
+kind, bindingUuid or installationId)`, not only `targetGrantId`. A delayed, still-signed install I1 for binding B
+(refused while `disabled`, re-issued as I2 under a new `operationUuid` per §4.2, then I2 revoked on unbind, applied
+or pending) therefore refuses `revoked_before_install` whatever its `operationUuid` or revision. The per-binding
+epoch is binary: a revoked lineage never installs on that session again. Cloud mints a new `bindingUuid` per bind, so
+a later bind is a new lineage (Cloud requirement; a reused one fails closed); a revoked native installation needs a
+successor install with handover (`handover_not_ready` in v1). The kind and lineage id are already signed fields of
+`A`, so `A`, the vectors and §4.2's re-issue stay unchanged. The fence touches no owner row, grant or other lineage,
+so an unrelated binding's current owner is unaffected. Option (ii), one install UUID per binding lifetime, was
+rejected: it forbids §4.2's re-issue after a terminal refusal and needs a separate recovery protocol.
 
 ## 5. Admission and publication recheck (exact hooks)
 
@@ -338,6 +381,9 @@ Current bodies: M:20261104055000, redefining M:20261104050000; each `LA` follows
 - **Grant presentation.** Both owner kinds present the `acquisition` array in the claim payload inside the existing
   signed body; the edge passes it through with no authority. Cloud uses its own publish path (Q3); native uses the
   Desktop batch body of an enrolled source (P1), never `sessions/selection`. `G` is never logged.
+- **Native issuer (Q2).** A History-owned exchange route beside the ingest edge; callers authenticate through the
+  deployment's control plane; one principal model; the Cloud MCP child credential is never upload authority or SID
+  proof.
 
 ## 7. Drain receipt producer (not in the first migration)
 
@@ -363,6 +409,15 @@ Open questions (reviews of 2026-11-07). Answered, now constraints:
 1. (Cloud) Issuer: the Factory binding service (§4.1) with a dedicated server-managed Ed25519 key and pinned
    `issuerKeyId` registry (not built); never the user's Factory key, ingest HMAC, audit purpose or generic history
    assertion key. Rotation keeps overlapping keys until old intents reconcile; `A`/`S` are never re-signed.
+2. (History owner lane, answered: shape + owner; unbuilt) The native issuer is a History-owned exchange route, a
+   sibling of the session-ingest edge (#316), owned by the layered-sessions-pipeline lane (History side), per the
+   self-host direction (relaycontrol is the control plane, relayauth removed). It mints `installation_id`, `G` and
+   native install/revoke/rebind assertions only after authenticating the caller through the deployment's control
+   plane: relaycontrol token introspection on self-host (#313); on the hosted path, the site's existing verified
+   Cloud assertion (deprecated with the cloud repo; must not grow). One principal model scoped to
+   site/user/workspace; no second customer key. The Cloud MCP child credential stays read/MCP only, never upload
+   authority or SID proof. Gateway contract: specified alongside #316. Not built: blocks activation (P1), not this
+   contract.
 4. (Desktop) Refusal signalling: the typed 409 of §5.6, shipped atomically with enrollment (P2).
 5. (Cloud) `expiresAt` null = non-expiring in v1; a TTL needs a reviewed renewal CAS Desktop can see and trigger
    (else a permanent 409 loop). Expiry never releases ownership.
@@ -375,10 +430,6 @@ Open questions (reviews of 2026-11-07). Answered, now constraints:
    before enabling the guard.
 
 Still open:
-2. (Desktop answered the shape; component unbuilt) Native issuer: the site's History, at the CLI-login exchange or a
-   sibling install route authenticated by the same Cloud-signed assertion, minting `installation_id` and `G` once and
-   binding `G` only to whoever presented that assertion (no attestation). A candidate only; P1 blocks. The Desktop
-   MCP credential is at most an enrollment bootstrap.
 3. (Cloud, partly) A separately authenticated Cloud publisher port at the History gateway over the private Ingest
    binding; proof never in provider payloads, logs, traces or archives; attempts pin grant and epoch; a retry never
    injects a new grant into an immutable outbox. Open: exact route and credential.
@@ -393,6 +444,17 @@ Implementation plan. One PR, dormant:
    shape; both §3 vectors in Cloud and SQL tests; and real two-connection, both-orders tests for admission↔install,
    publication claim↔revoke, publish↔guard, legacy pointer insert/update↔install/revoke, two installs on one physical
    key (`physical_collision`), buffered stage/commit↔revoke, reset↔admission, GC↔publication and rebind↔admission.
+   - `binding_lineage_delayed_install_after_revoke` (§4.9): I1 for binding B refused `disabled`; switch on; I2 (new
+     `operationUuid`, same B) installs, or is revoked before install; revoke I2; replaying I1's exact `A`/`S` →
+     `revoked_before_install`; an install for binding C still succeeds.
+   - Mandatory two-connection enrollment tests (§4.8). `enrollment_interlock_writer_during_uncommitted_begin`: C1
+     runs `enroll_begin` uncommitted; C2 (READ COMMITTED) legacy pointer insert → busy, nothing written; reversed: C2
+     inserts uncommitted, C1 `enroll_begin` blocks, C2 commits, C1 commits, `enroll_complete` backfills C2's session
+     as `unknown`, C2's next write is refused.
+   - `enrollment_interlock_retained_repeatable_read_snapshot`: C2 `BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1`
+     (snapshot, no XID); C1 `enroll_begin` commits; C2 pointer insert → `40001`, nothing written; C2's retry sees
+     `enrolling` and is refused. Both: no unguarded write commits after `enrolling`; the backfill covers every
+     earlier one.
 3. Indexes the step-8 scans need; `CONCURRENTLY` builds are an operator step with no slot.
 
 The migration registry owner assigns the slot after the PR exists, in F-lane order. Applying it, enrolling any
