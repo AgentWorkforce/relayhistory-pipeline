@@ -175,6 +175,14 @@ export interface AnalysisEvidenceDeps {
   harnesses(scope: AnalysisScope): Promise<string[]>;
   /** canonicalProducerSnapshot of one canonical identity. */
   snapshot(identity: AnalysisScope & { source: string }): Promise<CanonicalScopeRows>;
+  /**
+   * Proof that the scope never had Neon evidence (so it is complete from S3 without the
+   * export's coverage marker): true only when sessions-pipeline's own records show the
+   * session was born after the sealed Neon freeze, is absent from the frozen Neon copy,
+   * and every manifest is a live sessions-pipeline publication (no Neon export/backfill).
+   * Absent or false: the marker is required.
+   */
+  neonFree?(identity: AnalysisScope & { source: string }): Promise<boolean>;
 }
 
 /** Postgres timestamptz text or ISO, as the JS Date JSON relayhistory's readers returned. */
@@ -567,9 +575,14 @@ export async function loadSessionSource(
   const harness = harnesses[0]!;
   const snapshot = await deps.snapshot({ ...scope, source: harness });
   if (!snapshot.exists) throw new SessionSourceNotFoundError();
-  // As the turns route (session-turns-source.ts turns_unknown): without the export's
-  // coverage marker the scope may lack turns Neon held, so the evidence is incomplete.
-  if (!snapshot.legacyCoverage && options.assumeNoLegacyTurns !== true)
+  // Without the export's coverage marker a Neon-era scope may lack turns Neon held, so its
+  // evidence is incomplete (the turns route's turns_unknown). A session that never existed
+  // in Neon has no Neon-only evidence: it is complete from S3 alone (neonFree proves it).
+  if (
+    !snapshot.legacyCoverage &&
+    options.assumeNoLegacyTurns !== true &&
+    !(deps.neonFree && (await deps.neonFree({ ...scope, source: harness })))
+  )
     throw new SessionSourceIncompleteError("RelayHistory legacy evidence coverage is unknown");
   const budget = new EvidenceBudget();
   const byTable = (table: string) =>

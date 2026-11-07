@@ -55,8 +55,6 @@ ALTER ROLE bulls96_read_api SET statement_timeout = '2s';
 ALTER ROLE bulls96_read_api SET default_transaction_read_only = on;
 
 GRANT USAGE ON SCHEMA sessions TO bulls96_read_api;
--- Lane F1: the admission principal needs the schema to reach sessions.analysis_request_v1.
-GRANT USAGE ON SCHEMA sessions TO bulls96_analysis_admit;
 GRANT SELECT (org_id, workspace_id, harness, session_id, created_at, deleted_at,
               canonical_session_id, machine_id, canonical_machine_id, user_id,
               storage_provider, bucket, manifest_key, content_sha256, raw_format, revision)

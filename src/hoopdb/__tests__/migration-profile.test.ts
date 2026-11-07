@@ -412,7 +412,7 @@ describe("runtime role: required, existing, SELECT only", () => {
               AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
         )
       ).rows[0]?.n,
-    ).toBe(30);
+    ).toBe(33); // 30 + lane F1's three analysis tables (20261105046000)
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
@@ -2930,5 +2930,62 @@ describe("release pre-write fences", () => {
     expect(error?.code).toBe("live_release_refused");
     expect(invoked).toBe(true);
     expect(await snapshot(db)).toEqual({ledger:null,marker:null});
+  });
+});
+
+describe("lane F1 (20261105046000) under the dedicated runtime role", () => {
+  const sql = (path: string) => readFileSync(join(root, path), "utf8").split("\n").filter((l) => !l.startsWith("\\")).join("\n");
+  const asRole = (db: PGlite, role: string) => ({
+    async query<R>(text: string, params?: unknown[]) {
+      await db.exec(`SET ROLE ${role}`);
+      try {
+        return { rows: (await db.query<R>(text, params as never)).rows };
+      } finally {
+        await db.exec("RESET ROLE");
+      }
+    },
+  });
+
+  test("P0-1: the worker claims, reserves, completes and sweeps as the configured runtime role", async () => {
+    const db = await fresh();
+    await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
+    await runMigrations(client(db), { profile: { ...LOCAL, runtimeRole: "g6_rt", runtimeLogin: false } });
+    await db.query(
+      `INSERT INTO sessions.session_index (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
+         storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, title)
+       VALUES ('o', 'w', 'claude', 's', 'm', 'u', now(), now(), 'fs', 'b', 'o/w/m/claude/2026-11-01/s/manifest.json',
+         decode(repeat('ab', 32), 'hex'), 'ndjson', '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1, 't')`,
+    );
+    await db.query(
+      `INSERT INTO sessions.session_analysis_jobs_v2 (org_id, workspace_id, session_id, analysis_version, schema_version, model_version, summary_version, summary_model_version)
+       VALUES ('o', 'w', 's', 'session-analysis-v2.4:96bulls-s3-v1', 2, 'gpt-5.4', 'session-summary-v3:workspace-output-v2', 'gpt-5.6-luna')`,
+    );
+    const { postgresAnalysisJobStore, sweepAnalysisTickets } = await import("../../session-analysis/store.ts");
+    const { createFsStore } = await import("../../../packages/object-store/src/fs.ts");
+    const objects = createFsStore({ root: mkdtempSync(join(tmpdir(), "f1-rt-")) });
+    const runtime = asRole(db, "g6_rt");
+    const store = postgresAnalysisJobStore({ db: runtime as never, store: objects, anchorManifestKey: async () => "o/w/m/claude/2026-11-01/s/manifest.json" });
+    const job = (await store.claim({ leaseSeconds: 600 }))!;
+    expect(job.sourceRevision).toMatch(/^[0-9a-f]{64}$/);
+    const output = { harness: "claude", sourceFingerprint: "f".repeat(64), sourceGeneration: "e".repeat(64), inputTokens: 1, outputTokens: 1, result: { a: 1 } as never };
+    const bytes = new TextEncoder().encode(JSON.stringify(output.result));
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const key = (await store.reserve(job, output, { sha256, bytes: bytes.length }))!;
+    await store.put(key, bytes, sha256);
+    expect(await store.complete({ job, output, stored: { key, sha256, bytes: bytes.length } })).toBe(true);
+    await db.query("UPDATE sessions.session_index SET deleted_at = now()");
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: (work) => work(runtime as never) })).toBe(1);
+    // The runtime role is exactly the reviewed surface: no TRUNCATE, no ownership.
+    const p = (await db.query<{ t: boolean }>("SELECT has_table_privilege('g6_rt', 'sessions.session_analysis_jobs_v2', 'TRUNCATE') AS t")).rows[0]!;
+    expect(p.t).toBe(false);
+  });
+
+  test("P0-3: the admission principal's LOGIN step passes its verifier, and an extra privilege fails it", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    await db.exec(sql("supabase/bootstrap/session_analysis_admit_role.sql"));
+    await db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"));
+    await db.exec("GRANT SELECT ON sessions.session_analysis_jobs_v2 TO bulls96_analysis_admit");
+    expect((await failure(db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"))))?.code).toBe("55000");
   });
 });

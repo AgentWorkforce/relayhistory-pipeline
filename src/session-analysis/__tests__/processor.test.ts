@@ -257,10 +257,22 @@ describe("canonical evidence adapter", () => {
     );
   });
 
-  test("refuses a scope without the legacy coverage marker unless the operator assumes no turns", async () => {
-    const rows = { ...projectedRows(), legacyCoverage: null };
-    await expect(loadSessionSource(deps({}, rows), SCOPE)).rejects.toThrow("legacy evidence coverage is unknown");
-    expect((await loadSessionSource(deps({}, rows), SCOPE, { assumeNoLegacyTurns: true })).sourceProvider).toBe("claude");
+  test("coverage: Neon-era with marker analyzed; Neon-era without marker refused; born in sessions-pipeline analyzed", async () => {
+    const withMarker = projectedRows();
+    const noMarker = { ...projectedRows(), legacyCoverage: null };
+    let asked: unknown;
+    const neonFree = (v: boolean) => async (id: unknown) => ((asked = id), v);
+    // Neon-era session that has the export's coverage marker: analyzed (neonFree not consulted).
+    expect((await loadSessionSource(deps({ neonFree: neonFree(false) }, withMarker), SCOPE)).sourceProvider).toBe("claude");
+    expect(asked).toBeUndefined();
+    // Neon-era session without the marker: refused as incomplete.
+    await expect(loadSessionSource(deps({ neonFree: neonFree(false) }, noMarker), SCOPE)).rejects.toThrow("legacy evidence coverage is unknown");
+    await expect(loadSessionSource(deps({}, noMarker), SCOPE)).rejects.toThrow("legacy evidence coverage is unknown");
+    // Born after the Neon freeze, never in Neon: complete from S3 alone, analyzed.
+    expect((await loadSessionSource(deps({ neonFree: neonFree(true) }, noMarker), SCOPE)).sourceProvider).toBe("claude");
+    expect(asked).toEqual({ ...SCOPE, source: "claude" });
+    // The operator switch still overrides.
+    expect((await loadSessionSource(deps({}, noMarker), SCOPE, { assumeNoLegacyTurns: true })).sourceProvider).toBe("claude");
   });
 
   test("refuses a projected row from another source", async () => {

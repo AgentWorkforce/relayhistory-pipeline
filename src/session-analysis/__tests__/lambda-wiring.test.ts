@@ -12,3 +12,9 @@ test("a sessionAnalysis invocation with the flag off returns before reading any 
   expect(await handler({ sessionAnalysis: true })).toEqual({ ok: true });
 });
 
+
+test("P2: an enabled tick that fails throws (Lambda Error metric, alarm, async retry), never a swallowed ok:false", async () => {
+  process.env.SESSION_ANALYSIS_ENABLED = "true";
+  // No runtime env: init fails inside the tick.
+  await expect(handler({ sessionAnalysis: true })).rejects.toThrow("session analysis tick failed");
+});
