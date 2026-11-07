@@ -1,8 +1,11 @@
 -- Read-only verification of the session read API role (session_read_api_role.sql).
 -- Raises, listing every problem, unless the role has exactly the approved shape:
 -- attributes, no memberships, exactly the approved column SELECT on session_index and
--- schema USAGE as its effective privileges in schema sessions, no EXECUTE on any
--- sessions function, and the tenant-bound RLS policy on session_index.
+-- schema USAGE as its effective privileges in schema sessions, EXECUTE on no sessions
+-- SECURITY DEFINER function but the two tenant-setting directory reads of
+-- 20261105034000 (sessions.list_session_directory_for, session_directory_activity_for;
+-- allowed, not required, so this also passes before that migration), and the
+-- tenant-bound RLS policy on session_index.
 \set ON_ERROR_STOP 1
 DO $verify$
 DECLARE
@@ -62,11 +65,18 @@ BEGIN
       v_problems := array_append(v_problems, (format('column %s: SELECT is %s', v_row.attname, CASE WHEN v_row.sel THEN 'granted' ELSE 'missing' END))::text);
     END IF;
   END LOOP;
-  -- No callable sessions function: the claim-bound RPCs refuse other roles anyway,
-  -- but a definer function without such a check must not be reachable.
+  -- No other callable sessions definer function: the claim-bound RPCs refuse other roles
+  -- anyway, but a definer function without such a check must not be reachable. The two
+  -- allowed ones pin the tenant to this role's transaction settings
+  -- (sessions.session_directory_read_api_scope).
   FOR v_row IN
     SELECT p.oid::regprocedure::text AS fn FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
      WHERE n.nspname = 'sessions' AND p.prosecdef AND has_function_privilege(v_role.oid, p.oid, 'EXECUTE')
+       AND p.oid::regprocedure::text NOT IN (
+         'sessions.babysitter_evidence_page_for(text,jsonb)',
+         'sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
+         'sessions.session_brief_titles_for(text,text[],text[])',
+         'sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)')
   LOOP
     v_problems := array_append(v_problems, (format('EXECUTE on security definer %s', v_row.fn))::text);
   END LOOP;

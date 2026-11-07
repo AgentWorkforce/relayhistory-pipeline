@@ -17,9 +17,13 @@
  * Worker's own origin, the only audience accepted; unset = every /v1 request
  * 401), READ_API_COMPLETE_SINCE (ISO timestamp or "epoch"; missing = 503),
  * CLICKHOUSE_DATABASE, READ_API_DIRECTORY_WORKSPACES (the directory list/activity
- * and timing canary allowlist; unset = none), READ_API_TIMING_ASSUME_NO_TURNS, and
+ * and timing canary allowlist; unset = none), READ_API_BRIEF_TITLES_WORKSPACES (the
+ * brief-titles allowlist; unset = none), READ_API_TIMING_ASSUME_NO_TURNS, and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
- * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve).
+ * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve), and
+ * RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS with RELAYCONTROL_INTROSPECT_URL /
+ * RELAYCONTROL_INTROSPECT_SECRET (relaycontrol `sh_at_` tokens; default off,
+ * unset in wrangler.jsonc).
  */
 import pg from "pg";
 import { decompress } from "fzstd";
@@ -30,11 +34,15 @@ import { canonicalSnapshot, CanonicalReadError } from "../../../src/session-read
 import { sqlCanonicalPointers } from "../../../src/session-read-api/session-timing-source.ts";
 import { sqlSessionHarnesses } from "../../../src/session-read-api/session-turns-source.ts";
 import type { TimingDeps, TurnsDeps } from "../../../src/session-read-api/app.ts";
+import { sqlEvidenceDeps, type EvidenceDeps } from "../../../src/session-read-api/babysitter-evidence.ts";
+import { objectKey, readAll } from "../../../src/shared/vendor.ts";
 import { logLine, type Level } from "../../../src/shared/log.ts";
 import { createClickHouseClient, type ClickHouseClient, type RequestOptions } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-read-api/app.ts";
 import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
-import { relayAuthVerifier } from "../../../src/session-read-api/auth.ts";
+import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
+import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
+import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { sqlLiveness, TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
 
@@ -48,10 +56,31 @@ export interface Env extends CanonicalEnv {
   READ_API_COMPLETE_SINCE?: string;
   /** Directory list/activity and timing canary allowlist: unset = none, "*" = all, else comma-separated workspace ids. */
   READ_API_DIRECTORY_WORKSPACES?: string;
+  /** Brief-titles allowlist (GET /v1/sessions/titles): unset = none, "*" = all, else comma-separated workspace ids. */
+  READ_API_BRIEF_TITLES_WORKSPACES?: string;
   /** "true": time a session without legacy turn evidence as having none (session-timing-source.ts). */
   READ_API_TIMING_ASSUME_NO_TURNS?: string;
+  /** Babysitter evidence reader (GET /v1/delivery/records for its kinds): only "on" enables; default off. */
+  READ_API_BABYSITTER_EVIDENCE?: string;
+  /** The ingest key root the retention buckets live under (default 96bulls). */
+  READ_API_BABYSITTER_KEY_ROOT?: string;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
+  /** Exactly "true" also accepts relaycontrol `sh_at_` tokens; default off. */
+  RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS?: string;
+  RELAYCONTROL_INTROSPECT_URL?: string;
+  RELAYCONTROL_INTROSPECT_SECRET?: string;
+}
+
+/** The read verifier's config from Worker env; the introspection URL passes the https/loopback rule. */
+export function workerAuthConfig(env: Env): AuthConfig {
+  const config: AuthConfig = { origin: env.READ_API_ORIGIN?.trim() || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL?.trim() || undefined, issuer: env.RELAYAUTH_ISSUER?.trim() || undefined };
+  if (env.RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS === "true") {
+    const url = env.RELAYCONTROL_INTROSPECT_URL?.trim() || undefined;
+    if (url) assertDestinationUrl("RELAYCONTROL_INTROSPECT_URL", url, destinationPolicy({}));
+    config.relaycontrol = { url, secret: env.RELAYCONTROL_INTROSPECT_SECRET?.trim() || undefined };
+  }
+  return config;
 }
 
 const SERVICE = "96bulls-session-read-worker";
@@ -185,8 +214,10 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   if (request.method !== "GET") return json(405, "method_not_allowed", "GET only", { allow: "GET" });
   let ch: ClickHouseClient;
   let completeSinceMs: number;
+  let authConfig: AuthConfig;
   try {
     completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
+    authConfig = workerAuthConfig(env);
     ch = boundedClickHouse(createClickHouseClient(clickHouseConfig(env), overrides.fetcher));
     if (!overrides.connect && !env.SUPABASE?.connectionString) throw new ConfigError("SUPABASE");
   } catch (error) {
@@ -198,11 +229,14 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   const app = createReadApi({
     timing: timingDeps(env, tenant.run, overrides.fetcher),
     turns: turnsDeps(env, tenant.run, overrides.fetcher),
-    verify: relayAuthVerifier({ origin: env.READ_API_ORIGIN?.trim() || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL?.trim() || undefined, issuer: env.RELAYAUTH_ISSUER?.trim() || undefined }),
+    babysitter: babysitterEvidenceDeps(env, tenant.run, overrides.fetcher),
+    verify: readApiVerifier(authConfig),
     ch,
     liveness: sqlLiveness(tenant.run),
     directory: sqlDirectory(tenant.run),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
+    briefTitles: sqlBriefTitles(tenant.run),
+    briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
     log: (fields) => log("info", "session read", fields),
   });
@@ -254,6 +288,22 @@ export function turnsDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>
   const timing = timingDeps(env, run, fetcher);
   if (!timing) return undefined;
   return { harnesses: sqlSessionHarnesses(run), source: timing.source };
+}
+
+/**
+ * Babysitter evidence from the retention buckets (src/session-read-api/babysitter-evidence.ts):
+ * buckets and revisions through the read role (tenant-bound), objects with the raw-store
+ * secrets. Off unless READ_API_BABYSITTER_EVIDENCE=on and the raw store is configured.
+ */
+export function babysitterEvidenceDeps(env: Env, run: TenantRunner, fetcher: typeof fetch = (input, init) => fetch(input, init)): EvidenceDeps | undefined {
+  if ((env.READ_API_BABYSITTER_EVIDENCE ?? "").trim().toLowerCase() !== "on") return undefined;
+  if (!rawStoreFromEnv(env, fetcher)) return undefined;
+  const keyRoot = env.READ_API_BABYSITTER_KEY_ROOT?.trim() || "96bulls";
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(keyRoot)) return undefined;
+  // A store per request, its fetcher bound to the request's deadline: list and get both abort.
+  const storeFor = (signal: AbortSignal) =>
+    rawStoreFromEnv(env, ((input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal })) as typeof fetch)?.store;
+  return sqlEvidenceDeps(run as never, storeFor as never, (body) => readAll(body as never) /* the bound fetch aborts the body stream too */, (bytes) => decompress(bytes), (key) => objectKey(key) as never, keyRoot);
 }
 
 export default {

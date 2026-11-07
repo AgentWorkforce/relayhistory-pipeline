@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "technical-foul:manifest": "bun run scripts/technical-foul-manifest.ts",
+    "technical-foul:check": "bun run scripts/technical-foul-manifest.ts --check"
   },
   "dependencies": {
     "@relayhistory/object-store": "workspace:*"

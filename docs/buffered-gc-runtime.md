@@ -63,6 +63,15 @@ dual-fence contract; this GC does not move Desktop reads.
 
 ## S3, KMS and secret prerequisites
 
+The complete transcript bucket and CMK policies are owned by
+`stacks/aws/transcript-store.ts`. After a reviewed resource-policy repair, retain
+the exact separately managed GC role in the production private input
+`transcriptStore.bufferedGcRoleArn` before another whole-stack deployment. The
+production validator refuses omission so a future Lambda role-ARN cascade cannot
+silently remove that grant. See the continuity procedure in
+`runbooks/sessions-prod-transcript-store.md`. This does not create or arm a GC
+runtime, change credentials, or relax the existing plan/capture gate.
+
 The template is default off and has no Function URL. Its dedicated Lambda role
 has GetSecretValue on one exact secret; GetObject/PutObject/DeleteObjectVersion
 only under `96bulls/*/buffered-batches/*`; ListBucketVersions with that prefix;
@@ -113,6 +122,10 @@ The reviewed template fixes RoleName to `96bulls-sessions-prod-buffered-gc` so e
 The operator proposal preserves existing principals/statements, denies this GC role any deletion outside buffered storage and all plain DeleteObject, and grants data cryptography only via S3/account/object-prefix context. Re-read and compare exact semantic preimage hashes before applying; stop on drift. Create the default-off role first; do not enable/admit while policies or transport proof are missing. AWS Access Analyzer accepted the v3 KMS policy without findings; the v3 bucket policy has the documented shorter-prefix warning on the specific canonical-prefix deny. CloudFormation validate-template accepted the named-role template. These checks do not establish effective live permission.
 
 The existing transcript-store K-45 objective is immediate logical deletion and physical purge within 48 hours; it does not impose a waiting canary. The owned capacity case now creates 20 acknowledged batches with 500 records/groups each through the actual producer, then checks the default claim scans all 20 inside its 1.8 second metadata budget. Root measured 305 ms on owned PostgreSQL17/Node24/MinIO (106 S3 requests across 14 groups, about 299 MiB peak RSS). This does not prove production latency, sustained arrival capacity or the physical purge objective. Review actual backlog/throughput and retain active GC while admission closes.
+
+### Claim timeout correction (2026-11-05)
+
+From about 06Z on 2026-11-05 the production function failed every run with `buffered_gc_sql_57014`. The `sql_` prefix comes only from the SQL ledger, and `bufferedGcTick` defers collect-phase `sql_57014`, so the error that escaped was the claim RPC. `ingest_buffer_gc_claim` scans `4*limit` candidates (20 at the template's limit of 5). For each candidate it does the full retention computation in one statement: two original-record normalizations of up to 500 records, plus the ACK-decision and native-slot joins. The job caps that statement at 1.8 s. A healthy backlog of 500-record batches costs about 25 ms per candidate on owned PG17, about 490 ms for 20. That cost grows linearly with the candidate count and slower hosts multiply it. The timeout also rolls back every `gc_checked_at` rotation, so the next run rescans the same head of the queue and fails again. The tick now makes `limit` single-ticket claims. Each claim scans at most four candidates and commits its rotation. Per-tick coverage (`4*limit` candidates), the ticket bound, lease semantics and SQL are unchanged, and any claim error still fails the tick. This change has no schema change, so it does not change the compiled generation. `buffered-gc-claim-budget.postgres.test.ts` reproduces the stuck `claim(5)` against the actual lazy-current producer and shows that the tick makes progress under the same bounded executor and budget.
 
 Ordered dual-control epoch/version/digest contract: [ordered-ingest-controls.md](ordered-ingest-controls.md).
 

@@ -37,6 +37,14 @@ test("one dormant switch arms the permanent job and schedule", () => {
   expect(t.Resources.Function.Properties.Code.S3ObjectVersion).toEqual({ Ref: "CodeVersion" });
   expect(t.Resources.HealthyAlarm.Properties.TreatMissingData).toEqual({ "Fn::If": ["Armed", "breaching", "notBreaching"] });
 });
+test("deployment identity is a required stack input wired to the job, never defaulted", () => {
+  const vars = t.Resources.Function.Properties.Environment.Variables;
+  expect(vars.INGEST_GC_AWS_ACCOUNT_ID).toEqual({ Ref: "AwsAccountId" });
+  expect(vars.INGEST_GC_SUPABASE_PROJECT_REF).toEqual({ Ref: "SupabaseProjectRef" });
+  for (const name of ["AwsAccountId", "SupabaseProjectRef"]) expect(t.Parameters[name].Default).toBeUndefined();
+  expect(new RegExp("^" + t.Parameters.AwsAccountId.AllowedPattern + "$").test("111122223333")).toBe(true);
+  expect(new RegExp("^" + t.Parameters.SupabaseProjectRef.AllowedPattern + "$").test("abcdefghijklmnopqrst")).toBe(true);
+});
 test("actual producer stage permits needed operations but no plain deletion", () => {
   for (const action of ["s3:GetObject", "s3:DeleteObjectVersion"]) expect(decision(action, arn(key))).toBe("allowed");
   expect(decision("s3:PutObject", arn(key), { "s3:x-amz-server-side-encryption": "aws:kms", "s3:x-amz-server-side-encryption-aws-kms-key-id": parameters.KmsKeyArn! })).toBe("allowed");

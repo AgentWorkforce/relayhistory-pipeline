@@ -8,7 +8,7 @@ const clients: FakeClient[] = [], records: string[] = [];
 cp.execFileSync = (exe: string) => {
   if(exe!=="/synthetic-supabase-refuse-network") throw Error("unexpected_process_refused");
   currentPassword="synthetic-cli-password-"+(++logins);
-  return ['PGHOST="db.pyamkrhoyszgzirqqffq.supabase.co"','PGPORT="5432"','PGUSER="cli_login_postgres"','PGDATABASE="postgres"',"PGPASSWORD="+JSON.stringify(currentPassword)].join("\n");
+  return ['PGHOST="db.abcdefghijklmnopqrst.supabase.co"','PGPORT="5432"','PGUSER="cli_login_postgres"','PGDATABASE="postgres"',"PGPASSWORD="+JSON.stringify(currentPassword)].join("\n");
 };
 syncBuiltinESMExports();
 globalThis.fetch = async () => { throw Error("network_refused_in_copy_fixture"); };

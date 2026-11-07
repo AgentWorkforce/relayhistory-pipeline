@@ -1,0 +1,37 @@
+name: Amp transport Worker checks
+on:
+  pull_request:
+    paths: ["packages/amp-transport-worker/**", "bun.lock", ".github/workflows/amp-transport-worker-checks.yml"]
+  push:
+    branches: [main]
+    paths: ["packages/amp-transport-worker/**", "bun.lock", ".github/workflows/amp-transport-worker-checks.yml"]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          submodules: false
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - run: bun run --filter @96bulls/amp-transport-worker typecheck
+      - run: bun run --filter @96bulls/amp-transport-worker test
+      - name: Compile only; no image pull, registry credentials or deployment
+        working-directory: packages/amp-transport-worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: "00000000000000000000000000000000"
+          AMP_TRANSPORT_HOSTNAME: amp-transport.example.com
+        run: |
+          set -eu
+          bun scripts/render-config.ts registry.cloudflare.com/00000000000000000000000000000000/96bulls-services@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0000000000000000000000000000000000000000
+          bunx --no-install wrangler deploy --config wrangler.generated.json --dry-run --containers-rollout none --outdir dist

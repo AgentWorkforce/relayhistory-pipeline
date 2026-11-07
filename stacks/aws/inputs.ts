@@ -160,7 +160,7 @@ export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImag
   const hoopdb = hoopdbBackend(stage, eks.hoopdb?.backend);
   if (eks.relaycast) assertRelaycastInputs(eks.relaycast);
   if (eks.sessionDirectory?.enabled) assertSessionDirectoryPreconditions({ hoopdb, relayauthTls: Boolean(eks.relayauth) });
-  if (eks.ingress) ingressExposure({ ...(eks.ingress.scheme ? { scheme: eks.ingress.scheme } : {}), ...(eks.ingress.rateLimitPer5Min !== undefined ? { rateLimitPer5Min: eks.ingress.rateLimitPer5Min } : {}) });
+  if (eks.ingress) ingressExposure({ ...(eks.ingress.scheme ? { scheme: eks.ingress.scheme } : {}), ...(eks.ingress.rateLimitPer5Min !== undefined ? { rateLimitPer5Min: eks.ingress.rateLimitPer5Min } : {}), ...(eks.ingress.ampTransportEnabled !== undefined ? { ampTransportEnabled: eks.ingress.ampTransportEnabled } : {}) });
   return { endpointAccess, hoopdb };
 }
 

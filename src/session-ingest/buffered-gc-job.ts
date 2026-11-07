@@ -9,28 +9,37 @@ import {SemanticPostgresExecutor} from "../search-features/semantic-copy-postgre
 import {derivedSchemaAssets,type DerivedSchemaAssets} from "../session-pipeline/derived-schema.ts";
 import {awsJsonCall,lambdaCredentials} from "../session-pipeline/aws-json.ts";
 import {SUPABASE_PROD_CA_2021} from "../session-pipeline/supabase-ca.ts";
-import {bufferedGcTick,sqlBufferedGcLedger,BufferedGcError} from "./buffered-gc.ts";
-export interface GcJobConfig {region:"us-east-1";bucket:string;kmsKeyArn:string;secretArn:string;expectedGeneration:string;limit:number;budgetMs:number}
+import {deployTargetValue,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF} from "../shared/deploy-target.ts";
+import {bufferedGcTick,sqlBufferedGcLedger,BufferedGcError,BufferedGcDiagnostics} from "./buffered-gc.ts";
+export interface GcJobConfig {region:"us-east-1";accountId:string;supabaseProjectRef:string;bucket:string;kmsKeyArn:string;secretArn:string;expectedGeneration:string;limit:number;budgetMs:number}
 function no(code:string):never{throw new BufferedGcError(code)}
 export function gcJobConfig(env:NodeJS.ProcessEnv):GcJobConfig{
  const need=(name:string)=>{const v=env[name];if(!v)no("config_required");return v};
  if(env.AWS_REGION!=="us-east-1"||env.HOOPDB_DB_MODE!=="supabase")no("target_required");
  const bucket=need("INGEST_GC_BUCKET"),kmsKeyArn=need("INGEST_GC_KMS_KEY_ARN"),secretArn=need("INGEST_GC_SECRET_ARN");
- if(!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)||!/^arn:aws:kms:us-east-1:941433935742:key\/[0-9a-f-]{36}$/.test(kmsKeyArn)||
-  !/^arn:aws:secretsmanager:us-east-1:941433935742:secret:96bulls\/[A-Za-z0-9_./-]+\/buffered-gc-[A-Za-z0-9]{6}$/.test(secretArn))no("target_invalid");
+ const {accountId,supabaseProjectRef}=gcTargetConfig(env,{account:"INGEST_GC_AWS_ACCOUNT_ID",supabaseRef:"INGEST_GC_SUPABASE_PROJECT_REF"});
+ if(!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)||!new RegExp(`^arn:aws:kms:us-east-1:${accountId}:key/[0-9a-f-]{36}$`).test(kmsKeyArn)||
+  !new RegExp(`^arn:aws:secretsmanager:us-east-1:${accountId}:secret:96bulls/[A-Za-z0-9_./-]+/buffered-gc-[A-Za-z0-9]{6}$`).test(secretArn))no("target_invalid");
  const expectedGeneration=need("INGEST_GC_EXPECT_GENERATION");
  if(!/^[a-f0-9]{64}$/.test(expectedGeneration))no("generation_required");
  const limit=Number(env.INGEST_GC_BATCH_LIMIT??"5"),budgetMs=Number(env.INGEST_GC_BUDGET_MS??"45000");
  if(!Number.isInteger(limit)||limit<1||limit>20||!Number.isInteger(budgetMs)||budgetMs<5000||budgetMs>50000)no("budget_invalid");
- return{region:"us-east-1",bucket,kmsKeyArn,secretArn,expectedGeneration,limit,budgetMs};
+ return{region:"us-east-1",accountId,supabaseProjectRef,bucket,kmsKeyArn,secretArn,expectedGeneration,limit,budgetMs};
 }
-/** Dedicated login only. URL SSL options cannot weaken pinned CA/hostname checks. */
-export function gcPoolConfig(text:string):pg.PoolConfig{
+/** Deployment identity: explicit operator configuration with no default target. */
+export function gcTargetConfig(env:NodeJS.ProcessEnv,names:{account:string;supabaseRef:string}):{accountId:string;supabaseProjectRef:string}{
+ const fail=(reason:"required"|"invalid"):never=>no(reason==="required"?"config_required":"target_invalid");
+ return{accountId:deployTargetValue(env,names.account,AWS_ACCOUNT_ID,fail),supabaseProjectRef:deployTargetValue(env,names.supabaseRef,SUPABASE_PROJECT_REF,fail)};
+}
+/** Dedicated login only. URL SSL options cannot weaken pinned CA/hostname checks.
+ * `supabaseProjectRef` comes from validated operator config (gcTargetConfig). */
+export function gcPoolConfig(text:string,supabaseProjectRef:string):pg.PoolConfig{
+ if(!SUPABASE_PROJECT_REF.test(supabaseProjectRef))no("target_invalid");
  let v:unknown;try{v=JSON.parse(text)}catch{no("secret_invalid")}
  if(!v||typeof v!=="object"||Array.isArray(v)||Object.keys(v).join(",")!=="hoopdb_url"||typeof(v as any).hoopdb_url!=="string")no("secret_invalid");
  let u:URL;try{u=new URL((v as any).hoopdb_url)}catch{no("database_target")}
  if(!["postgres:","postgresql:"].includes(u.protocol)||u.hostname!=="aws-0-us-east-1.pooler.supabase.com"||
-  u.port!=="5432"||u.pathname!=="/postgres"||decodeURIComponent(u.username)!=="bulls96_session_ingest.pyamkrhoyszgzirqqffq"||!u.password||u.hash)no("database_target");
+  u.port!=="5432"||u.pathname!=="/postgres"||decodeURIComponent(u.username)!=="bulls96_session_ingest."+supabaseProjectRef||!u.password||u.hash)no("database_target");
  for(const[k,x]of u.searchParams)if(!((k==="sslmode"&&["require","verify-full"].includes(x))||(k==="channel_binding"&&x==="require")))no("database_options");
  return{host:u.hostname,port:5432,database:"postgres",user:decodeURIComponent(u.username),password:decodeURIComponent(u.password),
   ssl:{ca:SUPABASE_PROD_CA_2021,rejectUnauthorized:true,servername:u.hostname},max:2,connectionTimeoutMillis:1000,
@@ -58,8 +67,12 @@ export interface GcJobOverrides{
  fetcher?:typeof fetch;
 }
 /** Test factories can point at owned PG/MinIO; production entry supplies none. */
-export async function runBufferedGcJob(env:NodeJS.ProcessEnv,overrides:GcJobOverrides={}){
- const config=gcJobConfig(env),assets=await(overrides.assets??derivedSchemaAssets)();
+export async function runBufferedGcJob(env:NodeJS.ProcessEnv,overrides:GcJobOverrides={},diagnostics=new BufferedGcDiagnostics()){
+ diagnostics.phase("config");
+ try{
+ const config=gcJobConfig(env);
+ diagnostics.phase("assets");
+ const assets=await(overrides.assets??derivedSchemaAssets)();
  if(assets.expected.generation!==config.expectedGeneration||!assets.expected.names.length||
   Object.values(assets.verifiers).length!==4||Object.values(assets.verifiers).some(s=>typeof s!=="string"||!s.trim()))no("compiled_generation_mismatch");
  const deadline=Date.now()+config.budgetMs,controller=new AbortController(),timer=setTimeout(()=>controller.abort(),config.budgetMs);
@@ -71,27 +84,40 @@ export async function runBufferedGcJob(env:NodeJS.ProcessEnv,overrides:GcJobOver
  let pool:pg.Pool|undefined;
  try{
   const credentials=()=>{const c=lambdaCredentials();if(!/^ASIA[A-Z0-9]{16}$/.test(c.accessKeyId)||!c.sessionToken)no("managed_credentials_required");return c};
+  diagnostics.phase("secret");
   const secret=overrides.secret?await overrides.secret(config,boundedFetch):await(async()=>{
    const r=await awsJsonCall<{SecretString?:string}>({service:"secretsmanager",target:"secretsmanager.GetSecretValue",region:config.region,
     body:{SecretId:config.secretArn},credentials:credentials(),fetcher:boundedFetch,timeoutMs:Math.min(5000,config.budgetMs)});
    if(!r.SecretString)no("secret_empty");return r.SecretString;
   })();
   controller.signal.throwIfAborted();
-  pool=(overrides.pool??(c=>new pg.Pool(c)))(gcPoolConfig(secret));pool.on("error",()=>{});
+  diagnostics.phase("pool");
+  pool=(overrides.pool??(c=>new pg.Pool(c)))(gcPoolConfig(secret,config.supabaseProjectRef));pool.on("error",()=>{});
   const sql=new SemanticPostgresExecutor(pool),read=new SemanticPostgresExecutor(pool,true);
   const context=()=>({signal:controller.signal,deadline:Math.min(deadline,Date.now()+1800)});
+  diagnostics.phase("role_check");
   const who=(await read.queryBounded<{me:string;session:string}>("SELECT current_user AS me,session_user AS session",[],context())).rows[0];
   if(who?.me!=="bulls96_session_ingest"||who.session!=="bulls96_session_ingest")no("database_role");
+  diagnostics.phase("readiness");
   await read.queryBounded("SET LOCAL hoopdb.db_mode='supabase';"+Object.values(assets.verifiers).join("\n"),[],context());
+  diagnostics.phase("store_setup");
   const rawStore=(overrides.store??createS3Store)({bucket:config.bucket,region:config.region,credentials:async()=>credentials(),
    serverSideEncryption:"aws:kms",sseKmsKeyId:config.kmsKeyArn,fetch:boundedFetch});
   const eraser=(overrides.eraser??createS3Eraser)({bucket:config.bucket,region:config.region,credentials:credentials(),fetch:boundedFetch});
+  diagnostics.phase("tick");
   const result=await bufferedGcTick({keyRoot:"96bulls",store:scopedGcStore(rawStore),
    eraser:{eraseObjectExcept:async(key,version)=>{if(!bufferedKeyAllowed(key))no("eraser_scope");controller.signal.throwIfAborted();return eraser.eraseObjectExcept(key,version)}},
-   ledger:sqlBufferedGcLedger({query:(s,p)=>sql.queryBounded(s,p,context())},config.expectedGeneration)},config.limit);
+   ledger:sqlBufferedGcLedger({query:(s,p)=>sql.queryBounded(s,p,context())},config.expectedGeneration,diagnostics),diagnostics},config.limit);
+  diagnostics.phase("tick");
   controller.signal.throwIfAborted();return result;
+ }catch(error){
+  diagnostics.capture(error);throw error;
  }finally{
+  diagnostics.phase("cleanup");
   controller.abort();clearTimeout(timer);
   if(pool)await pool.end();
+ }
+ }catch(error){
+  diagnostics.capture(error);throw error;
  }
 }

@@ -3,7 +3,7 @@
  * Supabase directory, the canary allowlist, the 501 contract (never Neon), parameter
  * validation as relayhistory's, the row mapping and cursors, and the not-yet-migrated
  * routes. sqlDirectory itself is exercised against PGlite: without migration
- * 20261105029000 it answers null (501 directory_not_migrated), never an empty page.
+ * 20261105034000 it answers null (501 directory_not_migrated), never an empty page.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
@@ -139,7 +139,7 @@ describe("GET /v1/sessions from the directory", () => {
     expect(parseDirectoryWorkspaces(undefined)).toEqual(new Set());
     expect(parseDirectoryWorkspaces("  ")).toEqual(new Set());
     expect(parseDirectoryWorkspaces("*")).toBe("*");
-    expect(parseDirectoryWorkspaces(" 1220c1dc-0ce5-45fe-8b67-e7bb57a2db63 , ws-b,")).toEqual(new Set(["1220c1dc-0ce5-45fe-8b67-e7bb57a2db63", "ws-b"]));
+    expect(parseDirectoryWorkspaces(" 20000000-0000-4000-8000-000000000002 , ws-b,")).toEqual(new Set(["20000000-0000-4000-8000-000000000002", "ws-b"]));
   });
 
   test("until the migration exists: 501 directory_not_migrated, never an empty page", async () => {
@@ -343,7 +343,7 @@ describe("mapping and cursors", () => {
   });
 });
 
-describe("sqlDirectory against Supabase without migration 20261105029000", () => {
+describe("sqlDirectory against Supabase without migration 20261105034000", () => {
   const open: PGlite[] = [];
   afterEach(async () => {
     await Promise.all(open.splice(0).map((db) => db.close()));
@@ -355,9 +355,9 @@ describe("sqlDirectory against Supabase without migration 20261105029000", () =>
     const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
     open.push(db);
     await db.exec(read("supabase/tests/supabase_shim.sql"));
-    for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles"]) await db.exec(read(`supabase/bootstrap/${f}.sql`));
+    for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read(`supabase/bootstrap/${f}.sql`));
     for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
-      if (file.startsWith("20261105029000")) continue;
+      if (file.startsWith("20261105034000")) continue;
       await db.exec(read(`supabase/migrations/${file}`));
     }
     await db.exec(read("supabase/bootstrap/session_read_api_role.sql").split("\n").filter((l) => !l.startsWith("\\")).join("\n"));

@@ -50,6 +50,20 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: psql client
         run: psql --version
+      - name: RDS setup refuses PostgreSQL 15 before changing roles
+        if: matrix.pg == '15'
+        run: |
+          for file in rds_owner_function_default_revoke.sql rds_migration_roles.sql hoopdb_runtime_role_rds.sql; do
+            if psql -X -h 127.0.0.1 -p 5432 -U postgres -d postgres \
+              -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -v migration_owner=postgres \
+              -v runtime_role=g7_rds_version_probe -v runtime_login=false \
+              -f "supabase/bootstrap/$file" > rds-version-refusal.log 2>&1; then
+              echo "RDS setup unexpectedly accepted PostgreSQL 15: $file"
+              exit 1
+            fi
+            grep -Eq 'ERROR:[[:space:]]+0A000:' rds-version-refusal.log
+            echo "$file refused PostgreSQL 15 with SQLSTATE 0A000" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
       # Before the role proofs, which lock the superuser down. The suite creates
       # and drops its own database, so it leaves nothing behind for them.
       - name: SearchIndexAdapter conformance (postgres adapter, real server)
@@ -97,6 +111,74 @@ jobs:
             pg-proof-pg${{ matrix.pg }}.log
             auth-upgrade-pg${{ matrix.pg }}.json
             auth-upgrade-pg${{ matrix.pg }}.log
+
+  rds-emulated-postgres:
+    # The managed-RDS HoopDb profile (HOOPDB_DB_MODE=rds) on disposable PostgreSQL 16/17
+    # whose bootstrap superuser is named rdsadmin, so PostgreSQL's automatic PG16+
+    # creator edges carry rdsadmin as grantor, as on RDS. An emulation, not RDS: the
+    # live RDS gates are listed in the bootstrap runbook.
+    name: managed-RDS profile (emulated, PostgreSQL ${{ matrix.pg }})
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          # Disposable container: trust auth means no credential exists anywhere.
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_USER: rdsadmin
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rdsadmin -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED), RDS emulation PostgreSQL ${{ matrix.pg }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Prove the rds profile, its drift refusals and its mode binding
+        env:
+          PGPROOF_HOST: 127.0.0.1
+          PGPROOF_PORT: "5432"
+          PGPROOF_SUPERUSER: rdsadmin
+          PGPROOF_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          PGPROOF_OUT: rds-profile-proof.json
+        run: |
+          set -o pipefail
+          bun scripts/pg-proof/rds-profile-proof.ts 2>&1 | tee rds-profile-proof.log
+      - name: Check the results file names this head
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          jq -e --arg head "$EXPECTED" --argjson major ${{ matrix.pg }} \
+            '.head == $head and .tracked_tree_clean == true and .pg_major == $major and .bootstrap_superuser == "rdsadmin" and .failed == 0 and .passed >= 21 and (.cases | all(.pass))' rds-profile-proof.json
+          jq -r '"\(.passed) passed, \(.failed) failed on PostgreSQL \(.pg_version) (rds emulation) at \(.head)"' rds-profile-proof.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rds-profile-proof-pg${{ matrix.pg }}
+          path: |
+            rds-profile-proof.json
+            rds-profile-proof.log
 
   brief-postgres:
     name: brief publication PostgreSQL ${{ matrix.pg }}
@@ -168,7 +250,9 @@ jobs:
         env:
           PROOF_DISPOSABLE: "1"
         run: |
-          set -o pipefail
-          bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |
-            tee consumer-lease-pg${{ matrix.pg }}.log
-          grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}.log
+          set -euo pipefail
+          for scheme in legacy-prefix-v1 scope-v1; do
+            PROOF_PARTITION_SCHEME="$scheme" bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |
+              tee consumer-lease-pg${{ matrix.pg }}-$scheme.log
+            grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}-$scheme.log
+          done

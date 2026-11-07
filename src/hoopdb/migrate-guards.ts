@@ -75,7 +75,7 @@ export function migrationChecksumAlias(
 // ---------------------------------------------------------------------------
 
 export interface RuntimeRoleConfig {
-  mode: "local" | "selfhosted" | "cloudsql" | "supabase";
+  mode: "local" | "selfhosted" | "cloudsql" | "supabase" | "rds";
   role: string;
   /** HOOPDB_RUNTIME_ROLE_LOGIN: whether the role logs in itself (true) or is reached through a workload role (false). */
   login?: boolean;
@@ -260,6 +260,33 @@ export function isSupabaseCreatorEdge(
 }
 
 /**
+ * rds mode only, PostgreSQL 16+: the unavoidable automatic creator edge left when the
+ * non-superuser RDS master (the migration owner) creates the runtime role. PostgreSQL
+ * records it with the bootstrap superuser as grantor (rdsadmin on RDS), ADMIN true and
+ * neither INHERIT nor SET, and the creator cannot revoke it. The owner keeps only the
+ * ability to manage the role (set or rotate its password, drop it); it gains none of
+ * the runtime role's privileges, and the runtime role gains nothing. The member must be
+ * the connected migration owner itself, never a configurable name.
+ */
+export function isRdsCreatorEdge(
+  cfg: Pick<RuntimeRoleConfig, "mode">,
+  serverVersion: number,
+  edge: RoleGrantEdge,
+  migrationOwner: string,
+): boolean {
+  return (
+    cfg.mode === "rds" &&
+    serverVersion >= 160000 &&
+    edge.rolname === migrationOwner &&
+    edge.grantor === "rdsadmin" &&
+    edge.grantor_super &&
+    edge.admin_option &&
+    !edge.inherit_option &&
+    !edge.set_option
+  );
+}
+
+/**
  * The one optional workload membership. On PG16+ both per-grant options must keep
  * ordinary privilege inheritance and SET ROLE enabled; on PG15 the query projects
  * the member role's INHERIT attribute and the platform's implicit SET capability.
@@ -332,6 +359,9 @@ export async function runtimeRoleViolations(
   phase: "pre" | "post" = "post",
 ): Promise<string[]> {
   const out: string[] = [];
+  const migrationOwner = cfg.mode === "rds"
+    ? (await client.query<{ me: string }>("SELECT current_user AS me")).rows[0]!.me
+    : "";
   const serverVersion = Number(
     (
       await client.query<{ server_version_num: string }>(
@@ -430,6 +460,7 @@ export async function runtimeRoleViolations(
     const supabaseCreatorEdge = isSupabaseCreatorEdge(cfg, serverVersion, m);
     if (
       supabaseCreatorEdge ||
+      isRdsCreatorEdge(cfg, serverVersion, m, migrationOwner) ||
       isRuntimeWorkloadEdge(cfg, m, supabaseCreatorPresent)
     )
       continue;
@@ -1094,7 +1125,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "efd38ada85eadb9100a36bcb22480a6989fbba5e39319fbe38a1e6bafeb8fe2f";
+  "8061b2c51d99613e3fd606bc4b2d639107638171e77122e0abb59a628f90fda0";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
@@ -1200,6 +1231,20 @@ export const CLOUDSQL_PLATFORM_SUPERUSERS: readonly string[] = Object.freeze([
   "cloudsqladmin",
 ]);
 
+/**
+ * AWS documents rdsadmin as the RDS for PostgreSQL internal role that performs the
+ * management tasks a superuser would perform on standalone PostgreSQL; customers (the
+ * rds_superuser master included) cannot log in as it or alter its default privileges.
+ * Its catalog shape on a real instance is a live gate (runbooks/
+ * session-directory-search-worker-bootstrap.md, "Amazon RDS for PostgreSQL").
+ * Excluded only in rds mode, only while the catalog marks it SUPERUSER, and never when it
+ * is the migration owner. Aurora is NOT covered by this list until separately proven.
+ * https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Appendix.PostgreSQL.CommonDBATasks.Roles.html
+ */
+export const RDS_PLATFORM_SUPERUSERS: readonly string[] = Object.freeze([
+  "rdsadmin",
+]);
+
 /** A fixed provider platform superuser excluded from creator coverage, with its attributes. */
 export interface ExcludedPlatformSuperuser {
   role: string;
@@ -1247,7 +1292,7 @@ export interface FunctionBoundaryEvidence {
    * it: full coverage). Only provider-specific modes exclude their fixed platform
    * superusers.
    */
-  db_mode: "local" | "selfhosted" | "cloudsql" | "supabase" | "unspecified";
+  db_mode: "local" | "selfhosted" | "cloudsql" | "supabase" | "rds" | "unspecified";
   /**
    * Provider mode only: CREATE-capable roles left out of sessions_create_roles because
    * the catalog shows rolsuper AND the name is in that provider's fixed platform list.
@@ -1299,7 +1344,7 @@ export interface FunctionBoundaryEvidence {
 export async function functionBoundaryEvidence(
   client: GuardClient,
   mode: FunctionBoundaryMode | undefined,
-  dbMode: "local" | "selfhosted" | "cloudsql" | "supabase" | undefined = undefined,
+  dbMode: "local" | "selfhosted" | "cloudsql" | "supabase" | "rds" | undefined = undefined,
   runtimeRole: string | undefined = undefined,
 ): Promise<FunctionBoundaryEvidence> {
   const head = (
@@ -1354,7 +1399,9 @@ export async function functionBoundaryEvidence(
         ? SUPABASE_PLATFORM_SUPERUSERS
         : dbMode === "cloudsql"
           ? CLOUDSQL_PLATFORM_SUPERUSERS
-          : [];
+          : dbMode === "rds"
+            ? RDS_PLATFORM_SUPERUSERS
+            : [];
     if (
       providerSuperusers.length > 0 &&
       r.rolsuper === true &&

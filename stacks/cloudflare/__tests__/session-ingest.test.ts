@@ -5,6 +5,8 @@ import * as Cloudflare from "@alchemy.run/cloudflare";
 import {
   COMPATIBILITY_DATE,
   FANOUT_DLQ,
+  INBOX_AUTHORITY_MODE,
+  INBOX_CANDIDATE_KEY_ROOT,
   SESSION_INGEST_RESOURCES,
   SESSION_INGEST_WORKER,
   assertFanoutConsumer,
@@ -27,6 +29,14 @@ const refuse = (why: string): never => {
 const hex = (c: string) => c.repeat(32);
 const KEY_ARN = "arn:aws:kms:us-east-1:941433935742:key/12345678-90ab-cdef-1234-567890abcdef";
 const inputs: SessionIngestInputs = { accountId: hex("a"), hyperdriveId: hex("b"), secretsStoreId: hex("c"), kmsKeyArn: KEY_ARN };
+const authority = {
+  mode: INBOX_AUTHORITY_MODE,
+  keyRoot: "96bulls/inbox-authority/v1",
+  expectedGeneration: "1".repeat(64),
+  expectedControlEpoch: "2".repeat(64),
+  expectedAuthEpoch: "3".repeat(64),
+  expectedSourceIdentitySha256: "4".repeat(64),
+} as const;
 const bindings = { HYPERDRIVE: Cloudflare.Hyperdrive.lookup("HYPERDRIVE", { hyperdriveId: hex("b") }), INGEST_FANOUT: { Type: "Cloudflare.Queues.Queue", queueName: "96bulls-session-ingest-fanout" } };
 const props = (p: SessionIngestInputs = inputs) => sessionIngestWorkerProps(p, bindings) as unknown as Record<string, unknown> & { env: Record<string, unknown> };
 const src = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
@@ -93,6 +103,20 @@ describe("session ingest worker: bindings and no credential in state", () => {
     });
   });
 
+  it("selects the inbox authority only with the exact all-or-nothing managed vars", () => {
+    expect(sessionIngestVars({ ...inputs, authority })).toEqual({
+      ...sessionIngestVars(inputs),
+      INGEST_AUTHORITY_MODE: "authority-v1",
+      INGEST_AUTHORITY_KEY_ROOT: "96bulls/inbox-authority/v1",
+      INGEST_AUTHORITY_EXPECT_GENERATION: "1".repeat(64),
+      INGEST_AUTHORITY_EXPECT_CONTROL_EPOCH: "2".repeat(64),
+      INGEST_AUTHORITY_EXPECT_AUTH_EPOCH: "3".repeat(64),
+      INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY: "4".repeat(64),
+    });
+    expect(Object.keys(sessionIngestVars(inputs)).filter((key) => key.startsWith("INGEST_AUTHORITY_"))).toEqual([]);
+    expect(() => assertNoSecretLiterals(props({ ...inputs, authority }).env, refuse)).not.toThrow();
+  });
+
   it("S3 credentials are Secrets Store bindings, never values", () => {
     const env = props().env;
     expect(env.S3_ACCESS_KEY_ID).toEqual(secretsStoreSecret(hex("c"), "96bulls-session-ingest-s3-access-key-id"));
@@ -110,6 +134,21 @@ describe("session ingest worker: bindings and no credential in state", () => {
       expect(() => assertNoSecretLiterals({ ...env, ...bad }, refuse)).toThrow();
     const { S3_ACCESS_KEY_ID: _, ...missing } = env;
     expect(() => assertNoSecretLiterals(missing, refuse)).toThrow(/missing/);
+    const selected = props({ ...inputs, authority }).env;
+    for (const key of [
+      "INGEST_AUTHORITY_MODE",
+      "INGEST_AUTHORITY_KEY_ROOT",
+      "INGEST_AUTHORITY_EXPECT_GENERATION",
+      "INGEST_AUTHORITY_EXPECT_CONTROL_EPOCH",
+      "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
+      "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
+    ]) {
+      const partial = { ...selected };
+      delete partial[key];
+      expect(() => assertNoSecretLiterals(partial, refuse)).toThrow(/missing/);
+    }
+    expect(() => assertNoSecretLiterals({ ...env, INGEST_AUTHORITY_STALE_BINDING: "x" }, refuse)).toThrow(/not a known/);
+    expect(() => assertNoSecretLiterals({ ...env, INGEST_AUTHORITY_MODE: "off" }, refuse)).toThrow(/missing/);
   });
 
   it("Hyperdrive is a lookup by id; the replica queue is bound only in queue mode, producer only", () => {
@@ -150,6 +189,7 @@ describe("session ingest worker: inputs", () => {
   it("accepts the documented shapes and refuses everything else", () => {
     assertSessionIngestInputs(inputs, refuse);
     assertSessionIngestInputs({ ...inputs, maxPerUser: 2, maxPerOrg: 8, inlineMaxSessions: 48, replicaMode: "queue", neonReplicaQueue: "relayhistory-neon-replica" }, refuse);
+    assertSessionIngestInputs({ ...inputs, authority }, refuse);
     for (const bad of [
       null,
       [],
@@ -165,7 +205,27 @@ describe("session ingest worker: inputs", () => {
       { ...inputs, replicaMode: "queue" },
       { ...inputs, neonReplicaQueue: "relayhistory-neon-replica" },
       { ...inputs, replicaMode: "queue", neonReplicaQueue: "some-other-queue" },
+      { ...inputs, authority: null },
+      { ...inputs, authority: { ...authority, extra: true } },
+      { ...inputs, authority: { ...authority, mode: "off" } },
+      { ...inputs, authority: { ...authority, expectedAuthEpoch: undefined } },
+      { ...inputs, authority: { ...authority, expectedGeneration: "A".repeat(64) } },
+      { ...inputs, authority: { ...authority, keyRoot: "other/inbox-authority/v1" } },
+      { ...inputs, authority: { ...authority, keyRoot: `${INBOX_CANDIDATE_KEY_ROOT}` } },
+      { ...inputs, authority: { ...authority, keyRoot: "96bulls/upload-inbox" } },
+      { ...inputs, authority: { ...authority, keyRoot: "96bulls//inbox-authority" } },
+      { ...inputs, authority: { ...authority, keyRoot: "96bulls/inbox-authority/../escape" } },
     ])
+      expect(() => assertSessionIngestInputs(bad, refuse)).toThrow();
+    expect(() => sessionIngestVars({ ...inputs, authority: { ...authority, expectedControlEpoch: "bad" } as never })).toThrow(/expectedControlEpoch/);
+  });
+
+  it("C3 privacyAuthority: supabase only with frozen-supabase custody in buffered mode, rendered as INGEST_PRIVACY_AUTHORITY", () => {
+    const frozen = { ...inputs, acceptanceMode: "buffered" as const, expectedGeneration: "f".repeat(64), inlineMaxSessions: 0, custodySource: "frozen-supabase" as const };
+    assertSessionIngestInputs({ ...frozen, privacyAuthority: "supabase" }, refuse);
+    expect(sessionIngestVars({ ...frozen, privacyAuthority: "supabase" })).toMatchObject({ INGEST_CUSTODY_SOURCE: "frozen-supabase", INGEST_PRIVACY_AUTHORITY: "supabase" });
+    expect(sessionIngestVars(frozen)).not.toHaveProperty("INGEST_PRIVACY_AUTHORITY");
+    for (const bad of [{ ...frozen, privacyAuthority: "neon" }, { ...frozen, custodySource: "shadow", privacyAuthority: "supabase" }, { ...inputs, privacyAuthority: "supabase" }])
       expect(() => assertSessionIngestInputs(bad, refuse)).toThrow();
   });
 

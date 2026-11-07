@@ -37,6 +37,8 @@ import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { LedgerUnavailableError } from "./ledger.ts";
+import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
@@ -125,6 +127,13 @@ export interface IngestAppDeps {
    * build it from the sealed Supabase copy (refuses, never guesses, when unsealed).
    */
   custodySource?: "relayhistory" | "shadow" | "frozen-supabase";
+  /**
+   * C3 privacy authority (INGEST_PRIVACY_AUTHORITY). "neon" (default): today's Neon-first controls, the
+   * Supabase mirror routes, and relayhistory's Neon witness accepted. "supabase" (needs frozen-supabase):
+   * only the Supabase-authority control routes; every relayhistory-built (Neon) custody envelope and the
+   * legacy mirror routes are refused, because Neon's heads are no longer the authority.
+   */
+  privacyAuthority?: "neon" | "supabase";
 }
 
 type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined } };
@@ -206,6 +215,20 @@ function errorBody(c: Context<Env>, code: string, message: string, extra: Record
   return { error: { code, message, ...extra }, correlationId: c.get("correlationId") ?? "" };
 }
 
+/** The 503 diagnosis on the route's log line: stage, cause code and, for a database cause,
+ * the closed diagnosis (heuristic class, safe code, basis; never a message). A raw ledger
+ * error that reached the route outside a delivery stage is reported the same way.
+ * Diagnostic only. */
+function unavailableFields(error: unknown): Record<string, unknown> {
+  if (error instanceof IngestUnavailable) return { stage: error.stage, error_code: error.cause_code, ...dbFields(error.db) };
+  if (error instanceof LedgerUnavailableError) return { error_code: error.code, ...dbFields(error.db) };
+  return {};
+}
+
+function dbFields(db: DbErrorDiagnosis | undefined): Record<string, unknown> {
+  return db ? { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis } : {};
+}
+
 function failure(c: Context<Env>, error: unknown) {
   const safe = error instanceof DeliveryError ? error : new DeliveryError("delivery_unavailable", 503, "Durable delivery is temporarily unavailable");
   // A busy refusal is retryable and wrote nothing durable; tell the client when (relayhistory's header).
@@ -277,6 +300,9 @@ export function createIngestApp(deps: IngestAppDeps) {
   const app = new Hono<Env>();
   const emit = deps.log ?? ((fields) => log.info("session ingest", fields));
   const custodyMode = deps.custodySource ?? "relayhistory";
+  const privacyAuthority = deps.privacyAuthority ?? "neon";
+  if (privacyAuthority !== "neon" && (privacyAuthority !== "supabase" || custodyMode !== "frozen-supabase"))
+    throw new Error("session ingest: privacyAuthority=supabase requires custodySource=frozen-supabase");
   const frozenWitness = async (input: FrozenWitnessInput): Promise<CurrentCustodyPacket> => {
     if (!deps.deliver.ledger.frozenWitness) throw new IngestUnavailable("fence", "custody_source_unavailable");
     return deps.deliver.ledger.frozenWitness(input);
@@ -320,6 +346,8 @@ export function createIngestApp(deps: IngestAppDeps) {
       const contentType=c.req.header("content-type")?.split(";")[0]?.trim();
       const privateWire=contentType===CURRENT_CUSTODY_CONTENT_TYPE||contentType===RECOVERY_CONTENT_TYPE;
       if(privateWire&&(deps.deliver.acceptanceMode!=="buffered"||!["","identity"].includes(c.req.header("content-encoding")?.trim().toLowerCase()??"")))throw new IngestUnavailable("fence","custody_wire_unavailable");
+      // C3: under Supabase privacy authority a relayhistory-built (Neon) witness is stale by definition.
+      if(privateWire&&privacyAuthority==="supabase")throw new IngestUnavailable("fence","privacy_authority_moved");
       body = c.req.raw.body ? await readBounded(c.req.raw.body, privateWire?PRIVATE_CUSTODY_BYTES:MAX_DELIVERY_BYTES) : new Uint8Array();
     } catch (error) {
       return failure(c, error);
@@ -399,7 +427,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       emit({
         ...fields,
         outcome: code,
-        ...(error instanceof IngestUnavailable ? { stage: error.stage, error_code: error.cause_code } : {}),
+        ...unavailableFields(error),
         ...(error instanceof DeliveryError && error.conflictCount ? { count: error.conflictCount } : {}),
         duration_ms: Date.now() - started,
         bytes_raw: read.bytes,
@@ -434,7 +462,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json({ ...result.receipt, limits: { ...result.receipt.limits, contentEncodings: contentEncodings() } });
     } catch (error) {
       const code = error instanceof DeliveryError ? error.code : "delivery_unavailable";
-      emit({ ...fields, outcome: code, ...(error instanceof IngestUnavailable ? { stage: error.stage, error_code: error.cause_code } : {}), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
+      emit({ ...fields, outcome: code, ...unavailableFields(error), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
       return failure(c, error);
     }
   });
@@ -530,6 +558,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   app.post("/v1/custody/control/begin", async (c) => {
     const identity = c.get("identity");
     try {
+      if (privacyAuthority !== "neon") throw new IngestUnavailable("fence", "privacy_authority_moved");
       if (!deps.deliver.ledger.sourceControlBegin) throw new IngestUnavailable("fence", "control_unavailable");
       const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control");
       exactKeys(b as Record<string, unknown>, ["epoch", "kind", "payload"]);
@@ -545,6 +574,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   app.post("/v1/custody/control/complete", async (c) => {
     const identity = c.get("identity");
     try {
+      if (privacyAuthority !== "neon") throw new IngestUnavailable("fence", "privacy_authority_moved");
       if (!deps.deliver.ledger.sourceControlComplete) throw new IngestUnavailable("fence", "control_unavailable");
       const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control completion");
       const v = b as Record<string, unknown>;exactKeys(v, ["epoch", "version", "digest", "kind", "outcome"]);
@@ -555,6 +585,43 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json(r);
     } catch (error) {
       emit({ route: "custody.control.complete", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+
+  // C3 Supabase-first privacy authority: relayhistory (DELIVERY_CUSTODY_SOURCE_MODE=supabase-authority) begins
+  // here (head + frozen privacy written, Neon never called), writes the unchanged ordered fence, then completes here.
+  app.post("/v1/custody/authority/begin", async (c) => {
+    const identity = c.get("identity");
+    try {
+      if (privacyAuthority !== "supabase" || !deps.deliver.ledger.privacyAuthorityBegin) throw new IngestUnavailable("fence", "privacy_authority_unavailable");
+      const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control");
+      exactKeys(b as Record<string, unknown>, ["epoch", "kind", "payload"]);
+      const v = b as Record<string, unknown>;
+      if (typeof v.epoch !== "string") invalid("Invalid control epoch");
+      const head = await deps.deliver.ledger.privacyAuthorityBegin({ epoch: v.epoch as string, kind: controlKind(v.kind), payload: v.payload,
+        tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId } });
+      emit({ route: "custody.authority.begin", outcome: head.apply ? "begun" : "pending_replay", org_id: identity.orgId });
+      return c.json(head);
+    } catch (error) {
+      emit({ route: "custody.authority.begin", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+  app.post("/v1/custody/authority/complete", async (c) => {
+    const identity = c.get("identity");
+    try {
+      if (privacyAuthority !== "supabase" || !deps.deliver.ledger.privacyAuthorityComplete) throw new IngestUnavailable("fence", "privacy_authority_unavailable");
+      const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control completion");
+      const v = b as Record<string, unknown>;exactKeys(v, ["epoch", "version", "digest", "kind", "outcome"]);
+      if (v.outcome !== "applied" && v.outcome !== "replay" && v.outcome !== "stale") invalid("Invalid control outcome");
+      if (typeof v.epoch !== "string" || typeof v.version !== "string" || typeof v.digest !== "string") invalid("Invalid control");
+      const r = await deps.deliver.ledger.privacyAuthorityComplete({ epoch: v.epoch as string, version: v.version as string, digest: v.digest as string, kind: controlKind(v.kind),
+        outcome: v.outcome as "applied" | "replay" | "stale", tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId } });
+      emit({ route: "custody.authority.complete", outcome: r.superseded ? "superseded" : "completed", org_id: identity.orgId });
+      return c.json(r);
+    } catch (error) {
+      emit({ route: "custody.authority.complete", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
       return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
     }
   });

@@ -15,6 +15,8 @@ import { schemaVerdict, type Transact } from "../../shared/db.ts";
 import {
   CLOUDSQL_PLATFORM_SUPERUSERS,
   functionBoundaryEvidence,
+  isRdsCreatorEdge,
+  RDS_PLATFORM_SUPERUSERS,
   isSupabaseCreatorEdge,
   isSupabasePublicTemp,
   isRuntimeWorkloadEdge,
@@ -106,6 +108,20 @@ async function snapshot(db: PGlite) {
   };
 }
 
+test("managed-provider bootstrap fixed-role inventories stay equal", () => {
+  const declaredRoles = (file: string) => {
+    const sql = readFileSync(join(root, "supabase/bootstrap", file), "utf8");
+    const inventory = /FOREACH\s+v_role\s+IN\s+ARRAY\s+ARRAY\[([\s\S]*?)\]\s+LOOP/.exec(sql);
+    if (!inventory) throw new Error(`${file}: fixed-role validation inventory not found`);
+    const roles = [...inventory[1]!.matchAll(/'([^']+)'::name/g)].map((m) => m[1]!).sort();
+    expect(roles.length).toBeGreaterThan(0);
+    return roles;
+  };
+  expect(declaredRoles("rds_migration_roles.sql")).toEqual(
+    declaredRoles("cloudsql_migration_roles.sql"),
+  );
+});
+
 describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
   const base = {
     HOOPDB_RUNTIME_ROLE: "hoop_runtime",
@@ -115,7 +131,7 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
     ["no mode", { ...base, HOOPDB_SUPABASE_SHIM: "true" }, "db_mode_invalid"],
     [
       "an unknown mode",
-      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_SUPABASE_SHIM: "true" },
+      { ...base, HOOPDB_DB_MODE: "aurora", HOOPDB_SUPABASE_SHIM: "true" },
       "db_mode_invalid",
     ],
     [
@@ -142,6 +158,31 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
       "cloudsql without an explicit shim choice",
       { ...base, HOOPDB_DB_MODE: "cloudsql" },
       "shim_unset",
+    ],
+    [
+      "rds with the shim forced on",
+      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_SUPABASE_SHIM: "true" },
+      "shim_forbidden",
+    ],
+    [
+      "rds with the generic bootstrap forced on",
+      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_ROLE_BOOTSTRAP: "true" },
+      "bootstrap_forbidden",
+    ],
+    [
+      "rds with a workload role",
+      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_RUNTIME_WORKLOAD_ROLE: "app_login" },
+      "db_profile_invalid",
+    ],
+    [
+      "rds with the event-trigger boundary",
+      { ...base, HOOPDB_DB_MODE: "rds", HOOPDB_FUNCTION_BOUNDARY_MODE: "event-trigger" },
+      "function_boundary_mode_unsupported",
+    ],
+    [
+      "rds without an explicit runtime login choice",
+      { HOOPDB_DB_MODE: "rds", HOOPDB_RUNTIME_ROLE: "hoop_runtime" },
+      "runtime_role_login_unset",
     ],
     [
       "a non-boolean flag",
@@ -210,6 +251,24 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
       bootstrap: false,
       functionBoundary: "global-default-revoke",
     });
+    // rds: never the shim nor the generic bootstrap, with or without an explicit "false".
+    for (const shim of [{}, { HOOPDB_SUPABASE_SHIM: "false" }])
+      expect(
+        migrationProfile({
+          ...base,
+          ...shim,
+          HOOPDB_DB_MODE: "rds",
+          HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+        }),
+      ).toEqual({
+        mode: "rds",
+        shim: false,
+        bootstrap: false,
+        verify: true,
+        runtimeRole: "hoop_runtime",
+        runtimeLogin: true,
+        functionBoundary: "global-default-revoke",
+      });
   });
 
   test("migrate() refuses supabase+shim before opening any connection", async () => {
@@ -230,6 +289,17 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
       for (const k of Object.keys(process.env))
         if (!(k in saved)) delete process.env[k];
       Object.assign(process.env, saved);
+    }
+  });
+
+  test("readiness binds the explicit rds database mode", async () => {
+    const saved = process.env.HOOPDB_DB_MODE;
+    try {
+      process.env.HOOPDB_DB_MODE = "rds";
+      expect(await expectedSchema()).toMatchObject({ dbMode: "rds" });
+    } finally {
+      if (saved === undefined) delete process.env.HOOPDB_DB_MODE;
+      else process.env.HOOPDB_DB_MODE = saved;
     }
   });
 
@@ -766,6 +836,43 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
       );
   });
 
+  test("RDS PG16+ creator-edge predicate is bound to rds mode, the connected owner and rdsadmin", () => {
+    const cfg = { mode: "rds" as const };
+    const edge = {
+      rolname: "rds_master",
+      grantor: "rdsadmin",
+      grantor_super: true,
+      admin_option: true,
+      inherit_option: false,
+      set_option: false,
+    };
+    expect(isRdsCreatorEdge(cfg, 170011, edge, "rds_master")).toBe(true);
+    for (const mode of ["local", "selfhosted", "cloudsql", "supabase"] as const)
+      expect(isRdsCreatorEdge({ mode }, 170011, edge, "rds_master")).toBe(false);
+    expect(isRdsCreatorEdge(cfg, 150019, edge, "rds_master")).toBe(false);
+    expect(isRdsCreatorEdge(cfg, 170011, edge, "someone_else")).toBe(false);
+    for (const mutation of [
+      { rolname: "other_rds_superuser_member" },
+      { grantor: "rds_master" },
+      { grantor: "supabase_admin" },
+      { grantor_super: false },
+      { admin_option: false },
+      { inherit_option: true },
+      { set_option: true },
+    ])
+      expect(
+        isRdsCreatorEdge(cfg, 170011, { ...edge, ...mutation }, "rds_master"),
+      ).toBe(false);
+    // The Supabase predicate never matches in rds mode, and vice versa.
+    expect(
+      isSupabaseCreatorEdge(cfg, 170011, {
+        ...edge,
+        rolname: "postgres",
+        grantor: "supabase_admin",
+      }),
+    ).toBe(false);
+  });
+
   test("runtime workload edge is exact, inheriting and granted only by the hosted creator or a superuser", () => {
     const cfg = {
       mode: "supabase" as const,
@@ -1174,7 +1281,7 @@ describe("per-step catalog sentinels", () => {
       readFileSync(
         join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
-      ),
+      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
     );
     for (let i = 0; i <= upTo; i++)
       await db.exec(readFileSync(steps[i]!.path, "utf8"));
@@ -1231,7 +1338,7 @@ describe("per-step catalog sentinels", () => {
       readFileSync(
         join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
-      ),
+      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
     );
     for (const st of steps) {
       expect(await sentinel(db, st.name), `${st.name} before`).toBe(false);
@@ -1349,7 +1456,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       readFileSync(
         join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
-      ),
+      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
     );
     await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
     return db;
@@ -1513,27 +1620,44 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const C = "upstream:20261105030000_canonical_feature_consumer_acks.sql";
     const D = "upstream:20261105031000_desktop_catalog_forget_reproject.sql";
     const K = "upstream:20261105032000_session_large_read_routing_fixes.sql";
+    const P = "upstream:20261105033000_canonical_project_events.sql";
     const S = "upstream:20261105035000_semantic_copy_state.sql";
     const E = "upstream:20261105036000_canonical_consumer_lease.sql";
     const F = "upstream:20261105037000_session_directory_document_pool.sql";
+    const R = "upstream:20261105034000_session_directory_read_api.sql";
+    const T = "upstream:20261105038000_claim_attempt_records_retirement.sql";
+    const G = "upstream:20261105039000_buffered_gc_single_candidate.sql";
+    const Z = "upstream:20261105040000_ingest_lazy_source_tables.sql";
+    const Y = "upstream:20261105041000_ingest_privacy_authority.sql";
+    const H = "upstream:20261105043000_brief_titles.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
-    const rollback = (name: string) =>
-      db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8"));
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
+    const rollback = async (name: string) => {
+      try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
+      catch (error) { await db.exec("ROLLBACK"); throw error; }
+    };
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
-    // 036000 is the latest lane: 035000, 032000, 031000 and 030000 all refuse while it is applied.
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H]));
+    // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
+    expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(R);
+    // 033000 cannot be removed under 034000 or any later ledgered step.
+    expect((await failure(rollback("20261105033000_canonical_project_events.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(P);
+    // Later lanes remain applied: 035000, 032000, 031000 and 030000 all refuse while it is applied.
     expect((await failure(rollback("20261105035000_semantic_copy_state.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105031000_desktop_catalog_forget_reproject.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105030000_canonical_feature_consumer_acks.down.sql")))?.code).toBe("55000");
     expect(await names()).toEqual(expect.arrayContaining([C, D, K, S, E]));
     const relation = async (name: string) =>
       (await db.query<{ r: string | null }>("SELECT to_regclass($1)::text r", [name])).rows[0]?.r ?? null;
+    const lazySrc = async () =>
+      (await db.query<{ s: string }>("SELECT string_agg(prosrc, '' ORDER BY oid) s FROM pg_proc WHERE oid IN ('sessions.ingest_lazy_user(jsonb,text,jsonb)'::regprocedure, 'sessions.ingest_lazy_begin(jsonb,text)'::regprocedure)")).rows[0]!.s;
     const catalogRpc = async () =>
       (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.session_directory_desktop_catalog(text,text,text)'::regprocedure")).rows[0]!.s;
     const routeRpc = async () =>
@@ -1555,7 +1679,70 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // Later lanes roll back first and remove their own ledger rows; only then
-    // can the next down preserve a gap-free applied prefix.
+    // 043000 (F2 brief titles) is the latest: 042000, 041000, 040000 and 039000 all refuse
+    // (55000) while it is applied, so it rolls back first.
+    expect(await names()).toContain(H);
+    expect((await failure(rollback("20261105042000_babysitter_evidence_retention.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain("upstream:20261105042000_babysitter_evidence_retention.sql");
+    expect((await failure(rollback("20261105041000_ingest_privacy_authority.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Y);
+    expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Z);
+    expect((await failure(rollback("20261105039000_buffered_gc_single_candidate.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(G);
+    await rollback("20261105043000_brief_titles.down.sql");
+    expect(await names()).not.toContain(H);
+    // Roll back the complete 041000..038000 suffix in descending order before earlier lanes.
+    // 042000 (babysitter retention) is the latest lane: 041000 refuses until it rolls back.
+    const BR = "upstream:20261105042000_babysitter_evidence_retention.sql";
+    expect(await names()).toContain(BR);
+    expect((await failure(rollback("20261105041000_ingest_privacy_authority.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Y);
+    await rollback("20261105042000_babysitter_evidence_retention.down.sql");
+    expect(await names()).not.toContain(BR);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.babysitter_retention_objects')::text r")).rows[0]?.r).toBeNull();
+    // 041000 is the latest lane: 040000 refuses while it is applied; its own down needs Neon authority (no row).
+    expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Z);
+    await db.query("INSERT INTO sessions.ingest_privacy_authority(state,control_epoch) VALUES('fenced',$1)", ["3".repeat(64)]);
+    expect((await failure(rollback("20261105041000_ingest_privacy_authority.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Y);
+    await db.query("DELETE FROM sessions.ingest_privacy_authority");
+    // 041000's own down refuses while any later upstream migration is ledgered.
+    await db.query(
+      "INSERT INTO sessions.__96bulls_migrations SELECT (jsonb_populate_record(NULL::sessions.__96bulls_migrations, to_jsonb(m) || jsonb_build_object('name', $2::text))).* FROM sessions.__96bulls_migrations m WHERE m.name = $1",
+      [Y, "upstream:20261105041500_later_fixture.sql"],
+    );
+    expect((await failure(rollback("20261105041000_ingest_privacy_authority.down.sql")))?.code).toBe("55000");
+    await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", ["upstream:20261105041500_later_fixture.sql"]);
+    expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
+    await rollback("20261105041000_ingest_privacy_authority.down.sql");
+    expect(await names()).not.toContain(Y);
+    // The 041000 down restores the EXACT 040000 lazy bodies (prefix exclusion), not 055000's.
+    expect((await lazySrc()).split("NOT LIKE 'ingest\\_frozen\\_source\\_%'").length).toBe(3);
+    expect(await lazySrc()).not.toContain("NOT IN('ingest_frozen_source_records'");
+    expect(await relation("sessions.ingest_privacy_authority")).toBeNull();
+    // 040000 is the latest lane: 039000 refuses while it is applied.
+    expect((await failure(rollback("20261105039000_buffered_gc_single_candidate.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(G);
+    await rollback("20261105040000_ingest_lazy_source_tables.down.sql");
+    expect(await names()).not.toContain(Z);
+    expect(await passed()).toBe(false);
+    expect((await failure(rollback("20261105038000_claim_attempt_records_retirement.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(T);
+    await rollback("20261105039000_buffered_gc_single_candidate.down.sql");
+    expect(await names()).not.toContain(G);
+    expect(await passed()).toBe(false);
+    // can the next down preserve a gap-free applied prefix. 038000 is the latest lane:
+    // 037000 and 036000 refuse while it is applied.
+    expect(await names()).toEqual(expect.arrayContaining([F, T]));
+    expect((await failure(rollback("20261105037000_session_directory_document_pool.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(F);
+    expect((await failure(rollback("20261105036000_canonical_consumer_lease.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.canonical_feature_consumer_lease")).toBe("sessions.canonical_feature_consumer_lease");
+    await rollback("20261105038000_claim_attempt_records_retirement.down.sql");
+    expect(await names()).not.toContain(T);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_attribute WHERE attrelid='sessions.ingest_claim_attempts'::regclass AND attname LIKE 'records\\_%' AND NOT attisdropped")).rows[0]?.n).toBe(0);
     await rollback("20261105037000_session_directory_document_pool.down.sql");
     expect(await names()).not.toContain(F);
     await rollback("20261105036000_canonical_consumer_lease.down.sql");
@@ -1567,6 +1754,17 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105035000_semantic_copy_state.down.sql");
     expect(await names()).not.toContain(S);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.search_feature_copy_state')::text r")).rows[0]?.r).toBeNull();
+    // 034000 (P3b) is now the latest lane: 032000 refuses until it rolls back (strictly descending).
+    expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
+    await rollback("20261105034000_session_directory_read_api.down.sql");
+    expect(await names()).not.toContain(R);
+    expect((await db.query<{ f: string | null }>("SELECT to_regprocedure('sessions.session_directory_activity_for(text,timestamptz,timestamptz)')::text f")).rows[0]?.f).toBeNull();
+    // With 034000 gone, 033000 is still a later lane; 032000 must keep refusing.
+    expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
+    await rollback("20261105033000_canonical_project_events.down.sql");
+    expect(await names()).not.toContain(P);
+    expect(await relation("sessions.canonical_project_events")).toBeNull();
+    expect(await relation("sessions.canonical_project_event_scopes")).toBeNull();
     await rollback("20261105032000_session_large_read_routing_fixes.down.sql");
     expect(await names()).not.toContain(K);
     expect(await relation("sessions.session_large_read_scope_errors")).toBeNull();
@@ -1587,10 +1785,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105024000_session_brief_documents.down.sql");
     expect(await names()).not.toContain(B);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBeNull();
-    // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 032000, 035000 and
-    // 036000; the post-validation exact-ACL check finds no drift.
+    // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 032000, 033000 (F10), 034000 (P3b),
+    // 035000 through 039000, 040000 (lazy source tables) and 041000 (privacy authority); the post-validation
+    // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, C, D, K, S, E]));
+    // Up again: 041000's exact source-table list is back in both lazy functions.
+    expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
@@ -1644,6 +1845,53 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     );
   });
 
+  test("RDS trust root: only AWS's fixed rdsadmin SUPERUSER is excluded, only in rds mode", async () => {
+    expect(Object.isFrozen(RDS_PLATFORM_SUPERUSERS)).toBe(true);
+    expect([...RDS_PLATFORM_SUPERUSERS]).toEqual(["rdsadmin"]);
+    const db = await supabaseLike();
+    await db.exec(
+      `${OWNER_FN_DEFAULT_REVOKE}; CREATE ROLE rdsadmin SUPERUSER NOLOGIN; CREATE ROLE rds_lookalike SUPERUSER NOLOGIN`,
+    );
+    const rds = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "rds",
+    );
+    // A second superuser stays covered, even with an RDS-like name.
+    expect(rds.satisfied).toBe(false);
+    expect(rds.excluded_platform_superusers.map((e) => e.role)).toEqual([
+      "rdsadmin",
+    ]);
+    expect(rds.sessions_create_roles).toContainEqual(
+      expect.objectContaining({ role: "rds_lookalike", function_default_exact: false }),
+    );
+    await db.exec("DROP ROLE rds_lookalike");
+    expect(
+      (await functionBoundaryEvidence(client(db), "global-default-revoke", "rds"))
+        .satisfied,
+    ).toBe(true);
+    for (const mode of ["selfhosted", "cloudsql", "supabase"] as const) {
+      const other = await functionBoundaryEvidence(
+        client(db),
+        "global-default-revoke",
+        mode,
+      );
+      expect(other.satisfied).toBe(false);
+      expect(other.excluded_platform_superusers.map((e) => e.role)).not.toContain(
+        "rdsadmin",
+      );
+    }
+    // The fixed name excluded only while it is SUPERUSER.
+    await db.exec("CREATE SCHEMA IF NOT EXISTS sessions; ALTER ROLE rdsadmin NOSUPERUSER; GRANT CREATE ON SCHEMA sessions TO rdsadmin");
+    const demoted = await functionBoundaryEvidence(
+      client(db),
+      "global-default-revoke",
+      "rds",
+    );
+    expect(demoted.excluded_platform_superusers).toEqual([]);
+    expect(demoted.satisfied).toBe(false);
+  });
+
   test("Cloud SQL owner and migration-role bootstraps produce catalog-proven, membership-free state", async () => {
     const db = new PGlite({
       username: "cloudsqladmin",
@@ -1693,13 +1941,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         "utf8",
       )}`,
     );
-    // As the superuser (cluster roles), then back to the role the test continues as.
-    await db.exec(
-      `RESET ROLE; ${readFileSync(
-        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
-        "utf8",
-      )}; SET ROLE migration_owner;`,
-    );
+    // No superuser role bootstrap may fill a missing Cloud SQL prerequisite here.
     const targets = await db.query<{
       rolname: string;
       rolcanlogin: boolean;
@@ -1711,10 +1953,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(4);
+    expect(targets.rows).toHaveLength(12);
+    expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
+    const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
+    const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);
+    expect(targets.rows.map(r => r.rolname).sort()).toEqual([...prerequisites].sort());
     expect(targets.rows).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -1727,6 +1973,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
           rolinherit: false,
           memberships: 0,
         }),
+        expect.objectContaining({
+          rolname: "bulls96_read_api",
+          rolcanlogin: false,
+          rolinherit: false,
+          rolbypassrls: false,
+          memberships: 0,
+        }),
       ]),
     );
     expect(
@@ -1734,6 +1987,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         `SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_cloudsql_role_seed'`,
       ),
     ).toMatchObject({ rows: [] });
+    // The added prerequisite shares the existing fail-closed, never-repair contract.
+    await db.exec("RESET ROLE; ALTER ROLE bulls96_read_api INHERIT; SET ROLE migration_owner");
+    expect((await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"), "utf8"))))?.code).toBe("55000");
+    expect((await db.query<{ rolinherit: boolean }>("SELECT rolinherit FROM pg_roles WHERE rolname='bulls96_read_api'")).rows[0]?.rolinherit).toBe(true);
   });
 
   test("platform trust root: supabase_admin as a superuser with no safe default is excluded in supabase mode (listed with its attributes); the same catalog fails without the exclusion (selfhosted)", async () => {
@@ -2284,6 +2541,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
             "utf8",
           ),
         );
+        await db.exec(
+          readFileSync(
+            join(
+              root,
+              "supabase/bootstrap/session_read_api_roles.sql",
+            ),
+            "utf8",
+          ),
+        );
         await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
         await db.exec(
           readFileSync(
@@ -2325,6 +2591,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               join(
                 root,
                 "supabase/bootstrap/session_ingest_roles.sql",
+              ),
+              "utf8",
+            ),
+          );
+          await db.exec(
+            readFileSync(
+              join(
+                root,
+                "supabase/bootstrap/session_read_api_roles.sql",
               ),
               "utf8",
             ),

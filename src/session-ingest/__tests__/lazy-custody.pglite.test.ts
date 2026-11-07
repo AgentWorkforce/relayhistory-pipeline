@@ -18,7 +18,7 @@ afterEach(async()=>{for(const close of open.splice(0).reverse())await close()});
 async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
+ for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
  for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.exec(read("supabase/migrations/"+f));
  await db.exec("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','"+generation+"','pass')");
  const owner=async(name:string,p:unknown)=>(await db.query("SELECT sessions."+name+"($1::jsonb) AS r",[JSON.stringify(p)])).rows[0]!.r as any;
@@ -117,17 +117,24 @@ test("committed NULL-session custody survives reset; no-op enable preserves curr
  const raw=await batch(records,{batch_id:"mixed-A"});await deliverBatch({...f.deps,custody:await f.packet(raw)},TENANT,raw);
  await f.send("move-B",record({record_id:"moving",session_id:"B",revision:2}));
  await f.control("selection",{origin_id:"origin-1",sessions:[{source:"claude",session_id:"B"}],enabled:false});
- const tickets=(await f.gc("claim",{limit:10})).tickets;
+ // Both retention decisions remain required;039 commits each on its own RPC.
+ const claimBoth=async()=>{
+  const tickets:any[]=[];
+  for(let i=0;i<2;i++)tickets.push(...(await f.gc("claim",{limit:1})).tickets);
+  expect(tickets).toHaveLength(2);expect(new Set(tickets.map(t=>t.stageToken)).size).toBe(2);
+  return tickets;
+ };
+ const tickets=await claimBoth();
  expect(tickets.find((t:any)=>t.groupOrdinals.flat().length===3).keepOrdinals).toEqual([1,2]);
  expect(tickets.find((t:any)=>t.groupOrdinals.flat().length===3).keepGroupIndexes.length).toBeGreaterThan(0);
  expect(tickets.find((t:any)=>t.groupOrdinals.flat().length===1).keepOrdinals).toEqual([]);
  await f.control("selection",{origin_id:"origin-1",sessions:[{source:"claude",session_id:"A"}],enabled:true});
  await f.db.exec("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1 second'");
- const enabled=(await f.gc("claim",{limit:10})).tickets.find((t:any)=>t.groupOrdinals.flat().length===3);
+ const enabled=(await claimBoth()).find((t:any)=>t.groupOrdinals.flat().length===3);
  expect(enabled.keepOrdinals).toEqual([1,2]);
  await f.control("reset",{request_id:"reset-real"});
  await f.db.exec("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1 second'");
- const reset=(await f.gc("claim",{limit:10})).tickets.find((t:any)=>t.groupOrdinals.flat().length===3);
+ const reset=(await claimBoth()).find((t:any)=>t.groupOrdinals.flat().length===3);
  expect(reset.keepOrdinals).toEqual([2]);
  await f.send("lower-null",record({record_id:"null",session_id:null,revision:1}),null,"3");
  expect((await f.seats("lower-null")).records[0].bodyAccepted).toBe(false);

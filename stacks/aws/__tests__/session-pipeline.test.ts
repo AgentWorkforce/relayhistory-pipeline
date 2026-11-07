@@ -36,6 +36,7 @@ const ROLE = `arn:aws:iam::${ACCOUNT}:role/session-pipeline-role`;
 const t = transcriptNames(STAGE, ACCOUNT);
 const p = sessionPipelineNames(STAGE, ACCOUNT, REGION);
 const example = JSON.parse(readFileSync(fileURLToPath(new URL("../examples/aws-sessions-prod.inputs.example.json", import.meta.url)), "utf8")) as AwsInputs;
+example.transcriptStore!.bufferedGcRoleArn = `arn:aws:iam::${ACCOUNT}:role/test-buffered-gc`;
 
 describe("session pipeline: grants", () => {
   it("the role may only decrypt via S3, for objects under 96bulls/ in this bucket", () => {
@@ -130,6 +131,9 @@ describe("session pipeline: wiring", () => {
     expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { briefs: { enabled: false, globalDailyCap: 5 } } }).SESSION_BRIEF_ENABLED).toBe("false");
     const on = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { briefs: { enabled: true, backgroundDailyBudget: 1000, globalDailyCap: 2000 } } });
     expect(on).toMatchObject({ SESSION_BRIEF_ENABLED: "true", SESSION_BRIEF_BACKGROUND_DAILY_BUDGET: "1000", SESSION_BRIEF_GLOBAL_DAILY_CAP: "2000" });
+    // The sweep is emitted only when set; absent keeps the worker default (0, off).
+    expect(Object.keys(on)).not.toContain("SESSION_BRIEF_SWEEP_SECONDS");
+    expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { briefs: { enabled: true, sweepSeconds: 300 } } }).SESSION_BRIEF_SWEEP_SECONDS).toBe("300");
     // The model key is never in env: it is read from the pipeline secret.
     expect(Object.keys(on)).not.toContain("OPENAI_API_KEY");
 
@@ -286,6 +290,11 @@ describe("session pipeline: inputs", () => {
     expect(() => validate(withPipeline({ briefs: { enabled: true, openai_api_key: "sk-x" } }))).toThrow(/briefs.openai_api_key is not a known setting/);
     expect(() => validate(withPipeline({ briefs: { enabled: true, globalDailyCap: -1 } }))).toThrow(/globalDailyCap/);
     expect(() => validate(withPipeline({ briefs: { enabled: true, backgroundDailyBudget: 1.5 } }))).toThrow(/backgroundDailyBudget/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, sweepSeconds: 300 } }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, sweepSeconds: 0 } }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, sweepSeconds: 86_401 } }))).toThrow(/sweepSeconds/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, sweepSeconds: 2.5 } }))).toThrow(/sweepSeconds/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, sweepSeconds: "60" } }))).toThrow(/sweepSeconds/);
     expect(() => validate(withPipeline({ briefs: [] }))).toThrow(/briefs must be a plain object/);
     expect(() => validate(withPipeline({ briefs: null }))).toThrow(/briefs must be a plain object/);
   });

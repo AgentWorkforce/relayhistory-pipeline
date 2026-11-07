@@ -4,6 +4,7 @@
  * `chunksAreServerSealed`, the RelayHistory transform's `readRelayhistoryExport`
  * and the projection, and the reader's SQL runs against a Neon-shaped PGlite.
  */
+import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,8 +22,10 @@ import {
   readAll,
   readRelayhistoryExport,
   relayhistoryExportProvenance,
+  ObjectStoreError,
   type ObjectStore,
 } from "../../shared/vendor.ts";
+import { manifestClaim, obligatedStore } from "../neon-s3-sync/obligated-store.ts";
 import { canonicalManifestIdentity } from "../../shared/manifest-identity.ts";
 import { chunksAreServerSealed } from "../../alleyoop/manifests.ts";
 import { SCRUB_RULESET_VERSION } from "../../shared/vendor.ts";
@@ -32,8 +35,24 @@ import { storeEraser } from "../neon-s3-erasure/eraser.ts";
 import { ErasureJob, DEFAULT_ERASURE_CONFIG } from "../neon-s3-erasure/job.ts";
 import { boundStrings, EXPORT_KINDS, fencedGroups, MAX_STRING_TOKEN, neonUnitSource, readOnly, sessionUnits, type SessionUnit, type StreamLine, type UnitSource } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
+
+/**
+ * TEST-ONLY: exporter-path completion is opted into explicitly through the job's test seam
+ * (ErasureConfig.obligationsSettled; production never sets it). The state file itself can never attest.
+ */
+const SETTLED_CFG = { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true };
+const attestedState = (path: string) => new SyncState(path, { obligations: OBLIGATIONS_MODE === "on" });
 import { Syncer, DEFAULT_SYNC_CONFIG } from "../neon-s3-sync/sync.ts";
 import { Throttle, parseWindows } from "../neon-s3-sync/throttle.ts";
+
+// These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
+// The suite's OWN mode, pinned per module (never inherited from another file's leaked env): ON, or OFF when
+// imported as "?mode=off" (the *.off.test.ts wrappers). Re-applied before every test.
+const OBLIGATIONS_MODE: "on" | "off" = new URL(import.meta.url).searchParams.get("mode") === "off" ? "off" : "on";
+const __modeBefore = process.env.S3X_OBLIGATIONS;
+process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE;
+__modeBeforeEach(() => void (process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE));
+__modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OBLIGATIONS; else process.env.S3X_OBLIGATIONS = __modeBefore; });
 
 const dirs: string[] = [];
 afterAll(async () => {
@@ -253,7 +272,7 @@ describe("scrub rule set 2: long strings stored whole", () => {
   });
 
   test("--reexport-truncated queues every ledgered group as changed", async () => {
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     state.seeRevisions(1, [{ org_id: "o", session_id: "t", revision: "1" }, { org_id: "o", session_id: "u", revision: "1" }]);
     state.markExported("o", "t", 1, ["96bulls/o/v1/k/manifest.json"], Date.now());
     state.markExported("o", "u", 1, ["96bulls/o/v1/j/manifest.json"], Date.now());
@@ -365,7 +384,7 @@ describe("delete propagation", () => {
   test("a session hard-deleted from Neon (no units left) loses every object, including pipeline outputs", async () => {
     const { store } = await countingStore();
     const t = target(store);
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const db = fakeDb([unit("org-a")]);
     const syncer = new Syncer(db, state, t, fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => fixedSource(baseRecords()));
     state.seeRevisions(1, [{ org_id: "org-a", session_id: "sess:with:colons-1", revision: "5" }]);
@@ -389,7 +408,7 @@ describe("delete propagation", () => {
   test("the erasure job erases an exported group that has no rollups left, and leaves the rest", async () => {
     const { store } = await countingStore();
     const t = target(store);
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const gone = await exportUnit(t, unit("o1", { sessionId: "gone" }), fixedSource(baseRecords().slice(0, 1)));
     const kept = await exportUnit(t, unit("o1", { sessionId: "kept" }), fixedSource(baseRecords().slice(0, 1)));
     state.seeRevisions(1, [{ org_id: "o1", session_id: "kept", revision: "1" }]);
@@ -399,7 +418,7 @@ describe("delete propagation", () => {
     const fresh = await exportUnit(t, unit("o1", { sessionId: "fresh" }), fixedSource(baseRecords().slice(0, 1)));
     state.markExported("o1", "fresh", 1, fresh.manifests.map((m) => m.manifestKey), Date.now() + 60_000);
     const db = sweepDb([{ org_id: "o1", session_id: "kept", last_ms: "1", events: "1" }]);
-    const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    const job = new ErasureJob(db, state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
     await job.sweep();
     await job.drain();
     expect(await allKeys(store, "96bulls/o1/v1")).toEqual(
@@ -410,7 +429,7 @@ describe("delete propagation", () => {
     );
     expect(state.exported("o1", "gone")!.keys).toEqual([]);
     // a sweep that read nothing never erases
-    const empty = new ErasureJob(sweepDb([]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    const empty = new ErasureJob(sweepDb([]), state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
     await empty.sweep();
     expect(state.erasureBacklog().queued).toBe(0);
     state.close();
@@ -418,12 +437,12 @@ describe("delete propagation", () => {
 
   test("an exported session Neon has only in the catalog (no rollup) is never erased", async () => {
     const { store } = await countingStore();
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const r = await exportUnit(target(store), unit("o1", { sessionId: "cat-only" }), fixedSource(baseRecords().slice(0, 1)));
     state.markExported("o1", "cat-only", 0, r.manifests.map((m) => m.manifestKey), Date.now() - 1000);
     const job = new ErasureJob(
       sweepDb([{ org_id: "o9", session_id: "x", last_ms: "1", events: "1" }], [], [{ org_id: "o1", session_id: "cat-only" }]),
-      state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {},
+      state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {},
     );
     await job.sweep();
     await job.drain();
@@ -434,11 +453,11 @@ describe("delete propagation", () => {
 
   test("the erasure job erases a group a deletion fence covers", async () => {
     const { store } = await countingStore();
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const r = await exportUnit(target(store), unit("o1", { sessionId: "s1" }), fixedSource(baseRecords().slice(0, 1)));
     state.seeRevisions(1, [{ org_id: "o1", session_id: "s1", revision: "1" }]);
     state.markExported("o1", "s1", 1, r.manifests.map((m) => m.manifestKey), Date.now() - 1000);
-    const job = new ErasureJob(sweepDb([{ org_id: "o1", session_id: "s1", last_ms: "1", events: "1" }], [{ org_id: "o1", session_id: "s1" }]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    const job = new ErasureJob(sweepDb([{ org_id: "o1", session_id: "s1", last_ms: "1", events: "1" }], [{ org_id: "o1", session_id: "s1" }]), state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
     await job.sweep();
     await job.drain();
     expect(await allKeys(store)).toEqual([]);
@@ -447,7 +466,7 @@ describe("delete propagation", () => {
 
   test("the eraser refuses keys outside the item's org or session layout; a leased session waits", async () => {
     const { store } = await countingStore();
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const r = await exportUnit(target(store), unit("org-b"), fixedSource(baseRecords().slice(0, 1)));
     const prefixB = r.manifests[0]!.manifestKey.replace("manifest.json", "");
     state.enqueueErasure([
@@ -458,10 +477,10 @@ describe("delete propagation", () => {
     expect(job.counters.refused).toBe(2);
     expect((await allKeys(store, "96bulls/org-b")).length).toBeGreaterThan(0);
     // lease held by the exporter: the erasure is deferred, not done
-    const s2 = new SyncState(join(await tempDir(), "s.sqlite"));
+    const s2 = attestedState(join(await tempDir(), "s.sqlite"));
     s2.enqueueErasure([{ key: prefixB, kind: "prefix", org_id: "org-b", reason: "test" }]);
     expect(s2.acquireLease(prefixB, "exporter:1")).toBe(true);
-    const j2 = new ErasureJob(fakeDb([]), s2, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    const j2 = new ErasureJob(fakeDb([]), s2, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
     expect(await j2.drain()).toBe(0);
     expect(j2.counters.deferred).toBe(1);
     s2.releaseLeases("exporter:1", [prefixB]);
@@ -474,7 +493,7 @@ describe("delete propagation", () => {
   test("an orphan the exporter references again is cancelled, never erased", async () => {
     const { store } = await countingStore();
     const t = target(store, { maxChunkBytes: 200 });
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const records = baseRecords().slice(0, 3);
     const syncer = new Syncer(fakeDb([unit("org-a")]), state, t, fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => fixedSource(records));
     const w = (rev: number) => ({ org_id: "org-a", session_id: "sess:with:colons-1", revision: rev, kind: "changed" as const, events: 3 });
@@ -503,7 +522,7 @@ describe("ownership and failure bookkeeping", () => {
   test("a failed run records the keys it wrote under, so a later erasure still removes them", async () => {
     const { store } = await countingStore();
     const t = target(store);
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const failing: UnitSource = {
       fenced: async () => false,
       async *lines() {
@@ -520,7 +539,7 @@ describe("ownership and failure bookkeeping", () => {
     expect(row.keys).toHaveLength(1);
     expect((await allKeys(store)).length).toBeGreaterThan(0); // sealed chunks, no manifest
     // Neon then hard-deletes the session: the erasure job's sweep no longer sees it and erases the prefix.
-    const job = new ErasureJob(sweepDb([{ org_id: "org-z", session_id: "other", last_ms: "1", events: "1" }]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    const job = new ErasureJob(sweepDb([{ org_id: "org-z", session_id: "other", last_ms: "1", events: "1" }]), state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
     await job.sweep();
     await job.drain();
     expect(await allKeys(store)).toEqual([]);
@@ -529,7 +548,7 @@ describe("ownership and failure bookkeeping", () => {
 
   test("the truncation ledger records every cut manifest and clears when the group is re-exported whole", async () => {
     const { store } = await countingStore();
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     let huge = true;
     const src: UnitSource = {
       fenced: async () => false,
@@ -555,7 +574,7 @@ describe("ownership and failure bookkeeping", () => {
   });
 
   test("a failed group is retried at once when its revision moves; a fence forces a re-export", async () => {
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const now = Date.now();
     state.seeRevisions(1, [{ org_id: "o", session_id: "s", revision: "3" }, { org_id: "o", session_id: "f", revision: "1" }]);
     state.seeActivity(1, [{ org_id: "o", session_id: "s", last_ms: String(now), events: "1" }, { org_id: "o", session_id: "f", last_ms: String(now), events: "1" }]);
@@ -570,7 +589,7 @@ describe("ownership and failure bookkeeping", () => {
   });
 
   test("a fence revives a failure past its attempt cap, once", async () => {
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     let now = Date.now();
     state.seeRevisions(1, [{ org_id: "o", session_id: "x", revision: "1" }]);
     for (let i = 0; i < 8; i++) state.markFailed("o", "x", "57014", ["96bulls/o/v1/b/manifest.json"], 1, now);
@@ -585,7 +604,7 @@ describe("ownership and failure bookkeeping", () => {
   test("a stale key that is not this exporter's does not stop the group's own erasure", async () => {
     const { store } = await countingStore();
     const t = target(store);
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const own = await exportUnit(t, unit("org-a"), fixedSource(baseRecords().slice(0, 1)));
     const other = await exportUnit(t, unit("org-a", { sessionId: "other" }), fixedSource(baseRecords().slice(0, 1)));
     state.seeRevisions(1, [{ org_id: "org-a", session_id: "sess:with:colons-1", revision: "2" }]);
@@ -627,7 +646,7 @@ describe("ownership and failure bookkeeping", () => {
     const m = JSON.parse(await readText(store, key));
     m.raw.owner = m.writer.delivery_instance_id = "client-1";
     await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(m)));
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const syncer = new Syncer(fakeDb([unit("org-a")]), state, t, fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false, () => fixedSource(baseRecords()));
     expect(await syncer.processGroup({ org_id: "org-a", session_id: "sess:with:colons-1", revision: 1, kind: "recent", events: 1 })).toBe(false);
     expect(state.exported("org-a", "sess:with:colons-1")!.keys).toEqual([]);
@@ -635,7 +654,7 @@ describe("ownership and failure bookkeeping", () => {
   });
 
   test("a restarted exporter releases its predecessor's leases, never the eraser's", async () => {
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     expect(state.acquireLease("p1/", "exporter:1")).toBe(true);
     expect(state.acquireLease("p2/", "eraser:9")).toBe(true);
     expect(state.releaseStaleLeases("exporter:", "exporter:2")).toBe(1);
@@ -645,7 +664,7 @@ describe("ownership and failure bookkeeping", () => {
   });
 
   test("keys of a run that died mid-group are recovered at the next start; a lost lease stops the write", async () => {
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     state.recordPendingKey("o", "s", "96bulls/o/v1/k/manifest.json");
     expect(state.recoverPendingKeys()).toBe(1);
     expect(state.exported("o", "s")).toMatchObject({ error: "interrupted", keys: ["96bulls/o/v1/k/manifest.json"] });
@@ -685,7 +704,7 @@ describe("ownership and failure bookkeeping", () => {
     const { store } = await countingStore();
     const t = target(store, { maxChunkBytes: 200 });
     const path = join(await tempDir(), "s.sqlite");
-    const state = new SyncState(path);
+    const state = attestedState(path);
     let release!: () => void;
     const hang = new Promise<void>((r) => (release = r));
     const src: UnitSource = {
@@ -701,10 +720,10 @@ describe("ownership and failure bookkeeping", () => {
     await new Promise((r) => setTimeout(r, 200));
     expect((await allKeys(store)).length).toBeGreaterThan(0); // chunks sealed, no manifest
     // A new process on the same state file.
-    const after = new SyncState(path);
+    const after = attestedState(path);
     expect(after.recoverPendingKeys()).toBe(1);
     after.releaseStaleLeases("exporter:", "exporter:new");
-    const job = new ErasureJob(sweepDb([{ org_id: "org-z", session_id: "other", last_ms: "1", events: "1" }]), after, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, () => Date.now() + 60_000, async () => {});
+    const job = new ErasureJob(sweepDb([{ org_id: "org-z", session_id: "other", last_ms: "1", events: "1" }]), after, storeEraser(store), () => {}, SETTLED_CFG, () => Date.now() + 60_000, async () => {});
     await job.sweep();
     await job.drain();
     expect(await allKeys(store)).toEqual([]);
@@ -743,7 +762,7 @@ describe("prefixes and tenant isolation", () => {
     expect((await allKeys(store)).length).toBe(keysA.length + keysB.length);
     // An org-b key is never erasable for org-a.
     expect(await erasableByExporter(t, "org-a", b.manifests[0]!.manifestKey)).toBe(false);
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     state.enqueueErasure(a.manifests.map((m) => ({ key: m.manifestKey.replace("manifest.json", ""), kind: "prefix" as const, org_id: "org-a", reason: "test" })));
     await drainErasures(state, store);
     state.close();
@@ -798,7 +817,7 @@ describe("throttle", () => {
 describe("run loop", () => {
   test("lanes pull continuously: a slow group does not hold the others; every group is exported once", async () => {
     const { store } = await countingStore();
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const now = Date.now();
     const ids = Array.from({ length: 40 }, (_, i) => `s${i}`);
     state.seeRevisions(1, ids.map((id) => ({ org_id: "org-a", session_id: id, revision: "1" })));
@@ -841,7 +860,7 @@ describe("run loop", () => {
 
 describe("work order", () => {
   test("changed (past debounce) before recent before history, newest first", async () => {
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const now = Date.parse("2026-10-31T16:00:00Z");
     const day = 86_400_000;
     state.seeRevisions(1, ["old", "new", "mid", "chg"].map((s) => ({ org_id: "o", session_id: s, revision: "2" })));
@@ -1015,7 +1034,7 @@ describe("Neon reader SQL (Neon-shaped PGlite)", () => {
     const read = await readRelayhistoryExport(m, store, (b) => new Uint8Array(zstdDecompressSync(b)), { prefix: "96bulls/o1" });
     expect(read.map((x) => x.kind).sort()).toEqual(["presence", "session", "session_event"]);
     // The exporter's activity sweep sees it.
-    const state = new SyncState(join(await tempDir(), "s.sqlite"));
+    const state = attestedState(join(await tempDir(), "s.sqlite"));
     const syncer = new Syncer(db, state, target(store), fastThrottle(), () => {}, DEFAULT_SYNC_CONFIG, () => false);
     await syncer.sweepActivity();
     expect(state.nextWork(Date.parse("2026-10-21T00:00:00Z"), 14 * 86_400_000, 10).map((w) => w.session_id)).toEqual(["c1"]);
@@ -1096,14 +1115,14 @@ function fakeDb(units: SessionUnit[]): Queryable & { units: SessionUnit[] } {
 
 /** The erasure job over a plain store, draining what is queued. */
 async function drainErasures(state: SyncState, store: ObjectStore) {
-  const job = new ErasureJob(fakeDb([]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+  const job = new ErasureJob(fakeDb([]), state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
   while ((await job.drain()) > 0);
   return job;
 }
 
 /** Queue a unit result's orphans as the exporter does, then erase them. */
 async function eraseOrphans(store: ObjectStore, org: string, r: { manifests: { orphans: string[] }[] }) {
-  const state = new SyncState(join(await tempDir(), "s.sqlite"));
+  const state = attestedState(join(await tempDir(), "s.sqlite"));
   state.enqueueErasure(r.manifests.flatMap((m) => m.orphans.map((key) => ({ key, kind: "object" as const, org_id: org, reason: "unreferenced" }))));
   await drainErasures(state, store);
   state.close();
@@ -1170,7 +1189,7 @@ describe("SSE-KMS key id (sessions-prod bucket policy)", () => {
   test("every put names aws:kms and the key ARN, signed", async () => {
     const { createS3Store } = await import("../../shared/vendor.ts");
     const seen: Headers[] = [];
-    const key = "arn:aws:kms:us-east-1:941433935742:key/c74376a5-f6ff-4ef0-9a26-543c940094ba";
+    const key = "arn:aws:kms:us-east-1:111122223333:key/11111111-2222-4333-8444-555555555555";
     const store = createS3Store({
       bucket: "b",
       region: "us-east-1",
@@ -1188,4 +1207,102 @@ describe("SSE-KMS key id (sessions-prod bucket policy)", () => {
     expect(h.get("x-amz-server-side-encryption-aws-kms-key-id")).toBe(key);
     expect(h.get("authorization")).toContain("x-amz-server-side-encryption-aws-kms-key-id");
   });
+});
+
+/**
+ * #309 P1: the REAL exportUnit publication boundary against an E3 reservation. The manifest claim (obligated-store.ts
+ * manifestClaim, exactly what Syncer.processGroup passes as onPublish) runs BEFORE the manifest PUT and covers every
+ * referenced object (new and reused chunks, and the manifest): a reserve-first erasure refuses the manifest; a
+ * publish-first claim refuses the reservation; never a manifest referencing an erased version. The manifest PUT is an
+ * obligation too: an unknown outcome stays tracked.
+ */
+// The obligation protocol (S3X_OBLIGATIONS on) only: the claim / reservation interlock does not exist when off.
+let onInterlockRan = false;
+describe.skipIf(OBLIGATIONS_MODE !== "on")("exporter publication vs E3 reservation (real exportUnit)", () => {
+  // A probe that only EXECUTES when this suite is not skipped (registration alone runs the callback either way).
+  test("guard probe: the interlock suite executes, on a per-instance ON fixture", async () => {
+    const st = attestedState(join(await tempDir(), "s.sqlite"));
+    expect(st.obligations).toBe(true); // the fixture's own mode, not whatever the process env holds
+    st.close();
+    onInterlockRan = true;
+  });
+  async function world() {
+    const { store } = await countingStore();
+    const st = attestedState(join(await tempDir(), "s.sqlite"));
+    // Exactly the Syncer's wiring: lease (with its generation) on the manifest prefix, obligated store, manifest claim.
+    const opts = (acked: Map<string, string>) => {
+      const gens: Record<string, string> = {};
+      return {
+        onLease: (k: string) => {
+          const p = k.slice(0, -"manifest.json".length);
+          if (!st.acquireLease(p, "exporter:test")) throw Object.assign(new Error("busy"), { code: "prefix_busy" });
+          gens[p] = st.leaseGen(p)!;
+        },
+        onPublish: manifestClaim(st, acked, "exporter:test", gens),
+      };
+    };
+    const run = async (records: DeliveryRecord[], wrap: (s: ObjectStore) => ObjectStore = (s) => s) => {
+      const acked = new Map<string, string>();
+      return exportUnit(target(wrap(obligatedStore(store, st, "exporter:test", acked)), { maxChunkBytes: 200 }), unit("org-a"), fixedSource(records), opts(acked));
+    };
+    return { store, st, run, opts };
+  }
+  const recs1 = () => baseRecords().slice(0, 3);
+  const recs2 = () => [...baseRecords().slice(0, 3), rec("session_event", "origin-a", "e-9", { ts_ms: T0 + 2500, role: "user", text: "later" }, "4", "14")];
+
+  test("reserve FIRST: E3 reserved a reused chunk -> the next manifest is refused (not written); the old manifest stays", async () => {
+    const w = await world();
+    const r1 = await w.run(recs1());
+    const m = r1.manifests[0]!;
+    const prefix = m.manifestKey.slice(0, -"manifest.json".length);
+    const reused = m.referenced.find((k) => k.includes("/raw/"))!;
+    const before = await readText(w.store, m.manifestKey);
+    // E3: the prefix is queued (ownership ends), and a page reserves the reused chunk's version.
+    w.st.enqueueErasure([{ key: prefix, kind: "prefix", org_id: "org-a", reason: "fenced" }]);
+    expect(w.st.reserveErase(prefix, w.st.obligationRev(prefix), "e3-test", [{ key: reused, versionId: "null" }]).ok).toBe(true);
+    // The exporter's next run would reference that reused chunk: its claim is refused BEFORE the manifest PUT.
+    expect(await w.run(recs2()).then(() => "written", (e) => e.code)).toBe("publish_reserved");
+    expect(await readText(w.store, m.manifestKey)).toBe(before);
+  });
+
+  test("publish FIRST: once the manifest claim is made, an E3 reservation of a referenced (reused) version is refused", async () => {
+    const w = await world();
+    const r1 = await w.run(recs1());
+    const m = r1.manifests[0]!;
+    const prefix = m.manifestKey.slice(0, -"manifest.json".length);
+    const reused = m.referenced.find((k) => k.includes("/raw/"))!;
+    let reserveAtManifestPut: boolean | undefined;
+    // E3 tries to reserve exactly when the manifest PUT is about to go out (the claim already ran).
+    const r2 = await w.run(recs2(), (s) => ({
+      ...s,
+      put: async (k, b, o) => {
+        if (String(k) === m.manifestKey) reserveAtManifestPut = w.st.reserveErase(prefix, w.st.obligationRev(prefix), "e3-test", [{ key: reused, versionId: "null" }]).ok;
+        return s.put(k, b, o);
+      },
+    }));
+    expect(reserveAtManifestPut).toBe(false);
+    expect(r2.manifests[0]!.written).toBe(true);
+    expect(w.st.publishedUnder(prefix).map((p) => p.key)).toContain(reused);
+  });
+
+  test("an unknown manifest PUT outcome stays tracked (dispatched), keeping the prefix unresolved for E3", async () => {
+    const w = await world();
+    const r1 = await w.run(recs1());
+    const m = r1.manifests[0]!;
+    const prefix = m.manifestKey.slice(0, -"manifest.json".length);
+    const failing = (s: ObjectStore): ObjectStore => ({ ...s, put: async (k, b, o) => {
+      if (String(k) === m.manifestKey) throw new ObjectStoreError("transient", "fs", "timeout (outcome unknown)");
+      return s.put(k, b, o);
+    } });
+    // The obligated store sits INSIDE the failing wrapper here, so wrap the base store instead.
+    const acked = new Map<string, string>();
+    const st = w.st;
+    await expect(exportUnit(target(obligatedStore(failing(w.store), st, "exporter:test", acked), { maxChunkBytes: 200 }), unit("org-a"), fixedSource(recs2()), w.opts(acked))).rejects.toThrow();
+    expect(st.unresolvedWrites(prefix).filter((i) => i.key === m.manifestKey && i.outcome === "dispatched").length).toBe(1);
+  });
+});
+
+// Guard: in the ON run this suite MUST be registered and run; only the "?mode=off" wrapper may skip it.
+test(`mode guard (${OBLIGATIONS_MODE}): the ON-only exportUnit interlock suite EXECUTES exactly when ON`, () => {
+  expect(onInterlockRan).toBe(OBLIGATIONS_MODE === "on");
 });

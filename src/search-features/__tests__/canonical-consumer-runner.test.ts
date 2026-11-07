@@ -5,9 +5,9 @@ import type { CanonicalConsumer }
   from "../canonical-consumer.ts";
 
 const A = "a".repeat(64);
-const CANARY = { orgId: "c4fae7b9-43a9-44e8-94d5-455aa579d67b",
-  workspaceId: "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63" };
-const CFG = { enabled: true, targetId: "t", ownerId: "me",
+const CANARY = { orgId: "10000000-0000-4000-8000-000000000001",
+  workspaceId: "20000000-0000-4000-8000-000000000002" };
+const CFG = { enabled: true, scope: CANARY, partitionScheme: "legacy-prefix-v1" as const, targetId: "t", ownerId: "me",
   leaseTtlMs: 60000, maxRetries: 0, pageSize: 100,
   pollIntervalMs: 50, deadlineMs: 300 };
 const empty = { copied: 0, dead: 0, skipped: 0, checkpoint: "0" };
@@ -128,4 +128,34 @@ describe("canonical consumer runner — cooperative deadline proof", () => {
     await r.run();
     expect(Date.now() - t0).toBeLessThan(500);   // bounded, not 60s
   });
+});
+
+
+test("runner snapshots explicit enablement instead of accepting later caller mutation", async () => {
+  let drains = 0;
+  const cfg = { ...CFG, enabled: false, scope: { ...CANARY } };
+  const r = new CanonicalConsumerRunner({ drain: async () => {
+    drains++; return { ...empty, status: "idle" };
+  } } as never, images as never, ch as never, cfg);
+  cfg.enabled = true;
+  expect((await r.run()).enabled).toBe(false);
+  expect(drains).toBe(0);
+});
+
+test("runner factory snapshots scope before the first run", async () => {
+  let copiedImages = 0;
+  const cfg = { ...CFG, deadlineMs: 60, scope: { ...CANARY } };
+  const db = { query: async <T>(sql: string) => ({ rows:
+    (sql.startsWith("SELECT rev FROM")
+      ? [] : [{ n: 1 }]) as T[] }) };
+  const journal = { entries: async () => ({ entries: [{ revision: "1",
+    scope: { ...CANARY, workspaceId: "other-ws" } }], hasMore: false }) };
+  const r = CanonicalConsumerRunner.make(db, journal as never, {} as never,
+    { imageDescriptor: async () => {
+      copiedImages++; throw new Error("unexpected_image");
+    } } as never, ch as never, cfg);
+  cfg.scope.workspaceId = "other-ws";
+  const health = await r.run();
+  expect(health.skipped).toBeGreaterThan(0);
+  expect(copiedImages).toBe(0);
 });

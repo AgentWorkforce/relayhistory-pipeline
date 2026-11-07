@@ -51,9 +51,15 @@ The remaining ~7% are 503s, mostly a 5 s bounded custody-witness statement on Ne
   runs `cutover-ceremony.ts --admit-new-orgs` every 120 s from the launchd agent `mini/launchd/dev.agentworkforce.bulls-admit-new-orgs.plist`
   on sf-mac-mini. It copies the live policy's epoch, baseline, retention and generation, and never changes existing rows. Move it into the cloud.
 - **Admission expiry.** Every admission row expires 2026-12-05T05:49:28Z. Renew it before then (owner UPDATE of `valid_until`, not a re-insert), or every org closes.
-- **Replica queue.** `relayhistory-neon-replica` is PAUSED with about 12.9k pre-switch s3_first ACKs whose Neon copies never landed.
-  Messages expire after 4 days (oldest around 2026-11-08 00:00Z). They must be recovered into the new read path; do not resume them into Neon
-  (`active` refuses those writes). The DLQ holds 247.
+- **Replica queue.** At the switch, `relayhistory-neon-replica` was paused with about 12.9k pre-switch s3_first ACKs whose Neon copies never landed.
+  They must be recovered into the new read path; do not resume them into Neon (`active` refuses those writes).
+  - **Observed 2026-11-07 (read-only Cloudflare metadata, 20:52-20:55Z):** delivery is no longer paused (`delivery_paused=false`,
+    queue last modified 2026-11-05T07:05:26Z, consumer `relayhistory-api`, max_retries 10). The main backlog is 0, so those messages were
+    delivered or dead-lettered. Where each one ended up is not verified. Who unpaused it is not recorded.
+  - **DLQ.** `relayhistory-neon-replica-dlq` holds 247 messages (about 2.3 MB) and has no consumer. Its retention was raised from 4 to
+    14 days on 2026-11-07 at 20:57:51Z by one retention-only PATCH, with a readback showing every other field unchanged. Cloudflare does
+    not document that this extends messages already enqueued. These envelopes are the only copy of the small batches' revision ids and
+    digests, so keep them until the recovery into the new read path is verified.
 - **Note:** relayhistory's Deploy Production pins the replica consumer to `max_concurrency` 4.
 
 ## Rollback (fail-closed, manual)
