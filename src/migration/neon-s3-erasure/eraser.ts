@@ -38,6 +38,195 @@ export function inSessionAnyDate(base: string, sessionSegment: string, key: stri
   return !!m && m[1] === sessionSegment;
 }
 
+/**
+ * THE shared strict, paged, resumable eraser primitive (Babysitter retention, the F1 analysis
+ * sweeper and the E3 job all compose this one implementation; consumers persist the returned
+ * checkpoint in their own durable state and must not fork the traversal).
+ *
+ * `eraseStep` runs ONE bounded invocation: strict pages (complete Key/VersionId/IsLatest,
+ * exact key+version identity, recognized pagination with both markers equal to the last
+ * entry, every key under the prefix, no duplicate in a page, monotonic cursor, no cycle) and
+ * exact-version deletes of the selected entries, with `authorize()` re-checked before every
+ * page's deletes. It never reports erasure: `traversed` means one full pass ended; only
+ * `verifyErased` (a fresh strict zero inventory, under the consumer's current fence) proves it.
+ * On budget exhaustion it returns `incomplete` with a checkpoint covering exactly the progress
+ * whose deletes succeeded. A crash or lost response simply reuses the previous checkpoint: the
+ * relist is idempotent (deleted versions are gone; delete-by-version of a gone one is a no-op).
+ *
+ * The checkpoint is content-free beyond object keys (hash-named) and is BOUND to the bucket,
+ * the prefix and the consumer's `scope` (operation, tenant/session, generation, fence, lease
+ * owner digest); a mismatched checkpoint is refused, never adopted. Resumption is at a
+ * completed-key boundary (`afterKey`, S3 key-marker only), so a deleted marker version can
+ * never strand the cursor; only a single key with more versions than one page uses the
+ * provider's in-key markers, and a provider that rejects them (400: its marker version was
+ * deleted) restarts at `afterKey` within the same bounded run.
+ */
+export interface EraseCheckpoint {
+  v: 1;
+  bucket: string;
+  prefix: string;
+  scope: string;
+  /** Every version of every key <= afterKey (C order) was processed. null: from the start. */
+  afterKey: string | null;
+  /** In-key provider continuation (a key with more versions than one page). */
+  inKey: { key: string; versionId: string } | null;
+}
+export interface ListedVersion { key: string; versionId: string; latest: boolean; deleteMarker: boolean; lastModified?: number }
+export interface EraseBudget {
+  /** Versions listed per invocation (hard ceiling 10,000). */
+  versions?: number;
+  /** Pages per invocation (hard ceiling 100). */
+  pages?: number;
+  /** Absolute ms; no new page or delete batch starts at or after it. */
+  deadlineAt?: number;
+}
+export interface EraseStepOptions {
+  /** Consumer scope digest: operation, tenant/session, generation, fence, lease owner. */
+  scope: string;
+  checkpoint?: EraseCheckpoint | null;
+  /** Which listed versions to delete (default: all). */
+  select?: (v: ListedVersion) => boolean;
+  /** Re-checks current authority (lease, generation, fence); throws to stop before any delete. */
+  authorize: () => Promise<void>;
+  budget?: EraseBudget;
+  now?: () => number;
+}
+export type EraseStepResult =
+  | { status: "incomplete"; checkpoint: EraseCheckpoint; deleted: number; listed: number; reason: "versions" | "pages" | "deadline" }
+  | { status: "traversed"; deleted: number; listed: number };
+export type ErasedProof =
+  | { status: "erased"; listed: number }
+  | { status: "pending"; reason: "remaining" | "budget"; remaining: number; listed: number };
+export interface PagedEraser {
+  eraseStep(prefix: string, opts: EraseStepOptions): Promise<EraseStepResult>;
+  /** A fresh, strict, full traversal from the start: erased only when zero selected versions remain. */
+  verifyErased(prefix: string, opts: { select?: (v: ListedVersion) => boolean; authorize: () => Promise<void>; budget?: EraseBudget; now?: () => number }): Promise<ErasedProof>;
+}
+export const ERASE_RUN_MAX_VERSIONS = 10_000;
+export const ERASE_RUN_MAX_PAGES = 100;
+const MAX_CURSOR_RESTARTS = 3;
+
+interface StrictPage { entries: ListedVersion[]; truncated: boolean; nextKey?: string; nextVersion?: string }
+type PageFetcher = (prefix: string, keyMarker?: string, versionMarker?: string) => Promise<StrictPage>;
+const cmpC = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Validates one strict page against the prefix and the requested cursor. */
+function checkPage(prefix: string, page: StrictPage, keyMarker?: string, versionMarker?: string): void {
+  const seen = new Set<string>();
+  let prev: string | undefined;
+  for (const v of page.entries) {
+    if (!v.key.startsWith(prefix) || v.key.length === prefix.length || v.key.split("/").some((seg) => seg === "." || seg === ".."))
+      throw coded("erasure_foreign_key", "an inventory key is outside the requested prefix");
+    const id = JSON.stringify([v.key, v.versionId]);
+    if (seen.has(id)) throw coded("erasure_inventory", "duplicate version in one inventory page");
+    seen.add(id);
+    if (prev !== undefined && cmpC(v.key, prev) < 0) throw coded("erasure_inventory", "inventory keys out of order");
+    prev = v.key;
+    // Monotonic: a key-marker-only page starts strictly after the marker; an in-key page at or after it.
+    if (keyMarker !== undefined && (versionMarker === undefined ? cmpC(v.key, keyMarker) <= 0 : cmpC(v.key, keyMarker) < 0))
+      throw coded("erasure_inventory", "inventory cursor went backwards");
+  }
+  if (page.truncated) {
+    const last = page.entries[page.entries.length - 1];
+    if (!last || page.nextKey !== last.key || page.nextVersion !== last.versionId)
+      throw coded("erasure_inventory", "version pagination markers do not match the page");
+  }
+}
+
+function checkCheckpoint(bucket: string, prefix: string, scope: string, cp: EraseCheckpoint | null | undefined): EraseCheckpoint | null {
+  if (cp === null || cp === undefined) return null;
+  if (!cp || cp.v !== 1 || cp.bucket !== bucket || cp.prefix !== prefix || cp.scope !== scope)
+    throw coded("erasure_checkpoint_scope", "the checkpoint is bound to another bucket, prefix or scope");
+  if (cp.afterKey !== null && (typeof cp.afterKey !== "string" || !cp.afterKey.startsWith(prefix)))
+    throw coded("erasure_checkpoint_scope", "the checkpoint cursor is outside the prefix");
+  if (cp.inKey !== null && (!cp.inKey || typeof cp.inKey.key !== "string" || !cp.inKey.key.startsWith(prefix) || typeof cp.inKey.versionId !== "string" || !cp.inKey.versionId
+      || (cp.afterKey !== null && cmpC(cp.inKey.key, cp.afterKey) <= 0)))
+    throw coded("erasure_checkpoint_scope", "the checkpoint in-key cursor is malformed");
+  return cp;
+}
+
+function budgetOf(b: EraseBudget | undefined) {
+  const versions = Math.min(b?.versions ?? ERASE_RUN_MAX_VERSIONS, ERASE_RUN_MAX_VERSIONS);
+  const pages = Math.min(b?.pages ?? ERASE_RUN_MAX_PAGES, ERASE_RUN_MAX_PAGES);
+  if (!(versions > 0) || !(pages > 0)) throw coded("erasure_budget", "an erase run needs a positive budget");
+  return { versions, pages, deadlineAt: b?.deadlineAt ?? Number.POSITIVE_INFINITY };
+}
+
+/** The one traversal both stores share (S3 versions, or an unversioned store's keys). */
+function pagedEraser(bucket: string, fetchPage: PageFetcher, removeExact: (list: ListedVersion[]) => Promise<number>): PagedEraser {
+  return {
+    async eraseStep(prefix, opts) {
+      if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
+      if (typeof opts.scope !== "string" || !opts.scope) throw coded("erasure_checkpoint_scope", "an erase run needs a scope");
+      const cp = checkCheckpoint(bucket, prefix, opts.scope, opts.checkpoint);
+      const budget = budgetOf(opts.budget), now = opts.now ?? Date.now, select = opts.select ?? (() => true);
+      let afterKey = cp?.afterKey ?? null, inKey = cp?.inKey ?? null;
+      let pages = 0, listed = 0, deleted = 0, restarts = 0;
+      const gone = new Set<string>(), states = new Set<string>();
+      const checkpoint = (): EraseCheckpoint => ({ v: 1, bucket, prefix, scope: opts.scope, afterKey, inKey });
+      for (;;) {
+        if (now() >= budget.deadlineAt) return { status: "incomplete", checkpoint: checkpoint(), deleted, listed, reason: "deadline" };
+        if (pages >= budget.pages) return { status: "incomplete", checkpoint: checkpoint(), deleted, listed, reason: "pages" };
+        if (listed >= budget.versions) return { status: "incomplete", checkpoint: checkpoint(), deleted, listed, reason: "versions" };
+        const state = JSON.stringify([afterKey, inKey]);
+        const keyMarker = inKey ? inKey.key : afterKey ?? undefined, versionMarker = inKey?.versionId;
+        let page: StrictPage;
+        try {
+          page = await fetchPage(prefix, keyMarker, versionMarker);
+        } catch (e) {
+          // A provider that rejects its own in-key marker (the marker version was deleted):
+          // reconcile from the last completed key, inside this bounded run; never guess a marker.
+          if (inKey && (e as { code?: string }).code === "s3_400" && restarts < MAX_CURSOR_RESTARTS) { restarts++; inKey = null; continue; }
+          throw e;
+        }
+        pages++;
+        checkPage(prefix, page, keyMarker, versionMarker);
+        for (const v of page.entries)
+          if (gone.has(JSON.stringify([v.key, v.versionId]))) throw coded("erasure_inventory_changed", "a deleted version reappeared");
+        listed += page.entries.length;
+        const doomed = page.entries.filter(select);
+        if (doomed.length) {
+          if (now() >= budget.deadlineAt) return { status: "incomplete", checkpoint: checkpoint(), deleted, listed, reason: "deadline" };
+          await opts.authorize();
+          assertUnderPrefix(prefix, doomed);
+          deleted += await removeExact(doomed);
+          for (const v of doomed) gone.add(JSON.stringify([v.key, v.versionId]));
+        }
+        if (!page.truncated) return { status: "traversed", deleted, listed };
+        const lastKey = page.nextKey!;
+        const complete = page.entries.filter((v) => cmpC(v.key, lastKey) < 0);
+        if (complete.length) { afterKey = complete[complete.length - 1]!.key; inKey = null; }
+        else if (doomed.length) inKey = null;          // progress by deletion: relist the key from afterKey
+        else inKey = { key: lastKey, versionId: page.nextVersion! };
+        // A state seen again in this run with nothing deleted since is a provider cycle.
+        if (!doomed.length && states.has(JSON.stringify([afterKey, inKey]))) throw coded("erasure_inventory", "version pagination cycle");
+        states.add(state);
+      }
+    },
+    async verifyErased(prefix, opts) {
+      if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
+      const budget = budgetOf(opts.budget), now = opts.now ?? Date.now, select = opts.select ?? (() => true);
+      await opts.authorize();
+      let keyMarker: string | undefined, versionMarker: string | undefined, pages = 0, listed = 0, remaining = 0;
+      const cursors = new Set<string>();
+      for (;;) {
+        if (now() >= budget.deadlineAt || pages >= budget.pages || listed >= budget.versions) return { status: "pending", reason: "budget", remaining, listed };
+        const page = await fetchPage(prefix, keyMarker, versionMarker);
+        pages++;
+        checkPage(prefix, page, keyMarker, versionMarker);
+        listed += page.entries.length;
+        remaining += page.entries.filter(select).length;
+        if (remaining) return { status: "pending", reason: "remaining", remaining, listed };
+        if (!page.truncated) return { status: "erased", listed };
+        keyMarker = page.nextKey; versionMarker = page.nextVersion;
+        const c = JSON.stringify([keyMarker, versionMarker]);
+        if (cursors.has(c)) throw coded("erasure_inventory", "version pagination cycle");
+        cursors.add(c);
+      }
+    },
+  };
+}
+
 export interface S3EraserConfig {
   bucket: string;
   region: string;
@@ -121,7 +310,7 @@ function assertInventoryXml(xml: string): void {
   if (stack.length || roots !== 1 || xml.slice(at).trim()) throw coded("erasure_inventory", "incomplete version inventory");
 }
 
-export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & SnapshotEraser {
+export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & SnapshotEraser & PagedEraser {
   const doFetch = cfg.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const url = (key = "") => {
     if (cfg.endpoint) {
@@ -140,58 +329,72 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
     return res;
   };
 
+  /** One ListObjectVersions page (strict: assertInventoryXml, complete entries, recognized pagination). */
+  async function fetchPage(prefix: string, keyMarker?: string, versionMarker?: string, strict = true): Promise<StrictPage> {
+    const u = url();
+    u.searchParams.set("versions", "");
+    u.searchParams.set("prefix", prefix);
+    u.searchParams.set("max-keys", "1000");
+    if (keyMarker !== undefined) u.searchParams.set("key-marker", keyMarker);
+    if (versionMarker !== undefined) u.searchParams.set("version-id-marker", versionMarker);
+    const response = await request("GET", u);
+    let xml: string;
+    if (!strict) xml = await response.text();
+    else {
+      const reader = response.body?.getReader(), chunks: Uint8Array[] = []; let size = 0;
+      try {
+        if (!reader) throw coded("erasure_inventory", "empty version inventory");
+        for (;;) {
+          const r = await reader.read(); if (r.done) break;
+          size += r.value.byteLength;
+          if (size > 16 * 1024 * 1024) throw coded("erasure_inventory", "version inventory byte bound");
+          chunks.push(r.value);
+        }
+        const body = new Uint8Array(size); let at = 0;
+        for (const chunk of chunks) { body.set(chunk, at); at += chunk.byteLength; }
+        try { xml = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(body); }
+        catch { throw coded("erasure_inventory", "version inventory encoding"); }
+      } finally { await reader?.cancel().catch(() => {}); reader?.releaseLock(); }
+    }
+    if (strict) assertInventoryXml(xml);
+    const entries: ListedVersion[] = [];
+    // Document order (S3 returns key order; versions newest first within a key).
+    const els: { el: string; marker: boolean }[] = [];
+    for (const m of xml.matchAll(/<(Version|DeleteMarker)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/g)) els.push({ el: m[2]!, marker: m[1] === "DeleteMarker" });
+    for (const { el, marker } of els) {
+      const key = xmlText(el, "Key");
+      const versionId = xmlText(el, "VersionId");
+      const modified = Date.parse(xmlText(el, "LastModified") ?? "");
+      const latest = xmlText(el, "IsLatest");
+      if (strict && (!key || !versionId || /[\x00-\x1f\x7f]/u.test(versionId) || (latest !== "true" && latest !== "false")))
+        throw coded("erasure_inventory", "incomplete version entry");
+      // xmlText already decodes entities; decoding again would mangle a literal `&amp;`.
+      if (key !== undefined && versionId !== undefined)
+        entries.push({ key, versionId, latest: latest === "true", deleteMarker: marker, ...(Number.isFinite(modified) ? { lastModified: modified } : {}) });
+    }
+    const truncated = xmlText(xml, "IsTruncated");
+    if (strict && truncated !== "true" && truncated !== "false") throw coded("erasure_inventory", "version pagination is unproven");
+    if (truncated !== "true") return { entries, truncated: false };
+    const nextKey = xmlText(xml, "NextKeyMarker"), nextVersion = xmlText(xml, "NextVersionIdMarker");
+    if (strict && (nextKey === undefined || nextVersion === undefined)) throw coded("erasure_inventory", "version pagination is incomplete or unbounded");
+    return { entries, truncated: true, ...(nextKey !== undefined ? { nextKey } : {}), ...(nextVersion !== undefined ? { nextVersion } : {}) };
+  }
+
   // Strict by default: every inventory here is destructive authority (assertInventoryXml,
   // required Key/VersionId/IsLatest, proven pagination with cursor progress, the 10k bound).
+  // A whole-prefix listing in one call; large prefixes use the resumable `eraseStep`.
   async function versions(prefix: string, strict = true): Promise<Version[]> {
     const out: Version[] = [];
     const pages = new Set<string>();
     let keyMarker: string | undefined;
     let versionMarker: string | undefined;
     for (;;) {
-      const u = url();
-      u.searchParams.set("versions", "");
-      u.searchParams.set("prefix", prefix);
-      u.searchParams.set("max-keys", "1000");
-      if (keyMarker !== undefined) u.searchParams.set("key-marker", keyMarker);
-      if (versionMarker !== undefined) u.searchParams.set("version-id-marker", versionMarker);
-      const response = await request("GET", u);
-      let xml: string;
-      if (!strict) xml = await response.text();
-      else {
-        const reader = response.body?.getReader(), chunks: Uint8Array[] = []; let size = 0;
-        try {
-          if (!reader) throw coded("erasure_inventory", "empty version inventory");
-          for (;;) {
-            const r = await reader.read(); if (r.done) break;
-            size += r.value.byteLength;
-            if (size > 16 * 1024 * 1024) throw coded("erasure_inventory", "version inventory byte bound");
-            chunks.push(r.value);
-          }
-          const body = new Uint8Array(size); let at = 0;
-          for (const chunk of chunks) { body.set(chunk, at); at += chunk.byteLength; }
-          try { xml = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(body); }
-          catch { throw coded("erasure_inventory", "version inventory encoding"); }
-        } finally { await reader?.cancel().catch(() => {}); reader?.releaseLock(); }
-      }
-      if (strict) assertInventoryXml(xml);
-      for (const tag of ["Version", "DeleteMarker"])
-        for (const el of xmlElements(xml, tag)) {
-          const key = xmlText(el, "Key");
-          const versionId = xmlText(el, "VersionId");
-          const modified = Date.parse(xmlText(el, "LastModified") ?? "");
-          const latest = xmlText(el, "IsLatest");
-          if (strict && (!key || !versionId || /[\x00-\x1f\x7f]/u.test(versionId) || (latest !== "true" && latest !== "false")))
-            throw coded("erasure_inventory", "incomplete version entry");
-          // xmlText already decodes entities; decoding again would mangle a literal `&amp;`.
-          if (key !== undefined && versionId !== undefined)
-            out.push({ key, versionId, latest: xmlText(el, "IsLatest") === "true", deleteMarker: tag === "DeleteMarker", ...(Number.isFinite(modified) ? { lastModified: modified } : {}) });
-        }
-      const truncated = xmlText(xml, "IsTruncated");
+      const page = await fetchPage(prefix, keyMarker, versionMarker, strict);
+      out.push(...page.entries);
       if (strict && out.length > 10000) throw coded("erasure_inventory", "version inventory exceeds bound");
-      if (strict && truncated !== "true" && truncated !== "false") throw coded("erasure_inventory", "version pagination is unproven");
-      if (truncated !== "true") return out;
-      keyMarker = xmlText(xml, "NextKeyMarker");
-      versionMarker = xmlText(xml, "NextVersionIdMarker");
+      if (!page.truncated) return out;
+      keyMarker = page.nextKey;
+      versionMarker = page.nextVersion;
       if (strict) {
         const cursor = JSON.stringify([keyMarker, versionMarker]);
         if (keyMarker === undefined || versionMarker === undefined || pages.has(cursor) || pages.size >= 100 || out.length > 10000)
@@ -215,7 +418,11 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
     return list.length;
   }
 
+  const paged = pagedEraser(cfg.bucket, (prefix, k, v) => fetchPage(prefix, k, v), (list) =>
+    remove(list.map((v) => ({ key: v.key, versionId: v.versionId, latest: v.latest, deleteMarker: v.deleteMarker }))));
   return {
+    eraseStep: paged.eraseStep,
+    verifyErased: paged.verifyErased,
     listVersions: async (prefix) => {
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
       // Strict: the snapshot is destructive authority (assertInventoryXml, proven pagination, bounds).
@@ -278,8 +485,25 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
 }
 
 /** The same contract over a plain (unversioned) store, for tests and local runs. */
-export function storeEraser(store: ObjectStore): Eraser & SnapshotEraser {
+export function storeEraser(store: ObjectStore): Eraser & SnapshotEraser & PagedEraser {
+  // Unversioned: one "null" version per key, pages of 1000 keys after the key marker.
+  const fetchPage: PageFetcher = async (prefix, keyMarker) => {
+    const keys: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await store.list(objectKey(prefix.slice(0, -1)), cursor);
+      keys.push(...page.items.map((i) => String(i.key)).filter((k) => k.startsWith(prefix)));
+      cursor = page.nextCursor;
+    } while (cursor);
+    const after = keys.sort(cmpC).filter((k) => keyMarker === undefined || cmpC(k, keyMarker) > 0);
+    const entries = after.slice(0, 1000).map((key) => ({ key, versionId: "null", latest: true, deleteMarker: false }));
+    const truncated = after.length > 1000;
+    return truncated ? { entries, truncated, nextKey: entries[entries.length - 1]!.key, nextVersion: "null" } : { entries, truncated };
+  };
+  const paged = pagedEraser("store", fetchPage, async (list) => { for (const v of list) await store.delete(objectKey(v.key)); return list.length; });
   return {
+    eraseStep: paged.eraseStep,
+    verifyErased: paged.verifyErased,
     async listVersions(prefix) {
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
       const out: VersionRef[] = [];
