@@ -17,7 +17,8 @@
  * Worker's own origin, the only audience accepted; unset = every /v1 request
  * 401), READ_API_COMPLETE_SINCE (ISO timestamp or "epoch"; missing = 503),
  * CLICKHOUSE_DATABASE, READ_API_DIRECTORY_WORKSPACES (the directory list/activity
- * and timing canary allowlist; unset = none), READ_API_TIMING_ASSUME_NO_TURNS, and
+ * and timing canary allowlist; unset = none), READ_API_BRIEF_TITLES_WORKSPACES (the
+ * brief-titles allowlist; unset = none), READ_API_TIMING_ASSUME_NO_TURNS, and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve).
  */
@@ -34,6 +35,7 @@ import { logLine, type Level } from "../../../src/shared/log.ts";
 import { createClickHouseClient, type ClickHouseClient, type RequestOptions } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-read-api/app.ts";
 import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
+import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
 import { relayAuthVerifier } from "../../../src/session-read-api/auth.ts";
 import { sqlLiveness, TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
@@ -48,6 +50,8 @@ export interface Env extends CanonicalEnv {
   READ_API_COMPLETE_SINCE?: string;
   /** Directory list/activity and timing canary allowlist: unset = none, "*" = all, else comma-separated workspace ids. */
   READ_API_DIRECTORY_WORKSPACES?: string;
+  /** Brief-titles allowlist (GET /v1/sessions/titles): unset = none, "*" = all, else comma-separated workspace ids. */
+  READ_API_BRIEF_TITLES_WORKSPACES?: string;
   /** "true": time a session without legacy turn evidence as having none (session-timing-source.ts). */
   READ_API_TIMING_ASSUME_NO_TURNS?: string;
   RELAYAUTH_JWKS_URL?: string;
@@ -203,6 +207,8 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     liveness: sqlLiveness(tenant.run),
     directory: sqlDirectory(tenant.run),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
+    briefTitles: sqlBriefTitles(tenant.run),
+    briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
     log: (fields) => log("info", "session read", fields),
   });

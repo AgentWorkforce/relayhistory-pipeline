@@ -21,6 +21,7 @@ import { SUPABASE_PROD_CA_2021 } from "../session-pipeline/supabase-ca.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces } from "./app.ts";
 import { sqlDirectory } from "./directory.ts";
+import { sqlBriefTitles } from "./brief-titles.ts";
 import { relayAuthVerifier, type AuthConfig } from "./auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
@@ -96,6 +97,8 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env): Promise<App> {
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
     directory: sqlDirectory(poolTenantRunner(pool as never)),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
+    briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
+    briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
     log: (fields) => log.info("session read", fields),
   });

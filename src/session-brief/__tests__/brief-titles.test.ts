@@ -1,0 +1,306 @@
+/**
+ * Feature F2 (20261105043000_brief_titles.sql): session_briefs provenance, the read API's
+ * sessions.session_brief_titles_for, the Neon backfill load against fixtures, and up/down/up.
+ * PGlite with every migration; the backfill is also rehearsed on owned PG17 in
+ * src/migration/__tests__/neon-brief-titles.postgres.test.ts.
+ */
+import { afterEach, describe, expect, test } from "bun:test";
+import type { PGlite } from "@electric-sql/pglite";
+import { briefRpc, database, hoopDb, pointer, code, read, KEY } from "./harness.ts";
+import { recordBrief, type BriefText } from "../store.ts";
+import { TENANT_SETTINGS_SQL, poolTenantRunner } from "../../session-read-api/liveness.ts";
+import { sqlBriefTitles } from "../../session-read-api/brief-titles.ts";
+import {
+  BACKFILL_ENGINE_VERSION,
+  backfillFingerprint,
+  loadBackfill,
+  verifyBackfill,
+  type NeonBriefRow,
+} from "../../migration/neon-brief-titles/backfill.ts";
+
+const sql = (path: string) => read(path).split("\n").filter((l) => !l.startsWith("\\")).join("\n");
+const ROLE = sql("supabase/bootstrap/session_read_api_role.sql");
+const VERIFY = sql("supabase/bootstrap/session_read_api_role_verify.sql");
+const DOWN = "supabase/rollbacks/20261105043000_brief_titles.down.sql";
+const UP = "supabase/migrations/20261105043000_brief_titles.sql";
+
+const open: PGlite[] = [];
+afterEach(async () => {
+  await Promise.all(open.splice(0).map((db) => db.close()));
+});
+async function db(): Promise<PGlite> {
+  const pg = await database();
+  open.push(pg);
+  await pg.exec(ROLE);
+  return pg;
+}
+
+/** As the read Worker: role, BEGIN READ ONLY, tenant bound, run, COMMIT. */
+async function asReadApi<T>(pg: PGlite, tenant: [string, string] | null, work: () => Promise<T>, role = "bulls96_read_api"): Promise<T> {
+  await pg.exec(`SET ROLE ${role}`);
+  try {
+    await pg.exec("BEGIN READ ONLY");
+    try {
+      if (tenant) await pg.query(TENANT_SETTINGS_SQL, tenant);
+      const out = await work();
+      await pg.exec("COMMIT");
+      return out;
+    } catch (error) {
+      await pg.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    await pg.exec("RESET ROLE");
+  }
+}
+
+const titlesFor = (pg: PGlite, ws: string, keys: Array<[string, string]>) =>
+  pg
+    .query<Record<string, unknown>>("SELECT * FROM sessions.session_brief_titles_for($1, $2::text[], $3::text[])", [
+      ws,
+      keys.map((k) => k[0]),
+      keys.map((k) => k[1]),
+    ])
+    .then((r) => r.rows);
+
+const text = (over: Partial<BriefText> = {}): BriefText => ({
+  title: "Native title",
+  description: "A native description.",
+  state: "completed",
+  scrubRuleset: "relayhistory-scrub",
+  scrubVersion: 1,
+  fingerprint: "f".repeat(64),
+  promptVersion: "session-summary-v3",
+  engineVersion: "session-brief-v3",
+  model: "gpt-5.6-luna",
+  messageCount: 3,
+  shortenedMessages: 0,
+  inputTokens: 10,
+  outputTokens: 5,
+  durationMs: 20,
+  generatedAt: new Date("2026-11-01T00:00:00Z"),
+  ...over,
+});
+
+const neon = (over: Partial<NeonBriefRow> = {}): NeonBriefRow => ({
+  org_id: KEY.orgId,
+  workspace_id: KEY.workspaceId,
+  source_provider: KEY.harness,
+  session_id: KEY.sessionId,
+  job_id: "0b6f6a39-7d5e-4c0e-9c1e-2f1d8b8f0a01",
+  title: "  Neon title  ",
+  description: "A Neon description.",
+  state: "completed",
+  prompt_version: "session-summary-v3",
+  summary_version: "session-summary-v3",
+  model: "gpt-5.6-luna",
+  summary_model_version: "gpt-5.6-luna",
+  generated_at: "2026-10-20T10:00:00.000Z",
+  completed_at: "2026-10-20T10:00:01.000000Z",
+  message_count: "4",
+  shortened_messages: "0",
+  input_tokens: "100",
+  output_tokens: "20",
+  ...over,
+});
+
+const row = async (pg: PGlite, key = KEY) =>
+  (
+    await pg.query<Record<string, unknown>>(
+      "SELECT * FROM sessions.session_briefs WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4",
+      [key.orgId, key.workspaceId, key.harness, key.sessionId],
+    )
+  ).rows[0];
+
+/** The PGlite connection as a transaction-capable target client. */
+const target = (pg: PGlite) => ({ query: async (q: string, p?: unknown[]) => ({ rows: (await pg.query(q, p as never)).rows as never[] }) });
+
+describe("session_briefs provenance", () => {
+  test("origin is derived from the brief text, never from the writer", async () => {
+    const pg = await db();
+    await pointer(pg);
+    await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { status: "ready", text: text() });
+    expect(await row(pg)).toMatchObject({ origin: "native", legacy_job_id: null });
+    // A writer cannot label a native brief as backfilled.
+    await pg.query("UPDATE sessions.session_briefs SET origin = 'neon_backfill', legacy_job_id = 'j-1'");
+    expect(await row(pg)).toMatchObject({ origin: "native", legacy_job_id: null });
+    // A backfill engine version without a legacy job id violates the CHECK.
+    expect(await code(pg.query(`UPDATE sessions.session_briefs SET engine_version = '${BACKFILL_ENGINE_VERSION}'`))).toBe("23514");
+  });
+
+  test("a native brief replaces a backfilled one; a failed attempt keeps it; a quarantine clears it", async () => {
+    const pg = await db();
+    await pointer(pg);
+    expect((await loadBackfill(target(pg), [neon()], "execute")).outcomes.inserted).toBe(1);
+    expect(await row(pg)).toMatchObject({
+      origin: "neon_backfill",
+      legacy_job_id: neon().job_id,
+      title: "Neon title",
+      engine_version: BACKFILL_ENGINE_VERSION,
+      brief_fingerprint: backfillFingerprint(neon().job_id),
+      revision: 0,
+    });
+    // session_brief reports a backfilled brief stale, never ready.
+    expect((await briefRpc(pg))[0]).toMatchObject({ status: "stale", stale: true, title: "Neon title", state: "completed" });
+    // A failed native attempt keeps the previous text and so its provenance.
+    await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { status: "failed", error: "model_failed" });
+    expect(await row(pg)).toMatchObject({ status: "failed", origin: "neon_backfill", title: "Neon title" });
+    // A native "reused" never matches the backfill fingerprint.
+    await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { status: "reused", fingerprint: "f".repeat(64) });
+    expect(await row(pg)).toMatchObject({ origin: "neon_backfill" });
+    await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { status: "ready", text: text() });
+    expect(await row(pg)).toMatchObject({ origin: "native", legacy_job_id: null, title: "Native title" });
+    // The backfill never overwrites a native title, on a rerun either.
+    expect((await loadBackfill(target(pg), [neon()], "execute")).outcomes).toMatchObject({ skipped_native: 1, inserted: 0, updated: 0 });
+    expect(await row(pg)).toMatchObject({ title: "Native title" });
+    await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { status: "quarantined", error: "session_quarantined" });
+    expect(await row(pg)).toMatchObject({ origin: "native", title: null, status: "quarantined" });
+    // A quarantine is never refilled.
+    expect((await loadBackfill(target(pg), [neon()], "execute")).outcomes.skipped_quarantined).toBe(1);
+    expect(await row(pg)).toMatchObject({ title: null });
+  });
+});
+
+describe("sessions.session_brief_titles_for", () => {
+  test("titles for the bound tenant only; physical or logical ids; live pointers only", async () => {
+    const pg = await db();
+    const other = { ...KEY, sessionId: "s-2" };
+    const foreign = { ...KEY, orgId: "org-b" };
+    await pointer(pg);
+    await pointer(pg, { key: other });
+    await pointer(pg, { key: foreign });
+    await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { status: "ready", text: text({ title: "First" }) });
+    await recordBrief(hoopDb(pg), foreign, { "m-1": 1 }, { status: "ready", text: text({ title: "Foreign" }) });
+    // s-2 has a pointer and no brief: no row (a known null).
+    const got = await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"], ["claude", "s-2"], ["claude", "nope"], ["claude", "s-1"]]));
+    expect(got).toEqual([{ org_id: "org-a", workspace_id: "ws-a", harness: "claude", session_id: "s-1", title: "First", origin: "native", generated_at: expect.anything() }]);
+    // org-b's brief is invisible to org-a's binding, whatever is asked.
+    expect(await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"]]))).toHaveLength(1);
+    expect((await asReadApi(pg, ["org-b", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"]])))[0]).toMatchObject({ title: "Foreign", org_id: "org-b" });
+    // A logical (canonical) id resolves to its physical session's brief.
+    await pg.query("UPDATE sessions.session_index SET canonical_session_id = 'logical-1' WHERE org_id='org-a' AND session_id='s-1'");
+    expect((await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "logical-1"]])))[0]).toMatchObject({ session_id: "logical-1", title: "First" });
+    // A tombstoned pointer removes the brief (forget trigger) and so the title.
+    await pg.query("UPDATE sessions.session_index SET deleted_at = now() WHERE org_id='org-a' AND session_id='s-1'");
+    expect(await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"], ["claude", "logical-1"]]))).toEqual([]);
+  });
+
+  test("refuses every other caller, binding, workspace and malformed key list", async () => {
+    const pg = await db();
+    await pointer(pg);
+    expect(await code(asReadApi(pg, null, () => titlesFor(pg, "ws-a", [["claude", "s-1"]])))).toBe("42501");
+    expect(await code(asReadApi(pg, ["org-a", "ws-b"], () => titlesFor(pg, "ws-a", [["claude", "s-1"]])))).toBe("42501");
+    expect(await code(asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"]]), "session_directory_search_worker"))).toBe("42501");
+    expect(await code(asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"]]), "service_role"))).toBe("42501");
+    for (const keys of [[], Array.from({ length: 101 }, (_, i) => ["claude", `s-${i}`] as [string, string]), [["Bad Harness", "s"]], [["claude", ""]], [["claude", "x".repeat(256)]]] as Array<Array<[string, string]>>)
+      expect(await code(asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", keys)))).toBe("22023");
+    expect(
+      await code(
+        asReadApi(pg, ["org-a", "ws-a"], () =>
+          pg.query("SELECT * FROM sessions.session_brief_titles_for('ws-a', ARRAY['claude','claude'], ARRAY['s-1'])"),
+        ),
+      ),
+    ).toBe("22023");
+    // The read role still cannot read the table directly.
+    expect(await code(asReadApi(pg, ["org-a", "ws-a"], () => pg.query("SELECT title FROM sessions.session_briefs")))).toBe("42501");
+  });
+
+  test("the read API's runner reads it, the role verifier passes, and the ACL is exact", async () => {
+    const pg = await db();
+    await pointer(pg);
+    await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { status: "ready", text: text() });
+    await pg.exec(VERIFY);
+    const acl = (
+      await pg.query<{ fn: string; grantee: string }>(
+        `SELECT p.oid::regprocedure::text AS fn, coalesce(r.rolname, 'PUBLIC') AS grantee
+           FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+           CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+           LEFT JOIN pg_roles r ON r.oid = a.grantee
+          WHERE n.nspname = 'sessions' AND p.proname IN ('session_brief_titles_for', 'session_briefs_provenance')
+            AND a.grantee <> p.proowner ORDER BY 1, 2`,
+      )
+    ).rows;
+    expect(acl).toEqual([{ fn: "sessions.session_brief_titles_for(text,text[],text[])", grantee: "bulls96_read_api" }]);
+    await pg.exec("SET ROLE bulls96_read_api");
+    try {
+      const run = poolTenantRunner({ connect: async () => ({ query: (t: string, p?: unknown[]) => pg.query(t, p as never) as never, release() {} }) });
+      const rows = await sqlBriefTitles(run).titles("org-a", "ws-a", [{ source: "claude", sessionId: "s-1" }]);
+      expect(rows?.map((r) => r.title)).toEqual(["Native title"]);
+    } finally {
+      await pg.exec("RESET ROLE");
+    }
+  });
+});
+
+describe("Neon backfill load (fixtures)", () => {
+  test("dry run reports and keeps nothing; execute writes; rerun is idempotent; verify is exact", async () => {
+    const pg = await db();
+    await pointer(pg);
+    await pointer(pg, { key: { ...KEY, sessionId: "s-2" } });
+    await pointer(pg, { key: { ...KEY, sessionId: "s-3" } });
+    await pg.query("UPDATE sessions.session_index SET deleted_at = now() WHERE session_id = 's-3'");
+    const fixture = [
+      neon(),
+      neon({ session_id: "s-2", job_id: "j-2", state: null, prompt_version: "session-summary-v1", title: "Legacy v1" }),
+      neon({ session_id: "s-3", job_id: "j-3" }),
+      neon({ session_id: "s-4", job_id: "j-4" }),
+      neon({ session_id: "s-5", job_id: "j-5", title: "   " }),
+      neon({ session_id: "s-6", job_id: "j-6", title: "line\nbreak" }),
+      neon({ session_id: "s-7", job_id: "j-7", description: null }),
+      neon({ session_id: "s-8", job_id: "j-8", state: "nope" }),
+      neon({ session_id: "s-9", job_id: "j-9", generated_at: "garbage", completed_at: null }),
+      neon({ session_id: "s-10", job_id: "j-10", source_provider: "Bad" }),
+    ];
+    const dry = await loadBackfill(target(pg), fixture, "dry-run");
+    expect(dry).toMatchObject({
+      mode: "dry-run",
+      candidates: 10,
+      outcomes: { inserted: 2, updated: 0, skipped_native: 0, skipped_quarantined: 0, skipped_no_pointer: 2 },
+      skipped: { title_blank: 1, title_invalid: 1, description_invalid: 1, state_invalid: 1, generated_at_invalid: 1, key_invalid: 1 },
+    });
+    expect((await pg.query("SELECT 1 FROM sessions.session_briefs")).rows).toHaveLength(0);
+    const exec = await loadBackfill(target(pg), fixture, "execute");
+    expect(exec.outcomes).toEqual(dry.outcomes);
+    expect(await row(pg, { ...KEY, sessionId: "s-2" })).toMatchObject({ origin: "neon_backfill", state: null, prompt_version: "session-summary-v1", title: "Legacy v1" });
+    // The directory title is not touched by the backfill.
+    expect((await pg.query<{ title: string }>("SELECT title FROM sessions.session_directory WHERE session_id = 's-1'")).rows[0]?.title).toBe("pointer title");
+    const again = await loadBackfill(target(pg), fixture, "execute");
+    expect(again.outcomes).toMatchObject({ inserted: 0, updated: 2 });
+    const v = await verifyBackfill(target(pg), fixture);
+    // s-1 and s-2 equal; s-3 (erased), s-4 (no pointer) and the invalid ones are missing; s-5 is blank (not compared).
+    expect(v).toMatchObject({ candidates: 10, compared: 9, equal: 2, different: 0, native: 0, missing: 7 });
+    // Served through the read API function exactly as Neon's Cloud-visible (trimmed) titles.
+    const served = await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"], ["claude", "s-2"], ["claude", "s-3"]]));
+    expect(served.map((r) => [r.session_id, r.title, r.origin])).toEqual([["s-1", "Neon title", "neon_backfill"], ["s-2", "Legacy v1", "neon_backfill"]]);
+    // A tampered SP title is a reported difference, never silently equal.
+    await pg.query("UPDATE sessions.session_briefs SET title = 'Tampered' WHERE session_id = 's-1'");
+    expect((await verifyBackfill(target(pg), fixture)).different).toBe(1);
+  });
+
+  test("a fixture that repeats a key is refused before any write", async () => {
+    const pg = await db();
+    await pointer(pg);
+    await expect(loadBackfill(target(pg), [neon(), neon({ job_id: "j-x" })], "execute")).rejects.toThrow(/duplicate session key/);
+    expect((await pg.query("SELECT 1 FROM sessions.session_briefs")).rows).toHaveLength(0);
+  });
+});
+
+describe("20261105043000 up/down/up", () => {
+  test("down refuses while backfilled briefs remain, then restores the 020000 shape; up again is clean", async () => {
+    const pg = await db();
+    await pointer(pg);
+    await loadBackfill(target(pg), [neon()], "execute");
+    expect(await code(pg.exec(read(DOWN)))).toBe("55000");
+    await pg.query("DELETE FROM sessions.session_briefs WHERE origin = 'neon_backfill'");
+    await pg.exec(read(DOWN));
+    const cols = (await pg.query<{ attname: string }>("SELECT attname FROM pg_attribute WHERE attrelid = 'sessions.session_briefs'::regclass AND attname IN ('origin','legacy_job_id') AND NOT attisdropped")).rows;
+    expect(cols).toEqual([]);
+    expect((await pg.query("SELECT to_regprocedure('sessions.session_brief_titles_for(text,text[],text[])') AS f")).rows[0]).toEqual({ f: null });
+    // The restored CHECK refuses a v3 brief without a state again.
+    await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { status: "ready", text: text() });
+    expect(await code(pg.query("UPDATE sessions.session_briefs SET state = NULL"))).toBe("23514");
+    await pg.exec(read(UP));
+    expect(await row(pg)).toMatchObject({ origin: "native", legacy_job_id: null });
+    await pg.exec(VERIFY);
+  });
+});
