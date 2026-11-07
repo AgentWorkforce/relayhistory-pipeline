@@ -244,6 +244,19 @@ export class ErasureJob {
         return { status: "incomplete", deleted: step.deleted, remaining, rev };
       }
     }
+    // M1 recovery: this scope's reservations for versions the proof still LISTS were never deleted: release them (the
+    // next run re-reserves what it deletes), so the exporter's claim / re-export is not wedged behind them.
+    for (;;) {
+      await authorize();
+      const rel = this.state.releasePresentPage(prefix, scope, exactKey, (key, versionId) => keyFilter(key) && (listed.get(key)?.has(versionId) ?? false), proofSeq, lease, rev);
+      if (!rel.ok) {
+        this.counters.reservationsRefused += 1;
+        return { status: "refused", deleted: step.deleted, remaining, rev: rel.rev };
+      }
+      rev = rel.rev;
+      if (rel.done) break;
+      if (this.now() >= deadline) return { status: "incomplete", deleted: step.deleted, remaining, rev };
+    }
     // M1: the proven-absent reservations above are retired EVEN when completion is impossible (an unresolved PUT, or
     // the unsettled production genesis), so a writer's claim / cancel is never wedged behind reservations nobody will
     // retire. Only the done claim is gated here.

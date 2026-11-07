@@ -100,6 +100,19 @@ export class SyncState {
       CREATE INDEX IF NOT EXISTS groups_last ON groups (last_ms DESC);
     `);
     if (this.obligations) this.#openObligations();
+    else this.#refuseUsedObligationsWhenOff();
+  }
+
+  /**
+   * Off / rollback must never silently drop tracked obligations: if this file's obligation state was ever USED
+   * (any invocation, claim or reservation mutation stamped, or rows present), refuse to open it with the flag off,
+   * instead of letting the legacy job delete without those protections.
+   */
+  #refuseUsedObligationsWhenOff() {
+    const has = (t: string) => !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
+    const rows = (t: string) => has(t) && !!this.db.prepare(`SELECT 1 FROM ${t} LIMIT 1`).get();
+    if (rows("write_touch") || rows("write_invocations") || rows("erase_reservations") || rows("write_published"))
+      throw Object.assign(new Error("this state file's obligation state is in use: S3X_OBLIGATIONS cannot be turned off for it"), { code: "obligations_state_in_use" });
   }
 
   /** The obligation schema, triggers, lease generation column and genesis (only with S3X_OBLIGATIONS on). */
@@ -293,7 +306,9 @@ export class SyncState {
   markFailed(org: string, session: string, code: string, keys: string[], revision: number, at = Date.now()) {
     const prior = this.exported(org, session);
     // Waiting for the other process's lease, or an interrupted run, is not the group's failure.
-    const transientWait = code === "prefix_busy" || code === "interrupted";
+    // publish_reserved (S3X_OBLIGATIONS on): the erasure job holds a reservation on something this group references; it
+    // is released or retired when that erasure run proves, so the group simply retries (never stuck_with_keys).
+    const transientWait = code === "prefix_busy" || code === "interrupted" || code === "publish_reserved";
     const attempts = (prior?.attempts ?? 0) + (transientWait ? 0 : 1);
     const nextTry = at + (transientWait ? 2 * 60 * 1000 : Math.min(4, 2 ** Math.max(0, attempts - 1)) * 60 * 60 * 1000);
     const all = JSON.stringify([...new Set([...(prior?.keys ?? []), ...keys])].sort());
@@ -692,6 +707,35 @@ export class SyncState {
       ok = Number(this.db.prepare("DELETE FROM erasures WHERE key = ? AND enqueued_at = ?").run(key, enqueuedAt).changes) === 1;
     });
     return ok;
+  }
+  /**
+   * One bounded page RELEASING (no history: they were not erased) this scope's reservations, at or below `maxSeq`, whose
+   * versions a complete strict proof still LISTS (present). The next run re-reserves what it deletes, so a writer is
+   * never wedged behind a reservation for a version nobody deleted.
+   */
+  releasePresentPage(prefix: string, scope: string, exactKey: string | undefined, present: (key: string, versionId: string) => boolean, maxSeq: number,
+    lease?: { prefix: string; holder: string; gen: string }, expectRev?: number, limit = 1000): { released: number; done: boolean; ok: boolean; rev: number } {
+    let out = { released: 0, done: false, ok: false, rev: -1 };
+    this.#tx(() => {
+      // Compare-and-set on the non-reverting revision + the eraser's lease, like every retirement page.
+      if (!this.#leaseHeld(lease) || (expectRev !== undefined && this.obligationRev(prefix) !== expectRev)) {
+        out = { released: 0, done: false, ok: false, rev: this.obligationRev(prefix) };
+        return;
+      }
+      const where = exactKey !== undefined ? "key = ?" : SyncState.#under;
+      const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${where} AND scope = ? AND seq <= ? ORDER BY key, version_id`).all(
+        ...(exactKey !== undefined ? [exactKey] : SyncState.#u(prefix)), scope, maxSeq) as { key: string; version_id: string }[];
+      const del = this.db.prepare("DELETE FROM erase_reservations WHERE key = ? AND version_id = ?");
+      let released = 0;
+      for (const r of rows) {
+        if (released >= limit) break;
+        if (!present(r.key, r.version_id)) continue;
+        del.run(r.key, r.version_id);
+        released += 1;
+      }
+      out = { released, done: released < limit, ok: true, rev: this.obligationRev(prefix) };
+    });
+    return out;
   }
   /** Unbounded convenience over the paged retirement (tests): every page, in order. */
   retireReservations(prefix: string, absent: (key: string, versionId: string) => boolean, scope?: string) {
