@@ -95,5 +95,49 @@ describe("P0-3: the read API serves analysis results only when analysisBucket is
     const k = readApiAnalysisKeyStatement({ accountId: "a", region: "us-east-1", bucketName: "bkt", roleArn: "r", glob: ANALYSIS_RESULT_OBJECT_GLOB });
     expect(k.Action).toEqual(["kms:Decrypt"]);
     expect(k.Condition.StringLike["kms:EncryptionContext:aws:s3:arn"]).toBe("arn:aws:s3:::bkt/96bulls/*/v1/*/normalized/session-analysis-v2/*");
+
+import { transcriptBucketPolicy } from "../transcript-store.ts";
+
+/** A minimal S3 bucket-policy evaluator: explicit deny wins, then an explicit allow. */
+function evaluate(policy: any[], principal: string, action: string, resource: string): "allow" | "deny" | "implicit" {
+  const glob = (g: string) => new RegExp("^" + g.split("*").map((p) => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
+  const matchRes = (st: any) =>
+    st.Resource ? [].concat(st.Resource).some((r: string) => glob(r).test(resource)) : ![].concat(st.NotResource).some((r: string) => glob(r).test(resource));
+  const matchAct = (st: any) => [].concat(st.Action).some((a: string) => glob(a).test(action));
+  const matchPrin = (st: any) => st.Principal === "*" || [].concat(st.Principal?.AWS ?? []).includes(principal);
+  const cond = (st: any) => {
+    const c = st.Condition;
+    if (!c) return true;
+    if (c.ArnNotEquals) return ![].concat(c.ArnNotEquals["aws:PrincipalArn"]).includes(principal);
+    if (c.Bool || c.NumericLessThan || c.StringNotEquals || c.Null) return false; // transport/encryption conditions: not this request
+    return true;
+  };
+  const applies = (st: any) => matchPrin(st) && matchAct(st) && matchRes(st) && cond(st);
+  if (policy.some((st) => st.Effect === "Deny" && applies(st))) return "deny";
+  return policy.some((st) => st.Effect === "Allow" && applies(st)) ? "allow" : "implicit";
+}
+
+describe("P0-a: the FINAL aggregate bucket policy lets the analysis worker erase only its results", () => {
+  const bucketArn = "arn:aws:s3:::bkt";
+  const roleArn = "arn:aws:iam::941433935742:role/pipeline";
+  const eraserArn = "arn:aws:iam::941433935742:user/eraser";
+  const result = `${bucketArn}/96bulls/org-a/v1/ws/m/claude/d=2026/11/07/s/normalized/session-analysis-v2/0b6f3a3e-6a59-4d5c-9b1e-2f7f6c1d9a10/${"a".repeat(64)}.json`;
+  const transcript = `${bucketArn}/96bulls/org-a/v1/ws/m/claude/d=2026/11/07/s/raw/00000001.zst`;
+  const final = (on: boolean) => [
+    ...transcriptBucketPolicy({ bucketArn, keyArn: "k", eraserArn, ...(on ? { analysisDeleterArn: roleArn } : {}) }),
+    ...pipelineBucketStatements({ bucketArn, roleArn, analysisResults: on }),
+  ];
+  test("on: DeleteObjectVersion allowed on a result key, denied on any other key", () => {
+    expect(evaluate(final(true), roleArn, "s3:DeleteObjectVersion", result)).toBe("allow");
+    expect(evaluate(final(true), roleArn, "s3:DeleteObject", result)).toBe("allow");
+    expect(evaluate(final(true), roleArn, "s3:DeleteObjectVersion", transcript)).toBe("deny");
+    // Nobody else gains delete on the results; the eraser keeps it everywhere.
+    expect(evaluate(final(true), "arn:aws:iam::941433935742:user/writer", "s3:DeleteObject", result)).toBe("deny");
+    expect(evaluate(final(true), eraserArn, "s3:DeleteObjectVersion", transcript)).not.toBe("deny");
+  });
+  test("off: the eraser-only deny is exactly as before (the pipeline cannot delete anything)", () => {
+    expect(evaluate(final(false), roleArn, "s3:DeleteObjectVersion", result)).toBe("deny");
+    const deny = transcriptBucketPolicy({ bucketArn, keyArn: "k", eraserArn }).find((s: any) => s.Sid === "OnlyTheEraserDeletes") as any;
+    expect(deny.Resource).toEqual([`${bucketArn}/*`]);
   });
 });

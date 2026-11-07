@@ -27,5 +27,8 @@ $role$;
 -- name SUPERUSER/REPLICATION); the verifier refuses any elevated attribute.
 ALTER ROLE bulls96_analysis_admit LOGIN NOINHERIT;
 ALTER ROLE bulls96_analysis_admit SET statement_timeout = '2s';
+-- Read-write by design (it inserts the request and job), stated explicitly so no inherited or
+-- copied default_transaction_read_only=on can make every admission fail.
+ALTER ROLE bulls96_analysis_admit SET default_transaction_read_only = off;
 GRANT USAGE ON SCHEMA sessions TO bulls96_analysis_admit;
 COMMIT;
