@@ -153,9 +153,15 @@ readers ready, by running, after migrate:
 
 ```sh
 GEN=$(bun src/hoopdb/migrate.ts --generation)
-psql -v ON_ERROR_STOP=1 -X -v generation="$GEN" \
+psql -v ON_ERROR_STOP=1 -X -v generation="$GEN" -v db_mode="$HOOPDB_DB_MODE" \
+  -v runtime_role="$HOOPDB_RUNTIME_ROLE" \
   -f supabase/bootstrap/session_directory_search_worker_mark_pass.sql
 ```
+
+Since `20261105047000` the script also runs `portable_search_storage_verify.sql`, bound
+to `runtime_role` (the configured `HOOPDB_RUNTIME_ROLE`, never inferred from catalog
+contents), so PASS requires the portable storage admission on this route too. Without
+`-v runtime_role` psql stops before PASS.
 
 In one transaction, that script:
 

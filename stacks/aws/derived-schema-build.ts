@@ -18,7 +18,8 @@ export async function packagedDerivedSchemaSource(onInput?: (path: string) => vo
   if (JSON.stringify(first) !== JSON.stringify(final))
     throw new Error("derived schema sources changed during the build");
   if (!first.expected.names.length || !/^[0-9a-f]{64}$/.test(first.expected.generation) ||
-      !first.verifiers.searchWorker.trim() || !first.verifiers.tokenVerifier.trim()||!first.verifiers.ingestSeeder.trim()||!first.verifiers.ingest.trim())
+      !first.verifiers.searchWorker.trim() || !first.verifiers.tokenVerifier.trim()||!first.verifiers.ingestSeeder.trim()||!first.verifiers.ingest.trim()
+      || !first.portableStorageVerifier?.trim())
     throw new Error("derived schema build assets are incomplete");
   // Include generation-only SQL as well as the four runtime verifier bodies.
   // Consumers use this inventory both for watch invalidation and packaged assets.
@@ -37,7 +38,7 @@ export async function derivedSchemaAssets() {
   const dbMode = process.env.HOOPDB_DB_MODE;
   return { expected: { ...assets.expected,
     ...(["local", "selfhosted", "cloudsql", "supabase", "rds"].includes(dbMode ?? "") ? { dbMode } : {}) },
-    verifiers: assets.verifiers };
+    verifiers: assets.verifiers, portableStorageVerifier: assets.portableStorageVerifier };
 }
 `;
 }

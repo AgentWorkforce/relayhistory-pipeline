@@ -53,6 +53,7 @@ import { searchIndexLimits } from "./search-index.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
+import { PortableConnectionRefused } from "../shared/portable-connection-identity.ts";
 import type { PipelineRuntimeRegistry } from "@rhc/adapters/defaults.ts";
 import { dispatchRegisteredLambda, type PipelineLambdaEvent } from "./lambda-runtime.ts";
 import { writerTransactionSql } from "./transaction-sql.ts";
@@ -257,11 +258,35 @@ async function init(composition?: SearchComposition): Promise<Runtime> {
   });
   if (!SecretString) throw new Error("session pipeline secret has no value yet");
   const rt = runtimeFromSecret(env, SecretString, publicationSchema.expected.generation, composition);
-  // M5: a composition that declares admission refuses privileged writer identities
-  // once, before any work. runtimeFromSecret stays synchronous and network-free.
-  if (env.searchEnabled && env.searchBackend && env.searchBackend !== "clickhouse" && composition?.admit)
-    await composition.admit(rt.deps.pointer.db, "writer");
+  await admitWriterRuntime(rt, env, composition, publicationSchema.portableStorageVerifier, publicationSchema.expected.dbMode);
   return rt;
+}
+
+/**
+ * M5 + storage admission for a composition that declares it, once, before any work.
+ * One dedicated transaction: identity refusals, then the embedded storage verifier bound
+ * to this connection's own identity. On ANY refusal the runtime's newly opened pool is
+ * closed (so a retrying cold start cannot accumulate pools) and the refusal is rethrown
+ * unchanged. runtimeFromSecret stays synchronous and network-free.
+ */
+export async function admitWriterRuntime(
+  rt: Pick<Runtime, "deps">,
+  env: Pick<LambdaEnv, "searchEnabled" | "searchBackend">,
+  composition: SearchComposition | undefined,
+  storageVerifySql: string | undefined,
+  dbMode: string | undefined,
+): Promise<void> {
+  if (!(env.searchEnabled && env.searchBackend && env.searchBackend !== "clickhouse" && composition?.admit)) return;
+  const db = rt.deps.pointer.db;
+  try {
+    // A composition that declares admission requires the embedded storage verifier body:
+    // a missing or empty body refuses the profile; it never skips the check.
+    if (!storageVerifySql?.trim()) throw new PortableConnectionRefused("storage_verifier_missing");
+    await transaction(db, tx => composition.admit!(tx, "writer", { storageVerifySql, ...(dbMode ? { dbMode } : {}) }));
+  } catch (error) {
+    await db.end?.().catch(() => undefined);
+    throw error;
+  }
 }
 
 /**
