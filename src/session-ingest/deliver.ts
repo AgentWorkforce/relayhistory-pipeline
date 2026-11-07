@@ -47,7 +47,8 @@ import { batchMarkerKey, replicaMessage, sendReplica, stagedReplicaMessage, type
 import { CAS_ATTEMPTS, GROUP_ATTEMPTS, IngestWriteError, assertTenantSegment, groupRecords, liveMachineId, writeBatchObjects, type WriteResult, type WriteTarget } from "./writer.ts";
 import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { prepareBufferedStage, putBufferedStage, fanoutMessages, stageGroups, type FanoutMessage } from "./staging.ts";
-import { MAX_FETCH_REDIRECTS, babysitterStub, bucketRefs, planBabysitterBuckets, planKey, worstCaseSubrequests, writeBucketObjects, type BucketRefs } from "./babysitter-retention.ts";
+import { MAX_FETCH_REDIRECTS, babysitterStub, bucketBodies, bucketRefs, planBabysitterBuckets, planKey, worstCaseSubrequests, writeBucketObjects, type BucketRefs } from "./babysitter-retention.ts";
+import { expectedEtag } from "../migration/neon-s3-erasure/write-obligation.ts";
 
 export interface DeliverDeps {
   /** Verified private source packet, bound to this request only. */
@@ -300,16 +301,28 @@ async function writeAndCommit(
     if (!deps.ledger.registerBabysitterRetention) throw new IngestUnavailable("babysitter_retention", "retention_not_configured");
     // Registered BEFORE the bucket PUT, so no bucket exists without its row. SQL issues the refs,
     // bound to this claim's fence/reset epochs and the current generation (40001/55000 otherwise).
+    // The exact object bodies first: register records each one's expected ETag on its write
+    // obligation (write-obligation.ts), BEFORE the PUT, so a lost response is never "nothing written".
+    const bodies = bucketBodies(plan, receivedAt);
     const registered = await stage("babysitter_retention", () =>
       deps.ledger.registerBabysitterRetention!({ tenant, originId: prepared.originId, batchId: prepared.batchId, batchDigest: prepared.batchDigest,
-        claimToken, generation: deps.retentionGeneration!, resetEpoch: resets, buckets: plan.requests, records: plan.entries }),
+        claimToken, generation: deps.retentionGeneration!, resetEpoch: resets,
+        buckets: plan.requests.map((b) => ({ ...b, etag: expectedEtag(bodies.get(planKey(b))!) })), records: plan.entries }),
     );
     refs = await stage("babysitter_retention", async () => bucketRefs(plan, registered.objects));
     mark("babysitter_retention");
-    // One create-only object per bucket (idempotent by batch digest): never collapsed.
-    await stage("babysitter_buckets", () =>
-      writeBucketObjects(deps.target, { orgId: tenant.orgId, workspaceId: tenant.workspaceId, userId: tenant.userId, originId: prepared.originId, batchDigest: prepared.batchDigest }, plan, refs!, receivedAt),
-    );
+    // One create-only object per bucket (idempotent by batch digest): never collapsed. Each PUT
+    // runs under an enforced wall deadline; its definite outcome (acked with its own version id,
+    // or refused) is recorded on its invocation; an unknown one stays dispatched and fails the
+    // request (the client retries; the sweeper never treats it as nothing written).
+    if (plan.requests.length > 0) {
+      const wrote = await stage("babysitter_buckets", () =>
+        writeBucketObjects(deps.target, { orgId: tenant.orgId, workspaceId: tenant.workspaceId, userId: tenant.userId, originId: prepared.originId, batchDigest: prepared.batchDigest }, plan, refs!, bodies),
+      );
+      if (wrote.outcomes.length > 0 && deps.ledger.babysitterRetentionWritten)
+        await stage("babysitter_buckets", async () => { await deps.ledger.babysitterRetentionWritten!({ tenant, originId: prepared.originId, generation: deps.retentionGeneration!, claimToken, objects: wrote.outcomes }); });
+      if (wrote.unknown !== null) await stage("babysitter_buckets", async () => { throw wrote.unknown; });
+    }
     mark("babysitter_buckets");
   }
   const records = plan && refs ? kept.map((r) => { const b = plan.of(r); return b ? babysitterStub(r, refs!.get(planKey(b))!) : r; }) : kept;

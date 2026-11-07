@@ -15,7 +15,7 @@ import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
  * the shape the function promises is `ledger_bad_result`.
  */
 import type { StagedAttempt, LedgerRecord, SelectionInput } from "./ledger.ts";
-import type { BabysitterRetentionRegistration } from "./ledger.ts";
+import type { BabysitterRetentionRegistration, BabysitterWriteOutcome } from "./ledger.ts";
 import {
   LedgerUnavailableError,
   type ClaimInput,
@@ -66,6 +66,7 @@ type LedgerFunction =
   | "ingest_fanout_fence"
   | "ingest_commit_revisions"
   | "ingest_babysitter_retention_register"
+  | "ingest_babysitter_retention_written"
   | "ingest_frozen_source_witness"
   | "ingest_source_control_begin"
   | "ingest_source_control_complete"
@@ -308,6 +309,11 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
         return { ref: x.ref, source: x.source, sessionId: x.sessionId as string | null, eraseAfterMs: x.eraseAfterMs };
       });
       return { objects, reopened: r.reopened };
+    },
+    async babysitterRetentionWritten(input: BabysitterWriteOutcome) {
+      const r = (await call(run, "ingest_babysitter_retention_written", input)) as Record<string, unknown>;
+      if (typeof r.updated !== "number") throw new LedgerUnavailableError("ledger_bad_result");
+      return r.updated;
     },
     async resetUploadedSessions(tenant: LedgerTenant, requestId: string): Promise<number> {
       const r = (await call(run, "ingest_reset_uploaded_sessions", options.acceptanceMode==="buffered"?buffered({tenant,requestId}):{tenant,requestId})) as Record<string, unknown>;

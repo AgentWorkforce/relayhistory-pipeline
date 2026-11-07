@@ -15,15 +15,18 @@ END $rollback_guard$;
 DROP TRIGGER babysitter_retention_audit_append_only ON sessions.babysitter_retention_audit;
 DROP FUNCTION sessions.babysitter_retention_configure(jsonb),
  sessions.babysitter_evidence_page_for(text,jsonb),
+ sessions.ingest_babysitter_retention_obligation(jsonb),
+ sessions.ingest_babysitter_retention_written(jsonb),
  sessions.ingest_babysitter_retention_fence(jsonb),
  sessions.ingest_babysitter_retention_complete(jsonb),
  sessions.ingest_babysitter_retention_claim(jsonb),
  sessions.babysitter_retention_due_reason(sessions.babysitter_retention_objects),
  sessions.babysitter_retention_fenced(sessions.babysitter_retention_objects),
+ sessions.babysitter_evidence_fenced(text,text,text,text,text,text,bigint,bigint),
  sessions.ingest_babysitter_retention_register(jsonb),
  sessions.babysitter_retention_bucket_hour(text),
  sessions.babysitter_retention_audit_guard();
-DROP TABLE sessions.babysitter_evidence_index,sessions.babysitter_retention_audit,sessions.babysitter_retention_objects,sessions.babysitter_retention_settings;
+DROP TABLE sessions.babysitter_evidence_index,sessions.babysitter_write_invocations,sessions.babysitter_write_obligations,sessions.babysitter_retention_audit,sessions.babysitter_retention_objects,sessions.babysitter_retention_settings;
 DO $ledger$ BEGIN
  IF to_regclass('sessions.__96bulls_migrations')IS NOT NULL THEN
   DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105042000_babysitter_evidence_retention.sql';

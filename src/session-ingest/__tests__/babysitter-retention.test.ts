@@ -16,7 +16,7 @@ import {
   babysitterBucket,
   babysitterRetentionTick,
   planBabysitterBuckets,
-  babysitterTombstoneBucket,
+  isBabysitterTombstone,
   retentionTargets,
   routingFlag,
   sweepMode,
@@ -27,6 +27,7 @@ import {
 } from "../babysitter-retention.ts";
 import type { EraseCheckpoint, EraseStepOptions, EraseStepResult, ErasedProof, PagedEraser } from "../../migration/neon-s3-erasure/eraser.ts";
 import { FakeS3Versions } from "../../migration/__tests__/fake-s3-versions.ts";
+import { expectedEtag } from "../../migration/neon-s3-erasure/write-obligation.ts";
 import { babysitterRoutingActive, deliverBatch, DeliveryBudgetExceeded, IngestUnavailable } from "../deliver.ts";
 import type { BabysitterRetentionRegistration } from "../ledger.ts";
 import { liveMachineId } from "../writer.ts";
@@ -77,6 +78,12 @@ async function chunkText(store: ObjectStore, prefix: string): Promise<string> {
 class RecordingLedger extends MemoryLedger {
   registrations: BabysitterRetentionRegistration[] = [];
   order: string[] = [];
+  outcomes: { ref: string; object: string; outcome: string; versionId: string | null }[][] = [];
+  async babysitterRetentionWritten(input: { objects: { ref: string; object: string; outcome: string; versionId: string | null }[] }) {
+    this.outcomes.push(input.objects);
+    this.order.push(`written:${input.objects.map((o) => o.outcome).join(",")}`);
+    return input.objects.length;
+  }
   async registerBabysitterRetention(input: BabysitterRetentionRegistration) {
     this.registrations.push(input);
     this.order.push("register");
@@ -128,7 +135,7 @@ describe("bucket derivation", () => {
     const ok = bucketRefs(three, three.requests.map((r, i) => ({ ...r, ref: `_bx2026120614-${String(i).repeat(16)}` })));
     expect(ok.size).toBe(2);
   });
-  test("tombstones: a Babysitter-kind delete becomes an index-only key row (no object line), kept 30 days from receipt", () => {
+  test("tombstones: a Babysitter-kind delete becomes a PERMANENT index-only key row with no bucket and no object line", () => {
     const now = Date.UTC(2026, 10, 7, 5, 30);
     const del = { ...receipt("gone"), operation: "delete", payload: null, revision: 2, revision_id: "gone:2" };
     const plan = planBabysitterBuckets([receipt("a"), del, receipt("b")] as never, now);
@@ -136,10 +143,12 @@ describe("bucket derivation", () => {
     expect(plan.tombstones).toHaveLength(1);
     const tomb = plan.entries.find((e) => e.operation === "delete")!;
     expect(tomb).toMatchObject({ recordId: "gone", revision: "2", revisionId: "gone:2", line: null, expiresAtMs: null });
-    expect(plan.requests[tomb.bucket]!.eraseAfterMs).toBe(Math.ceil((now + 30 * 24 * HOUR) / HOUR) * HOUR);
+    expect(tomb).toMatchObject({ bucket: null, source: "claude", sessionId: "sess-1" });
+    expect(plan.requests).toHaveLength(1);   // the upserts' bucket only: a tombstone opens no bucket
     // Upsert lines are numbered in the exact order writeBucketObjects writes them.
     expect(plan.entries.filter((e) => e.operation === "upsert").map((e) => [e.recordId, e.line])).toEqual([["a", 0], ["b", 1]]);
-    expect(babysitterTombstoneBucket({ kind: "session_event", operation: "delete", source: "claude", session_id: "s" }, now)).toBeNull();
+    expect(isBabysitterTombstone({ kind: "session_event", operation: "delete" })).toBe(false);
+    expect(isBabysitterTombstone({ kind: "turn_receipt", operation: "delete" })).toBe(true);
   });
   test("routing flag is case-insensitive like the sweep flag; anything else is off", () => {
     expect(routingFlag("on")).toBe(true);
@@ -169,7 +178,7 @@ describe("write path (canonical inline and staged)", () => {
     const reg = rec.registrations[0]!;
     expect(reg).toMatchObject({ resetEpoch: 0, generation: GEN, batchId: "batch-1" });
     expect(reg.claimToken).toMatch(/^[0-9a-f-]{36}$/);
-    expect(reg.buckets).toEqual([{ source: "claude", sessionId: "sess-1", eraseAfterMs: Date.UTC(2026, 11, 6, 14) }]);
+    expect(reg.buckets).toEqual([{ source: "claude", sessionId: "sess-1", eraseAfterMs: Date.UTC(2026, 11, 6, 14), etag: expect.stringMatching(/^[0-9a-f]{32}$/) }]);
     const ref = (await rec.registerBabysitterRetention(reg)).objects[0]!.ref;
     // One create-only object per (bucket, batch): no manifest and no live-session pointer.
     const bucketKeys = await listAll(store, bucketPrefix);
@@ -355,10 +364,25 @@ function claimed(over: Partial<ClaimedObject> = {}): ClaimedObject {
     ref: `_bx2026120614-${"a".repeat(16)}`, reason: "expired", fenceEpoch: 0, resetEpoch: 0, writeSeq: 1, eraseRuns: 0, checkpoint: null, ...over };
 }
 
-function fakeLedger(objects: ClaimedObject[], settings = { enabled: true, dryRun: false }, fenceOk = true) {
+type FakeInvocation = { id: string; outcome: "dispatched" | "acked" | "refused"; versionId?: string; observedVersion?: string; expectedEtag?: string };
+type FakeObligation = { object: string; rev: number; invocations: FakeInvocation[]; checkpoint: EraseCheckpoint | null; sweeps: number };
+function fakeLedger(objects: ClaimedObject[], settings = { enabled: true, dryRun: false }, fenceOk = true, obligations: FakeObligation[] = []) {
   const completions: { token: string; outcome: string; versions: number; checkpoint?: EraseCheckpoint | null }[] = [];
   let fences = 0;
+  const table = new Map(obligations.map((o) => [o.object, o]));
   const ledger: BabysitterRetentionLedger = {
+    obligations: async (_token, q) => {
+      if (q.action === "list") return { ok: true, objects: [...table.keys()] };
+      const o = table.get(q.object!);
+      if (q.action === "load") return { ok: true, obligation: o ? { rev: o.rev, invocations: o.invocations.map((i) => ({ ...i })), checkpoint: o.checkpoint, sweeps: o.sweeps } : null };
+      if (!o || o.rev !== q.rev) return { ok: false };
+      if (q.action === "observe") { const i = o.invocations.find((x) => x.id === q.invocations![0] && x.outcome === "dispatched" && !x.observedVersion); if (!i) return { ok: false }; i.observedVersion = q.versionId!; }
+      if (q.action === "checkpoint") o.checkpoint = q.checkpoint ?? null;
+      if (q.action === "resolve") o.invocations = o.invocations.filter((i) => !q.invocations!.includes(i.id));
+      if (q.action === "reschedule") { o.sweeps++; o.checkpoint = null; }
+      if (q.action === "retire") { if (o.invocations.length) return { ok: false }; table.delete(o.object); return { ok: true, rev: o.rev + 1 }; }
+      return { ok: true, rev: ++o.rev };
+    },
     claim: async () => ({ ...settings, objects }),
     fence: async () => { fences++; return fenceOk; },
     complete: async (token, outcome, versions, checkpoint) => {
@@ -366,7 +390,7 @@ function fakeLedger(objects: ClaimedObject[], settings = { enabled: true, dryRun
       return { ok: true, state: outcome === "erased" ? "erased" : "pending" };
     },
   };
-  return { ledger, completions, fences: () => fences };
+  return { ledger, completions, fences: () => fences, table };
 }
 
 /** A PagedEraser double: one traversal deleting 3 versions after authorize(), then a zero proof. */
@@ -393,7 +417,7 @@ function fakeEraser() {
 describe("sweep tick (durable resumable strict erase)", () => {
   test("off does nothing at all", async () => {
     let claims = 0;
-    await babysitterRetentionTick({ ledger: { claim: async () => { claims++; return { enabled: true, dryRun: false, objects: [] }; }, fence: async () => true, complete: async () => ({ ok: true }) }, eraser: fakeEraser().eraser, keyRoot: "96bulls", generation: G, mode: "off" });
+    await babysitterRetentionTick({ ledger: { claim: async () => { claims++; return { enabled: true, dryRun: false, objects: [] }; }, fence: async () => true, complete: async () => ({ ok: true }), obligations: async () => ({ ok: true, objects: [] }) }, eraser: fakeEraser().eraser, keyRoot: "96bulls", generation: G, mode: "off" });
     expect(claims).toBe(0);
   });
 
@@ -505,7 +529,7 @@ describe("sweep tick (durable resumable strict erase)", () => {
   });
 
   test("a raced erase is not counted as erased", async () => {
-    const ledger: BabysitterRetentionLedger = { claim: async () => ({ enabled: true, dryRun: false, objects: [claimed()] }), fence: async () => true, complete: async () => ({ ok: true, state: "pending" }) };
+    const ledger: BabysitterRetentionLedger = { claim: async () => ({ enabled: true, dryRun: false, objects: [claimed()] }), fence: async () => true, complete: async () => ({ ok: true, state: "pending" }), obligations: async () => ({ ok: true, objects: [] }) };
     expect(await babysitterRetentionTick({ ledger, eraser: fakeEraser().eraser, keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 0, raced: 1 });
   });
 
@@ -636,13 +660,14 @@ describe("E3 erasure phase (no new process, Lambda or S3 key)", () => {
     expect(() => poolConfig("postgresql://bulls96_babysitter_retention@127.0.0.1:5432/postgres", false)).toThrow("pooler");
     expect(poolConfig("postgresql://bulls96_babysitter_retention@127.0.0.1:5432/postgres", true).ssl).toBeUndefined();
   });
-  test("fixed call allowlist: the phase sends only its four statements; anything else is refused unsent", async () => {
+  test("fixed call allowlist: the phase sends only its five statements; anything else is refused unsent", async () => {
     const sent: string[] = [];
     const pool = { end: async () => {}, query: async (sql: string) => {
       sent.push(sql);
       if (sql.startsWith("SELECT current_user")) return { rows: [{ c: "bulls96_babysitter_retention" }] };
       if (sql.includes("_claim(")) return { rows: [{ result: { enabled: true, dryRun: false, objects: [claimed()] } }] };
       if (sql.includes("_fence(")) return { rows: [{ result: { ok: true } }] };
+      if (sql.includes("_obligation(")) return { rows: [{ result: { ok: true, objects: [] } }] };
       return { rows: [{ result: { ok: true, state: "erased" } }] };
     } };
     const settings = phaseSettings(env({ BABYSITTER_RETENTION_SWEEP: "on", INGEST_EXPECT_GENERATION: gen }), true, "96bulls");
@@ -687,5 +712,100 @@ describe("retention buckets are never indexed as sessions", () => {
     const { indexPointer } = await import("../../session-pipeline/pointer.ts");
     const deps = new Proxy({}, { get: () => { throw new Error("no dependency may be touched"); } });
     expect(await indexPointer({ key } as never, deps as never)).toEqual({ status: "ignored", reason: "retention_bucket" });
+  });
+});
+
+describe("lead ruling: an unresolved PUT is never 'nothing was written' (per-invocation write obligations)", () => {
+  const o0 = claimed();
+  const raw = `${retentionTargets("96bulls", o0).prefix}raw/`;
+  const OBJ = `b=${"a".repeat(32)}.ndjson.zst`;
+  const BODY = new TextEncoder().encode("the bucket object body"), ETAG = expectedEtag(BODY);
+  const ob = (...invocations: FakeInvocation[]): FakeObligation => ({ object: OBJ, rev: 1, invocations, checkpoint: null, sweeps: 0 });
+  const dispatched = (id = crypto.randomUUID()): FakeInvocation => ({ id, outcome: "dispatched", expectedEtag: ETAG });
+
+  test("a lost response, abort + hold-off + an initial ZERO inventory: never erased, tracked; the late original PUT is attributed, erased, and only then the bucket is erased", async () => {
+    const s = new FakeS3Versions();
+    const a = fakeLedger([claimed()], undefined, true, [ob(dispatched())]);
+    const r1 = await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" });
+    expect(r1).toMatchObject({ erased: 0, progressed: 1, codes: { obligation_rescheduled: 1 } });
+    expect(a.table.get(OBJ)!.invocations).toHaveLength(1);
+    const late = s.put(`${raw}${OBJ}`, Date.now(), ETAG);   // the provider commits it after all of that
+    const b = fakeLedger([claimed()], undefined, true, [a.table.get(OBJ)!]);
+    expect((await babysitterRetentionTick({ ledger: b.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).erased).toBe(1);
+    expect(s.deletes).toEqual([`${raw}${OBJ}@${late}`]);
+    expect(b.table.size).toBe(0);
+  });
+
+  test("a different body at the same key (another attempt's, or a stray) is erased but never resolves this invocation", async () => {
+    const s = new FakeS3Versions();
+    s.put(`${raw}${OBJ}`, 1, expectedEtag(new TextEncoder().encode("another body")));
+    const a = fakeLedger([claimed()], undefined, true, [ob(dispatched())]);
+    expect(await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 0, progressed: 1 });
+    expect(s.count(raw)).toBe(0);
+    expect(a.table.get(OBJ)!.invocations).toHaveLength(1);
+  });
+
+  test("two dispatched attempts at one key, one version appears: one resolves, the bucket stays tracked for the other", async () => {
+    const s = new FakeS3Versions();
+    s.put(`${raw}${OBJ}`, 1, ETAG);
+    const a = fakeLedger([claimed()], undefined, true, [ob(dispatched("inv-a"), dispatched("inv-b"))]);
+    expect(await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 0, progressed: 1 });
+    expect(a.table.get(OBJ)!.invocations).toHaveLength(1);
+  });
+
+  test("acked (its own version, gone after the erase) and refused invocations resolve; the bucket is erased", async () => {
+    const s = new FakeS3Versions();
+    const v = s.put(`${raw}${OBJ}`, 1, ETAG);
+    const a = fakeLedger([claimed()], undefined, true, [ob({ id: "ok", outcome: "acked", versionId: v }, { id: "no", outcome: "refused" })]);
+    expect((await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).erased).toBe(1);
+    expect(a.table.size).toBe(0);
+  });
+
+  test("the attribution is durable before the bucket-wide delete: a lost DELETE ack keeps it, and the rerun completes", async () => {
+    const s = new FakeS3Versions();
+    const v = s.put(`${raw}${OBJ}`, 1, ETAG);
+    let lose = true;
+    s.onDelete = () => (lose ? ((lose = false), "lose") : undefined);
+    const a = fakeLedger([claimed()], undefined, true, [ob(dispatched("inv-1"))]);
+    expect(await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 0, failed: 1 });
+    expect(a.table.get(OBJ)!.invocations[0]!.observedVersion).toBe(v);
+    const b = fakeLedger([claimed()], undefined, true, [a.table.get(OBJ)!]);
+    expect((await babysitterRetentionTick({ ledger: b.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).erased).toBe(1);
+  });
+
+  test("crash/restart with a bucket checkpoint keeps the obligation: a resumed run still cannot erase while an invocation is unresolved", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 10;
+    for (let i = 0; i < 25; i++) s.put(`${raw}b=${String(i).padStart(32, "0")}.ndjson.zst`, 1, "f".repeat(32));
+    const a = fakeLedger([claimed()], undefined, true, [ob(dispatched())]);
+    await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on", eraseBudget: { pages: 1 } });
+    const cp = a.completions[0]!.checkpoint!;
+    const b = fakeLedger([claimed({ checkpoint: cp })], undefined, true, [a.table.get(OBJ)!]);
+    expect(await babysitterRetentionTick({ ledger: b.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 0, progressed: 1 });
+    expect(b.table.get(OBJ)!.invocations).toHaveLength(1);
+    expect(s.count(raw)).toBe(0);
+  });
+});
+
+describe("deliver: the expected ETag is registered BEFORE the PUT; definite outcomes are recorded", () => {
+  test("an acked PUT records acked with its own version; the registered ETag is the object body's MD5", async () => {
+    const { deps, ledger, store } = setup({ routing: true });
+    await deliverBatch(deps as never, TENANT, await batch([receipt("ack-1")]));
+    const rec = ledger as RecordingLedger;
+    expect(rec.order.indexOf("register")).toBeLessThan(rec.order.findIndex((x) => x.startsWith("written:")));
+    expect(rec.outcomes.flat().map((o) => o.outcome)).toEqual(["acked"]);
+    const key = (await listAll(store, bucketPrefix)).find((k) => k.includes("/raw/"))!;
+    const body = await readAll((await store.getObject(objectKey(key))).body);
+    expect(rec.registrations[0]!.buckets[0]!.etag).toBe(expectedEtag(body));
+  });
+
+  test("a PUT that errors leaves the invocation dispatched (nothing reported) and fails the request; a retry's 412-style refusal is recorded as refused", async () => {
+    const failing = setup({ routing: true });
+    const put = failing.deps.target.store.put.bind(failing.deps.target.store);
+    failing.deps.target.store.put = (async (key: never, body: never, opts: never) => {
+      if (String(key).includes("/h=_babysitter/")) throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+      return put(key, body, opts);
+    }) as never;
+    await expect(deliverBatch(failing.deps as never, TENANT, await batch([receipt("ack-2")]))).rejects.toBeDefined();
+    expect((failing.ledger as RecordingLedger).outcomes).toEqual([]);
   });
 });

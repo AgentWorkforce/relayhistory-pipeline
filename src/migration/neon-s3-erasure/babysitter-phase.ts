@@ -33,7 +33,8 @@
  *      SELECT sessions.ingest_babysitter_retention_claim($1::jsonb) AS result     {generation, limit 1..200}
  *      SELECT sessions.ingest_babysitter_retention_fence($1::jsonb) AS result     {generation, leaseToken} (before every page of deletes)
  *      SELECT sessions.ingest_babysitter_retention_complete($1::jsonb) AS result  {generation, leaseToken, outcome erased|progress|released, versions, checkpoint}
- *    and the role itself can EXECUTE only those three functions (20261105042000).
+ *      SELECT sessions.ingest_babysitter_retention_obligation($1::jsonb) AS result {generation, leaseToken, action, objects, checkpoint, strayFound}
+ *    and the role itself can EXECUTE only those four functions (20261105042000).
  *  - bounds: statement and lock timeout 1.8 s, connect 1 s, pool max 2, claim 1..200,
  *    tick budget 45 s, lease 5 min (erase starts with >= 2 min left, cut at lease - 1 min),
  *    interval >= 60 s.
@@ -106,6 +107,7 @@ export const ALLOWED_SQL: ReadonlySet<string> = new Set([
   "SELECT sessions.ingest_babysitter_retention_claim($1::jsonb) AS result",
   "SELECT sessions.ingest_babysitter_retention_fence($1::jsonb) AS result",
   "SELECT sessions.ingest_babysitter_retention_complete($1::jsonb) AS result",
+  "SELECT sessions.ingest_babysitter_retention_obligation($1::jsonb) AS result",
 ]);
 
 /** The only way the phase talks to the database: a statement outside ALLOWED_SQL is refused unsent. */

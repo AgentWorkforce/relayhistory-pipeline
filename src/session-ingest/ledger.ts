@@ -208,6 +208,8 @@ export interface Ledger {
    * is on; a ledger without it makes such a batch a retryable 503.
    */
   registerBabysitterRetention?(input: BabysitterRetentionRegistration): Promise<{ objects: BabysitterRetentionObject[]; reopened: number }>;
+  /** The bucket PUTs' outcome: acked (with versions) or unknown (may still commit). */
+  babysitterRetentionWritten?(input: BabysitterWriteOutcome): Promise<number>;
   /** Staged path: the records one slice wrote become stored (a session fenced since is re-armed instead). */
   commitRevisions(tenant: LedgerTenant, originId: string, machineId: string, records: LedgerRecord[], attempt: StagedAttempt): Promise<{ committed: number; rearmed: number }>;
 }
@@ -238,9 +240,20 @@ export interface BabysitterRetentionRegistration {
   generation: string;
   /** The user's reset count the claim saw. */
   resetEpoch: number;
-  buckets: BabysitterRetentionRequest[];
+  /** Each bucket with its object body's expected ETag (MD5), recorded on the write obligation. */
+  buckets: (BabysitterRetentionRequest & { etag: string })[];
   /** The content-free key index rows (babysitter-retention.ts BabysitterIndexEntry). */
-  records: { bucket: number; originId: string; recordId: string; revision: string; revisionId: string; digest: string; operation: "upsert" | "delete"; kind: string; line: number | null; expiresAtMs: number | null }[];
+  records: { bucket: number | null; originId: string; recordId: string; revision: string; revisionId: string; digest: string; operation: "upsert" | "delete"; kind: string; source: string; sessionId: string | null; line: number | null; expiresAtMs: number | null }[];
+}
+
+/** The writer's PUT outcome for its registered bucket objects (write-obligation.ts writer side). */
+export interface BabysitterWriteOutcome {
+  tenant: LedgerTenant;
+  originId: string;
+  generation: string;
+  claimToken: string;
+  /** Definite outcomes only (an unknown outcome is never reported: the invocation stays dispatched). */
+  objects: ({ ref: string; object: string; outcome: "acked"; versionId: string } | { ref: string; object: string; outcome: "refused"; versionId: null })[];
 }
 
 /** The ledger is unreachable or refused: the batch answers 503 (retryable), never a fallback. */

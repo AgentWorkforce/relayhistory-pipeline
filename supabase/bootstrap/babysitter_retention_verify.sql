@@ -6,7 +6,8 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  v_allowed text[] := ARRAY[
  'sessions.ingest_babysitter_retention_claim(jsonb)',
  'sessions.ingest_babysitter_retention_complete(jsonb)',
- 'sessions.ingest_babysitter_retention_fence(jsonb)'
+ 'sessions.ingest_babysitter_retention_fence(jsonb)',
+ 'sessions.ingest_babysitter_retention_obligation(jsonb)'
  ]::text[];
  v_oids oid[];
  v_table text:='SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'||

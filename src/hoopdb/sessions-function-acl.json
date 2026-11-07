@@ -21,6 +21,9 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.babysitter_evidence_fenced(text,text,text,text,text,text,bigint,bigint)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.babysitter_evidence_page_for(text,jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
@@ -204,7 +207,15 @@
       "<owner>:EXECUTE",
       "bulls96_babysitter_retention:EXECUTE"
     ],
+    "sessions.ingest_babysitter_retention_obligation(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_babysitter_retention:EXECUTE"
+    ],
     "sessions.ingest_babysitter_retention_register(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_babysitter_retention_written(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
