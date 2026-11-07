@@ -182,6 +182,11 @@ export async function applyBackfill(
     eraser: PagedEraser;
     /** The PUT's hard deadline (default ANALYSIS_PUT_TIMEOUT_MS, well inside the ticket lease). */
     putTimeoutMs?: number;
+    /**
+     * One transaction on ONE connection for each scoped admission (see scopeLock). Default:
+     * BEGIN / COMMIT on `db`, which must then be a single connection (a pg Client), never a pool.
+     */
+    transact?: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
   },
 ): Promise<{ jobs: number; requests: number; objects: number }> {
   if (typeof options?.eraser?.eraseStep !== "function" || typeof options.eraser.verifyErased !== "function")
@@ -189,6 +194,32 @@ export async function applyBackfill(
   const prefix = await anchorPrefix(db, scope);
   const scopeParams = [scope.orgId, scope.workspaceId, scope.sessionId];
   const scope_ = scope;
+  const transact = options.transact ?? (async <T,>(work: (tx: SqlExecutor) => Promise<T>): Promise<T> => {
+    await db.query("BEGIN");
+    try {
+      const out = await work(db);
+      await db.query("COMMIT");
+      return out;
+    } catch (error) {
+      await db.query("ROLLBACK").catch(() => {});
+      throw error;
+    }
+  });
+  /**
+   * The per-scope serialization C3's purge shares (purge_session_analysis_for_owned and
+   * analysis_request_v1 take the same pg_advisory_xact_lock first). Each admission (the job row,
+   * every request-history row) runs in its own transaction that takes the lock BEFORE its
+   * generation/fence-checked statement: a purge holding the lock blocks it until the purge
+   * commits, after which the statement's fresh snapshot sees the fence and inserts nothing; a
+   * purge that comes later deletes what was admitted. Never a stale-snapshot insert after a purge.
+   */
+  const scopeLock = <T,>(work: (tx: SqlExecutor) => Promise<T>) =>
+    transact(async (tx) => {
+      await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `session-analysis-scope:${scope.orgId}/${scope.workspaceId}/${scope.sessionId}`,
+      ]);
+      return work(tx);
+    });
   // This run's writer identity: every ticket fence names it, so a successor's live lease is
   // never mistaken for ours, and a takeover is possible only after our lease expired.
   const writer = randomUUID();
@@ -373,7 +404,7 @@ export async function applyBackfill(
       versionId = ack?.versionId ?? got.meta.version.version ?? null;
       objects += 1;
     }
-    const { rows } = await db.query<{ live: boolean; inserted: number; current: boolean }>(
+    const { rows } = await scopeLock((tx) => tx.query<{ live: boolean; inserted: number; current: boolean }>(
       `WITH ins AS (
          INSERT INTO sessions.session_analysis_jobs_v2
            (id, org_id, workspace_id, session_id, harness, status, attempts, analysis_version, schema_version,
@@ -394,7 +425,7 @@ export async function applyBackfill(
       [job.id, ...scopeParams, job.harness, job.status, job.attempts, job.analysis_version, job.schema_version,
        job.model_version, job.summary_version, job.summary_model_version, job.source_fingerprint, ref?.key ?? null,
        ref?.sha256 ?? null, ref?.bytes ?? null, job.last_error, job.created_at, job.updated_at, job.completed_at, writer, generation, versionId],
-    );
+    ));
     if (!rows[0]?.live) throw new BackfillError("backfill_session_not_live");
     if (!(rows[0] as { current?: boolean }).current) throw new BackfillError("backfill_generation_changed");
     if (Number(rows[0]?.inserted) !== 1) {
@@ -417,7 +448,7 @@ export async function applyBackfill(
   // Request history is bound to the same captured generation and to the absence of a C3 purge
   // fence IN THE SAME STATEMENT: a purge committed after the capture inserts nothing.
   for (const r of plan.requests) {
-    const { rows } = await db.query<{ current: boolean }>(
+    const { rows } = await scopeLock((tx) => tx.query<{ current: boolean }>(
       `/* backfill:request */ WITH ins AS (
          INSERT INTO sessions.session_analysis_requests_v2
            (id, org_id, workspace_id, session_id, requested_by_user_id, status, analysis_job_id, v1_job_id,
@@ -429,7 +460,11 @@ export async function applyBackfill(
        )
        SELECT (${LIVE} AND ${GENERATION} AND ${NOT_PURGED}) AS current`,
       [r.id, ...scopeParams, r.status, r.analysis_job_id, r.v1_job_id, generation, r.last_error, r.created_at, r.updated_at],
-    );
+    ).then((res) => {
+      // Refused inside the transaction: nothing it inserted survives.
+      if (!res.rows[0]?.current) throw new BackfillError("backfill_generation_changed");
+      return res;
+    }));
     if (!rows[0]?.current) throw new BackfillError("backfill_generation_changed");
   }
   // And the generation is re-verified before success.
