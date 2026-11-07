@@ -29,6 +29,10 @@ DECLARE
   v_row record;
   v_default text[];
 BEGIN
+  IF current_setting('server_version_num')::int < 160000 THEN
+    RAISE EXCEPTION USING ERRCODE = '0A000',
+      MESSAGE = 'RDS function boundary requires PostgreSQL 16 or later';
+  END IF;
   IF (SELECT rolsuper FROM pg_roles WHERE oid = v_me) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = 'RDS function boundary: the migration owner must not be SUPERUSER';

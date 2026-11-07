@@ -37,6 +37,7 @@ export interface Transport {
     mode: PutMode,
     metadata: Metadata,
     contentType: string,
+    signal?: AbortSignal,
   ): Promise<ObjectVersion>;
   head(key: ObjectKey): Promise<ObjectMeta | undefined>;
   getObject(key: ObjectKey, range?: ByteRange): Promise<GetObject>;
@@ -156,12 +157,15 @@ export class BaseStore implements ObjectStore {
         ? { kind: "update", version: opts.ifMatch }
         : { kind: "overwrite" };
     try {
+      if (opts.signal?.aborted)
+        throw new ObjectStoreError("transient", this.backend, `${key}: put aborted`);
       const version = await this.#transport.put(
         key,
         body,
         mode,
         metadata,
         contentType,
+        opts.signal,
       );
       return {
         key,

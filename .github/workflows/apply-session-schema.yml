@@ -45,7 +45,7 @@ env:
 jobs:
   # No environment here: a typo/missing environment must not auto-create an unprotected one.
   prerequisite-gate:
-    if: github.repository == 'AgentWorkforce/sessions-pipeline' && github.ref == 'refs/heads/main'
+    if: github.repository_id == '1437714333' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -94,7 +94,7 @@ jobs:
         with:
           name: schema-release-plan
           path: release-plan
-          repository: AgentWorkforce/sessions-pipeline
+          repository: ${{ github.repository }}
           run-id: ${{ inputs.plan_run }}
           github-token: ${{ github.token }}
       - name: Read-only plan or approved apply (only step with database secret)

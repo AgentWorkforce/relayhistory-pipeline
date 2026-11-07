@@ -254,12 +254,12 @@ jobs:
           provenance: mode=max
           tags: us-central1-docker.pkg.dev/agentrelay-96bulls-soc2-2610/awf-conformance-images/96bulls-services:sha-${{ github.sha }}
           labels: |
-            org.opencontainers.image.source=https://github.com/AgentWorkforce/sessions-pipeline
+            org.opencontainers.image.source=https://github.com/AgentWorkforce/relayhistory-pipeline
             org.opencontainers.image.revision=${{ github.sha }}
           annotations: |
-            index:org.opencontainers.image.source=https://github.com/AgentWorkforce/sessions-pipeline
+            index:org.opencontainers.image.source=https://github.com/AgentWorkforce/relayhistory-pipeline
             index:org.opencontainers.image.revision=${{ github.sha }}
-            manifest:org.opencontainers.image.source=https://github.com/AgentWorkforce/sessions-pipeline
+            manifest:org.opencontainers.image.source=https://github.com/AgentWorkforce/relayhistory-pipeline
             manifest:org.opencontainers.image.revision=${{ github.sha }}
       - name: Digest
         env:

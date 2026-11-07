@@ -196,7 +196,7 @@ phase 2 can mark PASS.
 
 - **Missing role:** `runtime_role_missing`.
 - **The migrator itself (owner-as-runtime):** accepted only in `local` (the Docker
-  stack, where one superuser runs everything). Refused in `selfhosted`, `cloudsql` and `supabase`
+  stack, where one superuser runs everything). Refused in `selfhosted`, `cloudsql`, `supabase` and `rds`
   (`runtime_role_unsafe`).
 - **Who creates the dedicated role:**
   - `selfhosted` (CNPG): the privileged
@@ -243,7 +243,7 @@ violation is named:
 - **TEMPORARY is refused**, except for one Supabase-only platform baseline: effective
   TEMPORARY must come solely from PUBLIC, the role must have no direct TEMPORARY ACL or
   PUBLIC GRANT OPTION. A configured workload does not change this database-wide PUBLIC
-  baseline. Local, selfhosted and cloudsql still refuse every effective TEMPORARY grant.
+  baseline. Local, selfhosted, cloudsql and rds still refuse every effective TEMPORARY grant.
   This is compatibility, not a
   service requirement: no service creates temporary objects or relies on runtime
   `search_path` (the runtime temp-usage audit is not kept in the repository).
@@ -392,6 +392,10 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |
 | `upstream:20261105038000_claim_attempt_records_retirement.sql` | column sessions.ingest_claim_attempts.records_retired_at |
 | `upstream:20261105039000_buffered_gc_single_candidate.sql` | replacement: GC claim contains its single-candidate advisory admission domain |
+| `upstream:20261105040000_ingest_lazy_source_tables.sql` | replacement: lazy-current adoption checks exclude the source-side tables |
+| `upstream:20261105041000_ingest_privacy_authority.sql` | table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix) |
+| `upstream:20261105042000_babysitter_evidence_retention.sql` | table sessions.babysitter_retention_objects |
+| `upstream:20261105043000_brief_titles.sql` | column sessions.session_briefs.origin |
 | `upstream:20261105047000_portable_search_storage.sql` | table sessions.search_projection_state |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
@@ -541,7 +545,7 @@ config fails closed.
   on PG15 and PG17). Separately, every existing `sessions` function must be owned by the
   owner (`sessions_functions_owned_by_owner`).
 - **Run-time exact manifest (every non-local mode: `global-default-revoke` in
-  `selfhosted` and `cloudsql`, `event-trigger` in `supabase`):** after the last
+  `selfhosted`, `cloudsql` and `rds`, `event-trigger` in `supabase`):** after the last
   migration, inside the validation transaction with phase 2 and the PASS write, every
   `sessions` function's ACL must equal `src/hoopdb/sessions-function-acl.json` plus
   `<runtime role>:EXECUTE` on `RUNTIME_APPLICATION_FUNCTIONS` (#116)
@@ -573,7 +577,7 @@ config fails closed.
   (`sessions_schema_function_defaults` must be empty; tested on PG15 and PG17).
 - **`event-trigger` (supabase only):** a reviewed `ddl_command_end` event trigger scoped
   to `sessions`, with no project-wide `ALTER DEFAULT PRIVILEGES`. Accepted only with
-  `HOOPDB_DB_MODE=supabase`; `selfhosted`, `cloudsql` and `local` refuse it
+  `HOOPDB_DB_MODE=supabase`; `selfhosted`, `cloudsql`, `rds` and `local` refuse it
   (`function_boundary_mode_unsupported`) and keep `global-default-revoke`.
   - **Install:** `supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql`, run
     as `postgres` after the runtime-role and Worker bootstraps and before migrate
@@ -705,7 +709,12 @@ the reviewed alternative for Supabase. Tracked in #98.
 
 ## Amazon RDS for PostgreSQL (`rds` mode)
 
-RDS for PostgreSQL 16+ only (proven against an emulation on PostgreSQL 17). **Aurora is a
+This is a self-host/customer profile. Production remains Supabase + S3 under
+ADR 0001; enabling this profile does not authorize a production database change.
+`HOOPDB_DB_MODE=rds` is now accepted (previously it was `db_mode_invalid`), and it
+refuses a server without the required RDS catalog shape before any migration write.
+
+RDS for PostgreSQL 16+ only (CI emulates PostgreSQL 16 and 17). **Aurora is a
 separate variant and is NOT covered** (`aurora` is `db_mode_invalid`). The master user is a
 CREATEROLE/CREATEDB member of `rds_superuser`, not a superuser; the only superuser is AWS's
 internal `rdsadmin`, the bootstrap superuser. The generic bootstraps refuse that master
@@ -720,12 +729,14 @@ catalog shows that shape (`rds_profile_unproven`).
 **Order, as the migration owner, connected to the HoopDb database:**
 
 1. `rds_owner_function_default_revoke.sql`: the owner's exact global function default.
-2. `rds_migration_roles.sql`: the ten fixed NOLOGIN roles (the Cloud SQL set) through a disposable CREATEROLE
+2. `rds_migration_roles.sql`: the twelve fixed NOLOGIN roles (the Cloud SQL set,
+   including `bulls96_privacy_eraser` and `bulls96_babysitter_retention` required by
+   041000 and 042000) through a disposable CREATEROLE
    trampoline, so they are membership-free (by design, afterwards only `rdsadmin` can alter
    or drop them).
 3. `hoopdb_runtime_role_rds.sql -v migration_owner=<owner> -v runtime_role=<role>
    -v runtime_login=true`: the runtime LOGIN role, PUBLIC TEMPORARY revoked, CONNECT
-   granted, in one transaction. Then set its password from the secret manager (never on
+   granted, in one transaction. Then set its password from 1Password (never on
    disk).
 4. The phase 1 verifiers `session_directory_search_worker.sql`,
    `session_token_verifier.sql`, `session_ingest_roles.sql`, `session_read_api_roles.sql`
@@ -736,7 +747,10 @@ catalog shows that shape (`rds_profile_unproven`).
    Generation, ledger, sequence, checksum, exact-ACL and phase 2 checks are unchanged.
 
 **Proof:** `scripts/pg-proof/rds-profile-proof.ts` (CI job `rds-emulated-postgres`), against
-a disposable PostgreSQL 17 whose bootstrap superuser is named `rdsadmin`. Emulation limits:
+disposable PostgreSQL 16/17 servers whose bootstrap superuser is named `rdsadmin`.
+The proof verifies the actual Git checkout against the requested head and refuses
+tracked source changes before connecting; each CI matrix job records the checkout
+and uploads its own version-specific receipt. Emulation limits:
 no `rds.*` parameters or parameter groups, no RDS extension allow-list, no IAM
 authentication, no RDS-specific catalog hooks, and vanilla PostgreSQL refuses
 `CREATE EVENT TRIGGER` to `rds_superuser` members where RDS allows it (irrelevant here: rds
@@ -747,19 +761,28 @@ mode uses `global-default-revoke`).
 - `SELECT oid, rolname, rolsuper FROM pg_roles WHERE oid = 10` is `rdsadmin`, SUPERUSER,
   and `rdsadmin` is the recorded grantor of the master's PG16+ creator edges.
 - The master's attributes and memberships (`rds_superuser`, no SUPERUSER, CREATEROLE), that
-  the master owns the Terraform-created database, and that `rdsadmin` is the only SUPERUSER.
+  the master owns the customer-provisioned database, and that `rdsadmin` is the only SUPERUSER.
 - Steps 1-5 pass on the target engine version and parameter group, and the canonical
   readiness gate passes as the runtime role over TLS.
-- Rotating the runtime password as the master (and through Secrets Manager rotation, if
-  used) keeps the exact creator edge. IAM database authentication is NOT supported: it
+- Rotating the runtime password as the master through the approved operator path,
+  with 1Password as the system of record, keeps the exact creator edge. No rotation
+  tool or live rotation proof is supplied here. IAM database authentication is NOT supported: it
   needs `rds_iam` membership, which the allowlist refuses.
 - `pg_trgm` and `btree_gin` are creatable by the master on the target version.
 - Snapshot restore and major-version upgrade keep the role graph so steps 1-5 rerun clean.
 - Post-migrate activation scripts that `ALTER ROLE` a fixed role to LOGIN
   (`session_ingest_role.sql`, `session_read_api_role.sql`,
-  `canonical_project_events_role.sql`) cannot run as the master on trampoline-created
+  `canonical_project_events_role.sql`, `privacy_eraser_role.sql`,
+  `babysitter_retention_role.sql`) cannot run as the master on trampoline-created
   roles (no ADMIN; 42501). Those LOGIN roles need a reviewed RDS path before activation
   (same structural question as Cloud SQL); migrate and readiness do not depend on them.
+
+**RDS activation needs its own reviewed path.** With this bootstrap's membership-free
+fixed-role graph, the customer migration owner has no ADMIN path to alter or drop
+those roles; only the provider's `rdsadmin` can. The migration/PASS emulation does not
+activate ingest, read API, project events, privacy erasure or babysitter retention,
+and makes no application-activation claim. Do not run their LOGIN activation scripts
+as the customer master or treat migration readiness as full application readiness.
 
 ## CNPG (self-hosted HoopDb)
 

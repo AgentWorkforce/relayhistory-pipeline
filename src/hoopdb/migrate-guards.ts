@@ -363,9 +363,9 @@ export async function runtimeRoleViolations(
   phase: "pre" | "post" = "post",
 ): Promise<string[]> {
   const out: string[] = [];
-  const migrationOwner = (
-    await client.query<{ me: string }>("SELECT current_user AS me")
-  ).rows[0]!.me;
+  const migrationOwner = cfg.mode === "rds"
+    ? (await client.query<{ me: string }>("SELECT current_user AS me")).rows[0]!.me
+    : "";
   const serverVersion = Number(
     (
       await client.query<{ server_version_num: string }>(
@@ -1129,7 +1129,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "999da9336773c474a349da26f674160b96cb74fe0313884c84ac8a28bc1fecc5";
+  "8061b2c51d99613e3fd606bc4b2d639107638171e77122e0abb59a628f90fda0";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

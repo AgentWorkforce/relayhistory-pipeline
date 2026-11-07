@@ -31,7 +31,7 @@ if (Bun.version !== "1.4.2") throw new Error("Lambda builder requires Bun 1.4.2"
 const git = (...argv: string[]) => execFileSync("git", argv, { cwd: root, encoding: "utf8" }).trim();
 const status = () => git("status", "--porcelain", "--untracked-files=normal");
 const head = git("rev-parse", "HEAD");
-const canonicalRemote = /^(git@github\.com:|https:\/\/github\.com\/)AgentWorkforce\/(sessions-pipeline|96BullSessions)(\.git)?$/.test(git("remote", "get-url", "origin"));
+const canonicalRemote = /^(git@github\.com:|https:\/\/github\.com\/)AgentWorkforce\/(relayhistory-pipeline|sessions-pipeline|96BullSessions)(\.git)?$/.test(git("remote", "get-url", "origin"));
 if (!canonicalRemote && !allowDirtyTest) throw new Error("Canonical Lambda release builder requires the original repository remote");
 if (sourceSha !== head || !allowDirtyTest && status()) throw new Error("Lambda source must be the exact clean checked-out commit");
 const before = status();

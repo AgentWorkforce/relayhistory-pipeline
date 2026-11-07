@@ -220,6 +220,15 @@ describe("session ingest worker: inputs", () => {
     expect(() => sessionIngestVars({ ...inputs, authority: { ...authority, expectedControlEpoch: "bad" } as never })).toThrow(/expectedControlEpoch/);
   });
 
+  it("C3 privacyAuthority: supabase only with frozen-supabase custody in buffered mode, rendered as INGEST_PRIVACY_AUTHORITY", () => {
+    const frozen = { ...inputs, acceptanceMode: "buffered" as const, expectedGeneration: "f".repeat(64), inlineMaxSessions: 0, custodySource: "frozen-supabase" as const };
+    assertSessionIngestInputs({ ...frozen, privacyAuthority: "supabase" }, refuse);
+    expect(sessionIngestVars({ ...frozen, privacyAuthority: "supabase" })).toMatchObject({ INGEST_CUSTODY_SOURCE: "frozen-supabase", INGEST_PRIVACY_AUTHORITY: "supabase" });
+    expect(sessionIngestVars(frozen)).not.toHaveProperty("INGEST_PRIVACY_AUTHORITY");
+    for (const bad of [{ ...frozen, privacyAuthority: "neon" }, { ...frozen, custodySource: "shadow", privacyAuthority: "supabase" }, { ...inputs, privacyAuthority: "supabase" }])
+      expect(() => assertSessionIngestInputs(bad, refuse)).toThrow();
+  });
+
   it("the stage refuses another stage, destroy, another account and a deploy without approval", () => {
     const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
     expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: inputs }, env)).not.toThrow();

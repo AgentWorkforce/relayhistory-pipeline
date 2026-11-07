@@ -31,6 +31,11 @@
  *                                   (session-timing-source.ts, timing.ts), same allowlist.
  *   GET /v1/sessions/:id/turns      the relay session journal from canonical S3 (legacy
  *   GET /v1/sessions/:id/metadata   export + live turns: session-turns-source.ts), same allowlist.
+ *   GET /v1/sessions/titles         cached brief titles of up to 100 `key=<source>:<sessionId>`
+ *                                   keys, from Supabase session_briefs (brief-titles.ts). Its
+ *                                   own allowlist, READ_API_BRIEF_TITLES_WORKSPACES (unset = none,
+ *                                   "*" = all): 501 `brief_titles_workspace_not_enabled`, and 501
+ *                                   `brief_titles_not_migrated` until 20261105043000 is applied.
  *   GET /v1/sessions/output and /v1/digest/daily are registered and answer 501 with a
  *   reason naming the store they still need: their relayhistory semantics read tables
  *   that neither ClickHouse, S3 nor the directory holds yet (per-message and commit
@@ -50,6 +55,7 @@ import type { EventQuery } from "./queries.ts";
 import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
+import { EvidenceRequestError, readBabysitterEvidence, type EvidenceDeps } from "./babysitter-evidence.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
@@ -60,6 +66,7 @@ import {
   type Directory,
   type DirectoryListArgs,
 } from "./directory.ts";
+import { BRIEF_TITLES_MAX_KEYS, BriefTitlesError, briefTitleEntries, type BriefTitleKey, type BriefTitles } from "./brief-titles.ts";
 
 export interface VerifiedIdentity {
   userId: string;
@@ -90,10 +97,16 @@ export interface ReadApiDeps {
   directory?: Directory;
   /** READ_API_DIRECTORY_WORKSPACES: workspaces the directory routes serve; "*" = all. Absent/empty = none. */
   directoryWorkspaces?: ReadonlySet<string> | "*";
+  /** Cached brief titles (brief-titles.ts); absent = GET /v1/sessions/titles answers 501. */
+  briefTitles?: BriefTitles;
+  /** READ_API_BRIEF_TITLES_WORKSPACES (parseDirectoryWorkspaces syntax): "*" = all. Absent/empty = none. */
+  briefTitleWorkspaces?: ReadonlySet<string> | "*";
   /** Session timing from canonical S3 (session-timing-source.ts); absent = 501 `timing_not_configured`. */
   timing?: TimingDeps;
   /** Relay session turns and metadata from canonical S3 (session-turns-source.ts); absent = 501 `turns_not_configured`. */
   turns?: TurnsDeps;
+  /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
+  babysitter?: EvidenceDeps;
 }
 
 export interface TurnsDeps {
@@ -121,6 +134,24 @@ export function parseDirectoryWorkspaces(raw: string | undefined): ReadonlySet<s
   const value = raw?.trim() ?? "";
   if (value === "*") return "*";
   return new Set(value.split(",").map((v) => v.trim()).filter(Boolean));
+}
+
+/** The titles `key` values: 1 to 100 valid `<source>:<sessionId>` keys, duplicates dropped. */
+function titleKeys(raw: readonly string[]): BriefTitleKey[] {
+  if (raw.length < 1 || raw.length > BRIEF_TITLES_MAX_KEYS) throw bad(`key must be given 1 to ${BRIEF_TITLES_MAX_KEYS} times`);
+  const seen = new Set<string>();
+  const keys: BriefTitleKey[] = [];
+  for (const value of raw) {
+    const at = value.indexOf(":");
+    const source = at < 0 ? "" : value.slice(0, at);
+    const sessionId = at < 0 ? "" : value.slice(at + 1);
+    if (!HARNESS_NAME.test(source)) throw bad("key source is invalid");
+    if (sessionId.length < 1 || sessionId.length > MAX_LIST_ID_LENGTH) throw bad("key sessionId is invalid");
+    if (seen.has(value)) continue;
+    seen.add(value);
+    keys.push({ source, sessionId });
+  }
+  return keys;
 }
 
 /** relayhistory routes/recall.ts limits for the session list and activity. */
@@ -575,6 +606,39 @@ export function createReadApi(deps: ReadApiDeps) {
       return fail(c, error);
     }
   };
+  /**
+   * Cached brief titles for the session list (feature F2): `workspace=<the token's>` and 1 to
+   * 100 repeated `key=<source>:<sessionId>` (the source is a harness name, which has no
+   * colon, so the first colon splits). 100 keys of up to 255-character ids can exceed a
+   * front-door URL limit (414 before auth); callers keep each URL bounded (Cloud's client
+   * splits batches at 8,000 characters). Answers `{ titles: [{ source, sessionId, title }] }`:
+   * a requested session with no entry has no title (none generated or backfilled, or erased).
+   * It never enqueues generation. A failure is a non-2xx, never an empty 200, so a caller can
+   * tell "unavailable" from "no title".
+   */
+  app.get("/v1/sessions/titles", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      const allowed = deps.briefTitleWorkspaces;
+      if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported("brief_titles_workspace_not_enabled");
+      if (!deps.briefTitles) throw unsupported("brief_titles_not_configured");
+      const keys = titleKeys(c.req.queries("key") ?? []);
+      const rows = await deps.briefTitles.titles(identity.orgId, identity.workspaceId, keys);
+      if (rows === null) throw unsupported("brief_titles_not_migrated");
+      return c.json({ titles: briefTitleEntries(rows, identity, keys), correlationId: c.get("correlationId") });
+    } catch (error) {
+      if (error instanceof BriefTitlesError) {
+        if (error.reason === "tenant_mismatch") return fail(c, new TenantMismatchError());
+        if (error.reason === "invalid_argument") return fail(c, bad("invalid session keys"));
+        const correlationId = c.get("correlationId") as string;
+        log({ route: c.req.routePath, reason: `brief_titles_${error.reason}`, status: 503, correlation_id: correlationId });
+        return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId }, 503);
+      }
+      return fail(c, error);
+    }
+  });
+
   app.get("/v1/sessions/output", notMigrated("output_not_migrated"));
 
   /**
@@ -659,6 +723,30 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   });
   app.get("/v1/digest/daily", notMigrated("digest_not_migrated"));
+
+  // Babysitter evidence (Neon GET /v1/delivery/records parity for session_lineage /
+  // turn_receipt; babysitter-evidence.ts). Tenant from the verified identity, as Neon's
+  // auth context; default off (501 until the worker wires the deps).
+  app.get("/v1/delivery/records", async (c) => {
+    const correlationId = c.get("correlationId");
+    try {
+      const evidence = deps.babysitter;
+      if (!evidence) throw unsupported("delivery_records_not_configured");
+      const identity = c.get("identity");
+      const query: Record<string, string> = {};
+      for (const key of new Set(new URL(c.req.url).searchParams.keys())) {
+        const all = c.req.queries(key) ?? [];
+        if (all.length > 1) return c.json({ error: { code: "invalid_delivery", message: "Repeated delivery filters are unsupported" }, correlationId }, 400);
+        query[key] = all[0]!;
+      }
+      // Neon order: repeated filters (400) above, then the account assertion (403) before any read.
+      return c.json(await readBabysitterEvidence(evidence, { orgId: identity.orgId, workspaceId: identity.workspaceId }, query, c.req.header("X-RelayHistory-Expected-Account")));
+    } catch (error) {
+      if (error instanceof EvidenceRequestError)
+        return c.json({ error: { code: error.code, message: error.message, ...(error.reason ? { reason: error.reason } : {}) }, correlationId }, error.status);
+      return fail(c, error);
+    }
+  });
 
   app.notFound((c) => c.json({ error: { code: "unsupported_by_backend", message: "route not served by this backend", reason: "route" }, correlationId: c.get("correlationId") }, 501));
 
