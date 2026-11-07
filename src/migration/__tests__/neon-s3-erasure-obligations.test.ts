@@ -491,3 +491,63 @@ describe("queueing an exact OBJECT never unpublishes another key that merely sta
     expect(w.queued()).toEqual([B]); // its stale item is refused (owned), never done
   });
 });
+
+describe("bounded, resumable reservation retirement (dogpatch 5548 P2)", () => {
+  const D = `${PREFIX}raw/`;
+  async function reserved(n: number, scope = "S") {
+    const dir = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-retire-"));
+    const path = join(dir, "s.sqlite");
+    const st = new SyncState(path);
+    const vs = Array.from({ length: n }, (_, i) => ({ key: `${D}b=${String(i).padStart(6, "0")}.zst`, versionId: `v${i}` }));
+    for (let i = 0; i < vs.length; i += 500) expect(st.reserveErase(D, st.obligationRev(D), scope, vs.slice(i, i + 500)).ok).toBe(true);
+    return { st, path, vs };
+  }
+  const count = (st: SyncState, sql: string) => ((st as unknown as { db: { prepare(s: string): { get(): { n: number } } } }).db.prepare(sql).get().n);
+
+  test("a large set retires in bounded pages (<= 1000 rows per transaction); a crash mid-retirement RESUMES from the durable cursor", async () => {
+    const r = await reserved(2_500);
+    const first = r.st.retireReservationsPage(D, "S", undefined, () => true);
+    expect(first).toEqual({ retired: 1000, done: false });
+    expect(r.st.retireCursor("S")).toEqual([r.vs[999]!.key, "v999"]);
+    // Crash: a new process on the same file resumes after the cursor (nothing re-scanned, nothing lost).
+    r.st.close();
+    const st2 = new SyncState(r.path);
+    expect(st2.retireCursor("S")).toEqual([r.vs[999]!.key, "v999"]);
+    expect(st2.retireReservationsPage(D, "S", undefined, () => true)).toEqual({ retired: 1000, done: false });
+    expect(st2.retireReservationsPage(D, "S", undefined, () => true)).toEqual({ retired: 500, done: true });
+    expect(st2.retireCursor("S")).toBeNull();
+    expect(count(st2, "SELECT count(*) AS n FROM erased_versions")).toBe(2_500);
+    expect(count(st2, "SELECT count(*) AS n FROM erase_reservations")).toBe(0);
+  });
+
+  test("only this scope's proven-absent rows are retired: another scope's reservations and kept versions are untouched", async () => {
+    const r = await reserved(1_200, "S");
+    const other = `${D}zz-other.zst`;
+    expect(r.st.reserveErase(D, r.st.obligationRev(D), "T", [{ key: other, versionId: "vo" }]).ok).toBe(true);
+    const kept = r.vs[5]!;
+    while (!r.st.retireReservationsPage(D, "S", undefined, (k, v) => !(k === kept.key && v === kept.versionId)).done);
+    expect(r.st.reservationsAt(other)).toEqual(["vo"]);
+    expect(r.st.reservationsAt(kept.key)).toEqual([kept.versionId]);
+    expect(r.st.erasedAt(kept.key)).toEqual([]);
+    expect(count(r.st, "SELECT count(*) AS n FROM erased_versions")).toBe(1_199);
+  });
+
+  test("the exact-key scan touches only that key's rows (SQL key filter, index search), never the directory", async () => {
+    const r = await reserved(1_500);
+    const target = r.vs[700]!.key;
+    expect(r.st.retirePlan(target, "S")).toMatch(/SEARCH .* USING (COVERING )?(INDEX|PRIMARY KEY)/);
+    let seen = 0;
+    const res = r.st.retireReservationsPage(D, "S", target, (k) => { seen += 1; expect(k).toBe(target); return true; });
+    expect(res).toEqual({ retired: 1, done: true });
+    expect(seen).toBe(1);
+    expect(count(r.st, "SELECT count(*) AS n FROM erase_reservations")).toBe(1_499);
+  });
+
+  test("job level: a prefix whose reservations span several retirement pages still completes, and every proven-absent version is in the history", async () => {
+    const w = await world(2_500);
+    await w.j.drain();
+    expect(w.queued()).toEqual([]);
+    expect(count(w.st, "SELECT count(*) AS n FROM erased_versions")).toBe(2_500);
+    expect(count(w.st, "SELECT count(*) AS n FROM erase_reservations")).toBe(0);
+  });
+});

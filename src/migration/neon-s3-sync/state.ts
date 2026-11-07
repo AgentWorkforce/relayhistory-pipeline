@@ -566,20 +566,51 @@ export class SyncState {
   }
   /** After a proven erasure: the prefix's reservations are no longer needed (its versions are gone). */
   /**
-   * Retire EXACTLY the reserved versions a complete strict proof showed absent: each moves to the protected erased
-   * history; every other reservation (a kept sibling, a successor, another subset) is left untouched.
+   * Retire, in ONE bounded page (at most `limit` rows, one IMMEDIATE transaction), the reservations made under
+   * `scope` at exactly `exactKey` (or under the "/"-terminated `prefix`) that a complete strict proof showed absent.
+   * Each moves to the protected erased history; everything else (other scopes' reservations, kept versions, siblings)
+   * is untouched. The filter is in SQL (index range on key); `absent` decides per row. Resumable: rows are visited in
+   * (key, version_id) order after the DURABLE cursor (`retire_cursor:<scope>`), so a crash resumes instead of
+   * rescanning; the cursor is cleared when the scan is complete.
    */
-  retireReservations(prefix: string, absent: (key: string, versionId: string) => boolean) {
+  retireReservationsPage(prefix: string, scope: string, exactKey: string | undefined, absent: (key: string, versionId: string) => boolean, limit = 1000):
+    { retired: number; done: boolean } {
+    let out = { retired: 0, done: false };
     this.#tx(() => {
-      const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${SyncState.#under}`).all(...SyncState.#u(prefix)) as { key: string; version_id: string }[];
+      const ck = `retire_cursor:${scope}`;
+      const cur = JSON.parse(this.meta(ck) ?? "null") as [string, string] | null;
+      const after = cur ? "AND (key > ? OR (key = ? AND version_id > ?))" : "";
+      const where = exactKey !== undefined ? "key = ?" : SyncState.#under;
+      const params: (string | number | Uint8Array)[] = [...(exactKey !== undefined ? [exactKey] : SyncState.#u(prefix)), scope, ...(cur ? [cur[0], cur[0], cur[1]] : []), limit];
+      const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${where} AND scope = ? ${after} ORDER BY key, version_id LIMIT ?`).all(...params) as { key: string; version_id: string }[];
       const hist = this.db.prepare("INSERT OR IGNORE INTO erased_versions (key, version_id, at) VALUES (?, ?, ?)");
       const del = this.db.prepare("DELETE FROM erase_reservations WHERE key = ? AND version_id = ?");
+      let retired = 0;
       for (const r of rows) {
         if (!absent(r.key, r.version_id)) continue;
         hist.run(r.key, r.version_id, Date.now());
         del.run(r.key, r.version_id);
+        retired += 1;
       }
+      const done = rows.length < limit;
+      if (done) this.db.prepare("DELETE FROM meta WHERE k = ?").run(ck);
+      else this.setMeta(ck, JSON.stringify([rows[rows.length - 1]!.key, rows[rows.length - 1]!.version_id]));
+      out = { retired, done };
     });
+    return out;
+  }
+  /** Unbounded convenience over the paged retirement (tests): every page, in order. */
+  retireReservations(prefix: string, absent: (key: string, versionId: string) => boolean, scope?: string) {
+    const scopes = scope !== undefined ? [scope] : (this.db.prepare(`SELECT DISTINCT scope FROM erase_reservations WHERE ${SyncState.#under}`).all(...SyncState.#u(prefix)) as { scope: string }[]).map((r) => r.scope);
+    for (const sc of scopes) while (!this.retireReservationsPage(prefix, sc, undefined, absent).done);
+  }
+  /** The durable retirement cursor of a scope (tests / audits). */
+  retireCursor(scope: string): [string, string] | null {
+    return JSON.parse(this.meta(`retire_cursor:${scope}`) ?? "null");
+  }
+  /** EXPLAIN QUERY PLAN of the exact-key retirement scan (tests: an index on key, no prefix range). */
+  retirePlan(key: string, scope: string): string {
+    return (this.db.prepare("EXPLAIN QUERY PLAN SELECT key, version_id FROM erase_reservations WHERE key = ? AND scope = ? ORDER BY key, version_id LIMIT 1000").all(key, scope) as { detail: string }[]).map((r) => r.detail).join(" | ");
   }
   /** Versions in the protected erased history at one key (tests / audits). */
   erasedAt(key: string): string[] {

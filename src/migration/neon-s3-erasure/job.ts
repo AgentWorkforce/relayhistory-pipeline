@@ -216,7 +216,19 @@ export class ErasureJob {
     }
     // Retire EXACTLY the reserved versions this complete inventory shows absent (within keyFilter); every other
     // reservation (kept siblings, successors, other subsets) stays.
-    this.state.retireReservations(prefix, (key, versionId) => keyFilter(key) && !(listed.get(key)?.has(versionId) ?? false));
+    // Bounded, resumable retirement of THIS scope's reservations proven absent (SQL-filtered by scope and exact key /
+    // prefix; <= 1000 rows per transaction; durable cursor). Terminal completion only once every page is retired; at
+    // the step deadline it stays incomplete and resumes from the cursor on the next run.
+    const absent = (key: string, versionId: string) => keyFilter(key) && !(listed.get(key)?.has(versionId) ?? false);
+    const deadline = this.now() + ERASE_STEP_DEADLINE_MS;
+    for (;;) {
+      const page = this.state.retireReservationsPage(prefix, scope, exactKey, absent);
+      if (page.done) break;
+      if (this.now() >= deadline) {
+        this.counters.resumable += 1;
+        return { status: "incomplete", deleted: step.deleted, remaining };
+      }
+    }
     return { status: "erased", deleted: step.deleted, remaining };
   }
 
