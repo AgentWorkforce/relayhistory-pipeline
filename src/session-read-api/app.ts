@@ -725,6 +725,7 @@ export function createReadApi(deps: ReadApiDeps) {
    *   digest_before_watermark     the day starts before the watermark's complete_since
    *   digest_session_partial      an inexact session whose facts span overlaps the day
    *   digest_session_unindexed    a session with transcript events in the day and no complete facts state
+   *   digest_schema_missing       the output-facts DDL (or a v4 column) is not applied
    *   digest_directory_unavailable the day has sessions and the directory cannot list them
    * Once served, every narrative outcome is a 200 (`narrative.unavailable`), including a
    * miss the Worker could not fill within the deadline. `refresh=true` regenerates.
@@ -748,10 +749,17 @@ export function createReadApi(deps: ReadApiDeps) {
       const ch = deps.ch;
       if (!deps.digest || !ch) throw unsupported("digest_not_configured");
       const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
-      // The day is half-open [since, until): the readiness window ends 1 ms before `until`.
-      const readiness = await outputWindowReadiness(ch, identity.orgId, identity.workspaceId, window.since, new Date(window.until.getTime() - 1), opts);
-      if (readiness !== "ready") throw unsupported(`digest_${readiness}`);
-      const digest = await buildDailyDigest(ch, deps.directory, { orgId: identity.orgId, workspaceId: identity.workspaceId, since: window.since, until: window.until, projectId }, opts);
+      let digest;
+      try {
+        // Exactly the stats window, half-open [since, until), so no event the stats count escapes
+        // the readiness check (an event at until - 0.5 ms is in both).
+        const readiness = await outputWindowReadiness(ch, identity.orgId, identity.workspaceId, window.since, window.until, { ...opts, untilExclusive: true });
+        if (readiness !== "ready") throw unsupported(`digest_${readiness}`);
+        digest = await buildDailyDigest(ch, deps.directory, { orgId: identity.orgId, workspaceId: identity.workspaceId, since: window.since, until: window.until, projectId }, opts);
+      } catch (error) {
+        if (isOutputSchemaShort(error)) throw unsupported("digest_schema_missing");
+        throw error;
+      }
       const statsHash = await computeStatsHash(digest, identity.workspaceId);
       const narrative = await resolveDigestNarrative(deps.digest, {
         orgId: identity.orgId, workspaceId: identity.workspaceId, day: window.date, tz: window.tz, projectId, statsHash, refresh,

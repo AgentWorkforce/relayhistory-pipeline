@@ -84,7 +84,11 @@ suite("digest route on ClickHouse", () => {
     expect(b.stats.outcomes.reverted).toBe(0);
     expect(b.stats.eventCount).toBe(15);
     expect(b.narrative).toEqual(generated);
-    expect(b.sessions.map((s: any) => s.sessionId)).toEqual(["s1"]);
+    // The fixture's events carry an alias id ("s1"); the digest is keyed on the canonical id.
+    expect(b.sessions.map((s: any) => s.sessionId)).toEqual(["s1-canonical"]);
+    // P2 outcome join: the session's only outcome is a revert, so it is neither committed nor
+    // unknown (relayhistory's rule). Keyed apart, the session would wrongly count as unknown.
+    expect(b.stats.outcomes).toEqual({ committed: 0, reverted: 0, unknown: 0 });
   }, 60_000);
 
   test("a quiet day is no_activity; a failing Worker is provider_error; both are 200s", async () => {
@@ -94,5 +98,40 @@ suite("digest route on ClickHouse", () => {
     const failing = await api(ch, { workspaces: "*", digest: { generator: { generate: async () => { throw new Error("binding"); } } } })(`/v1/digest/daily?workspace=${WS}&date=2026-11-05`);
     expect(failing.status).toBe(200);
     expect((await body(failing)).narrative.unavailable).toBe("provider_error");
+  }, 60_000);
+});
+
+(CH_URL ? describe : describe.skip)("digest readiness window == stats window", () => {
+  test("P2: an inexact session whose facts are only at until - 0.5 ms blocks the day (the old until - 1 ms window missed it)", async () => {
+    const { OUTPUT_FACTS_SESSION_STATE_TABLE } = await import("../../session-pipeline/output-facts-schema.ts");
+    const ch = await freshClickHouse();
+    try {
+      for (const s of outputFactsSchemaStatements()) await ch.command(s);
+      await ch.insert(OUTPUT_FACTS_STATE_TABLE, [{ org_id: ID.orgId, workspace_id: WS, complete_since: "2026-11-01 00:00:00.000000", marked_at: "2026-11-06 00:00:00.000", marked_by: "test", version: 1 }]);
+      const state = (complete: number, version: number) => ch.insert(OUTPUT_FACTS_SESSION_STATE_TABLE, [{
+        org_id: ID.orgId, workspace_id: WS, source: "codex", session_id: "s-late", complete, synced_at: "2026-11-06 00:00:00.000",
+        min_ts: "2026-11-05 23:59:59.999500", max_ts: "2026-11-05 23:59:59.999500", version,
+      }]);
+      await state(0, 1);
+      const get = api(ch, { workspaces: "*" });
+      expect((await body(await get(`/v1/digest/daily?workspace=${WS}&date=2026-11-05`))).error.reason).toBe("digest_session_partial");
+      // The next day does not overlap it.
+      expect((await get(`/v1/digest/daily?workspace=${WS}&date=2026-11-06`)).status).toBe(200);
+      await state(1, 2);
+      expect((await get(`/v1/digest/daily?workspace=${WS}&date=2026-11-05`)).status).toBe(200);
+    } finally {
+      await ch.drop();
+    }
+  }, 60_000);
+
+  test("a missing output-facts table or column is 501 digest_schema_missing, never a 500", async () => {
+    const bare = await freshClickHouse();
+    try {
+      const r = await api(bare, { workspaces: "*" })(`/v1/digest/daily?workspace=${WS}&date=2026-11-05`);
+      expect(r.status).toBe(501);
+      expect((await body(r)).error.reason).toBe("digest_schema_missing");
+    } finally {
+      await bare.drop();
+    }
   }, 60_000);
 });
