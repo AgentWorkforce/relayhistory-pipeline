@@ -223,6 +223,39 @@ describe("analysis_request_v1", () => {
     }
   });
 
+  test("P2: a change that flips the never-in-Neon proof (an old tombstoned pointer) moves the revision: no reuse", async () => {
+    await pg.query(
+      `INSERT INTO sessions.ingest_frozen_source_completeness
+         (source_identity_sha256, control_epoch, privacy_baseline_sha256, org_count, record_rows, manifest_sha256, neon_snapshot, sealed_at)
+       VALUES (repeat('a',64), repeat('b',64), repeat('c',64), 1, 0, repeat('d',64), '{}'::jsonb, now() - interval '1 hour')`,
+    );
+    const proof = async () =>
+      (await pg.query<{ f: boolean }>("SELECT sessions.session_analysis_neon_free($1, $2, $3) AS f", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.f;
+    expect(await proof()).toBe(true);
+    const first = await request();
+    const store = jobStore();
+    expect((await publish(store, (await store.claim({ leaseSeconds: 600 }))!)).stage).toBe("completed");
+    // An already-tombstoned pointer from before the seal arrives (no live->tombstoned UPDATE:
+    // the forget trigger does not fire). The proof flips to false...
+    await pg.query(
+      `INSERT INTO sessions.session_index
+         (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
+          storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, title, deleted_at)
+       VALUES ($1, $2, $3, $4, 'm-old', 'u-1', now() - interval '2 hours', now() - interval '2 hours', 'fs', 'bucket', 'manifest/old',
+               decode(repeat('ab', 32), 'hex'), 'jsonl', '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1, 't', now() - interval '90 minutes')`,
+      [KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId],
+    );
+    expect(await proof()).toBe(false);
+    // ...so the completed analysis is not reused.
+    await age("session_analysis_requests_v2", "3 minutes");
+    const second = await request();
+    expect(second.request.analysisId).not.toBe(first.request.analysisId);
+    // And a proof-flip during a run refuses its publication.
+    const job = (await store.claim({ leaseSeconds: 600 }))!;
+    await pg.query("UPDATE sessions.session_index SET created_at = now() WHERE machine_id = 'm-old'");
+    expect((await publish(store, job)).stage).toBe("refused");
+  });
+
   test("P1-3: a backfilled in-flight job neither answers nor blocks a new request", async () => {
     await pg.query(
       `INSERT INTO sessions.session_analysis_jobs_v2 (id, org_id, workspace_id, session_id, status, analysis_version, schema_version, model_version, origin)
