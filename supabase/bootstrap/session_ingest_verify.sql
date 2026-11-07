@@ -8,6 +8,8 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.canonical_project_events_release_v1(jsonb)',
  'sessions.canonical_project_events_sent_v1(jsonb)',
  'sessions.ingest_acquire_slot(jsonb)',
+ 'sessions.ingest_babysitter_retention_register(jsonb)',
+ 'sessions.ingest_babysitter_retention_written(jsonb)',
  'sessions.ingest_buffer_gc_claim(jsonb)',
  'sessions.ingest_buffer_gc_finish(jsonb)',
  'sessions.ingest_buffer_gc_prepare(jsonb)',

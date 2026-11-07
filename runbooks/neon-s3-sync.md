@@ -65,6 +65,55 @@ holds only the eraser key ("sessions-prod transcript eraser").
     (ListObjectVersions + DeleteObject?versionId), only under a session prefix
     of the item's own org, with the session leased.
   - It logs `erasure SLA at risk` once the oldest queued item is older than 24 h.
+- **Strict inventory: fail closed** (lead ruling C3 on #294; shipped unflagged as
+  destructive-operation safety hardening, NOT gated by any Babysitter flag). The
+  erasure job's existing S3 calls (`eraseObject`, `erasePrefix`,
+  `eraseSessionAnyDate`, `eraseObjectBefore`, `listKeys`, via
+  `src/migration/neon-s3-erasure/eraser.ts`) now accept only a strictly valid
+  ListObjectVersions inventory. Two kinds of refusal, with different meaning:
+  - **Initial inventory refusal (no deletes were made from that inventory).**
+    The whole listing is read and validated before its first delete, and is
+    refused when it is not strictly valid:
+    - `erasure_inventory`: malformed, truncated or non-UTF-8 XML; an entry
+      without Key/VersionId/IsLatest; unproven pagination (no IsTruncated,
+      missing or mismatched next markers, a repeated cursor); or a bound:
+      more than 10,000 versions or 100 pages in one whole-prefix listing, or
+      a single listing response body over 16 MiB;
+    - `erasure_foreign_key`: a listed key outside the requested prefix.
+  - **Post-delete refusal (deletes MAY already have happened).**
+    `erasure_inventory_changed`, or any failure of the post-delete
+    verification listing (including an `erasure_inventory` /
+    `erasure_foreign_key` refusal of that second listing), or a DeleteObject
+    error partway through the deletes: the deletes of the first inventory were
+    issued, and some or all may have succeeded. Pending
+    here is NOT an atomic rollback: the deleted versions are gone, and the item
+    stays pending only because zero is not yet proven.
+  - **Semantics (both kinds):** a refusal is an error for that item or group
+    only, and the item is NOT marked done: the queued erasure, tombstone or
+    fence stays pending and is retried on the next sweep (as any failed
+    erase). Other items still run. A retry lists afresh; after a post-delete
+    refusal it sees only what survived.
+  - **Where the codes appear:** the erasure job's structured log lines carry
+    `error_code` (`erasure failed` with `kind` for a queued item; `fence sweep
+    failed`, `live fence sweep failed`, `live listing failed` or `live erasure
+    failed` for a sweep), and its counters (`failed`, `fenceSweepFailed`,
+    `liveFenceFailed`) count them. A refusal never stops the job; the oldest
+    queued item's age drives `erasure SLA at risk` after 24 h.
+  - **Operator action** (the lead's ruling, verbatim): "retain the
+    obligation/tombstone, investigate the inventory shape, or move to a
+    separately reviewed resumable consumer. NO manual done, NO reservation
+    clearing, NO disabling the strict checks, NO cap escalation as recovery."
+    The codes say which rule refused; a whole-inventory workload above 10k
+    versions needs the separately reviewed resumable consumer (`eraseStep`,
+    the paged eraser with checkpoints).
+  - **Regression evidence** on the existing E3 path:
+    `src/migration/__tests__/neon-s3-erasure-live.test.ts` ("E3 on the strict
+    shared eraser": a small valid inventory erases as before; a malformed and a
+    >10k inventory are each refused before any delete and the same tombstone is
+    erased by a later healthy sweep; a queued prefix erasure over a malformed
+    inventory stays queued, backed off, and a later healthy drain erases it);
+    the eraser-level refusals are in
+    `strict-inventory-erasure.test.ts` and `buffered-version-erasure.test.ts`.
 - Accepted gap (#105): record-level changes that do not bump
   `session_revisions` reach S3 only through the exporter's idle 14-day re-read.
 

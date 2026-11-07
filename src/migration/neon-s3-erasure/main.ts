@@ -22,6 +22,12 @@
  *                          connected at all.
  *   S3X_STATE, S3X_BUCKET, S3X_EXPECT_BUCKET, S3X_REGION, S3X_ENDPOINT, S3X_KEY_ROOT,
  *   S3X_ERASER_RECOGNIZES_LEGACY ("true" keeps legacy-only groups; default false; neon only)
+ *
+ * Phase: Babysitter evidence retention (./babysitter-phase.ts), BABYSITTER_RETENTION_SWEEP
+ * off (default) | dry_run | on. It shares this process's eraser, --execute gate and stop
+ * signal; its registry login (the least-privilege bulls96_babysitter_retention role, never
+ * the ingest login) arrives as the optional "retentionDatabaseUrl" field of the same stdin
+ * credential JSON, required only when the phase is not off.
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
@@ -31,6 +37,7 @@ import { eraserDatabaseUrl, pinnedPgClient, readStdinCredentials, refuseCredenti
 import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
 import { createS3Eraser, type Eraser, type PagedEraser } from "./eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "./job.ts";
+import { phaseSettings, poolConfig, startBabysitterPhase, type BabysitterPhase } from "./babysitter-phase.ts";
 
 /**
  * S3X_OBLIGATIONS (default OFF) gates the new exporter-obligation protocol, its schema and genesis bootstrap. The
@@ -82,7 +89,13 @@ export async function main() {
   const execute = flag("execute");
   refuseCredentialEnv();
   const kind = authorityKind(env("S3X_PRIVACY_AUTHORITY"));
-  const creds = await readStdinCredentials(execute ? ["databaseUrl", "eraser"] : ["databaseUrl"], ["databaseUrl", "eraser"]);
+  // Babysitter retention phase (additive): off without --execute; when on, its registry login is one
+  // more field of the same stdin credential JSON (never a file, env or argv).
+  const retention = phaseSettings(env, execute, env("S3X_KEY_ROOT", "96bulls")!);
+  const required = [...(execute ? ["databaseUrl", "eraser"] : ["databaseUrl"]), ...(retention.mode !== "off" ? ["retentionDatabaseUrl"] : [])];
+  const creds = await readStdinCredentials(required, ["databaseUrl", "eraser", "retentionDatabaseUrl"]);
+  const retentionUrl = creds.retentionDatabaseUrl;
+  delete creds.retentionDatabaseUrl;
   const url = authorityUrl(kind, creds.databaseUrl);
   const eraser = eraserFor(execute, creds.eraser === undefined ? undefined : s3Credentials(creds.eraser, "eraser"));
   delete creds.databaseUrl;
@@ -95,6 +108,12 @@ export async function main() {
   await client.connect();
   let stop = false;
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => void (stop = true));
+  let phase: BabysitterPhase | undefined;
+  if (retention.mode !== "off") {
+    const pool = new pg.Pool(poolConfig(retentionUrl, env("BABYSITTER_RETENTION_ALLOW_LOOPBACK") === "true"));
+    const stoppable = async (ms: number) => { for (let left = ms; left > 0 && !stop; left -= 1000) await new Promise((r) => setTimeout(r, Math.min(1000, left))); };
+    phase = await startBabysitterPhase(retention, pool, eraser, log, stoppable);
+  }
   try {
     const db = await sessionReadOnly(client as unknown as Queryable);
     const cfg = {
@@ -113,8 +132,12 @@ export async function main() {
       job.progress(true);
       return;
     }
+    // Babysitter retention phase (additive): runs beside the job until the same stop signal.
+    const phaseRun = phase?.loop(() => stop, flag("once"));
     await job.run({ once: flag("once") });
+    await phaseRun;
   } finally {
+    await phase?.close();
     state.close();
     await client.end().catch(() => undefined);
   }
