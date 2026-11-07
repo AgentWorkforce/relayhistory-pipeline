@@ -71,3 +71,29 @@ describe("P0-2: the analysis-enabled pipeline S3/KMS policy", () => {
     expect(JSON.stringify(transcriptKeyPolicy({ ...base, analysisResults: true }))).toContain("SessionPipelineEncryptsAnalysisResultsViaS3");
   });
 });
+
+import {
+  assertSessionReadApiInputs,
+  readApiAnalysisBucketStatement,
+  readApiAnalysisKeyStatement,
+  sessionReadApiEnv,
+  sessionReadApiNames,
+} from "../session-read-api.ts";
+import { ANALYSIS_RESULT_OBJECT_GLOB } from "../session-pipeline.ts";
+
+describe("P0-3: the read API serves analysis results only when analysisBucket is on", () => {
+  const rn = sessionReadApiNames("aws-sessions-prod");
+  const p = { completeSince: "epoch" } as const;
+  test("env: READ_API_ANALYSIS_BUCKET only with analysisBucket (no change for existing deploys)", () => {
+    expect(sessionReadApiEnv({ stage: "s", names: rn, p, analysisBucketName: "bkt" })).not.toHaveProperty("READ_API_ANALYSIS_BUCKET");
+    expect(sessionReadApiEnv({ stage: "s", names: rn, p: { ...p, analysisBucket: true }, analysisBucketName: "bkt" }).READ_API_ANALYSIS_BUCKET).toBe("bkt");
+    expect(() => assertSessionReadApiInputs({ ...p, analysisBucket: "yes" }, refuse)).toThrow(/analysisBucket/);
+  });
+  test("GetObject and Decrypt on the analysis result root only", () => {
+    const b = readApiAnalysisBucketStatement({ bucketArn: "arn:aws:s3:::bkt", roleArn: "r", glob: ANALYSIS_RESULT_OBJECT_GLOB });
+    expect(b).toMatchObject({ Action: ["s3:GetObject"], Resource: ["arn:aws:s3:::bkt/96bulls/*/v1/*/normalized/session-analysis-v2/*"] });
+    const k = readApiAnalysisKeyStatement({ accountId: "a", region: "us-east-1", bucketName: "bkt", roleArn: "r", glob: ANALYSIS_RESULT_OBJECT_GLOB });
+    expect(k.Action).toEqual(["kms:Decrypt"]);
+    expect(k.Condition.StringLike["kms:EncryptionContext:aws:s3:arn"]).toBe("arn:aws:s3:::bkt/96bulls/*/v1/*/normalized/session-analysis-v2/*");
+  });
+});

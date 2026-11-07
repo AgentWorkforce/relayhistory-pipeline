@@ -59,6 +59,7 @@ const roleRunner = (db: PGlite, role: string, readOnly: boolean) => {
 test("POST admits as the admission principal; GET serves the published analysis as the read role", async () => {
   const db = (pg = await database());
   await db.exec(read("supabase/bootstrap/session_read_api_role.sql").split("\n").filter((l) => !l.startsWith("\\")).join("\n"));
+  await db.exec(read("supabase/bootstrap/session_analysis_admit_role.sql").split("\n").filter((l) => !l.startsWith("\\")).join("\n"));
   await pointer(db);
   const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "analysis-src-")) });
   const reader = roleRunner(db, "bulls96_read_api", true);
