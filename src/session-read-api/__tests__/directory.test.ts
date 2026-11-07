@@ -294,7 +294,7 @@ describe("routes not yet migrated answer 501 with the store they need", () => {
       ["/v1/sessions/output?workspace=ws-a&since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z", "output_not_configured"],
       ["/v1/sessions/s-1/turns?workspace=ws-a", "turns_not_configured"],
       ["/v1/sessions/s-1/metadata?workspace=ws-a", "turns_not_configured"],
-      ["/v1/digest/daily?workspace=ws-a&date=2026-10-01", "digest_not_migrated"],
+      ["/v1/digest/daily?workspace=ws-a&date=2026-10-01", "digest_not_configured"],
     ] as const) {
       const r = await get(path);
       expect(r.status, path).toBe(501);

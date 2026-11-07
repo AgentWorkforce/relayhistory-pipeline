@@ -118,6 +118,17 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.digest_narrative_read(text,date,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.digest_narrative_scope_workspace(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.digest_narrative_upsert(text,text,date,text,text,text,text,text,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "bulls96_digest_narrative:EXECUTE"
+    ],
     "sessions.discover_session_large_reads()": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -680,6 +691,9 @@
     "sessions.publish_session_replay_pages(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.purge_daily_digest_narratives(text,text)": [
+      "<owner>:EXECUTE"
     ],
     "sessions.queue_session_brief_document(jsonb)": [
       "<owner>:EXECUTE"

@@ -72,6 +72,8 @@ export interface DirectoryListArgs {
   firstTsAfter?: Date;
   firstTsBefore?: Date;
   cursor?: DirectoryCursor;
+  /** Exactly these (harness, session id) keys, 1..200 (the RPC's p_session_harnesses/p_session_ids). */
+  sessionKeys?: Array<{ harness: string; sessionId: string }>;
   /** Page size, 1..200; the function returns up to limit + 1 rows. */
   limit: number;
 }
@@ -117,7 +119,7 @@ export const DIRECTORY_LIST_SQL = `SELECT org_id, workspace_id, harness, session
     p_user_ids => $5, p_agent => $6, p_last_ts_after => $7, p_last_ts_before => $8,
     p_first_ts_after => $9, p_first_ts_before => $10,
     p_cursor_last_activity_at => $11, p_cursor_session_id => $12, p_cursor_harness => $13,
-    p_limit => $14)`;
+    p_limit => $14, p_session_harnesses => $15, p_session_ids => $16)`;
 
 export const DIRECTORY_ACTIVITY_SQL = `SELECT to_char(day, 'YYYY-MM-DD') AS day, harness, sessions
   FROM sessions.session_directory_activity_for($1, $2, $3)`;
@@ -157,6 +159,8 @@ export function sqlDirectory(run: TenantRunner): Directory {
             a.cursor?.sessionId ?? null,
             a.cursor?.harness ?? null,
             a.limit,
+            a.sessionKeys?.length ? a.sessionKeys.map((k) => k.harness) : null,
+            a.sessionKeys?.length ? a.sessionKeys.map((k) => k.sessionId) : null,
           ])
           .catch(mapPgError);
         return r.rows;

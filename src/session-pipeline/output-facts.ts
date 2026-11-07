@@ -54,7 +54,8 @@ export interface OutputFactsScope {
 export interface EventFactRow {
   org_id: string; workspace_id: string; ts: string; session_id: string; source: string;
   machine_id: string; kind: string; event_id: string;
-  project_id: string | null; task_ref_id: string | null; task_ref_empty: number; branch: string | null;
+  project_id: string | null; task_ref_id: string | null; task_ref_empty: number; task_ref_json: string; branch: string | null;
+  task_title: string | null; user_id: string | null;
   model: string | null; provider: string | null;
   input_tokens: number; output_tokens: number; reasoning_tokens: number; cache_read_tokens: number; cache_create_tokens: number;
   cache_create_5m_tokens: number | null; cache_create_1h_tokens: number | null; cost_usd_micros: number | null;
@@ -169,6 +170,13 @@ export function branchOf(taskRef: unknown): string | null {
   return at < 0 ? null : id.slice(at + 1);
 }
 
+/** Key-sorted JSON (jsonb has no key order, so equal task_refs must serialize equally). */
+export function canonicalJson(value: unknown): string {
+  const sort = (v: unknown): unknown =>
+    Array.isArray(v) ? v.map(sort) : isObject(v) ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sort(v[k])])) : v;
+  return JSON.stringify(sort(value));
+}
+
 const sha256 = (parts: unknown[]) => createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 const int = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : typeof v === "string" && /^-?\d+$/.test(v) ? Number(v) : 0);
 const nint = (v: unknown) => (v === null || v === undefined ? null : int(v));
@@ -277,7 +285,10 @@ export function outputFactsFromScope(
         project_id: jtext(e.project_id),
         task_ref_id: jtext(taskRef.id),
         task_ref_empty: Object.keys(taskRef).length === 0 ? 1 : 0,
+        task_ref_json: canonicalJson(taskRef),
         branch: branchOf(taskRef),
+        task_title: jtext(e.task_title),
+        user_id: jtext(e.user_id),
         model: jtext(e.model),
         provider: jtext(e.provider),
         input_tokens: int(e.input_tokens),
@@ -464,7 +475,7 @@ export async function recordOutputFactsState(
 
 /** Columns each output-facts table must have before anything writes or reads it. */
 const REQUIRED_COLUMNS: Record<string, readonly string[]> = {
-  [EVENT_FACTS_TABLE]: ["row_id", "task_ref_empty", "files_touched", "fingerprint", "version"],
+  [EVENT_FACTS_TABLE]: ["row_id", "task_ref_empty", "task_ref_json", "task_title", "user_id", "files_touched", "fingerprint", "version"],
   [OUTPUT_FACTS_TABLE]: ["row_id", "scope_source", "fact_kind", "origin", "fingerprint", "version"],
   [OUTPUT_FACTS_SESSION_STATE_TABLE]: ["complete", "min_ts", "max_ts", "version"],
 };

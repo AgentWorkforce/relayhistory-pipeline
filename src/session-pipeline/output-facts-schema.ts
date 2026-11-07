@@ -45,7 +45,7 @@ export const OUTPUT_FACTS_STATE_TABLE = "output_facts_workspace_state";
 /** Per-session facts state, written by every producer pass (output-facts.ts). */
 export const OUTPUT_FACTS_SESSION_STATE_TABLE = "output_facts_session_state";
 
-export const OUTPUT_FACTS_SCHEMA_VERSION = 3;
+export const OUTPUT_FACTS_SCHEMA_VERSION = 4;
 
 /** `session_output_facts.fact_kind` values. */
 export const OUTPUT_FACT_KINDS = ["message", "legacy_turn_message", "commit", "outcome"] as const;
@@ -71,6 +71,10 @@ export function outputFactsSchemaStatements(): string[] {
     task_ref_id            Nullable(String),
     -- 1 when task_ref is '{}' (branchSql's NULL case); kept for the epic rollup's key.
     task_ref_empty         UInt8 DEFAULT 0,
+    -- The whole task_ref as canonical (key-sorted) JSON, for the digest sessions' taskRefs.
+    task_ref_json          String DEFAULT '{}',
+    task_title             Nullable(String),
+    user_id                Nullable(String),
     branch                 Nullable(String),
     model                  Nullable(String),
     provider               Nullable(String),

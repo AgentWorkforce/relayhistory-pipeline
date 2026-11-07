@@ -34,8 +34,10 @@
  *   GET /v1/sessions/output         Output from the ClickHouse facts (output-query.ts), off unless
  *                                   READ_API_OUTPUT_ENABLED=1 (deps.output), same allowlist; 501
  *                                   until the workspace's backfill watermark exists.
- *   GET /v1/digest/daily is registered and answers 501 with a reason naming the store it
- *   still needs (the digest narrative cache), and this backend never answers approximately.
+ *   GET /v1/digest/daily            the daily digest from the ClickHouse facts + the directory,
+ *                                   narrative from the Supabase cache / narrative Worker
+ *                                   (digest-query.ts, digest-narrative.ts), off unless
+ *                                   READ_API_DIGEST_ENABLED=1 (deps.digest), same allowlist.
  *
  * Auth: a RelayAuth assertion JWT minted for THIS service's origin with scope
  * `rth:read` (verifyAgentRelayToken: RS256, JWKS, issuer, exact audience).
@@ -53,6 +55,9 @@ import { TimingInputError } from "./timing.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
 import { outputWindowReadiness, readSessionOutput } from "./output-query.ts";
 import { READ_SETTINGS } from "./queries.ts";
+import { DigestInputError, resolveDayWindow } from "./day-window.ts";
+import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, buildDailyDigest, computeStatsHash } from "./digest-query.ts";
+import { resolveDigestNarrative, type DigestNarrativeDeps } from "./digest-narrative.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
   DirectoryError,
@@ -101,6 +106,12 @@ export interface ReadApiDeps {
    * (output-query.ts) with `ch`. Absent = 501 `output_not_configured`.
    */
   output?: { enabled: true };
+  /**
+   * READ_API_DIGEST_ENABLED=1: serve GET /v1/digest/daily (digest-query.ts) with `ch` and
+   * `directory`; the narrative from `cache` and the service-bound `generator`. Absent = 501
+   * `digest_not_configured`.
+   */
+  digest?: DigestNarrativeDeps;
 }
 
 export interface TurnsDeps {
@@ -399,7 +410,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "output"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "output" | "digest"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -573,15 +584,6 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   });
 
-  // Registered so their 501 names what they still need; see the header comment.
-  const notMigrated = (reason: string) => async (c: Context) => {
-    try {
-      attestWorkspace(c, c.get("identity") as VerifiedIdentity);
-      throw unsupported(reason);
-    } catch (error) {
-      return fail(c, error);
-    }
-  };
   /**
    * GET /v1/sessions/output (relayhistory routes/recall.ts + lib/session-output.ts): the
    * workspace's agent messages and unique commits in [since, until] (inclusive), from the
@@ -705,7 +707,67 @@ export function createReadApi(deps: ReadApiDeps) {
       return turnsFail(c, error);
     }
   });
-  app.get("/v1/digest/daily", notMigrated("digest_not_migrated"));
+  /**
+   * GET /v1/digest/daily (relayhistory routes/digest.ts): one civil day's rollup from the
+   * ClickHouse facts and the directory, plus the cached model narrative, never Neon. The 400s
+   * are resolveDayWindow's (ported verbatim). A workspace off the allowlist, or a backend not
+   * ready, is a 501 naming why:
+   *   digest_not_configured       READ_API_DIGEST_ENABLED is off
+   *   digest_backfill_incomplete  no output-facts watermark for the workspace yet
+   *   digest_before_watermark     the day starts before the watermark's complete_since
+   *   digest_session_partial      an inexact session whose facts span overlaps the day
+   *   digest_session_unindexed    a session with transcript events in the day and no complete facts state
+   *   digest_directory_unavailable the day has sessions and the directory cannot list them
+   * Once served, every narrative outcome is a 200 (`narrative.unavailable`), including a
+   * miss the Worker could not fill within the deadline. `refresh=true` regenerates.
+   * stats.outcomes.reverted is omitted (0, declared in X-Sessions-Digest-Omitted).
+   */
+  app.get("/v1/digest/daily", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      let window;
+      try {
+        window = resolveDayWindow(c.req.query("date"), c.req.query("tz"));
+      } catch (error) {
+        if (error instanceof DigestInputError) throw bad(error.message);
+        throw error;
+      }
+      const projectId = c.req.query("project")?.trim() || null;
+      const refresh = c.req.query("refresh") === "true";
+      requireCanary(identity, "digest");
+      // The digest reads the ClickHouse facts: a portable search adapter cannot serve it.
+      const ch = deps.ch;
+      if (!deps.digest || !ch) throw unsupported("digest_not_configured");
+      const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
+      // The day is half-open [since, until): the readiness window ends 1 ms before `until`.
+      const readiness = await outputWindowReadiness(ch, identity.orgId, identity.workspaceId, window.since, new Date(window.until.getTime() - 1), opts);
+      if (readiness !== "ready") throw unsupported(`digest_${readiness}`);
+      const digest = await buildDailyDigest(ch, deps.directory, { orgId: identity.orgId, workspaceId: identity.workspaceId, since: window.since, until: window.until, projectId }, opts);
+      const statsHash = await computeStatsHash(digest, identity.workspaceId);
+      const narrative = await resolveDigestNarrative(deps.digest, {
+        orgId: identity.orgId, workspaceId: identity.workspaceId, day: window.date, tz: window.tz, projectId, statsHash, refresh,
+      }, digest);
+      c.header("X-Sessions-Digest-Omitted", DIGEST_OMITTED_FIELDS.join(","));
+      log({ route: c.req.routePath, reason: "digest_served", narrative: narrative.unavailable ?? (narrative.cached ? "cached" : "generated"), correlation_id: c.get("correlationId") });
+      return c.json({
+        date: window.date,
+        tz: window.tz,
+        window: { since: window.since.toISOString(), until: window.until.toISOString() },
+        scope: { projectId },
+        stats: digest.stats,
+        projects: digest.projects,
+        epics: digest.epics,
+        sessions: digest.sessions,
+        narrative,
+        correlationId: c.get("correlationId"),
+      });
+    } catch (error) {
+      if (error instanceof DigestDirectoryUnavailable) return fail(c, unsupported("digest_directory_unavailable"));
+      if (error instanceof DirectoryError) return directoryFail(c, error);
+      return fail(c, error);
+    }
+  });
 
   app.notFound((c) => c.json({ error: { code: "unsupported_by_backend", message: "route not served by this backend", reason: "route" }, correlationId: c.get("correlationId") }, 501));
 
