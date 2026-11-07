@@ -20,8 +20,7 @@ import {
   type CanonicalPointer,
 } from "../session-read-api/canonical.ts";
 import { SESSION_HARNESSES_SQL } from "../session-read-api/session-turns-source.ts";
-import { objectStoreManifestReader } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
-import { NEON_FREE_SQL, neonDerivedManifest, neverInNeon } from "../shared/never-in-neon.ts";
+import { NEON_FREE_SQL } from "../shared/never-in-neon.ts";
 import { SESSION_POINTERS_SQL } from "../session-read-api/session-timing-source.ts";
 import type { AnalysisModelTransport } from "./engine/model.ts";
 import type { AnalysisEvidenceDeps } from "./evidence.ts";
@@ -56,7 +55,7 @@ const hex = (value: unknown) =>
 
 /** Canonical pointers of one identity, read with the worker's connection. */
 async function pointers(db: SqlExecutor, identity: CanonicalIdentity): Promise<CanonicalPointer[]> {
-  const { rows } = await db.query<Record<string, unknown>>(SESSION_POINTERS_SQL, [
+  const { rows } = await db.query<Record<string, unknown>>(WORKER_POINTERS_SQL, [
     identity.orgId,
     identity.workspaceId,
     identity.source,
@@ -67,6 +66,13 @@ async function pointers(db: SqlExecutor, identity: CanonicalIdentity): Promise<C
 
 /** Shared with the read API's turns routes (src/shared/never-in-neon.ts). */
 export { neonDerivedManifest } from "../shared/never-in-neon.ts";
+
+/**
+ * The worker's pointer read: SESSION_POINTERS_SQL plus manifest_etag, so the canonical
+ * snapshot refuses any manifest version other than the one the pointer names (canonical.ts
+ * manifest_mismatch) and the never-in-Neon verdict is bound to that exact version.
+ */
+export const WORKER_POINTERS_SQL = SESSION_POINTERS_SQL.replace("p.manifest_key, p.content_sha256,", "p.manifest_key, p.manifest_etag, p.content_sha256,");
 
 export function canonicalEvidenceDeps(
   db: SqlExecutor,
@@ -84,27 +90,23 @@ export function canonicalEvidenceDeps(
     },
     async snapshot(identity) {
       const snap = await canonicalProducerSnapshot(deps, identity);
-      return { exists: snap.exists, generation: snap.generation, legacyCoverage: snap.legacyCoverage, rows: snap.rows };
+      return {
+        exists: snap.exists,
+        generation: snap.generation,
+        legacyCoverage: snap.legacyCoverage,
+        ...(snap.neonDerived ? { neonDerived: true } : {}),
+        rows: snap.rows,
+      };
     },
     /**
-     * Never in Neon: sessions.session_analysis_neon_free (sealed freeze, absent from the
-     * frozen copy, born after the seal) AND no manifest of the scope is Neon-derived. Any
-     * unreadable manifest is doubt, and doubt is false (the coverage marker stays required).
+     * The DATABASE half of the never-in-Neon proof (sessions.session_analysis_neon_free, a
+     * SECURITY DEFINER function: the runtime role never reads the frozen custody tables). The
+     * objects half is the evidence snapshot's own neonDerived (evidence.ts), bound to the
+     * exact manifest versions it read; there is no second manifest read here.
      */
     async neonFree(identity) {
-      const { rows } = await db.query<{ free: boolean }>(NEON_FREE_SQL, [
-        identity.orgId,
-        identity.workspaceId,
-        identity.sessionId,
-      ]);
-      if (rows[0]?.free !== true) return false;
-      const reader = objectStoreManifestReader(canonical.store, { provider: canonical.provider as "s3", bucket: canonical.bucket, maxBytes: 1024 * 1024 });
-      let derived = false;
-      for (const p of await pointers(db, identity)) {
-        const read = await reader.read(p.manifest_key).catch(() => null);
-        if (!read || neonDerivedManifest(read.manifest)) derived = true;
-      }
-      return neverInNeon(true, derived);
+      const { rows } = await db.query<{ free: boolean }>(NEON_FREE_SQL, [identity.orgId, identity.workspaceId, identity.sessionId]);
+      return rows[0]?.free === true;
     },
     async anchorManifestKey(identity) {
       const first = (await pointers(db, identity))[0];

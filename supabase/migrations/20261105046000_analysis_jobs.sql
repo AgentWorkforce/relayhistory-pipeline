@@ -131,7 +131,11 @@ CREATE TABLE sessions.session_analysis_result_tickets (
   workspace_id text NOT NULL,
   session_id text NOT NULL,
   reason text NOT NULL CHECK (reason IN ('publishing', 'forgotten')),
-  created_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now(),
+  -- A writer's bounded lease on a 'publishing' ticket (the operator backfill heartbeats it):
+  -- the sweeper never sweeps a ticket whose lease is live, and a writer whose lease lapsed
+  -- must not write. NULL for the worker's tickets (its job lease fences them instead).
+  lease_expires_at timestamptz
 );
 CREATE INDEX session_analysis_result_tickets_created_idx ON sessions.session_analysis_result_tickets (created_at);
 ALTER TABLE sessions.session_analysis_result_tickets ENABLE ROW LEVEL SECURITY;
@@ -147,13 +151,17 @@ GRANT ALL ON sessions.session_analysis_result_tickets TO service_role;
 CREATE FUNCTION sessions.session_analysis_source_revision(p_org_id text, p_workspace_id text, p_session_id text)
 RETURNS text LANGUAGE sql STABLE
 SET search_path = pg_catalog, sessions, pg_temp AS $revision$
-  SELECT CASE WHEN count(*) = 0 THEN NULL ELSE encode(sha256(convert_to(
-           concat_ws('|', p_org_id, p_workspace_id, p_session_id) || E'\n' || string_agg(
-           concat_ws('|', p.harness, coalesce(p.canonical_session_id, p.session_id),
+  -- An unambiguous tuple (a JSON array of arrays; NULL kept as null), never a separator
+  -- join, so no two different pointer sets can sign alike. manifest_etag binds the exact
+  -- manifest version (a manifest replaced at the same revision and raw digest moves it).
+  SELECT CASE WHEN count(*) = 0 THEN NULL ELSE encode(sha256(convert_to(jsonb_build_array(
+           p_org_id, p_workspace_id, p_session_id,
+           jsonb_agg(jsonb_build_array(
+             p.harness, coalesce(p.canonical_session_id, p.session_id),
              coalesce(p.canonical_machine_id, p.machine_id), p.machine_id, p.user_id,
-             p.storage_provider, p.bucket, p.manifest_key, p.revision::text,
-             encode(p.content_sha256, 'hex'), p.raw_format),
-           E'\n' ORDER BY p.manifest_key, p.harness, p.machine_id), 'UTF8')), 'hex') END
+             p.storage_provider, p.bucket, p.manifest_key, p.manifest_etag, p.revision,
+             encode(p.content_sha256, 'hex'), p.raw_format)
+             ORDER BY p.manifest_key, p.harness, p.machine_id))::text, 'UTF8')), 'hex') END
     FROM sessions.session_index AS p
    WHERE p.org_id = p_org_id AND p.workspace_id = p_workspace_id
      AND (coalesce(p.canonical_session_id, p.session_id) = p_session_id OR p.session_id = p_session_id)
@@ -171,8 +179,10 @@ $revision$;
 -- The worker additionally requires that no manifest carries a Neon export/backfill marker
 -- (src/session-analysis/worker.ts), which catches a turns-only Neon session copied later.
 -- Index for (2) on large frozen copies: supabase/pending/20261105046000_frozen_records_session_index.sql.
+-- SECURITY DEFINER: the frozen custody tables stay owner-only (no SELECT for the runtime or
+-- read role); this returns one boolean.
 CREATE FUNCTION sessions.session_analysis_neon_free(p_org_id text, p_workspace_id text, p_session_id text)
-RETURNS boolean LANGUAGE sql STABLE
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $neon_free$
   WITH seal AS (SELECT sealed_at FROM sessions.ingest_frozen_source_completeness WHERE singleton),
   ptr AS (

@@ -159,6 +159,12 @@ export interface CanonicalScopeRows {
    * were exported, so turns relayhistory would have read may be missing.
    */
   legacyCoverage: { version: 1; tables: string[] } | null;
+  /**
+   * The objects half of the never-in-Neon proof, from THIS snapshot's own manifest reads (each
+   * bound to its pointer's etag): true when any manifest carries a Neon export marker or a
+   * backfill epoch. Never re-derived from a second, unbound manifest read.
+   */
+  neonDerived?: boolean;
   /** canonicalSourceGeneration: pointer set identity, recorded as the job's source revision. */
   generation: string;
   rows: Array<{ table: string; row: RecordValue }>;
@@ -176,11 +182,10 @@ export interface AnalysisEvidenceDeps {
   /** canonicalProducerSnapshot of one canonical identity. */
   snapshot(identity: AnalysisScope & { source: string }): Promise<CanonicalScopeRows>;
   /**
-   * Proof that the scope never had Neon evidence (so it is complete from S3 without the
-   * export's coverage marker): true only when sessions-pipeline's own records show the
-   * session was born after the sealed Neon freeze, is absent from the frozen Neon copy,
-   * and every manifest is a live sessions-pipeline publication (no Neon export/backfill).
-   * Absent or false: the marker is required.
+   * The DATABASE half of the never-in-Neon proof: sessions-pipeline's own records show the
+   * session was born after the sealed Neon freeze and is absent from the frozen Neon copy.
+   * The objects half is the snapshot's own `neonDerived`. Absent or false: the marker is
+   * required.
    */
   neonFree?(identity: AnalysisScope & { source: string }): Promise<boolean>;
 }
@@ -581,7 +586,7 @@ export async function loadSessionSource(
   if (
     !snapshot.legacyCoverage &&
     options.assumeNoLegacyTurns !== true &&
-    !(deps.neonFree && (await deps.neonFree({ ...scope, source: harness })))
+    !(deps.neonFree && snapshot.neonDerived !== true && (await deps.neonFree({ ...scope, source: harness })))
   )
     throw new SessionSourceIncompleteError("RelayHistory legacy evidence coverage is unknown");
   const budget = new EvidenceBudget();

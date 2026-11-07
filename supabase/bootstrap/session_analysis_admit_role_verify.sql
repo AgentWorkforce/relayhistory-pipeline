@@ -25,6 +25,12 @@ BEGIN
   FOR v_row IN SELECT g.rolname FROM pg_auth_members AS m JOIN pg_roles AS g ON g.oid = m.roleid WHERE m.member = r.oid LOOP
     v_problems := array_append(v_problems, format('member of %I', v_row.rolname)::text);
   END LOOP;
+  -- Exactly the reviewed role settings (pg_db_role_setting, every database): statement_timeout
+  -- 2s and default_transaction_read_only off; nothing else, nothing missing.
+  IF (SELECT coalesce(array_agg(cfg ORDER BY cfg), '{}') FROM pg_db_role_setting AS d, unnest(d.setconfig) AS cfg
+       WHERE d.setrole = r.oid) IS DISTINCT FROM ARRAY['default_transaction_read_only=off', 'statement_timeout=2s']::text[] THEN
+    v_problems := array_append(v_problems, 'role settings are not exactly statement_timeout=2s, default_transaction_read_only=off'::text);
+  END IF;
   IF NOT has_schema_privilege(r.oid, 'sessions', 'USAGE') THEN v_problems := array_append(v_problems, 'no USAGE on sessions'::text); END IF;
   IF has_schema_privilege(r.oid, 'sessions', 'CREATE') THEN v_problems := array_append(v_problems, 'CREATE on sessions'::text); END IF;
   FOR v_row IN
