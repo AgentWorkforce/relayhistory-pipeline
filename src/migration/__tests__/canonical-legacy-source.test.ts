@@ -26,6 +26,9 @@ import {
   type CanonicalPointer,
 } from "../../session-read-api/canonical.ts";
 import type { Queryable } from "../relayhistory-export.ts";
+
+// These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
+process.env.S3X_OBLIGATIONS = "on";
 const pg = new PGlite(),
   db = pg as unknown as Queryable;
 const turnId = "11111111-1111-4111-8111-111111111111";

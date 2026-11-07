@@ -7,6 +7,9 @@ import { join } from "node:path";
 import { stateForRun } from "../neon-s3-sync/main.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 
+// These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
+process.env.S3X_OBLIGATIONS = "on";
+
 const dirs: string[] = [];
 afterAll(async () => {
   await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));

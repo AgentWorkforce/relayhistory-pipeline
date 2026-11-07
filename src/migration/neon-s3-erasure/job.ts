@@ -94,7 +94,7 @@ export function sessionPrefixOf(keyRoot: string, orgId: string, key: string): st
 export type PagedOutcome = "incomplete" | "erased" | "unverified" | "unresolved" | "refused";
 
 export class ErasureJob {
-  readonly counters = { unresolved: 0, reservationsRefused: 0, swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0, resumable: 0, unverified: 0 };
+  readonly counters = { doneRefused: 0, unresolved: 0, reservationsRefused: 0, swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0, resumable: 0, unverified: 0 };
   #lastSweep = 0;
   #lastProgress = 0;
   readonly authority: ErasureAuthority;
@@ -216,12 +216,6 @@ export class ErasureJob {
       this.counters.unverified += 1;
       return { status: "unverified", deleted: step.deleted, remaining, rev };
     }
-    // A prefix the exporter writes is never done while its obligations may be incomplete: an unattested genesis (a
-    // lost / recreated state file) may have forgotten outstanding PUTs, so it fails closed.
-    if (invocations.length - done.length > 0 || (exporterWritten && !(this.cfg.obligationsSettled?.() ?? false))) {
-      this.counters.unresolved += 1;
-      return { status: "unresolved", deleted: step.deleted, remaining, rev };
-    }
     // Retire EXACTLY the reserved versions this complete inventory shows absent (within keyFilter); every other
     // reservation (kept siblings, successors, other subsets) stays.
     // Bounded, resumable retirement of THIS scope's reservations proven absent (SQL-filtered by scope and exact key /
@@ -249,6 +243,15 @@ export class ErasureJob {
         this.counters.resumable += 1;
         return { status: "incomplete", deleted: step.deleted, remaining, rev };
       }
+    }
+    // M1: the proven-absent reservations above are retired EVEN when completion is impossible (an unresolved PUT, or
+    // the unsettled production genesis), so a writer's claim / cancel is never wedged behind reservations nobody will
+    // retire. Only the done claim is gated here.
+    // A prefix the exporter writes is never done while its obligations may be incomplete: an unattested genesis (a
+    // lost / recreated state file) may have forgotten outstanding PUTs, so it fails closed.
+    if (invocations.length - done.length > 0 || (exporterWritten && !(this.cfg.obligationsSettled?.() ?? false))) {
+      this.counters.unresolved += 1;
+      return { status: "unresolved", deleted: step.deleted, remaining, rev };
     }
     // Final assertion under the CURRENT proof: no eligible (proof-absent) reservation of this scope remains (bounded,
     // read-only pages within the same deadline). Anything left, or no time to check: incomplete, never done.
@@ -596,7 +599,9 @@ export class ErasureJob {
           if (r.status !== "erased") continue;
           // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
           if (!this.state.completeErasure(item.key, item.enqueued_at, item.key.slice(0, item.key.lastIndexOf("/") + 1), r.rev, itemLease)) {
-            this.counters.reservationsRefused += 1;
+            this.counters.doneRefused += 1;
+            this.state.erasureFailed(item.key, "erasure_done_refused", this.now());
+            this.log({ message: "erasure done refused", error_code: "erasure_done_refused", kind: item.kind });
             continue;
           }
           this.counters.objectsErased += 1;
@@ -624,7 +629,9 @@ export class ErasureJob {
         if (r.status !== "erased") continue;
         // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
         if (!this.state.completeErasure(item.key, item.enqueued_at, item.key, r.rev, itemLease)) {
-          this.counters.reservationsRefused += 1;
+          this.counters.doneRefused += 1;
+          this.state.erasureFailed(item.key, "erasure_done_refused", this.now());
+          this.log({ message: "erasure done refused", error_code: "erasure_done_refused", kind: item.kind });
           continue;
         }
         this.counters.prefixesErased += 1;

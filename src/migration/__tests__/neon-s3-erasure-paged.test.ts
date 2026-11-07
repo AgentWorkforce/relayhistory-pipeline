@@ -16,6 +16,9 @@ import type { ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import type { LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 
+// These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
+process.env.S3X_OBLIGATIONS = "on";
+
 /**
  * TEST-ONLY: exporter-path completion is opted into explicitly through the job's test seam
  * (ErasureConfig.obligationsSettled; production never sets it). The state file itself can never attest.

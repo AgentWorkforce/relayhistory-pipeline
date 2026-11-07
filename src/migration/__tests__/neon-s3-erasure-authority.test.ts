@@ -22,6 +22,9 @@ import { SUPABASE_PROD_CA_2021 } from "../../session-pipeline/supabase-ca.ts";
 import { CredentialRefusal, FORBIDDEN_CREDENTIAL_ENV, parseCredentialDocument, pinnedPgClient, pinnedPgConfig, readStdinCredentials, refuseCredentialEnv, s3Credentials } from "../stdin-credentials.ts";
 import { authorityFixture, epoch } from "../../session-ingest/__tests__/privacy-authority-support.ts";
 
+// These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
+process.env.S3X_OBLIGATIONS = "on";
+
 setDefaultTimeout(60_000);
 const open: Array<() => unknown> = [];
 afterEach(async () => {

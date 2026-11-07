@@ -16,6 +16,9 @@ import { SyncState } from "../neon-s3-sync/state.ts";
 import { obligatedStore } from "../neon-s3-sync/obligated-store.ts";
 import { ObjectStoreError, type ObjectStore } from "../../shared/vendor.ts";
 
+// These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
+process.env.S3X_OBLIGATIONS = "on";
+
 setDefaultTimeout(120_000);
 const OLD = Date.parse("2026-11-01T00:00:00Z");
 const PREFIX = "96bulls/org-1/v1/ws=ws_1/m=delivery_x/h=claude/d=2026/10/30/s=sess_1/";

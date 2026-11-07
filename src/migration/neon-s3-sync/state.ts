@@ -48,12 +48,18 @@ export interface Backlog {
 export class SyncState {
   readonly db: DatabaseSync;
 
-  constructor(path: string) {
+  /**
+   * S3X_OBLIGATIONS (default OFF): the durable unresolved-write obligation model (its schema, triggers and genesis on
+   * open, the exporter's invocation recording and claims, and the paged gated erasure job). Off is today's behaviour
+   * byte for byte: none of it is created, recorded or consulted. An explicit option overrides the environment.
+   */
+  readonly obligations: boolean;
+
+  constructor(path: string, opts: { obligations?: boolean } = {}) {
+    this.obligations = opts.obligations ?? process.env.S3X_OBLIGATIONS === "on";
     this.db = new DatabaseSync(path);
     // Shared by the exporter and the erasure job (two processes): WAL plus a busy wait.
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 10000;");
-    // A file that already holds the legacy exporter's schema (opened before obligations existed) vs. a new / recreated one.
-    const legacyFile = !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get();
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS groups (
         org_id TEXT NOT NULL, session_id TEXT NOT NULL,
@@ -76,6 +82,32 @@ export class SyncState {
       CREATE TABLE IF NOT EXISTS leases (prefix TEXT PRIMARY KEY, holder TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS erasure_seen (org_id TEXT NOT NULL, session_id TEXT NOT NULL, sweep INTEGER NOT NULL,
         PRIMARY KEY (org_id, session_id));
+      CREATE TABLE IF NOT EXISTS truncations (
+        org_id TEXT NOT NULL, session_id TEXT NOT NULL, manifest_key TEXT NOT NULL,
+        strings INTEGER NOT NULL, recorded_at INTEGER NOT NULL,
+        PRIMARY KEY (org_id, session_id, manifest_key));
+    `);
+    // Added after the first production start: migrate in place.
+    const cols = this.db.prepare("PRAGMA table_info(truncations)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "max_chars"))
+      try {
+        this.db.exec("ALTER TABLE truncations ADD COLUMN max_chars INTEGER NOT NULL DEFAULT 0");
+      } catch (error) {
+        // The other process (exporter or erasure job) added it first.
+        if (!/duplicate column/i.test(String((error as Error).message))) throw error;
+      }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS groups_last ON groups (last_ms DESC);
+    `);
+    if (this.obligations) this.#openObligations();
+  }
+
+  /** The obligation schema, triggers, lease generation column and genesis (only with S3X_OBLIGATIONS on). */
+  #openObligations() {
+    // A file that already held the obligation-free schema before this open (legacy) vs. a new / recreated one.
+    const legacyFile = !this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'write_invocations'").get()
+      && !!this.db.prepare("SELECT 1 FROM pending_keys LIMIT 1").get();
+    this.db.exec(`
       -- Unresolved-write obligations (shared write-obligation v3, write-obligation.ts), E3's own tables:
       -- one row per exporter PUT invocation, recorded BEFORE it is sent; the versions the exporter
       -- currently publishes (owns); and the versions the eraser reserved for deletion. Every mutation
@@ -102,22 +134,6 @@ export class SyncState {
       CREATE TABLE IF NOT EXISTS write_touch (key TEXT PRIMARY KEY, seq INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS erase_checkpoints (
         scope TEXT PRIMARY KEY, checkpoint TEXT NOT NULL, updated_at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS truncations (
-        org_id TEXT NOT NULL, session_id TEXT NOT NULL, manifest_key TEXT NOT NULL,
-        strings INTEGER NOT NULL, recorded_at INTEGER NOT NULL,
-        PRIMARY KEY (org_id, session_id, manifest_key));
-    `);
-    // Added after the first production start: migrate in place.
-    const cols = this.db.prepare("PRAGMA table_info(truncations)").all() as { name: string }[];
-    if (!cols.some((c) => c.name === "max_chars"))
-      try {
-        this.db.exec("ALTER TABLE truncations ADD COLUMN max_chars INTEGER NOT NULL DEFAULT 0");
-      } catch (error) {
-        // The other process (exporter or erasure job) added it first.
-        if (!/duplicate column/i.test(String((error as Error).message))) throw error;
-      }
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS groups_last ON groups (last_ms DESC);
     `);
     for (const t of ["write_invocations", "write_published", "erase_reservations"])
       for (const [op, row] of [["INSERT", "NEW"], ["UPDATE", "NEW"], ["DELETE", "OLD"]] as const)
@@ -321,6 +337,13 @@ export class SyncState {
         | { holder: string; at: number }
         | undefined;
       if (row && row.holder !== holder && now - Number(row.at) < ttlMs) return;
+      if (!this.obligations) {
+        this.db
+          .prepare("INSERT INTO leases (prefix, holder, at) VALUES (?, ?, ?) ON CONFLICT (prefix) DO UPDATE SET holder = excluded.holder, at = excluded.at")
+          .run(prefix, holder, now);
+        ok = true;
+        return;
+      }
       // The same holder keeps its generation; a new acquisition (absent, or taken over) mints a fresh one.
       this.db
         .prepare(`INSERT INTO leases (prefix, holder, at, gen) VALUES (?, ?, ?, ?) ON CONFLICT (prefix) DO UPDATE SET at = excluded.at,
@@ -333,6 +356,7 @@ export class SyncState {
 
   /** The lease's current generation (minted at acquisition), or undefined when no one holds it. */
   leaseGen(prefix: string): string | undefined {
+    if (!this.obligations) return undefined;
     return (this.db.prepare("SELECT gen FROM leases WHERE prefix = ?").get(prefix) as { gen: string | null } | undefined)?.gen ?? undefined;
   }
 
@@ -373,6 +397,12 @@ export class SyncState {
     // Queued for erasure: no longer owned (the eraser may then reserve its versions), scoped by the item's KIND: an
     // object item unpublishes EXACTLY its key (never another key that merely starts with it); a prefix item, the
     // keys under its "/"-terminated prefix.
+    if (!this.obligations) {
+      this.#tx(() => {
+        for (const i of items) q.run(i.key, i.kind, i.org_id, i.reason, at);
+      });
+      return;
+    }
     const unpubKey = this.db.prepare("DELETE FROM write_published WHERE key = ?");
     const unpubPrefix = this.db.prepare(`DELETE FROM write_published WHERE ${SyncState.#under}`);
     this.#tx(() => {

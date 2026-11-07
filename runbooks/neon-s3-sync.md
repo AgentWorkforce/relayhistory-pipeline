@@ -120,17 +120,25 @@ activation (migration 20261105041000_ingest_privacy_authority) and the RHC
 `supabase-authority` flip; restarting in `supabase` before activation only
 logs `sweep refused: privacy authority not ready`.
 
-Dry run (reads the authority, builds everything, stores nothing): run `main.ts`
-without `--execute`; it needs only `databaseUrl` on stdin.
+Dry run (reads the authority, builds everything, erases nothing): run `main.ts`
+without `--execute`; it needs only `databaseUrl` on stdin. It does open the state
+file at `S3X_STATE` (creating it if absent, and with `S3X_OBLIGATIONS=on`
+initializing the obligation schema and an unattested genesis there); point
+`S3X_STATE` at a scratch copy for a dry run that must leave the real file untouched.
+
+`S3X_OBLIGATIONS` (default OFF; set in BOTH the exporter's and the eraser's
+environment): off is the pre-#309 behaviour byte for byte (no obligation schema
+or genesis on open, no exporter invocation recording or claims, the legacy erasure
+job). On enables the durable unresolved-write obligations, reservations and the
+paged, gated erasure job described below.
 
 Completion (shared eraser + write obligation v3): a session prefix is erased in
 bounded, resumable steps (checkpoint in the state file, bound to the operation,
 authority, tenant/session or queued item and lease), with every doomed version
 reserved first, and is marked done only after a fresh strict zero inventory AND
-no unresolved exporter PUT under it. Exact-object erasure in a directory with more than 10k
-unrelated kept versions cannot complete yet (the shared primitive's verification
-lists the whole directory from its start under the 10k budget; an exact-key
-verify is pending in that primitive). A PUT whose outcome is unknown (timeout,
+no unresolved exporter PUT under it. A single object (an orphan, a staged batch, a pointer)
+is erased and verified in the shared primitive's exact-key mode, so it completes
+however many other versions share its directory. A PUT whose outcome is unknown (timeout,
 crash, lost response) keeps the prefix queued indefinitely, re-swept on the
 bounded backoff: `erasure_write_unresolved` in the queue is expected, not a
 failure to clear by hand.

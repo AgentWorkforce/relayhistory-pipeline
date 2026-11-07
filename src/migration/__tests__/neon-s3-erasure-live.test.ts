@@ -22,6 +22,9 @@ import { liveMachineId, liveTargets } from "../neon-s3-erasure/live.ts";
 import { fencedLivePage } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 
+// These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
+process.env.S3X_OBLIGATIONS = "on";
+
 const M = "srv_47a49913c03b1505faf877017e54ae00";
 const DIR = `96bulls/org-1/v1/ws=ws_1/m=${M}/h=claude/d=2026/10/30/s=sess_1/`;
 const WORKER_KEYS = [`${DIR}manifest.json`, `${DIR}raw/0000000000-0-e568b589.ndjson.zst`];

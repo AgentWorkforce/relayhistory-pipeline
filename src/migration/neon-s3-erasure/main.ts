@@ -31,6 +31,15 @@ import { eraserDatabaseUrl, pinnedPgClient, readStdinCredentials, refuseCredenti
 import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
 import { createS3Eraser, type Eraser, type PagedEraser } from "./eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "./job.ts";
+import { DEFAULT_ERASURE_CONFIG as LEGACY_ERASURE_CONFIG, ErasureJob as LegacyErasureJob } from "./job-legacy.ts";
+
+/**
+ * S3X_OBLIGATIONS (default OFF). Off: the pre-#309 erasure job (job-legacy.ts, byte-identical to #289's job.ts) over an
+ * obligation-free state file. On: the paged, obligation-gated job (job.ts) over the obligation schema.
+ */
+export function obligationsEnabled(e: (k: string) => string | undefined = (k) => process.env[k]): boolean {
+  return e("S3X_OBLIGATIONS") === "on";
+}
 
 const env = (k: string, d?: string) => process.env[k]?.trim() || d;
 const flag = (name: string) => process.argv.includes(`--${name}`);
@@ -79,7 +88,8 @@ export async function main() {
   const eraser = eraserFor(execute, creds.eraser === undefined ? undefined : s3Credentials(creds.eraser, "eraser"));
   delete creds.databaseUrl;
   delete creds.eraser;
-  const state = new SyncState(env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!);
+  const obligations = obligationsEnabled();
+  const state = new SyncState(env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!, { obligations });
   const { default: pg } = await import("pg");
   // The password is pinned from the stdin URL: pg can never fall back to ~/.pgpass (a credential on disk).
   const client = pinnedPgClient(pg, url, "databaseUrl", kind, { application_name: `96bulls-${kind}-s3-erasure` });
@@ -89,15 +99,17 @@ export async function main() {
   try {
     const db = await sessionReadOnly(client as unknown as Queryable);
     const cfg = {
-      ...DEFAULT_ERASURE_CONFIG,
+      ...(obligations ? DEFAULT_ERASURE_CONFIG : LEGACY_ERASURE_CONFIG),
       keyRoot: env("S3X_KEY_ROOT", "96bulls")!,
       recognizeLegacy: env("S3X_ERASER_RECOGNIZES_LEGACY", "false") === "true",
     };
     // Supabase mode: least-privilege identity first (bulls96_privacy_eraser only; never owner/superuser/BYPASSRLS).
     if (kind === "supabase") await assertEraserIdentity(db);
     const authority = kind === "supabase" ? supabaseAuthority(db) : neonAuthority(db);
-    const job = new ErasureJob(authority, state, eraser, log, cfg, Date.now, undefined, () => stop);
-    log({ message: "start", execute, authority: kind, recognize_legacy: cfg.recognizeLegacy });
+    const job = obligations
+      ? new ErasureJob(authority, state, eraser, log, cfg, Date.now, undefined, () => stop)
+      : new LegacyErasureJob(authority, state, eraser, log, cfg, Date.now, undefined, () => stop);
+    log({ message: "start", execute, authority: kind, recognize_legacy: cfg.recognizeLegacy, obligations });
     // A dry run changes nothing: it sweeps and reports what it would erase.
     if (!execute) {
       await job.sweep({ dryRun: true });

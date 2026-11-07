@@ -44,6 +44,9 @@ const attestedState = (path: string) => new SyncState(path);
 import { Syncer, DEFAULT_SYNC_CONFIG } from "../neon-s3-sync/sync.ts";
 import { Throttle, parseWindows } from "../neon-s3-sync/throttle.ts";
 
+// These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
+process.env.S3X_OBLIGATIONS = "on";
+
 const dirs: string[] = [];
 afterAll(async () => {
   await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
