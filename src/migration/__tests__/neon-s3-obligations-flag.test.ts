@@ -220,3 +220,36 @@ test("P2: releasing a LARGE, SPARSE-present reservation set reads <= 1000 rows p
   st.releasePresentPage(D, "S", undefined, () => { seen2 += 1; return false; }, hw, undefined, q.rev, 1000, "proof-B");
   expect(seen2).toBe(1000); // restarted from the start under proof-B
 });
+
+test("release path RACE: a write landing between pages refuses the next release page (CAS); nothing is released by it", async () => {
+  const st = new SyncState(await tmp("e3-flag-relrace-"), { obligations: true });
+  const D = `${PFX}raw/`;
+  const vs = Array.from({ length: 1_500 }, (_, i) => ({ key: `${D}b=${String(i).padStart(6, "0")}.zst`, versionId: `v${i}` }));
+  for (let i = 0; i < vs.length; i += 500) expect(st.reserveErase(D, st.obligationRev(D), "S", vs.slice(i, i + 500)).ok).toBe(true);
+  const hw = st.reservationHighWater(D);
+  const p1 = st.releasePresentPage(D, "S", undefined, () => true, hw, undefined, st.obligationRev(D), 1000, "proof-1");
+  expect(p1).toMatchObject({ released: 1000, ok: true, done: false });
+  st.dispatchWrite(`${D}late.zst`, "exporter:1"); // a concurrent writer lands between pages
+  const p2 = st.releasePresentPage(D, "S", undefined, () => true, hw, undefined, p1.rev, 1000, "proof-1");
+  expect(p2).toMatchObject({ released: 0, ok: false });
+  expect((st as unknown as { db: DatabaseSync }).db.prepare("SELECT count(*) AS n FROM erase_reservations").get()).toEqual({ n: 500 });
+});
+
+test("release path CRASH: a crash after page 1 resumes from the durable proof-bound cursor in a NEW process (no rescan)", async () => {
+  const path = await tmp("e3-flag-relcrash-");
+  const st = new SyncState(path, { obligations: true });
+  const D = `${PFX}raw/`;
+  const vs = Array.from({ length: 1_500 }, (_, i) => ({ key: `${D}b=${String(i).padStart(6, "0")}.zst`, versionId: `v${i}` }));
+  for (let i = 0; i < vs.length; i += 500) expect(st.reserveErase(D, st.obligationRev(D), "S", vs.slice(i, i + 500)).ok).toBe(true);
+  const hw = st.reservationHighWater(D);
+  const keepAll = () => false; // nothing present: scan only
+  expect(st.releasePresentPage(D, "S", undefined, keepAll, hw, undefined, st.obligationRev(D), 1000, "proof-1")).toMatchObject({ ok: true, done: false });
+  st.close();
+  const st2 = new SyncState(path, { obligations: true });
+  expect(st2.releaseCursor("S")).toEqual([vs[999]!.key, "v999"]);
+  let seen = 0;
+  const p = st2.releasePresentPage(D, "S", undefined, () => { seen += 1; return false; }, hw, undefined, st2.obligationRev(D), 1000, "proof-1");
+  expect(p).toMatchObject({ ok: true, done: true });
+  expect(seen).toBe(500); // resumed after the cursor
+  st2.close();
+});
