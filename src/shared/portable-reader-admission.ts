@@ -14,6 +14,9 @@ export const PORTABLE_READER_ROLE = "bulls96_read_api";
 export const READER_MARKER_TABLE = "sessions.__96bulls_role_validation";
 export const READER_MARKER_NAME = "session_directory_search_worker";
 export const READER_LEDGER_TABLE = "sessions.__96bulls_migrations";
+const READINESS_REFUSALS = new Set(["schema_pending", "marker_missing", "generation_mismatch", "validation_pending"]);
+/** The reader-only readiness RPC (048000); returns one bounded status code. */
+export const READER_READINESS_SQL = "SELECT sessions.portable_reader_readiness($1::text[], $2::text) AS v";
 
 export interface ReaderAdmission {
   readonly generation: string;
@@ -38,29 +41,36 @@ export async function portableReaderGate(tx: SqlExecutor, a: ReaderAdmission): P
   if (!a.storageVerifySql?.trim() || !a.readerVerifySql?.trim()) throw new PortableConnectionRefused("reader_verifier_missing");
   const names = a.expectedNames.filter(n => !/^(shim|bootstrap|verify):/.test(n));
   if (!names.length) throw new PortableConnectionRefused("reader_expected_names_missing");
-  const who = (await tx.query<{ cu: string; su: string; iso: string; ro: string; st: string }>(
+  const who = (await tx.query<{ cu: string; su: string; iso: string; ro: string; dro: string; st: string }>(
     `SELECT current_user AS cu, session_user AS su, current_setting('transaction_isolation') AS iso,
-            current_setting('transaction_read_only') AS ro, current_setting('statement_timeout') AS st`)).rows[0];
+            current_setting('transaction_read_only') AS ro, current_setting('default_transaction_read_only') AS dro,
+            current_setting('statement_timeout') AS st`)).rows[0];
   // The fixed reader on its own startup identity (not SET ROLE from another login).
   if (!who || who.cu !== PORTABLE_READER_ROLE || who.su !== PORTABLE_READER_ROLE) throw new PortableConnectionRefused("reader_identity");
   if (who.iso !== "read committed") throw new PortableConnectionRefused("reader_isolation");
+  // BEGIN READ ONLY forces transaction_read_only; the startup default is checked separately.
   if (who.ro !== "on") throw new PortableConnectionRefused("reader_not_read_only");
+  if (who.dro !== "on") throw new PortableConnectionRefused("reader_default_not_read_only");
   if (!boundedTimeout(who.st)) throw new PortableConnectionRefused("reader_statement_timeout");
-  const applied = (await tx.query<{ n: string | number }>(
-    `SELECT count(DISTINCT name) AS n FROM ${READER_LEDGER_TABLE} WHERE name = ANY($1::text[])`, [names])).rows[0];
-  if (Number(applied?.n ?? 0) !== new Set(names).size) throw new PortableConnectionRefused("reader_schema_pending");
-  const passed = async () => {
-    const m = (await tx.query<{ status: string; generation: string }>(
-      `SELECT status, generation FROM ${READER_MARKER_TABLE} WHERE name = $1`, [READER_MARKER_NAME])).rows;
-    if (m.length !== 1) throw new PortableConnectionRefused("reader_marker_missing");
-    if (m[0]!.generation !== a.generation) throw new PortableConnectionRefused("reader_generation_mismatch");
-    if (m[0]!.status !== "pass") throw new PortableConnectionRefused("reader_marker_pending");
+  // Readiness through the reader-only SECURITY DEFINER RPC (048000): the fixed reader may
+  // not SELECT the ledger or the marker. A REAL query each time (no cached result).
+  const ready = async () => {
+    let verdict: string | undefined;
+    try {
+      verdict = (await tx.query<{ v: string }>(READER_READINESS_SQL, [names, a.generation])).rows[0]?.v;
+    } catch (error) {
+      const sqlstate = (error as { code?: unknown })?.code;
+      throw new PortableConnectionRefused(typeof sqlstate === "string" ? `reader_readiness_sqlstate_${sqlstate}` : "reader_readiness_failed");
+    }
+    if (verdict === "pass") return;
+    // Only the reviewed status enum is mapped; anything else is a fixed code, never echoed.
+    throw new PortableConnectionRefused(READINESS_REFUSALS.has(verdict ?? "") ? `reader_${verdict}` : "reader_readiness_unknown");
   };
-  await passed();
+  await ready(); // initial
   await run(tx, a.readerVerifySql, "reader_contract_unverified");
   await tx.query("SELECT set_config('hoopdb.runtime_role', $1, true), set_config('hoopdb.db_mode', $2, true)", [a.writerRole, a.dbMode ?? ""]);
   await run(tx, a.storageVerifySql, "reader_storage_unverified");
-  await passed(); // FINAL read
+  await ready(); // FINAL read, after both verifiers, immediately before work
 }
 
 async function run(tx: SqlExecutor, sql: string, code: string): Promise<void> {

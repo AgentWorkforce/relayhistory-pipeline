@@ -200,6 +200,9 @@ BEGIN
       v_problems := array_append(v_problems, 'directory policy naming the reader exists without the 048000 reader contract'::text);
     END IF;
   END IF;
+  IF NOT v_portable AND to_regprocedure('sessions.portable_reader_readiness(text[],text)') IS NOT NULL THEN
+    v_problems := array_append(v_problems, ('readiness function exists without the 048000 reader contract')::text);
+  END IF;
   -- The directory half of the 048000 reader contract, checked here too so every route
   -- that runs this verifier (phase 2, mark_pass, writer admission) covers it.
   IF v_portable THEN
@@ -222,6 +225,36 @@ BEGIN
                 WHERE a.attrelid IN (to_regclass('sessions.session_directory'), to_regclass('sessions.search_projection_state'))
                   AND a.attnum > 0 AND a.attacl IS NOT NULL AND x.grantee = v_reader AND x.is_grantable) THEN
       v_problems := array_append(v_problems, ('reader column SELECT WITH GRANT OPTION on the portable relations')::text);
+    END IF;
+    -- The readiness RPC is part of the 048000 unit: exactly owner-owned, SECURITY DEFINER,
+    -- pinned search_path, EXECUTE for exactly the owner and the reader (no GRANT OPTION).
+    IF to_regprocedure('sessions.portable_reader_readiness(text[],text)') IS NULL THEN
+      v_problems := array_append(v_problems, ('readiness function sessions.portable_reader_readiness(text[],text) is missing')::text);
+    ELSE
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_proc p
+         WHERE p.oid = to_regprocedure('sessions.portable_reader_readiness(text[],text)')
+           AND p.prosecdef AND p.provolatile = 'v' AND p.prorettype = 'text'::regtype
+           AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
+           AND p.proconfig = ARRAY['search_path=pg_catalog, pg_temp']
+           -- The migration owner: owner of the 047000 table this contract extends.
+           AND p.proowner = (SELECT relowner FROM pg_class WHERE oid = to_regclass('sessions.search_projection_state'))) THEN
+        v_problems := array_append(v_problems, ('readiness function is not owner-owned VOLATILE SECURITY DEFINER with the pinned search_path')::text);
+      END IF;
+      -- The exact reviewed body, pinned by the sha256 of the committed definition (never
+      -- inferred from the live catalog): a body replaced with an always-pass is refused.
+      IF (SELECT encode(sha256(convert_to(p.prosrc, 'UTF8')), 'hex') FROM pg_proc p
+           WHERE p.oid = to_regprocedure('sessions.portable_reader_readiness(text[],text)'))
+         IS DISTINCT FROM '6f198ba75dc55787c7af275752540c0ee494976110687575cb3020ce93ef6795' THEN
+        v_problems := array_append(v_problems, ('readiness function body differs from the reviewed definition')::text);
+      END IF;
+      IF (SELECT string_agg(CASE WHEN x.grantee = p.proowner THEN '<owner>' WHEN x.grantee = 0 THEN 'PUBLIC' ELSE x.grantee::regrole::text END
+                            || ':' || x.privilege_type || CASE WHEN x.is_grantable THEN '*' ELSE '' END, ',' ORDER BY 1)
+            FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+           WHERE p.oid = to_regprocedure('sessions.portable_reader_readiness(text[],text)'))
+         IS DISTINCT FROM '<owner>:EXECUTE,bulls96_read_api:EXECUTE' THEN
+        v_problems := array_append(v_problems, ('readiness function EXECUTE grants are not exactly the owner and bulls96_read_api')::text);
+      END IF;
     END IF;
     IF NOT coalesce((SELECT relrowsecurity FROM pg_class WHERE oid = to_regclass('sessions.session_directory')), false) THEN
       v_problems := array_append(v_problems, 'RLS is off on sessions.session_directory'::text);

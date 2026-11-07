@@ -87,6 +87,30 @@ const cases: [string, string, RegExp, RegExp][] = [
     "ALTER TABLE sessions.session_directory DROP COLUMN event_projection_ready CASCADE",
     /sessions\.session_directory required column event_projection_ready is missing/,
     /directory required column event_projection_ready is missing/],
+  ["readiness RPC granted to PUBLIC",
+    "GRANT EXECUTE ON FUNCTION sessions.portable_reader_readiness(text[], text) TO PUBLIC",
+    /readiness function EXECUTE grants are not exactly the owner and bulls96_read_api/,
+    /readiness function EXECUTE grants are not exactly the owner and bulls96_read_api/],
+  ["readiness RPC granted to another role",
+    "GRANT EXECUTE ON FUNCTION sessions.portable_reader_readiness(text[], text) TO authenticated",
+    /readiness function EXECUTE grants are not exactly the owner and bulls96_read_api/,
+    /readiness function EXECUTE grants are not exactly the owner and bulls96_read_api/],
+  ["readiness RPC made SECURITY INVOKER",
+    "ALTER FUNCTION sessions.portable_reader_readiness(text[], text) SECURITY INVOKER",
+    /readiness function is not owner-owned VOLATILE SECURITY DEFINER with the pinned search_path/,
+    /readiness function is not owner-owned VOLATILE SECURITY DEFINER with the pinned search_path/],
+  ["readiness RPC search_path changed",
+    "ALTER FUNCTION sessions.portable_reader_readiness(text[], text) SET search_path = public, pg_catalog",
+    /readiness function is not owner-owned VOLATILE SECURITY DEFINER with the pinned search_path/,
+    /readiness function is not owner-owned VOLATILE SECURITY DEFINER with the pinned search_path/],
+  ["readiness RPC body replaced with an always-pass (same signature, flags, ACL)",
+    "CREATE OR REPLACE FUNCTION sessions.portable_reader_readiness(p_names text[], p_generation text) RETURNS text LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $b$ BEGIN RETURN 'pass'; END $b$",
+    /readiness function body differs from the reviewed definition/,
+    /readiness function body differs from the reviewed definition/],
+  ["readiness RPC dropped while 048000 stays",
+    "DROP FUNCTION sessions.portable_reader_readiness(text[], text)",
+    /readiness function sessions\.portable_reader_readiness\(text\[\],text\) is missing/,
+    /readiness function sessions\.portable_reader_readiness\(text\[\],text\) is missing/],
 ];
 
 for (const [name, drift, readerMessage, storageMessage] of cases)
@@ -96,3 +120,23 @@ for (const [name, drift, readerMessage, storageMessage] of cases)
     await expect(reader(db)).rejects.toThrow(readerMessage);
     await expect(storage(db)).rejects.toThrow(storageMessage);
   }, 120_000);
+
+test("readiness RPC present without the rest of 048000 is refused by both verifiers (all-or-nothing)", async () => {
+  const db = await migrated();
+  // Remove everything 048000 creates EXCEPT the function.
+  await db.exec(`DROP POLICY session_directory_portable_read_api ON sessions.session_directory;
+    DROP POLICY search_projection_state_read_api ON sessions.search_projection_state;
+    REVOKE SELECT (org_id, workspace_id, harness, session_id, event_projection_epoch, event_projection_ready) ON sessions.session_directory FROM bulls96_read_api;
+    REVOKE SELECT (backend_id, org_id, workspace_id, source, session_id, canonical_session_id, source_epoch, coverage_from_ms, complete) ON sessions.search_projection_state FROM bulls96_read_api;`);
+  await expect(reader(db)).rejects.toThrow(/readiness function exists without the 048000 reader contract/);
+  await expect(storage(db)).rejects.toThrow(/readiness function exists without the 048000 reader contract/);
+}, 120_000);
+
+test("the readiness RPC refuses any caller that is not the fixed reader on its own login (42501), including SET ROLE", async () => {
+  const db = await migrated();
+  const call = () => db.query("SELECT sessions.portable_reader_readiness(ARRAY['upstream:x.sql'], repeat('a', 64)) AS v");
+  await expect(call()).rejects.toMatchObject({ code: "42501" }); // postgres (owner/superuser)
+  await db.exec("SET ROLE bulls96_read_api");
+  try { await expect(call()).rejects.toMatchObject({ code: "42501" }); } // session_user is still postgres
+  finally { await db.exec("RESET ROLE"); }
+}, 120_000);

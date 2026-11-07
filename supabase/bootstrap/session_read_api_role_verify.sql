@@ -121,6 +121,7 @@ BEGIN
      WHERE n.nspname = 'sessions' AND p.prosecdef AND has_function_privilege(v_role.oid, p.oid, 'EXECUTE')
        AND p.oid::regprocedure::text NOT IN (
          'sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
+         'sessions.portable_reader_readiness(text[],text)',
          'sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)')
   LOOP
     v_problems := array_append(v_problems, (format('EXECUTE on security definer %s', v_row.fn))::text);
@@ -176,6 +177,36 @@ BEGIN
         v_problems := array_append(v_problems, (format('policy %s on %s is missing or not exactly FOR SELECT TO bulls96_read_api on the tenant settings', v_row.name, v_row.rel))::text);
       END IF;
     END LOOP;
+    -- The readiness RPC is part of the 048000 unit: exactly owner-owned, SECURITY DEFINER,
+    -- pinned search_path, EXECUTE for exactly the owner and the reader (no GRANT OPTION).
+    IF to_regprocedure('sessions.portable_reader_readiness(text[],text)') IS NULL THEN
+      v_problems := array_append(v_problems, ('readiness function sessions.portable_reader_readiness(text[],text) is missing')::text);
+    ELSE
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_proc p
+         WHERE p.oid = to_regprocedure('sessions.portable_reader_readiness(text[],text)')
+           AND p.prosecdef AND p.provolatile = 'v' AND p.prorettype = 'text'::regtype
+           AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
+           AND p.proconfig = ARRAY['search_path=pg_catalog, pg_temp']
+           -- The migration owner: owner of the 047000 table this contract extends.
+           AND p.proowner = (SELECT relowner FROM pg_class WHERE oid = to_regclass('sessions.search_projection_state'))) THEN
+        v_problems := array_append(v_problems, ('readiness function is not owner-owned VOLATILE SECURITY DEFINER with the pinned search_path')::text);
+      END IF;
+      -- The exact reviewed body, pinned by the sha256 of the committed definition (never
+      -- inferred from the live catalog): a body replaced with an always-pass is refused.
+      IF (SELECT encode(sha256(convert_to(p.prosrc, 'UTF8')), 'hex') FROM pg_proc p
+           WHERE p.oid = to_regprocedure('sessions.portable_reader_readiness(text[],text)'))
+         IS DISTINCT FROM '6f198ba75dc55787c7af275752540c0ee494976110687575cb3020ce93ef6795' THEN
+        v_problems := array_append(v_problems, ('readiness function body differs from the reviewed definition')::text);
+      END IF;
+      IF (SELECT string_agg(CASE WHEN x.grantee = p.proowner THEN '<owner>' WHEN x.grantee = 0 THEN 'PUBLIC' ELSE x.grantee::regrole::text END
+                            || ':' || x.privilege_type || CASE WHEN x.is_grantable THEN '*' ELSE '' END, ',' ORDER BY 1)
+            FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+           WHERE p.oid = to_regprocedure('sessions.portable_reader_readiness(text[],text)'))
+         IS DISTINCT FROM '<owner>:EXECUTE,bulls96_read_api:EXECUTE' THEN
+        v_problems := array_append(v_problems, ('readiness function EXECUTE grants are not exactly the owner and bulls96_read_api')::text);
+      END IF;
+    END IF;
     -- No GRANT OPTION anywhere in the reader's column grants on the two relations.
     IF EXISTS (SELECT 1 FROM pg_attribute a, aclexplode(a.attacl) x
                 WHERE a.attrelid IN (to_regclass('sessions.session_directory'), to_regclass('sessions.search_projection_state'))
@@ -191,6 +222,9 @@ BEGIN
     END IF;
   END IF;
 
+  IF NOT v_portable AND to_regprocedure('sessions.portable_reader_readiness(text[],text)') IS NOT NULL THEN
+    v_problems := array_append(v_problems, ('readiness function exists without the 048000 reader contract')::text);
+  END IF;
   IF cardinality(v_problems) > 0 THEN
     RAISE EXCEPTION 'session read api role is not in the approved shape: %', array_to_string(v_problems, '; ');
   END IF;

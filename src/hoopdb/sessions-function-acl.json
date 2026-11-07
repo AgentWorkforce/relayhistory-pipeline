@@ -669,6 +669,10 @@
     "sessions.pipeline_jobs_observability()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.portable_reader_readiness(text[],text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.publish_session_analysis_cache(text,text,text,text,bigint,text,timestamp with time zone,text,text,text,text,text,text,integer,uuid)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"

@@ -25,6 +25,7 @@ BEGIN
   END IF;
 END
 $rollback_guard$;
+DROP FUNCTION sessions.portable_reader_readiness(text[], text);
 DROP POLICY session_directory_portable_read_api ON sessions.session_directory;
 DROP POLICY search_projection_state_read_api ON sessions.search_projection_state;
 REVOKE SELECT (org_id, workspace_id, harness, session_id, event_projection_epoch, event_projection_ready)

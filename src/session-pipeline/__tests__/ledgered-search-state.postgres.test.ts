@@ -287,7 +287,7 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     const reader = ledgeredSearchState({ backendId: "opensearch-v1", fromMs: 0, reader: gatedReaderRunner(readCommittedTenantRunner(flipping as never), a) });
     expect(await reader.partials({ orgId: "org-a", workspaceId: "ws-a" }, { limit: 10 })).toEqual({ sessions: [], overflow: false });
     flip = true;
-    await expect(reader.partials({ orgId: "org-a", workspaceId: "ws-a" }, { limit: 10 })).rejects.toThrow("reader_marker_pending");
+    await expect(reader.partials({ orgId: "org-a", workspaceId: "ws-a" }, { limit: 10 })).rejects.toThrow("reader_validation_pending");
     flip = false;
     await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pass'");
     // Control: the shared (ungated) runner inherits the database default REPEATABLE READ.
@@ -307,5 +307,74 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     await expect(admitPortableReader(readerPool as never, { ...a, writerRole: t.other })).rejects.toThrow(/reader_storage_unverified/);
     // Still valid afterwards.
     await admitPortableReader(readerPool as never, a);
+  }, 300_000);
+
+  test("readiness RPC natively: each status from real state, input validation, and the fixed-session guard; seeded complete/incomplete/missing/cross-tenant completeness through the gated reader", async () => {
+    const t = await database();
+    await t.migrate();
+    await t.owner.query(readFileSync(join(root, "supabase/bootstrap/session_read_api_role.sql"), "utf8").split("\n").filter(l => !l.startsWith("\\")).join("\n"));
+    const gen = await generation();
+    const names = (await expectedMigrationNames()).filter(n => !/^(shim|bootstrap|verify):/.test(n));
+    const readerPool = t.loginPool("bulls96_read_api");
+    const rpc = async (pool: pg.Pool, n: unknown, g: unknown) =>
+      (await pool.query<{ v: string }>("SELECT sessions.portable_reader_readiness($1::text[], $2::text) AS v", [n, g])).rows[0]!.v;
+    const errCode = async (p: Promise<unknown>) => ((await p.then(() => undefined, (e: { code?: string }) => e)) as { code?: string } | undefined)?.code;
+    // Status codes from real state.
+    expect(await rpc(readerPool, names, gen)).toBe("pass");
+    expect(await rpc(readerPool, names, "f".repeat(64))).toBe("generation_mismatch");
+    expect(await rpc(readerPool, [...names, "upstream:99999999999999_not_applied.sql"], gen)).toBe("schema_pending");
+    await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pending'");
+    expect(await rpc(readerPool, names, gen)).toBe("validation_pending");
+    await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pass'");
+    // Input validation (22023): NULL generation/array/member, empty array, bad member, oversize, bad hex.
+    for (const [n, g] of [[names, null], [null, gen], [[...names, null], gen], [[], gen], [["drop table x"], gen], [["upstream:" + "a".repeat(201)], gen], [Array.from({ length: 513 }, (_, i) => `upstream:f${i}.sql`), gen], [names, "XYZ"]] as [unknown, unknown][])
+      expect(await errCode(rpc(readerPool, n, g))).toBe("22023");
+    // Guard (42501): the owner/superuser, SET ROLE substitution, and the writer's own login.
+    expect(await errCode(t.owner.query("SELECT sessions.portable_reader_readiness($1::text[], $2::text)", [names, gen]))).toBe("42501");
+    await t.owner.query("BEGIN; SET LOCAL ROLE bulls96_read_api");
+    expect(await errCode(t.owner.query("SELECT sessions.portable_reader_readiness($1::text[], $2::text)", [names, gen]))).toBe("42501");
+    await t.owner.query("ROLLBACK");
+    expect(await errCode(rpc(t.loginPool(t.rt), names, gen))).toMatch(/^42501$/);
+    // The reader still may NOT read the ledger or marker directly.
+    expect(await errCode(readerPool.query("SELECT 1 FROM sessions.__96bulls_migrations"))).toBe("42501");
+    expect(await errCode(readerPool.query("SELECT 1 FROM sessions.__96bulls_role_validation"))).toBe("42501");
+
+    // Seeded completeness fixtures through the production schema (owner inserts pointers and
+    // directory rows; the writer records state as itself).
+    const seed = async (org: string, sid: string, epoch: number, ready: boolean) => {
+      await t.owner.query(`INSERT INTO sessions.session_index(org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at, storage_provider, bucket, manifest_key, trace_id)
+        VALUES ($1, 'ws-a', 'codex', $2, 'm1', 'u1', now(), now(), 's3', 'b', 'k/' || $1 || '/' || $2, gen_random_uuid())`, [org, sid]);
+      await t.owner.query(`INSERT INTO sessions.session_directory(org_id, workspace_id, harness, session_id, created_at, last_activity_at, event_projection_epoch, event_projection_ready)
+        VALUES ($1, 'ws-a', 'codex', $2, now(), now(), $3, $4)`, [org, sid, epoch, ready]);
+    };
+    const w = await t.runtime();
+    const writer = ledgeredSearchState({ backendId: "opensearch-v1", fromMs: 0 });
+    const record = async (org: string, sid: string, complete: boolean) => {
+      await w.query("BEGIN");
+      await writer.record(w as never, { orgId: org, workspaceId: "ws-a", harness: "codex", sessionId: sid }, { revision: 1, rows: 1, complete, at: new Date(0), canonicalSessionId: sid });
+      await w.query("COMMIT");
+    };
+    await seed("org-a", "s-complete", 3, true); await record("org-a", "s-complete", true);
+    await seed("org-a", "s-partial", 3, true); await record("org-a", "s-partial", false);
+    await seed("org-a", "s-stale", 3, true); await record("org-a", "s-stale", true);
+    await t.owner.query("UPDATE sessions.session_directory SET event_projection_epoch = 4 WHERE org_id = 'org-a' AND session_id = 's-stale'");
+    await seed("org-a", "s-unready", 3, false); await record("org-a", "s-unready", true);
+    await seed("org-a", "s-nostate", 3, true);
+    await seed("org-b", "s-complete", 3, true); await record("org-b", "s-complete", true);
+    await seed("org-b", "s-only-b", 3, true);
+    const a: ReaderAdmission = {
+      generation: gen, expectedNames: await expectedMigrationNames(), storageVerifySql: VERIFY,
+      readerVerifySql: readFileSync(join(root, "supabase/bootstrap/session_read_api_role_verify.sql"), "utf8").split("\n").filter(l => !l.startsWith("\\")).join("\n"),
+      writerRole: t.rt, dbMode: "local",
+    };
+    await admitPortableReader(readerPool as never, a);
+    const reader = ledgeredSearchState({ backendId: "opensearch-v1", fromMs: 0, reader: gatedReaderRunner(readCommittedTenantRunner(readerPool as never), a) });
+    expect(await reader.partials({ orgId: "org-a", workspaceId: "ws-a" }, { limit: 50 })).toEqual({ sessions: ["s-nostate", "s-partial", "s-stale", "s-unready"], overflow: false });
+    expect(await reader.partials({ orgId: "org-b", workspaceId: "ws-a" }, { limit: 50 })).toEqual({ sessions: ["s-only-b"], overflow: false });
+    expect((await reader.partials({ orgId: "org-a", workspaceId: "ws-a" }, { limit: 50, sessionId: "s-complete" })).sessions).toEqual([]);
+    // Readiness flips refuse the completeness read before any result.
+    await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pending'");
+    await expect(reader.partials({ orgId: "org-a", workspaceId: "ws-a" }, { limit: 50 })).rejects.toThrow("reader_validation_pending");
+    await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pass'");
   }, 300_000);
 });
