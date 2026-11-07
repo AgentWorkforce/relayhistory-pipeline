@@ -453,3 +453,19 @@ test("digest narratives: without migration 045000 the guarded purge is a no-op (
   await activateFrom(f, n);
   expect((await authorityControl(f, "reset", { request_id: "no-045" })).head).toMatchObject({ apply: true });
 });
+
+test("analysis purge (guarded, ordering): a reset calls purge_session_analysis_for_owned while the user's owned set is still present", async () => {
+  // STAND-IN until the analysis lane's head lands (046000/#292): records what the owned set holds at call time.
+  // It proves only the guarded call and its ordering; the real function's semantics get their own fixture test.
+  const f = await setup();
+  const n = await fakeNeon();
+  open.push(n.close);
+  await n.pg.query("INSERT INTO sessions.uploaded_support_identities VALUES($1,$2,'o1','r1',$3,'claude','NEON-ERA')", [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
+  await activateFrom(f, n);
+  await f.db.exec(`CREATE TABLE sessions.__c3_analysis_purge_calls(org_id text,user_id text,owned_seen bigint);
+    CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_user text) RETURNS bigint LANGUAGE sql AS $$
+      INSERT INTO sessions.__c3_analysis_purge_calls SELECT p_org,p_user,(SELECT count(*) FROM sessions.ingest_frozen_source_owned_sessions WHERE org_id=p_org AND user_id=p_user) RETURNING 0::bigint $$;`);
+  await authorityControl(f, "reset", { request_id: "analysis-1" });
+  expect((await f.db.query("SELECT org_id,user_id,owned_seen::int FROM sessions.__c3_analysis_purge_calls")).rows).toEqual([{ org_id: TENANT.orgId, user_id: TENANT.userId, owned_seen: 1 }]);
+  expect(((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_owned_sessions")).rows[0] as any).n).toBe(0);
+});

@@ -398,6 +398,11 @@ BEGIN
   WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)s;
  INSERT INTO sessions.ingest_frozen_source_deletions
   SELECT p_org,p_ws,p_user,o.origin_id,o.source,o.session_id FROM pg_temp.pa_owned o ON CONFLICT DO NOTHING;
+ -- SP v2 analysis of Neon-era sessions (046000) is keyed by the user's owned set, so it is purged BEFORE that set is
+ -- emptied below. Guarded like the digest purge: a no-op until the analysis lane's function exists.
+ IF to_regprocedure('sessions.purge_session_analysis_for_owned(text,text)') IS NOT NULL THEN
+  EXECUTE 'SELECT sessions.purge_session_analysis_for_owned($1,$2)' USING p_org,p_user;
+ END IF;
  DELETE FROM sessions.ingest_frozen_source_records WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL;
  DELETE FROM sessions.ingest_frozen_source_owned_sessions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user;
  DROP TABLE pg_temp.pa_owned;
