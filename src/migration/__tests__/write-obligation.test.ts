@@ -211,3 +211,15 @@ describe("boundedPut: an enforced wall deadline with contained late hooks", () =
     for (const bad of [0, -1, 1.5, 900_001]) await expect(boundedPut(async () => "x", hooks, bad)).rejects.toMatchObject({ code: "timeout_bounds" });
   });
 });
+
+describe("exact-key reconcile", () => {
+  test("a key whose directory holds 10,001 kept siblings still reconciles within budget, and only its own versions are erased", async () => {
+    const s = new FakeS3Versions();
+    for (let i = 0; i <= 10_000; i++) s.put(KEY.replace("b=0123456789abcdef0123456789abcdef", `b=${String(i).padStart(32, "0")}`));
+    const v = s.put(KEY);
+    const l = lane([{ id: "x", outcome: "acked", versionId: v }]);
+    expect(await reconcileObligation(s.eraser(), l.store)).toBe("retired");
+    expect(s.deletes).toEqual([`${KEY}@${v}`]);
+    expect(s.count(KEY.slice(0, KEY.lastIndexOf("/") + 1))).toBe(10_001);
+  }, 60_000);
+});

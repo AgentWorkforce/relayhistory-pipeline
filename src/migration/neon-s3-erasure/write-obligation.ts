@@ -39,7 +39,8 @@
  * loaded; a changed row refuses and the reconcile returns "refused" without retiring anything.
  *
  * Reconcile (`reconcileObligation`) always goes through the shared strict paged eraser
- * (eraser.ts eraseStep / verifyErased): every unowned version at the key is erased, by exact
+ * (eraser.ts eraseStep / verifyErased) in EXACT-KEY mode (only the key's own versions are listed,
+ * so a directory of any number of kept siblings stays within budget): every unowned version at the key is erased, by exact
  * version id, successor-safe (owned versions are never selected); the checkpoint scope binds
  * the lane identity, key, owned set and invocation set; the row version is re-checked before
  * every page's deletes; an owner with an unrecorded version id blocks every erase.
@@ -181,7 +182,7 @@ export async function reconcileObligation(
   const checkpoint = first.checkpoint && first.checkpoint.scope === scope ? first.checkpoint : null;
   let step;
   try {
-    step = await eraser.eraseStep(prefix, { scope, checkpoint, select: unowned, authorize, beforeDelete, ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.now ? { now: opts.now } : {}) });
+    step = await eraser.eraseStep(prefix, { scope, checkpoint, select: unowned, authorize, beforeDelete, exactKey: key, ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.now ? { now: opts.now } : {}) });
   } catch (error) {
     if (lost) return "refused";
     throw error;
@@ -192,7 +193,7 @@ export async function reconcileObligation(
   let proof;
   try {
     proof = await eraser.verifyErased(prefix, { select: (v) => { if (v.key === key && !v.deleteMarker) present.add(v.versionId); return unowned(v); },
-      authorize, ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.now ? { now: opts.now } : {}) });
+      authorize, exactKey: key, ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.now ? { now: opts.now } : {}) });
   } catch (error) {
     if (lost) return "refused";
     throw error;
