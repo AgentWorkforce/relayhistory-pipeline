@@ -43,6 +43,7 @@
  */
 import { Hono, type Context } from "hono";
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
+import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
 import { CursorError, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
@@ -80,7 +81,8 @@ export class AuthError extends Error {
 
 export interface ReadApiDeps {
   verify: Verifier;
-  ch: ClickHouseClient;
+  ch?: ClickHouseClient;
+  adapter?: SearchServiceBinding;
   liveness: Liveness;
   /** Epoch ms from which ClickHouse holds complete history; 0 = complete. */
   completeSinceMs: number;
@@ -224,6 +226,7 @@ function attestWorkspace(c: Context, identity: VerifiedIdentity): void {
 }
 
 export function createReadApi(deps: ReadApiDeps) {
+  if (Boolean(deps.ch) === Boolean(deps.adapter)) throw new Error("read API requires exactly one search service binding");
   const app = new Hono<{ Variables: { identity: VerifiedIdentity; correlationId: string } }>();
   const log = deps.log ?? (() => {});
 
@@ -287,7 +290,7 @@ export function createReadApi(deps: ReadApiDeps) {
     return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId }, 503);
   };
 
-  const pageDeps = () => ({ ch: deps.ch, liveness: deps.liveness, timeoutMs: deps.timeoutMs });
+  const pageDeps = () => ({ ch: deps.ch, adapter: deps.adapter, completeSinceMs: deps.completeSinceMs, liveness: deps.liveness, timeoutMs: deps.timeoutMs });
 
   /**
    * Session reads: erased → empty page; history older than the floor → 501;
@@ -301,7 +304,7 @@ export function createReadApi(deps: ReadApiDeps) {
       if (start.createdAtMs === null) throw unsupported("history_floor_unknown_session");
       if (start.createdAtMs < deps.completeSinceMs) throw unsupported("history_floor");
     }
-    if (!continuing && (await partialSessions(pageDeps(), identity.orgId, sessionId)).length > 0) throw unsupported("session_partial");
+    if (!continuing && (await partialSessions(pageDeps(), identity.orgId, sessionId, identity.workspaceId)).length > 0) throw unsupported("session_partial");
     return "ok";
   }
 
@@ -321,7 +324,7 @@ export function createReadApi(deps: ReadApiDeps) {
       if ((await sessionGate(identity, sessionId, source, cursor !== undefined)) === "empty")
         return c.json({ sessionId, events: [], nextCursor: null, correlationId: c.get("correlationId") });
       const page = await readEventPage(
-        { ch: deps.ch, liveness: deps.liveness, timeoutMs: deps.timeoutMs },
+        pageDeps(),
         { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, order, limit, maxContent, cursor },
       );
       return c.json({ sessionId, events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
@@ -355,7 +358,7 @@ export function createReadApi(deps: ReadApiDeps) {
         base.limit = clampLimit(single(c, "limit"), EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT);
         if ((await sessionGate(identity, sessionId, source, cursor !== undefined)) === "empty")
           return c.json({ events: [], nextCursor: null, correlationId: c.get("correlationId") });
-        const page = await readEventPage({ ch: deps.ch, liveness: deps.liveness, timeoutMs: deps.timeoutMs }, base);
+        const page = await readEventPage(pageDeps(), base);
         return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
       }
 
@@ -605,13 +608,15 @@ export function createReadApi(deps: ReadApiDeps) {
           Math.max(0, Math.floor(until.getTime() / day) - Math.floor(since.getTime() / day) + 1) > 366)
         throw bad("Invalid output date range");
       requireCanary(identity, "output");
-      if (!deps.output) throw unsupported("output_not_configured");
+      // The facts are ClickHouse tables: a portable search adapter cannot serve Output.
+      const ch = deps.ch;
+      if (!deps.output || !ch) throw unsupported("output_not_configured");
       const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
-      if (!(await outputCompleteSince(deps.ch, identity.orgId, identity.workspaceId, opts))) throw unsupported("output_backfill_incomplete");
+      if (!(await outputCompleteSince(ch, identity.orgId, identity.workspaceId, opts))) throw unsupported("output_backfill_incomplete");
       const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
       if (partials.overflow || partials.sessions.length > 0) throw unsupported("output_session_partial");
-      if ((await incompleteOutputSessions(deps.ch, identity.orgId, identity.workspaceId, opts)) > 0) throw unsupported("output_session_partial");
-      const output = await readSessionOutput(deps.ch, { orgId: identity.orgId, workspaceIds: [identity.workspaceId] }, { since, until }, opts);
+      if ((await incompleteOutputSessions(ch, identity.orgId, identity.workspaceId, opts)) > 0) throw unsupported("output_session_partial");
+      const output = await readSessionOutput(ch, { orgId: identity.orgId, workspaceIds: [identity.workspaceId] }, { since, until }, opts);
       log({ route: c.req.routePath, reason: "output_served", correlation_id: c.get("correlationId") });
       return c.json({ since: since.toISOString(), until: until.toISOString(), output, correlationId: c.get("correlationId") });
     } catch (error) {
