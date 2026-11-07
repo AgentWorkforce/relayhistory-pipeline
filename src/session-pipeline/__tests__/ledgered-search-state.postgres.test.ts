@@ -11,7 +11,10 @@ import pg from "pg";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import { runMigrations, type MigrationProfile } from "../../hoopdb/migrate.ts";
+import { expectedMigrationNames, generation, runMigrations, type MigrationProfile } from "../../hoopdb/migrate.ts";
+import { gatedSearchTransact, portableWorkGate } from "../lambda.ts";
+import { createLedgeredSearchComposition } from "../../shared/search-composition.ts";
+import { createSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
 import { runtimeRoleViolations } from "../../hoopdb/migrate-guards.ts";
 import { ledgeredSearchState } from "../postgres-search-state.ts";
 import { admitPortableConnection } from "../../shared/portable-connection-identity.ts";
@@ -67,7 +70,13 @@ async function database() {
     const r = spawnSync(PSQL, args, { encoding: "utf8", env: { PATH: process.env.PATH ?? "" } });
     return { status: r.status, stderr: r.stderr };
   };
-  return { name, rt, other, owner, profile, runtime, markPass,
+  /** A pg Pool authenticated as the runtime role, shaped as HoopDb for gatedSearchTransact. */
+  const runtimePool = () => {
+    const pool = new pg.Pool({ connectionString: at(rt), max: 2 });
+    cleanup.push(() => pool.end()); // runs before the database cleanup (reverse order)
+    return { pool, query: (q: string, p?: unknown[]) => pool.query(q, p), end: () => pool.end() };
+  };
+  return { name, rt, other, owner, profile, runtime, runtimePool, markPass,
     migrate: (over: Partial<MigrationProfile> = {}) => runMigrations(client as never, { profile: { ...profile, ...over } }) };
 }
 
@@ -164,5 +173,53 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     const ok = t.markPass({ generation: gen, db_mode: "local", runtime_role: t.rt });
     expect(ok.status).toBe(0);
     expect(await marker()).toEqual([{ status: "pass", generation: gen }]);
+  }, 300_000);
+
+  test("transition window on real PG: a marker flip committed by a SECOND connection during verification is refused by the gate's final read (RC pinned, database default REPEATABLE READ); a missing ledger row with old PASS refuses before work", async () => {
+    const t = await database();
+    await t.migrate();
+    // Make the pin causal: without it, every gated transaction would be REPEATABLE READ.
+    await t.owner.query(`ALTER DATABASE ${t.name} SET default_transaction_isolation = 'repeatable read'`);
+    const gen = await generation();
+    const names = await expectedMigrationNames();
+    const db = t.runtimePool();
+    const real = createLedgeredSearchComposition({ backendId: "opensearch-v1", fromMs: 0, registry: createSearchIndexRegistry() });
+    let flipDuringVerify = false;
+    const comp = { ...real, admit: async (sql: never, role: never, options: never) => {
+      await real.admit!(sql, role, options);
+      if (flipDuringVerify) await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pending'"); // committed on another connection
+    } };
+    const admission = { storageVerifySql: VERIFY, dbMode: "local", expectedNames: names };
+    let worked = 0;
+    const pass = () => gatedSearchTransact(db as never, (tx) => portableWorkGate(tx, gen, comp as never, admission), async () => { worked++; });
+    await pass(); // warm success
+    expect(worked).toBe(1);
+    flipDuringVerify = true;
+    const refused = await pass().catch((e: { code?: string }) => e);
+    expect((refused as { code?: string }).code).toBe("work_gate_marker_pending");
+    expect(worked).toBe(1);
+    flipDuringVerify = false;
+    // Control: the same sequence without the RC pin reads the stale snapshot (proves causality).
+    await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pass'");
+    const c = await db.pool.connect();
+    try {
+      await c.query("BEGIN");
+      expect((await c.query("SELECT current_setting('transaction_isolation') AS i")).rows[0].i).toBe("repeatable read");
+      expect((await c.query("SELECT status FROM sessions.__96bulls_role_validation")).rows[0].status).toBe("pass");
+      await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pending'");
+      expect((await c.query("SELECT status FROM sessions.__96bulls_role_validation")).rows[0].status).toBe("pass"); // stale without the pin
+      await c.query("ROLLBACK");
+    } finally { c.release(); }
+    // Missing expected ledger row, old PASS and same generation, valid storage: refused before work.
+    await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pass'");
+    const victim = names.find(n => n.startsWith("upstream:"))!;
+    const saved = (await t.owner.query<{ sha256: string }>("SELECT sha256 FROM sessions.__96bulls_migrations WHERE name = $1", [victim])).rows[0]!.sha256;
+    await t.owner.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [victim]);
+    const pending = await pass().catch((e: { code?: string }) => e);
+    expect((pending as { code?: string }).code).toBe("work_gate_schema_pending");
+    expect(worked).toBe(1);
+    await t.owner.query("INSERT INTO sessions.__96bulls_migrations(name, sha256) VALUES ($1, $2)", [victim, saved]);
+    await pass();
+    expect(worked).toBe(2);
   }, 300_000);
 });
