@@ -51,7 +51,11 @@ import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord }
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { searchIndexLimits } from "./search-index.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
-import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
+import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
+import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
+import type { PipelineRuntimeRegistry } from "@rhc/adapters/defaults.ts";
+import { dispatchRegisteredLambda, type PipelineLambdaEvent } from "./lambda-runtime.ts";
+import { writerTransactionSql } from "./transaction-sql.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
 import {checkedAnalysisCursor,reconcileAnalysisPage} from "./analysis-reconcile.ts";
@@ -78,9 +82,13 @@ interface PipelineSecret {
   analysis_source_readonly_url?: unknown;
   clickhouse?: { url: string; user: string; password: string; database: string };
   openai_api_key?: string;
+  search?: unknown;
 }
 
 export interface LambdaEnv {
+  searchBackend?: string;
+  adapterEnv?: Readonly<Record<string, string | undefined>>;
+  postgresTls?: ReturnType<typeof postgresTlsOptions>;
   region: string;
   bucket: string;
   keyPrefix: string;
@@ -101,7 +109,7 @@ export interface LambdaEnv {
   dbPoolMax: number;
 }
 
-export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
+export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition): LambdaEnv {
   const need = (name: string) => {
     const value = env[name];
     if (!value) throw new Error(`session pipeline: ${name} is not set`);
@@ -112,7 +120,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
   // This entry point is the lambda runtime with the ClickHouse stage. Unset
   // selection variables (today's stack) resolve to exactly that; anything else
   // is a misconfiguration (docs/search-and-runtime-adapters.md).
-  validateAdapterEnv(env, { runtime: ["lambda"], runtimeDefault: "lambda", search: ["clickhouse"], searchDefault: "clickhouse" });
+  const selected = validateAdapterEnv(env, { runtime: ["lambda"], runtimeDefault: "lambda", search: ["clickhouse", ...(composition?.registry.registered().filter(name => name !== "clickhouse") ?? [])], searchDefault: "clickhouse" });
   if (env.PIPELINE_ORG_FROM_PREFIX !== "true") throw new Error("session pipeline: PIPELINE_ORG_FROM_PREFIX must be true (org-prefix layout)");
   // Both read the legacy readonly source, which has no non-Neon replacement; no host check substitutes.
   const neonExit = neonExitProfile(env);
@@ -121,6 +129,9 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     "SESSION_SEMANTIC_COPY_ENABLED=1": env.SESSION_SEMANTIC_COPY_ENABLED === "1",
   });
   return {
+    searchBackend: selected.search,
+    adapterEnv: Object.freeze(Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith("SEARCH_INDEX_") || ["PIPELINE_RUNTIME", "AWS_REGION", "READ_API_COMPLETE_SINCE"].includes(key)))),
+    postgresTls: postgresTlsOptions(env),
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
     keyPrefix: need("PIPELINE_KEY_PREFIX").replace(/^\/+|\/+$/g, ""),
@@ -177,14 +188,12 @@ export function analysisSourceReadonlyUrl(value: unknown): string {
  * A pg pool that verifies Supabase's certificate against the pinned root. The
  * URL's own ssl parameters are dropped so they cannot weaken that.
  */
-export function supabasePool(url: string, max: number): HoopDb {
-  const parsed = new URL(url);
-  for (const k of ["sslmode", "sslrootcert", "sslcert", "sslkey", "ssl"]) parsed.searchParams.delete(k);
+export function supabasePool(url: string, max: number, tls = postgresTlsOptions()): HoopDb {
   const pool = new pg.Pool({
-    connectionString: parsed.toString(),
+    connectionString: postgresConnectionString(url),
     max,
     application_name: "96bulls-session-pipeline",
-    ssl: { ca: SUPABASE_PROD_CA_2021, rejectUnauthorized: true },
+    ssl: tls,
     idleTimeoutMillis: 60_000,
   });
   pool.on("error", (err) => log.error("hoopdb pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
@@ -241,10 +250,8 @@ export interface Runtime {
 
 type SemanticCopyStats = Awaited<ReturnType<typeof runSemanticCopyTick>>;
 
-let runtime: Promise<Runtime> | undefined;
-
-async function init(): Promise<Runtime> {
-  const env = lambdaEnv();
+async function init(composition?: SearchComposition): Promise<Runtime> {
+  const env = lambdaEnv(process.env, composition);
   const publicationSchema=await derivedSchemaAssets();
   const { SecretString } = await awsJsonCall<{ SecretString?: string }>({
     service: "secretsmanager",
@@ -254,16 +261,16 @@ async function init(): Promise<Runtime> {
     credentials: lambdaCredentials(),
   });
   if (!SecretString) throw new Error("session pipeline secret has no value yet");
-  return runtimeFromSecret(env, SecretString, publicationSchema.expected.generation);
+  return runtimeFromSecret(env, SecretString, publicationSchema.expected.generation, composition);
 }
 
 /**
  * The shared runtime for every invocation kind. Network-free: pools and clients
  * connect lazily. The analysis source field is carried raw and not validated here.
  */
-export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGeneration: string): Runtime {
+export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGeneration: string, composition?: SearchComposition): Runtime {
   const secret = parseSecret(secretText);
-  const db = supabasePool(secret.hoopdb_url, env.dbPoolMax);
+  const db = supabasePool(secret.hoopdb_url, env.dbPoolMax, env.postgresTls ?? postgresTlsOptions());
   const store = createS3Store({ bucket: env.bucket, region: env.region, credentials: async () => lambdaCredentials() });
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: env.bucket });
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: env.keyPrefix };
@@ -298,12 +305,18 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     },
   };
   if (env.searchEnabled) {
-    if (!secret.clickhouse) throw new Error("SEARCH_INDEX_ENABLED=1 but the secret has no clickhouse block");
+    const portable = env.searchBackend && env.searchBackend !== "clickhouse";
+    if (portable && !composition) throw new Error("search service composition is not registered");
+    if (!portable && !secret.clickhouse) throw new Error("SEARCH_INDEX_ENABLED=1 but the secret has no clickhouse block");
+    // Portable SQL joins the pass's metadata transaction. External indexes
+    // retain their own service-native commit/rollback semantics.
+    const writerSql = portable ? writerTransactionSql(db) : undefined;
+    const binding = portable ? composeSearchService(composition!, { env: { ...env.adapterEnv, SEARCH_INDEX_BACKEND: env.searchBackend }, sql: writerSql!.sql, secrets: searchSecret(secret.search) }, "writer") : undefined;
     deps.search = {
-      transact: (work) => transaction(db, work),
+      transact: (work) => transaction(db, tx => writerSql ? writerSql.run(tx, () => work(tx)) : work(tx)),
       reader,
       store,
-      ch: createClickHouseClient(secret.clickhouse),
+      ...(binding ? { adapter: binding } : { ch: createClickHouseClient(secret.clickhouse!) }),
       prefixFor: (orgId) => `${env.keyPrefix}/${orgId}`,
       // Raised to the replay producer's source bound only when that stage is on.
       limits: searchIndexLimits(env.replayPagesEnabled),
@@ -340,9 +353,13 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     },
     transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
     transact: (work) => transaction(db, work),
-    // The bucket is versioned: the sweeper erases every version of an orphan result key.
-    eraseObject: (key) =>
-      createS3Eraser({ bucket: env.bucket, region: env.region, credentials: lambdaCredentials() }).eraseObject(key),
+    // The bucket is versioned: the sweeper erases, by exact version id and in resumable strict
+    // pages, every version of a ticketed result key that no published job owns.
+    // Built per call so each step signs with the current Lambda credentials.
+    eraser: {
+      eraseStep: (prefix, opts) => createS3Eraser({ bucket: env.bucket, region: env.region, credentials: lambdaCredentials() }).eraseStep(prefix, opts),
+      verifyErased: (prefix, opts) => createS3Eraser({ bucket: env.bucket, region: env.region, credentials: lambdaCredentials() }).verifyErased(prefix, opts),
+    },
   });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
   // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
@@ -387,14 +404,6 @@ export function analysisDeps(rt: Runtime): AnalysisRefreshDeps {
   return rt.analysis;
 }
 
-function ready(): Promise<Runtime> {
-  runtime ??= init().catch((error) => {
-    // A failed init (secret not set yet, bad URL) is retried on the next invoke.
-    runtime = undefined;
-    throw error;
-  });
-  return runtime;
-}
 
 export interface ReconcileSummary {
   listed: number;
@@ -556,9 +565,9 @@ export function semanticTickState(stats:{failed:number;eventComplete:boolean;bri
   return quiet(stats.reasons.event)&&quiet(stats.reasons.brief)?"idle":"continuation";
 }
 
-type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; sessionAnalysis?: unknown; analysisCache?:unknown; analysisCacheReconcile?:unknown; analysisCursor?:unknown; semanticCopy?:unknown; cursor?: string; since?: string; link?: number };
 
-export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok: boolean }> {
+
+async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Promise<Runtime>): Promise<BatchResponse | { ok: boolean }> {
   if(event?.semanticCopy===true){
     // Default off before secret lookup, connection pools or source access.
     if(process.env.SESSION_SEMANTIC_COPY_ENABLED!=="1")return {ok:true};
@@ -654,3 +663,32 @@ export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok:
   log.warn("unknown invocation", { stage: "init", reason: "unknown_event" });
   return { ok: false };
 }
+
+
+/** Each composition owns its cold-start cache. Default export retains the
+ * legacy service path; an explicit reviewed entrypoint supplies registries. */
+export function createPipelineLambdaHandler(options: { search?: SearchComposition; runtime?: PipelineRuntimeRegistry; loadRuntime?: () => Promise<Runtime> } = {}) {
+  let pending: Promise<Runtime> | undefined;
+  const ready = options.loadRuntime ?? (() => {
+    pending ??= init(options.search).catch(error => { pending = undefined; throw error; });
+    return pending;
+  });
+  return async (event: PipelineLambdaEvent): Promise<BatchResponse | { ok: boolean }> => {
+    const invoke = (input: PipelineLambdaEvent) => dispatchLambdaEvent(input, ready);
+    if (!options.runtime) return invoke(event);
+    try {
+      if (process.env.PIPELINE_RUNTIME !== "lambda") throw new Error("registered Lambda runtime must be selected explicitly");
+      const adapter = options.runtime.create({ PIPELINE_RUNTIME: "lambda" }, { env: { PIPELINE_RUNTIME: "lambda" } }, ["lambda"]);
+      return await dispatchRegisteredLambda(adapter, event, invoke);
+    } catch (error) {
+      if (Array.isArray(event.Records)) {
+        log.error("Lambda runtime dispatch failed", { stage: "init", ...errorFields(error) });
+        return { batchItemFailures: event.Records.map(record => ({ itemIdentifier: record.messageId })) };
+      }
+      // A selected platform runtime throws failed schedules for platform retry.
+      throw new Error("Lambda runtime schedule failed");
+    }
+  };
+}
+
+export const handler = createPipelineLambdaHandler();

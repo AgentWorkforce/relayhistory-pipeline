@@ -23,8 +23,8 @@ DROP TRIGGER session_analysis_v2_forget_tombstoned_pointer ON sessions.session_i
 DROP FUNCTION sessions.analysis_read_v1(text, text);
 DROP FUNCTION sessions.analysis_request_v1(text, text, text, text);
 DROP FUNCTION sessions.analysis_request_json_v1(sessions.session_analysis_requests_v2);
-DROP FUNCTION sessions.purge_session_analysis_for_owned(text, text);
-DROP FUNCTION sessions.purge_session_analysis_for_owned(text, text, jsonb);
+DROP FUNCTION sessions.purge_session_analysis_for_owned(text, text, text);
+DROP FUNCTION sessions.purge_session_analysis_for_owned(text, text, text, jsonb);
 DROP FUNCTION sessions.session_analysis_v2_forget();
 DROP FUNCTION sessions.session_analysis_admit_scope(text, text);
 DROP FUNCTION sessions.session_analysis_source_revision(text, text, text);

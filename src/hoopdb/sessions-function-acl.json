@@ -692,10 +692,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
-    "sessions.purge_session_analysis_for_owned(text,text)": [
+    "sessions.purge_session_analysis_for_owned(text,text,text)": [
       "<owner>:EXECUTE"
     ],
-    "sessions.purge_session_analysis_for_owned(text,text,jsonb)": [
+    "sessions.purge_session_analysis_for_owned(text,text,text,jsonb)": [
       "<owner>:EXECUTE"
     ],
     "sessions.queue_session_brief_document(jsonb)": [
