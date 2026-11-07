@@ -1,14 +1,14 @@
 {
   "version": 1,
-  "at": "2026-11-07T19:25:44.818641+00:00",
+  "at": "2026-11-07T19:35:58.211562+00:00",
   "kind": "source_plan_and_readonly_fixture_evidence",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
-  "readiness": "HOLD: four roles missing; privileged bootstrap not authorized/run; runtime/live outage pins missing",
+  "readiness": "HOLD: privileged bootstrap, live runtime/outage pins, unconditional turns route disposition",
   "files": [
     {
       "name": "generation-window.md",
-      "bytes": 32188,
-      "sha256": "41244e9cf9db34494d9664b3cc33f621b354e89614e8096b5d7c23862213c83b"
+      "bytes": 33399,
+      "sha256": "38b24f948395edee31c8c12cc4547ba3f88598b80bc0fcb54538cf93ddd9ce33"
     },
     {
       "name": "readonly-plan.json",
@@ -27,8 +27,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 4918,
-      "sha256": "4ef15792135663edd8d89ffd524359f65d3cf05102d3fab8ffb49946310895d3"
+      "bytes": 5338,
+      "sha256": "c0cfee07182edd82a3f3bce889728e35ba9beb3fc51eff29f32c42fc858231b2"
     },
     {
       "name": "source-evidence.json",
@@ -37,8 +37,8 @@
     },
     {
       "name": "review-notes.md",
-      "bytes": 3330,
-      "sha256": "e74c761ab1e58aa5dea9297a37851ed91258d0db31ed3549dc2075987a8b5ef5"
+      "bytes": 4614,
+      "sha256": "c6b207de9f4ceed963ea79fb8339ffe57379cdda38b42f2156314b11196e58ec"
     },
     {
       "name": "supporting-readiness.md",
@@ -89,6 +89,46 @@
       "name": "rehearsal-summary.json",
       "bytes": 2245,
       "sha256": "213962668c8c63ecc1a4503f09cc460af35746bb054ce87eab4a5df667ea779c"
+    },
+    {
+      "name": "retained-aws-targets.json",
+      "bytes": 5358,
+      "sha256": "dc86de3b33e79ea37d589b5e3c11b30a9d2c0026249f97256629f2d57029b5cc"
+    },
+    {
+      "name": "retained-aws-targets.md",
+      "bytes": 5506,
+      "sha256": "66d02939dfcc55069ba552513d61d4ca49f76a15eda4fcffc0fb5cf75f586fc6"
+    },
+    {
+      "name": "gc-last-retained-code-update-receipt.json",
+      "bytes": 1865,
+      "sha256": "a6e39b73c324f4d49ec56d941ba0cdddea0a2118fe3e0f49beec1be027c66b33"
+    },
+    {
+      "name": "ec2-retained-migration-host-proof.json",
+      "bytes": 464,
+      "sha256": "c8da6a4700d0d6ac80ae7aa2001b546a9be57169c15c7d01711a80d26dac00f8"
+    },
+    {
+      "name": "worker-compatibility-review.md",
+      "bytes": 7916,
+      "sha256": "b8f0ccd357e6ae78e6864b3feedec3431e79d79d5a2988a070c1f84c3ca1225a"
+    },
+    {
+      "name": "worker-compatibility-receipt.json",
+      "bytes": 920,
+      "sha256": "617410a4f28f05da8d697269617e959d3747106427ba720782cfa948b851f759"
+    },
+    {
+      "name": "worker-delta-focused-tests.log",
+      "bytes": 12583,
+      "sha256": "c81636cfc85b474547cec3b234e81f2f49802ed19836c12afe6fc2087981ee25"
+    },
+    {
+      "name": "worker-shared-delta-tests.log",
+      "bytes": 6575,
+      "sha256": "766e7e2d649df9384274695a9bff84293ebd1e4c46763c2e69c678e58af1ce07"
     }
   ]
 }

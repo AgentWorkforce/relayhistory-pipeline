@@ -48,7 +48,11 @@
   "worker": {
     "candidateSource": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
     "currentDeployedSourceAndVersion": null,
-    "compatibilityDeltaReview": null,
+    "compatibilityDeltaReview": {
+      "status": "HOLD_NOT_ALL_NEW_PATHS_DEFAULT_OFF",
+      "receipt": "worker-compatibility-receipt.json",
+      "sha256": "617410a4f28f05da8d697269617e959d3747106427ba720782cfa948b851f759"
+    },
     "semanticInputsSha256": null,
     "nativePlanSha256": null,
     "provenanceSha256": null,
@@ -66,6 +70,11 @@
     "requiredExplicitInputs": {
       "AwsAccountId": "941433935742",
       "SupabaseProjectRef": "pyamkrhoyszgzirqqffq"
+    },
+    "retainedOnlyTargetHistory": {
+      "receipt": "retained-aws-targets.json",
+      "sha256": "dc86de3b33e79ea37d589b5e3c11b30a9d2c0026249f97256629f2d57029b5cc",
+      "freshProviderPreimageRequired": true
     }
   },
   "publisherAndPublicationGc": {
@@ -76,7 +85,8 @@
     "managedRoleProfile": null,
     "preservedEnablement": null,
     "artifactSha256": null,
-    "reviewedReplacementCommand": null
+    "reviewedReplacementCommand": null,
+    "retainedCandidateNotDeploymentProof": true
   },
   "otherGenerationBoundConsumers": {
     "indexerAndSessionPipelineInventory": null,
@@ -88,7 +98,6 @@
   "missingRuntimeAndHealthPins": [
     "preWindowTrafficGcHealthEvidence",
     "worker.currentDeployedSourceAndVersion",
-    "worker.compatibilityDeltaReview",
     "worker.semanticInputsSha256",
     "worker.nativePlanSha256",
     "worker.provenanceSha256",
