@@ -1,7 +1,7 @@
 /**
  * G6: short_summary on sessions.session_directory and its one search path,
  * sessions.search_session_directory. In-process PGlite only, with every
- * supabase/migrations file applied in name order after the Supabase role shim; no
+ * supabase/migrations file applied in name order by default after the Supabase role shim; no
  * hosted database is involved. Synthetic ids and text only.
  */
 import { afterEach, describe, expect, test } from "bun:test";
@@ -101,7 +101,7 @@ afterEach(async () => {
   await Promise.all(open.splice(0).map((db) => db.close()));
 });
 
-async function database(prelude = ""): Promise<PGlite> {
+async function database(prelude = "", throughMigration?: string): Promise<PGlite> {
   const db = new PGlite({ extensions: { auto_explain, btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
@@ -111,6 +111,7 @@ async function database(prelude = ""): Promise<PGlite> {
   await db.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
   if (prelude) await db.exec(prelude);
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
+    if (throughMigration && file > throughMigration) break;
     await db.exec(read(`supabase/migrations/${file}`));
   }
   await db.query(
@@ -635,10 +636,12 @@ describe("search RPC authorization", () => {
   });
 
   test("no role in pg_roles except the Worker and the owner can execute the search RPC", async () => {
-    // Default privileges and a pre-existing runtime role, present before the migration runs.
+    // Poison defaults before G6 and check its ACL repair at that migration boundary.
+    // Later 048000 deliberately refuses inherited grants on its readiness RPC;
+    // portable-reader-contract.test.ts covers that separate fail-closed contract.
     const db = await database(`CREATE ROLE relayhistory_app;
       ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO relayhistory_app;
-      ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;`);
+      ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;`, MIGRATION);
     const executors = await db.query<{ rolname: string }>(
       `SELECT r.rolname FROM pg_roles AS r, pg_proc AS p
         WHERE p.oid = 'sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)'::regprocedure
