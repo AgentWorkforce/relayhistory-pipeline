@@ -282,6 +282,39 @@ describe("POST /v1/cli/login", () => {
     expect(s.headers.get("x-relayhistory-workspace-id")).toBe("ws-any");
   });
 
+  test("scopes: only served scopes are advertised; no served scope is 403 after canary and expiry", async () => {
+    // (i) rth:sync is never advertised by this read-only backend.
+    const both = api({ selfhost: { login: relaycontrolLogin(config, stub(() => Response.json(active({ scopes: ["rth:read", "rth:sync"] }))).introspector) } });
+    const ok = await both.login({ agentRelayToken: TOKEN });
+    expect(ok.status).toBe(200);
+    expect((await json(ok)).scopes).toEqual(["rth:read"]);
+    expect(JSON.stringify(both.logs)).not.toContain("rth:");
+
+    // (ii) a grant with no served scope reaching the handler is refused (its own check, not only the exchange's).
+    const syncOnly = { ...identity, scopes: ["rth:sync"] };
+    const refused = api({ selfhost: { login: async () => ({ identity: syncOnly, expiresAtMs: NOW + 3600_000 }) } });
+    const r = await refused.login({ agentRelayToken: TOKEN });
+    const text = await r.text();
+    expect(r.status).toBe(403);
+    expect(JSON.parse(text).error).toEqual({ code: "forbidden", message: "missing required scope: rth:read" });
+    expect(r.headers.get("x-relayhistory-workspace-id")).toBeNull();
+    expect(text).not.toContain(TOKEN);
+    expect(refused.logs.some((l) => l.reason === "cli_login_refused" && l.code === "forbidden" && l.status === 403)).toBe(true);
+    expect(refused.logs.some((l) => l.reason === "cli_login")).toBe(false);
+    expect(JSON.stringify(refused.logs)).not.toContain(TOKEN);
+    expect(JSON.stringify(refused.logs)).not.toContain("rth:");
+
+    // Ordering: off the canary allowlist the answer stays 501, and an expired grant stays 401.
+    const offCanary = api({ workspaces: new Set(["ws-z"]), selfhost: { login: async () => ({ identity: syncOnly, expiresAtMs: NOW + 3600_000 }) } });
+    const r501 = await offCanary.login({ agentRelayToken: TOKEN });
+    expect(r501.status).toBe(501);
+    expect((await json(r501)).error.reason).toBe("login_workspace_not_enabled");
+    const expired = api({ selfhost: { login: async () => ({ identity: syncOnly, expiresAtMs: NOW }) } });
+    const r401 = await expired.login({ agentRelayToken: TOKEN });
+    expect(r401.status).toBe(401);
+    expect((await json(r401)).error.code).toBe("token_expired");
+  });
+
   test("GET on the login path is not a login", async () => {
     const r = await api().get("/v1/cli/login");
     expect(r.status).toBe(501);

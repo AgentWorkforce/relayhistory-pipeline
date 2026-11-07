@@ -84,6 +84,13 @@ import {
   type SelfhostDeps,
 } from "./selfhost.ts";
 
+/**
+ * The only scopes POST /v1/cli/login advertises (next to LOGIN_MAX_TTL_MS, selfhost.ts). This backend
+ * has no write routes, so a client holding `rth:sync` must not believe sync is available here;
+ * relaycontrol refuses mode=sync when the login reply lacks `rth:sync`.
+ */
+const SERVED_SCOPES = ["rth:read"] as const;
+
 export interface VerifiedIdentity {
   userId: string;
   orgId: string;
@@ -306,7 +313,11 @@ export function createReadApi(deps: ReadApiDeps) {
    * server keeps accepting the token until relaycontrol's own exp or revocation. There is no
    * refresh route: refreshToken repeats the access token with the same expiry, and a client
    * logs in again. A workspace off the reads' canary allowlist (READ_API_DIRECTORY_WORKSPACES)
-   * is refused with 501 `login_workspace_not_enabled`, after introspection. The label is validated and otherwise unused. Token values are never logged.
+   * is refused with 501 `login_workspace_not_enabled`, after introspection. The reply's `scopes`
+   * is the token's scopes filtered to SERVED_SCOPES; a token with none of them is 403 `forbidden`
+   * after the canary and expiry checks (relaycontrolLogin already refuses no `rth:read` with the
+   * same 403 during introspection; this is the handler's own fail-closed check). The label is
+   * validated and otherwise unused. Token values and scopes are never logged.
    */
   const selfhost = deps.selfhost;
   if (selfhost) {
@@ -343,6 +354,9 @@ export function createReadApi(deps: ReadApiDeps) {
         const at = now();
         const expiresAtMs = Math.min(grant.expiresAtMs, at + LOGIN_MAX_TTL_MS);
         if (!(expiresAtMs > at)) return loginError(c, 401, "token_expired", "token has expired");
+        // Read-only backend: advertise only the scopes served here (never rth:sync), after canary and expiry.
+        const scopes = grant.identity.scopes.filter((s) => (SERVED_SCOPES as readonly string[]).includes(s));
+        if (scopes.length === 0) return loginError(c, 403, "forbidden", "missing required scope: rth:read");
         const expiresAt = new Date(expiresAtMs).toISOString();
         log({ route: "/v1/cli/login", reason: "cli_login", status: 200, workspace_id: grant.identity.workspaceId, correlation_id: c.get("correlationId") });
         c.header("X-Relayhistory-Workspace-Id", grant.identity.workspaceId);
@@ -352,7 +366,7 @@ export function createReadApi(deps: ReadApiDeps) {
           refreshToken: token,
           refreshTokenExpiresAt: expiresAt,
           tokenType: "Bearer",
-          scopes: grant.identity.scopes,
+          scopes,
         });
       },
     );
