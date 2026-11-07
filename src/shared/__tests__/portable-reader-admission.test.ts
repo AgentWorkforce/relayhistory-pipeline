@@ -116,6 +116,8 @@ test("assembly admission runs on one READ ONLY, READ COMMITTED transaction and r
   const pool = { async connect() { return { query: (t: string, p?: unknown[]) => (f.tx as any).query(t, p), release() { released++; } }; } };
   expect(await code(admitPortableReader(pool as never, A))).toBe("reader_validation_pending");
   expect(f.st.texts[0]).toBe("BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED");
+  // Identity gate runs before the privilege checks (attributable substitution refusal).
+  expect(f.st.texts.findIndex(x => x.includes("current_setting('transaction_isolation')"))).toBeLessThan(f.st.texts.findIndex(x => x.includes("rolsuper")) === -1 ? Infinity : f.st.texts.findIndex(x => x.includes("rolsuper")));
   expect(f.st.texts).toContain("ROLLBACK");
   expect(released).toBe(1);
 });

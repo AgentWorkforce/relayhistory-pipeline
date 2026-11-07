@@ -344,8 +344,11 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     const seed = async (org: string, sid: string, epoch: number, ready: boolean) => {
       await t.owner.query(`INSERT INTO sessions.session_index(org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at, storage_provider, bucket, manifest_key, trace_id)
         VALUES ($1, 'ws-a', 'codex', $2, 'm1', 'u1', now(), now(), 's3', 'b', 'k/' || $1 || '/' || $2, gen_random_uuid())`, [org, sid]);
-      await t.owner.query(`INSERT INTO sessions.session_directory(org_id, workspace_id, harness, session_id, created_at, last_activity_at, event_projection_epoch, event_projection_ready)
-        VALUES ($1, 'ws-a', 'codex', $2, now(), now(), $3, $4)`, [org, sid, epoch, ready]);
+      // A ready projection must carry its version/time/sources (session_directory_events_ready).
+      await t.owner.query(`INSERT INTO sessions.session_directory(org_id, workspace_id, harness, session_id, created_at, last_activity_at,
+          event_projection_epoch, event_projection_ready, event_projection_version, event_projected_at, event_projection_sources)
+        VALUES ($1, 'ws-a', 'codex', $2, now(), now(), $3, $4, CASE WHEN $4 THEN 1 ELSE 0 END, CASE WHEN $4 THEN now() END,
+                CASE WHEN $4 THEN jsonb_build_object('k/' || $1 || '/' || $2, 1) ELSE '{}'::jsonb END)`, [org, sid, epoch, ready]);
     };
     const w = await t.runtime();
     const writer = ledgeredSearchState({ backendId: "opensearch-v1", fromMs: 0 });

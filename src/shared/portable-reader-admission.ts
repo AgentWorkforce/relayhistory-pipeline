@@ -95,8 +95,10 @@ export async function admitPortableReader(pool: { connect(): Promise<{ query(tex
   const tx: SqlExecutor = { async query<R>(text: string, params?: unknown[]) { return { rows: (await client.query(text, params)).rows as R[] }; } };
   try {
     await client.query("BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED");
-    await admitPortableConnection(tx, "reader");
+    // Fixed-identity gate first, so substitution is attributed to reader_identity; the
+    // privilege refusals (superuser/BYPASSRLS/owner/write-capable) follow in the same tx.
     await portableReaderGate(tx, a);
+    await admitPortableConnection(tx, "reader");
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
