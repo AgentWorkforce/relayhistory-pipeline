@@ -256,6 +256,32 @@ describe("POST /v1/cli/login", () => {
     expect(JSON.stringify(broken.logs)).not.toContain(TOKEN);
   });
 
+  test("the reads' workspace allowlist applies after introspection, fail closed", async () => {
+    const answer = () => Response.json(active());
+    const allowed = api({ selfhost: { login: relaycontrolLogin(config, stub(answer).introspector) } });
+    const ok = await allowed.login({ agentRelayToken: TOKEN });
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("x-relayhistory-workspace-id")).toBe("ws-a");
+
+    for (const workspaces of [new Set(["ws-z"]), new Set<string>(), undefined] as const) {
+      const { introspector, calls } = stub(answer);
+      const off = api({ workspaces, selfhost: { login: relaycontrolLogin(config, introspector) } });
+      const r = await off.login({ agentRelayToken: TOKEN });
+      const text = await r.text();
+      expect(r.status).toBe(501);
+      expect(JSON.parse(text).error).toEqual({ code: "unsupported_by_backend", message: expect.any(String), reason: "login_workspace_not_enabled" });
+      expect(r.headers.get("x-relayhistory-workspace-id")).toBeNull();
+      expect(text).not.toContain(TOKEN);
+      expect(JSON.stringify(off.logs)).not.toContain(TOKEN);
+      expect(calls).toHaveLength(1);
+    }
+
+    const star = api({ workspaces: "*", selfhost: { login: relaycontrolLogin(config, stub(() => Response.json(active({ workspace: "ws-any" }))).introspector) } });
+    const s = await star.login({ agentRelayToken: TOKEN });
+    expect(s.status).toBe(200);
+    expect(s.headers.get("x-relayhistory-workspace-id")).toBe("ws-any");
+  });
+
   test("GET on the login path is not a login", async () => {
     const r = await api().get("/v1/cli/login");
     expect(r.status).toBe(501);

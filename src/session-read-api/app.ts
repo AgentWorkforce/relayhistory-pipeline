@@ -305,7 +305,8 @@ export function createReadApi(deps: ReadApiDeps) {
    * same introspection. accessTokenExpiresAt = min(token exp, now + 15 min) is advisory: the
    * server keeps accepting the token until relaycontrol's own exp or revocation. There is no
    * refresh route: refreshToken repeats the access token with the same expiry, and a client
-   * logs in again. The label is validated and otherwise unused. Token values are never logged.
+   * logs in again. A workspace off the reads' canary allowlist (READ_API_DIRECTORY_WORKSPACES)
+   * is refused with 501 `login_workspace_not_enabled`, after introspection. The label is validated and otherwise unused. Token values are never logged.
    */
   const selfhost = deps.selfhost;
   if (selfhost) {
@@ -332,6 +333,12 @@ export function createReadApi(deps: ReadApiDeps) {
         } catch (error) {
           const e = error instanceof AuthError ? error : new AuthError(503, "relaycontrol_unavailable", "token introspection is unavailable");
           return loginError(c, e.status, e.code, e.message);
+        }
+        // Fail closed: the reads' canary allowlist applies before any success (no workspace header on refusal).
+        try {
+          requireCanary(grant.identity, "login");
+        } catch (error) {
+          return fail(c, error);
         }
         const at = now();
         const expiresAtMs = Math.min(grant.expiresAtMs, at + LOGIN_MAX_TTL_MS);
@@ -508,7 +515,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "catalog"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "catalog" | "login"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
