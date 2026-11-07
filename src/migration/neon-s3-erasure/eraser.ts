@@ -88,6 +88,13 @@ export interface EraseStepOptions {
   select?: (v: ListedVersion) => boolean;
   /** Re-checks current authority (lease, generation, fence); throws to stop before any delete. */
   authorize: () => Promise<void>;
+  /**
+   * Durable evidence hook: runs after authorize() and BEFORE a page's deletes with exactly the
+   * versions about to be deleted (write-obligation.ts records "an unowned write was found"
+   * here, so a lost DELETE acknowledgement can never erase that proof). Throwing stops the run
+   * before that page deletes anything.
+   */
+  beforeDelete?: (doomed: readonly ListedVersion[]) => Promise<void>;
   budget?: EraseBudget;
   now?: () => number;
 }
@@ -189,6 +196,7 @@ function pagedEraser(bucket: string, fetchPage: PageFetcher, removeExact: (list:
           if (now() >= budget.deadlineAt) return { status: "incomplete", checkpoint: checkpoint(), deleted, listed, reason: "deadline" };
           await opts.authorize();
           assertUnderPrefix(prefix, doomed);
+          if (opts.beforeDelete) await opts.beforeDelete(doomed);
           deleted += await removeExact(doomed);
           for (const v of doomed) gone.add(JSON.stringify([v.key, v.versionId]));
         }
