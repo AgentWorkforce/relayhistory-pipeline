@@ -55,7 +55,7 @@ export interface EvidenceDeps {
 }
 
 export class EvidenceRequestError extends Error {
-  constructor(readonly status: 400 | 413 | 501 | 503, readonly code: string, message: string, readonly reason?: string) {
+  constructor(readonly status: 400 | 403 | 413 | 501 | 503, readonly code: string, message: string, readonly reason?: string) {
     super(message);
   }
 }
@@ -143,8 +143,32 @@ function parseLines(body: Uint8Array): Line[] {
   return out;
 }
 
-/** Neon `listDelivery` for Babysitter kinds over the retention buckets. */
-export async function readBabysitterEvidence(deps: EvidenceDeps, scope: { orgId: string; workspaceId: string }, query: Record<string, string>): Promise<EvidencePage> {
+/**
+ * Neon's delivery account (relayhistory delivery.ts `deliveryAccount`): "relayhistory:" +
+ * sha256 of the canonical JSON of [orgId, workspaceId], which for two strings is exactly
+ * JSON.stringify. A client assertion only; tenancy still comes from the verified token.
+ */
+export function evidenceAccount(scope: { orgId: string; workspaceId: string }): string {
+  return "relayhistory:" + createHash("sha256").update(JSON.stringify([scope.orgId, scope.workspaceId ?? ""])).digest("hex");
+}
+
+/**
+ * Neon `requireDeliveryAccount`: the X-RelayHistory-Expected-Account header must equal the
+ * verified tenant's account. A missing header is the same refusal as a mismatched one:
+ * 403 `delivery_account_mismatch`, "Delivery account does not match authenticated tenant".
+ */
+export function requireEvidenceAccount(scope: { orgId: string; workspaceId: string }, expected: string | undefined): void {
+  if (expected !== evidenceAccount(scope))
+    throw new EvidenceRequestError(403, "delivery_account_mismatch", "Delivery account does not match authenticated tenant");
+}
+
+/**
+ * Neon `listDelivery` for Babysitter kinds over the retention buckets. The account
+ * assertion is checked FIRST, before any evidence database or S3 access (Neon checks it
+ * before listDelivery runs).
+ */
+export async function readBabysitterEvidence(deps: EvidenceDeps, scope: { orgId: string; workspaceId: string }, query: Record<string, string>, expectedAccount: string | undefined): Promise<EvidencePage> {
+  requireEvidenceAccount(scope, expectedAccount);
   for (const key of Object.keys(query)) if (!FILTERS.includes(key)) throw invalid("Unknown delivery filter");
   if (query.kind === undefined || !BABYSITTER_EVIDENCE_KINDS.has(query.kind))
     throw new EvidenceRequestError(501, "unsupported_by_backend", "not served by this backend: delivery_kind", "delivery_kind");
