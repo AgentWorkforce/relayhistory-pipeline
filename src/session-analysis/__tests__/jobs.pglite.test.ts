@@ -87,6 +87,8 @@ beforeEach(async () => {
   pg = await database();
   // The read role's post-migrate grants (schema USAGE, its column grants and RLS policy).
   await pg.exec(read("supabase/bootstrap/session_read_api_role.sql").split("\n").filter((l) => !l.startsWith("\\")).join("\n"));
+  // The admission principal's checked-in operator step (LOGIN, schema USAGE).
+  await pg.exec(read("supabase/bootstrap/session_analysis_admit_role.sql").split("\n").filter((l) => !l.startsWith("\\")).join("\n"));
   await pointer(pg);
 });
 
@@ -170,6 +172,38 @@ describe("analysis_request_v1", () => {
     const second = await request();
     expect(second.request.analysisId).not.toBe(first.request.analysisId);
     expect(second.request.status).toBe("queued");
+  });
+
+  test("P1-a: a canonical machine id or user id correction is a new revision: no stale reuse", async () => {
+    for (const fix of [
+      "UPDATE sessions.session_index SET canonical_machine_id = 'm-canonical'",
+      "UPDATE sessions.session_index SET user_id = 'u-corrected'",
+    ]) {
+      await pg.query("DELETE FROM sessions.session_analysis_requests_v2");
+      await pg.query("DELETE FROM sessions.session_analysis_jobs_v2");
+      const first = await request();
+      const store = jobStore();
+      expect((await publish(store, (await store.claim({ leaseSeconds: 600 }))!)).stage).toBe("completed");
+      await pg.query(fix);
+      await age("session_analysis_requests_v2", "3 minutes");
+      const second = await request();
+      expect(second.request.analysisId, fix).not.toBe(first.request.analysisId);
+    }
+  });
+
+  test("the revision signs every canonicalSourceGeneration field", async () => {
+    const rev = async () =>
+      (await pg.query<{ r: string }>("SELECT sessions.session_analysis_source_revision($1, $2, $3) AS r", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.r;
+    const seen = new Set([await rev()]);
+    for (const fix of [
+      "canonical_machine_id = 'm-c'", "user_id = 'u-2'", "bucket = 'bucket-2'", "storage_provider = 's3'",
+      "raw_format = 'ndjson'", "revision = revision + 1", "manifest_key = 'manifest/x'", "content_sha256 = decode(repeat('cd', 32), 'hex')",
+    ]) {
+      await pg.query(`UPDATE sessions.session_index SET ${fix}`);
+      const next = await rev();
+      expect(seen.has(next), fix).toBe(false);
+      seen.add(next);
+    }
   });
 
   test("P1-3: a backfilled in-flight job neither answers nor blocks a new request", async () => {
@@ -350,6 +384,31 @@ describe("P0-2 erase-safe publication", () => {
     expect((await publish(store, job)).stage).toBe("refused");
   });
 
+  test("P1-c: on a versioned bucket the sweeper erases every version and keeps the ticket until none remains", async () => {
+    await request();
+    const objects = results();
+    const store = jobStore(objects);
+    const out = await publish(store, (await store.claim({ leaseSeconds: 600 }))!, async () => {
+      await pg.query("UPDATE sessions.session_index SET deleted_at = now()");
+    });
+    expect(out.stage).toBe("lost");
+    // A versioned bucket: a plain delete leaves a noncurrent version.
+    const versions = new Map<string, number>([[out.key!, 2]]);
+    let stubborn = true;
+    const eraseObject = async (key: string) => {
+      const n = versions.get(key) ?? 0;
+      if (stubborn) return n; // the first sweep "deletes" nothing: versions remain
+      versions.set(key, 0);
+      return n;
+    };
+    await expect(sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject })).rejects.toThrow("analysis_sweep_versions_remain");
+    expect((await pg.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(1);
+    stubborn = false;
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject })).toBe(1);
+    expect(versions.get(out.key!)).toBe(0);
+    expect((await pg.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
+  });
+
   test("erasing a completed session tickets its result for deletion; a live result is never swept", async () => {
     await request();
     const objects = results();
@@ -386,5 +445,45 @@ describe("analysisTick is default-off", () => {
     expect((await pg.query<Json>("SELECT status, attempts FROM sessions.session_analysis_jobs_v2")).rows).toEqual([
       { status: "queued", attempts: 0 },
     ]);
+  });
+});
+
+describe("never-in-Neon proof (session_analysis_neon_free + live-only manifests)", () => {
+  const free = async () =>
+    (await pg.query<{ f: boolean }>("SELECT sessions.session_analysis_neon_free($1, $2, $3) AS f", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.f;
+  const seal = (ago: string) =>
+    pg.query(
+      `INSERT INTO sessions.ingest_frozen_source_completeness
+         (source_identity_sha256, control_epoch, privacy_baseline_sha256, org_count, record_rows, manifest_sha256, neon_snapshot, sealed_at)
+       VALUES (repeat('a',64), repeat('b',64), repeat('c',64), 1, 0, repeat('d',64), '{}'::jsonb, now() - $1::interval)`,
+      [ago],
+    );
+
+  test("born after the sealed freeze and absent from the frozen copy: complete without the marker", async () => {
+    expect(await free()).toBe(false); // no seal yet: doubt
+    await seal("1 hour");
+    expect(await free()).toBe(true);
+  });
+
+  test("a Neon-era session is never proven Neon-free", async () => {
+    await seal("1 hour");
+    // In the frozen Neon copy (any workspace): Neon delivery session.
+    await pg.query(
+      "INSERT INTO sessions.ingest_frozen_source_records (org_id, workspace_id, origin_id, record_id, source, session_id) VALUES ($1, 'other-ws', 'o', 'r', 'claude', $2)",
+      [KEY.orgId, KEY.sessionId],
+    );
+    expect(await free()).toBe(false);
+    await pg.query("DELETE FROM sessions.ingest_frozen_source_records");
+    // Born before the freeze (a pre-freeze copy or continuation).
+    await pg.query("UPDATE sessions.session_index SET created_at = now() - interval '2 hours'");
+    expect(await free()).toBe(false);
+  });
+
+  test("a Neon export/backfill manifest makes the scope Neon-derived", async () => {
+    const { neonDerivedManifest } = await import("../worker.ts");
+    const base = { extensions: {}, raw: { epochs: [{ epoch: 1, reason: "live" }] } } as never;
+    expect(neonDerivedManifest(base)).toBe(false);
+    expect(neonDerivedManifest({ extensions: {}, raw: { epochs: [{ epoch: 2, reason: "backfill" }] } } as never)).toBe(true);
+    expect(neonDerivedManifest({ extensions: { "client.relayhistory_export": {} }, raw: { epochs: [] } } as never)).toBe(true);
   });
 });

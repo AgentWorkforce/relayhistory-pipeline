@@ -92,3 +92,19 @@ Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--
 
 - **Cloud:** set the route's flag back to `off`. This needs no AWS change.
 - **Service:** if the service itself must stop, set reserved concurrency to 0 via a reviewed update, or remove `sessionReadApi` from the inputs. Removing it shows up as deletes, which the contract refuses, so it is a deliberate, separately approved change.
+
+## Session analysis (lane F1, migration 20261105046000)
+
+Default off. Every step below needs Khaliq's explicit OK, and none of it is run by this repository.
+
+1. **Admission principal.** `bulls96_analysis_admit` is created NOLOGIN before migrate by `supabase/bootstrap/session_read_api_roles.sql`, and the migration grants it EXECUTE on `sessions.analysis_request_v1` only. After migrate, as `postgres`:
+   ```sh
+   psql -v ON_ERROR_STOP=1 -X -d <HoopDb> -f supabase/bootstrap/session_analysis_admit_role.sql
+   psql -X -d <HoopDb> -c '\password bulls96_analysis_admit'   # password from 1Password, never on disk
+   psql -v ON_ERROR_STOP=1 -X -d <HoopDb> -f supabase/bootstrap/session_analysis_admit_role_verify.sql
+   ```
+   The verifier must pass. It fails with 55000 on any elevated attribute, membership, table, column or sequence privilege, or any SECURITY DEFINER EXECUTE other than `analysis_request_v1`.
+2. **Read API secret.** Add `"analysis_admit_url": "postgresql://bulls96_analysis_admit:…@…"` to the read API secret (Secrets Manager, loaded from 1Password). If it is absent, POST answers 501 `analysis_admission_not_configured`.
+3. **Read API stack.** Set `transcriptStore.sessionReadApi.analysisBucket` (the transcript bucket). This sets `READ_API_ANALYSIS_BUCKET` and grants the function role `s3:GetObject` on `96bulls/*/v1/*/normalized/session-analysis-v2/*` and `kms:Decrypt` for that object root only.
+4. **Worker.** Set `transcriptStore.sessionPipeline.analysisJobs.enabled: true`, with `openai_api_key` in the pipeline secret. This enables the one-minute `session-analysis-job-schedule`, sets `SESSION_ANALYSIS_ENABLED=true`, and adds the pipeline role's analysis-result bucket and key statements on the same root: Put, Delete, DeleteObjectVersion, ListBucketVersions, GenerateDataKey and Encrypt. That deploy is its own plan phase, `session analysis jobs rollout`.
+5. **Post-apply index** (operator job, outside a transaction): `supabase/pending/20261105046000_frozen_records_session_index.sql`.

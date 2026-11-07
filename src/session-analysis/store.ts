@@ -190,12 +190,30 @@ export function postgresAnalysisJobStore(deps: AnalysisJobStoreDeps): AnalysisJo
  */
 export async function sweepAnalysisTickets(
   store: ObjectStore,
-  options: { graceSeconds?: number; limit?: number; transact: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T> },
+  options: {
+    graceSeconds?: number;
+    limit?: number;
+    transact: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
+    /**
+     * Every-version erase of exactly one key (src/migration/neon-s3-erasure/eraser.ts
+     * eraseObject): the transcript bucket is versioned, so a plain DELETE would only add a
+     * delete marker and leave the bytes. Required in production; absent = a plain delete
+     * (unversioned stores and tests only).
+     */
+    eraseObject?: (key: string) => Promise<number>;
+  },
 ): Promise<number> {
   return options.transact(async (tx) => {
     const { rows } = await tx.query<{ result_key: string }>(SWEEP_SQL, [options.graceSeconds ?? TICKET_GRACE_SECONDS, options.limit ?? 50]);
     for (const { result_key } of rows) {
-      await store.delete(objectKey(result_key));
+      if (options.eraseObject) {
+        await options.eraseObject(result_key);
+        // Acknowledged only when a second inventory finds no version or marker left: until
+        // then the ticket stays, and the next sweep retries.
+        if ((await options.eraseObject(result_key)) !== 0) throw new Error("analysis_sweep_versions_remain");
+      } else {
+        await store.delete(objectKey(result_key));
+      }
       await tx.query("DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1", [result_key]);
     }
     return rows.length;

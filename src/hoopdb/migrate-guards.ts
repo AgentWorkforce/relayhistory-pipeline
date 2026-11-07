@@ -121,6 +121,10 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_briefs": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_brief_wakeups": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_brief_attempts": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  // Lane F1 (20261105046000): the session-analysis worker's claim/reserve/complete/fail and sweep.
+  "sessions.session_analysis_jobs_v2": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_analysis_requests_v2": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_analysis_result_tickets": ["SELECT", "INSERT", "UPDATE", "DELETE"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const RUNTIME_APPLICATION_SEQUENCES = [
@@ -160,6 +164,9 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_briefs",
   "sessions.session_brief_wakeups",
   "sessions.session_brief_attempts",
+  "sessions.session_analysis_jobs_v2",
+  "sessions.session_analysis_requests_v2",
+  "sessions.session_analysis_result_tickets",
 ] as const;
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [
@@ -202,6 +209,7 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.retry_session_brief_documents(uuid,text)",
   "sessions.retry_session_large_read(text,text,text,text,uuid,text)",
   "sessions.route_session_large_read(text,text,text,text)",
+  "sessions.session_analysis_neon_free(text,text,text)",
   "sessions.session_analysis_source_revision(text,text,text)",
   "sessions.session_directory_project_text(text,text,text)",
   "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)",
@@ -1095,7 +1103,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "b7b21378518070a97a6ec5af4dab219d1aa34788e55aece2b6ccc1dc97f8e384";
+  "29e038bc7e800fe278039bedfd3b671a31639d3d5df63686b64e0d22d1bcc671";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

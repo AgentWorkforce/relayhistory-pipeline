@@ -762,6 +762,10 @@
     "sessions.session_analysis_cache_demand(text,text,text,text,boolean)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_analysis_neon_free(text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.session_analysis_source_revision(text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
