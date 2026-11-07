@@ -9,7 +9,11 @@
  *                required for --execute and --verify only
  *
  *   bun scripts/neon-census-load.ts                 dry run (default): Neon census counts + digest; writes nothing
+ *   bun scripts/neon-census-load.ts --pin           pin THIS Neon as the authoritative production source: stdin must
+ *                                                   also carry "expectedSourceIdentity" (the out-of-band verified
+ *                                                   production identity the dry run prints); any field differing refuses
  *   bun scripts/neon-census-load.ts --execute       load the census in batches (resumable, idempotent) and seal it
+ *                                                   (the seal refuses any snapshot not from the pinned source)
  *   bun scripts/neon-census-load.ts --verify        recompute from Neon; compare with the seal and the sealed rows
  *                                                   (exit 2 on any mismatch, 3 when nothing is sealed)
  * Options: --batch N (default 5000, max 10000), --fetch N (cursor page, default 5000),
@@ -34,7 +38,7 @@ const val = (k: string, d: number) => {
   }
   return n;
 };
-const known = new Set(["--execute", "--verify", "--batch", "--fetch", "--statement-timeout-ms"]);
+const known = new Set(["--execute", "--verify", "--pin", "--batch", "--fetch", "--statement-timeout-ms"]);
 for (let i = 0; i < args.length; i += 1) {
   if (!known.has(args[i]!)) {
     // Never echo the argument: it may be a credential pasted on argv.
@@ -43,14 +47,14 @@ for (let i = 0; i < args.length; i += 1) {
   }
   if (["--batch", "--fetch", "--statement-timeout-ms"].includes(args[i]!)) i += 1;
 }
-if (flag("--execute") && flag("--verify")) {
-  console.error("one of --execute | --verify (or neither for a dry run)");
+if ([flag("--execute"), flag("--verify"), flag("--pin")].filter(Boolean).length > 1) {
+  console.error("one of --execute | --verify | --pin (or none for a dry run)");
   process.exit(64);
 }
-const mode = flag("--execute") ? "execute" : flag("--verify") ? "verify" : "dry-run";
+const mode = flag("--execute") ? "execute" : flag("--verify") ? "verify" : flag("--pin") ? "pin" : "dry-run";
 const log = (m: string, f: Record<string, unknown> = {}) => console.log(JSON.stringify({ at: new Date().toISOString(), mode, m, ...f }));
 
-let input: { neonUrl?: string; supabaseUrl?: string } = {};
+let input: { neonUrl?: string; supabaseUrl?: string; expectedSourceIdentity?: Record<string, unknown> } = {};
 try {
   input = JSON.parse(readFileSync(0, "utf8").split("\n")[0] || "{}");
 } catch {
@@ -59,13 +63,18 @@ try {
 }
 const neonUrl = input.neonUrl ?? "";
 const supabaseUrl = input.supabaseUrl ?? "";
+const expectedSourceIdentity = input.expectedSourceIdentity;
 input = {};
 if (!/^postgres(ql)?:\/\//.test(neonUrl)) {
   console.error("neonUrl required on stdin");
   process.exit(64);
 }
 if (mode !== "dry-run" && !/^postgres(ql)?:\/\//.test(supabaseUrl)) {
-  console.error("supabaseUrl (owner) required on stdin for --execute/--verify");
+  console.error("supabaseUrl (owner) required on stdin for --execute/--verify/--pin");
+  process.exit(64);
+}
+if (mode === "pin" && (typeof expectedSourceIdentity !== "object" || expectedSourceIdentity === null)) {
+  console.error("--pin needs expectedSourceIdentity (the verified production identity) on stdin");
   process.exit(64);
 }
 
@@ -77,15 +86,23 @@ async function main(): Promise<number> {
   await neon.connect();
   let census;
   try {
-    census = await readNeonCensus(neon, { fetch: val("--fetch", 5000), statementTimeoutMs: val("--statement-timeout-ms", 900_000) });
+    census = await readNeonCensus(neon, {
+      fetch: val("--fetch", 5000), statementTimeoutMs: val("--statement-timeout-ms", 900_000), endpoint: new URL(neonUrl).hostname,
+    });
   } finally {
     await neon.end().catch(() => {});
   }
-  log("neon census", { rows: census.count, sha256: census.sha256, snapshot: census.snapshot.snapshot, read_at: census.snapshot.read_at, lsn: census.snapshot.lsn });
+  log("neon census", { rows: census.count, sha256: census.sha256, snapshot: census.snapshot.snapshot, read_at: census.snapshot.read_at, lsn: census.snapshot.lsn,
+    source_identity: census.snapshot.source_identity });
   if (mode === "dry-run") return 0;
   const supa = client(supabaseUrl, "neon-census-load");
   await supa.connect();
   try {
+    if (mode === "pin") {
+      const out = await pinSource(supa, census, expectedSourceIdentity!);
+      log(out.pinned ? "census source pinned" : "census source REFUSED: the live Neon is not the expected production source", out);
+      return out.pinned ? 0 : 2;
+    }
     if (mode === "execute") {
       const out = await loadAndSeal(supa, census, { batch: val("--batch", 5000), log });
       log("census sealed", out);

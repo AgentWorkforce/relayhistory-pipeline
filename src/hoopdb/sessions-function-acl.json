@@ -961,6 +961,9 @@
     "sessions.session_neon_census_load(text,jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_neon_census_pin_source(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_neon_census_seal(text,bigint,text,jsonb)": [
       "<owner>:EXECUTE"
     ],

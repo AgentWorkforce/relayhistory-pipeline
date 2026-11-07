@@ -226,6 +226,45 @@ ALTER TABLE sessions.session_neon_census ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.session_neon_census_seal ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.session_neon_census, sessions.session_neon_census_seal FROM PUBLIC, anon, authenticated, service_role;
 
+-- The PINNED authoritative Neon source (final review P2): the census may be sealed only from
+-- this exact source identity (server-reported database, system identifier, Neon tenant /
+-- timeline and the endpoint host), pinned by the owner from an out-of-band verified record of
+-- the PRODUCTION Neon (scripts/neon-census-load.ts --pin compares the live identity with the
+-- operator's expected identity first), and bound to the frozen copy's source identity at pin
+-- time. A staging or wrong-branch Neon therefore cannot seal a census. Owner-only.
+CREATE TABLE sessions.session_neon_census_source (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  source_identity jsonb NOT NULL CHECK (jsonb_typeof(source_identity) = 'object'),
+  frozen_source_identity_sha256 text NOT NULL CHECK (frozen_source_identity_sha256 ~ '^[0-9a-f]{64}$'),
+  pinned_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+ALTER TABLE sessions.session_neon_census_source ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_neon_census_source FROM PUBLIC, anon, authenticated, service_role;
+
+CREATE FUNCTION sessions.session_neon_census_pin_source(p_identity jsonb)
+RETURNS void LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $census_pin$
+DECLARE
+  v_frozen text := (SELECT source_identity_sha256 FROM sessions.ingest_frozen_source_completeness WHERE singleton);
+BEGIN
+  PERFORM sessions.session_analysis_require_caller(ARRAY[]::text[]);
+  IF EXISTS (SELECT 1 FROM sessions.session_neon_census_seal WHERE singleton) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'neon census: the source is pinned before any seal';
+  END IF;
+  IF v_frozen IS NULL THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'neon census: the frozen Neon copy is not sealed';
+  END IF;
+  IF jsonb_typeof(p_identity) IS DISTINCT FROM 'object' OR coalesce(p_identity ->> 'database', '') = ''
+     OR coalesce(p_identity ->> 'endpoint', '') = '' OR coalesce(p_identity ->> 'system_identifier', '') = '' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'neon census: a source identity needs database, endpoint and system_identifier';
+  END IF;
+  INSERT INTO sessions.session_neon_census_source (singleton, source_identity, frozen_source_identity_sha256)
+  VALUES (true, p_identity, v_frozen)
+  ON CONFLICT (singleton) DO UPDATE SET source_identity = excluded.source_identity,
+    frozen_source_identity_sha256 = excluded.frozen_source_identity_sha256, pinned_at = clock_timestamp();
+END
+$census_pin$;
+
 -- A sealed generation is immutable: no row of it is inserted, changed or deleted, and the
 -- table is never truncated while a seal exists. Rows of an unsealed generation can be loaded
 -- (resumably) and a superseded generation's rows are dropped by the next seal.
@@ -340,6 +379,13 @@ BEGIN
   END IF;
   IF NOT (p_snapshot ? 'snapshot' AND p_snapshot ? 'read_at' AND p_snapshot ? 'source_identity') THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'neon census: the seal needs the Neon snapshot and source identity';
+  END IF;
+  -- Only the pinned production source, still bound to the same frozen copy, can seal.
+  IF NOT EXISTS (
+    SELECT 1 FROM sessions.session_neon_census_source AS s, sessions.ingest_frozen_source_completeness AS f
+     WHERE s.singleton AND f.singleton AND s.source_identity = p_snapshot -> 'source_identity'
+       AND s.frozen_source_identity_sha256 = f.source_identity_sha256) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'neon census: the snapshot is not from the pinned production Neon source';
   END IF;
   v_digest := sessions.session_neon_census_digest(p_generation);
   v_have := (v_digest ->> 'rows')::bigint;
@@ -883,6 +929,7 @@ REVOKE ALL ON FUNCTION sessions.session_analysis_require_caller(text[]) FROM PUB
 REVOKE ALL ON FUNCTION sessions.session_neon_census_immutable() FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_neon_census_load(text, jsonb) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_neon_census_digest(text) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_neon_census_pin_source(jsonb) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_neon_census_seal(text, bigint, text, jsonb) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text, text, jsonb) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
@@ -914,6 +961,7 @@ BEGIN
     'sessions.session_neon_census_immutable()'::regprocedure,
     'sessions.session_neon_census_load(text, jsonb)'::regprocedure,
     'sessions.session_neon_census_digest(text)'::regprocedure,
+    'sessions.session_neon_census_pin_source(jsonb)'::regprocedure,
     'sessions.session_neon_census_seal(text, bigint, text, jsonb)'::regprocedure,
     'sessions.purge_session_analysis_for_owned(text, text, text, jsonb)'::regprocedure,
     'sessions.purge_session_analysis_for_owned(text, text, text)'::regprocedure,

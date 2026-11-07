@@ -70,7 +70,10 @@ export interface NeonCensus {
  * connection (the cursor lives in its transaction). Rows are kept in memory (one census is
  * ids only) so the same set is both digested and loaded.
  */
-export async function readNeonCensus(connection: Queryable, opts: { fetch?: number; statementTimeoutMs?: number } = {}): Promise<NeonCensus> {
+export async function readNeonCensus(
+  connection: Queryable,
+  opts: { fetch?: number; statementTimeoutMs?: number; /** The connection's endpoint host (from the operator's URL). */ endpoint?: string } = {},
+): Promise<NeonCensus> {
   const fetch = opts.fetch ?? 5000;
   await connection.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   try {
@@ -84,6 +87,8 @@ export async function readNeonCensus(connection: Queryable, opts: { fetch?: numb
     )).rows[0]!;
     const lsn = await optional(connection, "SELECT pg_current_wal_lsn()::text AS v");
     const system = await optional(connection, "SELECT system_identifier::text AS v FROM pg_control_system()");
+    const tenant = await optional(connection, "SELECT nullif(current_setting('neon.tenant_id', true), '') AS v");
+    const timeline = await optional(connection, "SELECT nullif(current_setting('neon.timeline_id', true), '') AS v");
     await connection.query(`DECLARE neon_census NO SCROLL CURSOR FOR ${CENSUS_SQL}`);
     const digest = new CensusDigest();
     const out: CensusRow[] = [];
@@ -106,7 +111,7 @@ export async function readNeonCensus(connection: Queryable, opts: { fetch?: numb
         snapshot: ident.snapshot,
         read_at: ident.read_at,
         lsn,
-        source_identity: { database: ident.database, system_identifier: system },
+        source_identity: { database: ident.database, endpoint: opts.endpoint ?? null, system_identifier: system, neon_tenant_id: tenant, neon_timeline_id: timeline },
         tables: CENSUS_SOURCES.map((s) => `sessions.${s.table}`),
       },
     };
@@ -142,6 +147,19 @@ export async function currentSeal(supabase: Queryable): Promise<SealState | null
     "SELECT generation, census_rows, census_sha256 FROM sessions.session_neon_census_seal WHERE singleton",
   );
   return rows[0] ?? null;
+}
+
+/**
+ * --pin: pin the authoritative production source. The live identity must EQUAL the operator's
+ * out-of-band verified `expected` identity (field by field) before it is pinned.
+ */
+export async function pinSource(supabase: Queryable, census: Pick<NeonCensus, "snapshot">, expected: Record<string, unknown>) {
+  const live = census.snapshot.source_identity;
+  const keys = [...new Set([...Object.keys(live), ...Object.keys(expected)])].sort();
+  const differs = keys.filter((k) => JSON.stringify(live[k] ?? null) !== JSON.stringify(expected[k] ?? null));
+  if (differs.length) return { pinned: false as const, differs };
+  await supabase.query("SELECT sessions.session_neon_census_pin_source($1::jsonb)", [JSON.stringify(live)]);
+  return { pinned: true as const, differs };
 }
 
 /** --execute: load (resumable) and seal. Returns what happened; never prints rows. */

@@ -49,6 +49,7 @@ export const analysisJobs: LaneManifest = {
     "sessions.session_neon_census_immutable()": { secdef: true, grants: [] },
     "sessions.session_neon_census_load(text,jsonb)": { secdef: true, grants: [] },
     "sessions.session_neon_census_digest(text)": { secdef: true, grants: [] },
+    "sessions.session_neon_census_pin_source(jsonb)": { secdef: true, grants: [] },
     "sessions.session_neon_census_seal(text,bigint,text,jsonb)": { secdef: true, grants: [] },
   },
   replaces: {},
