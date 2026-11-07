@@ -7,8 +7,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "technical-foul:manifest": "bun scripts/technical-foul-manifest.ts",
-    "technical-foul:check": "bun scripts/technical-foul-manifest.ts --check"
+    "technical-foul:manifest": "bun run scripts/technical-foul-manifest.ts",
+    "technical-foul:check": "bun run scripts/technical-foul-manifest.ts --check"
   },
   "dependencies": {
     "@relayhistory/object-store": "workspace:*"

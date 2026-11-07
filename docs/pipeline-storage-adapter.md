@@ -84,7 +84,8 @@ an object (identical bytes or not), it is kept and described from its own
 metadata; an object with no scrub metadata is refused rather than vouched for.
 `SCRUB_RULESET_VERSION` must be bumped with any change to `lib/scrub.ts`:
 `test/scrub-ruleset-version.test.ts` pins each version to the file's digest
-and fails until the bump is made.
+and fails until the bump is made. Regenerate `packages/pipeline/technical-foul.json` in the same PR
+(`bun run technical-foul:manifest` in `packages/pipeline`; see `docs/technical-foul-manifest.md`).
 
 A manifest with no `raw.scrub` is still indexed, with `scrubbed: false`, so its
 pointer row is quarantined and the transform never reads its chunks.

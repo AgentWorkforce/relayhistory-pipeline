@@ -32,6 +32,17 @@ export function segmenterSource(): string {
   return m[0];
 }
 
+/** The redaction token, read from the `const REDACTED = "...";` declaration in scrub.ts. */
+export function redactionToken(): string {
+  const matches = [...readLf(RULESET_PATH).matchAll(/^const REDACTED = "([^"\\\n]*)";$/gm)];
+  if (matches.length !== 1) {
+    throw new Error(
+      `scrub.ts must declare exactly one \`const REDACTED = "...";\` line; found ${matches.length}`,
+    );
+  }
+  return matches[0][1];
+}
+
 export interface TechnicalFoulManifest {
   schema: 1;
   rulesetVersion: number;
@@ -56,7 +67,7 @@ export function computeManifest(): TechnicalFoulManifest {
     segmenterSha256: sha256(segmenter),
     corpusSha256: sha256(readLf(CORPUS_PATH)),
     corpusPath: CORPUS_PATH,
-    redactionToken: "[REDACTED]",
+    redactionToken: redactionToken(),
     maxScrubChars: MAX_SCRUB_CHARS,
   };
 }

@@ -5,6 +5,7 @@ import { SCRUB_RULESET_VERSION } from "../src/lib/pipeline/raw-chunks.js";
 import {
   computeManifest,
   MANIFEST_PATH,
+  redactionToken,
   serializeManifest,
 } from "../src/lib/technical-foul-manifest.js";
 
@@ -32,5 +33,10 @@ describe("technical-foul.json", () => {
     );
     expect(rulesetPin, "SCRUB_RULESETS pin not found").not.toBeNull();
     expect(manifest.rulesetSourceSha256).toBe(rulesetPin![1]);
+  });
+
+  it("derives the redaction token from scrub.ts", () => {
+    expect(redactionToken()).toBe("[REDACTED]");
+    expect(JSON.parse(checkedIn).redactionToken).toBe("[REDACTED]");
   });
 });

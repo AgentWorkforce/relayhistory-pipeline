@@ -23,6 +23,8 @@ two tests, and regenerate the manifest:
 `test/technical-foul-manifest.test.ts` fails in CI (vitest) when the checked-in
 manifest differs from the one computed from source.
 
+The corpus must also stay byte-identical in relayhistory-cloud (the corpus test header says so).
+
 ## desktop-core
 
 desktop-core vendors the corpus and this manifest, recomputes the same digests
