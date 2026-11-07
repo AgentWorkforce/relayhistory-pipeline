@@ -57,6 +57,7 @@ const TOKEN_VERIFY = readFileSync(
 
 const SEEDER_VERIFY = readFileSync(join(root,"supabase/bootstrap/session_ingest_seeder_verify.sql"),"utf8");
 const INGEST_VERIFY = readFileSync(join(root,"supabase/bootstrap/session_ingest_verify.sql"),"utf8");
+const PORTABLE_VERIFY = readFileSync(join(root,"supabase/bootstrap/portable_search_storage_verify.sql"),"utf8");
 
 const open: PGlite[] = [];
 afterEach(async () => {
@@ -543,9 +544,12 @@ describe("the live gate: the marker is never the sole authority", () => {
               ? SEEDER_VERIFY
               : l === "\\ir session_ingest_verify.sql"
                 ? INGEST_VERIFY
+                : l === "\\ir portable_search_storage_verify.sql"
+                  ? PORTABLE_VERIFY
                 : l
                 .replace(":'generation'", `'${gen.replace(/'/g, "''")}'`)
-                .replace(":'db_mode'", "'local'"),
+                .replace(":'db_mode'", "'local'")
+                .replace(":'runtime_role'", "'postgres'"), // LOCAL: the owner-run runtime
       )
       .join("\n");
   const runMarkPass = async (db: PGlite, gen: string) => {
