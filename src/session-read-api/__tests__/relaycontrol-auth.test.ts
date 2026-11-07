@@ -68,9 +68,11 @@ describe("readApiVerifier with relaycontrol", () => {
       workspace: [() => Response.json(active({ workspace: "ws-b" })), "401 unauthorized"],
       agentPrincipal: [() => Response.json(active({ principal_type: "agent" })), "401 unauthorized"],
       noPrincipal: [() => Response.json(active({ principal_type: undefined })), "401 unauthorized"],
-      rc400: [() => new Response("", { status: 400 }), "401 unauthorized"],
-      // Our introspection secret is wrong: an outage, never a token refusal.
+      // A caller cannot cause a 400 (contract drift or a History bug), and a 401
+      // means our introspection secret is wrong: outages, never token refusals.
+      rc400: [() => new Response("", { status: 400 }), "503 relaycontrol_unavailable"],
       rc401: [() => new Response("", { status: 401 }), "503 relaycontrol_unavailable"],
+      rc404: [() => new Response("", { status: 404 }), "503 relaycontrol_unavailable"],
       rc302: [() => new Response(null, { status: 302, headers: { location: "http://elsewhere.test/" } }), "503 relaycontrol_unavailable"],
       oversized: [() => Response.json({ active: false, reason: "x".repeat(17 * 1024) }), "503 relaycontrol_unavailable"],
       rc500: [() => new Response("", { status: 500 }), "503 relaycontrol_unavailable"],

@@ -43,6 +43,10 @@ describe("relaycontrol introspection over workerd's real fetch", () => {
     expect(await unavailableReason(introspector("/rc-ok", "synthetic-wrong").verifyRelaycontrolToken(TOKEN, { aud: AUD }))).toBe("introspect_unauthorized");
   });
 
+  test("a relaycontrol 400 (contract drift, not the caller) is unavailable", async () => {
+    expect(await unavailableReason(introspector("/rc-bad-request").verifyRelaycontrolToken(TOKEN, { aud: AUD }))).toBe("introspect_bad_request");
+  });
+
   test("an oversized response is refused unparsed", async () => {
     expect(await unavailableReason(introspector("/rc-large").verifyRelaycontrolToken(TOKEN, { aud: AUD }))).toBe("response_too_large");
   });

@@ -13,17 +13,19 @@
  *   body {token, aud, workspace?, machine?}
  *   200 {active:true, sub, email, principal_type, machine_id: string|null, org,
  *        workspace, scopes, aud, iat, exp, token_id} | {active:false, reason}
- *   400 = malformed body; 401 = our secret is wrong or missing; 404 =
- *   introspection disabled on relaycontrol.
+ *   400 = malformed body (History validates token, workspace and machine
+ *   first, so a caller cannot cause one: contract drift or a History bug);
+ *   401 = our secret is wrong or missing; 404 = introspection disabled.
  *
- * Fail closed: a timeout, network error, a 3xx (never followed: the fetch
- * uses `redirect: "manual"`, the only non-following mode workerd supports),
- * relaycontrol's 401 (our introspection secret is wrong: a deployment fault,
- * not the caller's), 404, 5xx, a body over 16 KiB, or a body that is not the
+ * Fail closed: a timeout (of the call or of the body read), network error, a
+ * 3xx (never followed: the fetch uses `redirect: "manual"`, the only
+ * non-following mode workerd supports), relaycontrol's 400, 401 (our
+ * introspection secret is wrong: a deployment fault, not the caller's), 404,
+ * 5xx, a body over 16 KiB, or a body that is not the
  * contract shape is RelaycontrolUnavailableError (the caller answers 503
  * `relaycontrol_unavailable`, retryable); `active:false` (any reason), a
  * principal_type other than "desktop-user", an audience, workspace or machine
- * mismatch, and relaycontrol's 400 are RelaycontrolRejectedError (401, generic
+ * mismatch is RelaycontrolRejectedError (401, generic
  * code; the reason goes to the log only). The audience is compared as a
  * normalized origin on both sides (lowercased scheme and host, no path or
  * trailing slash, an explicit non-default port kept), as relaycontrol matches
@@ -293,6 +295,11 @@ export function createRelaycontrolIntrospector(
     cache.set(key, { outcome, expiresAt: now() + ttlMs });
   };
 
+  const fetchFailureReason = (error: unknown): string => {
+    const name = (error as { name?: string } | null)?.name;
+    return name === "TimeoutError" || name === "AbortError" ? "timeout" : "network_error";
+  };
+
   async function introspect(
     token: string,
     request: RelaycontrolRequest,
@@ -318,10 +325,7 @@ export function createRelaycontrolIntrospector(
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
-      const name = (error as { name?: string } | null)?.name;
-      throw new RelaycontrolUnavailableError(
-        name === "TimeoutError" || name === "AbortError" ? "timeout" : "network_error",
-      );
+      throw new RelaycontrolUnavailableError(fetchFailureReason(error));
     }
     if (response.status === 401) {
       // Our introspection secret is wrong or missing: a deployment fault that
@@ -334,15 +338,14 @@ export function createRelaycontrolIntrospector(
       throw new RelaycontrolUnavailableError("introspect_unauthorized");
     }
     if (response.status === 400) {
-      // A malformed request body: does not admit the caller; not cached.
+      // History validates token, workspace and machine before calling, so a
+      // caller cannot cause a 400: it means contract drift or a History bug.
+      // An outage (503), never a 401, and never cached.
       await response.body?.cancel().catch(() => {});
       log("error", "relaycontrol introspection refused our request", {
         status: 400,
       });
-      return {
-        outcome: { ok: false, reason: "relaycontrol_400" },
-        ttlMs: 0,
-      };
+      throw new RelaycontrolUnavailableError("introspect_bad_request");
     }
     if (response.status !== 200) {
       // 404 is introspection disabled on relaycontrol: an outage, not a refusal.
@@ -352,8 +355,9 @@ export function createRelaycontrolIntrospector(
     let text: string | null;
     try {
       text = await readCapped(response, RELAYCONTROL_MAX_RESPONSE_BYTES);
-    } catch {
-      throw new RelaycontrolUnavailableError("network_error");
+    } catch (error) {
+      // The fetch's AbortSignal also bounds the body read.
+      throw new RelaycontrolUnavailableError(fetchFailureReason(error));
     }
     if (text === null) throw new RelaycontrolUnavailableError("response_too_large");
     let body: Record<string, unknown>;
