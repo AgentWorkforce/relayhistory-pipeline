@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "at": "2026-11-07T22:06:10.908123+00:00",
+  "at": "2026-11-07T22:16:49.868385+00:00",
   "kind": "source_plan_readonly_evidence_and_directly_approved_role_bootstrap",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
-  "readiness": "DIRECT_USER_SCHEMA_WINDOW_APPROVAL_RECORDED; four missing roles created and verified; fresh PLAN/capture; runtime handoff unresolved before schema apply",
+  "readiness": "DIRECT_SCHEMA_WINDOW_APPROVAL_RETAINED; roles verified and fresh bindings; GC executor existing session expired and native status login timed out; runtime qualification unresolved before apply",
   "files": [
     {
       "name": "generation-window.md",
@@ -27,8 +27,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 8564,
-      "sha256": "8598d317025478098fcaafc824db9ac409f9ef4789429ef7525ec3b7c7311c15"
+      "bytes": 9027,
+      "sha256": "403301cc3a6549f41a2ab66f862923db007761937e2799434f940d4667837293"
     },
     {
       "name": "source-evidence.json",
@@ -329,6 +329,21 @@
       "name": "approved-window-current-status.md",
       "bytes": 3270,
       "sha256": "d7784608c0f94cf2bddb8c4f29a34bf2391159588cdbec6757fa19647ef75a49"
+    },
+    {
+      "name": "approved-window-gc-executor-answer.md",
+      "bytes": 5947,
+      "sha256": "ca1e2737ce91dd8f70dd372b93921b97760a5084ff352ae7428b5df95837e3db"
+    },
+    {
+      "name": "approved-window-gc-existing-session-result.json",
+      "bytes": 502,
+      "sha256": "8e7cbeb13c21674bca458cdc1091db7482037b87b602a0ccf5dad412bc738587"
+    },
+    {
+      "name": "approved-window-gc-native-status-result.json",
+      "bytes": 314,
+      "sha256": "04e8353ad907d8f796ea98cf98b11bb9bcd9218719f460a10f05e24ef4dc8231"
     }
   ]
 }

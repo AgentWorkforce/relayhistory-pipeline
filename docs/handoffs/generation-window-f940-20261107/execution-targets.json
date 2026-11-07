@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "status": "HOLD_RUNTIME_AND_FRESH_WINDOW_BINDINGS_USER_AUTHORIZED",
+  "status": "HOLD_GC_EXECUTOR_AUTHENTICATION_AND_RUNTIME_BINDINGS_USER_AUTHORIZED",
   "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
   "schemaGeneration": "e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",
   "captureGenerationIsSchemaGeneration": false,
@@ -73,6 +73,15 @@
       "receipt": "retained-aws-targets.json",
       "sha256": "a59e72559a6742e97d9d4eaaec9d5f0f669f6c5c05fb2fdf00e8d0553a8ec51c",
       "freshProviderPreimageRequired": true
+    },
+    "executorAvailability": {
+      "status": "NOT_CURRENTLY_AUTHENTICATED_OR_QUALIFIED",
+      "answer": "approved-window-gc-executor-answer.md",
+      "answerSha256": "ca1e2737ce91dd8f70dd372b93921b97760a5084ff352ae7428b5df95837e3db",
+      "existingSession": "cache_expired_or_expiring",
+      "nativeStatusAttempt": "bounded_native_login_timeout",
+      "awsLambdaMutationRequested": false,
+      "cloudShellIntrinsicallyRequired": false
     }
   },
   "publisherAndPublicationGc": {
