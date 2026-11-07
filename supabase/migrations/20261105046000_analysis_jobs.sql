@@ -143,6 +143,36 @@ REVOKE ALL ON sessions.session_analysis_result_tickets FROM PUBLIC, anon, authen
 GRANT ALL ON sessions.session_analysis_result_tickets TO service_role;
 
 
+-- Authoritative legacy coverage for the never-in-Neon proof. The frozen copy
+-- (ingest_frozen_source_records) holds Neon DELIVERY records only: an older turns-only Neon
+-- session (turns uploaded on the legacy path, no delivery record) is absent from it, and
+-- session_index.created_at is the SP pointer's insert time, not the session's age, so a
+-- not-yet-exported old session whose FIRST SP pointer lands after the seal (a continuation,
+-- or a late first upload) passes both absence checks while its old Neon turns are
+-- unaccounted for. No invariant in the source excludes that case, so the proof also needs a
+-- Neon-side census: every (org, workspace, session id) Neon holds any turn/event/session row
+-- for, loaded by the owner AFTER Neon refuses legacy turn writes, and sealed with its row
+-- count and digest. Until the census is sealed the proof is FALSE for every session (the
+-- read API stays turns_unknown and analysis stays incomplete): fail closed, never inferred.
+-- Owner-only: no grant to any runtime or read role; only the SECURITY DEFINER proof reads it.
+CREATE TABLE sessions.session_neon_census (
+  org_id text NOT NULL CHECK (char_length(org_id) BETWEEN 1 AND 512),
+  workspace_id text NOT NULL CHECK (char_length(workspace_id) BETWEEN 1 AND 512),
+  session_id text NOT NULL CHECK (char_length(session_id) BETWEEN 1 AND 512),
+  PRIMARY KEY (org_id, session_id, workspace_id)
+);
+CREATE TABLE sessions.session_neon_census_seal (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  census_rows bigint NOT NULL CHECK (census_rows >= 0),
+  census_sha256 text NOT NULL CHECK (census_sha256 ~ '^[0-9a-f]{64}$'),
+  -- The Neon-side evidence the loader verified (counts per source table, snapshot time).
+  neon_snapshot jsonb NOT NULL,
+  sealed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+ALTER TABLE sessions.session_neon_census ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions.session_neon_census_seal ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_neon_census, sessions.session_neon_census_seal FROM PUBLIC, anon, authenticated, service_role;
+
 -- Proof that a session never had Neon evidence, from sessions-pipeline's own records, so
 -- its analysis is complete from S3 without the legacy export's coverage marker. True only
 -- when ALL hold (any doubt is false, and false keeps the marker requirement):
@@ -150,15 +180,64 @@ GRANT ALL ON sessions.session_analysis_result_tickets TO service_role;
 --   2. the sealed copy holds no delivery record for the session id in the org (any
 --      workspace, physical or canonical id): it was never a Neon delivery session;
 --   3. it has a live pointer, and every pointer (live or tombstoned) was created after the
---      seal: it was born after the freeze, so it is not a pre-freeze copy or continuation.
+--      seal (a necessary condition only: created_at is the SP insert time, not the session's age);
+--   4. the Neon census (above) is sealed and holds no row for the session id in the org (any
+--      workspace, physical or canonical id): this is the authoritative exclusion of an old
+--      turns-only or not-yet-exported Neon session whose first SP pointer lands after the seal.
 -- The worker additionally requires that no manifest carries a Neon export/backfill marker
 -- (src/session-analysis/worker.ts), which catches a turns-only Neon session copied later.
 -- Index for (2) on large frozen copies: supabase/pending/20261105046000_frozen_records_session_index.sql.
 -- SECURITY DEFINER: the frozen custody tables stay owner-only (no SELECT for the runtime or
 -- read role); this returns one boolean.
+-- Caller pin for this lane's SECURITY DEFINER functions (the ingest_require_role pattern):
+-- the session's effective role (SET ROLE, else the login; a definer does not change it) must
+-- be one of p_roles, or the migration owner (operators, tests). The entry '<runtime>' names the
+-- migrator's configured runtime role (HOOPDB_RUNTIME_ROLE), read from the role literal the
+-- migrator writes into the verified function-boundary trigger (the bootstrap reads it the same
+-- way). Without that trigger (the local/Hoop profile, which has no Supabase bootstrap) it names
+-- a role holding an explicit EXECUTE grant on session_analysis_source_revision: only the
+-- migrator grants that (RUNTIME_APPLICATION_FUNCTIONS) and its ACL drift check refuses any
+-- other grantee. Not SECURITY DEFINER; owner-only.
+CREATE FUNCTION sessions.session_analysis_require_caller(p_roles text[])
+RETURNS void LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp AS $require_caller$
+DECLARE
+  v_caller text := coalesce(nullif(current_setting('role', true), 'none'), session_user::text);
+  v_runtime text;
+BEGIN
+  IF '<runtime>' = ANY (p_roles) THEN
+    IF to_regprocedure('hoopdb_boundary.sessions_function_boundary()') IS NOT NULL THEN
+      SELECT substring(p.prosrc FROM 'v_runtime text := ''([a-z0-9_]+)'';') INTO v_runtime
+        FROM pg_proc AS p WHERE p.oid = to_regprocedure('hoopdb_boundary.sessions_function_boundary()');
+    ELSIF EXISTS (
+      SELECT 1 FROM pg_proc AS p
+       CROSS JOIN LATERAL aclexplode(p.proacl) AS a
+       JOIN pg_roles AS g ON g.oid = a.grantee
+      WHERE p.oid = 'sessions.session_analysis_source_revision(text,text,text)'::regprocedure
+        AND a.privilege_type = 'EXECUTE' AND g.rolname = v_caller
+        AND g.rolname NOT IN ('anon', 'authenticated', 'bulls96_read_api', 'bulls96_analysis_admit')) THEN
+      v_runtime := v_caller;
+    END IF;
+  END IF;
+  IF v_caller = ANY (p_roles) OR v_caller = v_runtime OR v_caller = (
+    SELECT pg_get_userbyid(p.proowner) FROM pg_proc AS p
+     WHERE p.oid = 'sessions.session_analysis_require_caller(text[])'::regprocedure) THEN
+    RETURN;
+  END IF;
+  RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session analysis: caller is not a role this function serves';
+END
+$require_caller$;
+
+-- Callers: the worker (service_role or the configured runtime role, directly and through
+-- session_analysis_source_revision),
+-- admission (bulls96_analysis_admit, through analysis_request_v1) and the read role (through
+-- session_neon_free_for when present).
 CREATE FUNCTION sessions.session_analysis_neon_free(p_org_id text, p_workspace_id text, p_session_id text)
-RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER
+RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $neon_free$
+BEGIN
+  PERFORM sessions.session_analysis_require_caller(ARRAY['service_role', '<runtime>', 'bulls96_analysis_admit', 'bulls96_read_api']);
+  RETURN (
   WITH seal AS (SELECT sealed_at FROM sessions.ingest_frozen_source_completeness WHERE singleton),
   ptr AS (
     SELECT p.session_id, p.created_at, p.deleted_at FROM sessions.session_index AS p
@@ -171,7 +250,13 @@ SET search_path = pg_catalog, sessions, pg_temp AS $neon_free$
      AND NOT EXISTS (
        SELECT 1 FROM sessions.ingest_frozen_source_records AS r
         WHERE r.org_id = p_org_id
-          AND (r.session_id = p_session_id OR r.session_id IN (SELECT ptr.session_id FROM ptr)));
+          AND (r.session_id = p_session_id OR r.session_id IN (SELECT ptr.session_id FROM ptr)))
+     AND EXISTS (SELECT 1 FROM sessions.session_neon_census_seal WHERE singleton)
+     AND NOT EXISTS (
+       SELECT 1 FROM sessions.session_neon_census AS c
+        WHERE c.org_id = p_org_id
+          AND (c.session_id = p_session_id OR c.session_id IN (SELECT ptr.session_id FROM ptr))));
+END
 $neon_free$;
 
 -- The source revision of a session: the live pointer set as the read API matches it
@@ -180,16 +265,32 @@ $neon_free$;
 -- pointer the harness, canonical and physical machine id, user id, storage provider,
 -- bucket, manifest key and etag, revision, raw content digest and raw format; PLUS every
 -- input of the never-in-Neon proof (session_analysis_neon_free above): each pointer's
--- created_at and deleted_at, tombstoned ones included, and the proof's verdict itself. Any
+-- created_at and deleted_at, tombstoned ones included, the frozen copy's seal (sealed_at and
+-- manifest digest), whether a frozen delivery record names the session, the census seal (sealed_at
+-- and digest), whether the census names the session, and the proof's verdict itself. (Export and
+-- backfill markers live in the manifest, so its etag carries them.) Any
 -- change that can change the evidence or the proof moves it, so neither a reuse nor a
 -- publication can outlive it. An unambiguous tuple (a JSON array; NULL kept), never a
 -- separator join. NULL when no pointer is live.
+-- SECURITY DEFINER (pinned like the proof) to read the owner-only proof inputs; returns one hash.
 CREATE FUNCTION sessions.session_analysis_source_revision(p_org_id text, p_workspace_id text, p_session_id text)
-RETURNS text LANGUAGE sql STABLE
+RETURNS text LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $revision$
+BEGIN
+  PERFORM sessions.session_analysis_require_caller(ARRAY['service_role', '<runtime>', 'bulls96_analysis_admit']);
+  RETURN (
+  WITH ids AS (
+    SELECT DISTINCT p.session_id FROM sessions.session_index AS p
+     WHERE p.org_id = p_org_id AND p.workspace_id = p_workspace_id
+       AND (coalesce(p.canonical_session_id, p.session_id) = p_session_id OR p.session_id = p_session_id)
+    UNION SELECT p_session_id)
   SELECT CASE WHEN count(*) FILTER (WHERE p.deleted_at IS NULL) = 0 THEN NULL ELSE encode(sha256(convert_to(jsonb_build_array(
            p_org_id, p_workspace_id, p_session_id,
            sessions.session_analysis_neon_free(p_org_id, p_workspace_id, p_session_id),
+           (SELECT jsonb_build_array(c.sealed_at, c.manifest_sha256) FROM sessions.ingest_frozen_source_completeness AS c WHERE c.singleton),
+           EXISTS (SELECT 1 FROM sessions.ingest_frozen_source_records AS r WHERE r.org_id = p_org_id AND r.session_id IN (SELECT session_id FROM ids)),
+           (SELECT jsonb_build_array(c.sealed_at, c.census_sha256) FROM sessions.session_neon_census_seal AS c WHERE c.singleton),
+           EXISTS (SELECT 1 FROM sessions.session_neon_census AS c WHERE c.org_id = p_org_id AND c.session_id IN (SELECT session_id FROM ids)),
            jsonb_agg(jsonb_build_array(
              p.harness, coalesce(p.canonical_session_id, p.session_id),
              coalesce(p.canonical_machine_id, p.machine_id), p.machine_id, p.user_id,
@@ -198,7 +299,8 @@ SET search_path = pg_catalog, sessions, pg_temp AS $revision$
              ORDER BY p.manifest_key, p.harness, p.machine_id, p.created_at))::text, 'UTF8')), 'hex') END
     FROM sessions.session_index AS p
    WHERE p.org_id = p_org_id AND p.workspace_id = p_workspace_id
-     AND (coalesce(p.canonical_session_id, p.session_id) = p_session_id OR p.session_id = p_session_id);
+     AND (coalesce(p.canonical_session_id, p.session_id) = p_session_id OR p.session_id = p_session_id));
+END
 $revision$;
 
 -- The admission principal's tenant pin (session_directory_read_api_scope's pattern):
@@ -260,6 +362,91 @@ CREATE TRIGGER session_analysis_v2_forget_tombstoned_directory
 CREATE TRIGGER session_analysis_v2_forget_deleted_directory
   AFTER DELETE ON sessions.session_directory
   FOR EACH ROW EXECUTE FUNCTION sessions.session_analysis_v2_forget();
+
+-- C3 privacy purge for Neon-era sessions. Exported/backfilled sessions have no publication
+-- head in SP, so a reset or disable tombstones no pointer and the forget triggers never fire
+-- for them. Lane A's authority (041000) calls these, guarded, BEFORE it deletes the owned rows:
+--   purge_session_analysis_for_owned(org, user)          reset: the user's whole owned set
+--   purge_session_analysis_for_owned(org, user, sessions) disable: only the listed
+--     [{"source": ..., "session_id": ...}] that are in the user's owned set
+-- The owned set is ingest_frozen_source_owned_sessions UNION the user's frozen delivery records
+-- with a session (exactly the set the reset fences). Rows are matched on the owned row's org,
+-- workspace and session id, never on a bare session id: another user's or workspace's session
+-- with the same id is untouched. Like the forget trigger, every result key is ticketed
+-- 'forgotten' for the sweeper's every-version erase before the rows are deleted. A no-op (0)
+-- when lane A's tables are absent. Returns the analysis jobs purged. Owner-only.
+CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text, p_user text, p_sessions jsonb)
+RETURNS integer LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $purge_owned$
+DECLARE
+  v_jobs integer;
+BEGIN
+  -- Caller pin: lane A's privacy authority (bulls96_session_ingest, inside its begin, which
+  -- sets bulls96.privacy_authority_writer) or the migration owner (operator).
+  PERFORM sessions.session_analysis_require_caller(ARRAY['bulls96_session_ingest']);
+  IF coalesce(nullif(current_setting('role', true), 'none'), session_user::text) = 'bulls96_session_ingest'
+     AND coalesce(current_setting('bulls96.privacy_authority_writer', true), '') <> 'authority' THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'purge_session_analysis_for_owned: outside the privacy authority';
+  END IF;
+  IF p_org IS NULL OR btrim(p_org) = '' OR p_user IS NULL OR btrim(p_user) = '' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'purge_session_analysis_for_owned: org and user are required';
+  END IF;
+  IF p_sessions IS NOT NULL AND jsonb_typeof(p_sessions) <> 'array' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'purge_session_analysis_for_owned: sessions must be a json array';
+  END IF;
+  IF p_sessions IS NOT NULL AND EXISTS (
+    SELECT 1 FROM jsonb_array_elements(p_sessions) AS e(v)
+     WHERE jsonb_typeof(e.v) <> 'object' OR coalesce(e.v ->> 'source', '') = '' OR coalesce(e.v ->> 'session_id', '') = ''
+  ) THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'purge_session_analysis_for_owned: each session needs source and session_id';
+  END IF;
+  IF to_regclass('sessions.ingest_frozen_source_owned_sessions') IS NULL THEN
+    RETURN 0;
+  END IF;
+  CREATE TEMP TABLE IF NOT EXISTS pg_temp.analysis_purge_owned (org_id text, workspace_id text, session_id text) ON COMMIT DROP;
+  TRUNCATE pg_temp.analysis_purge_owned;
+  INSERT INTO pg_temp.analysis_purge_owned
+  SELECT DISTINCT o.org_id, o.workspace_id, o.session_id
+    FROM sessions.ingest_frozen_source_owned_sessions AS o
+   WHERE o.org_id = p_org AND o.user_id = p_user
+     AND (p_sessions IS NULL OR EXISTS (
+       SELECT 1 FROM jsonb_array_elements(p_sessions) AS e(v)
+        WHERE e.v ->> 'source' = o.source AND e.v ->> 'session_id' = o.session_id));
+  IF to_regclass('sessions.ingest_frozen_source_records') IS NOT NULL THEN
+    EXECUTE $records$
+      INSERT INTO pg_temp.analysis_purge_owned
+      SELECT DISTINCT r.org_id, r.workspace_id, r.session_id
+        FROM sessions.ingest_frozen_source_records AS r
+       WHERE r.org_id = $1 AND r.user_id = $2 AND r.session_id IS NOT NULL
+         AND ($3::jsonb IS NULL OR EXISTS (
+           SELECT 1 FROM jsonb_array_elements($3::jsonb) AS e(v)
+            WHERE e.v ->> 'source' = r.source AND e.v ->> 'session_id' = r.session_id))
+    $records$ USING p_org, p_user, p_sessions;
+  END IF;
+  INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason)
+  SELECT j.result_s3_key, j.id, j.org_id, j.workspace_id, j.session_id, 'forgotten'
+    FROM sessions.session_analysis_jobs_v2 AS j
+    JOIN (SELECT DISTINCT * FROM pg_temp.analysis_purge_owned) AS o
+      ON j.org_id = o.org_id AND j.workspace_id = o.workspace_id AND j.session_id = o.session_id
+   WHERE j.result_s3_key IS NOT NULL
+  ON CONFLICT (result_key) DO UPDATE SET reason = 'forgotten', lease_expires_at = NULL;
+  DELETE FROM sessions.session_analysis_requests_v2 AS r
+   USING (SELECT DISTINCT * FROM pg_temp.analysis_purge_owned) AS o
+   WHERE r.org_id = o.org_id AND r.workspace_id = o.workspace_id AND r.session_id = o.session_id;
+  DELETE FROM sessions.session_analysis_jobs_v2 AS j
+   USING (SELECT DISTINCT * FROM pg_temp.analysis_purge_owned) AS o
+   WHERE j.org_id = o.org_id AND j.workspace_id = o.workspace_id AND j.session_id = o.session_id;
+  GET DIAGNOSTICS v_jobs = ROW_COUNT;
+  TRUNCATE pg_temp.analysis_purge_owned;
+  RETURN v_jobs;
+END
+$purge_owned$;
+
+CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text, p_user text)
+RETURNS integer LANGUAGE sql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $purge_owned_all$
+  SELECT sessions.purge_session_analysis_for_owned(p_org, p_user, NULL::jsonb);
+$purge_owned_all$;
 
 -- relayhistory request_session_analysis_v1 (0062:413) over the v2 tables. Same outcome
 -- enum and request object: accepted {request} | not_found | rate_limited | invalid_request.
@@ -444,6 +631,9 @@ END
 $read$;
 
 REVOKE ALL ON FUNCTION sessions.session_analysis_v2_forget() FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_analysis_require_caller(text[]) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text, jsonb) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_admit_scope(text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_source_revision(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_neon_free(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
@@ -466,6 +656,9 @@ DECLARE
 BEGIN
   FOREACH v_fn IN ARRAY ARRAY[
     'sessions.session_analysis_v2_forget()'::regprocedure,
+    'sessions.session_analysis_require_caller(text[])'::regprocedure,
+    'sessions.purge_session_analysis_for_owned(text, text, jsonb)'::regprocedure,
+    'sessions.purge_session_analysis_for_owned(text, text)'::regprocedure,
     'sessions.session_analysis_admit_scope(text, text)'::regprocedure,
     'sessions.session_analysis_source_revision(text, text, text)'::regprocedure,
     'sessions.session_analysis_neon_free(text, text, text)'::regprocedure,

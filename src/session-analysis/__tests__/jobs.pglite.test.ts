@@ -229,6 +229,7 @@ describe("analysis_request_v1", () => {
          (source_identity_sha256, control_epoch, privacy_baseline_sha256, org_count, record_rows, manifest_sha256, neon_snapshot, sealed_at)
        VALUES (repeat('a',64), repeat('b',64), repeat('c',64), 1, 0, repeat('d',64), '{}'::jsonb, now() - interval '1 hour')`,
     );
+    await pg.query("INSERT INTO sessions.session_neon_census_seal (census_rows, census_sha256, neon_snapshot) VALUES (0, repeat('e',64), '{}'::jsonb)");
     const proof = async () =>
       (await pg.query<{ f: boolean }>("SELECT sessions.session_analysis_neon_free($1, $2, $3) AS f", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.f;
     expect(await proof()).toBe(true);
@@ -524,6 +525,7 @@ describe("analysisTick is default-off", () => {
 describe("never-in-Neon proof (session_analysis_neon_free + live-only manifests)", () => {
   const free = async () =>
     (await pg.query<{ f: boolean }>("SELECT sessions.session_analysis_neon_free($1, $2, $3) AS f", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.f;
+  const census = () => pg.query("INSERT INTO sessions.session_neon_census_seal (census_rows, census_sha256, neon_snapshot) VALUES (0, repeat('e',64), '{}'::jsonb)");
   const seal = (ago: string) =>
     pg.query(
       `INSERT INTO sessions.ingest_frozen_source_completeness
@@ -535,11 +537,30 @@ describe("never-in-Neon proof (session_analysis_neon_free + live-only manifests)
   test("born after the sealed freeze and absent from the frozen copy: complete without the marker", async () => {
     expect(await free()).toBe(false); // no seal yet: doubt
     await seal("1 hour");
+    expect(await free()).toBe(false); // no Neon census sealed: no authoritative legacy coverage
+    await census();
     expect(await free()).toBe(true);
+  });
+
+  test("#301 (1): an OLD turns-only / not-yet-exported Neon session whose FIRST SP pointer lands after the seal is not Neon-free", async () => {
+    // No frozen delivery record (turns-only on the legacy path), every pointer born after the
+    // seal (a late first upload or a continuation), no export marker yet: both absence checks
+    // hold, and only the Neon census excludes it.
+    await seal("1 hour");
+    await census();
+    expect(await free()).toBe(true);
+    await pg.query("INSERT INTO sessions.session_neon_census (org_id, workspace_id, session_id) VALUES ($1, 'any-ws', $2)", [KEY.orgId, KEY.sessionId]);
+    expect(await free()).toBe(false);
+    // By physical id too (a canonicalized continuation).
+    await pg.query("DELETE FROM sessions.session_neon_census");
+    await pg.query("UPDATE sessions.session_index SET canonical_session_id = $1, session_id = 'phys-1'", [KEY.sessionId]);
+    await pg.query("INSERT INTO sessions.session_neon_census (org_id, workspace_id, session_id) VALUES ($1, $2, 'phys-1')", [KEY.orgId, KEY.workspaceId]);
+    expect(await free()).toBe(false);
   });
 
   test("a Neon-era session is never proven Neon-free", async () => {
     await seal("1 hour");
+    await census();
     // In the frozen Neon copy (any workspace): Neon delivery session.
     await pg.query(
       "INSERT INTO sessions.ingest_frozen_source_records (org_id, workspace_id, origin_id, record_id, source, session_id) VALUES ($1, 'other-ws', 'o', 'r', 'claude', $2)",
@@ -558,5 +579,40 @@ describe("never-in-Neon proof (session_analysis_neon_free + live-only manifests)
     expect(neonDerivedManifest(base)).toBe(false);
     expect(neonDerivedManifest({ extensions: {}, raw: { epochs: [{ epoch: 2, reason: "backfill" }] } } as never)).toBe(true);
     expect(neonDerivedManifest({ extensions: { "client.relayhistory_export": {} }, raw: { epochs: [] } } as never)).toBe(true);
+  });
+});
+
+describe("item 3: every DB proof input is in the source revision (a change to any one invalidates reuse)", () => {
+  const rev = async () =>
+    (await pg.query<{ r: string }>("SELECT sessions.session_analysis_source_revision($1, $2, $3) AS r", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.r;
+  test("seal, census seal, frozen record, census row, pointer created/deleted, manifest etag and the verdict each move it", async () => {
+    const seen = new Set<string>([await rev()]);
+    const step = async (label: string, sql: string, params: unknown[] = []) => {
+      await pg.query(sql, params);
+      const next = await rev();
+      expect(next, label).toMatch(/^[0-9a-f]{64}$/);
+      expect(seen.has(next), label).toBe(false);
+      seen.add(next);
+    };
+    await step("frozen seal", `INSERT INTO sessions.ingest_frozen_source_completeness
+      (source_identity_sha256, control_epoch, privacy_baseline_sha256, org_count, record_rows, manifest_sha256, neon_snapshot, sealed_at)
+      VALUES (repeat('a',64), repeat('b',64), repeat('c',64), 1, 0, repeat('d',64), '{}'::jsonb, now() - interval '1 hour')`);
+    await step("census seal (verdict flips true)", "INSERT INTO sessions.session_neon_census_seal (census_rows, census_sha256, neon_snapshot) VALUES (0, repeat('e',64), '{}'::jsonb)");
+    await step("frozen seal digest", "UPDATE sessions.ingest_frozen_source_completeness SET manifest_sha256 = repeat('9',64)");
+    await step("census digest", "UPDATE sessions.session_neon_census_seal SET census_sha256 = repeat('8',64)");
+    await step("frozen record presence", "INSERT INTO sessions.ingest_frozen_source_records (org_id, workspace_id, origin_id, record_id, source, session_id) VALUES ($1, 'other', 'o', 'r', 'claude', $2)", [KEY.orgId, KEY.sessionId]);
+    await pg.query("DELETE FROM sessions.ingest_frozen_source_records");
+    seen.add(await rev());
+    await step("census presence", "INSERT INTO sessions.session_neon_census (org_id, workspace_id, session_id) VALUES ($1, 'other', $2)", [KEY.orgId, KEY.sessionId]);
+    await pg.query("DELETE FROM sessions.session_neon_census");
+    seen.add(await rev());
+    await step("pointer created_at", "UPDATE sessions.session_index SET created_at = created_at + interval '1 second'");
+    await step("manifest etag (export/backfill markers live in the manifest)", "UPDATE sessions.session_index SET manifest_etag = 'etag-2'");
+    await step("tombstoned pointer deleted_at", `INSERT INTO sessions.session_index
+         (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
+          storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, title, deleted_at)
+       VALUES ($1, $2, $3, $4, 'm-t', 'u-1', now(), now(), 'fs', 'bucket', 'manifest/t',
+               decode(repeat('ab', 32), 'hex'), 'jsonl', '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1, 't', now())`, [KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId]);
+    await step("deleted_at moves", "UPDATE sessions.session_index SET deleted_at = deleted_at + interval '1 second' WHERE machine_id = 'm-t'");
   });
 });
