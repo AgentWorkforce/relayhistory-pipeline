@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "at": "2026-11-07T22:54:29.407432+00:00",
+  "at": "2026-11-07T23:02:38.008942+00:00",
   "kind": "directly_approved_role_bootstrap_and_schema_apply_evidence",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
-  "readiness": "SCHEMA_WORKER_AND_REBIND_VERIFIED_G2_AWAIT_UPLOAD_SAMPLE",
+  "readiness": "G2_WINDOW_VERIFIED_ACCEPTANCE_RESUMED_INTERMITTENT_CLAIM_TIMEOUTS_REMAIN",
   "files": [
     {
       "name": "approved-missing-nologin-bootstrap.ts.txt",
@@ -47,8 +47,8 @@
     },
     {
       "name": "approved-window-current-status.md",
-      "bytes": 3921,
-      "sha256": "44266e3f9a03e388587508733611da765afad9fd417b8154e4059d0e27d6d150"
+      "bytes": 4449,
+      "sha256": "80c80aac7dfccb2202b62a77dad00a429d29b23f61d78c58d757926c595a7a89"
     },
     {
       "name": "approved-window-gc-executor-answer.md",
@@ -151,6 +151,11 @@
       "sha256": "e54a299c17781ad0b63150d8cd57fb98ec4be7313314b5ec2ab5f09b1236cb32"
     },
     {
+      "name": "brian-dual-worker-120s-closed-tail-20261107T225613Z.json",
+      "bytes": 4407,
+      "sha256": "bc058ed2e2e31416e6ef33c1f377cefec77206e88e49f65937fadab5ee8257db"
+    },
+    {
       "name": "brian-ingest-aggregate-snapshot-v2.sql.txt",
       "bytes": 4158,
       "sha256": "8930e4cfc0497aa4eb56b20add752f8eaa60fadd6c00ee53068a38ee1b4ae3cf"
@@ -167,8 +172,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 12052,
-      "sha256": "c3841b92201ca8cc755b4d35482d544bf1ee7d133a0fc910b341109a21e5e236"
+      "bytes": 12901,
+      "sha256": "306290f1f5051ba794f6a324d7792c151548d885780ae192c354adc16a2d4fa7"
     },
     {
       "name": "fixed-role-inventory-readonly.ts.txt",
@@ -226,6 +231,11 @@
       "sha256": "7d13d267202966c569eb9f4adb87d4413c1d7c5e01a7b8585adfb01faa8d32ce"
     },
     {
+      "name": "ingest-claim-inner-statement-stats-readonly-draft-20261107.sql",
+      "bytes": 4773,
+      "sha256": "24fa86fe520d69d279e69659b96c830969bbcc410a6cb86b5537a6b656b48fa7"
+    },
+    {
       "name": "ingest-unpaired-tail-receipt.json",
       "bytes": 706,
       "sha256": "4e77499fb02e73e42c24dd7ad1e9884c33b85dfabec7e42dd3b4b0d500fc1c54"
@@ -269,6 +279,16 @@
       "name": "post-cutover-daily-ack.sql.txt",
       "bytes": 2868,
       "sha256": "004e9baa07cecfcf663848c0bd421cafdc94aecd3d5310a8319b3c5ba4c792a6"
+    },
+    {
+      "name": "post-window-claim-stats-result.json",
+      "bytes": 26282,
+      "sha256": "4a9fd9da38b291cec3ca24bc848d2321a37a0ae0743e55a14c2f9503b384471a"
+    },
+    {
+      "name": "post-window-claim-stats-summary.md",
+      "bytes": 1724,
+      "sha256": "bab08c79cbd46d8f31214f7aad86c328acfbd7a6e79d80b82ddf78caa7bd42eb"
     },
     {
       "name": "publisher-activity-observation.md",

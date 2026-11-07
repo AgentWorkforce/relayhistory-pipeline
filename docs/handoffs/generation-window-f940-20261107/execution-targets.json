@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "status": "SCHEMA_WORKER_AND_REBIND_VERIFIED_G2_AWAIT_UPLOAD_SAMPLE",
+  "status": "G2_WINDOW_VERIFIED_ACCEPTANCE_RESUMED_INTERMITTENT_CLAIM_TIMEOUTS_REMAIN",
   "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
   "schemaGeneration": "e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",
   "captureGenerationIsSchemaGeneration": false,
@@ -249,5 +249,32 @@
     "censusReceipt": "approved-window-post-rebind-g2-census.json",
     "censusReceiptSha256": "ce0fccaaffa72468c399398acf5d3897ec2a856d1447fed1afbff41023cef6e5",
     "unexpectedAdmissions": 0
+  },
+  "postRebindUploadSample": {
+    "receipt": "brian-dual-worker-120s-closed-tail-20261107T225613Z.json",
+    "sha256": "bc058ed2e2e31416e6ef33c1f377cefec77206e88e49f65937fadab5ee8257db",
+    "private": {
+      "total": 116,
+      "http200": 101,
+      "http503": 12,
+      "http429": 3
+    },
+    "public": {
+      "total": 78,
+      "http200": 64,
+      "http503": 12,
+      "http429": 2
+    },
+    "observedGenerationErrors": 0,
+    "privateClaimLockTimeouts": 8,
+    "privateClaimStatementTimeouts": 4,
+    "completeFix": false
+  },
+  "postWindowClaimStatistics": {
+    "receipt": "post-window-claim-stats-result.json",
+    "sha256": "4a9fd9da38b291cec3ca24bc848d2321a37a0ae0743e55a14c2f9503b384471a",
+    "nestedCapture": "disabled_track_top",
+    "functionCapture": "disabled_track_none",
+    "configurationChanged": false
   }
 }
