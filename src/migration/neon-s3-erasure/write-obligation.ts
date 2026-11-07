@@ -87,8 +87,7 @@ export interface ObligationStore {
    * after it succeeds, a publish of any reserved version must be refused.
    */
   reserve(rev: number, versionIds: readonly string[]): Promise<Cas>;
-  /** Persist the run's checkpoint, or clear it (null) to restart the traversal; a CAS like the rest. */
-  saveCheckpoint(rev: number, checkpoint: EraseCheckpoint | null): Promise<Cas>;
+  saveCheckpoint(rev: number, checkpoint: EraseCheckpoint): Promise<Cas>;
   /** Clear exactly these invocations (each on its own terminal evidence). */
   resolve(rev: number, invocationIds: readonly string[]): Promise<Cas>;
   /** Not complete: clear the checkpoint, back off (`nextSweepDelayMs`). */
@@ -180,26 +179,14 @@ export async function reconcileObligation(
     if (!ids.length) return;
     if (!(await cas(store.reserve(rev, ids)))) { lost = true; throw coded("reservation_refused"); }
   };
-  // The persisted checkpoint:
-  //  - this key's exact-key checkpoint under this scope: resumed;
-  //  - the KNOWN legacy mode only (a directory-mode checkpoint of this key's own directory under
-  //    the SAME scope, as 142761c7 persisted it, no exactKey): its progress is restarted by a
-  //    compare-and-set that clears ONLY the checkpoint (invocations, reservations and terminal
-  //    history untouched); a concurrent change makes the CAS refuse and nothing is overwritten;
-  //  - anything else (another directory, another exact key, another scope): refused with
-  //    erasure_checkpoint_scope, nothing traversed or deleted. A lane that changes an
-  //    obligation's invocations or owned set clears its checkpoint in the same transaction.
-  let checkpoint: EraseCheckpoint | null = first.checkpoint ?? null;
-  if (checkpoint) {
-    const legacy = checkpoint.v === 1 && checkpoint.scope === scope && checkpoint.prefix === prefix && (checkpoint.exactKey ?? null) === null;
-    const current = checkpoint.v === 1 && checkpoint.scope === scope && checkpoint.prefix === prefix && checkpoint.exactKey === key;
-    if (legacy) {
-      if (!(await cas(store.saveCheckpoint(rev, null)))) return "refused";
-      checkpoint = null;
-    } else if (!current) {
-      throw Object.assign(new Error("write obligation: the persisted checkpoint is bound to another key, directory or scope"), { code: "erasure_checkpoint_scope" });
-    }
-  }
+  // Progress selection (local, not a durable change): a checkpoint is reused only for this scope
+  // AND this listing mode (exactKey). Any other one (a legacy directory-mode checkpoint, or one
+  // whose scope changed because the obligation changed: a new invocation, a new owned version)
+  // is simply ignored and the traversal restarts with a fresh strict listing; nothing of the
+  // obligation (invocations, reservations, history) is touched by that choice. The low-level
+  // eraseStep/verifyErased API still refuses a mismatched checkpoint passed to it directly.
+  const checkpoint: EraseCheckpoint | null = first.checkpoint && first.checkpoint.scope === scope && first.checkpoint.prefix === prefix
+    && (first.checkpoint.exactKey ?? null) === key ? first.checkpoint : null;
   let step;
   try {
     step = await eraser.eraseStep(prefix, { scope, checkpoint, select: unowned, authorize, beforeDelete, exactKey: key, ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.now ? { now: opts.now } : {}) });
