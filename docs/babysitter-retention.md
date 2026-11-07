@@ -1,0 +1,158 @@
+# Babysitter evidence retention (replacement for the Neon sweep)
+
+Status: **dormant by default.** Every switch is off. Nothing changes in production until the production lead applies migration `20261105042000` in a window and turns on the flags in the order below, with Khaliq's OK.
+
+## What is being replaced
+
+relayhistory-cloud enforces the 30-day promise for Babysitter evidence (`session_lineage` and `turn_receipt` delivery records, `retention_class=standard_30d`) in Neon only.
+
+- **Expired:** `payload.expires_at_ms <= now`. The timestamp is the client's, compared with the database clock. Ingest checks that it is a positive number at most 31 days ahead, with no lower bound (`vendor/delivery/prepare.ts`).
+- **Purge:** the cron's global `expireBabysitterEvidence` runs every minute, up to 500 rows across all tenants. It sets `operation='delete'` and `payload=NULL`, and keeps the revision and digest.
+- **Hide:** every `GET /v1/delivery/records` filters out expired rows, whatever the switches say.
+
+**Finding (2026-11-06):** under Neon's 0078 cutover guard (`phase=active`), that UPDATE has no cutover permit. It most likely raises `delivery_cutover_held` on every tick, which the cron logs as `Babysitter evidence expiry failed`. This is read from code; confirm it with a read-only `wrangler tail`.
+
+## Where the evidence lives on the new store
+
+- **Supabase:** metadata only, in `ingest_record_revisions` and in the frozen copy `ingest_frozen_source_records`. No table holds the payload.
+- **S3:** the payload bytes:
+  - in session raw chunks, and in `h=_none/s=_origin` for evidence with no session;
+  - in staged batch objects.
+
+The pipeline does not project or serve these kinds, and the Neon→S3 exporter never exported them. The transcript eraser key has no GetObject, so it cannot remove a single line from a chunk.
+
+## Design
+
+1. **Write path** (ingest Worker, `INGEST_BABYSITTER_RETENTION_ROUTING=on`; any case, trimmed). Identical in every acceptance mode: canonical inline, canonical staged, and buffered, which is the Neon-exit production path.
+   1. **Register** the batch's buckets with `sessions.ingest_babysitter_retention_register`. Each bucket is `h=_babysitter/d=*/s=_bx<yyyymmddhh>-<sha16(source␟session␟reset epoch)>` under the same machine, keyed by the expiry rounded **up** to the UTC hour.
+   2. **Write** each bucket's full Babysitter lines as **one create-only object**, `…/h=_babysitter/d=<erase date>/s=<bucket>/raw/b=<sha32(batch digest)>.ndjson.zst`, with no manifest, no pointer and no CAS. It is scrubbed like every chunk and idempotent by batch digest.
+   3. **Carry on** with today's path, with the record in its **own** session as a **payload-free stub**: same identity, revision, operation and digest metadata, payload `{retention_class, expires_at_ms, retention_bucket}`.
+   - **What this guarantees:** a bucket holds only Babysitter lines, and no session chunk, staged object, buffered stage or canonical generation ever holds the payload. No mixed object is ever registered or erased.
+   - **What stays unchanged:** the SQL prepare, publication, seats and custody, which compare SQL metadata only, and the revision fence.
+   - **Reset epoch:** it is part of the key, so a write after a user reset always opens a new bucket. A reset never erases post-reset evidence.
+   - **Request budget: routing is HOLD until the deployed cap is proven.**
+     - Cloudflare's documented Workers Paid default became **10,000** subrequests on 2026-02-11, configurable per Worker; Free stays at 50 external and 1,000 internal ([changelog](https://developers.cloudflare.com/changelog/post/2026-02-11-subrequests-limit/), [limits](https://developers.cloudflare.com/workers/platform/limits/)). That is vendor documentation, not proof of this account's entitlement.
+     - Root's read-only observation (2026-11-07T02:55Z): the ingest Worker has `usage_model=standard` and no explicit `limits.subrequests`, and the plan entitlement was not readable. The effective deployed cap is **unproven**.
+     - So routing is active **only** with an explicit `INGEST_SUBREQUEST_CAP` set to the proven cap. It is never assumed; without it, routing stays inactive and logs a warning.
+   - **Worst-case proof** (`worstCaseSubrequests`, counting every subrequest, with retries and redirects at their maxima):
+
+     | Component | Subrequests |
+     |---|---|
+     | database | 1 (one Hyperdrive connection per request; every ledger call rides it) |
+     | replica | 0 (routing requires it off) |
+     | bucket PUTs | B, one create-only PUT per bucket, no retry (a failure is a 503) |
+     | inline (canonical, S ≤ the inline bound) | S × `GROUP_ATTEMPTS` (3) × (4 pointer calls + `CAS_ATTEMPTS` (8) × 4 CAS calls) = S × 108 |
+     | staged (canonical, S > the inline bound) | 1 staged PUT + 1 queue send |
+     | buffered | 1 stage PUT + 1 conflict GET |
+
+     Every S3 call is multiplied by (1 + R), where R is the redirects one `fetch` may follow: `INGEST_SUBREQUEST_REDIRECTS`, default **20**, the fetch maximum. R may be lowered only once proven. **Total** = 1 + queue sends + S3 calls × (1 + R).
+   - **Refusal is before any write.** A routed batch whose worst case exceeds the cap is refused **before the claim**: no ledger row, no S3 object. The response is a **typed 422** (`delivery_budget_exceeded`). It is not a 503, because the batch is an immutable idempotency unit that can never fit, so replaying it makes no progress.
+   - **Supported client reduction and recovery.** The server never splits a batch or changes an identity. Desktop releases from `released-v2026.11.4-beta.1` (relay-desktop `desktop-core/src/history/destination.rs`, `ReceiverRejection::isolatable`: 400/422) isolate a rejected batch **locally**: they split it depth-first into smaller deterministic child batches (at most 32 isolation requests per drain, resuming later) until each child fits, and a single record that is still rejected is set aside.
+     - The worst case per record is bounded: 1 bucket plus 1 session (about 110 × (1 + R)). So children fit whenever the cap is at least that; below it nothing can fit and routing must stay off.
+     - **Older Desktops** (v2026.10.27, desktop-v2026.10.65/.66): their handling of a 422 is unverified, so they must be on a release with isolation, or routing must stay off for them.
+     - Optionally, the destination can publish a lower `limits.maxRecords` in receipts so that *future* batches are prepared smaller. A prepared batch is never resized.
+   - **Wide batches are never collapsed.** Every (source, session, reset epoch, hour) keeps its own bucket, so the per-session deletion fence stays immediate.
+   - **Replica:** routing requires the Neon replica `off`, because its consumer rebuilds rows from lines. With a replica on, routing is inactive and logs a warning.
+   - **Deliberate exception:** this is the only object family the buffered Worker writes outside the stage. The indexer skips it, and it is outside `upload-generations/`.
+2. **SQL lane** (`supabase/migrations/20261105042000_babysitter_evidence_retention.sql`).
+   - Owner-only settings (`enabled=false, dry_run=true`; `configure(jsonb)` is audited), a metadata-only bucket registry, and an append-only audit (trigger) that holds bucket segments, never S3 keys.
+   - **Roles.** `register` belongs to the ingest login. `claim` and `complete` belong to a dedicated **least-privilege role, `bulls96_babysitter_retention`**: provisioned NOLOGIN by `supabase/bootstrap/session_ingest_roles.sql`, verified by the migration (42704 if absent, 55000 if elevated), EXECUTE on those two RPCs and **nothing else** (no ingest, register, reset or commit RPC, no table), and made LOGIN only by the operator step `supabase/bootstrap/babysitter_retention_role.sql`. Its verifier is `supabase/bootstrap/babysitter_retention_verify.sql` (generated).
+   - RPCs:
+     - `register`: the machine is derived in SQL; the ref must name its hour, session and reset epoch; the epoch must still be current (otherwise 40001, retry); it is **refused while the bucket is leased**; a late write re-opens an erased bucket.
+     - `claim`: needs `enabled` and the generation, takes 1..200 buckets with SKIP LOCKED and a 5-minute lease, and returns `leaseUntil`.
+     - `complete`: refused while disabled or in dry run; a moved `write_seq` stays pending.
+   - **Due**, always after a **15-minute hold-off** since the last registration (no PUT can be in flight). The hold-off also delays a deletion or reset fence: a bucket is erased at most about 25 minutes after the fence (15 minutes plus the 10-minute sweep cadence), comparable to E3's own session erasure cadence.
+     - the expiry hour has passed; or
+     - the session is deleted; or
+     - the user reset after the bucket's epoch.
+   - **Rollback** refuses while **any** bucket is registered, in any state, and while any erase is recorded. So only a never-used install can be rolled back.
+3. **Sweeper: a phase of the existing E3 erasure process** (`src/migration/neon-s3-erasure/babysitter-phase.ts`, hooked into `neon-s3-erasure/main.ts`; `BABYSITTER_RETENTION_SWEEP=off|dry_run|on`, default `off`).
+   - **No new Lambda, process, S3 key or IAM binding.** It runs beside the erasure job and shares its eraser, `--execute` gate and stop signal. Without `--execute`, an `on` phase is a dry run.
+   - **A new consuming credential binding with write authority: NOT covered by the earlier no-new-binding note.** It is default OFF and needs its own live credential-consumer decision before use. Nothing is provisioned by this change. E3's own read-only session and grants are untouched.
+     - **Input:** `retentionDatabaseUrl` for the least-privilege role `bulls96_babysitter_retention`. Its write authority is lease and audit rows only, through the two RPCs.
+     - **Lifetime:** read once, from the first stdin line, at process start, and only when the phase is on **and** the process runs with `--execute`. It is parsed and handed to one `pg.Pool` (max 2), and the field is deleted from the parsed object. It is held only in that pool's memory until shutdown (`pool.end()` in the process's `finally`). It is never logged, written, or put in argv or env.
+     - **Role pin:** the URL user must be `bulls96_babysitter_retention`; the ingest login is refused. The host must be the session pooler with the pinned CA. The connected `current_user` is checked before any other call.
+     - **Fixed call allowlist** (`ALLOWED_SQL`, enforced on every statement; anything else is refused unsent):
+       - `SELECT current_user::text AS c` (no arguments);
+       - `SELECT sessions.ingest_babysitter_retention_claim($1::jsonb) AS result` with `{generation, limit 1..200}`;
+       - `SELECT sessions.ingest_babysitter_retention_complete($1::jsonb) AS result` with `{generation, leaseToken, outcome: erased|released, versions}`.
+       The role itself can EXECUTE only those two functions.
+     - **Bounds:** statement and lock timeout 1.8 s, connect 1 s, pool max 2, claim 1..200, tick budget 45 s, lease 5 minutes (an erase starts with at least 2 minutes left and is cut at the lease end less 1 minute), interval at least 60 s.
+     - **Error sanitization:** codes only (SQLSTATE class or fixed names). No message, key, URL or id is logged.
+     - **Shutdown:** SIGINT and SIGTERM set the process's stop flag. The loop finishes its current tick, the sleep wakes within 1 s, and the pool is ended.
+     - **Dry run / no `--execute`:** without `--execute` the phase is **off**: no stdin read, no connection, no database or S3 write. `BABYSITTER_RETENTION_SWEEP=dry_run` with `--execute` claims and releases (lease and audit rows only) and never calls the eraser.
+   - A bounded tick every 10 minutes. It erases a bucket only with at least 2 minutes of lease left, and only the bucket's own directory `…/h=_babysitter/d=<date from the ref>/s=<bucket>/` (never a machine-wide listing). The erase is cut off at the lease end less a 1-minute margin, then released and re-claimed later; deletion by version id is idempotent.
+   - **A stalled S3 call that completes after its lease** can only remove objects that are themselves expired (their expiry rounds up to the bucket's past hour) or fenced (deleted session or older epoch). In those cases `complete` sees `write_seq` moved and keeps the bucket pending, and the next sweep erases what landed.
+   - **Residual:** if a session is re-enabled within that window, evidence written just after the re-enable could be lost early. That is retention-safe, but earlier than its expiry.
+   - It logs counts and codes only.
+   - **Erase/write fence:** a PUT happens only inside its own request, right after its registration. Registration is refused while a lease holds. A bucket is claimable only 15 minutes after its last registration, and no erase starts near the lease end. So no PUT can land under an erase.
+
+## Operator order
+
+Each step is the production lead's, with Khaliq's OK for the window, deploys and flips. No step is authorized by this document.
+
+0. **Read-only checks.**
+   - The census of Babysitter upserts already in mixed chunks.
+   - A bounded observation of the Neon cron (counts and codes only). The failing-cron finding is a **hypothesis** until observed.
+1. **Land in slot order:** #288 (040000), then #289 (041000), then this change (042000), dormant (both flags off, settings disabled). This change rebases onto #289. The E3 hook in `neon-s3-erasure/main.ts` composes with #289's stdin reader by adding `retentionDatabaseUrl` to its optional fields. If this change is ready first, it gets renumbered rather than landed out of order.
+2. **Schema-generation ceremony, in a window:**
+   1. regenerate the boundary (`bun scripts/sync-sessions-function-boundary.ts --check` clean);
+   2. take the new compiled generation from `derivedSchemaAssets()`;
+   3. apply 040000, 041000 and 042000 through the migrator (readers stay non-ready while the marker is `pending`);
+   4. the role-validation PASS for the new generation;
+   5. `ingest-generation-rebind`;
+   6. redeploy the ingest Worker, buffered GC and publication with the new `INGEST_EXPECT_GENERATION`;
+   7. set the same value for the E3 phase.
+   A stale generation is refused by `claim` and `complete` (55000).
+3. **HOLD:** first prove the effective deployed subrequest cap and set `INGEST_SUBREQUEST_CAP` (and `INGEST_SUBREQUEST_REDIRECTS` only if R is proven lower), and confirm the deployed Desktops isolate a 422. Then ingest `INGEST_BABYSITTER_RETENTION_ROUTING=on`. **Stop point:** new Babysitter upserts appear as one object per bucket with registry rows, the session and stage copies are stubs, and receipt and replay rates are unchanged.
+4. **Separate live credential-consumer decision** for the E3 retention login, then the operator steps `babysitter_retention_role.sql` and `babysitter_retention_verify.sql`. Then E3 phase `dry_run` (with `--execute`), plus `configure({"enabled":true,"dryRun":true})`. **Stop point:** the audit lists exactly the expected due buckets.
+5. E3 phase `on` (with `--execute`), plus `configure({"enabled":true,"dryRun":false})`. **Stop point:** buckets are `erased`, the audit reconciles, and an S3 version listing of an erased bucket is empty.
+6. Backlog cleanup, if step 0 finds any. That is a separate owner, review and OK; this change grants none.
+7. **Then**, and only once steps 3 to 5 are live and verified, RHC `NEON_JOB_BABYSITTER_EXPIRY=off`. A failing old job does not waive this replacement-before-disable gate.
+
+## Reader: Neon read parity (source only, default off)
+
+**Where:** `GET /v1/delivery/records` for `kind=session_lineage|turn_receipt`, inside the **existing** read API.
+- Code: `src/session-read-api/babysitter-evidence.ts`, a route in `app.ts`, deps in `packages/session-read-worker` (`READ_API_BABYSITTER_EVIDENCE=on`).
+- It reuses the worker's read-role connection and its `PIPELINE_RAW_S3_*` store: no new service, host or credential.
+- Without the flag it answers 501. Other kinds also answer 501: this backend serves only the Babysitter kinds.
+
+**Contract** (Neon's `listDelivery`):
+- filters `kind`, `source`, `session_id`, `include_deleted`, `cursor`, `limit` (1..100); unknown or repeated filters are 400;
+- ordered by (origin_id, record_id), with an opaque scope-bound cursor;
+- envelope `{protocolVersion: 1, listing: "live", records, nextCursor}` and Neon's record shape.
+
+**Visibility:**
+
+| Rule | Behaviour |
+|---|---|
+| Tenant | Org and workspace come from the verified token. The bucket and revision RPCs (`babysitter_evidence_*_for`) run as `bulls96_read_api` under the read API's binding (`session_directory_read_api_scope`); a missing or foreign binding is refused (42501). |
+| Expiry | `payload.expires_at_ms <= now` is unreadable. `include_deleted` returns a payload-free tombstone, as Neon's read-only predicate does. A bucket past its erase hour is not read at all, so nothing is readable after 30 days. |
+| Delete and reset (logical delete) | A bucket whose session fence epoch moved (any disable since its claim) or whose user reset is hidden **at once**, before any physical erase, and **stays hidden after a re-enable**. Erased buckets are never read. |
+| Supersession | The newest bucket line per (origin, record) wins. A committed newer revision (an update or a tombstone in `ingest_record_revisions`) hides it, or shows it as a tombstone with `include_deleted`. |
+
+## Re-enable safety (no loss, no resurrection)
+
+- **Bucket identity binds the claim's epochs.** It includes the session **fence epoch** taken from the claim attempt's snapshot (`ingest_claim_attempts.epochs`), plus the reset epoch. The fence epoch increments on every disable and survives re-enable (`ingest_fence_versions`).
+- **SQL issues the ref** and refuses (40001) a registration whose claimed session is fenced now. That includes a disable followed by a re-enable since the claim. So a pre-disable write never lands under a post-enable key.
+- **A fenced bucket stays fenced** (hidden and erasable) after a re-enable. New writes after the re-enable go to a **new** bucket that stays live.
+- **The erase deletes exactly a snapshot:**
+  1. list the bucket's object versions;
+  2. the **erase fence** (`ingest_babysitter_retention_fence`) checks that the lease is still held, with 30 s to spare, under the **current schema generation**;
+  3. delete exactly those versions.
+  Registration is refused while the lease holds, so the snapshot holds only pre-lease objects. A version written afterwards is never deleted, however late the deletes run.
+- Tests: disable → logical delete → re-enable (still hidden) → sweep → new writes kept and readable, pre-disable erased; a claim taken before a disable refused even after re-enable; a late writer survives the snapshot erase.
+
+## Generation fence
+
+Every evidence write (`register`) and every erase (`claim`, the erase `fence` before any delete, `complete`) requires the current compiled schema generation. A stale generation is refused even with a valid lease (55000), and the whole tick is refused at its claim. Routing is inactive without `INGEST_EXPECT_GENERATION`.
+
+**Rollback:**
+- **Operational:** set `configure({"enabled":false,"dryRun":true})` and turn both flags off. The registry and audit are kept.
+- **Schema rollback** (`supabase/rollbacks/20261105042000_babysitter_evidence_retention.down.sql`): refused while **any** bucket is registered (pending, leased or erased) or any erase is in the audit, and while a later migration is applied. A registered bucket is an S3 object only this registry knows to erase.
+- **The NOLOGIN role `bulls96_babysitter_retention` is kept** by the rollback, as every lane keeps its cluster roles (033000). Roles are cluster-wide, they are provisioned by the role bootstrap rather than by this migration, and the next migrate reapplies against the same role. With 042000 gone it can execute nothing. 042000 refuses a pre-existing role that can already log in (55000); LOGIN comes only from the operator step.
+
+## Decisions and open items
+
+- **Final Neon snapshot:** decided. Khaliq said "sure" to capping its retention at **31 days**.
+- **Backlog (open):** lines written before routing are in mixed chunks (canonical session chunks and canonical generations). They need a census first and, if any exist, an owner-run chunk rewrite.
