@@ -115,6 +115,7 @@ RETURNING id`;
 const SWEEP_SQL = `
 SELECT t.result_key FROM sessions.session_analysis_result_tickets AS t
  WHERE t.created_at < now() - make_interval(secs => $1::integer)
+   AND (t.lease_expires_at IS NULL OR t.lease_expires_at <= now())
    AND NOT EXISTS (SELECT 1 FROM sessions.session_analysis_jobs_v2 AS j
                     WHERE j.id = t.job_id AND j.status = 'completed' AND j.result_s3_key = t.result_key)
  ORDER BY t.created_at

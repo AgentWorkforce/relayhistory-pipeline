@@ -191,6 +191,23 @@ describe("analysis_request_v1", () => {
     }
   });
 
+  test("P2-a: the revision is injective (no separator collision) and P1-a: it signs manifest_etag", async () => {
+    const rev = async () =>
+      (await pg.query<{ r: string }>("SELECT sessions.session_analysis_source_revision($1, $2, $3) AS r", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.r;
+    // bucket 'x|y' + key 'z' vs bucket 'x' + key 'y|z' joined with '|' would sign alike.
+    await pg.query("UPDATE sessions.session_index SET bucket = 'x|y', manifest_key = 'z'");
+    const a = await rev();
+    await pg.query("UPDATE sessions.session_index SET bucket = 'x', manifest_key = 'y|z'");
+    expect(await rev()).not.toBe(a);
+    // NULL is a value: an absent etag differs from the empty one.
+    await pg.query("UPDATE sessions.session_index SET manifest_etag = NULL");
+    const none = await rev();
+    await pg.query("UPDATE sessions.session_index SET manifest_etag = ''");
+    expect(await rev()).not.toBe(none);
+    await pg.query("UPDATE sessions.session_index SET manifest_etag = '\"v2\"'");
+    expect(await rev()).not.toBe(none);
+  });
+
   test("the revision signs every canonicalSourceGeneration field", async () => {
     const rev = async () =>
       (await pg.query<{ r: string }>("SELECT sessions.session_analysis_source_revision($1, $2, $3) AS r", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.r;
@@ -407,6 +424,29 @@ describe("P0-2 erase-safe publication", () => {
     expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject })).toBe(1);
     expect(versions.get(out.key!)).toBe(0);
     expect((await pg.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
+  });
+
+  test("P1-c: a ticket under a live writer lease is never swept, however old", async () => {
+    await pg.query(
+      `INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, created_at, lease_expires_at)
+       VALUES ('k/leased', gen_random_uuid(), $1, $2, $3, 'publishing', now() - interval '1 day', now() + interval '5 minutes')`,
+      [KEY.orgId, KEY.workspaceId, KEY.sessionId],
+    );
+    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx })).toBe(0);
+    await pg.query("UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() - interval '1 second'");
+    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx })).toBe(1);
+  });
+
+  test("P1-a: the worker's database half never re-reads a manifest", async () => {
+    const { canonicalEvidenceDeps } = await import("../worker.ts");
+    const touched: string[] = [];
+    const store = new Proxy({}, { get: (_t, k) => () => { touched.push(String(k)); throw new Error("no manifest read expected"); } });
+    const deps = canonicalEvidenceDeps(
+      { query: async () => ({ rows: [{ free: true }] }) } as never,
+      { store: store as never, provider: "s3", bucket: "b", prefix: {}, decompress: (b: Uint8Array) => b },
+    );
+    expect(await deps.neonFree!({ orgId: "o", workspaceId: "w", sessionId: "s", source: "claude" })).toBe(true);
+    expect(touched).toEqual([]);
   });
 
   test("erasing a completed session tickets its result for deletion; a live result is never swept", async () => {

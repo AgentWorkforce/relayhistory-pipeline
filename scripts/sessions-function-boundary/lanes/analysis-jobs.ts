@@ -34,7 +34,7 @@ export const analysisJobs: LaneManifest = {
     "sessions.session_analysis_v2_forget()": { secdef: true, grants: [] },
     "sessions.session_analysis_admit_scope(text,text)": { secdef: false, grants: [] },
     "sessions.session_analysis_source_revision(text,text,text)": { secdef: false, grants: ["service_role"] },
-    "sessions.session_analysis_neon_free(text,text,text)": { secdef: false, grants: ["service_role"] },
+    "sessions.session_analysis_neon_free(text,text,text)": { secdef: true, grants: ["service_role"] },
   },
   replaces: {},
 };

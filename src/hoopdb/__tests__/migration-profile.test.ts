@@ -2975,6 +2975,10 @@ describe("lane F1 (20261105046000) under the dedicated runtime role", () => {
     expect(await store.complete({ job, output, stored: { key, sha256, bytes: bytes.length } })).toBe(true);
     await db.query("UPDATE sessions.session_index SET deleted_at = now()");
     expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: (work) => work(runtime as never) })).toBe(1);
+    // P0-b: the never-in-Neon proof is callable as the runtime role (SECURITY DEFINER) without
+    // the runtime role reading the frozen custody tables itself.
+    expect((await runtime.query<{ f: boolean }>("SELECT sessions.session_analysis_neon_free('o', 'w', 's') AS f")).rows[0]!.f).toBe(false);
+    await expect(runtime.query("SELECT count(*) FROM sessions.ingest_frozen_source_records")).rejects.toThrow(/permission denied/);
     // The runtime role is exactly the reviewed surface: no TRUNCATE, no ownership.
     const p = (await db.query<{ t: boolean }>("SELECT has_table_privilege('g6_rt', 'sessions.session_analysis_jobs_v2', 'TRUNCATE') AS t")).rows[0]!;
     expect(p.t).toBe(false);
@@ -2987,5 +2991,12 @@ describe("lane F1 (20261105046000) under the dedicated runtime role", () => {
     await db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"));
     await db.exec("GRANT SELECT ON sessions.session_analysis_jobs_v2 TO bulls96_analysis_admit");
     expect((await failure(db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"))))?.code).toBe("55000");
+    await db.exec("REVOKE SELECT ON sessions.session_analysis_jobs_v2 FROM bulls96_analysis_admit");
+    await db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"));
+    // P2-b: a read-only default (or any other setting) fails the verifier.
+    await db.exec("ALTER ROLE bulls96_analysis_admit SET default_transaction_read_only = on");
+    expect((await failure(db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"))))?.message).toMatch(/role settings/);
+    await db.exec(sql("supabase/bootstrap/session_analysis_admit_role.sql"));
+    await db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"));
   });
 });

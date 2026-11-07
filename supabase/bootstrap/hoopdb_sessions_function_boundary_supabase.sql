@@ -212,6 +212,7 @@ DECLARE
     'sessions.route_session_large_read(text,text,text,text)',
     'sessions.search_session_directory(text,text,text,text,text,boolean,text,text,text,text,text,timestamp with time zone,timestamp with time zone,text,timestamp with time zone,text,text,text,integer)',
     'sessions.session_analysis_cache_demand(text,text,text,text,boolean)',
+    'sessions.session_analysis_neon_free(text,text,text)',
     'sessions.session_analysis_v2_forget()',
     'sessions.session_brief(text,text,text)',
     'sessions.session_brief_document_authority(text,text[],text[])',

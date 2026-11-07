@@ -59,6 +59,7 @@ import {
   pipelineBucketStatements,
   pipelineKeyStatement,
   pipelineAnalysisKeyStatement,
+  ANALYSIS_RESULT_OBJECT_GLOB,
   sessionPipelineFunction,
   sessionPipelineWiring,
   type SessionPipelineInputs,
@@ -1133,7 +1134,7 @@ export function trailLifecycleRules() {
  * including `aws:kms` without a key id (S3 would use `aws/s3`). SSE-C is blocked
  * separately by the encryption configuration.
  */
-export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string }) {
+export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; analysisDeleterArn?: string }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId ?? "");
   return [
     ...denyInsecureTransport(i.bucketArn),
@@ -1145,14 +1146,36 @@ export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; e
       Resource: [i.bucketArn, `${i.bucketArn}/*`],
       Condition: { NumericLessThan: { "s3:TlsVersion": "1.2" } },
     },
-    {
-      Sid: "OnlyTheEraserDeletes",
-      Effect: "Deny" as const,
-      Principal: "*",
-      Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
-      Resource: [`${i.bucketArn}/*`],
-      Condition: { ArnNotEquals: { "aws:PrincipalArn": i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn } },
-    },
+    // Lane F1 (analysisJobs on): the session-analysis worker (the pipeline role) erases its own
+    // result objects, so the eraser-only deny excludes exactly that object root, and a second
+    // deny on that root alone exempts the eraser, the buffered GC and the pipeline role.
+    i.analysisDeleterArn
+      ? {
+          Sid: "OnlyTheEraserDeletes",
+          Effect: "Deny" as const,
+          Principal: "*",
+          Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+          NotResource: [`${i.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`],
+          Condition: { ArnNotEquals: { "aws:PrincipalArn": i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn } },
+        }
+      : {
+          Sid: "OnlyTheEraserDeletes",
+          Effect: "Deny" as const,
+          Principal: "*",
+          Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+          Resource: [`${i.bucketArn}/*`],
+          Condition: { ArnNotEquals: { "aws:PrincipalArn": i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn } },
+        },
+    ...(i.analysisDeleterArn
+      ? [{
+          Sid: "OnlyTheEraserOrAnalysisWorkerDeletesAnalysisResults",
+          Effect: "Deny" as const,
+          Principal: "*",
+          Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+          Resource: [`${i.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`],
+          Condition: { ArnNotEquals: { "aws:PrincipalArn": [i.eraserArn, ...(i.bufferedGcRoleArn ? [i.bufferedGcRoleArn] : []), i.analysisDeleterArn] } },
+        }]
+      : []),
     {
       Sid: "DenyOtherEncryption",
       Effect: "Deny" as const,
@@ -1508,7 +1531,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       publicAccessBlock: PUBLIC_ACCESS_BLOCK,
       objectOwnership: "BucketOwnerEnforced",
       policy: [
-        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn }),
+        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn, ...(pipelineRoleArn && pipeline?.analysisJobs?.enabled ? { analysisDeleterArn: pipelineRoleArn } : {}) }),
         ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn, analysisResults: pipeline?.analysisJobs?.enabled === true }) : []),
       ] as never,
       lifecycleRules: transcriptLifecycleRules() as never,
