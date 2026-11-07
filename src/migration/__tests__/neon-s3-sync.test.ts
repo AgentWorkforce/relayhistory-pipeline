@@ -45,7 +45,7 @@ import { Syncer, DEFAULT_SYNC_CONFIG } from "../neon-s3-sync/sync.ts";
 import { Throttle, parseWindows } from "../neon-s3-sync/throttle.ts";
 
 // These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
-process.env.S3X_OBLIGATIONS = "on";
+process.env.S3X_OBLIGATIONS ??= "on";
 
 const dirs: string[] = [];
 afterAll(async () => {
@@ -1209,7 +1209,8 @@ describe("SSE-KMS key id (sessions-prod bucket policy)", () => {
  * publish-first claim refuses the reservation; never a manifest referencing an erased version. The manifest PUT is an
  * obligation too: an unknown outcome stays tracked.
  */
-describe("exporter publication vs E3 reservation (real exportUnit)", () => {
+// The obligation protocol (S3X_OBLIGATIONS on) only: the claim / reservation interlock does not exist when off.
+describe.skipIf(process.env.S3X_OBLIGATIONS !== "on")("exporter publication vs E3 reservation (real exportUnit)", () => {
   async function world() {
     const { store } = await countingStore();
     const st = attestedState(join(await tempDir(), "s.sqlite"));

@@ -8,7 +8,6 @@ import { expect, test } from "bun:test";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { obligationsEnabled } from "../neon-s3-erasure/main.ts";
@@ -46,16 +45,12 @@ test("OFF (the default): no obligation schema, triggers, genesis or lease genera
   expect(names.some((n) => n.includes("_touch_"))).toBe(false);
 });
 
-test("OFF: the base schema statement is byte-identical to main 341dd5a9 (#289 merged)", async () => {
-  const root = new URL("../../../", import.meta.url).pathname;
-  let base: string;
-  try {
-    base = execFileSync("git", ["show", "341dd5a9:src/migration/neon-s3-sync/state.ts"], { cwd: root, encoding: "utf8" });
-  } catch {
-    return; // a shallow checkout without the base commit
-  }
-  const cut = (x: string) => x.slice(x.indexOf('this.db.exec("PRAGMA journal_mode'), x.indexOf("CREATE INDEX IF NOT EXISTS groups_last"));
-  expect(cut(await readFile(join(root, "src/migration/neon-s3-sync/state.ts"), "utf8"))).toBe(cut(base));
+test("OFF: the base schema statement is byte-identical to main 341dd5a9 (#289 merged), pinned by digest (no git needed)", async () => {
+  const { createHash } = await import("node:crypto");
+  const src = await readFile(new URL("../neon-s3-sync/state.ts", import.meta.url), "utf8");
+  const cut = src.slice(src.indexOf('this.db.exec("PRAGMA journal_mode'), src.indexOf("CREATE INDEX IF NOT EXISTS groups_last"));
+  // sha256 of exactly that span in main 341dd5a9's src/migration/neon-s3-sync/state.ts.
+  expect(createHash("sha256").update(cut).digest("hex")).toBe("01af58f5a8c87bd748930abfc15548be192a0993c00262a2b3fcf0514ba89420");
 });
 
 test("ON: the obligation schema, triggers, lease generations and an unattested genesis", async () => {
