@@ -276,5 +276,13 @@
     "nestedCapture": "disabled_track_top",
     "functionCapture": "disabled_track_none",
     "configurationChanged": false
+  },
+  "postWindowLockWaitSamples": {
+    "status": "FIVE_READONLY_SAMPLES_COMPLETED",
+    "rawReceipt": "post-window-lockwait-final-five-results.json",
+    "sha256": "93e2e59a34b6fb08c6908b6152a41a625494ff06287aeab609e73fbae6792b4f",
+    "sqlSha256": "2486bf707ef7b415d73313375a7f381f68179144d0ef51491a6c23a8a13ea1da",
+    "observed": "ingest-to-ingest blocking; receipt-seat-clock relation context; active claim DataFileRead near5s",
+    "unproven": "per-user-only root cause, complete503cause, backlog decay or full recovery"
   }
 }

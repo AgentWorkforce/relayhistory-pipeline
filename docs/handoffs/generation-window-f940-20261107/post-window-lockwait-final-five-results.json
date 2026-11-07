@@ -1,0 +1,213 @@
+{
+  "kind": "five_bounded_lockwait_readonly_samples",
+  "startedAt": "2026-11-07T23:09:02.937366+00:00",
+  "updatedAt": "2026-11-07T23:09:45.840188+00:00",
+  "sqlSha256": "2486bf707ef7b415d73313375a7f381f68179144d0ef51491a6c23a8a13ea1da",
+  "samples": [
+    {
+      "sample": 1,
+      "exitCode": 0,
+      "result": {
+        "kind": "ingest_lockwait_attribution_readonly",
+        "sample": 1,
+        "startedAt": "2026-11-07T23:09:04.652Z",
+        "completedAt": "2026-11-07T23:09:05.873Z",
+        "aggregated": {
+          "blockerGroups": [],
+          "longTransactionGroups": [],
+          "relationContextGroups": [],
+          "limitsReached": {
+            "blockerGroups": false,
+            "longTransactionRows": false,
+            "relationContextGroups": false
+          },
+          "longTransactionRowsObserved": 0
+        },
+        "sqlSha256": "2486bf707ef7b415d73313375a7f381f68179144d0ef51491a6c23a8a13ea1da",
+        "productionWrites": false,
+        "automaticRetry": false
+      },
+      "stderrPresent": false
+    },
+    {
+      "sample": 2,
+      "exitCode": 0,
+      "result": {
+        "kind": "ingest_lockwait_attribution_readonly",
+        "sample": 2,
+        "startedAt": "2026-11-07T23:09:14.629Z",
+        "completedAt": "2026-11-07T23:09:15.749Z",
+        "aggregated": {
+          "blockerGroups": [
+            {
+              "waiter_role": "bulls96_session_ingest",
+              "wait_event_type": "Lock",
+              "wait_event": "transactionid",
+              "blocker_role": "bulls96_session_ingest",
+              "blocker_state": "active",
+              "blocker_query_md5": "f9309f80043d",
+              "waiters": "2",
+              "blocking_edges": "2",
+              "max_waiter_query_age": {
+                "milliseconds": 130.654
+              },
+              "blocker_xact_age": {
+                "milliseconds": 152.601
+              }
+            },
+            {
+              "waiter_role": "bulls96_session_ingest",
+              "wait_event_type": "Lock",
+              "wait_event": "tuple",
+              "blocker_role": "bulls96_session_ingest",
+              "blocker_state": "active",
+              "blocker_query_md5": "f9309f80043d",
+              "waiters": "1",
+              "blocking_edges": "1",
+              "max_waiter_query_age": {
+                "milliseconds": 98.595
+              },
+              "blocker_xact_age": {
+                "milliseconds": 130.751
+              }
+            }
+          ],
+          "longTransactionGroups": [],
+          "relationContextGroups": [
+            {
+              "relation": "sessions.ingest_receipt_seat_clock",
+              "mode": "AccessExclusiveLock",
+              "granted": false,
+              "n": "1"
+            }
+          ],
+          "limitsReached": {
+            "blockerGroups": false,
+            "longTransactionRows": false,
+            "relationContextGroups": false
+          },
+          "longTransactionRowsObserved": 0
+        },
+        "sqlSha256": "2486bf707ef7b415d73313375a7f381f68179144d0ef51491a6c23a8a13ea1da",
+        "productionWrites": false,
+        "automaticRetry": false
+      },
+      "stderrPresent": false
+    },
+    {
+      "sample": 3,
+      "exitCode": 0,
+      "result": {
+        "kind": "ingest_lockwait_attribution_readonly",
+        "sample": 3,
+        "startedAt": "2026-11-07T23:09:24.584Z",
+        "completedAt": "2026-11-07T23:09:25.664Z",
+        "aggregated": {
+          "blockerGroups": [
+            {
+              "waiter_role": "bulls96_session_ingest",
+              "wait_event_type": "Lock",
+              "wait_event": "transactionid",
+              "blocker_role": "bulls96_session_ingest",
+              "blocker_state": "active",
+              "blocker_query_md5": "dc33447203e4",
+              "waiters": "1",
+              "blocking_edges": "1",
+              "max_waiter_query_age": {
+                "seconds": 1,
+                "milliseconds": 542.473
+              },
+              "blocker_xact_age": {
+                "seconds": 1,
+                "milliseconds": 762.799
+              }
+            }
+          ],
+          "longTransactionGroups": [],
+          "relationContextGroups": [],
+          "limitsReached": {
+            "blockerGroups": false,
+            "longTransactionRows": false,
+            "relationContextGroups": false
+          },
+          "longTransactionRowsObserved": 0
+        },
+        "sqlSha256": "2486bf707ef7b415d73313375a7f381f68179144d0ef51491a6c23a8a13ea1da",
+        "productionWrites": false,
+        "automaticRetry": false
+      },
+      "stderrPresent": false
+    },
+    {
+      "sample": 4,
+      "exitCode": 0,
+      "result": {
+        "kind": "ingest_lockwait_attribution_readonly",
+        "sample": 4,
+        "startedAt": "2026-11-07T23:09:34.567Z",
+        "completedAt": "2026-11-07T23:09:35.670Z",
+        "aggregated": {
+          "blockerGroups": [],
+          "longTransactionGroups": [],
+          "relationContextGroups": [],
+          "limitsReached": {
+            "blockerGroups": false,
+            "longTransactionRows": false,
+            "relationContextGroups": false
+          },
+          "longTransactionRowsObserved": 0
+        },
+        "sqlSha256": "2486bf707ef7b415d73313375a7f381f68179144d0ef51491a6c23a8a13ea1da",
+        "productionWrites": false,
+        "automaticRetry": false
+      },
+      "stderrPresent": false
+    },
+    {
+      "sample": 5,
+      "exitCode": 0,
+      "result": {
+        "kind": "ingest_lockwait_attribution_readonly",
+        "sample": 5,
+        "startedAt": "2026-11-07T23:09:44.531Z",
+        "completedAt": "2026-11-07T23:09:45.671Z",
+        "aggregated": {
+          "blockerGroups": [],
+          "longTransactionGroups": [
+            {
+              "role": "bulls96_session_ingest",
+              "state": "active",
+              "waitEventType": "IO",
+              "waitEvent": "DataFileRead",
+              "queryFingerprint": "dc33447203e4",
+              "transactions": 1,
+              "maxTransactionAgeSeconds": 4.857015
+            },
+            {
+              "role": "bulls96_session_ingest",
+              "state": "active",
+              "waitEventType": "IO",
+              "waitEvent": "DataFileRead",
+              "queryFingerprint": "03283919063e",
+              "transactions": 1,
+              "maxTransactionAgeSeconds": 4.857015
+            }
+          ],
+          "relationContextGroups": [],
+          "limitsReached": {
+            "blockerGroups": false,
+            "longTransactionRows": false,
+            "relationContextGroups": false
+          },
+          "longTransactionRowsObserved": 2
+        },
+        "sqlSha256": "2486bf707ef7b415d73313375a7f381f68179144d0ef51491a6c23a8a13ea1da",
+        "productionWrites": false,
+        "automaticRetry": false
+      },
+      "stderrPresent": false
+    }
+  ],
+  "automaticRetry": false,
+  "productionWrites": false
+}

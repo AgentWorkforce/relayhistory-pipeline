@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "at": "2026-11-07T23:05:42.256411+00:00",
+  "at": "2026-11-07T23:10:42.106561+00:00",
   "kind": "approved_window_and_forward_fix_sources_receipts",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
   "readiness": "G2_WINDOW_VERIFIED_ACCEPTANCE_RESUMED_INTERMITTENT_CLAIM_TIMEOUTS_REMAIN",
@@ -47,8 +47,8 @@
     },
     {
       "name": "approved-window-current-status.md",
-      "bytes": 4822,
-      "sha256": "3ffba27382913b905ede651600cdfeb703144ed6d2c2c2d1064e6a27cf74d232"
+      "bytes": 5252,
+      "sha256": "52b9572d1530b18d3c92f7e5b2c97e074e724138fbff7590e5f8bee1f8a3095d"
     },
     {
       "name": "approved-window-gc-executor-answer.md",
@@ -152,8 +152,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 12886,
-      "sha256": "b405235321403a403f7398db73a4d9489e03397f682f5fd77ffa603d08bd8f68"
+      "bytes": 13415,
+      "sha256": "0f093e9ddb38c66a355f1afb12c09dd4970c5ed5ff1ddbd6a56580e818b4cb51"
     },
     {
       "name": "fixed-role-inventory-readonly.ts.txt",
@@ -182,8 +182,8 @@
     },
     {
       "name": "forward-fix-evidence-index.md",
-      "bytes": 1464,
-      "sha256": "0a538dcb43b7d90b55257528b49dff6cee8442f36ba416163021a2c552bae613"
+      "bytes": 1754,
+      "sha256": "4f2ded198e01176da4e177649245f84fb4de83fa5eb67e7bfcec06b16d299468"
     },
     {
       "name": "forward-fix-guard-v3.ts.txt",
@@ -244,6 +244,11 @@
       "name": "g2-f940-upload-map-offline-replay-proof-20261107.json",
       "bytes": 2114,
       "sha256": "4fc9bd57773ec1d1bb1e76b74da061894dfa6decdc31a7aee33be9515eebede7"
+    },
+    {
+      "name": "g2-ingest-rpc-query-md5-metadata-map-20261107.json",
+      "bytes": 2334,
+      "sha256": "a5cc12c4cdd59e2a5ca57b178966ce83bcdeb0ae6036e22a4c62aaf7f40271fb"
     },
     {
       "name": "gc-last-retained-code-update-receipt.json",
@@ -349,6 +354,26 @@
       "name": "post-window-claim-stats-summary.md",
       "bytes": 1724,
       "sha256": "bab08c79cbd46d8f31214f7aad86c328acfbd7a6e79d80b82ddf78caa7bd42eb"
+    },
+    {
+      "name": "post-window-lockwait-final-five-labeled.json",
+      "bytes": 7324,
+      "sha256": "ca34727eccdd868f892e72e9c2f0a03c87a9661ccae718fc862baba27b45cf7c"
+    },
+    {
+      "name": "post-window-lockwait-final-five-results.json",
+      "bytes": 6929,
+      "sha256": "93e2e59a34b6fb08c6908b6152a41a625494ff06287aeab609e73fbae6792b4f"
+    },
+    {
+      "name": "post-window-lockwait-final-five-summary.md",
+      "bytes": 2984,
+      "sha256": "64f8ebcadf8d4d968b26af2b7861223a893a4c00ad51be58b47022dd46d77925"
+    },
+    {
+      "name": "post-window-lockwait-final-readonly.ts.txt",
+      "bytes": 6999,
+      "sha256": "acbb34e6a7b4a6b9aa4d2dd8d25d51b4db45caa056d15e7f3c123bc0e76d347e"
     },
     {
       "name": "publisher-activity-observation.md",
