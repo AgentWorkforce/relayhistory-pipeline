@@ -67,5 +67,20 @@ export function maskedProjection(
   }).rows;
   const direct = admitted.filter((r) => r.kind === CONVERGENCE_EVENT_KIND)
     .map((r) => directRow(r, scope.source)).filter((r): r is PrEvidenceProjectionRow => r !== null);
-  return [...projected, ...direct];
+  // The reader's single-row winner rule (canonical-projection.ts readCanonicalScope: direct groups
+  // first, the activity group last, byKey/metadataByKey.set): for one canonical event identity
+  // (machine_id, source, kind, event_id) the delivery/activity row overwrites the direct row, as
+  // Neon's one-row primary key does. Catalog rows are kept as they are.
+  const winners = new Map<string, PrEvidenceProjectionRow>();
+  const catalog: PrEvidenceProjectionRow[] = [];
+  for (const r of [...direct, ...projected]) {
+    if (r.table !== "convergence_events") { catalog.push(r); continue; }
+    winners.set(canonicalEventKey(r.row), r);
+  }
+  return [...catalog, ...winners.values()];
+}
+
+/** readCanonicalScope's keyOf: [machine_id, source, kind, event_id] joined by U+001F. */
+export function canonicalEventKey(row: Record<string, unknown>): string {
+  return [String(row.machine_id), String(row.source), String(row.kind), String(row.event_id)].join("\u001f");
 }

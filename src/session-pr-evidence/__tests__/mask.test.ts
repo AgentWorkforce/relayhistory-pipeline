@@ -101,3 +101,19 @@ test("direct/delivery projected-key collision (machine_id = deliveryMachine(W, O
   expect(numbers(leakedByKey as PrEvidenceProjectionRow[])).toEqual(["https://github.com/acme/repo/pull/9"]);
   expect(numbers(maskedProjection({ records }, scope, mask))).toEqual([]);
 });
+
+test("all four admitted with matching canonical identities: the reader's winner rule keeps only the delivery rows (PR #9)", () => {
+  const O = "origin-o", M = deliveryMachine(scope.workspaceId, O);
+  const r1 = rec("tool_call", { name: "Bash", tool_use_id: "t9", args_json: JSON.stringify({ command: "gh pr create" }), is_error: 0, ts_ms: T }, { origin_id: O, record_id: "r1" });
+  const r2 = rec("session_event", { role: "tool_result", kind: "tool_result", tool_use_id: "t9", text: "https://github.com/acme/repo/pull/9", ts_ms: T + 1 }, { origin_id: O, record_id: "r2" });
+  // Direct lines with the SAME (machine_id, source, kind, event_id) as the delivery rows, carrying PR #5.
+  const d1 = directCall(M, `${M}:r1`, "t5"), d2 = directResult(M, `${M}:r2`, "t5", 5);
+  const delivery = normalizeRelayhistoryRecords([r1, r2]);
+  const projected = projectRelayhistorySession(delivery, { ...scope, machineId: "m", userId: "u" }).rows;
+  expect(projected.map((r) => [r.row.kind, r.row.event_id])).toEqual([["tool_call", `${M}:r1`], ["session_event", `${M}:r2`]]);
+  const records = [...delivery, d1, d2];
+  const mask: HistoryMask = new Map([["r1", null], ["r2", null], [`${M}:r1`, null], [`${M}:r2`, null]]);
+  expect(maskRecords(records, mask)).toHaveLength(4);
+  // cf225368 concatenated both classes and emitted #9 AND #5; the reader (and Neon's one-row PK) yields only #9.
+  expect(numbers(maskedProjection({ records }, scope, mask))).toEqual(["https://github.com/acme/repo/pull/9"]);
+});
