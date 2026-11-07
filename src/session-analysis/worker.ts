@@ -1,9 +1,12 @@
 /**
  * The session-analysis tick: claim up to `batch` due analysis jobs and run each one
  * (relayhistory worker.ts runSessionAnalysisTick, kind "analysis"). Off unless
- * SESSION_ANALYSIS_ENABLED=true and a model transport is configured, so wiring it into a
- * runtime changes nothing on its own. The runtime wiring (Lambda + one-minute EventBridge
- * tick, OPENAI_API_KEY from Secrets Manager) is a later, separately approved change.
+ * SESSION_ANALYSIS_ENABLED=true and a model transport is configured. Runtime: the session
+ * pipeline Lambda's `{"sessionAnalysis": true}` invocation (src/session-pipeline/lambda.ts),
+ * driven by the stack's one-minute `session-analysis-job-schedule`, DISABLED unless
+ * `transcriptStore.sessionPipeline.analysisJobs.enabled`. The model key is the pipeline
+ * secret's `openai_api_key` only (operator-loaded from 1Password; never on disk). Each tick
+ * first sweeps orphan publication tickets (store.ts sweepAnalysisTickets).
  *
  * Evidence comes from the trusted producer read of the canonical scope; the pointer and
  * harness reads use the worker's own HoopDb connection, never caller input.
@@ -21,19 +24,29 @@ import { SESSION_POINTERS_SQL } from "../session-read-api/session-timing-source.
 import type { AnalysisModelTransport } from "./engine/model.ts";
 import type { AnalysisEvidenceDeps } from "./evidence.ts";
 import { runAnalysisJob } from "./processor.ts";
-import { postgresAnalysisJobStore } from "./store.ts";
+import { postgresAnalysisJobStore, sweepAnalysisTickets } from "./store.ts";
 
 export interface AnalysisConfig {
   enabled: boolean;
   batch: number;
   leaseSeconds: number;
+  /** SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS=true: analyze scopes without the export's coverage marker. */
+  assumeNoLegacyTurns: boolean;
 }
 
-/** SESSION_ANALYSIS_ENABLED ("true" only), SESSION_ANALYSIS_BATCH (1-20, default 2). */
+/**
+ * SESSION_ANALYSIS_ENABLED ("true" only), SESSION_ANALYSIS_BATCH (1-20, default 2),
+ * SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS ("true" only; default off).
+ */
 export function analysisConfig(env: NodeJS.ProcessEnv = process.env): AnalysisConfig {
   const raw = env.SESSION_ANALYSIS_BATCH?.trim() ?? "";
   const batch = /^\d{1,2}$/.test(raw) && Number(raw) >= 1 && Number(raw) <= 20 ? Number(raw) : 2;
-  return { enabled: env.SESSION_ANALYSIS_ENABLED === "true", batch, leaseSeconds: 600 };
+  return {
+    enabled: env.SESSION_ANALYSIS_ENABLED === "true",
+    batch,
+    leaseSeconds: 600,
+    assumeNoLegacyTurns: env.SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS === "true",
+  };
 }
 
 const hex = (value: unknown) =>
@@ -66,7 +79,7 @@ export function canonicalEvidenceDeps(
     },
     async snapshot(identity) {
       const snap = await canonicalProducerSnapshot(deps, identity);
-      return { exists: snap.exists, generation: snap.generation, rows: snap.rows };
+      return { exists: snap.exists, generation: snap.generation, legacyCoverage: snap.legacyCoverage, rows: snap.rows };
     },
     async anchorManifestKey(identity) {
       const first = (await pointers(db, identity))[0];
@@ -82,6 +95,8 @@ export function analysisTick(deps: {
   store: ObjectStore;
   canonical: Omit<CanonicalDeps, "pointers">;
   transport: AnalysisModelTransport | null;
+  /** One HoopDb transaction (the pipeline's `transaction(db, work)`); absent = no sweep. */
+  transact?: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
 }) {
   return async (): Promise<Record<string, number>> => {
     const counts: Record<string, number> = { completed: 0, failed: 0, "lease-lost": 0, idle: 0 };
@@ -94,8 +109,14 @@ export function analysisTick(deps: {
       anchorManifestKey: (job, harness) =>
         evidence.anchorManifestKey({ orgId: job.orgId, workspaceId: job.workspaceId, source: harness, sessionId: job.sessionId }),
     });
+    // Orphan publications first (erased, lost or crashed): their objects never outlive a tick.
+    if (deps.transact) counts.swept = await sweepAnalysisTickets(deps.store, { transact: deps.transact });
     for (let i = 0; i < deps.config.batch; i += 1) {
-      const outcome = await runAnalysisJob(store, { evidence, transport: deps.transport }, { leaseSeconds: deps.config.leaseSeconds });
+      const outcome = await runAnalysisJob(
+        store,
+        { evidence, transport: deps.transport, assumeNoLegacyTurns: deps.config.assumeNoLegacyTurns },
+        { leaseSeconds: deps.config.leaseSeconds },
+      );
       counts[outcome] = (counts[outcome] ?? 0) + 1;
       if (outcome === "idle") break;
     }

@@ -62,6 +62,8 @@ import {checkedAnalysisCursor,reconcileAnalysisPage} from "./analysis-reconcile.
 import {analysisRefreshTick,enqueueAnalysisScope,type AnalysisRefreshDeps} from "./analysis-refresh.ts";
 import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.ts";
 import { briefTick } from "../session-brief/worker.ts";
+import { analysisConfig, analysisTick } from "../session-analysis/worker.ts";
+import { zstdDecompressSync } from "node:zlib";
 import{derivedSchemaAssets}from "./derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import {runSemanticCopyTick,semanticFailureReason} from "../search-features/semantic-copy-job.ts";
@@ -232,6 +234,8 @@ export interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
   brief: ReturnType<typeof briefTick>;
+  /** Session analysis jobs (lane F1); claims nothing unless enabled AND a model key is set. */
+  sessionAnalysis: ReturnType<typeof analysisTick>;
   store: ReturnType<typeof createS3Store>;
   /** Raw, unvalidated secret field; see analysisDeps(). */
   analysisSourceUrl?: unknown;
@@ -334,11 +338,26 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
     config: briefConfig(),
   });
+  // Session analysis (lane F1): the same secret-only model key; no key = no claim.
+  const sessionAnalysis = analysisTick({
+    config: analysisConfig(),
+    db,
+    store,
+    canonical: {
+      store,
+      provider: "s3",
+      bucket: env.bucket,
+      prefix: bindings,
+      decompress: (bytes, maxBytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: maxBytes })),
+    },
+    transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
+    transact: (work) => transaction(db, work),
+  });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
   // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
   const semanticSecret = env.semanticCopyEnabled ? { hoopdbUrl: secret.hoopdb_url, clickhouse: secret.clickhouse, sourceUrl: secret.analysis_source_readonly_url } : undefined;
   // Neon-exit: the readonly source URL is dropped here, so no later branch can build its pool.
-  return { env, deps, brief, store, analysisSourceUrl: env.neonExit ? undefined : secret.analysis_source_readonly_url, semanticSecret };
+  return { env, deps, brief, sessionAnalysis, store, analysisSourceUrl: env.neonExit ? undefined : secret.analysis_source_readonly_url, semanticSecret };
 }
 
 /**
@@ -613,6 +632,20 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       return { ok: true };
     } catch (error) {
       log.error("session brief tick failed", { stage: "session-brief", ...errorFields(error), duration_ms: Date.now() - started });
+      return { ok: false };
+    }
+  }
+  if (event?.sessionAnalysis === true) {
+    // Off: return before init (no secret read, no pool), as the brief tick does.
+    if (!analysisConfig().enabled) return { ok: true };
+    const started = Date.now();
+    try {
+      const rt = await ready();
+      const counts = await rt.sessionAnalysis();
+      log.info("session analysis tick", { stage: "session-analysis", count: counts.completed ?? 0, failed: counts.failed ?? 0, skipped: counts["lease-lost"] ?? 0, duration_ms: Date.now() - started });
+      return { ok: (counts.failed ?? 0) === 0 };
+    } catch (error) {
+      log.error("session analysis tick failed", { stage: "session-analysis", ...errorFields(error), duration_ms: Date.now() - started });
       return { ok: false };
     }
   }

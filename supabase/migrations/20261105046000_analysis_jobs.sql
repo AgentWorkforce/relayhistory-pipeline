@@ -22,9 +22,17 @@
 -- 30 minutes is reused (relayhistory 0024 collect: "defers its analysis").
 --
 -- Functions:
---   sessions.analysis_request_v1(org, workspace, user, session)  SECURITY DEFINER, owner-only
---     EXECUTE here. The admission principal (read Worker, separate role, F1 map F1.4) is
---     granted in a later reviewed change once the SP owner places it.
+--   sessions.analysis_request_v1(org, workspace, user, session)  SECURITY DEFINER, EXECUTE
+--     bulls96_analysis_admit only: the read Lambda's separate admission principal (NOLOGIN
+--     until its operator step; provisioned before migrate by session_read_api_roles.sql).
+--     The tenant must equal the transaction's bound bulls96_read.* settings (the verified
+--     assertion), as session_directory_read_api_scope pins the read role.
+--   sessions.session_analysis_source_revision(org, workspace, session)  the live pointer-set
+--     revision (sha256 over the live pointers); reuse and publication compare it.
+--   sessions.session_analysis_result_tickets  erase-safe publication: a ticket is recorded
+--     (lease + liveness + revision checked) before a result object is written and retired
+--     with the completion; the forget trigger tickets every result key it orphans; the
+--     worker's sweeper deletes the object of an orphan or expired ticket.
 --   sessions.analysis_read_v1(workspace, session)  SECURITY DEFINER, EXECUTE bulls96_read_api;
 --     the tenant comes from sessions.session_directory_read_api_scope (034000).
 --   sessions.session_analysis_v2_forget()  erasure trigger (session_briefs_forget pattern).
@@ -56,6 +64,8 @@ CREATE TABLE sessions.session_analysis_jobs_v2 (
   source_fingerprint text CHECK (char_length(source_fingerprint) BETWEEN 1 AND 2048),
   -- canonicalSourceGeneration of the pointer set the evidence was read from.
   source_generation text CHECK (source_generation ~ '^[0-9a-f]{64}$'),
+  -- session_analysis_source_revision at claim; equal at reserve and completion.
+  source_revision text CHECK (source_revision ~ '^[0-9a-f]{64}$'),
   result_s3_key text CHECK (char_length(result_s3_key) BETWEEN 1 AND 1024),
   result_sha256 text CHECK (result_sha256 ~ '^[0-9a-f]{64}$'),
   result_bytes integer CHECK (result_bytes BETWEEN 1 AND 8388608),
@@ -112,9 +122,61 @@ REVOKE ALL ON sessions.session_analysis_jobs_v2, sessions.session_analysis_reque
   FROM PUBLIC, anon, authenticated;
 GRANT ALL ON sessions.session_analysis_jobs_v2, sessions.session_analysis_requests_v2 TO service_role;
 
+-- Erase-safe publication tickets. Not deleted by erasure: they are how the sweeper finds
+-- an object written for (or orphaned by) a forgotten session.
+CREATE TABLE sessions.session_analysis_result_tickets (
+  result_key text PRIMARY KEY CHECK (char_length(result_key) BETWEEN 1 AND 1024),
+  job_id uuid NOT NULL,
+  org_id text NOT NULL,
+  workspace_id text NOT NULL,
+  session_id text NOT NULL,
+  reason text NOT NULL CHECK (reason IN ('publishing', 'forgotten')),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX session_analysis_result_tickets_created_idx ON sessions.session_analysis_result_tickets (created_at);
+ALTER TABLE sessions.session_analysis_result_tickets ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_analysis_result_tickets FROM PUBLIC, anon, authenticated;
+GRANT ALL ON sessions.session_analysis_result_tickets TO service_role;
+
+-- The live pointer set of a session as the read API matches it (canonical id, else raw
+-- id), signed: any pointer add, removal, revision or content change moves it. NULL when
+-- no pointer is live.
+CREATE FUNCTION sessions.session_analysis_source_revision(p_org_id text, p_workspace_id text, p_session_id text)
+RETURNS text LANGUAGE sql STABLE
+SET search_path = pg_catalog, sessions, pg_temp AS $revision$
+  SELECT CASE WHEN count(*) = 0 THEN NULL ELSE encode(sha256(convert_to(string_agg(
+           concat_ws('|', p.harness, p.machine_id, p.manifest_key, p.revision::text, encode(p.content_sha256, 'hex')),
+           E'\n' ORDER BY p.harness, p.machine_id, p.manifest_key), 'UTF8')), 'hex') END
+    FROM sessions.session_index AS p
+   WHERE p.org_id = p_org_id AND p.workspace_id = p_workspace_id
+     AND (coalesce(p.canonical_session_id, p.session_id) = p_session_id OR p.session_id = p_session_id)
+     AND p.deleted_at IS NULL;
+$revision$;
+
+-- The admission principal's tenant pin (session_directory_read_api_scope's pattern):
+-- refuses 42501 unless the caller is bulls96_analysis_admit and the transaction's bound
+-- tenant (the verified assertion) is exactly (p_org_id, p_workspace_id).
+CREATE FUNCTION sessions.session_analysis_admit_scope(p_org_id text, p_workspace_id text)
+RETURNS void LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, sessions, pg_temp AS $scope$
+DECLARE
+  v_org text := nullif(current_setting('bulls96_read.org_id', true), '');
+  v_workspace text := nullif(current_setting('bulls96_read.workspace_id', true), '');
+BEGIN
+  IF coalesce(nullif(current_setting('role', true), 'none'), session_user::text)
+       IS DISTINCT FROM 'bulls96_analysis_admit' THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session analysis: caller is not the admission role';
+  END IF;
+  IF v_org IS NULL OR v_workspace IS NULL
+     OR p_org_id IS DISTINCT FROM v_org OR p_workspace_id IS DISTINCT FROM v_workspace THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'session analysis: tenant binding missing or not this tenant';
+  END IF;
+END
+$scope$;
+
 -- Erasure: a tombstoned or deleted pointer or directory row forgets the session's analysis
--- rows, as session_briefs_forget does. The result objects live under the session's manifest
--- directory and go with the session's object erasure.
+-- rows, as session_briefs_forget does, and tickets every result object it orphans so the
+-- sweeper deletes it even if the session's object erasure already ran.
 CREATE FUNCTION sessions.session_analysis_v2_forget()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $forget$
@@ -122,6 +184,12 @@ DECLARE
   -- A request names the session as the read API does (canonical id, else raw id).
   v_ids text[] := array_remove(ARRAY[OLD.session_id, to_jsonb(OLD) ->> 'canonical_session_id'], NULL);
 BEGIN
+  INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason)
+  SELECT j.result_s3_key, j.id, j.org_id, j.workspace_id, j.session_id, 'forgotten'
+    FROM sessions.session_analysis_jobs_v2 AS j
+   WHERE j.org_id = OLD.org_id AND j.workspace_id = OLD.workspace_id AND j.session_id = ANY (v_ids)
+     AND j.result_s3_key IS NOT NULL
+  ON CONFLICT (result_key) DO UPDATE SET reason = 'forgotten';
   DELETE FROM sessions.session_analysis_requests_v2 AS r
    WHERE r.org_id = OLD.org_id AND r.workspace_id = OLD.workspace_id AND r.session_id = ANY (v_ids);
   DELETE FROM sessions.session_analysis_jobs_v2 AS j
@@ -156,6 +224,9 @@ DECLARE
   c_analysis_version constant text := 'session-analysis-v2.4:96bulls-s3-v1';
   c_schema_version constant integer := 2;
   c_model_version constant text := 'gpt-5.4';
+  c_summary_version constant text := 'session-summary-v3:workspace-output-v2';
+  c_summary_model_version constant text := 'gpt-5.6-luna';
+  v_revision text;
   v_day timestamptz := date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC';
   v_latest sessions.session_analysis_requests_v2%ROWTYPE;
   v_request sessions.session_analysis_requests_v2%ROWTYPE;
@@ -168,6 +239,7 @@ BEGIN
     OR p_session_id IS NULL OR length(p_session_id) NOT BETWEEN 1 AND 512 OR btrim(p_session_id) = '' THEN
     RETURN jsonb_build_object('outcome', 'invalid_request');
   END IF;
+  PERFORM sessions.session_analysis_admit_scope(p_org_id, p_workspace_id);
   -- Serializes admission per org, as relayhistory does; the evidence check follows it.
   PERFORM pg_advisory_xact_lock(hashtextextended('session-analysis-request:' || p_org_id, 0));
   IF NOT EXISTS (SELECT 1 FROM sessions.session_index AS p
@@ -185,7 +257,7 @@ BEGIN
   SELECT r.* INTO v_request FROM sessions.session_analysis_requests_v2 AS r
     JOIN sessions.session_analysis_jobs_v2 AS j ON j.id = r.analysis_job_id
    WHERE r.org_id = p_org_id AND r.workspace_id = p_workspace_id AND r.session_id = p_session_id
-     AND j.status IN ('queued', 'running')
+     AND j.origin = 'native' AND j.status IN ('queued', 'running')
    ORDER BY r.created_at DESC, r.id DESC LIMIT 1;
   IF v_request.id IS NULL THEN
     -- Throttled (a request in the last 2 minutes): the session's latest request.
@@ -207,17 +279,24 @@ BEGIN
     RETURN jsonb_build_object('outcome', 'rate_limited');
   END IF;
 
-  -- An analysis of this engine completed in the last 30 minutes is reused.
+  -- A native analysis of this engine completed in the last 30 minutes over the SAME live
+  -- pointer set is reused (relayhistory reused by source fingerprint; this is its revision).
+  v_revision := sessions.session_analysis_source_revision(p_org_id, p_workspace_id, p_session_id);
   SELECT id INTO v_job_id FROM sessions.session_analysis_jobs_v2
    WHERE org_id = p_org_id AND workspace_id = p_workspace_id AND session_id = p_session_id
      AND origin = 'native' AND status = 'completed'
+     AND source_revision IS NOT DISTINCT FROM v_revision AND v_revision IS NOT NULL
      AND analysis_version = c_analysis_version AND schema_version = c_schema_version
-     AND model_version = c_model_version AND completed_at > now() - interval '30 minutes'
+     AND model_version = c_model_version AND summary_version = c_summary_version
+     AND summary_model_version = c_summary_model_version
+     AND completed_at > now() - interval '30 minutes'
    ORDER BY completed_at DESC, id DESC LIMIT 1;
   IF v_job_id IS NULL THEN
     INSERT INTO sessions.session_analysis_jobs_v2
-      (org_id, workspace_id, session_id, analysis_version, schema_version, model_version)
-    VALUES (p_org_id, p_workspace_id, p_session_id, c_analysis_version, c_schema_version, c_model_version)
+      (org_id, workspace_id, session_id, analysis_version, schema_version, model_version,
+       summary_version, summary_model_version)
+    VALUES (p_org_id, p_workspace_id, p_session_id, c_analysis_version, c_schema_version, c_model_version,
+            c_summary_version, c_summary_model_version)
     RETURNING id INTO v_job_id;
   END IF;
   INSERT INTO sessions.session_analysis_requests_v2
@@ -317,12 +396,16 @@ END
 $read$;
 
 REVOKE ALL ON FUNCTION sessions.session_analysis_v2_forget() FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_analysis_admit_scope(text, text) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_analysis_source_revision(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION sessions.session_analysis_source_revision(text, text, text) TO service_role;
 REVOKE ALL ON FUNCTION sessions.analysis_request_v1(text, text, text, text)
   FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.analysis_request_json_v1(sessions.session_analysis_requests_v2)
   FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.analysis_read_v1(text, text) FROM PUBLIC, anon, authenticated, service_role;
 GRANT EXECUTE ON FUNCTION sessions.analysis_read_v1(text, text) TO bulls96_read_api;
+GRANT EXECUTE ON FUNCTION sessions.analysis_request_v1(text, text, text, text) TO bulls96_analysis_admit;
 
 -- As 034000: strip EXECUTE from every grantee present at creation (default privileges),
 -- keeping only bulls96_read_api on analysis_read_v1.
@@ -333,6 +416,8 @@ DECLARE
 BEGIN
   FOREACH v_fn IN ARRAY ARRAY[
     'sessions.session_analysis_v2_forget()'::regprocedure,
+    'sessions.session_analysis_admit_scope(text, text)'::regprocedure,
+    'sessions.session_analysis_source_revision(text, text, text)'::regprocedure,
     'sessions.analysis_request_v1(text, text, text, text)'::regprocedure,
     'sessions.analysis_request_json_v1(sessions.session_analysis_requests_v2)'::regprocedure,
     'sessions.analysis_read_v1(text, text)'::regprocedure
@@ -344,6 +429,8 @@ BEGIN
         JOIN pg_roles AS r ON r.oid = a.grantee
        WHERE p.oid = v_fn AND a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner
          AND NOT (r.rolname = 'bulls96_read_api' AND v_fn = 'sessions.analysis_read_v1(text, text)'::regprocedure)
+         AND NOT (r.rolname = 'bulls96_analysis_admit' AND v_fn = 'sessions.analysis_request_v1(text, text, text, text)'::regprocedure)
+         AND NOT (r.rolname = 'service_role' AND v_fn = 'sessions.session_analysis_source_revision(text, text, text)'::regprocedure)
     LOOP
       EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I', v_fn, v_grantee);
     END LOOP;

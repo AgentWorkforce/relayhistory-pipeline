@@ -24,6 +24,11 @@ DROP FUNCTION sessions.analysis_read_v1(text, text);
 DROP FUNCTION sessions.analysis_request_v1(text, text, text, text);
 DROP FUNCTION sessions.analysis_request_json_v1(sessions.session_analysis_requests_v2);
 DROP FUNCTION sessions.session_analysis_v2_forget();
+DROP FUNCTION sessions.session_analysis_admit_scope(text, text);
+DROP FUNCTION sessions.session_analysis_source_revision(text, text, text);
+-- Outstanding tickets name objects the sweeper still had to delete: list them first
+-- (SELECT result_key FROM sessions.session_analysis_result_tickets) and remove them by hand.
+DROP TABLE sessions.session_analysis_result_tickets;
 DROP TABLE sessions.session_analysis_requests_v2;
 DROP TABLE sessions.session_analysis_jobs_v2;
 DO $ledger$

@@ -35,8 +35,6 @@ export type AdmitRpc =
   | { outcome: "accepted"; request: Record<string, unknown> }
   | { outcome: "not_found" | "rate_limited" | "invalid_request" };
 
-/** The brief half for a native completed analysis (session_briefs, lane F2), or null. */
-export type BriefLookup = (harness: string) => Promise<Record<string, unknown> | null>;
 
 const RESULT_KEY = /\/normalized\/session-analysis-v2\/[0-9a-f-]{36}\/[0-9a-f]{64}\.json$/u;
 
@@ -48,26 +46,23 @@ export class AnalysisReadError extends Error {
 }
 
 /**
- * relayhistory's v1 analyses[]: `result` is the stored object for a completed job.
- * Backfilled objects already hold Neon's exact v1 `result` (brief merged); a native one
- * holds the analysis envelope and gets `brief` from session_briefs when one exists
- * (relayhistory 0031: `a.result || {brief: b.result}`).
+ * relayhistory's v1 analyses[]: `result` is the stored object for a completed job, served
+ * verbatim. A native object already holds the analysis envelope AND the brief produced from
+ * the same evidence read (relayhistory 0031's `a.result || {brief: b.result}`); a backfilled
+ * one holds Neon's exact v1 `result`. Nothing is merged here, so no brief of another revision
+ * can ever be attached.
  */
 export async function assembleAnalyses(
   rpc: Extract<ReadRpc, { outcome: "ok" }>,
-  deps: { result(ref: StoredAnalysisResult): Promise<unknown>; brief?: BriefLookup },
+  deps: { result(ref: StoredAnalysisResult): Promise<unknown> },
 ): Promise<{ sessionId: string; requests: Record<string, unknown>[]; analyses: Record<string, unknown>[] }> {
   const analyses: Record<string, unknown>[] = [];
   for (const row of rpc.analyses) {
-    const { resultRef, origin, harness, ...wire } = row;
+    const { resultRef, origin: _origin, harness: _harness, ...wire } = row;
     let result: unknown = null;
     if (row.status === "completed") {
       if (!resultRef || !RESULT_KEY.test(resultRef.key)) throw new AnalysisReadError("analysis_result_ref_invalid");
       result = await deps.result(resultRef);
-      if (origin === "native" && harness && deps.brief) {
-        const brief = await deps.brief(harness);
-        if (brief && result && typeof result === "object") result = { ...(result as object), brief };
-      }
     }
     analyses.push({ ...wire, result });
   }
