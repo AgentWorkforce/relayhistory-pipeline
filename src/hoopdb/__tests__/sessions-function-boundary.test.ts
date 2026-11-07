@@ -11,6 +11,7 @@ import { generate, ACL_PATH, type Reader } from "../../../scripts/sessions-funct
 import { LANES } from "../../../scripts/sessions-function-boundary/lanes/index.ts";
 import { ingestHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-history.ts";
 import { bufferedGcSingleCandidate } from "../../../scripts/sessions-function-boundary/lanes/buffered-gc-single-candidate.ts";
+import { lazySourceTables, originalBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-source-tables.ts";
 import { createHash } from "node:crypto";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
@@ -53,6 +54,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql",
       "supabase/rollbacks/20261105033000_canonical_project_events.down.sql",
       "supabase/rollbacks/20261105039000_buffered_gc_single_candidate.down.sql",
+      "supabase/rollbacks/20261105040000_ingest_lazy_source_tables.down.sql",
       "supabase/rollbacks/20261105044000_pr_evidence.down.sql",
     ]);
   });
@@ -71,6 +73,23 @@ describe("unified sessions function-boundary generator", () => {
     expect(down).toContain(original);
     expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(original));
     expect(down).toContain("pg_advisory_xact_lock(961996,1)");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 040000 lazy source-table replacement changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== lazySourceTables), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105040000_ingest_lazy_source_tables.down.sql";
+    for (const [path, value] of Object.entries(without.outputs)) expect(withLane.outputs[path]).toBe(value);
+    expect(withLane.summary.lanes["lazy-source-tables"]).toEqual({ functions: 0, replaces: 2, grants: 0 });
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, lazySourceTables.migration!), "utf8")).digest("hex"));
+    for (const body of originalBodies(readFileSync(join(root, "supabase/migrations/20261104055000_lazy_current_custody.sql"), "utf8"))) {
+      expect(down).toContain(body);
+      expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(body));
+    }
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");
     expect(down.trim().endsWith("COMMIT;")).toBe(true);

@@ -91,23 +91,30 @@ test(`user data: under ${USER_DATA_BUDGET} bytes encoded (EC2 caps it at ${EC2_U
   console.log(`user data: ${encoded.length} bytes base64 (limit ${EC2_USER_DATA_ENCODED_LIMIT}, budget ${USER_DATA_BUDGET})`);
   assert.ok(encoded.length < USER_DATA_BUDGET, `user data is ${encoded.length} bytes encoded`);
   const script = gunzipSync(Buffer.from(encoded, "base64")).toString("utf8");
-  // The optional kit files (workers, relay sessions) are not in user data; they
-  // reach the host over SSM in the hot update after first boot (kit 0.1.10).
-  const optional: readonly string[] = [...WORKER_KIT_FILES, ...RELAY_SESSIONS_KIT_FILES];
+  // The optional kit files (headless supervisor, delegation, workers, relay
+  // sessions) are not in user data; they reach the host over SSM in the hot
+  // update after first boot (kit 0.1.10; headless.py and delegation.md since
+  // 0.1.12). The kit's OPTIONAL_KIT_FILES, which its own test/host.test.ts and
+  // test/fresh-host.test.ts use, is not exported, so those two are listed here.
+  const optional: readonly string[] = ["headless.py", "delegation.md", ...WORKER_KIT_FILES, ...RELAY_SESSIONS_KIT_FILES];
   for (const f of agent.files) if (!optional.includes(f.name)) assert.ok(script.includes(`cat > /opt/agent-host/${f.name} <<'`), f.name);
   for (const f of optional) assert.ok(!script.includes(`/opt/agent-host/${f} <<'`), `${f} is not in user data`);
   assert.doesNotMatch(script, /sk-ant-|ghp_|ghs_|gho_|github_pat_|BEGIN [A-Z ]*PRIVATE KEY/);
 });
 
-test("the lead runs on Fable: the rendered lead unit starts the kit's lead-run.sh, which runs Claude Code with --model claude-fable-5-1", () => {
+test("the lead runs on Fable: the rendered lead unit starts the kit's lead-run.sh, which runs the kit's headless supervisor with --model claude-fable-5-1", () => {
   // The model is the kit's (lead-run.sh, which the lead unit starts), not a
   // per-agent setting; implementation goes to sonnet or opus subagents per
-  // the routing block. lead-run.sh resumes the conversation on a restart.
+  // the routing block. Since kit 0.1.12 the unit runs lead-run.sh in the
+  // foreground (no tmux), and lead-run.sh execs the kit's headless.py
+  // supervisor, which the unit requires on disk (it arrives over SSM).
   const script = gunzipSync(Buffer.from(userDataBase64(agent, read), "base64")).toString("utf8");
-  const launch = script.split("\n").filter((l) => l.startsWith("ExecStart=/usr/bin/tmux new-session -d -s lead "));
+  const launch = script.split("\n").filter((l) => l.startsWith("ExecStart=/opt/agent-host/lead-run.sh "));
   assert.equal(launch.length, 1);
-  assert.equal(launch[0], "ExecStart=/usr/bin/tmux new-session -d -s lead /opt/agent-host/lead-run.sh /opt/agent-host/lead-prompt.md");
-  assert.match(script, /claude --model claude-fable-5-1 --dangerously-skip-permissions --append-system-prompt-file "\$p"/);
+  assert.equal(launch[0], "ExecStart=/opt/agent-host/lead-run.sh /opt/agent-host/lead-prompt.md");
+  assert.doesNotMatch(script, /ExecStart=.*tmux|ExecStop=.*tmux/);
+  assert.match(script, /ConditionPathExists=\/opt\/agent-host\/headless.py/);
+  assert.match(script, /--harness claude --model claude-fable-5-1 --prompt-file "\$state\/system.md"/);
   // Every hard-coded model id is Fable. (The worker launcher passes its model
   // through "$model", which defaults to the lead's Fable; it is not a literal.)
   assert.deepEqual([...new Set([...script.matchAll(/claude --model ([a-z0-9][\w.-]*)/g)].map((m) => m[1]))], ["claude-fable-5-1"]);
