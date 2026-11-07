@@ -15,7 +15,7 @@ END $rollback_guard$;
 DROP TRIGGER babysitter_retention_audit_append_only ON sessions.babysitter_retention_audit;
 DROP FUNCTION sessions.babysitter_retention_configure(jsonb),
  sessions.babysitter_evidence_revisions_for(text,jsonb),
- sessions.babysitter_evidence_buckets_for(text,jsonb),
+ sessions.babysitter_evidence_buckets_for(text,jsonb,jsonb,integer),
  sessions.ingest_babysitter_retention_fence(jsonb),
  sessions.ingest_babysitter_retention_complete(jsonb),
  sessions.ingest_babysitter_retention_claim(jsonb),

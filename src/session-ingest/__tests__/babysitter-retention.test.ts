@@ -352,7 +352,7 @@ function fakeEraser() {
     calls,
     eraser: {
       listVersions: async (prefix: string) => { calls.push(`list:${prefix}`); return [1, 2, 3].map((i) => ({ key: `${prefix}raw/b=${i}.ndjson.zst`, versionId: `v${i}` })); },
-      removeVersions: async (list: readonly { key: string; versionId: string }[]) => { calls.push(`remove:${list.length}`); return list.length; },
+      removeVersions: async (_prefix: string, list: readonly { key: string; versionId: string }[]) => { calls.push(`remove:${list.length}`); return list.length; },
     },
   };
 }
@@ -441,10 +441,10 @@ describe("sweep tick", () => {
     await s.store.put(objectKey(`${prefix}raw/b=old.ndjson.zst`), new Uint8Array([1]), { ifNoneMatch: true });
     const eraser = {
       listVersions: (p: string) => real.listVersions(p),
-      removeVersions: async (list: readonly { key: string; versionId: string }[]) => {
+      removeVersions: async (prefix: string, list: readonly { key: string; versionId: string }[]) => {
         // A re-enabled session's new evidence lands between the snapshot and the deletes.
         await s.store.put(objectKey(`${prefix}raw/b=new.ndjson.zst`), new Uint8Array([2]), { ifNoneMatch: true });
-        return real.removeVersions(list);
+        return real.removeVersions(prefix, list);
       },
     };
     const { ledger } = fakeLedger([o]);
@@ -478,7 +478,7 @@ describe("sweep tick", () => {
     let first = true;
     const eraser = {
       listVersions: async () => { if (first) { first = false; throw Object.assign(new Error("s3 quoted key"), { code: "AccessDenied" }); } return [{ key: "k", versionId: "v" }]; },
-      removeVersions: async (l: readonly unknown[]) => l.length,
+      removeVersions: async (_p: string, l: readonly unknown[]) => l.length,
     };
     const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", mode: "on" });
     expect(r).toMatchObject({ failed: 1, erased: 1, codes: { AccessDenied: 1 } });
@@ -583,5 +583,70 @@ describe("retention buckets are never indexed as sessions", () => {
     const { indexPointer } = await import("../../session-pipeline/pointer.ts");
     const deps = new Proxy({}, { get: () => { throw new Error("no dependency may be touched"); } });
     expect(await indexPointer({ key } as never, deps as never)).toEqual({ status: "ignored", reason: "retention_bucket" });
+  });
+});
+
+describe("P2: the snapshot erase trusts only a STRICT inventory (real createS3Eraser)", () => {
+  const o = claimed();
+  const prefix = retentionTargets("96bulls", o).prefix;
+  const own = (id: string) => `<Version><Key>${prefix}raw/b=${id}.ndjson.zst</Key><VersionId>${id}</VersionId><IsLatest>true</IsLatest></Version>`;
+  async function run(xml: string) {
+    const { createS3Eraser } = await import("../../migration/neon-s3-erasure/eraser.ts");
+    const deletes: string[] = [];
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "DELETE") { deletes.push(new URL(String(input)).pathname); return new Response(null, { status: 204 }); }
+      return new Response(xml);
+    }) as typeof fetch;
+    const eraser = createS3Eraser({ bucket: "unit-bucket", region: "us-east-1", credentials: { accessKeyId: "unit-access", secretAccessKey: "unit-secret" }, fetch: fetcher });
+    const { ledger, completions } = fakeLedger([o]);
+    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", mode: "on" });
+    return { r, deletes, completions };
+  }
+  for (const [name, xml, code] of [
+    ["truncated document", `<ListVersionsResult>${own("a")}${own("b")}<IsTruncated>false</IsTruncated><Version><Key>${prefix}raw/b=c`, "erasure_inventory"],
+    ["malformed document", `<ListVersionsResult>${own("a")}<Version><Key>x</Key></Bogus><IsTruncated>false</IsTruncated></ListVersionsResult>`, "erasure_inventory"],
+    ["truncated page without a next cursor", `<ListVersionsResult>${own("a")}<IsTruncated>true</IsTruncated></ListVersionsResult>`, "erasure_inventory"],
+    ["unproven pagination (no IsTruncated)", `<ListVersionsResult>${own("a")}</ListVersionsResult>`, "erasure_inventory"],
+    ["entry without IsLatest", `<ListVersionsResult><Version><Key>${prefix}raw/b=a.ndjson.zst</Key><VersionId>a</VersionId></Version><IsTruncated>false</IsTruncated></ListVersionsResult>`, "erasure_inventory"],
+    ["a foreign key in the document", `<ListVersionsResult>${own("a")}<Version><Key>96bulls/org-a/v1/ws=ws-a/other/raw/b=z.ndjson.zst</Key><VersionId>z</VersionId><IsLatest>true</IsLatest></Version><IsTruncated>false</IsTruncated></ListVersionsResult>`, "erasure_foreign_key"],
+  ] as const)
+    test(`${name}: zero deletes, the row is released (stays pending, reclaimable)`, async () => {
+      const { r, deletes, completions } = await run(xml);
+      expect(deletes).toEqual([]);
+      expect(r).toMatchObject({ erased: 0, failed: 1, codes: { [code]: 1 } });
+      expect(completions.map((c) => c.outcome)).toEqual(["released"]);
+    });
+
+  test("removeVersions refuses (before any delete) a key outside the requested prefix", async () => {
+    const { createS3Eraser, storeEraser } = await import("../../migration/neon-s3-erasure/eraser.ts");
+    let deletes = 0;
+    const s3 = createS3Eraser({ bucket: "b", region: "us-east-1", credentials: { accessKeyId: "a", secretAccessKey: "s" },
+      fetch: (async (_u, init) => { if (init?.method === "DELETE") deletes++; return new Response("<ListVersionsResult><IsTruncated>false</IsTruncated></ListVersionsResult>"); }) as typeof fetch });
+    for (const key of [`${prefix.slice(0, -1)}x/raw/b=1`, "96bulls/elsewhere/b=1", `${prefix}../../escape`, prefix])
+      await expect(s3.removeVersions(prefix, [{ key: `${prefix}raw/ok`, versionId: "1" }, { key, versionId: "2" }])).rejects.toMatchObject({ code: "erasure_foreign_key" });
+    expect(deletes).toBe(0);
+    const sc = scratchStore();
+    try {
+      await expect(storeEraser(sc.store).removeVersions(prefix, [{ key: "96bulls/elsewhere/b=1", versionId: "null" }])).rejects.toMatchObject({ code: "erasure_foreign_key" });
+    } finally { sc.done(); }
+  });
+
+  test("a strict, complete inventory erases exactly the snapshot and acknowledges only after a post-delete inventory shows it gone", async () => {
+    const { createS3Eraser } = await import("../../migration/neon-s3-erasure/eraser.ts");
+    const deleted = new Set<string>();
+    let lie = false;
+    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const u = new URL(String(input));
+      if (init?.method === "DELETE") { if (!lie) deleted.add(u.searchParams.get("versionId")!); return new Response(null, { status: 204 }); }
+      return new Response(`<ListVersionsResult>${["a", "b"].filter((id) => !deleted.has(id)).map(own).join("")}<IsTruncated>false</IsTruncated></ListVersionsResult>`);
+    }) as typeof fetch;
+    const eraser = createS3Eraser({ bucket: "b", region: "us-east-1", credentials: { accessKeyId: "a", secretAccessKey: "s" }, fetch: fetcher });
+    const ok = fakeLedger([claimed()]);
+    expect(await babysitterRetentionTick({ ledger: ok.ledger, eraser, keyRoot: "96bulls", mode: "on" })).toMatchObject({ erased: 1, erased_versions: 2 });
+    // A delete that S3 acknowledges but that leaves the version: never marked erased.
+    deleted.clear(); lie = true;
+    const bad = fakeLedger([claimed()]);
+    expect(await babysitterRetentionTick({ ledger: bad.ledger, eraser, keyRoot: "96bulls", mode: "on" })).toMatchObject({ erased: 0, failed: 1, codes: { erasure_inventory_changed: 1 } });
+    expect(bad.completions.map((c) => c.outcome)).toEqual(["released"]);
   });
 });

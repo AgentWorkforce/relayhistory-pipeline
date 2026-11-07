@@ -93,12 +93,13 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
   };
   const enable = (t: Tenant, session: string) => pool.query("DELETE FROM sessions.upload_deletions WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 AND origin_id=$4 AND source='claude' AND session_id=$5", [t.orgId, t.workspaceId, t.userId, ORIGIN, session]);
   /** The reader's bucket RPC exactly as the read API runs it: read role, tenant bound, READ ONLY. */
-  const readerBuckets = async (bound: { org: string; ws: string } | null, ws: string, filter = { source: null, sessionId: null }) => {
+  const readerBuckets = async (bound: { org: string; ws: string } | null, ws: string, filter = { source: null, sessionId: null },
+    after: { machineId: string; ref: string; inclusive: boolean } | null = null, limit = 200) => {
     const c = await pool.connect();
     try {
       await c.query("BEGIN READ ONLY;SET LOCAL ROLE bulls96_read_api");
       if (bound) await c.query("SELECT set_config('bulls96_read.org_id',$1,true),set_config('bulls96_read.workspace_id',$2,true)", [bound.org, bound.ws]);
-      const r = await c.query("SELECT sessions.babysitter_evidence_buckets_for($1,$2::jsonb) AS v", [ws, JSON.stringify(filter)]);
+      const r = await c.query("SELECT sessions.babysitter_evidence_buckets_for($1,$2::jsonb,$3::jsonb,$4) AS v", [ws, JSON.stringify(filter), JSON.stringify(after), limit]);
       await c.query("COMMIT");
       return (r.rows[0].v as { ref: string }[]).map((b) => b.ref);
     } catch (e) { await c.query("ROLLBACK").catch(() => {}); throw e; } finally { c.release(); }
@@ -111,7 +112,7 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
   const releaseAll = async (objs: { leaseToken: string }[]) => { for (const o of objs) await sweeper().complete(o.leaseToken, "released", 0); };
   const recEraser = () => {
     const removed: string[] = [];
-    return { removed, eraser: { listVersions: async (p: string) => [{ key: `${p}raw/b=x.ndjson.zst`, versionId: "v1" }], removeVersions: async (l: readonly { key: string }[]) => { removed.push(...l.map((x) => x.key)); return l.length; } } };
+    return { removed, eraser: { listVersions: async (p: string) => [{ key: `${p}raw/b=x.ndjson.zst`, versionId: "v1" }], removeVersions: async (_p: string, l: readonly { key: string }[]) => { removed.push(...l.map((x) => x.key)); return l.length; } } };
   };
 
   beforeAll(async () => {
@@ -150,7 +151,7 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
       WHERE n.nspname='sessions' AND p.prosecdef AND (p.proname LIKE '%babysitter%') AND has_function_privilege($1,p.oid,'EXECUTE') ORDER BY 1`, [role])).rows.map((r) => r.f);
     expect(await secdef("bulls96_session_ingest")).toEqual(["sessions.ingest_babysitter_retention_register(jsonb)"]);
     expect(await secdef("bulls96_babysitter_retention")).toEqual(["sessions.ingest_babysitter_retention_claim(jsonb)", "sessions.ingest_babysitter_retention_complete(jsonb)", "sessions.ingest_babysitter_retention_fence(jsonb)"]);
-    expect(await secdef("bulls96_read_api")).toEqual(["sessions.babysitter_evidence_buckets_for(text,jsonb)", "sessions.babysitter_evidence_revisions_for(text,jsonb)"]);
+    expect(await secdef("bulls96_read_api")).toEqual(["sessions.babysitter_evidence_buckets_for(text,jsonb,jsonb,integer)", "sessions.babysitter_evidence_revisions_for(text,jsonb)"]);
     const all = (await pool.query(`SELECT p.oid::regprocedure::text AS f FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
       WHERE n.nspname='sessions' AND p.prosecdef AND has_function_privilege('bulls96_babysitter_retention',p.oid,'EXECUTE') ORDER BY 1`)).rows.map((r) => r.f);
     expect(all).toEqual(["sessions.ingest_babysitter_retention_claim(jsonb)", "sessions.ingest_babysitter_retention_complete(jsonb)", "sessions.ingest_babysitter_retention_fence(jsonb)"]);
@@ -333,7 +334,48 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     expect(await code(readerBuckets({ org: t.orgId, ws: "ws-other" }, t.workspaceId))).toBe("42501");
     expect(await readerBuckets({ org: "org-other", ws: t.workspaceId }, t.workspaceId)).toEqual([]);
     expect(await readerBuckets({ org: t.orgId, ws: t.workspaceId }, t.workspaceId, { source: null, sessionId: "rd-exp" } as never)).toEqual([]);
-    expect(await code(asIngest("SELECT sessions.babysitter_evidence_buckets_for($1,$2::jsonb)", [t.workspaceId, JSON.stringify({ source: null, sessionId: null })]))).toBe("42501");
+    expect(await code(asIngest("SELECT sessions.babysitter_evidence_buckets_for($1,$2::jsonb,null,10)", [t.workspaceId, JSON.stringify({ source: null, sessionId: null })]))).toBe("42501");
+  });
+
+  test("P1 reader RPC: 2500 buckets page by keyset (limit 1, continuation, no 54000 raise), bounds refused, index range scan", async () => {
+    const t = { ...tenantOf("u-page"), workspaceId: "ws-page" };
+    await pool.query(`INSERT INTO sessions.babysitter_retention_objects(org_id,workspace_id,user_id,origin_id,machine_id,object_ref,source,session_id,reset_epoch,fence_epoch,erase_after)
+      SELECT $1,$2,$3,$4,'srv_'||repeat('a',32),'_bx2026112114-'||lpad(to_hex(g),16,'0'),'claude',NULL,0,0,clock_timestamp()+interval '10 days' FROM generate_series(0,2499) g`,
+      [t.orgId, t.workspaceId, t.userId, ORIGIN]);
+    const bound = { org: t.orgId, ws: t.workspaceId };
+    const ref = (g: number) => "_bx2026112114-" + g.toString(16).padStart(16, "0");
+    const first = await readerBuckets(bound, t.workspaceId, undefined, null, 1);
+    expect(first).toEqual([ref(0)]);
+    const m = "srv_" + "a".repeat(32);
+    expect(await readerBuckets(bound, t.workspaceId, undefined, { machineId: m, ref: ref(0), inclusive: false }, 2)).toEqual([ref(1), ref(2)]);
+    expect(await readerBuckets(bound, t.workspaceId, undefined, { machineId: m, ref: ref(0), inclusive: true }, 2)).toEqual([ref(0), ref(1)]);
+    expect(await readerBuckets(bound, t.workspaceId, undefined, { machineId: m, ref: ref(2498), inclusive: false }, 200)).toEqual([ref(2499)]);
+    // Walk the whole set at the max page: every bucket exactly once, no raise above 2000.
+    const all: string[] = [];
+    let after: { machineId: string; ref: string; inclusive: boolean } | null = null;
+    for (;;) {
+      const page = await readerBuckets(bound, t.workspaceId, undefined, after, 200);
+      all.push(...page);
+      if (page.length < 200) break;
+      after = { machineId: m, ref: page[page.length - 1]!, inclusive: false };
+    }
+    expect(all).toHaveLength(2500);
+    expect(new Set(all).size).toBe(2500);
+    for (const bad of [0, 201]) expect(await code(readerBuckets(bound, t.workspaceId, undefined, null, bad))).toBe("22023");
+    expect(await code(readerBuckets(bound, t.workspaceId, undefined, { machineId: m } as never, 1))).toBe("22023");
+    // The index serves the keyset order itself (no sort): proven with seq scans priced out.
+    const c = await pool.connect();
+    let plan = "";
+    try {
+      await c.query("BEGIN;SET LOCAL enable_seqscan=off");
+      plan = (await c.query(`EXPLAIN SELECT 1 FROM sessions.babysitter_retention_objects o WHERE o.org_id=$1 AND o.workspace_id=$2
+        AND (o.machine_id COLLATE "C",o.object_ref COLLATE "C")>($3 COLLATE "C",$4 COLLATE "C")
+        ORDER BY o.machine_id COLLATE "C",o.object_ref COLLATE "C" LIMIT 65`, [t.orgId, t.workspaceId, m, ref(7)])).rows.map((r) => r["QUERY PLAN"]).join("\n");
+      await c.query("ROLLBACK");
+    } finally { c.release(); }
+    expect(plan).toContain("babysitter_retention_objects_reader_idx");
+    expect(plan).not.toContain("Sort");
+    await pool.query("DELETE FROM sessions.babysitter_retention_objects WHERE workspace_id='ws-page'");
   });
 
   test("nothing is claimed while disabled; dry run cannot record an erase or pass the fence", async () => {

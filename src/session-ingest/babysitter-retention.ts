@@ -435,7 +435,7 @@ export async function babysitterRetentionTick(deps: TickDeps): Promise<TickResul
       const budget = Date.parse(o.leaseUntil) - clock() - minLease / 2;
       const snapshot = await withDeadline(deps.eraser.listVersions(targets.prefix), budget);
       if (!(await deps.ledger.fence(o.leaseToken))) { count("fence_refused"); result.lease_lost += 1; continue; }
-      const versions = await deps.eraser.removeVersions(snapshot);
+      const versions = await deps.eraser.removeVersions(targets.prefix, snapshot);
       const done = await deps.ledger.complete(o.leaseToken, "erased", versions);
       if (!done.ok) result.lease_lost += 1;
       else if (done.state === "erased") { result.erased += 1; result.erased_versions += versions; }

@@ -12,7 +12,7 @@
  * Its only extra input is the registry login, `retentionDatabaseUrl`, read from the
  * SAME stdin credential JSON the process already reads (never a file, env or argv),
  * and only when the phase is not off: the dedicated least-privilege role
- * `bulls96_babysitter_retention` (EXECUTE on the retention claim/complete RPCs and
+ * `bulls96_babysitter_retention` (EXECUTE on the retention claim/fence/complete RPCs and
  * nothing else; NOLOGIN until the operator step supabase/bootstrap/babysitter_retention_role.sql)
  * over the Supabase session pooler with the pinned CA. The full ingest login is
  * refused: the read-only erasure host must never hold a cross-tenant write credential.
@@ -52,7 +52,7 @@ import { babysitterRetentionTick, sqlBabysitterRetentionLedger, sweepMode, type 
 import { isSnapshotEraser } from "./eraser.ts";
 
 const POOLER = "aws-0-us-east-1.pooler.supabase.com";
-/** The phase's own least-privilege role: EXECUTE on the retention claim/complete RPCs only. */
+/** The phase's own least-privilege role: EXECUTE on the retention claim/fence/complete RPCs only. */
 const RETENTION_ROLE = "bulls96_babysitter_retention";
 /** Never accepted here: it can register, reset and commit ingest for every tenant. */
 const INGEST_ROLE = "bulls96_session_ingest";

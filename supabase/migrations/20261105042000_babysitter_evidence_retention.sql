@@ -72,6 +72,10 @@ CREATE TABLE sessions.babysitter_retention_objects(
  CHECK((state='erased')=(erased_at IS NOT NULL AND erased_versions IS NOT NULL AND erase_reason IS NOT NULL))
 );
 CREATE INDEX babysitter_retention_objects_due_idx ON sessions.babysitter_retention_objects(state,erase_after);
+-- The reader's keyset order (C collation, whatever the database default), so a page is an
+-- index range scan that stops at its LIMIT rather than a sort of the workspace's buckets.
+CREATE INDEX babysitter_retention_objects_reader_idx ON sessions.babysitter_retention_objects
+ (org_id,workspace_id,machine_id COLLATE "C",object_ref COLLATE "C");
 CREATE UNIQUE INDEX babysitter_retention_objects_lease_idx ON sessions.babysitter_retention_objects(lease_token) WHERE lease_token IS NOT NULL;
 
 CREATE TABLE sessions.babysitter_retention_audit(
@@ -86,7 +90,7 @@ ALTER TABLE sessions.babysitter_retention_settings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.babysitter_retention_objects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.babysitter_retention_audit ENABLE ROW LEVEL SECURITY;
 -- The sweeper's own least-privilege role (supabase/bootstrap/session_ingest_roles.sql, NOLOGIN; LOGIN
--- only by the operator step babysitter_retention_role.sql). It may run the claim/complete RPCs and
+-- only by the operator step babysitter_retention_role.sql). It may run the claim/fence/complete RPCs and
 -- nothing else: not register, not any ingest, reset or commit RPC, not any table. Fail closed if the
 -- bootstrap has not provisioned it (42704) or it exists elevated (55000).
 DO $retention_role$
@@ -340,23 +344,36 @@ END $fence$;
 
 -- READER (Neon GET /v1/delivery/records parity for Babysitter kinds), for the read API role
 -- only, tenant-pinned by the read API's verified binding (session_directory_read_api_scope).
--- The live, unfenced, unexpired buckets of the bound workspace. Logical delete is immediate:
--- a fenced bucket is hidden the moment the disable/reset commits, before any physical erase,
--- and stays hidden after a re-enable. p_filter: {source, sessionId} (each null = any).
-CREATE FUNCTION sessions.babysitter_evidence_buckets_for(p_workspace_id text,p_filter jsonb) RETURNS jsonb
+-- ONE keyset page of the live, unfenced, unexpired, unerased buckets of the bound workspace,
+-- ordered by (machine_id, object_ref) in C collation: never the whole set, never a raise for
+-- a large one. Logical delete is immediate: a fenced bucket is hidden the moment the
+-- disable/reset commits, before any physical erase, and stays hidden after a re-enable.
+-- p_filter: {source, sessionId} (each null = any); p_after: null or {machineId, ref, inclusive};
+-- p_limit 1..200.
+CREATE FUNCTION sessions.babysitter_evidence_buckets_for(p_workspace_id text,p_filter jsonb,p_after jsonb,p_limit integer) RETURNS jsonb
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $buckets$
-DECLARE v_org text;v jsonb;n integer;
+DECLARE v_org text;v jsonb;v_m text;v_r text;v_incl boolean;
 BEGIN
  v_org:=sessions.session_directory_read_api_scope(p_workspace_id);
  PERFORM sessions.ingest_exact_keys(p_filter,ARRAY['source','sessionId']);
- SELECT count(*),coalesce(jsonb_agg(jsonb_build_object('machineId',o.machine_id,'ref',o.object_ref,'source',o.source,'sessionId',o.session_id)
-   ORDER BY o.machine_id,o.object_ref COLLATE "C"),'[]'::jsonb) INTO n,v
-  FROM sessions.babysitter_retention_objects o
+ IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 200 THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter evidence: page bound must be 1..200';END IF;
+ IF p_after IS NOT NULL AND p_after<>'null'::jsonb THEN
+  PERFORM sessions.ingest_exact_keys(p_after,ARRAY['machineId','ref','inclusive']);
+  v_m:=p_after->>'machineId';v_r:=p_after->>'ref';v_incl:=(p_after->>'inclusive')::boolean;
+  IF v_m IS NULL OR v_r IS NULL OR v_incl IS NULL THEN
+   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter evidence: cursor malformed';END IF;
+ END IF;
+ SELECT coalesce(jsonb_agg(jsonb_build_object('machineId',q.machine_id,'ref',q.object_ref,'source',q.source,'sessionId',q.session_id)
+   ORDER BY q.machine_id COLLATE "C",q.object_ref COLLATE "C"),'[]'::jsonb) INTO v
+ FROM (SELECT o.machine_id,o.object_ref,o.source,o.session_id FROM sessions.babysitter_retention_objects o
   WHERE o.org_id=v_org AND o.workspace_id=p_workspace_id AND o.state<>'erased' AND o.erase_after>clock_timestamp()
    AND (p_filter->'source'='null'::jsonb OR o.source=p_filter->>'source')
    AND (p_filter->'sessionId'='null'::jsonb OR o.session_id=p_filter->>'sessionId')
-   AND NOT sessions.babysitter_retention_fenced(o);
- IF n>2000 THEN RAISE EXCEPTION USING ERRCODE='54000',MESSAGE='babysitter evidence: too many live buckets for one read';END IF;
+   AND (v_m IS NULL OR (o.machine_id COLLATE "C",o.object_ref COLLATE "C")>(v_m COLLATE "C",v_r COLLATE "C")
+        OR (v_incl AND o.machine_id=v_m AND o.object_ref=v_r))
+   AND NOT sessions.babysitter_retention_fenced(o)
+  ORDER BY o.machine_id COLLATE "C",o.object_ref COLLATE "C" LIMIT p_limit) q;
  RETURN v;
 END $buckets$;
 
@@ -394,11 +411,11 @@ END $configure$;
 REVOKE ALL ON FUNCTION sessions.babysitter_retention_audit_guard(),sessions.babysitter_retention_bucket_hour(text),
  sessions.ingest_babysitter_retention_register(jsonb),sessions.babysitter_retention_fenced(sessions.babysitter_retention_objects),
  sessions.babysitter_retention_due_reason(sessions.babysitter_retention_objects),sessions.ingest_babysitter_retention_fence(jsonb),
- sessions.babysitter_evidence_buckets_for(text,jsonb),sessions.babysitter_evidence_revisions_for(text,jsonb),
+ sessions.babysitter_evidence_buckets_for(text,jsonb,jsonb,integer),sessions.babysitter_evidence_revisions_for(text,jsonb),
  sessions.ingest_babysitter_retention_claim(jsonb),sessions.ingest_babysitter_retention_complete(jsonb),sessions.babysitter_retention_configure(jsonb)
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder,bulls96_babysitter_retention,bulls96_read_api;
 GRANT EXECUTE ON FUNCTION sessions.ingest_babysitter_retention_register(jsonb) TO bulls96_session_ingest;
 GRANT USAGE ON SCHEMA sessions TO bulls96_babysitter_retention;
 GRANT EXECUTE ON FUNCTION sessions.ingest_babysitter_retention_claim(jsonb),sessions.ingest_babysitter_retention_fence(jsonb),
  sessions.ingest_babysitter_retention_complete(jsonb) TO bulls96_babysitter_retention;
-GRANT EXECUTE ON FUNCTION sessions.babysitter_evidence_buckets_for(text,jsonb),sessions.babysitter_evidence_revisions_for(text,jsonb) TO bulls96_read_api;
+GRANT EXECUTE ON FUNCTION sessions.babysitter_evidence_buckets_for(text,jsonb,jsonb,integer),sessions.babysitter_evidence_revisions_for(text,jsonb) TO bulls96_read_api;

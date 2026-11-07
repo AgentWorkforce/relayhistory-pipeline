@@ -1,7 +1,7 @@
 /**
  * Lane: Babysitter evidence retention (slot 042000, assigned by layered-sessions-pipeline).
  * SQL authority: supabase/migrations/20261105042000_babysitter_evidence_retention.sql.
- * register is the ingest login's (before the bucket PUT); claim/complete belong to the
+ * register is the ingest login's (before the bucket PUT); claim/fence/complete belong to the
  * sweeper's own least-privilege role bulls96_babysitter_retention; everything else is
  * owner-only. Also generates the migration's rollback.
  */
@@ -58,7 +58,7 @@ export const babysitterRetention: LaneManifest = {
     "sessions.ingest_babysitter_retention_claim(jsonb)": { secdef: true, grants: ["bulls96_babysitter_retention"] },
     "sessions.ingest_babysitter_retention_complete(jsonb)": { secdef: true, grants: ["bulls96_babysitter_retention"] },
     "sessions.ingest_babysitter_retention_fence(jsonb)": { secdef: true, grants: ["bulls96_babysitter_retention"] },
-    "sessions.babysitter_evidence_buckets_for(text,jsonb)": { secdef: true, grants: ["bulls96_read_api"] },
+    "sessions.babysitter_evidence_buckets_for(text,jsonb,jsonb,integer)": { secdef: true, grants: ["bulls96_read_api"] },
     "sessions.babysitter_evidence_revisions_for(text,jsonb)": { secdef: true, grants: ["bulls96_read_api"] },
     "sessions.babysitter_retention_configure(jsonb)": { secdef: false, grants: [] },
   },
