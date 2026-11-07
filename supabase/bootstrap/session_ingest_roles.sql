@@ -17,7 +17,7 @@
 --                                            authority: EXECUTE on the four eraser read RPCs only
 --                                            (20261105041000; made LOGIN by privacy_eraser_role.sql)
 --             bulls96_babysitter_retention   the E3 erasure phase's registry login: EXECUTE on the
---                                            retention claim/complete RPCs only (20261105042000;
+--                                            retention claim/fence/complete RPCs only (20261105042000;
 --                                            made LOGIN by babysitter_retention_role.sql)
 --   attrs     NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
 --   members   member of none.

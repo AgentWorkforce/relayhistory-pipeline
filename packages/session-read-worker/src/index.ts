@@ -270,11 +270,13 @@ export function turnsDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>
  */
 export function babysitterEvidenceDeps(env: Env, run: TenantRunner, fetcher: typeof fetch = (input, init) => fetch(input, init)): EvidenceDeps | undefined {
   if ((env.READ_API_BABYSITTER_EVIDENCE ?? "").trim().toLowerCase() !== "on") return undefined;
-  const raw = rawStoreFromEnv(env, fetcher);
-  if (!raw) return undefined;
+  if (!rawStoreFromEnv(env, fetcher)) return undefined;
   const keyRoot = env.READ_API_BABYSITTER_KEY_ROOT?.trim() || "96bulls";
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(keyRoot)) return undefined;
-  return sqlEvidenceDeps(run as never, raw.store as never, (body) => readAll(body as never), (bytes) => decompress(bytes), (key) => objectKey(key) as never, keyRoot);
+  // A store per request, its fetcher bound to the request's deadline: list and get both abort.
+  const storeFor = (signal: AbortSignal) =>
+    rawStoreFromEnv(env, ((input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal })) as typeof fetch)?.store;
+  return sqlEvidenceDeps(run as never, storeFor as never, (body) => readAll(body as never) /* the bound fetch aborts the body stream too */, (bytes) => decompress(bytes), (key) => objectKey(key) as never, keyRoot);
 }
 
 export default {

@@ -73,7 +73,7 @@ BEGIN
     SELECT p.oid::regprocedure::text AS fn FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
      WHERE n.nspname = 'sessions' AND p.prosecdef AND has_function_privilege(v_role.oid, p.oid, 'EXECUTE')
        AND p.oid::regprocedure::text NOT IN (
-         'sessions.babysitter_evidence_buckets_for(text,jsonb)',
+         'sessions.babysitter_evidence_buckets_for(text,jsonb,jsonb,integer)',
          'sessions.babysitter_evidence_revisions_for(text,jsonb)',
          'sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
          'sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)')

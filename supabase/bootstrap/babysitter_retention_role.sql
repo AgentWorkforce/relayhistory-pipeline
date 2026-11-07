@@ -1,7 +1,7 @@
 -- Operator-only phase after migrations (20261105042000): make the E3 erasure phase's
 -- registry login able to log in. Password is set separately from 1Password in memory;
 -- never place it here or in a connection file. Run babysitter_retention_verify.sql
--- before and after activation. The role may EXECUTE only the retention claim/complete
+-- before and after activation. The role may EXECUTE only the retention claim/fence/complete
 -- RPCs (no ingest, register, reset or commit RPC, and no table), so the erasure host
 -- holds no cross-tenant write credential.
 BEGIN;
