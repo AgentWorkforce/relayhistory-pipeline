@@ -249,10 +249,12 @@ function identifier(v: unknown): v is string {
   return typeof v === "string" && v.length > 0 && new TextEncoder().encode(v).length <= 512 && !/[\x00-\x1f\x7f]/.test(v) && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(v);
 }
 
-export function parseSelection(body: unknown): { account_id: string; origin_id: string; sessions: { source: string; session_id: string }[]; enabled: boolean } {
+export function parseSelection(body: unknown): { account_id: string; expected_user_id?: string; origin_id: string; sessions: { source: string; session_id: string }[]; enabled: boolean } {
   if (!isObject(body)) invalid("Expected upload selection");
   const b = body as Record<string, unknown>;
-  exactKeys(b, ["account_id", "origin_id", "sessions", "enabled"]);
+  const expectedUser = Object.hasOwn(b, "expected_user_id");
+  exactKeys(b, ["account_id", "origin_id", "sessions", "enabled", ...(expectedUser ? ["expected_user_id"] : [])]);
+  if (expectedUser && !identifier(b.expected_user_id)) invalid("Invalid expected upload user");
   if (!identifier(b.origin_id) || typeof b.enabled !== "boolean" || !Array.isArray(b.sessions) || b.sessions.length < 1 || b.sessions.length > 2048)
     invalid("Invalid upload selection");
   for (const x of b.sessions as unknown[]) {
@@ -437,6 +439,8 @@ export function createIngestApp(deps: IngestAppDeps) {
     try {
       const input = parseSelection(await jsonOf(c));
       await requireDeliveryAccount(identity, input.account_id);
+      if (input.expected_user_id !== undefined && input.expected_user_id !== identity.userId)
+        throw new DeliveryError("delivery_user_mismatch", 403, "Upload selection does not match authenticated user");
       const selection={
         tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId },
         originId: input.origin_id,
