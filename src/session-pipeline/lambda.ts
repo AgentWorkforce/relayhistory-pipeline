@@ -257,7 +257,8 @@ async function init(composition?: SearchComposition): Promise<Runtime> {
     credentials: lambdaCredentials(),
   });
   if (!SecretString) throw new Error("session pipeline secret has no value yet");
-  const rt = runtimeFromSecret(env, SecretString, publicationSchema.expected.generation, composition);
+  const rt = runtimeFromSecret(env, SecretString, publicationSchema.expected.generation, composition,
+    { storageVerifySql: publicationSchema.portableStorageVerifier, ...(publicationSchema.expected.dbMode ? { dbMode: publicationSchema.expected.dbMode } : {}) });
   await admitWriterRuntime(rt, env, composition, publicationSchema.portableStorageVerifier, publicationSchema.expected.dbMode);
   return rt;
 }
@@ -293,7 +294,57 @@ export async function admitWriterRuntime(
  * The shared runtime for every invocation kind. Network-free: pools and clients
  * connect lazily. The analysis source field is carried raw and not validated here.
  */
-export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGeneration: string, composition?: SearchComposition): Runtime {
+/** The readiness marker (src/shared/db.ts ROLE_VALIDATION_TABLE / ROLE_VALIDATION_NAME).
+ * Literal here on purpose: a runtime import of db.ts would bundle its module-level
+ * verifier file reads into the Lambda archive, which carries embedded assets instead.
+ * writer-admission.test.ts pins these equal to db.ts. */
+export const PORTABLE_MARKER_TABLE = "sessions.__96bulls_role_validation";
+export const PORTABLE_MARKER_NAME = "session_directory_search_worker";
+
+/** The writer's per-work admission inputs: the embedded storage verifier and db mode. */
+export interface PortableWorkAdmission {
+  readonly storageVerifySql?: string;
+  readonly dbMode?: string;
+}
+
+/**
+ * Current-work freshness gate for a composition that declares admission. Runs at the
+ * start of EVERY portable search pass, in that pass's own transaction and on its client,
+ * before any work: the readiness marker must be PASS for exactly this build's generation,
+ * then the identity checks and the embedded storage verifier run bound to this connection's
+ * own identity. So drift, a migrator flipping the marker to pending, or a newer generation
+ * after a warm start refuses the next pass before it writes anything (the pass fails;
+ * SQS retries). Assembly-time admission (admitWriterRuntime) remains the cold-start check.
+ */
+export async function portableWorkGate(
+  tx: SqlExecutor,
+  schemaGeneration: string,
+  composition: SearchComposition,
+  admission: PortableWorkAdmission | undefined,
+): Promise<void> {
+  const storageVerifySql = admission?.storageVerifySql;
+  if (!storageVerifySql?.trim()) throw new PortableConnectionRefused("storage_verifier_missing");
+  const marker = (await tx.query<{ status: string; generation: string }>(
+    `SELECT status, generation FROM ${PORTABLE_MARKER_TABLE} WHERE name = $1`, [PORTABLE_MARKER_NAME])).rows;
+  if (marker.length !== 1) throw new PortableConnectionRefused("work_gate_marker_missing");
+  if (marker[0]!.generation !== schemaGeneration) throw new PortableConnectionRefused("work_gate_generation_mismatch");
+  if (marker[0]!.status !== "pass") throw new PortableConnectionRefused("work_gate_marker_pending");
+  await composition.admit!(tx, "writer", { storageVerifySql, ...(admission?.dbMode ? { dbMode: admission.dbMode } : {}) });
+}
+
+/** One search pass: optional freshness gate first, then the work, on one transaction. */
+export function gatedSearchTransact<T>(
+  db: HoopDb,
+  gate: ((tx: SqlExecutor) => Promise<void>) | undefined,
+  run: (tx: SqlExecutor) => Promise<T>,
+): Promise<T> {
+  return transaction(db, async (tx) => {
+    if (gate) await gate(tx);
+    return run(tx);
+  });
+}
+
+export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGeneration: string, composition?: SearchComposition, admission?: PortableWorkAdmission): Runtime {
   const secret = parseSecret(secretText);
   const db = supabasePool(secret.hoopdb_url, env.dbPoolMax, env.postgresTls ?? postgresTlsOptions());
   const store = createS3Store({ bucket: env.bucket, region: env.region, credentials: async () => lambdaCredentials() });
@@ -338,7 +389,10 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     const writerSql = portable ? writerTransactionSql(db) : undefined;
     const binding = portable ? composeSearchService(composition!, { env: { ...env.adapterEnv, SEARCH_INDEX_BACKEND: env.searchBackend }, sql: writerSql!.sql, secrets: searchSecret(secret.search) }, "writer") : undefined;
     deps.search = {
-      transact: (work) => transaction(db, tx => writerSql ? writerSql.run(tx, () => work(tx)) : work(tx)),
+      // A composition that declares admission is gated at every pass (current-work freshness).
+      transact: (work) => gatedSearchTransact(db,
+        portable && composition?.admit ? (tx) => portableWorkGate(tx, schemaGeneration, composition, admission) : undefined,
+        tx => writerSql ? writerSql.run(tx, () => work(tx)) : work(tx)),
       reader,
       store,
       ...(binding ? { adapter: binding } : { ch: createClickHouseClient(secret.clickhouse!) }),
