@@ -18,7 +18,7 @@ permissions:
 jobs:
   agent:
     name: Agent stack checks
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     permissions:
       contents: read
@@ -36,8 +36,8 @@ jobs:
           registry-url: https://npm.pkg.github.com
           scope: '@agentworkforce'
 
-      # No package-lock.json is committed yet (GitHub Packages refuses local
-      # installs); this run uploads the one it resolved, for committing.
+      # package-lock.json is committed from this run's artifact (GitHub Packages
+      # refuses local installs), so a pin bump lands as: bump, dispatch, commit the lock.
       - name: Install, typecheck and test
         working-directory: agent
         env:
