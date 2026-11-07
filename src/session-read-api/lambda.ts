@@ -20,7 +20,6 @@ import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts"
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
 import { admitPortableReader, gatedReaderRunner, readCommittedTenantRunner, readerWriterRole, type ReaderAdmission } from "../shared/portable-reader-admission.ts";
-import { derivedSchemaAssets } from "../session-pipeline/derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces } from "./app.ts";
@@ -128,6 +127,11 @@ export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessE
   const baseRunner = poolTenantRunner(pool as never);
   let readerAdmission: ReaderAdmission | undefined;
   if (backend !== "clickhouse" && composition?.admit) {
+    // Loaded only on the portable-admission path: derived-schema.ts reaches migrate.ts/db.ts,
+    // whose module-level verifier file reads must never enter the workerd import graph
+    // (the session read Worker imports this module for handleUrlEvent etc.). The Lambda
+    // build bundles this dynamic import and replaces derived-schema.ts with embedded assets.
+    const { derivedSchemaAssets } = await import("../session-pipeline/derived-schema.ts");
     const assets = await derivedSchemaAssets();
     readerAdmission = {
       generation: assets.expected.generation, expectedNames: assets.expected.names,
