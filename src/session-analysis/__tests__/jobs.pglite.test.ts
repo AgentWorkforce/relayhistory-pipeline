@@ -45,6 +45,12 @@ async function request(session = KEY.sessionId, workspace = KEY.workspaceId, org
 }
 
 const results = () => createFsStore({ root: mkdtempSync(join(tmpdir(), "analysis-jobs-")) });
+/** The unversioned fs store's every-version erase (a versioned bucket uses createS3Eraser). */
+const fsErase = (store: ReturnType<typeof results>) => async (key: string) => {
+  const had = (await store.head(objectKey(key))) !== undefined;
+  await store.delete(objectKey(key));
+  return had ? 1 : 0;
+};
 const ANCHOR = "org-a/ws-a/m-1/claude/2026-10-29/s-1/manifest.json";
 const jobStore = (store = results()) =>
   postgresAnalysisJobStore({ db: hoopDb(pg), store, anchorManifestKey: async () => ANCHOR });
@@ -410,7 +416,7 @@ describe("P0-2 erase-safe publication", () => {
     expect((await objects.head(objectKey(out.key!)))).toBeDefined();
     const tickets = (await pg.query<Json>("SELECT result_key, reason FROM sessions.session_analysis_result_tickets")).rows;
     expect(tickets).toEqual([{ result_key: out.key, reason: "publishing" }]);
-    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx })).toBe(1);
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject: fsErase(objects) })).toBe(1);
     expect(await objects.head(objectKey(out.key!))).toBeUndefined();
     expect((await pg.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
   });
@@ -466,9 +472,9 @@ describe("P0-2 erase-safe publication", () => {
        VALUES ('k/leased', gen_random_uuid(), $1, $2, $3, 'publishing', now() - interval '1 day', now() + interval '5 minutes')`,
       [KEY.orgId, KEY.workspaceId, KEY.sessionId],
     );
-    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx })).toBe(0);
+    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx, eraseObject: fsErase(results()) })).toBe(0);
     await pg.query("UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() - interval '1 second'");
-    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx })).toBe(1);
+    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx, eraseObject: fsErase(results()) })).toBe(1);
   });
 
   test("P1-a: the worker's database half never re-reads a manifest", async () => {
@@ -489,11 +495,11 @@ describe("P0-2 erase-safe publication", () => {
     const store = jobStore(objects);
     const out = await publish(store, (await store.claim({ leaseSeconds: 600 }))!);
     expect(out.stage).toBe("completed");
-    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx })).toBe(0);
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject: fsErase(objects) })).toBe(0);
     expect(await objects.head(objectKey(out.key!))).toBeDefined();
     await pg.query("UPDATE sessions.session_index SET deleted_at = now()");
     expect((await pg.query<Json>("SELECT reason FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ reason: "forgotten" }]);
-    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx })).toBe(1);
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject: fsErase(objects) })).toBe(1);
     expect(await objects.head(objectKey(out.key!))).toBeUndefined();
   });
 });
@@ -614,5 +620,123 @@ describe("item 3: every DB proof input is in the source revision (a change to an
        VALUES ($1, $2, $3, $4, 'm-t', 'u-1', now(), now(), 'fs', 'bucket', 'manifest/t',
                decode(repeat('ab', 32), 'hex'), 'jsonl', '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1, 't', now())`, [KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId]);
     await step("deleted_at moves", "UPDATE sessions.session_index SET deleted_at = deleted_at + interval '1 second' WHERE machine_id = 'm-t'");
+  });
+});
+
+describe("item 2: the worker's result PUT is bounded inside its lease", () => {
+  test("the deadline sits inside the 600 s lease and the sweeper's grace", async () => {
+    const { ANALYSIS_PUT_TIMEOUT_MS } = await import("../results.ts");
+    const { TICKET_GRACE_SECONDS } = await import("../store.ts");
+    const { analysisConfig } = await import("../worker.ts");
+    const lease = analysisConfig({}).leaseSeconds;
+    expect(ANALYSIS_PUT_TIMEOUT_MS).toBeLessThan((lease * 1000) / 2);
+    expect(TICKET_GRACE_SECONDS * 1000).toBeGreaterThan(lease * 1000 + ANALYSIS_PUT_TIMEOUT_MS);
+  });
+
+  test("a PUT that outlives its deadline is aborted (signal) and rejected; completion then refuses; no object", async () => {
+    await request();
+    const objects = results();
+    let aborted = false;
+    const stalling = {
+      ...objects,
+      put: (_k: unknown, _b: unknown, opts?: { signal?: AbortSignal }) =>
+        new Promise<never>((_, reject) => opts?.signal?.addEventListener("abort", () => { aborted = true; reject(new Error("aborted")); })),
+    } as typeof objects;
+    const store = postgresAnalysisJobStore({ db: hoopDb(pg), store: stalling, anchorManifestKey: async () => ANCHOR, putTimeoutMs: 50 });
+    const job = (await store.claim({ leaseSeconds: 600 }))!;
+    const out = output();
+    const { bytes, sha256 } = encodeAnalysisResult(out.result);
+    const key = (await store.reserve(job, out, { sha256, bytes: bytes.length }))!;
+    await expect(store.put(key, bytes, sha256)).rejects.toThrow("analysis_put_timeout");
+    expect(aborted).toBe(true);
+    expect(await objects.head(objectKey(key))).toBeUndefined();
+    // The ticket stays for the sweeper (no completed owner).
+    expect((await pg.query("SELECT reason FROM sessions.session_analysis_result_tickets WHERE result_key = $1", [key])).rows).toEqual([{ reason: "publishing" }]);
+  });
+});
+
+describe("C3 purge (purge_session_analysis_for_owned): read + admission fences, in-flight refusal, durable every-version erase", () => {
+  const ownedSet = async (user = "u-owner", org = KEY.orgId, ws = KEY.workspaceId, session = KEY.sessionId) => {
+    await pg.exec(`CREATE TABLE IF NOT EXISTS sessions.ingest_frozen_source_owned_sessions(
+      org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,origin_id text NOT NULL,
+      source text NOT NULL,session_id text NOT NULL,PRIMARY KEY(org_id,workspace_id,user_id,origin_id,source,session_id))`);
+    await pg.query("INSERT INTO sessions.ingest_frozen_source_owned_sessions VALUES ($1, $2, $3, 'origin', 'claude', $4)", [org, ws, user, session]);
+  };
+  const purge = (user = "u-owner") => pg.query("SELECT sessions.purge_session_analysis_for_owned($1, $2)", [KEY.orgId, user]);
+
+  test("reads hide and admission refuses at once; an in-flight job can neither reserve nor complete; a fresh upload reopens", async () => {
+    await ownedSet();
+    const objects = results();
+    const store = postgresAnalysisJobStore({ db: hoopDb(pg), store: objects, anchorManifestKey: async () => ANCHOR });
+    await request();
+    expect((await publish(store, (await store.claim({ leaseSeconds: 600 }))!)).stage).toBe("completed");
+    expect((await readAs()).analyses).toHaveLength(1);
+    // A second, in-flight job (the completed one is too old to be reused).
+    await pg.query("UPDATE sessions.session_analysis_jobs_v2 SET completed_at = now() - interval '1 hour'");
+    await age("session_analysis_requests_v2", "3 minutes");
+    await request();
+    const inflight = (await store.claim({ leaseSeconds: 600 }))!;
+    expect(inflight).toBeTruthy();
+    const out = output();
+    const { bytes, sha256 } = encodeAnalysisResult(out.result);
+    const key = (await store.reserve(inflight, out, { sha256, bytes: bytes.length }))!;
+    await store.put(key, bytes, sha256);
+
+    await purge();
+    // Immediately, before any object is gone:
+    expect(await readAs()).toEqual({ outcome: "not_found" });
+    await age("session_analysis_requests_v2", "3 minutes");
+    expect(await request()).toEqual({ outcome: "not_found" });
+    expect(await store.complete({ job: inflight, output: out, stored: { key, sha256, bytes: bytes.length } })).toBe(false);
+    expect(await store.reserve(inflight, out, { sha256, bytes: bytes.length })).toBeNull();
+    expect((await pg.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
+    // Every result key is ticketed for the every-version eraser.
+    const tickets = (await pg.query<{ reason: string }>("SELECT reason FROM sessions.session_analysis_result_tickets")).rows;
+    expect(tickets.length).toBeGreaterThanOrEqual(2);
+    expect(tickets.every((t) => t.reason === "forgotten")).toBe(true);
+    // A fresh upload after the purge (a new pointer) reopens admission.
+    await pointer(pg, { machine: "m-new" });
+    expect((await request()).outcome).toBe("accepted");
+  });
+
+  test("another user's or org's same-id session keeps its analysis and stays readable", async () => {
+    await ownedSet("u-other", "org-other");
+    const store = jobStore();
+    await request();
+    expect((await publish(store, (await store.claim({ leaseSeconds: 600 }))!)).stage).toBe("completed");
+    await purge("u-owner"); // u-owner owns nothing here
+    await pg.query("SELECT sessions.purge_session_analysis_for_owned('org-other', 'u-other')");
+    expect((await readAs()).analyses).toHaveLength(1);
+    expect((await pg.query("SELECT 1 FROM sessions.session_analysis_purge_fences")).rows).toEqual([{ "?column?": 1 }]);
+    expect((await pg.query<{ o: string }>("SELECT org_id o FROM sessions.session_analysis_purge_fences")).rows).toEqual([{ o: "org-other" }]);
+  });
+
+  test("durable: the result object's ticket survives an eraser failure and a later sweep leaves zero versions", async () => {
+    await ownedSet();
+    const objects = results();
+    const store = jobStore(objects);
+    await request();
+    const { key } = await publish(store, (await store.claim({ leaseSeconds: 600 }))!);
+    // A versioned bucket: the object plus one older version of it.
+    const versions = new Map<string, number>([[key!, 2]]);
+    let failures = 1;
+    const eraseObject = async (k: string) => {
+      if (failures-- > 0) throw new Error("S3 503");
+      const n = versions.get(k) ?? 0;
+      versions.delete(k);
+      await objects.delete(objectKey(k));
+      return n;
+    };
+    await purge();
+    await expect(sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject })).rejects.toThrow("S3 503");
+    expect((await pg.query("SELECT result_key FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ result_key: key }]);
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx, eraseObject })).toBe(1);
+    expect(versions.get(key!) ?? 0).toBe(0);
+    expect(await objects.head(objectKey(key!))).toBeUndefined();
+    expect((await pg.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
+  });
+
+  test("the sweeper refuses to run without the every-version eraser", async () => {
+    await expect(sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx } as never)).rejects.toThrow("analysis_sweep_eraser_required");
   });
 });

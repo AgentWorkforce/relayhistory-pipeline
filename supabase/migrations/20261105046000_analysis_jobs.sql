@@ -135,13 +135,31 @@ CREATE TABLE sessions.session_analysis_result_tickets (
   -- A writer's bounded lease on a 'publishing' ticket (the operator backfill heartbeats it):
   -- the sweeper never sweeps a ticket whose lease is live, and a writer whose lease lapsed
   -- must not write. NULL for the worker's tickets (its job lease fences them instead).
-  lease_expires_at timestamptz
+  lease_expires_at timestamptz,
+  -- The backfill writer that holds the lease (one random id per run): a successor may take the
+  -- ticket over only after the lease expired, and every fence names its own writer, so a
+  -- stale writer can never mistake a successor's live lease for its own. NULL for the worker.
+  writer_token uuid
 );
 CREATE INDEX session_analysis_result_tickets_created_idx ON sessions.session_analysis_result_tickets (created_at);
 ALTER TABLE sessions.session_analysis_result_tickets ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.session_analysis_result_tickets FROM PUBLIC, anon, authenticated;
 GRANT ALL ON sessions.session_analysis_result_tickets TO service_role;
 
+
+-- C3 purge fence (purge_session_analysis_for_owned): a session whose analysis was purged by a
+-- reset/disable stays fenced (admission answers not_found, the read hides it, and the fence moves
+-- the source revision so an in-flight job can neither reserve nor complete) until a NEW pointer
+-- for it is created after the purge (a fresh upload after re-enable). Owner-only.
+CREATE TABLE sessions.session_analysis_purge_fences (
+  org_id text NOT NULL,
+  workspace_id text NOT NULL,
+  session_id text NOT NULL,
+  purged_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (org_id, workspace_id, session_id)
+);
+ALTER TABLE sessions.session_analysis_purge_fences ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_analysis_purge_fences FROM PUBLIC, anon, authenticated, service_role;
 
 -- Authoritative legacy coverage for the never-in-Neon proof. The frozen copy
 -- (ingest_frozen_source_records) holds Neon DELIVERY records only: an older turns-only Neon
@@ -268,7 +286,8 @@ $neon_free$;
 -- created_at and deleted_at, tombstoned ones included, the frozen copy's seal (sealed_at and
 -- manifest digest), whether a frozen delivery record names the session, the census seal (sealed_at
 -- and digest), whether the census names the session, and the proof's verdict itself. (Export and
--- backfill markers live in the manifest, so its etag carries them.) Any
+-- backfill markers live in the manifest, so its etag carries them.) And a C3 purge fence's
+-- purged_at, so a purge refuses every in-flight reserve and completion. Any
 -- change that can change the evidence or the proof moves it, so neither a reuse nor a
 -- publication can outlive it. An unambiguous tuple (a JSON array; NULL kept), never a
 -- separator join. NULL when no pointer is live.
@@ -291,6 +310,8 @@ BEGIN
            EXISTS (SELECT 1 FROM sessions.ingest_frozen_source_records AS r WHERE r.org_id = p_org_id AND r.session_id IN (SELECT session_id FROM ids)),
            (SELECT jsonb_build_array(c.sealed_at, c.census_sha256) FROM sessions.session_neon_census_seal AS c WHERE c.singleton),
            EXISTS (SELECT 1 FROM sessions.session_neon_census AS c WHERE c.org_id = p_org_id AND c.session_id IN (SELECT session_id FROM ids)),
+           (SELECT f.purged_at FROM sessions.session_analysis_purge_fences AS f
+             WHERE f.org_id = p_org_id AND f.workspace_id = p_workspace_id AND f.session_id = p_session_id),
            jsonb_agg(jsonb_build_array(
              p.harness, coalesce(p.canonical_session_id, p.session_id),
              coalesce(p.canonical_machine_id, p.machine_id), p.machine_id, p.user_id,
@@ -423,6 +444,11 @@ BEGIN
             WHERE e.v ->> 'source' = r.source AND e.v ->> 'session_id' = r.session_id))
     $records$ USING p_org, p_user, p_sessions;
   END IF;
+  -- Fence first (same transaction): reads hide, admission refuses and in-flight jobs cannot
+  -- publish from here on, before any object is gone.
+  INSERT INTO sessions.session_analysis_purge_fences (org_id, workspace_id, session_id)
+  SELECT DISTINCT o.org_id, o.workspace_id, o.session_id FROM pg_temp.analysis_purge_owned AS o
+  ON CONFLICT (org_id, workspace_id, session_id) DO UPDATE SET purged_at = clock_timestamp();
   INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason)
   SELECT j.result_s3_key, j.id, j.org_id, j.workspace_id, j.session_id, 'forgotten'
     FROM sessions.session_analysis_jobs_v2 AS j
@@ -430,6 +456,11 @@ BEGIN
       ON j.org_id = o.org_id AND j.workspace_id = o.workspace_id AND j.session_id = o.session_id
    WHERE j.result_s3_key IS NOT NULL
   ON CONFLICT (result_key) DO UPDATE SET reason = 'forgotten', lease_expires_at = NULL;
+  -- In-flight publications of these sessions (reserved, not completed): forgotten too, so no
+  -- writer can take them over and the sweeper erases whatever their bounded PUT left.
+  UPDATE sessions.session_analysis_result_tickets AS t SET reason = 'forgotten', lease_expires_at = NULL
+    FROM (SELECT DISTINCT * FROM pg_temp.analysis_purge_owned) AS o
+   WHERE t.org_id = o.org_id AND t.workspace_id = o.workspace_id AND t.session_id = o.session_id;
   DELETE FROM sessions.session_analysis_requests_v2 AS r
    USING (SELECT DISTINCT * FROM pg_temp.analysis_purge_owned) AS o
    WHERE r.org_id = o.org_id AND r.workspace_id = o.workspace_id AND r.session_id = o.session_id;
@@ -481,6 +512,15 @@ BEGIN
                   WHERE p.org_id = p_org_id AND p.workspace_id = p_workspace_id
                     AND (coalesce(p.canonical_session_id, p.session_id) = p_session_id OR p.session_id = p_session_id)
                     AND p.deleted_at IS NULL) THEN
+    RETURN jsonb_build_object('outcome', 'not_found');
+  END IF;
+  -- Purged by a C3 reset/disable and not re-uploaded since: as if erased.
+  IF EXISTS (SELECT 1 FROM sessions.session_analysis_purge_fences AS f
+                  WHERE f.org_id = p_org_id AND f.workspace_id = p_workspace_id AND f.session_id = p_session_id
+                    AND NOT EXISTS (SELECT 1 FROM sessions.session_index AS p
+                                     WHERE p.org_id = f.org_id AND p.workspace_id = f.workspace_id
+                                       AND (coalesce(p.canonical_session_id, p.session_id) = f.session_id OR p.session_id = f.session_id)
+                                       AND p.deleted_at IS NULL AND p.created_at > f.purged_at)) THEN
     RETURN jsonb_build_object('outcome', 'not_found');
   END IF;
 
@@ -588,6 +628,14 @@ BEGIN
                     AND p.deleted_at IS NULL)
      AND NOT EXISTS (SELECT 1 FROM sessions.session_analysis_requests_v2
                       WHERE org_id = v_org AND workspace_id = p_workspace_id AND session_id = p_session_id) THEN
+    RETURN jsonb_build_object('outcome', 'not_found');
+  END IF;
+  IF EXISTS (SELECT 1 FROM sessions.session_analysis_purge_fences AS f
+                  WHERE f.org_id = v_org AND f.workspace_id = p_workspace_id AND f.session_id = p_session_id
+                    AND NOT EXISTS (SELECT 1 FROM sessions.session_index AS p
+                                     WHERE p.org_id = f.org_id AND p.workspace_id = f.workspace_id
+                                       AND (coalesce(p.canonical_session_id, p.session_id) = f.session_id OR p.session_id = f.session_id)
+                                       AND p.deleted_at IS NULL AND p.created_at > f.purged_at)) THEN
     RETURN jsonb_build_object('outcome', 'not_found');
   END IF;
 
