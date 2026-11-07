@@ -55,6 +55,7 @@ import type { EventQuery } from "./queries.ts";
 import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
+import { EvidenceRequestError, readBabysitterEvidence, type EvidenceDeps } from "./babysitter-evidence.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
@@ -104,6 +105,8 @@ export interface ReadApiDeps {
   timing?: TimingDeps;
   /** Relay session turns and metadata from canonical S3 (session-turns-source.ts); absent = 501 `turns_not_configured`. */
   turns?: TurnsDeps;
+  /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
+  babysitter?: EvidenceDeps;
 }
 
 export interface TurnsDeps {
@@ -718,6 +721,30 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   });
   app.get("/v1/digest/daily", notMigrated("digest_not_migrated"));
+
+  // Babysitter evidence (Neon GET /v1/delivery/records parity for session_lineage /
+  // turn_receipt; babysitter-evidence.ts). Tenant from the verified identity, as Neon's
+  // auth context; default off (501 until the worker wires the deps).
+  app.get("/v1/delivery/records", async (c) => {
+    const correlationId = c.get("correlationId");
+    try {
+      const evidence = deps.babysitter;
+      if (!evidence) throw unsupported("delivery_records_not_configured");
+      const identity = c.get("identity");
+      const query: Record<string, string> = {};
+      for (const key of new Set(new URL(c.req.url).searchParams.keys())) {
+        const all = c.req.queries(key) ?? [];
+        if (all.length > 1) return c.json({ error: { code: "invalid_delivery", message: "Repeated delivery filters are unsupported" }, correlationId }, 400);
+        query[key] = all[0]!;
+      }
+      // Neon order: repeated filters (400) above, then the account assertion (403) before any read.
+      return c.json(await readBabysitterEvidence(evidence, { orgId: identity.orgId, workspaceId: identity.workspaceId }, query, c.req.header("X-RelayHistory-Expected-Account")));
+    } catch (error) {
+      if (error instanceof EvidenceRequestError)
+        return c.json({ error: { code: error.code, message: error.message, ...(error.reason ? { reason: error.reason } : {}) }, correlationId }, error.status);
+      return fail(c, error);
+    }
+  });
 
   app.notFound((c) => c.json({ error: { code: "unsupported_by_backend", message: "route not served by this backend", reason: "route" }, correlationId: c.get("correlationId") }, 501));
 

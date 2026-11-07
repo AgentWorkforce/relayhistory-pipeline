@@ -31,6 +31,8 @@ import { canonicalSnapshot, CanonicalReadError } from "../../../src/session-read
 import { sqlCanonicalPointers } from "../../../src/session-read-api/session-timing-source.ts";
 import { sqlSessionHarnesses } from "../../../src/session-read-api/session-turns-source.ts";
 import type { TimingDeps, TurnsDeps } from "../../../src/session-read-api/app.ts";
+import { sqlEvidenceDeps, type EvidenceDeps } from "../../../src/session-read-api/babysitter-evidence.ts";
+import { objectKey, readAll } from "../../../src/shared/vendor.ts";
 import { logLine, type Level } from "../../../src/shared/log.ts";
 import { createClickHouseClient, type ClickHouseClient, type RequestOptions } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-read-api/app.ts";
@@ -54,6 +56,10 @@ export interface Env extends CanonicalEnv {
   READ_API_BRIEF_TITLES_WORKSPACES?: string;
   /** "true": time a session without legacy turn evidence as having none (session-timing-source.ts). */
   READ_API_TIMING_ASSUME_NO_TURNS?: string;
+  /** Babysitter evidence reader (GET /v1/delivery/records for its kinds): only "on" enables; default off. */
+  READ_API_BABYSITTER_EVIDENCE?: string;
+  /** The ingest key root the retention buckets live under (default 96bulls). */
+  READ_API_BABYSITTER_KEY_ROOT?: string;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
 }
@@ -202,6 +208,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   const app = createReadApi({
     timing: timingDeps(env, tenant.run, overrides.fetcher),
     turns: turnsDeps(env, tenant.run, overrides.fetcher),
+    babysitter: babysitterEvidenceDeps(env, tenant.run, overrides.fetcher),
     verify: relayAuthVerifier({ origin: env.READ_API_ORIGIN?.trim() || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL?.trim() || undefined, issuer: env.RELAYAUTH_ISSUER?.trim() || undefined }),
     ch,
     liveness: sqlLiveness(tenant.run),
@@ -260,6 +267,22 @@ export function turnsDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>
   const timing = timingDeps(env, run, fetcher);
   if (!timing) return undefined;
   return { harnesses: sqlSessionHarnesses(run), source: timing.source };
+}
+
+/**
+ * Babysitter evidence from the retention buckets (src/session-read-api/babysitter-evidence.ts):
+ * buckets and revisions through the read role (tenant-bound), objects with the raw-store
+ * secrets. Off unless READ_API_BABYSITTER_EVIDENCE=on and the raw store is configured.
+ */
+export function babysitterEvidenceDeps(env: Env, run: TenantRunner, fetcher: typeof fetch = (input, init) => fetch(input, init)): EvidenceDeps | undefined {
+  if ((env.READ_API_BABYSITTER_EVIDENCE ?? "").trim().toLowerCase() !== "on") return undefined;
+  if (!rawStoreFromEnv(env, fetcher)) return undefined;
+  const keyRoot = env.READ_API_BABYSITTER_KEY_ROOT?.trim() || "96bulls";
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(keyRoot)) return undefined;
+  // A store per request, its fetcher bound to the request's deadline: list and get both abort.
+  const storeFor = (signal: AbortSignal) =>
+    rawStoreFromEnv(env, ((input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal })) as typeof fetch)?.store;
+  return sqlEvidenceDeps(run as never, storeFor as never, (body) => readAll(body as never) /* the bound fetch aborts the body stream too */, (bytes) => decompress(bytes), (key) => objectKey(key) as never, keyRoot);
 }
 
 export default {

@@ -13,6 +13,13 @@ test("refuses publication from the duplicate import even under the same owner", 
  const duplicate = "AgentWorkforce/sessions-pipeline-oss";
  expect(() => validateRequest({ ...env(), GITHUB_REPOSITORY: duplicate, GITHUB_WORKFLOW_REF: `${duplicate}/.github/workflows/publish-image.yml@refs/heads/main` })).toThrow("dispatcher or workflow identity");
 });
+test("publishes only from the renamed canonical repository", () => expect(REPOSITORY).toBe("AgentWorkforce/relayhistory-pipeline"));
+for (const name of ["AgentWorkforce/sessions-pipeline", "AgentWorkforce/sessions-pipeline-cloud", "fork/relayhistory-pipeline", "agentworkforce/relayhistory-pipeline", "AgentWorkforce/relayhistory-pipeline-oss"]) {
+ test(`refuses publication or CI identity from unrelated repository ${name}`, async () => {
+  expect(() => validateRequest({ ...env(), GITHUB_REPOSITORY: name, GITHUB_WORKFLOW_REF: `${name}/.github/workflows/publish-image.yml@refs/heads/main` })).toThrow("dispatcher or workflow identity");
+  await expect(verifySourceCI(sha, api([{ ...run(), repository: { full_name: name }, head_repository: { full_name: name } }]))).rejects.toThrow("no official main CI run");
+ });
+}
 for (const [field, value] of Object.entries({ GITHUB_REPOSITORY: "fork/sessions-pipeline", GITHUB_EVENT_NAME: "push", GITHUB_REF: "refs/heads/topic", GITHUB_ACTOR: "another-actor", GITHUB_TRIGGERING_ACTOR: "another-actor", GITHUB_WORKFLOW_REF: `${REPOSITORY}/.github/workflows/other.yml@refs/heads/main`, CONFIRM: "publish", GITHUB_SHA: "bad" })) {
   test(`refuses foreign ${field}`, () => expect(() => validateRequest({ ...env(), [field]: value })).toThrow());
 }

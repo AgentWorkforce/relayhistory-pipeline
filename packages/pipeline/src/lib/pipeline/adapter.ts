@@ -476,7 +476,15 @@ export function prefixAllowed(
 
 export type BuildResult =
   | { status: "enqueue"; message: StageMessage<ObjectLandedPayload> }
-  | { status: "ignored"; reason: "not_a_session_key" | "not_a_manifest" };
+  | { status: "ignored"; reason: "not_a_session_key" | "not_a_manifest" | "retention_bucket" };
+
+/**
+ * The session ingest's Babysitter retention buckets (96BullSessions
+ * src/session-ingest/babysitter-retention.ts): `h=_babysitter` directories hold
+ * only evidence lines the projection never indexes, and are erased on expiry.
+ * They are not sessions, so neither a put nor a delete of their manifest is indexed.
+ */
+export const RETENTION_BUCKET_HARNESS = "_babysitter";
 
 /**
  * The object-landed message for a manifest. Throws a non-retryable
@@ -492,6 +500,7 @@ export function buildObjectLandedMessage(input: {
 }): BuildResult {
   const location = parseSessionKey(input.landed.key);
   if (!location) return { status: "ignored", reason: "not_a_session_key" };
+  if (location.harness === RETENTION_BUCKET_HARNESS) return { status: "ignored", reason: "retention_bucket" };
   if (!isManifestRest(location.rest) || (isPublicationManifestRest(location.rest) && !parseUploadGenerationPrefix(location.prefix)))
     return { status: "ignored", reason: "not_a_manifest" };
   const manifest = input.manifest;
@@ -575,6 +584,7 @@ export function buildObjectDeletedMessage(input: {
 }): BuildResult {
   const location = parseSessionKey(input.landed.key);
   if (!location) return { status: "ignored", reason: "not_a_session_key" };
+  if (location.harness === RETENTION_BUCKET_HARNESS) return { status: "ignored", reason: "retention_bucket" };
   if (!isManifestRest(location.rest) || (isPublicationManifestRest(location.rest) && !parseUploadGenerationPrefix(location.prefix)))
     return { status: "ignored", reason: "not_a_manifest" };
   const at = input.landed.eventTime ?? (input.now ?? new Date()).toISOString();
@@ -667,7 +677,7 @@ export async function handleObjectEventQueue(
       continue;
     }
     const location = parseSessionKey(landed.key);
-    if (!location || !isManifestRest(location.rest) || (isPublicationManifestRest(location.rest) && !parseUploadGenerationPrefix(location.prefix))) {
+    if (!location || location.harness === RETENTION_BUCKET_HARNESS || !isManifestRest(location.rest) || (isPublicationManifestRest(location.rest) && !parseUploadGenerationPrefix(location.prefix))) {
       message.ack();
       continue;
     }

@@ -206,6 +206,7 @@ describe("session read api: Function URL (public by design, application auth)", 
     const routes = [...src.matchAll(/app\.(get|post|put|patch|delete|all)\("([^"]+)"/g)].map((m) => m[2]);
     expect(routes.sort()).toEqual([
       "/health",
+      "/v1/delivery/records",
       "/v1/digest/daily",
       "/v1/events",
       "/v1/sessions",

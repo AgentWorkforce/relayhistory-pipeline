@@ -65,6 +65,55 @@ holds only the eraser key ("sessions-prod transcript eraser").
     (ListObjectVersions + DeleteObject?versionId), only under a session prefix
     of the item's own org, with the session leased.
   - It logs `erasure SLA at risk` once the oldest queued item is older than 24 h.
+- **Strict inventory: fail closed** (lead ruling C3 on #294; shipped unflagged as
+  destructive-operation safety hardening, NOT gated by any Babysitter flag). The
+  erasure job's existing S3 calls (`eraseObject`, `erasePrefix`,
+  `eraseSessionAnyDate`, `eraseObjectBefore`, `listKeys`, via
+  `src/migration/neon-s3-erasure/eraser.ts`) now accept only a strictly valid
+  ListObjectVersions inventory. Two kinds of refusal, with different meaning:
+  - **Initial inventory refusal (no deletes were made from that inventory).**
+    The whole listing is read and validated before its first delete, and is
+    refused when it is not strictly valid:
+    - `erasure_inventory`: malformed, truncated or non-UTF-8 XML; an entry
+      without Key/VersionId/IsLatest; unproven pagination (no IsTruncated,
+      missing or mismatched next markers, a repeated cursor); or a bound:
+      more than 10,000 versions or 100 pages in one whole-prefix listing, or
+      a single listing response body over 16 MiB;
+    - `erasure_foreign_key`: a listed key outside the requested prefix.
+  - **Post-delete refusal (deletes MAY already have happened).**
+    `erasure_inventory_changed`, or any failure of the post-delete
+    verification listing (including an `erasure_inventory` /
+    `erasure_foreign_key` refusal of that second listing), or a DeleteObject
+    error partway through the deletes: the deletes of the first inventory were
+    issued, and some or all may have succeeded. Pending
+    here is NOT an atomic rollback: the deleted versions are gone, and the item
+    stays pending only because zero is not yet proven.
+  - **Semantics (both kinds):** a refusal is an error for that item or group
+    only, and the item is NOT marked done: the queued erasure, tombstone or
+    fence stays pending and is retried on the next sweep (as any failed
+    erase). Other items still run. A retry lists afresh; after a post-delete
+    refusal it sees only what survived.
+  - **Where the codes appear:** the erasure job's structured log lines carry
+    `error_code` (`erasure failed` with `kind` for a queued item; `fence sweep
+    failed`, `live fence sweep failed`, `live listing failed` or `live erasure
+    failed` for a sweep), and its counters (`failed`, `fenceSweepFailed`,
+    `liveFenceFailed`) count them. A refusal never stops the job; the oldest
+    queued item's age drives `erasure SLA at risk` after 24 h.
+  - **Operator action** (the lead's ruling, verbatim): "retain the
+    obligation/tombstone, investigate the inventory shape, or move to a
+    separately reviewed resumable consumer. NO manual done, NO reservation
+    clearing, NO disabling the strict checks, NO cap escalation as recovery."
+    The codes say which rule refused; a whole-inventory workload above 10k
+    versions needs the separately reviewed resumable consumer (`eraseStep`,
+    the paged eraser with checkpoints).
+  - **Regression evidence** on the existing E3 path:
+    `src/migration/__tests__/neon-s3-erasure-live.test.ts` ("E3 on the strict
+    shared eraser": a small valid inventory erases as before; a malformed and a
+    >10k inventory are each refused before any delete and the same tombstone is
+    erased by a later healthy sweep; a queued prefix erasure over a malformed
+    inventory stays queued, backed off, and a later healthy drain erases it);
+    the eraser-level refusals are in
+    `strict-inventory-erasure.test.ts` and `buffered-version-erasure.test.ts`.
 - Accepted gap (#105): record-level changes that do not bump
   `session_revisions` reach S3 only through the exporter's idle 14-day re-read.
 
@@ -80,13 +129,29 @@ ssh kjg-lap "zsh -lc 'jq -n --argjson w \"\$(op item get <exporter item> --vault
   --argjson e \"\$(op item get <eraser item> --vault 96Bulls-prod --format json)\" ...'" > ~/.agent-tmp/s3x/creds.fifo
 touch ~/.agent-tmp/s3x/STOP   # stop after the current run
 
-# The erasure job (its own key, its own process; once the eraser item exists):
-NEON_URL_FILE=<(...) S3X_ERASER_CREDS_FILE=<(...) S3X_BUCKET=... S3X_EXPECT_BUCKET=... \
-  bun run migration:neon-s3-erasure --execute
+# The erasure job (its own key, its own process). Credentials ONLY on stdin, held in RAM:
+# one JSON object {"databaseUrl": ..., "eraser": {accessKeyId, secretAccessKey[, sessionToken]}}.
+# databaseUrl must carry user, non-empty password and host; only ?sslmode= is allowed (never ~/.pgpass).
+# NEON_URL_FILE / NEON_URL / S3X_ERASER_CREDS_FILE / AWS_* credential variables refuse to start, and so
+# does a terminal or a regular file on stdin (a pipe from `op` is the intended source).
+ssh kjg-lap "zsh -lc 'jq -cn --arg u \"\$(op read <authority db url ref>)\" \
+  --argjson e \"\$(op item get <eraser item> --vault 96Bulls-prod --format json | jq -c <reshape to the eraser object>)\" \
+  \"{databaseUrl:\$u,eraser:\$e}\"'" | \
+  S3X_BUCKET=... S3X_EXPECT_BUCKET=... bun run migration:neon-s3-erasure --execute
 ```
 
-Dry run (reads Neon, builds everything, stores nothing): run `main.ts` without
-`--execute`.
+`S3X_PRIVACY_AUTHORITY` selects where deletions are read: `neon` (default;
+`databaseUrl` is a direct Neon URL, `deleted_upload_sessions` plus the rollup
+presence sweep) or `supabase` (zero-Neon checklist C3/E3; `databaseUrl` is a
+Supabase direct or session-pooler URL; reads `ingest_frozen_source_deletions`,
+has no presence sweep, and erases nothing unless
+`sessions.ingest_privacy_authority` is `active`). Switch it only after the C3
+activation (migration 20261105041000_ingest_privacy_authority) and the RHC
+`supabase-authority` flip; restarting in `supabase` before activation only
+logs `sweep refused: privacy authority not ready`.
+
+Dry run (reads the authority, builds everything, stores nothing): run `main.ts`
+without `--execute`; it needs only `databaseUrl` on stdin.
 
 ## Later
 
