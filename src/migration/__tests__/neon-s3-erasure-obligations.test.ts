@@ -5,6 +5,7 @@
  * resolved by time or a zero inventory, a malformed later page / new versions mid-traversal never yield "done", and the
  * exporter's writer side (obligated-store.ts) records dispatch / acked / refused exactly. Offline: fake-s3-versions.ts.
  */
+import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,7 +18,12 @@ import { obligatedStore } from "../neon-s3-sync/obligated-store.ts";
 import { ObjectStoreError, type ObjectStore } from "../../shared/vendor.ts";
 
 // These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
-process.env.S3X_OBLIGATIONS = "on";
+// The suite's OWN mode, pinned per module, re-applied before every test and restored after the file (never leaked).
+const OBLIGATIONS_MODE: "on" | "off" = "on";
+const __modeBefore = process.env.S3X_OBLIGATIONS;
+process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE;
+__modeBeforeEach(() => void (process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE));
+__modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OBLIGATIONS; else process.env.S3X_OBLIGATIONS = __modeBefore; });
 
 setDefaultTimeout(120_000);
 const OLD = Date.parse("2026-11-01T00:00:00Z");
@@ -41,7 +47,7 @@ async function world(n = 30) {
   const s = new FakeS3Versions();
   const ids: string[] = [];
   for (let i = 0; i < n; i++) ids.push(s.put(key(i), OLD));
-  const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-")), "s.sqlite"));
+  const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-")), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
   let clock = Date.parse("2026-11-07T00:00:00Z");
   st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }], clock - 1000);
   // TEST-ONLY completion seam (production never sets it).
@@ -182,7 +188,7 @@ describe("E3 erasure gated on unresolved-write obligations (v3)", () => {
 describe("exporter writer side (obligated-store.ts)", () => {
   const base = (put: ObjectStore["put"]): ObjectStore => ({ backend: "fake", head: async () => undefined, get: async () => { throw new Error("x"); }, getObject: async () => { throw new Error("x"); }, list: async () => ({ items: [] }), presignGet: async () => "", put, delete: async () => {} }) as unknown as ObjectStore;
   async function st() {
-    return new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-w-")), "s.sqlite"));
+    return new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-w-")), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
   }
   test("dispatch is durable BEFORE the PUT; its own ack records the exact version; created:false and a definite refusal clear it; anything else stays dispatched", async () => {
     const s = await st();
@@ -214,7 +220,7 @@ describe("exporter writer side (obligated-store.ts)", () => {
 
 describe("prefix membership of the obligation tables (index-friendly, exact)", () => {
   test("exact under byte/code-point order for keys that sort differently under locale collations; the key index is used", async () => {
-    const s = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-p-")), "s.sqlite"));
+    const s = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-p-")), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const P = "96bulls/org-1/v1/ws=W-a/m=x/h=claude/d=2026/10/30/s=Sess_1/";
     const inside = [`${P}a`, `${P}Z`, `${P}-`, `${P}_`, `${P}é/ü.json`, `${P}\u{10FFFF}tail`, `${P}raw/日本.zst`];
     const outside = [
@@ -240,7 +246,7 @@ describe("prefix membership of the obligation tables (index-friendly, exact)", (
 });
 
 test("prefix membership: U+10FFFF right before the slash is still exact; a non-/ prefix is refused", async () => {
-  const s = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-q-")), "s.sqlite"));
+  const s = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-q-")), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
   const P = "k/\u{10FFFF}/";
   const inside = [`${P}x`, `${P}\u{10FFFF}\u{10FFFF}x`, `${P}a/b`];
   const outside = ["k/", "k/\u{10FFFF}", "k/\u{FFFF}/", "k/\u{10FFFF}0", "k0", "l"];
@@ -289,13 +295,13 @@ describe("every destructive route is gated; state loss fails closed", () => {
     s.put(OBJ, OLD);
     const dir = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-lost-"));
     const path = join(dir, "s.sqlite");
-    const first = new SyncState(path);
+    const first = new SyncState(path, { obligations: OBLIGATIONS_MODE === "on" });
     first.dispatchWrite(key(2), "exporter:1"); // an outstanding PUT ...
     first.close();
     // TOTAL loss: the pointer AND its sibling database (a lost pointer alone is quarantined, below).
     for (const f of [path, `${path}.obligations.sqlite`, `${path}.obligations.sqlite-wal`, `${path}.obligations.sqlite-shm`]) await rm(f, { force: true });
     // ... forgotten with the files. A fresh state is UNATTESTED, and nothing attests it.
-    const st = new SyncState(path);
+    const st = new SyncState(path, { obligations: OBLIGATIONS_MODE === "on" });
     expect(st.obligationGenesis()).toMatchObject({ attestedAt: null, basis: "none" });
     expect(st.unresolvedWrites(PREFIX)).toEqual([]);
     const clock = Date.parse("2026-11-07T00:00:00Z");
@@ -379,7 +385,7 @@ describe("publication proves its own invocation + lease generation; protected te
   });
 
   test("an exact publication must consume its own live acked invocation; a resolved one is refused; renew keeps the generation", async () => {
-    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-pub-")), "s.sqlite"));
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-pub-")), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const proof = lease(st, PREFIX);
     expect(st.renewLease(PREFIX, "exporter:1")).toBe(true);
     expect(st.leaseGen(PREFIX)).toBe(proof.gens[PREFIX]);
@@ -421,7 +427,7 @@ describe("terminal cleanup covers exactly the versions a proof showed absent", (
   });
 
   test("a kept successor's reservation (time-subset) is not retired as erased", async () => {
-    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-ret-")), "s.sqlite"));
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-ret-")), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const k = key(1);
     expect(st.reserveErase(PREFIX, 0, "s", [{ key: k, versionId: "v-old" }, { key: k, versionId: "v-kept" }]).ok).toBe(true);
     // The complete inventory shows v-kept still present: only v-old is retired.
@@ -483,7 +489,7 @@ describe("queueing an exact OBJECT never unpublishes another key that merely sta
   const A = `${PREFIX}raw/0000000000`;
   const B = `${PREFIX}raw/0000000000-0-abcdef01.ndjson.zst`;
   test("unit: claim B, enqueue exact object A -> B is still published", async () => {
-    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-ab-")), "s.sqlite"));
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-ab-")), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     st.enqueueErasure([{ key: B, kind: "object", org_id: "org-1", reason: "stale" }]);
     st.publishWrites([{ key: B, versionId: "*" }], lease(st, PREFIX));
     st.enqueueErasure([{ key: A, kind: "object", org_id: "org-1", reason: "unreferenced" }]);
@@ -519,7 +525,7 @@ describe("bounded, resumable reservation retirement (dogpatch 5548 P2)", () => {
   async function reserved(n: number, scope = "S") {
     const dir = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-retire-"));
     const path = join(dir, "s.sqlite");
-    const st = new SyncState(path);
+    const st = new SyncState(path, { obligations: OBLIGATIONS_MODE === "on" });
     const vs = Array.from({ length: n }, (_, i) => ({ key: `${D}b=${String(i).padStart(6, "0")}.zst`, versionId: `v${i}` }));
     for (let i = 0; i < vs.length; i += 500) expect(st.reserveErase(D, st.obligationRev(D), scope, vs.slice(i, i + 500)).ok).toBe(true);
     return { st, path, vs };
@@ -533,7 +539,7 @@ describe("bounded, resumable reservation retirement (dogpatch 5548 P2)", () => {
     expect(r.st.retireCursor("S")).toEqual([r.vs[999]!.key, "v999"]);
     // Crash: a new process on the same file resumes after the cursor (nothing re-scanned, nothing lost).
     r.st.close();
-    const st2 = new SyncState(r.path);
+    const st2 = new SyncState(r.path, { obligations: OBLIGATIONS_MODE === "on" });
     expect(st2.retireCursor("S")).toEqual([r.vs[999]!.key, "v999"]);
     // The SAME proof (unchanged workset) resumes after the cursor.
     expect(st2.retireReservationsPage(D, "S", undefined, () => true, 1000, Number.MAX_SAFE_INTEGER, "proof-1")).toMatchObject({ retired: 1000, done: false });
@@ -630,7 +636,7 @@ describe("bounded, resumable reservation retirement (dogpatch 5548 P2)", () => {
     const s = new FakeS3Versions();
     // dogpatch's independent case: 1,500 rows, a crash after page 1, then an earlier-key reservation at H1+1.
     for (let i = 0; i < 1_500; i++) s.put(key(1_000 + i), OLD);
-    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-xrun-")), "s.sqlite"));
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-xrun-")), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     let clock = Date.parse("2026-11-07T00:00:00Z");
     const enq = clock - 1000;
     st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }], enq);
@@ -661,7 +667,7 @@ describe("bounded, resumable reservation retirement (dogpatch 5548 P2)", () => {
   test("a write landing DURING retirement (during the awaited authority check between pages) refuses the done claim; the queue row and the new invocation stay", async () => {
     const s = new FakeS3Versions();
     for (let i = 0; i < 2_500; i++) s.put(key(1_000 + i), OLD);
-    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-during-")), "s.sqlite"));
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-during-")), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const clock = Date.parse("2026-11-07T00:00:00Z");
     const enq = clock - 1000;
     st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }], enq);
@@ -690,7 +696,7 @@ describe("bounded, resumable reservation retirement (dogpatch 5548 P2)", () => {
 
 describe("terminal claim: non-reverting revision + the eraser's lease generation (lead 10466e9c ABA)", () => {
   async function fresh() {
-    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-aba-")), "s.sqlite"));
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-aba-")), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const enq = Date.parse("2026-11-06T00:00:00Z");
     st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }], enq);
     return { st, enq };
@@ -718,7 +724,7 @@ describe("terminal claim: non-reverting revision + the eraser's lease generation
 
   test("the lead's EXACT harness schedule (pr309-1046 retirement-recheck.mjs): the stale completion is refused", () => {
     const P = PREFIX;
-    const st = new SyncState(":memory:", { inMemoryForTests: true });
+    const st = new SyncState(":memory:", { inMemoryForTests: true, obligations: OBLIGATIONS_MODE === "on" });
     const item = { key: P, kind: "prefix" as const, org_id: "synthetic-org", reason: "synthetic" };
     st.enqueueErasure([item], 1);
     expect(st.acquireLease(P, "eraser:old", 7_200_000, 0)).toBe(true);

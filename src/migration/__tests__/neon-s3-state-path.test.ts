@@ -1,7 +1,7 @@
 /**
- * #309 M-C rev 2: ON uses a FRESH state only (a pointer + a fixed sibling database), bootstrapped durably before any
- * external effect; existing SQLite / used state is never converted; leftovers are quarantined; the pre-obligation code
- * (main 341dd5a9, frozen fixture + its real entrypoint when the commit is available) refuses at open with no send.
+ * #309 M-C rev 2: ON uses a FRESH state only (a pointer + a fixed sibling database), bootstrapped durably in the constructor
+ * (before the caller's first S3 or database call); existing SQLite / used state is never converted; leftovers are quarantined; the pre-obligation code
+ * (main 341dd5a9, frozen fixture) refuses at open, before any write or delete.
  * Filesystem guarantees are stated for the tested local storage only (not network filesystems).
  */
 import { describe, expect, test } from "bun:test";
@@ -136,10 +136,11 @@ describe("the pre-obligation code (main 341dd5a9) refuses an ON state at open, i
   }, 30_000);
 
   // The frozen ENTRYPOINTS (verbatim 341dd5a9 sources, .txt so they are never executed or type-checked): both
-  // construct SyncState BEFORE any database connection, S3 client call, sweep or run. With SyncState refusing at open
-  // (above), neither can reach an external effect against an ON state. (A full frozen-entrypoint execution would need
+  // construct SyncState before any sweep or run (the eraser before any database or S3 call; the exporter after at most
+  // a read-only list/head preflight). With SyncState refusing at open (above), neither can WRITE or DELETE against an
+  // ON state. (A full frozen-entrypoint execution would need
   // a build-heavy worktree with its own install; the source-order proof + the independent-process open stand in.)
-  test("frozen 341dd5a9 entrypoints construct SyncState before any external effect (verbatim, pinned)", () => {
+  test("frozen 341dd5a9 entrypoints construct SyncState before any write or delete (verbatim, pinned)", () => {
     const er = readFileSync(join(FROZEN, "eraser-main.ts.txt"), "utf8");
     const ex = readFileSync(join(FROZEN, "exporter-main.ts.txt"), "utf8");
     expect(createHash("sha256").update(er).digest("hex")).toBe("f9e67d053611e56f64ccb14fcdfb2b7771f1ce1404fe89ee8dd83d406981f7e0");
@@ -251,5 +252,32 @@ describe("4f7b1670 review regressions", () => {
     writeFileSync(run2.path, pointerBytes(run2.path, "00000000-0000-4000-8000-000000000000"), { mode: 0o600 }); // not this run's
     run2.cleanup();
     expect(existsSync(`${run2.path}.obligations.sqlite`)).toBe(true); // quarantined, kept
+  });
+});
+
+describe("registry lows at 998c9de5 (quarantine -wal/-shm; never open a sibling directly)", () => {
+  for (const side of ["-wal", "-shm"]) {
+    for (const on of [true, false]) {
+      test(`a leftover sibling ${side} with no sibling and no pointer is QUARANTINED (${on ? "ON" : "OFF"}); its bytes are kept`, async () => {
+        const a = await tmp();
+        writeFileSync(`${a}.obligations.sqlite${side}`, "leftover", { mode: 0o600 });
+        expect(code(() => new SyncState(a, { obligations: on }))).toBe("obligations_state_conflict");
+        expect(existsSync(a)).toBe(false);
+        expect(existsSync(`${a}.obligations.sqlite`)).toBe(false);
+        expect(readFileSync(`${a}.obligations.sqlite${side}`, "utf8")).toBe("leftover");
+      });
+    }
+  }
+
+  test("S3X_STATE naming the ON sibling (or the pointer temp) refuses in BOTH modes; the sibling bytes are unchanged", async () => {
+    const a = await tmp();
+    new SyncState(a, { obligations: true }).close();
+    const sib = `${a}.obligations.sqlite`;
+    const before = bytes(sib);
+    expect(code(() => new SyncState(sib, { obligations: false }))).toBe("obligations_state_conflict");
+    expect(code(() => new SyncState(sib, { obligations: true }))).toBe("obligations_state_conflict");
+    expect(code(() => new SyncState(`${a}.pointer.tmp`, { obligations: false }))).toBe("obligations_state_conflict");
+    expect(bytes(sib).equals(before)).toBe(true);
+    expect(existsSync(`${a}.pointer.tmp`)).toBe(false);
   });
 });

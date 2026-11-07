@@ -325,7 +325,7 @@ export class ErasureJob {
     this.state.forgetKeys(org, session, keys);
   }
 
-  /** With `dryRun`, reports what it would erase and changes nothing. */
+  /** With `dryRun`, reports what it would erase; deletes nothing and marks nothing done. */
   async sweep(opts: { dryRun?: boolean } = {}) {
     const startedAt = this.now();
     const authority = this.authority;

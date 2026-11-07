@@ -4,6 +4,7 @@
  * `chunksAreServerSealed`, the RelayHistory transform's `readRelayhistoryExport`
  * and the projection, and the reader's SQL runs against a Neon-shaped PGlite.
  */
+import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -40,12 +41,18 @@ import { SyncState } from "../neon-s3-sync/state.ts";
  * (ErasureConfig.obligationsSettled; production never sets it). The state file itself can never attest.
  */
 const SETTLED_CFG = { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true };
-const attestedState = (path: string) => new SyncState(path);
+const attestedState = (path: string) => new SyncState(path, { obligations: OBLIGATIONS_MODE === "on" });
 import { Syncer, DEFAULT_SYNC_CONFIG } from "../neon-s3-sync/sync.ts";
 import { Throttle, parseWindows } from "../neon-s3-sync/throttle.ts";
 
 // These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
-process.env.S3X_OBLIGATIONS ??= "on";
+// The suite's OWN mode, pinned per module (never inherited from another file's leaked env): ON, or OFF when
+// imported as "?mode=off" (the *.off.test.ts wrappers). Re-applied before every test.
+const OBLIGATIONS_MODE: "on" | "off" = new URL(import.meta.url).searchParams.get("mode") === "off" ? "off" : "on";
+const __modeBefore = process.env.S3X_OBLIGATIONS;
+process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE;
+__modeBeforeEach(() => void (process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE));
+__modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OBLIGATIONS; else process.env.S3X_OBLIGATIONS = __modeBefore; });
 
 const dirs: string[] = [];
 afterAll(async () => {
@@ -1210,7 +1217,15 @@ describe("SSE-KMS key id (sessions-prod bucket policy)", () => {
  * obligation too: an unknown outcome stays tracked.
  */
 // The obligation protocol (S3X_OBLIGATIONS on) only: the claim / reservation interlock does not exist when off.
-describe.skipIf(process.env.S3X_OBLIGATIONS !== "on")("exporter publication vs E3 reservation (real exportUnit)", () => {
+let onInterlockRan = false;
+describe.skipIf(OBLIGATIONS_MODE !== "on")("exporter publication vs E3 reservation (real exportUnit)", () => {
+  // A probe that only EXECUTES when this suite is not skipped (registration alone runs the callback either way).
+  test("guard probe: the interlock suite executes, on a per-instance ON fixture", async () => {
+    const st = attestedState(join(await tempDir(), "s.sqlite"));
+    expect(st.obligations).toBe(true); // the fixture's own mode, not whatever the process env holds
+    st.close();
+    onInterlockRan = true;
+  });
   async function world() {
     const { store } = await countingStore();
     const st = attestedState(join(await tempDir(), "s.sqlite"));
@@ -1285,4 +1300,9 @@ describe.skipIf(process.env.S3X_OBLIGATIONS !== "on")("exporter publication vs E
     await expect(exportUnit(target(obligatedStore(failing(w.store), st, "exporter:test", acked), { maxChunkBytes: 200 }), unit("org-a"), fixedSource(recs2()), w.opts(acked))).rejects.toThrow();
     expect(st.unresolvedWrites(prefix).filter((i) => i.key === m.manifestKey && i.outcome === "dispatched").length).toBe(1);
   });
+});
+
+// Guard: in the ON run this suite MUST be registered and run; only the "?mode=off" wrapper may skip it.
+test(`mode guard (${OBLIGATIONS_MODE}): the ON-only exportUnit interlock suite EXECUTES exactly when ON`, () => {
+  expect(onInterlockRan).toBe(OBLIGATIONS_MODE === "on");
 });

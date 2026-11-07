@@ -1,8 +1,10 @@
 /**
- * Where the state database lives (S3X_OBLIGATIONS, #309 M-C rev 2: FRESH state only).
+ * Where the state database lives, in BOTH S3X_OBLIGATIONS modes (#309 M-C rev 2: ON uses FRESH state only).
  *
  * OFF: the configured S3X_STATE path is the SQLite file, exactly as before, unless that path holds an obligations
- * POINTER, which OFF refuses (obligations_state_in_use).
+ * POINTER, which OFF refuses (obligations_state_in_use). Unflagged (both modes): a symlink or non-regular S3X_STATE,
+ * a path naming a sibling / pointer temp file, and retained leftovers (a sibling, its -wal / -shm, a pointer temp)
+ * refuse (obligations_state_conflict).
  *
  * ON:
  *  - an ABSENT configured path is bootstrapped. A new sibling database `<base>.obligations.sqlite` is created
@@ -19,7 +21,8 @@
  *    pointer temp file, or any collision refuses with every byte preserved.
  *
  * The pre-obligation code (main 341dd5a9) opening the configured path finds the non-SQLite pointer and fails at its
- * first pragma ("file is not a database"), before any external effect. These filesystem guarantees are stated for the
+ * first pragma ("file is not a database"): its eraser makes no S3 or database call before that open; its exporter
+ * may first make only a read-only list/head preflight (no write or delete). These filesystem guarantees are stated for the
  * tested local storage only (not network filesystems).
  */
 import { closeSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, readSync, unlinkSync, writeSync } from "node:fs";
@@ -111,13 +114,16 @@ export function resolveStatePath(path: string, obligations: boolean): Resolved {
   // An in-memory database is never a supported state (two processes would see two databases): SyncState allows it
   // only through an explicit test option, before this resolution.
   if (path === ":memory:") refuse("state_memory_refused", "S3X_STATE=:memory: is not a supported state");
+  // The ON sibling is never a configured state path itself (either mode): its pointer is.
+  if (basename(path).endsWith(".obligations.sqlite") || basename(path).endsWith(".pointer.tmp"))
+    refuse("obligations_state_conflict", "S3X_STATE names an obligations sibling / temp file, not a state path");
   const parent = dirname(path);
   const sibling = join(parent, siblingName(path));
   const tmp = join(parent, `${basename(path)}.pointer.tmp`);
   const st = lstatOrNull(path);
   // Retained obligation state (a sibling or a pointer temp file) is QUARANTINED in BOTH modes: OFF must not create a
   // new database beside it, and an existing legacy SQLite path with a retained sibling refuses too.
-  const retained = !!(lstatOrNull(sibling) || lstatOrNull(tmp));
+  const retained = !!(lstatOrNull(sibling) || lstatOrNull(`${sibling}-wal`) || lstatOrNull(`${sibling}-shm`) || lstatOrNull(tmp));
   if (st === null) {
     if (retained) refuse("obligations_state_conflict", "retained obligation state without a pointer: quarantined (reviewed recovery only)");
     if (!obligations) return { db: path, pointer: null, bootstrap: false };

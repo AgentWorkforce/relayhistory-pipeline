@@ -1,3 +1,4 @@
+import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -28,7 +29,12 @@ import {
 import type { Queryable } from "../relayhistory-export.ts";
 
 // These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
-process.env.S3X_OBLIGATIONS = "on";
+// The suite's OWN mode, pinned per module, re-applied before every test and restored after the file (never leaked).
+const OBLIGATIONS_MODE: "on" | "off" = "on";
+const __modeBefore = process.env.S3X_OBLIGATIONS;
+process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE;
+__modeBeforeEach(() => void (process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE));
+__modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OBLIGATIONS; else process.env.S3X_OBLIGATIONS = __modeBefore; });
 const pg = new PGlite(),
   db = pg as unknown as Queryable;
 const turnId = "11111111-1111-4111-8111-111111111111";
@@ -203,7 +209,7 @@ test("opt-in sync discovers and exports a legacy-only group; default source stay
       return db.query<T>(sql, params);
     },
   };
-  const state = new SyncState(join(root, "sync.sqlite"));
+  const state = new SyncState(join(root, "sync.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
   const store = createFsStore({ root: join(root, "sync-objects") });
   const throttle = new Throttle({
     rowsPerSec: 1e9,

@@ -2,6 +2,7 @@
  * E3: the transcript eraser repointed to the C3 Supabase privacy authority, and credentials only via stdin.
  * The Supabase side is the real migration stack plus supabase/migrations/20261105041000_ingest_privacy_authority.sql (PGlite).
  */
+import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { openSync, closeSync, readFileSync } from "node:fs";
@@ -23,7 +24,12 @@ import { CredentialRefusal, FORBIDDEN_CREDENTIAL_ENV, parseCredentialDocument, p
 import { authorityFixture, epoch } from "../../session-ingest/__tests__/privacy-authority-support.ts";
 
 // These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
-process.env.S3X_OBLIGATIONS = "on";
+// The suite's OWN mode, pinned per module, re-applied before every test and restored after the file (never leaked).
+const OBLIGATIONS_MODE: "on" | "off" = "on";
+const __modeBefore = process.env.S3X_OBLIGATIONS;
+process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE;
+__modeBeforeEach(() => void (process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE));
+__modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OBLIGATIONS; else process.env.S3X_OBLIGATIONS = __modeBefore; });
 
 setDefaultTimeout(60_000);
 const open: Array<() => unknown> = [];
@@ -324,7 +330,7 @@ async function world() {
   await f.seal();
   const store = createFsStore({ root: await tmp() });
   for (const k of [...LIVE, POINTER]) await store.put(objectKey(k), new TextEncoder().encode("x"));
-  const state = new SyncState(join(await tmp(), "s.sqlite"));
+  const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
   open.push(() => state.close());
   // The job's read-only connection: the same database (an owner session, as the operator's login would be).
   const authority = supabaseAuthority(f.queryable);
@@ -506,7 +512,7 @@ describe("supabase eraser covers post-cutover sessions (review P0) and runs leas
     const q = (sql: string) => w.f.db.query(sql).then((r) => (r.rows[0] as any).n as number);
     expect(await q("SELECT count(*)::int AS n FROM sessions.upload_deletions WHERE session_id='POSTCUT'")).toBe(1);
     expect(await q("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_deletions WHERE session_id='POSTCUT'")).toBe(0);
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     open.push(() => state.close());
     // Past the staged-object redrive window, so staged batch copies are erased in the same sweep.
     const job = new ErasureJob(supabaseAuthority(w.f.queryable), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, () => Date.now() + 49 * 60 * 60 * 1000, async () => {});

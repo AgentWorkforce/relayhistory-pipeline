@@ -178,7 +178,7 @@ test("P1 mixed-mode admission: A opens OFF, THEN B opens ON and records an unkno
   expect(refused(() => A.cancelErasures([PFX]))).toBe("obligations_state_in_use");
   expect(refused(() => A.erasureDone(PFX, 1))).toBe("obligations_state_in_use");
   expect(refused(() => A.erasureFailed(PFX, "x"))).toBe("obligations_state_in_use");
-  // The OFF job's erase step refuses before any external effect: nothing is deleted.
+  // The OFF job's erase step refuses: nothing is deleted.
   const s = new FakeS3Versions();
   s.put(`${PFX}raw/b=000001.ndjson.zst`, Date.parse("2026-11-01T00:00:00Z"));
   const job = new ErasureJob(auth(), A, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => Date.now(), async () => {});

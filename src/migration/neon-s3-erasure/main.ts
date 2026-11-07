@@ -126,7 +126,7 @@ export async function main() {
     const authority = kind === "supabase" ? supabaseAuthority(db) : neonAuthority(db);
     const job = new ErasureJob(authority, state, eraser, log, cfg, Date.now, undefined, () => stop);
     log({ message: "start", execute, authority: kind, recognize_legacy: cfg.recognizeLegacy, obligations });
-    // A dry run changes nothing: it sweeps and reports what it would erase.
+    // A dry run deletes nothing and marks nothing done: it sweeps and reports what it would erase.
     if (!execute) {
       await job.sweep({ dryRun: true });
       job.progress(true);

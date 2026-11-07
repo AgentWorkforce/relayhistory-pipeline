@@ -5,6 +5,7 @@
  * bound to another scope is refused; successor versions are kept; nothing is marked done without a fresh strict zero
  * inventory. Offline provider: fake-s3-versions.ts.
  */
+import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,14 +18,19 @@ import type { LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 
 // These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
-process.env.S3X_OBLIGATIONS = "on";
+// The suite's OWN mode, pinned per module, re-applied before every test and restored after the file (never leaked).
+const OBLIGATIONS_MODE: "on" | "off" = "on";
+const __modeBefore = process.env.S3X_OBLIGATIONS;
+process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE;
+__modeBeforeEach(() => void (process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE));
+__modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OBLIGATIONS; else process.env.S3X_OBLIGATIONS = __modeBefore; });
 
 /**
  * TEST-ONLY: exporter-path completion is opted into explicitly through the job's test seam
  * (ErasureConfig.obligationsSettled; production never sets it). The state file itself can never attest.
  */
 const SETTLED_CFG = { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true };
-const attestedState = (path: string) => new SyncState(path);
+const attestedState = (path: string) => new SyncState(path, { obligations: OBLIGATIONS_MODE === "on" });
 
 setDefaultTimeout(120_000);
 const G: LiveFencedGroup = { org_id: "org-1", workspace_id: "ws/1", user_id: "user-1", origin_id: "origin-1", source: "claude", session_id: "sess:1" };

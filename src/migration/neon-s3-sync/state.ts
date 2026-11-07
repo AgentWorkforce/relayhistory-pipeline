@@ -59,15 +59,16 @@ export class SyncState {
 
   /**
    * S3X_OBLIGATIONS (default OFF): the durable unresolved-write obligation model (its schema, triggers and genesis on
-   * open, the exporter's invocation recording and claims, and the paged gated erasure job). Off is today's behaviour
-   * byte for byte: none of it is created, recorded or consulted. An explicit option overrides the environment.
+   * open, the exporter's invocation recording and claims, and the paged gated erasure job). Off creates, records and
+   * consults none of it (its schema statement is main's, digest-pinned); OFF still carries the unflagged safety changes
+   * (the strict paged eraser, the state-path refusals), so it is not main's behaviour in every respect. An explicit option overrides the environment.
    */
   readonly obligations: boolean;
 
   constructor(path: string, opts: { obligations?: boolean; direct?: boolean; inMemoryForTests?: boolean } = {}) {
     this.obligations = opts.obligations ?? obligationsFlag(process.env.S3X_OBLIGATIONS);
     // M-C rev 2 (state-path.ts): OFF opens the configured path as before (refusing an obligations pointer); ON uses a
-    // FRESH state only: a pointer + sibling database, bootstrapped durably before any external effect.
+    // FRESH state only: a pointer + sibling database, bootstrapped durably before the caller can make any S3 or database call.
     let dbPath = path;
     let pointer: { stateId: string } | null = null;
     if (!opts.direct && !(opts.inMemoryForTests && path === ":memory:")) {
@@ -136,7 +137,7 @@ export class SyncState {
    * Bootstrap a FRESH ON state: create the sibling exclusively (0600), commit the schema + a random state_id, checkpoint
    * the WAL COMPLETELY and close the sole bootstrap connection (an fsync of the main file alone would not persist
    * commits still in -wal), then fsync + publish the pointer (state-path.ts publishPointer). Any failure refuses
-   * before any external effect, with nothing adopted or guessed.
+   * in the constructor (before the caller's first S3 or database call), with nothing adopted or guessed.
    */
   static #checkIdentityReadOnly(dbPath: string, stateId: string) {
     let id: string | undefined;
