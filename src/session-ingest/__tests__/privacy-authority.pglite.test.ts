@@ -406,3 +406,50 @@ test("reset coverage: a disable removes the session's owned identity (as Neon de
   expect(await frozenDeleted(f, "ONLY-IDENTITY")).toBe(1);
   expect(((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_owned_sessions WHERE session_id='ONLY-IDENTITY'")).rows[0] as any).n).toBe(0);
 });
+
+/**
+ * "C3 must purge digest narratives": the F4 narrative cache (#299, migration 045000, lands after 041000) is purged in the
+ * authority's head transaction on every disable and reset, through #299's own purge function (vendored verbatim in the
+ * fixture). Without 045000 the guarded call is a no-op.
+ */
+async function withNarratives(f: F) {
+  await f.db.exec(await Bun.file(new URL("./fixtures/digest-narrative-cache-045000.sql", import.meta.url)).text());
+  const add = (ws: string) =>
+    f.db.query("INSERT INTO sessions.daily_digest_narratives(org_id,workspace_id,day,tz,scope_key,stats_hash,narrative_text,narrative_generated_at) VALUES($1,$2,'2026-11-05','UTC',$3,$4,'cached text',now())",
+      [TENANT.orgId, ws, "workspace:" + JSON.stringify([ws, null]), "a".repeat(64)]);
+  await add(TENANT.workspaceId);
+  await add("other-ws");
+  return async () => (await f.db.query("SELECT workspace_id FROM sessions.daily_digest_narratives ORDER BY 1")).rows.map((r: any) => r.workspace_id);
+}
+
+test("digest narratives: a Supabase-authority reset purges the workspace's cached narratives (other workspaces kept)", async () => {
+  const f = await setup();
+  const n = await fakeNeon();
+  open.push(n.close);
+  await activateFrom(f, n);
+  const left = await withNarratives(f);
+  expect(await left()).toEqual(["other-ws", TENANT.workspaceId].sort());
+  await authorityControl(f, "reset", { request_id: "purge-1" });
+  expect(await left()).toEqual(["other-ws"]);
+});
+
+test("digest narratives: a Supabase-authority disable purges them; a re-enable does not", async () => {
+  const f = await setup();
+  const n = await fakeNeon();
+  open.push(n.close);
+  await activateFrom(f, n);
+  const o = await origin();
+  const left = await withNarratives(f);
+  await authorityControl(f, "selection", { origin_id: o, sessions: [{ source: "claude", session_id: "S" }], enabled: true });
+  expect(await left()).toEqual(["other-ws", TENANT.workspaceId].sort());
+  await authorityControl(f, "selection", { origin_id: o, sessions: [{ source: "claude", session_id: "S" }], enabled: false });
+  expect(await left()).toEqual(["other-ws"]);
+});
+
+test("digest narratives: without migration 045000 the guarded purge is a no-op (reset still succeeds)", async () => {
+  const f = await setup();
+  const n = await fakeNeon();
+  open.push(n.close);
+  await activateFrom(f, n);
+  expect((await authorityControl(f, "reset", { request_id: "no-045" })).head).toMatchObject({ apply: true });
+});

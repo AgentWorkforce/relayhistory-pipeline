@@ -343,6 +343,22 @@ END $authority_release$;
 REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_release(jsonb)
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
+-- Derived caches that can hold text of a deleted session. Neon's set_session_uploads deletes the workspace's
+-- daily_digests (0074) when the user had a copy; the Supabase replacement is sessions.daily_digest_narratives,
+-- purged by sessions.purge_daily_digest_narratives (migration 20261105045000, lane F4, which lands AFTER this one).
+-- So the call is guarded: when 045000 is not applied the function does not exist and there is no cache to purge.
+-- Conservative: every disable and every reset purges the workspace's narratives (a cache: it regenerates).
+-- Same transaction as the head and the frozen privacy writes (045000's contract for C3).
+CREATE FUNCTION sessions.ingest_privacy_authority_purge_derived(p_org text,p_ws text) RETURNS void
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp AS $authority_purge_derived$
+BEGIN
+ IF to_regprocedure('sessions.purge_daily_digest_narratives(text,text)') IS NOT NULL THEN
+  EXECUTE 'SELECT sessions.purge_daily_digest_narratives($1,$2)' USING p_org,p_ws;
+ END IF;
+END $authority_purge_derived$;
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_purge_derived(text,text)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
 -- Neon's set_session_uploads / reset_uploaded_sessions, over the frozen copy. Called only inside the authority begin.
 CREATE FUNCTION sessions.ingest_privacy_authority_apply(p_org text,p_ws text,p_user text,p_kind text,p_payload jsonb) RETURNS bigint
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp AS $authority_apply$
@@ -365,6 +381,7 @@ BEGIN
      AND origin_id=v_origin AND source=item->>'source' AND session_id=item->>'session_id';
    END IF;
   END LOOP;
+  IF NOT v_enabled THEN PERFORM sessions.ingest_privacy_authority_purge_derived(p_org,p_ws);END IF;
   RETURN NULL;
  END IF;
  v_request:=p_payload->>'request_id';
@@ -384,6 +401,7 @@ BEGIN
  DELETE FROM sessions.ingest_frozen_source_records WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL;
  DELETE FROM sessions.ingest_frozen_source_owned_sessions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user;
  DROP TABLE pg_temp.pa_owned;
+ PERFORM sessions.ingest_privacy_authority_purge_derived(p_org,p_ws);
  INSERT INTO sessions.ingest_frozen_source_resets VALUES(p_org,p_ws,p_user,v_request,v_total);
  RETURN v_total;
 END $authority_apply$;

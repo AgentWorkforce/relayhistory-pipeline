@@ -501,6 +501,9 @@
     "sessions.ingest_privacy_authority_packet(jsonb,jsonb,jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_privacy_authority_purge_derived(text,text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_privacy_authority_release(jsonb)": [
       "<owner>:EXECUTE"
     ],

@@ -98,7 +98,7 @@ describe("unified sessions function-boundary generator", () => {
 
   test("041000 privacy authority: exactly two ingest-callable SECDEF functions; the rollback restores the 010000 mirror verbatim behind its guards", async () => {
     const g = await generate(repo, LANES, VERIFIERS);
-    expect(g.summary.lanes["privacy-authority"]).toEqual({ functions: 11, replaces: 2, grants: 2 });
+    expect(g.summary.lanes["privacy-authority"]).toEqual({ functions: 12, replaces: 2, grants: 2 });
     const acl = JSON.parse(g.outputs[ACL_PATH]!).functions as Record<string, string[]>;
     const granted = Object.entries(acl).filter(([k, v]) => k.startsWith("sessions.ingest_privacy_authority_") && v.some((x) => x.startsWith("bulls96_session_ingest"))).map(([k]) => k).sort();
     expect(granted).toEqual(["sessions.ingest_privacy_authority_begin(jsonb)", "sessions.ingest_privacy_authority_complete(jsonb)"]);
