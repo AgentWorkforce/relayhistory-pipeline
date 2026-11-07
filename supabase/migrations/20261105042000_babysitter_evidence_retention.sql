@@ -100,6 +100,9 @@ CREATE TABLE sessions.babysitter_evidence_index(
  record_id text NOT NULL CHECK(octet_length(record_id) BETWEEN 1 AND 512),
  revision bigint NOT NULL CHECK(revision>0),
  revision_id text NOT NULL CHECK(octet_length(revision_id) BETWEEN 1 AND 512),
+ -- The record's content digest (prepare's per-record sha256): the identity of the BODY a commit
+ -- source must have accepted (an equal revision with another body is not this row).
+ digest text NOT NULL CHECK(digest~'^[0-9a-f]{64}$'),
  operation text NOT NULL CHECK(operation IN('upsert','delete')),
  kind text NOT NULL CHECK(kind IN('session_lineage','turn_receipt')),
  -- upsert: the exact create-only object (b=<sha32(batch digest)>.ndjson.zst) and 0-based line.
@@ -176,7 +179,7 @@ END $hour$;
 -- p: {tenant{orgId,workspaceId,userId}, originId, batchId, batchDigest, claimToken, generation,
 --     resetEpoch, buckets:[{source, sessionId, eraseAfterMs}],
 --     records:[{bucket (index into buckets), originId, recordId, revision (decimal string),
---               revisionId, operation upsert|delete, kind, line (upsert) | null, expiresAtMs (upsert) | null}]}
+--               revisionId, digest, operation upsert|delete, kind, line (upsert) | null, expiresAtMs (upsert) | null}]}
 -- Each record becomes one content-free key-index row (the reader's native order and tombstones).
 -- returns {objects:[{ref, source, sessionId, eraseAfterMs}] in input order, reopened}
 CREATE FUNCTION sessions.ingest_babysitter_retention_register(p jsonb) RETURNS jsonb
@@ -258,7 +261,7 @@ BEGIN
  v_object:='b='||left(encode(sha256(convert_to(p->>'batchDigest','UTF8')),'hex'),32)||'.ndjson.zst';
  v_n:=jsonb_array_length(p->'buckets');
  FOR v_rec IN SELECT e FROM jsonb_array_elements(p->'records') e LOOP
-  PERFORM sessions.ingest_exact_keys(v_rec,ARRAY['bucket','originId','recordId','revision','revisionId','operation','kind','line','expiresAtMs']);
+  PERFORM sessions.ingest_exact_keys(v_rec,ARRAY['bucket','originId','recordId','revision','revisionId','digest','operation','kind','line','expiresAtMs']);
   -- Prepare binds every record's origin to its batch's (so to this user's machine).
   IF sessions.ingest_identifier(v_rec->'originId',false)<>v_origin THEN
    RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter retention: record origin is not the batch origin';END IF;
@@ -277,12 +280,12 @@ BEGIN
     OR (v_rec->>'expiresAtMs')::numeric<>trunc((v_rec->>'expiresAtMs')::numeric) OR (v_rec->>'expiresAtMs')::numeric NOT BETWEEN 1 AND 9007199254740991)
    OR v_op='delete' AND (v_rec->'line'<>'null'::jsonb OR v_rec->'expiresAtMs'<>'null'::jsonb) THEN
    RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter retention: record position malformed';END IF;
-  INSERT INTO sessions.babysitter_evidence_index AS t(org_id,workspace_id,machine_id,object_ref,origin_id,record_id,revision,revision_id,operation,kind,object_name,line,expires_at_ms)
-   VALUES(v_org,v_ws,v_machine,v_refs[v_b],v_origin,sessions.ingest_identifier(v_rec->'recordId',false),v_rev,v_rid,v_op,v_rec->>'kind',
+  INSERT INTO sessions.babysitter_evidence_index AS t(org_id,workspace_id,machine_id,object_ref,origin_id,record_id,revision,revision_id,digest,operation,kind,object_name,line,expires_at_ms)
+   VALUES(v_org,v_ws,v_machine,v_refs[v_b],v_origin,sessions.ingest_identifier(v_rec->'recordId',false),v_rev,v_rid,sessions.ingest_digest(v_rec->'digest'),v_op,v_rec->>'kind',
     CASE WHEN v_op='upsert' THEN v_object END,CASE WHEN v_op='upsert' THEN (v_rec->>'line')::integer END,CASE WHEN v_op='upsert' THEN (v_rec->>'expiresAtMs')::bigint END)
   -- A retried or re-batched revision re-points at the latest registration (the one that commits).
   ON CONFLICT(org_id,workspace_id,origin_id,record_id,revision) DO UPDATE
-   SET machine_id=EXCLUDED.machine_id,object_ref=EXCLUDED.object_ref,operation=EXCLUDED.operation,kind=EXCLUDED.kind,
+   SET machine_id=EXCLUDED.machine_id,object_ref=EXCLUDED.object_ref,digest=EXCLUDED.digest,operation=EXCLUDED.operation,kind=EXCLUDED.kind,
     object_name=EXCLUDED.object_name,line=EXCLUDED.line,expires_at_ms=EXCLUDED.expires_at_ms
    -- Only this user's own earlier registration of the same revision may be re-pointed.
    WHERE t.revision_id=EXCLUDED.revision_id AND t.machine_id=EXCLUDED.machine_id;
@@ -481,7 +484,7 @@ BEGIN
   SELECT DISTINCT ON (i.origin_id COLLATE "C",i.record_id COLLATE "C")
    i.origin_id,i.record_id,i.revision,i.revision_id,i.operation,i.object_name,i.line,i.expires_at_ms,
    o.machine_id,o.object_ref,o.source,o.session_id,o.erase_after,o.state,sessions.babysitter_retention_fenced(o) AS fenced,
-   c.revision AS c_rev,c.revision_id AS c_rid,n.current_revision AS n_rev
+   i.digest,c.revision AS c_rev,c.revision_id AS c_rid,c.digest AS c_digest,n.current_revision AS n_rev,n.current_digest AS n_digest
   FROM sessions.babysitter_evidence_index i
   JOIN sessions.babysitter_retention_objects o
    ON o.org_id=i.org_id AND o.workspace_id=i.workspace_id AND o.machine_id=i.machine_id AND o.object_ref=i.object_ref
@@ -500,9 +503,13 @@ BEGIN
   v_scanned:=v_scanned+1;
   v_last:=jsonb_build_array(r.origin_id,r.record_id);
   CONTINUE WHEN r.fenced OR r.state='erased';
-  -- Committed: no commit source holds a newer revision, and one holds exactly this one.
+  -- Committed: no commit source holds a newer revision, and one holds exactly THIS BODY: the same
+  -- revision, revision id and content digest (ingest_record_revisions), or the same revision and
+  -- digest in the native custody slot (an equal revision whose body the ack refused keeps the
+  -- slot's earlier digest, so it is not this row).
   CONTINUE WHEN coalesce(r.c_rev>r.revision,false) OR coalesce(r.n_rev>r.revision,false)
-   OR NOT (coalesce(r.c_rev=r.revision AND r.c_rid IS NOT DISTINCT FROM r.revision_id,false) OR coalesce(r.n_rev=r.revision,false));
+   OR NOT (coalesce(r.c_rev=r.revision AND r.c_rid=r.revision_id AND r.c_digest=r.digest,false)
+        OR coalesce(r.n_rev=r.revision AND r.n_digest=r.digest,false));
   CONTINUE WHEN (v_src IS NOT NULL AND r.source<>v_src) OR (NOT v_any_sess AND r.session_id IS DISTINCT FROM v_sess);
   IF r.operation='delete' OR r.erase_after<=v_now OR r.expires_at_ms<=v_now_ms THEN
    CONTINUE WHEN NOT v_inc;
