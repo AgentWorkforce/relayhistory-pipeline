@@ -189,6 +189,21 @@ SET search_path = pg_catalog, sessions, pg_temp AS $neon_free$
           AND (r.session_id = p_session_id OR r.session_id IN (SELECT ptr.session_id FROM ptr)));
 $neon_free$;
 
+-- The same proof for the read API's turns/metadata routes (src/shared/never-in-neon.ts), as
+-- bulls96_read_api: the org is the transaction's bound tenant (session_directory_read_api_scope),
+-- never a caller argument. SECURITY DEFINER only to read the frozen copy and seal, which the read
+-- role cannot; it returns one boolean.
+CREATE FUNCTION sessions.session_neon_free_for(p_workspace_id text, p_session_id text)
+RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $neon_free_for$
+DECLARE
+  v_org text := sessions.session_directory_read_api_scope(p_workspace_id);
+BEGIN
+  IF p_session_id IS NULL OR length(p_session_id) NOT BETWEEN 1 AND 512 THEN RETURN false; END IF;
+  RETURN sessions.session_analysis_neon_free(v_org, p_workspace_id, p_session_id);
+END
+$neon_free_for$;
+
 -- The admission principal's tenant pin (session_directory_read_api_scope's pattern):
 -- refuses 42501 unless the caller is bulls96_analysis_admit and the transaction's bound
 -- tenant (the verified assertion) is exactly (p_org_id, p_workspace_id).
@@ -436,6 +451,8 @@ REVOKE ALL ON FUNCTION sessions.session_analysis_admit_scope(text, text) FROM PU
 REVOKE ALL ON FUNCTION sessions.session_analysis_source_revision(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_neon_free(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
 GRANT EXECUTE ON FUNCTION sessions.session_analysis_neon_free(text, text, text) TO service_role;
+REVOKE ALL ON FUNCTION sessions.session_neon_free_for(text, text) FROM PUBLIC, anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION sessions.session_neon_free_for(text, text) TO bulls96_read_api;
 GRANT EXECUTE ON FUNCTION sessions.session_analysis_source_revision(text, text, text) TO service_role;
 REVOKE ALL ON FUNCTION sessions.analysis_request_v1(text, text, text, text)
   FROM PUBLIC, anon, authenticated, service_role;
@@ -457,6 +474,7 @@ BEGIN
     'sessions.session_analysis_admit_scope(text, text)'::regprocedure,
     'sessions.session_analysis_source_revision(text, text, text)'::regprocedure,
     'sessions.session_analysis_neon_free(text, text, text)'::regprocedure,
+    'sessions.session_neon_free_for(text, text)'::regprocedure,
     'sessions.analysis_request_v1(text, text, text, text)'::regprocedure,
     'sessions.analysis_request_json_v1(sessions.session_analysis_requests_v2)'::regprocedure,
     'sessions.analysis_read_v1(text, text)'::regprocedure
@@ -471,6 +489,7 @@ BEGIN
          AND NOT (r.rolname = 'bulls96_analysis_admit' AND v_fn = 'sessions.analysis_request_v1(text, text, text, text)'::regprocedure)
          AND NOT (r.rolname = 'service_role' AND v_fn = 'sessions.session_analysis_source_revision(text, text, text)'::regprocedure)
          AND NOT (r.rolname = 'service_role' AND v_fn = 'sessions.session_analysis_neon_free(text, text, text)'::regprocedure)
+         AND NOT (r.rolname = 'bulls96_read_api' AND v_fn = 'sessions.session_neon_free_for(text, text)'::regprocedure)
     LOOP
       EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I', v_fn, v_grantee);
     END LOOP;

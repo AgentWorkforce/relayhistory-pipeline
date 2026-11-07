@@ -21,8 +21,7 @@ import {
 } from "../session-read-api/canonical.ts";
 import { SESSION_HARNESSES_SQL } from "../session-read-api/session-turns-source.ts";
 import { objectStoreManifestReader } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
-import { RELAYHISTORY_EXPORT_EXTENSION } from "@rhc/lib/pipeline/relayhistory-transform.ts";
-import type { ManifestV1 } from "../shared/vendor.ts";
+import { NEON_FREE_SQL, neonDerivedManifest, neverInNeon } from "../shared/never-in-neon.ts";
 import { SESSION_POINTERS_SQL } from "../session-read-api/session-timing-source.ts";
 import type { AnalysisModelTransport } from "./engine/model.ts";
 import type { AnalysisEvidenceDeps } from "./evidence.ts";
@@ -66,13 +65,8 @@ async function pointers(db: SqlExecutor, identity: CanonicalIdentity): Promise<C
   return rows.map((r) => ({ ...(r as unknown as CanonicalPointer), content_sha256: hex(r.content_sha256), deleted_at: null }));
 }
 
-/** A manifest written by the Neon export/sync (signed export marker or a backfill epoch). */
-export function neonDerivedManifest(manifest: ManifestV1): boolean {
-  return (
-    manifest.extensions?.[RELAYHISTORY_EXPORT_EXTENSION] !== undefined ||
-    manifest.raw.epochs.some((epoch) => epoch.reason === "backfill")
-  );
-}
+/** Shared with the read API's turns routes (src/shared/never-in-neon.ts). */
+export { neonDerivedManifest } from "../shared/never-in-neon.ts";
 
 export function canonicalEvidenceDeps(
   db: SqlExecutor,
@@ -98,18 +92,19 @@ export function canonicalEvidenceDeps(
      * unreadable manifest is doubt, and doubt is false (the coverage marker stays required).
      */
     async neonFree(identity) {
-      const { rows } = await db.query<{ free: boolean }>("SELECT sessions.session_analysis_neon_free($1, $2, $3) AS free", [
+      const { rows } = await db.query<{ free: boolean }>(NEON_FREE_SQL, [
         identity.orgId,
         identity.workspaceId,
         identity.sessionId,
       ]);
       if (rows[0]?.free !== true) return false;
       const reader = objectStoreManifestReader(canonical.store, { provider: canonical.provider as "s3", bucket: canonical.bucket, maxBytes: 1024 * 1024 });
+      let derived = false;
       for (const p of await pointers(db, identity)) {
         const read = await reader.read(p.manifest_key).catch(() => null);
-        if (!read || neonDerivedManifest(read.manifest)) return false;
+        if (!read || neonDerivedManifest(read.manifest)) derived = true;
       }
-      return true;
+      return neverInNeon(true, derived);
     },
     async anchorManifestKey(identity) {
       const first = (await pointers(db, identity))[0];

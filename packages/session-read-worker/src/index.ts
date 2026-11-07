@@ -30,6 +30,7 @@ import { canonicalSnapshot, CanonicalReadError } from "../../../src/session-read
 import { sqlCanonicalPointers } from "../../../src/session-read-api/session-timing-source.ts";
 import { sqlSessionHarnesses } from "../../../src/session-read-api/session-turns-source.ts";
 import type { TimingDeps, TurnsDeps } from "../../../src/session-read-api/app.ts";
+import { NEON_FREE_FOR_READ_SQL } from "../../../src/shared/never-in-neon.ts";
 import { logLine, type Level } from "../../../src/shared/log.ts";
 import { createClickHouseClient, type ClickHouseClient, type RequestOptions } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-read-api/app.ts";
@@ -253,7 +254,14 @@ export function timingDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers
 export function turnsDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>[0], fetcher: typeof fetch = (input, init) => fetch(input, init)): TurnsDeps | undefined {
   const timing = timingDeps(env, run, fetcher);
   if (!timing) return undefined;
-  return { harnesses: sqlSessionHarnesses(run), source: timing.source };
+  return {
+    harnesses: sqlSessionHarnesses(run),
+    source: timing.source,
+    // The never-in-Neon proof's database half, as the read role, tenant bound by `run`.
+    neonFree: async (scope) =>
+      (await run(scope.orgId, scope.workspaceId, (q) => q.query<{ free: boolean }>(NEON_FREE_FOR_READ_SQL, [scope.workspaceId, scope.sessionId])))
+        .rows[0]?.free === true,
+  };
 }
 
 export default {

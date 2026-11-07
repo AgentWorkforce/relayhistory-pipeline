@@ -69,6 +69,8 @@ export function sqlCanonicalPointers(run: TenantRunner) {
 export interface CanonicalRows {
   rows: Array<{ table: string; row: Record<string, unknown> }>;
   legacyCoverage: { version: 1; tables: string[] } | null;
+  /** A manifest of the scope was written by the Neon export/sync (src/shared/never-in-neon.ts). */
+  neonDerived?: boolean;
 }
 
 export interface TimingOptions {

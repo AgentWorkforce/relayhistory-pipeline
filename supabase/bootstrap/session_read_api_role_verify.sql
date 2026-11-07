@@ -75,7 +75,8 @@ BEGIN
        AND p.oid::regprocedure::text NOT IN (
          'sessions.analysis_read_v1(text,text)',
          'sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
-         'sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)')
+         'sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)',
+         'sessions.session_neon_free_for(text,text)')
   LOOP
     v_problems := array_append(v_problems, (format('EXECUTE on security definer %s', v_row.fn))::text);
   END LOOP;

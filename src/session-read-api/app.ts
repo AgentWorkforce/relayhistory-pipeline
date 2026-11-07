@@ -47,6 +47,7 @@ import { CursorError, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
 import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
+import { neverInNeon } from "../shared/never-in-neon.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
@@ -99,6 +100,11 @@ export interface TurnsDeps {
   harnesses(scope: { orgId: string; workspaceId: string; sessionId: string }): Promise<HarnessState[]>;
   /** One harness scope's canonical rows; `signal` aborts its object reads at the deadline. */
   source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows>;
+  /**
+   * The database half of the never-in-Neon proof (sessions.session_neon_free_for, read role,
+   * tenant bound). Absent: a scope without the export's coverage marker is refused.
+   */
+  neonFree?(scope: { orgId: string; workspaceId: string; sessionId: string }): Promise<boolean>;
   /** Below Cloud's 4 s read timeout. Default 3000. */
   deadlineMs?: number;
 }
@@ -616,7 +622,10 @@ export function createReadApi(deps: ReadApiDeps) {
           }, turns.deadlineMs ?? 3000);
         }),
       ]);
-      return { rows: turnRows(scope, snapshots, source), erased: false };
+      // Only a scope without the coverage marker needs the never-in-Neon proof.
+      const proof = snapshots.some((s) => !s.snapshot.legacyCoverage) && turns.neonFree ? await turns.neonFree(scope) : false;
+      const proven = snapshots.map((s) => ({ ...s, neverInNeon: neverInNeon(proof, s.snapshot.neonDerived === true) }));
+      return { rows: turnRows(scope, proven, source), erased: false };
     } finally {
       clearTimeout(timer);
     }

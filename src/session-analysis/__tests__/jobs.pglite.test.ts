@@ -487,3 +487,36 @@ describe("never-in-Neon proof (session_analysis_neon_free + live-only manifests)
     expect(neonDerivedManifest({ extensions: { "client.relayhistory_export": {} }, raw: { epochs: [] } } as never)).toBe(true);
   });
 });
+
+describe("session_neon_free_for (the read role's half of the shared proof)", () => {
+  const sealNow = () =>
+    pg.query(
+      `INSERT INTO sessions.ingest_frozen_source_completeness
+         (source_identity_sha256, control_epoch, privacy_baseline_sha256, org_count, record_rows, manifest_sha256, neon_snapshot, sealed_at)
+       VALUES (repeat('a',64), repeat('b',64), repeat('c',64), 1, 0, repeat('d',64), '{}'::jsonb, now() - interval '1 hour')`,
+    );
+  async function asRead(bound: { org: string; ws: string }, ws = KEY.workspaceId) {
+    await pg.exec("BEGIN READ ONLY");
+    try {
+      await pg.query("SELECT set_config('bulls96_read.org_id', $1, true), set_config('bulls96_read.workspace_id', $2, true)", [bound.org, bound.ws]);
+      await pg.exec("SET LOCAL ROLE bulls96_read_api");
+      return (await pg.query<{ f: boolean }>("SELECT sessions.session_neon_free_for($1, $2) AS f", [ws, KEY.sessionId])).rows[0]!.f;
+    } finally {
+      await pg.exec("ROLLBACK");
+    }
+  }
+
+  test("the read role gets the same answer, tenant pinned; never-in-Neon only when proven", async () => {
+    expect(await asRead({ org: KEY.orgId, ws: KEY.workspaceId })).toBe(false); // no seal
+    await sealNow();
+    expect(await asRead({ org: KEY.orgId, ws: KEY.workspaceId })).toBe(true);
+    await expect(asRead({ org: KEY.orgId, ws: "ws-b" })).rejects.toThrow(/tenant binding/);
+    await pg.query(
+      "INSERT INTO sessions.ingest_frozen_source_records (org_id, workspace_id, origin_id, record_id, source, session_id) VALUES ($1, $2, 'o', 'r', 'claude', $3)",
+      [KEY.orgId, KEY.workspaceId, KEY.sessionId],
+    );
+    expect(await asRead({ org: KEY.orgId, ws: KEY.workspaceId })).toBe(false);
+    // Not callable by another role.
+    await expect(pg.query("SELECT sessions.session_neon_free_for($1, $2)", [KEY.workspaceId, KEY.sessionId])).rejects.toThrow();
+  });
+});

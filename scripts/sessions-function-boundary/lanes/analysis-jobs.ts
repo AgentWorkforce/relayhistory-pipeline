@@ -25,6 +25,7 @@ export const analysisJobs: LaneManifest = {
     "sessions.session_analysis_admit_scope(",
     "sessions.session_analysis_source_revision(",
     "sessions.session_analysis_neon_free(",
+    "sessions.session_neon_free_for(",
   ],
   grantSources: [{ path: MIGRATION, roles: ["bulls96_read_api", "bulls96_analysis_admit", "service_role"] }],
   functions: {
@@ -35,6 +36,7 @@ export const analysisJobs: LaneManifest = {
     "sessions.session_analysis_admit_scope(text,text)": { secdef: false, grants: [] },
     "sessions.session_analysis_source_revision(text,text,text)": { secdef: false, grants: ["service_role"] },
     "sessions.session_analysis_neon_free(text,text,text)": { secdef: false, grants: ["service_role"] },
+    "sessions.session_neon_free_for(text,text)": { secdef: true, grants: ["bulls96_read_api"] },
   },
   replaces: {},
 };

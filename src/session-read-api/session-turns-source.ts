@@ -110,10 +110,16 @@ function liveAttribution(row: Record<string, unknown>): string | null {
  * The turn rows of a session in one workspace from its harness snapshots, with
  * relayhistory's `source` selection when given. Throws TurnsInputError.
  */
-export function turnRows(identity: Omit<CanonicalIdentity, "source">, snapshots: Array<{ harness: string; snapshot: CanonicalRows }>, source: string | undefined): Record<string, unknown>[] {
+export function turnRows(
+  identity: Omit<CanonicalIdentity, "source">,
+  snapshots: Array<{ harness: string; snapshot: CanonicalRows; neverInNeon?: boolean }>,
+  source: string | undefined,
+): Record<string, unknown>[] {
   const byId = new Map<string, Record<string, unknown>>();
-  for (const { harness, snapshot } of snapshots) {
-    if (!snapshot.legacyCoverage) throw new TurnsInputError("turns_unknown");
+  for (const { harness, snapshot, neverInNeon } of snapshots) {
+    // Without the export's coverage marker a Neon-era scope may lack turns Neon held: refuse.
+    // A scope proven never in Neon (src/shared/never-in-neon.ts) has none to lack: complete.
+    if (!snapshot.legacyCoverage && neverInNeon !== true) throw new TurnsInputError("turns_unknown");
     for (const { table, row } of snapshot.rows) {
       if (table !== "conversation_turns") continue;
       if (row.session_id !== identity.sessionId || row.workspace_id !== identity.workspaceId || row.org_id !== identity.orgId) throw new TurnsInputError("turn_scope");
