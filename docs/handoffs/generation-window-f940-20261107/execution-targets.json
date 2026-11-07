@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "status": "SCHEMA_COMMITTED_VERIFIED_G2_AWAITING_WORKER_THEN_REBIND",
+  "status": "SCHEMA_WORKER_AND_REBIND_VERIFIED_G2_AWAIT_UPLOAD_SAMPLE",
   "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
   "schemaGeneration": "e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",
   "captureGenerationIsSchemaGeneration": false,
@@ -59,6 +59,38 @@
       "receiptSha256": "014f189ee2e8d57b49fb848eb835f6a7fd5ca5c9cc8c15d10c9b03bfc5498254",
       "releaseOwnerNotified": "244952112955813888",
       "deploymentNotYetProved": true
+    },
+    "latestApplyReport": {
+      "status": "UNKNOWN_HOLD_NO_RETRY",
+      "receiptPrefix": "ee6f0c6e",
+      "leadMessage": "244953681824702464",
+      "independentlyReconciledByRoot": false,
+      "receiptSha256": "ee6f0c6ed5043c79a91ebbdda1afb1f252c38fe83b8f6d34f02a876a84cc8766",
+      "releaseOwnerMessage": "244953697937571840",
+      "reportedCounts": {
+        "WorkerPUT": 0,
+        "StateStorePUTAcknowledged200": 1,
+        "otherCFWrites": 0
+      },
+      "qualification": "Peer-reported receipt; current remote state not independently reconciled by Root."
+    },
+    "reconciliation": {
+      "status": "B_NOT_APPLIED_THIS_ATTEMPT",
+      "receipt": "g2-f940-unknown-reconciliation-20261107T223941Z.json",
+      "sha256": "98b3e9bf20f34393739d2727fd6d96b9b0c80b5dc933f3a6da3328e0376658e3",
+      "activeGeneration": "78c7b28e5ebce7f5f534a1f3f41a55845251e950b6c4c49f676f2bda358c91d6"
+    },
+    "replacementPrepare": {
+      "status": "CAPTURE_AND_LIVE_STATE_AUTHORITY_QUALIFIED_NOT_APPLIED",
+      "receipt": "g2-f940-apply-check-20261107T224202Z.json",
+      "sha256": "6e9c4719ee005bcec30d027d98bbf66513dd72b770e047fc9ea6bd5b5edf0cf6"
+    },
+    "deployedG2": {
+      "status": "VERIFIED_DEPLOYED_G2_CODE_AND_20_BINDINGS",
+      "receipt": "g2-f940-after-apply-verify-20261107T225141Z.json",
+      "sha256": "8f0460433c72ac37f9e4fe8276e5643776180fa3befa8b35b0b228541e53cb4e",
+      "activeVersionId": "f858a219-55a2-46d6-97a4-b2c899c4833b",
+      "trafficPercentage": 100
     }
   },
   "bufferedGc": {
@@ -184,7 +216,7 @@
     "source": "direct user message in migration-handover-agent session",
     "schemaApplyAlreadyPerformed": true
   },
-  "productionWritesScope": "One approved four-role bootstrap and canonical 21-migration schema apply; no runtime deploy or generation rebind by Root.",
+  "productionWritesScope": "Approved role bootstrap, canonical schema apply and one generation rebind by Root; reviewed Worker deployment by release owner. GC deferred, publisher unchanged.",
   "currentRefreshedPlanCapture": {
     "planSha256": "95d9012c2183758fd4a81a05f887a8b395c4287e1b9ef37f7d9e7f55a3c7554e",
     "planAt": "2026-11-07T22:02:57.580Z",
@@ -205,8 +237,17 @@
     "completedAt": "2026-11-07T22:31:04.058852+00:00"
   },
   "rebind": {
-    "status": "AWAIT_WORKER_G2_DEPLOYMENT_AND_READBACK",
-    "dryRunPerformed": false,
-    "executePerformed": false
+    "status": "COMMITTED_G2_POSTCENSUS_PASS",
+    "dryRunPerformed": true,
+    "executePerformed": true,
+    "automaticRetry": false,
+    "dryRunReceipt": "approved-window-rebind-dry-result.json",
+    "executeReceipt": "approved-window-rebind-execute-result.json",
+    "executeReceiptSha256": "83716c6b1c703380c13fd466c30c4b25e9c7f2863d9f3cdbfc8f0feb417943da",
+    "completedAt": "2026-11-07T22:53:23.636256+00:00",
+    "admissionsRebound": 1031,
+    "censusReceipt": "approved-window-post-rebind-g2-census.json",
+    "censusReceiptSha256": "ce0fccaaffa72468c399398acf5d3897ec2a856d1447fed1afbff41023cef6e5",
+    "unexpectedAdmissions": 0
   }
 }

@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "at": "2026-11-07T22:33:07.922381+00:00",
+  "at": "2026-11-07T22:54:29.407432+00:00",
   "kind": "directly_approved_role_bootstrap_and_schema_apply_evidence",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
-  "readiness": "SCHEMA_COMMITTED_VERIFIED_G2; Worker deploy and rebind pending; GC deferred; AWS retry succeeded without mutation",
+  "readiness": "SCHEMA_WORKER_AND_REBIND_VERIFIED_G2_AWAIT_UPLOAD_SAMPLE",
   "files": [
     {
       "name": "approved-missing-nologin-bootstrap.ts.txt",
@@ -47,8 +47,8 @@
     },
     {
       "name": "approved-window-current-status.md",
-      "bytes": 2655,
-      "sha256": "c794cef82df70133528d4319ce0cba54554f0422d758faaf20f915f4e4638a88"
+      "bytes": 3921,
+      "sha256": "44266e3f9a03e388587508733611da765afad9fd417b8154e4059d0e27d6d150"
     },
     {
       "name": "approved-window-gc-executor-answer.md",
@@ -66,9 +66,29 @@
       "sha256": "04e8353ad907d8f796ea98cf98b11bb9bcd9218719f460a10f05e24ef4dc8231"
     },
     {
+      "name": "approved-window-post-rebind-g2-census.json",
+      "bytes": 2022,
+      "sha256": "ce0fccaaffa72468c399398acf5d3897ec2a856d1447fed1afbff41023cef6e5"
+    },
+    {
       "name": "approved-window-preapply-g1-census.json",
       "bytes": 1851,
       "sha256": "8331d453a51543b0e75aa57492996bea8761024349caa941d2147c2b0c6a7894"
+    },
+    {
+      "name": "approved-window-rebind-dry-result.json",
+      "bytes": 475,
+      "sha256": "c59068e1cf5c44a92e0c7b676761521131920977025137e5c8887e5e735aca78"
+    },
+    {
+      "name": "approved-window-rebind-execute-result.json",
+      "bytes": 480,
+      "sha256": "83716c6b1c703380c13fd466c30c4b25e9c7f2863d9f3cdbfc8f0feb417943da"
+    },
+    {
+      "name": "approved-window-rebind-staged-invocation.json",
+      "bytes": 1056,
+      "sha256": "c03b8b9bd0461f77afeb46fc3e9160e8b87fcfdd656cfdf4600e50deacf84d72"
     },
     {
       "name": "approved-window-refresh-capture-result.json",
@@ -147,8 +167,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 9995,
-      "sha256": "bf881833d702b62189d454e443b52adb62874b171604b1b285798d3ca2e0b13c"
+      "bytes": 12052,
+      "sha256": "c3841b92201ca8cc755b4d35482d544bf1ee7d133a0fc910b341109a21e5e236"
     },
     {
       "name": "fixed-role-inventory-readonly.ts.txt",
@@ -169,6 +189,31 @@
       "name": "g1-census.json",
       "bytes": 1851,
       "sha256": "71e19b00e7503440259ed1d0dcf9e0ebb40cc8a09a75103d9900f83f461a52fe"
+    },
+    {
+      "name": "g2-f940-after-apply-verify-20261107T225141Z.json",
+      "bytes": 1074,
+      "sha256": "8f0460433c72ac37f9e4fe8276e5643776180fa3befa8b35b0b228541e53cb4e"
+    },
+    {
+      "name": "g2-f940-apply-check-20261107T224202Z.json",
+      "bytes": 679,
+      "sha256": "6e9c4719ee005bcec30d027d98bbf66513dd72b770e047fc9ea6bd5b5edf0cf6"
+    },
+    {
+      "name": "g2-f940-apply-driver-20261107T224204Z.json",
+      "bytes": 603,
+      "sha256": "213427b88ea100e9c589c5f575fdbd985ed1d21a5d60486deb1cf5a431c25180"
+    },
+    {
+      "name": "g2-f940-unknown-reconciliation-20261107T223941Z.json",
+      "bytes": 1316,
+      "sha256": "98b3e9bf20f34393739d2727fd6d96b9b0c80b5dc933f3a6da3328e0376658e3"
+    },
+    {
+      "name": "g2-f940-upload-map-offline-replay-proof-20261107.json",
+      "bytes": 2114,
+      "sha256": "4fc9bd57773ec1d1bb1e76b74da061894dfa6decdc31a7aee33be9515eebede7"
     },
     {
       "name": "gc-last-retained-code-update-receipt.json",
