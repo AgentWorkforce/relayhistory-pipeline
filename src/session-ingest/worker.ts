@@ -66,6 +66,8 @@ export interface IngestWorkerEnv {
   INGEST_EXPECT_GENERATION?:string;
   /** P1: relayhistory (default) | shadow | frozen-supabase (sessions.ingest_frozen_source_witness). */
   INGEST_CUSTODY_SOURCE?: string;
+  /** C3: "supabase" makes the Supabase frozen custody heads the privacy authority (requires INGEST_CUSTODY_SOURCE=frozen-supabase). */
+  INGEST_PRIVACY_AUTHORITY?: string;
   /** Neon-exit release profile: unset/"false" (default) | "true" (src/shared/neon-exit.ts). */
   SESSIONS_NEON_EXIT?: string;
 }
@@ -188,8 +190,12 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: (
   const custodySource = custodySourceOf(env);
   if (!["relayhistory", "shadow", "frozen-supabase"].includes(custodySource) || (custodySource !== "relayhistory" && (env.INGEST_ACCEPTANCE_MODE ?? "canonical") !== "buffered"))
     throw new Error("session ingest: INGEST_CUSTODY_SOURCE must be relayhistory, shadow or frozen-supabase (the latter two only in buffered mode)");
+  const privacyAuthority = env.INGEST_PRIVACY_AUTHORITY?.trim() || "neon";
+  if (!["neon", "supabase"].includes(privacyAuthority) || (privacyAuthority === "supabase" && custodySource !== "frozen-supabase"))
+    throw new Error("session ingest: INGEST_PRIVACY_AUTHORITY must be neon, or supabase with INGEST_CUSTODY_SOURCE=frozen-supabase");
   return createIngestApp({
     custodySource: custodySource as "relayhistory" | "shadow" | "frozen-supabase",
+    privacyAuthority: privacyAuthority as "neon" | "supabase",
     signingKey: settings.signingKey,
     deliver: {
       ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration}),

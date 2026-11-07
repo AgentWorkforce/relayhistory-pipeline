@@ -80,13 +80,29 @@ ssh kjg-lap "zsh -lc 'jq -n --argjson w \"\$(op item get <exporter item> --vault
   --argjson e \"\$(op item get <eraser item> --vault 96Bulls-prod --format json)\" ...'" > ~/.agent-tmp/s3x/creds.fifo
 touch ~/.agent-tmp/s3x/STOP   # stop after the current run
 
-# The erasure job (its own key, its own process; once the eraser item exists):
-NEON_URL_FILE=<(...) S3X_ERASER_CREDS_FILE=<(...) S3X_BUCKET=... S3X_EXPECT_BUCKET=... \
-  bun run migration:neon-s3-erasure --execute
+# The erasure job (its own key, its own process). Credentials ONLY on stdin, held in RAM:
+# one JSON object {"databaseUrl": ..., "eraser": {accessKeyId, secretAccessKey[, sessionToken]}}.
+# databaseUrl must carry user, non-empty password and host; only ?sslmode= is allowed (never ~/.pgpass).
+# NEON_URL_FILE / NEON_URL / S3X_ERASER_CREDS_FILE / AWS_* credential variables refuse to start, and so
+# does a terminal or a regular file on stdin (a pipe from `op` is the intended source).
+ssh kjg-lap "zsh -lc 'jq -cn --arg u \"\$(op read <authority db url ref>)\" \
+  --argjson e \"\$(op item get <eraser item> --vault 96Bulls-prod --format json | jq -c <reshape to the eraser object>)\" \
+  \"{databaseUrl:\$u,eraser:\$e}\"'" | \
+  S3X_BUCKET=... S3X_EXPECT_BUCKET=... bun run migration:neon-s3-erasure --execute
 ```
 
-Dry run (reads Neon, builds everything, stores nothing): run `main.ts` without
-`--execute`.
+`S3X_PRIVACY_AUTHORITY` selects where deletions are read: `neon` (default;
+`databaseUrl` is a direct Neon URL, `deleted_upload_sessions` plus the rollup
+presence sweep) or `supabase` (zero-Neon checklist C3/E3; `databaseUrl` is a
+Supabase direct or session-pooler URL; reads `ingest_frozen_source_deletions`,
+has no presence sweep, and erases nothing unless
+`sessions.ingest_privacy_authority` is `active`). Switch it only after the C3
+activation (migration 20261105041000_ingest_privacy_authority) and the RHC
+`supabase-authority` flip; restarting in `supabase` before activation only
+logs `sweep refused: privacy authority not ready`.
+
+Dry run (reads the authority, builds everything, stores nothing): run `main.ts`
+without `--execute`; it needs only `databaseUrl` on stdin.
 
 ## Later
 

@@ -381,6 +381,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105038000_claim_attempt_records_retirement.sql` | column sessions.ingest_claim_attempts.records_retired_at |
 | `upstream:20261105039000_buffered_gc_single_candidate.sql` | replacement: GC claim contains its single-candidate advisory admission domain |
 | `upstream:20261105040000_ingest_lazy_source_tables.sql` | replacement: lazy-current adoption checks exclude the source-side tables |
+| `upstream:20261105041000_ingest_privacy_authority.sql` | table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix) |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |

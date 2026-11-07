@@ -472,6 +472,63 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_privacy_authority_activate(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_apply(text,text,text,text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_begin(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_complete(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_fence(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_lock(boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_owned_digest()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_packet(jsonb,jsonb,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_purge_derived(text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_release(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_authority_state()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_eraser_groups()": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.ingest_privacy_eraser_page(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.ingest_privacy_eraser_require_active()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_eraser_state()": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.ingest_privacy_eraser_still_fenced(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
     "sessions.ingest_publication_abandon(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

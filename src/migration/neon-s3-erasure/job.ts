@@ -12,13 +12,15 @@
  *  - what the exporter queued: objects a rewritten manifest no longer
  *    references, and session prefixes it no longer produces.
  *
- * It reads Neon (read-only) and the shared watermark, never object content.
+ * It reads the privacy authority (read-only) and the shared watermark, never object content. The
+ * authority is Neon today, or Supabase once C3 activated it (`./authority.ts`, S3X_PRIVACY_AUTHORITY).
  * A session prefix is leased while it is erased, so the exporter never reuses
  * a chunk the eraser is deleting.
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import { orgPrefix } from "../neon-s3-sync/export-session.ts";
-import { activityPage, catalogPage, fencedGroups, fencedLivePage, groupExistsInNeon, lockWaiters, type LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
+import type { LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
+import { isErasureAuthority, neonAuthority, type ErasureAuthority, type ErasurePresence } from "./authority.ts";
 import { liveObjectPrefix, livePointerPrefix, liveSessionsIn, liveStagedPrefix, liveTargets } from "./live.ts";
 
 /** Clock-skew margin between this host and S3 `LastModified`. */
@@ -76,9 +78,11 @@ export class ErasureJob {
   readonly counters = { swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0 };
   #lastSweep = 0;
   #lastProgress = 0;
+  readonly authority: ErasureAuthority;
 
   constructor(
-    readonly db: Queryable,
+    /** A Neon connection (today's authority) or an explicit `ErasureAuthority`. */
+    db: Queryable | ErasureAuthority,
     readonly state: SyncState,
     readonly eraser: Eraser,
     readonly log: Log,
@@ -86,7 +90,9 @@ export class ErasureJob {
     readonly now: () => number = Date.now,
     readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
     readonly stopped: () => boolean = () => false,
-  ) {}
+  ) {
+    this.authority = isErasureAuthority(db) ? db : neonAuthority(db);
+  }
 
   /** Queue the session prefixes of `keys` (manifest keys) and drop them from the group's watermark. */
   #queueGroup(org: string, session: string, keys: string[], reason: string) {
@@ -100,7 +106,16 @@ export class ErasureJob {
   /** With `dryRun`, reports what it would erase and changes nothing. */
   async sweep(opts: { dryRun?: boolean } = {}) {
     const startedAt = this.now();
-    const waiters = await lockWaiters(this.db);
+    const authority = this.authority;
+    try {
+      await authority.ready();
+    } catch (error) {
+      // Not the authority right now: erase nothing at all (a stale fence could destroy a re-enabled session).
+      this.counters.fenceSweepFailed += 1;
+      this.log({ message: "sweep refused: privacy authority not ready", authority: authority.kind, error_code: errorCode(error) });
+      return;
+    }
+    const waiters = await authority.lockWaiters();
     if (waiters.nonAdvisory > 3 || waiters.total > 25) {
       this.log({ message: "sweep deferred: lock waiters", lock_waiters: waiters.total });
       return;
@@ -113,45 +128,19 @@ export class ErasureJob {
       this.log({ message: "live fence sweep failed", error_code: errorCode(error) });
       return { groups: 0, versions: 0 };
     });
-    const id = Number(this.state.meta("erasure_sweep_done") ?? 0) + 1;
-    let after: { org_id: string; session_id: string } | null = null;
+    // Neon only: groups whose rollups and catalog rows vanished from Neon. Under the Supabase authority every
+    // deletion is a fence row (a reset fences each owned session), so there is no presence sweep.
+    let id = Number(this.state.meta("erasure_sweep_done") ?? 0);
     let seen = 0;
-    for (;;) {
-      const rows = await activityPage(this.db, after);
-      // A dry run marks under a sweep id no real sweep uses (and the next real sweep clears).
-      this.state.seeForErasure(opts.dryRun ? -id : id, rows);
-      seen += rows.length;
-      if (rows.length === 0 || this.stopped()) break;
-      after = rows.at(-1)!;
-    }
-    // Catalog sessions count as present too: the exporter exports them.
-    let cat: Parameters<typeof catalogPage>[1] = null;
-    for (;;) {
-      if (this.stopped()) break;
-      const rows = await catalogPage(this.db, cat);
-      this.state.seeForErasure(opts.dryRun ? -id : id, rows);
-      seen += rows.length;
-      if (rows.length === 0) break;
-      cat = rows.at(-1)!;
-    }
-    if (this.stopped()) return;
-    // A sweep that saw nothing at all is a broken read, not an empty Neon: never erase on it.
-    if (seen === 0) {
-      this.log({ message: "sweep saw no rollups; nothing erased" });
-      return;
-    }
-    if (!opts.dryRun) this.state.setMeta("erasure_sweep_done", String(id));
     let gone = 0;
-    for (const g of this.state.vanishedExports(opts.dryRun ? -id : id, startedAt, !opts.dryRun)) {
-      // Confirm on Neon right before erasing: no rollup and no catalog row now
-      // (and, with recognizeLegacy, no legacy turn, link or outcome row).
-      if (await groupExistsInNeon(this.db, g.org_id, g.session_id, this.cfg.recognizeLegacy)) continue;
-      gone += 1;
-      if (!opts.dryRun) this.#queueGroup(g.org_id, g.session_id, g.keys, "gone_from_neon");
+    if (authority.presence) {
+      const r = await this.#presenceSweep(authority.presence, startedAt, opts.dryRun ?? false);
+      if (!r) return;
+      ({ id, seen, gone } = r);
     }
     let fenced = 0;
     try {
-      for (const g of await fencedGroups(this.db)) {
+      for (const g of await authority.fencedGroups()) {
         const row = this.state.exported(g.org_id, g.session_id);
         if (row?.keys.length) {
           if (!opts.dryRun) this.#queueGroup(g.org_id, g.session_id, row.keys, "fenced");
@@ -164,7 +153,48 @@ export class ErasureJob {
     }
     this.counters.swept += 1;
     if (!opts.dryRun) this.state.setMeta("erasure_sweep_at", String(this.now()));
-    this.log({ message: opts.dryRun ? "erasure sweep (dry run)" : "erasure sweep", sweep: id, count: seen, gone, fenced, live_fenced: live.groups, live_versions: live.versions });
+    this.log({ message: opts.dryRun ? "erasure sweep (dry run)" : "erasure sweep", authority: authority.kind, sweep: id, count: seen, gone, fenced, live_fenced: live.groups, live_versions: live.versions });
+  }
+
+  /** The Neon presence sweep. Undefined: stopped, or a broken read (saw nothing); nothing is erased then. */
+  async #presenceSweep(presence: ErasurePresence, startedAt: number, dryRun: boolean): Promise<{ id: number; seen: number; gone: number } | undefined> {
+    const id = Number(this.state.meta("erasure_sweep_done") ?? 0) + 1;
+    let after: { org_id: string; session_id: string } | null = null;
+    let seen = 0;
+    for (;;) {
+      const rows = await presence.activityPage(after);
+      // A dry run marks under a sweep id no real sweep uses (and the next real sweep clears).
+      this.state.seeForErasure(dryRun ? -id : id, rows);
+      seen += rows.length;
+      if (rows.length === 0 || this.stopped()) break;
+      after = rows.at(-1)!;
+    }
+    // Catalog sessions count as present too: the exporter exports them.
+    let cat: Parameters<ErasurePresence["catalogPage"]>[0] = null;
+    for (;;) {
+      if (this.stopped()) break;
+      const rows = await presence.catalogPage(cat);
+      this.state.seeForErasure(dryRun ? -id : id, rows);
+      seen += rows.length;
+      if (rows.length === 0) break;
+      cat = rows.at(-1)!;
+    }
+    if (this.stopped()) return undefined;
+    // A sweep that saw nothing at all is a broken read, not an empty Neon: never erase on it.
+    if (seen === 0) {
+      this.log({ message: "sweep saw no rollups; nothing erased" });
+      return undefined;
+    }
+    if (!dryRun) this.state.setMeta("erasure_sweep_done", String(id));
+    let gone = 0;
+    for (const g of this.state.vanishedExports(dryRun ? -id : id, startedAt, !dryRun)) {
+      // Confirm on Neon right before erasing: no rollup and no catalog row now
+      // (and, with recognizeLegacy, no legacy turn, link or outcome row).
+      if (await presence.groupExists(g.org_id, g.session_id, this.cfg.recognizeLegacy)) continue;
+      gone += 1;
+      if (!dryRun) this.#queueGroup(g.org_id, g.session_id, g.keys, "gone_from_neon");
+    }
+    return { id, seen, gone };
   }
 
   /**
@@ -193,7 +223,7 @@ export class ErasureJob {
       if (this.stopped()) break;
       let rows: LiveFencedGroup[];
       try {
-        rows = await fencedLivePage(this.db, after);
+        rows = await this.authority.fencedLivePage(after);
       } catch (error) {
         this.counters.liveFenceFailed += 1;
         this.log({ message: "live fence sweep failed", error_code: errorCode(error) });
@@ -246,12 +276,7 @@ export class ErasureJob {
         if (dryRun) continue;
         try {
           const checkedAt = this.now();
-          const { rows: still } = await this.db.query(
-            `SELECT 1 FROM sessions.deleted_upload_sessions
-              WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3 AND origin_id = $4 AND source = $5 AND session_id = $6`,
-            [g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id],
-          );
-          if (still.length === 0) continue; // re-enabled since the page was read
+          if (!(await this.authority.stillFenced(g))) continue; // re-enabled since the page was read
           const before = new Date(checkedAt - LIVE_SKEW_MS);
           // The session ingest's staged copies of this (workspace, user, origin)'s batches,
           // once past the fan-out redrive window. Shared by the group's tombstones: once a page.
