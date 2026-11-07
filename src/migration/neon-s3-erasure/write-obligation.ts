@@ -1,49 +1,48 @@
 /**
  * THE shared unresolved-write obligation primitive (lead rulings 2026-11-07: "no unresolved-PUT
- * proof", shared-unknown-put-nonterminal, and the 3e8b914d review). F1 (analysis result /
- * backfill PUTs), lane A (E3) and Babysitter retention compose this one implementation; each
- * lane keeps its OWN obligation table behind `ObligationStore` / `ObligationWriter`.
+ * proof", shared-unknown-put-nonterminal, and the 3e8b914d / 8b00f44b reviews). F1 (analysis
+ * result / backfill PUTs), lane A (E3) and Babysitter retention compose this one implementation;
+ * each lane keeps its OWN tables behind `ObligationStore` / `ObligationWriter`.
  *
- * Model: one obligation per object KEY, holding the full set of DISPATCHED invocations at that
- * key. Each invocation (one PUT attempt) gets a durable id recorded BEFORE it is sent, with the
- * attribution evidence the provider will list back: the body's expected ETag (the MD5 of a
- * single-part, non-KMS PutObject body). An invocation's outcome is one of
+ * Model: one obligation per object KEY with the full set of DISPATCHED invocations at that key.
+ * Each invocation (one PUT attempt) gets a durable id recorded BEFORE it is sent. Its outcome:
  *   dispatched  sent; outcome unknown (lost/timed-out response, crash): it MAY still commit;
  *   acked       its OWN confirmed response, with the exact version id it created;
  *   refused     a definite provider refusal of THAT request (e.g. 412 If-None-Match): no write.
  * Terminal evidence clears exactly the invocation it belongs to, never another:
- *   refused                                     -> resolved;
- *   acked v, v owned as its own publish         -> resolved (the version stays);
- *   acked v / observed v, v NOT owned           -> resolved once a fresh strict, COMPLETE
- *                                                  inventory shows that exact version absent
- *                                                  (version ids are never reused);
- *   dispatched, nothing attributed              -> UNRESOLVED (nonterminal), however old.
- * Attribution: a listed, unowned, non-marker version whose ETag equals a dispatched
- * invocation's expected ETag is recorded on ONE such invocation (`observe`, durable BEFORE that
- * version's delete); each version is attributed at most once, so two attempts with one visible
- * version leave the other unresolved. Another owner's success, a different stray, a zero
- * inventory, time, lease expiry or a generation change are never terminal for an invocation.
- * A version that cannot be attributed (no expected ETag recorded, or a provider whose ETag is
- * not the body MD5) is still erased if unowned, but resolves nothing.
+ *   refused                                -> resolved;
+ *   acked v, v owned as its own publish    -> resolved (the version stays);
+ *   acked v, v NOT owned                   -> resolved once a fresh strict, COMPLETE inventory
+ *                                             shows that exact version absent (version ids are
+ *                                             never reused);
+ *   dispatched                             -> UNRESOLVED, indefinitely.
+ * There is NO content attribution: an ETag (even a body MD5, which SSE-KMS does not give) is
+ * CONTENT identity, not REQUEST identity, so a listed version never resolves a dispatched
+ * invocation (a pre-existing identical-content stray, or another invocation's identical body,
+ * would otherwise retire a PUT that can still commit). Strays are erased as cleanup only.
  *
  * NONTERMINAL UNKNOWN (shared-unknown-put-nonterminal ruling): without its own terminal
  * evidence an invocation stays unresolved indefinitely, re-swept on the bounded backoff
- * (capped at 1 day, so a stuck key costs one strict listing per day). It is never marked
- * erased by a timeout or any number of zero inventories, and the lane never reports the scope
- * fully erased while it remains. There is NO credential-rotation / bucket-policy / deny
- * observation terminal shortcut: preventing new requests does not prove an already-dispatched
- * one cannot commit; an error from a different later request never resolves an earlier one.
+ * (capped at 1 day, so a stuck key costs one strict listing per day). It is never resolved by a
+ * timeout, a lease expiry, a generation change, a zero inventory or a matching listed version,
+ * and the lane never reports the scope fully erased while it remains. There is NO
+ * credential-rotation / bucket-policy / deny-observation shortcut, and an error from a
+ * different later request never resolves an earlier lost acknowledgement.
  *
- * Atomicity: every sweep-side mutation is a compare-and-set on the row version (`rev`) the
- * sweep loaded; a changed row (a new invocation, a publish, a new owner) refuses the mutation
- * and the reconcile returns "refused" without retiring anything. The lane's publish path must
- * refuse to adopt a version an obligation has OBSERVED for deletion.
+ * Deletion reservations (distinct from any outcome evidence): before ANY version is deleted,
+ * EVERY doomed version of the page is reserved atomically (`reserve`) under the same row lock
+ * the lane's publish takes, so publish and reserve conflict in either order: a version owned
+ * before the reserve is refused (nothing in that page is deleted); a publish after the reserve
+ * must refuse the reserved version. A reservation proves nothing about which PUT created it.
+ *
+ * Atomicity: every sweep-side mutation is a compare-and-set on the row version (`rev`) the sweep
+ * loaded; a changed row refuses and the reconcile returns "refused" without retiring anything.
  *
  * Reconcile (`reconcileObligation`) always goes through the shared strict paged eraser
- * (eraser.ts eraseStep / verifyErased): every unowned version at the key is erased (cleanup),
- * by exact version id, successor-safe (owned versions are never selected); the checkpoint scope
- * binds the lane identity, key, owned set and invocation set; authority (rev) is re-checked
- * before every page's deletes; an owner with an unrecorded version id blocks every erase.
+ * (eraser.ts eraseStep / verifyErased): every unowned version at the key is erased, by exact
+ * version id, successor-safe (owned versions are never selected); the checkpoint scope binds
+ * the lane identity, key, owned set and invocation set; the row version is re-checked before
+ * every page's deletes; an owner with an unrecorded version id blocks every erase.
  */
 import { createHash } from "node:crypto";
 import type { EraseBudget, EraseCheckpoint, ListedVersion, PagedEraser } from "./eraser.ts";
@@ -54,12 +53,8 @@ export interface WriteInvocation {
   /** Durable id recorded BEFORE the PUT is sent (never reused). */
   id: string;
   outcome: InvocationOutcome;
-  /** acked: the version id its own response confirmed. */
+  /** acked: the version id its OWN response confirmed. */
   versionId?: string;
-  /** dispatched: the version a sweep attributed to it (recorded before deleting it). */
-  observedVersion?: string;
-  /** The body's expected ETag (lowercase hex MD5, no quotes), for attribution. */
-  expectedEtag?: string;
 }
 
 /** The obligation row as the sweep loads it; `rev` is the compare-and-set token. */
@@ -79,14 +74,18 @@ export interface ObligationState {
 export type Cas = { ok: true; rev: number } | { ok: false };
 
 /**
- * The lane's sweep-side adapter over its own table. Every mutation is a compare-and-set on
+ * The lane's sweep-side adapter over its own tables. Every mutation is a compare-and-set on
  * `rev` and returns the new rev, or { ok: false } when the row changed (or is gone). Each must
  * be durable when it returns (commit on its own) because remote deletes follow.
  */
 export interface ObligationStore {
   load(): Promise<ObligationState | null>;
-  /** Attribute `versionId` to dispatched invocation `invocationId` (it becomes unadoptable). */
-  observe(rev: number, invocationId: string, versionId: string): Promise<Cas>;
+  /**
+   * Atomically reserve EVERY version about to be deleted, under the row lock the lane's publish
+   * takes: refused ({ ok: false }) if the row changed or any version is owned (published) now;
+   * after it succeeds, a publish of any reserved version must be refused.
+   */
+  reserve(rev: number, versionIds: readonly string[]): Promise<Cas>;
   saveCheckpoint(rev: number, checkpoint: EraseCheckpoint): Promise<Cas>;
   /** Clear exactly these invocations (each on its own terminal evidence). */
   resolve(rev: number, invocationIds: readonly string[]): Promise<Cas>;
@@ -98,17 +97,16 @@ export interface ObligationStore {
 
 /**
  * The lane's writer side (its own SQL, inside ITS transaction `Tx`):
- *   dispatch  BEFORE the PUT, with the writer's lease/generation: a NEW invocation id and the
- *             body's expected ETag (never reuse an id);
- *   acked     its own confirmed response: the exact version id (resolves only this invocation);
+ *   dispatch  BEFORE the PUT, with the writer's lease/generation: a NEW invocation id;
+ *   acked     its OWN confirmed response: the exact version id (resolves only this invocation);
  *   refused   a definite refusal of this very request (no write happened);
- *   publish   the terminal success of an owner: records the owned version in the same tx; it
- *             must refuse a version any obligation has observed for deletion.
- * A timeout / abort / lost response leaves the invocation dispatched (unknown); nothing else
- * may downgrade or clear it.
+ *   publish   an owner's terminal success: records the owned version in the same tx, under the
+ *             same row lock `reserve` takes, and MUST refuse a version reserved for deletion.
+ * A timeout / abort / lost response leaves the invocation dispatched (unknown); nothing else may
+ * downgrade or clear it.
  */
 export interface ObligationWriter<Tx> {
-  dispatch(tx: Tx, key: string, identity: readonly unknown[], invocationId: string, expectedEtag: string | null): Promise<void>;
+  dispatch(tx: Tx, key: string, identity: readonly unknown[], invocationId: string): Promise<void>;
   acked(tx: Tx, key: string, invocationId: string, versionId: string): Promise<void>;
   refused(tx: Tx, key: string, invocationId: string): Promise<void>;
   publish(tx: Tx, key: string, identity: readonly unknown[], versionId: string): Promise<void>;
@@ -122,42 +120,36 @@ export function nextSweepDelayMs(sweeps: number): number {
   return Math.min(86_400_000, 60_000 * 2 ** n);
 }
 
-/** The body ETag a single-part, non-KMS PutObject reports (lowercase hex MD5). */
-export function expectedEtag(body: Uint8Array): string {
-  return createHash("md5").update(body).digest("hex");
-}
-
 /** The checkpoint scope: lane identity, key, owned set and the invocation set. */
 export function obligationScope(s: Pick<ObligationState, "key" | "identity" | "ownedVersions" | "invocations">): string {
   const owned = [...s.ownedVersions].sort();
-  const inv = [...s.invocations].map((i) => [i.id, i.outcome, i.versionId ?? null, i.observedVersion ?? null]).sort((a, b) => String(a[0]).localeCompare(String(b[0])));
-  return "write-obligation:" + createHash("sha256").update(JSON.stringify(["write-obligation-v2", s.identity, s.key, owned, inv])).digest("hex");
+  const inv = [...s.invocations].map((i) => [i.id, i.outcome, i.versionId ?? null]).sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  return "write-obligation:" + createHash("sha256").update(JSON.stringify(["write-obligation-v3", s.identity, s.key, owned, inv])).digest("hex");
 }
 
 /**
- * Which invocations have terminal evidence, given a COMPLETE strict inventory's versions at the
- * key (`present`) and the owned set. Pure; exported for the lanes' own SQL-side checks/tests.
+ * Which invocations have their OWN terminal evidence, given a COMPLETE strict inventory's
+ * versions at the key (`present`, or null when the inventory is incomplete) and the owned set.
+ * Pure; a dispatched invocation is never terminal.
  */
 export function terminalInvocations(invocations: readonly WriteInvocation[], owned: ReadonlySet<string>, present: ReadonlySet<string> | null): string[] {
   const out: string[] = [];
   for (const i of invocations) {
     if (i.outcome === "refused") { out.push(i.id); continue; }
-    const v = i.outcome === "acked" ? i.versionId : i.observedVersion;
-    if (!v) continue;                                   // dispatched, nothing attributed: nonterminal
-    if (owned.has(v)) { if (i.outcome === "acked") out.push(i.id); continue; }   // its own publish
-    if (present !== null && !present.has(v)) out.push(i.id);                    // that exact version is gone
+    if (i.outcome !== "acked" || !i.versionId) continue;          // dispatched: nonterminal
+    if (owned.has(i.versionId)) { out.push(i.id); continue; }     // its own publish
+    if (present !== null && !present.has(i.versionId)) out.push(i.id);   // that exact version is gone
   }
   return out;
 }
 
 const coded = (code: string) => Object.assign(new Error(`write obligation: ${code}`), { code });
-const normEtag = (e: string | undefined) => (e ?? "").replace(/^"|"$/g, "").toLowerCase();
 
 /**
  * One bounded reconcile of one key's obligation. Returns "incomplete" (checkpoint saved),
- * "rescheduled" (not provably complete), "retired", "refused" (a compare-and-set lost: the row
- * changed and survives) or "gone". Throws on a failed step (the obligation, its checkpoint and
- * every durable observation stay).
+ * "rescheduled" (not provably complete), "retired", "refused" (a compare-and-set or reservation
+ * lost: the row changed and survives, nothing of that page was deleted) or "gone". Throws on a
+ * failed step (the obligation, its checkpoint and its reservations stay).
  */
 export async function reconcileObligation(
   eraser: PagedEraser,
@@ -179,24 +171,12 @@ export async function reconcileObligation(
     const now = await store.load();
     if (!now || now.rev !== rev) { lost = true; throw coded("authority_changed"); }
   };
-  // Attribution state: each listed version is attributed to at most one dispatched invocation.
-  const pendingAttribution = new Map<string, WriteInvocation[]>();
-  for (const i of first.invocations)
-    if (i.outcome === "dispatched" && !i.observedVersion && i.expectedEtag) {
-      const e = normEtag(i.expectedEtag);
-      pendingAttribution.set(e, [...(pendingAttribution.get(e) ?? []), i]);
-    }
-  const attributed = new Set(first.invocations.map((i) => i.observedVersion).filter((v): v is string => !!v));
   const unowned = (v: ListedVersion) => v.key === key && !owned.has(v.versionId);
+  // Reserve EVERY doomed version (attributable or not) under the publish lock before its delete.
   const beforeDelete = async (doomed: readonly ListedVersion[]) => {
-    for (const v of doomed) {
-      if (v.deleteMarker || attributed.has(v.versionId)) continue;
-      const queue = pendingAttribution.get(normEtag(v.etag));
-      const inv = queue?.shift();
-      if (!inv) continue;
-      if (!(await cas(store.observe(rev, inv.id, v.versionId)))) { lost = true; throw coded("authority_changed"); }
-      attributed.add(v.versionId);
-    }
+    const ids = doomed.filter((v) => v.key === key).map((v) => v.versionId);
+    if (!ids.length) return;
+    if (!(await cas(store.reserve(rev, ids)))) { lost = true; throw coded("reservation_refused"); }
   };
   const checkpoint = first.checkpoint && first.checkpoint.scope === scope ? first.checkpoint : null;
   let step;
@@ -231,34 +211,42 @@ export class PutTimeout extends Error {
   constructor() { super("write obligation: PUT exceeded its wall deadline (outcome unknown)"); }
 }
 
+/** Runs an auxiliary hook so that neither a synchronous throw nor an async rejection escapes. */
+function contained(run: () => unknown): void {
+  try {
+    const r = run();
+    if (r && typeof (r as Promise<unknown>).then === "function") (r as Promise<unknown>).then(undefined, () => {});
+  } catch { /* an auxiliary late-evidence hook never crashes the caller or changes the outcome */ }
+}
+
 /**
  * The writer's bounded PUT with an ENFORCED wall deadline (the PUT is raced against an
  * independent timer; a port that ignores the abort cannot hang the caller). On the timeout,
  * or any error the caller does not classify as a definite refusal, `onUnknown` durably keeps
  * the invocation dispatched/unknown BEFORE the failure propagates; a definite refusal calls
  * `onRefused`. A late result or rejection after the deadline is contained and reported to
- * `onLate` only: it is never treated as proof of no commit, and the PUT is never retried here.
+ * `onLate` only (its own throws/rejections contained too): it never resolves the invocation,
+ * is never treated as proof of no commit, and the PUT is never retried here.
  */
 export async function boundedPut<T>(
   put: (signal: AbortSignal) => Promise<T>,
-  hooks: { onUnknown: () => Promise<void>; onRefused?: () => Promise<void>; isRefusal?: (error: unknown) => boolean; onLate?: (outcome: { ok: true; value: T } | { ok: false; error: unknown }) => void },
+  hooks: { onUnknown: () => Promise<void>; onRefused?: () => Promise<void>; isRefusal?: (error: unknown) => boolean; onLate?: (outcome: { ok: true; value: T } | { ok: false; error: unknown }) => unknown },
   timeoutMs = 120_000,
 ): Promise<T> {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 900_000) throw coded("timeout_bounds");
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let settled = false;
   const attempt = Promise.resolve().then(() => put(controller.signal));
   const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new PutTimeout()), timeoutMs); });
   try {
-    const value = await Promise.race([attempt, deadline]);
-    settled = true;
-    return value;
+    return await Promise.race([attempt, deadline]);
   } catch (error) {
-    settled = true;
     if (error instanceof PutTimeout) {
-      controller.abort(error);
-      attempt.then((value) => hooks.onLate?.({ ok: true, value }), (e) => hooks.onLate?.({ ok: false, error: e }));
+      contained(() => controller.abort(error));
+      attempt.then(
+        (value) => contained(() => hooks.onLate?.({ ok: true, value })),
+        (e) => contained(() => hooks.onLate?.({ ok: false, error: e })),
+      );
       await hooks.onUnknown();
       throw error;
     }
@@ -267,6 +255,5 @@ export async function boundedPut<T>(
     throw error;
   } finally {
     clearTimeout(timer);
-    void settled;
   }
 }
