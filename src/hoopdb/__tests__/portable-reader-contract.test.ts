@@ -32,17 +32,25 @@ async function migrated(): Promise<PGlite> {
   return db;
 }
 
-/** The storage verifier as phase 2 runs it: local owner-run (PGlite's postgres owns everything). */
-const storage = (db: PGlite) => db.transaction(async (tx) => {
+/** The storage verifier as phase 2 runs it: local owner-run (PGlite's postgres owns
+ * everything). `searchPath` makes sessions visible to prove rendering independence. */
+const storage = (db: PGlite, searchPath?: string) => db.transaction(async (tx) => {
+  if (searchPath) await tx.query("SELECT set_config('search_path', $1, true)", [searchPath]);
   await tx.query("SELECT set_config('hoopdb.runtime_role', 'postgres', true), set_config('hoopdb.db_mode', 'local', true)");
   await tx.exec(STORAGE_VERIFY);
 });
-const reader = (db: PGlite) => db.exec(READ_VERIFY);
+const reader = (db: PGlite, searchPath?: string) => db.transaction(async (tx) => {
+  if (searchPath) await tx.query("SELECT set_config('search_path', $1, true)", [searchPath]);
+  await tx.exec(READ_VERIFY);
+});
 
-test("the full migration set passes both verifiers with the exact 048000 reader contract", async () => {
+test("the full migration set passes both verifiers with the exact 048000 reader contract, with sessions on or off search_path", async () => {
   const db = await migrated();
   await reader(db);
   await storage(db);
+  // sessions visible: regclass would render unqualified; both verifiers must still pass.
+  await reader(db, "sessions, public");
+  await storage(db, "sessions, public");
 }, 120_000);
 
 const cases: [string, string, RegExp, RegExp][] = [
@@ -75,6 +83,10 @@ const cases: [string, string, RegExp, RegExp][] = [
     "GRANT SELECT (org_id) ON sessions.session_directory TO bulls96_read_api WITH GRANT OPTION",
     /reader column SELECT WITH GRANT OPTION on the portable relations/,
     /reader column SELECT WITH GRANT OPTION on the portable relations/],
+  ["a required directory contract column dropped (absent attribute, not a revoked grant)",
+    "ALTER TABLE sessions.session_directory DROP COLUMN event_projection_ready CASCADE",
+    /sessions\.session_directory required column event_projection_ready is missing/,
+    /directory required column event_projection_ready is missing/],
 ];
 
 for (const [name, drift, readerMessage, storageMessage] of cases)

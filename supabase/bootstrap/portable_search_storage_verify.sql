@@ -188,6 +188,18 @@ BEGIN
   IF v_portable AND NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = v_rel AND polname = 'search_projection_state_read_api') THEN
     v_problems := array_append(v_problems, 'policy search_projection_state_read_api is missing'::text);
   END IF;
+  -- Before 048000 (neither of its policies exists) no part of its directory reader surface
+  -- may exist either: no reader SELECT on any directory column and no directory policy
+  -- naming the reader. All-or-nothing in this standalone verifier, not only in the
+  -- production reader verifier.
+  IF NOT v_portable AND v_reader IS NOT NULL AND to_regclass('sessions.session_directory') IS NOT NULL THEN
+    IF has_any_column_privilege(v_reader, 'sessions.session_directory', 'SELECT') THEN
+      v_problems := array_append(v_problems, 'reader directory SELECT exists without the 048000 reader contract'::text);
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = 'sessions.session_directory'::regclass AND v_reader = ANY(p.polroles)) THEN
+      v_problems := array_append(v_problems, 'directory policy naming the reader exists without the 048000 reader contract'::text);
+    END IF;
+  END IF;
   -- The directory half of the 048000 reader contract, checked here too so every route
   -- that runs this verifier (phase 2, mark_pass, writer admission) covers it.
   IF v_portable THEN
@@ -214,6 +226,13 @@ BEGIN
     IF NOT coalesce((SELECT relrowsecurity FROM pg_class WHERE oid = to_regclass('sessions.session_directory')), false) THEN
       v_problems := array_append(v_problems, 'RLS is off on sessions.session_directory'::text);
     END IF;
+    FOR v_row IN
+      SELECT c.col FROM unnest(ARRAY['org_id', 'workspace_id', 'harness', 'session_id', 'event_projection_epoch', 'event_projection_ready']) AS c(col)
+       WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a
+                          WHERE a.attrelid = 'sessions.session_directory'::regclass AND a.attname = c.col AND a.attnum > 0 AND NOT a.attisdropped)
+    LOOP
+      v_problems := array_append(v_problems, format('directory required column %s is missing', v_row.col));
+    END LOOP;
     IF v_reader IS NULL OR has_table_privilege(v_reader, 'sessions.session_directory', 'SELECT') THEN
       v_problems := array_append(v_problems, 'reader has whole-table SELECT on sessions.session_directory (or is missing)'::text);
     ELSIF EXISTS (

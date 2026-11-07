@@ -252,3 +252,18 @@ test("048000 rollback removes exactly its surface and the reader fails closed ag
   await verify(db); // back to the 047000-only shape
   await expect(tenantReader(db)("org-a", "ws-a", (tx: any) => tx.query("SELECT 1 FROM sessions.search_projection_state"))).rejects.toThrow(/permission denied/);
 }, 120_000);
+
+test("before 048000 the standalone storage verifier refuses any directory reader surface; 047-only without a reader stays passing", async () => {
+  const clean = await fixture();
+  await verify(clean); // 047-only, no reader surface: PASS
+  const drifts: [string, RegExp][] = [
+    ["GRANT SELECT (org_id) ON sessions.session_directory TO bulls96_read_api", /reader directory SELECT exists without the 048000 reader contract/],
+    ["ALTER TABLE sessions.session_directory ENABLE ROW LEVEL SECURITY; CREATE POLICY reader_dir ON sessions.session_directory FOR SELECT TO bulls96_read_api USING (true)", /directory policy naming the reader exists without the 048000 reader contract/],
+  ];
+  for (const [drift, message] of drifts) {
+    const db = await fixture();
+    await as(db, "mig_owner", () => db.exec(drift));
+    await expect(verify(db)).rejects.toThrow(message);
+    await db.close(); open.pop();
+  }
+}, 120_000);

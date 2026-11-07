@@ -18,11 +18,16 @@ DECLARE
   v_qual text;
   -- 20261105048000 (portable search reader contract): all-or-nothing (see the body).
   v_portable boolean := false;
+  -- regclass/regprocedure render without the schema when it is on search_path; pin a
+  -- catalog-only path for this body so every rendered comparison is caller-independent,
+  -- and restore the caller's value afterwards (transaction-local either way).
+  v_saved_path text := current_setting('search_path');
   v_portable_cols constant jsonb := jsonb_build_object(
     'sessions.search_projection_state', jsonb_build_array('backend_id', 'canonical_session_id', 'complete', 'coverage_from_ms', 'org_id', 'session_id', 'source', 'source_epoch', 'workspace_id'),
     'sessions.session_directory', jsonb_build_array('event_projection_epoch', 'event_projection_ready', 'harness', 'org_id', 'session_id', 'workspace_id'));
   v_tenant_qual constant text := '((org_id = current_setting(''bulls96_read.org_id''::text, true)) AND (workspace_id = current_setting(''bulls96_read.workspace_id''::text, true)))';
 BEGIN
+  PERFORM set_config('search_path', 'pg_catalog, pg_temp', true);
   -- All-or-nothing: 048000 is present iff either of its two policies exists; then its
   -- complete exact surface is required, otherwise any part of it is refused. Independent of
   -- the ledger (test fixtures apply migrations without one) and of search_path.
@@ -51,7 +56,9 @@ BEGIN
 
   -- Effective table privileges in sessions, however obtained.
   FOR v_row IN
-    SELECT c.oid::regclass::text AS rel,
+    -- Explicit schema-qualified name: regclass rendering drops the schema when sessions is
+    -- on the caller's search_path, which would misclassify approved grants.
+    SELECT format('%I.%I', n.nspname, c.relname) AS rel,
            has_table_privilege(v_role.oid, c.oid, 'SELECT') AS sel,
            has_table_privilege(v_role.oid, c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') AS write,
            has_any_column_privilege(v_role.oid, c.oid, 'SELECT') AS col_sel,
@@ -72,6 +79,16 @@ BEGIN
   END LOOP;
   -- Exact column sets of the portable reader contract (only when 048000 is applied).
   IF v_portable THEN
+    -- Every required contract column must exist (not dropped) and be granted; enumerated
+    -- from the contract, not from surviving attributes.
+    FOR v_row IN
+      SELECT t.rel, c.col
+        FROM jsonb_object_keys(v_portable_cols) AS t(rel), jsonb_array_elements_text(v_portable_cols -> t.rel) AS c(col)
+       WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a
+                          WHERE a.attrelid = to_regclass(t.rel) AND a.attname = c.col AND a.attnum > 0 AND NOT a.attisdropped)
+    LOOP
+      v_problems := array_append(v_problems, (format('%s required column %s is missing', v_row.rel, v_row.col))::text);
+    END LOOP;
     FOR v_row IN
       SELECT t.rel, a.attname, has_column_privilege(v_role.oid, t.rel::regclass, a.attnum, 'SELECT') AS sel
         FROM jsonb_object_keys(v_portable_cols) AS t(rel)
@@ -177,6 +194,7 @@ BEGIN
   IF cardinality(v_problems) > 0 THEN
     RAISE EXCEPTION 'session read api role is not in the approved shape: %', array_to_string(v_problems, '; ');
   END IF;
+  PERFORM set_config('search_path', v_saved_path, true);
   RAISE NOTICE 'session read api role: PASS';
 END
 $verify$;
