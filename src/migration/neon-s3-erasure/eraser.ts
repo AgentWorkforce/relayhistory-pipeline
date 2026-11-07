@@ -510,7 +510,14 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
   };
 }
 
-/** The same contract over a plain (unversioned) store, for tests and local runs. */
+/**
+ * The same contract over a plain (unversioned) store, for TESTS AND LOCAL RUNS ONLY.
+ * Its paged listing exhausts the backend's `list` cursors for the directory and materializes,
+ * filters and sorts the result before it returns one synthetic page, so the outer page/version
+ * budgets bound the TRAVERSAL, not the backend list work. It is a functional model of the
+ * contract, NOT a bounded remote-store implementation and NOT evidence of a production budget
+ * (the versioned S3 eraser issues one bounded, key-prefix ListObjectVersions request per page).
+ */
 export function storeEraser(store: ObjectStore): Eraser & PagedEraser {
   // Unversioned: one "null" version per key, pages of 1000 keys after the key marker.
   const fetchPage: PageFetcher = async (prefix, keyMarker) => {
