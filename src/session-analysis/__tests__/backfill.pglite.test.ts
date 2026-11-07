@@ -7,6 +7,8 @@ import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import type { PGlite } from "@electric-sql/pglite";
 import { objectKey, type ObjectStore } from "../../../packages/object-store/src/index.ts";
 import { sweepAnalysisTickets } from "../store.ts";
+import { storeEraser } from "../../migration/neon-s3-erasure/eraser.ts";
+import { FakeS3Versions } from "../../migration/__tests__/fake-s3-versions.ts";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -60,14 +62,8 @@ const fresh = async () => {
   return db;
 };
 const tempStore = () => createFsStore({ root: mkdtempSync(join(tmpdir(), "analysis-bf-")) });
-/** The unversioned fs store's every-version erase: delete, report whether anything was there. */
-const fsEraser = (store: ObjectStore) => ({
-  eraseObject: async (key: string) => {
-    const had = (await store.head(objectKey(key))) !== undefined;
-    await store.delete(objectKey(key));
-    return had ? 1 : 0;
-  },
-});
+/** The shared paged eraser over the unversioned fs store (src/migration/neon-s3-erasure). */
+const fsEraser = (store: ObjectStore) => ({ eraser: storeEraser(store) });
 async function readSp(db: PGlite, store: ObjectStore) {
   await db.exec("BEGIN");
   await db.query("SELECT set_config('bulls96_read.org_id', $1, true), set_config('bulls96_read.workspace_id', $2, true)", [KEY.orgId, KEY.workspaceId]);
@@ -258,7 +254,8 @@ test("P1-b: a tombstone interposed after verify never lets the lost-race retirem
   };
   await expect(applyBackfill(hooked(db, "backfill:retire-lost-race", tombstone), spy.wrapped, SCOPE, plan, fsEraser(store))).rejects.toThrow();
   const tickets = (await db.query<{ k: string; reason: string }>("SELECT result_key k, reason FROM sessions.session_analysis_result_tickets")).rows;
-  expect(tickets).toEqual([{ k: key, reason: "forgotten" }]);
+  // The PUT's outcome is known to us, but the erase trigger cannot know it: 'unknown' (never retired on a timer).
+  expect(tickets).toEqual([{ k: key, reason: "unknown" }]);
 });
 
 test("P1-c: a lapsed backfill lease (fake clock) refuses the Put after a sweep: no orphan can land", async () => {
@@ -268,7 +265,8 @@ test("P1-c: a lapsed backfill lease (fake clock) refuses the Put after a sweep: 
   // The clock jumps past the lease between the ticket and the Put, and a sweep runs.
   const lapse = async () => {
     await db.query("UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() - interval '1 second', created_at = now() - interval '1 day'");
-    expect(await sweepAnalysisTickets(store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), ...fsEraser(store) })).toBe(1);
+    // A pending write of unknown outcome: swept (nothing there) but kept, never retired on a timer.
+    expect(await sweepAnalysisTickets(store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), ...fsEraser(store) })).toBe(0);
   };
   await expect(applyBackfill(hooked(db, "backfill:heartbeat", lapse), spy.wrapped, SCOPE, planBackfill(SCOPE, NEON), fsEraser(store))).rejects.toThrow("backfill_ticket_lease_lost");
   expect(spy.puts).toEqual([]);
@@ -282,56 +280,56 @@ test("P1-c: a lapsed backfill lease (fake clock) refuses the Put after a sweep: 
 });
 
 /**
- * A version-retaining S3 fake. Every put creates a version id (no conditional-create
- * shortcut unless `createOnly`); a plain delete only adds a delete marker. `eraseObject`
- * removes every version and marker; `eraseVersion` removes exactly one id (keepIfSole as
- * createS3Eraser().eraseVersion).
+ * A version-retaining S3 over the SHARED fake (src/migration/__tests__/fake-s3-versions.ts):
+ * every put creates a version id (no conditional-create shortcut unless `createOnly`); a plain
+ * delete only adds a delete marker; `eraser` is the shared strict paged eraser over it. Bytes
+ * live in the fs base (removed once no object version of the key is left).
  */
 function versionedStore(base: ObjectStore, opts: { createOnly?: boolean } = {}) {
-  const versions = new Map<string, { id: string; marker: boolean }[]>();
-  let n = 0;
-  const list = (k: string) => versions.get(k) ?? [];
+  const s3 = new FakeS3Versions();
+  const list = (k: string) => s3.keys.get(k) ?? [];
+  const live = (k: string) => list(k).length > 0 && !list(k)[0]!.marker;
+  const raw = s3.fetch;
+  s3.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const res = await raw(input, init);
+    if (init?.method === "DELETE") {
+      const key = decodeURIComponent(new URL(String(input)).pathname.replace(/^\/b\//, ""));
+      if (!list(key).some((v) => !v.marker)) await base.delete(objectKey(key));
+    }
+    return res;
+  }) as typeof fetch;
   const store: ObjectStore = {
     backend: base.backend,
     head: (k) => base.head(k), get: (k, r) => base.get(k, r), getObject: (k, r) => base.getObject(k, r), list: (p, c) => base.list(p, c),
     presignGet: (k, t) => base.presignGet(k, t),
     async put(key, body, o) {
       const k = String(key);
-      const live = list(k).length > 0 && !list(k).at(-1)!.marker;
-      if (opts.createOnly && live) {
+      if (opts.createOnly && live(k)) {
         // S3 If-None-Match: identical bytes already current -> no new version.
         const ack = await base.put(key, body, o);
         return { ...ack, created: false, version: {} };
       }
-      const id = `v${++n}`;
-      versions.set(k, [...list(k), { id, marker: false }]);
-      if (live) await base.delete(key); // let the fs base accept an overwrite
+      const id = s3.put(k);
+      if (await base.head(key)) await base.delete(key); // let the fs base accept an overwrite
       const ack = await base.put(key, body, { ...o, ifNoneMatch: false });
       return { ...ack, created: true, version: { ...ack.version, version: id } };
     },
     async delete(key) {
       const k = String(key);
-      versions.set(k, [...list(k), { id: `m${++n}`, marker: true }]);
+      s3.keys.set(k, [{ id: `m${Date.now()}${Math.random()}`, at: Date.now(), marker: true }, ...list(k)]);
       await base.delete(key);
     },
   };
-  const eraseObject = async (key: string) => {
-    const count = list(key).length;
-    versions.delete(key);
-    await base.delete(objectKey(key));
-    return count;
-  };
-  const eraseVersion = async (key: string, id: string, o: { keepIfSole?: boolean } = {}) => {
-    const all = list(key);
-    if (o.keepIfSole && all.some((v) => v.id === id) && !all.some((v) => v.id !== id && !v.marker)) return "kept_sole" as const;
-    versions.set(key, all.filter((v) => v.id !== id));
-    if (!list(key).some((v) => !v.marker)) await base.delete(objectKey(key));
-    return "gone" as const;
-  };
   return {
-    store, versions, eraseObject, eraseVersion,
+    store, s3, eraser: s3.eraser(),
     ids: (k: string) => list(k).filter((v) => !v.marker).map((v) => v.id),
-    erasePrefix: (prefix: string) => Promise.all([...versions.keys()].filter((k) => k.startsWith(prefix)).map(eraseObject)),
+    /** C3's whole-prefix erase: every version of every key under the prefix. */
+    erasePrefix: async (prefix: string) => {
+      for (const k of [...s3.keys.keys()].filter((x) => x.startsWith(prefix))) {
+        s3.keys.delete(k);
+        await base.delete(objectKey(k));
+      }
+    },
   };
 }
 
@@ -345,7 +343,7 @@ test("P1-b (verification): a Put stalled past its lease, then sweep + tombstone,
       // Paused right after the heartbeat: the lease lapses, a sweep runs, the session is erased,
       // and C3 retires the whole session prefix.
       await db.query("UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() - interval '1 second', created_at = now() - interval '1 day'");
-      expect(await sweepAnalysisTickets(v.store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraseObject: v.eraseObject })).toBe(1);
+      expect(await sweepAnalysisTickets(v.store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraser: v.eraser })).toBe(0); // kept: clean, nothing accounted for
       await db.query("UPDATE sessions.session_index SET deleted_at = now()");
       await v.erasePrefix("org-a/ws-a/m-1/claude/2026-10-29/s-1/");
       // ...then the stalled Put is released and lands a version.
@@ -353,7 +351,7 @@ test("P1-b (verification): a Put stalled past its lease, then sweep + tombstone,
       return v.store.put(key, body, opts);
     },
   };
-  await expect(applyBackfill(hoopDb(db), paused, SCOPE, planBackfill(SCOPE, NEON), { eraseObject: v.eraseObject, eraseVersion: v.eraseVersion })).rejects.toThrow("backfill_ticket_lease_lost");
+  await expect(applyBackfill(hoopDb(db), paused, SCOPE, planBackfill(SCOPE, NEON), { eraser: v.eraser })).rejects.toThrow("backfill_ticket_lease_lost");
   expect(written).not.toBe("");
   expect(v.ids(written)).toEqual([]);
   expect(await v.store.head(objectKey(written))).toBeUndefined();
@@ -369,30 +367,28 @@ test("P1 (final): if the exact-version erase throws once after the fence, a dura
     ...v.store,
     async put(key, body, opts) {
       await db.query("UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() - interval '1 second', created_at = now() - interval '1 day'");
-      await sweepAnalysisTickets(v.store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraseObject: v.eraseObject });
+      await sweepAnalysisTickets(v.store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraser: v.eraser });
       await db.query("UPDATE sessions.session_index SET deleted_at = now()");
       written = String(key);
       return v.store.put(key, body, opts);
     },
   };
-  let failures = 1;
-  const flaky = async (k: string, id: string, o?: { keepIfSole?: boolean }) => {
-    if (failures-- > 0) throw new Error("S3 503");
-    return v.eraseVersion(k, id, o);
-  };
-  await expect(applyBackfill(hoopDb(db), paused, SCOPE, planBackfill(SCOPE, NEON), { eraseObject: v.eraseObject, eraseVersion: flaky })).rejects.toThrow("S3 503");
-  expect(v.ids(written)).toHaveLength(1);
+  let lose = true;
+  v.s3.onDelete = () => (lose ? ((lose = false), "lose") : undefined); // the exact delete's ack is lost
+  await expect(applyBackfill(hoopDb(db), paused, SCOPE, planBackfill(SCOPE, NEON), { eraser: v.eraser })).rejects.toThrow();
+  expect(v.ids(written)).toEqual([]); // deleted, but the ack was lost: the erase is unproven
   const tickets = (await db.query<{ k: string; reason: string }>("SELECT result_key k, reason FROM sessions.session_analysis_result_tickets")).rows;
   expect(tickets).toEqual([{ k: written, reason: "forgotten" }]);
   await db.query("UPDATE sessions.session_analysis_result_tickets SET created_at = now() - interval '1 second'");
-  expect(await sweepAnalysisTickets(v.store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraseObject: v.eraseObject })).toBe(1);
-  expect(v.versions.get(written) ?? []).toEqual([]);
+  expect(await sweepAnalysisTickets(v.store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraser: v.eraser })).toBe(1);
+  expect(v.ids(written)).toEqual([]);
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
 });
 
 test("P1 (final): the backfill refuses to run without the every-version eraser", async () => {
   const db = await fresh();
   await expect(applyBackfill(hoopDb(db), tempStore(), SCOPE, planBackfill(SCOPE, NEON), {} as never)).rejects.toThrow("backfill_eraser_required");
+  await expect(applyBackfill(hoopDb(db), tempStore(), SCOPE, planBackfill(SCOPE, NEON), { eraseObject: async () => 0 } as never)).rejects.toThrow("backfill_eraser_required");
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
 });
 
@@ -409,7 +405,7 @@ test("item 2: a PUT that outlives its deadline is aborted and refused inside the
   expect(aborted).toBe(true);
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
   expect((await db.query<{ reason: string; lease: unknown }>("SELECT reason, lease_expires_at lease FROM sessions.session_analysis_result_tickets")).rows)
-    .toEqual([{ reason: "forgotten", lease: null }]);
+    .toEqual([{ reason: "unknown", lease: null }]);
 });
 
 test("item 4: a source-generation change during the PUT (a new manifest etag) refuses publication; the version is erased exactly", async () => {
@@ -425,7 +421,7 @@ test("item 4: a source-generation change during the PUT (a new manifest etag) re
       return ack;
     },
   };
-  await expect(applyBackfill(hoopDb(db), moving, SCOPE, planBackfill(SCOPE, NEON), { eraseObject: v.eraseObject, eraseVersion: v.eraseVersion })).rejects.toThrow("backfill_ticket_lease_lost");
+  await expect(applyBackfill(hoopDb(db), moving, SCOPE, planBackfill(SCOPE, NEON), { eraser: v.eraser })).rejects.toThrow("backfill_ticket_lease_lost");
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
   expect(v.ids(written)).toEqual([]);
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
@@ -441,15 +437,15 @@ test("successor-safe: writer A's slow PUT lands AFTER writer B (the new lease) p
     async put(key, body, opts) {
       // A's lease lapses while its PUT is in flight; B takes the ticket over and publishes.
       await db.query("UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() - interval '1 second'");
-      await applyBackfill(hoopDb(db), v.store, SCOPE, plan, { eraseObject: v.eraseObject, eraseVersion: v.eraseVersion });
+      await applyBackfill(hoopDb(db), v.store, SCOPE, plan, { eraser: v.eraser });
       written = String(key);
       // ...then A's PUT lands a second version over B's.
       return v.store.put(key, body, opts);
     },
   };
-  await expect(applyBackfill(hoopDb(db), slowA, SCOPE, plan, { eraseObject: v.eraseObject, eraseVersion: v.eraseVersion })).rejects.toThrow("backfill_ticket_lease_lost");
+  await expect(applyBackfill(hoopDb(db), slowA, SCOPE, plan, { eraser: v.eraser })).rejects.toThrow("backfill_ticket_lease_lost");
   // B's version stays (and stays published); A's is gone.
-  expect(v.ids(written)).toEqual(["v1"]);
+  expect(v.ids(written)).toEqual(["v00000001"]);
   expect((await db.query<{ k: string }>("SELECT result_s3_key k FROM sessions.session_analysis_jobs_v2")).rows).toEqual([{ k: written }]);
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
   expect(parityEqual(NEON, (await readSp(db, v.store))!)).toEqual({ equal: true, requests: 2, analyses: 1 });
@@ -464,13 +460,13 @@ test("successor-safe: with create-only S3 semantics A's late PUT creates nothing
     ...v.store,
     async put(key, body, opts) {
       await db.query("UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() - interval '1 second'");
-      await applyBackfill(hoopDb(db), v.store, SCOPE, plan, { eraseObject: v.eraseObject, eraseVersion: v.eraseVersion });
+      await applyBackfill(hoopDb(db), v.store, SCOPE, plan, { eraser: v.eraser });
       written = String(key);
       return v.store.put(key, body, opts);
     },
   };
-  await expect(applyBackfill(hoopDb(db), slowA, SCOPE, plan, { eraseObject: v.eraseObject, eraseVersion: v.eraseVersion })).rejects.toThrow("backfill_ticket_lease_lost");
-  expect(v.ids(written)).toEqual(["v1"]);
+  await expect(applyBackfill(hoopDb(db), slowA, SCOPE, plan, { eraser: v.eraser })).rejects.toThrow("backfill_ticket_lease_lost");
+  expect(v.ids(written)).toEqual(["v00000001"]);
   expect(parityEqual(NEON, (await readSp(db, v.store))!)).toEqual({ equal: true, requests: 2, analyses: 1 });
 });
 
@@ -492,4 +488,59 @@ test("F2 parity: backfilled title-only legacy briefs (NULL description and state
   const sp = (await readSp(db, store))!;
   const briefs = sp.analyses.map((a: any) => a.result.brief).sort((a: any, b: any) => a.title.localeCompare(b.title));
   expect(briefs).toEqual([{ title: "Fix the queue", description: null, state: null }, { title: "Older" }]);
+});
+
+test("final review P1-a: a C3 purge committed after the generation capture inserts NO request history (bound to the generation and the purge fence)", async () => {
+  const db = await fresh();
+  const store = tempStore();
+  await db.exec(`CREATE TABLE IF NOT EXISTS sessions.ingest_frozen_source_owned_sessions(
+    org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,origin_id text NOT NULL,
+    source text NOT NULL,session_id text NOT NULL,PRIMARY KEY(org_id,workspace_id,user_id,origin_id,source,session_id))`);
+  await db.query("INSERT INTO sessions.ingest_frozen_source_owned_sessions VALUES ($1, $2, 'u-owner', 'o', 'claude', $3)", [KEY.orgId, KEY.workspaceId, KEY.sessionId]);
+  // An ok payload with no analyses and one failed request (analysisId null): no job, no object.
+  const neon: NeonV1Payload = { outcome: "ok", sessionId: KEY.sessionId, analyses: [], requests: [(NEON as any).requests[1]] };
+  let purged = false;
+  const purgeFirst = async () => {
+    if (purged) return;
+    purged = true;
+    await db.query("SELECT sessions.purge_session_analysis_for_owned($1, $2, 'u-owner')", [KEY.orgId, KEY.workspaceId]);
+  };
+  await expect(applyBackfill(hooked(db, "backfill:request", purgeFirst), store, SCOPE, planBackfill(SCOPE, neon), fsEraser(store))).rejects.toThrow("backfill_generation_changed");
+  expect(purged).toBe(true);
+  expect((await db.query("SELECT 1 FROM sessions.session_analysis_requests_v2")).rows).toHaveLength(0);
+  expect((await db.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
+});
+
+test("unknown-PUT: a backfill PUT that loses its response leaves an 'unknown' ticket; the sweeper lists versions and erases the committed stray", async () => {
+  const db = await fresh();
+  const v = versionedStore(tempStore());
+  let written = "";
+  const lossy: ObjectStore = {
+    ...v.store,
+    async put(key, body, opts) {
+      written = String(key);
+      await v.store.put(key, body, opts); // committed...
+      throw new Error("socket hang up"); // ...but the response (and its version id) is lost
+    },
+  };
+  await expect(applyBackfill(hoopDb(db), lossy, SCOPE, planBackfill(SCOPE, NEON), { eraser: v.eraser })).rejects.toThrow("socket hang up");
+  expect((await db.query<{ reason: string }>("SELECT reason FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ reason: "unknown" }]);
+  expect(v.ids(written)).toHaveLength(1);
+  expect(await sweepAnalysisTickets(v.store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraser: v.eraser })).toBe(1);
+  expect(v.ids(written)).toEqual([]);
+  expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
+});
+
+test("unknown-PUT: a published backfill job records its exact version; an unknown stray at the same key is erased, the published version kept", async () => {
+  const db = await fresh();
+  const v = versionedStore(tempStore());
+  await applyBackfill(hoopDb(db), v.store, SCOPE, planBackfill(SCOPE, NEON), { eraser: v.eraser });
+  const job = (await db.query<{ k: string; v: string }>("SELECT result_s3_key k, result_version_id v FROM sessions.session_analysis_jobs_v2")).rows[0]!;
+  expect(job.v).toBe("v00000001");
+  // A stale writer's unknown PUT at the same key commits later.
+  await v.store.put(objectKey(job.k), new TextEncoder().encode("{}"), {});
+  await db.query(`INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, created_at)
+    VALUES ($1, gen_random_uuid(), $2, $3, $4, 'unknown', now() - interval '1 day')`, [job.k, KEY.orgId, KEY.workspaceId, KEY.sessionId]);
+  expect(await sweepAnalysisTickets(v.store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraser: v.eraser })).toBe(1);
+  expect(v.ids(job.k)).toEqual(["v00000001"]);
 });
