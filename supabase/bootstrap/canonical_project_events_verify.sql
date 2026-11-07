@@ -6,7 +6,8 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  v_allowed text[] := ARRAY[
  'sessions.canonical_project_event_ack_v1(jsonb)',
  'sessions.canonical_project_event_read_v1(jsonb)',
- 'sessions.canonical_project_events_pending_v1(jsonb)'
+ 'sessions.canonical_project_events_pending_v1(jsonb)',
+ 'sessions.session_pr_evidence_read_v1(jsonb)'
  ]::text[];
  v_oids oid[];
  v_table text:='SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'||

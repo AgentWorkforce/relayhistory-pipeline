@@ -1520,19 +1520,20 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const R = "upstream:20261105034000_session_directory_read_api.sql";
     const T = "upstream:20261105038000_claim_attempt_records_retirement.sql";
     const G = "upstream:20261105039000_buffered_gc_single_candidate.sql";
+    const PE = "upstream:20261105044000_pr_evidence.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, PE]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, PE]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
@@ -1570,6 +1571,11 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // Roll back the complete039/038 suffix in descending order before earlier lanes.
     expect((await failure(rollback("20261105038000_claim_attempt_records_retirement.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(T);
+    // 044000 (F3 PR evidence) is the latest lane: 039000 refuses until it rolls back.
+    expect((await failure(rollback("20261105039000_buffered_gc_single_candidate.down.sql")))?.code).toBe("55000");
+    await rollback("20261105044000_pr_evidence.down.sql");
+    expect(await names()).not.toContain(PE);
+    expect(await relation("sessions.session_pr_evidence_state")).toBeNull();
     await rollback("20261105039000_buffered_gc_single_candidate.down.sql");
     expect(await names()).not.toContain(G);
     expect(await passed()).toBe(false);
@@ -1628,7 +1634,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 032000, 033000 (F10), 034000 (P3b),
     // 035000 through039000; the post-validation exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, PE]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");

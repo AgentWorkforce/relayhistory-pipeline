@@ -53,6 +53,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql",
       "supabase/rollbacks/20261105033000_canonical_project_events.down.sql",
       "supabase/rollbacks/20261105039000_buffered_gc_single_candidate.down.sql",
+      "supabase/rollbacks/20261105044000_pr_evidence.down.sql",
     ]);
   });
 
