@@ -104,6 +104,15 @@ logs `sweep refused: privacy authority not ready`.
 Dry run (reads the authority, builds everything, stores nothing): run `main.ts`
 without `--execute`; it needs only `databaseUrl` on stdin.
 
+Completion (shared eraser + write obligation v3): a session prefix is erased in
+bounded, resumable steps (checkpoint in the state file, bound to the operation,
+authority, tenant/session or queued item and lease), with every doomed version
+reserved first, and is marked done only after a fresh strict zero inventory AND
+no unresolved exporter PUT under it. A PUT whose outcome is unknown (timeout,
+crash, lost response) keeps the prefix queued indefinitely, re-swept on the
+bounded backoff: `erasure_write_unresolved` in the queue is expected, not a
+failure to clear by hand.
+
 ## Later
 
 Move to a scheduled Worker or a 96Bulls service in us-east-1 (the transcript
