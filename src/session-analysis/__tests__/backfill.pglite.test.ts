@@ -391,3 +391,23 @@ test("P1 (final): the backfill refuses to run without the every-version eraser",
   await expect(applyBackfill(hoopDb(db), tempStore(), SCOPE, planBackfill(SCOPE, NEON), {} as never)).rejects.toThrow("backfill_eraser_required");
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
 });
+
+test("F2 parity: backfilled title-only legacy briefs (NULL description and state, or absent) are served byte-equal", async () => {
+  const db = await fresh();
+  const store = tempStore();
+  const neon = structuredClone(NEON) as any;
+  neon.analyses[0].result.brief = { title: "Fix the queue", description: null, state: null };
+  const second = structuredClone(neon.analyses[0]);
+  second.id = "7a1d4b63-9e3b-5c4f-b5f2-0a2f1e3d4c5b";
+  second.createdAt = "2026-09-29T00:00:00+00:00";
+  second.sourceFingerprint = second.result.sourceFingerprint = "def";
+  second.result.brief = { title: "Older" }; // title-only: no description/state keys at all
+  neon.analyses.push(second);
+  neon.requests.push({ ...neon.requests[0], id: "44444444-4444-4444-8444-444444444444", analysisId: second.id,
+    createdAt: "2026-09-29T00:00:00+00:00", updatedAt: "2026-09-29T00:00:02+00:00" });
+  const out = await backfillScope({ db: hoopDb(db), store, readSp: () => readSp(db, store), ...fsEraser(store) }, SCOPE, neon);
+  expect(out.parity.equal).toBe(true);
+  const sp = (await readSp(db, store))!;
+  const briefs = sp.analyses.map((a: any) => a.result.brief).sort((a: any, b: any) => a.title.localeCompare(b.title));
+  expect(briefs).toEqual([{ title: "Fix the queue", description: null, state: null }, { title: "Older" }]);
+});
