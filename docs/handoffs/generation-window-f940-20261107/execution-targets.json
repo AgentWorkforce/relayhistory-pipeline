@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "status": "HOLD_GC_EXECUTOR_AUTHENTICATION_AND_RUNTIME_BINDINGS_USER_AUTHORIZED",
+  "status": "SCHEMA_COMMITTED_VERIFIED_G2_AWAITING_WORKER_THEN_REBIND",
   "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
   "schemaGeneration": "e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",
   "captureGenerationIsSchemaGeneration": false,
@@ -8,14 +8,12 @@
   "capturedCaptureSha256": "695aa5bfcf18646aabf9081c6028662017d42d94d0e4629a283e5b215f479c50",
   "lastRetainedG1": "78c7b28e5ebce7f5f534a1f3f41a55845251e950b6c4c49f676f2bda358c91d6",
   "freshG1MarkerPolicyAdmissionsProof": {
-    "status": "OBSERVED_READONLY_2026-11-07T19:21:51.808Z",
-    "receipt": "g1-census.json",
-    "sha256": "71e19b00e7503440259ed1d0dcf9e0ebb40cc8a09a75103d9900f83f461a52fe",
-    "markerPassAtG1": true,
-    "policyAtG1AndUnexpired": true,
-    "admissionsAtG1": 1028,
+    "status": "PREAPPLY_PASS_2026-11-07T22:21:07Z",
+    "receipt": "approved-window-preapply-g1-census.json",
+    "sha256": "8331d453a51543b0e75aa57492996bea8761024349caa941d2147c2b0c6a7894",
+    "admissionsAtG1": 1031,
     "unexpectedAdmissions": 0,
-    "refreshBeforeWindow": true
+    "historicalPreApplyOnly": true
   },
   "preWindowRoleAttributesMembershipSettingsProof": {
     "status": "PASS_13_PRESENT_NO_CATALOG_VIOLATIONS",
@@ -55,7 +53,13 @@
     "nativePlanSha256": null,
     "provenanceSha256": null,
     "bundleSha256": null,
-    "qualifiedMemoryBroker": null
+    "qualifiedMemoryBroker": null,
+    "readiness": {
+      "status": "APPLY_READY_WAITING_SCHEMA_COMMITTED_PASS_G2_NOW_NOTIFIED",
+      "receiptSha256": "014f189ee2e8d57b49fb848eb835f6a7fd5ca5c9cc8c15d10c9b03bfc5498254",
+      "releaseOwnerNotified": "244952112955813888",
+      "deploymentNotYetProved": true
+    }
   },
   "bufferedGc": {
     "candidateSource": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
@@ -75,13 +79,18 @@
       "freshProviderPreimageRequired": true
     },
     "executorAvailability": {
-      "status": "NOT_CURRENTLY_AUTHENTICATED_OR_QUALIFIED",
-      "answer": "approved-window-gc-executor-answer.md",
-      "answerSha256": "ca1e2737ce91dd8f70dd372b93921b97760a5084ff352ae7428b5df95837e3db",
-      "existingSession": "cache_expired_or_expiring",
-      "nativeStatusAttempt": "bounded_native_login_timeout",
+      "status": "USER_RETRIGGERED_NATIVE_AWS_STATUS_SUCCESS_SESSION_CLOSED",
+      "receipt": "approved-window-aws-user-retry-result.json",
+      "sha256": "9816ec74e6ee3a494ea073182364b2c94d4e8410b96064c8138a60eef9998508",
       "awsLambdaMutationRequested": false,
-      "cloudShellIntrinsicallyRequired": false
+      "credentialsPersisted": false,
+      "futureLoginRequired": true
+    },
+    "windowDisposition": {
+      "status": "DEFERRED_BY_LEAD",
+      "message": "244948358983348224",
+      "guard": "G1 ingest_buffer_gc_claim requires generation before candidate/lease work; G2 marker refuses G1 claims",
+      "noBacklogClaim": true
     }
   },
   "publisherAndPublicationGc": {
@@ -173,9 +182,9 @@
     "quote": "schema window approved",
     "recordedAt": "2026-11-07T22:03:09.811837+00:00",
     "source": "direct user message in migration-handover-agent session",
-    "schemaApplyAlreadyPerformed": false
+    "schemaApplyAlreadyPerformed": true
   },
-  "productionWritesScope": "Only the one approved four-role bootstrap; no schema migrations or runtime changes.",
+  "productionWritesScope": "One approved four-role bootstrap and canonical 21-migration schema apply; no runtime deploy or generation rebind by Root.",
   "currentRefreshedPlanCapture": {
     "planSha256": "95d9012c2183758fd4a81a05f887a8b395c4287e1b9ef37f7d9e7f55a3c7554e",
     "planAt": "2026-11-07T22:02:57.580Z",
@@ -185,5 +194,19 @@
     "earliestExpiry": "2026-11-07T23:02:57.580000Z",
     "receipt": "approved-window-refresh-receipt.json",
     "sha256": "0ab7eec9ba4fdc6a3e81511ed1d09946de969224767539c80c36758de229f90c"
+  },
+  "schemaApply": {
+    "status": "owner_apply_verified",
+    "receipt": "approved-window-schema-apply-result.json",
+    "sha256": "d690c2b2eaf95f8612bd4b052a54ca87de3c7db7ada53ec00b7aa5926aea25d7",
+    "applied": 21,
+    "skipped": 35,
+    "ledgerSha256": "502349fe27871cb12de3fb93d8b02c3a1ece691ad500c1d7a6b2176dbed66502",
+    "completedAt": "2026-11-07T22:31:04.058852+00:00"
+  },
+  "rebind": {
+    "status": "AWAIT_WORKER_G2_DEPLOYMENT_AND_READBACK",
+    "dryRunPerformed": false,
+    "executePerformed": false
   }
 }
