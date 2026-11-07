@@ -127,6 +127,8 @@ export function analysisTick(deps: {
   transport: AnalysisModelTransport | null;
   /** One HoopDb transaction (the pipeline's `transaction(db, work)`); absent = no sweep. */
   transact?: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
+  /** Every-version erase of one key (versioned bucket); see sweepAnalysisTickets. */
+  eraseObject?: (key: string) => Promise<number>;
 }) {
   return async (): Promise<Record<string, number>> => {
     const counts: Record<string, number> = { completed: 0, failed: 0, "lease-lost": 0, idle: 0 };
@@ -140,7 +142,11 @@ export function analysisTick(deps: {
         evidence.anchorManifestKey({ orgId: job.orgId, workspaceId: job.workspaceId, source: harness, sessionId: job.sessionId }),
     });
     // Orphan publications first (erased, lost or crashed): their objects never outlive a tick.
-    if (deps.transact) counts.swept = await sweepAnalysisTickets(deps.store, { transact: deps.transact });
+    if (deps.transact)
+      counts.swept = await sweepAnalysisTickets(deps.store, {
+        transact: deps.transact,
+        ...(deps.eraseObject ? { eraseObject: deps.eraseObject } : {}),
+      });
     for (let i = 0; i < deps.config.batch; i += 1) {
       const outcome = await runAnalysisJob(
         store,

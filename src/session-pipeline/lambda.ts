@@ -60,6 +60,7 @@ import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.t
 import { briefTick } from "../session-brief/worker.ts";
 import { analysisConfig, analysisTick } from "../session-analysis/worker.ts";
 import { zstdDecompressSync } from "node:zlib";
+import { createS3Eraser } from "../migration/neon-s3-erasure/eraser.ts";
 import{derivedSchemaAssets}from "./derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import {runSemanticCopyTick,semanticFailureReason} from "../search-features/semantic-copy-job.ts";
@@ -339,6 +340,9 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     },
     transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
     transact: (work) => transaction(db, work),
+    // The bucket is versioned: the sweeper erases every version of an orphan result key.
+    eraseObject: (key) =>
+      createS3Eraser({ bucket: env.bucket, region: env.region, credentials: lambdaCredentials() }).eraseObject(key),
   });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
   // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
@@ -637,11 +641,14 @@ export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok:
     try {
       const rt = await ready();
       const counts = await rt.sessionAnalysis();
+      // A job that fails is a recorded job outcome (its code is on the row), not a tick error.
       log.info("session analysis tick", { stage: "session-analysis", count: counts.completed ?? 0, failed: counts.failed ?? 0, skipped: counts["lease-lost"] ?? 0, duration_ms: Date.now() - started });
-      return { ok: (counts.failed ?? 0) === 0 };
+      return { ok: true };
     } catch (error) {
       log.error("session analysis tick failed", { stage: "session-analysis", ...errorFields(error), duration_ms: Date.now() - started });
-      return { ok: false };
+      // Surface it: the invocation fails, so the Lambda Errors metric (and its alarm) and the
+      // schedule's async retry see it; a swallowed {ok:false} would be invisible.
+      throw new Error("session analysis tick failed");
     }
   }
   log.warn("unknown invocation", { stage: "init", reason: "unknown_event" });

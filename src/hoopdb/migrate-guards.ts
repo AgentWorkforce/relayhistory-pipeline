@@ -121,6 +121,10 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_briefs": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_brief_wakeups": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_brief_attempts": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  // Lane F1 (20261105046000): the session-analysis worker's claim/reserve/complete/fail and sweep.
+  "sessions.session_analysis_jobs_v2": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_analysis_requests_v2": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_analysis_result_tickets": ["SELECT", "INSERT", "UPDATE", "DELETE"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const RUNTIME_APPLICATION_SEQUENCES = [
@@ -160,6 +164,9 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_briefs",
   "sessions.session_brief_wakeups",
   "sessions.session_brief_attempts",
+  "sessions.session_analysis_jobs_v2",
+  "sessions.session_analysis_requests_v2",
+  "sessions.session_analysis_result_tickets",
 ] as const;
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [

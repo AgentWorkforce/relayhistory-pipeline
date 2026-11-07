@@ -139,14 +139,21 @@ REVOKE ALL ON sessions.session_analysis_result_tickets FROM PUBLIC, anon, authen
 GRANT ALL ON sessions.session_analysis_result_tickets TO service_role;
 
 -- The live pointer set of a session as the read API matches it (canonical id, else raw
--- id), signed: any pointer add, removal, revision or content change moves it. NULL when
--- no pointer is live.
+-- id), signed over every field canonicalSourceGeneration (src/session-read-api/canonical.ts)
+-- binds: the tenant and canonical session id, and per pointer the harness, canonical and
+-- physical machine id, user id, storage provider, bucket, manifest key, revision, raw
+-- content digest and raw format. Any change to any of them moves it, so a reuse or a
+-- publication can never outlive a pointer correction. NULL when no pointer is live.
 CREATE FUNCTION sessions.session_analysis_source_revision(p_org_id text, p_workspace_id text, p_session_id text)
 RETURNS text LANGUAGE sql STABLE
 SET search_path = pg_catalog, sessions, pg_temp AS $revision$
-  SELECT CASE WHEN count(*) = 0 THEN NULL ELSE encode(sha256(convert_to(string_agg(
-           concat_ws('|', p.harness, p.machine_id, p.manifest_key, p.revision::text, encode(p.content_sha256, 'hex')),
-           E'\n' ORDER BY p.harness, p.machine_id, p.manifest_key), 'UTF8')), 'hex') END
+  SELECT CASE WHEN count(*) = 0 THEN NULL ELSE encode(sha256(convert_to(
+           concat_ws('|', p_org_id, p_workspace_id, p_session_id) || E'\n' || string_agg(
+           concat_ws('|', p.harness, coalesce(p.canonical_session_id, p.session_id),
+             coalesce(p.canonical_machine_id, p.machine_id), p.machine_id, p.user_id,
+             p.storage_provider, p.bucket, p.manifest_key, p.revision::text,
+             encode(p.content_sha256, 'hex'), p.raw_format),
+           E'\n' ORDER BY p.manifest_key, p.harness, p.machine_id), 'UTF8')), 'hex') END
     FROM sessions.session_index AS p
    WHERE p.org_id = p_org_id AND p.workspace_id = p_workspace_id
      AND (coalesce(p.canonical_session_id, p.session_id) = p_session_id OR p.session_id = p_session_id)

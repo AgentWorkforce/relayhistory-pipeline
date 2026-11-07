@@ -201,9 +201,54 @@ export function pipelineKeyStatement(i: { accountId: string; region: string; buc
   };
 }
 
-/** Bucket-policy grants for the pipeline role: list keys, read session objects. Nothing else. */
-export function pipelineBucketStatements(i: { bucketArn: string; roleArn: string }) {
+/** The only object root the analysis worker writes (src/session-analysis/results.ts). */
+export const ANALYSIS_RESULT_OBJECT_GLOB = `${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/*/normalized/session-analysis-v2/*`;
+
+/**
+ * Lane F1, only with analysisJobs enabled: the pipeline role creates, verifies and erases
+ * analysis result objects (and their exact versions, the bucket is versioned), and only
+ * under normalized/session-analysis-v2/.
+ */
+export function pipelineAnalysisBucketStatements(i: { bucketArn: string; roleArn: string }) {
   return [
+    {
+      Sid: "SessionPipelineWritesAnalysisResults",
+      Effect: "Allow" as const,
+      Principal: { AWS: i.roleArn },
+      Action: ["s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"],
+      Resource: [`${i.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`],
+    },
+    {
+      // The sweeper's every-version erase lists the versions of exactly its result keys.
+      Sid: "SessionPipelineListsAnalysisResultVersions",
+      Effect: "Allow" as const,
+      Principal: { AWS: i.roleArn },
+      Action: ["s3:ListBucketVersions"],
+      Resource: [i.bucketArn],
+      Condition: { StringLike: { "s3:prefix": [ANALYSIS_RESULT_OBJECT_GLOB] } },
+    },
+  ];
+}
+
+/** Lane F1: SSE-KMS data keys for those objects only (encryption context = the object ARN). */
+export function pipelineAnalysisKeyStatement(i: { accountId: string; region: string; bucketName: string; roleArn: string }) {
+  return {
+    Sid: "SessionPipelineEncryptsAnalysisResultsViaS3",
+    Effect: "Allow" as const,
+    Principal: { AWS: i.roleArn },
+    Action: ["kms:GenerateDataKey", "kms:Encrypt"],
+    Resource: "*",
+    Condition: {
+      StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
+      StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${ANALYSIS_RESULT_OBJECT_GLOB}` },
+    },
+  };
+}
+
+/** Bucket-policy grants for the pipeline role: list keys, read session objects (and, with analysis jobs, write their results). */
+export function pipelineBucketStatements(i: { bucketArn: string; roleArn: string; analysisResults?: boolean }) {
+  return [
+    ...(i.analysisResults ? pipelineAnalysisBucketStatements(i) : []),
     {
       Sid: "SessionPipelineLists",
       Effect: "Allow" as const,
