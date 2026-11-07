@@ -29,8 +29,15 @@
 --    only the ACK-accepted candidate is served. Upserts point at their exact bucket object
 --    line (and go with the bucket's erase); deletes are PERMANENT payload-free tombstones with
 --    no bucket, removed only by a privacy fence (disable/reset, C3).
---  * babysitter_write_obligations: one durable unresolved-write obligation per bucket object
---    (the shared write-obligation.ts contract); a bucket is erased only when all are complete.
+--  * babysitter_write_obligations: one durable unresolved-write obligation per bucket object KEY
+--    (the shared write-obligation.ts contract: row version, resume checkpoint, re-sweep backoff);
+--    a bucket is erased only when none remains.
+--  * babysitter_write_invocations: one row per DISPATCHED PUT at a key, resolved only by its own
+--    terminal evidence (acked with its own version id, or refused).
+--  * babysitter_write_reservations: every version an erase is about to delete, reserved under
+--    the key row's lock first, so a publisher and the erase can never both win.
+--  * babysitter_purge_cursor: owner-only singleton holding the privacy purge's keyset cursor
+--    over the permanent tombstones (bounded work per claim), apart from the settings row.
 --
 -- Erase/write fence: a registration is refused while the bucket is leased, and a bucket is
 -- claimable only after a 15 min hold-off since its last registration. That narrows races but
@@ -56,7 +63,8 @@ CREATE TABLE sessions.babysitter_retention_settings(
 INSERT INTO sessions.babysitter_retention_settings(singleton,enabled,dry_run) VALUES(true,false,true);
 -- The privacy purge's keyset cursor over the permanent tombstones (bounded work per claim). Its own
 -- singleton row, NOT the settings row: a claim holds settings FOR SHARE and takes this row
--- FOR UPDATE SKIP LOCKED, so concurrent claims never upgrade a shared lock (no deadlock); a claim
+-- FOR UPDATE SKIP LOCKED, so concurrent claims never upgrade a shared settings lock (which removes
+-- that lock-upgrade deadlock cycle; it is not a claim about every lock in the system); a claim
 -- that finds the cursor busy skips the purge for this call and still claims buckets.
 CREATE TABLE sessions.babysitter_purge_cursor(
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),

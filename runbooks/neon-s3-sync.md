@@ -90,14 +90,23 @@ holds only the eraser key ("sessions-prod transcript eraser").
     stays pending only because zero is not yet proven.
   - **Semantics (both kinds):** a refusal is an error for that item or group
     only, and the item is NOT marked done: the queued erasure, tombstone or
-    fence stays pending and is retried on the next sweep (as any failed
-    erase). Other items still run. A retry lists afresh; after a post-delete
+    fence stays pending and is retried. A fenced tombstone is found again by
+    the next sweep (every 10 min). A queued item records the code in its
+    `error` column and backs off 1, 2, 4 ... minutes, capped at one hour
+    (`src/migration/neon-s3-sync/state.ts:317`), and is retried after that.
+    Other items still run. A retry lists afresh; after a post-delete
     refusal it sees only what survived.
-  - **Where the codes appear:** the erasure job's structured log lines carry
-    `error_code` (`erasure failed` with `kind` for a queued item; `fence sweep
-    failed`, `live fence sweep failed`, `live listing failed` or `live erasure
-    failed` for a sweep), and its counters (`failed`, `fenceSweepFailed`,
-    `liveFenceFailed`) count them. A refusal never stops the job; the oldest
+  - **Where the S3 refusal codes appear** (`src/migration/neon-s3-erasure/job.ts`):
+    as `error_code` on the job's structured log lines `live listing failed`
+    (:270) and `live erasure failed` (:301), counted by `liveFenceFailed`, and
+    `erasure failed` with `kind` for a queued item (:348), counted by `failed`.
+    The erasure backlog's `failing` count is the queued items whose `error` is
+    set.
+  - **Authority failures are different lines** (no S3 call was made, nothing
+    was deleted): `sweep refused: privacy authority not ready` (:115) and
+    `fence sweep failed` (:152), counted by `fenceSweepFailed`, and `live fence
+    sweep failed` (:128, :229), counted by `liveFenceFailed`. Fix the
+    authority, never the inventory checks. A refusal never stops the job; the oldest
     queued item's age drives `erasure SLA at risk` after 24 h.
   - **Operator action** (the lead's ruling, verbatim): "retain the
     obligation/tombstone, investigate the inventory shape, or move to a
