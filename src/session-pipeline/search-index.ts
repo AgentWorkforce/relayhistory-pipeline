@@ -50,6 +50,7 @@ import { chNow, deleteRows, windowStart, type PendingDelete } from "./vendor/sea
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
 import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
+import { adapterProjectionIo, type SearchProjectionIo, type SearchServiceBinding } from "./search-adapter.ts";
 
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
 
@@ -58,7 +59,9 @@ export interface SearchIndexDeps {
   transact: Transact;
   reader: ManifestReader;
   store: ObjectStore;
-  ch: ClickHouseClient;
+  ch?: ClickHouseClient;
+  /** Explicit registered service composition; mutually exclusive with legacy CH. */
+  adapter?: SearchServiceBinding;
   /** The deployment prefix of an org's keys, e.g. `96bulls/<org>`. */
   prefixFor(orgId: string): string;
   decompress?: (stored: Uint8Array, maxOutputLength: number) => Uint8Array;
@@ -241,9 +244,11 @@ async function livePointerSnapshot(tx: SqlExecutor, scope: SessionScope): Promis
 }
 
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
+  if (Boolean(deps.ch) === Boolean(deps.adapter)) throw new Error("search requires exactly one service binding");
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
   return deps.transact(async (tx) => {
+    const io = deps.adapter ? adapterProjectionIo(deps.adapter, tx) : legacyProjectionIo(deps.ch!);
     // Non-blocking: a pass already running for this session is busy for as long
     // as its ClickHouse work takes. The caller re-enqueues this event with a
     // delay instead of waiting (and timing out into the DLQ behind a hot session).
@@ -260,7 +265,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     // A stale DB alias is not authority to delete another canonical session.
     if(layoutComponent(pointerSnapshot.canonicalId)!==scope.sessionId){
       await invalidateDirectoryEvents(tx,scope);
-      await recordState(deps.ch,scope,0,0,false,at,pointerSnapshot.canonicalId);
+      await io.record(scope,0,0,false,at,pointerSnapshot.canonicalId);
       return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["canonical_session_mismatch"]};
     }
     const {rows:siblings}=await tx.query<{manifest_key:string}>(`SELECT manifest_key FROM sessions.session_index
@@ -269,37 +274,29 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if(!keys.length&&siblingKeys.length){
       // Erasing one alias must never erase a live canonical sibling.
       await invalidateDirectoryEvents(tx,scope);
-      await recordState(deps.ch,scope,0,0,false,at,pointerSnapshot.canonicalId);
+      await io.record(scope,0,0,false,at,pointerSnapshot.canonicalId);
       return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,reasons:["canonical_scope_still_live"]};
     }
     if (keys.length === 0) {
       // Erased: no live manifest is left, so every row of the scope goes, in or
       // out of the window. One predicate delete, no listing, so no size can
       // truncate it. It throws on failure and the message retries.
-      await deps.ch.command(
-        `DELETE FROM ${EVENTS_TABLE}
-         WHERE org_id = {org:String} AND workspace_id = {workspace:String}
-           AND source = {source:String} AND (session_id = {session:String} OR session_id = {canonical:String})`,
-        {
-          params: { org: scope.orgId, workspace: scope.workspaceId, source: scope.harness, session: scope.sessionId, canonical: pointerSnapshot.canonicalId },
-          settings: { lightweight_deletes_sync: 2 },
-          timeoutMs: 120_000,
-        },
-      );
-      await recordState(deps.ch,scope,0,0,true,at,pointerSnapshot.canonicalId);
+      await io.erase(scope,pointerSnapshot.canonicalId);
+      await io.record(scope,0,0,true,at,pointerSnapshot.canonicalId);
       await completeErasedDirectoryEvents(tx,scope);
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
     }
-    const fromMs = Date.parse(await windowStart(deps.ch, at));
+    const fromMs = await io.fromMs(at);
     const s3 = await readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId);
     if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
       await invalidateDirectoryEvents(tx,scope);
-      await recordState(deps.ch,scope,s3.revision,0,false,at,pointerSnapshot.canonicalId);
+      await io.record(scope,s3.revision,0,false,at,pointerSnapshot.canonicalId);
       return {manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]};
     }
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
-    const chRows = await clickhouseScope(deps.ch, scope, fromMs, limits.maxRows + 1, pointerSnapshot.canonicalId);
-    const truncated = chRows.length > limits.maxRows;
+    const scan = await io.scan(scope, pointerSnapshot.canonicalId, fromMs, limits.maxRows);
+    const chRows = scan.rows;
+    const truncated = scan.truncated;
     const existing = new Map<string, ScopeIdentity[]>();
     for (const r of chRows) existing.set(keyOf(r), [...(existing.get(keyOf(r)) ?? []), r]);
 
@@ -308,11 +305,16 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       const same = existing.get(keyOf({ machineId: r.machine_id, source: r.source, kind: r.kind, eventId: r.event_id })) ?? [];
       return !same.some((c) => c.sessionId === r.session_id && c.workspaceId === r.workspace_id && c.tsMs === tsMs && c.fingerprint === r.fingerprint);
     });
+    let inserted = 0;
     for (let i = 0; i < toInsert.length; i += limits.insertBatch)
-      await deps.ch.insert(EVENTS_TABLE, toInsert.slice(i, i + limits.insertBatch), { timeoutMs: 60_000 });
+      inserted += await io.upsert(toInsert.slice(i, i + limits.insertBatch), scope, pointerSnapshot.canonicalId);
 
-    const deletes: PendingDelete[] = [];
-    let complete = s3.complete && !truncated;
+    const deletes: ScopeIdentity[] = [];
+    let deletedCount = 0;
+    // A version-guarded adapter may refuse a stale write. Never delete against
+    // that older snapshot or mark its projection complete.
+    const staleWrite = inserted !== toInsert.length;
+    let complete = s3.complete && !truncated && !staleWrite;
     if (!complete) await invalidateDirectoryEvents(tx, scope);
     if (complete) {
       const wanted = new Map(inWindow.map((r) => [keyOf({ machineId: r.machine_id, source: r.source, kind: r.kind, eventId: r.event_id }), r]));
@@ -326,10 +328,10 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
         for (const c of list) {
           if (!regenerable.has(c.kind)) continue;
           if (!current || current.session_id !== c.sessionId || current.workspace_id !== c.workspaceId || tsMillis(`${current.ts.replace(" ", "T")}Z`) !== c.tsMs)
-            deletes.push({ orgId: scope.orgId, sessionId: c.sessionId, identity: c } as PendingDelete);
+            deletes.push(c);
         }
       }
-      await deleteRows(deps.ch, deletes);
+      deletedCount = await io.remove(scope, deletes);
     }
     // Metadata and CH describe the same validated canonical source union.
     if(complete){
@@ -339,14 +341,41 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       else {complete=false;s3.reasons.push("directory_event_sources_changed");await invalidateDirectoryEvents(tx,scope);}
     }
     // Only a complete pass makes the session current; any other leaves it owing one.
-    await recordState(deps.ch, scope, s3.revision, inWindow.length, complete, at, pointerSnapshot.canonicalId);
+    await io.record(scope, s3.revision, inWindow.length, complete, at, pointerSnapshot.canonicalId);
     return {
       manifests: s3.manifests,
       rows: inWindow.length,
-      inserted: toInsert.length,
-      deleted: deletes.length,
+      inserted,
+      deleted: deletedCount,
       complete,
-      reasons: truncated ? [...s3.reasons, "clickhouse_truncated"] : s3.reasons,
+      reasons: [...s3.reasons, ...(truncated ? [deps.adapter ? "search_index_truncated" : "clickhouse_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
     };
   });
+}
+
+/** Preserve the existing SQL, retention and state behavior for an unselected
+ * legacy deployment. Portable adapters never implement a fake SQL client. */
+function legacyProjectionIo(ch: ClickHouseClient): SearchProjectionIo {
+  return {
+    async fromMs(at) { return Date.parse(await windowStart(ch, at)); },
+    async scan(scope, canonicalId, fromMs, limit) {
+      const rows = await clickhouseScope(ch, scope, fromMs, limit + 1, canonicalId);
+      return { rows, truncated: rows.length > limit };
+    },
+    async upsert(rows) { await ch.insert(EVENTS_TABLE, [...rows], { timeoutMs: 60_000 }); return rows.length; },
+    async remove(scope, positions) {
+      const deletes: PendingDelete[] = positions.map(identity => ({ orgId: scope.orgId, sessionId: identity.sessionId, identity }));
+      await deleteRows(ch, deletes);
+      return deletes.length;
+    },
+    async erase(scope, canonical) {
+      await ch.command(`DELETE FROM ${EVENTS_TABLE}
+         WHERE org_id = {org:String} AND workspace_id = {workspace:String}
+           AND source = {source:String} AND (session_id = {session:String} OR session_id = {canonical:String})`, {
+        params: { org: scope.orgId, workspace: scope.workspaceId, source: scope.harness, session: scope.sessionId, canonical },
+        settings: { lightweight_deletes_sync: 2 }, timeoutMs: 120_000,
+      });
+    },
+    record: (scope, revision, rows, complete, at, canonicalId) => recordState(ch, scope, revision, rows, complete, at, canonicalId),
+  };
 }
