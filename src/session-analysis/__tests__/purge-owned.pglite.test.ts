@@ -5,7 +5,7 @@
  */
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import type { PGlite } from "@electric-sql/pglite";
-import { database } from "../../session-brief/__tests__/harness.ts";
+import { database, read } from "../../session-brief/__tests__/harness.ts";
 
 setDefaultTimeout(60_000);
 let pg: PGlite | undefined;
@@ -159,4 +159,18 @@ test("caller pin: every SECURITY DEFINER in 046000 refuses a role it does not se
   expect(unpinned).toEqual([]);
   expect((await db.query<{ n: number }>(`SELECT count(*)::int n FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
     WHERE n.nspname = 'sessions' AND p.prosecdef AND p.proname IN ('session_analysis_neon_free', 'purge_session_analysis_for_owned')`)).rows[0]!.n).toBe(3);
+});
+
+test("no runtime or read role holds any privilege on the frozen custody, census or purge-fence tables (only the definers read them)", async () => {
+  const db = (pg = await database());
+  await db.exec(read("supabase/bootstrap/session_read_api_role.sql").split("\n").filter((l) => !l.startsWith("\\")).join("\n"));
+  const grants = (await db.query<{ t: string; g: string; p: string }>(`
+    SELECT c.relname t, r.rolname g, a.privilege_type p
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      CROSS JOIN LATERAL aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) a
+      JOIN pg_roles r ON r.oid = a.grantee
+     WHERE n.nspname = 'sessions' AND c.relkind = 'r' AND a.grantee <> c.relowner
+       AND (c.relname LIKE 'ingest_frozen_source%' OR c.relname IN ('session_neon_census', 'session_neon_census_seal', 'session_analysis_purge_fences'))
+       AND r.rolname IN ('service_role', 'bulls96_read_api', 'bulls96_analysis_admit', 'anon', 'authenticated', 'bulls96_session_ingest')`)).rows;
+  expect(grants).toEqual([]);
 });
