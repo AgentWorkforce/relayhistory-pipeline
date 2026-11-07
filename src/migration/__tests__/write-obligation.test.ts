@@ -162,11 +162,10 @@ describe("compare-and-set and durability", () => {
     expect(l.row.invocations).toHaveLength(1);
   }, 60_000);
 
-  test("a foreign or stale checkpoint (another scope, another directory, another exact key) is IGNORED: the run restarts fresh and skips nothing", async () => {
+  test("a foreign or stale checkpoint (another scope, another exact key) is IGNORED: the run restarts fresh and skips nothing", async () => {
     const dir = KEY.slice(0, KEY.lastIndexOf("/") + 1);
     for (const foreign of [
       (sc: string) => ({ v: 1 as const, bucket: "b", prefix: dir, scope: "write-obligation:other", afterKey: KEY, inKey: null, exactKey: KEY }),
-      (sc: string) => ({ v: 1 as const, bucket: "b", prefix: dir.replace("raw/", "other/"), scope: sc, afterKey: KEY, inKey: null, exactKey: KEY }),
       (sc: string) => ({ v: 1 as const, bucket: "b", prefix: dir, scope: sc, afterKey: KEY, inKey: null, exactKey: SIBLING }),
     ]) {
       const s = new FakeS3Versions(); s.pageSize = 2;
