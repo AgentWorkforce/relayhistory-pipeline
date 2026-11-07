@@ -132,7 +132,14 @@ bare-origin matches, and the RelayAuth URL is never used as an audience.
 | `OPENAI_BASE_URL` | session-brief | `https://api.openai.com/v1` (calls `<base>/responses`) | transport rule (the request carries `OPENAI_API_KEY`) | an OpenAI-compatible gateway, e.g. `http://llm-gateway.ai.svc:4000/v1` (flag) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | unset: no export | not validated (no credential) | your collector, e.g. `http://otel-collector.observability.svc:4318` |
 | `LOCKER_ENDPOINT` | all | S3 for `LOCKER_REGION` | GCS mode: own stricter check (`src/shared/locker-selection.ts`) | MinIO Service or object store |
-| `ALLOW_IN_CLUSTER_HTTP` | courier, ingest, read API, session-brief | `false` | `true`/`false` only | `true` on in-cluster pods that use `*.svc` URLs |
+| `SESSION_INGEST_EDGE_ENABLED` | session-ingest-edge | unset (dormant: `/healthz` only, every other route 503) | `true`/`false` only | `true` once the variables below are set |
+| `SESSION_INGEST_EDGE_ORIGIN` | session-ingest-edge | required when enabled | exact bare origin (`normalizedAudience`) | the edge's public origin; also listed in relaycontrol's `SELFHOST_INTROSPECT_AUDIENCES` |
+| `SESSION_INGEST_UPSTREAM_URL` | session-ingest-edge | required when enabled | bare origin + transport rule | the session-ingest Worker, e.g. `http://<svc>.<ns>.svc:8080` (flag) |
+| `RELAYCONTROL_INTROSPECT_URL` | session-ingest-edge | required when enabled | transport rule | `http://relaycontrol.<ns>.svc:8080` (flag) |
+| `RELAYCONTROL_INTROSPECT_SECRET` | session-ingest-edge | required when enabled | non-empty | from the secret store (1Password), never on disk |
+| `INGEST_SIGNING_KEY` | session-ingest-edge | required when enabled | non-empty | this deployment's own key from the secret store; never the cloud ingest signing key |
+| `SESSION_INGEST_EDGE_PORT` | session-ingest-edge | `8080` (parsed even when dormant) | TCP port 1-65535 | `8080` |
+| `ALLOW_IN_CLUSTER_HTTP` | courier, ingest, read API, session-brief, session-ingest-edge | `false` | `true`/`false` only | `true` on in-cluster pods that use `*.svc` URLs |
 
 Hosted values that are not runtime destinations of a self-host: the vendored
 PostHog default (`https://i.agentrelay.com`, `packages/pipeline/src/lib/logger.ts`)

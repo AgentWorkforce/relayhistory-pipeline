@@ -20,7 +20,8 @@ pattern (the Worker's own "every request 503 `not_configured`" when unconfigured
 with the strict `true`/`false` parsing of `ALLOW_IN_CLUSTER_HTTP`):
 
 - unset, empty or `false`: dormant. The process starts and reads no other
-  variable. `GET /healthz` answers `200 {"ok":true,"enabled":false}` and every
+  variable except `SESSION_INGEST_EDGE_PORT` (to listen; a malformed port still
+  fails startup). `GET /healthz` answers `200 {"ok":true,"enabled":false}` and every
   other route answers `503 not_configured`. Nothing is introspected or forwarded.
 - `true`: enabled. Every variable below is required and validated at startup.
 - anything else: the process refuses to start (a typo never silently means either).
@@ -34,9 +35,20 @@ with the strict `true`/`false` parsing of `ALLOW_IN_CLUSTER_HTTP`):
 | `SESSION_INGEST_UPSTREAM_URL` | The session-ingest Worker, a bare origin (no path). https, loopback, or an in-cluster Service name (`<svc>.<ns>.svc[.cluster.local]`) with `ALLOW_IN_CLUSTER_HTTP=true` (`src/shared/destination-url.ts`). |
 | `RELAYCONTROL_INTROSPECT_URL` | relaycontrol's base URL (same transport rule); the client appends `/internal/v1/auth/introspect`. |
 | `RELAYCONTROL_INTROSPECT_SECRET` | The dedicated introspection service secret, from the secret store (1Password); never on disk. |
-| `INGEST_SIGNING_KEY` | The HMAC key the Worker verifies (`signRequest`), from the secret store. |
+| `INGEST_SIGNING_KEY` | The HMAC key the Worker verifies (`signRequest`), from the secret store. **This deployment's own key, never the cloud ingest signing key** (see below). |
 | `SESSION_INGEST_EDGE_PORT` | Listen port, default 8080. |
 | `ALLOW_IN_CLUSTER_HTTP` | Existing switch: allows plain http to in-cluster Service names. |
+
+**Signing key isolation.** The edge signs identities it takes from
+relaycontrol's org and workspace namespace with the same HMAC scheme the cloud
+signing edge uses. Give each self-host deployment its own `INGEST_SIGNING_KEY`,
+shared only between this edge and its own Worker, and never reuse the cloud
+ingest signing key: a shared key would let a self-host edge (or anyone who
+reads its secret) mint identities that a cloud Worker accepts.
+
+**Probes.** Point liveness and readiness probes at `GET /healthz` (200 when
+dormant and when enabled). The edge has no `/readyz`, like the Worker; a probe
+there would get 404 when enabled and 503 when dormant.
 
 Startup errors name the variable, never its value. The edge makes no outbound
 call except to these two configured URLs.
