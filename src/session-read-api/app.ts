@@ -846,7 +846,11 @@ export function createReadApi(deps: ReadApiDeps) {
    * catalogFromCanonical). `catalog` is the session's latest delivered catalog record,
    * `children` its relationship edges, `commitLinks` its delivered commit links; `parents` is
    * always empty (a parent edge lives with the parent session's objects). A session with no
-   * pointer is 501 `catalog_no_pointers` as timing/turns; erased is the empty catalog.
+   * pointer is 404 `not_found` (reason `catalog_no_pointers`), the answer relaycontrol maps to
+   * an empty catalog; erased is the empty catalog. The 404 is in-workspace only: it is
+   * reachable strictly after attestWorkspace and requireCanary pass and the canonical source
+   * is wired, so a caller outside the workspace still gets its 401/403/501 and never learns
+   * whether a session id exists.
    */
   if (selfhost) {
     app.get("/v1/sessions/:sessionId/catalog", async (c) => {
@@ -864,7 +868,10 @@ export function createReadApi(deps: ReadApiDeps) {
         if (!sessionId || sessionId.length > MAX_ID_CHARS) throw unsupported("catalog_session_id");
         const scope: CanonicalIdentity = { orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId };
         const state = await catalog.state(scope);
-        if (state.pointers === 0) throw unsupported("catalog_no_pointers");
+        if (state.pointers === 0) {
+          log({ route: c.req.routePath, reason: "catalog_no_pointers", status: 404, correlation_id: c.get("correlationId") });
+          throw new HttpError(404, "not_found", `No catalog found for session ${sessionId}`, "catalog_no_pointers");
+        }
         let payload = EMPTY_CATALOG;
         if (state.live > 0) {
           const controller = new AbortController();

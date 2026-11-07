@@ -312,15 +312,56 @@ describe("GET /v1/sessions/:id/catalog", () => {
     expect(calls).toEqual([{ orgId: "org-a", workspaceId: "ws-a", source: "codex", sessionId: "s-1" }]);
   });
 
-  test("no rows is the empty catalog; erased is the empty catalog without a read; no pointer is refused as timing is", async () => {
+  test("no rows is the empty catalog; erased is the empty catalog without a read; no pointer is an in-workspace 404", async () => {
     const empty = await json(await api({ rows: { rows: [], legacyCoverage: null } }).get(CATALOG));
     expect(empty).toEqual({ workspaceId: "ws-a", catalog: null, parents: [], children: [], commitLinks: [], truncated: false });
     const erased = api({ state: { pointers: 1, live: 0 } });
     expect(await json(await erased.get(CATALOG))).toEqual(empty);
     expect(erased.calls).toEqual([]);
-    const unknown = await api({ state: { pointers: 0, live: 0 } }).get(CATALOG);
-    expect(unknown.status).toBe(501);
-    expect((await json(unknown)).error.reason).toBe("catalog_no_pointers");
+    const missing = api({ state: { pointers: 0, live: 0 } });
+    const unknown = await missing.get(CATALOG);
+    expect(unknown.status).toBe(404);
+    expect(unknown.headers.get("x-relayhistory-workspace-id")).toBe("ws-a");
+    expect((await json(unknown)).error).toEqual({ code: "not_found", message: expect.any(String), reason: "catalog_no_pointers" });
+    expect(missing.calls).toEqual([]);
+    expect(missing.logs).toContainEqual(expect.objectContaining({ reason: "catalog_no_pointers", status: 404 }));
+  });
+
+  test("an unknown session is never a 404 unless the caller is attested and canaried for the workspace", async () => {
+    let probes = 0;
+    const unknown = (over: Parameters<typeof api>[0] = {}) =>
+      api({
+        state: { pointers: 0, live: 0 },
+        catalog: {
+          state: async () => {
+            probes++;
+            return { pointers: 0, live: 0 };
+          },
+        },
+        ...over,
+      });
+    const status = async (r: Response) => `${r.status} ${(await json(r)).error.reason}`;
+    const { get } = unknown();
+    // Wrong workspace: the same 403 as a known session, no state probe.
+    const mismatch = await get("/v1/sessions/s-unknown/catalog?workspace=ws-b&source=codex");
+    expect(mismatch.status).toBe(403);
+    expect((await json(mismatch)).error.code).toBe("forbidden");
+    // No workspace: the org-scope 501.
+    expect(await status(await get("/v1/sessions/s-unknown/catalog?source=codex"))).toBe("501 org_scope");
+    // Unauthenticated or bad token: 401.
+    expect((await get("/v1/sessions/s-unknown/catalog?workspace=ws-a&source=codex", null)).status).toBe(401);
+    expect((await get("/v1/sessions/s-unknown/catalog?workspace=ws-a&source=codex", "bad")).status).toBe(401);
+    // Workspace not on the canary allowlist (or allowlist absent): the canary 501.
+    expect(await status(await unknown({ workspaces: new Set(["ws-z"]) }).get("/v1/sessions/s-unknown/catalog?workspace=ws-a&source=codex"))).toBe(
+      "501 catalog_workspace_not_enabled",
+    );
+    expect(await status(await unknown({ workspaces: undefined }).get("/v1/sessions/s-unknown/catalog?workspace=ws-a&source=codex"))).toBe(
+      "501 catalog_workspace_not_enabled",
+    );
+    expect(probes).toBe(0);
+    // Attested and canaried: now, and only now, the 404.
+    expect((await get("/v1/sessions/s-unknown/catalog?workspace=ws-a&source=codex")).status).toBe(404);
+    expect(probes).toBe(1);
   });
 
   test("workspace mismatch, missing workspace and unauthenticated are refused like the sibling routes", async () => {
