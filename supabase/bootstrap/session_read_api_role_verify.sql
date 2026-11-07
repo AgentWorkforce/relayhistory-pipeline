@@ -61,7 +61,7 @@ BEGIN
   LOOP
     IF v_row.sel <> (v_row.attname IN ('org_id', 'workspace_id', 'harness', 'session_id', 'created_at', 'deleted_at',
                                        'canonical_session_id', 'machine_id', 'canonical_machine_id', 'user_id',
-                                       'storage_provider', 'bucket', 'manifest_key', 'content_sha256', 'raw_format', 'revision')) THEN
+                                       'storage_provider', 'bucket', 'manifest_key', 'manifest_etag', 'content_sha256', 'raw_format', 'revision')) THEN
       v_problems := array_append(v_problems, (format('column %s: SELECT is %s', v_row.attname, CASE WHEN v_row.sel THEN 'granted' ELSE 'missing' END))::text);
     END IF;
   END LOOP;

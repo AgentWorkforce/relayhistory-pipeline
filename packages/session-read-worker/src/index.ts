@@ -242,7 +242,9 @@ export function timingDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers
         },
         identity,
       );
-      return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage };
+      // neonDerived (the never-in-Neon proof's objects half, from these very manifest reads)
+      // must survive the composition: dropping it would let the database half alone pass.
+      return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage, ...(snapshot.neonDerived ? { neonDerived: true } : {}) };
     },
   };
 }

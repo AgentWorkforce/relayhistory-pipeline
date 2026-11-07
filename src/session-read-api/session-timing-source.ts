@@ -26,7 +26,7 @@ import {
 export const SESSION_POINTERS_SQL = `SELECT p.org_id, p.workspace_id, p.harness,
        coalesce(p.canonical_session_id, p.session_id) AS session_id,
        coalesce(p.canonical_machine_id, p.machine_id) AS machine_id, p.user_id,
-       p.storage_provider, p.bucket, p.manifest_key, p.content_sha256,
+       p.storage_provider, p.bucket, p.manifest_key, p.manifest_etag, p.content_sha256,
        p.raw_format, p.revision, p.deleted_at
   FROM sessions.session_index AS p
  WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3

@@ -17,7 +17,8 @@
 --             (org_id, workspace_id, harness, session_id, created_at, deleted_at)
 --             and the pointer columns (canonical_session_id, machine_id,
 --             canonical_machine_id, user_id, storage_provider, bucket,
---             manifest_key, content_sha256, raw_format, revision).
+--             manifest_key, manifest_etag, content_sha256, raw_format, revision). manifest_etag
+--             binds a canonical read to the exact manifest version the pointer names.
 --             Narrowing back is a REVOKE of the pointer columns; re-running an
 --             older copy of this file does not remove them.
 --   RLS       session_index already has RLS on. The policy below admits only rows
@@ -57,7 +58,7 @@ ALTER ROLE bulls96_read_api SET default_transaction_read_only = on;
 GRANT USAGE ON SCHEMA sessions TO bulls96_read_api;
 GRANT SELECT (org_id, workspace_id, harness, session_id, created_at, deleted_at,
               canonical_session_id, machine_id, canonical_machine_id, user_id,
-              storage_provider, bucket, manifest_key, content_sha256, raw_format, revision)
+              storage_provider, bucket, manifest_key, manifest_etag, content_sha256, raw_format, revision)
   ON sessions.session_index TO bulls96_read_api;
 
 DROP POLICY IF EXISTS session_index_read_api ON sessions.session_index;
