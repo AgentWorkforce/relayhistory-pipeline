@@ -125,13 +125,15 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_analysis_jobs_v2": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_analysis_requests_v2": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_analysis_result_tickets": ["SELECT", "INSERT", "UPDATE", "DELETE"],
-  "sessions.session_analysis_ticket_strays": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_analysis_ticket_invocations": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_analysis_ticket_reservations": ["SELECT", "INSERT"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const RUNTIME_APPLICATION_SEQUENCES = [
   "sessions.pipeline_jobs_id_seq",
   "sessions.migration_ingest_audit_id_seq",
   "sessions.session_verdicts_id_seq",
+  "sessions.session_analysis_ticket_rev_seq",
 ] as const;
 
 export const RUNTIME_APPLICATION_RLS_TABLES = [
@@ -168,7 +170,8 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_analysis_jobs_v2",
   "sessions.session_analysis_requests_v2",
   "sessions.session_analysis_result_tickets",
-  "sessions.session_analysis_ticket_strays",
+  "sessions.session_analysis_ticket_invocations",
+  "sessions.session_analysis_ticket_reservations",
 ] as const;
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [
@@ -1105,7 +1108,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "5a37ed67f948cacdc05b6a6f8df848128832d5e2709db14b2bc4475657c0b87a";
+  "0399d5b909de667e660c1aaa4dee88acbe865dd65d73cab289bff13a468338ef";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

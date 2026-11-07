@@ -71,7 +71,15 @@ export interface EraseCheckpoint {
   /** In-key provider continuation (a key with more versions than one page). */
   inKey: { key: string; versionId: string } | null;
 }
-export interface ListedVersion { key: string; versionId: string; latest: boolean; deleteMarker: boolean; lastModified?: number }
+export interface ListedVersion {
+  key: string;
+  versionId: string;
+  latest: boolean;
+  deleteMarker: boolean;
+  lastModified?: number;
+  /** The provider's ETag without quotes (absent for delete markers / unversioned stores). */
+  etag?: string;
+}
 export interface EraseBudget {
   /** Versions listed per invocation (hard ceiling 10,000). */
   versions?: number;
@@ -361,11 +369,12 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
       const versionId = xmlText(el, "VersionId");
       const modified = Date.parse(xmlText(el, "LastModified") ?? "");
       const latest = xmlText(el, "IsLatest");
+      const etag = xmlText(el, "ETag")?.replace(/^"|"$/g, "");
       if (strict && (!key || !versionId || /[\x00-\x1f\x7f]/u.test(versionId) || (latest !== "true" && latest !== "false")))
         throw coded("erasure_inventory", "incomplete version entry");
       // xmlText already decodes entities; decoding again would mangle a literal `&amp;`.
       if (key !== undefined && versionId !== undefined)
-        entries.push({ key, versionId, latest: latest === "true", deleteMarker: marker, ...(Number.isFinite(modified) ? { lastModified: modified } : {}) });
+        entries.push({ key, versionId, latest: latest === "true", deleteMarker: marker, ...(Number.isFinite(modified) ? { lastModified: modified } : {}), ...(etag && !marker ? { etag } : {}) });
     }
     const truncated = xmlText(xml, "IsTruncated");
     if (strict && truncated !== "true" && truncated !== "false") throw coded("erasure_inventory", "version pagination is unproven");
