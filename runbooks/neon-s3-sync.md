@@ -72,16 +72,24 @@ holds only the eraser key ("sessions-prod transcript eraser").
 
 State: `~/.agent-tmp/s3x/state.sqlite` (ids, revisions, keys; no content).
 It is NOT disposable: it also holds the unresolved-write obligations (every exporter
-PUT, recorded before it is sent), ownership claims and erasure reservations. Never
-delete or replace it to "reset" a run. A new, recreated or upgraded state file starts
-with its obligation genesis UNATTESTED, and the erasure job then never marks an
-exporter prefix or object erased (`erasure_obligations_unattested`; it still erases,
-it just never reports done). Reviewed reconciliation, by an operator only:
-1. stop the exporter and confirm no exporter process from before the file's genesis
-   is alive (its requests must have ended);
-2. `bun src/migration/neon-s3-erasure/main.ts --attest-obligation-genesis`
-   (`S3X_STATE` as usual; no credentials). It is refused while an exporter holds
-   `<state>.lock`, and is recorded once, never unset.
+PUT, recorded before it is sent), ownership claims, erasure reservations and the
+protected terminal / erased history. Never delete, replace or restore it from a
+backup. Every state file's obligation genesis is UNATTESTED: no dead process,
+absent lock, cancellation or wait proves an earlier PUT cannot still commit, so the
+erasure job never marks an exporter prefix or object erased on it
+(`erasure_obligations_unattested`; it still erases, it never reports done). There is
+no unlock. Clearing it needs a separately reviewed recovery contract (the old
+effects proven terminal or reconciled, or a genuinely never-used scope). A legacy
+file's surviving `pending_keys` are imported as prefix-level unresolved obligations,
+which is extra fail-closed information, not evidence.
+
+UNQUALIFIED dependency (remote writers): relayhistory-api's live writer
+(`m=srv_` session directories and pointers) and the session ingest's staged
+batches (`live-batches/`) are NOT in this local ledger. Their PUTs have no local
+invocation, claim or reservation, so the erasure job cannot prove their unknown
+outcomes are settled. It only re-sweeps their tombstones on every pass and never
+retires or reports them complete. Their publication/obligation interlock belongs to
+their own lanes and must be qualified there before activation.
 Logs: `~/.agent-tmp/s3x/sync.log` (counts and codes only).
 
 ```sh
@@ -119,7 +127,10 @@ Completion (shared eraser + write obligation v3): a session prefix is erased in
 bounded, resumable steps (checkpoint in the state file, bound to the operation,
 authority, tenant/session or queued item and lease), with every doomed version
 reserved first, and is marked done only after a fresh strict zero inventory AND
-no unresolved exporter PUT under it. A PUT whose outcome is unknown (timeout,
+no unresolved exporter PUT under it. Exact-object erasure in a directory with more than 10k
+unrelated kept versions cannot complete yet (the shared primitive's verification
+lists the whole directory from its start under the 10k budget; an exact-key
+verify is pending in that primitive). A PUT whose outcome is unknown (timeout,
 crash, lost response) keeps the prefix queued indefinitely, re-swept on the
 bounded backoff: `erasure_write_unresolved` in the queue is expected, not a
 failure to clear by hand.

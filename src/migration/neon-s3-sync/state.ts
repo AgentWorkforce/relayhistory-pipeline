@@ -3,10 +3,10 @@
  * object keys; never content). It is NOT disposable: it also holds the durable
  * unresolved-write obligations (every exporter PUT recorded before it is sent),
  * ownership claims and erasure reservations (write-obligation.ts v3). A lost or
- * recreated file forgets outstanding PUTs, so a new file starts UNATTESTED: the
- * erasure job then never marks an exporter prefix or object erased (it fails
- * closed) until an operator attests the obligation genesis (no exporter PUT from
- * before this file can still be in flight; see runbooks/neon-s3-sync.md).
+ * recreated file forgets outstanding PUTs, so a new file is UNATTESTED for good:
+ * the erasure job never marks an exporter prefix or object erased on it (fails
+ * closed). Nothing attests it: no timer, PID or lock-file check ever settles an
+ * unknown PUT; a reviewed recovery contract must come first.
  *
  * - `groups`: every `(org, session)` the last sweeps saw, with its Neon
  *   revision and activity, and the sweep id that last saw it.
@@ -52,6 +52,8 @@ export class SyncState {
     this.db = new DatabaseSync(path);
     // Shared by the exporter and the erasure job (two processes): WAL plus a busy wait.
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 10000;");
+    // A file that already holds the legacy exporter's schema (opened before obligations existed) vs. a new / recreated one.
+    const legacyFile = !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get();
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS groups (
         org_id TEXT NOT NULL, session_id TEXT NOT NULL,
@@ -112,28 +114,38 @@ export class SyncState {
     `);
     // Lease generation: minted on every NEW acquisition (absent, or taken from another holder); a renew keeps it.
     if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('leases') WHERE name = 'gen'").get())) this.db.exec("ALTER TABLE leases ADD COLUMN gen TEXT");
-    // Obligation genesis: the first open of this file (new, recreated, or upgraded from a version without
-    // obligations) records when tracking began, UNATTESTED. INSERT OR IGNORE: never reset on a later open.
-    this.db.prepare("INSERT OR IGNORE INTO meta (k, v) VALUES ('obligations_genesis', ?)").run(JSON.stringify({ at: Date.now(), attestedAt: null }));
+    // Obligation genesis (once per file, never reset), from EVIDENCE only, never a timer, a PID or a lock file:
+    // A file has no evidence that writes dispatched before it are terminal (a dead process, an absent lock or any
+    // wait proves nothing; the legacy exporter even cleared pending_keys on a failed group whose PUT timed out), so
+    // EVERY genesis is UNATTESTED and the erasure job never marks an exporter prefix or object erased on it. There is
+    // no unlock: a separately reviewed recovery contract (old effects proven terminal, or a genuinely never-used
+    // scope) is required first. A legacy file's surviving pending_keys are still imported as PREFIX-level unresolved
+    // obligations (dispatched, nonterminal): more fail-closed information, never evidence.
+    if (!this.meta("obligations_genesis")) {
+      this.#tx(() => {
+        if (this.meta("obligations_genesis")) return;
+        let imported = 0;
+        if (legacyFile) {
+          const rows = this.db.prepare("SELECT DISTINCT key FROM pending_keys").all() as { key: string }[];
+          const ins = this.db.prepare("INSERT INTO write_invocations (id, key, holder, outcome, version_id, seq) VALUES (?, ?, 'legacy-exporter', 'dispatched', NULL, ?)");
+          for (const r of rows) {
+            const prefix = r.key.endsWith("manifest.json") ? r.key.slice(0, -"manifest.json".length) : r.key;
+            ins.run(crypto.randomUUID(), prefix.endsWith("/") ? prefix : `${prefix}/`, this.#seq());
+            imported += 1;
+          }
+        }
+        this.setMeta("obligations_genesis", JSON.stringify({ at: Date.now(), attestedAt: null, basis: legacyFile ? "legacy-unattested" : "none", imported }));
+      });
+    }
   }
 
   /** The obligation genesis: when this file began tracking exporter PUTs, and whether an operator attested it. */
-  obligationGenesis(): { at: number; attestedAt: number | null } {
+  obligationGenesis(): { at: number; attestedAt: number | null; basis?: string; imported?: number } {
     return JSON.parse(this.meta("obligations_genesis") ?? '{"at":0,"attestedAt":null}');
   }
   /** Erasures may be marked done only after the genesis is attested (fail closed on a lost / recreated file). */
   obligationsAttested(): boolean {
     return this.obligationGenesis().attestedAt !== null;
-  }
-  /**
-   * Operator attestation (reviewed reconciliation): no exporter PUT dispatched before this file's genesis can
-   * still be in flight (the prior exporter process is gone and its requests ended). Idempotent; never unset.
-   */
-  attestObligationGenesis(at = Date.now()) {
-    this.#tx(() => {
-      const g = this.obligationGenesis();
-      if (g.attestedAt === null) this.setMeta("obligations_genesis", JSON.stringify({ at: g.at, attestedAt: at }));
-    });
   }
 
   #tx(fn: () => void) {
@@ -342,12 +354,16 @@ export class SyncState {
        ON CONFLICT (key) DO UPDATE SET next_try = 0,
          kind = CASE WHEN excluded.kind = 'prefix' THEN 'prefix' ELSE erasures.kind END`,
     );
-    const unpub = this.db.prepare(`DELETE FROM write_published WHERE ${SyncState.#under}`);
+    // Queued for erasure: no longer owned (the eraser may then reserve its versions), scoped by the item's KIND: an
+    // object item unpublishes EXACTLY its key (never another key that merely starts with it); a prefix item, the
+    // keys under its "/"-terminated prefix.
+    const unpubKey = this.db.prepare("DELETE FROM write_published WHERE key = ?");
+    const unpubPrefix = this.db.prepare(`DELETE FROM write_published WHERE ${SyncState.#under}`);
     this.#tx(() => {
       for (const i of items) {
         q.run(i.key, i.kind, i.org_id, i.reason, at);
-        // Queued for erasure: no longer owned (the eraser may then reserve its versions).
-        unpub.run(...SyncState.#u(i.key));
+        if (i.kind === "object") unpubKey.run(i.key);
+        else unpubPrefix.run(...SyncState.#u(i.key));
       }
     });
   }
@@ -403,6 +419,8 @@ export class SyncState {
    */
   static #under = "key COLLATE BINARY >= ? AND key COLLATE BINARY < ? AND substr(key, 1, length(?)) = ?";
   static #u(prefix: string): [string, string | Uint8Array, string, string] {
+    // Range membership is for "/"-terminated directory / session prefixes only; an item KEY is matched exactly.
+    if (!prefix.endsWith("/")) throw Object.assign(new Error("a prefix range needs a /-terminated prefix"), { code: "prefix_shape" });
     // The least string greater than every string starting with `p`: increment its last code point (dropping trailing
     // U+10FFFF first). None (empty, or all U+10FFFF): a BLOB, which SQLite orders after every TEXT value.
     const succ = (p: string): string | Uint8Array => {
@@ -480,12 +498,9 @@ export class SyncState {
       }
     });
   }
-  /** Ownership ends when a key or prefix is queued for erasure (or forgotten): exact keys, or everything under a prefix. */
-  unpublish(keysOrPrefixes: Iterable<string>) {
-    this.#tx(() => {
-      const q = this.db.prepare(`DELETE FROM write_published WHERE ${SyncState.#under}`);
-      for (const k of keysOrPrefixes) q.run(...SyncState.#u(k));
-    });
+  /** Ownership ends for everything under a "/"-terminated prefix (a prefix-kind erasure or a forgotten session). */
+  unpublishPrefix(prefix: string) {
+    this.db.prepare(`DELETE FROM write_published WHERE ${SyncState.#under}`).run(...SyncState.#u(prefix));
   }
   /** The prefix's compare-and-set revision: the newest seq of any invocation, publication or reservation under it. */
   obligationRev(prefix: string): number {
@@ -500,6 +515,11 @@ export class SyncState {
   /** EXPLAIN QUERY PLAN of the prefix predicate on `table` (tests: the key index must be used). */
   prefixPlan(table: "write_invocations" | "write_published" | "erase_reservations", prefix: string): string {
     return (this.db.prepare(`EXPLAIN QUERY PLAN SELECT max(seq) FROM ${table} WHERE ${SyncState.#under}`).all(...SyncState.#u(prefix)) as { detail: string }[]).map((r) => r.detail).join(" | ");
+  }
+  /** Prefix-level unresolved obligations (legacy imports: key ends in "/") that COVER `prefix` (an ancestor or itself). */
+  coveringWrites(prefix: string): { id: string; key: string; outcome: "dispatched" | "acked"; versionId?: string }[] {
+    return (this.db.prepare("SELECT id, key, outcome, version_id FROM write_invocations WHERE substr(key, -1) = '/' AND substr(?, 1, length(key)) = key").all(prefix) as
+      { id: string; key: string; outcome: "dispatched" | "acked"; version_id: string | null }[]).map((r) => ({ id: r.id, key: r.key, outcome: r.outcome, ...(r.version_id ? { versionId: r.version_id } : {}) }));
   }
   /** Versions the writer currently owns under a prefix. */
   publishedUnder(prefix: string): { key: string; versionId: string }[] {
@@ -543,13 +563,29 @@ export class SyncState {
     return out;
   }
   /** After a proven erasure: the prefix's reservations are no longer needed (its versions are gone). */
-  clearReservations(prefix: string) {
-    // The reserved versions are proven gone: they move to the PROTECTED erased history (never reopened), so a late
-    // publish of any of them is refused even after the reservation itself is cleared.
+  /**
+   * Retire EXACTLY the reserved versions a complete strict proof showed absent: each moves to the protected erased
+   * history; every other reservation (a kept sibling, a successor, another subset) is left untouched.
+   */
+  retireReservations(prefix: string, absent: (key: string, versionId: string) => boolean) {
     this.#tx(() => {
-      this.db.prepare(`INSERT OR IGNORE INTO erased_versions (key, version_id, at) SELECT key, version_id, ? FROM erase_reservations WHERE ${SyncState.#under}`).run(Date.now(), ...SyncState.#u(prefix));
-      this.db.prepare(`DELETE FROM erase_reservations WHERE ${SyncState.#under}`).run(...SyncState.#u(prefix));
+      const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${SyncState.#under}`).all(...SyncState.#u(prefix)) as { key: string; version_id: string }[];
+      const hist = this.db.prepare("INSERT OR IGNORE INTO erased_versions (key, version_id, at) VALUES (?, ?, ?)");
+      const del = this.db.prepare("DELETE FROM erase_reservations WHERE key = ? AND version_id = ?");
+      for (const r of rows) {
+        if (!absent(r.key, r.version_id)) continue;
+        hist.run(r.key, r.version_id, Date.now());
+        del.run(r.key, r.version_id);
+      }
     });
+  }
+  /** Versions in the protected erased history at one key (tests / audits). */
+  erasedAt(key: string): string[] {
+    return (this.db.prepare("SELECT version_id FROM erased_versions WHERE key = ? ORDER BY version_id").all(key) as { version_id: string }[]).map((r) => r.version_id);
+  }
+  /** The reservations at one key (tests / audits). */
+  reservationsAt(key: string): string[] {
+    return (this.db.prepare("SELECT version_id FROM erase_reservations WHERE key = ? ORDER BY version_id").all(key) as { version_id: string }[]).map((r) => r.version_id);
   }
   /** The protected terminal history of one invocation (tests / audits). */
   writeTerminal(id: string): { outcome: string; versionId: string | null } | undefined {

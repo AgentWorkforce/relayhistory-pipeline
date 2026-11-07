@@ -35,10 +35,13 @@ import { ErasureJob, DEFAULT_ERASURE_CONFIG } from "../neon-s3-erasure/job.ts";
 import { boundStrings, EXPORT_KINDS, fencedGroups, MAX_STRING_TOKEN, neonUnitSource, readOnly, sessionUnits, type SessionUnit, type StreamLine, type UnitSource } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 
-/** A state file whose obligation genesis is attested (a fresh test file; production attests by operator only). */
+/**
+ * TEST-ONLY: a state file whose obligation genesis is marked attested by writing the meta row directly (a fresh,
+ * never-used test scope). Production has NO attestation path: every real genesis stays unattested.
+ */
 function attestedState(path: string): SyncState {
   const s = new SyncState(path);
-  s.attestObligationGenesis();
+  s.setMeta("obligations_genesis", JSON.stringify({ at: Date.now(), attestedAt: Date.now(), basis: "test-never-used-scope" }));
   return s;
 }
 import { Syncer, DEFAULT_SYNC_CONFIG } from "../neon-s3-sync/sync.ts";

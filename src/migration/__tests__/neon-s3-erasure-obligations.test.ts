@@ -39,7 +39,8 @@ async function world(n = 30) {
   const ids: string[] = [];
   for (let i = 0; i < n; i++) ids.push(s.put(key(i), OLD));
   const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-")), "s.sqlite"));
-  st.attestObligationGenesis();
+  // TEST-ONLY attestation (a never-used test scope); production has no attestation path.
+  st.setMeta("obligations_genesis", JSON.stringify({ at: Date.now(), attestedAt: Date.now(), basis: "test-never-used-scope" }));
   let clock = Date.parse("2026-11-07T00:00:00Z");
   st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }], clock - 1000);
   const j = new ErasureJob(authority(), st, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => clock, async () => {});
@@ -230,19 +231,20 @@ describe("prefix membership of the obligation tables (index-friendly, exact)", (
     expect(s.unresolvedWrites(P).map((r) => r.key).sort()).toEqual([...inside].sort());
     // A range-only predicate would still be exact here; the residual test pins exactness at the U+10FFFF edge.
     for (const t of ["write_invocations", "write_published", "erase_reservations"] as const) expect(s.prefixPlan(t, P)).toMatch(/SEARCH .* USING (COVERING )?(INDEX|PRIMARY KEY)/);
-    s.unpublish([P]);
+    s.unpublishPrefix(P);
     expect(s.publishedUnder(P)).toEqual([]);
     expect(s.publishedUnder(outside[1]!).length).toBe(1);
   });
 });
 
-test("prefix membership: a prefix ending in U+10FFFF (no simple successor) is still exact", async () => {
+test("prefix membership: U+10FFFF right before the slash is still exact; a non-/ prefix is refused", async () => {
   const s = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-q-")), "s.sqlite"));
-  const P = "k/\u{10FFFF}";
-  const inside = [P, `${P}\u{10FFFF}\u{10FFFF}x`, `${P}a`];
-  const outside = ["k/", "k/\u{FFFF}", "k0", "l"];
+  const P = "k/\u{10FFFF}/";
+  const inside = [`${P}x`, `${P}\u{10FFFF}\u{10FFFF}x`, `${P}a/b`];
+  const outside = ["k/", "k/\u{10FFFF}", "k/\u{FFFF}/", "k/\u{10FFFF}0", "k0", "l"];
   for (const k of [...inside, ...outside]) s.dispatchWrite(k, "h");
   expect(s.unresolvedWrites(P).map((r) => r.key).sort()).toEqual([...inside].sort());
+  expect(() => s.unresolvedWrites("k/\u{10FFFF}")).toThrow();
 });
 
 describe("every destructive route is gated; state loss fails closed", () => {
@@ -279,44 +281,49 @@ describe("every destructive route is gated; state loss fails closed", () => {
     expect(w.queued()).toEqual([OBJ]);
   });
 
-  test("a deleted / recreated state DB fails CLOSED: nothing is marked erased until the genesis is attested", async () => {
+  test("a deleted / recreated state DB fails CLOSED: nothing is ever marked erased; there is no attestation unlock", async () => {
     const s = new FakeS3Versions();
     for (let i = 0; i < 5; i++) s.put(key(i), OLD);
     s.put(OBJ, OLD);
     const dir = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-lost-"));
     const path = join(dir, "s.sqlite");
     const first = new SyncState(path);
-    first.attestObligationGenesis();
     first.dispatchWrite(key(2), "exporter:1"); // an outstanding PUT ...
     first.close();
     for (const f of [path, `${path}-wal`, `${path}-shm`]) await rm(f, { force: true });
-    // ... forgotten with the file. A fresh file is UNATTESTED.
+    // ... forgotten with the file. A fresh file is UNATTESTED, and nothing attests it.
     const st = new SyncState(path);
-    expect(st.obligationsAttested()).toBe(false);
+    expect(st.obligationGenesis()).toMatchObject({ attestedAt: null, basis: "none" });
     expect(st.unresolvedWrites(PREFIX)).toEqual([]);
     const clock = Date.parse("2026-11-07T00:00:00Z");
     st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }, { key: OBJ, kind: "object", org_id: "org-1", reason: "unreferenced" }], clock - 1000);
     let now = clock;
     const j = new ErasureJob(authority(), st, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => now, async () => {});
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 4; i++) {
       await j.drain();
-      now += 2 * 3_600_000;
+      now += 30 * 86_400_000; // no amount of time settles it
     }
     expect(s.count(PREFIX)).toBe(0); // erasure still proceeds ...
     expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10).map((e) => e.key).sort()).toEqual([OBJ, PREFIX].sort()); // ... never done
     expect(j.counters.prefixesErased + j.counters.objectsErased).toBe(0);
-    // The operator attestation (refused while an exporter holds the lock), then the queue completes.
-    const { attestObligationGenesis } = await import("../neon-s3-erasure/main.ts");
-    const lines: Record<string, unknown>[] = [];
-    await writeFile(`${path}.lock`, String(process.pid));
-    expect(attestObligationGenesis(path, (l) => lines.push(l))).toBe(1);
-    expect(st.obligationsAttested()).toBe(false);
-    await rm(`${path}.lock`);
-    expect(attestObligationGenesis(path, (l) => lines.push(l))).toBe(0);
-    expect(st.obligationsAttested()).toBe(true);
-    await j.drain();
-    expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10)).toEqual([]);
-    expect(lines.map((l) => l.error_code ?? l.message)).toEqual(["state_locked", "obligation genesis attested"]);
+    // No CLI / PID / lock-file unlock exists.
+    const main = await import("../neon-s3-erasure/main.ts");
+    expect("attestObligationGenesis" in main).toBe(false);
+    expect(typeof (st as unknown as { attestObligationGenesis?: unknown }).attestObligationGenesis).toBe("undefined");
+  });
+
+  test("a LEGACY state file's surviving pending keys become prefix-level obligations; its genesis is still unattested", async () => {
+    const dir = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-legacy-"));
+    const path = join(dir, "s.sqlite");
+    // The pre-obligation exporter's schema with one pending (mid-group) manifest key.
+    const { DatabaseSync } = await import("node:sqlite");
+    const legacy = new DatabaseSync(path);
+    legacy.exec("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT); CREATE TABLE pending_keys (org_id TEXT NOT NULL, session_id TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (org_id, session_id, key))");
+    legacy.prepare("INSERT INTO pending_keys VALUES ('org-1', 'sess_1', ?)").run(`${PREFIX}manifest.json`);
+    legacy.close();
+    const st = new SyncState(path);
+    expect(st.obligationGenesis()).toMatchObject({ attestedAt: null, basis: "legacy-unattested", imported: 1 });
+    expect(st.coveringWrites(`${PREFIX}raw/`).map((w) => [w.key, w.outcome])).toEqual([[PREFIX, "dispatched"]]);
   });
 });
 
@@ -363,5 +370,76 @@ describe("publication proves its own invocation + lease generation; protected te
     // A reservation (eraser) refuses a key-level claim at that key.
     expect(st.reserveErase(`${PREFIX}raw/`, st.obligationRev(`${PREFIX}raw/`), "e3", [{ key: key(2), versionId: "v-2" }]).ok).toBe(true);
     expect(code(() => st.publishWrites([{ key: key(2), versionId: "*" }], proof))).toBe("publish_reserved");
+  });
+});
+
+describe("terminal cleanup covers exactly the versions a proof showed absent", () => {
+  test("a single-key erase leaves a SIBLING's reservation and erased history untouched (its bytes remain)", async () => {
+    const w = await world(0);
+    const OBJ = `${PREFIX}raw/orphan.ndjson.zst`;
+    w.st.erasureDone(PREFIX, Date.parse("2026-11-07T00:00:00Z") - 1000);
+    w.s.put(OBJ, OLD);
+    const sib = key(5);
+    const sibV = w.s.put(sib, OLD);
+    // An earlier (other) erasure reserved the sibling's version; its bytes are still there.
+    const dir = `${PREFIX}raw/`;
+    expect(w.st.reserveErase(dir, w.st.obligationRev(dir), "other-subset", [{ key: sib, versionId: sibV }]).ok).toBe(true);
+    w.st.enqueueErasure([{ key: OBJ, kind: "object", org_id: "org-1", reason: "unreferenced" }], Date.parse("2026-11-06T00:00:00Z"));
+    await w.j.drain();
+    expect(w.queued()).toEqual([]); // the object is done ...
+    expect(w.st.erasedAt(OBJ).length).toBe(1);
+    expect(w.s.count(sib)).toBe(1); // ... the sibling's bytes remain, and so do its reservation and (empty) erased history
+    expect(w.st.reservationsAt(sib)).toEqual([sibV]);
+    expect(w.st.erasedAt(sib)).toEqual([]);
+  });
+
+  test("a kept successor's reservation (time-subset) is not retired as erased", async () => {
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-ret-")), "s.sqlite"));
+    const k = key(1);
+    expect(st.reserveErase(PREFIX, 0, "s", [{ key: k, versionId: "v-old" }, { key: k, versionId: "v-kept" }]).ok).toBe(true);
+    // The complete inventory shows v-kept still present: only v-old is retired.
+    st.retireReservations(PREFIX, (key, v) => !(key === k && v === "v-kept"));
+    expect(st.erasedAt(k)).toEqual(["v-old"]);
+    expect(st.reservationsAt(k)).toEqual(["v-kept"]);
+  });
+
+  // BLOCKED on the shared primitive (eraser.ts, Babysitter lane; not forked here): verifyErased lists the whole
+  // directory from its start under the 10k-version budget, so an exact key with >10k unrelated KEPT siblings never
+  // gets a fresh strict proof. Needs an exact-key (or start-marker) verifyErased in the primitive.
+  test.todo("exact-key erase: the target + 10,001 kept siblings in its directory still completes (needs the primitive's exact-key verify)");
+});
+
+describe("queueing an exact OBJECT never unpublishes another key that merely starts with it (dogpatch 7772 P1)", () => {
+  const A = `${PREFIX}raw/0000000000`;
+  const B = `${PREFIX}raw/0000000000-0-abcdef01.ndjson.zst`;
+  test("unit: claim B, enqueue exact object A -> B is still published", async () => {
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-ab-")), "s.sqlite"));
+    st.enqueueErasure([{ key: B, kind: "object", org_id: "org-1", reason: "stale" }]);
+    st.publishWrites([{ key: B, versionId: "*" }], lease(st, PREFIX));
+    st.enqueueErasure([{ key: A, kind: "object", org_id: "org-1", reason: "unreferenced" }]);
+    expect(st.publishedUnder(PREFIX)).toEqual([{ key: B, versionId: "*" }]);
+    // A prefix item still unpublishes everything under its prefix.
+    st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }]);
+    expect(st.publishedUnder(PREFIX)).toEqual([]);
+  });
+
+  test("end to end: B reused + claimed, orphan A queued, crash before cancelErasures, lease expires -> E3 erases A and B SURVIVES", async () => {
+    const w = await world(0);
+    w.st.erasureDone(PREFIX, Date.parse("2026-11-07T00:00:00Z") - 1000);
+    w.s.put(A, OLD);
+    w.s.put(B, OLD);
+    // A stale queued erasure of B; a new export reuses and claims B (its manifest references B) ...
+    w.st.enqueueErasure([{ key: B, kind: "object", org_id: "org-1", reason: "stale" }], Date.parse("2026-11-05T00:00:00Z"));
+    w.st.publishWrites([{ key: B, versionId: "*" }], lease(w.st, PREFIX, "exporter:1", Date.parse("2026-11-06T00:00:00Z")));
+    // ... queues orphan A, then hard-crashes before cancelErasures (B's stale item stays queued; the lease expires).
+    w.st.enqueueErasure([{ key: A, kind: "object", org_id: "org-1", reason: "unreferenced" }], Date.parse("2026-11-06T00:00:00Z"));
+    w.advance(3 * 3_600_000);
+    await w.j.drain();
+    w.advance(3 * 3_600_000);
+    await w.j.drain();
+    // Exact-key counts (FakeS3Versions.count is by prefix, and A is a string prefix of B).
+    expect(w.s.keys.get(A)?.length ?? 0).toBe(0);
+    expect(w.s.keys.get(B)?.length ?? 0).toBe(1); // the manifest's reference is never erased
+    expect(w.queued()).toEqual([B]); // its stale item is refused (owned), never done
   });
 });

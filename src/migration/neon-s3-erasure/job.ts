@@ -163,7 +163,10 @@ export class ErasureJob {
     let remaining = 0;
     for (const vs of present.values()) remaining += vs.size;
     if (this.state.obligationRev(prefix) !== rev) return { status: "refused", deleted: step.deleted, remaining };
-    const invocations = this.state.unresolvedWrites(prefix).filter((i) => keyFilter(i.key));
+    // The obligations the subset depends on: those at its keys under the prefix, plus prefix-level ones covering the
+    // prefix itself (an ancestor or equal: legacy imports, nonterminal), deduplicated.
+    const seen = new Set<string>();
+    const invocations = [...this.state.unresolvedWrites(prefix).filter((i) => keyFilter(i.key)), ...this.state.coveringWrites(prefix)].filter((i) => !seen.has(i.id) && !!seen.add(i.id));
     const owned = new Map<string, Set<string>>();
     for (const o of this.state.publishedUnder(prefix)) (owned.get(o.key) ?? owned.set(o.key, new Set()).get(o.key)!).add(o.versionId);
     const byKey = new Map<string, typeof invocations>();
@@ -182,7 +185,9 @@ export class ErasureJob {
       this.counters.unresolved += 1;
       return { status: "unresolved", deleted: step.deleted, remaining };
     }
-    this.state.clearReservations(prefix);
+    // Retire EXACTLY the reserved versions this complete inventory shows absent (within keyFilter); every other
+    // reservation (kept siblings, successors, other subsets) stays.
+    this.state.retireReservations(prefix, (key, versionId) => keyFilter(key) && !(present.get(key)?.has(versionId) ?? false));
     return { status: "erased", deleted: step.deleted, remaining };
   }
 
@@ -318,6 +323,9 @@ export class ErasureJob {
    * kept, and so is the pointer while anything is kept, so the next sweep
    * finds the session again.
    */
+  // UNQUALIFIED dependency: the live writer (relayhistory-api) and the ingest's staged batches are REMOTE writers
+  // outside this local obligation ledger, so their unknown PUT outcomes are never settled here. Their tombstones are
+  // re-swept every pass and never retired or reported complete; their own lanes must qualify their interlock.
   async #eraseLiveFenced(dryRun: boolean): Promise<{ groups: number; versions: number }> {
     let groups = 0;
     let versions = 0;
