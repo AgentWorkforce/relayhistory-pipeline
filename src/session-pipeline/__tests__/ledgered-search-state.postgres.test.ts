@@ -15,6 +15,8 @@ import { expectedMigrationNames, generation, runMigrations, type MigrationProfil
 import { gatedSearchTransact, portableWorkGate } from "../lambda.ts";
 import { createLedgeredSearchComposition } from "../../shared/search-composition.ts";
 import { createSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
+import { admitPortableReader, gatedReaderRunner, readCommittedTenantRunner, type ReaderAdmission } from "../../shared/portable-reader-admission.ts";
+import { poolTenantRunner } from "../../session-read-api/liveness.ts";
 import { runtimeRoleViolations } from "../../hoopdb/migrate-guards.ts";
 import { ledgeredSearchState } from "../postgres-search-state.ts";
 import { admitPortableConnection } from "../../shared/portable-connection-identity.ts";
@@ -76,7 +78,13 @@ async function database() {
     cleanup.push(() => pool.end()); // runs before the database cleanup (reverse order)
     return { pool, query: (q: string, p?: unknown[]) => pool.query(q, p), end: () => pool.end() };
   };
-  return { name, rt, other, owner, profile, runtime, runtimePool, markPass,
+  /** A pool that logs in AS a given role (its own startup identity), like the read API's. */
+  const loginPool = (user: string) => {
+    const pool = new pg.Pool({ connectionString: at(user), max: 2, statement_timeout: 2_000, options: "-c statement_timeout=2000" });
+    cleanup.push(() => pool.end());
+    return pool;
+  };
+  return { name, rt, other, owner, profile, runtime, runtimePool, loginPool, markPass,
     migrate: (over: Partial<MigrationProfile> = {}) => runMigrations(client as never, { profile: { ...profile, ...over } }) };
 }
 
@@ -244,5 +252,60 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     await t.owner.query("INSERT INTO sessions.__96bulls_migrations(name, sha256) VALUES ($1, $2)", [victim, saved]);
     await pass();
     expect(worked).toBe(2);
+  }, 300_000);
+
+  test("full reader admission on a real reader startup LOGIN (bulls96_read_api, local trust): assembly + gated completeness reads under default REPEATABLE READ; concurrent flip, identity substitution and writer-role misconfiguration refused", async () => {
+    const t = await database();
+    await t.migrate();
+    await t.owner.query(readFileSync(join(root, "supabase/bootstrap/session_read_api_role.sql"), "utf8").split("\n").filter(l => !l.startsWith("\\")).join("\n"));
+    await t.owner.query(`ALTER DATABASE ${t.name} SET default_transaction_isolation = 'repeatable read'`);
+    // The writer records state for org-a as itself.
+    const w = await t.runtime();
+    const writer = ledgeredSearchState({ backendId: "opensearch-v1", fromMs: 0 });
+    await w.query("BEGIN");
+    await writer.record(w as never, { orgId: "org-a", workspaceId: "ws-a", harness: "codex", sessionId: "s1" }, { revision: 1, rows: 1, complete: true, at: new Date(0), canonicalSessionId: "s1" });
+    await w.query("COMMIT");
+    const readerPool = t.loginPool("bulls96_read_api");
+    const startup = (await readerPool.query("SELECT current_user AS cu, session_user AS su, current_setting('default_transaction_read_only') AS ro, current_setting('statement_timeout') AS st")).rows[0];
+    expect(startup).toEqual({ cu: "bulls96_read_api", su: "bulls96_read_api", ro: "on", st: "2s" });
+    const a: ReaderAdmission = {
+      generation: await generation(), expectedNames: await expectedMigrationNames(),
+      storageVerifySql: VERIFY,
+      readerVerifySql: readFileSync(join(root, "supabase/bootstrap/session_read_api_role_verify.sql"), "utf8").split("\n").filter(l => !l.startsWith("\\")).join("\n"),
+      writerRole: t.rt, dbMode: "local",
+    };
+    await admitPortableReader(readerPool as never, a); // assembly: PASS
+    // Inject a second-connection flip when the gate reaches the storage verifier.
+    let flip = false;
+    const flipping = { connect: async () => {
+      const c = await readerPool.connect();
+      return { release: () => c.release(), query: async (text: string, params?: unknown[]) => {
+        if (flip && text === a.storageVerifySql) await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pending'");
+        return c.query(text, params);
+      } };
+    } };
+    const reader = ledgeredSearchState({ backendId: "opensearch-v1", fromMs: 0, reader: gatedReaderRunner(readCommittedTenantRunner(flipping as never), a) });
+    expect(await reader.partials({ orgId: "org-a", workspaceId: "ws-a" }, { limit: 10 })).toEqual({ sessions: [], overflow: false });
+    flip = true;
+    await expect(reader.partials({ orgId: "org-a", workspaceId: "ws-a" }, { limit: 10 })).rejects.toThrow("reader_marker_pending");
+    flip = false;
+    await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pass'");
+    // Control: the shared (ungated) runner inherits the database default REPEATABLE READ.
+    const iso = await poolTenantRunner(readerPool as never)("org-a", "ws-a", q => q.query<{ i: string }>("SELECT current_setting('transaction_isolation') AS i"));
+    expect(iso.rows[0]!.i).toBe("repeatable read");
+    const pinned = await readCommittedTenantRunner(readerPool as never)("org-a", "ws-a", q => q.query<{ i: string }>("SELECT current_setting('transaction_isolation') AS i"));
+    expect(pinned.rows[0]!.i).toBe("read committed");
+    // Identity substitution refused: the writer's own login, and SET ROLE from another login.
+    await expect(admitPortableReader(t.loginPool(t.rt) as never, a)).rejects.toThrow("reader_identity");
+    const substitute = { connect: async () => {
+      const c = await t.loginPool("rdsadmin").connect();
+      await c.query("SET ROLE bulls96_read_api");
+      return c;
+    } };
+    await expect(admitPortableReader(substitute as never, a)).rejects.toThrow("reader_identity");
+    // Writer role misconfigured: the storage verifier bound to the wrong writer refuses.
+    await expect(admitPortableReader(readerPool as never, { ...a, writerRole: t.other })).rejects.toThrow(/reader_storage_unverified/);
+    // Still valid afterwards.
+    await admitPortableReader(readerPool as never, a);
   }, 300_000);
 });

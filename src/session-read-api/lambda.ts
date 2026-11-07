@@ -19,6 +19,8 @@ import { log } from "../shared/log.ts";
 import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
+import { admitPortableReader, gatedReaderRunner, readCommittedTenantRunner, readerWriterRole, type ReaderAdmission } from "../shared/portable-reader-admission.ts";
+import { derivedSchemaAssets } from "../session-pipeline/derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces } from "./app.ts";
@@ -118,9 +120,25 @@ export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessE
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   try {
-  const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", poolTenantRunner(pool as never));
-  // M5: refuse a privileged or write-capable reader identity before serving.
-  if (adapter && composition?.admit) await composition.admit(pool as never, "reader");
+  // A composition that declares admission gets the full portable reader admission: the
+  // fixed reader identity, defaults, ledger/marker freshness, the production reader
+  // verifier and the storage verifier bound to the independently configured writer role,
+  // at assembly AND inside every completeness-read transaction (final marker read).
+  // Liveness/directory reads keep the ungated runner; v1 compositions are unchanged.
+  const baseRunner = poolTenantRunner(pool as never);
+  let readerAdmission: ReaderAdmission | undefined;
+  if (backend !== "clickhouse" && composition?.admit) {
+    const assets = await derivedSchemaAssets();
+    readerAdmission = {
+      generation: assets.expected.generation, expectedNames: assets.expected.names,
+      storageVerifySql: assets.portableStorageVerifier, readerVerifySql: assets.readerContractVerifier,
+      writerRole: readerWriterRole(env), ...(assets.expected.dbMode ? { dbMode: assets.expected.dbMode } : {}),
+    };
+  }
+  // READ COMMITTED is fixed in BEGIN, before the tenant SELECT, for the gated path only.
+  const stateRunner = readerAdmission ? gatedReaderRunner(readCommittedTenantRunner(pool as never), readerAdmission) : baseRunner;
+  const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", stateRunner);
+  if (adapter && readerAdmission) await admitPortableReader(pool as never, readerAdmission);
   if (adapter && await adapter.state.fromMs(new Date()) > completeSinceMs) throw new Error("read history floor is below search coverage");
   const app = createReadApi({
     verify: relayAuthVerifier(readApiAuthConfig(env)),
