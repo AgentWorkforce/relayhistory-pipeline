@@ -39,9 +39,8 @@ Cloud's session list shows each session's cached model-written brief title. Toda
 
 ## Containment: backfilled titles stay out of the directory and search
 
-- A backfilled title has **two readers**, and neither is the directory:
-  - `session_brief_titles_for`: Cloud's session list, gated by `READ_API_BRIEF_TITLES_WORKSPACES`;
-  - **`sessions.session_brief()`** (20261102000000, last replaced in 026000): relayhistory-cloud's `GET /v1/sessions/:id/brief`, granted to `session_directory_search_worker`. After a backfill it returns the Neon title (line breaks included) as `stale`, with a NULL description and state and `engine_version 'neon-backfill:v1'`. Before `--execute`, this response shape needs the Cloud brief-endpoint owner's acceptance, or containment in `session_brief()`. That decision belongs to the migration lead.
+- A backfilled title is served **only** through `session_brief_titles_for` (Cloud's session list, gated by `READ_API_BRIEF_TITLES_WORKSPACES`).
+- **`sessions.session_brief()` is contained too.** It is relayhistory-cloud's `GET /v1/sessions/:id/brief`, granted to `session_directory_search_worker`. 043000 replaces it with 026000's body plus one block that reads a backfilled brief as no brief: `missing`, or `pending` while a wakeup is queued. So `/brief` never serves a Neon title, a description-less brief or a line-break title. The down restores 026000's body exactly.
 - The directory projector (`src/hoopdb/session-directory-projector.ts`) reads native brief titles only. It filters on `engine_version NOT LIKE 'neon-backfill:%'`, which also works before 043000 adds `origin`.
 - So a Neon title never reaches `session_directory.title`, `search_text`, `list_session_directory_for`, or the brief-document/search publication built from the directory row.
 - The runtime writer role could set the reserved `neon-backfill:` prefix itself (finding A5). That would only widen the legacy-row CHECKs for that row, and the row would stay out of the directory like any backfilled one. Accepted; no owner-role pin.

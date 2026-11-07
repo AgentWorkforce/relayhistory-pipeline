@@ -33,9 +33,9 @@
  *   - a NATIVE model-written brief title (sessions.session_briefs, src/session-brief) wins
  *     over the latest pointer's title while the brief exists. A Neon-backfilled brief
  *     (20261105043000, engine_version 'neon-backfill:*') never does: it is kept out of the
- *     directory title, search_text and the publication built from them. Its two readers
- *     are sessions.session_brief_titles_for (Cloud's session list) and
- *     sessions.session_brief() (the /brief route; see docs/brief-titles.md). Deleting a pointer deletes the
+ *     directory title, search_text and the publication built from them. Only
+ *     sessions.session_brief_titles_for (Cloud's session list) serves it; sessions.session_brief()
+ *     (the /brief route) reads it as no brief (docs/brief-titles.md). Deleting a pointer deletes the
  *     brief (trigger), so the pointer title returns on the next projection.
  *
  * search_text is always rebuilt with sessions.session_directory_search_text, so the
@@ -79,8 +79,8 @@ export async function projectSessionDirectory(
      ), brief AS (
        -- A NATIVE brief title only. A Neon backfill (20261105043000, origin 'neon_backfill',
        -- engine_version 'neon-backfill:*') never goes into the directory title, search_text or
-       -- the brief-document/search publication built from them. It is read only by
-       -- sessions.session_brief_titles_for and sessions.session_brief() (docs/brief-titles.md). Filtered on engine_version,
+       -- the brief-document/search publication built from them. Only
+       -- sessions.session_brief_titles_for serves it (session_brief() reads it as no brief). Filtered on engine_version,
        -- the column origin is derived from, so this read also works before 043000 is applied.
        SELECT title FROM sessions.session_briefs
         WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4

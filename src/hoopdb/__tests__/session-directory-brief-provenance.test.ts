@@ -2,9 +2,9 @@
  * The directory projector reads NATIVE brief titles only (F2 containment, registry finding A1).
  * A Neon-backfilled brief (20261105043000, engine_version 'neon-backfill:*', origin
  * 'neon_backfill') must never reach session_directory.title, search_text, or the
- * brief-document publication built from the directory row. (Its readers are
- * sessions.session_brief_titles_for and sessions.session_brief(); this file proves only the
- * directory/publication containment.)
+ * brief-document publication built from the directory row. (Only
+ * sessions.session_brief_titles_for serves it; session_brief()'s containment is proved in
+ * src/session-brief/__tests__/brief-titles.test.ts.)
  *
  * Proved through the real projector (projectSessionDirectory) and the real document
  * consumer (sessions.session_brief_document_json), on PGlite:

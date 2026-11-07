@@ -142,7 +142,8 @@ describe("session_briefs provenance", () => {
       revision: 0,
     });
     // session_brief reports a backfilled brief stale, never ready.
-    expect((await briefRpc(pg))[0]).toMatchObject({ status: "stale", stale: true, title: "Neon title", state: "completed" });
+    // Contained: relayhistory-cloud's /brief (session_brief) reads a backfilled brief as no brief.
+    expect((await briefRpc(pg))[0]).toMatchObject({ status: "missing", stale: false, title: null, description: null, state: null, engine_version: null });
     // A failed native attempt keeps the previous text and so its provenance.
     await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { status: "failed", error: "model_failed" });
     expect(await row(pg)).toMatchObject({ status: "failed", origin: "neon_backfill", title: "Neon title" });
@@ -159,6 +160,27 @@ describe("session_briefs provenance", () => {
     // A quarantine is never refilled.
     expect((await loadBackfill(target(pg), [neon()], "execute")).outcomes.skipped_quarantined).toBe(1);
     expect(await row(pg)).toMatchObject({ title: null });
+  });
+});
+
+describe("sessions.session_brief (the /brief route) is contained", () => {
+  test("an ordinary or line-break backfilled brief reads as no brief; a native brief is served; down restores 026000", async () => {
+    for (const title of ["Neon title", "Fix login\nand logout"]) {
+      const pg = await db();
+      await pointer(pg);
+      await loadBackfill(target(pg), [neon({ title, description: null })], "execute");
+      const row = (await briefRpc(pg))[0]!;
+      expect(row).toMatchObject({ status: "missing", title: null, description: null, state: null, prompt_version: null, engine_version: null, model: null, generated_at: null });
+      // A queued wakeup reads as pending, never as a refresh of the Neon title.
+      await pg.query("INSERT INTO sessions.session_brief_wakeups (org_id, workspace_id, harness, session_id, admission, due_at) VALUES ($1,$2,$3,$4,'background',now())", [KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId]);
+      expect((await briefRpc(pg))[0]).toMatchObject({ status: "pending", title: null });
+      // The session list still gets the title (its gated reader).
+      expect((await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"]]))).map((r) => r.title)).toEqual([title]);
+      // A native brief replaces it and is served.
+      await pg.query("DELETE FROM sessions.session_brief_wakeups");
+      await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { status: "ready", text: text() });
+      expect((await briefRpc(pg))[0]).toMatchObject({ status: "ready", title: "Native title" });
+    }
   });
 });
 
@@ -347,6 +369,10 @@ describe("20261105043000 up/down/up", () => {
     expect(await code(pg.exec(read(DOWN)))).toBe("55000");
     await pg.query("DELETE FROM sessions.session_briefs WHERE origin = 'neon_backfill'");
     await pg.exec(read(DOWN));
+    // session_brief is back to 026000's body exactly.
+    const body = (await pg.query<{ src: string }>("SELECT prosrc AS src FROM pg_proc WHERE oid = 'sessions.session_brief(text,text,text)'::regprocedure")).rows[0]!.src;
+    const original = read("supabase/migrations/20261105026000_canonical_history_lineage.sql").match(/CREATE OR REPLACE FUNCTION sessions\.session_brief\([\s\S]*?AS \$brief\$([\s\S]*?)\$brief\$;/)![1];
+    expect(body).toBe(original);
     const cols = (await pg.query<{ attname: string }>("SELECT attname FROM pg_attribute WHERE attrelid = 'sessions.session_briefs'::regclass AND attname IN ('origin','legacy_job_id') AND NOT attisdropped")).rows;
     expect(cols).toEqual([]);
     expect((await pg.query("SELECT to_regprocedure('sessions.session_brief_titles_for(text,text[],text[])') AS f")).rows[0]).toEqual({ f: null });

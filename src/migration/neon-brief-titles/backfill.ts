@@ -36,10 +36,9 @@
  * "reuses" it instead of calling the model. The directory title is not touched, now or on a
  * later re-projection: the directory projector reads native briefs only
  * (src/hoopdb/session-directory-projector.ts), so a backfilled title never reaches
- * session_directory.title, search_text or the brief-document/search publication. Its two
- * readers are sessions.session_brief_titles_for (Cloud's session list) and sessions.session_brief()
- * (the /brief route, which reports it 'stale' with a NULL description and state); see
- * docs/brief-titles.md.
+ * session_directory.title, search_text or the brief-document/search publication, and
+ * sessions.session_brief() (the /brief route) reads it as no brief: only
+ * sessions.session_brief_titles_for (Cloud's session list) serves it; see docs/brief-titles.md.
  *
  * The brief sweep (store.ts sweepUnbriefed) arms only sessions with no brief row, so a
  * backfilled session is not re-briefed by the sweep. That is intended: the Neon title keeps
