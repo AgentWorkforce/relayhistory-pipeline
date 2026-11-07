@@ -77,50 +77,64 @@ export class AuthorityNotActive extends Error {
   }
 }
 
-const COLS = "org_id, workspace_id, user_id, origin_id, source, session_id";
-
+/**
+ * The Supabase authority's fenced set, through the least-privilege eraser RPCs (20261105041000): the deduplicated
+ * UNION of the frozen-source deletions (Neon-era sessions) and the target's upload_deletions (every session the
+ * ordered fence deleted, post-cutover uploads included). Each RPC refuses unless the authority is active. The
+ * connection is expected to be bulls96_privacy_eraser (assertEraserIdentity), which can call nothing else.
+ */
 export function supabaseAuthority(db: Queryable): ErasureAuthority {
+  const rpc = async <T>(sql: string, params: unknown[] = []): Promise<T> => {
+    const r = (await db.query<{ r: T }>(sql, params)).rows[0];
+    if (!r) throw Object.assign(new Error("eraser rpc returned no row"), { code: "eraser_rpc_empty" });
+    return r.r;
+  };
   const ready = async () => {
-    const { rows } = await db.query<{ state: string | null }>(
-      "SELECT (SELECT state FROM sessions.ingest_privacy_authority WHERE singleton) AS state",
-    );
-    if (rows[0]?.state !== "active") throw new AuthorityNotActive();
+    const s = await rpc<{ active?: unknown }>("SELECT sessions.ingest_privacy_eraser_state() AS r");
+    if (s?.active !== true) throw new AuthorityNotActive();
   };
   return {
     kind: "supabase",
     ready,
     lockWaiters: () => lockWaiters(db),
-    fencedGroups: async () => {
-      await ready();
-      const { rows } = await db.query<{ org_id: string; session_id: string }>(
-        "SELECT DISTINCT org_id, session_id FROM sessions.ingest_frozen_source_deletions LIMIT 100001",
-      );
-      if (rows.length > 100_000) throw Object.assign(new Error("too many fenced groups"), { code: "fence_overflow" });
-      return rows;
-    },
-    fencedLivePage: async (after, limit = LIVE_FENCE_PAGE) => {
-      await ready();
-      const { rows } = after
-        ? await db.query<LiveFencedGroup>(
-            `SELECT ${COLS} FROM sessions.ingest_frozen_source_deletions
-              WHERE (${COLS}) > ($1, $2, $3, $4, $5, $6) ORDER BY ${COLS} LIMIT $7`,
-            [after.org_id, after.workspace_id, after.user_id, after.origin_id, after.source, after.session_id, limit],
-          )
-        : await db.query<LiveFencedGroup>(`SELECT ${COLS} FROM sessions.ingest_frozen_source_deletions ORDER BY ${COLS} LIMIT $1`, [limit]);
-      return rows;
-    },
-    stillFenced: async (g) => {
-      // Re-check the authority too: a release back to Neon makes this table stale at once.
-      await ready();
-      return (
-        await db.query(
-          `SELECT 1 FROM sessions.ingest_frozen_source_deletions
-            WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3 AND origin_id = $4 AND source = $5 AND session_id = $6`,
-          [g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id],
-        )
-      ).rows.length > 0;
-    },
+    fencedGroups: async () => rpc<{ org_id: string; session_id: string }[]>("SELECT sessions.ingest_privacy_eraser_groups() AS r"),
+    fencedLivePage: async (after, limit = LIVE_FENCE_PAGE) =>
+      rpc<LiveFencedGroup[]>("SELECT sessions.ingest_privacy_eraser_page($1::jsonb) AS r", [JSON.stringify({
+        after: after ? [after.org_id, after.workspace_id, after.user_id, after.origin_id, after.source, after.session_id] : null,
+        limit: Math.min(limit, 5000),
+      })]),
+    // The RPC re-checks the authority too: a release back to Neon makes these sets stale at once.
+    stillFenced: async (g) =>
+      (await rpc<boolean>("SELECT sessions.ingest_privacy_eraser_still_fenced($1::jsonb) AS r", [JSON.stringify({
+        org_id: g.org_id, workspace_id: g.workspace_id, user_id: g.user_id, origin_id: g.origin_id, source: g.source, session_id: g.session_id,
+      })])) === true,
   };
+}
+
+export class EraserIdentityRefused extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = "EraserIdentityRefused";
+  }
+}
+
+/**
+ * The Supabase eraser must run as bulls96_privacy_eraser and nothing stronger: never a superuser, a BYPASSRLS role,
+ * the owner of the privacy tables, or a member of that owner (a compromised eraser would otherwise hold the
+ * destructive S3 key AND an owner credential). Checked at startup, before any sweep.
+ */
+export async function assertEraserIdentity(db: Queryable): Promise<void> {
+  const r = (await db.query<{ who: string; super: boolean; bypass: boolean; owner_member: boolean }>(
+    `SELECT current_user::text AS who, r.rolsuper AS super, r.rolbypassrls AS bypass,
+            pg_has_role(current_user, c.relowner, 'MEMBER') AS owner_member
+       FROM pg_roles r, pg_class c
+      WHERE r.rolname = current_user AND c.oid = 'sessions.ingest_frozen_source_deletions'::regclass`,
+  )).rows[0];
+  if (!r) throw new EraserIdentityRefused("eraser_identity_unknown");
+  if (r.super) throw new EraserIdentityRefused("eraser_identity_superuser");
+  if (r.bypass) throw new EraserIdentityRefused("eraser_identity_bypassrls");
+  if (r.owner_member) throw new EraserIdentityRefused("eraser_identity_owner");
+  if (r.who !== "bulls96_privacy_eraser") throw new EraserIdentityRefused("eraser_identity_not_privacy_eraser");
 }
 
 export function isErasureAuthority(v: unknown): v is ErasureAuthority {

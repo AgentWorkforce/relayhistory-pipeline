@@ -510,6 +510,25 @@
     "sessions.ingest_privacy_authority_state()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_privacy_eraser_groups()": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.ingest_privacy_eraser_page(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.ingest_privacy_eraser_require_active()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_privacy_eraser_state()": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.ingest_privacy_eraser_still_fenced(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
     "sessions.ingest_publication_abandon(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

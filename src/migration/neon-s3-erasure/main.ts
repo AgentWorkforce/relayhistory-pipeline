@@ -15,9 +15,11 @@
  * watermark (`S3X_STATE`) on the same host.
  *
  *   S3X_PRIVACY_AUTHORITY  "neon" (default): databaseUrl is a direct Neon URL; reads deleted_upload_sessions.
- *                          "supabase" (C3): databaseUrl is a Supabase session/direct URL; reads
- *                          ingest_frozen_source_deletions, and erases nothing unless the Supabase privacy
- *                          authority is active. Neon is not connected at all.
+ *                          "supabase" (C3): databaseUrl is a Supabase session/direct URL for the
+ *                          bulls96_privacy_eraser login (owner/superuser/BYPASSRLS refused at startup);
+ *                          reads the union of frozen-source and target deletions through the eraser RPCs,
+ *                          and erases nothing unless the Supabase privacy authority is active. Neon is not
+ *                          connected at all.
  *   S3X_STATE, S3X_BUCKET, S3X_EXPECT_BUCKET, S3X_REGION, S3X_ENDPOINT, S3X_KEY_ROOT,
  *   S3X_ERASER_RECOGNIZES_LEGACY ("true" keeps legacy-only groups; default false; neon only)
  */
@@ -26,7 +28,7 @@ import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode } from "../neon-s3-sync/sync.ts";
 import { readStdinCredentials, refuseCredentialEnv, s3Credentials, sessionAffinityUrl, type S3Credentials } from "../stdin-credentials.ts";
-import { neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
+import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
 import { createS3Eraser, type Eraser } from "./eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "./job.ts";
 
@@ -86,6 +88,8 @@ export async function main() {
       keyRoot: env("S3X_KEY_ROOT", "96bulls")!,
       recognizeLegacy: env("S3X_ERASER_RECOGNIZES_LEGACY", "false") === "true",
     };
+    // Supabase mode: least-privilege identity first (bulls96_privacy_eraser only; never owner/superuser/BYPASSRLS).
+    if (kind === "supabase") await assertEraserIdentity(db);
     const authority = kind === "supabase" ? supabaseAuthority(db) : neonAuthority(db);
     const job = new ErasureJob(authority, state, eraser, log, cfg, Date.now, undefined, () => stop);
     log({ message: "start", execute, authority: kind, recognize_legacy: cfg.recognizeLegacy });

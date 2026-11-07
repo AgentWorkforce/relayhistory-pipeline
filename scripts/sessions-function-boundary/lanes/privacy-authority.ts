@@ -7,6 +7,7 @@ const ORIGINAL = "supabase/migrations/20261105010000_frozen_source_custody.sql";
 const ROLLBACK = "supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql";
 const NAME = "upstream:20261105041000_ingest_privacy_authority.sql";
 const INGEST = "bulls96_session_ingest";
+const ERASER = "bulls96_privacy_eraser";
 
 /** The exact 010000 legacy mirror begin/complete, as CREATE OR REPLACE (owner/ACL stay unchanged). */
 export function originalMirrorBodies(source: string): string[] {
@@ -51,6 +52,12 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
     "DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_resets;",
     "DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_records;",
     "DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_owned_sessions;",
+    "DROP FUNCTION sessions.ingest_privacy_eraser_still_fenced(jsonb);",
+    "DROP FUNCTION sessions.ingest_privacy_eraser_page(jsonb);",
+    "DROP FUNCTION sessions.ingest_privacy_eraser_groups();",
+    "DROP FUNCTION sessions.ingest_privacy_eraser_require_active();",
+    "DROP FUNCTION sessions.ingest_privacy_eraser_state();",
+    "REVOKE USAGE ON SCHEMA sessions FROM bulls96_privacy_eraser;",
     "DROP FUNCTION sessions.ingest_privacy_authority_begin(jsonb);",
     "DROP FUNCTION sessions.ingest_privacy_authority_complete(jsonb);",
     "DROP FUNCTION sessions.ingest_privacy_authority_apply(text,text,text,text,jsonb);",
@@ -80,8 +87,8 @@ export const privacyAuthority: LaneManifest = {
   lane: "privacy-authority",
   owner: "C3 lane A, sessions-pipeline #289 (slot 041000)",
   migration: MIGRATION,
-  prefixes: ["sessions.ingest_privacy_authority_"],
-  grantSources: [{ path: MIGRATION, roles: [INGEST] }],
+  prefixes: ["sessions.ingest_privacy_authority_", "sessions.ingest_privacy_eraser_"],
+  grantSources: [{ path: MIGRATION, roles: [INGEST, ERASER] }],
   functions: {
     "sessions.ingest_privacy_authority_lock(boolean)": owner,
     "sessions.ingest_privacy_authority_guard()": { secdef: true, grants: [] },
@@ -95,6 +102,11 @@ export const privacyAuthority: LaneManifest = {
     "sessions.ingest_privacy_authority_purge_derived(text,text)": owner,
     "sessions.ingest_privacy_authority_begin(jsonb)": { secdef: true, grants: [INGEST] },
     "sessions.ingest_privacy_authority_complete(jsonb)": { secdef: true, grants: [INGEST] },
+    "sessions.ingest_privacy_eraser_state()": { secdef: true, grants: [ERASER] },
+    "sessions.ingest_privacy_eraser_require_active()": owner,
+    "sessions.ingest_privacy_eraser_groups()": { secdef: true, grants: [ERASER] },
+    "sessions.ingest_privacy_eraser_page(jsonb)": { secdef: true, grants: [ERASER] },
+    "sessions.ingest_privacy_eraser_still_fenced(jsonb)": { secdef: true, grants: [ERASER] },
   },
   replaces: {
     "sessions.ingest_source_control_begin(jsonb)": { secdef: true, original: ORIGINAL },
