@@ -1,7 +1,7 @@
 import type {CurrentCustodyPacket,CurrentCustodyAck} from "./custody-protocol.ts";
 import type {OrderedControl,OrderedControlResult} from "./control-protocol.ts";
 import type { BufferedStageSpec, BufferedStageIntent } from "./buffered-protocol.ts";
-import type { DbErrorClass } from "./db-error-class.ts";
+import type { DbErrorDiagnosis } from "./db-error-class.ts";
 /**
  * The session ingest's Supabase ledger: everything `accept_delivery_batch`
  * decided in Neon that is not transcript content.
@@ -203,8 +203,8 @@ export interface Ledger {
 
 /** The ledger is unreachable or refused: the batch answers 503 (retryable), never a fallback. */
 export class LedgerUnavailableError extends Error {
-  /** `dbClass`: the closed client-error class of the underlying failure (diagnostic only). */
-  constructor(readonly code: string, readonly dbClass?: DbErrorClass) {
+  /** `db`: the closed diagnosis (class, safe code, basis) of the underlying failure (diagnostic only). */
+  constructor(readonly code: string, readonly db?: DbErrorDiagnosis) {
     super(`session ingest ledger unavailable: ${code}`);
     this.name = "LedgerUnavailableError";
   }

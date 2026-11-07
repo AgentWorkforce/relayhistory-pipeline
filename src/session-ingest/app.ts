@@ -38,6 +38,7 @@ import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
+import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
@@ -208,14 +209,17 @@ function errorBody(c: Context<Env>, code: string, message: string, extra: Record
 }
 
 /** The 503 diagnosis on the route's log line: stage, cause code and, for a database cause,
- * the closed client-error class (never a message). A raw ledger error that reached the
- * route outside a delivery stage is reported the same way. Diagnostic only. */
+ * the closed diagnosis (heuristic class, safe code, basis; never a message). A raw ledger
+ * error that reached the route outside a delivery stage is reported the same way.
+ * Diagnostic only. */
 function unavailableFields(error: unknown): Record<string, unknown> {
-  if (error instanceof IngestUnavailable)
-    return { stage: error.stage, error_code: error.cause_code, ...(error.db_class ? { db_error_class: error.db_class } : {}) };
-  if (error instanceof LedgerUnavailableError)
-    return { error_code: error.code, ...(error.dbClass ? { db_error_class: error.dbClass } : {}) };
+  if (error instanceof IngestUnavailable) return { stage: error.stage, error_code: error.cause_code, ...dbFields(error.db) };
+  if (error instanceof LedgerUnavailableError) return { error_code: error.code, ...dbFields(error.db) };
   return {};
+}
+
+function dbFields(db: DbErrorDiagnosis | undefined): Record<string, unknown> {
+  return db ? { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis } : {};
 }
 
 function failure(c: Context<Env>, error: unknown) {

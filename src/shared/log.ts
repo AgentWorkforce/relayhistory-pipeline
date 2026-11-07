@@ -19,7 +19,7 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "migration", "ledger_sha", "accepted_as_alias_of",
   "route", "correlation_id",
   // Closed values only (src/session-ingest/db-error-class.ts): never a message or stack.
-  "db_error_class", "error_name",
+  "db_error_class", "db_error_code", "db_error_basis", "error_name",
 ]);
 
 export type Level = "debug" | "info" | "warn" | "error";
