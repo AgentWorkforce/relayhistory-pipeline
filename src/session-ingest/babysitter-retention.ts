@@ -626,8 +626,9 @@ export async function babysitterRetentionTick(deps: TickDeps): Promise<TickResul
       }
       // Zero versions now is not "no PUT can still commit": every invocation at every key must
       // be resolved on its OWN terminal evidence (write-obligation.ts). A dispatched invocation
-      // with nothing attributed stays UNRESOLVED (nonterminal) and the bucket stays tracked,
-      // re-swept on the bounded backoff; a late commit is attributed and erased then.
+      // without its own terminal evidence stays UNRESOLVED (nonterminal) and the bucket stays
+      // tracked, re-swept on the bounded backoff; a late commit found then is erased as cleanup
+      // (its version reserved first) but resolves nothing.
       let open = 0;
       for (const store of stores.values()) {
         const verdict = await withDeadline(reconcileObligation(deps.eraser, store, { budget: { ...deps.eraseBudget, deadlineAt }, now: clock }), deadlineAt - clock());

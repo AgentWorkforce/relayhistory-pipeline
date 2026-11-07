@@ -22,7 +22,8 @@
  *   INGEST_INLINE_MAX_SESSIONS (default 40)
  *   INGEST_REPLICA_MODE        off | queue (= required) | best_effort; required needs NEON_REPLICA
  *   INGEST_BABYSITTER_RETENTION_ROUTING  unset/off (default) | on (any case): Babysitter upserts go to
- *                              retention buckets (babysitter-retention.ts); replica off only, and
+ *                              retention buckets (babysitter-retention.ts); only with the replica
+ *                              off, and only with INGEST_SUBREQUEST_CAP set (below)
  *   INGEST_SUBREQUEST_CAP      required for routing: this Worker's PROVEN effective subrequest cap
  *   INGEST_SUBREQUEST_REDIRECTS  worst-case redirects per S3 fetch (0..20, default 20)
  *   SESSIONS_NEON_EXIT         unset/false (default) | true: refuse every Neon edge at startup

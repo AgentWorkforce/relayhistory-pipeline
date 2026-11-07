@@ -51,11 +51,18 @@ CREATE TABLE sessions.babysitter_retention_settings(
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  enabled boolean NOT NULL DEFAULT false,
  dry_run boolean NOT NULL DEFAULT true,
- -- The privacy purge's keyset cursor over the permanent tombstones (bounded work per claim).
- purge_after jsonb CHECK(purge_after IS NULL OR (jsonb_typeof(purge_after)='array' AND jsonb_array_length(purge_after)=6)),
  updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 INSERT INTO sessions.babysitter_retention_settings(singleton,enabled,dry_run) VALUES(true,false,true);
+-- The privacy purge's keyset cursor over the permanent tombstones (bounded work per claim). Its own
+-- singleton row, NOT the settings row: a claim holds settings FOR SHARE and takes this row
+-- FOR UPDATE SKIP LOCKED, so concurrent claims never upgrade a shared lock (no deadlock); a claim
+-- that finds the cursor busy skips the purge for this call and still claims buckets.
+CREATE TABLE sessions.babysitter_purge_cursor(
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ purge_after jsonb CHECK(purge_after IS NULL OR (jsonb_typeof(purge_after)='array' AND jsonb_array_length(purge_after)=6))
+);
+INSERT INTO sessions.babysitter_purge_cursor(singleton) VALUES(true);
 
 CREATE TABLE sessions.babysitter_retention_objects(
  org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,origin_id text NOT NULL,
@@ -186,6 +193,7 @@ CREATE TABLE sessions.babysitter_write_reservations(
 );
 
 ALTER TABLE sessions.babysitter_retention_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions.babysitter_purge_cursor ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.babysitter_retention_objects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.babysitter_retention_audit ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.babysitter_evidence_index ENABLE ROW LEVEL SECURITY;
@@ -208,7 +216,7 @@ BEGIN
   OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=r.oid) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='babysitter retention: role bulls96_babysitter_retention can log in, is elevated or is a member';END IF;
 END $retention_role$;
-REVOKE ALL ON sessions.babysitter_retention_settings,sessions.babysitter_retention_objects,sessions.babysitter_retention_audit,sessions.babysitter_evidence_index,
+REVOKE ALL ON sessions.babysitter_retention_settings,sessions.babysitter_purge_cursor,sessions.babysitter_retention_objects,sessions.babysitter_retention_audit,sessions.babysitter_evidence_index,
  sessions.babysitter_write_obligations,sessions.babysitter_write_invocations,sessions.babysitter_write_reservations FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder,bulls96_babysitter_retention;
 
 -- The audit is append-only for everyone, owner included (only the rollback drops it).
@@ -427,6 +435,7 @@ CREATE FUNCTION sessions.ingest_babysitter_retention_claim(p jsonb) RETURNS json
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $claim$
 DECLARE s sessions.babysitter_retention_settings%ROWTYPE;q sessions.babysitter_retention_objects%ROWTYPE;
  n integer;t uuid;why text;out jsonb:='[]'::jsonb;v_purged bigint:=0;
+ v_after jsonb;v_seen bigint;v_last jsonb;
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_babysitter_retention');
  PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','limit']);
@@ -444,24 +453,34 @@ BEGIN
  -- claim scans at most 1000 tombstones after a persisted keyset cursor (wrapping at the end), so the
  -- work stays bounded however many tombstones accumulate.
  IF NOT s.dry_run THEN
-  CREATE TEMP TABLE IF NOT EXISTS babysitter_purge_window(org_id text,workspace_id text,origin_id text,record_id text,revision bigint,claim_token uuid,fenced boolean) ON COMMIT DROP;
-  DELETE FROM babysitter_purge_window;
-  INSERT INTO babysitter_purge_window
-   SELECT x.org_id,x.workspace_id,x.origin_id,x.record_id,x.revision,x.claim_token,
-    sessions.babysitter_evidence_fenced(x.org_id,x.workspace_id,x.user_id,x.origin_id,x.source,x.session_id,x.fence_epoch,x.reset_epoch)
-   FROM sessions.babysitter_evidence_index x
-   WHERE x.operation='delete' AND (s.purge_after IS NULL OR (x.org_id,x.workspace_id,x.origin_id,x.record_id,x.revision,x.claim_token)>
-     (s.purge_after->>0,s.purge_after->>1,s.purge_after->>2,s.purge_after->>3,(s.purge_after->>4)::bigint,(s.purge_after->>5)::uuid))
-   ORDER BY x.org_id,x.workspace_id,x.origin_id,x.record_id,x.revision,x.claim_token LIMIT 1000;
-  WITH gone AS (DELETE FROM sessions.babysitter_evidence_index i USING babysitter_purge_window w
-    WHERE w.fenced AND i.operation='delete' AND i.org_id=w.org_id AND i.workspace_id=w.workspace_id AND i.origin_id=w.origin_id
-     AND i.record_id=w.record_id AND i.revision=w.revision AND i.claim_token=w.claim_token RETURNING 1)
-  SELECT count(*) INTO v_purged FROM gone;
-  UPDATE sessions.babysitter_retention_settings SET purge_after=(SELECT CASE WHEN count(*)<1000 THEN NULL ELSE
-    (SELECT jsonb_build_array(w.org_id,w.workspace_id,w.origin_id,w.record_id,w.revision::text,w.claim_token::text) FROM babysitter_purge_window w
-     ORDER BY w.org_id DESC,w.workspace_id DESC,w.origin_id DESC,w.record_id DESC,w.revision DESC,w.claim_token DESC LIMIT 1) END FROM babysitter_purge_window)
-   WHERE singleton;
-  IF v_purged>0 THEN INSERT INTO sessions.babysitter_retention_audit(action,versions) VALUES('purged',v_purged);END IF;
+  -- One statement over a bounded CTE: no temp or other caller-controllable relation (a caller with
+  -- TEMP could pre-create one with a trigger that would run as this definer's owner); every object is
+  -- schema-qualified under the fixed search_path. The cursor row is skipped, not waited on, if busy.
+  SELECT c.purge_after INTO v_after FROM sessions.babysitter_purge_cursor c WHERE c.singleton FOR UPDATE SKIP LOCKED;
+  IF FOUND THEN
+   WITH win AS MATERIALIZED (
+     SELECT x.org_id,x.workspace_id,x.origin_id,x.record_id,x.revision,x.claim_token,
+      sessions.babysitter_evidence_fenced(x.org_id,x.workspace_id,x.user_id,x.origin_id,x.source,x.session_id,x.fence_epoch,x.reset_epoch) AS fenced
+     FROM sessions.babysitter_evidence_index x
+     -- Sargable: one row comparison against the cursor, or (no cursor) against a key below every
+     -- real one ('' sorts first and revision>0 by CHECK), so it is always an index range scan.
+     WHERE x.operation='delete' AND (x.org_id,x.workspace_id,x.origin_id,x.record_id,x.revision,x.claim_token)>
+       (coalesce(v_after->>0,''),coalesce(v_after->>1,''),coalesce(v_after->>2,''),coalesce(v_after->>3,''),
+        coalesce((v_after->>4)::bigint,0),coalesce((v_after->>5)::uuid,'00000000-0000-0000-0000-000000000000'::uuid))
+     ORDER BY x.org_id,x.workspace_id,x.origin_id,x.record_id,x.revision,x.claim_token LIMIT 1000),
+   gone AS (DELETE FROM sessions.babysitter_evidence_index i USING win w
+     WHERE w.fenced AND i.operation='delete' AND i.org_id=w.org_id AND i.workspace_id=w.workspace_id AND i.origin_id=w.origin_id
+      AND i.record_id=w.record_id AND i.revision=w.revision AND i.claim_token=w.claim_token RETURNING 1)
+   SELECT (SELECT count(*) FROM gone),(SELECT count(*) FROM win),
+    (SELECT jsonb_build_array(w.org_id,w.workspace_id,w.origin_id,w.record_id,w.revision::text,w.claim_token::text) FROM win w
+     ORDER BY w.org_id DESC,w.workspace_id DESC,w.origin_id DESC,w.record_id DESC,w.revision DESC,w.claim_token DESC LIMIT 1)
+   INTO v_purged,v_seen,v_last;
+   -- Skip a no-op write (NULL->NULL: a short scan from the start).
+   IF (CASE WHEN v_seen<1000 THEN NULL ELSE v_last END) IS DISTINCT FROM v_after THEN
+    UPDATE sessions.babysitter_purge_cursor SET purge_after=CASE WHEN v_seen<1000 THEN NULL ELSE v_last END WHERE singleton;
+   END IF;
+   IF v_purged>0 THEN INSERT INTO sessions.babysitter_retention_audit(action,versions) VALUES('purged',v_purged);END IF;
+  END IF;
  END IF;
  FOR q IN SELECT * FROM sessions.babysitter_retention_objects o
   WHERE (o.state='pending' OR (o.state='leased' AND o.lease_until<=clock_timestamp()))

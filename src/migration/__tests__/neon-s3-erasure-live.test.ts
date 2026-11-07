@@ -303,8 +303,9 @@ describe("E3 on the strict shared eraser (fail closed, retried)", () => {
     const { pg, db } = await neon();
     await tombstone(pg, GROUP);
     const state = new SyncState(join(await tmp(), "s.sqlite"));
-    const job = new ErasureJob(db, state, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
-    return { job, done: async () => { state.close(); await pg.close(); } };
+    const logs: Record<string, unknown>[] = [];
+    const job = new ErasureJob(db, state, s.eraser(), (l: Record<string, unknown>) => { logs.push(l); }, DEFAULT_ERASURE_CONFIG, later, async () => {});
+    return { job, codes: () => logs.map((l) => l.error_code).filter(Boolean), done: async () => { state.close(); await pg.close(); } };
   };
   const live = (s: import("./fake-s3-versions.ts").FakeS3Versions) => [...WORKER_KEYS, POINTER].filter((k) => s.keys.has(k));
   const old = Date.now() - 60 * 60 * 1000;
@@ -324,8 +325,9 @@ describe("E3 on the strict shared eraser (fail closed, retried)", () => {
     const s = new FakeS3Versions();
     for (const k of [...WORKER_KEYS, POINTER]) s.put(k, old);
     s.rewrite = (_call, xml) => xml.slice(0, xml.length - 30);   // truncated XML on every listing
-    const { job, done } = await s3Job(s);
-    await job.sweep().catch(() => {});
+    const { job, codes, done } = await s3Job(s);
+    await job.sweep();   // a refusal is logged and counted, never thrown out of the sweep
+    expect(codes()).toContain("erasure_inventory");
     expect(s.deletes).toEqual([]);
     expect(live(s)).toHaveLength(3);
     s.rewrite = undefined;
@@ -340,9 +342,10 @@ describe("E3 on the strict shared eraser (fail closed, retried)", () => {
     for (const k of [...WORKER_KEYS, POINTER]) s.put(k, old);
     const neighbour = `96bulls/org-1/v1/ws=ws_1/m=${M}/h=claude/d=2026/10/30/s=sess_big/raw/`;
     for (let i = 0; i <= 10_000; i++) s.put(`${neighbour}${String(i).padStart(6, "0")}.ndjson.zst`, old);
-    const { job, done } = await s3Job(s);
-    await job.sweep().catch(() => {});
-    expect(s.deletes.filter((d) => !d.includes("/s=sess_big/"))).toEqual([]);
+    const { job, codes, done } = await s3Job(s);
+    await job.sweep();
+    expect(codes()).toContain("erasure_inventory");
+    expect(s.deletes).toEqual([]);
     expect(live(s)).toHaveLength(3);
     // The workload shrinks (here: the neighbour is gone): the same tombstone is erased by the next sweep.
     for (const k of [...s.keys.keys()]) if (k.startsWith(neighbour)) s.keys.delete(k);
@@ -355,12 +358,15 @@ describe("E3 on the strict shared eraser (fail closed, retried)", () => {
     const { FakeS3Versions } = await import("./fake-s3-versions.ts");
     const s = new FakeS3Versions();
     for (const k of WORKER_KEYS) s.put(k, old);
-    s.rewrite = (_call, xml) => xml.replace("<IsTruncated>", "<IsTruncatedX>");   // unproven pagination
+    // An unbalanced tag (<IsTruncatedX>...</IsTruncated>): refused as malformed XML (erasure_inventory).
+    s.rewrite = (_call, xml) => xml.replace("<IsTruncated>", "<IsTruncatedX>");
     const { db } = await neon();
     const state = new SyncState(join(await tmp(), "s.sqlite"));
     state.enqueueErasure([{ key: DIR, kind: "prefix", org_id: "org-1", reason: "test" }], 1);
-    const job = new ErasureJob(db, state, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
+    const logs: Record<string, unknown>[] = [];
+    const job = new ErasureJob(db, state, s.eraser(), (l: Record<string, unknown>) => { logs.push(l); }, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.drain();
+    expect(logs.find((l) => l.message === "erasure failed")?.error_code).toBe("erasure_inventory");
     expect(s.deletes).toEqual([]);
     expect(job.counters.failed).toBe(1);
     expect(state.erasureQueued(DIR, 1)).toBe(true);   // not done, not removed

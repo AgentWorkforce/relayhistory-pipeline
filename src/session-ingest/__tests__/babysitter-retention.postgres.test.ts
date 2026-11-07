@@ -207,7 +207,7 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     expect(all).toEqual(["sessions.ingest_babysitter_retention_claim(jsonb)", "sessions.ingest_babysitter_retention_complete(jsonb)", "sessions.ingest_babysitter_retention_fence(jsonb)", "sessions.ingest_babysitter_retention_obligation(jsonb)"]);
     expect((await pool.query("SELECT rolcanlogin FROM pg_roles WHERE rolname='bulls96_babysitter_retention'")).rows[0].rolcanlogin).toBe(false);
     for (const r of ["bulls96_session_ingest", "bulls96_babysitter_retention", "bulls96_read_api"])
-      for (const t of ["babysitter_retention_settings", "babysitter_retention_objects", "babysitter_retention_audit", "babysitter_evidence_index", "babysitter_write_obligations"])
+      for (const t of ["babysitter_retention_settings", "babysitter_purge_cursor", "babysitter_retention_objects", "babysitter_retention_audit", "babysitter_evidence_index", "babysitter_write_obligations", "babysitter_write_invocations", "babysitter_write_reservations"])
         expect((await pool.query("SELECT has_table_privilege($1,'sessions.'||$2,'SELECT') AS s", [r, t])).rows[0].s).toBe(false);
     expect(await code(asIngest("SELECT sessions.ingest_babysitter_retention_claim($1::jsonb)", [JSON.stringify({ generation, limit: 1 })]))).toBe("42501");
     expect(await code(asRetention("SELECT sessions.ingest_babysitter_retention_register($1::jsonb)", [JSON.stringify({})]))).toBe("42501");
@@ -236,6 +236,22 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     expect(await code(pool.query(readFileSync(join(root, ROLLBACK), "utf8")))).toBe("55000");
     expect((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_evidence_index WHERE org_id=$1", [t.orgId])).rows[0].n).toBe(1);
     expect(readFileSync(join(root, ROLLBACK), "utf8")).toContain("EXISTS(SELECT 1 FROM sessions.babysitter_evidence_index)");
+  });
+
+  test("P2 delta (purge history): once the privacy purge removed the last tombstone, leaving only action=purged, rollback still refuses (55000)", async () => {
+    // Runs right after M1, before any bucket exists: M1's delete-only tombstone is the only index row.
+    const t = { orgId: "org-m1", workspaceId: "ws-m1", userId: "u-m1" };
+    expect((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_evidence_index")).rows[0].n).toBe(1);
+    await disable(t, "m1-sess");
+    await configure(true, false);
+    try { await sweeper().claim(1); } finally { await configure(false, true); }
+    // The purge removed it: no bucket, no index row, no obligation remains; only the audit says so.
+    for (const tbl of ["babysitter_retention_objects", "babysitter_evidence_index", "babysitter_write_obligations"])
+      expect((await pool.query(`SELECT count(*)::int n FROM sessions.${tbl}`)).rows[0].n).toBe(0);
+    expect((await pool.query("SELECT array_agg(DISTINCT action ORDER BY action) a FROM sessions.babysitter_retention_audit")).rows[0].a).toEqual(["configured", "purged"]);
+    expect(await code(pool.query(readFileSync(join(root, ROLLBACK), "utf8")))).toBe("55000");
+    expect((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_retention_audit WHERE action='purged'")).rows[0].n).toBe(1);
+    expect(readFileSync(join(root, ROLLBACK), "utf8")).toContain("babysitter_retention_audit WHERE action<>'configured'");
   });
 
   // Runs before any test writes raw privacy rows for the org (the lazy-custody baseline would refuse).
@@ -872,6 +888,118 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     await releaseAll(all);
     await configure(false, true);
   });
+
+  test("P1 delta: a GENUINE retention login that pre-creates a trapped temp relation of the purge's old name: it never runs as the owner, nothing leaks into it, no active tombstone is deleted", async () => {
+    // Operator phase (LOGIN + timeouts), then a TEST-ONLY password on this owned synthetic cluster (scram-sha-256).
+    await pool.query(readFileSync(join(root, "supabase/bootstrap/babysitter_retention_role.sql"), "utf8"));
+    await pool.query("ALTER ROLE bulls96_babysitter_retention PASSWORD 'br294-test-only-synthetic'");
+    const u = new URL(url!);
+    u.pathname = "/" + name;
+    u.username = "bulls96_babysitter_retention";
+    u.password = "br294-test-only-synthetic";
+    const c = new pg.Client({ connectionString: u.href });
+    try {
+      await configure(true, false);
+      await c.connect();
+      expect((await c.query("SELECT system_user::text AS s, current_user::text AS c")).rows[0]).toEqual({ s: "scram-sha-256:bulls96_babysitter_retention", c: "bulls96_babysitter_retention" });
+      // The vector exists: the role may create temp relations (Supabase keeps PUBLIC TEMP).
+      expect((await c.query("SELECT has_database_privilege(current_user,current_database(),'TEMP') AS t")).rows[0].t).toBe(true);
+      // An ACTIVE (unfenced) permanent tombstone of another tenant that the trap would try to delete.
+      const v = { orgId: "org-trap", workspaceId: "ws-trap", userId: "u-trap" };
+      await register(v, [], await seedClaim(v, ["trap-sess"]), generation, [{ bucket: null, originId: ORIGIN, recordId: "trap-r", revision: "1", revisionId: "trap-r:1", digest: dig("trap-r:1"),
+        operation: "delete", kind: "turn_receipt", source: "claude", sessionId: "trap-sess", line: null, expiresAtMs: null }]);
+      // Settle any legitimately fenced tombstones first, so the trap claim below must purge nothing.
+      for (let i = 0; i < 3; i++) await sweeper().claim(1);
+      const purged = async () => Number((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_retention_audit WHERE action='purged'")).rows[0].n);
+      const purgedBefore = await purged();
+      await c.query("BEGIN");
+      await c.query("CREATE TEMP TABLE babysitter_purge_window(org_id text,workspace_id text,origin_id text,record_id text,revision bigint,claim_token uuid,fenced boolean)");
+      await c.query("CREATE FUNCTION pg_temp.br294_trap() RETURNS trigger LANGUAGE plpgsql AS $t$BEGIN RAISE EXCEPTION 'trap fired as %', current_user; END$t$");
+      await c.query("CREATE TRIGGER br294_trap BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON babysitter_purge_window FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.br294_trap()");
+      // The trap is live for the caller's own statements.
+      await c.query("SAVEPOINT own");
+      expect(await code(c.query("DELETE FROM babysitter_purge_window"))).toBe("P0001");
+      await c.query("ROLLBACK TO SAVEPOINT own");
+      // The definer claim (enabled, not dry run: the purge runs) never touches it.
+      const r = (await c.query("SELECT sessions.ingest_babysitter_retention_claim($1::jsonb) AS v", [JSON.stringify({ generation, limit: 1 })])).rows[0].v;
+      expect(r.enabled).toBe(true);
+      // No identity leaked into the caller's relation, and the active tombstone survives.
+      expect((await c.query("SELECT count(*)::int n FROM babysitter_purge_window")).rows[0].n).toBe(0);
+      await c.query("COMMIT");
+      expect((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_evidence_index WHERE org_id='org-trap' AND operation='delete'")).rows[0].n).toBe(1);
+      expect(await purged()).toBe(purgedBefore);
+    } finally {
+      await c.end().catch(() => undefined);
+      await pool.query("ALTER ROLE bulls96_babysitter_retention NOLOGIN PASSWORD NULL; ALTER ROLE bulls96_babysitter_retention RESET ALL");
+      await configure(false, true);
+    }
+    const src = readFileSync(join(root, "supabase/migrations/20261105042000_babysitter_evidence_retention.sql"), "utf8");
+    expect(src.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n")).not.toMatch(/\bTEMP(ORARY)?\s+TABLE\b/i);
+  }, 30_000);
+
+  test("P2 delta: two connections claiming in overlapping transactions never wait on or deadlock over the purge cursor; the busy one skips the purge and still claims", async () => {
+    await configure(true, false);
+    const t = tenantOf("u-cursor");
+    for (let i = 0; i < 2; i++) await age(await refOfReg(t, bucket(200 + i, `cur-${i}`)));
+    const a = await pool.connect(), b = await pool.connect();
+    try {
+      const claim = (c: pg.PoolClient) => c.query("SELECT sessions.ingest_babysitter_retention_claim($1::jsonb) AS v", [JSON.stringify({ generation, limit: 1 })]).then((r) => r.rows[0].v);
+      await a.query("BEGIN;SET LOCAL ROLE bulls96_babysitter_retention;SET LOCAL lock_timeout='2s'");
+      await b.query("BEGIN;SET LOCAL ROLE bulls96_babysitter_retention;SET LOCAL lock_timeout='2s'");
+      const ra = await claim(a); // holds settings FOR SHARE and the cursor row FOR UPDATE until it ends
+      const t0 = Date.now();
+      const rb = await claim(b); // the old shared-lock upgrade would block here (55P03) or deadlock (40P01)
+      expect(Date.now() - t0).toBeLessThan(1500);
+      expect(ra.enabled && rb.enabled).toBe(true);
+      expect(ra.objects.length + rb.objects.length).toBeGreaterThanOrEqual(1);
+      expect(new Set([...ra.objects, ...rb.objects].map((o: { ref: string }) => o.ref)).size).toBe(ra.objects.length + rb.objects.length);
+      // The cursor row is A's: B neither took nor waited for it.
+      expect(await code(pool.query("SELECT 1 FROM sessions.babysitter_purge_cursor FOR UPDATE NOWAIT"))).toBe("55P03");
+      // Both again, concurrently, in fresh transactions: both complete.
+      await a.query("ROLLBACK"); await b.query("ROLLBACK");
+      await a.query("BEGIN;SET LOCAL ROLE bulls96_babysitter_retention;SET LOCAL lock_timeout='2s'");
+      await b.query("BEGIN;SET LOCAL ROLE bulls96_babysitter_retention;SET LOCAL lock_timeout='2s'");
+      const both = await Promise.allSettled([claim(a), claim(b)]);
+      expect(both.map((x) => x.status)).toEqual(["fulfilled", "fulfilled"]);
+    } finally {
+      await a.query("ROLLBACK").catch(() => undefined); await b.query("ROLLBACK").catch(() => undefined);
+      a.release(); b.release();
+      await configure(false, true);
+    }
+  }, 30_000);
+
+  test("I6: the purge pages 1,500 fenced tombstones in bounded windows of at most 1000 per claim, wraps its cursor, and spares an active one", async () => {
+    const t = { orgId: "org-zz-purge", workspaceId: "ws-zz", userId: "u-zz" };
+    const keep = { orgId: "org-zz-purge", workspaceId: "ws-zz", userId: "u-zz-keep" };
+    const tomb = (recordId: string, sessionId: string) => ({ bucket: null, originId: ORIGIN, recordId, revision: "1", revisionId: `${recordId}:1`, digest: dig(`${recordId}:1`),
+      operation: "delete" as const, kind: "turn_receipt", source: "claude", sessionId, line: null, expiresAtMs: null });
+    await register(t, [], await seedClaim(t, ["zz-sess"]), generation, [tomb("zz-0000", "zz-sess")]);
+    await register(keep, [], await seedClaim(keep, ["zz-keep"]), generation, [tomb("zz-keep", "zz-keep")]);
+    // 1,499 more of the same identity (owner fixture: copies of the registered row, distinct record ids).
+    const cols = (await pool.query("SELECT string_agg(quote_ident(column_name),',' ORDER BY ordinal_position) c FROM information_schema.columns WHERE table_schema='sessions' AND table_name='babysitter_evidence_index'")).rows[0].c as string;
+    await pool.query(`INSERT INTO sessions.babysitter_evidence_index(${cols}) SELECT ${cols.split(",").map((c) => c === "record_id" ? "'zz-'||lpad(g::text,4,'0')" : "i." + c).join(",")}
+      FROM sessions.babysitter_evidence_index i, generate_series(1,1499) g WHERE i.org_id=$1 AND i.record_id='zz-0000'`, [t.orgId]);
+    const left = async () => Number((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_evidence_index WHERE org_id=$1 AND user_id=$2", [t.orgId, t.userId])).rows[0].n);
+    expect(await left()).toBe(1500);
+    await disable(t, "zz-sess");
+    const purgedBefore = Number((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_retention_audit WHERE action='purged'")).rows[0].n);
+    await configure(true, false);
+    const seen: number[] = [];
+    try {
+      for (let i = 0; i < 6 && (await left()) > 0; i++) { await sweeper().claim(1); seen.push(await left()); }
+    } finally { await configure(false, true); }
+    // Bounded: no single claim purged more than the 1000-row window, so the first left some behind.
+    expect(seen[0]).toBeGreaterThanOrEqual(500);
+    expect(seen.at(-1)).toBe(0);
+    const runs = (await pool.query("SELECT versions FROM sessions.babysitter_retention_audit WHERE action='purged' ORDER BY id OFFSET $1", [purgedBefore])).rows.map((r) => Number(r.versions));
+    expect(runs.every((n) => n >= 1 && n <= 1000)).toBe(true);
+    expect(runs.reduce((a, b) => a + b, 0)).toBe(1500);
+    // The active (unfenced) tombstone of the other identity survived every window; the cursor wrapped.
+    expect((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_evidence_index WHERE org_id=$1 AND user_id=$2", [keep.orgId, keep.userId])).rows[0].n).toBe(1);
+    await configure(true, false);
+    try { for (let i = 0; i < 3; i++) await sweeper().claim(1); } finally { await configure(false, true); }
+    expect((await pool.query("SELECT purge_after FROM sessions.babysitter_purge_cursor")).rows[0].purge_after).toBeNull();
+  }, 60_000);
 
   test("the tick against real SQL: dry run releases; on erases the derived directory under the fence, proves zero, records erased and drops its index rows", async () => {
     const t = tenantOf("u-tick");
