@@ -1,0 +1,9 @@
+{
+  "status": "owner_apply_capture_readonly_not_approval",
+  "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "generation": "e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",
+  "ledgerSha256": "3173f2df7f749fd79c340286f3284d91d8f5a8b988b7f1b1a11e01c3a3307641",
+  "captureSha256": "695aa5bfcf18646aabf9081c6028662017d42d94d0e4629a283e5b215f479c50",
+  "captureGeneration": "c9bc7700eaf8b9aeacf15bca9c0a7a781c30ceccbffc5b3286c602623b1b7042",
+  "wrapperSha256": "09b1d7804612f38fc121106004752348d56d8781930b66e840e1ef71391c4808"
+}

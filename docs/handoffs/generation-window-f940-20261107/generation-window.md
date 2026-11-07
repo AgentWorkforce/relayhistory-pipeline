@@ -1,5 +1,7 @@
 # Generation window at f9409ccb — source-only draft
 
+> Current update: see [approved-window-current-status.md](approved-window-current-status.md). The user directly approved the four-role bootstrap and schema window; the four roles were created/verified at 21:59Z and plan/capture refreshed at 22:02–22:04Z. Runtime coordination remains open. The original draft and 18:47 bindings below are historical.
+
 Prepared for pipeline-lead@linuyc-244866483991928832. Runtime release-owner coordination is codex-relay-desktop-find-prior@khaliqs-macbook-pro-244648072446341120; SQL transport uses the existing khaliqgant CLI session on sf-frame. No apply, runtime deployment, role bootstrap, approval record, rebind, feature activation or Cloud merge has been performed by this preparation.
 
 Status: schema plan and capture are concrete; the COMPLETE generation window is NOT execution-ready. Required live prerequisites and artifact/capture slots below are not established. Do not present the whole-window approval until execution-targets.json has no unresolved slots and its final digest is fixed. The read-only plan/capture do not establish those prerequisites.

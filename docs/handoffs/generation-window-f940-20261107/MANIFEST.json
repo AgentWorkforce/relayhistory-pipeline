@@ -1,14 +1,14 @@
 {
   "version": 1,
-  "at": "2026-11-07T21:16:00.471205+00:00",
-  "kind": "source_plan_and_readonly_fixture_evidence",
+  "at": "2026-11-07T22:06:10.908123+00:00",
+  "kind": "source_plan_readonly_evidence_and_directly_approved_role_bootstrap",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
-  "readiness": "HOLD execution prerequisites and expired schema plan/capture; exact Worker source/build supplement reviewed PASS; pending fresh provider bracket and apply-time artifact identity",
+  "readiness": "DIRECT_USER_SCHEMA_WINDOW_APPROVAL_RECORDED; four missing roles created and verified; fresh PLAN/capture; runtime handoff unresolved before schema apply",
   "files": [
     {
       "name": "generation-window.md",
-      "bytes": 35051,
-      "sha256": "c69bf7f07e9d0823d438a0559da1cbed2c662ba689d20e3de6b520516b410d11"
+      "bytes": 35404,
+      "sha256": "7d13d267202966c569eb9f4adb87d4413c1d7c5e01a7b8585adfb01faa8d32ce"
     },
     {
       "name": "readonly-plan.json",
@@ -27,8 +27,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 7693,
-      "sha256": "d88dd490ed4d28904ed044befae527460497d0cc667ea4fde79191fcf2f288f2"
+      "bytes": 8564,
+      "sha256": "8598d317025478098fcaafc824db9ac409f9ef4789429ef7525ec3b7c7311c15"
     },
     {
       "name": "source-evidence.json",
@@ -269,6 +269,66 @@
       "name": "supabase-nonsystem-catalog-census-observation.md",
       "bytes": 3425,
       "sha256": "32ed3bc65a72c6dfdd7785e73ed72f1b4692616bc8d8af64fad37e6cf09088e4"
+    },
+    {
+      "name": "approved-role-bootstrap.sql.txt",
+      "bytes": 4771,
+      "sha256": "c957ae416d707d471b576bea93dee07f2035fb8b930bacaff4207d63ffc0b478"
+    },
+    {
+      "name": "approved-missing-nologin-bootstrap.ts.txt",
+      "bytes": 6575,
+      "sha256": "50911d8a6a8baa49a77b1d4bf29b88c3f2423662f47d2f2348af96ba6bbb7474"
+    },
+    {
+      "name": "approved-role-bootstrap-before.json",
+      "bytes": 17318,
+      "sha256": "b12abf05d7e98efbfbbdc97c571aca1288b1222f98a947825ce2740ab20f2a19"
+    },
+    {
+      "name": "approved-role-bootstrap-after.json",
+      "bytes": 21285,
+      "sha256": "d52d5723bb4be7919ea561bb931edf1a196402f104e998e8a6bb83b764acb85d"
+    },
+    {
+      "name": "approved-role-bootstrap-result.json",
+      "bytes": 980,
+      "sha256": "c344b597b2bc31b3f79a7ae183bf985a93ba41e07449adbe59d4f337e14e850e"
+    },
+    {
+      "name": "approved-role-bootstrap-verification.json",
+      "bytes": 1929,
+      "sha256": "15b01a1d79e4723fe8e636aef5b54111010f0636afd68a581174652fafc3b9a1"
+    },
+    {
+      "name": "approved-role-bootstrap-observation.md",
+      "bytes": 2057,
+      "sha256": "05ab85406b79f63b683c8ba6549eeeb8cf292040188e225a60895722706484f1"
+    },
+    {
+      "name": "approved-window-refresh-readonly-plan.json",
+      "bytes": 20210,
+      "sha256": "95d9012c2183758fd4a81a05f887a8b395c4287e1b9ef37f7d9e7f55a3c7554e"
+    },
+    {
+      "name": "approved-window-refresh-capture.json",
+      "bytes": 2428,
+      "sha256": "695aa5bfcf18646aabf9081c6028662017d42d94d0e4629a283e5b215f479c50"
+    },
+    {
+      "name": "approved-window-refresh-capture-result.json",
+      "bytes": 554,
+      "sha256": "3467764ffdc6aaebc1c71fbad448e17df500dcfd5fe030d1dadfe33de6194c33"
+    },
+    {
+      "name": "approved-window-refresh-receipt.json",
+      "bytes": 1474,
+      "sha256": "0ab7eec9ba4fdc6a3e81511ed1d09946de969224767539c80c36758de229f90c"
+    },
+    {
+      "name": "approved-window-current-status.md",
+      "bytes": 3270,
+      "sha256": "d7784608c0f94cf2bddb8c4f29a34bf2391159588cdbec6757fa19647ef75a49"
     }
   ]
 }
