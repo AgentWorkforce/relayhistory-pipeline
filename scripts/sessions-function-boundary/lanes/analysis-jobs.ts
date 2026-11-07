@@ -7,6 +7,7 @@
  *   session_analysis_v2_forget  erasure trigger; SECURITY DEFINER; owner-only
  *   session_analysis_admit_scope      admit role + tenant pin; not SECURITY DEFINER; owner-only
  *   session_analysis_source_revision  live pointer-set revision; EXECUTE to service_role (worker)
+ *   session_analysis_neon_free        never-in-Neon proof; EXECUTE to service_role (worker)
  */
 import type { LaneManifest } from "../types.ts";
 
@@ -23,6 +24,7 @@ export const analysisJobs: LaneManifest = {
     "sessions.session_analysis_v2_forget(",
     "sessions.session_analysis_admit_scope(",
     "sessions.session_analysis_source_revision(",
+    "sessions.session_analysis_neon_free(",
   ],
   grantSources: [{ path: MIGRATION, roles: ["bulls96_read_api", "bulls96_analysis_admit", "service_role"] }],
   functions: {
@@ -32,6 +34,7 @@ export const analysisJobs: LaneManifest = {
     "sessions.session_analysis_v2_forget()": { secdef: true, grants: [] },
     "sessions.session_analysis_admit_scope(text,text)": { secdef: false, grants: [] },
     "sessions.session_analysis_source_revision(text,text,text)": { secdef: false, grants: ["service_role"] },
+    "sessions.session_analysis_neon_free(text,text,text)": { secdef: false, grants: ["service_role"] },
   },
   replaces: {},
 };

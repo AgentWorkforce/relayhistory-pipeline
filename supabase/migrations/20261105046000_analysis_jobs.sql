@@ -153,6 +153,35 @@ SET search_path = pg_catalog, sessions, pg_temp AS $revision$
      AND p.deleted_at IS NULL;
 $revision$;
 
+-- Proof that a session never had Neon evidence, from sessions-pipeline's own records, so
+-- its analysis is complete from S3 without the legacy export's coverage marker. True only
+-- when ALL hold (any doubt is false, and false keeps the marker requirement):
+--   1. the frozen Neon copy is sealed (20261105010000 ingest_frozen_source_completeness);
+--   2. the sealed copy holds no delivery record for the session id in the org (any
+--      workspace, physical or canonical id): it was never a Neon delivery session;
+--   3. it has a live pointer, and every pointer (live or tombstoned) was created after the
+--      seal: it was born after the freeze, so it is not a pre-freeze copy or continuation.
+-- The worker additionally requires that no manifest carries a Neon export/backfill marker
+-- (src/session-analysis/worker.ts), which catches a turns-only Neon session copied later.
+-- Index for (2) on large frozen copies: supabase/pending/20261105046000_frozen_records_session_index.sql.
+CREATE FUNCTION sessions.session_analysis_neon_free(p_org_id text, p_workspace_id text, p_session_id text)
+RETURNS boolean LANGUAGE sql STABLE
+SET search_path = pg_catalog, sessions, pg_temp AS $neon_free$
+  WITH seal AS (SELECT sealed_at FROM sessions.ingest_frozen_source_completeness WHERE singleton),
+  ptr AS (
+    SELECT p.session_id, p.created_at, p.deleted_at FROM sessions.session_index AS p
+     WHERE p.org_id = p_org_id AND p.workspace_id = p_workspace_id
+       AND (coalesce(p.canonical_session_id, p.session_id) = p_session_id OR p.session_id = p_session_id)
+  )
+  SELECT EXISTS (SELECT 1 FROM seal)
+     AND EXISTS (SELECT 1 FROM ptr WHERE ptr.deleted_at IS NULL)
+     AND NOT EXISTS (SELECT 1 FROM ptr, seal WHERE ptr.created_at <= seal.sealed_at)
+     AND NOT EXISTS (
+       SELECT 1 FROM sessions.ingest_frozen_source_records AS r
+        WHERE r.org_id = p_org_id
+          AND (r.session_id = p_session_id OR r.session_id IN (SELECT ptr.session_id FROM ptr)));
+$neon_free$;
+
 -- The admission principal's tenant pin (session_directory_read_api_scope's pattern):
 -- refuses 42501 unless the caller is bulls96_analysis_admit and the transaction's bound
 -- tenant (the verified assertion) is exactly (p_org_id, p_workspace_id).
@@ -398,6 +427,8 @@ $read$;
 REVOKE ALL ON FUNCTION sessions.session_analysis_v2_forget() FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_admit_scope(text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_source_revision(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_analysis_neon_free(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
+GRANT EXECUTE ON FUNCTION sessions.session_analysis_neon_free(text, text, text) TO service_role;
 GRANT EXECUTE ON FUNCTION sessions.session_analysis_source_revision(text, text, text) TO service_role;
 REVOKE ALL ON FUNCTION sessions.analysis_request_v1(text, text, text, text)
   FROM PUBLIC, anon, authenticated, service_role;
@@ -418,6 +449,7 @@ BEGIN
     'sessions.session_analysis_v2_forget()'::regprocedure,
     'sessions.session_analysis_admit_scope(text, text)'::regprocedure,
     'sessions.session_analysis_source_revision(text, text, text)'::regprocedure,
+    'sessions.session_analysis_neon_free(text, text, text)'::regprocedure,
     'sessions.analysis_request_v1(text, text, text, text)'::regprocedure,
     'sessions.analysis_request_json_v1(sessions.session_analysis_requests_v2)'::regprocedure,
     'sessions.analysis_read_v1(text, text)'::regprocedure
@@ -431,6 +463,7 @@ BEGIN
          AND NOT (r.rolname = 'bulls96_read_api' AND v_fn = 'sessions.analysis_read_v1(text, text)'::regprocedure)
          AND NOT (r.rolname = 'bulls96_analysis_admit' AND v_fn = 'sessions.analysis_request_v1(text, text, text, text)'::regprocedure)
          AND NOT (r.rolname = 'service_role' AND v_fn = 'sessions.session_analysis_source_revision(text, text, text)'::regprocedure)
+         AND NOT (r.rolname = 'service_role' AND v_fn = 'sessions.session_analysis_neon_free(text, text, text)'::regprocedure)
     LOOP
       EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I', v_fn, v_grantee);
     END LOOP;

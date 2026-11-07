@@ -388,3 +388,43 @@ describe("analysisTick is default-off", () => {
     ]);
   });
 });
+
+describe("never-in-Neon proof (session_analysis_neon_free + live-only manifests)", () => {
+  const free = async () =>
+    (await pg.query<{ f: boolean }>("SELECT sessions.session_analysis_neon_free($1, $2, $3) AS f", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.f;
+  const seal = (ago: string) =>
+    pg.query(
+      `INSERT INTO sessions.ingest_frozen_source_completeness
+         (source_identity_sha256, control_epoch, privacy_baseline_sha256, org_count, record_rows, manifest_sha256, neon_snapshot, sealed_at)
+       VALUES (repeat('a',64), repeat('b',64), repeat('c',64), 1, 0, repeat('d',64), '{}'::jsonb, now() - $1::interval)`,
+      [ago],
+    );
+
+  test("born after the sealed freeze and absent from the frozen copy: complete without the marker", async () => {
+    expect(await free()).toBe(false); // no seal yet: doubt
+    await seal("1 hour");
+    expect(await free()).toBe(true);
+  });
+
+  test("a Neon-era session is never proven Neon-free", async () => {
+    await seal("1 hour");
+    // In the frozen Neon copy (any workspace): Neon delivery session.
+    await pg.query(
+      "INSERT INTO sessions.ingest_frozen_source_records (org_id, workspace_id, origin_id, record_id, source, session_id) VALUES ($1, 'other-ws', 'o', 'r', 'claude', $2)",
+      [KEY.orgId, KEY.sessionId],
+    );
+    expect(await free()).toBe(false);
+    await pg.query("DELETE FROM sessions.ingest_frozen_source_records");
+    // Born before the freeze (a pre-freeze copy or continuation).
+    await pg.query("UPDATE sessions.session_index SET created_at = now() - interval '2 hours'");
+    expect(await free()).toBe(false);
+  });
+
+  test("a Neon export/backfill manifest makes the scope Neon-derived", async () => {
+    const { neonDerivedManifest } = await import("../worker.ts");
+    const base = { extensions: {}, raw: { epochs: [{ epoch: 1, reason: "live" }] } } as never;
+    expect(neonDerivedManifest(base)).toBe(false);
+    expect(neonDerivedManifest({ extensions: {}, raw: { epochs: [{ epoch: 2, reason: "backfill" }] } } as never)).toBe(true);
+    expect(neonDerivedManifest({ extensions: { "client.relayhistory_export": {} }, raw: { epochs: [] } } as never)).toBe(true);
+  });
+});
