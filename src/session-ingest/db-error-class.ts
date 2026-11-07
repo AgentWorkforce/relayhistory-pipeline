@@ -21,7 +21,11 @@
  * Classes (first match wins, codes before message patterns):
  *   terminated  57P01-57P03, 08003/08006; "connection terminated", "server closed the connection", ...
  *   reset       ECONNRESET/EPIPE/ECONNABORTED; "socket hang up", workerd "Network connection lost", ...
- *   timeout     ETIMEDOUT/ESOCKETTIMEDOUT, 57014; "timeout", "timed out"
+ *   timeout     ETIMEDOUT/ESOCKETTIMEDOUT; 57014 (statement timeout OR cancel); 25P03
+ *               (idle_in_transaction_session_timeout: the server ends the session); 57P05
+ *               (idle_session_timeout); "timeout", "timed out". The SQLSTATE is kept as
+ *               db_error_code, so a statement timeout, an idle-in-transaction kill and a
+ *               pooler/transport drop (terminated/reset, usually code-less) stay distinct.
  *   pool        53300/53400, ECONNREFUSED, 08001/08004; "too many clients", "remaining connection slots", ...
  *   tls         the reviewed TLS/certificate codes in SAFE_CODES; "certificate", "tls", "ssl", "handshake"
  *   unknown     anything else (including no usable code or message)
@@ -44,7 +48,7 @@ const SQLSTATE = /^[0-9A-Z]{5}$/;
 /** SQLSTATEs with a fixed class. A Map: no inherited keys (`constructor`, `__proto__`, ...). */
 const SQLSTATE_CLASS: ReadonlyMap<string, DbErrorClass> = new Map<string, DbErrorClass>([
   ["57P01", "terminated"], ["57P02", "terminated"], ["57P03", "terminated"], ["08003", "terminated"], ["08006", "terminated"],
-  ["57014", "timeout"],
+  ["57014", "timeout"], ["25P03", "timeout"], ["57P05", "timeout"],
   ["53300", "pool"], ["53400", "pool"], ["08001", "pool"], ["08004", "pool"],
 ]);
 

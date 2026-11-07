@@ -114,6 +114,19 @@ describe("dbErrorName / dbClientErrorFields: only closed values leave", () => {
     expect(dbClientErrorFields(partial)).toEqual({ error_code: "ECONNRESET", db_error_class: "reset", db_error_basis: "code", error_name: "Error" });
   });
 
+  test("statement timeout (57014) and idle-in-transaction kill (25P03) keep distinct safe codes, apart from code-less drops", () => {
+    expect(dbErrorDiagnosis(err({ code: "57014", message: "canceling statement due to statement timeout" }))).toEqual({ db_error_class: "timeout", db_error_code: "57014", db_error_basis: "code" });
+    expect(dbErrorDiagnosis(err({ code: "25P03", message: "terminating connection due to idle-in-transaction timeout" }))).toEqual({ db_error_class: "timeout", db_error_code: "25P03", db_error_basis: "code" });
+    expect(dbErrorDiagnosis(err({ code: "57P05", message: "terminating connection due to idle-session timeout" }))).toEqual({ db_error_class: "timeout", db_error_code: "57P05", db_error_basis: "code" });
+    // The NEXT query on a killed session: pg's code-less client error, not a timeout code.
+    expect(dbErrorDiagnosis(err({ message: "Connection terminated unexpectedly" }))).toEqual({ db_error_class: "terminated", db_error_code: "db_error", db_error_basis: "message" });
+    for (const code of ["57014", "25P03"]) {
+      const f = dbClientErrorFields(err({ code }));
+      expect(f).toMatchObject({ error_code: code, db_error_class: "timeout", db_error_basis: "code" });
+      expect(JSON.parse(logLine("error", "session ingest db error", f))).toMatchObject({ error_code: code });
+    }
+  });
+
   test("the class travels with its safe code and basis (a heuristic, not a cause)", () => {
     expect(dbErrorDiagnosis(err({ code: "57014" }))).toEqual({ db_error_class: "timeout", db_error_code: "57014", db_error_basis: "code" });
     expect(dbErrorDiagnosis(err({ code: "ECONNREFUSED" }))).toEqual({ db_error_class: "pool", db_error_code: "ECONNREFUSED", db_error_basis: "code" });
@@ -198,6 +211,15 @@ describe("the /v1/delivery/batches 503 path logs the same closed class with the 
     const route = logged.find((f) => f.route === "delivery.batches")!;
     return { status: res.status, retryAfter: res.headers.get("retry-after"), json, calls, route, line: logLine("info", "session ingest", route) };
   }
+
+  test("route boundary: 57014 and 25P03 reach the 503 line with distinct ledger and safe codes; response unchanged", async () => {
+    const base = await post(() => new Error("plain"), "corr-x");
+    const st = await post(() => err({ code: "57014", message: "canceling statement due to statement timeout" }), "corr-x");
+    const idle = await post(() => err({ code: "25P03", message: "terminating connection due to idle-in-transaction timeout" }), "corr-x");
+    for (const r of [st, idle]) expect([r.status, r.retryAfter, r.json, r.calls]).toEqual([base.status, base.retryAfter, base.json, base.calls]);
+    expect(st.route).toMatchObject({ error_code: "ledger_timeout", db_error_class: "timeout", db_error_code: "57014", db_error_basis: "code" });
+    expect(idle.route).toMatchObject({ error_code: "ledger_sqlstate_25P03", db_error_class: "timeout", db_error_code: "25P03", db_error_basis: "code" });
+  });
 
   test("route boundary: opaque codes, inherited keys and throwing getters change only closed log fields; status, body and retry are unchanged", async () => {
     const base = await post(() => new Error("plain"), "corr-x");
