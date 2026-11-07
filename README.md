@@ -129,6 +129,7 @@ bare-origin matches, and the RelayAuth URL is never used as an audience.
 | `RELAYHISTORY_ORIGIN` | ingest | unset (legacy shared audience accepted) | exact bare origin + transport rule | the origin couriers mint for, e.g. `http://<release>-alleyoop-ingest.<ns>.svc:8080` (flag) |
 | `RELAYAUTH_JWKS_URL`, `RELAYAUTH_ISSUER` | read API (Lambda) | `https://relayauth.dev/.well-known/jwks.json`, `https://relayauth.dev` (vendored defaults) | JWKS: transport rule when set | your RelayAuth JWKS and issuer |
 | `READ_API_ORIGIN` | read API | unset (every request 401) | exact audience | the read API's own origin |
+| `RELAYHISTORY_SELFHOST_READ_API` | read API | unset (off: `POST /v1/cli/login` and `GET /v1/sessions/:id/catalog` are not registered) | `true`/`false`/empty only, else startup fails | `true` on a self-host whose relaycontrol proxies History reads; login also needs `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true` (docs/session-read-api-design.md §2a) |
 | `OPENAI_BASE_URL` | session-brief | `https://api.openai.com/v1` (calls `<base>/responses`) | transport rule (the request carries `OPENAI_API_KEY`) | an OpenAI-compatible gateway, e.g. `http://llm-gateway.ai.svc:4000/v1` (flag) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | unset: no export | not validated (no credential) | your collector, e.g. `http://otel-collector.observability.svc:4318` |
 | `LOCKER_ENDPOINT` | all | S3 for `LOCKER_REGION` | GCS mode: own stricter check (`src/shared/locker-selection.ts`) | MinIO Service or object store |

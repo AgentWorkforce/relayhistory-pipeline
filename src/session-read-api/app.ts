@@ -42,11 +42,17 @@
  *   facts, session_outcomes, the digest narrative cache), and this backend never
  *   answers approximately.
  *
+ * Self-host routes (RELAYHISTORY_SELFHOST_READ_API=true only; selfhost.ts; unregistered when off):
+ *   POST /v1/cli/login              relaycontrol `sh_at_` token in the body, introspected; answers
+ *                                   that same token as the access token (pass-through, no minting)
+ *   GET /v1/sessions/:id/catalog    catalog, children and commit links from canonical S3
+ *
  * Auth: a RelayAuth assertion JWT minted for THIS service's origin with scope
  * `rth:read` (verifyAgentRelayToken: RS256, JWKS, issuer, exact audience).
  * Org and workspace come only from the verified claims.
  */
 import { Hono, type Context } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
 import { CursorError, decodeCursor } from "./cursor.ts";
@@ -67,6 +73,16 @@ import {
   type DirectoryListArgs,
 } from "./directory.ts";
 import { BRIEF_TITLES_MAX_KEYS, BriefTitlesError, briefTitleEntries, type BriefTitleKey, type BriefTitles } from "./brief-titles.ts";
+import {
+  CatalogInputError,
+  EMPTY_CATALOG,
+  LOGIN_MAX_BODY_BYTES,
+  LOGIN_MAX_TTL_MS,
+  LoginBodyError,
+  catalogFromCanonical,
+  parseLoginBody,
+  type SelfhostDeps,
+} from "./selfhost.ts";
 
 export interface VerifiedIdentity {
   userId: string;
@@ -113,6 +129,11 @@ export interface ReadApiDeps {
   turns?: TurnsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
   babysitter?: EvidenceDeps;
+  /**
+   * RELAYHISTORY_SELFHOST_READ_API=true only (selfhost.ts): registers POST /v1/cli/login and
+   * GET /v1/sessions/:id/catalog. Absent = neither route exists and nothing else changes.
+   */
+  selfhost?: SelfhostDeps;
 }
 
 export interface TurnsDeps {
@@ -274,6 +295,62 @@ export function createReadApi(deps: ReadApiDeps) {
 
   app.get("/health", (c) => c.json({ ok: true }));
 
+  /**
+   * POST /v1/cli/login (self-host only). Registered BEFORE the /v1/* bearer middleware: the
+   * token arrives in the body, and this handler answers without calling next(), so that
+   * middleware never runs for it. Body `{ agentRelayToken, label? }`; the token must be a
+   * relaycontrol `sh_at_` token and is introspected exactly as a relaycontrol read bearer is
+   * (auth.ts relaycontrolLogin). Pass-through: the access token IS the presented token, so
+   * nothing is minted, signed or stored, and every later read authenticates it through the
+   * same introspection. accessTokenExpiresAt = min(token exp, now + 15 min) is advisory: the
+   * server keeps accepting the token until relaycontrol's own exp or revocation. There is no
+   * refresh route: refreshToken repeats the access token with the same expiry, and a client
+   * logs in again. The label is validated and otherwise unused. Token values are never logged.
+   */
+  const selfhost = deps.selfhost;
+  if (selfhost) {
+    const now = selfhost.now ?? (() => Date.now());
+    const loginError = (c: Context, status: 400 | 401 | 403 | 413 | 503, code: string, message: string) => {
+      if (status === 503) c.header("Retry-After", "1");
+      log({ route: "/v1/cli/login", reason: "cli_login_refused", code, status, correlation_id: c.get("correlationId") });
+      return c.json({ error: { code, message }, correlationId: c.get("correlationId") }, status);
+    };
+    app.post(
+      "/v1/cli/login",
+      bodyLimit({ maxSize: LOGIN_MAX_BODY_BYTES, onError: (c) => loginError(c, 413, "body_too_large", "body is too large") }),
+      async (c) => {
+        let token: string;
+        try {
+          token = parseLoginBody(await c.req.text()).agentRelayToken;
+        } catch (error) {
+          if (error instanceof LoginBodyError) return loginError(c, 400, error.code, error.message);
+          return loginError(c, 400, "invalid_body", "body must be a JSON object");
+        }
+        let grant;
+        try {
+          grant = await selfhost.login(token);
+        } catch (error) {
+          const e = error instanceof AuthError ? error : new AuthError(503, "relaycontrol_unavailable", "token introspection is unavailable");
+          return loginError(c, e.status, e.code, e.message);
+        }
+        const at = now();
+        const expiresAtMs = Math.min(grant.expiresAtMs, at + LOGIN_MAX_TTL_MS);
+        if (!(expiresAtMs > at)) return loginError(c, 401, "token_expired", "token has expired");
+        const expiresAt = new Date(expiresAtMs).toISOString();
+        log({ route: "/v1/cli/login", reason: "cli_login", status: 200, workspace_id: grant.identity.workspaceId, correlation_id: c.get("correlationId") });
+        c.header("X-Relayhistory-Workspace-Id", grant.identity.workspaceId);
+        return c.json({
+          accessToken: token,
+          accessTokenExpiresAt: expiresAt,
+          refreshToken: token,
+          refreshTokenExpiresAt: expiresAt,
+          tokenType: "Bearer",
+          scopes: grant.identity.scopes,
+        });
+      },
+    );
+  }
+
   app.use("/v1/*", async (c, next) => {
     const header = c.req.header("authorization") ?? "";
     const m = /^Bearer\s+(\S+)$/i.exec(header);
@@ -431,7 +508,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "catalog"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -755,6 +832,66 @@ export function createReadApi(deps: ReadApiDeps) {
       return fail(c, error);
     }
   });
+
+  /**
+   * GET /v1/sessions/:id/catalog (self-host only): `workspace=` and `source=` (exactly once)
+   * as the timing route, same canary allowlist, same canonical S3 read (selfhost.ts
+   * catalogFromCanonical). `catalog` is the session's latest delivered catalog record,
+   * `children` its relationship edges, `commitLinks` its delivered commit links; `parents` is
+   * always empty (a parent edge lives with the parent session's objects). A session with no
+   * pointer is 501 `catalog_no_pointers` as timing/turns; erased is the empty catalog.
+   */
+  if (selfhost) {
+    app.get("/v1/sessions/:sessionId/catalog", async (c) => {
+      try {
+        const identity = c.get("identity");
+        attestWorkspace(c, identity);
+        requireCanary(identity, "catalog");
+        const sources = c.req.queries("source") ?? [];
+        const source = sources[0]?.trim();
+        if (sources.length !== 1 || !source) throw bad("source must be supplied exactly once and be non-empty");
+        if (source.length > MAX_ID_CHARS) throw bad("source is not valid");
+        const catalog = selfhost.catalog;
+        if (!catalog) throw unsupported("catalog_not_configured");
+        const sessionId = c.req.param("sessionId");
+        if (!sessionId || sessionId.length > MAX_ID_CHARS) throw unsupported("catalog_session_id");
+        const scope: CanonicalIdentity = { orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId };
+        const state = await catalog.state(scope);
+        if (state.pointers === 0) throw unsupported("catalog_no_pointers");
+        let payload = EMPTY_CATALOG;
+        if (state.live > 0) {
+          const controller = new AbortController();
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const snapshot = await Promise.race([
+              catalog.source(scope, controller.signal),
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(() => {
+                  reject(new CanonicalReadError("deadline"));
+                  controller.abort();
+                }, catalog.deadlineMs ?? 3000);
+              }),
+            ]);
+            payload = catalogFromCanonical(scope, snapshot);
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+        log({
+          route: c.req.routePath,
+          reason: state.live === 0 ? "catalog_erased" : "catalog_served",
+          children: payload.children.length,
+          commit_links: payload.commitLinks.length,
+          correlation_id: c.get("correlationId"),
+        });
+        return c.json({ workspaceId: identity.workspaceId, ...payload });
+      } catch (error) {
+        if (error instanceof CanonicalReadError) return fail(c, unsupported(`catalog_canonical_${error.reason}`));
+        if (error instanceof CatalogInputError) return fail(c, unsupported(`catalog_${error.reason}`));
+        return fail(c, error);
+      }
+    });
+  }
 
   app.notFound((c) => c.json({ error: { code: "unsupported_by_backend", message: "route not served by this backend", reason: "route" }, correlationId: c.get("correlationId") }, 501));
 
