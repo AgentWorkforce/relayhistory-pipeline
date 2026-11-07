@@ -332,7 +332,10 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     const byLocale = (await t.owner.query<{ s: string }>("SELECT string_agg(k, ',' ORDER BY k) AS s FROM (VALUES ('<owner>:EXECUTE'), ('bulls96_read_api:EXECUTE')) v(k)")).rows[0]!.s;
     const byC = (await t.owner.query<{ s: string }>(`SELECT string_agg(k, ',' ORDER BY k COLLATE "C") AS s FROM (VALUES ('<owner>:EXECUTE'), ('bulls96_read_api:EXECUTE')) v(k)`)).rows[0]!.s;
     expect(byC).toBe("<owner>:EXECUTE,bulls96_read_api:EXECUTE");
-    if (coll !== "C" && coll !== "POSIX") expect(byLocale).not.toBe(byC); // the hazard is real here
+    // Observation only, scoped to THIS locale: some non-C locales (e.g. C.UTF-8) order the two
+    // keys the same as "C". Record which; the verifiers' COLLATE "C" result is what is asserted.
+    console.log(JSON.stringify({ portable_acl_sort_observation: { datcollate: coll, default_order: byLocale, c_order: byC,
+      locale_reorders: byLocale !== byC } }));
     // Reorder the identical grant set physically; both verifiers must still pass.
     await t.owner.query(`REVOKE EXECUTE ON FUNCTION sessions.portable_reader_readiness(text[], text) FROM CURRENT_USER;
       GRANT EXECUTE ON FUNCTION sessions.portable_reader_readiness(text[], text) TO CURRENT_USER`);
