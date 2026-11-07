@@ -75,10 +75,16 @@ export interface VerifiedIdentity {
   scopes: string[];
 }
 
-export type Verifier = (bearer: string) => Promise<VerifiedIdentity>;
+/** What the request claims, for verifiers that bind it (relaycontrol introspection). Never identity. */
+export interface VerifyRequest {
+  /** The single `workspace=` query value, when given exactly once. */
+  workspace?: string;
+}
+
+export type Verifier = (bearer: string, request?: VerifyRequest) => Promise<VerifiedIdentity>;
 
 export class AuthError extends Error {
-  constructor(readonly status: 401 | 403, readonly code: string, message: string) {
+  constructor(readonly status: 401 | 403 | 503, readonly code: string, message: string) {
     super(message);
     this.name = "AuthError";
   }
@@ -274,9 +280,11 @@ export function createReadApi(deps: ReadApiDeps) {
     if (!m) return c.json({ error: { code: "missing_authorization", message: "Bearer token required" }, correlationId: c.get("correlationId") }, 401);
     let identity: VerifiedIdentity;
     try {
-      identity = await deps.verify(m[1]!);
+      const workspaces = c.req.queries("workspace");
+      identity = await deps.verify(m[1]!, workspaces?.length === 1 && workspaces[0] ? { workspace: workspaces[0] } : {});
     } catch (error) {
       const e = error instanceof AuthError ? error : new AuthError(401, "invalid_token", "token is not valid");
+      if (e.status === 503) c.header("Retry-After", "1");
       return c.json({ error: { code: e.code, message: e.message }, correlationId: c.get("correlationId") }, e.status);
     }
     if (!identity.orgId || !identity.workspaceId)

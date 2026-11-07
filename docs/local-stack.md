@@ -72,6 +72,67 @@ assertion key from a central broker or secret manager. The command is never run
 through a shell, and neither that key nor minted assertions are saved in the
 courier ledger. `96bulls token local` remains available for manual calls.
 
+### Relaycontrol user access tokens (dual-accept, default off)
+
+Relaycontrol (owned by layered-control) issues opaque user access tokens with
+the prefix `sh_at_`. The ingest and the read API can also accept them, verified
+by relaycontrol's introspection endpoint (contract v1.2, pinned to
+relay-control PR #20: `POST <RELAYCONTROL_INTROSPECT_URL>/internal/v1/auth/introspect`
+with body `{token, aud, workspace?, machine?}`). Off by default; RelayAuth JWTs
+keep their path unchanged either way.
+
+| Env | Where | Meaning |
+| --- | --- | --- |
+| `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS` | ingest, read API (Lambda and Worker) | Exactly `true` enables; anything else is off. Off, a `sh_at_` bearer is refused exactly as before. |
+| `RELAYCONTROL_INTROSPECT_URL` | same | Relaycontrol's base URL, configuration only. Same transport rule as every destination: https, loopback, or `http` to an in-cluster Service name with `ALLOW_IN_CLUSTER_HTTP=true` (the Worker: https or loopback only). |
+| `RELAYCONTROL_INTROSPECT_SECRET` | same | The dedicated service secret, sent as `Authorization: Bearer`. From the secret store only, never a file. |
+
+- **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
+  the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
+  RelayAuth and never to relaycontrol.
+- **Binding.** `aud` is `RELAYHISTORY_ORIGIN` at the ingest and
+  `READ_API_ORIGIN` at the read API, and relaycontrol must echo exactly that
+  origin. A workspace the request names (the ingest's
+  `x-relayhistory-workspace-id` header, the read API's single `workspace=`
+  query) is sent along and relaycontrol must return exactly that workspace;
+  with none, `workspace` is omitted. Either way the org and workspace come only
+  from relaycontrol's answer. A malformed workspace is refused without a call.
+- **Scopes.** Only `rth:read` and `rth:sync` are granted; `cli:auth` and
+  anything else grant nothing.
+- **Fail closed.** Inactive (any reason, including the machine reasons
+  below), aud, workspace or machine mismatch, expired, or relaycontrol
+  answering 401/400 (our secret or request refused): 401 `unauthorized`, with
+  the reason in logs only. Timeout (5 s), network error, 404 (introspection
+  disabled on relaycontrol), 5xx, a redirect, or malformed JSON: 503
+  `relaycontrol_unavailable` with
+  `Retry-After: 1`. The flag on with the URL, secret or origin missing: 401
+  `auth_not_configured` (read API: `not_configured`). With the flag on and both
+  values set, the ingest starts without any RelayAuth key source.
+- **Cache and revocation lag.** Answers are cached in memory per
+  sha256(token), aud, workspace sent and machine claimed: an admit for min(token exp, 60 s), a refusal
+  for at most 5 s, at most 1000 entries, single-flight per key. A revoked token
+  can therefore keep working for up to 60 s per process. Unavailability is never
+  cached, an expired entry is never reused, and a result is never reused for a
+  different claimed machine.
+- **Machine verification (AlleyOop courier surface only).** At the ingest the
+  request's `X-Machine-Id` (which the courier sends on chunk and manifest
+  writes) is forwarded verbatim as `machine`, a claim for relaycontrol to
+  verify against the token's user and workspace. It must match
+  `^[A-Za-z0-9._:-]{1,200}$` or it is refused (401) without a call. The machine
+  claim the unchanged live-write machine gate reads is set only from
+  relaycontrol's `machine_id`, and only when it equals the claimed id. No
+  `X-Machine-Id`, or `machine_id: null`, means no machine claim: every write
+  is refused (403 `machine_claim_refused`) and reads pass. An unverified claim
+  (`machine_not_owned`, `machine_unclaimed`, `machine_workspace_mismatch`) is
+  401. A verified machine still has to match the chunk's `machine` query, the
+  event's `machineId` and the manifest's `session.machine_id`, and writes need
+  `rth:sync`. Desktop uploads are authenticated by the edge that signs
+  `x-relay-ingest-identity` and are out of scope here.
+- **Logs and egress.** Logs carry relaycontrol's `token_id`, never the token or
+  the secret, and go to the console only. The only new call is to the
+  configured introspection URL (in-cluster for a self-host); nothing new leaves
+  the cluster.
+
 ## Ports and credentials
 
 Host ports are bound to `127.0.0.1` only; the ingest API is the boundary, and
