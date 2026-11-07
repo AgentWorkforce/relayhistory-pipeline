@@ -226,3 +226,23 @@ test("final review P2: only the PINNED production source seals; a staging/wrong-
   // Once sealed, the pin cannot move.
   await expect(db.query("SELECT sessions.session_neon_census_pin_source($1::jsonb)", [JSON.stringify(census.snapshot.source_identity)])).rejects.toThrow("pinned before any seal");
 });
+
+test("final re-review P1: the CLI's --pin branch (injected Neon + Supabase clients) writes the pin for a matching identity and exits 2 on a mismatch", async () => {
+  const { runCensusCli } = await import("../../../scripts/neon-census-load.ts");
+  const neon = await fakeNeon();
+  const db = await supabase();
+  const asClient = (pg: PGlite) => ({ ...q(pg), connect: async () => {}, end: async () => {} });
+  const lines: string[] = [];
+  const deps = { client: (url: string) => asClient(url.includes("neon") ? neon : db), out: (l: string) => lines.push(l), err: (l: string) => lines.push(l) };
+  // The identity the dry run prints (the endpoint is the neonUrl host).
+  const live = (await readNeonCensus(q(neon), { endpoint: "ep-prod.neon.example" })).snapshot.source_identity;
+  const stdin = (expected: unknown) => JSON.stringify({ neonUrl: "postgresql://ro@ep-prod.neon.example/db", supabaseUrl: "postgresql://owner@supabase.example/postgres", expectedSourceIdentity: expected });
+  expect(await runCensusCli(["--pin"], stdin({ ...live, system_identifier: "0" }), deps)).toBe(2);
+  expect((await db.query("SELECT 1 FROM sessions.session_neon_census_source")).rows).toHaveLength(0);
+  expect(await runCensusCli(["--pin"], stdin(live), deps)).toBe(0);
+  expect((await db.query<{ i: unknown }>("SELECT source_identity i FROM sessions.session_neon_census_source")).rows).toEqual([{ i: live }]);
+  // Then --execute seals through the same CLI.
+  expect(await runCensusCli(["--execute"], stdin(undefined), deps)).toBe(0);
+  expect((await db.query("SELECT 1 FROM sessions.session_neon_census_seal")).rows).toHaveLength(1);
+  expect(lines.join("\n")).not.toContain("owner@");
+});

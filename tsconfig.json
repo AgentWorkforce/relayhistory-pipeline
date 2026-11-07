@@ -32,6 +32,7 @@
     "smoke",
     "src/types/*.d.ts",
     "scripts/proof-buffer-gc.ts",
+    "scripts/neon-census-load.ts",
     "scripts/sync-ingest-buffer-gc-boundary.ts",
     "scripts/session-ingest-seed.ts",
     "scripts/proof-ingest-s3-seed.ts",
