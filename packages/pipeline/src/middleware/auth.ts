@@ -48,14 +48,24 @@ export function requireScope(scope: string) {
  * the context: with `RELAYHISTORY_ORIGIN` set, only RelayAuth's assertions
  * minted for that origin (and, behind their own flag, migration assertions);
  * `ALLOW_INTERIM_RELAYAUTH_BEARER=true` (local dev only) admits any RelayAuth
- * JWT.
+ * JWT. With `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true` (default off) an
+ * opaque `sh_at_` relaycontrol user access token is instead introspected
+ * (`auth/relaycontrol.ts`, fail-closed); every other bearer still takes the
+ * RelayAuth path unchanged.
  */
 import {
+  configuredHistoryOrigin,
   IdentityError,
   verifyAgentRelayToken,
   verifyMigrationAssertion,
   verifyOriginBoundAssertion,
 } from "../auth/relayauth.js";
+import {
+  isRelaycontrolToken,
+  RelaycontrolRejectedError,
+  RelaycontrolUnavailableError,
+  sharedRelaycontrolIntrospector,
+} from "../auth/relaycontrol.js";
 import {
   migrationKindAllowsRoute,
   migrationPairAuthorized,
@@ -78,6 +88,15 @@ export const requireAuth = createMiddleware<AppEnv>(async (c, next) => {
       "unsupported_token",
       "opaque relayhistory tokens are not supported by this deployment",
     );
+  // 96BullSessions: relaycontrol user access tokens (`sh_at_`), behind their
+  // own default-off flag. Off, such a bearer takes the path below unchanged
+  // and is refused there as today. On, it is introspected (and never reaches
+  // the RelayAuth verifiers); every other bearer takes the path below.
+  if (
+    c.env?.RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS === "true" &&
+    isRelaycontrolToken(token)
+  )
+    return relaycontrolAuth(c, token, next);
   // As upstream: the broad interim bearer (dev only) verifies any RelayAuth
   // JWT; the dedicated, default-off RELAYHISTORY_ACCEPT_MIGRATION_ASSERTIONS
   // path admits only migration assertions, and a migration assertion needs
@@ -134,3 +153,84 @@ export const requireAuth = createMiddleware<AppEnv>(async (c, next) => {
   c.set("auth", auth);
   await next();
 });
+
+/**
+ * The optional request header naming the workspace a relaycontrol token is
+ * presented for. The courier sends no other request-level workspace signal
+ * (the workspace lives inside manifest bodies and object keys), so a caller
+ * that knows it names it here and relaycontrol must return exactly this
+ * workspace. Absent, relaycontrol's answer alone decides; either way the
+ * token's identity (org, workspace, scopes) comes only from that answer.
+ */
+export const RELAYCONTROL_WORKSPACE_HEADER = "x-relayhistory-workspace-id";
+
+/**
+ * The caller-claimed machine id (AlleyOop courier surface: chunks, events,
+ * manifests). Forwarded to relaycontrol as `machine` for verification; only
+ * relaycontrol's verified `machine_id` ever becomes the machine claim.
+ */
+export const RELAYCONTROL_MACHINE_HEADER = "x-machine-id";
+
+/**
+ * The relaycontrol branch of requireAuth: introspect against
+ * RELAYCONTROL_INTROSPECT_URL with `aud` = this History's RELAYHISTORY_ORIGIN.
+ * Unconfigured: 401 auth_not_configured. Relaycontrol unreachable, disabled
+ * (its 404), refusing our request (its 400) or our introspection secret (its
+ * 401), redirecting, oversized or malformed: 503 relaycontrol_unavailable
+ * (retryable). Refused (including a
+ * non-desktop-user principal and an unverified or malformed X-Machine-Id
+ * claim): 401 unauthorized, the reason in a server log line only.
+ */
+async function relaycontrolAuth(
+  c: AppContext,
+  token: string,
+  next: () => Promise<void>,
+) {
+  const deny = (status: 401 | 503, code: string, message: string) =>
+    c.json(
+      { error: { code, message }, correlationId: c.get("correlationId") ?? "" },
+      status,
+    );
+  const url = c.env?.RELAYCONTROL_INTROSPECT_URL?.trim();
+  const secret = c.env?.RELAYCONTROL_INTROSPECT_SECRET?.trim();
+  let aud: string | undefined;
+  try {
+    aud = configuredHistoryOrigin(c.env ?? {});
+  } catch {
+    aud = undefined;
+  }
+  const notConfigured = () =>
+    deny(
+      401,
+      "auth_not_configured",
+      "relaycontrol tokens are not configured (set RELAYCONTROL_INTROSPECT_URL, RELAYCONTROL_INTROSPECT_SECRET and RELAYHISTORY_ORIGIN)",
+    );
+  if (!url || !secret || !aud) return notConfigured();
+  let introspector;
+  try {
+    introspector = await sharedRelaycontrolIntrospector({ url, secret });
+  } catch {
+    return notConfigured();
+  }
+  let auth: AuthContext;
+  try {
+    const workspace = c.req.header(RELAYCONTROL_WORKSPACE_HEADER)?.trim();
+    // Verbatim: a claim relaycontrol verifies, never trimmed into a match.
+    const machine = c.req.header(RELAYCONTROL_MACHINE_HEADER);
+    auth = await introspector.verifyRelaycontrolToken(token, {
+      aud,
+      ...(workspace ? { workspace } : {}),
+      ...(machine ? { machine } : {}),
+    });
+  } catch (err) {
+    if (err instanceof RelaycontrolUnavailableError) {
+      c.header("Retry-After", "1");
+      return deny(503, err.code, err.message);
+    }
+    if (err instanceof RelaycontrolRejectedError)
+      return deny(401, err.code, err.message);
+    throw err;
+  }
+  c.set("auth", auth);
+  await next();
+}

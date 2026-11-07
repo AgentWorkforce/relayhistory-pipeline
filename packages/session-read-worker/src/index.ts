@@ -20,7 +20,10 @@
  * and timing canary allowlist; unset = none), READ_API_BRIEF_TITLES_WORKSPACES (the
  * brief-titles allowlist; unset = none), READ_API_TIMING_ASSUME_NO_TURNS, and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
- * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve).
+ * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve), and
+ * RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS with RELAYCONTROL_INTROSPECT_URL /
+ * RELAYCONTROL_INTROSPECT_SECRET (relaycontrol `sh_at_` tokens; default off,
+ * unset in wrangler.jsonc).
  */
 import pg from "pg";
 import { decompress } from "fzstd";
@@ -38,7 +41,8 @@ import { createClickHouseClient, type ClickHouseClient, type RequestOptions } fr
 import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-read-api/app.ts";
 import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
 import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
-import { relayAuthVerifier } from "../../../src/session-read-api/auth.ts";
+import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
+import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { sqlLiveness, TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
 
@@ -62,6 +66,21 @@ export interface Env extends CanonicalEnv {
   READ_API_BABYSITTER_KEY_ROOT?: string;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
+  /** Exactly "true" also accepts relaycontrol `sh_at_` tokens; default off. */
+  RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS?: string;
+  RELAYCONTROL_INTROSPECT_URL?: string;
+  RELAYCONTROL_INTROSPECT_SECRET?: string;
+}
+
+/** The read verifier's config from Worker env; the introspection URL passes the https/loopback rule. */
+export function workerAuthConfig(env: Env): AuthConfig {
+  const config: AuthConfig = { origin: env.READ_API_ORIGIN?.trim() || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL?.trim() || undefined, issuer: env.RELAYAUTH_ISSUER?.trim() || undefined };
+  if (env.RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS === "true") {
+    const url = env.RELAYCONTROL_INTROSPECT_URL?.trim() || undefined;
+    if (url) assertDestinationUrl("RELAYCONTROL_INTROSPECT_URL", url, destinationPolicy({}));
+    config.relaycontrol = { url, secret: env.RELAYCONTROL_INTROSPECT_SECRET?.trim() || undefined };
+  }
+  return config;
 }
 
 const SERVICE = "96bulls-session-read-worker";
@@ -195,8 +214,10 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   if (request.method !== "GET") return json(405, "method_not_allowed", "GET only", { allow: "GET" });
   let ch: ClickHouseClient;
   let completeSinceMs: number;
+  let authConfig: AuthConfig;
   try {
     completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
+    authConfig = workerAuthConfig(env);
     ch = boundedClickHouse(createClickHouseClient(clickHouseConfig(env), overrides.fetcher));
     if (!overrides.connect && !env.SUPABASE?.connectionString) throw new ConfigError("SUPABASE");
   } catch (error) {
@@ -209,7 +230,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     timing: timingDeps(env, tenant.run, overrides.fetcher),
     turns: turnsDeps(env, tenant.run, overrides.fetcher),
     babysitter: babysitterEvidenceDeps(env, tenant.run, overrides.fetcher),
-    verify: relayAuthVerifier({ origin: env.READ_API_ORIGIN?.trim() || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL?.trim() || undefined, issuer: env.RELAYAUTH_ISSUER?.trim() || undefined }),
+    verify: readApiVerifier(authConfig),
     ch,
     liveness: sqlLiveness(tenant.run),
     directory: sqlDirectory(tenant.run),
