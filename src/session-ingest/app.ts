@@ -37,6 +37,8 @@ import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { LedgerUnavailableError } from "./ledger.ts";
+import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
@@ -211,6 +213,20 @@ export async function boundedJson(request: Request, read: BodyRead): Promise<unk
 
 function errorBody(c: Context<Env>, code: string, message: string, extra: Record<string, unknown> = {}) {
   return { error: { code, message, ...extra }, correlationId: c.get("correlationId") ?? "" };
+}
+
+/** The 503 diagnosis on the route's log line: stage, cause code and, for a database cause,
+ * the closed diagnosis (heuristic class, safe code, basis; never a message). A raw ledger
+ * error that reached the route outside a delivery stage is reported the same way.
+ * Diagnostic only. */
+function unavailableFields(error: unknown): Record<string, unknown> {
+  if (error instanceof IngestUnavailable) return { stage: error.stage, error_code: error.cause_code, ...dbFields(error.db) };
+  if (error instanceof LedgerUnavailableError) return { error_code: error.code, ...dbFields(error.db) };
+  return {};
+}
+
+function dbFields(db: DbErrorDiagnosis | undefined): Record<string, unknown> {
+  return db ? { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis } : {};
 }
 
 function failure(c: Context<Env>, error: unknown) {
@@ -411,7 +427,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       emit({
         ...fields,
         outcome: code,
-        ...(error instanceof IngestUnavailable ? { stage: error.stage, error_code: error.cause_code } : {}),
+        ...unavailableFields(error),
         ...(error instanceof DeliveryError && error.conflictCount ? { count: error.conflictCount } : {}),
         duration_ms: Date.now() - started,
         bytes_raw: read.bytes,
@@ -446,7 +462,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json({ ...result.receipt, limits: { ...result.receipt.limits, contentEncodings: contentEncodings() } });
     } catch (error) {
       const code = error instanceof DeliveryError ? error.code : "delivery_unavailable";
-      emit({ ...fields, outcome: code, ...(error instanceof IngestUnavailable ? { stage: error.stage, error_code: error.cause_code } : {}), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
+      emit({ ...fields, outcome: code, ...unavailableFields(error), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
       return failure(c, error);
     }
   });
