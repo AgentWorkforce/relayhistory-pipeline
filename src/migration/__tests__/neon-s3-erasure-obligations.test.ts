@@ -10,7 +10,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
-import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "../neon-s3-erasure/job.ts";
+import { DEFAULT_ERASURE_CONFIG, ErasureJob, eraseScope } from "../neon-s3-erasure/job.ts";
 import type { ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { obligatedStore } from "../neon-s3-sync/obligated-store.ts";
@@ -39,11 +39,10 @@ async function world(n = 30) {
   const ids: string[] = [];
   for (let i = 0; i < n; i++) ids.push(s.put(key(i), OLD));
   const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-")), "s.sqlite"));
-  // TEST-ONLY attestation (a never-used test scope); production has no attestation path.
-  st.setMeta("obligations_genesis", JSON.stringify({ at: Date.now(), attestedAt: Date.now(), basis: "test-never-used-scope" }));
   let clock = Date.parse("2026-11-07T00:00:00Z");
   st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }], clock - 1000);
-  const j = new ErasureJob(authority(), st, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => clock, async () => {});
+  // TEST-ONLY completion seam (production never sets it).
+  const j = new ErasureJob(authority(), st, s.eraser(), () => {}, { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true }, () => clock, async () => {});
   const queued = () => st.nextErasures(Number.MAX_SAFE_INTEGER, 10).map((e) => e.key);
   return { s, st, j, ids, queued, advance: (ms: number) => void (clock += ms) };
 }
@@ -306,6 +305,12 @@ describe("every destructive route is gated; state loss fails closed", () => {
     expect(s.count(PREFIX)).toBe(0); // erasure still proceeds ...
     expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10).map((e) => e.key).sort()).toEqual([OBJ, PREFIX].sort()); // ... never done
     expect(j.counters.prefixesErased + j.counters.objectsErased).toBe(0);
+    // Pre-existing / forged attested metadata does NOT unlock (the reader ignores attestedAt).
+    st.setMeta("obligations_genesis", JSON.stringify({ at: 1, attestedAt: Date.now(), basis: "forged" }));
+    expect(st.obligationsAttested()).toBe(false);
+    expect(st.obligationGenesis().attestedAt).toBeNull();
+    await j.drain();
+    expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10).map((e) => e.key).sort()).toEqual([OBJ, PREFIX].sort());
     // No CLI / PID / lock-file unlock exists.
     const main = await import("../neon-s3-erasure/main.ts");
     expect("attestObligationGenesis" in main).toBe(false);
@@ -406,7 +411,50 @@ describe("terminal cleanup covers exactly the versions a proof showed absent", (
   // BLOCKED on the shared primitive (eraser.ts, Babysitter lane; not forked here): verifyErased lists the whole
   // directory from its start under the 10k-version budget, so an exact key with >10k unrelated KEPT siblings never
   // gets a fresh strict proof. Needs an exact-key (or start-marker) verifyErased in the primitive.
-  test.todo("exact-key erase: the target + 10,001 kept siblings in its directory still completes (needs the primitive's exact-key verify)");
+  test("exact-key erase: the target + 10,001 kept siblings in its directory still completes (the primitive's exactKey mode)", async () => {
+    const w = await world(0);
+    w.st.erasureDone(PREFIX, Date.parse("2026-11-07T00:00:00Z") - 1000);
+    const OBJ = `${PREFIX}raw/target.ndjson.zst`;
+    for (let i = 0; i < 10_001; i++) w.s.put(`${PREFIX}raw/b=${String(i).padStart(6, "0")}.ndjson.zst`, OLD); // sorts BEFORE the target
+    w.s.put(OBJ, OLD);
+    w.st.enqueueErasure([{ key: OBJ, kind: "object", org_id: "org-1", reason: "unreferenced" }], Date.parse("2026-11-06T00:00:00Z"));
+    await w.j.drain();
+    expect(w.s.keys.get(OBJ)?.length ?? 0).toBe(0);
+    expect(w.queued()).toEqual([]);
+    expect(w.s.count(`${PREFIX}raw/b=`)).toBe(10_001); // every sibling kept
+  });
+
+  test("a LEGACY directory-mode checkpoint under an exact-key scope restarts the traversal (never refused or stuck)", async () => {
+    const w = await world(0);
+    w.st.erasureDone(PREFIX, Date.parse("2026-11-07T00:00:00Z") - 1000);
+    const OBJ = `${PREFIX}raw/legacy.ndjson.zst`;
+    w.s.put(OBJ, OLD);
+    const enq = Date.parse("2026-11-06T00:00:00Z");
+    w.st.enqueueErasure([{ key: OBJ, kind: "object", org_id: "org-1", reason: "unreferenced" }], enq);
+    // The checkpoint an earlier (directory-mode) run persisted for exactly this item's scope.
+    const scope = eraseScope(["queued-object", "supabase", "org-1", OBJ, "unreferenced", enq, "lease:" + PREFIX]);
+    w.st.setEraseCheckpoint(scope, { v: 1, bucket: "b", prefix: `${PREFIX}raw/`, scope, afterKey: null, inKey: null });
+    await w.j.drain();
+    expect(w.s.keys.get(OBJ)?.length ?? 0).toBe(0);
+    expect(w.queued()).toEqual([]);
+    expect(w.j.counters.failed).toBe(0);
+  });
+
+  test("a FOREIGN stored checkpoint (another bucket, same scope and mode) is ignored and the traversal restarts", async () => {
+    const w = await world(0);
+    w.st.erasureDone(PREFIX, Date.parse("2026-11-07T00:00:00Z") - 1000);
+    const OBJ = `${PREFIX}raw/foreign.ndjson.zst`;
+    w.s.put(OBJ, OLD);
+    const enq = Date.parse("2026-11-06T00:00:00Z");
+    w.st.enqueueErasure([{ key: OBJ, kind: "object", org_id: "org-1", reason: "unreferenced" }], enq);
+    const scope = eraseScope(["queued-object", "supabase", "org-1", OBJ, "unreferenced", enq, "lease:" + PREFIX]);
+    w.st.setEraseCheckpoint(scope, { v: 1, bucket: "another-bucket", prefix: `${PREFIX}raw/`, scope, afterKey: null, inKey: null, exactKey: OBJ });
+    await w.j.drain();
+    expect(w.s.keys.get(OBJ)?.length ?? 0).toBe(0);
+    expect(w.queued()).toEqual([]);
+    expect(w.j.counters.failed).toBe(0);
+  });
+
 });
 
 describe("queueing an exact OBJECT never unpublishes another key that merely starts with it (dogpatch 7772 P1)", () => {

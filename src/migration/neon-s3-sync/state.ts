@@ -140,12 +140,14 @@ export class SyncState {
   }
 
   /** The obligation genesis: when this file began tracking exporter PUTs, and whether an operator attested it. */
-  obligationGenesis(): { at: number; attestedAt: number | null; basis?: string; imported?: number } {
-    return JSON.parse(this.meta("obligations_genesis") ?? '{"at":0,"attestedAt":null}');
+  obligationGenesis(): { at: number; attestedAt: null; basis?: string; imported?: number } {
+    // Any stored attestedAt (old, forged or otherwise) is IGNORED: there is no attestation policy, so it is always null.
+    const g = JSON.parse(this.meta("obligations_genesis") ?? '{"at":0}') as { at: number; basis?: string; imported?: number };
+    return { at: g.at, attestedAt: null, ...(g.basis !== undefined ? { basis: g.basis } : {}), ...(g.imported !== undefined ? { imported: g.imported } : {}) };
   }
   /** Erasures may be marked done only after the genesis is attested (fail closed on a lost / recreated file). */
   obligationsAttested(): boolean {
-    return this.obligationGenesis().attestedAt !== null;
+    return false; // always: no metadata, old or forged, ever unlocks completion
   }
 
   #tx(fn: () => void) {

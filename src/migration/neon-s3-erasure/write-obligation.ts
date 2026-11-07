@@ -39,7 +39,8 @@
  * loaded; a changed row refuses and the reconcile returns "refused" without retiring anything.
  *
  * Reconcile (`reconcileObligation`) always goes through the shared strict paged eraser
- * (eraser.ts eraseStep / verifyErased): every unowned version at the key is erased, by exact
+ * (eraser.ts eraseStep / verifyErased) in EXACT-KEY mode (only the key's own versions are listed,
+ * so a directory of any number of kept siblings stays within budget): every unowned version at the key is erased, by exact
  * version id, successor-safe (owned versions are never selected); the checkpoint scope binds
  * the lane identity, key, owned set and invocation set; the row version is re-checked before
  * every page's deletes; an owner with an unrecorded version id blocks every erase.
@@ -86,7 +87,8 @@ export interface ObligationStore {
    * after it succeeds, a publish of any reserved version must be refused.
    */
   reserve(rev: number, versionIds: readonly string[]): Promise<Cas>;
-  saveCheckpoint(rev: number, checkpoint: EraseCheckpoint): Promise<Cas>;
+  /** Persist the run's checkpoint, or clear it (null) to restart the traversal; a CAS like the rest. */
+  saveCheckpoint(rev: number, checkpoint: EraseCheckpoint | null): Promise<Cas>;
   /** Clear exactly these invocations (each on its own terminal evidence). */
   resolve(rev: number, invocationIds: readonly string[]): Promise<Cas>;
   /** Not complete: clear the checkpoint, back off (`nextSweepDelayMs`). */
@@ -178,10 +180,29 @@ export async function reconcileObligation(
     if (!ids.length) return;
     if (!(await cas(store.reserve(rev, ids)))) { lost = true; throw coded("reservation_refused"); }
   };
-  const checkpoint = first.checkpoint && first.checkpoint.scope === scope ? first.checkpoint : null;
+  // The persisted checkpoint:
+  //  - this key's exact-key checkpoint under this scope: resumed;
+  //  - the KNOWN legacy mode only (a directory-mode checkpoint of this key's own directory under
+  //    the SAME scope, as 142761c7 persisted it, no exactKey): its progress is restarted by a
+  //    compare-and-set that clears ONLY the checkpoint (invocations, reservations and terminal
+  //    history untouched); a concurrent change makes the CAS refuse and nothing is overwritten;
+  //  - anything else (another directory, another exact key, another scope): refused with
+  //    erasure_checkpoint_scope, nothing traversed or deleted. A lane that changes an
+  //    obligation's invocations or owned set clears its checkpoint in the same transaction.
+  let checkpoint: EraseCheckpoint | null = first.checkpoint ?? null;
+  if (checkpoint) {
+    const legacy = checkpoint.v === 1 && checkpoint.scope === scope && checkpoint.prefix === prefix && (checkpoint.exactKey ?? null) === null;
+    const current = checkpoint.v === 1 && checkpoint.scope === scope && checkpoint.prefix === prefix && checkpoint.exactKey === key;
+    if (legacy) {
+      if (!(await cas(store.saveCheckpoint(rev, null)))) return "refused";
+      checkpoint = null;
+    } else if (!current) {
+      throw Object.assign(new Error("write obligation: the persisted checkpoint is bound to another key, directory or scope"), { code: "erasure_checkpoint_scope" });
+    }
+  }
   let step;
   try {
-    step = await eraser.eraseStep(prefix, { scope, checkpoint, select: unowned, authorize, beforeDelete, ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.now ? { now: opts.now } : {}) });
+    step = await eraser.eraseStep(prefix, { scope, checkpoint, select: unowned, authorize, beforeDelete, exactKey: key, ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.now ? { now: opts.now } : {}) });
   } catch (error) {
     if (lost) return "refused";
     throw error;
@@ -192,7 +213,7 @@ export async function reconcileObligation(
   let proof;
   try {
     proof = await eraser.verifyErased(prefix, { select: (v) => { if (v.key === key && !v.deleteMarker) present.add(v.versionId); return unowned(v); },
-      authorize, ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.now ? { now: opts.now } : {}) });
+      authorize, exactKey: key, ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.now ? { now: opts.now } : {}) });
   } catch (error) {
     if (lost) return "refused";
     throw error;

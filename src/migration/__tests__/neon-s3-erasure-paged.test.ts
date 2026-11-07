@@ -17,14 +17,11 @@ import type { LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 
 /**
- * TEST-ONLY: a state file whose obligation genesis is marked attested by writing the meta row directly (a fresh,
- * never-used test scope). Production has NO attestation path: every real genesis stays unattested.
+ * TEST-ONLY: exporter-path completion is opted into explicitly through the job's test seam
+ * (ErasureConfig.obligationsSettled; production never sets it). The state file itself can never attest.
  */
-function attestedState(path: string): SyncState {
-  const s = new SyncState(path);
-  s.setMeta("obligations_genesis", JSON.stringify({ at: Date.now(), attestedAt: Date.now(), basis: "test-never-used-scope" }));
-  return s;
-}
+const SETTLED_CFG = { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true };
+const attestedState = (path: string) => new SyncState(path);
 
 setDefaultTimeout(120_000);
 const G: LiveFencedGroup = { org_id: "org-1", workspace_id: "ws/1", user_id: "user-1", origin_id: "origin-1", source: "claude", session_id: "sess:1" };
@@ -58,7 +55,7 @@ function fill(s: FakeS3Versions, n: number, at = OLD) {
   s.put(T.pointerKey, at);
 }
 const job = (s: FakeS3Versions, st: SyncState, a: ErasureAuthority, now = () => NOW) =>
-  new ErasureJob(a, st, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, now, async () => {});
+  new ErasureJob(a, st, s.eraser(), () => {}, SETTLED_CFG, now, async () => {});
 
 describe("E3 job on the shared paged eraser", () => {
   test("a machine over 10k versions resumes across sweeps (and a fresh process) instead of failing closed; pointer last", async () => {
@@ -181,6 +178,24 @@ describe("the live pointer and staged objects go through the same reserve gate",
       expect(s.deletes.some((d) => d.startsWith(T.pointerKey) || d.startsWith(STAGED))).toBe(!claimed);
       st.close();
     }
+  });
+});
+
+describe("absence proof includes delete markers", () => {
+  test("a kept (newer) DELETE MARKER reserved by an earlier subset is NOT retired as erased by the session erase", async () => {
+    const s = new FakeS3Versions();
+    fill(s, 3);
+    const K = `${dir("2026/10/30")}raw/b=000001.ndjson.zst`;
+    // A delete marker newer than the job's re-read (a successor the time-subset keeps), still listed.
+    s.keys.set(K, [{ id: "m-kept", at: NOW, marker: true }, ...(s.keys.get(K) ?? [])]);
+    const st = await state();
+    expect(st.reserveErase(T.base, st.obligationRev(T.base), "earlier-subset", [{ key: K, versionId: "m-kept" }]).ok).toBe(true);
+    await job(s, st, authority()).sweep();
+    expect(s.keys.get(K)?.map((v) => v.id)).toEqual(["m-kept"]); // the old object versions are gone, the marker kept
+    expect(st.reservationsAt(K)).toEqual(["m-kept"]); // still reserved ...
+    expect(st.erasedAt(K)).not.toContain("m-kept"); // ... and never in the erased history (the erased object version is)
+    expect(st.erasedAt(K).length).toBe(1);
+    st.close();
   });
 });
 

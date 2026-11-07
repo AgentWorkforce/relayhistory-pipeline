@@ -218,3 +218,58 @@ describe("paged eraser: beforeDelete evidence hook", () => {
     expect(s.deletes).toHaveLength(10);   // the second page deleted nothing
   });
 });
+
+describe("paged eraser: exact-key mode", () => {
+  const D = P;   // the directory
+  const TARGET = `${D}raw/b=5000.ndjson.zst`;
+  const sib = (i: number) => `${D}raw/b=${String(i).padStart(4, "0")}${i >= 5000 ? "x" : ""}.ndjson.zst`;
+
+  test("a target key + 10,001 kept siblings in its directory: exact-key verification completes within budget and proves only that key", async () => {
+    const s = new FakeS3Versions();
+    for (let i = 0; i <= 10_000; i++) s.put(sib(i));
+    const t1 = s.put(TARGET), t2 = s.put(TARGET);
+    s.put(`${TARGET}.later`);   // shares the key as a prefix: never counted, never deleted
+    const e = s.eraser();
+    // Directory mode cannot finish (10k per-run ceiling) ...
+    expect(await e.verifyErased(D, { authorize: ok, select: (v) => v.key === TARGET })).toMatchObject({ status: "pending" });
+    // ... exact-key mode lists only the key's own versions.
+    expect(await e.verifyErased(D, { authorize: ok, exactKey: TARGET })).toMatchObject({ status: "pending", reason: "remaining", remaining: 2 });
+    const r = await e.eraseStep(D, { scope, authorize: ok, exactKey: TARGET });
+    expect(r).toMatchObject({ status: "traversed", deleted: 2 });
+    expect(s.deletes.sort()).toEqual([`${TARGET}@${t1}`, `${TARGET}@${t2}`].sort());
+    expect(await e.verifyErased(D, { authorize: ok, exactKey: TARGET })).toEqual({ status: "erased", listed: 0 });
+    expect(s.count(D)).toBe(10_002);   // every sibling (and the prefix-sharing key) kept
+  }, 60_000);
+
+  test("exact-key pages stay strict: a foreign key, a duplicate or bad markers refuse; the key must lie under the prefix; its checkpoint is bound to it", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 2;
+    for (let i = 0; i < 5; i++) s.put(TARGET);
+    s.rewrite = (call, xml) => (call === 2 ? xml.replace(/<Key>[^<]*<\/Key>/, "<Key>96bulls/elsewhere/x</Key>") : xml);
+    await expect(s.eraser().eraseStep(D, { scope, authorize: ok, exactKey: TARGET })).rejects.toMatchObject({ code: "erasure_foreign_key" });
+    s.rewrite = undefined;
+    for (const bad of ["96bulls/other/k", D, `${D}raw/`, `${D}raw/../x`]) await expect(s.eraser().verifyErased(D, { authorize: ok, exactKey: bad })).rejects.toMatchObject({ code: "erasure_prefix_shape" });
+    const r = await s.eraser().eraseStep(D, { scope, authorize: ok, exactKey: TARGET, budget: { pages: 1 } });
+    expect(r.status).toBe("incomplete");
+    const cp = (r as { checkpoint: EraseCheckpoint }).checkpoint;
+    expect(cp.exactKey).toBe(TARGET);
+    await expect(s.eraser().eraseStep(D, { scope, authorize: ok, checkpoint: cp })).rejects.toMatchObject({ code: "erasure_checkpoint_scope" });
+    await expect(s.eraser().eraseStep(D, { scope, authorize: ok, checkpoint: cp, exactKey: `${D}raw/b=0001.ndjson.zst` })).rejects.toMatchObject({ code: "erasure_checkpoint_scope" });
+    expect(await s.eraser().eraseStep(D, { scope, authorize: ok, checkpoint: cp, exactKey: TARGET })).toMatchObject({ status: "traversed" });
+    expect(s.count(TARGET)).toBe(0);
+  });
+
+  test("the unversioned store's exact-key mode lists the key's directory filtered to the key", async () => {
+    const { storeEraser } = await import("../neon-s3-erasure/eraser.ts");
+    const { scratchStore } = await import("../../session-ingest/__tests__/support.ts");
+    const { objectKey } = await import("../../shared/vendor.ts");
+    const sc = scratchStore();
+    try {
+      await sc.store.put(objectKey(TARGET), new Uint8Array([1]), { ifNoneMatch: true });
+      await sc.store.put(objectKey(sib(1)), new Uint8Array([2]), { ifNoneMatch: true });
+      const e = storeEraser(sc.store);
+      expect(await e.eraseStep(D, { scope, authorize: ok, exactKey: TARGET })).toMatchObject({ status: "traversed", deleted: 1 });
+      expect(await e.verifyErased(D, { authorize: ok, exactKey: TARGET })).toEqual({ status: "erased", listed: 0 });
+      expect(await e.verifyErased(D, { authorize: ok })).toMatchObject({ status: "pending" });   // the sibling remains
+    } finally { sc.done(); }
+  });
+});

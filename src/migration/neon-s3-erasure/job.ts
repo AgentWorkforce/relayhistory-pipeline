@@ -62,6 +62,12 @@ export interface ErasureConfig {
    * exporter's `S3X_INCLUDE_LEGACY_SOURCES`.
    */
   recognizeLegacy: boolean;
+  /**
+   * TEST SEAM ONLY (never set by main.ts): whether exporter obligations may be treated as settled. Production has NO
+   * value for it, so an exporter prefix or object is never marked erased (every genesis is unattested; there is no
+   * unlock until a separately reviewed recovery contract exists). Tests of the completion path opt in explicitly.
+   */
+  obligationsSettled?: () => boolean;
 }
 
 export const DEFAULT_ERASURE_CONFIG: ErasureConfig = {
@@ -120,7 +126,8 @@ export class ErasureJob {
    *    an acked one only when its exact version is absent from that complete inventory.
    */
   async #erasePaged(prefix: string, scope: string, select: ((v: ListedVersion) => boolean) | undefined, authorize: () => Promise<void>,
-    keyFilter: (key: string) => boolean = () => true, exporterWritten = false): Promise<{ status: PagedOutcome; deleted: number; remaining: number }> {
+    keyFilter: (key: string) => boolean = () => true, exporterWritten = false, exactKey?: string): Promise<{ status: PagedOutcome; deleted: number; remaining: number }> {
+    const exact = exactKey !== undefined ? { exactKey } : {};
     let rev = this.state.obligationRev(prefix);
     let lost = false;
     const budget = () => ({ deadlineAt: this.now() + ERASE_STEP_DEADLINE_MS });
@@ -133,11 +140,27 @@ export class ErasureJob {
       }
       rev = r.rev;
     };
+    // Legacy migration: a checkpoint persisted under this scope in the OTHER mode (directory vs exact-key, e.g. written
+    // before the exact-key wiring) is not resumable; restart the traversal from the start instead of being refused.
+    // Progress only: invocations, reservations and the terminal / erased history are untouched.
+    let checkpoint = this.state.eraseCheckpoint(scope) as (EraseCheckpoint & { exactKey?: string }) | null;
+    if (checkpoint && (checkpoint.scope !== scope || checkpoint.prefix !== prefix || (checkpoint.exactKey ?? null) !== (exactKey ?? null))) {
+      this.state.clearEraseCheckpoint(scope);
+      checkpoint = null;
+    }
+    const run = (cp: EraseCheckpoint | null) => this.eraser.eraseStep(prefix, {
+      scope, checkpoint: cp, ...(select ? { select } : {}), authorize, beforeDelete, budget: budget(), now: this.now, ...exact,
+    });
     let step;
     try {
-      step = await this.eraser.eraseStep(prefix, {
-        scope, checkpoint: this.state.eraseCheckpoint(scope) as EraseCheckpoint | null, ...(select ? { select } : {}), authorize, beforeDelete, budget: budget(), now: this.now,
-      });
+      try {
+        step = await run(checkpoint);
+      } catch (error) {
+        // A stale / foreign stored checkpoint (e.g. another bucket) is ignored and the traversal restarted, never a stall.
+        if (!checkpoint || errorCode(error) !== "erasure_checkpoint_scope") throw error;
+        this.state.clearEraseCheckpoint(scope);
+        step = await run(null);
+      }
     } catch (error) {
       if (lost) {
         this.counters.reservationsRefused += 1;
@@ -152,13 +175,19 @@ export class ErasureJob {
     }
     this.state.clearEraseCheckpoint(scope);
     // A fresh strict COMPLETE inventory: which exact versions are present per key.
+    // `present`: object versions (the invocation evidence); `listed`: EVERY listed entry INCLUDING delete markers (the
+    // absence proof: a marker still listed is present, never "erased").
     const present = new Map<string, Set<string>>();
+    const listed = new Map<string, Set<string>>();
     const proof = await this.eraser.verifyErased(prefix, {
       select: (v) => {
-        if (!v.deleteMarker && keyFilter(v.key)) (present.get(v.key) ?? present.set(v.key, new Set()).get(v.key)!).add(v.versionId);
+        if (keyFilter(v.key)) {
+          (listed.get(v.key) ?? listed.set(v.key, new Set()).get(v.key)!).add(v.versionId);
+          if (!v.deleteMarker) (present.get(v.key) ?? present.set(v.key, new Set()).get(v.key)!).add(v.versionId);
+        }
         return select ? select(v) : true;
       },
-      authorize, budget: budget(), now: this.now,
+      authorize, budget: budget(), now: this.now, ...exact,
     });
     let remaining = 0;
     for (const vs of present.values()) remaining += vs.size;
@@ -181,13 +210,13 @@ export class ErasureJob {
     }
     // A prefix the exporter writes is never done while its obligations may be incomplete: an unattested genesis (a
     // lost / recreated state file) may have forgotten outstanding PUTs, so it fails closed.
-    if (invocations.length - done.length > 0 || (exporterWritten && !this.state.obligationsAttested())) {
+    if (invocations.length - done.length > 0 || (exporterWritten && !(this.cfg.obligationsSettled?.() ?? false))) {
       this.counters.unresolved += 1;
       return { status: "unresolved", deleted: step.deleted, remaining };
     }
     // Retire EXACTLY the reserved versions this complete inventory shows absent (within keyFilter); every other
     // reservation (kept siblings, successors, other subsets) stays.
-    this.state.retireReservations(prefix, (key, versionId) => keyFilter(key) && !(present.get(key)?.has(versionId) ?? false));
+    this.state.retireReservations(prefix, (key, versionId) => keyFilter(key) && !(listed.get(key)?.has(versionId) ?? false));
     return { status: "erased", deleted: step.deleted, remaining };
   }
 
@@ -199,7 +228,9 @@ export class ErasureJob {
   #eraseKey(key: string, scope: string, select: (v: ListedVersion) => boolean, authorize: () => Promise<void>, exporterWritten = false) {
     const dir = key.slice(0, key.lastIndexOf("/") + 1);
     if (!dir || dir === key) throw refusal("erasure_refused_shape");
-    return this.#erasePaged(dir, scope, (v) => v.key === key && select(v), authorize, (k) => k === key, exporterWritten);
+    // The shared primitive's exact-key mode: listing and verification cover exactly this key (cut at the first other
+    // key), so unrelated siblings never count against the budget.
+    return this.#erasePaged(dir, scope, (v) => v.key === key && select(v), authorize, (k) => k === key, exporterWritten, key);
   }
 
   /** Queue the session prefixes of `keys` (manifest keys) and drop them from the group's watermark. */
@@ -512,7 +543,7 @@ export class ErasureJob {
           this.counters.versionsDeleted += r.deleted;
           handled += 1;
           if (r.status === "unresolved") {
-            this.state.erasureFailed(item.key, this.state.obligationsAttested() ? "erasure_write_unresolved" : "erasure_obligations_unattested", this.now());
+            this.state.erasureFailed(item.key, (this.cfg.obligationsSettled?.() ?? false) ? "erasure_write_unresolved" : "erasure_obligations_unattested", this.now());
             continue;
           }
           if (r.status !== "erased") continue;
@@ -536,7 +567,7 @@ export class ErasureJob {
         // Still queued unless proven: incomplete resumes from the checkpoint; unverified / refused retry on the next
         // drain; an unresolved write (a PUT whose outcome is unknown) keeps it queued, re-swept on the bounded backoff.
         if (r.status === "unresolved") {
-          this.state.erasureFailed(item.key, this.state.obligationsAttested() ? "erasure_write_unresolved" : "erasure_obligations_unattested", this.now());
+          this.state.erasureFailed(item.key, (this.cfg.obligationsSettled?.() ?? false) ? "erasure_write_unresolved" : "erasure_obligations_unattested", this.now());
           continue;
         }
         if (r.status !== "erased") continue;

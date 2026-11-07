@@ -36,14 +36,11 @@ import { boundStrings, EXPORT_KINDS, fencedGroups, MAX_STRING_TOKEN, neonUnitSou
 import { SyncState } from "../neon-s3-sync/state.ts";
 
 /**
- * TEST-ONLY: a state file whose obligation genesis is marked attested by writing the meta row directly (a fresh,
- * never-used test scope). Production has NO attestation path: every real genesis stays unattested.
+ * TEST-ONLY: exporter-path completion is opted into explicitly through the job's test seam
+ * (ErasureConfig.obligationsSettled; production never sets it). The state file itself can never attest.
  */
-function attestedState(path: string): SyncState {
-  const s = new SyncState(path);
-  s.setMeta("obligations_genesis", JSON.stringify({ at: Date.now(), attestedAt: Date.now(), basis: "test-never-used-scope" }));
-  return s;
-}
+const SETTLED_CFG = { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true };
+const attestedState = (path: string) => new SyncState(path);
 import { Syncer, DEFAULT_SYNC_CONFIG } from "../neon-s3-sync/sync.ts";
 import { Throttle, parseWindows } from "../neon-s3-sync/throttle.ts";
 
@@ -411,7 +408,7 @@ describe("delete propagation", () => {
     const fresh = await exportUnit(t, unit("o1", { sessionId: "fresh" }), fixedSource(baseRecords().slice(0, 1)));
     state.markExported("o1", "fresh", 1, fresh.manifests.map((m) => m.manifestKey), Date.now() + 60_000);
     const db = sweepDb([{ org_id: "o1", session_id: "kept", last_ms: "1", events: "1" }]);
-    const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    const job = new ErasureJob(db, state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
     await job.sweep();
     await job.drain();
     expect(await allKeys(store, "96bulls/o1/v1")).toEqual(
@@ -422,7 +419,7 @@ describe("delete propagation", () => {
     );
     expect(state.exported("o1", "gone")!.keys).toEqual([]);
     // a sweep that read nothing never erases
-    const empty = new ErasureJob(sweepDb([]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    const empty = new ErasureJob(sweepDb([]), state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
     await empty.sweep();
     expect(state.erasureBacklog().queued).toBe(0);
     state.close();
@@ -435,7 +432,7 @@ describe("delete propagation", () => {
     state.markExported("o1", "cat-only", 0, r.manifests.map((m) => m.manifestKey), Date.now() - 1000);
     const job = new ErasureJob(
       sweepDb([{ org_id: "o9", session_id: "x", last_ms: "1", events: "1" }], [], [{ org_id: "o1", session_id: "cat-only" }]),
-      state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {},
+      state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {},
     );
     await job.sweep();
     await job.drain();
@@ -450,7 +447,7 @@ describe("delete propagation", () => {
     const r = await exportUnit(target(store), unit("o1", { sessionId: "s1" }), fixedSource(baseRecords().slice(0, 1)));
     state.seeRevisions(1, [{ org_id: "o1", session_id: "s1", revision: "1" }]);
     state.markExported("o1", "s1", 1, r.manifests.map((m) => m.manifestKey), Date.now() - 1000);
-    const job = new ErasureJob(sweepDb([{ org_id: "o1", session_id: "s1", last_ms: "1", events: "1" }], [{ org_id: "o1", session_id: "s1" }]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    const job = new ErasureJob(sweepDb([{ org_id: "o1", session_id: "s1", last_ms: "1", events: "1" }], [{ org_id: "o1", session_id: "s1" }]), state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
     await job.sweep();
     await job.drain();
     expect(await allKeys(store)).toEqual([]);
@@ -473,7 +470,7 @@ describe("delete propagation", () => {
     const s2 = attestedState(join(await tempDir(), "s.sqlite"));
     s2.enqueueErasure([{ key: prefixB, kind: "prefix", org_id: "org-b", reason: "test" }]);
     expect(s2.acquireLease(prefixB, "exporter:1")).toBe(true);
-    const j2 = new ErasureJob(fakeDb([]), s2, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    const j2 = new ErasureJob(fakeDb([]), s2, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
     expect(await j2.drain()).toBe(0);
     expect(j2.counters.deferred).toBe(1);
     s2.releaseLeases("exporter:1", [prefixB]);
@@ -532,7 +529,7 @@ describe("ownership and failure bookkeeping", () => {
     expect(row.keys).toHaveLength(1);
     expect((await allKeys(store)).length).toBeGreaterThan(0); // sealed chunks, no manifest
     // Neon then hard-deletes the session: the erasure job's sweep no longer sees it and erases the prefix.
-    const job = new ErasureJob(sweepDb([{ org_id: "org-z", session_id: "other", last_ms: "1", events: "1" }]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+    const job = new ErasureJob(sweepDb([{ org_id: "org-z", session_id: "other", last_ms: "1", events: "1" }]), state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
     await job.sweep();
     await job.drain();
     expect(await allKeys(store)).toEqual([]);
@@ -716,7 +713,7 @@ describe("ownership and failure bookkeeping", () => {
     const after = attestedState(path);
     expect(after.recoverPendingKeys()).toBe(1);
     after.releaseStaleLeases("exporter:", "exporter:new");
-    const job = new ErasureJob(sweepDb([{ org_id: "org-z", session_id: "other", last_ms: "1", events: "1" }]), after, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, () => Date.now() + 60_000, async () => {});
+    const job = new ErasureJob(sweepDb([{ org_id: "org-z", session_id: "other", last_ms: "1", events: "1" }]), after, storeEraser(store), () => {}, SETTLED_CFG, () => Date.now() + 60_000, async () => {});
     await job.sweep();
     await job.drain();
     expect(await allKeys(store)).toEqual([]);
@@ -1108,7 +1105,7 @@ function fakeDb(units: SessionUnit[]): Queryable & { units: SessionUnit[] } {
 
 /** The erasure job over a plain store, draining what is queued. */
 async function drainErasures(state: SyncState, store: ObjectStore) {
-  const job = new ErasureJob(fakeDb([]), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
+  const job = new ErasureJob(fakeDb([]), state, storeEraser(store), () => {}, SETTLED_CFG, Date.now, async () => {});
   while ((await job.drain()) > 0);
   return job;
 }
