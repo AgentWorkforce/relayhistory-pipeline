@@ -76,10 +76,12 @@ const JOBS: Job[] = [
   { org: "org-a", ws: "ws-a", src: "claude", session: "sess/abc", title: "Fix login", at: "2026-10-02T00:00:00Z" },
   // A title Cloud shows whose description is empty: carried as a title-only legacy brief.
   { org: "org-a", ws: "ws-a", src: "claude", session: "s-8", title: "Title only", description: "", at: "2026-10-02T00:00:00Z" },
+  // A Cloud-visible title SP cannot store (over 90): it has a live pointer, so verify fails.
+  { org: "org-a", ws: "ws-a", src: "claude", session: "s-9", title: "x".repeat(91), at: "2026-10-02T00:00:00Z" },
 ];
 /** SP sessions with a live pointer (s-6 has none): [org, ws, harness, physical id, canonical id?]. */
 const POINTERS: Array<[string, string, string, string, string?]> = [
-  ["org-a", "ws-a", "claude", "sess_abc", "sess/abc"], ["org-a", "ws-a", "claude", "s-8"],
+  ["org-a", "ws-a", "claude", "sess_abc", "sess/abc"], ["org-a", "ws-a", "claude", "s-8"], ["org-a", "ws-a", "claude", "s-9"],
   ["org-a", "ws-a", "claude", "s-1"], ["org-a", "ws-a", "codex", "s-1"], ["org-a", "ws-a", "claude", "s-2"],
   ["org-a", "ws-a", "claude", "s-3"], ["org-a", "ws-a", "claude", "s-4"], ["org-a", "ws-a", "claude", "s-5"],
   ["org-a", "ws-a", "claude", "s-7"], ["org-a", "ws-b", "claude", "s-1"], ["org-b", "ws-a", "claude", "s-1"],
@@ -171,7 +173,7 @@ describe.skipIf(!url)("owned PG17: F2 brief-title backfill rehearsal", () => {
     const dry = await cli([]);
     expect(dry.exit).toBe(0);
     expect(dry.out.backfill).toMatchObject({
-      mode: "dry-run", candidates: 10, skipped: { title_blank: 1 },
+      mode: "dry-run", candidates: 11, skipped: { title_blank: 1, title_too_long: 1 },
       outcomes: { inserted: 7, updated: 0, skipped_native: 1, skipped_quarantined: 0, skipped_no_pointer: 1 },
     });
     expect((await target.query("SELECT count(*)::int AS n FROM sessions.session_briefs")).rows[0].n).toBe(1);
@@ -202,7 +204,7 @@ describe.skipIf(!url)("owned PG17: F2 brief-title backfill rehearsal", () => {
       for (const key of keys) {
         const id = JSON.stringify(key);
         if (org === "org-a" && ws === "ws-a" && key[1] === "s-7") { expect(served.get(id)).toBe("Native title"); continue; }
-        if (key[1] === "s-6") { expect(served.has(id)).toBe(false); continue; }
+        if (key[1] === "s-6" || key[1] === "s-9") { expect(served.has(id)).toBe(false); continue; }
         expect(served.get(id)).toBe(cloud.get(id));
         compared += 1;
       }
@@ -214,11 +216,13 @@ describe.skipIf(!url)("owned PG17: F2 brief-title backfill rehearsal", () => {
     expect((await servedTitles("org-a", "ws-a", [["claude", "s-1"]])).get(JSON.stringify(["claude", "s-1"]))).toBe("Latest title");
 
     const verify = await cli(["--verify"]);
-    // s-6 (no SP pointer) is a Cloud-visible title SP cannot serve: the run fails (exit 2).
+    // s-9 has a live pointer and a Cloud-visible title SP cannot serve: the run fails (exit 2).
+    // s-6 has no SP pointer at all: reported as no_pointer residue, not failed.
     expect(verify.exit).toBe(2);
     expect(verify.out.passed).toBe(false);
-    expect(verify.out.verify).toMatchObject({ candidates: 10, compared: 9, equal: 7, native: 1, missing: 1, different: 0 });
-    expect(verify.out.verify.samples.missing).toEqual([["org-a", "ws-a", "claude", "s-6"]]);
+    expect(verify.out.verify).toMatchObject({ candidates: 11, compared: 10, equal: 7, native: 1, missing: 1, no_pointer: 1, different: 0 });
+    expect(verify.out.verify.samples.missing).toEqual([["org-a", "ws-a", "claude", "s-9"]]);
+    expect(verify.out.verify.samples.no_pointer).toEqual([["org-a", "ws-a", "claude", "s-6"]]);
     expect((await cli(["--verify", "--execute"])).exit).toBe(1);
 
     const again = await cli(["--execute", "--expect-target-host=127.0.0.1"]);

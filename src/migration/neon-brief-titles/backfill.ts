@@ -33,7 +33,15 @@
  * origin = 'neon_backfill'), legacy_job_id = the Neon job id, revision 0 and empty source
  * revisions (session_brief reports it 'stale', never 'ready'), and a brief_fingerprint that
  * no native input can have (sha256 of a backfill-only string), so the native worker never
- * "reuses" it instead of calling the model. The directory title is not touched.
+ * "reuses" it instead of calling the model. The directory title is not touched, now or on a
+ * later re-projection: the directory projector reads native briefs only
+ * (src/hoopdb/session-directory-projector.ts), so a backfilled title never reaches
+ * session_directory.title, search_text or the brief-document/search publication.
+ *
+ * The brief sweep (store.ts sweepUnbriefed) arms only sessions with no brief row, so a
+ * backfilled session is not re-briefed by the sweep. That is intended: the Neon title keeps
+ * showing until the session gets new evidence, whose indexing arms a wakeup, and the native
+ * brief then replaces it (origin becomes native).
  *
  * Nothing here logs titles or descriptions: reports carry counts, reasons and session keys.
  */
@@ -151,7 +159,8 @@ export function toBackfillRow(n: NeonBriefRow): { row: BackfillRow } | { skip: S
     return { skip: "key_invalid" };
   const title = cloudTitle(n.title);
   if (title === null) return { skip: "title_blank" };
-  if (title.length > 90) return { skip: "title_too_long" };
+  // Code points, as the CHECK's char_length counts (not UTF-16 units).
+  if ([...title].length > 90) return { skip: "title_too_long" };
   const description = typeof n.description === "string" ? n.description.trim() : "";
   const state = n.state !== null && STATES.has(n.state) ? n.state : null;
   const prompt = [n.prompt_version, n.summary_version].find((v) => typeof v === "string" && VERSION.test(v)) ?? UNKNOWN_PROMPT_VERSION;
@@ -328,7 +337,12 @@ export async function loadBackfill(target: TargetClient, source: readonly NeonBr
  * resolution and preference (logical id through canonical_session_id; native first, then
  * newest; trimmed, never blank), without its role guard (verify runs as the owner, READ ONLY).
  */
-export const VERIFY_SQL = `SELECT i.org_id, i.workspace_id, i.harness, i.session_id, hit.title, hit.origin
+export const VERIFY_SQL = `SELECT i.org_id, i.workspace_id, i.harness, i.session_id, hit.title, hit.origin,
+       EXISTS (SELECT 1 FROM sessions.session_index AS p
+                WHERE p.org_id = i.org_id AND p.workspace_id = i.workspace_id AND p.harness = i.harness
+                  AND p.deleted_at IS NULL
+                  AND ((p.session_id = i.session_id AND p.canonical_session_id IS NULL)
+                       OR p.canonical_session_id = i.session_id)) AS live
   FROM jsonb_to_recordset($1::jsonb) AS i(org_id text, workspace_id text, harness text, session_id text)
   LEFT JOIN LATERAL (
     SELECT btrim(b.title) AS title, b.origin
@@ -349,7 +363,7 @@ export const VERIFY_SQL = `SELECT i.org_id, i.workspace_id, i.harness, i.session
      LIMIT 1
   ) AS hit ON true`;
 
-/** Parity holds only with nothing missing and nothing different. */
+/** Parity holds only with nothing missing and nothing different (no_pointer is reported, not failed). */
 export function verifyPassed(r: VerifyReport): boolean {
   return r.missing === 0 && r.different === 0;
 }
@@ -359,19 +373,24 @@ export interface VerifyReport {
   /** Cloud-visible Neon titles (non-blank after btrim). */
   compared: number;
   equal: number;
-  /** SP has no title for the key (not backfilled, skipped, or no live pointer). */
+  /** SP has a live pointer for the key but serves no title (not backfilled or skipped): a defect. */
   missing: number;
+  /**
+   * SP has no live pointer resolving to the key (erased, tombstoned or never copied): the
+   * session is not listable after the cutover, so this is residue, not a parity failure.
+   */
+  no_pointer: number;
   /** SP serves a native brief title instead (expected after native regeneration). */
   native: number;
   /** SP serves a backfilled title that differs from Neon: always a defect. */
   different: number;
   /** Up to 20 keys per class, identifiers only. */
-  samples: { missing: string[][]; different: string[][] };
+  samples: { missing: string[][]; different: string[][]; no_pointer: string[][] };
 }
 
 /** Read-only parity: every Cloud-visible Neon title must equal the title SP serves. */
 export async function verifyBackfill(target: Queryable, source: readonly NeonBriefRow[]): Promise<VerifyReport> {
-  const report: VerifyReport = { candidates: source.length, compared: 0, equal: 0, missing: 0, native: 0, different: 0, samples: { missing: [], different: [] } };
+  const report: VerifyReport = { candidates: source.length, compared: 0, equal: 0, missing: 0, no_pointer: 0, native: 0, different: 0, samples: { missing: [], different: [], no_pointer: [] } };
   const wanted = source.flatMap((n) => {
     const title = cloudTitle(n.title);
     return title === null ? [] : [{ key: { org_id: n.org_id, workspace_id: n.workspace_id, harness: n.source_provider, session_id: n.session_id }, title }];
@@ -379,7 +398,7 @@ export async function verifyBackfill(target: Queryable, source: readonly NeonBri
   report.compared = wanted.length;
   for (let at = 0; at < wanted.length; at += LOAD_BATCH_ROWS) {
     const batch = wanted.slice(at, at + LOAD_BATCH_ROWS);
-    const { rows } = await target.query<{ org_id: string; workspace_id: string; harness: string; session_id: string; title: string | null; origin: string | null }>(
+    const { rows } = await target.query<{ org_id: string; workspace_id: string; harness: string; session_id: string; title: string | null; origin: string | null; live: boolean }>(
       VERIFY_SQL,
       [JSON.stringify(batch.map((w) => w.key))],
     );
@@ -387,7 +406,10 @@ export async function verifyBackfill(target: Queryable, source: readonly NeonBri
     for (const w of batch) {
       const id = [w.key.org_id, w.key.workspace_id, w.key.harness, w.key.session_id];
       const r = got.get(JSON.stringify(id));
-      if (!r || r.title === null) {
+      if (!r || (r.title === null && !r.live)) {
+        report.no_pointer += 1;
+        if (report.samples.no_pointer.length < 20) report.samples.no_pointer.push(id);
+      } else if (r.title === null) {
         report.missing += 1;
         if (report.samples.missing.length < 20) report.samples.missing.push(id);
       } else if (r.origin === "native") {

@@ -129,12 +129,15 @@ describe("GET /v1/sessions/titles", () => {
       row({ session_id: "s-2", title: "x".repeat(91) }),
       row({ session_id: "s-3", title: "  Fix login  " }),
       row({ session_id: "s-4", title: "two\nlines" }),
+      // 90 code points (180 UTF-16 units): within the bound the CHECK counts.
+      row({ session_id: "s-5", title: "\u{1F600}".repeat(90) }),
     ];
-    const r = await api({ titles: stub({ rows }).titles }).get(q("claude:s-1", "claude:s-2", "claude:s-3", "claude:s-4"));
+    const r = await api({ titles: stub({ rows }).titles }).get(q("claude:s-1", "claude:s-2", "claude:s-3", "claude:s-4", "claude:s-5"));
     expect(r.status).toBe(200);
     expect((await body(r)).titles).toEqual([
       { source: "claude", sessionId: "s-3", title: "Fix login" },
       { source: "claude", sessionId: "s-4", title: "two\nlines" },
+      { source: "claude", sessionId: "s-5", title: "\u{1F600}".repeat(90) },
     ]);
   });
 

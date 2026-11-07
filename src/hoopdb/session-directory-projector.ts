@@ -30,8 +30,10 @@
  *     every companion's last_activity_at equal to the row's in the row's own transaction,
  *     and on tombstone or delete remove the session's agent rows and its edges as parent
  *     and as child; the tombstone trigger clears the catalog columns.
- *   - a model-written brief title (sessions.session_briefs, src/session-brief) wins over
- *     the latest pointer's title while the brief exists. Deleting a pointer deletes the
+ *   - a NATIVE model-written brief title (sessions.session_briefs, src/session-brief) wins
+ *     over the latest pointer's title while the brief exists. A Neon-backfilled brief
+ *     (20261105043000, engine_version 'neon-backfill:*') never does: it is served only to
+ *     Cloud's session list through sessions.session_brief_titles_for. Deleting a pointer deletes the
  *     brief (trigger), so the pointer title returns on the next projection.
  *
  * search_text is always rebuilt with sessions.session_directory_search_text, so the
@@ -73,9 +75,14 @@ export async function projectSessionDirectory(
          ELSE i.canonical_session_id END AS session_id
        FROM identity AS i
      ), brief AS (
+       -- A NATIVE brief title only. A Neon backfill (20261105043000, origin 'neon_backfill',
+       -- engine_version 'neon-backfill:*') is served solely to Cloud's session list through
+       -- sessions.session_brief_titles_for, never into the directory title, search_text or
+       -- the brief-document/search publication built from them. Filtered on engine_version,
+       -- the column origin is derived from, so this read also works before 043000 is applied.
        SELECT title FROM sessions.session_briefs
         WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4
-          AND title IS NOT NULL
+          AND title IS NOT NULL AND engine_version NOT LIKE 'neon-backfill:%'
      ), agg AS (
        SELECT min(created_at) AS created_at, max(last_activity_at) AS last_activity_at,
               coalesce(array_agg(DISTINCT coalesce(canonical_machine_id, machine_id)

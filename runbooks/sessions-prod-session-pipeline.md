@@ -224,8 +224,12 @@ controls them:
   `openai_api_key: ($key | rtrimstr("\n"))` to its output object. Do not use
   `--arg key "$(op read …)"`; command substitution would expose the key in
   `jq`'s argv.
-- Historical sessions are not enqueued: `SESSION_BRIEF_SWEEP_SECONDS` stays 0.
-  A backfill needs its own approval and budget.
+- Historical sessions are not enqueued unless `briefs.sweepSeconds` is set: it emits
+  `SESSION_BRIEF_SWEEP_SECONDS` (an integer 0-86400; absent = not emitted, so the worker
+  default 0, off). Each sweep queues up to 100 indexed sessions that have no brief row at
+  all, under the same budgets. Setting it is a budgeted backfill and needs its own
+  approval. Sessions holding a Neon-backfilled title (docs/brief-titles.md) have a brief
+  row, so the sweep never re-briefs them; new evidence does.
 
 **Turning them on (each step needs Khaliq's OK):**
 

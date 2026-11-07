@@ -352,6 +352,29 @@ describe("reads through ClickHouse and Supabase", () => {
 });
 
 describe("directory list and activity (P3b)", () => {
+  test("brief titles: off unless READ_API_BRIEF_TITLES_WORKSPACES names the workspace; on, the tenant's titles only", async () => {
+    const t = tenant();
+    const bearer = await token(t);
+    const call = async (over: Partial<Env> = {}) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions/titles?workspace=${t.ws}&key=codex:t-1`, { headers: { authorization: `Bearer ${bearer}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    for (const over of [{}, { READ_API_BRIEF_TITLES_WORKSPACES: "" }, { READ_API_BRIEF_TITLES_WORKSPACES: "ws-someone-else" }, { READ_API_DIRECTORY_WORKSPACES: "*" }]) {
+      const r = await call(over);
+      expect(r.status).toBe(501);
+      expect((await body(r)).error.reason).toBe("brief_titles_workspace_not_enabled");
+    }
+    // With migration 20261105043000 applied (global-setup runs every migration): no brief yet.
+    for (const allow of [t.ws, `ws-other,${t.ws}`, "*"]) {
+      const r = await call({ READ_API_BRIEF_TITLES_WORKSPACES: allow });
+      expect(r.status).toBe(200);
+      expect(r.headers.get("x-relayhistory-workspace-id")).toBe(t.ws);
+      expect((await body(r)).titles).toEqual([]);
+    }
+  });
+
   test("off the canary allowlist every workspace falls back; on it, the directory serves the tenant only", async () => {
     const t = tenant();
     const bearer = await token(t);

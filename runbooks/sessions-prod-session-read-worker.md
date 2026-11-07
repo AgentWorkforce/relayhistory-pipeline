@@ -35,6 +35,7 @@ The same `b96e1:` cursors are issued and accepted. A cursor that the Lambda issu
 | `RELAYAUTH_JWKS_URL`, `RELAYAUTH_ISSUER` | `wrangler.jsonc` vars | `https://api.relayauth.dev/.well-known/jwks.json` and `https://relayauth.dev`, as on the Lambda since #158. Never leave them unset: the verifier's fallback JWKS does not resolve, so every token would be refused with a 401 |
 
 | `READ_API_DIRECTORY_WORKSPACES` | GitHub env var `SESSION_READ_DIRECTORY_WORKSPACES` | the P3 canary allowlist (directory list/activity and session timing); unset = every P3 route answers 501 |
+| `READ_API_BRIEF_TITLES_WORKSPACES` | GitHub env var `SESSION_READ_BRIEF_TITLES_WORKSPACES` | the F2 brief-titles allowlist (`GET /v1/sessions/titles`, docs/brief-titles.md); separate from the P3 canary; unset = 501 `brief_titles_workspace_not_enabled`, `*` = all |
 | `PIPELINE_RAW_S3_BUCKET`, `_REGION`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` (+ optional `_ENDPOINT`, `_SSE`), `PIPELINE_KEY_PREFIX`, `PIPELINE_ORG_FROM_PREFIX` | Worker secrets / vars | session timing's canonical S3 read: a GetObject-only key on the raw bucket, the same key layout the session-pipeline Lambda writes. Unset = timing answers 501 `timing_not_configured` |
 | `READ_API_TIMING_ASSUME_NO_TURNS` | GitHub env var `SESSION_READ_TIMING_ASSUME_NO_TURNS` | `true` only for canary workspaces a read-only count showed have no Neon `conversation_turns` (see "Session timing" below); unset = such sessions answer 501 `timing_turns_unknown` |
 

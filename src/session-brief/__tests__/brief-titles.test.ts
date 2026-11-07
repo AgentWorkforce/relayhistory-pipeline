@@ -241,7 +241,7 @@ describe("Neon backfill load (fixtures)", () => {
     await pointer(pg);
     await pointer(pg, { key: { ...KEY, sessionId: "s-2" } });
     await pointer(pg, { key: { ...KEY, sessionId: "s-3" } });
-    for (const id of ["s-6", "s-7", "s-8"]) await pointer(pg, { key: { ...KEY, sessionId: id } });
+    for (const id of ["s-6", "s-7", "s-8", "s-9"]) await pointer(pg, { key: { ...KEY, sessionId: id } });
     await pg.query("UPDATE sessions.session_index SET deleted_at = now() WHERE session_id = 's-3'");
     const fixture = [
       neon(),
@@ -276,8 +276,11 @@ describe("Neon backfill load (fixtures)", () => {
     const again = await loadBackfill(target(pg), fixture, "execute");
     expect(again.outcomes).toMatchObject({ inserted: 0, updated: 5 });
     const v = await verifyBackfill(target(pg), fixture);
-    // s-3 (erased), s-4 (no pointer), s-9 and s-10 (unkeyable) are missing; s-5 is blank (not compared).
-    expect(v).toMatchObject({ candidates: 10, compared: 9, equal: 5, different: 0, native: 0, missing: 4 });
+    // s-9 has a live pointer but no representable brief: missing (a defect, fails the run).
+    // s-3 (erased), s-4 (never copied) and s-10 (unkeyable) have no live pointer: reported
+    // as no_pointer residue, not failed. s-5 is blank (not compared).
+    expect(v).toMatchObject({ candidates: 10, compared: 9, equal: 5, different: 0, native: 0, missing: 1, no_pointer: 3 });
+    expect(v.samples.missing).toEqual([["org-a", "ws-a", "claude", "s-9"]]);
     expect(verifyPassed(v)).toBe(false);
     // Served through the read API function exactly as Neon's Cloud-visible (trimmed) titles.
     const served = await asReadApi(pg, ["org-a", "ws-a"], () => titlesFor(pg, "ws-a", [["claude", "s-1"], ["claude", "s-2"], ["claude", "s-3"]]));
@@ -300,7 +303,7 @@ describe("Neon backfill load (fixtures)", () => {
     expect(served.map((r) => [r.session_id, r.title])).toEqual([["sess/abc", "Fix login"]]);
     // ...and verify agrees.
     const v = await verifyBackfill(target(pg), fixture);
-    expect(v).toMatchObject({ equal: 1, missing: 0, different: 0 });
+    expect(v).toMatchObject({ equal: 1, missing: 0, no_pointer: 0, different: 0 });
     expect(verifyPassed(v)).toBe(true);
   });
 

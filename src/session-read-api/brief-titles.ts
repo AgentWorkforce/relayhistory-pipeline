@@ -96,7 +96,8 @@ export function briefTitleEntries(
     if (!wanted.has(key) || seen.has(key)) throw new BriefTitlesError("parse");
     seen.add(key);
     const title = typeof row.title === "string" ? row.title.trim() : "";
-    if (!title || title.length > BRIEF_TITLE_MAX_CHARS) continue;
+    // Code points, as the CHECK's char_length counts (not UTF-16 units).
+    if (!title || [...title].length > BRIEF_TITLE_MAX_CHARS) continue;
     out.push({ source: row.harness, sessionId: row.session_id, title });
   }
   return out;
