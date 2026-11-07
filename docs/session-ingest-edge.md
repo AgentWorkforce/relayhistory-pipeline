@@ -30,7 +30,7 @@ with the strict `true`/`false` parsing of `ALLOW_IN_CLUSTER_HTTP`):
 | Variable | Meaning |
 | --- | --- |
 | `SESSION_INGEST_EDGE_ENABLED` | `true` to enable; default off (above). |
-| `SESSION_INGEST_EDGE_ORIGIN` | This edge's public origin, exactly `scheme://host[:port]` (lowercase, no path, no trailing slash, no default port). Sent as the introspection `aud`; relaycontrol must echo it exactly. **The operator must add the same string to relaycontrol's `SELFHOST_INTROSPECT_AUDIENCES`**, or every token is refused as `audience` (401). |
+| `SESSION_INGEST_EDGE_ORIGIN` | This edge's public origin, exactly `scheme://host[:port]` (lowercase, no path, no trailing slash, no default port). Sent as the introspection `aud`; relaycontrol's echo must normalize to the same origin (the #313 client's `normalizedAudience`, also used to validate this value). Must be listed in relaycontrol's `SELFHOST_INTROSPECT_AUDIENCES`; see [Relaycontrol audiences](#relaycontrol-audiences-operator). |
 | `SESSION_INGEST_UPSTREAM_URL` | The session-ingest Worker, a bare origin (no path). https, loopback, or an in-cluster Service name (`<svc>.<ns>.svc[.cluster.local]`) with `ALLOW_IN_CLUSTER_HTTP=true` (`src/shared/destination-url.ts`). |
 | `RELAYCONTROL_INTROSPECT_URL` | relaycontrol's base URL (same transport rule); the client appends `/internal/v1/auth/introspect`. |
 | `RELAYCONTROL_INTROSPECT_SECRET` | The dedicated introspection service secret, from the secret store (1Password); never on disk. |
@@ -40,6 +40,29 @@ with the strict `true`/`false` parsing of `ALLOW_IN_CLUSTER_HTTP`):
 
 Startup errors name the variable, never its value. The edge makes no outbound
 call except to these two configured URLs.
+
+## Relaycontrol audiences (operator)
+
+relaycontrol only marks a token active for an `aud` in its
+`SELFHOST_INTROSPECT_AUDIENCES`: a comma-separated list, each entry normalized
+to `scheme://host[:port]` (lowercased, path and trailing slash dropped, default
+port dropped). When it is **unset**, the list is `[RELAYHISTORY_PUBLIC_URL]`
+only, so the edge's audience is not on it and every Desktop upload is refused
+as `audience` (401 `invalid_token`).
+
+With the edge enabled, list **both** origins:
+
+- the History public URL (`RELAYHISTORY_PUBLIC_URL`; what the read API and
+  pipeline send as `aud`), and
+- `SESSION_INGEST_EDGE_ORIGIN` (what this edge sends).
+
+Example (placeholders):
+`SELFHOST_INTROSPECT_AUDIENCES=https://history.example.test,https://ingest.example.test`.
+
+Optional preflight before setting `SESSION_INGEST_EDGE_ENABLED=true`: from
+inside the cluster, `GET` relaycontrol's `/readyz` and check that its
+`introspection.audiences` contains `SESSION_INGEST_EDGE_ORIGIN` (normalized).
+The edge does not run this check itself; it is an operator step.
 
 ## Routes (Amendment 4)
 
@@ -83,7 +106,7 @@ for `GET /v1/delivery/limits`, so Desktop tokens need both scopes there.
   cookies, `X-Machine-Id` or workspace header never reach the Worker. The query
   string is dropped (the signature covers the path only).
 - **Response:** the Worker's status, body and headers stream back, minus
-  hop-by-hop headers and `Set-Cookie`. `X-Request-Id` is the edge's id;
+  hop-by-hop headers, `Content-Length`, `Content-Encoding` and `Set-Cookie`. `X-Request-Id` is the edge's id;
   `X-Correlation-Id` is the client's (if it matches `[A-Za-z0-9._:-]{1,128}`)
   or the request id.
 
@@ -102,8 +125,8 @@ sha256(token) + aud, single-flight.
 | declared or streamed body over 2 MiB | 413 `delivery_too_large` |
 | no bearer | 401 `missing_authorization` |
 | bearer not `sh_at_` | 401 `invalid_token` (relaycontrol not called) |
-| `active:false` (any reason), audience mismatch, relaycontrol 400 | 401 `invalid_token` |
-| relaycontrol 401 (our secret refused), 404 (disabled), 5xx, network, timeout, malformed answer | 503 `relaycontrol_unavailable`, `Retry-After: 1` (as the #313 paths) |
+| `active:false` (any reason), principal not `desktop-user`, audience mismatch (normalized) | 401 `invalid_token` |
+| relaycontrol 400 (our request malformed), 401 (our secret refused; `introspect_unauthorized`), 404 (introspection disabled), 16 KiB answer cap, 5xx, network, timeout, malformed answer | 503 `relaycontrol_unavailable`, `Retry-After: 1` (as the #313 paths) |
 | token lacks the route's scope | 403 `forbidden` |
 | Worker unreachable | 503 `delivery_unavailable` |
 | dormant | 503 `not_configured` |
@@ -111,6 +134,13 @@ sha256(token) + aud, single-flight.
 Every refusal forwards nothing. Logs carry route, outcome, status, org and
 workspace ids and the correlation id; never the bearer, the introspection
 secret, the signing key, the identity header or the body.
+
+Whenever relaycontrol answers 400, 401 or 404 the edge surfaces **503**
+`relaycontrol_unavailable`, never 401: each is a deployment fault (our request,
+our secret, or introspection switched off), not a verdict on the caller's
+token, so Desktop must retry rather than discard a valid token. Only an
+`active:false` answer, a non-`desktop-user` principal or an audience mismatch
+is a 401.
 
 ## Extension point: origin_id
 

@@ -354,13 +354,20 @@ describe("401: not a usable relaycontrol token; nothing forwarded", () => {
     ["active:false expired", () => Response.json({ active: false, reason: "expired" })],
     ["active:false audience", () => Response.json({ active: false, reason: "audience" })],
     ["an active answer for another aud", () => Response.json(active({ aud: OTHER_ORIGIN }))],
-    ["relaycontrol 400 (our request malformed)", () => Response.json({ error: "invalid_request" }, { status: 400 })],
+    ["an active answer for an agent principal", () => Response.json(active({ principal_type: "agent" }))],
   ] as [string, Answer][])("%s is 401 invalid_token", async (_name, answer) => {
     const h = harness({ answer });
     const res = await h.send("/v1/delivery/batches", { body: await deliveryBody() });
     expect([res.status, await code(res)]).toEqual([401, "invalid_token"]);
     expect(h.rcCalls.length).toBe(1);
     expect(h.forwarded).toEqual([]);
+  });
+
+  test("relaycontrol echoing its own spelling of the same origin is accepted (normalized, as #313 compares)", async () => {
+    const h = harness({ answer: () => Response.json(active({ aud: "HTTPS://Edge.Example.Test:443/" })) });
+    const res = await h.send("/v1/delivery/batches", { body: await deliveryBody() });
+    expect(res.status).toBe(200);
+    expect(h.forwarded.length).toBe(1);
   });
 
   test("audience mismatch: an edge whose origin relaycontrol does not list is refused", async () => {
@@ -381,6 +388,7 @@ describe("503 relaycontrol_unavailable: fail closed, retryable, nothing forwarde
     ["503", () => new Response("", { status: 503 })],
     ["404 (introspection disabled)", () => Response.json({ error: "not_found" }, { status: 404 })],
     ["401 (our secret refused: a deployment error)", () => Response.json({ error: "unauthorized" }, { status: 401 })],
+    ["400 (our request malformed: a deployment error)", () => Response.json({ error: "invalid_request" }, { status: 400 })],
     ["a network error", () => Promise.reject(new TypeError("fetch failed"))],
     ["malformed JSON", () => new Response("not json", { status: 200 })],
     ["an active answer missing fields", () => Response.json({ active: true, sub: "u" })],

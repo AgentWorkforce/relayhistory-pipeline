@@ -5,8 +5,9 @@
  *   SESSION_INGEST_EDGE_ENABLED     unset | "" | "false" (default: dormant) | "true"; anything else is a
  *                                   startup error, so a typo never silently means either
  *   SESSION_INGEST_EDGE_ORIGIN      this edge's public origin, exactly scheme://host[:port]; sent as the
- *                                   introspection `aud` and required back verbatim. The operator lists the
- *                                   same string in relaycontrol's SELFHOST_INTROSPECT_AUDIENCES
+ *                                   introspection `aud`; relaycontrol's echo must normalize to it. The operator
+ *                                   lists it, with the History public URL, in relaycontrol's
+ *                                   SELFHOST_INTROSPECT_AUDIENCES
  *   SESSION_INGEST_UPSTREAM_URL     the session-ingest Worker, a bare origin (no path); https, loopback, or
  *                                   an in-cluster Service name with ALLOW_IN_CLUSTER_HTTP=true
  *   RELAYCONTROL_INTROSPECT_URL     relaycontrol's base URL (same transport rule)
@@ -19,6 +20,7 @@
  * above is required and validated at startup; errors name the variable, never
  * its value.
  */
+import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 
 export const EDGE_FLAG = "SESSION_INGEST_EDGE_ENABLED";
@@ -49,15 +51,13 @@ function requiredValue(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
-/** An exact bare http(s) origin (what relaycontrol compares and echoes as `aud`). */
+/**
+ * An exact bare http(s) origin: already in the normalized form relaycontrol
+ * and the #313 client compare (normalizedAudience), so what the edge sends as
+ * `aud` is exactly what both sides match.
+ */
 export function edgeOrigin(raw: string): string {
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error("96bulls: SESSION_INGEST_EDGE_ORIGIN must be an absolute http(s) origin");
-  }
-  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password || url.origin !== raw)
+  if (normalizedAudience(raw) !== raw)
     throw new Error("96bulls: SESSION_INGEST_EDGE_ORIGIN must be exactly scheme://host[:port] (lowercase, no path or trailing slash)");
   return raw;
 }

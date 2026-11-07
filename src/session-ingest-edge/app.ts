@@ -19,10 +19,11 @@
  *   3. Bearer: only a relaycontrol user access token (`sh_at_`), else 401.
  *   4. Introspection through the shared client (packages/pipeline/src/auth/
  *      relaycontrol.ts) with `aud` = SESSION_INGEST_EDGE_ORIGIN, no workspace
- *      and no machine (contract pin 28e9d95). Inactive / refused / relaycontrol
- *      400: 401 invalid_token. Timeout, network, 404 (disabled), 5xx, a
- *      malformed answer, or relaycontrol's 401 (our secret is wrong: a
- *      deployment error): 503 relaycontrol_unavailable.
+ *      and no machine (contract pin 28e9d95). Inactive, non-desktop-user
+ *      principal or audience mismatch (normalized, as #313 compares): 401
+ *      invalid_token. relaycontrol 400/401/404 (deployment faults), 5xx,
+ *      timeout, network, an oversized or malformed answer: 503
+ *      relaycontrol_unavailable (the #313 client's mapping, not re-derived).
  *   5. Scope: rth:sync for POST routes, rth:read for GET routes, else 403.
  *   6. Body read bounded by MAX_DELIVERY_BYTES on the wire (413), unmodified.
  *   7. originIdGate (no-op today; the one place a future origin_id machine gate goes).
@@ -39,8 +40,8 @@
  */
 import { Hono, type Context } from "hono";
 import {
-  isRelaycontrolSecretRefusal,
   isRelaycontrolToken,
+  normalizedAudience,
   RelaycontrolRejectedError,
   type RelaycontrolIntrospector,
 } from "@rhc/auth/relaycontrol.ts";
@@ -203,12 +204,14 @@ export function createIngestEdgeApp(deps: EdgeDeps) {
     try {
       auth = await live.introspector.verifyRelaycontrolToken(token, { aud: live.origin });
     } catch (error) {
-      if (error instanceof RelaycontrolRejectedError && !isRelaycontrolSecretRefusal(error))
+      // The #313 client already maps relaycontrol's 401 (our secret refused),
+      // 404, 5xx, timeouts and oversized answers to RelaycontrolUnavailableError.
+      if (error instanceof RelaycontrolRejectedError)
         throw new EdgeRefusal(401, "invalid_token", "invalid or expired token");
-      // Unavailable, our secret refused, or anything unexpected: fail closed, retryable.
+      // Unavailable or anything unexpected: fail closed, retryable.
       throw new EdgeRefusal(503, "relaycontrol_unavailable", "token introspection is unavailable");
     }
-    if (auth.historyOrigin !== live.origin || !auth.workspaceId || auth.migration)
+    if (normalizedAudience(auth.historyOrigin ?? "") !== normalizedAudience(live.origin) || !auth.workspaceId || auth.migration)
       throw new EdgeRefusal(401, "invalid_token", "invalid or expired token");
     // Only these four fields, only from relaycontrol's answer; never `control`.
     const identity: IngestIdentity = {
