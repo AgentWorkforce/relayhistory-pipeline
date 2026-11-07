@@ -134,8 +134,9 @@ CREATE TABLE sessions.babysitter_evidence_index(
  CHECK(operation='upsert' OR (machine_id IS NULL AND object_ref IS NULL AND object_name IS NULL AND line IS NULL AND expires_at_ms IS NULL))
 );
 -- Neon's native page order, C collation: (origin_id, record_id), newest revision first.
+-- The tie-break (registered_at DESC, claim_token) makes the same inputs always pick the same candidate.
 CREATE INDEX babysitter_evidence_index_page_idx ON sessions.babysitter_evidence_index
- (org_id,workspace_id,kind,origin_id COLLATE "C",record_id COLLATE "C",revision DESC);
+ (org_id,workspace_id,kind,origin_id COLLATE "C",record_id COLLATE "C",revision DESC,registered_at DESC,claim_token);
 CREATE INDEX babysitter_evidence_index_bucket_idx ON sessions.babysitter_evidence_index(org_id,workspace_id,machine_id,object_ref) WHERE machine_id IS NOT NULL;
 -- The privacy purge of permanent tombstones (fenced identities), deletes only.
 CREATE INDEX babysitter_evidence_index_tombstone_idx ON sessions.babysitter_evidence_index(org_id,workspace_id,user_id) WHERE operation='delete';
@@ -651,7 +652,7 @@ BEGIN
    SELECT w.org_id,w.workspace_id,w.machine_id,w.object_ref,w.object_name,x FROM jsonb_array_elements_text(p->'versions') x
   ON CONFLICT DO NOTHING;
  ELSIF v_act='checkpoint' THEN
-  IF p->'checkpoint'='null'::jsonb OR right(p->'checkpoint'->>'prefix',length(q.object_ref)+9)<>'/s='||q.object_ref||'/raw/' THEN
+  IF p->'checkpoint'='null'::jsonb OR right(p->'checkpoint'->>'prefix',length('/s='||q.object_ref||'/raw/'))<>'/s='||q.object_ref||'/raw/' THEN
    RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter retention: obligation checkpoint is for another directory';END IF;
   UPDATE sessions.babysitter_write_obligations o SET erase_checkpoint=p->'checkpoint',rev=v_rev WHERE o.org_id=w.org_id AND o.workspace_id=w.workspace_id
    AND o.machine_id=w.machine_id AND o.object_ref=w.object_ref AND o.object_name=w.object_name;
@@ -705,7 +706,7 @@ CREATE FUNCTION sessions.babysitter_evidence_page_for(p_workspace_id text,p json
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $page$
 DECLARE v_org text;r record;v_rows jsonb:='[]'::jsonb;v_emitted integer:=0;v_scanned integer:=0;v_limit integer;v_inc boolean;
  v_a0 text;v_a1 text;v_last jsonb;v_cur_o text;v_cur_r text;v_done boolean:=false;v_now timestamptz:=clock_timestamp();v_now_ms bigint;
- v_src text;v_sess text;v_any_sess boolean;v_newer boolean;v_bucket sessions.babysitter_retention_objects%ROWTYPE;
+ v_src text;v_sess text;v_any_sess boolean;v_newer boolean;v_bucket sessions.babysitter_retention_objects%ROWTYPE;v_fenced_rev bigint;
 BEGIN
  v_org:=sessions.session_directory_read_api_scope(p_workspace_id);
  PERFORM sessions.ingest_exact_keys(p,ARRAY['kind','source','sessionId','after','limit','includeDeleted']);
@@ -728,13 +729,13 @@ BEGIN
   SELECT i.* FROM sessions.babysitter_evidence_index i
   WHERE i.org_id=v_org AND i.workspace_id=p_workspace_id AND i.kind=p->>'kind'
    AND (v_a0 IS NULL OR (i.origin_id COLLATE "C",i.record_id COLLATE "C")>(v_a0 COLLATE "C",v_a1 COLLATE "C"))
-  ORDER BY i.origin_id COLLATE "C",i.record_id COLLATE "C",i.revision DESC
+  ORDER BY i.origin_id COLLATE "C",i.record_id COLLATE "C",i.revision DESC,i.registered_at DESC,i.claim_token
  LOOP
   IF v_cur_o IS DISTINCT FROM r.origin_id OR v_cur_r IS DISTINCT FROM r.record_id THEN
    -- The previous record is fully decided: the only point a bounded page may stop.
    IF v_cur_o IS NOT NULL THEN v_last:=jsonb_build_array(v_cur_o,v_cur_r);END IF;
    IF v_scanned>=1000 THEN RETURN jsonb_build_object('rows',v_rows,'more',true,'scannedTo',v_last);END IF;
-   v_cur_o:=r.origin_id;v_cur_r:=r.record_id;v_done:=false;
+   v_cur_o:=r.origin_id;v_cur_r:=r.record_id;v_done:=false;v_fenced_rev:=NULL;
   END IF;
   v_scanned:=v_scanned+1;
   CONTINUE WHEN v_done;
@@ -745,8 +746,15 @@ BEGIN
    OR NOT (EXISTS(SELECT 1 FROM sessions.ingest_lazy_ack_decisions d WHERE d.claim_token=r.claim_token AND d.candidate_digest=r.digest AND d.body_accepted)
         OR EXISTS(SELECT 1 FROM sessions.ingest_record_revisions c WHERE c.org_id=r.org_id AND c.workspace_id=r.workspace_id AND c.origin_id=r.origin_id
               AND c.record_id=r.record_id AND c.revision=r.revision AND c.revision_id=r.revision_id AND c.digest=r.digest AND c.user_id=r.user_id));
-  v_done:=true;   -- this record's newest accepted candidate decides; older rows are never served
-  CONTINUE WHEN sessions.babysitter_evidence_fenced(r.org_id,r.workspace_id,r.user_id,r.origin_id,r.source,r.session_id,r.fence_epoch,r.reset_epoch);
+  -- A FENCED accepted candidate (disable/reset since its claim) is never decisive by itself: an
+  -- unfenced accepted candidate of the SAME revision (re-sent after a re-enable/reset) may still
+  -- decide. But nothing OLDER than a fenced candidate is ever served (no superseded body exposed).
+  IF sessions.babysitter_evidence_fenced(r.org_id,r.workspace_id,r.user_id,r.origin_id,r.source,r.session_id,r.fence_epoch,r.reset_epoch) THEN
+   v_fenced_rev:=coalesce(v_fenced_rev,r.revision);
+   CONTINUE;
+  END IF;
+  IF v_fenced_rev IS NOT NULL AND r.revision<v_fenced_rev THEN v_done:=true;CONTINUE;END IF;
+  v_done:=true;   -- this record's newest unfenced accepted candidate decides; older rows are never served
   -- A newer committed revision (live or delete), indexed or not, wins: never a stale row.
   v_newer:=EXISTS(SELECT 1 FROM sessions.ingest_record_revisions c WHERE c.org_id=r.org_id AND c.workspace_id=r.workspace_id AND c.origin_id=r.origin_id
      AND c.record_id=r.record_id AND c.revision>r.revision)

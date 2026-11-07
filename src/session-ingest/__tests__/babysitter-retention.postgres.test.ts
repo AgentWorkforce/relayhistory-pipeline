@@ -550,6 +550,72 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     await configure(false, true);
   }, 60000);
 
+  test("finn P1: a FENCED accepted candidate is never decisive by itself, yet nothing older than it is exposed; a re-sent equal revision after re-enable serves; ties pick a stable winner", async () => {
+    const scratch = scratchStore();
+    const T = { orgId: "org-fx", workspaceId: "ws-fx", userId: "u-fx" };
+    try {
+      const h = hourAhead(45) - 1;
+      const d = sqlEvidenceDeps(readRun({ org: T.orgId, ws: T.workspaceId }) as never, () => scratch.store as never, (b) => readAll(b as never),
+        (bytes) => new Uint8Array(zstdDecompressSync(bytes)), (k) => objectKey(k) as never, "96bulls");
+      void d;
+      // (a) Through the REAL buffered path (immutable ACK decisions): rev 1 accepted in session fa, rev 2
+      //     accepted in session fb. fb is disabled (its fence epoch moves and, as ingest_lazy_clear does, its
+      //     native custody slot is cleared): the fenced rev 2 must NOT expose the superseded rev 1 body.
+      const X = { orgId: "org-fx", workspaceId: "ws-fx-buf", userId: "u-fx" };
+      const up = (rev: number, body: string, session: string) => record({ record_id: "fx-r", kind: "turn_receipt", revision: rev, revision_id: `fx-r:${rev}`, session_id: session, payload: trPayload(body, session) });
+      await deliverBuffered(X, scratch.store, [up(1, "OLD", "fa")], "fx-1");
+      await deliverBuffered(X, scratch.store, [up(2, "NEW", "fb")], "fx-2");
+      const dx = sqlEvidenceDeps(readRun({ org: X.orgId, ws: X.workspaceId }) as never, () => scratch.store as never, (b) => readAll(b as never),
+        (bytes) => new Uint8Array(zstdDecompressSync(bytes)), (k) => objectKey(k) as never, "96bulls");
+      const readX = async () => (await readBabysitterEvidence(dx, X, { kind: "turn_receipt", include_deleted: "true" }, evidenceAccount(X))).records.map((r) => `${r.record_id}:${r.revision}:${(r.payload as { id: string } | null)?.id ?? null}`);
+      expect(await readX()).toEqual(["fx-r:2:NEW"]);
+      await pool.query(`INSERT INTO sessions.ingest_fence_versions AS f(org_id,workspace_id,user_id,origin_id,source,session_id,epoch) VALUES($1,$2,$3,$4,'claude','fb',1)
+        ON CONFLICT(org_id,workspace_id,user_id,origin_id,source,session_id) DO UPDATE SET epoch=f.epoch+1`, [X.orgId, X.workspaceId, X.userId, ORIGIN]);
+      await pool.query(`UPDATE sessions.ingest_lazy_native_slots SET lineage=lineage+1,current_owner=NULL,current_source=NULL,current_session=NULL,current_revision=NULL,
+        current_digest=NULL,current_reset_epoch=NULL,current_fence_epoch=NULL,current_seat_key=NULL,current_legacy_key=NULL WHERE org_id=$1 AND workspace_id=$2 AND record_id='fx-r'`, [X.orgId, X.workspaceId]);
+      expect(await readX()).toEqual([]);
+      // (b) a re-sent EQUAL revision after the session is usable again (a new claim, a new fence epoch) is
+      //     an unfenced accepted candidate of the same revision: it serves, the fenced one does not hide it.
+      const S = { ...T, workspaceId: "ws-fx-2" };
+      const d2 = sqlEvidenceDeps(readRun({ org: S.orgId, ws: S.workspaceId }) as never, () => scratch.store as never, (b) => readAll(b as never),
+        (bytes) => new Uint8Array(zstdDecompressSync(bytes)), (k) => objectKey(k) as never, "96bulls");
+      const read2 = async () => (await readBabysitterEvidence(d2, S, { kind: "turn_receipt", include_deleted: "true" }, evidenceAccount(S))).records.map((r) => `${r.record_id}:${r.revision}:${(r.payload as { id: string } | null)?.id ?? null}`);
+      await deliverIndexed(S, scratch.store, [ev("eq-r", "fe", 3, h, "FIRST")]);
+      await disable(S, "fe"); await enable(S, "fe");
+      expect(await read2()).toEqual([]);
+      await deliverIndexed(S, scratch.store, [ev("eq-r", "fe", 3, h, "FIRST")]);
+      expect(await read2()).toEqual(["eq-r:3:FIRST"]);
+      // (c) a tie (two accepted, unfenced candidates of one revision): the same inputs always choose the same one.
+      const U = { ...T, workspaceId: "ws-fx-3" };
+      await deliverIndexed(U, scratch.store, [ev("tie-r", "ft", 1, h, "T")]);
+      await deliverIndexed(U, scratch.store, [ev("tie-r", "ft", 1, h, "T")]);
+      const pick = async () => (await readerPage({ org: U.orgId, ws: U.workspaceId }, U.workspaceId)).rows.map((r) => `${r.ref}/${(r as unknown as { object: string }).object}`);
+      const first = await pick();
+      for (let i = 0; i < 3; i++) expect(await pick()).toEqual(first);
+      const newest = (await pool.query("SELECT object_ref||'/'||object_name AS k FROM sessions.babysitter_evidence_index WHERE record_id='tie-r' ORDER BY registered_at DESC,claim_token LIMIT 1")).rows[0].k;
+      expect(first).toEqual([newest]);
+    } finally { scratch.done(); }
+  }, 60000);
+
+  test("finn P3: a real obligation checkpoint (the key's own raw/ directory) saves and resumes; another directory is refused", async () => {
+    await configure(true, false);
+    const t = tenantOf("u-ocp");
+    const ref = await refOfReg(t, bucket(715, "ocp-sess"));
+    await age(ref);
+    const objs = await claimAll();
+    const mine = objs.find((o) => o.ref === ref)!;
+    const object = (await sweeper().obligations(mine.leaseToken, { action: "list" })).objects![0]!;
+    const st = (await sweeper().obligations(mine.leaseToken, { action: "load", object })).obligation!;
+    const prefix = `${retentionTargets("96bulls", mine).prefix}raw/`;
+    const cp = { v: 1, bucket: "b", prefix, scope: "write-obligation:x", afterKey: `${prefix}${object}`, inKey: null };
+    const saved = await sweeper().obligations(mine.leaseToken, { action: "checkpoint", object, rev: st.rev, checkpoint: cp as never });
+    expect(saved.ok).toBe(true);
+    expect((await sweeper().obligations(mine.leaseToken, { action: "load", object })).obligation!.checkpoint).toEqual(cp);
+    expect(await code(sweeper().obligations(mine.leaseToken, { action: "checkpoint", object, rev: saved.rev!, checkpoint: { ...cp, prefix: prefix.replace(ref, "_bx2026010100-0000000000000000") } as never }))).toBe("ledger_input_refused");
+    await releaseAll(objs);
+    await configure(false, true);
+  });
+
   test("PERMANENT tombstones: beyond day 30 and after the payload bucket's physical erase, an old cursor still gets the delete; no bytes read; ordinary reads hide it; the privacy fence purges it", async () => {
     const scratch = scratchStore();
     const T = { orgId: "org-tomb", workspaceId: "ws-tomb", userId: "u-tomb" };
