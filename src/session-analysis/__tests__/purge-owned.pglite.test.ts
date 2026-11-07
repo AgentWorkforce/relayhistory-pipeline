@@ -164,6 +164,34 @@ test("caller pin: every SECURITY DEFINER in 046000 refuses a role it does not se
   // The authority path: its definer (owner) writes the proof in THIS transaction, then purges once.
   expect(await as(db, "bulls96_session_ingest", purge, `${guc}; SELECT sessions.session_analysis_purge_grant('org-a','ws-1','user-1')`)).toBe("ok");
   expect(await as(db, "bulls96_session_ingest", `${purge}; ${purge}`, `${guc}; SELECT sessions.session_analysis_purge_grant('org-a','ws-1','user-1')`)).toContain("no privacy-authority proof"); // consumed
+  // Lead hardening: EXECUTE drifted on BOTH the grant helper and the purge, plus a spoofed GUC:
+  // the ingest role still cannot mint its own proof (the helper runs as the invoker and requires
+  // the owning role), so the purge stays refused.
+  await db.exec("GRANT EXECUTE ON FUNCTION sessions.session_analysis_purge_grant(text,text,text) TO bulls96_session_ingest");
+  await db.exec("GRANT INSERT ON sessions.session_analysis_purge_authority TO bulls96_session_ingest");
+  expect(await as(db, "bulls96_session_ingest", "SELECT sessions.session_analysis_purge_grant('org-a','ws-1','user-1')", guc))
+    .toContain("minted only in an owner execution context");
+  expect(await as(db, "bulls96_session_ingest", `SELECT sessions.session_analysis_purge_grant('org-a','ws-1','user-1'); ${purge}`, guc))
+    .toContain("minted only in an owner execution context");
+  await db.exec("REVOKE ALL ON FUNCTION sessions.session_analysis_purge_grant(text,text,text) FROM bulls96_session_ingest");
+  await db.exec("REVOKE ALL ON sessions.session_analysis_purge_authority FROM bulls96_session_ingest");
+  await db.exec("DELETE FROM sessions.session_analysis_purge_authority"); // the stale earlier-transaction proof
+  // The authority path as lane A composes it: an owner-owned SECURITY DEFINER function (the C3
+  // begin -> reset/disable apply) sets its writer GUC, mints the proof and purges, invoked by the
+  // ingest role; the proof is consumed.
+  await db.exec(`CREATE FUNCTION sessions.test_c3_authority_apply(p_org text, p_ws text, p_user text) RETURNS integer
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, sessions, pg_temp AS $f$
+    DECLARE n integer;
+    BEGIN
+      PERFORM set_config('bulls96.privacy_authority_writer', 'authority', true);
+      PERFORM sessions.session_analysis_purge_grant(p_org, p_ws, p_user);
+      n := sessions.purge_session_analysis_for_owned(p_org, p_ws, p_user);
+      RETURN n;
+    END $f$;
+    GRANT EXECUTE ON FUNCTION sessions.test_c3_authority_apply(text,text,text) TO bulls96_session_ingest`);
+  expect(await as(db, "bulls96_session_ingest", "SELECT sessions.test_c3_authority_apply('org-a','ws-1','user-1')")).toBe("ok");
+  expect((await db.query("SELECT 1 FROM sessions.session_analysis_purge_authority")).rows).toHaveLength(0);
+  await db.exec("DROP FUNCTION sessions.test_c3_authority_apply(text,text,text)");
   // Without any grant the ingest role has no EXECUTE on the purge or the grant at all.
   await db.exec("REVOKE EXECUTE ON FUNCTION sessions.purge_session_analysis_for_owned(text,text,text) FROM bulls96_session_ingest");
   expect(await as(db, "bulls96_session_ingest", purge, guc)).toContain("permission denied");

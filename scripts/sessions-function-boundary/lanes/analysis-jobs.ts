@@ -42,7 +42,7 @@ export const analysisJobs: LaneManifest = {
     "sessions.session_analysis_neon_free(text,text,text)": { secdef: true, grants: ["service_role"] },
     "sessions.purge_session_analysis_for_owned(text,text,text,jsonb)": { secdef: true, grants: [] },
     "sessions.purge_session_analysis_for_owned(text,text,text)": { secdef: true, grants: [] },
-    "sessions.session_analysis_purge_grant(text,text,text)": { secdef: true, grants: [] },
+    "sessions.session_analysis_purge_grant(text,text,text)": { secdef: false, grants: [] },
     "sessions.session_analysis_require_caller(text[])": { secdef: false, grants: [] },
   },
   replaces: {},
