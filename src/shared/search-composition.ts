@@ -4,7 +4,7 @@ import { assertSearchServiceBinding, type SearchProjectionState, type SearchServ
 import { ledgeredSearchState, postgresSearchState } from "../session-pipeline/postgres-search-state.ts";
 import type { TenantRunner } from "../session-read-api/liveness.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
-import { admitPortableConnection, type PortableRole } from "./portable-connection-identity.ts";
+import { admitPortableConnection, type AdmissionOptions, type PortableRole } from "./portable-connection-identity.ts";
 
 /** A reviewed entrypoint supplies implementations, not a private import in the
  * public engine. Registering a name alone never provides completeness state. */
@@ -15,7 +15,7 @@ export interface SearchComposition {
   /** Optional, additive: awaited once by the Lambda assemblies (async init) before
    * any work, with the pool the composition's state uses. Throwing refuses the
    * service. Absent on v1 compositions, which keep their previous behavior. */
-  admit?(sql: SqlExecutor, role: PortableRole): Promise<void>;
+  admit?(sql: SqlExecutor, role: PortableRole, options?: AdmissionOptions): Promise<void>;
 }
 
 export function composeSearchService(composition: SearchComposition, input: SearchFactoryInput, role: "writer" | "reader", tenantRunner?: TenantRunner): SearchServiceBinding {
@@ -64,6 +64,6 @@ export function createLedgeredSearchComposition(options: { backendId: string; fr
       if (input.backend === "postgres") throw new Error("the ledgered profile has no Postgres content index");
       return ledgeredSearchState({ backendId, fromMs, reader: input.tenantRunner });
     },
-    admit: (sql, role) => admitPortableConnection(sql, role),
+    admit: (sql, role, admission) => admitPortableConnection(sql, role, admission),
   };
 }

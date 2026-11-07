@@ -26,26 +26,37 @@ async function database() {
   const name = `ps_state_${id}`;
   const rt = `ps_rt_${id}`;
   const other = `ps_other_${id}`;
+  // Cleanup is registered BEFORE any mutation and drops only what this run created
+  // (tracked flags), so an early setup failure cannot leak or touch anything else.
+  const created = { db: false, rt: false, other: false };
+  const clients: pg.Client[] = [];
   const admin = new pg.Client({ connectionString: url });
-  await admin.connect();
-  await admin.query(`CREATE DATABASE ${name}`);
-  await admin.query(`CREATE ROLE ${rt} NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS; CREATE ROLE ${other} NOLOGIN NOSUPERUSER NOBYPASSRLS`);
-  const target = new URL(url!);
-  target.pathname = `/${name}`;
-  const owner = new pg.Client({ connectionString: target.href });
-  await owner.connect();
+  clients.push(admin);
   cleanup.push(async () => {
-    await owner.end().catch(() => undefined);
-    await admin.query(`DROP DATABASE ${name} WITH (FORCE)`);
-    await admin.query(`DROP ROLE IF EXISTS ${rt}; DROP ROLE IF EXISTS ${other}`);
-    await admin.end();
+    for (const c of clients.slice(1).reverse()) await c.end().catch(() => undefined);
+    try {
+      if (created.db) await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+      if (created.rt) await admin.query(`DROP ROLE IF EXISTS ${rt}`);
+      if (created.other) await admin.query(`DROP ROLE IF EXISTS ${other}`);
+    } finally { await admin.end().catch(() => undefined); }
   });
+  await admin.connect();
+  await admin.query(`CREATE DATABASE ${name}`); created.db = true;
+  // The runtime role logs in itself (the fixture's loopback test-only auth); no password.
+  await admin.query(`CREATE ROLE ${rt} LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`); created.rt = true;
+  await admin.query(`CREATE ROLE ${other} NOLOGIN NOSUPERUSER NOBYPASSRLS`); created.other = true;
+  const at = (user?: string) => { const u = new URL(url!); u.pathname = `/${name}`; if (user) u.username = user; return u.href; };
+  const owner = new pg.Client({ connectionString: at() });
+  clients.push(owner);
+  await owner.connect();
   // What the selfhosted bootstraps do to this database (cf. migration-profile.test.ts).
   await owner.query(`DO $t$ BEGIN EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database()); END $t$`);
   await owner.query(`ALTER DEFAULT PRIVILEGES FOR ROLE ${(await owner.query<{ u: string }>("SELECT current_user AS u")).rows[0]!.u} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`);
-  const profile: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: true, runtimeRole: rt, runtimeLogin: false };
+  const profile: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: true, runtimeRole: rt, runtimeLogin: true };
   const client = { query: <R>(text: string, params?: unknown[]) => owner.query(text, params) as unknown as Promise<{ rows: R[] }> };
-  return { name, rt, other, owner, profile, migrate: () => runMigrations(client as never, { profile }) };
+  /** A separate authenticated connection as the runtime role itself. */
+  const runtime = async () => { const c = new pg.Client({ connectionString: at(rt) }); clients.push(c); await c.connect(); return c; };
+  return { name, rt, other, owner, profile, runtime, migrate: () => runMigrations(client as never, { profile }) };
 }
 
 const verifyAs = (c: pg.Client, role: string) => c.query("BEGIN").then(async () => {
@@ -63,19 +74,19 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     expect(marker.map(r => r.status)).toEqual(["pass"]);
     expect(await runtimeRoleViolations(t.owner as never, { mode: "local", role: t.rt, login: false }, { ledger: "sessions.__96bulls_migrations", marker: "sessions.__96bulls_role_validation" }, "post")).toEqual([]);
     await verifyAs(t.owner, t.rt);
-    // The writer is the runtime role, not the owner: SET ROLE drops every owner/superuser right.
-    await t.owner.query(`SET ROLE ${t.rt}`);
-    try {
-      await admitPortableConnection(t.owner as never, "writer");
-      const state = ledgeredSearchState({ backendId: "opensearch-v1", fromMs: 0 });
-      await t.owner.query("BEGIN");
-      await state.record(t.owner as never, { orgId: "org-a", workspaceId: "ws-a", harness: "codex", sessionId: "s1" }, { revision: 1, rows: 2, complete: true, at: new Date(0), canonicalSessionId: "s1" });
-      await t.owner.query("COMMIT");
-      const rows = (await t.owner.query<{ org_id: string; source_epoch: string }>("SELECT org_id, source_epoch FROM sessions.search_projection_state")).rows;
-      expect(rows).toEqual([{ org_id: "org-a", source_epoch: "-1" }]);
-      // TRUNCATE is not granted (RLS does not cover it).
-      await expect(t.owner.query("TRUNCATE sessions.search_projection_state")).rejects.toThrow(/permission denied/);
-    } finally { await t.owner.query("RESET ROLE"); }
+    // The writer is its own LOGIN connection: no owner, superuser or SET ROLE.
+    const w = await t.runtime();
+    expect((await w.query<{ u: string; s: string }>("SELECT current_user AS u, session_user AS s")).rows[0]).toEqual({ u: t.rt, s: t.rt });
+    await admitPortableConnection(w as never, "writer");
+    const state = ledgeredSearchState({ backendId: "opensearch-v1", fromMs: 0 });
+    await w.query("BEGIN");
+    await state.record(w as never, { orgId: "org-a", workspaceId: "ws-a", harness: "codex", sessionId: "s1" }, { revision: 1, rows: 2, complete: true, at: new Date(0), canonicalSessionId: "s1" });
+    await w.query("COMMIT");
+    const rows = (await w.query<{ org_id: string; source_epoch: string }>("SELECT org_id, source_epoch FROM sessions.search_projection_state")).rows;
+    expect(rows).toEqual([{ org_id: "org-a", source_epoch: "-1" }]);
+    // TRUNCATE is not granted (RLS does not cover it), nor DDL.
+    await expect(w.query("TRUNCATE sessions.search_projection_state")).rejects.toThrow(/permission denied|must be owner/);
+    await expect(w.query("ALTER TABLE sessions.search_projection_state DISABLE ROW LEVEL SECURITY")).rejects.toThrow(/must be owner/);
     // FORCE RLS: the owner role itself (not superuser) would see nothing; the read role is refused.
     await t.owner.query("SET ROLE bulls96_read_api");
     try { await expect(t.owner.query("SELECT 1 FROM sessions.search_projection_state")).rejects.toThrow(/permission denied/); }
@@ -92,6 +103,12 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     expect((await t.owner.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.map(r => r.status)).toEqual(["pending"]);
     await t.owner.query("REVOKE SELECT ON sessions.search_projection_state FROM PUBLIC");
     await t.migrate(); // restored: PASS again
+    // A drift only the portable storage verifier detects: its own refusal blocks PASS.
+    await t.owner.query("ALTER TABLE sessions.search_projection_state NO FORCE ROW LEVEL SECURITY");
+    await expect(t.migrate()).rejects.toThrow(/portable search storage is not in the approved shape: .*RLS is not FORCEd/);
+    expect((await t.owner.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.map(r => r.status)).toEqual(["pending"]);
+    await t.owner.query("ALTER TABLE sessions.search_projection_state FORCE ROW LEVEL SECURITY");
+    await t.migrate();
     // Standalone verifier: moving both policy and grant to another ordinary role is refused for the bound role.
     await t.owner.query(`REVOKE ALL ON sessions.search_projection_state FROM ${t.rt}; DROP POLICY bulls96_trusted_backend ON sessions.search_projection_state;
       GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.search_projection_state TO ${t.other};

@@ -31,9 +31,21 @@ export const PORTABLE_IDENTITY_SQL = `SELECT to_regclass($1) IS NOT NULL AS pres
     OR has_table_privilege(current_user, $1, 'DELETE') OR has_table_privilege(current_user, $1, 'TRUNCATE') END AS can_write
   FROM pg_roles r WHERE r.rolname = current_user`;
 
+export interface AdmissionOptions {
+  /** supabase/bootstrap/portable_search_storage_verify.sql (embedded in the artifact).
+   * When given, it runs after the identity checks with hoopdb.runtime_role bound to this
+   * connection's own current_user. `sql` must then be ONE transaction (the setting is
+   * transaction-local), never a pool. Writer only: the reader has no runtime identity. */
+  readonly storageVerifySql?: string;
+  /** HOOPDB_DB_MODE, bound as hoopdb.db_mode for the verifier. */
+  readonly dbMode?: string;
+  readonly table?: string;
+}
+
 /** Throws PortableConnectionRefused with a stable code; returns nothing on success.
  * Error text never carries connection strings or row data. */
-export async function admitPortableConnection(sql: SqlExecutor, role: PortableRole, table: string = LEDGERED_SEARCH_STATE_TABLE): Promise<void> {
+export async function admitPortableConnection(sql: SqlExecutor, role: PortableRole, options: AdmissionOptions = {}): Promise<void> {
+  const table = options.table ?? LEDGERED_SEARCH_STATE_TABLE;
   let row: IdentityRow | undefined;
   try {
     row = (await sql.query<IdentityRow>(PORTABLE_IDENTITY_SQL, [table])).rows[0];
@@ -47,4 +59,14 @@ export async function admitPortableConnection(sql: SqlExecutor, role: PortableRo
   if (!row.present) throw new PortableConnectionRefused("storage_missing");
   if (row.owner_member) throw new PortableConnectionRefused("storage_owner");
   if (role === "reader" && row.can_write) throw new PortableConnectionRefused("reader_can_write");
+  if (options.storageVerifySql !== undefined) {
+    if (role !== "writer") throw new PortableConnectionRefused("storage_verify_writer_only");
+    try {
+      await sql.query("SELECT set_config('hoopdb.runtime_role', current_user, true), set_config('hoopdb.db_mode', $1, true)", [options.dbMode ?? ""]);
+      await sql.query(options.storageVerifySql);
+    } catch (error) {
+      const code = (error as { code?: unknown })?.code;
+      throw new PortableConnectionRefused(typeof code === "string" ? `storage_unverified_sqlstate_${code}` : "storage_unverified");
+    }
+  }
 }
