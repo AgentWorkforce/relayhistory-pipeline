@@ -42,6 +42,23 @@ export function analysisResultKey(prefix: string, jobId: string, digest: string)
   return `${prefix}${jobId}/${digest}.json`;
 }
 
+/** The result's bytes and digest; the key is planned from these before any write. */
+export function encodeAnalysisResult(result: unknown): { bytes: Uint8Array; sha256: string } {
+  const bytes = new TextEncoder().encode(JSON.stringify(result));
+  if (bytes.length > ANALYSIS_RESULT_MAX_BYTES) throw new AnalysisResultError("analysis_result_bound");
+  return { bytes, sha256: sha256(bytes) };
+}
+
+/** Create-only put of planned bytes at a reserved key, then a byte-exact read-back. */
+export async function putAnalysisResult(store: ObjectStore, key: string, bytes: Uint8Array, digest: string): Promise<void> {
+  const ack = await store.put(objectKey(key), bytes, { ifNoneMatch: true, contentSha256: digest, contentType: "application/json" });
+  if (ack.size !== bytes.length || ack.contentSha256 !== digest)
+    throw new AnalysisResultError("analysis_write_ack_invalid", true);
+  const read = await readAll(await store.get(objectKey(key)));
+  if (read.length !== bytes.length || sha256(read) !== digest)
+    throw new AnalysisResultError("analysis_write_verification_failed", true);
+}
+
 /** Create-only write, then a read-back that must match byte for byte. */
 export async function writeAnalysisResult(
   store: ObjectStore,

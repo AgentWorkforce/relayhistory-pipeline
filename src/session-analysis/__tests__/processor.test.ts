@@ -36,12 +36,15 @@ import {
   type AnalysisJobStore,
 } from "../processor.ts";
 import {
+  putAnalysisResult,
   analysisResultKey,
   analysisResultPrefix,
   readAnalysisResult,
   writeAnalysisResult,
 } from "../results.ts";
 import {
+  SESSION_ANALYSIS_SUMMARY_MODEL_VERSION,
+  SESSION_ANALYSIS_SUMMARY_VERSION,
   SESSION_ANALYSIS_MODEL_VERSION,
   SESSION_ANALYSIS_RESULT_SCHEMA_VERSION,
   SESSION_ANALYSIS_VERSION,
@@ -100,6 +103,7 @@ function projectedRows(recs = records()): CanonicalScopeRows {
   return {
     exists: true,
     generation: "a".repeat(64),
+    legacyCoverage: { version: 1, tables: ["conversation_turns", "session_links", "session_outcomes"] },
     rows: projection.rows.map(({ table, row }) => ({
       table,
       row: { org_id: SCOPE.orgId, workspace_id: SCOPE.workspaceId, ...row },
@@ -137,6 +141,14 @@ function fakeTransport(seen: ModelTransportRequest[] = []) {
   return {
     async complete(request: ModelTransportRequest): Promise<ModelTransportResponse> {
       seen.push(request);
+      if (request.schemaName === "session_summary")
+        return {
+          outputText: JSON.stringify({ title: "Fix the flaky queue test", description: "Fixed a race in acks.", state: "completed" }),
+          inputTokens: 30,
+          outputTokens: 10,
+          providerRequestId: "resp-0",
+          model: "gpt-5.6-luna-2026-10-01",
+        };
       const input = JSON.parse(request.input) as { references: Array<{ id: string }> };
       return {
         outputText: JSON.stringify({ title: "Fix the flaky queue test", ...analysisFor(input.references[0]!.id) }),
@@ -155,6 +167,9 @@ const job = (over: Partial<AnalysisJob> = {}): AnalysisJob => ({
   analysisVersion: SESSION_ANALYSIS_VERSION,
   schemaVersion: SESSION_ANALYSIS_RESULT_SCHEMA_VERSION,
   modelVersion: SESSION_ANALYSIS_MODEL_VERSION,
+  summaryVersion: SESSION_ANALYSIS_SUMMARY_VERSION,
+  summaryModelVersion: SESSION_ANALYSIS_SUMMARY_MODEL_VERSION,
+  sourceRevision: "r".repeat(64),
   attempts: 1,
   leaseToken: "8d1c8f4e-1b0a-4f3e-9a51-0c2e3d4f5a6b",
   ...over,
@@ -235,11 +250,17 @@ describe("canonical evidence adapter", () => {
       loadSessionSource(deps({ harnesses: async () => ["claude", "codex"] }), SCOPE),
     ).rejects.toBeInstanceOf(SessionSourceIncompleteError);
     await expect(
-      loadSessionSource(deps({ snapshot: async () => ({ exists: false, generation: "x", rows: [] }) }), SCOPE),
+      loadSessionSource(deps({ snapshot: async () => ({ exists: false, generation: "x", legacyCoverage: null, rows: [] }) }), SCOPE),
     ).rejects.toBeInstanceOf(SessionSourceNotFoundError);
     await expect(loadSessionSource(deps(), { ...SCOPE, sessionId: " " })).rejects.toBeInstanceOf(
       SessionSourceNotFoundError,
     );
+  });
+
+  test("refuses a scope without the legacy coverage marker unless the operator assumes no turns", async () => {
+    const rows = { ...projectedRows(), legacyCoverage: null };
+    await expect(loadSessionSource(deps({}, rows), SCOPE)).rejects.toThrow("legacy evidence coverage is unknown");
+    expect((await loadSessionSource(deps({}, rows), SCOPE, { assumeNoLegacyTurns: true })).sourceProvider).toBe("claude");
   });
 
   test("refuses a projected row from another source", async () => {
@@ -253,24 +274,38 @@ describe("processSessionAnalysis", () => {
   test("produces relayhistory's v1 job result over canonical evidence", async () => {
     const seen: ModelTransportRequest[] = [];
     const out = await processSessionAnalysis(job(), { evidence: deps(), transport: fakeTransport(seen) });
-    expect(seen).toHaveLength(1);
-    expect(seen[0]!.model).toBe("gpt-5.4");
-    expect(seen[0]!.schemaName).toBe("session_analysis");
+    // Both halves from one evidence read: relayhistory's brief, then the full analysis.
+    expect(seen.map((r) => [r.schemaName, r.model])).toEqual([
+      ["session_summary", "gpt-5.6-luna"],
+      ["session_analysis", "gpt-5.4"],
+    ]);
+    expect(out.result.brief).toMatchObject({
+      schemaVersion: 1,
+      promptVersion: "session-summary-v3",
+      title: "Fix the flaky queue test",
+      state: "completed",
+      messageCount: 3,
+      backend: { model: "gpt-5.6-luna-2026-10-01", inputTokens: 30, outputTokens: 10 },
+    });
+    expect(out.result.brief.inputFingerprint).toMatch(/^[0-9a-f]{64}$/);
     expect(out.harness).toBe("claude");
     expect(out.result.schemaVersion).toBe(1);
     expect(out.result.analysisVersion).toBe(SESSION_ANALYSIS_VERSION);
     expect(out.result.sourceFingerprint).toBe(out.sourceFingerprint);
     expect(out.result.analysis.title).toBe("Fix the flaky queue test");
     expect(out.result.analysis.backend?.requestId).toBe(JOB_ID);
-    expect(out.inputTokens).toBe(120);
-    expect(decodeSessionAnalysisResult(out.result, { source: "claude", sessionId: "s-1" }).status).toBe("ready");
+    expect(out.inputTokens).toBe(150);
+    // The v1 result is relayhistory's `a.result || {brief: b.result}`; the analysis channel
+    // (what decodeSessionAnalysisResult reads) is the envelope without `brief`.
+    const { brief: _brief, ...envelope } = out.result;
+    expect(decodeSessionAnalysisResult(envelope, { source: "claude", sessionId: "s-1" }).status).toBe("ready");
   });
 
   test("refuses an unsupported version before any read or model call", async () => {
     let reads = 0;
     const seen: ModelTransportRequest[] = [];
     await expect(
-      processSessionAnalysis(job({ analysisVersion: "session-analysis-v2.3:x" }), {
+      processSessionAnalysis(job({ summaryModelVersion: "gpt-4o" }), {
         evidence: deps({ harnesses: async () => (reads++, ["claude"]) }),
         transport: fakeTransport(seen),
       }),
@@ -311,7 +346,7 @@ describe("results in object storage", () => {
 });
 
 describe("runAnalysisJob", () => {
-  function memoryStore(claimed: AnalysisJob | null, opts: { lose?: boolean } = {}) {
+  function memoryStore(claimed: AnalysisJob | null, opts: { lose?: boolean; refuseReserve?: boolean } = {}) {
     const calls: Array<[string, unknown]> = [];
     const results = tempStore();
     const store: AnalysisJobStore = {
@@ -319,9 +354,16 @@ describe("runAnalysisJob", () => {
         calls.push(["claim", o]);
         return claimed;
       },
-      writeResult: (j, out) => writeAnalysisResult(results, PREFIX, j.id, out.result),
+      async reserve(j, _out, planned) {
+        calls.push(["reserve", planned.sha256]);
+        return opts.refuseReserve ? null : analysisResultKey(PREFIX, j.id, planned.sha256);
+      },
+      async put(key, bytes, sha) {
+        calls.push(["put", key]);
+        await putAnalysisResult(results, key, bytes, sha);
+      },
       async complete(input) {
-        calls.push(["complete", { jobId: input.jobId, key: input.stored.key, fp: input.output.sourceFingerprint }]);
+        calls.push(["complete", { jobId: input.job.id, key: input.stored.key, fp: input.output.sourceFingerprint }]);
         return !opts.lose;
       },
       async fail(input) {
@@ -337,9 +379,15 @@ describe("runAnalysisJob", () => {
     const ok = memoryStore(job());
     expect(await runAnalysisJob(ok.store, { evidence: deps(), transport: fakeTransport() })).toBe("completed");
     expect(ok.calls[0]).toEqual(["claim", { leaseSeconds: 600 }]);
-    expect(ok.calls[1]![0]).toBe("complete");
+    expect(ok.calls.slice(1).map((c) => c[0])).toEqual(["reserve", "put", "complete"]);
     const lost = memoryStore(job(), { lose: true });
     expect(await runAnalysisJob(lost.store, { evidence: deps(), transport: fakeTransport() })).toBe("lease-lost");
+  });
+
+  test("erase-safe: nothing is written when the reservation fails (lease, liveness or revision)", async () => {
+    const refused = memoryStore(job(), { refuseReserve: true });
+    expect(await runAnalysisJob(refused.store, { evidence: deps(), transport: fakeTransport() })).toBe("lease-lost");
+    expect(refused.calls.map((c) => c[0])).toEqual(["claim", "reserve"]);
   });
 
   test("persists only controlled codes", async () => {
