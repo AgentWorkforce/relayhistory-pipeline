@@ -163,3 +163,59 @@ test("M1 (a)+(b), production default: a claim hitting publish_reserved is a tran
   st.cancelErasures([PFX]);
   expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 5)).toEqual([]);
 });
+
+test("P1 mixed-mode admission: A opens OFF, THEN B opens ON and records an unknown -> A's lease, queue mutations and erase step are REFUSED", async () => {
+  const path = await tmp("e3-flag-mixed-");
+  const A = new SyncState(path, { obligations: false });
+  A.enqueueErasure([{ key: PFX, kind: "prefix", org_id: "org-1", reason: "fenced" }], 1); // fine: nothing used yet
+  const B = new SyncState(path, { obligations: true });
+  B.dispatchWrite(`${PFX}raw/x.zst`, "exporter:1"); // ON records a tracked unknown
+  const refused = (f: () => unknown) => { try { f(); return null; } catch (e) { return (e as { code?: string }).code; } };
+  expect(refused(() => A.acquireLease(PFX, "eraser:A"))).toBe("obligations_state_in_use");
+  expect(refused(() => A.renewLease(PFX, "eraser:A"))).toBe("obligations_state_in_use");
+  expect(refused(() => A.enqueueErasure([{ key: PFX, kind: "prefix", org_id: "org-1", reason: "fenced" }], 2))).toBe("obligations_state_in_use");
+  expect(refused(() => A.cancelErasures([PFX]))).toBe("obligations_state_in_use");
+  expect(refused(() => A.erasureDone(PFX, 1))).toBe("obligations_state_in_use");
+  expect(refused(() => A.erasureFailed(PFX, "x"))).toBe("obligations_state_in_use");
+  // The OFF job's erase step refuses before any external effect: nothing is deleted.
+  const s = new FakeS3Versions();
+  s.put(`${PFX}raw/b=000001.ndjson.zst`, Date.parse("2026-11-01T00:00:00Z"));
+  const job = new ErasureJob(auth(), A, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => Date.now(), async () => {});
+  await job.drain().catch(() => undefined);
+  expect(s.deletes).toEqual([]);
+  expect(B.unresolvedWrites(PFX).length).toBe(1); // the tracked unknown is preserved
+  expect(B.nextErasures(Number.MAX_SAFE_INTEGER, 5).map((e) => e.key)).toEqual([PFX]);
+  A.close();
+  B.close();
+});
+
+test("P2: releasing a LARGE, SPARSE-present reservation set reads <= 1000 rows per transaction and resumes from a proof-bound cursor", async () => {
+  const st = new SyncState(await tmp("e3-flag-rel-"), { obligations: true });
+  const D = `${PFX}raw/`;
+  const vs = Array.from({ length: 2_500 }, (_, i) => ({ key: `${D}b=${String(i).padStart(6, "0")}.zst`, versionId: `v${i}` }));
+  for (let i = 0; i < vs.length; i += 500) expect(st.reserveErase(D, st.obligationRev(D), "S", vs.slice(i, i + 500)).ok).toBe(true);
+  const hw = st.reservationHighWater(D);
+  // Only ONE version (the last) is still present: a sparse match.
+  const last = vs[vs.length - 1]!;
+  let seen = 0;
+  const present = (k: string, v: string) => { seen += 1; return k === last.key && v === last.versionId; };
+  let rev = st.obligationRev(D);
+  const p1 = st.releasePresentPage(D, "S", undefined, present, hw, undefined, rev, 1000, "proof-1");
+  expect(p1).toMatchObject({ released: 0, done: false, ok: true });
+  expect(seen).toBe(1000); // rows READ per transaction are bounded, not just the releases
+  expect(st.releaseCursor("S")).toEqual([vs[999]!.key, "v999"]);
+  rev = p1.rev;
+  const p2 = st.releasePresentPage(D, "S", undefined, present, hw, undefined, rev, 1000, "proof-1");
+  expect(seen).toBe(2000);
+  const p3 = st.releasePresentPage(D, "S", undefined, present, hw, undefined, p2.rev, 1000, "proof-1");
+  expect(p3).toMatchObject({ released: 1, done: true, ok: true });
+  expect(seen).toBe(2500);
+  expect(st.releaseCursor("S")).toBeNull();
+  expect(st.reservationsAt(last.key)).toEqual([]);
+  // A different proof discards a saved cursor (restart), never resuming a foreign workset.
+  const q = st.releasePresentPage(D, "S", undefined, () => false, hw, undefined, st.obligationRev(D), 1000, "proof-A");
+  expect(q.done).toBe(false);
+  let seen2 = 0;
+  st.releasePresentPage(D, "S", undefined, () => { seen2 += 1; return false; }, hw, undefined, q.rev, 1000, "proof-B");
+  expect(seen2).toBe(1000); // restarted from the start under proof-B
+});

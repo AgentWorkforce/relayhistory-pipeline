@@ -119,6 +119,26 @@ export class SyncState {
     if (rows("write_touch") || rows("write_invocations") || rows("erase_reservations") || rows("write_published"))
       throw Object.assign(new Error("this state file's obligation state is in use: S3X_OBLIGATIONS cannot be turned off for it"), { code: "obligations_state_in_use" });
   }
+  /**
+   * The ENFORCED cross-process mode interlock for an OFF handle: the persisted "obligations used" marker is the
+   * never-deleted write_touch stamp an ON handle writes atomically (trigger) on its first use. Every OFF lease
+   * acquisition / renewal / queue mutation re-reads it INSIDE its own IMMEDIATE transaction, and the OFF erase path
+   * before every page, so a live OFF handle (opened before an ON handle recorded state, e.g. a rolling restart) can
+   * never act once obligations are in use. A no-op for an ON handle.
+   */
+  assertModeAllowed() {
+    if (!this.obligations) this.#refuseUsedObligationsWhenOff();
+  }
+  /** Off: run a single-statement effect inside an IMMEDIATE transaction behind the interlock; on: unchanged. */
+  #offGuarded<T>(fn: () => T): T {
+    if (this.obligations) return fn();
+    let out!: T;
+    this.#tx(() => {
+      this.#refuseUsedObligationsWhenOff();
+      out = fn();
+    });
+    return out;
+  }
 
   /** The obligation schema, triggers, lease generation column and genesis (only with S3X_OBLIGATIONS on). */
   #openObligations() {
@@ -357,6 +377,7 @@ export class SyncState {
         | undefined;
       if (row && row.holder !== holder && now - Number(row.at) < ttlMs) return;
       if (!this.obligations) {
+        this.#refuseUsedObligationsWhenOff();
         this.db
           .prepare("INSERT INTO leases (prefix, holder, at) VALUES (?, ?, ?) ON CONFLICT (prefix) DO UPDATE SET holder = excluded.holder, at = excluded.at")
           .run(prefix, holder, now);
@@ -381,7 +402,7 @@ export class SyncState {
 
   /** Extend a lease this holder still has; false if it was taken over. */
   renewLease(prefix: string, holder: string, now = Date.now()): boolean {
-    return Number(this.db.prepare("UPDATE leases SET at = ? WHERE prefix = ? AND holder = ?").run(now, prefix, holder).changes) === 1;
+    return this.#offGuarded(() => Number(this.db.prepare("UPDATE leases SET at = ? WHERE prefix = ? AND holder = ?").run(now, prefix, holder).changes) === 1);
   }
 
   /** Leases of a holder kind other than `current` (a previous run of the same single process). */
@@ -400,6 +421,7 @@ export class SyncState {
   cancelErasures(keys: Iterable<string>) {
     const q = this.db.prepare("DELETE FROM erasures WHERE key = ?");
     this.#tx(() => {
+      if (!this.obligations) this.#refuseUsedObligationsWhenOff();
       for (const k of keys) q.run(k);
     });
   }
@@ -418,6 +440,7 @@ export class SyncState {
     // keys under its "/"-terminated prefix.
     if (!this.obligations) {
       this.#tx(() => {
+        this.#refuseUsedObligationsWhenOff();
         for (const i of items) q.run(i.key, i.kind, i.org_id, i.reason, at);
       });
       return;
@@ -449,7 +472,7 @@ export class SyncState {
 
   erasureDone(key: string, enqueuedAt: number) {
     // Only if not re-queued meanwhile.
-    this.db.prepare("DELETE FROM erasures WHERE key = ? AND enqueued_at = ?").run(key, enqueuedAt);
+    this.#offGuarded(() => this.db.prepare("DELETE FROM erasures WHERE key = ? AND enqueued_at = ?").run(key, enqueuedAt));
   }
 
   /**
@@ -718,7 +741,7 @@ export class SyncState {
    * never wedged behind a reservation for a version nobody deleted.
    */
   releasePresentPage(prefix: string, scope: string, exactKey: string | undefined, present: (key: string, versionId: string) => boolean, maxSeq: number,
-    lease?: { prefix: string; holder: string; gen: string }, expectRev?: number, limit = 1000): { released: number; done: boolean; ok: boolean; rev: number } {
+    lease?: { prefix: string; holder: string; gen: string }, expectRev?: number, limit = 1000, proofId = "unbound"): { released: number; done: boolean; ok: boolean; rev: number } {
     let out = { released: 0, done: false, ok: false, rev: -1 };
     this.#tx(() => {
       // Compare-and-set on the non-reverting revision + the eraser's lease, like every retirement page.
@@ -726,20 +749,31 @@ export class SyncState {
         out = { released: 0, done: false, ok: false, rev: this.obligationRev(prefix) };
         return;
       }
+      // SQL-bounded SCAN (LIMIT on the rows read, not the releases), after a durable cursor bound to the proof workset.
+      const ck = `release_cursor:${scope}`;
+      const saved = JSON.parse(this.meta(ck) ?? "null") as { proof: string; pos: [string, string] } | null;
+      const cur = saved && saved.proof === proofId ? saved.pos : null;
       const where = exactKey !== undefined ? "key = ?" : SyncState.#under;
-      const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${where} AND scope = ? AND seq <= ? ORDER BY key, version_id`).all(
-        ...(exactKey !== undefined ? [exactKey] : SyncState.#u(prefix)), scope, maxSeq) as { key: string; version_id: string }[];
+      const after = cur ? "AND (key > ? OR (key = ? AND version_id > ?))" : "";
+      const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${where} AND scope = ? AND seq <= ? ${after} ORDER BY key, version_id LIMIT ?`).all(
+        ...(exactKey !== undefined ? [exactKey] : SyncState.#u(prefix)), scope, maxSeq, ...(cur ? [cur[0], cur[0], cur[1]] : []), limit) as { key: string; version_id: string }[];
       const del = this.db.prepare("DELETE FROM erase_reservations WHERE key = ? AND version_id = ?");
       let released = 0;
       for (const r of rows) {
-        if (released >= limit) break;
         if (!present(r.key, r.version_id)) continue;
         del.run(r.key, r.version_id);
         released += 1;
       }
-      out = { released, done: released < limit, ok: true, rev: this.obligationRev(prefix) };
+      const done = rows.length < limit;
+      if (done) this.db.prepare("DELETE FROM meta WHERE k = ?").run(ck);
+      else this.setMeta(ck, JSON.stringify({ proof: proofId, pos: [rows[rows.length - 1]!.key, rows[rows.length - 1]!.version_id] }));
+      out = { released, done, ok: true, rev: this.obligationRev(prefix) };
     });
     return out;
+  }
+  /** Rows the most recent release page read (tests: the scan is bounded). */
+  releaseCursor(scope: string): [string, string] | null {
+    return (JSON.parse(this.meta(`release_cursor:${scope}`) ?? "null") as { pos: [string, string] } | null)?.pos ?? null;
   }
   /** Unbounded convenience over the paged retirement (tests): every page, in order. */
   retireReservations(prefix: string, absent: (key: string, versionId: string) => boolean, scope?: string) {
@@ -772,9 +806,9 @@ export class SyncState {
   }
 
   erasureFailed(key: string, code: string, at = Date.now()) {
-    this.db
+    this.#offGuarded(() => this.db
       .prepare("UPDATE erasures SET attempts = attempts + 1, error = ?, next_try = ? + min(3600000, 60000 * (1 << min(attempts, 6))) WHERE key = ?")
-      .run(code, at, key);
+      .run(code, at, key));
   }
 
   erasureBacklog(now = Date.now()): { queued: number; oldestAgeH: number | null; failing: number } {

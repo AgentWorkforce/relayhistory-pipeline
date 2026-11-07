@@ -132,6 +132,15 @@ export class ErasureJob {
     // S3X_OBLIGATIONS off: the SAME strict canonical paged eraser (no permissive fallback), without the obligation
     // protocol (no reservations, invocations, retirement or genesis gate): done = a fresh strict zero inventory.
     const ob = this.state.obligations;
+    if (!ob) {
+      // The cross-process mode interlock, before ANY external effect and before every page's deletes.
+      const inner = authorize;
+      authorize = async () => {
+        this.state.assertModeAllowed();
+        await inner();
+      };
+      this.state.assertModeAllowed();
+    }
     let rev = ob ? this.state.obligationRev(prefix) : 0;
     let lost = false;
     const budget = () => ({ deadlineAt: this.now() + ERASE_STEP_DEADLINE_MS });
@@ -259,7 +268,7 @@ export class ErasureJob {
     // next run re-reserves what it deletes), so the exporter's claim / re-export is not wedged behind them.
     for (;;) {
       await authorize();
-      const rel = this.state.releasePresentPage(prefix, scope, exactKey, (key, versionId) => keyFilter(key) && (listed.get(key)?.has(versionId) ?? false), proofSeq, lease, rev);
+      const rel = this.state.releasePresentPage(prefix, scope, exactKey, (key, versionId) => keyFilter(key) && (listed.get(key)?.has(versionId) ?? false), proofSeq, lease, rev, 1000, proofId);
       if (!rel.ok) {
         this.counters.reservationsRefused += 1;
         return { status: "refused", deleted: step.deleted, remaining, rev: rel.rev };
