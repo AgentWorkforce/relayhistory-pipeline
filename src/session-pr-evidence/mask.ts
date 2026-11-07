@@ -29,8 +29,8 @@ export function maskRecords(records: readonly RelayhistoryStreamRecord[], mask: 
 /**
  * The evidence input rows of a history scope: delivery records are masked raw and then projected
  * (catalog collapse happens over admitted records only). Direct `convergence_event` lines are
- * already rows; the reader projected them with their own manifest's identity, so those rows are
- * kept when their raw record is admitted.
+ * already rows; the reader projected them with their own manifest's identity, so a row is kept
+ * only when its own copy (origin machine + event id) was admitted.
  */
 export function maskedProjection(
   read: { records: readonly RelayhistoryStreamRecord[]; projectionRows: readonly PrEvidenceProjectionRow[] },
@@ -39,14 +39,18 @@ export function maskedProjection(
 ): PrEvidenceProjectionRow[] {
   const admitted = maskRecords(read.records, mask);
   const delivery = admitted.filter((r) => r.kind !== CONVERGENCE_EVENT_KIND);
-  const direct = new Set(admitted.filter((r) => r.kind === CONVERGENCE_EVENT_KIND).map((r) => r.record_id));
-  const allDirect = new Set(read.records.filter((r) => r.kind === CONVERGENCE_EVENT_KIND).map((r) => r.record_id));
+  // Direct lines are admitted per COPY: (origin, record id), after the winner's origin+revision check.
+  // A projected direct row's origin is `machine:<machine_id>` (directEvent enforces it), so a
+  // losing copy from another machine with the same event id is never kept.
+  const key = (origin: string, id: string) => `${origin}\u001f${id}`;
+  const direct = new Set(admitted.filter((r) => r.kind === CONVERGENCE_EVENT_KIND).map((r) => key(r.origin_id, r.record_id)));
   const projected = projectRelayhistorySession(delivery, {
     workspaceId: scope.workspaceId, source: scope.source, sessionId: scope.sessionId,
     // Used only to validate direct lines, which are not passed here.
     machineId: "pr-evidence", userId: "",
   }).rows;
   const directRows = read.projectionRows.filter((r) =>
-    r.table === "convergence_events" && allDirect.has(String(r.row.event_id)) && direct.has(String(r.row.event_id)));
+    r.table === "convergence_events" && typeof r.row.machine_id === "string" &&
+    direct.has(key(`machine:${r.row.machine_id}`, String(r.row.event_id))));
   return [...projected, ...directRows];
 }

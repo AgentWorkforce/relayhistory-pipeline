@@ -57,3 +57,25 @@ test("moved tool calls never contribute; delete winners and other-origin or othe
   expect(maskRecords([r], new Map([[r.record_id, { originId: "o1", operation: "upsert" as const, revision: "2" }]]))).toEqual([]);
   expect(maskRecords([r], new Map([[r.record_id, { originId: "o1", operation: "upsert" as const, revision: "1" }]]))).toEqual([r]);
 });
+
+test("two manifests with the same direct event ids: only the winning machine's copy contributes", () => {
+  // Raw direct `convergence_event` copies of e1 (call) and e2 (result) from machine:m1 and machine:m2.
+  const raw = (origin: string, id: string) => ({ kind: "convergence_event", origin_id: origin, record_id: id, revision: "1",
+    operation: "upsert" as const, received_at: "2026-10-30 12:00:00.000000+00", payload: {} });
+  const records = [raw("machine:m1", "e1"), raw("machine:m1", "e2"), raw("machine:m2", "e1"), raw("machine:m2", "e2")];
+  // The reader's projected rows for each machine's copy (directEvent keeps the line's machine_id/event_id).
+  const row = (machine: string, id: string, extra: Record<string, unknown>) => ({ table: "convergence_events", row: {
+    machine_id: machine, event_id: id, delivery_record_id: id, ts: "2026-11-01T00:00:00.000000Z", ...extra } });
+  const call = (machine: string, tool: string) => row(machine, "e1", { kind: "tool_call", tool_name: "Bash",
+    tool_calls: [{ toolUseId: tool, args: { command: "gh pr create" } }], record: { payload: { tool_use_id: tool } } });
+  const result = (machine: string, tool: string, n: number) => row(machine, "e2", { kind: "session_event", type: "tool_result",
+    content: `https://github.com/acme/repo/pull/${n}`, record: { payload: { tool_use_id: tool, kind: "tool_result" } } });
+  const projectionRows = [call("m1", "t1"), result("m1", "t1", 5), call("m2", "t2"), result("m2", "t2", 9)] as PrEvidenceProjectionRow[];
+  const mask: HistoryMask = new Map([
+    ["e1", { originId: "machine:m1", operation: "upsert" as const, revision: "1" }],
+    ["e2", { originId: "machine:m1", operation: "upsert" as const, revision: "1" }],
+  ]);
+  expect(maskRecords(records, mask).map((r) => r.origin_id)).toEqual(["machine:m1", "machine:m1"]);
+  // Keyed by record id alone (abe281c9) both machines' rows were kept and PR 9 leaked in.
+  expect(numbers(maskedProjection({ records, projectionRows }, scope, mask))).toEqual(["https://github.com/acme/repo/pull/5"]);
+});
