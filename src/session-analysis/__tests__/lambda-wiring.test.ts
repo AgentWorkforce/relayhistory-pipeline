@@ -18,3 +18,8 @@ test("P2: an enabled tick that fails throws (Lambda Error metric, alarm, async r
   // No runtime env: init fails inside the tick.
   await expect(handler({ sessionAnalysis: true })).rejects.toThrow("session analysis tick failed");
 });
+
+test("P1-a: the worker's pointer read carries manifest_etag, so the snapshot refuses another manifest version", async () => {
+  const { WORKER_POINTERS_SQL } = await import("../worker.ts");
+  expect(WORKER_POINTERS_SQL).toContain("p.manifest_key, p.manifest_etag, p.content_sha256,");
+});
