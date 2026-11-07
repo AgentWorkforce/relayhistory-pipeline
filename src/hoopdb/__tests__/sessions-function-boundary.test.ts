@@ -10,6 +10,10 @@ import { dirname, join } from "node:path";
 import { generate, ACL_PATH, type Reader } from "../../../scripts/sessions-function-boundary/generate.ts";
 import { LANES } from "../../../scripts/sessions-function-boundary/lanes/index.ts";
 import { ingestHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-history.ts";
+import { bufferedGcSingleCandidate } from "../../../scripts/sessions-function-boundary/lanes/buffered-gc-single-candidate.ts";
+import { lazySourceTables, originalBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-source-tables.ts";
+import { privacyAuthority, originalLazyBodies, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
+import { createHash } from "node:crypto";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
 import { run } from "../../../scripts/sync-sessions-function-boundary.ts";
@@ -44,10 +48,81 @@ describe("unified sessions function-boundary generator", () => {
     expect(c.outputs).toEqual(a.outputs);
     expect(Object.keys(a.outputs).sort()).toEqual([
       "src/hoopdb/migrate-guards.ts", "src/hoopdb/sessions-function-acl.json",
+      "supabase/bootstrap/canonical_project_events_verify.sql",
       "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql",
+      "supabase/bootstrap/privacy_eraser_verify.sql",
       "supabase/bootstrap/session_directory_search_worker_verify.sql", "supabase/bootstrap/session_ingest_verify.sql",
+      "supabase/bootstrap/session_read_api_role_verify.sql",
       "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql",
+      "supabase/rollbacks/20261105033000_canonical_project_events.down.sql",
+      "supabase/rollbacks/20261105039000_buffered_gc_single_candidate.down.sql",
+      "supabase/rollbacks/20261105040000_ingest_lazy_source_tables.down.sql",
+      "supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql",
     ]);
+  });
+
+  test("the GC replacement changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {
+    const withGc = await generate(repo, LANES, VERIFIERS);
+    const withoutGc = await generate(repo, LANES.filter((l) => l !== bufferedGcSingleCandidate), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105039000_buffered_gc_single_candidate.down.sql";
+    for (const [path, value] of Object.entries(withoutGc.outputs)) expect(withGc.outputs[path]).toBe(value);
+    expect(withGc.summary.lanes["buffered-gc-single-candidate"]).toEqual({ functions: 0, replaces: 1, grants: 0 });
+    const down = withGc.outputs[downPath]!;
+    const source = readFileSync(join(root, bufferedGcSingleCandidate.migration!), "utf8");
+    expect(down).toContain(createHash("sha256").update(source).digest("hex"));
+    const originalPath = bufferedGcSingleCandidate.replaces["sessions.ingest_buffer_gc_claim(jsonb)"]!.original;
+    const original = readFileSync(join(root, originalPath), "utf8").match(/CREATE OR REPLACE FUNCTION sessions\.ingest_buffer_gc_claim\(p jsonb\)[\s\S]*?END \$claim\$;/)![0];
+    expect(down).toContain(original);
+    expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(original));
+    expect(down).toContain("pg_advisory_xact_lock(961996,1)");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 040000 lazy source-table replacement changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== lazySourceTables), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105040000_ingest_lazy_source_tables.down.sql";
+    for (const [path, value] of Object.entries(without.outputs)) expect(withLane.outputs[path]).toBe(value);
+    expect(withLane.summary.lanes["lazy-source-tables"]).toEqual({ functions: 0, replaces: 2, grants: 0 });
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, lazySourceTables.migration!), "utf8")).digest("hex"));
+    for (const body of originalBodies(readFileSync(join(root, "supabase/migrations/20261104055000_lazy_current_custody.sql"), "utf8"))) {
+      expect(down).toContain(body);
+      expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(body));
+    }
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("041000 privacy authority: exactly two ingest-callable SECDEF functions; the rollback restores the 010000 mirror and the 040000 lazy bodies verbatim behind its guards", async () => {
+    const g = await generate(repo, LANES, VERIFIERS);
+    expect(g.summary.lanes["privacy-authority"]).toEqual({ functions: 17, replaces: 4, grants: 6 });
+    const acl = JSON.parse(g.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    const granted = Object.entries(acl).filter(([k, v]) => k.startsWith("sessions.ingest_privacy_authority_") && v.some((x) => x.startsWith("bulls96_session_ingest"))).map(([k]) => k).sort();
+    expect(granted).toEqual(["sessions.ingest_privacy_authority_begin(jsonb)", "sessions.ingest_privacy_authority_complete(jsonb)"]);
+    const down = g.outputs["supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql"]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, privacyAuthority.migration!), "utf8")).digest("hex"));
+    for (const body of originalMirrorBodies(readFileSync(join(root, "supabase/migrations/20261105010000_frozen_source_custody.sql"), "utf8"))) {
+      expect(down).toContain(body);
+      expect(down.indexOf(body)).toBeLessThan(down.indexOf("DROP FUNCTION sessions.ingest_privacy_authority_lock(boolean);"));
+    }
+    // The 040000 lazy-current bodies (prefix exclusion) are restored EXACTLY, not 055000's.
+    const lazy = originalLazyBodies(readFileSync(join(root, "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql"), "utf8"));
+    expect(lazy.length).toBe(2);
+    for (const body of lazy) {
+      expect(body).toContain("NOT LIKE 'ingest\\_frozen\\_source\\_%'");
+      expect(down).toContain(body);
+    }
+    expect(down).not.toContain("NOT IN('ingest_frozen_source_records'");
+    const up = readFileSync(join(root, privacyAuthority.migration!), "utf8");
+    expect(up.match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
+    expect(up).not.toContain("NOT LIKE 'ingest\\_frozen");
+    expect(down.indexOf("release to neon first")).toBeLessThan(down.indexOf("DROP TRIGGER"));
+    expect(down).toContain("a later migration is applied");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
   });
 
   test("--check catches drift in every generated artifact and writes nothing; a write run repairs it", async () => {
@@ -119,15 +194,20 @@ describe("unified sessions function-boundary generator", () => {
     await expect(generate(repo, LANES, [...VERIFIERS, VERIFIERS[0]!])).rejects.toThrow("is configured twice");
   });
 
-  test("the remaining empty read-api and canonical-project-events slots are inert; the consumer slot is filled", async () => {
+  test("required lanes are present and filled, including project events 033000 and read API 034000", async () => {
     const slots = LANES.filter((l) => l.migration === null);
-    expect(slots.map((l) => l.lane).sort()).toEqual(["canonical-project-events", "read-api"]);
+    expect(slots.map((l) => l.lane).sort()).toEqual([]);
+    expect(LANES.map((l) => l.lane)).toEqual(expect.arrayContaining(["ingest-history", "read-api", "canonical-project-events", "canonical-feature-consumer"]));
     for (const l of slots) {
       expect([Object.keys(l.functions).length, Object.keys(l.replaces).length, l.prefixes.length, l.grantSources.length]).toEqual([0, 0, 0, 0]);
       expect(l.extraOutputs).toBeUndefined();
     }
     const summary = (await generate(repo, LANES, VERIFIERS)).summary.lanes;
     for (const l of slots) expect(summary[l.lane]).toEqual({ functions: 0, replaces: 0, grants: 0 });
+    expect(LANES.find((l) => l.lane === "read-api")?.migration).toBe("supabase/migrations/20261105034000_session_directory_read_api.sql");
+    expect(summary["canonical-project-events"]).toEqual({ functions: 10, replaces: 0, grants: 6 });
+    expect(LANES.find((l) => l.lane === "canonical-project-events")?.migration).toBe("supabase/migrations/20261105033000_canonical_project_events.sql");
+    expect(summary["read-api"]).toEqual({ functions: 3, replaces: 0, grants: 2 });
     expect(summary["canonical-feature-consumer"]).toEqual({ functions: 2, replaces: 0, grants: 1 });
   });
 });

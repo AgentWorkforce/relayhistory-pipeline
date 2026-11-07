@@ -365,6 +365,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261104051000_ingest_buffer_gc.sql` | column sessions.ingest_stage_intents.gc_lease_token |
 | `upstream:20261104052000_ordered_ingest_controls.sql` | column sessions.ingest_buffer_admission.control_epoch |
 | `upstream:20261105010000_frozen_source_custody.sql` | table sessions.ingest_frozen_source_completeness |
+| `upstream:20261105034000_session_directory_read_api.sql` | function sessions.list_session_directory_for |
 | `upstream:20261104055000_lazy_current_custody.sql` | table sessions.ingest_lazy_policy |
 | `upstream:20261104054000_ingest_custody_baseline.sql` | table sessions.ingest_custody_imports |
 | `upstream:20261104053000_ingest_first_ack_seats.sql` | table sessions.ingest_receipt_seat_clock |
@@ -373,9 +374,14 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105030000_canonical_feature_consumer_acks.sql` | table sessions.canonical_feature_copy_state |
 | `upstream:20261105031000_desktop_catalog_forget_reproject.sql` | table sessions.session_desktop_catalog_reproject |
 | `upstream:20261105032000_session_large_read_routing_fixes.sql` | table sessions.session_large_read_scope_errors |
+| `upstream:20261105033000_canonical_project_events.sql` | table sessions.canonical_project_events |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |
+| `upstream:20261105038000_claim_attempt_records_retirement.sql` | column sessions.ingest_claim_attempts.records_retired_at |
+| `upstream:20261105039000_buffered_gc_single_candidate.sql` | replacement: GC claim contains its single-candidate advisory admission domain |
+| `upstream:20261105040000_ingest_lazy_source_tables.sql` | replacement: lazy-current adoption checks exclude the source-side tables |
+| `upstream:20261105041000_ingest_privacy_authority.sql` | table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix) |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |

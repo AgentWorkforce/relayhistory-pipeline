@@ -1,0 +1,22 @@
+{
+  "name": "@96bulls/amp-transport-worker",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./src/gateway.test.ts ./src/native-server.test.ts ./scripts/render-config.test.ts",
+    "render-config": "bun scripts/render-config.ts"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20260621.1",
+    "@types/bun": "latest",
+    "@types/node": "24",
+    "typescript": "5.9.3",
+    "wrangler": "4.158.0"
+  }
+}

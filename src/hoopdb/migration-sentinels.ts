@@ -30,6 +30,19 @@ export interface Sentinel {
 }
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
+  "upstream:20261105041000_ingest_privacy_authority.sql": {
+    evidence: "table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix)",
+    sql: "SELECT to_regclass('sessions.ingest_privacy_authority') IS NOT NULL AND (SELECT count(*)=2 FROM pg_proc WHERE oid IN(to_regprocedure('sessions.ingest_lazy_user(jsonb,text,jsonb)'),to_regprocedure('sessions.ingest_lazy_begin(jsonb,text)')) AND position('NOT IN(''ingest_frozen_source_records''' in prosrc)>0 AND position('''ingest_frozen_source_owned_sessions'')' in prosrc)>0 AND position('NOT LIKE ''ingest' in prosrc)=0) AS applied",
+  },
+  "upstream:20261105040000_ingest_lazy_source_tables.sql": {
+    evidence: "replacement: lazy-current adoption checks exclude the source-side tables",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_user(jsonb,text,jsonb)') AND prosrc LIKE '%ingest_source_control_heads%') AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_begin(jsonb,text)') AND prosrc LIKE '%ingest_source_control_heads%') AS applied",
+  },
+  "upstream:20261105034000_session_directory_read_api.sql": {evidence:"function sessions.list_session_directory_for",sql:fn("sessions","list_session_directory_for")},
+  "upstream:20261105039000_buffered_gc_single_candidate.sql": {
+    evidence: "replacement: GC claim has its single-candidate advisory admission domain",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_buffer_gc_claim(jsonb)') AND prosecdef AND prosrc LIKE '%96bulls:buffer-gc-user-v1%') AS applied",
+  },
   "upstream:20261105024000_session_brief_documents.sql": { evidence: "table sessions.session_brief_document_outbox", sql: relation("sessions.session_brief_document_outbox") },
   "upstream:20261105025000_canonical_feature_journal.sql": { evidence: "table sessions.canonical_feature_journal", sql: relation("sessions.canonical_feature_journal") },
   "upstream:20261105026000_canonical_history_lineage.sql": { evidence: "table sessions.ingest_history_carriers", sql: relation("sessions.ingest_history_carriers") },
@@ -39,6 +52,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105035000_semantic_copy_state.sql": {evidence:"table sessions.search_feature_copy_state",sql:relation("sessions.search_feature_copy_state")},
   "upstream:20261105036000_canonical_consumer_lease.sql": { evidence: "table sessions.canonical_feature_consumer_lease", sql: relation("sessions.canonical_feature_consumer_lease") },
   "upstream:20261105037000_session_directory_document_pool.sql": { evidence: "function sessions.canonical_feature_document_finish", sql: "SELECT to_regprocedure('sessions.canonical_feature_document_finish(bigint,jsonb,text,text,text,text,text)') IS NOT NULL AS applied" },
+  "upstream:20261105038000_claim_attempt_records_retirement.sql": { evidence: "column sessions.ingest_claim_attempts.records_retired_at", sql: column("sessions.ingest_claim_attempts", "records_retired_at") },
   "upstream:20261105010000_frozen_source_custody.sql": {evidence:"table sessions.ingest_frozen_source_completeness",sql:relation("sessions.ingest_frozen_source_completeness")},
   "upstream:20261104055000_lazy_current_custody.sql": {evidence:"table sessions.ingest_lazy_policy",sql:relation("sessions.ingest_lazy_policy")},
   "upstream:20261104054000_ingest_custody_baseline.sql": {evidence:"table sessions.ingest_custody_imports",sql:relation("sessions.ingest_custody_imports")},
@@ -146,6 +160,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.ingest_stage_intents",
     sql: relation("sessions.ingest_stage_intents"),
   },
+  "upstream:20261105033000_canonical_project_events.sql": { evidence: "table sessions.canonical_project_events", sql: relation("sessions.canonical_project_events") },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
@@ -167,6 +182,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
 
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */
 export const NON_CREATE_STEPS = [
+  "upstream:20261105039000_buffered_gc_single_candidate.sql",
   "upstream:20261025000300_upsert_keep_on_null.sql",
   "upstream:20261030000000_relayhistory_machines_compat.sql",
   "upstream:20261102010000_session_directory_canonical_ids.sql",

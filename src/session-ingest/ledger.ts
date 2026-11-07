@@ -174,6 +174,8 @@ export interface FrozenWitnessInput { kind: "batch" | "selection" | "reset"; ten
 export interface SourceControlBeginInput { epoch: string; tenant: LedgerTenant; kind: "selection" | "reset"; payload: unknown }
 export interface SourceControlHead { epoch: string; version: string; digest: string; kind: "selection" | "reset"; pending: true; apply: boolean }
 export interface SourceControlCompleteInput { epoch: string; tenant: LedgerTenant; version: string; digest: string; kind: "selection" | "reset"; outcome: "applied" | "replay" | "stale" }
+/** C3 Supabase-first privacy authority head: the mirror head plus Neon's reset count (null for a selection). */
+export interface PrivacyAuthorityHead extends SourceControlHead { deleted: string | null }
 export interface Ledger {
   /** Frozen-source custody witness (refuses unless the sealed copy and policy agree). */
   frozenWitness?(input: FrozenWitnessInput): Promise<CurrentCustodyPacket>;
@@ -183,6 +185,10 @@ export interface Ledger {
   sourceControlBegin?(input: SourceControlBeginInput): Promise<SourceControlHead>;
   /** Mirror completion; relayhistory calls it AFTER Neon completes. */
   sourceControlComplete?(input: SourceControlCompleteInput): Promise<{ completed: true; superseded: boolean }>;
+  /** C3: begin with Supabase as the privacy authority (head + frozen privacy written first; Neon never written). */
+  privacyAuthorityBegin?(input: SourceControlBeginInput): Promise<PrivacyAuthorityHead>;
+  /** C3: complete the Supabase-authority head after the ingest fence acknowledged it. */
+  privacyAuthorityComplete?(input: SourceControlCompleteInput): Promise<{ completed: true; superseded: boolean }>;
   /** Private verified-identity path. Unsupported stores must fail, never fall back. */
   applyOrderedControl?(input:OrderedControlInput):Promise<OrderedControlResult>;
   claim(input: ClaimInput): Promise<ClaimResult>;

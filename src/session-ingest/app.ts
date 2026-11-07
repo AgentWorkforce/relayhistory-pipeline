@@ -125,6 +125,13 @@ export interface IngestAppDeps {
    * build it from the sealed Supabase copy (refuses, never guesses, when unsealed).
    */
   custodySource?: "relayhistory" | "shadow" | "frozen-supabase";
+  /**
+   * C3 privacy authority (INGEST_PRIVACY_AUTHORITY). "neon" (default): today's Neon-first controls, the
+   * Supabase mirror routes, and relayhistory's Neon witness accepted. "supabase" (needs frozen-supabase):
+   * only the Supabase-authority control routes; every relayhistory-built (Neon) custody envelope and the
+   * legacy mirror routes are refused, because Neon's heads are no longer the authority.
+   */
+  privacyAuthority?: "neon" | "supabase";
 }
 
 type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined } };
@@ -277,6 +284,9 @@ export function createIngestApp(deps: IngestAppDeps) {
   const app = new Hono<Env>();
   const emit = deps.log ?? ((fields) => log.info("session ingest", fields));
   const custodyMode = deps.custodySource ?? "relayhistory";
+  const privacyAuthority = deps.privacyAuthority ?? "neon";
+  if (privacyAuthority !== "neon" && (privacyAuthority !== "supabase" || custodyMode !== "frozen-supabase"))
+    throw new Error("session ingest: privacyAuthority=supabase requires custodySource=frozen-supabase");
   const frozenWitness = async (input: FrozenWitnessInput): Promise<CurrentCustodyPacket> => {
     if (!deps.deliver.ledger.frozenWitness) throw new IngestUnavailable("fence", "custody_source_unavailable");
     return deps.deliver.ledger.frozenWitness(input);
@@ -320,6 +330,8 @@ export function createIngestApp(deps: IngestAppDeps) {
       const contentType=c.req.header("content-type")?.split(";")[0]?.trim();
       const privateWire=contentType===CURRENT_CUSTODY_CONTENT_TYPE||contentType===RECOVERY_CONTENT_TYPE;
       if(privateWire&&(deps.deliver.acceptanceMode!=="buffered"||!["","identity"].includes(c.req.header("content-encoding")?.trim().toLowerCase()??"")))throw new IngestUnavailable("fence","custody_wire_unavailable");
+      // C3: under Supabase privacy authority a relayhistory-built (Neon) witness is stale by definition.
+      if(privateWire&&privacyAuthority==="supabase")throw new IngestUnavailable("fence","privacy_authority_moved");
       body = c.req.raw.body ? await readBounded(c.req.raw.body, privateWire?PRIVATE_CUSTODY_BYTES:MAX_DELIVERY_BYTES) : new Uint8Array();
     } catch (error) {
       return failure(c, error);
@@ -530,6 +542,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   app.post("/v1/custody/control/begin", async (c) => {
     const identity = c.get("identity");
     try {
+      if (privacyAuthority !== "neon") throw new IngestUnavailable("fence", "privacy_authority_moved");
       if (!deps.deliver.ledger.sourceControlBegin) throw new IngestUnavailable("fence", "control_unavailable");
       const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control");
       exactKeys(b as Record<string, unknown>, ["epoch", "kind", "payload"]);
@@ -545,6 +558,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   app.post("/v1/custody/control/complete", async (c) => {
     const identity = c.get("identity");
     try {
+      if (privacyAuthority !== "neon") throw new IngestUnavailable("fence", "privacy_authority_moved");
       if (!deps.deliver.ledger.sourceControlComplete) throw new IngestUnavailable("fence", "control_unavailable");
       const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control completion");
       const v = b as Record<string, unknown>;exactKeys(v, ["epoch", "version", "digest", "kind", "outcome"]);
@@ -555,6 +569,43 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json(r);
     } catch (error) {
       emit({ route: "custody.control.complete", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+
+  // C3 Supabase-first privacy authority: relayhistory (DELIVERY_CUSTODY_SOURCE_MODE=supabase-authority) begins
+  // here (head + frozen privacy written, Neon never called), writes the unchanged ordered fence, then completes here.
+  app.post("/v1/custody/authority/begin", async (c) => {
+    const identity = c.get("identity");
+    try {
+      if (privacyAuthority !== "supabase" || !deps.deliver.ledger.privacyAuthorityBegin) throw new IngestUnavailable("fence", "privacy_authority_unavailable");
+      const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control");
+      exactKeys(b as Record<string, unknown>, ["epoch", "kind", "payload"]);
+      const v = b as Record<string, unknown>;
+      if (typeof v.epoch !== "string") invalid("Invalid control epoch");
+      const head = await deps.deliver.ledger.privacyAuthorityBegin({ epoch: v.epoch as string, kind: controlKind(v.kind), payload: v.payload,
+        tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId } });
+      emit({ route: "custody.authority.begin", outcome: head.apply ? "begun" : "pending_replay", org_id: identity.orgId });
+      return c.json(head);
+    } catch (error) {
+      emit({ route: "custody.authority.begin", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+  app.post("/v1/custody/authority/complete", async (c) => {
+    const identity = c.get("identity");
+    try {
+      if (privacyAuthority !== "supabase" || !deps.deliver.ledger.privacyAuthorityComplete) throw new IngestUnavailable("fence", "privacy_authority_unavailable");
+      const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control completion");
+      const v = b as Record<string, unknown>;exactKeys(v, ["epoch", "version", "digest", "kind", "outcome"]);
+      if (v.outcome !== "applied" && v.outcome !== "replay" && v.outcome !== "stale") invalid("Invalid control outcome");
+      if (typeof v.epoch !== "string" || typeof v.version !== "string" || typeof v.digest !== "string") invalid("Invalid control");
+      const r = await deps.deliver.ledger.privacyAuthorityComplete({ epoch: v.epoch as string, version: v.version as string, digest: v.digest as string, kind: controlKind(v.kind),
+        outcome: v.outcome as "applied" | "replay" | "stale", tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId } });
+      emit({ route: "custody.authority.complete", outcome: r.superseded ? "superseded" : "completed", org_id: identity.orgId });
+      return c.json(r);
+    } catch (error) {
+      emit({ route: "custody.authority.complete", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
       return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
     }
   });

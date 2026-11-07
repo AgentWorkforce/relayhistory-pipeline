@@ -68,6 +68,7 @@ await admin.query(
 );
 await admin.query(await read("supabase/bootstrap/session_token_verifier.sql"));
 await admin.query(await read("supabase/bootstrap/session_ingest_roles.sql"));
+await admin.query(await read("supabase/bootstrap/session_read_api_roles.sql"));
 await admin.query(
   "DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_runtime') THEN CREATE ROLE bulls96_runtime LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION; END IF; END $$",
 );

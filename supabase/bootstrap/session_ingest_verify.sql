@@ -4,6 +4,9 @@
 DO $verify$
 DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_setting('hoopdb.db_mode',true),'');
  v_allowed text[] := ARRAY[
+ 'sessions.canonical_project_events_claim_v1(jsonb)',
+ 'sessions.canonical_project_events_release_v1(jsonb)',
+ 'sessions.canonical_project_events_sent_v1(jsonb)',
  'sessions.ingest_acquire_slot(jsonb)',
  'sessions.ingest_buffer_gc_claim(jsonb)',
  'sessions.ingest_buffer_gc_finish(jsonb)',
@@ -33,6 +36,8 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_history_scope_capture(jsonb)',
  'sessions.ingest_history_scope_install(jsonb)',
  'sessions.ingest_prepare_buffer_stage(jsonb)',
+ 'sessions.ingest_privacy_authority_begin(jsonb)',
+ 'sessions.ingest_privacy_authority_complete(jsonb)',
  'sessions.ingest_publication_abandon(jsonb)',
  'sessions.ingest_publication_candidates(jsonb)',
  'sessions.ingest_publication_claim(jsonb)',

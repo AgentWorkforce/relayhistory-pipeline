@@ -21,6 +21,9 @@
  *   INGEST_MAX_PER_USER / INGEST_MAX_PER_ORG   (defaults 4 / 32)
  *   INGEST_INLINE_MAX_SESSIONS (default 40)
  *   INGEST_REPLICA_MODE        off | queue (= required) | best_effort; required needs NEON_REPLICA
+ *   SESSIONS_NEON_EXIT         unset/false (default) | true: refuse every Neon edge at startup
+ *                              (replica, NEON_REPLICA binding, a custody source other than
+ *                              frozen-supabase in buffered mode); docs/neon-exit-edge-map.md
  *
  * Until the S3 key, the KMS key ARN and Hyperdrive are present, every request
  * is 503 `not_configured` and nothing is written.
@@ -30,6 +33,7 @@ import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { createS3Store, objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { log } from "../shared/log.ts";
+import { assertNoNeonEdge, neonExitProfile, NeonExitRefusal } from "../shared/neon-exit.ts";
 import { createIngestApp } from "./app.ts";
 import { sqlLedger } from "./ledger-sql.ts";
 import type { ReplicaMode, ReplicaSink, NeonReplicaMessage } from "./replica.ts";
@@ -62,6 +66,10 @@ export interface IngestWorkerEnv {
   INGEST_EXPECT_GENERATION?:string;
   /** P1: relayhistory (default) | shadow | frozen-supabase (sessions.ingest_frozen_source_witness). */
   INGEST_CUSTODY_SOURCE?: string;
+  /** C3: "supabase" makes the Supabase frozen custody heads the privacy authority (requires INGEST_CUSTODY_SOURCE=frozen-supabase). */
+  INGEST_PRIVACY_AUTHORITY?: string;
+  /** Neon-exit release profile: unset/"false" (default) | "true" (src/shared/neon-exit.ts). */
+  SESSIONS_NEON_EXIT?: string;
 }
 
 interface SecretBinding {
@@ -107,6 +115,13 @@ export interface IngestSettings {
 
 /** The settings, or null while any required one is missing (every request is then 503 not_configured). */
 export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettings | null> {
+  // Before the not-configured checks, so a Neon edge under the profile is a loud refusal, never a quiet 503.
+  assertNoNeonEdge(neonExitProfile(env as Record<string, unknown>), "the session ingest", {
+    "INGEST_REPLICA_MODE is not off": (env.INGEST_REPLICA_MODE ?? "off") !== "off",
+    "a NEON_REPLICA queue is bound": env.NEON_REPLICA !== undefined,
+    "INGEST_CUSTODY_SOURCE is not frozen-supabase": custodySourceOf(env) !== "frozen-supabase",
+    "INGEST_ACCEPTANCE_MODE is not buffered (frozen-supabase custody needs it)": (env.INGEST_ACCEPTANCE_MODE ?? "canonical") !== "buffered",
+  });
   const { INGEST_S3_BUCKET: bucket, INGEST_KMS_KEY_ARN: kmsKeyArn } = env;
   if (!bucket || !kmsKeyArn || !env.HYPERDRIVE || !env.INGEST_FANOUT) return null;
   const [accessKeyId, secretAccessKey, signingKey] = await Promise.all([
@@ -141,6 +156,10 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   };
 }
 
+function custodySourceOf(env: IngestWorkerEnv): string {
+  return env.INGEST_CUSTODY_SOURCE?.trim() || "relayhistory";
+}
+
 function store(s: IngestSettings): ObjectStore {
   return createS3Store({
     bucket: s.bucket,
@@ -149,6 +168,52 @@ function store(s: IngestSettings): ObjectStore {
     serverSideEncryption: "aws:kms",
     sseKmsKeyId: s.kmsKeyArn,
   });
+}
+
+/**
+ * The request app for one invocation, from validated settings: a Hyperdrive `run`
+ * and the S3 target in production, a test database and a scratch store in tests.
+ */
+export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: (text: string, params: unknown[]) => Promise<{ rows: Record<string, unknown>[] }>, target: WriteTarget) {
+  const replica: ReplicaSink | undefined = settings.replicaMode !== "off" && env.NEON_REPLICA
+    ? {
+        mode: settings.replicaMode,
+        send: (message) => env.NEON_REPLICA!.send(message),
+        putDescriptor: async (key, body) => {
+          await target.store.put(objectKey(key), body, { ifNoneMatch: true, contentType: "application/json" }).catch((error: { code?: string }) => {
+            // Deterministic body: an existing descriptor is this batch's own earlier attempt.
+            if (error?.code !== "already_exists" && error?.code !== "precondition_failed") throw error;
+          });
+        },
+      }
+    : undefined;
+  const custodySource = custodySourceOf(env);
+  if (!["relayhistory", "shadow", "frozen-supabase"].includes(custodySource) || (custodySource !== "relayhistory" && (env.INGEST_ACCEPTANCE_MODE ?? "canonical") !== "buffered"))
+    throw new Error("session ingest: INGEST_CUSTODY_SOURCE must be relayhistory, shadow or frozen-supabase (the latter two only in buffered mode)");
+  const privacyAuthority = env.INGEST_PRIVACY_AUTHORITY?.trim() || "neon";
+  if (!["neon", "supabase"].includes(privacyAuthority) || (privacyAuthority === "supabase" && custodySource !== "frozen-supabase"))
+    throw new Error("session ingest: INGEST_PRIVACY_AUTHORITY must be neon, or supabase with INGEST_CUSTODY_SOURCE=frozen-supabase");
+  return createIngestApp({
+    custodySource: custodySource as "relayhistory" | "shadow" | "frozen-supabase",
+    privacyAuthority: privacyAuthority as "neon" | "supabase",
+    signingKey: settings.signingKey,
+    deliver: {
+      ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration}),
+      acceptanceMode:settings.acceptanceMode,
+      target,
+      replica,
+      // Slot TTL: past the Worker's wall-clock budget, so a lost release frees itself.
+      slots: { maxPerUser: settings.maxPerUser, maxPerOrg: settings.maxPerOrg, ttlSeconds: 90 },
+      inlineMaxSessions: settings.inlineMaxSessions,
+      fanout: (messages) => env.INGEST_FANOUT!.sendBatch(messages.map((body) => ({ body }))),
+    },
+    onboarding: { run },
+  });
+}
+
+/** A malformed setting or a Neon-exit refusal: a code, never the setting's value. */
+function logSettingsInvalid(error: unknown): void {
+  log.error("session ingest settings invalid", { error_code: error instanceof NeonExitRefusal ? error.code : "settings_invalid" });
 }
 
 const NOT_CONFIGURED = () =>
@@ -161,9 +226,9 @@ export default {
     let settings: IngestSettings | null;
     try {
       settings = await ingestSettings(env);
-    } catch {
+    } catch (error) {
       // A malformed setting: relayhistory's envelope, retryable, never a bare 500.
-      log.error("session ingest settings invalid", { error_code: "settings_invalid" });
+      logSettingsInvalid(error);
       return NOT_CONFIGURED();
     }
     if (!settings) return NOT_CONFIGURED();
@@ -177,37 +242,7 @@ export default {
       await connected;
       return (await client.query(text, params as unknown[])) as unknown as { rows: Record<string, unknown>[] };
     };
-    const target: WriteTarget = { store: store(settings), keyRoot: settings.keyRoot };
-    const replica: ReplicaSink | undefined = settings.replicaMode !== "off" && env.NEON_REPLICA
-      ? {
-          mode: settings.replicaMode,
-          send: (message) => env.NEON_REPLICA!.send(message),
-          putDescriptor: async (key, body) => {
-            await target.store.put(objectKey(key), body, { ifNoneMatch: true, contentType: "application/json" }).catch((error: { code?: string }) => {
-              // Deterministic body: an existing descriptor is this batch's own earlier attempt.
-              if (error?.code !== "already_exists" && error?.code !== "precondition_failed") throw error;
-            });
-          },
-        }
-      : undefined;
-    const custodySource = env.INGEST_CUSTODY_SOURCE?.trim() || "relayhistory";
-    if (!["relayhistory", "shadow", "frozen-supabase"].includes(custodySource) || (custodySource !== "relayhistory" && (env.INGEST_ACCEPTANCE_MODE ?? "canonical") !== "buffered"))
-      throw new Error("session ingest: INGEST_CUSTODY_SOURCE must be relayhistory, shadow or frozen-supabase (the latter two only in buffered mode)");
-    const app = createIngestApp({
-      custodySource: custodySource as "relayhistory" | "shadow" | "frozen-supabase",
-      signingKey: settings.signingKey,
-      deliver: {
-        ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration}),
-        acceptanceMode:settings.acceptanceMode,
-        target,
-        replica,
-        // Slot TTL: past the Worker's wall-clock budget, so a lost release frees itself.
-        slots: { maxPerUser: settings.maxPerUser, maxPerOrg: settings.maxPerOrg, ttlSeconds: 90 },
-        inlineMaxSessions: settings.inlineMaxSessions,
-        fanout: (messages) => env.INGEST_FANOUT!.sendBatch(messages.map((body) => ({ body }))),
-      },
-      onboarding: { run },
-    });
+    const app = ingestApp(env, settings, run, { store: store(settings), keyRoot: settings.keyRoot });
     try {
       return await app.fetch(request);
     } finally {
@@ -222,7 +257,7 @@ export default {
    * minutes per attempt instead of walking to the DLQ in seconds.
    */
   async queue(batch: { messages: { body: unknown; ack(): void; retry(o?: { delaySeconds?: number }): void }[] }, env: IngestWorkerEnv): Promise<void> {
-    const settings = await ingestSettings(env).catch(() => null);
+    const settings = await ingestSettings(env).catch((error: unknown) => { logSettingsInvalid(error); return null; });
     if (settings?.acceptanceMode === "buffered") {
       for (const message of batch.messages) message.retry({delaySeconds:300});
       log.info("session ingest fanout refused", {reason:"buffered_publication_refused"});
