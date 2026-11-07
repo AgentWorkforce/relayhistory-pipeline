@@ -339,18 +339,22 @@ describe("E3 on the strict shared eraser (fail closed, retried)", () => {
     await done();
   });
 
-  test("a > 10k-version inventory is refused (the bound) before any delete; the tombstone stays eligible", async () => {
+  // #309: a machine prefix over the strict 10k-per-run bound is traversed in BOUNDED, RESUMABLE runs (durable
+  // checkpoint). The tombstoned session's objects are erased across sweeps and the neighbour never; its POINTER is erased
+  // only after a fresh strict verification, which cannot complete while > 10k kept neighbour versions share the prefix
+  // (not proven: retried, never claimed). Once the workload shrinks, the next sweep proves it and erases the pointer.
+  test("a > 10k-version machine prefix: objects erased across bounded sweeps, the neighbour untouched; the pointer only after a strict verification", async () => {
     const { FakeS3Versions } = await import("./fake-s3-versions.ts");
     const s = new FakeS3Versions();
     for (const k of [...WORKER_KEYS, POINTER]) s.put(k, old);
     const neighbour = `96bulls/org-1/v1/ws=ws_1/m=${M}/h=claude/d=2026/10/30/s=sess_big/raw/`;
     for (let i = 0; i <= 10_000; i++) s.put(`${neighbour}${String(i).padStart(6, "0")}.ndjson.zst`, old);
-    const { job, codes, done } = await s3Job(s);
-    await job.sweep();
-    expect(codes()).toContain("erasure_inventory");
-    expect(s.deletes).toEqual([]);
-    expect(live(s)).toHaveLength(3);
-    // The workload shrinks (here: the neighbour is gone): the same tombstone is erased by the next sweep.
+    const { job, done } = await s3Job(s);
+    for (let i = 0; i < 4; i++) await job.sweep();
+    expect(WORKER_KEYS.filter((k) => s.keys.has(k))).toEqual([]); // the session's objects are gone
+    expect(s.keys.has(POINTER)).toBe(true); // not proven yet: the pointer stays (retried)
+    expect(s.deletes.some((d) => d.startsWith(neighbour))).toBe(false);
+    expect(s.count(neighbour)).toBe(10_001);
     for (const k of [...s.keys.keys()]) if (k.startsWith(neighbour)) s.keys.delete(k);
     await job.sweep();
     expect(live(s)).toEqual([]);
@@ -376,8 +380,9 @@ describe("E3 on the strict shared eraser (fail closed, retried)", () => {
     s.rewrite = undefined;
     const healthy = new ErasureJob(db, state, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => later() + 2 * 3_600_000, async () => {});
     await healthy.drain();
-    expect(state.erasureQueued(DIR, 1)).toBe(false);
     expect(WORKER_KEYS.filter((k) => s.keys.has(k))).toEqual([]);
+    // OFF: done after the strict zero inventory. ON (#309): erased, but never claimed done under the unattested genesis.
+    expect(state.erasureQueued(DIR, 1)).toBe(state.obligations);
     state.close();
   });
 });

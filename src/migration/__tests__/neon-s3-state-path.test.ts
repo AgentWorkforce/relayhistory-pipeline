@@ -163,3 +163,93 @@ describe("the pre-obligation code (main 341dd5a9) refuses an ON state at open, i
     expect(pf).not.toMatch(/\.put\(|\.delete\(/);
   });
 });
+
+describe("4f7b1670 review regressions", () => {
+  test("lead P1: ON state + unknown, ONLY the pointer removed -> OFF refuses (no new DB beside the retained sibling); the sibling is unchanged", async () => {
+    const path = await tmp();
+    const st = new SyncState(path, { obligations: true });
+    st.dispatchWrite("96bulls/o/v1/ws=w/m=m/h=claude/d=2026/10/30/s=s/raw/a.zst", "exporter:1");
+    st.close();
+    const sib = bytes(`${path}.obligations.sqlite`);
+    await rm(path);
+    expect(code(() => new SyncState(path, { obligations: false }))).toBe("obligations_state_conflict");
+    expect(existsSync(path)).toBe(false);
+    expect(bytes(`${path}.obligations.sqlite`).equals(sib)).toBe(true);
+    // ... and an existing legacy SQLite path with a retained sibling refuses too.
+    new SyncState(join(path, "..", "other.sqlite"), { obligations: false }).close();
+    writeFileSync(path, readFileSync(join(path, "..", "other.sqlite")), { mode: 0o600 });
+    expect(code(() => new SyncState(path, { obligations: false }))).toBe("obligations_state_conflict");
+  });
+
+  test("lead P2: a canonical pointer to a FOREIGN 0600 SQLite (other state_id) refuses BEFORE any mutation: target bytes + tables unchanged", async () => {
+    const path = await tmp();
+    new SyncState(path, { obligations: true }).close();
+    const sib = `${path}.obligations.sqlite`;
+    await rm(sib);
+    const foreign = new DatabaseSync(sib);
+    foreign.exec("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT); CREATE TABLE unrelated (x); INSERT INTO meta VALUES ('obligations_state_id', '00000000-0000-4000-8000-000000000000')");
+    foreign.close();
+    chmodSync(sib, 0o600);
+    const before = bytes(sib);
+    expect(code(() => new SyncState(path, { obligations: true }))).toBe("obligations_state_conflict");
+    expect(bytes(sib).equals(before)).toBe(true);
+    const ro = new DatabaseSync(sib, { readOnly: true });
+    expect((ro.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as { name: string }[]).map((r) => r.name)).toEqual(["meta", "unrelated"]);
+    ro.close();
+  });
+
+  test("dogpatch P1: S3X_STATE=:memory: is refused (both modes) without the explicit test-only option", () => {
+    expect(code(() => new SyncState(":memory:", { obligations: true }))).toBe("state_memory_refused");
+    expect(code(() => new SyncState(":memory:", { obligations: false }))).toBe("state_memory_refused");
+    new SyncState(":memory:", { obligations: true, inMemoryForTests: true }).close();
+  });
+
+  test("dogpatch P2-a: after an ON handle stamps use, an OFF handle's releaseStaleLeases / releaseLeases REFUSE (B's live lease survives)", async () => {
+    const path = await tmp();
+    const A = new SyncState(path, { obligations: false });
+    const B = new SyncState(path, { obligations: true, direct: true });
+    const P = "96bulls/o/v1/ws=w/m=m/h=claude/d=2026/10/30/s=s/";
+    expect(B.acquireLease(P, "eraser:B")).toBe(true);
+    B.dispatchWrite(`${P}raw/a.zst`, "exporter:1"); // stamps use AFTER A's admission
+    expect(code(() => A.releaseStaleLeases("eraser:", "eraser:A"))).toBe("obligations_state_in_use");
+    expect(code(() => A.releaseLeases("eraser:B", [P]))).toBe("obligations_state_in_use");
+    expect(B.leaseGen(P)).toBeDefined();
+    A.close();
+    B.close();
+  });
+
+  test("dogpatch P2-a: the OFF erase path re-checks the mode AFTER the awaited authorization: use stamped during it -> no delete", async () => {
+    const { FakeS3Versions } = await import("./fake-s3-versions.ts");
+    const { DEFAULT_ERASURE_CONFIG, ErasureJob } = await import("../neon-s3-erasure/job.ts");
+    const path = await tmp();
+    const A = new SyncState(path, { obligations: false });
+    const PFX = "96bulls/org-1/v1/ws=ws_1/m=delivery_x/h=claude/d=2026/10/30/s=sess_1/";
+    A.enqueueErasure([{ key: PFX, kind: "prefix", org_id: "org-1", reason: "fenced" }], 1);
+    const s = new FakeS3Versions();
+    s.put(`${PFX}raw/b=000001.ndjson.zst`, Date.parse("2026-11-01T00:00:00Z"));
+    let B: SyncState | undefined;
+    const auth = { kind: "supabase" as const, lockWaiters: async () => ({ total: 0, nonAdvisory: 0 }), fencedGroups: async () => [], fencedLivePage: async () => [], stillFenced: async () => true,
+      ready: async () => { if (!B) { B = new SyncState(path, { obligations: true, direct: true }); B.dispatchWrite(`${PFX}raw/x.zst`, "exporter:1"); } } };
+    const job = new ErasureJob(auth, A, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => Date.now(), async () => {});
+    await job.drain().catch(() => undefined);
+    expect(B).toBeDefined();
+    expect(s.deletes).toEqual([]);
+    B!.close();
+    A.close();
+  });
+
+  test("dogpatch P2-b / lead P2: an ON dry run's own scratch tuple is fully removed; a non-scratch (foreign-id) sibling is never deleted", async () => {
+    const { stateForRun } = await import("../neon-s3-sync/main.ts");
+    const scratch = join(await tmp(), "..", "dry");
+    const run = stateForRun(false, join(scratch, "absent.sqlite"), scratch);
+    new SyncState(run.path, { obligations: true }).close();
+    expect(existsSync(`${run.path}.obligations.sqlite`)).toBe(true);
+    run.cleanup();
+    for (const f of [run.path, `${run.path}.obligations.sqlite`, `${run.path}.obligations.sqlite-wal`, `${run.path}.obligations.sqlite-shm`, `${run.path}.pointer.tmp`]) expect(existsSync(f)).toBe(false);
+    const run2 = stateForRun(false, join(scratch, "absent.sqlite"), scratch);
+    new SyncState(run2.path, { obligations: true }).close();
+    writeFileSync(run2.path, pointerBytes(run2.path, "00000000-0000-4000-8000-000000000000"), { mode: 0o600 }); // not this run's
+    run2.cleanup();
+    expect(existsSync(`${run2.path}.obligations.sqlite`)).toBe(true); // quarantined, kept
+  });
+});

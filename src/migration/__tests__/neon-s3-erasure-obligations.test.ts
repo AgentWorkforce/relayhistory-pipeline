@@ -718,7 +718,7 @@ describe("terminal claim: non-reverting revision + the eraser's lease generation
 
   test("the lead's EXACT harness schedule (pr309-1046 retirement-recheck.mjs): the stale completion is refused", () => {
     const P = PREFIX;
-    const st = new SyncState(":memory:");
+    const st = new SyncState(":memory:", { inMemoryForTests: true });
     const item = { key: P, kind: "prefix" as const, org_id: "synthetic-org", reason: "synthetic" };
     st.enqueueErasure([item], 1);
     expect(st.acquireLease(P, "eraser:old", 7_200_000, 0)).toBe(true);

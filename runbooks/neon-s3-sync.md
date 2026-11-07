@@ -223,6 +223,10 @@ reservations, the retirement cursor and genesis applies to ON only.
 | `obligations_requires_fresh_state` | ON was given an existing SQLite state | process refuses | use a FRESH `S3X_STATE`; converting existing state is a reviewed offline contract |
 | `obligations_state_conflict` / `obligations_pointer_invalid` | pointer/sibling collision, leftover, permission, symlink or identity mismatch | process refuses; state quarantined | none without a reviewed, evidence-backed recovery |
 
+**Mismatched modes (symptom).** The flag must match across the exporter and the eraser:
+- **Eraser ON, exporter OFF:** they are on different state paths. The exporter's OFF file is refused by the ON eraser (`obligations_requires_fresh_state`), or the ON eraser bootstraps its own fresh pointer state that the exporter never writes. The exporter records no invocations, so an ON eraser never sees the exporter's PUTs. The symptom is queue items that never reach "done" and an exporter that refuses the pointer (`obligations_state_in_use`). Set the flag the same in both environments.
+- **Exporter ON, eraser OFF:** the OFF eraser refuses the pointer at start.
+
 **Prohibited recoveries:** do these never:
 - no manual "done";
 - no reservation clearing;

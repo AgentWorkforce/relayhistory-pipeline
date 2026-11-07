@@ -138,6 +138,8 @@ export class ErasureJob {
       authorize = async () => {
         this.state.assertModeAllowed();
         await inner();
+        // ... and AGAIN after the awaited authorization, immediately before this page's deletes.
+        this.state.assertModeAllowed();
       };
       this.state.assertModeAllowed();
     }

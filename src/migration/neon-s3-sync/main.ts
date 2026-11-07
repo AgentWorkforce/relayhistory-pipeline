@@ -28,7 +28,7 @@
  * sessions, keys or credentials.
  */
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, unlinkSync, writeSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { createS3Store, objectKey, ObjectStoreError, type ObjectStore } from "../../shared/vendor.ts";
@@ -165,6 +165,22 @@ async function preflight(store: ObjectStore, root: string): Promise<boolean> {
  * discards every write, so recording its "exports" in the real watermark would
  * mark sessions exported that are not in S3.
  */
+/** The scratch pointer at `copy` names `sib` and carries the sibling's own state_id (read-only check). */
+function ownedScratch(copy: string, sib: string): boolean {
+  try {
+    const ptr = JSON.parse(readFileSync(copy, "utf8")) as { state_id?: unknown; db?: unknown };
+    if (typeof ptr.state_id !== "string" || ptr.db !== `${basename(copy)}.obligations.sqlite`) return false;
+    const ro = new DatabaseSync(sib, { readOnly: true });
+    try {
+      return (ro.prepare("SELECT v FROM meta WHERE k = 'obligations_state_id'").get() as { v?: string } | undefined)?.v === ptr.state_id;
+    } finally {
+      ro.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
 export function stateForRun(execute: boolean, statePath: string, scratchDir = `${process.env.HOME}/.agent-tmp/s3x/dry-runs`): {
   path: string;
   cleanup: () => void;
@@ -183,7 +199,11 @@ export function stateForRun(execute: boolean, statePath: string, scratchDir = `$
   return {
     path: copy,
     cleanup: () => {
-      for (const f of [copy, `${copy}-wal`, `${copy}-shm`, `${copy}.lock`]) rmSync(f, { force: true });
+      // ON dry run: the scratch is a pointer + sibling this dry run bootstrapped. Remove that tuple ONLY when it is
+      // positively this dry run's own (the pointer's state_id is the sibling's); anything else is quarantined, kept.
+      const sib = `${copy}.obligations.sqlite`;
+      if (existsSync(sib) && !ownedScratch(copy, sib)) return;
+      for (const f of [copy, `${copy}-wal`, `${copy}-shm`, `${copy}.lock`, sib, `${sib}-wal`, `${sib}-shm`, `${copy}.pointer.tmp`]) rmSync(f, { force: true });
     },
   };
 }

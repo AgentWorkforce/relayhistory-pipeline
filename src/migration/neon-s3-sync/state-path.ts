@@ -108,16 +108,19 @@ export type Resolved = { db: string; pointer: { stateId: string } | null; bootst
  * initialized by the caller, who then calls publishPointer; nothing is published here.
  */
 export function resolveStatePath(path: string, obligations: boolean): Resolved {
-  // An in-memory database has no path to point at (tests only): opened directly, never published.
-  if (path === ":memory:") return { db: path, pointer: null, bootstrap: false };
+  // An in-memory database is never a supported state (two processes would see two databases): SyncState allows it
+  // only through an explicit test option, before this resolution.
+  if (path === ":memory:") refuse("state_memory_refused", "S3X_STATE=:memory: is not a supported state");
   const parent = dirname(path);
   const sibling = join(parent, siblingName(path));
   const tmp = join(parent, `${basename(path)}.pointer.tmp`);
   const st = lstatOrNull(path);
+  // Retained obligation state (a sibling or a pointer temp file) is QUARANTINED in BOTH modes: OFF must not create a
+  // new database beside it, and an existing legacy SQLite path with a retained sibling refuses too.
+  const retained = !!(lstatOrNull(sibling) || lstatOrNull(tmp));
   if (st === null) {
+    if (retained) refuse("obligations_state_conflict", "retained obligation state without a pointer: quarantined (reviewed recovery only)");
     if (!obligations) return { db: path, pointer: null, bootstrap: false };
-    // A sibling or a pointer temp file without a published pointer is AMBIGUOUS retained state: quarantine it.
-    if (lstatOrNull(sibling) || lstatOrNull(tmp)) refuse("obligations_state_conflict", "retained obligation state without a pointer: quarantined (reviewed recovery only)");
     return { db: sibling, pointer: null, bootstrap: true };
   }
   if (st.isSymbolicLink()) refuse("obligations_state_conflict", "the state path is a symlink");
@@ -125,6 +128,7 @@ export function resolveStatePath(path: string, obligations: boolean): Resolved {
   const head = st.size === 0 ? Buffer.alloc(0) : headBytes(path, 16);
   const isSqlite = st.size === 0 || head.toString("latin1") === SQLITE_MAGIC;
   if (isSqlite) {
+    if (retained) refuse("obligations_state_conflict", "a SQLite state with retained obligation state beside it: quarantined (reviewed recovery only)");
     if (obligations) refuse("obligations_requires_fresh_state", "S3X_OBLIGATIONS on needs a fresh (absent) S3X_STATE; existing state is converted only by a reviewed offline contract");
     return { db: path, pointer: null, bootstrap: false };
   }

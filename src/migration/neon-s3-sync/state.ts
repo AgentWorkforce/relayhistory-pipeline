@@ -1,12 +1,13 @@
 /**
- * The exporter's local watermark: one SQLite file (ids, revisions, counts and
- * object keys; never content). It is NOT disposable: it also holds the durable
- * unresolved-write obligations (every exporter PUT recorded before it is sent),
- * ownership claims and erasure reservations (write-obligation.ts v3). A lost or
- * recreated file forgets outstanding PUTs, so a new file is UNATTESTED for good:
- * the erasure job never marks an exporter prefix or object erased on it (fails
- * closed). Nothing attests it: no timer, PID or lock-file check ever settles an
- * unknown PUT; a reviewed recovery contract must come first.
+ * The exporter's local watermark (ids, revisions, counts and object keys; never content).
+ *
+ * S3X_OBLIGATIONS OFF (default): one SQLite file at S3X_STATE, as before.
+ * S3X_OBLIGATIONS ON: S3X_STATE is a small pointer and the database is the fixed sibling
+ * `<S3X_STATE>.obligations.sqlite` (state-path.ts; fresh state only). It is NOT disposable: it
+ * holds the durable unresolved-write obligations (every exporter PUT recorded before it is sent),
+ * ownership claims, erasure reservations and the protected terminal / erased history
+ * (write-obligation.ts v3). Its genesis is always UNATTESTED: the erasure job never marks an
+ * exporter prefix or object erased on it, and no timer, PID or lock-file check settles an unknown PUT.
  *
  * - `groups`: every `(org, session)` the last sweeps saw, with its Neon
  *   revision and activity, and the sweep id that last saw it.
@@ -63,17 +64,20 @@ export class SyncState {
    */
   readonly obligations: boolean;
 
-  constructor(path: string, opts: { obligations?: boolean; direct?: boolean } = {}) {
+  constructor(path: string, opts: { obligations?: boolean; direct?: boolean; inMemoryForTests?: boolean } = {}) {
     this.obligations = opts.obligations ?? obligationsFlag(process.env.S3X_OBLIGATIONS);
     // M-C rev 2 (state-path.ts): OFF opens the configured path as before (refusing an obligations pointer); ON uses a
     // FRESH state only: a pointer + sibling database, bootstrapped durably before any external effect.
     let dbPath = path;
     let pointer: { stateId: string } | null = null;
-    if (!opts.direct) {
+    if (!opts.direct && !(opts.inMemoryForTests && path === ":memory:")) {
       const r = resolveStatePath(path, this.obligations);
       dbPath = r.db;
       pointer = r.pointer;
       if (r.bootstrap) pointer = { stateId: SyncState.#bootstrap(path, r.db) };
+      // IDENTITY BEFORE MUTATION: a pointer target is checked READ-ONLY (its meta.state_id) before any PRAGMA, schema
+      // or genesis write, so a malformed or foreign target stays byte-unchanged.
+      else if (pointer) SyncState.#checkIdentityReadOnly(dbPath, pointer.stateId);
     }
     this.db = new DatabaseSync(dbPath);
     // Shared by the exporter and the erasure job (two processes): WAL plus a busy wait.
@@ -134,6 +138,21 @@ export class SyncState {
    * commits still in -wal), then fsync + publish the pointer (state-path.ts publishPointer). Any failure refuses
    * before any external effect, with nothing adopted or guessed.
    */
+  static #checkIdentityReadOnly(dbPath: string, stateId: string) {
+    let id: string | undefined;
+    try {
+      const ro = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        id = (ro.prepare("SELECT v FROM meta WHERE k = 'obligations_state_id'").get() as { v: string } | undefined)?.v;
+      } finally {
+        ro.close();
+      }
+    } catch {
+      id = undefined;
+    }
+    if (id !== stateId) throw Object.assign(new Error("the obligations database does not carry the pointer's state_id"), { code: "obligations_state_conflict" });
+  }
+
   static #bootstrap(path: string, sibling: string): string {
     closeSync(openSync(sibling, "wx", 0o600));
     const stateId = crypto.randomUUID();
@@ -184,14 +203,11 @@ export class SyncState {
 
   /** The obligation schema, triggers, lease generation column and genesis (only with S3X_OBLIGATIONS on). */
   #openObligations() {
-    // A file that already held the obligation-free schema before this open (legacy) vs. a new / recreated one.
-    const legacyFile = !this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'write_invocations'").get()
-      && !!this.db.prepare("SELECT 1 FROM pending_keys LIMIT 1").get();
     this.db.exec(`
       -- Unresolved-write obligations (shared write-obligation v3, write-obligation.ts), E3's own tables:
       -- one row per exporter PUT invocation, recorded BEFORE it is sent; the versions the exporter
-      -- currently publishes (owns); and the versions the eraser reserved for deletion. Every mutation
-      -- takes a fresh seq; a prefix's revision is the max seq under it (the compare-and-set token).
+      -- currently publishes (owns); and the versions the eraser reserved for deletion. The compare-and-set
+      -- token is the NON-REVERTING revision in write_touch (below), not a max over these removable rows.
       CREATE TABLE IF NOT EXISTS write_invocations (id TEXT PRIMARY KEY, key TEXT NOT NULL, holder TEXT NOT NULL,
         outcome TEXT NOT NULL CHECK (outcome IN ('dispatched', 'acked')), version_id TEXT, seq INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS write_invocations_key ON write_invocations (key);
@@ -228,22 +244,12 @@ export class SyncState {
     // wait proves nothing; the legacy exporter even cleared pending_keys on a failed group whose PUT timed out), so
     // EVERY genesis is UNATTESTED and the erasure job never marks an exporter prefix or object erased on it. There is
     // no unlock: a separately reviewed recovery contract (old effects proven terminal, or a genuinely never-used
-    // scope) is required first. A legacy file's surviving pending_keys are still imported as PREFIX-level unresolved
-    // obligations (dispatched, nonterminal): more fail-closed information, never evidence.
+    // scope) is required first. ON only ever bootstraps a FRESH state (state-path.ts), so there is no legacy content
+    // to import here: an existing pre-obligation file is refused before this point.
     if (!this.meta("obligations_genesis")) {
       this.#tx(() => {
         if (this.meta("obligations_genesis")) return;
-        let imported = 0;
-        if (legacyFile) {
-          const rows = this.db.prepare("SELECT DISTINCT key FROM pending_keys").all() as { key: string }[];
-          const ins = this.db.prepare("INSERT INTO write_invocations (id, key, holder, outcome, version_id, seq) VALUES (?, ?, 'legacy-exporter', 'dispatched', NULL, ?)");
-          for (const r of rows) {
-            const prefix = r.key.endsWith("manifest.json") ? r.key.slice(0, -"manifest.json".length) : r.key;
-            ins.run(crypto.randomUUID(), prefix.endsWith("/") ? prefix : `${prefix}/`, this.#seq());
-            imported += 1;
-          }
-        }
-        this.setMeta("obligations_genesis", JSON.stringify({ at: Date.now(), attestedAt: null, basis: legacyFile ? "legacy-unattested" : "none", imported }));
+        this.setMeta("obligations_genesis", JSON.stringify({ at: Date.now(), attestedAt: null, basis: "none", imported: 0 }));
       });
     }
   }
@@ -449,12 +455,13 @@ export class SyncState {
 
   /** Leases of a holder kind other than `current` (a previous run of the same single process). */
   releaseStaleLeases(kind: string, current: string): number {
-    return Number(this.db.prepare("DELETE FROM leases WHERE holder LIKE ? AND holder <> ?").run(`${kind}%`, current).changes);
+    return this.#offGuarded(() => Number(this.db.prepare("DELETE FROM leases WHERE holder LIKE ? AND holder <> ?").run(`${kind}%`, current).changes));
   }
 
   releaseLeases(holder: string, prefixes: Iterable<string>) {
     const q = this.db.prepare("DELETE FROM leases WHERE prefix = ? AND holder = ?");
     this.#tx(() => {
+      if (!this.obligations) this.#refuseUsedObligationsWhenOff();
       for (const p of prefixes) q.run(p, holder);
     });
   }
