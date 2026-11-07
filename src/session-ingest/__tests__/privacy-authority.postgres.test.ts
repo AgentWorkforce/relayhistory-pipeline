@@ -411,31 +411,56 @@ describe.skipIf(!url)("C3 privacy authority on actual PostgreSQL", () => {
     await d.pool.query(readFileSync(join(root, "supabase/bootstrap/privacy_eraser_verify.sql"), "utf8"));
   }, 30_000);
 
-  test("P1 on real PG: only a GENUINE bulls96_privacy_eraser login passes; a superuser that SET ROLE to it is refused", async () => {
+  test("P1 on real PG: only an AUTHENTICATED bulls96_privacy_eraser login passes; SET ROLE / SET SESSION AUTHORIZATION / startup options are refused", async () => {
     const d = await database();
     await d.owner("ingest_privacy_authority_fence", { controlEpoch: epoch });
     await d.activateEmpty();
-    // The operator phase that makes the role a LOGIN (trust auth on this owned test container; no password involved).
+    // Operator phase (LOGIN + timeouts), then a TEST-ONLY password on this owned synthetic container (scram-sha-256).
     await d.pool.query(readFileSync(join(root, "supabase/bootstrap/privacy_eraser_role.sql"), "utf8"));
+    await d.pool.query("ALTER ROLE bulls96_privacy_eraser PASSWORD 'c3-test-only-synthetic'");
     cleanup.push(async () => {
-      await d.pool.query("ALTER ROLE bulls96_privacy_eraser NOLOGIN; ALTER ROLE bulls96_privacy_eraser RESET ALL").catch(() => undefined);
+      await d.pool.query("ALTER ROLE bulls96_privacy_eraser NOLOGIN PASSWORD NULL; ALTER ROLE bulls96_privacy_eraser RESET ALL").catch(() => undefined);
     });
     await d.pool.query(readFileSync(join(root, "supabase/bootstrap/privacy_eraser_verify.sql"), "utf8"));
-    const u = new URL(d.url);
-    u.username = "bulls96_privacy_eraser";
-    u.password = "";
-    const login = new pg.Client({ connectionString: u.href });
-    await login.connect();
-    cleanup.push(() => login.end().catch(() => undefined));
-    const q = { query: async (t: string, p?: unknown[]) => ({ rows: (await login.query(t, p as never)).rows }) };
-    await assertEraserIdentity(q);
-    expect(await supabaseAuthority(q).fencedLivePage(null)).toEqual([]);
-    expect(((await settle(login.query("SELECT 1 FROM sessions.upload_deletions LIMIT 1"))) as { e?: string }).e).toContain("permission denied");
-    // Causal negative (passed on 957467fe): the elevated session with SET ROLE keeps its credential, so it is refused.
-    const su = await d.conn();
-    await su.query("SET ROLE bulls96_privacy_eraser");
-    const sq = { query: async (t: string, p?: unknown[]) => ({ rows: (await su.query(t, p as never)).rows }) };
-    expect(await assertEraserIdentity(sq).then(() => "ok", (e) => e.code)).toBe("eraser_identity_superuser");
-    await su.query("RESET ROLE");
+    const client = async (config: pg.ClientConfig) => {
+      const c = new pg.Client(config);
+      await c.connect();
+      cleanup.push(() => c.end().catch(() => undefined));
+      return { c, q: { query: async (t: string, p?: unknown[]) => ({ rows: (await c.query(t, p as never)).rows }) } };
+    };
+    const as = (user: string, password: string) => {
+      const u = new URL(d.url);
+      u.username = user;
+      u.password = password;
+      return u.href;
+    };
+    const auth = (await d.pool.query("SELECT current_setting('server_version_num')::int AS v")).rows[0].v;
+    expect(auth).toBeGreaterThanOrEqual(160000);
+    // Genuine authenticated login: accepted, reads through its RPCs, no table.
+    const login = await client({ connectionString: as("bulls96_privacy_eraser", "c3-test-only-synthetic") });
+    expect((await login.c.query("SELECT system_user::text AS s")).rows[0].s).toBe("scram-sha-256:bulls96_privacy_eraser");
+    await assertEraserIdentity(login.q);
+    expect(await supabaseAuthority(login.q).fencedLivePage(null)).toEqual([]);
+    expect(((await settle(login.c.query("SELECT 1 FROM sessions.upload_deletions LIMIT 1"))) as { e?: string }).e).toContain("permission denied");
+    // Causal negatives (accepted on 70c03606): the superuser's own credential with a forged session identity.
+    const su = new URL(d.url);
+    // Exactly the reviewed vector: the startup `options` parameter inside the connection URL (node-postgres forwards it).
+    const forged = new URL(d.url);
+    forged.searchParams.set("options", "-c session_authorization=bulls96_privacy_eraser");
+    // The effective bypass: SET SESSION AUTHORIZATION rewrites BOTH session_user and current_user (70c03606 accepted it).
+    const viaSet = await client({ connectionString: su.href });
+    await viaSet.c.query("SET SESSION AUTHORIZATION bulls96_privacy_eraser");
+    expect((await viaSet.c.query("SELECT session_user::text AS s, current_user::text AS c")).rows[0]).toEqual({ s: "bulls96_privacy_eraser", c: "bulls96_privacy_eraser" });
+    expect(await assertEraserIdentity(viaSet.q).then(() => "ok", (e) => e.code)).toBe("eraser_identity_not_authenticated_as_privacy_eraser");
+    await viaSet.c.query("RESET SESSION AUTHORIZATION");
+    expect((await viaSet.c.query("SELECT rolsuper FROM pg_roles WHERE rolname=session_user")).rows[0].rolsuper).toBe(true);
+    // (PostgreSQL 17 does not honour session_authorization from the startup packet, so session_user may stay the
+    // superuser; whether or not a server honours it, the authenticated identity is the superuser's: refused. The URL
+    // itself is refused before connecting by eraserDatabaseUrl, covered in neon-s3-erasure-authority.test.ts.)
+    const viaOptions = await client({ connectionString: forged.href });
+    expect(await assertEraserIdentity(viaOptions.q).then(() => "ok", (e) => e.code)).toBe("eraser_identity_not_authenticated_as_privacy_eraser");
+    const viaRole = await client({ connectionString: su.href });
+    await viaRole.c.query("SET ROLE bulls96_privacy_eraser");
+    expect(await assertEraserIdentity(viaRole.q).then(() => "ok", (e) => e.code)).toBe("eraser_identity_not_authenticated_as_privacy_eraser");
   }, 30_000);
 });

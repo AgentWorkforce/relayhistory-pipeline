@@ -18,6 +18,15 @@ export const FORBIDDEN_CREDENTIAL_ENV = [
   "AWS_SESSION_TOKEN",
   "AWS_SHARED_CREDENTIALS_FILE",
   "AWS_PROFILE",
+  // libpq/node-postgres environment defaults that would override the stdin URL's identity or startup parameters
+  // (PGOPTIONS can carry -c session_authorization=...), or read credentials from disk.
+  "PGOPTIONS",
+  "PGUSER",
+  "PGPASSWORD",
+  "PGPASSFILE",
+  "PGSERVICE",
+  "PGSERVICEFILE",
+  "PGSSLKEY",
 ] as const;
 
 export const MAX_STDIN_CREDENTIAL_BYTES = 64 * 1024;
@@ -136,6 +145,19 @@ export function sessionAffinityUrl(v: unknown, name: string, provider: "supabase
   const prefix = name.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase()); // supabaseUrl -> supabase_url
   if (provider === "neon" && /-pooler\./.test(u.hostname)) throw new CredentialRefusal(`${prefix}_pooler`);
   if (u.port === "6543" || /^(true|1)$/i.test(u.searchParams.get("pgbouncer") ?? "")) throw new CredentialRefusal(`${prefix}_transaction_pooler`);
+  return url;
+}
+
+/** The only connection-string parameter an eraser URL may carry: TLS mode. Everything else (notably `options`,
+ *  which node-postgres forwards in the startup packet, e.g. -c session_authorization=...) is refused pre-connect. */
+export const ERASER_URL_ALLOWED_PARAMS = ["sslmode"] as const;
+
+/** A session-affinity URL with no startup-parameter overrides (`options` or any other query parameter). */
+export function eraserDatabaseUrl(v: unknown, name: string, provider: "supabase" | "neon"): string {
+  const url = sessionAffinityUrl(v, name, provider);
+  const prefix = name.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
+  for (const k of new URL(url).searchParams.keys())
+    if (!(ERASER_URL_ALLOWED_PARAMS as readonly string[]).includes(k)) throw new CredentialRefusal(`${prefix}_startup_parameter_refused.${/^[a-z_]{1,32}$/.test(k) ? k : "other"}`);
   return url;
 }
 
