@@ -1,6 +1,8 @@
-/** Log visibility of the private ingest Worker's closed DB-error classification INSIDE
- * workerd: the real logger (src/shared/log.ts) writes the line, with the closed class,
- * and nothing from the error's message/stack/URL. Diagnostic only; no DB is needed. */
+/** Formatter and route behaviour of the private ingest Worker's closed DB-error
+ * classification INSIDE workerd: the real logger (src/shared/log.ts) writes the line, with
+ * the closed class, safe code and basis, and nothing from the error's message/stack/URL or
+ * any opaque code. The lines are captured by intercepting process.stdout/stderr.write; this
+ * is NOT proof of delivery into real Cloudflare tail logs. Diagnostic only; no DB is needed. */
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { dbClientErrorFields } from "../../../src/session-ingest/db-error-class.ts";
 import { log } from "../../../src/shared/log.ts";
@@ -20,7 +22,7 @@ function capture() {
 }
 afterEach(() => vi.restoreAllMocks());
 
-describe("workerd: session ingest db error classification is visible in the emitted log line", () => {
+describe("workerd: session ingest db error classification in the formatted log line (stdout interception)", () => {
   test("the pg Client 'error' line carries db_error_class and an allowlisted error_name, never the message", () => {
     const lines = capture();
     const e = Object.assign(new Error(`Connection terminated unexpectedly ${SECRET}`), { name: "Error" });
@@ -32,7 +34,26 @@ describe("workerd: session ingest db error classification is visible in the emit
     for (const n of NEEDLES) expect(line).not.toContain(n);
     // workerd's own network failure text classifies as reset.
     log.error("session ingest db error", dbClientErrorFields(new Error("Network connection lost.")));
-    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ db_error_class: "reset" });
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ db_error_class: "reset", db_error_basis: "message" });
+  });
+
+  test("opaque codes, inherited keys and throwing getters: closed fallbacks, nothing echoed, nothing thrown", () => {
+    const lines = capture();
+    const boom = () => { throw new Error(SECRET); };
+    // [input, its allowlisted error_name]: a plain Error keeps "Error"; anything else is "other".
+    const inputs: [unknown, string][] = [
+      [Object.assign(new Error("x"), { code: "AbCd1234tokenXYZ" }), "Error"],
+      [Object.assign(new Error("x"), { code: "ERR_TLS_AbCd1234tokenXYZ" }), "Error"],
+      [Object.assign(new Error("x"), { code: "constructor", name: "__proto__" }), "other"],
+      [Object.assign(new Error("x"), { code: "toString" }), "Error"],
+      [Object.defineProperties(new Error(), { code: { get: boom }, message: { get: boom }, name: { get: boom } }), "other"],
+      [new Proxy({}, { get: boom }), "other"],
+    ];
+    for (const [e] of inputs) expect(() => log.error("session ingest db error", dbClientErrorFields(e))).not.toThrow();
+    const parsed = lines.filter(l => l.includes("session ingest db error")).map(l => JSON.parse(l) as Record<string, unknown>);
+    expect(parsed).toHaveLength(inputs.length);
+    parsed.forEach((p, i) => expect(p).toMatchObject({ error_code: "db_error", db_error_class: "unknown", db_error_basis: "none", error_name: inputs[i]![1] }));
+    for (const l of lines) for (const n of [...NEEDLES, "AbCd1234"]) expect(l).not.toContain(n);
   });
 
   test("the /v1/delivery/batches 503 route line carries the same class and the correlation id", async () => {
@@ -59,7 +80,7 @@ describe("workerd: session ingest db error classification is visible in the emit
     const route = lines.map(l => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return undefined; } })
       .find(l => l?.route === "delivery.batches");
     expect(res.status).toBe(503);
-    expect(route).toMatchObject({ outcome: "delivery_unavailable", correlation_id: "corr-workerd-503", db_error_class: "terminated" });
+    expect(route).toMatchObject({ outcome: "delivery_unavailable", correlation_id: "corr-workerd-503", db_error_class: "terminated", db_error_code: "db_error", db_error_basis: "message" });
     for (const l of lines) for (const n of NEEDLES) expect(l).not.toContain(n);
   });
 });
