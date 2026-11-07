@@ -471,7 +471,7 @@ test("analysis purge (guarded, ordering): a reset calls purge_session_analysis_f
   expect(((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_owned_sessions")).rows[0] as any).n).toBe(0);
 });
 
-/** #292's workspace-scoped purge_session_analysis_for_owned (both forms), loaded VERBATIM from b608ea3b (046000). */
+/** #292's workspace-scoped purge_session_analysis_for_owned (both forms), loaded VERBATIM from #292 e17231b1 (046000). */
 async function withAnalysis(f: F) {
   await f.db.exec("DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_analysis_admit') THEN CREATE ROLE bulls96_analysis_admit NOLOGIN NOINHERIT; END IF; END$$;");
   await f.db.exec(await Bun.file(new URL("./fixtures/analysis-jobs-046000.sql", import.meta.url)).text());
