@@ -143,7 +143,13 @@ const JOB_COLUMNS = `id::text, harness, status, attempts, analysis_version, sche
   (created_at = $5::timestamptz AND updated_at = $6::timestamptz
    AND completed_at IS NOT DISTINCT FROM $7::timestamptz) AS times_equal`;
 
-/** Ticket, write, then insert+retire, per object; then the requests; then verify every row. */
+/**
+ * Per job: an existing row is proven identical BEFORE anything is written (drift refuses, no
+ * object); otherwise ticket -> write -> insert, and the ticket is retired in the same
+ * statement only when that statement inserted the row. A lost race (the row appeared
+ * meanwhile) keeps the ticket until the winner is proven identical; a drifted winner leaves
+ * the ticket, so the sweeper deletes the orphan object. Then the requests; then verify all.
+ */
 export async function applyBackfill(
   db: SqlExecutor,
   store: ObjectStore,
@@ -156,27 +162,34 @@ export async function applyBackfill(
   const refs = new Map<string, { key: string; sha256: string; bytes: number }>();
   for (const job of plan.jobs) {
     let ref: { key: string; sha256: string; bytes: number } | null = null;
+    let bytes: Uint8Array | null = null;
     if (job.result !== null) {
-      const bytes = new TextEncoder().encode(JSON.stringify(job.result));
+      bytes = new TextEncoder().encode(JSON.stringify(job.result));
       if (bytes.length > ANALYSIS_RESULT_MAX_BYTES) throw new BackfillError("backfill_result_bound");
       const sha256 = createHash("sha256").update(bytes).digest("hex");
-      const key = analysisResultKey(prefix, job.id, sha256);
+      ref = { key: analysisResultKey(prefix, job.id, sha256), sha256, bytes: bytes.length };
+      refs.set(job.id, ref);
+    }
+    // An existing row (a re-run, or another backfill) must equal the plan before any write.
+    if (await jobRowExists(db, scope, job.id)) {
+      await verifyJob(db, scope, job, ref);
+      continue;
+    }
+    if (ref && bytes) {
       // Ticket first, only while the scope is live: an erase from here on leaves the ticket.
       const ticket = await db.query(
         `INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason)
          SELECT $1, $5::uuid, $2, $3, $4, 'publishing' WHERE ${LIVE}
          ON CONFLICT (result_key) DO UPDATE SET created_at = now() RETURNING result_key`,
-        [key, ...scopeParams, job.id],
+        [ref.key, ...scopeParams, job.id],
       );
       if (!ticket.rows.length) throw new BackfillError("backfill_session_not_live");
-      await store.put(objectKey(key), bytes, { ifNoneMatch: true, contentSha256: sha256, contentType: "application/json" });
-      const read = await readAll(await store.get(objectKey(key)));
-      if (createHash("sha256").update(read).digest("hex") !== sha256) throw new BackfillError("backfill_write_verification_failed");
-      ref = { key, sha256, bytes: bytes.length };
-      refs.set(job.id, ref);
+      await store.put(objectKey(ref.key), bytes, { ifNoneMatch: true, contentSha256: ref.sha256, contentType: "application/json" });
+      const read = await readAll(await store.get(objectKey(ref.key)));
+      if (createHash("sha256").update(read).digest("hex") !== ref.sha256) throw new BackfillError("backfill_write_verification_failed");
       objects += 1;
     }
-    const { rows } = await db.query<{ live: boolean }>(
+    const { rows } = await db.query<{ live: boolean; inserted: number }>(
       `WITH ins AS (
          INSERT INTO sessions.session_analysis_jobs_v2
            (id, org_id, workspace_id, session_id, harness, status, attempts, analysis_version, schema_version,
@@ -188,15 +201,20 @@ export async function applyBackfill(
          ON CONFLICT (id) DO NOTHING RETURNING id
        ), retired AS (
          DELETE FROM sessions.session_analysis_result_tickets AS t
-          WHERE $14::text IS NOT NULL AND t.result_key = $14 AND ${LIVE}
+          WHERE $14::text IS NOT NULL AND t.result_key = $14 AND EXISTS (SELECT 1 FROM ins)
          RETURNING t.result_key
        )
-       SELECT ${LIVE} AS live`,
+       SELECT ${LIVE} AS live, (SELECT count(*) FROM ins)::int AS inserted`,
       [job.id, ...scopeParams, job.harness, job.status, job.attempts, job.analysis_version, job.schema_version,
        job.model_version, job.summary_version, job.summary_model_version, job.source_fingerprint, ref?.key ?? null,
        ref?.sha256 ?? null, ref?.bytes ?? null, job.last_error, job.created_at, job.updated_at, job.completed_at],
     );
     if (!rows[0]?.live) throw new BackfillError("backfill_session_not_live");
+    if (Number(rows[0]?.inserted) !== 1) {
+      // Lost the race: the winner must be identical (throws drift and KEEPS the ticket otherwise).
+      await verifyJob(db, scope, job, ref);
+      if (ref) await db.query("DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1 AND job_id = $2::uuid", [ref.key, job.id]);
+    }
   }
   for (const r of plan.requests) {
     await db.query(
@@ -213,6 +231,50 @@ export async function applyBackfill(
   return { jobs: plan.jobs.length, requests: plan.requests.length, objects };
 }
 
+/** Whether a row with this id exists; one in another scope is drift, never this scope's. */
+async function jobRowExists(db: SqlExecutor, scope: BackfillScope, id: string): Promise<boolean> {
+  const { rows } = await db.query<{ same: boolean }>(
+    "SELECT (org_id = $2 AND workspace_id = $3 AND session_id = $4) AS same FROM sessions.session_analysis_jobs_v2 WHERE id = $1::uuid",
+    [id, scope.orgId, scope.workspaceId, scope.sessionId],
+  );
+  if (!rows.length) return false;
+  if (rows[0]!.same !== true) throw new BackfillError("backfill_existing_row_drift");
+  return true;
+}
+
+/** One planned job row exists exactly as planned, result key, digest and size included. */
+async function verifyJob(
+  db: SqlExecutor,
+  scope: BackfillScope,
+  job: BackfillPlan["jobs"][number],
+  ref: { key: string; sha256: string; bytes: number } | null,
+): Promise<void> {
+  const { rows } = await db.query<Json>(
+    `SELECT ${JOB_COLUMNS} FROM sessions.session_analysis_jobs_v2 WHERE id = $1::uuid AND org_id = $2 AND workspace_id = $3 AND session_id = $4`,
+    [job.id, scope.orgId, scope.workspaceId, scope.sessionId, job.created_at, job.updated_at, job.completed_at],
+  );
+  const row = rows[0];
+  if (
+    !row ||
+    row.origin !== "neon_backfill" ||
+    row.status !== job.status ||
+    Number(row.attempts) !== job.attempts ||
+    row.harness !== job.harness ||
+    row.analysis_version !== job.analysis_version ||
+    Number(row.schema_version) !== job.schema_version ||
+    row.model_version !== job.model_version ||
+    row.summary_version !== job.summary_version ||
+    row.summary_model_version !== job.summary_model_version ||
+    row.source_fingerprint !== job.source_fingerprint ||
+    row.last_error !== job.last_error ||
+    (row.result_s3_key ?? null) !== (ref?.key ?? null) ||
+    (row.result_sha256 ?? null) !== (ref?.sha256 ?? null) ||
+    (row.result_bytes === null || row.result_bytes === undefined ? null : Number(row.result_bytes)) !== (ref?.bytes ?? null) ||
+    row.times_equal !== true
+  )
+    throw new BackfillError("backfill_existing_row_drift");
+}
+
 /** Every planned row exists exactly as planned (an existing row that drifted is refused). */
 export async function verifyBackfill(
   db: SqlExecutor,
@@ -220,32 +282,7 @@ export async function verifyBackfill(
   plan: BackfillPlan,
   refs: Map<string, { key: string; sha256: string; bytes: number }>,
 ): Promise<void> {
-  for (const job of plan.jobs) {
-    const { rows } = await db.query<Json>(
-      `SELECT ${JOB_COLUMNS} FROM sessions.session_analysis_jobs_v2 WHERE id = $1::uuid AND org_id = $2 AND workspace_id = $3 AND session_id = $4`,
-      [job.id, scope.orgId, scope.workspaceId, scope.sessionId, job.created_at, job.updated_at, job.completed_at],
-    );
-    const row = rows[0];
-    const ref = refs.get(job.id) ?? null;
-    if (
-      !row ||
-      row.origin !== "neon_backfill" ||
-      row.status !== job.status ||
-      Number(row.attempts) !== job.attempts ||
-      row.harness !== job.harness ||
-      row.analysis_version !== job.analysis_version ||
-      Number(row.schema_version) !== job.schema_version ||
-      row.model_version !== job.model_version ||
-      row.summary_version !== job.summary_version ||
-      row.summary_model_version !== job.summary_model_version ||
-      row.source_fingerprint !== job.source_fingerprint ||
-      row.last_error !== job.last_error ||
-      (row.result_s3_key ?? null) !== (ref?.key ?? null) ||
-      (row.result_sha256 ?? null) !== (ref?.sha256 ?? null) ||
-      row.times_equal !== true
-    )
-      throw new BackfillError("backfill_existing_row_drift");
-  }
+  for (const job of plan.jobs) await verifyJob(db, scope, job, refs.get(job.id) ?? null);
   for (const r of plan.requests) {
     const { rows } = await db.query<Json>(
       `SELECT status, analysis_job_id::text, v1_job_id::text, last_error, origin,

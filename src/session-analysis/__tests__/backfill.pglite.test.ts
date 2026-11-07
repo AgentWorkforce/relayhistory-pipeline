@@ -156,3 +156,52 @@ test("the planner refuses what it cannot keep exactly", () => {
   expect(planBackfill(SCOPE, { outcome: "not_found" })).toEqual({ jobs: [], requests: [], terminalized: 0 });
   expect(parityEqual({ outcome: "not_found" }, null).equal).toBe(true);
 });
+
+const spyStore = (store: ObjectStore, onPut?: (key: string) => Promise<void>) => {
+  const puts: string[] = [];
+  const wrapped: ObjectStore = {
+    backend: store.backend,
+    head: (k) => store.head(k), get: (k, r) => store.get(k, r), getObject: (k, r) => store.getObject(k, r), list: (p, c) => store.list(p, c),
+    presignGet: (k, t) => store.presignGet(k, t), delete: (k) => store.delete(k),
+    async put(key, body, opts) {
+      puts.push(key);
+      const ack = await store.put(key, body, opts);
+      if (onPut) await onPut(key);
+      return ack;
+    },
+  };
+  return { wrapped, puts };
+};
+
+test("P1-b: a drifted existing row is refused before any object is written (result_bytes compared)", async () => {
+  const db = await fresh();
+  const store = tempStore();
+  const plan = planBackfill(SCOPE, NEON);
+  await applyBackfill(hoopDb(db), store, SCOPE, plan);
+  await db.query("UPDATE sessions.session_analysis_jobs_v2 SET result_bytes = result_bytes + 1");
+  const spy = spyStore(store);
+  await expect(applyBackfill(hoopDb(db), spy.wrapped, SCOPE, plan)).rejects.toThrow("backfill_existing_row_drift");
+  expect(spy.puts).toEqual([]);
+  expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
+});
+
+test("P1-b: losing the insert race to a drifted row keeps the ticket, so the sweeper deletes the orphan", async () => {
+  const db = await fresh();
+  const store = tempStore();
+  const plan = planBackfill(SCOPE, NEON);
+  const job = plan.jobs[0]!;
+  // Between the existence check and the insert, another writer lands a different row.
+  const spy = spyStore(store, async () => {
+    await db.query(
+      `INSERT INTO sessions.session_analysis_jobs_v2 (id, org_id, workspace_id, session_id, status, analysis_version, schema_version, model_version, origin, attempts)
+       VALUES ($1::uuid, $2, $3, $4, 'failed', 'x:y', 2, 'gpt-5.4', 'neon_backfill', 9)`,
+      [job.id, KEY.orgId, KEY.workspaceId, KEY.sessionId],
+    );
+  });
+  await expect(applyBackfill(hoopDb(db), spy.wrapped, SCOPE, plan)).rejects.toThrow("backfill_existing_row_drift");
+  expect(spy.puts).toHaveLength(1);
+  const tickets = (await db.query<{ k: string }>("SELECT result_key k FROM sessions.session_analysis_result_tickets")).rows;
+  expect(tickets.map((t) => t.k)).toEqual(spy.puts);
+  expect(await sweepAnalysisTickets(store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never) })).toBe(1);
+  expect(await store.head(objectKey(spy.puts[0]!))).toBeUndefined();
+});
