@@ -26,3 +26,6 @@ Aggregate-v2 evidence adversarial review: exact SQL hash, two distinct READ ONLY
 
 
 Publisher activity evidence adversarial review: exact reviewed SQL and source application-name/runtime-role match, full visibility/read-only/owner guards per distinct transaction, no transaction-role carryover, bounded timeouts and closed-count projection, no identifiers or payload. Zero matching backends/rows is not a daemon-absence, actual-host or authorization claim. Contextual: append the requested one-shot activity observation while preserving lead's conditional inactive disposition and expired schema approval prerequisites. Validation: actual single read-only observation, two guards PASS, exact JSON/hash/manifest and docs-only whitespace checks; no polling or write.
+
+
+Unpaired-tail evidence review: copied existing release-owner closed-count receipt and verified the full digest; no provider call or re-collection. Explicit interval comparison proves NO OVERLAP with SQL; the historical correlated30 kind/name is not accepted as correlation evidence. Exact49/42/5/2 counts retained, raw events absent, no causal/health claim. Contextual: replaces pending-tail metadata with unpaired evidence while preserving all prior scope/approval holds. Validation: receipt/hash/JSON/manifest and docs-only diff checks.

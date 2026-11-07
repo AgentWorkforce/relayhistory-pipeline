@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "at": "2026-11-07T19:53:15.377810+00:00",
+  "at": "2026-11-07T20:04:13.838916+00:00",
   "kind": "source_plan_and_readonly_fixture_evidence",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
   "readiness": "HOLD overall prerequisites and expired plan/capture; Worker exception/publisher plan recorded; bounded diagnostic only",
@@ -27,8 +27,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 7042,
-      "sha256": "4f5f7195b705b583b5decc3cc72ea828fab7fdf9185352e1aa40dbcec0d9e269"
+      "bytes": 7388,
+      "sha256": "d73e5a931e66fde46f33ace0bd2eddef843ebf814fba2d8940c8473485193696"
     },
     {
       "name": "source-evidence.json",
@@ -37,8 +37,8 @@
     },
     {
       "name": "review-notes.md",
-      "bytes": 7071,
-      "sha256": "c001d4800a82b7456727a3d269e6be9b9fe9b97f42994c5a4e75aa7747fa936d"
+      "bytes": 7612,
+      "sha256": "d6d41ab437ef5c252a26f9c361a1dcb7012a097504f628d6faa64fb96ffde96f"
     },
     {
       "name": "supporting-readiness.md",
@@ -152,8 +152,8 @@
     },
     {
       "name": "brian-aggregate-observation.md",
-      "bytes": 3078,
-      "sha256": "ab44f3d96e343d1ba16fea60529c9817895cfc8ab9932555651cbd17f6ee1457"
+      "bytes": 4232,
+      "sha256": "d9c2c90859e0453c3e6399fbafec055ca8755a8d9fb41062b1c3ee11b740ce1b"
     },
     {
       "name": "publisher-activity-result.json",
@@ -174,6 +174,11 @@
       "name": "publisher-activity-observation.md",
       "bytes": 2638,
       "sha256": "28c00fdd1ce9821a4eec332d7f1d12bb162c05fce3326a05cbc5db828e62eb89"
+    },
+    {
+      "name": "ingest-unpaired-tail-receipt.json",
+      "bytes": 706,
+      "sha256": "4e77499fb02e73e42c24dd7ad1e9884c33b85dfabec7e42dd3b4b0d500fc1c54"
     }
   ]
 }

@@ -144,7 +144,17 @@
     "sha256": "e54a299c17781ad0b63150d8cd57fb98ec4be7313314b5ec2ab5f09b1236cb32",
     "status": "OBSERVED_ONE_SAMPLE_NOT_HEALTH_OR_CAUSE_PROOF",
     "interval": "2026-11-07T19:48:47.928Z..2026-11-07T19:48:48.025Z",
-    "pairedTailReceipt": "PENDING_RELEASE_OWNER_REPORT"
+    "pairedTailReceipt": {
+      "status": "COLLECTED_NO_TIME_OVERLAP_UNPAIRED_ONLY",
+      "receipt": "ingest-unpaired-tail-receipt.json",
+      "sha256": "4e77499fb02e73e42c24dd7ad1e9884c33b85dfabec7e42dd3b4b0d500fc1c54",
+      "start": "2026-11-07T19:49:16.645893Z",
+      "durationSeconds": 30.002,
+      "http200": 42,
+      "http503": 5,
+      "http429": 2,
+      "correlationClaim": false
+    }
   },
   "originalPlanCaptureFreshness": "EXPIRED_AT_2026-11-07T19:47:10.129Z_REPLAN_RECAPTURE_REQUIRED"
 }
