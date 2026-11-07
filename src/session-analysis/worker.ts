@@ -139,11 +139,9 @@ export function analysisTick(deps: {
         evidence.anchorManifestKey({ orgId: job.orgId, workspaceId: job.workspaceId, source: harness, sessionId: job.sessionId }),
     });
     // Orphan publications first (erased, lost or crashed): their objects never outlive a tick.
-    if (deps.transact)
-      counts.swept = await sweepAnalysisTickets(deps.store, {
-        transact: deps.transact,
-        ...(deps.eraseObject ? { eraseObject: deps.eraseObject } : {}),
-      });
+    // Only with the every-version eraser: without it, tickets wait (never a plain delete).
+    if (deps.transact && deps.eraseObject)
+      counts.swept = await sweepAnalysisTickets(deps.store, { transact: deps.transact, eraseObject: deps.eraseObject });
     for (let i = 0; i < deps.config.batch; i += 1) {
       const outcome = await runAnalysisJob(
         store,
