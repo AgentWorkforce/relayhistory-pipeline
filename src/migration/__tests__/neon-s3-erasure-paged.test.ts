@@ -200,5 +200,36 @@ describe("absence proof includes delete markers", () => {
   });
 });
 
+describe("retirement cursor bound to the proof workset (lead 913e7ba5 case b)", () => {
+  test("a formerly KEPT reserved version that becomes absent under a fresh proof (same high-water) BEFORE the cursor is retired, not skipped", async () => {
+    const s = new FakeS3Versions();
+    fill(s, 2_500);
+    const EARLY = `${dir("2026/10/30")}raw/a-early.ndjson.zst`; // sorts before every b=... key
+    const keptId = s.put(EARLY, NOW); // newer than the re-read: the time-subset KEEPS it
+    const st = await state();
+    const scope = eraseScope(["live-session", "supabase", G.org_id, G.workspace_id, G.user_id, G.origin_id, G.source, G.session_id]);
+    // Reserved under this scope by an earlier run (it was doomed then), now a kept successor.
+    expect(st.reserveErase(T.base, st.obligationRev(T.base), scope, [{ key: EARLY, versionId: keptId }]).ok).toBe(true);
+    // Run 1 "crashes" right after the first retirement page saved its cursor.
+    let crash = true;
+    const a = authority({ ready: async () => { if (crash && st.retireCursor(scope) !== null) throw Object.assign(new Error("crash"), { code: "crash" }); } });
+    await job(s, st, a).sweep();
+    const cursor = st.retireCursor(scope);
+    expect(cursor).not.toBeNull();
+    expect(EARLY < cursor![0]).toBe(true);
+    expect(st.reservationsAt(EARLY)).toEqual([keptId]); // kept: present, so not retired
+    // Between runs the kept version disappears (absent now); no new reservation: the high-water is unchanged.
+    const hw = st.reservationHighWater(T.base);
+    s.remove(EARLY, keptId);
+    expect(st.reservationHighWater(T.base)).toBe(hw);
+    crash = false;
+    await job(s, st, a).sweep();
+    // The fresh proof's workset differs: the cursor is discarded and the early row retired before any done claim.
+    expect(st.reservationsAt(EARLY)).toEqual([]);
+    expect(st.erasedAt(EARLY)).toEqual([keptId]);
+    st.close();
+  });
+});
+
 // Keep the pointer-prefix helper referenced (the live layout the tests address).
 void livePointerPrefix;

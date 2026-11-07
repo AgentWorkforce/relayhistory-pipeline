@@ -126,7 +126,7 @@ export class ErasureJob {
    *    an acked one only when its exact version is absent from that complete inventory.
    */
   async #erasePaged(prefix: string, scope: string, select: ((v: ListedVersion) => boolean) | undefined, authorize: () => Promise<void>,
-    keyFilter: (key: string) => boolean = () => true, exporterWritten = false, exactKey?: string): Promise<{ status: PagedOutcome; deleted: number; remaining: number }> {
+    keyFilter: (key: string) => boolean = () => true, exporterWritten = false, exactKey?: string): Promise<{ status: PagedOutcome; deleted: number; remaining: number; rev: number }> {
     const exact = exactKey !== undefined ? { exactKey } : {};
     let rev = this.state.obligationRev(prefix);
     let lost = false;
@@ -164,14 +164,14 @@ export class ErasureJob {
     } catch (error) {
       if (lost) {
         this.counters.reservationsRefused += 1;
-        return { status: "refused", deleted: 0, remaining: -1 };
+        return { status: "refused", deleted: 0, remaining: -1, rev };
       }
       throw error;
     }
     if (step.status === "incomplete") {
       this.state.setEraseCheckpoint(scope, step.checkpoint, this.now());
       this.counters.resumable += 1;
-      return { status: "incomplete", deleted: step.deleted, remaining: -1 };
+      return { status: "incomplete", deleted: step.deleted, remaining: -1, rev };
     }
     this.state.clearEraseCheckpoint(scope);
     // The reservation generation the proof below covers: captured BEFORE the inventory, so every reservation it can
@@ -194,7 +194,7 @@ export class ErasureJob {
     });
     let remaining = 0;
     for (const vs of present.values()) remaining += vs.size;
-    if (this.state.obligationRev(prefix) !== rev) return { status: "refused", deleted: step.deleted, remaining };
+    if (this.state.obligationRev(prefix) !== rev) return { status: "refused", deleted: step.deleted, remaining, rev };
     // The obligations the subset depends on: those at its keys under the prefix, plus prefix-level ones covering the
     // prefix itself (an ancestor or equal: legacy imports, nonterminal), deduplicated.
     const seen = new Set<string>();
@@ -206,16 +206,20 @@ export class ErasureJob {
     const done: string[] = [];
     for (const [key, list] of byKey)
       done.push(...terminalInvocations(list, owned.get(key) ?? new Set(), proof.status === "erased" ? (present.get(key) ?? new Set()) : null));
-    if (done.length && !this.state.resolveWrites(prefix, rev, done).ok) return { status: "refused", deleted: step.deleted, remaining };
+    if (done.length) {
+      const r = this.state.resolveWrites(prefix, rev, done);
+      if (!r.ok) return { status: "refused", deleted: step.deleted, remaining, rev };
+      rev = r.rev;
+    }
     if (proof.status !== "erased") {
       this.counters.unverified += 1;
-      return { status: "unverified", deleted: step.deleted, remaining };
+      return { status: "unverified", deleted: step.deleted, remaining, rev };
     }
     // A prefix the exporter writes is never done while its obligations may be incomplete: an unattested genesis (a
     // lost / recreated state file) may have forgotten outstanding PUTs, so it fails closed.
     if (invocations.length - done.length > 0 || (exporterWritten && !(this.cfg.obligationsSettled?.() ?? false))) {
       this.counters.unresolved += 1;
-      return { status: "unresolved", deleted: step.deleted, remaining };
+      return { status: "unresolved", deleted: step.deleted, remaining, rev };
     }
     // Retire EXACTLY the reserved versions this complete inventory shows absent (within keyFilter); every other
     // reservation (kept siblings, successors, other subsets) stays.
@@ -223,18 +227,40 @@ export class ErasureJob {
     // prefix; <= 1000 rows per transaction; durable cursor). Terminal completion only once every page is retired; at
     // the step deadline it stays incomplete and resumes from the cursor on the next run.
     const absent = (key: string, versionId: string) => keyFilter(key) && !(listed.get(key)?.has(versionId) ?? false);
+    // The workset identity this retirement (and its durable cursor) is bound to: prefix, exact key, the reservation
+    // generation and the COMPLETE listing it was proven against. Any change discards a saved cursor (restart).
+    const proofId = createHash("sha256").update(JSON.stringify(["retire-v1", prefix, exactKey ?? null, proofSeq,
+      [...listed].map(([k, vs]) => [k, [...vs].sort()]).sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0))])).digest("hex");
     const deadline = this.now() + ERASE_STEP_DEADLINE_MS;
     for (;;) {
       // Authority re-checked before EVERY page (async, outside the page's transaction; no network await inside it).
       await authorize();
-      const page = this.state.retireReservationsPage(prefix, scope, exactKey, absent, 1000, proofSeq);
+      const page = this.state.retireReservationsPage(prefix, scope, exactKey, absent, 1000, proofSeq, proofId, rev);
+      // A write that landed during the awaited authority check (or since the proof) refuses the page: no done claim;
+      // the next run takes a fresh proof, and the new pending effect is kept.
+      if (!page.ok) {
+        this.counters.reservationsRefused += 1;
+        return { status: "refused", deleted: step.deleted, remaining, rev: page.rev };
+      }
+      rev = page.rev;
       if (page.done) break;
       if (this.now() >= deadline) {
         this.counters.resumable += 1;
-        return { status: "incomplete", deleted: step.deleted, remaining };
+        return { status: "incomplete", deleted: step.deleted, remaining, rev };
       }
     }
-    return { status: "erased", deleted: step.deleted, remaining };
+    // Final assertion under the CURRENT proof: no eligible (proof-absent) reservation of this scope remains (bounded,
+    // read-only pages within the same deadline). Anything left, or no time to check: incomplete, never done.
+    for (let after: [string, string] | null = null, first = true; first || after !== null; first = false) {
+      if (this.now() >= deadline) {
+        this.counters.resumable += 1;
+        return { status: "incomplete", deleted: step.deleted, remaining, rev };
+      }
+      const pg = this.state.eligibleRemainingPage(prefix, scope, exactKey, absent, proofSeq, after);
+      if (pg.eligible > 0) return { status: "incomplete", deleted: step.deleted, remaining, rev };
+      after = pg.next;
+    }
+    return { status: "erased", deleted: step.deleted, remaining, rev };
   }
 
   /**
@@ -564,8 +590,12 @@ export class ErasureJob {
             continue;
           }
           if (r.status !== "erased") continue;
+          // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
+          if (!this.state.completeErasure(item.key, item.enqueued_at, item.key.slice(0, item.key.lastIndexOf("/") + 1), r.rev)) {
+            this.counters.reservationsRefused += 1;
+            continue;
+          }
           this.counters.objectsErased += 1;
-          this.state.erasureDone(item.key, item.enqueued_at);
           continue;
         }
         // A session prefix: the shared strict paged eraser, resumable across runs from a durable checkpoint bound to
@@ -588,8 +618,12 @@ export class ErasureJob {
           continue;
         }
         if (r.status !== "erased") continue;
+        // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
+        if (!this.state.completeErasure(item.key, item.enqueued_at, item.key, r.rev)) {
+          this.counters.reservationsRefused += 1;
+          continue;
+        }
         this.counters.prefixesErased += 1;
-        this.state.erasureDone(item.key, item.enqueued_at);
       } catch (error) {
         this.counters.failed += 1;
         this.state.erasureFailed(item.key, errorCode(error), this.now());

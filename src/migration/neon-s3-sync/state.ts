@@ -574,11 +574,21 @@ export class SyncState {
    * rescanning; the cursor is cleared when the scan is complete.
    */
   retireReservationsPage(prefix: string, scope: string, exactKey: string | undefined, absent: (key: string, versionId: string) => boolean, limit = 1000,
-    maxSeq = Number.MAX_SAFE_INTEGER): { retired: number; done: boolean } {
-    let out = { retired: 0, done: false };
+    maxSeq = Number.MAX_SAFE_INTEGER, proofId = "unbound", expectRev?: number): { retired: number; done: boolean; ok: boolean; rev: number } {
+    let out = { retired: 0, done: false, ok: false, rev: -1 };
     this.#tx(() => {
+      // Under the writer/retire lock (this IMMEDIATE transaction): the prefix revision must still be the one the caller
+      // proved against; a dispatch / publish / reservation that landed meanwhile refuses this page (nothing retired).
+      if (expectRev !== undefined && this.obligationRev(prefix) !== expectRev) {
+        out = { retired: 0, done: false, ok: false, rev: this.obligationRev(prefix) };
+        return;
+      }
       const ck = `retire_cursor:${scope}`;
-      const cur = JSON.parse(this.meta(ck) ?? "null") as [string, string] | null;
+      // The cursor is bound to the proof/workset it was taken under ({proof, pos}). A different proof (new reservations,
+      // a changed listing, another key or selection) DISCARDS it: retirement restarts from the start (idempotent),
+      // so a row that now sorts before an old cursor is never skipped.
+      const saved = JSON.parse(this.meta(ck) ?? "null") as { proof: string; pos: [string, string] } | null;
+      const cur = saved && saved.proof === proofId ? saved.pos : null;
       const after = cur ? "AND (key > ? OR (key = ? AND version_id > ?))" : "";
       const where = exactKey !== undefined ? "key = ?" : SyncState.#under;
       // Bound to the PROOF's generation: only reservations at or below the high-water seq captured when the proof completed
@@ -596,15 +606,42 @@ export class SyncState {
       }
       const done = rows.length < limit;
       if (done) this.db.prepare("DELETE FROM meta WHERE k = ?").run(ck);
-      else this.setMeta(ck, JSON.stringify([rows[rows.length - 1]!.key, rows[rows.length - 1]!.version_id]));
-      out = { retired, done };
+      else this.setMeta(ck, JSON.stringify({ proof: proofId, pos: [rows[rows.length - 1]!.key, rows[rows.length - 1]!.version_id] }));
+      out = { retired, done, ok: true, rev: this.obligationRev(prefix) };
     });
     return out;
+  }
+  /**
+   * Read-only bounded page: how many of this scope's reservations (<= maxSeq, at exactKey or under prefix) the current
+   * proof says are absent but are still reserved. Used as the final assertion (must be 0) before any done claim.
+   */
+  eligibleRemainingPage(prefix: string, scope: string, exactKey: string | undefined, absent: (key: string, versionId: string) => boolean,
+    maxSeq: number, after: [string, string] | null, limit = 1000): { eligible: number; next: [string, string] | null } {
+    const where = exactKey !== undefined ? "key = ?" : SyncState.#under;
+    const cond = after ? "AND (key > ? OR (key = ? AND version_id > ?))" : "";
+    const params: (string | number | Uint8Array)[] = [...(exactKey !== undefined ? [exactKey] : SyncState.#u(prefix)), scope, maxSeq, ...(after ? [after[0], after[0], after[1]] : []), limit];
+    const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${where} AND scope = ? AND seq <= ? ${cond} ORDER BY key, version_id LIMIT ?`).all(...params) as { key: string; version_id: string }[];
+    let eligible = 0;
+    for (const r of rows) if (absent(r.key, r.version_id)) eligible += 1;
+    return { eligible, next: rows.length < limit ? null : [rows[rows.length - 1]!.key, rows[rows.length - 1]!.version_id] };
+  }
+  /**
+   * The terminal claim, atomically with its re-validation: the queue row is removed (erasure done) only if the prefix
+   * revision is still `expectRev` in the SAME transaction; otherwise nothing changes and the item stays queued.
+   */
+  completeErasure(key: string, enqueuedAt: number, prefix: string, expectRev: number): boolean {
+    let ok = false;
+    this.#tx(() => {
+      if (this.obligationRev(prefix) !== expectRev) return;
+      this.db.prepare("DELETE FROM erasures WHERE key = ? AND enqueued_at = ?").run(key, enqueuedAt);
+      ok = true;
+    });
+    return ok;
   }
   /** Unbounded convenience over the paged retirement (tests): every page, in order. */
   retireReservations(prefix: string, absent: (key: string, versionId: string) => boolean, scope?: string) {
     const scopes = scope !== undefined ? [scope] : (this.db.prepare(`SELECT DISTINCT scope FROM erase_reservations WHERE ${SyncState.#under}`).all(...SyncState.#u(prefix)) as { scope: string }[]).map((r) => r.scope);
-    for (const sc of scopes) while (!this.retireReservationsPage(prefix, sc, undefined, absent).done);
+    for (const sc of scopes) while (!this.retireReservationsPage(prefix, sc, undefined, absent, 1000, Number.MAX_SAFE_INTEGER, "convenience").done);
   }
   /** The reservations' high-water seq under a prefix (the generation a completed proof covers). */
   reservationHighWater(prefix: string): number {
@@ -612,7 +649,7 @@ export class SyncState {
   }
   /** The durable retirement cursor of a scope (tests / audits). */
   retireCursor(scope: string): [string, string] | null {
-    return JSON.parse(this.meta(`retire_cursor:${scope}`) ?? "null");
+    return (JSON.parse(this.meta(`retire_cursor:${scope}`) ?? "null") as { pos: [string, string] } | null)?.pos ?? null;
   }
   /** EXPLAIN QUERY PLAN of the exact-key retirement scan (tests: an index on key, no prefix range). */
   retirePlan(key: string, scope: string): string {

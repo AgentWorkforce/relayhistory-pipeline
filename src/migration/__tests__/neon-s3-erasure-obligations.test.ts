@@ -506,15 +506,16 @@ describe("bounded, resumable reservation retirement (dogpatch 5548 P2)", () => {
 
   test("a large set retires in bounded pages (<= 1000 rows per transaction); a crash mid-retirement RESUMES from the durable cursor", async () => {
     const r = await reserved(2_500);
-    const first = r.st.retireReservationsPage(D, "S", undefined, () => true);
-    expect(first).toEqual({ retired: 1000, done: false });
+    const first = r.st.retireReservationsPage(D, "S", undefined, () => true, 1000, Number.MAX_SAFE_INTEGER, "proof-1");
+    expect(first).toMatchObject({ retired: 1000, done: false });
     expect(r.st.retireCursor("S")).toEqual([r.vs[999]!.key, "v999"]);
     // Crash: a new process on the same file resumes after the cursor (nothing re-scanned, nothing lost).
     r.st.close();
     const st2 = new SyncState(r.path);
     expect(st2.retireCursor("S")).toEqual([r.vs[999]!.key, "v999"]);
-    expect(st2.retireReservationsPage(D, "S", undefined, () => true)).toEqual({ retired: 1000, done: false });
-    expect(st2.retireReservationsPage(D, "S", undefined, () => true)).toEqual({ retired: 500, done: true });
+    // The SAME proof (unchanged workset) resumes after the cursor.
+    expect(st2.retireReservationsPage(D, "S", undefined, () => true, 1000, Number.MAX_SAFE_INTEGER, "proof-1")).toMatchObject({ retired: 1000, done: false });
+    expect(st2.retireReservationsPage(D, "S", undefined, () => true, 1000, Number.MAX_SAFE_INTEGER, "proof-1")).toMatchObject({ retired: 500, done: true });
     expect(st2.retireCursor("S")).toBeNull();
     expect(count(st2, "SELECT count(*) AS n FROM erased_versions")).toBe(2_500);
     expect(count(st2, "SELECT count(*) AS n FROM erase_reservations")).toBe(0);
@@ -538,9 +539,38 @@ describe("bounded, resumable reservation retirement (dogpatch 5548 P2)", () => {
     expect(r.st.retirePlan(target, "S")).toMatch(/SEARCH .* USING (COVERING )?(INDEX|PRIMARY KEY)/);
     let seen = 0;
     const res = r.st.retireReservationsPage(D, "S", target, (k) => { seen += 1; expect(k).toBe(target); return true; });
-    expect(res).toEqual({ retired: 1, done: true });
+    expect(res).toMatchObject({ retired: 1, done: true });
     expect(seen).toBe(1);
     expect(count(r.st, "SELECT count(*) AS n FROM erase_reservations")).toBe(1_499);
+  });
+
+  test("lead schedule 1 (state method): after page 1, a FRESH proof with an earlier-key new reservation (HW 5 -> 6) is not skipped; done only with eligibleRemaining 0", async () => {
+    const r = await reserved(2_500);
+    const all = () => true;
+    const hw1 = r.st.reservationHighWater(D);
+    expect(r.st.retireReservationsPage(D, "S", undefined, all, 1000, hw1, "proof-1")).toMatchObject({ retired: 1000, done: false });
+    const early = { key: `${D}a-early.zst`, versionId: "v-early" };
+    expect(r.st.reserveErase(D, r.st.obligationRev(D), "S", [early]).ok).toBe(true);
+    const hw2 = r.st.reservationHighWater(D);
+    let last;
+    do last = r.st.retireReservationsPage(D, "S", undefined, all, 1000, hw2, "proof-2"); while (!last.done);
+    expect(r.st.eligibleRemainingPage(D, "S", undefined, all, hw2, null).eligible).toBe(0);
+    expect(r.st.reservationsAt(early.key)).toEqual([]);
+  });
+
+  test("lead schedule 2 (state method): a formerly KEPT row behind the cursor, absent under a fresh proof at the SAME HW, is not skipped", async () => {
+    const r = await reserved(2_500);
+    const kept = r.vs[3]!; // sorts before page 1's cursor
+    const hw = r.st.reservationHighWater(D);
+    const proof1 = (k: string, v: string) => !(k === kept.key && v === kept.versionId);
+    expect(r.st.retireReservationsPage(D, "S", undefined, proof1, 1000, hw, "proof-1")).toMatchObject({ done: false });
+    expect(r.st.reservationsAt(kept.key)).toEqual([kept.versionId]);
+    // A fresh proof (same HW) now finds the kept version absent: a different workset identity.
+    const proof2 = () => true;
+    let last;
+    do last = r.st.retireReservationsPage(D, "S", undefined, proof2, 1000, hw, "proof-2"); while (!last.done);
+    expect(r.st.eligibleRemainingPage(D, "S", undefined, proof2, hw, null).eligible).toBe(0);
+    expect(r.st.reservationsAt(kept.key)).toEqual([]);
   });
 
   test("a reservation added AFTER the proof's generation stays reserved (never retired against the older proof)", async () => {
@@ -572,6 +602,59 @@ describe("bounded, resumable reservation retirement (dogpatch 5548 P2)", () => {
     expect(w.st.reservationsAt(late.key)).toEqual(["v-late-concurrent"]);
     expect(w.st.erasedAt(late.key)).toEqual([]);
     expect(w.queued()).toEqual([PREFIX]);
+  });
+
+  test("job level, across runs: a row that sorts BEFORE a saved cursor under a FRESH proof is not skipped (no erased until it is handled)", async () => {
+    const s = new FakeS3Versions();
+    // dogpatch's independent case: 1,500 rows, a crash after page 1, then an earlier-key reservation at H1+1.
+    for (let i = 0; i < 1_500; i++) s.put(key(1_000 + i), OLD);
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-xrun-")), "s.sqlite"));
+    let clock = Date.parse("2026-11-07T00:00:00Z");
+    const enq = clock - 1000;
+    st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }], enq);
+    const scope = eraseScope(["queued-prefix", "supabase", "org-1", PREFIX, "fenced", enq, "lease:" + PREFIX]);
+    // Run 1 "crashes" right after its first retirement page saved the cursor (the authority check before page 2 fails).
+    let crash = true;
+    const a = { ...authority(), ready: async () => { if (crash && st.retireCursor(scope) !== null) throw Object.assign(new Error("crash"), { code: "crash" }); } };
+    const j = new ErasureJob(a, st, s.eraser(), () => {}, { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true }, () => clock, async () => {});
+    await j.drain();
+    const cursor = st.retireCursor(scope);
+    expect(cursor).not.toBeNull();
+    expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10).map((e) => e.key)).toEqual([PREFIX]);
+    // Between runs: a reservation (same scope) at a key that sorts BEFORE the cursor, whose version is absent.
+    const early = { key: key(0), versionId: "v-early" };
+    expect(early.key < cursor![0]).toBe(true);
+    const h1 = st.reservationHighWater(PREFIX);
+    expect(st.reserveErase(PREFIX, st.obligationRev(PREFIX), scope, [early]).ok).toBe(true);
+    expect(st.reservationHighWater(PREFIX)).toBeGreaterThan(h1); // the early row sits at H1+1
+    // Run 2 with a fresh proof: the early row must be handled (retired) before the prefix is reported erased.
+    crash = false;
+    clock += 3_600_000;
+    await j.drain();
+    expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10)).toEqual([]);
+    expect(st.reservationsAt(early.key)).toEqual([]);
+    expect(st.erasedAt(early.key)).toEqual(["v-early"]);
+  });
+
+  test("a write landing DURING retirement (during the awaited authority check between pages) refuses the done claim; the queue row and the new invocation stay", async () => {
+    const s = new FakeS3Versions();
+    for (let i = 0; i < 2_500; i++) s.put(key(1_000 + i), OLD);
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-during-")), "s.sqlite"));
+    const clock = Date.parse("2026-11-07T00:00:00Z");
+    const enq = clock - 1000;
+    st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }], enq);
+    const scope = eraseScope(["queued-prefix", "supabase", "org-1", PREFIX, "fenced", enq, "lease:" + PREFIX]);
+    let inv: string | undefined;
+    const a = { ...authority(), ready: async () => {
+      // Once retirement has begun (page 1 saved its cursor), an exporter dispatch lands under the prefix.
+      if (inv === undefined && st.retireCursor(scope) !== null) inv = st.dispatchWrite(`${PREFIX}raw/new.ndjson.zst`, "exporter:1");
+    } };
+    const j = new ErasureJob(a, st, s.eraser(), () => {}, { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true }, () => clock, async () => {});
+    await j.drain();
+    expect(inv).toBeDefined();
+    expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10).map((e) => e.key)).toEqual([PREFIX]); // no done claim
+    expect(j.counters.prefixesErased).toBe(0);
+    expect(st.unresolvedWrites(PREFIX).map((w) => w.id)).toEqual([inv]); // the new pending effect is kept
   });
 
   test("job level: a prefix whose reservations span several retirement pages still completes, and every proven-absent version is in the history", async () => {
