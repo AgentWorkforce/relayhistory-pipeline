@@ -140,3 +140,15 @@ test("the readiness RPC refuses any caller that is not the fixed reader on its o
   try { await expect(call()).rejects.toMatchObject({ code: "42501" }); } // session_user is still postgres
   finally { await db.exec("RESET ROLE"); }
 }, 120_000);
+
+test("an identical RPC grant set in a different physical ACL order passes both verifiers", async () => {
+  const db = await migrated();
+  // REVOKE then re-GRANT the owner's EXECUTE: the same set, but the reader entry is now first.
+  await db.exec(`REVOKE EXECUTE ON FUNCTION sessions.portable_reader_readiness(text[], text) FROM postgres;
+    GRANT EXECUTE ON FUNCTION sessions.portable_reader_readiness(text[], text) TO postgres;`);
+  const order = (await db.query<{ k: string }>(`SELECT x.grantee::regrole::text AS k
+      FROM pg_proc p, aclexplode(p.proacl) x WHERE p.oid = 'sessions.portable_reader_readiness(text[],text)'::regprocedure`)).rows.map(r => r.k);
+  expect(order[0]).toBe("bulls96_read_api"); // physically reordered
+  await reader(db);
+  await storage(db);
+}, 120_000);

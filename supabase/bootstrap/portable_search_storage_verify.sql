@@ -248,10 +248,15 @@ BEGIN
          IS DISTINCT FROM '6f198ba75dc55787c7af275752540c0ee494976110687575cb3020ce93ef6795' THEN
         v_problems := array_append(v_problems, ('readiness function body differs from the reviewed definition')::text);
       END IF;
-      IF (SELECT string_agg(CASE WHEN x.grantee = p.proowner THEN '<owner>' WHEN x.grantee = 0 THEN 'PUBLIC' ELSE x.grantee::regrole::text END
-                            || ':' || x.privilege_type || CASE WHEN x.is_grantable THEN '*' ELSE '' END, ',' ORDER BY 1)
-            FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
-           WHERE p.oid = to_regprocedure('sessions.portable_reader_readiness(text[],text)'))
+      -- Sorted by the computed grant key itself (an aggregate ORDER BY cannot name an
+      -- output column; ORDER BY 1 would sort by a constant and keep physical ACL order),
+      -- under COLLATE "C" so the customer database's locale/punctuation rules cannot reorder
+      -- '<owner>' against role names and falsely refuse the exact set.
+      IF (SELECT string_agg(g.k, ',' ORDER BY g.k COLLATE "C")
+            FROM (SELECT CASE WHEN x.grantee = p.proowner THEN '<owner>' WHEN x.grantee = 0 THEN 'PUBLIC' ELSE x.grantee::regrole::text END
+                         || ':' || x.privilege_type || CASE WHEN x.is_grantable THEN '*' ELSE '' END AS k
+                    FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+                   WHERE p.oid = to_regprocedure('sessions.portable_reader_readiness(text[],text)')) AS g)
          IS DISTINCT FROM '<owner>:EXECUTE,bulls96_read_api:EXECUTE' THEN
         v_problems := array_append(v_problems, ('readiness function EXECUTE grants are not exactly the owner and bulls96_read_api')::text);
       END IF;

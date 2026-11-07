@@ -326,6 +326,26 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pending'");
     expect(await rpc(readerPool, names, gen)).toBe("validation_pending");
     await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pass'");
+    // Locale independence of the verifiers' exact grant-set comparison: record the database
+    // collation and show that it would order the two canonical keys differently from "C".
+    const coll = (await t.owner.query<{ c: string }>("SELECT datcollate AS c FROM pg_database WHERE datname = current_database()")).rows[0]!.c;
+    const byLocale = (await t.owner.query<{ s: string }>("SELECT string_agg(k, ',' ORDER BY k) AS s FROM (VALUES ('<owner>:EXECUTE'), ('bulls96_read_api:EXECUTE')) v(k)")).rows[0]!.s;
+    const byC = (await t.owner.query<{ s: string }>(`SELECT string_agg(k, ',' ORDER BY k COLLATE "C") AS s FROM (VALUES ('<owner>:EXECUTE'), ('bulls96_read_api:EXECUTE')) v(k)`)).rows[0]!.s;
+    expect(byC).toBe("<owner>:EXECUTE,bulls96_read_api:EXECUTE");
+    if (coll !== "C" && coll !== "POSIX") expect(byLocale).not.toBe(byC); // the hazard is real here
+    // Reorder the identical grant set physically; both verifiers must still pass.
+    await t.owner.query(`REVOKE EXECUTE ON FUNCTION sessions.portable_reader_readiness(text[], text) FROM CURRENT_USER;
+      GRANT EXECUTE ON FUNCTION sessions.portable_reader_readiness(text[], text) TO CURRENT_USER`);
+    await t.owner.query(readFileSync(join(root, "supabase/bootstrap/session_read_api_role_verify.sql"), "utf8").split("\n").filter(l => !l.startsWith("\\")).join("\n"));
+    await verifyAs(t.owner, t.rt);
+    // marker_missing: delete the marker row, observe, restore exactly.
+    const saved = (await t.owner.query<{ name: string; generation: string; status: string; updated_at: string }>("SELECT * FROM sessions.__96bulls_role_validation")).rows;
+    expect(saved.length).toBe(1);
+    await t.owner.query("DELETE FROM sessions.__96bulls_role_validation");
+    expect(await rpc(readerPool, names, gen)).toBe("marker_missing");
+    await t.owner.query("INSERT INTO sessions.__96bulls_role_validation(name, generation, status, updated_at) VALUES ($1, $2, $3, $4)",
+      [saved[0]!.name, saved[0]!.generation, saved[0]!.status, saved[0]!.updated_at]);
+    expect(await rpc(readerPool, names, gen)).toBe("pass");
     // Input validation (22023): NULL generation/array/member, empty array, bad member, oversize, bad hex.
     for (const [n, g] of [[names, null], [null, gen], [[...names, null], gen], [[], gen], [["drop table x"], gen], [["upstream:" + "a".repeat(201)], gen], [Array.from({ length: 513 }, (_, i) => `upstream:f${i}.sql`), gen], [names, "XYZ"]] as [unknown, unknown][])
       expect(await errCode(rpc(readerPool, n, g))).toBe("22023");
