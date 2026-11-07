@@ -7,7 +7,7 @@
  */
 import { createS3Eraser } from "../neon-s3-erasure/eraser.ts";
 
-export interface FakeVersion { id: string; at: number; marker?: boolean }
+export interface FakeVersion { id: string; at: number; marker?: boolean; etag?: string }
 
 export class FakeS3Versions {
   readonly keys = new Map<string, FakeVersion[]>();
@@ -20,9 +20,9 @@ export class FakeS3Versions {
   /** Called for every DELETE; return "lose" to apply it but answer 500. */
   onDelete?: (key: string, id: string) => "lose" | void;
 
-  put(key: string, at = Date.now()): string {
+  put(key: string, at = Date.now(), etag?: string): string {
     const id = `v${String(++this.#n).padStart(8, "0")}`;
-    this.keys.set(key, [{ id, at }, ...(this.keys.get(key) ?? [])]);
+    this.keys.set(key, [{ id, at, ...(etag ? { etag } : {}) }, ...(this.keys.get(key) ?? [])]);
     return id;
   }
   count(prefix = ""): number {
@@ -54,7 +54,7 @@ export class FakeS3Versions {
     const last = page[page.length - 1];
     const entries = page.map((e) => {
       const tag = e.v.marker ? "DeleteMarker" : "Version";
-      return `<${tag}><Key>${e.key}</Key><VersionId>${e.v.id}</VersionId><IsLatest>${e.latest}</IsLatest><LastModified>${new Date(e.v.at).toISOString()}</LastModified></${tag}>`;
+      return `<${tag}><Key>${e.key}</Key><VersionId>${e.v.id}</VersionId><IsLatest>${e.latest}</IsLatest><LastModified>${new Date(e.v.at).toISOString()}</LastModified>${e.v.etag && !e.v.marker ? `<ETag>&quot;${e.v.etag}&quot;</ETag>` : ""}</${tag}>`;
     }).join("");
     let xml = `<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult><Name>b</Name><Prefix>${prefix}</Prefix><IsTruncated>${truncated}</IsTruncated>`
       + (truncated && last ? `<NextKeyMarker>${last.key}</NextKeyMarker><NextVersionIdMarker>${last.v.id}</NextVersionIdMarker>` : "") + `${entries}</ListVersionsResult>`;

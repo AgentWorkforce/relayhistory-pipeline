@@ -460,6 +460,39 @@ CREATE TRIGGER session_analysis_v2_forget_deleted_directory
 -- with the same id is untouched. Like the forget trigger, every result key is ticketed
 -- 'forgotten' for the sweeper's every-version erase before the rows are deleted. A no-op (0)
 -- when lane A's tables are absent. Returns the analysis jobs purged. Owner-only.
+-- Proof of an in-progress privacy-authority operation, bound to the CURRENT transaction and the
+-- exact (org, workspace, user): lane A's SECURITY DEFINER authority writes it with
+-- session_analysis_purge_grant (owner-only EXECUTE) immediately before it calls the purge, and the
+-- purge consumes it. A role that merely SETs bulls96.privacy_authority_writer has no proof (and no
+-- EXECUTE on either function). Owner-only.
+CREATE TABLE sessions.session_analysis_purge_authority (
+  txid bigint NOT NULL,
+  org_id text NOT NULL,
+  workspace_id text NOT NULL,
+  user_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (txid, org_id, workspace_id, user_id)
+);
+ALTER TABLE sessions.session_analysis_purge_authority ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_analysis_purge_authority FROM PUBLIC, anon, authenticated, service_role;
+
+CREATE FUNCTION sessions.session_analysis_purge_grant(p_org text, p_workspace text, p_user text)
+RETURNS void LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $purge_grant$
+BEGIN
+  PERFORM sessions.session_analysis_require_caller(ARRAY['bulls96_session_ingest']);
+  IF coalesce(current_setting('bulls96.privacy_authority_writer', true), '') <> 'authority'
+     AND coalesce(nullif(current_setting('role', true), 'none'), session_user::text) = 'bulls96_session_ingest' THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'purge_session_analysis_for_owned: outside the privacy authority';
+  END IF;
+  IF p_org IS NULL OR btrim(p_org) = '' OR p_workspace IS NULL OR btrim(p_workspace) = '' OR p_user IS NULL OR btrim(p_user) = '' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'purge_session_analysis_for_owned: org, workspace and user are required';
+  END IF;
+  INSERT INTO sessions.session_analysis_purge_authority (txid, org_id, workspace_id, user_id)
+  VALUES (txid_current(), p_org, p_workspace, p_user) ON CONFLICT DO NOTHING;
+END
+$purge_grant$;
+
 CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text, p_workspace text, p_user text, p_sessions jsonb)
 RETURNS integer LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $purge_owned$
@@ -472,6 +505,17 @@ BEGIN
   IF coalesce(nullif(current_setting('role', true), 'none'), session_user::text) = 'bulls96_session_ingest'
      AND coalesce(current_setting('bulls96.privacy_authority_writer', true), '') <> 'authority' THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'purge_session_analysis_for_owned: outside the privacy authority';
+  END IF;
+  -- Not the GUC alone: a non-owner caller must hold the authority's proof for THIS transaction
+  -- and THIS exact scope (consumed here, so it authorizes exactly one purge).
+  IF coalesce(nullif(current_setting('role', true), 'none'), session_user::text) <> (
+       SELECT pg_get_userbyid(p.proowner) FROM pg_proc AS p
+        WHERE p.oid = 'sessions.session_analysis_require_caller(text[])'::regprocedure) THEN
+    DELETE FROM sessions.session_analysis_purge_authority
+     WHERE txid = txid_current() AND org_id = p_org AND workspace_id = p_workspace AND user_id = p_user;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'purge_session_analysis_for_owned: no privacy-authority proof for this transaction and scope';
+    END IF;
   END IF;
   IF p_org IS NULL OR btrim(p_org) = '' OR p_workspace IS NULL OR btrim(p_workspace) = ''
      OR p_user IS NULL OR btrim(p_user) = '' THEN
@@ -759,6 +803,7 @@ $read$;
 REVOKE ALL ON FUNCTION sessions.session_analysis_v2_forget() FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_require_caller(text[]) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text, text, jsonb) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_analysis_purge_grant(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_admit_scope(text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_source_revision(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
@@ -784,6 +829,7 @@ BEGIN
     'sessions.session_analysis_v2_forget()'::regprocedure,
     'sessions.session_analysis_require_caller(text[])'::regprocedure,
     'sessions.purge_session_analysis_for_owned(text, text, text, jsonb)'::regprocedure,
+    'sessions.session_analysis_purge_grant(text, text, text)'::regprocedure,
     'sessions.purge_session_analysis_for_owned(text, text, text)'::regprocedure,
     'sessions.session_analysis_admit_scope(text, text)'::regprocedure,
     'sessions.session_analysis_source_revision(text, text, text)'::regprocedure,
