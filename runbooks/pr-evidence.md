@@ -31,9 +31,10 @@ PRs in cloud-web, and cloud-web stamps the PR bodies.
      replay-source snapshot (pointer manifest keys, epoch, fingerprint);
    - for a history-authoritative scope, the worker pages the authority's record-winner mask
      (`session_history_mask_page`);
-   - `readCanonicalScope` reads those manifests, `applyHistoryMask` drops records that moved to
-     another scope or whose winner is a delete or another origin, then `extractPullRequestEvidence`
-     runs;
+   - `readCanonicalScope` reads those manifests. For a history scope, `maskedProjection` first
+     filters the RAW normalized records through the mask (records that moved to another scope,
+     delete winners, other-origin or other-revision copies), then projects. The catalog collapse
+     therefore sees only admitted records. `extractPullRequestEvidence` runs last;
    - `session_pr_evidence_install_v1` CAS-installs the rows under the replay-publication row lock,
      bound to the fingerprint. For a history scope, install requires the worker to attest the
      exact live, ready authority and mask it applied.
@@ -74,7 +75,8 @@ recovers a lost wakeup. Retention-ready: rows carry `org_id` plus `built_at`.
    claims nothing until step 3.
 3. `INSERT INTO sessions.session_pr_evidence_settings(enabled) VALUES (true);`. New publishes
    arm wakeups from this point.
-4. Backfill old sessions in bounded pages:
+4. Backfill old sessions, and recover any lost wakeup, in bounded pages. This arms every live
+   scope whose evidence is missing, or stale against the current replay-source fingerprint:
    `SELECT sessions.session_pr_evidence_enqueue_v1('{"limit":1000,"after":null}')`.
    Repeat it with the returned `next` until `next` is null. Watch the wakeup depth and
    `last_error` counts.
@@ -137,9 +139,8 @@ with `relayhistory_readonly`.
 
 ## Known limits
 
-- The mask filter cannot check a winner's revision, because projected rows do not carry it. A copy
-  from the winner's origin is kept and a copy from any other origin is dropped. The failure mode is
-  under-attribution, never mis-attribution.
+- If the winning copy was folded away by revision normalization, the record is dropped. The
+  failure mode is under-attribution, never mis-attribution.
 - Extraction is CPU-bound per scope, bounded by the artifact source limits (256 MiB, 1M records).
   A larger scope installs `incomplete:scope_too_large`.
 

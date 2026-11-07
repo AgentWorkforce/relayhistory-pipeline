@@ -226,6 +226,31 @@ test("P2: a wakeup failure never fails the creator transaction", async () => {
   } finally { await db.exec("ALTER TABLE sessions.session_pr_evidence_wakeups DROP CONSTRAINT f3_probe_refuse"); }
 });
 
+test("P1-b: a wakeup lost to the trigger's handler is recovered by enqueue even when older ready evidence exists", async () => {
+  await setEnabled(true);
+  const f = await prepare(); await f.install();
+  const v1 = await claimFor(f.sessionId);
+  expect(await store().install(v1, PR_EVIDENCE_EXTRACTOR_VERSION, { status: "ready", rows: [ROW] })).toEqual({ ok: true });
+  // V2 publishes while ONLY the wakeup insert fails (swallowed by the trigger's handler).
+  await db.exec("ALTER TABLE sessions.session_pr_evidence_wakeups ADD CONSTRAINT f3_probe_lost CHECK (false) NOT VALID");
+  try { await f.replace(); } finally { await db.exec("ALTER TABLE sessions.session_pr_evidence_wakeups DROP CONSTRAINT f3_probe_lost"); }
+  const e2 = await f.event();
+  expect(await f.wakeup()).toBeUndefined();
+  expect(await read(e2.event_id, e2.generation)).toEqual({ status: "pending" });
+  // Bounded recovery arms the stale scope (V1 state, V2 source) ...
+  let after: unknown = null, found = false;
+  for (let i = 0; i < 100 && !found; i++) {
+    const page = (await db.query<{ r: any }>("SELECT sessions.session_pr_evidence_enqueue_v1($1::jsonb) r", [JSON.stringify({ limit: 5000, after })])).rows[0]!.r;
+    found = !!(await f.wakeup()); after = page.next; if (after === null) break;
+  }
+  expect(await f.wakeup()).toBeDefined();
+  // ... and the rebuild serves V2.
+  const v2 = await claimFor(f.sessionId);
+  expect(v2.source.fingerprint).toBe(e2.source_fingerprint);
+  expect(await store().install(v2, PR_EVIDENCE_EXTRACTOR_VERSION, { status: "ready", rows: [BRANCH] })).toEqual({ ok: true });
+  expect((await read(e2.event_id, e2.generation)).evidence.map((x: any) => x.head_ref)).toEqual(["lonely"]);
+});
+
 test("incomplete builds are served as incomplete, not as no PRs", async () => {
   const f = await prepare(); await f.install(); const e = await f.event();
   const c = await claimFor(f.sessionId);
@@ -293,7 +318,8 @@ test("operator backfill arms only scopes without state, bounded and resumable", 
   expect(page.armed).toBeLessThanOrEqual(2); expect(page.next).not.toBeNull();
   const next = (await db.query<{ r: any }>("SELECT sessions.session_pr_evidence_enqueue_v1($1::jsonb) r", [JSON.stringify({ limit: 5000, after: page.next })])).rows[0]!.r;
   const after = (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.session_pr_evidence_wakeups")).rows[0]!.n;
-  expect(after).toBe(before + page.armed + next.armed);
+  // Arming is an upsert (an existing wakeup is re-dated), so new rows <= armed.
+  expect(after - before).toBeLessThanOrEqual(page.armed + next.armed);
   // A scope that already has evidence state is not re-armed.
   expect((await db.query("SELECT 1 FROM sessions.session_pr_evidence_wakeups WHERE session_id=$1", [readySession])).rows).toHaveLength(0);
 });

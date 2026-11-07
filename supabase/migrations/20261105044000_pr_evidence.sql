@@ -302,7 +302,10 @@ BEGIN
  RETURN jsonb_build_object('status','ready','extractorVersion',s.extractor_version,'evidence',rows);
 END $read$;
 
--- Operator only (no grant): bounded backfill of directory scopes with no evidence state yet.
+-- Operator only (no grant): bounded backfill AND recovery. Arms every live directory scope whose
+-- evidence is missing or STALE against the current replay source (fingerprint of the live
+-- snapshot), so a wakeup lost to the journal trigger's exception handler is always recoverable,
+-- even when older evidence exists. Arming is idempotent; up-to-date scopes are skipped.
 CREATE FUNCTION sessions.session_pr_evidence_enqueue_v1(p jsonb)RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $enqueue$
 DECLARE n integer;a text[];armed integer;last text[];
@@ -314,10 +317,13 @@ BEGIN
  WITH page AS(SELECT d.org_id,d.workspace_id,d.harness,d.session_id FROM sessions.session_directory d
    WHERE d.deleted_at IS NULL AND(a IS NULL OR(d.org_id,d.workspace_id,d.harness,d.session_id)>(a[1],a[2],a[3],a[4]))
    ORDER BY d.org_id,d.workspace_id,d.harness,d.session_id LIMIT n),
-  ins AS(INSERT INTO sessions.session_pr_evidence_wakeups(org_id,workspace_id,harness,session_id)
-   SELECT x.* FROM page x WHERE NOT EXISTS(SELECT 1 FROM sessions.session_pr_evidence_state s WHERE s.org_id=x.org_id
-    AND s.workspace_id=x.workspace_id AND s.harness=x.harness AND s.session_id=x.session_id)
-   ON CONFLICT DO NOTHING RETURNING 1)
+  due AS(SELECT x.* FROM page x LEFT JOIN sessions.session_pr_evidence_state s ON s.org_id=x.org_id AND s.workspace_id=x.workspace_id
+    AND s.harness=x.harness AND s.session_id=x.session_id
+   WHERE s.org_id IS NULL OR s.source_fingerprint IS DISTINCT FROM
+    encode(sha256(convert_to(sessions.session_replay_source_snapshot(x.org_id,x.workspace_id,x.harness,x.session_id)::text,'UTF8')),'hex')),
+  ins AS(INSERT INTO sessions.session_pr_evidence_wakeups AS w(org_id,workspace_id,harness,session_id)SELECT * FROM due
+   ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET request_version=w.request_version+1,requested_at=clock_timestamp(),
+    not_before=clock_timestamp(),attempts=0,last_error=NULL RETURNING 1)
  SELECT(SELECT count(*)FROM ins),(SELECT ARRAY[org_id,workspace_id,harness,session_id]FROM page ORDER BY org_id DESC,workspace_id DESC,harness DESC,session_id DESC LIMIT 1)
  INTO armed,last;
  RETURN jsonb_build_object('armed',armed,'next',CASE WHEN last IS NULL THEN NULL ELSE

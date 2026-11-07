@@ -17,7 +17,7 @@ import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../sessi
 import { log } from "../shared/log.ts";
 import { extractPullRequestEvidence, PR_EVIDENCE_EXTRACTOR_VERSION, type PullRequestEvidenceRow } from "./extract.ts";
 import type { PrEvidenceClaim, PrEvidenceInstall, PrEvidenceStore } from "./store.ts";
-import { applyHistoryMask, type MaskWinner } from "./mask.ts";
+import { maskedProjection, type MaskWinner } from "./mask.ts";
 
 export interface PrEvidenceDeps {
   store: PrEvidenceStore;
@@ -71,7 +71,10 @@ export async function buildPrEvidence(claim: PrEvidenceClaim, deps: PrEvidenceDe
   if (read.reasons.includes("manifest_missing")) throw new PipelineError("manifest_missing", "a live pointer's manifest is missing", true);
   if (read.partial) return { status: "incomplete", reason: "scope_too_large" };
   if (!read.complete) return { status: "incomplete", reason: (read.reasons[0] ?? "source_incomplete").replace(/[^a-z0-9_]/g, "_").slice(0, 64) };
-  const rows = extractPullRequestEvidence(mask ? applyHistoryMask(read.projectionRows, claim.scope.workspaceId, mask) : read.projectionRows);
+  // History scopes: mask the RAW records, then project (see mask.ts), never mask projected rows.
+  const rows = extractPullRequestEvidence(mask
+    ? maskedProjection(read, { workspaceId: claim.scope.workspaceId, source: claim.scope.source, sessionId: claim.scope.sessionId }, mask)
+    : read.projectionRows);
   if (!storable(rows)) return { status: "incomplete", reason: "evidence_not_storable" };
   return { status: "ready", rows };
 }

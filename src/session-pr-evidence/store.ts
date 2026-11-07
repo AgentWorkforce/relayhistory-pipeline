@@ -19,7 +19,7 @@ export interface PrEvidenceClaim {
 export type PrEvidenceInstall =
   | { status: "ready"; rows: PullRequestEvidenceRow[] }
   | { status: "incomplete"; reason: string };
-export interface MaskPage { records: { recordId: string; winner: { originId: string; operation: "upsert" | "delete" } | null }[]; next: string | null }
+export interface MaskPage { records: { recordId: string; winner: { originId: string; operation: "upsert" | "delete"; revision: string } | null }[]; next: string | null }
 
 export interface PrEvidenceStore {
   claim(limit: number): Promise<PrEvidenceClaim[]>;
@@ -99,8 +99,9 @@ export function prEvidenceStore(sql: SqlExecutor): PrEvidenceStore {
           if (!object(x) || typeof x.recordId !== "string") return invalid();
           const w = x.winner;
           if (w === null) return { recordId: x.recordId, winner: null };
-          if (!object(w) || typeof w.originId !== "string" || (w.operation !== "upsert" && w.operation !== "delete")) return invalid();
-          return { recordId: x.recordId, winner: { originId: w.originId, operation: w.operation as "upsert" | "delete" } };
+          if (!object(w) || typeof w.originId !== "string" || (w.operation !== "upsert" && w.operation !== "delete") ||
+              typeof w.revision !== "string" || !/^[1-9][0-9]{0,18}$/.test(w.revision)) return invalid();
+          return { recordId: x.recordId, winner: { originId: w.originId, operation: w.operation as "upsert" | "delete", revision: w.revision } };
         }),
       };
     },

@@ -1,42 +1,52 @@
 /**
  * The history record-winner mask for a history-authoritative scope (05026000). The mask is the
  * scope's exact record set: a record id absent from it belongs to another scope (a move) and must
- * not contribute evidence here. A non-null winner names the copy that is current: its origin must be
- * the copy read, and a `delete` winner removes the record. Rows are filtered before extraction, so a
- * moved or deleted record can never be attributed to this scope.
+ * not contribute evidence here. A non-null winner names the copy that is current: only that origin
+ * and revision is kept, and a `delete` winner removes the record.
  *
- * Revision is not checked: projected rows do not carry it. A copy from the winner's origin is kept;
- * a copy from another origin is dropped (under-attribution, never mis-attribution).
+ * The mask is applied to the RAW normalized records, BEFORE projectRelayhistorySession: the
+ * projection collapses catalog records (session, commit_link, ...) by logical key, so masking
+ * afterwards would let an out-of-mask record win the collapse and then be dropped, suppressing the
+ * valid in-mask record it displaced.
  */
-import { deliveryMachine } from "@rhc/lib/pipeline/relayhistory-projection.ts";
+import { CONVERGENCE_EVENT_KIND, projectRelayhistorySession } from "@rhc/lib/pipeline/relayhistory-projection.ts";
+import type { RelayhistoryStreamRecord } from "@rhc/lib/pipeline/relayhistory-transform.ts";
 import type { PrEvidenceProjectionRow } from "./extract.ts";
 
-export interface MaskWinner { originId: string; operation: "upsert" | "delete" }
+export interface MaskWinner { originId: string; operation: "upsert" | "delete"; revision?: string }
 export type HistoryMask = ReadonlyMap<string, MaskWinner | null>;
 
-const text = (v: unknown) => (typeof v === "string" && v !== "" ? v : null);
-
-/** The record id and origin a projected row came from, or null when it has none. */
-function provenance(row: PrEvidenceProjectionRow, workspaceId: string): { recordId: string; originMatches: (origin: string) => boolean } | null {
-  const r = row.row;
-  if (row.table === "convergence_events") {
-    const delivery = text(r.delivery_record_id);
-    const machine = text(r.machine_id);
-    if (delivery && machine) return { recordId: delivery, originMatches: (o) => deliveryMachine(workspaceId, o) === machine };
-    const direct = text(r.event_id);
-    if (direct && machine) return { recordId: direct, originMatches: (o) => o === `machine:${machine}` };
-    return null;
-  }
-  const recordId = text(r.record_id), origin = text(r.origin_id);
-  return recordId && origin ? { recordId, originMatches: (o) => o === origin } : null;
+/** The records the mask admits: in the scope's record set, and the winning copy when one is named. */
+export function maskRecords(records: readonly RelayhistoryStreamRecord[], mask: HistoryMask): RelayhistoryStreamRecord[] {
+  return records.filter((r) => {
+    if (!mask.has(r.record_id)) return false;
+    const w = mask.get(r.record_id) ?? null;
+    if (w === null) return true;
+    return w.operation !== "delete" && r.origin_id === w.originId && (w.revision === undefined || String(r.revision) === w.revision);
+  });
 }
 
-export function applyHistoryMask(rows: readonly PrEvidenceProjectionRow[], workspaceId: string, mask: HistoryMask): PrEvidenceProjectionRow[] {
-  return rows.filter((row) => {
-    const p = provenance(row, workspaceId);
-    if (!p || !mask.has(p.recordId)) return false;
-    const winner = mask.get(p.recordId) ?? null;
-    if (winner === null) return true;
-    return winner.operation !== "delete" && p.originMatches(winner.originId);
-  });
+/**
+ * The evidence input rows of a history scope: delivery records are masked raw and then projected
+ * (catalog collapse happens over admitted records only). Direct `convergence_event` lines are
+ * already rows; the reader projected them with their own manifest's identity, so those rows are
+ * kept when their raw record is admitted.
+ */
+export function maskedProjection(
+  read: { records: readonly RelayhistoryStreamRecord[]; projectionRows: readonly PrEvidenceProjectionRow[] },
+  scope: { workspaceId: string; source: string; sessionId: string },
+  mask: HistoryMask,
+): PrEvidenceProjectionRow[] {
+  const admitted = maskRecords(read.records, mask);
+  const delivery = admitted.filter((r) => r.kind !== CONVERGENCE_EVENT_KIND);
+  const direct = new Set(admitted.filter((r) => r.kind === CONVERGENCE_EVENT_KIND).map((r) => r.record_id));
+  const allDirect = new Set(read.records.filter((r) => r.kind === CONVERGENCE_EVENT_KIND).map((r) => r.record_id));
+  const projected = projectRelayhistorySession(delivery, {
+    workspaceId: scope.workspaceId, source: scope.source, sessionId: scope.sessionId,
+    // Used only to validate direct lines, which are not passed here.
+    machineId: "pr-evidence", userId: "",
+  }).rows;
+  const directRows = read.projectionRows.filter((r) =>
+    r.table === "convergence_events" && allDirect.has(String(r.row.event_id)) && direct.has(String(r.row.event_id)));
+  return [...projected, ...directRows];
 }
