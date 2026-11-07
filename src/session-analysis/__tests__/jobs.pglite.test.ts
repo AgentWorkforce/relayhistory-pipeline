@@ -830,7 +830,7 @@ describe("durable unknown-PUT recovery through the shared paged eraser: an abort
     v.s3.onDelete = () => (lose ? ((lose = false), "lose") : undefined);
     expect(await sweep(v)).toBe(0); // the step failed: the ticket survives, the found stray is recorded
     expect(await ticket()).toEqual([{ k: key, reason: "unknown", sweeps: 0 }]);
-    expect((await pg.query<{ f: boolean }>("SELECT stray_found f FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ f: true }]);
+    expect((await pg.query<{ k: string }>("SELECT result_key k FROM sessions.session_analysis_ticket_strays")).rows).toEqual([{ k: key }]);
     expect(await sweep(v)).toBe(1);
     expect(v.ids(key)).toEqual([]);
     expect(await ticket()).toEqual([]);

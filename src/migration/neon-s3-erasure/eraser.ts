@@ -88,6 +88,13 @@ export interface EraseStepOptions {
   select?: (v: ListedVersion) => boolean;
   /** Re-checks current authority (lease, generation, fence); throws to stop before any delete. */
   authorize: () => Promise<void>;
+  /**
+   * Durable evidence hook: runs after authorize() and BEFORE a page's deletes with exactly the
+   * versions about to be deleted (write-obligation.ts records "an unowned write was found"
+   * here, so a lost DELETE acknowledgement can never erase that proof). Throwing stops the run
+   * before that page deletes anything.
+   */
+  beforeDelete?: (doomed: readonly ListedVersion[]) => Promise<void>;
   budget?: EraseBudget;
   now?: () => number;
 }
@@ -189,6 +196,7 @@ function pagedEraser(bucket: string, fetchPage: PageFetcher, removeExact: (list:
           if (now() >= budget.deadlineAt) return { status: "incomplete", checkpoint: checkpoint(), deleted, listed, reason: "deadline" };
           await opts.authorize();
           assertUnderPrefix(prefix, doomed);
+          if (opts.beforeDelete) await opts.beforeDelete(doomed);
           deleted += await removeExact(doomed);
           for (const v of doomed) gone.add(JSON.stringify([v.key, v.versionId]));
         }
@@ -236,23 +244,10 @@ export interface S3EraserConfig {
   fetch?: typeof fetch;
 }
 
-/**
- * Snapshot erasure (Babysitter retention, babysitter-retention.ts): list the exact versions
- * under a prefix, then permanently delete exactly those versions. A version written after
- * the listing is never deleted, however late the deletes run.
- */
+/** One exact (key, version) identity. */
 export interface VersionRef {
   key: string;
   versionId: string;
-}
-export interface SnapshotEraser {
-  /**
-   * Every version under `prefix` from a STRICTLY parsed inventory: a malformed, truncated or
-   * unproven page, or any listed key outside `prefix`, throws (never a partial list).
-   */
-  listVersions(prefix: string): Promise<VersionRef[]>;
-  /** Deletes exactly `list`; refuses (before any delete) if any key is outside `prefix`. */
-  removeVersions(prefix: string, list: readonly VersionRef[]): Promise<number>;
 }
 
 /** Refuses a snapshot entry outside its own prefix (no dot segments either). */
@@ -262,8 +257,8 @@ export function assertUnderPrefix(prefix: string, list: readonly VersionRef[]): 
     if (typeof v.key !== "string" || !v.key.startsWith(prefix) || v.key.length === prefix.length || v.key.split("/").some((seg) => seg === "." || seg === ".."))
       throw coded("erasure_foreign_key", "a snapshot key is outside its bucket prefix");
 }
-export function isSnapshotEraser(e: unknown): e is SnapshotEraser {
-  return !!e && typeof (e as SnapshotEraser).listVersions === "function" && typeof (e as SnapshotEraser).removeVersions === "function";
+export function isPagedEraser(e: unknown): e is PagedEraser {
+  return !!e && typeof (e as PagedEraser).eraseStep === "function" && typeof (e as PagedEraser).verifyErased === "function";
 }
 
 export interface PreservedVersionEraser {
@@ -310,7 +305,7 @@ function assertInventoryXml(xml: string): void {
   if (stack.length || roots !== 1 || xml.slice(at).trim()) throw coded("erasure_inventory", "incomplete version inventory");
 }
 
-export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & SnapshotEraser & PagedEraser {
+export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & PagedEraser {
   const doFetch = cfg.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const url = (key = "") => {
     if (cfg.endpoint) {
@@ -423,23 +418,6 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
   return {
     eraseStep: paged.eraseStep,
     verifyErased: paged.verifyErased,
-    listVersions: async (prefix) => {
-      if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
-      // Strict: the snapshot is destructive authority (assertInventoryXml, proven pagination, bounds).
-      const list = (await versions(prefix)).map((v) => ({ key: v.key, versionId: v.versionId }));
-      assertUnderPrefix(prefix, list);
-      return list;
-    },
-    removeVersions: async (prefix, list) => {
-      assertUnderPrefix(prefix, list);
-      const deleted = await remove(list.map((v) => ({ key: v.key, versionId: v.versionId, latest: false, deleteMarker: false })));
-      // Acknowledge only when a post-delete strict inventory shows zero of the snapshot left
-      // (versions written after the snapshot are not the snapshot's to delete).
-      const gone = new Set(list.map((v) => JSON.stringify([v.key, v.versionId])));
-      if ((await versions(prefix)).some((v) => gone.has(JSON.stringify([v.key, v.versionId]))))
-        throw coded("erasure_inventory_changed", "snapshot versions survived permanent erasure");
-      return deleted;
-    },
     eraseObjectExcept: async (key, preservedVersionId) => {
       if (!preservedVersionId || /[\x00-\x1f\x7f]/u.test(preservedVersionId))
         throw coded("erasure_preserved_version", "a concrete preserved version is required");
@@ -485,18 +463,24 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
 }
 
 /** The same contract over a plain (unversioned) store, for tests and local runs. */
-export function storeEraser(store: ObjectStore): Eraser & SnapshotEraser & PagedEraser {
+export function storeEraser(store: ObjectStore): Eraser & PagedEraser {
   // Unversioned: one "null" version per key, pages of 1000 keys after the key marker.
   const fetchPage: PageFetcher = async (prefix, keyMarker) => {
-    const keys: string[] = [];
+    const items: { key: string; lastModified?: number }[] = [];
     let cursor: string | undefined;
     do {
       const page = await store.list(objectKey(prefix.slice(0, -1)), cursor);
-      keys.push(...page.items.map((i) => String(i.key)).filter((k) => k.startsWith(prefix)));
+      for (const i of page.items) {
+        const key = String(i.key);
+        if (!key.startsWith(prefix)) continue;
+        const at = i.lastModified instanceof Date ? i.lastModified.getTime() : NaN;
+        // Same shape as the S3 eraser's entries: lastModified only when readable.
+        items.push({ key, ...(Number.isFinite(at) ? { lastModified: at } : {}) });
+      }
       cursor = page.nextCursor;
     } while (cursor);
-    const after = keys.sort(cmpC).filter((k) => keyMarker === undefined || cmpC(k, keyMarker) > 0);
-    const entries = after.slice(0, 1000).map((key) => ({ key, versionId: "null", latest: true, deleteMarker: false }));
+    const after = items.sort((a, b) => cmpC(a.key, b.key)).filter((i) => keyMarker === undefined || cmpC(i.key, keyMarker) > 0);
+    const entries = after.slice(0, 1000).map((i) => ({ ...i, versionId: "null", latest: true, deleteMarker: false }));
     const truncated = after.length > 1000;
     return truncated ? { entries, truncated, nextKey: entries[entries.length - 1]!.key, nextVersion: "null" } : { entries, truncated };
   };
@@ -504,23 +488,6 @@ export function storeEraser(store: ObjectStore): Eraser & SnapshotEraser & Paged
   return {
     eraseStep: paged.eraseStep,
     verifyErased: paged.verifyErased,
-    async listVersions(prefix) {
-      if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
-      const out: VersionRef[] = [];
-      let cursor: string | undefined;
-      do {
-        const page = await store.list(objectKey(prefix.slice(0, -1)), cursor);
-        out.push(...page.items.map((i) => ({ key: String(i.key), versionId: "null" })));
-        cursor = page.nextCursor;
-      } while (cursor);
-      return out;
-    },
-    async removeVersions(prefix, list) {
-      assertUnderPrefix(prefix, list);
-      // An unversioned store has one version per key; only the listed keys are deleted.
-      for (const v of list) await store.delete(objectKey(v.key));
-      return list.length;
-    },
     async eraseObject(key) {
       const had = await store.head(objectKey(key));
       await store.delete(objectKey(key));
