@@ -53,6 +53,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105036000_canonical_consumer_lease.sql": { evidence: "table sessions.canonical_feature_consumer_lease", sql: relation("sessions.canonical_feature_consumer_lease") },
   "upstream:20261105037000_session_directory_document_pool.sql": { evidence: "function sessions.canonical_feature_document_finish", sql: "SELECT to_regprocedure('sessions.canonical_feature_document_finish(bigint,jsonb,text,text,text,text,text)') IS NOT NULL AS applied" },
   "upstream:20261105038000_claim_attempt_records_retirement.sql": { evidence: "column sessions.ingest_claim_attempts.records_retired_at", sql: column("sessions.ingest_claim_attempts", "records_retired_at") },
+  "upstream:20261105042000_babysitter_evidence_retention.sql": { evidence: "table sessions.babysitter_retention_objects", sql: relation("sessions.babysitter_retention_objects") },
   "upstream:20261105010000_frozen_source_custody.sql": {evidence:"table sessions.ingest_frozen_source_completeness",sql:relation("sessions.ingest_frozen_source_completeness")},
   "upstream:20261104055000_lazy_current_custody.sql": {evidence:"table sessions.ingest_lazy_policy",sql:relation("sessions.ingest_lazy_policy")},
   "upstream:20261104054000_ingest_custody_baseline.sql": {evidence:"table sessions.ingest_custody_imports",sql:relation("sessions.ingest_custody_imports")},

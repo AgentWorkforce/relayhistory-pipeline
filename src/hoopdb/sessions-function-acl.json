@@ -21,6 +21,29 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.babysitter_evidence_buckets_for(text,jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.babysitter_evidence_revisions_for(text,jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.babysitter_retention_audit_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.babysitter_retention_bucket_hour(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.babysitter_retention_configure(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.babysitter_retention_due_reason(sessions.babysitter_retention_objects)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.babysitter_retention_fenced(sessions.babysitter_retention_objects)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.backfill_session_brief_documents(integer)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -172,6 +195,22 @@
     ],
     "sessions.ingest_attempt_fenced(text,text,text,text,jsonb,jsonb)": [
       "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_babysitter_retention_claim(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_babysitter_retention:EXECUTE"
+    ],
+    "sessions.ingest_babysitter_retention_complete(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_babysitter_retention:EXECUTE"
+    ],
+    "sessions.ingest_babysitter_retention_fence(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_babysitter_retention:EXECUTE"
+    ],
+    "sessions.ingest_babysitter_retention_register(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.ingest_batch_key(jsonb)": [
       "<owner>:EXECUTE"

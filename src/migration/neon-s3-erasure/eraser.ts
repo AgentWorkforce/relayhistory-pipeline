@@ -47,6 +47,23 @@ export interface S3EraserConfig {
   fetch?: typeof fetch;
 }
 
+/**
+ * Snapshot erasure (Babysitter retention, babysitter-retention.ts): list the exact versions
+ * under a prefix, then permanently delete exactly those versions. A version written after
+ * the listing is never deleted, however late the deletes run.
+ */
+export interface VersionRef {
+  key: string;
+  versionId: string;
+}
+export interface SnapshotEraser {
+  listVersions(prefix: string): Promise<VersionRef[]>;
+  removeVersions(list: readonly VersionRef[]): Promise<number>;
+}
+export function isSnapshotEraser(e: unknown): e is SnapshotEraser {
+  return !!e && typeof (e as SnapshotEraser).listVersions === "function" && typeof (e as SnapshotEraser).removeVersions === "function";
+}
+
 export interface PreservedVersionEraser {
   /** Keep the current non-delete barrier version; permanently remove only older versions. */
   eraseObjectExcept(key: string, preservedVersionId: string): Promise<{ deleted: number; kept: number }>;
@@ -91,7 +108,7 @@ function assertInventoryXml(xml: string): void {
   if (stack.length || roots !== 1 || xml.slice(at).trim()) throw coded("erasure_inventory", "incomplete version inventory");
 }
 
-export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser {
+export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & SnapshotEraser {
   const doFetch = cfg.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const url = (key = "") => {
     if (cfg.endpoint) {
@@ -184,6 +201,12 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
   }
 
   return {
+    listVersions: async (prefix) => {
+      if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
+      return (await versions(prefix)).map((v) => ({ key: v.key, versionId: v.versionId }));
+    },
+    removeVersions: async (list) =>
+      remove(list.map((v) => ({ key: v.key, versionId: v.versionId, latest: false, deleteMarker: false }))),
     eraseObjectExcept: async (key, preservedVersionId) => {
       if (!preservedVersionId || /[\x00-\x1f\x7f]/u.test(preservedVersionId))
         throw coded("erasure_preserved_version", "a concrete preserved version is required");
@@ -220,8 +243,24 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
 }
 
 /** The same contract over a plain (unversioned) store, for tests and local runs. */
-export function storeEraser(store: ObjectStore): Eraser {
+export function storeEraser(store: ObjectStore): Eraser & SnapshotEraser {
   return {
+    async listVersions(prefix) {
+      if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
+      const out: VersionRef[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await store.list(objectKey(prefix.slice(0, -1)), cursor);
+        out.push(...page.items.map((i) => ({ key: String(i.key), versionId: "null" })));
+        cursor = page.nextCursor;
+      } while (cursor);
+      return out;
+    },
+    async removeVersions(list) {
+      // An unversioned store has one version per key; only the listed keys are deleted.
+      for (const v of list) await store.delete(objectKey(v.key));
+      return list.length;
+    },
     async eraseObject(key) {
       const had = await store.head(objectKey(key));
       await store.delete(objectKey(key));
