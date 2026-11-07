@@ -37,3 +37,23 @@ test("without the exclusion a mirror head blocks the user's first fence forever,
   expect((await createIngestApp({ identify: () => ({ ...u2, scopes: ["rth:sync"] }), deliver: f.deps, log: () => {}, custodySource: "frozen-supabase" })
     .request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ protocolVersion: 1, batch: raw }) })).status).toBe(200);
 });
+
+test("negative: a user with a real TARGET row (ingest_seed_fence_baselines) is still refused 55000 by lazy adoption, with the fix", async () => {
+  // The exclusion covers only source-side tables (ingest_frozen_source_*, ingest_source_control_heads). A genuine
+  // prior target-authority row for the user must still fail closed into reviewed recovery.
+  const f = await authorityFixture({ pending: false });
+  open.push(f.close);
+  await f.seal();
+  await f.db.query("INSERT INTO sessions.ingest_seed_fence_baselines(org_id,workspace_id,user_id,fingerprint) VALUES($1,$2,$3,$4)", [TENANT.orgId, TENANT.workspaceId, TENANT.userId, "c".repeat(64)]);
+  const head = await f.rpc("ingest_source_control_begin", { epoch, tenant: TENANT, kind: "reset", payload: { request_id: "t" } });
+  const w = await f.rpc("ingest_frozen_source_witness", { kind: "reset", tenant: TENANT, originId: null, batchId: null, batchDigest: null, originalRecordCount: 0, candidates: [] });
+  const control = { epoch, version: head.version, digest: head.digest, kind: "reset" };
+  const e = await f.rpc("ingest_reset_uploaded_sessions", { tenant: TENANT, requestId: "t", control, custody: w, generation: "a".repeat(64) }).then(() => null, (x: any) => x);
+  expect(e?.code).toBe("55000");
+  expect(String(e?.message)).toContain("requires recovery");
+  // Control: the same control for a user WITHOUT a target row is applied (only the baseline row made the difference).
+  const u2 = { ...TENANT, userId: "user-2" };
+  const h2 = await f.rpc("ingest_source_control_begin", { epoch, tenant: u2, kind: "reset", payload: { request_id: "t2" } });
+  const w2 = await f.rpc("ingest_frozen_source_witness", { kind: "reset", tenant: u2, originId: null, batchId: null, batchDigest: null, originalRecordCount: 0, candidates: [] });
+  expect((await f.rpc("ingest_reset_uploaded_sessions", { tenant: u2, requestId: "t2", control: { epoch, version: h2.version, digest: h2.digest, kind: "reset" }, custody: w2, generation: "a".repeat(64) })).control).toMatchObject({ outcome: "applied" });
+});

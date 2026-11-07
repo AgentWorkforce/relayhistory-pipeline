@@ -1569,7 +1569,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // Later lanes roll back first and remove their own ledger rows; only then
-    // Roll back the complete039/038 suffix in descending order before earlier lanes.
+    // Roll back the complete 041000..038000 suffix in descending order before earlier lanes.
     // 041000 is the latest lane: 040000 refuses while it is applied; its own down needs Neon authority (no row).
     expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(Z);
@@ -1644,7 +1644,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).not.toContain(B);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBeNull();
     // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 032000, 033000 (F10), 034000 (P3b),
-    // 035000 through039000; the post-validation exact-ACL check finds no drift.
+    // 035000 through 039000, 040000 (lazy source tables) and 041000 (privacy authority); the post-validation
+    // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
