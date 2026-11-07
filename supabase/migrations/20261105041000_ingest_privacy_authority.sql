@@ -372,7 +372,7 @@ DECLARE v_origin text;v_enabled boolean;item jsonb;v_total bigint;v_request text
 BEGIN
  IF coalesce(current_setting('bulls96.privacy_authority_writer',true),'')<>'authority' THEN
   RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='frozen source: authority apply outside the authority begin';END IF;
- -- The analysis purge ABI (046000, #292 b28e634c), checked BEFORE any change. A no-op only while 046000 is entirely
+ -- The analysis purge ABI (046000, #292 fe120007), checked BEFORE any change. A no-op only while 046000 is entirely
  -- absent; once ANY sign of it exists (its jobs or purge-authority table, or any purge / grant overload), BOTH exact
  -- workspace-scoped purge signatures AND the grant helper must exist, or this reset/disable aborts (fail closed).
  v_analysis:=to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,text)') IS NOT NULL

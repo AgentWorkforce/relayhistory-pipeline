@@ -472,7 +472,7 @@ test("analysis purge (guarded, ordering): a reset calls purge_session_analysis_f
   expect(((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_owned_sessions")).rows[0] as any).n).toBe(0);
 });
 
-/** #292's workspace-scoped purge_session_analysis_for_owned (both forms) + its per-transaction grant, VERBATIM from #292 b28e634c (046000). */
+/** #292's workspace-scoped purge_session_analysis_for_owned (both forms) + its per-transaction grant, VERBATIM from #292 fe120007 (046000). */
 async function withAnalysis(f: F) {
   await f.db.exec("DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_analysis_admit') THEN CREATE ROLE bulls96_analysis_admit NOLOGIN NOINHERIT; END IF; END$$;");
   await f.db.exec(await Bun.file(new URL("./fixtures/analysis-jobs-046000.sql", import.meta.url)).text());
@@ -539,7 +539,7 @@ test("analysis purge (real #292 function): a disable purges only the listed sess
   expect(await w.jobs()).toEqual([`${TENANT.workspaceId}/S1`, `${TENANT.workspaceId}/S2`, `${TENANT.workspaceId}/S3`, "ws-b/S1", "ws-c/S1"]);
 });
 
-test("analysis purge (real #292 b28e634c): a reset and a disable each mint the grant for EXACTLY the scope, consumed by the purge in the SAME transaction", async () => {
+test("analysis purge (real #292 fe120007): a reset and a disable each mint the grant for EXACTLY the scope, consumed by the purge in the SAME transaction", async () => {
   const w = await analysisWorld();
   // Every grant row inserted, with the transaction that minted it; every purge fence write, with ITS transaction and
   // whether the grant row for its scope was already consumed (the purge deletes it before writing fences).
@@ -567,7 +567,7 @@ test("analysis purge (real #292 b28e634c): a reset and a disable each mint the g
   expect(((await w.f.db.query("SELECT count(*)::int AS n FROM sessions.session_analysis_purge_authority")).rows[0] as any).n).toBe(0);
 });
 
-test("analysis purge (real #292 b28e634c): without the authority's grant, a purge in the ingest role is refused even under the writer marker", async () => {
+test("analysis purge (real #292 fe120007): without the authority's grant, a purge in the ingest role is refused even under the writer marker", async () => {
   const w = await analysisWorld();
   const e = await w.f.db.transaction(async (tx) => {
     await tx.exec("SET LOCAL ROLE bulls96_session_ingest");
@@ -575,6 +575,22 @@ test("analysis purge (real #292 b28e634c): without the authority's grant, a purg
     return tx.query("SELECT sessions.purge_session_analysis_for_owned($1,$2,$3)", [TENANT.orgId, TENANT.workspaceId, TENANT.userId]).then(() => null, (x: any) => x.code);
   });
   expect(e).toBe("42501");
+});
+
+test("analysis purge grant (real #292 fe120007): the ingest role cannot MINT a proof directly, even under the writer marker; only the owner-context authority can", async () => {
+  const w = await analysisWorld();
+  const e = await w.f.db.transaction(async (tx) => {
+    await tx.exec("SET LOCAL ROLE bulls96_session_ingest");
+    await tx.query("SELECT set_config('bulls96.privacy_authority_writer','authority',true)");
+    return tx.query("SELECT sessions.session_analysis_purge_grant($1,$2,$3)", [TENANT.orgId, TENANT.workspaceId, TENANT.userId]).then(() => null, (x: any) => x.code);
+  });
+  expect(e).toBe("42501");
+  expect(((await w.f.db.query("SELECT count(*)::int AS n FROM sessions.session_analysis_purge_authority")).rows[0] as any).n).toBe(0);
+  // The positive path is the REAL C3 apply as the ingest role: begin (definer) -> mint -> purge consumes (above test).
+  await authorityControl(w.f, "reset", { request_id: "owner-context-mint" });
+  // This tenant's W1 analysis (S1, S2) is purged; the other org's same-id W1 job, user-3's S3 and other workspaces stay.
+  expect(await w.jobs()).toEqual([`${TENANT.workspaceId}/S1`, `${TENANT.workspaceId}/S3`, "ws-b/S1", "ws-c/S1"]);
+  expect(await w.org2()).toEqual(["S1"]);
 });
 
 test("analysis purge (real #292 function): the ingest role cannot call it outside the authority (writer marker required)", async () => {

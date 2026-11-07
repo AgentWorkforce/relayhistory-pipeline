@@ -1,5 +1,5 @@
 -- Test fixture: sessions-pipeline #292 (lane F1) supabase/migrations/20261105046000_analysis_jobs.sql, VERBATIM at
--- b28e634c (workspace-scoped purge in both forms, per-transaction purge grant + authority). source-sha256: def292de9473e4ea233ae66882f751924487e7b6bf7be323d721d52ee0e47856
+-- fe120007 (workspace-scoped purge in both forms, owner-context SECURITY INVOKER purge grant + authority). source-sha256: 3231dbfe6a26c8a5411ddb71f5bae166fa979c502712df7cd186df1c426b906c
 -- Registry slot 046000 (lane F1, session ANALYSIS panel off Neon). The full-analysis
 -- request/job lifecycle that relayhistory ran on Neon (sessions.session_analysis_requests,
 -- sessions.session_analysis_jobs; RHC migrations 0015, 0016, 0024, 0031, 0043, 0062), owned
@@ -478,14 +478,18 @@ CREATE TABLE sessions.session_analysis_purge_authority (
 ALTER TABLE sessions.session_analysis_purge_authority ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.session_analysis_purge_authority FROM PUBLIC, anon, authenticated, service_role;
 
+-- SECURITY INVOKER: minting runs with the CALLER's identity and requires it to BE the owning role,
+-- i.e. owner-context code (lane A's owner-owned SECURITY DEFINER authority function, or an owner
+-- session). A role that holds EXECUTE through drift still runs as itself and is refused, so a
+-- proof can never be self-issued by the ingest (or any runtime) role. Owner-only EXECUTE.
 CREATE FUNCTION sessions.session_analysis_purge_grant(p_org text, p_workspace text, p_user text)
-RETURNS void LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+RETURNS void LANGUAGE plpgsql VOLATILE SECURITY INVOKER
 SET search_path = pg_catalog, sessions, pg_temp AS $purge_grant$
 BEGIN
-  PERFORM sessions.session_analysis_require_caller(ARRAY['bulls96_session_ingest']);
-  IF coalesce(current_setting('bulls96.privacy_authority_writer', true), '') <> 'authority'
-     AND coalesce(nullif(current_setting('role', true), 'none'), session_user::text) = 'bulls96_session_ingest' THEN
-    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'purge_session_analysis_for_owned: outside the privacy authority';
+  IF current_user::text IS DISTINCT FROM (
+       SELECT pg_get_userbyid(p.proowner) FROM pg_proc AS p
+        WHERE p.oid = 'sessions.session_analysis_purge_grant(text,text,text)'::regprocedure) THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'purge_session_analysis_for_owned: a purge proof is minted only in an owner execution context';
   END IF;
   IF p_org IS NULL OR btrim(p_org) = '' OR p_workspace IS NULL OR btrim(p_workspace) = '' OR p_user IS NULL OR btrim(p_user) = '' THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'purge_session_analysis_for_owned: org, workspace and user are required';
