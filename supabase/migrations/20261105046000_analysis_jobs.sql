@@ -127,6 +127,12 @@ GRANT ALL ON sessions.session_analysis_jobs_v2, sessions.session_analysis_reques
 
 -- Erase-safe publication tickets. Not deleted by erasure: they are how the sweeper finds
 -- an object written for (or orphaned by) a forgotten session.
+-- Monotonic across ticket re-creation, so a retired-and-recreated ticket never reuses a rev
+-- (no ABA for a sweeper holding an old one).
+CREATE SEQUENCE sessions.session_analysis_ticket_rev_seq;
+REVOKE ALL ON SEQUENCE sessions.session_analysis_ticket_rev_seq FROM PUBLIC, anon, authenticated;
+GRANT USAGE, SELECT ON SEQUENCE sessions.session_analysis_ticket_rev_seq TO service_role;
+
 CREATE TABLE sessions.session_analysis_result_tickets (
   result_key text PRIMARY KEY CHECK (char_length(result_key) BETWEEN 1 AND 1024),
   job_id uuid NOT NULL,
@@ -153,24 +159,55 @@ CREATE TABLE sessions.session_analysis_result_tickets (
   next_sweep_at timestamptz,
   -- The shared paged eraser's checkpoint (src/migration/neon-s3-erasure/eraser.ts eraseStep),
   -- bound to the bucket, prefix and this ticket's obligation scope; resumed by the next sweep.
-  erase_checkpoint jsonb
+  erase_checkpoint jsonb,
+  -- The write obligation's compare-and-set token (write-obligation.ts ObligationState.rev).
+  rev bigint NOT NULL DEFAULT nextval('sessions.session_analysis_ticket_rev_seq'),
+  -- The versions reserved for deletion while this ticket lives, ON the row every publish locks:
+  -- a publish's FOR UPDATE re-evaluates this predicate against the newest row version (READ
+  -- COMMITTED EvalPlanQual), so a reservation committed while the publish waited is never missed
+  -- by a stale statement snapshot. The permanent reservations table covers re-created tickets.
+  reserved_versions text[] NOT NULL DEFAULT '{}'
 );
 CREATE INDEX session_analysis_result_tickets_created_idx ON sessions.session_analysis_result_tickets (created_at);
 ALTER TABLE sessions.session_analysis_result_tickets ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.session_analysis_result_tickets FROM PUBLIC, anon, authenticated;
 GRANT ALL ON sessions.session_analysis_result_tickets TO service_role;
 
--- Durable stray evidence for a ticket (write-obligation.ts ObligationStore.markStray): an
--- unowned object version was found at the key. Its own table so the mark can COMMIT on its own
--- (autocommit) while the sweep holds the ticket row locked, before that page's deletes; a lost
--- DELETE ack or a failed sweep can then never lose the only proof that the write landed.
-CREATE TABLE sessions.session_analysis_ticket_strays (
-  result_key text PRIMARY KEY CHECK (char_length(result_key) BETWEEN 1 AND 1024),
-  found_at timestamptz NOT NULL DEFAULT now()
+-- The ticket is the per-key write obligation (src/migration/neon-s3-erasure/write-obligation.ts,
+-- v3): `rev` is its compare-and-set token (every sweep mutation and every publish bumps it).
+-- Each PUT attempt is an INVOCATION, recorded (dispatched) BEFORE the PUT is sent, in the
+-- writer's lease/generation transaction, with a unique id; only that request's OWN evidence
+-- (acked with the exact version id, or a definite refusal) changes it. A dispatched invocation
+-- is unresolved indefinitely (no timeout, listing, ETag or zero inventory resolves it).
+CREATE TABLE sessions.session_analysis_ticket_invocations (
+  invocation_id uuid PRIMARY KEY,
+  result_key text NOT NULL CHECK (char_length(result_key) BETWEEN 1 AND 1024),
+  outcome text NOT NULL DEFAULT 'dispatched' CHECK (outcome IN ('dispatched', 'acked', 'refused')),
+  version_id text CHECK (char_length(version_id) BETWEEN 1 AND 1024),
+  -- The writer's fence the evidence must match (worker: the job lease token; backfill: its writer).
+  writer_token uuid,
+  generation text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT session_analysis_ticket_invocations_acked CHECK ((outcome = 'acked') = (version_id IS NOT NULL))
 );
-ALTER TABLE sessions.session_analysis_ticket_strays ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON sessions.session_analysis_ticket_strays FROM PUBLIC, anon, authenticated;
-GRANT ALL ON sessions.session_analysis_ticket_strays TO service_role;
+CREATE INDEX session_analysis_ticket_invocations_key_idx ON sessions.session_analysis_ticket_invocations (result_key);
+ALTER TABLE sessions.session_analysis_ticket_invocations ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_analysis_ticket_invocations FROM PUBLIC, anon, authenticated;
+GRANT ALL ON sessions.session_analysis_ticket_invocations TO service_role;
+
+-- Deletion reservations: before ANY version is deleted, EVERY doomed version of the page is
+-- reserved here, under the ticket row lock every publishing path takes; a publish of a reserved
+-- version is refused. Reservations are NEVER deleted (not on retire, reschedule or re-creation of
+-- the ticket), so a version once doomed can never become publishable through lost bookkeeping.
+CREATE TABLE sessions.session_analysis_ticket_reservations (
+  result_key text NOT NULL CHECK (char_length(result_key) BETWEEN 1 AND 1024),
+  version_id text NOT NULL CHECK (char_length(version_id) BETWEEN 1 AND 1024),
+  reserved_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (result_key, version_id)
+);
+ALTER TABLE sessions.session_analysis_ticket_reservations ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_analysis_ticket_reservations FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT ON sessions.session_analysis_ticket_reservations TO service_role;
 
 
 -- C3 purge fence (purge_session_analysis_for_owned): a session whose analysis was purged by a

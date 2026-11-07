@@ -145,8 +145,6 @@ export function analysisTick(deps: {
       counts.swept = await sweepAnalysisTickets(deps.store, {
         transact: deps.transact,
         eraser: deps.eraser,
-        // The worker's pool commits on its own: durable stray evidence (ObligationStore.markStray).
-        durable: deps.db,
         onError: () => { counts.sweep_failed = (counts.sweep_failed ?? 0) + 1; },
       });
     for (let i = 0; i < deps.config.batch; i += 1) {
