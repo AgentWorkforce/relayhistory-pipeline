@@ -81,7 +81,12 @@ export interface DbErrorDiagnosis {
   readonly db_error_basis: DbErrorBasis;
 }
 
-interface Snapshot { code?: string; message?: string; name?: string }
+/** One guarded read of an error's code, message (bounded, lower-cased) and name. In RAM
+ * only: never logged. Every consumer of a caught DB error (the ledger's P0W01 check, its
+ * ledger code and this diagnosis) reads THIS snapshot, so a throwing getter or proxy trap
+ * cannot escape a catch path. */
+export interface DbErrorSnapshot { readonly code?: string; readonly message?: string; readonly name?: string }
+type Snapshot = DbErrorSnapshot;
 
 /** One read of a property; any throw (getter, proxy trap, revoked proxy) reads as absent. */
 function readString(target: unknown, key: "code" | "message" | "name"): string | undefined {
@@ -123,13 +128,29 @@ function diagnose(s: Snapshot): DbErrorDiagnosis {
 
 const FALLBACK_DIAGNOSIS: DbErrorDiagnosis = Object.freeze({ db_error_class: "unknown", db_error_code: DB_ERROR_CODE_FALLBACK, db_error_basis: "none" });
 
-/** The closed diagnosis of a database error. Never throws. */
-export function dbErrorDiagnosis(error: unknown): DbErrorDiagnosis {
+const EMPTY_SNAPSHOT: DbErrorSnapshot = Object.freeze({});
+
+/** The guarded snapshot. Never throws; on any inspection failure it is empty. */
+export function dbErrorSnapshot(error: unknown): DbErrorSnapshot {
   try {
-    return diagnose(snapshot(error));
+    return Object.freeze(snapshot(error));
+  } catch {
+    return EMPTY_SNAPSHOT;
+  }
+}
+
+/** The closed diagnosis from an already-taken snapshot. Never throws. */
+export function dbErrorDiagnosisFrom(s: DbErrorSnapshot): DbErrorDiagnosis {
+  try {
+    return diagnose(s);
   } catch {
     return FALLBACK_DIAGNOSIS;
   }
+}
+
+/** The closed diagnosis of a database error. Never throws. */
+export function dbErrorDiagnosis(error: unknown): DbErrorDiagnosis {
+  return dbErrorDiagnosisFrom(dbErrorSnapshot(error));
 }
 
 export function classifyDbError(error: unknown): DbErrorClass {

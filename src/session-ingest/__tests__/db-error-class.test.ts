@@ -4,7 +4,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { DB_ERROR_BASES, DB_ERROR_CLASSES, DB_ERROR_CODE_FALLBACK, classifyDbError, dbClientErrorFields, dbErrorDiagnosis, dbErrorName } from "../db-error-class.ts";
 import { ALLOWED_LOG_FIELDS, log, logLine } from "../../shared/log.ts";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
-import { sqlLedger } from "../ledger-sql.ts";
+import { ledgerErrorCode, sqlLedger } from "../ledger-sql.ts";
+import { LedgerUnavailableError } from "../ledger.ts";
+import { DeliveryError } from "../vendor/delivery/delivery-contracts.ts";
 import { TENANT, batch, record, scratchStore } from "./support.ts";
 
 const err = (fields: { code?: unknown; message?: string; name?: string }) =>
@@ -211,6 +213,51 @@ describe("the /v1/delivery/batches 503 path logs the same closed class with the 
     const route = logged.find((f) => f.route === "delivery.batches")!;
     return { status: res.status, retryAfter: res.headers.get("retry-after"), json, calls, route, line: logLine("info", "session ingest", route) };
   }
+
+  test("ledger catch path: throwing code/name getters and proxies become LedgerUnavailableError, never escape", async () => {
+    const boom = () => { throw new Error(`getter escaped ${SECRET}`); };
+    const inputs: unknown[] = [
+      Object.defineProperty({}, "code", { get: boom }),
+      Object.defineProperty(new Error("x"), "name", { get: boom }),
+      new Proxy({}, { get: boom }),
+      (() => { const r = Proxy.revocable({}, {}); r.revoke(); return r.proxy; })(),
+    ];
+    for (const e of inputs) {
+      expect(() => ledgerErrorCode(e)).not.toThrow();
+      expect(ledgerErrorCode(e)).toBe("ledger_error");
+      const ledger = sqlLedger(async () => { throw e; });
+      let caught: unknown;
+      try { await ledger.releaseSlot(TENANT as never, "h"); } catch (x) { caught = x; }
+      expect(caught).toBeInstanceOf(LedgerUnavailableError);
+      expect((caught as LedgerUnavailableError).code).toBe("ledger_error");
+      expect((caught as LedgerUnavailableError).db).toEqual({ db_error_class: "unknown", db_error_code: "db_error", db_error_basis: "none" });
+    }
+    // The P0W01 ownership refusal still maps to 403 through the same snapshot.
+    let owned: unknown;
+    try { await sqlLedger(async () => { throw err({ code: "P0W01" }); }).releaseSlot(TENANT as never, "h"); } catch (x) { owned = x; }
+    expect(owned).toBeInstanceOf(DeliveryError);
+    expect((owned as DeliveryError).status).toBe(403);
+  });
+
+  test("route boundary: throwing code/name getters, a throwing Proxy trap and a revoked Proxy: unchanged 503/body/Retry-After/calls, closed fields", async () => {
+    const base = await post(() => new Error("plain"), "corr-x");
+    const boom = () => { throw new Error(`getter escaped ${SECRET}`); };
+    const variants: [string, () => unknown][] = [
+      ["throwing code getter", () => Object.defineProperty({}, "code", { get: boom })],
+      ["throwing name getter", () => Object.defineProperty(new Error("x"), "name", { get: boom })],
+      ["throwing Proxy trap", () => new Proxy({}, { get: boom })],
+      ["revoked Proxy", () => { const r = Proxy.revocable({}, {}); r.revoke(); return r.proxy; }],
+    ];
+    for (const [name, thrown] of variants) {
+      const r = await post(thrown, "corr-x");
+      expect([name, r.status, r.retryAfter, r.json, r.calls]).toEqual([name, base.status, base.retryAfter, base.json, base.calls]);
+      expect(r.route).toMatchObject({ outcome: "delivery_unavailable", error_code: "ledger_error", db_error_class: "unknown", db_error_code: "db_error", db_error_basis: "none" });
+      for (const needle of ["getter escaped", "hunter2", "s3cr3t"]) {
+        expect(r.line).not.toContain(needle);
+        expect(JSON.stringify(r.json)).not.toContain(needle);
+      }
+    }
+  });
 
   test("route boundary: 57014 and 25P03 reach the 503 line with distinct ledger and safe codes; response unchanged", async () => {
     const base = await post(() => new Error("plain"), "corr-x");
