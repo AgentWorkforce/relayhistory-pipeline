@@ -67,6 +67,7 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
     - `mode: "off"`: rollback for everyone.
   - **Forwarding:** a routed batch is handed byte for byte over the `DELIVERY_INGEST` service binding. The verified identity goes in `x-relay-ingest-identity`; **the bearer is never sent.** The ingest's status, body and `Retry-After` come back unchanged.
   - **Ingest unreachable** (the binding throws or times out): by default a retryable 503, so the ingest stays the only writer for a routed org and the retry replays. `onUnreachable: "local"` (an emergency choice) runs today's path on the same bytes; reseed the org afterwards.
+- **Self-host edge** (default off): `SERVICE=session-ingest-edge` does the same signing in front of the Worker for relaycontrol `sh_at_` tokens, with no RelayAuth and a fixed route allowlist; see `docs/session-ingest-edge.md`.
 - **The ingest Worker** (`src/session-ingest/worker.ts`, stack `stacks/cloudflare/session-ingest.ts`, stage `cf-sessions-prod`):
   - `nodejs_compat` with smart placement, which runs it near S3 and Supabase in us-east-1.
   - **Private:** `workersDev: false`, `routes: []`, `domain: null`. Pure functions, tests and mutations enforce this. The binding is its only way in, so the identity header is trusted.

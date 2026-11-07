@@ -127,7 +127,7 @@ keep their path unchanged either way.
   401. A verified machine still has to match the chunk's `machine` query, the
   event's `machineId` and the manifest's `session.machine_id`, and writes need
   `rth:sync`. Desktop uploads are authenticated by the edge that signs
-  `x-relay-ingest-identity` and are out of scope here.
+  `x-relay-ingest-identity` and are out of scope here (self-host: `SERVICE=session-ingest-edge`, `docs/session-ingest-edge.md`).
 - **Logs and egress.** Logs carry relaycontrol's `token_id`, never the token or
   the secret, and go to the console only. The only new call is to the
   configured introspection URL (in-cluster for a self-host); nothing new leaves

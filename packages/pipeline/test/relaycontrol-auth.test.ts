@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createRelaycontrolIntrospector,
   introspectEndpoint,
+  isRelaycontrolSecretRefusal,
   RelaycontrolRejectedError,
   RelaycontrolUnavailableError,
   resetSharedRelaycontrolIntrospectors,
@@ -392,6 +393,18 @@ describe("the introspector directly", () => {
     await expect(second.introspector.verifyRelaycontrolToken(TOKEN, req)).rejects.toBeInstanceOf(RelaycontrolRejectedError);
     await expect(second.introspector.verifyRelaycontrolToken(TOKEN, req)).rejects.toBeInstanceOf(RelaycontrolRejectedError);
     expect(second.calls).toHaveLength(2);
+  });
+
+  it("marks only relaycontrol's 401 (our secret refused) as a secret refusal", async () => {
+    const refusal = (status: number) => make(() => new Response("", { status })).introspector.verifyRelaycontrolToken(TOKEN, req).catch((e) => e);
+    const secret = await refusal(401);
+    expect(secret).toBeInstanceOf(RelaycontrolRejectedError);
+    expect(isRelaycontrolSecretRefusal(secret)).toBe(true);
+    for (const other of [await refusal(400), await refusal(503), await make(() => Response.json({ active: false, reason: "revoked" })).introspector.verifyRelaycontrolToken(TOKEN, req).catch((e) => e)])
+      expect(isRelaycontrolSecretRefusal(other)).toBe(false);
+    expect(isRelaycontrolSecretRefusal(new RelaycontrolUnavailableError("timeout"))).toBe(false);
+    expect(isRelaycontrolSecretRefusal(new Error("relaycontrol_401"))).toBe(false);
+    expect(isRelaycontrolSecretRefusal(undefined)).toBe(false);
   });
 
   it("does not cache unavailability", async () => {

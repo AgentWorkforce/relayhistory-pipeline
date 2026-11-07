@@ -152,7 +152,8 @@ export interface BodyRead {
   encoding: ContentEncoding | "identity";
 }
 
-async function readBounded(stream: ReadableStream<Uint8Array>, limit: number): Promise<Uint8Array> {
+/** Reads a stream into memory, refusing (413 delivery_too_large) once it passes `limit` bytes. Also used by the session-ingest edge. */
+export async function readBounded(stream: ReadableStream<Uint8Array>, limit: number): Promise<Uint8Array> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;

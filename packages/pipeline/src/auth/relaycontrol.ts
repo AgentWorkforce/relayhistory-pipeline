@@ -78,6 +78,23 @@ export class RelaycontrolRejectedError extends Error {
   }
 }
 
+/** The refusal reason recorded when relaycontrol answers 401 to our own introspection secret. */
+export const RELAYCONTROL_SECRET_REFUSED_REASON = "relaycontrol_401";
+
+/**
+ * True when relaycontrol refused our introspection secret (its 401): a
+ * deployment error, not a verdict on the caller's token. Callers that must
+ * fail closed as unavailable (the session-ingest edge answers 503
+ * relaycontrol_unavailable, contract pin 28e9d95) use this instead of matching
+ * the reason string; callers that keep 401 need nothing.
+ */
+export function isRelaycontrolSecretRefusal(error: unknown): boolean {
+  return (
+    error instanceof RelaycontrolRejectedError &&
+    error.reason === RELAYCONTROL_SECRET_REFUSED_REASON
+  );
+}
+
 export type RelaycontrolLog = (
   level: "info" | "warn" | "error",
   message: string,
@@ -267,7 +284,13 @@ export function createRelaycontrolIntrospector(
         status: response.status,
       });
       return {
-        outcome: { ok: false, reason: `relaycontrol_${response.status}` },
+        outcome: {
+          ok: false,
+          reason:
+            response.status === 401
+              ? RELAYCONTROL_SECRET_REFUSED_REASON
+              : `relaycontrol_${response.status}`,
+        },
         ttlMs: 0,
       };
     }
