@@ -6,7 +6,7 @@
  * exporter's writer side (obligated-store.ts) records dispatch / acked / refused exactly. Offline: fake-s3-versions.ts.
  */
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
@@ -34,6 +34,7 @@ async function world(n = 30) {
   const ids: string[] = [];
   for (let i = 0; i < n; i++) ids.push(s.put(key(i), OLD));
   const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-")), "s.sqlite"));
+  st.attestObligationGenesis();
   let clock = Date.parse("2026-11-07T00:00:00Z");
   st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }], clock - 1000);
   const j = new ErasureJob(authority(), st, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => clock, async () => {});
@@ -233,4 +234,78 @@ test("prefix membership: a prefix ending in U+10FFFF (no simple successor) is st
   const outside = ["k/", "k/\u{FFFF}", "k0", "l"];
   for (const k of [...inside, ...outside]) s.dispatchWrite(k, "h");
   expect(s.unresolvedWrites(P).map((r) => r.key).sort()).toEqual([...inside].sort());
+});
+
+describe("every destructive route is gated; state loss fails closed", () => {
+  const OBJ = `${PREFIX}raw/orphan.ndjson.zst`;
+  test("queued OBJECT: a pending PUT + empty inventory stays queued; the late PUT is then erased and only then done", async () => {
+    const w = await world(0);
+    w.s.put(OBJ, OLD);
+    w.st.enqueueErasure([{ key: OBJ, kind: "object", org_id: "org-1", reason: "unreferenced" }], Date.parse("2026-11-06T00:00:00Z"));
+    // Only the object item (drop the prefix item world() queued).
+    w.st.erasureDone(PREFIX, Date.parse("2026-11-07T00:00:00Z") - 1000);
+    const inv = w.st.dispatchWrite(OBJ, "exporter:1");
+    await w.j.drain();
+    expect(w.s.count(OBJ)).toBe(0);
+    expect(w.queued()).toEqual([OBJ]); // NOT done: the PUT may still commit
+    const late = w.s.put(OBJ, OLD); // ... and it does
+    w.st.ackWrite(inv, late);
+    w.advance(3_600_000);
+    await w.j.drain();
+    expect(w.s.count(OBJ)).toBe(0);
+    expect(w.queued()).toEqual([]);
+    expect(w.j.counters.objectsErased).toBe(1);
+  });
+
+  test("queued OBJECT: an owned (claimed) version refuses the reservation; nothing deleted", async () => {
+    const w = await world(0);
+    w.s.put(OBJ, OLD);
+    w.st.erasureDone(PREFIX, Date.parse("2026-11-07T00:00:00Z") - 1000);
+    w.st.enqueueErasure([{ key: OBJ, kind: "object", org_id: "org-1", reason: "unreferenced" }], Date.parse("2026-11-06T00:00:00Z"));
+    w.st.publishWrites([{ key: OBJ, versionId: "*" }]); // the exporter claims it again (key level)
+    await w.j.drain();
+    expect(w.s.count(OBJ)).toBe(1);
+    expect(w.s.deletes).toEqual([]);
+    expect(w.queued()).toEqual([OBJ]);
+  });
+
+  test("a deleted / recreated state DB fails CLOSED: nothing is marked erased until the genesis is attested", async () => {
+    const s = new FakeS3Versions();
+    for (let i = 0; i < 5; i++) s.put(key(i), OLD);
+    s.put(OBJ, OLD);
+    const dir = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-lost-"));
+    const path = join(dir, "s.sqlite");
+    const first = new SyncState(path);
+    first.attestObligationGenesis();
+    first.dispatchWrite(key(2), "exporter:1"); // an outstanding PUT ...
+    first.close();
+    for (const f of [path, `${path}-wal`, `${path}-shm`]) await rm(f, { force: true });
+    // ... forgotten with the file. A fresh file is UNATTESTED.
+    const st = new SyncState(path);
+    expect(st.obligationsAttested()).toBe(false);
+    expect(st.unresolvedWrites(PREFIX)).toEqual([]);
+    const clock = Date.parse("2026-11-07T00:00:00Z");
+    st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }, { key: OBJ, kind: "object", org_id: "org-1", reason: "unreferenced" }], clock - 1000);
+    let now = clock;
+    const j = new ErasureJob(authority(), st, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => now, async () => {});
+    for (let i = 0; i < 3; i++) {
+      await j.drain();
+      now += 2 * 3_600_000;
+    }
+    expect(s.count(PREFIX)).toBe(0); // erasure still proceeds ...
+    expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10).map((e) => e.key).sort()).toEqual([OBJ, PREFIX].sort()); // ... never done
+    expect(j.counters.prefixesErased + j.counters.objectsErased).toBe(0);
+    // The operator attestation (refused while an exporter holds the lock), then the queue completes.
+    const { attestObligationGenesis } = await import("../neon-s3-erasure/main.ts");
+    const lines: Record<string, unknown>[] = [];
+    await writeFile(`${path}.lock`, String(process.pid));
+    expect(attestObligationGenesis(path, (l) => lines.push(l))).toBe(1);
+    expect(st.obligationsAttested()).toBe(false);
+    await rm(`${path}.lock`);
+    expect(attestObligationGenesis(path, (l) => lines.push(l))).toBe(0);
+    expect(st.obligationsAttested()).toBe(true);
+    await j.drain();
+    expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10)).toEqual([]);
+    expect(lines.map((l) => l.error_code ?? l.message)).toEqual(["state_locked", "obligation genesis attested"]);
+  });
 });

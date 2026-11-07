@@ -71,6 +71,17 @@ holds only the eraser key ("sessions-prod transcript eraser").
 ## Run (linuyc, for now)
 
 State: `~/.agent-tmp/s3x/state.sqlite` (ids, revisions, keys; no content).
+It is NOT disposable: it also holds the unresolved-write obligations (every exporter
+PUT, recorded before it is sent), ownership claims and erasure reservations. Never
+delete or replace it to "reset" a run. A new, recreated or upgraded state file starts
+with its obligation genesis UNATTESTED, and the erasure job then never marks an
+exporter prefix or object erased (`erasure_obligations_unattested`; it still erases,
+it just never reports done). Reviewed reconciliation, by an operator only:
+1. stop the exporter and confirm no exporter process from before the file's genesis
+   is alive (its requests must have ended);
+2. `bun src/migration/neon-s3-erasure/main.ts --attest-obligation-genesis`
+   (`S3X_STATE` as usual; no credentials). It is refused while an exporter holds
+   `<state>.lock`, and is recorded once, never unset.
 Logs: `~/.agent-tmp/s3x/sync.log` (counts and codes only).
 
 ```sh

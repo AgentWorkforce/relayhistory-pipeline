@@ -19,7 +19,7 @@ import {
 } from "./neon-reader.ts";
 import type { SyncState, WorkItem } from "./state.ts";
 import type { Throttle } from "./throttle.ts";
-import { obligatedStore } from "./obligated-store.ts";
+import { manifestClaim, obligatedStore } from "./obligated-store.ts";
 
 export interface LockGuard {
   maxNonAdvisory: number;
@@ -291,6 +291,9 @@ export class Syncer {
             touched.add(k);
             this.state.recordPendingKey(work.org_id, work.session_id, k);
           },
+          // Claim every object the manifest will reference BEFORE it is visible: this run's acked versions exactly,
+          // reused / unchanged ones at the key level. Refused (the group fails, no manifest) if any is reserved.
+          onPublish: manifestClaim(this.state, acked),
         });
         if (r.fenced) this.counters.fenced += 1;
         for (const m of r.manifests) {

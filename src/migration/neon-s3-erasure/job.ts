@@ -119,7 +119,8 @@ export class ErasureJob {
    *    dispatched PUT (unknown outcome) is never resolved by time, a zero inventory or a matching listed version;
    *    an acked one only when its exact version is absent from that complete inventory.
    */
-  async #erasePaged(prefix: string, scope: string, select: ((v: ListedVersion) => boolean) | undefined, authorize: () => Promise<void>): Promise<{ status: PagedOutcome; deleted: number }> {
+  async #erasePaged(prefix: string, scope: string, select: ((v: ListedVersion) => boolean) | undefined, authorize: () => Promise<void>,
+    keyFilter: (key: string) => boolean = () => true, exporterWritten = false): Promise<{ status: PagedOutcome; deleted: number; remaining: number }> {
     let rev = this.state.obligationRev(prefix);
     let lost = false;
     const budget = () => ({ deadlineAt: this.now() + ERASE_STEP_DEADLINE_MS });
@@ -140,27 +141,29 @@ export class ErasureJob {
     } catch (error) {
       if (lost) {
         this.counters.reservationsRefused += 1;
-        return { status: "refused", deleted: 0 };
+        return { status: "refused", deleted: 0, remaining: -1 };
       }
       throw error;
     }
     if (step.status === "incomplete") {
       this.state.setEraseCheckpoint(scope, step.checkpoint, this.now());
       this.counters.resumable += 1;
-      return { status: "incomplete", deleted: step.deleted };
+      return { status: "incomplete", deleted: step.deleted, remaining: -1 };
     }
     this.state.clearEraseCheckpoint(scope);
     // A fresh strict COMPLETE inventory: which exact versions are present per key.
     const present = new Map<string, Set<string>>();
     const proof = await this.eraser.verifyErased(prefix, {
       select: (v) => {
-        if (!v.deleteMarker) (present.get(v.key) ?? present.set(v.key, new Set()).get(v.key)!).add(v.versionId);
+        if (!v.deleteMarker && keyFilter(v.key)) (present.get(v.key) ?? present.set(v.key, new Set()).get(v.key)!).add(v.versionId);
         return select ? select(v) : true;
       },
       authorize, budget: budget(), now: this.now,
     });
-    if (this.state.obligationRev(prefix) !== rev) return { status: "refused", deleted: step.deleted };
-    const invocations = this.state.unresolvedWrites(prefix);
+    let remaining = 0;
+    for (const vs of present.values()) remaining += vs.size;
+    if (this.state.obligationRev(prefix) !== rev) return { status: "refused", deleted: step.deleted, remaining };
+    const invocations = this.state.unresolvedWrites(prefix).filter((i) => keyFilter(i.key));
     const owned = new Map<string, Set<string>>();
     for (const o of this.state.publishedUnder(prefix)) (owned.get(o.key) ?? owned.set(o.key, new Set()).get(o.key)!).add(o.versionId);
     const byKey = new Map<string, typeof invocations>();
@@ -168,17 +171,30 @@ export class ErasureJob {
     const done: string[] = [];
     for (const [key, list] of byKey)
       done.push(...terminalInvocations(list, owned.get(key) ?? new Set(), proof.status === "erased" ? (present.get(key) ?? new Set()) : null));
-    if (done.length && !this.state.resolveWrites(prefix, rev, done).ok) return { status: "refused", deleted: step.deleted };
+    if (done.length && !this.state.resolveWrites(prefix, rev, done).ok) return { status: "refused", deleted: step.deleted, remaining };
     if (proof.status !== "erased") {
       this.counters.unverified += 1;
-      return { status: "unverified", deleted: step.deleted };
+      return { status: "unverified", deleted: step.deleted, remaining };
     }
-    if (invocations.length - done.length > 0) {
+    // A prefix the exporter writes is never done while its obligations may be incomplete: an unattested genesis (a
+    // lost / recreated state file) may have forgotten outstanding PUTs, so it fails closed.
+    if (invocations.length - done.length > 0 || (exporterWritten && !this.state.obligationsAttested())) {
       this.counters.unresolved += 1;
-      return { status: "unresolved", deleted: step.deleted };
+      return { status: "unresolved", deleted: step.deleted, remaining };
     }
     this.state.clearReservations(prefix);
-    return { status: "erased", deleted: step.deleted };
+    return { status: "erased", deleted: step.deleted, remaining };
+  }
+
+  /**
+   * The same gate for ONE object key (every version at exactly `key` that `select` accepts): listed under the key's
+   * directory, reserved before delete, done only after a strict empty inventory of the selected versions and no
+   * unresolved PUT at exactly that key. `remaining`: versions still at the key (e.g. successors kept by `select`).
+   */
+  #eraseKey(key: string, scope: string, select: (v: ListedVersion) => boolean, authorize: () => Promise<void>, exporterWritten = false) {
+    const dir = key.slice(0, key.lastIndexOf("/") + 1);
+    if (!dir || dir === key) throw refusal("erasure_refused_shape");
+    return this.#erasePaged(dir, scope, (v) => v.key === key && select(v), authorize, (k) => k === key, exporterWritten);
   }
 
   /** Queue the session prefixes of `keys` (manifest keys) and drop them from the group's watermark. */
@@ -384,10 +400,16 @@ export class ErasureJob {
           if (seen.staged !== null) {
             const stagedLeft: string[] = [];
             for (const key of seen.staged) {
-              const st = await this.eraser.eraseObjectBefore(key, stagedBefore);
+              // Per staged object, through the gate (reserve before delete, strict empty, no unresolved PUT).
+              const st = await this.#eraseKey(key, eraseScope(["live-staged-object", this.authority.kind, g.org_id, g.workspace_id, g.user_id, g.origin_id, key]),
+                (v) => v.lastModified !== undefined && v.lastModified < stagedBefore.getTime(),
+                async () => {
+                  if (!(await this.authority.stillFenced(g))) throw refusal("erasure_reenabled");
+                  await this.authority.ready();
+                });
               versions += st.deleted;
               this.counters.liveVersionsDeleted += st.deleted;
-              if (st.kept > 0) stagedLeft.push(key);
+              if (st.status !== "erased" || st.remaining > 0) stagedLeft.push(key);
             }
             seen.staged = stagedLeft;
           } else if (!seen.stagedDone) {
@@ -423,7 +445,9 @@ export class ErasureJob {
           this.counters.liveVersionsDeleted += r.deleted;
           // incomplete: resumes from the checkpoint; unverified / unresolved / refused: the next sweep traverses again.
           if (r.status !== "erased") continue;
-          const ptr = await this.eraser.eraseObjectBefore(t.pointerKey, before);
+          // The pointer last, through the same gate (versions newer than the re-read kept).
+          const ptr = await this.#eraseKey(t.pointerKey, eraseScope(["live-pointer", this.authority.kind, g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id]),
+            (v) => v.lastModified !== undefined && v.lastModified < before.getTime(), authorize);
           versions += ptr.deleted;
           this.counters.liveVersionsDeleted += ptr.deleted;
         } catch (error) {
@@ -469,10 +493,23 @@ export class ErasureJob {
         // The exporter may have cancelled it before we took the lease.
         if (!this.state.erasureQueued(item.key, item.enqueued_at)) continue;
         if (item.kind === "object") {
-          this.counters.versionsDeleted += await this.eraser.eraseObject(item.key);
+          // One queued object, through the SAME gate as a prefix: reserve every version before its delete, done only
+          // after a strict empty inventory of the key and no unresolved PUT at exactly that key.
+          const objScope = eraseScope(["queued-object", this.authority.kind, item.org_id, item.key, item.reason, item.enqueued_at, "lease:" + prefix]);
+          const r = await this.#eraseKey(item.key, objScope, () => true, async () => {
+            if (!this.state.erasureQueued(item.key, item.enqueued_at)) throw refusal("erasure_item_cancelled");
+            if (!this.state.renewLease(prefix, LEASE_HOLDER, this.now())) throw refusal("erasure_lease_lost");
+            await this.authority.ready();
+          }, true);
+          this.counters.versionsDeleted += r.deleted;
+          handled += 1;
+          if (r.status === "unresolved") {
+            this.state.erasureFailed(item.key, this.state.obligationsAttested() ? "erasure_write_unresolved" : "erasure_obligations_unattested", this.now());
+            continue;
+          }
+          if (r.status !== "erased") continue;
           this.counters.objectsErased += 1;
           this.state.erasureDone(item.key, item.enqueued_at);
-          handled += 1;
           continue;
         }
         // A session prefix: the shared strict paged eraser, resumable across runs from a durable checkpoint bound to
@@ -485,13 +522,13 @@ export class ErasureJob {
           if (!this.state.renewLease(prefix, LEASE_HOLDER, this.now())) throw refusal("erasure_lease_lost");
           await this.authority.ready();
         };
-        const r = await this.#erasePaged(item.key, scope, undefined, authorize);
+        const r = await this.#erasePaged(item.key, scope, undefined, authorize, undefined, true);
         this.counters.versionsDeleted += r.deleted;
         handled += 1;
         // Still queued unless proven: incomplete resumes from the checkpoint; unverified / refused retry on the next
         // drain; an unresolved write (a PUT whose outcome is unknown) keeps it queued, re-swept on the bounded backoff.
         if (r.status === "unresolved") {
-          this.state.erasureFailed(item.key, "erasure_write_unresolved", this.now());
+          this.state.erasureFailed(item.key, this.state.obligationsAttested() ? "erasure_write_unresolved" : "erasure_obligations_unattested", this.now());
           continue;
         }
         if (r.status !== "erased") continue;

@@ -1,8 +1,12 @@
 /**
  * The exporter's local watermark: one SQLite file (ids, revisions, counts and
- * object keys; never content). Losing it is safe: a fresh run re-reads Neon,
- * finds every unchanged chunk and manifest already stored and writes nothing,
- * but it then re-reads everything, so keep it.
+ * object keys; never content). It is NOT disposable: it also holds the durable
+ * unresolved-write obligations (every exporter PUT recorded before it is sent),
+ * ownership claims and erasure reservations (write-obligation.ts v3). A lost or
+ * recreated file forgets outstanding PUTs, so a new file starts UNATTESTED: the
+ * erasure job then never marks an exporter prefix or object erased (it fails
+ * closed) until an operator attests the obligation genesis (no exporter PUT from
+ * before this file can still be in flight; see runbooks/neon-s3-sync.md).
  *
  * - `groups`: every `(org, session)` the last sweeps saw, with its Neon
  *   revision and activity, and the sweep id that last saw it.
@@ -100,6 +104,28 @@ export class SyncState {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS groups_last ON groups (last_ms DESC);
     `);
+    // Obligation genesis: the first open of this file (new, recreated, or upgraded from a version without
+    // obligations) records when tracking began, UNATTESTED. INSERT OR IGNORE: never reset on a later open.
+    this.db.prepare("INSERT OR IGNORE INTO meta (k, v) VALUES ('obligations_genesis', ?)").run(JSON.stringify({ at: Date.now(), attestedAt: null }));
+  }
+
+  /** The obligation genesis: when this file began tracking exporter PUTs, and whether an operator attested it. */
+  obligationGenesis(): { at: number; attestedAt: number | null } {
+    return JSON.parse(this.meta("obligations_genesis") ?? '{"at":0,"attestedAt":null}');
+  }
+  /** Erasures may be marked done only after the genesis is attested (fail closed on a lost / recreated file). */
+  obligationsAttested(): boolean {
+    return this.obligationGenesis().attestedAt !== null;
+  }
+  /**
+   * Operator attestation (reviewed reconciliation): no exporter PUT dispatched before this file's genesis can
+   * still be in flight (the prior exporter process is gone and its requests ended). Idempotent; never unset.
+   */
+  attestObligationGenesis(at = Date.now()) {
+    this.#tx(() => {
+      const g = this.obligationGenesis();
+      if (g.attestedAt === null) this.setMeta("obligations_genesis", JSON.stringify({ at: g.at, attestedAt: at }));
+    });
   }
 
   #tx(fn: () => void) {
@@ -402,9 +428,11 @@ export class SyncState {
    */
   publishWrites(entries: { key: string; versionId: string }[]) {
     this.#tx(() => {
-      const reserved = this.db.prepare("SELECT 1 FROM erase_reservations WHERE key = ? AND version_id = ?");
+      // A key-level claim ("*": every version at the key, e.g. a reused chunk whose version id this run never saw)
+      // conflicts with ANY reservation at the key; an exact claim with that exact version's reservation.
+      const reserved = this.db.prepare("SELECT 1 FROM erase_reservations WHERE key = ? AND (version_id = ? OR ? = '*')");
       for (const e of entries)
-        if (reserved.get(e.key, e.versionId)) throw Object.assign(new Error("a published version is reserved for erasure"), { code: "publish_reserved" });
+        if (reserved.get(e.key, e.versionId, e.versionId)) throw Object.assign(new Error("a published version is reserved for erasure"), { code: "publish_reserved" });
       const seq = this.#seq();
       const ins = this.db.prepare("INSERT INTO write_published (key, version_id, seq) VALUES (?, ?, ?) ON CONFLICT DO NOTHING");
       const done = this.db.prepare("DELETE FROM write_invocations WHERE key = ? AND outcome = 'acked' AND version_id = ?");
@@ -448,7 +476,8 @@ export class SyncState {
     let out: { ok: true; rev: number } | { ok: false } = { ok: false };
     this.#tx(() => {
       if (this.obligationRev(prefix) !== rev) return;
-      const owned = this.db.prepare("SELECT 1 FROM write_published WHERE key = ? AND version_id = ?");
+      // Owned: that exact version, or the whole key (a key-level claim).
+      const owned = this.db.prepare("SELECT 1 FROM write_published WHERE key = ? AND (version_id = ? OR version_id = '*')");
       for (const v of versions) {
         if (!v.key.startsWith(prefix)) return;
         if (owned.get(v.key, v.versionId)) return;

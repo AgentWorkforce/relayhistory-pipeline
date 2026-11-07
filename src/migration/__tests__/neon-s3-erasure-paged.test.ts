@@ -11,10 +11,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob, eraseScope } from "../neon-s3-erasure/job.ts";
-import { liveTargets, livePointerPrefix } from "../neon-s3-erasure/live.ts";
+import { liveStagedPrefix, liveTargets, livePointerPrefix } from "../neon-s3-erasure/live.ts";
 import type { ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import type { LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
+
+/** A state file whose obligation genesis is attested (a fresh test file; production attests by operator only). */
+function attestedState(path: string): SyncState {
+  const s = new SyncState(path);
+  s.attestObligationGenesis();
+  return s;
+}
 
 setDefaultTimeout(120_000);
 const G: LiveFencedGroup = { org_id: "org-1", workspace_id: "ws/1", user_id: "user-1", origin_id: "origin-1", source: "claude", session_id: "sess:1" };
@@ -40,7 +47,7 @@ function authority(over: Partial<ErasureAuthority> = {}): ErasureAuthority & { f
 let lastPath = "";
 async function state() {
   lastPath = join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-paged-")), "s.sqlite");
-  return new SyncState(lastPath);
+  return attestedState(lastPath);
 }
 function fill(s: FakeS3Versions, n: number, at = OLD) {
   for (let i = 0; i < n; i++) s.put(`${dir("2026/10/30")}raw/b=${String(i).padStart(6, "0")}.ndjson.zst`, at);
@@ -64,7 +71,7 @@ describe("E3 job on the shared paged eraser", () => {
     expect(st.eraseCheckpoint(eraseScope(["live-session", "supabase", G.org_id, G.workspace_id, G.user_id, G.origin_id, G.source, G.session_id]))).not.toBeNull();
     // Crash: a brand-new process on the same durable state resumes from the checkpoint.
     st.close();
-    const st2 = new SyncState(path);
+    const st2 = attestedState(path);
     await job(s, st2, a).sweep();
     expect(s.count(dir("2026/10/30"))).toBe(0);
     expect(s.count(T.pointerKey)).toBe(0);
@@ -150,6 +157,24 @@ describe("E3 job on the shared paged eraser", () => {
     expect(st.nextErasures(NOW + 1, 10)).toEqual([]);
     expect(j.counters.prefixesErased).toBe(1);
     st.close();
+  });
+});
+
+describe("the live pointer and staged objects go through the same reserve gate", () => {
+  const STAGED = `${liveStagedPrefix("96bulls", G)}d=2026/10/30/b=batch-1.staged.ndjson.zst`;
+  test("a claimed (owned) pointer / staged version refuses its reservation and is not deleted; unclaimed ones are erased", async () => {
+    for (const claimed of [true, false]) {
+      const s = new FakeS3Versions();
+      fill(s, 3);
+      s.put(STAGED, OLD);
+      const st = await state();
+      if (claimed) st.publishWrites([{ key: T.pointerKey, versionId: "*" }, { key: STAGED, versionId: "*" }]);
+      await job(s, st, authority()).sweep();
+      expect(s.count(dir("2026/10/30"))).toBe(0);
+      expect([claimed, s.count(T.pointerKey), s.count(STAGED)]).toEqual([claimed, claimed ? 1 : 0, claimed ? 1 : 0]);
+      expect(s.deletes.some((d) => d.startsWith(T.pointerKey) || d.startsWith(STAGED))).toBe(!claimed);
+      st.close();
+    }
   });
 });
 

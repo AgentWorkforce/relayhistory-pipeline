@@ -25,6 +25,7 @@
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
+import { existsSync, readFileSync } from "node:fs";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode } from "../neon-s3-sync/sync.ts";
 import { eraserDatabaseUrl, pinnedPgClient, readStdinCredentials, refuseCredentialEnv, s3Credentials, type S3Credentials } from "../stdin-credentials.ts";
@@ -70,7 +71,43 @@ export function authorityUrl(kind: ErasureAuthorityKind, raw: unknown): string {
   return eraserDatabaseUrl(raw, "databaseUrl", kind);
 }
 
+/**
+ * Operator attestation of the obligation genesis (runbooks/neon-s3-sync.md): refused while an exporter holds the
+ * state lock (a live exporter may have PUTs in flight). Needs no credentials and changes nothing else.
+ */
+export function attestObligationGenesis(statePath: string, log: (f: Record<string, unknown>) => void): number {
+  const lockPath = `${statePath}.lock`;
+  if (existsSync(lockPath)) {
+    const pid = Number(readFileSync(lockPath, "utf8").trim());
+    let alive = false;
+    try {
+      process.kill(pid, 0);
+      alive = Number.isInteger(pid) && pid > 0;
+    } catch {}
+    if (alive) {
+      log({ message: "attestation refused: an exporter holds the state lock", error_code: "state_locked" });
+      return 1;
+    }
+  }
+  if (!existsSync(statePath)) {
+    log({ message: "attestation refused: no state file", error_code: "state_missing" });
+    return 1;
+  }
+  const state = new SyncState(statePath);
+  try {
+    state.attestObligationGenesis();
+    log({ message: "obligation genesis attested", genesis_at: state.obligationGenesis().at });
+    return 0;
+  } finally {
+    state.close();
+  }
+}
+
 export async function main() {
+  if (flag("attest-obligation-genesis")) {
+    process.exitCode = attestObligationGenesis(env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!, log);
+    return;
+  }
   const execute = flag("execute");
   refuseCredentialEnv();
   const kind = authorityKind(env("S3X_PRIVACY_AUTHORITY"));

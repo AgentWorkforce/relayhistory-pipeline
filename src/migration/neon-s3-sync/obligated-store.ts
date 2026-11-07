@@ -41,3 +41,14 @@ export function obligatedStore(store: ObjectStore, state: SyncState, holder: str
     },
   };
 }
+
+/**
+ * The exporter's manifest claim (exportUnit `onPublish`), run BEFORE the manifest becomes visible: every object the
+ * manifest references (new and reused chunks, and the manifest key) is claimed under the erasure job's reservation
+ * lock: this run's acked versions exactly, anything else (reused / unchanged, version id unknown here) at the key
+ * level. Throws `publish_reserved` (and the manifest is NOT written) if any of them is reserved for erasure; once it
+ * succeeds, an erasure reserve of any claimed version is refused. No network await happens inside the transaction.
+ */
+export function manifestClaim(state: SyncState, acked: ReadonlyMap<string, string>) {
+  return (_manifestKey: string, refs: readonly string[]) => state.publishWrites(refs.map((key) => ({ key, versionId: acked.get(key) ?? "*" })));
+}
