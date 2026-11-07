@@ -158,6 +158,11 @@ describe.skipIf(!url)("offline one-candidate GC SQL prototype", () => {
     await expect(down()).rejects.toMatchObject({ code: "55000" }); expect(await view()).toEqual(before);
     expect((await pool.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows[0].status).toBe("pass");
     await pool.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1", [later]);
+    // Lane F3 (20261105044000) is a later ledgered step: 039's guard refuses while it is applied,
+    // so it rolls back first (descending order), then 039 may.
+    await expect(down()).rejects.toMatchObject({ code: "55000" }); expect(await view()).toEqual(before);
+    { const c = await connect(); try { await c.query(text("supabase/rollbacks/20261105044000_pr_evidence.down.sql")); } finally { await release(c); } }
+    expect((await pool.query("SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044000_pr_evidence.sql'")).rows).toHaveLength(0);
     const ledgerBefore = (await pool.query("SELECT name,sha256 FROM sessions.__96bulls_migrations ORDER BY name")).rows;
     await down();
     expect((await pool.query("SELECT name,sha256 FROM sessions.__96bulls_migrations ORDER BY name")).rows).toEqual(ledgerBefore.filter((r) => r.name !== migrationName));
@@ -167,7 +172,7 @@ describe.skipIf(!url)("offline one-candidate GC SQL prototype", () => {
     await expect(down()).rejects.toMatchObject({ code: "55000" }); // absent own ledger is not permission to restore
     const assets = await derivedSchemaAssets();
     expect(await schemaVerdict({ ...assets.expected, dbMode: "local" }, transact)).toMatchObject({ ok: false, reason: "schema_pending" });
-    expect((await migrate()).applied).toBe(1);
+    expect((await migrate()).applied).toBe(2); // 039000 and the rolled-back later 044000
     expect(await view()).toEqual(before);
     expect(await schemaVerdict({ ...assets.expected, dbMode: "local" }, transact)).toEqual({ ok: true });
     console.log(JSON.stringify({ proof: "gc-039-down-up", generation, ownLedgerOnly: true, laterMigrationRefused: true, checksumDriftRefused: true, exactPriorBodyAndAcl: true, pendingBeforeReapply: true, finalVerifier: "pass" }));
