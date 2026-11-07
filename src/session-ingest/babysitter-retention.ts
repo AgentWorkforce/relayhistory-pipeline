@@ -32,7 +32,7 @@
  */
 import { createHash } from "node:crypto";
 import { layoutComponent } from "../shared/layout-component.ts";
-import type { SnapshotEraser } from "../migration/neon-s3-erasure/eraser.ts";
+import type { EraseCheckpoint, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 import type { BabysitterRetentionObject } from "./ledger.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import { ledgerErrorCode, type SqlRun } from "./ledger-sql.ts";
@@ -81,13 +81,46 @@ export function babysitterBucket(record: Pick<PreparedDeliveryRecord, "kind" | "
   return { eraseAfterMs: hour, source: record.source, sessionId };
 }
 
+/** Tombstones of Babysitter kinds are kept for the evidence class's 30 days from the delete. */
+export const TOMBSTONE_RETENTION_MS = 30 * 24 * HOUR_MS;
+
+/**
+ * The bucket of a Babysitter-kind DELETE: no payload and no object, only a content-free
+ * key-index row (Neon's include_deleted tombstone), retained 30 days from its receipt.
+ */
+export function babysitterTombstoneBucket(record: Pick<PreparedDeliveryRecord, "kind" | "operation" | "source" | "session_id">, receivedAtMs: number): BabysitterBucket | null {
+  if (!BABYSITTER_KINDS.has(record.kind) || record.operation !== "delete" || !Number.isFinite(receivedAtMs)) return null;
+  const hour = Math.ceil((receivedAtMs + TOMBSTONE_RETENTION_MS) / HOUR_MS) * HOUR_MS;
+  const sessionId = record.session_id === null || record.session_id === "" ? null : record.session_id;
+  return { eraseAfterMs: hour, source: record.source, sessionId };
+}
+
+/** One content-free key-index row of the registration (sessions.babysitter_evidence_index). */
+export interface BabysitterIndexEntry {
+  /** Index into the registration's `buckets`. */
+  bucket: number;
+  originId: string;
+  recordId: string;
+  revision: string;
+  revisionId: string;
+  operation: "upsert" | "delete";
+  kind: string;
+  /** upsert: the 0-based line in this batch's bucket object (writeBucketObjects order). */
+  line: number | null;
+  expiresAtMs: number | null;
+}
+
 export interface BucketPlan {
-  /** The bucket request of each record (by identity), absent: not routed. */
+  /** The bucket request of each routed UPSERT (by identity), absent: not routed. */
   of(record: PreparedDeliveryRecord): BabysitterBucket | undefined;
-  /** The routed records, in batch order. */
+  /** The routed upserts, in batch order (their full lines go to the bucket objects). */
   routed: PreparedDeliveryRecord[];
-  /** Distinct bucket requests (at most one per routed record), in first-seen order. */
+  /** Babysitter-kind deletes: index-only tombstones (no object, the record travels unchanged). */
+  tombstones: PreparedDeliveryRecord[];
+  /** Distinct bucket requests, in first-seen order. */
   requests: BabysitterBucket[];
+  /** The key-index rows of every routed upsert and tombstone. */
+  entries: BabysitterIndexEntry[];
 }
 
 /**
@@ -95,16 +128,33 @@ export interface BucketPlan {
  * epochs. Never collapsed across sessions, whatever the batch width: the per-session
  * deletion fence must stay immediate (the bucket objects are one PUT each).
  */
-export function planBabysitterBuckets(records: readonly PreparedDeliveryRecord[]): BucketPlan {
+export function planBabysitterBuckets(records: readonly PreparedDeliveryRecord[], receivedAtMs: number): BucketPlan {
   const byRecord = new Map<PreparedDeliveryRecord, BabysitterBucket>();
   const requests = new Map<string, BabysitterBucket>();
+  const order = new Map<string, number>();
+  const lines = new Map<string, number>();
+  const entries: BabysitterIndexEntry[] = [];
+  const tombstones: PreparedDeliveryRecord[] = [];
   for (const r of records) {
-    const b = babysitterBucket(r);
+    const up = babysitterBucket(r);
+    const b = up ?? babysitterTombstoneBucket(r, receivedAtMs);
     if (!b) continue;
-    byRecord.set(r, b);
-    if (!requests.has(planKey(b))) requests.set(planKey(b), b);
+    const key = planKey(b);
+    if (!requests.has(key)) { requests.set(key, b); order.set(key, order.size); }
+    if (up) {
+      byRecord.set(r, up);
+      // The same order writeBucketObjects writes this bucket's lines in.
+      const line = lines.get(key) ?? 0;
+      lines.set(key, line + 1);
+      entries.push({ bucket: order.get(key)!, originId: r.origin_id, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id,
+        operation: "upsert", kind: r.kind, line, expiresAtMs: r.payload!.expires_at_ms as number });
+    } else {
+      tombstones.push(r);
+      entries.push({ bucket: order.get(key)!, originId: r.origin_id, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id,
+        operation: "delete", kind: r.kind, line: null, expiresAtMs: null });
+    }
   }
-  return { of: (r) => byRecord.get(r), routed: records.filter((r) => byRecord.has(r)), requests: [...requests.values()] };
+  return { of: (r) => byRecord.get(r), routed: records.filter((r) => byRecord.has(r)), tombstones, requests: [...requests.values()], entries };
 }
 
 /** The refs SQL issued, by plan key. */
@@ -251,6 +301,13 @@ export interface ClaimedObject {
   machineId: string;
   ref: string;
   reason: "expired" | "fenced";
+  /** The bucket's epochs and write sequence at the claim: they bind a resume checkpoint. */
+  fenceEpoch: number;
+  resetEpoch: number;
+  writeSeq: number;
+  eraseRuns: number;
+  /** The content-free checkpoint of the last bounded run whose deletes succeeded (null: from the start). */
+  checkpoint: EraseCheckpoint | null;
 }
 
 export interface RetentionClaim {
@@ -263,7 +320,7 @@ export interface BabysitterRetentionLedger {
   claim(limit: number): Promise<RetentionClaim>;
   /** The erase fence: true only while the lease is held (30 s to spare) under the CURRENT generation. */
   fence(leaseToken: string): Promise<boolean>;
-  complete(leaseToken: string, outcome: "erased" | "released", versions: number): Promise<{ ok: boolean; state?: string }>;
+  complete(leaseToken: string, outcome: "erased" | "released" | "progress", versions: number, checkpoint?: EraseCheckpoint | null): Promise<{ ok: boolean; state?: string }>;
 }
 
 const UUID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -294,7 +351,9 @@ export function sqlBabysitterRetentionLedger(run: SqlRun, generation: string): B
         const x = o as Record<string, unknown>;
         if (!x || !str(x.leaseToken) || !UUID.test(x.leaseToken) || !str(x.leaseUntil) || !Number.isFinite(Date.parse(x.leaseUntil)) ||
             !str(x.orgId) || !str(x.workspaceId) || !str(x.userId) || !str(x.originId) ||
-            !str(x.machineId) || !str(x.ref) || (x.reason !== "expired" && x.reason !== "fenced"))
+            !str(x.machineId) || !str(x.ref) || (x.reason !== "expired" && x.reason !== "fenced") ||
+            ![x.fenceEpoch, x.resetEpoch, x.writeSeq, x.eraseRuns].every((n) => Number.isSafeInteger(n) && (n as number) >= 0) ||
+            (x.checkpoint !== null && (typeof x.checkpoint !== "object" || Array.isArray(x.checkpoint))))
           throw new LedgerUnavailableError("ledger_bad_result");
         return x as unknown as ClaimedObject;
       });
@@ -305,8 +364,8 @@ export function sqlBabysitterRetentionLedger(run: SqlRun, generation: string): B
       if (typeof r.ok !== "boolean") throw new LedgerUnavailableError("ledger_bad_result");
       return r.ok;
     },
-    async complete(leaseToken, outcome, versions) {
-      const r = await call("ingest_babysitter_retention_complete", { generation, leaseToken, outcome, versions });
+    async complete(leaseToken, outcome, versions, checkpoint = null) {
+      const r = await call("ingest_babysitter_retention_complete", { generation, leaseToken, outcome, versions, checkpoint });
       if (typeof r.ok !== "boolean") throw new LedgerUnavailableError("ledger_bad_result");
       return { ok: r.ok, ...(str(r.state) ? { state: r.state } : {}) };
     },
@@ -334,6 +393,11 @@ export function retentionTargets(keyRoot: string, o: ClaimedObject): RetentionTa
   return { prefix: `${bucketBase(keyRoot, o.orgId, o.workspaceId, machine)}d=${y}/${m}/${d}/s=${o.ref}/` };
 }
 
+/** The resume-checkpoint scope: operation, tenant, bucket, generation, epochs and write_seq. */
+export function eraseScope(o: Pick<ClaimedObject, "orgId" | "workspaceId" | "machineId" | "ref" | "fenceEpoch" | "resetEpoch" | "writeSeq">, generation: string): string {
+  return "babysitter_bucket_erase:" + sha256Hex(JSON.stringify(["babysitter_bucket_erase", o.orgId, o.workspaceId, o.machineId, o.ref, generation, o.fenceEpoch, o.resetEpoch, o.writeSeq]));
+}
+
 export class RetentionRefused extends Error {
   constructor(readonly code: string) {
     super(`babysitter retention refused: ${code}`);
@@ -357,8 +421,10 @@ export function routingFlag(raw: string | undefined): boolean {
 
 export interface TickDeps {
   ledger: BabysitterRetentionLedger;
-  eraser: SnapshotEraser;
+  eraser: PagedEraser;
   keyRoot: string;
+  /** The compiled schema generation the ledger runs under (binds every resume checkpoint). */
+  generation: string;
   mode: SweepMode;
   /** Buckets per claim (1..200). */
   limit?: number;
@@ -366,6 +432,8 @@ export interface TickDeps {
   budgetMs?: number;
   /** Least lease left to start an erase (default MIN_LEASE_LEFT_MS); half of it is the erase's margin. */
   minLeaseLeftMs?: number;
+  /** Per-run erase bounds below the eraser's hard ceilings (10k versions / 100 pages); tests only. */
+  eraseBudget?: { versions?: number; pages?: number };
   clock?: () => number;
 }
 
@@ -377,6 +445,8 @@ export interface TickResult {
   erased: number;
   erased_versions: number;
   released: number;
+  /** Bounded runs that persisted a checkpoint (or a restart) and stay pending: never erased. */
+  progressed: number;
   raced: number;
   failed: number;
   refused: number;
@@ -395,7 +465,7 @@ export interface TickResult {
 export async function babysitterRetentionTick(deps: TickDeps): Promise<TickResult> {
   const clock = deps.clock ?? Date.now;
   const deadline = clock() + (deps.budgetMs ?? 45_000);
-  const result: TickResult = { mode: deps.mode, enabled: false, dry_run: deps.mode !== "on", claimed: 0, erased: 0, erased_versions: 0, released: 0, raced: 0, failed: 0, refused: 0, lease_lost: 0, codes: {} };
+  const result: TickResult = { mode: deps.mode, enabled: false, dry_run: deps.mode !== "on", claimed: 0, erased: 0, erased_versions: 0, released: 0, progressed: 0, raced: 0, failed: 0, refused: 0, lease_lost: 0, codes: {} };
   if (deps.mode === "off") return result;
   const limit = deps.limit ?? 50;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error("babysitter retention: limit must be 1..200");
@@ -426,21 +496,46 @@ export async function babysitterRetentionTick(deps: TickDeps): Promise<TickResul
       // A write may be registered again once the lease ends: never erase near its end.
       const minLease = deps.minLeaseLeftMs ?? MIN_LEASE_LEFT_MS;
       if (Date.parse(o.leaseUntil) - clock() < minLease) { count("lease_short"); await release(o, 0); continue; }
-      // 1. Snapshot exactly the versions in this bucket's own directory (never machine-wide),
-      //    bounded by the lease. 2. The fence: the lease is still held under the CURRENT schema
-      //    generation (a stale generation is refused even with a valid lease). 3. Delete exactly
-      //    the snapshot. Registration is refused while the lease holds, so the snapshot holds only
-      //    pre-lease objects; a version written after it (a re-enabled session's new evidence, a
-      //    retried batch) is never in it and is never deleted, however late the deletes run.
-      const budget = Date.parse(o.leaseUntil) - clock() - minLease / 2;
-      const snapshot = await withDeadline(deps.eraser.listVersions(targets.prefix), budget);
-      if (!(await deps.ledger.fence(o.leaseToken))) { count("fence_refused"); result.lease_lost += 1; continue; }
-      const versions = await deps.eraser.removeVersions(targets.prefix, snapshot);
-      const done = await deps.ledger.complete(o.leaseToken, "erased", versions);
+      // A durable, resumable, strict erase of this bucket's own directory (never machine-wide),
+      // in bounded runs (eraser.ts eraseStep: <= 10k versions / 100 pages per run, cut at the
+      // lease end less half the margin). authorize() is the SQL fence (lease held, CURRENT
+      // generation) and runs before EVERY page's deletes and before the proof. Registration is
+      // refused while the lease holds, so no PUT lands mid-run. The checkpoint is bound to this
+      // bucket, the generation, its epochs and write_seq: anything else restarts from the top.
+      const deadlineAt = Date.parse(o.leaseUntil) - minLease / 2;
+      const scope = eraseScope(o, deps.generation);
+      const authorize = async () => { if (!(await deps.ledger.fence(o.leaseToken))) throw new RetentionRefused("fence_refused"); };
+      let step;
+      try {
+        step = await withDeadline(deps.eraser.eraseStep(targets.prefix, { scope, checkpoint: o.checkpoint, authorize, budget: { ...deps.eraseBudget, deadlineAt }, now: clock }), deadlineAt - clock());
+      } catch (error) {
+        if ((error as { code?: string }).code !== "erasure_checkpoint_scope") throw error;
+        count("checkpoint_restart");
+        step = await withDeadline(deps.eraser.eraseStep(targets.prefix, { scope, checkpoint: null, authorize, budget: { ...deps.eraseBudget, deadlineAt }, now: clock }), deadlineAt - clock());
+      }
+      if (step.status === "incomplete") {
+        count(`incomplete_${step.reason}`);
+        const done = await deps.ledger.complete(o.leaseToken, "progress", step.deleted, step.checkpoint);
+        if (done.ok) result.progressed += 1; else result.lease_lost += 1;
+        result.erased_versions += step.deleted;
+        continue;
+      }
+      // Never erased on a traversal alone: a FRESH strict zero inventory under the fence.
+      const proof = await withDeadline(deps.eraser.verifyErased(targets.prefix, { authorize, budget: { deadlineAt }, now: clock }), deadlineAt - clock());
+      if (proof.status !== "erased") {
+        count(`proof_${proof.reason}`);
+        // Versions behind the cursor (or an unfinished proof): restart the traversal next lease.
+        const done = await deps.ledger.complete(o.leaseToken, "progress", step.deleted, null);
+        if (done.ok) result.progressed += 1; else result.lease_lost += 1;
+        result.erased_versions += step.deleted;
+        continue;
+      }
+      const done = await deps.ledger.complete(o.leaseToken, "erased", step.deleted);
       if (!done.ok) result.lease_lost += 1;
-      else if (done.state === "erased") { result.erased += 1; result.erased_versions += versions; }
-      else { result.raced += 1; result.erased_versions += versions; }
+      else if (done.state === "erased") { result.erased += 1; result.erased_versions += step.deleted; }
+      else { result.raced += 1; result.erased_versions += step.deleted; }
     } catch (error) {
+      if (error instanceof RetentionRefused && error.code === "fence_refused") { count("fence_refused"); result.lease_lost += 1; continue; }
       result.failed += 1;
       count(error instanceof LedgerUnavailableError ? error.code : codeOf(error));
       // The lease expires by itself (5 min) if this release fails too.

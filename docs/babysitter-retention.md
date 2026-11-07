@@ -27,6 +27,9 @@ The pipeline does not project or serve these kinds, and the Neon→S3 exporter n
    1. **Register** the batch's buckets with `sessions.ingest_babysitter_retention_register`. Each bucket is `h=_babysitter/d=*/s=_bx<yyyymmddhh>-<sha16(source␟session␟reset epoch␟fence epoch)>` under the same machine, keyed by the expiry rounded **up** to the UTC hour.
    2. **Write** each bucket's full Babysitter lines as **one create-only object**, `…/h=_babysitter/d=<erase date>/s=<bucket>/raw/b=<sha32(batch digest)>.ndjson.zst`, with no manifest, no pointer and no CAS. It is scrubbed like every chunk and idempotent by batch digest.
    3. **Carry on** with today's path, with the record in its **own** session as a **payload-free stub**: same identity, revision, operation and digest metadata, payload `{retention_class, expires_at_ms, retention_bucket}`.
+   - **Content-free key index** (`sessions.babysitter_evidence_index`, registered in the same call): one row per routed (record, revision) holding identity, revision, operation, kind, the exact object name and 0-based line, and `expires_at_ms`. It never holds a payload.
+     - **Babysitter-kind deletes** become index-only tombstone rows in a bucket kept 30 days from the delete (no object). The delete record itself travels today's path unchanged.
+     - Index rows are hidden the moment their bucket is fenced or expired, and are deleted with the bucket's erase.
    - **What this guarantees:** a bucket holds only Babysitter lines, and no session chunk, staged object, buffered stage or canonical generation ever holds the payload. No mixed object is ever registered or erased.
    - **What stays unchanged:** the SQL prepare, publication, seats and custody, which compare SQL metadata only, and the revision fence.
    - **Reset epoch:** it is part of the key, so a write after a user reset always opens a new bucket. A reset never erases post-reset evidence.
@@ -60,7 +63,7 @@ The pipeline does not project or serve these kinds, and the Neon→S3 exporter n
    - RPCs:
      - `register`: the machine is derived in SQL; the ref must name its hour, session and reset epoch; the epoch must still be current (otherwise 40001, retry); it is **refused while the bucket is leased**; a late write re-opens an erased bucket.
      - `claim`: needs `enabled` and the generation, takes 1..200 buckets with SKIP LOCKED and a 5-minute lease, and returns `leaseUntil`.
-     - `complete`: refused while disabled or in dry run; a moved `write_seq` stays pending.
+     - `complete`: `erased` | `progress` | `released`. `erased` and `progress` are refused while disabled or in dry run. `erased` needs `write_seq` unchanged since the claim, and it deletes the bucket's key-index rows. `progress` persists the content-free resume checkpoint (or NULL, to restart), which must name this bucket's directory, and the bucket stays pending. `released` keeps the last checkpoint. A registration clears the checkpoint.
    - **Due**, always after a **15-minute hold-off** since the last registration (no PUT can be in flight). The hold-off also delays a deletion or reset fence: a bucket is erased at most about 25 minutes after the fence (15 minutes plus the 10-minute sweep cadence), comparable to E3's own session erasure cadence.
      - the expiry hour has passed; or
      - the session is deleted; or
@@ -75,15 +78,22 @@ The pipeline does not project or serve these kinds, and the Neon→S3 exporter n
      - **Fixed call allowlist** (`ALLOWED_SQL`, enforced on every statement; anything else is refused unsent):
        - `SELECT current_user::text AS c` (no arguments);
        - `SELECT sessions.ingest_babysitter_retention_claim($1::jsonb) AS result` with `{generation, limit 1..200}`;
-       - `SELECT sessions.ingest_babysitter_retention_fence($1::jsonb) AS result` with `{generation, leaseToken}` (the fence between the snapshot and the deletes);
-       - `SELECT sessions.ingest_babysitter_retention_complete($1::jsonb) AS result` with `{generation, leaseToken, outcome: erased|released, versions}`.
+       - `SELECT sessions.ingest_babysitter_retention_fence($1::jsonb) AS result` with `{generation, leaseToken}` (re-checked before every page's deletes and before the proof);
+       - `SELECT sessions.ingest_babysitter_retention_complete($1::jsonb) AS result` with `{generation, leaseToken, outcome: erased|progress|released, versions, checkpoint}`.
        The role itself can EXECUTE only those three functions (claim, fence, complete).
      - **Bounds:** statement and lock timeout 1.8 s, connect 1 s, pool max 2, claim 1..200, tick budget 45 s, lease 5 minutes (an erase starts with at least 2 minutes left and is cut at the lease end less 1 minute), interval at least 60 s.
      - **Error sanitization:** codes only (SQLSTATE class or fixed names). No message, key, URL or id is logged.
      - **Shutdown:** SIGINT and SIGTERM set the process's stop flag. The loop finishes its current tick, the sleep wakes within 1 s, and the pool is ended.
      - **Dry run / no `--execute`:** without `--execute` the phase is **off**: no stdin read, no connection, no database or S3 write. `BABYSITTER_RETENTION_SWEEP=dry_run` with `--execute` claims and releases (lease and audit rows only) and never calls the eraser.
    - A bounded tick every 10 minutes. It erases a bucket only with at least 2 minutes of lease left, and only the bucket's own directory `…/h=_babysitter/d=<date from the ref>/s=<bucket>/` (never a machine-wide listing). The erase is cut off at the lease end less a 1-minute margin, then released and re-claimed later; deletion by version id is idempotent.
-   - **Snapshot erase, strict inventory:** list the exact versions of the bucket directory, fence the lease, then delete exactly that snapshot. A version written after the snapshot is never deleted, however late the deletes run. The inventory is strict (well-formed complete XML, required Key/VersionId/IsLatest, proven pagination with cursor progress, a 10,000-version bound); any doubt, or any listed key outside the bucket directory, throws before a delete, and the bucket is released (still pending, reclaimed later). The erase is acknowledged only after a post-delete strict inventory shows none of the snapshot left.
+   - **Durable, resumable, strict erase** through the ONE shared primitive in `src/migration/neon-s3-erasure/eraser.ts`: `eraseStep` and `verifyErased`, which F1 and the E3 job compose identically.
+     - **Each run is bounded:** at most 10,000 versions and 100 pages, cut at the lease end less half the margin, with a hard timeout.
+     - **Every page is strict:** complete Key/VersionId/IsLatest, both pagination markers equal to the last entry, every key under the bucket directory, no duplicates, monotonic cursor, cycle detection. Nothing is deleted from an ambiguous page.
+     - **The fence RPC runs before every page's deletes.** Deletes are exact key+version only.
+     - **A run that ends on its budget** persists a content-free checkpoint through `complete(progress)`, and the bucket stays pending. The checkpoint is bound to the bucket, the generation, both epochs and `write_seq`. Anything else (a new registration, a generation, a stale scope) is refused and the run restarts from the top.
+     - **Resume points:** a run resumes at a completed-key boundary, so a deleted marker version cannot strand the cursor. A provider 400 on an in-key marker restarts at that boundary.
+     - **Erased needs proof.** A bucket is `erased` only after a full traversal **and** a fresh strict zero-version inventory under the fence, with `write_seq` unchanged. That `write_seq` check is the no-unresolved-PUT obligation: registration is refused while leased, and claims wait out the 15-minute hold-off. Versions found behind the cursor restart the traversal; they are never erased-by-assumption.
+     - **Crash or lost acknowledgement** at any step reuses the last persisted checkpoint; deletes by version are idempotent.
    - It logs counts and codes only.
    - **Erase/write fence:** a PUT happens only inside its own request, right after its registration. Registration is refused while a lease holds. A bucket is claimable only 15 minutes after its last registration, and no erase starts near the lease end. So no PUT can land under an erase.
 
@@ -119,19 +129,23 @@ Each step is the production lead's, with Khaliq's OK for the window, deploys and
 
 **Contract** (Neon's `listDelivery`):
 - filters `kind`, `source`, `session_id`, `include_deleted`, `cursor`, `limit` (1..100); unknown or repeated filters are 400;
-- a real page with an opaque scope-bound cursor: buckets come from SQL by keyset (`babysitter_evidence_buckets_for`, 1..200 per call, never a raise for a large set) and objects are read one at a time until limit + 1 visible records (or a work bound: 256 buckets, 32 objects), so a page reads O(limit) objects and a continuation never rereads earlier ones;
-- ordered by (bucket machine, bucket ref, object key, line), stable across pages. Neon orders by (origin_id, record_id), which only a full scan could reproduce; clients treat the cursor as opaque either way;
-- the 3 s deadline reaches the store (list and get abort); backend failures are 503 `backend_unavailable` with no message;
+- **Neon's native order:** (origin_id, record_id) in C collation, with the cursor position (origin_id, record_id) bound to the filter scope;
+- **bounded page work, no materialization:**
+  - one SQL page over the content-free key index (`babysitter_evidence_page_for`, index range scan): limit+1 rows, at most 1,000 records scanned;
+  - then exact-key GETs of only the objects the page's live rows point at (at most 32 distinct; no listing at all);
+  - any bound that cuts a page returns a cursor at the last record decided, so it resumes there and never claims completeness;
+- the 3 s deadline reaches every GET; backend faults (including an indexed line that is not exactly that revision) are 503 `backend_unavailable` with no message;
 - envelope `{protocolVersion: 1, listing: "live", records, nextCursor}` and Neon's record shape.
 
 **Visibility:**
 
 | Rule | Behaviour |
 |---|---|
-| Tenant | Org and workspace come from the verified token. The bucket and revision RPCs (`babysitter_evidence_*_for`) run as `bulls96_read_api` under the read API's binding (`session_directory_read_api_scope`); a missing or foreign binding is refused (42501). |
+| Tenant | Org and workspace come from the verified token. The page RPC (`babysitter_evidence_page_for`) runs as `bulls96_read_api` under the read API's binding (`session_directory_read_api_scope`); a missing or foreign binding is refused (42501). |
 | Expiry | `payload.expires_at_ms <= now` is unreadable. `include_deleted` returns a payload-free tombstone, as Neon's read-only predicate does. A bucket past its erase hour is not read at all, so nothing is readable after 30 days. |
 | Delete and reset (logical delete) | A bucket whose session fence epoch moved (any disable since its claim) or whose user reset is hidden **at once**, before any physical erase, and **stays hidden after a re-enable**. Erased buckets are never read. |
-| Supersession | A line older than the committed revision (an update or a tombstone in `ingest_record_revisions`) is never served, not even with `include_deleted`: a page cannot tell whether the newer revision is live in a later bucket. `include_deleted` tombstones come from expiry only (a deliberate deviation: Neon keeps tombstone rows). |
+| Supersession and deletes | Per record, its **newest indexed revision** decides, as Neon's one row per record does. A newer live revision wins, and older lines are never served. A latest **delete** is Neon's tombstone (operation `delete`, payload null, the delete's revision id and revision), returned **exactly once** under `include_deleted` and hidden otherwise. The newest revision must be the committed one (`ingest_record_revisions`): otherwise nothing is served, neither a stale payload nor a guessed tombstone. |
+| Tombstone lifetime (residual) | A tombstone row lives in a bucket kept 30 days from the delete, then is erased with it. Neon keeps tombstone rows indefinitely, so after 30 days `include_deleted` no longer lists that delete; every payload it shadowed expired earlier. |
 
 ## Re-enable safety (no loss, no resurrection)
 

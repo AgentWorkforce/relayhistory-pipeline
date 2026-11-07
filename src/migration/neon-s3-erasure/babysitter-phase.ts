@@ -31,8 +31,8 @@
  *  - fixed call allowlist (ALLOWED_SQL), enforced on every statement:
  *      SELECT current_user::text AS c                                         (no arguments)
  *      SELECT sessions.ingest_babysitter_retention_claim($1::jsonb) AS result     {generation, limit 1..200}
- *      SELECT sessions.ingest_babysitter_retention_fence($1::jsonb) AS result     {generation, leaseToken}
- *      SELECT sessions.ingest_babysitter_retention_complete($1::jsonb) AS result  {generation, leaseToken, outcome erased|released, versions}
+ *      SELECT sessions.ingest_babysitter_retention_fence($1::jsonb) AS result     {generation, leaseToken} (before every page of deletes)
+ *      SELECT sessions.ingest_babysitter_retention_complete($1::jsonb) AS result  {generation, leaseToken, outcome erased|progress|released, versions, checkpoint}
  *    and the role itself can EXECUTE only those three functions (20261105042000).
  *  - bounds: statement and lock timeout 1.8 s, connect 1 s, pool max 2, claim 1..200,
  *    tick budget 45 s, lease 5 min (erase starts with >= 2 min left, cut at lease - 1 min),
@@ -49,7 +49,7 @@
 import pg from "pg";
 import { SUPABASE_PROD_CA_2021 } from "../../session-pipeline/supabase-ca.ts";
 import { babysitterRetentionTick, sqlBabysitterRetentionLedger, sweepMode, type SweepMode, type TickResult } from "../../session-ingest/babysitter-retention.ts";
-import { isSnapshotEraser } from "./eraser.ts";
+import { isPagedEraser } from "./eraser.ts";
 
 const POOLER = "aws-0-us-east-1.pooler.supabase.com";
 /** The phase's own least-privilege role: EXECUTE on the retention claim/fence/complete RPCs only. */
@@ -134,13 +134,13 @@ export async function startBabysitterPhase(
   log: (fields: Record<string, unknown>) => void,
   sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
 ): Promise<BabysitterPhase> {
-  if (!isSnapshotEraser(eraser)) throw new Error("the retention phase needs a snapshot-capable eraser");
+  if (!isPagedEraser(eraser)) throw new Error("the retention phase needs the strict paged eraser");
   const query = allowlistedQuery(pool);
   const who = (await query("SELECT current_user::text AS c")).rows[0] as { c: string };
   if (who.c !== RETENTION_ROLE) throw new Error("the retention phase is connected as the wrong role");
   const run = query;
   const ledger = sqlBabysitterRetentionLedger(run, settings.generation);
-  const tick = () => babysitterRetentionTick({ ledger, eraser, keyRoot: settings.keyRoot, mode: settings.mode, limit: settings.limit });
+  const tick = () => babysitterRetentionTick({ ledger, eraser, keyRoot: settings.keyRoot, mode: settings.mode, limit: settings.limit, generation: settings.generation });
   return {
     tick,
     async loop(stop, once = false) {
