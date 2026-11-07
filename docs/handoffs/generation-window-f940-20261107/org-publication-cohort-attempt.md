@@ -12,3 +12,6 @@ Closed result:
 ~~~
 
 Raw receipt org-publication-cohort-result.json SHA2564193c08c328b0d43674c15e0df62a5b15507889957169f2194c3c6291240a658. Lead244917106160033792 and release owner244917112420069376 were sent the exact closed result. Need an authoritative scope resolver/binding qualification before this org cohort can run. A separately reviewed auth/workspace directory path might supply it, but none was queried or assumed here. The earlier global publisher zero-activity snapshot remains only its own timestamped observation, not a scoped answer to this cohort or a canonical readback proof.
+
+
+Privacy wording clarification: the no-argv guarantee is specifically for the resolved organization ID, as required. The supplied workspace/user coordinates originated in the authorized request and control invocation and were fed to the helper through stdin; they were not retrieved as database output or included in the receipt. The79fbf764 commit message used the broader shorthand no IDs in argv; it should be read with this narrower, accurate scope. No organization value was emitted or guessed, and the org cohort did not execute.
