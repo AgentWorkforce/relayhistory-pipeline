@@ -22,7 +22,9 @@ pointer win" (`src/hoopdb/session-directory-projector.ts:10`), so a lagged API u
   (`src/session-ingest/control-protocol.ts:4-15`, which cannot carry an install proof), custody witnesses
   (`custody-protocol.ts:9`) or the recovery wire (`recovery-protocol.ts:1-9`) as acquisition evidence.
 - No manufactured drain proof (§7). No change to 049 publication ownership, privacy selection/reset or erasure;
-  deletions and tombstones are never blocked. No global write hold for other sources or providers.
+  deletions and tombstones are never blocked. Other sources and providers share only a bounded enrollment barrier:
+  while an `enroll_begin` runs (bounded by its `lock_timeout`, §4.8) the singleton `LE` gate makes otherwise
+  unenrolled writers briefly return retryable `40001 session_busy`; there is no other cross-source write hold.
 
 ## 3. Data model
 
@@ -179,13 +181,21 @@ with `SET search_path=pg_catalog,pg_temp`. Install, revoke and rebind keys are e
 `targetOwnerKind` and its `targetBindingUuid` or `targetInstallationId`. A missing target is `invalid_request`.
 1. Run install steps 1-2 and 4-5.
 2. If the grant row `targetGrantId` exists, its scope, epoch, kind and binding/installation must equal the target
-   (else `42501 target_mismatch`). The current `active` grant needs `p.revision > revision` (else `stale_revision`);
-   owner and grant become `draining` and revision = tombstone = `p.revision`. An already `draining`/`released` or
-   superseded grant returns `superseded` unchanged.
-3. Otherwise (revoke-before-install) insert the target into `ingest_acquisition_revoked_grants`, owner row untouched
-   (`revoked_pending`); that `operationUuid`'s install later refuses `revoked_before_install`. Both paths also insert
-   the target's lineage into `ingest_acquisition_revoked_lineages` (`ON CONFLICT DO NOTHING`, §4.9). A revoke never
-   affects another binding, kind or epoch; a Cloud key for a native target, or vice versa, is `not_authorized`.
+   (else `42501 target_mismatch`); nothing else is decided here.
+3. Otherwise (revoke-before-install) insert the target into `ingest_acquisition_revoked_grants`; that
+   `operationUuid`'s install later refuses `revoked_before_install`.
+4. Lineage fence (§4.9), on both paths, in the same transaction and under the same `LA` → `LP` → owner-row locks:
+   insert the target's lineage into `ingest_acquisition_revoked_lineages` (`ON CONFLICT DO NOTHING`). Then, if the
+   owner row is `active` and its current grant has the target's `ownerKind` and `bindingUuid`/`installationId`,
+   whether or not that grant is `targetGrantId`, owner and grant become `draining`: `owner_epoch`, `grant_id`,
+   owner and origins unchanged; revision = tombstone_revision = `greatest(revision, p.revision)`; `row_version`
+   +1; outcome `draining`. A `p.revision` at or below the current revision never yields `stale_revision` here: a
+   lineage revocation is final (§4.9), so `greatest` keeps revision monotonic and tombstone ≤ revision without
+   letting a stale ordering keep the lineage admitting. Otherwise (owner absent, `unknown`, `draining`,
+   `released`, or a current grant of another lineage) the owner row and grants stay untouched; outcome
+   `superseded` if `targetGrantId` exists, else `revoked_pending`. An absent or superseded target never bypasses
+   this step. A revoke never affects another binding, kind, epoch or session; a Cloud key for a native target, or
+   vice versa, is `not_authorized`.
 
 **Error contract.** The message is the stable code, prefixed `acquisition: `.
 
@@ -319,9 +329,29 @@ or pending) therefore refuses `revoked_before_install` whatever its `operationUu
 epoch is binary: a revoked lineage never installs on that session again. Cloud mints a new `bindingUuid` per bind, so
 a later bind is a new lineage (Cloud requirement; a reused one fails closed); a revoked native installation needs a
 successor install with handover (`handover_not_ready` in v1). The kind and lineage id are already signed fields of
-`A`, so `A`, the vectors and §4.2's re-issue stay unchanged. The fence touches no owner row, grant or other lineage,
-so an unrelated binding's current owner is unaffected. Option (ii), one install UUID per binding lifetime, was
+`A`, so `A`, the vectors and §4.2's re-issue stay unchanged. The fence touches no other lineage's owner row or
+grant, so an unrelated binding's current owner is unaffected. Option (ii), one install UUID per binding lifetime, was
 rejected: it forbids §4.2's re-issue after a terminal refusal and needs a separate recovery protocol.
+
+**Admission stop for the same lineage (both orderings).** A committed lineage revocation is the linearization point
+for stopping new admission and pre-receipt commits for every grant of that exact `(org, ws, source, session, owner
+kind, bindingUuid|installationId)`, even when `targetGrantId` is absent or names another grant. Reverse schedule: a
+delayed copy of I1 (binding B) installs and commits first; unbind then revokes the still-uninstalled I2 (same B). Revoke
+step 4 (§3.1) finds the current `active` grant in B's lineage and makes owner and grant `draining` in the revoke's
+transaction, so from its commit `_admit` refuses (`owner_draining`, §4.4) and every pre-receipt `_fenced(...,'admit')`
+recheck refuses (`owner_changed`, it requires `active`). The forward schedule (revoke first) is refused at install
+step 6. A writer mid-admission holds `LA` shared, so revoke's exclusive try-lock returns `session_busy` until that
+claim commits or aborts; the claim either committed before the revoke (an accepted obligation) or sees `draining`.
+I1's already-receipted obligations keep their epoch and stay server-owned publication/reconciliation work under §7
+(publication claim and publish accept `draining` at the admitted epoch); nothing is dropped and no client replay is
+needed. Binding C, another owner kind and another session are never touched. Native origin or UUID knowledge
+(`grantId`, `installationId`, `bindingUuid`, `ownerOriginId`) remains insufficient authorization: admission still
+requires `G` (§5.1). The hooks of §5 do not read `ingest_acquisition_revoked_lineages`.
+
+Rationale (non-normative): revoke already holds `LA` exclusive, `LP` and the owner row `FOR UPDATE`, so draining the
+matching grant there adds no lock and no hook read and keeps the §4.5 order; `draining` is already refused by
+admission and the pre-receipt rechecks and accepted by publication, so receipts and §7 are unchanged; and status
+stays truthful, with a path to `released` through the drain producer.
 
 ## 5. Admission and publication recheck (exact hooks)
 
@@ -447,6 +477,20 @@ Implementation plan. One PR, dormant:
    - `binding_lineage_delayed_install_after_revoke` (§4.9): I1 for binding B refused `disabled`; switch on; I2 (new
      `operationUuid`, same B) installs, or is revoked before install; revoke I2; replaying I1's exact `A`/`S` →
      `revoked_before_install`; an install for binding C still succeeds.
+   - Mandatory two-connection lineage tests (§4.9); both end with no new B admission, and in both a writer
+     presenting only native origin/UUID knowledge of I1 (`grantId`, `ownerEpoch`, `bindingUuid`/`installationId`,
+     origin) without `G` is refused, never admitted (`not_owner` while I1 is `active`).
+     `binding_lineage_install_then_revoke_other_uuid`: I1 for B installs and commits; a writer under I1 claims a
+     batch and its durable receipt is acknowledged; C1's second I1 claim holds `LA` uncommitted while C2 revokes I2
+     (target absent, and again naming a superseded grant) → `session_busy`, retried after commit; the revoke
+     commits `draining` with epoch unchanged and revision = tombstone = `greatest(revision, p.revision)`, including
+     a `p.revision` below the current revision; then a new I1 claim → `owner_draining`, an I1 prepared stage commit
+     → `owner_changed`, nothing written; the acknowledged receipt still publication-claims and publishes at its
+     epoch under `draining`, after which committed ledger state shows no accepted obligation for it (§7); a current
+     binding-C owner on another session, and an owner of the other kind, stay byte-identical.
+     `binding_lineage_revoke_then_install_other_uuid`: C1 revokes uninstalled I2 and holds it uncommitted; C2's
+     delayed I1 install → `session_busy`; C1 commits; C2's retry → `revoked_before_install`, no grant, epoch and
+     revision unchanged; a binding-C install on another session still succeeds.
    - Mandatory two-connection enrollment tests (§4.8). `enrollment_interlock_writer_during_uncommitted_begin`: C1
      runs `enroll_begin` uncommitted; C2 (READ COMMITTED) legacy pointer insert → busy, nothing written; reversed: C2
      inserts uncommitted, C1 `enroll_begin` blocks, C2 commits, C1 commits, `enroll_complete` backfills C2's session
