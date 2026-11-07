@@ -190,17 +190,22 @@ security off and no credential anywhere, and uses no hosted service:
 It then runs:
 
 1. The shared `SearchIndexAdapter` conformance suite plus OpenSearch-specific parity
-   cases (rewrite after delete, a maximum-length `q` across window boundaries, a scan
-   past `max_result_window`): `test/search-index-opensearch-real.test.ts`.
+   cases: `test/search-index-opensearch-real.test.ts`. The cases are rewrite after
+   delete; a 500-character `q` containing one `İ` across window boundaries;
+   `'a'.repeat(500)`, `'İ'.repeat(500)` (folds to 1,000 code points) and
+   `'ab'.repeat(250)` against `matchesQuery`; and a scan past `max_result_window`.
 2. `scripts/opensearch-proof/e2e.ts`, in one process: records carrying a content
    marker and the placeholder secrets from `src/concourse/seed.ts` pass through the
    pipeline scrubber into a zstd chunk and manifest in a temp-directory store;
-   `indexSearchScope` indexes the scope through the default registry with
-   `SEARCH_INDEX_BACKEND=opensearch`; the marker query returns the event; no
+   the same three repetitive or maximal `q` are checked against `matchesQuery` in a
+   separate tenant that is then deleted; `indexSearchScope` indexes the scope through
+   the opensearch-capable registry with `SEARCH_INDEX_BACKEND=opensearch`; the marker query returns the event; no
    placeholder secret is found by query or in any stored `_source`; with the live
    pointers gone, `indexSearchScope` erases the scope, the query is empty and
    `_count` for the tenant is 0. It writes a JSON result (head, dialect, server
-   version, each case) that the job checks.
+   version, each case). The job requires exactly 19 passing cases and that the detected
+   distribution matches the dialect. Detection uses `version.distribution`, or the
+   `X-Elastic-Product` header, and is `unknown` otherwise.
 
 The basic-auth and failure paths are covered by the fake-`fetch` unit tests
 (`test/search-index-opensearch.test.ts`). To run the proof locally against any

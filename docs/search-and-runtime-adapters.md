@@ -31,14 +31,20 @@ closed at boot.
 | Shared runtime conformance | `packages/pipeline/src/runtime/conformance.ts` |
 | Explicit registration and boot selection | `packages/pipeline/src/adapters/` |
 
-The default search registry (`createSearchIndexRegistry`) contains Postgres
-(the default) and OpenSearch; `createPostgresSearchIndexRegistry` contains
-Postgres only and backs `createPostgresSearchComposition`. The default runtime
+The default search registry (`createSearchIndexRegistry`) contains only
+Postgres. It backs `createPostgresSearchComposition` and is the registry the
+Lambda composition ABI (`src/lambda-artifact/composition.ts`) exports.
+`createOpenSearchCapableSearchIndexRegistry` adds OpenSearch and is opt-in: the
+ABI does not export it, and no shipped entry point uses it. The default runtime
 registry contains only the worker runtime. Recognizing a provider name does not
 install that implementation. Creating an unregistered adapter fails. Each entry
-point declares the implementations it can run, and registration does not widen
-that list: workers still refuse `SEARCH_INDEX_BACKEND=opensearch`. Future
-compositions must explicitly register and allow any additions.
+point declares the implementations it can run. Workers refuse
+`SEARCH_INDEX_BACKEND=opensearch` whatever is registered. The Lambda entries
+allow `clickhouse` plus the names their composition's registry holds, so they
+refuse `opensearch` with no composition or with any composition built on the
+ABI's registry (`src/session-pipeline/__tests__/lambda-search-backends.test.ts`).
+A future composition that runs OpenSearch must choose the opensearch-capable
+registry explicitly, as a reviewed change.
 
 ClickHouse, Lambda, Cloud Run and Terse implementation ownership, distribution
 and service integration, and wiring OpenSearch into an entry point, are separate
@@ -105,17 +111,49 @@ dialect.
   `bool.filter`; nothing is scored.
 - `q` is matched like the Postgres reference (lower-cased substring of the first
   4,096 characters of content, or the title) by a `wildcard` over lower-cased
-  keyword windows of 4,096 characters at a 2,048 stride, so a 500-character
-  query always falls inside one window.
+  keyword windows of 4,096 characters at a 2,048 stride. A 500-character `q`
+  lower-cases to at most 1,000 code points (`İ` becomes two), and any substring
+  of up to 2,049 code points falls wholly inside one window. That arithmetic is
+  unit-tested over a fake `fetch`. The real-server tests run three kinds of `q`:
+  a 500-character `q` containing one `İ` at four window boundaries of a 9,000-character
+  title; `'a'.repeat(500)`; and the maximal folded `'İ'.repeat(500)` and `'ab'.repeat(250)`,
+  within one window and past the first window boundary. Each is compared with
+  `matchesQuery`. The repetitive and maximal cases are new and have not yet been
+  proven on a real server; that proof is the `opensearch-proof` CI job. Until it
+  passes on both dialects, treat Lucene's wildcard automaton limits
+  (`too_complex_to_determinize`, which maps to a non-retryable `http_400`) as
+  unverified for these inputs.
+- Cost: `q` is a leading-wildcard query, so each search enumerates the whole
+  folded-term dictionary of every shard it hits. The tenant `filter` does not
+  narrow that walk, so the cost grows with the whole index, not the tenant,
+  and one tenant's long queries (each up to the request timeout) slow search
+  for every tenant sharing the index. The adapter declares this
+  (`minIndexedQueryChars` is `Number.MAX_SAFE_INTEGER`) but does not limit it.
+  Before shared production use, at least one of these must be in place: a
+  per-tenant index or alias (so the term walk covers one tenant), an n-gram
+  field that turns `q` into term lookups, or a per-tenant rate limit on search
+  at the read API.
 - Upserts are `_bulk?refresh=wait_for` with `version_type=external_gte`, so a
   newer stored version wins and reads see writes on return. `index.gc_deletes`
   is `0s`, so a deleted key can be rewritten at any version, as in Postgres.
   The engine only drops a delete tombstone on a refresh after its coarse clock
   (200 ms) ticks, so a write that conflicts with no live document (checked by
   `_mget`) is retried after `_refresh` for up to about 4 s, then fails
-  retryably with `deleted_key_conflict`. A basic-auth user therefore needs
+  retryably with `deleted_key_conflict`. A conflict whose `_mget` item has no
+  boolean `found` (an error item) fails with `bad_response` instead of being
+  counted as a newer row. `_bulk` is not atomic, unlike the single Postgres
+  `INSERT`: when one item fails, the request throws `bulk_item_<status>` after
+  earlier items in the same request have been written. A retry is safe, because
+  external versions make each write idempotent. Callers must not assume a failed
+  upsert wrote nothing. A basic-auth user therefore needs
   read, write, `_delete_by_query`, `_mget` and `_refresh` on the index, plus
-  index creation and mapping updates for `ensureSchema`.
+  index creation, mapping updates and reading settings for `ensureSchema`.
+- `ensureSchema` reads `index.gc_deletes` back after creating or confirming the
+  index. An index that already existed or came from a template may keep the
+  60 s default, which the tombstone handling above does not expect. Anything
+  other than `0`, `0s` or `0ms` fails `schema_mismatch` (detail `gc_deletes`).
+  The adapter never applies settings. An operator sets
+  `index.gc_deletes: 0s` (a dynamic setting) and reruns `ensureSchema`.
 - `deleteEvents` and `eraseScope` are `_delete_by_query?refresh=true&conflicts=proceed`
   under the tenant filter; an erase repeats while version conflicts remain and
   fails rather than reporting partial erasure.
@@ -125,7 +163,10 @@ dialect.
 - Errors map to `SearchIndexError` codes without backend text: 404 index →
   `schema_missing`, 429/5xx/network/timeout → retryable `unavailable`.
 - Auth: `none`, `basic` (password from the secret loader), `sigv4` (not
-  implemented: construction fails `unsupported`). `CA_FILE` needs Bun.
+  implemented: construction fails `unsupported`). `basic` needs an `https` URL
+  unless the host is loopback (`localhost`, `127.0.0.0/8`, `::1`). Otherwise
+  construction fails `invalid_argument` (detail `basic_auth_needs_https`), so
+  credentials never cross a network in cleartext. `CA_FILE` needs Bun.
 
 `.github/workflows/opensearch-proof.yml` runs the shared conformance suite and an
 end-to-end upload → scrub → index → search → erase proof on real OpenSearch 2
@@ -215,17 +256,17 @@ components retain their existing timing checks.
 
 | Variable | Recognized names | Current entry-point behavior |
 | --- | --- | --- |
-| `SEARCH_INDEX_BACKEND` | `postgres`, `clickhouse`, `opensearch` | workers allow `postgres`; the existing Lambda entry allows `clickhouse` |
+| `SEARCH_INDEX_BACKEND` | `postgres`, `clickhouse`, `opensearch` | workers allow `postgres`; the existing Lambda entries allow `clickhouse`, plus `postgres` with a composition from the ABI; no shipped entry allows `opensearch` |
 | `PIPELINE_RUNTIME` | `workers`, `lambda`, `cloudrun`, `terse` | workers allow `workers`; the existing Lambda entry allows `lambda` |
 | `SEARCH_INDEX_POSTGRES_SCHEMA` | SQL identifier | `search_index` unless explicitly configured; validated when constructing the adapter |
 | `SEARCH_INDEX_OPENSEARCH_URL` | `http(s)://host[:port][/path]` | required when `SEARCH_INDEX_BACKEND=opensearch`; creation fails without it. No credentials, query or fragment in the URL |
 | `SEARCH_INDEX_OPENSEARCH_DIALECT` | `opensearch`, `elasticsearch` | `opensearch` |
 | `SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX` | lower-case `[a-z0-9][a-z0-9_-]*` | `relayhistory` (index `relayhistory-transcript-events`) |
-| `SEARCH_INDEX_OPENSEARCH_AUTH` | `none`, `basic`, `sigv4` | `none`; `sigv4` is not implemented and fails at creation |
+| `SEARCH_INDEX_OPENSEARCH_AUTH` | `none`, `basic`, `sigv4` | `none`; `basic` needs an `https` or loopback URL; `sigv4` is not implemented and fails at creation |
 | `SEARCH_INDEX_OPENSEARCH_USERNAME` | string without `:` | required for `basic` |
 | `SEARCH_INDEX_OPENSEARCH_PASSWORD` | secret, from the secret loader (`secrets`), never env | required for `basic` |
 | `SEARCH_INDEX_OPENSEARCH_CA_FILE` | path to a PEM bundle | unset; https only, Bun runtime only |
-| `SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS` | positive integer | `10000` |
+| `SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS` | integer, 1 to 600000 | `10000` |
 
 Empty or unset selection variables use each entry point's existing behavior.
 Unknown names and recognized but unsupported choices fail at boot. Workers use
