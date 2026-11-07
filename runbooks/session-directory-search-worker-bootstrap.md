@@ -383,6 +383,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105040000_ingest_lazy_source_tables.sql` | replacement: lazy-current adoption checks exclude the source-side tables |
 | `upstream:20261105041000_ingest_privacy_authority.sql` | table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix) |
 | `upstream:20261105042000_babysitter_evidence_retention.sql` | table sessions.babysitter_retention_objects |
+| `upstream:20261105043000_brief_titles.sql` | column sessions.session_briefs.origin |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |

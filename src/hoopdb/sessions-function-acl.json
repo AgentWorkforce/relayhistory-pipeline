@@ -865,7 +865,14 @@
     "sessions.session_brief_document_json(sessions.session_directory,boolean)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_brief_titles_for(text,text[],text[])": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.session_briefs_forget()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_briefs_provenance()": [
       "<owner>:EXECUTE"
     ],
     "sessions.session_desktop_catalog_mark_parents()": [

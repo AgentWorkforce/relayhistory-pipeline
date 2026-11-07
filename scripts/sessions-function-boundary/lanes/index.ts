@@ -1,5 +1,6 @@
 import type { LaneManifest } from "../types.ts";
 import { briefDocuments } from "./brief-documents.ts";
+import { briefTitles } from "./brief-titles.ts";
 import { bufferedGcSingleCandidate } from "./buffered-gc-single-candidate.ts";
 import { babysitterRetention } from "./babysitter-retention.ts";
 import { canonicalFeatureConsumer } from "./canonical-feature-consumer.ts";
@@ -14,4 +15,4 @@ import { readApi } from "./read-api.ts";
 import { semanticCopy } from "./semantic-copy.ts";
 
 /** Every lane the unified generator composes. Order does not affect the output. */
-export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention];
+export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles];
