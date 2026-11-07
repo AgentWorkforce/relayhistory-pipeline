@@ -33,6 +33,7 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  */
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
+import type { DbErrorClass } from "./db-error-class.ts";
 import {
   DELIVERY_LIMITS,
   DeliveryBusyError,
@@ -92,7 +93,8 @@ export interface DeliverResult {
 
 /** Code only: storage and ledger messages can quote keys. */
 export class IngestUnavailable extends DeliveryError {
-  constructor(readonly stage: string, readonly cause_code: string) {
+  /** `db_class`: set only for a ledger (database) cause; the closed client-error class. */
+  constructor(readonly stage: string, readonly cause_code: string, readonly db_class?: DbErrorClass) {
     super("delivery_unavailable", 503, "Durable delivery is temporarily unavailable");
   }
 }
@@ -131,7 +133,7 @@ async function stage<T>(name: string, work: () => Promise<T>): Promise<T> {
     return await work();
   } catch (error) {
     if (error instanceof DeliveryError) throw error;
-    throw new IngestUnavailable(name, causeCode(error));
+    throw new IngestUnavailable(name, causeCode(error), error instanceof LedgerUnavailableError ? error.dbClass : undefined);
   }
 }
 
