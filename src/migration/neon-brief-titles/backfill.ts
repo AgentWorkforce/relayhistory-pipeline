@@ -410,10 +410,12 @@ function wellFormed(r: VerifyRow): boolean {
   if (r.title === null) return r.origin === null;
   // A served title implies a live pointer and a provenance label, and is exactly what
   // VERIFY_SQL can return: btrim()-ed (PostgreSQL's default btrim strips spaces only) and
-  // nonblank after that trim (its WHERE btrim(title) <> '').
+  // nonblank after that trim (its WHERE btrim(title) <> ''). It must also survive the HTTP
+  // reader's JS trim() (session-read-api/brief-titles.ts), which drops an all-whitespace
+  // title (e.g. a lone tab) that btrim keeps: such a key would verify yet serve nothing.
   if (typeof r.title !== "string") return false;
   const sqlTrimmed = r.title.replace(/^ +| +$/g, "");
-  if (sqlTrimmed === "" || sqlTrimmed !== r.title) return false;
+  if (sqlTrimmed === "" || sqlTrimmed !== r.title || r.title.trim() === "") return false;
   return r.live === true && (r.origin === "native" || r.origin === "neon_backfill");
 }
 

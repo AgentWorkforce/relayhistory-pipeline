@@ -68,6 +68,17 @@ describe("--verify coverage and row shape", () => {
     }
   });
 
+  test("an all-whitespace served title the HTTP reader trims to empty (tab-only) fails (malformed)", async () => {
+    // btrim keeps "\t", but the reader's JS trim() drops it, so the key would serve no title.
+    for (const title of ["\t", "\t\t", "\u00a0"]) {
+      for (const origin of ["native", "neon_backfill"]) {
+        const r = await verifyBackfill(scripted([{ ...key, title, origin, live: true }]), [neon()]);
+        expect(r).toMatchObject({ malformed: 1, native: 0, equal: 0, different: 0 });
+        expect(verifyPassed(r)).toBe(false);
+      }
+    }
+  });
+
   test("only spaces count as trim (PostgreSQL btrim): a tab- or newline-edged title is servable", async () => {
     // btrim(title) strips spaces only, so VERIFY_SQL can return these; they are well formed.
     for (const title of ["\tFix login", "Fix login\n"]) {
