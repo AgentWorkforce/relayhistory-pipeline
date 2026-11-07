@@ -185,7 +185,7 @@
     "otherGenerationBoundConsumers.reviewedDeploymentCaptures"
   ],
   "readOnlyAggregateDiagnostic": {
-    "receipt": "brian-aggregate-v2-result.json",
+    "receipt": "ingest-aggregate-v2-result.json",
     "sha256": "e54a299c17781ad0b63150d8cd57fb98ec4be7313314b5ec2ab5f09b1236cb32",
     "status": "OBSERVED_ONE_SAMPLE_NOT_HEALTH_OR_CAUSE_PROOF",
     "interval": "2026-11-07T19:48:47.928Z..2026-11-07T19:48:48.025Z",
@@ -251,7 +251,7 @@
     "unexpectedAdmissions": 0
   },
   "postRebindUploadSample": {
-    "receipt": "brian-dual-worker-120s-closed-tail-20261107T225613Z.json",
+    "receipt": "post-rebind-dual-worker-120s-sample.json",
     "sha256": "bc058ed2e2e31416e6ef33c1f377cefec77206e88e49f65937fadab5ee8257db",
     "private": {
       "total": 116,

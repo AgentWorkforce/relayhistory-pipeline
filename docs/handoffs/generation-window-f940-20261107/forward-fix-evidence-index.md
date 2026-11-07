@@ -1,0 +1,7 @@
+# Forward-fix evidence supplement
+
+The inert .txt source snapshots record the executed, reviewed operator protocol. They are not executable deployment entrypoints or new approval. Original and published hashes are recorded in forward-fix-source-provenance.json. Guard v3 original c3bf3d6c, driver v3 b554cadb, bracket 1e294808 are byte-identical. Verifier original ec4fd235 has one output-label redaction (a named-customer label becomes Customer); original source hash and the distinct published hash are explicit. No credentials or customer identifiers were embedded in the source snapshots.
+
+Review packet 00e7574e, PREPARE 0062be16 and apply 83b72053 are retained byte-identical. Apply means operator completion; deployed code/bindings are separately proved by readback 8f046043. Canonical rebind and the G2 census are separate receipts. The post-rebind observer was renamed post-rebind-dual-worker-120s-sample.json without changing bytes (bc058ed2). It shows resumed acceptance with remaining claim timeouts, not full recovery or canonical read visibility.
+
+The claim-statistics SQL/result/summary are recorded; tracking is top-level only and functions are not tracked. Lock query 653631a3 is historical and withdrawn; claim-lockwait-attribution-final-20261107.sql is final source 2486bf70. At this supplement's preparation no lock samples have run; independent delta review is pending. Do not execute a withdrawn query or infer a sample from source evidence.

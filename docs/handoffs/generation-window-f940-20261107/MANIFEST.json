@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "at": "2026-11-07T23:02:38.008942+00:00",
-  "kind": "directly_approved_role_bootstrap_and_schema_apply_evidence",
+  "at": "2026-11-07T23:05:42.256411+00:00",
+  "kind": "approved_window_and_forward_fix_sources_receipts",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
   "readiness": "G2_WINDOW_VERIFIED_ACCEPTANCE_RESUMED_INTERMITTENT_CLAIM_TIMEOUTS_REMAIN",
   "files": [
@@ -47,8 +47,8 @@
     },
     {
       "name": "approved-window-current-status.md",
-      "bytes": 4449,
-      "sha256": "80c80aac7dfccb2202b62a77dad00a429d29b23f61d78c58d757926c595a7a89"
+      "bytes": 4822,
+      "sha256": "3ffba27382913b905ede651600cdfeb703144ed6d2c2c2d1064e6a27cf74d232"
     },
     {
       "name": "approved-window-gc-executor-answer.md",
@@ -131,39 +131,19 @@
       "sha256": "f9e4d9c97c60f77af58341ce81b742f80843422743977b3eb2a1013d1dccfb28"
     },
     {
-      "name": "brian-aggregate-attempt-receipt.json",
-      "bytes": 1132,
-      "sha256": "431b29a4d420f42592266e371c423f8fb54f57e916203970c909c5f2ee288b4d"
-    },
-    {
-      "name": "brian-aggregate-observation.md",
-      "bytes": 4232,
-      "sha256": "d9c2c90859e0453c3e6399fbafec055ca8755a8d9fb41062b1c3ee11b740ce1b"
-    },
-    {
-      "name": "brian-aggregate-v2-readonly.ts.txt",
-      "bytes": 7875,
-      "sha256": "8079a725cbc93ef0f30cd71e4ba01f5c58def43324a624d30e56b8166fddced8"
-    },
-    {
-      "name": "brian-aggregate-v2-result.json",
-      "bytes": 1916,
-      "sha256": "e54a299c17781ad0b63150d8cd57fb98ec4be7313314b5ec2ab5f09b1236cb32"
-    },
-    {
-      "name": "brian-dual-worker-120s-closed-tail-20261107T225613Z.json",
-      "bytes": 4407,
-      "sha256": "bc058ed2e2e31416e6ef33c1f377cefec77206e88e49f65937fadab5ee8257db"
-    },
-    {
-      "name": "brian-ingest-aggregate-snapshot-v2.sql.txt",
-      "bytes": 4158,
-      "sha256": "8930e4cfc0497aa4eb56b20add752f8eaa60fadd6c00ee53068a38ee1b4ae3cf"
-    },
-    {
       "name": "capture.json",
       "bytes": 2428,
       "sha256": "f561d85d2b422c5fc0bcc07ff4bede94e071d086d89dcb8c71752c045dcf33e0"
+    },
+    {
+      "name": "claim-lockwait-attribution-20261107.sql",
+      "bytes": 2224,
+      "sha256": "653631a3fe5fada39df2ca74ebee35c7236bfe2240be51818d515422edde98fa"
+    },
+    {
+      "name": "claim-lockwait-attribution-final-20261107.sql",
+      "bytes": 2545,
+      "sha256": "2486bf707ef7b415d73313375a7f381f68179144d0ef51491a6c23a8a13ea1da"
     },
     {
       "name": "ec2-retained-migration-host-proof.json",
@@ -172,8 +152,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 12901,
-      "sha256": "306290f1f5051ba794f6a324d7792c151548d885780ae192c354adc16a2d4fa7"
+      "bytes": 12886,
+      "sha256": "b405235321403a403f7398db73a4d9489e03397f682f5fd77ffa603d08bd8f68"
     },
     {
       "name": "fixed-role-inventory-readonly.ts.txt",
@@ -184,6 +164,51 @@
       "name": "fixed-role-inventory.json",
       "bytes": 11178,
       "sha256": "8b783e760171d2a9f9b9526002c5d968cf06c08ff169517a32a4d3b5588f7c4e"
+    },
+    {
+      "name": "forward-fix-apply-execution.json",
+      "bytes": 765,
+      "sha256": "83b720530389487fe675d0aa0710131be8c71679499258bb3a79409e48915078"
+    },
+    {
+      "name": "forward-fix-bracket.py.txt",
+      "bytes": 6798,
+      "sha256": "1e2948088498e3c898992ac35abc8b4195dfa367497dab7a462e8776876541e6"
+    },
+    {
+      "name": "forward-fix-driver-v3.py.txt",
+      "bytes": 5469,
+      "sha256": "b554cadbc0bce65861eb0c49cde49b41d14428dffaed6ea2a660b263f13b3aaf"
+    },
+    {
+      "name": "forward-fix-evidence-index.md",
+      "bytes": 1464,
+      "sha256": "0a538dcb43b7d90b55257528b49dff6cee8442f36ba416163021a2c552bae613"
+    },
+    {
+      "name": "forward-fix-guard-v3.ts.txt",
+      "bytes": 9437,
+      "sha256": "c3bf3d6c45ef6e9c3136251bac8ced5fbe5472554ca2ed201229ed189b77ebb9"
+    },
+    {
+      "name": "forward-fix-prepare-check.json",
+      "bytes": 679,
+      "sha256": "0062be164614487adfaba6963ff3c4b5d346d552079096f63e9284df05ba7a86"
+    },
+    {
+      "name": "forward-fix-review-packet.json",
+      "bytes": 1174,
+      "sha256": "00e7574e48d2ca26b0f7d7af95b0f9a49f20267110694d3138bd238c6172240b"
+    },
+    {
+      "name": "forward-fix-source-provenance.json",
+      "bytes": 3174,
+      "sha256": "234f11336a98cd977dabf004f5db2a53cf04f57d6ce7813169be7f961cae2162"
+    },
+    {
+      "name": "forward-fix-verifier.py.txt",
+      "bytes": 6200,
+      "sha256": "17f83b4abe321357f8d67d282e75854aae2508b87ac397c58e8e72a74cb8ef4a"
     },
     {
       "name": "g1-census-readonly.ts.txt",
@@ -231,6 +256,31 @@
       "sha256": "7d13d267202966c569eb9f4adb87d4413c1d7c5e01a7b8585adfb01faa8d32ce"
     },
     {
+      "name": "ingest-aggregate-attempt-receipt.json",
+      "bytes": 1132,
+      "sha256": "431b29a4d420f42592266e371c423f8fb54f57e916203970c909c5f2ee288b4d"
+    },
+    {
+      "name": "ingest-aggregate-observation.md",
+      "bytes": 4232,
+      "sha256": "d9c2c90859e0453c3e6399fbafec055ca8755a8d9fb41062b1c3ee11b740ce1b"
+    },
+    {
+      "name": "ingest-aggregate-snapshot-v2.sql.txt",
+      "bytes": 4158,
+      "sha256": "8930e4cfc0497aa4eb56b20add752f8eaa60fadd6c00ee53068a38ee1b4ae3cf"
+    },
+    {
+      "name": "ingest-aggregate-v2-readonly.ts.txt",
+      "bytes": 7875,
+      "sha256": "8079a725cbc93ef0f30cd71e4ba01f5c58def43324a624d30e56b8166fddced8"
+    },
+    {
+      "name": "ingest-aggregate-v2-result.json",
+      "bytes": 1916,
+      "sha256": "e54a299c17781ad0b63150d8cd57fb98ec4be7313314b5ec2ab5f09b1236cb32"
+    },
+    {
       "name": "ingest-claim-inner-statement-stats-readonly-draft-20261107.sql",
       "bytes": 4773,
       "sha256": "24fa86fe520d69d279e69659b96c830969bbcc410a6cb86b5537a6b656b48fa7"
@@ -261,6 +311,11 @@
       "sha256": "bc431aa6f55eefc755126f5d7a8536c4b72e1f7ede9ff9c40ee65bd6c39481fd"
     },
     {
+      "name": "packet-secret-scan-review.json",
+      "bytes": 851,
+      "sha256": "6813545320540e42a62733f2bd2f3464fed0e058a8f26eec6210f9e5b9dc6ced"
+    },
+    {
       "name": "post-cutover-daily-ack-observation.md",
       "bytes": 3304,
       "sha256": "552605f1e456a5f0fc3ea2f83e15ac4ca1ff536543c326d8b565f5d121cee3b8"
@@ -279,6 +334,11 @@
       "name": "post-cutover-daily-ack.sql.txt",
       "bytes": 2868,
       "sha256": "004e9baa07cecfcf663848c0bd421cafdc94aecd3d5310a8319b3c5ba4c792a6"
+    },
+    {
+      "name": "post-rebind-dual-worker-120s-sample.json",
+      "bytes": 4407,
+      "sha256": "bc058ed2e2e31416e6ef33c1f377cefec77206e88e49f65937fadab5ee8257db"
     },
     {
       "name": "post-window-claim-stats-result.json",
@@ -435,5 +495,6 @@
       "bytes": 6575,
       "sha256": "766e7e2d649df9384274695a9bff84293ebd1e4c46763c2e69c678e58af1ce07"
     }
-  ]
+  ],
+  "sourceSnapshotsAreInert": true
 }
