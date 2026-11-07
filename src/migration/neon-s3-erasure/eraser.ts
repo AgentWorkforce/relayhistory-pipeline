@@ -70,6 +70,8 @@ export interface EraseCheckpoint {
   afterKey: string | null;
   /** In-key provider continuation (a key with more versions than one page). */
   inKey: { key: string; versionId: string } | null;
+  /** Exact-key mode: the one key this traversal lists (absent/null: the whole prefix). */
+  exactKey?: string | null;
 }
 export interface ListedVersion {
   key: string;
@@ -103,6 +105,13 @@ export interface EraseStepOptions {
    * before that page deletes anything.
    */
   beforeDelete?: (doomed: readonly ListedVersion[]) => Promise<void>;
+  /**
+   * Exact-key mode: list and erase only this one key's versions (it must lie under `prefix`).
+   * The provider is listed with Prefix = the key itself, so the key's versions come first and
+   * the traversal stops at the first other key: a key whose directory holds any number of kept
+   * siblings stays within budget. Every strict-page rule still applies.
+   */
+  exactKey?: string;
   budget?: EraseBudget;
   now?: () => number;
 }
@@ -114,8 +123,11 @@ export type ErasedProof =
   | { status: "pending"; reason: "remaining" | "budget"; remaining: number; listed: number };
 export interface PagedEraser {
   eraseStep(prefix: string, opts: EraseStepOptions): Promise<EraseStepResult>;
-  /** A fresh, strict, full traversal from the start: erased only when zero selected versions remain. */
-  verifyErased(prefix: string, opts: { select?: (v: ListedVersion) => boolean; authorize: () => Promise<void>; budget?: EraseBudget; now?: () => number }): Promise<ErasedProof>;
+  /**
+   * A fresh, strict, full traversal from the start: erased only when zero selected versions
+   * remain. With `exactKey`, the traversal covers exactly that key's versions (see EraseStepOptions).
+   */
+  verifyErased(prefix: string, opts: { select?: (v: ListedVersion) => boolean; authorize: () => Promise<void>; budget?: EraseBudget; now?: () => number; exactKey?: string }): Promise<ErasedProof>;
 }
 export const ERASE_RUN_MAX_VERSIONS = 10_000;
 export const ERASE_RUN_MAX_PAGES = 100;
@@ -125,12 +137,15 @@ interface StrictPage { entries: ListedVersion[]; truncated: boolean; nextKey?: s
 type PageFetcher = (prefix: string, keyMarker?: string, versionMarker?: string) => Promise<StrictPage>;
 const cmpC = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 
-/** Validates one strict page against the prefix and the requested cursor. */
-function checkPage(prefix: string, page: StrictPage, keyMarker?: string, versionMarker?: string): void {
+/**
+ * Validates one strict page against the listed prefix and the requested cursor. In exact-key
+ * mode the listed prefix IS the key, which itself is a valid entry.
+ */
+function checkPage(prefix: string, page: StrictPage, keyMarker?: string, versionMarker?: string, exact = false): void {
   const seen = new Set<string>();
   let prev: string | undefined;
   for (const v of page.entries) {
-    if (!v.key.startsWith(prefix) || v.key.length === prefix.length || v.key.split("/").some((seg) => seg === "." || seg === ".."))
+    if (!v.key.startsWith(prefix) || (!exact && v.key.length === prefix.length) || v.key.split("/").some((seg) => seg === "." || seg === ".."))
       throw coded("erasure_foreign_key", "an inventory key is outside the requested prefix");
     const id = JSON.stringify([v.key, v.versionId]);
     if (seen.has(id)) throw coded("erasure_inventory", "duplicate version in one inventory page");
@@ -148,10 +163,10 @@ function checkPage(prefix: string, page: StrictPage, keyMarker?: string, version
   }
 }
 
-function checkCheckpoint(bucket: string, prefix: string, scope: string, cp: EraseCheckpoint | null | undefined): EraseCheckpoint | null {
+function checkCheckpoint(bucket: string, prefix: string, scope: string, cp: EraseCheckpoint | null | undefined, exactKey: string | null = null): EraseCheckpoint | null {
   if (cp === null || cp === undefined) return null;
-  if (!cp || cp.v !== 1 || cp.bucket !== bucket || cp.prefix !== prefix || cp.scope !== scope)
-    throw coded("erasure_checkpoint_scope", "the checkpoint is bound to another bucket, prefix or scope");
+  if (!cp || cp.v !== 1 || cp.bucket !== bucket || cp.prefix !== prefix || cp.scope !== scope || (cp.exactKey ?? null) !== exactKey)
+    throw coded("erasure_checkpoint_scope", "the checkpoint is bound to another bucket, prefix, key or scope");
   if (cp.afterKey !== null && (typeof cp.afterKey !== "string" || !cp.afterKey.startsWith(prefix)))
     throw coded("erasure_checkpoint_scope", "the checkpoint cursor is outside the prefix");
   if (cp.inKey !== null && (!cp.inKey || typeof cp.inKey.key !== "string" || !cp.inKey.key.startsWith(prefix) || typeof cp.inKey.versionId !== "string" || !cp.inKey.versionId
@@ -167,18 +182,37 @@ function budgetOf(b: EraseBudget | undefined) {
   return { versions, pages, deadlineAt: b?.deadlineAt ?? Number.POSITIVE_INFINITY };
 }
 
+/** The exact key of an exact-key run, validated against its directory prefix (or null). */
+function exactKeyOf(prefix: string, exactKey: string | undefined): string | null {
+  if (exactKey === undefined) return null;
+  if (typeof exactKey !== "string" || !exactKey.startsWith(prefix) || exactKey.length === prefix.length || exactKey.endsWith("/")
+      || exactKey.split("/").some((seg) => seg === "." || seg === ".."))
+    throw coded("erasure_prefix_shape", "an exact key lies under its prefix and names one object");
+  return exactKey;
+}
+
+/** In exact-key mode a page is cut at the first other key (it sorts after every version of the key). */
+function cutToKey(page: StrictPage, exact: string | null): StrictPage {
+  if (exact === null) return page;
+  const at = page.entries.findIndex((v) => v.key !== exact);
+  return at < 0 ? page : { entries: page.entries.slice(0, at), truncated: false };
+}
+
 /** The one traversal both stores share (S3 versions, or an unversioned store's keys). */
 function pagedEraser(bucket: string, fetchPage: PageFetcher, removeExact: (list: ListedVersion[]) => Promise<number>): PagedEraser {
   return {
     async eraseStep(prefix, opts) {
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
       if (typeof opts.scope !== "string" || !opts.scope) throw coded("erasure_checkpoint_scope", "an erase run needs a scope");
-      const cp = checkCheckpoint(bucket, prefix, opts.scope, opts.checkpoint);
-      const budget = budgetOf(opts.budget), now = opts.now ?? Date.now, select = opts.select ?? (() => true);
+      const exact = exactKeyOf(prefix, opts.exactKey);
+      const cp = checkCheckpoint(bucket, prefix, opts.scope, opts.checkpoint, exact);
+      const budget = budgetOf(opts.budget), now = opts.now ?? Date.now, base = opts.select ?? (() => true);
+      const select = exact === null ? base : (v: ListedVersion) => v.key === exact && base(v);
+      const listPrefix = exact ?? prefix;
       let afterKey = cp?.afterKey ?? null, inKey = cp?.inKey ?? null;
       let pages = 0, listed = 0, deleted = 0, restarts = 0;
       const gone = new Set<string>(), states = new Set<string>();
-      const checkpoint = (): EraseCheckpoint => ({ v: 1, bucket, prefix, scope: opts.scope, afterKey, inKey });
+      const checkpoint = (): EraseCheckpoint => ({ v: 1, bucket, prefix, scope: opts.scope, afterKey, inKey, ...(exact !== null ? { exactKey: exact } : {}) });
       for (;;) {
         if (now() >= budget.deadlineAt) return { status: "incomplete", checkpoint: checkpoint(), deleted, listed, reason: "deadline" };
         if (pages >= budget.pages) return { status: "incomplete", checkpoint: checkpoint(), deleted, listed, reason: "pages" };
@@ -187,7 +221,7 @@ function pagedEraser(bucket: string, fetchPage: PageFetcher, removeExact: (list:
         const keyMarker = inKey ? inKey.key : afterKey ?? undefined, versionMarker = inKey?.versionId;
         let page: StrictPage;
         try {
-          page = await fetchPage(prefix, keyMarker, versionMarker);
+          page = await fetchPage(listPrefix, keyMarker, versionMarker);
         } catch (e) {
           // A provider that rejects its own in-key marker (the marker version was deleted):
           // reconcile from the last completed key, inside this bounded run; never guess a marker.
@@ -195,7 +229,8 @@ function pagedEraser(bucket: string, fetchPage: PageFetcher, removeExact: (list:
           throw e;
         }
         pages++;
-        checkPage(prefix, page, keyMarker, versionMarker);
+        checkPage(listPrefix, page, keyMarker, versionMarker, exact !== null);
+        page = cutToKey(page, exact);
         for (const v of page.entries)
           if (gone.has(JSON.stringify([v.key, v.versionId]))) throw coded("erasure_inventory_changed", "a deleted version reappeared");
         listed += page.entries.length;
@@ -221,15 +256,19 @@ function pagedEraser(bucket: string, fetchPage: PageFetcher, removeExact: (list:
     },
     async verifyErased(prefix, opts) {
       if (!prefix.endsWith("/")) throw coded("erasure_prefix_shape", "a prefix ends in /");
-      const budget = budgetOf(opts.budget), now = opts.now ?? Date.now, select = opts.select ?? (() => true);
+      const exact = exactKeyOf(prefix, opts.exactKey);
+      const budget = budgetOf(opts.budget), now = opts.now ?? Date.now, base = opts.select ?? (() => true);
+      const select = exact === null ? base : (v: ListedVersion) => v.key === exact && base(v);
+      const listPrefix = exact ?? prefix;
       await opts.authorize();
       let keyMarker: string | undefined, versionMarker: string | undefined, pages = 0, listed = 0, remaining = 0;
       const cursors = new Set<string>();
       for (;;) {
         if (now() >= budget.deadlineAt || pages >= budget.pages || listed >= budget.versions) return { status: "pending", reason: "budget", remaining, listed };
-        const page = await fetchPage(prefix, keyMarker, versionMarker);
+        const listedPage = await fetchPage(listPrefix, keyMarker, versionMarker);
         pages++;
-        checkPage(prefix, page, keyMarker, versionMarker);
+        checkPage(listPrefix, listedPage, keyMarker, versionMarker, exact !== null);
+        const page = cutToKey(listedPage, exact);
         listed += page.entries.length;
         remaining += page.entries.filter(select).length;
         if (remaining) return { status: "pending", reason: "remaining", remaining, listed };
@@ -471,14 +510,23 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
   };
 }
 
-/** The same contract over a plain (unversioned) store, for tests and local runs. */
+/**
+ * The same contract over a plain (unversioned) store, for TESTS AND LOCAL RUNS ONLY.
+ * Its paged listing exhausts the backend's `list` cursors for the directory and materializes,
+ * filters and sorts the result before it returns one synthetic page, so the outer page/version
+ * budgets bound the TRAVERSAL, not the backend list work. It is a functional model of the
+ * contract, NOT a bounded remote-store implementation and NOT evidence of a production budget
+ * (the versioned S3 eraser issues one bounded, key-prefix ListObjectVersions request per page).
+ */
 export function storeEraser(store: ObjectStore): Eraser & PagedEraser {
   // Unversioned: one "null" version per key, pages of 1000 keys after the key marker.
   const fetchPage: PageFetcher = async (prefix, keyMarker) => {
     const items: { key: string; lastModified?: number }[] = [];
     let cursor: string | undefined;
     do {
-      const page = await store.list(objectKey(prefix.slice(0, -1)), cursor);
+      // A directory prefix lists itself; an exact key lists its directory, filtered to the key.
+      const base = prefix.endsWith("/") ? prefix.slice(0, -1) : prefix.slice(0, prefix.lastIndexOf("/"));
+      const page = await store.list(objectKey(base), cursor);
       for (const i of page.items) {
         const key = String(i.key);
         if (!key.startsWith(prefix)) continue;
