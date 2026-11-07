@@ -40,10 +40,14 @@ Cloud's session list shows each session's cached model-written brief title. Toda
 ## Containment: backfilled titles stay out of the directory and search
 
 - A backfilled title is served **only** through `session_brief_titles_for` (Cloud's session list, gated by `READ_API_BRIEF_TITLES_WORKSPACES`).
-- **`sessions.session_brief()` is contained too.** It is relayhistory-cloud's `GET /v1/sessions/:id/brief`, granted to `session_directory_search_worker`. 043000 replaces it with 026000's body plus one block that reads a backfilled brief as no brief: `missing`, or `pending` while a wakeup is queued. So `/brief` never serves a Neon title, a description-less brief or a line-break title. The down restores 026000's body exactly.
+- One operator tool also reads `session_briefs` rows, backfilled ones included: `scripts/session-brief-parity.ts`. It compares Neon briefs with Supabase briefs from operator-made exports and prints counts and similarity only, never a title. Filter `origin = 'native'` in its Supabase export when comparing native generation; otherwise backfilled rows compare as exact Neon matches.
+- **`sessions.session_brief()` is contained too.** It is relayhistory-cloud's `GET /v1/sessions/:id/brief`, granted to `session_directory_search_worker`. 043000 replaces it with 026000's body plus one block, with two cases:
+  - **Backfill-only row** (status `ready`, no native attempt since): it reads exactly as no row, so `missing`, or `pending` while a wakeup is queued.
+  - **Backfilled row a later native attempt touched** (that attempt failed or was rate-limited, ineligible, quarantined or empty, and kept the Neon text): it keeps the native attempt's status, error and attempt time, and drops the legacy title, description, state and engine metadata. For example it returns `failed` with the native error and no title.
+  - Either way, `/brief` never serves a Neon title, a description-less brief or a line-break title. The down restores 026000's body exactly.
 - The directory projector (`src/hoopdb/session-directory-projector.ts`) reads native brief titles only. It filters on `engine_version NOT LIKE 'neon-backfill:%'`, which also works before 043000 adds `origin`.
 - So a Neon title never reaches `session_directory.title`, `search_text`, `list_session_directory_for`, or the brief-document/search publication built from the directory row.
-- The runtime writer role could set the reserved `neon-backfill:` prefix itself (finding A5). That would only widen the legacy-row CHECKs for that row, and the row would stay out of the directory like any backfilled one. Accepted; no owner-role pin.
+- The runtime writer role could set the reserved `neon-backfill:` prefix itself (finding A5). To get the relaxed CHECKs it must also set a `legacy_job_id`, because `session_briefs_origin_provenance` requires one. Such a self-labelled row behaves like any backfilled one: it stays out of the directory and `/brief`, and it **is** served by the titles endpoint. Accepted; no owner-role pin.
 - Proof: `src/hoopdb/__tests__/session-directory-brief-provenance.test.ts`. It covers native precedence and the pointer fallback, ordinary and line-break negatives, a causal run of the unfiltered pre-fix SQL, and pre-043000 projection.
 
 ## Freshness
@@ -62,6 +66,8 @@ Cloud's session list shows each session's cached model-written brief title. Toda
 6. Cloud: #6145 and #6151, then `CLOUD_BRIEF_TITLES_BACKEND=sessions_pipeline` (canary first), then the #6125 `brief_titles` Neon off-switch.
 
 ## Rollback
+
+**Stop the backfill before running the down.** The guard checks for `neon_backfill` rows without a table lock, so a backfill batch committing concurrently with the down would race it.
 
 `supabase/rollbacks/20261105043000_brief_titles.down.sql` refuses (55000):
 - while a later migration is applied;

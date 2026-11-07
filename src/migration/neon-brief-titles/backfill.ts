@@ -408,8 +408,13 @@ function wellFormed(r: VerifyRow): boolean {
   if (typeof r.org_id !== "string" || typeof r.workspace_id !== "string" || typeof r.harness !== "string" || typeof r.session_id !== "string") return false;
   if (typeof r.live !== "boolean") return false;
   if (r.title === null) return r.origin === null;
-  // A served title implies a live pointer and a provenance label.
-  return typeof r.title === "string" && r.live === true && (r.origin === "native" || r.origin === "neon_backfill");
+  // A served title implies a live pointer and a provenance label, and is exactly what
+  // VERIFY_SQL can return: btrim()-ed (PostgreSQL's default btrim strips spaces only) and
+  // nonblank after that trim (its WHERE btrim(title) <> '').
+  if (typeof r.title !== "string") return false;
+  const sqlTrimmed = r.title.replace(/^ +| +$/g, "");
+  if (sqlTrimmed === "" || sqlTrimmed !== r.title) return false;
+  return r.live === true && (r.origin === "native" || r.origin === "neon_backfill");
 }
 
 /** Read-only parity: every Cloud-visible Neon title against the title SP serves. */

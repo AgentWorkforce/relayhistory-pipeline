@@ -7,10 +7,12 @@
  *   - a row lacking `live` (or with a non-boolean `live`);
  *   - a duplicate row;
  *   - a row for an unrequested key;
- *   - a served title on a row that says there is no live pointer.
+ *   - a served title on a row that says there is no live pointer;
+ *   - a served title VERIFY_SQL cannot return: empty, blank, or not btrim()-ed.
  * no_pointer is counted only from a present, well-formed row with live === false.
  * These are causal: at 9419893d, verifyBackfill treated an absent row, or one lacking `live`,
- * as no_pointer and passed.
+ * as no_pointer and passed; at 677ed8b3 it accepted an empty or blank served title (e.g. as
+ * native) and passed.
  */
 import { describe, expect, test } from "bun:test";
 import { verifyBackfill, verifyPassed, type NeonBriefRow } from "../neon-brief-titles/backfill.ts";
@@ -52,6 +54,25 @@ describe("--verify coverage and row shape", () => {
       const r = await verifyBackfill(scripted(rows), [neon()]);
       expect(r.malformed).toBeGreaterThanOrEqual(1);
       expect(verifyPassed(r)).toBe(false);
+    }
+  });
+
+  test("a served title VERIFY_SQL cannot return (empty, blank, or untrimmed) fails (malformed)", async () => {
+    // VERIFY_SQL serves btrim(title) WHERE btrim(title) <> '': none of these can come back.
+    for (const title of ["", "   ", " Fix login", "Fix login "]) {
+      for (const origin of ["native", "neon_backfill"]) {
+        const r = await verifyBackfill(scripted([{ ...key, title, origin, live: true }]), [neon()]);
+        expect(r).toMatchObject({ malformed: 1, native: 0, equal: 0, different: 0 });
+        expect(verifyPassed(r)).toBe(false);
+      }
+    }
+  });
+
+  test("only spaces count as trim (PostgreSQL btrim): a tab- or newline-edged title is servable", async () => {
+    // btrim(title) strips spaces only, so VERIFY_SQL can return these; they are well formed.
+    for (const title of ["\tFix login", "Fix login\n"]) {
+      const r = await verifyBackfill(scripted([{ ...key, title, origin: "native", live: true }]), [neon()]);
+      expect(r).toMatchObject({ malformed: 0, native: 1 });
     }
   });
 

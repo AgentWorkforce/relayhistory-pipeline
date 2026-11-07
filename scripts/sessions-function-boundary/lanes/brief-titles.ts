@@ -1,6 +1,6 @@
 /**
  * Lane: brief-titles (F2, session-list brief titles off Neon; registry slot 043000).
- * supabase/migrations/20261105043000_brief_titles.sql owns two functions:
+ * supabase/migrations/20261105043000_brief_titles.sql owns two functions and replaces one:
  *   session_briefs_provenance   BEFORE trigger on session_briefs; not SECURITY DEFINER; owner-only
  *   session_brief               REPLACED (026000's body plus the backfill containment); ACL kept
  *   session_brief_titles_for    SECURITY DEFINER; EXECUTE to bulls96_read_api (tenant pinned by

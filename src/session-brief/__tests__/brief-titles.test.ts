@@ -141,8 +141,8 @@ describe("session_briefs provenance", () => {
       brief_fingerprint: backfillFingerprint(neon().job_id),
       revision: 0,
     });
-    // session_brief reports a backfilled brief stale, never ready.
-    // Contained: relayhistory-cloud's /brief (session_brief) reads a backfilled brief as no brief.
+    // Contained: relayhistory-cloud's /brief (session_brief) reads a backfill-only brief as
+    // missing (an absent brief), never stale or ready.
     expect((await briefRpc(pg))[0]).toMatchObject({ status: "missing", stale: false, title: null, description: null, state: null, engine_version: null });
     // A failed native attempt keeps the previous text and so its provenance.
     await recordBrief(hoopDb(pg), KEY, { "m-1": 1 }, { status: "failed", error: "model_failed" });
