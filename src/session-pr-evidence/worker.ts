@@ -17,6 +17,7 @@ import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../sessi
 import { log } from "../shared/log.ts";
 import { extractPullRequestEvidence, PR_EVIDENCE_EXTRACTOR_VERSION, type PullRequestEvidenceRow } from "./extract.ts";
 import type { PrEvidenceClaim, PrEvidenceInstall, PrEvidenceStore } from "./store.ts";
+import { applyHistoryMask, type MaskWinner } from "./mask.ts";
 
 export interface PrEvidenceDeps {
   store: PrEvidenceStore;
@@ -26,8 +27,12 @@ export interface PrEvidenceDeps {
   decompress?: (stored: Uint8Array, maxOutputLength: number) => Uint8Array;
   limits?: { maxScopeBytes: number; maxScopeEvents: number };
   batch?: number;
+  /** The reviewed schema-generation pin (INGEST_EXPECT_GENERATION); required to read history masks. */
+  generation?: string;
 }
-export interface PrEvidenceTickResult { claimed: number; ready: number; incomplete: number; absent: number; refused: number; failed: number }
+/** A claim the worker must give back rather than build: never installed, never deletes evidence. */
+export class PrEvidenceDeferred extends Error { constructor(readonly code: string) { super(code); } }
+export interface PrEvidenceTickResult { claimed: number; ready: number; incomplete: number; deferred: number; refused: number; failed: number }
 
 const defaultDecompress = (stored: Uint8Array, maxOutputLength: number) =>
   new Uint8Array(zstdDecompressSync(stored, { maxOutputLength }));
@@ -43,7 +48,20 @@ function storable(rows: PullRequestEvidenceRow[]): boolean {
 
 /** Read, extract and classify one claimed scope. Retryable read failures throw. */
 export async function buildPrEvidence(claim: PrEvidenceClaim, deps: PrEvidenceDeps): Promise<PrEvidenceInstall> {
-  if (!claim.exists || claim.blocked) return { status: "absent", reason: claim.blocked ? "session_blocked" : "session_absent" };
+  // A blocked/absent source is released, never installed: erasure (not the worker) removes evidence.
+  if (!claim.exists || claim.blocked || claim.source.epoch === null) throw new PrEvidenceDeferred(claim.blocked ? "session_blocked" : "session_absent");
+  if (claim.history && !claim.history.ready) throw new PrEvidenceDeferred("history_not_ready");
+  if (claim.history && !(deps.generation && /^[0-9a-f]{64}$/.test(deps.generation))) throw new PrEvidenceDeferred("history_generation_unset");
+  let mask: Map<string, MaskWinner | null> | null = null;
+  if (claim.history) {
+    mask = new Map();
+    for (let after: string | null = "0", pages = 0; after !== null; pages++) {
+      if (pages > 4100) throw new PrEvidenceDeferred("history_mask_unbounded");
+      const page = await deps.store.maskPage(claim, deps.generation!, after);
+      for (const r of page.records) mask.set(r.recordId, r.winner);
+      after = page.next;
+    }
+  }
   const scope = { orgId: claim.scope.orgId, workspaceId: claim.scope.workspaceId, harness: claim.scope.source, sessionId: claim.scope.sessionId };
   const limits = deps.limits ?? { maxScopeBytes: ARTIFACT_MAX_SOURCE_BYTES, maxScopeEvents: ARTIFACT_MAX_SOURCE_RECORDS };
   const read = await readCanonicalScope(scope, claim.manifestKeys,
@@ -53,13 +71,13 @@ export async function buildPrEvidence(claim: PrEvidenceClaim, deps: PrEvidenceDe
   if (read.reasons.includes("manifest_missing")) throw new PipelineError("manifest_missing", "a live pointer's manifest is missing", true);
   if (read.partial) return { status: "incomplete", reason: "scope_too_large" };
   if (!read.complete) return { status: "incomplete", reason: (read.reasons[0] ?? "source_incomplete").replace(/[^a-z0-9_]/g, "_").slice(0, 64) };
-  const rows = extractPullRequestEvidence(read.projectionRows);
+  const rows = extractPullRequestEvidence(mask ? applyHistoryMask(read.projectionRows, claim.scope.workspaceId, mask) : read.projectionRows);
   if (!storable(rows)) return { status: "incomplete", reason: "evidence_not_storable" };
   return { status: "ready", rows };
 }
 
 export async function prEvidenceTick(deps: PrEvidenceDeps): Promise<PrEvidenceTickResult> {
-  const result: PrEvidenceTickResult = { claimed: 0, ready: 0, incomplete: 0, absent: 0, refused: 0, failed: 0 };
+  const result: PrEvidenceTickResult = { claimed: 0, ready: 0, incomplete: 0, deferred: 0, refused: 0, failed: 0 };
   const claims = await deps.store.claim(deps.batch ?? 5);
   result.claimed = claims.length;
   for (const claim of claims) {
@@ -67,20 +85,11 @@ export async function prEvidenceTick(deps: PrEvidenceDeps): Promise<PrEvidenceTi
     try {
       built = await buildPrEvidence(claim, deps);
     } catch (error) {
-      result.failed++;
-      const code = error instanceof PipelineError && /^[a-z0-9_]{1,64}$/.test(error.code) ? error.code : "read_failed";
+      if (error instanceof PrEvidenceDeferred) result.deferred++;
+      else result.failed++;
+      const code = error instanceof PrEvidenceDeferred ? error.code
+        : error instanceof PipelineError && /^[a-z0-9_]{1,64}$/.test(error.code) ? error.code : "read_failed";
       await deps.store.release(claim, code).catch(() => false);
-      continue;
-    }
-    if (built.status !== "absent" && claim.source.epoch === null) {
-      result.failed++;
-      await deps.store.release(claim, "source_epoch_missing").catch(() => false);
-      continue;
-    }
-    if (built.status === "absent" && claim.source.epoch === null) {
-      // Nothing was ever published for this scope; let the wakeup back off.
-      result.absent++;
-      await deps.store.release(claim, "session_absent").catch(() => false);
       continue;
     }
     const installed = await deps.store.install(claim, PR_EVIDENCE_EXTRACTOR_VERSION, built);

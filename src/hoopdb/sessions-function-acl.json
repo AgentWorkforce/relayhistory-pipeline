@@ -920,7 +920,7 @@
     ],
     "sessions.session_pr_evidence_claim_v1(jsonb)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.session_pr_evidence_enqueue_v1(jsonb)": [
       "<owner>:EXECUTE"
@@ -928,9 +928,12 @@
     "sessions.session_pr_evidence_forget()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_pr_evidence_forget_reset()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_pr_evidence_install_v1(jsonb)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.session_pr_evidence_journal_changed()": [
       "<owner>:EXECUTE"
@@ -941,7 +944,7 @@
     ],
     "sessions.session_pr_evidence_release_v1(jsonb)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.session_pr_evidence_scope(jsonb)": [
       "<owner>:EXECUTE"

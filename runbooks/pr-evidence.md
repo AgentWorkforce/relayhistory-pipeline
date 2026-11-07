@@ -22,12 +22,23 @@ PRs in cloud-web, and cloud-web stamps the PR bodies.
 1. A canonical publish (`canonical_feature_journal` `publish`) arms a
    `session_pr_evidence_wakeups` row while `session_pr_evidence_settings.enabled`. This covers
    every scope, independent of the F10 canary scope rows.
-2. The worker (`SERVICE=session-pr-evidence`, `SESSION_PR_EVIDENCE_ENABLED=true`) runs these RPCs:
+2. The worker (`SERVICE=session-pr-evidence`, `SESSION_PR_EVIDENCE_ENABLED=true`) runs these RPCs.
+   They are pinned to `bulls96_session_ingest` (`ingest_require_role` plus EXECUTE), never
+   `service_role`. The worker has its own ingest-actor connection, `SESSION_PR_EVIDENCE_DATABASE_URL`,
+   which is a runtime secret from 1Password and never on disk. It verifies `current_user` before any
+   RPC. It needs `INGEST_EXPECT_GENERATION` to read history masks.
    - `session_pr_evidence_claim_v1` leases the wakeup and captures the scope's exact
      replay-source snapshot (pointer manifest keys, epoch, fingerprint);
-   - `readCanonicalScope` reads those manifests, then `extractPullRequestEvidence` runs;
+   - for a history-authoritative scope, the worker pages the authority's record-winner mask
+     (`session_history_mask_page`);
+   - `readCanonicalScope` reads those manifests, `applyHistoryMask` drops records that moved to
+     another scope or whose winner is a delete or another origin, then `extractPullRequestEvidence`
+     runs;
    - `session_pr_evidence_install_v1` CAS-installs the rows under the replay-publication row lock,
-     bound to the fingerprint.
+     bound to the fingerprint. For a history scope, install requires the worker to attest the
+     exact live, ready authority and mask it applied.
+   - A blocked, absent or not-yet-ready source is released with backoff and never installed. The
+     worker never deletes evidence; only the erasure triggers do.
    - Oversize or inconsistent sources install `incomplete` with a code. A missing manifest or an
      S3 failure releases the wakeup with backoff, and the worker retries.
 3. Cloud's `bulls96_project_events` actor calls `session_pr_evidence_read_v1` with
@@ -43,10 +54,14 @@ PRs in cloud-web, and cloud-web stamps the PR bodies.
    | `incomplete` | the source could not be read completely | park as a coded failure, never "no PRs" |
    | `missing` | no unacknowledged event at that generation | none |
 
-   A current `retire` event returns `ready`, `retired:true`, `[]`.
+   A current `retire` event returns the distinct status `retired` (no rows). Cloud then adds no
+   PR rows and leaves existing stamps alone. This is not the same as "the session had no PRs".
 
 Erasure: deleting or tombstoning a `session_directory` row purges that scope's evidence, state
-and wakeup in the same transaction. Retention-ready: rows carry `org_id` plus `built_at`.
+and wakeup in the same transaction. A user's `upload_resets` row does the same for every logical
+session that user has any pointer in, even when the directory row stays. A wakeup-arming failure
+never fails the creator transaction (an exception handler skips it), and the bounded backfill
+recovers a lost wakeup. Retention-ready: rows carry `org_id` plus `built_at`.
 
 ## Activation order (lead, each step with Khaliq's OK)
 
@@ -122,10 +137,9 @@ with `relayhistory_readonly`.
 
 ## Known limits
 
-- For history-authoritative scopes the worker reads the scope's live pointer manifests. That is
-  the same source as the live search-index pass. It does not apply the history record-winner
-  mask: SP has no TypeScript mask reader yet. A record moved to another scope can still add
-  evidence to the scope it was read from until that reader exists.
+- The mask filter cannot check a winner's revision, because projected rows do not carry it. A copy
+  from the winner's origin is kept and a copy from any other origin is dropped. The failure mode is
+  under-attribution, never mis-attribution.
 - Extraction is CPU-bound per scope, bounded by the artifact source limits (256 MiB, 1M records).
   A larger scope installs `incomplete:scope_too_large`.
 

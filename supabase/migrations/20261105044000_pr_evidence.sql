@@ -13,6 +13,12 @@ SET LOCAL lock_timeout='5s';
 --    fingerprint, so Cloud is served evidence ONLY for the event's own source; otherwise 'pending'.
 --  * Default off: no settings row = no wakeups, no claims. Enabling is an operator action.
 --  * Cloud's actor reads through its own event only; there is no arbitrary-session lookup.
+--  * Worker RPCs are pinned to bulls96_session_ingest (ingest_require_role + EXECUTE), never
+--    service_role: a shared service key cannot claim wakeups or install evidence.
+--  * History-authoritative scopes are read through their record-winner mask (session_history_mask_page,
+--    already granted to bulls96_session_ingest); install requires the worker to attest the exact live
+--    authority + mask it applied, so moved or deleted records are never attributed to this scope.
+--  * The worker never deletes evidence: erasure (directory delete/tombstone, upload reset) does.
 --  * Retention-ready: every row carries org_id plus built_at/requested_at.
 CREATE TABLE sessions.session_pr_evidence_settings(
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
@@ -82,9 +88,14 @@ DECLARE h text:=NEW.scope->>'harness';s text:=NEW.scope->>'sessionId';
 BEGIN
  IF NEW.kind<>'publish'OR h IS NULL OR s IS NULL OR h=''OR s=''
   OR NOT EXISTS(SELECT 1 FROM sessions.session_pr_evidence_settings WHERE enabled)THEN RETURN NEW;END IF;
+BEGIN
  INSERT INTO sessions.session_pr_evidence_wakeups AS w(org_id,workspace_id,harness,session_id)VALUES(NEW.org_id,NEW.workspace_id,h,s)
  ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET request_version=w.request_version+1,requested_at=clock_timestamp(),
   not_before=clock_timestamp(),attempts=0,last_error=NULL;
+ EXCEPTION WHEN OTHERS THEN
+  -- Never fail the creator transaction: a lost wakeup is recovered by the bounded backfill.
+  NULL;
+ END;
  RETURN NEW;
 END $changed$;
 CREATE TRIGGER session_pr_evidence_after_journal AFTER INSERT ON sessions.canonical_feature_journal
@@ -103,6 +114,21 @@ BEGIN
 END $forget$;
 CREATE TRIGGER session_pr_evidence_forget AFTER DELETE OR UPDATE OF deleted_at ON sessions.session_directory
  FOR EACH ROW EXECUTE FUNCTION sessions.session_pr_evidence_forget();
+-- A user's "delete all sessions" reset may keep directory rows: forget every logical session that user
+-- ever uploaded a pointer for in that workspace (tombstoned pointers included; mixed-user sessions too).
+CREATE FUNCTION sessions.session_pr_evidence_forget_reset()RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $reset$
+BEGIN
+ DELETE FROM sessions.session_pr_evidence_state s USING(SELECT DISTINCT p.harness,coalesce(p.canonical_session_id,p.session_id)AS session_id
+   FROM sessions.session_index p WHERE p.org_id=NEW.org_id AND p.workspace_id=NEW.workspace_id AND p.user_id=NEW.user_id)x
+  WHERE s.org_id=NEW.org_id AND s.workspace_id=NEW.workspace_id AND s.harness=x.harness AND s.session_id=x.session_id;
+ DELETE FROM sessions.session_pr_evidence_wakeups w USING(SELECT DISTINCT p.harness,coalesce(p.canonical_session_id,p.session_id)AS session_id
+   FROM sessions.session_index p WHERE p.org_id=NEW.org_id AND p.workspace_id=NEW.workspace_id AND p.user_id=NEW.user_id)x
+  WHERE w.org_id=NEW.org_id AND w.workspace_id=NEW.workspace_id AND w.harness=x.harness AND w.session_id=x.session_id;
+ RETURN NULL;
+END $reset$;
+CREATE TRIGGER session_pr_evidence_forget_reset AFTER INSERT ON sessions.upload_resets
+ FOR EACH ROW EXECUTE FUNCTION sessions.session_pr_evidence_forget_reset();
 
 CREATE FUNCTION sessions.session_pr_evidence_scope(p jsonb)RETURNS text[]
 LANGUAGE plpgsql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $scope$
@@ -120,6 +146,7 @@ CREATE FUNCTION sessions.session_pr_evidence_claim_v1(p jsonb)RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $claim$
 DECLARE w sessions.session_pr_evidence_wakeups%ROWTYPE;r jsonb:='[]';n integer;t uuid;c jsonb;
 BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
  PERFORM sessions.ingest_exact_keys(p,ARRAY['limit']);
  IF jsonb_typeof(p->'limit')IS DISTINCT FROM'number'OR(p->>'limit')::numeric<>trunc((p->>'limit')::numeric)OR(p->>'limit')::numeric NOT BETWEEN 1 AND 10
  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='pr evidence: invalid batch bound';END IF;n:=(p->>'limit')::integer;
@@ -134,8 +161,8 @@ BEGIN
     WHERE org_id=w.org_id AND workspace_id=w.workspace_id AND harness=w.harness AND session_id=w.session_id;
    CONTINUE;
   END;
-  -- History-authoritative scopes: the legacy replay capture reports them blocked; like
-  -- session_history_capture (05026000), a ready history authority on a live directory row is readable.
+  -- A ready history authority on a live directory row is readable THROUGH ITS MASK (as
+  -- session_history_capture, 05026000); the claim hands the worker the authority and mask to apply.
   IF c#>>'{snapshot,history,required}'='true'AND c#>>'{snapshot,history,ready}'='true'
    AND jsonb_typeof(c#>'{snapshot,directory}')='object'AND c#>>'{snapshot,directory,deleted_at}'IS NULL THEN
    c:=jsonb_set(c,'{blocked}','false'::jsonb);END IF;
@@ -146,7 +173,9 @@ BEGIN
    not_before=clock_timestamp()+make_interval(secs=>LEAST(3600,30*power(2,LEAST(attempts,10))))
    WHERE org_id=w.org_id AND workspace_id=w.workspace_id AND harness=w.harness AND session_id=w.session_id;
   r:=r||jsonb_build_array(jsonb_build_object('scope',jsonb_build_object('orgId',w.org_id,'workspaceId',w.workspace_id,'source',w.harness,'sessionId',w.session_id),
-   'requestVersion',w.request_version::text,'leaseToken',t::text,'exists',c->'exists','blocked',c->'blocked','source',c->'source',
+   'requestVersion',w.request_version::text,'leaseToken',t::text,'exists',c->'exists','blocked',c->'blocked',
+   'history',CASE WHEN c#>>'{snapshot,history,required}'='true'THEN jsonb_build_object('ready',c#>>'{snapshot,history,ready}'='true',
+    'authorityId',c#>>'{snapshot,history,authorityId}','maskSha256',c#>>'{snapshot,history,maskSha256}')ELSE NULL END,'source',c->'source',
    'manifestKeys',coalesce((SELECT jsonb_agg(x->>'manifest_key' ORDER BY ord)FROM jsonb_array_elements(c#>'{snapshot,pointers}')WITH ORDINALITY AS a(x,ord)),'[]'::jsonb)));
  END LOOP;
  RETURN r;
@@ -158,7 +187,8 @@ CREATE FUNCTION sessions.session_pr_evidence_install_v1(p jsonb)RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $install$
 DECLARE k text[];w sessions.session_pr_evidence_wakeups%ROWTYPE;live jsonb;fp text;st text;n integer;
 BEGIN
- PERFORM sessions.ingest_exact_keys(p,ARRAY['scope','requestVersion','leaseToken','source','extractorVersion','status','reason','rows']);
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['scope','requestVersion','leaseToken','source','history','extractorVersion','status','reason','rows']);
  k:=sessions.session_pr_evidence_scope(p->'scope');
  PERFORM sessions.ingest_exact_keys(p->'source',ARRAY['epoch','fingerprint']);
  st:=p->>'status';
@@ -167,7 +197,7 @@ BEGIN
   OR jsonb_typeof(p#>'{source,epoch}')IS DISTINCT FROM'string'OR p#>>'{source,epoch}'!~'^[1-9][0-9]{0,18}$'
   OR jsonb_typeof(p#>'{source,fingerprint}')IS DISTINCT FROM'string'OR p#>>'{source,fingerprint}'!~'^[0-9a-f]{64}$'
   OR jsonb_typeof(p->'extractorVersion')IS DISTINCT FROM'string'
-  OR st IS NULL OR st NOT IN('ready','incomplete','absent')OR jsonb_typeof(p->'rows')IS DISTINCT FROM'array'
+  OR st IS NULL OR st NOT IN('ready','incomplete')OR jsonb_typeof(p->'rows')IS DISTINCT FROM'array'
   OR(st='ready'AND p->'reason'<>'null'::jsonb)OR(st<>'ready'AND(jsonb_typeof(p->'reason')IS DISTINCT FROM'string'OR jsonb_array_length(p->'rows')<>0))
   OR jsonb_array_length(p->'rows')>10000
  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='pr evidence: invalid install';END IF;
@@ -185,8 +215,19 @@ BEGIN
    WHERE org_id=k[1]AND workspace_id=k[2]AND harness=k[3]AND session_id=k[4];
   RETURN jsonb_build_object('ok',false,'code','source_changed');
  END IF;
- DELETE FROM sessions.session_pr_evidence_state WHERE org_id=k[1]AND workspace_id=k[2]AND harness=k[3]AND session_id=k[4];
- IF st<>'absent'THEN
+ -- Never install from a blocked or absent source, nor from a history-authoritative one unless the
+ -- worker attests the exact live, ready authority and mask it filtered by (and none otherwise).
+ IF jsonb_typeof(live->'directory')IS DISTINCT FROM'object'OR coalesce(live#>>'{directory,deleted_at}','')<>''
+  OR jsonb_array_length(coalesce(live->'pointers','[]'))=0
+  OR(live#>>'{history,required}'IS NOT DISTINCT FROM'true'AND(live#>>'{history,ready}'IS DISTINCT FROM'true'
+   OR p->'history'IS DISTINCT FROM jsonb_build_object('authorityId',live#>>'{history,authorityId}','maskSha256',live#>>'{history,maskSha256}','maskApplied',true)))
+  OR(live#>>'{history,required}'IS DISTINCT FROM'true'AND p->'history'IS DISTINCT FROM'null'::jsonb)THEN
+  UPDATE sessions.session_pr_evidence_wakeups SET lease_token=NULL,lease_until=NULL,last_error='source_not_installable'
+   WHERE org_id=k[1]AND workspace_id=k[2]AND harness=k[3]AND session_id=k[4];
+  RETURN jsonb_build_object('ok',false,'code','source_not_installable');
+ END IF;
+ BEGIN
+  DELETE FROM sessions.session_pr_evidence_state WHERE org_id=k[1]AND workspace_id=k[2]AND harness=k[3]AND session_id=k[4];
   n:=jsonb_array_length(p->'rows');
   FOR i IN 0..n-1 LOOP
    PERFORM sessions.ingest_exact_keys(p->'rows'->i,ARRAY['pull_request_url','owner','repo','number','head_ref','tool_use_id','tool_name',
@@ -202,7 +243,7 @@ BEGIN
   FROM jsonb_array_elements(p->'rows')WITH ORDINALITY AS e(v,ord)
   CROSS JOIN LATERAL jsonb_to_record(e.v)AS x(pull_request_url text,owner text,repo text,number integer,head_ref text,tool_use_id text,
    tool_name text,evidence_kind text,role text,detected_at timestamptz,last_seen_at timestamptz);
- END IF;
+ END;
  IF w.request_version=(p->>'requestVersion')::bigint THEN
   DELETE FROM sessions.session_pr_evidence_wakeups WHERE org_id=k[1]AND workspace_id=k[2]AND harness=k[3]AND session_id=k[4];
  ELSE
@@ -218,6 +259,7 @@ CREATE FUNCTION sessions.session_pr_evidence_release_v1(p jsonb)RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $release$
 DECLARE k text[];
 BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
  PERFORM sessions.ingest_exact_keys(p,ARRAY['scope','leaseToken','code']);
  k:=sessions.session_pr_evidence_scope(p->'scope');
  IF jsonb_typeof(p->'leaseToken')IS DISTINCT FROM'string'OR p->>'leaseToken'!~'^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
@@ -245,7 +287,9 @@ BEGIN
   AND acknowledged_at IS NULL;
  IF NOT FOUND THEN RETURN jsonb_build_object('status','missing');END IF;
  IF NOT sessions.canonical_project_event_is_current(q,p->>'schemaGeneration',false)THEN RETURN jsonb_build_object('status','deferred');END IF;
- IF q.publication_kind='retire'THEN RETURN jsonb_build_object('status','ready','retired',true,'evidence','[]'::jsonb);END IF;
+ -- A retired source has no current transcript to derive evidence from. A distinct state, never
+ -- 'ready' with []: Cloud adds no PR rows and keeps existing stamps; it is not "this session had no PRs".
+ IF q.publication_kind='retire'THEN RETURN jsonb_build_object('status','retired');END IF;
  SELECT*INTO s FROM sessions.session_pr_evidence_state WHERE org_id=q.org_id AND workspace_id=q.workspace_id AND harness=q.harness AND session_id=q.session_id;
  IF NOT FOUND OR s.source_epoch IS DISTINCT FROM q.source_epoch OR s.source_fingerprint IS DISTINCT FROM q.source_fingerprint THEN
   RETURN jsonb_build_object('status','pending');END IF;
@@ -255,7 +299,7 @@ BEGIN
    'detected_at',e.detected_at,'last_seen_at',e.last_seen_at)ORDER BY e.ordinal),'[]'::jsonb)INTO rows
   FROM sessions.session_pr_evidence e WHERE e.org_id=q.org_id AND e.workspace_id=q.workspace_id AND e.harness=q.harness AND e.session_id=q.session_id;
  IF jsonb_array_length(rows)<>s.row_count THEN RAISE EXCEPTION USING ERRCODE='XX000',MESSAGE='pr evidence: row count drift';END IF;
- RETURN jsonb_build_object('status','ready','retired',false,'extractorVersion',s.extractor_version,'evidence',rows);
+ RETURN jsonb_build_object('status','ready','extractorVersion',s.extractor_version,'evidence',rows);
 END $read$;
 
 -- Operator only (no grant): bounded backfill of directory scopes with no evidence state yet.
@@ -280,10 +324,10 @@ BEGIN
   jsonb_build_object('orgId',last[1],'workspaceId',last[2],'source',last[3],'sessionId',last[4])END);
 END $enqueue$;
 
-REVOKE ALL ON FUNCTION sessions.session_pr_evidence_journal_changed(),sessions.session_pr_evidence_forget(),
+REVOKE ALL ON FUNCTION sessions.session_pr_evidence_journal_changed(),sessions.session_pr_evidence_forget(),sessions.session_pr_evidence_forget_reset(),
  sessions.session_pr_evidence_scope(jsonb),sessions.session_pr_evidence_claim_v1(jsonb),sessions.session_pr_evidence_install_v1(jsonb),
  sessions.session_pr_evidence_release_v1(jsonb),sessions.session_pr_evidence_read_v1(jsonb),sessions.session_pr_evidence_enqueue_v1(jsonb)
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder,bulls96_project_events;
 GRANT EXECUTE ON FUNCTION sessions.session_pr_evidence_claim_v1(jsonb),sessions.session_pr_evidence_install_v1(jsonb),
- sessions.session_pr_evidence_release_v1(jsonb)TO service_role;
+ sessions.session_pr_evidence_release_v1(jsonb)TO bulls96_session_ingest;
 GRANT EXECUTE ON FUNCTION sessions.session_pr_evidence_read_v1(jsonb)TO bulls96_project_events;

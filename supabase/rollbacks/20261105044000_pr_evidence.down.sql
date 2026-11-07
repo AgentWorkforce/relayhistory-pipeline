@@ -11,8 +11,10 @@ DO $guard$ DECLARE later boolean; BEGIN
 END $guard$;
 DROP TRIGGER session_pr_evidence_after_journal ON sessions.canonical_feature_journal;
 DROP TRIGGER session_pr_evidence_forget ON sessions.session_directory;
+DROP TRIGGER session_pr_evidence_forget_reset ON sessions.upload_resets;
 DROP FUNCTION sessions.session_pr_evidence_journal_changed(),
  sessions.session_pr_evidence_forget(),
+ sessions.session_pr_evidence_forget_reset(),
  sessions.session_pr_evidence_scope(jsonb),
  sessions.session_pr_evidence_claim_v1(jsonb),
  sessions.session_pr_evidence_install_v1(jsonb),

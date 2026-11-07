@@ -1,5 +1,5 @@
 /** F3 owns registry slot 044000 (confirmed by the registry owner), its rollback and the PR-evidence
- * RPC ACLs: worker RPCs for service_role, one event-bound read RPC for bulls96_project_events.
+ * RPC ACLs: worker RPCs for bulls96_session_ingest (ingest_require_role), one event-bound read RPC for bulls96_project_events.
  * No replacement of any journal/creator/history/F10 function. */
 import type { LaneContext, LaneManifest } from "../types.ts";
 const MIGRATION = "supabase/migrations/20261105044000_pr_evidence.sql";
@@ -20,6 +20,7 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
       "END $guard$;",
       "DROP TRIGGER session_pr_evidence_after_journal ON sessions.canonical_feature_journal;",
       "DROP TRIGGER session_pr_evidence_forget ON sessions.session_directory;",
+      "DROP TRIGGER session_pr_evidence_forget_reset ON sessions.upload_resets;",
       "DROP FUNCTION " + ctx.defined.join(",\n ") + ";",
       "DROP TABLE sessions.session_pr_evidence,sessions.session_pr_evidence_state,sessions.session_pr_evidence_wakeups,sessions.session_pr_evidence_settings;",
       "DO $ledger$ BEGIN",
@@ -36,14 +37,15 @@ export const prEvidence: LaneManifest = {
   owner: "F3 (feat/f3-pr-evidence-044000)",
   migration: MIGRATION,
   prefixes: ["sessions.session_pr_evidence_"],
-  grantSources: [{ path: MIGRATION, roles: ["service_role", "bulls96_project_events"] }],
+  grantSources: [{ path: MIGRATION, roles: ["bulls96_session_ingest", "bulls96_project_events"] }],
   functions: {
     "sessions.session_pr_evidence_journal_changed()": { secdef: true, grants: [] },
     "sessions.session_pr_evidence_forget()": { secdef: true, grants: [] },
+    "sessions.session_pr_evidence_forget_reset()": { secdef: true, grants: [] },
     "sessions.session_pr_evidence_scope(jsonb)": { secdef: false, grants: [] },
-    "sessions.session_pr_evidence_claim_v1(jsonb)": { secdef: true, grants: ["service_role"] },
-    "sessions.session_pr_evidence_install_v1(jsonb)": { secdef: true, grants: ["service_role"] },
-    "sessions.session_pr_evidence_release_v1(jsonb)": { secdef: true, grants: ["service_role"] },
+    "sessions.session_pr_evidence_claim_v1(jsonb)": { secdef: true, grants: ["bulls96_session_ingest"] },
+    "sessions.session_pr_evidence_install_v1(jsonb)": { secdef: true, grants: ["bulls96_session_ingest"] },
+    "sessions.session_pr_evidence_release_v1(jsonb)": { secdef: true, grants: ["bulls96_session_ingest"] },
     "sessions.session_pr_evidence_read_v1(jsonb)": { secdef: true, grants: ["bulls96_project_events"] },
     "sessions.session_pr_evidence_enqueue_v1(jsonb)": { secdef: true, grants: [] },
   },

@@ -61,7 +61,10 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.session_history_source_lock(jsonb)',
  'sessions.session_history_state_publish(jsonb)',
  'sessions.session_history_summary_get(jsonb)',
- 'sessions.session_history_summary_publish(jsonb)'
+ 'sessions.session_history_summary_publish(jsonb)',
+ 'sessions.session_pr_evidence_claim_v1(jsonb)',
+ 'sessions.session_pr_evidence_install_v1(jsonb)',
+ 'sessions.session_pr_evidence_release_v1(jsonb)'
  ]::text[];
  v_oids oid[];
  v_table text:='SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'||

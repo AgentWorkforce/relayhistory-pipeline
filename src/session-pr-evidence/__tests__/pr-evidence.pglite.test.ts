@@ -62,7 +62,7 @@ const rpc = async (fn: string, p: unknown) => (await ingest<{ r: any }>("SELECT 
 const read = async (eventId: string, gen: string, s = scope) =>
   (await actor<{ r: any }>("SELECT sessions.session_pr_evidence_read_v1($1::jsonb) r", [JSON.stringify({ schemaGeneration: generation, scope: s, eventId, generation: gen })])).rows[0]!.r;
 const setEnabled = (on: boolean) => db.query("INSERT INTO sessions.session_pr_evidence_settings(enabled) VALUES($1) ON CONFLICT(singleton) DO UPDATE SET enabled=excluded.enabled", [on]);
-const store = () => prEvidenceStore({ query: service } as never);
+const store = () => prEvidenceStore({ query: ingest } as never);
 
 async function prepare() {
   const sessionId = `f3-${++serial}`, identity = { orgId: org, workspaceId: ws, source: "claude", sessionId };
@@ -110,13 +110,14 @@ test("enabled: claim captures the exact F10 source, install binds it, Cloud read
   const c = await claimFor(f.sessionId);
   expect(c.source).toEqual({ epoch: e.source_epoch, fingerprint: e.source_fingerprint });
   expect({ exists: c.exists, blocked: c.blocked }).toEqual({ exists: true, blocked: false });
+  expect(c.history).toMatchObject({ ready: true });
   expect(c.manifestKeys).toEqual([`96bulls/${org}/v1/ws=${ws}/m=srv_origin/h=claude/d=2026/11/01/s=${f.sessionId}/manifest.json`]);
   expect(await read(e.event_id, e.generation)).toEqual({ status: "pending" });
   expect(await store().install(c, PR_EVIDENCE_EXTRACTOR_VERSION, { status: "ready", rows: [ROW, BRANCH] })).toEqual({ ok: true });
   expect(await f.wakeup()).toBeUndefined();
   readySession = f.sessionId;
   const r = await read(e.event_id, e.generation);
-  expect(r.status).toBe("ready"); expect(r.retired).toBe(false); expect(r.extractorVersion).toBe(PR_EVIDENCE_EXTRACTOR_VERSION);
+  expect(r.status).toBe("ready"); expect(r.extractorVersion).toBe(PR_EVIDENCE_EXTRACTOR_VERSION);
   expect(r.evidence.map((x: any) => ({ ...x, detected_at: new Date(x.detected_at).toISOString(), last_seen_at: new Date(x.last_seen_at).toISOString() }))).toEqual(
     [ROW, BRANCH].map(x => ({ ...x, detected_at: new Date(x.detected_at).toISOString(), last_seen_at: new Date(x.last_seen_at).toISOString() })));
   expect(Object.keys(r.evidence[0]).sort()).toEqual(Object.keys(ROW).sort());
@@ -159,6 +160,72 @@ test("an expired lease without an install is not re-claimed before its backoff; 
   expect(await claimFor(f.sessionId)).toBeDefined();
 });
 
+test("P1-b: a ready scope that later claims blocked is released by the worker, never wiped; install refuses it too", async () => {
+  await setEnabled(true);
+  const f = await prepare(); await f.install(); const e = await f.event();
+  const c = await claimFor(f.sessionId);
+  expect(await store().install(c, PR_EVIDENCE_EXTRACTOR_VERSION, { status: "ready", rows: [ROW] })).toEqual({ ok: true });
+  // The directory row is tombstoned for a moment without the forget path (simulated: trigger disabled).
+  await db.exec("ALTER TABLE sessions.session_directory DISABLE TRIGGER session_pr_evidence_forget");
+  try {
+    await db.query("UPDATE sessions.session_directory SET deleted_at=now() WHERE org_id=$1 AND session_id=$2", [org, f.sessionId]);
+    await db.query("INSERT INTO sessions.session_pr_evidence_wakeups(org_id,workspace_id,harness,session_id) VALUES($1,$2,'claude',$3)", [org, ws, f.sessionId]);
+    const blocked = await claimFor(f.sessionId);
+    expect(blocked.blocked).toBe(true);
+    const tick = await prEvidenceTick({ store: { ...store(), claim: async () => [blocked] }, reader: {} as never, objects: {} as never,
+      prefixFor: o => `96bulls/${o}`, generation });
+    expect(tick).toMatchObject({ deferred: 1, ready: 0, incomplete: 0 });
+    expect((await f.wakeup()).last_error).toBe("session_blocked");
+    // Even a forged install for the blocked source is refused and keeps the stored evidence.
+    const again = { ...blocked, leaseToken: (await claimFor(f.sessionId).catch(() => null))?.leaseToken ?? blocked.leaseToken };
+    await db.query("UPDATE sessions.session_pr_evidence_wakeups SET lease_token=$2,lease_until=now()+interval'60 seconds' WHERE session_id=$1", [f.sessionId, again.leaseToken]);
+    expect(await store().install(again, PR_EVIDENCE_EXTRACTOR_VERSION, { status: "ready", rows: [] })).toMatchObject({ ok: false });
+    expect((await db.query("SELECT row_count FROM sessions.session_pr_evidence_state WHERE session_id=$1", [f.sessionId])).rows).toEqual([{ row_count: 1 }]);
+  } finally {
+    await db.query("UPDATE sessions.session_directory SET deleted_at=NULL WHERE org_id=$1 AND session_id=$2", [org, f.sessionId]);
+    await db.exec("ALTER TABLE sessions.session_directory ENABLE TRIGGER session_pr_evidence_forget");
+  }
+  expect(e).toBeDefined();
+});
+
+test("P1-c: history scopes install only with the attested live authority+mask; the worker reads the real mask", async () => {
+  const f = await prepare(); await f.install();
+  const c = await claimFor(f.sessionId);
+  expect(c.history?.ready).toBe(true);
+  // The real mask for this authority (05026000 fixture: one record) is readable by the worker actor.
+  const page = await store().maskPage(c, generation, "0");
+  expect(page).toEqual({ records: [{ recordId: "record-" + f.sessionId, winner: null }], next: null });
+  // Unattested (no mask applied) or a wrong mask is refused; the correct attestation installs.
+  const forged = (history: unknown) => ingest("SELECT sessions.session_pr_evidence_install_v1($1::jsonb) r", [JSON.stringify({
+    scope: c.scope, requestVersion: c.requestVersion, leaseToken: c.leaseToken, source: c.source, history,
+    extractorVersion: PR_EVIDENCE_EXTRACTOR_VERSION, status: "ready", reason: null, rows: [] })]);
+  expect((await forged(null)).rows[0].r).toMatchObject({ ok: false, code: "source_not_installable" });
+  await db.query("UPDATE sessions.session_pr_evidence_wakeups SET lease_token=$2,lease_until=now()+interval'60 seconds' WHERE session_id=$1", [f.sessionId, c.leaseToken]);
+  expect((await forged({ authorityId: c.history!.authorityId, maskSha256: "0".repeat(64), maskApplied: true })).rows[0].r).toMatchObject({ ok: false });
+  await db.query("UPDATE sessions.session_pr_evidence_wakeups SET lease_token=$2,lease_until=now()+interval'60 seconds' WHERE session_id=$1", [f.sessionId, c.leaseToken]);
+  expect(await store().install(c, PR_EVIDENCE_EXTRACTOR_VERSION, { status: "ready", rows: [] })).toEqual({ ok: true });
+});
+
+test("P2: a user's upload reset forgets that user's sessions' evidence even when the directory row stays", async () => {
+  const f = await prepare(); await f.install();
+  const c = await claimFor(f.sessionId);
+  await store().install(c, PR_EVIDENCE_EXTRACTOR_VERSION, { status: "ready", rows: [ROW] });
+  await db.query("INSERT INTO sessions.upload_resets(org_id,workspace_id,user_id,request_id) VALUES($1,$2,$3,$4)", [org, ws, user, "reset-" + f.sessionId]);
+  expect((await db.query("SELECT 1 FROM sessions.session_directory WHERE session_id=$1 AND deleted_at IS NULL", [f.sessionId])).rows).toHaveLength(1);
+  expect((await db.query("SELECT 1 FROM sessions.session_pr_evidence_state WHERE session_id=$1", [f.sessionId])).rows).toHaveLength(0);
+  expect((await db.query("SELECT 1 FROM sessions.session_pr_evidence WHERE session_id=$1", [f.sessionId])).rows).toHaveLength(0);
+});
+
+test("P2: a wakeup failure never fails the creator transaction", async () => {
+  const f = await prepare();
+  await db.exec("ALTER TABLE sessions.session_pr_evidence_wakeups ADD CONSTRAINT f3_probe_refuse CHECK (session_id <> 'never-matches' AND false) NOT VALID");
+  try {
+    await f.install(); // must not throw
+    expect(await f.event()).toBeDefined();
+    expect(await f.wakeup()).toBeUndefined();
+  } finally { await db.exec("ALTER TABLE sessions.session_pr_evidence_wakeups DROP CONSTRAINT f3_probe_refuse"); }
+});
+
 test("incomplete builds are served as incomplete, not as no PRs", async () => {
   const f = await prepare(); await f.install(); const e = await f.event();
   const c = await claimFor(f.sessionId);
@@ -170,7 +237,7 @@ test("worker tick: an unreadable source is released with a code and retried, nev
   await setEnabled(true);
   const f = await prepare(); await f.install();
   const result = await prEvidenceTick({ store: store(), reader: { read: async () => { throw Object.assign(new Error("x"), { code: "s3_down", retryable: true }); } } as never,
-    objects: {} as never, prefixFor: o => `96bulls/${o}`, batch: 10 });
+    objects: {} as never, prefixFor: o => `96bulls/${o}`, batch: 10, generation });
   expect(result.claimed).toBeGreaterThan(0); expect(result.failed).toBe(result.claimed);
   expect((await f.wakeup()).last_error).toBe("read_failed");
   expect((await db.query("SELECT 1 FROM sessions.session_pr_evidence_state WHERE session_id=$1", [f.sessionId])).rows).toHaveLength(0);
@@ -194,6 +261,13 @@ test("roles: Cloud cannot touch worker RPCs or tables, the worker cannot read th
   await expect(service("SELECT sessions.session_pr_evidence_read_v1($1::jsonb)", [JSON.stringify({ schemaGeneration: generation, scope, eventId: e.event_id, generation: e.generation })])).rejects.toThrow();
   await expect(service("SELECT * FROM sessions.session_pr_evidence")).rejects.toThrow();
   await expect(service("SELECT sessions.session_pr_evidence_enqueue_v1('{\"limit\":1,\"after\":null}')")).rejects.toThrow();
+  // P1-a: the shared service key cannot claim, install or release (no EXECUTE, and ingest_require_role).
+  for (const fn of ["claim", "install", "release"])
+    await expect(service(`SELECT sessions.session_pr_evidence_${fn}_v1('{}')`)).rejects.toThrow();
+  await db.exec("GRANT EXECUTE ON FUNCTION sessions.session_pr_evidence_claim_v1(jsonb) TO service_role");
+  try {
+    await expect(service("SELECT sessions.session_pr_evidence_claim_v1('{\"limit\":1}')")).rejects.toMatchObject({ code: "42501" });
+  } finally { await db.exec("REVOKE EXECUTE ON FUNCTION sessions.session_pr_evidence_claim_v1(jsonb) FROM service_role"); }
   await expect(ingest("SELECT sessions.session_pr_evidence_install_v1('{}')")).rejects.toThrow();
   await expect(read(e.event_id, e.generation, { ...scope, orgId: "99999999-9999-9999-9999-999999999999" })).rejects.toThrow("scope not enabled");
   await expect(read("not-a-uuid", e.generation)).rejects.toThrow();
@@ -211,6 +285,9 @@ test("install refuses malformed rows atomically", async () => {
 });
 
 test("operator backfill arms only scopes without state, bounded and resumable", async () => {
+  // A scope with fresh evidence state (the reset test above forgot earlier ones, as it should).
+  { const f = await prepare(); await f.install(); const c = await claimFor(f.sessionId);
+    expect(await store().install(c, PR_EVIDENCE_EXTRACTOR_VERSION, { status: "ready", rows: [] })).toEqual({ ok: true }); readySession = f.sessionId; }
   const before = (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.session_pr_evidence_wakeups")).rows[0]!.n;
   const page = (await db.query<{ r: any }>("SELECT sessions.session_pr_evidence_enqueue_v1('{\"limit\":2,\"after\":null}') r")).rows[0]!.r;
   expect(page.armed).toBeLessThanOrEqual(2); expect(page.next).not.toBeNull();
