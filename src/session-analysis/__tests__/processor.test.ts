@@ -271,6 +271,11 @@ describe("canonical evidence adapter", () => {
     // Born after the Neon freeze, never in Neon: complete from S3 alone, analyzed.
     expect((await loadSessionSource(deps({ neonFree: neonFree(true) }, noMarker), SCOPE)).sourceProvider).toBe("claude");
     expect(asked).toEqual({ ...SCOPE, source: "claude" });
+    // P1-a: the objects half comes from THIS snapshot's manifests: a Neon-derived snapshot is
+    // refused even when the database half says free (no second, unbound manifest read).
+    await expect(
+      loadSessionSource(deps({ neonFree: neonFree(true) }, { ...noMarker, neonDerived: true }), SCOPE),
+    ).rejects.toThrow("legacy evidence coverage is unknown");
     // The operator switch still overrides.
     expect((await loadSessionSource(deps({}, noMarker), SCOPE, { assumeNoLegacyTurns: true })).sourceProvider).toBe("claude");
   });
