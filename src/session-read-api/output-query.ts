@@ -180,11 +180,14 @@ export async function outputWindowReadiness(
   workspaceId: string,
   since: Date,
   until: Date,
-  opts: { timeoutMs?: number; settings?: Record<string, string | number> } = {},
+  opts: { timeoutMs?: number; settings?: Record<string, string | number>; untilExclusive?: boolean } = {},
 ): Promise<OutputReadiness> {
+  // The readiness window is exactly the caller's data window: Output is [since, until],
+  // the digest [since, until) (untilExclusive).
+  const lt = opts.untilExclusive ? "<" : "<=";
   const base = { org: orgId, workspace: workspaceId, since: chInstant(since), until: chInstant(until) };
   const o = { params: base, timeoutMs: opts.timeoutMs ?? 3_000, ...(opts.settings ? { settings: opts.settings } : {}) };
-  const watermark = await outputCompleteSince(ch, orgId, workspaceId, opts);
+  const watermark = await outputCompleteSince(ch, orgId, workspaceId, { ...(opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}), ...(opts.settings ? { settings: opts.settings } : {}) });
   if (!watermark) return "backfill_incomplete";
   // Microsecond compare: Date.parse would truncate the watermark to milliseconds.
   if (chMicros(watermark) > BigInt(since.getTime()) * 1000n) return "before_watermark";
@@ -192,14 +195,14 @@ export async function outputWindowReadiness(
     ch.select<{ n: string | number }>(
       `SELECT count() AS n FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
         WHERE org_id = {org:String} AND workspace_id = {workspace:String} AND complete = 0
-          AND (isNull(min_ts) OR (max_ts >= toDateTime64({since:String}, 6, 'UTC') AND min_ts <= toDateTime64({until:String}, 6, 'UTC')))`,
+          AND (isNull(min_ts) OR (max_ts >= toDateTime64({since:String}, 6, 'UTC') AND min_ts ${lt} toDateTime64({until:String}, 6, 'UTC')))`,
       o,
     ),
     ch.select<{ n: string | number }>(
       `SELECT count() AS n FROM (
          SELECT DISTINCT session_id, source FROM ${EVENTS_TABLE} FINAL
           WHERE org_id = {org:String} AND workspace_id = {workspace:String}
-            AND ts >= toDateTime64({since:String}, 6, 'UTC') AND ts <= toDateTime64({until:String}, 6, 'UTC'))
+            AND ts >= toDateTime64({since:String}, 6, 'UTC') AND ts ${lt} toDateTime64({until:String}, 6, 'UTC'))
         WHERE (session_id, source) NOT IN (
          SELECT session_id, source FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
           WHERE org_id = {org:String} AND workspace_id = {workspace:String} AND complete = 1)`,
@@ -209,4 +212,11 @@ export async function outputWindowReadiness(
   if (Number(partial?.n ?? 0) > 0) return "session_partial";
   if (Number(unindexed?.n ?? 0) > 0) return "session_unindexed";
   return "ready";
+}
+
+/** ClickHouse codes for a table or column the query names but the database lacks (DDL not applied / older skeleton). */
+const SCHEMA_SHORT_CODES = new Set(["16", "47", "60", "81"]);
+export function isOutputSchemaShort(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return error instanceof Error && error.name === "ClickHouseError" && code !== undefined && SCHEMA_SHORT_CODES.has(String(code));
 }

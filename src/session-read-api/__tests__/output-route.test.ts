@@ -137,4 +137,26 @@ suite("output route on ClickHouse", () => {
     await state("s-old2", 1, 2, "2026-10-01 00:00:00.000000", "2026-10-02 00:00:00.000000");
     expect(await reason()).toBe(200);
   }, 60_000);
+
+  test("P2 (digest window): an exclusive window ignores a transcript row exactly at `until`; inclusive does not", async () => {
+    const { outputWindowReadiness } = await import("../output-query.ts");
+    await transcript("s-edge", "2026-11-06 00:00:00.000");
+    const since = new Date("2026-11-05T00:00:00Z"), until = new Date("2026-11-06T00:00:00Z");
+    expect(await outputWindowReadiness(ch, ID.orgId, WS, since, until, { untilExclusive: true })).toBe("ready");
+    expect(await outputWindowReadiness(ch, ID.orgId, WS, since, until)).toBe("session_unindexed");
+    await state("s-edge", 1, 1, "2026-11-06 00:00:00.000000", "2026-11-06 00:00:00.000000");
+  }, 60_000);
+});
+
+(CH_URL ? describe : describe.skip)("output route without the output-facts DDL", () => {
+  test("a missing table or column is 501 output_schema_missing, never a 500", async () => {
+    const bare = await freshClickHouse();
+    try {
+      const r = await api(bare, { workspaces: "*" })(`/v1/sessions/output?workspace=${WS}&${DAY}`);
+      expect(r.status).toBe(501);
+      expect((await body(r)).error.reason).toBe("output_schema_missing");
+    } finally {
+      await bare.drop();
+    }
+  }, 60_000);
 });

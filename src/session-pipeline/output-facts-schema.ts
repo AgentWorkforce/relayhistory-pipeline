@@ -45,7 +45,7 @@ export const OUTPUT_FACTS_STATE_TABLE = "output_facts_workspace_state";
 /** Per-session facts state, written by every producer pass (output-facts.ts). */
 export const OUTPUT_FACTS_SESSION_STATE_TABLE = "output_facts_session_state";
 
-export const OUTPUT_FACTS_SCHEMA_VERSION = 3;
+export const OUTPUT_FACTS_SCHEMA_VERSION = 4;
 
 /** `session_output_facts.fact_kind` values. */
 export const OUTPUT_FACT_KINDS = ["message", "legacy_turn_message", "commit", "outcome"] as const;
@@ -71,6 +71,10 @@ export function outputFactsSchemaStatements(): string[] {
     task_ref_id            Nullable(String),
     -- 1 when task_ref is '{}' (branchSql's NULL case); kept for the epic rollup's key.
     task_ref_empty         UInt8 DEFAULT 0,
+    -- The whole task_ref as canonical (key-sorted) JSON, for the digest sessions' taskRefs.
+    task_ref_json          String DEFAULT '{}',
+    task_title             Nullable(String),
+    user_id                Nullable(String),
     branch                 Nullable(String),
     model                  Nullable(String),
     provider               Nullable(String),
@@ -169,5 +173,25 @@ ORDER BY (org_id, workspace_id)`,
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY (org_id, workspace_id, source, session_id)`,
+  ];
+}
+
+/**
+ * Idempotent upgrades for a table created from an older copy of this file (CREATE TABLE IF NOT
+ * EXISTS never alters one). Apply after outputFactsSchemaStatements(); a no-op on current tables.
+ * The producer's schema probe (output-facts.ts outputFactsSchema) refuses to write until every
+ * column below exists.
+ */
+export function outputFactsUpgradeStatements(): string[] {
+  return [
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS task_ref_empty UInt8 DEFAULT 0`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS task_ref_json String DEFAULT '{}'`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS task_title Nullable(String)`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS user_id Nullable(String)`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS row_id String`,
+    `ALTER TABLE ${OUTPUT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS scope_source LowCardinality(String)`,
+    `ALTER TABLE ${OUTPUT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS row_id String`,
+    `ALTER TABLE ${OUTPUT_FACTS_SESSION_STATE_TABLE} ADD COLUMN IF NOT EXISTS min_ts Nullable(DateTime64(6, 'UTC'))`,
+    `ALTER TABLE ${OUTPUT_FACTS_SESSION_STATE_TABLE} ADD COLUMN IF NOT EXISTS max_ts Nullable(DateTime64(6, 'UTC'))`,
   ];
 }

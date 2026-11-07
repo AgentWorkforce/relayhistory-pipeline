@@ -1041,6 +1041,11 @@ const OUTPUT_CH_URL = process.env.READ_API_TEST_CLICKHOUSE_URL;
       // The next good pass makes it complete again.
       expect(await indexSearchScope(scope, { ...searchDeps(ch, sb.transact), outputFacts: true })).toMatchObject({ outputFacts: { complete: true } });
       expect((await ch.select<{ complete: number }>("SELECT complete FROM output_facts_session_state FINAL")).map((r) => Number(r.complete))).toEqual([1]);
+      // P3: every pass here runs at the same fixed `now`; versions still strictly increase.
+      const v1 = Number((await ch.select<{ v: string }>("SELECT max(version) AS v FROM output_facts_session_state"))[0]!.v);
+      await indexSearchScope(scope, { ...searchDeps(ch, sb.transact), outputFacts: true });
+      const v2 = Number((await ch.select<{ v: string }>("SELECT max(version) AS v FROM output_facts_session_state"))[0]!.v);
+      expect(v2).toBeGreaterThan(v1);
     } finally {
       await ch.drop();
     }

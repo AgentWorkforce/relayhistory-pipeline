@@ -50,7 +50,7 @@ import { chNow, deleteRows, windowStart, type PendingDelete } from "./vendor/sea
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
 import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
-import { eraseOutputFacts, outputFactsFromScope, outputFactsSchema, previousOutputFactsRange, reconcileOutputFacts, recordOutputFactsState, type OutputFactsScope } from "./output-facts.ts";
+import { eraseOutputFacts, outputFactsFromScope, outputFactsSchema, passVersion, previousOutputFactsState, reconcileOutputFacts, recordOutputFactsState, type OutputFactsScope } from "./output-facts.ts";
 import { adapterProjectionIo, type SearchProjectionIo, type SearchServiceBinding } from "./search-adapter.ts";
 
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
@@ -304,7 +304,10 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
         if (schema.present) {
           const fScope = factsScope(scope, pointerSnapshot.canonicalId);
           await eraseOutputFacts(deps.ch, fScope);
-          if (schema.ready) await recordOutputFactsState(deps.ch, fScope, true, at, null);
+          if (schema.ready) {
+            const prior = await previousOutputFactsState(deps.ch, fScope);
+            await recordOutputFactsState(deps.ch, fScope, true, at, null, "final", passVersion(at, prior.version));
+          }
         }
       }
       await io.record(scope,0,0,true,at,pointerSnapshot.canonicalId);
@@ -320,7 +323,8 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       // span they last covered, so only windows that span overlaps are refused).
       if (deps.outputFacts && (await outputFactsSchema(deps.ch!)).ready) {
         const fScope = factsScope(scope, pointerSnapshot.canonicalId);
-        await recordOutputFactsState(deps.ch!, fScope, false, at, await previousOutputFactsRange(deps.ch!, fScope));
+        const prior = await previousOutputFactsState(deps.ch!, fScope);
+        await recordOutputFactsState(deps.ch!, fScope, false, at, prior.range, "final", passVersion(at, prior.version));
       }
       return {manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]};
     }
@@ -375,22 +379,28 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if (deps.outputFacts) {
       // The whole scope (not the transcript window), from the same validated read. An
       // incomplete pass inserts what it read and deletes nothing.
-      const fScope = factsScope(scope, pointerSnapshot.canonicalId);
+      // Every session id this pass saw (scope, canonical, and any owner/alias id a projected event
+      // carries): the facts are all written under the canonical id, and the state rows, the delete
+      // filter and the route's readiness join all use this same set.
+      const fScope = factsScope(scope, pointerSnapshot.canonicalId, s3.projectionRows);
       if (!(await outputFactsSchema(deps.ch!)).ready) {
         // Flag on before the owner applied the DDL (or an older skeleton): write nothing, say why.
         // Search is unaffected; the Output route has no state rows and refuses.
         outputFacts = { inserted: 0, deleted: 0, complete: false, reasons: ["output_facts_schema_missing"] };
       } else {
-        const facts = outputFactsFromScope(fScope, { projectionRows: s3.projectionRows, records: s3.records, complete }, version);
+        // Strictly increasing per scope, even for two passes in one ms (fact rows and state alike).
+        const prev = await previousOutputFactsState(deps.ch!, fScope);
+        const base = passVersion(at, prev.version);
+        const facts = outputFactsFromScope(fScope, { projectionRows: s3.projectionRows, records: s3.records, complete }, base);
         const range = facts.range ?? null;
         // Pending first: the ClickHouse inserts and deletes are not transactional, so a pass that
         // dies mid-reconcile must leave the scope incomplete, never complete over torn facts.
-        const prior = await previousOutputFactsRange(deps.ch!, fScope);
+        const prior = prev.range;
         const span = prior && range ? { min: prior.min < range.min ? prior.min : range.min, max: prior.max > range.max ? prior.max : range.max } : (range ?? prior);
-        await recordOutputFactsState(deps.ch!, fScope, false, at, span, "pending");
+        await recordOutputFactsState(deps.ch!, fScope, false, at, span, "pending", base);
         const r = await reconcileOutputFacts(deps.ch!, fScope, facts, { maxRows: limits.maxRows, insertBatch: limits.insertBatch });
         outputFacts = { inserted: r.inserted, deleted: r.deleted, complete: r.complete, reasons: r.reasons };
-        await recordOutputFactsState(deps.ch!, fScope, r.complete, at, r.complete ? range : span);
+        await recordOutputFactsState(deps.ch!, fScope, r.complete, at, r.complete ? range : span, "final", base);
       }
     }
     // Only a complete pass makes the session current; any other leaves it owing one.
@@ -407,12 +417,13 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   });
 }
 
-function factsScope(scope: SessionScope, canonicalId: string): OutputFactsScope {
+function factsScope(scope: SessionScope, canonicalId: string, projectionRows: Array<{ table: string; row: Record<string, unknown> }> = []): OutputFactsScope {
+  const seen = projectionRows.filter((r) => r.table === "convergence_events" && typeof r.row.session_id === "string").map((r) => r.row.session_id as string);
   return {
     orgId: scope.orgId,
     workspaceId: scope.workspaceId,
     harness: scope.harness,
-    sessionIds: [...new Set([scope.sessionId, canonicalId])],
+    sessionIds: [...new Set([scope.sessionId, canonicalId, ...seen])],
     canonicalId,
   };
 }

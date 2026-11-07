@@ -6,7 +6,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createClickHouseClient, type ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import { schemaStatements } from "../vendor/search-index/schema.ts";
-import { EVENT_FACTS_TABLE, OUTPUT_FACTS_STATE_TABLE, OUTPUT_FACTS_TABLE, outputFactsSchemaStatements } from "../output-facts-schema.ts";
+import { EVENT_FACTS_TABLE, OUTPUT_FACTS_STATE_TABLE, OUTPUT_FACTS_TABLE, outputFactsSchemaStatements, outputFactsUpgradeStatements } from "../output-facts-schema.ts";
+import { outputFactsSchema, resetOutputFactsSchemaProbe } from "../output-facts.ts";
 
 const CH_URL = process.env.READ_API_TEST_CLICKHOUSE_URL;
 const CH_USER = process.env.READ_API_TEST_CLICKHOUSE_USER ?? "default";
@@ -54,8 +55,8 @@ suite("output facts DDL on ClickHouse", () => {
     await admin.command(`CREATE DATABASE ${database}`);
     ch = createClickHouseClient({ url: CH_URL!, user: CH_USER, password: CH_PASSWORD, database });
     for (const s of outputFactsSchemaStatements()) await ch.command(s);
-    // Re-applying is a no-op.
-    for (const s of outputFactsSchemaStatements()) await ch.command(s);
+    // Re-applying is a no-op, upgrades included.
+    for (const s of [...outputFactsSchemaStatements(), ...outputFactsUpgradeStatements()]) await ch.command(s);
   });
   afterAll(async () => {
     await admin?.command(`DROP DATABASE IF EXISTS ${database}`);
@@ -102,5 +103,14 @@ suite("output facts DDL on ClickHouse", () => {
           AND ts >= toDateTime64('2026-11-05 00:00:00', 6, 'UTC') AND ts <= toDateTime64('2026-11-06 00:00:00', 6, 'UTC')`,
     );
     expect(Number(r!.n)).toBe(2);
+  });
+
+  test("an older skeleton (a column missing) is present but not ready; the upgrade statements make it ready", async () => {
+    await ch.command(`ALTER TABLE ${EVENT_FACTS_TABLE} DROP COLUMN task_title`);
+    resetOutputFactsSchemaProbe(ch);
+    expect(await outputFactsSchema(ch)).toMatchObject({ present: true, ready: false });
+    for (const s of outputFactsUpgradeStatements()) await ch.command(s);
+    resetOutputFactsSchemaProbe(ch);
+    expect(await outputFactsSchema(ch)).toMatchObject({ present: true, ready: true });
   });
 });
