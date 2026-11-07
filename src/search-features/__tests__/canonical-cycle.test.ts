@@ -77,7 +77,7 @@ const fakeCH = () => {
   return { inserts, database: "event_feature_fixture_codex_builtin",
     insert: async (_t: string, rows: Record<string, unknown>[]) => {
       inserts.push(rows);
-    }, select: async () => [] };
+    }, command: async () => {}, select: async () => [] };
 };
 const fakeAcks = () => {
   const acked: string[] = [];
