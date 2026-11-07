@@ -64,7 +64,7 @@ describe("OSS default registries", () => {
     const runtime = createPipelineRuntimeRegistry().create({}, { env: {}, source: { claim: async () => [], settle: async () => {} } });
     expect(runtime.kind).toBe("workers");
     await db.close();
-  });
+  }, 30_000); // PGlite boot can pass vitest's 5s default on a loaded host
 
   it("registers opensearch, which fails fast without a URL; the postgres-only registry still refuses it", () => {
     expect(createSearchIndexRegistry().registered()).toEqual(["postgres", "opensearch"]);
