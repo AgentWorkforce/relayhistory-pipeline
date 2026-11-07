@@ -152,3 +152,16 @@ test("an identical RPC grant set in a different physical ACL order passes both v
   await reader(db);
   await storage(db);
 }, 120_000);
+
+test("048000 fails closed (55000) when the owner's function default privileges would leak EXECUTE on the readiness RPC", async () => {
+  const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+  open.push(db);
+  for (const f of ["supabase/tests/supabase_shim.sql", "supabase/bootstrap/session_directory_search_worker.sql",
+    "supabase/bootstrap/session_token_verifier.sql", "supabase/bootstrap/session_ingest_roles.sql",
+    "supabase/bootstrap/session_read_api_roles.sql"]) await db.exec(read(f));
+  await db.exec("CREATE SCHEMA IF NOT EXISTS sessions; CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY, sha256 text NOT NULL)");
+  const files = readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort();
+  for (const file of files.filter(f => f < "20261105048000")) await db.exec(read(`supabase/migrations/${file}`));
+  await db.exec("ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT EXECUTE ON FUNCTIONS TO session_token_verifier");
+  await expect(db.exec(read("supabase/migrations/20261105048000_portable_search_reader_contract.sql"))).rejects.toMatchObject({ code: "55000" });
+}, 120_000);

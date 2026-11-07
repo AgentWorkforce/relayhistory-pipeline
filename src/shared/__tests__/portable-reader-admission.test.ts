@@ -5,7 +5,8 @@ import {
 } from "../portable-reader-admission.ts";
 import { PortableConnectionRefused } from "../portable-connection-identity.ts";
 import { ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE } from "../db.ts";
-import { MIGRATION_LEDGER } from "../../hoopdb/migrate.ts";
+import { MIGRATION_LEDGER, expectedMigrationNames } from "../../hoopdb/migrate.ts";
+import { readFileSync } from "node:fs";
 
 const NAMES = ["upstream:a.sql", "96bulls:b.sql", "verify:x"];
 const A: ReaderAdmission = { generation: "gen-a", expectedNames: NAMES, storageVerifySql: "DO $s$ BEGIN END $s$", readerVerifySql: "DO $r$ BEGIN END $r$", writerRole: "bulls96_runtime", dbMode: "rds" };
@@ -131,4 +132,16 @@ test("the gated reader's tenant runner fixes READ COMMITTED in BEGIN, before the
   expect(texts[1]).toContain("set_config('bulls96_read.org_id'");
   expect(texts.at(-1)).toBe("COMMIT");
   expect(released).toBe(1);
+});
+
+test("the readiness RPC's admitted name syntax is derived from, and admits, every compiled schema-step name (no duplicates)", async () => {
+  const sql = readFileSync(new URL("../../../supabase/migrations/20261105048000_portable_search_reader_contract.sql", import.meta.url), "utf8");
+  const pattern = /n\.name !~ '([^']+)'/.exec(sql)?.[1];
+  expect(pattern).toBeDefined();
+  const re = new RegExp(pattern!);
+  const names = (await expectedMigrationNames()).filter(n => !/^(shim|bootstrap|verify):/.test(n));
+  expect(names.length).toBeGreaterThan(0);
+  expect(names.length).toBeLessThanOrEqual(512);
+  for (const n of names) expect(re.test(n)).toBe(true);
+  expect(new Set(names).size).toBe(names.length);
 });

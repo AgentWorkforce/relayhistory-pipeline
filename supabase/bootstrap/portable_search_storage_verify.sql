@@ -245,7 +245,7 @@ BEGIN
       -- inferred from the live catalog): a body replaced with an always-pass is refused.
       IF (SELECT encode(sha256(convert_to(p.prosrc, 'UTF8')), 'hex') FROM pg_proc p
            WHERE p.oid = to_regprocedure('sessions.portable_reader_readiness(text[],text)'))
-         IS DISTINCT FROM '6f198ba75dc55787c7af275752540c0ee494976110687575cb3020ce93ef6795' THEN
+         IS DISTINCT FROM '1458aff0c0f1927e922adbfc6e5c1e597d41fd163e5941f669fdaadd3735cc4f' THEN
         v_problems := array_append(v_problems, ('readiness function body differs from the reviewed definition')::text);
       END IF;
       -- Sorted by the computed grant key itself (an aggregate ORDER BY cannot name an

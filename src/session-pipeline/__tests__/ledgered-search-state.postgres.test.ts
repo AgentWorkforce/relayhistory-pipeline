@@ -352,6 +352,10 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     // Input validation (22023): NULL generation/array/member, empty array, bad member, oversize, bad hex.
     for (const [n, g] of [[names, null], [null, gen], [[...names, null], gen], [[], gen], [["drop table x"], gen], [["upstream:" + "a".repeat(201)], gen], [Array.from({ length: 513 }, (_, i) => `upstream:f${i}.sql`), gen], [names, "XYZ"]] as [unknown, unknown][])
       expect(await errCode(rpc(readerPool, n, g))).toBe("22023");
+    // Multidimensional arrays are refused.
+    expect(await errCode(readerPool.query("SELECT sessions.portable_reader_readiness(ARRAY[[$1::text]], $2::text)", [names[0], gen]))).toBe("22023");
+    // Duplicates are refused, not collapsed.
+    expect(await errCode(rpc(readerPool, [...names, names[0]], gen))).toBe("22023");
     // Guard (42501): the owner/superuser, SET ROLE substitution, and the writer's own login.
     expect(await errCode(t.owner.query("SELECT sessions.portable_reader_readiness($1::text[], $2::text)", [names, gen]))).toBe("42501");
     await t.owner.query("BEGIN; SET LOCAL ROLE bulls96_read_api");
@@ -402,5 +406,11 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pending'");
     await expect(reader.partials({ orgId: "org-a", workspaceId: "ws-a" }, { limit: 50 })).rejects.toThrow("reader_validation_pending");
     await t.owner.query("UPDATE sessions.__96bulls_role_validation SET status = 'pass'");
+    // Missing EXECUTE, then a missing function: admission and reads fail closed before work.
+    await t.owner.query("REVOKE EXECUTE ON FUNCTION sessions.portable_reader_readiness(text[], text) FROM bulls96_read_api");
+    await expect(admitPortableReader(readerPool as never, a)).rejects.toThrow("reader_readiness_sqlstate_42501");
+    await expect(reader.partials({ orgId: "org-a", workspaceId: "ws-a" }, { limit: 50 })).rejects.toThrow("reader_readiness_sqlstate_42501");
+    await t.owner.query("DROP FUNCTION sessions.portable_reader_readiness(text[], text)");
+    await expect(admitPortableReader(readerPool as never, a)).rejects.toThrow("reader_readiness_sqlstate_42883");
   }, 300_000);
 });

@@ -38,7 +38,9 @@
 --   bulls96_read_api AND the `role` setting must be unset or bulls96_read_api, so an owner
 --   or other login that SET ROLEs to the reader is refused (42501). Inside SECURITY
 --   DEFINER current_user is the owner, so it is deliberately not the identity test.
---   Inputs: 1..512 names, each '(upstream|96bulls):<file>', no NULLs, deduplicated; a
+--   Inputs: a one-dimensional array of 1..512 names, each '(upstream|96bulls):<file>' (the
+--   compiled schema-step syntax; a unit test pins every compiled name to it), no NULLs, no
+--   duplicates; a
 --   64-hex generation; otherwise 22023. VOLATILE: each query takes a fresh snapshot under
 --   the caller's READ COMMITTED transaction; the reader gate calls it twice (initial and
 --   FINAL), so a concurrent flip across the verifier interval is caught; no whole-pass
@@ -99,12 +101,16 @@ BEGIN
   IF p_generation IS NULL OR p_generation !~ '^[0-9a-f]{64}$' THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'portable reader readiness: generation must be 64 hex';
   END IF;
-  IF p_names IS NULL OR cardinality(p_names) < 1 OR cardinality(p_names) > 512
+  IF p_names IS NULL OR array_ndims(p_names) IS DISTINCT FROM 1 OR cardinality(p_names) < 1 OR cardinality(p_names) > 512
      OR array_position(p_names, NULL) IS NOT NULL
      OR EXISTS (SELECT 1 FROM unnest(p_names) AS n(name) WHERE n.name !~ '^(upstream|96bulls):[A-Za-z0-9_.-]{1,200}$') THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'portable reader readiness: invalid expected schema names';
   END IF;
-  SELECT array_agg(DISTINCT n.name) INTO v_names FROM unnest(p_names) AS n(name);
+  -- Duplicates are refused, never silently collapsed: the compiled expected set is unique.
+  IF (SELECT count(DISTINCT n.name) FROM unnest(p_names) AS n(name)) <> cardinality(p_names) THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'portable reader readiness: duplicate expected schema names';
+  END IF;
+  v_names := p_names;
   SELECT count(*)::int INTO v_applied FROM sessions.__96bulls_migrations AS l WHERE l.name = ANY (v_names);
   IF v_applied <> cardinality(v_names) THEN
     RETURN 'schema_pending';
@@ -125,3 +131,20 @@ END
 $readiness$;
 REVOKE ALL ON FUNCTION sessions.portable_reader_readiness(text[], text) FROM PUBLIC, anon, authenticated, service_role;
 GRANT EXECUTE ON FUNCTION sessions.portable_reader_readiness(text[], text) TO bulls96_read_api;
+-- Fail closed on default-ACL leakage at creation: EXECUTE must be exactly the owner and the
+-- fixed reader (an owner's ALTER DEFAULT PRIVILEGES ... ON FUNCTIONS cannot widen it).
+DO $rpc_acl$
+DECLARE v_acl text;
+BEGIN
+  SELECT string_agg(g.k, ',' ORDER BY g.k COLLATE "C") INTO v_acl
+    FROM (SELECT CASE WHEN x.grantee = p.proowner THEN '<owner>' WHEN x.grantee = 0 THEN 'PUBLIC' ELSE x.grantee::regrole::text END
+                 || ':' || x.privilege_type || CASE WHEN x.is_grantable THEN '*' ELSE '' END AS k
+            FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) x
+           WHERE p.oid = 'sessions.portable_reader_readiness(text[],text)'::regprocedure) AS g;
+  IF v_acl IS DISTINCT FROM '<owner>:EXECUTE,bulls96_read_api:EXECUTE' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = format('portable reader readiness: EXECUTE is not exactly the owner and bulls96_read_api (%s)', v_acl),
+      HINT = 'Remove the migration owner''s ALTER DEFAULT PRIVILEGES for functions, then rerun. Nothing was committed.';
+  END IF;
+END
+$rpc_acl$;
