@@ -174,9 +174,10 @@ export const RELAYCONTROL_MACHINE_HEADER = "x-machine-id";
 /**
  * The relaycontrol branch of requireAuth: introspect against
  * RELAYCONTROL_INTROSPECT_URL with `aud` = this History's RELAYHISTORY_ORIGIN.
- * Unconfigured: 401 auth_not_configured. Relaycontrol unreachable, disabled,
- * refusing our introspection secret (its 401), redirecting, oversized or
- * malformed: 503 relaycontrol_unavailable (retryable). Refused (including a
+ * Unconfigured: 401 auth_not_configured. Relaycontrol unreachable, disabled
+ * (its 404), refusing our request (its 400) or our introspection secret (its
+ * 401), redirecting, oversized or malformed: 503 relaycontrol_unavailable
+ * (retryable). Refused (including a
  * non-desktop-user principal and an unverified or malformed X-Machine-Id
  * claim): 401 unauthorized, the reason in a server log line only.
  */

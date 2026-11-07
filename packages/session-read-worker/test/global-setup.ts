@@ -64,6 +64,10 @@ export function relaycontrolIntrospect(req: IncomingMessage, res: ServerResponse
       res.writeHead(401).end();
       return;
     }
+    if (base === "/rc-bad-request") {
+      res.writeHead(400).end();
+      return;
+    }
     if (base === "/rc-large") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ active: false, reason: "x".repeat(20 * 1024) }));

@@ -106,12 +106,15 @@ keep their path unchanged either way.
 - **Scopes.** Only `rth:read` and `rth:sync` are granted; `cli:auth` and
   anything else grant nothing.
 - **Fail closed.** Inactive (any reason, including the machine reasons
-  below), wrong principal, aud, workspace or machine mismatch, expired, or
-  relaycontrol answering 400 (our request refused): 401 `unauthorized`, with
-  the reason in logs only. Timeout (5 s), network error, relaycontrol 401 (our
-  introspection secret is wrong: a deployment fault, logged as
-  `introspect_unauthorized`, never a token refusal), 404 (introspection
-  disabled on relaycontrol), 5xx, a redirect (never followed: the fetch uses
+  below), wrong principal, aud, workspace or machine mismatch, or expired:
+  401 `unauthorized`, with the reason in logs only. Relaycontrol answering
+  400, 401 or 404 is a 503, never a token refusal: 400 means our request was
+  refused, which a caller cannot cause because History validates token,
+  workspace and machine first, so it is contract drift or a History bug
+  (logged `introspect_bad_request`); 401 means our introspection secret is
+  wrong, a deployment fault (logged `introspect_unauthorized`); 404 means
+  introspection is disabled on relaycontrol. Likewise a timeout (5 s, of the
+  call or the body read), network error, 5xx, a redirect (never followed: the fetch uses
   `redirect: "manual"`, the mode workerd supports), a response body over
   16 KiB (`response_too_large`, refused unparsed), or malformed JSON: 503
   `relaycontrol_unavailable` with `Retry-After: 1`. The flag on with the URL, secret or origin missing: 401
