@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "at": "2026-11-07T23:10:42.106561+00:00",
+  "at": "2026-11-07T23:14:59.789719+00:00",
   "kind": "approved_window_and_forward_fix_sources_receipts",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
   "readiness": "G2_WINDOW_VERIFIED_ACCEPTANCE_RESUMED_INTERMITTENT_CLAIM_TIMEOUTS_REMAIN",
@@ -47,8 +47,12 @@
     },
     {
       "name": "approved-window-current-status.md",
-      "bytes": 5252,
-      "sha256": "52b9572d1530b18d3c92f7e5b2c97e074e724138fbff7590e5f8bee1f8a3095d"
+      "bytes": 5753,
+      "sha256": "08c62f76d59acefefc5a1bc518099f24927c2257d6c7fd3b9bc9f95f471a6f86",
+      "redactionProvenance": {
+        "originalSha256": "52b9572d1530b18d3c92f7e5b2c97e074e724138fbff7590e5f8bee1f8a3095d",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
     },
     {
       "name": "approved-window-gc-executor-answer.md",
@@ -136,6 +140,11 @@
       "sha256": "f561d85d2b422c5fc0bcc07ff4bede94e071d086d89dcb8c71752c045dcf33e0"
     },
     {
+      "name": "claim-lockwait-2486-independent-delta-review-PASS-20261107.json",
+      "bytes": 1380,
+      "sha256": "dea37d2148ae36b143139e1c1561e55a3231bd373d7a0a99eb05ca2d8da790e8"
+    },
+    {
       "name": "claim-lockwait-attribution-20261107.sql",
       "bytes": 2224,
       "sha256": "653631a3fe5fada39df2ca74ebee35c7236bfe2240be51818d515422edde98fa"
@@ -202,8 +211,12 @@
     },
     {
       "name": "forward-fix-source-provenance.json",
-      "bytes": 3174,
-      "sha256": "234f11336a98cd977dabf004f5db2a53cf04f57d6ce7813169be7f961cae2162"
+      "bytes": 3191,
+      "sha256": "732efbd27cbfe3a205e9ae28c5e5929f13dd50aa6078a82ae68b2705b104737a",
+      "redactionProvenance": {
+        "originalSha256": "234f11336a98cd977dabf004f5db2a53cf04f57d6ce7813169be7f961cae2162",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
     },
     {
       "name": "forward-fix-verifier.py.txt",
@@ -223,7 +236,11 @@
     {
       "name": "g2-f940-after-apply-verify-20261107T225141Z.json",
       "bytes": 1074,
-      "sha256": "8f0460433c72ac37f9e4fe8276e5643776180fa3befa8b35b0b228541e53cb4e"
+      "sha256": "8f0460433c72ac37f9e4fe8276e5643776180fa3befa8b35b0b228541e53cb4e",
+      "historicalCustomerLabel": {
+        "originalBytesPreserved": true,
+        "scope": "Historical kind or boolean-field label contains a customer first name only; no customer IDs or payloads. Retained for receipt hash provenance, explicitly accepted by lead review 244961104601825280."
+      }
     },
     {
       "name": "g2-f940-apply-check-20261107T224202Z.json",
@@ -263,7 +280,11 @@
     {
       "name": "ingest-aggregate-attempt-receipt.json",
       "bytes": 1132,
-      "sha256": "431b29a4d420f42592266e371c423f8fb54f57e916203970c909c5f2ee288b4d"
+      "sha256": "431b29a4d420f42592266e371c423f8fb54f57e916203970c909c5f2ee288b4d",
+      "historicalCustomerLabel": {
+        "originalBytesPreserved": true,
+        "scope": "Historical kind or boolean-field label contains a customer first name only; no customer IDs or payloads. Retained for receipt hash provenance, explicitly accepted by lead review 244961104601825280."
+      }
     },
     {
       "name": "ingest-aggregate-observation.md",
@@ -277,13 +298,21 @@
     },
     {
       "name": "ingest-aggregate-v2-readonly.ts.txt",
-      "bytes": 7875,
-      "sha256": "8079a725cbc93ef0f30cd71e4ba01f5c58def43324a624d30e56b8166fddced8"
+      "bytes": 7909,
+      "sha256": "f568c5581a13ecfce6066b3bb940255247823d5bdf6b39b49a5dc5ed88f3206e",
+      "redactionProvenance": {
+        "originalSha256": "8079a725cbc93ef0f30cd71e4ba01f5c58def43324a624d30e56b8166fddced8",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
     },
     {
       "name": "ingest-aggregate-v2-result.json",
       "bytes": 1916,
-      "sha256": "e54a299c17781ad0b63150d8cd57fb98ec4be7313314b5ec2ab5f09b1236cb32"
+      "sha256": "e54a299c17781ad0b63150d8cd57fb98ec4be7313314b5ec2ab5f09b1236cb32",
+      "historicalCustomerLabel": {
+        "originalBytesPreserved": true,
+        "scope": "Historical kind or boolean-field label contains a customer first name only; no customer IDs or payloads. Retained for receipt hash provenance, explicitly accepted by lead review 244961104601825280."
+      }
     },
     {
       "name": "ingest-claim-inner-statement-stats-readonly-draft-20261107.sql",
@@ -297,13 +326,21 @@
     },
     {
       "name": "org-publication-cohort-attempt.md",
-      "bytes": 2924,
-      "sha256": "1c398fe3a1749bad2051d14b4b6470dc123c69462ad3ce2edd4efaf2b9a37e8a"
+      "bytes": 2941,
+      "sha256": "61d04ef0b95b6bfb9252e749a90b572536c2abf697d7a16d153df9602265bdd2",
+      "redactionProvenance": {
+        "originalSha256": "1c398fe3a1749bad2051d14b4b6470dc123c69462ad3ce2edd4efaf2b9a37e8a",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
     },
     {
       "name": "org-publication-cohort-readonly.ts.txt",
-      "bytes": 8544,
-      "sha256": "62431be76af7f06fbdb009c3db976e4694b853fb603c29344ddf6ca308eafe99"
+      "bytes": 8561,
+      "sha256": "11d518e41f0493b302188d00ad389be348efd5b013557ebd9a035bfe89cebd21",
+      "redactionProvenance": {
+        "originalSha256": "62431be76af7f06fbdb009c3db976e4694b853fb603c29344ddf6ca308eafe99",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
     },
     {
       "name": "org-publication-cohort-result.json",
@@ -312,8 +349,12 @@
     },
     {
       "name": "org-publication-cohort.sql.txt",
-      "bytes": 6614,
-      "sha256": "bc431aa6f55eefc755126f5d7a8536c4b72e1f7ede9ff9c40ee65bd6c39481fd"
+      "bytes": 6631,
+      "sha256": "35aaac827625f50d5208b0b116b515fce2de45e946b98759a3da4fe4b5ece980",
+      "redactionProvenance": {
+        "originalSha256": "bc431aa6f55eefc755126f5d7a8536c4b72e1f7ede9ff9c40ee65bd6c39481fd",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
     },
     {
       "name": "packet-secret-scan-review.json",
@@ -442,8 +483,12 @@
     },
     {
       "name": "supabase-nonsystem-catalog-census-observation.md",
-      "bytes": 3425,
-      "sha256": "32ed3bc65a72c6dfdd7785e73ed72f1b4692616bc8d8af64fad37e6cf09088e4"
+      "bytes": 3442,
+      "sha256": "9f4d21dfbb40edb7ec4a8fd6f75b44c7c3f6126ab28a12dd6588d12b0e4210bf",
+      "redactionProvenance": {
+        "originalSha256": "32ed3bc65a72c6dfdd7785e73ed72f1b4692616bc8d8af64fad37e6cf09088e4",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
     },
     {
       "name": "supabase-nonsystem-catalog-census-readonly.ts.txt",
@@ -521,5 +566,10 @@
       "sha256": "766e7e2d649df9384274695a9bff84293ebd1e4c46763c2e69c678e58af1ce07"
     }
   ],
-  "sourceSnapshotsAreInert": true
+  "sourceSnapshotsAreInert": true,
+  "customerLabelDisposition": {
+    "proseAndInertSources": "Redacted to the reporting customer",
+    "hashBoundReceipts": "Three originals retained byte-identical with per-file annotations; label-only, no customer identifiers",
+    "leadReviewMessage": "244961104601825280"
+  }
 }

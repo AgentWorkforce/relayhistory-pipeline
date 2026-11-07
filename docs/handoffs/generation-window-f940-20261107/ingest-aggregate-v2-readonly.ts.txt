@@ -20,7 +20,7 @@ function source(){
 }
 async function main(){
  source();if(await generation()!==G2)no("source_generation");
- const sql=readFileSync(ROOT+"/.96bulls/role-inventory/brian-ingest-aggregate-snapshot-draft-v2-20261107.sql","utf8");
+ const sql=readFileSync(ROOT+"/.96bulls/role-inventory/the reporting customer-ingest-aggregate-snapshot-draft-v2-20261107.sql","utf8");
  const sqlSha256="8930e4cfc0497aa4eb56b20add752f8eaa60fadd6c00ee53068a38ee1b4ae3cf";
  if(createHash("sha256").update(sql).digest("hex")!==sqlSha256)no("sql_sha_mismatch");
  const starts=[...sql.matchAll(/BEGIN READ ONLY;/g)].map(x=>x.index!+16);const ends=[...sql.matchAll(/ROLLBACK;/g)].map(x=>x.index!);
@@ -41,7 +41,7 @@ async function main(){
  };
  const begin=async()=>{await c.query("BEGIN READ ONLY");began=true;await c.query("SET LOCAL ROLE postgres");};
  const rollback=async()=>{await c.query("ROLLBACK");began=false;};
- const base=()=>({version:2,kind:"brian_ingest_aggregate_readonly",startedAt,sqlSha256,sourceSha:SHA,project:PROJECT,executionRole:"current_user postgres / session_user cli_login_postgres, SET LOCAL reasserted per phase",phasePreflights,productionWrites:false});
+ const base=()=>({version:2,kind:"the reporting customer_ingest_aggregate_readonly",startedAt,sqlSha256,sourceSha:SHA,project:PROJECT,executionRole:"current_user postgres / session_user cli_login_postgres, SET LOCAL reasserted per phase",phasePreflights,productionWrites:false});
  try{
   await c.connect();connected=true;phase="preflight";await begin();const ready=await check();await rollback();
   if(!ready){console.log(JSON.stringify({...base(),status:"preflight_refused",statistics:"UNKNOWN",aggregateBlockExecuted:false,completedAt:new Date().toISOString()}));return;}

@@ -21,7 +21,7 @@ function source(){
 async function main(){
  source();if(await generation()!==G2)no("source_generation");
  const input=JSON.parse(readFileSync(0,"utf8"));if(!input||typeof input!=="object"||Array.isArray(input)||Object.keys(input).sort().join()!=="userId,workspaceId"||typeof input.workspaceId!=="string"||typeof input.userId!=="string"||createHash("sha256").update(JSON.stringify([input.workspaceId,input.userId])).digest("hex")!=="434d966121c88c5924542e2b6dff005add979fd7dce35c3ed63d51b460c8a547")no("scope_binding");
- const sql=readFileSync(ROOT+"/.96bulls/role-inventory/brian-org-publication-cohort-draft-20261107.sql","utf8");const sqlSha256="bc431aa6f55eefc755126f5d7a8536c4b72e1f7ede9ff9c40ee65bd6c39481fd";
+ const sql=readFileSync(ROOT+"/.96bulls/role-inventory/the reporting customer-org-publication-cohort-draft-20261107.sql","utf8");const sqlSha256="bc431aa6f55eefc755126f5d7a8536c4b72e1f7ede9ff9c40ee65bd6c39481fd";
  if(createHash("sha256").update(sql).digest("hex")!==sqlSha256)no("sql_sha_mismatch");
  const cli="/home/khaliqgant/.local/bin/supabase";if(run(cli,["--version"]).trim()!=="2.122.0")no("cli_version");
  let raw=run(cli,["db","dump","--linked","--project-ref",PROJECT,"--dry-run"]);const login=parseCliLogin(raw);raw="";

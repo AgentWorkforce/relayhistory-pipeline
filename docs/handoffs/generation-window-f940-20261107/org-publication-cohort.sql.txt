@@ -1,5 +1,5 @@
 -- SOURCE DRAFT ONLY; DO NOT RUN without exact route/project/org qualification.
--- One parameterized SELECT. Bind $1 = Brian's currently verified org_id; never
+-- One parameterized SELECT. Bind $1 = the reporting customer's currently verified org_id; never
 -- interpolate it, log it, put it in argv, or return identifiers.
 -- Existing owner transport must BEGIN READ ONLY; SET LOCAL ROLE postgres;
 -- SET LOCAL statement_timeout='3s'; SET LOCAL lock_timeout='250ms';

@@ -4,7 +4,7 @@ One bounded read-only attempt on sf-frame2026-11-07T20:12:23.033Z..20:12:24.138Z
 
 The existing CLI owner route used one REPEATABLE READ READ ONLY transaction, SET LOCAL ROLE postgres, statement_timeout3s/lock_timeout250ms, and ROLLBACK. Expected owner/login/database/schema/read-only and SELECT/inactive-RLS checks for the four cohort tables plus ingest_fence_owners passed. Supplied workspace/user values entered the helper over RAM stdin, were bound to a fixed approved-pair digest, and were never included in output. Org lookup used parameterized SELECT DISTINCT org_id FROM sessions.ingest_fence_owners WHERE workspace_id=$1 AND user_id=$2 ORDER BY org_id LIMIT2. This is durable owner-bound ingest scope, not external organization-directory freshness proof.
 
-The only match fact emitted is exactlyOneOrgMatched=false. Do not reinterpret that Boolean as a particular zero/multiple count, proof the workspace/user is invalid, proof Brian did not upload, or proof of no published data. No org ID was emitted, persisted or placed in argv. The cohort SQL received no guessed/fallback org. The source helper and exact cohort SQL are included as text evidence, without supplied user/workspace identifiers.
+The only match fact emitted is exactlyOneOrgMatched=false. Do not reinterpret that Boolean as a particular zero/multiple count, proof the workspace/user is invalid, proof the reporting customer did not upload, or proof of no published data. No org ID was emitted, persisted or placed in argv. The cohort SQL received no guessed/fallback org. The source helper and exact cohort SQL are included as text evidence, without supplied user/workspace identifiers.
 
 Closed result:
 ~~~json

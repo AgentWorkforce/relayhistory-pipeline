@@ -12,7 +12,7 @@ Buffered GC is deferred by pipeline-lead message 244948358983348224. Its generat
 
 At the user's explicit “trigger aws access again”, native AWS authentication and fixed GC status succeeded at 22:19:56Z. The session was closed and RAM credentials discarded. No Lambda update was issued; future operator use requires a fresh login. Receipt: `approved-window-aws-user-retry-result.json` (SHA-256 `9816ec74e6ee3a494ea073182364b2c94d4e8410b96064c8138a60eef9998508`).
 
-Earlier plan documents, expired captures and missing-role/runtime records remain historical evidence; this supplement and execution-targets.json describe the current window state. This schema result does not establish complete Neon exit, a healthy upload path, canonical publication, or Brian's readback.
+Earlier plan documents, expired captures and missing-role/runtime records remain historical evidence; this supplement and execution-targets.json describe the current window state. This schema result does not establish complete Neon exit, a healthy upload path, canonical publication, or the reporting customer's readback.
 
 Latest lead report (message 244953681824702464): Worker apply returned `UNKNOWN_HOLD_NO_RETRY`, receipt prefix `ee6f0c6e`. Read-only reconciliation belongs to the release owner. Root has not run either rebind command and holds for qualified readback; no retry or down-migration.
 
@@ -25,3 +25,5 @@ Upload observation completed: acceptance resumed, with 101/116 private and 64/78
 Source-control supplement: reviewed forward-fix guard/driver/bracket/verifier snapshots and exact PREPARE/apply/review receipts are included with source provenance and scan review. Customer-neutral receipt filenames replace editorial customer names. Historical lock SQL 653631a3 is superseded by final 2486bf70; no lock samples are asserted by this source-only inclusion.
 
 Five final-query lock samples completed 23:09:04Z–23:09:45Z (93e2e59a), no retries or writes. Observed ingest-to-ingest blocking with receipt-seat-clock context in one sample, and active claim DataFileRead near five seconds in another. No idle/non-ingest blocker was sampled. See the explicit attribution/sampling limits in post-window-lockwait-final-five-summary.md; a per-user-only cause and full repair are not established.
+
+Customer-label handling: prose/comments/inert source snapshots use “the reporting customer”. Three hash-bound original receipts remain byte-identical: the deployed Worker verifier receipt and the aggregate attempt/result receipts. Their historical kind/boolean-field labels contain a first name only, with no customer IDs or payloads; each is explicitly annotated in MANIFEST rather than rewriting forensic receipt bytes. This disposition follows lead review 244961104601825280.

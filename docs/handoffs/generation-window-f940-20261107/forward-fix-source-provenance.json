@@ -32,7 +32,7 @@
       "originalSha256": "ec4fd235bb5cd3dc3231b63e029a8326098ebe3766e72ae5c9611a7af494c22e",
       "publishedSha256": "17f83b4abe321357f8d67d282e75854aae2508b87ac397c58e8e72a74cb8ef4a",
       "redactions": [
-        "Output boolean label Brian -> Customer; no executable control-flow/transport change"
+        "Output boolean label the reporting customer -> Customer; no executable control-flow/transport change"
       ]
     },
     {
