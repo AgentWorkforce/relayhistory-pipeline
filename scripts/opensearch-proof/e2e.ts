@@ -13,7 +13,7 @@
  *      (src/concourse/seed.ts) pass through the pipeline scrubber (scrubRecords, as
  *      session-ingest does before every put) into a zstd chunk + manifest in the store.
  *   2. index: indexSearchScope projects the scope through a composeSearchService
- *      binding built from the default registry with SEARCH_INDEX_BACKEND=opensearch.
+ *      binding built from the opensearch-capable registry with SEARCH_INDEX_BACKEND=opensearch.
  *   3. search: the marker query returns the event; no placeholder secret is found,
  *      neither by query nor in any stored _source of the index.
  *   4. erase: the scope's live pointers go away, indexSearchScope erases it; the query
@@ -34,7 +34,9 @@ import { join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
 import { createFsStore } from "../../packages/object-store/src/fs.ts";
 import { sha256Hex } from "../../packages/object-store/src/crypto.ts";
-import { createSearchIndexRegistry } from "../../packages/pipeline/src/adapters/defaults.ts";
+import { createOpenSearchCapableSearchIndexRegistry } from "../../packages/pipeline/src/adapters/defaults.ts";
+import { syntheticDoc } from "../../packages/pipeline/src/search-index/conformance.ts";
+import { matchesQuery, positionOf } from "../../packages/pipeline/src/search-index/contracts.ts";
 import { scrubRecords } from "../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
 import type { SqlExecutor } from "../../packages/pipeline/src/lib/pipeline/queue.ts";
 import { PLANTED_CONTENT_MARKER, PLANTED_SECRETS } from "../../src/concourse/seed.ts";
@@ -153,9 +155,18 @@ let serverVersion = "";
 let distribution = "";
 const root = await mkdtemp(join(tmpdir(), "96bulls-opensearch-proof-"));
 try {
-  const info = await raw("");
+  const rootRes = await fetch(`${BASE}/`, { redirect: "error" });
+  if (!rootRes.ok) throw new Error(`GET /: HTTP ${rootRes.status}`);
+  const info = (await rootRes.json()) as { version?: { number?: unknown; distribution?: unknown } };
   serverVersion = String(info?.version?.number ?? "");
-  distribution = String(info?.version?.distribution ?? "elasticsearch");
+  // The product signal the adapter checks; anything unlabelled stays "unknown"
+  // so the workflow's distribution check cannot pass on a guess.
+  distribution =
+    typeof info?.version?.distribution === "string"
+      ? info.version.distribution
+      : rootRes.headers.get("x-elastic-product") === "Elasticsearch"
+        ? "elasticsearch"
+        : "unknown";
   console.log(`server: ${distribution} ${serverVersion}, dialect ${DIALECT}, index ${INDEX}`);
 
   const store = createFsStore({ root });
@@ -167,7 +178,7 @@ try {
     async partials() { return { sessions: complete ? [] : [scope.sessionId], overflow: false }; },
   };
   const binding = composeSearchService(
-    { registry: createSearchIndexRegistry(), state: () => state },
+    { registry: createOpenSearchCapableSearchIndexRegistry(), state: () => state },
     { env: { SEARCH_INDEX_BACKEND: "opensearch", SEARCH_INDEX_OPENSEARCH_URL: BASE, SEARCH_INDEX_OPENSEARCH_DIALECT: DIALECT, SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX: PREFIX } },
     "writer",
   );
@@ -176,6 +187,28 @@ try {
   check("health before bootstrap is schema_missing", (await index.health()).code === "schema_missing");
   await index.ensureSchema(); // explicit proof bootstrap, never service startup
   check("health after ensureSchema is ok", (await index.health()).ok === true);
+
+  // Repetitive and maximally folded 500-character q against the oracle, in a
+  // separate tenant that is deleted again before the upload chain runs.
+  const stressTenant = { orgId: "org_e2e_q", workspaceId: scope.workspaceId };
+  const runs = `${"a".repeat(600)} ${"İ".repeat(600)} ${"ab".repeat(300)}`;
+  const stressDocs = [
+    syntheticDoc({ ...stressTenant, eventId: "rep-short", content: "", taskTitle: runs }),
+    syntheticDoc({ ...stressTenant, eventId: "rep-long", content: "", taskTitle: `${"x".repeat(3800)}${runs}` }),
+    syntheticDoc({ ...stressTenant, eventId: "rep-near", content: `${"a".repeat(499)}b${"İ".repeat(499)}b${"ab".repeat(249)}`, taskTitle: "" }),
+  ];
+  await index.upsert(stressDocs);
+  for (const [name, q] of [["a x 500", "a".repeat(500)], ["İ x 500", "İ".repeat(500)], ["ab x 250", "ab".repeat(250)]] as const) {
+    const expected = stressDocs.filter((d) => matchesQuery(d, q)).map((d) => d.eventId).sort().join(",");
+    let got: string;
+    try {
+      got = (await index.query({ tenant: stressTenant, q, order: "asc", limit: 10 })).hits.map((h) => h.eventId).sort().join(",");
+    } catch (error) {
+      got = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    }
+    check(`search: q ${name} matches the oracle`, expected === "rep-long,rep-short" && got === expected, `expected ${expected}; got ${got}`);
+  }
+  await index.deleteEvents(stressTenant, stressDocs.map(positionOf));
 
   // 1. upload (scrub on the way in)
   const t0 = Date.parse(AT);

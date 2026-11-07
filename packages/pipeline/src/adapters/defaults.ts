@@ -1,7 +1,12 @@
 /**
- * Registries pre-loaded with the OSS defaults. A composition adds its own
- * factories to the same registries before selecting. Provider implementation
- * placement and customer distribution are separate reviewed changes.
+ * Adapter registries for compositions. `createSearchIndexRegistry` registers
+ * Postgres only (the default backend); `createOpenSearchCapableSearchIndexRegistry`
+ * registers Postgres and OpenSearch and must be chosen explicitly by a
+ * composition that intends to run OpenSearch. `createPipelineRuntimeRegistry`
+ * registers the worker runtime only. A composition adds its own factories to
+ * these registries before selecting; registering a name never widens what an
+ * entry point allows. Provider implementation placement and customer
+ * distribution are separate reviewed changes.
  */
 import type { PipelineRuntimeAdapter } from "../runtime/contracts.js";
 import { createWorkerRuntime, type WorkSource } from "../runtime/workers.js";
@@ -9,6 +14,7 @@ import type { SearchIndexAdapter } from "../search-index/contracts.js";
 import { createPostgresSearchIndex, type SqlClient } from "../search-index/postgres.js";
 import {
   createOpenSearchSearchIndex,
+  MAX_OPENSEARCH_TIMEOUT_MS,
   OPENSEARCH_DIALECTS,
   type FetchLike,
   type OpenSearchDialect,
@@ -74,8 +80,8 @@ export function openSearchConfigFromInput(input: SearchFactoryInput): OpenSearch
     throw new Error(`SEARCH_INDEX_OPENSEARCH_DIALECT must be one of ${OPENSEARCH_DIALECTS.join(", ")}`);
   }
   const timeout = value("REQUEST_TIMEOUT_MS");
-  if (timeout !== undefined && !/^[1-9][0-9]{0,5}$/.test(timeout)) {
-    throw new Error("SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS must be a positive integer (ms)");
+  if (timeout !== undefined && (!/^[1-9][0-9]{0,5}$/.test(timeout) || Number(timeout) > MAX_OPENSEARCH_TIMEOUT_MS)) {
+    throw new Error(`SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS must be an integer from 1 to ${MAX_OPENSEARCH_TIMEOUT_MS} (ms)`);
   }
   const authKind = value("AUTH") ?? "none";
   let auth: OpenSearchSearchIndexConfig["auth"];
@@ -119,18 +125,26 @@ function registerOpenSearch(registry: SearchIndexRegistry): void {
   });
 }
 
-/** Every OSS search backend: postgres (the default) and opensearch (OpenSearch or Elasticsearch). */
+function newSearchIndexRegistry(): SearchIndexRegistry {
+  return new AdapterRegistry("SEARCH_INDEX_BACKEND", SEARCH_INDEX_BACKENDS, DEFAULT_SEARCH_INDEX_BACKEND);
+}
+
+/** Postgres only (the default backend). The composition ABI and every shipped entry point use this. */
 export function createSearchIndexRegistry(): SearchIndexRegistry {
-  const registry: SearchIndexRegistry = new AdapterRegistry("SEARCH_INDEX_BACKEND", SEARCH_INDEX_BACKENDS, DEFAULT_SEARCH_INDEX_BACKEND);
+  const registry = newSearchIndexRegistry();
   registerPostgres(registry);
-  registerOpenSearch(registry);
   return registry;
 }
 
-/** Postgres only: for compositions whose completeness state lives in Postgres beside the index. */
-export function createPostgresSearchIndexRegistry(): SearchIndexRegistry {
-  const registry: SearchIndexRegistry = new AdapterRegistry("SEARCH_INDEX_BACKEND", SEARCH_INDEX_BACKENDS, DEFAULT_SEARCH_INDEX_BACKEND);
+/**
+ * Postgres and opensearch (OpenSearch or Elasticsearch). Opt-in: only a
+ * composition that intends to run OpenSearch should use it, because an entry
+ * point built on a composition allows every name its registry holds.
+ */
+export function createOpenSearchCapableSearchIndexRegistry(): SearchIndexRegistry {
+  const registry = newSearchIndexRegistry();
   registerPostgres(registry);
+  registerOpenSearch(registry);
   return registry;
 }
 

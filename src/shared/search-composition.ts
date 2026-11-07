@@ -1,4 +1,4 @@
-import { createPostgresSearchIndexRegistry, type SearchFactoryInput, type SearchIndexRegistry } from "@rhc/adapters/defaults.ts";
+import { createSearchIndexRegistry, type SearchFactoryInput, type SearchIndexRegistry } from "@rhc/adapters/defaults.ts";
 import type { SearchIndexBackendName } from "@rhc/adapters/registry.ts";
 import { assertSearchServiceBinding, type SearchProjectionState, type SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
 import { postgresSearchState } from "../session-pipeline/postgres-search-state.ts";
@@ -27,7 +27,7 @@ export function composeSearchService(composition: SearchComposition, input: Sear
 export function createPostgresSearchComposition(options: { backendId: string; fromMs: number }): SearchComposition {
   const { backendId, fromMs } = options;
   return {
-    registry: createPostgresSearchIndexRegistry(),
+    registry: createSearchIndexRegistry(),
     state(input) { return postgresSearchState({ schema: input.env.SEARCH_INDEX_POSTGRES_SCHEMA, backendId, fromMs, reader: input.tenantRunner }); },
   };
 }

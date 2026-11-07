@@ -78,6 +78,8 @@ export interface OpenSearchSearchIndexConfig {
 
 export const DEFAULT_OPENSEARCH_INDEX_PREFIX = "relayhistory";
 export const DEFAULT_OPENSEARCH_TIMEOUT_MS = 10_000;
+/** Upper bound for requestTimeoutMs (and SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS). */
+export const MAX_OPENSEARCH_TIMEOUT_MS = 600_000;
 const PREFIX = /^[a-z0-9][a-z0-9_-]{0,100}$/;
 /** Folded-text window (code points) and stride: any needle up to WINDOW - STRIDE + 1 fits in one window. */
 const WINDOW = 4096;
@@ -154,6 +156,8 @@ export const OPENSEARCH_MAPPINGS = Object.freeze({
 
 /** Index settings. gc_deletes 0: a deleted key can be re-written at any version, as a deleted postgres row can. */
 export const OPENSEARCH_SETTINGS = Object.freeze({ index: { gc_deletes: "0s" } });
+/** The spellings of a zero gc_deletes that `ensureSchema` accepts on an existing index. */
+const ZERO_GC_DELETES = new Set(["0", "0s", "0ms"]);
 
 interface Source {
   org_id: string;
@@ -297,6 +301,12 @@ function isAbort(error: unknown): boolean {
 
 const retryableStatus = (status: number) => status === 429 || status >= 500;
 
+/** Loopback hosts, where plain http never leaves the machine. */
+function isLoopbackHost(hostname: string): boolean {
+  // WHATWG URL normalizes IPv4 shorthands (127.1) to dotted quads and brackets IPv6.
+  return hostname === "localhost" || hostname === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname);
+}
+
 export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig): SearchIndexAdapter {
   const base = normalizeBaseUrl(config.url);
   const dialect = config.dialect ?? "opensearch";
@@ -305,12 +315,17 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
   if (!PREFIX.test(prefix)) throw new SearchIndexError("invalid_argument", false, "index_prefix");
   const index = `${prefix}-transcript-events`;
   const timeoutMs = config.requestTimeoutMs ?? DEFAULT_OPENSEARCH_TIMEOUT_MS;
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 600_000) throw new SearchIndexError("invalid_argument", false, "timeout");
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_OPENSEARCH_TIMEOUT_MS) throw new SearchIndexError("invalid_argument", false, "timeout");
   const auth = config.auth ?? { kind: "none" };
   let authorization: string | undefined;
   if (auth.kind === "basic") {
     if (!auth.username || auth.username.includes(":") || typeof auth.password !== "string" || !auth.password) {
       throw new SearchIndexError("invalid_argument", false, "basic_auth");
+    }
+    // Basic credentials are replayable: never send them in cleartext off the machine.
+    const { protocol, hostname } = new URL(base);
+    if (protocol !== "https:" && !isLoopbackHost(hostname)) {
+      throw new SearchIndexError("invalid_argument", false, "basic_auth_needs_https");
     }
     const bytes = new TextEncoder().encode(`${auth.username}:${auth.password}`);
     authorization = `Basic ${btoa(String.fromCharCode(...bytes))}`;
@@ -461,6 +476,15 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
         const merged = await request("PUT", `${index}/_mapping`, OPENSEARCH_MAPPINGS, context, { accept: [400] });
         if (merged.status === 400) throw new SearchIndexError("schema_missing", false, "mapping_conflict");
       }
+      // Verify (never apply) gc_deletes: an existing or template-created index may
+      // keep the 60s default, and the tombstone handling in upsert assumes 0.
+      const settings = await request("GET", `${index}/_settings/index.gc_deletes?flat_settings=true`, undefined, context);
+      const entries = Object.values((settings.body ?? {}) as Record<string, { settings?: Record<string, unknown> } | undefined>);
+      if (entries.length !== 1) invalidReply();
+      const gcDeletes = entries[0]?.settings?.["index.gc_deletes"];
+      if (typeof gcDeletes !== "string" || !ZERO_GC_DELETES.has(gcDeletes)) {
+        throw new SearchIndexError("schema_mismatch", false, "gc_deletes");
+      }
     },
 
     async upsert(docs, context) {
@@ -504,7 +528,9 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
         const reply = await request("POST", `${index}/_mget?realtime=true&_source=false`, { ids: conflicts.map((c) => c.id) }, context);
         const found = (reply.body as { docs?: { found?: unknown }[] } | undefined)?.docs;
         if (!Array.isArray(found) || found.length !== conflicts.length) invalidReply();
-        return conflicts.filter((_, i) => found[i]?.found === false);
+        // An item without a boolean `found` (an error item) is neither live nor deleted.
+        if (found.some((item) => typeof item?.found !== "boolean")) invalidReply();
+        return conflicts.filter((_, i) => found[i]!.found === false);
       };
       const flush = async (batch: { id: string; line: string }[]) => {
         if (batch.length === 0) return;

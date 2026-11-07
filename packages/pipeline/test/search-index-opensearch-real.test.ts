@@ -54,7 +54,7 @@ if (!url) {
       expect((await a.query({ tenant, order: "asc", limit: 5 })).hits.map((h) => h.content)).toEqual(["one"]);
     });
 
-    it("matches a maximum-length folded q across a window boundary of a long title", async () => {
+    it("matches a 500-character q (one İ) across a window boundary of a long title", async () => {
       const org = `org-${Date.now().toString(36)}-win`;
       const tenant = { orgId: org, workspaceId: "ws-a" };
       const title = [...Array(9000)].map((_, i) => String.fromCharCode(65 + ((i * 7) % 26))).join("");
@@ -68,6 +68,29 @@ if (!url) {
         expect((await a.query({ tenant, q: plain, order: "asc", limit: 5 })).hits).toHaveLength(1);
       }
     });
+
+    // Repetitive and maximally folded q (500 x U+0130 folds to 1000 code points):
+    // the wildcard automata Lucene builds for these are the largest q can produce.
+    it("matches repetitive and maximally folded 500-character q like the oracle", async () => {
+      const org = `org-${Date.now().toString(36)}-rep`;
+      const tenant = { orgId: org, workspaceId: "ws-a" };
+      const runs = `${"a".repeat(600)} ${"İ".repeat(600)} ${"ab".repeat(300)}`;
+      const docs = [
+        // Every run in one window.
+        syntheticDoc({ orgId: org, eventId: "rep-short", content: "", taskTitle: runs }),
+        // The runs past the first window boundary of a long title.
+        syntheticDoc({ orgId: org, eventId: "rep-long", content: "", taskTitle: `${"x".repeat(3800)}${runs}` }),
+        // One character short of every run: matches none of them.
+        syntheticDoc({ orgId: org, eventId: "rep-near", content: `${"a".repeat(499)}b${"İ".repeat(499)}b${"ab".repeat(249)}`, taskTitle: "" }),
+      ];
+      expect(await a.upsert(docs)).toEqual({ written: docs.length });
+      for (const [name, q] of [["a x 500", "a".repeat(500)], ["İ x 500", "İ".repeat(500)], ["ab x 250", "ab".repeat(250)]] as const) {
+        const expected = docs.filter((d) => matchesQuery(d, q)).map((d) => d.eventId).sort();
+        expect(expected, `${name} oracle`).toEqual(["rep-long", "rep-short"]);
+        const hits = (await a.query({ tenant, q, order: "asc", limit: 10 })).hits.map((h) => h.eventId).sort();
+        expect(hits, name).toEqual(expected);
+      }
+    }, 60_000);
 
     it("scans past index.max_result_window (10000) with search_after", async () => {
       const org = `org-${Date.now().toString(36)}-scan`;

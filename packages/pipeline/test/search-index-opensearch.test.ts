@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createSearchIndexRegistry, openSearchConfigFromInput } from "../src/adapters/defaults.js";
+import { createOpenSearchCapableSearchIndexRegistry, openSearchConfigFromInput } from "../src/adapters/defaults.js";
 import { syntheticDoc } from "../src/search-index/conformance.js";
 import { SearchIndexError, matchesQuery } from "../src/search-index/contracts.js";
 import {
@@ -135,6 +135,18 @@ describe("opensearch adapter request shapes", () => {
     const e = await rejects(createOpenSearchSearchIndex({ url: BASE, fetch: fake(items(429)).fetch }).upsert([syntheticDoc({ orgId: "o" })]), "unavailable", "bulk_item_429");
     expect(e.retryable).toBe(true);
     expect(e.message).not.toContain("secret");
+  });
+
+  it("refuses an _mget item without a boolean found (an error item) instead of dropping the write", async () => {
+    for (const item of [{ _id: "x", error: { type: "shard_not_available_exception" } }, { _id: "x", found: "false" }, null]) {
+      const { calls, fetch } = fake((c) =>
+        c.url.includes("/_mget")
+          ? json(200, { docs: [item] })
+          : json(200, { items: [{ index: { status: 409, error: { type: "version_conflict_engine_exception" } } }] }),
+      );
+      await rejects(createOpenSearchSearchIndex({ url: BASE, fetch }).upsert([syntheticDoc({ orgId: "o" })]), "unavailable", "bad_response");
+      expect(calls).toHaveLength(2); // bulk + mget; no retry and no silent { written: 0 }
+    }
   });
 
   it("deletes exact rows with _delete_by_query, refresh=true, conflicts=proceed and tenant filters", async () => {
@@ -296,12 +308,16 @@ describe("opensearch adapter schema and dialects", () => {
     product === "opensearch"
       ? json(200, { version: { distribution: "opensearch", number: "2.19.0" } })
       : json(200, { version: { number: "8.15.3" }, tagline: "You Know, for Search" }, { "x-elastic-product": "Elasticsearch" });
+  const SETTINGS_URL = `${BASE}/${INDEX}/_settings/index.gc_deletes?flat_settings=true`;
+  const gcDeletes = (value: string | undefined) => json(200, { [INDEX]: { settings: value === undefined ? {} : { "index.gc_deletes": value } } });
 
   for (const dialect of ["opensearch", "elasticsearch"] as const) {
     it(`creates the index with explicit mappings after the ${dialect} product check`, async () => {
-      const { calls, fetch } = fake((call) => (call.method === "GET" ? root(dialect) : json(200, { acknowledged: true })));
+      const { calls, fetch } = fake((call) =>
+        call.url === SETTINGS_URL ? gcDeletes("0s") : call.method === "GET" ? root(dialect) : json(200, { acknowledged: true }),
+      );
       await createOpenSearchSearchIndex({ url: BASE, dialect, fetch }).ensureSchema();
-      expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([`GET ${BASE}/`, `PUT ${BASE}/${INDEX}`]);
+      expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([`GET ${BASE}/`, `PUT ${BASE}/${INDEX}`, `GET ${SETTINGS_URL}`]);
       const body = JSON.parse(calls[1]!.body!);
       expect(body.mappings).toEqual(OPENSEARCH_MAPPINGS);
       expect(body.mappings.dynamic).toBe("strict");
@@ -317,24 +333,88 @@ describe("opensearch adapter schema and dialects", () => {
     const exists = json(400, { error: { type: "resource_already_exists_exception" } });
     let mappingStatus = 200;
     const { calls, fetch } = fake((call) =>
-      call.method === "GET" ? root("opensearch") : call.url.endsWith("/_mapping") ? json(mappingStatus, {}) : exists.clone(),
+      call.url === SETTINGS_URL
+        ? gcDeletes("0s")
+        : call.method === "GET"
+          ? root("opensearch")
+          : call.url.endsWith("/_mapping")
+            ? json(mappingStatus, {})
+            : exists.clone(),
     );
     const a = createOpenSearchSearchIndex({ url: BASE, fetch });
     await a.ensureSchema();
-    expect(calls.map((c) => `${c.method} ${c.url}`).at(-1)).toBe(`PUT ${BASE}/${INDEX}/_mapping`);
+    expect(calls.map((c) => `${c.method} ${c.url}`).slice(-2)).toEqual([`PUT ${BASE}/${INDEX}/_mapping`, `GET ${SETTINGS_URL}`]);
     mappingStatus = 400;
     await rejects(a.ensureSchema(), "schema_missing", "mapping_conflict");
   });
 
+  it("verifies index.gc_deletes is zero on an existing index and never applies settings", async () => {
+    const exists = json(400, { error: { type: "resource_already_exists_exception" } });
+    const run = async (value: string | undefined, body?: unknown) => {
+      const { calls, fetch } = fake((call) =>
+        call.url === SETTINGS_URL
+          ? body !== undefined ? json(200, body) : gcDeletes(value)
+          : call.method === "GET"
+            ? root("opensearch")
+            : call.url.endsWith("/_mapping")
+              ? json(200, { acknowledged: true })
+              : exists.clone(),
+      );
+      const result = await createOpenSearchSearchIndex({ url: BASE, fetch }).ensureSchema().then(() => "ok", (e: unknown) => e);
+      // Only the create attempt and the mapping merge write; nothing touches _settings with PUT.
+      expect(calls.filter((c) => c.method === "PUT").map((c) => c.url)).toEqual([`${BASE}/${INDEX}`, `${BASE}/${INDEX}/_mapping`]);
+      return result;
+    };
+    for (const zero of ["0s", "0", "0ms"]) expect(await run(zero), zero).toBe("ok");
+    for (const wrong of ["60s", "1s", "", undefined]) {
+      const e = await run(wrong);
+      expect(e, String(wrong)).toBeInstanceOf(SearchIndexError);
+      expect((e as SearchIndexError).code).toBe("schema_mismatch");
+      expect((e as SearchIndexError).detail).toBe("gc_deletes");
+    }
+    // An unexpected reply shape (no index entry, or several) is a bad response, not a pass.
+    for (const body of [{}, { a: { settings: { "index.gc_deletes": "0s" } }, b: { settings: { "index.gc_deletes": "0s" } } }]) {
+      const e = await run(undefined, body);
+      expect((e as SearchIndexError).detail).toBe("bad_response");
+    }
+  });
+
   it("sends basic auth only to the configured URL and refuses URLs with credentials or queries", async () => {
     const { calls, fetch } = fake(() => new Response(null, { status: 200 }));
-    await createOpenSearchSearchIndex({ url: BASE, fetch, auth: { kind: "basic", username: "reader", password: "pässword" } }).health();
+    await createOpenSearchSearchIndex({ url: "https://search.test:9200", fetch, auth: { kind: "basic", username: "reader", password: "pässword" } }).health();
+    expect(calls[0]!.url).toBe(`https://search.test:9200/${INDEX}`);
     expect(calls[0]!.headers.authorization).toBe(`Basic ${Buffer.from("reader:pässword").toString("base64")}`);
     for (const url of ["http://u:p@search.test", "ftp://search.test", "http://search.test/?a=1", "http://search.test/#x", "not a url"]) {
       expect(() => createOpenSearchSearchIndex({ url, fetch })).toThrow(SearchIndexError);
     }
-    expect(() => createOpenSearchSearchIndex({ url: BASE, fetch, auth: { kind: "basic", username: "a:b", password: "p" } })).toThrow(SearchIndexError);
+    expect(() => createOpenSearchSearchIndex({ url: "https://search.test", fetch, auth: { kind: "basic", username: "a:b", password: "p" } })).toThrow(SearchIndexError);
     expect(() => createOpenSearchSearchIndex({ url: BASE, fetch, indexPrefix: "Bad/Prefix" })).toThrow(SearchIndexError);
+  });
+
+  it("refuses basic auth over plain http to a non-loopback host, without echoing the password", async () => {
+    const password = "hunter2-do-not-leak";
+    for (const url of ["http://search.test:9200", "http://10.0.0.5:9200", "http://128.0.0.1", "http://localhost.example.com", "http://[::2]:9200", "http://127.0.0.1.nip.io"]) {
+      const { calls, fetch } = fake(() => new Response(null, { status: 200 }));
+      let error: unknown;
+      try {
+        createOpenSearchSearchIndex({ url, fetch, auth: { kind: "basic", username: "reader", password } });
+      } catch (e) {
+        error = e;
+      }
+      expect(error, url).toBeInstanceOf(SearchIndexError);
+      expect((error as SearchIndexError).code).toBe("invalid_argument");
+      expect((error as SearchIndexError).detail).toBe("basic_auth_needs_https");
+      expect((error as SearchIndexError).message).not.toContain(password);
+      expect(calls).toHaveLength(0);
+    }
+    // https anywhere, or plain http to loopback (never leaves the machine), is allowed.
+    for (const url of ["https://search.test", "http://localhost:9200", "http://127.0.0.1:9200", "http://127.1.2.3", "http://[::1]:9200"]) {
+      const { calls, fetch } = fake(() => new Response(null, { status: 200 }));
+      await createOpenSearchSearchIndex({ url, fetch, auth: { kind: "basic", username: "reader", password } }).health();
+      expect(calls[0]!.headers.authorization, url).toMatch(/^Basic /);
+    }
+    // No auth over plain http to a remote host stays allowed (nothing to leak).
+    expect(() => createOpenSearchSearchIndex({ url: BASE, fetch: fake(() => new Response(null)).fetch })).not.toThrow();
   });
 
   it("refuses SigV4 at construction (not implemented)", () => {
@@ -361,7 +441,7 @@ describe("opensearch adapter schema and dialects", () => {
 describe("opensearch env parsing", () => {
   it("fails fast without a URL and parses every SEARCH_INDEX_OPENSEARCH_ setting", () => {
     expect(() => openSearchConfigFromInput({ env: {} })).toThrow(/needs SEARCH_INDEX_OPENSEARCH_URL/);
-    expect(() => createSearchIndexRegistry().create({ SEARCH_INDEX_BACKEND: "opensearch" }, { env: { SEARCH_INDEX_OPENSEARCH_URL: " " } })).toThrow(
+    expect(() => createOpenSearchCapableSearchIndexRegistry().create({ SEARCH_INDEX_BACKEND: "opensearch" }, { env: { SEARCH_INDEX_OPENSEARCH_URL: " " } })).toThrow(
       /needs SEARCH_INDEX_OPENSEARCH_URL/,
     );
     const config = openSearchConfigFromInput({
@@ -385,8 +465,17 @@ describe("opensearch env parsing", () => {
     expect(() => openSearchConfigFromInput({ env: { SEARCH_INDEX_OPENSEARCH_URL: BASE, SEARCH_INDEX_OPENSEARCH_DIALECT: "solr" } })).toThrow(/DIALECT/);
     expect(() => openSearchConfigFromInput({ env: { SEARCH_INDEX_OPENSEARCH_URL: BASE, SEARCH_INDEX_OPENSEARCH_AUTH: "token" } })).toThrow(/AUTH/);
     expect(() => openSearchConfigFromInput({ env: { SEARCH_INDEX_OPENSEARCH_URL: BASE, SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS: "-1" } })).toThrow(/TIMEOUT/);
+    // The env bound is the adapter's bound (600000 ms): anything env accepts, construction accepts.
+    for (const bad of ["0", "600001", "700000", "999999", "1e5", "1000000"]) {
+      expect(() => openSearchConfigFromInput({ env: { SEARCH_INDEX_OPENSEARCH_URL: BASE, SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS: bad } }), bad).toThrow(/1 to 600000/);
+    }
+    for (const good of ["1", "600000"]) {
+      const parsed = openSearchConfigFromInput({ env: { SEARCH_INDEX_OPENSEARCH_URL: BASE, SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS: good } });
+      expect(parsed.requestTimeoutMs).toBe(Number(good));
+      expect(() => createOpenSearchSearchIndex(parsed)).not.toThrow();
+    }
     expect(() =>
-      createSearchIndexRegistry().create({ SEARCH_INDEX_BACKEND: "opensearch" }, { env: { SEARCH_INDEX_OPENSEARCH_URL: BASE, SEARCH_INDEX_OPENSEARCH_AUTH: "sigv4" } }),
+      createOpenSearchCapableSearchIndexRegistry().create({ SEARCH_INDEX_BACKEND: "opensearch" }, { env: { SEARCH_INDEX_OPENSEARCH_URL: BASE, SEARCH_INDEX_OPENSEARCH_AUTH: "sigv4" } }),
     ).toThrow(/sigv4_not_implemented/);
   });
 });

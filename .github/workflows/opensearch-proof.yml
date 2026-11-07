@@ -87,7 +87,7 @@ jobs:
         run: |
           f=opensearch-proof-${{ matrix.dialect }}.json
           jq -e --arg head "$EXPECTED" --arg dialect "${{ matrix.dialect }}" \
-            '.head == $head and .dialect == $dialect and .distribution == $dialect and .failed == 0 and .passed >= 16 and (.cases | all(.pass))' "$f"
+            '.head == $head and .dialect == $dialect and .distribution == $dialect and .failed == 0 and .passed == 19 and (.cases | all(.pass))' "$f"
           jq -r '"\(.passed) passed, \(.failed) failed on \(.distribution) \(.server_version) at \(.head)"' "$f" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Server log on failure
         if: failure()
