@@ -18,3 +18,11 @@ export const SESSION_ANALYSIS_RESULT_SCHEMA_VERSION = SESSION_ANALYSIS_SCHEMA_VE
 export const SESSION_ANALYSIS_MODEL_VERSION = "gpt-5.4";
 /** The job envelope's own version (relayhistory processor.ts `schemaVersion: 1`). */
 export const SESSION_ANALYSIS_ENVELOPE_VERSION = 1 as const;
+
+/**
+ * The brief half of each request (relayhistory processSessionBrief): the vendored
+ * session-brief summary engine, relayhistory's versions, unchanged
+ * (versions.ts SESSION_ANALYSIS_SUMMARY_VERSION / SESSION_SUMMARY_MODEL_VERSION).
+ */
+export const SESSION_ANALYSIS_SUMMARY_VERSION = "session-summary-v3:workspace-output-v2";
+export const SESSION_ANALYSIS_SUMMARY_MODEL_VERSION = "gpt-5.6-luna";
