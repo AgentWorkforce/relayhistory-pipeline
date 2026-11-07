@@ -26,7 +26,8 @@
 import { createHash } from "node:crypto";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { objectKey, readAll, type ObjectStore } from "../../packages/object-store/src/index.ts";
-import { analysisResultKey, analysisResultPrefix, ANALYSIS_RESULT_MAX_BYTES } from "./results.ts";
+import { randomUUID } from "node:crypto";
+import { analysisResultKey, analysisResultPrefix, ANALYSIS_RESULT_MAX_BYTES, boundedPut, type AnalysisPutAck } from "./results.ts";
 
 type Json = Record<string, unknown>;
 export type NeonV1Payload = { outcome: "not_found" } | { outcome: "ok"; sessionId: string; requests: Json[]; analyses: Json[] };
@@ -125,6 +126,16 @@ export function planBackfill(scope: BackfillScope, payload: NeonV1Payload): Back
 const LIVE = `EXISTS (SELECT 1 FROM sessions.session_index AS p
    WHERE p.org_id = $2 AND p.workspace_id = $3
      AND (coalesce(p.canonical_session_id, p.session_id) = $4 OR p.session_id = $4) AND p.deleted_at IS NULL)`;
+/** The planned source generation ($8) is still current: pointer set and every proof input. */
+const GENERATION = "sessions.session_analysis_source_revision($2, $3, $4) = $8::text";
+
+async function sourceRevision(db: SqlExecutor, scope: BackfillScope): Promise<string | null> {
+  const { rows } = await db.query<{ r: string | null }>(
+    "SELECT sessions.session_analysis_source_revision($1, $2, $3) AS r",
+    [scope.orgId, scope.workspaceId, scope.sessionId],
+  );
+  return rows[0]?.r ?? null;
+}
 
 /** The scope's anchor manifest (first live pointer), from which the result prefix derives. */
 async function anchorPrefix(db: SqlExecutor, scope: BackfillScope): Promise<string> {
@@ -165,11 +176,26 @@ export async function applyBackfill(
      * Returns the versions (and markers) removed; 0 means nothing is left.
      */
     eraseObject: (key: string) => Promise<number>;
+    /**
+     * Successor-safe cleanup of exactly the version this run's put created (production:
+     * createS3Eraser().eraseVersion). Absent (an unversioned store): a fence-lost write is
+     * left to the sweeper under a durable 'forgotten' ticket instead.
+     */
+    eraseVersion?: (key: string, versionId: string, opts?: { keepIfSole?: boolean }) => Promise<"gone" | "kept_sole">;
+    /** The PUT's hard deadline (default ANALYSIS_PUT_TIMEOUT_MS, well inside the ticket lease). */
+    putTimeoutMs?: number;
   },
 ): Promise<{ jobs: number; requests: number; objects: number }> {
   if (typeof options?.eraseObject !== "function") throw new BackfillError("backfill_eraser_required");
   const prefix = await anchorPrefix(db, scope);
   const scopeParams = [scope.orgId, scope.workspaceId, scope.sessionId];
+  // This run's writer identity: every ticket fence names it, so a successor's live lease is
+  // never mistaken for ours, and a takeover is possible only after our lease expired.
+  const writer = randomUUID();
+  // The source generation this backfill was planned against (pointer set + every proof
+  // input): every ticket fence also requires it unchanged.
+  const generation = await sourceRevision(db, scope);
+  if (generation === null) throw new BackfillError("backfill_session_not_live");
   let objects = 0;
   const refs = new Map<string, { key: string; sha256: string; bytes: number }>();
   for (const job of plan.jobs) {
@@ -182,12 +208,55 @@ export async function applyBackfill(
       if (key)
         await db
           .query(
-            "UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() WHERE result_key = $1 AND job_id = $2::uuid AND reason = 'publishing'",
-            [key, job.id],
+            "UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() WHERE result_key = $1 AND job_id = $2::uuid AND reason = 'publishing' AND writer_token = $3::uuid",
+            [key, job.id, writer],
           )
           .catch(() => {});
       throw error;
     }
+  }
+  /**
+   * A write whose ownership was lost (lease, generation, scope) or whose PUT did not complete.
+   * Successor-safe: never touches a successor's ticket and never deletes a version this run
+   * did not create.
+   *   1. Durable: if the ticket is still ours, it becomes a lease-free 'forgotten' ticket;
+   *      with no ticket at all (swept) and no job row naming the key, one is created. A
+   *      'forgotten' ticket cannot be taken over, so no successor can publish the key until
+   *      the sweeper (every-version erase, verified) clears it. A successor's ticket or a
+   *      published job row is left alone.
+   *   2. Exact: when the PUT returned the version id it created, that one version is erased
+   *      (kept only when it is the key's sole object version and a successor holds the key:
+   *      a successor whose create-only put found identical bytes publishes that version), and
+   *      our durable ticket is retired only after the erase is verified. Otherwise (timeout,
+   *      error, unversioned store) the ticket stays for the sweeper.
+   */
+  async function abandonWrite(key: string, jobId: string, ack: AnalysisPutAck | null) {
+    const mine = await db.query(
+      `/* backfill:fence-lost */ WITH ours AS (
+         UPDATE sessions.session_analysis_result_tickets
+            SET reason = 'forgotten', lease_expires_at = NULL
+          WHERE result_key = $1 AND job_id = $5::uuid AND writer_token = $6::uuid
+          RETURNING result_key
+       ), adopted AS (
+         INSERT INTO sessions.session_analysis_result_tickets
+           (result_key, job_id, org_id, workspace_id, session_id, reason, lease_expires_at, writer_token)
+         SELECT $1, $5::uuid, $2, $3, $4, 'forgotten', NULL, $6::uuid
+          WHERE NOT EXISTS (SELECT 1 FROM ours)
+            AND NOT EXISTS (SELECT 1 FROM sessions.session_analysis_jobs_v2 AS j WHERE j.result_s3_key = $1)
+         ON CONFLICT (result_key) DO NOTHING
+         RETURNING result_key
+       )
+       SELECT (SELECT count(*) FROM ours) + (SELECT count(*) FROM adopted) AS n`,
+      [key, ...scopeParams, jobId, writer],
+    );
+    const held = Number((mine.rows[0] as { n?: number | string } | undefined)?.n ?? 0) > 0;
+    if (!ack?.created || !ack.versionId || !options.eraseVersion) return;
+    const outcome = await options.eraseVersion(key, ack.versionId, { keepIfSole: !held });
+    if (held && outcome === "gone")
+      await db.query(
+        "DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1 AND job_id = $2::uuid AND reason = 'forgotten' AND writer_token = $3::uuid",
+        [key, jobId, writer],
+      );
   }
   async function applyJob(job: BackfillPlan["jobs"][number]) {
     let ref: { key: string; sha256: string; bytes: number } | null = null;
@@ -208,62 +277,66 @@ export async function applyBackfill(
       // Ticket first, only while the scope is live: an erase from here on leaves the ticket.
       // Leased: the sweeper skips it while the lease is live (P1-c).
       const ticket = await db.query(
-        `INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, lease_expires_at)
-         SELECT $1, $5::uuid, $2, $3, $4, 'publishing', now() + make_interval(secs => $6::integer) WHERE ${LIVE}
-         ON CONFLICT (result_key) DO UPDATE SET created_at = now(), lease_expires_at = excluded.lease_expires_at
+        `INSERT INTO sessions.session_analysis_result_tickets
+           (result_key, job_id, org_id, workspace_id, session_id, reason, lease_expires_at, writer_token)
+         SELECT $1, $5::uuid, $2, $3, $4, 'publishing', now() + make_interval(secs => $6::integer), $7::uuid
+          WHERE ${LIVE} AND ${GENERATION}
+         ON CONFLICT (result_key) DO UPDATE
+           SET created_at = now(), lease_expires_at = excluded.lease_expires_at, writer_token = excluded.writer_token
            WHERE sessions.session_analysis_result_tickets.reason = 'publishing'
              AND sessions.session_analysis_result_tickets.job_id = excluded.job_id
+             -- A takeover only after the holder's lease expired (its PUT was bounded inside it).
+             AND (sessions.session_analysis_result_tickets.lease_expires_at IS NULL
+                  OR sessions.session_analysis_result_tickets.lease_expires_at <= now()
+                  OR sessions.session_analysis_result_tickets.writer_token = excluded.writer_token)
          RETURNING result_key`,
-        [ref.key, ...scopeParams, job.id, BACKFILL_TICKET_LEASE_SECONDS],
+        [ref.key, ...scopeParams, job.id, BACKFILL_TICKET_LEASE_SECONDS, writer, generation],
       );
       if (!ticket.rows.length) throw new BackfillError("backfill_session_not_live");
       // Erase barrier: immediately before the Put, the ticket must still be ours, 'publishing'
       // and under a LIVE lease (heartbeat extends it). A lapsed, swept or forgotten ticket
       // refuses the Put, so no object can land after a sweep that already ran.
+      // Erase barrier: immediately before the Put, the ticket must still be OURS (writer),
+      // 'publishing', under a live lease, at the planned source generation.
       const beat = await db.query(
         `/* backfill:heartbeat */ UPDATE sessions.session_analysis_result_tickets
-            SET lease_expires_at = now() + make_interval(secs => $3::integer)
-          WHERE result_key = $1 AND job_id = $2::uuid AND reason = 'publishing' AND lease_expires_at > now()
+            SET lease_expires_at = now() + make_interval(secs => $6::integer)
+          WHERE result_key = $1 AND job_id = $5::uuid AND reason = 'publishing' AND writer_token = $7::uuid
+            AND lease_expires_at > now() AND ${GENERATION}
           RETURNING result_key`,
-        [ref.key, job.id, BACKFILL_TICKET_LEASE_SECONDS],
+        [ref.key, ...scopeParams, job.id, BACKFILL_TICKET_LEASE_SECONDS, writer, generation],
       );
       if (!beat.rows.length) throw new BackfillError("backfill_ticket_lease_lost");
-      await store.put(objectKey(ref.key), bytes, { ifNoneMatch: true, contentSha256: ref.sha256, contentType: "application/json" });
-      // Post-write ownership fence: the Put has no deadline of its own, so after it returns the
-      // ticket must still be ours, 'publishing', under a live lease, with the scope live. If a
-      // stall let the lease lapse (and a sweep or an erase ran meanwhile), the object we just
-      // wrote is untracked: erase it (every version) before failing, so nothing is left behind.
-      const owned = await db.query(
-        `/* backfill:post-put */ UPDATE sessions.session_analysis_result_tickets
-            SET lease_expires_at = now() + make_interval(secs => $6::integer)
-          WHERE result_key = $1 AND job_id = $5::uuid AND reason = 'publishing' AND lease_expires_at > now() AND ${LIVE}
-          RETURNING result_key`,
-        [ref.key, ...scopeParams, job.id, BACKFILL_TICKET_LEASE_SECONDS],
-      );
+      // Bounded: aborted at the deadline, well inside the lease the heartbeat just renewed.
+      let ack: AnalysisPutAck | null = null;
+      let putError: unknown = null;
+      try {
+        ack = await boundedPut(store, ref.key, bytes, ref.sha256, options.putTimeoutMs);
+      } catch (error) {
+        putError = error;
+      }
+      // Post-write ownership fence: ours (writer), 'publishing', lease live, scope live, and the
+      // source generation unchanged.
+      const owned = putError
+        ? { rows: [] }
+        : await db.query(
+            `/* backfill:post-put */ UPDATE sessions.session_analysis_result_tickets
+                SET lease_expires_at = now() + make_interval(secs => $6::integer)
+              WHERE result_key = $1 AND job_id = $5::uuid AND reason = 'publishing' AND writer_token = $7::uuid
+                AND lease_expires_at > now() AND ${LIVE} AND ${GENERATION}
+              RETURNING result_key`,
+            [ref.key, ...scopeParams, job.id, BACKFILL_TICKET_LEASE_SECONDS, writer, generation],
+          );
       if (!owned.rows.length) {
-        // Durable first: a 'forgotten' ticket for the key (whatever happened to ours), so the
-        // sweeper erases it even if this process dies or the erase below fails.
-        await db.query(
-          `/* backfill:fence-lost */ INSERT INTO sessions.session_analysis_result_tickets
-             (result_key, job_id, org_id, workspace_id, session_id, reason, lease_expires_at)
-           VALUES ($1, $5::uuid, $2, $3, $4, 'forgotten', NULL)
-           ON CONFLICT (result_key) DO UPDATE SET reason = 'forgotten', lease_expires_at = NULL`,
-          [ref.key, ...scopeParams, job.id],
-        );
-        // Then erase every version and verify none remain; only then retire that ticket.
-        await options.eraseObject(ref.key);
-        if ((await options.eraseObject(ref.key)) !== 0) throw new BackfillError("backfill_ticket_lease_lost");
-        await db.query(
-          "DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1 AND job_id = $2::uuid AND reason = 'forgotten'",
-          [ref.key, job.id],
-        );
+        await abandonWrite(ref.key, job.id, ack);
+        if (putError) throw putError;
         throw new BackfillError("backfill_ticket_lease_lost");
       }
       const read = await readAll(await store.get(objectKey(ref.key)));
       if (createHash("sha256").update(read).digest("hex") !== ref.sha256) throw new BackfillError("backfill_write_verification_failed");
       objects += 1;
     }
-    const { rows } = await db.query<{ live: boolean; inserted: number }>(
+    const { rows } = await db.query<{ live: boolean; inserted: number; current: boolean }>(
       `WITH ins AS (
          INSERT INTO sessions.session_analysis_jobs_v2
            (id, org_id, workspace_id, session_id, harness, status, attempts, analysis_version, schema_version,
@@ -271,20 +344,22 @@ export async function applyBackfill(
             result_bytes, last_error, origin, created_at, updated_at, completed_at)
          SELECT $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'neon_backfill',
                 $18::timestamptz, $19::timestamptz, $20::timestamptz
-          WHERE ${LIVE}
+          WHERE ${LIVE} AND sessions.session_analysis_source_revision($2, $3, $4) = $22::text
          ON CONFLICT (id) DO NOTHING RETURNING id
        ), retired AS (
          DELETE FROM sessions.session_analysis_result_tickets AS t
           WHERE $14::text IS NOT NULL AND t.result_key = $14 AND t.job_id = $1::uuid AND t.reason = 'publishing'
-            AND EXISTS (SELECT 1 FROM ins)
+            AND t.writer_token = $21::uuid AND EXISTS (SELECT 1 FROM ins)
          RETURNING t.result_key
        )
-       SELECT ${LIVE} AS live, (SELECT count(*) FROM ins)::int AS inserted`,
+       SELECT ${LIVE} AS live, (SELECT count(*) FROM ins)::int AS inserted,
+              sessions.session_analysis_source_revision($2, $3, $4) IS NOT DISTINCT FROM $22::text AS current`,
       [job.id, ...scopeParams, job.harness, job.status, job.attempts, job.analysis_version, job.schema_version,
        job.model_version, job.summary_version, job.summary_model_version, job.source_fingerprint, ref?.key ?? null,
-       ref?.sha256 ?? null, ref?.bytes ?? null, job.last_error, job.created_at, job.updated_at, job.completed_at],
+       ref?.sha256 ?? null, ref?.bytes ?? null, job.last_error, job.created_at, job.updated_at, job.completed_at, writer, generation],
     );
     if (!rows[0]?.live) throw new BackfillError("backfill_session_not_live");
+    if (!(rows[0] as { current?: boolean }).current) throw new BackfillError("backfill_generation_changed");
     if (Number(rows[0]?.inserted) !== 1) {
       // Lost the race: the winner must be identical (throws drift and KEEPS the ticket otherwise).
       await verifyJob(db, scope, job, ref);
@@ -294,11 +369,11 @@ export async function applyBackfill(
       if (ref)
         await db.query(
           `/* backfill:retire-lost-race */ DELETE FROM sessions.session_analysis_result_tickets AS t
-            WHERE t.result_key = $5 AND t.job_id = $1::uuid AND t.reason = 'publishing' AND ${LIVE}
+            WHERE t.result_key = $5 AND t.job_id = $1::uuid AND t.reason = 'publishing' AND t.writer_token = $8::uuid AND ${LIVE}
               AND EXISTS (SELECT 1 FROM sessions.session_analysis_jobs_v2 AS j
                            WHERE j.id = $1::uuid AND j.org_id = $2 AND j.workspace_id = $3 AND j.session_id = $4
                              AND j.result_s3_key = $5 AND j.result_sha256 = $6 AND j.result_bytes = $7)`,
-          [job.id, ...scopeParams, ref.key, ref.sha256, ref.bytes],
+          [job.id, ...scopeParams, ref.key, ref.sha256, ref.bytes, writer],
         );
     }
   }
@@ -412,12 +487,19 @@ export async function backfillScope(
     readSp(): Promise<{ sessionId: string; requests: unknown[]; analyses: unknown[] } | null>;
     /** REQUIRED every-version erase (see applyBackfill). */
     eraseObject: (key: string) => Promise<number>;
+    /** Exact-version cleanup of this run's own write (see applyBackfill). */
+    eraseVersion?: (key: string, versionId: string, opts?: { keepIfSole?: boolean }) => Promise<"gone" | "kept_sole">;
+    putTimeoutMs?: number;
   },
   scope: BackfillScope,
   neon: NeonV1Payload,
 ) {
   const plan = planBackfill(scope, neon);
-  const applied = await applyBackfill(deps.db, deps.store, scope, plan, { eraseObject: deps.eraseObject });
+  const applied = await applyBackfill(deps.db, deps.store, scope, plan, {
+    eraseObject: deps.eraseObject,
+    ...(deps.eraseVersion ? { eraseVersion: deps.eraseVersion } : {}),
+    ...(deps.putTimeoutMs !== undefined ? { putTimeoutMs: deps.putTimeoutMs } : {}),
+  });
   const parity = parityEqual(expectedAfterBackfill(neon), await deps.readSp());
   if (!parity.equal) throw new BackfillError("backfill_parity_failed");
   return { ...applied, terminalized: plan.terminalized, parity };
