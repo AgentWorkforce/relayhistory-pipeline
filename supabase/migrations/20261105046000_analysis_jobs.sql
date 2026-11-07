@@ -142,31 +142,6 @@ ALTER TABLE sessions.session_analysis_result_tickets ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.session_analysis_result_tickets FROM PUBLIC, anon, authenticated;
 GRANT ALL ON sessions.session_analysis_result_tickets TO service_role;
 
--- The live pointer set of a session as the read API matches it (canonical id, else raw
--- id), signed over every field canonicalSourceGeneration (src/session-read-api/canonical.ts)
--- binds: the tenant and canonical session id, and per pointer the harness, canonical and
--- physical machine id, user id, storage provider, bucket, manifest key, revision, raw
--- content digest and raw format. Any change to any of them moves it, so a reuse or a
--- publication can never outlive a pointer correction. NULL when no pointer is live.
-CREATE FUNCTION sessions.session_analysis_source_revision(p_org_id text, p_workspace_id text, p_session_id text)
-RETURNS text LANGUAGE sql STABLE
-SET search_path = pg_catalog, sessions, pg_temp AS $revision$
-  -- An unambiguous tuple (a JSON array of arrays; NULL kept as null), never a separator
-  -- join, so no two different pointer sets can sign alike. manifest_etag binds the exact
-  -- manifest version (a manifest replaced at the same revision and raw digest moves it).
-  SELECT CASE WHEN count(*) = 0 THEN NULL ELSE encode(sha256(convert_to(jsonb_build_array(
-           p_org_id, p_workspace_id, p_session_id,
-           jsonb_agg(jsonb_build_array(
-             p.harness, coalesce(p.canonical_session_id, p.session_id),
-             coalesce(p.canonical_machine_id, p.machine_id), p.machine_id, p.user_id,
-             p.storage_provider, p.bucket, p.manifest_key, p.manifest_etag, p.revision,
-             encode(p.content_sha256, 'hex'), p.raw_format)
-             ORDER BY p.manifest_key, p.harness, p.machine_id))::text, 'UTF8')), 'hex') END
-    FROM sessions.session_index AS p
-   WHERE p.org_id = p_org_id AND p.workspace_id = p_workspace_id
-     AND (coalesce(p.canonical_session_id, p.session_id) = p_session_id OR p.session_id = p_session_id)
-     AND p.deleted_at IS NULL;
-$revision$;
 
 -- Proof that a session never had Neon evidence, from sessions-pipeline's own records, so
 -- its analysis is complete from S3 without the legacy export's coverage marker. True only
@@ -213,6 +188,33 @@ BEGIN
   RETURN sessions.session_analysis_neon_free(v_org, p_workspace_id, p_session_id);
 END
 $neon_free_for$;
+
+-- The source revision of a session: the live pointer set as the read API matches it
+-- (canonical id, else raw id), signed over every field canonicalSourceGeneration
+-- (src/session-read-api/canonical.ts) binds: the tenant and canonical session id, and per
+-- pointer the harness, canonical and physical machine id, user id, storage provider,
+-- bucket, manifest key and etag, revision, raw content digest and raw format; PLUS every
+-- input of the never-in-Neon proof (session_analysis_neon_free above): each pointer's
+-- created_at and deleted_at, tombstoned ones included, and the proof's verdict itself. Any
+-- change that can change the evidence or the proof moves it, so neither a reuse nor a
+-- publication can outlive it. An unambiguous tuple (a JSON array; NULL kept), never a
+-- separator join. NULL when no pointer is live.
+CREATE FUNCTION sessions.session_analysis_source_revision(p_org_id text, p_workspace_id text, p_session_id text)
+RETURNS text LANGUAGE sql STABLE
+SET search_path = pg_catalog, sessions, pg_temp AS $revision$
+  SELECT CASE WHEN count(*) FILTER (WHERE p.deleted_at IS NULL) = 0 THEN NULL ELSE encode(sha256(convert_to(jsonb_build_array(
+           p_org_id, p_workspace_id, p_session_id,
+           sessions.session_analysis_neon_free(p_org_id, p_workspace_id, p_session_id),
+           jsonb_agg(jsonb_build_array(
+             p.harness, coalesce(p.canonical_session_id, p.session_id),
+             coalesce(p.canonical_machine_id, p.machine_id), p.machine_id, p.user_id,
+             p.storage_provider, p.bucket, p.manifest_key, p.manifest_etag, p.revision,
+             encode(p.content_sha256, 'hex'), p.raw_format, p.created_at, p.deleted_at)
+             ORDER BY p.manifest_key, p.harness, p.machine_id, p.created_at))::text, 'UTF8')), 'hex') END
+    FROM sessions.session_index AS p
+   WHERE p.org_id = p_org_id AND p.workspace_id = p_workspace_id
+     AND (coalesce(p.canonical_session_id, p.session_id) = p_session_id OR p.session_id = p_session_id);
+$revision$;
 
 -- The admission principal's tenant pin (session_directory_read_api_scope's pattern):
 -- refuses 42501 unless the caller is bulls96_analysis_admit and the transaction's bound
