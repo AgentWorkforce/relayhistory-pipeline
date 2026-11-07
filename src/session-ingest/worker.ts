@@ -33,6 +33,7 @@ import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { createS3Store, objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { log } from "../shared/log.ts";
+import { dbClientErrorFields } from "./db-error-class.ts";
 import { assertNoNeonEdge, neonExitProfile, NeonExitRefusal } from "../shared/neon-exit.ts";
 import { createIngestApp } from "./app.ts";
 import { sqlLedger } from "./ledger-sql.ts";
@@ -229,7 +230,7 @@ export default {
     // One Hyperdrive connection per request; Hyperdrive pools the real ones.
     const client = new pg.Client({ connectionString: env.HYPERDRIVE!.connectionString });
     // A dropped socket surfaces on the next query as a coded 503, never as an uncaught error.
-    client.on("error", (err: Error) => log.error("session ingest db error", { error_code: (err as { code?: string }).code ?? "db_error" }));
+    client.on("error", (err: Error) => log.error("session ingest db error", dbClientErrorFields(err)));
     let connected: Promise<void> | undefined;
     const run = async (text: string, params: unknown[]) => {
       connected ??= client.connect();
@@ -258,7 +259,7 @@ export default {
       return;
     }
     const client = settings && env.HYPERDRIVE ? new pg.Client({ connectionString: env.HYPERDRIVE.connectionString }) : null;
-    client?.on("error", (err: Error) => log.error("session ingest db error", { error_code: (err as { code?: string }).code ?? "db_error" }));
+    client?.on("error", (err: Error) => log.error("session ingest db error", dbClientErrorFields(err)));
     let connected: Promise<void> | undefined;
     const ledger = client
       ? sqlLedger(async (text, params) => {
