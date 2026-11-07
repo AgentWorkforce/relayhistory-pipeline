@@ -2,6 +2,7 @@
  * E3: the transcript eraser repointed to the C3 Supabase privacy authority, and credentials only via stdin.
  * The Supabase side is the real migration stack plus supabase/migrations/20261105041000_ingest_privacy_authority.sql (PGlite).
  */
+import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { openSync, closeSync, readFileSync } from "node:fs";
@@ -17,8 +18,18 @@ import { liveMachineId, liveTargets } from "../neon-s3-erasure/live.ts";
 import { supabaseAuthority, type ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import { authorityKind, authorityUrl, eraserFor } from "../neon-s3-erasure/main.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
+import { postgresTlsOptions } from "../../shared/postgres-tls.ts";
+import { SUPABASE_PROD_CA_2021 } from "../../session-pipeline/supabase-ca.ts";
 import { CredentialRefusal, FORBIDDEN_CREDENTIAL_ENV, parseCredentialDocument, pinnedPgClient, pinnedPgConfig, readStdinCredentials, refuseCredentialEnv, s3Credentials } from "../stdin-credentials.ts";
 import { authorityFixture, epoch } from "../../session-ingest/__tests__/privacy-authority-support.ts";
+
+// These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
+// The suite's OWN mode, pinned per module, re-applied before every test and restored after the file (never leaked).
+const OBLIGATIONS_MODE: "on" | "off" = "on";
+const __modeBefore = process.env.S3X_OBLIGATIONS;
+process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE;
+__modeBeforeEach(() => void (process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE));
+__modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OBLIGATIONS; else process.env.S3X_OBLIGATIONS = __modeBefore; });
 
 setDefaultTimeout(60_000);
 const open: Array<() => unknown> = [];
@@ -175,34 +186,40 @@ describe("no ~/.pgpass fallback: stdin DB URLs carry their own password (dogpatc
       expect(at(`postgres://u:synthetic@${provider}`)).toBeNull();
       const r = recordingPg();
       for (const bad of [`postgres://bulls96_privacy_eraser@${provider}`, `postgres://:synthetic@${provider}`, `postgres://u:@${provider}`, "postgres://u:synthetic@/postgres"])
-        expect(code(() => pinnedPgClient(r.pg, bad, "databaseUrl"))).not.toBeNull();
+        expect(code(() => pinnedPgClient(r.pg, bad, "databaseUrl", mode))).not.toBeNull();
       expect(r.seen.constructed).toBe(0);
     });
 
   test("the final client config is DISCRETE (no connectionString) with the decoded stdin password; no fallback can occur", () => {
     const r = recordingPg();
-    pinnedPgClient(r.pg, "postgres://bulls96_privacy_eraser:p%40ss%3Aw%2Frd%25@db.ref.supabase.co:5432/postgres?sslmode=verify-full", "databaseUrl", { application_name: "x" });
-    expect(r.seen.configs).toEqual([{ application_name: "x", host: "db.ref.supabase.co", port: 5432, user: "bulls96_privacy_eraser", password: "p@ss:w/rd%", database: "postgres", ssl: {} }]);
+    pinnedPgClient(r.pg, "postgres://bulls96_privacy_eraser:p%40ss%3Aw%2Frd%25@db.ref.supabase.co:5432/postgres?sslmode=verify-full", "databaseUrl", "supabase", { application_name: "x" });
+    expect(r.seen.configs).toEqual([{ application_name: "x", host: "db.ref.supabase.co", port: 5432, user: "bulls96_privacy_eraser", password: "p@ss:w/rd%", database: "postgres", ssl: postgresTlsOptions() }]);
+    expect((r.seen.configs[0]!.ssl as { ca: string }).ca).toBe(SUPABASE_PROD_CA_2021);
     expect(r.seen.pgpassFallback).toBe(0);
-    expect(pinnedPgConfig("postgres://u:s@h:6000/d?sslmode=disable", "databaseUrl")).toEqual({ host: "h", port: 6000, user: "u", password: "s", database: "d", ssl: false });
-    expect(code(() => pinnedPgConfig("postgres://u:s@h/d?sslmode=no-verify", "databaseUrl"))).toBe("database_url_sslmode_refused");
-    expect(code(() => pinnedPgConfig("postgres://u:s@h/d?options=-c%20x%3Dy", "databaseUrl"))).toBe("database_url_startup_parameter_refused.options");
-    expect(code(() => pinnedPgConfig("postgres://u:s@h/", "databaseUrl"))).toBe("database_url_database_required");
+    expect(pinnedPgConfig("postgres://u:s@127.0.0.1:6000/d?sslmode=disable", "databaseUrl", "neon")).toEqual({ host: "127.0.0.1", port: 6000, user: "u", password: "s", database: "d", ssl: false });
+    expect(pinnedPgConfig("postgres://u:s@h:6000/d?sslmode=verify-full", "databaseUrl", "neon")).toEqual({ host: "h", port: 6000, user: "u", password: "s", database: "d", ssl: { rejectUnauthorized: true } });
+    // TLS is always explicit: no sslmode (pg would read PGSSLMODE), a weaker mode, or disable for a non-loopback host: refused.
+    expect(code(() => pinnedPgConfig("postgres://u:s@h/d", "databaseUrl", "neon"))).toBe("database_url_sslmode_required");
+    for (const m of ["no-verify", "require", "prefer", "verify-ca", "allow"]) expect(code(() => pinnedPgConfig(`postgres://u:s@h/d?sslmode=${m}`, "databaseUrl", "neon"))).toBe("database_url_sslmode_refused");
+    expect(code(() => pinnedPgConfig("postgres://u:s@db.ref.supabase.co/d?sslmode=disable", "databaseUrl", "neon"))).toBe("database_url_sslmode_refused");
+    for (const k of ["PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGSSLNEGOTIATION", "PGTARGETSESSIONATTRS"]) expect(code(() => refuseCredentialEnv({ [k]: "require" }))).toBe(`credential_env_refused.${k}`);
+    expect(code(() => pinnedPgConfig("postgres://u:s@h/d?options=-c%20x%3Dy", "databaseUrl", "neon"))).toBe("database_url_startup_parameter_refused.options");
+    expect(code(() => pinnedPgConfig("postgres://u:s@h/", "databaseUrl", "neon"))).toBe("database_url_database_required");
     // A caller cannot smuggle identity or a connectionString through the extra options.
-    for (const k of ["connectionString", "password", "user", "host"]) expect(code(() => pinnedPgClient(r.pg, "postgres://u:s@h/d", "databaseUrl", { [k]: "x" }))).toBe("database_url_config_override_refused");
+    for (const k of ["connectionString", "password", "user", "host"]) expect(code(() => pinnedPgClient(r.pg, "postgres://u:s@h/d?sslmode=verify-full", "databaseUrl", "neon", { [k]: "x" }))).toBe("database_url_config_override_refused");
   });
 
   test("a client whose resolved password differs from the stdin one (pg would consult ~/.pgpass) is refused pre-connect", () => {
     const dropped = recordingPg((c) => void (c.password = ""));
-    expect(code(() => pinnedPgClient(dropped.pg, "postgres://u:s@h/d", "databaseUrl"))).toBe("database_url_password_not_pinned");
+    expect(code(() => pinnedPgClient(dropped.pg, "postgres://u:s@h/d?sslmode=verify-full", "databaseUrl", "neon"))).toBe("database_url_password_not_pinned");
     expect(dropped.seen.pgpassFallback).toBe(1); // the sentinel saw the fallback condition, and the client was refused
     const swapped = recordingPg((c) => void (c.password = "other"));
-    expect(code(() => pinnedPgClient(swapped.pg, "postgres://u:s@h/d", "databaseUrl"))).toBe("database_url_password_not_pinned");
+    expect(code(() => pinnedPgClient(swapped.pg, "postgres://u:s@h/d?sslmode=verify-full", "databaseUrl", "neon"))).toBe("database_url_password_not_pinned");
   });
 
   test("real pg: the pinned client resolves the stdin password; a connectionString-only client resolves NONE (the fallback path)", async () => {
     const { default: pg } = await import("pg");
-    const pinned = pinnedPgClient(pg, "postgres://bulls96_privacy_eraser:p%40ss@127.0.0.1:9/postgres", "databaseUrl") as unknown as { password: unknown; connectionParameters: { password: unknown } };
+    const pinned = pinnedPgClient(pg, "postgres://bulls96_privacy_eraser:p%40ss@127.0.0.1:9/postgres?sslmode=disable", "databaseUrl", "supabase") as unknown as { password: unknown; connectionParameters: { password: unknown } };
     expect([pinned.password, pinned.connectionParameters.password]).toEqual(["p@ss", "p@ss"]);
     // What ff29da7f built for a password-less stdin URL: pg resolves null, i.e. it WOULD read ~/.pgpass at auth time.
     const legacy = new pg.Client({ connectionString: "postgres://bulls96_privacy_eraser@127.0.0.1:9/postgres" }) as unknown as { password: unknown };
@@ -223,6 +240,22 @@ describe("no ~/.pgpass fallback: stdin DB URLs carry their own password (dogpatc
         expect(JSON.stringify(r.lines)).not.toContain("127.0.0.1");
       }
   }, 60_000);
+
+  test("handoff CLI: BOTH full discrete configs (TLS included) are validated before EITHER connection", async () => {
+    const EPOCH = "3".repeat(64);
+    // A valid, reachable-looking Supabase URL plus a Neon URL without sslmode: refused by name, the Supabase side never
+    // dialled (a connection attempt to 127.0.0.1:1 would surface as a connect error instead).
+    const r = await runWith(handoff, ["sync-owned", "--epoch", EPOCH], {
+      supabaseUrl: "postgres://postgres:synthetic@127.0.0.1:1/postgres?sslmode=disable",
+      neonUrl: "postgres://ro:synthetic@127.0.0.1:9/neondb",
+    });
+    expect([r.code, r.lines.at(-1)?.refused]).toEqual([1, "neon_url_sslmode_required"]);
+    const r2 = await runWith(handoff, ["sync-owned", "--epoch", EPOCH], {
+      supabaseUrl: "postgres://postgres:synthetic@127.0.0.1:1/postgres",
+      neonUrl: "postgres://ro:synthetic@127.0.0.1:9/neondb?sslmode=disable",
+    });
+    expect([r2.code, r2.lines.at(-1)?.refused]).toEqual([1, "supabase_url_sslmode_required"]);
+  }, 30_000);
 
   test("handoff CLI: password-less supabaseUrl / neonUrl are refused before EITHER connection", async () => {
     const EPOCH = "3".repeat(64);
@@ -297,7 +330,7 @@ async function world() {
   await f.seal();
   const store = createFsStore({ root: await tmp() });
   for (const k of [...LIVE, POINTER]) await store.put(objectKey(k), new TextEncoder().encode("x"));
-  const state = new SyncState(join(await tmp(), "s.sqlite"));
+  const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
   open.push(() => state.close());
   // The job's read-only connection: the same database (an owner session, as the operator's login would be).
   const authority = supabaseAuthority(f.queryable);
@@ -479,7 +512,7 @@ describe("supabase eraser covers post-cutover sessions (review P0) and runs leas
     const q = (sql: string) => w.f.db.query(sql).then((r) => (r.rows[0] as any).n as number);
     expect(await q("SELECT count(*)::int AS n FROM sessions.upload_deletions WHERE session_id='POSTCUT'")).toBe(1);
     expect(await q("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_deletions WHERE session_id='POSTCUT'")).toBe(0);
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     open.push(() => state.close());
     // Past the staged-object redrive window, so staged batch copies are erased in the same sweep.
     const job = new ErasureJob(supabaseAuthority(w.f.queryable), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, () => Date.now() + 49 * 60 * 60 * 1000, async () => {});

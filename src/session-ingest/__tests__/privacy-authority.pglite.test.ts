@@ -646,6 +646,27 @@ test("analysis ABI: the begin's refusal is the ABI mismatch itself (55000), call
   expect([e?.code, e?.message]).toEqual(["55000", "frozen source: analysis purge ABI mismatch"]);
 });
 
+/** Issue #310 (relayhistory-pipeline): each 046000 footprint clause in isolation (and the no-grant variant) refuses
+ * with exactly 55000 at begin, for a RESET and for a DISABLE. */
+for (const [name, ddl] of [
+  ["no-grant (both purges, no grant helper)", `CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;
+    CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text,p_sessions jsonb) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;`],
+  ["purge-authority table only", "CREATE TABLE sessions.session_analysis_purge_authority(txid bigint, org_id text, workspace_id text, user_id text)"],
+  ["grant-name only (another overload)", "CREATE FUNCTION sessions.session_analysis_purge_grant(p_x jsonb) RETURNS void LANGUAGE sql AS $$ SELECT $$"],
+] as const)
+  test(`#310 analysis ABI footprint (${name}): a reset AND a disable begin refuse with exactly 55000 "analysis purge ABI mismatch"`, async () => {
+    const f = await setup();
+    const n = await fakeNeon();
+    open.push(n.close);
+    await activateFrom(f, n);
+    const o = await origin();
+    await f.db.exec(ddl);
+    for (const [kind, payload] of [["reset", { request_id: "footprint" }], ["selection", { origin_id: o, sessions: [{ source: "claude", session_id: "S" }], enabled: false }]] as const) {
+      const e = await f.rpc("ingest_privacy_authority_begin", { epoch, tenant: TENANT, kind, payload }).then(() => null, (x: any) => x);
+      expect([kind, e?.code, e?.message]).toEqual([kind, "55000", "frozen source: analysis purge ABI mismatch"]);
+    }
+  });
+
 test("digest ABI fail-closed: 045000's table present without purge_daily_digest_narratives(text,text) aborts the reset", async () => {
   const f = await setup();
   const n = await fakeNeon();

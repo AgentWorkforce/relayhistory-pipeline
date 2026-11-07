@@ -31,13 +31,21 @@
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
-import { SyncState } from "../neon-s3-sync/state.ts";
+import { SyncState, obligationsFlag } from "../neon-s3-sync/state.ts";
 import { errorCode } from "../neon-s3-sync/sync.ts";
 import { eraserDatabaseUrl, pinnedPgClient, readStdinCredentials, refuseCredentialEnv, s3Credentials, type S3Credentials } from "../stdin-credentials.ts";
 import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
-import { createS3Eraser, type Eraser } from "./eraser.ts";
+import { createS3Eraser, type Eraser, type PagedEraser } from "./eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "./job.ts";
 import { phaseSettings, poolConfig, startBabysitterPhase, type BabysitterPhase } from "./babysitter-phase.ts";
+
+/**
+ * S3X_OBLIGATIONS (default OFF) gates the new exporter-obligation protocol, its schema and genesis bootstrap. The
+ * strict canonical paged eraser runs in BOTH modes (safety hardening, unflagged); off it runs without obligations.
+ */
+export function obligationsEnabled(e: (k: string) => string | undefined = (k) => process.env[k]): boolean {
+  return obligationsFlag(e("S3X_OBLIGATIONS"));
+}
 
 const env = (k: string, d?: string) => process.env[k]?.trim() || d;
 const flag = (name: string) => process.argv.includes(`--${name}`);
@@ -45,7 +53,7 @@ function log(fields: Record<string, unknown>) {
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), service: "neon-s3-erasure", ...fields })}\n`);
 }
 
-export function eraserFor(execute: boolean, creds: S3Credentials | undefined, e: (k: string, d?: string) => string | undefined = env): Eraser {
+export function eraserFor(execute: boolean, creds: S3Credentials | undefined, e: (k: string, d?: string) => string | undefined = env): Eraser & PagedEraser {
   if (!execute)
     return {
       eraseObject: async () => 0,
@@ -53,6 +61,9 @@ export function eraserFor(execute: boolean, creds: S3Credentials | undefined, e:
       eraseSessionAnyDate: async () => ({ deleted: 0, kept: 0 }),
       eraseObjectBefore: async () => ({ deleted: 0, kept: 0 }),
       listKeys: async () => [],
+      // A dry run never reaches a delete path (the sweep returns before erasing); refuse loudly if it ever did.
+      eraseStep: async () => { throw Object.assign(new Error("dry run: no erasure"), { code: "dry_run" }); },
+      verifyErased: async () => { throw Object.assign(new Error("dry run: no erasure"), { code: "dry_run" }); },
     };
   const bucket = e("S3X_BUCKET");
   if (!bucket || e("S3X_EXPECT_BUCKET") !== bucket) throw new Error("S3X_BUCKET must equal S3X_EXPECT_BUCKET (write guard)");
@@ -89,10 +100,11 @@ export async function main() {
   const eraser = eraserFor(execute, creds.eraser === undefined ? undefined : s3Credentials(creds.eraser, "eraser"));
   delete creds.databaseUrl;
   delete creds.eraser;
-  const state = new SyncState(env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!);
+  const obligations = obligationsEnabled();
+  const state = new SyncState(env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!, { obligations });
   const { default: pg } = await import("pg");
   // The password is pinned from the stdin URL: pg can never fall back to ~/.pgpass (a credential on disk).
-  const client = pinnedPgClient(pg, url, "databaseUrl", { application_name: `96bulls-${kind}-s3-erasure` });
+  const client = pinnedPgClient(pg, url, "databaseUrl", kind, { application_name: `96bulls-${kind}-s3-erasure` });
   await client.connect();
   let stop = false;
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => void (stop = true));
@@ -113,8 +125,8 @@ export async function main() {
     if (kind === "supabase") await assertEraserIdentity(db);
     const authority = kind === "supabase" ? supabaseAuthority(db) : neonAuthority(db);
     const job = new ErasureJob(authority, state, eraser, log, cfg, Date.now, undefined, () => stop);
-    log({ message: "start", execute, authority: kind, recognize_legacy: cfg.recognizeLegacy });
-    // A dry run changes nothing: it sweeps and reports what it would erase.
+    log({ message: "start", execute, authority: kind, recognize_legacy: cfg.recognizeLegacy, obligations });
+    // A dry run deletes nothing and marks nothing done: it sweeps and reports what it would erase.
     if (!execute) {
       await job.sweep({ dryRun: true });
       job.progress(true);
