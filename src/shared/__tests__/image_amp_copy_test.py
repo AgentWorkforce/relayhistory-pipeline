@@ -2,6 +2,7 @@ import base64
 import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -49,6 +50,39 @@ class AmpImageCopyTests(unittest.TestCase):
         self.assertTrue(receipt["cloudflare_image"].endswith("@"+self.native))
         self.assertNotIn("CF_REGISTRY_TOKEN",receipt)
         self.assertEqual(receipt["registry_credential_expires_at"],4600)
+    def test_runner_skopeo_1_13_supports_copy_arguments_and_reports_only_fixed_phases(self):
+        def skopeo_1_13(args,**options):
+            if "--image-parallel-copies" in args:
+                raise subprocess.CalledProcessError(1,args,stderr=b"unknown flag: --image-parallel-copies")
+            return self.fake_run(args,**options)
+        progress=io.StringIO()
+        with contextlib.redirect_stdout(progress):
+            receipt=module.copy_image(self.env,skopeo_1_13,self.auth,lambda:1000)
+        self.assertTrue(receipt["cloudflare_image"].endswith("@"+self.native))
+        self.assertEqual(progress.getvalue().splitlines(),[
+            "Amp registry copy phase: source-copy",
+            "Amp registry copy phase: source-verification",
+            "Amp registry copy phase: destination-copy",
+            "Amp registry copy phase: tag-verification",
+            "Amp registry copy phase: digest-verification",
+        ])
+    def test_destination_failure_reports_phase_without_client_diagnostics(self):
+        sensitive=b"https://registry.example/upload?credential=fixture-private-upload-capability"
+        def failed(args,**options):
+            if args[1]=="copy" and args[-1].startswith("docker://registry.cloudflare.com/"):
+                self.assertEqual(options.get("stdout"),subprocess.PIPE)
+                self.assertEqual(options.get("stderr"),subprocess.PIPE)
+                raise subprocess.CalledProcessError(17,args,output=sensitive,stderr=sensitive)
+            return self.fake_run(args,**options)
+        progress,diagnostics=io.StringIO(),io.StringIO()
+        with contextlib.redirect_stdout(progress),contextlib.redirect_stderr(diagnostics):
+            with self.assertRaises(subprocess.CalledProcessError) as caught:
+                module.copy_image(self.env,failed,self.auth,lambda:1000)
+        self.assertEqual(progress.getvalue().splitlines()[-1],"Amp registry copy phase: destination-copy")
+        self.assertNotIn(sensitive.decode(),progress.getvalue()+diagnostics.getvalue())
+        self.assertEqual(diagnostics.getvalue(),"")
+        self.assertEqual(caught.exception.stdout,sensitive)
+        self.assertEqual(caught.exception.stderr,sensitive)
     def test_expired_or_substituted_authority_never_reaches_registry(self):
         for key,value in [("SOURCE_SHA","main"),("CLOUDFLARE_ACCOUNT_ID","e"*32),("GH_TOKEN",""),("CF_REGISTRY_TOKEN","bad"),("GITHUB_ACTOR","other")]:
             with self.assertRaises((RuntimeError,ValueError)):

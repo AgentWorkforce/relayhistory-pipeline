@@ -77,9 +77,11 @@ def copy_image(env, run=subprocess.run, auth=memory_auth, clock=time.time):
     with auth(env["GITHUB_ACTOR"], env["GH_TOKEN"], env["CF_REGISTRY_TOKEN"]) as (fd, path):
         options = {"check": True, "pass_fds": (fd,), "env": child_env,
                    "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+        print("Amp registry copy phase: source-copy", flush=True)
         run(["skopeo", "copy", "--preserve-digests", "--authfile", path,
              f"docker://ghcr.io/agentworkforce/96bulls-services@{native}",
              f"oci:{layout}:approved"], timeout=300, **options)
+        print("Amp registry copy phase: source-verification", flush=True)
         raw = (layout / "blobs" / "sha256" / native[7:]).read_bytes()
         if "sha256:" + hashlib.sha256(raw).hexdigest() != native:
             raise RuntimeError("Source OCI manifest differs from the signed native descriptor")
@@ -88,10 +90,13 @@ def copy_image(env, run=subprocess.run, auth=memory_auth, clock=time.time):
         config = json.loads(config.stdout)
         if config.get("os") != "linux" or config.get("architecture") != "amd64":
             raise RuntimeError("Native image platform differs from its verified descriptor")
+        print("Amp registry copy phase: destination-copy", flush=True)
         token_expiry(env["CF_REGISTRY_TOKEN"], clock())
-        run(["skopeo", "copy", "--preserve-digests", "--image-parallel-copies", "1",
+        run(["skopeo", "copy", "--preserve-digests",
              "--authfile", path, f"oci:{layout}:approved", target], timeout=600, **options)
-        for reference in [target, f"docker://{repo}@{native}"]:
+        for phase, reference in [("tag-verification", target),
+                                 ("digest-verification", f"docker://{repo}@{native}")]:
+            print("Amp registry copy phase:", phase, flush=True)
             result = run(["skopeo", "inspect", "--raw", "--authfile", path, reference],
                          timeout=60, **options)
             if not isinstance(result.stdout, bytes) or "sha256:" + hashlib.sha256(result.stdout).hexdigest() != native:
