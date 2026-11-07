@@ -28,6 +28,7 @@ function api(over: { analysis?: Partial<AnalysisDeps> | null; rpc?: ReadRpc; sco
       ? undefined
       : {
           read: async (_i, s) => (seen.push(["read", s]), over.rpc ?? { outcome: "ok", sessionId: "s-1", requests: [REQ], analyses: [row()] }),
+          harnesses: async () => ["claude"],
           result: async (ref) => (seen.push(["result", ref.key]), { schemaVersion: 1, analysisVersion: "v", sourceFingerprint: "f", analysis: { title: "T" }, durationMs: 1 }),
           ...over.analysis,
         };
@@ -64,17 +65,22 @@ describe("GET /v1/sessions/:id/analysis", () => {
     expect(seen).toEqual([["read", "s-1"], ["result", KEY]]);
   });
 
-  test("a native result gets the brief half; a backfilled one is served verbatim", async () => {
-    const brief = { title: "B", description: "D", state: "completed" };
-    const merged = await json(await api({ analysis: { brief: () => async () => brief } }).call("GET"));
-    expect(merged.analyses[0].result.brief).toEqual(brief);
-    const backfill = await json(
-      await api({
-        analysis: { brief: () => async () => brief },
-        rpc: { outcome: "ok", sessionId: "s-1", requests: [], analyses: [row({ origin: "neon_backfill" })] },
-      }).call("GET"),
-    );
-    expect(backfill.analyses[0].result.brief).toBeUndefined();
+  test("the stored result is served verbatim: no brief of another revision is merged in", async () => {
+    const stored = { schemaVersion: 1, analysis: { title: "T" }, brief: { title: "B", inputFingerprint: "x" } };
+    const b = await json(await api({ analysis: { result: async () => stored } }).call("GET"));
+    expect(b.analyses[0].result).toEqual(stored);
+  });
+
+  test("relayhistory selectedSource: a mismatched or ambiguous source is 400 source_mismatch", async () => {
+    const at = (harnesses: string[], path: string) => api({ analysis: { harnesses: async () => harnesses } }).call("GET", path);
+    const base = "/v1/sessions/s-1/analysis?workspace=ws-a";
+    const mismatch = await at(["claude"], base + "&source=codex");
+    expect([mismatch.status, (await json(mismatch)).error.code]).toEqual([400, "source_mismatch"]);
+    expect((await at(["claude", "codex"], base)).status).toBe(400);
+    expect((await at(["claude"], base + "&source=claude")).status).toBe(200);
+    expect((await at([], base + "&source=claude")).status).toBe(200);
+    const post = await api({ scopes: ["rth:read", "rth:sync"], analysis: { harnesses: async () => ["claude", "codex"], admit: async () => ({ outcome: "accepted", request: REQ }) } }).call("POST");
+    expect(post.status).toBe(400);
   });
 
   test("queued and failed analyses carry a null result and read no object", async () => {

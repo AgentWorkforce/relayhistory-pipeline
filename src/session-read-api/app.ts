@@ -52,7 +52,7 @@ import { CursorError, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
 import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
-import { AnalysisReadError, admitResponse, assembleAnalyses, type AdmitRpc, type BriefLookup, type ReadRpc } from "../session-analysis/read.ts";
+import { AnalysisReadError, admitResponse, assembleAnalyses, type AdmitRpc, type ReadRpc } from "../session-analysis/read.ts";
 import type { StoredAnalysisResult } from "../session-analysis/processor.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
@@ -111,8 +111,8 @@ export interface AnalysisDeps {
   admit?(identity: VerifiedIdentity, sessionId: string): Promise<AdmitRpc>;
   /** Read and verify one result object (session-analysis/results.ts readAnalysisResult). */
   result(ref: StoredAnalysisResult): Promise<unknown>;
-  /** The native brief half (session_briefs, lane F2); absent = analyses carry no `brief`. */
-  brief?(identity: VerifiedIdentity, sessionId: string): BriefLookup;
+  /** Live harnesses of the session in the identity's workspace (relayhistory selectedSource). */
+  harnesses(identity: VerifiedIdentity, sessionId: string): Promise<string[]>;
 }
 
 export interface TurnsDeps {
@@ -686,15 +686,23 @@ export function createReadApi(deps: ReadApiDeps) {
    * admission principal (deps.analysis.admit); without it POST is 501
    * `analysis_admission_not_configured`. A missing or altered result object is a 503.
    */
-  const analysisSession = (c: Context, identity: VerifiedIdentity) => {
+  const sourceMismatch = () => new HttpError(400, "source_mismatch", "Session source does not match or is ambiguous");
+  /**
+   * relayhistory routes/session-analysis.ts selectedSource: a session id held by more than
+   * one live harness, or a `source` that is not its harness, is 400 source_mismatch.
+   */
+  const analysisSession = async (c: Context, identity: VerifiedIdentity) => {
     attestWorkspace(c, identity);
     requireCanary(identity, "analysis");
-    if (!deps.analysis) throw unsupported("analysis_not_configured");
+    const analysis = deps.analysis;
+    if (!analysis) throw unsupported("analysis_not_configured");
     const sessionId = c.req.param("sessionId");
     if (!sessionId || sessionId.length > MAX_ID_CHARS) throw bad("sessionId is not valid");
     const source = single(c, "source");
-    if (source !== undefined && source.length > MAX_ID_CHARS) throw bad("source is not valid");
-    return { analysis: deps.analysis, sessionId };
+    if (source !== undefined && (source.length > 128 || /[\x00-\x1f\x7f]/u.test(source))) throw sourceMismatch();
+    const harnesses = [...new Set(await analysis.harnesses(identity, sessionId))];
+    if (harnesses.length > 1 || (source && harnesses.length === 1 && harnesses[0] !== source)) throw sourceMismatch();
+    return { analysis, sessionId };
   };
   const notFound = (c: Context) =>
     c.json({ error: { code: "not_found", message: "Session not found" }, correlationId: c.get("correlationId") }, 404);
@@ -702,13 +710,10 @@ export function createReadApi(deps: ReadApiDeps) {
   app.get("/v1/sessions/:sessionId/analysis", async (c) => {
     try {
       const identity = c.get("identity");
-      const { analysis, sessionId } = analysisSession(c, identity);
+      const { analysis, sessionId } = await analysisSession(c, identity);
       const rpc = await analysis.read(identity, sessionId);
       if (rpc.outcome !== "ok" || rpc.sessionId !== sessionId) return notFound(c);
-      const body = await assembleAnalyses(rpc, {
-        result: (ref) => analysis.result(ref),
-        ...(analysis.brief ? { brief: analysis.brief(identity, sessionId) } : {}),
-      });
+      const body = await assembleAnalyses(rpc, { result: (ref) => analysis.result(ref) });
       return c.json({ ...body, correlationId: c.get("correlationId") });
     } catch (error) {
       if (error instanceof AnalysisReadError || (error as { name?: string })?.name === "AnalysisResultError") {
@@ -722,7 +727,7 @@ export function createReadApi(deps: ReadApiDeps) {
   app.post("/v1/sessions/:sessionId/analysis", async (c) => {
     try {
       const identity = c.get("identity");
-      const { analysis, sessionId } = analysisSession(c, identity);
+      const { analysis, sessionId } = await analysisSession(c, identity);
       // relayhistory routes/session-analysis.ts:174-177: POST needs rth:read and rth:sync.
       if (!identity.scopes.includes("rth:sync"))
         return c.json({ error: { code: "forbidden", message: "missing required scope: rth:sync" }, correlationId: c.get("correlationId") }, 403);
