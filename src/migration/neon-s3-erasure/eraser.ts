@@ -458,15 +458,21 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
 export function storeEraser(store: ObjectStore): Eraser & PagedEraser {
   // Unversioned: one "null" version per key, pages of 1000 keys after the key marker.
   const fetchPage: PageFetcher = async (prefix, keyMarker) => {
-    const keys: string[] = [];
+    const items: { key: string; lastModified?: number }[] = [];
     let cursor: string | undefined;
     do {
       const page = await store.list(objectKey(prefix.slice(0, -1)), cursor);
-      keys.push(...page.items.map((i) => String(i.key)).filter((k) => k.startsWith(prefix)));
+      for (const i of page.items) {
+        const key = String(i.key);
+        if (!key.startsWith(prefix)) continue;
+        const at = i.lastModified instanceof Date ? i.lastModified.getTime() : NaN;
+        // Same shape as the S3 eraser's entries: lastModified only when readable.
+        items.push({ key, ...(Number.isFinite(at) ? { lastModified: at } : {}) });
+      }
       cursor = page.nextCursor;
     } while (cursor);
-    const after = keys.sort(cmpC).filter((k) => keyMarker === undefined || cmpC(k, keyMarker) > 0);
-    const entries = after.slice(0, 1000).map((key) => ({ key, versionId: "null", latest: true, deleteMarker: false }));
+    const after = items.sort((a, b) => cmpC(a.key, b.key)).filter((i) => keyMarker === undefined || cmpC(i.key, keyMarker) > 0);
+    const entries = after.slice(0, 1000).map((i) => ({ ...i, versionId: "null", latest: true, deleteMarker: false }));
     const truncated = after.length > 1000;
     return truncated ? { entries, truncated, nextKey: entries[entries.length - 1]!.key, nextVersion: "null" } : { entries, truncated };
   };
