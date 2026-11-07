@@ -104,7 +104,7 @@ export interface TurnsDeps {
    * The database half of the never-in-Neon proof (sessions.session_neon_free_for, read role,
    * tenant bound). Absent: a scope without the export's coverage marker is refused.
    */
-  neonFree?(scope: { orgId: string; workspaceId: string; sessionId: string }): Promise<boolean>;
+  neonFree?(scope: { orgId: string; workspaceId: string; sessionId: string }, signal: AbortSignal): Promise<boolean>;
   /** Below Cloud's 4 s read timeout. Default 3000. */
   deadlineMs?: number;
 }
@@ -613,8 +613,20 @@ export function createReadApi(deps: ReadApiDeps) {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const snapshots = await Promise.race([
-        Promise.all(live.map(async (h) => ({ harness: h.harness, snapshot: await turns.source({ ...scope, source: h.harness }, controller.signal) }))),
+      // ONE deadline for the whole read, the database proof included: the proof runs inside the
+      // race, takes the same signal, and the result is refused if the deadline fired at any point
+      // (a late proof is never accepted after the abort). No extension.
+      const { snapshots, proof } = await Promise.race([
+        (async () => {
+          const snapshots = await Promise.all(
+            live.map(async (h) => ({ harness: h.harness, snapshot: await turns.source({ ...scope, source: h.harness }, controller.signal) })),
+          );
+          // Only a scope without the coverage marker needs the never-in-Neon proof.
+          const proof = snapshots.some((s) => !s.snapshot.legacyCoverage) && turns.neonFree && !controller.signal.aborted
+            ? await turns.neonFree(scope, controller.signal)
+            : false;
+          return { snapshots, proof };
+        })(),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             reject(new CanonicalReadError("deadline"));
@@ -622,8 +634,7 @@ export function createReadApi(deps: ReadApiDeps) {
           }, turns.deadlineMs ?? 3000);
         }),
       ]);
-      // Only a scope without the coverage marker needs the never-in-Neon proof.
-      const proof = snapshots.some((s) => !s.snapshot.legacyCoverage) && turns.neonFree ? await turns.neonFree(scope) : false;
+      if (controller.signal.aborted) throw new CanonicalReadError("deadline");
       const proven = snapshots.map((s) => ({ ...s, neverInNeon: neverInNeon(proof, s.snapshot.neonDerived === true) }));
       return { rows: turnRows(scope, proven, source), erased: false };
     } finally {

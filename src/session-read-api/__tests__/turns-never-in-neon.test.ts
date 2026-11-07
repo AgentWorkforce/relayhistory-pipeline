@@ -24,7 +24,7 @@ function api(rows: CanonicalRows, neonFree?: TurnsDeps["neonFree"]) {
   const turns: TurnsDeps = {
     harnesses: async () => [{ harness: "claude", pointers: 1, live: 1 }],
     source: async () => rows,
-    ...(neonFree ? { neonFree: async (scope) => (asked.push(scope), neonFree(scope)) } : {}),
+    ...(neonFree ? { neonFree: async (scope, signal) => (asked.push(scope), neonFree(scope, signal)) } : {}),
   };
   const app = createReadApi({
     verify: async () => identity,
@@ -66,5 +66,49 @@ describe("turns: the never-in-Neon proof (shared with the session analysis)", ()
   test("default-preserving: with no proof wired, a coverage-less scope is refused exactly as before", async () => {
     const r = await api({ rows: [TURN], legacyCoverage: null }).get();
     expect([r.status, (await body(r)).error.reason]).toEqual([501, "turns_unknown"]);
+  });
+});
+
+describe("#301 (2): the database proof is bound to the route's single deadline", () => {
+  const deadlineApi = (neonFree: TurnsDeps["neonFree"]) => {
+    const turns: TurnsDeps = {
+      harnesses: async () => [{ harness: "claude", pointers: 1, live: 1 }],
+      source: async () => ({ rows: [TURN], legacyCoverage: null, neonDerived: false }),
+      neonFree,
+      deadlineMs: 50,
+    };
+    const app = createReadApi({
+      verify: async () => identity,
+      ch: { database: "x", async command() {}, async insert() {}, async select() { throw new Error("no ClickHouse"); } },
+      liveness: { async erased() { return new Set(); }, async livePointerSessions() { return new Set(); }, async sessionStart() { return { pointers: 0, live: 0, createdAtMs: null }; } },
+      completeSinceMs: 0,
+      directoryWorkspaces: new Set(["ws-a"]),
+      turns,
+    });
+    return () => app.request("/v1/sessions/s-1/turns?workspace=ws-a", { headers: { authorization: "Bearer t" } });
+  };
+
+  test("an unresolved proof times out at the deadline (refused, not extended) and its signal is aborted", async () => {
+    let signal: AbortSignal | undefined;
+    const started = Date.now();
+    const r = await deadlineApi(async (_scope, s) => {
+      signal = s;
+      return new Promise<boolean>(() => {});
+    })();
+    expect([r.status, (await body(r)).error.reason]).toEqual([501, "turns_canonical_deadline"]);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(signal?.aborted).toBe(true);
+  });
+
+  test("a proof that resolves TRUE only after the abort is refused", async () => {
+    const r = await deadlineApi(
+      (_scope, s) => new Promise<boolean>((resolve) => s.addEventListener("abort", () => setTimeout(() => resolve(true), 5))),
+    )();
+    expect([r.status, (await body(r)).error.reason]).toEqual([501, "turns_canonical_deadline"]);
+  });
+
+  test("a proof that resolves TRUE inside the deadline is served", async () => {
+    const r = await deadlineApi(async () => true)();
+    expect(r.status).toBe(200);
   });
 });

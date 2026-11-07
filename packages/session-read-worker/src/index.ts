@@ -260,9 +260,16 @@ export function turnsDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>
     harnesses: sqlSessionHarnesses(run),
     source: timing.source,
     // The never-in-Neon proof's database half, as the read role, tenant bound by `run`.
-    neonFree: async (scope) =>
-      (await run(scope.orgId, scope.workspaceId, (q) => q.query<{ free: boolean }>(NEON_FREE_FOR_READ_SQL, [scope.workspaceId, scope.sessionId])))
-        .rows[0]?.free === true,
+    // Bound to the route's deadline: never started after the abort, and a result that arrives
+    // after it is discarded (the route also refuses it). An in-flight statement is bounded by
+    // the reader role's statement_timeout (2 s); the abort cannot cancel it mid-flight.
+    neonFree: async (scope, signal) => {
+      if (signal.aborted) throw new Error("neon_free aborted");
+      const free = (await run(scope.orgId, scope.workspaceId, (q) => q.query<{ free: boolean }>(NEON_FREE_FOR_READ_SQL, [scope.workspaceId, scope.sessionId])))
+        .rows[0]?.free === true;
+      if (signal.aborted) throw new Error("neon_free aborted");
+      return free;
+    },
   };
 }
 

@@ -129,6 +129,8 @@ export interface AnalysisJobStoreDeps {
   store: ObjectStore;
   /** The anchor manifest key of the job's session (its first live pointer). */
   anchorManifestKey(job: AnalysisJob, harness: string): Promise<string>;
+  /** The result PUT's hard deadline (default ANALYSIS_PUT_TIMEOUT_MS, well inside the lease). */
+  putTimeoutMs?: number;
 }
 
 export function postgresAnalysisJobStore(deps: AnalysisJobStoreDeps): AnalysisJobStore {
@@ -160,7 +162,7 @@ export function postgresAnalysisJobStore(deps: AnalysisJobStoreDeps): AnalysisJo
       const { rows } = await deps.db.query<{ result_key: string }>(RESERVE_SQL, [job.id, job.leaseToken, job.sourceRevision, key]);
       return rows[0]?.result_key ?? null;
     },
-    put: (key, bytes, sha256) => putAnalysisResult(deps.store, key, bytes, sha256),
+    put: (key, bytes, sha256) => putAnalysisResult(deps.store, key, bytes, sha256, deps.putTimeoutMs),
     async complete({ job, output, stored }) {
       const { rows } = await deps.db.query<{ n: number }>(COMPLETE_SQL, [
         job.id,
@@ -198,23 +200,19 @@ export async function sweepAnalysisTickets(
     /**
      * Every-version erase of exactly one key (src/migration/neon-s3-erasure/eraser.ts
      * eraseObject): the transcript bucket is versioned, so a plain DELETE would only add a
-     * delete marker and leave the bytes. Required in production; absent = a plain delete
-     * (unversioned stores and tests only).
+     * delete marker and leave the bytes. REQUIRED: there is no plain-delete fallback.
      */
-    eraseObject?: (key: string) => Promise<number>;
+    eraseObject: (key: string) => Promise<number>;
   },
 ): Promise<number> {
+  if (typeof options?.eraseObject !== "function") throw new Error("analysis_sweep_eraser_required");
   return options.transact(async (tx) => {
     const { rows } = await tx.query<{ result_key: string }>(SWEEP_SQL, [options.graceSeconds ?? TICKET_GRACE_SECONDS, options.limit ?? 50]);
     for (const { result_key } of rows) {
-      if (options.eraseObject) {
-        await options.eraseObject(result_key);
-        // Acknowledged only when a second inventory finds no version or marker left: until
-        // then the ticket stays, and the next sweep retries.
-        if ((await options.eraseObject(result_key)) !== 0) throw new Error("analysis_sweep_versions_remain");
-      } else {
-        await store.delete(objectKey(result_key));
-      }
+      await options.eraseObject(result_key);
+      // Acknowledged only when a second inventory finds no version or marker left: until
+      // then the ticket stays (the transaction rolls back), and the next sweep retries.
+      if ((await options.eraseObject(result_key)) !== 0) throw new Error("analysis_sweep_versions_remain");
       await tx.query("DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1", [result_key]);
     }
     return rows.length;

@@ -692,6 +692,12 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.purge_session_analysis_for_owned(text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.purge_session_analysis_for_owned(text,text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.queue_session_brief_document(jsonb)": [
       "<owner>:EXECUTE"
     ],
@@ -765,6 +771,9 @@
     "sessions.session_analysis_neon_free(text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.session_analysis_require_caller(text[])": [
+      "<owner>:EXECUTE"
     ],
     "sessions.session_analysis_source_revision(text,text,text)": [
       "<owner>:EXECUTE",

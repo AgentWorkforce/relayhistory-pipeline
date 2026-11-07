@@ -47,6 +47,17 @@ export interface S3EraserConfig {
   fetch?: typeof fetch;
 }
 
+/**
+ * Successor-safe cleanup: delete exactly ONE version id of one key (the version a writer's own
+ * put created), never another version of the same key, then verify that id is gone.
+ * `keepIfSole`: keep it when it is the key's only object version (a successor whose
+ * create-only put found it identical may be publishing it). Returns "gone" when the version
+ * is absent afterwards, "kept_sole" when it was kept for that reason.
+ */
+export interface VersionEraser {
+  eraseVersion(key: string, versionId: string, opts?: { keepIfSole?: boolean }): Promise<"gone" | "kept_sole">;
+}
+
 export interface PreservedVersionEraser {
   /** Keep the current non-delete barrier version; permanently remove only older versions. */
   eraseObjectExcept(key: string, preservedVersionId: string): Promise<{ deleted: number; kept: number }>;
@@ -91,7 +102,7 @@ function assertInventoryXml(xml: string): void {
   if (stack.length || roots !== 1 || xml.slice(at).trim()) throw coded("erasure_inventory", "incomplete version inventory");
 }
 
-export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser {
+export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEraser & VersionEraser {
   const doFetch = cfg.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const url = (key = "") => {
     if (cfg.endpoint) {
@@ -184,6 +195,17 @@ export function createS3Eraser(cfg: S3EraserConfig): Eraser & PreservedVersionEr
   }
 
   return {
+    eraseVersion: async (key, versionId, opts = {}) => {
+      if (!versionId || /[\x00-\x1f\x7f]/u.test(versionId) || versionId === "null")
+        throw coded("erasure_version_id", "a concrete version id is required");
+      const all = (await versions(key, true)).filter((v) => v.key === key);
+      const present = all.filter((v) => v.versionId === versionId);
+      if (opts.keepIfSole && present.length && !all.some((v) => v.versionId !== versionId && !v.deleteMarker)) return "kept_sole";
+      if (present.length) await remove(present);
+      if ((await versions(key, true)).some((v) => v.key === key && v.versionId === versionId))
+        throw coded("erasure_inventory_changed", "the version is still present after its delete");
+      return "gone";
+    },
     eraseObjectExcept: async (key, preservedVersionId) => {
       if (!preservedVersionId || /[\x00-\x1f\x7f]/u.test(preservedVersionId))
         throw coded("erasure_preserved_version", "a concrete preserved version is required");
