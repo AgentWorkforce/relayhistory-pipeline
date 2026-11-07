@@ -368,10 +368,10 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='frozen source: authority apply outside the authority begin';END IF;
  IF p_kind='selection' THEN
   v_origin:=p_payload->>'origin_id';v_enabled:=(p_payload->>'enabled')::boolean;
-  -- SP v2 analysis of exactly the disabled sessions (046000's session-scoped form), BEFORE their owned/frozen rows
+  -- SP v2 analysis of exactly the disabled sessions in THIS workspace (046000's session-scoped form), BEFORE their owned/frozen rows
   -- are removed below (it reads them). Guarded: a no-op until the analysis lane's migration is applied.
-  IF NOT v_enabled AND to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,jsonb)') IS NOT NULL THEN
-   EXECUTE 'SELECT sessions.purge_session_analysis_for_owned($1,$2,$3)' USING p_org,p_user,p_payload->'sessions';
+  IF NOT v_enabled AND to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,text,jsonb)') IS NOT NULL THEN
+   EXECUTE 'SELECT sessions.purge_session_analysis_for_owned($1,$2,$3,$4)' USING p_org,p_ws,p_user,p_payload->'sessions';
   END IF;
   FOR item IN SELECT value FROM jsonb_array_elements(p_payload->'sessions') LOOP
    IF v_enabled THEN
@@ -403,10 +403,10 @@ BEGIN
   WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)s;
  INSERT INTO sessions.ingest_frozen_source_deletions
   SELECT p_org,p_ws,p_user,o.origin_id,o.source,o.session_id FROM pg_temp.pa_owned o ON CONFLICT DO NOTHING;
- -- SP v2 analysis of Neon-era sessions (046000) is keyed by the user's owned set, so it is purged BEFORE that set is
+ -- SP v2 analysis of Neon-era sessions (046000) in THIS workspace is keyed by the user's owned set, so it is purged BEFORE that set is
  -- emptied below. Guarded like the digest purge: a no-op until the analysis lane's function exists.
- IF to_regprocedure('sessions.purge_session_analysis_for_owned(text,text)') IS NOT NULL THEN
-  EXECUTE 'SELECT sessions.purge_session_analysis_for_owned($1,$2)' USING p_org,p_user;
+ IF to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,text)') IS NOT NULL THEN
+  EXECUTE 'SELECT sessions.purge_session_analysis_for_owned($1,$2,$3)' USING p_org,p_ws,p_user;
  END IF;
  DELETE FROM sessions.ingest_frozen_source_records WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL;
  DELETE FROM sessions.ingest_frozen_source_owned_sessions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user;
