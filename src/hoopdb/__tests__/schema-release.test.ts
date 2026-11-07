@@ -221,6 +221,23 @@ for (const [k, v] of Object.entries({
         githubReleaseGate({ ...base, [k]: v }, get(api()), true),
       ).rejects.toThrow(),
   );
+test("release gate pins the renamed repository and reads only its API", async () => {
+  expect(P.repository).toBe("AgentWorkforce/relayhistory-pipeline");
+  const paths: string[] = [];
+  const inner = get(api());
+  await githubReleaseGate(base, async (path) => (paths.push(path), inner(path)), true);
+  expect(paths.length).toBeGreaterThan(0);
+  expect(paths.every((p) => p.startsWith("/repos/AgentWorkforce/relayhistory-pipeline/"))).toBe(true);
+  for (const name of [
+    "AgentWorkforce/sessions-pipeline",
+    "AgentWorkforce/sessions-pipeline-oss",
+    "fork/relayhistory-pipeline",
+    "agentworkforce/relayhistory-pipeline",
+  ])
+    await expect(
+      githubReleaseGate({ ...base, GITHUB_REPOSITORY: name }, get(api()), true),
+    ).rejects.toThrow("release_context");
+});
 test("apply rejects foreign, stale, replayed or failed prior plan and artifact bindings", async () => {
   const env = {
     ...base,
@@ -281,6 +298,27 @@ test("workflow keeps credentials step-scoped and refuses implicit environment cr
   );
   expect(w).toContain("cancel-in-progress: false");
   expect(w).toContain("persist-credentials: false");
+});
+test("workflow gates on the exact repository id and downloads the plan from this repository", () => {
+  const w = readFileSync(
+    new URL(
+      "../../../.github/workflows/apply-session-schema.yml",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  const gates = [...w.matchAll(/^\s*if: (github\.repository.*)$/gm)].map((m) => m[1]);
+  expect(gates).toEqual([
+    "github.repository_id == '1437714333' && github.ref == 'refs/heads/main'",
+  ]);
+  // Unrelated repository ids or a name comparison must not satisfy the gate.
+  const ids = [...w.matchAll(/github\.repository_id == '([^']*)'/g)].map((m) => m[1]);
+  expect(ids).toEqual(["1437714333"]);
+  for (const other of ["1437714334", "143771433", "252050005", ""]) expect(ids).not.toContain(other);
+  expect(w).not.toMatch(/github\.repository ==|repository_id !=|repository_id >/);
+  expect(w).not.toContain("sessions-pipeline");
+  const plan = w.slice(w.indexOf("name: schema-release-plan"));
+  expect(plan).toMatch(/^\s+repository: \$\{\{ github\.repository \}\}$/m);
 });
 
 test("connection enforces pinned CA/hostname and release profile ignores ambient bootstrap switches", async () => {

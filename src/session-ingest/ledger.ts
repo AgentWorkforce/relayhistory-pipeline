@@ -1,6 +1,7 @@
 import type {CurrentCustodyPacket,CurrentCustodyAck} from "./custody-protocol.ts";
 import type {OrderedControl,OrderedControlResult} from "./control-protocol.ts";
 import type { BufferedStageSpec, BufferedStageIntent } from "./buffered-protocol.ts";
+import type { DbErrorDiagnosis } from "./db-error-class.ts";
 /**
  * The session ingest's Supabase ledger: everything `accept_delivery_batch`
  * decided in Neon that is not transcript content.
@@ -174,6 +175,8 @@ export interface FrozenWitnessInput { kind: "batch" | "selection" | "reset"; ten
 export interface SourceControlBeginInput { epoch: string; tenant: LedgerTenant; kind: "selection" | "reset"; payload: unknown }
 export interface SourceControlHead { epoch: string; version: string; digest: string; kind: "selection" | "reset"; pending: true; apply: boolean }
 export interface SourceControlCompleteInput { epoch: string; tenant: LedgerTenant; version: string; digest: string; kind: "selection" | "reset"; outcome: "applied" | "replay" | "stale" }
+/** C3 Supabase-first privacy authority head: the mirror head plus Neon's reset count (null for a selection). */
+export interface PrivacyAuthorityHead extends SourceControlHead { deleted: string | null }
 export interface Ledger {
   /** Frozen-source custody witness (refuses unless the sealed copy and policy agree). */
   frozenWitness?(input: FrozenWitnessInput): Promise<CurrentCustodyPacket>;
@@ -183,6 +186,10 @@ export interface Ledger {
   sourceControlBegin?(input: SourceControlBeginInput): Promise<SourceControlHead>;
   /** Mirror completion; relayhistory calls it AFTER Neon completes. */
   sourceControlComplete?(input: SourceControlCompleteInput): Promise<{ completed: true; superseded: boolean }>;
+  /** C3: begin with Supabase as the privacy authority (head + frozen privacy written first; Neon never written). */
+  privacyAuthorityBegin?(input: SourceControlBeginInput): Promise<PrivacyAuthorityHead>;
+  /** C3: complete the Supabase-authority head after the ingest fence acknowledged it. */
+  privacyAuthorityComplete?(input: SourceControlCompleteInput): Promise<{ completed: true; superseded: boolean }>;
   /** Private verified-identity path. Unsupported stores must fail, never fall back. */
   applyOrderedControl?(input:OrderedControlInput):Promise<OrderedControlResult>;
   claim(input: ClaimInput): Promise<ClaimResult>;
@@ -196,13 +203,63 @@ export interface Ledger {
   resetUploadedSessions(tenant: LedgerTenant, requestId: string): Promise<number>;
   /** Staged path: the slice's sessions fenced right now (skipped by the fan-out). */
   fanoutFence(tenant: LedgerTenant, originId: string, sessions: [string, string][], attempt: StagedAttempt): Promise<[string, string][]>;
+  /**
+   * Babysitter retention (20261105042000): register the retention buckets a batch is
+   * about to write, BEFORE their PUT. Only called while INGEST_BABYSITTER_RETENTION_ROUTING
+   * is on; a ledger without it makes such a batch a retryable 503.
+   */
+  registerBabysitterRetention?(input: BabysitterRetentionRegistration): Promise<{ objects: BabysitterRetentionObject[]; reopened: number }>;
+  /** The bucket PUTs' outcome: acked (with versions) or unknown (may still commit). */
+  babysitterRetentionWritten?(input: BabysitterWriteOutcome): Promise<number>;
   /** Staged path: the records one slice wrote become stored (a session fenced since is re-armed instead). */
   commitRevisions(tenant: LedgerTenant, originId: string, machineId: string, records: LedgerRecord[], attempt: StagedAttempt): Promise<{ committed: number; rearmed: number }>;
 }
 
+/** One retention bucket request (babysitter-retention.ts): metadata only. */
+export interface BabysitterRetentionRequest {
+  /** The records' own source and session (null: no session). */
+  source: string;
+  sessionId: string | null;
+  /** The UTC hour the bucket becomes erasable (its records' expiry, rounded up). */
+  eraseAfterMs: number;
+}
+
+/** A registered bucket: the request plus the ref SQL issued (bound to the claim's fence and reset epochs). */
+export interface BabysitterRetentionObject extends BabysitterRetentionRequest {
+  /** The `_bx…` bucket session segment. */
+  ref: string;
+}
+
+export interface BabysitterRetentionRegistration {
+  tenant: LedgerTenant;
+  originId: string;
+  /** The live claim attempt whose epoch snapshot binds every bucket. */
+  batchId: string;
+  batchDigest: string;
+  claimToken: string;
+  /** The current compiled schema generation (refused when stale). */
+  generation: string;
+  /** The user's reset count the claim saw. */
+  resetEpoch: number;
+  buckets: BabysitterRetentionRequest[];
+  /** The content-free key index rows (babysitter-retention.ts BabysitterIndexEntry). */
+  records: { bucket: number | null; originId: string; recordId: string; revision: string; revisionId: string; digest: string; operation: "upsert" | "delete"; kind: string; source: string; sessionId: string | null; line: number | null; expiresAtMs: number | null }[];
+}
+
+/** The writer's PUT outcome for its registered bucket objects (write-obligation.ts writer side). */
+export interface BabysitterWriteOutcome {
+  tenant: LedgerTenant;
+  originId: string;
+  generation: string;
+  claimToken: string;
+  /** Definite outcomes only (an unknown outcome is never reported: the invocation stays dispatched). */
+  objects: ({ ref: string; object: string; outcome: "acked"; versionId: string } | { ref: string; object: string; outcome: "refused"; versionId: null })[];
+}
+
 /** The ledger is unreachable or refused: the batch answers 503 (retryable), never a fallback. */
 export class LedgerUnavailableError extends Error {
-  constructor(readonly code: string) {
+  /** `db`: the closed diagnosis (class, safe code, basis) of the underlying failure (diagnostic only). */
+  constructor(readonly code: string, readonly db?: DbErrorDiagnosis) {
     super(`session ingest ledger unavailable: ${code}`);
     this.name = "LedgerUnavailableError";
   }
