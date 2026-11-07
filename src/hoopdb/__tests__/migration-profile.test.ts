@@ -1570,6 +1570,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // Roll back the complete039/038 suffix in descending order before earlier lanes.
     expect((await failure(rollback("20261105038000_claim_attempt_records_retirement.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(T);
+    // 045000 (lane F4 digest narratives) is the latest lane: 039000 refuses until it rolls back.
+    const N = "upstream:20261105045000_digest_narrative_cache.sql";
+    expect(await names()).toContain(N);
+    expect((await failure(rollback("20261105039000_buffered_gc_single_candidate.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(G);
+    await rollback("20261105045000_digest_narrative_cache.down.sql");
+    expect(await names()).not.toContain(N);
+    expect(await relation("sessions.daily_digest_narratives")).toBeNull();
     await rollback("20261105039000_buffered_gc_single_candidate.down.sql");
     expect(await names()).not.toContain(G);
     expect(await passed()).toBe(false);
@@ -1743,10 +1751,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_digest_narrative')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(10);
+    expect(targets.rows).toHaveLength(11);
     expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
     const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
     const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);
