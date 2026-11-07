@@ -44,6 +44,8 @@ export class BackfillError extends Error {
 }
 
 export const MIGRATION_INTERRUPTED = "analysis_migration_interrupted";
+/** A backfill ticket's writer lease; the sweeper never sweeps a ticket under a live lease. */
+export const BACKFILL_TICKET_LEASE_SECONDS = 600;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const STATUS = new Set(["queued", "running", "completed", "failed"]);
 const IN_FLIGHT = new Set(["queued", "running"]);
@@ -161,6 +163,23 @@ export async function applyBackfill(
   let objects = 0;
   const refs = new Map<string, { key: string; sha256: string; bytes: number }>();
   for (const job of plan.jobs) {
+    try {
+      await applyJob(job);
+    } catch (error) {
+      // A failed job releases its lease at once, so the sweeper may clear any orphan now
+      // instead of after the lease runs out. Never touches a forgotten or foreign ticket.
+      const key = refs.get(job.id)?.key;
+      if (key)
+        await db
+          .query(
+            "UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() WHERE result_key = $1 AND job_id = $2::uuid AND reason = 'publishing'",
+            [key, job.id],
+          )
+          .catch(() => {});
+      throw error;
+    }
+  }
+  async function applyJob(job: BackfillPlan["jobs"][number]) {
     let ref: { key: string; sha256: string; bytes: number } | null = null;
     let bytes: Uint8Array | null = null;
     if (job.result !== null) {
@@ -173,17 +192,32 @@ export async function applyBackfill(
     // An existing row (a re-run, or another backfill) must equal the plan before any write.
     if (await jobRowExists(db, scope, job.id)) {
       await verifyJob(db, scope, job, ref);
-      continue;
+      return;
     }
     if (ref && bytes) {
       // Ticket first, only while the scope is live: an erase from here on leaves the ticket.
+      // Leased: the sweeper skips it while the lease is live (P1-c).
       const ticket = await db.query(
-        `INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason)
-         SELECT $1, $5::uuid, $2, $3, $4, 'publishing' WHERE ${LIVE}
-         ON CONFLICT (result_key) DO UPDATE SET created_at = now() RETURNING result_key`,
-        [ref.key, ...scopeParams, job.id],
+        `INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, lease_expires_at)
+         SELECT $1, $5::uuid, $2, $3, $4, 'publishing', now() + make_interval(secs => $6::integer) WHERE ${LIVE}
+         ON CONFLICT (result_key) DO UPDATE SET created_at = now(), lease_expires_at = excluded.lease_expires_at
+           WHERE sessions.session_analysis_result_tickets.reason = 'publishing'
+             AND sessions.session_analysis_result_tickets.job_id = excluded.job_id
+         RETURNING result_key`,
+        [ref.key, ...scopeParams, job.id, BACKFILL_TICKET_LEASE_SECONDS],
       );
       if (!ticket.rows.length) throw new BackfillError("backfill_session_not_live");
+      // Erase barrier: immediately before the Put, the ticket must still be ours, 'publishing'
+      // and under a LIVE lease (heartbeat extends it). A lapsed, swept or forgotten ticket
+      // refuses the Put, so no object can land after a sweep that already ran.
+      const beat = await db.query(
+        `/* backfill:heartbeat */ UPDATE sessions.session_analysis_result_tickets
+            SET lease_expires_at = now() + make_interval(secs => $3::integer)
+          WHERE result_key = $1 AND job_id = $2::uuid AND reason = 'publishing' AND lease_expires_at > now()
+          RETURNING result_key`,
+        [ref.key, job.id, BACKFILL_TICKET_LEASE_SECONDS],
+      );
+      if (!beat.rows.length) throw new BackfillError("backfill_ticket_lease_lost");
       await store.put(objectKey(ref.key), bytes, { ifNoneMatch: true, contentSha256: ref.sha256, contentType: "application/json" });
       const read = await readAll(await store.get(objectKey(ref.key)));
       if (createHash("sha256").update(read).digest("hex") !== ref.sha256) throw new BackfillError("backfill_write_verification_failed");
@@ -201,7 +235,8 @@ export async function applyBackfill(
          ON CONFLICT (id) DO NOTHING RETURNING id
        ), retired AS (
          DELETE FROM sessions.session_analysis_result_tickets AS t
-          WHERE $14::text IS NOT NULL AND t.result_key = $14 AND EXISTS (SELECT 1 FROM ins)
+          WHERE $14::text IS NOT NULL AND t.result_key = $14 AND t.job_id = $1::uuid AND t.reason = 'publishing'
+            AND EXISTS (SELECT 1 FROM ins)
          RETURNING t.result_key
        )
        SELECT ${LIVE} AS live, (SELECT count(*) FROM ins)::int AS inserted`,
@@ -213,7 +248,18 @@ export async function applyBackfill(
     if (Number(rows[0]?.inserted) !== 1) {
       // Lost the race: the winner must be identical (throws drift and KEEPS the ticket otherwise).
       await verifyJob(db, scope, job, ref);
-      if (ref) await db.query("DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1 AND job_id = $2::uuid", [ref.key, job.id]);
+      // Retire atomically: only our still-'publishing' ticket, only while the scope is live, and
+      // only if the winning row is still this job holding exactly this object. A ticket that an
+      // erase turned 'forgotten' (or a scope erased meanwhile) is never deleted here.
+      if (ref)
+        await db.query(
+          `/* backfill:retire-lost-race */ DELETE FROM sessions.session_analysis_result_tickets AS t
+            WHERE t.result_key = $5 AND t.job_id = $1::uuid AND t.reason = 'publishing' AND ${LIVE}
+              AND EXISTS (SELECT 1 FROM sessions.session_analysis_jobs_v2 AS j
+                           WHERE j.id = $1::uuid AND j.org_id = $2 AND j.workspace_id = $3 AND j.session_id = $4
+                             AND j.result_s3_key = $5 AND j.result_sha256 = $6 AND j.result_bytes = $7)`,
+          [job.id, ...scopeParams, ref.key, ref.sha256, ref.bytes],
+        );
     }
   }
   for (const r of plan.requests) {

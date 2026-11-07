@@ -205,3 +205,65 @@ test("P1-b: losing the insert race to a drifted row keeps the ticket, so the swe
   expect(await sweepAnalysisTickets(store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never) })).toBe(1);
   expect(await store.head(objectKey(spy.puts[0]!))).toBeUndefined();
 });
+
+/** hoopDb with a hook that runs just before a statement carrying `marker`. */
+const hooked = (db: PGlite, marker: string, before: () => Promise<void>) => {
+  const base = hoopDb(db);
+  return {
+    ...base,
+    async query(text: string, params?: unknown[]) {
+      if (text.includes(marker)) await before();
+      return base.query(text, params as never);
+    },
+  } as unknown as ReturnType<typeof hoopDb>;
+};
+
+test("P1-b: a tombstone interposed after verify never lets the lost-race retirement delete the forgotten ticket", async () => {
+  const db = await fresh();
+  const store = tempStore();
+  const plan = planBackfill(SCOPE, NEON);
+  const job = plan.jobs[0]!;
+  const bytes = new TextEncoder().encode(JSON.stringify(job.result));
+  const { createHash } = await import("node:crypto");
+  const sha = createHash("sha256").update(bytes).digest("hex");
+  const key = `${KEY_PREFIX}${job.id}/${sha}.json`;
+  // Another writer lands the IDENTICAL row between the existence check and our insert.
+  const spy = spyStore(store, async () => {
+    await db.query(
+      `INSERT INTO sessions.session_analysis_jobs_v2 (id, org_id, workspace_id, session_id, harness, status, attempts, analysis_version, schema_version,
+         model_version, summary_version, summary_model_version, source_fingerprint, result_s3_key, result_sha256, result_bytes, last_error, origin,
+         created_at, updated_at, completed_at)
+       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'neon_backfill', $18::timestamptz, $19::timestamptz, $20::timestamptz)`,
+      [job.id, KEY.orgId, KEY.workspaceId, KEY.sessionId, job.harness, job.status, job.attempts, job.analysis_version, job.schema_version,
+       job.model_version, job.summary_version, job.summary_model_version, job.source_fingerprint, key, sha, bytes.length, job.last_error,
+       job.created_at, job.updated_at, job.completed_at],
+    );
+  });
+  // ...and the session is erased right after our verify, before the retirement.
+  const tombstone = async () => {
+    await db.query("UPDATE sessions.session_index SET deleted_at = now()");
+  };
+  await expect(applyBackfill(hooked(db, "backfill:retire-lost-race", tombstone), spy.wrapped, SCOPE, plan)).rejects.toThrow();
+  const tickets = (await db.query<{ k: string; reason: string }>("SELECT result_key k, reason FROM sessions.session_analysis_result_tickets")).rows;
+  expect(tickets).toEqual([{ k: key, reason: "forgotten" }]);
+});
+
+test("P1-c: a lapsed backfill lease (fake clock) refuses the Put after a sweep: no orphan can land", async () => {
+  const db = await fresh();
+  const store = tempStore();
+  const spy = spyStore(store);
+  // The clock jumps past the lease between the ticket and the Put, and a sweep runs.
+  const lapse = async () => {
+    await db.query("UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() - interval '1 second', created_at = now() - interval '1 day'");
+    expect(await sweepAnalysisTickets(store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never) })).toBe(1);
+  };
+  await expect(applyBackfill(hooked(db, "backfill:heartbeat", lapse), spy.wrapped, SCOPE, planBackfill(SCOPE, NEON))).rejects.toThrow("backfill_ticket_lease_lost");
+  expect(spy.puts).toEqual([]);
+  // A live lease survives the sweeper.
+  const db2 = await fresh();
+  const plan = planBackfill(SCOPE, NEON);
+  await applyBackfill(hooked(db2, "backfill:heartbeat", async () => {
+    expect(await sweepAnalysisTickets(store, { graceSeconds: 0, transact: (w) => w(hoopDb(db2) as never) })).toBe(0);
+  }), store, SCOPE, plan);
+  expect((await db2.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
+});
