@@ -19,13 +19,14 @@ export async function packagedDerivedSchemaSource(onInput?: (path: string) => vo
     throw new Error("derived schema sources changed during the build");
   if (!first.expected.names.length || !/^[0-9a-f]{64}$/.test(first.expected.generation) ||
       !first.verifiers.searchWorker.trim() || !first.verifiers.tokenVerifier.trim()||!first.verifiers.ingestSeeder.trim()||!first.verifiers.ingest.trim()
-      || !first.portableStorageVerifier?.trim())
+      || !first.portableStorageVerifier?.trim() || !first.readerContractVerifier?.trim())
     throw new Error("derived schema build assets are incomplete");
   // Include generation-only SQL as well as the four runtime verifier bodies.
   // Consumers use this inventory both for watch invalidation and packaged assets.
   for (const path of [ROLE_VERIFY_SQL_PATH, TOKEN_VERIFIER_VERIFY_SQL_PATH,INGEST_SEED_VERIFY_SQL_PATH,INGEST_ROLE_VERIFY_SQL_PATH,
     join(ROOT, "supabase/bootstrap/canonical_project_events_verify.sql"),
     join(ROOT, "supabase/bootstrap/portable_search_storage_verify.sql"),
+    join(ROOT, "supabase/bootstrap/session_read_api_role_verify.sql"),
     ...first.expected.names.map(name => {
       const [kind, file] = name.split(":");
       if (!file || !["upstream", "96bulls"].includes(kind!)) throw new Error("unknown schema input");
@@ -38,7 +39,8 @@ export async function derivedSchemaAssets() {
   const dbMode = process.env.HOOPDB_DB_MODE;
   return { expected: { ...assets.expected,
     ...(["local", "selfhosted", "cloudsql", "supabase", "rds"].includes(dbMode ?? "") ? { dbMode } : {}) },
-    verifiers: assets.verifiers, portableStorageVerifier: assets.portableStorageVerifier };
+    verifiers: assets.verifiers, portableStorageVerifier: assets.portableStorageVerifier,
+    readerContractVerifier: assets.readerContractVerifier };
 }
 `;
 }

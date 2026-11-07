@@ -21,8 +21,11 @@ test("captured build/watch inputs reproduce the actual generation without expand
   const code = await packagedDerivedSchemaSource(path => inputs.push(path));
   expect(new Set(inputs).size).toBe(inputs.length);
   const parts: [string, string][] = [];
+  // Packaged and watched, but deliberately NOT generation inputs.
+  const packagedOnly = new Set(["supabase/bootstrap/session_read_api_role_verify.sql"]);
   for (const path of inputs) {
     const rel = relative(root, path);
+    if (packagedOnly.has(rel)) continue;
     const verifier = verifierNames.find(([file]) => file === basename(path));
     const name = verifier?.[1] ?? (rel.startsWith("supabase/migrations/") ? `upstream:${basename(path)}`
       : rel.startsWith("src/hoopdb/migrations/") ? `96bulls:${basename(path)}` : undefined);
@@ -44,6 +47,9 @@ test("captured build/watch inputs reproduce the actual generation without expand
   // The portable storage verifier is packaged separately: consumers count and run
   // `verifiers` as exactly this set.
   expect((await packaged.derivedSchemaAssets()).portableStorageVerifier).toContain("portable search storage");
+  const readerContract = (await packaged.derivedSchemaAssets()).readerContractVerifier;
+  expect(readerContract).toContain("session read api role");
+  expect(readerContract.split("\n").some((line: string) => line.startsWith("\\"))).toBe(false);
   const watched: string[] = [];
   const loaded = await derivedSchemaBuildPlugin().load.call({ addWatchFile(path) { watched.push(path); } },
     fileURLToPath(new URL("../../../src/session-pipeline/derived-schema.ts", import.meta.url)));
