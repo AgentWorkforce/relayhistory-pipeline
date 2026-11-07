@@ -93,21 +93,25 @@ holds only the eraser key ("sessions-prod transcript eraser").
     fence stays pending and is retried. A fenced tombstone is found again by
     the next sweep (every 10 min). A queued item records the code in its
     `error` column and backs off 1, 2, 4 ... minutes, capped at one hour
-    (`src/migration/neon-s3-sync/state.ts:317`), and is retried after that.
+    (`erasureFailed` in `src/migration/neon-s3-sync/state.ts`), and is retried after that.
     Other items still run. A retry lists afresh; after a post-delete
     refusal it sees only what survived.
-  - **Where the S3 refusal codes appear** (`src/migration/neon-s3-erasure/job.ts`):
-    as `error_code` on the job's structured log lines `live listing failed`
-    (:270) and `live erasure failed` (:301), counted by `liveFenceFailed`, and
-    `erasure failed` with `kind` for a queued item (:348), counted by `failed`.
-    The erasure backlog's `failing` count is the queued items whose `error` is
-    set.
-  - **Authority failures are different lines** (no S3 call was made, nothing
-    was deleted): `sweep refused: privacy authority not ready` (:115) and
-    `fence sweep failed` (:152), counted by `fenceSweepFailed`, and `live fence
-    sweep failed` (:128, :229), counted by `liveFenceFailed`. Fix the
-    authority, never the inventory checks. A refusal never stops the job; the oldest
-    queued item's age drives `erasure SLA at risk` after 24 h.
+  - **Where the S3 refusal codes appear** (`src/migration/neon-s3-erasure/job.ts`;
+    the log strings and counter names are the stable anchors): as `error_code`
+    on the job's structured log lines `live listing failed` and `live erasure
+    failed`, counted by `liveFenceFailed`, and `erasure failed` with `kind` for
+    a queued item, counted by `failed`. The erasure backlog's `failing` count
+    is the queued items whose `error` is set. `live erasure failed` can also
+    carry an authority error: the per-group `stillFenced` re-check runs inside
+    the same step, before that group's deletes.
+  - **Authority failures** are the lines `sweep refused: privacy authority not
+    ready` and `fence sweep failed`, counted by `fenceSweepFailed`, and `live
+    fence sweep failed`, counted by `liveFenceFailed`. The failing step made
+    no S3 call. Earlier steps of the same sweep may still have deleted: live
+    erasure runs first, and a later page follows earlier pages' deletes. Fix
+    the authority, never the inventory checks.
+  - **Either kind:** a refusal never stops the job. The oldest queued item's
+    age drives `erasure SLA at risk` after 24 h.
   - **Operator action** (the lead's ruling, verbatim): "retain the
     obligation/tombstone, investigate the inventory shape, or move to a
     separately reviewed resumable consumer. NO manual done, NO reservation

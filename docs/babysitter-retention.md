@@ -171,6 +171,7 @@ Each step is the production lead's, with Khaliq's OK for the window, deploys and
   2. every doomed version of a key with an obligation is reserved first, then exactly the listed versions are deleted by version id;
   3. a run that ends on its budget persists a checkpoint; `erased` needs a fresh strict zero inventory AND every write obligation complete.
   Registration is refused while the lease holds; a bucket registered again after the erase reopens and is swept again.
+- **The PG17 suite runs in no CI job:** `src/session-ingest/__tests__/babysitter-retention.postgres.test.ts` needs a live, owned PG17 (`SESSION_INGEST_TEST_PG_URL`) and skips without one. `ci.yml` sets none, and `pg-proof.yml` runs only `brief-documents.postgres.test.ts`. Its evidence is the local aw-heavy runs recorded on #294. Wiring it into CI needs the role bootstrap and a SCRAM cluster in a workflow, and is deferred to a follow-up.
 - Tests: disable → logical delete → re-enable (still hidden) → sweep → new writes kept and readable, pre-disable erased; a claim taken before a disable refused even after re-enable; a lost PUT response keeps the bucket tracked and a late commit is erased as cleanup.
 
 ## Generation fence
