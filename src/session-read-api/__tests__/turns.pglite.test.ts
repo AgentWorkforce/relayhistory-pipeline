@@ -113,7 +113,7 @@ describe("parity with Neon conversation_turns", () => {
 
   test("a live record outside its scope or with a forged record id fails the read", () => {
     const id = { ...scope, source: "claude" };
-    expect(() => canonicalLiveTurns([live("claude", 0, { org_id: "org-b" })], id)).toThrow("canonical live turn invalid");
+    expect(() => canonicalLiveTurns([live("claude", 0, { org_id: "org-b" })], id)).toThrow("Canonical session read refused");
     expect(() => canonicalLiveTurns([{ ...live("claude", 0), record_id: turnRecordId(WS, "claude", SESSION, 9) }], id)).toThrow();
     expect(() => canonicalLiveTurns([live("claude", 0, { metadata_json: "[]" })], id)).toThrow();
   });

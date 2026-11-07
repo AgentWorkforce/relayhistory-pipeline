@@ -271,6 +271,12 @@ function eventTime(record: RelayhistoryStreamRecord): number {
 const LEGACY_RECORD_KINDS = new Set([
   "legacy_conversation_turn", "legacy_session_link", "legacy_session_outcome", "legacy_scope",
 ]);
+/**
+ * The one machine id under which the legacy exporter writes a scope's legacy
+ * evidence (its own manifest, never mixed with delivery records). Readers accept
+ * legacy records only from an exporter-owned manifest on this machine.
+ */
+export const RELAYHISTORY_LEGACY_MACHINE_ID = "rh-legacy-tables-v1";
 export const isLegacyRelayhistoryRecord = (record: RelayhistoryStreamRecord) => LEGACY_RECORD_KINDS.has(record.kind);
 function recordKey(record: RelayhistoryStreamRecord): string {
   return JSON.stringify(isLegacyRelayhistoryRecord(record)
