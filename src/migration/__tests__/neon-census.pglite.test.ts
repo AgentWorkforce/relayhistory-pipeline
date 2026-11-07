@@ -237,12 +237,45 @@ test("final re-review P1: the CLI's --pin branch (injected Neon + Supabase clien
   // The identity the dry run prints (the endpoint is the neonUrl host).
   const live = (await readNeonCensus(q(neon), { endpoint: "ep-prod.neon.example" })).snapshot.source_identity;
   const stdin = (expected: unknown) => JSON.stringify({ neonUrl: "postgresql://ro@ep-prod.neon.example/db", supabaseUrl: "postgresql://owner@supabase.example/postgres", expectedSourceIdentity: expected });
-  expect(await runCensusCli(["--pin"], stdin({ ...live, system_identifier: "0" }), deps)).toBe(2);
+  expect(await runCensusCli(["--pin"], () => stdin({ ...live, system_identifier: "0" }), deps)).toBe(2);
   expect((await db.query("SELECT 1 FROM sessions.session_neon_census_source")).rows).toHaveLength(0);
-  expect(await runCensusCli(["--pin"], stdin(live), deps)).toBe(0);
+  expect(await runCensusCli(["--pin"], () => stdin(live), deps)).toBe(0);
   expect((await db.query<{ i: unknown }>("SELECT source_identity i FROM sessions.session_neon_census_source")).rows).toEqual([{ i: live }]);
   // Then --execute seals through the same CLI.
-  expect(await runCensusCli(["--execute"], stdin(undefined), deps)).toBe(0);
+  expect(await runCensusCli(["--execute"], () => stdin(undefined), deps)).toBe(0);
   expect((await db.query("SELECT 1 FROM sessions.session_neon_census_seal")).rows).toHaveLength(1);
   expect(lines.join("\n")).not.toContain("owner@");
+});
+
+test("lead P2: bad argv is refused BEFORE stdin (the credentials) is read and before any connection; a stdin read failure is a bounded refusal", async () => {
+  const { runCensusCli, parseCensusArgs } = await import("../../../scripts/neon-census-load.ts");
+  for (const bad of [["--nope"], ["postgresql://u:secret@h/db"], ["--execute", "--pin"], ["--batch", "0"], ["--fetch"], ["--verify", "--execute"]]) {
+    let read = 0, connected = 0;
+    const errors: string[] = [];
+    const code = await runCensusCli(bad, () => { read += 1; return "SENTINEL-CREDENTIAL-DOC"; }, {
+      client: () => { connected += 1; throw new Error("no connection expected"); }, out: () => {}, err: (l) => errors.push(l),
+    });
+    expect([bad.join(" "), code, read, connected]).toEqual([bad.join(" "), 64, 0, 0]);
+    expect(errors.join("")).not.toContain("secret");
+    expect(parseCensusArgs(bad).ok).toBe(false);
+  }
+  // A stdin read failure: fixed message, exit 66, no connection.
+  let connected = 0;
+  const errors: string[] = [];
+  expect(await runCensusCli(["--pin"], () => { throw new Error("EBADF: fd 0 at /secret/path"); }, {
+    client: () => { connected += 1; throw new Error("no"); }, out: () => {}, err: (l) => errors.push(l),
+  })).toBe(66);
+  expect(connected).toBe(0);
+  expect(errors).toEqual(["stdin could not be read"]);
+});
+
+test("lead P2: the EXECUTABLE refuses bad argv promptly with stdin held open (never waits for the credential document)", async () => {
+  const proc = Bun.spawn([process.execPath, "scripts/neon-census-load.ts", "--unknown-flag"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  // stdin stays OPEN (never written, never closed): a pre-read would block until EOF.
+  const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 10_000));
+  const result = await Promise.race([proc.exited, timeout]);
+  if (result === "timeout") proc.kill();
+  expect(result).toBe(64);
+  expect(await new Response(proc.stderr).text()).toContain("unknown argument at position 1");
+  proc.stdin.end();
 });
