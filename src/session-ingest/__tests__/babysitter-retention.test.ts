@@ -16,13 +16,17 @@ import {
   babysitterBucket,
   babysitterRetentionTick,
   planBabysitterBuckets,
+  babysitterTombstoneBucket,
   retentionTargets,
   routingFlag,
   sweepMode,
   worstCaseSubrequests,
+  eraseScope,
   type BabysitterRetentionLedger,
   type ClaimedObject,
 } from "../babysitter-retention.ts";
+import type { EraseCheckpoint, EraseStepOptions, EraseStepResult, ErasedProof, PagedEraser } from "../../migration/neon-s3-erasure/eraser.ts";
+import { FakeS3Versions } from "../../migration/__tests__/fake-s3-versions.ts";
 import { babysitterRoutingActive, deliverBatch, DeliveryBudgetExceeded, IngestUnavailable } from "../deliver.ts";
 import type { BabysitterRetentionRegistration } from "../ledger.ts";
 import { liveMachineId } from "../writer.ts";
@@ -117,12 +121,25 @@ describe("bucket derivation", () => {
     expect(babysitterBucket({ ...base, kind: "turn_receipt", operation: "upsert", payload: { expires_at_ms: "1" } })).toBeNull();
   });
   test("plan: one request per (source, session, hour); a partial or malformed registry answer is refused", () => {
-    const three = planBabysitterBuckets([receipt("a"), receipt("b"), receipt("c", { expires_at_ms: EXPIRES + 2 * HOUR })] as never);
+    const three = planBabysitterBuckets([receipt("a"), receipt("b"), receipt("c", { expires_at_ms: EXPIRES + 2 * HOUR })] as never, Date.now());
     expect(three.requests).toHaveLength(2);
     expect(() => bucketRefs(three, [])).toThrow();
     expect(() => bucketRefs(three, three.requests.map((r) => ({ ...r, ref: "../x" })))).toThrow();
     const ok = bucketRefs(three, three.requests.map((r, i) => ({ ...r, ref: `_bx2026120614-${String(i).repeat(16)}` })));
     expect(ok.size).toBe(2);
+  });
+  test("tombstones: a Babysitter-kind delete becomes an index-only key row (no object line), kept 30 days from receipt", () => {
+    const now = Date.UTC(2026, 10, 7, 5, 30);
+    const del = { ...receipt("gone"), operation: "delete", payload: null, revision: 2, revision_id: "gone:2" };
+    const plan = planBabysitterBuckets([receipt("a"), del, receipt("b")] as never, now);
+    expect(plan.routed).toHaveLength(2);
+    expect(plan.tombstones).toHaveLength(1);
+    const tomb = plan.entries.find((e) => e.operation === "delete")!;
+    expect(tomb).toMatchObject({ recordId: "gone", revision: "2", revisionId: "gone:2", line: null, expiresAtMs: null });
+    expect(plan.requests[tomb.bucket]!.eraseAfterMs).toBe(Math.ceil((now + 30 * 24 * HOUR) / HOUR) * HOUR);
+    // Upsert lines are numbered in the exact order writeBucketObjects writes them.
+    expect(plan.entries.filter((e) => e.operation === "upsert").map((e) => [e.recordId, e.line])).toEqual([["a", 0], ["b", 1]]);
+    expect(babysitterTombstoneBucket({ kind: "session_event", operation: "delete", source: "claude", session_id: "s" }, now)).toBeNull();
   });
   test("routing flag is case-insensitive like the sweep flag; anything else is off", () => {
     expect(routingFlag("on")).toBe(true);
@@ -331,46 +348,63 @@ describe("buffered acceptance (the Neon-exit path)", () => {
 });
 
 const machineOf = (ws: string, origin: string, user: string) => liveMachineId(ws, origin, user);
+const G = "e".repeat(64);
 function claimed(over: Partial<ClaimedObject> = {}): ClaimedObject {
   const base = { orgId: "org-a", workspaceId: "ws-a", userId: "user-1", originId: "origin-1" };
-  return { leaseToken: crypto.randomUUID(), leaseUntil: new Date(Date.now() + 300_000).toISOString(), ...base, machineId: machineOf(base.workspaceId, base.originId, base.userId), ref: `_bx2026120614-${"a".repeat(16)}`, reason: "expired", ...over };
+  return { leaseToken: crypto.randomUUID(), leaseUntil: new Date(Date.now() + 300_000).toISOString(), ...base, machineId: machineOf(base.workspaceId, base.originId, base.userId),
+    ref: `_bx2026120614-${"a".repeat(16)}`, reason: "expired", fenceEpoch: 0, resetEpoch: 0, writeSeq: 1, eraseRuns: 0, checkpoint: null, ...over };
 }
 
 function fakeLedger(objects: ClaimedObject[], settings = { enabled: true, dryRun: false }, fenceOk = true) {
-  const completions: { token: string; outcome: string; versions: number }[] = [];
+  const completions: { token: string; outcome: string; versions: number; checkpoint?: EraseCheckpoint | null }[] = [];
+  let fences = 0;
   const ledger: BabysitterRetentionLedger = {
     claim: async () => ({ ...settings, objects }),
-    fence: async () => fenceOk,
-    complete: async (token, outcome, versions) => { completions.push({ token, outcome, versions }); return { ok: true, state: outcome === "erased" ? "erased" : "pending" }; },
+    fence: async () => { fences++; return fenceOk; },
+    complete: async (token, outcome, versions, checkpoint) => {
+      completions.push({ token, outcome, versions, ...(checkpoint !== undefined ? { checkpoint } : {}) });
+      return { ok: true, state: outcome === "erased" ? "erased" : "pending" };
+    },
   };
-  return { ledger, completions };
+  return { ledger, completions, fences: () => fences };
 }
 
+/** A PagedEraser double: one traversal deleting 3 versions after authorize(), then a zero proof. */
 function fakeEraser() {
   const calls: string[] = [];
   return {
     calls,
     eraser: {
-      listVersions: async (prefix: string) => { calls.push(`list:${prefix}`); return [1, 2, 3].map((i) => ({ key: `${prefix}raw/b=${i}.ndjson.zst`, versionId: `v${i}` })); },
-      removeVersions: async (_prefix: string, list: readonly { key: string; versionId: string }[]) => { calls.push(`remove:${list.length}`); return list.length; },
-    },
+      eraseStep: async (prefix: string, opts: EraseStepOptions): Promise<EraseStepResult> => {
+        calls.push(`step:${prefix}`);
+        await opts.authorize();
+        calls.push("delete:3");
+        return { status: "traversed", deleted: 3, listed: 3 };
+      },
+      verifyErased: async (_prefix: string, opts: { authorize: () => Promise<void> }): Promise<ErasedProof> => {
+        await opts.authorize();
+        calls.push("verify");
+        return { status: "erased", listed: 0 };
+      },
+    } as PagedEraser,
   };
 }
 
-describe("sweep tick", () => {
+describe("sweep tick (durable resumable strict erase)", () => {
   test("off does nothing at all", async () => {
     let claims = 0;
-    await babysitterRetentionTick({ ledger: { claim: async () => { claims++; return { enabled: true, dryRun: false, objects: [] }; }, fence: async () => true, complete: async () => ({ ok: true }) }, eraser: fakeEraser().eraser, keyRoot: "96bulls", mode: "off" });
+    await babysitterRetentionTick({ ledger: { claim: async () => { claims++; return { enabled: true, dryRun: false, objects: [] }; }, fence: async () => true, complete: async () => ({ ok: true }) }, eraser: fakeEraser().eraser, keyRoot: "96bulls", generation: G, mode: "off" });
     expect(claims).toBe(0);
   });
 
-  test("on: erases only the bucket directory it derived, then records the erase", async () => {
+  test("on: erases only the bucket directory it derived, authorizes before deleting, proves zero, then records the erase", async () => {
     const o = claimed();
-    const { ledger, completions } = fakeLedger([o]);
+    const { ledger, completions, fences } = fakeLedger([o]);
     const { eraser, calls } = fakeEraser();
-    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", mode: "on" });
+    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on" });
     // Exactly this bucket's own directory (its date from the ref's hour): never a machine-wide listing.
-    expect(calls).toEqual([`list:96bulls/org-a/v1/ws=ws-a/m=${o.machineId}/h=_babysitter/d=2026/12/06/s=${o.ref}/`, "remove:3"]);
+    expect(calls).toEqual([`step:96bulls/org-a/v1/ws=ws-a/m=${o.machineId}/h=_babysitter/d=2026/12/06/s=${o.ref}/`, "delete:3", "verify"]);
+    expect(fences()).toBe(2);
     expect(completions).toEqual([{ token: o.leaseToken, outcome: "erased", versions: 3 }]);
     expect(r).toMatchObject({ claimed: 1, erased: 1, erased_versions: 3, failed: 0 });
   });
@@ -379,32 +413,30 @@ describe("sweep tick", () => {
     const o = claimed({ leaseUntil: new Date(Date.now() + MIN_LEASE_LEFT_MS - 1_000).toISOString() });
     const { ledger, completions } = fakeLedger([o]);
     const { eraser, calls } = fakeEraser();
-    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", mode: "on" });
+    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on" });
     expect(calls).toEqual([]);
     expect(completions).toEqual([{ token: o.leaseToken, outcome: "released", versions: 0 }]);
     expect(r.codes.lease_short).toBe(1);
   });
 
-  test("P2: a slow eraser never outlives the lease: it is cut at the deadline, released, and re-claimed later", async () => {
+  test("a hung eraser never outlives the lease: it is cut at the deadline and released (its checkpoint kept)", async () => {
     const o = claimed({ leaseUntil: new Date(Date.now() + 300).toISOString() });
     const { ledger, completions } = fakeLedger([o]);
-    let resolve!: (n: number) => void;
-    const slow = { listVersions: () => new Promise<never[]>(() => { resolve = () => {}; }), removeVersions: async () => 0 };
+    const slow = { eraseStep: () => new Promise<never>(() => {}), verifyErased: async () => ({ status: "erased", listed: 0 }) } as unknown as PagedEraser;
     const started = Date.now();
-    const r = await babysitterRetentionTick({ ledger, eraser: slow, keyRoot: "96bulls", mode: "on", minLeaseLeftMs: 100 });
+    const r = await babysitterRetentionTick({ ledger, eraser: slow, keyRoot: "96bulls", generation: G, mode: "on", minLeaseLeftMs: 100 });
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(r).toMatchObject({ erased: 0, failed: 1, codes: { lease_deadline: 1 } });
     expect(completions).toEqual([{ token: o.leaseToken, outcome: "released", versions: 0 }]);
-    resolve(0);
   });
 
-  test("generation fence: a stale generation (fence refused) deletes nothing even with a valid lease", async () => {
+  test("generation/lease fence: authorize() refused before the first delete deletes nothing and records nothing", async () => {
     const { ledger, completions } = fakeLedger([claimed()], { enabled: true, dryRun: false }, false);
     const { eraser, calls } = fakeEraser();
-    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", mode: "on" });
-    expect(calls.some((c) => c.startsWith("remove"))).toBe(false);
+    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on" });
+    expect(calls.some((c) => c.startsWith("delete"))).toBe(false);
     expect(completions).toEqual([]);
-    expect(r).toMatchObject({ erased: 0, codes: { fence_refused: 1 } });
+    expect(r).toMatchObject({ erased: 0, lease_lost: 1, codes: { fence_refused: 1 } });
   });
 
   test("mixed objects: with live siblings beside the bucket (canonical chunk, staged batch, another bucket), only the claimed bucket is erased", async () => {
@@ -425,38 +457,17 @@ describe("sweep tick", () => {
     };
     for (const k of Object.values(keys)) await s.store.put(objectKey(k), new Uint8Array([1]), { ifNoneMatch: true });
     const { ledger } = fakeLedger([o]);
-    expect((await babysitterRetentionTick({ ledger, eraser: storeEraser(s.store), keyRoot: "96bulls", mode: "on" })).erased).toBe(1);
+    expect((await babysitterRetentionTick({ ledger, eraser: storeEraser(s.store), keyRoot: "96bulls", generation: G, mode: "on" })).erased).toBe(1);
     const left = await listAll(s.store, "96bulls");
     expect(left).not.toContain(keys.target);
     for (const k of [keys.sibling, keys.laterHour, keys.canonical, keys.manifest, keys.staged, keys.otherMachine]) expect(left).toContain(k);
-  });
-
-  test("late writer: a version written after the snapshot is never deleted, however late the deletes run", async () => {
-    const s = scratchStore();
-    cleanups.push(s.done);
-    const { storeEraser } = await import("../../migration/neon-s3-erasure/eraser.ts");
-    const real = storeEraser(s.store);
-    const o = claimed();
-    const prefix = `96bulls/org-a/v1/ws=ws-a/m=${o.machineId}/h=_babysitter/d=2026/12/06/s=${o.ref}/`;
-    await s.store.put(objectKey(`${prefix}raw/b=old.ndjson.zst`), new Uint8Array([1]), { ifNoneMatch: true });
-    const eraser = {
-      listVersions: (p: string) => real.listVersions(p),
-      removeVersions: async (prefix: string, list: readonly { key: string; versionId: string }[]) => {
-        // A re-enabled session's new evidence lands between the snapshot and the deletes.
-        await s.store.put(objectKey(`${prefix}raw/b=new.ndjson.zst`), new Uint8Array([2]), { ifNoneMatch: true });
-        return real.removeVersions(prefix, list);
-      },
-    };
-    const { ledger } = fakeLedger([o]);
-    expect((await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", mode: "on" })).erased).toBe(1);
-    expect(await listAll(s.store, prefix.slice(0, -1))).toEqual([`${prefix}raw/b=new.ndjson.zst`]);
   });
 
   test("dry run (flag or DB setting) never calls the eraser and releases every lease", async () => {
     for (const [mode, dbDry] of [["dry_run", false], ["on", true]] as const) {
       const { ledger, completions } = fakeLedger([claimed(), claimed()], { enabled: true, dryRun: dbDry });
       const { eraser, calls } = fakeEraser();
-      expect((await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", mode })).dry_run).toBe(true);
+      expect((await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", generation: G, mode })).dry_run).toBe(true);
       expect(calls).toEqual([]);
       expect(completions.every((c) => c.outcome === "released")).toBe(true);
     }
@@ -466,7 +477,7 @@ describe("sweep tick", () => {
     const bad = [claimed({ ref: "../escape" }), claimed({ machineId: "srv_" + "0".repeat(32) }), claimed({ ref: "96bulls/org-a/live-batches/v1/x.staged.ndjson.zst" }), claimed({ orgId: "../org" })];
     const { ledger, completions } = fakeLedger(bad);
     const { eraser, calls } = fakeEraser();
-    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", mode: "on" });
+    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on" });
     expect(calls).toEqual([]);
     expect(r.refused).toBe(4);
     expect(completions.every((c) => c.outcome === "released")).toBe(true);
@@ -476,11 +487,9 @@ describe("sweep tick", () => {
   test("an eraser failure releases the lease and counts a code; the next bucket still runs", async () => {
     const { ledger, completions } = fakeLedger([claimed(), claimed()]);
     let first = true;
-    const eraser = {
-      listVersions: async () => { if (first) { first = false; throw Object.assign(new Error("s3 quoted key"), { code: "AccessDenied" }); } return [{ key: "k", versionId: "v" }]; },
-      removeVersions: async (_p: string, l: readonly unknown[]) => l.length,
-    };
-    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", mode: "on" });
+    const inner = fakeEraser().eraser;
+    const eraser = { ...inner, eraseStep: async (p: string, o: EraseStepOptions) => { if (first) { first = false; throw Object.assign(new Error("s3 quoted key"), { code: "AccessDenied" }); } return inner.eraseStep(p, o); } } as PagedEraser;
+    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on" });
     expect(r).toMatchObject({ failed: 1, erased: 1, codes: { AccessDenied: 1 } });
     expect(completions.map((c) => c.outcome)).toEqual(["released", "erased"]);
   });
@@ -489,7 +498,7 @@ describe("sweep tick", () => {
     let t = Date.now();
     const { ledger, completions } = fakeLedger([claimed(), claimed()]);
     const { eraser, calls } = fakeEraser();
-    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", mode: "on", budgetMs: 10, clock: () => (t += 20) });
+    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on", budgetMs: 10, clock: () => (t += 20) });
     expect(calls).toEqual([]);
     expect(r.codes.budget).toBe(2);
     expect(completions.every((c) => c.outcome === "released")).toBe(true);
@@ -497,13 +506,108 @@ describe("sweep tick", () => {
 
   test("a raced erase is not counted as erased", async () => {
     const ledger: BabysitterRetentionLedger = { claim: async () => ({ enabled: true, dryRun: false, objects: [claimed()] }), fence: async () => true, complete: async () => ({ ok: true, state: "pending" }) };
-    expect(await babysitterRetentionTick({ ledger, eraser: fakeEraser().eraser, keyRoot: "96bulls", mode: "on" })).toMatchObject({ erased: 0, raced: 1 });
+    expect(await babysitterRetentionTick({ ledger, eraser: fakeEraser().eraser, keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 0, raced: 1 });
   });
 
   test("the result holds counts and codes only", async () => {
     const { ledger } = fakeLedger([claimed()]);
-    const text = JSON.stringify(await babysitterRetentionTick({ ledger, eraser: fakeEraser().eraser, keyRoot: "96bulls", mode: "on" }));
+    const text = JSON.stringify(await babysitterRetentionTick({ ledger, eraser: fakeEraser().eraser, keyRoot: "96bulls", generation: G, mode: "on" }));
     for (const s of ["org-a", "_bx", "srv_"]) expect(text).not.toContain(s);
+  });
+});
+
+describe("§3 large bucket: durable resumable erase over the real strict S3 eraser (offline provider)", () => {
+  const o0 = claimed();
+  const prefix = retentionTargets("96bulls", o0).prefix;
+  const fill = (s: FakeS3Versions, n: number) => { for (let i = 0; i < n; i++) s.put(`${prefix}raw/b=${String(i).padStart(32, "0")}.ndjson.zst`, 1_000); };
+
+  test("bounded runs persist a bound checkpoint and stay pending; only the run whose fresh strict proof is zero records erased", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 10; fill(s, 35);
+    const eraser = s.eraser();
+    let o = claimed();
+    const outcomes: string[] = [];
+    for (let run = 0; run < 10; run++) {
+      const { ledger, completions } = fakeLedger([o]);
+      const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on", eraseBudget: { pages: 2 } });
+      const c = completions[0]!;
+      outcomes.push(c.outcome);
+      if (c.outcome === "erased") { expect(r.erased).toBe(1); break; }
+      expect(c.outcome).toBe("progress");
+      expect(r).toMatchObject({ erased: 0, progressed: 1 });
+      // The checkpoint is content-free and bound to this bucket, generation, epochs and write_seq.
+      expect(c.checkpoint).toMatchObject({ v: 1, prefix, scope: eraseScope(o, G) });
+      o = claimed({ ...o, leaseToken: crypto.randomUUID(), checkpoint: c.checkpoint ?? null });
+    }
+    expect(outcomes).toEqual(["progress", "erased"]);   // 20 deletes, then 15 + proof
+    expect(s.count(prefix)).toBe(0);
+    expect(s.deletes).toHaveLength(35);
+  });
+
+  test("12,500 versions: the 10k per-run ceiling persists progress; the next lease resumes and proves zero", async () => {
+    const s = new FakeS3Versions(); fill(s, 12_500);
+    const eraser = s.eraser();
+    const a = fakeLedger([claimed()]);
+    expect(await babysitterRetentionTick({ ledger: a.ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ progressed: 1, erased: 0, codes: { incomplete_versions: 1 } });
+    expect(s.count(prefix)).toBe(2_500);
+    const b = fakeLedger([claimed({ checkpoint: a.completions[0]!.checkpoint! })]);
+    expect(await babysitterRetentionTick({ ledger: b.ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 1 });
+    expect(s.count(prefix)).toBe(0);
+  }, 60_000);
+
+  test("wrong-generation / wrong-epoch / wrong-write_seq checkpoints are never adopted: the run restarts from the top", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 10; fill(s, 25);
+    const eraser = s.eraser();
+    const a = fakeLedger([claimed()]);
+    await babysitterRetentionTick({ ledger: a.ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on", eraseBudget: { pages: 1 } });
+    const cp = a.completions[0]!.checkpoint!;
+    for (const over of [{ writeSeq: 2 }, { fenceEpoch: 1 }, { resetEpoch: 1 }]) {
+      const b = fakeLedger([claimed({ ...over, checkpoint: cp })]);
+      const r = await babysitterRetentionTick({ ledger: b.ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on", eraseBudget: { pages: 1 } });
+      expect(r.codes.checkpoint_restart).toBe(1);
+    }
+    const c = fakeLedger([claimed({ checkpoint: cp })]);
+    expect((await babysitterRetentionTick({ ledger: c.ledger, eraser, keyRoot: "96bulls", generation: "f".repeat(64), mode: "on" })).codes.checkpoint_restart).toBe(1);
+    expect(s.count(prefix)).toBe(0);
+  });
+
+  test("a version behind the cursor (proof not zero) is never erased: progress with a restart (null) checkpoint", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 10; fill(s, 25);
+    const eraser = s.eraser();
+    const a = fakeLedger([claimed()]);
+    await babysitterRetentionTick({ ledger: a.ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on", eraseBudget: { pages: 2 } });
+    s.put(`${prefix}raw/b=${"0".repeat(31)}.ndjson.zst`);   // sorts before the checkpoint
+    const b = fakeLedger([claimed({ checkpoint: a.completions[0]!.checkpoint! })]);
+    const r = await babysitterRetentionTick({ ledger: b.ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on" });
+    expect(r).toMatchObject({ erased: 0, progressed: 1, codes: { proof_remaining: 1 } });
+    expect(b.completions[0]).toMatchObject({ outcome: "progress", checkpoint: null });
+    const c = fakeLedger([claimed()]);
+    expect(await babysitterRetentionTick({ ledger: c.ledger, eraser, keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 1 });
+  });
+
+  for (const [name, mutate, code] of [
+    ["a truncated later page", (x: string) => x.slice(0, x.length - 40), "erasure_inventory"],
+    ["a page without IsLatest", (x: string) => x.replace("<IsLatest>true</IsLatest>", ""), "erasure_inventory"],
+    ["a truncated page without markers", (x: string) => x.replace(/<NextKeyMarker>.*?<\/NextVersionIdMarker>/, ""), "erasure_inventory"],
+    ["a foreign key on a later page", (x: string) => x.replace(/<Key>[^<]*<\/Key>/, "<Key>96bulls/org-a/v1/ws=ws-a/other/raw/b=z.ndjson.zst</Key>"), "erasure_foreign_key"],
+  ] as const)
+    test(`${name}: that page deletes nothing, the run is released (pending, earlier checkpoint kept), never erased`, async () => {
+      const s = new FakeS3Versions(); s.pageSize = 10; fill(s, 35);
+      s.rewrite = (call, xml) => (call === 2 ? mutate(xml) : xml);
+      const { ledger, completions } = fakeLedger([claimed()]);
+      const r = await babysitterRetentionTick({ ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" });
+      expect(s.deletes).toHaveLength(10);   // page 1 only
+      expect(r).toMatchObject({ erased: 0, failed: 1, codes: { [code]: 1 } });
+      expect(completions.map((c) => c.outcome)).toEqual(["released"]);
+    });
+
+  test("an acknowledged delete that left its version: the fresh strict proof is not zero, so never erased", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 10; fill(s, 5);
+    const orig = s.remove.bind(s);
+    s.remove = (key, id) => { if (!key.endsWith(`b=${String(2).padStart(32, "0")}.ndjson.zst`)) orig(key, id); };
+    const { ledger, completions } = fakeLedger([claimed()]);
+    const r = await babysitterRetentionTick({ ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" });
+    expect(r).toMatchObject({ erased: 0, progressed: 1, codes: { proof_remaining: 1 } });
+    expect(completions[0]).toMatchObject({ outcome: "progress", checkpoint: null });
   });
 });
 
@@ -583,70 +687,5 @@ describe("retention buckets are never indexed as sessions", () => {
     const { indexPointer } = await import("../../session-pipeline/pointer.ts");
     const deps = new Proxy({}, { get: () => { throw new Error("no dependency may be touched"); } });
     expect(await indexPointer({ key } as never, deps as never)).toEqual({ status: "ignored", reason: "retention_bucket" });
-  });
-});
-
-describe("P2: the snapshot erase trusts only a STRICT inventory (real createS3Eraser)", () => {
-  const o = claimed();
-  const prefix = retentionTargets("96bulls", o).prefix;
-  const own = (id: string) => `<Version><Key>${prefix}raw/b=${id}.ndjson.zst</Key><VersionId>${id}</VersionId><IsLatest>true</IsLatest></Version>`;
-  async function run(xml: string) {
-    const { createS3Eraser } = await import("../../migration/neon-s3-erasure/eraser.ts");
-    const deletes: string[] = [];
-    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.method === "DELETE") { deletes.push(new URL(String(input)).pathname); return new Response(null, { status: 204 }); }
-      return new Response(xml);
-    }) as typeof fetch;
-    const eraser = createS3Eraser({ bucket: "unit-bucket", region: "us-east-1", credentials: { accessKeyId: "unit-access", secretAccessKey: "unit-secret" }, fetch: fetcher });
-    const { ledger, completions } = fakeLedger([o]);
-    const r = await babysitterRetentionTick({ ledger, eraser, keyRoot: "96bulls", mode: "on" });
-    return { r, deletes, completions };
-  }
-  for (const [name, xml, code] of [
-    ["truncated document", `<ListVersionsResult>${own("a")}${own("b")}<IsTruncated>false</IsTruncated><Version><Key>${prefix}raw/b=c`, "erasure_inventory"],
-    ["malformed document", `<ListVersionsResult>${own("a")}<Version><Key>x</Key></Bogus><IsTruncated>false</IsTruncated></ListVersionsResult>`, "erasure_inventory"],
-    ["truncated page without a next cursor", `<ListVersionsResult>${own("a")}<IsTruncated>true</IsTruncated></ListVersionsResult>`, "erasure_inventory"],
-    ["unproven pagination (no IsTruncated)", `<ListVersionsResult>${own("a")}</ListVersionsResult>`, "erasure_inventory"],
-    ["entry without IsLatest", `<ListVersionsResult><Version><Key>${prefix}raw/b=a.ndjson.zst</Key><VersionId>a</VersionId></Version><IsTruncated>false</IsTruncated></ListVersionsResult>`, "erasure_inventory"],
-    ["a foreign key in the document", `<ListVersionsResult>${own("a")}<Version><Key>96bulls/org-a/v1/ws=ws-a/other/raw/b=z.ndjson.zst</Key><VersionId>z</VersionId><IsLatest>true</IsLatest></Version><IsTruncated>false</IsTruncated></ListVersionsResult>`, "erasure_foreign_key"],
-  ] as const)
-    test(`${name}: zero deletes, the row is released (stays pending, reclaimable)`, async () => {
-      const { r, deletes, completions } = await run(xml);
-      expect(deletes).toEqual([]);
-      expect(r).toMatchObject({ erased: 0, failed: 1, codes: { [code]: 1 } });
-      expect(completions.map((c) => c.outcome)).toEqual(["released"]);
-    });
-
-  test("removeVersions refuses (before any delete) a key outside the requested prefix", async () => {
-    const { createS3Eraser, storeEraser } = await import("../../migration/neon-s3-erasure/eraser.ts");
-    let deletes = 0;
-    const s3 = createS3Eraser({ bucket: "b", region: "us-east-1", credentials: { accessKeyId: "a", secretAccessKey: "s" },
-      fetch: (async (_u, init) => { if (init?.method === "DELETE") deletes++; return new Response("<ListVersionsResult><IsTruncated>false</IsTruncated></ListVersionsResult>"); }) as typeof fetch });
-    for (const key of [`${prefix.slice(0, -1)}x/raw/b=1`, "96bulls/elsewhere/b=1", `${prefix}../../escape`, prefix])
-      await expect(s3.removeVersions(prefix, [{ key: `${prefix}raw/ok`, versionId: "1" }, { key, versionId: "2" }])).rejects.toMatchObject({ code: "erasure_foreign_key" });
-    expect(deletes).toBe(0);
-    const sc = scratchStore();
-    try {
-      await expect(storeEraser(sc.store).removeVersions(prefix, [{ key: "96bulls/elsewhere/b=1", versionId: "null" }])).rejects.toMatchObject({ code: "erasure_foreign_key" });
-    } finally { sc.done(); }
-  });
-
-  test("a strict, complete inventory erases exactly the snapshot and acknowledges only after a post-delete inventory shows it gone", async () => {
-    const { createS3Eraser } = await import("../../migration/neon-s3-erasure/eraser.ts");
-    const deleted = new Set<string>();
-    let lie = false;
-    const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const u = new URL(String(input));
-      if (init?.method === "DELETE") { if (!lie) deleted.add(u.searchParams.get("versionId")!); return new Response(null, { status: 204 }); }
-      return new Response(`<ListVersionsResult>${["a", "b"].filter((id) => !deleted.has(id)).map(own).join("")}<IsTruncated>false</IsTruncated></ListVersionsResult>`);
-    }) as typeof fetch;
-    const eraser = createS3Eraser({ bucket: "b", region: "us-east-1", credentials: { accessKeyId: "a", secretAccessKey: "s" }, fetch: fetcher });
-    const ok = fakeLedger([claimed()]);
-    expect(await babysitterRetentionTick({ ledger: ok.ledger, eraser, keyRoot: "96bulls", mode: "on" })).toMatchObject({ erased: 1, erased_versions: 2 });
-    // A delete that S3 acknowledges but that leaves the version: never marked erased.
-    deleted.clear(); lie = true;
-    const bad = fakeLedger([claimed()]);
-    expect(await babysitterRetentionTick({ ledger: bad.ledger, eraser, keyRoot: "96bulls", mode: "on" })).toMatchObject({ erased: 0, failed: 1, codes: { erasure_inventory_changed: 1 } });
-    expect(bad.completions.map((c) => c.outcome)).toEqual(["released"]);
   });
 });

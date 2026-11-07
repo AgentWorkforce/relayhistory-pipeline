@@ -114,7 +114,9 @@ export class DeliveryBudgetExceeded extends DeliveryError {
 /** Refuses (DeliveryBudgetExceeded) a routed batch over the cap; a no-op when routing is inactive or nothing routes. */
 export function assertWithinBudget(deps: Pick<DeliverDeps, "babysitterRetention" | "replica" | "subrequestCap" | "subrequestRedirects" | "acceptanceMode" | "inlineMaxSessions" | "retentionGeneration">, records: PreparedDelivery["records"], receivedAt: Date): void {
   if (!babysitterRoutingActive(deps)) return;
-  const buckets = planBabysitterBuckets(records).requests.length;
+  // Bucket PUTs: one per bucket holding an upsert line (tombstone-only buckets write no object).
+  const plan = planBabysitterBuckets(records, receivedAt.getTime());
+  const buckets = new Set(plan.routed.map((r) => planKey(plan.of(r)!))).size;
   if (buckets === 0) return;
   const sessions = groupRecords(records, receivedAt).groups.length;
   const mode = deps.acceptanceMode === "buffered" ? "buffered" : deps.inlineMaxSessions !== undefined && sessions > deps.inlineMaxSessions ? "staged" : "inline";
@@ -292,15 +294,15 @@ async function writeAndCommit(
   // register the buckets, write the full evidence to them, then let the record travel
   // today's path as a payload-free stub in its OWN session. No mixed object (session
   // chunk, staged batch, buffered stage, canonical generation) ever holds the payload.
-  const plan = babysitterRoutingActive(deps) ? planBabysitterBuckets(kept) : null;
+  const plan = babysitterRoutingActive(deps) ? planBabysitterBuckets(kept, receivedAt.getTime()) : null;
   let refs: BucketRefs | null = null;
-  if (plan && plan.routed.length > 0) {
+  if (plan && plan.entries.length > 0) {
     if (!deps.ledger.registerBabysitterRetention) throw new IngestUnavailable("babysitter_retention", "retention_not_configured");
     // Registered BEFORE the bucket PUT, so no bucket exists without its row. SQL issues the refs,
     // bound to this claim's fence/reset epochs and the current generation (40001/55000 otherwise).
     const registered = await stage("babysitter_retention", () =>
       deps.ledger.registerBabysitterRetention!({ tenant, originId: prepared.originId, batchId: prepared.batchId, batchDigest: prepared.batchDigest,
-        claimToken, generation: deps.retentionGeneration!, resetEpoch: resets, buckets: plan.requests }),
+        claimToken, generation: deps.retentionGeneration!, resetEpoch: resets, buckets: plan.requests, records: plan.entries }),
     );
     refs = await stage("babysitter_retention", async () => bucketRefs(plan, registered.objects));
     mark("babysitter_retention");

@@ -4,30 +4,29 @@
  * for the `session_lineage` / `turn_receipt` kinds, whose payloads now live only in the
  * retention buckets (src/session-ingest/babysitter-retention.ts).
  *
- * Same query contract as Neon: filters kind, source, session_id, include_deleted, cursor
- * and limit (1..100, default 100); unknown or repeated filters refused; an opaque cursor
- * bound to the filter scope; the same envelope `{protocolVersion: 1, listing: "live",
- * records, nextCursor}` and record shape. It is a real PAGE: buckets come from SQL by
- * keyset and objects are read one at a time, stopping at limit + 1 visible records (or a
- * work bound), so a page reads O(limit) objects and a continuation never rereads earlier
- * ones. Order is (bucket machine, bucket ref, object key, line), stable across pages; Neon
- * orders by (origin_id, record_id), which only a full scan could reproduce here, and the
- * cursor is opaque either way.
+ * Same contract as Neon: filters kind, source, session_id, include_deleted, cursor and
+ * limit (1..100, default 100); unknown or repeated filters refused; Neon's NATIVE order
+ * (origin_id, record_id) in C collation; an opaque cursor bound to the filter scope whose
+ * position is (origin_id, record_id); the envelope `{protocolVersion: 1, listing: "live",
+ * records, nextCursor}` and Neon's record shape.
  *
- * Visibility (Neon-equivalent, and stricter where privacy requires):
- *  - tenant-pinned: the bucket and revision reads run as the read API role under the
- *    verified binding (sessions.babysitter_evidence_*_for, session_directory_read_api_scope);
- *  - expiry: a record whose payload.expires_at_ms <= now is hidden (include_deleted shows
- *    it as a payload-free tombstone, as Neon's read-only expiry predicate does); a bucket
- *    whose expiry hour passed is not read at all;
- *  - delete / reset: a bucket whose session was disabled or whose user reset after its
- *    claim is hidden AT ONCE (logical delete, before any physical erase) and stays hidden
- *    after a re-enable; erased buckets are never read;
- *  - supersession: a line older than the committed revision (ingest_record_revisions: a
- *    newer upsert or a tombstone) is never served, not even under include_deleted: a page
- *    cannot tell whether the newer revision is a live line in a later bucket, and a
- *    delete@N beside an upsert@N would contradict itself. include_deleted tombstones come
- *    from expiry only (a deliberate deviation from Neon, which keeps tombstone rows).
+ * Bounded page work, no materialization: the order and every visibility decision come from
+ * the content-free key index in SQL (sessions.babysitter_evidence_page_for: limit+1 rows,
+ * at most 1000 records scanned). The reader then GETs only the exact objects the page's
+ * live rows point at (at most MAX_OBJECTS_PER_PAGE distinct objects, by exact key, never a
+ * listing) and takes the indexed line. A page cut by any bound returns a cursor at the last
+ * record it fully decided, so it resumes exactly there and never claims completeness.
+ *
+ * Visibility (Neon's, per record by its newest indexed revision; see the SQL):
+ *  - tenant-pinned (read API role, verified binding, session_directory_read_api_scope);
+ *  - delete -> Neon's tombstone (operation "delete", payload null, the delete's revision)
+ *    exactly once under include_deleted; hidden otherwise; never a superseded payload;
+ *  - expiry: payload.expires_at_ms <= now (or the bucket hour passed) is unreadable, and
+ *    include_deleted shows a payload-free tombstone with the line's revision;
+ *  - delete / reset / disable: a fenced bucket is hidden at once, before any physical
+ *    erase, and stays hidden after a re-enable; erased buckets have no index rows;
+ *  - the newest revision must be the committed one (ingest_record_revisions), else the
+ *    record is not served (never a stale payload, never a guessed tombstone).
  * Default off: the route answers 501 unless the read worker wires these deps
  * (READ_API_BABYSITTER_EVIDENCE=on plus the raw store).
  */
@@ -39,34 +38,41 @@ const FILTERS = ["kind", "source", "session_id", "include_deleted", "cursor", "l
 const MAX_PAGE_BYTES = 2 * 1024 * 1024;
 const BUCKET_SEGMENT = /^_bx[0-9]{10}-[0-9a-f]{16}$/;
 const MACHINE = /^srv_[0-9a-f]{32}$/;
+const OBJECT = /^b=[0-9a-f]{32}\.ndjson\.zst$/;
+/** Distinct bucket objects one page may GET (each by exact key). */
+export const MAX_OBJECTS_PER_PAGE = 32;
+const OBJECT_CONCURRENCY = 8;
 
 export interface EvidenceBucket {
   machineId: string;
   ref: string;
-  source: string;
+}
+
+/** One row of sessions.babysitter_evidence_page_for, in native order. */
+export type EvidencePageRow =
+  | { originId: string; recordId: string; revision: string; revisionId: string; operation: "delete"; source: string; sessionId: string | null }
+  | { originId: string; recordId: string; revision: string; revisionId: string; operation: "upsert"; source: string; sessionId: string | null;
+      machineId: string; ref: string; object: string; line: number };
+
+export interface EvidencePageRequest {
+  kind: string;
+  source: string | null;
   sessionId: string | null;
+  after: [string, string] | null;
+  /** limit + 1 (1..101): the extra row proves there is more. */
+  limit: number;
+  includeDeleted: boolean;
 }
 
 export interface EvidenceDeps {
-  /** One keyset page (<= limit) of live, unfenced, unexpired, unerased buckets of the bound tenant (read role). */
-  buckets(scope: { orgId: string; workspaceId: string }, filter: { source: string | null; sessionId: string | null },
-    after: { machineId: string; ref: string; inclusive: boolean } | null, limit: number): Promise<EvidenceBucket[]>;
-  /** Committed revisions of the given (origin, record) keys (read role). */
-  revisions(scope: { orgId: string; workspaceId: string }, keys: [string, string][]): Promise<Map<string, { revision: bigint; revisionId: string }>>;
-  /** The object keys under one bucket directory, in key order; bounded by `signal`. */
-  objectKeys(prefix: string, signal: AbortSignal): Promise<string[]>;
-  /** One object's decompressed body; bounded by `signal`. */
+  /** One native-order page of the bound tenant (read role): <= limit rows, scan-bounded. */
+  page(scope: { orgId: string; workspaceId: string }, req: EvidencePageRequest): Promise<{ rows: EvidencePageRow[]; more: boolean; scannedTo: [string, string] | null }>;
+  /** One object's decompressed body, by exact key; bounded by `signal`. */
   object(key: string, signal: AbortSignal): Promise<Uint8Array>;
   keyRoot: string;
   /** Below Cloud's 4 s read timeout. Default 3000. */
   deadlineMs?: number;
-  now?: () => number;
 }
-
-/** Work bounds of one page: a page may end short of `limit` with a cursor when they bind. */
-export const PAGE_BUCKETS = 64;
-export const MAX_BUCKETS_PER_PAGE = 256;
-export const MAX_OBJECTS_PER_PAGE = 32;
 
 export class EvidenceRequestError extends Error {
   constructor(readonly status: 400 | 403 | 413 | 501 | 503, readonly code: string, message: string, readonly reason?: string) {
@@ -74,6 +80,7 @@ export class EvidenceRequestError extends Error {
   }
 }
 const invalid = (m: string) => new EvidenceRequestError(400, "invalid_delivery", m);
+const unavailable = () => new EvidenceRequestError(503, "backend_unavailable", "read backend unavailable");
 
 export interface EvidenceRecord {
   schema_version: 1;
@@ -96,7 +103,6 @@ export interface EvidencePage {
 }
 
 const identifier = (v: string) => v.length > 0 && v.length <= 512 && !/[\x00-\x1f\x7f]/u.test(v);
-const keyOf = (origin: string, record: string) => JSON.stringify([origin, record]);
 
 function scopeDigest(parts: unknown[]): string {
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
@@ -106,9 +112,7 @@ function b64url(text: string): string {
   return Buffer.from(text, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-type Position = [machineId: string, ref: string, key: string, line: number];
-
-function decodeCursor(raw: string, scope: string): Position {
+function decodeCursor(raw: string, scope: string): [string, string] {
   if (raw.length > 4096 || !/^[A-Za-z0-9_-]+$/.test(raw)) throw invalid("Invalid delivery cursor");
   let cursor: unknown;
   try {
@@ -117,21 +121,14 @@ function decodeCursor(raw: string, scope: string): Position {
     throw invalid("Invalid delivery cursor");
   }
   const c = cursor as { v?: unknown; scope?: unknown; position?: unknown };
-  const p = c?.position as unknown[];
-  if (!c || c.v !== 2 || c.scope !== scope || !Array.isArray(p) || p.length !== 4 || !MACHINE.test(String(p[0])) || !BUCKET_SEGMENT.test(String(p[1]))
-      || typeof p[2] !== "string" || p[2].length > 2048 || !Number.isSafeInteger(p[3]) || (p[3] as number) < -1)
+  if (!c || c.v !== 1 || c.scope !== scope || !Array.isArray(c.position) || c.position.length !== 2 || !c.position.every((p) => typeof p === "string" && identifier(p)))
     throw invalid("Invalid delivery cursor scope");
-  return p as Position;
+  return c.position as [string, string];
 }
 
-/** The C-collation order Neon uses (byte order of the UTF-8 text). */
-function compareC(a: string, b: string): number {
-  return Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
-}
-
-/** The exact bucket directory to read, rebuilt from its coordinates (same rule as the sweeper). */
+/** The exact bucket directory, rebuilt from its coordinates (same rule as the sweeper). */
 export function evidenceBucketPrefix(keyRoot: string, scope: { orgId: string; workspaceId: string }, b: EvidenceBucket): string {
-  if (!MACHINE.test(b.machineId) || !BUCKET_SEGMENT.test(b.ref)) throw new EvidenceRequestError(503, "backend_unavailable", "read backend unavailable");
+  if (!MACHINE.test(b.machineId) || !BUCKET_SEGMENT.test(b.ref)) throw unavailable();
   const y = b.ref.slice(3, 7), m = b.ref.slice(7, 9), d = b.ref.slice(9, 11);
   return `${keyRoot}/${scope.orgId}/v1/ws=${layoutComponent(scope.workspaceId)}/m=${b.machineId}/h=_babysitter/d=${y}/${m}/${d}/s=${b.ref}/`;
 }
@@ -146,19 +143,6 @@ interface Line {
   session_id: string | null;
   operation: string;
   payload: Record<string, unknown> | null;
-}
-
-function parseLines(body: Uint8Array): { line: Line; index: number }[] {
-  const out: { line: Line; index: number }[] = [];
-  new TextDecoder().decode(body).split("\n").forEach((text, index) => {
-    if (!text) return;
-    let l: Line;
-    try { l = JSON.parse(text) as Line; } catch { return; }
-    if (!l || typeof l.origin_id !== "string" || typeof l.record_id !== "string" || typeof l.revision !== "string" || !/^[1-9][0-9]{0,18}$/.test(l.revision)
-        || typeof l.revision_id !== "string" || typeof l.kind !== "string" || l.operation !== "upsert") return;
-    out.push({ line: l, index });
-  });
-  return out;
 }
 
 /**
@@ -181,9 +165,8 @@ export function requireEvidenceAccount(scope: { orgId: string; workspaceId: stri
 }
 
 /**
- * Neon `listDelivery` for Babysitter kinds over the retention buckets. The account
- * assertion is checked FIRST, before any evidence database or S3 access (Neon checks it
- * before listDelivery runs).
+ * Neon `listDelivery` for Babysitter kinds. The account assertion is checked FIRST, before
+ * any evidence database or S3 access (Neon checks it before listDelivery runs).
  */
 export async function readBabysitterEvidence(deps: EvidenceDeps, scope: { orgId: string; workspaceId: string }, query: Record<string, string>, expectedAccount: string | undefined): Promise<EvidencePage> {
   requireEvidenceAccount(scope, expectedAccount);
@@ -196,126 +179,110 @@ export async function readBabysitterEvidence(deps: EvidenceDeps, scope: { orgId:
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw invalid("limit must be 1..100");
   const includeDeleted = query.include_deleted === "true";
   const digest = scopeDigest([scope.orgId, scope.workspaceId, query.kind, query.source ?? "", query.session_id ?? "", includeDeleted]);
-  const position = query.cursor === undefined ? null : decodeCursor(query.cursor, digest);
-  const now = (deps.now ?? Date.now)();
+  const after = query.cursor === undefined ? null : decodeCursor(query.cursor, digest);
   const signal = AbortSignal.timeout(deps.deadlineMs ?? 3000);
 
-  const filter = { source: query.source ?? null, sessionId: query.session_id ?? null };
-  const rows: { record: EvidenceRecord; at: Position }[] = [];
-  let after: { machineId: string; ref: string; inclusive: boolean } | null = position ? { machineId: position[0], ref: position[1], inclusive: true } : null;
-  let last: Position | null = position;   // the last position fully processed
-  let bucketsSeen = 0, objectsRead = 0, exhausted = false, bound = false;
-  outer: for (;;) {
-    const page = await deps.buckets(scope, filter, after, PAGE_BUCKETS);
-    for (const b of page) {
-      if (++bucketsSeen > MAX_BUCKETS_PER_PAGE) { bound = true; break outer; }
-      const resume = position && b.machineId === position[0] && b.ref === position[1] ? position : null;
-      const keys = (await deps.objectKeys(evidenceBucketPrefix(deps.keyRoot, scope, b), signal)).sort(compareC)
-        .filter((k) => !resume || compareC(k, resume[2]) >= 0);
-      for (const key of keys) {
-        if (objectsRead >= MAX_OBJECTS_PER_PAGE) { bound = true; break outer; }
-        objectsRead++;
-        const fromLine = resume && key === resume[2] ? resume[3] : -1;
-        const lines = parseLines(await deps.object(key, signal)).filter((x) => x.index > fromLine && x.line.kind === query.kind
-          // The bucket row is the authority for (source, session); a line that disagrees is not served.
-          && x.line.source === b.source && (x.line.session_id ?? null) === b.sessionId);
-        const committed = lines.length === 0 ? new Map() : await deps.revisions(scope, lines.map((x) => [x.line.origin_id, x.line.record_id] as [string, string]));
-        for (const { line: l, index } of lines) {
-          const at: Position = [b.machineId, b.ref, key, index];
-          const r = visible(l, committed.get(keyOf(l.origin_id, l.record_id)), includeDeleted, now);
-          if (r) rows.push({ record: r, at });
-          if (rows.length > limit) break outer;
-          last = at;
-        }
-        last = [b.machineId, b.ref, key, Number.MAX_SAFE_INTEGER];
-      }
-      last = [b.machineId, b.ref, "\uffff", Number.MAX_SAFE_INTEGER];
+  const page = await deps.page(scope, { kind: query.kind, source: query.source ?? null, sessionId: query.session_id ?? null, after, limit: limit + 1, includeDeleted });
+  // Take rows in native order until the limit or the distinct-object bound.
+  const taken: EvidencePageRow[] = [];
+  const keys = new Map<string, string>();   // object key per row index
+  const objects = new Set<string>();
+  let cutByObjects = false;
+  for (const row of page.rows.slice(0, limit)) {
+    if (row.operation === "upsert") {
+      if (!OBJECT.test(row.object) || !Number.isSafeInteger(row.line) || row.line < 0) throw unavailable();
+      const key = evidenceBucketPrefix(deps.keyRoot, scope, row) + "raw/" + row.object;
+      if (!objects.has(key) && objects.size >= MAX_OBJECTS_PER_PAGE) { cutByObjects = true; break; }
+      objects.add(key);
+      keys.set(`${taken.length}`, key);
     }
-    if (page.length < PAGE_BUCKETS) { exhausted = true; break; }
-    const tail = page[page.length - 1]!;
-    after = { machineId: tail.machineId, ref: tail.ref, inclusive: false };
+    taken.push(row);
   }
-  // More: a (limit+1)th visible record was found, or a work bound stopped the scan.
-  const more = rows.length > limit || (bound && !exhausted);
-  const records = rows.slice(0, limit);
-  // `last` is the last position fully processed before the (limit+1)th record (or the bound):
-  // at or past the limit-th record, possibly the end of its object or bucket, so a
-  // continuation never rereads a finished object; anything skipped in between was invisible.
-  const cursorAt = last;
-  const build = (recs: EvidenceRecord[], at: Position | null): EvidencePage => ({ protocolVersion: 1, listing: "live", records: recs,
-    nextCursor: at ? b64url(JSON.stringify({ v: 2, scope: digest, position: at })) : null });
-  let out = build(records.map((r) => r.record), more ? cursorAt : null);
+  // GET exactly those objects (bounded concurrency, the request deadline).
+  const bodies = new Map<string, string[]>();
+  const queue = [...objects];
+  await Promise.all(Array.from({ length: Math.min(OBJECT_CONCURRENCY, queue.length) }, async () => {
+    for (let key = queue.shift(); key !== undefined; key = queue.shift())
+      bodies.set(key, new TextDecoder().decode(await deps.object(key, signal)).split("\n"));
+  }));
+  const records: EvidenceRecord[] = taken.map((row, i) => {
+    const base = { schema_version: 1 as const, origin_id: row.originId, record_id: row.recordId, kind: query.kind!, source: row.source, session_id: row.sessionId ?? null,
+      revision_id: row.revisionId, revision: Number(row.revision) };
+    if (row.operation === "delete") return { ...base, operation: "delete", payload: null };
+    let l: Line;
+    try { l = JSON.parse(bodies.get(keys.get(`${i}`)!)![row.line] ?? "") as Line; } catch { throw unavailable(); }
+    // The indexed line must be exactly this revision of this record (fail closed otherwise).
+    if (!l || l.origin_id !== row.originId || l.record_id !== row.recordId || l.revision !== row.revision || l.revision_id !== row.revisionId
+        || l.kind !== query.kind || l.source !== row.source || (l.session_id ?? null) !== (row.sessionId ?? null) || l.operation !== "upsert")
+      throw unavailable();
+    return { ...base, operation: "upsert", payload: l.payload };
+  });
+  // The next cursor: the last record decided, whenever any bound (limit+1, objects, scan) cut the page.
+  const last = records[records.length - 1];
+  // Scan-bound cut: scannedTo is the last record SQL decided (>= every emitted row).
+  const at: [string, string] | null = cutByObjects || page.rows.length > limit
+    ? (last ? [last.origin_id, last.record_id] : null)
+    : page.more ? page.scannedTo : null;
+  if ((cutByObjects || page.rows.length > limit || page.more) && !at) throw unavailable();
+  const build = (recs: EvidenceRecord[], cursorAt: [string, string] | null): EvidencePage => ({ protocolVersion: 1, listing: "live", records: recs,
+    nextCursor: cursorAt ? b64url(JSON.stringify({ v: 1, scope: digest, position: cursorAt })) : null });
+  let out = build(records, at);
   let kept = records.length;
   while (Buffer.byteLength(JSON.stringify(out)) > MAX_PAGE_BYTES) {
     if (kept <= 1) throw new EvidenceRequestError(413, "delivery_too_large", "Retained delivery record exceeds the readback byte limit");
     kept--;
-    out = build(records.slice(0, kept).map((r) => r.record), records[kept - 1]!.at);
+    const r = records[kept - 1]!;
+    out = build(records.slice(0, kept), [r.origin_id, r.record_id]);
   }
   return out;
 }
 
-/** Neon's visibility for one line: live, a tombstone (include_deleted), or nothing. */
-function visible(l: Line, c: { revision: bigint; revisionId: string } | undefined, includeDeleted: boolean, now: number): EvidenceRecord | null {
-  const base = { schema_version: 1 as const, origin_id: l.origin_id, record_id: l.record_id, kind: l.kind, source: l.source, session_id: l.session_id ?? null };
-  // Superseded or tombstoned since (a newer committed revision): never served (see header).
-  if (c && c.revision > BigInt(l.revision)) return null;
-  const expires = l.payload?.expires_at_ms;
-  if (typeof expires === "number" && expires <= now)
-    return includeDeleted ? { ...base, revision_id: l.revision_id, revision: Number(l.revision), operation: "delete", payload: null } : null;
-  return { ...base, revision_id: l.revision_id, revision: Number(l.revision), operation: "upsert", payload: l.payload };
+const str = (v: unknown): v is string => typeof v === "string";
+
+/** Strict shape of one SQL page (anything else is a 503, never a partial page). */
+function parsePage(v: unknown): { rows: EvidencePageRow[]; more: boolean; scannedTo: [string, string] | null } {
+  const p = v as { rows?: unknown; more?: unknown; scannedTo?: unknown };
+  if (!p || !Array.isArray(p.rows) || typeof p.more !== "boolean") throw unavailable();
+  const scannedTo = p.scannedTo === null || p.scannedTo === undefined ? null : p.scannedTo;
+  if (scannedTo !== null && !(Array.isArray(scannedTo) && scannedTo.length === 2 && scannedTo.every(str))) throw unavailable();
+  for (const r of p.rows as Record<string, unknown>[]) {
+    if (!r || !str(r.originId) || !str(r.recordId) || !str(r.revision) || !/^[1-9][0-9]{0,17}$/.test(r.revision) || !str(r.revisionId) || !str(r.source)
+        || (r.sessionId !== null && !str(r.sessionId)) || (r.operation !== "upsert" && r.operation !== "delete"))
+      throw unavailable();
+    if (r.operation === "upsert" && (!str(r.machineId) || !str(r.ref) || !str(r.object) || !Number.isSafeInteger(r.line))) throw unavailable();
+  }
+  return { rows: p.rows as EvidencePageRow[], more: p.more, scannedTo: scannedTo as [string, string] | null };
 }
 
 /**
  * The read worker's deps over the read role's tenant runner and a raw store built PER CALL
- * with a fetcher bound to the request's abort signal (so list and get honor the deadline).
+ * with a fetcher bound to the request's abort signal (so every GET honors the deadline).
  * Backend failures surface as 503 `backend_unavailable` (never a payload, key or message).
  */
 export function sqlEvidenceDeps(
   run: <T>(orgId: string, workspaceId: string, work: (q: { query<R = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{ rows: R[] }> }) => Promise<T>) => Promise<T>,
-  storeFor: (signal: AbortSignal) => { list(prefix: never, cursor?: string): Promise<{ items: { key: unknown }[]; nextCursor?: string }>; getObject(key: never): Promise<{ body: unknown }> } | undefined,
+  storeFor: (signal: AbortSignal) => { getObject(key: never): Promise<{ body: unknown }> } | undefined,
   read: (body: unknown, signal: AbortSignal) => Promise<Uint8Array>,
   decompress: (bytes: Uint8Array) => Uint8Array,
   objectKey: (key: string) => never,
   keyRoot: string,
 ): EvidenceDeps {
-  const unavailable = () => new EvidenceRequestError(503, "backend_unavailable", "read backend unavailable");
   const guard = async <T>(work: () => Promise<T>): Promise<T> => {
     try { return await work(); } catch (e) { if (e instanceof EvidenceRequestError) throw e; throw unavailable(); }
   };
-  const store = (signal: AbortSignal) => { signal.throwIfAborted(); const s = storeFor(signal); if (!s) throw unavailable(); return s; };
   return {
     keyRoot,
-    buckets: (scope, filter, after, limit) => guard(async () => {
+    page: (scope, req) => guard(async () => {
       const { rows } = await run(scope.orgId, scope.workspaceId, (q) =>
-        q.query<{ v: unknown }>("SELECT sessions.babysitter_evidence_buckets_for($1, $2::jsonb, $3::jsonb, $4) AS v", [scope.workspaceId, JSON.stringify(filter), JSON.stringify(after), limit]));
-      const v = rows[0]?.v;
-      if (!Array.isArray(v)) throw unavailable();
-      return v as EvidenceBucket[];
+        q.query<{ v: unknown }>("SELECT sessions.babysitter_evidence_page_for($1, $2::jsonb) AS v", [scope.workspaceId, JSON.stringify(req)]));
+      return parsePage(rows[0]?.v);
     }),
-    revisions: (scope, keys) => guard(async () => {
-      const out = new Map<string, { revision: bigint; revisionId: string }>();
-      for (let i = 0; i < keys.length; i += 2000) {
-        const { rows } = await run(scope.orgId, scope.workspaceId, (q) =>
-          q.query<{ v: unknown }>("SELECT sessions.babysitter_evidence_revisions_for($1, $2::jsonb) AS v", [scope.workspaceId, JSON.stringify(keys.slice(i, i + 2000))]));
-        const v = rows[0]?.v;
-        if (!Array.isArray(v)) throw unavailable();
-        for (const e of v as [string, string, string, string][]) out.set(keyOf(e[0], e[1]), { revision: BigInt(e[2]), revisionId: e[3] });
-      }
-      return out;
+    object: (key, signal) => guard(async () => {
+      signal.throwIfAborted();
+      const s = storeFor(signal);
+      if (!s) throw unavailable();
+      return decompress(await read((await s.getObject(objectKey(key))).body, signal));
     }),
-    objectKeys: (prefix, signal) => guard(async () => {
-      const s = store(signal);
-      const keys: string[] = [];
-      let cursor: string | undefined;
-      do {
-        signal.throwIfAborted();
-        const page = await s.list(objectKey(prefix.slice(0, -1)), cursor);
-        keys.push(...page.items.map((i) => String(i.key)).filter((k) => k.startsWith(prefix)));
-        cursor = page.nextCursor;
-      } while (cursor);
-      return keys;
-    }),
-    object: (key, signal) => guard(async () => decompress(await read((await store(signal).getObject(objectKey(key))).body, signal))),
   };
 }
 

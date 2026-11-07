@@ -53,9 +53,9 @@ test("versions that survive the deletes are never acknowledged as erased", async
   await expect(g.eraser.eraseObject(prefix + "a")).rejects.toMatchObject({ code: "erasure_inventory_changed" });
 });
 
-test("listVersions refuses a key outside the requested prefix; removeVersions refuses before any delete", async () => {
+test("the paged eraser refuses a key outside the requested prefix before any delete of that page", async () => {
   const f = fixture((d) => doc([[prefix + "a", "1"], ["96bulls/other/x", "2"]], d));
-  await expect(f.eraser.listVersions(prefix)).rejects.toMatchObject({ code: "erasure_foreign_key" });
-  await expect(f.eraser.removeVersions(prefix, [{ key: prefix + "a", versionId: "1" }, { key: "96bulls/other/x", versionId: "2" }])).rejects.toMatchObject({ code: "erasure_foreign_key" });
+  await expect(f.eraser.eraseStep(prefix, { scope: "s", authorize: async () => {} })).rejects.toMatchObject({ code: "erasure_foreign_key" });
+  await expect(f.eraser.verifyErased(prefix, { authorize: async () => {} })).rejects.toMatchObject({ code: "erasure_foreign_key" });
   expect(f.deleted.size).toBe(0);
 });

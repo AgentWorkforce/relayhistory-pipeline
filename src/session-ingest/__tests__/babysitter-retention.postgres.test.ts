@@ -8,13 +8,17 @@ import { zstdDecompressSync } from "node:zlib";
 import { runMigrations, type MigrationProfile } from "../../hoopdb/migrate.ts";
 import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
 import { sqlLedger } from "../ledger-sql.ts";
-import { babysitterRetentionTick, sqlBabysitterRetentionLedger } from "../babysitter-retention.ts";
+import { babysitterRetentionTick, bucketRefs, eraseScope, planBabysitterBuckets, retentionTargets, sqlBabysitterRetentionLedger, writeBucketObjects } from "../babysitter-retention.ts";
+import { evidenceAccount, readBabysitterEvidence, sqlEvidenceDeps, type EvidenceDeps } from "../../session-read-api/babysitter-evidence.ts";
+import { createReadApi } from "../../session-read-api/app.ts";
+import { FakeS3Versions } from "../../migration/__tests__/fake-s3-versions.ts";
+import type { EraseStepOptions } from "../../migration/neon-s3-erasure/eraser.ts";
 import { liveMachineId } from "../writer.ts";
 import { readBufferedStage } from "../staging.ts";
 import { deliverBatch } from "../deliver.ts";
 import { deliveryAccount, prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { batch, record, scratchStore } from "./support.ts";
-import { objectKey } from "../../shared/vendor.ts";
+import { objectKey, readAll } from "../../shared/vendor.ts";
 import type { BabysitterRetentionRequest } from "../ledger.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
@@ -73,10 +77,21 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     return { batchId, batchDigest: digest, claimToken: token, resetEpoch: reset };
   };
   const bucket = (h: number, session: string | null, source = "claude"): BabysitterRetentionRequest => ({ source, sessionId: session, eraseAfterMs: hourAhead(h) });
-  /** Register under a FRESH claim (snapshot now), or under a given one. */
-  const register = async (t: Tenant, buckets: BabysitterRetentionRequest[], claim?: Awaited<ReturnType<typeof seedClaim>>, gen = generation) => {
+  /** Commit (owner) the revisions a delivery would have committed: the reader serves only committed revisions. */
+  const commitRevision = (t: Tenant, recordId: string, revision: number, revisionId: string, source: string, session: string | null) => pool.query(
+    `INSERT INTO sessions.ingest_record_revisions AS r(org_id,workspace_id,origin_id,record_id,revision,revision_id,digest,user_id,source,session_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+     ON CONFLICT(org_id,workspace_id,origin_id,record_id) DO UPDATE SET revision=EXCLUDED.revision,revision_id=EXCLUDED.revision_id,digest=EXCLUDED.digest`,
+    [t.orgId, t.workspaceId, ORIGIN, recordId, revision, revisionId, createHash("sha256").update(revisionId).digest("hex"), t.userId, source, session]);
+  /** Register under a FRESH claim (snapshot now), or under a given one; by default one committed upsert row per bucket. */
+  const register = async (t: Tenant, buckets: BabysitterRetentionRequest[], claim?: Awaited<ReturnType<typeof seedClaim>>, gen = generation,
+    records?: { bucket: number; originId: string; recordId: string; revision: string; revisionId: string; operation: "upsert" | "delete"; kind: string; line: number | null; expiresAtMs: number | null }[]) => {
     const c = claim ?? await seedClaim(t, [...new Set(buckets.filter((b) => b.sessionId).map((b) => b.sessionId!))]);
-    return sqlLedger(run).registerBabysitterRetention!({ tenant: t, originId: ORIGIN, ...c, generation: gen, buckets });
+    const n = ++serial;
+    const recs = records ?? buckets.map((b, i) => ({ bucket: i, originId: ORIGIN, recordId: `rec-${n}-${i}`, revision: "1", revisionId: `rec-${n}-${i}:1`, operation: "upsert" as const,
+      kind: "turn_receipt", line: 0, expiresAtMs: b.eraseAfterMs }));
+    const out = await sqlLedger(run).registerBabysitterRetention!({ tenant: t, originId: ORIGIN, ...c, generation: gen, buckets, records: recs });
+    if (!records) for (const [i, r] of recs.entries()) await commitRevision(t, r.recordId, 1, r.revisionId, buckets[i]!.source, buckets[i]!.sessionId);
+    return out;
   };
   const refOfReg = async (t: Tenant, b: BabysitterRetentionRequest) => (await register(t, [b])).objects[0]!.ref;
   const row = async (ref: string) => (await pool.query("SELECT * FROM sessions.babysitter_retention_objects WHERE object_ref=$1", [ref])).rows[0];
@@ -92,27 +107,46 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     await pool.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,$3,$4,'claude',$5) ON CONFLICT DO NOTHING", [t.orgId, t.workspaceId, t.userId, ORIGIN, session]);
   };
   const enable = (t: Tenant, session: string) => pool.query("DELETE FROM sessions.upload_deletions WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 AND origin_id=$4 AND source='claude' AND session_id=$5", [t.orgId, t.workspaceId, t.userId, ORIGIN, session]);
-  /** The reader's bucket RPC exactly as the read API runs it: read role, tenant bound, READ ONLY. */
-  const readerBuckets = async (bound: { org: string; ws: string } | null, ws: string, filter = { source: null, sessionId: null },
-    after: { machineId: string; ref: string; inclusive: boolean } | null = null, limit = 200) => {
+  /** The read API's tenant runner: read role, verified binding, READ ONLY (exactly as the worker runs it). */
+  const readRun = (bound: { org: string; ws: string } | null) => async <T>(_o: string, _w: string, work: (q: { query<R = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{ rows: R[] }> }) => Promise<T>): Promise<T> => {
     const c = await pool.connect();
     try {
       await c.query("BEGIN READ ONLY;SET LOCAL ROLE bulls96_read_api");
       if (bound) await c.query("SELECT set_config('bulls96_read.org_id',$1,true),set_config('bulls96_read.workspace_id',$2,true)", [bound.org, bound.ws]);
-      const r = await c.query("SELECT sessions.babysitter_evidence_buckets_for($1,$2::jsonb,$3::jsonb,$4) AS v", [ws, JSON.stringify(filter), JSON.stringify(after), limit]);
+      const out = await work(c as never);
       await c.query("COMMIT");
-      return (r.rows[0].v as { ref: string }[]).map((b) => b.ref);
+      return out;
     } catch (e) { await c.query("ROLLBACK").catch(() => {}); throw e; } finally { c.release(); }
   };
-  const visible = (t: Tenant) => readerBuckets({ org: t.orgId, ws: t.workspaceId }, t.workspaceId);
+  type PageReq = { kind?: string; source?: string | null; sessionId?: string | null; after?: [string, string] | null; limit?: number; includeDeleted?: boolean };
+  const readerPage = (bound: { org: string; ws: string } | null, ws: string, req: PageReq = {}) => readRun(bound)("", "", async (q) =>
+    (await q.query<{ v: { rows: { originId: string; recordId: string; operation: string; ref?: string; revision: string }[]; more: boolean; scannedTo: [string, string] | null } }>(
+      "SELECT sessions.babysitter_evidence_page_for($1,$2::jsonb) AS v",
+      [ws, JSON.stringify({ kind: "turn_receipt", source: null, sessionId: null, after: null, limit: 101, includeDeleted: false, ...req })])).rows[0]!.v);
+  /** The buckets whose live rows the reader serves (walks every page). */
+  const visible = async (t: Tenant) => {
+    const refs: string[] = [];
+    let after: [string, string] | null = null;
+    for (let i = 0; i < 200; i++) {
+      const p = await readerPage({ org: t.orgId, ws: t.workspaceId }, t.workspaceId, { after });
+      refs.push(...p.rows.filter((r) => r.operation === "upsert").map((r) => r.ref!));
+      if (!p.more) break;
+      after = p.rows.length > 100 ? [p.rows[99]!.originId, p.rows[99]!.recordId] : p.scannedTo;
+    }
+    return refs;
+  };
   const audit = async (ref: string) => (await pool.query("SELECT action FROM sessions.babysitter_retention_audit WHERE object_ref=$1 ORDER BY id", [ref])).rows.map((r) => r.action);
   const code = async (p: Promise<unknown>) => { try { await p; return "none"; } catch (e) { return (e as { code?: string }).code ?? "error"; } };
   const migrate = async () => { const c = await pool.connect(); try { return await runMigrations(c, { profile }); } finally { c.release(); } };
   const claimAll = async () => (await sweeper().claim(200)).objects;
   const releaseAll = async (objs: { leaseToken: string }[]) => { for (const o of objs) await sweeper().complete(o.leaseToken, "released", 0); };
+  /** A PagedEraser double recording the directory it erased (after authorize), then a zero proof. */
   const recEraser = () => {
     const removed: string[] = [];
-    return { removed, eraser: { listVersions: async (p: string) => [{ key: `${p}raw/b=x.ndjson.zst`, versionId: "v1" }], removeVersions: async (_p: string, l: readonly { key: string }[]) => { removed.push(...l.map((x) => x.key)); return l.length; } } };
+    return { removed, eraser: {
+      eraseStep: async (p: string, o: EraseStepOptions) => { await o.authorize(); removed.push(`${p}raw/b=x.ndjson.zst`); return { status: "traversed" as const, deleted: 1, listed: 1 }; },
+      verifyErased: async (_p: string, o: { authorize: () => Promise<void> }) => { await o.authorize(); return { status: "erased" as const, listed: 0 }; },
+    } };
   };
 
   beforeAll(async () => {
@@ -151,13 +185,13 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
       WHERE n.nspname='sessions' AND p.prosecdef AND (p.proname LIKE '%babysitter%') AND has_function_privilege($1,p.oid,'EXECUTE') ORDER BY 1`, [role])).rows.map((r) => r.f);
     expect(await secdef("bulls96_session_ingest")).toEqual(["sessions.ingest_babysitter_retention_register(jsonb)"]);
     expect(await secdef("bulls96_babysitter_retention")).toEqual(["sessions.ingest_babysitter_retention_claim(jsonb)", "sessions.ingest_babysitter_retention_complete(jsonb)", "sessions.ingest_babysitter_retention_fence(jsonb)"]);
-    expect(await secdef("bulls96_read_api")).toEqual(["sessions.babysitter_evidence_buckets_for(text,jsonb,jsonb,integer)", "sessions.babysitter_evidence_revisions_for(text,jsonb)"]);
+    expect(await secdef("bulls96_read_api")).toEqual(["sessions.babysitter_evidence_page_for(text,jsonb)"]);
     const all = (await pool.query(`SELECT p.oid::regprocedure::text AS f FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
       WHERE n.nspname='sessions' AND p.prosecdef AND has_function_privilege('bulls96_babysitter_retention',p.oid,'EXECUTE') ORDER BY 1`)).rows.map((r) => r.f);
     expect(all).toEqual(["sessions.ingest_babysitter_retention_claim(jsonb)", "sessions.ingest_babysitter_retention_complete(jsonb)", "sessions.ingest_babysitter_retention_fence(jsonb)"]);
     expect((await pool.query("SELECT rolcanlogin FROM pg_roles WHERE rolname='bulls96_babysitter_retention'")).rows[0].rolcanlogin).toBe(false);
     for (const r of ["bulls96_session_ingest", "bulls96_babysitter_retention", "bulls96_read_api"])
-      for (const t of ["babysitter_retention_settings", "babysitter_retention_objects", "babysitter_retention_audit"])
+      for (const t of ["babysitter_retention_settings", "babysitter_retention_objects", "babysitter_retention_audit", "babysitter_evidence_index"])
         expect((await pool.query("SELECT has_table_privilege($1,'sessions.'||$2,'SELECT') AS s", [r, t])).rows[0].s).toBe(false);
     expect(await code(asIngest("SELECT sessions.ingest_babysitter_retention_claim($1::jsonb)", [JSON.stringify({ generation, limit: 1 })]))).toBe("42501");
     expect(await code(asRetention("SELECT sessions.ingest_babysitter_retention_register($1::jsonb)", [JSON.stringify({})]))).toBe("42501");
@@ -248,7 +282,22 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
       expect(await code(register(t, [bad as never]))).toBe("ledger_input_refused");
     const claim = await seedClaim(t, ["sess-1"]);
     // A reset since the claim, a stale generation, or a foreign claim token: refused, nothing registered.
-    expect(await code(sqlLedger(run).registerBabysitterRetention!({ tenant: t, originId: ORIGIN, ...claim, resetEpoch: 7, generation, buckets: [b] }))).toBe("ledger_sqlstate_40001");
+    const one = [{ bucket: 0, originId: ORIGIN, recordId: "reg-r", revision: "1", revisionId: "reg-r:1", operation: "upsert" as const, kind: "turn_receipt", line: 0, expiresAtMs: b.eraseAfterMs }];
+    expect(await code(sqlLedger(run).registerBabysitterRetention!({ tenant: t, originId: ORIGIN, ...claim, resetEpoch: 7, generation, buckets: [b], records: one }))).toBe("ledger_sqlstate_40001");
+    // Index rows are validated too: a record outside the buckets, a bad position or operation, a changed revision identity.
+    for (const bad of [{ ...one[0]!, bucket: 1 }, { ...one[0]!, line: null }, { ...one[0]!, operation: "delete" }, { ...one[0]!, kind: "session_event" }, { ...one[0]!, revision: "0" }])
+      expect(await code(register(t, [b], undefined, generation, [bad as never]))).toBe("ledger_input_refused");
+    await register(t, [b], undefined, generation, one);
+    expect(await code(register(t, [b], undefined, generation, [{ ...one[0]!, revisionId: "other" }]))).toBe("ledger_input_refused");
+    // Cross-user: a record of another origin, or another user's registration of the same revision, is refused;
+    // and a revision committed by another user is never served from this user's bucket.
+    expect(await code(register(t, [b], undefined, generation, [{ ...one[0]!, originId: "origin-other" }]))).toBe("ledger_input_refused");
+    const mallory = tenantOf("u-mallory");
+    expect(await code(register(mallory, [b], undefined, generation, one))).toBe("ledger_input_refused");
+    await commitRevision(mallory, "x-steal", 1, "x-steal:1", "claude", "sess-1");
+    await pool.query("UPDATE sessions.ingest_record_revisions SET user_id='u-other' WHERE record_id='x-steal'");
+    await register(mallory, [b], undefined, generation, [{ ...one[0]!, recordId: "x-steal", revisionId: "x-steal:1" }]);
+    expect((await readerPage({ org: t.orgId, ws: t.workspaceId }, t.workspaceId, { includeDeleted: true, limit: 101 })).rows.some((r) => r.recordId === "x-steal")).toBe(false);
     expect(await code(register(t, [b], claim, "f".repeat(64)))).toBe("ledger_sqlstate_55000");
     expect(await code(register(t, [b], { ...claim, claimToken: crypto.randomUUID() }))).toBe("ledger_sqlstate_40001");
     expect(await code(pool.query("SELECT sessions.ingest_babysitter_retention_register($1::jsonb)", [JSON.stringify({})]))).toBe("42501");
@@ -283,7 +332,7 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     expect(await visible(t)).not.toContain(before);
     await age(before, false);
     const { removed, eraser } = recEraser();
-    expect((await babysitterRetentionTick({ ledger: sweeper(), eraser, keyRoot: "96bulls", mode: "on", limit: 200 })).erased).toBeGreaterThanOrEqual(1);
+    expect((await babysitterRetentionTick({ ledger: sweeper(), eraser, keyRoot: "96bulls", generation, mode: "on", limit: 200 })).erased).toBeGreaterThanOrEqual(1);
     expect(removed.some((k) => k.includes(`/s=${before}/`))).toBe(true);
     expect(await row(before)).toMatchObject({ state: "erased", erase_reason: "fenced" });
     // New writes after the re-enable: a new bucket (new fence epoch), kept and readable.
@@ -314,7 +363,7 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
       expect(await code(register(t, [bucket(401, "gen-sess")]))).toBe("ledger_sqlstate_55000");
       // The whole tick is refused at its claim under a stale generation: nothing listed, nothing deleted.
       const { removed, eraser } = recEraser();
-      expect(await code(babysitterRetentionTick({ ledger: sweeper(), eraser, keyRoot: "96bulls", mode: "on", limit: 200 }))).toBe("ledger_sqlstate_55000");
+      expect(await code(babysitterRetentionTick({ ledger: sweeper(), eraser, keyRoot: "96bulls", generation, mode: "on", limit: 200 }))).toBe("ledger_sqlstate_55000");
       expect(removed).toEqual([]);
     } finally {
       await pool.query("UPDATE sessions.__96bulls_role_validation SET generation=$1 WHERE name='session_directory_search_worker'", [marker]);
@@ -324,59 +373,123 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     await configure(false, true);
   });
 
-  test("reader RPC: tenant-pinned to the verified binding; expired, fenced and erased buckets are never listed", async () => {
+  test("reader RPC: tenant-pinned to the verified binding; expired, fenced and erased buckets are never served live; bounds refused", async () => {
     const t = tenantOf("u-reader");
     const live = await refOfReg(t, bucket(600, "rd-sess"));
-    await pool.query("UPDATE sessions.babysitter_retention_objects SET erase_after=clock_timestamp()-interval '1 minute' WHERE object_ref=$1", [await refOfReg(t, bucket(601, "rd-exp"))]);
-    expect(await visible(t)).toContain(live);
-    expect(await visible(t)).toHaveLength(new Set(await visible(t)).size);
-    expect(await code(readerBuckets(null, t.workspaceId))).toBe("42501");
-    expect(await code(readerBuckets({ org: t.orgId, ws: "ws-other" }, t.workspaceId))).toBe("42501");
-    expect(await readerBuckets({ org: "org-other", ws: t.workspaceId }, t.workspaceId)).toEqual([]);
-    expect(await readerBuckets({ org: t.orgId, ws: t.workspaceId }, t.workspaceId, { source: null, sessionId: "rd-exp" } as never)).toEqual([]);
-    expect(await code(asIngest("SELECT sessions.babysitter_evidence_buckets_for($1,$2::jsonb,null,10)", [t.workspaceId, JSON.stringify({ source: null, sessionId: null })]))).toBe("42501");
+    const exp = await refOfReg(t, bucket(601, "rd-exp"));
+    await pool.query("UPDATE sessions.babysitter_retention_objects SET erase_after=clock_timestamp()-interval '1 minute' WHERE object_ref=$1", [exp]);
+    const v = await visible(t);
+    expect(v).toContain(live);
+    expect(v).not.toContain(exp);
+    const bound = { org: t.orgId, ws: t.workspaceId };
+    expect(await code(readerPage(null, t.workspaceId))).toBe("42501");
+    expect(await code(readerPage({ org: t.orgId, ws: "ws-other" }, t.workspaceId))).toBe("42501");
+    expect((await readerPage({ org: "org-other", ws: t.workspaceId }, t.workspaceId)).rows).toEqual([]);
+    expect((await readerPage(bound, t.workspaceId, { sessionId: "rd-exp" })).rows).toEqual([]);
+    // Expired under include_deleted: Neon's read-time tombstone (no payload position).
+    expect((await readerPage(bound, t.workspaceId, { sessionId: "rd-exp", includeDeleted: true })).rows).toEqual([expect.objectContaining({ operation: "delete", revision: "1" })]);
+    for (const bad of [{ limit: 0 }, { limit: 102 }, { after: ["only-one"] as never }, { kind: "session_event" }])
+      expect(await code(readerPage(bound, t.workspaceId, bad))).toBe("22023");
+    expect(await code(asIngest("SELECT sessions.babysitter_evidence_page_for($1,$2::jsonb)", [t.workspaceId, JSON.stringify({ kind: "turn_receipt", source: null, sessionId: null, after: null, limit: 1, includeDeleted: false })]))).toBe("42501");
   });
 
-  test("P1 reader RPC: 2500 buckets page by keyset (limit 1, continuation, no 54000 raise), bounds refused, index range scan", async () => {
-    const t = { ...tenantOf("u-page"), workspaceId: "ws-page" };
-    await pool.query(`INSERT INTO sessions.babysitter_retention_objects(org_id,workspace_id,user_id,origin_id,machine_id,object_ref,source,session_id,reset_epoch,fence_epoch,erase_after)
-      SELECT $1,$2,$3,$4,'srv_'||repeat('a',32),'_bx2026112114-'||lpad(to_hex(g),16,'0'),'claude',NULL,0,0,clock_timestamp()+interval '10 days' FROM generate_series(0,2499) g`,
-      [t.orgId, t.workspaceId, t.userId, ORIGIN]);
-    const bound = { org: t.orgId, ws: t.workspaceId };
-    const ref = (g: number) => "_bx2026112114-" + g.toString(16).padStart(16, "0");
-    const first = await readerBuckets(bound, t.workspaceId, undefined, null, 1);
-    expect(first).toEqual([ref(0)]);
-    const m = "srv_" + "a".repeat(32);
-    expect(await readerBuckets(bound, t.workspaceId, undefined, { machineId: m, ref: ref(0), inclusive: false }, 2)).toEqual([ref(1), ref(2)]);
-    expect(await readerBuckets(bound, t.workspaceId, undefined, { machineId: m, ref: ref(0), inclusive: true }, 2)).toEqual([ref(0), ref(1)]);
-    expect(await readerBuckets(bound, t.workspaceId, undefined, { machineId: m, ref: ref(2498), inclusive: false }, 200)).toEqual([ref(2499)]);
-    // Walk the whole set at the max page: every bucket exactly once, no raise above 2000.
-    const all: string[] = [];
-    let after: { machineId: string; ref: string; inclusive: boolean } | null = null;
-    for (;;) {
-      const page = await readerBuckets(bound, t.workspaceId, undefined, after, 200);
-      all.push(...page);
-      if (page.length < 200) break;
-      after = { machineId: m, ref: page[page.length - 1]!, inclusive: false };
+  // ---- §1/§2 differential: storage order != native order; tombstones; supersession; expiry; disable/re-enable ----
+  const DT = { orgId: "org-a", workspaceId: "ws-diff", userId: "u-diff" };
+  const ev = (id: string, session: string, rev: number, expiresAtMs: number, payloadId = id) => ({ kind: "turn_receipt", operation: "upsert", origin_id: ORIGIN, record_id: id,
+    revision: rev, revision_id: `${id}:${rev}`, source: "claude", session_id: session, payload: { id: payloadId, retention_class: "standard_30d", expires_at_ms: expiresAtMs } });
+  const gone = (id: string, session: string, rev: number) => ({ kind: "turn_receipt", operation: "delete", origin_id: ORIGIN, record_id: id, revision: rev, revision_id: `${id}:${rev}`,
+    source: "claude", session_id: session, payload: null });
+  /** One batch exactly as deliver routes it: plan -> register (index rows) -> bucket objects -> commit. */
+  const deliverIndexed = async (t: Tenant, store: Parameters<typeof writeBucketObjects>[0]["store"], records: Record<string, unknown>[], commit = (_r: Record<string, unknown>) => true) => {
+    const claim = await seedClaim(t, [...new Set(records.map((r) => r.session_id as string))]);
+    const plan = planBabysitterBuckets(records as never, Date.now());
+    const reg = await register(t, plan.requests, claim, generation, plan.entries);
+    await writeBucketObjects({ store, keyRoot: "96bulls" }, { orgId: t.orgId, workspaceId: t.workspaceId, userId: t.userId, originId: ORIGIN, batchDigest: claim.batchDigest }, plan, bucketRefs(plan, reg.objects), new Date());
+    for (const r of records) if (commit(r)) await commitRevision(t, r.record_id as string, r.revision as number, r.revision_id as string, "claude", r.session_id as string);
+  };
+  const evidence = (store: Parameters<typeof writeBucketObjects>[0]["store"]): EvidenceDeps => sqlEvidenceDeps(readRun({ org: DT.orgId, ws: DT.workspaceId }) as never, () => store as never,
+    (b) => readAll(b as never), (bytes) => new Uint8Array(zstdDecompressSync(bytes)), (k) => objectKey(k) as never, "96bulls");
+  const walk = async (d: EvidenceDeps, q: Record<string, string>, limit: number) => {
+    const out: { id: string; op: string; rev: number; payload: unknown }[] = [];
+    let cursor: string | null = null;
+    for (let i = 0; i < 50; i++) {
+      const p = await readBabysitterEvidence(d, DT, { ...q, limit: String(limit), ...(cursor ? { cursor } : {}) }, evidenceAccount(DT));
+      out.push(...p.records.map((r) => ({ id: r.record_id, op: r.operation, rev: r.revision, payload: r.payload === null ? null : (r.payload as { id: string }).id })));
+      cursor = p.nextCursor;
+      if (!cursor) break;
     }
-    expect(all).toHaveLength(2500);
-    expect(new Set(all).size).toBe(2500);
-    for (const bad of [0, 201]) expect(await code(readerBuckets(bound, t.workspaceId, undefined, null, bad))).toBe("22023");
-    expect(await code(readerBuckets(bound, t.workspaceId, undefined, { machineId: m } as never, 1))).toBe("22023");
-    // The index serves the keyset order itself (no sort): proven with seq scans priced out.
-    const c = await pool.connect();
-    let plan = "";
+    return out;
+  };
+
+  test("§1/§2 native (origin_id, record_id) order over storage order; a latest delete is Neon's tombstone exactly once; newer live wins; expiry, disable and re-enable keep privacy and stable pages (direct and through the route)", async () => {
+    const scratch = scratchStore();
     try {
-      await c.query("BEGIN;SET LOCAL enable_seqscan=off");
-      plan = (await c.query(`EXPLAIN SELECT 1 FROM sessions.babysitter_retention_objects o WHERE o.org_id=$1 AND o.workspace_id=$2
-        AND (o.machine_id COLLATE "C",o.object_ref COLLATE "C")>($3 COLLATE "C",$4 COLLATE "C")
-        ORDER BY o.machine_id COLLATE "C",o.object_ref COLLATE "C" LIMIT 65`, [t.orgId, t.workspaceId, m, ref(7)])).rows.map((r) => r["QUERY PLAN"]).join("\n");
-      await c.query("ROLLBACK");
-    } finally { c.release(); }
-    expect(plan).toContain("babysitter_retention_objects_reader_idx");
-    expect(plan).not.toContain("Sort");
-    await pool.query("DELETE FROM sessions.babysitter_retention_objects WHERE workspace_id='ws-page'");
-  });
+      const h50 = hourAhead(50) - 1, h60 = hourAhead(60) - 1;
+      await deliverIndexed(DT, scratch.store, [ev("r-c", "s1", 1, h50, "c1"), ev("r-a", "s1", 1, h50)]);         // storage: r-c before r-a
+      await deliverIndexed(DT, scratch.store, [ev("r-b", "s2", 1, h60)]);
+      await deliverIndexed(DT, scratch.store, [ev("r-aa", "s1", 1, h50), ev("r-e", "s1", 1, Date.now() - 1_000)]);  // r-e already expired
+      await deliverIndexed(DT, scratch.store, [gone("r-b", "s2", 2)]);                                          // a later delete
+      await deliverIndexed(DT, scratch.store, [ev("r-c", "s2", 2, h60, "c2")]);                                 // a newer live revision
+      const d = evidence(scratch.store);
+      const live = [{ id: "r-a", op: "upsert", rev: 1, payload: "r-a" }, { id: "r-aa", op: "upsert", rev: 1, payload: "r-aa" }, { id: "r-c", op: "upsert", rev: 2, payload: "c2" }];
+      const all = [live[0], live[1], { id: "r-b", op: "delete", rev: 2, payload: null }, live[2], { id: "r-e", op: "delete", rev: 1, payload: null }];
+      for (const limit of [1, 2, 3, 100]) {
+        expect(await walk(d, { kind: "turn_receipt" }, limit)).toEqual(live);
+        expect(await walk(d, { kind: "turn_receipt", include_deleted: "true" }, limit)).toEqual(all);
+      }
+      expect(await walk(d, { kind: "session_lineage", include_deleted: "true" }, 10)).toEqual([]);
+      expect(await walk(d, { kind: "turn_receipt", session_id: "s2", include_deleted: "true" }, 1)).toEqual([all[2], all[3]]);
+      // No superseded payload bytes anywhere: c1 is never served, not even as a tombstone.
+      expect(JSON.stringify(await walk(d, { kind: "turn_receipt", include_deleted: "true" }, 100))).not.toContain("c1");
+      // The actual route/worker composition returns exactly the direct reader's pages.
+      const app = createReadApi({ verify: async () => ({ orgId: DT.orgId, workspaceId: DT.workspaceId, userId: DT.userId, scopes: ["rth:read"] }) as never, ch: {} as never, liveness: {} as never, completeSinceMs: 0, babysitter: d });
+      let cursor = "";
+      for (let i = 0; i < 10; i++) {
+        const res = await app.fetch(new Request(`https://read.example/v1/delivery/records?kind=turn_receipt&include_deleted=true&limit=2${cursor ? `&cursor=${cursor}` : ""}`,
+          { headers: { authorization: "Bearer t", "X-RelayHistory-Expected-Account": evidenceAccount(DT) } }));
+        expect(res.status).toBe(200);
+        const body = await res.json() as { nextCursor: string | null };
+        expect(body).toEqual(await readBabysitterEvidence(d, DT, { kind: "turn_receipt", include_deleted: "true", limit: "2", ...(cursor ? { cursor } : {}) }, evidenceAccount(DT)) as never);
+        if (!body.nextCursor) break;
+        cursor = body.nextCursor;
+      }
+      // Disable s1: everything of s1 is hidden at once (even its tombstones), the rest pages stably.
+      await disable(DT, "s1");
+      const s2Only = [all[2], all[3]];
+      for (const limit of [1, 2]) expect(await walk(d, { kind: "turn_receipt", include_deleted: "true" }, limit)).toEqual(s2Only);
+      await enable(DT, "s1");
+      for (const limit of [1, 2]) expect(await walk(d, { kind: "turn_receipt", include_deleted: "true" }, limit)).toEqual(s2Only);
+      expect(await walk(d, { kind: "turn_receipt" }, 1)).toEqual([live[2]]);
+    } finally { scratch.done(); }
+  }, 60000);
+
+  test("§1 bounded scan: 1,100 uncommitted index rows before a live one end page 1 with a resumable cursor (no false end); page 2 serves it; the index serves the order", async () => {
+    const scratch = scratchStore();
+    const T = { ...DT, workspaceId: "ws-scan", userId: "u-scan" };
+    try {
+      const recs = Array.from({ length: 1100 }, (_, i) => ev(`n-${String(i).padStart(5, "0")}`, "s9", 1, hourAhead(70) - 1));
+      await deliverIndexed(T, scratch.store, [...recs, ev("z-live", "s9", 1, hourAhead(70) - 1)], (r) => r.record_id === "z-live");
+      const d = sqlEvidenceDeps(readRun({ org: T.orgId, ws: T.workspaceId }) as never, () => scratch.store as never, (b) => readAll(b as never),
+        (bytes) => new Uint8Array(zstdDecompressSync(bytes)), (k) => objectKey(k) as never, "96bulls");
+      const p1 = await readBabysitterEvidence(d, T, { kind: "turn_receipt" }, evidenceAccount(T));
+      expect(p1.records).toEqual([]);
+      expect(p1.nextCursor).not.toBeNull();
+      const p2 = await readBabysitterEvidence(d, T, { kind: "turn_receipt", cursor: p1.nextCursor! }, evidenceAccount(T));
+      expect(p2.records.map((r) => r.record_id)).toEqual(["z-live"]);
+      expect(p2.nextCursor).toBeNull();
+      const c = await pool.connect();
+      let plan = "";
+      try {
+        await c.query("BEGIN;SET LOCAL enable_seqscan=off");
+        plan = (await c.query(`EXPLAIN SELECT DISTINCT ON (i.origin_id COLLATE "C",i.record_id COLLATE "C") i.revision FROM sessions.babysitter_evidence_index i
+          WHERE i.org_id=$1 AND i.workspace_id=$2 AND i.kind='turn_receipt' AND (i.origin_id COLLATE "C",i.record_id COLLATE "C")>($3 COLLATE "C",$4 COLLATE "C")
+          ORDER BY i.origin_id COLLATE "C",i.record_id COLLATE "C",i.revision DESC`, [T.orgId, T.workspaceId, ORIGIN, "n-00500"])).rows.map((r) => r["QUERY PLAN"]).join("\n");
+        await c.query("ROLLBACK");
+      } finally { c.release(); }
+      expect(plan).toContain("babysitter_evidence_index_page_idx");
+      expect(plan).not.toMatch(/\bSort\b/);
+    } finally { scratch.done(); }
+  }, 60000);
 
   test("nothing is claimed while disabled; dry run cannot record an erase or pass the fence", async () => {
     const t = tenantOf("u-dis");
@@ -455,23 +568,82 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     await configure(false, true);
   });
 
-  test("the tick against real SQL: dry run releases; on snapshots, passes the fence, deletes exactly the snapshot", async () => {
+  test("the tick against real SQL: dry run releases; on erases the derived directory under the fence, proves zero, records erased and drops its index rows", async () => {
     const t = tenantOf("u-tick");
     const b = bucket(120, "tick-1");
     const ref = await refOfReg(t, b);
     await age(ref);
     await configure(true, true);
     const dry = recEraser();
-    expect((await babysitterRetentionTick({ ledger: sweeper(), eraser: dry.eraser, keyRoot: "96bulls", mode: "on", limit: 200 })).dry_run).toBe(true);
+    expect((await babysitterRetentionTick({ ledger: sweeper(), eraser: dry.eraser, keyRoot: "96bulls", generation, mode: "on", limit: 200 })).dry_run).toBe(true);
     expect(dry.removed).toEqual([]);
     await configure(true, false);
     const live = recEraser();
-    expect((await babysitterRetentionTick({ ledger: sweeper(), eraser: live.eraser, keyRoot: "96bulls", mode: "on", limit: 200 })).erased).toBeGreaterThanOrEqual(1);
+    expect((await babysitterRetentionTick({ ledger: sweeper(), eraser: live.eraser, keyRoot: "96bulls", generation, mode: "on", limit: 200 })).erased).toBeGreaterThanOrEqual(1);
     const d = new Date(b.eraseAfterMs), p2 = (n: number) => String(n).padStart(2, "0");
     expect(live.removed).toContain(`96bulls/org-a/v1/ws=ws-a/m=${liveMachineId(t.workspaceId, ORIGIN, t.userId)}/h=_babysitter/d=${d.getUTCFullYear()}/${p2(d.getUTCMonth() + 1)}/${p2(d.getUTCDate())}/s=${ref}/raw/b=x.ndjson.zst`);
     expect((await row(ref)).state).toBe("erased");
+    expect((await pool.query("SELECT count(*)::int AS n FROM sessions.babysitter_evidence_index WHERE object_ref=$1", [ref])).rows[0].n).toBe(0);
     await configure(false, true);
   });
+
+  test("§3 durable resumable erase on real SQL: 12,500 versions persist a bound checkpoint and stay pending; a new write clears it; only a fresh zero proof records erased", async () => {
+    await configure(true, false);
+    const t = tenantOf("u-big");
+    const b = bucket(720, "big-sess");
+    const ref = await refOfReg(t, b);
+    await age(ref);
+    const d = new Date(b.eraseAfterMs), p2 = (n: number) => String(n).padStart(2, "0");
+    const prefix = `96bulls/org-a/v1/ws=ws-a/m=${liveMachineId(t.workspaceId, ORIGIN, t.userId)}/h=_babysitter/d=${d.getUTCFullYear()}/${p2(d.getUTCMonth() + 1)}/${p2(d.getUTCDate())}/s=${ref}/`;
+    const s3 = new FakeS3Versions();
+    for (let i = 0; i < 12_500; i++) s3.put(`${prefix}raw/b=${String(i).padStart(32, "0")}.ndjson.zst`, 1_000);
+    const eraser = s3.eraser();
+    const r1 = await babysitterRetentionTick({ ledger: sweeper(), eraser, keyRoot: "96bulls", generation, mode: "on", limit: 200 });
+    expect(r1.codes.incomplete_versions).toBe(1);
+    let r = await row(ref);
+    expect(r).toMatchObject({ state: "pending", erase_runs: 1 });
+    expect(r.erase_checkpoint).toMatchObject({ v: 1, prefix, scope: eraseScope({ orgId: t.orgId, workspaceId: t.workspaceId, machineId: r.machine_id, ref, fenceEpoch: 0, resetEpoch: 0, writeSeq: 1 }, generation) });
+    expect(s3.count(prefix)).toBe(2_500);
+    expect(await audit(ref)).toContain("progress");
+    // A registration between runs (allowed: not leased) clears the checkpoint and bumps write_seq: never adopted.
+    await register(t, [b]);
+    r = await row(ref);
+    expect(r).toMatchObject({ erase_checkpoint: null, write_seq: "2" });
+    await age(ref);
+    const r2 = await babysitterRetentionTick({ ledger: sweeper(), eraser, keyRoot: "96bulls", generation, mode: "on", limit: 200 });
+    expect(r2.erased).toBeGreaterThanOrEqual(1);
+    expect(await row(ref)).toMatchObject({ state: "erased", erase_checkpoint: null });
+    expect(s3.count(prefix)).toBe(0);
+    expect((await pool.query("SELECT count(*)::int AS n FROM sessions.babysitter_evidence_index WHERE object_ref=$1", [ref])).rows[0].n).toBe(0);
+    await configure(false, true);
+  }, 120000);
+
+  test("§3 complete: progress is refused in dry run, for another bucket's checkpoint, or with a checkpoint on erased/released; a scope-mismatched stored checkpoint restarts", async () => {
+    await configure(true, false);
+    const t = tenantOf("u-cp");
+    const ref = await refOfReg(t, bucket(730, "cp-sess"));
+    const other = await refOfReg(t, bucket(731, "cp-other"));
+    await age(ref);
+    const objs = await claimAll();
+    const mine = objs.find((o) => o.ref === ref)!;
+    const cp = (r: string) => ({ v: 1, bucket: "b", prefix: `96bulls/org-a/v1/ws=ws-a/m=${mine.machineId}/h=_babysitter/d=2026/01/01/s=${r}/`, scope: "s", afterKey: null, inKey: null });
+    expect(await code(sweeper().complete(mine.leaseToken, "progress", 1, cp(other) as never))).toBe("ledger_input_refused");
+    expect(await code(sweeper().complete(mine.leaseToken, "erased", 1, cp(ref) as never))).toBe("ledger_input_refused");
+    expect(await code(sweeper().complete(mine.leaseToken, "released", 0, cp(ref) as never))).toBe("ledger_input_refused");
+    expect(await code(sweeper().complete(mine.leaseToken, "progress", 1, { v: 2 } as never))).toBe("ledger_input_refused");
+    await configure(true, true);
+    expect(await code(sweeper().complete(mine.leaseToken, "progress", 1, cp(ref) as never))).toBe("ledger_sqlstate_55000");
+    await configure(true, false);
+    expect(await sweeper().complete(mine.leaseToken, "progress", 1, cp(ref) as never)).toEqual({ ok: true, state: "pending" });
+    expect((await row(ref)).erase_checkpoint).toMatchObject({ scope: "s" });
+    await releaseAll(objs.filter((o) => o.ref !== ref));
+    // The stored checkpoint's scope is not this bucket/generation/epochs/write_seq: the tick restarts, never adopts it.
+    const s3 = new FakeS3Versions();
+    const res = await babysitterRetentionTick({ ledger: sweeper(), eraser: s3.eraser(), keyRoot: "96bulls", generation, mode: "on", limit: 200 });
+    expect(res.codes.checkpoint_restart).toBeGreaterThanOrEqual(1);
+    expect((await row(ref)).state).toBe("erased");
+    await configure(false, true);
+  }, 60000);
 });
 
 function witnessFor(t: Tenant, prepared: Awaited<ReturnType<typeof prepareDelivery>>, count: number, resets: { request_id: string; deleted: string }[]) {

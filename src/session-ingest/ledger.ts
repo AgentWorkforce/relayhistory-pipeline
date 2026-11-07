@@ -239,6 +239,8 @@ export interface BabysitterRetentionRegistration {
   /** The user's reset count the claim saw. */
   resetEpoch: number;
   buckets: BabysitterRetentionRequest[];
+  /** The content-free key index rows (babysitter-retention.ts BabysitterIndexEntry). */
+  records: { bucket: number; originId: string; recordId: string; revision: string; revisionId: string; operation: "upsert" | "delete"; kind: string; line: number | null; expiresAtMs: number | null }[];
 }
 
 /** The ledger is unreachable or refused: the batch answers 503 (retryable), never a fallback. */

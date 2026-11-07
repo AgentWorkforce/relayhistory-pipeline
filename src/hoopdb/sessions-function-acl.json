@@ -21,11 +21,7 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
-    "sessions.babysitter_evidence_buckets_for(text,jsonb,jsonb,integer)": [
-      "<owner>:EXECUTE",
-      "bulls96_read_api:EXECUTE"
-    ],
-    "sessions.babysitter_evidence_revisions_for(text,jsonb)": [
+    "sessions.babysitter_evidence_page_for(text,jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
