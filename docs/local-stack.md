@@ -87,6 +87,20 @@ tokens require `COURIER_ALLOW_FIXED_TOKEN=1`. `JWT_PRIVATE_KEY_PEM` is local
 fixture auth only and is refused in `new` mode unless
 `COURIER_ALLOW_LOCAL_SIGNING_KEY=1` is explicitly set.
 
+## Search backend
+
+The local stack keeps the default search backend, Postgres (`SEARCH_INDEX_BACKEND`
+unset or `postgres`). The `opensearch` backend (OpenSearch or Elasticsearch) is
+configured with `SEARCH_INDEX_BACKEND=opensearch`, `SEARCH_INDEX_OPENSEARCH_URL`
+(required), `SEARCH_INDEX_OPENSEARCH_DIALECT` (`opensearch` or `elasticsearch`),
+`SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX`, `SEARCH_INDEX_OPENSEARCH_AUTH` (`none`,
+`basic`; `sigv4` is not implemented), `SEARCH_INDEX_OPENSEARCH_USERNAME`, the
+`SEARCH_INDEX_OPENSEARCH_PASSWORD` secret, `SEARCH_INDEX_OPENSEARCH_CA_FILE` and
+`SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS` (see
+`docs/search-and-runtime-adapters.md`). No local container runs it yet, and the
+worker entry points still allow only `postgres`; the backend's proof runs against
+disposable containers (`docs/session-search-proof.md`).
+
 ## Known limits
 
 - Alchemy's Docker provider has no health gating; the CLI waits.

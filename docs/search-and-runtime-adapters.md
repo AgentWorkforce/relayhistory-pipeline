@@ -24,19 +24,25 @@ closed at boot.
 | Search contract, validation and query reference semantics | `packages/pipeline/src/search-index/contracts.ts` |
 | Backend-independent scope reconcile | `packages/pipeline/src/search-index/reconcile.ts` |
 | Postgres search using pg_trgm | `packages/pipeline/src/search-index/postgres.ts` |
+| OpenSearch / Elasticsearch search over REST (`fetch` only) | `packages/pipeline/src/search-index/opensearch.ts` |
 | Shared search conformance | `packages/pipeline/src/search-index/conformance.ts` |
 | Runtime contract and shared failure handling | `packages/pipeline/src/runtime/contracts.ts` |
 | Worker poll loop and in-process schedules | `packages/pipeline/src/runtime/workers.ts` |
 | Shared runtime conformance | `packages/pipeline/src/runtime/conformance.ts` |
 | Explicit registration and boot selection | `packages/pipeline/src/adapters/` |
 
-The default registries contain only Postgres search and the worker runtime.
-Recognizing a provider name does not install that implementation. Creating an
-unregistered adapter fails. Each entry point declares the implementations it
-can run; future compositions must explicitly register and allow any additions.
+The default search registry (`createSearchIndexRegistry`) contains Postgres
+(the default) and OpenSearch; `createPostgresSearchIndexRegistry` contains
+Postgres only and backs `createPostgresSearchComposition`. The default runtime
+registry contains only the worker runtime. Recognizing a provider name does not
+install that implementation. Creating an unregistered adapter fails. Each entry
+point declares the implementations it can run, and registration does not widen
+that list: workers still refuse `SEARCH_INDEX_BACKEND=opensearch`. Future
+compositions must explicitly register and allow any additions.
 
-OpenSearch, ClickHouse, Lambda, Cloud Run and Terse implementation ownership,
-distribution and service integration are separate follow-ups. This foundation
+ClickHouse, Lambda, Cloud Run and Terse implementation ownership, distribution
+and service integration, and wiring OpenSearch into an entry point, are separate
+follow-ups. This foundation
 does not select their repository placement or advertise them as Helm profiles.
 
 ## SearchIndexAdapter
@@ -82,6 +88,42 @@ each one against the reference oracle (`matchesQuery`):
 
 Tenant ids must come from verified auth. The adapter filters on them; it does
 not authenticate them.
+
+### OpenSearch / Elasticsearch implementation
+
+`createOpenSearchSearchIndex` speaks the REST API with `fetch` only (no client
+library) and sends requests only to the configured URL (redirects are refused).
+One adapter serves both products; `SEARCH_INDEX_OPENSEARCH_DIALECT` names which
+one, because GCP and Azure have no managed OpenSearch (Elastic Cloud only).
+`ensureSchema` checks the product (`GET /`: `version.distribution` for
+OpenSearch, the `X-Elastic-Product` header for Elasticsearch) and refuses a
+mismatch. The backend name stays `opensearch` for both; the adapter `id` is the
+dialect.
+
+- One index, `<prefix>-transcript-events`, with every field mapped explicitly
+  and `dynamic: strict`. Tenant, session and kind filters are `term` clauses in
+  `bool.filter`; nothing is scored.
+- `q` is matched like the Postgres reference (lower-cased substring of the first
+  4,096 characters of content, or the title) by a `wildcard` over lower-cased
+  keyword windows of 4,096 characters at a 2,048 stride, so a 500-character
+  query always falls inside one window.
+- Upserts are `_bulk?refresh=wait_for` with `version_type=external_gte`, so a
+  newer stored version wins and reads see writes on return. `index.gc_deletes`
+  is `0s`, so a deleted key can be rewritten at any version, as in Postgres.
+- `deleteEvents` and `eraseScope` are `_delete_by_query?refresh=true&conflicts=proceed`
+  under the tenant filter; an erase repeats while version conflicts remain and
+  fails rather than reporting partial erasure.
+- Ordering is the contract key order on keyword/long sort fields; paging and
+  `scanFingerprints` use `search_after`, so results past `max_result_window`
+  are reachable.
+- Errors map to `SearchIndexError` codes without backend text: 404 index →
+  `schema_missing`, 429/5xx/network/timeout → retryable `unavailable`.
+- Auth: `none`, `basic` (password from the secret loader), `sigv4` (not
+  implemented: construction fails `unsupported`). `CA_FILE` needs Bun.
+
+`.github/workflows/opensearch-proof.yml` runs the shared conformance suite and an
+end-to-end upload → scrub → index → search → erase proof on real OpenSearch 2
+and Elasticsearch 8 containers (`docs/session-search-proof.md`).
 
 ### Postgres implementation
 
@@ -170,6 +212,14 @@ components retain their existing timing checks.
 | `SEARCH_INDEX_BACKEND` | `postgres`, `clickhouse`, `opensearch` | workers allow `postgres`; the existing Lambda entry allows `clickhouse` |
 | `PIPELINE_RUNTIME` | `workers`, `lambda`, `cloudrun`, `terse` | workers allow `workers`; the existing Lambda entry allows `lambda` |
 | `SEARCH_INDEX_POSTGRES_SCHEMA` | SQL identifier | `search_index` unless explicitly configured; validated when constructing the adapter |
+| `SEARCH_INDEX_OPENSEARCH_URL` | `http(s)://host[:port][/path]` | required when `SEARCH_INDEX_BACKEND=opensearch`; creation fails without it. No credentials, query or fragment in the URL |
+| `SEARCH_INDEX_OPENSEARCH_DIALECT` | `opensearch`, `elasticsearch` | `opensearch` |
+| `SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX` | lower-case `[a-z0-9][a-z0-9_-]*` | `relayhistory` (index `relayhistory-transcript-events`) |
+| `SEARCH_INDEX_OPENSEARCH_AUTH` | `none`, `basic`, `sigv4` | `none`; `sigv4` is not implemented and fails at creation |
+| `SEARCH_INDEX_OPENSEARCH_USERNAME` | string without `:` | required for `basic` |
+| `SEARCH_INDEX_OPENSEARCH_PASSWORD` | secret, from the secret loader (`secrets`), never env | required for `basic` |
+| `SEARCH_INDEX_OPENSEARCH_CA_FILE` | path to a PEM bundle | unset; https only, Bun runtime only |
+| `SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS` | positive integer | `10000` |
 
 Empty or unset selection variables use each entry point's existing behavior.
 Unknown names and recognized but unsupported choices fail at boot. Workers use
@@ -209,6 +259,11 @@ bun run --filter @96bulls/pipeline typecheck
 bun run --filter @96bulls/pipeline test
 bun test src/shared src/session-pipeline
 ```
+
+The OpenSearch backend's unit tests use a fake `fetch`
+(`test/search-index-opensearch.test.ts`); its real-server suite runs when
+`SEARCH_INDEX_OPENSEARCH_TEST_URL` names a disposable server
+(`SEARCH_INDEX_OPENSEARCH_TEST_DIALECT=elasticsearch` for Elasticsearch).
 
 The shared search suite exercises PGlite with pg_trgm and can run against a
 disposable PostgreSQL database using `SEARCH_CONFORMANCE_PG_URL`. CI runs that

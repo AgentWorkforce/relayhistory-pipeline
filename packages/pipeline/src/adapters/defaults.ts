@@ -8,6 +8,13 @@ import { createWorkerRuntime, type WorkSource } from "../runtime/workers.js";
 import type { SearchIndexAdapter } from "../search-index/contracts.js";
 import { createPostgresSearchIndex, type SqlClient } from "../search-index/postgres.js";
 import {
+  createOpenSearchSearchIndex,
+  OPENSEARCH_DIALECTS,
+  type FetchLike,
+  type OpenSearchDialect,
+  type OpenSearchSearchIndexConfig,
+} from "../search-index/opensearch.js";
+import {
   AdapterRegistry,
   DEFAULT_PIPELINE_RUNTIME,
   DEFAULT_SEARCH_INDEX_BACKEND,
@@ -36,8 +43,7 @@ export interface RuntimeFactoryInput {
 export type SearchIndexRegistry = AdapterRegistry<SearchIndexBackendName, SearchFactoryInput, SearchIndexAdapter>;
 export type PipelineRuntimeRegistry = AdapterRegistry<PipelineRuntimeName, RuntimeFactoryInput, PipelineRuntimeAdapter>;
 
-export function createSearchIndexRegistry(): SearchIndexRegistry {
-  const registry: SearchIndexRegistry = new AdapterRegistry("SEARCH_INDEX_BACKEND", SEARCH_INDEX_BACKENDS, DEFAULT_SEARCH_INDEX_BACKEND);
+function registerPostgres(registry: SearchIndexRegistry): void {
   registry.register({
     name: "postgres",
     create(input) {
@@ -48,6 +54,83 @@ export function createSearchIndexRegistry(): SearchIndexRegistry {
       });
     },
   });
+}
+
+/**
+ * OpenSearch / Elasticsearch settings from env (`SEARCH_INDEX_OPENSEARCH_*`).
+ * The basic-auth password is a secret: it comes from `input.secrets`, never env.
+ * CA_FILE is a path read once here (contents are passed to the adapter).
+ */
+export function openSearchConfigFromInput(input: SearchFactoryInput): OpenSearchSearchIndexConfig {
+  const env = input.env;
+  const value = (name: string) => {
+    const raw = env[`SEARCH_INDEX_OPENSEARCH_${name}`]?.trim();
+    return raw === undefined || raw === "" ? undefined : raw;
+  };
+  const url = value("URL");
+  if (!url) throw new Error("SEARCH_INDEX_BACKEND=opensearch needs SEARCH_INDEX_OPENSEARCH_URL");
+  const dialect = (value("DIALECT") ?? "opensearch") as OpenSearchDialect;
+  if (!OPENSEARCH_DIALECTS.includes(dialect)) {
+    throw new Error(`SEARCH_INDEX_OPENSEARCH_DIALECT must be one of ${OPENSEARCH_DIALECTS.join(", ")}`);
+  }
+  const timeout = value("REQUEST_TIMEOUT_MS");
+  if (timeout !== undefined && !/^[1-9][0-9]{0,5}$/.test(timeout)) {
+    throw new Error("SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS must be a positive integer (ms)");
+  }
+  const authKind = value("AUTH") ?? "none";
+  let auth: OpenSearchSearchIndexConfig["auth"];
+  if (authKind === "none") auth = { kind: "none" };
+  else if (authKind === "basic") {
+    const username = value("USERNAME");
+    const password = input.secrets?.SEARCH_INDEX_OPENSEARCH_PASSWORD;
+    if (!username || !password) {
+      throw new Error("SEARCH_INDEX_OPENSEARCH_AUTH=basic needs SEARCH_INDEX_OPENSEARCH_USERNAME and the SEARCH_INDEX_OPENSEARCH_PASSWORD secret");
+    }
+    auth = { kind: "basic", username, password };
+  } else if (authKind === "sigv4") auth = { kind: "sigv4" };
+  else throw new Error("SEARCH_INDEX_OPENSEARCH_AUTH must be one of none, basic, sigv4");
+  const caFile = value("CA_FILE");
+  let ca: string | undefined;
+  if (caFile !== undefined) {
+    const fs = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process?.getBuiltinModule?.("node:fs") as
+      | { readFileSync(path: string, encoding: "utf8"): string }
+      | undefined;
+    if (!fs) throw new Error("SEARCH_INDEX_OPENSEARCH_CA_FILE needs a runtime with node:fs");
+    ca = fs.readFileSync(caFile, "utf8");
+  }
+  const fetch = input.extras?.fetch as FetchLike | undefined;
+  return {
+    url,
+    dialect,
+    auth,
+    ...(value("INDEX_PREFIX") ? { indexPrefix: value("INDEX_PREFIX") } : {}),
+    ...(timeout !== undefined ? { requestTimeoutMs: Number(timeout) } : {}),
+    ...(ca !== undefined ? { ca } : {}),
+    ...(typeof fetch === "function" ? { fetch } : {}),
+  };
+}
+
+function registerOpenSearch(registry: SearchIndexRegistry): void {
+  registry.register({
+    name: "opensearch",
+    create(input) {
+      return createOpenSearchSearchIndex(openSearchConfigFromInput(input));
+    },
+  });
+}
+
+/** Every OSS search backend: postgres (the default) and opensearch (OpenSearch or Elasticsearch). */
+export function createSearchIndexRegistry(): SearchIndexRegistry {
+  const registry: SearchIndexRegistry = new AdapterRegistry("SEARCH_INDEX_BACKEND", SEARCH_INDEX_BACKENDS, DEFAULT_SEARCH_INDEX_BACKEND);
+  registerPostgres(registry);
+  registerOpenSearch(registry);
+  return registry;
+}
+
+/** Postgres only: for compositions whose completeness state lives in Postgres beside the index. */
+export function createPostgresSearchIndexRegistry(): SearchIndexRegistry {
+  const registry: SearchIndexRegistry = new AdapterRegistry("SEARCH_INDEX_BACKEND", SEARCH_INDEX_BACKENDS, DEFAULT_SEARCH_INDEX_BACKEND);
+  registerPostgres(registry);
   return registry;
 }
 

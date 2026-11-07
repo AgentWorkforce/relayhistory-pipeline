@@ -53,7 +53,7 @@ describe("adapter selection", () => {
 });
 
 import { PGlite } from "@electric-sql/pglite";
-import { createPipelineRuntimeRegistry, createSearchIndexRegistry } from "../src/adapters/defaults.js";
+import { createPipelineRuntimeRegistry, createPostgresSearchIndexRegistry, createSearchIndexRegistry } from "../src/adapters/defaults.js";
 import type { SqlClient } from "../src/search-index/postgres.js";
 
 describe("OSS default registries", () => {
@@ -63,7 +63,22 @@ describe("OSS default registries", () => {
     expect(search.backend).toBe("postgres");
     const runtime = createPipelineRuntimeRegistry().create({}, { env: {}, source: { claim: async () => [], settle: async () => {} } });
     expect(runtime.kind).toBe("workers");
-    expect(() => createSearchIndexRegistry().create({ SEARCH_INDEX_BACKEND: "opensearch" }, { env: {} })).toThrow(/not registered/);
     await db.close();
+  });
+
+  it("registers opensearch, which fails fast without a URL; the postgres-only registry still refuses it", () => {
+    expect(createSearchIndexRegistry().registered()).toEqual(["postgres", "opensearch"]);
+    expect(() => createSearchIndexRegistry().create({ SEARCH_INDEX_BACKEND: "opensearch" }, { env: {} })).toThrow(
+      /needs SEARCH_INDEX_OPENSEARCH_URL/,
+    );
+    const search = createSearchIndexRegistry().create(
+      { SEARCH_INDEX_BACKEND: "opensearch" },
+      { env: { SEARCH_INDEX_OPENSEARCH_URL: "http://127.0.0.1:9200" } },
+    );
+    expect(search.backend).toBe("opensearch");
+    expect(createPostgresSearchIndexRegistry().registered()).toEqual(["postgres"]);
+    expect(() => createPostgresSearchIndexRegistry().create({ SEARCH_INDEX_BACKEND: "opensearch" }, { env: {} })).toThrow(/not registered/);
+    // Worker boot keeps refusing it: registration does not widen an entry point's allowed list.
+    expect(() => validateAdapterEnv({ SEARCH_INDEX_BACKEND: "opensearch" }, { runtime: ["workers"] })).toThrow(/not allowed/);
   });
 });
