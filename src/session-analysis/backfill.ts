@@ -157,6 +157,13 @@ export async function applyBackfill(
   store: ObjectStore,
   scope: BackfillScope,
   plan: BackfillPlan,
+  options: {
+    /**
+     * Every-version erase of one key (the transcript bucket is versioned; production passes
+     * createS3Eraser().eraseObject). Absent: a plain delete (unversioned stores and tests).
+     */
+    eraseObject?: (key: string) => Promise<number>;
+  } = {},
 ): Promise<{ jobs: number; requests: number; objects: number }> {
   const prefix = await anchorPrefix(db, scope);
   const scopeParams = [scope.orgId, scope.workspaceId, scope.sessionId];
@@ -219,6 +226,21 @@ export async function applyBackfill(
       );
       if (!beat.rows.length) throw new BackfillError("backfill_ticket_lease_lost");
       await store.put(objectKey(ref.key), bytes, { ifNoneMatch: true, contentSha256: ref.sha256, contentType: "application/json" });
+      // Post-write ownership fence: the Put has no deadline of its own, so after it returns the
+      // ticket must still be ours, 'publishing', under a live lease, with the scope live. If a
+      // stall let the lease lapse (and a sweep or an erase ran meanwhile), the object we just
+      // wrote is untracked: erase it (every version) before failing, so nothing is left behind.
+      const owned = await db.query(
+        `/* backfill:post-put */ UPDATE sessions.session_analysis_result_tickets
+            SET lease_expires_at = now() + make_interval(secs => $6::integer)
+          WHERE result_key = $1 AND job_id = $5::uuid AND reason = 'publishing' AND lease_expires_at > now() AND ${LIVE}
+          RETURNING result_key`,
+        [ref.key, ...scopeParams, job.id, BACKFILL_TICKET_LEASE_SECONDS],
+      );
+      if (!owned.rows.length) {
+        await (options.eraseObject ? options.eraseObject(ref.key) : store.delete(objectKey(ref.key)));
+        throw new BackfillError("backfill_ticket_lease_lost");
+      }
       const read = await readAll(await store.get(objectKey(ref.key)));
       if (createHash("sha256").update(read).digest("hex") !== ref.sha256) throw new BackfillError("backfill_write_verification_failed");
       objects += 1;
@@ -366,12 +388,17 @@ export function parityEqual(neon: NeonV1Payload, sp: { sessionId: string; reques
 
 /** One scope end to end: plan, apply, then the parity gate against SP's own GET. */
 export async function backfillScope(
-  deps: { db: SqlExecutor; store: ObjectStore; readSp(): Promise<{ sessionId: string; requests: unknown[]; analyses: unknown[] } | null> },
+  deps: {
+    db: SqlExecutor;
+    store: ObjectStore;
+    readSp(): Promise<{ sessionId: string; requests: unknown[]; analyses: unknown[] } | null>;
+    eraseObject?: (key: string) => Promise<number>;
+  },
   scope: BackfillScope,
   neon: NeonV1Payload,
 ) {
   const plan = planBackfill(scope, neon);
-  const applied = await applyBackfill(deps.db, deps.store, scope, plan);
+  const applied = await applyBackfill(deps.db, deps.store, scope, plan, deps.eraseObject ? { eraseObject: deps.eraseObject } : {});
   const parity = parityEqual(expectedAfterBackfill(neon), await deps.readSp());
   if (!parity.equal) throw new BackfillError("backfill_parity_failed");
   return { ...applied, terminalized: plan.terminalized, parity };

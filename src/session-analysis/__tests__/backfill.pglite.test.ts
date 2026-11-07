@@ -124,9 +124,11 @@ test("P0-2: an erased scope is refused before any write; an erase mid-backfill l
       return ack;
     },
   };
-  await expect(applyBackfill(hoopDb(db), racing, SCOPE, planBackfill(SCOPE, NEON))).rejects.toThrow("backfill_session_not_live");
+  // The post-write ownership fence sees the erase and removes the object it just wrote; the
+  // ticket remains for the sweeper (which then finds nothing left to delete).
+  await expect(applyBackfill(hoopDb(db), racing, SCOPE, planBackfill(SCOPE, NEON))).rejects.toThrow("backfill_ticket_lease_lost");
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
-  expect(await store.head(objectKey(written))).toBeDefined();
+  expect(await store.head(objectKey(written))).toBeUndefined();
   expect(await sweepAnalysisTickets(store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never) })).toBe(1);
   expect(await store.head(objectKey(written))).toBeUndefined();
 });
@@ -266,4 +268,35 @@ test("P1-c: a lapsed backfill lease (fake clock) refuses the Put after a sweep: 
     expect(await sweepAnalysisTickets(store, { graceSeconds: 0, transact: (w) => w(hoopDb(db2) as never) })).toBe(0);
   }), store, SCOPE, plan);
   expect((await db2.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
+});
+
+test("P1-b (verification): a Put stalled past its lease, then sweep + tombstone, then released, leaves no object", async () => {
+  const db = await fresh();
+  const store = tempStore();
+  const erased: string[] = [];
+  let written = "";
+  const stalling: ObjectStore = {
+    backend: store.backend,
+    head: (k) => store.head(k), get: (k, r) => store.get(k, r), getObject: (k, r) => store.getObject(k, r), list: (p, c) => store.list(p, c),
+    presignGet: (k, t) => store.presignGet(k, t), delete: (k) => store.delete(k),
+    async put(key, body, opts) {
+      // Paused right after the heartbeat: the lease lapses, a sweep runs, the session is erased.
+      await db.query("UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() - interval '1 second', created_at = now() - interval '1 day'");
+      expect(await sweepAnalysisTickets(store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never) })).toBe(1);
+      await db.query("UPDATE sessions.session_index SET deleted_at = now()");
+      // ...then the stalled Put is released and lands.
+      written = key;
+      return store.put(key, body, opts);
+    },
+  };
+  const eraseObject = async (key: string) => {
+    erased.push(key);
+    await store.delete(objectKey(key));
+    return 1;
+  };
+  await expect(applyBackfill(hoopDb(db), stalling, SCOPE, planBackfill(SCOPE, NEON), { eraseObject })).rejects.toThrow("backfill_ticket_lease_lost");
+  expect(written).not.toBe("");
+  expect(erased).toEqual([written]);
+  expect(await store.head(objectKey(written))).toBeUndefined();
+  expect((await db.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
 });
