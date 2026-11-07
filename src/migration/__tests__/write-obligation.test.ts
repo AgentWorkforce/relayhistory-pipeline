@@ -25,7 +25,7 @@ function lane(invocations: WriteInvocation[], over: Partial<ObligationState> = {
   const store: ObligationStore = {
     load: async () => (row.gone ? null : { ...row, invocations: row.invocations.map((i) => ({ ...i })), ownedVersions: [...row.ownedVersions] }),
     reserve: async (rev, ids) => { if (!guard(rev) || ids.some((v) => row.ownedVersions.includes(v))) return { ok: false }; for (const v of ids) row.reserved.add(v); return bump(); },
-    saveCheckpoint: async (rev, cp: EraseCheckpoint | null) => { if (!guard(rev)) return { ok: false }; row.checkpoint = cp; return bump(); },
+    saveCheckpoint: async (rev, cp: EraseCheckpoint) => { if (!guard(rev)) return { ok: false }; row.checkpoint = cp; return bump(); },
     resolve: async (rev, ids) => { if (!guard(rev)) return { ok: false }; row.invocations = row.invocations.filter((i) => !ids.includes(i.id)); return bump(); },
     reschedule: async (rev) => { if (!guard(rev)) return { ok: false }; row.sweeps++; row.checkpoint = null; return bump(); },
     retire: async (rev) => { if (!guard(rev)) return { ok: false }; row.gone = true; return { ok: true, rev: rev + 1 }; },
@@ -162,24 +162,31 @@ describe("compare-and-set and durability", () => {
     expect(l.row.invocations).toHaveLength(1);
   }, 60_000);
 
-  test("a foreign checkpoint (another scope, another directory, another exact key) is REFUSED: nothing traversed or deleted, the row untouched", async () => {
+  test("a foreign or stale checkpoint (another scope, another exact key) is IGNORED: the run restarts fresh and skips nothing", async () => {
     const dir = KEY.slice(0, KEY.lastIndexOf("/") + 1);
     for (const foreign of [
       (sc: string) => ({ v: 1 as const, bucket: "b", prefix: dir, scope: "write-obligation:other", afterKey: KEY, inKey: null, exactKey: KEY }),
-      (sc: string) => ({ v: 1 as const, bucket: "b", prefix: dir.replace("raw/", "other/"), scope: sc, afterKey: null, inKey: null, exactKey: KEY }),
-      (sc: string) => ({ v: 1 as const, bucket: "b", prefix: dir, scope: sc, afterKey: null, inKey: null, exactKey: SIBLING }),
-      (sc: string) => ({ v: 1 as const, bucket: "b", prefix: dir, scope: "write-obligation:other", afterKey: null, inKey: null }),   // directory mode, other scope: not the legacy case
+      (sc: string) => ({ v: 1 as const, bucket: "b", prefix: dir, scope: sc, afterKey: KEY, inKey: null, exactKey: SIBLING }),
     ]) {
-      const s = new FakeS3Versions();
+      const s = new FakeS3Versions(); s.pageSize = 2;
       for (let i = 0; i < 3; i++) s.put(KEY, i);
       const l = lane([]);
       l.row.checkpoint = foreign(obligationScope((await l.store.load())!));
-      const before = { rev: l.row.rev, checkpoint: l.row.checkpoint };
-      await expect(reconcileObligation(s.eraser(), l.store)).rejects.toMatchObject({ code: "erasure_checkpoint_scope" });
-      expect(s.deletes).toEqual([]);
-      expect(s.lists).toBe(0);
-      expect({ rev: l.row.rev, checkpoint: l.row.checkpoint }).toEqual(before);
+      expect(await reconcileObligation(s.eraser(), l.store)).toBe("retired");
+      expect(s.count(KEY)).toBe(0);   // not skipped past by the foreign afterKey
     }
+  });
+
+  test("a NORMAL scope change (a new invocation dispatched after a bounded run saved its checkpoint) restarts and completes, never stuck", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 2;
+    const versions = [0, 1, 2, 3, 4].map((i) => s.put(KEY, i));
+    const l = lane([{ id: "first", outcome: "acked", versionId: versions[4]! }]);
+    expect(await reconcileObligation(s.eraser(), l.store, { budget: { pages: 1 } })).toBe("incomplete");
+    expect(l.row.checkpoint).not.toBeNull();
+    (l.row.invocations as WriteInvocation[]).push({ id: "second", outcome: "refused" });   // the obligation changed: the scope hash changes
+    l.row.rev++;
+    expect(await reconcileObligation(s.eraser(), l.store)).toBe("retired");
+    expect(s.count(KEY)).toBe(0);
   });
 });
 
@@ -237,7 +244,7 @@ describe("exact-key reconcile", () => {
 });
 
 describe("checkpoint mode migration", () => {
-  test("the known LEGACY mode (a same-scope DIRECTORY-mode checkpoint from 142761c7) is restarted by a CAS that clears only the checkpoint, then completes in exact mode; invocations, reservations and history are preserved", async () => {
+  test("the known LEGACY mode (a same-scope DIRECTORY-mode checkpoint from 142761c7) is ignored and the run restarts in exact mode and completes; invocations, reservations and history are preserved", async () => {
     const s = new FakeS3Versions(); s.pageSize = 2;
     for (let i = 0; i < 5; i++) s.put(KEY.replace("b=0123456789abcdef0123456789abcdef", `b=${String(i).padStart(32, "0")}`));   // kept siblings sort first
     const v = s.put(KEY);
@@ -245,28 +252,20 @@ describe("checkpoint mode migration", () => {
     l.row.reserved.add("v-earlier");
     const dir = KEY.slice(0, KEY.lastIndexOf("/") + 1);
     l.row.checkpoint = { v: 1, bucket: "b", prefix: dir, scope: obligationScope((await l.store.load())!), afterKey: KEY.replace("b=0123456789abcdef0123456789abcdef", `b=${"0".repeat(31)}3`), inKey: null };
-    const saves: { rev: number; checkpoint: EraseCheckpoint | null }[] = [];
-    const inner = l.store.saveCheckpoint;
-    l.store.saveCheckpoint = async (rev, cp) => { saves.push({ rev, checkpoint: cp }); return inner(rev, cp); };
-    const rev0 = l.row.rev;
     expect(await reconcileObligation(s.eraser(), l.store)).toBe("rescheduled");   // "pending" stays unresolved (nonterminal)
-    expect(saves[0]).toEqual({ rev: rev0, checkpoint: null });                    // the CAS restart, at the loaded row version
     expect(s.deletes).toEqual([`${KEY}@${v}`]);
     expect(l.row.invocations).toEqual([{ id: "pending", outcome: "dispatched" }]);
     expect([...l.row.reserved].sort()).toEqual([v, "v-earlier"].sort());
     expect(s.count(dir)).toBe(5);
   });
 
-  test("a concurrent change during the legacy restart makes its CAS refuse: nothing overwritten, nothing deleted", async () => {
+  test("the low-level eraseStep / verifyErased still REFUSE a mismatched checkpoint passed in directly", async () => {
     const s = new FakeS3Versions();
     s.put(KEY, 1);
-    const l = lane([{ id: "pending", outcome: "dispatched" }]);
-    const legacy = { v: 1 as const, bucket: "b", prefix: KEY.slice(0, KEY.lastIndexOf("/") + 1), scope: obligationScope((await l.store.load())!), afterKey: null, inKey: null };
-    l.row.checkpoint = legacy;
-    const inner = l.store.saveCheckpoint;
-    l.store.saveCheckpoint = async (rev, cp) => { l.row.rev++; return inner(rev, cp); };   // a writer moved the row first
-    expect(await reconcileObligation(s.eraser(), l.store)).toBe("refused");
-    expect(l.row.checkpoint).toEqual(legacy);
+    const dir = KEY.slice(0, KEY.lastIndexOf("/") + 1);
+    const legacy = { v: 1 as const, bucket: "b", prefix: dir, scope: "s", afterKey: null, inKey: null };
+    await expect(s.eraser().eraseStep(dir, { scope: "s", authorize: async () => {}, checkpoint: legacy, exactKey: KEY })).rejects.toMatchObject({ code: "erasure_checkpoint_scope" });
+    await expect(s.eraser().eraseStep(dir, { scope: "other", authorize: async () => {}, checkpoint: { ...legacy, exactKey: KEY }, exactKey: KEY })).rejects.toMatchObject({ code: "erasure_checkpoint_scope" });
     expect(s.deletes).toEqual([]);
   });
 });

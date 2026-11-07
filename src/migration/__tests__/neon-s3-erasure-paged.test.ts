@@ -123,7 +123,7 @@ describe("E3 job on the shared paged eraser", () => {
     st.close();
   });
 
-  test("a checkpoint bound to another scope is refused and deletes nothing", async () => {
+  test("a checkpoint bound to another scope is IGNORED: the traversal restarts from the start (never resumes a foreign cursor, never stalls)", async () => {
     const s = new FakeS3Versions();
     fill(s, 12_500);
     const st = await state();
@@ -134,11 +134,12 @@ describe("E3 job on the shared paged eraser", () => {
     const cp = st.eraseCheckpoint(neonScope);
     expect(cp).not.toBeNull();
     st.setEraseCheckpoint(supaScope, cp);
-    const before = s.count(dir("2026/10/30"));
     const j = job(s, st, authority());
     await j.sweep();
-    expect(j.counters.liveFenceFailed).toBeGreaterThan(0);
-    expect(s.count(dir("2026/10/30"))).toBe(before);
+    // Not a failure: the foreign checkpoint was dropped and a fresh traversal (this scope's own) ran and finished.
+    expect(j.counters.liveFenceFailed).toBe(0);
+    expect(s.count(dir("2026/10/30"))).toBe(0);
+    expect(st.eraseCheckpoint(supaScope)).toBeNull();
     st.close();
   });
 
