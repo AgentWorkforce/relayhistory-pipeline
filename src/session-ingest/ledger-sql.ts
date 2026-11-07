@@ -15,6 +15,7 @@ import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
  * the shape the function promises is `ledger_bad_result`.
  */
 import type { StagedAttempt, LedgerRecord, SelectionInput } from "./ledger.ts";
+import type { BabysitterRetentionRegistration, BabysitterWriteOutcome } from "./ledger.ts";
 import {
   LedgerUnavailableError,
   type ClaimInput,
@@ -64,6 +65,8 @@ type LedgerFunction =
   | "ingest_reset_uploaded_sessions"
   | "ingest_fanout_fence"
   | "ingest_commit_revisions"
+  | "ingest_babysitter_retention_register"
+  | "ingest_babysitter_retention_written"
   | "ingest_frozen_source_witness"
   | "ingest_source_control_begin"
   | "ingest_source_control_complete"
@@ -294,6 +297,23 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
       const r = (await call(run, "ingest_commit_revisions", { tenant, originId, machineId, records, batchDigest: attempt.batchDigest, claimToken: attempt.claimToken })) as Record<string, unknown>;
       if (typeof r.committed !== "number" || typeof r.rearmed !== "number") throw new LedgerUnavailableError("ledger_bad_result");
       return { committed: r.committed, rearmed: r.rearmed };
+    },
+    async registerBabysitterRetention(input: BabysitterRetentionRegistration) {
+      const r = (await call(run, "ingest_babysitter_retention_register", input)) as Record<string, unknown>;
+      if (!Array.isArray(r.objects) || typeof r.reopened !== "number" || r.objects.length !== input.buckets.length)
+        throw new LedgerUnavailableError("ledger_bad_result");
+      const objects = r.objects.map((o: unknown) => {
+        const x = o as Record<string, unknown>;
+        if (!x || typeof x.ref !== "string" || typeof x.source !== "string" || (x.sessionId !== null && typeof x.sessionId !== "string") || typeof x.eraseAfterMs !== "number")
+          throw new LedgerUnavailableError("ledger_bad_result");
+        return { ref: x.ref, source: x.source, sessionId: x.sessionId as string | null, eraseAfterMs: x.eraseAfterMs };
+      });
+      return { objects, reopened: r.reopened };
+    },
+    async babysitterRetentionWritten(input: BabysitterWriteOutcome) {
+      const r = (await call(run, "ingest_babysitter_retention_written", input)) as Record<string, unknown>;
+      if (typeof r.updated !== "number") throw new LedgerUnavailableError("ledger_bad_result");
+      return r.updated;
     },
     async resetUploadedSessions(tenant: LedgerTenant, requestId: string): Promise<number> {
       const r = (await call(run, "ingest_reset_uploaded_sessions", options.acceptanceMode==="buffered"?buffered({tenant,requestId}):{tenant,requestId})) as Record<string, unknown>;

@@ -44,4 +44,13 @@ export const VERIFIERS: readonly VerifierTarget[] = [
     render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
     transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_privacy_eraser").replaceAll("session ingest", "privacy eraser"),
   },
+  {
+    // The E3 erasure phase's registry login (20261105042000): only the retention claim/fence/complete RPCs.
+    role: "bulls96_babysitter_retention",
+    path: "supabase/bootstrap/babysitter_retention_verify.sql",
+    template: "supabase/bootstrap/session_ingest_verify.sql",
+    pattern: /v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
+    render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
+    transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_babysitter_retention").replaceAll("session ingest", "babysitter retention"),
+  },
 ];

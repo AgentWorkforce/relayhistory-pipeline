@@ -290,3 +290,91 @@ describe("live (srv_) erasure", () => {
     await pg.close();
   });
 });
+
+/**
+ * C3 (lead ruling, #294): the canonical eraser's strict inventory validation and bounded legacy
+ * listing ship UNFLAGGED to the EXISTING E3 job (Babysitter flags off). A malformed inventory and
+ * a > 10k-version inventory are each refused BEFORE that inventory's deletes; the tombstone is not
+ * marked done (it is erased by a later sweep once the inventory is healthy); a small valid
+ * inventory behaves as before. Real createS3Eraser over the offline versioned provider.
+ */
+describe("E3 on the strict shared eraser (fail closed, retried)", () => {
+  const s3Job = async (s: import("./fake-s3-versions.ts").FakeS3Versions) => {
+    const { pg, db } = await neon();
+    await tombstone(pg, GROUP);
+    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const logs: Record<string, unknown>[] = [];
+    const job = new ErasureJob(db, state, s.eraser(), (l: Record<string, unknown>) => { logs.push(l); }, DEFAULT_ERASURE_CONFIG, later, async () => {});
+    return { job, codes: () => logs.map((l) => l.error_code).filter(Boolean), done: async () => { state.close(); await pg.close(); } };
+  };
+  const live = (s: import("./fake-s3-versions.ts").FakeS3Versions) => [...WORKER_KEYS, POINTER].filter((k) => s.keys.has(k));
+  const old = Date.now() - 60 * 60 * 1000;
+
+  test("a small valid inventory erases as before", async () => {
+    const { FakeS3Versions } = await import("./fake-s3-versions.ts");
+    const s = new FakeS3Versions();
+    for (const k of [...WORKER_KEYS, POINTER]) s.put(k, old);
+    const { job, done } = await s3Job(s);
+    await job.sweep();
+    expect(live(s)).toEqual([]);
+    await done();
+  });
+
+  test("a MALFORMED inventory is refused before any delete; the tombstone stays eligible and a later healthy sweep erases it", async () => {
+    const { FakeS3Versions } = await import("./fake-s3-versions.ts");
+    const s = new FakeS3Versions();
+    for (const k of [...WORKER_KEYS, POINTER]) s.put(k, old);
+    s.rewrite = (_call, xml) => xml.slice(0, xml.length - 30);   // truncated XML on every listing
+    const { job, codes, done } = await s3Job(s);
+    await job.sweep();   // a refusal is logged and counted, never thrown out of the sweep
+    expect(codes()).toContain("erasure_inventory");
+    expect(s.deletes).toEqual([]);
+    expect(live(s)).toHaveLength(3);
+    s.rewrite = undefined;
+    await job.sweep();
+    expect(live(s)).toEqual([]);
+    await done();
+  });
+
+  test("a > 10k-version inventory is refused (the bound) before any delete; the tombstone stays eligible", async () => {
+    const { FakeS3Versions } = await import("./fake-s3-versions.ts");
+    const s = new FakeS3Versions();
+    for (const k of [...WORKER_KEYS, POINTER]) s.put(k, old);
+    const neighbour = `96bulls/org-1/v1/ws=ws_1/m=${M}/h=claude/d=2026/10/30/s=sess_big/raw/`;
+    for (let i = 0; i <= 10_000; i++) s.put(`${neighbour}${String(i).padStart(6, "0")}.ndjson.zst`, old);
+    const { job, codes, done } = await s3Job(s);
+    await job.sweep();
+    expect(codes()).toContain("erasure_inventory");
+    expect(s.deletes).toEqual([]);
+    expect(live(s)).toHaveLength(3);
+    // The workload shrinks (here: the neighbour is gone): the same tombstone is erased by the next sweep.
+    for (const k of [...s.keys.keys()]) if (k.startsWith(neighbour)) s.keys.delete(k);
+    await job.sweep();
+    expect(live(s)).toEqual([]);
+    await done();
+  }, 60_000);
+
+  test("a queued prefix erasure over a MALFORMED inventory is not marked done or removed: it stays queued (backed off) and a later healthy drain erases it", async () => {
+    const { FakeS3Versions } = await import("./fake-s3-versions.ts");
+    const s = new FakeS3Versions();
+    for (const k of WORKER_KEYS) s.put(k, old);
+    // An unbalanced tag (<IsTruncatedX>...</IsTruncated>): refused as malformed XML (erasure_inventory).
+    s.rewrite = (_call, xml) => xml.replace("<IsTruncated>", "<IsTruncatedX>");
+    const { db } = await neon();
+    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    state.enqueueErasure([{ key: DIR, kind: "prefix", org_id: "org-1", reason: "test" }], 1);
+    const logs: Record<string, unknown>[] = [];
+    const job = new ErasureJob(db, state, s.eraser(), (l: Record<string, unknown>) => { logs.push(l); }, DEFAULT_ERASURE_CONFIG, later, async () => {});
+    await job.drain();
+    expect(logs.find((l) => l.message === "erasure failed")?.error_code).toBe("erasure_inventory");
+    expect(s.deletes).toEqual([]);
+    expect(job.counters.failed).toBe(1);
+    expect(state.erasureQueued(DIR, 1)).toBe(true);   // not done, not removed
+    s.rewrite = undefined;
+    const healthy = new ErasureJob(db, state, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => later() + 2 * 3_600_000, async () => {});
+    await healthy.drain();
+    expect(state.erasureQueued(DIR, 1)).toBe(false);
+    expect(WORKER_KEYS.filter((k) => s.keys.has(k))).toEqual([]);
+    state.close();
+  });
+});
