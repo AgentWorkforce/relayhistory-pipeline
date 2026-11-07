@@ -206,3 +206,15 @@ describe("paged eraser: unversioned store entries", () => {
     } finally { s.done(); }
   });
 });
+
+describe("paged eraser: beforeDelete evidence hook", () => {
+  test("runs after authorize with exactly the page's doomed versions, before any delete; throwing stops that page", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 10; fill(s, 15);
+    const seen: number[] = [];
+    let n = 0;
+    await expect(s.eraser().eraseStep(P, { scope, authorize: ok, beforeDelete: async (doomed) => { seen.push(doomed.length); if (++n === 2) throw Object.assign(new Error("db down"), { code: "evidence_unwritten" }); } }))
+      .rejects.toMatchObject({ code: "evidence_unwritten" });
+    expect(seen).toEqual([10, 5]);
+    expect(s.deletes).toHaveLength(10);   // the second page deleted nothing
+  });
+});
