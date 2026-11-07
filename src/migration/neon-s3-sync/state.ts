@@ -99,6 +99,11 @@ export class SyncState {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS groups_last ON groups (last_ms DESC);
     `);
+    // The strict paged eraser's resume checkpoints: unflagged (part of the eraser hardening, not the obligation protocol).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS erase_checkpoints (
+        scope TEXT PRIMARY KEY, checkpoint TEXT NOT NULL, updated_at INTEGER NOT NULL);
+    `);
     if (this.obligations) this.#openObligations();
     else this.#refuseUsedObligationsWhenOff();
   }
@@ -145,8 +150,7 @@ export class SyncState {
       CREATE TABLE IF NOT EXISTS write_clock (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL);
       INSERT OR IGNORE INTO write_clock (id, n) VALUES (1, 0);
       CREATE TABLE IF NOT EXISTS write_touch (key TEXT PRIMARY KEY, seq INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS erase_checkpoints (
-        scope TEXT PRIMARY KEY, checkpoint TEXT NOT NULL, updated_at INTEGER NOT NULL);
+
     `);
     for (const t of ["write_invocations", "write_published", "erase_reservations"])
       for (const [op, row] of [["INSERT", "NEW"], ["UPDATE", "NEW"], ["DELETE", "OLD"]] as const)

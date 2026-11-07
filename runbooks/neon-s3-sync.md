@@ -127,10 +127,12 @@ initializing the obligation schema and an unattested genesis there); point
 `S3X_STATE` at a scratch copy for a dry run that must leave the real file untouched.
 
 `S3X_OBLIGATIONS` (default OFF; set in BOTH the exporter's and the eraser's
-environment): off is the pre-#309 behaviour byte for byte (no obligation schema
-or genesis on open, no exporter invocation recording or claims, the legacy erasure
-job). On enables the durable unresolved-write obligations, reservations and the
-paged, gated erasure job described below.
+environment) gates the NEW exporter-obligation protocol: its schema and genesis on
+open, the exporter's invocation recording and claims, reservations and the
+obligation-gated completion. The strict canonical paged eraser (bounded, resumable,
+done only after a strict zero inventory) runs in BOTH modes as safety hardening.
+A state file whose obligation state was used refuses to open with the flag off
+(`obligations_state_in_use`): turning it off never drops tracked unknowns.
 
 Completion (shared eraser + write obligation v3): a session prefix is erased in
 bounded, resumable steps (checkpoint in the state file, bound to the operation,

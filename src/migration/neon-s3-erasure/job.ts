@@ -129,11 +129,14 @@ export class ErasureJob {
     keyFilter: (key: string) => boolean = () => true, exporterWritten = false, exactKey?: string,
     lease?: { prefix: string; holder: string; gen: string }): Promise<{ status: PagedOutcome; deleted: number; remaining: number; rev: number }> {
     const exact = exactKey !== undefined ? { exactKey } : {};
-    let rev = this.state.obligationRev(prefix);
+    // S3X_OBLIGATIONS off: the SAME strict canonical paged eraser (no permissive fallback), without the obligation
+    // protocol (no reservations, invocations, retirement or genesis gate): done = a fresh strict zero inventory.
+    const ob = this.state.obligations;
+    let rev = ob ? this.state.obligationRev(prefix) : 0;
     let lost = false;
     const budget = () => ({ deadlineAt: this.now() + ERASE_STEP_DEADLINE_MS });
     const beforeDelete = async (doomed: readonly ListedVersion[]) => {
-      if (!doomed.length) return;
+      if (!doomed.length || !ob) return;
       const r = this.state.reserveErase(prefix, rev, scope, doomed.map((v) => ({ key: v.key, versionId: v.versionId })));
       if (!r.ok) {
         lost = true;
@@ -175,6 +178,14 @@ export class ErasureJob {
       return { status: "incomplete", deleted: step.deleted, remaining: -1, rev };
     }
     this.state.clearEraseCheckpoint(scope);
+    if (!ob) {
+      const proof = await this.eraser.verifyErased(prefix, { ...(select ? { select } : {}), authorize, budget: budget(), now: this.now, ...exact });
+      if (proof.status !== "erased") {
+        this.counters.unverified += 1;
+        return { status: "unverified", deleted: step.deleted, remaining: -1, rev };
+      }
+      return { status: "erased", deleted: step.deleted, remaining: 0, rev };
+    }
     // The reservation generation the proof below covers: captured BEFORE the inventory, so every reservation it can
     // retire existed when the inventory was taken (one added later stays reserved).
     const proofSeq = this.state.reservationHighWater(prefix);
@@ -611,7 +622,7 @@ export class ErasureJob {
           }
           if (r.status !== "erased") continue;
           // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
-          if (!this.state.completeErasure(item.key, item.enqueued_at, item.key.slice(0, item.key.lastIndexOf("/") + 1), r.rev, itemLease)) {
+          if (this.state.obligations ? !this.state.completeErasure(item.key, item.enqueued_at, item.key.slice(0, item.key.lastIndexOf("/") + 1), r.rev, itemLease) : (this.state.erasureDone(item.key, item.enqueued_at), false)) {
             this.counters.doneRefused += 1;
             this.state.erasureFailed(item.key, "erasure_done_refused", this.now());
             this.log({ message: "erasure done refused", error_code: "erasure_done_refused", kind: item.kind });
@@ -641,7 +652,7 @@ export class ErasureJob {
         }
         if (r.status !== "erased") continue;
         // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
-        if (!this.state.completeErasure(item.key, item.enqueued_at, item.key, r.rev, itemLease)) {
+        if (this.state.obligations ? !this.state.completeErasure(item.key, item.enqueued_at, item.key, r.rev, itemLease) : (this.state.erasureDone(item.key, item.enqueued_at), false)) {
           this.counters.doneRefused += 1;
           this.state.erasureFailed(item.key, "erasure_done_refused", this.now());
           this.log({ message: "erasure done refused", error_code: "erasure_done_refused", kind: item.kind });

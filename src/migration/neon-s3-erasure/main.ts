@@ -31,11 +31,10 @@ import { eraserDatabaseUrl, pinnedPgClient, readStdinCredentials, refuseCredenti
 import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
 import { createS3Eraser, type Eraser, type PagedEraser } from "./eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "./job.ts";
-import { DEFAULT_ERASURE_CONFIG as LEGACY_ERASURE_CONFIG, ErasureJob as LegacyErasureJob } from "./job-legacy.ts";
 
 /**
- * S3X_OBLIGATIONS (default OFF). Off: the pre-#309 erasure job (job-legacy.ts, byte-identical to #289's job.ts) over an
- * obligation-free state file. On: the paged, obligation-gated job (job.ts) over the obligation schema.
+ * S3X_OBLIGATIONS (default OFF) gates the new exporter-obligation protocol, its schema and genesis bootstrap. The
+ * strict canonical paged eraser runs in BOTH modes (safety hardening, unflagged); off it runs without obligations.
  */
 export function obligationsEnabled(e: (k: string) => string | undefined = (k) => process.env[k]): boolean {
   return e("S3X_OBLIGATIONS") === "on";
@@ -99,16 +98,14 @@ export async function main() {
   try {
     const db = await sessionReadOnly(client as unknown as Queryable);
     const cfg = {
-      ...(obligations ? DEFAULT_ERASURE_CONFIG : LEGACY_ERASURE_CONFIG),
+      ...DEFAULT_ERASURE_CONFIG,
       keyRoot: env("S3X_KEY_ROOT", "96bulls")!,
       recognizeLegacy: env("S3X_ERASER_RECOGNIZES_LEGACY", "false") === "true",
     };
     // Supabase mode: least-privilege identity first (bulls96_privacy_eraser only; never owner/superuser/BYPASSRLS).
     if (kind === "supabase") await assertEraserIdentity(db);
     const authority = kind === "supabase" ? supabaseAuthority(db) : neonAuthority(db);
-    const job = obligations
-      ? new ErasureJob(authority, state, eraser, log, cfg, Date.now, undefined, () => stop)
-      : new LegacyErasureJob(authority, state, eraser, log, cfg, Date.now, undefined, () => stop);
+    const job = new ErasureJob(authority, state, eraser, log, cfg, Date.now, undefined, () => stop);
     log({ message: "start", execute, authority: kind, recognize_legacy: cfg.recognizeLegacy, obligations });
     // A dry run changes nothing: it sweeps and reports what it would erase.
     if (!execute) {

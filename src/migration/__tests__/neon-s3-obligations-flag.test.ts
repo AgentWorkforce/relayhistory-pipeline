@@ -1,7 +1,8 @@
 /**
- * S3X_OBLIGATIONS (default OFF). Off is today's behaviour: no obligation schema, triggers or genesis on open; leases
- * without generations; the exporter records no invocation and claims nothing; main runs the legacy job (byte-identical
- * to #289's job.ts). On: the obligation model. Plus the registry's M1 case on the UNSETTLED production default.
+ * S3X_OBLIGATIONS (default OFF) gates the NEW exporter-obligation protocol, its schema and genesis bootstrap. Off: no
+ * obligation schema, triggers or genesis on open; leases without generations; the exporter records and claims nothing;
+ * the erasure job still uses the STRICT canonical paged eraser (unflagged hardening), without obligations. Used
+ * obligation state is refused off. On: the obligation model. Plus the registry's M1 cases on the production default.
  */
 import { expect, test } from "bun:test";
 import { mkdtemp, readFile } from "node:fs/promises";
@@ -12,7 +13,6 @@ import { DatabaseSync } from "node:sqlite";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { obligationsEnabled } from "../neon-s3-erasure/main.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "../neon-s3-erasure/job.ts";
-import { DEFAULT_ERASURE_CONFIG as LEGACY_CONFIG, ErasureJob as LegacyErasureJob } from "../neon-s3-erasure/job-legacy.ts";
 import type { ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
 
@@ -40,23 +40,22 @@ test("OFF (the default): no obligation schema, triggers, genesis or lease genera
   expect(st.meta("obligations_genesis")).toBeUndefined();
   st.close();
   const names = tables(path);
-  for (const t of ["write_invocations", "write_published", "erase_reservations", "write_terminal", "erased_versions", "write_touch", "write_clock", "erase_checkpoints"])
+  for (const t of ["write_invocations", "write_published", "erase_reservations", "write_terminal", "erased_versions", "write_touch", "write_clock"])
     expect(names).not.toContain(t);
+  expect(names).toContain("erase_checkpoints"); // the strict eraser's resume state: unflagged hardening
   expect(names.some((n) => n.includes("_touch_"))).toBe(false);
 });
 
-test("OFF: the schema statement and the legacy job are byte-identical to main 341dd5a9 (#289 merged)", async () => {
+test("OFF: the base schema statement is byte-identical to main 341dd5a9 (#289 merged)", async () => {
   const root = new URL("../../../", import.meta.url).pathname;
-  const git = (...a: string[]) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
   let base: string;
   try {
-    base = git("show", "341dd5a9:src/migration/neon-s3-erasure/job.ts");
+    base = execFileSync("git", ["show", "341dd5a9:src/migration/neon-s3-sync/state.ts"], { cwd: root, encoding: "utf8" });
   } catch {
-    return; // shallow CI checkout without the base commit: the blob pin below still applies
+    return; // a shallow checkout without the base commit
   }
-  expect(await readFile(join(root, "src/migration/neon-s3-erasure/job-legacy.ts"), "utf8")).toBe(base);
-  const cut = (s: string) => s.slice(s.indexOf('this.db.exec("PRAGMA journal_mode'), s.indexOf("CREATE INDEX IF NOT EXISTS groups_last"));
-  expect(cut(await readFile(join(root, "src/migration/neon-s3-sync/state.ts"), "utf8"))).toBe(cut(git("show", "341dd5a9:src/migration/neon-s3-sync/state.ts")));
+  const cut = (x: string) => x.slice(x.indexOf('this.db.exec("PRAGMA journal_mode'), x.indexOf("CREATE INDEX IF NOT EXISTS groups_last"));
+  expect(cut(await readFile(join(root, "src/migration/neon-s3-sync/state.ts"), "utf8"))).toBe(cut(base));
 });
 
 test("ON: the obligation schema, triggers, lease generations and an unattested genesis", async () => {
@@ -111,14 +110,25 @@ test("C1: ON -> OFF with USED obligation state is REFUSED (never silently droppe
   off.close();
 });
 
-test("C1: OFF dry run (the legacy job) creates no obligation state", async () => {
+test("C1: OFF dry run and OFF erasure use the STRICT paged eraser and create no obligation state", async () => {
   const path = await tmp("e3-flag-dry-");
   const st = new SyncState(path, { obligations: false });
   const s = new FakeS3Versions();
-  const job = new LegacyErasureJob(auth(), st, s.eraser(), () => {}, LEGACY_CONFIG, () => Date.now(), async () => {});
+  for (let i = 0; i < 12_500; i++) s.put(`${PFX}raw/b=${String(i).padStart(6, "0")}.ndjson.zst`, Date.parse("2026-11-01T00:00:00Z"));
+  const clock = Date.parse("2026-11-07T00:00:00Z");
+  st.enqueueErasure([{ key: PFX, kind: "prefix", org_id: "org-1", reason: "fenced" }], clock - 1000);
+  const job = new ErasureJob(auth(), st, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => clock, async () => {});
   await job.sweep({ dryRun: true });
+  expect(s.count(PFX)).toBe(12_500); // the dry run erases nothing
+  // The strict primitive: bounded per run (10k), resumed from its checkpoint, done only after a strict zero inventory.
+  await job.drain();
+  expect(s.count(PFX)).toBe(2_500);
+  expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 5).map((e) => e.key)).toEqual([PFX]);
+  await job.drain();
+  expect(s.count(PFX)).toBe(0);
+  expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 5)).toEqual([]);
   st.close();
-  expect(tables(path).filter((n) => n.startsWith("write_") || n === "erase_reservations")).toEqual([]);
+  expect(tables(path).filter((n) => n.startsWith("write_") || n === "erase_reservations" || n === "erased_versions")).toEqual([]);
 });
 
 test("M1 (a)+(b), production default: a claim hitting publish_reserved is a transient wait (never stuck_with_keys); after the erasure run proves, the claim and cancelErasures go through", async () => {
