@@ -17,16 +17,17 @@
  * Values only travel as bound parameters; no result or transcript text is written here.
  */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
+import { randomUUID } from "node:crypto";
 import type { ObjectStore } from "../../packages/object-store/src/index.ts";
 import type { EraseBudget, EraseCheckpoint, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 import {
   nextSweepDelayMs,
   reconcileObligation,
-  type ObligationAuthority,
-  type ObligationReason,
+  type Cas,
+  type InvocationOutcome,
+  type ObligationState,
   type ObligationStore,
   type ObligationWriter,
-  type WriteObligation,
 } from "../migration/neon-s3-erasure/write-obligation.ts";
 import type { AnalysisJob, AnalysisJobStore } from "./processor.ts";
 import { analysisResultKey, analysisResultPrefix, putAnalysisResult } from "./results.ts";
@@ -85,23 +86,46 @@ WITH job AS (
    FOR UPDATE
 ), live AS (
   SELECT job.*, sessions.session_analysis_source_revision(job.org_id, job.workspace_id, job.session_id) AS rev FROM job
+), ticket AS (
+  INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, writer_token, generation)
+  SELECT $4, live.id, live.org_id, live.workspace_id, live.session_id, 'publishing', $2::uuid, $3
+    FROM live WHERE live.rev IS NOT NULL AND live.rev = $3
+  ON CONFLICT (result_key) DO UPDATE SET created_at = now(), writer_token = excluded.writer_token, generation = excluded.generation,
+      rev = nextval('sessions.session_analysis_ticket_rev_seq')
+    WHERE sessions.session_analysis_result_tickets.job_id = excluded.job_id
+      AND sessions.session_analysis_result_tickets.reason = 'publishing'
+  RETURNING result_key
+), dispatched AS (
+  -- The invocation, committed with the reservation BEFORE the PUT is sent (write-obligation v3).
+  INSERT INTO sessions.session_analysis_ticket_invocations (invocation_id, result_key, writer_token, generation)
+  SELECT $5::uuid, ticket.result_key, $2::uuid, $3 FROM ticket
+  RETURNING result_key
 )
-INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, writer_token, generation)
-SELECT $4, live.id, live.org_id, live.workspace_id, live.session_id, 'publishing', $2::uuid, $3
-  FROM live WHERE live.rev IS NOT NULL AND live.rev = $3
-ON CONFLICT (result_key) DO UPDATE SET created_at = now(), writer_token = excluded.writer_token, generation = excluded.generation
-  WHERE sessions.session_analysis_result_tickets.job_id = excluded.job_id
-    AND sessions.session_analysis_result_tickets.reason = 'publishing'
-RETURNING result_key`;
+SELECT result_key FROM dispatched`;
 
-/** An aborted, timed-out or errored PUT: its outcome is unknown (it may commit, even late). */
-const MARK_UNKNOWN_SQL = `
-UPDATE sessions.session_analysis_result_tickets
-   SET reason = 'unknown', lease_expires_at = NULL, next_sweep_at = now()
- WHERE result_key = $1 AND job_id = $2::uuid AND reason = 'publishing' AND writer_token = $3::uuid`;
+/** The request's OWN evidence (writer + generation scoped): acked with its exact version id, or refused. */
+const INVOCATION_ACKED_SQL = `
+UPDATE sessions.session_analysis_ticket_invocations SET outcome = 'acked', version_id = $3
+ WHERE invocation_id = $2::uuid AND result_key = $1 AND outcome = 'dispatched'
+   AND writer_token IS NOT DISTINCT FROM $4::uuid AND generation IS NOT DISTINCT FROM $5`;
+const INVOCATION_REFUSED_SQL = `
+UPDATE sessions.session_analysis_ticket_invocations SET outcome = 'refused'
+ WHERE invocation_id = $2::uuid AND result_key = $1 AND outcome = 'dispatched'
+   AND writer_token IS NOT DISTINCT FROM $3::uuid AND generation IS NOT DISTINCT FROM $4`;
 
+/**
+ * Publish (write-obligation v3 ObligationWriter.publish): under the ticket ROW LOCK that the
+ * sweep's reserve takes, refused for a version reserved for deletion; records the owned version,
+ * resolves the publishing invocation (acked + owned) and bumps the ticket rev; the ticket is
+ * retired only when no other invocation is left at the key.
+ */
 const COMPLETE_SQL = `
-WITH done AS (
+WITH lk AS (
+  SELECT t.result_key FROM sessions.session_analysis_result_tickets AS t
+   WHERE t.result_key = $6 AND t.job_id = $1::uuid AND t.reason = 'publishing' AND t.writer_token = $2::uuid
+     AND ($12::text IS NULL OR NOT ($12::text = ANY (t.reserved_versions)))
+   FOR UPDATE
+), done AS (
   UPDATE sessions.session_analysis_jobs_v2 AS j
      SET status = 'completed', harness = $3, source_fingerprint = $4, source_generation = $5,
          source_revision = $11, result_s3_key = $6, result_sha256 = $7, result_bytes = $8,
@@ -109,12 +133,24 @@ WITH done AS (
          lease_token = NULL, lease_expires_at = NULL, completed_at = now(), updated_at = now()
    WHERE j.id = $1::uuid AND j.status = 'running' AND j.lease_token = $2::uuid AND j.lease_expires_at > now()
      AND sessions.session_analysis_source_revision(j.org_id, j.workspace_id, j.session_id) = $11
-     AND EXISTS (SELECT 1 FROM sessions.session_analysis_result_tickets AS t
-                  WHERE t.result_key = $6 AND t.job_id = j.id AND t.reason = 'publishing')
+     AND EXISTS (SELECT 1 FROM lk)
+     AND NOT EXISTS (SELECT 1 FROM sessions.session_analysis_ticket_reservations AS v
+                      WHERE v.result_key = $6 AND v.version_id = $12)
   RETURNING j.id
+), own AS (
+  DELETE FROM sessions.session_analysis_ticket_invocations AS i USING done
+   WHERE i.invocation_id = $13::uuid AND i.result_key = $6
+  RETURNING i.invocation_id
 ), retired AS (
   DELETE FROM sessions.session_analysis_result_tickets AS t USING done
    WHERE t.result_key = $6 AND t.job_id = done.id
+     AND NOT EXISTS (SELECT 1 FROM sessions.session_analysis_ticket_invocations AS i
+                      WHERE i.result_key = $6 AND i.invocation_id <> $13::uuid)
+  RETURNING t.result_key
+), bumped AS (
+  UPDATE sessions.session_analysis_result_tickets AS t SET rev = nextval('sessions.session_analysis_ticket_rev_seq')
+    FROM done
+   WHERE t.result_key = $6 AND NOT EXISTS (SELECT 1 FROM retired)
   RETURNING t.result_key
 )
 SELECT (SELECT count(*) FROM done)::int AS n, (SELECT count(*) FROM retired)::int AS r`;
@@ -133,15 +169,13 @@ RETURNING id`;
  */
 const SWEEP_SQL = `
 SELECT t.result_key, t.reason, t.org_id, t.workspace_id, t.session_id, t.job_id::text AS job_id, t.generation,
-       t.writer_token::text AS writer_token, t.erase_checkpoint, t.sweeps,
-       EXISTS (SELECT 1 FROM sessions.session_analysis_ticket_strays AS s WHERE s.result_key = t.result_key) AS stray_found
+       t.writer_token::text AS writer_token
   FROM sessions.session_analysis_result_tickets AS t
  WHERE t.created_at < now() - make_interval(secs => $1::integer)
    AND (t.lease_expires_at IS NULL OR t.lease_expires_at <= now())
    AND (t.next_sweep_at IS NULL OR t.next_sweep_at <= now())
  ORDER BY t.created_at
- LIMIT $2
- FOR UPDATE OF t SKIP LOCKED`;
+ LIMIT $2`;
 
 const ERROR_CODE = /^[a-z][a-z0-9_]{0,63}$/u;
 
@@ -155,6 +189,8 @@ export interface AnalysisJobStoreDeps {
 }
 
 export function postgresAnalysisJobStore(deps: AnalysisJobStoreDeps): AnalysisJobStore {
+  // key -> this tick's dispatched invocation id (one PUT attempt per reservation).
+  const invocations = new Map<string, string>();
   return {
     async claim(options) {
       const lease = Math.min(MAX_LEASE_SECONDS, Math.max(1, Math.floor(options.leaseSeconds)));
@@ -180,18 +216,25 @@ export function postgresAnalysisJobStore(deps: AnalysisJobStoreDeps): AnalysisJo
     async reserve(job, output, planned) {
       if (!job.sourceRevision) return null;
       const key = analysisResultKey(analysisResultPrefix(await deps.anchorManifestKey(job, output.harness)), job.id, planned.sha256);
-      const { rows } = await deps.db.query<{ result_key: string }>(RESERVE_SQL, [job.id, job.leaseToken, job.sourceRevision, key]);
+      const invocationId = randomUUID();
+      const { rows } = await deps.db.query<{ result_key: string }>(RESERVE_SQL, [job.id, job.leaseToken, job.sourceRevision, key, invocationId]);
+      if (rows[0]) invocations.set(key, invocationId);
       return rows[0]?.result_key ?? null;
     },
     async put(key, bytes, sha256, job) {
-      try {
-        return await putAnalysisResult(deps.store, key, bytes, sha256, deps.putTimeoutMs);
-      } catch (error) {
-        // Aborted, timed out, lost response or a failed read-back: the PUT may have committed
-        // (even after any grace). The pending-write ticket becomes 'unknown' for the sweeper.
-        if (job) await analysisObligationWriter.markUnknown(deps.db, key, workerIdentity(job));
-        throw error;
-      }
+      const invocationId = invocations.get(key);
+      // The shared bounded PUT: a definite refusal is the request's own refused evidence; a
+      // timeout, abort, error or lost response leaves the invocation DISPATCHED (unresolved).
+      const out = await putAnalysisResult(deps.store, key, bytes, sha256, deps.putTimeoutMs, {
+        onUnknown: async () => {},
+        onRefused: async () => {
+          if (job && invocationId) await analysisObligationWriter.refused(deps.db, key, invocationId, workerFence(job));
+        },
+      });
+      // Only the PUT's OWN ack (its exact version id) is evidence; a version learnt from a read is not.
+      if (job && invocationId && out.ackedVersionId)
+        await analysisObligationWriter.acked(deps.db, key, invocationId, out.ackedVersionId, workerFence(job));
+      return out.versionId ? { versionId: out.versionId } : {};
     },
     async complete({ job, output, stored }) {
       const { rows } = await deps.db.query<{ n: number }>(COMPLETE_SQL, [
@@ -207,6 +250,7 @@ export function postgresAnalysisJobStore(deps: AnalysisJobStoreDeps): AnalysisJo
         output.outputTokens,
         job.sourceRevision,
         stored.versionId ?? null,
+        invocations.get(stored.key) ?? "00000000-0000-0000-0000-000000000000",
       ]);
       return Number(rows[0]?.n ?? 0) === 1;
     },
@@ -218,49 +262,77 @@ export function postgresAnalysisJobStore(deps: AnalysisJobStoreDeps): AnalysisJo
   };
 }
 
-/** The worker's obligation identity: the job and its lease token (the ticket's writer). */
-export const workerIdentity = (job: Pick<AnalysisJob, "id" | "leaseToken">): readonly unknown[] => [job.id, job.leaseToken];
+/** A writer's fence the request evidence must match (worker: lease token + claimed source revision). */
+export interface WriterFence {
+  writer: string;
+  generation: string | null;
+}
+export const workerFence = (job: Pick<AnalysisJob, "leaseToken" | "sourceRevision">): WriterFence => ({ writer: job.leaseToken, generation: job.sourceRevision });
 
 /**
- * F1's ObligationWriter (write-obligation.ts) over session_analysis_result_tickets. The worker's
- * record and publish are the fenced CTEs RESERVE_SQL / COMPLETE_SQL (record inside the job-lease
- * + source-revision transaction; publish records result_version_id and retires the ticket in the
- * completion statement); the backfill's are its writer/generation/purge-fenced ticket and job
- * inserts. These methods are the same contract for callers outside those statements.
- * identity = [job id, writer token].
+ * F1's ObligationWriter (write-obligation.ts v3) over the ticket + invocation tables.
+ *   dispatch  the worker's is RESERVE_SQL (the ticket + a NEW invocation id, in the job-lease and
+ *             source-revision statement, committed before the PUT); the backfill's is its fenced
+ *             ticket insert. This method is the same contract for other callers.
+ *   acked / refused  only the request's OWN evidence, writer- and generation-scoped.
+ *   publish  the worker's is COMPLETE_SQL, the backfill's its job insert: both take the ticket row
+ *             lock, refuse a reserved version and record the owned version.
  */
-export const analysisObligationWriter: ObligationWriter<SqlExecutor> = {
-  async record(tx, key, identity) {
-    const [jobId, writer] = identity as [string, string];
-    await tx.query(
-      `INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, writer_token)
-       SELECT $1, j.id, j.org_id, j.workspace_id, j.session_id, 'publishing', $3::uuid FROM sessions.session_analysis_jobs_v2 AS j WHERE j.id = $2::uuid
-       ON CONFLICT (result_key) DO NOTHING`,
-      [key, jobId, writer],
-    );
-  },
-  async markUnknown(tx, key, identity) {
-    const [jobId, writer] = identity as [string, string];
-    await tx.query(MARK_UNKNOWN_SQL, [key, jobId, writer]);
-  },
-  async publish(tx, key, identity, versionId) {
-    const [jobId, writer] = identity as [string, string];
-    await tx.query(
-      `WITH owned AS (
-         UPDATE sessions.session_analysis_jobs_v2 SET result_version_id = $4 WHERE id = $2::uuid AND result_s3_key = $1 RETURNING id
-       ), gone AS (
-         DELETE FROM sessions.session_analysis_result_tickets
-          WHERE result_key = $1 AND job_id = $2::uuid AND writer_token = $3::uuid AND EXISTS (SELECT 1 FROM owned) RETURNING result_key
-       )
-       DELETE FROM sessions.session_analysis_ticket_strays WHERE result_key IN (SELECT result_key FROM gone)`,
-      [key, jobId, writer, versionId],
-    );
-  },
+export function analysisObligationWriterFor(fence: WriterFence) {
+  return {
+    async dispatch(tx: SqlExecutor, key: string, identity: readonly unknown[], invocationId: string) {
+      const [orgId, workspaceId, sessionId, jobId] = identity as [string, string, string, string];
+      await tx.query(
+        `WITH t AS (
+           INSERT INTO sessions.session_analysis_result_tickets (result_key, job_id, org_id, workspace_id, session_id, reason, writer_token, generation)
+           VALUES ($1, $2::uuid, $3, $4, $5, 'publishing', $6::uuid, $7)
+           ON CONFLICT (result_key) DO UPDATE SET rev = nextval('sessions.session_analysis_ticket_rev_seq')
+           RETURNING result_key
+         )
+         INSERT INTO sessions.session_analysis_ticket_invocations (invocation_id, result_key, writer_token, generation)
+         SELECT $8::uuid, result_key, $6::uuid, $7 FROM t`,
+        [key, jobId, orgId, workspaceId, sessionId, fence.writer, fence.generation, invocationId],
+      );
+    },
+    acked: (tx: SqlExecutor, key: string, invocationId: string, versionId: string) =>
+      tx.query(INVOCATION_ACKED_SQL, [key, invocationId, versionId, fence.writer, fence.generation]).then(() => {}),
+    refused: (tx: SqlExecutor, key: string, invocationId: string) =>
+      tx.query(INVOCATION_REFUSED_SQL, [key, invocationId, fence.writer, fence.generation]).then(() => {}),
+    async publish(tx: SqlExecutor, key: string, identity: readonly unknown[], versionId: string) {
+      const [, , , jobId] = identity as [string, string, string, string];
+      const { rows } = await tx.query<{ ok: boolean }>(
+        `WITH lk AS (
+           SELECT result_key FROM sessions.session_analysis_result_tickets
+            WHERE result_key = $1 AND NOT ($3::text = ANY (reserved_versions)) FOR UPDATE
+         ), owned AS (
+           UPDATE sessions.session_analysis_jobs_v2 SET result_version_id = $3
+            WHERE id = $2::uuid AND result_s3_key = $1 AND EXISTS (SELECT 1 FROM lk)
+              AND NOT EXISTS (SELECT 1 FROM sessions.session_analysis_ticket_reservations WHERE result_key = $1 AND version_id = $3)
+           RETURNING id
+         ), bump AS (
+           UPDATE sessions.session_analysis_result_tickets SET rev = nextval('sessions.session_analysis_ticket_rev_seq')
+            WHERE result_key = $1 AND EXISTS (SELECT 1 FROM owned) RETURNING result_key
+         )
+         SELECT EXISTS (SELECT 1 FROM owned) AS ok`,
+        [key, jobId, versionId],
+      );
+      if (!rows[0]?.ok) throw new Error("analysis_publish_refused");
+    },
+  } satisfies ObligationWriter<SqlExecutor> & Record<string, unknown>;
+}
+/** Back-compat shape used by the worker's put (fence passed per call). */
+export const analysisObligationWriter = {
+  acked: (tx: SqlExecutor, key: string, invocationId: string, versionId: string, fence: WriterFence) =>
+    analysisObligationWriterFor(fence).acked(tx, key, invocationId, versionId),
+  refused: (tx: SqlExecutor, key: string, invocationId: string, fence: WriterFence) =>
+    analysisObligationWriterFor(fence).refused(tx, key, invocationId),
 };
 
-/** One ticket's authority: reason, identity, and the versions completed jobs own at its key. */
-const TICKET_AUTHORITY_SQL = `
-SELECT t.reason, t.job_id::text AS job_id, t.writer_token::text AS writer_token,
+const TICKET_STATE_SQL = `
+SELECT t.rev::text AS rev, t.org_id, t.workspace_id, t.session_id, t.job_id::text AS job_id, t.generation, t.writer_token::text AS writer_token,
+       t.erase_checkpoint,
+       ARRAY(SELECT jsonb_build_object('id', i.invocation_id::text, 'outcome', i.outcome, 'versionId', i.version_id)
+               FROM sessions.session_analysis_ticket_invocations AS i WHERE i.result_key = t.result_key ORDER BY i.invocation_id) AS invocations,
        ARRAY(SELECT j.result_version_id FROM sessions.session_analysis_jobs_v2 AS j
               WHERE j.result_s3_key = t.result_key AND j.status = 'completed' AND j.result_version_id IS NOT NULL
               ORDER BY 1) AS owned,
@@ -268,64 +340,104 @@ SELECT t.reason, t.job_id::text AS job_id, t.writer_token::text AS writer_token,
          WHERE j.result_s3_key = t.result_key AND j.status = 'completed' AND j.result_version_id IS NULL)::int AS without_version
   FROM sessions.session_analysis_result_tickets AS t WHERE t.result_key = $1`;
 
-interface TicketRow {
-  result_key: string; reason: ObligationReason; org_id: string; workspace_id: string; session_id: string; job_id: string;
-  generation: string | null; writer_token: string | null; erase_checkpoint: EraseCheckpoint | null; sweeps: number; stray_found: boolean;
+/** One ticket CAS: lock the row, require the loaded rev, apply `work`, bump the rev; commits on its own. */
+async function casTicket(
+  transact: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>,
+  key: string,
+  rev: number,
+  work: (tx: SqlExecutor) => Promise<boolean>,
+  deleteRow = false,
+): Promise<Cas> {
+  return transact(async (tx) => {
+    const cur = (await tx.query<{ rev: string }>("SELECT rev::text AS rev FROM sessions.session_analysis_result_tickets WHERE result_key = $1 FOR UPDATE", [key])).rows[0];
+    if (!cur || Number(cur.rev) !== rev) return { ok: false } as const;
+    if (!(await work(tx))) return { ok: false } as const;
+    if (deleteRow) {
+      await tx.query("DELETE FROM sessions.session_analysis_ticket_invocations WHERE result_key = $1", [key]);
+      await tx.query("DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1", [key]);
+      return { ok: true, rev } as const;
+    }
+    const next = (await tx.query<{ rev: string }>(
+      "UPDATE sessions.session_analysis_result_tickets SET rev = nextval('sessions.session_analysis_ticket_rev_seq') WHERE result_key = $1 RETURNING rev::text AS rev", [key],
+    )).rows[0]!;
+    return { ok: true, rev: Number(next.rev) } as const;
+  });
 }
-const ticketIdentity = (t: Pick<TicketRow, "org_id" | "workspace_id" | "session_id" | "job_id" | "generation" | "writer_token">) =>
-  ["analysis-result-ticket", t.org_id, t.workspace_id, t.session_id, t.job_id, t.generation, t.writer_token] as const;
 
 /**
- * F1's ObligationStore (write-obligation.ts) for one locked ticket. `tx` holds the ticket row
- * (FOR UPDATE); `durable` commits on its own: markStray writes session_analysis_ticket_strays
- * (no lock on the ticket row) so the evidence is durable before the page's deletes even if the
- * sweep transaction later rolls back.
+ * F1's ObligationStore (write-obligation.ts v3) for one ticket. Every mutation is a CAS on the
+ * loaded rev in ITS OWN committed transaction (no remote await inside it), so it is durable before
+ * the deletes that follow. `reserve` takes the same ticket row lock as every publishing path
+ * (COMPLETE_SQL, the backfill's job insert, analysisObligationWriterFor().publish) and refuses if
+ * any version is owned now; reservations are permanent.
  */
-function ticketObligationStore(tx: SqlExecutor, durable: SqlExecutor, t: TicketRow): ObligationStore {
+export function ticketObligationStore(transact: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>, key: string): ObligationStore {
   return {
-    async load(): Promise<ObligationAuthority | null> {
-      const row = (await tx.query<{ reason: ObligationReason; job_id: string; writer_token: string | null; owned: string[] | null; without_version: number }>(
-        TICKET_AUTHORITY_SQL, [t.result_key],
-      )).rows[0];
+    async load(): Promise<ObligationState | null> {
+      const row = await transact(async (tx) =>
+        (await tx.query<{
+          rev: string; org_id: string; workspace_id: string; session_id: string; job_id: string; generation: string | null;
+          writer_token: string | null; erase_checkpoint: EraseCheckpoint | null; invocations: { id: string; outcome: InvocationOutcome; versionId: string | null }[] | null;
+          owned: string[] | null; without_version: number;
+        }>(TICKET_STATE_SQL, [key])).rows[0]);
       if (!row) return null;
       return {
-        reason: row.reason,
-        identity: ticketIdentity({ ...t, job_id: row.job_id, writer_token: row.writer_token }),
+        key,
+        identity: ["analysis-result-ticket", row.org_id, row.workspace_id, row.session_id, row.job_id, row.generation, row.writer_token],
+        rev: Number(row.rev),
+        invocations: (row.invocations ?? []).map((i) => ({ id: i.id, outcome: i.outcome, ...(i.versionId ? { versionId: i.versionId } : {}) })),
         ownedVersions: row.owned ?? [],
         ownersWithoutVersion: Number(row.without_version),
+        checkpoint: row.erase_checkpoint,
       };
     },
-    async markStray() {
-      await durable.query("INSERT INTO sessions.session_analysis_ticket_strays (result_key) VALUES ($1) ON CONFLICT DO NOTHING", [t.result_key]);
-    },
-    async saveCheckpoint(checkpoint) {
-      await tx.query("UPDATE sessions.session_analysis_result_tickets SET erase_checkpoint = $2::jsonb WHERE result_key = $1", [t.result_key, JSON.stringify(checkpoint)]);
-    },
-    async reschedule(strayFound) {
-      if (strayFound) await tx.query("INSERT INTO sessions.session_analysis_ticket_strays (result_key) VALUES ($1) ON CONFLICT DO NOTHING", [t.result_key]);
-      await tx.query(
-        `UPDATE sessions.session_analysis_result_tickets
-            SET sweeps = sweeps + 1, erase_checkpoint = NULL, next_sweep_at = now() + $2::double precision * interval '1 millisecond'
-          WHERE result_key = $1`,
-        [t.result_key, nextSweepDelayMs(Number(t.sweeps))],
-      );
-    },
-    async retire() {
-      await tx.query("DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1", [t.result_key]);
-      await tx.query("DELETE FROM sessions.session_analysis_ticket_strays WHERE result_key = $1", [t.result_key]);
-    },
+    reserve: (rev, versionIds) =>
+      casTicket(transact, key, rev, async (tx) => {
+        const owned = (await tx.query("SELECT 1 FROM sessions.session_analysis_jobs_v2 WHERE result_s3_key = $1 AND status = 'completed' AND result_version_id = ANY($2::text[]) LIMIT 1", [key, [...versionIds]])).rows;
+        if (owned.length) return false;
+        await tx.query(
+          "INSERT INTO sessions.session_analysis_ticket_reservations (result_key, version_id) SELECT $1, v FROM unnest($2::text[]) AS v ON CONFLICT DO NOTHING",
+          [key, [...versionIds]],
+        );
+        // On the locked row too, where every publish's FOR UPDATE re-checks it (no stale snapshot).
+        await tx.query(
+          "UPDATE sessions.session_analysis_result_tickets SET reserved_versions = ARRAY(SELECT DISTINCT unnest(reserved_versions || $2::text[]) ORDER BY 1) WHERE result_key = $1",
+          [key, [...versionIds]],
+        );
+        return true;
+      }),
+    saveCheckpoint: (rev, checkpoint) =>
+      casTicket(transact, key, rev, async (tx) => {
+        await tx.query("UPDATE sessions.session_analysis_result_tickets SET erase_checkpoint = $2::jsonb WHERE result_key = $1", [key, JSON.stringify(checkpoint)]);
+        return true;
+      }),
+    resolve: (rev, ids) =>
+      casTicket(transact, key, rev, async (tx) => {
+        await tx.query("DELETE FROM sessions.session_analysis_ticket_invocations WHERE result_key = $1 AND invocation_id::text = ANY($2::text[])", [key, [...ids]]);
+        return true;
+      }),
+    reschedule: (rev) =>
+      casTicket(transact, key, rev, async (tx) => {
+        await tx.query(
+          `UPDATE sessions.session_analysis_result_tickets
+              SET erase_checkpoint = NULL, next_sweep_at = now() + $2::double precision * interval '1 millisecond', sweeps = sweeps + 1
+            WHERE result_key = $1`,
+          [key, nextSweepDelayMs(Number((await tx.query<{ s: number }>("SELECT sweeps s FROM sessions.session_analysis_result_tickets WHERE result_key = $1", [key])).rows[0]?.s ?? 0))],
+        );
+        return true;
+      }),
+    retire: (rev) => casTicket(transact, key, rev, async () => true, true),
   };
 }
 
 /**
- * Sweep the result tickets: each ticket is one durable write obligation, reconciled by THE
- * shared implementation (src/migration/neon-s3-erasure/write-obligation.ts reconcileObligation,
- * over the shared strict paged eraser). Successor-safe (versions completed jobs own are never
- * selected), checkpointed per ticket, authority re-read before every page's deletes, durable
- * stray evidence, and the shared completion predicate (forgotten: a fresh strict zero
- * inventory of unowned versions; unknown/publishing: additionally the write accounted for, by a
- * found stray or by ownership). A clean sweep only reschedules; a failed step keeps the ticket,
- * its checkpoint and its stray evidence, and the sweep continues. Returns the tickets retired.
+ * Sweep the result tickets: each ticket is one key's write obligation, reconciled by THE shared
+ * implementation (write-obligation.ts v3 reconcileObligation over the strict paged eraser).
+ * Successor-safe (owned versions never selected), every doomed version reserved under the publish
+ * row lock before its delete, every mutation a CAS committed on its own, the checkpoint scope bound
+ * to identity + owned + invocation set. A dispatched invocation (lost response, timeout, crash) is
+ * unresolved indefinitely: the ticket is rescheduled, never retired, until that request's own
+ * acked/refused evidence. A failed step keeps everything; the sweep continues. Returns retired.
  */
 export async function sweepAnalysisTickets(
   store: ObjectStore,
@@ -335,37 +447,26 @@ export async function sweepAnalysisTickets(
     transact: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
     /** REQUIRED: the shared paged eraser (createS3Eraser / storeEraser). No plain-delete fallback. */
     eraser: PagedEraser;
-    /** Commits on its own (the worker's pool): durable stray evidence. Default: the sweep transaction. */
-    durable?: SqlExecutor;
     /** Per-ticket budget for one step (the eraser's hard ceilings still apply). */
     budget?: EraseBudget;
-    /** A ticket's step failed (it stays, with its last checkpoint); the sweep continues. */
+    /** A ticket's step failed or its CAS was refused (it stays); the sweep continues. */
     onError?: (key: string, error: unknown) => void;
   },
 ): Promise<number> {
   if (typeof options?.eraser?.eraseStep !== "function" || typeof options.eraser.verifyErased !== "function")
     throw new Error("analysis_sweep_eraser_required");
   void store;
-  return options.transact(async (tx) => {
-    const { rows } = await tx.query<TicketRow>(SWEEP_SQL, [options.graceSeconds ?? TICKET_GRACE_SECONDS, options.limit ?? 50]);
-    let retired = 0;
-    for (const t of rows) {
-      const obligation: WriteObligation = {
-        key: t.result_key,
-        reason: t.reason,
-        identity: ticketIdentity(t),
-        checkpoint: t.erase_checkpoint,
-        strayFound: t.stray_found === true,
-      };
-      try {
-        const outcome = await reconcileObligation(options.eraser, ticketObligationStore(tx, options.durable ?? tx, t), obligation, {
-          ...(options.budget ? { budget: options.budget } : {}),
-        });
-        if (outcome === "retired") retired += 1;
-      } catch (error) {
-        options.onError?.(t.result_key, error);
-      }
+  const { rows } = await options.transact((tx) =>
+    tx.query<{ result_key: string }>(SWEEP_SQL, [options.graceSeconds ?? TICKET_GRACE_SECONDS, options.limit ?? 50]));
+  let retired = 0;
+  for (const { result_key } of rows) {
+    try {
+      const outcome = await reconcileObligation(options.eraser, ticketObligationStore(options.transact, result_key), options.budget ? { budget: options.budget } : {});
+      if (outcome === "retired") retired += 1;
+      else if (outcome === "refused") options.onError?.(result_key, new Error("analysis_sweep_cas_refused"));
+    } catch (error) {
+      options.onError?.(result_key, error);
     }
-    return retired;
-  });
+  }
+  return retired;
 }

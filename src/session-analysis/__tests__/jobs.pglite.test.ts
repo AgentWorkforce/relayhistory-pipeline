@@ -61,9 +61,9 @@ async function publish(store: ReturnType<typeof jobStore>, job: AnalysisJob, bet
   const { bytes, sha256 } = encodeAnalysisResult(out.result);
   const key = await store.reserve(job, out, { sha256, bytes: bytes.length });
   if (!key) return { stage: "refused" as const, key: null };
-  await store.put(key, bytes, sha256);
+  const put = await store.put(key, bytes, sha256, job);
   if (between) await between();
-  const ok = await store.complete({ job, output: out, stored: { key, sha256, bytes: bytes.length } });
+  const ok = await store.complete({ job, output: out, stored: { key, sha256, bytes: bytes.length, ...(put && put.versionId ? { versionId: put.versionId } : {}) } });
   return { stage: ok ? ("completed" as const) : ("lost" as const), key };
 }
 const tx = <T,>(work: (q: { query: (t: string, p?: unknown[]) => Promise<{ rows: any[] }> }) => Promise<T>) => work(hoopDb(pg) as never);
@@ -469,10 +469,9 @@ describe("P0-2 erase-safe publication", () => {
     );
     expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx, eraser: storeEraser(results()) })).toBe(0);
     await pg.query("UPDATE sessions.session_analysis_result_tickets SET lease_expires_at = now() - interval '1 second'");
-    // Expired: swept, but nothing was found, so a pending write of unknown outcome is kept and
-    // rescheduled (never retired on a timer).
-    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx, eraser: storeEraser(results()) })).toBe(0);
-    expect((await pg.query("SELECT reason, sweeps FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ reason: "publishing", sweeps: 1 }]);
+    // Expired: an obligation with no dispatched invocation is an erase duty only; with nothing
+    // left at the key it retires.
+    expect(await sweepAnalysisTickets(results(), { graceSeconds: 0, transact: tx, eraser: storeEraser(results()) })).toBe(1);
   });
 
   test("P1-a: the worker's database half never re-reads a manifest", async () => {
@@ -770,19 +769,28 @@ describe("durable unknown-PUT recovery through the shared paged eraser: an abort
     return { js, job, out, bytes, sha256, key };
   }
 
-  test("(a) LOST RESPONSE: the PUT committed but its response (and version id) was lost -> 'unknown'; the sweep finds the stray by strict listing, erases it, verifies zero, retires", async () => {
+  const invocation = async () =>
+    (await pg.query<{ outcome: string }>("SELECT outcome FROM sessions.session_analysis_ticket_invocations")).rows.map((r) => r.outcome);
+
+  test("(a) LOST RESPONSE stays UNRESOLVED: the committed stray is erased (reserved first), but the dispatched invocation never retires the ticket", async () => {
     const v = versioned();
     const lossy = withPut(v.base, async (key, body) => { await v.commit(String(key), body as Uint8Array); throw new Error("socket hang up"); });
     const { js, job, bytes, sha256, key } = await reserved(lossy);
+    expect(await invocation()).toEqual(["dispatched"]); // recorded BEFORE the PUT
     await expect(js.put(key, bytes, sha256, job)).rejects.toThrow("socket hang up");
-    expect(await ticket()).toEqual([{ k: key, reason: "unknown", sweeps: 0 }]);
-    expect(v.ids(key)).toHaveLength(1);
-    expect(await sweep(v)).toBe(1);
-    expect(v.ids(key)).toEqual([]);
-    expect(await ticket()).toEqual([]);
+    expect(await invocation()).toEqual(["dispatched"]); // a lost response is no evidence
+    const stray = v.ids(key)[0]!;
+    expect(await sweep(v)).toBe(0);
+    expect(v.ids(key)).toEqual([]); // cleaned up...
+    expect((await pg.query<{ v: string }>("SELECT version_id v FROM sessions.session_analysis_ticket_reservations")).rows).toEqual([{ v: stray }]); // ...reserved before its delete
+    expect(await invocation()).toEqual(["dispatched"]); // ...but never resolved: no listing is request evidence
+    expect((await ticket()).length).toBe(1);
+    await pg.query("UPDATE sessions.session_analysis_result_tickets SET next_sweep_at = now() - interval '1 second'");
+    expect(await sweep(v)).toBe(0);
+    expect((await ticket()).length).toBe(1);
   });
 
-  test("(b) AFTER-GRACE commit: a clean sweep never retires the unknown ticket; the late commit is found and erased on a re-sweep", async () => {
+  test("(b) AFTER-GRACE commit: clean sweeps never retire the dispatched invocation; the late commit is erased on a re-sweep and the obligation stays", async () => {
     const v = versioned();
     let late: (() => Promise<string>) | null = null;
     const aborting = withPut(v.base, (key, body, opts) => new Promise((_, reject) => {
@@ -792,15 +800,16 @@ describe("durable unknown-PUT recovery through the shared paged eraser: an abort
     const { js, job, bytes, sha256, key } = await reserved(aborting);
     await expect(js.put(key, bytes, sha256, job)).rejects.toThrow("analysis_put_timeout");
     await pg.query("UPDATE sessions.session_analysis_result_tickets SET created_at = now() - interval '7 days'");
-    expect(await sweep(v)).toBe(0); // a strict zero inventory, but nothing accounted for: kept
-    expect(await ticket()).toEqual([{ k: key, reason: "unknown", sweeps: 1 }]);
+    expect(await sweep(v)).toBe(0); // a strict zero inventory, but the invocation is dispatched: kept
+    expect(await ticket()).toEqual([{ k: key, reason: "publishing", sweeps: 1 }]);
     expect(await sweep(v)).toBe(0); // not due yet (backoff)
     await late!();
     expect(v.ids(key)).toHaveLength(1);
     await pg.query("UPDATE sessions.session_analysis_result_tickets SET next_sweep_at = now() - interval '1 second'");
-    expect(await sweep(v)).toBe(1);
-    expect(v.ids(key)).toEqual([]);
-    expect(await ticket()).toEqual([]);
+    expect(await sweep(v)).toBe(0);
+    expect(v.ids(key)).toEqual([]); // the late commit is erased...
+    expect(await invocation()).toEqual(["dispatched"]); // ...and the obligation stays unresolved indefinitely
+    expect((await ticket()).length).toBe(1);
   });
 
   test("successor-safe: a published job's exact version at the key is never selected; only the unowned stray is erased", async () => {
@@ -821,19 +830,20 @@ describe("durable unknown-PUT recovery through the shared paged eraser: an abort
     expect((await readAs()).analyses).toHaveLength(1);
   });
 
-  test("ticket survival: the exact delete's ack is lost once -> the unknown ticket survives; the next sweep resolves it", async () => {
+  test("ticket survival: the exact delete's ack is lost once -> the ticket, its reservation and its unresolved invocation survive", async () => {
     const v = versioned();
     const lossy = withPut(v.base, async (key, body) => { await v.commit(String(key), body as Uint8Array); throw new Error("ECONNRESET"); });
     const { js, job, bytes, sha256, key } = await reserved(lossy);
     await expect(js.put(key, bytes, sha256, job)).rejects.toThrow("ECONNRESET");
     let lose = true;
     v.s3.onDelete = () => (lose ? ((lose = false), "lose") : undefined);
-    expect(await sweep(v)).toBe(0); // the step failed: the ticket survives, the found stray is recorded
-    expect(await ticket()).toEqual([{ k: key, reason: "unknown", sweeps: 0 }]);
-    expect((await pg.query<{ k: string }>("SELECT result_key k FROM sessions.session_analysis_ticket_strays")).rows).toEqual([{ k: key }]);
-    expect(await sweep(v)).toBe(1);
+    expect(await sweep(v)).toBe(0); // the step failed: the ticket, its reservation and its invocation survive
+    expect((await ticket()).length).toBe(1);
+    expect((await pg.query("SELECT 1 FROM sessions.session_analysis_ticket_reservations")).rows).toHaveLength(1);
+    expect(await sweep(v)).toBe(0);
     expect(v.ids(key)).toEqual([]);
-    expect(await ticket()).toEqual([]);
+    expect(await invocation()).toEqual(["dispatched"]);
+    expect((await ticket()).length).toBe(1);
   });
 
   test(">10k versions: a budget-exhausted step persists the bound checkpoint; a crash keeps it; the resumed sweep completes, verifies zero, retires", async () => {
@@ -883,5 +893,62 @@ describe("durable unknown-PUT recovery through the shared paged eraser: an abort
     expect(await js.complete({ job, output: out, stored: { key, sha256, bytes: bytes.length, ...(put && put.versionId ? { versionId: put.versionId } : {}) } })).toBe(true);
     expect(await ticket()).toEqual([]);
     expect((await pg.query<{ v: string }>("SELECT result_version_id v FROM sessions.session_analysis_jobs_v2 WHERE id = $1", [job.id])).rows[0]!.v).toBe(v.ids(key)[0]);
+  });
+});
+
+describe("write-obligation v3 adapters on the real tables: publish vs reserve, CAS", () => {
+  async function inflight() {
+    const objects = results();
+    const js = postgresAnalysisJobStore({ db: hoopDb(pg), store: objects, anchorManifestKey: async () => ANCHOR });
+    await request();
+    const job = (await js.claim({ leaseSeconds: 600 }))!;
+    const out = output();
+    const { bytes, sha256 } = encodeAnalysisResult(out.result);
+    const key = (await js.reserve(job, out, { sha256, bytes: bytes.length }))!;
+    return { js, job, out, bytes, sha256, key };
+  }
+  test("reserve BEFORE publish: the publish of the reserved version is refused (nothing owned)", async () => {
+    const { js, job, out, bytes, sha256, key } = await inflight();
+    const { ticketObligationStore } = await import("../store.ts");
+    const store = ticketObligationStore(tx, key);
+    const state = (await store.load())!;
+    expect(await store.reserve(state.rev, ["v-doomed"])).toMatchObject({ ok: true });
+    expect(await js.complete({ job, output: out, stored: { key, sha256, bytes: bytes.length, versionId: "v-doomed" } })).toBe(false);
+    expect((await pg.query("SELECT result_version_id v FROM sessions.session_analysis_jobs_v2 WHERE id = $1", [job.id])).rows).toEqual([{ v: null }]);
+  });
+  test("publish BEFORE reserve: the reservation is refused (the version is owned) and nothing can be deleted", async () => {
+    const { js, job, out, bytes, sha256, key } = await inflight();
+    const { ticketObligationStore, analysisObligationWriterFor, workerFence } = await import("../store.ts");
+    // Another invocation keeps the obligation alive after this publish.
+    await analysisObligationWriterFor(workerFence(job)).dispatch(hoopDb(pg) as never, key, [KEY.orgId, KEY.workspaceId, KEY.sessionId, job.id], "99999999-9999-4999-8999-999999999999");
+    expect(await js.complete({ job, output: out, stored: { key, sha256, bytes: bytes.length, versionId: "v-owned" } })).toBe(true);
+    const store = ticketObligationStore(tx, key);
+    const state = (await store.load())!;
+    expect(state.ownedVersions).toEqual(["v-owned"]);
+    expect(await store.reserve(state.rev, ["v-owned"])).toEqual({ ok: false });
+    expect((await pg.query("SELECT 1 FROM sessions.session_analysis_ticket_reservations")).rows).toHaveLength(0);
+  });
+  test("every sweep mutation is a CAS on the loaded rev: a dispatch in between refuses it; a missing row refuses it", async () => {
+    const { job, key } = await inflight();
+    const { ticketObligationStore, analysisObligationWriterFor, workerFence } = await import("../store.ts");
+    const store = ticketObligationStore(tx, key);
+    const state = (await store.load())!;
+    await analysisObligationWriterFor(workerFence(job)).dispatch(hoopDb(pg) as never, key, [KEY.orgId, KEY.workspaceId, KEY.sessionId, job.id], "88888888-8888-4888-8888-888888888888");
+    const cp = { v: 1 as const, bucket: "b", prefix: key.slice(0, key.lastIndexOf("/") + 1), scope: "s", afterKey: null, inKey: null };
+    for (const m of [store.saveCheckpoint(state.rev, cp), store.reserve(state.rev, ["x"]), store.resolve(state.rev, []), store.reschedule(state.rev), store.retire(state.rev)])
+      expect(await m).toEqual({ ok: false });
+    expect((await pg.query<{ c: unknown }>("SELECT erase_checkpoint c FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ c: null }]);
+    expect(await ticketObligationStore(tx, "k/missing").reschedule(1)).toEqual({ ok: false });
+    expect(await ticketObligationStore(tx, "k/missing").load()).toBeNull();
+  });
+  test("acked/refused are the request's OWN evidence: a foreign writer's or generation's evidence changes nothing", async () => {
+    const { job, key } = await inflight();
+    const { analysisObligationWriterFor, workerFence } = await import("../store.ts");
+    const id = (await pg.query<{ id: string }>("SELECT invocation_id::text id FROM sessions.session_analysis_ticket_invocations")).rows[0]!.id;
+    await analysisObligationWriterFor({ writer: "77777777-7777-4777-8777-777777777777", generation: job.sourceRevision }).acked(hoopDb(pg) as never, key, id, "v1");
+    await analysisObligationWriterFor({ writer: job.leaseToken, generation: "f".repeat(64) }).refused(hoopDb(pg) as never, key, id);
+    expect((await pg.query("SELECT outcome FROM sessions.session_analysis_ticket_invocations")).rows).toEqual([{ outcome: "dispatched" }]);
+    await analysisObligationWriterFor(workerFence(job)).acked(hoopDb(pg) as never, key, id, "v1");
+    expect((await pg.query("SELECT outcome, version_id FROM sessions.session_analysis_ticket_invocations")).rows).toEqual([{ outcome: "acked", version_id: "v1" }]);
   });
 });

@@ -12,7 +12,8 @@
  * Bucket default encryption (SSE-KMS) applies; nothing here sets a weaker one.
  */
 import { createHash } from "node:crypto";
-import { objectKey, readAll, type ObjectStore } from "../../packages/object-store/src/index.ts";
+import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../../packages/object-store/src/index.ts";
+import { boundedPut as sharedBoundedPut, PutTimeout } from "../migration/neon-s3-erasure/write-obligation.ts";
 import type { SessionAnalysisResult } from "./engine/session-analysis-result.ts";
 import type { StoredAnalysisResult } from "./processor.ts";
 
@@ -65,30 +66,45 @@ export interface AnalysisPutAck {
   versionId?: string;
 }
 
-/** Create-only put with a hard deadline (aborted at `timeoutMs`). */
+/** The request's own evidence hooks (write-obligation v3): unknown stays dispatched; refused is terminal. */
+export interface PutEvidenceHooks {
+  onUnknown?: () => Promise<void>;
+  onRefused?: () => Promise<void>;
+}
+
+/**
+ * Create-only put through THE shared bounded PUT (write-obligation.ts boundedPut: an enforced
+ * wall deadline, late results contained). A definite provider refusal (precondition_failed /
+ * already_exists) calls onRefused; a timeout, abort, error or lost response calls onUnknown and
+ * leaves the invocation dispatched. The deadline surfaces as analysis_put_timeout.
+ */
 export async function boundedPut(
   store: ObjectStore,
   key: string,
   bytes: Uint8Array,
   digest: string,
   timeoutMs = ANALYSIS_PUT_TIMEOUT_MS,
+  hooks: PutEvidenceHooks = {},
 ): Promise<AnalysisPutAck> {
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const ack = await Promise.race([
-      store.put(objectKey(key), bytes, { ifNoneMatch: true, contentSha256: digest, contentType: "application/json", signal: controller.signal }),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          reject(new AnalysisResultError("analysis_put_timeout", true));
-          controller.abort();
-        }, timeoutMs);
-      }),
-    ]);
+    const ack = await sharedBoundedPut(
+      (signal) => store.put(objectKey(key), bytes, { ifNoneMatch: true, contentSha256: digest, contentType: "application/json", signal }),
+      {
+        onUnknown: hooks.onUnknown ?? (async () => {}),
+        ...(hooks.onRefused ? { onRefused: hooks.onRefused } : {}),
+        isRefusal: (e) => isObjectStoreError(e, "precondition_failed") || isObjectStoreError(e, "already_exists"),
+      },
+      timeoutMs,
+    );
     if (ack.size !== bytes.length || ack.contentSha256 !== digest) throw new AnalysisResultError("analysis_write_ack_invalid", true);
-    return { created: ack.created, ...(ack.created && ack.version.version ? { versionId: ack.version.version } : {}) };
-  } finally {
-    clearTimeout(timer);
+    // Identical bytes already current (create-only): the provider refused this request; no write.
+    if (!ack.created && hooks.onRefused) await hooks.onRefused();
+    // Its OWN ack: the exact version it created. An unversioned store (S3 suspended versioning,
+    // the fs store) names its single version "null", exactly as the strict eraser lists it.
+    return { created: ack.created, ...(ack.created ? { versionId: ack.version.version ?? "null" } : {}) };
+  } catch (error) {
+    if (error instanceof PutTimeout) throw new AnalysisResultError("analysis_put_timeout", true);
+    throw error;
   }
 }
 
@@ -98,16 +114,17 @@ export async function putAnalysisResult(
   bytes: Uint8Array,
   digest: string,
   timeoutMs = ANALYSIS_PUT_TIMEOUT_MS,
-): Promise<{ versionId?: string }> {
-  const ack = await boundedPut(store, key, bytes, digest, timeoutMs);
+  hooks: PutEvidenceHooks = {},
+): Promise<{ versionId?: string; ackedVersionId?: string }> {
+  const ack = await boundedPut(store, key, bytes, digest, timeoutMs, hooks);
   const got = await store.getObject(objectKey(key));
   const read = await readAll(got.body);
   if (read.length !== bytes.length || sha256(read) !== digest)
     throw new AnalysisResultError("analysis_write_verification_failed", true);
-  // The version the publication owns: the one this PUT created, else the current one it found
-  // identical (create-only), as the verified read reports it.
-  const versionId = ack.versionId ?? got.meta.version.version;
-  return versionId ? { versionId } : {};
+  // The version the publication owns: the one this PUT created (its OWN ack, the only request
+  // evidence), else the current one it found identical, as the verified read reports it.
+  const versionId = ack.versionId ?? got.meta.version.version ?? "null";
+  return { ...(versionId ? { versionId } : {}), ...(ack.versionId ? { ackedVersionId: ack.versionId } : {}) };
 }
 
 /** Create-only write, then a read-back that must match byte for byte. */
