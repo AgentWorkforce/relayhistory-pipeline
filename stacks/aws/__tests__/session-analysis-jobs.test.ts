@@ -95,6 +95,8 @@ describe("P0-3: the read API serves analysis results only when analysisBucket is
     const k = readApiAnalysisKeyStatement({ accountId: "a", region: "us-east-1", bucketName: "bkt", roleArn: "r", glob: ANALYSIS_RESULT_OBJECT_GLOB });
     expect(k.Action).toEqual(["kms:Decrypt"]);
     expect(k.Condition.StringLike["kms:EncryptionContext:aws:s3:arn"]).toBe("arn:aws:s3:::bkt/96bulls/*/v1/*/normalized/session-analysis-v2/*");
+  });
+});
 
 import { transcriptBucketPolicy } from "../transcript-store.ts";
 
