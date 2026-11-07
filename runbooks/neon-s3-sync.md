@@ -215,6 +215,7 @@ reservations, the retirement cursor and genesis applies to ON only.
 | `erasure_lease_lost` / `erasure_item_cancelled` | the lease was taken, or the exporter cancelled the item | stays / removed | none |
 | `erasure_inventory` (initial) | a strict listing page failed BEFORE any delete | stays, retried | none (provider/listing issue) |
 | `erasure_inventory` / pending verify (post-delete) | deletes MAY have happened, then verification failed or the inventory changed; pending is NOT a rollback | stays, retried | none; the next run re-proves |
+| `erasure_verify_pending` (log `live erasure unverified`, with the group ids) | a live session's objects may be erased, but its pointer waits for a fresh strict proof that could not complete (e.g. > 10k kept versions share the machine prefix) | tombstone re-swept every pass; never claimed | none; it completes once the proof can (the workload shrinks) |
 | `erasure_reservation_refused` (ON) | a writer changed the prefix, or a version is owned | stays, retried | none |
 | `erasure_write_unresolved` (ON) | an exporter PUT has an unknown outcome | stays indefinitely (backoff) | none |
 | `erasure_obligations_unattested` (ON) | genesis is unattested: completion is never claimed | stays indefinitely | none until a reviewed recovery contract |

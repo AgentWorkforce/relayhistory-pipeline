@@ -566,6 +566,11 @@ export class ErasureJob {
           versions += r.deleted;
           this.counters.liveVersionsDeleted += r.deleted;
           // incomplete: resumes from the checkpoint; unverified / unresolved / refused: the next sweep traverses again.
+          if (r.status === "unverified")
+            // Visible to operators: the session's objects may be gone, but its pointer waits for a strict proof (e.g. the
+            // verification budget is exhausted by > 10k kept versions sharing the machine prefix). Never claimed.
+            this.log({ message: "live erasure unverified", error_code: "erasure_verify_pending", reason: "budget_or_remaining",
+              org_id: g.org_id, workspace_id: g.workspace_id, user_id: g.user_id, origin_id: g.origin_id, source: g.source, session_id: g.session_id });
           if (r.status !== "erased") continue;
           // The pointer last, through the same gate (versions newer than the re-read kept).
           const ptr = await this.#eraseKey(t.pointerKey, eraseScope(["live-pointer", this.authority.kind, g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id]),

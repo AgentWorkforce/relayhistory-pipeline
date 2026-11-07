@@ -349,10 +349,11 @@ describe("E3 on the strict shared eraser (fail closed, retried)", () => {
     for (const k of [...WORKER_KEYS, POINTER]) s.put(k, old);
     const neighbour = `96bulls/org-1/v1/ws=ws_1/m=${M}/h=claude/d=2026/10/30/s=sess_big/raw/`;
     for (let i = 0; i <= 10_000; i++) s.put(`${neighbour}${String(i).padStart(6, "0")}.ndjson.zst`, old);
-    const { job, done } = await s3Job(s);
+    const { job, codes, done } = await s3Job(s);
     for (let i = 0; i < 4; i++) await job.sweep();
     expect(WORKER_KEYS.filter((k) => s.keys.has(k))).toEqual([]); // the session's objects are gone
     expect(s.keys.has(POINTER)).toBe(true); // not proven yet: the pointer stays (retried)
+    expect(codes()).toContain("erasure_verify_pending"); // and operators see why
     expect(s.deletes.some((d) => d.startsWith(neighbour))).toBe(false);
     expect(s.count(neighbour)).toBe(10_001);
     for (const k of [...s.keys.keys()]) if (k.startsWith(neighbour)) s.keys.delete(k);
