@@ -28,7 +28,8 @@ const tables = (path: string) => {
 test("OFF (the default): no obligation schema, triggers, genesis or lease generation; base lease / queue behaviour", async () => {
   expect(obligationsEnabled(() => undefined)).toBe(false);
   expect(obligationsEnabled(() => "on")).toBe(true);
-  expect(obligationsEnabled(() => "true")).toBe(false);
+  expect(obligationsEnabled(() => " TRUE ")).toBe(true);
+  expect(obligationsEnabled(() => "yes")).toBe(false);
   const path = await tmp("e3-flag-off-");
   const st = new SyncState(path, { obligations: false });
   expect(st.obligations).toBe(false);
@@ -60,7 +61,8 @@ test("ON: the obligation schema, triggers, lease generations and an unattested g
   expect(st.leaseGen("96bulls/o/v1/ws=w/m=m/h=claude/d=2026/10/30/s=s/")).toMatch(/^[0-9a-f-]{36}$/);
   expect(st.obligationGenesis()).toMatchObject({ attestedAt: null, basis: "none" });
   st.close();
-  const names = tables(path);
+  // ON keeps its database at the fixed sibling; the configured path is the non-SQLite pointer.
+  const names = tables(`${path}.obligations.sqlite`);
   for (const t of ["write_invocations", "write_published", "erase_reservations", "write_terminal", "erased_versions", "write_touch", "erase_checkpoints"]) expect(names).toContain(t);
 });
 
@@ -88,7 +90,7 @@ test("M1, the UNSETTLED production default (obligationsSettled unset): reservati
 const PFX = "96bulls/org-1/v1/ws=ws_1/m=delivery_x/h=claude/d=2026/10/30/s=sess_1/";
 const auth = (): ErasureAuthority => ({ kind: "supabase", ready: async () => {}, lockWaiters: async () => ({ total: 0, nonAdvisory: 0 }), fencedGroups: async () => [], fencedLivePage: async () => [], stillFenced: async () => true });
 
-test("C1: ON -> OFF with USED obligation state is REFUSED (never silently dropped); unused state may be opened off", async () => {
+test("C1: ON -> OFF is REFUSED for an ON state (its pointer), used or not; tracked state preserved; an OFF-created file stays OFF-usable", async () => {
   const used = await tmp("e3-flag-used-");
   const a = new SyncState(used, { obligations: true });
   a.dispatchWrite(`${PFX}raw/x.zst`, "exporter:1");
@@ -100,7 +102,10 @@ test("C1: ON -> OFF with USED obligation state is REFUSED (never silently droppe
   again.close();
   const unused = await tmp("e3-flag-unused-");
   new SyncState(unused, { obligations: true }).close();
-  const off = new SyncState(unused, { obligations: false });
+  expect(() => new SyncState(unused, { obligations: false })).toThrow(expect.objectContaining({ code: "obligations_state_in_use" }));
+  const offFile = await tmp("e3-flag-offfile-");
+  new SyncState(offFile, { obligations: false }).close();
+  const off = new SyncState(offFile, { obligations: false });
   expect(off.obligations).toBe(false);
   off.close();
 });
@@ -163,7 +168,8 @@ test("P1 mixed-mode admission: A opens OFF, THEN B opens ON and records an unkno
   const path = await tmp("e3-flag-mixed-");
   const A = new SyncState(path, { obligations: false });
   A.enqueueErasure([{ key: PFX, kind: "prefix", org_id: "org-1", reason: "fenced" }], 1); // fine: nothing used yet
-  const B = new SyncState(path, { obligations: true });
+  // A handle BYPASSING the supported path (direct: the same SQLite file in ON mode): the in-tx interlock still holds.
+  const B = new SyncState(path, { obligations: true, direct: true });
   B.dispatchWrite(`${PFX}raw/x.zst`, "exporter:1"); // ON records a tracked unknown
   const refused = (f: () => unknown) => { try { f(); return null; } catch (e) { return (e as { code?: string }).code; } };
   expect(refused(() => A.acquireLease(PFX, "eraser:A"))).toBe("obligations_state_in_use");

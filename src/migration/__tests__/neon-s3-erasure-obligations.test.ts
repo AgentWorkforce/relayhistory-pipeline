@@ -292,8 +292,9 @@ describe("every destructive route is gated; state loss fails closed", () => {
     const first = new SyncState(path);
     first.dispatchWrite(key(2), "exporter:1"); // an outstanding PUT ...
     first.close();
-    for (const f of [path, `${path}-wal`, `${path}-shm`]) await rm(f, { force: true });
-    // ... forgotten with the file. A fresh file is UNATTESTED, and nothing attests it.
+    // TOTAL loss: the pointer AND its sibling database (a lost pointer alone is quarantined, below).
+    for (const f of [path, `${path}.obligations.sqlite`, `${path}.obligations.sqlite-wal`, `${path}.obligations.sqlite-shm`]) await rm(f, { force: true });
+    // ... forgotten with the files. A fresh state is UNATTESTED, and nothing attests it.
     const st = new SyncState(path);
     expect(st.obligationGenesis()).toMatchObject({ attestedAt: null, basis: "none" });
     expect(st.unresolvedWrites(PREFIX)).toEqual([]);
@@ -320,18 +321,36 @@ describe("every destructive route is gated; state loss fails closed", () => {
     expect(typeof (st as unknown as { attestObligationGenesis?: unknown }).attestObligationGenesis).toBe("undefined");
   });
 
-  test("a LEGACY state file's surviving pending keys become prefix-level obligations; its genesis is still unattested", async () => {
+  test("a LEGACY (pre-obligation) state file is REFUSED by ON (fresh state only); its bytes are unchanged", async () => {
     const dir = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-legacy-"));
     const path = join(dir, "s.sqlite");
-    // The pre-obligation exporter's schema with one pending (mid-group) manifest key.
     const { DatabaseSync } = await import("node:sqlite");
     const legacy = new DatabaseSync(path);
     legacy.exec("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT); CREATE TABLE pending_keys (org_id TEXT NOT NULL, session_id TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (org_id, session_id, key))");
     legacy.prepare("INSERT INTO pending_keys VALUES ('org-1', 'sess_1', ?)").run(`${PREFIX}manifest.json`);
     legacy.close();
-    const st = new SyncState(path);
-    expect(st.obligationGenesis()).toMatchObject({ attestedAt: null, basis: "legacy-unattested", imported: 1 });
-    expect(st.coveringWrites(`${PREFIX}raw/`).map((w) => [w.key, w.outcome])).toEqual([[PREFIX, "dispatched"]]);
+    const { readFile } = await import("node:fs/promises");
+    const before = await readFile(path);
+    expect(() => new SyncState(path, { obligations: true })).toThrow(expect.objectContaining({ code: "obligations_requires_fresh_state" }));
+    expect((await readFile(path)).equals(before)).toBe(true);
+  });
+
+  test("a USED sibling whose pointer DISAPPEARS is QUARANTINED: ON refuses, nothing is adopted, reset or deleted", async () => {
+    const dir = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-lostptr-"));
+    const path = join(dir, "s.sqlite");
+    const st = new SyncState(path, { obligations: true });
+    const inv = st.dispatchWrite(key(1), "exporter:1");
+    expect(st.reserveErase(`${PREFIX}raw/`, st.obligationRev(`${PREFIX}raw/`), "S", [{ key: key(2), versionId: "v2" }]).ok).toBe(true);
+    st.close();
+    await rm(path); // the published pointer is lost
+    expect(() => new SyncState(path, { obligations: true })).toThrow(expect.objectContaining({ code: "obligations_state_conflict" }));
+    expect(() => new SyncState(path, { obligations: true })).toThrow(expect.objectContaining({ code: "obligations_state_conflict" }));
+    // The retained state is untouched (read through the sibling directly, read-only).
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(`${path}.obligations.sqlite`, { readOnly: true });
+    expect((db.prepare("SELECT id FROM write_invocations").all() as { id: string }[]).map((r) => r.id)).toEqual([inv]);
+    expect((db.prepare("SELECT count(*) AS n FROM erase_reservations").get() as { n: number }).n).toBe(1);
+    db.close();
   });
 });
 

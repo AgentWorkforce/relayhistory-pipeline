@@ -7,8 +7,9 @@ import { join } from "node:path";
 import { stateForRun } from "../neon-s3-sync/main.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 
-// These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
-process.env.S3X_OBLIGATIONS = "on";
+// The exporter's dry run copies the real watermark: the OFF (default) behaviour. An ON dry run needs a fresh scratch
+// S3X_STATE instead (runbooks/neon-s3-sync.md).
+process.env.S3X_OBLIGATIONS = "off";
 
 const dirs: string[] = [];
 afterAll(async () => {

@@ -145,6 +145,51 @@ crash, lost response) keeps the prefix queued indefinitely, re-swept on the
 bounded backoff: `erasure_write_unresolved` in the queue is expected, not a
 failure to clear by hand.
 
+## E3 erasure: strict eraser (both modes)
+
+The strict canonical paged eraser (`src/migration/neon-s3-erasure/eraser.ts`,
+shared primitive 9fef0acd) runs with `S3X_OBLIGATIONS` OFF and ON. Every
+destructive route uses it, with no permissive fallback:
+- queued session prefixes and queued single objects (exact-key mode);
+- live-fenced session directories (every date);
+- live pointers and staged batches (exact-key);
+- machine prefixes with more than 10k versions (bounded per run, resumed from
+  `erase_checkpoints`).
+
+Each item is done only after a fresh strict zero inventory. ON additionally
+requires the obligation protocol. Everything below about invocations, claims,
+reservations, the retirement cursor and genesis applies to ON only.
+
+| code (queue `error` / log) | meaning | queue | operator action |
+|---|---|---|---|
+| `erasure_refused_shape` | key outside a session prefix of its own org | retried, never deleted | investigate the enqueuer |
+| `erasure_lease_lost` / `erasure_item_cancelled` | the lease was taken, or the exporter cancelled the item | stays / removed | none |
+| `erasure_inventory` (initial) | a strict listing page failed BEFORE any delete | stays, retried | none (provider/listing issue) |
+| `erasure_inventory` / pending verify (post-delete) | deletes MAY have happened, then verification failed or the inventory changed; pending is NOT a rollback | stays, retried | none; the next run re-proves |
+| `erasure_reservation_refused` (ON) | a writer changed the prefix, or a version is owned | stays, retried | none |
+| `erasure_write_unresolved` (ON) | an exporter PUT has an unknown outcome | stays indefinitely (backoff) | none |
+| `erasure_obligations_unattested` (ON) | genesis is unattested: completion is never claimed | stays indefinitely | none until a reviewed recovery contract |
+| `erasure_done_refused` (ON) | the done claim's revision / lease / queue identity re-check failed | stays, retried | none |
+| `obligations_state_in_use` | an OFF handle met used obligation state, or a pointer | process refuses | keep `S3X_OBLIGATIONS=on` for that state |
+| `obligations_requires_fresh_state` | ON was given an existing SQLite state | process refuses | use a FRESH `S3X_STATE`; converting existing state is a reviewed offline contract |
+| `obligations_state_conflict` / `obligations_pointer_invalid` | pointer/sibling collision, leftover, permission, symlink or identity mismatch | process refuses; state quarantined | none without a reviewed, evidence-backed recovery |
+
+**Prohibited recoveries:** do these never:
+- no manual "done";
+- no reservation clearing;
+- no disabling strict checks;
+- no cap escalation;
+- no deleting, adopting or resetting a quarantined sibling or pointer;
+- no downgrade of a used ON state to older code.
+
+**ON state layout (fresh state only).**
+- **Layout:** `S3X_STATE` holds a small 0600 JSON pointer, and the database is the fixed sibling `<S3X_STATE>.obligations.sqlite` (0600, same directory).
+- **Bootstrap:** it happens only when `S3X_STATE` is absent, before any external effect. The commit is checkpointed and the connection closed before the fsync. The pointer is published with a no-replace link, then the directory is fsynced.
+- **Pre-obligation code** (main 341dd5a9) fails at open on the pointer. Its eraser makes no external call first. Its exporter makes only its read-only preflight (S3 list + head, with `--execute`), never a PUT or DELETE.
+- **Downgrade:** it is unsupported for used state, and enforced by that open failure.
+- **Dry run:** an ON dry run needs its own fresh scratch `S3X_STATE`.
+- **Scope:** these guarantees are stated for the tested local storage, not network filesystems.
+
 ## Later
 
 Move to a scheduled Worker or a 96Bulls service in us-east-1 (the transcript

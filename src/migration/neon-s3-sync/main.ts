@@ -266,7 +266,7 @@ export async function main() {
       undefined,
       extra,
     );
-    log({ message: "start", execute, backend: store.backend, lanes, rates: throttle.rates() });
+    log({ message: "start", execute, backend: store.backend, lanes, rates: throttle.rates(), obligations: state.obligations });
     const maxGroups = arg("max-groups");
     await syncer.run({ once: flag("once"), ...(maxGroups ? { maxGroups: Number(maxGroups) } : {}) });
   } finally {

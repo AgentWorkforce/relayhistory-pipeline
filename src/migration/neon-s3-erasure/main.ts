@@ -25,7 +25,7 @@
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
-import { SyncState } from "../neon-s3-sync/state.ts";
+import { SyncState, obligationsFlag } from "../neon-s3-sync/state.ts";
 import { errorCode } from "../neon-s3-sync/sync.ts";
 import { eraserDatabaseUrl, pinnedPgClient, readStdinCredentials, refuseCredentialEnv, s3Credentials, type S3Credentials } from "../stdin-credentials.ts";
 import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
@@ -37,7 +37,7 @@ import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "./job.ts";
  * strict canonical paged eraser runs in BOTH modes (safety hardening, unflagged); off it runs without obligations.
  */
 export function obligationsEnabled(e: (k: string) => string | undefined = (k) => process.env[k]): boolean {
-  return e("S3X_OBLIGATIONS") === "on";
+  return obligationsFlag(e("S3X_OBLIGATIONS"));
 }
 
 const env = (k: string, d?: string) => process.env[k]?.trim() || d;

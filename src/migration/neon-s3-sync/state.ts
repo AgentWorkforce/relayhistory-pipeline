@@ -13,7 +13,15 @@
  * - `exported`: what this exporter last wrote for a group: the revision it
  *   read before reading the content, and the manifest keys it owns.
  */
+import { closeSync, openSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { publishPointer, resolveStatePath } from "./state-path.ts";
+
+/** S3X_OBLIGATIONS: on for "on" / "true" (trimmed, case-insensitive); anything else (including unset) is OFF. */
+export function obligationsFlag(v: string | undefined): boolean {
+  const t = (v ?? "").trim().toLowerCase();
+  return t === "on" || t === "true";
+}
 
 export interface ExportedRow {
   org_id: string;
@@ -55,9 +63,19 @@ export class SyncState {
    */
   readonly obligations: boolean;
 
-  constructor(path: string, opts: { obligations?: boolean } = {}) {
-    this.obligations = opts.obligations ?? process.env.S3X_OBLIGATIONS === "on";
-    this.db = new DatabaseSync(path);
+  constructor(path: string, opts: { obligations?: boolean; direct?: boolean } = {}) {
+    this.obligations = opts.obligations ?? obligationsFlag(process.env.S3X_OBLIGATIONS);
+    // M-C rev 2 (state-path.ts): OFF opens the configured path as before (refusing an obligations pointer); ON uses a
+    // FRESH state only: a pointer + sibling database, bootstrapped durably before any external effect.
+    let dbPath = path;
+    let pointer: { stateId: string } | null = null;
+    if (!opts.direct) {
+      const r = resolveStatePath(path, this.obligations);
+      dbPath = r.db;
+      pointer = r.pointer;
+      if (r.bootstrap) pointer = { stateId: SyncState.#bootstrap(path, r.db) };
+    }
+    this.db = new DatabaseSync(dbPath);
     // Shared by the exporter and the erasure job (two processes): WAL plus a busy wait.
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 10000;");
     this.db.exec(`
@@ -106,6 +124,30 @@ export class SyncState {
     `);
     if (this.obligations) this.#openObligations();
     else this.#refuseUsedObligationsWhenOff();
+    if (pointer && this.meta("obligations_state_id") !== pointer.stateId)
+      throw Object.assign(new Error("the obligations database does not carry the pointer's state_id"), { code: "obligations_state_conflict" });
+  }
+
+  /**
+   * Bootstrap a FRESH ON state: create the sibling exclusively (0600), commit the schema + a random state_id, checkpoint
+   * the WAL COMPLETELY and close the sole bootstrap connection (an fsync of the main file alone would not persist
+   * commits still in -wal), then fsync + publish the pointer (state-path.ts publishPointer). Any failure refuses
+   * before any external effect, with nothing adopted or guessed.
+   */
+  static #bootstrap(path: string, sibling: string): string {
+    closeSync(openSync(sibling, "wx", 0o600));
+    const stateId = crypto.randomUUID();
+    const st = new SyncState(sibling, { obligations: true, direct: true });
+    try {
+      st.setMeta("obligations_state_id", stateId);
+      const cp = st.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number; log: number; checkpointed: number };
+      if (cp.busy !== 0 || cp.log !== cp.checkpointed)
+        throw Object.assign(new Error("the bootstrap checkpoint did not complete"), { code: "obligations_bootstrap_failed" });
+    } finally {
+      st.close();
+    }
+    publishPointer(path, stateId);
+    return stateId;
   }
 
   /**
