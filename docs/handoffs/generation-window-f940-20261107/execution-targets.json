@@ -156,5 +156,13 @@
       "correlationClaim": false
     }
   },
-  "originalPlanCaptureFreshness": "EXPIRED_AT_2026-11-07T19:47:10.129Z_REPLAN_RECAPTURE_REQUIRED"
+  "originalPlanCaptureFreshness": "EXPIRED_AT_2026-11-07T19:47:10.129Z_REPLAN_RECAPTURE_REQUIRED",
+  "orgCohortDiagnostic": {
+    "status": "ORG_SCOPE_NOT_UNIQUELY_QUALIFIED",
+    "exactlyOneOrgMatched": false,
+    "cohortExecuted": false,
+    "result": "UNKNOWN",
+    "receipt": "org-publication-cohort-result.json",
+    "sha256": "4193c08c328b0d43674c15e0df62a5b15507889957169f2194c3c6291240a658"
+  }
 }

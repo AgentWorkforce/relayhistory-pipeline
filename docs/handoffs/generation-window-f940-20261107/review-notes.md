@@ -29,3 +29,6 @@ Publisher activity evidence adversarial review: exact reviewed SQL and source ap
 
 
 Unpaired-tail evidence review: copied existing release-owner closed-count receipt and verified the full digest; no provider call or re-collection. Explicit interval comparison proves NO OVERLAP with SQL; the historical correlated30 kind/name is not accepted as correlation evidence. Exact49/42/5/2 counts retained, raw events absent, no causal/health claim. Contextual: replaces pending-tail metadata with unpaired evidence while preserving all prior scope/approval holds. Validation: receipt/hash/JSON/manifest and docs-only diff checks.
+
+
+Org-cohort refusal review: exact cohort SQL checked; approved workspace/user pair delivered RAM-only and source-hash-bound; owner/read-only/all-five-table visibility checked. Durable ingest-fence lookup emits only exactly-one Boolean; false stops before any cohort SELECT/guessed org parameter. No auth-token fields, IDs or payload are selected for output, no retry/escalation/cross-service fallback. Contextual: reports UNKNOWN rather than zero publication for an unqualified scope and explicitly leaves authoritative scope mapping open. Validation: one guarded read-only preflight/resolution attempt, receipt/source/hash/JSON/manifest and docs-only diff checks.

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "at": "2026-11-07T20:04:13.838916+00:00",
+  "at": "2026-11-07T20:14:03.200185+00:00",
   "kind": "source_plan_and_readonly_fixture_evidence",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
   "readiness": "HOLD overall prerequisites and expired plan/capture; Worker exception/publisher plan recorded; bounded diagnostic only",
@@ -27,8 +27,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 7388,
-      "sha256": "d73e5a931e66fde46f33ace0bd2eddef843ebf814fba2d8940c8473485193696"
+      "bytes": 7693,
+      "sha256": "d88dd490ed4d28904ed044befae527460497d0cc667ea4fde79191fcf2f288f2"
     },
     {
       "name": "source-evidence.json",
@@ -37,8 +37,8 @@
     },
     {
       "name": "review-notes.md",
-      "bytes": 7612,
-      "sha256": "d6d41ab437ef5c252a26f9c361a1dcb7012a097504f628d6faa64fb96ffde96f"
+      "bytes": 8278,
+      "sha256": "1ef578f8d644f4362fd720868ed50de7a5db953aa3ad0fc8d3434b4c7f3cd742"
     },
     {
       "name": "supporting-readiness.md",
@@ -179,6 +179,26 @@
       "name": "ingest-unpaired-tail-receipt.json",
       "bytes": 706,
       "sha256": "4e77499fb02e73e42c24dd7ad1e9884c33b85dfabec7e42dd3b4b0d500fc1c54"
+    },
+    {
+      "name": "org-publication-cohort-result.json",
+      "bytes": 773,
+      "sha256": "4193c08c328b0d43674c15e0df62a5b15507889957169f2194c3c6291240a658"
+    },
+    {
+      "name": "org-publication-cohort.sql.txt",
+      "bytes": 6614,
+      "sha256": "bc431aa6f55eefc755126f5d7a8536c4b72e1f7ede9ff9c40ee65bd6c39481fd"
+    },
+    {
+      "name": "org-publication-cohort-readonly.ts.txt",
+      "bytes": 8544,
+      "sha256": "62431be76af7f06fbdb009c3db976e4694b853fb603c29344ddf6ca308eafe99"
+    },
+    {
+      "name": "org-publication-cohort-attempt.md",
+      "bytes": 2387,
+      "sha256": "d58bfc9bd73a524b85feb3f699b7c85d58257ded041e7ea3dc34a381a4fb7c75"
     }
   ]
 }
