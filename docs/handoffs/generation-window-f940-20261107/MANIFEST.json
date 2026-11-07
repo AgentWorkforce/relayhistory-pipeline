@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "at": "2026-11-07T20:14:03.200185+00:00",
+  "at": "2026-11-07T20:26:00.748800+00:00",
   "kind": "source_plan_and_readonly_fixture_evidence",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
-  "readiness": "HOLD overall prerequisites and expired plan/capture; Worker exception/publisher plan recorded; bounded diagnostic only",
+  "readiness": "HOLD execution prerequisites and expired schema plan/capture; exact Worker source/build supplement reviewed PASS; pending fresh provider bracket and apply-time artifact identity",
   "files": [
     {
       "name": "generation-window.md",
@@ -199,6 +199,26 @@
       "name": "org-publication-cohort-attempt.md",
       "bytes": 2924,
       "sha256": "1c398fe3a1749bad2051d14b4b6470dc123c69462ad3ce2edd4efaf2b9a37e8a"
+    },
+    {
+      "name": "worker-bundle-root-review.md",
+      "bytes": 4804,
+      "sha256": "60b6d11972abb5a5d45a0762b6fe6ca8e154937e5bbaab95b0912805e38cf475"
+    },
+    {
+      "name": "worker-bundle-root-review.json",
+      "bytes": 5355,
+      "sha256": "4face92ba0bfa233e888c6804ccc57f559dc35a76b1c7bd0940642717946dfc5"
+    },
+    {
+      "name": "worker-bundle-root-repo-sources.json",
+      "bytes": 26924,
+      "sha256": "f57dc3ec8b001023d421e22e7fbcfd57541627ecec09baf19d76a933446ff485"
+    },
+    {
+      "name": "worker-bundle-root-dependency-sources.json",
+      "bytes": 25015,
+      "sha256": "e5ab141cb809e06917c7aca20f38339c386f3d095e7647a057b5e7751c75d141"
     }
   ]
 }
