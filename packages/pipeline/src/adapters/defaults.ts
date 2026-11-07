@@ -4,9 +4,10 @@
  * registers Postgres and OpenSearch and must be chosen explicitly by a
  * composition that intends to run OpenSearch. `createPipelineRuntimeRegistry`
  * registers the worker runtime only. A composition adds its own factories to
- * these registries before selecting; registering a name never widens what an
- * entry point allows. Provider implementation placement and customer
- * distribution are separate reviewed changes.
+ * these registries before selecting; registering a name does not widen the
+ * worker entry points' allow list, while the Lambda entries allow the names
+ * their composition's registry holds. Provider implementation placement and
+ * customer distribution are separate reviewed changes.
  */
 import type { PipelineRuntimeAdapter } from "../runtime/contracts.js";
 import { createWorkerRuntime, type WorkSource } from "../runtime/workers.js";

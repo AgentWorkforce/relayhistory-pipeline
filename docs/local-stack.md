@@ -97,7 +97,10 @@ configured with `SEARCH_INDEX_BACKEND=opensearch`, `SEARCH_INDEX_OPENSEARCH_URL`
 `basic`; `sigv4` is not implemented), `SEARCH_INDEX_OPENSEARCH_USERNAME`, the
 `SEARCH_INDEX_OPENSEARCH_PASSWORD` secret, `SEARCH_INDEX_OPENSEARCH_CA_FILE` and
 `SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS` (see
-`docs/search-and-runtime-adapters.md`). No local container runs it yet, and the
+`docs/search-and-runtime-adapters.md`). `basic` is accepted only when
+`SEARCH_INDEX_OPENSEARCH_URL` is https or a loopback host; a plain-http service
+hostname (for example a compose service name) fails at startup with
+`basic_auth_needs_https`. No local container runs it yet, and the
 worker entry points still allow only `postgres`; the backend's proof runs against
 disposable containers (`docs/session-search-proof.md`).
 

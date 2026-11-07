@@ -145,7 +145,7 @@ dialect.
   `INSERT`: when one item fails, the request throws `bulk_item_<status>` after
   earlier items in the same request have been written. A retry is safe, because
   external versions make each write idempotent. Callers must not assume a failed
-  upsert wrote nothing. A basic-auth user therefore needs
+  upsert wrote nothing. A basic-auth user needs
   read, write, `_delete_by_query`, `_mget` and `_refresh` on the index, plus
   index creation, mapping updates and reading settings for `ensureSchema`.
 - `ensureSchema` reads `index.gc_deletes` back after creating or confirming the
