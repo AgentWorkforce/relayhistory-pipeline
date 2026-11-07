@@ -1,0 +1,115 @@
+/**
+ * C3 fixtures: the full Supabase migration stack plus supabase/pending/ingest_privacy_authority.sql (slot TBD),
+ * and a minimal "Neon" with relayhistory's exact privacy tables (0038 / 0039 / 0078 DDL).
+ */
+import { PGlite } from "@electric-sql/pglite";
+import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
+import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { sqlLedger } from "../ledger-sql.ts";
+import { prepareDelivery } from "../vendor/delivery/prepare.ts";
+import type { CurrentCustodyPacket } from "../custody-protocol.ts";
+import type { Queryable } from "../../migration/relayhistory-export.ts";
+import { TENANT, scratchStore } from "./support.ts";
+
+export const ROOT = join(import.meta.dir, "../../..");
+export const generation = "a".repeat(64), epoch = "3".repeat(64), identity = "c".repeat(64), baseline = "a".repeat(64);
+export const PENDING_SQL = "supabase/pending/ingest_privacy_authority.sql";
+/** Independent prerequisite fix (also needed by mirror/frozen-supabase without C3). */
+export const LAZY_SOURCE_SQL = "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql";
+/** C3 post-apply index job (non-transactional in production). */
+export const INDEX_SQL = "supabase/pending/ingest_privacy_authority_index.sql";
+const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
+
+export async function authorityFixture(opts: { pending?: boolean; lazyFix?: boolean; index?: boolean } = {}) {
+  const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+  const closers: Array<() => unknown> = [() => db.close()];
+  await db.exec(read("supabase/tests/supabase_shim.sql"));
+  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
+  // lazyFix:false reproduces the pre-040000 state (that migration skipped; it touches nothing later ones depend on).
+  for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort())
+    if (opts.lazyFix !== false || "supabase/migrations/" + f !== LAZY_SOURCE_SQL) await db.exec(read("supabase/migrations/" + f));
+  if (opts.pending !== false) await db.exec(read(PENDING_SQL));
+  if (opts.pending !== false && opts.index !== false) await db.exec(read(INDEX_SQL));
+  await db.exec("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','" + generation + "','pass')");
+  const owner = async (name: string, p: unknown) => (await db.query("SELECT sessions." + name + "($1::jsonb) AS r", [JSON.stringify(p)])).rows[0] as { r: any };
+  await owner("ingest_lazy_policy_set", { baselineMode: "lazy-current", generation, sourceIdentitySha256: identity, controlEpoch: epoch, privacyBaselineSha256: baseline, retentionContractSha256: "b".repeat(64), sourceProofSha256: "d".repeat(64), validUntil: new Date(Date.now() + 3600000).toISOString(), issuer: "relayhistory-cloud" });
+  await owner("ingest_receipt_seat_initialize", { protocol: "delivery-acceptance-floor-v1", controlEpoch: epoch, capturedAt: "2026-11-04T00:00:00.000000Z", sourceSequences: ["sessions.delivery_catalog_acceptance_seq", "sessions.delivery_projection_acceptance_seq"].map((sequenceRegclass, i) => ({ sequenceRegclass, sequenceOid: String(i + 1), allocatedHighWater: "9007199254740993", isCalled: true, incrementBy: "1", cycle: false })), allocatedHighWater: "9007199254740993", generation, sourceIdentitySha256: identity, sourceProofSha256: "d".repeat(64) });
+  const run = async (s: string, p: unknown[] = []) => {
+    await db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest");
+    try {
+      const r = await db.query(s, p as never);
+      await db.exec("COMMIT");
+      return r as never;
+    } catch (e) {
+      await db.exec("ROLLBACK");
+      throw e;
+    }
+  };
+  const ledger = sqlLedger(run, { acceptanceMode: "buffered", expectedGeneration: generation });
+  const fs = scratchStore();
+  closers.push(fs.done);
+  const deps = { ledger, acceptanceMode: "buffered" as const, target: { store: fs.store, keyRoot: "96bulls" } };
+  const seal = () => db.query("INSERT INTO sessions.ingest_frozen_source_completeness(source_identity_sha256,control_epoch,privacy_baseline_sha256,org_count,record_rows,manifest_sha256,neon_snapshot) VALUES($1,$2,$3,0,0,$4,'{}')", [identity, epoch, baseline, "e".repeat(64)]);
+  const rpc = async (fn: string, p: unknown) => ((await run("SELECT sessions." + fn + "($1::jsonb) AS r", [JSON.stringify(p)])) as any).rows[0].r;
+  const ownerRpc = async (fn: string, p?: unknown) => (await db.query("SELECT sessions." + fn + (p === undefined ? "()" : "($1::jsonb)") + " AS r", p === undefined ? [] : [JSON.stringify(p)])).rows[0] as { r: any };
+  async function witnessFor(raw: any, kind: "batch" | "selection" | "reset" = "batch", tenant = TENANT) {
+    const p = await prepareDelivery(tenant, raw);
+    return rpc("ingest_frozen_source_witness", { kind, tenant, originId: p.originId, batchId: p.batchId, batchDigest: p.batchDigest, originalRecordCount: raw.records.length,
+      candidates: p.records.map((r, i) => ({ preparedOrd: i, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id, candidateDigest: r.digest, source: r.source, sessionId: r.session_id })) }) as Promise<CurrentCustodyPacket>;
+  }
+  /** A pg-style client over PGlite for the handoff module (BEGIN/COMMIT pass straight through). */
+  const queryable: Queryable = { query: async (text, params) => (params?.length ? db.query(text, params as never) : db.query(text)) as never };
+  return { db, owner, ownerRpc, run, rpc, ledger, deps, seal, witnessFor, queryable, close: async () => { for (const c of closers.reverse()) await c(); } };
+}
+
+/** relayhistory's exact privacy tables (0038 deleted_upload_sessions, 0039 session_resets, 0078 control heads). */
+export async function fakeNeon() {
+  const pg = new PGlite();
+  const v38 = read("vendor/relayhistory-cloud/migrations/0038_session_upload_deletion.sql");
+  const v39 = read("vendor/relayhistory-cloud/migrations/0039_session_reset.sql");
+  const ddl = (src: string, table: string) => {
+    const m = new RegExp(`CREATE TABLE sessions\\.${table} \\([\\s\\S]*?\\n\\);`).exec(src)?.[0];
+    if (!m) throw new Error(`vendored migration no longer creates ${table}`);
+    return m;
+  };
+  await pg.exec(`CREATE SCHEMA sessions; ${ddl(v38, "deleted_upload_sessions")} ${ddl(v39, "session_resets")}
+    -- relayhistory 0078, verbatim.
+    CREATE TABLE sessions.delivery_cutover_control_heads (
+      org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,
+      epoch text NOT NULL,version bigint NOT NULL CHECK(version>0),
+      digest text NOT NULL CHECK(digest ~ '^[0-9a-f]{64}$'),
+      kind text NOT NULL CHECK(kind IN ('selection','reset')),payload jsonb NOT NULL,
+      pending boolean NOT NULL,deleted bigint,
+      before_privacy jsonb,privacy_version bigint NOT NULL DEFAULT 0 CHECK(privacy_version>=0),updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+      PRIMARY KEY(org_id,workspace_id,user_id)
+    );
+    CREATE TABLE sessions.delivery_cutover_state(singleton boolean PRIMARY KEY, phase text, epoch text);
+    INSERT INTO sessions.delivery_cutover_state VALUES(true,'active','${epoch}');
+    CREATE FUNCTION sessions.delivery_cutover_status() RETURNS jsonb LANGUAGE sql STABLE AS
+      $$ SELECT jsonb_build_object('version',1,'phase',phase,'epoch',epoch) FROM sessions.delivery_cutover_state $$;`);
+  const queryable: Queryable = { query: async (text, params) => (params?.length ? pg.query(text, params as never) : pg.query(text)) as never };
+  const digest = async (kind: string, tenant: typeof TENANT, payload: unknown) =>
+    ((await pg.query("SELECT encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',$1::text,$2::text,$3::text,$4::text,$5::text,$6::jsonb)::text,'UTF8')),'hex') AS d",
+      [epoch, tenant.orgId, tenant.workspaceId, tenant.userId, kind, JSON.stringify(payload)])).rows[0] as { d: string }).d;
+  /** A completed Neon head (what relayhistory leaves after begin -> apply -> fence -> complete). */
+  const head = async (tenant: typeof TENANT, version: number, kind: "selection" | "reset", payload: unknown, opts: { pending?: boolean; deleted?: number | null } = {}) => {
+    const d = await digest(kind, tenant, payload);
+    await pg.query(`INSERT INTO sessions.delivery_cutover_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending,deleted,privacy_version)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(org_id,workspace_id,user_id) DO UPDATE SET version=EXCLUDED.version,digest=EXCLUDED.digest,kind=EXCLUDED.kind,
+      payload=EXCLUDED.payload,pending=EXCLUDED.pending,deleted=EXCLUDED.deleted,privacy_version=EXCLUDED.privacy_version`,
+      [tenant.orgId, tenant.workspaceId, tenant.userId, epoch, version, d, kind, JSON.stringify(payload), opts.pending ?? false, opts.deleted ?? null, version - 1]);
+    return d;
+  };
+  return { pg, queryable, digest, head, close: () => pg.close() };
+}
+
+export const err = async (p: Promise<unknown>) => {
+  try {
+    await p;
+    return null;
+  } catch (e) {
+    return String((e as Error).message);
+  }
+};
