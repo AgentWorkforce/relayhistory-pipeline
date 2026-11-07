@@ -70,6 +70,17 @@ export class SyncState {
       CREATE TABLE IF NOT EXISTS leases (prefix TEXT PRIMARY KEY, holder TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS erasure_seen (org_id TEXT NOT NULL, session_id TEXT NOT NULL, sweep INTEGER NOT NULL,
         PRIMARY KEY (org_id, session_id));
+      -- Unresolved-write obligations (shared write-obligation v3, write-obligation.ts), E3's own tables:
+      -- one row per exporter PUT invocation, recorded BEFORE it is sent; the versions the exporter
+      -- currently publishes (owns); and the versions the eraser reserved for deletion. Every mutation
+      -- takes a fresh seq; a prefix's revision is the max seq under it (the compare-and-set token).
+      CREATE TABLE IF NOT EXISTS write_invocations (id TEXT PRIMARY KEY, key TEXT NOT NULL, holder TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('dispatched', 'acked')), version_id TEXT, seq INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS write_invocations_key ON write_invocations (key);
+      CREATE TABLE IF NOT EXISTS write_published (key TEXT NOT NULL, version_id TEXT NOT NULL, seq INTEGER NOT NULL,
+        PRIMARY KEY (key, version_id));
+      CREATE TABLE IF NOT EXISTS erase_reservations (key TEXT NOT NULL, version_id TEXT NOT NULL, scope TEXT NOT NULL,
+        seq INTEGER NOT NULL, PRIMARY KEY (key, version_id));
       CREATE TABLE IF NOT EXISTS erase_checkpoints (
         scope TEXT PRIMARY KEY, checkpoint TEXT NOT NULL, updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS truncations (
@@ -290,8 +301,13 @@ export class SyncState {
        ON CONFLICT (key) DO UPDATE SET next_try = 0,
          kind = CASE WHEN excluded.kind = 'prefix' THEN 'prefix' ELSE erasures.kind END`,
     );
+    const unpub = this.db.prepare(`DELETE FROM write_published WHERE ${SyncState.#under}`);
     this.#tx(() => {
-      for (const i of items) q.run(i.key, i.kind, i.org_id, i.reason, at);
+      for (const i of items) {
+        q.run(i.key, i.kind, i.org_id, i.reason, at);
+        // Queued for erasure: no longer owned (the eraser may then reserve its versions).
+        unpub.run(i.key, i.key);
+      }
     });
   }
 
@@ -329,6 +345,112 @@ export class SyncState {
   }
   clearEraseCheckpoint(scope: string) {
     this.db.prepare("DELETE FROM erase_checkpoints WHERE scope = ?").run(scope);
+  }
+
+  // ---------------------------------------------------------------- unresolved-write obligations (v3)
+
+  #seq(): number {
+    const n = Number(this.meta("write_seq") ?? 0) + 1;
+    this.setMeta("write_seq", String(n));
+    return n;
+  }
+  static #under = "substr(key, 1, length(?)) = ?";
+
+  /** Writer: a NEW invocation id for one PUT at `key`, durable BEFORE the PUT is sent. */
+  dispatchWrite(key: string, holder: string): string {
+    const id = crypto.randomUUID();
+    this.#tx(() => {
+      this.db.prepare("INSERT INTO write_invocations (id, key, holder, outcome, version_id, seq) VALUES (?, ?, ?, 'dispatched', NULL, ?)").run(id, key, holder, this.#seq());
+    });
+    return id;
+  }
+  /** Writer: its OWN confirmed response, with the exact version id it created ("null" on an unversioned store). */
+  ackWrite(id: string, versionId: string) {
+    this.#tx(() => {
+      this.db.prepare("UPDATE write_invocations SET outcome = 'acked', version_id = ?, seq = ? WHERE id = ? AND outcome = 'dispatched'").run(versionId, this.#seq(), id);
+    });
+  }
+  /** Writer: a definite refusal of this very request (no write happened): terminal, so the row goes. */
+  refuseWrite(id: string) {
+    this.#tx(() => {
+      this.db.prepare("DELETE FROM write_invocations WHERE id = ? AND outcome = 'dispatched'").run(id);
+    });
+  }
+  /**
+   * Writer publish: the versions this group now references become owned, under the same lock the
+   * eraser's reserve takes. Refused (nothing recorded) if ANY of them is reserved for deletion; the
+   * acked invocations of exactly those versions are then terminal (their own publish) and go.
+   */
+  publishWrites(entries: { key: string; versionId: string }[]) {
+    this.#tx(() => {
+      const reserved = this.db.prepare("SELECT 1 FROM erase_reservations WHERE key = ? AND version_id = ?");
+      for (const e of entries)
+        if (reserved.get(e.key, e.versionId)) throw Object.assign(new Error("a published version is reserved for erasure"), { code: "publish_reserved" });
+      const seq = this.#seq();
+      const ins = this.db.prepare("INSERT INTO write_published (key, version_id, seq) VALUES (?, ?, ?) ON CONFLICT DO NOTHING");
+      const done = this.db.prepare("DELETE FROM write_invocations WHERE key = ? AND outcome = 'acked' AND version_id = ?");
+      for (const e of entries) {
+        ins.run(e.key, e.versionId, seq);
+        done.run(e.key, e.versionId);
+      }
+    });
+  }
+  /** Ownership ends when a key or prefix is queued for erasure (or forgotten): exact keys, or everything under a prefix. */
+  unpublish(keysOrPrefixes: Iterable<string>) {
+    this.#tx(() => {
+      const q = this.db.prepare(`DELETE FROM write_published WHERE ${SyncState.#under}`);
+      for (const k of keysOrPrefixes) q.run(k, k);
+    });
+  }
+  /** The prefix's compare-and-set revision: the newest seq of any invocation, publication or reservation under it. */
+  obligationRev(prefix: string): number {
+    const q = (t: string) => Number((this.db.prepare(`SELECT coalesce(max(seq), 0) AS n FROM ${t} WHERE ${SyncState.#under}`).get(prefix, prefix) as { n: number }).n);
+    return Math.max(q("write_invocations"), q("write_published"), q("erase_reservations"));
+  }
+  /** The unresolved invocations under a prefix (dispatched, or acked whose version was not yet seen gone). */
+  unresolvedWrites(prefix: string): { id: string; key: string; outcome: "dispatched" | "acked"; versionId?: string }[] {
+    return (this.db.prepare(`SELECT id, key, outcome, version_id FROM write_invocations WHERE ${SyncState.#under} ORDER BY id`).all(prefix, prefix) as
+      { id: string; key: string; outcome: "dispatched" | "acked"; version_id: string | null }[]).map((r) => ({ id: r.id, key: r.key, outcome: r.outcome, ...(r.version_id ? { versionId: r.version_id } : {}) }));
+  }
+  /** Versions the writer currently owns under a prefix. */
+  publishedUnder(prefix: string): { key: string; versionId: string }[] {
+    return (this.db.prepare(`SELECT key, version_id FROM write_published WHERE ${SyncState.#under}`).all(prefix, prefix) as { key: string; version_id: string }[]).map((r) => ({ key: r.key, versionId: r.version_id }));
+  }
+  /**
+   * Eraser reserve (compare-and-set on the prefix revision): atomically reserve EVERY version about to be
+   * deleted. Refused if the prefix changed since `rev` (a writer dispatched/acked/published there) or if any
+   * doomed version is owned now; after it succeeds, a publish of any reserved version is refused.
+   */
+  reserveErase(prefix: string, rev: number, scope: string, versions: { key: string; versionId: string }[]): { ok: true; rev: number } | { ok: false } {
+    let out: { ok: true; rev: number } | { ok: false } = { ok: false };
+    this.#tx(() => {
+      if (this.obligationRev(prefix) !== rev) return;
+      const owned = this.db.prepare("SELECT 1 FROM write_published WHERE key = ? AND version_id = ?");
+      for (const v of versions) {
+        if (!v.key.startsWith(prefix)) return;
+        if (owned.get(v.key, v.versionId)) return;
+      }
+      const seq = this.#seq();
+      const ins = this.db.prepare("INSERT INTO erase_reservations (key, version_id, scope, seq) VALUES (?, ?, ?, ?) ON CONFLICT (key, version_id) DO UPDATE SET scope = excluded.scope, seq = excluded.seq");
+      for (const v of versions) ins.run(v.key, v.versionId, scope, seq);
+      out = { ok: true, rev: this.obligationRev(prefix) };
+    });
+    return out;
+  }
+  /** Clear exactly these invocations (each on its own terminal evidence), compare-and-set on the prefix revision. */
+  resolveWrites(prefix: string, rev: number, ids: readonly string[]): { ok: true; rev: number } | { ok: false } {
+    let out: { ok: true; rev: number } | { ok: false } = { ok: false };
+    this.#tx(() => {
+      if (this.obligationRev(prefix) !== rev) return;
+      const del = this.db.prepare(`DELETE FROM write_invocations WHERE id = ? AND ${SyncState.#under}`);
+      for (const id of ids) del.run(id, prefix, prefix);
+      out = { ok: true, rev: this.obligationRev(prefix) };
+    });
+    return out;
+  }
+  /** After a proven erasure: the prefix's reservations are no longer needed (its versions are gone). */
+  clearReservations(prefix: string) {
+    this.db.prepare(`DELETE FROM erase_reservations WHERE ${SyncState.#under}`).run(prefix, prefix);
   }
 
   erasureFailed(key: string, code: string, at = Date.now()) {

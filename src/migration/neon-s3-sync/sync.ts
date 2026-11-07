@@ -19,6 +19,7 @@ import {
 } from "./neon-reader.ts";
 import type { SyncState, WorkItem } from "./state.ts";
 import type { Throttle } from "./throttle.ts";
+import { obligatedStore } from "./obligated-store.ts";
 
 export interface LockGuard {
   maxNonAdvisory: number;
@@ -259,6 +260,9 @@ export class Syncer {
     const touched = new Set<string>();
     const leased: string[] = [];
     const referenced = new Set<string>();
+    // Every PUT of this group as an unresolved-write invocation (obligated-store.ts); the acked versions.
+    const acked = new Map<string, string>();
+    const store = obligatedStore(this.target.store, this.state, LEASE_HOLDER, acked);
     try {
       const keys: string[] = [];
       const truncations: { key: string; strings: number; maxChars: number }[] = [];
@@ -271,6 +275,7 @@ export class Syncer {
       for (const unit of units) {
         const target = {
           ...this.target,
+          store,
           renew: (k: string) => this.state.renewLease(k.slice(0, -"manifest.json".length), LEASE_HOLDER),
         };
         const r = await exportUnit(target, unit, lane.source, {
@@ -311,6 +316,9 @@ export class Syncer {
         if (await erasableByExporter(this.target, work.org_id, key, work.session_id))
           erase.push({ key: key.slice(0, -"manifest.json".length), kind: "prefix", org_id: work.org_id, reason: "stale_prefix" });
       }
+      // Publish (own) the versions this group references, under the eraser's reservation lock: refused,
+      // and the group failed, if the erasure job reserved any of them for deletion meanwhile.
+      this.state.publishWrites([...acked].filter(([k]) => referenced.has(k) || keep.has(k)).map(([key, versionId]) => ({ key, versionId })));
       this.state.enqueueErasure(erase);
       // Under the lease: nothing this group now references, or writes under, stays queued.
       this.state.cancelErasures([...referenced, ...keys.map((k) => k.slice(0, -"manifest.json".length))]);
