@@ -37,6 +37,10 @@ DROP TABLE sessions.session_analysis_result_tickets;
 DROP TABLE sessions.session_neon_census_seal;
 DROP TABLE sessions.session_analysis_purge_fences;
 DROP TABLE sessions.session_neon_census;
+DROP FUNCTION sessions.session_neon_census_seal(text, bigint, text, jsonb);
+DROP FUNCTION sessions.session_neon_census_load(text, jsonb);
+DROP FUNCTION sessions.session_neon_census_digest(text);
+DROP FUNCTION sessions.session_neon_census_immutable();
 DROP TABLE sessions.session_analysis_requests_v2;
 DROP TABLE sessions.session_analysis_jobs_v2;
 DO $ledger$

@@ -235,7 +235,7 @@ describe("analysis_request_v1", () => {
          (source_identity_sha256, control_epoch, privacy_baseline_sha256, org_count, record_rows, manifest_sha256, neon_snapshot, sealed_at)
        VALUES (repeat('a',64), repeat('b',64), repeat('c',64), 1, 0, repeat('d',64), '{}'::jsonb, now() - interval '1 hour')`,
     );
-    await pg.query("INSERT INTO sessions.session_neon_census_seal (census_rows, census_sha256, neon_snapshot) VALUES (0, repeat('e',64), '{}'::jsonb)");
+    await pg.query("INSERT INTO sessions.session_neon_census_seal (generation, census_rows, census_sha256, neon_snapshot) VALUES (repeat('e',64), 0, repeat('e',64), '{}'::jsonb)");
     const proof = async () =>
       (await pg.query<{ f: boolean }>("SELECT sessions.session_analysis_neon_free($1, $2, $3) AS f", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.f;
     expect(await proof()).toBe(true);
@@ -531,7 +531,7 @@ describe("analysisTick is default-off", () => {
 describe("never-in-Neon proof (session_analysis_neon_free + live-only manifests)", () => {
   const free = async () =>
     (await pg.query<{ f: boolean }>("SELECT sessions.session_analysis_neon_free($1, $2, $3) AS f", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.f;
-  const census = () => pg.query("INSERT INTO sessions.session_neon_census_seal (census_rows, census_sha256, neon_snapshot) VALUES (0, repeat('e',64), '{}'::jsonb)");
+  const census = () => pg.query("INSERT INTO sessions.session_neon_census_seal (generation, census_rows, census_sha256, neon_snapshot) VALUES (repeat('e',64), 0, repeat('e',64), '{}'::jsonb)");
   const seal = (ago: string) =>
     pg.query(
       `INSERT INTO sessions.ingest_frozen_source_completeness
@@ -555,12 +555,12 @@ describe("never-in-Neon proof (session_analysis_neon_free + live-only manifests)
     await seal("1 hour");
     await census();
     expect(await free()).toBe(true);
-    await pg.query("INSERT INTO sessions.session_neon_census (org_id, workspace_id, session_id) VALUES ($1, 'any-ws', $2)", [KEY.orgId, KEY.sessionId]);
+    await pg.query("WITH g AS (SELECT encode(sha256(convert_to(random()::text, 'UTF8')), 'hex') AS g), ins AS (INSERT INTO sessions.session_neon_census (generation, org_id, workspace_id, session_id) SELECT g.g, $1, 'any-ws', $2 FROM g RETURNING generation) UPDATE sessions.session_neon_census_seal SET generation = (SELECT generation FROM ins LIMIT 1)", [KEY.orgId, KEY.sessionId]);
     expect(await free()).toBe(false);
     // By physical id too (a canonicalized continuation).
-    await pg.query("DELETE FROM sessions.session_neon_census");
+    await pg.query("UPDATE sessions.session_neon_census_seal SET generation = encode(sha256(convert_to(random()::text, 'UTF8')), 'hex')");
     await pg.query("UPDATE sessions.session_index SET canonical_session_id = $1, session_id = 'phys-1'", [KEY.sessionId]);
-    await pg.query("INSERT INTO sessions.session_neon_census (org_id, workspace_id, session_id) VALUES ($1, $2, 'phys-1')", [KEY.orgId, KEY.workspaceId]);
+    await pg.query("WITH g AS (SELECT encode(sha256(convert_to(random()::text, 'UTF8')), 'hex') AS g), ins AS (INSERT INTO sessions.session_neon_census (generation, org_id, workspace_id, session_id) SELECT g.g, $1, $2, 'phys-1' FROM g RETURNING generation) UPDATE sessions.session_neon_census_seal SET generation = (SELECT generation FROM ins LIMIT 1)", [KEY.orgId, KEY.workspaceId]);
     expect(await free()).toBe(false);
   });
 
@@ -594,7 +594,7 @@ describe("session_neon_free_for (the read role's half of the shared proof)", () 
       `INSERT INTO sessions.ingest_frozen_source_completeness
          (source_identity_sha256, control_epoch, privacy_baseline_sha256, org_count, record_rows, manifest_sha256, neon_snapshot, sealed_at)
        VALUES (repeat('a',64), repeat('b',64), repeat('c',64), 1, 0, repeat('d',64), '{}'::jsonb, now() - interval '1 hour')`,
-    ).then(() => pg.query("INSERT INTO sessions.session_neon_census_seal (census_rows, census_sha256, neon_snapshot) VALUES (0, repeat('e',64), '{}'::jsonb)"));
+    ).then(() => pg.query("INSERT INTO sessions.session_neon_census_seal (generation, census_rows, census_sha256, neon_snapshot) VALUES (repeat('e',64), 0, repeat('e',64), '{}'::jsonb)"));
   async function asRead(bound: { org: string; ws: string }, ws = KEY.workspaceId) {
     await pg.exec("BEGIN READ ONLY");
     try {
@@ -648,14 +648,14 @@ describe("item 3: every DB proof input is in the source revision (a change to an
     await step("frozen seal", `INSERT INTO sessions.ingest_frozen_source_completeness
       (source_identity_sha256, control_epoch, privacy_baseline_sha256, org_count, record_rows, manifest_sha256, neon_snapshot, sealed_at)
       VALUES (repeat('a',64), repeat('b',64), repeat('c',64), 1, 0, repeat('d',64), '{}'::jsonb, now() - interval '1 hour')`);
-    await step("census seal (verdict flips true)", "INSERT INTO sessions.session_neon_census_seal (census_rows, census_sha256, neon_snapshot) VALUES (0, repeat('e',64), '{}'::jsonb)");
+    await step("census seal (verdict flips true)", "INSERT INTO sessions.session_neon_census_seal (generation, census_rows, census_sha256, neon_snapshot) VALUES (repeat('e',64), 0, repeat('e',64), '{}'::jsonb)");
     await step("frozen seal digest", "UPDATE sessions.ingest_frozen_source_completeness SET manifest_sha256 = repeat('9',64)");
     await step("census digest", "UPDATE sessions.session_neon_census_seal SET census_sha256 = repeat('8',64)");
     await step("frozen record presence", "INSERT INTO sessions.ingest_frozen_source_records (org_id, workspace_id, origin_id, record_id, source, session_id) VALUES ($1, 'other', 'o', 'r', 'claude', $2)", [KEY.orgId, KEY.sessionId]);
     await pg.query("DELETE FROM sessions.ingest_frozen_source_records");
     seen.add(await rev());
-    await step("census presence", "INSERT INTO sessions.session_neon_census (org_id, workspace_id, session_id) VALUES ($1, 'other', $2)", [KEY.orgId, KEY.sessionId]);
-    await pg.query("DELETE FROM sessions.session_neon_census");
+    await step("census presence", "WITH g AS (SELECT encode(sha256(convert_to(random()::text, 'UTF8')), 'hex') AS g), ins AS (INSERT INTO sessions.session_neon_census (generation, org_id, workspace_id, session_id) SELECT g.g, $1, 'other', $2 FROM g RETURNING generation) UPDATE sessions.session_neon_census_seal SET generation = (SELECT generation FROM ins LIMIT 1)", [KEY.orgId, KEY.sessionId]);
+    await pg.query("UPDATE sessions.session_neon_census_seal SET generation = encode(sha256(convert_to(random()::text, 'UTF8')), 'hex')");
     seen.add(await rev());
     await step("pointer created_at", "UPDATE sessions.session_index SET created_at = created_at + interval '1 second'");
     await step("manifest etag (export/backfill markers live in the manifest)", "UPDATE sessions.session_index SET manifest_etag = 'etag-2'");

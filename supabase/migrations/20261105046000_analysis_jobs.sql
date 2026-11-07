@@ -168,19 +168,28 @@ REVOKE ALL ON sessions.session_analysis_purge_fences FROM PUBLIC, anon, authenti
 -- not-yet-exported old session whose FIRST SP pointer lands after the seal (a continuation,
 -- or a late first upload) passes both absence checks while its old Neon turns are
 -- unaccounted for. No invariant in the source excludes that case, so the proof also needs a
--- Neon-side census: every (org, workspace, session id) Neon holds any turn/event/session row
--- for, loaded by the owner AFTER Neon refuses legacy turn writes, and sealed with its row
--- count and digest. Until the census is sealed the proof is FALSE for every session (the
--- read API stays turns_unknown and analysis stays incomplete): fail closed, never inferred.
+-- Neon-side census: every (org, workspace, user, source, session id) Neon holds any
+-- delivery record, turn, event, link, outcome, rollup or catalog row for, loaded by the owner
+-- (scripts/neon-census-load.ts) AFTER Neon refuses legacy writes, and sealed with its row
+-- count and digest. Until a census generation is sealed the proof is FALSE for every session
+-- (the read API stays turns_unknown and analysis stays incomplete): fail closed, never
+-- inferred. Columns Neon does not carry for a row (a rollup's workspace, a turn's user) are ''.
+-- Generations: rows are loaded under a generation (the census digest), the seal names the one
+-- in force, and a sealed generation is immutable (trigger below); a reload loads a NEW
+-- generation and its seal replaces the old one, which is then dropped.
 -- Owner-only: no grant to any runtime or read role; only the SECURITY DEFINER proof reads it.
 CREATE TABLE sessions.session_neon_census (
+  generation text NOT NULL CHECK (generation ~ '^[0-9a-f]{64}$'),
   org_id text NOT NULL CHECK (char_length(org_id) BETWEEN 1 AND 512),
-  workspace_id text NOT NULL CHECK (char_length(workspace_id) BETWEEN 1 AND 512),
+  workspace_id text NOT NULL DEFAULT '' CHECK (char_length(workspace_id) <= 512),
+  user_id text NOT NULL DEFAULT '' CHECK (char_length(user_id) <= 512),
+  source text NOT NULL DEFAULT '' CHECK (char_length(source) <= 512),
   session_id text NOT NULL CHECK (char_length(session_id) BETWEEN 1 AND 512),
-  PRIMARY KEY (org_id, session_id, workspace_id)
+  PRIMARY KEY (generation, org_id, session_id, workspace_id, user_id, source)
 );
 CREATE TABLE sessions.session_neon_census_seal (
   singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  generation text NOT NULL CHECK (generation ~ '^[0-9a-f]{64}$'),
   census_rows bigint NOT NULL CHECK (census_rows >= 0),
   census_sha256 text NOT NULL CHECK (census_sha256 ~ '^[0-9a-f]{64}$'),
   -- The Neon-side evidence the loader verified (counts per source table, snapshot time).
@@ -190,6 +199,138 @@ CREATE TABLE sessions.session_neon_census_seal (
 ALTER TABLE sessions.session_neon_census ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.session_neon_census_seal ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.session_neon_census, sessions.session_neon_census_seal FROM PUBLIC, anon, authenticated, service_role;
+
+-- A sealed generation is immutable: no row of it is inserted, changed or deleted, and the
+-- table is never truncated while a seal exists. Rows of an unsealed generation can be loaded
+-- (resumably) and a superseded generation's rows are dropped by the next seal.
+CREATE FUNCTION sessions.session_neon_census_immutable()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $census_immutable$
+DECLARE
+  v_sealed text := (SELECT generation FROM sessions.session_neon_census_seal WHERE singleton);
+BEGIN
+  IF TG_OP = 'TRUNCATE' THEN
+    IF v_sealed IS NOT NULL THEN
+      RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'neon census: a sealed census is immutable';
+    END IF;
+    RETURN NULL;
+  END IF;
+  IF (TG_OP <> 'DELETE' AND NEW.generation = v_sealed) OR (TG_OP <> 'INSERT' AND OLD.generation = v_sealed) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'neon census: a sealed census is immutable';
+  END IF;
+  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END
+$census_immutable$;
+CREATE TRIGGER session_neon_census_immutable BEFORE INSERT OR UPDATE OR DELETE ON sessions.session_neon_census
+  FOR EACH ROW EXECUTE FUNCTION sessions.session_neon_census_immutable();
+CREATE TRIGGER session_neon_census_no_truncate BEFORE TRUNCATE ON sessions.session_neon_census
+  FOR EACH STATEMENT EXECUTE FUNCTION sessions.session_neon_census_immutable();
+
+-- The loader's write path (owner-only; scripts/neon-census-load.ts --execute). Idempotent:
+-- one batch of [org, workspace, user, source, session] rows into an UNSEALED generation,
+-- ON CONFLICT DO NOTHING, so a rerun of the same generation resumes. Returns rows inserted.
+CREATE FUNCTION sessions.session_neon_census_load(p_generation text, p_rows jsonb)
+RETURNS integer LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $census_load$
+DECLARE
+  v_n integer;
+BEGIN
+  PERFORM sessions.session_analysis_require_caller(ARRAY[]::text[]);
+  IF p_generation IS NULL OR p_generation !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'neon census: generation must be 64 hex';
+  END IF;
+  IF p_generation = (SELECT generation FROM sessions.session_neon_census_seal WHERE singleton) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'neon census: a sealed census is immutable';
+  END IF;
+  IF jsonb_typeof(p_rows) IS DISTINCT FROM 'array' OR jsonb_array_length(p_rows) > 10000 OR EXISTS (
+    SELECT 1 FROM jsonb_array_elements(p_rows) AS e(v)
+     WHERE jsonb_typeof(e.v) <> 'array' OR jsonb_array_length(e.v) <> 5
+        OR EXISTS (SELECT 1 FROM jsonb_array_elements(e.v) AS x(f) WHERE jsonb_typeof(x.f) <> 'string')
+        OR coalesce(e.v ->> 0, '') = '' OR coalesce(e.v ->> 4, '') = '') THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'neon census: rows must be [org, workspace, user, source, session] strings';
+  END IF;
+  INSERT INTO sessions.session_neon_census (generation, org_id, workspace_id, user_id, source, session_id)
+  SELECT p_generation, e.v ->> 0, e.v ->> 1, e.v ->> 2, e.v ->> 3, e.v ->> 4 FROM jsonb_array_elements(p_rows) AS e(v)
+  ON CONFLICT DO NOTHING;
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  RETURN v_n;
+END
+$census_load$;
+
+-- The census digest of one generation, recomputed from its rows (owner-only). Tenant-keyed:
+-- every row's (org, workspace, user, source, session) as a length-prefixed line
+-- (octet_length:value joined by '|'), each line's sha256 truncated to 60 bits, summed
+-- (order-independent, streamable on the Neon side), then
+-- sha256('neon-census-v1:' || rows || ':' || sum). src/migration/neon-census.ts computes the
+-- identical value from Neon.
+CREATE FUNCTION sessions.session_neon_census_digest(p_generation text)
+RETURNS jsonb LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $census_digest$
+DECLARE
+  v_rows bigint;
+  v_sum numeric;
+BEGIN
+  PERFORM sessions.session_analysis_require_caller(ARRAY[]::text[]);
+  SELECT count(*), coalesce(sum(('x' || substr(encode(sha256(convert_to(
+           octet_length(c.org_id) || ':' || c.org_id || '|' || octet_length(c.workspace_id) || ':' || c.workspace_id || '|' ||
+           octet_length(c.user_id) || ':' || c.user_id || '|' || octet_length(c.source) || ':' || c.source || '|' ||
+           octet_length(c.session_id) || ':' || c.session_id, 'UTF8')), 'hex'), 1, 15))::bit(60)::bigint::numeric), 0)
+    INTO v_rows, v_sum
+    FROM sessions.session_neon_census AS c WHERE c.generation = p_generation;
+  RETURN jsonb_build_object('rows', v_rows,
+    'sha256', encode(sha256(convert_to('neon-census-v1:' || v_rows || ':' || v_sum::text, 'UTF8')), 'hex'));
+END
+$census_digest$;
+
+-- Seal a fully loaded generation (owner-only). The seal RECOMPUTES the generation's row count
+-- and digest from its rows and refuses unless both equal what the loader computed from Neon
+-- (p_rows, p_sha256); only then does it flip, atomically, and every other generation's rows
+-- are dropped. Since a sealed generation is immutable (trigger above), its stored digest keeps
+-- matching its rows, and neon_free admits only against that sealed generation: a partial or
+-- in-progress load (unsealed) never admits. p_snapshot records the Neon snapshot identity
+-- (snapshot, LSN, read time), the source identity and per-table counts. Sealing the generation
+-- already in force with the same count and digest is a no-op (resumable); anything else for it
+-- is refused.
+CREATE FUNCTION sessions.session_neon_census_seal(p_generation text, p_rows bigint, p_sha256 text, p_snapshot jsonb)
+RETURNS jsonb LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $census_seal$
+DECLARE
+  v_seal sessions.session_neon_census_seal%ROWTYPE;
+  v_have bigint;
+  v_digest jsonb;
+BEGIN
+  PERFORM sessions.session_analysis_require_caller(ARRAY[]::text[]);
+  IF p_generation IS NULL OR p_generation !~ '^[0-9a-f]{64}$' OR p_sha256 IS NULL OR p_sha256 !~ '^[0-9a-f]{64}$'
+     OR p_rows IS NULL OR p_rows < 0 OR jsonb_typeof(p_snapshot) IS DISTINCT FROM 'object' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'neon census: invalid seal arguments';
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended('session-neon-census-seal', 0));
+  SELECT * INTO v_seal FROM sessions.session_neon_census_seal WHERE singleton FOR UPDATE;
+  IF v_seal.generation = p_generation THEN
+    IF v_seal.census_rows = p_rows AND v_seal.census_sha256 = p_sha256 THEN
+      RETURN jsonb_build_object('sealed', true, 'already', true);
+    END IF;
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'neon census: a sealed census is immutable';
+  END IF;
+  IF NOT (p_snapshot ? 'snapshot' AND p_snapshot ? 'read_at' AND p_snapshot ? 'source_identity') THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'neon census: the seal needs the Neon snapshot and source identity';
+  END IF;
+  v_digest := sessions.session_neon_census_digest(p_generation);
+  v_have := (v_digest ->> 'rows')::bigint;
+  IF v_have <> p_rows THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('neon census: generation holds %s rows, expected %s', v_have, p_rows);
+  END IF;
+  IF v_digest ->> 'sha256' <> p_sha256 THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'neon census: the recomputed digest does not match';
+  END IF;
+  INSERT INTO sessions.session_neon_census_seal (singleton, generation, census_rows, census_sha256, neon_snapshot)
+  VALUES (true, p_generation, p_rows, p_sha256, p_snapshot)
+  ON CONFLICT (singleton) DO UPDATE SET generation = excluded.generation, census_rows = excluded.census_rows,
+    census_sha256 = excluded.census_sha256, neon_snapshot = excluded.neon_snapshot, sealed_at = clock_timestamp();
+  DELETE FROM sessions.session_neon_census WHERE generation <> p_generation;
+  RETURN jsonb_build_object('sealed', true, 'already', false);
+END
+$census_seal$;
 
 -- Proof that a session never had Neon evidence, from sessions-pipeline's own records, so
 -- its analysis is complete from S3 without the legacy export's coverage marker. True only
@@ -272,7 +413,8 @@ BEGIN
      AND EXISTS (SELECT 1 FROM sessions.session_neon_census_seal WHERE singleton)
      AND NOT EXISTS (
        SELECT 1 FROM sessions.session_neon_census AS c
-        WHERE c.org_id = p_org_id
+        WHERE c.generation = (SELECT generation FROM sessions.session_neon_census_seal WHERE singleton)
+          AND c.org_id = p_org_id
           AND (c.session_id = p_session_id OR c.session_id IN (SELECT ptr.session_id FROM ptr))));
 END
 $neon_free$;
@@ -323,8 +465,10 @@ BEGIN
            sessions.session_analysis_neon_free(p_org_id, p_workspace_id, p_session_id),
            (SELECT jsonb_build_array(c.sealed_at, c.manifest_sha256) FROM sessions.ingest_frozen_source_completeness AS c WHERE c.singleton),
            EXISTS (SELECT 1 FROM sessions.ingest_frozen_source_records AS r WHERE r.org_id = p_org_id AND r.session_id IN (SELECT session_id FROM ids)),
-           (SELECT jsonb_build_array(c.sealed_at, c.census_sha256) FROM sessions.session_neon_census_seal AS c WHERE c.singleton),
-           EXISTS (SELECT 1 FROM sessions.session_neon_census AS c WHERE c.org_id = p_org_id AND c.session_id IN (SELECT session_id FROM ids)),
+           (SELECT jsonb_build_array(c.generation, c.sealed_at, c.census_sha256) FROM sessions.session_neon_census_seal AS c WHERE c.singleton),
+           EXISTS (SELECT 1 FROM sessions.session_neon_census AS c
+                    WHERE c.generation = (SELECT generation FROM sessions.session_neon_census_seal WHERE singleton)
+                      AND c.org_id = p_org_id AND c.session_id IN (SELECT session_id FROM ids)),
            (SELECT f.purged_at FROM sessions.session_analysis_purge_fences AS f
              WHERE f.org_id = p_org_id AND f.workspace_id = p_workspace_id AND f.session_id = p_session_id),
            jsonb_agg(jsonb_build_array(
@@ -695,6 +839,10 @@ $read$;
 
 REVOKE ALL ON FUNCTION sessions.session_analysis_v2_forget() FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_require_caller(text[]) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_neon_census_immutable() FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_neon_census_load(text, jsonb) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_neon_census_digest(text) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_neon_census_seal(text, bigint, text, jsonb) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text, jsonb) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_admit_scope(text, text) FROM PUBLIC, anon, authenticated, service_role;
@@ -722,6 +870,10 @@ BEGIN
   FOREACH v_fn IN ARRAY ARRAY[
     'sessions.session_analysis_v2_forget()'::regprocedure,
     'sessions.session_analysis_require_caller(text[])'::regprocedure,
+    'sessions.session_neon_census_immutable()'::regprocedure,
+    'sessions.session_neon_census_load(text, jsonb)'::regprocedure,
+    'sessions.session_neon_census_digest(text)'::regprocedure,
+    'sessions.session_neon_census_seal(text, bigint, text, jsonb)'::regprocedure,
     'sessions.purge_session_analysis_for_owned(text, text, jsonb)'::regprocedure,
     'sessions.purge_session_analysis_for_owned(text, text)'::regprocedure,
     'sessions.session_analysis_admit_scope(text, text)'::regprocedure,

@@ -952,6 +952,18 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.session_neon_census_digest(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_neon_census_immutable()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_neon_census_load(text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_neon_census_seal(text,bigint,text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_neon_free_for(text,text)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"

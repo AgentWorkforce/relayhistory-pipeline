@@ -9,6 +9,7 @@
  *   session_analysis_source_revision  pointer-set + proof-input revision; SECURITY DEFINER; EXECUTE to service_role (worker)
  *   session_analysis_neon_free        never-in-Neon proof; EXECUTE to service_role (worker)
  *   session_analysis_require_caller   caller pin for the definers; not SECURITY DEFINER; owner-only
+ *   session_neon_census_load / _seal  owner-only census loader path; _immutable trigger; SECURITY DEFINER
  *   purge_session_analysis_for_owned  C3 reset/disable purge of the user's owned set; SECURITY DEFINER; owner-only
  */
 import type { LaneManifest } from "../types.ts";
@@ -30,6 +31,7 @@ export const analysisJobs: LaneManifest = {
     "sessions.session_neon_free_for(",
     "sessions.purge_session_analysis_for_owned(",
     "sessions.session_analysis_require_caller(",
+    "sessions.session_neon_census_",
   ],
   grantSources: [{ path: MIGRATION, roles: ["bulls96_read_api", "bulls96_analysis_admit", "service_role"] }],
   functions: {
@@ -44,6 +46,10 @@ export const analysisJobs: LaneManifest = {
     "sessions.purge_session_analysis_for_owned(text,text,jsonb)": { secdef: true, grants: [] },
     "sessions.purge_session_analysis_for_owned(text,text)": { secdef: true, grants: [] },
     "sessions.session_analysis_require_caller(text[])": { secdef: false, grants: [] },
+    "sessions.session_neon_census_immutable()": { secdef: true, grants: [] },
+    "sessions.session_neon_census_load(text,jsonb)": { secdef: true, grants: [] },
+    "sessions.session_neon_census_digest(text)": { secdef: true, grants: [] },
+    "sessions.session_neon_census_seal(text,bigint,text,jsonb)": { secdef: true, grants: [] },
   },
   replaces: {},
 };

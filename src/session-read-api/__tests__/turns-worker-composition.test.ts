@@ -207,7 +207,7 @@ describe("real database: the worker composition with the SQL proof", () => {
          (source_identity_sha256, control_epoch, privacy_baseline_sha256, org_count, record_rows, manifest_sha256, neon_snapshot, sealed_at)
        VALUES (repeat('a',64), repeat('b',64), repeat('c',64), 1, 0, repeat('d',64), '{}'::jsonb, now() - interval '1 hour')`,
     );
-    await db.query("INSERT INTO sessions.session_neon_census_seal (census_rows, census_sha256, neon_snapshot) VALUES (0, repeat('e',64), '{}'::jsonb)");
+    await db.query("INSERT INTO sessions.session_neon_census_seal (generation, census_rows, census_sha256, neon_snapshot) VALUES (repeat('e',64), 0, repeat('e',64), '{}'::jsonb)");
   };
   const realApi = () => {
     const env = {
@@ -256,7 +256,7 @@ describe("real database: the worker composition with the SQL proof", () => {
 
   test("#301 (1): an old turns-only Neon session (census row) whose first SP pointer is after the seal: turns_unknown", async () => {
     await seal();
-    await db.query("INSERT INTO sessions.session_neon_census (org_id, workspace_id, session_id) VALUES ('org_1', 'ws_old', 'sess_1')");
+    await db.query("WITH g AS (SELECT encode(sha256(convert_to(random()::text, 'UTF8')), 'hex') AS g), ins AS (INSERT INTO sessions.session_neon_census (generation, org_id, workspace_id, session_id) SELECT g.g, 'org_1', 'ws_old', 'sess_1' FROM g RETURNING generation) UPDATE sessions.session_neon_census_seal SET generation = (SELECT generation FROM ins LIMIT 1)");
     await insertPointer(String(pointerRow.manifest_etag));
     const r = await realApi();
     expect([r.status, await reason(r)]).toEqual([501, "turns_unknown"]);
