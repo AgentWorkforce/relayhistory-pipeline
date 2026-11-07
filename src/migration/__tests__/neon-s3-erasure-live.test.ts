@@ -296,10 +296,13 @@ describe("live (srv_) erasure", () => {
 
 /**
  * C3 (lead ruling, #294): the canonical eraser's strict inventory validation and bounded legacy
- * listing ship UNFLAGGED to the EXISTING E3 job (Babysitter flags off). A malformed inventory and
- * a > 10k-version inventory are each refused BEFORE that inventory's deletes; the tombstone is not
- * marked done (it is erased by a later sweep once the inventory is healthy); a small valid
- * inventory behaves as before. Real createS3Eraser over the offline versioned provider.
+ * listing ship UNFLAGGED to the E3 job. A MALFORMED inventory is refused BEFORE that inventory's
+ * deletes and the tombstone / queued item is never marked done (a later healthy sweep erases it).
+ * A > 10k-version prefix is NOT refused as a whole any more (that was the legacy single-listing
+ * job): #309's paged job traverses it in BOUNDED, RESUMABLE runs, so deletes may be PARTIAL
+ * progress across sweeps, and the pointer is erased only after a fresh strict verification
+ * (erasure_verify_pending until then). A small valid inventory behaves as before. Real
+ * createS3Eraser over the offline versioned provider.
  */
 describe("E3 on the strict shared eraser (fail closed, retried)", () => {
   const s3Job = async (s: import("./fake-s3-versions.ts").FakeS3Versions) => {

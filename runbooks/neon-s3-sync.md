@@ -103,14 +103,18 @@ holds only the eraser key ("sessions-prod transcript eraser").
     obligation/tombstone, investigate the inventory shape, or move to a
     separately reviewed resumable consumer. NO manual done, NO reservation
     clearing, NO disabling the strict checks, NO cap escalation as recovery."
-    The codes say which rule refused; a whole-inventory workload above 10k
-    versions needs the separately reviewed resumable consumer (`eraseStep`,
-    the paged eraser with checkpoints).
+    The codes say which rule refused. The LEGACY single-listing job refused a
+    whole inventory above 10k versions before any delete; #309's paged job (the
+    resumable consumer, `eraseStep` with checkpoints) instead traverses it in
+    bounded runs, so deletes may be PARTIAL progress across sweeps, and a live
+    pointer waits for a fresh strict proof (`erasure_verify_pending`).
   - **Regression evidence** on the existing E3 path:
     `src/migration/__tests__/neon-s3-erasure-live.test.ts` ("E3 on the strict
-    shared eraser": a small valid inventory erases as before; a malformed and a
-    >10k inventory are each refused before any delete and the same tombstone is
-    erased by a later healthy sweep; a queued prefix erasure over a malformed
+    shared eraser": a small valid inventory erases as before; a malformed
+    inventory is refused before any delete and the same tombstone is erased by a
+    later healthy sweep; a >10k machine prefix is erased in bounded resumable
+    sweeps (partial progress) with the pointer only after a strict proof; a
+    queued prefix erasure over a malformed
     inventory stays queued, backed off, and a later healthy drain erases it);
     the eraser-level refusals are in
     `strict-inventory-erasure.test.ts` and `buffered-version-erasure.test.ts`.
