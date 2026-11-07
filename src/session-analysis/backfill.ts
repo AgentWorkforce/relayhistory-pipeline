@@ -159,12 +159,15 @@ export async function applyBackfill(
   plan: BackfillPlan,
   options: {
     /**
-     * Every-version erase of one key (the transcript bucket is versioned; production passes
-     * createS3Eraser().eraseObject). Absent: a plain delete (unversioned stores and tests).
+     * REQUIRED every-version erase of exactly one key (production: createS3Eraser().eraseObject).
+     * The transcript bucket is versioned: a plain DELETE would only add a delete marker and
+     * leave the bytes, so there is no fallback and the backfill refuses to run without it.
+     * Returns the versions (and markers) removed; 0 means nothing is left.
      */
-    eraseObject?: (key: string) => Promise<number>;
-  } = {},
+    eraseObject: (key: string) => Promise<number>;
+  },
 ): Promise<{ jobs: number; requests: number; objects: number }> {
+  if (typeof options?.eraseObject !== "function") throw new BackfillError("backfill_eraser_required");
   const prefix = await anchorPrefix(db, scope);
   const scopeParams = [scope.orgId, scope.workspaceId, scope.sessionId];
   let objects = 0;
@@ -238,7 +241,22 @@ export async function applyBackfill(
         [ref.key, ...scopeParams, job.id, BACKFILL_TICKET_LEASE_SECONDS],
       );
       if (!owned.rows.length) {
-        await (options.eraseObject ? options.eraseObject(ref.key) : store.delete(objectKey(ref.key)));
+        // Durable first: a 'forgotten' ticket for the key (whatever happened to ours), so the
+        // sweeper erases it even if this process dies or the erase below fails.
+        await db.query(
+          `/* backfill:fence-lost */ INSERT INTO sessions.session_analysis_result_tickets
+             (result_key, job_id, org_id, workspace_id, session_id, reason, lease_expires_at)
+           VALUES ($1, $5::uuid, $2, $3, $4, 'forgotten', NULL)
+           ON CONFLICT (result_key) DO UPDATE SET reason = 'forgotten', lease_expires_at = NULL`,
+          [ref.key, ...scopeParams, job.id],
+        );
+        // Then erase every version and verify none remain; only then retire that ticket.
+        await options.eraseObject(ref.key);
+        if ((await options.eraseObject(ref.key)) !== 0) throw new BackfillError("backfill_ticket_lease_lost");
+        await db.query(
+          "DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1 AND job_id = $2::uuid AND reason = 'forgotten'",
+          [ref.key, job.id],
+        );
         throw new BackfillError("backfill_ticket_lease_lost");
       }
       const read = await readAll(await store.get(objectKey(ref.key)));
@@ -392,13 +410,14 @@ export async function backfillScope(
     db: SqlExecutor;
     store: ObjectStore;
     readSp(): Promise<{ sessionId: string; requests: unknown[]; analyses: unknown[] } | null>;
-    eraseObject?: (key: string) => Promise<number>;
+    /** REQUIRED every-version erase (see applyBackfill). */
+    eraseObject: (key: string) => Promise<number>;
   },
   scope: BackfillScope,
   neon: NeonV1Payload,
 ) {
   const plan = planBackfill(scope, neon);
-  const applied = await applyBackfill(deps.db, deps.store, scope, plan, deps.eraseObject ? { eraseObject: deps.eraseObject } : {});
+  const applied = await applyBackfill(deps.db, deps.store, scope, plan, { eraseObject: deps.eraseObject });
   const parity = parityEqual(expectedAfterBackfill(neon), await deps.readSp());
   if (!parity.equal) throw new BackfillError("backfill_parity_failed");
   return { ...applied, terminalized: plan.terminalized, parity };
