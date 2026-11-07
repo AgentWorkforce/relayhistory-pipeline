@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "at": "2026-11-07T20:35:07.533602+00:00",
+  "at": "2026-11-07T21:16:00.471205+00:00",
   "kind": "source_plan_and_readonly_fixture_evidence",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
   "readiness": "HOLD execution prerequisites and expired schema plan/capture; exact Worker source/build supplement reviewed PASS; pending fresh provider bracket and apply-time artifact identity",
@@ -244,6 +244,31 @@
       "name": "retained-history-neon-readonly-pin.json",
       "bytes": 1195,
       "sha256": "6590b44ba815dbc71e8a2f84e9ae753ddcfca41352fff3681e8b0bdc72ff1347"
+    },
+    {
+      "name": "supabase-nonsystem-catalog-census-result.json",
+      "bytes": 172798,
+      "sha256": "94613369617d66de97064b6817d4fd656e648795bb80e2a0d9aec2420f88b219"
+    },
+    {
+      "name": "supabase-nonsystem-catalog-census-summary.json",
+      "bytes": 1110,
+      "sha256": "230b8f60e50ccce7b78691c2dc668cd69e82dd078839e0cf2e4d7b9d124befd4"
+    },
+    {
+      "name": "supabase-nonsystem-catalog-census.sql.txt",
+      "bytes": 2896,
+      "sha256": "6eb326424b3737f3a90f321c8f6e21fcc217bb07d0f34d1eaa476796843b5943"
+    },
+    {
+      "name": "supabase-nonsystem-catalog-census-readonly.ts.txt",
+      "bytes": 6921,
+      "sha256": "28970c259ec051c134fcb51faa8a66d3de9fdc7ab7f36ca1ecbdd62044cb0534"
+    },
+    {
+      "name": "supabase-nonsystem-catalog-census-observation.md",
+      "bytes": 3425,
+      "sha256": "32ed3bc65a72c6dfdd7785e73ed72f1b4692616bc8d8af64fad37e6cf09088e4"
     }
   ]
 }

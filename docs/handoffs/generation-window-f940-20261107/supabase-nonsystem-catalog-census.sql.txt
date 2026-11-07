@@ -1,0 +1,55 @@
+-- SOURCE-ONLY DRAFT. One census SELECT, no application-table scans or values.
+-- Root must independently pin the existing Supabase project/owner transport.
+-- Catalog covers ALL pg_class relkinds in every non-system namespace, including
+-- indexes/sequences/composites; downstream table mapping may filter by relkind.
+-- reltuples is a planner estimate (-1 means unknown), never an exact row count.
+-- Migration checksum is the stored ledger sha256, not a fresh content hash.
+-- A guard failure returns null inventories: UNKNOWN, never an empty catalog.
+BEGIN READ ONLY;
+SET LOCAL ROLE postgres;
+SET LOCAL search_path = pg_catalog, pg_temp;
+SET LOCAL statement_timeout = '3s';
+SET LOCAL lock_timeout = '250ms';
+WITH route_guard AS MATERIALIZED (
+ SELECT current_user AS effective_role, session_user AS source_login,
+        current_setting('transaction_read_only') = 'on' AS read_only,
+        has_table_privilege(current_user,'sessions.__96bulls_migrations','SELECT')
+          AS ledger_select_visible,
+        NOT row_security_active('sessions.__96bulls_migrations'::regclass)
+          AS ledger_not_rls_filtered
+), qualified AS MATERIALIZED (
+ SELECT *, effective_role = 'postgres' AND source_login = 'cli_login_postgres'
+       AND read_only AND ledger_select_visible AND ledger_not_rls_filtered AS ok
+ FROM route_guard
+), catalog_relations AS (
+ SELECT n.nspname AS schema_name, c.relname AS relation_name,
+        format('%I.%I',n.nspname,c.relname) AS qualified_name,
+        c.relkind::text AS relkind,
+        (SELECT count(a.attnum)::integer FROM pg_catalog.pg_attribute a
+         WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped)
+           AS column_count,
+        c.relrowsecurity,
+        pg_catalog.pg_get_userbyid(c.relowner) AS owner_role,
+        c.reltuples::double precision AS approximate_rows
+ FROM pg_catalog.pg_class c
+ JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+ WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+), ledger AS (
+ SELECT name, sha256 AS checksum FROM sessions.__96bulls_migrations
+)
+SELECT jsonb_build_object(
+ 'route_guard',to_jsonb(q),
+ 'relations',CASE WHEN q.ok THEN coalesce(
+   (SELECT jsonb_agg(to_jsonb(r) ORDER BY r.schema_name COLLATE "C",
+                    r.relation_name COLLATE "C",r.relkind COLLATE "C")
+    FROM catalog_relations r),'[]'::jsonb) ELSE NULL END,
+ 'migration_ledger',CASE WHEN q.ok THEN coalesce(
+   (SELECT jsonb_agg(to_jsonb(l) ORDER BY l.name COLLATE "C") FROM ledger l),
+   '[]'::jsonb) ELSE NULL END
+) AS catalog_census
+FROM qualified q;
+ROLLBACK;
+-- No credential lookup, schema change, ANALYZE, table COUNT(*), application data,
+-- trigger definitions, policy expressions, defaults or function bodies requested.
+-- The operator must persist only bounded complete results; timeout/truncation/
+-- missing ledger/masked route is UNKNOWN and must not become a partial table map.
