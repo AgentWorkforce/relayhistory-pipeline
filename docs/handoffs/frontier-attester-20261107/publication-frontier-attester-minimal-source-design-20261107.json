@@ -1,0 +1,96 @@
+{
+  "schema": "publication-frontier-attester-design-v1",
+  "at": "2026-11-07T20:33:55.609528+00:00",
+  "status": "PROPOSED_SOURCE_ONLY_REGISTRY_SLOT_OWNER_REQUIRED_NO_CODE_OR_SEED",
+  "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "problem": "Publication candidates and claims require an unexpired target/G2-matched ingest_publication_frontiers row. Tracked code consumes opaque source_frontier_sha256 and record_maxima_sha256; only tracked INSERT is synthetic proof. A source completeness attester is missing. No digest is invented in this design.",
+  "existing_contract": {
+    "table": "supabase/migrations/20261104060000_ingest_canonical_publication.sql:4; PK(org,workspace,user,origin), two64hex digests,valid_until,bucket,region,keyroot,schema_generation; no attestation signer/evidence pointer/version column",
+    "role_boundary": "Table RLS enabled and all privileges revoked from PUBLIC/anon/authenticated/service_role/ingest/seeder. Current owner write is trust boundary, not a cryptographic signature verifier.",
+    "claim": "candidates require unexpired exacttarget+generation. Claim captures full frontier row, including valid_until; heartbeat/publication compare exact captured row. History lineage plan also captures and compares full row.",
+    "important": "Any UPDATE to valid_until or either digest invalidates a previously admitted attempt/plan. A naive periodic TTL extension breaks live work. Current RPCs do not independently recompute semantic completeness from the two digests."
+  },
+  "minimal_roles_and_signer": {
+    "preparer": "Bounded one-shot source reader, no ingress hooks and no publisher override. Existing independently qualified History readonly route plus metadata-only destination read route; exact identities/targets must be pinned. Readonly evidence collection only; no schema/role/new-secret changes.",
+    "attester": "Initially one human-controlled qualified owner ceremony consumes independently verified complete manifest, checks same current authority, and writes only exact origin frontier under locks/CAS; never an owner credential in publisher daemon. Existing owner authority is not assumed in this design.",
+    "future_automation": "Registry to assign a separate NOLOGIN boundary plus narrow qualified execution role/RPC to validate evidence and update exactfrontier; no direct table DML, no genericSQL, no owner/seeder/publisher privilege reuse. A new LOGIN/secret/IAM consumer needs explicit review/authorization.",
+    "signature": "Current table implements DB-owner attestation, not KMS/Ed25519. Manifest hash authenticates bytes only when bound by approved operator receipt; do not call an unsigned hash a signature. If unattended external signing is chosen, specify exact publickey/keyid+domain+expiry+replaynonce and verify server-side in new source slot before trusting it; no arbitrary existing KMS key or self-signed approval is inferred."
+  },
+  "required_real_inputs": [
+    "Current authoritative exact org/workspace/user/origin ownership, not historical email mapping or inferred workspace=org",
+    "Exact History source project/branch/DB/host/role identity and cutover active epoch/source identity/privacy baseline; immutable source boundary/sequence witnesses and schema version",
+    "Complete legacy delivery_records metadata including revisions/tombstones/owner/source/session and real revision IDs/digests, receipts and accepted-order metadata; full per-origin scan with explicit end-of-scan proof",
+    "Complete inventory/reconciliation of pre-switch S3-first ACKs whose Neon copies were not applied, including replica and DLQ. Neon snapshot alone excludes those. Immutable resolved recovery envelopes+receipts and verified raw/S3 object versions must cover them; unmeasured or expired data prevents completeness attestation",
+    "Verified historical S3 current pointer/manifest/chunk lineage and exact ownership where it contributes records. S3 maximum numeric revision alone is not a complete source frontier and cannot supply missing original revision IDs/digests",
+    "Current authoritative privacy controls/reset/deletion/disable generations and pending status. Use actual authority mode: relayhistory cutover heads + matching destination control receipts today; do not require an unrelated mirror absent for relayhistory mode. Frozen-Supabase mode requires actual sealed completeness + current mirror/authority proof",
+    "Destination admitted receipt-seat ordering/native ownership and replay-bound metadata needed to prove source-vs-current union; keep unknown historical originals null, with provenance, not fabricated",
+    "Exact target bucket/region/keyroot/G2 and source/target mapping schema; no Cloud-only identity assumption"
+  ],
+  "proposed_digest_format": {
+    "status": "NEW_VERSIONED_ALGORITHM_TO_REVIEW, not an existing production digest implementation",
+    "source_frontier": "SHA256 over domain publication-source-frontier-v1 plus canonical manifest bytes: exact scope+target+schema+source identity+cutover epoch+privacy/control receipts+source snapshot/freeze proof+component row counts/end sentinels+receipt/archive/object-version inventory roots. Every included root binds a domain/version and byte length; absence is explicit unmeasured/refused, never empty.",
+    "record_maxima": "SHA256 over domain publication-record-maxima-v1 plus scope/target/source-frontier root and complete deterministic per-record winners. Use authoritative receipt-seat/acceptance ordering and legacy revision/conflict semantics; include tombstones, equal-revision content-conflict refusal, owner/source/session identity and proof provenance. Do not use MAX(revision) over arbitrary S3 objects or choose latest timestamp.",
+    "codec": "One shared cross-store implementation: fixed-order arrays with explicit nulls, decimal integer strings (never JS Number for bigint), exact UTF8 scalar bytes, binary/C ordering without localeCompare or Unicode normalization, length-framed rows and domain-separated component roots. Snapshot/page hashes chained with counts and final end marker; version binds exact field lists and algorithms. Do not mix PostgreSQL jsonb::text formatting with JS JSON.stringify implicitly.",
+    "coverage": "Inventory evidence proves completeness; a hash only commits to supplied rows. Require exact source counts/keyset exhaustion and immutable ACK coverage, distinguish unknown from proven-empty origin. No chosen page limit can silently truncate scope."
+  },
+  "preparation_sequence": [
+    "Source-only plan validates exact targets/roles/codec/generation and bounded approved origin list. Default preview only; no credential request until operator route qualifies.",
+    "Capture source legacy freeze/current privacy control descriptor, independent of payload copy; open bounded readonly repeatable-read snapshot or use independently verified immutable complete export receipt. Read pages with keyset and per-page/final counts. On timeout/overflow stop with incomplete receipt.",
+    "Reconcile accepted pre-switch queue+DLQ and current S3 pointers/versions with receipts. Resolve descriptor references and verify object bytes/hashes where needed, parse transiently; disk index stores metadata only, no transcript bodies. Missing staged originals cannot be replaced with scrubbed bytes without an explicit protocol/proof decision.",
+    "Build complete deterministic union/winners with authoritative tie/conflict/privacy semantics. Compute proposed manifest and maxima roots from real metadata; compare independent implementation for canary cohort.",
+    "Recapture source authority/privacy boundary and current destination seats/ownership. Any source mutation/pending control/ownership change/coverage difference refuses; do not reseal stale baseline.",
+    "Qualified attester validates manifest bytes/hash/evidence/expiry and current fences in one destination transaction. Acquire existing user fence lock then exact frontier row FOR UPDATE in same established order; inspect active publication attempts AND history plans with fresh statement after row lock. CAS expected old frontier image (or exact absent insert); require exacttarget+G2 and current admission/privacy authority. Persist audited evidence link/roots/counts/actor via reviewed narrow mechanism; do not silently overwrite previous origin attestation.",
+    "Canary one origin, one admitted batch; verify claim->publication->readroute exact records and privacy negatives before broadening. This is a separate reviewed live window, not authorized by this document."
+  ],
+  "refresh_cadence_and_inflight_safety": {
+    "proposal": "Example validity60min, evaluate renewal at30min, minimum safety budget >max configured job duration+clockskew+reviewed margin; exact values must be measured and set in operator plan. They are not hardcoded authority or evidence of real retention.",
+    "no_blind_ttl_touch": "Do not UPDATE valid_until while any admitted/prepared publication attempt or history plan lease for this origin remains live. Lock frontier row and recheck both lease tables under same transaction; claim FOR SHARE serializes with update. Existing attempts may not be silently rebound to a different frontier.",
+    "busy_origin": "Defer renewal boundedly, alert and let frontier expire failclosed if no safe gap; do not steal/revoke active leases. For reliable continuous draining, a new per-origin renewal reservation / immutable frontier-version contract may be needed and must be designed in registry slot. Current full-row equality is preserved.",
+    "stability": "A valid immutable frozen-source root can be reused only while underlying completeness/authority evidence stays identical and privacy/current-controls are revalidated; do not rehash/include mutable native rows each timer tick and label it the same source frontier. Exact treatment of native accepted seat highwater versus fixed legacy boundary must be normative in assigned protocol.",
+    "admission_deadline": "Current claim only checks valid_until>now. Add reviewed minimum remaining validity guard, or bound publication maxJobMs to remaining validity minus margin, before enabling unattended operation; never increase expiry mid-attempt. Otherwise late claims safely refuse at commit but can cause orphan cleanup/liveness churn.",
+    "expiry": "Expiration stops new qualified work; never bypass completeness gate, backdate expiry, clear privacy fences or set arbitrary long-lived dummy rows."
+  },
+  "failure_modes": [
+    "Unknown current Brian owner/scope -> refuse; no historical identity fallback",
+    "Unbound History DB/role or RLS masking -> refuse",
+    "No archive coverage / missing raw/staged object / expired original -> incomplete and refuse",
+    "Source controls pending/mismatch/new owner/reset/deletion -> refuse current attestation",
+    "Any incomplete/overflowed snapshot/page/token -> UNKNOWN, never empty-complete",
+    "Equal revision content or cross-owner/scope ambiguity -> refuse reconciliation",
+    "CAS drift or in-flight lease -> no write; bounded retry only through new reviewed preparation",
+    "Ambiguous attestation commit -> read exact audited receipt before any resend",
+    "Source/target/generation/keyroot mismatch -> refuse",
+    "No frontier candidates -> telemetry missing-frontier/unqualified, not healthy backlog drained"
+  ],
+  "required_tests": [
+    "Real synthetic fixture records from metadata folds, independently recomputed roots, empty-vs-unscanned and one-bit corruption",
+    "Bigint beyond2^53, Unicode/binary order, null/empty differences, page boundaries/duplicates/missing terminalpage and stable repeat hashes",
+    "Neon-only latest revision/tombstone and S3-first not-yet-Neon ACK included; omission blocks, DLQ coverage counted separately",
+    "Missing descriptor/staged original, altered VersionId/receipt digest and scrubbed-vs-original mismatch refuse",
+    "Equal-revision accepted winner/conflict, tombstone/reset/delete/disable race, same record id across owners and origins",
+    "Repeatable source recapture mismatch, actual custody authority mode, mirror notrequired in wrongmode, pending controls",
+    "Direct publisher/seeder/anon/other-org attestation privilege denied; bad actor/signature/nonce if signaturemode chosen",
+    "Concurrent claim versus refresh: claim before renewal prevents update; renewal first yields new exact snapshot; no borrowed lease after update",
+    "Both publication AND history-plan live leases block renewal; expired lease commits still fail, obligation GC remains",
+    "TTL near expiry/deadline, clockskew, CAS drift, transaction rollback, lost commit response and no blind resend",
+    "End-to-end one real approved-origin acceptance->published ordinal->Cloud intended read route; no payload logs"
+  ],
+  "remaining_decisions_for_registry": [
+    "Assigned protocol/source owner and migration slot",
+    "Normative digest domains/codec/record winner source and independent verifier",
+    "Exact authoritative target and immutable source/queue/payload coverage evidence",
+    "Current privacy authority plus receipt-seat highwater relationship",
+    "Owner ceremony initially vs new narrow attester RPC/role/credential deployment",
+    "Audit evidence storage/schema link and versionedfrontier or renewal-reservation behavior",
+    "Measured TTL/maxjob/skew bounds and approved bounded cohort"
+  ],
+  "actions_performed": {
+    "source_reads": true,
+    "design_file_only": true,
+    "credential_reads": 0,
+    "provider_calls": 0,
+    "database_queries": 0,
+    "writes_to_frontiers": 0,
+    "new_pr_or_daemon": false
+  }
+}
