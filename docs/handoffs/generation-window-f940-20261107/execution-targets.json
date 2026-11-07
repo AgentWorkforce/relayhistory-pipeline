@@ -99,7 +99,16 @@
       "ifRunningFound": "HOLD until exact reviewed G2 replacement or stop path and applicable authorization are supplied"
     },
     "retainedCandidateNotDeploymentProof": true,
-    "windowPlan": "NO_PUBLISHER_REDEPLOY_UNLESS_RUNNING_PUBLISHER_FOUND"
+    "windowPlan": "NO_PUBLISHER_REDEPLOY_UNLESS_RUNNING_PUBLISHER_FOUND",
+    "boundedReadOnlyActivityEvidence": {
+      "receipt": "publisher-activity-result.json",
+      "sha256": "8aae951f892362d70623e44f0aab0a6d4a302c1e8f546730f0d537ad4b358b9f",
+      "interval": "2026-11-07T19:52:02.517Z..2026-11-07T19:52:02.618Z",
+      "matchingDbBackends": 0,
+      "attemptRows": 0,
+      "objectRows": 0,
+      "qualification": "NO_ACTIVITY_SAMPLE_NOT_PROCESS_ABSENCE_OR_DEPLOYMENT_PROOF"
+    }
   },
   "otherGenerationBoundConsumers": {
     "indexerAndSessionPipelineInventory": null,
