@@ -1,0 +1,145 @@
+{
+  "protocol": "scoped-publication-source-readiness-v1",
+  "qualification": "SOURCE_PREPARATION_ONLY",
+  "currentMain": "f6ccc2f8e0f4e839f197e333c9ac5fb8d5377038",
+  "retainedBase": "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b",
+  "designHead": "95ec68550602925158aa48f9fa73e4d24e0e6b4c",
+  "candidateTree": "1c549604378afa95fb1939d72ea2d71801effe9e",
+  "candidateTested": false,
+  "receiptProducer": "MISSING",
+  "captureGate": "HOLD_SCAN_INCOMPLETE",
+  "productionReadiness": "NOT_ESTABLISHED",
+  "actualPublisher": "UNKNOWN",
+  "actualConsumerRouting": "UNKNOWN",
+  "liveOperationReady": false,
+  "sourcePins": {
+    "retainedBase": "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b",
+    "currentMain": "f6ccc2f8e0f4e839f197e333c9ac5fb8d5377038",
+    "resolvedCandidateTree": "1c549604378afa95fb1939d72ea2d71801effe9e",
+    "files": {
+      "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b:src/session-ingest/frontier-plan.ts": {
+        "gitBlob": "4f4e42f535acb399282e354a8bcad95d1a189a34",
+        "sha256": "967219e11f3460090bce1e10f0a010d8596005f9f19ffc7730043a6d72655819"
+      },
+      "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b:src/session-ingest/frontier-capture-source.ts": {
+        "gitBlob": "ab2ee0acc4b40f88058c95c2dd4a133bc978c230",
+        "sha256": "d5f684095ead29db7ceeba9512bc5aeb534af4a111c1fb2f6c428f422b7b3a97"
+      },
+      "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b:src/session-ingest/frontier-plan-source.ts": {
+        "gitBlob": "a993b59e7648d4cfa4a754f95876dd975c06228b",
+        "sha256": "5c92a1b7ada50c12f477d29df336d10e334eb71ab37b62e239955f2f28205f11"
+      },
+      "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b:src/session-ingest/frontier-plan-input.ts": {
+        "gitBlob": "c9419d809e1d59ecb27f80c77b72109d299efc54",
+        "sha256": "88b48da5c8bd7da697917f5c7c56decd570606cc489362d5b5f505af6ca2386e"
+      },
+      "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b:src/session-ingest/publication-canary.ts": {
+        "gitBlob": "96f7d3315bd2c7235e4dd815392de9a84f416a5c",
+        "sha256": "d143b450871dc0b1f512f3248301dcfacff693f4e3428986eb186a0f6edac56b"
+      },
+      "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b:src/session-ingest/publication-rpc.ts": {
+        "gitBlob": "825146b9b81090229aa312490f41171d6c67be88",
+        "sha256": "6c8b3fb0cc5dfc8ba6e8ca3cb0c0102fb0853b96936a771cdac17ec689aef89b"
+      },
+      "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b:src/session-ingest/seed-proof.ts": {
+        "gitBlob": "e06c66b3e28fecf453ba1cda7dd9389bf080b980",
+        "sha256": "d3ae3d166a5dd8b2fe9c53f4a2a531f822dc3d8ab80134072848d5b4d6d40d3b"
+      },
+      "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b:docs/canonical-frontier-plan.md": {
+        "gitBlob": "754be90ad688b743909523b994643014ea6a2466",
+        "sha256": "a1065fd01354fd54f4b5e9cf7ef86918448dd9e03adeb1dd91f1204207b68a13"
+      },
+      "f6ccc2f8e0f4e839f197e333c9ac5fb8d5377038:supabase/migrations/20261104060000_ingest_canonical_publication.sql": {
+        "gitBlob": "516dbf85a2f5a213a0a19ea125db9554e7ee611b",
+        "sha256": "0e92fd9a8a9bb61e5000ca6dcd1b0ea28fe2fe46eb0784059c083bff4d7dbb8a"
+      },
+      "f6ccc2f8e0f4e839f197e333c9ac5fb8d5377038:supabase/migrations/20261104055000_lazy_current_custody.sql": {
+        "gitBlob": "d1445e39ca189f77ac86b7c59fbe18cc85d0bcf2",
+        "sha256": "3bf238706e71ed1bbeaefbfb592edd6fd40f8f30240e856827250f124ba419cc"
+      },
+      "f6ccc2f8e0f4e839f197e333c9ac5fb8d5377038:supabase/migrations/20261105039000_buffered_gc_single_candidate.sql": {
+        "gitBlob": "07ba2a4dcdc41678f1f54def6764870fe189dd19",
+        "sha256": "eb04d062b0b612978ffa9da4dc42b63f4d6e2a1c1b0223f3ef7c903b3f1b0cde"
+      },
+      "f6ccc2f8e0f4e839f197e333c9ac5fb8d5377038:supabase/migrations/20261105041000_ingest_privacy_authority.sql": {
+        "gitBlob": "1994ec05cf8fb92b67ec995b11b36c8e66a73ba7",
+        "sha256": "ea95cde07d67ed91abccbaef50de1d4ce503310d2f4d523c58e02833d87d8557"
+      },
+      "f6ccc2f8e0f4e839f197e333c9ac5fb8d5377038:supabase/migrations/20261105042000_babysitter_evidence_retention.sql": {
+        "gitBlob": "4df16f709df117a463bc699bf15adc6d3623e8d5",
+        "sha256": "2d3d04b3fd48c72ecf3ddcc6da7a54d30e9d72234d27241feab8b3e4499db29f"
+      },
+      "f6ccc2f8e0f4e839f197e333c9ac5fb8d5377038:src/session-ingest/publication-runtime.ts": {
+        "gitBlob": "588f4f7c42684a04333e4b07d0b3556ad62b0f63",
+        "sha256": "5fb4be5e500b36ffd186fc746135cc3f8bb0009ca0c5830cda08b99687991a71"
+      },
+      "f6ccc2f8e0f4e839f197e333c9ac5fb8d5377038:src/hoopdb/sessions-function-acl.json": {
+        "gitBlob": "82dd68197842bfa2f1edd34f466ecee255324939",
+        "sha256": "c2de888cad0b0ae37f7e4615a9a0cf6419ee62e1e44f32d580127cf95d57a4ab"
+      },
+      "f6ccc2f8e0f4e839f197e333c9ac5fb8d5377038:scripts/sessions-function-boundary/lanes/index.ts": {
+        "gitBlob": "1c8190f646b95dcc5fdd10fe7cf708893056ea18",
+        "sha256": "925d8e4801cd030afb0c09c94580b895cbf7ef3debd7201b9ee2983ee8081c84"
+      }
+    },
+    "comparisons": {
+      "supabase/migrations/20261104060000_ingest_canonical_publication.sql": {
+        "sameAtB128AndMain": true
+      },
+      "supabase/migrations/20261105039000_buffered_gc_single_candidate.sql": {
+        "presentAtB128": false
+      }
+    }
+  },
+  "reconciliation": {
+    "retainedBase": "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b",
+    "main": "f6ccc2f8e0f4e839f197e333c9ac5fb8d5377038",
+    "mergeBase": "8741efddbf0836146903f8cc452fe7ca71592ace",
+    "retainedDeltaPaths": [
+      "docs/canonical-frontier-plan.md",
+      "docs/runbooks/canonical-publication-canary.md",
+      "scripts/canonical-frontier-plan.ts",
+      "scripts/capture-canonical-frontier.ts",
+      "scripts/proof-canonical-frontier-plan.ts",
+      "scripts/proof-publication-canary.ts",
+      "src/session-ingest/__tests__/fixtures/publication-canary-guard.sql",
+      "src/session-ingest/__tests__/frontier-plan-source.test.ts",
+      "src/session-ingest/__tests__/frontier-plan.postgres.test.ts",
+      "src/session-ingest/__tests__/frontier-plan.test.ts",
+      "src/session-ingest/__tests__/publication-canary.test.ts",
+      "src/session-ingest/__tests__/publication.postgres.test.ts",
+      "src/session-ingest/frontier-capture-source.ts",
+      "src/session-ingest/frontier-plan-input.ts",
+      "src/session-ingest/frontier-plan-source.ts",
+      "src/session-ingest/frontier-plan.ts",
+      "src/session-ingest/publication-canary-outcomes.ts",
+      "src/session-ingest/publication-canary.ts",
+      "src/session-ingest/publication-rpc.ts",
+      "src/session-ingest/seed-proof.ts",
+      "src/session-read-api/__tests__/canonical-history-adapter.test.ts",
+      "src/session-read-api/canonical-history-adapter.ts"
+    ],
+    "mainDeltaPathCount": 303,
+    "overlapPaths": [
+      "src/session-ingest/__tests__/publication.postgres.test.ts"
+    ],
+    "mergeTreeExit": 1,
+    "candidateTree": "fee96fb8464627519df38cc6d7edf079f645e1f1",
+    "mergeMessages": [
+      "100644 6b5ef058bca18fa167580f12d0879da430e04b52 1\tsrc/session-ingest/__tests__/publication.postgres.test.ts",
+      "100644 1aaf92499fbc633c64073d68aed3f618088172ba 2\tsrc/session-ingest/__tests__/publication.postgres.test.ts",
+      "100644 ac9510cc7d325ebfcbd26581ec10ae7ff9d0b0f3 3\tsrc/session-ingest/__tests__/publication.postgres.test.ts",
+      "",
+      "Auto-merging src/session-ingest/__tests__/publication.postgres.test.ts",
+      "CONFLICT (content): Merge conflict in src/session-ingest/__tests__/publication.postgres.test.ts"
+    ],
+    "resolvedCandidateTree": "1c549604378afa95fb1939d72ea2d71801effe9e",
+    "resolvedTestBlob": "fdf8b67540dee6ce6d382d9c590a8991cd69a468",
+    "resolution": "Keep main bootstrap array including session_read_api_roles.sql; retain all other auto-merged canary test additions. No shared worktree/index/ref/branch changed; only a task-private temporary Git index was used.",
+    "diffCheckExit": 0,
+    "candidateQualified": false,
+    "candidateTested": false,
+    "priorMainSnapshot": "09a1dac574e1cd1c08d56cfa0fe256764c47f7a6",
+    "mainAdvancedDuringPreparation": "#306 diagnostic-only classifier source integration; no deployment/repair efficacy inferred"
+  }
+}
