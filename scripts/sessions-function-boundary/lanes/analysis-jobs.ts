@@ -46,7 +46,7 @@ export const analysisJobs: LaneManifest = {
     "sessions.session_neon_free_for(text,text)": { secdef: true, grants: ["bulls96_read_api"] },
     "sessions.purge_session_analysis_for_owned(text,text,text,jsonb)": { secdef: true, grants: [] },
     "sessions.purge_session_analysis_for_owned(text,text,text)": { secdef: true, grants: [] },
-    "sessions.session_analysis_purge_grant(text,text,text)": { secdef: true, grants: [] },
+    "sessions.session_analysis_purge_grant(text,text,text)": { secdef: false, grants: [] },
     "sessions.session_analysis_require_caller(text[])": { secdef: false, grants: [] },
     "sessions.session_neon_census_immutable()": { secdef: true, grants: [] },
     "sessions.session_neon_census_load(text,jsonb)": { secdef: true, grants: [] },
