@@ -5,7 +5,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { EraseCheckpoint } from "../neon-s3-erasure/eraser.ts";
-import { boundedPut, nextSweepDelayMs, PutTimeout, reconcileObligation, terminalInvocations, type Cas, type ObligationState, type ObligationStore, type WriteInvocation } from "../neon-s3-erasure/write-obligation.ts";
+import { boundedPut, nextSweepDelayMs, obligationScope, PutTimeout, reconcileObligation, terminalInvocations, type Cas, type ObligationState, type ObligationStore, type WriteInvocation } from "../neon-s3-erasure/write-obligation.ts";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
 
 const KEY = "96bulls/org/v1/ws=w/m=srv_x/h=_babysitter/d=2026/12/06/s=_bx2026120614-aaaaaaaaaaaaaaaa/raw/b=0123456789abcdef0123456789abcdef.ndjson.zst";
@@ -222,4 +222,23 @@ describe("exact-key reconcile", () => {
     expect(s.deletes).toEqual([`${KEY}@${v}`]);
     expect(s.count(KEY.slice(0, KEY.lastIndexOf("/") + 1))).toBe(10_001);
   }, 60_000);
+});
+
+describe("checkpoint mode migration", () => {
+  test("a legacy SAME-scope DIRECTORY-mode checkpoint (persisted before exact-key mode) restarts in exact mode and completes; invocations, reservations and history are preserved", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 2;
+    for (let i = 0; i < 5; i++) s.put(KEY.replace("b=0123456789abcdef0123456789abcdef", `b=${String(i).padStart(32, "0")}`));   // kept siblings sort first
+    const v = s.put(KEY);
+    const l = lane([{ id: "pending", outcome: "dispatched" }, { id: "own", outcome: "acked", versionId: v }]);
+    l.row.reserved.add("v-earlier");                                  // an earlier run's reservation (history)
+    const dir = KEY.slice(0, KEY.lastIndexOf("/") + 1);
+    const state = (await l.store.load())!;
+    // Exactly what 142761c7 persisted: the same scope hash, directory mode (no exactKey), mid-directory cursor.
+    l.row.checkpoint = { v: 1, bucket: "b", prefix: dir, scope: obligationScope(state), afterKey: KEY.replace("b=0123456789abcdef0123456789abcdef", `b=${"0".repeat(31)}3`), inKey: null };
+    expect(await reconcileObligation(s.eraser(), l.store)).toBe("rescheduled");   // "pending" stays unresolved (nonterminal)
+    expect(s.deletes).toEqual([`${KEY}@${v}`]);                    // exact mode: only the key's own version
+    expect(l.row.invocations).toEqual([{ id: "pending", outcome: "dispatched" }]);   // only "own" resolved, on its own evidence
+    expect([...l.row.reserved].sort()).toEqual([v, "v-earlier"].sort());   // history kept, new reservation added
+    expect(s.count(dir)).toBe(5);
+  });
 });

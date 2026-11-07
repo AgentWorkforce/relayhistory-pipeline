@@ -179,7 +179,11 @@ export async function reconcileObligation(
     if (!ids.length) return;
     if (!(await cas(store.reserve(rev, ids)))) { lost = true; throw coded("reservation_refused"); }
   };
-  const checkpoint = first.checkpoint && first.checkpoint.scope === scope ? first.checkpoint : null;
+  // A checkpoint is reused only for this scope AND this listing mode (exact key). A foreign or
+  // legacy one (e.g. a directory-mode checkpoint persisted before exact-key mode) is discarded and
+  // the traversal restarts with a fresh strict listing; invocations, reservations and every other
+  // part of the obligation are untouched (the next saveCheckpoint replaces only the checkpoint).
+  const checkpoint = first.checkpoint && first.checkpoint.scope === scope && (first.checkpoint.exactKey ?? null) === key ? first.checkpoint : null;
   let step;
   try {
     step = await eraser.eraseStep(prefix, { scope, checkpoint, select: unowned, authorize, beforeDelete, exactKey: key, ...(opts.budget ? { budget: opts.budget } : {}), ...(opts.now ? { now: opts.now } : {}) });
