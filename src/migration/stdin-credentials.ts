@@ -151,10 +151,10 @@ export function sessionAffinityUrl(v: unknown, name: string, provider: "supabase
 
 /**
  * The URL itself must carry the whole identity: an explicit user, a NON-EMPTY password and a TCP host, all refused
- * before any connection. Otherwise node-postgres fills the gap from outside RAM: with a null or empty password it
+ * before any Client exists. Otherwise node-postgres fills the gap from outside RAM: with a null or empty password it
  * reads ~/.pgpass through its bundled pgpass module (a credential ON DISK, and a genuine login that would pass every
  * identity check), with no user it uses the OS login name, and with no host (or a `host=` query parameter) it uses
- * PGHOST or a local socket. Pair this with pinnedPgClient, which also pins the password in the client config.
+ * PGHOST or a local socket. Codes name only the field, never a value.
  */
 export function requireUrlIdentity(u: URL, prefix: string): void {
   if (!u.username) throw new CredentialRefusal(`${prefix}_user_required`);
@@ -162,23 +162,77 @@ export function requireUrlIdentity(u: URL, prefix: string): void {
   if (!u.hostname || u.searchParams.has("host") || u.searchParams.has("hostaddr")) throw new CredentialRefusal(`${prefix}_host_required`);
 }
 
-/** The minimal node-postgres surface pinnedPgClient needs (kept structural so tests can pass a real or fake `pg`). */
+/** The discrete pg config built from a stdin URL: never a connectionString (pg merges a parsed one OVER the config). */
+export interface PinnedPgConfig {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  database: string;
+  ssl?: false | Record<string, never>;
+}
+
+/** pg 8.x's default (non-libpq) sslmode mapping, kept exactly; `no-verify` (unverified TLS) is refused. */
+const SSLMODES: Record<string, false | Record<string, never>> = { disable: false, prefer: {}, require: {}, "verify-ca": {}, "verify-full": {} };
+
+/**
+ * Parses a stdin URL (already checked by its provider guard) into the discrete config the client gets: host, port,
+ * user, password and database are decoded from the URL here, so nothing but the bounded stdin document supplies
+ * them. Only `sslmode` may appear in the query (anything else would be silently dropped, or override the identity).
+ */
+export function pinnedPgConfig(url: string, name: string): PinnedPgConfig {
+  const prefix = name.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    throw new CredentialRefusal(`credentials_invalid.${name}`);
+  }
+  if (u.protocol !== "postgres:" && u.protocol !== "postgresql:") throw new CredentialRefusal(`credentials_invalid.${name}`);
+  requireUrlIdentity(u, prefix);
+  for (const k of u.searchParams.keys())
+    if (k !== "sslmode") throw new CredentialRefusal(`${prefix}_startup_parameter_refused.${/^[a-z_]{1,32}$/.test(k) ? k : "other"}`);
+  let user: string, password: string, database: string;
+  try {
+    user = decodeURIComponent(u.username);
+    password = decodeURIComponent(u.password);
+    database = decodeURIComponent(u.pathname.replace(/^\//, ""));
+  } catch {
+    throw new CredentialRefusal(`credentials_invalid.${name}`);
+  }
+  if (!user) throw new CredentialRefusal(`${prefix}_user_required`);
+  if (!password) throw new CredentialRefusal(`${prefix}_password_required`);
+  if (!database || database.includes("/")) throw new CredentialRefusal(`${prefix}_database_required`);
+  const host = u.hostname.replace(/^\[(.*)\]$/, "$1");
+  const port = u.port ? Number(u.port) : 5432;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new CredentialRefusal(`credentials_invalid.${name}`);
+  const cfg: PinnedPgConfig = { host, port, user, password, database };
+  const mode = u.searchParams.get("sslmode");
+  if (mode !== null) {
+    if (!Object.hasOwn(SSLMODES, mode)) throw new CredentialRefusal(`${prefix}_sslmode_refused`);
+    cfg.ssl = SSLMODES[mode] === false ? false : {};
+  }
+  return cfg;
+}
+
+/** The minimal node-postgres surface pinnedPgClient needs (structural, so tests can inject a recording fake). */
 interface PgLike<C> {
   Client: new (config: Record<string, unknown>) => C;
 }
 
 /**
- * A pg Client for a URL that passed requireUrlIdentity, with the password PINNED from that URL (RAM). pg's
- * pgpass fallback runs only when the resolved password is null, so the constructed client is checked too: if
- * its password is not exactly the URL's (non-empty) password, it is refused before connect().
+ * A pg Client for a stdin URL from the DISCRETE config above (no connectionString), with the password pinned. pg
+ * consults ~/.pgpass only when the resolved password is null, so the constructed client is checked as well: a
+ * client whose password is not exactly the stdin one (or that carries a connectionString) is refused before connect().
  */
 export function pinnedPgClient<C extends object>(pg: PgLike<C>, url: string, name: string, extra: Record<string, unknown> = {}): C {
-  const u = new URL(url);
+  const cfg = pinnedPgConfig(url, name);
   const prefix = name.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
-  requireUrlIdentity(u, prefix);
-  const password = decodeURIComponent(u.password);
-  const client = new pg.Client({ ...extra, connectionString: url, password });
-  if ((client as { password?: unknown }).password !== password || !password) throw new CredentialRefusal(`${prefix}_password_not_pinned`);
+  for (const k of ["connectionString", "host", "port", "user", "password", "database", "ssl"]) if (k in extra) throw new CredentialRefusal(`${prefix}_config_override_refused`);
+  const client = new pg.Client({ ...extra, ...cfg });
+  const c = client as { password?: unknown; connectionParameters?: { password?: unknown; user?: unknown; host?: unknown } };
+  if (c.password !== cfg.password || (c.connectionParameters && (c.connectionParameters.password !== cfg.password || c.connectionParameters.user !== cfg.user || c.connectionParameters.host !== cfg.host)))
+    throw new CredentialRefusal(`${prefix}_password_not_pinned`);
   return client;
 }
 

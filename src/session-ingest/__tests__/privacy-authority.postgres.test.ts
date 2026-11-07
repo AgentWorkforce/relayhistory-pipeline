@@ -4,8 +4,8 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import pg from "pg";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, readdirSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import { sqlLedger } from "../ledger-sql.ts";
 import { deliverBatch } from "../deliver.ts";
@@ -476,7 +476,7 @@ describe.skipIf(!url)("C3 privacy authority on actual PostgreSQL", () => {
     expect(await assertEraserIdentity(viaRole.q).then(() => "ok", (e) => e.code)).toBe("eraser_identity_not_authenticated_as_privacy_eraser");
   }, 30_000);
 
-  test("P2 on real PG: a password-less eraser URL would log in from ~/.pgpass; the stdin guard refuses it before connect", async () => {
+  test("P2 on real PG: a password-less eraser URL reaches pg's pgpass fallback; the stdin guard and pinned client never do", async () => {
     const d = await database();
     await d.owner("ingest_privacy_authority_fence", { controlEpoch: epoch });
     await d.activateEmpty();
@@ -485,40 +485,48 @@ describe.skipIf(!url)("C3 privacy authority on actual PostgreSQL", () => {
     cleanup.push(async () => {
       await d.pool.query("ALTER ROLE bulls96_privacy_eraser NOLOGIN PASSWORD NULL; ALTER ROLE bulls96_privacy_eraser RESET ALL").catch(() => undefined);
     });
-    const u = new URL(d.url);
-    u.username = "bulls96_privacy_eraser";
-    u.password = "";
-    const passwordless = u.href;
-    // A temp HOME with a 0600 .pgpass for the synthetic eraser role; PGPASSFILE / PGPASSWORD unset.
-    const home = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "c3-pgpass-"));
-    writeFileSync(join(home, ".pgpass"), `${u.hostname}:${u.port || 5432}:*:bulls96_privacy_eraser:c3-test-only-synthetic\n`, { mode: 0o600 });
-    const saved = { HOME: process.env.HOME, PGPASSFILE: process.env.PGPASSFILE, PGPASSWORD: process.env.PGPASSWORD };
-    process.env.HOME = home;
-    delete process.env.PGPASSFILE;
-    delete process.env.PGPASSWORD;
+    // An in-memory sentinel in place of pg's bundled pgpass module (no credential file anywhere): it records every
+    // fallback attempt and supplies nothing.
+    const req = createRequire(join(root, "package.json"));
+    const fromPg = createRequire(req.resolve("pg"));
+    const pgpassPath = fromPg.resolve("pgpass");
+    fromPg("pgpass");
+    const entry = (req.cache as Record<string, { exports: unknown }>)[pgpassPath]!;
+    const real = entry.exports;
+    let fallbacks = 0;
+    entry.exports = (_params: unknown, cb: (pass?: string) => void) => {
+      fallbacks += 1;
+      cb(undefined);
+    };
     try {
-      // The vector is real: plain pg authenticates the password-less URL from the file (a genuine SCRAM login).
+      const u = new URL(d.url);
+      u.username = "bulls96_privacy_eraser";
+      u.password = "";
+      const passwordless = u.href;
+      // The vector (ff29da7f's construction): pg reaches its pgpass fallback during SCRAM auth for this URL.
       const raw = new pg.Client({ connectionString: passwordless });
-      await raw.connect();
-      try {
-        expect((await raw.query("SELECT system_user::text AS s")).rows[0].s).toBe("scram-sha-256:bulls96_privacy_eraser");
-      } finally {
-        await raw.end();
-      }
-      // The E3 job's guards refuse it by name, before any connection.
+      expect(await raw.connect().then(() => "connected", () => "refused")).toBe("refused");
+      await raw.end().catch(() => undefined);
+      expect(fallbacks).toBe(1);
+      // The E3 guards refuse it by name before any Client exists.
       expect(errCode(() => authorityUrl("supabase", passwordless))).toBe("database_url_password_required");
       expect(errCode(() => pinnedPgClient(pg, passwordless, "databaseUrl"))).toBe("database_url_password_required");
-      // And the pinned client for the real stdin URL logs in with exactly that password.
-      const ok = pinnedPgClient(pg, new URL(d.url).href.replace(/\/\/[^@]*@/, "//bulls96_privacy_eraser:c3-test-only-synthetic@"), "databaseUrl");
+      // The genuine narrow-role SCRAM login through the pinned DISCRETE config (percent-encoded password in the URL):
+      await d.pool.query("ALTER ROLE bulls96_privacy_eraser PASSWORD 'c3@test:only/synthetic%'");
+      const good = new URL(d.url);
+      good.username = "bulls96_privacy_eraser";
+      good.password = encodeURIComponent("c3@test:only/synthetic%");
+      const ok = pinnedPgClient(pg, authorityUrl("supabase", good.href), "databaseUrl");
       await ok.connect();
       try {
         expect((await ok.query("SELECT system_user::text AS s")).rows[0].s).toBe("scram-sha-256:bulls96_privacy_eraser");
+        await assertEraserIdentity({ query: async (t: string, p?: unknown[]) => ({ rows: (await ok.query(t, p as never)).rows }) });
       } finally {
         await ok.end();
       }
+      expect(fallbacks).toBe(1);
     } finally {
-      for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
-      rmSync(home, { recursive: true, force: true });
+      entry.exports = real;
     }
   }, 30_000);
 });

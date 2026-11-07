@@ -43,6 +43,9 @@ and the eraser reads the frozen deletions exactly where it read Neon's `deleted_
 
 `OP` = `bun run scripts/privacy-authority-handoff.ts` from a clean worktree at the reviewed head. Credentials: one
 JSON object on stdin, piped from 1Password, never a file: `{"neonUrl": <Neon owner URL, used read-only>, "supabaseUrl": <Supabase owner URL>}`.
+Each URL must carry an explicit user, a non-empty password and a TCP host, and no query parameter but `sslmode`
+(`no-verify` is refused). Anything else is refused by field name before any connection, so the password always comes
+from stdin and never from `~/.pgpass`, `PGHOST` or the OS login. The client gets a discrete config, never a connection string.
 `EPOCH` = the live `DELIVERY_CUTOVER` epoch.
 
 **Session affinity (required).** Both URLs must be dedicated direct or session-mode connections, never a transaction
@@ -88,6 +91,8 @@ lock may stay held on the original backend until that session ends: rerun on a d
      role needs a password (1Password) and SCRAM auth. `session_user` and `current_user` must also be the eraser role.
      SET ROLE, SET SESSION AUTHORIZATION, a superuser/owner/BYPASSRLS login, any `options=` or other URL startup
      parameter (only `sslmode` is allowed) and `PGOPTIONS`/`PGUSER`/`PGPASSFILE`/`PGSERVICE` are refused.
+     The stdin URL must also carry the user, a non-empty password and the host: a password-less URL is refused
+     before connecting (pg would otherwise read `~/.pgpass`).
 
    The role can call only `ingest_privacy_eraser_{state,groups,page,still_fenced}`, which read the deduplicated union
    of the frozen-source deletions and the target's `upload_deletions`. That union covers both Neon-era and post-cutover
