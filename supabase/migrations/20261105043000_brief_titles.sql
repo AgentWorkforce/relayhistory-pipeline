@@ -155,11 +155,18 @@ BEGIN
      AND x.harness = p_harness AND x.session_id = p_session_id;
   -- F2 containment (20261105043000): a Neon-backfilled brief (engine_version 'neon-backfill:*',
   -- origin 'neon_backfill') is served only to Cloud's session list through
-  -- sessions.session_brief_titles_for, never as this session's brief: it reads as no brief.
+  -- sessions.session_brief_titles_for. Here it behaves as an ABSENT native brief: a
+  -- backfill-only row (status 'ready': no native attempt since) reads exactly as no row; a
+  -- row a later native attempt touched keeps that attempt's status, error and time, and
+  -- drops only the legacy text and its engine metadata.
   IF b.title IS NOT NULL AND b.engine_version LIKE 'neon-backfill:%' THEN
-    b.title := NULL; b.description := NULL; b.state := NULL; b.brief_revision := NULL;
-    b.brief_source_revisions := NULL; b.prompt_version := NULL; b.engine_version := NULL;
-    b.model := NULL; b.generated_at := NULL;
+    IF b.status = 'ready' THEN
+      b := NULL;
+    ELSE
+      b.title := NULL; b.description := NULL; b.state := NULL; b.brief_revision := NULL;
+      b.brief_source_revisions := NULL; b.brief_fingerprint := NULL; b.prompt_version := NULL;
+      b.engine_version := NULL; b.model := NULL; b.generated_at := NULL;
+    END IF;
   END IF;
   v_queued := EXISTS (SELECT 1 FROM sessions.session_brief_wakeups AS w
                        WHERE w.org_id = v_org AND w.workspace_id = p_workspace_id
