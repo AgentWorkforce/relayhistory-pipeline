@@ -99,10 +99,30 @@ describe.skipIf(!url)("ledgered portable search state on PostgreSQL", () => {
     // TRUNCATE is not granted (RLS does not cover it), nor DDL.
     await expect(w.query("TRUNCATE sessions.search_projection_state")).rejects.toThrow(/permission denied|must be owner/);
     await expect(w.query("ALTER TABLE sessions.search_projection_state DISABLE ROW LEVEL SECURITY")).rejects.toThrow(/must be owner/);
-    // FORCE RLS: the owner role itself (not superuser) would see nothing; the read role is refused.
-    await t.owner.query("SET ROLE bulls96_read_api");
-    try { await expect(t.owner.query("SELECT 1 FROM sessions.search_projection_state")).rejects.toThrow(/permission denied/); }
-    finally { await t.owner.query("RESET ROLE"); }
+    // 048000 reader contract (applied by the real migrator on this branch): the fixed read
+    // role sees exactly its tenant's state rows and contracted columns, never another
+    // tenant's, never a non-contract column, and cannot write.
+    await w.query("BEGIN");
+    await state.record(w as never, { orgId: "org-b", workspaceId: "ws-a", harness: "codex", sessionId: "s1" }, { revision: 1, rows: 1, complete: true, at: new Date(0), canonicalSessionId: "s1" });
+    await w.query("COMMIT");
+    const asReader = async <R>(org: string, sql: string) => {
+      await t.owner.query("BEGIN");
+      try {
+        await t.owner.query("SET LOCAL ROLE bulls96_read_api");
+        await t.owner.query("SELECT set_config('bulls96_read.org_id', $1, true), set_config('bulls96_read.workspace_id', 'ws-a', true)", [org]);
+        return (await t.owner.query<R>(sql)).rows;
+      } finally { await t.owner.query("ROLLBACK"); }
+    };
+    expect(await asReader<{ org_id: string }>("org-a", "SELECT org_id FROM sessions.search_projection_state")).toEqual([{ org_id: "org-a" }]);
+    expect(await asReader<{ org_id: string }>("org-b", "SELECT org_id FROM sessions.search_projection_state")).toEqual([{ org_id: "org-b" }]);
+    expect(await asReader<{ org_id: string }>("org-c", "SELECT org_id FROM sessions.search_projection_state")).toEqual([]);
+    await expect(asReader("org-a", "SELECT revision FROM sessions.search_projection_state")).rejects.toThrow(/permission denied/);
+    await expect(asReader("org-a", "DELETE FROM sessions.search_projection_state")).rejects.toThrow(/permission denied|read-only/);
+    await expect(asReader("org-a", "SELECT search_text FROM sessions.session_directory")).rejects.toThrow(/permission denied/);
+    // The read API's admission accepts the fixed read role (not privileged, cannot write).
+    await t.owner.query("BEGIN");
+    try { await t.owner.query("SET LOCAL ROLE bulls96_read_api"); await admitPortableConnection(t.owner as never, "reader"); }
+    finally { await t.owner.query("ROLLBACK"); }
     // Privileged connections are refused at admission (the admin is a superuser).
     await expect(admitPortableConnection(t.owner as never, "writer")).rejects.toThrow("superuser");
   }, 300_000);
