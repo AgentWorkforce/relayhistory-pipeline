@@ -26,6 +26,7 @@ import type { AnalysisModelTransport } from "./engine/model.ts";
 import type { AnalysisEvidenceDeps } from "./evidence.ts";
 import { runAnalysisJob } from "./processor.ts";
 import { postgresAnalysisJobStore, sweepAnalysisTickets } from "./store.ts";
+import type { PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 
 export interface AnalysisConfig {
   enabled: boolean;
@@ -124,8 +125,8 @@ export function analysisTick(deps: {
   transport: AnalysisModelTransport | null;
   /** One HoopDb transaction (the pipeline's `transaction(db, work)`); absent = no sweep. */
   transact?: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
-  /** Every-version erase of one key (versioned bucket); see sweepAnalysisTickets. */
-  eraseObject?: (key: string) => Promise<number>;
+  /** The shared strict paged eraser (createS3Eraser); see sweepAnalysisTickets. Absent = no sweep. */
+  eraser?: PagedEraser;
 }) {
   return async (): Promise<Record<string, number>> => {
     const counts: Record<string, number> = { completed: 0, failed: 0, "lease-lost": 0, idle: 0 };
@@ -140,8 +141,12 @@ export function analysisTick(deps: {
     });
     // Orphan publications first (erased, lost or crashed): their objects never outlive a tick.
     // Only with the every-version eraser: without it, tickets wait (never a plain delete).
-    if (deps.transact && deps.eraseObject)
-      counts.swept = await sweepAnalysisTickets(deps.store, { transact: deps.transact, eraseObject: deps.eraseObject });
+    if (deps.transact && deps.eraser)
+      counts.swept = await sweepAnalysisTickets(deps.store, {
+        transact: deps.transact,
+        eraser: deps.eraser,
+        onError: () => { counts.sweep_failed = (counts.sweep_failed ?? 0) + 1; },
+      });
     for (let i = 0; i < deps.config.batch; i += 1) {
       const outcome = await runAnalysisJob(
         store,
