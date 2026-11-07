@@ -469,3 +469,46 @@ test("analysis purge (guarded, ordering): a reset calls purge_session_analysis_f
   expect((await f.db.query("SELECT org_id,user_id,owned_seen::int FROM sessions.__c3_analysis_purge_calls")).rows).toEqual([{ org_id: TENANT.orgId, user_id: TENANT.userId, owned_seen: 1 }]);
   expect(((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_owned_sessions")).rows[0] as any).n).toBe(0);
 });
+
+/** #292's purge_session_analysis_for_owned (both forms), loaded VERBATIM from f7f49308 (046000). */
+async function withAnalysis(f: F) {
+  await f.db.exec("DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_analysis_admit') THEN CREATE ROLE bulls96_analysis_admit NOLOGIN NOINHERIT; END IF; END$$;");
+  await f.db.exec(await Bun.file(new URL("./fixtures/analysis-jobs-046000.sql", import.meta.url)).text());
+  const job = (ws: string, sid: string) =>
+    f.db.query("INSERT INTO sessions.session_analysis_jobs_v2(org_id,workspace_id,session_id,analysis_version,schema_version,model_version) VALUES($1,$2,$3,'session-analysis-v2.4',2,'gpt-5.4')", [TENANT.orgId, ws, sid]);
+  const owned = (ws: string, user: string, sid: string, o: string) =>
+    f.db.query("INSERT INTO sessions.ingest_frozen_source_owned_sessions VALUES($1,$2,$3,$4,'claude',$5)", [TENANT.orgId, ws, user, o, sid]);
+  const jobs = async () => (await f.db.query("SELECT workspace_id,session_id FROM sessions.session_analysis_jobs_v2 ORDER BY 1,2")).rows.map((r: any) => `${r.workspace_id}/${r.session_id}`);
+  return { job, owned, jobs };
+}
+
+async function analysisWorld() {
+  const f = await setup();
+  const n = await fakeNeon();
+  open.push(n.close);
+  const o = await origin();
+  const a = await withAnalysis(f);
+  // user-1 owns S1, S2 in ws-a; user-2 owns a same-id S1 in ws-b. Neon has the same owned identities.
+  for (const [ws, user, sid] of [[TENANT.workspaceId, TENANT.userId, "S1"], [TENANT.workspaceId, TENANT.userId, "S2"], ["ws-b", "user-2", "S1"]] as const)
+    await n.pg.query("INSERT INTO sessions.uploaded_support_identities VALUES($1,$2,$3,$4,$5,'claude',$6)", [TENANT.orgId, ws, o, `r-${ws}-${user}-${sid}`, user, sid]);
+  await activateFrom(f, n);
+  for (const [ws, sid] of [[TENANT.workspaceId, "S1"], [TENANT.workspaceId, "S2"], ["ws-b", "S1"]] as const) await a.job(ws, sid);
+  return { f, o, ...a };
+}
+
+test("analysis purge (real #292 function): a reset purges the user's whole owned set; another user's same-id session is untouched", async () => {
+  const w = await analysisWorld();
+  expect(await w.jobs()).toEqual([`${TENANT.workspaceId}/S1`, `${TENANT.workspaceId}/S2`, "ws-b/S1"]);
+  await authorityControl(w.f, "reset", { request_id: "analysis-reset" });
+  expect(await w.jobs()).toEqual(["ws-b/S1"]);
+  expect((await w.f.db.query("SELECT session_id FROM sessions.session_analysis_purge_fences ORDER BY 1")).rows.map((r: any) => r.session_id)).toEqual(["S1", "S2"]);
+});
+
+test("analysis purge (real #292 function): a disable purges only the listed sessions", async () => {
+  const w = await analysisWorld();
+  await authorityControl(w.f, "selection", { origin_id: w.o, sessions: [{ source: "claude", session_id: "S2" }], enabled: false });
+  expect(await w.jobs()).toEqual([`${TENANT.workspaceId}/S1`, "ws-b/S1"]);
+  // A re-enable purges nothing.
+  await authorityControl(w.f, "selection", { origin_id: w.o, sessions: [{ source: "claude", session_id: "S1" }], enabled: true });
+  expect(await w.jobs()).toEqual([`${TENANT.workspaceId}/S1`, "ws-b/S1"]);
+});

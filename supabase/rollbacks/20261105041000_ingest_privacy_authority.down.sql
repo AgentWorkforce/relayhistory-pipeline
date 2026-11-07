@@ -12,7 +12,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105041000_ingest_privacy_authority.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105041000_ingest_privacy_authority.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'7f0f8ac2242310a5a595b93e7b07dcc698533a8b5f056526fb170597f4b5d027'
+ IF NOT FOUND OR v_sha<>'af2fd247c4a46e003b9116b5471071005c03d5ec33fe7b8ccc74f6b8719a0b65'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy authority: own applied checksum required';END IF;
  PERFORM pg_advisory_xact_lock(1919249529,96); -- the authority lock: no begin/transition in flight
  IF EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority)
@@ -25,6 +25,12 @@ DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_del
 DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_resets;
 DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_records;
 DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_owned_sessions;
+DROP FUNCTION sessions.ingest_privacy_eraser_still_fenced(jsonb);
+DROP FUNCTION sessions.ingest_privacy_eraser_page(jsonb);
+DROP FUNCTION sessions.ingest_privacy_eraser_groups();
+DROP FUNCTION sessions.ingest_privacy_eraser_require_active();
+DROP FUNCTION sessions.ingest_privacy_eraser_state();
+REVOKE USAGE ON SCHEMA sessions FROM bulls96_privacy_eraser;
 DROP FUNCTION sessions.ingest_privacy_authority_begin(jsonb);
 DROP FUNCTION sessions.ingest_privacy_authority_complete(jsonb);
 DROP FUNCTION sessions.ingest_privacy_authority_apply(text,text,text,text,jsonb);
@@ -103,5 +109,5 @@ DROP TABLE sessions.ingest_frozen_source_owned_sessions;
 ALTER TABLE sessions.ingest_source_control_heads DROP COLUMN deleted;
 -- The post-apply index job's index, if it was built (scripts/ops/c3-privacy-authority/ingest_privacy_authority_index.sql).
 DROP INDEX IF EXISTS sessions.ingest_frozen_source_records_user_session;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105041000_ingest_privacy_authority.sql' AND sha256='7f0f8ac2242310a5a595b93e7b07dcc698533a8b5f056526fb170597f4b5d027';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105041000_ingest_privacy_authority.sql' AND sha256='af2fd247c4a46e003b9116b5471071005c03d5ec33fe7b8ccc74f6b8719a0b65';
 COMMIT;

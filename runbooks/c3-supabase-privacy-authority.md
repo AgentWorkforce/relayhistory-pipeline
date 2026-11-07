@@ -80,7 +80,14 @@ lock may stay held on the original backend until that session ends: rerun on a d
    Between activation and the flip, controls stay 503 (fail closed). Old mixed isolates during rollout also 503.
 7. **Verify (READ-ONLY):** one synthetic selection round trip on a test account; census shows `authority: "active"`;
    relayhistory selection/reset Neon statements in `pg_stat_statements` delta 0; upload 2xx unchanged.
-8. **Eraser:** restart in `S3X_PRIVACY_AUTHORITY=supabase` with stdin credentials
+8. **Eraser:** run it as the least-privilege login `bulls96_privacy_eraser`, never an owner, superuser or BYPASSRLS URL. Steps:
+   - make the role LOGIN with `supabase/bootstrap/privacy_eraser_role.sql` (explicit apply OK; password from 1Password, in memory);
+   - run `supabase/bootstrap/privacy_eraser_verify.sql` before and after;
+   - check the eraser starts: it refuses any other identity at startup.
+
+   The role can call only `ingest_privacy_eraser_{state,groups,page,still_fenced}`, which read the deduplicated union
+   of the frozen-source deletions and the target's `upload_deletions`. That union covers both Neon-era and post-cutover
+   sessions. Then restart the eraser in `S3X_PRIVACY_AUTHORITY=supabase` with stdin credentials
    (`{"databaseUrl": <Supabase session/direct URL>, "eraser": {...}}`, see `runbooks/neon-s3-sync.md`). Dry run first
    (no `--execute`); expect `authority: "supabase"` sweep lines and no `sweep refused`.
 
@@ -117,7 +124,7 @@ plus session ids recovered from null-session delete tombstones through `neighbor
 | target ingest data (post-cutover uploads) | unchanged: `ingest_apply_reset` through the ordered fence |
 | S3 copies (P5a exports, live `srv_` objects) | the eraser in `supabase` mode erases every (org, session) in `ingest_frozen_source_deletions` |
 | `daily_digests` delete (workspace) | `sessions.daily_digest_narratives` (F4, migration 045000) purged in the head transaction through `purge_daily_digest_narratives(org, ws)` on every disable and reset. Guarded: a no-op until 045000 is applied |
-| SP v2 analysis results (046000 `session_analysis_jobs_v2`) | post-cutover sessions: forgotten by 046000's trigger when the fence's target apply tombstones their `session_index`/`session_directory` rows. **Neon-era sessions: ACTIVATION BLOCKER.** The analysis lane adds `sessions.purge_session_analysis_for_owned(org, user)` (046000/#292), which purges exactly the user's owned set. The reset calls it (guarded) BEFORE the owned rows are deleted. Still open: (1) the causal test against the lane's real function (pending its head); (2) **disable**: an `(org, user)` signature cannot target only the disabled sessions, so disable does not call it yet. That needs a session-scoped signature from the analysis lane |
+| SP v2 analysis results (046000 `session_analysis_jobs_v2`) | post-cutover sessions: forgotten by 046000's trigger when the fence's target apply tombstones their pointers. Neon-era sessions: the authority calls #292's `purge_session_analysis_for_owned`, guarded (a no-op until 046000 is applied), BEFORE the owned/frozen rows go. A reset calls the `(org, user)` form; a disable calls the `(org, user, sessions)` form with exactly the disabled sessions. Both pass its caller pin, because they run as `bulls96_session_ingest` inside the authority begin, which sets the writer marker. Note: 046000 scopes both forms by `(org, user)` across workspaces, so a reset also purges the user's analysis in their other workspaces (over-purge, not a leak; the analysis lane's call) |
 | Neon-resident derived data (projected events, rollups, catalogs, claims/edges, patterns, memory jobs, analysis requests/jobs/caches, conversation turns) | **not written** (Neon is not written). Contract: before activation, nothing may read or write these for history (precondition 4, and below); they are destroyed when Neon `sessions` is dropped. |
 | `conversation_turn_fences` insert (blocks re-ingest of the session's turns) | **contract**: turns must be written through the ingest (`TURNS_WRITE_PATH=forward`, SP #241 live) with an ingest-side fence on `upload_deletions` before activation. Otherwise `/v1/sessions/:id/turns` could write a deleted session's turns into Neon. |
 

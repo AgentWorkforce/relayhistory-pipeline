@@ -4,15 +4,16 @@
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtemp, writeFile } from "node:fs/promises";
-import { openSync, closeSync } from "node:fs";
+import { openSync, closeSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import type { Queryable } from "../relayhistory-export.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { objectKey } from "../../shared/vendor.ts";
 import { storeEraser } from "../neon-s3-erasure/eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "../neon-s3-erasure/job.ts";
-import { liveMachineId } from "../neon-s3-erasure/live.ts";
+import { liveMachineId, liveTargets } from "../neon-s3-erasure/live.ts";
 import { supabaseAuthority, type ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import { authorityKind, authorityUrl, eraserFor } from "../neon-s3-erasure/main.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
@@ -282,4 +283,104 @@ describe("supabase privacy authority as the eraser's source", () => {
     expect(await w.keys()).toEqual([...LIVE, POINTER].sort());
     expect(j.counters.liveFenceFailed).toBeGreaterThan(0);
   });
+});
+
+/**
+ * Independent dogpatch review, P0: a session uploaded AFTER activation is owned only by the target (ingest), never in
+ * the frozen copy. A Supabase-authority reset fences it in the target's upload_deletions; the eraser must see that set
+ * too, or its live objects survive the reset forever. Runs the REAL ingest upload path and the REAL Supabase eraser.
+ */
+describe("supabase eraser covers post-cutover sessions (review P0) and runs least-privilege (review P1)", () => {
+  const { createIngestApp } = require("../../session-ingest/app.ts") as typeof import("../../session-ingest/app.ts");
+  const { deliveryAccount } = require("../../session-ingest/vendor/delivery/prepare.ts") as typeof import("../../session-ingest/vendor/delivery/prepare.ts");
+  const { batch, record, TENANT } = require("../../session-ingest/__tests__/support.ts") as typeof import("../../session-ingest/__tests__/support.ts");
+  const { fakeNeon } = require("../../session-ingest/__tests__/privacy-authority-support.ts") as typeof import("../../session-ingest/__tests__/privacy-authority-support.ts");
+  const handoff = require("../privacy-authority-handoff.ts") as typeof import("../privacy-authority-handoff.ts");
+  const { assertEraserIdentity } = require("../neon-s3-erasure/authority.ts") as typeof import("../neon-s3-erasure/authority.ts");
+
+  async function activeWorld() {
+    const f = await authorityFixture();
+    open.push(f.close);
+    await f.seal();
+    const n = await fakeNeon();
+    open.push(n.close);
+    await handoff.fence(f.queryable, epoch);
+    await handoff.syncOwned(n.queryable, f.queryable);
+    const c = await handoff.census(n.queryable, f.queryable, epoch);
+    await handoff.activate(n.queryable, f.queryable, { epoch, expectNeonFingerprint: c.neon.fingerprint, settleMs: 0 });
+    const app = (control?: object) => createIngestApp({ identify: () => ({ ...TENANT, scopes: ["rth:sync"], ...(control ? { control } : {}) }) as never, deliver: f.deps, log: () => {}, custodySource: "frozen-supabase", privacyAuthority: "supabase" });
+    const post = (a: ReturnType<typeof app>, path: string, body: unknown) => a.request(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const reset = async (request_id: string) => {
+      const head = (await (await post(app(), "/v1/custody/authority/begin", { epoch, kind: "reset", payload: { request_id } })).json()) as any;
+      const control = { epoch, version: head.version, digest: head.digest, kind: "reset" };
+      const r = await post(app(control), "/v1/delivery/sessions/reset", { account_id: await deliveryAccount(TENANT), request_id, confirmation: "DELETE ALL SESSIONS" });
+      if (r.status !== 200) throw new Error("reset fence " + r.status);
+      await post(app(), "/v1/custody/authority/complete", { ...control, outcome: ((await r.json()) as any).control.outcome });
+    };
+    /** The eraser's own login: every statement runs as bulls96_privacy_eraser. */
+    const asEraser: Queryable = {
+      query: async (t, p) => {
+        await f.db.exec("SET ROLE bulls96_privacy_eraser");
+        try {
+          return (await (p?.length ? f.db.query(t, p as never) : f.db.query(t))) as never;
+        } finally {
+          await f.db.exec("RESET ROLE");
+        }
+      },
+    };
+    return { f, app, post, reset, asEraser };
+  }
+  const allKeys = async (store: any) => {
+    const out: string[] = [];
+    let c: string | undefined;
+    do {
+      const p = await store.list(objectKey("96bulls"), c);
+      out.push(...p.items.map((i: any) => i.key));
+      c = p.nextCursor;
+    } while (c);
+    return out;
+  };
+
+  test("P0: a post-cutover session's live objects are erased after a Supabase-authority reset", async () => {
+    const w = await activeWorld();
+    const up = await w.post(w.app(), "/v1/delivery/batches", { protocolVersion: 1, batch: await batch([record({ record_id: "p1", session_id: "POSTCUT" })], { batch_id: "after-activation" }) });
+    expect(up.status).toBe(200);
+    const store = w.f.deps.target.store as any;
+    // Publication (canonical) writes the session's live objects and pointer in the m=srv_ layout; place them exactly
+    // there (liveTargets) for the real tenant/origin/session the target now owns.
+    const origin = (await (require("../../session-ingest/vendor/delivery/prepare.ts") as any).prepareDelivery(TENANT, await batch([record({ record_id: "x" })]))).originId as string;
+    const g = { org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, user_id: TENANT.userId, origin_id: origin, source: "claude", session_id: "POSTCUT" };
+    const t = liveTargets("96bulls", g);
+    const live = [`${t.base}d=2026/11/06/${t.sessionSegment}/manifest.json`, `${t.base}d=2026/11/06/${t.sessionSegment}/raw/0000000000-0-aa.ndjson.zst`, t.pointerKey];
+    for (const k of live) await store.put(objectKey(k), new TextEncoder().encode("x"));
+    await w.reset("wipe-1");
+    const q = (sql: string) => w.f.db.query(sql).then((r) => (r.rows[0] as any).n as number);
+    expect(await q("SELECT count(*)::int AS n FROM sessions.upload_deletions WHERE session_id='POSTCUT'")).toBe(1);
+    expect(await q("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_deletions WHERE session_id='POSTCUT'")).toBe(0);
+    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    open.push(() => state.close());
+    // Past the staged-object redrive window, so staged batch copies are erased in the same sweep.
+    const job = new ErasureJob(supabaseAuthority(w.f.queryable), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, () => Date.now() + 49 * 60 * 60 * 1000, async () => {});
+    await job.sweep();
+    const left = await allKeys(store);
+    for (const k of live) expect(left).not.toContain(k);
+  }, 60_000);
+
+  test("P1: the eraser login reads only through its RPCs; owner, superuser and other identities are refused", async () => {
+    const w = await activeWorld();
+    await w.reset("wipe-2");
+    const a = supabaseAuthority(w.asEraser);
+    await a.ready();
+    expect(Array.isArray(await a.fencedGroups())).toBe(true);
+    expect(Array.isArray(await a.fencedLivePage(null))).toBe(true);
+    await assertEraserIdentity(w.asEraser);
+    for (const t of ["sessions.ingest_frozen_source_deletions", "sessions.upload_deletions", "sessions.ingest_privacy_authority", "sessions.ingest_frozen_source_records"])
+      expect(await w.asEraser.query(`SELECT 1 FROM ${t} LIMIT 1`).then(() => "read", (e) => String(e.message))).toContain("permission denied");
+    for (const fn of ["sessions.ingest_privacy_authority_state()", "sessions.ingest_privacy_authority_owned_digest()"])
+      expect(await w.asEraser.query(`SELECT ${fn}`).then(() => "ran", (e) => String(e.message))).toContain("permission denied");
+    // The fixture's own connection is a superuser (the owner): refused.
+    expect(await assertEraserIdentity(w.f.queryable).then(() => "ok", (e) => e.code)).toBe("eraser_identity_superuser");
+    // The generated verifier accepts the bare role exactly as provisioned.
+    await w.f.db.exec(readFileSync(new URL("../../../supabase/bootstrap/privacy_eraser_verify.sql", import.meta.url), "utf8"));
+  }, 60_000);
 });

@@ -368,6 +368,11 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='frozen source: authority apply outside the authority begin';END IF;
  IF p_kind='selection' THEN
   v_origin:=p_payload->>'origin_id';v_enabled:=(p_payload->>'enabled')::boolean;
+  -- SP v2 analysis of exactly the disabled sessions (046000's session-scoped form), BEFORE their owned/frozen rows
+  -- are removed below (it reads them). Guarded: a no-op until the analysis lane's migration is applied.
+  IF NOT v_enabled AND to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,jsonb)') IS NOT NULL THEN
+   EXECUTE 'SELECT sessions.purge_session_analysis_for_owned($1,$2,$3)' USING p_org,p_user,p_payload->'sessions';
+  END IF;
   FOR item IN SELECT value FROM jsonb_array_elements(p_payload->'sessions') LOOP
    IF v_enabled THEN
     DELETE FROM sessions.ingest_frozen_source_deletions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user
@@ -590,3 +595,101 @@ BEGIN
   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
  RETURN jsonb_build_object('completed',true,'superseded',false);
 END $control_complete$;
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- The transcript eraser's least-privilege read surface (zero-Neon E3; independent dogpatch review P0/P1).
+--
+-- P0: under the Supabase authority, what a user deleted is the UNION of
+--   * sessions.ingest_frozen_source_deletions: Neon-era sessions, kept exactly as Neon kept deleted_upload_sessions;
+--   * sessions.upload_deletions: the target's own fences, written by the ordered fence for EVERY session (Neon-era
+--     and post-cutover uploads alike) on a disable or reset.
+-- A post-cutover session exists only in the second, so the eraser reads the deduplicated union.
+--
+-- P1: the eraser connects as bulls96_privacy_eraser (provisioned NOLOGIN by supabase/bootstrap/session_ingest_roles.sql,
+-- made LOGIN only by the operator phase privacy_eraser_role.sql). It holds EXECUTE on exactly these four SECURITY
+-- DEFINER functions and no table, column or sequence right (privacy_eraser_verify.sql), so the host that holds the
+-- destructive S3 key holds no owner or BYPASSRLS database credential. Every read refuses unless the authority is active.
+DO $eraser_role$
+DECLARE r pg_roles%ROWTYPE;
+BEGIN
+ SELECT * INTO r FROM pg_roles WHERE rolname='bulls96_privacy_eraser';
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='42704',MESSAGE='role bulls96_privacy_eraser does not exist; this migration does not create it',
+  HINT='Run supabase/bootstrap/session_ingest_roles.sql (or cloudsql_migration_roles.sql) first, then rerun.';END IF;
+ IF r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolinherit THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='role bulls96_privacy_eraser exists elevated';END IF;
+END $eraser_role$;
+
+CREATE FUNCTION sessions.ingest_privacy_eraser_state() RETURNS jsonb
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $eraser_state$
+ SELECT jsonb_build_object('active',EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority WHERE state='active'))
+$eraser_state$;
+
+CREATE FUNCTION sessions.ingest_privacy_eraser_require_active() RETURNS void
+LANGUAGE plpgsql STABLE SET search_path=pg_catalog,sessions,pg_temp AS $eraser_require$
+BEGIN
+ IF NOT EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority WHERE state='active') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: supabase privacy authority not active';END IF;
+END $eraser_require$;
+
+-- Every exported (org, session) group a deletion fence covers, bounded (overflow refuses the sweep, as on Neon).
+CREATE FUNCTION sessions.ingest_privacy_eraser_groups() RETURNS jsonb
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $eraser_groups$
+DECLARE v jsonb;n bigint;
+BEGIN
+ PERFORM sessions.ingest_privacy_eraser_require_active();
+ SELECT coalesce(jsonb_agg(jsonb_build_object('org_id',org_id,'session_id',session_id)),'[]'::jsonb),count(*) INTO v,n FROM(
+  SELECT org_id,session_id FROM sessions.ingest_frozen_source_deletions
+  UNION SELECT org_id,session_id FROM sessions.upload_deletions LIMIT 100001)g;
+ IF n>100000 THEN RAISE EXCEPTION USING ERRCODE='54000',MESSAGE='frozen source: too many fenced groups';END IF;
+ RETURN v;
+END $eraser_groups$;
+
+-- One keyset page of the deduplicated union of fenced (org, ws, user, origin, source, session), in C order.
+-- p: {"after": null | [org, ws, user, origin, source, session], "limit": 1..5000}
+CREATE FUNCTION sessions.ingest_privacy_eraser_page(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $eraser_page$
+DECLARE v_limit int;a jsonb;v jsonb;
+BEGIN
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['after','limit']);
+ IF jsonb_typeof(p->'limit') IS DISTINCT FROM 'number' OR p->>'limit'!~'^[1-9][0-9]{0,3}$' OR (p->>'limit')::int>5000 THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid eraser page limit';END IF;
+ v_limit:=(p->>'limit')::int;a:=p->'after';
+ IF a<>'null'::jsonb AND (jsonb_typeof(a)<>'array' OR jsonb_array_length(a)<>6
+   OR EXISTS(SELECT 1 FROM jsonb_array_elements(a) e WHERE jsonb_typeof(e)<>'string')) THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid eraser page cursor';END IF;
+ PERFORM sessions.ingest_privacy_eraser_require_active();
+ SELECT coalesce(jsonb_agg(jsonb_build_object('org_id',org_id,'workspace_id',workspace_id,'user_id',user_id,'origin_id',origin_id,
+   'source',source,'session_id',session_id) ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C",
+   origin_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"),'[]'::jsonb) INTO v FROM(
+  SELECT * FROM(
+   SELECT org_id,workspace_id,user_id,origin_id,source,session_id FROM sessions.ingest_frozen_source_deletions
+   UNION SELECT org_id,workspace_id,user_id,origin_id,source,session_id FROM sessions.upload_deletions)u
+  WHERE a='null'::jsonb OR (org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C",origin_id COLLATE "C",source COLLATE "C",session_id COLLATE "C")
+   > (a->>0,a->>1,a->>2,a->>3,a->>4,a->>5)
+  ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C",origin_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"
+  LIMIT v_limit)q;
+ RETURN v;
+END $eraser_page$;
+
+-- Re-read right before an erasure: still fenced in either set (a re-enable removes the row from both).
+CREATE FUNCTION sessions.ingest_privacy_eraser_still_fenced(p jsonb) RETURNS boolean
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $eraser_still$
+DECLARE g text[];
+BEGIN
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['org_id','workspace_id','user_id','origin_id','source','session_id']);
+ IF EXISTS(SELECT 1 FROM jsonb_each(p) e WHERE jsonb_typeof(e.value)<>'string') THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid eraser group';END IF;
+ PERFORM sessions.ingest_privacy_eraser_require_active();
+ g:=ARRAY[p->>'org_id',p->>'workspace_id',p->>'user_id',p->>'origin_id',p->>'source',p->>'session_id'];
+ RETURN EXISTS(SELECT 1 FROM sessions.ingest_frozen_source_deletions WHERE org_id=g[1] AND workspace_id=g[2] AND user_id=g[3]
+   AND origin_id=g[4] AND source=g[5] AND session_id=g[6])
+  OR EXISTS(SELECT 1 FROM sessions.upload_deletions WHERE org_id=g[1] AND workspace_id=g[2] AND user_id=g[3]
+   AND origin_id=g[4] AND source=g[5] AND session_id=g[6]);
+END $eraser_still$;
+
+REVOKE ALL ON FUNCTION sessions.ingest_privacy_eraser_state(),sessions.ingest_privacy_eraser_require_active(),
+ sessions.ingest_privacy_eraser_groups(),sessions.ingest_privacy_eraser_page(jsonb),sessions.ingest_privacy_eraser_still_fenced(jsonb)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+GRANT USAGE ON SCHEMA sessions TO bulls96_privacy_eraser;
+GRANT EXECUTE ON FUNCTION sessions.ingest_privacy_eraser_state(),sessions.ingest_privacy_eraser_groups(),
+ sessions.ingest_privacy_eraser_page(jsonb),sessions.ingest_privacy_eraser_still_fenced(jsonb) TO bulls96_privacy_eraser;

@@ -35,4 +35,13 @@ export const VERIFIERS: readonly VerifierTarget[] = [
     render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
     transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_project_events").replaceAll("session ingest", "canonical project events"),
   },
+  {
+    // The E3 transcript eraser under the Supabase privacy authority (20261105041000): only the four eraser read RPCs.
+    role: "bulls96_privacy_eraser",
+    path: "supabase/bootstrap/privacy_eraser_verify.sql",
+    template: "supabase/bootstrap/session_ingest_verify.sql",
+    pattern: /v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
+    render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
+    transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_privacy_eraser").replaceAll("session ingest", "privacy eraser"),
+  },
 ];

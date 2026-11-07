@@ -394,4 +394,19 @@ describe.skipIf(!url)("C3 privacy authority on actual PostgreSQL", () => {
       n2.release();
     }
   }, 30_000);
+
+  test("P1 on real PG: the eraser role reads only through its four RPCs, no table; the generated verifier passes", async () => {
+    const d = await database();
+    await d.owner("ingest_privacy_authority_fence", { controlEpoch: epoch });
+    await d.activateEmpty();
+    const e = await d.conn();
+    await e.query("SET ROLE bulls96_privacy_eraser");
+    for (const t of ["ingest_frozen_source_deletions", "upload_deletions", "ingest_privacy_authority", "ingest_frozen_source_owned_sessions"])
+      expect(((await settle(e.query(`SELECT 1 FROM sessions.${t} LIMIT 1`))) as { e?: string }).e).toContain("permission denied");
+    expect((await e.query("SELECT sessions.ingest_privacy_eraser_state() AS r")).rows[0].r).toEqual({ active: true });
+    expect((await e.query("SELECT sessions.ingest_privacy_eraser_page($1::jsonb) AS r", [JSON.stringify({ after: null, limit: 10 })])).rows[0].r).toEqual([]);
+    expect(((await settle(e.query("SELECT sessions.ingest_privacy_authority_state()"))) as { e?: string }).e).toContain("permission denied");
+    await e.query("RESET ROLE");
+    await d.pool.query(readFileSync(join(root, "supabase/bootstrap/privacy_eraser_verify.sql"), "utf8"));
+  }, 30_000);
 });
