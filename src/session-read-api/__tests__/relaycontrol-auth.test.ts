@@ -18,7 +18,7 @@ const config: AuthConfig = { origin: ORIGIN, relaycontrol: { url: "http://relayc
 
 function active(over: Record<string, unknown> = {}) {
   const now = Math.floor(Date.now() / 1000);
-  return { active: true, sub: "u-1", email: "a@example.test", org: "org-a", workspace: "ws-a", scopes: ["cli:auth", "rth:read"], machine_id: null, aud: ORIGIN, iat: now, exp: now + 600, token_id: "tokid_1", ...over };
+  return { active: true, sub: "u-1", email: "a@example.test", principal_type: "desktop-user", org: "org-a", workspace: "ws-a", scopes: ["cli:auth", "rth:read"], machine_id: null, aud: ORIGIN, iat: now, exp: now + 600, token_id: "tokid_1", ...over };
 }
 
 function stub(answer: (body: { aud: string; workspace?: string }) => Response | Promise<Response>) {
@@ -64,8 +64,15 @@ describe("readApiVerifier with relaycontrol", () => {
     const cases: Record<string, [() => Response | never, string]> = {
       inactive: [() => Response.json({ active: false }), "401 unauthorized"],
       aud: [() => Response.json(active({ aud: "https://history.example.test" })), "401 unauthorized"],
+      audEquivalent: [() => Response.json(active({ aud: "HTTPS://READ.example.test/" })), "admitted"],
       workspace: [() => Response.json(active({ workspace: "ws-b" })), "401 unauthorized"],
-      rc401: [() => new Response("", { status: 401 }), "401 unauthorized"],
+      agentPrincipal: [() => Response.json(active({ principal_type: "agent" })), "401 unauthorized"],
+      noPrincipal: [() => Response.json(active({ principal_type: undefined })), "401 unauthorized"],
+      rc400: [() => new Response("", { status: 400 }), "401 unauthorized"],
+      // Our introspection secret is wrong: an outage, never a token refusal.
+      rc401: [() => new Response("", { status: 401 }), "503 relaycontrol_unavailable"],
+      rc302: [() => new Response(null, { status: 302, headers: { location: "http://elsewhere.test/" } }), "503 relaycontrol_unavailable"],
+      oversized: [() => Response.json({ active: false, reason: "x".repeat(17 * 1024) }), "503 relaycontrol_unavailable"],
       rc500: [() => new Response("", { status: 500 }), "503 relaycontrol_unavailable"],
       malformed: [() => new Response("nope"), "503 relaycontrol_unavailable"],
       network: [() => { throw new TypeError("fetch failed"); }, "503 relaycontrol_unavailable"],

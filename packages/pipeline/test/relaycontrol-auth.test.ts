@@ -50,7 +50,7 @@ function assertionJwt() {
 function active(overrides: Record<string, unknown> = {}) {
   const now = Math.floor(Date.now() / 1000);
   return {
-    active: true, sub: USER, email: "a@example.test", org: ORG, workspace: WORKSPACE,
+    active: true, sub: USER, email: "a@example.test", principal_type: "desktop-user", org: ORG, workspace: WORKSPACE,
     scopes: ["cli:auth", "rth:read", "rth:sync"], machine_id: null, aud: ORIGIN,
     iat: now, exp: now + 3600, token_id: "tokid_synthetic_1", ...overrides,
   };
@@ -137,12 +137,13 @@ describe("flag on", () => {
     expect(jwksCalls()).toHaveLength(0);
   });
 
-  it("sends the configured secret, the token, aud and workspace, with redirect error and a timeout signal", async () => {
+  it("sends the configured secret, the token, aud and workspace, with redirect manual (never error, which workerd rejects) and a timeout signal", async () => {
     await app()(TOKEN);
     const [[url, init]] = introspectCalls() as [[string, RequestInit]];
     expect(url).toBe(INTROSPECT_URL);
     expect(init.method).toBe("POST");
-    expect(init.redirect).toBe("error");
+    expect(init.redirect).toBe("manual");
+    expect(init.redirect).not.toBe("error");
     expect(init.signal).toBeInstanceOf(AbortSignal);
     expect(new Headers(init.headers).get("authorization")).toBe(`Bearer ${SECRET}`);
     expect(JSON.parse(String(init.body))).toEqual({ token: TOKEN, aud: ORIGIN, workspace: WORKSPACE });
@@ -175,25 +176,50 @@ describe("flag on", () => {
     expect(await code(response)).toBe("forbidden");
   });
 
-  it("accepts and ignores principal_type, known or not", async () => {
-    for (const principal_type of ["desktop-user", "something-new", undefined]) {
+  it("admits only principal_type desktop-user; agent, new or missing principals are 401 (reason in logs only)", async () => {
+    for (const principal_type of ["agent", "something-new", "Desktop-User", "", null, undefined]) {
       resetSharedRelaycontrolIntrospectors();
+      logged = [];
       introspect = () => Response.json(active({ principal_type }));
-      expect((await app()(TOKEN)).status).toBe(200);
+      const response = await app()(TOKEN);
+      expect(`${String(principal_type)}: ${response.status}`).toBe(`${String(principal_type)}: 401`);
+      const text = await response.text();
+      expect(text).toContain("unauthorized");
+      expect(text).not.toContain("wrong-principal");
+      expect(logged.join("\n")).toContain("wrong-principal");
     }
+    resetSharedRelaycontrolIntrospectors();
+    introspect = () => Response.json(active({ principal_type: "desktop-user" }));
+    expect((await app()(TOKEN)).status).toBe(200);
   });
 
-  it("refuses inactive, wrong aud, workspace mismatch, expired, and relaycontrol 401/400 (401 unauthorized)", async () => {
+  it("matches an equivalently written aud (case, trailing slash, default port) and refuses a different origin", async () => {
+    for (const aud of [`${ORIGIN}/`, "HTTPS://History.Example.Test", "https://history.example.test:443", "https://history.example.test/"]) {
+      resetSharedRelaycontrolIntrospectors();
+      introspect = () => Response.json(active({ aud }));
+      expect(`${aud}: ${(await app()(TOKEN)).status}`).toBe(`${aud}: 200`);
+    }
+    for (const aud of ["https://history.other.test", "http://history.example.test", "https://history.example.test:8443", "not a url", "https://user@history.example.test"]) {
+      resetSharedRelaycontrolIntrospectors();
+      introspect = () => Response.json(active({ aud }));
+      expect(`${aud}: ${(await app()(TOKEN)).status}`).toBe(`${aud}: 401`);
+    }
+    // Our configured origin is normalized the same way.
+    resetSharedRelaycontrolIntrospectors();
+    introspect = () => Response.json(active({ aud: ORIGIN }));
+    expect((await app()(TOKEN, { RELAYHISTORY_ORIGIN: "https://HISTORY.example.test/" })).status).toBe(200);
+  });
+
+  it("refuses inactive, wrong aud, workspace mismatch, expired, and relaycontrol 400 (401 unauthorized)", async () => {
     const cases: Record<string, Handler> = {
       ...Object.fromEntries(
         ["expired", "revoked", "unknown", "wrong-kind", "audience", "workspace", "machine_not_owned", "machine_unclaimed", "machine_workspace_mismatch", undefined]
           .map((reason) => [`inactive:${reason}`, () => Response.json({ active: false, ...(reason ? { reason } : {}) })]),
       ),
       audOther: () => Response.json(active({ aud: "https://history.other.test" })),
-      audSlash: () => Response.json(active({ aud: `${ORIGIN}/` })),
+      audOtherSlash: () => Response.json(active({ aud: "https://history.other.test/" })),
       workspace: () => Response.json(active({ workspace: "ws_other" })),
       expired: () => Response.json(active({ exp: Math.floor(Date.now() / 1000) - 1 })),
-      status401: () => new Response("no", { status: 401 }),
       status400: () => new Response("bad", { status: 400 }),
     };
     for (const [name, handler] of Object.entries(cases)) {
@@ -236,7 +262,9 @@ describe("flag on", () => {
     const cases: Record<string, Handler> = {
       timeout: () => { throw timeout; },
       network: () => { throw new TypeError("fetch failed"); },
+      status401BadSecret: () => new Response("no", { status: 401 }),
       status404Disabled: () => new Response("not found", { status: 404 }),
+      oversized: () => Response.json({ active: false, reason: "x".repeat(17 * 1024) }),
       status500: () => new Response("down", { status: 500 }),
       status503: () => new Response("down", { status: 503 }),
       status302: () => new Response(null, { status: 302 }),
@@ -377,7 +405,7 @@ describe("the introspector directly", () => {
     expect((await introspector.verifyRelaycontrolToken(TOKEN, req)).scopes).toEqual(["rth:read", "rth:sync"]);
   });
 
-  it("caches a refusal for at most 5 s and never a relaycontrol 401", async () => {
+  it("caches a refusal for at most 5 s, and never a relaycontrol 401 (unavailable: our secret)", async () => {
     let body: unknown = { active: false };
     const { introspector, calls, tick } = make(() => Response.json(body));
     await expect(introspector.verifyRelaycontrolToken(TOKEN, req)).rejects.toBeInstanceOf(RelaycontrolRejectedError);
@@ -389,9 +417,35 @@ describe("the introspector directly", () => {
     expect(calls).toHaveLength(2);
 
     const second = make(() => new Response("", { status: 401 }));
-    await expect(second.introspector.verifyRelaycontrolToken(TOKEN, req)).rejects.toBeInstanceOf(RelaycontrolRejectedError);
-    await expect(second.introspector.verifyRelaycontrolToken(TOKEN, req)).rejects.toBeInstanceOf(RelaycontrolRejectedError);
+    await expect(second.introspector.verifyRelaycontrolToken(TOKEN, req)).rejects.toMatchObject({ name: "RelaycontrolUnavailableError", reason: "introspect_unauthorized" });
+    await expect(second.introspector.verifyRelaycontrolToken(TOKEN, req)).rejects.toBeInstanceOf(RelaycontrolUnavailableError);
     expect(second.calls).toHaveLength(2);
+  });
+
+  it("times out a relaycontrol that never answers (real AbortSignal timeout, 503)", async () => {
+    const { introspector } = make((_body, init) => new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+    }), { timeoutMs: 20 });
+    await expect(introspector.verifyRelaycontrolToken(TOKEN, req)).rejects.toMatchObject({ name: "RelaycontrolUnavailableError", reason: "timeout" });
+  });
+
+  it("refuses a response over 16 KiB, declared or streamed, as response_too_large (503)", async () => {
+    const big = JSON.stringify({ ...active({ iat: at(0), exp: at(3600) }), pad: "x".repeat(16 * 1024) });
+    const streamed = () => new Response(new ReadableStream({
+      start(controller) {
+        for (let i = 0; i < big.length; i += 1024) controller.enqueue(new TextEncoder().encode(big.slice(i, i + 1024)));
+        controller.close();
+      },
+    }), { status: 200 });
+    const declared = () => new Response("{}", { status: 200, headers: { "content-length": String(64 * 1024) } });
+    for (const handler of [streamed, declared, () => new Response(big, { status: 200 })]) {
+      const { introspector } = make(handler);
+      await expect(introspector.verifyRelaycontrolToken(TOKEN, req)).rejects.toMatchObject({ name: "RelaycontrolUnavailableError", reason: "response_too_large" });
+    }
+    // Just under the cap still parses.
+    const fits = JSON.stringify(active({ iat: at(0), exp: at(3600) }));
+    const { introspector } = make(() => new Response(fits.slice(0, -1) + `,"pad":"${"x".repeat(16 * 1024 - fits.length - 9)}"}`, { status: 200 }));
+    await expect(introspector.verifyRelaycontrolToken(TOKEN, req)).resolves.toMatchObject({ userId: USER });
   });
 
   it("does not cache unavailability", async () => {

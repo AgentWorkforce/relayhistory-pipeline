@@ -16,16 +16,23 @@
  *   400 = malformed body; 401 = our secret is wrong or missing; 404 =
  *   introspection disabled on relaycontrol.
  *
- * Fail closed: a timeout, network error, 404, 5xx, or a body that is not the
+ * Fail closed: a timeout, network error, a 3xx (never followed: the fetch
+ * uses `redirect: "manual"`, the only non-following mode workerd supports),
+ * relaycontrol's 401 (our introspection secret is wrong: a deployment fault,
+ * not the caller's), 404, 5xx, a body over 16 KiB, or a body that is not the
  * contract shape is RelaycontrolUnavailableError (the caller answers 503
- * `relaycontrol_unavailable`, retryable); `active:false` (any reason), an
- * audience, workspace or machine mismatch, and relaycontrol's 401/400 are
- * RelaycontrolRejectedError (401, generic code; the reason goes to the log
- * only). The response's org, workspace and scopes are the only source of
- * identity: `workspace` in the request is optional, and when it is sent the
- * response must echo it exactly; either way the AuthContext's workspace is the
- * response's. Token material is never logged, cached in clear or echoed: the
- * cache key is sha256(token), and logs carry `token_id` only.
+ * `relaycontrol_unavailable`, retryable); `active:false` (any reason), a
+ * principal_type other than "desktop-user", an audience, workspace or machine
+ * mismatch, and relaycontrol's 400 are RelaycontrolRejectedError (401, generic
+ * code; the reason goes to the log only). The audience is compared as a
+ * normalized origin on both sides (lowercased scheme and host, no path or
+ * trailing slash, an explicit non-default port kept), as relaycontrol matches
+ * it, because relaycontrol echoes its configured spelling. The response's
+ * org, workspace and scopes are the only source of identity: `workspace` in
+ * the request is optional, and when it is sent the response must echo it
+ * exactly; either way the AuthContext's workspace is the response's. Token
+ * material is never logged, cached in clear or echoed: the cache key is
+ * sha256(token), and logs carry `token_id` only.
  *
  * Machine verification (v1.1, AlleyOop courier surface only): the caller's
  * claimed machine id (the request's X-Machine-Id) is forwarded as `machine`,
@@ -50,6 +57,10 @@ export const RELAYCONTROL_SCOPE_ALLOWLIST: Readonly<Record<string, string>> =
 export const RELAYCONTROL_TOKEN_SUBJECT = "relaycontrol_user_access_token";
 /** relaycontrol's NODE_ID_PATTERN: a claimed machine id it would not answer 400 to. */
 export const RELAYCONTROL_MACHINE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
+/** The only principal this service admits; relaycontrol also issues e.g. "agent". */
+export const RELAYCONTROL_PRINCIPAL_TYPE = "desktop-user";
+/** Introspection responses larger than this are refused unread (503). */
+export const RELAYCONTROL_MAX_RESPONSE_BYTES = 16 * 1024;
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_POSITIVE_TTL_MS = 60_000;
@@ -112,7 +123,7 @@ export interface RelaycontrolIntrospectorOptions {
 }
 
 export interface RelaycontrolRequest {
-  /** This service's configured origin, sent as `aud` and required back verbatim. */
+  /** This service's configured origin, sent as `aud`; the echo must be the same normalized origin. */
   aud: string;
   /**
    * The workspace the request claims to target, when the caller knows it.
@@ -169,6 +180,57 @@ const WORKSPACE_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/;
 /** The request-side workspace a caller may name: a bounded id, nothing else. */
 export function isWorkspaceId(value: unknown): value is string {
   return typeof value === "string" && WORKSPACE_SHAPE.test(value);
+}
+
+/**
+ * The audience as relaycontrol compares it (its `normalizedOrigin`): the URL
+ * origin, so scheme and host are lowercased, any path or trailing slash is
+ * dropped, a default port is dropped and an explicit non-default port kept.
+ * Null for anything that is not a credential-free http(s) URL.
+ */
+export function normalizedAudience(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    if (url.username || url.password) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read at most `limit` bytes of a response body; null when it is larger (the
+ * rest is cancelled, never buffered). A declared Content-Length over the limit
+ * is refused before reading.
+ */
+async function readCapped(response: Response, limit: number): Promise<string | null> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) {
+    await response.body?.cancel().catch(() => {});
+    return null;
+  }
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 async function sha256Hex(text: string): Promise<string> {
@@ -250,7 +312,9 @@ export function createRelaycontrolIntrospector(
           ...(request.workspace !== undefined ? { workspace: request.workspace } : {}),
           ...(request.machine !== undefined ? { machine: request.machine } : {}),
         }),
-        redirect: "error",
+        // workerd rejects "error"; "manual" never follows, and a 3xx is a
+        // non-200, so it maps to 503 below.
+        redirect: "manual",
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
@@ -259,15 +323,24 @@ export function createRelaycontrolIntrospector(
         name === "TimeoutError" || name === "AbortError" ? "timeout" : "network_error",
       );
     }
-    if (response.status === 401 || response.status === 400) {
-      // 401: our introspection secret is wrong (a deployment error); 400: a
-      // malformed request body. Neither admits the caller; neither is cached.
+    if (response.status === 401) {
+      // Our introspection secret is wrong or missing: a deployment fault that
+      // says nothing about the caller's token, so an outage (503), never a 401
+      // that would tell clients to discard a valid token.
+      await response.body?.cancel().catch(() => {});
+      log("error", "relaycontrol introspection refused our service secret", {
+        status: 401,
+      });
+      throw new RelaycontrolUnavailableError("introspect_unauthorized");
+    }
+    if (response.status === 400) {
+      // A malformed request body: does not admit the caller; not cached.
       await response.body?.cancel().catch(() => {});
       log("error", "relaycontrol introspection refused our request", {
-        status: response.status,
+        status: 400,
       });
       return {
-        outcome: { ok: false, reason: `relaycontrol_${response.status}` },
+        outcome: { ok: false, reason: "relaycontrol_400" },
         ttlMs: 0,
       };
     }
@@ -276,9 +349,16 @@ export function createRelaycontrolIntrospector(
       await response.body?.cancel().catch(() => {});
       throw new RelaycontrolUnavailableError(`status_${response.status}`);
     }
+    let text: string | null;
+    try {
+      text = await readCapped(response, RELAYCONTROL_MAX_RESPONSE_BYTES);
+    } catch {
+      throw new RelaycontrolUnavailableError("network_error");
+    }
+    if (text === null) throw new RelaycontrolUnavailableError("response_too_large");
     let body: Record<string, unknown>;
     try {
-      const parsed: unknown = await response.json();
+      const parsed: unknown = JSON.parse(text);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
         throw new Error("not an object");
       body = parsed as Record<string, unknown>;
@@ -309,11 +389,19 @@ export function createRelaycontrolIntrospector(
       typeof body.iat !== "number" ||
       !Number.isFinite(body.iat) ||
       !(body.machine_id === null || body.machine_id === undefined || typeof body.machine_id === "string") ||
-      !(body.principal_type === undefined || typeof body.principal_type === "string")
+      !(body.email === undefined || body.email === null || typeof body.email === "string")
     )
       throw new RelaycontrolUnavailableError("malformed_response");
-    // The response audience is the matched origin echoed back: exactly ours.
-    if (body.aud !== request.aud)
+    // Only desktop users; an "agent" (or any new or absent) principal is refused.
+    if (body.principal_type !== RELAYCONTROL_PRINCIPAL_TYPE)
+      return {
+        outcome: { ok: false, reason: "wrong-principal", tokenId },
+        ttlMs: negativeTtlMs,
+      };
+    // relaycontrol echoes its configured spelling of the matched audience:
+    // compare normalized origins, as it does.
+    const echoed = normalizedAudience(body.aud);
+    if (echoed === null || echoed !== normalizedAudience(request.aud))
       return {
         outcome: { ok: false, reason: "aud_mismatch", tokenId },
         ttlMs: negativeTtlMs,

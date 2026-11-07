@@ -91,21 +91,30 @@ keep their path unchanged either way.
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
   RelayAuth and never to relaycontrol.
 - **Binding.** `aud` is `RELAYHISTORY_ORIGIN` at the ingest and
-  `READ_API_ORIGIN` at the read API, and relaycontrol must echo exactly that
-  origin. A workspace the request names (the ingest's
+  `READ_API_ORIGIN` at the read API, and relaycontrol must echo the same
+  origin, compared normalized on both sides as relaycontrol matches it
+  (scheme and host lowercased, a trailing slash or path dropped, an explicit
+  non-default port kept): `https://History.example/` matches
+  `https://history.example`, a different scheme, host or port does not. A workspace the request names (the ingest's
   `x-relayhistory-workspace-id` header, the read API's single `workspace=`
   query) is sent along and relaycontrol must return exactly that workspace;
   with none, `workspace` is omitted. Either way the org and workspace come only
   from relaycontrol's answer. A malformed workspace is refused without a call.
+- **Principal.** Only `principal_type: "desktop-user"` is admitted; any other
+  principal (relaycontrol's `agent` tokens, a new type) or none is 401, reason
+  `wrong-principal` in logs only.
 - **Scopes.** Only `rth:read` and `rth:sync` are granted; `cli:auth` and
   anything else grant nothing.
 - **Fail closed.** Inactive (any reason, including the machine reasons
-  below), aud, workspace or machine mismatch, expired, or relaycontrol
-  answering 401/400 (our secret or request refused): 401 `unauthorized`, with
-  the reason in logs only. Timeout (5 s), network error, 404 (introspection
-  disabled on relaycontrol), 5xx, a redirect, or malformed JSON: 503
-  `relaycontrol_unavailable` with
-  `Retry-After: 1`. The flag on with the URL, secret or origin missing: 401
+  below), wrong principal, aud, workspace or machine mismatch, expired, or
+  relaycontrol answering 400 (our request refused): 401 `unauthorized`, with
+  the reason in logs only. Timeout (5 s), network error, relaycontrol 401 (our
+  introspection secret is wrong: a deployment fault, logged as
+  `introspect_unauthorized`, never a token refusal), 404 (introspection
+  disabled on relaycontrol), 5xx, a redirect (never followed: the fetch uses
+  `redirect: "manual"`, the mode workerd supports), a response body over
+  16 KiB (`response_too_large`, refused unparsed), or malformed JSON: 503
+  `relaycontrol_unavailable` with `Retry-After: 1`. The flag on with the URL, secret or origin missing: 401
   `auth_not_configured` (read API: `not_configured`). With the flag on and both
   values set, the ingest starts without any RelayAuth key source.
 - **Cache and revocation lag.** Answers are cached in memory per
