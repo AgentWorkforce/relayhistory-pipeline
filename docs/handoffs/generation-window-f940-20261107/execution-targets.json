@@ -7,10 +7,43 @@
   "capturedPlanSha256": "9f18fc767ca002522060e53012e861411dc52c7b90d77172254d30cafc4d3100",
   "capturedCaptureSha256": "f561d85d2b422c5fc0bcc07ff4bede94e071d086d89dcb8c71752c045dcf33e0",
   "lastRetainedG1": "78c7b28e5ebce7f5f534a1f3f41a55845251e950b6c4c49f676f2bda358c91d6",
-  "freshG1MarkerPolicyAdmissionsProof": null,
-  "preWindowRoleAttributesMembershipSettingsProof": null,
-  "privilegedBootstrapAuthorizationIfNeeded": null,
-  "full21MigrationRehearsalAndMeasuredOutageBudget": null,
+  "freshG1MarkerPolicyAdmissionsProof": {
+    "status": "OBSERVED_READONLY_2026-11-07T19:21:51.808Z",
+    "receipt": "g1-census.json",
+    "sha256": "71e19b00e7503440259ed1d0dcf9e0ebb40cc8a09a75103d9900f83f461a52fe",
+    "markerPassAtG1": true,
+    "policyAtG1AndUnexpired": true,
+    "admissionsAtG1": 1028,
+    "unexpectedAdmissions": 0,
+    "refreshBeforeWindow": true
+  },
+  "preWindowRoleAttributesMembershipSettingsProof": {
+    "status": "HOLD_FOUR_REQUIRED_ROLES_MISSING",
+    "receipt": "fixed-role-inventory.json",
+    "sha256": "8b783e760171d2a9f9b9526002c5d968cf06c08ff169517a32a4d3b5588f7c4e",
+    "scope": "catalog attributes/memberships/settings only; not full effective privileges/phase2 proof",
+    "missing": [
+      "bulls96_canonical_feature_producer",
+      "bulls96_project_events",
+      "bulls96_privacy_eraser",
+      "bulls96_babysitter_retention"
+    ]
+  },
+  "privilegedBootstrapAuthorizationIfNeeded": {
+    "status": "REQUIRED_NOT_AUTHORIZED_OR_RUN",
+    "receipt": "bootstrap-prerequisite.json",
+    "sha256": "f9e4d9c97c60f77af58341ce81b742f80843422743977b3eb2a1013d1dccfb28",
+    "scriptSha256": "c957ae416d707d471b576bea93dee07f2035fb8b930bacaff4207d63ffc0b478"
+  },
+  "full21MigrationRehearsalAndMeasuredOutageBudget": {
+    "fixtureStatus": "PASS_21_SCHEMA_5_PHASE2",
+    "summary": "rehearsal-summary.json",
+    "summarySha256": "213962668c8c63ecc1a4503f09cc460af35746bb054ce87eab4a5df667ea779c",
+    "result": "window21-rehearsal-result.json",
+    "resultSha256": "058f617f93ae0175f71459277959157da0afb81675421f0a0d6159de1c1fc0c8",
+    "applyWallMs": 2893.33557,
+    "productionOutageBudget": "MISSING_RUNTIME_REPLACEMENT_AND_PRODUCTION_DATA_TIMING"
+  },
   "preWindowTrafficGcHealthEvidence": null,
   "worker": {
     "candidateSource": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
@@ -51,5 +84,30 @@
     "reviewedDeploymentCaptures": null
   },
   "approvalQuotePlaceholder": "FINAL_EXECUTION_TARGETS_SHA256 is computed only after all readiness slots are resolved; do not use this draft digest as a substitute",
-  "productionWritesPerformed": false
+  "productionWritesPerformed": false,
+  "missingRuntimeAndHealthPins": [
+    "preWindowTrafficGcHealthEvidence",
+    "worker.currentDeployedSourceAndVersion",
+    "worker.compatibilityDeltaReview",
+    "worker.semanticInputsSha256",
+    "worker.nativePlanSha256",
+    "worker.provenanceSha256",
+    "worker.bundleSha256",
+    "worker.qualifiedMemoryBroker",
+    "bufferedGc.zipSha256",
+    "bufferedGc.immutableS3Version",
+    "bufferedGc.currentTemplateAndPreservedParametersProof",
+    "bufferedGc.reviewedChangeSetIdAndSha256",
+    "bufferedGc.currentAwsOperatorIdentityAndWrapperPin",
+    "publisherAndPublicationGc.activeRuntimeInventory",
+    "publisherAndPublicationGc.host",
+    "publisherAndPublicationGc.launcher",
+    "publisherAndPublicationGc.managedRoleProfile",
+    "publisherAndPublicationGc.preservedEnablement",
+    "publisherAndPublicationGc.artifactSha256",
+    "publisherAndPublicationGc.reviewedReplacementCommand",
+    "otherGenerationBoundConsumers.indexerAndSessionPipelineInventory",
+    "otherGenerationBoundConsumers.replacementOrDocumentedInactiveDecision",
+    "otherGenerationBoundConsumers.reviewedDeploymentCaptures"
+  ]
 }

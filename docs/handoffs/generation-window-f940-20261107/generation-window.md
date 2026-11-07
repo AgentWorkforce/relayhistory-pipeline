@@ -248,3 +248,8 @@ Commands and fields were checked at f9409ccb in:
 - Exact pending migration sources and bootstrap files listed in section7.
 
 All artifact and deployment HOLDs are explicit in execution-targets.json. No source/SQL was modified for this draft, and no production write or approval file was created. The attached plan/capture bytes preserve their original SHA256.
+
+
+## Supporting evidence update (19:23Z)
+
+See [supporting-readiness.md](supporting-readiness.md) and the raw receipt hashes in MANIFEST.json. The fresh census confirms G1 marker/policy/all 1,028 admissions. Four required roles are missing and need a separately authorized exact bare bootstrap before apply; no production bootstrap ran. The full owned PostgreSQL 17.11 fixture passed all 21 schema files and five phase-two verifiers, actual generation rebind and custody ACK checks; apply cost was 2.893 seconds on synthetic data. This does not resolve production data/lock cost or runtime replacement time, and is not a live outage budget. execution-targets.json retains HOLD with explicit missing runtime/health pins and the bootstrap authorization gap. The initial source commands/approval template above remain a draft until those gaps are resolved and a fresh plan/capture is bound.

@@ -1,14 +1,14 @@
 {
   "version": 1,
-  "at": "2026-11-07T19:01:53.523958+00:00",
-  "kind": "source_only_generation_window_draft",
+  "at": "2026-11-07T19:25:44.818641+00:00",
+  "kind": "source_plan_and_readonly_fixture_evidence",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
-  "readiness": "HOLD; complete live target and prerequisite evidence before approval",
+  "readiness": "HOLD: four roles missing; privileged bootstrap not authorized/run; runtime/live outage pins missing",
   "files": [
     {
       "name": "generation-window.md",
-      "bytes": 31301,
-      "sha256": "3a687532d7ca518dc498a0ac395aae8679f51488aa243ed861629e28ee0fe149"
+      "bytes": 32188,
+      "sha256": "41244e9cf9db34494d9664b3cc33f621b354e89614e8096b5d7c23862213c83b"
     },
     {
       "name": "readonly-plan.json",
@@ -27,8 +27,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 2323,
-      "sha256": "481ad94a377262d43f62f69f9b3cec9c7a64807b68447cac4316af50f7c10fc9"
+      "bytes": 4918,
+      "sha256": "4ef15792135663edd8d89ffd524359f65d3cf05102d3fab8ffb49946310895d3"
     },
     {
       "name": "source-evidence.json",
@@ -37,8 +37,58 @@
     },
     {
       "name": "review-notes.md",
-      "bytes": 1637,
-      "sha256": "1f688c36e446a6a4b1e161404ee93db94bdddc0967e69ec3df37b14ef26c6726"
+      "bytes": 3330,
+      "sha256": "e74c761ab1e58aa5dea9297a37851ed91258d0db31ed3549dc2075987a8b5ef5"
+    },
+    {
+      "name": "supporting-readiness.md",
+      "bytes": 10922,
+      "sha256": "2bf13916a0d68107a65a5972827176bce71f478e9790b1a33b90a811931c0782"
+    },
+    {
+      "name": "g1-census.json",
+      "bytes": 1851,
+      "sha256": "71e19b00e7503440259ed1d0dcf9e0ebb40cc8a09a75103d9900f83f461a52fe"
+    },
+    {
+      "name": "g1-census-readonly.ts.txt",
+      "bytes": 5582,
+      "sha256": "42c3c8a34ac628f3ee7e277401791d4f49f4223084c69761397c2ee12476d6c7"
+    },
+    {
+      "name": "fixed-role-inventory.json",
+      "bytes": 11178,
+      "sha256": "8b783e760171d2a9f9b9526002c5d968cf06c08ff169517a32a4d3b5588f7c4e"
+    },
+    {
+      "name": "fixed-role-inventory-readonly.ts.txt",
+      "bytes": 10708,
+      "sha256": "36b214ea191c16ddfeba91c8b52c5323b0dc525e2f573be3d8eb2e4e3fb0a81f"
+    },
+    {
+      "name": "bootstrap-prerequisite.json",
+      "bytes": 1293,
+      "sha256": "f9e4d9c97c60f77af58341ce81b742f80843422743977b3eb2a1013d1dccfb28"
+    },
+    {
+      "name": "session_ingest_roles.sql.txt",
+      "bytes": 4771,
+      "sha256": "c957ae416d707d471b576bea93dee07f2035fb8b930bacaff4207d63ffc0b478"
+    },
+    {
+      "name": "window21-rehearsal-result.json",
+      "bytes": 15563,
+      "sha256": "058f617f93ae0175f71459277959157da0afb81675421f0a0d6159de1c1fc0c8"
+    },
+    {
+      "name": "window21-rehearsal.ts.txt",
+      "bytes": 20530,
+      "sha256": "feba9f9679b0a237e2191ab639430d89c4f4dd0f42604c172eee356c6401e40f"
+    },
+    {
+      "name": "rehearsal-summary.json",
+      "bytes": 2245,
+      "sha256": "213962668c8c63ecc1a4503f09cc460af35746bb054ce87eab4a5df667ea779c"
     }
   ]
 }
