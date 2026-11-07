@@ -6,8 +6,10 @@
  *   analysis_read_v1          SECURITY DEFINER; EXECUTE to bulls96_read_api
  *   session_analysis_v2_forget  erasure trigger; SECURITY DEFINER; owner-only
  *   session_analysis_admit_scope      admit role + tenant pin; not SECURITY DEFINER; owner-only
- *   session_analysis_source_revision  live pointer-set revision; EXECUTE to service_role (worker)
+ *   session_analysis_source_revision  pointer-set + proof-input revision; SECURITY DEFINER; EXECUTE to service_role (worker)
  *   session_analysis_neon_free        never-in-Neon proof; EXECUTE to service_role (worker)
+ *   session_analysis_require_caller   caller pin for the definers; not SECURITY DEFINER; owner-only
+ *   purge_session_analysis_for_owned  C3 reset/disable purge of the user's owned set; SECURITY DEFINER; owner-only
  */
 import type { LaneManifest } from "../types.ts";
 
@@ -25,6 +27,8 @@ export const analysisJobs: LaneManifest = {
     "sessions.session_analysis_admit_scope(",
     "sessions.session_analysis_source_revision(",
     "sessions.session_analysis_neon_free(",
+    "sessions.purge_session_analysis_for_owned(",
+    "sessions.session_analysis_require_caller(",
   ],
   grantSources: [{ path: MIGRATION, roles: ["bulls96_read_api", "bulls96_analysis_admit", "service_role"] }],
   functions: {
@@ -33,8 +37,11 @@ export const analysisJobs: LaneManifest = {
     "sessions.analysis_request_v1(text,text,text,text)": { secdef: true, grants: ["bulls96_analysis_admit"] },
     "sessions.session_analysis_v2_forget()": { secdef: true, grants: [] },
     "sessions.session_analysis_admit_scope(text,text)": { secdef: false, grants: [] },
-    "sessions.session_analysis_source_revision(text,text,text)": { secdef: false, grants: ["service_role"] },
+    "sessions.session_analysis_source_revision(text,text,text)": { secdef: true, grants: ["service_role"] },
     "sessions.session_analysis_neon_free(text,text,text)": { secdef: true, grants: ["service_role"] },
+    "sessions.purge_session_analysis_for_owned(text,text,jsonb)": { secdef: true, grants: [] },
+    "sessions.purge_session_analysis_for_owned(text,text)": { secdef: true, grants: [] },
+    "sessions.session_analysis_require_caller(text[])": { secdef: false, grants: [] },
   },
   replaces: {},
 };

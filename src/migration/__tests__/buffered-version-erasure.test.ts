@@ -48,3 +48,23 @@ for(const [name,xml] of [
  await expect(eraser.eraseObjectExcept(key,"barrier")).rejects.toMatchObject({code:"erasure_inventory"});
  expect(deletes).toBe(0);
 });
+
+test("eraseVersion: deletes exactly the writer's own version id, never the successor's", async () => {
+  const f = fixture([{ id: "successor" }, { id: "mine", latest: true }, { id: "other-key", key: key + "-sibling" }]);
+  expect(await f.eraser.eraseVersion(key, "mine")).toBe("gone");
+  expect(f.deleted).toEqual(["mine"]);
+});
+test("eraseVersion keepIfSole: the sole object version (a successor may publish it) is kept; a shadowed one is deleted", async () => {
+  const sole = fixture([{ id: "mine", latest: true }, { id: "m", marker: true }]);
+  expect(await sole.eraser.eraseVersion(key, "mine", { keepIfSole: true })).toBe("kept_sole");
+  expect(sole.deleted).toEqual([]);
+  const shadowed = fixture([{ id: "mine", latest: true }, { id: "successor" }]);
+  expect(await shadowed.eraser.eraseVersion(key, "mine", { keepIfSole: true })).toBe("gone");
+  expect(shadowed.deleted).toEqual(["mine"]);
+});
+test("eraseVersion refuses an empty or 'null' version id before any read or delete", async () => {
+  const f = fixture([{ id: "x", latest: true }]);
+  for (const id of ["", "null"]) await expect(f.eraser.eraseVersion(key, id)).rejects.toMatchObject({ code: "erasure_version_id" });
+  expect(f.reads()).toBe(0);
+  expect(f.deleted).toEqual([]);
+});
