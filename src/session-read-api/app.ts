@@ -678,7 +678,8 @@ export function createReadApi(deps: ReadApiDeps) {
         if (all.length > 1) return c.json({ error: { code: "invalid_delivery", message: "Repeated delivery filters are unsupported" }, correlationId }, 400);
         query[key] = all[0]!;
       }
-      return c.json(await readBabysitterEvidence(evidence, { orgId: identity.orgId, workspaceId: identity.workspaceId }, query));
+      // Neon order: repeated filters (400) above, then the account assertion (403) before any read.
+      return c.json(await readBabysitterEvidence(evidence, { orgId: identity.orgId, workspaceId: identity.workspaceId }, query, c.req.header("X-RelayHistory-Expected-Account")));
     } catch (error) {
       if (error instanceof EvidenceRequestError)
         return c.json({ error: { code: error.code, message: error.message, ...(error.reason ? { reason: error.reason } : {}) }, correlationId }, error.status);
