@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { parseFrontierJson, readFrontierBundle, MAX_FRONTIER_BUNDLE_BYTES } from "../frontier-plan-input.ts";
+import { mkdtempSync, rmSync, writeFileSync, symlinkSync, truncateSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -317,24 +318,81 @@ describe("canonical frontier read-only planner", () => {
       const capture = readyCapture();
       writeFileSync(evidence, JSON.stringify({ capture, exportBindings: bindingsFor(capture) }));
       const script = join(import.meta.dir, "../../../scripts/canonical-frontier-plan.ts");
-      const ready = spawnSync(process.execPath, [script, "--evidence", evidence, "--now", NOW.toISOString()], { encoding: "utf8" });
+      const ready = spawnSync(process.execPath, ["--no-env-file", script, "--evidence", evidence, "--now", NOW.toISOString()], { encoding: "utf8" });
       expect(ready.status).toBe(0);
-      expect(JSON.parse(ready.stdout)).toMatchObject({ status: "ready", protocol: "canonical-publication-frontier-plan-v1" });
-      const refused = spawnSync(process.execPath, [script, "--evidence", evidence, "--now", NOW.toISOString(), "--apply"], { encoding: "utf8" });
+      expect(JSON.parse(ready.stdout)).toMatchObject({ status: "ready", qualification: "OFFLINE_ONLY", protocol: "canonical-publication-frontier-plan-v1" });
+      const refused = spawnSync(process.execPath, ["--no-env-file", script, "--evidence", evidence, "--now", NOW.toISOString(), "--apply"], { encoding: "utf8" });
       expect(refused.status).toBe(1);
       expect(JSON.parse(refused.stderr)).toMatchObject({ status: "error", code: "frontier_plan_usage" });
     } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+
+  test("offline CLI rejects duplicate keys and resealed unexpected scope fields without echoing them", () => {
+    const directory = mkdtempSync(join(tmpdir(), "frontier-untrusted-cli-"));
+    try {
+      const capture = readyCapture();
+      const bundle = { capture, exportBindings: bindingsFor(capture) };
+      const script = join(import.meta.dir, "../../../scripts/canonical-frontier-plan.ts");
+      const evidence = join(directory, "capture.json");
+      const run = () => spawnSync(process.execPath, ["--no-env-file", script, "--evidence", evidence, "--now", NOW.toISOString()], { encoding: "utf8" });
+      const raw = JSON.stringify(bundle);
+      writeFileSync(evidence, '{"capture":null,' + raw.slice(1));
+      const duplicate = run();
+      expect(duplicate.status).toBe(1);
+      expect(JSON.parse(duplicate.stderr)).toEqual({ status: "error", code: "frontier_plan_evidence_invalid" });
+      Object.assign(capture.scope, { unreviewed: "PRIVATE-SCOPE-SENTINEL" }); reseal(capture);
+      writeFileSync(evidence, JSON.stringify(bundle));
+      const extra = run();
+      expect(extra.status).toBe(1);
+      expect(extra.stdout + extra.stderr).not.toContain("PRIVATE-SCOPE-SENTINEL");
+      writeFileSync(evidence, Buffer.from([0xff]));
+      expect(run().status).toBe(1);
+      rmSync(evidence);
+      const absent = run();
+      expect(absent.status).toBe(1);
+      expect(absent.stderr).not.toContain(evidence);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test("offline file reader refuses symlinks and oversize files before materializing input", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "frontier-file-bounds-"));
+    try {
+      const file = join(directory, "capture.json"), link = join(directory, "linked.json");
+      writeFileSync(file, "{}"); symlinkSync(file, link);
+      await expect(readFrontierBundle(link)).rejects.toBeDefined();
+      const fifo = join(directory, "input.fifo");
+      expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+      await expect(readFrontierBundle(fifo)).rejects.toMatchObject({ code: "frontier_plan_evidence_invalid" });
+      truncateSync(file, MAX_FRONTIER_BUNDLE_BYTES + 1);
+      await expect(readFrontierBundle(file)).rejects.toMatchObject({ code: "frontier_plan_evidence_invalid" });
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test("strict JSON handles escaped duplicate keys, prototype keys and structural limits", () => {
+    expect(() => parseFrontierJson('{"a":1,"\\u0061":2}')).toThrow();
+    expect(() => parseFrontierJson('{"x":{"a":1,"a":2}}')).toThrow();
+    expect(() => parseFrontierJson('['.repeat(66) + '0' + ']'.repeat(66))).toThrow();
+    expect(() => parseFrontierJson('{"n":9007199254740992}')).toThrow();
+    expect(() => parseFrontierJson('{"n":NaN}')).toThrow();
+    expect(() => parseFrontierJson('[1,]')).toThrow();
+    expect(() => parseFrontierJson('{"a":1,}')).toThrow();
+    expect(() => parseFrontierJson('true false')).toThrow();
+    const value = parseFrontierJson('{"__proto__":{"polluted":true},"escaped":"a\\\"b"}') as Record<string, unknown>;
+    expect(Object.getPrototypeOf(value)).toBeNull();
+    expect(value.escaped).toBe('a"b');
+    expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
   });
 
   test("live-capable capture runner accepts credentials only through bounded stdin", () => {
     const directory = mkdtempSync(join(tmpdir(), "frontier-capture-cli-"));
     try {
       const script = join(import.meta.dir, "../../../scripts/capture-canonical-frontier.ts");
-      const argvSecret = spawnSync(process.execPath, [script, "--source-url", "postgresql://user:secret@example.invalid/db"], { encoding: "utf8", input: "{}" });
+      const argvSecret = spawnSync(process.execPath, ["--no-env-file", script, "--source-url", "postgresql://user:secret@example.invalid/db"], { encoding: "utf8", input: "{}" });
       expect(argvSecret.status).toBe(1);
       expect(JSON.parse(argvSecret.stderr)).toMatchObject({ code: "frontier_capture_usage" });
       expect(argvSecret.stderr).not.toContain("secret");
-      const malformed = spawnSync(process.execPath, [script, "--output", join(directory, "capture.json"), "--cache-dir", join(directory, "cache")], { encoding: "utf8", input: JSON.stringify({ protocol: "fixture" }) });
+      const malformed = spawnSync(process.execPath, ["--no-env-file", script, "--output", join(directory, "capture.json"), "--cache-dir", join(directory, "cache")], { encoding: "utf8", input: JSON.stringify({ protocol: "fixture" }) });
       expect(malformed.status).toBe(1);
       expect(JSON.parse(malformed.stderr)).toMatchObject({ code: "frontier_capture_config_shape" });
     } finally { rmSync(directory, { recursive: true, force: true }); }

@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 /** Offline-only evaluator for a reviewed canonical frontier capture. */
-import { open } from "node:fs/promises";
 import { resolve } from "node:path";
-import { evaluateCanonicalFrontier, frontierCanonicalJson, type CanonicalFrontierCapture, type FrontierExportBinding } from "../src/session-ingest/frontier-plan.ts";
+import { evaluateCanonicalFrontier, frontierCanonicalJson } from "../src/session-ingest/frontier-plan.ts";
+import { readFrontierBundle } from "../src/session-ingest/frontier-plan-input.ts";
 
-const MAX_EVIDENCE_BYTES = 64 * 1024 * 1024;
 const UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3,6}Z$/;
 
 function usage(): never {
@@ -30,26 +29,15 @@ function argumentsFor(argv: string[]): { evidence: string; now: Date } {
 
 async function main(): Promise<void> {
   const args = argumentsFor(process.argv.slice(2));
-  const handle = await open(args.evidence, "r");
-  let bytes: Buffer;
-  try {
-    const metadata = await handle.stat();
-    if (!metadata.isFile() || metadata.size > MAX_EVIDENCE_BYTES) throw Object.assign(new Error("frontier evidence exceeds 64 MiB or is not a regular file"), { code: "frontier_plan_evidence_bound" });
-    bytes = await handle.readFile();
-    if (bytes.byteLength > MAX_EVIDENCE_BYTES) throw Object.assign(new Error("frontier evidence exceeds 64 MiB"), { code: "frontier_plan_evidence_bound" });
-  } finally { await handle.close(); }
-  let evidence: { capture: CanonicalFrontierCapture; exportBindings: FrontierExportBinding[] };
-  try { evidence = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as typeof evidence; }
-  catch { throw Object.assign(new Error("frontier evidence is not strict UTF-8 JSON"), { code: "frontier_plan_evidence_invalid" }); }
-  if (!evidence || typeof evidence !== "object" || !evidence.capture || !Array.isArray(evidence.exportBindings))
-    throw Object.assign(new Error("frontier evidence bundle is incomplete"), { code: "frontier_plan_evidence_invalid" });
+  const evidence = await readFrontierBundle(args.evidence);
   const result = evaluateCanonicalFrontier(evidence.capture, { now: args.now, exportBindings: evidence.exportBindings });
-  process.stdout.write(frontierCanonicalJson(result) + "\n");
+  process.stdout.write(frontierCanonicalJson({ ...result, qualification: "OFFLINE_ONLY" }) + "\n");
   if (result.status === "hold") process.exitCode = 2;
 }
 
 await main().catch((error: unknown) => {
-  const value = error as { code?: unknown; message?: unknown };
-  process.stderr.write(JSON.stringify({ status: "error", code: typeof value.code === "string" ? value.code : "frontier_plan_error", message: typeof value.message === "string" ? value.message : "frontier plan failed" }) + "\n");
+  const code = (error as { code?: unknown })?.code;
+  const allowed = ["frontier_plan_usage", "frontier_plan_evidence_invalid"];
+  process.stderr.write(JSON.stringify({ status: "error", code: typeof code === "string" && allowed.includes(code) ? code : "frontier_plan_error" }) + "\n");
   process.exitCode = 1;
 });

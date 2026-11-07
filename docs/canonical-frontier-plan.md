@@ -67,7 +67,7 @@ bun scripts/canonical-frontier-plan.ts \
   --now 2026-11-06T04:00:05.000Z
 ```
 
-Exit `0` is a deterministic ready plan, exit `2` is an actionable hold, and exit `1` is malformed CLI/input. Evidence is capped at 64 MiB and emitted without payload logging.
+Exit `0` is a deterministic internally consistent candidate plan, exit `2` is an actionable hold, and exit `1` is malformed CLI/input. Every offline CLI result carries `qualification: "OFFLINE_ONLY"`: file-supplied bindings are not authenticated production evidence or write authority. The production capture still requires the separately reviewed byte adapter and complete receipt/source provenance. Evidence is read incrementally up to 64 MiB from one non-symlink regular file; duplicate/unknown keys, invalid UTF-8, unsafe numbers and excessive nesting refuse without echoing inputs or file paths.
 
 ## Hold actions
 
