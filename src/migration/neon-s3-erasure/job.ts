@@ -126,7 +126,8 @@ export class ErasureJob {
    *    an acked one only when its exact version is absent from that complete inventory.
    */
   async #erasePaged(prefix: string, scope: string, select: ((v: ListedVersion) => boolean) | undefined, authorize: () => Promise<void>,
-    keyFilter: (key: string) => boolean = () => true, exporterWritten = false, exactKey?: string): Promise<{ status: PagedOutcome; deleted: number; remaining: number; rev: number }> {
+    keyFilter: (key: string) => boolean = () => true, exporterWritten = false, exactKey?: string,
+    lease?: { prefix: string; holder: string; gen: string }): Promise<{ status: PagedOutcome; deleted: number; remaining: number; rev: number }> {
     const exact = exactKey !== undefined ? { exactKey } : {};
     let rev = this.state.obligationRev(prefix);
     let lost = false;
@@ -235,7 +236,7 @@ export class ErasureJob {
     for (;;) {
       // Authority re-checked before EVERY page (async, outside the page's transaction; no network await inside it).
       await authorize();
-      const page = this.state.retireReservationsPage(prefix, scope, exactKey, absent, 1000, proofSeq, proofId, rev);
+      const page = this.state.retireReservationsPage(prefix, scope, exactKey, absent, 1000, proofSeq, proofId, rev, lease);
       // A write that landed during the awaited authority check (or since the proof) refuses the page: no done claim;
       // the next run takes a fresh proof, and the new pending effect is kept.
       if (!page.ok) {
@@ -268,12 +269,13 @@ export class ErasureJob {
    * directory, reserved before delete, done only after a strict empty inventory of the selected versions and no
    * unresolved PUT at exactly that key. `remaining`: versions still at the key (e.g. successors kept by `select`).
    */
-  #eraseKey(key: string, scope: string, select: (v: ListedVersion) => boolean, authorize: () => Promise<void>, exporterWritten = false) {
+  #eraseKey(key: string, scope: string, select: (v: ListedVersion) => boolean, authorize: () => Promise<void>, exporterWritten = false,
+    lease?: { prefix: string; holder: string; gen: string }) {
     const dir = key.slice(0, key.lastIndexOf("/") + 1);
     if (!dir || dir === key) throw refusal("erasure_refused_shape");
     // The shared primitive's exact-key mode: listing and verification cover exactly this key (cut at the first other
     // key), so unrelated siblings never count against the budget.
-    return this.#erasePaged(dir, scope, (v) => v.key === key && select(v), authorize, (k) => k === key, exporterWritten, key);
+    return this.#erasePaged(dir, scope, (v) => v.key === key && select(v), authorize, (k) => k === key, exporterWritten, key, lease);
   }
 
   /** Queue the session prefixes of `keys` (manifest keys) and drop them from the group's watermark. */
@@ -574,6 +576,8 @@ export class ErasureJob {
       try {
         // The exporter may have cancelled it before we took the lease.
         if (!this.state.erasureQueued(item.key, item.enqueued_at)) continue;
+        // The lease generation this eraser acquired: every retirement page and the done claim re-validate it.
+        const itemLease = { prefix, holder: LEASE_HOLDER, gen: this.state.leaseGen(prefix) ?? "" };
         if (item.kind === "object") {
           // One queued object, through the SAME gate as a prefix: reserve every version before its delete, done only
           // after a strict empty inventory of the key and no unresolved PUT at exactly that key.
@@ -582,7 +586,7 @@ export class ErasureJob {
             if (!this.state.erasureQueued(item.key, item.enqueued_at)) throw refusal("erasure_item_cancelled");
             if (!this.state.renewLease(prefix, LEASE_HOLDER, this.now())) throw refusal("erasure_lease_lost");
             await this.authority.ready();
-          }, true);
+          }, true, itemLease);
           this.counters.versionsDeleted += r.deleted;
           handled += 1;
           if (r.status === "unresolved") {
@@ -591,7 +595,7 @@ export class ErasureJob {
           }
           if (r.status !== "erased") continue;
           // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
-          if (!this.state.completeErasure(item.key, item.enqueued_at, item.key.slice(0, item.key.lastIndexOf("/") + 1), r.rev)) {
+          if (!this.state.completeErasure(item.key, item.enqueued_at, item.key.slice(0, item.key.lastIndexOf("/") + 1), r.rev, itemLease)) {
             this.counters.reservationsRefused += 1;
             continue;
           }
@@ -608,7 +612,7 @@ export class ErasureJob {
           if (!this.state.renewLease(prefix, LEASE_HOLDER, this.now())) throw refusal("erasure_lease_lost");
           await this.authority.ready();
         };
-        const r = await this.#erasePaged(item.key, scope, undefined, authorize, undefined, true);
+        const r = await this.#erasePaged(item.key, scope, undefined, authorize, undefined, true, undefined, itemLease);
         this.counters.versionsDeleted += r.deleted;
         handled += 1;
         // Still queued unless proven: incomplete resumes from the checkpoint; unverified / refused retry on the next
@@ -619,7 +623,7 @@ export class ErasureJob {
         }
         if (r.status !== "erased") continue;
         // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
-        if (!this.state.completeErasure(item.key, item.enqueued_at, item.key, r.rev)) {
+        if (!this.state.completeErasure(item.key, item.enqueued_at, item.key, r.rev, itemLease)) {
           this.counters.reservationsRefused += 1;
           continue;
         }

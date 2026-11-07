@@ -93,6 +93,13 @@ export class SyncState {
         outcome TEXT NOT NULL CHECK (outcome IN ('erased', 'published', 'refused')), at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS erased_versions (key TEXT NOT NULL, version_id TEXT NOT NULL, at INTEGER NOT NULL,
         PRIMARY KEY (key, version_id));
+      -- NON-REVERTING obligation revision: every insert / update / delete on the three obligation tables (dispatch, ack,
+      -- refuse, publish, unpublish, reserve, retire, resolve, legacy import) bumps a monotonic clock and stamps the
+      -- affected key in write_touch, which is NEVER deleted. A prefix's revision is the newest stamp under it, so a
+      -- deletion can never make it revert (no ABA).
+      CREATE TABLE IF NOT EXISTS write_clock (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL);
+      INSERT OR IGNORE INTO write_clock (id, n) VALUES (1, 0);
+      CREATE TABLE IF NOT EXISTS write_touch (key TEXT PRIMARY KEY, seq INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS erase_checkpoints (
         scope TEXT PRIMARY KEY, checkpoint TEXT NOT NULL, updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS truncations (
@@ -112,6 +119,13 @@ export class SyncState {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS groups_last ON groups (last_ms DESC);
     `);
+    for (const t of ["write_invocations", "write_published", "erase_reservations"])
+      for (const [op, row] of [["INSERT", "NEW"], ["UPDATE", "NEW"], ["DELETE", "OLD"]] as const)
+        this.db.exec(`CREATE TRIGGER IF NOT EXISTS ${t}_touch_${op.toLowerCase()} AFTER ${op} ON ${t} BEGIN
+          UPDATE write_clock SET n = n + 1 WHERE id = 1;
+          INSERT INTO write_touch (key, seq) VALUES (${row}.key, (SELECT n FROM write_clock WHERE id = 1))
+            ON CONFLICT (key) DO UPDATE SET seq = excluded.seq;
+        END`);
     // Lease generation: minted on every NEW acquisition (absent, or taken from another holder); a renew keeps it.
     if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('leases') WHERE name = 'gen'").get())) this.db.exec("ALTER TABLE leases ADD COLUMN gen TEXT");
     // Obligation genesis (once per file, never reset), from EVIDENCE only, never a timer, a PID or a lock file:
@@ -506,8 +520,14 @@ export class SyncState {
   }
   /** The prefix's compare-and-set revision: the newest seq of any invocation, publication or reservation under it. */
   obligationRev(prefix: string): number {
-    const q = (t: string) => Number((this.db.prepare(`SELECT coalesce(max(seq), 0) AS n FROM ${t} WHERE ${SyncState.#under}`).get(...SyncState.#u(prefix)) as { n: number }).n);
-    return Math.max(q("write_invocations"), q("write_published"), q("erase_reservations"));
+    // The newest never-deleted touch stamp under the prefix: monotonic across EVERY transition (non-reverting).
+    return Number((this.db.prepare(`SELECT coalesce(max(seq), 0) AS n FROM write_touch WHERE ${SyncState.#under}`).get(...SyncState.#u(prefix)) as { n: number }).n);
+  }
+  /** The eraser still holds `prefix`'s lease at the generation it acquired (checked inside page / completion txs). */
+  #leaseHeld(lease: { prefix: string; holder: string; gen: string } | undefined): boolean {
+    if (!lease) return true;
+    const h = this.db.prepare("SELECT holder, gen FROM leases WHERE prefix = ?").get(lease.prefix) as { holder: string; gen: string | null } | undefined;
+    return !!h && h.holder === lease.holder && h.gen === lease.gen;
   }
   /** The unresolved invocations under a prefix (dispatched, or acked whose version was not yet seen gone). */
   unresolvedWrites(prefix: string): { id: string; key: string; outcome: "dispatched" | "acked"; versionId?: string }[] {
@@ -574,9 +594,13 @@ export class SyncState {
    * rescanning; the cursor is cleared when the scan is complete.
    */
   retireReservationsPage(prefix: string, scope: string, exactKey: string | undefined, absent: (key: string, versionId: string) => boolean, limit = 1000,
-    maxSeq = Number.MAX_SAFE_INTEGER, proofId = "unbound", expectRev?: number): { retired: number; done: boolean; ok: boolean; rev: number } {
+    maxSeq = Number.MAX_SAFE_INTEGER, proofId = "unbound", expectRev?: number, lease?: { prefix: string; holder: string; gen: string }): { retired: number; done: boolean; ok: boolean; rev: number } {
     let out = { retired: 0, done: false, ok: false, rev: -1 };
     this.#tx(() => {
+      if (!this.#leaseHeld(lease)) {
+        out = { retired: 0, done: false, ok: false, rev: this.obligationRev(prefix) };
+        return;
+      }
       // Under the writer/retire lock (this IMMEDIATE transaction): the prefix revision must still be the one the caller
       // proved against; a dispatch / publish / reservation that landed meanwhile refuses this page (nothing retired).
       if (expectRev !== undefined && this.obligationRev(prefix) !== expectRev) {
@@ -629,12 +653,13 @@ export class SyncState {
    * The terminal claim, atomically with its re-validation: the queue row is removed (erasure done) only if the prefix
    * revision is still `expectRev` in the SAME transaction; otherwise nothing changes and the item stays queued.
    */
-  completeErasure(key: string, enqueuedAt: number, prefix: string, expectRev: number): boolean {
+  completeErasure(key: string, enqueuedAt: number, prefix: string, expectRev: number, lease?: { prefix: string; holder: string; gen: string }): boolean {
     let ok = false;
     this.#tx(() => {
-      if (this.obligationRev(prefix) !== expectRev) return;
-      this.db.prepare("DELETE FROM erasures WHERE key = ? AND enqueued_at = ?").run(key, enqueuedAt);
-      ok = true;
+      // The non-reverting revision AND the eraser's lease (holder + generation), in the same transaction as the removal.
+      if (this.obligationRev(prefix) !== expectRev || !this.#leaseHeld(lease)) return;
+      // ... and the exact queue identity (key + enqueue time) must still be there to be removed.
+      ok = Number(this.db.prepare("DELETE FROM erasures WHERE key = ? AND enqueued_at = ?").run(key, enqueuedAt).changes) === 1;
     });
     return ok;
   }

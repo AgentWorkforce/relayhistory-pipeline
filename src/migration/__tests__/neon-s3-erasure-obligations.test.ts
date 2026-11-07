@@ -665,3 +665,88 @@ describe("bounded, resumable reservation retirement (dogpatch 5548 P2)", () => {
     expect(count(w.st, "SELECT count(*) AS n FROM erase_reservations")).toBe(0);
   });
 });
+
+describe("terminal claim: non-reverting revision + the eraser's lease generation (lead 10466e9c ABA)", () => {
+  async function fresh() {
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-aba-")), "s.sqlite"));
+    const enq = Date.parse("2026-11-06T00:00:00Z");
+    st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }], enq);
+    return { st, enq };
+  }
+
+  test("the lead's schedule: proof at rev R; lease expires, a writer takes it, dispatch + ACK + publish, then enqueue/unpublish empties the active rows -> the old completion is REFUSED", async () => {
+    const { st, enq } = await fresh();
+    expect(st.acquireLease(PREFIX, "eraser:1", undefined, Date.parse("2026-11-06T00:00:00Z"))).toBe(true);
+    const eraserLease = { prefix: PREFIX, holder: "eraser:1", gen: st.leaseGen(PREFIX)! };
+    const proofRev = st.obligationRev(PREFIX);
+    // The eraser's lease expires; a writer takes it, writes, gets its own ACK and publishes.
+    expect(st.acquireLease(PREFIX, "writer:new")).toBe(true);
+    const writer = { holder: "writer:new", gens: { [PREFIX]: st.leaseGen(PREFIX)! } };
+    const inv = st.dispatchWrite(key(1), "writer:new");
+    st.ackWrite(inv, "v-new");
+    st.publishWrites([{ key: key(1), versionId: "v-new" }], writer);
+    // An enqueue / unpublish removes the active rows again (the old active-row revision would be back at R).
+    st.enqueueErasure([{ key: PREFIX, kind: "prefix", org_id: "org-1", reason: "fenced" }], enq);
+    expect(st.unresolvedWrites(PREFIX)).toEqual([]);
+    expect(st.publishedUnder(PREFIX)).toEqual([]);
+    expect(st.obligationRev(PREFIX)).toBeGreaterThan(proofRev); // non-reverting
+    expect(st.completeErasure(PREFIX, enq, PREFIX, proofRev, eraserLease)).toBe(false);
+    expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10).map((e) => e.key)).toEqual([PREFIX]);
+  });
+
+  test("the lead's EXACT harness schedule (pr309-1046 retirement-recheck.mjs): the stale completion is refused", () => {
+    const P = PREFIX;
+    const st = new SyncState(":memory:");
+    const item = { key: P, kind: "prefix" as const, org_id: "synthetic-org", reason: "synthetic" };
+    st.enqueueErasure([item], 1);
+    expect(st.acquireLease(P, "eraser:old", 7_200_000, 0)).toBe(true);
+    const oldGen = st.leaseGen(P)!;
+    const proofRev = st.obligationRev(P);
+    expect(st.acquireLease(P, "writer:new", 7_200_000, 10_800_000)).toBe(true);
+    const writerGen = st.leaseGen(P)!;
+    expect(writerGen).not.toBe(oldGen);
+    const k = `${P}new-object`;
+    const id = st.dispatchWrite(k, "writer:new");
+    st.ackWrite(id, "native-v-new");
+    st.publishWrites([{ key: k, versionId: "native-v-new" }], { holder: "writer:new", gens: { [P]: writerGen } });
+    expect(st.obligationRev(P)).toBeGreaterThan(proofRev);
+    st.enqueueErasure([item], 10_800_001);
+    // On 10466e9c the active-row revision reverted to proofRev here and the completion was accepted.
+    expect(st.obligationRev(P)).toBeGreaterThan(proofRev);
+    expect(st.completeErasure(P, 1, P, proofRev, { prefix: P, holder: "eraser:old", gen: oldGen })).toBe(false);
+    expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10).map((e) => e.key)).toEqual([P]);
+  });
+
+  test("the queue identity must still exist: a completion for an already-removed item is refused", async () => {
+    const { st, enq } = await fresh();
+    const rev = st.obligationRev(PREFIX);
+    st.erasureDone(PREFIX, enq);
+    expect(st.completeErasure(PREFIX, enq, PREFIX, rev)).toBe(false);
+  });
+
+  test("pure revision ABA (no lease change): dispatch then refuse leaves no active row, yet the old revision is stale", async () => {
+    const { st, enq } = await fresh();
+    expect(st.acquireLease(PREFIX, "eraser:1")).toBe(true);
+    const eraserLease = { prefix: PREFIX, holder: "eraser:1", gen: st.leaseGen(PREFIX)! };
+    const proofRev = st.obligationRev(PREFIX);
+    st.refuseWrite(st.dispatchWrite(key(2), "exporter:1"));
+    expect(st.unresolvedWrites(PREFIX)).toEqual([]);
+    expect(st.completeErasure(PREFIX, enq, PREFIX, proofRev, eraserLease)).toBe(false);
+    // With the CURRENT revision and the held lease, the claim succeeds.
+    expect(st.completeErasure(PREFIX, enq, PREFIX, st.obligationRev(PREFIX), eraserLease)).toBe(true);
+  });
+
+  test("a lease taken over before completion refuses it, even at an unchanged revision; a re-acquired lease has a NEW generation", async () => {
+    const { st, enq } = await fresh();
+    expect(st.acquireLease(PREFIX, "eraser:1", undefined, Date.parse("2026-11-06T00:00:00Z"))).toBe(true);
+    const eraserLease = { prefix: PREFIX, holder: "eraser:1", gen: st.leaseGen(PREFIX)! };
+    const rev = st.obligationRev(PREFIX);
+    expect(st.acquireLease(PREFIX, "writer:new")).toBe(true); // expired: taken over
+    expect(st.completeErasure(PREFIX, enq, PREFIX, rev, eraserLease)).toBe(false);
+    st.releaseLeases("writer:new", [PREFIX]);
+    expect(st.acquireLease(PREFIX, "eraser:1")).toBe(true); // the same holder again: a NEW generation
+    expect(st.leaseGen(PREFIX)).not.toBe(eraserLease.gen);
+    expect(st.completeErasure(PREFIX, enq, PREFIX, rev, eraserLease)).toBe(false);
+    expect(st.retireReservationsPage(PREFIX, "S", undefined, () => true, 1000, Number.MAX_SAFE_INTEGER, "p", rev, eraserLease)).toMatchObject({ ok: false });
+  });
+});
