@@ -13,6 +13,7 @@ const verifierNames = [
   ["session_ingest_seeder_verify.sql", "verify:session_ingest_seeder"],
   ["session_ingest_verify.sql", "verify:session_ingest"],
   ["canonical_project_events_verify.sql", "verify:canonical_project_events"],
+  ["portable_search_storage_verify.sql", "verify:portable_search_storage"],
 ] as const;
 
 test("captured build/watch inputs reproduce the actual generation without expanding runtime verifiers", async () => {
@@ -40,6 +41,9 @@ test("captured build/watch inputs reproduce the actual generation without expand
   expect(Object.keys((await packaged.derivedSchemaAssets()).verifiers).sort()).toEqual([
     "ingest", "ingestSeeder", "searchWorker", "tokenVerifier",
   ]);
+  // The portable storage verifier is packaged separately: consumers count and run
+  // `verifiers` as exactly this set.
+  expect((await packaged.derivedSchemaAssets()).portableStorageVerifier).toContain("portable search storage");
   const watched: string[] = [];
   const loaded = await derivedSchemaBuildPlugin().load.call({ addWatchFile(path) { watched.push(path); } },
     fileURLToPath(new URL("../../../src/session-pipeline/derived-schema.ts", import.meta.url)));

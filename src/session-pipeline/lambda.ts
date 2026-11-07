@@ -53,6 +53,7 @@ import { searchIndexLimits } from "./search-index.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
+import { PortableConnectionRefused } from "../shared/portable-connection-identity.ts";
 import type { PipelineRuntimeRegistry } from "@rhc/adapters/defaults.ts";
 import { dispatchRegisteredLambda, type PipelineLambdaEvent } from "./lambda-runtime.ts";
 import { writerTransactionSql } from "./transaction-sql.ts";
@@ -257,7 +258,7 @@ async function init(composition?: SearchComposition): Promise<Runtime> {
   });
   if (!SecretString) throw new Error("session pipeline secret has no value yet");
   const rt = runtimeFromSecret(env, SecretString, publicationSchema.expected.generation, composition);
-  await admitWriterRuntime(rt, env, composition, publicationSchema.verifiers.portableStorage, publicationSchema.expected.dbMode);
+  await admitWriterRuntime(rt, env, composition, publicationSchema.portableStorageVerifier, publicationSchema.expected.dbMode);
   return rt;
 }
 
@@ -278,7 +279,10 @@ export async function admitWriterRuntime(
   if (!(env.searchEnabled && env.searchBackend && env.searchBackend !== "clickhouse" && composition?.admit)) return;
   const db = rt.deps.pointer.db;
   try {
-    await transaction(db, tx => composition.admit!(tx, "writer", { ...(storageVerifySql !== undefined ? { storageVerifySql } : {}), ...(dbMode ? { dbMode } : {}) }));
+    // A composition that declares admission requires the embedded storage verifier body:
+    // a missing or empty body refuses the profile; it never skips the check.
+    if (!storageVerifySql?.trim()) throw new PortableConnectionRefused("storage_verifier_missing");
+    await transaction(db, tx => composition.admit!(tx, "writer", { storageVerifySql, ...(dbMode ? { dbMode } : {}) }));
   } catch (error) {
     await db.end?.().catch(() => undefined);
     throw error;

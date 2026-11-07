@@ -84,3 +84,12 @@ test("the reader may not run the storage verifier", async () => {
   const client = await (f.rt as any).deps.pointer.db.pool.connect();
   await expect(admitPortableConnection(client, "reader", { storageVerifySql: "SELECT 1" })).rejects.toThrow("storage_verify_writer_only");
 });
+
+test("a declared admission with a missing or empty storage verifier body refuses (never skips) and closes the pool", async () => {
+  for (const body of [undefined, "", "   "]) {
+    const f = fakeRuntime();
+    const error = await admitWriterRuntime(f.rt, PORTABLE, composition(async () => undefined), body, "rds").catch(e => e);
+    expect((error as PortableConnectionRefused).code).toBe("storage_verifier_missing");
+    expect(f.stats().ended).toBe(1);
+  }
+});

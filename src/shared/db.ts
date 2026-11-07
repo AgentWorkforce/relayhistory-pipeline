@@ -116,10 +116,7 @@ export const INGEST_ROLE_VERIFY_SQL_PATH=fileURLToPath(new URL("../../supabase/b
 const INGEST_SEED_VERIFY_SQL=readFileSync(INGEST_SEED_VERIFY_SQL_PATH,"utf8");
 const TOKEN_VERIFIER_VERIFY_SQL=readFileSync(TOKEN_VERIFIER_VERIFY_SQL_PATH,"utf8");
 const INGEST_ROLE_VERIFY_SQL=readFileSync(INGEST_ROLE_VERIFY_SQL_PATH,"utf8");
-export interface SchemaVerifierSql {searchWorker:string;tokenVerifier:string;ingestSeeder:string;ingest:string;
-  /** 20261105047000 storage admission, run by the portable writer's assembly admission
-   * (not by schemaVerdict, whose callers have no portable runtime identity to bind). */
-  portableStorage?:string}
+export interface SchemaVerifierSql {searchWorker:string;tokenVerifier:string;ingestSeeder:string;ingest:string}
 
 /**
  * Live sessions-function boundary, read-only, part of every readiness check: no sessions

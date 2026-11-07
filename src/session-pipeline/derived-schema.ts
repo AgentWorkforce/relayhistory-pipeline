@@ -10,7 +10,12 @@ export const PORTABLE_STORAGE_VERIFY_SQL_PATH = fileURLToPath(new URL("../../sup
 
 export interface DerivedSchemaAssets {
   expected: ExpectedSchema;
+  /** Exactly the four shared phase-2 verifiers that other consumers (ingest
+   * publication, buffered GC) count and run as a set. Do not add keys here. */
   verifiers: SchemaVerifierSql;
+  /** 20261105047000 storage admission, run only by the portable writer's assembly
+   * admission with its own identity bound; deliberately outside `verifiers`. */
+  portableStorageVerifier: string;
 }
 
 export async function derivedSchemaAssets(): Promise<DerivedSchemaAssets> {
@@ -19,5 +24,5 @@ export async function derivedSchemaAssets(): Promise<DerivedSchemaAssets> {
     readFile(ROLE_VERIFY_SQL_PATH, "utf8"), readFile(TOKEN_VERIFIER_VERIFY_SQL_PATH, "utf8"),readFile(INGEST_SEED_VERIFY_SQL_PATH,"utf8"),readFile(INGEST_ROLE_VERIFY_SQL_PATH,"utf8"),
     readFile(PORTABLE_STORAGE_VERIFY_SQL_PATH, "utf8"),
   ]);
-  return { expected, verifiers: { searchWorker, tokenVerifier,ingestSeeder,ingest,portableStorage } };
+  return { expected, verifiers: { searchWorker, tokenVerifier,ingestSeeder,ingest }, portableStorageVerifier: portableStorage };
 }
