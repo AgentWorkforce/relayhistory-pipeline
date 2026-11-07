@@ -27,6 +27,7 @@ import { createHash } from "node:crypto";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { objectKey, readAll, type ObjectStore } from "../../packages/object-store/src/index.ts";
 import { randomUUID } from "node:crypto";
+import { analysisObligationWriterFor } from "./store.ts";
 import type { EraseCheckpoint, ListedVersion, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 import { analysisResultKey, analysisResultPrefix, ANALYSIS_RESULT_MAX_BYTES, boundedPut, type AnalysisPutAck } from "./results.ts";
 
@@ -194,6 +195,8 @@ export async function applyBackfill(
   const prefix = await anchorPrefix(db, scope);
   const scopeParams = [scope.orgId, scope.workspaceId, scope.sessionId];
   const scope_ = scope;
+  void scope_;
+
   const transact = options.transact ?? (async <T,>(work: (tx: SqlExecutor) => Promise<T>): Promise<T> => {
     await db.query("BEGIN");
     try {
@@ -227,6 +230,8 @@ export async function applyBackfill(
   // input): every ticket fence also requires it unchanged.
   const generation = await sourceRevision(db, scope);
   if (generation === null) throw new BackfillError("backfill_session_not_live");
+  // The write's OWN evidence (acked / refused), scoped to this run's writer and generation.
+  const evidence = analysisObligationWriterFor({ writer, generation });
   let objects = 0;
   const refs = new Map<string, { key: string; sha256: string; bytes: number }>();
   for (const job of plan.jobs) {
@@ -284,47 +289,16 @@ export async function applyBackfill(
        SELECT (SELECT count(*) FROM ours) + (SELECT count(*) FROM adopted) AS n`,
       [key, ...scopeParams, jobId, writer, reason],
     );
-    const held = Number((mine.rows[0] as { n?: number | string } | undefined)?.n ?? 0) > 0;
-    if (!ack?.created || !ack.versionId) return;
-    const ownId = ack.versionId;
-    const prefix = key.slice(0, key.lastIndexOf("/") + 1);
-    const ownVersion = (v: ListedVersion) => v.key === key && v.versionId === ownId;
-    // Not held (a successor holds the key): keep our version when it is the key's sole object
-    // version (a successor whose create-only put found it identical publishes it).
-    if (!held) {
-      const others = await options.eraser.verifyErased(prefix, {
-        select: (v) => v.key === key && !v.deleteMarker && v.versionId !== ownId,
-        authorize: async () => {},
-      });
-      if (others.status === "erased") return;
-    }
-    const authorize = async () => {
-      if (!held) return;
-      const still = await db.query(
-        "SELECT 1 FROM sessions.session_analysis_result_tickets WHERE result_key = $1 AND job_id = $2::uuid AND writer_token = $3::uuid AND reason = 'forgotten'",
-        [key, jobId, writer],
-      );
-      if (!still.rows.length) throw new BackfillError("backfill_ticket_lease_lost");
-    };
-    const scope = createHash("sha256")
-      .update(JSON.stringify(["analysis-backfill-abandon", scope_.orgId, scope_.workspaceId, scope_.sessionId, key, jobId, writer, generation, ownId]))
-      .digest("hex");
-    let checkpoint: EraseCheckpoint | null = null;
-    for (let i = 0; i < 5; i += 1) {
-      const step = await options.eraser.eraseStep(prefix, { scope, checkpoint, select: ownVersion, authorize });
-      if (step.status === "traversed") break;
-      checkpoint = step.checkpoint;
-    }
-    const proof = await options.eraser.verifyErased(prefix, { select: ownVersion, authorize });
-    if (held && proof.status === "erased")
-      await db.query(
-        "DELETE FROM sessions.session_analysis_result_tickets WHERE result_key = $1 AND job_id = $2::uuid AND reason = 'forgotten' AND writer_token = $3::uuid",
-        [key, jobId, writer],
-      );
+    void mine;
+    // No direct erase here (no caller bypasses the shared reserve): the write's own evidence is
+    // already recorded on its invocation (acked with the exact version, or still dispatched),
+    // and the sweeper's reconcileObligation reserves then erases every unowned version.
+    void ack;
   }
   async function applyJob(job: BackfillPlan["jobs"][number]) {
     let ref: { key: string; sha256: string; bytes: number } | null = null;
     let versionId: string | null = null;
+    let publishInvocation: string | null = null;
     let bytes: Uint8Array | null = null;
     if (job.result !== null) {
       bytes = new TextEncoder().encode(JSON.stringify(job.result));
@@ -341,21 +315,29 @@ export async function applyBackfill(
     if (ref && bytes) {
       // Ticket first, only while the scope is live: an erase from here on leaves the ticket.
       // Leased: the sweeper skips it while the lease is live (P1-c).
+      // Dispatch (write-obligation v3): the ticket and a NEW invocation id, committed before the PUT.
+      const invocationId = randomUUID();
       const ticket = await db.query(
-        `INSERT INTO sessions.session_analysis_result_tickets
-           (result_key, job_id, org_id, workspace_id, session_id, reason, lease_expires_at, writer_token, generation)
-         SELECT $1, $5::uuid, $2, $3, $4, 'publishing', now() + make_interval(secs => $6::integer), $7::uuid, $8
-          WHERE ${LIVE} AND ${GENERATION} AND ${NOT_PURGED}
-         ON CONFLICT (result_key) DO UPDATE
-           SET created_at = now(), lease_expires_at = excluded.lease_expires_at, writer_token = excluded.writer_token
-           WHERE sessions.session_analysis_result_tickets.reason = 'publishing'
-             AND sessions.session_analysis_result_tickets.job_id = excluded.job_id
-             -- A takeover only after the holder's lease expired (its PUT was bounded inside it).
-             AND (sessions.session_analysis_result_tickets.lease_expires_at IS NULL
-                  OR sessions.session_analysis_result_tickets.lease_expires_at <= now()
-                  OR sessions.session_analysis_result_tickets.writer_token = excluded.writer_token)
+        `WITH t AS (
+           INSERT INTO sessions.session_analysis_result_tickets
+             (result_key, job_id, org_id, workspace_id, session_id, reason, lease_expires_at, writer_token, generation)
+           SELECT $1, $5::uuid, $2, $3, $4, 'publishing', now() + make_interval(secs => $6::integer), $7::uuid, $8
+            WHERE ${LIVE} AND ${GENERATION} AND ${NOT_PURGED}
+           ON CONFLICT (result_key) DO UPDATE
+             SET created_at = now(), lease_expires_at = excluded.lease_expires_at, writer_token = excluded.writer_token,
+                 generation = excluded.generation, rev = nextval('sessions.session_analysis_ticket_rev_seq')
+             WHERE sessions.session_analysis_result_tickets.reason = 'publishing'
+               AND sessions.session_analysis_result_tickets.job_id = excluded.job_id
+               -- A takeover only after the holder's lease expired (its PUT was bounded inside it).
+               AND (sessions.session_analysis_result_tickets.lease_expires_at IS NULL
+                    OR sessions.session_analysis_result_tickets.lease_expires_at <= now()
+                    OR sessions.session_analysis_result_tickets.writer_token = excluded.writer_token)
+           RETURNING result_key
+         )
+         INSERT INTO sessions.session_analysis_ticket_invocations (invocation_id, result_key, writer_token, generation)
+         SELECT $9::uuid, t.result_key, $7::uuid, $8 FROM t
          RETURNING result_key`,
-        [ref.key, ...scopeParams, job.id, BACKFILL_TICKET_LEASE_SECONDS, writer, generation],
+        [ref.key, ...scopeParams, job.id, BACKFILL_TICKET_LEASE_SECONDS, writer, generation, invocationId],
       );
       if (!ticket.rows.length) throw new BackfillError("backfill_session_not_live");
       // Erase barrier: immediately before the Put, the ticket must still be ours, 'publishing'
@@ -376,7 +358,12 @@ export async function applyBackfill(
       let ack: AnalysisPutAck | null = null;
       let putError: unknown = null;
       try {
-        ack = await boundedPut(store, ref.key, bytes, ref.sha256, options.putTimeoutMs);
+        ack = await boundedPut(store, ref.key, bytes, ref.sha256, options.putTimeoutMs, {
+          // A timeout, abort, error or lost response leaves the invocation DISPATCHED.
+          onRefused: () => evidence.refused(db, ref!.key, invocationId),
+        });
+        // Only this request's OWN ack is evidence: the exact version it created.
+        if (ack.created && ack.versionId) await evidence.acked(db, ref.key, invocationId, ack.versionId);
       } catch (error) {
         putError = error;
       }
@@ -401,10 +388,24 @@ export async function applyBackfill(
       const read = await readAll(got.body);
       if (createHash("sha256").update(read).digest("hex") !== ref.sha256) throw new BackfillError("backfill_write_verification_failed");
       // The exact version this publication owns (the unknown-PUT sweeper never erases it).
-      versionId = ack?.versionId ?? got.meta.version.version ?? null;
+      versionId = ack?.versionId ?? got.meta.version.version ?? "null";
+      publishInvocation = invocationId;
       objects += 1;
     }
-    const { rows } = await scopeLock((tx) => tx.query<{ live: boolean; inserted: number; current: boolean }>(
+    const { rows } = await scopeLock(async (tx) => {
+      // Publish (write-obligation v3): the ticket ROW LOCK that the sweep's reserve takes, with the
+      // row's reserved_versions predicate; a reserved version is never published.
+      if (ref) {
+        const lk = await tx.query(
+          `/* backfill:publish-lock */ SELECT 1 FROM sessions.session_analysis_result_tickets
+            WHERE result_key = $1 AND job_id = $2::uuid AND writer_token = $3::uuid AND reason = 'publishing'
+              AND NOT ($4::text = ANY (reserved_versions))
+            FOR UPDATE`,
+          [ref.key, job.id, writer, versionId ?? "null"],
+        );
+        if (!lk.rows.length) throw new BackfillError("backfill_ticket_lease_lost");
+      }
+      return tx.query<{ live: boolean; inserted: number; current: boolean }>(
       `WITH ins AS (
          INSERT INTO sessions.session_analysis_jobs_v2
            (id, org_id, workspace_id, session_id, harness, status, attempts, analysis_version, schema_version,
@@ -413,19 +414,33 @@ export async function applyBackfill(
          SELECT $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'neon_backfill',
                 $18::timestamptz, $19::timestamptz, $20::timestamptz, $23
           WHERE ${LIVE} AND sessions.session_analysis_source_revision($2, $3, $4) = $22::text AND ${NOT_PURGED}
+            AND ($14::text IS NULL OR NOT EXISTS (SELECT 1 FROM sessions.session_analysis_ticket_reservations AS v
+                                                   WHERE v.result_key = $14 AND v.version_id = $23))
          ON CONFLICT (id) DO NOTHING RETURNING id
+       ), own AS (
+         DELETE FROM sessions.session_analysis_ticket_invocations AS i
+          WHERE $24::uuid IS NOT NULL AND i.invocation_id = $24::uuid AND i.result_key = $14 AND EXISTS (SELECT 1 FROM ins)
+         RETURNING i.invocation_id
        ), retired AS (
          DELETE FROM sessions.session_analysis_result_tickets AS t
           WHERE $14::text IS NOT NULL AND t.result_key = $14 AND t.job_id = $1::uuid AND t.reason = 'publishing'
             AND t.writer_token = $21::uuid AND EXISTS (SELECT 1 FROM ins)
+            AND NOT EXISTS (SELECT 1 FROM sessions.session_analysis_ticket_invocations AS i
+                             WHERE i.result_key = $14 AND i.invocation_id IS DISTINCT FROM $24::uuid)
+         RETURNING t.result_key
+       ), bumped AS (
+         UPDATE sessions.session_analysis_result_tickets AS t SET rev = nextval('sessions.session_analysis_ticket_rev_seq')
+          WHERE $14::text IS NOT NULL AND t.result_key = $14 AND EXISTS (SELECT 1 FROM ins) AND NOT EXISTS (SELECT 1 FROM retired)
          RETURNING t.result_key
        )
        SELECT ${LIVE} AS live, (SELECT count(*) FROM ins)::int AS inserted,
               (sessions.session_analysis_source_revision($2, $3, $4) IS NOT DISTINCT FROM $22::text AND ${NOT_PURGED}) AS current`,
       [job.id, ...scopeParams, job.harness, job.status, job.attempts, job.analysis_version, job.schema_version,
        job.model_version, job.summary_version, job.summary_model_version, job.source_fingerprint, ref?.key ?? null,
-       ref?.sha256 ?? null, ref?.bytes ?? null, job.last_error, job.created_at, job.updated_at, job.completed_at, writer, generation, versionId],
-    ));
+       ref?.sha256 ?? null, ref?.bytes ?? null, job.last_error, job.created_at, job.updated_at, job.completed_at, writer, generation, versionId,
+       publishInvocation],
+      );
+    });
     if (!rows[0]?.live) throw new BackfillError("backfill_session_not_live");
     if (!(rows[0] as { current?: boolean }).current) throw new BackfillError("backfill_generation_changed");
     if (Number(rows[0]?.inserted) !== 1) {

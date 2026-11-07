@@ -62,6 +62,12 @@ const fresh = async () => {
   return db;
 };
 const tempStore = () => createFsStore({ root: mkdtempSync(join(tmpdir(), "analysis-bf-")) });
+/** One due sweep through the shared reconcile (clears any backoff first). */
+async function sweepNow(db: PGlite, store: ObjectStore, eraser: unknown) {
+  // Time passes: past the grace, any writer lease expired, any backoff due.
+  await db.query("UPDATE sessions.session_analysis_result_tickets SET next_sweep_at = NULL, created_at = now() - interval '1 day', lease_expires_at = CASE WHEN lease_expires_at IS NULL THEN NULL ELSE now() - interval '1 second' END");
+  return sweepAnalysisTickets(store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraser: eraser as never });
+}
 /** The shared paged eraser over the unversioned fs store (src/migration/neon-s3-erasure). */
 const fsEraser = (store: ObjectStore) => ({ eraser: storeEraser(store) });
 async function readSp(db: PGlite, store: ObjectStore) {
@@ -353,13 +359,16 @@ test("P1-b (verification): a Put stalled past its lease, then sweep + tombstone,
   };
   await expect(applyBackfill(hoopDb(db), paused, SCOPE, planBackfill(SCOPE, NEON), { eraser: v.eraser })).rejects.toThrow("backfill_ticket_lease_lost");
   expect(written).not.toBe("");
+  // The landed write's OWN ack was recorded; the shared reconcile reserves then erases it and,
+  // the acked version being absent, resolves the invocation and retires the obligation.
+  expect(await sweepNow(db, v.store, v.eraser)).toBe(1);
   expect(v.ids(written)).toEqual([]);
   expect(await v.store.head(objectKey(written))).toBeUndefined();
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
 });
 
-test("P1 (final): if the exact-version erase throws once after the fence, a durable ticket survives and a later sweep clears every version", async () => {
+test("P1 (final): if the sweep's delete ack is lost after the fence, the obligation survives and a later sweep clears every version", async () => {
   const db = await fresh();
   const v = versionedStore(tempStore());
   let written = "";
@@ -373,14 +382,14 @@ test("P1 (final): if the exact-version erase throws once after the fence, a dura
       return v.store.put(key, body, opts);
     },
   };
-  let lose = true;
-  v.s3.onDelete = () => (lose ? ((lose = false), "lose") : undefined); // the exact delete's ack is lost
-  await expect(applyBackfill(hoopDb(db), paused, SCOPE, planBackfill(SCOPE, NEON), { eraser: v.eraser })).rejects.toThrow();
-  expect(v.ids(written)).toEqual([]); // deleted, but the ack was lost: the erase is unproven
+  await expect(applyBackfill(hoopDb(db), paused, SCOPE, planBackfill(SCOPE, NEON), { eraser: v.eraser })).rejects.toThrow("backfill_ticket_lease_lost");
   const tickets = (await db.query<{ k: string; reason: string }>("SELECT result_key k, reason FROM sessions.session_analysis_result_tickets")).rows;
   expect(tickets).toEqual([{ k: written, reason: "forgotten" }]);
-  await db.query("UPDATE sessions.session_analysis_result_tickets SET created_at = now() - interval '1 second'");
-  expect(await sweepAnalysisTickets(v.store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraser: v.eraser })).toBe(1);
+  let lose = true;
+  v.s3.onDelete = () => (lose ? ((lose = false), "lose") : undefined); // the sweep's DELETE ack is lost
+  expect(await sweepNow(db, v.store, v.eraser)).toBe(0); // the step fails: everything survives
+  expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(1);
+  expect(await sweepNow(db, v.store, v.eraser)).toBe(1);
   expect(v.ids(written)).toEqual([]);
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
 });
@@ -423,6 +432,7 @@ test("item 4: a source-generation change during the PUT (a new manifest etag) re
   };
   await expect(applyBackfill(hoopDb(db), moving, SCOPE, planBackfill(SCOPE, NEON), { eraser: v.eraser })).rejects.toThrow("backfill_ticket_lease_lost");
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
+  expect(await sweepNow(db, v.store, v.eraser)).toBe(1);
   expect(v.ids(written)).toEqual([]);
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
 });
@@ -444,7 +454,8 @@ test("successor-safe: writer A's slow PUT lands AFTER writer B (the new lease) p
     },
   };
   await expect(applyBackfill(hoopDb(db), slowA, SCOPE, plan, { eraser: v.eraser })).rejects.toThrow("backfill_ticket_lease_lost");
-  // B's version stays (and stays published); A's is gone.
+  // The sweep erases only A's acked (unowned) version; B's published version is owned and kept.
+  expect(await sweepNow(db, v.store, v.eraser)).toBe(1);
   expect(v.ids(written)).toEqual(["v00000001"]);
   expect((await db.query<{ k: string }>("SELECT result_s3_key k FROM sessions.session_analysis_jobs_v2")).rows).toEqual([{ k: written }]);
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
@@ -511,7 +522,7 @@ test("final review P1-a: a C3 purge committed after the generation capture inser
   expect((await db.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
 });
 
-test("unknown-PUT: a backfill PUT that loses its response leaves an 'unknown' ticket; the sweeper lists versions and erases the committed stray", async () => {
+test("unknown-PUT: a backfill PUT that loses its response stays UNRESOLVED; the sweep reserves and erases the committed stray but never retires it", async () => {
   const db = await fresh();
   const v = versionedStore(tempStore());
   let written = "";
@@ -524,11 +535,13 @@ test("unknown-PUT: a backfill PUT that loses its response leaves an 'unknown' ti
     },
   };
   await expect(applyBackfill(hoopDb(db), lossy, SCOPE, planBackfill(SCOPE, NEON), { eraser: v.eraser })).rejects.toThrow("socket hang up");
-  expect((await db.query<{ reason: string }>("SELECT reason FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ reason: "unknown" }]);
+  expect((await db.query<{ o: string }>("SELECT outcome o FROM sessions.session_analysis_ticket_invocations")).rows).toEqual([{ o: "dispatched" }]);
   expect(v.ids(written)).toHaveLength(1);
-  expect(await sweepAnalysisTickets(v.store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraser: v.eraser })).toBe(1);
+  // The stray is reserved then erased, but a lost response is no evidence: the obligation stays.
+  expect(await sweepNow(db, v.store, v.eraser)).toBe(0);
   expect(v.ids(written)).toEqual([]);
-  expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
+  expect((await db.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(1);
+  expect((await db.query<{ o: string }>("SELECT outcome o FROM sessions.session_analysis_ticket_invocations")).rows).toEqual([{ o: "dispatched" }]);
 });
 
 test("unknown-PUT: a published backfill job records its exact version; an unknown stray at the same key is erased, the published version kept", async () => {
@@ -543,4 +556,21 @@ test("unknown-PUT: a published backfill job records its exact version; an unknow
     VALUES ($1, gen_random_uuid(), $2, $3, $4, 'unknown', now() - interval '1 day')`, [job.k, KEY.orgId, KEY.workspaceId, KEY.sessionId]);
   expect(await sweepAnalysisTickets(v.store, { graceSeconds: 0, transact: (w) => w(hoopDb(db) as never), eraser: v.eraser })).toBe(1);
   expect(v.ids(job.k)).toEqual(["v00000001"]);
+});
+
+test("v3 publish barrier (backfill path): a version reserved for deletion before the backfill's publish is never published", async () => {
+  const db = await fresh();
+  const v = versionedStore(tempStore());
+  let written = "";
+  const store: ObjectStore = { ...v.store, async put(key, body, opts) { written = String(key); return v.store.put(key, body, opts); } };
+  const { ticketObligationStore } = await import("../store.ts");
+  const reserveFirst = async () => {
+    const t = ticketObligationStore((w) => w(hoopDb(db) as never), written);
+    const state = (await t.load())!;
+    expect(await t.reserve(state.rev, v.ids(written))).toMatchObject({ ok: true });
+  };
+  await expect(applyBackfill(hooked(db, "backfill:post-put", reserveFirst), store, SCOPE, planBackfill(SCOPE, NEON), { eraser: v.eraser }))
+    .rejects.toThrow("backfill_ticket_lease_lost");
+  expect((await db.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
+  expect((await db.query<{ v: string }>("SELECT version_id v FROM sessions.session_analysis_ticket_reservations")).rows).toEqual([{ v: v.ids(written)[0] }]);
 });
