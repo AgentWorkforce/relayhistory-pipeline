@@ -1,6 +1,5 @@
 import type {
   ClickHouseClient,
-  QueryParams,
 } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import {
   featureVersion,
@@ -10,6 +9,7 @@ import {
   type FeatureSnapshot,
 } from "./source.ts";
 import { EVENT_FEATURES_TABLE } from "./event-schema.ts";
+import { featureRetirementCommands } from "./feature-retirement.ts";
 export class EventFeatureError extends Error {
   constructor(readonly reason: string) {
     super("Event feature publication refused");
@@ -204,28 +204,9 @@ export async function publishEventFeatureSnapshots(
   deps.signal?.throwIfAborted();
   try {
     await deps.ch.insert(EVENT_FEATURES_TABLE, rows);
-    const erased = rows.filter((r) => r.deleted === 1);
-    if (erased.length) {
-      const params: QueryParams = {};
-      const where = erased.map((r, n) => {
-        const terms = keyFields.map((f, i) => {
-          const name = "k" + n + "_" + i;
-          params[name] = r[f] as string;
-          return f === "ts"
-            ? f + "=parseDateTime64BestEffort({" + name + ":String},6,'UTC')"
-            : f + "={" + name + ":String}";
-        });
-        params["v" + n] = r.version as string;
-        terms.push("version<{v" + n + ":UInt64}");
-        return "(" + terms.join(" AND ") + ")";
-      });
-      await deps.ch.command(
-        "DELETE FROM " + EVENT_FEATURES_TABLE + " WHERE " + where.join(" OR "),
-        {
-          params,
-          settings: { lightweight_deletes_sync: 2, max_query_size: 1048576 },
-        },
-      );
+    for (const command of featureRetirementCommands(EVENT_FEATURES_TABLE, rows)) {
+      deps.signal?.throwIfAborted();
+      await deps.ch.command(command.query, command.options);
     }
     deps.signal?.throwIfAborted();
     const current = await readFeatureSnapshots(
