@@ -258,7 +258,8 @@ async function init(composition?: SearchComposition): Promise<Runtime> {
   });
   if (!SecretString) throw new Error("session pipeline secret has no value yet");
   const rt = runtimeFromSecret(env, SecretString, publicationSchema.expected.generation, composition,
-    { storageVerifySql: publicationSchema.portableStorageVerifier, ...(publicationSchema.expected.dbMode ? { dbMode: publicationSchema.expected.dbMode } : {}) });
+    { storageVerifySql: publicationSchema.portableStorageVerifier, expectedNames: publicationSchema.expected.names,
+      ...(publicationSchema.expected.dbMode ? { dbMode: publicationSchema.expected.dbMode } : {}) });
   await admitWriterRuntime(rt, env, composition, publicationSchema.portableStorageVerifier, publicationSchema.expected.dbMode);
   return rt;
 }
@@ -305,7 +306,13 @@ export const PORTABLE_MARKER_NAME = "session_directory_search_worker";
 export interface PortableWorkAdmission {
   readonly storageVerifySql?: string;
   readonly dbMode?: string;
+  /** The build's expected schema step names (DerivedSchemaAssets.expected.names). */
+  readonly expectedNames?: readonly string[];
 }
+
+/** The migration ledger (src/hoopdb/migrate.ts MIGRATION_LEDGER); literal for the same
+ * bundling reason as the marker. */
+export const PORTABLE_LEDGER_TABLE = "sessions.__96bulls_migrations";
 
 /**
  * Current-work freshness gate for a composition that declares admission. Runs at the
@@ -324,12 +331,29 @@ export async function portableWorkGate(
 ): Promise<void> {
   const storageVerifySql = admission?.storageVerifySql;
   if (!storageVerifySql?.trim()) throw new PortableConnectionRefused("storage_verifier_missing");
-  const marker = (await tx.query<{ status: string; generation: string }>(
-    `SELECT status, generation FROM ${PORTABLE_MARKER_TABLE} WHERE name = $1`, [PORTABLE_MARKER_NAME])).rows;
-  if (marker.length !== 1) throw new PortableConnectionRefused("work_gate_marker_missing");
-  if (marker[0]!.generation !== schemaGeneration) throw new PortableConnectionRefused("work_gate_generation_mismatch");
-  if (marker[0]!.status !== "pass") throw new PortableConnectionRefused("work_gate_marker_pending");
+  const names = (admission?.expectedNames ?? []).filter(n => !/^(shim|bootstrap|verify):/.test(n));
+  if (!names.length) throw new PortableConnectionRefused("work_gate_expected_names_missing");
+  // Same current-tick semantics as schemaVerdict: READ COMMITTED, so every statement
+  // takes a fresh snapshot and the FINAL marker read sees a migrator's committed flip
+  // that happened while the verifier ran. First statement that could take a snapshot.
+  await tx.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+  // Ledger membership: every expected schema step applied; the marker is not the sole
+  // authority (schemaVerdict: schema_pending).
+  const applied = (await tx.query<{ n: string | number }>(
+    `SELECT count(DISTINCT name) AS n FROM ${PORTABLE_LEDGER_TABLE} WHERE name = ANY($1::text[])`, [names])).rows[0];
+  if (Number(applied?.n ?? 0) !== new Set(names).size) throw new PortableConnectionRefused("work_gate_schema_pending");
+  const passed = async (): Promise<void> => {
+    const marker = (await tx.query<{ status: string; generation: string }>(
+      `SELECT status, generation FROM ${PORTABLE_MARKER_TABLE} WHERE name = $1`, [PORTABLE_MARKER_NAME])).rows;
+    if (marker.length !== 1) throw new PortableConnectionRefused("work_gate_marker_missing");
+    if (marker[0]!.generation !== schemaGeneration) throw new PortableConnectionRefused("work_gate_generation_mismatch");
+    if (marker[0]!.status !== "pass") throw new PortableConnectionRefused("work_gate_marker_pending");
+  };
+  await passed();
   await composition.admit!(tx, "writer", { storageVerifySql, ...(admission?.dbMode ? { dbMode: admission.dbMode } : {}) });
+  // FINAL read, after full verification and immediately before work: the verdict holds as
+  // of this read (as schemaVerdict's); a flip committed during verification refuses here.
+  await passed();
 }
 
 /** One search pass: optional freshness gate first, then the work, on one transaction. */
