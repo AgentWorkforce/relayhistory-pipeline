@@ -510,13 +510,14 @@ describe.skipIf(!url)("C3 privacy authority on actual PostgreSQL", () => {
       expect(fallbacks).toBe(1);
       // The E3 guards refuse it by name before any Client exists.
       expect(errCode(() => authorityUrl("supabase", passwordless))).toBe("database_url_password_required");
-      expect(errCode(() => pinnedPgClient(pg, passwordless, "databaseUrl"))).toBe("database_url_password_required");
+      expect(errCode(() => pinnedPgClient(pg, passwordless, "databaseUrl", "supabase"))).toBe("database_url_password_required");
       // The genuine narrow-role SCRAM login through the pinned DISCRETE config (percent-encoded password in the URL):
       await d.pool.query("ALTER ROLE bulls96_privacy_eraser PASSWORD 'c3@test:only/synthetic%'");
       const good = new URL(d.url);
       good.username = "bulls96_privacy_eraser";
       good.password = encodeURIComponent("c3@test:only/synthetic%");
-      const ok = pinnedPgClient(pg, authorityUrl("supabase", good.href), "databaseUrl");
+      good.searchParams.set("sslmode", "disable"); // loopback test container: the only place disable is accepted
+      const ok = pinnedPgClient(pg, authorityUrl("supabase", good.href), "databaseUrl", "supabase");
       await ok.connect();
       try {
         expect((await ok.query("SELECT system_user::text AS s")).rows[0].s).toBe("scram-sha-256:bulls96_privacy_eraser");

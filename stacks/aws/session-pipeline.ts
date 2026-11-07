@@ -72,6 +72,13 @@ export interface SessionBriefInputs {
   backgroundDailyBudget?: number;
   /** Model attempts across all orgs per UTC day (SESSION_BRIEF_GLOBAL_DAILY_CAP). */
   globalDailyCap?: number;
+  /**
+   * How often the brief tick queues indexed sessions that have no brief at all
+   * (SESSION_BRIEF_SWEEP_SECONDS; store.ts sweepUnbriefed, 100 per sweep). Absent: not set,
+   * so the worker's default (0, off) applies. History that never receives new evidence is
+   * briefed only by this sweep; new evidence arms its own wakeup through indexing.
+   */
+  sweepSeconds?: number;
 }
 
 export const SESSION_PIPELINE_RESOURCES = [
@@ -164,13 +171,16 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     if (b === null || typeof b !== "object" || Array.isArray(b) || Object.getPrototypeOf(b) !== Object.prototype)
       refuse("transcriptStore.sessionPipeline.briefs must be a plain object");
     for (const k of Object.keys(b))
-      if (k !== "enabled" && k !== "backgroundDailyBudget" && k !== "globalDailyCap") refuse(`transcriptStore.sessionPipeline.briefs.${k} is not a known setting`);
+      if (k !== "enabled" && k !== "backgroundDailyBudget" && k !== "globalDailyCap" && k !== "sweepSeconds") refuse(`transcriptStore.sessionPipeline.briefs.${k} is not a known setting`);
     if (typeof b.enabled !== "boolean") refuse("transcriptStore.sessionPipeline.briefs.enabled must be a boolean");
     // The same bounds as src/session-brief/config.ts, so a value here is never silently clamped.
     if (b.backgroundDailyBudget !== undefined && !(Number.isInteger(b.backgroundDailyBudget) && (b.backgroundDailyBudget as number) >= 0 && (b.backgroundDailyBudget as number) <= 1_000_000))
       refuse("transcriptStore.sessionPipeline.briefs.backgroundDailyBudget must be an integer from 0 to 1000000");
     if (b.globalDailyCap !== undefined && !(Number.isInteger(b.globalDailyCap) && (b.globalDailyCap as number) >= 0 && (b.globalDailyCap as number) <= 10_000_000))
       refuse("transcriptStore.sessionPipeline.briefs.globalDailyCap must be an integer from 0 to 10000000");
+    // src/session-brief/config.ts bounds SESSION_BRIEF_SWEEP_SECONDS to 0-86400 (0 = off).
+    if (b.sweepSeconds !== undefined && !(Number.isInteger(b.sweepSeconds) && (b.sweepSeconds as number) >= 0 && (b.sweepSeconds as number) <= 86_400))
+      refuse("transcriptStore.sessionPipeline.briefs.sweepSeconds must be an integer from 0 to 86400");
   }
 }
 
@@ -311,6 +321,7 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_BRIEF_ENABLED: i.p.briefs?.enabled ? "true" : "false",
     ...(i.p.briefs?.backgroundDailyBudget !== undefined ? { SESSION_BRIEF_BACKGROUND_DAILY_BUDGET: String(i.p.briefs.backgroundDailyBudget) } : {}),
     ...(i.p.briefs?.globalDailyCap !== undefined ? { SESSION_BRIEF_GLOBAL_DAILY_CAP: String(i.p.briefs.globalDailyCap) } : {}),
+    ...(i.p.briefs?.sweepSeconds !== undefined ? { SESSION_BRIEF_SWEEP_SECONDS: String(i.p.briefs.sweepSeconds) } : {}),
   };
 }
 

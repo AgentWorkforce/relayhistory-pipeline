@@ -4,6 +4,8 @@
  * JSON object, e.g. `op read ... | jq ... | bun run <job>`; nothing is echoed or logged.
  */
 import { createReadStream, fstatSync } from "node:fs";
+import type { ConnectionOptions } from "node:tls";
+import { postgresTlsOptions } from "../shared/postgres-tls.ts";
 
 /** Environment names that would put a credential, or a path to one, outside RAM. Any of them refuses. */
 export const FORBIDDEN_CREDENTIAL_ENV = [
@@ -27,6 +29,12 @@ export const FORBIDDEN_CREDENTIAL_ENV = [
   "PGSERVICE",
   "PGSERVICEFILE",
   "PGSSLKEY",
+  // TLS / session-target defaults: a stdin URL's TLS mode must never come from the environment.
+  "PGSSLMODE",
+  "PGSSLROOTCERT",
+  "PGSSLCERT",
+  "PGSSLNEGOTIATION",
+  "PGTARGETSESSIONATTRS",
 ] as const;
 
 export const MAX_STDIN_CREDENTIAL_BYTES = 64 * 1024;
@@ -169,18 +177,17 @@ export interface PinnedPgConfig {
   user: string;
   password: string;
   database: string;
-  ssl?: false | Record<string, never>;
+  /** Always explicit: verify-full against the provider's pinned trust (see pinnedPgConfig); false only for a loopback host. */
+  ssl: false | ConnectionOptions;
 }
 
-/** pg 8.x's default (non-libpq) sslmode mapping, kept exactly; `no-verify` (unverified TLS) is refused. */
-const SSLMODES: Record<string, false | Record<string, never>> = { disable: false, prefer: {}, require: {}, "verify-ca": {}, "verify-full": {} };
 
 /**
  * Parses a stdin URL (already checked by its provider guard) into the discrete config the client gets: host, port,
  * user, password and database are decoded from the URL here, so nothing but the bounded stdin document supplies
  * them. Only `sslmode` may appear in the query (anything else would be silently dropped, or override the identity).
  */
-export function pinnedPgConfig(url: string, name: string): PinnedPgConfig {
+export function pinnedPgConfig(url: string, name: string, trust: "supabase" | "neon"): PinnedPgConfig {
   const prefix = name.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
   let u: URL;
   try {
@@ -206,13 +213,15 @@ export function pinnedPgConfig(url: string, name: string): PinnedPgConfig {
   const host = u.hostname.replace(/^\[(.*)\]$/, "$1");
   const port = u.port ? Number(u.port) : 5432;
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new CredentialRefusal(`credentials_invalid.${name}`);
-  const cfg: PinnedPgConfig = { host, port, user, password, database };
+  // TLS is always explicit (never pg's environment fallback): sslmode=verify-full, or sslmode=disable for a
+  // loopback host only (local test databases). Any other mode, or none, is refused before any Client exists.
   const mode = u.searchParams.get("sslmode");
-  if (mode !== null) {
-    if (!Object.hasOwn(SSLMODES, mode)) throw new CredentialRefusal(`${prefix}_sslmode_refused`);
-    cfg.ssl = SSLMODES[mode] === false ? false : {};
-  }
-  return cfg;
+  const loopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
+  if (mode === null) throw new CredentialRefusal(`${prefix}_sslmode_required`);
+  if (mode !== "verify-full" && !(mode === "disable" && loopback)) throw new CredentialRefusal(`${prefix}_sslmode_refused`);
+  // verify-full trust: Supabase's pinned CA (src/shared/postgres-tls.ts, or its explicit custom-CA profile); Neon's
+  // publicly trusted chain against the system roots. The hostname is verified in both.
+  return { host, port, user, password, database, ssl: mode === "disable" ? false : trust === "supabase" ? postgresTlsOptions() : { rejectUnauthorized: true } };
 }
 
 /** The minimal node-postgres surface pinnedPgClient needs (structural, so tests can inject a recording fake). */
@@ -225,8 +234,8 @@ interface PgLike<C> {
  * consults ~/.pgpass only when the resolved password is null, so the constructed client is checked as well: a
  * client whose password is not exactly the stdin one (or that carries a connectionString) is refused before connect().
  */
-export function pinnedPgClient<C extends object>(pg: PgLike<C>, url: string, name: string, extra: Record<string, unknown> = {}): C {
-  const cfg = pinnedPgConfig(url, name);
+export function pinnedPgClient<C extends object>(pg: PgLike<C>, url: string, name: string, trust: "supabase" | "neon", extra: Record<string, unknown> = {}): C {
+  const cfg = pinnedPgConfig(url, name, trust);
   const prefix = name.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
   for (const k of ["connectionString", "host", "port", "user", "password", "database", "ssl"]) if (k in extra) throw new CredentialRefusal(`${prefix}_config_override_refused`);
   const client = new pg.Client({ ...extra, ...cfg });

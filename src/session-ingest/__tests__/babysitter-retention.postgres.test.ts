@@ -216,10 +216,19 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
   });
 
   test("rollback is reversible on an empty registry, then migrate reapplies it", async () => {
+    // Lanes registered after 042000 (043000 brief titles) are applied too: 042000's guard
+    // rightly refuses (55000) while they are, so they roll back first, in descending order,
+    // through their own downs, and migrate reapplies them with 042000.
+    const later = (await pool.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE \"C\" > $1 ORDER BY name COLLATE \"C\" DESC", [NAME])).rows.map((r) => r.name);
+    if (later.length) {
+      await expect(pool.query(readFileSync(join(root, ROLLBACK), "utf8"))).rejects.toMatchObject({ code: "55000" });
+      for (const n of later) await pool.query(readFileSync(join(root, `supabase/rollbacks/${n.slice("upstream:".length).replace(/\.sql$/, ".down.sql")}`), "utf8"));
+    }
     await pool.query(readFileSync(join(root, ROLLBACK), "utf8"));
     expect((await pool.query("SELECT to_regclass('sessions.babysitter_retention_objects') AS t")).rows[0].t).toBeNull();
     await migrate();
     expect((await pool.query("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name=$1", [NAME])).rows[0].n).toBe(1);
+    for (const n of later) expect((await pool.query("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name=$1", [n])).rows[0].n).toBe(1);
   }, 120000);
 
   test("M1: rollback refuses (55000) while a delete-only batch's permanent tombstone exists, though no bucket was ever registered", async () => {
