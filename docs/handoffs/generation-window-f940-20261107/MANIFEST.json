@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "at": "2026-11-07T19:01:53.523958+00:00",
+  "kind": "source_only_generation_window_draft",
+  "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "readiness": "HOLD; complete live target and prerequisite evidence before approval",
+  "files": [
+    {
+      "name": "generation-window.md",
+      "bytes": 31301,
+      "sha256": "3a687532d7ca518dc498a0ac395aae8679f51488aa243ed861629e28ee0fe149"
+    },
+    {
+      "name": "readonly-plan.json",
+      "bytes": 20210,
+      "sha256": "9f18fc767ca002522060e53012e861411dc52c7b90d77172254d30cafc4d3100"
+    },
+    {
+      "name": "capture.json",
+      "bytes": 2428,
+      "sha256": "f561d85d2b422c5fc0bcc07ff4bede94e071d086d89dcb8c71752c045dcf33e0"
+    },
+    {
+      "name": "readonly-preparation-receipt.json",
+      "bytes": 3110,
+      "sha256": "ab2ba135b8086d6f502f18e1df3dab482ce0ff4ab0cc70bda651b2ed3f20e6f0"
+    },
+    {
+      "name": "execution-targets.json",
+      "bytes": 2323,
+      "sha256": "481ad94a377262d43f62f69f9b3cec9c7a64807b68447cac4316af50f7c10fc9"
+    },
+    {
+      "name": "source-evidence.json",
+      "bytes": 7877,
+      "sha256": "904f6ce4e3ab284420c67ffa400fc0403ee16b2b7653d51fb982c7c16d58f074"
+    },
+    {
+      "name": "review-notes.md",
+      "bytes": 1637,
+      "sha256": "1f688c36e446a6a4b1e161404ee93db94bdddc0967e69ec3df37b14ef26c6726"
+    }
+  ]
+}

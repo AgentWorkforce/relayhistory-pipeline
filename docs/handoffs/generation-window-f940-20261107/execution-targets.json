@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "status": "HOLD_SOURCE_DRAFT_ONLY",
+  "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "schemaGeneration": "e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",
+  "captureGenerationIsSchemaGeneration": false,
+  "capturedPlanSha256": "9f18fc767ca002522060e53012e861411dc52c7b90d77172254d30cafc4d3100",
+  "capturedCaptureSha256": "f561d85d2b422c5fc0bcc07ff4bede94e071d086d89dcb8c71752c045dcf33e0",
+  "lastRetainedG1": "78c7b28e5ebce7f5f534a1f3f41a55845251e950b6c4c49f676f2bda358c91d6",
+  "freshG1MarkerPolicyAdmissionsProof": null,
+  "preWindowRoleAttributesMembershipSettingsProof": null,
+  "privilegedBootstrapAuthorizationIfNeeded": null,
+  "full21MigrationRehearsalAndMeasuredOutageBudget": null,
+  "preWindowTrafficGcHealthEvidence": null,
+  "worker": {
+    "candidateSource": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+    "currentDeployedSourceAndVersion": null,
+    "compatibilityDeltaReview": null,
+    "semanticInputsSha256": null,
+    "nativePlanSha256": null,
+    "provenanceSha256": null,
+    "bundleSha256": null,
+    "qualifiedMemoryBroker": null
+  },
+  "bufferedGc": {
+    "candidateSource": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+    "zipSha256": null,
+    "immutableS3Version": null,
+    "templateSha256": "1cc115091b443e31bc8c98bd2d213b163cfa5a95b19dfe49d73446c88c7e2150",
+    "currentTemplateAndPreservedParametersProof": null,
+    "reviewedChangeSetIdAndSha256": null,
+    "currentAwsOperatorIdentityAndWrapperPin": null,
+    "requiredExplicitInputs": {
+      "AwsAccountId": "941433935742",
+      "SupabaseProjectRef": "pyamkrhoyszgzirqqffq"
+    }
+  },
+  "publisherAndPublicationGc": {
+    "candidateSource": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+    "activeRuntimeInventory": null,
+    "host": null,
+    "launcher": null,
+    "managedRoleProfile": null,
+    "preservedEnablement": null,
+    "artifactSha256": null,
+    "reviewedReplacementCommand": null
+  },
+  "otherGenerationBoundConsumers": {
+    "indexerAndSessionPipelineInventory": null,
+    "replacementOrDocumentedInactiveDecision": null,
+    "reviewedDeploymentCaptures": null
+  },
+  "approvalQuotePlaceholder": "FINAL_EXECUTION_TARGETS_SHA256 is computed only after all readiness slots are resolved; do not use this draft digest as a substitute",
+  "productionWritesPerformed": false
+}
