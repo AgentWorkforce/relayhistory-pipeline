@@ -23,6 +23,7 @@ import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces } from "./app.ts";
 import { sqlDirectory } from "./directory.ts";
+import { sqlBriefTitles } from "./brief-titles.ts";
 import { relayAuthVerifier, type AuthConfig } from "./auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
@@ -126,6 +127,8 @@ export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessE
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
     directory: sqlDirectory(poolTenantRunner(pool as never)),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
+    briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
+    briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
     log: (fields) => log.info("session read", fields),
   });

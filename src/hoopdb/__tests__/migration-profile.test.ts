@@ -1521,6 +1521,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const T = "upstream:20261105038000_claim_attempt_records_retirement.sql";
     const G = "upstream:20261105039000_buffered_gc_single_candidate.sql";
     const Z = "upstream:20261105040000_ingest_lazy_source_tables.sql";
+    const Y = "upstream:20261105041000_ingest_privacy_authority.sql";
+    const H = "upstream:20261105043000_brief_titles.sql";
     const PE = "upstream:20261105044000_pr_evidence.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
@@ -1528,13 +1530,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, PE]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, PE]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, PE]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, PE]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
@@ -1548,6 +1550,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toEqual(expect.arrayContaining([C, D, K, S, E]));
     const relation = async (name: string) =>
       (await db.query<{ r: string | null }>("SELECT to_regclass($1)::text r", [name])).rows[0]?.r ?? null;
+    const lazySrc = async () =>
+      (await db.query<{ s: string }>("SELECT string_agg(prosrc, '' ORDER BY oid) s FROM pg_proc WHERE oid IN ('sessions.ingest_lazy_user(jsonb,text,jsonb)'::regprocedure, 'sessions.ingest_lazy_begin(jsonb,text)'::regprocedure)")).rows[0]!.s;
     const catalogRpc = async () =>
       (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.session_directory_desktop_catalog(text,text,text)'::regprocedure")).rows[0]!.s;
     const routeRpc = async () =>
@@ -1569,14 +1573,60 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // Later lanes roll back first and remove their own ledger rows; only then
-    // Roll back the complete039/038 suffix in descending order before earlier lanes.
-    // 044000 (F3 PR evidence) is the latest lane: 040000 and 039000 refuse until it rolls back.
+    // 044000 (F3 PR evidence) is the latest lane: every earlier lane down (043000..039000)
+    // refuses (55000) while it is applied, so it rolls back first.
+    expect(await names()).toContain(PE);
+    expect((await failure(rollback("20261105043000_brief_titles.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(H);
     expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105039000_buffered_gc_single_candidate.down.sql")))?.code).toBe("55000");
     await rollback("20261105044000_pr_evidence.down.sql");
     expect(await names()).not.toContain(PE);
     expect(await relation("sessions.session_pr_evidence_state")).toBeNull();
-    // 040000 is then the latest lane: 039000 refuses while it is applied.
+    // 043000 (F2 brief titles) is the latest: 042000, 041000, 040000 and 039000 all refuse
+    // (55000) while it is applied, so it rolls back first.
+    expect(await names()).toContain(H);
+    expect((await failure(rollback("20261105042000_babysitter_evidence_retention.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain("upstream:20261105042000_babysitter_evidence_retention.sql");
+    expect((await failure(rollback("20261105041000_ingest_privacy_authority.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Y);
+    expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Z);
+    expect((await failure(rollback("20261105039000_buffered_gc_single_candidate.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(G);
+    await rollback("20261105043000_brief_titles.down.sql");
+    expect(await names()).not.toContain(H);
+    // Roll back the complete 041000..038000 suffix in descending order before earlier lanes.
+    // 042000 (babysitter retention) is the latest lane: 041000 refuses until it rolls back.
+    const BR = "upstream:20261105042000_babysitter_evidence_retention.sql";
+    expect(await names()).toContain(BR);
+    expect((await failure(rollback("20261105041000_ingest_privacy_authority.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Y);
+    await rollback("20261105042000_babysitter_evidence_retention.down.sql");
+    expect(await names()).not.toContain(BR);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.babysitter_retention_objects')::text r")).rows[0]?.r).toBeNull();
+    // 041000 is the latest lane: 040000 refuses while it is applied; its own down needs Neon authority (no row).
+    expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Z);
+    await db.query("INSERT INTO sessions.ingest_privacy_authority(state,control_epoch) VALUES('fenced',$1)", ["3".repeat(64)]);
+    expect((await failure(rollback("20261105041000_ingest_privacy_authority.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Y);
+    await db.query("DELETE FROM sessions.ingest_privacy_authority");
+    // 041000's own down refuses while any later upstream migration is ledgered.
+    await db.query(
+      "INSERT INTO sessions.__96bulls_migrations SELECT (jsonb_populate_record(NULL::sessions.__96bulls_migrations, to_jsonb(m) || jsonb_build_object('name', $2::text))).* FROM sessions.__96bulls_migrations m WHERE m.name = $1",
+      [Y, "upstream:20261105041500_later_fixture.sql"],
+    );
+    expect((await failure(rollback("20261105041000_ingest_privacy_authority.down.sql")))?.code).toBe("55000");
+    await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", ["upstream:20261105041500_later_fixture.sql"]);
+    expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
+    await rollback("20261105041000_ingest_privacy_authority.down.sql");
+    expect(await names()).not.toContain(Y);
+    // The 041000 down restores the EXACT 040000 lazy bodies (prefix exclusion), not 055000's.
+    expect((await lazySrc()).split("NOT LIKE 'ingest\\_frozen\\_source\\_%'").length).toBe(3);
+    expect(await lazySrc()).not.toContain("NOT IN('ingest_frozen_source_records'");
+    expect(await relation("sessions.ingest_privacy_authority")).toBeNull();
+    // 040000 is the latest lane: 039000 refuses while it is applied.
     expect((await failure(rollback("20261105039000_buffered_gc_single_candidate.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(G);
     await rollback("20261105040000_ingest_lazy_source_tables.down.sql");
@@ -1640,9 +1690,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).not.toContain(B);
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_brief_document_scopes')::text r")).rows[0]?.r).toBeNull();
     // The very next migrate reapplies 024000, 025000, 026000, 030000, 031000, 032000, 033000 (F10), 034000 (P3b),
-    // 035000 through039000; the post-validation exact-ACL check finds no drift.
+    // 035000 through 039000, 040000 (lazy source tables) and 041000 (privacy authority); the post-validation
+    // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, PE]));
+    // Up again: 041000's exact source-table list is back in both lazy functions.
+    expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, PE]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
@@ -1757,10 +1810,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(10);
+    expect(targets.rows).toHaveLength(12);
     expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
     const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
     const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);

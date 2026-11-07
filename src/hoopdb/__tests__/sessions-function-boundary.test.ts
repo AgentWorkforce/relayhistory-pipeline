@@ -12,6 +12,7 @@ import { LANES } from "../../../scripts/sessions-function-boundary/lanes/index.t
 import { ingestHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-history.ts";
 import { bufferedGcSingleCandidate } from "../../../scripts/sessions-function-boundary/lanes/buffered-gc-single-candidate.ts";
 import { lazySourceTables, originalBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-source-tables.ts";
+import { privacyAuthority, originalLazyBodies, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
 import { createHash } from "node:crypto";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
@@ -47,14 +48,18 @@ describe("unified sessions function-boundary generator", () => {
     expect(c.outputs).toEqual(a.outputs);
     expect(Object.keys(a.outputs).sort()).toEqual([
       "src/hoopdb/migrate-guards.ts", "src/hoopdb/sessions-function-acl.json",
+      "supabase/bootstrap/babysitter_retention_verify.sql",
       "supabase/bootstrap/canonical_project_events_verify.sql",
       "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql",
+      "supabase/bootstrap/privacy_eraser_verify.sql",
       "supabase/bootstrap/session_directory_search_worker_verify.sql", "supabase/bootstrap/session_ingest_verify.sql",
       "supabase/bootstrap/session_read_api_role_verify.sql",
       "supabase/rollbacks/20261105026000_canonical_history_lineage.down.sql",
       "supabase/rollbacks/20261105033000_canonical_project_events.down.sql",
       "supabase/rollbacks/20261105039000_buffered_gc_single_candidate.down.sql",
       "supabase/rollbacks/20261105040000_ingest_lazy_source_tables.down.sql",
+      "supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql",
+      "supabase/rollbacks/20261105042000_babysitter_evidence_retention.down.sql",
       "supabase/rollbacks/20261105044000_pr_evidence.down.sql",
     ]);
   });
@@ -92,6 +97,34 @@ describe("unified sessions function-boundary generator", () => {
     }
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("041000 privacy authority: exactly two ingest-callable SECDEF functions; the rollback restores the 010000 mirror and the 040000 lazy bodies verbatim behind its guards", async () => {
+    const g = await generate(repo, LANES, VERIFIERS);
+    expect(g.summary.lanes["privacy-authority"]).toEqual({ functions: 17, replaces: 4, grants: 6 });
+    const acl = JSON.parse(g.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    const granted = Object.entries(acl).filter(([k, v]) => k.startsWith("sessions.ingest_privacy_authority_") && v.some((x) => x.startsWith("bulls96_session_ingest"))).map(([k]) => k).sort();
+    expect(granted).toEqual(["sessions.ingest_privacy_authority_begin(jsonb)", "sessions.ingest_privacy_authority_complete(jsonb)"]);
+    const down = g.outputs["supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql"]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, privacyAuthority.migration!), "utf8")).digest("hex"));
+    for (const body of originalMirrorBodies(readFileSync(join(root, "supabase/migrations/20261105010000_frozen_source_custody.sql"), "utf8"))) {
+      expect(down).toContain(body);
+      expect(down.indexOf(body)).toBeLessThan(down.indexOf("DROP FUNCTION sessions.ingest_privacy_authority_lock(boolean);"));
+    }
+    // The 040000 lazy-current bodies (prefix exclusion) are restored EXACTLY, not 055000's.
+    const lazy = originalLazyBodies(readFileSync(join(root, "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql"), "utf8"));
+    expect(lazy.length).toBe(2);
+    for (const body of lazy) {
+      expect(body).toContain("NOT LIKE 'ingest\\_frozen\\_source\\_%'");
+      expect(down).toContain(body);
+    }
+    expect(down).not.toContain("NOT IN('ingest_frozen_source_records'");
+    const up = readFileSync(join(root, privacyAuthority.migration!), "utf8");
+    expect(up.match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
+    expect(up).not.toContain("NOT LIKE 'ingest\\_frozen");
+    expect(down.indexOf("release to neon first")).toBeLessThan(down.indexOf("DROP TRIGGER"));
+    expect(down).toContain("a later migration is applied");
     expect(down.trim().endsWith("COMMIT;")).toBe(true);
   });
 
