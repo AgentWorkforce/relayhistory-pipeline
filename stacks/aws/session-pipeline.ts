@@ -43,6 +43,12 @@ export interface SessionPipelineInputs {
   searchIndex?: boolean;
   /** Default off; source identity must match the immutable CH copier binding. */
   semanticCopy?: {enabled:boolean;sourceId:string};
+  /**
+   * Session analysis jobs (src/session-analysis, lane F1). Absent or `enabled: false`: the
+   * schedule is DISABLED and SESSION_ANALYSIS_ENABLED is "false". The model key comes only
+   * from the pipeline secret's `openai_api_key` (operator-loaded from 1Password).
+   */
+  analysisJobs?: {enabled:boolean};
   /** Default off. `true` is refused until the reviewed normalized-prefix PutObject/KMS grant and publication migration exist. */
   replayPages?: boolean;
   /** Dormant full v1 analysis-cache worker; separate readonly source secret required. */
@@ -95,6 +101,8 @@ export const SESSION_PIPELINE_RESOURCES = [
  */
 export const SESSION_BRIEF_RESOURCES = ["session-brief-schedule", "session-brief-permission"] as const;
 export const SESSION_SEMANTIC_COPY_RESOURCES=["session-semantic-copy-schedule","session-semantic-copy-permission"] as const;
+/** The analysis-job schedule (lane F1); its own reviewed phase, like the semantic copier. */
+export const SESSION_ANALYSIS_JOB_RESOURCES=["session-analysis-job-schedule","session-analysis-job-permission"] as const;
 /** The brief tick runs this often. */
 export const BRIEF_SCHEDULE_MINUTES = 1;
 export const SESSION_ANALYSIS_CACHE_RESOURCES=["session-analysis-cache-schedule","session-analysis-cache-permission","session-analysis-reconcile-schedule","session-analysis-reconcile-permission"] as const;
@@ -118,6 +126,7 @@ export interface SessionPipelineNames {
   rule: string;
   briefRule: string;
   semanticRule:string;
+  analysisJobRule:string;
 }
 
 export function sessionPipelineNames(stage: string, accountId: string, region: string): SessionPipelineNames {
@@ -133,6 +142,7 @@ export function sessionPipelineNames(stage: string, accountId: string, region: s
     rule: n("session-reconcile"),
     briefRule: n("session-brief"),
     semanticRule:n("session-semantic-copy"),
+    analysisJobRule:n("session-analysis-jobs"),
   };
 }
 
@@ -141,7 +151,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -156,6 +166,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
     refuse("transcriptStore.sessionPipeline.reconcileMinutes must be an integer from 15 to 120");
+  if(v.analysisJobs!==undefined){const c=v.analysisJobs as Record<string,unknown>|null;
+    if(!c||typeof c!=="object"||Array.isArray(c)||Object.getPrototypeOf(c)!==Object.prototype||Object.keys(c).some(k=>k!=="enabled")||typeof c.enabled!=="boolean")refuse("transcriptStore.sessionPipeline.analysisJobs requires exactly { enabled: boolean }");}
   if(v.semanticCopy!==undefined){const c=v.semanticCopy as Record<string,unknown>|null;
     if(!c||typeof c!=="object"||Array.isArray(c)||Object.getPrototypeOf(c)!==Object.prototype||Object.keys(c).some(k=>k!=="enabled"&&k!=="sourceId")||typeof c.enabled!=="boolean"||typeof c.sourceId!=="string"||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(c.sourceId))refuse("transcriptStore.sessionPipeline.semanticCopy requires enabled and an explicit sourceId");
   }
@@ -304,6 +316,7 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_DESKTOP_CATALOG_ENABLED: "0",
     SESSION_SEMANTIC_COPY_ENABLED:i.p.semanticCopy?.enabled?"1":"0",
     SESSION_SEARCH_FEATURE_SOURCE_ID:i.p.semanticCopy?.sourceId??"",
+    SESSION_ANALYSIS_ENABLED:i.p.analysisJobs?.enabled?"true":"false",
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",
@@ -354,7 +367,7 @@ export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { b
  * and brief rules, this account) and the function's own role (the reconcile chain),
  * all `lambda:InvokeFunction` only. Nothing public, no Function URL action.
  */
-export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; analysisRuleArn?:string; analysisReconcileRuleArn?:string; semanticRuleArn?:string; roleArn: string }) {
+export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; analysisRuleArn?:string; analysisReconcileRuleArn?:string; semanticRuleArn?:string; analysisJobRuleArn?:string; roleArn: string }) {
   return [
     {
       id: "session-reconcile-permission",
@@ -389,6 +402,7 @@ export function sessionPipelinePermissions(i: { accountId: string; functionName:
     ...(i.analysisReconcileRuleArn?[{id:"session-analysis-reconcile-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisReconcileRuleArn,sourceAccount:i.accountId}}]:[]),
     ...(i.analysisRuleArn?[{id:"session-analysis-cache-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisRuleArn,sourceAccount:i.accountId}}]:[]),
     ...(i.semanticRuleArn?[{id:"session-semantic-copy-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.semanticRuleArn,sourceAccount:i.accountId}}]:[]),
+    ...(i.analysisJobRuleArn?[{id:"session-analysis-job-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisJobRuleArn,sourceAccount:i.accountId}}]:[]),
   ] as const;
 }
 
@@ -419,6 +433,11 @@ export function analysisReconcileScheduleProps(i:{names:SessionPipelineNames;fun
 /** One bounded background feature tick; defaults disabled and carries no credentials. */
 export function semanticCopyScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
  return {name:i.names.semanticRule,description:"96bulls verified global feature copy",scheduleExpression:"rate(1 minute)",state:i.p.semanticCopy?.enabled?("ENABLED" as const):("DISABLED" as const),targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({semanticCopy:true})}],tags:i.tags};
+}
+
+/** One analysis-job tick a minute (lane F1); DISABLED unless `analysisJobs.enabled`. */
+export function analysisJobScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
+ return {name:i.names.analysisJobRule,description:"96bulls session analysis jobs (relayhistory engine port)",scheduleExpression:"rate(1 minute)",state:i.p.analysisJobs?.enabled?("ENABLED" as const):("DISABLED" as const),targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({sessionAnalysis:true})}],tags:i.tags};
 }
 
 /** Step 1, before the transcripts key and bucket: the function (and so its role) must exist first. */
@@ -481,6 +500,7 @@ export const sessionPipelineWiring = (
     const analysisRule=yield* AWS.EventBridge.Rule("session-analysis-cache-schedule",analysisCacheScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
     const analysisReconcileRule=yield* AWS.EventBridge.Rule("session-analysis-reconcile-schedule",analysisReconcileScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
     const semanticRule=yield* AWS.EventBridge.Rule("session-semantic-copy-schedule",semanticCopyScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
+    const analysisJobRule=yield* AWS.EventBridge.Rule("session-analysis-job-schedule",analysisJobScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
     for (const { id, props } of sessionPipelinePermissions({
       accountId: i.accountId,
       functionName: i.fn.functionName as unknown as string,
@@ -489,6 +509,7 @@ export const sessionPipelineWiring = (
       analysisRuleArn:(analysisRule as unknown as {ruleArn:string}).ruleArn,
       analysisReconcileRuleArn:(analysisReconcileRule as unknown as {ruleArn:string}).ruleArn,
       semanticRuleArn:(semanticRule as unknown as {ruleArn:string}).ruleArn,
+      analysisJobRuleArn:(analysisJobRule as unknown as {ruleArn:string}).ruleArn,
       roleArn,
     }))
       yield* AWS.Lambda.Permission(id, props as never);

@@ -3,11 +3,20 @@
  * harness): relayhistory's admission outcomes and limits, the v1 read projection for
  * native and backfilled rows, the read role guard, erasure, and the worker lease.
  */
-import { beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import type { PGlite } from "@electric-sql/pglite";
 import { database, hoopDb, pointer, KEY } from "../../session-brief/__tests__/harness.ts";
-import { postgresAnalysisJobStore } from "../store.ts";
+import { postgresAnalysisJobStore, sweepAnalysisTickets } from "../store.ts";
+import { createFsStore } from "../../../packages/object-store/src/fs.ts";
+import { objectKey } from "../../../packages/object-store/src/index.ts";
+import { analysisResultKey, analysisResultPrefix, encodeAnalysisResult } from "../results.ts";
+import type { AnalysisJob, AnalysisJobOutput } from "../processor.ts";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  SESSION_ANALYSIS_SUMMARY_MODEL_VERSION,
+  SESSION_ANALYSIS_SUMMARY_VERSION,
   SESSION_ANALYSIS_MODEL_VERSION,
   SESSION_ANALYSIS_RESULT_SCHEMA_VERSION,
   SESSION_ANALYSIS_VERSION,
@@ -20,9 +29,41 @@ setDefaultTimeout(60_000);
 type Json = Record<string, any>;
 let pg: PGlite;
 
-const request = async (session = KEY.sessionId, workspace = KEY.workspaceId, org = KEY.orgId, user = "u-1") =>
-  (await pg.query<{ r: Json }>("SELECT sessions.analysis_request_v1($1, $2, $3, $4) AS r", [org, workspace, user, session]))
-    .rows[0]!.r;
+/** analysis_request_v1 as the admission principal, bound to `bound` (the verified assertion's tenant). */
+async function request(session = KEY.sessionId, workspace = KEY.workspaceId, org = KEY.orgId, user = "u-1", bound = { org, ws: workspace }) {
+  await pg.exec("BEGIN");
+  try {
+    await pg.query("SELECT set_config('bulls96_read.org_id', $1, true), set_config('bulls96_read.workspace_id', $2, true)", [bound.org, bound.ws]);
+    await pg.exec("SET LOCAL ROLE bulls96_analysis_admit");
+    const r = (await pg.query<{ r: Json }>("SELECT sessions.analysis_request_v1($1, $2, $3, $4) AS r", [org, workspace, user, session])).rows[0]!.r;
+    await pg.exec("COMMIT");
+    return r;
+  } catch (error) {
+    await pg.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+const results = () => createFsStore({ root: mkdtempSync(join(tmpdir(), "analysis-jobs-")) });
+const ANCHOR = "org-a/ws-a/m-1/claude/2026-10-29/s-1/manifest.json";
+const jobStore = (store = results()) =>
+  postgresAnalysisJobStore({ db: hoopDb(pg), store, anchorManifestKey: async () => ANCHOR });
+const output = (over: Partial<AnalysisJobOutput> = {}): AnalysisJobOutput => ({
+  harness: "claude", sourceFingerprint: "f".repeat(64), sourceGeneration: "e".repeat(64), inputTokens: 5, outputTokens: 2,
+  result: { schemaVersion: 1, analysisVersion: "v", sourceFingerprint: "f", analysis: {} as never, durationMs: 1, brief: {} as never }, ...over,
+});
+/** reserve -> put -> complete, as runAnalysisJob does; returns the stage reached. */
+async function publish(store: ReturnType<typeof jobStore>, job: AnalysisJob, between?: () => Promise<void>) {
+  const out = output();
+  const { bytes, sha256 } = encodeAnalysisResult(out.result);
+  const key = await store.reserve(job, out, { sha256, bytes: bytes.length });
+  if (!key) return { stage: "refused" as const, key: null };
+  await store.put(key, bytes, sha256);
+  if (between) await between();
+  const ok = await store.complete({ job, output: out, stored: { key, sha256, bytes: bytes.length } });
+  return { stage: ok ? ("completed" as const) : ("lost" as const), key };
+}
+const tx = <T,>(work: (q: { query: (t: string, p?: unknown[]) => Promise<{ rows: any[] }> }) => Promise<T>) => work(hoopDb(pg) as never);
 
 async function readAs(workspace = KEY.workspaceId, session = KEY.sessionId, bound = { org: KEY.orgId, ws: KEY.workspaceId }) {
   await pg.exec("BEGIN");
@@ -38,6 +79,10 @@ async function readAs(workspace = KEY.workspaceId, session = KEY.sessionId, boun
 const age = (table: string, interval: string) =>
   pg.query(`UPDATE sessions.${table} SET created_at = created_at - $1::interval`, [interval]);
 
+afterEach(async () => {
+  await pg.close();
+});
+
 beforeEach(async () => {
   pg = await database();
   // The read role's post-migrate grants (schema USAGE, its column grants and RLS policy).
@@ -50,6 +95,9 @@ describe("analysis_request_v1", () => {
     expect(await request(" ")).toEqual({ outcome: "invalid_request" });
     expect(await request("nope")).toEqual({ outcome: "not_found" });
     expect(await request(KEY.sessionId, "other-ws")).toEqual({ outcome: "not_found" });
+    // The caller's binding pins the tenant: another org/workspace than the bound one is refused.
+    await expect(request(KEY.sessionId, KEY.workspaceId, KEY.orgId, "u-1", { org: KEY.orgId, ws: "ws-b" })).rejects.toThrow(/tenant binding/);
+    await expect(pg.query("SELECT sessions.analysis_request_v1($1, $2, 'u', $3)", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rejects.toThrow(/admission role/);
     const first = await request();
     expect(first.outcome).toBe("accepted");
     expect(first.request).toMatchObject({ sessionId: KEY.sessionId, status: "queued", error: null });
@@ -60,6 +108,8 @@ describe("analysis_request_v1", () => {
       analysis_version: SESSION_ANALYSIS_VERSION,
       schema_version: SESSION_ANALYSIS_RESULT_SCHEMA_VERSION,
       model_version: SESSION_ANALYSIS_MODEL_VERSION,
+      summary_version: SESSION_ANALYSIS_SUMMARY_VERSION,
+      summary_model_version: SESSION_ANALYSIS_SUMMARY_MODEL_VERSION,
       origin: "native",
     });
     // An in-flight analysis answers a repeat request with the same request.
@@ -102,15 +152,43 @@ describe("analysis_request_v1", () => {
 
   test("an analysis completed in the last 30 minutes is reused", async () => {
     const first = await request();
-    await pg.query(
-      `UPDATE sessions.session_analysis_jobs_v2 SET status = 'completed', completed_at = now(),
-         result_s3_key = 'k', result_sha256 = repeat('a', 64), result_bytes = 10`,
-    );
+    const store = jobStore();
+    expect((await publish(store, (await store.claim({ leaseSeconds: 600 }))!)).stage).toBe("completed");
     await age("session_analysis_requests_v2", "3 minutes");
     const second = await request();
     expect(second.request.id).not.toBe(first.request.id);
     expect(second.request).toMatchObject({ analysisId: first.request.analysisId, status: "completed" });
     expect((await pg.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(1);
+  });
+
+  test("P1-2: a completed analysis of an older pointer revision is NOT reused", async () => {
+    const first = await request();
+    const store = jobStore();
+    expect((await publish(store, (await store.claim({ leaseSeconds: 600 }))!)).stage).toBe("completed");
+    await pg.query("UPDATE sessions.session_index SET revision = revision + 1");
+    await age("session_analysis_requests_v2", "3 minutes");
+    const second = await request();
+    expect(second.request.analysisId).not.toBe(first.request.analysisId);
+    expect(second.request.status).toBe("queued");
+  });
+
+  test("P1-3: a backfilled in-flight job neither answers nor blocks a new request", async () => {
+    await pg.query(
+      `INSERT INTO sessions.session_analysis_jobs_v2 (id, org_id, workspace_id, session_id, status, analysis_version, schema_version, model_version, origin)
+       VALUES ('11111111-1111-4111-8111-111111111111', $1, $2, $3, 'queued', 'session-analysis-v2.4:relayhistory-session-v2', 2, 'gpt-5.4', 'neon_backfill')`,
+      [KEY.orgId, KEY.workspaceId, KEY.sessionId],
+    );
+    await pg.query(
+      `INSERT INTO sessions.session_analysis_requests_v2 (org_id, workspace_id, session_id, requested_by_user_id, status, analysis_job_id, origin, created_at)
+       VALUES ($1, $2, $3, 'u', 'queued', '11111111-1111-4111-8111-111111111111', 'neon_backfill', now() - interval '1 day')`,
+      [KEY.orgId, KEY.workspaceId, KEY.sessionId],
+    );
+    const r = await request();
+    expect(r.request.analysisId).not.toBe("11111111-1111-4111-8111-111111111111");
+    expect(r.request.status).toBe("queued");
+    // And the worker never claims a backfilled row.
+    const claimed = await jobStore().claim({ leaseSeconds: 600 });
+    expect(claimed?.id).toBe(r.request.analysisId);
   });
 });
 
@@ -130,14 +208,10 @@ describe("analysis_read_v1", () => {
     expect(await readAs(KEY.workspaceId, "nope")).toEqual({ outcome: "not_found" });
     expect(await readAs()).toEqual({ outcome: "ok", sessionId: KEY.sessionId, requests: [], analyses: [] });
     const accepted = await request();
-    const job = postgresAnalysisJobStore({ db: hoopDb(pg), store: null as never, anchorManifestKey: async () => "" });
+    const job = jobStore();
     const claimed = (await job.claim({ leaseSeconds: 600 }))!;
-    expect(await job.complete({
-      jobId: claimed.id,
-      leaseToken: claimed.leaseToken,
-      output: { harness: "claude", sourceFingerprint: "f".repeat(64), sourceGeneration: "e".repeat(64), inputTokens: 5, outputTokens: 2, result: {} as never },
-      stored: { key: "org-a/x/normalized/session-analysis-v2/j/s.json", sha256: "d".repeat(64), bytes: 42 },
-    })).toBe(true);
+    const published = await publish(job, claimed);
+    expect(published.stage).toBe("completed");
     const env = await readAs();
     expect(env.requests).toEqual([
       expect.objectContaining({ id: accepted.request.id, status: "completed", analysisId: claimed.id, error: null }),
@@ -145,9 +219,10 @@ describe("analysis_read_v1", () => {
     expect(env.analyses).toHaveLength(1);
     expect(env.analyses[0]).toMatchObject({
       id: claimed.id, sourceProvider: "claude", sourceFingerprint: "f".repeat(64), status: "completed",
-      attempts: 1, analysisVersion: SESSION_ANALYSIS_VERSION, schemaVersion: 2, summaryVersion: "",
-      modelVersion: "gpt-5.4", summaryModelVersion: "", origin: "native", error: null,
-      resultRef: { key: "org-a/x/normalized/session-analysis-v2/j/s.json", sha256: "d".repeat(64), bytes: 42 },
+      attempts: 1, analysisVersion: SESSION_ANALYSIS_VERSION, schemaVersion: 2,
+      summaryVersion: "session-summary-v3:workspace-output-v2", modelVersion: "gpt-5.4",
+      summaryModelVersion: "gpt-5.6-luna", origin: "native", error: null,
+      resultRef: { key: published.key },
     });
     expect(env.analyses[0].completedAt).toEqual(expect.any(String));
   });
@@ -194,7 +269,7 @@ describe("analysis_read_v1", () => {
 describe("worker lease (relayhistory repository.ts)", () => {
   test("claim, lease fence, bounded retry with backoff, expiry after max attempts", async () => {
     await request();
-    const store = postgresAnalysisJobStore({ db: hoopDb(pg), store: null as never, anchorManifestKey: async () => "" });
+    const store = jobStore();
     const a = (await store.claim({ leaseSeconds: 600 }))!;
     expect(a.attempts).toBe(1);
     expect(await store.claim({ leaseSeconds: 600 })).toBeNull();
@@ -207,7 +282,7 @@ describe("worker lease (relayhistory repository.ts)", () => {
     expect(b.attempts).toBe(2);
     // A lost lease: it expires; the third attempt reclaims, then expiry at max attempts fails it.
     await pg.query("UPDATE sessions.session_analysis_jobs_v2 SET lease_expires_at = now() - interval '1 second'");
-    expect(await store.complete({ jobId: b.id, leaseToken: b.leaseToken, output: {} as never, stored: {} as never })).toBe(false);
+    expect((await publish(jobStore(), b)).stage).toBe("refused");
     const c = (await store.claim({ leaseSeconds: 600 }))!;
     expect(c.attempts).toBe(3);
     await pg.query("UPDATE sessions.session_analysis_jobs_v2 SET lease_expires_at = now() - interval '1 second'");
@@ -217,14 +292,76 @@ describe("worker lease (relayhistory repository.ts)", () => {
     expect(row).toEqual({ status: "failed", last_error: "analysis_processing_failed" });
   });
 
+  test("P2: fail() is fenced by the lease expiry, not only the token", async () => {
+    await request();
+    const store = jobStore();
+    const a = (await store.claim({ leaseSeconds: 600 }))!;
+    await pg.query("UPDATE sessions.session_analysis_jobs_v2 SET lease_expires_at = now() - interval '1 second'");
+    expect(await store.fail({ jobId: a.id, leaseToken: a.leaseToken, error: "model_refusal", retryable: false })).toBe(false);
+  });
+
   test("a non-retryable failure is final", async () => {
     await request();
-    const store = postgresAnalysisJobStore({ db: hoopDb(pg), store: null as never, anchorManifestKey: async () => "" });
+    const store = jobStore();
     const a = (await store.claim({ leaseSeconds: 600 }))!;
     await store.fail({ jobId: a.id, leaseToken: a.leaseToken, error: "session_quarantined", retryable: false });
     expect((await pg.query<Json>("SELECT status, last_error FROM sessions.session_analysis_jobs_v2")).rows[0]).toEqual({
       status: "failed", last_error: "session_quarantined",
     });
+  });
+});
+
+describe("P0-2 erase-safe publication", () => {
+  test("an erase between put and complete leaves no untracked object: the ticket survives and the sweeper deletes it", async () => {
+    await request();
+    const objects = results();
+    const store = jobStore(objects);
+    const job = (await store.claim({ leaseSeconds: 600 }))!;
+    const out = await publish(store, job, async () => {
+      await pg.query("UPDATE sessions.session_index SET deleted_at = now()");
+    });
+    expect(out.stage).toBe("lost");
+    expect((await pg.query("SELECT 1 FROM sessions.session_analysis_jobs_v2")).rows).toHaveLength(0);
+    expect((await objects.head(objectKey(out.key!)))).toBeDefined();
+    const tickets = (await pg.query<Json>("SELECT result_key, reason FROM sessions.session_analysis_result_tickets")).rows;
+    expect(tickets).toEqual([{ result_key: out.key, reason: "publishing" }]);
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx })).toBe(1);
+    expect(await objects.head(objectKey(out.key!))).toBeUndefined();
+    expect((await pg.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
+  });
+
+  test("an erase before the reservation writes nothing at all", async () => {
+    await request();
+    const objects = results();
+    const store = jobStore(objects);
+    const job = (await store.claim({ leaseSeconds: 600 }))!;
+    await pg.query("UPDATE sessions.session_index SET deleted_at = now()");
+    expect((await publish(store, job)).stage).toBe("refused");
+    const { sha256 } = encodeAnalysisResult(output().result);
+    expect(await objects.head(objectKey(analysisResultKey(analysisResultPrefix(ANCHOR), job.id, sha256)))).toBeUndefined();
+    expect((await pg.query("SELECT 1 FROM sessions.session_analysis_result_tickets")).rows).toHaveLength(0);
+  });
+
+  test("a changed pointer revision refuses the reservation", async () => {
+    await request();
+    const store = jobStore();
+    const job = (await store.claim({ leaseSeconds: 600 }))!;
+    await pg.query("UPDATE sessions.session_index SET revision = revision + 1");
+    expect((await publish(store, job)).stage).toBe("refused");
+  });
+
+  test("erasing a completed session tickets its result for deletion; a live result is never swept", async () => {
+    await request();
+    const objects = results();
+    const store = jobStore(objects);
+    const out = await publish(store, (await store.claim({ leaseSeconds: 600 }))!);
+    expect(out.stage).toBe("completed");
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx })).toBe(0);
+    expect(await objects.head(objectKey(out.key!))).toBeDefined();
+    await pg.query("UPDATE sessions.session_index SET deleted_at = now()");
+    expect((await pg.query<Json>("SELECT reason FROM sessions.session_analysis_result_tickets")).rows).toEqual([{ reason: "forgotten" }]);
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: tx })).toBe(1);
+    expect(await objects.head(objectKey(out.key!))).toBeUndefined();
   });
 });
 
@@ -239,7 +376,7 @@ test("the migration's engine identity is src/session-analysis/versions.ts", () =
 describe("analysisTick is default-off", () => {
   test("disabled or without a model it claims nothing", async () => {
     const { analysisConfig, analysisTick } = await import("../worker.ts");
-    expect(analysisConfig({})).toEqual({ enabled: false, batch: 2, leaseSeconds: 600 });
+    expect(analysisConfig({})).toEqual({ enabled: false, batch: 2, leaseSeconds: 600, assumeNoLegacyTurns: false });
     expect(analysisConfig({ SESSION_ANALYSIS_ENABLED: "1", SESSION_ANALYSIS_BATCH: "99" }).enabled).toBe(false);
     await request();
     const base = { db: hoopDb(pg), store: null as never, canonical: null as never };

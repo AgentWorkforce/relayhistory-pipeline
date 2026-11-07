@@ -13,7 +13,8 @@
       "<owner>:EXECUTE"
     ],
     "sessions.analysis_request_v1(text,text,text,text)": [
-      "<owner>:EXECUTE"
+      "<owner>:EXECUTE",
+      "bulls96_analysis_admit:EXECUTE"
     ],
     "sessions.applied_repo_evidence(jsonb,jsonb)": [
       "<owner>:EXECUTE",
@@ -755,8 +756,15 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.session_analysis_admit_scope(text,text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_analysis_cache_demand(text,text,text,text,boolean)": [
       "<owner>:EXECUTE"
+    ],
+    "sessions.session_analysis_source_revision(text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
     ],
     "sessions.session_analysis_v2_forget()": [
       "<owner>:EXECUTE"
