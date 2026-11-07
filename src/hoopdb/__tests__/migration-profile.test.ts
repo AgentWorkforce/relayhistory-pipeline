@@ -108,6 +108,20 @@ async function snapshot(db: PGlite) {
   };
 }
 
+test("managed-provider bootstrap fixed-role inventories stay equal", () => {
+  const declaredRoles = (file: string) => {
+    const sql = readFileSync(join(root, "supabase/bootstrap", file), "utf8");
+    const inventory = /FOREACH\s+v_role\s+IN\s+ARRAY\s+ARRAY\[([\s\S]*?)\]\s+LOOP/.exec(sql);
+    if (!inventory) throw new Error(`${file}: fixed-role validation inventory not found`);
+    const roles = [...inventory[1]!.matchAll(/'([^']+)'::name/g)].map((m) => m[1]!).sort();
+    expect(roles.length).toBeGreaterThan(0);
+    return roles;
+  };
+  expect(declaredRoles("rds_migration_roles.sql")).toEqual(
+    declaredRoles("cloudsql_migration_roles.sql"),
+  );
+});
+
 describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
   const base = {
     HOOPDB_RUNTIME_ROLE: "hoop_runtime",

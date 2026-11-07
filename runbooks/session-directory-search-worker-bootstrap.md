@@ -237,7 +237,7 @@ violation is named:
 - **TEMPORARY is refused**, except for one Supabase-only platform baseline: effective
   TEMPORARY must come solely from PUBLIC, the role must have no direct TEMPORARY ACL or
   PUBLIC GRANT OPTION. A configured workload does not change this database-wide PUBLIC
-  baseline. Local, selfhosted and cloudsql still refuse every effective TEMPORARY grant.
+  baseline. Local, selfhosted, cloudsql and rds still refuse every effective TEMPORARY grant.
   This is compatibility, not a
   service requirement: no service creates temporary objects or relies on runtime
   `search_path` (the runtime temp-usage audit is not kept in the repository).
@@ -537,7 +537,7 @@ config fails closed.
   on PG15 and PG17). Separately, every existing `sessions` function must be owned by the
   owner (`sessions_functions_owned_by_owner`).
 - **Run-time exact manifest (every non-local mode: `global-default-revoke` in
-  `selfhosted` and `cloudsql`, `event-trigger` in `supabase`):** after the last
+  `selfhosted`, `cloudsql` and `rds`, `event-trigger` in `supabase`):** after the last
   migration, inside the validation transaction with phase 2 and the PASS write, every
   `sessions` function's ACL must equal `src/hoopdb/sessions-function-acl.json` plus
   `<runtime role>:EXECUTE` on `RUNTIME_APPLICATION_FUNCTIONS` (#116)
@@ -569,7 +569,7 @@ config fails closed.
   (`sessions_schema_function_defaults` must be empty; tested on PG15 and PG17).
 - **`event-trigger` (supabase only):** a reviewed `ddl_command_end` event trigger scoped
   to `sessions`, with no project-wide `ALTER DEFAULT PRIVILEGES`. Accepted only with
-  `HOOPDB_DB_MODE=supabase`; `selfhosted`, `cloudsql` and `local` refuse it
+  `HOOPDB_DB_MODE=supabase`; `selfhosted`, `cloudsql`, `rds` and `local` refuse it
   (`function_boundary_mode_unsupported`) and keep `global-default-revoke`.
   - **Install:** `supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql`, run
     as `postgres` after the runtime-role and Worker bootstraps and before migrate
@@ -768,6 +768,13 @@ mode uses `global-default-revoke`).
   `babysitter_retention_role.sql`) cannot run as the master on trampoline-created
   roles (no ADMIN; 42501). Those LOGIN roles need a reviewed RDS path before activation
   (same structural question as Cloud SQL); migrate and readiness do not depend on them.
+
+**RDS activation needs its own reviewed path.** With this bootstrap's membership-free
+fixed-role graph, the customer migration owner has no ADMIN path to alter or drop
+those roles; only the provider's `rdsadmin` can. The migration/PASS emulation does not
+activate ingest, read API, project events, privacy erasure or babysitter retention,
+and makes no application-activation claim. Do not run their LOGIN activation scripts
+as the customer master or treat migration readiness as full application readiness.
 
 ## CNPG (self-hosted HoopDb)
 
