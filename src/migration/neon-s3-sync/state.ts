@@ -85,6 +85,12 @@ export class SyncState {
         PRIMARY KEY (key, version_id));
       CREATE TABLE IF NOT EXISTS erase_reservations (key TEXT NOT NULL, version_id TEXT NOT NULL, scope TEXT NOT NULL,
         seq INTEGER NOT NULL, PRIMARY KEY (key, version_id));
+      -- PROTECTED terminal history, never deleted or reopened: every invocation's terminal outcome, and every
+      -- version the eraser proved erased (moved here when its reservation is cleared).
+      CREATE TABLE IF NOT EXISTS write_terminal (id TEXT PRIMARY KEY, key TEXT NOT NULL, version_id TEXT,
+        outcome TEXT NOT NULL CHECK (outcome IN ('erased', 'published', 'refused')), at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS erased_versions (key TEXT NOT NULL, version_id TEXT NOT NULL, at INTEGER NOT NULL,
+        PRIMARY KEY (key, version_id));
       CREATE TABLE IF NOT EXISTS erase_checkpoints (
         scope TEXT PRIMARY KEY, checkpoint TEXT NOT NULL, updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS truncations (
@@ -104,6 +110,8 @@ export class SyncState {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS groups_last ON groups (last_ms DESC);
     `);
+    // Lease generation: minted on every NEW acquisition (absent, or taken from another holder); a renew keeps it.
+    if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('leases') WHERE name = 'gen'").get())) this.db.exec("ALTER TABLE leases ADD COLUMN gen TEXT");
     // Obligation genesis: the first open of this file (new, recreated, or upgraded from a version without
     // obligations) records when tracking began, UNATTESTED. INSERT OR IGNORE: never reset on a later open.
     this.db.prepare("INSERT OR IGNORE INTO meta (k, v) VALUES ('obligations_genesis', ?)").run(JSON.stringify({ at: Date.now(), attestedAt: null }));
@@ -285,12 +293,19 @@ export class SyncState {
         | { holder: string; at: number }
         | undefined;
       if (row && row.holder !== holder && now - Number(row.at) < ttlMs) return;
+      // The same holder keeps its generation; a new acquisition (absent, or taken over) mints a fresh one.
       this.db
-        .prepare("INSERT INTO leases (prefix, holder, at) VALUES (?, ?, ?) ON CONFLICT (prefix) DO UPDATE SET holder = excluded.holder, at = excluded.at")
-        .run(prefix, holder, now);
+        .prepare(`INSERT INTO leases (prefix, holder, at, gen) VALUES (?, ?, ?, ?) ON CONFLICT (prefix) DO UPDATE SET at = excluded.at,
+          gen = CASE WHEN leases.holder = excluded.holder AND leases.gen IS NOT NULL THEN leases.gen ELSE excluded.gen END, holder = excluded.holder`)
+        .run(prefix, holder, now, crypto.randomUUID());
       ok = true;
     });
     return ok;
+  }
+
+  /** The lease's current generation (minted at acquisition), or undefined when no one holds it. */
+  leaseGen(prefix: string): string | undefined {
+    return (this.db.prepare("SELECT gen FROM leases WHERE prefix = ?").get(prefix) as { gen: string | null } | undefined)?.gen ?? undefined;
   }
 
   /** Extend a lease this holder still has; false if it was taken over. */
@@ -418,27 +433,50 @@ export class SyncState {
   /** Writer: a definite refusal of this very request (no write happened): terminal, so the row goes. */
   refuseWrite(id: string) {
     this.#tx(() => {
-      this.db.prepare("DELETE FROM write_invocations WHERE id = ? AND outcome = 'dispatched'").run(id);
+      const r = this.db.prepare("INSERT OR IGNORE INTO write_terminal (id, key, version_id, outcome, at) SELECT id, key, NULL, 'refused', ? FROM write_invocations WHERE id = ? AND outcome = 'dispatched'").run(Date.now(), id);
+      if (Number(r.changes) === 1) this.db.prepare("DELETE FROM write_invocations WHERE id = ?").run(id);
     });
   }
   /**
-   * Writer publish: the versions this group now references become owned, under the same lock the
-   * eraser's reserve takes. Refused (nothing recorded) if ANY of them is reserved for deletion; the
-   * acked invocations of exactly those versions are then terminal (their own publish) and go.
+   * Writer publish: the versions this group now references become owned, in ONE transaction under the lock the
+   * eraser's reserve takes, and only while the writer can prove it is still the writer:
+   *  - lease: every entry lies under one of `lease.prefixes`, each still held by `lease.holder` (an eraser that took
+   *    an expired lease, or finished and released it, makes a delayed writer's publish fail);
+   *  - an exact version must CONSUME its own still-live acked invocation (or already be owned exactly: idempotent);
+   *    once the eraser resolved that invocation (the version was seen gone), a late publish fails;
+   *  - a key-level claim ("*": reused / unchanged objects whose version id this run never saw) conflicts with ANY
+   *    reservation at the key; an exact one with that version's reservation.
+   * Any refusal records nothing (the group then fails; nothing is marked exported).
    */
-  publishWrites(entries: { key: string; versionId: string }[]) {
+  publishWrites(entries: { key: string; versionId: string }[], lease: { holder: string; gens: Readonly<Record<string, string>> }) {
     this.#tx(() => {
-      // A key-level claim ("*": every version at the key, e.g. a reused chunk whose version id this run never saw)
-      // conflicts with ANY reservation at the key; an exact claim with that exact version's reservation.
+      const held = this.db.prepare("SELECT holder, gen FROM leases WHERE prefix = ?");
+      const erased = this.db.prepare("SELECT 1 FROM erased_versions WHERE key = ? AND version_id = ?");
       const reserved = this.db.prepare("SELECT 1 FROM erase_reservations WHERE key = ? AND (version_id = ? OR ? = '*')");
-      for (const e of entries)
-        if (reserved.get(e.key, e.versionId, e.versionId)) throw Object.assign(new Error("a published version is reserved for erasure"), { code: "publish_reserved" });
+      const live = this.db.prepare("SELECT id FROM write_invocations WHERE key = ? AND outcome = 'acked' AND version_id = ? AND holder = ?");
+      const owned = this.db.prepare("SELECT 1 FROM write_published WHERE key = ? AND version_id = ?");
+      const refuse = (code: string, msg: string) => { throw Object.assign(new Error(msg), { code }); };
+      const consume: string[] = [];
+      for (const e of entries) {
+        const p = Object.keys(lease.gens).find((x) => e.key.startsWith(x));
+        const h = p ? (held.get(p) as { holder: string; gen: string | null } | undefined) : undefined;
+        // Holder AND generation: a lease that expired and was taken (even if re-acquired later) never validates.
+        if (!p || !h || h.holder !== lease.holder || h.gen === null || h.gen !== lease.gens[p]) refuse("publish_lease_lost", "the writer no longer holds this lease generation");
+        if (reserved.get(e.key, e.versionId, e.versionId)) refuse("publish_reserved", "a published version is reserved for erasure");
+        if (e.versionId === "*") continue;
+        if (erased.get(e.key, e.versionId)) refuse("publish_erased", "the version was erased");
+        const inv = live.get(e.key, e.versionId, lease.holder) as { id: string } | undefined;
+        if (inv) consume.push(inv.id);
+        else if (!owned.get(e.key, e.versionId)) refuse("publish_unresolved", "the version's own invocation is no longer live (it may have been erased)");
+      }
       const seq = this.#seq();
       const ins = this.db.prepare("INSERT INTO write_published (key, version_id, seq) VALUES (?, ?, ?) ON CONFLICT DO NOTHING");
-      const done = this.db.prepare("DELETE FROM write_invocations WHERE key = ? AND outcome = 'acked' AND version_id = ?");
-      for (const e of entries) {
-        ins.run(e.key, e.versionId, seq);
-        done.run(e.key, e.versionId);
+      for (const e of entries) ins.run(e.key, e.versionId, seq);
+      const term = this.db.prepare("INSERT OR IGNORE INTO write_terminal (id, key, version_id, outcome, at) SELECT id, key, version_id, 'published', ? FROM write_invocations WHERE id = ?");
+      const done = this.db.prepare("DELETE FROM write_invocations WHERE id = ?");
+      for (const id of consume) {
+        term.run(Date.now(), id);
+        done.run(id);
       }
     });
   }
@@ -494,15 +532,28 @@ export class SyncState {
     let out: { ok: true; rev: number } | { ok: false } = { ok: false };
     this.#tx(() => {
       if (this.obligationRev(prefix) !== rev) return;
+      const term = this.db.prepare(`INSERT OR IGNORE INTO write_terminal (id, key, version_id, outcome, at) SELECT id, key, version_id, 'erased', ? FROM write_invocations WHERE id = ? AND ${SyncState.#under}`);
       const del = this.db.prepare(`DELETE FROM write_invocations WHERE id = ? AND ${SyncState.#under}`);
-      for (const id of ids) del.run(id, ...SyncState.#u(prefix));
+      for (const id of ids) {
+        term.run(Date.now(), id, ...SyncState.#u(prefix));
+        del.run(id, ...SyncState.#u(prefix));
+      }
       out = { ok: true, rev: this.obligationRev(prefix) };
     });
     return out;
   }
   /** After a proven erasure: the prefix's reservations are no longer needed (its versions are gone). */
   clearReservations(prefix: string) {
-    this.db.prepare(`DELETE FROM erase_reservations WHERE ${SyncState.#under}`).run(...SyncState.#u(prefix));
+    // The reserved versions are proven gone: they move to the PROTECTED erased history (never reopened), so a late
+    // publish of any of them is refused even after the reservation itself is cleared.
+    this.#tx(() => {
+      this.db.prepare(`INSERT OR IGNORE INTO erased_versions (key, version_id, at) SELECT key, version_id, ? FROM erase_reservations WHERE ${SyncState.#under}`).run(Date.now(), ...SyncState.#u(prefix));
+      this.db.prepare(`DELETE FROM erase_reservations WHERE ${SyncState.#under}`).run(...SyncState.#u(prefix));
+    });
+  }
+  /** The protected terminal history of one invocation (tests / audits). */
+  writeTerminal(id: string): { outcome: string; versionId: string | null } | undefined {
+    return (this.db.prepare("SELECT outcome, version_id AS versionId FROM write_terminal WHERE id = ?").get(id) as { outcome: string; versionId: string | null } | undefined) ?? undefined;
   }
 
   erasureFailed(key: string, code: string, at = Date.now()) {

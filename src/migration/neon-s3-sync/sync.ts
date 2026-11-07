@@ -262,6 +262,8 @@ export class Syncer {
     const referenced = new Set<string>();
     // Every PUT of this group as an unresolved-write invocation (obligated-store.ts); the acked versions.
     const acked = new Map<string, string>();
+    // The lease generation of each prefix this group leased (the publication proof).
+    const gens: Record<string, string> = {};
     const store = obligatedStore(this.target.store, this.state, LEASE_HOLDER, acked);
     try {
       const keys: string[] = [];
@@ -286,6 +288,8 @@ export class Syncer {
             if (!this.state.acquireLease(prefix, LEASE_HOLDER))
               throw Object.assign(new Error("the erasure job holds this session"), { code: "prefix_busy" });
             leased.push(prefix);
+            const gen = this.state.leaseGen(prefix);
+            if (gen) gens[prefix] = gen;
           },
           onKey: (k) => {
             touched.add(k);
@@ -293,7 +297,7 @@ export class Syncer {
           },
           // Claim every object the manifest will reference BEFORE it is visible: this run's acked versions exactly,
           // reused / unchanged ones at the key level. Refused (the group fails, no manifest) if any is reserved.
-          onPublish: manifestClaim(this.state, acked),
+          onPublish: manifestClaim(this.state, acked, LEASE_HOLDER, gens),
         });
         if (r.fenced) this.counters.fenced += 1;
         for (const m of r.manifests) {
@@ -321,7 +325,7 @@ export class Syncer {
       }
       // Publish (own) the versions this group references, under the eraser's reservation lock: refused,
       // and the group failed, if the erasure job reserved any of them for deletion meanwhile.
-      this.state.publishWrites([...acked].filter(([k]) => referenced.has(k) || keep.has(k)).map(([key, versionId]) => ({ key, versionId })));
+      this.state.publishWrites([...acked].filter(([k]) => referenced.has(k) || keep.has(k)).map(([key, versionId]) => ({ key, versionId })), { holder: LEASE_HOLDER, gens });
       this.state.enqueueErasure(erase);
       // Under the lease: nothing this group now references, or writes under, stays queued.
       this.state.cancelErasures([...referenced, ...keys.map((k) => k.slice(0, -"manifest.json".length))]);

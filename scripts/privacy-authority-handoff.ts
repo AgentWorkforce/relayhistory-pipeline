@@ -16,7 +16,7 @@
  */
 import pg from "pg";
 import { activate, census, fence, release, syncOwned, HandoffRefusal } from "../src/migration/privacy-authority-handoff.ts";
-import { pinnedPgClient, readStdinCredentials, refuseCredentialEnv, sessionAffinityUrl, CredentialRefusal } from "../src/migration/stdin-credentials.ts";
+import { pinnedPgClient, pinnedPgConfig, readStdinCredentials, refuseCredentialEnv, sessionAffinityUrl, CredentialRefusal } from "../src/migration/stdin-credentials.ts";
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const out = (fields: Record<string, unknown>) => process.stdout.write(JSON.stringify({ at: new Date().toISOString(), tool: "privacy-authority-handoff", ...fields }) + "\n");
@@ -52,6 +52,9 @@ async function main(): Promise<number> {
     // Both URLs are checked before EITHER connection is opened.
     const supabaseUrl = sessionAffinityUrl(creds.supabaseUrl, "supabaseUrl", "supabase");
     const neonUrl = needsNeon ? sessionAffinityUrl(creds.neonUrl, "neonUrl", "neon") : undefined;
+    // ... including the FULL discrete config (identity, TLS, parameters) of both, before either connect().
+    pinnedPgConfig(supabaseUrl, "supabaseUrl", "supabase");
+    if (neonUrl) pinnedPgConfig(neonUrl, "neonUrl", "neon");
     const supa = await connect(supabaseUrl, "supabaseUrl", "supabase", "c3-privacy-authority-handoff", cmd === "census");
     clients.push(supa);
     const neon = neonUrl ? await connect(neonUrl, "neonUrl", "neon", "c3-privacy-authority-handoff-ro", true) : undefined;

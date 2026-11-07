@@ -232,6 +232,22 @@ describe("no ~/.pgpass fallback: stdin DB URLs carry their own password (dogpatc
       }
   }, 60_000);
 
+  test("handoff CLI: BOTH full discrete configs (TLS included) are validated before EITHER connection", async () => {
+    const EPOCH = "3".repeat(64);
+    // A valid, reachable-looking Supabase URL plus a Neon URL without sslmode: refused by name, the Supabase side never
+    // dialled (a connection attempt to 127.0.0.1:1 would surface as a connect error instead).
+    const r = await runWith(handoff, ["sync-owned", "--epoch", EPOCH], {
+      supabaseUrl: "postgres://postgres:synthetic@127.0.0.1:1/postgres?sslmode=disable",
+      neonUrl: "postgres://ro:synthetic@127.0.0.1:9/neondb",
+    });
+    expect([r.code, r.lines.at(-1)?.refused]).toEqual([1, "neon_url_sslmode_required"]);
+    const r2 = await runWith(handoff, ["sync-owned", "--epoch", EPOCH], {
+      supabaseUrl: "postgres://postgres:synthetic@127.0.0.1:1/postgres",
+      neonUrl: "postgres://ro:synthetic@127.0.0.1:9/neondb?sslmode=disable",
+    });
+    expect([r2.code, r2.lines.at(-1)?.refused]).toEqual([1, "supabase_url_sslmode_required"]);
+  }, 30_000);
+
   test("handoff CLI: password-less supabaseUrl / neonUrl are refused before EITHER connection", async () => {
     const EPOCH = "3".repeat(64);
     const fence = await runWith(handoff, ["fence", "--epoch", EPOCH], { supabaseUrl: "postgres://postgres@127.0.0.1:1/postgres" });

@@ -49,6 +49,10 @@ export function obligatedStore(store: ObjectStore, state: SyncState, holder: str
  * level. Throws `publish_reserved` (and the manifest is NOT written) if any of them is reserved for erasure; once it
  * succeeds, an erasure reserve of any claimed version is refused. No network await happens inside the transaction.
  */
-export function manifestClaim(state: SyncState, acked: ReadonlyMap<string, string>) {
-  return (_manifestKey: string, refs: readonly string[]) => state.publishWrites(refs.map((key) => ({ key, versionId: acked.get(key) ?? "*" })));
+export function manifestClaim(state: SyncState, acked: ReadonlyMap<string, string>, holder: string, gens: Readonly<Record<string, string>>) {
+  // The lease proof: the manifest's session prefix, still held by this exporter at the generation it acquired.
+  return (manifestKey: string, refs: readonly string[]) => {
+    const p = manifestKey.slice(0, -"manifest.json".length);
+    state.publishWrites(refs.map((key) => ({ key, versionId: acked.get(key) ?? "*" })), { holder, gens: gens[p] ? { [p]: gens[p]! } : {} });
+  };
 }

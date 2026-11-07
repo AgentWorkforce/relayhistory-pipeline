@@ -1210,11 +1210,23 @@ describe("exporter publication vs E3 reservation (real exportUnit)", () => {
   async function world() {
     const { store } = await countingStore();
     const st = attestedState(join(await tempDir(), "s.sqlite"));
+    // Exactly the Syncer's wiring: lease (with its generation) on the manifest prefix, obligated store, manifest claim.
+    const opts = (acked: Map<string, string>) => {
+      const gens: Record<string, string> = {};
+      return {
+        onLease: (k: string) => {
+          const p = k.slice(0, -"manifest.json".length);
+          if (!st.acquireLease(p, "exporter:test")) throw Object.assign(new Error("busy"), { code: "prefix_busy" });
+          gens[p] = st.leaseGen(p)!;
+        },
+        onPublish: manifestClaim(st, acked, "exporter:test", gens),
+      };
+    };
     const run = async (records: DeliveryRecord[], wrap: (s: ObjectStore) => ObjectStore = (s) => s) => {
       const acked = new Map<string, string>();
-      return exportUnit(target(wrap(obligatedStore(store, st, "exporter:test", acked)), { maxChunkBytes: 200 }), unit("org-a"), fixedSource(records), { onPublish: manifestClaim(st, acked) });
+      return exportUnit(target(wrap(obligatedStore(store, st, "exporter:test", acked)), { maxChunkBytes: 200 }), unit("org-a"), fixedSource(records), opts(acked));
     };
-    return { store, st, run };
+    return { store, st, run, opts };
   }
   const recs1 = () => baseRecords().slice(0, 3);
   const recs2 = () => [...baseRecords().slice(0, 3), rec("session_event", "origin-a", "e-9", { ts_ms: T0 + 2500, role: "user", text: "later" }, "4", "14")];
@@ -1266,7 +1278,7 @@ describe("exporter publication vs E3 reservation (real exportUnit)", () => {
     // The obligated store sits INSIDE the failing wrapper here, so wrap the base store instead.
     const acked = new Map<string, string>();
     const st = w.st;
-    await expect(exportUnit(target(obligatedStore(failing(w.store), st, "exporter:test", acked), { maxChunkBytes: 200 }), unit("org-a"), fixedSource(recs2()), { onPublish: manifestClaim(st, acked) })).rejects.toThrow();
+    await expect(exportUnit(target(obligatedStore(failing(w.store), st, "exporter:test", acked), { maxChunkBytes: 200 }), unit("org-a"), fixedSource(recs2()), w.opts(acked))).rejects.toThrow();
     expect(st.unresolvedWrites(prefix).filter((i) => i.key === m.manifestKey && i.outcome === "dispatched").length).toBe(1);
   });
 });

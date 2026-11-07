@@ -29,6 +29,11 @@ const authority = (): ErasureAuthority => ({
   fencedLivePage: async () => [],
   stillFenced: async () => true,
 });
+/** An exporter lease on `prefix` (generation minted at acquisition): the publication proof. */
+function lease(st: SyncState, prefix: string, holder = "exporter:1", at = Date.now()) {
+  if (!st.acquireLease(prefix, holder, undefined, at)) throw new Error("lease busy");
+  return { holder, gens: { [prefix]: st.leaseGen(prefix)! } };
+}
 async function world(n = 30) {
   const s = new FakeS3Versions();
   const ids: string[] = [];
@@ -81,7 +86,9 @@ describe("E3 erasure gated on unresolved-write obligations (v3)", () => {
   test("publish BEFORE reserve: an owned version refuses the page's reservation; nothing in that page is deleted", async () => {
     const w = await world(5);
     // The exporter published (owns) a version under the queued prefix after it was queued.
-    w.st.publishWrites([{ key: key(2), versionId: w.ids[2]! }]);
+    // (its own publication of a reused version it referenced, at the key level, then its group ended)
+    w.st.publishWrites([{ key: key(2), versionId: "*" }], lease(w.st, PREFIX));
+    w.st.releaseLeases("exporter:1", [PREFIX]);
     await w.j.drain();
     expect(w.s.count(PREFIX)).toBe(5);
     expect(w.s.deletes).toEqual([]);
@@ -102,14 +109,15 @@ describe("E3 erasure gated on unresolved-write obligations (v3)", () => {
     w.s.onDelete = (k, id) => {
       if (refused === undefined && k === key(0))
         try {
-          w.st.publishWrites([{ key: key(4), versionId: w.ids[4]! }]);
+          // A delayed exporter whose lease the eraser took: refused (lease generation, or the reservation).
+          w.st.publishWrites([{ key: key(4), versionId: "*" }], { holder: "exporter:1", gens: { [PREFIX]: "stale-generation" } });
           refused = "published";
         } catch (e) {
           refused = (e as { code?: string }).code;
         }
     };
     await w.j.drain();
-    expect(refused).toBe("publish_reserved");
+    expect(["publish_lease_lost", "publish_reserved"]).toContain(refused);
     expect(w.st.publishedUnder(PREFIX)).toEqual([]);
     expect(w.s.count(PREFIX)).toBe(0);
     expect(w.queued()).toEqual([]);
@@ -186,7 +194,7 @@ describe("exporter writer side (obligated-store.ts)", () => {
     expect(s.unresolvedWrites(PREFIX)).toEqual([expect.objectContaining({ key: key(1), outcome: "acked", versionId: "ver-1" })]);
     expect(acked.get(key(1))).toBe("ver-1");
     // Its own publish resolves exactly that invocation.
-    s.publishWrites([{ key: key(1), versionId: "ver-1" }]);
+    s.publishWrites([{ key: key(1), versionId: "ver-1" }], lease(s, PREFIX));
     expect(s.unresolvedWrites(PREFIX)).toEqual([]);
     // An unversioned store: "null".
     await obligatedStore(base(async (k) => ({ key: k, version: { eTag: "e" }, contentSha256: "x", size: 1, created: true })), s, "exporter:1", acked).put(key(2) as never, new Uint8Array([1]));
@@ -215,7 +223,8 @@ describe("prefix membership of the obligation tables (index-friendly, exact)", (
       P.replace("s=Sess_1/", "s=Sess_1é/"), // multibyte right after the prefix body
       `${P.slice(0, -1)}\u{10FFFF}/x`,
     ];
-    for (const k of [...inside, ...outside]) s.publishWrites([{ key: k, versionId: "v1" }]);
+    const root = lease(s, "96bulls/");
+    for (const k of [...inside, ...outside]) s.publishWrites([{ key: k, versionId: "*" }], root);
     expect(s.publishedUnder(P).map((r) => r.key).sort()).toEqual([...inside].sort());
     for (const k of [...inside, ...outside]) s.dispatchWrite(k, "exporter:1");
     expect(s.unresolvedWrites(P).map((r) => r.key).sort()).toEqual([...inside].sort());
@@ -262,7 +271,8 @@ describe("every destructive route is gated; state loss fails closed", () => {
     w.s.put(OBJ, OLD);
     w.st.erasureDone(PREFIX, Date.parse("2026-11-07T00:00:00Z") - 1000);
     w.st.enqueueErasure([{ key: OBJ, kind: "object", org_id: "org-1", reason: "unreferenced" }], Date.parse("2026-11-06T00:00:00Z"));
-    w.st.publishWrites([{ key: OBJ, versionId: "*" }]); // the exporter claims it again (key level)
+    w.st.publishWrites([{ key: OBJ, versionId: "*" }], lease(w.st, PREFIX)); // the exporter claims it again (key level)
+    w.st.releaseLeases("exporter:1", [PREFIX]);
     await w.j.drain();
     expect(w.s.count(OBJ)).toBe(1);
     expect(w.s.deletes).toEqual([]);
@@ -307,5 +317,51 @@ describe("every destructive route is gated; state loss fails closed", () => {
     await j.drain();
     expect(st.nextErasures(Number.MAX_SAFE_INTEGER, 10)).toEqual([]);
     expect(lines.map((l) => l.error_code ?? l.message)).toEqual(["state_locked", "obligation genesis attested"]);
+  });
+});
+
+describe("publication proves its own invocation + lease generation; protected terminal history", () => {
+  test("a DELAYED exporter cannot publish after the eraser took its expired lease, erased the version and cleared everything", async () => {
+    const w = await world(0);
+    const k = key(7);
+    // The exporter leased the prefix long ago (now expired), PUT v, got its own ack, then stalled.
+    const proof = lease(w.st, PREFIX, "exporter:1", Date.parse("2026-11-06T00:00:00Z"));
+    const inv = w.st.dispatchWrite(k, "exporter:1");
+    const v = w.s.put(k, OLD);
+    w.st.ackWrite(inv, v);
+    // The eraser takes the expired lease, reserves + deletes v, resolves the invocation, clears its reservations, retires.
+    await w.j.drain();
+    expect(w.s.count(PREFIX)).toBe(0);
+    expect(w.queued()).toEqual([]);
+    expect(w.st.writeTerminal(inv)).toEqual({ outcome: "erased", versionId: v });
+    // The old exporter resumes: its publication is refused (the lease generation moved, then the erased history).
+    const code = (f: () => void) => { try { f(); return null; } catch (e) { return (e as { code?: string }).code; } };
+    expect(code(() => w.st.publishWrites([{ key: k, versionId: v }], proof))).toBe("publish_lease_lost");
+    // Even with a NEW lease generation, the erased version (protected history, reservations long cleared) is refused.
+    const fresh = lease(w.st, PREFIX, "exporter:1");
+    expect(fresh.gens[PREFIX]).not.toBe(proof.gens[PREFIX]);
+    expect(code(() => w.st.publishWrites([{ key: k, versionId: v }], fresh))).toBe("publish_erased");
+    expect(w.st.publishedUnder(PREFIX)).toEqual([]);
+  });
+
+  test("an exact publication must consume its own live acked invocation; a resolved one is refused; renew keeps the generation", async () => {
+    const st = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-pub-")), "s.sqlite"));
+    const proof = lease(st, PREFIX);
+    expect(st.renewLease(PREFIX, "exporter:1")).toBe(true);
+    expect(st.leaseGen(PREFIX)).toBe(proof.gens[PREFIX]);
+    const code = (f: () => void) => { try { f(); return null; } catch (e) { return (e as { code?: string }).code; } };
+    // No invocation at all for that version: refused.
+    expect(code(() => st.publishWrites([{ key: key(1), versionId: "v-unknown" }], proof))).toBe("publish_unresolved");
+    const inv = st.dispatchWrite(key(1), "exporter:1");
+    st.ackWrite(inv, "v-1");
+    st.publishWrites([{ key: key(1), versionId: "v-1" }], proof); // consumes it
+    expect(st.writeTerminal(inv)).toEqual({ outcome: "published", versionId: "v-1" });
+    expect(st.unresolvedWrites(PREFIX)).toEqual([]);
+    st.publishWrites([{ key: key(1), versionId: "v-1" }], proof); // idempotent: already owned exactly
+    // A different holder never validates against this lease.
+    expect(code(() => st.publishWrites([{ key: key(1), versionId: "*" }], { holder: "exporter:2", gens: proof.gens }))).toBe("publish_lease_lost");
+    // A reservation (eraser) refuses a key-level claim at that key.
+    expect(st.reserveErase(`${PREFIX}raw/`, st.obligationRev(`${PREFIX}raw/`), "e3", [{ key: key(2), versionId: "v-2" }]).ok).toBe(true);
+    expect(code(() => st.publishWrites([{ key: key(2), versionId: "*" }], proof))).toBe("publish_reserved");
   });
 });

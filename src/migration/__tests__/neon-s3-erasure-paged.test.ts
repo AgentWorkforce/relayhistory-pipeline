@@ -168,7 +168,10 @@ describe("the live pointer and staged objects go through the same reserve gate",
       fill(s, 3);
       s.put(STAGED, OLD);
       const st = await state();
-      if (claimed) st.publishWrites([{ key: T.pointerKey, versionId: "*" }, { key: STAGED, versionId: "*" }]);
+      if (claimed) {
+        st.acquireLease("96bulls/", "exporter:claim");
+        st.publishWrites([{ key: T.pointerKey, versionId: "*" }, { key: STAGED, versionId: "*" }], { holder: "exporter:claim", gens: { "96bulls/": st.leaseGen("96bulls/")! } });
+      }
       await job(s, st, authority()).sweep();
       expect(s.count(dir("2026/10/30"))).toBe(0);
       expect([claimed, s.count(T.pointerKey), s.count(STAGED)]).toEqual([claimed, claimed ? 1 : 0, claimed ? 1 : 0]);
