@@ -199,3 +199,38 @@ describe("exporter writer side (obligated-store.ts)", () => {
     expect(s.unresolvedWrites(PREFIX).length).toBe(2);
   });
 });
+
+describe("prefix membership of the obligation tables (index-friendly, exact)", () => {
+  test("exact under byte/code-point order for keys that sort differently under locale collations; the key index is used", async () => {
+    const s = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-p-")), "s.sqlite"));
+    const P = "96bulls/org-1/v1/ws=W-a/m=x/h=claude/d=2026/10/30/s=Sess_1/";
+    const inside = [`${P}a`, `${P}Z`, `${P}-`, `${P}_`, `${P}é/ü.json`, `${P}\u{10FFFF}tail`, `${P}raw/日本.zst`];
+    const outside = [
+      P.slice(0, -1), // the prefix without its slash
+      P.replace("Sess_1", "sess_1"), // case
+      P.replace("Sess_1", "Sess-1"), // '_' vs '-'
+      P.replace("W-a", "W_a"),
+      P.replace("W-a", "W-A"),
+      P.replace("s=Sess_1/", "s=Sess_1é/"), // multibyte right after the prefix body
+      `${P.slice(0, -1)}\u{10FFFF}/x`,
+    ];
+    for (const k of [...inside, ...outside]) s.publishWrites([{ key: k, versionId: "v1" }]);
+    expect(s.publishedUnder(P).map((r) => r.key).sort()).toEqual([...inside].sort());
+    for (const k of [...inside, ...outside]) s.dispatchWrite(k, "exporter:1");
+    expect(s.unresolvedWrites(P).map((r) => r.key).sort()).toEqual([...inside].sort());
+    // A range-only predicate would still be exact here; the residual test pins exactness at the U+10FFFF edge.
+    for (const t of ["write_invocations", "write_published", "erase_reservations"] as const) expect(s.prefixPlan(t, P)).toMatch(/SEARCH .* USING (COVERING )?(INDEX|PRIMARY KEY)/);
+    s.unpublish([P]);
+    expect(s.publishedUnder(P)).toEqual([]);
+    expect(s.publishedUnder(outside[1]!).length).toBe(1);
+  });
+});
+
+test("prefix membership: a prefix ending in U+10FFFF (no simple successor) is still exact", async () => {
+  const s = new SyncState(join(await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "e3-obl-q-")), "s.sqlite"));
+  const P = "k/\u{10FFFF}";
+  const inside = [P, `${P}\u{10FFFF}\u{10FFFF}x`, `${P}a`];
+  const outside = ["k/", "k/\u{FFFF}", "k0", "l"];
+  for (const k of [...inside, ...outside]) s.dispatchWrite(k, "h");
+  expect(s.unresolvedWrites(P).map((r) => r.key).sort()).toEqual([...inside].sort());
+});

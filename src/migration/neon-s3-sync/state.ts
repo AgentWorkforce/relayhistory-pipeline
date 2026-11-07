@@ -306,7 +306,7 @@ export class SyncState {
       for (const i of items) {
         q.run(i.key, i.kind, i.org_id, i.reason, at);
         // Queued for erasure: no longer owned (the eraser may then reserve its versions).
-        unpub.run(i.key, i.key);
+        unpub.run(...SyncState.#u(i.key));
       }
     });
   }
@@ -354,7 +354,26 @@ export class SyncState {
     this.setMeta("write_seq", String(n));
     return n;
   }
-  static #under = "substr(key, 1, length(?)) = ?";
+  /**
+   * Prefix membership that can use the key index: a BINARY range (byte order of UTF-8 = code point order; SQLite's
+   * default collation, stated explicitly) [prefix, successor(prefix)), where successor increments the prefix's last
+   * code point, so every string starting with the prefix sorts inside it; plus an exact residual prefix test.
+   * Parameters: SyncState.#u(prefix).
+   */
+  static #under = "key COLLATE BINARY >= ? AND key COLLATE BINARY < ? AND substr(key, 1, length(?)) = ?";
+  static #u(prefix: string): [string, string | Uint8Array, string, string] {
+    // The least string greater than every string starting with `p`: increment its last code point (dropping trailing
+    // U+10FFFF first). None (empty, or all U+10FFFF): a BLOB, which SQLite orders after every TEXT value.
+    const succ = (p: string): string | Uint8Array => {
+      const cps = [...p];
+      while (cps.length && cps[cps.length - 1]!.codePointAt(0) === 0x10ffff) cps.pop();
+      const last = cps.pop()?.codePointAt(0);
+      if (last === undefined) return new Uint8Array([0xff]);
+      const next = last + 1 >= 0xd800 && last + 1 <= 0xdfff ? 0xe000 : last + 1; // never a lone surrogate
+      return cps.join("") + String.fromCodePoint(next);
+    };
+    return [prefix, succ(prefix), prefix, prefix];
+  }
 
   /** Writer: a NEW invocation id for one PUT at `key`, durable BEFORE the PUT is sent. */
   dispatchWrite(key: string, holder: string): string {
@@ -399,22 +418,26 @@ export class SyncState {
   unpublish(keysOrPrefixes: Iterable<string>) {
     this.#tx(() => {
       const q = this.db.prepare(`DELETE FROM write_published WHERE ${SyncState.#under}`);
-      for (const k of keysOrPrefixes) q.run(k, k);
+      for (const k of keysOrPrefixes) q.run(...SyncState.#u(k));
     });
   }
   /** The prefix's compare-and-set revision: the newest seq of any invocation, publication or reservation under it. */
   obligationRev(prefix: string): number {
-    const q = (t: string) => Number((this.db.prepare(`SELECT coalesce(max(seq), 0) AS n FROM ${t} WHERE ${SyncState.#under}`).get(prefix, prefix) as { n: number }).n);
+    const q = (t: string) => Number((this.db.prepare(`SELECT coalesce(max(seq), 0) AS n FROM ${t} WHERE ${SyncState.#under}`).get(...SyncState.#u(prefix)) as { n: number }).n);
     return Math.max(q("write_invocations"), q("write_published"), q("erase_reservations"));
   }
   /** The unresolved invocations under a prefix (dispatched, or acked whose version was not yet seen gone). */
   unresolvedWrites(prefix: string): { id: string; key: string; outcome: "dispatched" | "acked"; versionId?: string }[] {
-    return (this.db.prepare(`SELECT id, key, outcome, version_id FROM write_invocations WHERE ${SyncState.#under} ORDER BY id`).all(prefix, prefix) as
+    return (this.db.prepare(`SELECT id, key, outcome, version_id FROM write_invocations WHERE ${SyncState.#under} ORDER BY id`).all(...SyncState.#u(prefix)) as
       { id: string; key: string; outcome: "dispatched" | "acked"; version_id: string | null }[]).map((r) => ({ id: r.id, key: r.key, outcome: r.outcome, ...(r.version_id ? { versionId: r.version_id } : {}) }));
+  }
+  /** EXPLAIN QUERY PLAN of the prefix predicate on `table` (tests: the key index must be used). */
+  prefixPlan(table: "write_invocations" | "write_published" | "erase_reservations", prefix: string): string {
+    return (this.db.prepare(`EXPLAIN QUERY PLAN SELECT max(seq) FROM ${table} WHERE ${SyncState.#under}`).all(...SyncState.#u(prefix)) as { detail: string }[]).map((r) => r.detail).join(" | ");
   }
   /** Versions the writer currently owns under a prefix. */
   publishedUnder(prefix: string): { key: string; versionId: string }[] {
-    return (this.db.prepare(`SELECT key, version_id FROM write_published WHERE ${SyncState.#under}`).all(prefix, prefix) as { key: string; version_id: string }[]).map((r) => ({ key: r.key, versionId: r.version_id }));
+    return (this.db.prepare(`SELECT key, version_id FROM write_published WHERE ${SyncState.#under}`).all(...SyncState.#u(prefix)) as { key: string; version_id: string }[]).map((r) => ({ key: r.key, versionId: r.version_id }));
   }
   /**
    * Eraser reserve (compare-and-set on the prefix revision): atomically reserve EVERY version about to be
@@ -443,14 +466,14 @@ export class SyncState {
     this.#tx(() => {
       if (this.obligationRev(prefix) !== rev) return;
       const del = this.db.prepare(`DELETE FROM write_invocations WHERE id = ? AND ${SyncState.#under}`);
-      for (const id of ids) del.run(id, prefix, prefix);
+      for (const id of ids) del.run(id, ...SyncState.#u(prefix));
       out = { ok: true, rev: this.obligationRev(prefix) };
     });
     return out;
   }
   /** After a proven erasure: the prefix's reservations are no longer needed (its versions are gone). */
   clearReservations(prefix: string) {
-    this.db.prepare(`DELETE FROM erase_reservations WHERE ${SyncState.#under}`).run(prefix, prefix);
+    this.db.prepare(`DELETE FROM erase_reservations WHERE ${SyncState.#under}`).run(...SyncState.#u(prefix));
   }
 
   erasureFailed(key: string, code: string, at = Date.now()) {
