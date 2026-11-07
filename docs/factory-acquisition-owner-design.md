@@ -32,8 +32,8 @@ acquisition paths from publishing the same `(source, session_id)`:
 
 ## 2. Non-goals
 
-- No change to the Desktop upload path: the route, edge, signed identity, HMAC and batch schema stay unchanged.
-  Sessions of unenrolled sources behave exactly as on main.
+- No change to the Desktop upload path for unenrolled sources: route, edge, signed identity, HMAC and batch
+  schema stay as on main. An enrolled source adds only the `acquisition` payload key, and only after P1 (§4.1).
 - No reuse of the ingest HMAC signing key (`app.ts:60-74`), `rth:sync` (`app.ts:364-365`) or `OrderedControl`
   for install, revoke or grant presentation.
 - No acceptance of cloud-issuer custody witnesses (`custody-protocol.ts:9`, `app.ts:252-253`) or of the
@@ -80,14 +80,14 @@ CREATE TABLE sessions.ingest_acquisition_grants(          -- the replaceable bin
  org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
  owner_epoch bigint NOT NULL CHECK(owner_epoch>0),predecessor_grant_id uuid REFERENCES sessions.ingest_acquisition_grants,
  owner_kind text NOT NULL CHECK(owner_kind IN('cloud','native')),owner_user_id text NOT NULL,owner_origin_id text NOT NULL,
- binding_uuid uuid,installation_id uuid,grant_sha256 text UNIQUE CHECK(grant_sha256~'^[0-9a-f]{64}$'),
+ binding_uuid uuid,installation_id uuid,grant_sha256 text NOT NULL UNIQUE CHECK(grant_sha256~'^[0-9a-f]{64}$'),
  evidence_sha256 text NOT NULL CHECK(evidence_sha256~'^[0-9a-f]{64}$'),issuer_key_id text NOT NULL,
  expires_at timestamptz,state text NOT NULL CHECK(state IN('active','draining','released')),
  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),released_at timestamptz,
  UNIQUE(org_id,workspace_id,source,session_id,owner_epoch),
  FOREIGN KEY(org_id,workspace_id,source,session_id) REFERENCES sessions.ingest_acquisition_owners ON DELETE RESTRICT,
- CHECK((owner_kind='cloud')=(binding_uuid IS NOT NULL AND grant_sha256 IS NOT NULL AND installation_id IS NULL)),
- CHECK((owner_kind='native')=(installation_id IS NOT NULL AND binding_uuid IS NULL AND grant_sha256 IS NULL)));
+ CHECK((owner_kind='cloud')=(binding_uuid IS NOT NULL AND installation_id IS NULL)),
+ CHECK((owner_kind='native')=(installation_id IS NOT NULL AND binding_uuid IS NULL)));
 CREATE TABLE sessions.ingest_acquisition_operations(      -- idempotency ledger (install and revoke)
  operation_uuid uuid PRIMARY KEY,kind text NOT NULL CHECK(kind IN('install','revoke')),
  org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
@@ -120,14 +120,19 @@ The grant carries no revision and no tombstone: those live on the fence row, so 
 cannot reset them.
 
 **Grant secret and hash.**
-- Secret `G`: `rhg_` + 64 lowercase hex (32 CSPRNG bytes). Cloud generates it and persists it encrypted with its
-  intent (§4.2) before the first install call. The database stores only the hash and never sees `G` at install.
-- Formula: `grant_sha256 = lowerhex(SHA-256(UTF-8(join(U+001F, ["relayhistory-acquisition-grant-v1", org_id,
-  workspace_id, source, session_id, grant_id, G]))))`.
+- Secret `G`: `rhg_` + 64 lowercase hex (32 CSPRNG bytes), per install. The issuer generates it (Cloud for Cloud
+  owners; the native issuer for one installation, delivered only to it) and persists it encrypted with its intent
+  (§4.2) before the first install call. The database stores only the hash and never sees `G` at install.
+- Formula (the only one; §5.1 admission reuses it): `grant_sha256 = lowerhex(SHA-256(UTF-8(join(U+001F,
+  ["relayhistory-acquisition-grant-v1", org_id, workspace_id, source, session_id, grant_id, G]))))`.
 - `grant_id` is the lowercase canonical UUID of the install operation.
 - Encoding: identifiers can contain no control characters (M:20261104022000:236-238), so U+001F joins are
   unambiguous. This is the same convention as the machine id (M:20261104060000:245). An empty `workspace_id` keeps
-  its position.
+  its position. Inputs are validated byte-exactly, never trimmed or case-folded.
+- Shared vector (Cloud and SQL tests): org `org_test`, ws `ws_test`, `droid`, `sess-0001`, grant id
+  `00000000-0000-4000-8000-000000000001`, `G` = `rhg_` + `0123456789abcdef`×4 →
+  `eca3f7669845e8b736db441074fcbaa51183bfb167f7cc71003d4d564496d227`. Cross-scope negative: the same inputs with
+  `sess-0002` → `359de6c40574725c3256fb529e69c51c4cdefbe06c1cd3558c1068b8bd9019b4`, which must not admit `sess-0001`.
 
 **Request digest.** `request_sha256` is SHA-256 over the U+001F join of:
 - install: `["relayhistory-acquisition-install-v1", operationUuid, orgId, workspaceId, source, sessionId,
@@ -199,34 +204,37 @@ install at or below it refuses (`revoked_before_install`), so it cannot resurrec
 | SQLSTATE | Codes |
 |---|---|
 | `22023` | `invalid_request`, `request_digest_mismatch`, `acquisition_unexpected` |
-| `42501` | `not_installer`, `not_owner`, `predecessor_mismatch` |
+| installer, before SQL | `not_authorized` (§4.1) |
+| `42501` | `not_installer`, `not_owner` |
 | `55000` | `disabled`, `not_enrolled`, `owner_unknown`, `owner_draining`, `owner_released`, `revoked_before_install`, `handover_not_ready`, `grant_expired`, `physical_collision`, `owner_changed`, `drain_not_ready` |
-| `40001` | `session_busy`, `revision_cas_lost`, `stale_revision`, `operation_conflict` |
+| `40001` | `session_busy`, `revision_cas_lost`, `stale_revision`, `predecessor_mismatch`, `operation_conflict` |
 
 ## 4. Open conditions from the migration-owner installer-boundary review (2026-11-07)
 
-**4.1 A trusted service derives the binding; the role is not proof.**
+**4.1 A trusted service derives and authorizes the binding; neither role nor predecessor is proof.**
 
 The control-only role remains a *candidate* least-privilege boundary until the concrete producer is chosen. No
-broad owner or global custody capability is reused.
+broad owner or global custody capability is reused. Each install or revoke carries an Ed25519 assertion (key id
+`issuerKeyId`) over the §3 request digest, from an issuer that derived the scope itself and decided per session:
+- Cloud: the binding service derives `org, ws, user, source, session_id, binding_uuid` and Cloud's origin from its
+  currently authorized binding row under its existing binding fence. That row selecting this SID is the authorization.
+- Native: the native issuer (Q2) derives `org, ws, user` from token introspection plus the `installation_id` and
+  origin it issued. In v1 it authorizes a SID only as a first claim of a fresh session (§3 step 11). A successor
+  to any prior owner needs a release assertion from the predecessor's issuer naming this installation; v1 does
+  not ship one (`handover_not_ready`). Residual: among one user's authenticated installations, first claim wins.
+- The digest covers `expectedOwnerEpoch` and `expectedPredecessorGrantId`, so an assertion is bound to one predecessor.
 
-Cloud binding. The Cloud source owner's binding service derives the following from its currently authorized
-binding row, while holding its existing binding fence:
-- `org, ws, user, source='droid', session_id, binding_uuid` and Cloud's origin.
+**Order and codes.** Authorization fails first. The installer verifies signature, scope and issuer class (Cloud
+key: `cloud` + `bindingUuid` only; native key: `native` + `installationId` only) and otherwise refuses with
+`not_authorized` without calling SQL. SQL then checks role (`42501 not_installer`) and digest (`22023`), and only
+then the revision and predecessor CAS (§3 steps 9-10). Those are ordering checks (`40001`/`55000`), never
+authorization. `evidenceSha256` (SHA-256 of the signed assertion bytes) and `issuerKeyId` are stored on the grant.
+SQL does not verify Ed25519; a bare role call without verified evidence is out of contract.
 
-It signs the install or revoke request digest. The signature is an Ed25519 detached signature over the §3
-canonical string, with key id `issuerKeyId`.
-
-Native installation. A native-installation issuer derives `org, ws, user` from authenticated token introspection,
-plus the `installation_id` and origin it issued at setup. Which service this is remains open (Q2).
-
-The installer principal verifies the signature against a pinned public key for that issuer class, and checks the
-class: a Cloud key may sign only `ownerKind=cloud` with a `bindingUuid`, a native key only `native` with an
-`installationId`. Only then does it call SQL with `evidenceSha256` (SHA-256 of the exact signed assertion bytes)
-and `issuerKeyId`, both stored on the grant for audit.
-
-SQL does not verify Ed25519 (no in-database verifier is assumed); a bare role call without verified evidence is
-out of contract.
+**Precondition P1 (not an open question).** A native user plus caller-supplied `origin_id` is not installation
+proof. No source may be enrolled, and no protected `droid` admission may ship, until the native issuer delivers a
+per-installation `G` only to that installation and Desktop presents it (§5.1). Native admission then runs exactly
+the Cloud grant check. Unenrolled sources keep current behaviour.
 
 **4.2 Cross-database consistency is by committed intent, not a distributed transaction.**
 
@@ -238,20 +246,19 @@ A reconciliation loop, with no local mutex held across the network:
 1. Selects `pending` intents per session in revision order.
 2. Sends each intent exactly, unchanged.
 3. Marks it `applied` on a result or `replay`; any refusal other than `session_busy` marks it `refused`
-   (`stale_revision`, `revision_cas_lost` and `operation_conflict` are terminal although `40001`, as at
+   (`stale_revision`, `revision_cas_lost`, `predecessor_mismatch` and `operation_conflict` are terminal though `40001`, as at
    M:20261104052000:88-95).
 4. Retries only `session_busy` and transport failures.
 5. Reads `status` to adopt the authority's revision and tombstone.
 
 A lost response is resolved by exact replay of the same `operationUuid`. Unbind commits a revoke intent first.
-A `refused` intent is never edited; Cloud reads `status` and commits a new intent with a new `operationUuid`.
+A `refused` intent is never edited; a new intent gets a new `operationUuid`. The native issuer uses the same loop.
 
-**4.3 An unrelated native grant cannot seize a session.**
+**4.3 An unrelated grant cannot seize a session.**
 
-Install requires `expectedOwnerEpoch` and `expectedPredecessorGrantId` to equal the authority's (§3 step 10).
-An `active`, `draining` or `unknown` session refuses. A native grant that knows a session id without its
-predecessor gets `42501 predecessor_mismatch`. One aimed at an existing session gets `55000 owner_unknown` or
-`handover_not_ready`.
+Seizure is prevented by §4.1 authorization: an unrelated installation holds no assertion naming this SID and
+predecessor. Predecessor CAS only orders authorized requests: a stale expectation gets `40001 predecessor_mismatch`;
+an `active`, `draining` or `unknown` session refuses with `55000 handover_not_ready` or `owner_unknown`.
 
 **4.4 An empty owner table is not proof of absence.**
 
@@ -260,30 +267,22 @@ backfills an `unknown` row for every `(source, session_id)` found in the step-11
 records `backfill_sha256` over the sorted keys and sets `enrolled`.
 
 For an enrolled source, admission treats no owner row, `unknown`, `released` and `draining` as not-ready, never
-as free. Pre-existing sessions are never implicitly unowned; native upload resumes only through a native install
-against the released predecessor.
+as free. Pre-existing sessions are never implicitly unowned; native upload resumes only through an authorized native install
+(§4.1).
 
-**4.5 Lock graph.** Existing rules: authority rows precede the USER, BATCH and INTENT locks (M:20261104050000:56;
-M:20261104052000:53); the user fence is `ingest_lock_fences` (M:20261104030000:26-33).
+**4.5 Lock graph (one order, used at every hook).** Existing rules: authority rows precede USER, BATCH and INTENT
+(M:20261104050000:56; M:20261104052000:53); the user fence is `ingest_lock_fences` (M:20261104030000:26-33).
 
-The total order is:
-- **L0**: privacy and buffer authority rows, `FOR SHARE`.
-- **L1**: per-user fence.
-- **L2** (new): the acquisition enrollment row, `FOR SHARE NOWAIT`. Then
-  `pg_try_advisory_xact_lock[_shared](hashtextextended(concat_ws(chr(31),'96bulls:acquisition',org,ws,source,session),0))`
-  per session, in `(source, session_id) COLLATE "C"` order, the order of M:20261104030000:96. Shared for
-  admission and publication; exclusive for install, revoke and drain.
-- **L3** batch row, **L4** stage intent, **L5** outbox.
-- **L6**: the publication pointer try-lock and head. This covers ordinary claims (M:20261104060000:259-262) and
-  scoped ones (`ingest_publication_scope` :372-385).
-
-Rules by operation:
-- Reset and selection take L0 and L1, and buffered GC takes L1 per candidate (M:20261104055000:1557); neither
-  takes L2, so privacy and cleanup are never blocked.
-- Install, revoke and drain take only L2 plus the owner row, never L1 or L3-L6.
-- The pointer guard keeps its existing pointer → user `NOWAIT` order (M:20261104060000:417-424). It reads owner
-  rows without locking. Publication already holds L2 shared.
-- Every L2 and L6 acquisition is a try-lock (`40001 session_busy`). No wait can close a cycle.
+`L0` authority rows `FOR SHARE` → `L1` user fence → `L2` batch → `L3` stage intent → `L4` outbox → `L5` publication
+pointer try-lock and head → `LA` acquisition → owner row. `LA` is new and always the leaf of a hook: the enrollment
+row `FOR SHARE NOWAIT`, then `pg_try_advisory_xact_lock_shared(hashtextextended(concat_ws(chr(31),
+'96bulls:acquisition',org,ws,source,session),0))` per session in `(source, session_id) COLLATE "C"` order
+(M:20261104030000:96). Hooks never lock owner rows; they read them under `LA`. Install, revoke and drain take only
+`LA` exclusive and then the owner row `FOR UPDATE`, holding nothing else. `LA` is never waited on (`40001
+session_busy`), and the only owner-row lockers hold only `LA`, so no cycle exists. Reset and selection (`L0`,
+`L1`) and buffered GC (`L1` per candidate, M:20261104055000:1557) take no `LA`, so privacy and cleanup are never
+blocked. The pointer guard keeps its pointer → user `NOWAIT` order (M:20261104060000:417-424) and runs inside
+publish, which already holds `LA`. §5 names the exact position at each hook.
 
 **4.6 Denial versus final refusal.**
 
@@ -298,38 +297,36 @@ return `55000 owner_changed`; a guard refusal surfaces as the existing publish `
 
 ## 5. Admission and publication recheck (exact hooks)
 
-Current bodies are in M:20261104055000, which redefines the M:20261104050000 functions.
+Current bodies are in M:20261104055000, which redefines the M:20261104050000 functions. Every `LA` below is taken
+after that hook's existing locks, per §4.5.
 1. `ingest_claim_batch_mode`. Current body M:20261104055000:1081-1313; first body M:20261104050000:85-130.
-   - Take L2 shared right after `ingest_lock_fences` (:1129), over the union of `sessions` pairs and record
-     sessions, the set used for the epochs at :1302-1306.
-   - Before the ownership insert (:1289), when `v_state IN('claimed','resume')`, call `_admit`, which applies the
-     §4.4 not-ready rules and the principal check:
-     - Cloud: one `acquisition` entry per protected session, `{source,sessionId,grantId,ownerEpoch,grant}`, sorted.
-       The SHA-256 of the entry must equal `grant_sha256`; `grantId` and `ownerEpoch` must be current; `expires_at`
-       must be in the future; and `k.user_id/k.origin_id` must equal the owner's.
-     - Native: no entry; the user and origin must match.
-   - Any miss rejects the whole batch (`not_owner`, `grant_expired` or `owner_*`). Nothing is dropped.
-   - Store the snapshot in `ingest_claim_attempts.acquisition` at the insert (:1308).
-   - An `acquisition` key for an unenrolled source is refused with `acquisition_unexpected`.
-   - Exact replays of committed receipts skip `_admit` and return the original receipt.
-   - `ingest_claim_batch` (M:20261104050000:306) and `ingest_claim_buffered_batch` (055000:748) inherit this.
-2. Accepted-stage recheck, with `_fenced(...,'admit')` beside `ingest_attempt_fenced`. It requires state
-   `active` and the same epoch and grant:
-   - `ingest_prepare_buffer_stage` (M:20261104055000:788, :854);
-   - `ingest_commit_buffered_batch` (:883, :914);
-   - canonical `ingest_commit_batch` (M:20261104060000:981, :1024).
-3. `ingest_publication_claim` (M:20261104060000:179-305).
-   - Take L2 shared after the user fence (:196) and stage locks.
-   - Before the pointer lock (:259), require the snapshot epoch to equal the current `owner_epoch` and the state to
-     be `active` or `draining`.
-   - Write `acquisition_epoch` on the head, and add `h.acquisition_epoch<>v_owner_epoch` to the generation
-     rollover predicate (:278).
-4. `ingest_publication_publish` (:626). After `ingest_publication_locked` (:656), recheck, and add
+   - Existing `L1` (:1129) and batch locks, then `LA` over the session set of the epoch snapshot (:1302-1306),
+     then `_admit` before the ownership insert (:1289) when `v_state IN('claimed','resume')`.
+   - `_admit` applies the §4.4 not-ready rules, then the grant check, identical for both owner kinds (P1). Each
+     protected session needs exactly one entry `{source,sessionId,grantId,ownerEpoch,grant}`, sorted, no
+     duplicates. Strict validation, never normalization: `grant` ~ `^rhg_[0-9a-f]{64}$`, `grantId` a lowercase
+     canonical UUID, `ownerEpoch` a positive decimal, `source`/`sessionId` byte-equal to a batch session.
+   - `_admit` rebuilds the §3 grant preimage from the authenticated `k.org_id, k.workspace_id` and the entry, and
+     requires its hash to equal `grant_sha256`. `grantId`/`ownerEpoch` must be current, `expires_at` in the
+     future, and `k.user_id/k.origin_id` the owner's.
+   - Any miss rejects the whole batch (`not_owner`, `grant_expired` or `owner_*`); nothing is dropped. The
+     snapshot goes to `ingest_claim_attempts.acquisition` (:1308). An entry for an unenrolled source is
+     `acquisition_unexpected`. Exact replays of committed receipts skip `_admit`. `ingest_claim_batch`
+     (M:20261104050000:306) and `ingest_claim_buffered_batch` (055000:748) inherit this.
+2. Accepted-stage recheck: `LA`, then `_fenced(...,'admit')` beside `ingest_attempt_fenced`, requiring `active`
+   and the same epoch and grant, in `ingest_prepare_buffer_stage` (M:20261104055000:799 → :854),
+   `ingest_commit_buffered_batch` (:894 → :914) and `ingest_commit_batch` (M:20261104060000:1017 → :1024).
+3. `ingest_publication_claim` (M:20261104060000:179-305): `L1` (:196), batch and stage intent (:200-204), pointer
+   try-lock (:259-260) and head, then `LA`. Then require the snapshot epoch to equal the current `owner_epoch`
+   with state `active` or `draining`. Write `acquisition_epoch` on the head and add
+   `h.acquisition_epoch<>v_owner_epoch` to the rollover predicate (:278).
+4. `ingest_publication_publish` (:626): directory-events try-lock (:653), `ingest_publication_locked` (:656;
+   stage, attempt and pointer try-lock), then `LA` and the recheck. Add
    `AND acquisition_epoch=(v->>'acquisitionEpoch')::bigint` to the head CAS (:712-716). The pointer CAS
    (:718-720) stays the final gate.
-5. `ingest_publication_guard_pointer` (:407-448). Before the non-`srv_` early return (:412-414), and for live
-   writes only (not `DELETE`, `deleted_at IS NULL`), find owners by physical key. If any is `active` or `draining`:
-   - a non-`srv_` (legacy, not server-derived :245) machine → `RETURN NULL`, fail-closed (Q9);
+5. `ingest_publication_guard_pointer` (:407-448). Before the non-`srv_` early return (:412-414), for live writes
+   only (not `DELETE`, `deleted_at IS NULL`), find owners by physical key. If any is `active` or `draining`:
+   - a non-`srv_` (legacy, not server-derived :245) machine → `RETURN NULL`, fail-closed (Q8);
    - an `srv_` head whose `acquisition_epoch` or user/origin differs from the owner → `RETURN NULL`, next to the
      final CAS (:440-444). Publish then raises `40001` (:720).
    - Tombstones and retire paths (:426-433, :450-482) are untouched.
@@ -345,44 +342,43 @@ Current bodies are in M:20261104055000, which redefines the M:20261104050000 fun
     (M:20261105041000:552).
 - **Installer principal.** A separate service identity; its database password lives in 1Password, never on disk.
   It holds the pinned issuer public keys and is never the ingest signing key or `rth:sync`.
-- **Grant presentation.** Cloud presents the `acquisition` array in the claim payload on Cloud's publish path
-  only, never via the Desktop-upload edge (which must refuse a body carrying it) or `OrderedControl`. Native
-  presents nothing; admission binds the installed user and origin. The pipeline never logs `G`.
+- **Grant presentation.** Both owner kinds present the `acquisition` array in the claim payload, inside the
+  existing signed body; the edge passes it through and gives it no authority. Cloud uses its own publish path (Q3);
+  native uses the Desktop upload of an enrolled source (P1). The pipeline never logs `G`.
 
 ## 7. Drain receipt producer (not in the first migration)
 
-Accepted-obligation evidence for `(org, ws, source, session)` under epoch E is any of:
-- a `pending` `ingest_batches` claim whose attempt snapshot names the session;
-- an acknowledged, live stage intent with a `buffered` outbox (M:20261104050000:20-50) whose records include it;
-- a receipt seat (M:20261104053000:43-60) for it whose stage is not yet published;
-- a head with a live `build_lease_until`.
+Two obligation classes for `(org, ws, source, session)` under epoch E:
+- **Accepted** (acknowledged to the writer): a committed batch whose attempt snapshot names the session, an
+  acknowledged live stage intent with a `buffered` outbox (M:20261104050000:20-50), an unpublished receipt seat
+  (M:20261104053000:43-60), or a head with a live `build_lease_until`. Only these count as evidence for handover
+  readiness. They must be published or explicitly reconciled; a producer must never delete or expire them to
+  make a drain look empty.
+- **Unacknowledged**: a `pending` claim or a prepared, unacknowledged stage. These are not readiness evidence.
+  They cannot become accepted under a `draining` epoch (§5.2 requires `active`), and existing GC cleans them up.
 
-A drain receipt may be written, and `draining → released` applied, only by a producer that takes L2 exclusive
-and proves all four empty from committed state. It records the evidence digest.
-
-Until that producer ships with tests on real accepted stages: handover and drain always return
-`handover_not_ready`/`drain_not_ready`, `unknown` sessions stay not-ready, and only fresh sessions (§3 step 11)
-can be installed.
+`draining → released` may be applied only by a producer that takes `LA` exclusive and proves from committed
+ledger state, never from the owner table, that no accepted obligation remains. It records the evidence digest.
+Until it ships with tests on real accepted stages, handover and drain return `handover_not_ready`/`drain_not_ready`,
+`unknown` sessions stay not-ready, and only fresh sessions (§3 step 11) can be installed.
 
 ## 8. Open questions and implementation plan
 
 Open questions for the Cloud source owner (C) and Desktop (D):
 1. (C) Which binding service and key holds the Ed25519 issuer key? How are rotation and key ids published to the
    installer?
-2. (D) Which service issues native installations in self-host, now that relayauth is removed? What setup
-   authenticates it?
+2. (D) Which service issues native installations and their per-installation `G` in self-host, now that relayauth
+   is removed, and what setup authenticates it? This blocks P1, so no source is enrolled before it is answered.
 3. (C) What route and service identity carry `acquisition` from Cloud's publisher to the private ingest Worker,
    without the Desktop-upload edge?
-4. (D) Native admission binds user and origin, but `origin_id` is client-supplied. Should a later Desktop release
-   present an installation grant, given that the current path must not change?
-5. (D) For a refused protected session (`owner_*`, `not_owner`), what HTTP status and code should Desktop hold on?
+4. (D) For a refused protected session (`owner_*`, `not_owner`), what HTTP status and code should Desktop hold on?
    It must not mark records uploaded or advance checkpoints.
-6. (C) Grant expiry policy. Expiry refuses admission but never releases ownership. Is renewal a new install?
-7. (C, D) Enrollment (per `(org, ws, source)`, proposed) refuses every native upload of that source until a native
+5. (C) Grant expiry policy. Expiry refuses admission but never releases ownership. Is renewal a new install?
+6. (C, D) Enrollment (per `(org, ws, source)`, proposed) refuses every native upload of that source until a native
    install exists. When may `droid` be enrolled, and is per-org scope needed?
-8. (C) Until the drain producer exists, an unbound session stays `draining` (Cloud and native both refused) and a
+7. (C) Until the drain producer exists, an unbound session stays `draining` (Cloud and native both refused) and a
    backfilled `unknown` session can never be installed. Is that acceptable for the first rollout?
-9. (D) Does any legacy non-`srv_` pointer writer still serve `droid`? §5.5 refuses such live writes for owned keys.
+8. (D) Does any legacy non-`srv_` pointer writer still serve `droid`? §5.5 refuses such live writes for owned keys.
 
 Implementation plan. One PR, dormant:
 1. Migration and rollback: `<SLOT>_ingest_acquisition_owner.sql` with the §3 DDL, functions, hooks and REVOKEs.
@@ -391,7 +387,8 @@ Implementation plan. One PR, dormant:
 4. Tests on disposable Postgres: every error code; revoke-before-install; exact replay and operation conflict;
    predecessor seizure; enrolled no-row and `unknown` refusals; zero-write denial; post-PUT refusal that preserves
    objects; legacy and `srv_` pointer guard; physical collision; and a real two-connection, both-orders test for
-   admission↔install, publication claim↔revoke and publish↔guard.
+   admission↔install, publication claim↔revoke, publish↔guard, buffered stage/commit↔revoke, reset↔admission
+   and GC↔publication; the §3 shared grant vectors in both Cloud and SQL tests.
 5. Indexes the step-11 scans need. Indexes built `CONCURRENTLY` are an operator step with no slot.
 
 The migration registry owner assigns the slot after the PR exists, in F-lane order. Applying it, enrolling any
