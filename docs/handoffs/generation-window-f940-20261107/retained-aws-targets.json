@@ -60,7 +60,12 @@
     "retainedEc2ReceiptSha256": "c8da6a4700d0d6ac80ae7aa2001b546a9be57169c15c7d01711a80d26dac00f8",
     "publicationReadinessAt": "2026-11-07T05:57:03.005493+00:00",
     "publicationReadinessStatus": "publisherAWSDeployment NOT_VERIFIED; actualArtifactUnitConfigRolePolicyHealth UNKNOWN",
-    "noLauncherInferred": true
+    "noLauncherInferred": true,
+    "leadWindowDisposition": {
+      "message": "244908112388333568",
+      "plan": "documented INACTIVE; no redeploy unless release owner discovers a running canonical publisher",
+      "ifRunningFound": "redeploy at G2 or stop before rebind, with exact action/authorization; actual inventory remains unverified"
+    }
   },
-  "workerReviewStatus": "See worker-compatibility-review.md; all-new-paths-default-off assertion REFUSED due unconditional turns route and active shared changes."
+  "workerReviewStatus": "PASS_WITH_ONE_EXPLICIT_LEAD_EXCEPTION_RETAINED_CONFIG_ONLY"
 }

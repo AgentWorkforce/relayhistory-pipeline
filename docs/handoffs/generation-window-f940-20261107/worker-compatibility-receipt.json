@@ -1,11 +1,11 @@
 {
   "version": 1,
-  "status": "HOLD_NOT_ALL_NEW_PATHS_DEFAULT_OFF",
+  "status": "PASS_WITH_ONE_EXPLICIT_LEAD_EXCEPTION_RETAINED_CONFIG_ONLY",
   "base": "6440bbf2e7b1c05e5dd7312a2f3179e861680881",
   "candidate": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
   "finding": "app.ts:443 unconditional /v1/turns/batches, plus active diagnostic and shared transport changes",
   "review": "worker-compatibility-review.md",
-  "reviewSha256": "b8f0ccd357e6ae78e6864b3feedec3431e79d79d5a2988a070c1f84c3ca1225a",
+  "reviewSha256": "32e59d040278503a1d259bc5ee1a97695a8e05f9fca2e81fd6819e1b937f09d3",
   "testRuns": [
     {
       "log": "worker-delta-focused-tests.log",
@@ -22,5 +22,19 @@
   ],
   "currentLiveBindingsVerifiedInThisReview": false,
   "sourceEdited": false,
-  "providerOrProductionSqlCalled": false
+  "providerOrProductionSqlCalled": false,
+  "originalFindingStatus": "HOLD_NOT_ALL_NEW_PATHS_DEFAULT_OFF",
+  "leadDispositionMessage": "244908112388333568",
+  "leadAcceptedEndpointException": {
+    "route": "POST /v1/turns/batches",
+    "sourceChange": false,
+    "newArtifact": false,
+    "callerConfigEvidence": "relayhistory-api TURNS_WRITE_PATH current value: UNKNOWN, accepted risk",
+    "signerQualification": "Only signer relayhistory-api per lead; not independently inventoried in this review"
+  },
+  "acceptedActiveCompatibleChanges": [
+    "closed diagnostic logging",
+    "successful PUT S3 version metadata"
+  ],
+  "allNewPathsDefaultOff": false
 }

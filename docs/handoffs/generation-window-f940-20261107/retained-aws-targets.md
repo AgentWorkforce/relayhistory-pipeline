@@ -50,3 +50,10 @@ Actual canonical publisher/GC host, launcher/systemd unit/script hash and last d
 The Nov7 05:57 publication packet likewise says publisherAWSDeployment NOT_VERIFIED and actualArtifactUnitConfigRolePolicyHealth UNKNOWN. Its expectedHostFromSource label is not independent evidence of a live publisher. No literal instance pin is embedded in f940's tracked source; the source runtime requires an explicitly supplied, qualified instance identity. Do not assume this migration host is the service host, invent a systemd unit, or grant it publication permissions from these receipts.
 
 The release owner should qualify the actual runtime inventory before declaring a replacement target, or record a reviewed inactive decision if no publisher exists. Source build success at e778 does not answer that question.
+
+
+## Lead disposition update — 244908112388333568
+
+Worker compatibility is PASS WITH ONE EXPLICIT EXCEPTION: turns is an accepted tested additive endpoint, with current relayhistory-api TURNS_WRITE_PATH UNKNOWN, accepted risk. Diagnostic logging and S3 version metadata are accepted active-compatible changes; no server gate/source/artifact change is requested. The retained config's alternative custody/privacy/retention/Neon-exit selections remain inactive; default relayhistory custody remains active. This does not convert the original all-new-paths-default-off assertion into a true statement or verify fresh live bindings.
+
+Publisher plan: documented INACTIVE because no live publisher deployment is evidenced; no publisher redeploy in this window. If the release owner finds a running canonical publisher, it must be redeployed with G2 or stopped before rebind, using an exact qualified action and applicable authorization. This is a conditional planning disposition, not a fresh process inventory, proof of actual absence, or authorization to stop a service. Historical instance identity/launcher/IAM remain unverified and must not be invented. Other readiness/approval requirements remain in force.

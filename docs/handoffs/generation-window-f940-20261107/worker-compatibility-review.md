@@ -1,6 +1,6 @@
 # Worker compatibility delta: 6440bbf2 -> f9409ccb
 
-Disposition: **HOLD for the requested assertion that every new path is default-off.** That assertion is false for the unconditional turns endpoint and active shared changes. This is a source/compatibility finding, not a report of an authentication bypass and not authorization to deploy. Pipeline-lead owns disposition of the new endpoint and the final runtime selection.
+Current disposition: **PASS WITH ONE EXPLICIT LEAD EXCEPTION**, recorded from pipeline-lead message 244908112388333568. The turns endpoint is accepted as a tested additive endpoint, without a server flag or source/artifact change. Diagnostic logging and S3 version metadata are accepted active-compatible changes. The original all-new-paths-default-off assertion remains false; the following source findings are preserved. This is compatibility acceptance under the retained config, not deployment approval or a fresh provider/config verification.
 
 ## Exact evidence baseline
 
@@ -26,7 +26,7 @@ The retained 20 provider bindings contain 15 application bindings: buffered acce
 
 The lazy custody policy/native-slot protocol already belongs to the deployed G1 schema/source, not a wholly new Worker flag in this delta. Applying 040000-043000 changes underlying SQL/ACL/read surfaces and is covered by the separate full21 schema rehearsal; a Worker-only source review cannot prove every effect of those migrations dormant. 041000's authority activation is separately guarded; 042000's routing flag does not imply every SQL surface or strict eraser change is gated.
 
-## Material finding requiring lead disposition
+## Original material finding and final lead disposition
 
 The requested worker.compatibilityDeltaReview slot cannot be marked PASS_ALL_NEW_PATHS_DEFAULT_OFF. At least the turns route is an additive write admission surface. Options for the lead are an explicitly accepted, tested additive endpoint with qualified caller/config evidence, or a reviewed server-side default-off gate/narrower runtime source followed by fresh artifact/native capture bindings. Do not silently mark an upstream caller's default as a server fence. This review changes no source or configuration.
 
@@ -44,3 +44,10 @@ These are offline synthetic tests, not current Cloudflare bindings, a real deplo
 Adversarial: checked source gates at their mutating callers, not just defaults in comments; surfaced the unconditional route and active shared changes; distinguished caller suppression from admission enforcement, metadata IDs from authority, old runtime receipt from current preimage, separate E3 from Worker wiring, and schema effects from Worker flags. No blanket compatibility signoff inferred from passing tests.
 
 Contextual: completes the lead's requested broad delta inventory against the actual retained config and reports the assertion that cannot be met. Preserves current privacy/custody behavior by default, identifies the explicit decision needed without inventing flags or a deployment, and keeps G2 generation/source/capture bindings separate. AWS target evidence is retained-only and does not qualify a publisher host.
+
+
+## Recorded lead disposition (244908112388333568)
+
+Pipeline-lead accepts POST /v1/turns/batches as the tested additive endpoint with signed tenant + rth:sync + private custody validation, including the missing-witness refusal. No new server gate, source commit or artifact is requested. The current relayhistory-api TURNS_WRITE_PATH value is **UNKNOWN, accepted risk**. Lead states relayhistory-api is the only signer; that statement is recorded as the lead's basis, not a new signer/credential inventory performed by this review. The existing entrypoint authenticates signed bindings and the receipt validation remains in force. Under buffered mode, accepted turns create Supabase ledger/custody metadata and an S3 buffered stage; this is not a claim that transcript payloads are stored in Supabase tables or that canonical publication/readback is ready.
+
+Supabase privacy-authority selection, frozen/shadow custody selection, Babysitter routing and the Neon-exit guard remain inactive under the retained absent settings. Default relayhistory custody itself remains active. Diagnostic logging and optional successful-PUT S3 version metadata are accepted active-compatible changes. The source does not change, and the 106 focused test results remain applicable to the same bytes. Fresh exact live/native capture and the complete generation-window prerequisites remain required. This disposition does not authorize a deploy, turn-forwarding flag, source activation or Cloud PR landing.

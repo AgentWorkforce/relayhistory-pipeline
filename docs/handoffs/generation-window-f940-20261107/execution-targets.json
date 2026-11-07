@@ -49,9 +49,12 @@
     "candidateSource": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
     "currentDeployedSourceAndVersion": null,
     "compatibilityDeltaReview": {
-      "status": "HOLD_NOT_ALL_NEW_PATHS_DEFAULT_OFF",
+      "status": "PASS_WITH_ONE_EXPLICIT_LEAD_EXCEPTION_RETAINED_CONFIG_ONLY",
       "receipt": "worker-compatibility-receipt.json",
-      "sha256": "617410a4f28f05da8d697269617e959d3747106427ba720782cfa948b851f759"
+      "sha256": "8aeb39de56d450862729b708e9832d6fc01ea75f02ee7d1c861ae64e06d561aa",
+      "leadDispositionMessage": "244908112388333568",
+      "callerConfigEvidence": "relayhistory-api TURNS_WRITE_PATH current value: UNKNOWN, accepted risk",
+      "allNewPathsDefaultOff": false
     },
     "semanticInputsSha256": null,
     "nativePlanSha256": null,
@@ -73,20 +76,30 @@
     },
     "retainedOnlyTargetHistory": {
       "receipt": "retained-aws-targets.json",
-      "sha256": "dc86de3b33e79ea37d589b5e3c11b30a9d2c0026249f97256629f2d57029b5cc",
+      "sha256": "a59e72559a6742e97d9d4eaaec9d5f0f669f6c5c05fb2fdf00e8d0553a8ec51c",
       "freshProviderPreimageRequired": true
     }
   },
   "publisherAndPublicationGc": {
     "candidateSource": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
-    "activeRuntimeInventory": null,
+    "activeRuntimeInventory": {
+      "status": "LEAD_DOCUMENTED_INACTIVE_NO_LIVE_DEPLOYMENT_EVIDENCED",
+      "leadDispositionMessage": "244908112388333568",
+      "noFreshProcessInventoryClaim": true,
+      "basis": "Nov4 migration host app_enabled=false; Nov7 publisher deployment NOT_VERIFIED",
+      "releaseOwnerConditionalCheck": "If a running canonical publisher is found, it must be redeployed at G2 or stopped before rebind; this record does not authorize either action"
+    },
     "host": null,
     "launcher": null,
     "managedRoleProfile": null,
     "preservedEnablement": null,
     "artifactSha256": null,
-    "reviewedReplacementCommand": null,
-    "retainedCandidateNotDeploymentProof": true
+    "reviewedReplacementCommand": {
+      "status": "NOT_APPLICABLE_UNDER_DOCUMENTED_INACTIVE_DISPOSITION",
+      "ifRunningFound": "HOLD until exact reviewed G2 replacement or stop path and applicable authorization are supplied"
+    },
+    "retainedCandidateNotDeploymentProof": true,
+    "windowPlan": "NO_PUBLISHER_REDEPLOY_UNLESS_RUNNING_PUBLISHER_FOUND"
   },
   "otherGenerationBoundConsumers": {
     "indexerAndSessionPipelineInventory": null,
@@ -108,13 +121,11 @@
     "bufferedGc.currentTemplateAndPreservedParametersProof",
     "bufferedGc.reviewedChangeSetIdAndSha256",
     "bufferedGc.currentAwsOperatorIdentityAndWrapperPin",
-    "publisherAndPublicationGc.activeRuntimeInventory",
     "publisherAndPublicationGc.host",
     "publisherAndPublicationGc.launcher",
     "publisherAndPublicationGc.managedRoleProfile",
     "publisherAndPublicationGc.preservedEnablement",
     "publisherAndPublicationGc.artifactSha256",
-    "publisherAndPublicationGc.reviewedReplacementCommand",
     "otherGenerationBoundConsumers.indexerAndSessionPipelineInventory",
     "otherGenerationBoundConsumers.replacementOrDocumentedInactiveDecision",
     "otherGenerationBoundConsumers.reviewedDeploymentCaptures"

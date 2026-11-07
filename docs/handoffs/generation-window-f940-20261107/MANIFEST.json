@@ -1,14 +1,14 @@
 {
   "version": 1,
-  "at": "2026-11-07T19:35:58.211562+00:00",
+  "at": "2026-11-07T19:39:21.771395+00:00",
   "kind": "source_plan_and_readonly_fixture_evidence",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
-  "readiness": "HOLD: privileged bootstrap, live runtime/outage pins, unconditional turns route disposition",
+  "readiness": "HOLD overall prerequisites; Worker compatibility accepted with explicit lead exception, publisher documented inactive conditional on no running publisher found",
   "files": [
     {
       "name": "generation-window.md",
-      "bytes": 33399,
-      "sha256": "38b24f948395edee31c8c12cc4547ba3f88598b80bc0fcb54538cf93ddd9ce33"
+      "bytes": 35051,
+      "sha256": "c69bf7f07e9d0823d438a0559da1cbed2c662ba689d20e3de6b520516b410d11"
     },
     {
       "name": "readonly-plan.json",
@@ -27,8 +27,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 5338,
-      "sha256": "c0cfee07182edd82a3f3bce889728e35ba9beb3fc51eff29f32c42fc858231b2"
+      "bytes": 6166,
+      "sha256": "b9eb6d973b90d86b9a3b9d329c1369021497f02c137cfc86f12603837a8a8918"
     },
     {
       "name": "source-evidence.json",
@@ -37,8 +37,8 @@
     },
     {
       "name": "review-notes.md",
-      "bytes": 4614,
-      "sha256": "c6b207de9f4ceed963ea79fb8339ffe57379cdda38b42f2156314b11196e58ec"
+      "bytes": 5572,
+      "sha256": "df2cd10560f690e1d37dccb2a56ac090f9607ad98aac591eef5f61fc153d8896"
     },
     {
       "name": "supporting-readiness.md",
@@ -92,13 +92,13 @@
     },
     {
       "name": "retained-aws-targets.json",
-      "bytes": 5358,
-      "sha256": "dc86de3b33e79ea37d589b5e3c11b30a9d2c0026249f97256629f2d57029b5cc"
+      "bytes": 5601,
+      "sha256": "a59e72559a6742e97d9d4eaaec9d5f0f669f6c5c05fb2fdf00e8d0553a8ec51c"
     },
     {
       "name": "retained-aws-targets.md",
-      "bytes": 5506,
-      "sha256": "66d02939dfcc55069ba552513d61d4ca49f76a15eda4fcffc0fb5cf75f586fc6"
+      "bytes": 6716,
+      "sha256": "61ef73779b39f9cc50c4de7442d9c99dfa7c2f175517c2531c64ffac668c4a91"
     },
     {
       "name": "gc-last-retained-code-update-receipt.json",
@@ -112,13 +112,13 @@
     },
     {
       "name": "worker-compatibility-review.md",
-      "bytes": 7916,
-      "sha256": "b8f0ccd357e6ae78e6864b3feedec3431e79d79d5a2988a070c1f84c3ca1225a"
+      "bytes": 9588,
+      "sha256": "32e59d040278503a1d259bc5ee1a97695a8e05f9fca2e81fd6819e1b937f09d3"
     },
     {
       "name": "worker-compatibility-receipt.json",
-      "bytes": 920,
-      "sha256": "617410a4f28f05da8d697269617e959d3747106427ba720782cfa948b851f759"
+      "bytes": 1561,
+      "sha256": "8aeb39de56d450862729b708e9832d6fc01ea75f02ee7d1c861ae64e06d561aa"
     },
     {
       "name": "worker-delta-focused-tests.log",
