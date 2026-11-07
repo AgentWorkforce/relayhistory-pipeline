@@ -1,8 +1,7 @@
 -- Rollback for registry slot 20261105047000 (portable search storage).
--- Disable every portable Postgres search composition first: this drops the derived
--- index and completeness state (rebuildable from canonical projection). The runtime
--- grants and trusted-backend policies on these tables go with the tables; the image
--- that still lists them in RUNTIME_APPLICATION_TABLE_PRIVILEGES must not migrate again.
+-- Disable every portable search composition first: this drops the content-free
+-- completeness state (rebuildable from canonical projection). The runtime grant and
+-- trusted-backend policy go with the table; the image that still lists it in RUNTIME_APPLICATION_TABLE_PRIVILEGES must not migrate again.
 -- Explicit transaction: guard, marker fence, drops and ledger removal are atomic.
 BEGIN;
 SELECT pg_advisory_xact_lock(961996,1); -- same namespace as the real migrator
@@ -23,7 +22,6 @@ BEGIN
   END IF;
 END
 $rollback_guard$;
-DROP TABLE sessions.search_transcript_events;
 DROP TABLE sessions.search_projection_state;
 DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105047000_portable_search_storage.sql';
 COMMIT;
