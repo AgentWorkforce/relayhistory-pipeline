@@ -35,6 +35,8 @@ const ORIGIN = "origin-1";
 const EPOCH = "3".repeat(64), IDENTITY = "c".repeat(64);
 type Tenant = { orgId: string; workspaceId: string; userId: string };
 const tenantOf = (userId: string): Tenant => ({ orgId: "org-a", workspaceId: "ws-a", userId });
+/** The test records' content digest (prepare's per-record sha256 stand-in). */
+const dig = (revisionId: string) => createHash("sha256").update(revisionId).digest("hex");
 const hourAhead = (h: number) => Math.ceil((Date.now() + 1) / 3_600_000) * 3_600_000 + h * 3_600_000;
 /** The ref SQL issues: the hour, and sha16(source, session, reset epoch, fence epoch). */
 const refOf = (ms: number, source: string, session: string | null, reset = 0, fence = 0) => {
@@ -81,13 +83,13 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
   const commitRevision = (t: Tenant, recordId: string, revision: number, revisionId: string, source: string, session: string | null) => pool.query(
     `INSERT INTO sessions.ingest_record_revisions AS r(org_id,workspace_id,origin_id,record_id,revision,revision_id,digest,user_id,source,session_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
      ON CONFLICT(org_id,workspace_id,origin_id,record_id) DO UPDATE SET revision=EXCLUDED.revision,revision_id=EXCLUDED.revision_id,digest=EXCLUDED.digest`,
-    [t.orgId, t.workspaceId, ORIGIN, recordId, revision, revisionId, createHash("sha256").update(revisionId).digest("hex"), t.userId, source, session]);
+    [t.orgId, t.workspaceId, ORIGIN, recordId, revision, revisionId, dig(revisionId), t.userId, source, session]);
   /** Register under a FRESH claim (snapshot now), or under a given one; by default one committed upsert row per bucket. */
   const register = async (t: Tenant, buckets: BabysitterRetentionRequest[], claim?: Awaited<ReturnType<typeof seedClaim>>, gen = generation,
-    records?: { bucket: number; originId: string; recordId: string; revision: string; revisionId: string; operation: "upsert" | "delete"; kind: string; line: number | null; expiresAtMs: number | null }[]) => {
+    records?: { bucket: number; originId: string; recordId: string; revision: string; revisionId: string; digest: string; operation: "upsert" | "delete"; kind: string; line: number | null; expiresAtMs: number | null }[]) => {
     const c = claim ?? await seedClaim(t, [...new Set(buckets.filter((b) => b.sessionId).map((b) => b.sessionId!))]);
     const n = ++serial;
-    const recs = records ?? buckets.map((b, i) => ({ bucket: i, originId: ORIGIN, recordId: `rec-${n}-${i}`, revision: "1", revisionId: `rec-${n}-${i}:1`, operation: "upsert" as const,
+    const recs = records ?? buckets.map((b, i) => ({ bucket: i, originId: ORIGIN, recordId: `rec-${n}-${i}`, revision: "1", revisionId: `rec-${n}-${i}:1`, digest: dig(`rec-${n}-${i}:1`), operation: "upsert" as const,
       kind: "turn_receipt", line: 0, expiresAtMs: b.eraseAfterMs }));
     const out = await sqlLedger(run).registerBabysitterRetention!({ tenant: t, originId: ORIGIN, ...c, generation: gen, buckets, records: recs });
     if (!records) for (const [i, r] of recs.entries()) await commitRevision(t, r.recordId, 1, r.revisionId, buckets[i]!.source, buckets[i]!.sessionId);
@@ -282,7 +284,7 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
       expect(await code(register(t, [bad as never]))).toBe("ledger_input_refused");
     const claim = await seedClaim(t, ["sess-1"]);
     // A reset since the claim, a stale generation, or a foreign claim token: refused, nothing registered.
-    const one = [{ bucket: 0, originId: ORIGIN, recordId: "reg-r", revision: "1", revisionId: "reg-r:1", operation: "upsert" as const, kind: "turn_receipt", line: 0, expiresAtMs: b.eraseAfterMs }];
+    const one = [{ bucket: 0, originId: ORIGIN, recordId: "reg-r", revision: "1", revisionId: "reg-r:1", digest: dig("reg-r:1"), operation: "upsert" as const, kind: "turn_receipt", line: 0, expiresAtMs: b.eraseAfterMs }];
     expect(await code(sqlLedger(run).registerBabysitterRetention!({ tenant: t, originId: ORIGIN, ...claim, resetEpoch: 7, generation, buckets: [b], records: one }))).toBe("ledger_sqlstate_40001");
     // Index rows are validated too: a record outside the buckets, a bad position or operation, a changed revision identity.
     for (const bad of [{ ...one[0]!, bucket: 1 }, { ...one[0]!, line: null }, { ...one[0]!, operation: "delete" }, { ...one[0]!, kind: "session_event" }, { ...one[0]!, revision: "0" }])
@@ -296,7 +298,7 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     expect(await code(register(mallory, [b], undefined, generation, one))).toBe("ledger_input_refused");
     await commitRevision(mallory, "x-steal", 1, "x-steal:1", "claude", "sess-1");
     await pool.query("UPDATE sessions.ingest_record_revisions SET user_id='u-other' WHERE record_id='x-steal'");
-    await register(mallory, [b], undefined, generation, [{ ...one[0]!, recordId: "x-steal", revisionId: "x-steal:1" }]);
+    await register(mallory, [b], undefined, generation, [{ ...one[0]!, recordId: "x-steal", revisionId: "x-steal:1", digest: dig("x-steal:1") }]);
     expect((await readerPage({ org: t.orgId, ws: t.workspaceId }, t.workspaceId, { includeDeleted: true, limit: 101 })).rows.some((r) => r.recordId === "x-steal")).toBe(false);
     expect(await code(register(t, [b], claim, "f".repeat(64)))).toBe("ledger_sqlstate_55000");
     expect(await code(register(t, [b], { ...claim, claimToken: crypto.randomUUID() }))).toBe("ledger_sqlstate_40001");
@@ -393,12 +395,37 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     expect(await code(asIngest("SELECT sessions.babysitter_evidence_page_for($1,$2::jsonb)", [t.workspaceId, JSON.stringify({ kind: "turn_receipt", source: null, sessionId: null, after: null, limit: 1, includeDeleted: false })]))).toBe("42501");
   });
 
+  test("finn P1 (30f59f23): buffered custody at an EQUAL revision serves only the body the ack accepted (digest), never a refused delete or payload", async () => {
+    const t = { orgId: "org-a", workspaceId: "ws-cust", userId: "u-cust" };
+    const h = hourAhead(90) - 1;
+    const slot = (record: string, rev: number, digest: string) => {
+      const material = ["global-native-custody-v1", t.orgId, t.workspaceId, ORIGIN, record];
+      return pool.query(`INSERT INTO sessions.ingest_lazy_native_slots(key_sha256,key_material,org_id,workspace_id,origin_id,record_id,source_identity_sha256,control_epoch,
+        initialized_witness_sha256,current_owner,current_source,current_session,current_revision,current_digest,current_reset_epoch,current_fence_epoch)
+        VALUES(encode(sha256(convert_to($1::jsonb::text,'UTF8')),'hex'),$1::jsonb,$2,$3,$4,$5,$6,$6,$6,$7,'claude','cs',$8,$9,0,0)`,
+        [JSON.stringify(material), t.orgId, t.workspaceId, ORIGIN, record, "a".repeat(64), t.userId, rev, digest]);
+    };
+    // U holds native custody at rev 5 with body D1 for each record (an upsert, no index row).
+    for (const r of ["cust-del", "cust-body", "cust-ok"]) await slot(r, 5, dig(`${r}:5`));
+    const b = { source: "claude", sessionId: "cs", eraseAfterMs: h + 1 } as BabysitterRetentionRequest;
+    const row = (recordId: string, op: "upsert" | "delete", digest: string) => ({ bucket: 0, originId: ORIGIN, recordId, revision: "5", revisionId: `${recordId}:5`, digest, operation: op,
+      kind: "turn_receipt", line: op === "upsert" ? 0 : null, expiresAtMs: op === "upsert" ? h : null });
+    // A later buffered batch re-sends rev 5 as a DELETE / with another payload: kept and registered, but the ack refuses the body.
+    await register(t, [b], undefined, generation, [row("cust-del", "delete", dig("cust-del:5:other")), row("cust-body", "upsert", dig("cust-body:5:other")), row("cust-ok", "upsert", dig("cust-ok:5"))]);
+    const page = await readerPage({ org: t.orgId, ws: t.workspaceId }, t.workspaceId, { includeDeleted: true });
+    // Only the accepted body is served; the refused delete and the refused payload are not.
+    expect(page.rows.map((r) => [r.recordId, r.operation])).toEqual([["cust-ok", "upsert"]]);
+    // Same through ingest_record_revisions: an equal revision with another digest is not this row.
+    await commitRevision(t, "cust-del", 5, "cust-del:5", "claude", "cs");
+    expect((await readerPage({ org: t.orgId, ws: t.workspaceId }, t.workspaceId, { includeDeleted: true })).rows.map((r) => r.recordId)).toEqual(["cust-ok"]);
+  });
+
   // ---- §1/§2 differential: storage order != native order; tombstones; supersession; expiry; disable/re-enable ----
   const DT = { orgId: "org-a", workspaceId: "ws-diff", userId: "u-diff" };
   const ev = (id: string, session: string, rev: number, expiresAtMs: number, payloadId = id) => ({ kind: "turn_receipt", operation: "upsert", origin_id: ORIGIN, record_id: id,
-    revision: rev, revision_id: `${id}:${rev}`, source: "claude", session_id: session, payload: { id: payloadId, retention_class: "standard_30d", expires_at_ms: expiresAtMs } });
+    revision: rev, revision_id: `${id}:${rev}`, digest: dig(`${id}:${rev}`), source: "claude", session_id: session, payload: { id: payloadId, retention_class: "standard_30d", expires_at_ms: expiresAtMs } });
   const gone = (id: string, session: string, rev: number) => ({ kind: "turn_receipt", operation: "delete", origin_id: ORIGIN, record_id: id, revision: rev, revision_id: `${id}:${rev}`,
-    source: "claude", session_id: session, payload: null });
+    digest: dig(`${id}:${rev}`), source: "claude", session_id: session, payload: null });
   /** One batch exactly as deliver routes it: plan -> register (index rows) -> bucket objects -> commit. */
   const deliverIndexed = async (t: Tenant, store: Parameters<typeof writeBucketObjects>[0]["store"], records: Record<string, unknown>[], commit = (_r: Record<string, unknown>) => true) => {
     const claim = await seedClaim(t, [...new Set(records.map((r) => r.session_id as string))]);

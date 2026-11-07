@@ -103,6 +103,8 @@ export interface BabysitterIndexEntry {
   recordId: string;
   revision: string;
   revisionId: string;
+  /** The record's content digest: the body a commit source must have accepted. */
+  digest: string;
   operation: "upsert" | "delete";
   kind: string;
   /** upsert: the 0-based line in this batch's bucket object (writeBucketObjects order). */
@@ -146,11 +148,11 @@ export function planBabysitterBuckets(records: readonly PreparedDeliveryRecord[]
       // The same order writeBucketObjects writes this bucket's lines in.
       const line = lines.get(key) ?? 0;
       lines.set(key, line + 1);
-      entries.push({ bucket: order.get(key)!, originId: r.origin_id, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id,
+      entries.push({ bucket: order.get(key)!, originId: r.origin_id, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id, digest: r.digest,
         operation: "upsert", kind: r.kind, line, expiresAtMs: r.payload!.expires_at_ms as number });
     } else {
       tombstones.push(r);
-      entries.push({ bucket: order.get(key)!, originId: r.origin_id, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id,
+      entries.push({ bucket: order.get(key)!, originId: r.origin_id, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id, digest: r.digest,
         operation: "delete", kind: r.kind, line: null, expiresAtMs: null });
     }
   }
