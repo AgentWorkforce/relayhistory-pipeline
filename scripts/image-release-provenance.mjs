@@ -8,9 +8,21 @@ import { REPOSITORY, validateRequest } from "./check-image-release.mjs";
 export const IMAGE = "ghcr.io/agentworkforce/96bulls-services";
 export const SOURCE_TYPE = "https://agentrelay.com/attestations/reviewed-image-source/v1";
 export const BUILD_TYPE = "https://slsa.dev/provenance/v1";
-const REPO_URL = `https://github.com/${REPOSITORY}`;
-const WORKFLOW = `${REPO_URL}/.github/workflows/publish-image.yml`;
 const refuse = reason => { throw new Error(`Image provenance refused: ${reason}`); };
+// Exact signer names accepted when verifying an ALREADY-PUBLISHED release (the
+// Amp copy path). Releases signed before the 2026-11-07 rename carry the old
+// name in their Fulcio certificate, predicates and receipt; both entries are
+// the same repository (id REPOSITORY_ID, checked against the GitHub API by the
+// caller). Exact string matches only, one name used consistently for every
+// check of a release. New signatures and in-run verification use REPOSITORY.
+export const LEGACY_SIGNER_REPOSITORY = "AgentWorkforce/sessions-pipeline";
+export const PUBLICATION_SIGNER_REPOSITORIES = Object.freeze([REPOSITORY, LEGACY_SIGNER_REPOSITORY]);
+const signerIdentity = repository => {
+  if (typeof repository !== "string" || !PUBLICATION_SIGNER_REPOSITORIES.includes(repository))
+    refuse("unknown signer repository");
+  const url = `https://github.com/${repository}`;
+  return { repository, url, workflow: `${url}/.github/workflows/publish-image.yml` };
+};
 
 export function releaseParams(env) {
   const values = {
@@ -26,8 +38,9 @@ export function releaseParams(env) {
   return values;
 }
 
-export function predicates(env) {
+export function predicates(env, repository = REPOSITORY) {
   const p = releaseParams(env);
+  const { url: REPO_URL, workflow: WORKFLOW } = signerIdentity(repository);
   const source = {
     repository: REPO_URL, source_sha: p.source, workflow_sha: p.workflow,
     source_ref: "refs/heads/main", ci_run_id: p.ci, image: `${IMAGE}@${p.digest}`,
@@ -78,11 +91,12 @@ function statement(bytes, type, p) {
   } catch { refuse("verified attestation subject or type does not match"); }
 }
 
-export function verifyRelease(env, directory, run = execFileSync) {
+export function verifyRelease(env, directory, run = execFileSync, repository = REPOSITORY) {
   const p = releaseParams(env);
+  const { url: REPO_URL, workflow: WORKFLOW } = signerIdentity(repository);
   const index = artifactBytes(join(directory, "services-index.json"));
   verifyIndex(index, p);
-  const expected = predicates(env);
+  const expected = predicates(env, repository);
   for (const [file, type, kind] of [
     ["build-provenance.sigstore.json", BUILD_TYPE, "build"],
     ["reviewed-source.sigstore.json", SOURCE_TYPE, "source"],
@@ -94,7 +108,7 @@ export function verifyRelease(env, directory, run = execFileSync) {
         "--digest", p.digest.slice(7), "--digestAlg", "sha256", "--type", type,
         "--certificate-identity", `${WORKFLOW}@refs/heads/main`,
         "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com",
-        "--certificate-github-workflow-repository", REPOSITORY,
+        "--certificate-github-workflow-repository", repository,
         "--certificate-github-workflow-ref", "refs/heads/main",
         "--certificate-github-workflow-sha", p.workflow,
         "--certificate-github-workflow-trigger", "workflow_dispatch"],

@@ -1,8 +1,12 @@
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { REPOSITORY, githubJSON, verifyAncestry, verifySourceCI } from "./check-image-release.mjs";
-import { IMAGE, verifyRelease } from "./image-release-provenance.mjs";
+import { REPOSITORY, REPOSITORY_ID, githubJSON, verifyAncestry, verifySourceCI } from "./check-image-release.mjs";
+import { IMAGE, LEGACY_SIGNER_REPOSITORY, PUBLICATION_SIGNER_REPOSITORIES, verifyRelease } from "./image-release-provenance.mjs";
+// The legacy name is accepted only for publications created before the rename
+// (2026-11-07 ~05:56Z; no publish-image run exists between this bound and it),
+// so a later repository reusing the freed old name cannot sign accepted releases.
+export const LEGACY_SIGNER_CREATED_BEFORE = "2026-11-07T00:00:00Z";
 const fail = reason => { throw new Error(`Amp image copy refused: ${reason}`); };
 const sha = value => typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
 const id = value => typeof value === "string" && /^[1-9][0-9]{0,14}$/.test(value);
@@ -19,7 +23,10 @@ export function validateCopyRequest(e) {
 }
 export function validatePublication(e, receipt, run) {
   validateCopyRequest(e);
-  if (receipt.repository !== `https://github.com/${REPOSITORY}` ||
+  // A publication signed before the rename names the old repository; accept
+  // only the exact allow-listed names and verify it under that one name.
+  const signer = PUBLICATION_SIGNER_REPOSITORIES.find(name => receipt.repository === `https://github.com/${name}`);
+  if (!signer ||
       receipt.source_sha !== e.SOURCE_SHA || receipt.image !== `${IMAGE}@${e.IMAGE_DIGEST}` ||
       receipt.source_ref !== "refs/heads/main" || receipt.attestation_backend !== "sigstore" ||
       !sha(receipt.workflow_sha) || !id(receipt.ci_run_id) || receipt.publish_run_id !== e.PUBLISH_RUN_ID ||
@@ -29,8 +36,13 @@ export function validatePublication(e, receipt, run) {
       run.head_branch !== "main" || run.path !== ".github/workflows/publish-image.yml" ||
       run.head_sha !== receipt.workflow_sha || String(run.run_attempt) !== receipt.publish_run_attempt ||
       run.repository?.full_name !== REPOSITORY || run.head_repository?.full_name !== REPOSITORY ||
+      run.repository?.id !== REPOSITORY_ID || run.head_repository?.id !== REPOSITORY_ID ||
       run.actor?.login !== "khaliqgant" || run.triggering_actor?.login !== "khaliqgant")
     fail("successful canonical owner publication identity required");
+  if (signer === LEGACY_SIGNER_REPOSITORY && !(typeof run.created_at === "string" &&
+      Date.parse(run.created_at) < Date.parse(LEGACY_SIGNER_CREATED_BEFORE)))
+    fail("legacy repository name is accepted only for publications before the rename");
+  return signer;
 }
 async function main() {
   const e = process.env; validateCopyRequest(e);
@@ -40,13 +52,13 @@ async function main() {
   const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
   const get = githubJSON(e.GH_TOKEN);
   const run = await get(`/repos/${REPOSITORY}/actions/runs/${e.PUBLISH_RUN_ID}`);
-  validatePublication(e, receipt, run);
+  const signer = validatePublication(e, receipt, run);
   verifyAncestry(e.SOURCE_SHA); verifyAncestry(receipt.workflow_sha);
   const currentCI = await verifySourceCI(e.SOURCE_SHA, get);
   if (String(currentCI) !== receipt.ci_run_id) fail("source CI changed after signing");
   verifyRelease({ SOURCE_SHA: e.SOURCE_SHA, WORKFLOW_SHA: receipt.workflow_sha,
     SOURCE_CI_RUN: receipt.ci_run_id, PUBLISH_RUN_ID: e.PUBLISH_RUN_ID,
-    PUBLISH_RUN_ATTEMPT: receipt.publish_run_attempt, IMAGE_DIGEST: e.IMAGE_DIGEST }, e.ARTIFACT_DIR);
+    PUBLISH_RUN_ATTEMPT: receipt.publish_run_attempt, IMAGE_DIGEST: e.IMAGE_DIGEST }, e.ARTIFACT_DIR, undefined, signer);
   const index = JSON.parse(readFileSync(join(e.ARTIFACT_DIR, "services-index.json"), "utf8"));
   const native = index.manifests.filter(m => m.platform?.os === "linux" && m.platform?.architecture === "amd64");
   if (native.length !== 1 || !/^sha256:[a-f0-9]{64}$/.test(native[0].digest ?? ""))
