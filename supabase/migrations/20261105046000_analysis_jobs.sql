@@ -152,16 +152,25 @@ CREATE TABLE sessions.session_analysis_result_tickets (
   sweeps integer NOT NULL DEFAULT 0 CHECK (sweeps >= 0),
   next_sweep_at timestamptz,
   -- The shared paged eraser's checkpoint (src/migration/neon-s3-erasure/eraser.ts eraseStep),
-  -- bound to the bucket, prefix and this ticket's scope digest; resumed by the next sweep.
-  erase_checkpoint jsonb,
-  -- An unowned object version (not a delete marker) was found and erased for this key: the
-  -- unknown write is accounted for, so a fresh strict zero inventory may retire the ticket.
-  stray_found boolean NOT NULL DEFAULT false
+  -- bound to the bucket, prefix and this ticket's obligation scope; resumed by the next sweep.
+  erase_checkpoint jsonb
 );
 CREATE INDEX session_analysis_result_tickets_created_idx ON sessions.session_analysis_result_tickets (created_at);
 ALTER TABLE sessions.session_analysis_result_tickets ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.session_analysis_result_tickets FROM PUBLIC, anon, authenticated;
 GRANT ALL ON sessions.session_analysis_result_tickets TO service_role;
+
+-- Durable stray evidence for a ticket (write-obligation.ts ObligationStore.markStray): an
+-- unowned object version was found at the key. Its own table so the mark can COMMIT on its own
+-- (autocommit) while the sweep holds the ticket row locked, before that page's deletes; a lost
+-- DELETE ack or a failed sweep can then never lose the only proof that the write landed.
+CREATE TABLE sessions.session_analysis_ticket_strays (
+  result_key text PRIMARY KEY CHECK (char_length(result_key) BETWEEN 1 AND 1024),
+  found_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE sessions.session_analysis_ticket_strays ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_analysis_ticket_strays FROM PUBLIC, anon, authenticated;
+GRANT ALL ON sessions.session_analysis_ticket_strays TO service_role;
 
 
 -- C3 purge fence (purge_session_analysis_for_owned): a session whose analysis was purged by a
@@ -463,6 +472,13 @@ BEGIN
             WHERE e.v ->> 'source' = r.source AND e.v ->> 'session_id' = r.session_id))
     $records$ USING p_org, p_user, p_sessions, p_workspace;
   END IF;
+  -- Serialize with every writer of these scopes (the backfill's request/job/ticket admission
+  -- takes the same per-scope transaction lock, src/session-analysis/backfill.ts scopeLock): a
+  -- writer that took its snapshot before this purge either blocks here and then sees the fence,
+  -- or commits first and its rows are deleted below. Sorted, so two purges never deadlock.
+  PERFORM pg_advisory_xact_lock(hashtextextended('session-analysis-scope:' || s.org_id || '/' || s.workspace_id || '/' || s.session_id, 0))
+     FROM (SELECT DISTINCT o.org_id, o.workspace_id, o.session_id FROM pg_temp.analysis_purge_owned AS o
+            ORDER BY o.org_id, o.workspace_id, o.session_id) AS s;
   -- Fence first (same transaction): reads hide, admission refuses and in-flight jobs cannot
   -- publish from here on, before any object is gone.
   INSERT INTO sessions.session_analysis_purge_fences (org_id, workspace_id, session_id)
@@ -530,6 +546,9 @@ BEGIN
   PERFORM sessions.session_analysis_admit_scope(p_org_id, p_workspace_id);
   -- Serializes admission per org, as relayhistory does; the evidence check follows it.
   PERFORM pg_advisory_xact_lock(hashtextextended('session-analysis-request:' || p_org_id, 0));
+  -- The per-scope lock C3's purge takes first: an admission racing a purge either sees its
+  -- fence (blocked until the purge commits) or commits before it (and is purged).
+  PERFORM pg_advisory_xact_lock(hashtextextended('session-analysis-scope:' || p_org_id || '/' || p_workspace_id || '/' || p_session_id, 0));
   IF NOT EXISTS (SELECT 1 FROM sessions.session_index AS p
                   WHERE p.org_id = p_org_id AND p.workspace_id = p_workspace_id
                     AND (coalesce(p.canonical_session_id, p.session_id) = p_session_id OR p.session_id = p_session_id)
