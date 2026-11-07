@@ -68,7 +68,9 @@ export class SyncState {
   constructor(path: string, opts: { obligations?: boolean; direct?: boolean; inMemoryForTests?: boolean } = {}) {
     this.obligations = opts.obligations ?? obligationsFlag(process.env.S3X_OBLIGATIONS);
     // M-C rev 2 (state-path.ts): OFF opens the configured path as before (refusing an obligations pointer); ON uses a
-    // FRESH state only: a pointer + sibling database, bootstrapped durably before the caller can make any S3 or database call.
+    // FRESH state only: a pointer + sibling database, bootstrapped durably before the caller can proceed past
+    // construction (so before any S3 write/delete or database connection; the exporter's read-only S3 list + head
+    // preflight in main.ts may already have run).
     let dbPath = path;
     let pointer: { stateId: string } | null = null;
     if (!opts.direct && !(opts.inMemoryForTests && path === ":memory:")) {
@@ -137,7 +139,8 @@ export class SyncState {
    * Bootstrap a FRESH ON state: create the sibling exclusively (0600), commit the schema + a random state_id, checkpoint
    * the WAL COMPLETELY and close the sole bootstrap connection (an fsync of the main file alone would not persist
    * commits still in -wal), then fsync + publish the pointer (state-path.ts publishPointer). Any failure refuses
-   * in the constructor (before the caller's first S3 or database call), with nothing adopted or guessed.
+   * in the constructor (before the caller can proceed past construction: no S3 write/delete or database connection yet,
+   * though the exporter's read-only S3 preflight may have run), with nothing adopted or guessed.
    */
   static #checkIdentityReadOnly(dbPath: string, stateId: string) {
     let id: string | undefined;

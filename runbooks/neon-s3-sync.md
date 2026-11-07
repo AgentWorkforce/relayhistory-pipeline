@@ -257,7 +257,7 @@ reservations, the retirement cursor and genesis applies to ON only.
 
 **ON state layout (fresh state only).**
 - **Layout:** `S3X_STATE` holds a small 0600 JSON pointer, and the database is the fixed sibling `<S3X_STATE>.obligations.sqlite` (0600, same directory).
-- **Bootstrap:** it happens only when `S3X_STATE` is absent, before any external effect. The commit is checkpointed and the connection closed before the fsync. The pointer is published with a no-replace link, then the directory is fsynced.
+- **Bootstrap:** it happens only when `S3X_STATE` is absent, before any external write/delete or database connection (the exporter's read-only S3 list + head preflight with `--execute` runs first). The commit is checkpointed and the connection closed before the fsync. The pointer is published with a no-replace link, then the directory is fsynced.
 - **Pre-obligation code** (main 341dd5a9) fails at open on the pointer. Its eraser makes no external call first. Its exporter makes only its read-only preflight (S3 list + head, with `--execute`), never a PUT or DELETE.
 - **Downgrade:** it is unsupported for used state, and enforced by that open failure.
 - **Dry run:** an ON dry run needs its own fresh scratch `S3X_STATE`.
