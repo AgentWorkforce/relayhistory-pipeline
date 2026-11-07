@@ -33,6 +33,7 @@ DROP FUNCTION sessions.session_analysis_neon_free(text, text, text);
 DROP FUNCTION sessions.session_analysis_require_caller(text[]);
 -- Outstanding tickets name objects the sweeper still had to delete: list them first
 -- (SELECT result_key FROM sessions.session_analysis_result_tickets) and remove them by hand.
+DROP TABLE sessions.session_analysis_ticket_strays;
 DROP TABLE sessions.session_analysis_result_tickets;
 DROP TABLE sessions.session_neon_census_seal;
 DROP TABLE sessions.session_analysis_purge_fences;

@@ -183,3 +183,38 @@ describe("paged eraser: checkpoint binding", () => {
     expect(s.deletes.length).toBe(before);
   });
 });
+
+describe("paged eraser: unversioned store entries", () => {
+  test("storeEraser's paged entries carry lastModified (ms) like the S3 eraser's, so a time-based select works", async () => {
+    const { storeEraser } = await import("../neon-s3-erasure/eraser.ts");
+    const { scratchStore } = await import("../../session-ingest/__tests__/support.ts");
+    const { objectKey } = await import("../../shared/vendor.ts");
+    const s = scratchStore();
+    try {
+      const before = Date.now() - 1_000;
+      for (const i of [0, 1, 2]) await s.store.put(objectKey(k(i)), new Uint8Array([i]), { ifNoneMatch: true });
+      const seen: { key: string; lastModified?: number }[] = [];
+      const e = storeEraser(s.store);
+      const r = await e.eraseStep(P, { scope, authorize: ok, select: (v) => { seen.push(v); return (v.lastModified ?? Infinity) < Date.now() + 60_000; } });
+      expect(r).toMatchObject({ status: "traversed", deleted: 3 });
+      expect(seen.map((v) => v.key)).toEqual([k(0), k(1), k(2)]);
+      for (const v of seen) {
+        expect(typeof v.lastModified).toBe("number");
+        expect(v.lastModified!).toBeGreaterThanOrEqual(before - 60_000);
+      }
+      expect(await e.verifyErased(P, { authorize: ok })).toMatchObject({ status: "erased" });
+    } finally { s.done(); }
+  });
+});
+
+describe("paged eraser: beforeDelete evidence hook", () => {
+  test("runs after authorize with exactly the page's doomed versions, before any delete; throwing stops that page", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 10; fill(s, 15);
+    const seen: number[] = [];
+    let n = 0;
+    await expect(s.eraser().eraseStep(P, { scope, authorize: ok, beforeDelete: async (doomed) => { seen.push(doomed.length); if (++n === 2) throw Object.assign(new Error("db down"), { code: "evidence_unwritten" }); } }))
+      .rejects.toMatchObject({ code: "evidence_unwritten" });
+    expect(seen).toEqual([10, 5]);
+    expect(s.deletes).toHaveLength(10);   // the second page deleted nothing
+  });
+});
