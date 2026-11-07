@@ -772,6 +772,9 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.session_analysis_purge_grant(text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_analysis_require_caller(text[])": [
       "<owner>:EXECUTE"
     ],
