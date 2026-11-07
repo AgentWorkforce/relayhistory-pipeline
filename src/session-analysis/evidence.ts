@@ -153,6 +153,12 @@ class EvidenceBudget {
 /** One trusted read of a canonical scope: the projected Neon-shaped rows. */
 export interface CanonicalScopeRows {
   exists: boolean;
+  /**
+   * The legacy export's coverage marker (canonical-legacy.ts `legacy_scope`): null when the
+   * scope does not prove Neon's conversation_turns / session_links / session_outcomes
+   * were exported, so turns relayhistory would have read may be missing.
+   */
+  legacyCoverage: { version: 1; tables: string[] } | null;
   /** canonicalSourceGeneration: pointer set identity, recorded as the job's source revision. */
   generation: string;
   rows: Array<{ table: string; row: RecordValue }>;
@@ -542,6 +548,13 @@ function editsFromEvents(
 export async function loadSessionSource(
   deps: AnalysisEvidenceDeps,
   scope: AnalysisScope,
+  options: {
+    /**
+     * SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS (operator switch, default off; the read API's
+     * READ_API_TIMING_ASSUME_NO_TURNS pattern): analyze a scope without the coverage marker.
+     */
+    assumeNoLegacyTurns?: boolean;
+  } = {},
 ): Promise<SessionSourceSnapshot & { sourceGeneration: string }> {
   const { sessionId } = scope;
   if (!sessionId.trim()) throw new SessionSourceNotFoundError();
@@ -554,6 +567,10 @@ export async function loadSessionSource(
   const harness = harnesses[0]!;
   const snapshot = await deps.snapshot({ ...scope, source: harness });
   if (!snapshot.exists) throw new SessionSourceNotFoundError();
+  // As the turns route (session-turns-source.ts turns_unknown): without the export's
+  // coverage marker the scope may lack turns Neon held, so the evidence is incomplete.
+  if (!snapshot.legacyCoverage && options.assumeNoLegacyTurns !== true)
+    throw new SessionSourceIncompleteError("RelayHistory legacy evidence coverage is unknown");
   const budget = new EvidenceBudget();
   const byTable = (table: string) =>
     snapshot.rows.filter((r) => r.table === table).map((r) => r.row);

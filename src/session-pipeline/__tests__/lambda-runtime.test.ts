@@ -50,6 +50,7 @@ const schedules = [
   ["reconcile", "reconcile"], ["brief", "brief"],
   ["analysis-cache", "analysisCache"], ["analysis-cache-reconcile", "analysisCacheReconcile"],
   ["semantic-copy", "semanticCopy"],
+  ["session-analysis", "sessionAnalysis"],
 ] as const;
 
 const invalidSchedules: unknown[] = ["unknown", "", " ", "RECONCILE", "__proto__", null, false, 0, [], {}, ["brief"]];

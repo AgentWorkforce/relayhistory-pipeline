@@ -60,3 +60,43 @@ BEGIN
   END IF;
 END
 $bootstrap$;
+
+-- Lane F1 (migration 20261105046000): the read API's separate session-analysis admission
+-- principal, bulls96_analysis_admit. The same bare NOLOGIN provisioning and refusals as
+-- bulls96_read_api above; the migration grants it EXECUTE on sessions.analysis_request_v1
+-- only. Making it LOGIN (its own Hyperdrive/secret URL) is a separate, approved operator step.
+DO $bootstrap$
+DECLARE
+  v_name text := 'bulls96_analysis_admit';
+  v_me record;
+  r pg_roles%ROWTYPE;
+  v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
+  v_version int := current_setting('server_version_num')::int;
+BEGIN
+  SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
+  IF NOT FOUND THEN
+    SELECT rolsuper, rolcreaterole INTO v_me FROM pg_roles WHERE rolname = current_user;
+    IF NOT v_me.rolsuper
+       AND NOT (v_me.rolcreaterole AND v_version < 160000)
+       AND NOT (v_version >= 160000 AND current_user = 'postgres' AND v_me.rolcreaterole
+                AND (v_mode = 'supabase'
+                     OR EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supabase_admin' AND rolsuper))) THEN
+      RAISE EXCEPTION USING ERRCODE = '42501',
+        MESSAGE = format('bootstrap %s: %I may not create it', v_name, current_user),
+        HINT = 'Run as a superuser, a CREATEROLE role on PostgreSQL 15 or older, or Supabase''s postgres.';
+    END IF;
+    EXECUTE format('CREATE ROLE %I NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION', v_name);
+    SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
+  END IF;
+  IF r.rolsuper OR r.rolbypassrls OR r.rolinherit OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = format('bootstrap %s: the role exists elevated', v_name),
+      HINT = 'Nothing was changed. Fix or drop the role by hand (an operator decision), then rerun.';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_auth_members WHERE member = r.oid) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = format('bootstrap %s: the role is a member of another role', v_name),
+      HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
+  END IF;
+END
+$bootstrap$;
