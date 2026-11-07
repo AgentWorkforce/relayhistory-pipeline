@@ -278,7 +278,7 @@ describe("Neon backfill load (fixtures)", () => {
     const v = await verifyBackfill(target(pg), fixture);
     // s-9 has a live pointer but no representable brief: missing (a defect, fails the run).
     // s-3 (erased), s-4 (never copied) and s-10 (unkeyable) have no live pointer: reported
-    // as no_pointer residue, not failed. s-5 is blank (not compared).
+    // as no_pointer (excluded from the title comparison), not failed. s-5 is blank (not compared).
     expect(v).toMatchObject({ candidates: 10, compared: 9, equal: 5, different: 0, native: 0, missing: 1, no_pointer: 3 });
     expect(v.samples.missing).toEqual([["org-a", "ws-a", "claude", "s-9"]]);
     expect(verifyPassed(v)).toBe(false);

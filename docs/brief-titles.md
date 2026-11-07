@@ -33,7 +33,8 @@ Cloud's session list shows each session's cached model-written brief title. Toda
 - Modes:
   - dry run (default; each batch rolls back);
   - `--execute --expect-supabase-ref=<ref>` (guarded);
-  - `--verify`, which is read-only and exits 2 when any session with a live pointer is missing its title or serves a different one. Keys with no live pointer are reported as `no_pointer` residue.
+  - `--verify`, which is read-only and exits 2 when any session with a live pointer is missing its title or serves a different one, or when the verify output does not cover every key exactly (a missing, duplicate or malformed row).
+  - Keys that a well-formed row says have no live pointer are reported as `no_pointer` and **excluded from the title comparison**. That count is not a proof of copy completeness; the copy verifier owns that question.
 - Only counts and keys are printed, never titles.
 
 ## Containment: backfilled titles stay out of the directory and search

@@ -217,10 +217,10 @@ describe.skipIf(!url)("owned PG17: F2 brief-title backfill rehearsal", () => {
 
     const verify = await cli(["--verify"]);
     // s-9 has a live pointer and a Cloud-visible title SP cannot serve: the run fails (exit 2).
-    // s-6 has no SP pointer at all: reported as no_pointer residue, not failed.
+    // s-6 has no SP pointer at all: reported as no_pointer (excluded from the title comparison), not failed.
     expect(verify.exit).toBe(2);
     expect(verify.out.passed).toBe(false);
-    expect(verify.out.verify).toMatchObject({ candidates: 11, compared: 10, equal: 7, native: 1, missing: 1, no_pointer: 1, different: 0 });
+    expect(verify.out.verify).toMatchObject({ candidates: 11, compared: 10, equal: 7, native: 1, missing: 1, no_pointer: 1, malformed: 0, different: 0 });
     expect(verify.out.verify.samples.missing).toEqual([["org-a", "ws-a", "claude", "s-9"]]);
     expect(verify.out.verify.samples.no_pointer).toEqual([["org-a", "ws-a", "claude", "s-6"]]);
     expect((await cli(["--verify", "--execute"])).exit).toBe(1);

@@ -363,9 +363,12 @@ export const VERIFY_SQL = `SELECT i.org_id, i.workspace_id, i.harness, i.session
      LIMIT 1
   ) AS hit ON true`;
 
-/** Parity holds only with nothing missing and nothing different (no_pointer is reported, not failed). */
+/**
+ * Parity holds only with nothing missing, nothing different and complete, well-formed verify
+ * output. no_pointer keys are excluded from the comparison and reported, not failed.
+ */
 export function verifyPassed(r: VerifyReport): boolean {
-  return r.missing === 0 && r.different === 0;
+  return r.missing === 0 && r.different === 0 && r.malformed === 0;
 }
 
 export interface VerifyReport {
@@ -376,37 +379,78 @@ export interface VerifyReport {
   /** SP has a live pointer for the key but serves no title (not backfilled or skipped): a defect. */
   missing: number;
   /**
-   * SP has no live pointer resolving to the key (erased, tombstoned or never copied): the
-   * session is not listable after the cutover, so this is residue, not a parity failure.
+   * A present, well-formed verify row says no live pointer resolves to the key (erased,
+   * tombstoned, or not copied). These keys are EXCLUDED from the title comparison. This is not
+   * a proof of copy completeness: whether every session was copied is the copy verifier's job.
    */
   no_pointer: number;
+  /**
+   * The verify query's output did not cover the batch exactly: a key with no row, a duplicate
+   * or unrequested row, or a row of the wrong shape (live not a boolean, a title with no live
+   * pointer). VERIFY_SQL returns exactly one row per key, so any of these fails the run.
+   */
+  malformed: number;
   /** SP serves a native brief title instead (expected after native regeneration). */
   native: number;
   /** SP serves a backfilled title that differs from Neon: always a defect. */
   different: number;
   /** Up to 20 keys per class, identifiers only. */
-  samples: { missing: string[][]; different: string[][]; no_pointer: string[][] };
+  samples: { missing: string[][]; different: string[][]; no_pointer: string[][]; malformed: string[][] };
 }
 
 /** Read-only parity: every Cloud-visible Neon title must equal the title SP serves. */
+type VerifyRow = { org_id: unknown; workspace_id: unknown; harness: unknown; session_id: unknown; title: unknown; origin: unknown; live: unknown };
+
+/** One VERIFY_SQL row's shape, exactly: a row that is not this is malformed, never evidence. */
+function wellFormed(r: VerifyRow): boolean {
+  if (typeof r.org_id !== "string" || typeof r.workspace_id !== "string" || typeof r.harness !== "string" || typeof r.session_id !== "string") return false;
+  if (typeof r.live !== "boolean") return false;
+  if (r.title === null) return r.origin === null;
+  // A served title implies a live pointer and a provenance label.
+  return typeof r.title === "string" && r.live === true && (r.origin === "native" || r.origin === "neon_backfill");
+}
+
+/** Read-only parity: every Cloud-visible Neon title against the title SP serves. */
 export async function verifyBackfill(target: Queryable, source: readonly NeonBriefRow[]): Promise<VerifyReport> {
-  const report: VerifyReport = { candidates: source.length, compared: 0, equal: 0, missing: 0, no_pointer: 0, native: 0, different: 0, samples: { missing: [], different: [], no_pointer: [] } };
-  const wanted = source.flatMap((n) => {
+  const report: VerifyReport = {
+    candidates: source.length, compared: 0, equal: 0, missing: 0, no_pointer: 0, malformed: 0, native: 0, different: 0,
+    samples: { missing: [], different: [], no_pointer: [], malformed: [] },
+  };
+  const seen = new Map<string, string>();
+  const wanted: Array<{ key: { org_id: string; workspace_id: string; harness: string; session_id: string }; title: string }> = [];
+  for (const n of source) {
     const title = cloudTitle(n.title);
-    return title === null ? [] : [{ key: { org_id: n.org_id, workspace_id: n.workspace_id, harness: n.source_provider, session_id: n.session_id }, title }];
-  });
+    if (title === null) continue;
+    const id = JSON.stringify([n.org_id, n.workspace_id, n.source_provider, n.session_id]);
+    // DISTINCT ON makes this impossible from Neon; a fixture may still repeat a key.
+    if (seen.has(id)) throw new Error("verify: duplicate session key in the source");
+    seen.set(id, title);
+    wanted.push({ key: { org_id: n.org_id, workspace_id: n.workspace_id, harness: n.source_provider, session_id: n.session_id }, title });
+  }
   report.compared = wanted.length;
+  const malformed = (id: string[]) => {
+    report.malformed += 1;
+    if (report.samples.malformed.length < 20) report.samples.malformed.push(id);
+  };
   for (let at = 0; at < wanted.length; at += LOAD_BATCH_ROWS) {
     const batch = wanted.slice(at, at + LOAD_BATCH_ROWS);
-    const { rows } = await target.query<{ org_id: string; workspace_id: string; harness: string; session_id: string; title: string | null; origin: string | null; live: boolean }>(
-      VERIFY_SQL,
-      [JSON.stringify(batch.map((w) => w.key))],
-    );
-    const got = new Map(rows.map((r) => [JSON.stringify([r.org_id, r.workspace_id, r.harness, r.session_id]), r]));
+    const { rows } = await target.query<VerifyRow>(VERIFY_SQL, [JSON.stringify(batch.map((w) => w.key))]);
+    const asked = new Set(batch.map((w) => JSON.stringify([w.key.org_id, w.key.workspace_id, w.key.harness, w.key.session_id])));
+    const got = new Map<string, VerifyRow>();
+    const bad = new Set<string>();
+    for (const r of rows) {
+      const id = JSON.stringify([r.org_id, r.workspace_id, r.harness, r.session_id]);
+      if (!asked.has(id)) { malformed([String(r.org_id), String(r.workspace_id), String(r.harness), String(r.session_id)]); continue; }
+      if (got.has(id) || !wellFormed(r)) bad.add(id);
+      got.set(id, r);
+    }
     for (const w of batch) {
       const id = [w.key.org_id, w.key.workspace_id, w.key.harness, w.key.session_id];
-      const r = got.get(JSON.stringify(id));
-      if (!r || (r.title === null && !r.live)) {
+      const key = JSON.stringify(id);
+      const r = got.get(key);
+      if (!r || bad.has(key)) {
+        malformed(id);
+      } else if (r.title === null && r.live === false) {
         report.no_pointer += 1;
         if (report.samples.no_pointer.length < 20) report.samples.no_pointer.push(id);
       } else if (r.title === null) {

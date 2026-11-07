@@ -8,7 +8,10 @@
  *       writes (target-guard.ts); the live run is the lead's, with the user's OK
  *   ... --verify
  *       read-only parity: every Cloud-visible Neon title against the title SP serves, with
- *       the read path's resolution; exit 2 when any is missing or different
+ *       the read path's resolution; exit 2 when any is missing or different, or when the
+ *       verify output does not cover every key with exactly one well-formed row. Keys a
+ *       well-formed row reports without a live pointer are excluded from the comparison
+ *       (no_pointer), which is not a proof of copy completeness
  *
  * Env, injected at run time (e.g. `op run`; never a file on disk):
  *   NEON_BRIEF_TITLES_SOURCE_URL   Neon (relayhistory_readonly) or the frozen copy; the
