@@ -428,13 +428,14 @@ export type FactsRange = { min: string; max: string } | null;
 
 /** The scope's last recorded facts span, for a pass that cannot compute one (a partial read). */
 export async function previousOutputFactsRange(ch: ClickHouseClient, scope: OutputFactsScope): Promise<FactsRange> {
-  const rows = await ch.select<{ min_ts: string | null; max_ts: string | null }>(
-    `SELECT toString(min(min_ts)) AS min_ts, toString(max(max_ts)) AS max_ts FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
-      WHERE ${scopeWhere} AND source = {source:String} AND isNotNull(min_ts)`,
+  // Aliases must not shadow the columns: WHERE would then name the aggregate (code 184).
+  const rows = await ch.select<{ lo: string | null; hi: string | null; n: string | number }>(
+    `SELECT toString(min(min_ts)) AS lo, toString(max(max_ts)) AS hi, count() AS n FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
+      WHERE ${scopeWhere} AND source = {source:String} AND isNotNull(min_ts) AND isNotNull(max_ts)`,
     { params: { org: scope.orgId, workspace: scope.workspaceId, sessions: scope.sessionIds, source: scope.harness }, timeoutMs: 20_000 },
   );
   const r = rows[0];
-  return r?.min_ts && r.max_ts && !r.min_ts.startsWith("1970") ? { min: r.min_ts, max: r.max_ts } : null;
+  return r && Number(r.n) > 0 && r.lo && r.hi ? { min: r.lo, max: r.hi } : null;
 }
 
 /**

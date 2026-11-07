@@ -49,6 +49,14 @@ export class OutputScopeError extends Error {
   }
 }
 
+/** ClickHouse DateTime64 text ("YYYY-MM-DD HH:MM:SS[.ffffff]", UTC) as epoch microseconds. */
+export function chMicros(text: string): bigint {
+  const [whole, fraction = ""] = text.split(".");
+  const ms = Date.parse(`${whole!.replace(" ", "T")}Z`);
+  if (!Number.isFinite(ms)) throw new Error("invalid ClickHouse time");
+  return BigInt(ms) * 1000n + BigInt(fraction.slice(0, 6).padEnd(6, "0"));
+}
+
 /** A JS instant as DateTime64(6) text (UTC). JS Dates are millisecond, as relayhistory's are. */
 export function chInstant(date: Date): string {
   return date.toISOString().replace("T", " ").replace("Z", "000");
@@ -178,7 +186,8 @@ export async function outputWindowReadiness(
   const o = { params: base, timeoutMs: opts.timeoutMs ?? 3_000, ...(opts.settings ? { settings: opts.settings } : {}) };
   const watermark = await outputCompleteSince(ch, orgId, workspaceId, opts);
   if (!watermark) return "backfill_incomplete";
-  if (Date.parse(`${watermark.replace(" ", "T")}Z`) > since.getTime()) return "before_watermark";
+  // Microsecond compare: Date.parse would truncate the watermark to milliseconds.
+  if (chMicros(watermark) > BigInt(since.getTime()) * 1000n) return "before_watermark";
   const [[partial], [unindexed]] = await Promise.all([
     ch.select<{ n: string | number }>(
       `SELECT count() AS n FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
