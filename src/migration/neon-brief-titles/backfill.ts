@@ -31,7 +31,7 @@
  *     (the native stage decided the text must not exist) is never refilled.
  * A backfilled row: engine_version 'neon-backfill:v1' (so the provenance trigger labels it
  * origin = 'neon_backfill'), legacy_job_id = the Neon job id, revision 0 and empty source
- * revisions (session_brief reports it 'stale', never 'ready'), and a brief_fingerprint that
+ * revisions (never 'ready' anywhere; session_brief reads it as absent), and a brief_fingerprint that
  * no native input can have (sha256 of a backfill-only string), so the native worker never
  * "reuses" it instead of calling the model. The directory title is not touched, now or on a
  * later re-projection: the directory projector reads native briefs only
