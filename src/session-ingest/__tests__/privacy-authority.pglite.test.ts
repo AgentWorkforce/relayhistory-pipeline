@@ -465,13 +465,14 @@ test("analysis purge (guarded, ordering): a reset calls purge_session_analysis_f
   await f.db.exec(`CREATE TABLE sessions.__c3_analysis_purge_calls(org_id text,user_id text,owned_seen bigint);
     CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text) RETURNS bigint LANGUAGE sql AS $$
       INSERT INTO sessions.__c3_analysis_purge_calls SELECT p_org,p_user,(SELECT count(*) FROM sessions.ingest_frozen_source_owned_sessions WHERE org_id=p_org AND workspace_id=p_workspace AND user_id=p_user) RETURNING 0::bigint $$;
-    CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text,p_sessions jsonb) RETURNS bigint LANGUAGE sql AS $$ SELECT 0::bigint $$;`);
+    CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text,p_sessions jsonb) RETURNS bigint LANGUAGE sql AS $$ SELECT 0::bigint $$;
+    CREATE FUNCTION sessions.session_analysis_purge_grant(p_org text,p_workspace text,p_user text) RETURNS void LANGUAGE sql AS $$ SELECT $$;`);
   await authorityControl(f, "reset", { request_id: "analysis-1" });
   expect((await f.db.query("SELECT org_id,user_id,owned_seen::int FROM sessions.__c3_analysis_purge_calls")).rows).toEqual([{ org_id: TENANT.orgId, user_id: TENANT.userId, owned_seen: 1 }]);
   expect(((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_frozen_source_owned_sessions")).rows[0] as any).n).toBe(0);
 });
 
-/** #292's workspace-scoped purge_session_analysis_for_owned (both forms), loaded VERBATIM from #292 e17231b1 (046000). */
+/** #292's workspace-scoped purge_session_analysis_for_owned (both forms) + its per-transaction grant, VERBATIM from #292 b28e634c (046000). */
 async function withAnalysis(f: F) {
   await f.db.exec("DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_analysis_admit') THEN CREATE ROLE bulls96_analysis_admit NOLOGIN NOINHERIT; END IF; END$$;");
   await f.db.exec(await Bun.file(new URL("./fixtures/analysis-jobs-046000.sql", import.meta.url)).text());
@@ -538,6 +539,44 @@ test("analysis purge (real #292 function): a disable purges only the listed sess
   expect(await w.jobs()).toEqual([`${TENANT.workspaceId}/S1`, `${TENANT.workspaceId}/S2`, `${TENANT.workspaceId}/S3`, "ws-b/S1", "ws-c/S1"]);
 });
 
+test("analysis purge (real #292 b28e634c): a reset and a disable each mint the grant for EXACTLY the scope, consumed by the purge in the SAME transaction", async () => {
+  const w = await analysisWorld();
+  // Every grant row inserted, with the transaction that minted it; every purge fence write, with ITS transaction and
+  // whether the grant row for its scope was already consumed (the purge deletes it before writing fences).
+  await w.f.db.exec(`CREATE TABLE sessions.__c3_grants(txid bigint, org_id text, workspace_id text, user_id text);
+    CREATE FUNCTION sessions.__c3_grant_fn() RETURNS trigger LANGUAGE plpgsql AS $t$ BEGIN
+      INSERT INTO sessions.__c3_grants VALUES (NEW.txid, NEW.org_id, NEW.workspace_id, NEW.user_id); RETURN NEW; END $t$;
+    CREATE TRIGGER __c3_grant AFTER INSERT ON sessions.session_analysis_purge_authority FOR EACH ROW EXECUTE FUNCTION sessions.__c3_grant_fn();
+    CREATE TABLE sessions.__c3_fence_tx(txid bigint, pending bigint);
+    CREATE FUNCTION sessions.__c3_fence_tx_fn() RETURNS trigger LANGUAGE plpgsql AS $t$ BEGIN
+      INSERT INTO sessions.__c3_fence_tx SELECT txid_current(), (SELECT count(*) FROM sessions.session_analysis_purge_authority); RETURN NEW; END $t$;
+    CREATE TRIGGER __c3_fence_tx BEFORE INSERT ON sessions.session_analysis_purge_fences FOR EACH ROW EXECUTE FUNCTION sessions.__c3_fence_tx_fn();`);
+  const grants = async () => (await w.f.db.query("SELECT txid::text AS txid, org_id, workspace_id, user_id FROM sessions.__c3_grants ORDER BY txid")).rows as { txid: string; org_id: string; workspace_id: string; user_id: string }[];
+  const fences = async () => (await w.f.db.query("SELECT txid::text AS txid, pending::int AS pending FROM sessions.__c3_fence_tx")).rows as { txid: string; pending: number }[];
+  await authorityControl(w.f, "selection", { origin_id: w.o, sessions: [{ source: "claude", session_id: "S1" }], enabled: false });
+  const g1 = await grants();
+  expect(g1.map(({ org_id, workspace_id, user_id }) => ({ org_id, workspace_id, user_id }))).toEqual([{ org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, user_id: TENANT.userId }]);
+  expect((await fences()).map((r) => r.txid)).toEqual([g1[0]!.txid]); // the purge ran in the grant's transaction
+  expect((await fences())[0]!.pending).toBe(0); // and consumed the grant before writing its fence
+  await authorityControl(w.f, "reset", { request_id: "grant-reset" });
+  const g2 = await grants();
+  expect(g2.length).toBe(2);
+  expect(g2[1]).toMatchObject({ org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, user_id: TENANT.userId });
+  expect(new Set((await fences()).slice(1).map((r) => r.txid))).toEqual(new Set([g2[1]!.txid]));
+  // No proof outlives its transaction.
+  expect(((await w.f.db.query("SELECT count(*)::int AS n FROM sessions.session_analysis_purge_authority")).rows[0] as any).n).toBe(0);
+});
+
+test("analysis purge (real #292 b28e634c): without the authority's grant, a purge in the ingest role is refused even under the writer marker", async () => {
+  const w = await analysisWorld();
+  const e = await w.f.db.transaction(async (tx) => {
+    await tx.exec("SET LOCAL ROLE bulls96_session_ingest");
+    await tx.query("SELECT set_config('bulls96.privacy_authority_writer','authority',true)");
+    return tx.query("SELECT sessions.purge_session_analysis_for_owned($1,$2,$3)", [TENANT.orgId, TENANT.workspaceId, TENANT.userId]).then(() => null, (x: any) => x.code);
+  });
+  expect(e).toBe("42501");
+});
+
 test("analysis purge (real #292 function): the ingest role cannot call it outside the authority (writer marker required)", async () => {
   const w = await analysisWorld();
   for (const sql of ["SELECT sessions.purge_session_analysis_for_owned($1,$2,$3)", "SELECT sessions.purge_session_analysis_for_owned($1,$2,$3,'[]'::jsonb)"])
@@ -546,16 +585,21 @@ test("analysis purge (real #292 function): the ingest role cannot call it outsid
 });
 
 /** 046000 present in any form, but without BOTH exact workspace-scoped signatures (e.g. #292's older f7f49308 ABI). */
-async function staleAnalysisAbi(f: F, variant: "old-signatures" | "table-only" | "reset-form-only") {
+async function staleAnalysisAbi(f: F, variant: "old-signatures" | "table-only" | "reset-form-only" | "no-grant") {
   if (variant !== "reset-form-only") await f.db.exec("CREATE TABLE sessions.session_analysis_jobs_v2(org_id text, workspace_id text, session_id text)");
   if (variant === "old-signatures")
     await f.db.exec(`CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_user text) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;
       CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_user text,p_sessions jsonb) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;`);
+  if (variant === "no-grant")
+    // Both exact workspace-scoped purges, but 046000's grant helper is missing (its purge-authority table is present).
+    await f.db.exec(`CREATE TABLE sessions.session_analysis_purge_authority(txid bigint, org_id text, workspace_id text, user_id text);
+      CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;
+      CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text,p_sessions jsonb) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;`);
   if (variant === "reset-form-only")
     await f.db.exec("CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;");
 }
 
-for (const variant of ["old-signatures", "table-only", "reset-form-only"] as const)
+for (const variant of ["old-signatures", "table-only", "reset-form-only", "no-grant"] as const)
   test(`analysis ABI fail-closed (${variant}): a reset and a disable ABORT, nothing applied`, async () => {
     const f = await setup();
     const n = await fakeNeon();

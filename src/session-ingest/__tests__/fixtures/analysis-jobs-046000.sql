@@ -1,5 +1,5 @@
 -- Test fixture: sessions-pipeline #292 (lane F1) supabase/migrations/20261105046000_analysis_jobs.sql, VERBATIM at
--- e17231b1 (workspace-scoped purge_session_analysis_for_owned in both forms, per-scope advisory lock). source-sha256: 9b565bb6b4d676f189a70655f3fa9579e48eebe6038fb44267ad6cc694615c51
+-- b28e634c (workspace-scoped purge in both forms, per-transaction purge grant + authority). source-sha256: def292de9473e4ea233ae66882f751924487e7b6bf7be323d721d52ee0e47856
 -- Registry slot 046000 (lane F1, session ANALYSIS panel off Neon). The full-analysis
 -- request/job lifecycle that relayhistory ran on Neon (sessions.session_analysis_requests,
 -- sessions.session_analysis_jobs; RHC migrations 0015, 0016, 0024, 0031, 0043, 0062), owned
@@ -129,6 +129,12 @@ GRANT ALL ON sessions.session_analysis_jobs_v2, sessions.session_analysis_reques
 
 -- Erase-safe publication tickets. Not deleted by erasure: they are how the sweeper finds
 -- an object written for (or orphaned by) a forgotten session.
+-- Monotonic across ticket re-creation, so a retired-and-recreated ticket never reuses a rev
+-- (no ABA for a sweeper holding an old one).
+CREATE SEQUENCE sessions.session_analysis_ticket_rev_seq;
+REVOKE ALL ON SEQUENCE sessions.session_analysis_ticket_rev_seq FROM PUBLIC, anon, authenticated;
+GRANT USAGE, SELECT ON SEQUENCE sessions.session_analysis_ticket_rev_seq TO service_role;
+
 CREATE TABLE sessions.session_analysis_result_tickets (
   result_key text PRIMARY KEY CHECK (char_length(result_key) BETWEEN 1 AND 1024),
   job_id uuid NOT NULL,
@@ -155,24 +161,55 @@ CREATE TABLE sessions.session_analysis_result_tickets (
   next_sweep_at timestamptz,
   -- The shared paged eraser's checkpoint (src/migration/neon-s3-erasure/eraser.ts eraseStep),
   -- bound to the bucket, prefix and this ticket's obligation scope; resumed by the next sweep.
-  erase_checkpoint jsonb
+  erase_checkpoint jsonb,
+  -- The write obligation's compare-and-set token (write-obligation.ts ObligationState.rev).
+  rev bigint NOT NULL DEFAULT nextval('sessions.session_analysis_ticket_rev_seq'),
+  -- The versions reserved for deletion while this ticket lives, ON the row every publish locks:
+  -- a publish's FOR UPDATE re-evaluates this predicate against the newest row version (READ
+  -- COMMITTED EvalPlanQual), so a reservation committed while the publish waited is never missed
+  -- by a stale statement snapshot. The permanent reservations table covers re-created tickets.
+  reserved_versions text[] NOT NULL DEFAULT '{}'
 );
 CREATE INDEX session_analysis_result_tickets_created_idx ON sessions.session_analysis_result_tickets (created_at);
 ALTER TABLE sessions.session_analysis_result_tickets ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.session_analysis_result_tickets FROM PUBLIC, anon, authenticated;
 GRANT ALL ON sessions.session_analysis_result_tickets TO service_role;
 
--- Durable stray evidence for a ticket (write-obligation.ts ObligationStore.markStray): an
--- unowned object version was found at the key. Its own table so the mark can COMMIT on its own
--- (autocommit) while the sweep holds the ticket row locked, before that page's deletes; a lost
--- DELETE ack or a failed sweep can then never lose the only proof that the write landed.
-CREATE TABLE sessions.session_analysis_ticket_strays (
-  result_key text PRIMARY KEY CHECK (char_length(result_key) BETWEEN 1 AND 1024),
-  found_at timestamptz NOT NULL DEFAULT now()
+-- The ticket is the per-key write obligation (src/migration/neon-s3-erasure/write-obligation.ts,
+-- v3): `rev` is its compare-and-set token (every sweep mutation and every publish bumps it).
+-- Each PUT attempt is an INVOCATION, recorded (dispatched) BEFORE the PUT is sent, in the
+-- writer's lease/generation transaction, with a unique id; only that request's OWN evidence
+-- (acked with the exact version id, or a definite refusal) changes it. A dispatched invocation
+-- is unresolved indefinitely (no timeout, listing, ETag or zero inventory resolves it).
+CREATE TABLE sessions.session_analysis_ticket_invocations (
+  invocation_id uuid PRIMARY KEY,
+  result_key text NOT NULL CHECK (char_length(result_key) BETWEEN 1 AND 1024),
+  outcome text NOT NULL DEFAULT 'dispatched' CHECK (outcome IN ('dispatched', 'acked', 'refused')),
+  version_id text CHECK (char_length(version_id) BETWEEN 1 AND 1024),
+  -- The writer's fence the evidence must match (worker: the job lease token; backfill: its writer).
+  writer_token uuid,
+  generation text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT session_analysis_ticket_invocations_acked CHECK ((outcome = 'acked') = (version_id IS NOT NULL))
 );
-ALTER TABLE sessions.session_analysis_ticket_strays ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON sessions.session_analysis_ticket_strays FROM PUBLIC, anon, authenticated;
-GRANT ALL ON sessions.session_analysis_ticket_strays TO service_role;
+CREATE INDEX session_analysis_ticket_invocations_key_idx ON sessions.session_analysis_ticket_invocations (result_key);
+ALTER TABLE sessions.session_analysis_ticket_invocations ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_analysis_ticket_invocations FROM PUBLIC, anon, authenticated;
+GRANT ALL ON sessions.session_analysis_ticket_invocations TO service_role;
+
+-- Deletion reservations: before ANY version is deleted, EVERY doomed version of the page is
+-- reserved here, under the ticket row lock every publishing path takes; a publish of a reserved
+-- version is refused. Reservations are NEVER deleted (not on retire, reschedule or re-creation of
+-- the ticket), so a version once doomed can never become publishable through lost bookkeeping.
+CREATE TABLE sessions.session_analysis_ticket_reservations (
+  result_key text NOT NULL CHECK (char_length(result_key) BETWEEN 1 AND 1024),
+  version_id text NOT NULL CHECK (char_length(version_id) BETWEEN 1 AND 1024),
+  reserved_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (result_key, version_id)
+);
+ALTER TABLE sessions.session_analysis_ticket_reservations ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_analysis_ticket_reservations FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT ON sessions.session_analysis_ticket_reservations TO service_role;
 
 
 -- C3 purge fence (purge_session_analysis_for_owned): a session whose analysis was purged by a
@@ -425,6 +462,39 @@ CREATE TRIGGER session_analysis_v2_forget_deleted_directory
 -- with the same id is untouched. Like the forget trigger, every result key is ticketed
 -- 'forgotten' for the sweeper's every-version erase before the rows are deleted. A no-op (0)
 -- when lane A's tables are absent. Returns the analysis jobs purged. Owner-only.
+-- Proof of an in-progress privacy-authority operation, bound to the CURRENT transaction and the
+-- exact (org, workspace, user): lane A's SECURITY DEFINER authority writes it with
+-- session_analysis_purge_grant (owner-only EXECUTE) immediately before it calls the purge, and the
+-- purge consumes it. A role that merely SETs bulls96.privacy_authority_writer has no proof (and no
+-- EXECUTE on either function). Owner-only.
+CREATE TABLE sessions.session_analysis_purge_authority (
+  txid bigint NOT NULL,
+  org_id text NOT NULL,
+  workspace_id text NOT NULL,
+  user_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (txid, org_id, workspace_id, user_id)
+);
+ALTER TABLE sessions.session_analysis_purge_authority ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.session_analysis_purge_authority FROM PUBLIC, anon, authenticated, service_role;
+
+CREATE FUNCTION sessions.session_analysis_purge_grant(p_org text, p_workspace text, p_user text)
+RETURNS void LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $purge_grant$
+BEGIN
+  PERFORM sessions.session_analysis_require_caller(ARRAY['bulls96_session_ingest']);
+  IF coalesce(current_setting('bulls96.privacy_authority_writer', true), '') <> 'authority'
+     AND coalesce(nullif(current_setting('role', true), 'none'), session_user::text) = 'bulls96_session_ingest' THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'purge_session_analysis_for_owned: outside the privacy authority';
+  END IF;
+  IF p_org IS NULL OR btrim(p_org) = '' OR p_workspace IS NULL OR btrim(p_workspace) = '' OR p_user IS NULL OR btrim(p_user) = '' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'purge_session_analysis_for_owned: org, workspace and user are required';
+  END IF;
+  INSERT INTO sessions.session_analysis_purge_authority (txid, org_id, workspace_id, user_id)
+  VALUES (txid_current(), p_org, p_workspace, p_user) ON CONFLICT DO NOTHING;
+END
+$purge_grant$;
+
 CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text, p_workspace text, p_user text, p_sessions jsonb)
 RETURNS integer LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $purge_owned$
@@ -437,6 +507,17 @@ BEGIN
   IF coalesce(nullif(current_setting('role', true), 'none'), session_user::text) = 'bulls96_session_ingest'
      AND coalesce(current_setting('bulls96.privacy_authority_writer', true), '') <> 'authority' THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'purge_session_analysis_for_owned: outside the privacy authority';
+  END IF;
+  -- Not the GUC alone: a non-owner caller must hold the authority's proof for THIS transaction
+  -- and THIS exact scope (consumed here, so it authorizes exactly one purge).
+  IF coalesce(nullif(current_setting('role', true), 'none'), session_user::text) <> (
+       SELECT pg_get_userbyid(p.proowner) FROM pg_proc AS p
+        WHERE p.oid = 'sessions.session_analysis_require_caller(text[])'::regprocedure) THEN
+    DELETE FROM sessions.session_analysis_purge_authority
+     WHERE txid = txid_current() AND org_id = p_org AND workspace_id = p_workspace AND user_id = p_user;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'purge_session_analysis_for_owned: no privacy-authority proof for this transaction and scope';
+    END IF;
   END IF;
   IF p_org IS NULL OR btrim(p_org) = '' OR p_workspace IS NULL OR btrim(p_workspace) = ''
      OR p_user IS NULL OR btrim(p_user) = '' THEN
@@ -724,6 +805,7 @@ $read$;
 REVOKE ALL ON FUNCTION sessions.session_analysis_v2_forget() FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_require_caller(text[]) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text, text, jsonb) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.session_analysis_purge_grant(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_admit_scope(text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_source_revision(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
@@ -749,6 +831,7 @@ BEGIN
     'sessions.session_analysis_v2_forget()'::regprocedure,
     'sessions.session_analysis_require_caller(text[])'::regprocedure,
     'sessions.purge_session_analysis_for_owned(text, text, text, jsonb)'::regprocedure,
+    'sessions.session_analysis_purge_grant(text, text, text)'::regprocedure,
     'sessions.purge_session_analysis_for_owned(text, text, text)'::regprocedure,
     'sessions.session_analysis_admit_scope(text, text)'::regprocedure,
     'sessions.session_analysis_source_revision(text, text, text)'::regprocedure,

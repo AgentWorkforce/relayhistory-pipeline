@@ -372,19 +372,25 @@ DECLARE v_origin text;v_enabled boolean;item jsonb;v_total bigint;v_request text
 BEGIN
  IF coalesce(current_setting('bulls96.privacy_authority_writer',true),'')<>'authority' THEN
   RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='frozen source: authority apply outside the authority begin';END IF;
- -- The analysis purge ABI (046000, #292 b608ea3b), checked BEFORE any change. A no-op only while 046000 is entirely
- -- absent; once ANY sign of it exists (its jobs table or any purge_session_analysis_for_owned overload), BOTH exact
- -- workspace-scoped signatures must exist, or this reset/disable aborts (fail closed: it never silently skips).
+ -- The analysis purge ABI (046000, #292 b28e634c), checked BEFORE any change. A no-op only while 046000 is entirely
+ -- absent; once ANY sign of it exists (its jobs or purge-authority table, or any purge / grant overload), BOTH exact
+ -- workspace-scoped purge signatures AND the grant helper must exist, or this reset/disable aborts (fail closed).
  v_analysis:=to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,text)') IS NOT NULL
-  AND to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,text,jsonb)') IS NOT NULL;
- IF NOT v_analysis AND (to_regclass('sessions.session_analysis_jobs_v2') IS NOT NULL OR EXISTS(SELECT 1 FROM pg_proc
-   WHERE pronamespace='sessions'::regnamespace AND proname='purge_session_analysis_for_owned')) THEN
+  AND to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,text,jsonb)') IS NOT NULL
+  -- 046000's per-transaction purge proof: the grant helper is part of the ABI (the purge consumes its row).
+  AND to_regprocedure('sessions.session_analysis_purge_grant(text,text,text)') IS NOT NULL;
+ IF NOT v_analysis AND (to_regclass('sessions.session_analysis_jobs_v2') IS NOT NULL
+   OR to_regclass('sessions.session_analysis_purge_authority') IS NOT NULL OR EXISTS(SELECT 1 FROM pg_proc
+   WHERE pronamespace='sessions'::regnamespace AND proname IN('purge_session_analysis_for_owned','session_analysis_purge_grant'))) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: analysis purge ABI mismatch';END IF;
  IF p_kind='selection' THEN
   v_origin:=p_payload->>'origin_id';v_enabled:=(p_payload->>'enabled')::boolean;
   -- SP v2 analysis of exactly the disabled sessions in THIS workspace (046000's session-scoped form), BEFORE their owned/frozen rows
   -- are removed below (it reads them). v_analysis: the fail-closed ABI check above.
   IF NOT v_enabled AND v_analysis THEN
+   -- The proof for exactly this transaction and scope, minted in owner context (this runs inside the SECURITY DEFINER
+   -- authority begin), immediately before the purge that consumes it.
+   EXECUTE 'SELECT sessions.session_analysis_purge_grant($1,$2,$3)' USING p_org,p_ws,p_user;
    EXECUTE 'SELECT sessions.purge_session_analysis_for_owned($1,$2,$3,$4)' USING p_org,p_ws,p_user,p_payload->'sessions';
   END IF;
   FOR item IN SELECT value FROM jsonb_array_elements(p_payload->'sessions') LOOP
@@ -420,6 +426,7 @@ BEGIN
  -- SP v2 analysis of Neon-era sessions (046000) in THIS workspace is keyed by the user's owned set, so it is purged BEFORE that set is
  -- emptied below. v_analysis: the fail-closed ABI check above.
  IF v_analysis THEN
+  EXECUTE 'SELECT sessions.session_analysis_purge_grant($1,$2,$3)' USING p_org,p_ws,p_user;
   EXECUTE 'SELECT sessions.purge_session_analysis_for_owned($1,$2,$3)' USING p_org,p_ws,p_user;
  END IF;
  DELETE FROM sessions.ingest_frozen_source_records WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL;
