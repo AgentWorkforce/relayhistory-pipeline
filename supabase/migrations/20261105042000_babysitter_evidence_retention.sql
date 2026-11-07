@@ -143,10 +143,12 @@ CREATE INDEX babysitter_evidence_index_tombstone_idx ON sessions.babysitter_evid
 -- Durable unresolved-write obligations (the shared src/migration/neon-s3-erasure/write-obligation.ts
 -- contract): one row per bucket object KEY (its compare-and-set row version, resume checkpoint and
 -- re-sweep backoff) and one row per DISPATCHED PUT invocation at that key, recorded by register
--- BEFORE the PUT with the body's expected ETag. An invocation resolves only on its OWN terminal
--- evidence: refused (a definite refusal of that request); acked/observed exact version absent
--- from a fresh strict COMPLETE inventory. A dispatched invocation with nothing attributed stays
--- UNRESOLVED indefinitely (nonterminal; re-swept at most daily), and its bucket is never erased.
+-- BEFORE the PUT. An invocation resolves only on its OWN terminal evidence, recorded by its
+-- writer: refused (a definite refusal of that request), or acked with its own version id and
+-- that exact version absent from a fresh strict COMPLETE inventory. A dispatched invocation
+-- stays UNRESOLVED indefinitely (nonterminal; a listed version, even with an identical ETag,
+-- never resolves it): its bucket is erased as cleanup on each re-sweep (at most daily) but never
+-- marked erased. Every version is RESERVED (babysitter_write_reservations) before its delete.
 CREATE TABLE sessions.babysitter_write_obligations(
  org_id text NOT NULL,workspace_id text NOT NULL,machine_id text NOT NULL,object_ref text NOT NULL,
  object_name text NOT NULL CHECK(object_name~'^b=[0-9a-f]{32}\.ndjson\.zst$'),
@@ -163,14 +165,21 @@ CREATE TABLE sessions.babysitter_write_invocations(
  -- The dispatching delivery's claim token: one PUT per bucket object per claim, never reused.
  invocation_id uuid NOT NULL,
  outcome text NOT NULL DEFAULT 'dispatched' CHECK(outcome IN('dispatched','acked','refused')),
- expected_etag text CHECK(expected_etag IS NULL OR expected_etag~'^[0-9a-f]{32}$'),
  version_id text CHECK(version_id IS NULL OR octet_length(version_id) BETWEEN 1 AND 1024),
- observed_version text CHECK(observed_version IS NULL OR octet_length(observed_version) BETWEEN 1 AND 1024),
  dispatched_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  PRIMARY KEY(org_id,workspace_id,machine_id,object_ref,object_name,invocation_id),
  FOREIGN KEY(org_id,workspace_id,machine_id,object_ref,object_name) REFERENCES sessions.babysitter_write_obligations(org_id,workspace_id,machine_id,object_ref,object_name),
- CHECK(outcome<>'acked' OR version_id IS NOT NULL),
- CHECK(outcome='dispatched' OR observed_version IS NULL)
+ CHECK((outcome='acked')=(version_id IS NOT NULL))
+);
+-- Deletion reservations (distinct from outcome evidence): every version a sweep is about to delete,
+-- reserved under the key row's lock first. Babysitter has no publishers, so nothing can contend;
+-- the reservation keeps the shared contract (a future owner must refuse a reserved version).
+CREATE TABLE sessions.babysitter_write_reservations(
+ org_id text NOT NULL,workspace_id text NOT NULL,machine_id text NOT NULL,object_ref text NOT NULL,object_name text NOT NULL,
+ version_id text NOT NULL CHECK(octet_length(version_id) BETWEEN 1 AND 1024),
+ reserved_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ PRIMARY KEY(org_id,workspace_id,machine_id,object_ref,object_name,version_id),
+ FOREIGN KEY(org_id,workspace_id,machine_id,object_ref,object_name) REFERENCES sessions.babysitter_write_obligations(org_id,workspace_id,machine_id,object_ref,object_name) ON DELETE CASCADE
 );
 
 ALTER TABLE sessions.babysitter_retention_settings ENABLE ROW LEVEL SECURITY;
@@ -179,6 +188,7 @@ ALTER TABLE sessions.babysitter_retention_audit ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.babysitter_evidence_index ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.babysitter_write_obligations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.babysitter_write_invocations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions.babysitter_write_reservations ENABLE ROW LEVEL SECURITY;
 -- The sweeper's own least-privilege role (supabase/bootstrap/session_ingest_roles.sql, NOLOGIN; LOGIN
 -- only by the operator step babysitter_retention_role.sql). It may run the claim/fence/complete RPCs and
 -- nothing else: not register, not any ingest, reset or commit RPC, not any table. Fail closed if the
@@ -196,7 +206,7 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='babysitter retention: role bulls96_babysitter_retention can log in, is elevated or is a member';END IF;
 END $retention_role$;
 REVOKE ALL ON sessions.babysitter_retention_settings,sessions.babysitter_retention_objects,sessions.babysitter_retention_audit,sessions.babysitter_evidence_index,
- sessions.babysitter_write_obligations,sessions.babysitter_write_invocations FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder,bulls96_babysitter_retention;
+ sessions.babysitter_write_obligations,sessions.babysitter_write_invocations,sessions.babysitter_write_reservations FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder,bulls96_babysitter_retention;
 
 -- The audit is append-only for everyone, owner included (only the rollback drops it).
 CREATE FUNCTION sessions.babysitter_retention_audit_guard() RETURNS trigger
@@ -232,7 +242,7 @@ END $hour$;
 -- re-enabled since the claim) is refused (40001: re-claim drops them), so a pre-disable
 -- write can never land under a post-enable key. The current schema generation is required.
 -- p: {tenant{orgId,workspaceId,userId}, originId, batchId, batchDigest, claimToken, generation,
---     resetEpoch, buckets:[{source, sessionId, eraseAfterMs, etag (the object body's MD5)}],
+--     resetEpoch, buckets:[{source, sessionId, eraseAfterMs}],
 --     records:[{bucket (upsert: index into buckets; delete: null), originId, recordId, revision
 --               (decimal string), revisionId, digest, operation upsert|delete, kind, source, sessionId,
 --               line (upsert) | null, expiresAtMs (upsert) | null}]}
@@ -243,7 +253,7 @@ CREATE FUNCTION sessions.ingest_babysitter_retention_register(p jsonb) RETURNS j
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $register$
 DECLARE v_org text;v_ws text;v_user text;v_origin text;v_machine text;v_epoch bigint;v_epochs jsonb;v_pairs jsonb;v_fenced jsonb;
  o jsonb;v_ref text;v_source text;v_session text;v_after timestamptz;v_fence bigint;v_hour text;v_refs text[]:='{}';v_object text;
- v_rec jsonb;v_b integer;v_op text;v_rev bigint;v_rid text;v_n integer;v_etags text[]:='{}';
+ v_rec jsonb;v_b integer;v_op text;v_rev bigint;v_rid text;v_n integer;
  v_prev sessions.babysitter_retention_objects%ROWTYPE;r sessions.babysitter_retention_objects%ROWTYPE;out jsonb:='[]'::jsonb;reopened integer:=0;
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
@@ -278,9 +288,7 @@ BEGIN
  END IF;
  v_machine:='srv_'||left(encode(sha256(convert_to(v_ws||chr(31)||v_origin||chr(31)||v_user,'UTF8')),'hex'),32);
  FOR o IN SELECT x FROM jsonb_array_elements(p->'buckets') x LOOP
-  PERFORM sessions.ingest_exact_keys(o,ARRAY['source','sessionId','eraseAfterMs','etag']);
-  IF o->>'etag' IS NULL OR o->>'etag'!~'^[0-9a-f]{32}$' THEN
-   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter retention: bucket object etag malformed';END IF;
+  PERFORM sessions.ingest_exact_keys(o,ARRAY['source','sessionId','eraseAfterMs']);
   v_source:=sessions.ingest_identifier(o->'source',false);
   v_session:=CASE WHEN o->'sessionId'='null'::jsonb THEN NULL ELSE sessions.ingest_identifier(o->'sessionId',false) END;
   IF jsonb_typeof(o->'eraseAfterMs') IS DISTINCT FROM 'number' OR (o->>'eraseAfterMs')::numeric<>trunc((o->>'eraseAfterMs')::numeric)
@@ -314,7 +322,7 @@ BEGIN
     VALUES('reopened',r.org_id,r.workspace_id,r.machine_id,r.object_ref,r.write_seq);
   END IF;
   out:=out||jsonb_build_array(jsonb_build_object('ref',v_ref,'source',v_source,'sessionId',v_session,'eraseAfterMs',(o->'eraseAfterMs')));
-  v_refs:=v_refs||v_ref;v_etags:=v_etags||(o->>'etag');
+  v_refs:=v_refs||v_ref;
  END LOOP;
  -- The content-free key index: one IMMUTABLE candidate row per routed (record, revision) of
  -- this claim, upsert or delete. Never re-pointed: an equal-revision attempt adds its own row
@@ -373,8 +381,8 @@ BEGIN
   INSERT INTO sessions.babysitter_write_obligations AS w(org_id,workspace_id,machine_id,object_ref,object_name)
    VALUES(v_org,v_ws,v_machine,v_refs[v_b],v_object)
   ON CONFLICT(org_id,workspace_id,machine_id,object_ref,object_name) DO UPDATE SET rev=w.rev+1;
-  INSERT INTO sessions.babysitter_write_invocations(org_id,workspace_id,machine_id,object_ref,object_name,invocation_id,expected_etag)
-   VALUES(v_org,v_ws,v_machine,v_refs[v_b],v_object,(p->>'claimToken')::uuid,v_etags[v_b])
+  INSERT INTO sessions.babysitter_write_invocations(org_id,workspace_id,machine_id,object_ref,object_name,invocation_id)
+   VALUES(v_org,v_ws,v_machine,v_refs[v_b],v_object,(p->>'claimToken')::uuid)
   ON CONFLICT(org_id,workspace_id,machine_id,object_ref,object_name,invocation_id) DO NOTHING;
  END LOOP;
  RETURN jsonb_build_object('objects',out,'reopened',reopened);
@@ -579,7 +587,7 @@ BEGIN
    RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter retention: write outcome malformed';END IF;
   UPDATE sessions.babysitter_write_invocations w SET outcome=o->>'outcome',version_id=CASE WHEN o->>'outcome'='acked' THEN o->>'versionId' END
    WHERE w.org_id=v_org AND w.workspace_id=v_ws AND w.machine_id=v_machine AND w.object_ref=o->>'ref' AND w.object_name=o->>'object'
-    AND w.invocation_id=(p->>'claimToken')::uuid AND w.outcome='dispatched' AND w.observed_version IS NULL;
+    AND w.invocation_id=(p->>'claimToken')::uuid AND w.outcome='dispatched';
   GET DIAGNOSTICS v_k=ROW_COUNT;
   IF v_k>0 THEN
    UPDATE sessions.babysitter_write_obligations w SET rev=w.rev+1 WHERE w.org_id=v_org AND w.workspace_id=v_ws AND w.machine_id=v_machine
@@ -594,24 +602,26 @@ END $written$;
 -- CURRENT generation. Every mutation is a compare-and-set on the key row's version (rev) and
 -- answers {ok:true, rev} or {ok:false}; each call is its own statement, so it is durable before
 -- the remote deletes that follow it.
--- p: {generation, leaseToken, action list|load|observe|checkpoint|resolve|reschedule|retire, object, rev, invocations, versionId, checkpoint}
+-- p: {generation, leaseToken, action list|load|reserve|checkpoint|resolve|reschedule|retire, object, rev, invocations, versions, checkpoint}
 CREATE FUNCTION sessions.ingest_babysitter_retention_obligation(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $obligation$
-DECLARE q sessions.babysitter_retention_objects%ROWTYPE;w sessions.babysitter_write_obligations%ROWTYPE;v_act text;v jsonb;v_rev bigint;v_ids uuid[];v_k integer;
+DECLARE q sessions.babysitter_retention_objects%ROWTYPE;w sessions.babysitter_write_obligations%ROWTYPE;v_act text;v jsonb;v_rev bigint;v_ids uuid[];
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_babysitter_retention');
- PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','leaseToken','action','object','rev','invocations','versionId','checkpoint']);
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['generation','leaseToken','action','object','rev','invocations','versions','checkpoint']);
  IF jsonb_typeof(p->'generation') IS DISTINCT FROM 'string' OR p->>'generation'!~'^[0-9a-f]{64}$' THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter retention: generation malformed';END IF;
  PERFORM sessions.ingest_require_generation(p->>'generation');
  IF jsonb_typeof(p->'leaseToken') IS DISTINCT FROM 'string' OR p->>'leaseToken'!~'^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter retention: lease token malformed';END IF;
  v_act:=p->>'action';
- IF v_act IS NULL OR v_act NOT IN('list','load','observe','checkpoint','resolve','reschedule','retire')
+ IF v_act IS NULL OR v_act NOT IN('list','load','reserve','checkpoint','resolve','reschedule','retire')
   OR (v_act<>'list' AND (p->>'object' IS NULL OR p->>'object'!~'^b=[0-9a-f]{32}\.ndjson\.zst$'))
   OR (v_act NOT IN('list','load') AND (jsonb_typeof(p->'rev') IS DISTINCT FROM 'number' OR (p->>'rev')::numeric<>trunc((p->>'rev')::numeric) OR (p->>'rev')::numeric<1))
   OR jsonb_typeof(p->'invocations') IS DISTINCT FROM 'array' OR jsonb_array_length(p->'invocations')>1000
-  OR (p->'versionId'<>'null'::jsonb AND (jsonb_typeof(p->'versionId') IS DISTINCT FROM 'string' OR octet_length(p->>'versionId') NOT BETWEEN 1 AND 1024))
+  OR jsonb_typeof(p->'versions') IS DISTINCT FROM 'array' OR jsonb_array_length(p->'versions')>1000
+  OR EXISTS(SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p->'versions')='array' THEN p->'versions' ELSE '[]'::jsonb END) x
+   WHERE jsonb_typeof(x) IS DISTINCT FROM 'string' OR octet_length(x#>>'{}') NOT BETWEEN 1 AND 1024)
   OR (p->'checkpoint'<>'null'::jsonb AND (jsonb_typeof(p->'checkpoint')<>'object' OR octet_length((p->'checkpoint')::text)>8192)) THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter retention: obligation request malformed';END IF;
  SELECT * INTO q FROM sessions.babysitter_retention_objects WHERE lease_token=(p->>'leaseToken')::uuid AND state='leased';
@@ -626,8 +636,7 @@ BEGIN
   AND o.machine_id=q.machine_id AND o.object_ref=q.object_ref AND o.object_name=p->>'object' FOR UPDATE;
  IF NOT FOUND THEN RETURN jsonb_build_object('ok',CASE WHEN v_act='load' THEN true ELSE false END,'obligation',NULL);END IF;
  IF v_act='load' THEN
-  SELECT coalesce(jsonb_agg(jsonb_build_object('id',i.invocation_id::text,'outcome',i.outcome,'versionId',i.version_id,'observedVersion',i.observed_version,
-    'expectedEtag',i.expected_etag) ORDER BY i.invocation_id),'[]'::jsonb) INTO v
+  SELECT coalesce(jsonb_agg(jsonb_build_object('id',i.invocation_id::text,'outcome',i.outcome,'versionId',i.version_id) ORDER BY i.invocation_id),'[]'::jsonb) INTO v
    FROM sessions.babysitter_write_invocations i WHERE i.org_id=w.org_id AND i.workspace_id=w.workspace_id AND i.machine_id=w.machine_id
     AND i.object_ref=w.object_ref AND i.object_name=w.object_name;
   RETURN jsonb_build_object('ok',true,'obligation',jsonb_build_object('rev',w.rev,'invocations',v,'checkpoint',w.erase_checkpoint,'sweeps',w.sweeps));
@@ -635,14 +644,12 @@ BEGIN
  -- Compare-and-set: a changed row (a new invocation, a writer outcome, another sweep) refuses.
  IF w.rev<>(p->>'rev')::bigint THEN RETURN jsonb_build_object('ok',false,'code','rev_changed');END IF;
  v_rev:=w.rev+1;
- IF v_act='observe' THEN
-  IF jsonb_array_length(p->'invocations')<>1 OR p->'versionId'='null'::jsonb THEN
-   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter retention: observe needs one invocation and a version';END IF;
-  UPDATE sessions.babysitter_write_invocations i SET observed_version=p->>'versionId'
-   WHERE i.org_id=w.org_id AND i.workspace_id=w.workspace_id AND i.machine_id=w.machine_id AND i.object_ref=w.object_ref AND i.object_name=w.object_name
-    AND i.invocation_id=(p->'invocations'->>0)::uuid AND i.outcome='dispatched' AND i.observed_version IS NULL;
-  GET DIAGNOSTICS v_k=ROW_COUNT;
-  IF v_k<>1 THEN RETURN jsonb_build_object('ok',false,'code','not_attributable');END IF;
+ IF v_act='reserve' THEN
+  -- Every version about to be deleted, under this key row's lock (FOR UPDATE above): refused when
+  -- the row changed. (No Babysitter owner exists to contend; a future one must refuse these.)
+  INSERT INTO sessions.babysitter_write_reservations(org_id,workspace_id,machine_id,object_ref,object_name,version_id)
+   SELECT w.org_id,w.workspace_id,w.machine_id,w.object_ref,w.object_name,x FROM jsonb_array_elements_text(p->'versions') x
+  ON CONFLICT DO NOTHING;
  ELSIF v_act='checkpoint' THEN
   IF p->'checkpoint'='null'::jsonb OR right(p->'checkpoint'->>'prefix',length(q.object_ref)+9)<>'/s='||q.object_ref||'/raw/' THEN
    RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='babysitter retention: obligation checkpoint is for another directory';END IF;

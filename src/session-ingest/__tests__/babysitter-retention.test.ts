@@ -27,7 +27,6 @@ import {
 } from "../babysitter-retention.ts";
 import type { EraseCheckpoint, EraseStepOptions, EraseStepResult, ErasedProof, PagedEraser } from "../../migration/neon-s3-erasure/eraser.ts";
 import { FakeS3Versions } from "../../migration/__tests__/fake-s3-versions.ts";
-import { expectedEtag } from "../../migration/neon-s3-erasure/write-obligation.ts";
 import { babysitterRoutingActive, deliverBatch, DeliveryBudgetExceeded, IngestUnavailable } from "../deliver.ts";
 import type { BabysitterRetentionRegistration } from "../ledger.ts";
 import { liveMachineId } from "../writer.ts";
@@ -178,7 +177,7 @@ describe("write path (canonical inline and staged)", () => {
     const reg = rec.registrations[0]!;
     expect(reg).toMatchObject({ resetEpoch: 0, generation: GEN, batchId: "batch-1" });
     expect(reg.claimToken).toMatch(/^[0-9a-f-]{36}$/);
-    expect(reg.buckets).toEqual([{ source: "claude", sessionId: "sess-1", eraseAfterMs: Date.UTC(2026, 11, 6, 14), etag: expect.stringMatching(/^[0-9a-f]{32}$/) }]);
+    expect(reg.buckets).toEqual([{ source: "claude", sessionId: "sess-1", eraseAfterMs: Date.UTC(2026, 11, 6, 14) }]);
     const ref = (await rec.registerBabysitterRetention(reg)).objects[0]!.ref;
     // One create-only object per (bucket, batch): no manifest and no live-session pointer.
     const bucketKeys = await listAll(store, bucketPrefix);
@@ -364,8 +363,8 @@ function claimed(over: Partial<ClaimedObject> = {}): ClaimedObject {
     ref: `_bx2026120614-${"a".repeat(16)}`, reason: "expired", fenceEpoch: 0, resetEpoch: 0, writeSeq: 1, eraseRuns: 0, checkpoint: null, ...over };
 }
 
-type FakeInvocation = { id: string; outcome: "dispatched" | "acked" | "refused"; versionId?: string; observedVersion?: string; expectedEtag?: string };
-type FakeObligation = { object: string; rev: number; invocations: FakeInvocation[]; checkpoint: EraseCheckpoint | null; sweeps: number };
+type FakeInvocation = { id: string; outcome: "dispatched" | "acked" | "refused"; versionId?: string };
+type FakeObligation = { object: string; rev: number; invocations: FakeInvocation[]; checkpoint: EraseCheckpoint | null; sweeps: number; reserved?: string[] };
 function fakeLedger(objects: ClaimedObject[], settings = { enabled: true, dryRun: false }, fenceOk = true, obligations: FakeObligation[] = []) {
   const completions: { token: string; outcome: string; versions: number; checkpoint?: EraseCheckpoint | null }[] = [];
   let fences = 0;
@@ -376,7 +375,7 @@ function fakeLedger(objects: ClaimedObject[], settings = { enabled: true, dryRun
       const o = table.get(q.object!);
       if (q.action === "load") return { ok: true, obligation: o ? { rev: o.rev, invocations: o.invocations.map((i) => ({ ...i })), checkpoint: o.checkpoint, sweeps: o.sweeps } : null };
       if (!o || o.rev !== q.rev) return { ok: false };
-      if (q.action === "observe") { const i = o.invocations.find((x) => x.id === q.invocations![0] && x.outcome === "dispatched" && !x.observedVersion); if (!i) return { ok: false }; i.observedVersion = q.versionId!; }
+      if (q.action === "reserve") o.reserved = [...(o.reserved ?? []), ...q.versions!];
       if (q.action === "checkpoint") o.checkpoint = q.checkpoint ?? null;
       if (q.action === "resolve") o.invocations = o.invocations.filter((i) => !q.invocations!.includes(i.id));
       if (q.action === "reschedule") { o.sweeps++; o.checkpoint = null; }
@@ -715,67 +714,58 @@ describe("retention buckets are never indexed as sessions", () => {
   });
 });
 
-describe("lead ruling: an unresolved PUT is never 'nothing was written' (per-invocation write obligations)", () => {
+describe("lead ruling: an unresolved PUT is never 'nothing was written' (write-obligation v3)", () => {
   const o0 = claimed();
   const raw = `${retentionTargets("96bulls", o0).prefix}raw/`;
   const OBJ = `b=${"a".repeat(32)}.ndjson.zst`;
-  const BODY = new TextEncoder().encode("the bucket object body"), ETAG = expectedEtag(BODY);
+  const SAME = "5d41402abc4b2a76b9719d911017c592";
   const ob = (...invocations: FakeInvocation[]): FakeObligation => ({ object: OBJ, rev: 1, invocations, checkpoint: null, sweeps: 0 });
-  const dispatched = (id = crypto.randomUUID()): FakeInvocation => ({ id, outcome: "dispatched", expectedEtag: ETAG });
+  const dispatched = (id = crypto.randomUUID()): FakeInvocation => ({ id, outcome: "dispatched" });
 
-  test("a lost response, abort + hold-off + an initial ZERO inventory: never erased, tracked; the late original PUT is attributed, erased, and only then the bucket is erased", async () => {
+  test("a lost response: never erased; a late identical-content commit is reserved and erased as cleanup but never resolves the invocation; the bucket stays tracked", async () => {
     const s = new FakeS3Versions();
     const a = fakeLedger([claimed()], undefined, true, [ob(dispatched())]);
-    const r1 = await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" });
-    expect(r1).toMatchObject({ erased: 0, progressed: 1, codes: { obligation_rescheduled: 1 } });
-    expect(a.table.get(OBJ)!.invocations).toHaveLength(1);
-    const late = s.put(`${raw}${OBJ}`, Date.now(), ETAG);   // the provider commits it after all of that
+    expect(await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 0, progressed: 1, codes: { obligation_rescheduled: 1 } });
+    const late = s.put(`${raw}${OBJ}`, Date.now(), SAME);
     const b = fakeLedger([claimed()], undefined, true, [a.table.get(OBJ)!]);
-    expect((await babysitterRetentionTick({ ledger: b.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).erased).toBe(1);
+    expect(await babysitterRetentionTick({ ledger: b.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 0, progressed: 1 });
     expect(s.deletes).toEqual([`${raw}${OBJ}@${late}`]);
-    expect(b.table.size).toBe(0);
+    expect(b.table.get(OBJ)!.reserved).toContain(late);
+    expect(b.table.get(OBJ)!.invocations).toHaveLength(1);
   });
 
-  test("a different body at the same key (another attempt's, or a stray) is erased but never resolves this invocation", async () => {
+  test("a pre-existing identical-content stray never resolves an in-flight invocation (erased as cleanup)", async () => {
     const s = new FakeS3Versions();
-    s.put(`${raw}${OBJ}`, 1, expectedEtag(new TextEncoder().encode("another body")));
+    s.put(`${raw}${OBJ}`, 1, SAME);
     const a = fakeLedger([claimed()], undefined, true, [ob(dispatched())]);
     expect(await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 0, progressed: 1 });
     expect(s.count(raw)).toBe(0);
     expect(a.table.get(OBJ)!.invocations).toHaveLength(1);
   });
 
-  test("two dispatched attempts at one key, one version appears: one resolves, the bucket stays tracked for the other", async () => {
-    const s = new FakeS3Versions();
-    s.put(`${raw}${OBJ}`, 1, ETAG);
-    const a = fakeLedger([claimed()], undefined, true, [ob(dispatched("inv-a"), dispatched("inv-b"))]);
-    expect(await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 0, progressed: 1 });
-    expect(a.table.get(OBJ)!.invocations).toHaveLength(1);
-  });
-
   test("acked (its own version, gone after the erase) and refused invocations resolve; the bucket is erased", async () => {
     const s = new FakeS3Versions();
-    const v = s.put(`${raw}${OBJ}`, 1, ETAG);
+    const v = s.put(`${raw}${OBJ}`, 1, SAME);
     const a = fakeLedger([claimed()], undefined, true, [ob({ id: "ok", outcome: "acked", versionId: v }, { id: "no", outcome: "refused" })]);
     expect((await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).erased).toBe(1);
     expect(a.table.size).toBe(0);
   });
 
-  test("the attribution is durable before the bucket-wide delete: a lost DELETE ack keeps it, and the rerun completes", async () => {
+  test("a lost DELETE ack: the reservation was durable before the delete; the rerun proves the acked version absent and completes", async () => {
     const s = new FakeS3Versions();
-    const v = s.put(`${raw}${OBJ}`, 1, ETAG);
+    const v = s.put(`${raw}${OBJ}`, 1, SAME);
     let lose = true;
     s.onDelete = () => (lose ? ((lose = false), "lose") : undefined);
-    const a = fakeLedger([claimed()], undefined, true, [ob(dispatched("inv-1"))]);
+    const a = fakeLedger([claimed()], undefined, true, [ob({ id: "ok", outcome: "acked", versionId: v })]);
     expect(await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).toMatchObject({ erased: 0, failed: 1 });
-    expect(a.table.get(OBJ)!.invocations[0]!.observedVersion).toBe(v);
+    expect(a.table.get(OBJ)!.reserved).toContain(v);
     const b = fakeLedger([claimed()], undefined, true, [a.table.get(OBJ)!]);
     expect((await babysitterRetentionTick({ ledger: b.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on" })).erased).toBe(1);
   });
 
   test("crash/restart with a bucket checkpoint keeps the obligation: a resumed run still cannot erase while an invocation is unresolved", async () => {
     const s = new FakeS3Versions(); s.pageSize = 10;
-    for (let i = 0; i < 25; i++) s.put(`${raw}b=${String(i).padStart(32, "0")}.ndjson.zst`, 1, "f".repeat(32));
+    for (let i = 0; i < 25; i++) s.put(`${raw}b=${String(i).padStart(32, "0")}.ndjson.zst`, 1);
     const a = fakeLedger([claimed()], undefined, true, [ob(dispatched())]);
     await babysitterRetentionTick({ ledger: a.ledger, eraser: s.eraser(), keyRoot: "96bulls", generation: G, mode: "on", eraseBudget: { pages: 1 } });
     const cp = a.completions[0]!.checkpoint!;
@@ -786,19 +776,17 @@ describe("lead ruling: an unresolved PUT is never 'nothing was written' (per-inv
   });
 });
 
-describe("deliver: the expected ETag is registered BEFORE the PUT; definite outcomes are recorded", () => {
-  test("an acked PUT records acked with its own version; the registered ETag is the object body's MD5", async () => {
-    const { deps, ledger, store } = setup({ routing: true });
+describe("deliver: the invocation is registered BEFORE the PUT; definite outcomes are recorded", () => {
+  test("an acked PUT records acked with its own version, after the registration", async () => {
+    const { deps, ledger } = setup({ routing: true });
     await deliverBatch(deps as never, TENANT, await batch([receipt("ack-1")]));
     const rec = ledger as RecordingLedger;
     expect(rec.order.indexOf("register")).toBeLessThan(rec.order.findIndex((x) => x.startsWith("written:")));
     expect(rec.outcomes.flat().map((o) => o.outcome)).toEqual(["acked"]);
-    const key = (await listAll(store, bucketPrefix)).find((k) => k.includes("/raw/"))!;
-    const body = await readAll((await store.getObject(objectKey(key))).body);
-    expect(rec.registrations[0]!.buckets[0]!.etag).toBe(expectedEtag(body));
+    expect(rec.outcomes.flat()[0]!.versionId).toEqual(expect.any(String));
   });
 
-  test("a PUT that errors leaves the invocation dispatched (nothing reported) and fails the request; a retry's 412-style refusal is recorded as refused", async () => {
+  test("a PUT that errors leaves the invocation dispatched (nothing reported) and fails the request", async () => {
     const failing = setup({ routing: true });
     const put = failing.deps.target.store.put.bind(failing.deps.target.store);
     failing.deps.target.store.put = (async (key: never, body: never, opts: never) => {

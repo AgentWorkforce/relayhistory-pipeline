@@ -29,7 +29,7 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
     "END $rollback_guard$;",
     "DROP TRIGGER babysitter_retention_audit_append_only ON sessions.babysitter_retention_audit;",
     "DROP FUNCTION " + [...ctx.defined].reverse().join(",\n ") + ";",
-    "DROP TABLE sessions.babysitter_evidence_index,sessions.babysitter_write_invocations,sessions.babysitter_write_obligations,sessions.babysitter_retention_audit,sessions.babysitter_retention_objects,sessions.babysitter_retention_settings;",
+    "DROP TABLE sessions.babysitter_evidence_index,sessions.babysitter_write_reservations,sessions.babysitter_write_invocations,sessions.babysitter_write_obligations,sessions.babysitter_retention_audit,sessions.babysitter_retention_objects,sessions.babysitter_retention_settings;",
     "DO $ledger$ BEGIN",
     " IF to_regclass('sessions.__96bulls_migrations')IS NOT NULL THEN",
     "  DELETE FROM sessions.__96bulls_migrations WHERE name='" + NAME + "';",

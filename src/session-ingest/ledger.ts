@@ -240,8 +240,7 @@ export interface BabysitterRetentionRegistration {
   generation: string;
   /** The user's reset count the claim saw. */
   resetEpoch: number;
-  /** Each bucket with its object body's expected ETag (MD5), recorded on the write obligation. */
-  buckets: (BabysitterRetentionRequest & { etag: string })[];
+  buckets: BabysitterRetentionRequest[];
   /** The content-free key index rows (babysitter-retention.ts BabysitterIndexEntry). */
   records: { bucket: number | null; originId: string; recordId: string; revision: string; revisionId: string; digest: string; operation: "upsert" | "delete"; kind: string; source: string; sessionId: string | null; line: number | null; expiresAtMs: number | null }[];
 }

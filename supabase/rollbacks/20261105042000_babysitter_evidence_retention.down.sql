@@ -26,7 +26,7 @@ DROP FUNCTION sessions.babysitter_retention_configure(jsonb),
  sessions.ingest_babysitter_retention_register(jsonb),
  sessions.babysitter_retention_bucket_hour(text),
  sessions.babysitter_retention_audit_guard();
-DROP TABLE sessions.babysitter_evidence_index,sessions.babysitter_write_invocations,sessions.babysitter_write_obligations,sessions.babysitter_retention_audit,sessions.babysitter_retention_objects,sessions.babysitter_retention_settings;
+DROP TABLE sessions.babysitter_evidence_index,sessions.babysitter_write_reservations,sessions.babysitter_write_invocations,sessions.babysitter_write_obligations,sessions.babysitter_retention_audit,sessions.babysitter_retention_objects,sessions.babysitter_retention_settings;
 DO $ledger$ BEGIN
  IF to_regclass('sessions.__96bulls_migrations')IS NOT NULL THEN
   DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105042000_babysitter_evidence_retention.sql';

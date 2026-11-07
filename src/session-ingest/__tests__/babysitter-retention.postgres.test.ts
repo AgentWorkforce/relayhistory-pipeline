@@ -9,7 +9,6 @@ import { runMigrations, type MigrationProfile } from "../../hoopdb/migrate.ts";
 import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
 import { sqlLedger } from "../ledger-sql.ts";
 import { babysitterRetentionTick, bucketBodies, bucketRefs, eraseScope, planBabysitterBuckets, planKey, retentionTargets, sqlBabysitterRetentionLedger, writeBucketObjects } from "../babysitter-retention.ts";
-import { expectedEtag } from "../../migration/neon-s3-erasure/write-obligation.ts";
 import { evidenceAccount, readBabysitterEvidence, sqlEvidenceDeps, type EvidenceDeps } from "../../session-read-api/babysitter-evidence.ts";
 import { createReadApi } from "../../session-read-api/app.ts";
 import { FakeS3Versions } from "../../migration/__tests__/fake-s3-versions.ts";
@@ -102,8 +101,7 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     const n = ++serial;
     const recs: Rec[] = records ?? buckets.map((b, i) => ({ bucket: i, originId: ORIGIN, recordId: `rec-${n}-${i}`, revision: "1", revisionId: `rec-${n}-${i}:1`, digest: dig(`rec-${n}-${i}:1`), operation: "upsert" as const,
       kind: "turn_receipt", source: b.source, sessionId: b.sessionId, line: 0, expiresAtMs: b.eraseAfterMs }));
-    const withEtag = buckets.map((b) => ({ ...b, etag: (b as { etag?: string }).etag ?? createHash("md5").update(`${n}:${b.source}:${b.sessionId}`).digest("hex") }));
-    const out = await sqlLedger(run).registerBabysitterRetention!({ tenant: t, originId: ORIGIN, ...c, generation: gen, buckets: withEtag, records: recs });
+    const out = await sqlLedger(run).registerBabysitterRetention!({ tenant: t, originId: ORIGIN, ...c, generation: gen, buckets, records: recs });
     if (!records) {
       if (out.objects.length) await written(t, c.claimToken, out.objects.map((o) => ({ ref: o.ref, object: objectOf(c.batchDigest), outcome: "acked" as const, versionId: `v-${n}` })));
       await commitBatch(t, c.batchId);
@@ -518,34 +516,37 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     } finally { scratch.done(); }
   }, 60000);
 
-  test("unresolved PUT on real SQL: a dispatched invocation (lost response) keeps the bucket tracked through zero inventories; its late commit is attributed (CAS), erased, then the bucket is erased", async () => {
+  test("unresolved PUT on real SQL: a dispatched invocation (lost response) keeps the bucket tracked forever; a late identical commit is erased as cleanup but never resolves it; only its own outcome does", async () => {
     await configure(true, false);
     const t = tenantOf("u-late");
     const b = bucket(710, "late-sess");
     const claim = await seedClaim(t, ["late-sess"]);
-    const body = new TextEncoder().encode("late body"), etag = expectedEtag(body);
-    const reg = await register(t, [{ ...b, etag } as never], claim, generation, [{ bucket: 0, originId: ORIGIN, recordId: "late-r", revision: "1", revisionId: "late-r:1",
+    const reg = await register(t, [b], claim, generation, [{ bucket: 0, originId: ORIGIN, recordId: "late-r", revision: "1", revisionId: "late-r:1",
       digest: dig("late-r:1"), operation: "upsert", kind: "turn_receipt", source: "claude", sessionId: "late-sess", line: 0, expiresAtMs: b.eraseAfterMs }]);
     const ref = reg.objects[0]!.ref;
     await age(ref);
     const d = new Date(b.eraseAfterMs), p2 = (n: number) => String(n).padStart(2, "0");
     const key = `96bulls/org-a/v1/ws=ws-a/m=${liveMachineId(t.workspaceId, ORIGIN, t.userId)}/h=_babysitter/d=${d.getUTCFullYear()}/${p2(d.getUTCMonth() + 1)}/${p2(d.getUTCDate())}/s=${ref}/raw/${objectOf(claim.batchDigest)}`;
     const s3 = new FakeS3Versions();
-    for (let i = 0; i < 2; i++) {
+    const sweepOnce = async () => {
       const r = await babysitterRetentionTick({ ledger: sweeper(), eraser: s3.eraser(), keyRoot: "96bulls", generation, mode: "on", limit: 200 });
-      expect(r.codes.obligation_rescheduled ?? 0).toBeGreaterThanOrEqual(1);
-      expect((await row(ref)).state).toBe("pending");
-      // the backoff holds it off; a test fast-forwards past it
-      await pool.query("UPDATE sessions.babysitter_write_obligations SET next_sweep_at=NULL WHERE object_ref=$1", [ref]);
-    }
-    expect((await pool.query("SELECT outcome,expected_etag FROM sessions.babysitter_write_invocations WHERE object_ref=$1", [ref])).rows).toEqual([{ outcome: "dispatched", expected_etag: etag }]);
-    const late = s3.put(key, Date.now(), etag);
-    const r3 = await babysitterRetentionTick({ ledger: sweeper(), eraser: s3.eraser(), keyRoot: "96bulls", generation, mode: "on", limit: 200 });
-    expect(r3.erased).toBeGreaterThanOrEqual(1);
+      await pool.query("UPDATE sessions.babysitter_write_obligations SET next_sweep_at=NULL WHERE object_ref=$1", [ref]);   // fast-forward the backoff
+      return r;
+    };
+    for (let i = 0; i < 2; i++) { expect((await sweepOnce()).codes.obligation_rescheduled ?? 0).toBeGreaterThanOrEqual(1); expect((await row(ref)).state).toBe("pending"); }
+    // The late commit lands (identical content to what the PUT sent): erased as cleanup (reserved first), never "resolved".
+    const late = s3.put(key, Date.now(), "5d41402abc4b2a76b9719d911017c592");
+    await sweepOnce();
     expect(s3.deletes).toContain(`${key}@${late}`);
+    expect((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_write_reservations WHERE object_ref=$1 AND version_id=$2", [ref, late])).rows[0].n).toBe(1);
+    expect((await row(ref)).state).toBe("pending");
+    expect((await pool.query("SELECT outcome FROM sessions.babysitter_write_invocations WHERE object_ref=$1", [ref])).rows).toEqual([{ outcome: "dispatched" }]);
+    // Only the writer's OWN definite outcome resolves it (here: a refusal of that very request).
+    await written(t, claim.claimToken, [{ ref, object: objectOf(claim.batchDigest), outcome: "refused", versionId: null }]);
+    await sweepOnce();
     expect(await row(ref)).toMatchObject({ state: "erased" });
     expect((await pool.query("SELECT count(*)::int n FROM sessions.babysitter_write_obligations WHERE object_ref=$1", [ref])).rows[0].n).toBe(0);
-    // A stale row version is refused by every obligation mutation (compare-and-set).
+    // A stale row version is refused (compare-and-set) by every obligation mutation.
     await configure(false, true);
   }, 60000);
 
@@ -609,7 +610,7 @@ describe.skipIf(!url)("babysitter retention SQL lane (PG17)", () => {
     const claim = await seedClaim(t, [...new Set(records.map((r) => r.session_id as string))]);
     const plan = planBabysitterBuckets(records as never, Date.now());
     const bodies = bucketBodies(plan, new Date());
-    const reg = await register(t, plan.requests.map((b) => ({ ...b, etag: expectedEtag(bodies.get(planKey(b))!) })), claim, generation, plan.entries as Rec[]);
+    const reg = await register(t, plan.requests, claim, generation, plan.entries as Rec[]);
     const wrote = await writeBucketObjects({ store, keyRoot: "96bulls" }, { orgId: t.orgId, workspaceId: t.workspaceId, userId: t.userId, originId: ORIGIN, batchDigest: claim.batchDigest }, plan, bucketRefs(plan, reg.objects), bodies);
     if (wrote.outcomes.length) await written(t, claim.claimToken, wrote.outcomes);
     await commitBatch(t, claim.batchId);

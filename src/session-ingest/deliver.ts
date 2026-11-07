@@ -48,7 +48,6 @@ import { CAS_ATTEMPTS, GROUP_ATTEMPTS, IngestWriteError, assertTenantSegment, gr
 import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { prepareBufferedStage, putBufferedStage, fanoutMessages, stageGroups, type FanoutMessage } from "./staging.ts";
 import { MAX_FETCH_REDIRECTS, babysitterStub, bucketBodies, bucketRefs, planBabysitterBuckets, planKey, worstCaseSubrequests, writeBucketObjects, type BucketRefs } from "./babysitter-retention.ts";
-import { expectedEtag } from "../migration/neon-s3-erasure/write-obligation.ts";
 
 export interface DeliverDeps {
   /** Verified private source packet, bound to this request only. */
@@ -301,13 +300,13 @@ async function writeAndCommit(
     if (!deps.ledger.registerBabysitterRetention) throw new IngestUnavailable("babysitter_retention", "retention_not_configured");
     // Registered BEFORE the bucket PUT, so no bucket exists without its row. SQL issues the refs,
     // bound to this claim's fence/reset epochs and the current generation (40001/55000 otherwise).
-    // The exact object bodies first: register records each one's expected ETag on its write
-    // obligation (write-obligation.ts), BEFORE the PUT, so a lost response is never "nothing written".
+    // Register records each bucket object's write obligation (one dispatched invocation, this
+    // claim) BEFORE the PUT (write-obligation.ts), so a lost response is never "nothing written".
     const bodies = bucketBodies(plan, receivedAt);
     const registered = await stage("babysitter_retention", () =>
       deps.ledger.registerBabysitterRetention!({ tenant, originId: prepared.originId, batchId: prepared.batchId, batchDigest: prepared.batchDigest,
         claimToken, generation: deps.retentionGeneration!, resetEpoch: resets,
-        buckets: plan.requests.map((b) => ({ ...b, etag: expectedEtag(bodies.get(planKey(b))!) })), records: plan.entries }),
+        buckets: plan.requests, records: plan.entries }),
     );
     refs = await stage("babysitter_retention", async () => bucketRefs(plan, registered.objects));
     mark("babysitter_retention");

@@ -33,7 +33,7 @@
 import { createHash } from "node:crypto";
 import { layoutComponent } from "../shared/layout-component.ts";
 import type { EraseCheckpoint, ListedVersion, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
-import { boundedPut, expectedEtag, reconcileObligation, type Cas, type ObligationStore, type WriteInvocation } from "../migration/neon-s3-erasure/write-obligation.ts";
+import { boundedPut, reconcileObligation, type Cas, type ObligationStore, type WriteInvocation } from "../migration/neon-s3-erasure/write-obligation.ts";
 import type { BabysitterRetentionObject } from "./ledger.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import { ledgerErrorCode, type SqlRun } from "./ledger-sql.ts";
@@ -238,8 +238,7 @@ const BUCKET_PUT_CONCURRENCY = 8;
 export const BUCKET_PUT_TIMEOUT_MS = 20_000;
 
 /**
- * The exact bytes of each bucket's create-only object, by plan key: built BEFORE registration
- * so the register can record each object's expected ETag (its MD5) on the write obligation.
+ * The exact bytes of each bucket's create-only object, by plan key (built once, before the PUTs).
  */
 export function bucketBodies(plan: BucketPlan, receivedAt: Date): Map<string, Uint8Array> {
   const stamp = receivedAt.toISOString();
@@ -352,8 +351,8 @@ export interface BabysitterRetentionLedger {
   obligations(leaseToken: string, request: ObligationRequest): Promise<ObligationReply>;
 }
 
-export type ObligationAction = "list" | "load" | "observe" | "checkpoint" | "resolve" | "reschedule" | "retire";
-export interface ObligationRequest { action: ObligationAction; object?: string; rev?: number; invocations?: string[]; versionId?: string | null; checkpoint?: EraseCheckpoint | null }
+export type ObligationAction = "list" | "load" | "reserve" | "checkpoint" | "resolve" | "reschedule" | "retire";
+export interface ObligationRequest { action: ObligationAction; object?: string; rev?: number; invocations?: string[]; versions?: string[]; checkpoint?: EraseCheckpoint | null }
 /** One key's obligation as the SQL adapter loads it (sessions.babysitter_write_obligations / _invocations). */
 export interface BucketObligation { rev: number; invocations: WriteInvocation[]; checkpoint: EraseCheckpoint | null; sweeps: number }
 export interface ObligationReply { ok: boolean; rev?: number; objects?: string[]; obligation?: BucketObligation | null }
@@ -401,7 +400,7 @@ export function sqlBabysitterRetentionLedger(run: SqlRun, generation: string): B
     },
     async obligations(leaseToken, q) {
       const r = await call("ingest_babysitter_retention_obligation", { generation, leaseToken, action: q.action, object: q.object ?? null, rev: q.rev ?? null,
-        invocations: q.invocations ?? [], versionId: q.versionId ?? null, checkpoint: q.checkpoint ?? null });
+        invocations: q.invocations ?? [], versions: q.versions ?? [], checkpoint: q.checkpoint ?? null });
       if (typeof r.ok !== "boolean") throw new LedgerUnavailableError("ledger_bad_result");
       if (q.action === "list" && r.ok && !Array.isArray(r.objects)) throw new LedgerUnavailableError("ledger_bad_result");
       if (r.ok && q.action !== "list" && q.action !== "load" && typeof r.rev !== "number") throw new LedgerUnavailableError("ledger_bad_result");
@@ -456,10 +455,10 @@ function obligationStore(ledger: BabysitterRetentionLedger, leaseToken: string, 
       const r = await ledger.obligations(leaseToken, { action: "load", object });
       if (!r.ok) throw new RetentionRefused("fence_refused");
       if (!r.obligation) return null;
-      return { key, identity, rev: r.obligation.rev, invocations: r.obligation.invocations.map((i) => ({ ...i, ...(i.versionId === null ? { versionId: undefined } : {}), ...(i.observedVersion === null ? { observedVersion: undefined } : {}), ...(i.expectedEtag === null ? { expectedEtag: undefined } : {}) })),
+      return { key, identity, rev: r.obligation.rev, invocations: r.obligation.invocations.map((i) => ({ id: i.id, outcome: i.outcome, ...(typeof i.versionId === "string" ? { versionId: i.versionId } : {}) })),
         ownedVersions: [], ownersWithoutVersion: 0, checkpoint: r.obligation.checkpoint };
     },
-    observe: (rev, invocationId, versionId) => cas({ action: "observe", rev, invocations: [invocationId], versionId }),
+    reserve: (rev, versionIds) => cas({ action: "reserve", rev, versions: [...versionIds] }),
     saveCheckpoint: (rev, checkpoint) => cas({ action: "checkpoint", rev, checkpoint }),
     resolve: (rev, ids) => cas({ action: "resolve", rev, invocations: [...ids] }),
     reschedule: (rev) => cas({ action: "reschedule", rev }),
@@ -586,26 +585,18 @@ export async function babysitterRetentionTick(deps: TickDeps): Promise<TickResul
       const raw = `${targets.prefix}raw/`;
       const objects = listed.objects ?? [];
       const stores = new Map(objects.map((object) => [object, obligationStore(deps.ledger, o.leaseToken, `${raw}${object}`, object, obligationIdentity(o, object, deps.generation))]));
-      // The bucket-wide erase deletes every version, so a version that belongs to an unresolved
-      // invocation is ATTRIBUTED (CAS, durable) before its delete: never a lost write.
+      // The bucket-wide erase RESERVES every doomed version of a key with an obligation (CAS under
+      // the key row's lock, the shared contract) before its delete. No listed version resolves a
+      // dispatched invocation: that needs its writer's own outcome (write-obligation.ts v3).
       const beforeDelete = async (doomed: readonly ListedVersion[]) => {
-        const byKey = new Map<string, ListedVersion[]>();
-        for (const v of doomed) if (!v.deleteMarker && v.key.startsWith(raw) && stores.has(v.key.slice(raw.length))) byKey.set(v.key, [...(byKey.get(v.key) ?? []), v]);
+        const byKey = new Map<string, string[]>();
+        for (const v of doomed) if (v.key.startsWith(raw) && stores.has(v.key.slice(raw.length))) byKey.set(v.key, [...(byKey.get(v.key) ?? []), v.versionId]);
         for (const [key, versions] of byKey) {
           const store = stores.get(key.slice(raw.length))!;
           const state = await store.load();
           if (!state) continue;
-          let rev = state.rev;
-          const attributed = new Set(state.invocations.map((i) => i.observedVersion).filter((v): v is string => !!v));
-          const open = state.invocations.filter((i) => i.outcome === "dispatched" && !i.observedVersion && i.expectedEtag);
-          for (const v of versions) {
-            if (attributed.has(v.versionId)) continue;
-            const at = open.findIndex((i) => i.expectedEtag === (v.etag ?? "").toLowerCase());
-            if (at < 0) continue;
-            const r = await store.observe(rev, open[at]!.id, v.versionId);
-            if (!r.ok) throw new RetentionRefused("obligation_changed");
-            rev = r.rev; attributed.add(v.versionId); open.splice(at, 1);
-          }
+          const r = await store.reserve(state.rev, versions);
+          if (!r.ok) throw new RetentionRefused("obligation_changed");
         }
       };
       let step;
