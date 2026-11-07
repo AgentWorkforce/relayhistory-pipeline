@@ -66,6 +66,9 @@ const TOKEN_VERIFIER_VERIFY = join(
 // file. 20261102010000 verifies them and fails closed if absent (42704); it never creates them.
 const INGEST_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_ingest_roles.sql");
 const PROJECT_EVENTS_VERIFY = join(ROOT,"supabase/bootstrap/canonical_project_events_verify.sql");
+// 20261105047000 portable search state: exact owner/shape/constraint/index/RLS/policy/ACL
+// admission. Phase 2 (so PASS requires it), bound to the configured runtime role.
+const PORTABLE_STORAGE_VERIFY = join(ROOT, "supabase/bootstrap/portable_search_storage_verify.sql");
 const INGEST_ROLE_VERIFY = join(ROOT,"supabase/bootstrap/session_ingest_verify.sql");
 // The session read API role (bulls96_read_api), bare: the same contract, its own file.
 // 20261105034000 verifies it and fails closed if absent (42704); it never creates it.
@@ -310,6 +313,7 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
           {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
           {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
           {name:"verify:canonical_project_events",path:PROJECT_EVENTS_VERIFY},
+          {name:"verify:portable_search_storage",path:PORTABLE_STORAGE_VERIFY},
         ]
       : []),
   ];
@@ -342,6 +346,7 @@ export async function generation(): Promise<string> {
     {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
     {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
     {name:"verify:canonical_project_events",path:PROJECT_EVENTS_VERIFY},
+    {name:"verify:portable_search_storage",path:PORTABLE_STORAGE_VERIFY},
   ];
   const parts: string[][] = [];
   for (const s of steps)
@@ -582,6 +587,9 @@ export async function runMigrations(
           try {
             await bindDbMode();
             if (verify) await hardenAndCheck();
+            // The storage verifier binds identity to configuration, never to a policy.
+            if (verify)
+              await client.query("SELECT set_config('hoopdb.runtime_role', $1, true)", [profile.runtimeRole]);
             await client.query(sql);
             if (verify && stepIndex === lastVerifyIndex) {
               const passed = await client.query(

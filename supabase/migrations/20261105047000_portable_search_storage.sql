@@ -30,7 +30,7 @@
 -- production supabase/bootstrap/session_read_api_role_verify.sql fail ("SELECT on ...",
 -- "unapproved policy"), so every reader grant/policy (this table and the
 -- session_directory columns) ships together with that verifier's exact extension in a
--- separate slot (048000), reviewed by the migration lead. Until then only the runtime
+-- separate, not-yet-allocated slot, reviewed by the migration lead. Until then only the runtime
 -- writer can reach this table; the read API's completeness check fails closed.
 -- FORCE ROW LEVEL SECURITY: the owner has no policy, so an owner connection sees and
 -- writes nothing.

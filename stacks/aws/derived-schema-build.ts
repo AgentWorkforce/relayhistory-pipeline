@@ -24,6 +24,7 @@ export async function packagedDerivedSchemaSource(onInput?: (path: string) => vo
   // Consumers use this inventory both for watch invalidation and packaged assets.
   for (const path of [ROLE_VERIFY_SQL_PATH, TOKEN_VERIFIER_VERIFY_SQL_PATH,INGEST_SEED_VERIFY_SQL_PATH,INGEST_ROLE_VERIFY_SQL_PATH,
     join(ROOT, "supabase/bootstrap/canonical_project_events_verify.sql"),
+    join(ROOT, "supabase/bootstrap/portable_search_storage_verify.sql"),
     ...first.expected.names.map(name => {
       const [kind, file] = name.split(":");
       if (!file || !["upstream", "96bulls"].includes(kind!)) throw new Error("unknown schema input");

@@ -468,7 +468,7 @@ describe("runtime role: required, existing, SELECT only", () => {
               AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
         )
       ).rows[0]?.n,
-    ).toBe(30);
+    ).toBe(31);
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
@@ -1663,6 +1663,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // Roll back the complete039/038 suffix in descending order before earlier lanes.
     expect((await failure(rollback("20261105038000_claim_attempt_records_retirement.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(T);
+    // 047000 (portable search state) is later: 039000 refuses until it is rolled back.
+    const PS = "upstream:20261105047000_portable_search_storage.sql";
+    expect((await failure(rollback("20261105039000_buffered_gc_single_candidate.down.sql")))?.code).toBe("55000");
+    await rollback("20261105047000_portable_search_storage.down.sql");
+    expect(await names()).not.toContain(PS);
+    expect(await relation("sessions.search_projection_state")).toBeNull();
     await rollback("20261105039000_buffered_gc_single_candidate.down.sql");
     expect(await names()).not.toContain(G);
     expect(await passed()).toBe(false);

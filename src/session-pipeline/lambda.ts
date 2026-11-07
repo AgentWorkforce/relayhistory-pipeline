@@ -256,7 +256,12 @@ async function init(composition?: SearchComposition): Promise<Runtime> {
     credentials: lambdaCredentials(),
   });
   if (!SecretString) throw new Error("session pipeline secret has no value yet");
-  return runtimeFromSecret(env, SecretString, publicationSchema.expected.generation, composition);
+  const rt = runtimeFromSecret(env, SecretString, publicationSchema.expected.generation, composition);
+  // M5: a composition that declares admission refuses privileged writer identities
+  // once, before any work. runtimeFromSecret stays synchronous and network-free.
+  if (env.searchEnabled && env.searchBackend && env.searchBackend !== "clickhouse" && composition?.admit)
+    await composition.admit(rt.deps.pointer.db, "writer");
+  return rt;
 }
 
 /**

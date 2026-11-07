@@ -13,19 +13,28 @@
 --              OPTION; nothing for PUBLIC or any other role; no column ACL. This also
 --              catches grants inherited from ALTER DEFAULT PRIVILEGES;
 --   R          not SUPERUSER, not BYPASSRLS, not the owner, not a member of the owner.
--- The runtime role is taken from the policy rather than configuration, and the
--- migrate-time guard (runtimeRoleViolations) separately pins that role's complete
--- surface. No reader surface is accepted here: a bulls96_read_api grant or policy on this
--- table fails until the separately reviewed read-API slot extends this file.
--- Any role that can read the catalogs can run it; it changes nothing.
---   psql -v ON_ERROR_STOP=1 -X -d <the HoopDb database> -f supabase/bootstrap/portable_search_storage_verify.sql
-\set ON_ERROR_STOP 1
+-- Identity binding: the approved runtime role is NOT inferred from the (mutable) policy.
+-- The caller binds it transaction-locally as hoopdb.runtime_role: the migrator does so
+-- in phase 2 from HOOPDB_RUNTIME_ROLE, the Lambda admission from its own connection
+-- identity, an operator explicitly. Unset or unknown refuses. The policy and the grant
+-- must both name exactly that role. Only db_mode 'local' with the owner as runtime (the
+-- Docker dev owner-run profile) accepts no runtime grant or policy.
+-- No reader surface is accepted here: a bulls96_read_api grant or policy on this table
+-- fails until the separately reviewed reader-contract slot extends this file.
+-- Read-only; any role that can read the catalogs can run it. It is a phase-2 step of
+-- src/hoopdb/migrate.ts (so PASS requires it), and has no psql meta-commands. Operator:
+--   psql -v ON_ERROR_STOP=1 -X -d <db> -c "BEGIN" \
+--     -c "SELECT set_config('hoopdb.runtime_role', '<runtime role>', true)" \
+--     -f supabase/bootstrap/portable_search_storage_verify.sql -c "ROLLBACK"
 DO $verify$
 DECLARE
   v_rel oid := to_regclass('sessions.search_projection_state');
   v_owner oid;
   v_migration_owner oid;
   v_runtime oid;
+  v_expected oid;
+  v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
+  v_owner_run boolean := false;
   v_problems text[] := ARRAY[]::text[];
   v_row record;
   v_cols text;
@@ -42,6 +51,16 @@ BEGIN
   SELECT c.relowner INTO v_migration_owner FROM pg_class c WHERE c.oid = to_regclass('sessions.__96bulls_migrations');
   IF v_migration_owner IS NULL OR v_owner IS DISTINCT FROM v_migration_owner THEN
     v_problems := array_append(v_problems, 'owner is not the migration owner'::text);
+  END IF;
+
+  SELECT r.oid INTO v_expected FROM pg_roles r WHERE r.rolname = nullif(current_setting('hoopdb.runtime_role', true), '');
+  IF v_expected IS NULL THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = 'portable search storage: the expected runtime role is not bound (hoopdb.runtime_role) or does not exist';
+  END IF;
+  v_owner_run := v_expected = v_owner AND v_mode = 'local';
+  IF v_expected = v_owner AND NOT v_owner_run THEN
+    v_problems := array_append(v_problems, 'runtime role is the owner outside local mode'::text);
   END IF;
 
   SELECT * INTO v_row FROM pg_class WHERE oid = v_rel;
@@ -67,17 +86,56 @@ BEGIN
     v_problems := array_append(v_problems, 'a column default is present'::text);
   END IF;
 
-  IF (SELECT string_agg(conname || ':' || contype, ',' ORDER BY conname) FROM pg_constraint WHERE conrelid = v_rel)
-     IS DISTINCT FROM 'search_projection_state_counts:c,search_projection_state_ids:c,search_projection_state_pkey:p' THEN
-    v_problems := array_append(v_problems, 'constraint set differs'::text);
+  -- Exact constraint set and definitions, all validated and immediate. PG18 NOT NULL
+  -- constraint rows are excluded (nullability is checked via attnotnull above).
+  IF (SELECT string_agg(format('%s|%s|%s|%s', conname, contype::text, convalidated::text, condeferrable::text), ',' ORDER BY conname)
+        FROM pg_constraint WHERE conrelid = v_rel AND contype <> 'n')
+     IS DISTINCT FROM 'search_projection_state_counts|c|true|false,search_projection_state_ids|c|true|false,search_projection_state_pkey|p|true|false' THEN
+    v_problems := array_append(v_problems, 'constraint set, validation or deferrability differs'::text);
   END IF;
-  IF (SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = v_rel AND conname = 'search_projection_state_pkey')
-     IS DISTINCT FROM 'PRIMARY KEY (backend_id, org_id, workspace_id, source, session_id)' THEN
-    v_problems := array_append(v_problems, 'primary key differs'::text);
+  FOR v_row IN
+    SELECT x.name, x.def, pg_get_constraintdef(c.oid) AS actual
+      FROM (VALUES
+        ('search_projection_state_pkey', 'PRIMARY KEY (backend_id, org_id, workspace_id, source, session_id)'),
+        ('search_projection_state_counts', 'CHECK (((revision >= 0) AND (row_count >= 0) AND (coverage_from_ms >= 0)))'),
+        ('search_projection_state_ids', 'CHECK (((backend_id ~ ''^[a-zA-Z0-9._-]{1,128}$''::text) AND (org_id <> ''''::text) AND (workspace_id <> ''''::text)))')
+      ) AS x(name, def)
+      LEFT JOIN pg_constraint c ON c.conrelid = v_rel AND c.conname = x.name
+  LOOP
+    IF v_row.actual IS DISTINCT FROM v_row.def THEN
+      v_problems := array_append(v_problems, format('constraint %s definition differs', v_row.name));
+    END IF;
+  END LOOP;
+  -- Index: by catalog identity, never by a search_path-dependent rendering
+  -- (regclass and pg_get_indexdef qualify names only when not visible).
+  IF (SELECT count(*) FROM pg_index WHERE indrelid = v_rel) <> 1 THEN
+    v_problems := array_append(v_problems, 'index set differs (exactly one index expected)'::text);
   END IF;
-  IF (SELECT string_agg(i.indexrelid::regclass::text, ',') FROM pg_index i WHERE i.indrelid = v_rel)
-     IS DISTINCT FROM 'sessions.search_projection_state_pkey' THEN
-    v_problems := array_append(v_problems, 'index set differs'::text);
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_index i
+      JOIN pg_class ic ON ic.oid = i.indexrelid
+      JOIN pg_am am ON am.oid = ic.relam
+     WHERE i.indrelid = v_rel
+       AND ic.relname = 'search_projection_state_pkey'
+       AND ic.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = v_rel)
+       AND am.amname = 'btree'
+       AND i.indisunique AND i.indisprimary AND i.indisvalid AND i.indisready AND i.indimmediate
+       AND i.indpred IS NULL AND i.indexprs IS NULL
+       AND i.indnatts = 5 AND i.indnkeyatts = 5
+       AND NOT coalesce((to_jsonb(i) ->> 'indnullsnotdistinct')::boolean, false)
+       AND (SELECT array_agg(a.attname::text ORDER BY k.n)
+              FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, n)
+              JOIN pg_attribute a ON a.attrelid = v_rel AND a.attnum = k.attnum)
+           = ARRAY['backend_id', 'org_id', 'workspace_id', 'source', 'session_id']
+       AND (SELECT bool_and(o = 0) FROM unnest(i.indoption::int2[]) o)
+       AND (SELECT bool_and(oc.opcdefault)
+              FROM unnest(i.indclass::oid[]) c(opc) JOIN pg_opclass oc ON oc.oid = c.opc)
+       AND (SELECT bool_and(k.coll = a.attcollation)
+              FROM unnest(i.indcollation::oid[], i.indkey::int2[]) k(coll, attnum)
+              JOIN pg_attribute a ON a.attrelid = v_rel AND a.attnum = k.attnum)
+  ) THEN
+    v_problems := array_append(v_problems, 'index search_projection_state_pkey identity or properties differ'::text);
   END IF;
   IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = v_rel) THEN
     v_problems := array_append(v_problems, 'a trigger is present'::text);
@@ -91,14 +149,17 @@ BEGIN
   LOOP
     IF v_row.polname = 'bulls96_trusted_backend' AND v_row.polpermissive AND v_row.polcmd = '*'
        AND cardinality(v_row.polroles) = 1 AND v_row.polroles[1] <> 0
+       AND v_row.polroles[1] = v_expected AND NOT v_owner_run
        AND v_row.q = 'true' AND v_row.c = 'true' AND v_runtime IS NULL THEN
       v_runtime := v_row.polroles[1];
     ELSE
       v_problems := array_append(v_problems, format('unapproved policy %s', v_row.polname));
     END IF;
   END LOOP;
-  IF v_runtime IS NULL THEN
-    v_problems := array_append(v_problems, 'policy bulls96_trusted_backend is missing'::text);
+  IF v_owner_run THEN
+    NULL; -- local owner-run: no runtime grant or policy exists or is accepted
+  ELSIF v_runtime IS NULL THEN
+    v_problems := array_append(v_problems, 'policy bulls96_trusted_backend for the bound runtime role is missing'::text);
   ELSE
     SELECT * INTO v_row FROM pg_roles WHERE oid = v_runtime;
     IF v_row.rolsuper OR v_row.rolbypassrls THEN
@@ -116,7 +177,7 @@ BEGIN
      WHERE c.oid = v_rel AND a.grantee <> c.relowner
      GROUP BY a.grantee
   LOOP
-    IF v_row.grantee = v_runtime AND v_row.privs = 'DELETE,INSERT,SELECT,UPDATE' AND NOT v_row.grantable THEN
+    IF NOT v_owner_run AND v_row.grantee = v_expected AND v_row.privs = 'DELETE,INSERT,SELECT,UPDATE' AND NOT v_row.grantable THEN
       NULL;
     ELSE
       v_problems := array_append(v_problems, format('ACL: %s granted to %s%s', v_row.privs,
@@ -125,8 +186,8 @@ BEGIN
     END IF;
   END LOOP;
   -- has_table_privilege with a list is true if ANY is held, so test each one.
-  IF v_runtime IS NOT NULL AND NOT (has_table_privilege(v_runtime, v_rel, 'SELECT') AND has_table_privilege(v_runtime, v_rel, 'INSERT')
-                                    AND has_table_privilege(v_runtime, v_rel, 'UPDATE') AND has_table_privilege(v_runtime, v_rel, 'DELETE')) THEN
+  IF NOT v_owner_run AND NOT (has_table_privilege(v_expected, v_rel, 'SELECT') AND has_table_privilege(v_expected, v_rel, 'INSERT')
+                                    AND has_table_privilege(v_expected, v_rel, 'UPDATE') AND has_table_privilege(v_expected, v_rel, 'DELETE')) THEN
     v_problems := array_append(v_problems, 'runtime role lacks SELECT/INSERT/UPDATE/DELETE'::text);
   END IF;
 

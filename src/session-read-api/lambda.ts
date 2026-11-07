@@ -119,6 +119,8 @@ export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessE
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   try {
   const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", poolTenantRunner(pool as never));
+  // M5: refuse a privileged or write-capable reader identity before serving.
+  if (adapter && composition?.admit) await composition.admit(pool as never, "reader");
   if (adapter && await adapter.state.fromMs(new Date()) > completeSinceMs) throw new Error("read history floor is below search coverage");
   const app = createReadApi({
     verify: relayAuthVerifier(readApiAuthConfig(env)),

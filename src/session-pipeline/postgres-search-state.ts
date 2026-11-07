@@ -1,18 +1,91 @@
-/** Content-free portable index completeness. Explicit owner bootstrap only;
- * this helper issues no GRANT and is never initialized by a service implicitly.
- * Readers compare the recorded metadata epoch with current pointer-derived
- * directory readiness, so a failed first pass or newer pointer cannot look
- * complete merely because an older pass once succeeded. */
+/** Content-free portable index completeness. Readers compare the recorded
+ * metadata epoch with current pointer-derived directory readiness, so a failed
+ * first pass or newer pointer cannot look complete merely because an older pass
+ * once succeeded.
+ *
+ * Two constructors share one implementation:
+ *  - `ledgeredSearchState` (self-host profile): the migration-owned
+ *    `sessions.search_projection_state` (20261105047000). No DDL, no schema
+ *    option; storage admission is supabase/bootstrap/portable_search_storage_verify.sql.
+ *  - `postgresSearchState` (composition ABI v1, unchanged contract): an
+ *    operator-bootstrapped `<schema>.projection_state` with an explicit owner
+ *    `ensureSchema`. Reserved/platform schemas are refused (SQL-owner M2). */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { TenantRunner } from "../session-read-api/liveness.ts";
 import type { SearchProjectionState } from "./search-adapter.ts";
 
-export function postgresSearchState(options: { reader?: TenantRunner; backendId: string; fromMs: number; schema?: string }): SearchProjectionState & { ensureSchema(owner: SqlExecutor): Promise<void> } {
-  const schema = options.schema ?? "search_index";
+export const LEDGERED_SEARCH_STATE_TABLE = "sessions.search_projection_state";
+
+/** Schemas that an operator bootstrap must never create objects in: the
+ * migration-owned schema, PostgreSQL's own, and managed-platform schemas. */
+export function reservedSearchSchema(schema: string): boolean {
+  return ["public", "sessions", "information_schema", "auth", "storage", "extensions", "graphql", "graphql_public",
+    "realtime", "vault", "cron", "net", "pgbouncer", "supabase_functions", "supabase_migrations", "rds_tools", "aws_commons"].includes(schema)
+    || /^(pg_|pgsodium|supabase_|_realtime|_analytics|rds_|aws_)/.test(schema);
+}
+
+interface StateOptions { reader?: TenantRunner; backendId: string; fromMs: number }
+
+function validate(options: StateOptions): void {
+  if (!/^[a-zA-Z0-9._-]{1,128}$/.test(options.backendId) || !Number.isSafeInteger(options.fromMs) || options.fromMs < 0)
+    throw new Error("search state configuration invalid");
+}
+
+function stateOn(table: string, options: StateOptions): SearchProjectionState {
   const { backendId, fromMs, reader } = options;
-  if (!/^[a-z_][a-z0-9_]{0,62}$/.test(schema) || !/^[a-zA-Z0-9._-]{1,128}$/.test(options.backendId) || !Number.isSafeInteger(options.fromMs) || options.fromMs < 0) throw new Error("search state configuration invalid");
+  return {
+    async fromMs() { return fromMs; },
+    async record(tx, scope, value) {
+      if (![value.revision, value.rows, value.at.getTime()].every(n => Number.isSafeInteger(n) && n >= 0)) throw new Error("search state record invalid");
+      await tx.query("SELECT set_config('bulls96_read.org_id',$1,true),set_config('bulls96_read.workspace_id',$2,true)", [scope.orgId, scope.workspaceId]);
+      // L1: the stamped epoch is read under FOR SHARE in this statement, so a
+      // concurrent epoch bump waits for this transaction even for a caller that
+      // did not already lock the directory row.
+      await tx.query(`INSERT INTO ${table}(backend_id,org_id,workspace_id,source,session_id,canonical_session_id,source_epoch,coverage_from_ms,revision,row_count,complete,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,coalesce((SELECT d.event_projection_epoch FROM sessions.session_directory d
+          WHERE d.org_id=$2 AND d.workspace_id=$3 AND d.harness=$4 AND d.session_id=$6 FOR SHARE),-1),$7,$8,$9,$10,$11)
+        ON CONFLICT(backend_id,org_id,workspace_id,source,session_id) DO UPDATE SET
+          canonical_session_id=excluded.canonical_session_id,source_epoch=excluded.source_epoch,
+          coverage_from_ms=excluded.coverage_from_ms,revision=excluded.revision,row_count=excluded.row_count,
+          complete=excluded.complete,updated_at=excluded.updated_at`,
+        [backendId, scope.orgId, scope.workspaceId, scope.harness, scope.sessionId, value.canonicalSessionId, fromMs, value.revision, value.rows, value.complete, value.at.toISOString()]);
+    },
+    async partials(tenant, input) {
+      if (!reader) throw new Error("search state tenant reader missing");
+      if (!tenant.orgId || !tenant.workspaceId || !Number.isInteger(input.limit) || input.limit < 1 || input.limit > 1000) throw new Error("search state query invalid");
+      const { rows } = await reader(tenant.orgId, tenant.workspaceId, tx => tx.query<{ session_id: string }>(
+        `SELECT DISTINCT coalesce(p.canonical_session_id,p.session_id) AS session_id
+         FROM sessions.session_index p
+         LEFT JOIN ${table} s ON s.backend_id=$3 AND s.org_id=p.org_id AND s.workspace_id=p.workspace_id AND s.source=p.harness AND s.session_id=p.session_id
+         LEFT JOIN sessions.session_directory d ON d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id=coalesce(p.canonical_session_id,p.session_id)
+         WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.deleted_at IS NULL
+           AND ($4::text IS NULL OR p.session_id=$4 OR coalesce(p.canonical_session_id,p.session_id)=$4)
+           AND (s.complete IS DISTINCT FROM true OR d.event_projection_ready IS DISTINCT FROM true
+             OR s.canonical_session_id IS DISTINCT FROM coalesce(p.canonical_session_id,p.session_id)
+             OR s.source_epoch IS DISTINCT FROM d.event_projection_epoch OR s.coverage_from_ms IS DISTINCT FROM $5::bigint)
+         ORDER BY session_id LIMIT $6`,
+        [tenant.orgId, tenant.workspaceId, backendId, input.sessionId ?? null, fromMs, input.limit + 1]));
+      return { sessions: rows.slice(0, input.limit).map(r => r.session_id), overflow: rows.length > input.limit };
+    },
+  };
+}
+
+/** The self-host profile's state: migration-owned table, no DDL, no schema input. */
+export function ledgeredSearchState(options: StateOptions): SearchProjectionState {
+  validate(options);
+  return stateOn(LEDGERED_SEARCH_STATE_TABLE, { ...options });
+}
+
+/** Composition ABI v1. Explicit owner bootstrap only; issues no GRANT and is
+ * never initialized by a service implicitly. Not the self-host profile. */
+export function postgresSearchState(options: StateOptions & { schema?: string }): SearchProjectionState & { ensureSchema(owner: SqlExecutor): Promise<void> } {
+  const schema = options.schema ?? "search_index";
+  validate(options);
+  if (!/^[a-z_][a-z0-9_]{0,62}$/.test(schema)) throw new Error("search state configuration invalid");
+  if (reservedSearchSchema(schema)) throw new Error("search state schema is reserved");
   const table = `"${schema}".projection_state`;
   return {
+    ...stateOn(table, { ...options }),
     async ensureSchema(owner) {
       await owner.query(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
       await owner.query(`CREATE TABLE IF NOT EXISTS ${table} (
@@ -39,36 +112,6 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
       const normalize = (value: string) => value.replace(/\s+|::text|\(|\)/g, "");
       const expected = normalize("org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true)");
       if (rows.length !== 1 || rows[0]!.name !== "tenant_only" || rows[0]!.command !== "*" || rows[0]!.roles !== "{0}" || !rows[0]!.permissive || normalize(rows[0]!.qual ?? "") !== expected || normalize(rows[0]!.check ?? "") !== expected) throw new Error("search state tenant policy mismatch");
-    },
-    async fromMs() { return fromMs; },
-    async record(tx, scope, value) {
-      if (![value.revision, value.rows, value.at.getTime()].every(n => Number.isSafeInteger(n) && n >= 0)) throw new Error("search state record invalid");
-      await tx.query("SELECT set_config('bulls96_read.org_id',$1,true),set_config('bulls96_read.workspace_id',$2,true)", [scope.orgId, scope.workspaceId]);
-      await tx.query(`INSERT INTO ${table}(backend_id,org_id,workspace_id,source,session_id,canonical_session_id,source_epoch,coverage_from_ms,revision,row_count,complete,updated_at)
-        VALUES($1,$2,$3,$4,$5,$6,coalesce((SELECT event_projection_epoch FROM sessions.session_directory
-          WHERE org_id=$2 AND workspace_id=$3 AND harness=$4 AND session_id=$6),-1),$7,$8,$9,$10,$11)
-        ON CONFLICT(backend_id,org_id,workspace_id,source,session_id) DO UPDATE SET
-          canonical_session_id=excluded.canonical_session_id,source_epoch=excluded.source_epoch,
-          coverage_from_ms=excluded.coverage_from_ms,revision=excluded.revision,row_count=excluded.row_count,
-          complete=excluded.complete,updated_at=excluded.updated_at`,
-        [backendId, scope.orgId, scope.workspaceId, scope.harness, scope.sessionId, value.canonicalSessionId, fromMs, value.revision, value.rows, value.complete, value.at.toISOString()]);
-    },
-    async partials(tenant, input) {
-      if (!reader) throw new Error("search state tenant reader missing");
-      if (!tenant.orgId || !tenant.workspaceId || !Number.isInteger(input.limit) || input.limit < 1 || input.limit > 1000) throw new Error("search state query invalid");
-      const { rows } = await reader(tenant.orgId, tenant.workspaceId, tx => tx.query<{ session_id: string }>(
-        `SELECT DISTINCT coalesce(p.canonical_session_id,p.session_id) AS session_id
-         FROM sessions.session_index p
-         LEFT JOIN ${table} s ON s.backend_id=$3 AND s.org_id=p.org_id AND s.workspace_id=p.workspace_id AND s.source=p.harness AND s.session_id=p.session_id
-         LEFT JOIN sessions.session_directory d ON d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id=coalesce(p.canonical_session_id,p.session_id)
-         WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.deleted_at IS NULL
-           AND ($4::text IS NULL OR p.session_id=$4 OR coalesce(p.canonical_session_id,p.session_id)=$4)
-           AND (s.complete IS DISTINCT FROM true OR d.event_projection_ready IS DISTINCT FROM true
-             OR s.canonical_session_id IS DISTINCT FROM coalesce(p.canonical_session_id,p.session_id)
-             OR s.source_epoch IS DISTINCT FROM d.event_projection_epoch OR s.coverage_from_ms IS DISTINCT FROM $5::bigint)
-         ORDER BY session_id LIMIT $6`,
-        [tenant.orgId, tenant.workspaceId, backendId, input.sessionId ?? null, fromMs, input.limit + 1]));
-      return { sessions: rows.slice(0, input.limit).map(r => r.session_id), overflow: rows.length > input.limit };
     },
   };
 }

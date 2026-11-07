@@ -55,6 +55,15 @@ export interface PostgresSearchIndexConfig {
 
 const IDENT = /^[a-z_][a-z0-9_]{0,62}$/;
 
+/** Schemas the operator `ensureSchema` must never create objects in: a
+ * migration-owned schema, PostgreSQL's own, or a managed-platform schema. Query
+ * paths are unaffected, so a reviewed composition may still bind a ledgered table. */
+export function reservedIndexSchema(schema: string): boolean {
+  return ["public", "sessions", "information_schema", "auth", "storage", "extensions", "graphql", "graphql_public",
+    "realtime", "vault", "cron", "net", "pgbouncer", "supabase_functions", "supabase_migrations", "rds_tools", "aws_commons"].includes(schema)
+    || /^(pg_|pgsodium|supabase_|_realtime|_analytics|rds_|aws_)/.test(schema);
+}
+
 const COLUMNS = [
   "org_id",
   "workspace_id",
@@ -210,6 +219,7 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
     capabilities: () => capabilities,
 
     async ensureSchema(context) {
+      if (reservedIndexSchema(schema)) throw new SearchIndexError("invalid_argument", false, "reserved_schema");
       const ext = await run<{ nspname: string }>(
         `SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pg_trgm'`,
         [],
