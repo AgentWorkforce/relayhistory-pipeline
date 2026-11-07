@@ -138,6 +138,29 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 
 ## Backfill, retention and acceptance
 
+- Canonical retirement must await the same exact-key, strictly older-version
+  ClickHouse deletion as the legacy copier before acknowledging each page,
+  including the optional directory-document pool. Test ordinary `SELECT`
+  without `FINAL`; a blank tombstone alone is not proof that old text is hidden.
+  The synchronous lightweight delete establishes query visibility, not physical
+  purge of inactive parts, backups, S3 sources, or a defense against a writer
+  that is still allowed to replay retired data.
+- Stop and drain old writers and verify the existing ownership/version fences
+  before retirement acceptance. A stale INSERT after a successful delete can
+  otherwise make old rows visible again; this cleanup is not a write barrier.
+- Before activating an upgraded consumer, inventory whether the old
+  tombstone-only path ever wrote or acknowledged retirements in the target.
+  Already-complete entries and already-ACKed pages are skipped by durable
+  resume. Installing the fixed code does not repair those historical rows.
+  If any exist, keep readiness/traffic held and obtain a separately reviewed,
+  authorized reconciliation or target rebuild with non-`FINAL` read checks.
+  Do not reset checkpoints or discard ACKs as an incidental upgrade.
+- Run the local regression with
+  `node --experimental-transform-types --test src/search-features/__tests__/canonical-retirement.test.ts`.
+  An explicitly owned ClickHouse fixture at `http://127.0.0.1:32771` can opt in
+  with `CANONICAL_RETIREMENT_CH_PROOF=1`; the proof creates and removes a uniquely
+  named synthetic database. The default test run skips that integration proof.
+
 - Run bounded historical publication, live catch-up and directory-document
   backfill; prove zero dirty/outbox/journal backlog at a captured high-water.
 - Configure per-org retention and the reviewed Supabase/ClickHouse/S3 erasure
