@@ -127,7 +127,7 @@ async function as(db: PGlite, role: string, sql: string, setup = "") {
   try {
     if (setup) await db.exec(setup);
     await db.exec(`SET LOCAL ROLE ${role}`);
-    await db.query(sql);
+    await db.exec(sql);
     return "ok";
   } catch (error) {
     return (error as Error).message;
@@ -153,7 +153,21 @@ test("caller pin: every SECURITY DEFINER in 046000 refuses a role it does not se
   expect(await as(db, "intruder", "SELECT sessions.purge_session_analysis_for_owned('org-a','ws-1','user-1','[]'::jsonb)")).toContain("caller is not");
   // The ingest role only inside the authority begin (its writer GUC).
   expect(await as(db, "bulls96_session_ingest", purge)).toContain("outside the privacy authority");
-  expect(await as(db, "bulls96_session_ingest", purge, "SELECT set_config('bulls96.privacy_authority_writer','authority',true)")).toBe("ok");
+  // The GUC ALONE is not authority: the ingest role SETs it itself (even holding EXECUTE through
+  // drift) and is refused without the authority's proof for this transaction and scope.
+  const guc = "SELECT set_config('bulls96.privacy_authority_writer','authority',true)";
+  expect(await as(db, "bulls96_session_ingest", purge, guc)).toContain("no privacy-authority proof for this transaction and scope");
+  // A proof for another scope, or from an earlier transaction, is no proof.
+  expect(await as(db, "bulls96_session_ingest", purge, `${guc}; SELECT sessions.session_analysis_purge_grant('org-a','ws-2','user-1')`)).toContain("no privacy-authority proof");
+  await db.query("SELECT sessions.session_analysis_purge_grant('org-a','ws-1','user-1')"); // committed in its own (earlier) transaction
+  expect(await as(db, "bulls96_session_ingest", purge, guc)).toContain("no privacy-authority proof");
+  // The authority path: its definer (owner) writes the proof in THIS transaction, then purges once.
+  expect(await as(db, "bulls96_session_ingest", purge, `${guc}; SELECT sessions.session_analysis_purge_grant('org-a','ws-1','user-1')`)).toBe("ok");
+  expect(await as(db, "bulls96_session_ingest", `${purge}; ${purge}`, `${guc}; SELECT sessions.session_analysis_purge_grant('org-a','ws-1','user-1')`)).toContain("no privacy-authority proof"); // consumed
+  // Without any grant the ingest role has no EXECUTE on the purge or the grant at all.
+  await db.exec("REVOKE EXECUTE ON FUNCTION sessions.purge_session_analysis_for_owned(text,text,text) FROM bulls96_session_ingest");
+  expect(await as(db, "bulls96_session_ingest", purge, guc)).toContain("permission denied");
+  expect(await as(db, "bulls96_session_ingest", "SELECT sessions.session_analysis_purge_grant('org-a','ws-1','user-1')", guc)).toContain("permission denied");
   // The search_path is pinned on all of them.
   const unpinned = (await db.query<{ f: string }>(`
     SELECT p.oid::regprocedure::text f FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
