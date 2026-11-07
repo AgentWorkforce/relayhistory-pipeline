@@ -107,28 +107,30 @@ suite("Output parity: relayhistory SQL on Postgres == facts query on ClickHouse"
   const database = `output_parity_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
   const s = OUTPUT_FIXTURE_SCOPE;
 
+  // Neon holds the session under the id SP resolves it to (the canonical one); the SP fixture's
+  // events carry an owner/alias id ("s1"), so this also proves every fact lands on the canonical key.
   async function load(fx: ReturnType<typeof outputFixture>) {
     await db.query("TRUNCATE sessions.convergence_events, sessions.session_commit_links, sessions.session_outcomes, sessions.conversation_turns".replaceAll("sessions.", `${schema}.`));
     for (const { table, row: r } of fx.projectionRows) {
       if (table === "convergence_events")
         await db.query(`INSERT INTO ${schema}.convergence_events VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, [
-          s.orgId, s.workspaceId, r.source, r.session_id, r.machine_id, r.event_id, r.kind, r.type, r.ts, r.actor_role, r.content, r.request_key,
+          s.orgId, s.workspaceId, r.source, s.canonicalId, r.machine_id, r.event_id, r.kind, r.type, r.ts, r.actor_role, r.content, r.request_key,
           r.delivery_record_id, JSON.stringify(r.record), r.tool_name,
         ]);
       else if (table === "session_commit_links")
         await db.query(`INSERT INTO ${schema}.session_commit_links VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [
-          s.orgId, s.workspaceId, r.source, r.session_id, r.commit_sha, r.linked_at, r.received_at, JSON.stringify(r.numstat),
+          s.orgId, s.workspaceId, r.source, s.canonicalId, r.commit_sha, r.linked_at, r.received_at, JSON.stringify(r.numstat),
         ]);
     }
     for (const rec of fx.records) {
       const p = rec.payload!;
       if (rec.kind === "legacy_session_outcome")
         await db.query(`INSERT INTO ${schema}.session_outcomes VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [
-          s.orgId, s.workspaceId, p.source, p.session_id, p.commit_sha, p.shipped_at, p.created_at, JSON.stringify(p.numstat_json ?? null),
+          s.orgId, s.workspaceId, p.source, s.canonicalId, p.commit_sha, p.shipped_at, p.created_at, JSON.stringify(p.numstat_json ?? null),
         ]);
       else if (rec.kind === "legacy_conversation_turn")
         await db.query(`INSERT INTO ${schema}.conversation_turns VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [
-          p.id, s.orgId, s.workspaceId, p.source, p.session_id, p.ts, p.role, p.content,
+          p.id, s.orgId, s.workspaceId, p.source, s.canonicalId, p.ts, p.role, p.content,
         ]);
     }
     await ch.command(`TRUNCATE TABLE IF EXISTS transcript_event_facts`);
@@ -173,6 +175,7 @@ suite("Output parity: relayhistory SQL on Postgres == facts query on ClickHouse"
     { since: new Date("2026-11-05T09:30:00Z") },
     { until: new Date("2026-11-05T09:30:00Z") },
     { since: new Date("2026-11-07T00:00:00Z"), until: new Date("2026-11-08T00:00:00Z") },
+    { source: "codex", sessionId: OUTPUT_FIXTURE_SCOPE.canonicalId },
     { source: "codex", sessionId: "s1" },
     { source: "claude" },
   ];

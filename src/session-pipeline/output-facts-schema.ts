@@ -175,3 +175,23 @@ ENGINE = ReplacingMergeTree(version)
 ORDER BY (org_id, workspace_id, source, session_id)`,
   ];
 }
+
+/**
+ * Idempotent upgrades for a table created from an older copy of this file (CREATE TABLE IF NOT
+ * EXISTS never alters one). Apply after outputFactsSchemaStatements(); a no-op on current tables.
+ * The producer's schema probe (output-facts.ts outputFactsSchema) refuses to write until every
+ * column below exists.
+ */
+export function outputFactsUpgradeStatements(): string[] {
+  return [
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS task_ref_empty UInt8 DEFAULT 0`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS task_ref_json String DEFAULT '{}'`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS task_title Nullable(String)`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS user_id Nullable(String)`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS row_id String`,
+    `ALTER TABLE ${OUTPUT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS scope_source LowCardinality(String)`,
+    `ALTER TABLE ${OUTPUT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS row_id String`,
+    `ALTER TABLE ${OUTPUT_FACTS_SESSION_STATE_TABLE} ADD COLUMN IF NOT EXISTS min_ts Nullable(DateTime64(6, 'UTC'))`,
+    `ALTER TABLE ${OUTPUT_FACTS_SESSION_STATE_TABLE} ADD COLUMN IF NOT EXISTS max_ts Nullable(DateTime64(6, 'UTC'))`,
+  ];
+}

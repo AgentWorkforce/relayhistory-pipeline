@@ -8,12 +8,16 @@
 import type { RelayhistoryStreamRecord } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import type { OutputFactsScope } from "../output-facts.ts";
 
+/**
+ * The canonical session id differs from the projected events' session id ("s1", an owner/alias
+ * id), as it does for an aliased upload: every fact must still land under the canonical id.
+ */
 export const OUTPUT_FIXTURE_SCOPE: OutputFactsScope = {
   orgId: "org-f4",
   workspaceId: "ws-f4",
   harness: "codex",
-  sessionIds: ["s1"],
-  canonicalId: "s1",
+  sessionIds: ["s1", "s1-canonical"],
+  canonicalId: "s1-canonical",
 };
 
 export const LINK_SHA = "abc1234" + "f".repeat(33);

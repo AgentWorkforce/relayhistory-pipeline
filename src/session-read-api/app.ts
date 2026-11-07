@@ -53,7 +53,7 @@ import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
-import { outputWindowReadiness, readSessionOutput } from "./output-query.ts";
+import { isOutputSchemaShort, outputWindowReadiness, readSessionOutput } from "./output-query.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import { DigestInputError, resolveDayWindow } from "./day-window.ts";
 import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, buildDailyDigest, computeStatsHash } from "./digest-query.ts";
@@ -595,6 +595,7 @@ export function createReadApi(deps: ReadApiDeps) {
    *   output_session_partial     a session whose facts are inexact and whose span overlaps the window
    *   output_session_unindexed   a session with transcript events in the window and no complete
    *                              facts state (output-query.ts outputWindowReadiness)
+   *   output_schema_missing      the output-facts DDL (or one of its columns) is not applied
    */
   app.get("/v1/sessions/output", async (c) => {
     try {
@@ -616,9 +617,16 @@ export function createReadApi(deps: ReadApiDeps) {
       const ch = deps.ch;
       if (!deps.output || !ch) throw unsupported("output_not_configured");
       const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
-      const readiness = await outputWindowReadiness(ch, identity.orgId, identity.workspaceId, since, until, opts);
-      if (readiness !== "ready") throw unsupported(`output_${readiness}`);
-      const output = await readSessionOutput(ch, { orgId: identity.orgId, workspaceIds: [identity.workspaceId] }, { since, until }, opts);
+      let output;
+      try {
+        const readiness = await outputWindowReadiness(ch, identity.orgId, identity.workspaceId, since, until, opts);
+        if (readiness !== "ready") throw unsupported(`output_${readiness}`);
+        output = await readSessionOutput(ch, { orgId: identity.orgId, workspaceIds: [identity.workspaceId] }, { since, until }, opts);
+      } catch (error) {
+        // The fact tables are owner-applied DDL: a missing table or column is a 501, not a 500.
+        if (isOutputSchemaShort(error)) throw unsupported("output_schema_missing");
+        throw error;
+      }
       log({ route: c.req.routePath, reason: "output_served", correlation_id: c.get("correlationId") });
       return c.json({ since: since.toISOString(), until: until.toISOString(), output, correlationId: c.get("correlationId") });
     } catch (error) {

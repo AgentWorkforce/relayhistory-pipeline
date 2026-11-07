@@ -259,7 +259,7 @@ export function outputFactsFromScope(
   const pushFact = (f: Omit<OutputFactRow, "org_id" | "workspace_id" | "version" | "row_id" | "fingerprint" | "scope_source">) => {
     const row = { ...base, scope_source: scope.harness, ...f };
     const identity = [row.fact_kind, row.ts, row.source, row.session_id, row.fact_key, row.origin, row.row_key];
-    facts.push({ ...row, row_id: sha256(identity), fingerprint: sha256([...identity, row.added, row.removed, row.reverted]).slice(0, 16) });
+    facts.push({ ...row, row_id: sha256(identity), fingerprint: sha256([...identity, row.added, row.removed, row.reverted]) });
   };
   const events = read.projectionRows.filter((r) => r.table === "convergence_events").map((r) => r.row);
   const eventRows: EventFactRow[] = [];
@@ -273,12 +273,16 @@ export function outputFactsFromScope(
       const ts = chTime(String(e.ts));
       const taskRef = isObject(e.task_ref) ? e.task_ref : {};
       const files = Array.isArray(e.files_touched) ? e.files_touched.map(jtext) : [];
-      const identity = [ts, e.session_id, e.source, e.machine_id, e.kind, e.event_id];
+      // One key for every fact kind: the scope's canonical session id and harness. The event's
+      // own ids (machine, kind, event id) stay in the identity, so dedup is unchanged; the
+      // projected session id may be an owner/alias id, and keying on it would split one
+      // session's facts across two keys (and outside the scope's delete filter).
+      const identity = [ts, scope.canonicalId, scope.harness, e.machine_id, e.kind, e.event_id];
       const row = {
         ...base,
         ts,
-        session_id: String(e.session_id),
-        source: String(e.source),
+        session_id: scope.canonicalId,
+        source: scope.harness,
         machine_id: String(e.machine_id),
         kind: String(e.kind),
         event_id: String(e.event_id),
@@ -302,7 +306,7 @@ export function outputFactsFromScope(
         files_touched: files,
       };
       const { version: _v, ...covered } = row;
-      eventRows.push({ ...row, row_id: sha256(identity), fingerprint: sha256([covered]).slice(0, 16) });
+      eventRows.push({ ...row, row_id: sha256(identity), fingerprint: sha256([covered]) });
 
       // messages CTE
       const content = jtext(e.content);
@@ -313,7 +317,7 @@ export function outputFactsFromScope(
         (payloadKind === "text" || (payloadKind === null && ["assistant", "text"].includes(String(e.type))))
       ) {
         const messageId = nullIfEmpty(jtext(e.request_key)) ?? nullIfEmpty(ptext(e, "message_id")) ?? jtext(e.delivery_record_id) ?? `${e.machine_id}:${e.event_id}`;
-        pushFact({ fact_kind: "message", ts, source: String(e.source), session_id: String(e.session_id), fact_key: messageId, origin: "", row_key: `${e.machine_id}\u001f${e.kind}\u001f${e.event_id}`, added: null, removed: null, reverted: 0 });
+        pushFact({ fact_kind: "message", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: messageId, origin: "", row_key: `${e.machine_id}\u001f${e.kind}\u001f${e.event_id}`, added: null, removed: null, reverted: 0 });
       }
       // commit_candidates, third branch
       if (e.actor_role === "tool_result" && content !== null) {
@@ -321,7 +325,7 @@ export function outputFactsFromScope(
         if (matches.length && resultHasCommitCall(e, bySession.get(JSON.stringify([e.source, e.session_id])) ?? [])) {
           matches.forEach((m, i) => {
             const stats = normalizeStats({ added: m.added ?? "0", deleted: m.deleted ?? "0" });
-            pushFact({ fact_kind: "commit", ts, source: String(e.source), session_id: String(e.session_id), fact_key: m.sha, origin: "tool_result", row_key: `${e.machine_id}\u001f${e.event_id}\u001f${i}`, added: stats.added, removed: stats.removed, reverted: 0 });
+            pushFact({ fact_kind: "commit", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: m.sha, origin: "tool_result", row_key: `${e.machine_id}\u001f${e.event_id}\u001f${i}`, added: stats.added, removed: stats.removed, reverted: 0 });
           });
         }
       }
@@ -437,20 +441,31 @@ export async function reconcileOutputFacts(
  */
 export type FactsRange = { min: string; max: string } | null;
 
-/** The scope's last recorded facts span, for a pass that cannot compute one (a partial read). */
-export async function previousOutputFactsRange(ch: ClickHouseClient, scope: OutputFactsScope): Promise<FactsRange> {
+/**
+ * The scope's last recorded facts span (for a pass that cannot compute one, a partial read) and
+ * its highest state version (so the next pass's versions are strictly greater, even within one ms).
+ */
+export async function previousOutputFactsState(ch: ClickHouseClient, scope: OutputFactsScope): Promise<{ range: FactsRange; version: number }> {
   // Aliases must not shadow the columns: WHERE would then name the aggregate (code 184).
-  const rows = await ch.select<{ lo: string | null; hi: string | null; n: string | number }>(
-    `SELECT toString(min(min_ts)) AS lo, toString(max(max_ts)) AS hi, count() AS n FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
-      WHERE ${scopeWhere} AND source = {source:String} AND isNotNull(min_ts) AND isNotNull(max_ts)`,
+  const rows = await ch.select<{ lo: string | null; hi: string | null; n: string | number; v: string | number }>(
+    `SELECT toString(minIf(min_ts, isNotNull(min_ts))) AS lo, toString(maxIf(max_ts, isNotNull(max_ts))) AS hi,
+            countIf(isNotNull(min_ts) AND isNotNull(max_ts)) AS n, max(version) AS v
+       FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
+      WHERE ${scopeWhere} AND source = {source:String}`,
     { params: { org: scope.orgId, workspace: scope.workspaceId, sessions: scope.sessionIds, source: scope.harness }, timeoutMs: 20_000 },
   );
   const r = rows[0];
-  return r && Number(r.n) > 0 && r.lo && r.hi ? { min: r.lo, max: r.hi } : null;
+  return { range: r && Number(r.n) > 0 && r.lo && r.hi ? { min: r.lo, max: r.hi } : null, version: Number(r?.v ?? 0) };
+}
+
+/** A pass's base version: even, at least 2 x its ms, and above every earlier state of the scope. */
+export function passVersion(at: Date, previous: number): number {
+  const base = Math.max(at.getTime() * 2, previous + 1);
+  return base % 2 === 0 ? base : base + 1;
 }
 
 /**
- * The phase of a pass's state write. Within one pass (`at`), `pending` (written BEFORE the
+ * The phase of a pass's state write. Within one pass (`base`), `pending` (written BEFORE the
  * ClickHouse insert/delete) sorts below `final`, so a pass that dies between its fact writes
  * and its final state leaves the scope incomplete, never a torn reconcile read as complete.
  */
@@ -463,13 +478,15 @@ export async function recordOutputFactsState(
   at: Date,
   range: FactsRange,
   phase: StatePhase = "final",
+  /** The pass's base version (passVersion); pending = base, final = base + 1. */
+  base = at.getTime() * 2,
 ): Promise<void> {
   const synced = at.toISOString().replace("T", " ").replace("Z", "");
   await ch.insert(OUTPUT_FACTS_SESSION_STATE_TABLE, scope.sessionIds.map((session_id) => ({
     org_id: scope.orgId, workspace_id: scope.workspaceId, source: scope.harness, session_id,
     complete: complete && phase === "final" ? 1 : 0, synced_at: synced,
     min_ts: range?.min ?? null, max_ts: range?.max ?? null,
-    version: at.getTime() * 2 + (phase === "final" ? 1 : 0),
+    version: base + (phase === "final" ? 1 : 0),
   })));
 }
 

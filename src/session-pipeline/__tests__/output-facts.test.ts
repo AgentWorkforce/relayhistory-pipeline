@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createClickHouseClient, type ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import { EVENT_FACTS_TABLE, OUTPUT_FACTS_TABLE, outputFactsSchemaStatements } from "../output-facts-schema.ts";
 import {
-  branchOf, chTime, commitMatches, eraseOutputFacts, normalizeStats, outputFactsFromScope, reconcileOutputFacts,
+  branchOf, chTime, commitMatches, eraseOutputFacts, normalizeStats, outputFactsFromScope, passVersion, reconcileOutputFacts,
   type OutputFactsScope,
 } from "../output-facts.ts";
 import { OutputScopeError, readSessionOutput } from "../../session-read-api/output-query.ts";
@@ -120,6 +120,23 @@ describe("outputFactsFromScope", () => {
   test("an incomplete scope read stays incomplete", () => {
     expect(outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, { ...outputFixture(), complete: false }, 1).complete).toBe(false);
   });
+  test("P2 canonical split: every fact kind is keyed by the canonical session id and the harness", () => {
+    const keys = new Set([...facts.events, ...facts.facts].map((f) => `${"scope_source" in f ? f.scope_source : f.source}/${f.session_id}`));
+    expect([...keys]).toEqual(["codex/s1-canonical"]);
+    // Except a legacy turn's `source`, which is its STORED source (relayhistory's NOT EXISTS
+    // compares that); its scope_source is still the harness.
+    expect(kinds("message").every((f) => f.source === "codex" && f.session_id === "s1-canonical")).toBe(true);
+  });
+  test("P3: fingerprints are the full sha256", () => {
+    for (const f of [...facts.events, ...facts.facts]) expect(f.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+  });
+  test("P3: passVersion is even, at least 2 x ms, and strictly above the previous state", () => {
+    const at = new Date(1_000);
+    expect(passVersion(at, 0)).toBe(2_000);
+    expect(passVersion(at, 2_001)).toBe(2_002);
+    expect(passVersion(at, 2_002)).toBe(2_004);
+    expect(passVersion(at, 2_003)).toBe(2_004);
+  });
   test("row ids are stable across versions, so a re-pass changes nothing", () => {
     const again = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, outputFixture(), 2);
     expect(again.facts.map((f) => [f.row_id, f.fingerprint])).toEqual(facts.facts.map((f) => [f.row_id, f.fingerprint]));
@@ -197,6 +214,27 @@ suite("output facts on ClickHouse: reconcile and query", () => {
     expect(out.commits).toBe(3);
     expect(out.linesAdded).toBe(5 + 2 + 1);
   }, 60_000);
+
+  test("P2 canonical split: a per-session read by the canonical id sees every fact kind", async () => {
+    await reconcileOutputFacts(ch, scope, outputFactsFromScope(scope, outputFixture(), 4), limits);
+    const one = await readSessionOutput(ch, { orgId: scope.orgId, workspaceIds: [scope.workspaceId] }, { source: "codex", sessionId: "s1-canonical" });
+    expect(one).toEqual({ agentMessages: 3, commits: 3, linesAdded: 13, linesRemoved: 4, commitsWithoutLineCounts: 0 });
+    // Nothing is stored under the events' own (alias) session id.
+    const alias = await readSessionOutput(ch, { orgId: scope.orgId, workspaceIds: [scope.workspaceId] }, { source: "codex", sessionId: "s1" });
+    expect(alias.commits + alias.agentMessages).toBe(0);
+  });
+
+  test("P2 source key: events projected under a THIRD session id are written once, never re-inserted, and erased", async () => {
+    const fx = outputFixture();
+    fx.projectionRows = fx.projectionRows.map((r) => (r.table === "convergence_events" ? { ...r, row: { ...r.row, session_id: "s1-third" } } : r));
+    const first = await reconcileOutputFacts(ch, scope, outputFactsFromScope(scope, fx, 5), limits);
+    const again = await reconcileOutputFacts(ch, scope, outputFactsFromScope(scope, fx, 6), limits);
+    expect(again.inserted).toBe(0);
+    expect(first.complete && again.complete).toBe(true);
+    await eraseOutputFacts(ch, scope);
+    expect(await count(EVENT_FACTS_TABLE)).toBe(0);
+    await reconcileOutputFacts(ch, scope, outputFactsFromScope(scope, outputFixture(), 7), limits);
+  });
 
   test("erasure removes the scope from both tables", async () => {
     await eraseOutputFacts(ch, scope);
