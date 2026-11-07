@@ -118,20 +118,29 @@ export class EraserIdentityRefused extends Error {
   }
 }
 
+/** The authentication method the deployed eraser login uses (pinned): system_user must be `<method>:bulls96_privacy_eraser`. */
+export const ERASER_AUTH_METHOD = "scram-sha-256";
+
 /**
  * The Supabase eraser must run as bulls96_privacy_eraser and nothing stronger: never a superuser, a BYPASSRLS role,
  * the owner of the privacy tables, or a member of that owner (a compromised eraser would otherwise hold the
- * destructive S3 key AND an owner credential). Checked at startup, before any sweep, for BOTH the session identity
- * (the login) and the effective role: an elevated login that ran SET ROLE bulls96_privacy_eraser keeps its
- * credential (RESET ROLE restores it), so the login itself must be the eraser role and no role substitution is allowed.
+ * destructive S3 key AND an owner credential). Checked at startup, before any sweep:
+ *  - system_user (PostgreSQL 16+), the AUTHENTICATED identity, which neither SET ROLE nor SET SESSION AUTHORIZATION
+ *    (nor a startup `options=-c session_authorization=...`) can rewrite, must be exactly
+ *    `${ERASER_AUTH_METHOD}:bulls96_privacy_eraser`; servers without system_user are refused (unverifiable);
+ *  - session_user and current_user must both be bulls96_privacy_eraser (no SET ROLE substitution);
+ *  - superuser / BYPASSRLS / owner membership are refused for the session identity and the effective role.
  */
-export async function assertEraserIdentity(db: Queryable): Promise<void> {
+export async function assertEraserIdentity(db: Queryable, opts: { authMethod?: string } = {}): Promise<void> {
+  const method = opts.authMethod ?? ERASER_AUTH_METHOD;
+  const v = (await db.query<{ n: number }>("SELECT current_setting('server_version_num')::int AS n")).rows[0]?.n;
+  if (typeof v !== "number" || v < 160000) throw new EraserIdentityRefused("eraser_identity_unverifiable_server");
   const r = (await db.query<{
-    session_who: string; who: string;
+    system_who: string | null; session_who: string; who: string;
     session_super: boolean; session_bypass: boolean; session_owner_member: boolean;
     super: boolean; bypass: boolean; owner_member: boolean;
   }>(
-    `SELECT session_user::text AS session_who, current_user::text AS who,
+    `SELECT system_user::text AS system_who, session_user::text AS session_who, current_user::text AS who,
             s.rolsuper AS session_super, s.rolbypassrls AS session_bypass, pg_has_role(session_user, c.relowner, 'MEMBER') AS session_owner_member,
             e.rolsuper AS super, e.rolbypassrls AS bypass, pg_has_role(current_user, c.relowner, 'MEMBER') AS owner_member
        FROM pg_roles s, pg_roles e, pg_class c
@@ -139,6 +148,7 @@ export async function assertEraserIdentity(db: Queryable): Promise<void> {
         AND c.oid = 'sessions.ingest_frozen_source_deletions'::regclass`,
   )).rows[0];
   if (!r) throw new EraserIdentityRefused("eraser_identity_unknown");
+  if (r.system_who !== `${method}:bulls96_privacy_eraser`) throw new EraserIdentityRefused("eraser_identity_not_authenticated_as_privacy_eraser");
   if (r.session_super || r.super) throw new EraserIdentityRefused("eraser_identity_superuser");
   if (r.session_bypass || r.bypass) throw new EraserIdentityRefused("eraser_identity_bypassrls");
   if (r.session_owner_member || r.owner_member) throw new EraserIdentityRefused("eraser_identity_owner");

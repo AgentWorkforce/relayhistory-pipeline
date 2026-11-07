@@ -156,6 +156,11 @@ describe("credentials only through stdin (RAM)", () => {
     expect(code(() => authorityUrl("neon", "postgres://u@ep-x.us-east-2.aws.neon.tech:6543/db"))).toBe("database_url_transaction_pooler");
     expect(authorityUrl("supabase", "postgres://u@aws-0.pooler.supabase.com:5432/postgres")).toContain(":5432");
     expect(code(() => authorityUrl("supabase", "https://example.com"))).toBe("credentials_invalid.databaseUrl");
+    // Startup-parameter overrides are refused pre-connect (options=-c session_authorization=... forges the identity).
+    expect(code(() => authorityUrl("supabase", "postgres://postgres@db.ref.supabase.co:5432/postgres?options=-c%20session_authorization%3Dbulls96_privacy_eraser"))).toBe("database_url_startup_parameter_refused.options");
+    expect(code(() => authorityUrl("supabase", "postgres://u@db.ref.supabase.co:5432/postgres?application_name=x"))).toBe("database_url_startup_parameter_refused.application_name");
+    expect(authorityUrl("supabase", "postgres://u@db.ref.supabase.co:5432/postgres?sslmode=verify-full")).toContain("sslmode=verify-full");
+    for (const k of ["PGOPTIONS", "PGUSER", "PGPASSFILE", "PGSERVICE"]) expect(code(() => refuseCredentialEnv({ [k]: "" }))).toBe(`credential_env_refused.${k}`);
     const e = (m: Record<string, string>) => (k: string, d?: string) => m[k] ?? d;
     expect(code(() => eraserFor(true, undefined, e({ S3X_BUCKET: "b", S3X_EXPECT_BUCKET: "b" })))).toContain("stdin eraser credentials are required");
     expect(code(() => eraserFor(true, { accessKeyId: "A", secretAccessKey: "S" }, e({ S3X_BUCKET: "b", S3X_EXPECT_BUCKET: "c" })))).toContain("write guard");
@@ -375,13 +380,13 @@ describe("supabase eraser covers post-cutover sessions (review P0) and runs leas
     expect(Array.isArray(await a.fencedGroups())).toBe(true);
     expect(Array.isArray(await a.fencedLivePage(null))).toBe(true);
     // A superuser session that SET ROLE to the eraser role is refused: the login keeps its credential.
-    expect(await assertEraserIdentity(w.asEraser).then(() => "ok", (e) => e.code)).toBe("eraser_identity_superuser");
+    expect(await assertEraserIdentity(w.asEraser).then(() => "ok", (e) => e.code)).toMatch(/^eraser_identity_(not_authenticated_as_privacy_eraser|superuser)$/);
     for (const t of ["sessions.ingest_frozen_source_deletions", "sessions.upload_deletions", "sessions.ingest_privacy_authority", "sessions.ingest_frozen_source_records"])
       expect(await w.asEraser.query(`SELECT 1 FROM ${t} LIMIT 1`).then(() => "read", (e) => String(e.message))).toContain("permission denied");
     for (const fn of ["sessions.ingest_privacy_authority_state()", "sessions.ingest_privacy_authority_owned_digest()"])
       expect(await w.asEraser.query(`SELECT ${fn}`).then(() => "ran", (e) => String(e.message))).toContain("permission denied");
     // The fixture's own connection is a superuser (the owner): refused.
-    expect(await assertEraserIdentity(w.f.queryable).then(() => "ok", (e) => e.code)).toBe("eraser_identity_superuser");
+    expect(await assertEraserIdentity(w.f.queryable).then(() => "ok", (e) => e.code)).toMatch(/^eraser_identity_(not_authenticated_as_privacy_eraser|superuser)$/);
     // The generated verifier accepts the bare role exactly as provisioned.
     await w.f.db.exec(readFileSync(new URL("../../../supabase/bootstrap/privacy_eraser_verify.sql", import.meta.url), "utf8"));
   }, 60_000);

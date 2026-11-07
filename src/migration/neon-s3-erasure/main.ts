@@ -27,7 +27,7 @@ import type { Queryable } from "../relayhistory-export.ts";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode } from "../neon-s3-sync/sync.ts";
-import { readStdinCredentials, refuseCredentialEnv, s3Credentials, sessionAffinityUrl, type S3Credentials } from "../stdin-credentials.ts";
+import { eraserDatabaseUrl, readStdinCredentials, refuseCredentialEnv, s3Credentials, type S3Credentials } from "../stdin-credentials.ts";
 import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
 import { createS3Eraser, type Eraser } from "./eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "./job.ts";
@@ -63,7 +63,8 @@ export function authorityKind(raw: string | undefined): ErasureAuthorityKind {
 /** The authority database URL, refused when it cannot hold this job's session-level read-only settings. */
 export function authorityUrl(kind: ErasureAuthorityKind, raw: unknown): string {
   // Session-level read-only settings must stick: the shared guard refuses known transaction poolers pre-connect.
-  return sessionAffinityUrl(raw, "databaseUrl", kind);
+  // No startup-parameter overrides (options=-c session_authorization=... would forge the eraser identity).
+  return eraserDatabaseUrl(raw, "databaseUrl", kind);
 }
 
 export async function main() {

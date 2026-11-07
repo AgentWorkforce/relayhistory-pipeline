@@ -83,7 +83,11 @@ lock may stay held on the original backend until that session ends: rerun on a d
 8. **Eraser:** run it as the least-privilege login `bulls96_privacy_eraser`, never an owner, superuser or BYPASSRLS URL. Steps:
    - make the role LOGIN with `supabase/bootstrap/privacy_eraser_role.sql` (explicit apply OK; password from 1Password, in memory);
    - run `supabase/bootstrap/privacy_eraser_verify.sql` before and after;
-   - check the eraser starts: it refuses any other identity at startup.
+   - check the eraser starts: it refuses any other identity at startup. It requires PostgreSQL 16+ and an
+     AUTHENTICATED login: `system_user` must be exactly `scram-sha-256:bulls96_privacy_eraser` (pinned method), so the
+     role needs a password (1Password) and SCRAM auth. `session_user` and `current_user` must also be the eraser role.
+     SET ROLE, SET SESSION AUTHORIZATION, a superuser/owner/BYPASSRLS login, any `options=` or other URL startup
+     parameter (only `sslmode` is allowed) and `PGOPTIONS`/`PGUSER`/`PGPASSFILE`/`PGSERVICE` are refused.
 
    The role can call only `ingest_privacy_eraser_{state,groups,page,still_fenced}`, which read the deduplicated union
    of the frozen-source deletions and the target's `upload_deletions`. That union covers both Neon-era and post-cutover
