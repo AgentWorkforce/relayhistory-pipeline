@@ -178,7 +178,8 @@ export async function applyBackfill(
      * REQUIRED: the ONE shared strict, paged, resumable eraser (createS3Eraser / storeEraser,
      * src/migration/neon-s3-erasure/eraser.ts). The bucket is versioned: there is no plain-DELETE
      * fallback, and the backfill refuses to run without it. A fence-lost write is cleaned up by
-     * its exact version id (eraseStep + a fresh strict verifyErased), never a successor's.
+     * its OWN acked version id by the sweeper (reconcileObligation, exactKey), never a successor's;
+     * the backfill itself never erases (no caller bypasses the shared reserve).
      */
     eraser: PagedEraser;
     /** The PUT's hard deadline (default ANALYSIS_PUT_TIMEOUT_MS, well inside the ticket lease). */
