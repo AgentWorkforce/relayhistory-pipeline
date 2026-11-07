@@ -311,7 +311,7 @@ describe("E3 on the strict shared eraser (fail closed, retried)", () => {
     const state = new SyncState(join(await tmp(), "s.sqlite"));
     const logs: Record<string, unknown>[] = [];
     const job = new ErasureJob(db, state, s.eraser(), (l: Record<string, unknown>) => { logs.push(l); }, DEFAULT_ERASURE_CONFIG, later, async () => {});
-    return { job, codes: () => logs.map((l) => l.error_code).filter(Boolean), done: async () => { state.close(); await pg.close(); } };
+    return { job, logs: () => logs, codes: () => logs.map((l) => l.error_code).filter(Boolean), done: async () => { state.close(); await pg.close(); } };
   };
   const live = (s: import("./fake-s3-versions.ts").FakeS3Versions) => [...WORKER_KEYS, POINTER].filter((k) => s.keys.has(k));
   const old = Date.now() - 60 * 60 * 1000;
@@ -352,11 +352,12 @@ describe("E3 on the strict shared eraser (fail closed, retried)", () => {
     for (const k of [...WORKER_KEYS, POINTER]) s.put(k, old);
     const neighbour = `96bulls/org-1/v1/ws=ws_1/m=${M}/h=claude/d=2026/10/30/s=sess_big/raw/`;
     for (let i = 0; i <= 10_000; i++) s.put(`${neighbour}${String(i).padStart(6, "0")}.ndjson.zst`, old);
-    const { job, codes, done } = await s3Job(s);
+    const { job, codes, logs, done } = await s3Job(s);
     for (let i = 0; i < 4; i++) await job.sweep();
     expect(WORKER_KEYS.filter((k) => s.keys.has(k))).toEqual([]); // the session's objects are gone
     expect(s.keys.has(POINTER)).toBe(true); // not proven yet: the pointer stays (retried)
-    expect(codes()).toContain("erasure_verify_pending"); // and operators see why
+    expect(codes()).toContain("erasure_verify_pending"); // and operators see why: the primitive's own reason
+    expect(logs().filter((l) => l.error_code === "erasure_verify_pending").map((l) => l.reason)).toContain("budget");
     expect(s.deletes.some((d) => d.startsWith(neighbour))).toBe(false);
     expect(s.count(neighbour)).toBe(10_001);
     for (const k of [...s.keys.keys()]) if (k.startsWith(neighbour)) s.keys.delete(k);

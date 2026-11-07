@@ -127,7 +127,7 @@ export class ErasureJob {
    */
   async #erasePaged(prefix: string, scope: string, select: ((v: ListedVersion) => boolean) | undefined, authorize: () => Promise<void>,
     keyFilter: (key: string) => boolean = () => true, exporterWritten = false, exactKey?: string,
-    lease?: { prefix: string; holder: string; gen: string }): Promise<{ status: PagedOutcome; deleted: number; remaining: number; rev: number }> {
+    lease?: { prefix: string; holder: string; gen: string }): Promise<{ status: PagedOutcome; deleted: number; remaining: number; rev: number; proofReason?: string }> {
     const exact = exactKey !== undefined ? { exactKey } : {};
     // S3X_OBLIGATIONS off: the SAME strict canonical paged eraser (no permissive fallback), without the obligation
     // protocol (no reservations, invocations, retirement or genesis gate): done = a fresh strict zero inventory.
@@ -193,7 +193,7 @@ export class ErasureJob {
       const proof = await this.eraser.verifyErased(prefix, { ...(select ? { select } : {}), authorize, budget: budget(), now: this.now, ...exact });
       if (proof.status !== "erased") {
         this.counters.unverified += 1;
-        return { status: "unverified", deleted: step.deleted, remaining: -1, rev };
+        return { status: "unverified", deleted: step.deleted, remaining: -1, rev, proofReason: proof.reason };
       }
       return { status: "erased", deleted: step.deleted, remaining: 0, rev };
     }
@@ -236,7 +236,7 @@ export class ErasureJob {
     }
     if (proof.status !== "erased") {
       this.counters.unverified += 1;
-      return { status: "unverified", deleted: step.deleted, remaining, rev };
+      return { status: "unverified", deleted: step.deleted, remaining, rev, proofReason: proof.reason };
     }
     // Retire EXACTLY the reserved versions this complete inventory shows absent (within keyFilter); every other
     // reservation (kept siblings, successors, other subsets) stays.
@@ -567,9 +567,10 @@ export class ErasureJob {
           this.counters.liveVersionsDeleted += r.deleted;
           // incomplete: resumes from the checkpoint; unverified / unresolved / refused: the next sweep traverses again.
           if (r.status === "unverified")
-            // Visible to operators: the session's objects may be gone, but its pointer waits for a strict proof (e.g. the
-            // verification budget is exhausted by > 10k kept versions sharing the machine prefix). Never claimed.
-            this.log({ message: "live erasure unverified", error_code: "erasure_verify_pending", reason: "budget_or_remaining",
+            // Observability only (NOT a completion, NOT a waiver): the session is NOT complete; its pointer waits for a
+            // fresh strict proof. `reason` is the primitive's own pending reason: "budget" (the verification budget ran
+            // out, e.g. > 10k kept versions share the machine prefix) or "remaining" (selected versions are still listed).
+            this.log({ message: "live erasure unverified", error_code: "erasure_verify_pending", reason: r.proofReason ?? "unknown",
               org_id: g.org_id, workspace_id: g.workspace_id, user_id: g.user_id, origin_id: g.origin_id, source: g.source, session_id: g.session_id });
           if (r.status !== "erased") continue;
           // The pointer last, through the same gate (versions newer than the re-read kept).
