@@ -126,8 +126,18 @@ As built:
 - Identity deletes go by `row_id`, the sha256 of the identity.
 - `session_output_facts.scope_source` carries the harness, so that a legacy turn whose stored `source` differs is still erased with its scope.
 - Facts cover the whole scope, not the transcript_events window.
-- Every pass with the flag on records the scope in `output_facts_session_state` (complete or not). That table is separate from the search `needs_full`, so a facts problem never degrades transcript search. The Output route answers 501 `output_session_partial` while any session of the workspace is incomplete there or `needs_full`, so it never serves a stale count.
-- Turning `SEARCH_INDEX_OUTPUT_FACTS` off again stops fact erasure. Before doing so, turn the Output route off and drop or truncate the fact tables. The upload-erasure path (C3/#289) must also purge both fact tables.
+- **Facts state.** Every pass with the flag on records the scope in `output_facts_session_state`, complete or not, with the facts' time span. The table is separate from the search `needs_full`, so a facts problem never degrades transcript search.
+  - The state is written **pending (complete=0) before** the ClickHouse insert/delete, and final after. A pass that dies mid-reconcile therefore leaves the scope incomplete, never complete over torn facts. Version = 2 × pass ms + phase.
+  - A malformed legacy record or timestamp marks the facts inexact; it never throws out of the pass.
+- **Route readiness** (`outputWindowReadiness`) is positive and window-scoped:
+  - `output_backfill_incomplete`: no watermark row.
+  - `output_before_watermark`: `since` is earlier than `complete_since`.
+  - `output_session_partial`: an inexact session whose span overlaps the window. An unknown span overlaps every window.
+  - `output_session_unindexed`: a session with transcript events in the window but no complete facts-state row. A missing row is never read as complete.
+  - Sessions entirely outside the window never block it.
+- **Erasure** purges the fact tables whenever they exist, **independent of the flag**, so turning the producer off never leaves an erased session's facts behind. The S3 tombstone → `indexSearchScope` erasure pass covers the upload-erase path too: C3/#289 tombstones the pointers, and this pass purges ClickHouse.
+- **Schema guard.** With the flag on but the DDL absent, or an older skeleton (which `CREATE TABLE IF NOT EXISTS` never alters), nothing is written. The pass reports `output_facts_schema_missing`, and search is unaffected.
+- **Residual.** A session that has no transcript rows in the window (e.g. older than the transcript window) and no facts at all is invisible to the readiness check. The backfill watermark covers it: the backfill marks a workspace only after every live scope has a state row.
 
 `session_outcomes` dedup across exported copies: the Neon key is `(org, workspace, source, session, commit_sha)`, and the export carries the row as it stands (strongest method already applied), so the indexer needs no merge rule. `row_key` = the sha.
 

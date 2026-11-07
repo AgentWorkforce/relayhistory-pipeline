@@ -19,6 +19,7 @@
  */
 import type { ClickHouseClient, QueryParams } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { OUTPUT_FACTS_SESSION_STATE_TABLE, OUTPUT_FACTS_STATE_TABLE, OUTPUT_FACTS_TABLE } from "../session-pipeline/output-facts-schema.ts";
+import { EVENTS_TABLE } from "../session-pipeline/vendor/search-index/schema.ts";
 
 export interface SessionOutput {
   agentMessages: number;
@@ -153,17 +154,50 @@ export async function outputCompleteSince(
   return rows[0]?.complete_since ?? null;
 }
 
-/** Sessions of the workspace whose last facts pass was not exact (output_facts_session_state). */
-export async function incompleteOutputSessions(
+export type OutputReadiness = "ready" | "backfill_incomplete" | "before_watermark" | "session_partial" | "session_unindexed";
+
+/**
+ * Whether the facts answer [since, until] exactly for this workspace. Positive, window-scoped:
+ *   backfill_incomplete  no backfill watermark row for the workspace
+ *   before_watermark     `since` is earlier than the watermark's complete_since
+ *   session_partial      a session whose last facts pass was inexact, and whose facts span
+ *                        overlaps the window (an unknown span overlaps every window)
+ *   session_unindexed    a session with transcript events in the window but NO complete facts
+ *                        state row: a missing row is never read as complete
+ * Sessions entirely outside the window never block it.
+ */
+export async function outputWindowReadiness(
   ch: ClickHouseClient,
   orgId: string,
   workspaceId: string,
+  since: Date,
+  until: Date,
   opts: { timeoutMs?: number; settings?: Record<string, string | number> } = {},
-): Promise<number> {
-  const rows = await ch.select<{ n: string | number }>(
-    `SELECT count() AS n FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
-      WHERE org_id = {org:String} AND workspace_id = {workspace:String} AND complete = 0`,
-    { params: { org: orgId, workspace: workspaceId }, timeoutMs: opts.timeoutMs ?? 3_000, ...(opts.settings ? { settings: opts.settings } : {}) },
-  );
-  return Number(rows[0]?.n ?? 0);
+): Promise<OutputReadiness> {
+  const base = { org: orgId, workspace: workspaceId, since: chInstant(since), until: chInstant(until) };
+  const o = { params: base, timeoutMs: opts.timeoutMs ?? 3_000, ...(opts.settings ? { settings: opts.settings } : {}) };
+  const watermark = await outputCompleteSince(ch, orgId, workspaceId, opts);
+  if (!watermark) return "backfill_incomplete";
+  if (Date.parse(`${watermark.replace(" ", "T")}Z`) > since.getTime()) return "before_watermark";
+  const [[partial], [unindexed]] = await Promise.all([
+    ch.select<{ n: string | number }>(
+      `SELECT count() AS n FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
+        WHERE org_id = {org:String} AND workspace_id = {workspace:String} AND complete = 0
+          AND (isNull(min_ts) OR (max_ts >= toDateTime64({since:String}, 6, 'UTC') AND min_ts <= toDateTime64({until:String}, 6, 'UTC')))`,
+      o,
+    ),
+    ch.select<{ n: string | number }>(
+      `SELECT count() AS n FROM (
+         SELECT DISTINCT session_id, source FROM ${EVENTS_TABLE} FINAL
+          WHERE org_id = {org:String} AND workspace_id = {workspace:String}
+            AND ts >= toDateTime64({since:String}, 6, 'UTC') AND ts <= toDateTime64({until:String}, 6, 'UTC'))
+        WHERE (session_id, source) NOT IN (
+         SELECT session_id, source FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
+          WHERE org_id = {org:String} AND workspace_id = {workspace:String} AND complete = 1)`,
+      o,
+    ),
+  ]);
+  if (Number(partial?.n ?? 0) > 0) return "session_partial";
+  if (Number(unindexed?.n ?? 0) > 0) return "session_unindexed";
+  return "ready";
 }

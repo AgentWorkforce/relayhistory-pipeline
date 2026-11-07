@@ -100,6 +100,23 @@ describe("outputFactsFromScope", () => {
     expect(f.complete).toBe(false);
     expect(f.reasons).toContain("output_facts_legacy_invalid");
   });
+  test("P1-c: a bad legacy or event timestamp marks the facts inexact and never throws", () => {
+    const fx = outputFixture();
+    const outcome = fx.records.find((r) => r.kind === "legacy_session_outcome")!;
+    const { created_at: _c, ...noCreated } = outcome.payload!;
+    fx.records = [{ ...outcome, payload: { ...noCreated, shipped_at: null } }];
+    let f!: ReturnType<typeof outputFactsFromScope>;
+    expect(() => (f = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, fx, 1))).not.toThrow();
+    expect(f.complete).toBe(false);
+    const ev = outputFixture();
+    ev.projectionRows[0] = { ...ev.projectionRows[0]!, row: { ...ev.projectionRows[0]!.row, ts: "not a time" } };
+    expect(() => (f = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, ev, 1))).not.toThrow();
+    expect(f.complete).toBe(false);
+    expect(f.reasons).toContain("output_facts_invalid_time");
+  });
+  test("the facts span covers every fact (events, links, outcomes, legacy turns)", () => {
+    expect(outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, outputFixture(), 1).range).toEqual({ min: "2026-11-05 08:00:00.000000", max: "2026-11-05 12:00:00.000000" });
+  });
   test("an incomplete scope read stays incomplete", () => {
     expect(outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, { ...outputFixture(), complete: false }, 1).complete).toBe(false);
   });

@@ -75,6 +75,8 @@ export interface OutputFacts {
   /** False when a source could not be read exactly: the reconcile then never deletes. */
   complete: boolean;
   reasons: string[];
+  /** The facts' time span (ClickHouse DateTime64(6) text); null when the scope has none. */
+  range?: { min: string; max: string } | null;
 }
 
 /** Postgres `->>` on a jsonb value: strings as is, scalars as text, objects as JSON, null/absent as NULL. */
@@ -327,28 +329,37 @@ export function outputFactsFromScope(
     reasons.push(error instanceof Error && error.message.startsWith("output_facts_") ? error.message : "output_facts_projection_invalid");
   }
 
-  const legacy = legacyAndTurns(read.records, scope);
-  if (!legacy.ok) { complete = false; reasons.push("output_facts_legacy_invalid"); }
-  for (const { table, row } of legacy.rows) {
-    if (table === "session_outcomes") {
-      const sha = String(row.commit_sha).toLowerCase();
-      const at = jtext(row.shipped_at) ?? String(row.created_at);
-      const ts = chTime(at);
-      const stats = normalizeStats(row.numstat_json);
-      pushFact({ fact_kind: "commit", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: sha, origin: "outcome", row_key: sha, ...stats, reverted: 0 });
-      pushFact({ fact_kind: "outcome", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: sha, origin: "", row_key: sha, added: null, removed: null, reverted: row.reverted === true ? 1 : 0 });
-    } else if (table === "conversation_turns") {
-      const content = typeof row.content === "string" ? row.content : "";
-      if (row.role !== "assistant" || btrimSpaces(content) === "") continue;
-      // NOT EXISTS (… m.source = t.source …) compares the STORED turn source.
-      const stored = jtext(row.legacy_stored_source) ?? jtext(row.source) ?? scope.harness;
-      const at = String(row.ts);
-      const ts = chTime(at);
-      const key = jtext(row.id) ?? JSON.stringify([row.workspace_id, stored, Number(row.turn_index)]);
-      pushFact({ fact_kind: "legacy_turn_message", ts, source: stored, session_id: scope.canonicalId, fact_key: key, origin: "", row_key: key, added: null, removed: null, reverted: 0 });
+  // Legacy outcomes/turns are contained like the projection: a malformed record (a missing
+  // timestamp, an unparseable clock) marks the facts inexact; it never throws out of the pass,
+  // which would abort indexSearchScope after its transcript writes.
+  try {
+    const legacy = legacyAndTurns(read.records, scope);
+    if (!legacy.ok) { complete = false; reasons.push("output_facts_legacy_invalid"); }
+    for (const { table, row } of legacy.rows) {
+      if (table === "session_outcomes") {
+        const sha = String(row.commit_sha).toLowerCase();
+        const at = jtext(row.shipped_at) ?? String(row.created_at);
+        const ts = chTime(at);
+        const stats = normalizeStats(row.numstat_json);
+        pushFact({ fact_kind: "commit", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: sha, origin: "outcome", row_key: sha, ...stats, reverted: 0 });
+        pushFact({ fact_kind: "outcome", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: sha, origin: "", row_key: sha, added: null, removed: null, reverted: row.reverted === true ? 1 : 0 });
+      } else if (table === "conversation_turns") {
+        const content = typeof row.content === "string" ? row.content : "";
+        if (row.role !== "assistant" || btrimSpaces(content) === "") continue;
+        // NOT EXISTS (… m.source = t.source …) compares the STORED turn source.
+        const stored = jtext(row.legacy_stored_source) ?? jtext(row.source) ?? scope.harness;
+        const at = String(row.ts);
+        const ts = chTime(at);
+        const key = jtext(row.id) ?? JSON.stringify([row.workspace_id, stored, Number(row.turn_index)]);
+        pushFact({ fact_kind: "legacy_turn_message", ts, source: stored, session_id: scope.canonicalId, fact_key: key, origin: "", row_key: key, added: null, removed: null, reverted: 0 });
+      }
     }
+  } catch (error) {
+    complete = false;
+    reasons.push(error instanceof Error && error.message.startsWith("output_facts_") ? error.message : "output_facts_legacy_invalid");
   }
-  return { events: eventRows, facts, complete, reasons: [...new Set(reasons)] };
+  const times = [...eventRows.map((r) => r.ts), ...facts.map((f) => f.ts)].sort();
+  return { events: eventRows, facts, complete, reasons: [...new Set(reasons)], range: times.length ? { min: times[0]!, max: times.at(-1)! } : null };
 }
 
 export interface ReconcileOutputFactsResult {
@@ -413,12 +424,74 @@ export async function reconcileOutputFacts(
  * per session id of the scope. Written on every pass with the flag on, complete or not, and
  * by erasure (complete: nothing is owed).
  */
-export async function recordOutputFactsState(ch: ClickHouseClient, scope: OutputFactsScope, complete: boolean, at: Date): Promise<void> {
+export type FactsRange = { min: string; max: string } | null;
+
+/** The scope's last recorded facts span, for a pass that cannot compute one (a partial read). */
+export async function previousOutputFactsRange(ch: ClickHouseClient, scope: OutputFactsScope): Promise<FactsRange> {
+  const rows = await ch.select<{ min_ts: string | null; max_ts: string | null }>(
+    `SELECT toString(min(min_ts)) AS min_ts, toString(max(max_ts)) AS max_ts FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
+      WHERE ${scopeWhere} AND source = {source:String} AND isNotNull(min_ts)`,
+    { params: { org: scope.orgId, workspace: scope.workspaceId, sessions: scope.sessionIds, source: scope.harness }, timeoutMs: 20_000 },
+  );
+  const r = rows[0];
+  return r?.min_ts && r.max_ts && !r.min_ts.startsWith("1970") ? { min: r.min_ts, max: r.max_ts } : null;
+}
+
+/**
+ * The phase of a pass's state write. Within one pass (`at`), `pending` (written BEFORE the
+ * ClickHouse insert/delete) sorts below `final`, so a pass that dies between its fact writes
+ * and its final state leaves the scope incomplete, never a torn reconcile read as complete.
+ */
+export type StatePhase = "pending" | "final";
+
+export async function recordOutputFactsState(
+  ch: ClickHouseClient,
+  scope: OutputFactsScope,
+  complete: boolean,
+  at: Date,
+  range: FactsRange,
+  phase: StatePhase = "final",
+): Promise<void> {
   const synced = at.toISOString().replace("T", " ").replace("Z", "");
   await ch.insert(OUTPUT_FACTS_SESSION_STATE_TABLE, scope.sessionIds.map((session_id) => ({
     org_id: scope.orgId, workspace_id: scope.workspaceId, source: scope.harness, session_id,
-    complete: complete ? 1 : 0, synced_at: synced, version: at.getTime(),
+    complete: complete && phase === "final" ? 1 : 0, synced_at: synced,
+    min_ts: range?.min ?? null, max_ts: range?.max ?? null,
+    version: at.getTime() * 2 + (phase === "final" ? 1 : 0),
   })));
+}
+
+/** Columns each output-facts table must have before anything writes or reads it. */
+const REQUIRED_COLUMNS: Record<string, readonly string[]> = {
+  [EVENT_FACTS_TABLE]: ["row_id", "task_ref_empty", "files_touched", "fingerprint", "version"],
+  [OUTPUT_FACTS_TABLE]: ["row_id", "scope_source", "fact_kind", "origin", "fingerprint", "version"],
+  [OUTPUT_FACTS_SESSION_STATE_TABLE]: ["complete", "min_ts", "max_ts", "version"],
+};
+const schemaProbes = new WeakMap<ClickHouseClient, { at: number; ready: boolean; present: boolean }>();
+
+/**
+ * Whether the owner-applied output-facts DDL is present (`present`: any fact table exists, so
+ * erasure must purge it) and complete at this producer's schema (`ready`: every table with every
+ * required column, so a pass may write). An older skeleton (CREATE TABLE IF NOT EXISTS never
+ * alters it) is present but not ready. Cached for a minute per client.
+ */
+export async function outputFactsSchema(ch: ClickHouseClient, now = Date.now()): Promise<{ ready: boolean; present: boolean }> {
+  const cached = schemaProbes.get(ch);
+  if (cached && now - cached.at < 60_000) return cached;
+  const rows = await ch.select<{ table: string; name: string }>(
+    `SELECT table, name FROM system.columns WHERE database = currentDatabase() AND table IN {tables:Array(String)}`,
+    { params: { tables: Object.keys(REQUIRED_COLUMNS) }, timeoutMs: 10_000 },
+  );
+  const have = new Map<string, Set<string>>();
+  for (const r of rows) have.set(r.table, (have.get(r.table) ?? new Set()).add(r.name));
+  const ready = Object.entries(REQUIRED_COLUMNS).every(([t, cols]) => cols.every((c) => have.get(t)?.has(c)));
+  const probe = { at: now, ready, present: have.has(EVENT_FACTS_TABLE) || have.has(OUTPUT_FACTS_TABLE) };
+  schemaProbes.set(ch, probe);
+  return probe;
+}
+/** Tests: forget a client's cached probe. */
+export function resetOutputFactsSchemaProbe(ch: ClickHouseClient): void {
+  schemaProbes.delete(ch);
 }
 
 /** Erasure: no live pointer is left, so every fact of the scope goes. */

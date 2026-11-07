@@ -10,7 +10,7 @@ import type { ClickHouseClient } from "../../session-pipeline/vendor/search-inde
 import { OUTPUT_FACTS_SESSION_STATE_TABLE, OUTPUT_FACTS_STATE_TABLE, outputFactsSchemaStatements } from "../../session-pipeline/output-facts-schema.ts";
 import { outputFactsFromScope, reconcileOutputFacts } from "../../session-pipeline/output-facts.ts";
 import { outputFixture, OUTPUT_FIXTURE_SCOPE } from "../../session-pipeline/__tests__/output-facts-fixture.ts";
-import { SESSION_STATE_TABLE } from "../../session-pipeline/vendor/search-index/schema.ts";
+import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../../session-pipeline/vendor/search-index/schema.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: OUTPUT_FIXTURE_SCOPE.orgId, workspaceId: OUTPUT_FIXTURE_SCOPE.workspaceId, scopes: ["rth:read"] };
 const WS = OUTPUT_FIXTURE_SCOPE.workspaceId;
@@ -77,50 +77,64 @@ describe("output route: validation and gates (no ClickHouse reached)", () => {
 const suite = CH_URL ? describe : describe.skip;
 suite("output route on ClickHouse", () => {
   let ch: ClickHouseClient & { drop(): Promise<void> };
+  const get = () => api(ch, { workspaces: "*" });
+  const reason = async (path = `/v1/sessions/output?workspace=${WS}&${DAY}`) => {
+    const r = await get()(path);
+    return r.status === 200 ? 200 : (await body(r)).error.reason;
+  };
+  const watermark = (since: string, version: number) =>
+    ch.insert(OUTPUT_FACTS_STATE_TABLE, [{ org_id: ID.orgId, workspace_id: WS, complete_since: since, marked_at: "2026-11-06 00:00:00.000", marked_by: "test", version }]);
+  const state = (session: string, complete: number, version: number, min: string | null, max: string | null) =>
+    ch.insert(OUTPUT_FACTS_SESSION_STATE_TABLE, [{ org_id: ID.orgId, workspace_id: WS, source: "codex", session_id: session, complete, synced_at: "2026-11-06 00:00:00.000", min_ts: min, max_ts: max, version }]);
+  const transcript = (session: string, ts: string) =>
+    ch.insert(EVENTS_TABLE, [{ org_id: ID.orgId, workspace_id: WS, session_id: session, source: "codex", machine_id: "m1", kind: "session_event", event_id: `x-${session}-${ts}`, ts, fingerprint: "f", version: 1 }]);
   beforeAll(async () => {
     ch = await freshClickHouse();
     for (const s of outputFactsSchemaStatements()) await ch.command(s);
     await reconcileOutputFacts(ch, OUTPUT_FIXTURE_SCOPE, outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, outputFixture(), 1), { maxRows: 10_000, insertBatch: 500 });
+    await state("s1", 1, 1, "2026-11-05 08:00:00.000000", "2026-11-05 12:00:00.000000");
+    await transcript("s1", "2026-11-05 10:00:00.000");
   }, 60_000);
   afterAll(async () => {
     await ch?.drop();
   }, 60_000);
 
-  test("501 output_backfill_incomplete until the watermark exists, then the exact body", async () => {
-    const get = api(ch, { workspaces: "*" });
-    const before = await get(`/v1/sessions/output?workspace=${WS}&${DAY}`);
-    expect(before.status).toBe(501);
-    expect((await body(before)).error.reason).toBe("output_backfill_incomplete");
-    await ch.insert(OUTPUT_FACTS_STATE_TABLE, [{ org_id: ID.orgId, workspace_id: WS, complete_since: "2026-11-06 00:00:00.000000", marked_at: "2026-11-06 00:00:00.000", marked_by: "test", version: 1 }]);
-    const r = await get(`/v1/sessions/output?workspace=${WS}&${DAY}`);
+  test("watermark: none = backfill_incomplete; later than since = before_watermark; at or before since serves", async () => {
+    expect(await reason()).toBe("output_backfill_incomplete");
+    await watermark("2026-11-05 00:00:00.000001", 1);
+    expect(await reason()).toBe("output_before_watermark");
+    await watermark("2026-11-01 00:00:00.000000", 2);
+    const r = await get()(`/v1/sessions/output?workspace=${WS}&${DAY}`);
     expect(r.status).toBe(200);
     expect(r.headers.get("x-relayhistory-workspace-id")).toBe(WS);
     const b = await body(r);
     expect(Object.keys(b).sort()).toEqual(["correlationId", "output", "since", "until"]);
-    expect(b.since).toBe("2026-11-05T00:00:00.000Z");
     expect(b.output).toEqual({ agentMessages: 3, commits: 3, linesAdded: 13, linesRemoved: 4, commitsWithoutLineCounts: 0 });
   }, 60_000);
 
-  test("a session whose facts pass was inexact is 501 output_session_partial; complete again serves", async () => {
-    const get = api(ch, { workspaces: "*" });
-    const state = (complete: number, version: number) => ch.insert(OUTPUT_FACTS_SESSION_STATE_TABLE, [{ org_id: ID.orgId, workspace_id: WS, source: "codex", session_id: "s1", complete, synced_at: "2026-11-06 00:00:00.000", version }]);
-    await state(0, 1);
-    const r = await get(`/v1/sessions/output?workspace=${WS}&${DAY}`);
-    expect(r.status).toBe(501);
-    expect((await body(r)).error.reason).toBe("output_session_partial");
-    await state(1, 2);
-    expect((await get(`/v1/sessions/output?workspace=${WS}&${DAY}`)).status).toBe(200);
+  test("P1-a: a session with transcript in the window, needs_full=0, and NO facts-state row is 501, never omitted", async () => {
+    await transcript("s-unindexed", "2026-11-05 15:00:00.000");
+    await ch.insert(SESSION_STATE_TABLE, [{ org_id: ID.orgId, session_id: "s-unindexed", revision: 1, synced_at: "2026-11-06 00:00:00.000", full_synced_at: "2026-11-06 00:00:00.000", scanned_rows: 1, needs_full: 0 }]);
+    expect(await reason()).toBe("output_session_unindexed");
+    // Outside that session's transcript, the window is unaffected.
+    expect(await reason(`/v1/sessions/output?workspace=${WS}&since=2026-11-05T09:00:00Z&until=2026-11-05T11:00:00Z`)).toBe(200);
+    await state("s-unindexed", 1, 1, "2026-11-05 15:00:00.000000", "2026-11-05 15:00:00.000000");
+    expect(await reason()).toBe(200);
   }, 60_000);
 
-  test("a needs_full session in the workspace is 501 output_session_partial", async () => {
-    // The vendored state table: the session has rows in this workspace's transcript_events.
-    await ch.insert("transcript_events", [{
-      org_id: ID.orgId, workspace_id: WS, session_id: "s1", source: "codex", machine_id: "m1", kind: "session_event", event_id: "x",
-      ts: "2026-11-05 10:00:00.000", fingerprint: "f", version: 1,
-    }]);
-    await ch.insert(SESSION_STATE_TABLE, [{ org_id: ID.orgId, session_id: "s1", revision: 1, synced_at: "2026-11-06 00:00:00.000", full_synced_at: "1970-01-01 00:00:00.000", scanned_rows: 0, needs_full: 1 }]);
-    const r = await api(ch, { workspaces: "*" })(`/v1/sessions/output?workspace=${WS}&${DAY}`);
-    expect(r.status).toBe(501);
-    expect((await body(r)).error.reason).toBe("output_session_partial");
+  test("P1-b: an inexact session blocks only windows its facts span overlaps; an unknown span blocks all", async () => {
+    await state("s-old", 0, 1, "2026-10-01 00:00:00.000000", "2026-10-02 00:00:00.000000");
+    expect(await reason()).toBe(200);
+    expect(await reason(`/v1/sessions/output?workspace=${WS}&since=2026-11-01T12:00:00Z&until=2026-11-05T23:59:59Z`)).toBe(200);
+    await state("s-old", 1, 2, "2026-10-01 00:00:00.000000", "2026-10-02 00:00:00.000000");
+    await watermark("2026-09-01 00:00:00.000000", 3);
+    await state("s-old2", 0, 1, "2026-10-01 00:00:00.000000", "2026-10-02 00:00:00.000000");
+    expect(await reason(`/v1/sessions/output?workspace=${WS}&since=2026-10-01T12:00:00Z&until=2026-11-05T23:59:59Z`)).toBe("output_session_partial");
+    expect(await reason()).toBe(200);
+    await state("s-unknown", 0, 1, null, null);
+    expect(await reason()).toBe("output_session_partial");
+    await state("s-unknown", 1, 2, null, null);
+    await state("s-old2", 1, 2, "2026-10-01 00:00:00.000000", "2026-10-02 00:00:00.000000");
+    expect(await reason()).toBe(200);
   }, 60_000);
 });

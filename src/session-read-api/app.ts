@@ -51,7 +51,7 @@ import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
-import { incompleteOutputSessions, outputCompleteSince, readSessionOutput } from "./output-query.ts";
+import { outputWindowReadiness, readSessionOutput } from "./output-query.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
@@ -589,8 +589,10 @@ export function createReadApi(deps: ReadApiDeps) {
    * order. Then the canary allowlist, and a 501 for every case not answerable exactly:
    *   output_not_configured      READ_API_OUTPUT_ENABLED is off
    *   output_backfill_incomplete no backfill watermark for the workspace yet
-   *   output_session_partial     a session of the workspace has inexact facts (facts state), or is
-   *                              `needs_full` for search (its facts were not rewritten)
+   *   output_before_watermark    `since` is earlier than the watermark's complete_since
+   *   output_session_partial     a session whose facts are inexact and whose span overlaps the window
+   *   output_session_unindexed   a session with transcript events in the window and no complete
+   *                              facts state (output-query.ts outputWindowReadiness)
    */
   app.get("/v1/sessions/output", async (c) => {
     try {
@@ -612,10 +614,8 @@ export function createReadApi(deps: ReadApiDeps) {
       const ch = deps.ch;
       if (!deps.output || !ch) throw unsupported("output_not_configured");
       const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
-      if (!(await outputCompleteSince(ch, identity.orgId, identity.workspaceId, opts))) throw unsupported("output_backfill_incomplete");
-      const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
-      if (partials.overflow || partials.sessions.length > 0) throw unsupported("output_session_partial");
-      if ((await incompleteOutputSessions(ch, identity.orgId, identity.workspaceId, opts)) > 0) throw unsupported("output_session_partial");
+      const readiness = await outputWindowReadiness(ch, identity.orgId, identity.workspaceId, since, until, opts);
+      if (readiness !== "ready") throw unsupported(`output_${readiness}`);
       const output = await readSessionOutput(ch, { orgId: identity.orgId, workspaceIds: [identity.workspaceId] }, { since, until }, opts);
       log({ route: c.req.routePath, reason: "output_served", correlation_id: c.get("correlationId") });
       return c.json({ since: since.toISOString(), until: until.toISOString(), output, correlationId: c.get("correlationId") });

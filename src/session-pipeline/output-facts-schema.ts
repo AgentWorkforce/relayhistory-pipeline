@@ -45,7 +45,7 @@ export const OUTPUT_FACTS_STATE_TABLE = "output_facts_workspace_state";
 /** Per-session facts state, written by every producer pass (output-facts.ts). */
 export const OUTPUT_FACTS_SESSION_STATE_TABLE = "output_facts_session_state";
 
-export const OUTPUT_FACTS_SCHEMA_VERSION = 2;
+export const OUTPUT_FACTS_SCHEMA_VERSION = 3;
 
 /** `session_output_facts.fact_kind` values. */
 export const OUTPUT_FACT_KINDS = ["message", "legacy_turn_message", "commit", "outcome"] as const;
@@ -148,7 +148,8 @@ SETTINGS index_granularity = 1024`,
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY (org_id, workspace_id)`,
-    // One row per indexed scope: complete = 0 when its last pass could not write exact
+    // One row per indexed scope (version = 2 * pass ms + phase, so a pass's final row beats its
+    // pending row): complete = 0 when its last pass could not write exact
     // facts (incomplete read, invalid legacy evidence, truncation). Kept apart from the
     // search state (needs_full) so a facts problem never degrades transcript search.
     // The Output route answers 501 while any session of the workspace is incomplete.
@@ -160,6 +161,10 @@ ORDER BY (org_id, workspace_id)`,
     session_id     String,
     complete       UInt8,
     synced_at      DateTime64(3, 'UTC'),
+    -- The scope's facts span; the Output route blocks only windows it overlaps. NULL =
+    -- unknown (no pass has computed it yet), which blocks every window.
+    min_ts         Nullable(DateTime64(6, 'UTC')),
+    max_ts         Nullable(DateTime64(6, 'UTC')),
     version        UInt64
 )
 ENGINE = ReplacingMergeTree(version)
