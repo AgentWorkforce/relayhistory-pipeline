@@ -27,7 +27,7 @@ import type { Queryable } from "../relayhistory-export.ts";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode } from "../neon-s3-sync/sync.ts";
-import { eraserDatabaseUrl, readStdinCredentials, refuseCredentialEnv, s3Credentials, type S3Credentials } from "../stdin-credentials.ts";
+import { eraserDatabaseUrl, pinnedPgClient, readStdinCredentials, refuseCredentialEnv, s3Credentials, type S3Credentials } from "../stdin-credentials.ts";
 import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
 import { createS3Eraser, type Eraser } from "./eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "./job.ts";
@@ -78,7 +78,8 @@ export async function main() {
   delete creds.eraser;
   const state = new SyncState(env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!);
   const { default: pg } = await import("pg");
-  const client = new pg.Client({ connectionString: url, application_name: `96bulls-${kind}-s3-erasure` });
+  // The password is pinned from the stdin URL: pg can never fall back to ~/.pgpass (a credential on disk).
+  const client = pinnedPgClient(pg, url, "databaseUrl", { application_name: `96bulls-${kind}-s3-erasure` });
   await client.connect();
   let stop = false;
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => void (stop = true));

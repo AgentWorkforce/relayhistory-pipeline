@@ -4,7 +4,8 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import pg from "pg";
-import { readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sqlLedger } from "../ledger-sql.ts";
 import { deliverBatch } from "../deliver.ts";
@@ -13,6 +14,17 @@ import { TENANT, batch, record, scratchStore } from "./support.ts";
 import { epoch, generation, identity, baseline, INDEX_SQL, fakeNeonDdl } from "./privacy-authority-support.ts";
 import { activate, census, fence, syncOwned } from "../../migration/privacy-authority-handoff.ts";
 import { assertEraserIdentity, supabaseAuthority } from "../../migration/neon-s3-erasure/authority.ts";
+import { authorityUrl } from "../../migration/neon-s3-erasure/main.ts";
+import { pinnedPgClient } from "../../migration/stdin-credentials.ts";
+
+const errCode = (fn: () => unknown): string | null => {
+  try {
+    fn();
+    return null;
+  } catch (e) {
+    return (e as { code?: string }).code ?? "thrown";
+  }
+};
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 const root = join(import.meta.dir, "../../..");
@@ -462,5 +474,51 @@ describe.skipIf(!url)("C3 privacy authority on actual PostgreSQL", () => {
     const viaRole = await client({ connectionString: su.href });
     await viaRole.c.query("SET ROLE bulls96_privacy_eraser");
     expect(await assertEraserIdentity(viaRole.q).then(() => "ok", (e) => e.code)).toBe("eraser_identity_not_authenticated_as_privacy_eraser");
+  }, 30_000);
+
+  test("P2 on real PG: a password-less eraser URL would log in from ~/.pgpass; the stdin guard refuses it before connect", async () => {
+    const d = await database();
+    await d.owner("ingest_privacy_authority_fence", { controlEpoch: epoch });
+    await d.activateEmpty();
+    await d.pool.query(readFileSync(join(root, "supabase/bootstrap/privacy_eraser_role.sql"), "utf8"));
+    await d.pool.query("ALTER ROLE bulls96_privacy_eraser PASSWORD 'c3-test-only-synthetic'");
+    cleanup.push(async () => {
+      await d.pool.query("ALTER ROLE bulls96_privacy_eraser NOLOGIN PASSWORD NULL; ALTER ROLE bulls96_privacy_eraser RESET ALL").catch(() => undefined);
+    });
+    const u = new URL(d.url);
+    u.username = "bulls96_privacy_eraser";
+    u.password = "";
+    const passwordless = u.href;
+    // A temp HOME with a 0600 .pgpass for the synthetic eraser role; PGPASSFILE / PGPASSWORD unset.
+    const home = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "c3-pgpass-"));
+    writeFileSync(join(home, ".pgpass"), `${u.hostname}:${u.port || 5432}:*:bulls96_privacy_eraser:c3-test-only-synthetic\n`, { mode: 0o600 });
+    const saved = { HOME: process.env.HOME, PGPASSFILE: process.env.PGPASSFILE, PGPASSWORD: process.env.PGPASSWORD };
+    process.env.HOME = home;
+    delete process.env.PGPASSFILE;
+    delete process.env.PGPASSWORD;
+    try {
+      // The vector is real: plain pg authenticates the password-less URL from the file (a genuine SCRAM login).
+      const raw = new pg.Client({ connectionString: passwordless });
+      await raw.connect();
+      try {
+        expect((await raw.query("SELECT system_user::text AS s")).rows[0].s).toBe("scram-sha-256:bulls96_privacy_eraser");
+      } finally {
+        await raw.end();
+      }
+      // The E3 job's guards refuse it by name, before any connection.
+      expect(errCode(() => authorityUrl("supabase", passwordless))).toBe("database_url_password_required");
+      expect(errCode(() => pinnedPgClient(pg, passwordless, "databaseUrl"))).toBe("database_url_password_required");
+      // And the pinned client for the real stdin URL logs in with exactly that password.
+      const ok = pinnedPgClient(pg, new URL(d.url).href.replace(/\/\/[^@]*@/, "//bulls96_privacy_eraser:c3-test-only-synthetic@"), "databaseUrl");
+      await ok.connect();
+      try {
+        expect((await ok.query("SELECT system_user::text AS s")).rows[0].s).toBe("scram-sha-256:bulls96_privacy_eraser");
+      } finally {
+        await ok.end();
+      }
+    } finally {
+      for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      rmSync(home, { recursive: true, force: true });
+    }
   }, 30_000);
 });

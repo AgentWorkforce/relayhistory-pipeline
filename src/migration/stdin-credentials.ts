@@ -145,7 +145,41 @@ export function sessionAffinityUrl(v: unknown, name: string, provider: "supabase
   const prefix = name.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase()); // supabaseUrl -> supabase_url
   if (provider === "neon" && /-pooler\./.test(u.hostname)) throw new CredentialRefusal(`${prefix}_pooler`);
   if (u.port === "6543" || /^(true|1)$/i.test(u.searchParams.get("pgbouncer") ?? "")) throw new CredentialRefusal(`${prefix}_transaction_pooler`);
+  requireUrlIdentity(u, prefix);
   return url;
+}
+
+/**
+ * The URL itself must carry the whole identity: an explicit user, a NON-EMPTY password and a TCP host, all refused
+ * before any connection. Otherwise node-postgres fills the gap from outside RAM: with a null or empty password it
+ * reads ~/.pgpass through its bundled pgpass module (a credential ON DISK, and a genuine login that would pass every
+ * identity check), with no user it uses the OS login name, and with no host (or a `host=` query parameter) it uses
+ * PGHOST or a local socket. Pair this with pinnedPgClient, which also pins the password in the client config.
+ */
+export function requireUrlIdentity(u: URL, prefix: string): void {
+  if (!u.username) throw new CredentialRefusal(`${prefix}_user_required`);
+  if (!u.password) throw new CredentialRefusal(`${prefix}_password_required`);
+  if (!u.hostname || u.searchParams.has("host") || u.searchParams.has("hostaddr")) throw new CredentialRefusal(`${prefix}_host_required`);
+}
+
+/** The minimal node-postgres surface pinnedPgClient needs (kept structural so tests can pass a real or fake `pg`). */
+interface PgLike<C> {
+  Client: new (config: Record<string, unknown>) => C;
+}
+
+/**
+ * A pg Client for a URL that passed requireUrlIdentity, with the password PINNED from that URL (RAM). pg's
+ * pgpass fallback runs only when the resolved password is null, so the constructed client is checked too: if
+ * its password is not exactly the URL's (non-empty) password, it is refused before connect().
+ */
+export function pinnedPgClient<C extends object>(pg: PgLike<C>, url: string, name: string, extra: Record<string, unknown> = {}): C {
+  const u = new URL(url);
+  const prefix = name.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
+  requireUrlIdentity(u, prefix);
+  const password = decodeURIComponent(u.password);
+  const client = new pg.Client({ ...extra, connectionString: url, password });
+  if ((client as { password?: unknown }).password !== password || !password) throw new CredentialRefusal(`${prefix}_password_not_pinned`);
+  return client;
 }
 
 /** The only connection-string parameter an eraser URL may carry: TLS mode. Everything else (notably `options`,

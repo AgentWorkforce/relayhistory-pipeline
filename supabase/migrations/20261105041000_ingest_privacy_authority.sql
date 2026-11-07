@@ -352,8 +352,13 @@ REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_release(jsonb)
 CREATE FUNCTION sessions.ingest_privacy_authority_purge_derived(p_org text,p_ws text) RETURNS void
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp AS $authority_purge_derived$
 BEGIN
+ -- Guarded, but fail-closed: a no-op only while 045000 is entirely absent. Once ANY sign of it exists (its table or
+ -- any overload of the purge), the exact (text,text) signature must exist, or the reset/disable aborts (never skips).
  IF to_regprocedure('sessions.purge_daily_digest_narratives(text,text)') IS NOT NULL THEN
   EXECUTE 'SELECT sessions.purge_daily_digest_narratives($1,$2)' USING p_org,p_ws;
+ ELSIF to_regclass('sessions.daily_digest_narratives') IS NOT NULL OR EXISTS(SELECT 1 FROM pg_proc
+   WHERE pronamespace='sessions'::regnamespace AND proname='purge_daily_digest_narratives') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: digest narrative purge ABI mismatch';
  END IF;
 END $authority_purge_derived$;
 REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_purge_derived(text,text)
@@ -362,15 +367,23 @@ REVOKE ALL ON FUNCTION sessions.ingest_privacy_authority_purge_derived(text,text
 -- Neon's set_session_uploads / reset_uploaded_sessions, over the frozen copy. Called only inside the authority begin.
 CREATE FUNCTION sessions.ingest_privacy_authority_apply(p_org text,p_ws text,p_user text,p_kind text,p_payload jsonb) RETURNS bigint
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,sessions,pg_temp AS $authority_apply$
-DECLARE v_origin text;v_enabled boolean;item jsonb;v_total bigint;v_request text;
+DECLARE v_origin text;v_enabled boolean;item jsonb;v_total bigint;v_request text;v_analysis boolean;
 BEGIN
  IF coalesce(current_setting('bulls96.privacy_authority_writer',true),'')<>'authority' THEN
   RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='frozen source: authority apply outside the authority begin';END IF;
+ -- The analysis purge ABI (046000, #292 b608ea3b), checked BEFORE any change. A no-op only while 046000 is entirely
+ -- absent; once ANY sign of it exists (its jobs table or any purge_session_analysis_for_owned overload), BOTH exact
+ -- workspace-scoped signatures must exist, or this reset/disable aborts (fail closed: it never silently skips).
+ v_analysis:=to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,text)') IS NOT NULL
+  AND to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,text,jsonb)') IS NOT NULL;
+ IF NOT v_analysis AND (to_regclass('sessions.session_analysis_jobs_v2') IS NOT NULL OR EXISTS(SELECT 1 FROM pg_proc
+   WHERE pronamespace='sessions'::regnamespace AND proname='purge_session_analysis_for_owned')) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: analysis purge ABI mismatch';END IF;
  IF p_kind='selection' THEN
   v_origin:=p_payload->>'origin_id';v_enabled:=(p_payload->>'enabled')::boolean;
   -- SP v2 analysis of exactly the disabled sessions in THIS workspace (046000's session-scoped form), BEFORE their owned/frozen rows
-  -- are removed below (it reads them). Guarded: a no-op until the analysis lane's migration is applied.
-  IF NOT v_enabled AND to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,text,jsonb)') IS NOT NULL THEN
+  -- are removed below (it reads them). v_analysis: the fail-closed ABI check above.
+  IF NOT v_enabled AND v_analysis THEN
    EXECUTE 'SELECT sessions.purge_session_analysis_for_owned($1,$2,$3,$4)' USING p_org,p_ws,p_user,p_payload->'sessions';
   END IF;
   FOR item IN SELECT value FROM jsonb_array_elements(p_payload->'sessions') LOOP
@@ -404,8 +417,8 @@ BEGIN
  INSERT INTO sessions.ingest_frozen_source_deletions
   SELECT p_org,p_ws,p_user,o.origin_id,o.source,o.session_id FROM pg_temp.pa_owned o ON CONFLICT DO NOTHING;
  -- SP v2 analysis of Neon-era sessions (046000) in THIS workspace is keyed by the user's owned set, so it is purged BEFORE that set is
- -- emptied below. Guarded like the digest purge: a no-op until the analysis lane's function exists.
- IF to_regprocedure('sessions.purge_session_analysis_for_owned(text,text,text)') IS NOT NULL THEN
+ -- emptied below. v_analysis: the fail-closed ABI check above.
+ IF v_analysis THEN
   EXECUTE 'SELECT sessions.purge_session_analysis_for_owned($1,$2,$3)' USING p_org,p_ws,p_user;
  END IF;
  DELETE FROM sessions.ingest_frozen_source_records WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user AND session_id IS NOT NULL;
