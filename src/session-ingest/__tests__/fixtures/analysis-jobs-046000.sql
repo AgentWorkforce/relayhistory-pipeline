@@ -1,5 +1,5 @@
 -- Test fixture: sessions-pipeline #292 (lane F1) supabase/migrations/20261105046000_analysis_jobs.sql, VERBATIM at
--- f7f49308 (purge_session_analysis_for_owned in both forms). The C3 authority must call these exact functions.
+-- b608ea3b (workspace-scoped purge_session_analysis_for_owned in both forms). The C3 authority must call these exact functions.
 -- Registry slot 046000 (lane F1, session ANALYSIS panel off Neon). The full-analysis
 -- request/job lifecycle that relayhistory ran on Neon (sessions.session_analysis_requests,
 -- sessions.session_analysis_jobs; RHC migrations 0015, 0016, 0024, 0031, 0043, 0062), owned
@@ -71,6 +71,9 @@ CREATE TABLE sessions.session_analysis_jobs_v2 (
   result_s3_key text CHECK (char_length(result_s3_key) BETWEEN 1 AND 1024),
   result_sha256 text CHECK (result_sha256 ~ '^[0-9a-f]{64}$'),
   result_bytes integer CHECK (result_bytes BETWEEN 1 AND 8388608),
+  -- The exact object version the publication owns (S3 x-amz-version-id; NULL on an unversioned
+  -- store): the unknown-PUT sweeper erases every OTHER version of the key, never this one.
+  result_version_id text CHECK (char_length(result_version_id) BETWEEN 1 AND 1024),
   input_tokens bigint NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
   output_tokens bigint NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
   -- A controlled code (native), or relayhistory's stored error (backfill, bounded).
@@ -132,7 +135,10 @@ CREATE TABLE sessions.session_analysis_result_tickets (
   org_id text NOT NULL,
   workspace_id text NOT NULL,
   session_id text NOT NULL,
-  reason text NOT NULL CHECK (reason IN ('publishing', 'forgotten')),
+  -- publishing: a pending write (written before the PUT, in the lease/heartbeat transaction);
+  -- unknown: the PUT was aborted, timed out or errored (it may have committed, even late);
+  -- forgotten: the write's outcome is known and its key must be erased (an erase or a purge).
+  reason text NOT NULL CHECK (reason IN ('publishing', 'forgotten', 'unknown')),
   created_at timestamptz NOT NULL DEFAULT now(),
   -- A writer's bounded lease on a 'publishing' ticket (the operator backfill heartbeats it):
   -- the sweeper never sweeps a ticket whose lease is live, and a writer whose lease lapsed
@@ -141,7 +147,18 @@ CREATE TABLE sessions.session_analysis_result_tickets (
   -- The backfill writer that holds the lease (one random id per run): a successor may take the
   -- ticket over only after the lease expired, and every fence names its own writer, so a
   -- stale writer can never mistake a successor's live lease for its own. NULL for the worker.
-  writer_token uuid
+  writer_token uuid,
+  -- The source generation the write was fenced on (worker: the claim's source revision).
+  generation text,
+  -- Unknown-outcome tickets are never retired on a timer: each clean sweep reschedules them.
+  sweeps integer NOT NULL DEFAULT 0 CHECK (sweeps >= 0),
+  next_sweep_at timestamptz,
+  -- The shared paged eraser's checkpoint (src/migration/neon-s3-erasure/eraser.ts eraseStep),
+  -- bound to the bucket, prefix and this ticket's scope digest; resumed by the next sweep.
+  erase_checkpoint jsonb,
+  -- An unowned object version (not a delete marker) was found and erased for this key: the
+  -- unknown write is accounted for, so a fresh strict zero inventory may retire the ticket.
+  stray_found boolean NOT NULL DEFAULT false
 );
 CREATE INDEX session_analysis_result_tickets_created_idx ON sessions.session_analysis_result_tickets (created_at);
 ALTER TABLE sessions.session_analysis_result_tickets ENABLE ROW LEVEL SECURITY;
@@ -362,7 +379,7 @@ BEGIN
     FROM sessions.session_analysis_jobs_v2 AS j
    WHERE j.org_id = OLD.org_id AND j.workspace_id = OLD.workspace_id AND j.session_id = ANY (v_ids)
      AND j.result_s3_key IS NOT NULL
-  ON CONFLICT (result_key) DO UPDATE SET reason = 'forgotten';
+  ON CONFLICT (result_key) DO UPDATE SET reason = CASE WHEN sessions.session_analysis_result_tickets.reason IN ('publishing', 'unknown') THEN 'unknown' ELSE 'forgotten' END;
   DELETE FROM sessions.session_analysis_requests_v2 AS r
    WHERE r.org_id = OLD.org_id AND r.workspace_id = OLD.workspace_id AND r.session_id = ANY (v_ids);
   DELETE FROM sessions.session_analysis_jobs_v2 AS j
@@ -389,8 +406,9 @@ CREATE TRIGGER session_analysis_v2_forget_deleted_directory
 -- C3 privacy purge for Neon-era sessions. Exported/backfilled sessions have no publication
 -- head in SP, so a reset or disable tombstones no pointer and the forget triggers never fire
 -- for them. Lane A's authority (041000) calls these, guarded, BEFORE it deletes the owned rows:
---   purge_session_analysis_for_owned(org, user)          reset: the user's whole owned set
---   purge_session_analysis_for_owned(org, user, sessions) disable: only the listed
+--   purge_session_analysis_for_owned(org, workspace, user)           reset: the user's owned set in
+--                                                                    that workspace (C3 resets are per workspace)
+--   purge_session_analysis_for_owned(org, workspace, user, sessions) disable: only the listed
 --     [{"source": ..., "session_id": ...}] that are in the user's owned set
 -- The owned set is ingest_frozen_source_owned_sessions UNION the user's frozen delivery records
 -- with a session (exactly the set the reset fences). Rows are matched on the owned row's org,
@@ -398,7 +416,7 @@ CREATE TRIGGER session_analysis_v2_forget_deleted_directory
 -- with the same id is untouched. Like the forget trigger, every result key is ticketed
 -- 'forgotten' for the sweeper's every-version erase before the rows are deleted. A no-op (0)
 -- when lane A's tables are absent. Returns the analysis jobs purged. Owner-only.
-CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text, p_user text, p_sessions jsonb)
+CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text, p_workspace text, p_user text, p_sessions jsonb)
 RETURNS integer LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $purge_owned$
 DECLARE
@@ -411,8 +429,9 @@ BEGIN
      AND coalesce(current_setting('bulls96.privacy_authority_writer', true), '') <> 'authority' THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'purge_session_analysis_for_owned: outside the privacy authority';
   END IF;
-  IF p_org IS NULL OR btrim(p_org) = '' OR p_user IS NULL OR btrim(p_user) = '' THEN
-    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'purge_session_analysis_for_owned: org and user are required';
+  IF p_org IS NULL OR btrim(p_org) = '' OR p_workspace IS NULL OR btrim(p_workspace) = ''
+     OR p_user IS NULL OR btrim(p_user) = '' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'purge_session_analysis_for_owned: org, workspace and user are required';
   END IF;
   IF p_sessions IS NOT NULL AND jsonb_typeof(p_sessions) <> 'array' THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'purge_session_analysis_for_owned: sessions must be a json array';
@@ -431,7 +450,7 @@ BEGIN
   INSERT INTO pg_temp.analysis_purge_owned
   SELECT DISTINCT o.org_id, o.workspace_id, o.session_id
     FROM sessions.ingest_frozen_source_owned_sessions AS o
-   WHERE o.org_id = p_org AND o.user_id = p_user
+   WHERE o.org_id = p_org AND o.workspace_id = p_workspace AND o.user_id = p_user
      AND (p_sessions IS NULL OR EXISTS (
        SELECT 1 FROM jsonb_array_elements(p_sessions) AS e(v)
         WHERE e.v ->> 'source' = o.source AND e.v ->> 'session_id' = o.session_id));
@@ -440,11 +459,11 @@ BEGIN
       INSERT INTO pg_temp.analysis_purge_owned
       SELECT DISTINCT r.org_id, r.workspace_id, r.session_id
         FROM sessions.ingest_frozen_source_records AS r
-       WHERE r.org_id = $1 AND r.user_id = $2 AND r.session_id IS NOT NULL
+       WHERE r.org_id = $1 AND r.workspace_id = $4 AND r.user_id = $2 AND r.session_id IS NOT NULL
          AND ($3::jsonb IS NULL OR EXISTS (
            SELECT 1 FROM jsonb_array_elements($3::jsonb) AS e(v)
             WHERE e.v ->> 'source' = r.source AND e.v ->> 'session_id' = r.session_id))
-    $records$ USING p_org, p_user, p_sessions;
+    $records$ USING p_org, p_user, p_sessions, p_workspace;
   END IF;
   -- Fence first (same transaction): reads hide, admission refuses and in-flight jobs cannot
   -- publish from here on, before any object is gone.
@@ -457,10 +476,13 @@ BEGIN
     JOIN (SELECT DISTINCT * FROM pg_temp.analysis_purge_owned) AS o
       ON j.org_id = o.org_id AND j.workspace_id = o.workspace_id AND j.session_id = o.session_id
    WHERE j.result_s3_key IS NOT NULL
-  ON CONFLICT (result_key) DO UPDATE SET reason = 'forgotten', lease_expires_at = NULL;
-  -- In-flight publications of these sessions (reserved, not completed): forgotten too, so no
-  -- writer can take them over and the sweeper erases whatever their bounded PUT left.
-  UPDATE sessions.session_analysis_result_tickets AS t SET reason = 'forgotten', lease_expires_at = NULL
+  ON CONFLICT (result_key) DO UPDATE SET lease_expires_at = NULL,
+    reason = CASE WHEN sessions.session_analysis_result_tickets.reason IN ('publishing', 'unknown') THEN 'unknown' ELSE 'forgotten' END;
+  -- In-flight publications of these sessions (reserved, not completed): their PUT outcome is
+  -- unknown, so they become 'unknown' (never taken over; the sweeper lists the key's versions
+  -- and keeps re-sweeping until the write is found and erased); known ones become forgotten.
+  UPDATE sessions.session_analysis_result_tickets AS t SET lease_expires_at = NULL,
+    reason = CASE WHEN t.reason IN ('publishing', 'unknown') THEN 'unknown' ELSE 'forgotten' END
     FROM (SELECT DISTINCT * FROM pg_temp.analysis_purge_owned) AS o
    WHERE t.org_id = o.org_id AND t.workspace_id = o.workspace_id AND t.session_id = o.session_id;
   DELETE FROM sessions.session_analysis_requests_v2 AS r
@@ -475,10 +497,10 @@ BEGIN
 END
 $purge_owned$;
 
-CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text, p_user text)
+CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text, p_workspace text, p_user text)
 RETURNS integer LANGUAGE sql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $purge_owned_all$
-  SELECT sessions.purge_session_analysis_for_owned(p_org, p_user, NULL::jsonb);
+  SELECT sessions.purge_session_analysis_for_owned(p_org, p_workspace, p_user, NULL::jsonb);
 $purge_owned_all$;
 
 -- relayhistory request_session_analysis_v1 (0062:413) over the v2 tables. Same outcome
@@ -682,8 +704,8 @@ $read$;
 
 REVOKE ALL ON FUNCTION sessions.session_analysis_v2_forget() FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_require_caller(text[]) FROM PUBLIC, anon, authenticated, service_role;
-REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text, jsonb) FROM PUBLIC, anon, authenticated, service_role;
-REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text, text, jsonb) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.purge_session_analysis_for_owned(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_admit_scope(text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_source_revision(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.session_analysis_neon_free(text, text, text) FROM PUBLIC, anon, authenticated, service_role;
@@ -707,8 +729,8 @@ BEGIN
   FOREACH v_fn IN ARRAY ARRAY[
     'sessions.session_analysis_v2_forget()'::regprocedure,
     'sessions.session_analysis_require_caller(text[])'::regprocedure,
-    'sessions.purge_session_analysis_for_owned(text, text, jsonb)'::regprocedure,
-    'sessions.purge_session_analysis_for_owned(text, text)'::regprocedure,
+    'sessions.purge_session_analysis_for_owned(text, text, text, jsonb)'::regprocedure,
+    'sessions.purge_session_analysis_for_owned(text, text, text)'::regprocedure,
     'sessions.session_analysis_admit_scope(text, text)'::regprocedure,
     'sessions.session_analysis_source_revision(text, text, text)'::regprocedure,
     'sessions.session_analysis_neon_free(text, text, text)'::regprocedure,
