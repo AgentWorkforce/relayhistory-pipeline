@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "at": "2026-11-07T19:39:21.771395+00:00",
+  "at": "2026-11-07T19:50:20.050539+00:00",
   "kind": "source_plan_and_readonly_fixture_evidence",
   "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
-  "readiness": "HOLD overall prerequisites; Worker compatibility accepted with explicit lead exception, publisher documented inactive conditional on no running publisher found",
+  "readiness": "HOLD overall prerequisites and expired plan/capture; Worker exception/publisher plan recorded; bounded diagnostic only",
   "files": [
     {
       "name": "generation-window.md",
@@ -27,8 +27,8 @@
     },
     {
       "name": "execution-targets.json",
-      "bytes": 6166,
-      "sha256": "b9eb6d973b90d86b9a3b9d329c1369021497f02c137cfc86f12603837a8a8918"
+      "bytes": 6625,
+      "sha256": "a284d770bf15ef2fb7f8d581602a3b5aef501e0193782275fd60767d12e3cae8"
     },
     {
       "name": "source-evidence.json",
@@ -37,8 +37,8 @@
     },
     {
       "name": "review-notes.md",
-      "bytes": 5572,
-      "sha256": "df2cd10560f690e1d37dccb2a56ac090f9607ad98aac591eef5f61fc153d8896"
+      "bytes": 6388,
+      "sha256": "c29383251ce9f89f66e2213dab23b892a47379f69a45681a8c675c805eb64f57"
     },
     {
       "name": "supporting-readiness.md",
@@ -129,6 +129,31 @@
       "name": "worker-shared-delta-tests.log",
       "bytes": 6575,
       "sha256": "766e7e2d649df9384274695a9bff84293ebd1e4c46763c2e69c678e58af1ce07"
+    },
+    {
+      "name": "brian-aggregate-v2-result.json",
+      "bytes": 1916,
+      "sha256": "e54a299c17781ad0b63150d8cd57fb98ec4be7313314b5ec2ab5f09b1236cb32"
+    },
+    {
+      "name": "brian-aggregate-attempt-receipt.json",
+      "bytes": 1132,
+      "sha256": "431b29a4d420f42592266e371c423f8fb54f57e916203970c909c5f2ee288b4d"
+    },
+    {
+      "name": "brian-ingest-aggregate-snapshot-v2.sql.txt",
+      "bytes": 4158,
+      "sha256": "8930e4cfc0497aa4eb56b20add752f8eaa60fadd6c00ee53068a38ee1b4ae3cf"
+    },
+    {
+      "name": "brian-aggregate-v2-readonly.ts.txt",
+      "bytes": 7875,
+      "sha256": "8079a725cbc93ef0f30cd71e4ba01f5c58def43324a624d30e56b8166fddced8"
+    },
+    {
+      "name": "brian-aggregate-observation.md",
+      "bytes": 3078,
+      "sha256": "ab44f3d96e343d1ba16fea60529c9817895cfc8ab9932555651cbd17f6ee1457"
     }
   ]
 }
