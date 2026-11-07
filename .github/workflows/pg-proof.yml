@@ -221,6 +221,122 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test src/session-pipeline/__tests__/brief-documents.postgres.test.ts
+  ingest-postgres:
+    # The session-ingest publication suite (including the managed-canary guard fixture,
+    # src/session-ingest/__tests__/fixtures/publication-canary-guard.sql) and the
+    # frontier-plan capture on real PostgreSQL. Both describe.skipIf() without their
+    # connection env, so each step also fails when anything was skipped.
+    name: ingest publication and frontier PostgreSQL ${{ matrix.pg }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          # Disposable container: trust auth means no credential exists anywhere.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      NO_COLOR: "1"
+      # The MinIO digest pinned in versions.lock.json and stacks/local/topology.ts.
+      FRONTIER_MINIO_IMAGE: cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7
+      FRONTIER_MINIO_NAME: frontier-minio-${{ github.run_id }}-${{ github.run_attempt }}-pg${{ matrix.pg }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED), PostgreSQL ${{ matrix.pg }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Publication admission and canary guard on real PostgreSQL
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          set -o pipefail
+          log=publication-pg${{ matrix.pg }}.log
+          bun test src/session-ingest/__tests__/publication.postgres.test.ts 2>&1 | tee "$log"
+          # A green run must have executed tests, not skipped them.
+          grep -Eq '^ *[1-9][0-9]* pass$' "$log"
+          if grep -Eq '^ *[1-9][0-9]* skip$' "$log"; then echo "tests were skipped"; exit 1; fi
+          grep -E '^ *[0-9]+ (pass|fail)$' "$log" | tr -s ' ' | paste -sd, | sed "s/^/publication PostgreSQL ${{ matrix.pg }}:/" >> "$GITHUB_STEP_SUMMARY"
+      # MinIO needs a command (server /data), which job services cannot pass, so it runs
+      # here: loopback-only, random host port, tmpfs data, throwaway per-run credentials
+      # that live only in this step's environment. The cleanup step removes it.
+      - name: Frontier-plan capture on real PostgreSQL and versioned MinIO
+        env:
+          FRONTIER_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+          FRONTIER_TEST_S3_BUCKET: frontier-plan-fixture
+        run: |
+          set -euo pipefail
+          FRONTIER_TEST_S3_ACCESS_KEY="frontier-$(openssl rand -hex 6)"
+          FRONTIER_TEST_S3_SECRET_KEY="$(openssl rand -hex 24)"
+          echo "::add-mask::$FRONTIER_TEST_S3_SECRET_KEY"
+          export FRONTIER_TEST_S3_ACCESS_KEY FRONTIER_TEST_S3_SECRET_KEY
+          MINIO_ROOT_USER="$FRONTIER_TEST_S3_ACCESS_KEY" MINIO_ROOT_PASSWORD="$FRONTIER_TEST_S3_SECRET_KEY" \
+            docker run -d --name "$FRONTIER_MINIO_NAME" -p 127.0.0.1::9000 --tmpfs /data:rw,mode=1777 \
+            -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD -e MINIO_BROWSER=off \
+            "$FRONTIER_MINIO_IMAGE" server /data --address :9000 \
+            < /dev/null > /dev/null
+          hostport="$(docker port "$FRONTIER_MINIO_NAME" 9000/tcp | grep '^127\.0\.0\.1:' | head -1)"
+          export FRONTIER_TEST_S3_ENDPOINT="http://$hostport"
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS -o /dev/null "$FRONTIER_TEST_S3_ENDPOINT/minio/health/ready"; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != 1 ]; then docker logs "$FRONTIER_MINIO_NAME"; exit 1; fi
+          # Create the bucket and enable versioning with the repository's own SigV4 signer.
+          bun -e '
+            import { signRequest } from "./packages/object-store/src/sigv4.ts";
+            import { createHash } from "node:crypto";
+            const env = process.env;
+            const credentials = { accessKeyId: env.FRONTIER_TEST_S3_ACCESS_KEY, secretAccessKey: env.FRONTIER_TEST_S3_SECRET_KEY };
+            const s3 = async (method, suffix, body = "") => {
+              const url = new URL(`${env.FRONTIER_TEST_S3_ENDPOINT}/${env.FRONTIER_TEST_S3_BUCKET}${suffix}`);
+              const headers = new Headers({ "content-type": "application/xml" });
+              await signRequest({ method, url, headers, payloadSha256: createHash("sha256").update(body).digest("hex"), region: "us-east-1", credentials });
+              const response = await fetch(url, { method, headers, ...(body ? { body } : {}), signal: AbortSignal.timeout(10_000) });
+              if (!response.ok) throw new Error(`fixture_s3 ${method} ${suffix} ${response.status} ${await response.text()}`);
+            };
+            await s3("PUT", "");
+            await s3("PUT", "?versioning", `<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>`);
+          '
+          log=frontier-plan-pg${{ matrix.pg }}.log
+          bun test src/session-ingest/__tests__/frontier-plan.postgres.test.ts 2>&1 | tee "$log"
+          grep -Eq '^ *[1-9][0-9]* pass$' "$log"
+          if grep -Eq '^ *[1-9][0-9]* skip$' "$log"; then echo "tests were skipped"; exit 1; fi
+          grep -E '^ *[0-9]+ (pass|fail)$' "$log" | tr -s ' ' | paste -sd, | sed "s/^/frontier-plan PostgreSQL ${{ matrix.pg }}:/" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove the MinIO fixture
+        if: always()
+        run: docker rm -f "$FRONTIER_MINIO_NAME" >/dev/null 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ingest-postgres-pg${{ matrix.pg }}
+          path: |
+            publication-pg${{ matrix.pg }}.log
+            frontier-plan-pg${{ matrix.pg }}.log
+          if-no-files-found: ignore
+
   consumer-lease:
     name: canonical consumer lease proof (PG ${{ matrix.pg }})
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
