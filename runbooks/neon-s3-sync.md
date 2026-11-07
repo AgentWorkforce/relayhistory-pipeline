@@ -66,8 +66,8 @@ holds only the eraser key ("sessions-prod transcript eraser").
     of the item's own org, with the session leased.
   - It logs `erasure SLA at risk` once the oldest queued item is older than 24 h.
 - **Strict inventory: fail closed** (lead ruling C3 on #294; shipped unflagged as
-  destructive-operation safety hardening). Since #309 the erasure job erases ONLY
-  through the shared strict paged eraser (`eraseStep` / `verifyErased`,
+  destructive-operation safety hardening, NOT gated by any Babysitter flag). Since
+  #309 the erasure job erases ONLY through the shared strict paged eraser (`eraseStep` / `verifyErased`,
   `src/migration/neon-s3-erasure/eraser.ts`), in both `S3X_OBLIGATIONS` modes:
   - **Bounded traversal, not a refusal.** A run reads at most 10,000 versions /
     100 pages (and its step deadline), then saves a durable checkpoint and stops
@@ -80,22 +80,43 @@ holds only the eraser key ("sessions-prod transcript eraser").
     cursor; a listing body over 16 MiB) or `erasure_foreign_key` (a key outside
     the requested prefix).
   - **Post-delete refusal (deletes MAY already have happened).** A later page's
-    refusal, a failed fresh verification, or a DeleteObject error partway: the
+    refusal, `erasure_inventory_changed`, a failed fresh verification, or a
+    DeleteObject error partway: the
     earlier pages' deletes were issued and some or all may have succeeded.
     Pending here is NOT an atomic rollback: deleted versions are gone; the item
     stays pending only because zero is not yet proven.
-  - **Semantics:** a refusal is an error for that item or group only. In EITHER
-    mode, a refused (e.g. malformed) listing NEVER marks queued work done or
-    removes it; after a later-page or proof refusal the item stays incomplete.
-    The queued item (backed off), tombstone or fence stays pending and is
-    retried. OFF marks an item done after a healthy fresh strict zero inventory;
-    ON never marks an exporter item done under its unattested genesis.
-  - **Where the codes appear:** `error_code` on the job's log lines (`erasure
-    failed` with `kind` for a queued item; `fence sweep failed`, `live fence sweep
-    failed`, `live listing failed`, `live erasure failed`, `live erasure
-    unverified` for a sweep) and its counters (`failed`, `unverified`,
-    `fenceSweepFailed`, `liveFenceFailed`). The full table is in "E3 erasure:
-    strict eraser (both modes)" below.
+  - **Semantics (both kinds, both modes):** a refusal is an error for that item
+    or group only, and the item is NOT marked done: in EITHER mode a refused
+    (e.g. malformed) listing never marks queued work done or removes it, and
+    after a later-page or proof refusal the item stays incomplete. The queued
+    erasure, tombstone or fence stays pending and is retried. A fenced tombstone
+    is found again by the next sweep (every 10 min). A queued item records the
+    code in its `error` column and backs off 1, 2, 4 ... minutes, capped at one
+    hour (`erasureFailed` in `src/migration/neon-s3-sync/state.ts`), and is
+    retried after that. Other items still run. A retry lists afresh; after a
+    post-delete refusal it sees only what survived. Completion: OFF marks an item
+    done after a healthy fresh strict zero inventory; ON never marks an exporter
+    item done under its unattested genesis.
+  - **Where the S3 refusal codes appear** (`src/migration/neon-s3-erasure/job.ts`;
+    the log strings and counter names are the stable anchors): as `error_code`
+    on the job's structured log lines `live listing failed` and `live erasure
+    failed`, counted by `liveFenceFailed`, and `erasure failed` with `kind` for
+    a queued item, counted by `failed`. The erasure backlog's `failing` count
+    is the queued items whose `error` is set. `live erasure failed` can also
+    carry an authority error: the per-group `stillFenced` re-check runs inside
+    the same step, before that group's deletes. A live pointer whose strict
+    proof did not succeed this pass is logged as `live erasure unverified`
+    (`error_code` `erasure_verify_pending`, with the primitive's `reason`),
+    counted by `unverified`: the session is NOT complete (observability only).
+    The full code table is in "E3 erasure: strict eraser (both modes)" below.
+  - **Authority failures** are the lines `sweep refused: privacy authority not
+    ready` and `fence sweep failed`, counted by `fenceSweepFailed`, and `live
+    fence sweep failed`, counted by `liveFenceFailed`. The failing step made
+    no S3 call. Earlier steps of the same sweep may still have deleted: live
+    erasure runs first, and a later page follows earlier pages' deletes. Fix
+    the authority, never the inventory checks.
+  - **Either kind:** a refusal never stops the job. The oldest queued item's
+    age drives `erasure SLA at risk` after 24 h.
   - **Operator action** (the lead's ruling, verbatim): "retain the
     obligation/tombstone, investigate the inventory shape, or move to a
     separately reviewed resumable consumer. NO manual done, NO reservation
