@@ -1572,19 +1572,23 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // Later lanes roll back first and remove their own ledger rows; only then
-    // 044000 (F3 PR evidence) is the latest lane: every earlier lane down (043000..039000)
-    // refuses (55000) while it is applied, so it rolls back first.
+    // Later lanes roll back first and remove their own ledger rows. 044000 (F3 PR evidence) is
+    // the latest lane: every earlier lane down (043000..039000) refuses (55000) while it is
+    // applied, so it rolls back first.
     expect(await names()).toContain(PE);
     expect((await failure(rollback("20261105043000_brief_titles.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(H);
+    expect((await failure(rollback("20261105042000_babysitter_evidence_retention.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain("upstream:20261105042000_babysitter_evidence_retention.sql");
+    expect((await failure(rollback("20261105041000_ingest_privacy_authority.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Y);
     expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105039000_buffered_gc_single_candidate.down.sql")))?.code).toBe("55000");
     await rollback("20261105044000_pr_evidence.down.sql");
     expect(await names()).not.toContain(PE);
     expect(await relation("sessions.session_pr_evidence_state")).toBeNull();
-    // 043000 (F2 brief titles) is the latest: 042000, 041000, 040000 and 039000 all refuse
-    // (55000) while it is applied, so it rolls back first.
+    // Only then is 043000 (F2 brief titles) the latest: 042000, 041000, 040000 and 039000 all
+    // refuse (55000) while it is applied, so it rolls back first.
     expect(await names()).toContain(H);
     expect((await failure(rollback("20261105042000_babysitter_evidence_retention.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain("upstream:20261105042000_babysitter_evidence_retention.sql");

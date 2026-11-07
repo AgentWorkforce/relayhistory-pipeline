@@ -102,12 +102,19 @@ CREATE TRIGGER session_pr_evidence_after_journal AFTER INSERT ON sessions.canoni
  FOR EACH ROW EXECUTE FUNCTION sessions.session_pr_evidence_journal_changed();
 
 -- Erasure: a deleted or tombstoned logical session loses its evidence and wakeup in the same txn.
+-- Both erasure triggers first take the replay-publication row lock install_v1 holds (same scope row,
+-- same order: publication, then wakeup/state), so an erasure waits for an in-flight install and then
+-- deletes its rows, and an install that waits for an erasure finds its wakeup gone and refuses.
+-- They fire before session_replay_directory_changed (trigger name order), whose own publication
+-- upsert would take that lock only after these deletes had already run.
 CREATE FUNCTION sessions.session_pr_evidence_forget()RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $forget$
 DECLARE o record;
 BEGIN
  IF TG_OP='UPDATE'AND NEW.deleted_at IS NULL THEN RETURN NEW;END IF;
  o:=CASE WHEN TG_OP='DELETE'THEN OLD ELSE NEW END;
+ PERFORM 1 FROM sessions.session_replay_publications a WHERE a.org_id=o.org_id AND a.workspace_id=o.workspace_id AND a.harness=o.harness
+  AND a.session_id=o.session_id FOR UPDATE;
  DELETE FROM sessions.session_pr_evidence_state WHERE org_id=o.org_id AND workspace_id=o.workspace_id AND harness=o.harness AND session_id=o.session_id;
  DELETE FROM sessions.session_pr_evidence_wakeups WHERE org_id=o.org_id AND workspace_id=o.workspace_id AND harness=o.harness AND session_id=o.session_id;
  RETURN NULL;
@@ -119,6 +126,10 @@ CREATE TRIGGER session_pr_evidence_forget AFTER DELETE OR UPDATE OF deleted_at O
 CREATE FUNCTION sessions.session_pr_evidence_forget_reset()RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $reset$
 BEGIN
+ PERFORM 1 FROM sessions.session_replay_publications a JOIN(SELECT DISTINCT p.harness,coalesce(p.canonical_session_id,p.session_id)AS session_id
+   FROM sessions.session_index p WHERE p.org_id=NEW.org_id AND p.workspace_id=NEW.workspace_id AND p.user_id=NEW.user_id)x
+  ON a.harness=x.harness AND a.session_id=x.session_id
+  WHERE a.org_id=NEW.org_id AND a.workspace_id=NEW.workspace_id ORDER BY a.harness,a.session_id FOR UPDATE OF a;
  DELETE FROM sessions.session_pr_evidence_state s USING(SELECT DISTINCT p.harness,coalesce(p.canonical_session_id,p.session_id)AS session_id
    FROM sessions.session_index p WHERE p.org_id=NEW.org_id AND p.workspace_id=NEW.workspace_id AND p.user_id=NEW.user_id)x
   WHERE s.org_id=NEW.org_id AND s.workspace_id=NEW.workspace_id AND s.harness=x.harness AND s.session_id=x.session_id;

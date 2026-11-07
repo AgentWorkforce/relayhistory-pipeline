@@ -60,7 +60,10 @@ PRs in cloud-web, and cloud-web stamps the PR bodies.
 
 Erasure: deleting or tombstoning a `session_directory` row purges that scope's evidence, state
 and wakeup in the same transaction. A user's `upload_resets` row does the same for every logical
-session that user has any pointer in, even when the directory row stays. A wakeup-arming failure
+session that user has any pointer in, even when the directory row stays. Both erasure triggers
+first take the replay-publication row lock that `install_v1` holds, so an erasure waits for an
+in-flight install and then removes its rows; an install queued behind an erasure refuses
+(`lease_lost`). A wakeup-arming failure
 never fails the creator transaction (an exception handler skips it), and the bounded backfill
 recovers a lost wakeup. Retention-ready: rows carry `org_id` plus `built_at`.
 
