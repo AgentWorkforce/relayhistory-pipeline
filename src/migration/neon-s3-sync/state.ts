@@ -70,6 +70,8 @@ export class SyncState {
       CREATE TABLE IF NOT EXISTS leases (prefix TEXT PRIMARY KEY, holder TEXT NOT NULL, at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS erasure_seen (org_id TEXT NOT NULL, session_id TEXT NOT NULL, sweep INTEGER NOT NULL,
         PRIMARY KEY (org_id, session_id));
+      CREATE TABLE IF NOT EXISTS erase_checkpoints (
+        scope TEXT PRIMARY KEY, checkpoint TEXT NOT NULL, updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS truncations (
         org_id TEXT NOT NULL, session_id TEXT NOT NULL, manifest_key TEXT NOT NULL,
         strings INTEGER NOT NULL, recorded_at INTEGER NOT NULL,
@@ -310,6 +312,23 @@ export class SyncState {
   erasureDone(key: string, enqueuedAt: number) {
     // Only if not re-queued meanwhile.
     this.db.prepare("DELETE FROM erasures WHERE key = ? AND enqueued_at = ?").run(key, enqueuedAt);
+  }
+
+  /**
+   * The shared paged eraser's durable resume point (eraser.ts EraseCheckpoint), keyed by the job's scope digest
+   * (operation, authority, tenant/session or queued item identity). Progress only: a checkpoint is never proof of
+   * erasure; completion needs a fresh strict zero inventory (verifyErased).
+   */
+  eraseCheckpoint(scope: string): unknown | null {
+    const row = this.db.prepare("SELECT checkpoint FROM erase_checkpoints WHERE scope = ?").get(scope) as { checkpoint: string } | undefined;
+    return row ? JSON.parse(row.checkpoint) : null;
+  }
+  setEraseCheckpoint(scope: string, checkpoint: unknown, at = Date.now()) {
+    this.db.prepare("INSERT INTO erase_checkpoints(scope, checkpoint, updated_at) VALUES(?, ?, ?) ON CONFLICT(scope) DO UPDATE SET checkpoint = excluded.checkpoint, updated_at = excluded.updated_at")
+      .run(scope, JSON.stringify(checkpoint), at);
+  }
+  clearEraseCheckpoint(scope: string) {
+    this.db.prepare("DELETE FROM erase_checkpoints WHERE scope = ?").run(scope);
   }
 
   erasureFailed(key: string, code: string, at = Date.now()) {

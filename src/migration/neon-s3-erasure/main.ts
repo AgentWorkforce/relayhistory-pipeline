@@ -29,7 +29,7 @@ import { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode } from "../neon-s3-sync/sync.ts";
 import { eraserDatabaseUrl, pinnedPgClient, readStdinCredentials, refuseCredentialEnv, s3Credentials, type S3Credentials } from "../stdin-credentials.ts";
 import { assertEraserIdentity, neonAuthority, supabaseAuthority, type ErasureAuthorityKind } from "./authority.ts";
-import { createS3Eraser, type Eraser } from "./eraser.ts";
+import { createS3Eraser, type Eraser, type PagedEraser } from "./eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "./job.ts";
 
 const env = (k: string, d?: string) => process.env[k]?.trim() || d;
@@ -38,7 +38,7 @@ function log(fields: Record<string, unknown>) {
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), service: "neon-s3-erasure", ...fields })}\n`);
 }
 
-export function eraserFor(execute: boolean, creds: S3Credentials | undefined, e: (k: string, d?: string) => string | undefined = env): Eraser {
+export function eraserFor(execute: boolean, creds: S3Credentials | undefined, e: (k: string, d?: string) => string | undefined = env): Eraser & PagedEraser {
   if (!execute)
     return {
       eraseObject: async () => 0,
@@ -46,6 +46,9 @@ export function eraserFor(execute: boolean, creds: S3Credentials | undefined, e:
       eraseSessionAnyDate: async () => ({ deleted: 0, kept: 0 }),
       eraseObjectBefore: async () => ({ deleted: 0, kept: 0 }),
       listKeys: async () => [],
+      // A dry run never reaches a delete path (the sweep returns before erasing); refuse loudly if it ever did.
+      eraseStep: async () => { throw Object.assign(new Error("dry run: no erasure"), { code: "dry_run" }); },
+      verifyErased: async () => { throw Object.assign(new Error("dry run: no erasure"), { code: "dry_run" }); },
     };
   const bucket = e("S3X_BUCKET");
   if (!bucket || e("S3X_EXPECT_BUCKET") !== bucket) throw new Error("S3X_BUCKET must equal S3X_EXPECT_BUCKET (write guard)");
