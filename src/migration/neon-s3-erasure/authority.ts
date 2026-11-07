@@ -121,20 +121,29 @@ export class EraserIdentityRefused extends Error {
 /**
  * The Supabase eraser must run as bulls96_privacy_eraser and nothing stronger: never a superuser, a BYPASSRLS role,
  * the owner of the privacy tables, or a member of that owner (a compromised eraser would otherwise hold the
- * destructive S3 key AND an owner credential). Checked at startup, before any sweep.
+ * destructive S3 key AND an owner credential). Checked at startup, before any sweep, for BOTH the session identity
+ * (the login) and the effective role: an elevated login that ran SET ROLE bulls96_privacy_eraser keeps its
+ * credential (RESET ROLE restores it), so the login itself must be the eraser role and no role substitution is allowed.
  */
 export async function assertEraserIdentity(db: Queryable): Promise<void> {
-  const r = (await db.query<{ who: string; super: boolean; bypass: boolean; owner_member: boolean }>(
-    `SELECT current_user::text AS who, r.rolsuper AS super, r.rolbypassrls AS bypass,
-            pg_has_role(current_user, c.relowner, 'MEMBER') AS owner_member
-       FROM pg_roles r, pg_class c
-      WHERE r.rolname = current_user AND c.oid = 'sessions.ingest_frozen_source_deletions'::regclass`,
+  const r = (await db.query<{
+    session_who: string; who: string;
+    session_super: boolean; session_bypass: boolean; session_owner_member: boolean;
+    super: boolean; bypass: boolean; owner_member: boolean;
+  }>(
+    `SELECT session_user::text AS session_who, current_user::text AS who,
+            s.rolsuper AS session_super, s.rolbypassrls AS session_bypass, pg_has_role(session_user, c.relowner, 'MEMBER') AS session_owner_member,
+            e.rolsuper AS super, e.rolbypassrls AS bypass, pg_has_role(current_user, c.relowner, 'MEMBER') AS owner_member
+       FROM pg_roles s, pg_roles e, pg_class c
+      WHERE s.rolname = session_user AND e.rolname = current_user
+        AND c.oid = 'sessions.ingest_frozen_source_deletions'::regclass`,
   )).rows[0];
   if (!r) throw new EraserIdentityRefused("eraser_identity_unknown");
-  if (r.super) throw new EraserIdentityRefused("eraser_identity_superuser");
-  if (r.bypass) throw new EraserIdentityRefused("eraser_identity_bypassrls");
-  if (r.owner_member) throw new EraserIdentityRefused("eraser_identity_owner");
-  if (r.who !== "bulls96_privacy_eraser") throw new EraserIdentityRefused("eraser_identity_not_privacy_eraser");
+  if (r.session_super || r.super) throw new EraserIdentityRefused("eraser_identity_superuser");
+  if (r.session_bypass || r.bypass) throw new EraserIdentityRefused("eraser_identity_bypassrls");
+  if (r.session_owner_member || r.owner_member) throw new EraserIdentityRefused("eraser_identity_owner");
+  if (r.session_who !== r.who) throw new EraserIdentityRefused("eraser_identity_role_substituted");
+  if (r.session_who !== "bulls96_privacy_eraser") throw new EraserIdentityRefused("eraser_identity_not_privacy_eraser");
 }
 
 export function isErasureAuthority(v: unknown): v is ErasureAuthority {

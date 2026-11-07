@@ -317,7 +317,8 @@ describe("supabase eraser covers post-cutover sessions (review P0) and runs leas
       if (r.status !== 200) throw new Error("reset fence " + r.status);
       await post(app(), "/v1/custody/authority/complete", { ...control, outcome: ((await r.json()) as any).control.outcome });
     };
-    /** The eraser's own login: every statement runs as bulls96_privacy_eraser. */
+    /** A superuser session that runs every statement under SET ROLE bulls96_privacy_eraser: the role's privileges, but
+     *  NOT its login (a genuine LOGIN is exercised on real PostgreSQL in privacy-authority.postgres.test.ts). */
     const asEraser: Queryable = {
       query: async (t, p) => {
         await f.db.exec("SET ROLE bulls96_privacy_eraser");
@@ -366,14 +367,15 @@ describe("supabase eraser covers post-cutover sessions (review P0) and runs leas
     for (const k of live) expect(left).not.toContain(k);
   }, 60_000);
 
-  test("P1: the eraser login reads only through its RPCs; owner, superuser and other identities are refused", async () => {
+  test("P1: the eraser role reads only through its RPCs; owner, superuser and SET ROLE substitutes are refused", async () => {
     const w = await activeWorld();
     await w.reset("wipe-2");
     const a = supabaseAuthority(w.asEraser);
     await a.ready();
     expect(Array.isArray(await a.fencedGroups())).toBe(true);
     expect(Array.isArray(await a.fencedLivePage(null))).toBe(true);
-    await assertEraserIdentity(w.asEraser);
+    // A superuser session that SET ROLE to the eraser role is refused: the login keeps its credential.
+    expect(await assertEraserIdentity(w.asEraser).then(() => "ok", (e) => e.code)).toBe("eraser_identity_superuser");
     for (const t of ["sessions.ingest_frozen_source_deletions", "sessions.upload_deletions", "sessions.ingest_privacy_authority", "sessions.ingest_frozen_source_records"])
       expect(await w.asEraser.query(`SELECT 1 FROM ${t} LIMIT 1`).then(() => "read", (e) => String(e.message))).toContain("permission denied");
     for (const fn of ["sessions.ingest_privacy_authority_state()", "sessions.ingest_privacy_authority_owned_digest()"])

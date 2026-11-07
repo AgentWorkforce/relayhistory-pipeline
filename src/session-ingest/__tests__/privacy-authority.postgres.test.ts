@@ -12,6 +12,7 @@ import { prepareDelivery, deliveryAccount } from "../vendor/delivery/prepare.ts"
 import { TENANT, batch, record, scratchStore } from "./support.ts";
 import { epoch, generation, identity, baseline, INDEX_SQL, fakeNeonDdl } from "./privacy-authority-support.ts";
 import { activate, census, fence, syncOwned } from "../../migration/privacy-authority-handoff.ts";
+import { assertEraserIdentity, supabaseAuthority } from "../../migration/neon-s3-erasure/authority.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 const root = join(import.meta.dir, "../../..");
@@ -76,7 +77,7 @@ async function database() {
     await npool.query(fakeNeonDdl());
     return npool;
   };
-  return { pool, conn, owner, ingestLedger, activateEmpty, neon };
+  return { pool, conn, owner, ingestLedger, activateEmpty, neon, url: target.href };
 }
 
 /** Resolves once `pid` is waiting on a lock (proves the race is real, not sequential). */
@@ -408,5 +409,33 @@ describe.skipIf(!url)("C3 privacy authority on actual PostgreSQL", () => {
     expect(((await settle(e.query("SELECT sessions.ingest_privacy_authority_state()"))) as { e?: string }).e).toContain("permission denied");
     await e.query("RESET ROLE");
     await d.pool.query(readFileSync(join(root, "supabase/bootstrap/privacy_eraser_verify.sql"), "utf8"));
+  }, 30_000);
+
+  test("P1 on real PG: only a GENUINE bulls96_privacy_eraser login passes; a superuser that SET ROLE to it is refused", async () => {
+    const d = await database();
+    await d.owner("ingest_privacy_authority_fence", { controlEpoch: epoch });
+    await d.activateEmpty();
+    // The operator phase that makes the role a LOGIN (trust auth on this owned test container; no password involved).
+    await d.pool.query(readFileSync(join(root, "supabase/bootstrap/privacy_eraser_role.sql"), "utf8"));
+    cleanup.push(async () => {
+      await d.pool.query("ALTER ROLE bulls96_privacy_eraser NOLOGIN; ALTER ROLE bulls96_privacy_eraser RESET ALL").catch(() => undefined);
+    });
+    await d.pool.query(readFileSync(join(root, "supabase/bootstrap/privacy_eraser_verify.sql"), "utf8"));
+    const u = new URL(d.url);
+    u.username = "bulls96_privacy_eraser";
+    u.password = "";
+    const login = new pg.Client({ connectionString: u.href });
+    await login.connect();
+    cleanup.push(() => login.end().catch(() => undefined));
+    const q = { query: async (t: string, p?: unknown[]) => ({ rows: (await login.query(t, p as never)).rows }) };
+    await assertEraserIdentity(q);
+    expect(await supabaseAuthority(q).fencedLivePage(null)).toEqual([]);
+    expect(((await settle(login.query("SELECT 1 FROM sessions.upload_deletions LIMIT 1"))) as { e?: string }).e).toContain("permission denied");
+    // Causal negative (passed on 957467fe): the elevated session with SET ROLE keeps its credential, so it is refused.
+    const su = await d.conn();
+    await su.query("SET ROLE bulls96_privacy_eraser");
+    const sq = { query: async (t: string, p?: unknown[]) => ({ rows: (await su.query(t, p as never)).rows }) };
+    expect(await assertEraserIdentity(sq).then(() => "ok", (e) => e.code)).toBe("eraser_identity_superuser");
+    await su.query("RESET ROLE");
   }, 30_000);
 });

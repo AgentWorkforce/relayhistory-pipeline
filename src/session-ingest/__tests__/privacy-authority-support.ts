@@ -22,7 +22,7 @@ export const LAZY_SOURCE_SQL = "supabase/migrations/20261105040000_ingest_lazy_s
 export const INDEX_SQL = "scripts/ops/c3-privacy-authority/ingest_privacy_authority_index.sql";
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
 
-export async function authorityFixture(opts: { pending?: boolean; lazyFix?: boolean; index?: boolean } = {}) {
+export async function authorityFixture(opts: { pending?: boolean; lazyFix?: boolean; index?: boolean; store?: import("../../shared/vendor.ts").ObjectStore } = {}) {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   const closers: Array<() => unknown> = [() => db.close()];
   await db.exec(read("supabase/tests/supabase_shim.sql"));
@@ -53,7 +53,7 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   const ledger = sqlLedger(run, { acceptanceMode: "buffered", expectedGeneration: generation });
   const fs = scratchStore();
   closers.push(fs.done);
-  const deps = { ledger, acceptanceMode: "buffered" as const, target: { store: fs.store, keyRoot: "96bulls" } };
+  const deps = { ledger, acceptanceMode: "buffered" as const, target: { store: opts.store ?? fs.store, keyRoot: "96bulls" } };
   const seal = () => db.query("INSERT INTO sessions.ingest_frozen_source_completeness(source_identity_sha256,control_epoch,privacy_baseline_sha256,org_count,record_rows,manifest_sha256,neon_snapshot) VALUES($1,$2,$3,0,0,$4,'{}')", [identity, epoch, baseline, "e".repeat(64)]);
   const rpc = async (fn: string, p: unknown) => ((await run("SELECT sessions." + fn + "($1::jsonb) AS r", [JSON.stringify(p)])) as any).rows[0].r;
   const ownerRpc = async (fn: string, p?: unknown) => (await db.query("SELECT sessions." + fn + (p === undefined ? "()" : "($1::jsonb)") + " AS r", p === undefined ? [] : [JSON.stringify(p)])).rows[0] as { r: any };
