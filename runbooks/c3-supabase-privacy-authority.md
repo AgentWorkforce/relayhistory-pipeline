@@ -43,7 +43,8 @@ and the eraser reads the frozen deletions exactly where it read Neon's `deleted_
 
 `OP` = `bun run scripts/privacy-authority-handoff.ts` from a clean worktree at the reviewed head. Credentials: one
 JSON object on stdin, piped from 1Password, never a file: `{"neonUrl": <Neon owner URL, used read-only>, "supabaseUrl": <Supabase owner URL>}`.
-Each URL must carry an explicit user, a non-empty password and a TCP host, and no query parameter but `sslmode`
+Each URL must carry an explicit user, a non-empty password, a TCP host and `sslmode=verify-full` (TLS is never taken
+from `PGSSLMODE`/`PGSSL*`, which refuse; `disable` only for a loopback test database), and no other query parameter
 (`no-verify` is refused; strip Neon's default `channel_binding=require` and any `options=`). Anything else is refused by
 field name before any connection, so the password always comes
 from stdin and never from `~/.pgpass`, `PGHOST` or the OS login. The client gets a discrete config, never a connection string.

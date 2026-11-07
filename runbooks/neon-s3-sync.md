@@ -82,7 +82,7 @@ touch ~/.agent-tmp/s3x/STOP   # stop after the current run
 
 # The erasure job (its own key, its own process). Credentials ONLY on stdin, held in RAM:
 # one JSON object {"databaseUrl": ..., "eraser": {accessKeyId, secretAccessKey[, sessionToken]}}.
-# databaseUrl must carry user, non-empty password and host; only ?sslmode= is allowed (never ~/.pgpass).
+# databaseUrl must carry user, non-empty password, host and ?sslmode=verify-full (never ~/.pgpass or PGSSL*).
 # NEON_URL_FILE / NEON_URL / S3X_ERASER_CREDS_FILE / AWS_* credential variables refuse to start, and so
 # does a terminal or a regular file on stdin (a pipe from `op` is the intended source).
 ssh kjg-lap "zsh -lc 'jq -cn --arg u \"\$(op read <authority db url ref>)\" \

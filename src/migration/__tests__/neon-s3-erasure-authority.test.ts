@@ -17,6 +17,8 @@ import { liveMachineId, liveTargets } from "../neon-s3-erasure/live.ts";
 import { supabaseAuthority, type ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import { authorityKind, authorityUrl, eraserFor } from "../neon-s3-erasure/main.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
+import { postgresTlsOptions } from "../../shared/postgres-tls.ts";
+import { SUPABASE_PROD_CA_2021 } from "../../session-pipeline/supabase-ca.ts";
 import { CredentialRefusal, FORBIDDEN_CREDENTIAL_ENV, parseCredentialDocument, pinnedPgClient, pinnedPgConfig, readStdinCredentials, refuseCredentialEnv, s3Credentials } from "../stdin-credentials.ts";
 import { authorityFixture, epoch } from "../../session-ingest/__tests__/privacy-authority-support.ts";
 
@@ -175,34 +177,40 @@ describe("no ~/.pgpass fallback: stdin DB URLs carry their own password (dogpatc
       expect(at(`postgres://u:synthetic@${provider}`)).toBeNull();
       const r = recordingPg();
       for (const bad of [`postgres://bulls96_privacy_eraser@${provider}`, `postgres://:synthetic@${provider}`, `postgres://u:@${provider}`, "postgres://u:synthetic@/postgres"])
-        expect(code(() => pinnedPgClient(r.pg, bad, "databaseUrl"))).not.toBeNull();
+        expect(code(() => pinnedPgClient(r.pg, bad, "databaseUrl", mode))).not.toBeNull();
       expect(r.seen.constructed).toBe(0);
     });
 
   test("the final client config is DISCRETE (no connectionString) with the decoded stdin password; no fallback can occur", () => {
     const r = recordingPg();
-    pinnedPgClient(r.pg, "postgres://bulls96_privacy_eraser:p%40ss%3Aw%2Frd%25@db.ref.supabase.co:5432/postgres?sslmode=verify-full", "databaseUrl", { application_name: "x" });
-    expect(r.seen.configs).toEqual([{ application_name: "x", host: "db.ref.supabase.co", port: 5432, user: "bulls96_privacy_eraser", password: "p@ss:w/rd%", database: "postgres", ssl: {} }]);
+    pinnedPgClient(r.pg, "postgres://bulls96_privacy_eraser:p%40ss%3Aw%2Frd%25@db.ref.supabase.co:5432/postgres?sslmode=verify-full", "databaseUrl", "supabase", { application_name: "x" });
+    expect(r.seen.configs).toEqual([{ application_name: "x", host: "db.ref.supabase.co", port: 5432, user: "bulls96_privacy_eraser", password: "p@ss:w/rd%", database: "postgres", ssl: postgresTlsOptions() }]);
+    expect((r.seen.configs[0]!.ssl as { ca: string }).ca).toBe(SUPABASE_PROD_CA_2021);
     expect(r.seen.pgpassFallback).toBe(0);
-    expect(pinnedPgConfig("postgres://u:s@h:6000/d?sslmode=disable", "databaseUrl")).toEqual({ host: "h", port: 6000, user: "u", password: "s", database: "d", ssl: false });
-    expect(code(() => pinnedPgConfig("postgres://u:s@h/d?sslmode=no-verify", "databaseUrl"))).toBe("database_url_sslmode_refused");
-    expect(code(() => pinnedPgConfig("postgres://u:s@h/d?options=-c%20x%3Dy", "databaseUrl"))).toBe("database_url_startup_parameter_refused.options");
-    expect(code(() => pinnedPgConfig("postgres://u:s@h/", "databaseUrl"))).toBe("database_url_database_required");
+    expect(pinnedPgConfig("postgres://u:s@127.0.0.1:6000/d?sslmode=disable", "databaseUrl", "neon")).toEqual({ host: "127.0.0.1", port: 6000, user: "u", password: "s", database: "d", ssl: false });
+    expect(pinnedPgConfig("postgres://u:s@h:6000/d?sslmode=verify-full", "databaseUrl", "neon")).toEqual({ host: "h", port: 6000, user: "u", password: "s", database: "d", ssl: { rejectUnauthorized: true } });
+    // TLS is always explicit: no sslmode (pg would read PGSSLMODE), a weaker mode, or disable for a non-loopback host: refused.
+    expect(code(() => pinnedPgConfig("postgres://u:s@h/d", "databaseUrl", "neon"))).toBe("database_url_sslmode_required");
+    for (const m of ["no-verify", "require", "prefer", "verify-ca", "allow"]) expect(code(() => pinnedPgConfig(`postgres://u:s@h/d?sslmode=${m}`, "databaseUrl", "neon"))).toBe("database_url_sslmode_refused");
+    expect(code(() => pinnedPgConfig("postgres://u:s@db.ref.supabase.co/d?sslmode=disable", "databaseUrl", "neon"))).toBe("database_url_sslmode_refused");
+    for (const k of ["PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGSSLNEGOTIATION", "PGTARGETSESSIONATTRS"]) expect(code(() => refuseCredentialEnv({ [k]: "require" }))).toBe(`credential_env_refused.${k}`);
+    expect(code(() => pinnedPgConfig("postgres://u:s@h/d?options=-c%20x%3Dy", "databaseUrl", "neon"))).toBe("database_url_startup_parameter_refused.options");
+    expect(code(() => pinnedPgConfig("postgres://u:s@h/", "databaseUrl", "neon"))).toBe("database_url_database_required");
     // A caller cannot smuggle identity or a connectionString through the extra options.
-    for (const k of ["connectionString", "password", "user", "host"]) expect(code(() => pinnedPgClient(r.pg, "postgres://u:s@h/d", "databaseUrl", { [k]: "x" }))).toBe("database_url_config_override_refused");
+    for (const k of ["connectionString", "password", "user", "host"]) expect(code(() => pinnedPgClient(r.pg, "postgres://u:s@h/d?sslmode=verify-full", "databaseUrl", "neon", { [k]: "x" }))).toBe("database_url_config_override_refused");
   });
 
   test("a client whose resolved password differs from the stdin one (pg would consult ~/.pgpass) is refused pre-connect", () => {
     const dropped = recordingPg((c) => void (c.password = ""));
-    expect(code(() => pinnedPgClient(dropped.pg, "postgres://u:s@h/d", "databaseUrl"))).toBe("database_url_password_not_pinned");
+    expect(code(() => pinnedPgClient(dropped.pg, "postgres://u:s@h/d?sslmode=verify-full", "databaseUrl", "neon"))).toBe("database_url_password_not_pinned");
     expect(dropped.seen.pgpassFallback).toBe(1); // the sentinel saw the fallback condition, and the client was refused
     const swapped = recordingPg((c) => void (c.password = "other"));
-    expect(code(() => pinnedPgClient(swapped.pg, "postgres://u:s@h/d", "databaseUrl"))).toBe("database_url_password_not_pinned");
+    expect(code(() => pinnedPgClient(swapped.pg, "postgres://u:s@h/d?sslmode=verify-full", "databaseUrl", "neon"))).toBe("database_url_password_not_pinned");
   });
 
   test("real pg: the pinned client resolves the stdin password; a connectionString-only client resolves NONE (the fallback path)", async () => {
     const { default: pg } = await import("pg");
-    const pinned = pinnedPgClient(pg, "postgres://bulls96_privacy_eraser:p%40ss@127.0.0.1:9/postgres", "databaseUrl") as unknown as { password: unknown; connectionParameters: { password: unknown } };
+    const pinned = pinnedPgClient(pg, "postgres://bulls96_privacy_eraser:p%40ss@127.0.0.1:9/postgres?sslmode=disable", "databaseUrl", "supabase") as unknown as { password: unknown; connectionParameters: { password: unknown } };
     expect([pinned.password, pinned.connectionParameters.password]).toEqual(["p@ss", "p@ss"]);
     // What ff29da7f built for a password-less stdin URL: pg resolves null, i.e. it WOULD read ~/.pgpass at auth time.
     const legacy = new pg.Client({ connectionString: "postgres://bulls96_privacy_eraser@127.0.0.1:9/postgres" }) as unknown as { password: unknown };

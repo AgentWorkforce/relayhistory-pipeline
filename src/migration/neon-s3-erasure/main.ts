@@ -82,7 +82,7 @@ export async function main() {
   const state = new SyncState(env("S3X_STATE", `${process.env.HOME}/.agent-tmp/s3x/state.sqlite`)!);
   const { default: pg } = await import("pg");
   // The password is pinned from the stdin URL: pg can never fall back to ~/.pgpass (a credential on disk).
-  const client = pinnedPgClient(pg, url, "databaseUrl", { application_name: `96bulls-${kind}-s3-erasure` });
+  const client = pinnedPgClient(pg, url, "databaseUrl", kind, { application_name: `96bulls-${kind}-s3-erasure` });
   await client.connect();
   let stop = false;
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => void (stop = true));
