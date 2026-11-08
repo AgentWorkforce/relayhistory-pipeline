@@ -57,7 +57,9 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Output with no secret-keyed record value, no over-cap quoted value and no quoted
   // secret value left unclosed or open across a line break is byte-identical to version 4.
   // Updated before release (repeated source keys: scrubRecordLine writes a key the source
-  // repeats under its first written name, never another key's). Version 5 has sealed no chunk.
+  // repeats under its first written name, never another key's). Version 5 shipped and has
+  // sealed stored objects: it is immutable (frozen as fixtures/scrub-ruleset-5.ts). The next
+  // ruleset edit must again freeze the current version and bump.
   // Updated before release (PASS gate blockers 1 and 2: multi-line or unclosed quoted
   // secret values within the bound are redacted whole and never cut inside; secret context
   // runs through composite values, objects as well as arrays).
