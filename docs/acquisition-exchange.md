@@ -12,34 +12,63 @@ adapter, error table and ops handler, `native-issuer.ts` P3/P3a, `intent-store.t
 intents, `key-registry.ts` pinned keys and signer, `main.ts` listeners and reconciler).
 Proposed DDL: `supabase/acquisition-intents.proposed.sql` (not a migration).
 
-## Cloud reachability (pinned for phase 2, as implemented on this branch)
+## Cloud reachability (pinned for phase 2)
 
-Answers the Cloud phase-2 publisher's question. This states what the receiver on this
-branch exposes; it changes no deployed name or source pin.
+This answers the Cloud phase-2 publisher. It changes no deployed name or source pin.
 
-1. **Transport.** The receiver is authenticated HTTP(S) only. `SERVICE=acquisition` is a
-   Bun/Node container, not a Cloudflare Worker: it exposes **no** Worker service binding and
-   **no** named entrypoint class. The existing `RELAYHISTORY_READS` binding does not reach it
-   and is not an acquisition path. The ops listener (`ACQUISITION_OPS_PORT`) is intended for
-   private networking only (contract P1). Making it reachable from Cloud Worker egress needs an
-   ingress decision that this branch does not make (a deployment change, so it needs Khaliq's
-   explicit OK). Until then the receiver is not reachable from the Cloud Worker at all.
-2. **Routes, audience and issuer.** These are the only Cloud-facing routes:
-   `POST /v1/acquisition/ops/install`, `POST /v1/acquisition/ops/revoke`,
-   `POST /v1/acquisition/ops/rebind` (always 403 for cloud keys, because rebind is native-only
-   in the codec) and `POST /v1/acquisition/ops/status`. `Authorization: Bearer <token>` is
-   introspected by the deployment's relaycontrol (#313 client). The token issuer is that
-   relaycontrol. The expected `aud` is `ACQUISITION_ORIGIN`, compared by normalized URL origin
-   (one origin per deployment, shared with the native group). `principal_type` must be
-   `service` (a per-workspace service token), with scope `acquisition:operate`. Envelope
-   signatures must come from a `cloud`-class key in `ACQUISITION_PINNED_KEYS`.
-   **`/v1/acquisition/cloud/batches` does not exist** on this branch and is not in contract v1
-   (P5: anything not listed is not part of v1). A Q3 publication route needs a contract
-   addition from the History owner before anyone wires it.
-3. **Canonical path and fallback.** For phase 2 the canonical path is authenticated HTTPS to
-   `ACQUISITION_ORIGIN` + `/v1/acquisition/ops/*` as above. There is no alternate transport,
-   no service binding, no ingest-HMAC or `rth:sync` path and no fallback. Anything else must be
-   refused, not tried.
+1. **Transport.** Authenticated HTTPS to `ACQUISITION_ORIGIN` on the acquisition service's
+   private ingress only. `SERVICE=acquisition` is a Bun/Node container. It exposes **no**
+   Worker service binding and **no** named entrypoint class. `RELAYHISTORY_READS` does not
+   reach it and is not an acquisition path. These routes are not on the Desktop-facing upload
+   ingress. Exposing the private ingress to Cloud Worker egress is a separate deploy decision.
+   It is **not approved** and needs Khaliq's explicit OK. Until then the routes are not
+   reachable from Cloud.
+2. **Routes, audience and issuer.**
+   - Operations port (contract P2), implemented here:
+     - `POST /v1/acquisition/ops/install`
+     - `POST /v1/acquisition/ops/revoke`
+     - `POST /v1/acquisition/ops/rebind`: always 403 for cloud keys, because the codec treats
+       rebind as native-only.
+     - `POST /v1/acquisition/ops/status`
+   - Q3 publication port: `POST /v1/acquisition/cloud/batches`.
+     - It is part of contract v1, specified in PR #314 §9 ("Private Cloud publication port (Q3,
+       implementation contract v1)", head d72a664bab17): a three-field wrapper with a strict
+       ordinary durable receipt, scoped separately from P2.
+     - It is **not implemented on this branch**. Its handler, ingress binding and tests land in
+       a follow-up source PR on top of this service. Until then it answers `404 not_found` here.
+   - Auth for both:
+     - `Authorization: Bearer <token>`, introspected by the deployment's relaycontrol, which is
+       the token issuer.
+     - `aud` = the actual `ACQUISITION_ORIGIN`, compared by normalized URL origin.
+     - `principal_type` = `service`, scope `acquisition:operate`. §9.1 describes a per-workspace
+       `sh_wk_` operator token, and org/workspace come from introspection only.
+     - Envelopes must be signed by a `cloud`-class key in `ACQUISITION_PINNED_KEYS`.
+3. **Canonical path and fallback.**
+   - The canonical phase-2 path is authenticated HTTPS to `ACQUISITION_ORIGIN` +
+     `/v1/acquisition/ops/*`, plus `/v1/acquisition/cloud/batches` once the follow-up lands.
+   - There is no alternate transport, no service binding, no legacy publisher, no provider key,
+     no generic user token, no ingest-HMAC or `rth:sync` path, and no fallback.
+   - A missing receiver or missing configuration is refused, never retried elsewhere.
+
+### Verifier in use (must change)
+
+Both the ops and the native routes currently authenticate through the **shared #313
+relaycontrol client**.
+- `main.ts` builds an instance with `createRelaycontrolIntrospector`, from
+  `packages/pipeline/src/auth/relaycontrol.ts`. This is the same verifier code the read/MCP
+  paths use, wrapped by `relaycontrolAuthenticator` in `app.ts`.
+- It inherits that client's scope allowlist (`rth:read`, `rth:sync`) and its desktop-user-only
+  principal filter.
+- `app.ts` also rejects any bearer that fails the shared `isRelaycontrolToken` check, which
+  accepts only the `sh_at_` prefix. That would refuse the §9.1 `sh_wk_` operator token.
+
+**This is must-change.** The agreed design is a purpose-specific acquisition verifier:
+- service principal + `acquisition:operate` for the ops routes and the future Q3 route;
+- desktop-user + `rth:acquire` for the native routes;
+- `aud` = the actual acquisition origin in both cases.
+
+The shared #313 verifier must stay unchanged. Until the purpose-specific verifier replaces it,
+every acquisition request fails closed (see Authentication).
 
 ## Process model
 
@@ -109,9 +138,8 @@ acquisition request fails closed:
 In addition, the shared #313 client in this repo currently passes through only the scopes
 in `RELAYCONTROL_SCOPE_ALLOWLIST` (`rth:read`, `rth:sync`) and admits only
 `principal_type: "desktop-user"`. So today native requests get 403 (scope filtered) and ops
-requests get 403 (service principal rejected). Its owner must extend the allowlist with
-`rth:acquire` / `acquisition:operate` and admit `service` principals for the ops audience;
-`relaycontrolAuthenticator` in `app.ts` is the single adapter to update.
+requests get 403 (service principal rejected). The fix is a purpose-specific acquisition
+verifier (see "Verifier in use"), not a change to the shared #313 client.
 
 ## Routes
 
