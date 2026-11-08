@@ -170,9 +170,11 @@ compare-and-swap (If-Match / If-None-Match).
     - A settlement failure answers 503; the retry replays and settles.
     - Settlement is decided on the CURRENT journal, not on what a request saw at begin. Once a
       `(epoch, version)` is neither pending nor ambiguous and is at or below the maximum, it is
-      settled, and any further settler (a retry that ran concurrently) is a no-op. So `seq`
-      advances once per logical control whatever the settle order (tested both ways, with a
-      witness between).
+      settled, and any further settler (a retry that ran concurrently) is a no-op. So one logical
+      control moves `seq` at most once whatever the settle order (tested both ways, with a
+      witness between). `seq` is a monotonic privacy-transition watermark, not a control count:
+      contiguous versions can coalesce into one step (below). The gate only asks whether it moved
+      after the witness.
     - **Lower versions are subsumed.** SQL applies only version `last+1`
       (`ingest_apply_ordered_control`), so a completed version proves every lower version of its
       epoch applied before it, inside the window its own count covers. Completing version `v`
