@@ -4,7 +4,7 @@
  * the Worker; this file is the service's switch and port, in the
  * session-ingest-edge pattern.
  *
- *   RELAYHISTORY_SELFHOST_READ_API  unset | "" | "false" (default: dormant) | "true"; anything else is a
+ *   RELAYHISTORY_SELFHOST_READ_API  unset | "" | "false" (default: dormant) | exactly "true" (no trimming, case-sensitive); anything else is a
  *                                   startup error, so a typo never silently means either
  *   RELAYHISTORY_READ_API_PORT      listen port, default 8080 (parsed even when dormant)
  *   RELAYHISTORY_READ_API_SECRET    enabled only: the read API secret JSON, the same shape the Lambda
@@ -30,7 +30,7 @@ export type ReadApiServiceConfig =
 
 /** `RELAYHISTORY_SELFHOST_READ_API`: exactly "true" enables; unset, empty or "false" is off; anything else throws. */
 export function readApiServiceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env[READ_API_SERVICE_FLAG]?.trim();
+  const raw = env[READ_API_SERVICE_FLAG];
   if (raw === undefined || raw === "" || raw === "false") return false;
   if (raw === "true") return true;
   throw new Error(`96bulls: ${READ_API_SERVICE_FLAG} must be true or false`);

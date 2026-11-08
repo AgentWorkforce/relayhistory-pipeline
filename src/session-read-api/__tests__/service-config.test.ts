@@ -22,6 +22,18 @@ describe("RELAYHISTORY_SELFHOST_READ_API", () => {
     );
   });
 
+  test.each([" true", "true ", "TRUE", " false", "false ", "\ttrue\n"])("%j is not trimmed or case-folded: startup error naming the variable", (value) => {
+    const env = { RELAYHISTORY_SELFHOST_READ_API: value };
+    expect(() => readApiServiceEnabled(env)).toThrow(/RELAYHISTORY_SELFHOST_READ_API/);
+    expect(() => readApiServiceConfig(env)).toThrow("96bulls: RELAYHISTORY_SELFHOST_READ_API must be true or false");
+  });
+
+  test("the startup error never contains the offending value", () => {
+    expect(() => readApiServiceEnabled({ RELAYHISTORY_SELFHOST_READ_API: " secret-ish " })).toThrow(
+      expect.objectContaining({ message: expect.not.stringContaining("secret-ish") }),
+    );
+  });
+
   test("dormant needs nothing else and ignores a bad ALLOW_IN_CLUSTER_HTTP", () => {
     expect(readApiServiceConfig({ ALLOW_IN_CLUSTER_HTTP: "yes" })).toEqual({ enabled: false, port: 8080 });
   });
