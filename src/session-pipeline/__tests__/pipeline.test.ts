@@ -221,6 +221,10 @@ function fakeSupabase(live: () => string[], busy: () => boolean = () => false, c
   return { tx, calls, transact: async <T>(work: (tx: SqlExecutor) => Promise<T>) => work(tx) };
 }
 
+/** The in-process PGlite as a superuser test database: one transaction per tenant call. */
+const pgliteTenants = (db: PGlite): TenantSqlRunner => (orgId, workspaceId, work) =>
+  db.transaction(async tx => { await tx.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]); return work(tx); });
+
 function searchDeps(ch: ClickHouseClient, transact: SearchIndexDeps["transact"], limits?: SearchIndexDeps["limits"]): SearchIndexDeps {
   return { transact, reader, store, ch, prefixFor: (org) => `96bulls/${org}`, now: () => NOW, ...(limits ? { limits } : {}) };
 }
@@ -237,7 +241,7 @@ test("registered Postgres projection serves the actual read API, fences stale wr
     async partials(tenant) { expect(tenant).toEqual({ orgId: scope.orgId, workspaceId: scope.workspaceId }); return { sessions: complete ? [] : [scope.sessionId], overflow: false }; },
   };
   const registry = createSearchIndexRegistry();
-  const adapter = composeSearchService({ registry, state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer");
+  const adapter = composeSearchService({ registry, state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer", pgliteTenants(db));
   const index = adapter.index;
   await index.ensureSchema(); // explicit test bootstrap, never service startup
   const deps: SearchIndexDeps = { transact: sb.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => at };
@@ -340,9 +344,16 @@ test("forced tenant RLS on transcript_events: a non-superuser writer's scope pas
     expect(await unfiltered("search_owner")).toEqual([]);
     expect(await unfiltered("search_reader", { ...tenant, workspaceId: "ws_other" })).toEqual([]);
     // A writer with no open transaction cannot carry the settings to its
-    // statement: the write is refused and the read is empty (fails closed).
-    await expect(asOwner(() => bootstrap.upsert([{ ...first!, eventId: "loose", fingerprint: "loose", version: 1, taskRefId: "", deliveryRecordId: "" }]))).rejects.toMatchObject({ code: "unavailable", detail: "sqlstate_42" });
-    expect(await asOwner(() => bootstrap.query({ tenant, order: "asc", limit: 10 }))).toEqual({ hits: [] });
+    // statement. Every call throws rather than writing, reading or erasing
+    // nothing: an erase that matched no row under RLS would lose the erasure.
+    const unbound = { code: "unavailable", detail: "tenant_unbound" };
+    const stored = async () => (await db.query<{ org_id: string }>("SELECT org_id FROM search_index.transcript_events ORDER BY org_id")).rows.length;
+    const before = await stored();
+    await expect(asOwner(() => bootstrap.upsert([{ ...first!, eventId: "loose", fingerprint: "loose", version: 1, taskRefId: "", deliveryRecordId: "" }]))).rejects.toMatchObject(unbound);
+    await expect(asOwner(() => bootstrap.query({ tenant, order: "asc", limit: 10 }))).rejects.toMatchObject(unbound);
+    await expect(asOwner(() => bootstrap.eraseScope({ ...tenant, source: scope.harness, sessionIds: [scope.sessionId] }))).rejects.toMatchObject(unbound);
+    await expect(asOwner(() => bootstrap.deleteEvents(tenant, [first!]))).rejects.toMatchObject(unbound);
+    expect(await stored()).toBe(before);
     // Settings bound to one tenant never admit a write that moves a row to another.
     await expect(db.transaction(async tx => {
       await tx.exec("SET LOCAL ROLE search_owner");
@@ -388,7 +399,7 @@ for (const failure of ["none", "throw", "invalid count"] as const) {
       async record(_tx, _scope, value) { records.push(value.complete); },
       async partials() { return { sessions: records.at(-1) === true ? [] : [scope.sessionId], overflow: false }; },
     };
-    const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer");
+    const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer", pgliteTenants(db));
     const tenant = { orgId: scope.orgId, workspaceId: scope.workspaceId };
     const deps: SearchIndexDeps = {
       transact: sb.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW,

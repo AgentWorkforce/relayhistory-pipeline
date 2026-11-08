@@ -21,9 +21,16 @@
  * rows are visible and writable only where org_id/workspace_id equal the
  * transaction's `bulls96_read.org_id`/`bulls96_read.workspace_id` settings.
  * Each tenant-scoped statement runs with those settings bound to its own
- * tenant (see `tenantRunner`); with none bound, the policy shows no rows and
- * refuses every write. A superuser or BYPASSRLS role skips the policy, so the
- * read service refuses such a login at startup (session-read-api/lambda.ts).
+ * tenant (see `tenantRunner`). With none bound the policy would show no rows,
+ * refuse every write and let a delete match nothing, so an unbound call
+ * throws `unavailable (tenant_unbound)` instead of quietly succeeding.
+ * A superuser or BYPASSRLS role skips the policy, so the read service refuses
+ * such a login at startup (session-read-api/lambda.ts).
+ *
+ * Under RLS the trigram GIN indexes are not used for `q`: LIKE (`textlike`)
+ * is not leakproof, so PostgreSQL will not apply it before the policy, and a
+ * search scans the tenant's rows through the scope index instead. Cost is
+ * linear in one tenant's size; accepted at self-host scale for now.
  *
  * The client is anything with `query(text, params) -> { rows }`: a `pg` Pool
  * or PGlite. Ordering uses COLLATE "C" so the cursor order is code-point
@@ -68,13 +75,16 @@ export interface PostgresSearchIndexConfig {
   readonly id?: string;
   readonly client: SqlClient;
   /**
-   * Runs each tenant-scoped statement (query, scan, upsert, delete, erase) in
-   * its own tenant transaction, e.g. the read service's pool runner. Without
-   * one, each such statement is preceded on `client` by TENANT_SETTINGS_SQL
-   * for its tenant. That holds only when `client` is one open transaction (the
-   * writer's scope pass via writerTransactionSql); on a bare pool or outside a
-   * transaction the transaction-local settings lapse before the statement and
-   * the policy shows nothing and refuses writes: it fails closed, never open.
+   * Runs each tenant-scoped call (query, scan, upsert, delete, erase) in its
+   * own tenant transaction, e.g. the read service's pool runner. Without one,
+   * each call first runs TENANT_SETTINGS_SQL on `client` for its tenant, then
+   * checks on `client` that the settings hold. That holds only when `client`
+   * is one open transaction (the writer's scope pass via writerTransactionSql).
+   * On a bare pool or outside a transaction the transaction-local settings
+   * lapse, and every call throws `unavailable (tenant_unbound)` rather than
+   * reading nothing or deleting nothing. Deletes also check, in the deleting
+   * statement itself, that the settings are bound and that they removed every
+   * matching row they could see; erase then verifies no scope row remains.
    */
   readonly tenantRunner?: TenantSqlRunner;
   /** Schema of the derived index. Default `search_index`. */
@@ -201,6 +211,20 @@ export function likeLiteral(q: string): string {
   return `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 }
 
+/** True only when this statement's tenant settings equal the given params. */
+const BOUND = (org: string, workspace: string) =>
+  `(current_setting('bulls96_read.org_id', true) IS NOT DISTINCT FROM ${org} AND current_setting('bulls96_read.workspace_id', true) IS NOT DISTINCT FROM ${workspace})`;
+
+/** A delete's own statement reports whether its settings were bound and how
+ * many matching rows it saw against how many it removed. Under forced RLS an
+ * unbound delete matches nothing and would otherwise succeed silently. */
+function checkDeleted(row: { bound?: unknown; present?: unknown; deleted?: unknown } | undefined): number {
+  if (row?.bound !== true) throw new SearchIndexError("unavailable", false, "tenant_unbound");
+  const present = Number(row.present), deleted = Number(row.deleted);
+  if (!Number.isSafeInteger(deleted) || deleted !== present) throw new SearchIndexError("unavailable", true, "delete_incomplete");
+  return deleted;
+}
+
 function checkSignal(context?: SearchCallContext): void {
   if (context?.signal?.aborted) throw new SearchIndexError("aborted");
 }
@@ -212,22 +236,34 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
   const table = `"${schema}"."${tableName}"`;
   const db = config.client;
 
-  /** `tenant` set: the statement runs with that tenant's settings bound
-   * (config.tenantRunner, else TENANT_SETTINGS_SQL first on the same client). */
-  async function run<T>(text: string, params: unknown[], context?: SearchCallContext, tenant?: SearchTenant): Promise<T[]> {
+  function backendError(error: unknown): SearchIndexError {
+    if (error instanceof SearchIndexError) return error;
+    const code = (error as { code?: unknown })?.code;
+    if (code === "42P01" || code === "3F000") return new SearchIndexError("schema_missing");
+    // Backend text can quote row content: only the SQLSTATE class leaves.
+    return new SearchIndexError("unavailable", true, typeof code === "string" ? `sqlstate_${code.slice(0, 2)}` : undefined);
+  }
+
+  /** Runs `work` with `tenant`'s settings bound: config.tenantRunner, else
+   * TENANT_SETTINGS_SQL then a check that they held, both on `client`. */
+  async function asTenant<T>(tenant: SearchTenant, context: SearchCallContext | undefined, work: (client: SqlClient) => Promise<T>): Promise<T> {
     checkSignal(context);
     try {
-      if (!tenant) return (await db.query<T>(text, params)).rows;
-      if (config.tenantRunner)
-        return (await config.tenantRunner(tenant.orgId, tenant.workspaceId, (client) => client.query<T>(text, params))).rows;
+      if (config.tenantRunner) return await config.tenantRunner(tenant.orgId, tenant.workspaceId, work);
       await db.query(TENANT_SETTINGS_SQL, [tenant.orgId, tenant.workspaceId]);
+      const held = await db.query<{ bound: boolean }>(`SELECT ${BOUND("$1", "$2")} AS bound`, [tenant.orgId, tenant.workspaceId]);
+      if (held.rows[0]?.bound !== true) throw new SearchIndexError("unavailable", false, "tenant_unbound");
+      return await work(db);
+    } catch (error) { throw backendError(error); }
+  }
+
+  /** `tenant` set: the statement runs with that tenant's settings bound (asTenant). */
+  async function run<T>(text: string, params: unknown[], context?: SearchCallContext, tenant?: SearchTenant): Promise<T[]> {
+    if (tenant) return asTenant(tenant, context, async (client) => (await client.query<T>(text, params)).rows);
+    checkSignal(context);
+    try {
       return (await db.query<T>(text, params)).rows;
-    } catch (error) {
-      const code = (error as { code?: unknown })?.code;
-      if (code === "42P01" || code === "3F000") throw new SearchIndexError("schema_missing");
-      // Backend text can quote row content: only the SQLSTATE class leaves.
-      throw new SearchIndexError("unavailable", true, typeof code === "string" ? `sqlstate_${code.slice(0, 2)}` : undefined);
-    }
+    } catch (error) { throw backendError(error); }
   }
 
   const capabilities: SearchIndexCapabilities = Object.freeze({
@@ -366,14 +402,17 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
       if (positions.length > MAX_UPSERT_BATCH) throw new SearchIndexError("invalid_argument");
       if (positions.length === 0) return { deleted: 0 };
       for (const p of positions) assertPosition(p);
-      const rows = await run<{ n: string | number }>(
-        `WITH gone AS (
-           DELETE FROM ${table} t USING jsonb_to_recordset($3::jsonb) AS x(
-             ts_ms bigint, session_id text, source text, machine_id text, kind text, event_id text)
-           WHERE t.org_id = $1 AND t.workspace_id = $2 AND t.ts_ms = x.ts_ms AND t.session_id = x.session_id
-             AND t.source = x.source AND t.machine_id = x.machine_id AND t.kind = x.kind AND t.event_id = x.event_id
+      const match = `t.org_id = $1 AND t.workspace_id = $2 AND t.ts_ms = x.ts_ms AND t.session_id = x.session_id
+             AND t.source = x.source AND t.machine_id = x.machine_id AND t.kind = x.kind AND t.event_id = x.event_id`;
+      const positionsOf = `jsonb_to_recordset($3::jsonb) AS x(
+             ts_ms bigint, session_id text, source text, machine_id text, kind text, event_id text)`;
+      const rows = await run<{ bound: boolean; present: string | number; deleted: string | number }>(
+        `WITH present AS (
+           SELECT count(*) AS n FROM ${table} t WHERE EXISTS (SELECT 1 FROM ${positionsOf} WHERE ${match})
+         ), gone AS (
+           DELETE FROM ${table} t USING ${positionsOf} WHERE ${match}
            RETURNING 1)
-         SELECT count(*) AS n FROM gone`,
+         SELECT ${BOUND("$1", "$2")} AS bound, (SELECT n FROM present) AS present, (SELECT count(*) FROM gone) AS deleted`,
         [
           tenant.orgId,
           tenant.workspaceId,
@@ -391,17 +430,32 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
         context,
         tenant,
       );
-      return { deleted: Number(rows[0]?.n ?? 0) };
+      return { deleted: checkDeleted(rows[0]) };
     },
 
     async eraseScope(scope, context) {
       assertScope(scope);
-      await run(
-        `DELETE FROM ${table} WHERE org_id = $1 AND workspace_id = $2 AND source = $3 AND session_id = ANY($4::text[])`,
-        [scope.orgId, scope.workspaceId, scope.source, [...scope.sessionIds]],
-        context,
-        scope,
-      );
+      // Erasure must never report success while scope rows remain: the delete
+      // checks its own binding and count, then the same tenant context
+      // confirms that no row of the scope is left (a concurrent writer's row
+      // fails it, retryably, for the caller to erase again).
+      const where = `org_id = $1 AND workspace_id = $2 AND source = $3 AND session_id = ANY($4::text[])`;
+      const params = [scope.orgId, scope.workspaceId, scope.source, [...scope.sessionIds]];
+      await asTenant(scope, context, async (client) => {
+        const { rows } = await client.query<{ bound: boolean; present: string | number; deleted: string | number }>(
+          `WITH present AS (SELECT count(*) AS n FROM ${table} WHERE ${where}),
+                gone AS (DELETE FROM ${table} WHERE ${where} RETURNING 1)
+           SELECT ${BOUND("$1", "$2")} AS bound, (SELECT n FROM present) AS present, (SELECT count(*) FROM gone) AS deleted`,
+          params,
+        );
+        checkDeleted(rows[0]);
+        const left = await client.query<{ bound: boolean; n: string | number }>(
+          `SELECT ${BOUND("$1", "$2")} AS bound, count(*) AS n FROM ${table} WHERE ${where}`,
+          params,
+        );
+        if (left.rows[0]?.bound !== true) throw new SearchIndexError("unavailable", false, "tenant_unbound");
+        if (Number(left.rows[0].n) !== 0) throw new SearchIndexError("unavailable", true, "delete_incomplete");
+      });
     },
 
     async scanFingerprints(scope: SearchScope, options, context) {
