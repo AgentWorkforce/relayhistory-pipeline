@@ -279,6 +279,41 @@ In `async` and `drain` they also report the consumer:
   - `drain`: 200 iff both.
 - A dormant edge (`RELAYHISTORY_SELFHOST_INGEST` unset) reports neither field.
 
+**`drain` semantics.** New uploads take the synchronous path (SQL in the
+request; nothing new enters the inbox). The consumer keeps running and
+admits the backlog already in the inbox. It is not "consumer only": the
+upload routes are served. Roll back `async` -> `drain` -> wait for
+`consumer.backlog` 0 and `consumer.deadLettered` 0 -> `sync`.
+
+**Object-store permissions (async and drain).** `<root>` is `INGEST_KEY_ROOT`
+(default `96bulls`). Every key below sits in the srv-writer shape
+`<root>/*/v1/ws=*/m=srv_*`. The three dot-prefixed roots are disjoint from every
+tenant prefix, because no org id may start with a dot.
+
+| Prefix / key | Written by | Operations |
+| --- | --- | --- |
+| `<root>/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<machine>/r=<receipt>/a=<ms>-<nonce>.ndjson.zst` (the upload) | request path (async only); consumer | PutObject create-only (`If-None-Match: *`; on 412 the adapter runs HeadObject, plus GetObject if the digest metadata is missing, to accept identical bytes); GetObject (consumer); PutObject **unconditional overwrite** with a small tombstone after the terminal outcome. Never DeleteObject. |
+| `…/r=<receipt>/outcome-admitted.json`, `outcome-refused.json` | consumer | PutObject overwrite; GetObject (status route) |
+| `<root>/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<user hash>/privacy-journal.json` | request path (read), consumer (read; conditional write only when it completes a stranded pending control) | GetObject; PutObject with `If-None-Match: *` or `If-Match: <etag>`. Self-host serves no journaled control today, so it is normally only read. |
+| `<root>/.admission-inbox` (listing) | consumer | ListBucket with prefix `<root>/.admission-inbox` |
+| `<root>/.admission-dlq/<same path as the inbox key>.json` | consumer | PutObject overwrite; ListBucket with prefix `<root>/.admission-dlq`; DeleteObject (best effort, after a later admission; also the operator's redrive) |
+| `<root>/.admission-probe/v1/ws=probe/m=srv_<random>/probe.json` | startup gate, once per process start | PutObject create-only, a refused second create (with the HeadObject reconcile above), PutObject `If-Match` twice (one must be refused), GetObject, then DeleteObject best effort. If DeleteObject is denied, one ~60-byte object per start stays; startup still succeeds. Any other failure refuses startup. |
+| tenant data `<root>/<org>/…` | consumer (and the request path in `sync` / `drain`) | exactly the synchronous path's set (chunks, manifests, pointers; GetObject, HeadObject, conditional PutObject). Canonical acceptance stages nothing, so there is no `buffered-batches` stage prefix. |
+
+Backend notes:
+
+- **S3 / MinIO.** Grant `s3:ListBucket` on the bucket (prefix-conditioned to the
+  two listings above, plus whatever the sync path already needs). Without it S3
+  answers a missing key with 403 instead of 404, and a missing privacy journal
+  (the normal case) would read as an error. Every upload would then be a 503.
+  MinIO must honour `If-None-Match` and `If-Match` on PUT; the startup gate
+  checks this.
+- **GCS.** Creates use `x-goog-if-generation-match: 0` and swaps use
+  `x-goog-if-generation-match: <generation>`. Overwriting an existing object
+  (the tombstone, outcome and marker writes) needs `storage.objects.delete` as
+  well as `storage.objects.create`. Listing needs `storage.objects.list`.
+- `sync` touches none of the dot-prefixed roots and runs no probe.
+
 CA: `SESSION_POSTGRES_TLS_PROFILE=custom-ca` with `SESSION_POSTGRES_CA_FILE`
 (a mounted file, at most 128 KiB) and `SESSION_POSTGRES_CA_SHA256` (64 hex
 characters, pinned). A mismatch fails startup. `supabase` selects the pinned

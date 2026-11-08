@@ -157,6 +157,11 @@ cannot delete, one small probe object per pod start remains.
     `outcome: scan_failed`.
   - Never a key, body, token or header value (tested).
 
+## Object-store permissions
+
+The exact per-prefix contract (operations, the startup probe and its cleanup, S3 and GCS notes) is in
+`docs/selfhost-composition.md` section 5.
+
 ## Env
 
 | Variable | Values | Default |
