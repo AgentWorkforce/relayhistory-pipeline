@@ -142,6 +142,10 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     was. Numbers, booleans and null are kept; an object under a secret key is
     scrubbed by its own keys. The `<scrub-segmenter>` markers now also enclose
     `scrubRecordLine`, so the pinned digest covers the record path.
+  - **Repeated source keys.** `scrubRecordLine` writes a key the source repeats
+    in one object under the name its first occurrence got, so a repeated key
+    that scrubs to `[REDACTED] (2)` no longer lands on the first key's
+    `[REDACTED]` after parsing.
   - **Re-scrubbing rule set 4 output.** Rule set 5 over stored rule set 4
     records catches the first leak (the key is still there). It cannot catch the
     second: the stored value is already under the bound, so only the original

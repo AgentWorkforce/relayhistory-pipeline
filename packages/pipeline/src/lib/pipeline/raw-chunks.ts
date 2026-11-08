@@ -683,8 +683,12 @@ export function canScrubLong(text: string): boolean {
 interface ObjectKeys {
   /** Names written so far (after scrubbing and any suffix). */
   emitted: Set<string>;
-  /** Source key names, so a duplicate the source already had stays as it was. */
-  source: Set<string>;
+  /**
+   * Each source key name and the name it was written as, so a key the source
+   * repeats is written under the same name again (JSON's last value wins for
+   * it, as in the source) and never lands on another key's name.
+   */
+  source: Map<string, string>;
   /** Next suffix to try per scrubbed name, so many collisions stay linear. */
   nextSuffix: Map<string, number>;
   expectKey: boolean;
@@ -707,8 +711,8 @@ interface Container {
  *
  * Keys follow `scrubJson`: a key whose name collides with one already written
  * in the same object gets a ` (2)`, ` (3)`… suffix, so two keys that scrub to
- * the same name both stay readable. A key the source itself repeated is kept
- * as the source had it.
+ * the same name both stay readable. A key the source itself repeated is
+ * written again under the name its first occurrence got.
  *
  * Key context first, as in `scrubJson` (rule set 5): a string value under a key
  * that names a secret (`isSecretRecordKey`, the decoded source key), directly or
@@ -737,15 +741,16 @@ function scrubRecordLine(line: string): string {
       if (isKey) container!.secret = isSecretRecordKey(value);
       let name = scrubbed;
       if (top?.expectKey) {
-        const repeated = top.source.has(value);
-        top.source.add(value);
-        if (!repeated && top.emitted.has(name)) {
+        const written = top.source.get(value);
+        if (written !== undefined) name = written;
+        else if (top.emitted.has(name)) {
           const base = name;
           let n = top.nextSuffix.get(base) ?? 2;
           while (top.emitted.has(`${base} (${n})`)) n += 1;
           name = `${base} (${n})`;
           top.nextSuffix.set(base, n + 1);
         }
+        top.source.set(value, name);
         top.emitted.add(name);
         top.expectKey = false;
       }
@@ -766,7 +771,7 @@ function scrubRecordLine(line: string): string {
         stack.push({
           keys: {
             emitted: new Set(),
-            source: new Set(),
+            source: new Map(),
             nextSuffix: new Map(),
             expectKey: true,
           },

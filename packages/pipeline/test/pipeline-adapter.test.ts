@@ -557,13 +557,25 @@ describe("scrubbing raw chunks before object storage", () => {
       "[REDACTED] (2)": { "[REDACTED]": 2, x: [{ "[REDACTED]": 3 }] },
       "[REDACTED] (3)": 4,
     });
-    // A key the source itself repeated stays exactly as the source had it.
+    // A key the source itself repeated is written again under its first written
+    // name: a key no rule touches stays exactly as the source had it.
     const dup = '{"k":1,"k":2}\n';
     expect(
       new TextDecoder().decode(
         scrubRecords(new TextEncoder().encode(dup)).scrubbed,
       ),
     ).toBe(dup);
+  });
+
+  it("writes a repeated source key under its first written name, never another key's", () => {
+    // The repeated key's last value wins for it, as in the source; it must not
+    // land on "[REDACTED]", the first key's written name.
+    const line = '{"a@example.com":1,"b@example.com":2,"b@example.com":3}\n';
+    const out = new TextDecoder().decode(
+      scrubRecords(new TextEncoder().encode(line)).scrubbed,
+    );
+    expect(out).toBe('{"[REDACTED]":1,"[REDACTED] (2)":2,"[REDACTED] (2)":3}\n');
+    expect(JSON.parse(out)).toEqual({ "[REDACTED]": 1, "[REDACTED] (2)": 3 });
   });
 
   it("finds a secret behind a JSON escape, on a string line or inside a record", () => {

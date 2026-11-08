@@ -56,7 +56,9 @@ const SCRUB_RULESETS: Record<number, string> = {
   // segmenter markers also enclose scrubRecordLine, so the digest covers the record path.
   // Output with no secret-keyed record value and no over-cap quoted value is
   // byte-identical to version 4.
-  5: "50d5eacae1c3e706dba90c7a0a5e9e3b94346e0739072983415f8cbc5eed41ed",
+  // Updated before release (repeated source keys: scrubRecordLine writes a key the source
+  // repeats under its first written name, never another key's). Version 5 has sealed no chunk.
+  5: "b7834070de68bae1e20f4758081a3e1ee5fdd9003ebda6b38628afb7774b1dc2",
 };
 
 const read = (rel: string) =>
