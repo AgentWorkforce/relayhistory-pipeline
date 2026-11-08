@@ -122,6 +122,7 @@ keep their path unchanged either way.
 | `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS` | ingest, read API (Lambda, Worker and the self-host SERVICE) | Exactly `true` enables; anything else is off. Off, a `sh_at_` bearer is refused exactly as before. |
 | `RELAYCONTROL_INTROSPECT_URL` | same | Relaycontrol's base URL, configuration only. Same transport rule as every destination: https, loopback, or `http` to an in-cluster Service name with `ALLOW_IN_CLUSTER_HTTP=true` (the Worker: https or loopback only). |
 | `RELAYCONTROL_INTROSPECT_SECRET` | same | The dedicated service secret, sent as `Authorization: Bearer`. From the secret store only, never a file. |
+| `READ_API_INTROSPECT_POSITIVE_TTL_MS` | read API (Lambda and the self-host SERVICE; the Worker ignores it) | How long (ms) an admitted `sh_at_` token is reused before it is introspected again: the read path's revocation lag. Unset: `60000` (unchanged hosted behaviour). An integer `0`-`60000`; `0` introspects every request (strict revocation, recommended for self-host). Anything else, `""` included, fails startup. See "Cache and revocation lag" below. |
 | `RELAYHISTORY_SELFHOST_READ_API` | read API | Exactly `true` adds `POST /v1/cli/login` (pass-through `sh_at_` exchange through the introspection above, no refresh) and `GET /v1/sessions/:id/catalog`; unset/`""`/`false` off; anything else fails startup. See docs/session-read-api-design.md §2a. |
 | `SEARCH_INDEX_BACKEND` | session-read-api (enabled) | `postgres` (default; no ClickHouse, any known `PIPELINE_RUNTIME`) or `clickhouse` (hosted binding; needs the secret's `clickhouse` block). Anything else, including a name with no implementation in this build (`opensearch`), fails startup; the error names the variable, never the value. |
 | `SEARCH_INDEX_POSTGRES_BACKEND_ID` | session-read-api (enabled, `postgres`) | Required, `[a-zA-Z0-9._-]{1,128}`: the projection-state backend id the search writer records under. Coverage is `READ_API_COMPLETE_SINCE`. Not a credential. |
@@ -170,7 +171,21 @@ keep their path unchanged either way.
   for at most 5 s, at most 1000 entries, single-flight per key. A revoked token
   can therefore keep working for up to 60 s per process. Unavailability is never
   cached, an expired entry is never reused, and a result is never reused for a
-  different claimed machine.
+  different claimed machine. Per path:
+  - **Read API** (Lambda and the self-host SERVICE, reads and
+    `POST /v1/cli/login`): the admit window is
+    `READ_API_INTROSPECT_POSITIVE_TTL_MS`, always passed to the introspector
+    explicitly. Unset is `60000`, the hosted behaviour. Otherwise it must be a
+    plain decimal integer from `0` to `60000` (no sign, spaces, exponent or
+    leading zero). Any other value, `""` included, fails startup, with the flag
+    on or off. `0` introspects every request, so a revoked token or a removed
+    scope is refused on the next read. **Self-host operators who want strict
+    revocation set `READ_API_INTROSPECT_POSITIVE_TTL_MS=0`.** The refusal
+    window stays the client's own (at most 5 s); this setting never lengthens
+    it. The Worker does not read the variable and keeps 60 s.
+  - **Self-host ingest edge** (`src/session-ingest/selfhost-auth.ts`): no
+    positive cache at all (every request introspects); not configurable.
+  - **Hosted ingest middleware**: the client default of 60 s.
 - **Machine verification (AlleyOop courier surface only).** At the ingest the
   request's `X-Machine-Id` (which the courier sends on chunk and manifest
   writes) is forwarded verbatim as `machine`, a claim for relaycontrol to
