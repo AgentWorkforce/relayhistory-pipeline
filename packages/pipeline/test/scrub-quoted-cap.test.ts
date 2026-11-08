@@ -1,15 +1,15 @@
 /**
  * Rule set 4: a quoted secret value longer than the quoted rule's scan bound
  * (`MAX_QUOTED_VALUE`, 4096 UTF-16 code units in `lib/scrub.ts`) is redacted whole, up to
- * its closing quote or, with none, to the first line break (LF, CRLF or lone CR) or the
- * end of the input. U+2028 and U+0085 are not line breaks to it. Rule set 3
+ * its matching closing quote or, with none, to the end of the input. No line break (CR,
+ * LF, CRLF, U+2028, U+2029, U+0085) ends it past the bound. Rule set 3
  * redacted only the first 4096 units (or up to the first space in them) and stored the
  * rest in clear. The bound is a scan bound only; values within it scrub as in rule set 3.
  */
 import { describe, expect, it } from "vitest";
 import * as scrub from "../src/lib/scrub.js";
 import { MAX_SCRUB_CHARS, scrubText } from "../src/lib/scrub.js";
-import { scrubLong } from "../src/lib/pipeline/raw-chunks.js";
+import { canScrubLong, scrubLong, scrubRecords } from "../src/lib/pipeline/raw-chunks.js";
 
 /** `MAX_QUOTED_VALUE` in lib/scrub.ts. */
 const CAP = scrub.MAX_QUOTED_VALUE;
@@ -82,26 +82,82 @@ describe("quoted secret values past the scan bound (rule set 4)", () => {
     );
   });
 
-  it("stops at the end of the line: a quoted value never spans a line break", () => {
+  /** Every line break a value may hold: none ends an over-bound value. */
+  const BREAKS: Array<[string, string]> = [
+    ["LF", "\n"],
+    ["CRLF", "\r\n"],
+    ["CR", "\r"],
+    ["U+2028", "\u2028"],
+    ["U+2029", "\u2029"],
+    ["U+0085", "\u0085"],
+  ];
+  const QUOTES: Array<[string, string]> = [
+    ['"password"', '"'],
+    ["'token'", "'"],
+    ["`secret`", "`"],
+    ['\\"api_key\\"', '\\"'],
+  ];
+
+  it("runs an over-bound backtick value past LF and CRLF to its closing backtick (regression 1)", () => {
     for (const nl of ["\n", "\r\n"]) {
-      const v = solid(CAP * 2);
-      expect(scrubText(`"password": "${v}${nl}next line kept "token": "x"`)).toBe(
-        `"password": "${R}${nl}next line kept "token": "${R}"`,
-      );
-      expect(scrubText(`a: 1${nl}"password": "${spaced(CAP * 2)}"${nl}b: 2`)).toBe(
-        `a: 1${nl}"password": "${R}"${nl}b: 2`,
-      );
+      const tail = `TAILAFTERBREAK${nl === "\n" ? "LF" : "CRLF"}Q7`;
+      for (const head of [solid(CAP * 2), spaced(CAP * 2)]) {
+        const input = `const cfg = {\`secret\`: \`${head}${nl}${tail} more template text${nl}last line\`, kept: 1}${nl}after the literal`;
+        const out = scrubText(input);
+        expect(out).toBe(`const cfg = {\`secret\`: \`${R}\`, kept: 1}${nl}after the literal`);
+        expect(out.includes(tail)).toBe(false);
+        expect(scrub.overCapQuotedValueSpans(input)).toEqual([
+          [13, input.indexOf("`, kept")],
+        ]);
+      }
     }
   });
 
-  it("stops at a lone CR too, but not at U+2028 or U+0085 (not line breaks to the scan)", () => {
-    // LF, CRLF and a lone CR end the value; the rest of the line after the break is kept.
-    expect(scrubText(`"password": "${solid(CAP + 5)}\rafter line"`)).toBe(`"password": "${R}\rafter line"`);
-    // U+2028 and U+0085 are ordinary value units: the value runs on to its closing quote.
-    for (const sep of ["\u2028", "\u0085"]) {
-      const input = `"password": "${solid(CAP + 5)}${sep}after line" kept`;
-      expect(scrubText(input)).toBe(`"password": "${R}" kept`);
-      expect(scrub.overCapQuotedValueSpans(input)).toEqual([[0, input.length - 6]]);
+  it("runs an over-bound value of every quote past every line break to its matching quote", () => {
+    for (const [key, q] of QUOTES) {
+      for (const [name, nl] of BREAKS) {
+        const tail = `UNIQUETAIL${name.replace(/\W/g, "")}`;
+        const input = `${key}: ${q}${solid(CAP + 5)}${nl}${tail}${q} kept after${nl}next "token": "x"`;
+        const out = scrubText(input);
+        expect(out, `${key} ${name}`).toBe(`${key}: ${q}${R}${q} kept after${nl}next "token": "${R}"`);
+        expect(out.includes(tail), `${key} ${name}`).toBe(false);
+      }
+    }
+  });
+
+  it("redacts an over-bound value with a line break and no closing quote to the end of input (regression 2)", () => {
+    for (const [key, q] of QUOTES) {
+      for (const [name, nl] of BREAKS) {
+        for (const head of [solid(CAP + 1), spaced(CAP * 3)]) {
+          const tail = `NOCLOSETAIL${name.replace(/\W/g, "")}`;
+          const input = `x ${key}: ${q}${head}${nl}${tail} more words${nl}and another line`;
+          const out = scrubText(input);
+          expect(out, `${key} ${name}`).toBe(`x ${key}: ${q}${R}`);
+          expect(scrub.overCapQuotedValueSpans(input), `${key} ${name}`).toEqual([[2, input.length]]);
+        }
+      }
+    }
+  });
+
+  it("keeps the text after a closing quote that follows a line break (regression 4)", () => {
+    for (const [, nl] of BREAKS) {
+      const input = `a: 1${nl}"password": "${solid(CAP * 2)}${nl}line two of it${nl}" after the close${nl}b: 2 "user": "ops"`;
+      expect(scrubText(input)).toBe(`a: 1${nl}"password": "${R}" after the close${nl}b: 2 "user": "ops"`);
+    }
+    // Several over-bound values in one text: each ends at its own closing quote.
+    const two = `"password": "${solid(CAP + 9)}\nP1TAIL" mid\n'token': '${spaced(CAP + 9)}\r\nP2TAIL' end`;
+    expect(scrubText(two)).toBe(`"password": "${R}" mid\n'token': '${R}' end`);
+  });
+
+  it("leaves values within the bound line-scoped, as rule set 3 did", () => {
+    // A line break inside the bound still ends the scan: up to the next whitespace.
+    for (const [, nl] of [["LF", "\n"], ["CRLF", "\r\n"], ["CR", "\r"]]) {
+      expect(scrubText(`"password": "${solid(100)}${nl}next line kept"`)).toBe(
+        `"password": "${R}${nl}next line kept"`,
+      );
+      expect(scrubText(`"password": "${solid(CAP - 1)}${nl}${solid(CAP * 2)} kept"`)).toBe(
+        `"password": "${R}${nl}${solid(CAP * 2)} kept"`,
+      );
     }
   });
 
@@ -284,5 +340,87 @@ describe("the segmenter never cuts inside an over-bound value (rule set 4)", () 
   it("refuses a text whose only cuts fall inside an over-bound value", () => {
     const value = spaced(MAX_SCRUB_CHARS + 1024);
     expect(() => scrubLong(`"password": "${value}"`)).toThrow(/scrub limit/);
+  });
+
+  it("refuses a multi-line over-bound value crossing MAX_SCRUB_CHARS, with no content (regression 3)", () => {
+    const MARK3 = "MULTILINETAILMARK";
+    for (const nl of ["\n", "\r\n", "\u2028"]) {
+      const lines = `zeta kappa ${MARK3} omicron${nl}`.repeat(Math.ceil((MAX_SCRUB_CHARS + 2048) / 30));
+      for (const close of ['" after the close', ""]) {
+        const text = `"password": "${solid(CAP + 8)}${nl}${lines}${close}`;
+        expect(text.length).toBeGreaterThan(MAX_SCRUB_CHARS);
+        // Every whitespace (each line break included) is inside the protected span.
+        expect(scrub.overCapQuotedValueSpans(text)).toEqual([[0, close ? text.length - close.length : text.length]]);
+        expect(canScrubLong(text)).toBe(false);
+        let error: unknown;
+        try {
+          scrubLong(text);
+        } catch (e) {
+          error = e;
+        }
+        expect(error).toMatchObject({ code: "chunk_string_too_long", retryable: false });
+        const message = (error as Error).message;
+        expect(message.includes(MARK3) || message.includes("zeta") || message.includes("vvvv")).toBe(false);
+      }
+    }
+  });
+
+  it("does not cut a multi-line over-bound value whose key is far before the bound", () => {
+    // Key ~50,000 units below the bound, value across many lines past it: longCut must
+    // go back to the key; the line breaks inside the value are no cut.
+    const lines = `zeta kappa SPANTAILMARK omicron\n`.repeat(Math.ceil(60_000 / 32));
+    const head = "lorem ipsum dolor sit amet ".repeat(Math.ceil((MAX_SCRUB_CHARS - 50_000) / 27));
+    const text = `${head}"password": "${solid(CAP + 8)}\n${lines}" tail words here`;
+    expect(text.length).toBeGreaterThan(MAX_SCRUB_CHARS);
+    const out = scrubLong(text);
+    expect(out).toBe(`${head}"password": "${R}" tail words here`);
+  });
+});
+
+describe("raw-chunk runs never end inside an over-bound value (rule set 4)", () => {
+  const enc = (s: string) => new TextEncoder().encode(s);
+  const dec = (b: Uint8Array) => new TextDecoder().decode(b);
+
+  it("cuts a long run before the key line, not at a line break inside the value", () => {
+    // Text lines (no records): the run overflows inside the value; the only safe line
+    // boundaries are before the key line, which is within the cut search window.
+    const head = "lorem ipsum dolor sit amet\n".repeat(Math.ceil((MAX_SCRUB_CHARS - 50_000) / 27));
+    const lines = "zeta kappa RUNTAILMARK omicron\n".repeat(Math.ceil(100_000 / 31));
+    const text = `${head}"password": "${solid(CAP + 8)}\n${lines}" after the close\nlast line\n`;
+    expect(text.length).toBeGreaterThan(MAX_SCRUB_CHARS);
+    const out = dec(scrubRecords(enc(text)).scrubbed);
+    expect(out.includes("RUNTAILMARK")).toBe(false);
+    expect(out).toBe(`${head}"password": "${R}" after the close\nlast line\n`);
+  });
+
+  it("refuses a run whose only line boundaries fall inside an over-bound value", () => {
+    const lines = "zeta kappa RUNTAILMARK omicron\n".repeat(Math.ceil((MAX_SCRUB_CHARS + 4096) / 31));
+    const text = `"password": "${solid(CAP + 8)}\n${lines}" after\n`;
+    let error: unknown;
+    try {
+      scrubRecords(enc(text));
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toMatchObject({ code: "chunk_unsegmentable", retryable: false });
+    expect((error as Error).message.includes("RUNTAILMARK")).toBe(false);
+  });
+
+  it("keeps a record or key line inside an open over-bound value in the run", () => {
+    // A JSON record line and a private-key header line after the key line would end
+    // the run; the value is still open, so they join it and the tail stays redacted.
+    for (const between of ['{"a": 1}', "-----BEGIN PRIVATE KEY-----"]) {
+      const text = `x\n\`secret\`: \`${solid(CAP + 8)}\n${between}\nRECTAILMARK words\n\` after the close\n{"b": 2}\n`;
+      const out = dec(scrubRecords(enc(text)).scrubbed);
+      expect(out.includes("RECTAILMARK"), between).toBe(false);
+      expect(out.includes("vvvvvvvv"), between).toBe(false);
+      // The record line: text after the closing quote is kept. (A key header with no
+      // footer keeps the run open to the end, where the private-key rule takes over.)
+      if (between.startsWith("{"))
+        expect(out).toBe(`x\n\`secret\`: \`${R}\` after the close\n{"b": 2}\n`);
+    }
+    // A closed value ends the run as before: the record line after it is its own record.
+    const closed = `\`secret\`: \`${solid(CAP + 8)}\`\n{"note": "x"}\n`;
+    expect(dec(scrubRecords(enc(closed)).scrubbed)).toBe(`\`secret\`: \`${R}\`\n{"note": "x"}\n`);
   });
 });

@@ -52,6 +52,33 @@ describe("fitForScrub", () => {
     expect(out).not.toContain("SECRETTAILMARK");
   });
 
+  test("rule set 4: a multi-line over-bound quoted value crossing the bound becomes the marker; the refusal holds no content", () => {
+    // The value passes the quoted rule's 4096-unit scan bound on its first line, then runs
+    // across many lines (LF, CRLF, U+2028) past MAX_SCRUB_CHARS. Line breaks do not end
+    // it, so every cut candidate is inside its protected span and scrubLong refuses.
+    for (const nl of ["\n", "\r\n", "\u2028"]) {
+      const lines = `zeta kappa MULTILINETAILMARK omicron${nl}`.repeat(Math.ceil((MAX_SCRUB_CHARS + 2048) / 36));
+      for (const close of ['` after the close', ""]) {
+        const text = `\`secret\`: \`${"v".repeat(4104)}${nl}${lines}${close}`;
+        let error: unknown;
+        try {
+          scrubRecords(enc(liveLine({ ...base, payload: { text } }, "t") + "\n"));
+        } catch (e) {
+          error = e;
+        }
+        expect(error).toMatchObject({ code: "chunk_string_too_long", retryable: false });
+        expect((error as Error).message).not.toContain("MULTILINETAILMARK");
+        expect((error as Error).message).not.toContain("zeta");
+        const fitted = fitForScrub({ ...base, payload: { text, n: 1 } });
+        const out = dec(scrubRecords(enc(liveLine(fitted, "t") + "\n")).scrubbed);
+        expect(JSON.parse(out).payload.text).toBe(oversizeRedaction(text.length));
+        expect(JSON.parse(out).payload.n).toBe(1);
+        expect(out).not.toContain("MULTILINETAILMARK");
+        expect(out).not.toContain("zeta");
+      }
+    }
+  });
+
   test("a long text scrubLong can cut is left whole for it, and scrubbed", () => {
     const text = Array.from({ length: 60_000 }, (_, i) => (i % 997 === 0 ? KEY : `w${i}`)).join(" ");
     expect(text.length).toBeGreaterThan(MAX_SCRUB_CHARS);

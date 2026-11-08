@@ -80,26 +80,33 @@ scrubs when it seals a chunk. For a client that cannot, the server's
   (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3, 4 from rule set 4) for the client's manifest.
   Rule set 4: a quoted secret value longer than the quoted rule's 4096-unit scan
   bound (`MAX_QUOTED_VALUE` in `lib/scrub.ts`) is replaced whole by `[REDACTED]`,
-  up to its closing quote or, with none, to the first line break (LF, CRLF or a
-  lone CR) or the end of the input; rule set 3 stored the part past the bound in
-  clear. Values within the bound scrub byte-identically to rule set 3.
-  - **Line-confined, a narrowing.** The agreed wording redacts the whole
-    remainder of the value, to its closing quote or the end of the input. Rule
-    set 4 stops at a line break instead, so the segmenter can keep cutting runs at line boundaries; text after
-    the break is scrubbed by the other rules as usual. U+2028 and U+0085 are not
-    line breaks to it. This narrowing needs relayscrubber-lead's acceptance.
-  - **New refusals.** `longCut` (long strings, cut after any whitespace) never
-    ends a segment strictly between the start of such a value's key and the
-    value's end; a cut exactly at the key's start is allowed. The same holds for
-    a generated unquoted value of 4096 or more units after a quoted key. It finds
+  up to its matching closing quote or, with none, to the end of the input; rule
+  set 3 stored the part past the bound in clear. Values within the bound scrub
+  byte-identically to rule set 3.
+  - **Across line breaks.** Once a value is past the bound, no line break ends
+    it: CR, LF, CRLF, U+2028, U+2029 and U+0085 are ordinary value units, so a
+    template literal, an escaped line continuation or a malformed transcript
+    value that spans lines is redacted to its closing quote (any supported
+    quote, backtick included) or the end of the input, and the text after the
+    closing quote is kept. Stopping at a line break would leave a keyless tail
+    that no later rule could identify. Whether a value is past the bound is
+    still decided on its key's own line: within the bound a line break ends the
+    scan, as in rule set 3.
+  - **New refusals.** No segment boundary falls strictly between the start of
+    such a value's key and the value's end; a cut exactly at the key's start is
+    allowed. The same holds for a generated unquoted value of 4096 or more units
+    after a quoted key. `longCut` (long strings, cut after any whitespace) finds
     these values (`overCapQuotedValueSpans`) in the text up to 4096 + 256 units
     past the segment bound, which covers the longest key plus the scan's reach
     (4096 + 150 units from the key's start), so a key just below the bound or
-    straddling it is protected too. Values within the bound get no such span;
-    as in rule set 3 they rely on the context check (`CUT_CONTEXT_CHARS`). Runs
-    are cut only at line boundaries, which no such value crosses. When no other
-    cut is left the string is rejected with `chunk_string_too_long`, which is
-    non-retryable and holds no content. The session ingest (`src/session-ingest/oversize.ts`) replaces such
+    straddling it is protected too; one still open there is taken to run to the
+    end. `safeCut` (runs of text lines, cut at line boundaries) skips line
+    boundaries inside them, and a run whose last such value is still open keeps
+    a following record or private-key line instead of ending before it. Values
+    within the bound get no such span; as in rule set 3 they rely on the
+    context check (`CUT_CONTEXT_CHARS`). When no cut outside them is left the
+    string is rejected with `chunk_string_too_long` (a run: `chunk_unsegmentable`),
+    which is non-retryable and holds no content. The session ingest (`src/session-ingest/oversize.ts`) replaces such
     a string with its redaction marker before sealing, and the neon reader
     (`src/migration/neon-s3-sync/neon-reader.ts`) truncates it to a prefix that
     the sealer then scrubs.

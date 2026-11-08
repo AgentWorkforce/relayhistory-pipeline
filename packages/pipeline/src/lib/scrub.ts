@@ -84,8 +84,8 @@ const QUOTED_KEY =
 /**
  * How far the quoted key/value rule looks for a quoted value's closing quote before it
  * treats the value as over-long. A scan bound, not a storage bound (rule set 4): a value
- * that runs past it is redacted whole, up to its closing quote or, with none, to the end
- * of its line or of the input, so no part of it is stored.
+ * that runs past it is redacted whole, up to its matching closing quote or, with none,
+ * to the end of the input (line breaks do not end it), so no part of it is stored.
  */
 export const MAX_QUOTED_VALUE = 4096;
 
@@ -116,10 +116,13 @@ function backslashesBefore(text: string, at: number): number {
  * values already redacted and `op://` references.
  *
  * A value longer than `MAX_QUOTED_VALUE` (no closing quote and no line break within
- * it) is redacted whole, whatever it holds: up to its closing quote, found by the same
- * test past the bound, or to its first line break (LF or CR; not U+2028 or U+0085) or
- * the end of the input when there is none. A generated unquoted value longer than the
- * bound is redacted to its end too. The text
+ * it) is redacted whole, whatever it holds: up to its matching closing quote, found by
+ * the same test past the bound, or to the end of the input when there is none. No line
+ * break (CR, LF, CRLF, U+2028, U+2029, U+0085) ends it past the bound: a template
+ * literal, an escaped line continuation or a malformed value can span lines, and a
+ * tail left after a break would have no key for a later rule to find. Within the bound
+ * a line break still ends the scan, as in rule set 3. A generated unquoted value longer
+ * than the bound is redacted to its end too. The text
  * past the bound is walked once, and the redaction consumes it, so the pass stays
  * linear. With `overCap`, the span [key start, value end) of each over-long quoted value
  * and of each generated unquoted value of `MAX_QUOTED_VALUE` units or more is recorded.
@@ -161,12 +164,10 @@ function redactQuotedSecretValues(
         const own = i - run >= valueStart ? run : i - valueStart;
         return period ? own % period === bs : own === bs;
       };
-      /** From `i`: the value's end at its closing quote, or at a line break or the end. */
+      /** From `i`: the value's end at its matching closing quote, or the end of the input (no line break ends it). */
       const restOfValue = (i: number) => {
         for (; i < text.length; i += 1) {
-          const c = text[i];
-          if (c === "\n" || c === "\r") return i;
-          if (c === quote && closesAt(i)) return i - bs;
+          if (text[i] === quote && closesAt(i)) return i - bs;
         }
         return text.length;
       };
@@ -186,7 +187,7 @@ function redactQuotedSecretValues(
         i += 1;
       }
       if (valueEnd === -1 && !skipped && i - valueStart > MAX_QUOTED_VALUE) {
-        // Past the bound with no closing quote or line break: the whole rest of it.
+        // Past the bound with no closing quote or line break: the whole rest of it, across lines.
         longValue = true;
         valueEnd = restOfValue(i);
       } else if (valueEnd === -1) {

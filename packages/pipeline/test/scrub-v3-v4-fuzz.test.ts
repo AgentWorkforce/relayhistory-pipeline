@@ -3,8 +3,10 @@
  * units) scrubs byte-identically to rule set 3. This differential fuzz runs rule set 3's
  * `lib/scrub.ts` against the current one on random key/value inputs, and allows a
  * difference only where some line holds more than 4096 units (where an over-bound value
- * can be). 2,000 inputs by default; SCRUB_FUZZ_INPUTS raises it, SCRUB_FUZZ_SEED changes
- * the seed.
+ * can be: a value is over the bound only when its key's own line runs 4096 units past
+ * its opening quote, though from there it runs across later line breaks, CR, LF, CRLF,
+ * U+2028, U+2029 and U+0085 alike, to its matching closing quote or the end of input).
+ * 2,000 inputs by default; SCRUB_FUZZ_INPUTS raises it, SCRUB_FUZZ_SEED changes the seed.
  *
  * Rule set 3 is frozen in `fixtures/scrub-ruleset-3.ts`: byte for byte
  * `git show fc10bb03:packages/pipeline/src/lib/scrub.ts` (it has no imports), pinned by
@@ -42,7 +44,7 @@ describe("rule set 3 vs 4 within the scan bound (differential fuzz)", () => {
     const keys = ['"password"', "'token'", "`secret`", '\\"api_key\\"', '\\\\\\"auth\\\\\\"', '"name"', '"access_token"', '"db password"'];
     const seps = [": ", ":", " = ", " => ", "="];
     const quotes = ['"', "'", "`", '\\"', '\\\\\\"', ""];
-    const atoms = ["a b", '\\"', "\\\\", '"', "'", "`", "\n", "\r\n", "\r", " ", "op://", "capy_" + "Ab1".repeat(7), "aB3dE5fG7hJ9kL1mN2pQ4rS6tU8wX0yZ", ",", "{", "}", ":", "="];
+    const atoms = ["a b", '\\"', "\\\\", '"', "'", "`", "\n", "\r\n", "\r", "\u2028", "\u2029", "\u0085", " ", "op://", "capy_" + "Ab1".repeat(7), "aB3dE5fG7hJ9kL1mN2pQ4rS6tU8wX0yZ", ",", "{", "}", ":", "="];
     const value = () => {
       const r = rnd(10);
       const n = r < 6 ? rnd(40) : r < 9 ? rnd(4097) : 4090 + rnd(7);
