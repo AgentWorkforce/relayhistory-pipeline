@@ -110,12 +110,13 @@ migration bytes; this proposed client contract does not change that disposition.
 
 The next source sequence is:
 
-1. Route the proposed immutable capture-profile/current-candidate RPC contract
-   to layered-sessions-pipeline for reconciliation with its 049000 design and
-   the separate 050000 attester design. That owner must resolve the capability's
-   placement and trust boundary before executable SQL. Root reviews and then
-   binds the client to the accepted exact interface. Prove no direct table
-   grants, runtime profile installation, owner fallback, missing-join success or cross-scope
+1. Layered-sessions-pipeline accepted the dedicated receipt-reader RPC/profile
+   prerequisite in its 049000 bundle under the d9ced9cc contract (re-review
+   message 245204241430605824). That owner implements the source inventory,
+   role/ACL, profile and complete-domain SQL proof; Root coordinates/reviews
+   integration. The separate 050000 attester consumes that qualified capability.
+   Prove no direct table grants, runtime profile installation, owner fallback,
+   missing-join success or cross-scope
    reads. Actual SQL capability/role installation remains a separate operation.
 2. Produce verified buffered-stage byte/export bindings and current native
    maxima, then reconcile them with the existing legacy capture. Enclose slow
@@ -222,8 +223,10 @@ that separate evidence, and its success will still not qualify a live producer.
 C1: select a dedicated NOLOGIN receipt-reader boundary, not a seeder-reuse waiver.
 The proposed source name is bulls96_frontier_receipt_reader; activating or
 granting it is not part of this client PR. Group the read RPC, immutable capture
-profile and reader boundary with the 049000 prerequisite bundle, subject to the
-registry/implementation owner's explicit source inventory and lock/ACL review.
+profile and reader boundary with the 049000 prerequisite bundle. The
+implementation owner accepted this source amendment in message
+245204241430605824; its detailed source inventory and lock/ACL proof still
+require implementation/review.
 This follows v3 source_plan_reuse_C3's separate qualified least-privilege receipt
 adapter prerequisite and leaves the reviewed 050000 writer boundary unchanged.
 Do not implicitly broaden 050000 permissions or guess a new 053000 allocation.
@@ -294,3 +297,11 @@ vector paths, README and SHA256SUMS. Byte comparison verified both artifact pair
 identical before removing the duplicate paths. Tests now load the author paths
 with the same exact three source pins. This is provenance/path consolidation,
 not a change to the accepted reader API, planner hashing or coverage claims.
+
+Post-review source nits: the planner HOLD regression now reads the exact pinned
+plannerNonAsciiOrderVector from the author artifact, with surrogate/whitespace
+negatives added separately. Step 1 records the 049000 owner's accepted placement
+instead of calling it undecided. Typed audit-schema/S4 negatives and actual SQL
+completeness/PG-version qualification remain explicitly with their future
+consumers; the reconciliation review accepted these as non-blocking for this
+unwired client, not as implemented production guarantees.

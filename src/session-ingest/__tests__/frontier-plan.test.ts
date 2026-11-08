@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { parseFrontierJson, readFrontierBundle, MAX_FRONTIER_BUNDLE_BYTES } from "../frontier-plan-input.ts";
-import { mkdtempSync, rmSync, writeFileSync, symlinkSync, truncateSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, symlinkSync, truncateSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   FRONTIER_CAPTURE_PROTOCOL,
   evaluateCanonicalFrontier,
@@ -164,7 +165,11 @@ describe("canonical frontier read-only planner", () => {
   });
 
   test("unsupported non-ASCII or surrogate identifiers HOLD without changing planner order", () => {
-    for (const id of ["\u{10000}", "\ue000", "\ud800", "bad id"]) {
+    const bytes = readFileSync(new URL("../../../docs/handoffs/frontier-attester-20261107/publication-frontier-contract-vectors-20261107.json", import.meta.url));
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe("fd3f8908524b708b24e1511dc88795eb365304f7e3d74cb6267f4491a3231abe");
+    const vector = JSON.parse(bytes.toString("utf8")).plannerNonAsciiOrderVector as { identifiers: string[]; expected: string };
+    expect(vector.expected).toBe("HOLD_UNTIL_REVIEWED_049_AMENDMENT");
+    for (const id of [...vector.identifiers, "\ud800", "bad id"]) {
       const capture = readyCapture();
       const maximum = capture.origins[0]!.recordMaxima[0]!;
       maximum.recordId = id;
