@@ -10,7 +10,7 @@
  *
  * Dormant: no config, credential, database or store work. The process stays up,
  * GET /healthz and GET /readyz answer 200 {"ok":true,"enabled":false}, and SIGTERM exits 0.
- * Enabled: publicationRuntimeConfig is validated before the probe port opens, so a bad
+ * Enabled: the selected target's config (publicationConfigForTarget) is validated before the probe port opens, so a bad
  * or missing target fails startup (exit 1, the publication-main error line); then
  *   GET /healthz  200 {"ok":true,"enabled":true,"reason":"starting"|"ok"} while the last
  *                 cycle ended (or the service started) within the cycle budget
@@ -22,14 +22,15 @@
  * publication-main does on a host. SIGTERM/SIGINT stop the loop (publication-main
  * cancels owned IO) and exit 0. Publication GC (`--gc`) is not this service.
  *
- * The runtime is the existing host runtime: it requires the AWS/Supabase target
- * (publication-runtime.ts publicationRuntimeConfig, IMDSv2 credentials). This file
- * changes none of that; docs/selfhost-composition.md records what that means for a
- * self-host stack.
+ * The runtime is selected by INGEST_PUBLICATION_TARGET (publication-target.ts): unset
+ * or "aws" is the existing host runtime (AWS/Supabase target, IMDSv2 credentials,
+ * publication-runtime.ts publicationRuntimeConfig); "portable" is the self-host runtime
+ * (publication-portable.ts). docs/selfhost-composition.md records the self-host stack.
  */
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { publicationEnabled, publicationRuntimeConfig } from "./publication-runtime.ts";
+import { publicationEnabled } from "./publication-runtime.ts";
+import { publicationConfigForTarget } from "./publication-portable.ts";
 import { publicationMain } from "./publication-main.ts";
 
 export const PUBLICATION_HEALTH_PORT_VAR = "WORKER_HEALTH_PORT";
@@ -98,7 +99,7 @@ export async function publicationService(
   const port = publicationHealthPort(env);
   const enabled = publicationEnabled(env, "publish");
   // Enabled: the target is validated before anything listens, so a misconfiguration is a startup failure.
-  const maxAgeMs = enabled ? publicationRuntimeConfig(env).budgetMs + IDLE_WAIT_MS + STALL_MARGIN_MS : 0;
+  const maxAgeMs = enabled ? publicationConfigForTarget(env).budgetMs + IDLE_WAIT_MS + STALL_MARGIN_MS : 0;
   const state: PublicationHealthState = { enabled, lastProgressAt: now(), cycles: 0 };
   const stop = new AbortController();
   const onSignal = () => stop.abort();

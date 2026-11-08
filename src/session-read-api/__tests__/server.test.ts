@@ -12,6 +12,8 @@ import type { ClickHouseClient } from "../../session-pipeline/vendor/search-inde
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
 import { startReadApiService, type ReadApiService } from "../server.ts";
 import { memoryLiveness } from "./support.ts";
+import { READER_LOGIN_SQL, READER_PG16_SQL } from "../lambda.ts";
+import { readerLoginAnswer } from "./reader-login-support.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] };
 const LOOPBACK = { host: "127.0.0.1", port: 0 };
@@ -272,7 +274,7 @@ describe("enabled", () => {
     const seen: string[] = [];
     pg.Pool = class {
       on() { return this; }
-      async query(text: string) { seen.push(text); return { rows: [{ role: "reader", rolsuper: false, rolbypassrls: false }] }; }
+      async query(text: string) { seen.push(text); return { rows: readerLoginAnswer(text) ?? [] }; }
       async end() {}
     } as unknown as typeof pg.Pool;
     try {
@@ -291,8 +293,8 @@ describe("enabled", () => {
       const r = await fetch(url("/v1/events?q=x"));
       expect(r.status).toBe(401);
       expect(((await r.json()) as { error: { code: string } }).error.code).toBe("missing_authorization");
-      expect(seen).toHaveLength(1);
-      expect(seen[0]).toContain("FROM pg_roles r WHERE r.rolname = current_user");
+      // Reader admission only: the login row, then (PG16+) system_user and membership edges.
+      expect(seen).toEqual([READER_LOGIN_SQL, READER_PG16_SQL]);
     } finally { pg.Pool = RealPool; }
   });
 
