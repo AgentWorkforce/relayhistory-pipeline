@@ -2,9 +2,10 @@
 --
 -- The session read Worker (role bulls96_read_api) gates buffered-origin hits in
 -- transcript_events (READ_API_BUFFERED_SEARCH_GATE, src/session-read-api/buffered-search-gate.ts).
--- The gate reads sessions.ingest_claim_attempts, ingest_lazy_policy, ingest_lazy_ack_decisions,
--- owner_buffered_parity (and, through owner_buffered_parity_expected, ingest_control_receipts),
--- ingest_privacy_authority, upload_resets, upload_deletions and ingest_frozen_source_deletions.
+-- The gate reads sessions.ingest_claim_attempts, ingest_batches, ingest_fence_versions,
+-- ingest_lazy_policy, ingest_lazy_ack_decisions, owner_buffered_parity (and, through
+-- owner_buffered_parity_expected, ingest_control_receipts), ingest_privacy_authority,
+-- upload_resets, upload_deletions and ingest_frozen_source_deletions.
 -- bulls96_read_api holds no grant on any of them (20261105043700 REVOKEs owner_buffered_parity from
 -- it explicitly), so a direct read fails 42501. This migration adds ONE SECURITY DEFINER reader
 -- that evaluates the gate for one owner's hits. The Worker role never reads the gate tables
@@ -56,8 +57,87 @@
 --     deleted                    RULE 5(a)/(b): (org, ws, owner, source, session) is in
 --                                upload_deletions or ingest_frozen_source_deletions under ANY
 --                                origin;
---     reset                      the claim's reset_epoch is NULL or is not the owner's
---                                upload_resets count.
+--     batch_not_buffered         20261105043700 stg batch predicate: the claim's ingest_batches row
+--                                (org, ws, origin, batch) is missing, or is not the owner's, or
+--                                carries another digest, or is not state committed with
+--                                publication_state buffered and a non-NULL committed_at;
+--     reset                      RULE 5(c): the claim's reset_epoch is NULL or is not the owner's
+--                                upload_resets count; the batch's committed_at is NULL; a reset of
+--                                the owner has reset_at NULL or >= committed_at; or the hit's epochs
+--                                entry carries a reset_epoch other than that count;
+--     superseded                 LATEST ADMISSION (043700 judged.live, ingest_attempt_fenced): the
+--                                claim's epochs (jsonb array) hold no entry for (source,
+--                                session_id), or ambiguous entries (min <> max epoch or reset
+--                                epoch), or the entry's epoch is not the session's current
+--                                ingest_fence_versions epoch on the claim's origin (0 without a
+--                                row). A deletion, disable or reset bumps that fence after
+--                                admission, so the claim is no longer the record's latest
+--                                admission. Not covered by the parity digests.
+--
+-- 043700 PARITY: every admission condition 20261105043700 applies at read time (owner_buffered_read_scope,
+-- then the keep predicate shared by buffered_sessions_for and buffered_session_stages_for), and
+-- where this gate checks it (line numbers in this file) or why it does not.
+--   Scope
+--     caller is bulls96_read_api ................................ L204 (42501)
+--     org/workspace = transaction pins .......................... L207 (42501)
+--     user = the pinned reader (043700) ......................... DIFFERENT BY DESIGN: owner is a
+--         parameter (L342: claim must be (pins, owner)); see THREAT MODEL below
+--     head/baseline/epoch shapes ................................ L212-L222; hit shapes L242
+--     privacy authority not fenced (043700: 55006) .............. L256 (gate_closed)
+--     head not pending, head epoch = cutover ................... L255 (gate_closed)
+--     policy unexpired, control_epoch/baseline = passed ......... L260-L262 (gate_closed)
+--     G2 parity row exists ...................................... L268 (parity_missing)
+--     parity tuple, receipts_ok, target generation, digests ..... L273-L284 (parity_stale)
+--     required admission epoch (policy epoch via identity) ..... L305, CASE L358
+--     required admission version (head version, 0 no head) ..... L306, CASE L360
+--   Stage (stg)
+--     claim identity (org, ws, user) ............................ L342
+--     batch row: owner, digest, committed, buffered, accepted ... L343, L323 (batch_not_buffered)
+--     records is an array, holds (source, session), not retired  L312 (admission_session_mismatch)
+--     epochs is an array ........................................ L349 (non-array = no entry: superseded)
+--     claim reset_epoch NOT NULL and = upload_resets count ...... L292, L328 (reset)
+--     RULE 5(c): no reset at or after committed_at ............. L332 (reset)
+--     claim version/identity set, identity = policy identity .... L305, L306
+--     lazy ACK decisions carry the claim's version .............. L309 (admission_version_mismatch)
+--     outbox buffered with this active stage; stage acknowledged,
+--       not redacted; outbox/stage/claim identity rows equal;
+--       group_ordinals an array ................................. NOT MIRRORED: per-stage. The hit
+--         names a claim, not a stage; these normally move together with a deletion, reset or fence
+--         bump the gate does check, but that is not proven here (residual, see below)
+--     GC ancestor chain carries the same claim (bound 64) ....... NOT MIRRORED: per-stage (residual)
+--   Record (bad_stage, recn, ev, judged.live, kept)
+--     epochs entry present and unambiguous ..................... L338 (superseded)
+--     entry epoch = current fence version (claim origin) ........ L352, L338 (superseded)
+--     entry reset_epoch = upload_resets count ................... L333 (reset)
+--     upload_deletions same origin / ANY origin; frozen ANY ..... L315 (deleted; ANY covers same)
+--     record source/session non-NULL ............................ L242 (non-empty hit strings)
+--     group ordinals well formed, no duplicate ordinals;
+--       group is one session; >= 1 live (lazy) or all live ...... NOT MIRRORED: per-group/ordinal; the
+--         hit carries no ordinal (residual)
+--     lazy ACK branch: native slot current owner/seat/digest ... NOT MIRRORED: per-ordinal (residual)
+--   List only
+--     published (ingest_publication_heads) exclusion ........... INAPPLICABLE: list dedupe so the
+--         canonical copy wins; buffered_session_stages_for (detail) does not apply it, so it is not
+--         an admission condition
+-- Residual divergence: the NOT MIRRORED rows are 043700 conditions on the stage/ordinal serving
+-- the record. A hit whose claim passes every row above but whose stage is not (or no longer) the
+-- active, acknowledged one would pass here and be hidden by 043700. Closing it needs the hit's
+-- stage (ingest_stage_intents by claim_token); it is out of this follow-up's scope.
+--
+-- THREAT MODEL. p_owner_user_id is a parameter, not a pin: the reader of a shared workspace sees
+-- hits owned by other users, and the gate judges each against its owner. Only bulls96_read_api may
+-- call (L204), only inside the verified (org, workspace) pins (L207); a different tenant is
+-- 42501. Within that tenant a caller may name ANY user. What it can learn per call: for each
+-- supplied (claim_token, source, session_id), whether that claim token is a claim of (org, ws,
+-- owner) (a row or no row), and, only for such a claim, one drop reason, which can reveal the
+-- owner's gate/parity state, whether the session is deleted or reset, the batch's state and
+-- whether a later fence superseded it. It returns no content, no timestamps and no other claim.
+-- The claim token bounds this: rows exist only for a token that IS a claim of that owner in the
+-- pinned tenant (L342); tokens are random v4 UUIDs, stored only in the ledger and in the
+-- owner's transcript_events rows, so a caller without a token learns nothing (no row, no reason)
+-- and cannot enumerate users, sessions or deletions. The Worker only passes tokens and owners
+-- taken from transcript_events rows the reader's own tenant-scoped search returned, and reports
+-- only aggregate drop counts to logs, never per-hit reasons to the client.
 --
 -- Locks. STABLE, read-only, no row lock, no advisory lock, no write: AccessShareLock only, inside
 -- the read API's READ ONLY transactions under the read role's 2 s statement_timeout. The parity
@@ -82,12 +162,13 @@ BEGIN
  IF EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
    WHERE n.nspname='sessions' AND c.relname IN('ingest_claim_attempts','ingest_lazy_policy','ingest_lazy_ack_decisions',
     'owner_buffered_parity','upload_resets','upload_deletions','ingest_frozen_source_deletions',
-    'ingest_privacy_authority','ingest_control_receipts')
+    'ingest_privacy_authority','ingest_control_receipts','ingest_batches','ingest_fence_versions')
     AND c.relowner<>me)
   OR (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
    WHERE n.nspname='sessions' AND c.relkind='r' AND c.relname IN('ingest_claim_attempts','ingest_lazy_policy',
     'ingest_lazy_ack_decisions','owner_buffered_parity','upload_resets','upload_deletions',
-    'ingest_frozen_source_deletions','ingest_privacy_authority','ingest_control_receipts'))<>9
+    'ingest_frozen_source_deletions','ingest_privacy_authority','ingest_control_receipts','ingest_batches',
+    'ingest_fence_versions'))<>11
   OR NOT EXISTS(SELECT 1 FROM pg_proc p
    WHERE p.oid=to_regprocedure('sessions.owner_buffered_parity_expected(text, text, text, text, bigint, text, text)')
      AND p.proowner=me)
@@ -114,6 +195,7 @@ DECLARE
   v_version bigint;
   v_adm_version bigint;
   v_gate text;
+  v_resets bigint;
   v_hit jsonb;
   pol sessions.ingest_lazy_policy%ROWTYPE;
   par sessions.owner_buffered_parity%ROWTYPE;
@@ -206,6 +288,10 @@ BEGIN
     END IF;
   END IF;
 
+  -- 043700 ctl.resets: the owner's upload_resets count, read once per call.
+  SELECT count(*) INTO v_resets FROM sessions.upload_resets AS ur
+   WHERE ur.org_id = v_org AND ur.workspace_id = v_ws AND ur.user_id = p_owner_user_id;
+
   RETURN QUERY
   WITH hits AS (
     SELECT DISTINCT (t.e ->> 'claim_token')::uuid AS h_token, t.e ->> 'source' AS h_source, t.e ->> 'session_id' AS h_session
@@ -232,12 +318,40 @@ BEGIN
             OR EXISTS (SELECT 1 FROM sessions.ingest_frozen_source_deletions AS fd
                         WHERE fd.org_id = v_org AND fd.workspace_id = v_ws AND fd.user_id = p_owner_user_id
                           AND fd.source = h.h_source AND fd.session_id = h.h_session)) AS is_deleted,
-           (a.reset_epoch IS NULL OR a.reset_epoch IS DISTINCT FROM
-             (SELECT count(*) FROM sessions.upload_resets AS ur
-               WHERE ur.org_id = v_org AND ur.workspace_id = v_ws AND ur.user_id = p_owner_user_id)) AS reset_behind
+           -- 043700 stg batch predicate: the claim's batch row exists, is the owner's, carries the
+           -- claim's digest and is committed, buffered and accepted. A missing row fails closed.
+           coalesce(b.user_id = p_owner_user_id AND b.digest = a.digest AND b.state = 'committed'
+                    AND b.publication_state = 'buffered' AND b.committed_at IS NOT NULL, false) AS batch_ok,
+           -- RULE 5(c): the claim's admission reset epoch and the per-session epochs entry's reset
+           -- epoch are the owner's current upload_resets count, and no reset of the owner is at or
+           -- after the batch's acceptance (committed_at). A NULL anywhere hides.
+           (a.reset_epoch IS NULL OR a.reset_epoch IS DISTINCT FROM v_resets
+            OR b.committed_at IS NULL
+            OR EXISTS (SELECT 1 FROM sessions.upload_resets AS ur
+                        WHERE ur.org_id = v_org AND ur.workspace_id = v_ws AND ur.user_id = p_owner_user_id
+                          AND (ur.reset_at IS NULL OR ur.reset_at >= b.committed_at))
+            OR (ev.n > 0 AND ev.reset_epoch IS DISTINCT FROM v_resets)) AS reset_behind,
+           -- 043700 judged.live (ingest_attempt_fenced): exactly one unambiguous epochs entry for
+           -- (source, session) whose fence epoch is still the session's current fence version
+           -- (no fence row = 0) on the claim's origin. A later deletion, disable or reset bumps the
+           -- fence and supersedes this admission; a missing or ambiguous entry fails closed.
+           coalesce(ev.n > 0 AND ev.epoch = ev.epoch_max AND ev.reset_epoch = ev.reset_max
+                    AND coalesce(fv.epoch, 0) = ev.epoch, false) AS is_latest
       FROM hits AS h
       JOIN sessions.ingest_claim_attempts AS a
         ON a.claim_token = h.h_token AND a.org_id = v_org AND a.workspace_id = v_ws AND a.user_id = p_owner_user_id
+      LEFT JOIN sessions.ingest_batches AS b
+        ON b.org_id = a.org_id AND b.workspace_id = a.workspace_id AND b.origin_id = a.origin_id
+       AND b.batch_id = a.batch_id
+      LEFT JOIN LATERAL (
+        SELECT min(x.epoch) AS epoch, max(x.epoch) AS epoch_max, min(x.reset_epoch) AS reset_epoch,
+               max(x.reset_epoch) AS reset_max, count(*) AS n
+          FROM jsonb_to_recordset(CASE WHEN jsonb_typeof(a.epochs) = 'array' THEN a.epochs ELSE '[]'::jsonb END)
+               AS x(source text, session_id text, epoch bigint, reset_epoch bigint)
+         WHERE x.source = h.h_source AND x.session_id = h.h_session) AS ev ON true
+      LEFT JOIN sessions.ingest_fence_versions AS fv
+        ON fv.org_id = v_org AND fv.workspace_id = v_ws AND fv.user_id = p_owner_user_id
+       AND fv.origin_id = a.origin_id AND fv.source = h.h_source AND fv.session_id = h.h_session
   )
   SELECT j.h_token::text, j.h_source, j.h_session,
          CASE
@@ -247,7 +361,9 @@ BEGIN
            WHEN j.covers IS NOT TRUE THEN 'admission_session_mismatch'
            WHEN v_gate IS NOT NULL THEN v_gate
            WHEN j.is_deleted IS NOT FALSE THEN 'deleted'
+           WHEN j.batch_ok IS NOT TRUE THEN 'batch_not_buffered'
            WHEN j.reset_behind IS NOT FALSE THEN 'reset'
+           WHEN j.is_latest IS NOT TRUE THEN 'superseded'
          END::text
     FROM judged AS j;
 END

@@ -7,11 +7,14 @@
  * SQL behaviour is proven in buffered-search-gate.pglite.test.ts.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ClickHouseError, type ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
 import {
   CONTROL_HEAD_PATH,
   GATE_SQL,
+  GATE_SQL_REASONS,
   MAX_GATE_HITS,
   MAX_GATE_OWNERS,
   createBufferedSearchGate,
@@ -244,7 +247,9 @@ describe("the gate: every fail-closed case drops the hit", () => {
       "parity_missing",
       "parity_stale",
       "deleted",
+      "batch_not_buffered",
       "reset",
+      "superseded",
     ] as const).map((reason): [string, Parameters<typeof run>[1], string] => [`reader verdict ${reason}`, { st: store({ verdict: () => reason }) }, reason]),
   ];
   test.each(cases)("%s", async (_name, opts, reason) => {
@@ -507,4 +512,14 @@ describe("configuration and SQL", () => {
     expect((await sqlGateStore(runner).verdicts(ORG, WS, "u-2", parsed(), [])).size).toBe(0);
     expect(seen).toHaveLength(0);
   });
+});
+
+test("GATE_SQL_REASONS is exactly the set of drop reasons 043860 can return", () => {
+  const sql = readFileSync(join(import.meta.dir, "../../../supabase/migrations/20261105043860_buffered_search_gate.sql"), "utf8");
+  const body = sql.slice(sql.indexOf("AS $gate$"), sql.lastIndexOf("$gate$;"));
+  const returned = new Set([
+    ...[...body.matchAll(/THEN '([a-z_]+)'/g)].map((m) => m[1]),
+    ...[...body.matchAll(/v_gate := '([a-z_]+)'/g)].map((m) => m[1]),
+  ]);
+  expect([...returned].sort()).toEqual([...GATE_SQL_REASONS].sort());
 });

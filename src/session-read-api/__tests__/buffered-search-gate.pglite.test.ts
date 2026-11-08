@@ -144,7 +144,7 @@ test("positive: a healthy head-7 owner's hit is visible; a no-head owner admitte
 
 test("ACL: bulls96_read_api cannot read any gate table directly (42501), yet the function call succeeds",async()=>{
  const f=await healthy();
- for(const t of ["owner_buffered_parity","ingest_claim_attempts","ingest_lazy_policy","ingest_lazy_ack_decisions","upload_deletions","upload_resets","ingest_frozen_source_deletions","ingest_control_receipts","ingest_privacy_authority"])
+ for(const t of ["owner_buffered_parity","ingest_claim_attempts","ingest_lazy_policy","ingest_lazy_ack_decisions","upload_deletions","upload_resets","ingest_frozen_source_deletions","ingest_control_receipts","ingest_privacy_authority","ingest_batches","ingest_fence_versions"])
   expect([t,await code(f.asReader("SELECT count(*) FROM sessions."+t))]).toEqual([t,"42501"]);
  expect(await code(f.asReader("SELECT * FROM sessions.owner_buffered_parity_expected($1,$2,$3,$4,7,$5,'selection')",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,E1,D3]))).toBe("42501");
  expect(await f.verdict(await f.hit(S(1)),at(7))).toBeNull();
@@ -321,4 +321,92 @@ test("read-only: the reader takes no row or advisory lock",async()=>{
  expect(rows.map((r)=>[Number(r.n),Number(r.locks)])).toEqual([[1,0]]);
  const def=readFileSync(join(root,"supabase/migrations/20261105043860_buffered_search_gate.sql"),"utf8");
  expect(def).not.toMatch(/FOR (UPDATE|SHARE)|pg_advisory|\b(INSERT|UPDATE|DELETE)\s+(INTO\s+)?sessions\./u);
+});
+
+/** Owner-side fixture surgery with triggers and FK actions off (replica), so a test can plant a row state the
+ *  production writers never leave (CHECK constraints still apply). */
+async function raw(f:{db:PGlite},sql:string,params:unknown[]=[]){
+ await f.db.exec("BEGIN;SET LOCAL session_replication_role=replica");
+ try{await f.db.query(sql,params as never);await f.db.exec("COMMIT")}catch(e){await f.db.exec("ROLLBACK");throw e}
+}
+const BATCH_OF="(org_id,workspace_id,origin_id,batch_id)=(SELECT org_id,workspace_id,origin_id,batch_id FROM sessions.ingest_claim_attempts WHERE claim_token=$1::uuid)";
+
+test("043700 batch predicate: not committed, not buffered, committed_at NULL, other digest/user or a missing batch row drops",async()=>{
+ const cases:[string,string][]=[
+  ["publication_state canonical","UPDATE sessions.ingest_batches SET publication_state='canonical' WHERE "+BATCH_OF],
+  ["state pending","UPDATE sessions.ingest_batches SET state='pending',committed_at=NULL WHERE "+BATCH_OF],
+  ["committed_at NULL","ALTER TABLE sessions.ingest_batches DROP CONSTRAINT ingest_batches_check;UPDATE sessions.ingest_batches SET committed_at=NULL WHERE "+BATCH_OF],
+  ["other digest","UPDATE sessions.ingest_batches SET digest=repeat('9',64) WHERE "+BATCH_OF],
+  ["other user","UPDATE sessions.ingest_batches SET user_id='user-2' WHERE "+BATCH_OF],
+  ["missing batch row","DELETE FROM sessions.ingest_batches WHERE "+BATCH_OF],
+ ];
+ for(const [name,sql] of cases){
+  const f=await healthy();const h=await f.hit(S(1));
+  if(name==="committed_at NULL"){const [ddl,dml]=sql.split(";");await f.db.exec(ddl!);await raw(f,dml!,[h.claim_token])}else await raw(f,sql,[h.claim_token]);
+  await f.prove(at(7));
+  expect([name,await f.verdict(h,at(7)),await f.verdict(await f.hit(S(2)),at(7))]).toEqual([name,"batch_not_buffered",null]);
+ }
+});
+
+test("RULE 5(c): a reset at or after the batch's acceptance drops even when every reset epoch is current; one before passes",async()=>{
+ const f=await healthy();const h=await f.hit(S(1)),h2=await f.hit(S(2));
+ await f.db.query("INSERT INTO sessions.upload_resets(org_id,workspace_id,user_id,request_id) VALUES($1,$2,$3,'r-1')",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
+ // Align the claims' admission reset epoch and every epochs entry with the new reset count (1), so only the time check remains.
+ await raw(f,"UPDATE sessions.ingest_claim_attempts SET reset_epoch=1,epochs=(SELECT jsonb_agg(e||jsonb_build_object('reset_epoch',1)) FROM jsonb_array_elements(epochs) e) WHERE user_id=$1",[TENANT.userId]);
+ await f.prove(at(7));
+ const acceptedAt=async(t:string)=>((await f.db.query("SELECT committed_at::text c FROM sessions.ingest_batches WHERE "+BATCH_OF,[t])).rows[0] as any).c as string;
+ // reset_at (now) >= committed_at: dropped as reset.
+ expect([await f.verdict(h,at(7)),await f.verdict(h2,at(7))]).toEqual(["reset","reset"]);
+ // reset_at == committed_at of S(1)'s batch: still dropped (>=).
+ await raw(f,"UPDATE sessions.upload_resets SET reset_at=$1::timestamptz WHERE request_id='r-1'",[await acceptedAt(h.claim_token)]);
+ await f.prove(at(7));
+ expect(await f.verdict(h,at(7))).toBe("reset");
+ // reset_at < committed_at of both batches: the fully consistent hits pass.
+ await raw(f,"UPDATE sessions.upload_resets SET reset_at=$1::timestamptz-interval '1 second' WHERE request_id='r-1'",[await acceptedAt(h.claim_token)]);
+ await f.prove(at(7));
+ expect([await f.verdict(h,at(7)),await f.verdict(h2,at(7))]).toEqual([null,null]);
+ // A per-session epochs entry still on the old reset epoch drops as reset.
+ await raw(f,"UPDATE sessions.ingest_claim_attempts SET epochs=(SELECT jsonb_agg(e||jsonb_build_object('reset_epoch',0)) FROM jsonb_array_elements(epochs) e) WHERE claim_token=$1::uuid",[h.claim_token]);
+ expect([await f.verdict(h,at(7)),await f.verdict(h2,at(7))]).toEqual(["reset",null]);
+});
+
+test("supersession: a fence bump after admission, a missing or an ambiguous epochs entry drops as superseded",async()=>{
+ const f=await healthy();const h=await f.hit(S(1)),h2=await f.hit(S(2));
+ const entry=((await f.db.query("SELECT e FROM sessions.ingest_claim_attempts,jsonb_array_elements(epochs) e WHERE claim_token=$1::uuid AND e->>'session_id'=$2",[h.claim_token,S(1)])).rows as any[]);
+ expect(entry.length).toBe(1);
+ const fence=Number(entry[0].e.epoch);
+ // A newer fence version (deletion/disable/reset bumped it) on the claim's origin: this claim is not the latest admission.
+ await raw(f,"INSERT INTO sessions.ingest_fence_versions(org_id,workspace_id,user_id,origin_id,source,session_id,epoch) VALUES($1,$2,$3,$4,'claude',$5,$6) ON CONFLICT(org_id,workspace_id,user_id,origin_id,source,session_id) DO UPDATE SET epoch=EXCLUDED.epoch",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID,S(1),fence+1]);
+ await f.prove(at(7));
+ expect([await f.verdict(h,at(7)),await f.verdict(h2,at(7))]).toEqual(["superseded",null]);
+ // The same fence version on ANOTHER origin does not supersede (043700 matches the stage's origin).
+ const g=await healthy();const k=await g.hit(S(1));
+ await raw(g,"INSERT INTO sessions.ingest_fence_versions(org_id,workspace_id,user_id,origin_id,source,session_id,epoch) VALUES($1,$2,$3,'some-other-origin','claude',$4,$5)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,S(1),fence+1]);
+ await g.prove(at(7));
+ expect(await g.verdict(k,at(7))).toBeNull();
+ // Missing epochs entry for the session.
+ await raw(g,"UPDATE sessions.ingest_claim_attempts SET epochs=(SELECT coalesce(jsonb_agg(e),'[]') FROM jsonb_array_elements(epochs) e WHERE e->>'session_id'<>$2) WHERE claim_token=$1::uuid",[k.claim_token,S(1)]);
+ expect(await g.verdict(k,at(7))).toBe("superseded");
+ // Ambiguous: two entries for the session with different epochs.
+ await raw(g,"UPDATE sessions.ingest_claim_attempts SET epochs=epochs||$2::jsonb WHERE claim_token=$1::uuid",[k.claim_token,JSON.stringify([{source:"claude",session_id:S(1),epoch:fence,reset_epoch:0},{source:"claude",session_id:S(1),epoch:fence+1,reset_epoch:0}])]);
+ expect(await g.verdict(k,at(7))).toBe("superseded");
+ // Epochs not an array: fails closed.
+ await raw(g,"ALTER TABLE sessions.ingest_claim_attempts DISABLE TRIGGER ALL");
+ const c=(await g.db.query("SELECT conname FROM pg_constraint WHERE conrelid='sessions.ingest_claim_attempts'::regclass AND pg_get_constraintdef(oid) LIKE '%epochs%'")).rows as any[];
+ for(const r of c)await g.db.exec(`ALTER TABLE sessions.ingest_claim_attempts DROP CONSTRAINT "${r.conname}"`);
+ await raw(g,"UPDATE sessions.ingest_claim_attempts SET epochs='{}'::jsonb WHERE claim_token=$1::uuid",[k.claim_token]);
+ expect(await g.verdict(k,at(7))).toBe("superseded");
+});
+
+test("a fully consistent hit still passes: committed buffered batch, reset before acceptance, current fence, one epochs entry",async()=>{
+ const f=await healthy();const h=await f.hit(S(1));
+ const row=(await f.db.query(`SELECT b.state,b.publication_state,b.committed_at IS NOT NULL AS accepted,b.user_id=a.user_id AND b.digest=a.digest AS same,
+   a.reset_epoch,(SELECT count(*) FROM jsonb_array_elements(a.epochs) e WHERE e->>'session_id'=$2)::int AS entries
+   FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_batches b USING(org_id,workspace_id,origin_id,batch_id) WHERE a.claim_token=$1::uuid`,[h.claim_token,S(1)])).rows[0];
+ expect(row).toEqual({state:"committed",publication_state:"buffered",accepted:true,same:true,reset_epoch:0,entries:1} as any);
+ // Bump the fence AND re-admit at the new epoch (the claim's entry carries it): still the latest admission.
+ await raw(f,"INSERT INTO sessions.ingest_fence_versions(org_id,workspace_id,user_id,origin_id,source,session_id,epoch) VALUES($1,$2,$3,$4,'claude',$5,3) ON CONFLICT(org_id,workspace_id,user_id,origin_id,source,session_id) DO UPDATE SET epoch=3",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID,S(1)]);
+ await raw(f,"UPDATE sessions.ingest_claim_attempts SET epochs=(SELECT jsonb_agg(CASE WHEN e->>'session_id'=$2 THEN e||'{\"epoch\":3}' ELSE e END) FROM jsonb_array_elements(epochs) e) WHERE claim_token=$1::uuid",[h.claim_token,S(1)]);
+ await f.prove(at(7));
+ expect(await f.verdict(h,at(7))).toBeNull();
 });

@@ -39,10 +39,22 @@
  *         baseline, full head tuple (or no_head), target generation,
  *         deletion/reset digests and target lineage equal the passed head and
  *         sessions.owner_buffered_parity_expected recomputed now;
- *      d. DELETIONS AND RESETS: (owner, source, session) is in neither
- *         upload_deletions nor ingest_frozen_source_deletions under ANY origin,
- *         and the owner's upload_resets count still equals the claim's
- *         reset_epoch.
+ *      d. DELETIONS: (owner, source, session) is in neither upload_deletions
+ *         nor ingest_frozen_source_deletions under ANY origin;
+ *      e. BATCH (043700 stg): the claim's ingest_batches row exists, is the
+ *         owner's, carries the claim's digest, and is committed, buffered and
+ *         accepted (committed_at set); a missing row drops (batch_not_buffered);
+ *      f. RESETS (043700 RULE 5(c)): the claim's reset_epoch and the hit's
+ *         epochs entry's reset_epoch equal the owner's upload_resets count, and
+ *         no reset of the owner is at or after the batch's committed_at;
+ *      g. LATEST ADMISSION (043700 judged.live): the claim's epochs hold exactly
+ *         one unambiguous entry for (source, session) whose epoch is still the
+ *         session's ingest_fence_versions epoch on the claim's origin (0 with no
+ *         row); a later fence bump supersedes it (superseded).
+ *    Per-stage conditions of 043700 (outbox/stage acknowledgement, the GC
+ *    ancestor chain, group shape, the lazy ACK native-slot owner) are not
+ *    mirrored: the hit names a claim, not a stage or ordinal (see the
+ *    condition table in the migration header).
  *
  * The Worker role (bulls96_read_api) never reads the gate tables directly: it
  * has no grant on them (043700 revokes owner_buffered_parity from it). GATE_SQL
@@ -198,7 +210,9 @@ export const GATE_SQL_REASONS = [
   "parity_missing",
   "parity_stale",
   "deleted",
+  "batch_not_buffered",
   "reset",
+  "superseded",
 ] as const;
 export type GateSqlReason = (typeof GATE_SQL_REASONS)[number];
 
@@ -251,6 +265,13 @@ const isGateSqlReason = (v: string): v is GateSqlReason => (GATE_SQL_REASONS as 
  * The store over the read role's tenant-bound READ ONLY transactions: one
  * transaction per owner. Any error (043860 not applied, a role or pin
  * refusal, a timeout) rejects, and the gate drops that owner's hits.
+ *
+ * Snapshot: each reader call is one STABLE statement, so it judges its hits
+ * against one snapshot. The Worker's runner (requestTenantRunner) opens
+ * REPEATABLE READ READ ONLY, so the chunks of one owner also share a single
+ * snapshot. Under a READ COMMITTED runner (the Lambda's poolTenantRunner,
+ * where the gate is not wired) each chunk would take its own snapshot; every
+ * verdict would still be self-consistent, but two chunks could differ.
  */
 export function sqlGateStore(run: TenantRunner): GateStore {
   return {
@@ -258,7 +279,8 @@ export function sqlGateStore(run: TenantRunner): GateStore {
       const out = new Map<string, GateSqlReason | "admission_unknown_reason" | null>();
       if (refs.length === 0) return out;
       // One READ ONLY transaction per owner; one call per MAX_GATE_HITS hits (an event page is
-      // at most 1000 rows, so at most two calls), all in that transaction.
+      // at most 1000 rows, so at most two calls), all in that transaction and, under the
+      // Worker's REPEATABLE READ runner, all on that transaction's one snapshot.
       const chunks: AdmissionRef[][] = [];
       for (let i = 0; i < refs.length; i += MAX_GATE_HITS) chunks.push(refs.slice(i, i + MAX_GATE_HITS));
       const rows = await run(orgId, workspaceId, async (q: SqlQuery) => {

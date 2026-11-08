@@ -190,7 +190,12 @@ export function clickHouseConfig(env: Env) {
  * A TenantRunner over one lazily connected pg client for the request. The
  * Hyperdrive guidance is a client per request (Hyperdrive pools the origin
  * connections), closed after the response. Checks are serialized on the one
- * client, so two transactions never interleave on it.
+ * client, so two transactions never interleave on it. Each transaction is
+ * REPEATABLE READ READ ONLY: every statement in it reads ONE snapshot (taken
+ * at its first statement), so a check that issues several statements (the
+ * buffered search gate's 500-hit chunks, the owner-buffered scope then list)
+ * judges them all against the same database state. Every consumer only reads,
+ * and a read-only REPEATABLE READ transaction never fails serialization.
  */
 export function requestTenantRunner(connect: () => Promise<pg.Client>): { run: TenantRunner; close(): Promise<void> } {
   let client: Promise<pg.Client> | undefined;
@@ -198,7 +203,7 @@ export function requestTenantRunner(connect: () => Promise<pg.Client>): { run: T
   const run: TenantRunner = (orgId, workspaceId, work) => {
     const next = tail.then(async () => {
       const c = await (client ??= connect());
-      await c.query("BEGIN READ ONLY");
+      await c.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
       try {
         await c.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]);
         const q: SqlQuery = {
