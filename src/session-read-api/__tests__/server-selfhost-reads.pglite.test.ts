@@ -35,6 +35,7 @@ import { readApiVerifier } from "../auth.ts";
 import { readApiDepsFromSecret, readAppFromSecret } from "../lambda.ts";
 import { startReadApiService, type ReadApiService } from "../server.ts";
 import { readerLoginAnswer } from "./reader-login-support.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -206,10 +207,8 @@ const RealPool = pg.Pool;
 beforeAll(async () => {
   supa = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await supa.exec(read("supabase/tests/supabase_shim.sql"));
-  await supa.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
-  await supa.exec(read("supabase/bootstrap/session_token_verifier.sql"));
-  await supa.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
-  await supa.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
+  // Single-sourced bootstrap chain: the grant migration FAILs closed without the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES) await supa.exec(read(f));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await supa.exec(read(`supabase/migrations/${file}`));
   await supa.exec(psql("supabase/bootstrap/session_read_api_role.sql"));
   await supa.exec(psql("supabase/bootstrap/session_read_api_role_verify.sql"));

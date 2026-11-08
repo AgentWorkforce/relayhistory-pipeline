@@ -14,6 +14,7 @@ import {sqlLedger} from "../ledger-sql.ts";
 import {deliverBatch} from "../deliver.ts";
 import {deliveryAccount} from "../vendor/delivery/prepare.ts";
 import {AcquisitionRefusedError} from "../acquisition-refusal.ts";
+import {SESSION_BOOTSTRAP_FILES} from "../../hoopdb/session-bootstrap-chain.ts";
 import {runMigrations,type MigrationProfile} from "../../hoopdb/migrate.ts";
 import {batch,record,TENANT} from "./support.ts";
 import {orderedFixtureLedger,initializeFixtureSeatClock} from "./ordered-support.ts";
@@ -82,8 +83,8 @@ async function database(prefix:string,withAcquisition=true):Promise<Db>{
  const pool=new pg.Pool({connectionString:u.href,max:12});const dir=mkdtempSync(join(tmpdir(),"acq-"));
  const d={pool,name,dir};dbs.push(d);
  await pool.query(read("supabase/tests/supabase_shim.sql"));await pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");
- for(const f of["session_directory_search_worker.sql","session_token_verifier.sql","session_ingest_roles.sql","session_read_api_roles.sql"])
-  await pool.query(read("supabase/bootstrap/"+f));
+ // Single-sourced bootstrap chain: the grant migration FAILs closed without the bare consumer grantee.
+ for(const f of SESSION_BOOTSTRAP_FILES)await pool.query(read(f));
  for(const f of readdirSync(join(root,"supabase/migrations")).sort())if(withAcquisition||f!==MIGRATION)await pool.query(read("supabase/migrations/"+f));
  for(const f of readdirSync(join(root,"src/hoopdb/migrations")).sort())await pool.query(read("src/hoopdb/migrations/"+f));
  return d;

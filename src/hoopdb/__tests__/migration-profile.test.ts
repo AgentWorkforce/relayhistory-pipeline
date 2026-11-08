@@ -32,6 +32,7 @@ import {
   SUPABASE_PLATFORM_SUPERUSERS,
 } from "../migrate-guards.ts";
 import { gateOpen, workerTick } from "../../shared/worker.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 import {
   MIGRATION_SENTINELS,
   NON_CREATE_STEPS,
@@ -1265,24 +1266,9 @@ describe("per-step catalog sentinels", () => {
     await db.exec(
       readFileSync(join(root, "supabase/tests/supabase_shim.sql"), "utf8"),
     );
-    await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
-        "utf8",
-      ),
-    );
-    await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_token_verifier.sql"),
-        "utf8",
-      ),
-    );
-    await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
-        "utf8",
-      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
-    );
+    // Single-sourced bootstrap chain: the grant migration FAILs closed
+    // without the bare consumer grantee.
+    for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(readFileSync(join(root, f), "utf8"));
     for (let i = 0; i <= upTo; i++)
       await db.exec(readFileSync(steps[i]!.path, "utf8"));
     await db.exec(`CREATE SCHEMA IF NOT EXISTS sessions; CREATE TABLE sessions.__96bulls_migrations (
@@ -1322,24 +1308,9 @@ describe("per-step catalog sentinels", () => {
     await db.exec(
       readFileSync(join(root, "supabase/tests/supabase_shim.sql"), "utf8"),
     );
-    await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
-        "utf8",
-      ),
-    );
-    await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_token_verifier.sql"),
-        "utf8",
-      ),
-    );
-    await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
-        "utf8",
-      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
-    );
+    // Single-sourced bootstrap chain: the grant migration FAILs closed
+    // without the bare consumer grantee.
+    for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(readFileSync(join(root, f), "utf8"));
     for (const st of steps) {
       expect(await sentinel(db, st.name), `${st.name} before`).toBe(false);
       await db.exec(readFileSync(st.path, "utf8"));
@@ -1771,24 +1742,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await db.exec(
       readFileSync(join(root, "supabase/tests/supabase_shim.sql"), "utf8"),
     );
-    await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_directory_search_worker.sql"),
-        "utf8",
-      ),
-    );
-    await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_token_verifier.sql"),
-        "utf8",
-      ),
-    );
-    await db.exec(
-      readFileSync(
-        join(root, "supabase/bootstrap/session_ingest_roles.sql"),
-        "utf8",
-      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
-    );
+    // Single-sourced bootstrap chain: the grant migration FAILs closed
+    // without the bare consumer grantee.
+    for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(readFileSync(join(root, f), "utf8"));
     await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
     return db;
   }
@@ -1966,6 +1922,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const Q = "upstream:20261105043800_lazy_ack_clock_no_key_update.sql";
     const W = "upstream:20261105043860_buffered_search_gate.sql";
     const X = "upstream:20261105043870_buffered_search_feed_cursor.sql";
+    const CG = "upstream:20261105043900_session_consumer_function_grants.sql";
     const BK = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
@@ -1974,13 +1931,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
@@ -2016,8 +1973,21 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 043890 (gate retired witness) is the latest: 043880 refuses (55000) while it is applied, so it
-    // rolls back first; its down restores 043860's exact gate (no retired witness), owner and ACL unchanged.
+    // 20261105043900 (consumer function grants) applies last: earlier downs refuse (55000)
+    // while it is applied; its own down revokes the twelve search_consumer_runtime
+    // EXECUTEs and marks the validation pending.
+    const writerGrants = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'")).rows[0]!.n;
+    expect(await names()).toContain(CG);
+    expect(await writerGrants()).toBe(12);
+    expect((await failure(rollback("20261105043890_buffered_search_gate_retired_witness.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(GR);
+    await rollback("20261105043900_session_consumer_function_grants.down.sql");
+    expect(await names()).not.toContain(CG);
+    expect(await writerGrants()).toBe(0);
+    expect(await passed()).toBe(false);
+    // 043890 (gate retired witness) is then the latest: 043880 refuses (55000) while it is applied, so it
+    // rolls back next; its down restores 043860's exact gate (no retired witness), owner and ACL unchanged.
     const gateSrc = async () =>
       (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)')")).rows[0]?.s ?? null;
     const gateGrantees = async () =>
@@ -2032,7 +2002,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await gateSrc()).not.toContain("ingest_bookkeeping_retired_claims");
     expect(await gateGrantees()).toEqual(["bulls96_read_api"]);
     // 043880 (ingest bookkeeping cleanup, Phase A) is then the latest: 043870 refuses (55000) while it is
-    // applied, so it rolls back first; its down restores 042000's exact Babysitter register.
+    // applied, so it rolls back next; its down restores 042000's exact Babysitter register.
     expect(await names()).toContain(BK);
     expect((await failure(rollback("20261105043870_buffered_search_feed_cursor.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(X);
@@ -2055,7 +2025,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.buffered_search_feed_cursors")).toBeNull();
     // The down revokes the runtime role's schema USAGE and keeps the role itself.
     expect((await db.query<{ u: boolean | null }>("SELECT (SELECT has_schema_privilege(r.oid, 'sessions', 'USAGE') FROM pg_roles r WHERE r.rolname = 'buffered_search_feed_runtime') AS u")).rows[0]!.u).toBe(false);
-    expect(await passed()).toBe(true);
+    // Merged tree: the consumer-grants down above already marked validation
+    // pending, and the feed down keeps it as it was.
+    expect(await passed()).toBe(false);
     // 043860 (buffered search gate reader) is then the latest: 043800 and 043700 refuse (55000) while it is applied;
     // its own down drops only the one function and its ledger row (the validation stays as it was).
     const gateFn = async () =>
@@ -2068,7 +2040,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105043860_buffered_search_gate.down.sql");
     expect(await names()).not.toContain(W);
     expect(await gateFn()).toBeNull();
-    expect(await passed()).toBe(true);
+    // Merged tree: validation is still pending from the consumer-grants down above.
+    expect(await passed()).toBe(false);
     // Later lanes roll back first and remove their own ledger rows; only then
     // 043850 (acquisition owner, dormant) is the latest: 043000 refuses while it is applied.
     const AQ = "upstream:20261105043850_ingest_acquisition_owner.sql";
@@ -2247,7 +2220,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await ownerReadFns()).toBe(4);
     expect(await parityTable()).toBe("sessions.owner_buffered_parity");
     expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
@@ -2260,6 +2233,160 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.search_feature_copy_state')::text r")).rows[0]?.r).toBe("sessions.search_feature_copy_state");
     // And a no-op rerun stays clean.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
+  });
+
+  test("migrate, operator bootstrap, migrate: the claimed LOGIN converges; hand promotion and extra memberships refuse", async () => {
+    const profile: MigrationProfile = {
+      ...SUPA_A,
+      mode: "selfhosted",
+      shim: false,
+      bootstrap: true,
+      verify: true,
+      functionBoundary: "global-default-revoke",
+    };
+    const rolesFile = readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8");
+    const operatorFile = readFileSync(join(root, "supabase/bootstrap/session_consumer_role.sql"), "utf8");
+    // File level, on a bare database: absent creates, bare passes, a
+    // hand-promoted LOGIN without the claim marker refuses, and a role
+    // granted to another login refuses before any grant migration runs.
+    {
+      const db = await fresh();
+      await db.exec(rolesFile); // absent -> creates the bare role
+      await db.exec(rolesFile); // bare -> passes
+      const shape = async () =>
+        (await db.query<{ login: boolean; setting: string | null }>(
+          `SELECT rolcanlogin AS login, (SELECT setconfig FROM pg_db_role_setting WHERE setrole = pg_roles.oid AND setdatabase = 0) AS setting FROM pg_roles WHERE rolname = 'search_consumer_runtime'`,
+        )).rows[0];
+      expect(await shape()).toMatchObject({ login: false });
+      await db.exec(`ALTER ROLE search_consumer_runtime LOGIN`);
+      expect((await failure(db.exec(rolesFile)))?.code).toBe("28000");
+      await db.exec(`ALTER ROLE search_consumer_runtime NOLOGIN`);
+      await db.exec(rolesFile); // back to bare -> passes again
+      await db.exec(`CREATE ROLE attacker NOLOGIN; GRANT search_consumer_runtime TO attacker`);
+      expect((await failure(db.exec(rolesFile)))?.code).toBe("55000");
+    }
+    // Migrate level: a full migrate provisions the bare role, the operator
+    // bootstrap claims it (LOGIN plus the timeout marker), and the next
+    // migrate converges instead of 28000ing on the promotion. The operator
+    // file GRANTs on the writer-owned tables, so the test stands in the
+    // composition-built search tables and service tables (production builds
+    // them via the writer bootstrap before the operator step; their shape
+    // is proven by the installed()/e2e fixtures, not here).
+    {
+      const db = await supabaseLike();
+      await db.exec(OWNER_FN_DEFAULT_REVOKE);
+      expect(await failure(runMigrations(client(db), { profile }))).toBeNull();
+      await db.exec(`CREATE SCHEMA search_index;
+        CREATE TABLE search_index.transcript_events (id serial PRIMARY KEY);
+        CREATE TABLE search_index.projection_state (id serial PRIMARY KEY);
+        CREATE TABLE sessions.search_consumer_pending (backend_id text, manifest_key text, PRIMARY KEY (backend_id, manifest_key));
+        CREATE TABLE sessions.search_consumer_progress (backend_id text PRIMARY KEY);`);
+      await db.exec(operatorFile);
+      const claimed = await db.query<{ login: boolean }>(
+        `SELECT rolcanlogin AS login FROM pg_roles WHERE rolname = 'search_consumer_runtime'`,
+      );
+      expect(claimed.rows[0]).toMatchObject({ login: true });
+      expect(await failure(runMigrations(client(db), { profile }))).toBeNull();
+      const marker = await db.query<{ status: string }>(
+        `SELECT status FROM sessions.__96bulls_role_validation WHERE name = 'session_directory_search_worker'`,
+      );
+      expect(marker.rows[0]).toMatchObject({ status: "pass" });
+    }
+  });
+
+  test("consumer role settings are exact: extras refuse in bare and claimed states, preset credentials refuse promotion", async () => {
+    const rolesFile = readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8");
+    const operatorFile = readFileSync(join(root, "supabase/bootstrap/session_consumer_role.sql"), "utf8");
+    const dbName = async (db: PGlite) =>
+      (await db.query<{ db: string }>(`SELECT current_database() AS db`)).rows[0].db;
+    // Bare + an extra global setting refuses (it would inherit into the promotion).
+    {
+      const db = await fresh();
+      await db.exec(rolesFile);
+      await db.exec(`ALTER ROLE search_consumer_runtime SET search_path = attacker, pg_catalog`);
+      expect((await failure(db.exec(rolesFile)))?.code).toBe("28000");
+    }
+    // Bare + a per-database extra refuses (rolconfig would still look exact).
+    {
+      const db = await fresh();
+      await db.exec(rolesFile);
+      const name = await dbName(db);
+      await db.exec(`ALTER ROLE search_consumer_runtime IN DATABASE "${name}" SET search_path = attacker`);
+      expect((await failure(db.exec(rolesFile)))?.code).toBe("28000");
+    }
+    // A hand-claimed exact shape (LOGIN + only the timeout marker) passes;
+    // an extra global or per-database setting then refuses in the claimed state.
+    {
+      const db = await fresh();
+      await db.exec(rolesFile);
+      await db.exec(`ALTER ROLE search_consumer_runtime LOGIN`);
+      await db.exec(`ALTER ROLE search_consumer_runtime SET statement_timeout = '60s'`);
+      expect(await failure(db.exec(rolesFile))).toBeNull();
+      await db.exec(`ALTER ROLE search_consumer_runtime SET search_path = attacker, pg_catalog`);
+      expect((await failure(db.exec(rolesFile)))?.code).toBe("28000");
+      await db.exec(`ALTER ROLE search_consumer_runtime RESET search_path`);
+      expect(await failure(db.exec(rolesFile))).toBeNull();
+      const name = await dbName(db);
+      await db.exec(`ALTER ROLE search_consumer_runtime IN DATABASE "${name}" SET search_path = attacker`);
+      expect((await failure(db.exec(rolesFile)))?.code).toBe("28000");
+    }
+    // A preset password refuses the operator promotion (it would turn the
+    // claim into an already-credentialed account); same for VALID UNTIL.
+    // PGlite runs as superuser, so pg_authid carries the true value here.
+    {
+      const db = await fresh();
+      await db.exec(rolesFile);
+      await db.exec(`ALTER ROLE search_consumer_runtime PASSWORD 'preset-credential'`);
+      const err = await failure(db.exec(operatorFile));
+      expect(err?.code).toBe("55000");
+      expect(err?.message).toMatch(/pre-existing password/);
+    }
+    {
+      const db = await fresh();
+      await db.exec(rolesFile);
+      await db.exec(`ALTER ROLE search_consumer_runtime VALID UNTIL '2027-01-01'`);
+      const err = await failure(db.exec(operatorFile));
+      expect(err?.code).toBe("55000");
+      expect(err?.message).toMatch(/pre-existing validity/);
+    }
+  });
+
+  test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
+    const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
+    const grantRow = `SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043900_session_consumer_function_grants.sql'`;
+    const holds = async (db: PGlite) =>
+      (await db.query<{ holds: boolean }>(
+        `SELECT has_function_privilege('search_consumer_runtime', 'sessions.upsert_session_index(jsonb)', 'EXECUTE') AS holds`,
+      )).rows[0].holds;
+    // No ledger at all: the rollback refuses (fail closed — nothing to roll back).
+    {
+      const db = await fresh();
+      const err = await failure(db.exec(down));
+      expect(err?.code).toBe("55000");
+      expect(err?.message).toMatch(/ledger\/marker required/);
+    }
+    // Present role after a full migrate: the twelve EXECUTEs are installed,
+    // then revoked by the rollback and the ledger row is removed.
+    {
+      const db = await supabaseLike();
+      await db.exec(ET_BOOT);
+      await runMigrations(client(db), { profile: SUPA_ET });
+      expect(await holds(db)).toBe(true);
+      expect(await failure(db.exec(down))).toBeNull();
+      expect(await holds(db)).toBe(false);
+      expect((await db.query<{ n: number }>(grantRow)).rows[0].n).toBe(0);
+    }
+    // Role dropped by hand after the grants were installed: the revoke block
+    // is a no-op but the rollback still passes and removes the ledger row.
+    {
+      const db = await supabaseLike();
+      await db.exec(ET_BOOT);
+      await runMigrations(client(db), { profile: SUPA_ET });
+      await db.exec(`DROP OWNED BY search_consumer_runtime`);
+      await db.exec(`DROP ROLE search_consumer_runtime`);
+      expect(await failure(db.exec(down))).toBeNull();
+      expect((await db.query<{ n: number }>(grantRow)).rows[0].n).toBe(0);
+    }
   });
 
   test("Cloud SQL trust root: only Google's fixed cloudsqladmin SUPERUSER is excluded in cloudsql mode", async () => {
@@ -2397,6 +2524,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         "utf8",
       )}`,
     );
+    // N1: the consumer role is never trampolined. The migration owner
+    // provisions it with session_consumer_roles.sql, keeping the unavoidable
+    // ADMIN creator edge so the owner can promote it to LOGIN later.
+    await db.exec(
+      `SET ROLE migration_owner; ${readFileSync(
+        join(root, "supabase/bootstrap/session_consumer_roles.sql"),
+        "utf8",
+      )}`,
+    );
     // No superuser role bootstrap may fill a missing Cloud SQL prerequisite here.
     const targets = await db.query<{
       rolname: string;
@@ -2409,11 +2545,21 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'bulls96_acquisition_installer', 'buffered_search_feed_runtime')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'search_consumer_runtime', 'bulls96_acquisition_installer', 'buffered_search_feed_runtime')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(14);
-    expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
+    expect(targets.rows).toHaveLength(15);
+    const trampolined = targets.rows.filter(r => r.rolname !== "search_consumer_runtime");
+    expect(trampolined).toHaveLength(14);
+    expect(trampolined.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
+    // The owner-created consumer carries exactly the creator edge: the owner
+    // as member WITH ADMIN, neither INHERIT nor SET.
+    const consumerEdge = await db.query(
+      `SELECT m.rolname AS member, a.admin_option AS admin, a.inherit_option AS inherit, a.set_option AS set
+         FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+        WHERE a.roleid = (SELECT oid FROM pg_roles WHERE rolname = 'search_consumer_runtime')`,
+    );
+    expect(consumerEdge.rows).toEqual([{ member: "migration_owner", admin: true, inherit: false, set: false }]);
     const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
     const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);
     expect(targets.rows.map(r => r.rolname).sort()).toEqual([...prerequisites].sort());
@@ -2443,6 +2589,19 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         `SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_cloudsql_role_seed'`,
       ),
     ).toMatchObject({ rows: [] });
+    // Claimed-LOGIN steady state: the operator promotes the consumer role to
+    // LOGIN with exactly the 60s marker, and the consumer file re-run
+    // converges. Promoting as the owner that created it is the N1 proof: a
+    // trampoline copy would refuse these ALTERs with 42501. An extra setting
+    // still refuses, and the trampoline re-run ignores the role.
+    await db.exec("SET ROLE migration_owner");
+    await db.exec(`ALTER ROLE search_consumer_runtime LOGIN`);
+    await db.exec(`ALTER ROLE search_consumer_runtime SET statement_timeout = '60s'`);
+    expect(await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8")))).toBeNull();
+    await db.exec(`ALTER ROLE search_consumer_runtime SET search_path = attacker`);
+    expect(await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"), "utf8")))).toBeNull();
+    // The consumer file owns the claimed-shape refusal now: its 28000 shape error, not the trampoline 55000.
+    expect((await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8"))))?.code).toBe("28000");
     // The added prerequisite shares the existing fail-closed, never-repair contract.
     await db.exec("RESET ROLE; ALTER ROLE bulls96_read_api INHERIT; SET ROLE migration_owner");
     expect((await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"), "utf8"))))?.code).toBe("55000");
@@ -2681,6 +2840,30 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const error = await failure(inspectMigrations(client(db), SUPA_ET));
     await db.exec("ROLLBACK");
     expect(error?.code).toBe("migration_changed");
+  });
+
+  test("release inspection converges on an operator-claimed consumer role; extras still refuse", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    await runMigrations(client(db), { profile: SUPA_ET });
+    await db.exec(`CREATE SCHEMA IF NOT EXISTS search_index;
+      CREATE TABLE IF NOT EXISTS search_index.transcript_events (id serial PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS search_index.projection_state (id serial PRIMARY KEY)`);
+    // The operator grant file also touches the runtime service tables, which
+    // only the serve-time bootstrap creates: stub their shape here so the
+    // promotion under test is the role claim, not service provisioning.
+    await db.exec(`CREATE TABLE IF NOT EXISTS sessions.search_consumer_pending (id serial PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS sessions.search_consumer_progress (id serial PRIMARY KEY)`);
+    // Promote exactly like the operator bootstrap: the release inspection
+    // must accept the claimed steady state every later deploy sees (it
+    // returns an inventory instead of throwing).
+    await db.exec(readFileSync(join(root, "supabase/bootstrap/session_consumer_role.sql"), "utf8"));
+    expect((await inspectMigrations(client(db), SUPA_ET)).inventory.every((s) => !s.pending)).toBe(true);
+    await db.exec(`ALTER ROLE search_consumer_runtime SET search_path = attacker`);
+    const error = await failure(inspectMigrations(client(db), SUPA_ET));
+    expect(error?.code).toBe("bootstrap_prerequisite");
+    await db.exec(`ALTER ROLE search_consumer_runtime RESET search_path`);
+    expect((await inspectMigrations(client(db), SUPA_ET)).inventory.every((s) => !s.pending)).toBe(true);
   });
 
   test("event-trigger mode (supabase): the reviewed bootstrap passes a fresh full migrate; the trigger enforces the boundary afterwards", async () => {
@@ -3006,6 +3189,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
             "utf8",
           ),
         );
+        await db.exec(
+          readFileSync(
+            join(
+              root,
+              "supabase/bootstrap/session_consumer_roles.sql",
+            ),
+            "utf8",
+          ),
+        );
         await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
         await db.exec(
           readFileSync(
@@ -3056,6 +3248,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               join(
                 root,
                 "supabase/bootstrap/session_read_api_roles.sql",
+              ),
+              "utf8",
+            ),
+          );
+          await db.exec(
+            readFileSync(
+              join(
+                root,
+                "supabase/bootstrap/session_consumer_roles.sql",
               ),
               "utf8",
             ),

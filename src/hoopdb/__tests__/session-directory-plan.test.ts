@@ -15,7 +15,7 @@ import {
   auditSearchIndexes,
   type SearchIndexCatalogRow,
 } from "../search-index-contract.ts";
-
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 const migration = readFileSync(
   join(
     import.meta.dir,
@@ -34,20 +34,6 @@ const shim = readFileSync(
   join(import.meta.dir, "../../../supabase/tests/supabase_shim.sql"),
   "utf8",
 );
-const bootstrap = readFileSync(
-  join(
-    import.meta.dir,
-    "../../../supabase/bootstrap/session_directory_search_worker.sql",
-  ),
-  "utf8",
-);
-const tokenBootstrap = readFileSync(
-  join(
-    import.meta.dir,
-    "../../../supabase/bootstrap/session_token_verifier.sql",
-  ),
-  "utf8",
-);
 const open: PGlite[] = [];
 
 afterEach(async () => {
@@ -58,10 +44,11 @@ async function database(): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(shim);
-  await db.exec(bootstrap);
-  await db.exec(tokenBootstrap);
-  await db.exec(readFileSync(join(import.meta.dir, "../../../supabase/bootstrap/session_ingest_roles.sql"), "utf8"));
-  await db.exec(readFileSync(join(import.meta.dir, "../../../supabase/bootstrap/session_read_api_roles.sql"), "utf8"));
+  // Worker/verifier roles come from the single-sourced bootstrap chain
+  // (session-bootstrap-chain.ts): the grant migration FAILs closed without
+  // the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES)
+    await db.exec(readFileSync(join(import.meta.dir, "../../../" + f), "utf8"));
   await db.exec(`
     CREATE SCHEMA sessions;
     CREATE FUNCTION sessions.jwt_org_id() RETURNS text LANGUAGE sql STABLE AS $$
@@ -93,10 +80,11 @@ async function fullDatabase(): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(shim);
-  await db.exec(bootstrap);
-  await db.exec(tokenBootstrap);
-  await db.exec(readFileSync(join(import.meta.dir, "../../../supabase/bootstrap/session_ingest_roles.sql"), "utf8"));
-  await db.exec(readFileSync(join(import.meta.dir, "../../../supabase/bootstrap/session_read_api_roles.sql"), "utf8"));
+  // Worker/verifier roles come from the single-sourced bootstrap chain
+  // (session-bootstrap-chain.ts): the grant migration FAILs closed without
+  // the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES)
+    await db.exec(readFileSync(join(import.meta.dir, "../../../" + f), "utf8"));
   const root = join(import.meta.dir, "../../../supabase/migrations");
   for (const file of readdirSync(root).filter(file => file.endsWith(".sql")).sort())
     await db.exec(readFileSync(join(root, file), "utf8"));

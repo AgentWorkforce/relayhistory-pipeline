@@ -16,6 +16,7 @@ import {
   writeDirectoryCatalog,
 } from "../session-directory-catalog.ts";
 import { projectSessionDirectory } from "../session-directory-projector.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -35,10 +36,7 @@ async function database(options: { catalogReady?: boolean } = {}): Promise<PGlit
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
-  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
-  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
-  await db.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
   }

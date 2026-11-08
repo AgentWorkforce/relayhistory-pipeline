@@ -185,9 +185,11 @@ Order (plain Postgres or CNPG, `HOOPDB_DB_MODE=selfhosted`):
 
    With the role bootstrap on, the migrator itself creates the bare NOLOGIN
    roles first: the search worker, the token verifier,
-   `session_ingest_roles.sql` and `session_read_api_roles.sql`. Then it applies
+   `session_ingest_roles.sql`, `session_read_api_roles.sql` and
+   `session_consumer_roles.sql` (single-sourced in
+   `src/hoopdb/session-bootstrap-chain.ts`). Then it applies
    the migrations, and then the read-only verifies. With the bootstrap off, an
-   operator runs those four `supabase/bootstrap/*.sql` files as the superuser
+   operator runs those five `supabase/bootstrap/*.sql` files as the superuser
    **before** this Job. Migrations verify the roles and fail closed (42704) if
    they are absent.
 3. **Bootstrap roles (post-migrate, operator, superuser).** This step makes

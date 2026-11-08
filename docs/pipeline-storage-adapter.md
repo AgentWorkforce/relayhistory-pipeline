@@ -266,7 +266,7 @@ pointer row is quarantined and the transform never reads its chunks.
 | `PIPELINE_RAW_PROVIDER`                                                                        | `s3` (default), `r2`, or `gcs`. `gcs` uses the GCS adapter and a metadata token, and refuses HMAC keys. Any other name leaves the store unconfigured. An S3 or R2 endpoint on the GCS API is refused. |
 | `PIPELINE_RAW_S3_SSE`                                                                          | `AES256` or `aws:kms`; any other value leaves the raw store unconfigured (fail closed).                                                  |
 | `PIPELINE_ORG_ID` / `PIPELINE_ORG_FROM_PREFIX`                                                 | Object ownership. With neither, the manifest POST fails closed with 503.                                                                 |
-| `PIPELINE_KEY_PREFIX`                                                                          | Deployment prefix raw keys sit under. Required for reconcile when the org is taken from the prefix.                                      |
+| `PIPELINE_KEY_PREFIX`                                                                          | Bare deployment base raw keys sit under (e.g. `96bulls`; the org is appended at runtime as `<base>/<orgId>`). Required for reconcile when the org is taken from the prefix. A trailing org-shaped segment (e.g. `96bulls/org_1`) fails startup. |
 | `PIPELINE_RECONCILE_ENABLED`, `PIPELINE_RECONCILE_LOOKBACK_MINUTES`                            | `true` runs reconcile every 5 minutes over the last 15 minutes (default).                                                                |
 
 ## Decisions and follow-ups
