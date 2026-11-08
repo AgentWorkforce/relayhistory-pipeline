@@ -5,13 +5,7 @@
  * this a pre-cutover replay is re-claimed and a conflicting digest is delivered instead of refused.
  * Real buffered SQL (PGlite), so the "absent" case proves the unchanged claim and its custody ACK header.
  */
-import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { PGlite } from "@electric-sql/pglite";
-import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
-import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
-import { readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
-import { sqlLedger } from "../ledger-sql.ts";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import type { Ledger } from "../ledger.ts";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SIGNATURE_HEADER, signRequest, SYNC_SCOPE, type IngestIdentity } from "../app.ts";
 import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY, ADMISSION_QUEUED, syncAdmissionFrozenReceiptMode, type AdmissionMessage, type AsyncAdmissionMode } from "../async-admission.ts";
@@ -19,34 +13,30 @@ import { CURRENT_CUSTODY_ACK_HEADER } from "../custody-protocol.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { DELIVERY_LIMITS, type HistoryExportBatch } from "../vendor/delivery/delivery-contracts.ts";
 import type { ObjectStore } from "../../shared/vendor.ts";
-import { TENANT, batch, record, scratchStore } from "./support.ts";
+import { TENANT, batch, record } from "./support.ts";
+import { FROZEN_GENERATION, digestOf, frozenSupabaseFixture } from "./frozen-supabase-support.ts";
+import { G4_LAST_MIGRATION, type UndefinedObjectError } from "./pglite-schema.ts";
 
 setDefaultTimeout(60000);
-const root = join(import.meta.dir, "../../.."), generation = "a".repeat(64), epoch = "3".repeat(64), sourceIdentity = "c".repeat(64), baseline = "a".repeat(64);
+const generation = FROZEN_GENERATION;
 const open: Array<() => Promise<unknown> | void> = [];
-afterEach(async () => { for (const close of open.splice(0).reverse()) await close(); });
+/** The current describe's migration cutoff (undefined: every migration, or HOOPDB_MIGRATE_UNTIL). */
+let schemaUntil: string | undefined;
+/** Every fixture database of the running case: its applied migrations and undefined-object hits. */
+const databases: Array<{ applied: string[]; undefinedObjects: UndefinedObjectError[]; until: string | undefined }> = [];
+afterEach(async () => {
+  const seen = databases.splice(0);
+  for (const close of open.splice(0).reverse()) await close();
+  expect(seen.flatMap((d) => d.undefinedObjects)).toEqual([]);
+  for (const d of seen) if (d.until) expect(d.applied.at(-1)).toBe(d.until);
+});
 
-/** The frozen-custody.pglite.test.ts fixture: every migration, the lazy policy, a sealed frozen copy. */
+/** The frozen-custody.pglite.test.ts fixture (frozen-supabase-support.ts): the lazy policy, a sealed frozen copy. */
 async function fixture() {
-  const db = new PGlite({ extensions: { btree_gin, pg_trgm } }); open.push(() => db.close());
-  const read = (p: string) => readFileSync(join(root, p), "utf8");
-  await db.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
-  for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await db.exec(read("supabase/migrations/" + f));
-  await db.exec("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','" + generation + "','pass')");
-  const owner = async (name: string, p: unknown) => (await db.query("SELECT sessions." + name + "($1::jsonb) AS r", [JSON.stringify(p)])).rows[0];
-  await owner("ingest_lazy_policy_set", { baselineMode: "lazy-current", generation, sourceIdentitySha256: sourceIdentity, controlEpoch: epoch, privacyBaselineSha256: baseline, retentionContractSha256: "b".repeat(64), sourceProofSha256: "d".repeat(64), validUntil: new Date(Date.now() + 3600000).toISOString(), issuer: "relayhistory-cloud" });
-  await owner("ingest_receipt_seat_initialize", { protocol: "delivery-acceptance-floor-v1", controlEpoch: epoch, capturedAt: "2026-11-04T00:00:00.000000Z", sourceSequences: ["sessions.delivery_catalog_acceptance_seq", "sessions.delivery_projection_acceptance_seq"].map((sequenceRegclass, i) => ({ sequenceRegclass, sequenceOid: String(i + 1), allocatedHighWater: "9007199254740993", isCalled: true, incrementBy: "1", cycle: false })), allocatedHighWater: "9007199254740993", generation, sourceIdentitySha256: sourceIdentity, sourceProofSha256: "d".repeat(64) });
-  await db.query("INSERT INTO sessions.ingest_frozen_source_completeness(source_identity_sha256,control_epoch,privacy_baseline_sha256,org_count,record_rows,manifest_sha256,neon_snapshot) VALUES($1,$2,$3,0,0,$4,'{}')", [sourceIdentity, epoch, baseline, "e".repeat(64)]);
-  const run = async (s: string, p: unknown[] = []) => { await db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest"); try { const r = await db.query(s, p as never); await db.exec("COMMIT"); return r as never; } catch (e) { await db.exec("ROLLBACK"); throw e; } };
-  const fs = scratchStore(); open.push(fs.done);
-  /** A legacy (pre-cutover) receipt for this batch, stored with `digest`. */
-  const legacy = async (b: HistoryExportBatch, digest: string, withReceiptId = true) => {
-    const receipt = { protocolVersion: 1, batchId: b.batch_id, acceptanceLevel: "durable", acceptedRevisionIds: b.records.map((r) => r.revision_id), unsupportedRevisionIds: [], ...(withReceiptId ? { receiptId: "rhr_legacy" } : {}) };
-    await db.query("INSERT INTO sessions.ingest_frozen_source_receipts VALUES($1,$2,$3,$4,$5,$6)", [TENANT.orgId, TENANT.workspaceId, b.origin_id, b.batch_id, digest, JSON.stringify(receipt)]);
-    return receipt;
-  };
-  return { db, run, store: fs.store, ledger: sqlLedger(run, { acceptanceMode: "buffered", expectedGeneration: generation }), legacy };
+  const until = schemaUntil;
+  const f = await frozenSupabaseFixture((close) => open.push(close), { guard: true, ...(until ? { until } : {}) });
+  databases.push({ applied: f.applied, undefinedObjects: f.undefinedObjects, until });
+  return f;
 }
 
 /** Every ledger method call, by name, in order; `drop` hides one method (a ledger without it). */
@@ -95,159 +85,168 @@ async function setup({ mode = "off", flag = "on", admission = true, drop }: Setu
   const limits = async () => (await app.request("/v1/delivery/limits", { headers: { [IDENTITY_HEADER]: encodeIdentity(identity) } })).json();
   return { ...f, ...s, logs, sent, post, limits };
 }
-const digestOf = async (b: HistoryExportBatch) => (await prepareDelivery(TENANT, b)).batchDigest;
 const route = (logs: Record<string, unknown>[]) => logs.filter((l) => l.route === "delivery.batches");
 
-describe.each(["off", "on-witness-failed", "drain"] as const)("flag on, queued-v1 identity, INGEST_ASYNC_ADMISSION %s: synchronous path", (mode) => {
-  test("(a) stored legacy receipt, same digest: 200 with that receipt; no witness, claim, delivery or custody ACK", async () => {
-    const t = await setup({ mode });
-    const b = await batch([record({ record_id: "r1" })], { batch_id: "legacy-same" });
-    const receipt = await t.legacy(b, await digestOf(b));
-    const res = await t.post(b);
-    expect(res.status).toBe(200);
-    const { limits, ...body } = (await res.json()) as Record<string, unknown>;
-    expect(body).toEqual(receipt);
-    expect(body.receiptId).toBe("rhr_legacy");
-    expect(limits).toEqual(await t.limits());
-    expect(limits).toMatchObject({ ...DELIVERY_LIMITS });
-    expect(t.calls).toEqual(["frozenReceipt"]);
-    expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).toBeNull();
-    expect(res.headers.get(ADMISSION_HEADER)).toBe('{"version":1,"state":"legacy-replay"}');
-    expect(res.headers.get(ADMISSION_HEADER)).toBe(ADMISSION_LEGACY_REPLAY);
-    expect(t.sent).toHaveLength(0);
-    expect(route(t.logs).map((l) => l.outcome)).toEqual(["legacy_replay"]);
+/**
+ * The whole matrix runs twice: on every migration (or HOOPDB_MIGRATE_UNTIL, as the other PGlite suites),
+ * and on the G4-only set (through G4_LAST_MIGRATION, PR #388): the deploy actor's G4 frozen-fallback
+ * matrix. Each case's database carries the undefined-object guard; afterEach fails the case on any
+ * 42883 / 42P01 / 42703 / 42704 hit and, for G4, on any database not cut off at G4_LAST_MIGRATION.
+ */
+describe.each([["every migration", undefined], ["G4-only schema", G4_LAST_MIGRATION]] as const)("%s", (_schema, until) => {
+  beforeEach(() => { schemaUntil = until; });
+
+  describe.each(["off", "on-witness-failed", "drain"] as const)("flag on, queued-v1 identity, INGEST_ASYNC_ADMISSION %s: synchronous path", (mode) => {
+    test("(a) stored legacy receipt, same digest: 200 with that receipt; no witness, claim, delivery or custody ACK", async () => {
+      const t = await setup({ mode });
+      const b = await batch([record({ record_id: "r1" })], { batch_id: "legacy-same" });
+      const receipt = await t.legacy(b, await digestOf(b));
+      const res = await t.post(b);
+      expect(res.status).toBe(200);
+      const { limits, ...body } = (await res.json()) as Record<string, unknown>;
+      expect(body).toEqual(receipt);
+      expect(body.receiptId).toBe("rhr_legacy");
+      expect(limits).toEqual(await t.limits());
+      expect(limits).toMatchObject({ ...DELIVERY_LIMITS });
+      expect(t.calls).toEqual(["frozenReceipt"]);
+      expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).toBeNull();
+      expect(res.headers.get(ADMISSION_HEADER)).toBe('{"version":1,"state":"legacy-replay"}');
+      expect(res.headers.get(ADMISSION_HEADER)).toBe(ADMISSION_LEGACY_REPLAY);
+      expect(t.sent).toHaveLength(0);
+      expect(route(t.logs).map((l) => l.outcome)).toEqual(["legacy_replay"]);
+    });
+
+    test("(a2) stored legacy receipt without receiptId, same digest: 200 whose receiptId is the prepared receipt's; no witness, claim, delivery or custody ACK", async () => {
+      const t = await setup({ mode });
+      const b = await batch([record({ record_id: "r1" })], { batch_id: "legacy-no-receipt-id" });
+      const stored = await t.legacy(b, await digestOf(b), false);
+      expect("receiptId" in stored).toBe(false);
+      const expected = (await prepareDelivery(TENANT, b)).receipt.receiptId;
+      expect(typeof expected).toBe("string");
+      const res = await t.post(b);
+      expect(res.status).toBe(200);
+      const { limits, ...body } = (await res.json()) as Record<string, unknown>;
+      expect(body).toEqual({ ...stored, receiptId: expected });
+      expect(limits).toEqual(await t.limits());
+      expect(t.calls).toEqual(["frozenReceipt"]);
+      expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).toBeNull();
+      expect(res.headers.get(ADMISSION_HEADER)).toBe('{"version":1,"state":"legacy-replay"}');
+      expect(t.sent).toHaveLength(0);
+      expect(route(t.logs).map((l) => l.outcome)).toEqual(["legacy_replay"]);
+    });
+
+    test("(b) stored legacy receipt, other digest: 409 delivery_conflict (batch_id); no witness, claim or delivery", async () => {
+      const t = await setup({ mode });
+      const b = await batch([record({ record_id: "r1" })], { batch_id: "legacy-other" });
+      await t.legacy(b, "9".repeat(64));
+      const res = await t.post(b);
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: { code: string; conflict: Record<string, unknown> } };
+      expect(body.error.code).toBe("delivery_conflict");
+      expect(body.error.conflict).toEqual({ type: "batch_id", originId: b.origin_id, batchId: b.batch_id, submittedDigest: await digestOf(b), currentDigest: "9".repeat(64) });
+      expect(t.calls).toEqual(["frozenReceipt"]);
+      expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).toBeNull();
+      expect(res.headers.get(ADMISSION_HEADER)).toBeNull();
+      expect(t.sent).toHaveLength(0);
+      expect(route(t.logs).map((l) => l.outcome)).toEqual(["delivery_conflict"]);
+    });
+
+    test("(c) no stored receipt: the unchanged path (frozen witness, claim, delivery, custody ACK header)", async () => {
+      const t = await setup({ mode });
+      const b = await batch([record({ record_id: "r1" })], { batch_id: "legacy-absent" });
+      const res = await t.post(b);
+      expect(res.status).toBe(200);
+      expect(t.calls[0]).toBe("frozenReceipt");
+      expect(t.calls).toContain("frozenWitness");
+      expect(t.calls.length).toBeGreaterThan(2);
+      expect(JSON.parse(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)!)).toMatchObject({ version: 1, sourceControlVersion: "0" });
+      expect(res.headers.get(ADMISSION_HEADER)).toBeNull();
+      const { limits: _l, ...body } = (await res.json()) as Record<string, unknown>;
+      expect(body).toEqual((await prepareDelivery(TENANT, b)).receipt as never);
+      expect(t.sent).toHaveLength(0);
+    });
   });
 
-  test("(a2) stored legacy receipt without receiptId, same digest: 200 whose receiptId is the prepared receipt's; no witness, claim, delivery or custody ACK", async () => {
-    const t = await setup({ mode });
-    const b = await batch([record({ record_id: "r1" })], { batch_id: "legacy-no-receipt-id" });
-    const stored = await t.legacy(b, await digestOf(b), false);
-    expect("receiptId" in stored).toBe(false);
-    const expected = (await prepareDelivery(TENANT, b)).receipt.receiptId;
-    expect(typeof expected).toBe("string");
+  test("flag on, INGEST_ASYNC_ADMISSION on with a journal witness: the queued path is unchanged (queued header, no ledger call, even with a stored receipt)", async () => {
+    const t = await setup({ mode: "on" });
+    const b = await batch([record({ record_id: "r1" })], { batch_id: "queued" });
+    await t.legacy(b, await digestOf(b));
     const res = await t.post(b);
     expect(res.status).toBe(200);
-    const { limits, ...body } = (await res.json()) as Record<string, unknown>;
-    expect(body).toEqual({ ...stored, receiptId: expected });
-    expect(limits).toEqual(await t.limits());
-    expect(t.calls).toEqual(["frozenReceipt"]);
+    expect(res.headers.get(ADMISSION_HEADER)).toBe(ADMISSION_QUEUED);
+    expect(res.headers.get(ADMISSION_HEADER)).toBe('{"version":1,"state":"queued"}');
     expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).toBeNull();
-    expect(res.headers.get(ADMISSION_HEADER)).toBe('{"version":1,"state":"legacy-replay"}');
-    expect(t.sent).toHaveLength(0);
-    expect(route(t.logs).map((l) => l.outcome)).toEqual(["legacy_replay"]);
+    expect(t.calls).toEqual([]);
+    expect(t.sent).toHaveLength(1);
   });
 
-  test("(b) stored legacy receipt, other digest: 409 delivery_conflict (batch_id); no witness, claim or delivery", async () => {
-    const t = await setup({ mode });
-    const b = await batch([record({ record_id: "r1" })], { batch_id: "legacy-other" });
+  test("flag on, identity WITHOUT admission: frozenReceipt is never read; the path is unchanged", async () => {
+    const t = await setup({ admission: false });
+    const b = await batch([record({ record_id: "r1" })], { batch_id: "plain" });
     await t.legacy(b, "9".repeat(64));
     const res = await t.post(b);
-    expect(res.status).toBe(409);
-    const body = (await res.json()) as { error: { code: string; conflict: Record<string, unknown> } };
-    expect(body.error.code).toBe("delivery_conflict");
-    expect(body.error.conflict).toEqual({ type: "batch_id", originId: b.origin_id, batchId: b.batch_id, submittedDigest: await digestOf(b), currentDigest: "9".repeat(64) });
-    expect(t.calls).toEqual(["frozenReceipt"]);
-    expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).toBeNull();
+    expect(res.status).toBe(200);
+    expect(t.calls).not.toContain("frozenReceipt");
+    expect(t.calls[0]).toBe("frozenWitness");
+    expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).not.toBeNull();
     expect(res.headers.get(ADMISSION_HEADER)).toBeNull();
-    expect(t.sent).toHaveLength(0);
-    expect(route(t.logs).map((l) => l.outcome)).toEqual(["delivery_conflict"]);
   });
 
-  test("(c) no stored receipt: the unchanged path (frozen witness, claim, delivery, custody ACK header)", async () => {
-    const t = await setup({ mode });
-    const b = await batch([record({ record_id: "r1" })], { batch_id: "legacy-absent" });
+  test("flag off (default), queued-v1 identity, other stored digest: today's behaviour (no receipt read; the batch is claimed and delivered)", async () => {
+    const t = await setup({ flag: "off" });
+    const b = await batch([record({ record_id: "r1" })], { batch_id: "flag-off" });
+    await t.legacy(b, "9".repeat(64));
     const res = await t.post(b);
     expect(res.status).toBe(200);
-    expect(t.calls[0]).toBe("frozenReceipt");
-    expect(t.calls).toContain("frozenWitness");
-    expect(t.calls.length).toBeGreaterThan(2);
-    expect(JSON.parse(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)!)).toMatchObject({ version: 1, sourceControlVersion: "0" });
+    expect(t.calls).not.toContain("frozenReceipt");
+    expect(t.calls[0]).toBe("frozenWitness");
+    expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).not.toBeNull();
     expect(res.headers.get(ADMISSION_HEADER)).toBeNull();
-    const { limits: _l, ...body } = (await res.json()) as Record<string, unknown>;
-    expect(body).toEqual((await prepareDelivery(TENANT, b)).receipt as never);
-    expect(t.sent).toHaveLength(0);
-  });
-});
-
-test("flag on, INGEST_ASYNC_ADMISSION on with a journal witness: the queued path is unchanged (queued header, no ledger call, even with a stored receipt)", async () => {
-  const t = await setup({ mode: "on" });
-  const b = await batch([record({ record_id: "r1" })], { batch_id: "queued" });
-  await t.legacy(b, await digestOf(b));
-  const res = await t.post(b);
-  expect(res.status).toBe(200);
-  expect(res.headers.get(ADMISSION_HEADER)).toBe(ADMISSION_QUEUED);
-  expect(res.headers.get(ADMISSION_HEADER)).toBe('{"version":1,"state":"queued"}');
-  expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).toBeNull();
-  expect(t.calls).toEqual([]);
-  expect(t.sent).toHaveLength(1);
-});
-
-test("flag on, identity WITHOUT admission: frozenReceipt is never read; the path is unchanged", async () => {
-  const t = await setup({ admission: false });
-  const b = await batch([record({ record_id: "r1" })], { batch_id: "plain" });
-  await t.legacy(b, "9".repeat(64));
-  const res = await t.post(b);
-  expect(res.status).toBe(200);
-  expect(t.calls).not.toContain("frozenReceipt");
-  expect(t.calls[0]).toBe("frozenWitness");
-  expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).not.toBeNull();
-  expect(res.headers.get(ADMISSION_HEADER)).toBeNull();
-});
-
-test("flag off (default), queued-v1 identity, other stored digest: today's behaviour (no receipt read; the batch is claimed and delivered)", async () => {
-  const t = await setup({ flag: "off" });
-  const b = await batch([record({ record_id: "r1" })], { batch_id: "flag-off" });
-  await t.legacy(b, "9".repeat(64));
-  const res = await t.post(b);
-  expect(res.status).toBe(200);
-  expect(t.calls).not.toContain("frozenReceipt");
-  expect(t.calls[0]).toBe("frozenWitness");
-  expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).not.toBeNull();
-  expect(res.headers.get(ADMISSION_HEADER)).toBeNull();
-});
-
-test("flag on, ledger without frozenReceipt, queued-v1 identity: 503 custody_source_unavailable, no witness or claim", async () => {
-  const t = await setup({ drop: "frozenReceipt" });
-  const res = await t.post(await batch([record({ record_id: "r1" })], { batch_id: "no-receipt" }));
-  expect(res.status).toBe(503);
-  expect(((await res.json()) as { error: { code: string } }).error.code).toBe("delivery_unavailable");
-  expect(t.calls).toEqual([]);
-  expect(route(t.logs)[0]).toMatchObject({ outcome: "delivery_unavailable", stage: "fence", error_code: "custody_source_unavailable" });
-});
-
-describe("INGEST_SYNC_ADMISSION_FROZEN_RECEIPT settings", () => {
-  const full = { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_SIGNING_KEY: "sign", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn" };
-  const buffered = { ...full, INGEST_ACCEPTANCE_MODE: "buffered", INGEST_EXPECT_GENERATION: generation, INGEST_INLINE_MAX_SESSIONS: "0" };
-
-  test("parses off/on only (default off); anything else refuses", () => {
-    expect(syncAdmissionFrozenReceiptMode(undefined)).toBe("off");
-    expect(syncAdmissionFrozenReceiptMode("")).toBe("off");
-    expect(syncAdmissionFrozenReceiptMode(" OFF ")).toBe("off");
-    expect(syncAdmissionFrozenReceiptMode(" On ")).toBe("on");
-    for (const bad of ["yes", "true", "1", "drain"]) expect(() => syncAdmissionFrozenReceiptMode(bad)).toThrow(/INGEST_SYNC_ADMISSION_FROZEN_RECEIPT/);
   });
 
-  test("Worker settings: absent by default, present only for on, an invalid value throws at startup", async () => {
-    const { ingestSettings } = await import("../worker.ts");
-    expect((await ingestSettings(buffered))?.syncAdmissionFrozenReceipt).toBeUndefined();
-    expect((await ingestSettings({ ...buffered, INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "off" }))?.syncAdmissionFrozenReceipt).toBeUndefined();
-    expect((await ingestSettings({ ...buffered, INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on" }))?.syncAdmissionFrozenReceipt).toBe(true);
-    await expect(ingestSettings({ ...buffered, INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "yes" })).rejects.toThrow(/INGEST_SYNC_ADMISSION_FROZEN_RECEIPT/);
+  test("flag on, ledger without frozenReceipt, queued-v1 identity: 503 custody_source_unavailable, no witness or claim", async () => {
+    const t = await setup({ drop: "frozenReceipt" });
+    const res = await t.post(await batch([record({ record_id: "r1" })], { batch_id: "no-receipt" }));
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("delivery_unavailable");
+    expect(t.calls).toEqual([]);
+    expect(route(t.logs)[0]).toMatchObject({ outcome: "delivery_unavailable", stage: "fence", error_code: "custody_source_unavailable" });
   });
 
-  test.each(["on", undefined] as const)("Worker wiring (signed request through ingestApp), flag %s", async (flag) => {
-    const { ingestApp, ingestSettings } = await import("../worker.ts");
-    const f = await fixture();
-    const env = { ...buffered, INGEST_CUSTODY_SOURCE: "frozen-supabase", ...(flag ? { INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: flag } : {}) };
-    const settings = (await ingestSettings(env))!;
-    const app = ingestApp(env, settings, f.run, { store: f.store, keyRoot: "96bulls" });
-    const b = await batch([record({ record_id: "r1" })], { batch_id: "wired" });
-    await f.legacy(b, "9".repeat(64));
-    const identity = encodeIdentity({ ...TENANT, scopes: [SYNC_SCOPE], admission: ADMISSION_ACCEPT_VALUE });
-    const body = new TextEncoder().encode(JSON.stringify({ protocolVersion: 1, batch: b }));
-    const res = await app.request("/v1/delivery/batches", { method: "POST", body, headers: { "content-type": "application/json", [IDENTITY_HEADER]: identity,
-      [SIGNATURE_HEADER]: signRequest("sign", Math.floor(Date.now() / 1000), "POST", "/v1/delivery/batches", identity, body) } });
-    // on: the stored conflicting legacy receipt refuses; off: today's path claims and delivers.
-    expect(res.status).toBe(flag === "on" ? 409 : 200);
+  describe("INGEST_SYNC_ADMISSION_FROZEN_RECEIPT settings", () => {
+    const full = { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_SIGNING_KEY: "sign", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn" };
+    const buffered = { ...full, INGEST_ACCEPTANCE_MODE: "buffered", INGEST_EXPECT_GENERATION: generation, INGEST_INLINE_MAX_SESSIONS: "0" };
+
+    test("parses off/on only (default off); anything else refuses", () => {
+      expect(syncAdmissionFrozenReceiptMode(undefined)).toBe("off");
+      expect(syncAdmissionFrozenReceiptMode("")).toBe("off");
+      expect(syncAdmissionFrozenReceiptMode(" OFF ")).toBe("off");
+      expect(syncAdmissionFrozenReceiptMode(" On ")).toBe("on");
+      for (const bad of ["yes", "true", "1", "drain"]) expect(() => syncAdmissionFrozenReceiptMode(bad)).toThrow(/INGEST_SYNC_ADMISSION_FROZEN_RECEIPT/);
+    });
+
+    test("Worker settings: absent by default, present only for on, an invalid value throws at startup", async () => {
+      const { ingestSettings } = await import("../worker.ts");
+      expect((await ingestSettings(buffered))?.syncAdmissionFrozenReceipt).toBeUndefined();
+      expect((await ingestSettings({ ...buffered, INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "off" }))?.syncAdmissionFrozenReceipt).toBeUndefined();
+      expect((await ingestSettings({ ...buffered, INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on" }))?.syncAdmissionFrozenReceipt).toBe(true);
+      await expect(ingestSettings({ ...buffered, INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "yes" })).rejects.toThrow(/INGEST_SYNC_ADMISSION_FROZEN_RECEIPT/);
+    });
+
+    test.each(["on", undefined] as const)("Worker wiring (signed request through ingestApp), flag %s", async (flag) => {
+      const { ingestApp, ingestSettings } = await import("../worker.ts");
+      const f = await fixture();
+      const env = { ...buffered, INGEST_CUSTODY_SOURCE: "frozen-supabase", ...(flag ? { INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: flag } : {}) };
+      const settings = (await ingestSettings(env))!;
+      const app = ingestApp(env, settings, f.run, { store: f.store, keyRoot: "96bulls" });
+      const b = await batch([record({ record_id: "r1" })], { batch_id: "wired" });
+      await f.legacy(b, "9".repeat(64));
+      const identity = encodeIdentity({ ...TENANT, scopes: [SYNC_SCOPE], admission: ADMISSION_ACCEPT_VALUE });
+      const body = new TextEncoder().encode(JSON.stringify({ protocolVersion: 1, batch: b }));
+      const res = await app.request("/v1/delivery/batches", { method: "POST", body, headers: { "content-type": "application/json", [IDENTITY_HEADER]: identity,
+        [SIGNATURE_HEADER]: signRequest("sign", Math.floor(Date.now() / 1000), "POST", "/v1/delivery/batches", identity, body) } });
+      // on: the stored conflicting legacy receipt refuses; off: today's path claims and delivers.
+      expect(res.status).toBe(flag === "on" ? 409 : 200);
+    });
   });
 });

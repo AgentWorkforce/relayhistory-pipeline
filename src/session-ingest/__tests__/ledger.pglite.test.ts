@@ -12,6 +12,7 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { LedgerUnavailableError, type ClaimInput, type CommitInput, type LedgerRecord } from "../ledger.ts";
 import { sqlLedger } from "../ledger-sql.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
+import { migrationFiles } from "./pglite-schema.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -30,7 +31,7 @@ async function database(): Promise<PGlite> {
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
-  for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await db.exec(read(`supabase/migrations/${file}`));
+  for (const file of migrationFiles(root)) await db.exec(read(`supabase/migrations/${file}`));
   await db.exec(ROLE);
   return db;
 }
