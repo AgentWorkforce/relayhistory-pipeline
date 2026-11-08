@@ -168,6 +168,11 @@ compare-and-swap (If-Match / If-None-Match).
     - `new` / `unfinished`: `applied` or `replay` gives `seq + 1`; `stale` aborts.
     - `ambiguous`: `applied` gives `seq + 1`; `replay` / `stale` resolve with no change.
     - A settlement failure answers 503; the retry replays and settles.
+    - Settlement is decided on the CURRENT journal, not on what a request saw at begin. Once a
+      `(epoch, version)` is neither pending nor ambiguous and is at or below the maximum, it is
+      settled, and any further settler (a retry that ran concurrently) is a no-op. So `seq`
+      advances once per logical control whatever the settle order (tested both ways, with a
+      witness between).
   - **abort, when it definitely did not apply:** a typed 4xx, or a database error carrying a real
     SQLSTATE (a single autocommit statement that errored rolled back). Only an ambiguous failure
     (connection class 08xxx, server shutdown 57P0x, a code-less transport drop) stays pending.

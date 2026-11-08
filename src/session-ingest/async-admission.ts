@@ -350,13 +350,21 @@ export async function settlePrivacyControl(store: ObjectStore, keyRoot: string, 
   if (begun === "done") return;
   const id = idOf(control);
   await editJournal(store, keyRoot, tenant, (j) => {
+    // Decided on the CURRENT journal, not on what this request saw at begin: several requests can
+    // carry the same (epoch, version) (a retry while the first is still in flight), and seq must
+    // advance once per logical control, whichever settles first.
     const wasPending = j.pending.some((p) => p.id === id), wasAmbiguous = j.ambiguous.includes(id);
+    // Neither pending nor ambiguous any more: another settler already finished this control (it is now
+    // at or below the maximum), or it never applies (stale). Nothing left to count.
+    if (!wasPending && !wasAmbiguous && (outcome === "stale" || atOrBelowMax(j, control))) return { next: null, result: undefined };
     j.pending = j.pending.filter((p) => p.id !== id);
     j.ambiguous = j.ambiguous.filter((a) => a !== id);
-    const counted = begun === "ambiguous" ? outcome === "applied" : outcome !== "stale";
+    // Ambiguous now (counted conservatively by a consumer, whatever this request saw at begin): only a
+    // fresh application counts again. Otherwise an applied or replayed control this journal has not
+    // counted yet counts once.
+    const counted = begun === "ambiguous" || (!wasPending && wasAmbiguous) ? outcome === "applied" : outcome !== "stale";
     if (counted) j.seq += 1;
     if (outcome !== "stale") raiseMax(j, control);
-    if (!counted && !wasPending && !wasAmbiguous && outcome === "stale") return { next: null, result: undefined };
     return { next: j, result: undefined };
   });
 }

@@ -26,7 +26,8 @@ export async function recoverLines(store: ObjectStore, opts: { keyRoot: string; 
 
 const REGION = /^[a-z]{2}(-[a-z]+)+-\d$/;
 const BUCKET = /^(?!.*\.\.)(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
-const ORG = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+/** writer.ts assertTenantSegment: a segment of [A-Za-z0-9._-]{1,128}, never starting with a dot. */
+const ORG = /^(?!\.)[A-Za-z0-9._-]{1,128}$/;
 
 export interface RecoverArgs { bucket: string; region: string; orgId?: string; olderThanMs: number }
 

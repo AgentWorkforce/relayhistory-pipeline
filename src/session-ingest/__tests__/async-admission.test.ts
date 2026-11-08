@@ -238,6 +238,41 @@ describe("privacy journal", () => {
     await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 5, T0)).resolves.toBeUndefined();
   });
 
+  // Dogpatch round 4: one ordered control carried by two concurrent requests (A first, B a retry while A is in flight).
+  for (const order of ["A then B", "B then A"] as const) {
+    test(`P1 causal: two settlers of the same (epoch, version), ${order}, count it once; U witnessed between is admitted`, async () => {
+      const s = store();
+      expect(await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0)).toBe("new"); // A: SQL applied
+      expect(await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0 + 1)).toBe("unfinished"); // B: SQL replay
+      const settleA = () => settlePrivacyControl(s, "96bulls", TENANT, o(1), "new", "applied");
+      const settleB = () => settlePrivacyControl(s, "96bulls", TENANT, o(1), "unfinished", "replay");
+      await (order === "A then B" ? settleA() : settleB());
+      const witness = await witnessPrivacyJournal(s, "96bulls", TENANT); // U
+      expect(witness).toBe(1);
+      await (order === "A then B" ? settleB() : settleA());
+      expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(1);
+      await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, witness, T0 + 2)).resolves.toBeUndefined();
+      // Settling yet again (a third request) is still a no-op.
+      await settlePrivacyControl(s, "96bulls", TENANT, o(1), "unfinished", "replay");
+      expect((await j(s)).seq).toBe(1);
+    });
+  }
+
+  test("two settlers of one AMBIGUOUS control: the first resolves it by SQL's answer, the second changes nothing", async () => {
+    for (const first of ["replay", "applied"] as const) {
+      const s = store();
+      await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0);
+      await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 0, T0 + PENDING_TTL_MS + 1)).rejects.toThrow(); // counted, ambiguous
+      expect(await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0 + PENDING_TTL_MS + 2)).toBe("ambiguous");
+      expect(await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0 + PENDING_TTL_MS + 3)).toBe("ambiguous");
+      await settlePrivacyControl(s, "96bulls", TENANT, o(1), "ambiguous", first);
+      const after = (await j(s)).seq;
+      expect(after).toBe(first === "applied" ? 2 : 1);
+      await settlePrivacyControl(s, "96bulls", TENANT, o(1), "ambiguous", "replay");
+      expect((await j(s)).seq).toBe(after);
+    }
+  });
+
   test("the gate waits on a fresh pending control and counts a stale one conservatively, keeping it ambiguous", async () => {
     const s = store();
     await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0);
@@ -414,6 +449,9 @@ describe("recovery CLI: nothing reaches a host it should not", () => {
     for (const bucket of ["evil.example/x", "a@b", "127.0.0.1", "x..y", "UPPER", "a", ""])
       expect(() => parseRecoverArgs(["--bucket", bucket])).toThrow("--bucket");
     expect(() => parseRecoverArgs(["--bucket", "b-bucket", "--org", "org/a"])).toThrow("--org");
+    // The same tenant-segment rule as the writer (assertTenantSegment): dots allowed, never leading.
+    expect(parseRecoverArgs(["--bucket", "b-bucket", "--org", "org.with-dots_1"]).orgId).toBe("org.with-dots_1");
+    for (const org of [".admission-inbox", ".", "a b", "x".repeat(129)]) expect(() => parseRecoverArgs(["--bucket", "b-bucket", "--org", org])).toThrow("--org");
     const { createS3Store } = await import("../../shared/vendor.ts");
     let fetches = 0;
     const spy = (async () => { fetches++; return new Response("", { status: 500 }); }) as unknown as typeof fetch;
