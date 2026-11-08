@@ -4,8 +4,22 @@ name: opensearch-proof
 # conformance suite against the opensearch backend in each dialect, then the in-process
 # upload -> scrub -> index -> search -> erase proof (scripts/opensearch-proof/e2e.ts).
 # Each run uploads a machine-verifiable JSON (head SHA, server, each case) and its log.
+# Runs only when search-index paths change, and skips the proof steps when the proof
+# files are absent on the head (a PR branched before #315).
 on:
   pull_request:
+    paths:
+      - .github/workflows/opensearch-proof.yml
+      - packages/pipeline/src/search-index/**
+      - packages/pipeline/test/search-index-opensearch*
+      - packages/pipeline/package.json
+      - packages/object-store/src/**
+      - scripts/opensearch-proof/**
+      - src/session-pipeline/search-adapter*
+      - src/session-pipeline/pointer.ts
+      - src/concourse/seed.ts
+      - package.json
+      - bun.lock
   workflow_dispatch:
 permissions:
   contents: read
@@ -47,9 +61,20 @@ jobs:
           actual="$(git rev-parse HEAD)"
           echo "commit under test: $actual (expected $EXPECTED), ${{ matrix.dialect }} ${{ matrix.image }}" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$actual" = "$EXPECTED"
+      # Heads branched before PR #315 lack the proof files; skip rather than fail on them.
+      - name: Check the proof files exist on this head
+        id: proof
+        run: |
+          if [ -f packages/pipeline/test/search-index-opensearch-real.test.ts ] && [ -f scripts/opensearch-proof/e2e.ts ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::search-index proof files are absent on this head (branched before PR #315); skipping the real-server proof" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       # docker run rather than a service container: the two images read different
       # dotted env names, and a service's env cannot vary its keys per matrix entry.
       - name: Start the disposable server (loopback only)
+        if: steps.proof.outputs.present == 'true'
         run: |
           docker run -d --name search -p 127.0.0.1:9200:9200 ${{ matrix.env }} "${{ matrix.image }}"
           for i in $(seq 1 90); do
@@ -62,10 +87,13 @@ jobs:
           docker logs --tail 200 search
           exit 1
       - uses: oven-sh/setup-bun@v2
+        if: steps.proof.outputs.present == 'true'
         with:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
+        if: steps.proof.outputs.present == 'true'
       - name: SearchIndexAdapter conformance (opensearch backend, ${{ matrix.dialect }} dialect, real server)
+        if: steps.proof.outputs.present == 'true'
         env:
           SEARCH_INDEX_OPENSEARCH_TEST_URL: http://127.0.0.1:9200
           SEARCH_INDEX_OPENSEARCH_TEST_DIALECT: ${{ matrix.dialect }}
@@ -73,6 +101,7 @@ jobs:
           set -o pipefail
           bun run --filter @96bulls/pipeline test test/search-index-opensearch-real.test.ts 2>&1 | tee conformance-${{ matrix.dialect }}.log
       - name: End-to-end proof (upload, scrub, index, search, erase)
+        if: steps.proof.outputs.present == 'true'
         env:
           SEARCH_INDEX_OPENSEARCH_TEST_URL: http://127.0.0.1:9200
           SEARCH_INDEX_OPENSEARCH_TEST_DIALECT: ${{ matrix.dialect }}
@@ -82,6 +111,7 @@ jobs:
           set -o pipefail
           bun scripts/opensearch-proof/e2e.ts 2>&1 | tee opensearch-proof-${{ matrix.dialect }}.log
       - name: Check the results file names this head and this dialect
+        if: steps.proof.outputs.present == 'true'
         env:
           EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
