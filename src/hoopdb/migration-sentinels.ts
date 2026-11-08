@@ -48,6 +48,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "replacement: lazy claim reads the seat clock under KEY SHARE with one advisory lock per (org, workspace, origin)",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_records(jsonb)') AND NOT prosecdef AND prosrc LIKE '%lazy-native-origin-v1%') AS applied",
   },
+  "upstream:20261105043700_owner_buffered_read.sql": { evidence: "function sessions.buffered_sessions_for", sql: "SELECT to_regprocedure('sessions.buffered_sessions_for(text,timestamptz,text,text,integer,text,text,text,text,text,boolean,text)') IS NOT NULL AS applied" },
   "upstream:20261105024000_session_brief_documents.sql": { evidence: "table sessions.session_brief_document_outbox", sql: relation("sessions.session_brief_document_outbox") },
   "upstream:20261105025000_canonical_feature_journal.sql": { evidence: "table sessions.canonical_feature_journal", sql: relation("sessions.canonical_feature_journal") },
   "upstream:20261105026000_canonical_history_lineage.sql": { evidence: "table sessions.ingest_history_carriers", sql: relation("sessions.ingest_history_carriers") },

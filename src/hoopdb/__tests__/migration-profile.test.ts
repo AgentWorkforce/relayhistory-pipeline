@@ -1631,19 +1631,20 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const Y = "upstream:20261105041000_ingest_privacy_authority.sql";
     const H = "upstream:20261105043000_brief_titles.sql";
     const N = "upstream:20261105043500_lazy_claim_clock_narrowing.sql";
+    const O = "upstream:20261105043700_owner_buffered_read.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
@@ -1679,7 +1680,23 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 043500 (lazy claim clock narrowing, a non-1000 step between 043000 and 044000) is the latest: 043000
+    // 043700 (owner buffered read) is the latest: 043500 and 043000 refuse (55000) while it is applied;
+    // its own down removes its four functions and parity table.
+    const ownerReadFns = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE proname IN ('owner_buffered_read_scope','owner_buffered_parity_expected','buffered_sessions_for','buffered_session_stages_for')")).rows[0]!.n;
+    const parityTable = async () => relation("sessions.owner_buffered_parity");
+    expect(await names()).toContain(O);
+    expect(await ownerReadFns()).toBe(4);
+    expect(await parityTable()).toBe("sessions.owner_buffered_parity");
+    expect((await failure(rollback("20261105043500_lazy_claim_clock_narrowing.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(N);
+    expect((await failure(rollback("20261105043000_brief_titles.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(H);
+    await rollback("20261105043700_owner_buffered_read.down.sql");
+    expect(await names()).not.toContain(O);
+    expect(await ownerReadFns()).toBe(0);
+    expect(await parityTable()).toBeNull();
+    // 043500 (lazy claim clock narrowing, a non-1000 step between 043000 and 044000) is then the latest: 043000
     // refuses (55000) while it is applied; its own down restores the exact 055000 bodies and marks the
     // validation pending, and the reapply below restores PASS.
     const lazyRecords = async () =>
@@ -1693,8 +1710,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await passed()).toBe(false);
     expect(await lazyRecords()).not.toContain("lazy-native-origin-v1");
     expect(await lazyRecords()).toContain("WHERE singleton FOR UPDATE;");
-    // Later lanes roll back first and remove their own ledger rows; only then
-    // 043000 (F2 brief titles) is the latest: 042000, 041000, 040000 and 039000 all refuse
+    // Then 043000 (F2 brief titles) is the latest: 042000, 041000, 040000 and 039000 all refuse
     // (55000) while it is applied, so it rolls back first.
     expect(await names()).toContain(H);
     expect((await failure(rollback("20261105042000_babysitter_evidence_retention.down.sql")))?.code).toBe("55000");
@@ -1804,10 +1820,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // 035000 through 039000, 040000 (lazy source tables) and 041000 (privacy authority); the post-validation
     // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    // Up again: 041000's exact source-table list is back in both lazy functions.
+    // Up again: 041000's exact source-table list is back in both lazy functions, 043500's lazy claim
+    // narrowing is back, and 043700's four functions and parity table.
     expect(await lazyRecords()).toContain("lazy-native-origin-v1");
+    expect(await ownerReadFns()).toBe(4);
+    expect(await parityTable()).toBe("sessions.owner_buffered_parity");
     expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
