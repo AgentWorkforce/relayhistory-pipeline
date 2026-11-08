@@ -11,7 +11,13 @@ after Khaliq's own OK in his own words; `[missing]` = not in source.
 
 ## 1. Scope and status
 
-Merged main SHA: (to be filled when #377 merges)
+Merged main SHA: f196f637ed6caf4f02d6948aa5830c95b4d20df3 (#377 merged by khaliqgant at 2026-11-08T16:36:14Z
+from exact head 92c380a2; parents a5ba9648 = main after #367 and 92c380a2). The merged tree also carries #367
+(s3-first async ingest stack: `stacks/cloudflare/session-ingest.ts`, `buffered-queue-provider.ts`,
+`scripts/private-ingest-operator.ts`), which does not touch the Path R read-Worker files. At merge time the
+`unit-tests` check on 92c380a2 was still in progress (24 of 25 checks green); its terminal result is recorded in
+section 7. Cite this exact SHA, never mutable `main`. This SHA is a source reference only: the deploy and image
+source stays 8bb18be5 until Khaliq says otherwise.
 
 - "Path R" is the own-session owner-buffered EVENTS reader: `GET /v1/sessions/:sessionId/events` with `source`
   can serve the caller's own buffered events for a session that has no canonical pointer, behind
@@ -306,8 +312,9 @@ In CI (source; the clone has no installed dependencies, so nothing was executed 
 - #377 CI: at head 28394e2a the `session-read-worker / worker`, unit and real-PostgreSQL jobs were green, but the
   pg-proof "ingest publication and frontier" PG15/16 jobs failed because pg-proof checks out the PR head SHA and
   the pre-merge branch (based on c858e7fe) did not yet contain `frontier-plan.postgres.test.ts` from #374. The
-  branch was forward-merged with `main` 06764c94 (head 92c380a2); the merge SHA line in section 1 is filled only
-  after terminal green CI on that exact head and the merge.
+  branch was forward-merged with `main` 06764c94 (head 92c380a2). #377 was merged at 16:36:14Z (main f196f637)
+  while the `unit-tests` check on 92c380a2 was still in progress; the other 24 checks on 92c380a2 were green.
+  Terminal `unit-tests` result on 92c380a2: PENDING at packet time (watcher running; updated when terminal).
 - Not covered by CI `[missing]`:
   - The events path against real PostgreSQL RPCs, real S3 and a real control head. `pg-proof.yml` has no Path R
     job. The 043700 privacy guard's real-PG test predates #377.
@@ -331,8 +338,8 @@ Each step is an independent gate. Nothing here is executed from this packet.
 
 1. [source-ready] Path R source at #377 head 92c380a2 (delta 4528f207 + 28394e2a), default off; the flag-off route answers and the render
    are byte-identical (section 1).
-2. [pending #377 merge] #377 merged to `main`; fill in the merged main SHA (section 1). The deploy workflow runs
-   only from `main` (section 2).
+2. [done] #377 merged to `main` f196f637 (section 1). The deploy workflow runs only from `main` (section 2);
+   any dispatch is `[operator: needs Khaliq OK]` and is not requested by this packet.
 3. [operator: needs Khaliq OK] G4: verify 043700 is applied in production (migration-handover-agent lane).
 4. [operator: needs Khaliq OK] G2: parity rows for each canary owner. Bulk G2 has not run.
 5. [operator: needs Khaliq OK] Owner-buffered prerequisites: the S3/KMS grant on `buffered-batches/`, the
