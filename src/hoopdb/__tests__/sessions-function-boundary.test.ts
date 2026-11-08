@@ -63,7 +63,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql",
       "supabase/rollbacks/20261105042000_babysitter_evidence_retention.down.sql",
       "supabase/rollbacks/20261105043500_lazy_claim_clock_narrowing.down.sql",
-      "supabase/rollbacks/20261105053000_lazy_ack_clock_no_key_update.down.sql",
+      "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql",
     ]);
   });
 
@@ -124,10 +124,10 @@ describe("unified sessions function-boundary generator", () => {
     expect(down.trim().endsWith("COMMIT;")).toBe(true);
   });
 
-  test("the 053000 staged-ACK clock NO KEY UPDATE changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {
+  test("the 043800 staged-ACK clock NO KEY UPDATE changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {
     const withLane = await generate(repo, LANES, VERIFIERS);
     const without = await generate(repo, LANES.filter((l) => l !== lazyAckClockNoKeyUpdate), VERIFIERS);
-    const downPath = "supabase/rollbacks/20261105053000_lazy_ack_clock_no_key_update.down.sql";
+    const downPath = "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql";
     for (const [path, value] of Object.entries(without.outputs)) expect(withLane.outputs[path]).toBe(value);
     expect(Object.keys(withLane.outputs).filter((p) => !(p in without.outputs))).toEqual([downPath]);
     expect(withLane.summary.boundarySHA).toBe(without.summary.boundarySHA);

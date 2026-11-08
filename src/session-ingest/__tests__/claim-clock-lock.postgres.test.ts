@@ -4,7 +4,7 @@
  * per (org, workspace, origin) on ONE transaction advisory lock, so a claim of another origin no longer queues
  * behind it; same-origin claims serialize and a same-key loser takes the P0W01 ownership path, never 23505/40001.
  * F1/F2 bound the advisory footprint (one lock per claim, never one per record: 53200 safety).
- * C1/C2 (20261105053000_lazy_ack_clock_no_key_update): a staged ACK holds the clock FOR NO KEY UPDATE, so another
+ * C1/C2 (20261105043800_lazy_ack_clock_no_key_update): a staged ACK holds the clock FOR NO KEY UPDATE, so another
  * user's claim (KEY SHARE) no longer queues behind it, while FOR SHARE / FOR UPDATE holders still exclude the ACK.
  * Claim/commit payloads are captured from the real deliverBatch -> sqlLedger path and replayed on held connections.
  */
@@ -33,7 +33,7 @@ const root = join(import.meta.dir, "../../..");
 const epoch = "3".repeat(64), identity = "c".repeat(64);
 const migrationPath = "supabase/migrations/20261105043500_lazy_claim_clock_narrowing.sql";
 const migrationName = "upstream:20261105043500_lazy_claim_clock_narrowing.sql";
-const ackMigrationPath = "supabase/migrations/20261105053000_lazy_ack_clock_no_key_update.sql";
+const ackMigrationPath = "supabase/migrations/20261105043800_lazy_ack_clock_no_key_update.sql";
 const profile: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: true, runtimeRole: "postgres" };
 const text = (path: string) => readFileSync(join(root, path), "utf8").split("\n").filter((l) => !l.startsWith("\\")).join("\n");
 const CLAIM = "SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS result";
@@ -344,7 +344,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect((await hx.done).ok).toBe(true);
     const hy = await hold(COMMIT, py);
     await waitBlockedBy(hy.pid, hx.pid);
-    // Claim Z: since 053000 the staged ACK holds the clock FOR NO KEY UPDATE, which does not conflict with Z's KEY
+    // Claim Z: since 043800 the staged ACK holds the clock FOR NO KEY UPDATE, which does not conflict with Z's KEY
     // SHARE, so Z completes while X still holds the clock and Y is queued behind X (lock_timeout bounds a regression).
     expect((await pool.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0].prosrc).toContain("WHERE singleton FOR NO KEY UPDATE;");
     const hz = await hold(CLAIM, await capture("ingest_claim_buffered_batch", z, `b1z-${serial}`, [`b1-z-${serial}`]), "SET LOCAL lock_timeout=750");
@@ -358,7 +358,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect(await lastSeat()).toBe(rows.at(-1)!.seat);
   }, 60000);
 
-  test("C1 (053000): a claim of another user and origin proceeds while a staged ACK holds the clock; with the 043500 ACK body restored it queues (55P03 under lock_timeout)", async () => {
+  test("C1 (043800): a claim of another user and origin proceeds while a staged ACK holds the clock; with the 043500 ACK body restored it queues (55P03 under lock_timeout)", async () => {
     const run = async () => {
       const x = tenant("c1x"), y = tenant("c1y");
       await warm(x, y);
@@ -378,7 +378,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect((await pool.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0].prosrc).toContain("WHERE singleton FOR NO KEY UPDATE;");
   }, 60000);
 
-  test("C2 (053000): a FOR SHARE or FOR UPDATE holder of the clock (custody/GC/policy, quiesce) still excludes a staged ACK (55P03 under lock_timeout)", async () => {
+  test("C2 (043800): a FOR SHARE or FOR UPDATE holder of the clock (custody/GC/policy, quiesce) still excludes a staged ACK (55P03 under lock_timeout)", async () => {
     for (const mode of ["FOR SHARE", "FOR UPDATE"]) {
       const x = tenant("c2x");
       await warm(x);

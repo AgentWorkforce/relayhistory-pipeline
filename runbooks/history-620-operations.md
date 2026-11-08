@@ -29,7 +29,7 @@ initialization) still take it `FOR UPDATE`. After the fence lock and the clock r
 before any write, each claim takes exactly one transaction advisory lock keyed
 `'96bulls:lazy-native-origin-v1'` per (org, workspace, origin).
 
-Since 053000 the staged ACK (`ingest_lazy_ack_batch`) takes the clock `FOR NO KEY UPDATE`: it writes
+Since 043800 the staged ACK (`ingest_lazy_ack_batch`) takes the clock `FOR NO KEY UPDATE`: it writes
 `last_seat` only, so staged ACKs still serialize with each other and with every `FOR SHARE` /
 `FOR UPDATE` holder, but a claim's `KEY SHARE` no longer queues behind an in-flight ACK.
 
@@ -96,7 +96,7 @@ usually the statement timeout, but not provably so): `route` = `ingest.lock_aler
 and `sqlstate`. It carries no tenant data and no ids. The request's own 503 line is unchanged
 (`route` `delivery.batches` / `turns.batches` / `delivery.recovery`, `outcome`
 `delivery_unavailable`, `stage` `claim` or `buffer_receipt`, `error_code`, `db_error_code`).
-Since 053000 it also fires with `stage` = `staged_intent` for the buffered stage-intent call
+Since 043800 it also fires with `stage` = `staged_intent` for the buffered stage-intent call
 (`ingest_prepare_buffer_stage`, deliver stage `buffer_intent`), which takes no clock lock but waits
 on the fence and batch rows a staged ACK holds. This line covers only those three calls. Control changes and `lazy_clear` run nested inside the
 ordered selection/reset SQL (`ingest_apply_selection` / reset and the history-control triggers);

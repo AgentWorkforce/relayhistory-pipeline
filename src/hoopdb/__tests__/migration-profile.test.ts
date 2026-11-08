@@ -1632,7 +1632,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const H = "upstream:20261105043000_brief_titles.sql";
     const N = "upstream:20261105043500_lazy_claim_clock_narrowing.sql";
     const O = "upstream:20261105043700_owner_buffered_read.sql";
-    const Q = "upstream:20261105053000_lazy_ack_clock_no_key_update.sql";
+    const Q = "upstream:20261105043800_lazy_ack_clock_no_key_update.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -1681,7 +1681,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 053000 (staged-ACK clock NO KEY UPDATE) is the latest: 043700 and 043500 refuse (55000) while it is
+    // 043800 (staged-ACK clock NO KEY UPDATE) is the latest: 043700 and 043500 refuse (55000) while it is
     // applied; its own down restores the exact 043500 ACK body (clock FOR UPDATE) and marks the validation pending.
     const lazyAck = async () =>
       (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0]!.s;
@@ -1691,7 +1691,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toContain(O);
     expect((await failure(rollback("20261105043500_lazy_claim_clock_narrowing.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(N);
-    await rollback("20261105053000_lazy_ack_clock_no_key_update.down.sql");
+    await rollback("20261105043800_lazy_ack_clock_no_key_update.down.sql");
     expect(await names()).not.toContain(Q);
     expect(await passed()).toBe(false);
     expect(await lazyAck()).not.toContain("FOR NO KEY UPDATE");
@@ -1838,7 +1838,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
     // Up again: 041000's exact source-table list is back in both lazy functions, 043500's lazy claim
-    // narrowing is back, 043700's four functions and parity table, and 053000's staged-ACK NO KEY UPDATE.
+    // narrowing is back, 043700's four functions and parity table, and 043800's staged-ACK NO KEY UPDATE.
     expect(await lazyRecords()).toContain("lazy-native-origin-v1");
     expect(await lazyAck()).toContain("WHERE singleton FOR NO KEY UPDATE;");
     expect(await ownerReadFns()).toBe(4);

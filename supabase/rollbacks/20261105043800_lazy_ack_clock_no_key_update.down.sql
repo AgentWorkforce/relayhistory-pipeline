@@ -7,10 +7,10 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF to_regclass('sessions.__96bulls_migrations')IS NULL OR to_regclass('sessions.__96bulls_role_validation')IS NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy ack clock: migration ledger/marker required';END IF;
  LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
- IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105053000_lazy_ack_clock_no_key_update.sql')
+ IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105043800_lazy_ack_clock_no_key_update.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy ack clock: a later migration is applied; roll it back first';END IF;
- SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105053000_lazy_ack_clock_no_key_update.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'216f5e16b543c5af2b4c7cc5455008e5486553fa24ee1924c2686453c3e01b8c'
+ SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043800_lazy_ack_clock_no_key_update.sql' FOR UPDATE;
+ IF NOT FOUND OR v_sha<>'3792198a4790f4efed313d3590e68fb89ffc506087c98f7afc5993843df3dc39'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy ack clock: own applied checksum required';END IF;
  UPDATE sessions.__96bulls_role_validation SET status='pending',updated_at=clock_timestamp() WHERE name='session_directory_search_worker';
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy ack clock: validation marker required';END IF;
@@ -96,5 +96,5 @@ BEGIN
  IF t.expires_at<=clock_timestamp() THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: stage expired while assigning seats';END IF;
  PERFORM sessions.ingest_lazy_attempt(t.claim_token);
 END $lazy_ack_batch$;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105053000_lazy_ack_clock_no_key_update.sql' AND sha256='216f5e16b543c5af2b4c7cc5455008e5486553fa24ee1924c2686453c3e01b8c';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043800_lazy_ack_clock_no_key_update.sql' AND sha256='3792198a4790f4efed313d3590e68fb89ffc506087c98f7afc5993843df3dc39';
 COMMIT;

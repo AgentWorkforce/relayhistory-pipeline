@@ -1,5 +1,5 @@
 /**
- * 20261105053000_lazy_ack_clock_no_key_update, single-connection semantics (PGlite; every migration incl. 053000).
+ * 20261105043800_lazy_ack_clock_no_key_update, single-connection semantics (PGlite; every migration incl. 043800).
  * The staged ACK (sessions.ingest_lazy_ack_batch) now locks the singleton seat clock FOR NO KEY UPDATE instead of
  * FOR UPDATE, so a claim's FOR KEY SHARE read no longer queues behind it. The two-connection behaviour is proven on
  * real PostgreSQL in ack-clock-lock.postgres.test.ts; this file pins the installed body, the unchanged claim path and
@@ -31,7 +31,7 @@ const secdef = async (f: Fixture, sig: string) =>
   (await f.db.query<{ s: boolean }>("SELECT prosecdef s FROM pg_proc WHERE oid=$1::regprocedure", [sig])).rows[0]!.s;
 const ACK = "sessions.ingest_lazy_ack_batch(jsonb)", CLAIM = "sessions.ingest_lazy_records(jsonb)";
 
-test("053000 installs the staged ACK with FOR NO KEY UPDATE on the seat clock and leaves the claim path on FOR KEY SHARE", async () => {
+test("043800 installs the staged ACK with FOR NO KEY UPDATE on the seat clock and leaves the claim path on FOR KEY SHARE", async () => {
   const f = await fixture();
   const ack = await def(f, ACK);
   expect(ack).toContain("FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR NO KEY UPDATE;v_last:=c.last_seat;");
@@ -44,7 +44,7 @@ test("053000 installs the staged ACK with FOR NO KEY UPDATE on the seat clock an
   expect(claim).not.toMatch(/ingest_receipt_seat_clock WHERE singleton FOR (NO KEY )?UPDATE/);
 });
 
-test("053000 also applies on the pending:false profile (043700 skipped) because it depends only on 043500", async () => {
+test("043800 also applies on the pending:false profile (043700 skipped) because it depends only on 043500", async () => {
   const f = await fixture({ pending: false });
   expect(await def(f, ACK)).toContain("WHERE singleton FOR NO KEY UPDATE;");
 });

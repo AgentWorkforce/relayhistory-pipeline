@@ -1,11 +1,11 @@
-/** Replacement-only lane (slot 053000): the staged ACK locks the seat clock FOR NO KEY UPDATE, not FOR UPDATE. ACLs unchanged. */
+/** Replacement-only lane (slot 043800): the staged ACK locks the seat clock FOR NO KEY UPDATE, not FOR UPDATE. ACLs unchanged. */
 import { createHash } from "node:crypto";
 import type { LaneContext, LaneManifest } from "../types.ts";
 
-const MIGRATION = "supabase/migrations/20261105053000_lazy_ack_clock_no_key_update.sql";
+const MIGRATION = "supabase/migrations/20261105043800_lazy_ack_clock_no_key_update.sql";
 const ORIGINAL = "supabase/migrations/20261105043500_lazy_claim_clock_narrowing.sql";
-const ROLLBACK = "supabase/rollbacks/20261105053000_lazy_ack_clock_no_key_update.down.sql";
-const NAME = "upstream:20261105053000_lazy_ack_clock_no_key_update.sql";
+const ROLLBACK = "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql";
+const NAME = "upstream:20261105043800_lazy_ack_clock_no_key_update.sql";
 
 /** The exact 043500 ACK body (already CREATE OR REPLACE there; owner/ACL stay unchanged). */
 export function originalBodies(source: string): string[] {
@@ -43,7 +43,7 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
 
 export const lazyAckClockNoKeyUpdate: LaneManifest = {
   lane: "lazy-ack-clock-no-key-update",
-  owner: "claim-503 follow-up, fix/lazy-ack-clock-lock-053000 (slot 053000)",
+  owner: "claim-503 follow-up, fix/lazy-ack-clock-lock-043800 (slot 043800)",
   migration: MIGRATION,
   prefixes: [],
   grantSources: [],

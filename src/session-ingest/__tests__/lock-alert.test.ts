@@ -1,6 +1,6 @@
 /** The 55P03 / 57014 lock-wait alert line (runbooks/history-620-operations.md, "Lock-wait alert"):
  * one `{ route: "ingest.lock_alert", stage, sqlstate }` line per failed request on the lazy claim or
- * the staged ACK (and, since 053000, the staged-intent call that queues behind it), through the injected logger; nothing else changes (status, envelope, route line). */
+ * the staged ACK (and, since 043800, the staged-intent call that queues behind it), through the injected logger; nothing else changes (status, envelope, route line). */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createIngestApp, IDENTITY_HEADER, lockAlertFields, SYNC_SCOPE } from "../app.ts";
 import { IngestUnavailable } from "../deliver.ts";
