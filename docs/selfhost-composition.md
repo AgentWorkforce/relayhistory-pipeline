@@ -240,3 +240,101 @@ CA: `SESSION_POSTGRES_TLS_PROFILE=custom-ca` with `SESSION_POSTGRES_CA_FILE`
 (a mounted file, at most 128 KiB) and `SESSION_POSTGRES_CA_SHA256` (64 hex
 characters, pinned). A mismatch fails startup. `supabase` selects the pinned
 Supabase CA. There is no implicit default for the service.
+
+## 6. Summaries and the model transport (Bob Costas, session-brief)
+
+Both model users are off by default. With no change, Bob Costas writes
+extractive summaries (no model call) and session-brief claims nothing.
+
+### Enabling the Bob Costas model summariser
+
+`BOB_COSTAS_MODEL` picks the summariser (`src/bob-costas/model-summarizer.ts`,
+whose header is the reference for every variable):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BOB_COSTAS_MODEL` | unset (`off`) | unset, empty, `off` or `extractive`: extractive only. Any other value is the model id (session-brief's `MODEL_PATTERN`); an invalid id fails startup |
+| `OPENAI_API_KEY` | unset | the model credential, shared with session-brief, from the secret store. Unset, blank or `*-disabled`: every summary is extractive (reason `no_api_key`) |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible Responses API base, shared with session-brief; https, loopback, or an in-cluster Service with `ALLOW_IN_CLUSTER_HTTP=true`. A bad value fails startup |
+| `BOB_COSTAS_BACKGROUND_DAILY_BUDGET` | 5000 | distinct sessions per org per UTC day that may use the model |
+| `BOB_COSTAS_SESSION_DAILY_CAP` | 30 | model attempts per session per UTC day |
+| `BOB_COSTAS_GLOBAL_DAILY_CAP` | 20000 | model attempts per UTC day across every org (0 disables model calls) |
+| `BOB_COSTAS_MAX_ATTEMPTS` | 2 | a retryable failure (429, 5xx, timeout) is retried once, after `BOB_COSTAS_RETRY_DELAY_MS` (1000) |
+| `BOB_COSTAS_MODEL_TIMEOUT_MS` | 20000 | per attempt, as session-brief |
+| `BOB_COSTAS_MAX_OUTPUT_TOKENS_SHORT` / `_LONG` | 256 / 1024 | `max_output_tokens` per kind |
+| `BOB_COSTAS_REASONING_EFFORT` | `none` | as session-brief sends; `minimal`/`low`/`medium`/`high`, or `omit` for a gateway that rejects the field |
+
+The budget and caps are counted in memory by each Bob Costas process and reset
+at the UTC day boundary, so with N replicas the effective ceiling is N times
+the configured value. Size the values for the replica count.
+
+The summariser never fails a stage because of the model. With no key, with the
+budget or a cap exhausted, or when the call still fails after its retries, it
+writes the extractive summary and logs a reason code (`no_api_key`, `budget`,
+`session_cap`, `global_cap`, `model_failed` plus the provider error code). The
+prompt is built from the session digest only (harness, counts, the first user
+turns, the tool-call histogram, models, time span), every string scrubbed
+first; the model's output is scrubbed before it is stored. Logs carry the model
+id, token counts from the Responses usage block, attempt count and codes only:
+never prompts, outputs, request or response bodies, provider error text or the
+key.
+
+### One transport for both services
+
+Bob Costas reuses session-brief's Responses transport unchanged, so one
+`OPENAI_*` configuration drives both: `OPENAI_API_KEY` and `OPENAI_BASE_URL`
+are read by both services, while `SESSION_BRIEF_MODEL` and `BOB_COSTAS_MODEL`
+pick each one's model. The Helm chart will expose this as:
+
+| Helm value | Env |
+| --- | --- |
+| `intelligence.mode` | whether the model env is rendered at all (off by default) |
+| `intelligence.baseUrl` | `OPENAI_BASE_URL` |
+| `intelligence.briefModel` | `SESSION_BRIEF_MODEL` |
+| `intelligence.bobCostasModel` | `BOB_COSTAS_MODEL` |
+| `intelligence.existingSecret` | the Secret holding `OPENAI_API_KEY` |
+
+(The chart values are a contract for the stack builder; this repository ships
+no chart change.)
+
+### Bedrock on self-host today
+
+There is no native Bedrock provider. A self-host on AWS runs an in-cluster
+OpenAI-compatible gateway (any gateway that serves the Responses API and calls
+Bedrock with a pod IAM role), and points both services at it:
+
+```
+OPENAI_BASE_URL=http://<gateway>.<namespace>.svc:<port>/v1
+ALLOW_IN_CLUSTER_HTTP=true
+OPENAI_API_KEY=<the gateway's key, from the secret store>
+BOB_COSTAS_MODEL=<the gateway's model id>
+```
+
+The IAM role belongs to the gateway, not to the 96bulls workers. Plain http is
+accepted only for a Kubernetes Service name with `ALLOW_IN_CLUSTER_HTTP=true`;
+anything else needs https.
+
+### Follow-up: native Bedrock provider (scope only, no code now)
+
+A native provider would need: SigV4 request signing from the pod's role
+credentials (no `OPENAI_API_KEY`); a mapping from the Responses request
+(instructions, input, JSON-schema output, `max_output_tokens`) to the Bedrock
+Converse API and back (output text, `usage.inputTokens`/`outputTokens`, stop
+reasons onto the existing provider error codes and their retry classes); and
+region plus Bedrock model-id configuration, validated at startup like
+`OPENAI_BASE_URL`. It would sit behind the same transport interface so both
+services gain it together.
+
+### Hosted activation
+
+The hosted stack keeps the extractive summariser until a person flips it. The
+change is one env value on the hosted Bob Costas worker:
+
+- set `BOB_COSTAS_MODEL` to the chosen model id;
+- confirm `OPENAI_API_KEY` and `OPENAI_BASE_URL` (if overridden) are already
+  present there for session-brief; Bob Costas reads the same names;
+- optionally set the `BOB_COSTAS_*` budgets above.
+
+That flip and its deploy are a separate production change and need Khaliq's
+own explicit approval. Nothing in this repository changes the hosted or local
+value; the local stack (`alchemy.run.ts`) stays at `BOB_COSTAS_MODEL: "off"`.
