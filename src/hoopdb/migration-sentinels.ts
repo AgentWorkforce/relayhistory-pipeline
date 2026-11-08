@@ -61,6 +61,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT to_regclass('sessions.ingest_bookkeeping_retired_claims') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_babysitter_retention_register(jsonb)') AND prosecdef AND prosrc LIKE '%ingest_bookkeeping_claim_lock_key%') AS applied",
   },
   "upstream:20261105043885_ingest_generation_overlap.sql": { evidence: "table sessions.ingest_generation_overlap_windows", sql: relation("sessions.ingest_generation_overlap_windows") },
+  "upstream:20261105043890_buffered_search_gate_retired_witness.sql": {
+    evidence: "replacement: buffered_search_gate_for hides claims with an ingest_bookkeeping_retired_claims tombstone (drop reason retired)",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)') AND prosecdef AND prosrc LIKE '%ingest_bookkeeping_retired_claims%') AS applied",
+  },
   "upstream:20261105024000_session_brief_documents.sql": { evidence: "table sessions.session_brief_document_outbox", sql: relation("sessions.session_brief_document_outbox") },
   "upstream:20261105025000_canonical_feature_journal.sql": { evidence: "table sessions.canonical_feature_journal", sql: relation("sessions.canonical_feature_journal") },
   "upstream:20261105026000_canonical_history_lineage.sql": { evidence: "table sessions.ingest_history_carriers", sql: relation("sessions.ingest_history_carriers") },

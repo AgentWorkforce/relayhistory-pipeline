@@ -6,9 +6,9 @@
  *
  * Proves, on a real server, for 20261105043860_buffered_search_gate and 20261105043870_buffered_search_feed_cursor:
  *  (a) both apply through runMigrations (local profile: shim, bootstrap, every upstream migration, verify);
- *      down/up: every applied upstream step after 043870 (today 043880) is first rolled back in DESCENDING order
- *      from its supabase/rollbacks/<step>.down.sql (a missing file fails the test), so 043870 is the latest step;
- *      then 043860's down is refused (55000)
+ *      down/up: every applied upstream step after 043870 (today 043890 then 043880) is first rolled back in
+ *      DESCENDING order from its supabase/rollbacks/<step>.down.sql (a missing file fails the test; 043880's down is
+ *      refused (55000) while 043890 is applied), so 043870 is the latest step; then 043860's down is refused (55000)
  *      while 043870 is applied and drops nothing; 043870's down then 043860's down remove exactly their objects,
  *      ledger rows and the runtime role's schema USAGE; a second runMigrations reapplies every rolled-back step with
  *      the ledger equal to before and every role validation 'pass'.
@@ -60,6 +60,7 @@ const READ = "bulls96_read_api";
 const GATE_NAME = "upstream:20261105043860_buffered_search_gate.sql";
 const FEED_NAME = "upstream:20261105043870_buffered_search_feed_cursor.sql";
 const BK_NAME = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
+const GR_NAME = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
 const FEED_FNS = ["sessions.buffered_search_feed_advance(jsonb)", "sessions.buffered_search_feed_page(jsonb)", "sessions.buffered_search_feed_stage(jsonb)"];
 const GATE_FN = "sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)";
 const FEED_GUARD = "buffered search feed: caller is not the buffered_search_feed_runtime login";
@@ -246,8 +247,12 @@ describe.skipIf(!fixtureUrl)("buffered search gate/feed migrations and the feede
       return file;
     };
     const laterFiles = later.map(downFile);
-    // The order today, documented: 043880 is the only step after 043870 on this branch.
-    expect(later).toEqual(expect.arrayContaining([BK_NAME]));
+    // The order today, documented: 043890 goes before 043880, whose down is refused (55000, nothing changes) while
+    // 043890 is applied.
+    expect(later).toEqual(expect.arrayContaining([GR_NAME, BK_NAME]));
+    expect(later.indexOf(GR_NAME)).toBeLessThan(later.indexOf(BK_NAME));
+    expect(await down(downFile(BK_NAME))).toEqual({ code: "55000", message: "bookkeeping cleanup: a later migration is applied; roll it back first" });
+    expect(await ledger()).toEqual(expect.arrayContaining([BK_NAME, GR_NAME]));
     for (const [i, step] of later.entries()) {
       expect([step, await down(laterFiles[i]!)]).toEqual([step, { code: "accepted" }]);
       expect(await ledger()).not.toContain(step);

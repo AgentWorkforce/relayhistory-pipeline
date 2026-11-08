@@ -77,9 +77,11 @@ Worker-first ordering.
 
 ### 2.1 Database: one owner-opened, time-bounded window (migration `20261105043885`)
 
-**SLOT 043885**, assigned by the registry keeper. `migrate.ts` applies pending files in sorted order, so the
-migration sits between the landed `043880` (ingest bookkeeping cleanup) and the unlanded `043890` and applies
-next. It was first drafted as `043885`; the renumber changed only the slot header comment and the file names.
+**SLOT 043885**, assigned by the registry keeper under a recorded registry exception. `migrate.ts` applies
+pending files in sorted order: `043880` (ingest bookkeeping cleanup), `043885` (this), `043890` (buffered
+search gate retired witness, landed after the slot was assigned). The migration was first drafted as
+`053020`; the renumber changed only the slot header comment and the file names. The rollback chain follows
+the sorted order: `043890` rolls back first, and `043885` and `043880` refuse while it is applied.
 
 The migration creates `sessions.ingest_generation_overlap_windows`, an append-only record with these rules:
 - Columns: `from_generation`, `to_generation`, `admit_during_apply`, `approval_sha256`, `opened_by`,
@@ -193,25 +195,28 @@ Properties:
 
 ## 3. Rollout order
 
-### 3.1 Shipping this change without the outage it fixes
+### 3.1 Shipping this change: the one accepted outage
 
 `043885` is additive and accepts every old caller. It creates new objects, and the two replaced helpers
 reduce to the old predicate while no window exists. But applying it is itself a schema window: `generation()`
-moves, and the window machinery does not exist until the migration commits. **Its own window therefore
-cannot be zero.** It can be made as short as the apply.
+moves, and the window machinery does not exist until the migration commits.
 
+`migrate.ts` has no target-slot option. The first real migrate run after this lands therefore applies
+**every** pending slot in one window: `043850`..`043890`, including `043885`. That single window is the
+**one accepted outage** before overlap windows exist. Every window after it is overlap-protected.
+
+To keep that one window as short as possible:
 1. Merge (code only).
 2. Worker deploy of this code with `expectedGeneration = G_cur` and `overlapGeneration = G5`, where G5 is
-   the generation of the source containing `043885`. Against the unchanged database G_cur is admitted
-   first. G5 is offered only after a 55000.
-3. Apply `043885` **alone**, the smallest possible apply, with the normal approval. Uploads are refused
+   the final composed generation of the source being applied (all pending slots through `043890`). Against
+   the unchanged database G_cur is admitted first. G5 is offered only after a 55000.
+3. Run the one owner-apply of all pending slots with the normal approval. No overlap window can be opened
+   yet, because the table does not exist until `043885` commits inside this same run. Uploads are refused
    from the pending write until step 4, as today. The Worker PUT is no longer inside this interval.
 4. Run the rebind `G_cur → G5` immediately after PASS. The step-2 Worker switches to G5 on its next request
-   with one internal retry. No Worker PUT is needed to recover.
+   with one internal retry. No Worker PUT is needed to recover. From this rebind on, the policy trigger
+   records `G_cur` as retired.
 5. At leisure, Worker deploy with `expectedGeneration = G5` and no overlap.
-
-Alternative: fold `043885` into the next window that is needed anyway. It is the last window with an outage
-either way.
 
 ### 3.2 Every later window (G → H): zero 503 from the fence
 

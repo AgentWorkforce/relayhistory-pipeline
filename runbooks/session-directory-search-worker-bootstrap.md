@@ -398,6 +398,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105043870_buffered_search_feed_cursor.sql` | table sessions.buffered_search_feed_cursors (needs the `buffered_search_feed_runtime` role from the role bootstrap: absent fails closed `42704`, elevated/member/unexpected member `55000`) |
 | `upstream:20261105043880_ingest_bookkeeping_cleanup.sql` | table sessions.ingest_bookkeeping_retired_claims + Babysitter register carries the retirement interlock |
 | `upstream:20261105043885_ingest_generation_overlap.sql` | table sessions.ingest_generation_overlap_windows (slot 043885, zero-503 schema windows; owner-only, no role prerequisite) |
+| `upstream:20261105043890_buffered_search_gate_retired_witness.sql` | replacement: buffered_search_gate_for hides claims with an ingest_bookkeeping_retired_claims tombstone (drop reason retired) |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |

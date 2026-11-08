@@ -15,6 +15,7 @@ import { lazySourceTables, originalBodies } from "../../../scripts/sessions-func
 import { lazyClaimClockNarrowing, originalBodies as originalClaimClockBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-claim-clock-narrowing.ts";
 import { lazyAckClockNoKeyUpdate, originalBodies as originalAckClockBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-ack-clock-no-key-update.ts";
 import { privacyAuthority, originalLazyBodies, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
+import { bufferedSearchGateRetiredWitness, originalGateBody } from "../../../scripts/sessions-function-boundary/lanes/buffered-search-gate-retired-witness.ts";
 import { createHash } from "node:crypto";
 import { ingestGenerationOverlap, originalBodies as originalOverlapBodies } from "../../../scripts/sessions-function-boundary/lanes/ingest-generation-overlap.ts";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
@@ -71,6 +72,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105043850_ingest_acquisition_owner.down.sql",
       "supabase/rollbacks/20261105043880_ingest_bookkeeping_cleanup.down.sql",
       "supabase/rollbacks/20261105043885_ingest_generation_overlap.down.sql",
+      "supabase/rollbacks/20261105043890_buffered_search_gate_retired_witness.down.sql",
     ]);
   });
 
@@ -380,6 +382,43 @@ describe("unified sessions function-boundary generator", () => {
     expect(down).toContain("REVOKE USAGE ON SCHEMA sessions FROM buffered_search_feed_runtime;");
     expect(down).not.toMatch(/DROP ROLE/);
     expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043870_buffered_search_feed_cursor.sql'");
+  });
+
+  test("043890 retired witness: replaces 043860's gate only (ACL/boundary/verifiers unchanged) and derives the exact 043860 rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const withoutLane = await generate(repo, LANES.filter((l) => l !== bufferedSearchGateRetiredWitness), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105043890_buffered_search_gate_retired_witness.down.sql";
+    expect(withLane.summary.lanes["buffered-search-gate-retired-witness"]).toEqual({ functions: 0, replaces: 1, grants: 0 });
+    for (const [path, value] of Object.entries(withoutLane.outputs)) expect(withLane.outputs[path]).toBe(value);
+    expect(Object.keys(withLane.outputs).filter((p) => !(p in withoutLane.outputs))).toEqual([downPath]);
+    const migration = readFileSync(join(root, "supabase/migrations/20261105043890_buffered_search_gate_retired_witness.sql"), "utf8");
+    const original = readFileSync(join(root, "supabase/migrations/20261105043860_buffered_search_gate.sql"), "utf8");
+    // No GRANT at all (the read API grant stays 043860's); the 043860 REVOKE and sweep are re-issued.
+    expect(migration).not.toMatch(/^GRANT /mu);
+    expect(migration).toContain("FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder;");
+    // The body is 043860's plus exactly the retired column and the retired CASE branch.
+    const body = migration.match(/CREATE OR REPLACE FUNCTION sessions\.buffered_search_gate_for\([\s\S]*?\n\$gate\$;/)![0];
+    const added = [
+      "           -- 20261105043890: the 043880 cleanup (Phase A) tombstoned this claim and deleted its lazy ACK\n",
+      "           -- decisions, so version_consistent above no longer witnesses anything for it.\n",
+      "           EXISTS (SELECT 1 FROM sessions.ingest_bookkeeping_retired_claims AS r\n",
+      "                    WHERE r.claim_token = a.claim_token) AS retired,\n",
+      "           WHEN j.retired IS NOT FALSE THEN 'retired'\n",
+    ];
+    let stripped = body;
+    for (const line of added) { expect(stripped).toContain(line); stripped = stripped.replace(line, ""); }
+    expect(stripped).toBe(originalGateBody(original));
+    expect(body.indexOf("'admission_epoch_mismatch'")).toBeLessThan(body.indexOf("'retired'"));
+    expect(body.indexOf("'retired'")).toBeLessThan(body.indexOf("'admission_version_mismatch'"));
+    expect(body).toContain("LANGUAGE plpgsql STABLE SECURITY DEFINER");
+    const down = withLane.outputs[downPath]!;
+    expect(readFileSync(join(root, downPath), "utf8")).toBe(down);
+    expect(down).toContain(originalGateBody(original));
+    expect(down).not.toContain("ingest_bookkeeping_retired_claims AS r");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("claims were retired; turn the gate off instead of rolling back");
+    expect(down).not.toMatch(/DROP |GRANT /);
+    expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043890_buffered_search_gate_retired_witness.sql'");
   });
 
   test("a stale SECDEF signature under a lane's prefix (an old arity) is dropped from the wrapper, not carried forward", async () => {
