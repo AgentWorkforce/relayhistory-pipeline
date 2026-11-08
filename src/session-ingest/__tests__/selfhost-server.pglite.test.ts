@@ -27,6 +27,7 @@ import {
 import { SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
 import { deliveryAccount } from "../vendor/delivery/prepare.ts";
 import { liveMachineId } from "../writer.ts";
+import { TURN_ORIGIN_ID } from "../turns.ts";
 
 setDefaultTimeout(60_000);
 
@@ -386,6 +387,25 @@ describe("per-session erase (RELAYHISTORY_SELFHOST_SESSION_SELECTION=true)", () 
     expect(gone.rows[0]!.deleted_at).not.toBeNull();
   });
 
+  test("one selection erases every origin of the caller's session, relay turns included; another user's copy stays", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    const secondOrigin = liveMachineId(TENANT.workspaceId, "origin-2", TENANT.userId);
+    const turns = liveMachineId(TENANT.workspaceId, TURN_ORIGIN_ID, TENANT.userId);
+    const otherUser = liveMachineId(TENANT.workspaceId, "origin-2", "user-2");
+    for (const m of [machine, secondOrigin, turns, otherUser]) await pointer(db, "sess-1", m);
+    await db.query(
+      `INSERT INTO sessions.ingest_session_ownership (org_id, workspace_id, user_id, origin_id, source, session_id)
+       VALUES ($1, $2, $3, 'origin-2', 'claude', 'sess-1'), ($1, $2, 'user-2', 'origin-2', 'claude', 'sess-1')`,
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId],
+    );
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    for (const m of [machine, secondOrigin, turns]) expect((await row(db, "sess-1", m)).deleted_at).not.toBeNull();
+    expect((await row(db, "sess-1", otherUser)).deleted_at).toBeNull();
+    const fences = await db.query<{ user_id: string; origin_id: string }>("SELECT user_id, origin_id FROM sessions.upload_deletions WHERE session_id = 'sess-1' ORDER BY origin_id COLLATE \"C\"");
+    expect(fences.rows).toEqual(["origin-1", "origin-2", TURN_ORIGIN_ID].sort().map((origin_id) => ({ user_id: TENANT.userId, origin_id })));
+  });
+
   test("a selection naming a session the caller has no pointer for changes no directory row", async () => {
     const rc = await relaycontrol(() => active(["rth:sync"]));
     const { url, db } = await start(rc, on);
@@ -418,7 +438,7 @@ describe("per-session erase (RELAYHISTORY_SELFHOST_SESSION_SELECTION=true)", () 
     expect((await post(url(SELECTION), await selection())).status).toBe(200);
     const again = await post(url(SELECTION), await selection({ enabled: true }));
     expect([again.status, await code(again)]).toEqual([400, "unsupported_by_backend"]);
-    expect((await db.query("SELECT 1 FROM sessions.upload_deletions WHERE session_id = 'sess-1'")).rows).toHaveLength(1);
+    expect((await db.query("SELECT 1 FROM sessions.upload_deletions WHERE session_id = 'sess-1' AND origin_id = $1", [ORIGIN_ID])).rows).toHaveLength(1);
     const wrongAccount = await post(url(SELECTION), await selection({ account_id: "acct_someone_else" }));
     expect(wrongAccount.status).toBe(403);
     const unsigned = await fetch(url(SELECTION), { method: "POST", body: await selection(), headers: { "content-type": "application/json" } });

@@ -6,7 +6,6 @@ import {orderedControl,orderedControlResult} from "./control-protocol.ts";
 import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { dbErrorDiagnosisFrom, dbErrorSnapshot, type DbErrorSnapshot } from "./db-error-class.ts";
 import { acquisitionRefusalFrom } from "./acquisition-refusal.ts";
-import { liveMachineId } from "./writer.ts";
 /**
  * The ledger over SQL: one call per claim and per commit, each to its
  * SECURITY DEFINER function (supabase/migrations/20261104022000_session_ingest_ledger.sql),
@@ -296,10 +295,9 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
     },
     async setSessionUploads(input: SelectionInput): Promise<void> {
       if (options.selfhostSelectionErase) {
-        // The self-host erase front door: fence and tombstone in one transaction. Only a disable is served.
+        // The self-host erase front door: fence and tombstone every origin of the caller's session in one transaction. Only a disable is served.
         if (input.enabled) throw new DeliveryError("unsupported_by_backend", 400, "Re-enabling an erased session is not served by the self-host session ingest");
-        const machineId = liveMachineId(input.tenant.workspaceId, input.originId, input.tenant.userId);
-        const erased = (await call(run, "ingest_selfhost_set_session_uploads", { ...input, machineId })) as Record<string, unknown>;
+        const erased = (await call(run, "ingest_selfhost_set_session_uploads", input)) as Record<string, unknown>;
         if (typeof erased.updated !== "number") throw new LedgerUnavailableError("ledger_bad_result");
         return;
       }

@@ -279,13 +279,11 @@ export async function runAcceptance(stack: StackSession, log: (c: Check) => void
   });
 
   await step("erase", async () => {
-    // A selection is per origin (hosted semantics), and this session has records from two: the desktop upload and the relay turns.
+    // One selection erases the whole session, including the relay turns, which sit under their own origin.
     const account = await deliveryAccount({ orgId: TENANT_A.org, workspaceId: TENANT_A.workspace, userId: TENANT_A.sub });
-    for (const origin of [uploadA.originId, TURN_ORIGIN_ID]) {
-      const erase = await ingest("/v1/delivery/sessions/selection", tokenA, { account_id: account, origin_id: origin, sessions: [{ source: SOURCE, session_id: uploadA.sessionId }], enabled: false });
-      if (erase.status === 501) throw new Blocked("selection answers 501 unsupported_by_backend on this build (needs PR #392)");
-      must(erase.status === 200, `selection (${origin}): ${erase.status} ${erase.text.slice(0, 200)}`);
-    }
+    const erase = await ingest("/v1/delivery/sessions/selection", tokenA, { account_id: account, origin_id: uploadA.originId, sessions: [{ source: SOURCE, session_id: uploadA.sessionId }], enabled: false });
+    if (erase.status === 501) throw new Blocked("selection answers 501 unsupported_by_backend on this build (needs PR #392)");
+    must(erase.status === 200, `selection: ${erase.status} ${erase.text.slice(0, 200)}`);
     const list = await read("/v1/sessions", tokenA);
     must(list.status === 200 && !has(list, uploadA.sessionId), "list still returns the erased session");
     const turns = await read(`/v1/sessions/${uploadA.sessionId}/turns?source=${SOURCE}`, tokenA);

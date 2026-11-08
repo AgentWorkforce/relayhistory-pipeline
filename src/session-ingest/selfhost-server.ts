@@ -13,7 +13,7 @@
  *   POST /v1/auth/token/refresh  401 refresh_not_supported, always (see SELFHOST_REFRESH_PATH)
  *   POST /v1/delivery/sessions/selection  rth:sync, only with RELAYHISTORY_SELFHOST_SESSION_SELECTION=true:
  *                              per-session erase (enabled:false; enabled:true answers 400 unsupported_by_backend). The app.ts handler is
- *                              unchanged; the ledger's setSessionUploads becomes fence + tombstone in one transaction
+ *                              unchanged; the ledger's setSessionUploads fences and tombstones every origin of the caller's session in one transaction
  *                              (migration 043910). 404 afterwards means unreadable, not bytes gone.
  *   any other /v1 path         501 unsupported_by_backend (reset, recovery, custody,
  *                              onboarding are relayhistory-internal and not served self-host)
