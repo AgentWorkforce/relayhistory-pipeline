@@ -7,9 +7,9 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF to_regclass('sessions.__96bulls_migrations') IS NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='read api tokens: migration ledger required';END IF;
  LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
- IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105054000_read_api_tokens.sql')
+ IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105044000_read_api_tokens.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='read api tokens: a later migration is applied; roll it back first';END IF;
- SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105054000_read_api_tokens.sql' FOR UPDATE;
+ SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044000_read_api_tokens.sql' FOR UPDATE;
  IF NOT FOUND OR v_sha<>'33a2ae8f07a8ebe3574ce673a7b58a17e640bc7007002a01be29ad4a66ccf3f4'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='read api tokens: own applied checksum required';END IF;
 END $rollback_guard$;
@@ -20,5 +20,5 @@ DROP FUNCTION sessions.read_api_token_issue(text, text, text, text, text, text, 
 DROP FUNCTION sessions.read_api_token_sweep_expired(timestamptz);
 DROP FUNCTION sessions.read_api_token_verify(text, timestamptz);
 DROP TABLE sessions.read_api_tokens;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105054000_read_api_tokens.sql';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044000_read_api_tokens.sql';
 COMMIT;

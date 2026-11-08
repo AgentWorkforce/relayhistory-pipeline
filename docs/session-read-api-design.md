@@ -75,14 +75,15 @@ Anything Phase A cannot answer exactly gets **`501 unsupported_by_backend`** wit
 
 Contract: `docs/contracts/session-read-api-v1.openapi.yaml`. Self-host service only; the Lambda refuses the mode at startup.
 
-- **Tokens** are opaque (`rth_at_read_`, `rth_rt_read_`, `rth_st_read_`, 256 bits of CSPRNG entropy) and stored only as SHA-256 in `sessions.read_api_tokens` (migration `20261105054000`), reached only through SECURITY DEFINER functions guarded for the genuine `bulls96_read_api` login. Every read looks the hash up, so deleting a row is immediate revocation and there is no signing key. A lookup failure or timeout denies with 503.
+- **Tokens** are opaque (`rth_at_read_`, `rth_rt_read_`, `rth_st_read_`, 256 bits of CSPRNG entropy) and stored only as SHA-256 in `sessions.read_api_tokens` (migration `20261105044000`), reached only through SECURITY DEFINER functions guarded for the genuine `bulls96_read_api` login. Every read looks the hash up, so deleting a row is immediate revocation and there is no signing key. A lookup failure or timeout denies with 503.
 - **Identity** (user, org, workspace) comes only from the row, and the row's audience must be `READ_API_ORIGIN`. Other token families are refused before any lookup.
 - **Issuance** is Control's: after its membership check, Control calls `POST /internal/v1/session-read/sessions` and `.../sessions/refresh` with `READ_API_INTERNAL_SECRET` (`READ_API_INTERNAL_SECRET_PREVIOUS` overlaps during rotation). This service never calls Control. Refresh is one compare-and-set on the refresh hash and the exact identity.
-- **Access lifetime** defaults to 5 minutes (`READ_API_ACCESS_TOKEN_TTL_SECONDS`, 60 to 3600); refresh tokens live 90 days.
+- **Access lifetime** defaults to 5 minutes (`READ_API_ACCESS_TOKEN_TTL_SECONDS`, 60 to 300); refresh tokens live 90 days.
 - **Offboarding and erasure:** `POST /internal/v1/session-read/revoke` deletes by org and optionally user, workspace or id. Holders end their own session with `POST /v1/auth/token/revoke`. Issue and refresh sweep up to 100 fully expired rows per call.
 - **Standalone:** an operator mints an `rth_st_read_` token with `POST /internal/v1/session-read/service-tokens`. `/internal/*` must stay inside the cluster or operator network.
 - **Refuses to start** without `READ_API_ORIGIN` or a 32+ character secret, with any RelayAuth or relaycontrol setting beside it, or with a bad TTL. `POST /v1/cli/login` is not registered in this mode.
 - **Unchanged:** the R2 control-head privacy gate and `PIPELINE_ORG_FROM_PREFIX` / `PIPELINE_KEY_PREFIX` semantics run per request as before; a token replaces neither.
+- **Message ids** (`READ_API_EVENT_MESSAGE_IDS=true`, default off, service entry with the canonical store): `includeMessageId=true` on session events. Off, the parameter stays a 501.
 - **CORS** (`READ_API_CORS_ALLOWED_ORIGINS`, any mode, service entry only): exact https origins (http only on loopback), GET read routes only, never credentials or token routes.
 
 ## 2a. Self-host login and catalog (`RELAYHISTORY_SELFHOST_READ_API`, default off)

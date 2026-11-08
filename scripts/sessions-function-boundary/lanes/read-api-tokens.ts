@@ -1,12 +1,12 @@
 /**
  * Lane: read-api-tokens (READ_API_AUTH_MODE=self_issued, default off).
- * supabase/migrations/20261105054000_read_api_tokens.sql owns the token table's functions. All are
+ * supabase/migrations/20261105044000_read_api_tokens.sql owns the token table's functions. All are
  * SECURITY DEFINER with an inline guard for the genuine bulls96_read_api login. The sweep is
  * owner-only and runs from the issue and refresh functions.
  */
 import type { LaneManifest } from "../types.ts";
 
-const MIGRATION = "supabase/migrations/20261105054000_read_api_tokens.sql";
+const MIGRATION = "supabase/migrations/20261105044000_read_api_tokens.sql";
 
 export const readApiTokens: LaneManifest = {
   lane: "read-api-tokens",

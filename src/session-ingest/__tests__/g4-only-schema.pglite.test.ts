@@ -101,7 +101,7 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105043890_buffered_search_gate_retired_witness.sql",
       "20261105043900_session_consumer_function_grants.sql",
       // A new table and read API functions only; no ingest path touches them.
-      "20261105054000_read_api_tokens.sql",
+      "20261105044000_read_api_tokens.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

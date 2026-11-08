@@ -107,6 +107,18 @@ export const READ_API_INTERNAL_SECRET_VAR = "READ_API_INTERNAL_SECRET";
 export const READ_API_INTERNAL_SECRET_PREVIOUS_VAR = "READ_API_INTERNAL_SECRET_PREVIOUS";
 export const READ_API_ACCESS_TOKEN_TTL_VAR = "READ_API_ACCESS_TOKEN_TTL_SECONDS";
 export const READ_API_CORS_ORIGINS_VAR = "READ_API_CORS_ALLOWED_ORIGINS";
+export const READ_API_EVENT_MESSAGE_IDS_VAR = "READ_API_EVENT_MESSAGE_IDS";
+
+/**
+ * READ_API_EVENT_MESSAGE_IDS (default off): exactly "true" serves includeMessageId on session events
+ * from the canonical store. Unset, "" or "false" leaves /events as without it; anything else refuses startup.
+ */
+export function eventMessageIdDeps<T>(env: NodeJS.ProcessEnv, canonicalTurns: T | undefined): { eventMessageIds?: T } {
+  const raw = env[READ_API_EVENT_MESSAGE_IDS_VAR];
+  if (raw === undefined || raw === "" || raw === "false") return {};
+  if (raw !== "true") throw new Error(`session read api: ${READ_API_EVENT_MESSAGE_IDS_VAR} must be unset, "", "true" or "false"`);
+  return canonicalTurns ? { eventMessageIds: canonicalTurns } : {};
+}
 
 function internalSecret(env: NodeJS.ProcessEnv, name: string): string | undefined {
   const raw = env[name];
@@ -510,7 +522,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
-    ...(canonical ? { timing: canonical.timing, turns: canonical.turns, eventMessageIds: canonical.turns } : {}),
+    ...(canonical ? { timing: canonical.timing, turns: canonical.turns } : {}),
+    ...eventMessageIdDeps(env, canonical?.turns),
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),
     ...(corsAllowedOrigins?.size ? { corsAllowedOrigins } : {}),
     ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),

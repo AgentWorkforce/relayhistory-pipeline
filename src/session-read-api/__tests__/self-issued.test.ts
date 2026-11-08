@@ -6,7 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import { AuthError, createReadApi, type ReadApiDeps } from "../app.ts";
 import { selfIssuedVerifier } from "../auth.ts";
-import { readApiAuthConfig, readApiAuthMode, readApiCorsOrigins } from "../lambda.ts";
+import { eventMessageIdDeps, readApiAuthConfig, readApiAuthMode, readApiCorsOrigins } from "../lambda.ts";
 import { ACCESS_PREFIX, ACCESS_TTL_SECONDS_DEFAULT, REFRESH_PREFIX, SERVICE_PREFIX, generateToken, hashToken, type NewTokenRow, type RefreshInput, type TokenRow, type TokenStore } from "../self-issued.ts";
 import { memoryLiveness } from "./support.ts";
 import type { ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
@@ -308,7 +308,7 @@ describe("fail closed", () => {
     ["a RelayAuth setting", { RELAYAUTH_JWKS_URL: "https://x.example.test/jwks" }],
     ["relaycontrol introspection", { RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS: "true" }],
     ["a TTL of zero", { READ_API_ACCESS_TOKEN_TTL_SECONDS: "0" }],
-    ["a TTL over the cap", { READ_API_ACCESS_TOKEN_TTL_SECONDS: "3601" }],
+    ["a TTL over the 5 minute cap", { READ_API_ACCESS_TOKEN_TTL_SECONDS: "301" }],
     ["a TTL that is not a number", { READ_API_ACCESS_TOKEN_TTL_SECONDS: "5m" }],
   ] as Array<[string, Record<string, string | undefined>]>)("refuses to start with %s", (_name, over) => {
     expect(() => readApiAuthConfig({ ...env, ...over })).toThrow();
@@ -410,6 +410,24 @@ describe("includeMessageId", () => {
     expect((await json(r)).error.reason).toBe("message_id_canonical_too_large");
     const noSource = await a.get("/v1/sessions/s-1/events?workspace=ws-a&includeMessageId=true", token);
     expect((await json(noSource)).error.reason).toBe("message_id_source_required");
+  });
+
+  test("READ_API_EVENT_MESSAGE_IDS is default off and strict", () => {
+    const turns = { source: async () => ({ legacyCoverage: null, rows: [] }) };
+    for (const value of [undefined, "", "false"]) expect(eventMessageIdDeps({ READ_API_EVENT_MESSAGE_IDS: value }, turns)).toEqual({});
+    expect(eventMessageIdDeps({ READ_API_EVENT_MESSAGE_IDS: "true" }, turns)).toEqual({ eventMessageIds: turns });
+    expect(eventMessageIdDeps({ READ_API_EVENT_MESSAGE_IDS: "true" }, undefined)).toEqual({});
+    for (const value of ["TRUE", " true", "1"]) expect(() => eventMessageIdDeps({ READ_API_EVENT_MESSAGE_IDS: value }, turns)).toThrow(/READ_API_EVENT_MESSAGE_IDS/);
+  });
+
+  test("flag off: /events is exactly as before, the parameter 501s and the response has no messageId", async () => {
+    const turns = { async source() { throw new Error("must not be read"); } };
+    const off = api({ ch, liveness, ...eventMessageIdDeps({}, turns) });
+    const token = await session(off);
+    expect((await json(await off.get(URL, token))).error.reason).toBe("param_includeMessageId");
+    const plain = await off.get("/v1/sessions/s-1/events?workspace=ws-a&source=codex", token);
+    expect(plain.status).toBe(200);
+    expect("messageId" in (await json(plain)).events[0]).toBe(false);
   });
 
   test("absent on the Lambda and Worker: the 501 is unchanged; omitted, no read happens", async () => {

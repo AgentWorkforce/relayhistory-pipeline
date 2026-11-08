@@ -1,5 +1,5 @@
 /**
- * Migration 20261105054000 on PGlite, as the genuine bulls96_read_api login: the store over the
+ * Migration 20261105044000 on PGlite, as the genuine bulls96_read_api login: the store over the
  * real functions, atomic refresh, identity binding, delete, the sweep, the role guard and the
  * table's refusal of direct access.
  */
@@ -33,7 +33,7 @@ beforeAll(async () => {
     CREATE ROLE bulls96_read_api LOGIN NOINHERIT;
     CREATE SCHEMA sessions; GRANT USAGE ON SCHEMA sessions TO bulls96_read_api;
   `);
-  await db.exec(readFileSync(join(root, "supabase/migrations/20261105054000_read_api_tokens.sql"), "utf8"));
+  await db.exec(readFileSync(join(root, "supabase/migrations/20261105044000_read_api_tokens.sql"), "utf8"));
   const client: TokenQuery & { release(): void } = {
     async query(text, params) {
       return (await db.query(text, params as never)) as { rows: unknown[] };

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Session Read API
-  version: 1.2.0
+  version: 1.2.1
   license:
     name: Apache-2.0
     identifier: Apache-2.0
@@ -29,7 +29,7 @@ info:
 
     | Prefix         | What                                  | Lifetime                                                |
     | -------------- | ------------------------------------- | ------------------------------------------------------- |
-    | `rth_at_read_` | user access token, sent as the bearer | 5 minutes by default (`READ_API_ACCESS_TOKEN_TTL_SECONDS`, 60 to 3600) |
+    | `rth_at_read_` | user access token, sent as the bearer | 5 minutes by default (`READ_API_ACCESS_TOKEN_TTL_SECONDS`, 60 to 300; the cap is enforced at startup) |
     | `rth_rt_read_` | user refresh token, rotated on use    | 90 days                                                 |
     | `rth_st_read_` | operator service token (no refresh)   | 90 days by default, 365 at most                         |
 
@@ -220,7 +220,7 @@ paths:
         - {name: order, in: query, schema: {type: string, enum: [asc, desc]}}
         - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 1000, default: 200}}
         - {name: maxContent, in: query, description: Truncate event content to this many characters., schema: {type: integer, minimum: 1}}
-        - {name: includeMessageId, in: query, description: "true adds messageId to each event. Requires source. Self-host service with the canonical store only; elsewhere, or for events the canonical objects do not hold, 501.", schema: {type: boolean}}
+        - {name: includeMessageId, in: query, description: "true adds messageId to each event. Requires source. Self-host service with the canonical store and READ_API_EVENT_MESSAGE_IDS=true only; elsewhere, or for events the canonical objects do not hold, 501.", schema: {type: boolean}}
         - $ref: "#/components/parameters/cursor"
       responses:
         "200":

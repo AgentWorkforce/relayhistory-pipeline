@@ -3,7 +3,7 @@
  * docs/contracts/session-read-api-v1.openapi.yaml). Runtime-neutral: no AWS or Node imports.
  *
  * Tokens are opaque: a distinct prefix plus 256 bits of CSPRNG entropy, stored only as the SHA-256
- * hash of the whole string (migration 20261105054000). Every read looks the hash up, so deleting
+ * hash of the whole string (migration 20261105044000). Every read looks the hash up, so deleting
  * the row is immediate revocation and there is no signing key to rotate. Identity (user, org,
  * workspace) comes only from the row; the row's audience must be this service's origin.
  *
@@ -23,7 +23,7 @@ export const READ_SCOPES: readonly string[] = Object.freeze([READ_SCOPE]);
 
 export const ACCESS_TTL_SECONDS_DEFAULT = 300;
 export const ACCESS_TTL_SECONDS_MIN = 60;
-export const ACCESS_TTL_SECONDS_MAX = 3600;
+export const ACCESS_TTL_SECONDS_MAX = 300;
 export const REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90;
 export const SERVICE_TTL_DAYS_DEFAULT = 90;
 export const SERVICE_TTL_DAYS_MAX = 365;
