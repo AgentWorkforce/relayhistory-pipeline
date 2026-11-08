@@ -133,9 +133,10 @@ BEGIN
      AND p.polpermissive AND p.polcmd = 'r' AND p.polroles = ARRAY[v_role.oid];
   IF v_qual IS NULL THEN
     v_problems := array_append(v_problems, ('policy session_index_read_api is missing or not FOR SELECT TO bulls96_read_api only')::text);
-  ELSIF v_qual NOT LIKE '%current_setting(''bulls96_read.org_id''::text, true)%'
-     OR v_qual NOT LIKE '%current_setting(''bulls96_read.workspace_id''::text, true)%' THEN
-    v_problems := array_append(v_problems, ('policy session_index_read_api is not bound to the tenant settings')::text);
+  ELSIF v_qual IS DISTINCT FROM v_directory_qual THEN
+    -- Same exact tenant predicate as the directory policy (session_read_api_role.sql):
+    -- a LIKE on the setting names also accepts an OR/true bypass.
+    v_problems := array_append(v_problems, ('policy session_index_read_api differs from the tenant predicate')::text);
   END IF;
   -- Column grants expose directory metadata directly, so the policy must
   -- actually enforce both tenant settings. Merely mentioning their names
@@ -166,6 +167,15 @@ BEGIN
                 AND pg_get_expr(p.polqual, p.polrelid) = v_directory_qual)
   LOOP
     v_problems := array_append(v_problems, (format('unapproved policy %s on %s', v_row.polname, v_row.rel))::text);
+  END LOOP;
+  -- A PUBLIC policy (polroles {0}) also applies to bulls96_read_api and is
+  -- OR-ed with the tenant policy, so any on the two tenant tables is refused.
+  FOR v_row IN
+    SELECT p.polrelid::regclass::text AS rel, p.polname FROM pg_policy p
+     WHERE 0::oid = ANY(p.polroles)
+       AND p.polrelid IN ('sessions.session_index'::regclass, 'sessions.session_directory'::regclass)
+  LOOP
+    v_problems := array_append(v_problems, (format('PUBLIC policy %s on %s', v_row.polname, v_row.rel))::text);
   END LOOP;
 
   IF cardinality(v_problems) > 0 THEN
