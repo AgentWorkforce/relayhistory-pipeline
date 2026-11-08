@@ -132,6 +132,7 @@ keep their path unchanged either way.
 | `PIPELINE_ORG_FROM_PREFIX`, `PIPELINE_KEY_PREFIX` | session-read-api (with `LOCKER_BUCKET`) | `PIPELINE_ORG_FROM_PREFIX` must be exactly `true`, or startup fails. The org-prefix key layout is the only thing that binds an object to its org, so a static layout is refused, as in the session pipeline Lambda. `PIPELINE_KEY_PREFIX` must match the ingest's key layout. |
 | `READ_API_DIRECTORY_WORKSPACES` | read API | The canary allowlist for directory, timing, turns, catalog and login: comma-separated workspace ids or `*`. Unset means none (501 `*_workspace_not_enabled`). |
 | `READ_API_TIMING_ASSUME_NO_TURNS` | read API (Worker, self-host SERVICE) | Exactly `true`: time a session that has no legacy turn evidence as having no turns. Otherwise such a session is 501 `timing_turns_unknown`. |
+| `READ_API_TURNS_ASSUME_NO_LEGACY` | read API (self-host SERVICE only) | Exactly `true`: this deployment never had a Neon source, so `/turns` and `/metadata` serve a session's canonical turns without the legacy coverage marker. Otherwise such a session is 501 `turns_unknown`. Never set it on a deployment with legacy history. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
@@ -204,6 +205,38 @@ keep their path unchanged either way.
   the secret, and go to the console only. The only new call is to the
   configured introspection URL (in-cluster for a self-host); nothing new leaves
   the cluster.
+
+## End-to-end acceptance test
+
+One command, from a clean checkout, with only Docker and Bun installed:
+
+```sh
+bun run e2e:selfhost
+```
+
+It builds the services image, starts the stack in `e2e/selfhost/compose.yaml`,
+runs the checks, and removes everything (containers and volumes) when done.
+`E2E_KEEP=1` leaves the stack up; `E2E_SKIP_BUILD=1` reuses a built image. CI runs
+the same command on every pull request (`ci.yml`, job `selfhost-e2e`, part of
+the required `checks` result).
+
+The stack is what `docs/selfhost-composition.md` describes: Postgres, MinIO, the
+migrations, the operator role step (`e2e/selfhost/roles.sh`), `session-ingest`,
+the `session-pipeline-consumer` (the only processing worker on the canonical
+self-host path; `session-publication` is only for buffered acceptance and stays
+off), and `session-read-api`. Credentials and the Postgres CA are generated per
+run and never written outside the run's own `.96bulls/e2e-*` directory.
+
+The only stub is `control-stub`, at the real boundary: Control's token
+introspection endpoint. The ingest and read API run their real introspection
+client against it with `READ_API_AUTH_MODE=relaycontrol_only`.
+
+Checks, each reported PASS, FAIL or BLOCKED: authenticated upload (no token 401,
+read-only token 403, cross-tenant refused), processing by the consumer, reads
+through the read API (list, turns, search, activity), tenant isolation (org B's
+token gets nothing from org A), durability across a restart of Postgres, MinIO
+and all services, and erase through the session selection route (BLOCKED, not
+FAIL, on a build where that route still answers 501).
 
 ## Ports and credentials
 
