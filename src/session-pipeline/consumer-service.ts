@@ -30,6 +30,7 @@
  */
 import { createServer } from "node:http";
 import { unlinkSync, writeFileSync } from "node:fs";
+import { isTenantOnlyPolicy, type TenantPolicyRow } from "./postgres-search-state.ts";
 import { log } from "../shared/log.ts";
 import { integer } from "../shared/env.ts";
 import { inTransaction, type HoopDb } from "../shared/db.ts";
@@ -181,15 +182,23 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
   const consumable = io.dedupe ? await io.dedupe(bodies) : bodies;
   // Identities actually consumed this tick (post-dedupe), with the revision
   // carried on each body. A requeue callback only hands back the key, so the
-  // map below restores the consumed revision for busy-retry accounting.
+  // map below restores the consumed revision for busy-retry accounting. The
+  // same key can arrive twice in one tick (a due retry first, then the
+  // listing's current revision): last wins, because the listing carries the
+  // newest revision and scoring the stale one would dead-letter the wrong
+  // cycle.
   const consumedKeys: string[] = [];
   const consumedMetas = new Map<string, { etag?: string; version?: string }>();
   for (const body of consumable) {
     const meta = reconcileMeta(body);
     if (meta === null) continue;
     consumedKeys.push(meta.key);
-    if (!consumedMetas.has(meta.key)) consumedMetas.set(meta.key, { etag: meta.etag, version: meta.version });
+    consumedMetas.set(meta.key, { etag: meta.etag, version: meta.version });
   }
+  const lastBodyForKey = (key: string): string | undefined => {
+    for (let i = consumable.length - 1; i >= 0; i--) if (reconcileMeta(consumable[i])?.key === key) return consumable[i];
+    return undefined;
+  };
   const stamp = io.now?.() ?? Date.now();
   const records: QueueRecord[] = consumable.map((body, i) => ({ messageId: `reconcile-${stamp}-${i}`, body }));
   const bodyById = new Map(records.map((record, i) => [record.messageId, consumable[i]!]));
@@ -207,7 +216,6 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
   }
   const failedKeys: string[] = [];
   const failedItems: { key: string; etag?: string; version?: string }[] = [];
-  const requeuedKeys: string[] = [];
   let failedCount = 0;
   records.forEach((record) => {
     if (!failed.has(record.messageId)) return;
@@ -219,30 +227,37 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
     }
     if (io.pending.length < MAX_PENDING_ROWS) io.pending.push(bodyById.get(record.messageId)!);
   });
-  const requeuedItems: { key: string; etag?: string; version?: string }[] = [];
+  // Collapsed by key (first-seen order, last-wins values): a key the tick
+  // consumed twice scores and parks once, on its newest revision.
+  const requeued = new Map<string, { item: { key: string; etag?: string; version?: string }; body: string }>();
   for (const body of io.requeued) {
     const meta = reconcileMeta(body);
-    if (meta !== null) {
-      requeuedKeys.push(meta.key);
-      // The requeue callback hands back an etag-less body; carry the revision
-      // actually consumed so busy-retry accounting never nulls a known one.
-      const carried = consumedMetas.get(meta.key);
-      requeuedItems.push({
+    if (meta === null) {
+      if (io.pending.length < MAX_PENDING_ROWS) io.pending.push(body);
+      continue;
+    }
+    // The requeue callback hands back an etag-less body; carry the revision
+    // actually consumed so busy-retry accounting never nulls a known one.
+    const carried = consumedMetas.get(meta.key);
+    // Park the consumed (revision-carrying) body, not the etag-less
+    // requeue callback body, so the next tick still sees the revision.
+    requeued.set(meta.key, {
+      item: {
         key: meta.key,
         ...(carried?.etag !== undefined ? { etag: carried.etag } : {}),
         ...(carried?.version !== undefined ? { version: carried.version } : {}),
-      });
-      if (io.pending.length < MAX_PENDING_ROWS) {
-        // Park the consumed (revision-carrying) body, not the etag-less
-        // requeue callback body, so the next tick still sees the revision.
-        const carriedBody = consumable.find((b) => reconcileMeta(b)?.key === meta.key);
-        io.pending.push(carriedBody ?? body);
-      }
-    } else if (io.pending.length < MAX_PENDING_ROWS) {
-      io.pending.push(body);
-    }
+      },
+      body: lastBodyForKey(meta.key) ?? body,
+    });
   }
   io.requeued.length = 0;
+  const requeuedKeys: string[] = [];
+  const requeuedItems: { key: string; etag?: string; version?: string }[] = [];
+  for (const { item, body } of requeued.values()) {
+    requeuedKeys.push(item.key);
+    requeuedItems.push(item);
+    if (io.pending.length < MAX_PENDING_ROWS) io.pending.push(body);
+  }
   if (io.pending.length >= MAX_PENDING_ROWS)
     log.warn("pipeline consumer pending overflow; reconcile window re-discovers", { pending: io.pending.length });
   return {
@@ -510,22 +525,44 @@ export async function loadPendingDeferred(db: SqlExecutor, backendId: string, no
   return new Set(rows.map((r) => r.manifest_key));
 }
 
-/** A persisted reconcile-listing resume point, bound to the fixed since/window that produced it. */
+/**
+ * A persisted reconcile-listing resume point, bound to the fixed
+ * since/window AND the listing namespace (key prefix) that produced it. A
+ * cursor is an opaque position in one store listing: replaying it under a
+ * different prefix (or a different store behind the same backend id) can
+ * silently skip keys, so any namespace mismatch restarts the listing.
+ */
 export interface ReconcileCursor {
   cursor: string;
   since: Date;
   lookbackMinutes: number;
+  keyPrefix: string;
+}
+
+/**
+ * Resume only when the stored chain matches this tick's listing namespace:
+ * same key prefix and same window. Anything else restarts from scratch.
+ */
+export function selectResumeCursor(
+  stored: ReconcileCursor | null,
+  lookbackMinutes: number,
+  keyPrefix: string,
+): ReconcileCursor | null {
+  if (stored === null) return null;
+  if (stored.lookbackMinutes !== lookbackMinutes || stored.keyPrefix !== keyPrefix) return null;
+  return stored;
 }
 
 export async function loadReconcileCursor(db: SqlExecutor, backendId: string): Promise<ReconcileCursor | null> {
-  const { rows } = await db.query<{ cursor: string | null; since: string | null; window: number | null }>(
-    `SELECT reconcile_cursor AS cursor, reconcile_since AS since, reconcile_window_minutes AS window
+  const { rows } = await db.query<{ cursor: string | null; since: string | null; window: number | null; prefix: string | null }>(
+    `SELECT reconcile_cursor AS cursor, reconcile_since AS since, reconcile_window_minutes AS window,
+       reconcile_key_prefix AS prefix
      FROM sessions.search_consumer_progress WHERE backend_id=$1`,
     [backendId],
   );
   const row = rows[0];
-  if (!row?.cursor || !row.since || row.window === null) return null;
-  return { cursor: row.cursor, since: new Date(row.since), lookbackMinutes: Number(row.window) };
+  if (!row?.cursor || !row.since || row.window === null || !row.prefix) return null;
+  return { cursor: row.cursor, since: new Date(row.since), lookbackMinutes: Number(row.window), keyPrefix: row.prefix };
 }
 
 export async function storeReconcileCursor(
@@ -535,11 +572,12 @@ export async function storeReconcileCursor(
   at: Date,
 ): Promise<void> {
   await db.query(
-    `INSERT INTO sessions.search_consumer_progress(backend_id,last_complete_at,reconcile_cursor,reconcile_since,reconcile_window_minutes,updated_at)
-     VALUES($1,NULL,$2,$3,$4,$5)
+    `INSERT INTO sessions.search_consumer_progress(backend_id,last_complete_at,reconcile_cursor,reconcile_since,reconcile_window_minutes,reconcile_key_prefix,updated_at)
+     VALUES($1,NULL,$2,$3,$4,$5,$6)
      ON CONFLICT(backend_id) DO UPDATE SET reconcile_cursor=excluded.reconcile_cursor,
-       reconcile_since=excluded.reconcile_since,reconcile_window_minutes=excluded.reconcile_window_minutes,updated_at=excluded.updated_at`,
-    [backendId, state?.cursor ?? null, state?.since.toISOString() ?? null, state?.lookbackMinutes ?? null, at.toISOString()],
+       reconcile_since=excluded.reconcile_since,reconcile_window_minutes=excluded.reconcile_window_minutes,
+       reconcile_key_prefix=excluded.reconcile_key_prefix,updated_at=excluded.updated_at`,
+    [backendId, state?.cursor ?? null, state?.since.toISOString() ?? null, state?.lookbackMinutes ?? null, state?.keyPrefix ?? null, at.toISOString()],
   );
 }
 
@@ -587,6 +625,17 @@ const likeEscape = (value: string) => value.replace(/[\\%_]/g, (c) => `\\${c}`);
  */
 export const MAX_STALE_PAGES = 64;
 
+/**
+ * Cap on tenants enumerated per freshness/tombstone pass: the per-tenant
+ * work below is already bounded, but the tenant list itself must be too.
+ * Truncation reports overflow (blocking completion, like page overflow) so a
+ * tail tenant is retried, never silently stranded.
+ */
+export const MAX_FRESHNESS_TENANTS = 4096;
+
+/** Tenant keyspace for one backend: only manifests under our prefix are ours. */
+const prefixLike = (keyPrefix: string): string => `${likeEscape(keyPrefix)}/%`;
+
 export async function reconcileStaleProjections(
   db: SqlExecutor,
   partials: (tenant: { orgId: string; workspaceId: string }, after?: string) => Promise<{ sessions: readonly string[]; overflow: boolean }>,
@@ -594,10 +643,16 @@ export async function reconcileStaleProjections(
   send: (body: string) => Promise<void>,
 ): Promise<{ stale: number; overflow: boolean }> {
   const { rows: tenants } = await db.query<{ orgId: string; workspaceId: string }>(
-    `SELECT DISTINCT org_id AS "orgId", workspace_id AS "workspaceId" FROM sessions.session_index WHERE deleted_at IS NULL`);
+    `SELECT DISTINCT org_id AS "orgId", workspace_id AS "workspaceId" FROM sessions.session_index
+     WHERE deleted_at IS NULL AND manifest_key LIKE $1 ESCAPE '\\' ORDER BY org_id, workspace_id LIMIT $2`,
+    [prefixLike(keyPrefix), MAX_FRESHNESS_TENANTS + 1]);
   let stale = 0;
   let overflow = false;
-  for (const tenant of tenants) {
+  if (tenants.length > MAX_FRESHNESS_TENANTS) {
+    overflow = true;
+    log.warn("pipeline consumer stale tenant list truncated; restarts from scratch next tick", { tenants: tenants.length });
+  }
+  for (const tenant of tenants.slice(0, MAX_FRESHNESS_TENANTS)) {
     // Keyset pages over the tenant's stale sessions: without the cursor, a
     // tenant with more stale sessions than the page limit is skipped every
     // tick while later tenants starve behind it.
@@ -639,11 +694,14 @@ export const MAX_TOMBSTONE_PAGES = 64;
  * so a crash between them leaves erased content searchable with no live
  * pointer row for reconcileRecent or partials to find.
  *
- * Tenant GUCs, not a writer RLS policy, gate the search tables: every pass
- * runs inside the tenant's transaction (exactly as #330's writer path does),
- * so #330's exact-one-policy verify keeps passing and the writer can never
- * write across tenants. The tenant enumeration itself is cross-tenant and
- * uses the sessions-table writer policy (no GUCs involved).
+ * Gating, per table, in this tree: projection_state carries the forced
+ * tenant_only RLS policy and every pass runs inside the tenant's GUC-bound
+ * transaction (exactly as #330's writer path does), so no writer policy can
+ * ever widen it. transcript_events has NO row gate in this tree (no RLS is
+ * enabled on it; table grants govern), and gains its forced tenant_only
+ * gate with #330 — until then the serve-time tenant gate refuses to tick
+ * at all. The tenant enumeration itself is cross-tenant and uses the
+ * sessions-table writer policy (no GUCs involved).
  *
  * Three behaviors keep this convergent instead of a permanent resend loop:
  * 1. Erasure residue retires atomically per tenant: a tombstone whose
@@ -662,6 +720,52 @@ export const MAX_TOMBSTONE_PAGES = 64;
  *    bounded and idempotent (documented follow-up if a tenant ever exceeds
  *    pages-per-tick backlog in production).
  */
+export interface FreshnessCollection {
+  stale: number;
+  tombstoned: number;
+  overflow: boolean;
+  deferredSkipped: number;
+}
+
+/**
+ * Collect-then-filter freshness pass. Freshness and tombstone re-sends
+ * carry no revision, so a dead key is re-sent every tick, dropped by the
+ * dead-letter rule, yet still counted — blocking completion forever, freezing
+ * the high-water mark, and growing the listing window over a key that can
+ * never recover. Filter here with the same dead-letter rule the tick uses
+ * and count only what can actually be consumed. Deferred (backoff) keys
+ * still count, so a backing-off session blocks completion exactly like a
+ * failure does.
+ */
+export async function collectFreshnessSend(
+  db: SqlExecutor,
+  backendId: string,
+  keyPrefix: string,
+  partials: (tenant: { orgId: string; workspaceId: string }, after?: string) => Promise<{ sessions: readonly string[]; overflow: boolean }>,
+  runInTenant: TenantRunner,
+  limit: number,
+  deferred: Set<string>,
+  send: (body: string) => Promise<void>,
+): Promise<FreshnessCollection> {
+  const dedupe = makeDedupe(db, backendId);
+  const staleKept: string[] = [];
+  const gatedStale = gateDeferredSends(deferred, async (body) => { staleKept.push(body); });
+  const freshness = await reconcileStaleProjections(db, partials, keyPrefix, gatedStale.send);
+  const staleAlive = await dedupe(staleKept);
+  for (const body of staleAlive) await send(body);
+  const tombKept: string[] = [];
+  const gatedTomb = gateDeferredSends(deferred, async (body) => { tombKept.push(body); });
+  const tombstones = await reconcileTombstonedScopes(db, runInTenant, backendId, keyPrefix, limit, gatedTomb.send);
+  const tombAlive = await dedupe(tombKept);
+  for (const body of tombAlive) await send(body);
+  return {
+    stale: staleAlive.length + gatedStale.skipped(),
+    tombstoned: tombAlive.length + gatedTomb.skipped(),
+    overflow: freshness.overflow || tombstones.overflow,
+    deferredSkipped: gatedStale.skipped() + gatedTomb.skipped(),
+  };
+}
+
 export async function reconcileTombstonedScopes(
   db: SqlExecutor,
   runInTenant: TenantRunner,
@@ -672,11 +776,17 @@ export async function reconcileTombstonedScopes(
 ): Promise<{ tombstoned: number; overflow: boolean }> {
   const { rows: tenants } = await db.query<{ orgId: string; workspaceId: string }>(
     `SELECT DISTINCT org_id AS "orgId", workspace_id AS "workspaceId"
-     FROM sessions.session_index WHERE deleted_at IS NOT NULL`,
+     FROM sessions.session_index WHERE deleted_at IS NOT NULL AND manifest_key LIKE $1 ESCAPE '\\'
+     ORDER BY org_id, workspace_id LIMIT $2`,
+    [prefixLike(keyPrefix), MAX_FRESHNESS_TENANTS + 1],
   );
   let tombstoned = 0;
   let overflow = false;
-  for (const tenant of tenants) {
+  if (tenants.length > MAX_FRESHNESS_TENANTS) {
+    overflow = true;
+    log.warn("pipeline consumer tombstone tenant list truncated; restarts from scratch next tick", { tenants: tenants.length });
+  }
+  for (const tenant of tenants.slice(0, MAX_FRESHNESS_TENANTS)) {
     const out = await runInTenant(tenant.orgId, tenant.workspaceId, async (tx) => {
       const retired = await tx.query<{ n: string }>(
         `WITH retired AS (
@@ -756,6 +866,38 @@ export function nextFailureCount(previous: number, failed: boolean): number {
 }
 
 /** Fail-closed startup gate: the owner bootstrap must have created the writer's tables. */
+/**
+ * The search tables must carry exactly the tenant gate before the tick
+ * runs: without tenant_only, transcript_events has no row gate at all in
+ * this tree (its forced RLS lands with #330), and a writer policy or a
+ * permissive TO PUBLIC policy would widen the tenant the GUCs bind. The
+ * writer reads this catalog view with only its table grants; an invisible
+ * or drifted gate refuses boot rather than ticking unscoped.
+ */
+export async function assertSearchTenantGate(db: SqlExecutor): Promise<void> {
+  for (const table of ["search_index.transcript_events", "search_index.projection_state"]) {
+    const [schema, name] = table.split(".");
+    // pg_policies renders what pg_policy stores raw: FOR ALL shows as ALL
+    // (not *), TO PUBLIC as {public} (not {0}), and permissive as text.
+    // Map all three onto the TenantPolicyRow shape before the exact check.
+    const { rows } = await db.query<{ name: string; command: string; roles: string; permissive: string; qual: string | null; check: string | null }>(
+      `SELECT policyname AS name, cmd AS command, roles::text AS roles, permissive::text AS permissive, qual, with_check AS "check"
+       FROM pg_policies WHERE schemaname = $1 AND tablename = $2`,
+      [schema, name],
+    );
+    const shaped: TenantPolicyRow[] = rows.map((r) => ({
+      name: r.name,
+      command: r.command === "ALL" ? "*" : r.command,
+      roles: r.roles === "{public}" ? "{0}" : r.roles,
+      permissive: r.permissive === "PERMISSIVE",
+      qual: r.qual,
+      check: r.check,
+    }));
+    if (shaped.length !== 1 || !isTenantOnlyPolicy(shaped[0]!))
+      throw new Error(`pipeline consumer: search tenant gate missing on ${table}; refusing to tick unscoped`);
+  }
+}
+
 export async function assertServiceSchema(db: SqlExecutor): Promise<void> {
   for (const table of ["sessions.search_consumer_pending", "sessions.search_consumer_progress"]) {
     const { rows } = await db.query<{ present: boolean }>(`SELECT to_regclass($1) IS NOT NULL AS present`, [table]);
@@ -771,14 +913,38 @@ export async function assertServiceSchema(db: SqlExecutor): Promise<void> {
  * reader session_user fails closed here, before any read or write. Exported
  * so the refusal runs against real Postgres in tests.
  */
+/**
+ * Self-host writer admission. Tenant isolation on the search tables is
+ * forced row-level security (bulls96_read.* settings, `tenant_only`), which
+ * a superuser or BYPASSRLS login skips without any error: every tenant's
+ * rows would become visible. Refuse such a login at startup rather than
+ * tick with isolation resting on WHERE clauses alone, and refuse any
+ * attribute or inherited-membership drift off the pinned role shape. Any
+ * failure to read the role (no row, a query error) also refuses. Mirrors
+ * #330's assertReaderRole, plus the writer's pinned attributes.
+ */
 export async function assertRuntimeIdentity(db: SqlExecutor): Promise<void> {
-  const { rows: who } = await db.query<{ user: string; super: boolean }>(
-    `SELECT session_user AS user, (SELECT rolsuper FROM pg_roles WHERE rolname = session_user) AS super`,
+  const { rows } = await db.query<{ user: unknown; super: unknown; bypass: unknown; createdb: unknown; createrole: unknown; replication: unknown; inherit: unknown }>(
+    `SELECT current_user AS user, r.rolsuper AS super, r.rolbypassrls AS bypass,
+       r.rolcreatedb AS createdb, r.rolcreaterole AS createrole,
+       r.rolreplication AS replication, r.rolinherit AS inherit
+     FROM pg_roles r WHERE r.rolname = current_user`,
   );
-  if (who[0]?.user !== "search_consumer_runtime" || who[0]?.super)
-    throw new Error(
-      `pipeline consumer: refusing to run as session_user '${who[0]?.user ?? "unknown"}'; use the search_consumer_runtime URL`,
-    );
+  const me = rows[0];
+  if (rows.length !== 1 || !me || typeof me.user !== "string") throw new Error("pipeline consumer: cannot determine current_user");
+  const who = JSON.stringify(me.user.slice(0, 63));
+  if (me.user !== "search_consumer_runtime")
+    throw new Error(`pipeline consumer: refusing to run as ${who}; use the search_consumer_runtime URL`);
+  if (me.super !== false) throw new Error(`pipeline consumer: refusing to run as SUPERUSER ${who}`);
+  if (me.bypass !== false) throw new Error(`pipeline consumer: refusing to run as BYPASSRLS ${who}`);
+  if (me.createdb !== false || me.createrole !== false || me.replication !== false || me.inherit !== false)
+    throw new Error(`pipeline consumer: refusing to run with drifted attributes ${who}`);
+  // Inherited memberships would silently widen the writer: it holds its
+  // grants directly and must inherit none.
+  const membership = await db.query(
+    `SELECT 1 FROM pg_auth_members WHERE member = (SELECT oid FROM pg_roles WHERE rolname = current_user) LIMIT 1`,
+  );
+  if (membership.rows.length > 0) throw new Error(`pipeline consumer: refusing to run with inherited memberships ${who}`);
 }
 
 export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never> {
@@ -814,6 +980,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   const db = supabasePool(config.secret.hoopdb_url, 4, tls);
   await assertRuntimeIdentity(db);
   await assertServiceSchema(db);
+  await assertSearchTenantGate(db);
   // A healthy start clears a stale UNHEALTHY marker from an earlier crash
   // loop; without this the marker is sticky across restarts.
   clearUnhealthyFile(config.unhealthyFile);
@@ -885,10 +1052,10 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
           const mark = await loadHighWaterMark(db, config.backendId);
           // An interrupted listing resumes its own fixed since/window instead
           // of restarting: the stored cursor is only reused while the window
-          // matches, so a config change restarts the listing from scratch.
-          const stored = await loadReconcileCursor(db, config.backendId);
-          const resume = stored !== null && stored.lookbackMinutes === config.lookbackMinutes;
-          const since = resume && stored !== null ? stored.since : computeSince(now, lookbackMs, mark);
+          // AND the key prefix match, so a config change restarts the listing
+          // from scratch instead of skipping keys in a new namespace.
+          const stored = selectResumeCursor(await loadReconcileCursor(db, config.backendId), config.lookbackMinutes, config.keyPrefix);
+          const since = stored !== null ? stored.since : computeSince(now, lookbackMs, mark);
           const due = await loadPendingDue(db, config.backendId, MAX_PENDING_ROWS, new Date(now));
           // Freshness and tombstone re-sends skip keys still inside their
           // backoff: without the gate every tick re-sent a failing key and
@@ -912,30 +1079,23 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
                   keyPrefix: config.keyPrefix,
                   send,
                   since,
-                  ...(resume && stored !== null ? { cursor: stored.cursor } : {}),
+                  ...(stored !== null ? { cursor: stored.cursor } : {}),
                 });
                 return { enqueued: link.enqueued + due.length, complete: link.complete, ...(link.nextCursor === undefined ? {} : { nextCursor: link.nextCursor }) };
               },
               checkFreshness: async (send) => {
-                const staleGated = gateDeferredSends(deferred, send);
-                const freshness = await reconcileStaleProjections(
+                const collected = await collectFreshnessSend(
                   db,
-                  (tenant, after) => binding.state.partials(tenant, { limit: 1000, ...(after === undefined ? {} : { after }) }),
-                  config.keyPrefix,
-                  staleGated.send,
-                );
-                const tombGated = gateDeferredSends(deferred, send);
-                const tombstones = await reconcileTombstonedScopes(
-                  db,
-                  tenantRunner,
                   config.backendId,
                   config.keyPrefix,
+                  (tenant, after) => binding.state.partials(tenant, { limit: 1000, ...(after === undefined ? {} : { after }) }),
+                  tenantRunner,
                   MAX_PENDING_ROWS,
-                  tombGated.send,
+                  deferred,
+                  send,
                 );
-                const deferredSkipped = staleGated.skipped() + tombGated.skipped();
-                if (deferredSkipped) log.info("pipeline consumer tick defers backoff retries", { deferredSkipped });
-                return { stale: freshness.stale, tombstoned: tombstones.tombstoned, overflow: freshness.overflow || tombstones.overflow };
+                if (collected.deferredSkipped) log.info("pipeline consumer tick defers backoff retries", { deferredSkipped: collected.deferredSkipped });
+                return { stale: collected.stale, tombstoned: collected.tombstoned, overflow: collected.overflow };
               },
               dedupe,
               consume: (records) =>
@@ -1010,7 +1170,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
             await storeReconcileCursor(
               db,
               config.backendId,
-              { cursor: summary.nextCursor, since, lookbackMinutes: config.lookbackMinutes },
+              { cursor: summary.nextCursor, since, lookbackMinutes: config.lookbackMinutes, keyPrefix: config.keyPrefix },
               at,
             );
           }

@@ -7,6 +7,32 @@ import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { TenantRunner } from "../session-read-api/liveness.ts";
 import type { SearchProjectionState } from "./search-adapter.ts";
 
+/** A pg_policy-shaped row, as read from pg_policy or pg_policies. */
+export interface TenantPolicyRow {
+  name: string;
+  command: string;
+  /** "{0}" for TO PUBLIC, else the comma-joined grantee list. */
+  roles: string;
+  permissive: boolean;
+  qual: string | null;
+  check: string | null;
+}
+
+const normalizePolicyExpr = (value: string): string => value.replace(/\s+|::text|\(|\)/g, "");
+
+/** The exact tenant gate: one permissive FOR ALL TO PUBLIC tenant_only policy binding both GUCs. */
+export function isTenantOnlyPolicy(row: TenantPolicyRow): boolean {
+  const expected = normalizePolicyExpr("org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true)");
+  return (
+    row.name === "tenant_only" &&
+    row.command === "*" &&
+    row.roles === "{0}" &&
+    row.permissive &&
+    normalizePolicyExpr(row.qual ?? "") === expected &&
+    normalizePolicyExpr(row.check ?? "") === expected
+  );
+}
+
 export function postgresSearchState(options: { reader?: TenantRunner; backendId: string; fromMs: number; schema?: string }): SearchProjectionState & { ensureSchema(owner: SqlExecutor): Promise<void> } {
   const schema = options.schema ?? "search_index";
   const { backendId, fromMs, reader } = options;
@@ -39,10 +65,8 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
           polpermissive AS permissive,
           pg_get_expr(polqual,polrelid) AS qual,pg_get_expr(polwithcheck,polrelid) AS check
          FROM pg_policy WHERE polrelid=$1::regclass`, [table]);
-      const normalize = (value: string) => value.replace(/\s+|::text|\(|\)/g, "");
-      const expected = normalize("org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true)");
       const tenant = rows.find((r) => r.name === "tenant_only");
-      if (!tenant || tenant.command !== "*" || tenant.roles !== "{0}" || !tenant.permissive || normalize(tenant.qual ?? "") !== expected || normalize(tenant.check ?? "") !== expected) throw new Error("search state tenant policy mismatch");
+      if (!tenant || !isTenantOnlyPolicy(tenant)) throw new Error("search state tenant policy mismatch");
       // Exactly one policy may exist: a writer-targeted extra (the removed
       // search_consumer_trusted policy, or any other) would both collide
       // with #330's exact-one-policy check and widen the tenant gate, so it

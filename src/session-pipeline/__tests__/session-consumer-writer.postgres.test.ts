@@ -300,10 +300,10 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
     expect(missing.rows[0]).toMatchObject({ n: 1 }); // the install test's role, untouched by refusals
   }, 120_000);
 
-  test("assertRuntimeIdentity refuses the owner session_user", async () => {
+  test("assertRuntimeIdentity refuses the owner login", async () => {
     const client = await pool.connect();
     try {
-      await expect(assertRuntimeIdentity(asSql(client))).rejects.toThrow("refusing to run as session_user");
+      await expect(assertRuntimeIdentity(asSql(client))).rejects.toThrow("refusing to run as");
     } finally {
       client.release();
     }
@@ -426,6 +426,18 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
         [ORG],
       );
       expect(gone.rows[0]).toMatchObject({ tombed: true });
+    } finally {
+      client.release();
+    }
+  }, 120_000);
+
+  test("a genuine writer login passes admission", async () => {
+    // The BYPASSRLS negative runs in PGlite (only a BYPASSRLS role may flip
+    // the attribute, which the CREATEROLE owner is not): here the genuine
+    // writer login must pass with the pinned shape.
+    const client = await wpool.connect();
+    try {
+      await assertRuntimeIdentity(asSql(client));
     } finally {
       client.release();
     }

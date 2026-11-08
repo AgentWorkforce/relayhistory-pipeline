@@ -1,9 +1,9 @@
 -- Exact-shape verification for the self-host search-index writer role.
 -- Fails on any drift (attributes, membership, missing or extra grants,
--- missing or extra sessions-table writer policies, any writer-targeted
--- policy on the search tables, PUBLIC or anonymous access, direct database
--- or default or column grants, wrong ownership). Emits a NOTICE pass line
--- on success.
+-- missing or extra sessions-table writer policies, any search-table policy
+-- that is not exactly the tenant gate (writer-targeted or permissive TO
+-- PUBLIC), PUBLIC or anonymous access, direct database or default or column
+-- grants, wrong ownership). Emits a NOTICE pass line on success.
 --
 -- Run as the schema owner after session_consumer_role.sql:
 --   psql -v ON_ERROR_STOP=1 -X -d <the HoopDb database> -f supabase/bootstrap/session_consumer_role_verify.sql
@@ -287,18 +287,24 @@ BEGIN
       RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: extra writer-targeted policy on %s', v_role, v_bad);
     END IF;
   END LOOP;
-  -- No writer policy on the search tables, ever: those writes run with the
-  -- tenant GUCs bound per scope under the tenant_only policies, and a writer
-  -- policy would collide with #330's exact-one-policy check while widening
-  -- the tenant gate.
+  -- Every policy on the search tables must be exactly the tenant gate. A
+  -- writer-targeted policy would collide with #330's exact-one-policy check
+  -- while widening the gate, and a permissive TO PUBLIC policy ORs with
+  -- tenant_only and gives the writer cross-tenant visibility without ever
+  -- naming the role (roles @> ARRAY[v_role] does not match PUBLIC). Zero
+  -- policies passes too: pre-#330 transcript_events has no row gate yet,
+  -- and the serve-time tenant gate refuses to tick until it lands.
   FOR v_bad IN
-    SELECT format('%s.%s', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'search_index' AND c.relname IN ('transcript_events', 'projection_state')
+    SELECT format('%s.%s', p.schemaname, p.tablename) || ' ' || p.policyname FROM pg_policies p
+    WHERE p.schemaname = 'search_index' AND p.tablename IN ('transcript_events', 'projection_state')
   LOOP
-    IF EXISTS (SELECT 1 FROM pg_policies
-               WHERE schemaname = split_part(v_bad, '.', 1) AND tablename = split_part(v_bad, '.', 2)
-                 AND roles @> ARRAY[v_role]::name[]) THEN
-      RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: writer-targeted policy on %s', v_role, v_bad);
+    IF NOT EXISTS (SELECT 1 FROM pg_policies q
+                   WHERE format('%s.%s', q.schemaname, q.tablename) || ' ' || q.policyname = v_bad
+                     AND q.policyname = 'tenant_only' AND q.cmd = 'ALL'
+                     AND q.permissive = 'PERMISSIVE' AND q.roles = '{public}'::name[]
+                     AND q.qual LIKE '%bulls96_read.org_id%' AND q.qual LIKE '%bulls96_read.workspace_id%'
+                     AND q.with_check LIKE '%bulls96_read.org_id%' AND q.with_check LIKE '%bulls96_read.workspace_id%') THEN
+      RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: non-tenant policy %s', v_role, v_bad);
     END IF;
   END LOOP;
 

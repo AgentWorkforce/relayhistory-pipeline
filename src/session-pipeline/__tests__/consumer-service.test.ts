@@ -23,8 +23,11 @@ import {
   stripPsqlMeta,
 } from "../consumer-bootstrap.ts";
 import {
+  assertRuntimeIdentity,
+  assertSearchTenantGate,
   assertServiceSchema,
   clearUnhealthyFile,
+  collectFreshnessSend,
   computeSince,
   deletePending,
   gateDeferredSends,
@@ -44,6 +47,7 @@ import {
   reconcileTombstonedScopes,
   retryDelayMs,
   runConsumerTick,
+  selectResumeCursor,
   shouldSkipDeadLetter,
   storeHighWaterMark,
   storePending,
@@ -358,6 +362,24 @@ describe("consumer tick", () => {
     expect(summary.nextCursor).toBe("c1");
     expect(summary).toMatchObject({ complete: false, overflow: true });
   });
+  test("a duplicate key scores and parks once, on its newest revision", async () => {
+    // A due retry (etag e1) arrives first, then the listing's current
+    // revision (e2). An etag-less busy requeue for the e2 invocation must
+    // carry e2, not the stale first-seen e1.
+    const io = tickIo(ok, [
+      `{"reconcile":{"key":"hot","etag":"e1"}}`,
+      `{"reconcile":{"key":"hot","etag":"e2"}}`,
+    ]);
+    io.consume = async (records) => {
+      for (const record of records) io.requeued.push(JSON.stringify({ reconcile: { key: "hot" } }));
+      return ok();
+    };
+    const summary = await runConsumerTick(io, new Date());
+    expect(summary.requeuedKeys).toEqual(["hot"]);
+    expect(summary.requeuedItems).toEqual([{ key: "hot", etag: "e2" }]);
+    expect(io.pending).toEqual([`{"reconcile":{"key":"hot","etag":"e2"}}`]);
+    expect(summary).toMatchObject({ failed: 0, requeued: 1, complete: false });
+  });
 });
 
 describe("dead-letter skip rule", () => {
@@ -432,12 +454,22 @@ describe("dead-letter skip rule", () => {
       await ensureServiceTables(db);
       const at = new Date("2026-11-02T00:00:00Z");
       expect(await loadReconcileCursor(db, "b")).toBeNull();
-      await storeReconcileCursor(db, "b", { cursor: "c1", since: new Date("2026-11-01T00:00:00Z"), lookbackMinutes: 30 }, at);
-      expect(await loadReconcileCursor(db, "b")).toEqual({ cursor: "c1", since: new Date("2026-11-01T00:00:00Z"), lookbackMinutes: 30 });
+      await storeReconcileCursor(db, "b", { cursor: "c1", since: new Date("2026-11-01T00:00:00Z"), lookbackMinutes: 30, keyPrefix: "p" }, at);
+      expect(await loadReconcileCursor(db, "b")).toEqual({ cursor: "c1", since: new Date("2026-11-01T00:00:00Z"), lookbackMinutes: 30, keyPrefix: "p" });
       await storeReconcileCursor(db, "b", null, at);
       expect(await loadReconcileCursor(db, "b")).toBeNull();
     });
   }, 120_000);
+  test("a cursor from another key prefix or window never resumes", async () => {
+    const stored = { cursor: "c1", since: new Date("2026-11-01T00:00:00Z"), lookbackMinutes: 30, keyPrefix: "z" };
+    // Same window, different prefix: restart, or the new namespace's head is skipped.
+    expect(selectResumeCursor(stored, 30, "a")).toBeNull();
+    // Same prefix, different window: restart.
+    expect(selectResumeCursor(stored, 60, "z")).toBeNull();
+    // Exact match resumes.
+    expect(selectResumeCursor(stored, 30, "z")).toEqual(stored);
+    expect(selectResumeCursor(null, 30, "z")).toBeNull();
+  });
 });
 
 describe("reconcile listing resume", () => {
@@ -469,11 +501,13 @@ describe("reconcile listing resume", () => {
       expect(link1.complete).toBe(false);
       expect(link1.nextCursor).toBe("c1");
       expect(sent1).toHaveLength(2);
-      await storeReconcileCursor(db, "b", { cursor: link1.nextCursor!, since, lookbackMinutes: 30 }, at);
+      await storeReconcileCursor(db, "b", { cursor: link1.nextCursor!, since, lookbackMinutes: 30, keyPrefix: "p/testorg" }, at);
       // Next tick resumes the stored cursor with the same since: only the
       // tail page is listed, and the chain completes.
       const stored = await loadReconcileCursor(db, "b");
-      expect(stored).toMatchObject({ cursor: "c1", lookbackMinutes: 30 });
+      expect(stored).toMatchObject({ cursor: "c1", lookbackMinutes: 30, keyPrefix: "p/testorg" });
+      expect(selectResumeCursor(stored, 30, "p/testorg")).not.toBeNull();
+      expect(selectResumeCursor(stored, 30, "p/other")).toBeNull();
       const sent2: string[] = [];
       const link2 = await reconcileRecent({
         db: emptyDb, store, keyPrefix: "p/testorg",
@@ -806,6 +840,74 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
     }
   }, 180_000);
 
+  test("startup refuses a BYPASSRLS or membership-drifted writer login", async () => {
+    const { pg } = await installed();
+    try {
+      await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      const db = asDb(pg);
+      await pg.exec(`SET ROLE search_consumer_runtime`);
+      await assertRuntimeIdentity(db); // pinned shape passes
+      await pg.exec(`RESET ROLE`);
+      // An owner later ALTERs BYPASSRLS: startup must refuse the login even
+      // though the name is unchanged and it is not a superuser.
+      await pg.exec(`ALTER ROLE search_consumer_runtime BYPASSRLS`);
+      await pg.exec(`SET ROLE search_consumer_runtime`);
+      await expect(assertRuntimeIdentity(db)).rejects.toThrow("BYPASSRLS");
+      await pg.exec(`RESET ROLE`);
+      await pg.exec(`ALTER ROLE search_consumer_runtime NOBYPASSRLS`);
+      // An inherited membership widens the writer: refuse that too.
+      await pg.exec(`CREATE ROLE widen_nobody LOGIN; GRANT widen_nobody TO search_consumer_runtime`);
+      await pg.exec(`SET ROLE search_consumer_runtime`);
+      await expect(assertRuntimeIdentity(db)).rejects.toThrow("inherited memberships");
+      await pg.exec(`RESET ROLE`);
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("the tenant gate refuses boot unless both search tables carry exactly tenant_only", async () => {
+    const { pg } = await installed();
+    try {
+      await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      const db = asDb(pg);
+      await pg.exec(`SET ROLE search_consumer_runtime`);
+      // transcript_events has no policies at all in this tree (pre-#330) and
+      // projection_state carries tenant_only: the gate refuses, because an
+      // ungated search table would tick unscoped. (pg_policies is visible
+      // to the writer through its table grants: this also proves the gate
+      // can read its own catalog.)
+      await expect(assertSearchTenantGate(db)).rejects.toThrow("search_index.transcript_events");
+      await pg.exec(`RESET ROLE`);
+      // transcript_events gains its forced gate with #330; stage the exact
+      // shape here so the rest of the test proves the gate, not the absence.
+      await pg.exec(`CREATE POLICY tenant_only ON search_index.transcript_events AS PERMISSIVE FOR ALL TO PUBLIC
+        USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))
+        WITH CHECK (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))`);
+      // A permissive TO PUBLIC policy ORs with tenant_only and widens the
+      // tenant without naming the role: refuse that too.
+      await pg.exec(`CREATE POLICY open_all ON search_index.projection_state AS PERMISSIVE FOR ALL TO PUBLIC USING (true) WITH CHECK (true)`);
+      await expect(assertSearchTenantGate(db)).rejects.toThrow("search_index.projection_state");
+      await pg.exec(`DROP POLICY open_all ON search_index.projection_state`);
+      // Exactly the tenant gate on both tables passes.
+      await pg.exec(`SET ROLE search_consumer_runtime`);
+      await assertSearchTenantGate(db);
+      await pg.exec(`RESET ROLE`);
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("verify refuses a permissive TO PUBLIC search policy that never names the role", async () => {
+    const { pg } = await installed();
+    try {
+      await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      await pg.exec(`CREATE POLICY open_all ON search_index.projection_state AS PERMISSIVE FOR ALL TO PUBLIC USING (true) WITH CHECK (true)`);
+      await expect(pg.exec(stripPsqlMeta(readFileSync(VERIFY_SQL, "utf8")))).rejects.toThrow("non-tenant policy");
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
   test("a pre-existing elevated role fails the bootstrap", async () => {
     const { pg } = await installed();
     try {
@@ -991,6 +1093,43 @@ describe("tombstone backstop and freshness (PGlite, real partials, real migratio
       await pg.close();
     }
   }, 300_000);
+
+  test("dead keys no longer block completion: the mark advances past them", async () => {
+    const { pg, db, runner } = await fixture();
+    try {
+      await pg.exec(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id)
+        VALUES('o','w','h','s-dead','m','u',now(),now(),'s3','b','96bulls/o/manifest-dead.json','00000000-0000-0000-0000-000000000000');`);
+      const at = new Date("2026-11-01T12:00:00Z");
+      // The dead key exhausted its attempts; nothing live is stale.
+      await storePending(db, "test-backend", [
+        { manifestKey: "96bulls/o/manifest-dead.json", manifestEtag: "e1", attempts: 25, nextAt: new Date(at.getTime() - 1000), lastErrorCode: "x", dead: true },
+      ], at);
+      const sent: string[] = [];
+      const collected = await collectFreshnessSend(
+        db,
+        "test-backend",
+        "96bulls/o",
+        async () => ({ sessions: ["s-dead"], overflow: false }),
+        runner,
+        1000,
+        new Set(),
+        async (b) => { sent.push(b); },
+      );
+      // The dead key is filtered before counting: nothing to consume, and it
+      // does not appear in the completion counts.
+      expect(sent).toEqual([]);
+      expect(collected).toMatchObject({ stale: 0, tombstoned: 0, overflow: false });
+      // A tick built on this collection completes, so serve advances the
+      // high-water mark instead of stalling the listing window forever.
+      const io = tickIo(ok);
+      io.checkFreshness = async () => ({ stale: collected.stale, tombstoned: collected.tombstoned, overflow: collected.overflow });
+      const summary = await runConsumerTick(io, new Date());
+      expect(summary).toMatchObject({ collected: 0, failed: 0, complete: true });
+      expect(io.calls).toEqual([[]]); // consume ran once, on zero bodies
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
 
   test("a recorded floor mismatch keeps listing the session", async () => {
     const { pg, db, runner } = await fixture();

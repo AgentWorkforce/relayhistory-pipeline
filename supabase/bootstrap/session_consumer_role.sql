@@ -16,8 +16,10 @@
 --     (the member-read policies name only `authenticated`, so without
 --     these the writer sees 0 rows and reports complete wrongly; same
 --     shape as the migrator's trusted policy, scoped to this role). No
---     writer policy on the search_index tables: those writes always run
---     with the tenant GUCs bound per scope, under tenant_only policies.
+--     writer policy on the search_index tables: projection_state writes run
+--     with the tenant GUCs bound per scope under its forced tenant_only
+--     policy, and transcript_events has no RLS in this tree (grants govern;
+--     its forced tenant_only gate lands with #330).
 --
 -- Run as the schema owner INSIDE the bootstrap's single transaction (the
 -- bootstrap holds the advisory lock and rolls everything back on failure).
@@ -55,13 +57,12 @@ BEGIN
       MESSAGE = format('bootstrap %s: the role exists with different attributes', v_name),
       HINT = 'Nothing was changed. Fix or drop the role by hand (an operator decision), then rerun.';
   END IF;
-  -- The creator edge: whoever creates the role unavoidably becomes its
-  -- member WITH ADMIN OPTION but no INHERIT and no SET (observed on real
-  -- PG16+ for CREATEROLE owners and superusers alike; on PG15 the edge
-  -- carries only the admin flag, and the catalog lacks the other columns).
-  -- Tolerate exactly that row when the member is the invoker; the writer
-  -- itself must never be a member of another role, and any other membership
-  -- fails closed.
+  -- The creator edge: a CREATEROLE non-superuser invoker unavoidably becomes
+  -- a member of the role WITH ADMIN OPTION (observed on real PG15/16/17;
+  -- INHERIT/SET flags exist only on PG16+ so PG15 checks the admin flag).
+  -- Superuser creators get no such edge on 16+. Tolerate exactly that row
+  -- when the member is the invoker; the writer itself must never be a member
+  -- of another role, and any other membership fails closed.
   IF v_version >= 160000 THEN
     IF EXISTS (SELECT 1 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
                WHERE (a.roleid = r.oid OR a.member = r.oid)

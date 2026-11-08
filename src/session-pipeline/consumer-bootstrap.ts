@@ -127,9 +127,10 @@ export async function ensureServiceTables(owner: SqlExecutor): Promise<void> {
   await owner.query(`CREATE TABLE IF NOT EXISTS sessions.search_consumer_progress(
     backend_id text NOT NULL PRIMARY KEY,
     last_complete_at timestamptz, updated_at timestamptz NOT NULL,
-    reconcile_cursor text, reconcile_since timestamptz, reconcile_window_minutes integer)`);
+    reconcile_cursor text, reconcile_since timestamptz, reconcile_window_minutes integer,
+    reconcile_key_prefix text)`);
   // A rerun against a table created before the cursor columns existed.
-  for (const column of ["reconcile_cursor text", "reconcile_since timestamptz", "reconcile_window_minutes integer"])
+  for (const column of ["reconcile_cursor text", "reconcile_since timestamptz", "reconcile_window_minutes integer", "reconcile_key_prefix text"])
     await owner.query(`ALTER TABLE sessions.search_consumer_progress ADD COLUMN IF NOT EXISTS ${column}`);
 }
 
