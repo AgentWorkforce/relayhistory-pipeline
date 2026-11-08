@@ -393,6 +393,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105043500_lazy_claim_clock_narrowing.sql` | replacement: lazy claim reads the seat clock under KEY SHARE with one advisory lock per (org, workspace, origin) |
 | `upstream:20261105043700_owner_buffered_read.sql` | function sessions.buffered_sessions_for |
 | `upstream:20261105043800_lazy_ack_clock_no_key_update.sql` | replacement: staged ACK locks the seat clock FOR NO KEY UPDATE (claims' KEY SHARE no longer queues behind it), then the bounded origin advisory lock before any slot |
+| `upstream:20261105043850_ingest_acquisition_owner.sql` | table sessions.ingest_acquisition_owners |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |

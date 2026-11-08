@@ -92,6 +92,7 @@ const healthy = {
   session_user: ACQUISITION_INSTALLER_ROLE, current_user: ACQUISITION_INSTALLER_ROLE, role_setting: "none", server_version: 160004,
   statement_timeout: "5s", lock_timeout: "2s", idle_in_transaction_session_timeout: "10s",
   rolsuper: false, rolbypassrls: false, rolcreaterole: false, rolcreatedb: false, rolreplication: false, rolinherit: false, memberships: 0, members: 0,
+  backend_user: ACQUISITION_INSTALLER_ROLE,
 };
 
 function fakeDb(
@@ -148,6 +149,11 @@ test("live login negatives: wrong identity, SET ROLE, privileged role shape or t
     ["PG16 system_user is another identity", healthy, "system_user", "scram-sha-256:postgres"],
     ["PG16 system_user NULL (trust auth)", healthy, "system_user", null],
     ["PG16 system_user without method", healthy, "system_user", ACQUISITION_INSTALLER_ROLE],
+    ["backend usename NULL", { ...healthy, backend_user: null }, "backend_user"],
+    ["backend usename absent (no pg_stat_activity row)", { ...healthy, backend_user: undefined }, "backend_user"],
+    ["backend usename is another login", { ...healthy, backend_user: "postgres" }, "backend_user"],
+    ["backend usename case differs", { ...healthy, backend_user: ACQUISITION_INSTALLER_ROLE.toUpperCase() }, "backend_user"],
+    ["backend usename pooler form", { ...healthy, backend_user: `${ACQUISITION_INSTALLER_ROLE}.abcdefghij` }, "backend_user"],
   ];
   for (const [label, row, code, systemUser] of cases) expect([label, await loginRefusal(row, systemUser)]).toEqual([label, code]);
   // A failing query refuses too, and the error never carries a role name.
@@ -220,4 +226,46 @@ test("creator-edge look-alikes refuse startup", async () => {
   let err: unknown;
   try { await assertInstallerLogin(failing); } catch (e) { err = e; }
   expect(err instanceof InstallerLoginError && err.code).toBe("login_unreadable");
+});
+
+// ---------------------------------------------------------------- SET SESSION AUTHORIZATION (usename)
+// After a superuser runs SET SESSION AUTHORIZATION <installer>, session_user and current_user are the
+// installer and current_setting('role') stays 'none' (recorded on real PostgreSQL 15.19, 16.15 and 17.11,
+// as in #366). Only this backend's pg_stat_activity usename, and on PG16+ system_user, still name the
+// authenticated superuser. The usename check runs on every version, before the PG16 system_user query.
+
+const SSA = { ...healthy, backend_user: "postgres" };
+
+test("SET SESSION AUTHORIZATION on PG15: refused by the backend usename, with no PG16 query", async () => {
+  const pg15 = fakeDb({ ...SSA, server_version: 150000 });
+  let err: unknown;
+  try { await assertInstallerLogin(pg15.db); } catch (e) { err = e; }
+  expect(err instanceof InstallerLoginError && err.code).toBe("backend_user");
+  expect(String(err)).toBe("InstallerLoginError: 96bulls: acquisition installer login refused: backend_user");
+  expect(pg15.seen).toEqual([LOGIN_SQL]);
+  // Before this check the same row was accepted on PG15: every other property looks genuine.
+  expect(await loginRefusal({ ...SSA, server_version: 150019, backend_user: ACQUISITION_INSTALLER_ROLE })).toBe("accepted");
+});
+
+test("SET SESSION AUTHORIZATION on PG16+: the usename check refuses it too, independently of system_user", async () => {
+  for (const server_version of [160000, 160015, 170011]) {
+    // system_user would also catch it; the usename check refuses first, before system_user is read.
+    const both = fakeDb({ ...SSA, server_version }, "scram-sha-256:postgres");
+    let err: unknown;
+    try { await assertInstallerLogin(both.db); } catch (e) { err = e; }
+    expect([server_version, err instanceof InstallerLoginError && err.code]).toEqual([server_version, "backend_user"]);
+    expect(both.seen).toEqual([LOGIN_SQL]);
+    // Even if system_user agreed, usename alone refuses.
+    expect([server_version, await loginRefusal({ ...SSA, server_version }, `scram-sha-256:${ACQUISITION_INSTALLER_ROLE}`)]).toEqual([server_version, "backend_user"]);
+  }
+  // And system_user still refuses on its own when usename agrees (existing check kept).
+  expect(await loginRefusal({ ...healthy, server_version: 160015 }, "scram-sha-256:postgres")).toBe("system_user");
+});
+
+test("positive: backend usename equal to the installer role is accepted on PG15, PG16 and PG17", async () => {
+  for (const server_version of [150000, 150019, 160000, 160015, 170011]) {
+    expect([server_version, await loginRefusal({ ...healthy, server_version, backend_user: ACQUISITION_INSTALLER_ROLE })]).toEqual([server_version, "accepted"]);
+  }
+  // The query reads this backend's row, schema-qualified so a search_path object cannot shadow it.
+  expect(LOGIN_SQL).toContain("(SELECT a.usename::text FROM pg_catalog.pg_stat_activity a WHERE a.pid = pg_catalog.pg_backend_pid()) AS backend_user");
 });

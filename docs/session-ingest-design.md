@@ -142,6 +142,7 @@ Migration `supabase/migrations/20261104022000_session_ingest_ledger.sql`. It nev
   - The commit rechecks the fences. A tombstone or reset that landed after the claim queues that session in `upload_erasure_rearm` for another erasure sweep. That replaces the per-user lock Neon used to serialize resets against deliveries.
   - `upload_cleanup_ready()` is not ported: it is permanently true.
 - **`ingest_tenant_slots`** are per-tenant concurrency leases (section 5).
+- **Acquisition owner (dormant):** an enrolled `(org, workspace, source)` admits only the grant-holding owner of each session, and the edge answers a refusal with a typed 409. Nothing is enrolled and the switch is off. See `docs/ingest-acquisition-owner.md`.
 
 ## 4. Neon replica (transition only)
 
