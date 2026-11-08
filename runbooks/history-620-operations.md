@@ -25,9 +25,13 @@ before any build row.
 
 Since 043500 the lazy batch claim reads the seat clock `FOR KEY SHARE` (claims no longer exclude each
 other there); writers that must exclude claims (`set_live`, control changes, `lazy_clear`, seat
-initialization, staged ACKs) still take it `FOR UPDATE`. After the fence lock and the clock read, and
+initialization) still take it `FOR UPDATE`. After the fence lock and the clock read, and
 before any write, each claim takes exactly one transaction advisory lock keyed
 `'96bulls:lazy-native-origin-v1'` per (org, workspace, origin).
+
+Since 053000 the staged ACK (`ingest_lazy_ack_batch`) takes the clock `FOR NO KEY UPDATE`: it writes
+`last_seat` only, so staged ACKs still serialize with each other and with every `FOR SHARE` /
+`FOR UPDATE` holder, but a claim's `KEY SHARE` no longer queues behind an in-flight ACK.
 
 ## Kill switch (usable at any time, including after installs)
 
@@ -92,7 +96,9 @@ usually the statement timeout, but not provably so): `route` = `ingest.lock_aler
 and `sqlstate`. It carries no tenant data and no ids. The request's own 503 line is unchanged
 (`route` `delivery.batches` / `turns.batches` / `delivery.recovery`, `outcome`
 `delivery_unavailable`, `stage` `claim` or `buffer_receipt`, `error_code`, `db_error_code`).
-This line covers only those two calls. Control changes and `lazy_clear` run nested inside the
+Since 053000 it also fires with `stage` = `staged_intent` for the buffered stage-intent call
+(`ingest_prepare_buffer_stage`, deliver stage `buffer_intent`), which takes no clock lock but waits
+on the fence and batch rows a staged ACK holds. This line covers only those three calls. Control changes and `lazy_clear` run nested inside the
 ordered selection/reset SQL (`ingest_apply_selection` / reset and the history-control triggers);
 their 55P03/57014 currently reach the Worker's selection/reset routes as a generic unavailable
 error without the SQLSTATE, so this alert line does NOT cover them. A follow-up PR will preserve
@@ -111,6 +117,10 @@ Alert when any of these is true:
   (not from the Worker line) until the follow-up lands;
 - more than 1% of claim-path requests return 503 over 5 minutes (`outcome=delivery_unavailable`
   with `stage=claim`, divided by all batch, turns and recovery requests).
+
+Per-stage latency (default off): with `INGEST_STAGE_LATENCY_LOG=on` the Worker writes one
+`route` = `ingest.stage_latency` line per deliver stage with `stage`, `outcome` (`ok`, `refused`,
+`unavailable`), `duration_ms` and, for a database failure, `sqlstate`; no tenant data, no ids.
 
 No Workers analytics or Logpush observer is named in these runbooks, so the alert is not wired
 yet. It is to be wired by the release owner in the G3 window, using the fields `route`, `stage`,

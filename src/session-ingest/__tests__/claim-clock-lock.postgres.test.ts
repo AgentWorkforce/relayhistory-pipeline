@@ -4,6 +4,8 @@
  * per (org, workspace, origin) on ONE transaction advisory lock, so a claim of another origin no longer queues
  * behind it; same-origin claims serialize and a same-key loser takes the P0W01 ownership path, never 23505/40001.
  * F1/F2 bound the advisory footprint (one lock per claim, never one per record: 53200 safety).
+ * C1/C2 (20261105053000_lazy_ack_clock_no_key_update): a staged ACK holds the clock FOR NO KEY UPDATE, so another
+ * user's claim (KEY SHARE) no longer queues behind it, while FOR SHARE / FOR UPDATE holders still exclude the ACK.
  * Claim/commit payloads are captured from the real deliverBatch -> sqlLedger path and replayed on held connections.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
@@ -18,6 +20,7 @@ import { batch, record, scratchStore, TENANT } from "./support.ts";
 import { runMigrations, type MigrationProfile } from "../../hoopdb/migrate.ts";
 import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
 import { originalBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-claim-clock-narrowing.ts";
+import { originalBodies as ackOriginalBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-ack-clock-no-key-update.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 // Refuse credentials, remote endpoints and nonfixture database identities before connecting.
@@ -30,6 +33,7 @@ const root = join(import.meta.dir, "../../..");
 const epoch = "3".repeat(64), identity = "c".repeat(64);
 const migrationPath = "supabase/migrations/20261105043500_lazy_claim_clock_narrowing.sql";
 const migrationName = "upstream:20261105043500_lazy_claim_clock_narrowing.sql";
+const ackMigrationPath = "supabase/migrations/20261105053000_lazy_ack_clock_no_key_update.sql";
 const profile: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: true, runtimeRole: "postgres" };
 const text = (path: string) => readFileSync(join(root, path), "utf8").split("\n").filter((l) => !l.startsWith("\\")).join("\n");
 const CLAIM = "SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS result";
@@ -340,17 +344,57 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect((await hx.done).ok).toBe(true);
     const hy = await hold(COMMIT, py);
     await waitBlockedBy(hy.pid, hx.pid);
-    // Claim Z: the staged ACK holds the clock FOR UPDATE (043500 keeps it), which conflicts with Z's KEY SHARE.
-    expect((await pool.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0].prosrc).toContain("WHERE singleton FOR UPDATE;");
-    const hz = await hold(CLAIM, await capture("ingest_claim_buffered_batch", z, `b1z-${serial}`, [`b1-z-${serial}`]));
-    await waitBlockedBy(hz.pid, hx.pid); expect(await settled(hz.done, 200)).toBe(false);
+    // Claim Z: since 053000 the staged ACK holds the clock FOR NO KEY UPDATE, which does not conflict with Z's KEY
+    // SHARE, so Z completes while X still holds the clock and Y is queued behind X (lock_timeout bounds a regression).
+    expect((await pool.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0].prosrc).toContain("WHERE singleton FOR NO KEY UPDATE;");
+    const hz = await hold(CLAIM, await capture("ingest_claim_buffered_batch", z, `b1z-${serial}`, [`b1-z-${serial}`]), "SET LOCAL lock_timeout=750");
+    expect(await hz.done).toMatchObject({ ok: true }); await finish(hz, "COMMIT");
+    expect(await settled(hy.done, 200)).toBe(false);
     await finish(hx, "COMMIT");
     expect(await hy.done).toMatchObject({ ok: true }); await finish(hy, "COMMIT");
-    expect(await hz.done).toMatchObject({ ok: true }); await finish(hz, "COMMIT");
     const rows = (await pool.query("SELECT seat::text,key_material->>7 rid FROM sessions.ingest_receipt_seats WHERE seat>$1 ORDER BY seat", [before.toString()])).rows as { seat: string; rid: string }[];
     expect(rows.map((r) => r.rid)).toEqual([...xs, ...ys]);
     rows.forEach((r, i) => expect(BigInt(r.seat)).toBe(before + BigInt(i + 1)));
     expect(await lastSeat()).toBe(rows.at(-1)!.seat);
+  }, 60000);
+
+  test("C1 (053000): a claim of another user and origin proceeds while a staged ACK holds the clock; with the 043500 ACK body restored it queues (55P03 under lock_timeout)", async () => {
+    const run = async () => {
+      const x = tenant("c1x"), y = tenant("c1y");
+      await warm(x, y);
+      const hx = await hold(COMMIT, await capture("ingest_commit_buffered_batch", x, `c1x-${serial}`, [`c1-x-${serial}`], { origin: `c1-ox-${serial}` }));
+      expect((await hx.done).ok).toBe(true); // X's staged ACK ran inside this still-open transaction: it holds the clock
+      const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `c1y-${serial}`, [`c1-y-${serial}`], { origin: `c1-oy-${serial}` }), "SET LOCAL lock_timeout=750");
+      const y1 = await hy.done;
+      await finish(hy, y1.ok ? "COMMIT" : "ROLLBACK"); await finish(hx, "COMMIT");
+      return y1;
+    };
+    expect(await run()).toMatchObject({ ok: true });
+    // Before the fix: the exact 043500 ACK body takes the clock FOR UPDATE, which conflicts with the claim's KEY SHARE.
+    const fixed = text(ackMigrationPath);
+    for (const body of ackOriginalBodies(text(migrationPath))) await pool.query(body);
+    try { expect(await run()).toMatchObject({ ok: false, code: "55P03" }); }
+    finally { await pool.query(fixed); }
+    expect((await pool.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0].prosrc).toContain("WHERE singleton FOR NO KEY UPDATE;");
+  }, 60000);
+
+  test("C2 (053000): a FOR SHARE or FOR UPDATE holder of the clock (custody/GC/policy, quiesce) still excludes a staged ACK (55P03 under lock_timeout)", async () => {
+    for (const mode of ["FOR SHARE", "FOR UPDATE"]) {
+      const x = tenant("c2x");
+      await warm(x);
+      // Capture first: the capture's own claim reads the clock under KEY SHARE, which a FOR UPDATE holder would block.
+      const px = await capture("ingest_commit_buffered_batch", x, `c2x-${serial}`, [`c2-x-${serial}`]);
+      const before = await lastSeat();
+      const holder = await connect();
+      try {
+        await holder.query("BEGIN");
+        await holder.query(`SELECT 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton ${mode}`);
+        const hx = await hold(COMMIT, px, "SET LOCAL lock_timeout=750");
+        expect(await hx.done).toMatchObject({ ok: false, code: "55P03" });
+        await finish(hx, "ROLLBACK");
+      } finally { await release(holder); }
+      expect(await lastSeat()).toBe(before);
+    }
   }, 60000);
 
   test("B2: two suppressed claims from different origins run concurrently (the second never waits for the first), no 40P01, last_seat unchanged", async () => {
