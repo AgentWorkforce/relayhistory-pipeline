@@ -10,6 +10,9 @@
  * process instead of the first request. Search is selected by
  * SEARCH_INDEX_BACKEND (default postgres here, so no ClickHouse or Lambda is
  * needed; clickhouse keeps the hosted binding); see selfhostSearchComposition.
+ * With LOCKER_BUCKET set, timing, turns, metadata and catalog read canonical
+ * S3 (service-canonical.ts); READ_API_AUTH_MODE=relaycontrol_only removes the
+ * RelayAuth verifier entirely (lambda.ts readApiAuthConfig, auth.ts).
  * Like the Lambda and the Worker it answers GET, plus exactly one POST route: `POST /v1/cli/login`, whose JSON
  * body is the only request body ever read. It is buffered here with a hard
  * cap (LOGIN_BODY_CAP_BYTES, 413 beyond it) before the app sees it; every
