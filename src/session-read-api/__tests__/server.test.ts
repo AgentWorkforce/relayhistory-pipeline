@@ -2,9 +2,11 @@
  * The self-host SERVICE entry (server.ts) over real loopback HTTP on a random
  * port: dormant answers /healthz only; enabled serves the read API, both with
  * the test adapters and with the Lambda's own assembly (no database is touched:
- * pg and ClickHouse connect lazily and the routes hit here never query).
+ * ClickHouse connects lazily, the routes hit here never query, and pg.Pool is a
+ * stub that answers only the startup reader-role admission check).
  */
 import { connect } from "node:net";
+import pg from "pg";
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
@@ -265,28 +267,42 @@ describe("enabled", () => {
     expect((await fetch(url("/healthz"))).status).toBe(200);
   });
 
-  test("the Lambda's own assembly starts without a database and authenticates first", async () => {
-    const { url } = await start({
-      ...env,
-      RELAYHISTORY_READ_API_SECRET: JSON.stringify({
-        supabase_url: "postgresql://reader@db.example.invalid:5432/postgres",
-        clickhouse: { url: "https://ch.example.invalid:8443", user: "reader", password: "p", database: "relay_search" },
-      }),
-      READ_API_COMPLETE_SINCE: "epoch",
-    });
-    expect(await (await fetch(url("/healthz"))).json()).toEqual({ ok: true, enabled: true });
-    expect((await fetch(url("/health"))).status).toBe(200);
-    const r = await fetch(url("/v1/events?q=x"));
-    expect(r.status).toBe(401);
-    expect(((await r.json()) as { error: { code: string } }).error.code).toBe("missing_authorization");
+  test("the Lambda's own assembly (SEARCH_INDEX_BACKEND=clickhouse) starts after reader admission only and authenticates first", async () => {
+    const RealPool = pg.Pool;
+    const seen: string[] = [];
+    pg.Pool = class {
+      on() { return this; }
+      async query(text: string) { seen.push(text); return { rows: [{ role: "reader", rolsuper: false, rolbypassrls: false }] }; }
+      async end() {}
+    } as unknown as typeof pg.Pool;
+    try {
+      const { url } = await start({
+        ...env,
+        SEARCH_INDEX_BACKEND: "clickhouse",
+        SESSION_POSTGRES_TLS_PROFILE: "supabase",
+        RELAYHISTORY_READ_API_SECRET: JSON.stringify({
+          supabase_url: "postgresql://reader:pw@db.example.invalid:5432/postgres",
+          clickhouse: { url: "https://ch.example.invalid:8443", user: "reader", password: "p", database: "relay_search" },
+        }),
+        READ_API_COMPLETE_SINCE: "epoch",
+      });
+      expect(await (await fetch(url("/healthz"))).json()).toEqual({ ok: true, enabled: true });
+      expect((await fetch(url("/health"))).status).toBe(200);
+      const r = await fetch(url("/v1/events?q=x"));
+      expect(r.status).toBe(401);
+      expect(((await r.json()) as { error: { code: string } }).error.code).toBe("missing_authorization");
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toContain("FROM pg_roles r WHERE r.rolname = current_user");
+    } finally { pg.Pool = RealPool; }
   });
 
   test("startup fails on the Lambda's own checks (bad secret, missing history floor)", async () => {
-    await expect(startReadApiService({ ...env, READ_API_COMPLETE_SINCE: "epoch", RELAYHISTORY_READ_API_SECRET: "not json" }, LOOPBACK)).rejects.toThrow(
+    await expect(startReadApiService({ ...env, SEARCH_INDEX_POSTGRES_BACKEND_ID: "selfhost-pg", SESSION_POSTGRES_TLS_PROFILE: "supabase", READ_API_COMPLETE_SINCE: "epoch", RELAYHISTORY_READ_API_SECRET: "not json" }, LOOPBACK)).rejects.toThrow(
       "session read api secret is not JSON",
     );
-    await expect(
-      startReadApiService({ ...env, RELAYHISTORY_READ_API_SECRET: JSON.stringify({ supabase_url: "postgresql://r@h/p" }) }, LOOPBACK),
-    ).rejects.toThrow("READ_API_COMPLETE_SINCE");
+    for (const search of [{ SEARCH_INDEX_BACKEND: "clickhouse" }, { SEARCH_INDEX_POSTGRES_BACKEND_ID: "selfhost-pg" }])
+      await expect(
+        startReadApiService({ ...env, ...search, SESSION_POSTGRES_TLS_PROFILE: "supabase", RELAYHISTORY_READ_API_SECRET: JSON.stringify({ supabase_url: "postgresql://r:pw@h/p" }) }, LOOPBACK),
+      ).rejects.toThrow("READ_API_COMPLETE_SINCE");
   });
 });
