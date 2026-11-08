@@ -14,6 +14,13 @@
  * no parameter groups, and refuses CREATE EVENT TRIGGER to rds_superuser members (real
  * RDS allows it). See the runbook "Amazon RDS for PostgreSQL" for the live gates.
  *
+ * rds_superuser's effective CREATE on sessions is GRANTED DIRECTLY here, after the first
+ * migrate. Real RDS gives the role that CREATE without any entry in the schema ACL; vanilla
+ * PostgreSQL cannot reproduce that (making it a member of the master is a membership cycle,
+ * asserted below), so the proof models the catalog result, not AWS's mechanism. The direct
+ * grant is inherited by members, hence the second member below holds rds_superuser WITH
+ * INHERIT FALSE: the failing live catalog listed no creators beyond rds_superuser and the master.
+ *
  * Env: PGPROOF_HOST / PGPROOF_PORT (default 127.0.0.1:5432), PGPROOF_SUPERUSER (must be
  * rdsadmin), PGPROOF_PSQL, PGPROOF_HEAD, PGPROOF_OUT (default rds-profile-proof.json).
  * Exit 0 only if every case passes.
@@ -177,7 +184,7 @@ await sql(
    CREATE ROLE ${MASTER} LOGIN CREATEROLE CREATEDB NOSUPERUSER NOBYPASSRLS NOREPLICATION;
    GRANT rds_superuser TO ${MASTER} WITH ADMIN OPTION;
    CREATE ROLE ${OTHER} LOGIN CREATEROLE CREATEDB NOSUPERUSER NOBYPASSRLS NOREPLICATION;
-   GRANT rds_superuser TO ${OTHER};`,
+   GRANT rds_superuser TO ${OTHER} WITH INHERIT FALSE;`,
 );
 await sql("postgres", `CREATE DATABASE ${DB} OWNER ${MASTER}`);
 
@@ -238,11 +245,52 @@ await check("rds profile: owner bootstraps, full migrate, PASS marker, runtime r
   const err = [b.fn, b.roles, b.rt, ...b.phase1].find((r) => !r.ok)?.out.split("\n").find((l) => /ERROR/.test(l)) ?? "";
   return [ok, `boot=${b.ok} migrate=${fmt(m)} verdict=${fmt(v)} marker=${marker?.status} gen_match=${marker?.generation === gen} seed=${seed} runtime_edges=${fmt(rtEdges)} fixed=${fixed.length}${err ? ` err=${err}` : ""}`];
 });
-await check("rds profile: bootstraps and migrate are idempotent (rerun applies 0, stays PASS)", async () => {
+/** The global function default of a role, as grantee:PRIVILEGE:grantable (the #389 catalog form). */
+const fnDefault = async (role: string): Promise<string[]> =>
+  (await sql(DB, `SELECT pg_get_userbyid(a.grantee) || ':' || a.privilege_type || ':' || a.is_grantable AS e
+      FROM pg_default_acl d, aclexplode(d.defaclacl) a
+     WHERE d.defaclrole = '${role}'::regrole AND d.defaclnamespace = 0 AND d.defaclobjtype = 'f' ORDER BY 1`)).rows.map((r) => r.e);
+const RDS_SUPER_EXACT = fmt(["rds_superuser:EXECUTE:false"]);
+const firstError = (r: { out: string }) => r.out.split("\n").find((l) => /ERROR/.test(l)) ?? "";
+
+await check("emulation: rds_superuser (NOLOGIN, not SUPERUSER) has effective CREATE on sessions once it exists", async () => {
+  // The membership route cannot model RDS: master is already a member of rds_superuser.
+  const cycle = await attempt(DB, `GRANT ${MASTER} TO rds_superuser`);
+  await sql(DB, "GRANT CREATE ON SCHEMA sessions TO rds_superuser", MASTER);
+  const r = (await sql(DB, `SELECT rolsuper, rolcanlogin,
+      has_schema_privilege(oid, 'sessions', 'CREATE') AS can_create,
+      has_schema_privilege('${OTHER}', 'sessions', 'CREATE') AS other_can_create
+      FROM pg_roles WHERE rolname = 'rds_superuser'`)).rows[0];
+  const ok = cycle === "0LP01" && r.can_create && !r.rolsuper && !r.rolcanlogin && !r.other_can_create;
+  return [ok, `membership_cycle=${cycle} direct_grant=${fmt(r)}`];
+});
+await check("rds profile: bootstraps and a second migrate are idempotent with rds_superuser able to CREATE (rerun applies 0, stays PASS)", async () => {
   const b = boot();
   const m = migrate(RDS_ENV);
   const v = await verdict(RT);
-  return [b.ok && m.exit === 0 && m.applied === 0 && v.ok, `boot=${b.ok} migrate=${fmt(m)} verdict=${fmt(v)}`];
+  const d = await fnDefault("rds_superuser");
+  const err = [b.fn, b.roles, b.rt, ...b.phase1].map(firstError).find(Boolean) ?? "";
+  return [b.ok && m.exit === 0 && m.applied === 0 && v.ok && fmt(d) === RDS_SUPER_EXACT,
+    `boot=${b.ok} migrate=${fmt(m)} verdict=${fmt(v)} rds_superuser_default=${fmt(d)}${err ? ` err=${err}` : ""}`];
+});
+await check("rds profile: an existing install without rds_superuser's default fails function_boundary_unproven; the file or the one statement repairs it", async () => {
+  const clear = "ALTER DEFAULT PRIVILEGES FOR ROLE rds_superuser GRANT EXECUTE ON FUNCTIONS TO PUBLIC";
+  await sql(DB, clear, MASTER);
+  const cleared = await fnDefault("rds_superuser");
+  const broken = migrate(RDS_ENV);
+  const file = psql(DB, ["-f", FN_BOOT]);
+  const byFile = await fnDefault("rds_superuser");
+  const afterFile = migrate(RDS_ENV);
+  await sql(DB, clear, MASTER);
+  const brokenAgain = migrate(RDS_ENV);
+  await sql(DB, "ALTER DEFAULT PRIVILEGES FOR ROLE rds_superuser REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC", MASTER);
+  const byStatement = await fnDefault("rds_superuser");
+  const afterStatement = migrate(RDS_ENV);
+  const ok = cleared.length === 0 && broken.exit !== 0 && broken.code === "function_boundary_unproven" &&
+    file.ok && fmt(byFile) === RDS_SUPER_EXACT && afterFile.exit === 0 && afterFile.applied === 0 &&
+    brokenAgain.exit !== 0 && brokenAgain.code === "function_boundary_unproven" &&
+    fmt(byStatement) === RDS_SUPER_EXACT && afterStatement.exit === 0 && afterStatement.applied === 0;
+  return [ok, fmt({ cleared, broken, file: file.sqlstate, file_error: firstError(file), byFile, afterFile, brokenAgain, byStatement, afterStatement })];
 });
 await check("rds profile: the owner creates the consumer role via the bootstrap chain and promotes it; extras still refuse", async () => {
   // N1: the trampoline never provisions search_consumer_runtime. The
@@ -367,6 +415,12 @@ await drift(
   "function_boundary_unproven",
 );
 await drift(
+  "poisoned rds_superuser global function default",
+  "ALTER DEFAULT PRIVILEGES FOR ROLE rds_superuser GRANT EXECUTE ON FUNCTIONS TO authenticated",
+  "ALTER DEFAULT PRIVILEGES FOR ROLE rds_superuser REVOKE EXECUTE ON FUNCTIONS FROM authenticated",
+  "function_boundary_unproven",
+);
+await drift(
   "another rds_superuser member able to CREATE in sessions",
   `GRANT CREATE ON SCHEMA sessions TO ${OTHER}`, `REVOKE CREATE ON SCHEMA sessions FROM ${OTHER}`,
   "function_boundary_unproven",
@@ -438,6 +492,38 @@ await check("bootstraps refuse: wrong owner input, non-owned database, stale tra
   const ok = wrongOwner === "42501" && notOwner === "42501" && probeLeaked === 0 && staleSeed === "55000" &&
     unsafeFixed === "55000" && superCaller === "55000" && loginMismatch === "55000";
   return [ok, fmt({ wrongOwner, notOwner, probeLeaked, staleSeed, unsafeFixed, superCaller, loginMismatch })];
+});
+
+await check("function-default bootstrap refuses with nothing changed: poisoned rds_superuser default, missing rds_superuser, master not inheriting it", async () => {
+  // Master's default is cleared first, so a partial run would be visible on its row.
+  const snapshot = async () => fmt([await fnDefault(MASTER), await fnDefault("rds_superuser")]);
+  const clearMaster = `ALTER DEFAULT PRIVILEGES FOR ROLE ${MASTER} GRANT EXECUTE ON FUNCTIONS TO PUBLIC`;
+  await sql(DB, clearMaster, MASTER);
+  await sql(DB, "ALTER DEFAULT PRIVILEGES FOR ROLE rds_superuser GRANT EXECUTE ON FUNCTIONS TO authenticated", MASTER);
+  const beforePoison = await snapshot();
+  const poisoned = psql(DB, ["-f", FN_BOOT]);
+  const poisonKept = await snapshot() === beforePoison;
+  await sql(DB, "ALTER DEFAULT PRIVILEGES FOR ROLE rds_superuser REVOKE EXECUTE ON FUNCTIONS FROM authenticated", MASTER);
+
+  const beforeMissing = await snapshot();
+  await sql("postgres", "ALTER ROLE rds_superuser RENAME TO g7_rds_superuser_absent");
+  const missing = psql(DB, ["-f", FN_BOOT]);
+  await sql("postgres", "ALTER ROLE g7_rds_superuser_absent RENAME TO rds_superuser");
+  const missingKept = await snapshot() === beforeMissing;
+
+  await sql("postgres", `GRANT rds_superuser TO ${MASTER} WITH INHERIT FALSE`);
+  const beforeInherit = await snapshot();
+  const noInherit = psql(DB, ["-f", FN_BOOT]);
+  await sql("postgres", `GRANT rds_superuser TO ${MASTER} WITH INHERIT TRUE`);
+  const inheritKept = await snapshot() === beforeInherit;
+
+  const restored = psql(DB, ["-f", FN_BOOT]);
+  const after = migrate(RDS_ENV);
+  const ok = poisoned.sqlstate === "55000" && poisoned.out.includes("rds_superuser has a poisoned") && poisonKept &&
+    missing.sqlstate === "55000" && missing.out.includes("rds_superuser does not exist") && missingKept &&
+    noInherit.sqlstate === "55000" && noInherit.out.includes("must inherit rds_superuser") && inheritKept &&
+    restored.ok && after.exit === 0 && after.applied === 0;
+  return [ok, fmt({ poisoned: firstError(poisoned), poisonKept, missing: firstError(missing), missingKept, noInherit: firstError(noInherit), inheritKept, restored: restored.ok, after })];
 });
 
 // ---------------------------------------------------------------------------
