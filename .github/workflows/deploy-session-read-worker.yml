@@ -30,6 +30,15 @@ name: deploy session-read-worker
 # IAM grant); an on deploy refuses to run unless both exist. Every later dispatch without
 # inputs turns the feature off again.
 #
+# Buffered search gate (src/session-read-api/buffered-search-gate.ts, PR #338), default off.
+# buffered_search_gate=off (or no input) changes nothing: the render is byte-identical to the one
+# before this input existed. buffered_search_gate=on renders READ_API_BUFFERED_SEARCH_GATE=on and
+# the same pinned HISTORY_CONTROL_HEAD binding (once, also when owner_buffered=on); it needs no
+# workspace list and no S3, and refuses any other value. The gate drops every buffered-origin
+# search hit it cannot prove visible, so it must be deployed BEFORE the buffered search feeder
+# (#339) is enabled. Turning it on is a production change: dispatch is Khaliq's call. Every later
+# dispatch without the input turns the gate off again.
+#
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
 # are never handled here: they are set with `wrangler secret put` from 1Password
 # and survive deploys. This workflow checks that they exist, by name only.
@@ -45,6 +54,11 @@ on:
         description: 'Canary workspace ids, comma-separated, or exactly "*" for all workspaces (only if SESSION_READ_DIRECTORY_WORKSPACES is "*"); required when on'
         type: string
         default: ""
+      buffered_search_gate:
+        description: Per-hit privacy gate for buffered search hits (#338); needs no other input. off = exactly the default deploy
+        type: choice
+        options: ["off", "on"]
+        default: "off"
 permissions:
   contents: read
 concurrency:
@@ -79,6 +93,8 @@ jobs:
       OWNER_BUFFERED_WORKSPACES: ${{ inputs.owner_buffered_workspaces }}
       OWNER_BUFFERED_S3_BUCKET: ${{ vars.SESSION_READ_INGEST_S3_BUCKET }}
       OWNER_BUFFERED_S3_REGION: ${{ vars.SESSION_READ_INGEST_S3_REGION }}
+      # Buffered search gate (default off); renders the flag and the pinned binding when on.
+      BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}
     defaults:
       run:
         working-directory: packages/session-read-worker
@@ -120,7 +136,7 @@ jobs:
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/hyperdrive/configs/$HYPERDRIVE_ID" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             | bun run scripts/check-hyperdrive-config.ts
-      - name: Render the deploy config (Hyperdrive id; owner-buffered binding and vars only when on)
+      - name: Render the deploy config (Hyperdrive id; control-head binding and flags only when owner_buffered or buffered_search_gate is on)
         run: |
           grep -q '"id": "00000000000000000000000000000000"' wrangler.jsonc
           bun run scripts/render-deploy-config.ts

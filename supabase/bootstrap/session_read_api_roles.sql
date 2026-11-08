@@ -12,7 +12,7 @@
 --                                Made LOGIN, with its settings, column grant and RLS
 --                                policy, AFTER migrate by session_read_api_role.sql.
 --   attrs     NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
---   members   member of none.
+--   members   member of none, and no member (nobody may SET ROLE into it): see "Inbound" below.
 --   run as    a superuser (CNPG `postgres`); a CREATEROLE role on PostgreSQL 15 and
 --             older (Cloud SQL's migration_owner); or Supabase's `postgres` on 16+.
 --   when      before every migrate (src/hoopdb/migrate.ts runs it as its bootstrap step
@@ -21,14 +21,26 @@
 --             so there this file only verifies it.
 --   exit      success: the role exists (created now or already) and is not elevated.
 --             failure: 42501 (caller may not create it) or 55000 (the existing role is
---             elevated or a member of a role; nothing is changed). It never alters an
---             existing role, so it is safe after session_read_api_role.sql made it LOGIN.
+--             elevated, a member of a role or has an unexpected member; nothing is
+--             changed). It never alters an existing role, so it is safe after
+--             session_read_api_role.sql made it LOGIN.
+--
+-- Inbound. Membership is checked both ways: any role granted bulls96_read_api could SET ROLE
+-- to it and call the read API's SECURITY DEFINER functions. On PG16+ the only tolerated member
+-- row is the Supabase creator edge that PostgreSQL adds itself when Supabase's non-superuser
+-- `postgres` (CREATEROLE) creates the role: member `postgres`, grantor the superuser
+-- `supabase_admin`, admin_option true, inherit_option false, set_option false, and only with
+-- hoopdb.db_mode=supabase bound. That edge can neither SET ROLE to the role nor inherit its
+-- privileges. It is the same predicate as supabase/bootstrap/acquisition_installer_verify.sql
+-- (#332) and session_read_api_role_verify.sql. Before PG16 pg_auth_members has no
+-- inherit_option / set_option columns, so any member refuses.
 --
 -- Idempotent and atomic (one DO block). Roles are cluster-wide.
 DO $bootstrap$
 DECLARE
   v_name text := 'bulls96_read_api';
   v_me record;
+  m record;
   r pg_roles%ROWTYPE;
   v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
   v_version int := current_setting('server_version_num')::int;
@@ -56,6 +68,22 @@ BEGIN
   IF EXISTS (SELECT 1 FROM pg_auth_members WHERE member = r.oid) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = format('bootstrap %s: the role is a member of another role', v_name),
+      HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
+  END IF;
+  IF v_version >= 160000 THEN
+    FOR m IN EXECUTE 'SELECT u.rolname, g.rolname AS grantor, g.rolsuper AS grantor_super, a.admin_option, a.inherit_option, a.set_option FROM pg_auth_members a JOIN pg_roles u ON u.oid = a.member JOIN pg_roles g ON g.oid = a.grantor WHERE a.roleid = $1' USING r.oid LOOP
+      IF v_mode = 'supabase' AND m.rolname = 'postgres' AND m.grantor = 'supabase_admin' AND m.grantor_super
+         AND m.admin_option AND NOT m.inherit_option AND NOT m.set_option THEN
+        NULL; -- Supabase PG16+ creator edge: ADMIN only, no SET, no INHERIT
+      ELSE
+        RAISE EXCEPTION USING ERRCODE = '55000',
+          MESSAGE = format('bootstrap %s: the role has an unexpected member', v_name),
+          HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
+      END IF;
+    END LOOP;
+  ELSIF EXISTS (SELECT 1 FROM pg_auth_members WHERE roleid = r.oid) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = format('bootstrap %s: the role has an unexpected member', v_name),
       HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
   END IF;
 END

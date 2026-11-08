@@ -9,7 +9,9 @@ import type {PublicationRpc,PublicationTarget,PublicationTicket} from "./publica
 const UUID=/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const HEX=/^[a-f0-9]{64}$/;
 const bad=()=>Object.assign(Error("publication_rpc_invalid"),{code:"publication_rpc_invalid"});
-function ticket(v:any,target:PublicationTarget):PublicationTicket{
+/** Validate a ticket returned by an atomic authority/claim wrapper with the
+ * exact same trust checks used by the ordinary publication claim RPC. */
+export function parsePublicationTicket(v:any,target:PublicationTarget):PublicationTicket{
  if(!v||v.schemaGeneration!==target.generation||!UUID.test(v.attemptToken)||!UUID.test(v.leaseToken)||!UUID.test(v.claimToken)||!UUID.test(v.stageToken)||
   !Number.isFinite(Date.parse(v.leaseUntil))||!v.tenant||typeof v.tenant.orgId!=="string"||typeof v.tenant.workspaceId!=="string"||typeof v.tenant.userId!=="string"||
   !v.stage||!HEX.test(v.stage.sha256)||!Number.isSafeInteger(v.stage.bytes)||v.stage.bytes<1||v.stage.bytes>16*1024*1024||
@@ -52,7 +54,7 @@ export function publicationRpc(db:SemanticBoundedSql,target:PublicationTarget,op
  return {
   async candidates(limit,signal){const r=await call("candidates",{limit,keyRoot:target.keyRoot,bucket:target.bucket,region:target.region},signal);if(!Array.isArray(r.stageTokens)||r.stageTokens.some((x:any)=>typeof x!=="string"||!UUID.test(x)))throw bad();return r.stageTokens;},
   async defer(stageToken,code,signal){const r=await call("defer",{stageToken,code},signal);if(typeof r.deferred!=="boolean")throw bad();},
-  async claim(stageToken,signal){return ticket(await call("claim",{stageToken,keyRoot:target.keyRoot,bucket:target.bucket,region:target.region},signal),target);},
+  async claim(stageToken,signal){return parsePublicationTicket(await call("claim",{stageToken,keyRoot:target.keyRoot,bucket:target.bucket,region:target.region},signal),target);},
   async heartbeat(t,signal){const r=await call("heartbeat",attempt(t),signal);if(typeof r.leaseUntil!=="string"||!Number.isFinite(Date.parse(r.leaseUntil)))throw bad();t.leaseUntil=r.leaseUntil;},
   async prepare(t,images,signal){if((await call("prepare",{...attempt(t),images},signal)).prepared!==true)throw bad();},
   async register(t,objects,signal){if((await call("register_objects",{...attempt(t),objects},signal)).registered!==true)throw bad();},

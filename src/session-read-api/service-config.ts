@@ -21,8 +21,10 @@
  * Dormant (flag off): nothing else is read or required; the process starts and
  * answers 503 not_configured on every route but /healthz. Enabled: the secret is
  * required and ALLOW_IN_CLUSTER_HTTP is checked here; the remaining read API env
- * (READ_API_COMPLETE_SINCE, READ_API_ORIGIN, RELAYAUTH_*, PGSSL*, ...) is validated
- * at startup by the same assembly the Lambda uses (lambda.ts readAppFromSecret).
+ * (READ_API_COMPLETE_SINCE, READ_API_ORIGIN, RELAYAUTH_*, READ_API_AUTH_MODE, PGSSL*, ...)
+ * is validated at startup by the same assembly the Lambda uses (lambda.ts
+ * readAppFromSecret), and LOCKER_* (the canonical store behind timing, turns,
+ * metadata and catalog) by service-canonical.ts.
  * Errors name the variable, never its value.
  */
 import { destinationPolicy } from "../shared/destination-url.ts";
