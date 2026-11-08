@@ -200,6 +200,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
       "DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)",
     sql: column("sessions.session_summaries", "object_key"),
   },
+  "upstream:20261105043900_session_consumer_function_grants.sql": {
+    evidence: "twelve search_consumer_runtime EXECUTEs (composed writer path)",
+    sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'",
+  },
 };
 
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */
@@ -213,4 +217,5 @@ export const NON_CREATE_STEPS = [
   "upstream:20261102020000_session_brief_state.sql",
   "96bulls:0003_fanout_ledger.sql",
   "96bulls:0004_summary_pointers.sql",
+  "upstream:20261105043900_session_consumer_function_grants.sql",
 ] as const;

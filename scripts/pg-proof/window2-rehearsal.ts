@@ -12,6 +12,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { SESSION_BOOTSTRAP_FILES } from "../../src/hoopdb/session-bootstrap-chain.ts";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const argv = process.argv.slice(2);
@@ -109,8 +110,10 @@ const historyBefore = JSON.stringify((await admin.query("SELECT name,sha256 FROM
 // Window #2 adds a NOLOGIN canonical producer role. Its reviewed privileged
 // bootstrap is a prerequisite, separate from the non-CREATEROLE owner apply.
 // This fixture's proof_admin is the privileged bootstrap actor.
-await admin.query(await readFile(root + "/supabase/bootstrap/session_ingest_roles.sql", "utf8"));
-await admin.query(await readFile(root + "/supabase/bootstrap/session_read_api_roles.sql", "utf8"));
+// Single-sourced bootstrap chain: owner-apply may reach the function-grants
+// migration, which FAILs closed without the bare consumer grantee.
+for (const f of SESSION_BOOTSTRAP_FILES)
+  await admin.query(await readFile(root + "/" + f, "utf8"));
 const producer = (await admin.query("SELECT rolcanlogin,rolsuper,rolinherit,rolcreaterole,rolcreatedb,rolreplication,rolbypassrls FROM pg_roles WHERE rolname='bulls96_canonical_feature_producer'")).rows;
 if (producer.length !== 1 || Object.values(producer[0]).some(Boolean)) throw Error("window2_producer_bootstrap_attrs");
 ev("canonical-producer-bootstrap", { noLogin: true, elevated: false });

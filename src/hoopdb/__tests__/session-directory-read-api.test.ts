@@ -44,6 +44,9 @@ async function fresh(): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
+  // Intentionally partial: these suites test the read_api bootstrap itself,
+  // so the read_api (and consumer) roles stay absent here — database() adds
+  // BOOTSTRAP separately, and the "without the bootstrap" tests rely on it.
   await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
   await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
   await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));

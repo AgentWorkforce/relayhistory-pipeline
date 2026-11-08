@@ -7,6 +7,32 @@ import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { TenantRunner } from "../session-read-api/liveness.ts";
 import type { SearchProjectionState } from "./search-adapter.ts";
 
+/** A pg_policy-shaped row, as read from pg_policy or pg_policies. */
+export interface TenantPolicyRow {
+  name: string;
+  command: string;
+  /** "{0}" for TO PUBLIC, else the comma-joined grantee list. */
+  roles: string;
+  permissive: boolean;
+  qual: string | null;
+  check: string | null;
+}
+
+const normalizePolicyExpr = (value: string): string => value.replace(/\s+|::text|\(|\)/g, "");
+
+/** The exact tenant gate: one permissive FOR ALL TO PUBLIC tenant_only policy binding both GUCs. */
+export function isTenantOnlyPolicy(row: TenantPolicyRow): boolean {
+  const expected = normalizePolicyExpr("org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true)");
+  return (
+    row.name === "tenant_only" &&
+    row.command === "*" &&
+    row.roles === "{0}" &&
+    row.permissive &&
+    normalizePolicyExpr(row.qual ?? "") === expected &&
+    normalizePolicyExpr(row.check ?? "") === expected
+  );
+}
+
 export function postgresSearchState(options: { reader?: TenantRunner; backendId: string; fromMs: number; schema?: string }): SearchProjectionState & { ensureSchema(owner: SqlExecutor): Promise<void> } {
   const schema = options.schema ?? "search_index";
   const { backendId, fromMs, reader } = options;
@@ -32,13 +58,21 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
             WITH CHECK(org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true));
         END IF;
       END $policy$`);
-      const { rows } = await owner.query<{ name: string; command: string; roles: string; permissive: boolean; qual: string; check: string }>(
-        `SELECT polname AS name,polcmd::text AS command,polroles::text AS roles,polpermissive AS permissive,
+      const { rows } = await owner.query<{ name: string; command: string; roles: string; permissive: boolean; qual: string | null; check: string | null }>(
+        `SELECT polname AS name,polcmd::text AS command,
+          CASE WHEN polroles = '{0}' THEN '{0}'
+               ELSE (SELECT string_agg(r.rolname, ',' ORDER BY r.rolname) FROM pg_roles r WHERE r.oid = ANY(polroles)) END AS roles,
+          polpermissive AS permissive,
           pg_get_expr(polqual,polrelid) AS qual,pg_get_expr(polwithcheck,polrelid) AS check
          FROM pg_policy WHERE polrelid=$1::regclass`, [table]);
-      const normalize = (value: string) => value.replace(/\s+|::text|\(|\)/g, "");
-      const expected = normalize("org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true)");
-      if (rows.length !== 1 || rows[0]!.name !== "tenant_only" || rows[0]!.command !== "*" || rows[0]!.roles !== "{0}" || !rows[0]!.permissive || normalize(rows[0]!.qual ?? "") !== expected || normalize(rows[0]!.check ?? "") !== expected) throw new Error("search state tenant policy mismatch");
+      const tenant = rows.find((r) => r.name === "tenant_only");
+      if (!tenant || !isTenantOnlyPolicy(tenant)) throw new Error("search state tenant policy mismatch");
+      // Exactly one policy may exist: a writer-targeted extra (the removed
+      // search_consumer_trusted policy, or any other) would both collide
+      // with #330's exact-one-policy check and widen the tenant gate, so it
+      // fails closed here. The writer binds the tenant GUCs per scope
+      // instead (every search write runs inside a tenant transaction).
+      if (rows.length !== 1) throw new Error("search state tenant policy mismatch");
     },
     async fromMs() { return fromMs; },
     async record(tx, scope, value) {
@@ -56,6 +90,7 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
     async partials(tenant, input) {
       if (!reader) throw new Error("search state tenant reader missing");
       if (!tenant.orgId || !tenant.workspaceId || !Number.isInteger(input.limit) || input.limit < 1 || input.limit > 1000) throw new Error("search state query invalid");
+      if (input.after !== undefined && (typeof input.after !== "string" || input.after.length === 0)) throw new Error("search state query invalid");
       const { rows } = await reader(tenant.orgId, tenant.workspaceId, tx => tx.query<{ session_id: string }>(
         `SELECT DISTINCT coalesce(p.canonical_session_id,p.session_id) AS session_id
          FROM sessions.session_index p
@@ -63,11 +98,12 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
          LEFT JOIN sessions.session_directory d ON d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id=coalesce(p.canonical_session_id,p.session_id)
          WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.deleted_at IS NULL
            AND ($4::text IS NULL OR p.session_id=$4 OR coalesce(p.canonical_session_id,p.session_id)=$4)
+           AND ($7::text IS NULL OR coalesce(p.canonical_session_id,p.session_id) > $7)
            AND (s.complete IS DISTINCT FROM true OR d.event_projection_ready IS DISTINCT FROM true
              OR s.canonical_session_id IS DISTINCT FROM coalesce(p.canonical_session_id,p.session_id)
              OR s.source_epoch IS DISTINCT FROM d.event_projection_epoch OR s.coverage_from_ms IS DISTINCT FROM $5::bigint)
          ORDER BY session_id LIMIT $6`,
-        [tenant.orgId, tenant.workspaceId, backendId, input.sessionId ?? null, fromMs, input.limit + 1]));
+        [tenant.orgId, tenant.workspaceId, backendId, input.sessionId ?? null, fromMs, input.limit + 1, input.after ?? null]));
       return { sessions: rows.slice(0, input.limit).map(r => r.session_id), overflow: rows.length > input.limit };
     },
   };
