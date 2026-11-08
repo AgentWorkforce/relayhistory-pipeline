@@ -459,10 +459,9 @@ Open questions (reviews of 2026-11-07). Answered, now constraints:
    does not refuse them; Cloud has no active legacy Factory publisher. Confirm no other non-`srv_` `droid` writer
    before enabling the guard.
 
-Still open:
-3. (Cloud, partly) A separately authenticated Cloud publisher port at the History gateway over the private Ingest
-   binding; proof never in provider payloads, logs, traces or archives; attempts pin grant and epoch; a retry never
-   injects a new grant into an immutable outbox. Open: exact route and credential.
+3. (Cloud, answered) The private Cloud publisher route, credential, immutable byte envelope and acknowledgement
+   contract are specified in §9. Its receiver and Cloud outbox adapter are implementation work; they do not enable
+   publication or enroll a source by themselves.
 
 Implementation plan. One PR, dormant:
 1. Migration and rollback `<SLOT>_ingest_acquisition_owner.sql` (§3 DDL, functions, hooks, REVOKEs); bootstrap
@@ -503,3 +502,101 @@ Implementation plan. One PR, dormant:
 
 The migration registry owner assigns the slot after the PR exists, in F-lane order. Applying it, enrolling any
 source and enabling the switch each need Khaliq's separate OK.
+
+## 9. Private Cloud publication port (Q3, implementation contract v1)
+
+Owner split: Cloud owns prepared outboxes and its transport adapter; History owns the receiver and final claim.
+This section fixes the wire for `POST /v1/acquisition/cloud/batches`, on the acquisition service's private ingress,
+with `Content-Type: application/json`. It is not added to the Desktop-facing upload ingress allowlist. A missing
+receiver/configuration refuses; it never falls back to a legacy publisher, a provider key or a generic user token.
+
+### 9.1 Authentication and exact envelope
+
+`Authorization: Bearer <operator>` is a per-workspace relaycontrol `sh_wk_` token, purpose `acquisition-operator`,
+principal type `service`, scope `acquisition:operate`, audience the configured acquisition origin. History derives
+org/workspace from introspection and requires the install assertion's org/workspace to match exactly. The
+operator's token id is not a history user id. Provisioning uses the existing owner/admin enrollment action and its
+ephemeral `sh_at_` bearer, never persisted; the adapter stores only the encrypted workspace operator token keyed
+by site/acquisition origin, org and workspace. No install-wide mint credential or additional customer token form.
+The existing admin mint API may use `neverExpires:true` for unattended v1 operation; rotation may overlap.
+
+The JSON envelope has exactly three keys:
+
+```json
+{"v":1,"install":{"payload":{"...":"the original install A fields plus evidenceSha256 and requestSha256"},"signature":"unpadded base64url Ed25519 signature"},"batchBodyBase64url":"unpadded base64url of the immutable UTF-8 delivery request bytes"}
+```
+
+`install` is the original, unchanged signed install envelope from §3. The trusted route selects operation
+`install`; History uses the server-pinned **Cloud** issuer registry and the authenticated scope policy, rebuilds A,
+verifies S and both digests. All A values are canonical strings, absent optionals `""`. A body-supplied public key,
+issuer class, identity header or scope cannot authorize anything. Historical assertions remain usable for exact
+receipt replay; this transport does not require the grant to be currently active as a preflight shortcut.
+
+The outer uncompressed body is at most **2,100,000 bytes** and the decoded batch at most **1,500,000 bytes**.
+Both declared and streamed byte counts are bounded. Reject padded/noncanonical base64url, malformed UTF-8 or JSON,
+extra/missing outer keys, an empty batch, or more than **500 records**. Authentication precedes decoding record
+content; an oversized declared body may be refused earlier. The receiver uses its configured private Ingest
+destination only, never a caller-supplied URL, and follows no redirects. Introspection and transport are bounded.
+
+### 9.2 Batch binding and final admission
+
+The decoded delivery request has exactly `protocolVersion:1`, `batch` (the existing delivery batch), and
+`acquisition` as a **top-level sibling** of `batch`. `acquisition` contains exactly one entry:
+
+```json
+{"source":"droid","sessionId":"the selected SID","grantId":"the install operation UUID","ownerEpoch":"positive decimal string","grant":"rhg_ followed by 64 lowercase hex characters"}
+```
+
+The entry's source/session equal the signed A, grant id equals A.operationUuid, and epoch is exactly
+`A.expectedOwnerEpoch + 1` without Number conversion. Recompute §3's grant hash using G and require A.grantSha256.
+This route's v1 source is `droid`; every record has that exact source and SID. Batch and record `origin_id`, and
+the batch's `instance_id`, equal signed A.ownerOriginId. `account_id` must match the existing delivery-account
+derivation for the authenticated org/workspace. Revision ids are unique. The ordinary delivery validator owns
+the remaining record/schema/digest rules; this route introduces no second evidence parser.
+
+History derives upstream user, org, workspace and origin only from the verified A and authenticated operator
+scope. It rebuilds the internal identity/signature headers using the existing trusted edge signing path and
+forwards the **exact decoded bytes** to the private `POST /v1/delivery/batches`. Caller identity, Authorization and
+signature headers are never forwarded. The ingest HMAC authenticates this internal hop; it is not acquisition
+evidence. Final owner/epoch/grant checks run inside the SQL claim under §5 locks. Missing/current-owner failures
+refuse the whole batch, before acceptance; no preflight observation grants admission.
+
+The private assertion and G are control metadata. The normalizer extracts acquisition for admission and retains
+only source/SID/grant id/epoch in the attempt snapshot, never G or the signed envelope in provider payloads,
+manifests, raw evidence archives, logs or traces. Cloud retains the complete retry envelope only encrypted.
+
+### 9.3 Idempotency, responses and immutable outboxes
+
+The existing claim identity (authenticated tenant, signed origin and `batch.batch_id`) is the idempotency key;
+there is no additional gateway operation id or independent acceptance ledger. Ordinary batch/digest conflict
+semantics remain. A successful response is the ordinary **200 DeliveryReceipt**, directly, including the exact
+`batchId` and `acceptedRevisionIds` (no control `{result:...}` wrapper). Cloud advances only after the batch id
+and complete revision-id set match its stored outbox. A count, HTTP 200 or control install result is insufficient.
+
+Errors contain static codes and no proof/token/body bytes:
+
+- 400 `invalid_request`: invalid outer/base64/UTF-8/assertion scalar or binding shape; 413 for either byte bound or
+  record-count bound. No upstream call.
+- 403 `not_authorized` or `target_mismatch`: operator/class/signature/scope/G or signed tuple mismatch. No upstream
+  call. Introspection unavailability/configuration faults are 503, not a grant refusal.
+- Forward the ordinary ingest response for actual delivery errors. In particular, acquisition refusal is the
+  exact §5.6 **409 acquisition_refused** with its per-session `refused` array, never `delivery_conflict`, partial
+  2xx or cursor advancement. `Retry-After` may be forwarded for a genuine busy/unavailable result.
+- A transport failure or invalid upstream receipt is an unknown outcome (503). Retry only the exact saved
+  envelope/bytes; do not mint a new batch, grant or assertion to repair an ambiguous send.
+
+Before acquiring provider bytes for a new outbox, Cloud obtains an admitted install snapshot for the committed
+binding, validates its original A/S/G and epoch against current authority, and pins that snapshot into every
+prepared request **before encrypting/persisting** the outbox. A local binding/lease fence is rechecked when saving
+and dispatching. A retry restores the saved snapshot and exact wrapper; it never replaces the original grant,
+epoch, assertion or batch bytes, even when another grant is now current. An already committed receipt can replay
+under the historical grant while draining without requiring an active-owner preflight; a new claim under it is
+refused by SQL. Post-receipt publication remains the server's obligation (§7), never client replay.
+
+Required implementation regressions: cross-workspace operator and body-supplied identity refusal; wrong issuer
+class/signature/G/epoch/SID/origin/account rejection with zero upstream calls; bigint epochs above 2^53;
+noncanonical base64 and both streamed/declared limits; 501-record splitting on the sender; byte-identical retries
+after an accepted-but-lost response; no grant substitution into an existing pending outbox; committed receipt
+replay while draining and new-claim refusal; exact receipt-set acknowledgement; no proof in stored evidence or
+error/log output; and final real-Postgres admission/revocation ordering from §8. No enrollment or activation is
+implied by this contract or these component tests.
