@@ -48,6 +48,60 @@ describe("readerLoginRefusal (pure)", () => {
     for (const [l, p, code] of cases) expect([l, p, readerLoginRefusal(l, p, SUPABASE)]).toEqual([l, p, code]);
   });
 
+  /**
+   * Identity rows recorded from real PostgreSQL 15.19, 16.15 and 17.11 (#366 head 78e40100,
+   * src/session-ingest/__tests__/ingest-login.test.ts), with the role name set to this login. Each is
+   * merged over the production shape, since SET SESSION AUTHORIZATION does not change pg_roles.
+   *   genuine     a real SCRAM login as the role
+   *   ssa         superuser `postgres`, then SET SESSION AUTHORIZATION <role>
+   *   setrole     superuser `postgres`, then SET ROLE <role>
+   *   ssaSetrole  both
+   */
+  const R = "bulls96_read_api";
+  const RECORDED: Record<string, Record<string, [Record<string, unknown>, Record<string, unknown> | undefined]>> = {
+    "15": {
+      genuine: [{ session_user: R, current_user: R, role_setting: "none", server_version: 150019, backend_user: R }, undefined],
+      ssa: [{ session_user: R, current_user: R, role_setting: "none", server_version: 150019, backend_user: "postgres" }, undefined],
+      setrole: [{ session_user: "postgres", current_user: R, role_setting: R, server_version: 150019, backend_user: "postgres" }, undefined],
+      ssaSetrole: [{ session_user: R, current_user: R, role_setting: R, server_version: 150019, backend_user: "postgres" }, undefined],
+    },
+    "16": {
+      genuine: [{ session_user: R, current_user: R, role_setting: "none", server_version: 160015, backend_user: R }, { system_user: `scram-sha-256:${R}` }],
+      ssa: [{ session_user: R, current_user: R, role_setting: "none", server_version: 160015, backend_user: "postgres" }, { system_user: "scram-sha-256:postgres" }],
+      setrole: [{ session_user: "postgres", current_user: R, role_setting: R, server_version: 160015, backend_user: "postgres" }, { system_user: "scram-sha-256:postgres" }],
+      ssaSetrole: [{ session_user: R, current_user: R, role_setting: R, server_version: 160015, backend_user: "postgres" }, { system_user: "scram-sha-256:postgres" }],
+    },
+    "17": {
+      genuine: [{ session_user: R, current_user: R, role_setting: "none", server_version: 170011, backend_user: R }, { system_user: `scram-sha-256:${R}` }],
+      ssa: [{ session_user: R, current_user: R, role_setting: "none", server_version: 170011, backend_user: "postgres" }, { system_user: "scram-sha-256:postgres" }],
+      setrole: [{ session_user: "postgres", current_user: R, role_setting: R, server_version: 170011, backend_user: "postgres" }, { system_user: "scram-sha-256:postgres" }],
+      ssaSetrole: [{ session_user: R, current_user: R, role_setting: R, server_version: 170011, backend_user: "postgres" }, { system_user: "scram-sha-256:postgres" }],
+    },
+  };
+  const recorded = (v: string, k: string) => {
+    const [l, p] = RECORDED[v]![k]!;
+    return [login(l), p ? pg16(p) : undefined] as const;
+  };
+
+  test("recorded real-server rows: only a genuine login admits; SET SESSION AUTHORIZATION and SET ROLE refuse on 15, 16 and 17", () => {
+    for (const v of ["15", "16", "17"]) {
+      expect([v, readerLoginRefusal(...recorded(v, "genuine"), SUPABASE)]).toEqual([v, null]);
+      // SET SESSION AUTHORIZATION: session_user, current_user and role 'none' all look genuine; on PG15
+      // (no system_user) only the backend's usename reveals the superuser login.
+      expect([v, readerLoginRefusal(...recorded(v, "ssa"), SUPABASE)]).toEqual([v, "reader_role_backend_user"]);
+      expect([v, readerLoginRefusal(...recorded(v, "setrole"), SUPABASE)]).toEqual([v, "reader_role_session_user"]);
+      expect([v, readerLoginRefusal(...recorded(v, "ssaSetrole"), SUPABASE)]).toEqual([v, "reader_role_set_role"]);
+    }
+    // Without the usename check the PG15 SET SESSION AUTHORIZATION row would have passed everything else.
+    const [l15] = recorded("15", "ssa");
+    expect(readerLoginRefusal({ ...l15, backend_user: R }, undefined, SUPABASE)).toBeNull();
+    // A PG16+ SSA backend whose usename were somehow the role is still caught by system_user.
+    const [l17, p17] = recorded("17", "ssa");
+    expect(readerLoginRefusal({ ...l17, backend_user: R }, p17, SUPABASE)).toBe("reader_role_system_user");
+    // An unreadable usename (no pg_stat_activity row) never admits.
+    for (const u of [null, undefined, ""]) expect(readerLoginRefusal(login({ backend_user: u }), pg16(), SUPABASE)).toBe("reader_role_backend_user");
+  });
+
   test("attributes: every forbidden one, and LOGIN required", () => {
     expect(readerLoginRefusal(login({ rolsuper: true }), pg16(), SUPABASE)).toBe("reader_role_superuser");
     expect(readerLoginRefusal(login({ rolbypassrls: true }), pg16(), SUPABASE)).toBe("reader_role_bypassrls");
@@ -156,7 +210,9 @@ describe("against the bootstrap's actual role (PGlite)", () => {
     }
     // Only what a real login changes is substituted: the session identity and the role's settings
     // applied at login (SET ROLE does not apply them). Everything else is the bootstrap's own row.
-    const real = { ...row, session_user: "bulls96_read_api", role_setting: "none", statement_timeout: "2s", default_transaction_read_only: "on" };
+    const real = { ...row, session_user: "bulls96_read_api", role_setting: "none", backend_user: "bulls96_read_api", statement_timeout: "2s", default_transaction_read_only: "on" };
+    // The live usename is the superuser's (PGlite's single session), never the role SET ROLE assumed.
+    expect(row.backend_user === "bulls96_read_api").toBe(false);
     expect(row.rolconfig).toEqual(expect.arrayContaining(["statement_timeout=2s", "default_transaction_read_only=on"]));
     expect(readerLoginRefusal(real, { system_user: "scram-sha-256:bulls96_read_api", member_edges: [] }, OTHER)).toBeNull();
   });

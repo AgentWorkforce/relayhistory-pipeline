@@ -22,6 +22,7 @@ export const READER_LOGIN_ROW: Readonly<Record<string, unknown>> = Object.freeze
   rolconfig: ["statement_timeout=2s", "default_transaction_read_only=on"],
   memberships: 0,
   members: 0,
+  backend_user: "bulls96_read_api",
 });
 
 export const READER_PG16_ROW: Readonly<Record<string, unknown>> = Object.freeze({

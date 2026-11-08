@@ -158,7 +158,7 @@ export const READER_SETTINGS = Object.freeze({ statement_timeout: "2s", default_
 
 /** Closed refusal codes for a read login that row-level security would not bind. */
 export type ReaderRoleRefusal =
-  | "reader_role_unknown" | "reader_role_session_user" | "reader_role_current_user" | "reader_role_set_role"
+  | "reader_role_unknown" | "reader_role_session_user" | "reader_role_current_user" | "reader_role_set_role" | "reader_role_backend_user"
   | "reader_role_system_user" | "reader_role_superuser" | "reader_role_bypassrls" | "reader_role_attributes"
   | "reader_role_membership" | "reader_role_members" | "reader_role_settings";
 
@@ -177,7 +177,8 @@ export const READER_LOGIN_SQL = `SELECT session_user::text AS session_user, curr
   current_setting('default_transaction_read_only') AS default_transaction_read_only,
   r.rolsuper, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolinherit, r.rolcanlogin, r.rolconfig,
   (SELECT count(*)::int FROM pg_auth_members m WHERE m.member = r.oid) AS memberships,
-  (SELECT count(*)::int FROM pg_auth_members m WHERE m.roleid = r.oid) AS members
+  (SELECT count(*)::int FROM pg_auth_members m WHERE m.roleid = r.oid) AS members,
+  (SELECT a.usename::text FROM pg_catalog.pg_stat_activity a WHERE a.pid = pg_catalog.pg_backend_pid()) AS backend_user
   FROM pg_roles r WHERE r.rolname = current_user`;
 /**
  * PG16+ only: system_user, inherit_option and set_option do not exist earlier. LEFT JOINs, so an edge
@@ -220,6 +221,10 @@ export function readerLoginRefusal(login: Record<string, unknown> | undefined, p
   if (login.role_setting !== "none") return "reader_role_set_role";
   const version = login.server_version;
   if (typeof version !== "number" || !Number.isInteger(version) || version < 100000) return "reader_role_unknown";
+  // The login this backend authenticated as (fixed at authentication, every version). A superuser's
+  // SET SESSION AUTHORIZATION makes session_user and current_user the role with role 'none'; on PG15,
+  // which has no system_user, only usename shows the real login (#366's recorded 15.19/16.15/17.11 rows).
+  if (login.backend_user !== READ_API_ROLE) return "reader_role_backend_user";
   const modern = version >= 160000;
   if (modern) {
     if (!pg16) return "reader_role_unknown";
@@ -256,7 +261,8 @@ export function readerLoginRefusal(login: Record<string, unknown> | undefined, p
  * Reader admission (the self-host service, and any portable Postgres search binding). Tenant isolation
  * on sessions.session_index and the search tables is row-level security, which a superuser, BYPASSRLS
  * or otherwise different login skips or changes without any error. So the pool's session must be a
- * real login as exactly bulls96_read_api (session_user, current_user, no SET ROLE, and on PG16+
+ * real login as exactly bulls96_read_api (session_user, current_user, no SET ROLE, this backend's
+ * pg_stat_activity usename so no SET SESSION AUTHORIZATION, and on PG16+
  * system_user), with the bootstrap's role shape, no membership edge in either direction (but the
  * Supabase creator edge) and the pinned settings. Any mismatch or failure to read the rows refuses
  * startup; the error names the failed property only. A query error propagates unchanged.

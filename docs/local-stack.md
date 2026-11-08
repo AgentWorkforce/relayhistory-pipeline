@@ -33,7 +33,8 @@ binding; anything else fails startup), and it also requires
 role's grants have run. The read login must be a real login as exactly
 `bulls96_read_api`, shaped as `supabase/bootstrap/session_read_api_role.sql`
 provisions it (both search tables have forced tenant row-level security). The
-service checks the session identity (no `SET ROLE`; `system_user` on PG16+),
+service checks the session identity (no `SET ROLE` or `SET SESSION
+AUTHORIZATION`: the backend's `pg_stat_activity.usename`; `system_user` on PG16+),
 the role's attributes, its memberships in both directions and its pinned
 settings at startup, and refuses otherwise (`reader_role_<property>`). See "Postgres search prerequisites" under
 "Self-host SERVICE" in `docs/session-read-api-design.md`.
