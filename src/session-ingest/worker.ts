@@ -53,7 +53,7 @@ import type { StageLatencyFields } from "./deliver.ts";
 import type { WriteTarget } from "./writer.ts";
 import { routingFlag } from "./babysitter-retention.ts";
 import { asyncAdmissionMode, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
-import { admitMessage } from "./admission-consumer.ts";
+import { admitMessage, type AdmissionAction } from "./admission-consumer.ts";
 import { lockAlertFields } from "./app.ts";
 import type { DeliverDeps } from "./deliver.ts";
 
@@ -324,7 +324,7 @@ export async function admitQueueBatch(messages: QueueMessage[], env: IngestWorke
     for (const message of messages) {
       const started = Date.now();
       const r = await admitMessage({ mode: settings.asyncAdmission ?? "off", deliver, custodySource: custody.custodySource, decompress: zstd }, message.body, message.attempts ?? 1)
-        .catch((error: unknown) => ({ action: "retry" as const, delaySeconds: 300, code: "admission_failed", error }));
+        .catch((error: unknown): AdmissionAction => ({ action: "retry", delaySeconds: 300, code: "admission_failed", error }));
       if (r.action === "ack") {
         log.info("session ingest admission", { route: "ingest.admission", outcome: r.outcome, error_code: r.code, duration_ms: Date.now() - started, ...(r.lagMs !== undefined ? { offset: r.lagMs } : {}), attempt: message.attempts ?? 1 });
         message.ack();

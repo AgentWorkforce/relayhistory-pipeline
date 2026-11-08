@@ -65,7 +65,7 @@ export interface AdmissionMessage {
 }
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder("utf-8", { fatal: true });
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 const sha256Hex = (value: string) => createHash("sha256").update(value).digest("hex");
 const HEX64 = /^[0-9a-f]{64}$/;
 
