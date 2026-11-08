@@ -115,7 +115,7 @@ describe("unified sessions function-boundary generator", () => {
       expect(down).toContain(body);
       expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(body));
     }
-    expect(down).not.toContain("lazy-native-slot-v1");
+    expect(down).not.toContain("lazy-native-origin-v1");
     expect(down).toContain("pg_advisory_xact_lock(961996,1)");
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");

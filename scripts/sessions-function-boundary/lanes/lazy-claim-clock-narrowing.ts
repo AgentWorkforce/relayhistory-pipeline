@@ -1,4 +1,4 @@
-/** Replacement-only lane (slot 043500): the lazy claim reads the seat clock under KEY SHARE + per-key advisory locks. ACLs unchanged. */
+/** Replacement-only lane (slot 043500): the lazy claim reads the seat clock under KEY SHARE + one advisory lock per (org, workspace, origin). ACLs unchanged. */
 import { createHash } from "node:crypto";
 import type { LaneContext, LaneManifest } from "../types.ts";
 

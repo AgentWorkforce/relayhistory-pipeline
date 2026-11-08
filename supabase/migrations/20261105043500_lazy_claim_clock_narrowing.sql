@@ -7,8 +7,9 @@
 -- REVOKE ALL); every clock UPDATE sets last_seat only.
 --
 -- Changes (everything else in both functions is verbatim from 20261104055000):
---  * ingest_lazy_records: fail closed (40001) outside READ COMMITTED; clock FOR KEY SHARE; one sorted
---    pg_advisory_xact_lock per native slot key before any write; slot INSERT ON CONFLICT DO NOTHING + 40001 guard.
+--  * ingest_lazy_records: fail closed (40001) outside READ COMMITTED; clock FOR KEY SHARE; exactly ONE
+--    pg_advisory_xact_lock per claim, keyed by (org, workspace, origin), before any write; slot INSERT
+--    ON CONFLICT DO NOTHING + 40001 guard.
 --  * ingest_lazy_ack_batch: the suppressed receipt returns under KEY SHARE (below the guard/fence/seal checks,
 --    above the exclusive clock lock), so a claim never upgrades KEY SHARE -> FOR UPDATE.
 -- Lock-mode conflicts on the clock row: KEY SHARE conflicts only with FOR UPDATE (set_live, control_changed,
@@ -28,11 +29,11 @@ CREATE OR REPLACE FUNCTION sessions.ingest_lazy_records(p jsonb) RETURNS void
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lazy_records$
 DECLARE w jsonb;v_org text;v_ws text;v_user text;v_origin text;v_items jsonb;v_reset bigint;
  c sessions.ingest_receipt_seat_clock%ROWTYPE;slot sessions.ingest_lazy_native_slots%ROWTYPE;
- z record;v_slot_lock record;v_key text;v_material jsonb;cur jsonb;v_legacy text;v_meta jsonb;v_fence bigint;seq jsonb;
+ z record;v_key text;v_material jsonb;cur jsonb;v_legacy text;v_meta jsonb;v_fence bigint;seq jsonb;
 BEGIN
  w:=p#>'{custody,witness}';v_org:=p#>>'{tenant,orgId}';v_ws:=p#>>'{tenant,workspaceId}';v_user:=p#>>'{tenant,userId}';
  v_origin:=p->>'originId';v_items:=sessions.ingest_records(p->'records');
- -- 043500: the per-key advisory wait below is only sound when the re-check after it takes a FRESH snapshot,
+ -- 043500: the origin advisory wait below is only sound when the re-check after it takes a FRESH snapshot,
  -- i.e. READ COMMITTED (every caller uses it). Under REPEATABLE READ/SERIALIZABLE it would read the
  -- pre-wait snapshot, so fail closed (retryable) instead of relying on the ON CONFLICT guard alone.
  IF current_setting('transaction_isolation')<>'read committed' THEN
@@ -45,13 +46,16 @@ BEGIN
  -- another claim, so concurrent claims of different users stop queueing on the singleton row.
  SELECT * INTO STRICT c FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR KEY SHARE;
  -- 043500: the native slot key has no user, and the per-user fence does not serialize two users racing for
- -- one absent slot (FOR UPDATE on a missing row locks nothing). Take one transaction advisory lock per native
- -- key of the batch (same key expression as the loop below), in COLLATE "C" order (deadlock-free), BEFORE any
- -- write of this function. A superset is locked (records later skipped by a privacy fence too); harmless.
- FOR v_slot_lock IN SELECT x.key FROM(SELECT DISTINCT encode(sha256(convert_to(jsonb_build_array('global-native-custody-v1',v_org,v_ws,v_origin,r.record_id)::text,'UTF8')),'hex') AS key
-  FROM jsonb_to_recordset(v_items)r(record_id text))x ORDER BY x.key COLLATE "C" LOOP
-  PERFORM pg_advisory_xact_lock(hashtextextended(jsonb_build_array('96bulls:lazy-native-slot-v1',v_slot_lock.key)::text,0));
- END LOOP;
+ -- one absent slot (FOR UPDATE on a missing row locks nothing). The slot key (loop below) is
+ -- sha256(['global-native-custody-v1',org,ws,origin,record_id]), so every claim that can race for one absent
+ -- slot shares (org, ws, origin): take exactly ONE transaction advisory lock per claim on that triple, BEFORE
+ -- any write of this function. Bounded footprint: one shared lock-table entry per claim, never one per record
+ -- (a per-key lock for a 500-record batch could exhaust max_locks_per_transaction*(max_connections+
+ -- max_prepared_transactions) under concurrency -> 53200 for unrelated work). Same-origin uploads are
+ -- sequential by the uploader, so this serializes nothing that is parallel today; different origins never wait.
+ -- Lock order for every caller: per-user fence -> clock KEY SHARE -> origin advisory lock; a single advisory
+ -- lock per transaction cannot form a cycle among claims.
+ PERFORM pg_advisory_xact_lock(hashtextextended(jsonb_build_array('96bulls:lazy-native-origin-v1',v_org,v_ws,v_origin)::text,0));
  SELECT count(*) INTO v_reset FROM sessions.upload_resets WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
  -- Source true is an additional authoritative suppression. False never clears
  -- a target fence; only the ordered control may re-enable a scope.

@@ -174,7 +174,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     for (const body of originalBodies(text("supabase/migrations/20261104055000_lazy_current_custody.sql"))) await pool.query(body);
     try { expect(await run()).toMatchObject({ ok: false, code: "55P03" }); }
     finally { await pool.query(fixed); }
-    expect((await pool.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.ingest_lazy_records(jsonb)'::regprocedure")).rows[0].prosrc).toContain("lazy-native-slot-v1");
+    expect((await pool.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.ingest_lazy_records(jsonb)'::regprocedure")).rows[0].prosrc).toContain("lazy-native-origin-v1");
   }, 60000);
 
   test("A2: same owned key -- Y waits on the per-key advisory lock, then gets P0W01 (never 23505/40001); one slot, one custody row", async () => {

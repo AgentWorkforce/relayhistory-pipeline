@@ -65,7 +65,7 @@ test("043500 is applied: lazy_records holds KEY SHARE + the per-key advisory nam
   const f = await fixture();
   const src = async (sig: string) => (await f.db.query<{ s: string; d: boolean }>(`SELECT prosrc s,prosecdef d FROM pg_proc WHERE oid='sessions.${sig}'::regprocedure`)).rows[0]!;
   const records = await src("ingest_lazy_records(jsonb)"), ack = await src("ingest_lazy_ack_batch(jsonb)");
-  expect(records.s).toContain("lazy-native-slot-v1");
+  expect(records.s).toContain("lazy-native-origin-v1");
   expect(records.s).toContain("WHERE singleton FOR KEY SHARE;");
   expect(records.s).not.toContain("WHERE singleton FOR UPDATE;");
   expect(records.s.indexOf("pg_advisory_xact_lock")).toBeLessThan(records.s.indexOf("INSERT INTO sessions.ingest_fence_versions"));
