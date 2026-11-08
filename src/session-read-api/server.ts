@@ -9,7 +9,8 @@
  * the service entry's rules, once at startup, so a bad configuration fails the
  * process instead of the first request. Search is selected by
  * SEARCH_INDEX_BACKEND (default postgres here, so no ClickHouse or Lambda is
- * needed; clickhouse keeps the hosted binding); see selfhostSearchComposition.
+ * needed; clickhouse keeps the hosted binding; opensearch is the managed AWS
+ * index); see selfhostSearchComposition.
  * With LOCKER_BUCKET set, timing, turns, metadata and catalog read canonical
  * S3 (service-canonical.ts); READ_API_AUTH_MODE=relaycontrol_only removes the
  * RelayAuth verifier entirely (lambda.ts readApiAuthConfig, auth.ts).
@@ -24,6 +25,7 @@ import type { AddressInfo } from "node:net";
 import { Hono } from "hono";
 import { errorFields, log } from "../shared/log.ts";
 import { createPostgresSearchComposition, type SearchComposition } from "../shared/search-composition.ts";
+import { createOpenSearchSearchComposition } from "../shared/opensearch-composition.ts";
 import { parseCompleteSince } from "./config.ts";
 import { readApiAuthMode, readApiCorsOrigins, readAppFromSecret, serviceSearchBackend } from "./lambda.ts";
 import { TOKEN_ROUTE_PATHS } from "./self-issued.ts";
@@ -42,10 +44,13 @@ export type ReadAppBuilder = (secret: string, env: NodeJS.ProcessEnv) => Promise
  * the variable only.
  */
 export function selfhostSearchComposition(env: NodeJS.ProcessEnv): SearchComposition | undefined {
-  if (serviceSearchBackend(env) !== "postgres") return undefined;
+  const backend = serviceSearchBackend(env);
+  if (backend === "clickhouse") return undefined;
   const backendId = env[SEARCH_BACKEND_ID_VAR]?.trim();
-  if (!backendId) throw new Error(`96bulls: SEARCH_INDEX_BACKEND=postgres needs ${SEARCH_BACKEND_ID_VAR}`);
-  return createPostgresSearchComposition({ backendId, fromMs: parseCompleteSince(env.READ_API_COMPLETE_SINCE) });
+  if (!backendId) throw new Error(`96bulls: SEARCH_INDEX_BACKEND=${backend} needs ${SEARCH_BACKEND_ID_VAR}`);
+  const fromMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
+  if (backend === "opensearch") return createOpenSearchSearchComposition({ env, backendId, fromMs });
+  return createPostgresSearchComposition({ backendId, fromMs });
 }
 
 /** The production builder: the Lambda's assembly under the service entry's rules, with the selected search composition. */

@@ -76,6 +76,9 @@ BEGIN
     ELSIF v_row.rel = 'sessions.session_index' THEN
       IF v_row.sel THEN v_problems := array_append(v_problems, ('whole-table SELECT on sessions.session_index')::text); END IF;
       IF NOT v_row.col_sel THEN v_problems := array_append(v_problems, ('no column SELECT on sessions.session_index')::text); END IF;
+    ELSIF v_row.rel = 'sessions.session_directory' THEN
+      -- Optional (a role from before this grant still passes); columns are pinned in the loop below.
+      IF v_row.sel THEN v_problems := array_append(v_problems, ('whole-table SELECT on sessions.session_directory')::text); END IF;
     ELSIF v_row.sel OR v_row.col_sel THEN
       v_problems := array_append(v_problems, (format('SELECT on %s', v_row.rel))::text);
     END IF;
@@ -91,6 +94,15 @@ BEGIN
                                        'storage_provider', 'bucket', 'manifest_key', 'content_sha256', 'raw_format', 'revision')) THEN
       v_problems := array_append(v_problems, (format('column %s: SELECT is %s', v_row.attname, CASE WHEN v_row.sel THEN 'granted' ELSE 'missing' END))::text);
     END IF;
+  END LOOP;
+  FOR v_row IN
+    SELECT a.attname
+      FROM pg_attribute a
+     WHERE a.attrelid = 'sessions.session_directory'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+       AND has_column_privilege(v_role.oid, 'sessions.session_directory'::regclass, a.attnum, 'SELECT')
+       AND a.attname NOT IN ('org_id', 'workspace_id', 'harness', 'session_id', 'event_projection_ready', 'event_projection_epoch')
+  LOOP
+    v_problems := array_append(v_problems, (format('column %s of sessions.session_directory: SELECT is granted', v_row.attname))::text);
   END LOOP;
   -- No other callable sessions definer function: the claim-bound RPCs refuse other roles
   -- anyway, but a definer function without such a check must not be reachable. The two
@@ -131,7 +143,12 @@ BEGIN
   END IF;
   FOR v_row IN
     SELECT p.polrelid::regclass::text AS rel, p.polname FROM pg_policy p
-     WHERE v_role.oid = ANY(p.polroles) AND p.polname <> 'session_index_read_api'
+     WHERE v_role.oid = ANY(p.polroles)
+       AND NOT (p.polname = 'session_index_read_api' AND p.polrelid = 'sessions.session_index'::regclass)
+       AND NOT (p.polname = 'session_directory_read_api' AND p.polrelid = 'sessions.session_directory'::regclass
+                AND p.polpermissive AND p.polcmd = 'r' AND p.polroles = ARRAY[v_role.oid]
+                AND pg_get_expr(p.polqual, p.polrelid) LIKE '%current_setting(''bulls96_read.org_id''::text, true)%'
+                AND pg_get_expr(p.polqual, p.polrelid) LIKE '%current_setting(''bulls96_read.workspace_id''::text, true)%')
   LOOP
     v_problems := array_append(v_problems, (format('unapproved policy %s on %s', v_row.polname, v_row.rel))::text);
   END LOOP;

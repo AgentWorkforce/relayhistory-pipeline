@@ -201,6 +201,8 @@ export interface TurnsDeps {
   source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows>;
   /** Below Cloud's 4 s read timeout. Default 3000. */
   deadlineMs?: number;
+  /** READ_API_TURNS_ASSUME_NO_LEGACY: this deployment has no Neon source, so no legacy coverage marker is required. */
+  assumeNoLegacy?: boolean;
 }
 
 export interface TimingDeps {
@@ -1119,7 +1121,7 @@ export function createReadApi(deps: ReadApiDeps) {
           }, turns.deadlineMs ?? 3000);
         }),
       ]);
-      return { rows: turnRows(scope, snapshots, source), erased: false, buffered: false };
+      return { rows: turnRows(scope, snapshots, source, { assumeNoLegacy: turns.assumeNoLegacy === true }), erased: false, buffered: false };
     } finally {
       clearTimeout(timer);
     }

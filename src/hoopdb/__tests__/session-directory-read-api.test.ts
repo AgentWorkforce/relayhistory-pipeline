@@ -251,6 +251,23 @@ describe("list_session_directory_for / session_directory_activity_for", () => {
     expect(await code(asReadApi(db, ["org-a", "ws-a"], () => listFor(db, { agent: "lead" })))).toBe("0A000");
   }, 120_000);
 
+  test("the read role's directory access is the epoch columns only, tenant-bound; the verifier refuses anything wider", async () => {
+    const db = await database();
+    await db.exec(VERIFY);
+    const verifyFails = async (setup: string, undo: string) => {
+      await db.exec(setup);
+      await expect(db.exec(VERIFY)).rejects.toThrow(/approved shape/);
+      await db.exec(undo);
+      await db.exec(VERIFY);
+    };
+    await verifyFails("GRANT SELECT (title) ON sessions.session_directory TO bulls96_read_api", "REVOKE SELECT (title) ON sessions.session_directory FROM bulls96_read_api");
+    await verifyFails("GRANT SELECT ON sessions.session_directory TO bulls96_read_api", "REVOKE SELECT ON sessions.session_directory FROM bulls96_read_api; GRANT SELECT (org_id, workspace_id, harness, session_id, event_projection_ready, event_projection_epoch) ON sessions.session_directory TO bulls96_read_api");
+    await verifyFails(
+      "DROP POLICY session_directory_read_api ON sessions.session_directory; CREATE POLICY session_directory_read_api ON sessions.session_directory FOR SELECT TO bulls96_read_api USING (true)",
+      "DROP POLICY session_directory_read_api ON sessions.session_directory; CREATE POLICY session_directory_read_api ON sessions.session_directory FOR SELECT TO bulls96_read_api USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))",
+    );
+  }, 120_000);
+
   test("ACLs are exactly the manifest's, and the read role verifier passes with them", async () => {
     const db = await database();
     const manifest = JSON.parse(read("src/hoopdb/sessions-function-acl.json")).functions as Record<string, string[]>;
