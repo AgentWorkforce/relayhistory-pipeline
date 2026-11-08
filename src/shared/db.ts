@@ -1,6 +1,6 @@
 /** HoopDb access: a pg Pool that satisfies the vendored SqlExecutor, plus readiness gates. */
 import { readFileSync } from "node:fs";
-import { adoptRenamedLedgerRows, MIGRATION_RENAME_ALIASES, RUNTIME_APPLICATION_FUNCTIONS } from "../hoopdb/migrate-guards.ts";
+import { resolveRenamedLedger, RUNTIME_APPLICATION_FUNCTIONS } from "../hoopdb/migrate-guards.ts";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
@@ -90,7 +90,7 @@ export interface ExpectedSchema {
   generation: string;
   /**
    * Each schema step's file sha256 by name (expectedSchema()). Readiness uses it only
-   * to adopt MIGRATION_RENAME_ALIASES rows; absent, no renamed row is adopted.
+   * for resolveRenamedLedger; absent, no renamed row is adopted.
    */
   shas?: Record<string, string>;
   /** Exact database mode bound into the role verifier; absent/invalid never enables compatibility exceptions. */
@@ -208,22 +208,18 @@ export async function schemaVerdict(
       await tx.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
       await tx.query("SELECT set_config('hoopdb.db_mode', $1, true)", [expected.dbMode ?? "unspecified"]);
       stage = "ledger";
-      let have = new Set(
-        (await tx.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((r) => r.name),
+      // The physical ledger goes through the migrator's own rename-alias verdict
+      // (resolveRenamedLedger, in memory, never a write): exact original-name rows count
+      // as their release names; any alias state the migrator refuses (collision, wrong
+      // sha, missing repair, original sha under the release name) leaves it missing.
+      const physical = new Map(
+        (await tx.query<{ name: string; sha256: string }>("SELECT name, sha256 FROM sessions.__96bulls_migrations")).rows
+          .map((r) => [r.name, r.sha256]),
       );
-      // Current ledgers keep the cheap query above. A ledger holding original names of
-      // renamed migrations reads their recorded shas and applies the migrator's exact
-      // adoption in memory (never a write); unadopted rows leave the release name missing.
-      const originals = MIGRATION_RENAME_ALIASES.map((a) => a.ledger_name).filter((n) => have.has(n));
-      if (originals.length) {
-        const ledger = new Map([...have].map((n) => [n, ""]));
-        for (const r of (await tx.query<{ name: string; sha256: string }>(
-          "SELECT name, sha256 FROM sessions.__96bulls_migrations WHERE name = ANY($1::text[])", [originals],
-        )).rows) ledger.set(r.name, r.sha256);
-        const shas = expected.shas ?? {};
-        adoptRenamedLedgerRows(ledger, (n) => (Object.hasOwn(shas, n) ? shas[n] : undefined));
-        have = new Set(ledger.keys());
-      }
+      const shas = expected.shas ?? {};
+      const have = new Set(
+        resolveRenamedLedger(physical, (n) => (Object.hasOwn(shas, n) ? shas[n] : undefined)).effective.keys(),
+      );
       // The role shim, bootstrap and verify steps are not schema; the marker covers verify.
       const missing = expected.names.filter((n) => !isPrerequisiteStep(n) && !have.has(n));
       if (missing.length) return { ok: false, reason: "schema_pending", count: missing.length };

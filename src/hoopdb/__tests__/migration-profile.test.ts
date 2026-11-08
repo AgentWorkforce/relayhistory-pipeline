@@ -4,7 +4,7 @@
  */
 import { afterEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
 import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
@@ -20,7 +20,7 @@ import {
   isSupabaseCreatorEdge,
   isSupabasePublicTemp,
   isRuntimeWorkloadEdge,
-  adoptRenamedLedgerRows,
+  resolveRenamedLedger,
   renameAliasRepairMissing,
   inventoryOf,
   MIGRATION_CHECKSUM_ALIASES,
@@ -664,10 +664,11 @@ test("generation() is exactly the migration and verifier file bytes, with no reg
 });
 
 describe("append-only renamed migrations: adopted in memory only when every checksum matches", () => {
-  const fileSha = (name: string) =>
-    createHash("sha256")
-      .update(readFileSync(join(root, "supabase/migrations", name.slice("upstream:".length))))
-      .digest("hex");
+  /** The planned file's sha256; undefined for a name this tree has no file for (the migrator's plan lookup). */
+  const fileSha = (name: string) => {
+    const path = join(root, "supabase/migrations", name.slice("upstream:".length));
+    return existsSync(path) ? createHash("sha256").update(readFileSync(path)).digest("hex") : undefined;
+  };
   const [event, ingest] = MIGRATION_RENAME_ALIASES;
   const original = () =>
     new Map<string, string>([
@@ -705,6 +706,9 @@ describe("append-only renamed migrations: adopted in memory only when every chec
     expect(ingest!.repair > ingest!.migration && ingest!.repair > event!.migration).toBe(true);
   });
 
+  /** Codes of each refusal, by alias index. */
+  const codes = (r: ReturnType<typeof resolveRenamedLedger>) => r.refusals.map((x) => [x.alias.migration, x.code]);
+
   test("the ingest row is not adopted unless its forward repair is planned with the pinned sha", () => {
     for (const repairSha of ["f".repeat(64), undefined]) {
       const ledger = original();
@@ -712,55 +716,87 @@ describe("append-only renamed migrations: adopted in memory only when every chec
       const sha = (name: string) => (name === ingest!.repair ? repairSha : fileSha(name));
       expect(renameAliasRepairMissing(ingest!, sha)).toBe(true);
       expect(renameAliasRepairMissing(event!, sha)).toBe(false);
-      expect(adoptRenamedLedgerRows(ledger, sha)).toEqual([event!]);
-      expect(ledger.get(ingest!.ledger_name)).toBe(before.get(ingest!.ledger_name));
-      expect(ledger.has(ingest!.migration)).toBe(false);
+      const r = resolveRenamedLedger(ledger, sha);
+      expect(r.adopted).toEqual([event!]);
+      expect(codes(r)).toEqual([[ingest!.migration, "ledger_alias_repair_missing"]]);
+      expect(r.effective.get(ingest!.ledger_name)).toBe(before.get(ingest!.ledger_name));
+      expect(r.effective.has(ingest!.migration)).toBe(false);
+      expect(ledger).toEqual(before);
     }
     expect(renameAliasRepairMissing(ingest!, fileSha)).toBe(false);
   });
 
-  test("both original rows are adopted under their release names, keeping the recorded sha", () => {
+  test("both original rows are adopted under their release names, with the release file sha", () => {
     const ledger = original();
-    expect(adoptRenamedLedgerRows(ledger, fileSha)).toEqual([event!, ingest!]);
-    expect(ledger).toEqual(
+    const before = new Map(ledger);
+    const r = resolveRenamedLedger(ledger, fileSha);
+    expect(r.adopted).toEqual([event!, ingest!]);
+    expect(r.refusals).toEqual([]);
+    expect(r.effective).toEqual(
       new Map([
         ["upstream:20261102000000_session_briefs.sql", "a".repeat(64)],
-        [event!.migration, event!.ledger_sha],
-        [ingest!.migration, ingest!.ledger_sha],
+        [event!.migration, event!.accepted_as_alias_of],
+        [ingest!.migration, ingest!.accepted_as_alias_of],
       ]),
     );
+    expect(ledger).toEqual(before); // the physical map is never modified
   });
 
-  test("an original row with another sha (an earlier draft) is left untouched", () => {
+  test("an original row with another sha (an earlier draft) refuses as ledger_unknown_step", () => {
     const ledger = original();
     ledger.set(ingest!.ledger_name, "d".repeat(64));
-    const before = new Map(ledger);
-    expect(adoptRenamedLedgerRows(ledger, fileSha)).toEqual([event!]);
-    expect(ledger.get(ingest!.ledger_name)).toBe(before.get(ingest!.ledger_name));
-    expect(ledger.has(ingest!.migration)).toBe(false);
+    const r = resolveRenamedLedger(ledger, fileSha);
+    expect(r.adopted).toEqual([event!]);
+    expect(codes(r)).toEqual([[ingest!.migration, "ledger_unknown_step"]]);
+    expect(r.effective.get(ingest!.ledger_name)).toBe("d".repeat(64));
+    expect(r.effective.has(ingest!.migration)).toBe(false);
   });
 
-  test("a release file with another sha (a future edit) leaves the map untouched", () => {
+  test("a release file with another sha (a future edit) or not planned adopts nothing", () => {
     const ledger = original();
-    const before = new Map(ledger);
-    expect(adoptRenamedLedgerRows(ledger, () => "e".repeat(64))).toEqual([]);
-    expect(adoptRenamedLedgerRows(ledger, () => undefined)).toEqual([]);
-    expect(ledger).toEqual(before);
+    const originals = new Set<string>(MIGRATION_RENAME_ALIASES.map((a) => a.ledger_name));
+    for (const sha of [(n: string) => (originals.has(n) ? undefined : "e".repeat(64)), () => undefined]) {
+      const r = resolveRenamedLedger(ledger, sha);
+      expect(r.adopted).toEqual([]);
+      expect(r.refusals.map((x) => x.code)).toEqual(["ledger_unknown_step", "ledger_unknown_step"]);
+      expect(r.effective).toEqual(ledger);
+    }
   });
 
-  test("a ledger that already records the release name is left untouched", () => {
-    const ledger = original();
-    ledger.set(event!.migration, event!.accepted_as_alias_of);
-    ledger.set(ingest!.migration, ingest!.accepted_as_alias_of);
-    const before = new Map(ledger);
-    expect(adoptRenamedLedgerRows(ledger, fileSha)).toEqual([]);
-    expect(ledger).toEqual(before);
+  test("both the original and the release name recorded is a collision, whatever the shas", () => {
+    for (const originalSha of [event!.ledger_sha, "d".repeat(64)])
+      for (const releaseSha of [event!.accepted_as_alias_of, event!.ledger_sha, "d".repeat(64)]) {
+        const ledger = original();
+        ledger.set(event!.ledger_name, originalSha);
+        ledger.set(event!.migration, releaseSha);
+        const r = resolveRenamedLedger(ledger, fileSha);
+        expect(r.adopted).toEqual([ingest!]);
+        expect(codes(r)).toEqual([[event!.migration, "ledger_alias_collision"]]);
+        expect(r.effective.has(event!.migration)).toBe(false);
+      }
   });
 
-  test("the checksum guard accepts exactly the rename pair under the release name", () => {
+  test("the release name physically carrying the original sha is hand-edited history: migration_changed", () => {
+    const ledger = new Map([[event!.migration, event!.ledger_sha], [ingest!.migration, ingest!.accepted_as_alias_of]]);
+    const r = resolveRenamedLedger(ledger, fileSha);
+    expect(r.adopted).toEqual([]);
+    expect(codes(r)).toEqual([[event!.migration, "migration_changed"]]);
+    expect(r.effective).toEqual(new Map([[ingest!.migration, ingest!.accepted_as_alias_of]]));
+  });
+
+  test("a current ledger passes through unchanged, and a plan holding the original name skips the alias", () => {
+    const current = new Map(MIGRATION_RENAME_ALIASES.map((a) => [a.migration as string, a.accepted_as_alias_of as string]));
+    expect(resolveRenamedLedger(current, fileSha)).toEqual({ effective: current, adopted: [], refusals: [] });
+    const old = original();
+    const oldPlan = (name: string) => (name === event!.ledger_name ? event!.ledger_sha : name === ingest!.ledger_name ? ingest!.ledger_sha : undefined);
+    expect(resolveRenamedLedger(old, oldPlan)).toEqual({ effective: old, adopted: [], refusals: [] });
+  });
+
+  test("the checksum guard never accepts an original sha under the release name (only adoption does)", () => {
     for (const a of MIGRATION_RENAME_ALIASES) {
-      expect(migrationChecksumMatches(a.migration, a.ledger_sha, a.accepted_as_alias_of)).toBe(true);
-      expect(migrationChecksumAlias(a.migration, a.ledger_sha, a.accepted_as_alias_of)).toEqual(a);
+      expect(migrationChecksumMatches(a.migration, a.ledger_sha, a.accepted_as_alias_of)).toBe(false);
+      expect(migrationChecksumAlias(a.migration, a.ledger_sha, a.accepted_as_alias_of)).toBeUndefined();
+      expect(migrationChecksumMatches(a.migration, a.accepted_as_alias_of, a.accepted_as_alias_of)).toBe(true);
       expect(migrationChecksumMatches(a.ledger_name, a.ledger_sha, a.accepted_as_alias_of)).toBe(false);
       expect(migrationChecksumMatches(a.migration, "d".repeat(64), a.accepted_as_alias_of)).toBe(false);
       expect(migrationChecksumMatches(a.migration, a.ledger_sha, "e".repeat(64))).toBe(false);
@@ -808,10 +844,10 @@ describe("append-only renamed migrations: adopted in memory only when every chec
       [event!, ingest!].map(({ ledger_name, ledger_sha, migration, accepted_as_alias_of }) =>
         ({ ledger_name, ledger_sha, migration, accepted_as_alias_of })),
     );
+    // Adoption already carries the release sha: no checksum alias is involved for them.
     const accepted = lines.filter((l) => l.message === "accepted historical migration checksum");
-    expect(accepted.map((l) => l.migration)).toEqual(
-      expect.arrayContaining([event!.migration, ingest!.migration]),
-    );
+    expect(accepted.map((l) => l.migration)).not.toContain(event!.migration);
+    expect(accepted.map((l) => l.migration)).not.toContain(ingest!.migration);
     // The original rows stay exactly as recorded; only the marker generation is rewritten.
     expect((await snapshot(db)).ledger).toEqual(before.ledger);
   });
@@ -840,6 +876,47 @@ describe("append-only renamed migrations: adopted in memory only when every chec
     );
     expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: false, reason: "schema_pending", count: 1 });
     expect((await snapshot(db)).marker).toEqual(before.marker);
+  });
+
+  test("CLI authority at each original or current rename version refuses without ledger or marker writes", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    await recordedUnderOriginalNames(db);
+    await db.exec("CREATE SCHEMA supabase_migrations; CREATE TABLE supabase_migrations.schema_migrations(version text PRIMARY KEY)");
+    const before = await snapshot(db);
+    for (const alias of MIGRATION_RENAME_ALIASES) {
+      for (const name of [alias.ledger_name, alias.migration]) {
+        const version = name.slice("upstream:".length).split("_")[0]!;
+        await db.query("INSERT INTO supabase_migrations.schema_migrations(version) VALUES($1)", [version]);
+        expect((await failure(runMigrations(client(db), { profile: LOCAL })))?.code).toBe("mixed_migration_authority");
+        expect(await snapshot(db)).toEqual(before);
+        expect((await db.query("SELECT version FROM supabase_migrations.schema_migrations")).rows).toEqual([{ version }]);
+        await db.query("DELETE FROM supabase_migrations.schema_migrations WHERE version=$1", [version]);
+      }
+    }
+    expect((await runMigrations(client(db), { profile: LOCAL })).applied).toBe(0);
+    expect((await snapshot(db)).ledger).toEqual(before.ledger);
+  });
+
+  test("readiness refuses original/current collisions and bad original hashes without changing physical history or marker", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const expected = await expectedSchema();
+    expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: true });
+    const currentOnly = await snapshot(db);
+    for (const alias of MIGRATION_RENAME_ALIASES) {
+      for (const sha of [alias.ledger_sha, "0".repeat(64)]) {
+        await db.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)", [alias.ledger_name, sha]);
+        const before = await snapshot(db);
+        expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: false, reason: "schema_pending", count: 1 });
+        expect((await failure(runMigrations(client(db), { profile: LOCAL })))?.code).toBe("ledger_alias_collision");
+        expect(await snapshot(db)).toEqual(before);
+        // Removing only our injected fixture row restores the unchanged current-only baseline.
+        await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1", [alias.ledger_name]);
+        expect(await snapshot(db)).toEqual(currentOnly);
+        expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: true });
+      }
+    }
   });
 
   test("an exact original ingest row without its exact forward repair refuses as ledger_alias_repair_missing, nothing marked", async () => {
@@ -871,6 +948,30 @@ describe("append-only renamed migrations: adopted in memory only when every chec
     expect(error?.message).toContain(ingest!.ledger_name);
     expect(error?.message).not.toContain(event!.ledger_name);
     expect(await snapshot(db)).toEqual(before);
+  });
+
+  test("a release-name row carrying the original sha (hand-edited history) refuses as migration_changed, nothing written, readiness pending", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const expected = await expectedSchema();
+    expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: true });
+    for (const a of [event!, ingest!]) {
+      await db.query(
+        "UPDATE sessions.__96bulls_migrations SET sha256 = $1 WHERE name = $2",
+        [a.ledger_sha, a.migration],
+      );
+      const before = await snapshot(db);
+      const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+      expect(error?.code).toBe("migration_changed");
+      expect(error?.message).toContain(a.migration);
+      expect(await snapshot(db)).toEqual(before);
+      expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: false, reason: "schema_pending", count: 1 });
+      await db.query(
+        "UPDATE sessions.__96bulls_migrations SET sha256 = $1 WHERE name = $2",
+        [a.accepted_as_alias_of, a.migration],
+      );
+      expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: true });
+    }
   });
 });
 

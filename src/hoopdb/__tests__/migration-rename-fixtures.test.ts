@@ -5,17 +5,18 @@
  */
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { adoptRenamedLedgerRows, MIGRATION_RENAME_ALIASES } from "../migrate-guards.ts";
+import { MIGRATION_RENAME_ALIASES, resolveRenamedLedger } from "../migrate-guards.ts";
 
 const root = join(import.meta.dir, "../../..");
 const fixtures = join(import.meta.dir, "fixtures/released-migration-history");
 const ledger = JSON.parse(readFileSync(join(fixtures, "ledger.json"), "utf8")) as { name: string; sha256: string }[];
-const fileSha = (name: string) =>
-  createHash("sha256")
-    .update(readFileSync(join(root, "supabase/migrations", name.slice("upstream:".length))))
-    .digest("hex");
+/** The planned file's sha256; undefined for a name this tree has no file for (the migrator's plan lookup). */
+const fileSha = (name: string) => {
+  const path = join(root, "supabase/migrations", name.slice("upstream:".length));
+  return existsSync(path) ? createHash("sha256").update(readFileSync(path)).digest("hex") : undefined;
+};
 
 test("each ledger_sha is the sha256 of the released original file bytes", () => {
   for (const a of MIGRATION_RENAME_ALIASES) {
@@ -35,11 +36,14 @@ test("the released ledger records both original names with exactly those shas, a
 });
 
 test("the released ledger adopts both rows against this tree's files, in memory only", () => {
-  const map = new Map(ledger.map((r) => [r.name, r.sha256]));
-  expect(adoptRenamedLedgerRows(map, fileSha)).toEqual([...MIGRATION_RENAME_ALIASES]);
+  const physical = new Map(ledger.map((r) => [r.name, r.sha256]));
+  const { effective: map, adopted, refusals } = resolveRenamedLedger(physical, fileSha);
+  expect(adopted).toEqual([...MIGRATION_RENAME_ALIASES]);
+  expect(refusals).toEqual([]);
+  expect(physical.size).toBe(ledger.length);
   for (const a of MIGRATION_RENAME_ALIASES) {
     expect(map.has(a.ledger_name)).toBe(false);
-    expect(map.get(a.migration)).toBe(a.ledger_sha);
+    expect(map.get(a.migration)).toBe(a.accepted_as_alias_of);
   }
   expect(map.size).toBe(ledger.length);
 });

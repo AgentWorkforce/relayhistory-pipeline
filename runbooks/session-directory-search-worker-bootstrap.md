@@ -320,7 +320,8 @@ lock and before any write, the migrator refuses:
 
 - `mixed_migration_authority`: `supabase_migrations.schema_migrations` (the
   `supabase db push` history) records any of these migrations, or exists but can't be
-  read.
+  read. For every selected rename alias, the check covers both the original and the
+  current version.
 - `ledger_unknown_step`: the ledger names a schema step this image doesn't have.
 - `ledger_gap`: the ledger is not one contiguous prefix of the ordered steps (upstream,
   then 96bulls). A first 96bulls row with no upstream rows is refused, never backfilled.
@@ -947,7 +948,13 @@ name in memory, only when both pinned shas match, logged and shown in the releas
 `--activation-check`; any other original name or sha still refuses as `ledger_unknown_step`.
 The ingest row is adopted only while `20261104040000_ingest_s3_proof_seed.sql` (which revokes
 the original's seed grants) is planned with its pinned sha, else `ledger_alias_repair_missing`.
-Readiness (`schemaVerdict`) applies the same in-memory adoption; unadopted rows stay `schema_pending`.
+A ledger that records both the original and the release name refuses as
+`ledger_alias_collision`, whatever the shas. A release-name row that holds the original sha is
+hand-edited history: the original sha is accepted only through adoption, so it refuses as
+`migration_changed`. The migrator and readiness (`schemaVerdict`) call the same
+`resolveRenamedLedger`, so they reach the same verdict. The migrator refuses before any write;
+readiness reports a refused alias as `schema_pending`. CLI authority checks cover both the
+original and the current version of every selected alias.
 The original file bytes and the released ledger are pinned as test fixtures
 (`src/hoopdb/__tests__/fixtures/released-migration-history/`).
 

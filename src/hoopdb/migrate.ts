@@ -12,13 +12,12 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  adoptRenamedLedgerRows,
   functionBoundaryEvidence,
   guardError,
   MIGRATION_RENAME_ALIASES,
-  renameAliasRepairMissing,
   migrationChecksumAlias,
   migrationChecksumMatches,
+  resolveRenamedLedger,
   RUNTIME_APPLICATION_FUNCTIONS,
   RUNTIME_APPLICATION_POLICY,
   RUNTIME_APPLICATION_RLS_TABLES,
@@ -397,26 +396,21 @@ export interface RunOptions {
 
 /** Shared read-only preflight: release planning and apply enforce the same guards. */
 async function migrationPreflight(client: MigrationClient, profile: MigrationProfile, schema: Step[]) {
-  const ledger = await readLedger(client);
+  const physical = await readLedger(client);
   const stepShas = await stepSha256s(schema);
   // The release binding covers the rows exactly as stored, before any in-memory adoption.
-  const ledgerSha256 = migrationLedgerSha256(ledger);
-  // Once, before every guard and reader below: original-name rows of append-only
-  // renamed migrations become their release names in memory only when every checksum
-  // matches (MIGRATION_RENAME_ALIASES). Anything else stays for sequencePreflight to refuse.
-  const renameAliases = adoptRenamedLedgerRows(ledger, (name) => stepShas.get(name));
+  const ledgerSha256 = migrationLedgerSha256(physical);
+  // Once, before every guard and reader below, through the one verdict readiness also
+  // uses (resolveRenamedLedger): exact original-name rows of append-only renamed
+  // migrations become their release names in memory only; any other alias state
+  // (collision, wrong sha, missing repair, original sha under the release name) refuses.
+  const renamed = resolveRenamedLedger(physical, (name) => stepShas.get(name));
+  const renameAliases = renamed.adopted;
   for (const alias of renameAliases)
     log.info("adopted renamed migration ledger row", alias);
-  // An exact original row left unadopted only because its pinned forward repair is not
-  // planned with its exact sha says so, instead of the generic ledger_unknown_step.
-  for (const a of MIGRATION_RENAME_ALIASES)
-    if (ledger.get(a.ledger_name) === a.ledger_sha && !ledger.has(a.migration) &&
-        stepShas.get(a.migration) === a.accepted_as_alias_of &&
-        renameAliasRepairMissing(a, (name) => stepShas.get(name)))
-      throw guardError(
-        "ledger_alias_repair_missing",
-        `released migration ${a.ledger_name} requires its exact forward repair`,
-      );
+  const refusal = renamed.refusals[0];
+  if (refusal) throw guardError(refusal.code, refusal.message);
+  const ledger = renamed.effective;
   // A HoopDb built from the old vendored pin cannot be moved forward in place:
   // upstream changed 20261025000600 after it was applied there. Say so plainly.
   if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {
@@ -930,9 +924,21 @@ async function cliHistoryPreflight(
     throw err;
   }
   if (cliHistory) {
-    const versions = schema
-      .filter((st) => st.name.startsWith("upstream:"))
-      .map((st) => st.name.slice("upstream:".length).split("_")[0]!);
+    const upstreamNames = new Set(
+      schema.filter((st) => st.name.startsWith("upstream:")).map((st) => st.name),
+    );
+    // Renaming a released file must not hide a second migration authority: whenever
+    // either name of a rename alias is in this plan, check both versions (from #396).
+    for (const a of MIGRATION_RENAME_ALIASES)
+      if (upstreamNames.has(a.migration) || upstreamNames.has(a.ledger_name)) {
+        upstreamNames.add(a.migration);
+        upstreamNames.add(a.ledger_name);
+      }
+    const versions = [
+      ...new Set(
+        [...upstreamNames].map((name) => name.slice("upstream:".length).split("_")[0]!),
+      ),
+    ].sort();
     let hit: { version: string }[];
     try {
       hit = (
@@ -974,8 +980,12 @@ async function pendingMigrationsExist(
     ).rows.map((r) => [r.name, r.sha256]),
   );
   const shas = await stepSha256s(await schemaSteps());
-  adoptRenamedLedgerRows(done, (name) => shas.get(name));
-  return [...shas.keys()].some((n) => !done.has(n));
+  const { effective } = resolveRenamedLedger(done, (name) => shas.get(name));
+  // A recorded row counts as applied only with a checksum the migrator would skip.
+  return [...shas].some(([n, sha]) => {
+    const seen = effective.get(n);
+    return seen === undefined || !migrationChecksumMatches(n, seen, sha);
+  });
 }
 
 function migrationProfileMode(): FunctionBoundaryMode | undefined {
@@ -1021,10 +1031,10 @@ async function checksumAliasEvidence(client: MigrationClient) {
       );
       return alias ? [alias] : [];
     }),
-    rename: adoptRenamedLedgerRows(
+    rename: resolveRenamedLedger(
       new Map(rows.map((r) => [r.name, r.sha256])),
       (name) => actual.get(name),
-    ),
+    ).adopted,
   };
 }
 

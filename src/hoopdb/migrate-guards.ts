@@ -46,7 +46,9 @@ export const MIGRATION_CHECKSUM_ALIASES = [
 // applied them under their original names would otherwise stop at
 // ledger_unknown_step. Each original ledger row is adopted in memory (never written) as
 // its release name only when all four values match: the original name with its last
-// released sha, and the release file with exactly this sha. Bodies are statement-for-
+// released sha, and the release file with exactly this sha. Only adoption accepts
+// `ledger_sha`: a row physically stored under the release name with the original sha is
+// hand-edited history and fails closed (migration_changed), as does any other sha. Bodies are statement-for-
 // statement equal apart from the provenance header, except that the original ingest
 // ledger also granted the seed RPCs to bulls96_session_ingest_seeder, which
 // 20261104040000_ingest_s3_proof_seed (always on this image, after both) REVOKEs ALL,
@@ -78,9 +80,7 @@ export const MIGRATION_RENAME_ALIASES = [
   },
 ] as const;
 
-export type MigrationAlias =
-  | (typeof MIGRATION_CHECKSUM_ALIASES)[number]
-  | (typeof MIGRATION_RENAME_ALIASES)[number];
+export type MigrationAlias = (typeof MIGRATION_CHECKSUM_ALIASES)[number];
 
 export function migrationChecksumMatches(
   name: string,
@@ -98,7 +98,9 @@ export function migrationChecksumAlias(
   recorded: string,
   actual: string,
 ): MigrationAlias | undefined {
-  return [...MIGRATION_CHECKSUM_ALIASES, ...MIGRATION_RENAME_ALIASES].find(
+  // Rename aliases are deliberately absent: their original sha is accepted only by
+  // resolveRenamedLedger, for a row recorded under the original name only.
+  return MIGRATION_CHECKSUM_ALIASES.find(
     (a) =>
       a.migration === name &&
       a.ledger_sha === recorded &&
@@ -117,32 +119,78 @@ export function renameAliasRepairMissing(
   return "repair" in alias && fileSha(alias.repair) !== alias.repair_sha;
 }
 
+export type RenameAlias = (typeof MIGRATION_RENAME_ALIASES)[number];
+
+/** Why one MIGRATION_RENAME_ALIASES entry could not be adopted; the migrator throws it. */
+export interface RenameRefusal {
+  code:
+    | "ledger_alias_collision"
+    | "ledger_unknown_step"
+    | "ledger_alias_repair_missing"
+    | "migration_changed";
+  alias: RenameAlias;
+  message: string;
+}
+
 /**
- * Adopts, in `ledger` only, each MIGRATION_RENAME_ALIASES row whose four values all
- * match, whose pinned forward repair (if any) is planned with its exact sha, and whose
- * release name is not already recorded: the original key is replaced by the release
- * name, keeping the recorded sha. Anything else is left untouched for
- * sequencePreflight to refuse (ledger_unknown_step / migration_changed), and readiness
- * keeps reporting the release name as missing. Never writes.
+ * The one rename-alias verdict, shared by the migrator (migrationPreflight) and
+ * readiness (schemaVerdict), so both reach the same answer from the same physical
+ * ledger. Pure: `physical` is never modified and nothing is written.
+ *
+ * For each MIGRATION_RENAME_ALIASES entry (skipped when the plan itself contains the
+ * original name, i.e. an old image's plan):
+ *  - only the original name, with exactly `ledger_sha`, the release file planned with
+ *    exactly `accepted_as_alias_of` and the pinned repair (if any) planned with exactly
+ *    `repair_sha`: adopted. The effective ledger holds the release name with the release
+ *    file's sha, so the checksum guard needs no rename lookup afterwards;
+ *  - both the original and the release name recorded: ledger_alias_collision, whatever
+ *    the shas (never a supported state);
+ *  - only the original name with another sha, or a release file that is not planned
+ *    with exactly `accepted_as_alias_of`: ledger_unknown_step;
+ *  - an exact original row whose pinned repair is missing: ledger_alias_repair_missing;
+ *  - only the release name, physically carrying the original `ledger_sha` (hand-edited
+ *    history): migration_changed.
+ * A refused alias's release name is absent from `effective`, so readiness reports it
+ * as not applied; the migrator throws the first refusal before any write.
+ * `fileSha` returns the planned step's file sha256, or undefined if it is not planned.
  */
-export function adoptRenamedLedgerRows(
-  ledger: Map<string, string>,
+export function resolveRenamedLedger(
+  physical: ReadonlyMap<string, string>,
   fileSha: (name: string) => string | undefined,
-): (typeof MIGRATION_RENAME_ALIASES)[number][] {
-  const adopted: (typeof MIGRATION_RENAME_ALIASES)[number][] = [];
+): { effective: Map<string, string>; adopted: RenameAlias[]; refusals: RenameRefusal[] } {
+  const effective = new Map(physical);
+  const adopted: RenameAlias[] = [];
+  const refusals: RenameRefusal[] = [];
+  const refuse = (alias: RenameAlias, code: RenameRefusal["code"], message: string) => {
+    effective.delete(alias.migration);
+    refusals.push({ code, alias, message });
+  };
   for (const a of MIGRATION_RENAME_ALIASES) {
-    if (
-      ledger.get(a.ledger_name) !== a.ledger_sha ||
-      ledger.has(a.migration) ||
-      fileSha(a.migration) !== a.accepted_as_alias_of ||
-      renameAliasRepairMissing(a, fileSha)
-    )
-      continue;
-    ledger.delete(a.ledger_name);
-    ledger.set(a.migration, a.ledger_sha);
-    adopted.push(a);
+    if (fileSha(a.ledger_name) !== undefined) continue;
+    const original = physical.get(a.ledger_name);
+    const release = physical.get(a.migration);
+    if (original !== undefined && release !== undefined)
+      refuse(a, "ledger_alias_collision",
+        `the ledger records both ${a.ledger_name} and its release name ${a.migration}; nothing is marked, see the runbook decision point`);
+    else if (release !== undefined) {
+      if (release === a.ledger_sha)
+        refuse(a, "migration_changed",
+          `migration ${a.migration} is recorded with the checksum of ${a.ledger_name}; that is hand-edited history, nothing is marked, see the runbook decision point`);
+    } else if (original !== undefined) {
+      if (original !== a.ledger_sha || fileSha(a.migration) !== a.accepted_as_alias_of)
+        refuse(a, "ledger_unknown_step",
+          `the ledger records ${a.ledger_name}, which this image doesn't have or adopt; nothing is marked, see the runbook decision point`);
+      else if (renameAliasRepairMissing(a, fileSha))
+        refuse(a, "ledger_alias_repair_missing",
+          `released migration ${a.ledger_name} requires its exact forward repair`);
+      else {
+        effective.delete(a.ledger_name);
+        effective.set(a.migration, a.accepted_as_alias_of);
+        adopted.push(a);
+      }
+    }
   }
-  return adopted;
+  return { effective, adopted, refusals };
 }
 
 // ---------------------------------------------------------------------------
