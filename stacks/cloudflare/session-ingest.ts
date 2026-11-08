@@ -143,6 +143,12 @@ export interface SessionIngestInputs {
    * queue + DLQ + consumer, the INGEST_ADMISSION binding and the var. Omit for none (the default).
    */
   asyncAdmission?: "on" | "drain";
+  /**
+   * INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: the frozen legacy-receipt read before a synchronous claim for a
+   * queued-v1 caller. Buffered acceptance with custodySource frozen-supabase only. Present: the var only
+   * (no queue, no binding). Omit for off (the default; vars byte-identical to before).
+   */
+  syncAdmissionFrozenReceipt?: "on";
 }
 
 const HEX32 = /^[0-9a-f]{32}$/;
@@ -158,7 +164,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -246,6 +252,8 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
   inboxAuthority(v.authority, refuse);
   if (v.asyncAdmission !== undefined && (!(v.asyncAdmission === "on" || v.asyncAdmission === "drain") || v.acceptanceMode !== "buffered"))
     refuse('sessionIngest.asyncAdmission must be "on" or "drain", in buffered mode only (omit for none)');
+  if (v.syncAdmissionFrozenReceipt !== undefined && (v.syncAdmissionFrozenReceipt !== "on" || v.acceptanceMode !== "buffered" || v.custodySource !== "frozen-supabase"))
+    refuse('sessionIngest.syncAdmissionFrozenReceipt must be "on", in buffered mode with custodySource frozen-supabase only (omit for off)');
 }
 
 /** A producer binding to a queue this stack does not own (no state row: never created, changed or deleted here). */
@@ -275,6 +283,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.privacyAuthority ? { INGEST_PRIVACY_AUTHORITY: p.privacyAuthority } : {}),
     ...inboxAuthorityVars(p.authority, (why) => { throw new Error(why); }),
     ...(p.asyncAdmission ? { INGEST_ASYNC_ADMISSION: p.asyncAdmission } : {}),
+    ...(p.syncAdmissionFrozenReceipt === "on" ? { INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on" } : {}),
   };
 }
 
