@@ -225,6 +225,16 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
+      - name: Prove the self-host erase serializes with a concurrent claim on the fence lock (043920)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          # pg-proof checks out the PR head; heads predating this step lack the test. Remove once no open PR predates it.
+          if [ ! -f src/session-ingest/__tests__/selfhost-erase-lock.postgres.test.ts ]; then
+            echo "::warning title=pg-proof::selfhost-erase-lock.postgres.test.ts absent at this head; forward-merge main to run the erase lock proof"
+            exit 0
+          fi
+          bun test --timeout 300000 src/session-ingest/__tests__/selfhost-erase-lock.postgres.test.ts
       - name: Prove the acquisition installer login refuses a superuser SET SESSION AUTHORIZATION (pg_stat_activity usename)
         env:
           ACQUISITION_LOGIN_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres

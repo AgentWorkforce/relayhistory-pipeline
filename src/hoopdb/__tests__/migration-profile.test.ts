@@ -1924,6 +1924,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const X = "upstream:20261105043870_buffered_search_feed_cursor.sql";
     const CG = "upstream:20261105043900_session_consumer_function_grants.sql";
     const SE = "upstream:20261105043910_selfhost_session_selection_erase.sql";
+    const SL = "upstream:20261105043920_selfhost_erase_lock_fences.sql";
     const BK = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
@@ -1932,7 +1933,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -1974,7 +1975,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105043910 (self-host per-session erase) is the newest: its down drops the function, and
+    // 20261105043920 (erase takes the fence lock) is the newest: 043910's down refuses (55000) while it is
+    // applied, and its own down restores 043910's exact body, without the lock.
+    const eraseSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)')")).rows[0]!.s;
+    expect(await eraseSrc()).toContain("ingest_lock_fences(v_org,v_ws,v_user)");
+    expect((await failure(rollback("20261105043910_selfhost_session_selection_erase.down.sql")))?.code).toBe("55000");
+    await rollback("20261105043920_selfhost_erase_lock_fences.down.sql");
+    expect(await names()).not.toContain(SL);
+    expect(await eraseSrc()).not.toContain("ingest_lock_fences");
+    // 20261105043910 (self-host per-session erase) is then the newest: its down drops the function, and
     // 20261105043900's down refuses (55000) while it is applied.
     expect((await failure(rollback("20261105043900_session_consumer_function_grants.down.sql")))?.code).toBe("55000");
     await rollback("20261105043910_selfhost_session_selection_erase.down.sql");
@@ -2360,8 +2369,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
 
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
-    // 043910 is newer, so 043900's down refuses until it is rolled back.
-    const newerDown = readFileSync(join(root, "supabase/rollbacks/20261105043910_selfhost_session_selection_erase.down.sql"), "utf8");
+    // 043920 and 043910 are newer, so 043900's down refuses until they are rolled back, newest first.
+    const newerDown = ["20261105043920_selfhost_erase_lock_fences", "20261105043910_selfhost_session_selection_erase"]
+      .map((n) => readFileSync(join(root, `supabase/rollbacks/${n}.down.sql`), "utf8")).join("\n");
     const grantRow = `SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043900_session_consumer_function_grants.sql'`;
     const holds = async (db: PGlite) =>
       (await db.query<{ holds: boolean }>(
