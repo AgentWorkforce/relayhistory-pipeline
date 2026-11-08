@@ -3,7 +3,9 @@
  * union (filters, dedupe with canonical winning, composite cursor, fenced header, strict
  * sessionSummary keys), GET /v1/sessions/:id/turns and /metadata (buffered served, fenced 503,
  * erasure race, hidden admission), cross-user 500, flag/allowlist off (no gate call, bytes
- * unchanged), events never buffered, and the pre-v4 stored object regression.
+ * unchanged), events never buffered without the events flag, and the pre-v4 stored object
+ * regression; then GET /v1/sessions/:id/events with READ_API_OWNER_BUFFERED_EVENTS=on (served,
+ * precedence, gating order, backend transitions, hidden/fenced outcomes).
  */
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -11,6 +13,11 @@ import { AuthError, createReadApi, type TurnsDeps, type VerifiedIdentity } from 
 import { decodeCompositeListCursor, encodeCompositeListCursor, type Directory, type DirectoryListRow } from "../directory.ts";
 import { BUFFERED_USER_SQL, BufferedFenced, serviceBindingControlHead, sqlOwnerBufferedReads, type ControlHeadGate, type OwnerBufferedDeps, type OwnerBufferedReads } from "../owner-buffered.ts";
 import { memoryLiveness } from "./support.ts";
+import { BUFFERED_STAGE_MAX_BYTES } from "../owner-buffered.ts";
+import { encodeBufferedCursor, encodeCursor } from "../cursor.ts";
+import { deliveryMachine } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
+import { TURN_ORIGIN_ID } from "../../session-ingest/turns.ts";
+import { at } from "./support.ts";
 import { E1, SESSION, authority, bufferedRow, fencedGate, headBody, putStage, scratch, scriptedGate, scriptedReads, turn, unzip } from "./owner-buffered-support.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] };
@@ -54,6 +61,17 @@ interface Harness {
   livePointers?: (sessionIds: string[]) => Promise<Set<string>>;
   /** The verified identity the token maps to; default ID. */
   identity?: VerifiedIdentity;
+  /** READ_API_OWNER_BUFFERED_EVENTS=on (ownerBuffered.events); default off. */
+  events?: boolean;
+  /** READ_API_COMPLETE_SINCE as ms; default 0. */
+  completeSinceMs?: number;
+  /** Erased canonical sessions (tombstones: pointers without a live pointer). */
+  erased?: Array<{ source: string; sessionId: string }>;
+  /**
+   * A fake canonical ClickHouse: the partial-session query (needs_full = 1) answers these
+   * session ids, every other query no rows. Absent: every ClickHouse call throws.
+   */
+  canonical?: { partial?: string[] };
 }
 function api(h: Harness = {}) {
   const logs: Record<string, unknown>[] = [];
@@ -82,17 +100,28 @@ function api(h: Harness = {}) {
     gate: h.gate ?? scriptedGate(authority("7")),
     store: h.store ?? store(),
     decompress: unzip,
+    ...(h.events ? { events: true } : {}),
   };
+  const chQueries: string[] = [];
+  const select = h.canonical
+    ? async (query: string) => {
+        chQueries.push(query);
+        return /needs_full/u.test(query) ? (h.canonical!.partial ?? []).map((session_id) => ({ session_id })) : [];
+      }
+    : async () => {
+        throw new Error("no ClickHouse in these tests");
+      };
+  const live = memoryLiveness({ createdAt: h.liveSessions, erased: h.erased });
   const app = createReadApi({
     verify: async (t) => {
       if (t !== "good") throw new AuthError(401, "invalid_token", "token is not valid");
       return h.identity ?? ID;
     },
-    ch: { database: "relay_search", async command() {}, async insert() {}, async select() { throw new Error("no ClickHouse in these tests"); } } as never,
+    ch: { database: "relay_search", async command() {}, async insert() {}, select } as never,
     liveness: h.livePointers
-      ? { ...memoryLiveness({ createdAt: h.liveSessions }).liveness, livePointerSessions: (_o: string, _w: string, ids: string[]) => h.livePointers!(ids) }
-      : memoryLiveness({ createdAt: h.liveSessions }).liveness,
-    completeSinceMs: 0,
+      ? { ...live.liveness, livePointerSessions: (_o: string, _w: string, ids: string[]) => h.livePointers!(ids) }
+      : live.liveness,
+    completeSinceMs: h.completeSinceMs ?? 0,
     log: (f) => logs.push(f),
     directory,
     directoryWorkspaces: "workspaces" in h ? h.workspaces : new Set(["ws-a"]),
@@ -100,7 +129,7 @@ function api(h: Harness = {}) {
     ownerBuffered,
   });
   const get = (path: string) => app.request(path, { headers: { authorization: "Bearer good" } });
-  return { get, logs, dirCalls };
+  return { get, logs, dirCalls, chQueries };
 }
 const json = async (r: Response) => (await r.json()) as Record<string, any>;
 const strip = (b: Record<string, any>) => ({ ...b, correlationId: undefined });
@@ -493,7 +522,7 @@ describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => 
     expect(await r.text()).not.toContain("OTHER-USER");
   });
 
-  test("events are never buffered: same answer with the flag on, gate not called", async () => {
+  test("events are never buffered without READ_API_OWNER_BUFFERED_EVENTS: same answer with owner-buffered on, gate not called", async () => {
     const P = `/v1/sessions/${SESSION}/events?workspace=ws-a&source=claude`;
     const off = await api({ noOwnerBuffered: true }).get(P);
     const gate = scriptedGate(authority("7"));
@@ -657,5 +686,213 @@ describe("all-workspaces mode does not bypass the per-user privacy gate", () => 
       expect(at).toBeGreaterThan(0);
       expect(MIGRATION.slice(at, at + 2500)).toContain("FROM sessions.owner_buffered_read_scope(p_workspace,");
     }
+  });
+});
+
+describe("GET /v1/sessions/:id/events with READ_API_OWNER_BUFFERED_EVENTS=on", () => {
+  const TS = 1_793_000_000_000;
+  const P = `/v1/sessions/${SESSION}/events?workspace=ws-a&source=claude`;
+  const KEY = at({ source: "claude", sessionId: SESSION });
+  const ev = (id: string, over: Record<string, unknown> = {}) => ({ kind: "session_event", origin_id: TURN_ORIGIN_ID, record_id: id, revision: "1", operation: "upsert", received_at: "2026-11-05T12:00:00Z", payload: { text: `buffered ${id}`, ts_ms: TS, role: "user", ...over } });
+  async function staged(opts: Parameters<typeof putStage>[3] = {}) {
+    const s = store();
+    const st = await putStage(s, 1, [ev("e1"), ev("e2"), ev("e3", { ts_ms: TS + 1 })], opts);
+    return { s, st, ...scriptedReads({ stages: [[st.row]] }) };
+  }
+  /** Status, buffered header and body without the per-request correlation id. */
+  const answer = async (r: Response) => ({ status: r.status, buffered: r.headers.get("x-relayhistory-buffered"), body: strip(await json(r)) });
+  const offAnswer = (h: Harness = {}, path = P) => api({ ...h, noOwnerBuffered: true }).get(path).then(answer);
+
+  test("served: header, the projected rows in canonical order, buffered cursor pages, gate observed twice per read", async () => {
+    const { s, reads, calls } = await staged();
+    const gate = scriptedGate(authority("7"));
+    const { get, logs } = api({ events: true, store: s, reads, gate });
+    const r = await get(P);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("x-relayhistory-buffered")).toBe("1");
+    const b = await json(r);
+    expect(Object.keys(b).sort()).toEqual(["correlationId", "events", "nextCursor", "sessionId"]);
+    expect(b.events.map((e: any) => [e.eventId, e.sessionId, e.source, e.userId])).toEqual([
+      [`${deliveryMachine("ws-a", TURN_ORIGIN_ID)}:e1`, SESSION, "claude", "u-1"],
+      [`${deliveryMachine("ws-a", TURN_ORIGIN_ID)}:e2`, SESSION, "claude", "u-1"],
+      [`${deliveryMachine("ws-a", TURN_ORIGIN_ID)}:e3`, SESSION, "claude", "u-1"],
+    ]);
+    expect(b.nextCursor).toBeNull();
+    expect(gate.calls).toHaveLength(2);
+    expect(calls.map((c) => c.fn)).toEqual(["stages", "stages"]);
+    expect(logs.some((l) => l.reason === "buffered_events_served")).toBe(true);
+    expect(JSON.stringify(b) + JSON.stringify(logs)).not.toMatch(/buffered-batches|stage_key|ordinal/u);
+
+    const first = await json(await get(`${P}&limit=2`));
+    expect(first.events).toHaveLength(2);
+    expect(typeof first.nextCursor).toBe("string");
+    const second = await get(`${P}&limit=2&cursor=${encodeURIComponent(first.nextCursor)}`);
+    expect(second.headers.get("x-relayhistory-buffered")).toBe("1");
+    const sb = await json(second);
+    expect(sb.events.map((e: any) => e.eventId)).toEqual([b.events[2].eventId]);
+    expect(sb.nextCursor).toBeNull();
+    const desc = await json(await get(`${P}&order=desc`));
+    expect(desc.events.map((e: any) => e.eventId)).toEqual([...b.events].reverse().map((e: any) => e.eventId));
+  });
+
+  test("gating: flag off, owner-buffered off, no source, workspace off either allowlist: no gate or RPC call, bytes identical to no owner-buffered", async () => {
+    const cases: Array<[string, Harness, string]> = [
+      ["events flag off", { events: false }, P],
+      ["owner-buffered disabled", { events: true, enabled: false }, P],
+      ["no source", { events: true }, `/v1/sessions/${SESSION}/events?workspace=ws-a`],
+      ["not on the owner-buffered allowlist", { events: true, obWorkspaces: new Set(["ws-other"]) }, P],
+      ["not on the directory allowlist", { events: true, workspaces: new Set(["ws-other"]) }, P],
+    ];
+    for (const [, h, path] of cases) {
+      const { s, reads, calls } = await staged();
+      const gate = scriptedGate(authority("7"));
+      const on = await api({ ...h, store: s, reads, gate }).get(path).then(answer);
+      expect(on).toEqual(await offAnswer(h, path));
+      expect(gate.calls).toHaveLength(0);
+      expect(calls).toHaveLength(0);
+    }
+  });
+
+  test("history floor: flag off a buffered-only session is 501 history_floor_unknown_session; on, the buffered answer serves (decided before sessionGate)", async () => {
+    const off = await offAnswer({ completeSinceMs: TS });
+    expect(off.status).toBe(501);
+    expect(off.body.error.reason).toBe("history_floor_unknown_session");
+    const { s, reads } = await staged();
+    const flagOff = await api({ completeSinceMs: TS, store: s, reads }).get(P).then(answer);
+    expect(flagOff).toEqual(off);
+    const on = await api({ events: true, completeSinceMs: TS, store: s, reads }).get(P);
+    expect(on.status).toBe(200);
+    expect((await json(on)).events).toHaveLength(3);
+  });
+
+  test("precedence: any canonical pointer and canonical serves the whole response; the buffered gate and RPC are never called", async () => {
+    const { s, reads, calls } = await staged();
+    const gate = scriptedGate(authority("7"));
+    const h: Harness = { events: true, store: s, reads, gate, liveSessions: { [KEY]: TS }, canonical: {} };
+    const on = await api(h).get(P).then(answer);
+    expect(on).toEqual(await offAnswer(h));
+    expect(on.status).toBe(200);
+    expect(on.buffered).toBeNull();
+    expect(gate.calls).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("transition buffered -> canonical: pointers appear (needs_full = 1 too); a buffered cursor is refused 409, never continued into canonical", async () => {
+    const { s, reads } = await staged();
+    const first = await json(await api({ events: true, store: s, reads }).get(`${P}&limit=1`));
+    const cursor = encodeURIComponent(first.nextCursor);
+    for (const partial of [[SESSION], []]) {
+      const gate = scriptedGate(authority("7"));
+      const { get, chQueries } = api({ events: true, store: s, reads, gate, liveSessions: { [KEY]: TS }, canonical: { partial } });
+      const fresh = await get(P);
+      if (partial.length) {
+        expect(fresh.status).toBe(501);
+        expect((await json(fresh)).error.reason).toBe("session_partial");
+      } else expect(fresh.status).toBe(200);
+      const before = chQueries.length;
+      const r = await get(`${P}&cursor=${cursor}`);
+      expect(r.status).toBe(409);
+      const b = await json(r);
+      expect(b.error.code).toBe("cursor_backend_transition");
+      expect(r.headers.get("x-relayhistory-buffered")).toBeNull();
+      expect(chQueries.length).toBe(before);
+      expect(gate.calls).toHaveLength(0);
+    }
+  });
+
+  test("canonical tombstone: no cursor answers the canonical empty page (no buffered read); a buffered cursor is refused 409 (no resurrection)", async () => {
+    const { s, reads, calls } = await staged();
+    const first = await json(await api({ events: true, store: s, reads }).get(`${P}&limit=1`));
+    const gate = scriptedGate(authority("7"));
+    const before = calls.length;
+    const h: Harness = { events: true, store: s, reads, gate, erased: [{ source: "claude", sessionId: SESSION }] };
+    const r = await api(h).get(P).then(answer);
+    expect(r).toEqual(await offAnswer(h));
+    expect(r).toMatchObject({ status: 200, buffered: null, body: { events: [], nextCursor: null } });
+    const resumed = await api(h).get(`${P}&cursor=${encodeURIComponent(first.nextCursor)}`);
+    expect(resumed.status).toBe(409);
+    expect((await json(resumed)).error.code).toBe("cursor_backend_transition");
+    expect(gate.calls).toHaveLength(0);
+    expect(calls.length).toBe(before);
+  });
+
+  test("transition canonical -> buffered: a canonical cursor on a buffered session is refused 409", async () => {
+    const { s, reads } = await staged();
+    const c = encodeCursor({ tsMs: TS, sessionId: SESSION, source: "claude", machineId: "m", kind: "message", eventId: "e0" });
+    const r = await api({ events: true, store: s, reads }).get(`${P}&cursor=${encodeURIComponent(c)}`);
+    expect(r.status).toBe(409);
+    expect((await json(r)).error.code).toBe("cursor_backend_transition");
+  });
+
+  test("a buffered cursor where the buffered session is hidden: 409; with the events flag off: 400 bad_request (invalid cursor) as today; tampered or foreign: as today", async () => {
+    const b = encodeBufferedCursor({ tsMs: TS, sessionId: SESSION, source: "claude", machineId: "m", kind: "message", eventId: "e0" });
+    const old = await staged({ admission: { epoch: E1, version: "5" } });
+    const hidden = await api({ events: true, store: old.s, reads: old.reads }).get(`${P}&cursor=${encodeURIComponent(b)}`);
+    expect(hidden.status).toBe(409);
+    const off = await api({ store: old.s, reads: old.reads }).get(`${P}&cursor=${encodeURIComponent(b)}`).then(answer);
+    expect(off.status).toBe(400);
+    expect(off.body.error.code).toBe("bad_request");
+    expect(off).toEqual(await offAnswer({}, `${P}&cursor=${encodeURIComponent(b)}`));
+    const { s, reads } = await staged();
+    for (const bad of [`b96e1:${Buffer.from(JSON.stringify([TS, SESSION, "claude", "m", "k", "e", "ob9"])).toString("base64url")}`, "b96e1:%%%", "zz:1"]) {
+      const path = `${P}&cursor=${encodeURIComponent(bad)}`;
+      const r = await api({ events: true, store: s, reads }).get(path).then(answer);
+      expect(r).toEqual(await offAnswer({}, path));
+      expect(r.status).toBe(bad === "zz:1" ? 501 : 400);
+    }
+  });
+
+  test("another user's session (the RPC returns none of their stages): the same answer as the flag off", async () => {
+    const reads = scriptedReads({ stages: [[]] });
+    const other: VerifiedIdentity = { ...ID, userId: "u-2" };
+    const on = await api({ events: true, identity: other, reads: reads.reads }).get(P).then(answer);
+    expect(on).toEqual(await offAnswer({ identity: other }));
+    expect(reads.calls.every((c) => c.scope.userId === "u-2")).toBe(true);
+  });
+
+  test("a stage whose header names another user: 500, no content", async () => {
+    const { s, reads } = await staged({ header: { user_id: "u-2" } });
+    const r = await api({ events: true, store: s, reads }).get(P);
+    expect(r.status).toBe(500);
+    expect(await r.text()).not.toContain("buffered e1");
+  });
+
+  test("fenced after a candidate (head moved, pending): 503 buffered_fenced, no content", async () => {
+    for (const second of [authority("8"), new BufferedFenced("gate_pending")]) {
+      const { s, reads } = await staged();
+      const r = await api({ events: true, store: s, reads, gate: scriptedGate(authority("7"), second) }).get(P);
+      expect(r.status).toBe(503);
+      const text = await r.text();
+      expect(JSON.parse(text).error.code).toBe("buffered_fenced");
+      expect(text).not.toContain("buffered e1");
+    }
+  });
+
+  test("hidden outcomes answer exactly as the flag off: unverified first gate, too large, old admission, recheck changed, projection refused", async () => {
+    const off = await offAnswer();
+    const big = await staged();
+    const variants: Array<[string, Harness]> = [
+      ["unverified", { gate: fencedGate("gate_timeout"), ...(await staged()) }],
+      ["too large", { store: big.s, reads: scriptedReads({ stages: [[{ ...big.st.row, stage_bytes: BUFFERED_STAGE_MAX_BYTES + 1 }]] }).reads }],
+      ["old admission", await staged({ admission: { epoch: E1, version: "5" } })],
+    ];
+    const changed = await staged();
+    const other = await putStage(changed.s, 2, [ev("e9")]);
+    variants.push(["recheck changed", { store: changed.s, reads: scriptedReads({ stages: [[changed.st.row, other.row], [changed.st.row]] }).reads }]);
+    const conv = store();
+    const cst = await putStage(conv, 1, [{ ...ev("c1"), kind: "convergence_event", payload: { source: "claude", session_id: SESSION, machine_id: "x", user_id: "u-1", event_id: "c1", kind: "prompt", ts: "2026-11-05T12:00:00.000Z", content: "direct" } }]);
+    variants.push(["projection refused", { store: conv, reads: scriptedReads({ stages: [[cst.row]] }).reads }]);
+    for (const [name, h] of variants) {
+      const on = await api({ events: true, ...h }).get(P).then(answer);
+      expect([name, on]).toEqual([name, off]);
+    }
+  });
+
+  test("erased at the recheck: an empty page with the buffered header", async () => {
+    const { s, st } = await staged();
+    const r = await api({ events: true, store: s, reads: scriptedReads({ stages: [[st.row], []] }).reads }).get(P);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("x-relayhistory-buffered")).toBe("1");
+    expect(strip(await json(r))).toEqual({ sessionId: SESSION, events: [], nextCursor: null, correlationId: undefined });
   });
 });

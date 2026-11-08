@@ -197,6 +197,38 @@ describe("entry and configuration", () => {
     }
   });
 
+  test("READ_API_OWNER_BUFFERED_EVENTS: only \"on\" sets events; unset/empty leaves the deps unchanged; any other value is a 503 before any read", async () => {
+    const run = (async () => {
+      throw new Error("no database in this test");
+    }) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "ws-a", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    const keysOf = (d: object | undefined) => Object.keys(d ?? {}).sort();
+    const base = ownerBufferedDeps({ ...E, ...keys } as Env, run);
+    expect(base).toBeDefined();
+    expect("events" in base!).toBe(false);
+    for (const flag of [undefined, ""]) {
+      const d = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_EVENTS: flag } as Env, run);
+      expect(keysOf(d), String(flag)).toEqual(keysOf(base));
+      expect("events" in d!).toBe(false);
+    }
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_EVENTS: "on" } as Env, run)?.events).toBe(true);
+    // The events flag alone never enables owner-buffered reads.
+    expect(ownerBufferedDeps({ ...E, ...keys, RELAYHISTORY_READ_OWNER_BUFFERED: undefined, READ_API_OWNER_BUFFERED_EVENTS: "on" } as Env, run)).toBeUndefined();
+
+    const t = tenant();
+    const call = async (over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions/s-x/events?workspace=${t.ws}&source=claude`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    for (const bad of ["true", "1", "ON", " on", "off", "yes"]) {
+      const r = await call({ READ_API_OWNER_BUFFERED_EVENTS: bad });
+      expect(r.status, bad).toBe(503);
+      expect((await body(r)).error.code).toBe("backend_unavailable");
+    }
+  });
+
   test("all-workspaces mode without the HISTORY_CONTROL_HEAD binding is the same 503; bound, it is not refused", async () => {
     const t = tenant();
     const call = async (over: Partial<Env>) => {
