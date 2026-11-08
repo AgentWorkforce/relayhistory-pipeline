@@ -47,31 +47,40 @@ describe.skipIf(!url)("043700 + PR B fixtures on actual PostgreSQL", () => {
     if (admin) await admin.end();
   }, 30_000);
 
-  test("043700 exposes the concrete PR B authority inputs, admission witness, and G2 table", async () => {
-    const { rows } = await db.query<{ proname: string; args: string; result: string }>(`
-      SELECT p.proname, pg_get_function_arguments(p.oid) AS args, pg_get_function_result(p.oid) AS result
+  async function contract(name: string) {
+    const { rows } = await db.query<{ args: string; result: string }>(`
+      SELECT pg_get_function_arguments(p.oid) AS args, pg_get_function_result(p.oid) AS result
         FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-       WHERE n.nspname='sessions' AND p.proname IN
-         ('owner_buffered_read_scope','buffered_sessions_for','buffered_session_stages_for')`);
-    for (const name of ["owner_buffered_read_scope", "buffered_sessions_for", "buffered_session_stages_for"]) {
-      const fn = rows.find((row) => row.proname === name);
-      expect(fn, name).toBeDefined();
-      expect(fn!.args, `${name}: p_head_kind`).toContain("p_head_kind text");
-      expect(fn!.args, `${name}: p_privacy_baseline_sha256`).toContain("p_privacy_baseline_sha256 text");
-    }
-    const list = rows.find((row) => row.proname === "buffered_sessions_for")!.result;
-    const stages = rows.find((row) => row.proname === "buffered_session_stages_for")!.result;
-    for (const result of [list, stages]) {
-      expect(result).toContain("admission_epoch text");
-      expect(result).toContain("admission_version bigint");
-    }
-    expect(stages).toContain("group_ordinals bigint[]");
+       WHERE n.nspname='sessions' AND p.proname=$1`, [name]);
+    expect(rows, name).toHaveLength(1);
+    expect(rows[0]!.args, `${name}: p_head_kind`).toContain("p_head_kind text");
+    expect(rows[0]!.args, `${name}: p_privacy_baseline_sha256`).toContain("p_privacy_baseline_sha256 text");
+    return rows[0]!;
+  }
 
+  test("PR A seam 1: owner_buffered_read_scope binds v5.3 authority and mandatory G2", async () => {
+    const fn = await contract("owner_buffered_read_scope");
+    expect(fn.result).toContain("gate_open boolean");
+    expect(fn.result).toContain("admission_epoch text");
+    expect(fn.result).toContain("admission_version bigint");
     const proof = await db.query<{ name: string | null }>(
       "SELECT to_regclass('sessions.owner_buffered_parity')::text AS name",
     );
     // v5.3 authorizes the table name and semantics, but leaves columns/PK/CAS to the migration owner.
     expect(proof.rows[0]?.name).toBe("sessions.owner_buffered_parity");
+  });
+
+  test("PR A seam 2: buffered_sessions_for returns the immutable admission witness", async () => {
+    const fn = await contract("buffered_sessions_for");
+    expect(fn.result).toContain("admission_epoch text");
+    expect(fn.result).toContain("admission_version text");
+  });
+
+  test("PR A seam 3: buffered_session_stages_for returns witness and full group ordinals", async () => {
+    const fn = await contract("buffered_session_stages_for");
+    expect(fn.result).toContain("group_ordinals jsonb");
+    expect(fn.result).toContain("admission_epoch text");
+    expect(fn.result).toContain("admission_version text");
   });
 
   test("all 26 causal vectors round-trip through PostgreSQL jsonb and drive the final post-S3 gate", async () => {
