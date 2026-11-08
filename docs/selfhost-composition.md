@@ -335,15 +335,17 @@ change is one env value on the hosted Bob Costas worker:
   present there for session-brief; Bob Costas reads the same names;
 - optionally set the `BOB_COSTAS_*` budgets above.
 
-Precondition (pipeline lead ruling, 2026-11-08): the per-process daily budget
-above is not sufficient for the hosted flip. Hosted Workers and Lambda run
-many isolates, so the in-memory cap multiplies by the isolate count. Hosted
-activation needs a shared budget first: either a database-backed counter (a
-new table, which needs a migration-registry slot; production applies are
-frozen at the time of writing) or, as an interim, a provider-side spend cap on
-the API key or project, plus the per-session cap in code
-(`BOB_COSTAS_SESSION_DAILY_CAP`, already enforced). Until one of those is in
-place, `BOB_COSTAS_MODEL` stays `off` on the hosted worker.
+Budget sizing for the hosted flip (Khaliq, 2026-11-08, relayed by his desktop
+lead; the pipeline lead's concern that hosted isolates multiply an in-memory
+cap is covered by the sizing rule): per-process counters are acceptable for
+the first flip, with a conservative global cap divided by the replica or
+isolate count. Set `BOB_COSTAS_GLOBAL_DAILY_CAP` and
+`BOB_COSTAS_BACKGROUND_DAILY_BUDGET` to the intended total divided by the
+expected isolate count, keep the per-session cap
+(`BOB_COSTAS_SESSION_DAILY_CAP`), and prefer a provider-side spend cap on the
+API key or project as the backstop. A database-backed shared counter (a new
+table, so a migration-registry slot) follows after the schema freeze lifts.
+Until the flip, `BOB_COSTAS_MODEL` stays `off` on the hosted worker.
 
 That flip and its deploy are a separate production change and need Khaliq's
 own explicit approval. Nothing in this repository changes the hosted or local
