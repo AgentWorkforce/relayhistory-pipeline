@@ -8,6 +8,7 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  *   SQS batch (S3 object events, reconcile items) -> processBatch -> partial batch response
  *   EventBridge schedule {"reconcile": true}      -> list recent manifests -> SQS
  *   EventBridge schedule {"brief": true}          -> one session-brief tick (src/session-brief)
+ *   schedule {"bufferedSearchFeed": true}         -> one bounded buffered-stage feed run (default off)
  *
  * Configuration: plain env for ids and switches; credentials only from one
  * Secrets Manager secret (`SESSION_PIPELINE_SECRET_ARN`), read once per
@@ -28,6 +29,9 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * search stage from the pre-#182 catalog writer to the complete desktop catalog writer
  * (migration 20261105022000 columns); SEARCH_INDEX_ENABLED alone never does
  * (docs/session-desktop-catalog.md, Activation blockers).
+ * INGEST_BUFFERED_SEARCH_FEED=on (only the literal "on"; default "off", anything else refuses)
+ * feeds accepted buffered stages into transcript_events (buffered-search-feed.ts); it needs
+ * SEARCH_INDEX_ENABLED=1 on the ClickHouse backend and the draft RPCs applied.
  */
 import pg from "pg";
 import {
@@ -50,6 +54,7 @@ import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { searchIndexLimits } from "./search-index.ts";
+import { bufferedFeedConfig, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
@@ -104,6 +109,17 @@ export interface LambdaEnv {
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
   dbPoolMax: number;
+  /** INGEST_BUFFERED_SEARCH_FEED*: absent or `enabled: false` (default) builds nothing. */
+  bufferedSearchFeed?: BufferedFeedConfig;
+}
+
+/**
+ * The buffered feed's settings without risk to the shared runtime: a malformed value disarms the
+ * feed (logged by code) instead of failing init for SQS/search/reconcile. A typo never arms it.
+ */
+function bufferedFeedEnv(env: NodeJS.ProcessEnv): BufferedFeedConfig | undefined {
+  try { return bufferedFeedConfig(env); }
+  catch { log.warn("buffered search feed disarmed", { stage: "buffered-search-feed", reason: "config_invalid" }); return undefined; }
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition): LambdaEnv {
@@ -135,6 +151,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     secretArn: need("SESSION_PIPELINE_SECRET_ARN"),
     queueUrl: need("SESSION_PIPELINE_QUEUE_URL"),
     searchEnabled: env.SEARCH_INDEX_ENABLED === "1",
+    bufferedSearchFeed: bufferedFeedEnv(env),
     replayPagesEnabled: env.SESSION_REPLAY_PAGES_ENABLED === "1",
     largeScopeHandoffEnabled: env.SESSION_LARGE_READ_HANDOFF_ENABLED === "1",
     analysisCacheEnabled: env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
@@ -319,6 +336,12 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       // writer; the desktop catalog writer waits on migration 20261105031000 (docs/session-desktop-catalog.md).
       ...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}),
     };
+  }
+  if (env.bufferedSearchFeed?.enabled) {
+    // Writes the legacy transcript_events table only; a portable search backend has no buffered feed.
+    // Missing prerequisites disarm only this feed, never the shared runtime.
+    if (deps.search?.ch) deps.bufferedFeed = { source: sqlBufferedFeedSource(db), store, ch: deps.search.ch, keyRoot: env.keyPrefix };
+    else log.warn("buffered search feed disarmed", { stage: "buffered-search-feed", reason: "clickhouse_search_required" });
   }
   if (env.replayPagesEnabled) {
     // This stage needs scoped Put/Get on normalized read artifacts in addition to raw reads.
@@ -579,6 +602,23 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       return { ok: true };
     } catch (error) {
       log.error("reconcile failed", { stage: "object-landed", ...errorFields(error), duration_ms: Date.now() - started });
+      return { ok: false };
+    }
+  }
+  if (event?.bufferedSearchFeed === true) {
+    // Default off before secret lookup, connection pools or object access.
+    if (process.env.INGEST_BUFFERED_SEARCH_FEED !== "on") return { ok: true };
+    const started = Date.now();
+    try {
+      const rt = await ready();
+      if (!rt.deps.bufferedFeed || !rt.env.bufferedSearchFeed) throw new Error("buffered search feed unavailable");
+      const s = await runBufferedFeed(rt.deps.bufferedFeed, rt.env.bufferedSearchFeed);
+      log.info("buffered search feed run", { stage: "buffered-search-feed", listed: s.stages, inserted: s.indexed, skipped: s.skipped,
+        count: s.rows, deleted: s.deleted, ok: !s.blocked, state: s.caughtUp ? "caught_up" : s.blocked ? "blocked" : "continuation",
+        reason: s.blocked ?? (Object.entries(s.reasons).map(([k, n]) => `${k}:${n}`).join(",") || undefined), duration_ms: Date.now() - started });
+      return { ok: true };
+    } catch (error) {
+      log.error("buffered search feed failed", { stage: "buffered-search-feed", ...errorFields(error), duration_ms: Date.now() - started });
       return { ok: false };
     }
   }
