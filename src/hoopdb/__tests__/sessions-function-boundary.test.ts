@@ -50,6 +50,7 @@ describe("unified sessions function-boundary generator", () => {
     expect(c.outputs).toEqual(a.outputs);
     expect(Object.keys(a.outputs).sort()).toEqual([
       "src/hoopdb/migrate-guards.ts", "src/hoopdb/sessions-function-acl.json",
+      "supabase/bootstrap/acquisition_installer_verify.sql",
       "supabase/bootstrap/babysitter_retention_verify.sql",
       "supabase/bootstrap/canonical_project_events_verify.sql",
       "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql",
@@ -64,6 +65,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105042000_babysitter_evidence_retention.down.sql",
       "supabase/rollbacks/20261105043500_lazy_claim_clock_narrowing.down.sql",
       "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql",
+      "supabase/rollbacks/20261105043850_ingest_acquisition_owner.down.sql",
     ]);
   });
 
@@ -279,6 +281,28 @@ describe("unified sessions function-boundary generator", () => {
     expect(down.match(/DROP FUNCTION IF EXISTS/g)?.length).toBe(4);
     expect(down).toContain("DROP TABLE IF EXISTS sessions.owner_buffered_parity;");
     expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043700_owner_buffered_read.sql'");
+  });
+
+  test("043860 buffered search gate: one read-api-callable SECDEF reader, ACL +1, no table grant", async () => {
+    const g = await generate(repo, LANES, VERIFIERS);
+    expect(g.summary.lanes["buffered-search-gate"]).toEqual({ functions: 1, replaces: 0, grants: 1 });
+    expect(LANES.find((l) => l.lane === "buffered-search-gate")?.migration).toBe("supabase/migrations/20261105043860_buffered_search_gate.sql");
+    const acl = JSON.parse(g.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    const mine = Object.entries(acl).filter(([k]) => k.startsWith("sessions.buffered_search_gate_for("));
+    expect(Object.fromEntries(mine)).toEqual({
+      "sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)": ["<owner>:EXECUTE", "bulls96_read_api:EXECUTE"],
+    });
+    const migration = readFileSync(join(root, "supabase/migrations/20261105043860_buffered_search_gate.sql"), "utf8");
+    // EXECUTE only: no table, sequence or schema privilege for any role.
+    expect(migration.match(/^GRANT .*$/gmu)).toEqual(["GRANT EXECUTE ON FUNCTION sessions.buffered_search_gate_for(text, text, text, text, text, text, text, text, boolean, text, jsonb)"]);
+    expect(migration).toContain("FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder;");
+    // The parity tuple is CALLED from 043700, not re-derived.
+    expect(migration).toContain("FROM sessions.owner_buffered_parity_expected(v_org, v_ws, p_owner_user_id, p_cutover_epoch, v_version,");
+    const down = readFileSync(join(root, "supabase/rollbacks/20261105043860_buffered_search_gate.down.sql"), "utf8");
+    expect(down).toContain("a later migration is applied");
+    expect(down.match(/DROP FUNCTION IF EXISTS/g)?.length).toBe(1);
+    expect(down).toContain("DROP FUNCTION IF EXISTS sessions.buffered_search_gate_for(text, text, text, text, text, text, text, text, boolean, text, jsonb);");
+    expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043860_buffered_search_gate.sql'");
   });
 
   test("a stale SECDEF signature under a lane's prefix (an old arity) is dropped from the wrapper, not carried forward", async () => {

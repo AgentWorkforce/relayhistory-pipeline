@@ -30,10 +30,20 @@ binding; anything else fails startup), and it also requires
 `SEARCH_INDEX_POSTGRES_BACKEND_ID` (with `postgres`) and an explicit
 `SESSION_POSTGRES_TLS_PROFILE` (env table below). With `postgres`, search answers
 503 `backend_unavailable` until the search schema owner bootstrap and the read
-role's grants have run. The read login must be `NOSUPERUSER NOBYPASSRLS` (both
-search tables have forced tenant row-level security); the service checks this
-at startup and refuses otherwise. See "Postgres search prerequisites" under
+role's grants have run. The read login must be a real login as exactly
+`bulls96_read_api`, shaped as `supabase/bootstrap/session_read_api_role.sql`
+provisions it (both search tables have forced tenant row-level security). The
+service checks the session identity (no `SET ROLE` or `SET SESSION
+AUTHORIZATION`: the backend's `pg_stat_activity.usename`; `system_user` on PG16+),
+the role's attributes, its memberships in both directions and its pinned
+settings at startup, and refuses otherwise (`reader_role_<property>`). See "Postgres search prerequisites" under
 "Self-host SERVICE" in `docs/session-read-api-design.md`.
+
+It also carries `SERVICE=session-publication` (the canonical publisher,
+`src/session-ingest/publication-service.ts --continuous`, default-off on
+`INGEST_PUBLISH_ENABLED`, probes on `WORKER_HEALTH_PORT`). The local stack does
+not run it either. The per-SERVICE ports, probes, single-origin routing and
+role order are in `docs/selfhost-composition.md`.
 
 Every worker blocks at start until HoopDb answers and the migration ledger is
 complete, so apply order does not matter (the same rule the Kubernetes chart

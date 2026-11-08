@@ -64,8 +64,16 @@ import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
 import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
-import { sqlLiveness, TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
+import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
+import {
+  createBufferedSearchGate,
+  parseBufferedSearchGate,
+  serviceBindingControlHeads,
+  sqlGateStore,
+  type BufferedSearchGate,
+  type ServiceBinding,
+} from "../../../src/session-read-api/buffered-search-gate.ts";
 import { createS3Store } from "../../../src/shared/vendor.ts";
 import { boundedStreamDecompress, ownerBufferedEnabled, serviceBindingControlHead, sqlOwnerBufferedReads, type OwnerBufferedDeps } from "../../../src/session-read-api/owner-buffered.ts";
 
@@ -87,6 +95,18 @@ export interface Env extends CanonicalEnv {
   READ_API_BABYSITTER_EVIDENCE?: string;
   /** The ingest key root the retention buckets live under (default 96bulls). */
   READ_API_BABYSITTER_KEY_ROOT?: string;
+  /**
+   * The per-hit R2 privacy gate for buffered-origin search rows: only "on" enables; default off
+   * (src/session-read-api/buffered-search-gate.ts). It reads the same privacy authority as
+   * owner-buffered reads, the HISTORY_CONTROL_HEAD binding below; on without it, every
+   * buffered-origin row is dropped.
+   */
+  READ_API_BUFFERED_SEARCH_GATE?: string;
+  /**
+   * Tenant read transactions at REPEATABLE READ: only "1" enables; unset/"0" (default) keeps
+   * `BEGIN READ ONLY` at READ COMMITTED (see requestTenantRunner).
+   */
+  READ_API_REPEATABLE_READ?: string;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
   /** Exactly "true" also accepts relaycontrol `sh_at_` tokens; default off. */
@@ -176,14 +196,27 @@ export function clickHouseConfig(env: Env) {
  * Hyperdrive guidance is a client per request (Hyperdrive pools the origin
  * connections), closed after the response. Checks are serialized on the one
  * client, so two transactions never interleave on it.
+ *
+ * Isolation (READ_API_REPEATABLE_READ, default off): off, each transaction is
+ * `BEGIN READ ONLY` at READ COMMITTED, so every statement takes its own
+ * snapshot. On ("1"), it is REPEATABLE READ READ ONLY: every statement reads
+ * ONE snapshot (taken at its first statement), so a check that issues several
+ * statements (the buffered search gate's 500-hit chunks, the owner-buffered
+ * scope then list) judges them all against the same database state. Every
+ * consumer only reads, and a read-only REPEATABLE READ transaction never fails
+ * serialization. It is flagged because Hyperdrive's handling of it is unproven.
  */
-export function requestTenantRunner(connect: () => Promise<pg.Client>): { run: TenantRunner; close(): Promise<void> } {
+export function requestTenantRunner(
+  connect: () => Promise<pg.Client>,
+  options: { repeatableRead?: boolean } = {},
+): { run: TenantRunner; close(): Promise<void> } {
+  const begin = tenantBeginSql(options.repeatableRead === true);
   let client: Promise<pg.Client> | undefined;
   let tail: Promise<unknown> = Promise.resolve();
   const run: TenantRunner = (orgId, workspaceId, work) => {
     const next = tail.then(async () => {
       const c = await (client ??= connect());
-      await c.query("BEGIN READ ONLY");
+      await c.query(begin);
       try {
         await c.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]);
         const q: SqlQuery = {
@@ -265,7 +298,9 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     log("error", "read worker not configured", { error_code: error instanceof ConfigError ? `missing_${error.field}` : (error as { name?: string })?.name ?? "config" });
     return json(503, "backend_unavailable", "read backend unavailable");
   }
-  const tenant = requestTenantRunner(overrides.connect ?? hyperdriveClient(env.SUPABASE));
+  const tenant = requestTenantRunner(overrides.connect ?? hyperdriveClient(env.SUPABASE), {
+    repeatableRead: repeatableReadEnabled(env.READ_API_REPEATABLE_READ),
+  });
   const app = createReadApi({
     timing: timingDeps(env, tenant.run, overrides.fetcher),
     turns: turnsDeps(env, tenant.run, overrides.fetcher),
@@ -279,6 +314,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     briefTitles: sqlBriefTitles(tenant.run),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
+    bufferedSearchGate: bufferedSearchGate(env, tenant.run),
     log: (fields) => log("info", "session read", fields),
   });
   try {
@@ -286,6 +322,17 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   } finally {
     ctx.waitUntil(tenant.close());
   }
+}
+
+/**
+ * The buffered search gate, per request (control heads are never cached across requests).
+ * Off unless READ_API_BUFFERED_SEARCH_GATE=on.
+ */
+export function bufferedSearchGate(env: Env, run: TenantRunner): BufferedSearchGate | undefined {
+  if (!parseBufferedSearchGate(env.READ_API_BUFFERED_SEARCH_GATE)) return undefined;
+  const binding: ServiceBinding | undefined = typeof env.HISTORY_CONTROL_HEAD?.fetch === "function" ? env.HISTORY_CONTROL_HEAD : undefined;
+  if (!binding) log("warn", "buffered search gate on without HISTORY_CONTROL_HEAD: buffered rows are dropped", {});
+  return createBufferedSearchGate({ controlHeads: binding ? serviceBindingControlHeads(binding) : undefined, store: sqlGateStore(run) });
 }
 
 /**

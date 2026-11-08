@@ -26,6 +26,27 @@ export type TenantRunner = <T>(orgId: string, workspaceId: string, work: (q: Sql
 export const TENANT_SETTINGS_SQL =
   "SELECT set_config('bulls96_read.org_id', $1, true), set_config('bulls96_read.workspace_id', $2, true)";
 
+/** The Worker env var that opts its tenant transactions into REPEATABLE READ. */
+export const REPEATABLE_READ_FLAG = "READ_API_REPEATABLE_READ";
+
+/**
+ * READ_API_REPEATABLE_READ: only "1" (trimmed) enables; unset, "0" or anything else is off,
+ * so the default stays the long-standing READ COMMITTED transaction.
+ */
+export function repeatableReadEnabled(raw: string | undefined): boolean {
+  return raw?.trim() === "1";
+}
+
+/**
+ * The BEGIN of a tenant read transaction. Off: `BEGIN READ ONLY` (READ COMMITTED, one snapshot
+ * per statement). On: `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` (one snapshot, taken at
+ * the transaction's first statement, for every statement in it; read-only, so it never fails
+ * serialization).
+ */
+export function tenantBeginSql(repeatableRead: boolean): string {
+  return repeatableRead ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" : "BEGIN READ ONLY";
+}
+
 /** A TenantRunner over a pg-style pool (connect/release clients). */
 export function poolTenantRunner(pool: {
   connect(): Promise<{ query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }>; release(): void }>;

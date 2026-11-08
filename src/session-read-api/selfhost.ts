@@ -16,6 +16,13 @@ import type { CanonicalRows } from "./session-timing-source.ts";
 import type { VerifiedIdentity } from "./app.ts";
 
 export const SELFHOST_READ_API_ENV = "RELAYHISTORY_SELFHOST_READ_API";
+/**
+ * Pattern A (default off): exactly "true" lets POST /v1/cli/login advertise `rth:sync`, and only when
+ * relaycontrol's introspection granted it. Set it only where the self-host ingest edge
+ * (SERVICE=session-ingest) serves sync for the same origin; that edge re-introspects every request and
+ * never trusts this reply. Requires RELAYHISTORY_SELFHOST_READ_API=true.
+ */
+export const SELFHOST_LOGIN_SYNC_ENV = "RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC";
 
 /** Strict: unset, "" or "false" is off, exactly "true" is on, anything else throws at startup. Never echoes the value. */
 export function parseSelfhostReadApi(env: Record<string, unknown>): boolean {
@@ -23,6 +30,15 @@ export function parseSelfhostReadApi(env: Record<string, unknown>): boolean {
   if (raw === undefined || raw === "" || raw === "false") return false;
   if (raw === "true") return true;
   throw new Error(`session read api: ${SELFHOST_READ_API_ENV} must be unset, "", "true" or "false"`);
+}
+
+/** Strict, like parseSelfhostReadApi; on without the self-host read API is a startup error. Never echoes the value. */
+export function parseSelfhostLoginSync(env: Record<string, unknown>): boolean {
+  const raw = env[SELFHOST_LOGIN_SYNC_ENV];
+  if (raw === undefined || raw === "" || raw === "false") return false;
+  if (raw !== "true") throw new Error(`session read api: ${SELFHOST_LOGIN_SYNC_ENV} must be unset, "", "true" or "false"`);
+  if (!parseSelfhostReadApi(env)) throw new Error(`session read api: ${SELFHOST_LOGIN_SYNC_ENV}=true needs ${SELFHOST_READ_API_ENV}=true`);
+  return true;
 }
 
 /** What a successful login exchange proved about the presented token. */
@@ -51,6 +67,11 @@ export interface SelfhostDeps {
   catalog?: CatalogDeps;
   /** Epoch ms; tests pin it. */
   now?: () => number;
+  /**
+   * RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC=true only: the login reply may include `rth:sync`
+   * when introspection granted it. Absent: the reply is exactly as before (never `rth:sync`).
+   */
+  syncServed?: true;
 }
 
 /** The access token's advertised lifetime is capped at this (pass-through; see app.ts). */
