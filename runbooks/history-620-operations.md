@@ -86,21 +86,29 @@ half-done, so retry the aborted call (the switch or the backfill page).
 ## Lock-wait alert (55P03 / 57014)
 
 The ingest Worker writes one extra log line when a buffered lazy claim or a staged ACK fails with
-SQLSTATE 55P03 (`lock_not_available`, e.g. the 2s `lock_timeout`) or 57014 (`query_canceled`,
-statement timeout): `route` = `ingest.lock_alert`, `stage` = `lazy_claim`
-(`ingest_claim_buffered_batch`) or `staged_ack` (`ingest_commit_buffered_batch`), and `sqlstate`.
-It carries no tenant data and no ids. The request's own 503 line is unchanged (`route`
-`delivery.batches` / `turns.batches` / `delivery.recovery`, `outcome` `delivery_unavailable`,
-`stage` `claim` or `buffer_receipt`, `error_code`, `db_error_code`). `set_live`, control changes
-and `lazy_clear` have no Worker call site; for them use the operator session or database log
-(SQLSTATE in the error), with the same three stage names `set_live`, `control_changed`, `lazy_clear`.
+SQLSTATE 55P03 (`lock_not_available`, e.g. the 2s `lock_timeout`) or 57014 (query cancelled;
+usually the statement timeout, but not provably so): `route` = `ingest.lock_alert`, `stage` =
+`lazy_claim` (`ingest_claim_buffered_batch`) or `staged_ack` (`ingest_commit_buffered_batch`),
+and `sqlstate`. It carries no tenant data and no ids. The request's own 503 line is unchanged
+(`route` `delivery.batches` / `turns.batches` / `delivery.recovery`, `outcome`
+`delivery_unavailable`, `stage` `claim` or `buffer_receipt`, `error_code`, `db_error_code`).
+This line covers only those two calls. Control changes and `lazy_clear` run nested inside the
+ordered selection/reset SQL (`ingest_apply_selection` / reset and the history-control triggers);
+their 55P03/57014 currently reach the Worker's selection/reset routes as a generic unavailable
+error without the SQLSTATE, so this alert line does NOT cover them. A follow-up PR will preserve
+the closed SQLSTATE through that conversion and emit `ingest.lock_alert` with stage tags
+`control_changed`, `lazy_clear`, `set_live`, plus an exact attempt/success counter at the commit
+call site. Until then those paths are observable only in the database/operator log.
 
 Alert when any of these is true:
 
-- more than 1% of `commit_buffered_batch` calls fail with 55P03 or 57014 over 5 minutes (numerator:
-  `ingest.lock_alert` lines with `stage=staged_ack`; denominator: buffered requests that reached
-  `buffer_receipt`, i.e. successful batch/recovery lines plus 503 lines with `stage=buffer_receipt`);
-- any 55P03 on `set_live`, `control_changed` or `lazy_clear` (operator or database log);
+- commit lock-alert request rate above 1% over 5 minutes (numerator: `ingest.lock_alert` lines
+  with `stage=staged_ack`; denominator: buffered requests that reached `buffer_receipt`, i.e.
+  successful batch/recovery lines plus 503 lines with `stage=buffer_receipt`). This is a request
+  rate, not an exact RPC failure rate: the denominator includes replay/suppressed successes that
+  never called `ingest_commit_buffered_batch`;
+- any 55P03 on `set_live`, `control_changed` or `lazy_clear`, read from the database/operator log
+  (not from the Worker line) until the follow-up lands;
 - more than 1% of claim-path requests return 503 over 5 minutes (`outcome=delivery_unavailable`
   with `stage=claim`, divided by all batch, turns and recovery requests).
 
