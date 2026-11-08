@@ -25,7 +25,7 @@ whole table.
 | `alleyoop-courier`, `hoopdb-indexer`, `referee`, `bob-costas`, `session-brief` | Deployment (worker) | `src/<name>/...` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz` (`src/shared/worker.ts` `serveHealth`) |
 | `session-read-api` | Deployment (HTTP) | `src/session-read-api/server.ts` | `RELAYHISTORY_READ_API_PORT`, default 8080 | `GET /healthz` (200 `{"ok":true,"enabled":false\|true}`) |
 | `session-publication` | Deployment (worker) | `src/session-ingest/publication-service.ts --continuous` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz` (below) |
-| *(session-ingest)* | Deployment (HTTP) | **not in this image yet** | contract in section 3 | `GET /healthz` |
+| `session-ingest` | Deployment (HTTP) | `src/session-ingest/selfhost-server.ts` | `RELAYHISTORY_INGEST_PORT`, default 8081 | `GET /healthz` (200 `{"ok":true,"enabled":false\|true}`), `GET /readyz` (section 3) |
 
 The worker port serves probes only. It must never be reachable from outside
 the cluster.
@@ -132,11 +132,24 @@ not make it.
 login to advertise `rth:sync` when an ingest is configured. That is a
 read-api change, not made here.
 
-## 3. session-ingest contract (to be built)
+## 3. session-ingest contract
 
-`src/session-ingest/app.ts` serves the delivery contract today as a Cloudflare
-Worker behind relayhistory (`worker.ts`). No image SERVICE runs it. A
-self-host `SERVICE=session-ingest` must:
+`src/session-ingest/app.ts` serves the delivery contract as a Cloudflare
+Worker behind relayhistory (`worker.ts`). `SERVICE=session-ingest`
+(`src/session-ingest/selfhost-server.ts`, default off with
+`RELAYHISTORY_SELFHOST_INGEST`) serves the same app over node:http. Its exact
+behaviour is in `docs/session-ingest-design.md` ("Self-host"). It differs from
+the original sketch below in four ways:
+
+- Port: it listens on `RELAYHISTORY_INGEST_PORT`, default 8081, not 8090.
+- Audience: introspection uses `aud = RELAYHISTORY_INGEST_ORIGIN`.
+- Served routes: only `POST /v1/delivery/batches`, `POST /v1/turns/batches`
+  and `GET /v1/delivery/limits`.
+- Not served yet: recovery, selection, reset and onboarding answer 501
+  `unsupported_by_backend`.
+
+At startup it admits only a real login of `bulls96_session_ingest` with the
+bootstrap's role shape. The original sketch:
 
 1. Listen on its own port. 8090 is suggested, and the port is the router's
    upstream. It answers `GET /healthz`, default-off like read-api.
@@ -207,6 +220,7 @@ anything else fails startup.
 | --- | --- | --- | --- |
 | `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT` | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
 | `session-publication` | `INGEST_PUBLISH_ENABLED` | `INGEST_PUBLISH_{BUCKET,EXPECT_GENERATION,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,INSTANCE_ID,SECRET_ARN,KMS_KEY_ARN,INSTANCE_PROFILE_ARN,ROLE_NAME}`, `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, optional `INGEST_PUBLISH_BUDGET_MS`, `INGEST_PUBLISH_BATCH_LIMIT`, `WORKER_HEALTH_PORT` | none in env: IMDSv2 plus Secrets Manager (see the caveat in section 1) |
+| `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP` | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys |
 | workers | per service (`docs/local-stack.md`) | `HOOPDB_URL`, `WORKER_HEALTH_PORT` | `HOOPDB_URL` password |
 
 CA: `SESSION_POSTGRES_TLS_PROFILE=custom-ca` with `SESSION_POSTGRES_CA_FILE`
