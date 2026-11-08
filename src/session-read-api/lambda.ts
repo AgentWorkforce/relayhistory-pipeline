@@ -36,7 +36,7 @@ import { createReadApi, parseDirectoryWorkspaces, type ReadApiDeps } from "./app
 import { sqlDirectory } from "./directory.ts";
 import { sqlBriefTitles } from "./brief-titles.ts";
 import { readApiVerifier, relaycontrolLogin, type AuthConfig } from "./auth.ts";
-import { parseSelfhostReadApi } from "./selfhost.ts";
+import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
 import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
@@ -181,6 +181,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
   if (!region || !secretArn) throw new Error("session read api: AWS_REGION and SESSION_READ_API_SECRET_ARN are required");
   parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   parseSelfhostReadApi(env);
+  parseSelfhostLoginSync(env);
   postgresTlsOptions(env);
   searchBackend(env, composition); // reject unsupported selections before secret lookup
   const { SecretString } = await awsJsonCall<{ SecretString?: string }>({
@@ -203,6 +204,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const backend = searchBackend(env, composition, entry);
   const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   const selfhostReadApi = parseSelfhostReadApi(env);
+  const loginSync = parseSelfhostLoginSync(env);
   // The self-host service never inherits the hosted Supabase pin by omission.
   if (entry === "service" && !env.SESSION_POSTGRES_TLS_PROFILE)
     throw new Error("session read api: the self-host service needs SESSION_POSTGRES_TLS_PROFILE set explicitly");
@@ -240,7 +242,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
-    ...(selfhostReadApi ? { selfhost: { login: relaycontrolLogin(authConfig) } } : {}),
+    ...(selfhostReadApi ? { selfhost: { login: relaycontrolLogin(authConfig), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),
     log: (fields) => log.info("session read", fields),
   };
   return { deps, authConfig, close: () => pool.end() };
