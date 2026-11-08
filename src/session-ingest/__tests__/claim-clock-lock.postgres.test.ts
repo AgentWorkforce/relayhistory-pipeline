@@ -296,6 +296,11 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     const k = constrained ? Math.floor(capacity / 500) + 1 : 3;
     console.log(JSON.stringify({ proof: "claim-clock-lock-53200", ...cfg, maxBackends, nominalLockTable, measuredAdvisoryCapacity: constrained ? `<${capacity + chunk}` : `>=${cap}`,
       constrained, heldClaims: k, preFixAdvisoryFootprint: k * 500 }));
+    if (process.env.CLAIM_CLOCK_LOCK_EXPECT_CONSTRAINED === "1") {
+      // The constrained CI fixture must actually be constrained: fail instead of degrading to the unconstrained case.
+      expect(constrained).toBe(true);
+      if (k > maxHeld) throw new Error(`constrained server too large for the proof: measured advisory capacity <${capacity + chunk} needs ${k} held claims > ${maxHeld}`);
+    }
     if (constrained) expect(k * 500).toBeGreaterThan(capacity + chunk - 1);
     expect(k).toBeLessThanOrEqual(maxHeld);
     const ts = Array.from({ length: k }, (_, i) => tenant(`f2-${i}`));
