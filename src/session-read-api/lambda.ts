@@ -14,7 +14,12 @@
  * complete, or "epoch"; required), RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER
  * (optional overrides), RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS (exactly "true"
  * also accepts relaycontrol `sh_at_` tokens; default off) with
- * RELAYCONTROL_INTROSPECT_URL / RELAYCONTROL_INTROSPECT_SECRET.
+ * RELAYCONTROL_INTROSPECT_URL / RELAYCONTROL_INTROSPECT_SECRET,
+ * RELAYHISTORY_SELFHOST_READ_API (exactly "true" registers POST /v1/cli/login and
+ * GET /v1/sessions/:id/catalog; unset/""/"false" off; anything else fails startup.
+ * Login needs the relaycontrol introspection above, else 503; this entry wires no
+ * canonical source, so catalog answers 501 `catalog_not_configured`, and the
+ * Function URL handler is GET-only, so login is 405 here).
  *
  * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED, owner-buffered.ts) are
  * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
@@ -30,7 +35,8 @@ import { createClickHouseClient } from "../session-pipeline/vendor/search-index/
 import { createReadApi, parseDirectoryWorkspaces } from "./app.ts";
 import { sqlDirectory } from "./directory.ts";
 import { sqlBriefTitles } from "./brief-titles.ts";
-import { readApiVerifier, type AuthConfig } from "./auth.ts";
+import { readApiVerifier, relaycontrolLogin, type AuthConfig } from "./auth.ts";
+import { parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
 import { poolTenantRunner, sqlLiveness } from "./liveness.ts";
@@ -91,6 +97,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
   const secretArn = env.SESSION_READ_API_SECRET_ARN;
   if (!region || !secretArn) throw new Error("session read api: AWS_REGION and SESSION_READ_API_SECRET_ARN are required");
   parseCompleteSince(env.READ_API_COMPLETE_SINCE);
+  parseSelfhostReadApi(env);
   postgresTlsOptions(env);
   searchBackend(env, composition); // reject unsupported selections before secret lookup
   const { SecretString } = await awsJsonCall<{ SecretString?: string }>({
@@ -109,6 +116,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
 export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition): Promise<{ app: App; close(): Promise<void> }> {
   const backend = searchBackend(env, composition);
   const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
+  const selfhostReadApi = parseSelfhostReadApi(env);
   const tls = postgresTlsOptions(env);
   const secret = parseReadApiSecret(secretText, backend === "clickhouse");
   const connectionString = new URL(postgresConnectionString(secret.supabase_url));
@@ -135,8 +143,9 @@ export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessE
   try {
   const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", poolTenantRunner(pool as never));
   if (adapter && await adapter.state.fromMs(new Date()) > completeSinceMs) throw new Error("read history floor is below search coverage");
+  const authConfig = readApiAuthConfig(env);
   const app = createReadApi({
-    verify: readApiVerifier(readApiAuthConfig(env)),
+    verify: readApiVerifier(authConfig),
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
     directory: sqlDirectory(poolTenantRunner(pool as never)),
@@ -144,6 +153,7 @@ export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessE
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
+    ...(selfhostReadApi ? { selfhost: { login: relaycontrolLogin(authConfig) } } : {}),
     log: (fields) => log.info("session read", fields),
   });
   return { app, close: () => pool.end() };

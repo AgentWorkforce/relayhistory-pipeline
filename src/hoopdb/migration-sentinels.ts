@@ -44,6 +44,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_buffer_gc_claim(jsonb)') AND prosecdef AND prosrc LIKE '%96bulls:buffer-gc-user-v1%') AS applied",
   },
   "upstream:20261105043000_brief_titles.sql": { evidence: "column sessions.session_briefs.origin", sql: column("sessions.session_briefs", "origin") },
+  "upstream:20261105043500_lazy_claim_clock_narrowing.sql": {
+    evidence: "replacement: lazy claim reads the seat clock under KEY SHARE with one advisory lock per (org, workspace, origin)",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_records(jsonb)') AND NOT prosecdef AND prosrc LIKE '%lazy-native-origin-v1%') AS applied",
+  },
   "upstream:20261105043700_owner_buffered_read.sql": { evidence: "function sessions.buffered_sessions_for", sql: "SELECT to_regprocedure('sessions.buffered_sessions_for(text,timestamptz,text,text,integer,text,text,text,text,text,boolean,text)') IS NOT NULL AS applied" },
   "upstream:20261105024000_session_brief_documents.sql": { evidence: "table sessions.session_brief_document_outbox", sql: relation("sessions.session_brief_document_outbox") },
   "upstream:20261105025000_canonical_feature_journal.sql": { evidence: "table sessions.canonical_feature_journal", sql: relation("sessions.canonical_feature_journal") },
@@ -186,6 +190,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */
 export const NON_CREATE_STEPS = [
   "upstream:20261105039000_buffered_gc_single_candidate.sql",
+  "upstream:20261105043500_lazy_claim_clock_narrowing.sql",
   "upstream:20261025000300_upsert_keep_on_null.sql",
   "upstream:20261030000000_relayhistory_machines_compat.sql",
   "upstream:20261102010000_session_directory_canonical_ids.sql",

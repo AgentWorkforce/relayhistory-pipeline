@@ -21,6 +21,12 @@ services, same env contract, same migrations.
 | `96b-telemetry-init` | alpine | one-shot: opens the telemetry volume for the collector's uid |
 | `96b-otel-collector` | otel/opentelemetry-collector-contrib | OTLP in; spans to `/telemetry/spans.jsonl` (port 14318) |
 
+The services image also carries `SERVICE=session-read-api` (the session read
+API over HTTP, `src/session-read-api/server.ts`). The local stack does not run
+it, and it is default-off (`RELAYHISTORY_SELFHOST_READ_API`). Dormant, it
+answers `/healthz` only. See "Self-host SERVICE" in
+`docs/session-read-api-design.md`.
+
 Every worker blocks at start until HoopDb answers and the migration ledger is
 complete, so apply order does not matter (the same rule the Kubernetes chart
 uses via `/readyz`).
@@ -86,6 +92,7 @@ keep their path unchanged either way.
 | `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS` | ingest, read API (Lambda and Worker) | Exactly `true` enables; anything else is off. Off, a `sh_at_` bearer is refused exactly as before. |
 | `RELAYCONTROL_INTROSPECT_URL` | same | Relaycontrol's base URL, configuration only. Same transport rule as every destination: https, loopback, or `http` to an in-cluster Service name with `ALLOW_IN_CLUSTER_HTTP=true` (the Worker: https or loopback only). |
 | `RELAYCONTROL_INTROSPECT_SECRET` | same | The dedicated service secret, sent as `Authorization: Bearer`. From the secret store only, never a file. |
+| `RELAYHISTORY_SELFHOST_READ_API` | read API | Exactly `true` adds `POST /v1/cli/login` (pass-through `sh_at_` exchange through the introspection above, no refresh) and `GET /v1/sessions/:id/catalog`; unset/`""`/`false` off; anything else fails startup. See docs/session-read-api-design.md §2a. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
