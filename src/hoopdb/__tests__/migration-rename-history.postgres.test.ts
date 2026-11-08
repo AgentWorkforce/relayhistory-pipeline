@@ -70,6 +70,23 @@ native("native PG17: released image ledger upgrades in place as unchanged non-CR
   expect(await schemaVerdict({...await expectedSchema(),dbMode:"selfhosted"},txn(runtime))).toEqual({ok:true});
   expect((await runMigrations(sql(owner),{profile:next})).applied).toBe(0);
   expect(await liveRows(owner)).toEqual(physicalAfter);
+  // A canonical row cannot conceal an original/current collision, even if
+  // the original is corrupt. All negative probes are read-only for history/marker.
+  for(const alias of MIGRATION_RENAME_ALIASES){
+   for(const hash of [alias.ledger_sha,"0".repeat(64)]){
+    await owner.query("UPDATE sessions.__96bulls_migrations SET sha256=$1 WHERE name=$2",[hash,alias.ledger_name]);
+    await owner.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)",[alias.migration,alias.accepted_as_alias_of]);
+    const ledgerBefore=await liveRows(owner), markerBeforeCollision=(await owner.query("SELECT * FROM sessions.__96bulls_role_validation")).rows;
+    expect(await schemaVerdict({...await expectedSchema(),dbMode:"selfhosted"},txn(runtime))).toEqual({ok:false,reason:"schema_pending",count:1});
+    expect((await rejected(runMigrations(sql(owner),{profile:next})))?.code).toBe("ledger_unknown_step");
+    expect(await liveRows(owner)).toEqual(ledgerBefore);
+    expect((await owner.query("SELECT * FROM sessions.__96bulls_role_validation")).rows).toEqual(markerBeforeCollision);
+    expect(await selected(owner)).toEqual(preserved);
+    await owner.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1",[alias.migration]);
+    await owner.query("UPDATE sessions.__96bulls_migrations SET sha256=$1 WHERE name=$2",[alias.ledger_sha,alias.ledger_name]);
+    expect(await schemaVerdict({...await expectedSchema(),dbMode:"selfhosted"},txn(runtime))).toEqual({ok:true});
+   }
+  }
   // A checksum forgery on this isolated fixture is not adopted: readiness stays
   // schema_pending and the migrator refuses, without marker/ledger side effects.
   const a=MIGRATION_RENAME_ALIASES[0];await owner.query("UPDATE sessions.__96bulls_migrations SET sha256=$1 WHERE name=$2",["0".repeat(64),a.ledger_name]);

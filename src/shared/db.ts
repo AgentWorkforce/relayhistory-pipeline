@@ -222,6 +222,12 @@ export async function schemaVerdict(
         )).rows) ledger.set(r.name, r.sha256);
         const shas = expected.shas ?? {};
         adoptRenamedLedgerRows(ledger, (n) => (Object.hasOwn(shas, n) ? shas[n] : undefined));
+        // A recognized original left unadopted is invalid even when its
+        // canonical name is also present. Do not let that canonical row hide
+        // an original/current collision, wrong hash or unpinned repair.
+        const unadopted = originals.filter((name) => ledger.has(name));
+        if (unadopted.length)
+          return { ok: false, reason: "schema_pending", count: unadopted.length };
         have = new Set(ledger.keys());
       }
       // The role shim, bootstrap and verify steps are not schema; the marker covers verify.

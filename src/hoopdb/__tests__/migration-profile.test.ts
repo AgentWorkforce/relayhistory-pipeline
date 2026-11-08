@@ -842,6 +842,27 @@ describe("append-only renamed migrations: adopted in memory only when every chec
     expect((await snapshot(db)).marker).toEqual(before.marker);
   });
 
+  test("readiness refuses original/current collisions and bad original hashes without changing physical history or marker", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    const expected = await expectedSchema();
+    expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: true });
+    const currentOnly = await snapshot(db);
+    for (const alias of MIGRATION_RENAME_ALIASES) {
+      for (const sha of [alias.ledger_sha, "0".repeat(64)]) {
+        await db.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)", [alias.ledger_name, sha]);
+        const before = await snapshot(db);
+        expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: false, reason: "schema_pending", count: 1 });
+        expect((await failure(runMigrations(client(db), { profile: LOCAL })))?.code).toBe("ledger_unknown_step");
+        expect(await snapshot(db)).toEqual(before);
+        // Removing only our injected fixture row restores the unchanged current-only baseline.
+        await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1", [alias.ledger_name]);
+        expect(await snapshot(db)).toEqual(currentOnly);
+        expect(await schemaVerdict(expected, transact(db))).toEqual({ ok: true });
+      }
+    }
+  });
+
   test("an exact original ingest row without its exact forward repair refuses as ledger_alias_repair_missing, nothing marked", async () => {
     const db = await fresh();
     await runMigrations(client(db), { profile: LOCAL });
