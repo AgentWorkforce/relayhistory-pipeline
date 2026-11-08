@@ -8,7 +8,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import pg from "pg";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { causal, consumerVisible, parity, parityVisible, root, type CausalCase, type ParityCase } from "./buffered-privacy-fixture-support.ts";
+import { headParams, type AuthorityHead, type BufferedScope } from "../owner-buffered.ts";
+import { causal, consumerVisible, firstAuthority, parity, parityVisible, root, type CausalCase, type ParityCase } from "./buffered-privacy-fixture-support.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 const sql = (path: string) => readFileSync(join(root, path), "utf8");
@@ -36,6 +37,8 @@ describe.skipIf(!url)("043700 + PR B fixtures on actual PostgreSQL", () => {
       await db.query(sql(`supabase/bootstrap/${file}.sql`));
     for (const file of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort())
       await db.query(sql(`supabase/migrations/${file}`));
+    await db.query(sql("supabase/bootstrap/session_read_api_role.sql").split("\n")
+      .filter((line) => !line.startsWith("\\")).join("\n"));
     await db.query("CREATE TEMP TABLE prb_release_vectors(kind text NOT NULL, id text NOT NULL, payload jsonb NOT NULL, PRIMARY KEY(kind,id))");
     for (const item of causal.cases) await db.query("INSERT INTO prb_release_vectors VALUES('causal',$1,$2::jsonb)", [item.id, JSON.stringify(item)]);
     for (const item of parity.cases) await db.query("INSERT INTO prb_release_vectors VALUES('parity',$1,$2::jsonb)", [item.id, JSON.stringify(item)]);
@@ -56,6 +59,31 @@ describe.skipIf(!url)("043700 + PR B fixtures on actual PostgreSQL", () => {
     expect(rows[0]!.args, `${name}: p_head_kind`).toContain("p_head_kind text");
     expect(rows[0]!.args, `${name}: p_privacy_baseline_sha256`).toContain("p_privacy_baseline_sha256 text");
     return rows[0]!;
+  }
+
+  async function invokeReaders(scope: BufferedScope, authority: AuthorityHead, source: string, sessionId: string) {
+    const h = headParams(authority);
+    const authorityParams = [h.cutoverEpoch, h.headEpoch, h.headVersion, h.headDigest,
+      h.headKind, h.headPending, h.privacyBaselineSha256];
+    await db.query("BEGIN READ ONLY");
+    try {
+      await db.query("SELECT set_config('bulls96_read.org_id',$1,true),set_config('bulls96_read.workspace_id',$2,true),set_config('bulls96_read.user_id',$3,true)",
+        [scope.orgId, scope.workspaceId, scope.userId]);
+      await db.query("SET LOCAL ROLE bulls96_read_api");
+      const list = await db.query(
+        "SELECT count(*)::int AS n FROM sessions.buffered_sessions_for($1,null,null,null,10,$2,$3,$4,$5,$6,$7,$8)",
+        [scope.workspaceId, ...authorityParams],
+      );
+      const stages = await db.query(
+        "SELECT count(*)::int AS n FROM sessions.buffered_session_stages_for($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        [scope.workspaceId, source, sessionId, ...authorityParams],
+      );
+      await db.query("COMMIT");
+      return { list: list.rows[0]!.n as number, stages: stages.rows[0]!.n as number };
+    } catch (error) {
+      await db.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    }
   }
 
   test("PR A seam 1: owner_buffered_read_scope binds v5.3 authority and mandatory G2", async () => {
@@ -95,5 +123,25 @@ describe.skipIf(!url)("043700 + PR B fixtures on actual PostgreSQL", () => {
     expect(rows).toHaveLength(16);
     for (const { payload } of rows)
       expect(parityVisible(payload), payload.id).toBe(payload.emitBuffered);
+  });
+
+  test("all 42 release vectors execute both final reader RPC ABIs under bulls96_read_api", async () => {
+    const causalRows = await db.query<{ payload: CausalCase }>("SELECT payload FROM prb_release_vectors WHERE kind='causal' ORDER BY id");
+    for (const { payload } of causalRows.rows) {
+      const result = await invokeReaders(payload.candidate.scope, firstAuthority(payload),
+        payload.candidate.scope.source, payload.candidate.scope.sessionId);
+      // This proof database deliberately has no buffered candidates; route behavior is covered
+      // by buffered-privacy-fixtures.test.ts. Here each vector proves the real final ABI/role call.
+      expect(result, payload.id).toEqual({ list: 0, stages: 0 });
+    }
+    const parityAuthority: AuthorityHead = {
+      cutoverEpoch: "1".repeat(64), privacyBaselineSha256: "2".repeat(64),
+      head: { epoch: "1".repeat(64), version: "7", digest: "3".repeat(64), kind: "selection", pending: false },
+    };
+    const parityScope = { orgId: "fixture-org", workspaceId: "fixture-workspace", userId: "fixture-user" };
+    for (const vector of parity.cases) {
+      const result = await invokeReaders(parityScope, parityAuthority, "claude", "fixture-session");
+      expect(result, vector.id).toEqual({ list: 0, stages: 0 });
+    }
   });
 });
