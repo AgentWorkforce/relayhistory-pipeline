@@ -389,9 +389,16 @@ describe("includeMessageId", () => {
     expect(seen).toEqual([{ orgId: "org-a", workspaceId: "ws-a", sessionId: "s-1", source: "codex" }]);
   });
 
-  test("null when the record has no id or another event's id", async () => {
-    const a = api({ ch, liveness, eventMessageIds: { async source() { return { legacyCoverage: null, rows: [row(null), row("other", { event_id: "e-2" })] }; } } });
+  test("null when the canonical record has no id", async () => {
+    const a = api({ ch, liveness, eventMessageIds: { async source() { return { legacyCoverage: null, rows: [row(null)] }; } } });
     expect((await json(await a.get(URL, await session(a)))).events[0].messageId).toBeNull();
+  });
+
+  test("an event the canonical objects do not hold is a 501, not a null id", async () => {
+    const a = api({ ch, liveness, eventMessageIds: { async source() { return { legacyCoverage: null, rows: [row("other", { event_id: "e-2" })] }; } } });
+    const r = await a.get(URL, await session(a));
+    expect(r.status).toBe(501);
+    expect((await json(r)).error.reason).toBe("message_id_no_canonical_event");
   });
 
   test("a refused canonical read is a 501, never a page of nulls; source is required", async () => {

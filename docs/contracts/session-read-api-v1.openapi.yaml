@@ -220,7 +220,7 @@ paths:
         - {name: order, in: query, schema: {type: string, enum: [asc, desc]}}
         - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 1000, default: 200}}
         - {name: maxContent, in: query, description: Truncate event content to this many characters., schema: {type: integer, minimum: 1}}
-        - {name: includeMessageId, in: query, description: "true adds messageId to each event. Requires source. Self-host service with the canonical store only; elsewhere 501.", schema: {type: boolean}}
+        - {name: includeMessageId, in: query, description: "true adds messageId to each event. Requires source. Self-host service with the canonical store only; elsewhere, or for events the canonical objects do not hold, 501.", schema: {type: boolean}}
         - $ref: "#/components/parameters/cursor"
       responses:
         "200":

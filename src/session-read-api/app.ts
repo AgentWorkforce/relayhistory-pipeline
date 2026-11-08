@@ -615,8 +615,8 @@ export function createReadApi(deps: ReadApiDeps) {
    * missing ids would look like messages that have none.
    */
   async function withMessageIds<E extends { eventId: string; machineId: string; kind: string }>(identity: VerifiedIdentity, sessionId: string, source: string | undefined, events: E[]): Promise<Array<E & { messageId: string | null }>> {
-    if (events.length === 0) return [];
     if (source === undefined) throw unsupported("message_id_source_required");
+    if (events.length === 0) return [];
     const canonical = deps.eventMessageIds!;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -636,11 +636,15 @@ export function createReadApi(deps: ReadApiDeps) {
     }
     const key = (eventId: unknown, machineId: unknown, kind: unknown) => JSON.stringify([eventId, machineId, kind]);
     const ids = new Map<string, string>();
+    const known = new Set<string>();
     for (const { table, row } of snapshot.rows) {
       if (table !== "convergence_events") continue;
+      known.add(key(row.event_id, row.machine_id, row.kind));
       const payload = (row.record as { payload?: { message_id?: unknown } } | undefined)?.payload;
       if (typeof payload?.message_id === "string") ids.set(key(row.event_id, row.machine_id, row.kind), payload.message_id);
     }
+    // An event the canonical objects do not hold (backfilled history) has an unknown id, not a null one.
+    if (events.some((event) => !known.has(key(event.eventId, event.machineId, event.kind)))) throw unsupported("message_id_no_canonical_event");
     return events.map((event) => ({ ...event, messageId: ids.get(key(event.eventId, event.machineId, event.kind)) ?? null }));
   }
 
