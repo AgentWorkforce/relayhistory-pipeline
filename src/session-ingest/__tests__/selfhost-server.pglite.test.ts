@@ -351,11 +351,12 @@ describe("dormant and configuration", () => {
  * Rows captured verbatim from real password (scram) logins as bulls96_session_ingest, with the pool's
  * INGEST_OPTIONS, after session_ingest_roles.sql ran as a non-superuser CREATEROLE `postgres` under the
  * bootstrap superuser `supabase_admin` (the Supabase shape) and session_ingest_role.sql pinned LOGIN
- * NOINHERIT and the timeouts: postgres:16 (160015) and postgres:15 (150019). PGlite has no real login
- * (session_user is always its superuser), so the decision is tested over these rows.
+ * NOINHERIT and the timeouts: postgres:16 (160015), postgres:15 (150019) and postgres:17 (170011). PGlite
+ * has no real login (session_user is always its superuser), so the decision is tested over these rows.
  */
+const R = "bulls96_session_ingest";
 const REAL_PG16_LOGIN = {
-  session_user: "bulls96_session_ingest", current_user: "bulls96_session_ingest", role_setting: "none", server_version: 160015,
+  session_user: R, current_user: R, role_setting: "none", server_version: 160015, backend_user: R,
   statement_timeout: "5s", lock_timeout: "2s", idle_in_transaction_session_timeout: "10s",
   rolsuper: false, rolbypassrls: false, rolcreaterole: false, rolcreatedb: false, rolreplication: false, rolinherit: false,
   rolconfig: ["statement_timeout=5s", "lock_timeout=2s", "idle_in_transaction_session_timeout=10s"],
@@ -364,6 +365,41 @@ const REAL_PG16_LOGIN = {
 const CREATOR_EDGE = { member: "postgres", grantor: "supabase_admin", grantor_super: true, admin_option: true, inherit_option: false, set_option: false };
 const REAL_PG16_EXTRA = { system_user: "scram-sha-256:bulls96_session_ingest", member_edges: [CREATOR_EDGE] };
 const REAL_PG15_LOGIN = { ...REAL_PG16_LOGIN, server_version: 150019, members: 0 };
+const REAL_PG17_LOGIN = { ...REAL_PG16_LOGIN, server_version: 170011 };
+
+/**
+ * Identity columns recorded on the same servers (2026-11-08) for the three sessions that must be told apart.
+ * `ssa` is a superuser (supabase_admin) login that ran SET SESSION AUTHORIZATION bulls96_session_ingest:
+ * session_user and current_user become the role and role stays 'none'; only this backend's
+ * pg_stat_activity usename (and, on 16+, system_user) still names the authenticated login. These match
+ * #366's independent recordings (there with `postgres` as the superuser).
+ */
+const RECORDED_IDENTITY: Record<string, { base: Record<string, unknown>; sessions: Record<string, [Record<string, unknown>, string | undefined]> }> = {
+  "15": {
+    base: REAL_PG15_LOGIN,
+    sessions: {
+      genuine: [{ session_user: R, current_user: R, role_setting: "none", backend_user: R }, undefined],
+      ssa: [{ session_user: R, current_user: R, role_setting: "none", backend_user: "supabase_admin" }, undefined],
+      setrole: [{ session_user: "supabase_admin", current_user: R, role_setting: R, backend_user: "supabase_admin" }, undefined],
+    },
+  },
+  "16": {
+    base: REAL_PG16_LOGIN,
+    sessions: {
+      genuine: [{ session_user: R, current_user: R, role_setting: "none", backend_user: R }, `scram-sha-256:${R}`],
+      ssa: [{ session_user: R, current_user: R, role_setting: "none", backend_user: "supabase_admin" }, "scram-sha-256:supabase_admin"],
+      setrole: [{ session_user: "supabase_admin", current_user: R, role_setting: R, backend_user: "supabase_admin" }, "scram-sha-256:supabase_admin"],
+    },
+  },
+  "17": {
+    base: REAL_PG17_LOGIN,
+    sessions: {
+      genuine: [{ session_user: R, current_user: R, role_setting: "none", backend_user: R }, `scram-sha-256:${R}`],
+      ssa: [{ session_user: R, current_user: R, role_setting: "none", backend_user: "supabase_admin" }, "scram-sha-256:supabase_admin"],
+      setrole: [{ session_user: "supabase_admin", current_user: R, role_setting: R, backend_user: "supabase_admin" }, "scram-sha-256:supabase_admin"],
+    },
+  },
+};
 
 /** A SqlRun that answers the two admission statements with the given rows, and records what ran. */
 function injected(login: Record<string, unknown> | null, extra: Record<string, unknown> | null = REAL_PG16_EXTRA) {
@@ -397,6 +433,22 @@ describe("startup admission", () => {
     expect(pg15.seen).toEqual([INGEST_LOGIN_SQL]); // system_user and set_option do not exist before 16
     // A PG16 role with no incoming edge at all (a superuser created it: CNPG, Cloud SQL) is admitted on any provider.
     for (const provider of [SUPABASE, NOT_SUPABASE]) expect(ingestLoginRefusal({ ...REAL_PG16_LOGIN, members: 0 }, { ...REAL_PG16_EXTRA, member_edges: [] }, provider)).toBeNull();
+  });
+
+  test("recorded real-server rows: SET SESSION AUTHORIZATION and SET ROLE by a superuser refuse on PG15, 16 and 17", async () => {
+    const want = { genuine: "admitted", ssa: "backend_user", setrole: "session_user" };
+    for (const [v, { base, sessions }] of Object.entries(RECORDED_IDENTITY)) {
+      for (const [name, [identity, systemUser]] of Object.entries(sessions)) {
+        const login = { ...base, ...identity };
+        const extra = systemUser === undefined ? null : { ...REAL_PG16_EXTRA, system_user: systemUser };
+        expect([v, name, await admission(injected(login, extra).run)]).toEqual([v, name, want[name as keyof typeof want]]);
+      }
+    }
+    // PG15 has no system_user: the backend usename is the only signal there. On 16+ system_user also refuses
+    // SET SESSION AUTHORIZATION on its own, should the usename ever agree.
+    const [ssa16, su16] = RECORDED_IDENTITY["16"]!.sessions.ssa!;
+    expect(ingestLoginRefusal({ ...REAL_PG16_LOGIN, ...ssa16, backend_user: R }, { ...REAL_PG16_EXTRA, system_user: su16 }, SUPABASE)).toBe("system_user");
+    expect(ingestLoginRefusal({ ...REAL_PG16_LOGIN, backend_user: null }, REAL_PG16_EXTRA, SUPABASE)).toBe("backend_user");
   });
 
   test("causal: the non-assumable Supabase creator edge is the only incoming edge admitted, and only on a declared Supabase", async () => {
@@ -433,6 +485,8 @@ describe("startup admission", () => {
       ["member login + SET ROLE", { ...L, session_user: "app_member", role_setting: "bulls96_session_ingest" }, X, "session_user"],
       ["ingest login switched away (current_user)", { ...L, current_user: "postgres", role_setting: "postgres" }, X, "current_user"],
       ["SET ROLE to itself (role setting not none)", { ...L, role_setting: "bulls96_session_ingest" }, X, "set_role"],
+      ["SET SESSION AUTHORIZATION (backend usename differs)", { ...L, backend_user: "postgres" }, X, "backend_user"],
+      ["backend row unreadable", { ...L, backend_user: null }, X, "backend_user"],
       ["PG16 system_user NULL (trust auth)", L, { ...X, system_user: null }, "system_user"],
       ["PG16 system_user another identity", L, { ...X, system_user: "scram-sha-256:postgres" }, "system_user"],
       ["PG16 system_user suffix only", L, { ...X, system_user: "scram-sha-256:x:bulls96_session_ingest" }, "system_user"],

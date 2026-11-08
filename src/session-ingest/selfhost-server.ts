@@ -16,8 +16,9 @@
  * Bindings, Node instead of Cloudflare:
  *   HYPERDRIVE     -> pg.Pool as bulls96_session_ingest (discrete fields, SESSION_POSTGRES_TLS_PROFILE),
  *                     admitted at startup only as a real login of exactly that role (assertIngestRole:
- *                     session_user, current_user, no SET ROLE, PG16+ system_user), with the bootstrap's
- *                     role shape, no membership edge in either direction, and the pinned timeouts
+ *                     session_user, current_user, no SET ROLE, the backend usename, PG16+ system_user),
+ *                     with the bootstrap's role shape, no membership edge in either direction, and the
+ *                     pinned timeouts
  *   S3 secrets     -> the Locker store (src/shared/locker.ts: MinIO static keys, EKS Pod Identity, or GCS)
  *   INGEST_FANOUT  -> none. The queue only exists because a Worker invocation has a subrequest budget
  *                     (staging.ts); a Node process does not, so `inlineMaxSessions` is unset and every
@@ -108,7 +109,7 @@ export const INGEST_OPTIONS = Object.entries(INGEST_TIMEOUTS).map(([k, v]) => `-
 const INGEST_ROLCONFIG = JSON.stringify(Object.entries(INGEST_TIMEOUTS).map(([k, v]) => `${k}=${v}`).sort());
 
 export type IngestLoginRefusal =
-  | "login_unreadable" | "session_user" | "current_user" | "set_role" | "system_user"
+  | "login_unreadable" | "session_user" | "current_user" | "set_role" | "backend_user" | "system_user"
   | "superuser" | "bypassrls" | "role_attributes" | "role_membership" | "role_members" | "role_settings" | "timeouts";
 
 /** Names the failed property only; never an observed role name, URL or credential. */
@@ -124,6 +125,7 @@ export const INGEST_LOGIN_SQL = `SELECT session_user::text AS session_user, curr
   current_setting('role') AS role_setting, current_setting('server_version_num')::int AS server_version,
   current_setting('statement_timeout') AS statement_timeout, current_setting('lock_timeout') AS lock_timeout,
   current_setting('idle_in_transaction_session_timeout') AS idle_in_transaction_session_timeout,
+  (SELECT a.usename::text FROM pg_catalog.pg_stat_activity a WHERE a.pid = pg_catalog.pg_backend_pid()) AS backend_user,
   r.rolsuper, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolinherit, r.rolconfig,
   (SELECT count(*)::int FROM pg_auth_members m WHERE m.member = r.oid) AS memberships,
   (SELECT count(*)::int FROM pg_auth_members m WHERE m.roleid = r.oid) AS members,
@@ -179,6 +181,10 @@ export function ingestLoginRefusal(login: Record<string, unknown> | undefined, p
   if (login.role_setting !== "none") return "set_role";
   const version = login.server_version;
   if (typeof version !== "number" || !Number.isInteger(version) || version < 100000) return "login_unreadable";
+  // SET SESSION AUTHORIZATION by a superuser makes session_user and current_user the role and leaves role
+  // 'none' (real PG 15.19, 16.15, 17.11). This backend's pg_stat_activity usename is fixed at
+  // authentication and still names the real login, on every version; on PG15 it is the only signal.
+  if (login.backend_user !== SELFHOST_INGEST_ROLE) return "backend_user";
   const modern = version >= 160000;
   if (modern) {
     if (!pg16) return "login_unreadable";
@@ -209,8 +215,9 @@ export function ingestLoginRefusal(login: Record<string, unknown> | undefined, p
 
 /**
  * Startup admission: the pool's session is a real login as exactly the ingest role (session_user,
- * current_user, no SET ROLE, and on PG16+ system_user), with the bootstrap's role shape, no membership
- * edge in either direction (but the Supabase creator edge) and the pinned timeout profile. Any mismatch
+ * current_user, no SET ROLE, the backend's pg_stat_activity usename, and on PG16+ system_user), with the
+ * bootstrap's role shape, no membership edge in either direction (but the Supabase creator edge) and the
+ * pinned timeout profile. Any mismatch
  * or query failure refuses startup; the error names the failed property only.
  */
 export async function assertIngestRole(run: SqlRun, provider: IngestProvider): Promise<void> {
