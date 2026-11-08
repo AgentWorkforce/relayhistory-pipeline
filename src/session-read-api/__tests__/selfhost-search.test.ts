@@ -10,7 +10,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import pg from "pg";
 import { createReadApi } from "../app.ts";
 import { TENANT_SETTINGS_SQL } from "../liveness.ts";
-import { assertReaderRole, readApiDepsFromSecret } from "../lambda.ts";
+import { assertReaderRole, readApiDepsFromSecret, READER_LOGIN_SQL, READER_PG16_SQL } from "../lambda.ts";
+import { READER_LOGIN_ROW, readerLoginAnswer } from "./reader-login-support.ts";
 import { selfhostSearchComposition, startReadApiService, type ReadApiService } from "../server.ts";
 
 const LOOPBACK = { host: "127.0.0.1", port: 0 };
@@ -27,20 +28,20 @@ type Recorded = { text: string; params?: unknown[] };
 let configs: pg.PoolConfig[] = [];
 let sql: Recorded[] = [];
 const RealPool = pg.Pool;
-const ROLE_SQL = "FROM pg_roles r WHERE r.rolname = current_user";
-type RoleRow = { role: string; rolsuper: boolean; rolbypassrls: boolean };
-const READER: RoleRow = { role: "search_reader", rolsuper: false, rolbypassrls: false };
+type RoleRow = Record<string, unknown>;
+const READER: RoleRow = { ...READER_LOGIN_ROW };
 let roleRows: RoleRow[] = [READER];
 let roleChecks = 0;
+const isAdmission = (text: string) => text === READER_LOGIN_SQL || text === READER_PG16_SQL;
 
-/** The startup role check reads `roleRows`; every other query answers no rows. */
-const answer = async (text: string) => ({ rows: text.includes(ROLE_SQL) ? roleRows : [] });
+/** The startup login check reads `roleRows` (and the PG16 row); every other query answers no rows. */
+const answer = async (text: string) => ({ rows: text === READER_LOGIN_SQL ? roleRows : readerLoginAnswer(text) ?? [] });
 
 /** Records the pool config and every statement other than the startup role check. */
 class RecordingPool {
   constructor(config: pg.PoolConfig) { configs.push(config); }
   on() { return this; }
-  async query(text: string, params?: unknown[]) { if (text.includes(ROLE_SQL)) roleChecks++; else sql.push({ text, params }); return answer(text); }
+  async query(text: string, params?: unknown[]) { if (text === READER_LOGIN_SQL) roleChecks++; else if (!isAdmission(text)) sql.push({ text, params }); return answer(text); }
   async connect() {
     return { query: async (text: string, params?: unknown[]) => { sql.push({ text, params }); return answer(text); }, release() {} };
   }
@@ -157,7 +158,7 @@ describe("a fresh self-host before the search owner bootstrap and reader grants"
 });
 
 describe("reader admission: the read login must be bound by row-level security", () => {
-  test("a superuser or BYPASSRLS login refuses startup naming the role and the property, never the URL", async () => {
+  test("a superuser or BYPASSRLS login refuses startup naming the property, never the URL or an observed role", async () => {
     for (const [row, code] of [
       [{ ...READER, rolsuper: true }, "reader_role_superuser"],
       [{ ...READER, rolbypassrls: true }, "reader_role_bypassrls"],
@@ -166,14 +167,14 @@ describe("reader admission: the read login must be bound by row-level security",
       roleRows = [row];
       const error = await startReadApiService(ENV, LOOPBACK).then(() => null, (e: Error) => e);
       expect(error).toMatchObject({ name: "ReaderRoleError", code });
-      expect(error!.message).toBe(`session read api: ${code} (role "search_reader")`);
+      expect(error!.message).toBe(`session read api: ${code} (the read login must be bulls96_read_api)`);
       for (const secret of ["pw", "db.selfhost.internal", "postgresql:"]) expect(error!.message).not.toContain(secret);
     }
     expect(sql).toEqual([]); // refused before any search, state or directory SQL
   });
 
   test("an unreadable role (no row, unexpected shape, query failure) refuses rather than admits", async () => {
-    for (const rows of [[], [{ role: "search_reader" }], [{ ...READER, rolbypassrls: null }], [READER, READER]] as unknown as RoleRow[][]) {
+    for (const rows of [[], [{ role: "search_reader" }], [{ ...READER, rolbypassrls: null }], [READER, READER], [{ ...READER, server_version: "170004" }]] as unknown as RoleRow[][]) {
       roleRows = rows;
       const error = await startReadApiService(ENV, LOOPBACK).then(() => null, (e: Error) => e);
       expect(error?.name).toBe("ReaderRoleError");

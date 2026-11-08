@@ -119,3 +119,52 @@ test("verdict helpers", () => {
   expect(publicationLiveness({ enabled: false, lastProgressAt: 0, cycles: 0 }, 1e12, 1)).toEqual({ ok: true, enabled: false });
   expect(publicationReadiness({ enabled: true, lastProgressAt: 0, cycles: 0 }).ok).toBe(false);
 });
+
+// INGEST_PUBLICATION_TARGET=portable (publication-portable.ts): a self-host env with no AWS/Supabase identity.
+const PORTABLE = {
+  INGEST_PUBLISH_ENABLED: "true", INGEST_PUBLICATION_TARGET: "portable", INGEST_PUBLISH_BUCKET: "selfhost-sessions",
+  INGEST_PUBLISH_EXPECT_GENERATION: "a".repeat(64), INGEST_PUBLISH_S3_ENDPOINT: "http://minio.selfhost.svc:9000", ALLOW_IN_CLUSTER_HTTP: "true",
+  INGEST_PUBLISH_S3_REGION: "us-east-1", INGEST_PUBLISH_S3_ACCESS_KEY_ID_FILE: "/run/secrets/session-publication/access-key-id",
+  INGEST_PUBLISH_S3_SECRET_ACCESS_KEY_FILE: "/run/secrets/session-publication/secret-access-key",
+  INGEST_PUBLISH_DATABASE_URL_FILE: "/run/secrets/session-publication/database-url", HOOPDB_DB_MODE: "selfhosted",
+  SESSION_POSTGRES_TLS_PROFILE: "supabase", INGEST_PUBLISH_BUDGET_MS: "20000",
+};
+
+test("portable target passes the startup check, opens the port and uses its own budget for the stall limit", async () => {
+  let clock = 5_000_000;
+  let hooks: any;
+  let target: string | undefined;
+  const main = (_a: string[], env: NodeJS.ProcessEnv, h: any) => {
+    target = env.INGEST_PUBLICATION_TARGET;
+    hooks = h;
+    return new Promise((_r, reject) => h.signal.addEventListener("abort", () => reject(h.signal.reason), { once: true }));
+  };
+  const s = start(PORTABLE, main, () => clock);
+  const port = await s.port;
+  expect(target).toBe("portable");
+  expect(await get(port, "/healthz")).toEqual({ status: 200, body: { ok: true, enabled: true, reason: "starting" } });
+  hooks.onCycle({ examined: 0 });
+  expect(await get(port, "/readyz")).toEqual({ status: 200, body: { ok: true, enabled: true } });
+  clock += 20_000 + 5_000 + 60_000; // the portable budget, not the hosted default
+  expect((await get(port, "/healthz")).status).toBe(200);
+  clock += 1;
+  expect(await get(port, "/healthz")).toEqual({ status: 503, body: { ok: false, enabled: true, reason: "loop_stalled" } });
+  s.stop.abort();
+  expect(await s.done).toEqual({ enabled: true, cycles: 1 });
+});
+
+test("portable target startup refusals happen before the port opens", async () => {
+  const refused = async (env: NodeJS.ProcessEnv) => {
+    let listened = false;
+    const err = await publicationService(["--continuous"], env, { host: "127.0.0.1", port: 0, main: neverMain, onListening: () => (listened = true) }).then(() => null, (e) => e);
+    expect(listened).toBe(false);
+    return err?.code ?? err?.message;
+  };
+  const { INGEST_PUBLISH_S3_ENDPOINT: _, ...noEndpoint } = PORTABLE;
+  expect(await refused(noEndpoint)).toBe("publication_config_required");
+  expect(await refused({ ...PORTABLE, INGEST_PUBLISH_SECRET_ARN: ENABLED.INGEST_PUBLISH_SECRET_ARN })).toBe("publication_target_ambiguous");
+  expect(await refused({ ...PORTABLE, INGEST_PUBLICATION_TARGET: "minio" })).toBe("publication_target_invalid");
+  // An explicit "aws" target is still the unchanged hosted check.
+  const { INGEST_PUBLISH_BUCKET: __, ...hostedNoBucket } = ENABLED;
+  expect(await refused({ ...hostedNoBucket, INGEST_PUBLICATION_TARGET: "aws" })).toBe("publication_config_required");
+});

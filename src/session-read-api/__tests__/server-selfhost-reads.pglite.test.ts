@@ -34,6 +34,7 @@ import { AuthError } from "../app.ts";
 import { readApiVerifier } from "../auth.ts";
 import { readApiDepsFromSecret, readAppFromSecret } from "../lambda.ts";
 import { startReadApiService, type ReadApiService } from "../server.ts";
+import { readerLoginAnswer } from "./reader-login-support.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -110,6 +111,10 @@ class PglitePool {
   constructor() { PglitePool.created++; }
   on() { return this; }
   async query(text: string, params?: unknown[]) {
+    // Reader admission (lambda.ts assertReaderRole) needs a real login, which PGlite cannot make:
+    // answer it with the production login rows (the decision is tested in reader-login.test.ts).
+    const admission = readerLoginAnswer(text);
+    if (admission) return { rows: admission };
     const unlock = await exclusive();
     try {
       await supa.exec("SET ROLE bulls96_read_api");
