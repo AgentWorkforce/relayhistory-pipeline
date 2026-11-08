@@ -6,7 +6,7 @@
  * are stubbed through AdmissionStore; the head producer through a stub binding.
  */
 import { describe, expect, test } from "bun:test";
-import type { ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
+import { ClickHouseError, type ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
 import {
   ADMISSIONS_SQL,
@@ -27,7 +27,7 @@ import {
   type ServiceBinding,
 } from "../buffered-search-gate.ts";
 import type { TenantRunner } from "../liveness.ts";
-import { buildNewestQuery } from "../queries.ts";
+import { buildCandidateQuery, buildNewestQuery } from "../queries.ts";
 import { memoryLiveness } from "./support.ts";
 
 const EPOCH = "a".repeat(64);
@@ -311,11 +311,55 @@ describe("the read API with the gate", () => {
     return { get: (p: string) => app.request(p, { headers: { authorization: "Bearer good" } }), logs, bind };
   }
 
-  test("gate off: the newest query never names the origin columns", async () => {
-    const { ch, queries } = stubCh([newest("e-1", 3, "canonical", "u-1")].map(({ origin: _o, origin_claim_token: _t, ...r }) => r), [cand("e-1", 3)]);
-    const r = await api(false, ch).get("/v1/events?workspace=ws-a&q=needle&limit=10");
-    expect(r.status).toBe(200);
-    expect(queries.some((q) => q.includes("origin"))).toBe(false);
+  test("gate not wired (gate off, or the Lambda composition): canonical-only SQL, and no buffered row is served", async () => {
+    // A stub that ignores the SQL filter: the row-level defense still drops buffered and unmarked rows.
+    const rows = [newest("e-3", 3, "canonical", "u-1"), newest("e-2", 2, "buffered", "u-2"), { ...newest("e-1", 1, "canonical", "u-1"), origin: undefined }];
+    const { ch, queries } = stubCh(rows, [cand("e-3", 3), cand("e-2", 2), cand("e-1", 1)]);
+    const off = api(false, ch);
+    for (const path of ["/v1/events?workspace=ws-a&q=needle&limit=10", "/v1/events?workspace=ws-a&session=s-1", "/v1/sessions/s-1/events?workspace=ws-a"]) {
+      const b = await (await off.get(path)).json() as Record<string, any>;
+      expect(b.events.map((e: { eventId: string }) => e.eventId)).toEqual(["e-3"]);
+    }
+    const event = queries.filter((q) => !q.includes("search_ingest_session_state") && !q.includes("in_workspace"));
+    const candidates = event.filter((q) => !q.includes("bytes_before"));
+    const newestQs = event.filter((q) => q.includes("bytes_before"));
+    expect(candidates.length).toBeGreaterThan(0);
+    for (const q of candidates) expect(q).toContain("origin = 'canonical'");
+    // The newest query filters AFTER picking the newest version, never before it.
+    for (const q of newestQs) expect(q).toMatch(/LIMIT 1 BY[\s\S]*\) WHERE origin = 'canonical'/u);
+    expect(off.bind.requests).toHaveLength(0);
+  });
+
+  test("the Lambda never wires the gate, so it always reads canonical-only", async () => {
+    const source = await Bun.file(new URL("../lambda.ts", import.meta.url)).text();
+    expect(source).not.toContain("bufferedSearchGate");
+    expect(source).toContain("createReadApi({");
+  });
+
+  test("gate off on a table without the origin columns: answered unfiltered only after the probe finds none", async () => {
+    const rows = [newest("e-3", 3, "canonical", "u-1")].map(({ origin: _o, origin_claim_token: _t, ...r }) => r);
+    for (const [columns, status] of [[0, 200], [2, 503]] as const) {
+      const queries: string[] = [];
+      const ch: ClickHouseClient = {
+        database: "relay_search",
+        async command() {},
+        async insert() {},
+        async select<T>(query: string) {
+          queries.push(query);
+          if (query.includes("in_workspace") || query.includes("search_ingest_session_state")) return [] as T[];
+          if (query.includes("origin = 'canonical'")) throw new ClickHouseError(404, "47", "UNKNOWN_IDENTIFIER");
+          if (query.includes("system.columns")) return [{ n: columns }] as T[];
+          return (query.includes("bytes_before") ? rows : [cand("e-3", 3)]) as T[];
+        },
+      };
+      const r = await api(false, ch).get("/v1/events?workspace=ws-a&q=needle&limit=10");
+      expect(r.status).toBe(status);
+      if (status === 200) expect(((await r.json()) as Record<string, any>).events.map((e: { eventId: string }) => e.eventId)).toEqual(["e-3"]);
+      // The legacy read names no origin column, and the probe runs after it.
+      const legacy = queries.filter((q) => q.includes("transcript_events") && !q.includes("origin"));
+      expect(legacy.length).toBeGreaterThan(0);
+      expect(queries.at(-1)).toContain("system.columns");
+    }
   });
 
   test("gate on: the page shrinks, the cursor is the unfiltered page's, canonical rows stay", async () => {
@@ -359,11 +403,17 @@ describe("configuration and SQL", () => {
     expect(parseBufferedSearchGate(" ON ")).toBe(true);
   });
 
-  test("buildNewestQuery is byte-identical with the origin option off", () => {
+  test("origin modes: canonical filters, gate selects the marker unfiltered, legacy never names it", () => {
     const input = { orgId: ORG, workspaceId: WS, order: "desc" as const, limit: 10, q: "needle" };
     const pos = [{ tsMs: 1, sessionId: "s", source: "codex", machineId: "m", kind: "k", eventId: "e" }];
-    expect(buildNewestQuery("db", input, pos, {}).query).toBe(buildNewestQuery("db", input, pos).query);
-    expect(buildNewestQuery("db", input, pos).query).not.toContain("origin");
+    expect(buildNewestQuery("db", input, pos).query).toBe(buildNewestQuery("db", input, pos, "canonical").query);
+    expect(buildNewestQuery("db", input, pos).query).toContain("origin = 'canonical'");
+    expect(buildCandidateQuery("db", input).query).toContain("origin = 'canonical'");
+    expect(buildNewestQuery("db", input, pos, "gate").query).toContain("origin, origin_claim_token");
+    expect(buildNewestQuery("db", input, pos, "gate").query).not.toContain("origin = 'canonical'");
+    expect(buildCandidateQuery("db", input, "gate").query).not.toContain("origin");
+    expect(buildNewestQuery("db", input, pos, "legacy").query).not.toContain("origin");
+    expect(buildCandidateQuery("db", input, "legacy").query).not.toContain("origin");
   });
 
   test("the SQL store binds the verified tenant and the hit's owner, and maps the ledger row", async () => {

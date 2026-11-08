@@ -8,7 +8,7 @@
  * fewer rows survived the newest-version recheck. A page can therefore be short
  * (or empty) with a cursor; it is never short without one while rows remain.
  */
-import type { ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
+import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { SearchIndexError, assertPosition, comparePositions, type SearchHit, type SearchPosition } from "@rhc/search-index/contracts.ts";
 import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
 import { encodeCursor, type EventPosition } from "./cursor.ts";
@@ -17,7 +17,10 @@ import {
   READ_SETTINGS,
   buildCandidateQuery,
   buildNewestQuery,
+  buildOriginColumnProbe,
   buildPartialSessionsQuery,
+  MISSING_COLUMN_CODES,
+  type OriginMode,
   buildWorkspacePartialSessionsQuery,
   PARTIAL_SESSIONS_CAP,
   PAGE_BYTE_BUDGET,
@@ -161,14 +164,47 @@ export async function readEventPage(deps: PageDeps, input: EventQuery): Promise<
     return readAdapterPage(deps, input);
   }
   if (!deps.ch) throw new Error("read search binding missing");
-  const options = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
-  const c = buildCandidateQuery(deps.ch.database, input);
-  const candidateRows = await deps.ch.select<CandidateRow>(c.query, { ...options, params: c.params });
-  const candidates = candidateRows.map(candidatePosition);
-  if (candidates.length === 0) return { events: [], nextCursor: null, erasedDropped: 0 };
+  const ch = deps.ch;
+  const options: ReadOptions = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
+  if (deps.bufferedGate) return finishPage(deps, input, await selectPage(ch, input, "gate", options));
+  // No gate in this runtime (the Lambda, or the gate off): canonical rows only. A table
+  // without the origin column fails that query; the read is then answered unfiltered only
+  // if the column is STILL absent after the unfiltered read (columns are only ever added,
+  // and the feeder writes no row before they exist), so a buffered row is never served.
+  let selected: Selected;
+  try {
+    selected = await selectPage(ch, input, "canonical", options);
+  } catch (error) {
+    if (!(error instanceof ClickHouseError) || !error.code || !MISSING_COLUMN_CODES.has(error.code)) throw error;
+    selected = await selectPage(ch, input, "legacy", options);
+    const probe = buildOriginColumnProbe(ch.database);
+    const [found] = await ch.select<{ n: number | string }>(probe.query, { ...options, params: probe.params });
+    if (found === undefined || Number(found.n) !== 0) throw new ClickHouseError(503, null, "origin_column_changed");
+  }
+  return finishPage(deps, input, selected);
+}
 
-  const n = buildNewestQuery(deps.ch.database, input, candidates, { origin: deps.bufferedGate !== undefined });
-  const rows = await deps.ch.select<EventRow>(n.query, { ...options, params: n.params });
+interface Selected {
+  candidates: EventPosition[];
+  rows: EventRow[];
+}
+
+type ReadOptions = { settings: Record<string, string | number>; timeoutMs: number };
+
+async function selectPage(ch: ClickHouseClient, input: EventQuery, origin: OriginMode, options: ReadOptions): Promise<Selected> {
+  const c = buildCandidateQuery(ch.database, input, origin);
+  const candidateRows = await ch.select<CandidateRow>(c.query, { ...options, params: c.params });
+  const candidates = candidateRows.map(candidatePosition);
+  if (candidates.length === 0) return { candidates, rows: [] };
+  const n = buildNewestQuery(ch.database, input, candidates, origin);
+  const rows = await ch.select<EventRow>(n.query, { ...options, params: n.params });
+  // Defense in depth, as the tenant recheck: canonical mode never passes on a row the SQL
+  // should have excluded, nor one without the marker.
+  return { candidates, rows: origin === "canonical" ? rows.filter((r) => r.origin === "canonical") : rows };
+}
+
+async function finishPage(deps: PageDeps, input: EventQuery, { candidates, rows }: Selected): Promise<EventPage> {
+  if (candidates.length === 0) return { events: [], nextCursor: null, erasedDropped: 0 };
 
   // Defense in depth: every row must belong to the verified tenant and the
   // requested session/source, whatever the SQL said.

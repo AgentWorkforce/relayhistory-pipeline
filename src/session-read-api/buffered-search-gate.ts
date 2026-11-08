@@ -8,8 +8,10 @@
  * are not yet removed when the owner deletes or resets, so every buffered hit
  * must be proven visible at query time, against relayhistory-cloud's private
  * control head for the hit's OWNER (who, in a shared workspace, is often not
- * the reader). Canonical rows (`origin = 'canonical'`, the column default) are
- * returned exactly as before.
+ * the reader). Canonical rows (`origin = 'canonical'`, the column default) pass
+ * the gate untouched. Where the gate is NOT wired (the Lambda, or the flag off)
+ * the event queries serve canonical rows only (queries.ts OriginMode, page.ts
+ * readEventPage), so a buffered row is never served unchecked.
  *
  * A buffered hit is returned only when ALL of these hold; anything else drops
  * it (fail closed, never an error to the reader):

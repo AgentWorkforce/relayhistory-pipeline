@@ -185,9 +185,12 @@ function titleMatch(): string {
  * each branch dedupes keys BEFORE its LIMIT, so repeated versions of one event
  * can never fill a branch and fake an end of results.
  */
-export function buildCandidateQuery(database: string, input: EventQuery): Built {
+export function buildCandidateQuery(database: string, input: EventQuery, origin: OriginMode = "canonical"): Built {
   const params: QueryParams = { n: input.limit };
   const where = keyPredicates(input, params);
+  // Canonical-only: a key with ANY canonical version is a candidate (a superset); the
+  // newest query decides on the newest version.
+  if (origin === "canonical") where.push(CANONICAL_ONLY);
   if (input.projectId !== undefined) {
     where.push("project_id = {project:String}");
     params.project = input.projectId;
@@ -238,12 +241,15 @@ export function candidatePosition(r: CandidateRow): EventPosition {
  * there and issues a cursor); with maxContent only maxContent+1 code points are
  * read, which is exactly enough to decide and apply relayhistory's truncation.
  */
-export function buildNewestQuery(database: string, input: EventQuery, candidates: EventPosition[], options: { origin?: boolean } = {}): Built {
+export function buildNewestQuery(database: string, input: EventQuery, candidates: EventPosition[], origin: OriginMode = "canonical"): Built {
   if (candidates.length === 0) throw new Error("buildNewestQuery needs candidates");
   const params: QueryParams = { org: input.orgId, ws: input.workspaceId, lo: Math.min(...candidates.map((c) => c.tsMs)), hi: Math.max(...candidates.map((c) => c.tsMs)), budget: PAGE_BYTE_BUDGET };
   const keys = arrayLiteral(candidates.map((c) => tuple(c.tsMs, c.sessionId, c.source, c.machineId, c.kind, c.eventId)));
   const ord = orderBy(input.order);
   const value: string[] = [];
+  // On the NEWEST version only: a buffered version over an older canonical one is
+  // dropped, never answered with its stale canonical predecessor.
+  if (origin === "canonical") value.push(CANONICAL_ONLY);
   if (input.q !== undefined) {
     params.q = input.q;
     value.push(`(${contentMatch()} OR ${titleMatch()})`);
@@ -260,9 +266,8 @@ export function buildNewestQuery(database: string, input: EventQuery, candidates
     // A code point is at most 4 bytes.
     sizeExpr = "least(content_bytes, 4 * {mc:UInt32})";
   }
-  // The buffered-origin marker (buffered-search-gate.ts), read only while the gate is on, so
-  // the query is unchanged with the gate off and on a table without the columns.
-  const originCols = options.origin ? `, ${ORIGIN_COLUMNS}` : "";
+  // The buffered-origin marker (buffered-search-gate.ts); not named only in "legacy" mode.
+  const originCols = origin === "legacy" ? "" : `, ${ORIGIN_COLUMNS}`;
   const cols = `org_id, workspace_id, ts, session_id, source, machine_id, kind, event_id, type, user_id, actor_name, actor_role, subagent_id, project_id, task_title, task_ref, tags, files_touched, tool_name, tool_status${originCols}`;
   const newest = `SELECT ${cols}, content, content_bytes, version FROM ${qualifiedTable(database)}
 WHERE org_id = {org:String} AND workspace_id = {ws:String}
@@ -314,6 +319,30 @@ export interface EventRow {
  *   origin_claim_token String DEFAULT ''
  */
 export const ORIGIN_COLUMNS = "origin, origin_claim_token";
+
+/**
+ * How an event read treats the origin marker:
+ *   - "gate":      read the marker, no filter; the buffered search gate judges each row.
+ *   - "canonical": the default whenever the gate is not wired (Lambda, gate off): only
+ *                  rows whose newest version is `origin = 'canonical'` are served.
+ *   - "legacy":    the marker is not named. Used only by page.ts after the canonical query
+ *                  failed for want of the column AND a later probe proves it is still absent
+ *                  (then no buffered row can exist, so every row is canonical).
+ */
+export type OriginMode = "gate" | "canonical" | "legacy";
+const CANONICAL_ONLY = "origin = 'canonical'";
+
+/** ClickHouse codes for a query naming a column the table lacks (before the origin DDL). */
+export const MISSING_COLUMN_CODES: ReadonlySet<string> = new Set(["8", "16", "47"]);
+
+/** Whether `transcript_events` has either origin column (the probe after a missing-column error). */
+export function buildOriginColumnProbe(database: string): Built {
+  qualifiedTable(database);
+  return {
+    query: "SELECT toUInt64(count()) AS n FROM system.columns WHERE database = {db:String} AND table = {t:String} AND name IN ('origin', 'origin_claim_token')",
+    params: { db: database, t: EVENTS_TABLE },
+  };
+}
 
 /**
  * Settings for every read: bounded time and result size. Read-only is the

@@ -116,7 +116,8 @@ export interface ReadApiDeps {
   babysitter?: EvidenceDeps;
   /**
    * READ_API_BUFFERED_SEARCH_GATE=on: the per-hit R2 privacy gate (buffered-search-gate.ts) on
-   * every ClickHouse event page. Absent (the default) = pages are read exactly as before.
+   * every ClickHouse event page. Absent (the default, and always on the Lambda) = event pages
+   * serve canonical rows only (`origin = 'canonical'`; queries.ts OriginMode), never a buffered row.
    * Requires the ClickHouse binding.
    */
   bufferedSearchGate?: BufferedSearchGate;
