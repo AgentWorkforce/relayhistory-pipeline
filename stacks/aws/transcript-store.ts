@@ -43,6 +43,7 @@
  */
 import * as AWS from "@alchemy.run/aws";
 import * as Effect from "effect/Effect";
+import { formatDeclaredPropertyYaml } from "alchemy/Cli/PropertyDiff";
 import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
 import { sha256, type Provenance } from "../../src/cli/plan-provenance.ts";
 import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hardening.ts";
@@ -97,6 +98,12 @@ export interface TranscriptStoreInputs {
   auditPrincipalArn?: string;
   /** Default-off immutable inbox authority root. Omit to preserve the existing srv-writer policy exactly. */
   inboxAuthorityKeyRoot?: string;
+  /**
+   * Default-off: add ADMISSION_INBOX_LIFECYCLE_RULE (S3-first async ingest's inbox,
+   * docs/design/s3-first-async-ingest.md). Only the literal `true`. Omit to keep the bucket's
+   * lifecycle exactly as today.
+   */
+  admissionInboxLifecycle?: true;
   /**
    * The session pipeline (session-pipeline.ts): S3 manifest events -> SQS -> Lambda -> Supabase
    * pointer + ClickHouse index. Omit for the store alone.
@@ -204,7 +211,8 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "admissionInboxLifecycle") refuse(`transcriptStore.${k} is not a known setting`);
+  if (store.admissionInboxLifecycle !== undefined && store.admissionInboxLifecycle !== true) refuse("transcriptStore.admissionInboxLifecycle must be exactly true (omit for the current lifecycle)");
   assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
   assertInboxAuthorityKeyRoot(store.inboxAuthorityKeyRoot, refuse);
   if (store.sessionPipeline !== undefined) assertSessionPipelineInputs(store.sessionPipeline, refuse);
@@ -231,6 +239,7 @@ export type TranscriptStorePlanPhase =
   | "srv-writer addition"
   | "srv-writer propagation recovery"
   | "srv-writer inbox policy update"
+  | "admission inbox lifecycle"
   | "post-apply"
   | "session pipeline rollout"
   | "session pipeline update"
@@ -541,6 +550,14 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   if (planTouchesRepoTag(capture.detailedPlanText)) {
     assertRepoTagRenameDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
     return "repo tag rename";
+  }
+  // The admission inbox lifecycle rule alone: only the transcripts bucket, only that rule added.
+  {
+    const changed = [...compact.operations].filter(([, action]) => action !== "noop");
+    if (changed.length === 1 && changed[0]![0] === "transcripts" && changed[0]![1] === "update" && planTouchesTranscriptLifecycle(capture.detailedPlanText)) {
+      assertAdmissionInboxLifecycleDiff(capture.detailedPlanText, refuse);
+      return "admission inbox lifecycle";
+    }
   }
   // The brief schedule changes alone, or with exactly a session pipeline update.
   const semanticPhase=sessionSemanticCopyPhase(compact.operations,capture.detailedPlanText,capture.stateSnapshotText,refuse);
@@ -1066,12 +1083,57 @@ function assertPendingSrvWriterKeyUpdate(stateSnapshotText: string, refuse: (why
  * asynchronous, so it is the backstop: the erasure job deletes every version
  * explicitly (DeleteObjectVersion), which is immediate.
  */
-export function transcriptLifecycleRules() {
+export function transcriptLifecycleRules(options: { admissionInbox?: boolean } = {}) {
   return [
     { ID: "expire-noncurrent-versions", Status: "Enabled", Filter: { Prefix: "" }, NoncurrentVersionExpiration: { NoncurrentDays: NONCURRENT_VERSION_DAYS } },
     { ID: "remove-expired-delete-markers", Status: "Enabled", Filter: { Prefix: "" }, Expiration: { ExpiredObjectDeleteMarker: true } },
     { ID: "abort-incomplete-uploads", Status: "Enabled", Filter: { Prefix: "" }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: ABORT_INCOMPLETE_UPLOAD_DAYS } },
+    ...(options.admissionInbox === true ? [ADMISSION_INBOX_LIFECYCLE_RULE] : []),
   ];
+}
+
+/** The async-ingest inbox prefix (src/session-ingest/async-admission.ts INBOX_NAMESPACE): never a tenant root. */
+export const ADMISSION_INBOX_PREFIX = `${TENANT_KEY_BASE}/admission-inbox/`;
+/** Expiration days for the inbox's current versions; the bucket-wide noncurrent rule then purges them. */
+export const ADMISSION_INBOX_EXPIRATION_DAYS = 7;
+/**
+ * Bounds an async-ingest inbox object whose admission message was lost past the DLQ (admitted or
+ * refused inboxes are tombstoned by the consumer and purged as noncurrent versions within 48 h).
+ * The prefix is the dedicated inbox namespace only: tenant data lives under `96bulls/<org>/`, and the
+ * ingest refuses an org named `admission-inbox`.
+ */
+export const ADMISSION_INBOX_LIFECYCLE_RULE = {
+  ID: "expire-admission-inbox",
+  Status: "Enabled",
+  Filter: { Prefix: ADMISSION_INBOX_PREFIX },
+  Expiration: { Days: ADMISSION_INBOX_EXPIRATION_DAYS },
+} as const;
+
+/**
+ * The one permitted admission-inbox lifecycle change: the transcripts bucket's detailed diff must
+ * be exactly Alchemy's rendering of the current rules (-) replaced by the current rules plus
+ * ADMISSION_INBOX_LIFECYCLE_RULE (+), and nothing else. Alchemy renders a changed property whole,
+ * so any other bucket property change (policy, encryption, versioning, logging, tags, another rule,
+ * a removed rule) adds marked lines and refuses.
+ */
+function assertAdmissionInboxLifecycleDiff(detailedPlanText: string, refuse: (why: string) => never): void {
+  const label = "admission inbox lifecycle";
+  const block = detailedBlock(detailedPlanText.split(/\r?\n/), "transcripts");
+  const marked = block.filter((line) => /^  [+-] /.test(line)).map((line) => line.slice(2));
+  const document = formatDeclaredPropertyYaml(
+    { lifecycleRules: transcriptLifecycleRules() },
+    { lifecycleRules: transcriptLifecycleRules({ admissionInbox: true }) },
+    "update",
+  );
+  const expected = (document?.lines ?? []).filter((line) => /^[+-] /.test(line));
+  if (expected.length === 0) refuse(`${label}: no reference rendering`);
+  if (marked.length !== expected.length || marked.some((line, i) => line !== expected[i]))
+    refuse(`${label}: the transcripts bucket may change only by adding exactly the ${ADMISSION_INBOX_LIFECYCLE_RULE.ID} rule`);
+}
+
+/** Whether the transcripts bucket's detailed diff touches its lifecycle rules at all. */
+function planTouchesTranscriptLifecycle(detailedPlanText: string): boolean {
+  return detailedBlock(detailedPlanText.split(/\r?\n/), "transcripts").some((line) => /^  [+-]\s+lifecycleRules:/.test(line));
 }
 
 export function accessLogLifecycleRules() {
@@ -1474,7 +1536,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn }),
         ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn }) : []),
       ] as never,
-      lifecycleRules: transcriptLifecycleRules() as never,
+      lifecycleRules: transcriptLifecycleRules({ admissionInbox: i.transcriptStore.admissionInboxLifecycle === true }) as never,
       logging: { targetBucket: accessLogs.bucketName as unknown as string, targetPrefix: ACCESS_LOG_PREFIX, targetObjectKeyFormat: { PartitionedPrefix: { PartitionDateSource: "EventTime" } } as never },
       tags: i.tags("transcripts"),
     });
