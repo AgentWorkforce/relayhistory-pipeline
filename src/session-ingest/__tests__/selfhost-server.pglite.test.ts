@@ -2,8 +2,9 @@
  * The self-host ingest edge (SERVICE=session-ingest, selfhost-server.ts) end to
  * end over real loopback node:http: a stub relaycontrol introspection server
  * (also node:http) answers the real introspector, the ledger is PGlite with
- * every Supabase migration and the ingest role (SET ROLE bulls96_session_ingest,
- * as production logs in), and the store is a scratch fs store.
+ * every Supabase migration and the ingest role (SET ROLE bulls96_session_ingest for
+ * the role's grants; PGlite has no real login, so startup admission, which refuses
+ * SET ROLE, is tested over real-login rows below), and the store is a scratch fs store.
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createServer, type Server } from "node:http";
@@ -18,7 +19,10 @@ import { IDENTITY_HEADER, encodeIdentity } from "../app.ts";
 import type { SqlRun } from "../ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "../selfhost-auth.ts";
 import { selfhostIngestConfig } from "../selfhost-config.ts";
-import { assertIngestRole, selfhostIngestRuntime, startSelfhostIngestService, type RuntimeBuilder, type SelfhostIngestService } from "../selfhost-server.ts";
+import {
+  INGEST_LOGIN_SQL, INGEST_OPTIONS, INGEST_PG16_SQL, INGEST_TIMEOUTS, IngestLoginError, assertIngestRole, ingestLoginRefusal,
+  selfhostIngestRuntime, startSelfhostIngestService, type RuntimeBuilder, type SelfhostIngestService,
+} from "../selfhost-server.ts";
 import { SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
 import { deliveryAccount } from "../vendor/delivery/prepare.ts";
 
@@ -120,8 +124,9 @@ async function start(rc: { url: string }, over: NodeJS.ProcessEnv = {}) {
   const { run } = await database();
   const fs = scratchStore();
   cleanups.push(fs.done);
+  // No assertIngestRole here: PGlite has no real login, and the SET ROLE harness is exactly what
+  // admission refuses (see "startup admission" below).
   const build: RuntimeBuilder = async (settings, e) => {
-    await assertIngestRole(run);
     return selfhostIngestRuntime(settings, {
       run,
       store: fs.store,
@@ -338,9 +343,150 @@ describe("dormant and configuration", () => {
     expect(leaked).not.toContain("hunter2");
   });
 
-  test("startup admission: only the ingest role, never a superuser login", async () => {
+});
+
+// ---------------------------------------------------------------- startup admission (P1 identity, P2 role shape)
+
+/**
+ * Rows captured verbatim from real password (scram) logins as bulls96_session_ingest, with the pool's
+ * INGEST_OPTIONS, after session_ingest_roles.sql ran as a non-superuser CREATEROLE `postgres` under the
+ * bootstrap superuser `supabase_admin` (the Supabase shape) and session_ingest_role.sql pinned LOGIN
+ * NOINHERIT and the timeouts: postgres:16 (160015) and postgres:15 (150019). PGlite has no real login
+ * (session_user is always its superuser), so the decision is tested over these rows.
+ */
+const REAL_PG16_LOGIN = {
+  session_user: "bulls96_session_ingest", current_user: "bulls96_session_ingest", role_setting: "none", server_version: 160015,
+  statement_timeout: "5s", lock_timeout: "2s", idle_in_transaction_session_timeout: "10s",
+  rolsuper: false, rolbypassrls: false, rolcreaterole: false, rolcreatedb: false, rolreplication: false, rolinherit: false,
+  rolconfig: ["statement_timeout=5s", "lock_timeout=2s", "idle_in_transaction_session_timeout=10s"],
+  memberships: 0, members: 1, database_settings: 0,
+};
+const CREATOR_EDGE = { member: "postgres", grantor: "supabase_admin", grantor_super: true, admin_option: true, inherit_option: false, set_option: false };
+const REAL_PG16_EXTRA = { system_user: "scram-sha-256:bulls96_session_ingest", member_edges: [CREATOR_EDGE] };
+const REAL_PG15_LOGIN = { ...REAL_PG16_LOGIN, server_version: 150019, members: 0 };
+
+/** A SqlRun that answers the two admission statements with the given rows, and records what ran. */
+function injected(login: Record<string, unknown> | null, extra: Record<string, unknown> | null = REAL_PG16_EXTRA) {
+  const seen: string[] = [];
+  const run: SqlRun = async (text) => {
+    seen.push(text);
+    if (text === INGEST_LOGIN_SQL) return { rows: login ? [login] : [] };
+    if (text === INGEST_PG16_SQL) return { rows: extra ? [extra] : [] };
+    throw new Error("unexpected statement");
+  };
+  return { run, seen };
+}
+const SUPABASE = { supabase: true };
+const NOT_SUPABASE = { supabase: false };
+async function admission(run: SqlRun, provider = SUPABASE): Promise<string> {
+  try {
+    await assertIngestRole(run, provider);
+  } catch (e) {
+    return e instanceof IngestLoginError ? e.code : `other: ${String(e)}`;
+  }
+  return "admitted";
+}
+
+describe("startup admission", () => {
+  test("a real login as the ingest role is admitted (PG16 with the Supabase creator edge, and PG15)", async () => {
+    const pg16 = injected(REAL_PG16_LOGIN);
+    expect(await admission(pg16.run)).toBe("admitted");
+    expect(pg16.seen).toEqual([INGEST_LOGIN_SQL, INGEST_PG16_SQL]);
+    const pg15 = injected(REAL_PG15_LOGIN);
+    expect(await admission(pg15.run, NOT_SUPABASE)).toBe("admitted");
+    expect(pg15.seen).toEqual([INGEST_LOGIN_SQL]); // system_user and set_option do not exist before 16
+    // A PG16 role with no incoming edge at all (a superuser created it: CNPG, Cloud SQL) is admitted on any provider.
+    for (const provider of [SUPABASE, NOT_SUPABASE]) expect(ingestLoginRefusal({ ...REAL_PG16_LOGIN, members: 0 }, { ...REAL_PG16_EXTRA, member_edges: [] }, provider)).toBeNull();
+  });
+
+  test("causal: the non-assumable Supabase creator edge is the only incoming edge admitted, and only on a declared Supabase", async () => {
+    // Positive: postgres -> ingest, granted by superuser supabase_admin, ADMIN, INHERIT FALSE, SET FALSE.
+    expect(ingestLoginRefusal(REAL_PG16_LOGIN, REAL_PG16_EXTRA, SUPABASE)).toBeNull();
+    // The same edge off Supabase (the verifier's db_mode gate) is refused.
+    expect(ingestLoginRefusal(REAL_PG16_LOGIN, REAL_PG16_EXTRA, NOT_SUPABASE)).toBe("role_members");
+    // The one bit that makes it assumable: postgres could now SET ROLE bulls96_session_ingest. Refused.
+    expect(ingestLoginRefusal(REAL_PG16_LOGIN, { ...REAL_PG16_EXTRA, member_edges: [{ ...CREATOR_EDGE, set_option: true }] }, SUPABASE)).toBe("role_members");
+    // An incoming member that can SET ROLE (a plain GRANT bulls96_session_ingest TO app_member: SET TRUE, the
+    // PG16 default), alongside the permitted edge. Startup refuses.
+    const assumable = { member: "app_member", grantor: "supabase_admin", grantor_super: true, admin_option: false, inherit_option: false, set_option: true };
+    expect(await admission(injected({ ...REAL_PG16_LOGIN, members: 2 }, { ...REAL_PG16_EXTRA, member_edges: [CREATOR_EDGE, assumable] }).run)).toBe("role_members");
+  });
+
+  test("PGlite, live: a privileged login that SET ROLE bulls96_session_ingest is refused, as is the plain privileged login", async () => {
     const { run, runAs } = await database();
-    await assertIngestRole(run);
-    await expect(assertIngestRole(runAs("postgres"))).rejects.toThrow("bulls96_session_ingest");
+    // The old check (current_user only) admitted exactly this session.
+    const { rows } = await run("SELECT session_user::text AS s, current_user::text AS c, current_setting('role') AS r", []);
+    expect(rows[0]).toEqual({ s: "postgres", c: "bulls96_session_ingest", r: "bulls96_session_ingest" });
+    expect(await admission(run)).toBe("session_user");
+    expect(await admission(runAs("postgres"))).toBe("session_user");
+    // The admission SQL itself parses and runs on the PGlite server under the ingest role.
+    expect((await run(INGEST_LOGIN_SQL, [])).rows).toHaveLength(1);
+    expect((await run(INGEST_PG16_SQL, [])).rows).toHaveLength(1);
+  });
+
+  test("causal: one mutation per forbidden class refuses startup, naming only the property", async () => {
+    const L = REAL_PG16_LOGIN;
+    const X = REAL_PG16_EXTRA;
+    const cases: Array<[string, Record<string, unknown> | null, Record<string, unknown> | null, string]> = [
+      // P1: identity
+      ["privileged login + SET ROLE (session_user differs, role set)", { ...L, session_user: "postgres", role_setting: "bulls96_session_ingest" }, X, "session_user"],
+      ["member login + SET ROLE", { ...L, session_user: "app_member", role_setting: "bulls96_session_ingest" }, X, "session_user"],
+      ["ingest login switched away (current_user)", { ...L, current_user: "postgres", role_setting: "postgres" }, X, "current_user"],
+      ["SET ROLE to itself (role setting not none)", { ...L, role_setting: "bulls96_session_ingest" }, X, "set_role"],
+      ["PG16 system_user NULL (trust auth)", L, { ...X, system_user: null }, "system_user"],
+      ["PG16 system_user another identity", L, { ...X, system_user: "scram-sha-256:postgres" }, "system_user"],
+      ["PG16 system_user suffix only", L, { ...X, system_user: "scram-sha-256:x:bulls96_session_ingest" }, "system_user"],
+      ["PG16 system_user without method", L, { ...X, system_user: "bulls96_session_ingest" }, "system_user"],
+      ["PG16 extra row missing", L, null, "login_unreadable"],
+      ["no login row", null, X, "login_unreadable"],
+      ["unreadable version", { ...L, server_version: "160015" }, X, "login_unreadable"],
+      // P2: attributes
+      ["SUPERUSER", { ...L, rolsuper: true }, X, "superuser"],
+      ["BYPASSRLS", { ...L, rolbypassrls: true }, X, "bypassrls"],
+      ["CREATEROLE", { ...L, rolcreaterole: true }, X, "role_attributes"],
+      ["CREATEDB", { ...L, rolcreatedb: true }, X, "role_attributes"],
+      ["REPLICATION", { ...L, rolreplication: true }, X, "role_attributes"],
+      ["INHERIT", { ...L, rolinherit: true }, X, "role_attributes"],
+      ["attribute unreadable (null)", { ...L, rolcreatedb: null }, X, "role_attributes"],
+      // P2: membership, the role is a member of something
+      ["member of another role", { ...L, memberships: 1 }, X, "role_membership"],
+      // P2: membership, something is a member of the role
+      ["another role is a member", { ...L, members: 2 }, { ...X, member_edges: [CREATOR_EDGE, { ...CREATOR_EDGE, member: "attacker" }] }, "role_members"],
+      ["creator edge with SET", { ...L }, { ...X, member_edges: [{ ...CREATOR_EDGE, set_option: true }] }, "role_members"],
+      ["creator edge with INHERIT", { ...L }, { ...X, member_edges: [{ ...CREATOR_EDGE, inherit_option: true }] }, "role_members"],
+      ["creator edge from a non-superuser grantor", { ...L }, { ...X, member_edges: [{ ...CREATOR_EDGE, grantor_super: false }] }, "role_members"],
+      ["creator edge granted by another superuser", { ...L }, { ...X, member_edges: [{ ...CREATOR_EDGE, grantor: "root" }] }, "role_members"],
+      ["edge to a different member name", { ...L }, { ...X, member_edges: [{ ...CREATOR_EDGE, member: "authenticator" }] }, "role_members"],
+      ["unnamed member (dangling)", { ...L }, { ...X, member_edges: [{ ...CREATOR_EDGE, member: null }] }, "role_members"],
+      ["edge count disagrees with the list", { ...L, members: 2 }, X, "role_members"],
+      ["PG15: any member edge", { ...REAL_PG15_LOGIN, members: 1 }, X, "role_members"],
+      // P2: settings and timeouts
+      ["per-database role setting", { ...L, database_settings: 1 }, X, "role_settings"],
+      ["role profile: statement_timeout off", { ...L, rolconfig: ["statement_timeout=0", "lock_timeout=2s", "idle_in_transaction_session_timeout=10s"] }, X, "timeouts"],
+      ["role profile: extra setting", { ...L, rolconfig: [...L.rolconfig, "search_path=public"] }, X, "timeouts"],
+      ["role profile: none", { ...L, rolconfig: null }, X, "timeouts"],
+      ["live statement_timeout differs", { ...L, statement_timeout: "0" }, X, "timeouts"],
+      ["live lock_timeout differs", { ...L, lock_timeout: "0" }, X, "timeouts"],
+      ["live idle timeout differs", { ...L, idle_in_transaction_session_timeout: "0" }, X, "timeouts"],
+    ];
+    for (const [label, login, extra, code] of cases) expect([label, await admission(injected(login, extra).run)]).toEqual([label, code]);
+    // A failing query refuses too; the message names the expected role and the property, never an observed value.
+    const broken: SqlRun = async () => {
+      throw new Error("connect ECONNREFUSED 10.0.0.5");
+    };
+    let err: unknown;
+    try {
+      await assertIngestRole(broken, SUPABASE);
+    } catch (e) {
+      err = e;
+    }
+    expect(String(err)).toBe("IngestLoginError: 96bulls: the session ingest login (bulls96_session_ingest) refused: login_unreadable");
+    expect(String(new IngestLoginError("session_user"))).not.toContain("postgres");
+  });
+
+  test("the pool's startup options are exactly the role's pinned timeout profile (session_ingest_role.sql)", () => {
+    expect(INGEST_OPTIONS).toBe("-c statement_timeout=5s -c lock_timeout=2s -c idle_in_transaction_session_timeout=10s");
+    const pinned = [...read("supabase/bootstrap/session_ingest_role.sql").matchAll(/ALTER ROLE bulls96_session_ingest SET (\w+) = '([^']+)'/g)].map((m) => [m[1], m[2]]);
+    expect(Object.fromEntries(pinned)).toEqual({ ...INGEST_TIMEOUTS });
   });
 });

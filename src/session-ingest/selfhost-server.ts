@@ -15,8 +15,9 @@
  *
  * Bindings, Node instead of Cloudflare:
  *   HYPERDRIVE     -> pg.Pool as bulls96_session_ingest (discrete fields, SESSION_POSTGRES_TLS_PROFILE),
- *                     admitted at startup only if current_user is exactly that role, not superuser,
- *                     not BYPASSRLS
+ *                     admitted at startup only as a real login of exactly that role (assertIngestRole:
+ *                     session_user, current_user, no SET ROLE, PG16+ system_user), with the bootstrap's
+ *                     role shape, no membership edge in either direction, and the pinned timeouts
  *   S3 secrets     -> the Locker store (src/shared/locker.ts: MinIO static keys, EKS Pod Identity, or GCS)
  *   INGEST_FANOUT  -> none. The queue only exists because a Worker invocation has a subrequest budget
  *                     (staging.ts); a Node process does not, so `inlineMaxSessions` is unset and every
@@ -98,12 +99,137 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   return { app, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close };
 }
 
-/** Startup admission: the pool's login is exactly the ingest role, not superuser, not BYPASSRLS. Names the property only. */
-export async function assertIngestRole(run: SqlRun): Promise<void> {
-  const { rows } = await run("SELECT current_user AS role, r.rolsuper, r.rolbypassrls FROM pg_roles r WHERE r.rolname = current_user", []);
-  const me = rows[0];
-  if (rows.length !== 1 || !me || me.role !== SELFHOST_INGEST_ROLE) throw new Error(`96bulls: the session ingest login must be ${SELFHOST_INGEST_ROLE}`);
-  if (me.rolsuper !== false || me.rolbypassrls !== false) throw new Error(`96bulls: ${SELFHOST_INGEST_ROLE} must not be superuser or BYPASSRLS`);
+/**
+ * The bootstrap's LOGIN timeout profile (supabase/bootstrap/session_ingest_role.sql, checked exactly by
+ * session_ingest_verify.sql). The pool also sends it as startup options, so the live session matches.
+ */
+export const INGEST_TIMEOUTS = Object.freeze({ statement_timeout: "5s", lock_timeout: "2s", idle_in_transaction_session_timeout: "10s" });
+export const INGEST_OPTIONS = Object.entries(INGEST_TIMEOUTS).map(([k, v]) => `-c ${k}=${v}`).join(" ");
+const INGEST_ROLCONFIG = JSON.stringify(Object.entries(INGEST_TIMEOUTS).map(([k, v]) => `${k}=${v}`).sort());
+
+export type IngestLoginRefusal =
+  | "login_unreadable" | "session_user" | "current_user" | "set_role" | "system_user"
+  | "superuser" | "bypassrls" | "role_attributes" | "role_membership" | "role_members" | "role_settings" | "timeouts";
+
+/** Names the failed property only; never an observed role name, URL or credential. */
+export class IngestLoginError extends Error {
+  constructor(readonly code: IngestLoginRefusal) {
+    super(`96bulls: the session ingest login (${SELFHOST_INGEST_ROLE}) refused: ${code}`);
+    this.name = "IngestLoginError";
+  }
+}
+
+/** The live session and the role's shape in one row (pattern: assertInstallerLogin, src/acquisition/db-login.ts). */
+export const INGEST_LOGIN_SQL = `SELECT session_user::text AS session_user, current_user::text AS current_user,
+  current_setting('role') AS role_setting, current_setting('server_version_num')::int AS server_version,
+  current_setting('statement_timeout') AS statement_timeout, current_setting('lock_timeout') AS lock_timeout,
+  current_setting('idle_in_transaction_session_timeout') AS idle_in_transaction_session_timeout,
+  r.rolsuper, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolinherit, r.rolconfig,
+  (SELECT count(*)::int FROM pg_auth_members m WHERE m.member = r.oid) AS memberships,
+  (SELECT count(*)::int FROM pg_auth_members m WHERE m.roleid = r.oid) AS members,
+  (SELECT count(*)::int FROM pg_db_role_setting s WHERE s.setrole = r.oid AND s.setdatabase <> 0) AS database_settings
+  FROM pg_roles r WHERE r.rolname = current_user`;
+/**
+ * PG16+ only: system_user, inherit_option and set_option do not exist earlier. LEFT JOINs, so an edge
+ * whose member or grantor cannot be named is still listed, and then refused.
+ */
+export const INGEST_PG16_SQL = `SELECT system_user::text AS system_user,
+  (SELECT coalesce(json_agg(json_build_object('member', u.rolname, 'grantor', g.rolname, 'grantor_super', g.rolsuper,
+     'admin_option', a.admin_option, 'inherit_option', a.inherit_option, 'set_option', a.set_option)), '[]'::json)
+   FROM pg_auth_members a LEFT JOIN pg_roles u ON u.oid = a.member LEFT JOIN pg_roles g ON g.oid = a.grantor
+   WHERE a.roleid = (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS member_edges`;
+
+/**
+ * The one reverse membership edge permitted, and only on PG16+. When Supabase's non-superuser `postgres`
+ * (CREATEROLE) runs session_ingest_roles.sql, PostgreSQL 16 records the creator as a member of the new
+ * role, granted by the bootstrap superuser `supabase_admin`, WITH ADMIN, INHERIT FALSE, SET FALSE. That
+ * edge lets `postgres` administer grants of the role but never assume it (SET FALSE) or inherit its
+ * rights, and the repo's verifiers (session_ingest_verify.sql, and acquisition_installer_verify.sql for
+ * the sibling login) permit exactly this edge, with the same PG-version and provider logic:
+ *   - PG16+ only (before 16 a CREATEROLE creator gets no edge, so any incoming edge is refused);
+ *   - provider: the verifier requires hoopdb.db_mode='supabase', a GUC only migrate sets. At runtime the
+ *     declared provider is SESSION_POSTGRES_TLS_PROFILE=supabase (`provider.supabase`); off it, no edge
+ *     is permitted at all. A Supabase deployment on custom-ca must revoke the edge (as supabase_admin)
+ *     or the edge refuses startup;
+ *   - member `postgres`, grantor `supabase_admin` and that grantor a superuser, WITH ADMIN, INHERIT FALSE,
+ *     SET FALSE.
+ * Every other edge, in either direction, is refused.
+ */
+export interface IngestProvider {
+  /** SESSION_POSTGRES_TLS_PROFILE=supabase: the deployment declares Supabase (the verifier's db_mode). */
+  supabase: boolean;
+}
+function supabaseCreatorEdge(edge: unknown): boolean {
+  if (!edge || typeof edge !== "object") return false;
+  const e = edge as Record<string, unknown>;
+  return e.member === "postgres" && e.grantor === "supabase_admin" && e.grantor_super === true
+    && e.admin_option === true && e.inherit_option === false && e.set_option === false;
+}
+
+/**
+ * The admission decision over the live rows (pure, so a real-login row can be tested where PGlite has no
+ * login). `pg16` is the INGEST_PG16_SQL row, required when server_version >= 160000; `provider` gates
+ * the Supabase creator edge. null admits.
+ */
+export function ingestLoginRefusal(login: Record<string, unknown> | undefined, pg16: Record<string, unknown> | undefined, provider: IngestProvider): IngestLoginRefusal | null {
+  if (!login) return "login_unreadable";
+  // Identity: a real login as the role, never another login that SET ROLE into it.
+  if (login.session_user !== SELFHOST_INGEST_ROLE) return "session_user";
+  if (login.current_user !== SELFHOST_INGEST_ROLE) return "current_user";
+  if (login.role_setting !== "none") return "set_role";
+  const version = login.server_version;
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 100000) return "login_unreadable";
+  const modern = version >= 160000;
+  if (modern) {
+    if (!pg16) return "login_unreadable";
+    // "<auth method>:<authenticated identity>"; NULL means trust auth, which proves nothing.
+    const su = pg16.system_user;
+    const colon = typeof su === "string" ? su.indexOf(":") : -1;
+    if (typeof su !== "string" || colon < 1 || su.slice(colon + 1) !== SELFHOST_INGEST_ROLE) return "system_user";
+  }
+  // Shape: the bootstrap's NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION NOINHERIT.
+  if (login.rolsuper !== false) return "superuser";
+  if (login.rolbypassrls !== false) return "bypassrls";
+  if (login.rolcreaterole !== false || login.rolcreatedb !== false || login.rolreplication !== false || login.rolinherit !== false) return "role_attributes";
+  // Membership in both directions: a member of no role, and no role a member of it (but the creator edge).
+  if (login.memberships !== 0) return "role_membership";
+  if (typeof login.members !== "number") return "login_unreadable";
+  if (modern) {
+    const edges = pg16!.member_edges;
+    if (!Array.isArray(edges) || edges.length !== login.members || !edges.every((edge) => provider.supabase && supabaseCreatorEdge(edge))) return "role_members";
+  } else if (login.members !== 0) return "role_members";
+  // Settings: no per-database override (the verifier's rule), exactly the role's pinned timeout profile,
+  // and the live session's values.
+  if (login.database_settings !== 0) return "role_settings";
+  const config = login.rolconfig;
+  if (!Array.isArray(config) || JSON.stringify([...config].sort()) !== INGEST_ROLCONFIG) return "timeouts";
+  for (const [k, v] of Object.entries(INGEST_TIMEOUTS)) if (login[k] !== v) return "timeouts";
+  return null;
+}
+
+/**
+ * Startup admission: the pool's session is a real login as exactly the ingest role (session_user,
+ * current_user, no SET ROLE, and on PG16+ system_user), with the bootstrap's role shape, no membership
+ * edge in either direction (but the Supabase creator edge) and the pinned timeout profile. Any mismatch
+ * or query failure refuses startup; the error names the failed property only.
+ */
+export async function assertIngestRole(run: SqlRun, provider: IngestProvider): Promise<void> {
+  let login: Record<string, unknown> | undefined;
+  let pg16: Record<string, unknown> | undefined;
+  try {
+    const { rows } = await run(INGEST_LOGIN_SQL, []);
+    if (rows.length !== 1) throw new Error("rows");
+    login = rows[0];
+    if (typeof login?.server_version === "number" && login.server_version >= 160000) {
+      const extra = await run(INGEST_PG16_SQL, []);
+      if (extra.rows.length !== 1) throw new Error("rows");
+      pg16 = extra.rows[0];
+    }
+  } catch {
+    throw new IngestLoginError("login_unreadable");
+  }
+  const refusal = ingestLoginRefusal(login, pg16, provider);
+  if (refusal) throw new IngestLoginError(refusal);
 }
 
 export type RuntimeBuilder = (settings: SelfhostIngestSettings, env: NodeJS.ProcessEnv) => Promise<SelfhostIngestRuntime>;
@@ -115,13 +241,13 @@ export const productionRuntime: RuntimeBuilder = async (settings, env) => {
     application_name: "96bulls-session-ingest",
     idleTimeoutMillis: 60_000,
     connectionTimeoutMillis: 2_000,
-    // Nonempty, so pg never applies PGOPTIONS; the same bounds the role itself sets.
-    options: "-c statement_timeout=5000 -c lock_timeout=2000",
+    // Nonempty, so pg never applies PGOPTIONS; exactly the profile the role itself pins.
+    options: INGEST_OPTIONS,
   });
   pool.on("error", (err) => log.error("session ingest pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   const run: SqlRun = async (text, params) => (await pool.query(text, params as unknown[])) as unknown as { rows: Record<string, unknown>[] };
   try {
-    await assertIngestRole(run);
+    await assertIngestRole(run, { supabase: env.SESSION_POSTGRES_TLS_PROFILE === "supabase" });
     const store = buildLockerStore(env).store as unknown as ObjectStore;
     const verify = relaycontrolIngestIdentity(settings, selfhostIntrospector(settings, env));
     return selfhostIngestRuntime(settings, {
