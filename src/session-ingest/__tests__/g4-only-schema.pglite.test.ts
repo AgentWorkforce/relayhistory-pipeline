@@ -2,7 +2,8 @@
  * The session-ingest Worker on a G4-only database: supabase/migrations up to and including
  * 20261105043800_lazy_ack_clock_no_key_update.sql (plus bootstrap), WITHOUT 043850 (#332
  * acquisition owner), 043860 (#338 buffered search gate), 043870 (#339 buffered search feed
- * cursor), 043880 (#327 bookkeeping cleanup), 043890 (#384), 043900 (#336 consumer function grants,
+ * cursor), 043880 (#327 bookkeeping cleanup), 043885 (#386 generation overlap: owner-only window, retired
+ * record and policy trigger; replaces ingest_require_generation / ingest_lazy_guard), 043890 (#384), 043900 (#336 consumer function grants,
  * EXECUTE grants only) and any later migration (pglite-schema.ts
  * derives POST_G4_MIGRATIONS from the sorted list). The app runs with the Worker's default flags
  * (canonical acceptance, async admission / babysitter routing / replica off, relayhistory
@@ -98,12 +99,13 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105043860_buffered_search_gate.sql",
       "20261105043870_buffered_search_feed_cursor.sql",
       "20261105043880_ingest_bookkeeping_cleanup.sql",
+      "20261105043885_ingest_generation_overlap.sql",
       "20261105043890_buffered_search_gate_retired_witness.sql",
       "20261105043900_session_consumer_function_grants.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
-    expect(OBJECTS.replacedFunctions).toEqual(["ingest_babysitter_retention_register", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish"]);
+    expect(OBJECTS.replacedFunctions).toEqual(["ingest_babysitter_retention_register", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish", "ingest_require_generation"]);
   });
 
   test("no new table, function or column exists; the replaced RPCs exist in their prior form; no G4 body names a post-G4 object", async () => {
