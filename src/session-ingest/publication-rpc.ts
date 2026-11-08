@@ -25,7 +25,8 @@ function ticket(v:any,target:PublicationTarget):PublicationTicket{
   if(!UUID.test(h.generation)||typeof h.prefix!=="string"||h.prefix!==target.keyRoot+"/"+v.tenant.orgId+"/upload-generations/g="+h.generation||
    !Number.isInteger(h.groupIndex)||h.groupIndex<0||h.groupIndex>=v.stage.groupOrdinals.length||!Array.isArray(h.ordinals)||!h.ordinals.length||
    h.ordinals.some((i:any)=>!v.acceptedOrdinals.includes(i))||typeof h.revision!=="string"||!/^[1-9][0-9]*$/.test(h.revision)||
-   !Number.isSafeInteger(Number(h.revision)))throw bad();
+   !Number.isSafeInteger(Number(h.revision))||
+   (h.acquisitionEpoch!==undefined&&(typeof h.acquisitionEpoch!=="string"||!/^[1-9][0-9]{0,18}$/.test(h.acquisitionEpoch))))throw bad();
  }
  let receiptSeats;
  try{
