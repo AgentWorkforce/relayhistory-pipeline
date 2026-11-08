@@ -99,6 +99,7 @@ test("current ledger/source/gen/plan/capture/wrapper/manual exception are exact 
     { execution: "future-github" },
     { sourceSha: "e".repeat(40) },
     { ledgerSha256: "f".repeat(64) },
+    { ledgerSha256: "3173f2df7f749fd79c340286f3284d91d8f5a8b988b7f1b1a11e01c3a3307641" },
     { planSha256: "f".repeat(64) },
     { captureSha256: "f".repeat(64) },
     { wrapperSha256: "f".repeat(64) },
@@ -308,6 +309,7 @@ test("readonly plan rejects a changed current ledger/source/generation before ca
     p = JSON.parse(x.planText);
   for (const changed of [
     { ledgerSha256: "e".repeat(64) },
+    { ledgerSha256: "3173f2df7f749fd79c340286f3284d91d8f5a8b988b7f1b1a11e01c3a3307641" },
     { ledgerSha256: "de0e2fa02ba662bbc1e0ec23e1f619100d3b7cd824e8d055b04c44076d452729" },
     { sourceSha: "e".repeat(40) },
     { generation: "e".repeat(64) },
@@ -328,10 +330,19 @@ test("backend identity drift refuses the next canonical SQL before submission", 
   expect(x.calls.some((q) => q.includes("CREATE TABLE"))).toBe(false);
 });
 
-test("Window #2 requires the verified post-Window #1 ledger", () => {
+test("the next owner window requires the verified 56-step G2 ledger", () => {
   expect(A.ledger).toBe(
-    "3173f2df7f749fd79c340286f3284d91d8f5a8b988b7f1b1a11e01c3a3307641",
+    "502349fe27871cb12de3fb93d8b02c3a1ece691ad500c1d7a6b2176dbed66502",
   );
+});
+
+test("a capture from the pre-G2 ledger cannot authorize the next window", async () => {
+  const x = await evidence();
+  expect(() => validateOwnerApply(
+    x.planText,
+    JSON.stringify({ ...x.capture, ledgerSha256: "3173f2df7f749fd79c340286f3284d91d8f5a8b988b7f1b1a11e01c3a3307641" }),
+    JSON.stringify(x.approval), pin, x.wrapper, now,
+  )).toThrow("owner_capture_binding");
 });
 
 test("approved CLI version-cache churn cannot hide dirty source or arbitrary artifacts", () => {

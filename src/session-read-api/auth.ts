@@ -15,6 +15,7 @@ import {
   type RelaycontrolIntrospectorOptions,
 } from "@rhc/auth/relaycontrol.ts";
 import { AuthError, type Verifier } from "./app.ts";
+import type { LoginExchange } from "./selfhost.ts";
 
 export interface AuthConfig {
   /** This service's origin, e.g. https://xyz.lambda-url.us-east-1.on.aws. Unset: every token is refused. */
@@ -113,4 +114,55 @@ export function readApiVerifier(
   if (!config.relaycontrol) return relayAuth;
   const relaycontrol = relaycontrolVerifier(config, deps.introspector);
   return (bearer, request) => (isRelaycontrolToken(bearer) ? relaycontrol(bearer, request) : relayAuth(bearer, request));
+}
+
+/**
+ * POST /v1/cli/login's exchange (RELAYHISTORY_SELFHOST_READ_API): the presented
+ * `sh_at_` token through the same introspection as every relaycontrol read, with
+ * `aud` = READ_API_ORIGIN and no workspace (the response's is authoritative).
+ * Fail closed: the relaycontrol path off, unconfigured, unreachable or answering
+ * malformed data is a 503, never a 401 that would tell a client to drop a good
+ * token. Refusals are 401 with a fixed code mapped from the introspector's
+ * reason; nothing from the token or relaycontrol's reason text is echoed.
+ */
+export function relaycontrolLogin(
+  config: AuthConfig,
+  introspector: (opts: RelaycontrolIntrospectorOptions) => Promise<RelaycontrolIntrospector> = sharedRelaycontrolIntrospector,
+): LoginExchange {
+  return async (token) => {
+    if (!config.relaycontrol)
+      throw new AuthError(503, "relaycontrol_not_enabled", "relaycontrol token introspection is not enabled");
+    const url = config.relaycontrol.url?.trim();
+    const secret = config.relaycontrol.secret?.trim();
+    if (!config.origin || !url || !secret)
+      throw new AuthError(503, "relaycontrol_not_configured", "relaycontrol token introspection is not configured");
+    if (!isRelaycontrolToken(token)) throw new AuthError(401, "invalid_token", "token is not valid");
+    let auth;
+    try {
+      const verifier = await introspector({ url, secret });
+      auth = await verifier.verifyRelaycontrolToken(token, { aud: config.origin });
+    } catch (error) {
+      if (error instanceof RelaycontrolUnavailableError) throw new AuthError(503, error.code, error.message);
+      if (error instanceof RelaycontrolRejectedError) {
+        const reason = error.reason;
+        if (reason === "expired" || reason === "inactive:expired") throw new AuthError(401, "token_expired", "token has expired");
+        if (reason.startsWith("inactive:")) throw new AuthError(401, "token_inactive", "token is not active");
+        if (reason === "aud_mismatch") throw new AuthError(401, "wrong_audience", "token is not bound to this service");
+        throw new AuthError(401, "invalid_token", "token is not valid");
+      }
+      // A URL or secret the introspector refuses to be built with: configuration, not the caller.
+      throw new AuthError(503, "relaycontrol_not_configured", "relaycontrol token introspection is not configured");
+    }
+    if (auth.historyOrigin !== config.origin || auth.migration)
+      throw new AuthError(401, "wrong_audience", "token is not bound to this service");
+    const exp = auth.claims?.exp;
+    if (typeof exp !== "number" || !Number.isFinite(exp))
+      throw new AuthError(503, "relaycontrol_unavailable", "token introspection is unavailable");
+    if (!auth.orgId || !auth.workspaceId) throw new AuthError(401, "invalid_token", "token carries no workspace");
+    if (!auth.scopes.includes("rth:read")) throw new AuthError(403, "forbidden", "missing required scope: rth:read");
+    return {
+      identity: { userId: auth.userId, orgId: auth.orgId, workspaceId: auth.workspaceId, scopes: auth.scopes },
+      expiresAtMs: exp * 1000,
+    };
+  };
 }
