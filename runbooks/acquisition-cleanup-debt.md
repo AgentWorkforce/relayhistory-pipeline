@@ -12,7 +12,7 @@ It is never dropped because the install SQL may already have committed. Deleting
 
 - Reconciler counters (`NativeIssuer.reconcile()`): debt counts in `retry`, and in `stalled` after `MAX_SEND_ATTEMPTS` (8) failed attempts. `src/acquisition/main.ts` logs `acquisition reconcile` (`reason: retry=N`) at info, and at warn `acquisition reconcile stalled` (`reason: max_send_attempts`) and `acquisition reconcile stale` (`reason: lease_superseded`). Alert on `stalled`.
 - `stale` is not debt. It counts a completion whose `lease_token` compare-and-set lost to another sender (also logged as `acquisition stale completion`). It changes nothing; investigate only if it is sustained.
-- Pending-row condition, read-only (proposed tables):
+- Pending-row condition, read-only (proposed tables). This SQL is source-derived from the proposal and the code; it has not been executed against any database. Check every table and column name against the DDL actually applied in the target environment before running it:
 
 ```sql
 SELECT i.operation_uuid, i.installation_id, i.reservation, i.cancel_reason, i.attempts,
@@ -37,9 +37,11 @@ Stalled means `attempts >= 8`. Never select `grant_ciphertext`, `grant_nonce`, `
 
 Backoff is `min(30 s * 2^(attempts-1), 1 h)` (`RETRY_BASE_MS`, `RETRY_CAP_MS`); stalled rows are still resent hourly. A recognised retired installation: `installations.retired_at IS NOT NULL` (set by `NativeIssuer.retireInstallation`, which also sets `cancel_reason = 'installation_retired'` on pending installs). If it retired before the install ever received an epoch, the debt stays stalled and alerting forever by design; the install is not refused because its grant may have landed. The claim route answers `403 installation_not_proven` for it, so no client can resolve it.
 
-## 4. The only sanctioned manual resolution
+## 4. Last-resort repair design (not an approved operational command)
 
-Record an explicit revoke row for the grant so the next resend applies the install against it (the debt completion checks `NOT EXISTS` of a `kind = 'revoke'` row for the grant). The intended path is the issuer's own `unreservedRevoke` / `createRevokeIntent` (`POST .../revocations`, reason `explicit_exclude`), which signs against the authority status row only when its `grantId` is this install, else `409 grant_not_installed`. A debt install not yet stalled answers `409 session_busy`. A retired installation cannot use the route (403), so a row is needed. Statement shape (the `INSERT` in `createRevokeIntent`):
+This section is a design for a last resort, not a generally sanctioned operational procedure, and there is no approved CLI for it today. It may only be used as part of a scoped repair plan owned by the issuer owner, with the concrete SQL for that specific environment approved by the owner before it runs. Operators must not run it on their own authority.
+
+The design records an explicit revoke row for the grant so the next resend applies the install against it (the debt completion checks `NOT EXISTS` of a `kind = 'revoke'` row for the grant). The intended path is the issuer's own `unreservedRevoke` / `createRevokeIntent` (`POST .../revocations`, reason `explicit_exclude`), which signs against the authority status row only when its `grantId` is this install, else `409 grant_not_installed`. A debt install not yet stalled answers `409 session_busy`. A retired installation cannot use the route (403), so a row is needed. Statement shape (source-derived from the `INSERT` in `createRevokeIntent`, not executed anywhere; a template for the owner's approved SQL, not a command):
 
 ```sql
 INSERT INTO sessions.ingest_acquisition_native_intents
@@ -63,4 +65,8 @@ ON CONFLICT (target_grant_id) WHERE kind = 'revoke' DO NOTHING;
 
 ## 6. `lease_token` for environments with an earlier DDL copy
 
-An earlier copy of the proposed DDL may lack `lease_token uuid` on `ingest_acquisition_native_intents`, and the column-scoped `UPDATE (... lease_until, lease_token, ...)` grant. The code needs both, because every completion is a CAS on `lease_token`. Do not alter the table by hand: the SQL lane folds the final DDL into its migration. Treat such an environment as non-conforming and recreate it from the current proposal, with the owner's approval, before enablement.
+An earlier copy of the proposed DDL may lack `lease_token uuid` on `ingest_acquisition_native_intents`, and the column-scoped `UPDATE (... lease_until, lease_token, ...)` grant. The code needs both, because every completion is a CAS on `lease_token`. Do not alter the table by hand: the SQL lane folds the final DDL into its migration. Treat such an environment as non-conforming before enablement:
+
+- Recreating it from the current proposal is allowed only for an explicitly disposable environment whose acquisition tables are EMPTY, with the owner's approval.
+- Any environment holding real or durable rows needs an owner-approved SQL-lane migration that preserves every intent, its G (`grant_ciphertext`, `grant_nonce`), revoke rows and leases. Obligations are never dropped to make a column change.
+- No hand `ALTER` in either case.
