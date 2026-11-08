@@ -87,7 +87,7 @@ const QUOTED_KEY =
  * that runs past it is redacted whole, up to its closing quote or, with none, to the end
  * of its line or of the input, so no part of it is stored.
  */
-const MAX_QUOTED_VALUE = 4096;
+export const MAX_QUOTED_VALUE = 4096;
 
 /** JSON literals and numbers after a quoted secret key are not secrets (`"max_token": 512`). */
 const NON_SECRET_BARE =
@@ -121,8 +121,8 @@ function backslashesBefore(text: string, at: number): number {
  * the end of the input when there is none. A generated unquoted value longer than the
  * bound is redacted to its end too. The text
  * past the bound is walked once, and the redaction consumes it, so the pass stays
- * linear. With `overCap`, each over-long quoted value's span [key start, value end) is
- * recorded.
+ * linear. With `overCap`, the span [key start, value end) of each over-long quoted value
+ * and of each generated unquoted value of `MAX_QUOTED_VALUE` units or more is recorded.
  */
 function redactQuotedSecretValues(
   text: string,
@@ -147,6 +147,9 @@ function redactQuotedSecretValues(
     let valueEnd: number;
     // Past the bound: redacted whole, never kept.
     let longValue = false;
+    // A generated unquoted value of `MAX_QUOTED_VALUE` units or more: redacted as
+    // before (to its end), and its span recorded for the segmenter.
+    let overBound = false;
     if (quote === '"' || quote === "'" || quote === "`") {
       valueStart = end + bs + 1;
       // At escaping depth d the opening quote has 2^d - 1 backslashes, and a quote is
@@ -222,12 +225,13 @@ function redactQuotedSecretValues(
         const rest = /[^\s"'`,;{}[\]\\]*/y;
         rest.lastIndex = valueEnd;
         valueEnd += (rest.exec(text) as RegExpExecArray)[0].length;
+        overBound = true;
       }
     }
-    // From the key start: a cut between key and value would leave the value with no key to match.
-    if (longValue) overCap?.push([m.index, valueEnd]);
     const value = longValue ? "" : text.slice(valueStart, valueEnd);
     if (valueEnd <= valueStart || (!longValue && keepQuotedValue(value))) continue;
+    // From the key start: a cut between key and value would leave the value with no key to match.
+    if (longValue || overBound) overCap?.push([m.index, valueEnd]);
     out += text.slice(last, valueStart) + REDACTED;
     last = valueEnd;
     QUOTED_KEY.lastIndex = Math.max(QUOTED_KEY.lastIndex, valueEnd);
@@ -236,10 +240,15 @@ function redactQuotedSecretValues(
 }
 
 /**
- * The span [start, end) of every quoted secret value in `text` longer than the quoted
- * rule's scan bound, as `redactQuotedSecretValues` finds them in `text` as given. The
+ * The span [key start, value end) of every quoted secret value in `text` longer than the
+ * quoted rule's scan bound, and of every generated unquoted value after a quoted key of
+ * at least that length, as `redactQuotedSecretValues` finds them in `text` as given. The
  * rule redacts each whole, so a segmenter must not cut inside one: the segment after the
- * cut would hold the rest of the value with no key before it.
+ * cut would hold the rest of the value with no key before it. Whether a value is over
+ * the bound is decided by the first `MAX_QUOTED_VALUE` + 150 units from its key's start
+ * (a key match is at most 132 units and up to 16 backslashes and the quote follow it,
+ * then `MAX_QUOTED_VALUE` + 1 units of value), so a caller may pass a prefix of its text
+ * that reaches that far past the last key it cares about.
  */
 export function overCapQuotedValueSpans(text: string): Array<[number, number]> {
   const spans: Array<[number, number]> = [];

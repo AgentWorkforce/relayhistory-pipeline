@@ -17,6 +17,7 @@
  */
 import { sha256Hex as digestHex } from "../../../../object-store/src/crypto.js";
 import {
+  MAX_QUOTED_VALUE,
   MAX_SCRUB_CHARS,
   exceedsScrubBound,
   isCardNumber,
@@ -60,9 +61,14 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  *   Version 3 redacted only the first 4096 units (or up to the first
  *   whitespace in them) and stored the rest. A
  *   generated unquoted value after a quoted key is likewise redacted to its
- *   end. The segmenter never cuts between such a value's key and its end
- *   (`longCut`), and refuses the string when no other cut is left. Output for
- *   values within the bound is byte-identical to version 3.
+ *   end. `longCut` never ends a segment strictly between the start of such a
+ *   value's key and the value's end (a cut exactly at the key's start is
+ *   allowed), wherever the key sits relative to the segment bound, including a
+ *   key that straddles it: it looks `MAX_QUOTED_VALUE` + 256 units past the
+ *   bound for them. It refuses the string when no other cut is left. Values
+ *   within the bound get no such span and rely on the context check, as in
+ *   version 3. Output for values within the bound is byte-identical to
+ *   version 3.
  */
 export const SCRUB_RULESET_VERSION = 4;
 
@@ -323,7 +329,8 @@ const CUT_SEARCH_CHARS = 65_536;
  * From rule set 4 a quoted value past `MAX_QUOTED_VALUE` is redacted whole,
  * however long, up to the closing quote or the first line break (LF, CR).
  * `longCut` cuts a long string after any whitespace, so it refuses every cut
- * from the key start to the value end of such a value (`overCapQuotedValueSpans`);
+ * from the key start to the value end of such a value (`overCapQuotedValueSpans`,
+ * scanned past the bound so a key just below it is seen);
  * a run (`safeCut`) is cut only at line boundaries, which no such value crosses.
  */
 const CUT_CONTEXT_CHARS = 8192;
@@ -493,10 +500,13 @@ function scrubBounded(text: string): string {
  *    within one token, so a token is never split),
  *  - does not sit between two digit groups (cards, phone numbers),
  *  - is not inside a private-key block whose footer comes later,
- *  - is not between the key and the end of a quoted secret value longer than the
- *    quoted rule's scan bound (`overCapQuotedValueSpans`; rule set 4 redacts such a
- *    value whole, however far it runs, so no bounded context check can see its key
- *    from a cut deep inside), and
+ *  - is not strictly between the key start and the end of a quoted secret value
+ *    longer than the quoted rule's scan bound, or of a generated unquoted value of
+ *    at least that length (`overCapQuotedValueSpans`, over the text up to
+ *    `MAX_QUOTED_VALUE` + 256 past the bound, so a value whose length passes the
+ *    bound only after it is seen too; rule set 4 redacts such a value whole, however
+ *    far it runs, so no bounded context check can see its key from a cut deep
+ *    inside, and earlier rules can shrink it under the bound in a window), and
  *  - leaves `CUT_CONTEXT_CHARS` on each side scrubbing identically together and
  *    apart, which also covers rules whose match spans a separator before the
  *    secret (`Bearer <token>`, `key = value`).
@@ -532,9 +542,16 @@ function longCut(text: string): number {
   const floor = Math.max(1, MAX_SCRUB_CHARS - CUT_SEARCH_CHARS);
   const budget: CutBudget = { checks: 0, candidates: 0 };
   const keys = keyBlockSpans(text.slice(0, top));
-  // A value still open at `top` runs on past it: treat it as open to the end.
-  const longValues = overCapQuotedValueSpans(text.slice(0, top)).map(
-    ([start, end]): [number, number] => [start, end >= top ? text.length : end],
+  // Over-bound values whose key starts before `top`, found by looking past `top`: a
+  // value whose length passes the bound only after `top` (its key less than about 4,250
+  // units before `top`, or straddling it) must be protected too, or a cut could land in
+  // its key, at the seam or in the value and leave its tail keyless in the next segment.
+  // Whether a value is over the bound is decided within MAX_QUOTED_VALUE + 150 units of
+  // its key's start (`overCapQuotedValueSpans`); 256 leaves a margin. A value still open
+  // at `look` runs on past it: treat it as open to the end.
+  const look = Math.min(text.length, top + MAX_QUOTED_VALUE + 256);
+  const longValues = overCapQuotedValueSpans(text.slice(0, look)).map(
+    ([start, end]): [number, number] => [start, end >= look ? text.length : end],
   );
   for (let cut = top; cut >= floor && withinBudget(budget); cut--) {
     // Not inside a key block that closed below the bound either.

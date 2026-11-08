@@ -1,49 +1,38 @@
 /**
  * Rule set 4 promise: a quoted value within the scan bound (`MAX_QUOTED_VALUE`, 4096
  * units) scrubs byte-identically to rule set 3. This differential fuzz runs rule set 3's
- * `lib/scrub.ts` (read from git at its last commit, `fc10bb03`) against the current one
- * on random key/value inputs, and allows a difference only where some line holds more
- * than 4096 units (where an over-bound value can be). 2,000 inputs by default;
- * SCRUB_FUZZ_INPUTS raises it, SCRUB_FUZZ_SEED changes the seed. Skipped when the
- * rule set 3 source is not in the clone (a shallow checkout).
+ * `lib/scrub.ts` against the current one on random key/value inputs, and allows a
+ * difference only where some line holds more than 4096 units (where an over-bound value
+ * can be). 2,000 inputs by default; SCRUB_FUZZ_INPUTS raises it, SCRUB_FUZZ_SEED changes
+ * the seed.
+ *
+ * Rule set 3 is frozen in `fixtures/scrub-ruleset-3.ts`: byte for byte
+ * `git show fc10bb03:packages/pipeline/src/lib/scrub.ts` (it has no imports), pinned by
+ * its sha256 below, so the test runs in every checkout, shallow ones and CI included.
+ * Never edit the fixture: a rule set that has shipped does not change.
  */
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
-import { afterAll, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import { scrubText as v3 } from "./fixtures/scrub-ruleset-3.js";
 import { scrubText as v4 } from "../src/lib/scrub.js";
 
-const V3_COMMIT = "fc10bb03";
+/** sha256 of fixtures/scrub-ruleset-3.ts (LF line endings), rule set 3's scrub.ts at fc10bb03. */
+const V3_FIXTURE_SHA256 = "e912c396277d383ef07a77b5b3dbd54d9ad83e59d3d5d1bafdab62b2b619daa1";
 const INPUTS = Number(process.env.SCRUB_FUZZ_INPUTS ?? 2000);
 const SEED = Number(process.env.SCRUB_FUZZ_SEED ?? 12345);
 
-function v3Source(): string | null {
-  try {
-    return execFileSync("git", ["show", `${V3_COMMIT}:packages/pipeline/src/lib/scrub.ts`], {
-      cwd: resolve(__dirname, ".."),
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      maxBuffer: 8 * 1024 * 1024,
-    });
-  } catch {
-    return null;
-  }
-}
+describe("rule set 3 vs 4 within the scan bound (differential fuzz)", () => {
+  it("runs against the frozen rule set 3 source", () => {
+    const fixture = readFileSync(
+      fileURLToPath(new URL("./fixtures/scrub-ruleset-3.ts", import.meta.url).href),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+    expect(createHash("sha256").update(fixture).digest("hex")).toBe(V3_FIXTURE_SHA256);
+  });
 
-const source = v3Source();
-const dir = source ? mkdtempSync(join(tmpdir(), "scrub-v3-")) : "";
-afterAll(() => {
-  if (dir) rmSync(dir, { recursive: true, force: true });
-});
-
-describe.skipIf(!source)("rule set 3 vs 4 within the scan bound (differential fuzz)", () => {
-  it(`scrubs ${INPUTS} random inputs byte-identically wherever no line passes 4096 units`, async () => {
-    const file = join(dir, "scrub-v3.ts");
-    writeFileSync(file, source!);
-    const { scrubText: v3 } = (await import(pathToFileURL(file).href)) as { scrubText: (s: string) => string };
-
+  it(`scrubs ${INPUTS} random inputs byte-identically wherever no line passes 4096 units`, () => {
     let seed = SEED;
     const rnd = (n: number) => {
       seed = (seed * 1103515245 + 12345) & 0x7fffffff;

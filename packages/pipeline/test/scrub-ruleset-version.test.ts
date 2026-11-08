@@ -41,7 +41,10 @@ const SCRUB_RULESETS: Record<number, string> = {
   // segmenter's longCut never cuts between such a value's key and its end. Values within
   // the bound scrub
   // byte-identically to version 3.
-  4: "6fe2084c78bac7398b7db1cae84d0f7745c99220d472f594fcb0f9bce9996375",
+  // Updated before release (N1 delta review: longCut finds those values past the segment
+  // bound too, so a key just below the bound is protected; the unquoted over-bound value
+  // gets a span). Version 4 has sealed no chunk: it is only on this unmerged branch.
+  4: "902b2153f75ec6a2a8b9358f672229bc3855dbc3edc93af84f465ca4fa4f89d0",
 };
 
 const read = (rel: string) =>

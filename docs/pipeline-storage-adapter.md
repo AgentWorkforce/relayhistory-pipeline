@@ -88,11 +88,18 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     set 4 stops at a line break instead, so the segmenter can keep cutting runs at line boundaries; text after
     the break is scrubbed by the other rules as usual. U+2028 and U+0085 are not
     line breaks to it. This narrowing needs relayscrubber-lead's acceptance.
-  - **New refusals.** The segmenter does not cut inside such a value, from its key
-    to its end (`overCapQuotedValueSpans`). `longCut` (long strings, cut after any
-    whitespace) refuses those cuts; when no other cut is left the string is
-    rejected with `chunk_string_too_long`, which is non-retryable and holds no
-    content. The session ingest (`src/session-ingest/oversize.ts`) replaces such
+  - **New refusals.** `longCut` (long strings, cut after any whitespace) never
+    ends a segment strictly between the start of such a value's key and the
+    value's end; a cut exactly at the key's start is allowed. The same holds for
+    a generated unquoted value of 4096 or more units after a quoted key. It finds
+    these values (`overCapQuotedValueSpans`) in the text up to 4096 + 256 units
+    past the segment bound, which covers the longest key plus the scan's reach
+    (4096 + 150 units from the key's start), so a key just below the bound or
+    straddling it is protected too. Values within the bound get no such span;
+    as in rule set 3 they rely on the context check (`CUT_CONTEXT_CHARS`). Runs
+    are cut only at line boundaries, which no such value crosses. When no other
+    cut is left the string is rejected with `chunk_string_too_long`, which is
+    non-retryable and holds no content. The session ingest (`src/session-ingest/oversize.ts`) replaces such
     a string with its redaction marker before sealing, and the neon reader
     (`src/migration/neon-s3-sync/neon-reader.ts`) truncates it to a prefix that
     the sealer then scrubs.

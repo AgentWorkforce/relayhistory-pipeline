@@ -11,8 +11,8 @@ import * as scrub from "../src/lib/scrub.js";
 import { MAX_SCRUB_CHARS, scrubText } from "../src/lib/scrub.js";
 import { scrubLong } from "../src/lib/pipeline/raw-chunks.js";
 
-/** `MAX_QUOTED_VALUE` in lib/scrub.ts (not exported). */
-const CAP = 4096;
+/** `MAX_QUOTED_VALUE` in lib/scrub.ts. */
+const CAP = scrub.MAX_QUOTED_VALUE;
 const R = "[REDACTED]";
 
 /** Low-entropy filler no other rule matches, with no whitespace. */
@@ -143,6 +143,17 @@ describe("quoted secret values past the scan bound (rule set 4)", () => {
     expect(out).toBe(`'token' => ${R}; next`);
   });
 
+  it("records a span from the key for a generated unquoted value of 4096+ units, not for a shorter one", () => {
+    const chunk = "aB3dE5fG7hJ9kL1mN2pQ4rS6tU8wX0yZ";
+    for (const n of [CAP, CAP * 2]) {
+      const input = `x 'token' => ${chunk.repeat(n / chunk.length)}; next`;
+      expect(scrub.overCapQuotedValueSpans(input)).toEqual([[2, input.length - 6]]);
+    }
+    expect(scrub.overCapQuotedValueSpans(`'token' => ${chunk.repeat(8)}; next`)).toEqual([]);
+    // Low entropy: not taken, so no span either.
+    expect(scrub.overCapQuotedValueSpans(`'token' => ${solid(CAP * 2)}; next`)).toEqual([]);
+  });
+
   it("leaves no byte of the value in output for every shape", () => {
     const value = spaced(CAP * 5);
     const inputs = [
@@ -218,6 +229,56 @@ describe("the segmenter never cuts inside an over-bound value (rule set 4)", () 
     const out = scrubLong(text);
     expect(out.includes(marker)).toBe(false);
     expect(out.endsWith(`"password": "${R}" end words`)).toBe(true);
+  });
+
+  // Delta review N1: longCut found over-bound values only in the text below the segment
+  // bound, so a value whose length passes the scan bound only past it (its key less than
+  // about 4,250 units below the bound, or straddling it) had no span, and the cut could
+  // land in the key, at the seam or in the value, storing the value's tail keyless.
+  const MARK = "SECRETTAILMARK";
+  const capyTokens = `${"capy_" + "Ab1".repeat(10)} `.repeat(260);
+  /** Filler ending in a non-space, so the only whitespace before the key is the one added. */
+  const lorem = (n: number) => "lorem ipsum dolor ".repeat(Math.ceil(n / 18)).slice(0, n).replace(/ $/, "x");
+  /** A text whose key starts `off` units from MAX_SCRUB_CHARS. */
+  const keyAt = (off: number, key: string, sep: string, close: string) =>
+    `${lorem(MAX_SCRUB_CHARS + off - 1)} ${key}${sep}${capyTokens}${MARK} ${capyTokens}${close} end words`;
+  const KEY_STYLES: Array<[string, string, string]> = [
+    ['"password"', ': "', '"'],
+    ['"db password"', ': "', '"'],
+    ["'token'", ": '", "'"],
+    ['\\"api_key\\"', ': \\"', '\\"'],
+    ['"secret"', ' : "', '"'],
+  ];
+
+  it("protects a value whose key starts anywhere from 4,200 units below the bound to the bound", () => {
+    // Every 200 units up to the scan's reach (4096 + 150 from the key), then each unit
+    // where the cut can fall in the key or the separator.
+    const offsets = [-4250, -4100, -4096, -4000, -100, -64, -56, -48];
+    for (let off = -3800; off < -100; off += 200) offsets.push(off);
+    for (let off = -40; off <= 0; off += 1) offsets.push(off);
+    for (const [key, sep, close] of KEY_STYLES) {
+      for (const off of offsets) {
+        const text = keyAt(off, key, sep, close);
+        expect(text.length).toBeGreaterThan(MAX_SCRUB_CHARS);
+        expect(scrubLong(text).includes(MARK), `${key} at ${off}`).toBe(false);
+      }
+    }
+  }, 120_000);
+
+  it("does not cut inside the key, at the colon, at the opening quote or just after it", () => {
+    // Each was the cut rule set 4 made before the fix (key start + 4, + 11, + 12, + 14).
+    const cases: Array<[string, string, number, string]> = [
+      ['"db password"', ': "', -5, "inside the key"],
+      ['"password"', ' : "', -11, "before the colon"],
+      ['"password"', ': "', -14, "before the opening quote"],
+      ['"password"', ': " ', -14, "just after the opening quote"],
+    ];
+    for (const [key, sep, off, where] of cases) {
+      const text = keyAt(off, key, sep, '"');
+      const out = scrubLong(text);
+      expect(out.includes(MARK), where).toBe(false);
+      expect(out.endsWith(`${key}${sep.trimEnd()}${R}" end words`), where).toBe(true);
+    }
   });
 
   it("refuses a text whose only cuts fall inside an over-bound value", () => {
