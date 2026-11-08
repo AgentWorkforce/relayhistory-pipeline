@@ -93,6 +93,7 @@ native("native PG17: released image ledger upgrades in place as unchanged non-CR
     await owner.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)",[alias.migration,alias.accepted_as_alias_of]);
     const ledgerBefore=await liveRows(owner), markerBeforeCollision=(await owner.query("SELECT * FROM sessions.__96bulls_role_validation")).rows;
     expect(await schemaVerdict({...await expectedSchema(),dbMode:"selfhosted"},txn(runtime))).toEqual({ok:false,reason:"schema_pending",count:1});
+    // Both names recorded is a distinct refusal (ledger_alias_collision), not ledger_unknown_step as in the fix/readiness-renamed-collision draft; accepted by pipeline-lead 2026-11-08.
     expect((await rejected(runMigrations(sql(owner),{profile:next})))?.code).toBe("ledger_alias_collision");
     expect(await liveRows(owner)).toEqual(ledgerBefore);
     expect((await owner.query("SELECT * FROM sessions.__96bulls_role_validation")).rows).toEqual(markerBeforeCollision);
