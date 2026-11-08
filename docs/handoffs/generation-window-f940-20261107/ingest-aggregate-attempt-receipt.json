@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "kind": "brian_ingest_aggregate_snapshot_attempt_receipt",
+  "recordedAt": "2026-11-07T19:46:36.295568+00:00",
+  "assignmentMessage": "244906267098443776",
+  "aboutToRunRelayMessage": "244910267843174400",
+  "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "sqlSha256": "21d17eb075890825863625bba20604758a816652f878a10b80064b84e01002e6",
+  "runnerSha256": "2fdfbd5c344b806f083ddda5b29b80cd56fa1aeb546321e5dd2c663ca1f44523",
+  "host": "sf-frame",
+  "configuredPrincipal": "cli_login_postgres; exact draft pin, no SET ROLE",
+  "sameExistingCredentialTransport": true,
+  "attempts": 1,
+  "resultVerbatim": {
+    "status": "refused",
+    "code": "42501",
+    "productionWrites": false
+  },
+  "preflightRows": null,
+  "aggregateRows": null,
+  "aggregateBlockExecuted": false,
+  "statisticsVisibility": "UNKNOWN",
+  "slotVisibility": "UNKNOWN",
+  "phaseQualification": "Permission refusal during the connection/preflight attempt; no rows returned. Closed output does not isolate the denied object. No retry to diagnose by escalation.",
+  "permissionGrantOrRoleFallback": false,
+  "productionWrites": false
+}
