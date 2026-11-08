@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, test } from "vitest";
-import { ALL_WORKSPACES, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
+import { ALL_WORKSPACES, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const TEMPLATE = readFileSync(here("../wrangler.jsonc"), "utf8");
@@ -224,12 +224,60 @@ describe("deploy config render, buffered_search_gate", () => {
   });
 });
 
+describe("deploy config render, owner_buffered_events", () => {
+  const ALL = { ...ON, ownerBufferedWorkspaces: "*", directoryWorkspaces: "*" };
+
+  test("events off (no input, empty, off) is byte-identical to the render without the input, for every existing input combination", () => {
+    const combos: RenderInputs[] = [
+      { hyperdriveId: HD },
+      { hyperdriveId: HD, ownerBuffered: "off", directoryWorkspaces: "*" },
+      { hyperdriveId: HD, bufferedSearchGate: "on" },
+      ON,
+      { ...ON, bufferedSearchGate: "on" },
+      ALL,
+    ];
+    for (const combo of combos) {
+      const without = renderDeployConfig(TEMPLATE, combo);
+      for (const ownerBufferedEvents of [undefined, "", " ", "off", " off "]) {
+        const out = renderDeployConfig(TEMPLATE, { ...combo, ownerBufferedEvents });
+        expect(out, JSON.stringify({ combo, ownerBufferedEvents })).toBe(without);
+        expect(out).not.toContain(OWNER_BUFFERED_EVENTS_VAR);
+      }
+    }
+    expect(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ownerBufferedEvents: "off" })).toBe(sedRender(HD));
+    expect(TEMPLATE).not.toContain(OWNER_BUFFERED_EVENTS_VAR);
+  });
+
+  test("events on with owner_buffered=on adds exactly READ_API_OWNER_BUFFERED_EVENTS=on and nothing else", () => {
+    for (const base of [ON, ALL, { ...ON, bufferedSearchGate: "on" }]) {
+      const without = parse(renderDeployConfig(TEMPLATE, base));
+      const withEvents = parse(renderDeployConfig(TEMPLATE, { ...base, ownerBufferedEvents: " on " }));
+      expect(withEvents.vars[OWNER_BUFFERED_EVENTS_VAR]).toBe("on");
+      const { [OWNER_BUFFERED_EVENTS_VAR]: _, ...rest } = withEvents.vars;
+      expect({ ...withEvents, vars: rest }).toEqual(without);
+    }
+  });
+
+  test("events on without owner_buffered=on, or a bad value, or a template that sets the var, fails closed", () => {
+    for (const ownerBuffered of [undefined, "", "off"]) {
+      expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ownerBuffered, ownerBufferedEvents: "on" })).toThrow(/owner_buffered_events=on needs owner_buffered=on/);
+      expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ownerBuffered, bufferedSearchGate: "on", ownerBufferedEvents: "on" })).toThrow(/owner_buffered_events=on needs owner_buffered=on/);
+    }
+    for (const bad of ["yes", "true", "ON", "1"]) expect(() => renderDeployConfig(TEMPLATE, { ...ON, ownerBufferedEvents: bad })).toThrow(RenderError);
+    const flagged = TEMPLATE.replace(/"vars"\s*:\s*\{/, `"vars": { "${OWNER_BUFFERED_EVENTS_VAR}": "on",`);
+    expect(flagged).not.toBe(TEMPLATE);
+    expect(() => renderDeployConfig(flagged, { ...ON, ownerBufferedEvents: "on" })).toThrow(/leave READ_API_OWNER_BUFFERED_EVENTS unset/);
+  });
+});
+
 describe("deploy workflow wiring", () => {
   test("dispatch inputs default to off and none", () => {
     expect(WORKFLOW).toMatch(/owner_buffered:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
     expect(WORKFLOW).toMatch(/owner_buffered_workspaces:\n\s+description:[^\n]*\n\s+type: string\n\s+default: ""/);
     expect(WORKFLOW).toMatch(/buffered_search_gate:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
     expect(WORKFLOW).toContain("BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}");
+    expect(WORKFLOW).toMatch(/owner_buffered_events:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("OWNER_BUFFERED_EVENTS: ${{ inputs.owner_buffered_events }}");
   });
 
   test("inputs reach shell only through env, and the render runs this script", () => {
@@ -239,5 +287,6 @@ describe("deploy workflow wiring", () => {
     // The deploy command is unchanged: no owner-buffered --var; the vars live in the on-render only.
     expect(WORKFLOW).not.toContain("--var \"RELAYHISTORY_READ_OWNER_BUFFERED");
     expect(WORKFLOW).not.toContain("--var \"READ_API_BUFFERED_SEARCH_GATE");
+    expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_EVENTS");
   });
 });
