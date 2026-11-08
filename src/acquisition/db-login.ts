@@ -16,11 +16,18 @@
  *
  * Then, before the operations listener starts, assertInstallerLogin checks the real
  * session: session_user and current_user are exactly the installer role, no SET ROLE,
- * PG16+ system_user names the same authenticated identity, the role is not superuser,
+ * this backend's pg_stat_activity usename (on every version) and PG16+ system_user name
+ * the same authenticated identity, the role is not superuser,
  * BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION or INHERIT, is a member of no role, has
  * no member (see below), and the timeout profile is the expected one. Any mismatch or
  * query failure refuses startup. Errors name the variable or the failed property, never
  * a value.
+ *
+ * Why usename: after a superuser runs SET SESSION AUTHORIZATION <installer>, session_user
+ * and current_user both become the installer and current_setting('role') stays 'none'.
+ * pg_stat_activity.usename for pg_backend_pid() is fixed at authentication and still names
+ * the superuser, on every supported version; PG16+ system_user shows it as well, but before
+ * PG16 usename is the only signal. Same check as src/session-ingest/ingest-login.ts (#366).
  *
  * Members are checked as well as memberships: a LOGIN granted the installer role could
  * SET ROLE to it and call the SECURITY DEFINER RPCs (sessions.ingest_require_role reads
@@ -72,7 +79,7 @@ export function installerClientConfig(url: string, ca: string): ClientConfig {
 }
 
 export type InstallerLoginRefusal =
-  | "login_unreadable" | "session_user" | "current_user" | "set_role" | "system_user"
+  | "login_unreadable" | "session_user" | "current_user" | "set_role" | "backend_user" | "system_user"
   | "superuser" | "bypassrls" | "role_attributes" | "role_membership" | "role_members" | "timeouts";
 
 /** Names the failed property only; never a role name, URL or credential. */
@@ -93,7 +100,8 @@ export const LOGIN_SQL = `SELECT session_user::text AS session_user, current_use
   current_setting('idle_in_transaction_session_timeout') AS idle_in_transaction_session_timeout,
   r.rolsuper, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolinherit,
   (SELECT count(*)::int FROM pg_auth_members m WHERE m.member = r.oid) AS memberships,
-  (SELECT count(*)::int FROM pg_auth_members m WHERE m.roleid = r.oid) AS members
+  (SELECT count(*)::int FROM pg_auth_members m WHERE m.roleid = r.oid) AS members,
+  (SELECT a.usename::text FROM pg_catalog.pg_stat_activity a WHERE a.pid = pg_catalog.pg_backend_pid()) AS backend_user
   FROM pg_roles r WHERE r.rolname = current_user`;
 /** Only on PG16+ (system_user does not parse earlier). */
 export const SYSTEM_USER_SQL = "SELECT system_user::text AS system_user";
@@ -123,6 +131,9 @@ export async function assertInstallerLogin(sql: LoginQuery): Promise<void> {
   if (row.session_user !== ACQUISITION_INSTALLER_ROLE) throw new InstallerLoginError("session_user");
   if (row.current_user !== ACQUISITION_INSTALLER_ROLE) throw new InstallerLoginError("current_user");
   if (row.role_setting !== "none") throw new InstallerLoginError("set_role");
+  // The authenticated login of this backend (all versions): refuses a superuser's SET SESSION
+  // AUTHORIZATION, which leaves session_user/current_user/role looking genuine. NULL or no row refuses.
+  if (row.backend_user !== ACQUISITION_INSTALLER_ROLE) throw new InstallerLoginError("backend_user");
   if (row.rolsuper !== false) throw new InstallerLoginError("superuser");
   if (row.rolbypassrls !== false) throw new InstallerLoginError("bypassrls");
   if (row.rolcreaterole !== false || row.rolcreatedb !== false || row.rolreplication !== false || row.rolinherit !== false)

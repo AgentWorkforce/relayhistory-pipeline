@@ -156,7 +156,10 @@ even when disabled. The issuer-era variables are checked for presence only and r
 **Installer login check.** With `ACQUISITION_OPS_ENABLED=true`, before the ops listener starts
 (and so before `/healthz` answers), the service reads the live session and refuses to start
 unless: `session_user` and `current_user` are exactly `bulls96_acquisition_installer`, the
-`role` setting is `none` (no `SET ROLE`), on PG16+ `system_user` is `<method>:bulls96_acquisition_installer`
+`role` setting is `none` (no `SET ROLE`), this backend's `pg_stat_activity.usename` is
+`bulls96_acquisition_installer` on every version (`backend_user`: a superuser's
+`SET SESSION AUTHORIZATION` leaves the three previous signals looking genuine, and before PG16
+usename is the only one that still names the authenticated login), on PG16+ `system_user` is `<method>:bulls96_acquisition_installer`
 (NULL, i.e. trust auth, is refused), the role is not superuser, `BYPASSRLS`, `CREATEROLE`,
 `CREATEDB`, `REPLICATION` or `INHERIT`, it is a member of no role (`role_membership`), the role
 itself has no member (`role_members`, see below), and the effective
