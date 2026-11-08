@@ -28,6 +28,9 @@
  * while the fresh cursor also includes buffered tenants added since the prior
  * snapshot. Bulk output is aggregate counts only; tenant identifiers and
  * per-tenant hashes never leave the process.
+ * Both Supabase connections use the canonical temporary-login owner session:
+ * reset baseline and backend PID are proven before work, then owner identity
+ * is checked around every enumerator or writer query.
  *
  * Output is one aggregate JSON receipt. Single-tenant output contains a tenant
  * hash; bulk output contains counts only. Neither contains org/workspace/user
@@ -54,6 +57,11 @@ import {
   refuseCredentialEnv,
   sessionAffinityUrl,
 } from "../src/migration/stdin-credentials.ts";
+import {
+  ownerFencedClient,
+  withOwnerSession,
+  type ConnectedOwnerClient,
+} from "../src/hoopdb/owner-operator-apply.ts";
 import type { Queryable } from "../src/migration/relayhistory-export.ts";
 
 const HEX40 = /^[0-9a-f]{40}$/u;
@@ -187,20 +195,24 @@ function verifyCheckout(expected: string): void {
   if (head !== expected || dirty) throw new OwnerBufferedOperatorRefusal("checkout_pin_mismatch");
 }
 
-async function connect(
+function client(
   url: string,
   name: "neonUrl" | "supabaseUrl",
   trust: "neon" | "supabase",
   app: string,
-): Promise<pg.Client> {
-  const client = pinnedPgClient(pg, url, name, trust, {
+): pg.Client {
+  return pinnedPgClient(pg, url, name, trust, {
     application_name: app,
     statement_timeout: 5_000,
     lock_timeout: 2_000,
     idle_in_transaction_session_timeout: 15_000,
   });
-  await client.connect();
-  return client;
+}
+
+async function connectNeon(url: string): Promise<pg.Client> {
+  const neon = client(url, "neonUrl", "neon", "owner-buffered-g1-neon-readonly");
+  await neon.connect();
+  return neon;
 }
 
 async function requireReadOnly(client: Queryable, name: "neonUrl" | "supabaseUrl"): Promise<void> {
@@ -211,13 +223,8 @@ async function requireReadOnly(client: Queryable, name: "neonUrl" | "supabaseUrl
   if (row?.ro !== "on") throw new OwnerBufferedOperatorRefusal(`${name}_not_read_only`);
 }
 
-/** Assume and verify the one reviewed Supabase owner route before any ledger access. */
-export async function assumeAndRequireParityTableOwner(client: Queryable): Promise<void> {
-  try {
-    await client.query("SET ROLE postgres");
-  } catch {
-    throw new OwnerBufferedOperatorRefusal("target_owner_set_role_refused");
-  }
+/** Verify the canonical fenced owner session also owns the parity table. */
+async function requireParityTableOwner(client: Queryable): Promise<void> {
   let rows: Array<{ login: string; actor: string; owner: string }>;
   try {
     rows = (await client.query<{ login: string; actor: string; owner: string }>(`
@@ -231,6 +238,31 @@ export async function assumeAndRequireParityTableOwner(client: Queryable): Promi
   if (rows.length !== 1 || row?.login !== "cli_login_postgres" ||
       row.actor !== "postgres" || row.owner !== "postgres" || row.actor !== row.owner)
     throw new OwnerBufferedOperatorRefusal("target_owner_identity_refused");
+}
+
+/** Canonical owner route: reset-baseline proof, fixed backend and per-query identity fencing. */
+export async function withParityOwnerSession<T>(
+  target: ConnectedOwnerClient,
+  readOnly: boolean,
+  work: (target: Queryable) => Promise<T>,
+): Promise<T> {
+  return withOwnerSession(target, async (pid) => {
+    const fenced = ownerFencedClient(target, pid);
+    await requireParityTableOwner(fenced);
+    if (readOnly) await requireReadOnly(fenced, "supabaseUrl");
+    return work(fenced);
+  });
+}
+
+/** Keep the enumerator and writer on separate, independently fenced owner sessions. */
+export async function withBulkParityOwnerSessions<T>(
+  enumerator: ConnectedOwnerClient,
+  targetOwner: ConnectedOwnerClient,
+  work: (enumerator: Queryable, targetOwner: Queryable) => Promise<T>,
+): Promise<T> {
+  return withParityOwnerSession(enumerator, true, (fencedEnumerator) =>
+    withParityOwnerSession(targetOwner, false, (fencedTargetOwner) =>
+      work(fencedEnumerator, fencedTargetOwner)));
 }
 
 function generationMatches(receipt: ParityCensusReceipt, expected: string): boolean {
@@ -405,82 +437,78 @@ async function main(): Promise<number> {
     pinnedPgConfig(neonUrl, "neonUrl", "neon");
     pinnedPgConfig(supabaseUrl, "supabaseUrl", "supabase");
 
-    const neon = await connect(neonUrl, "neonUrl", "neon", "owner-buffered-g1-neon-readonly");
+    const neon = await connectNeon(neonUrl);
     clients.push(neon);
     await requireReadOnly(neon, "neonUrl");
     if (args.mode === "bulk") {
-      const enumerator = await connect(
+      const enumerator = client(
         supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-enumerator",
       );
-      clients.push(enumerator);
-      await assumeAndRequireParityTableOwner(enumerator);
-      await requireReadOnly(enumerator, "supabaseUrl");
-      const targetOwner = await connect(
+      const targetOwner = client(
         supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-owner",
       );
-      clients.push(targetOwner);
-      await assumeAndRequireParityTableOwner(targetOwner);
-      try {
-        const counts = await runBulkParity(
-          neon, enumerator, targetOwner, args.expectedTargetGeneration, args.batchSize,
-        );
-        const status = bulkCompletionStatus(counts);
-        output({ status, mode: "bulk", sourceSha: args.expectedSourceSha,
-          targetGeneration: args.expectedTargetGeneration, counts });
-        return status === "complete" ? 0 : 3;
-      } catch (error) {
-        if (error instanceof BulkParityFatal) {
-          output({ status: "refused", mode: "bulk", code: error.code,
-            sourceSha: args.expectedSourceSha, targetGeneration: args.expectedTargetGeneration, counts: error.counts });
-          return 1;
+      // Await inside this try so owner-route failures are sanitized and Neon stays open until cleanup.
+      return await withBulkParityOwnerSessions(enumerator, targetOwner, async (fencedEnumerator, fencedTargetOwner) => {
+        try {
+          const counts = await runBulkParity(
+            neon, fencedEnumerator, fencedTargetOwner, args.expectedTargetGeneration, args.batchSize,
+          );
+          const status = bulkCompletionStatus(counts);
+          output({ status, mode: "bulk", sourceSha: args.expectedSourceSha,
+            targetGeneration: args.expectedTargetGeneration, counts });
+          return status === "complete" ? 0 : 3;
+        } catch (error) {
+          if (error instanceof BulkParityFatal) {
+            output({ status: "refused", mode: "bulk", code: error.code,
+              sourceSha: args.expectedSourceSha, targetGeneration: args.expectedTargetGeneration, counts: error.counts });
+            return 1;
+          }
+          throw error;
         }
-        throw error;
-      }
+      });
     }
 
-    const target = await connect(
+    const target = client(
       supabaseUrl,
       "supabaseUrl",
       "supabase",
       args.mode === "census" ? "owner-buffered-g1-target-readonly" : "owner-buffered-g2-target-owner",
     );
-    clients.push(target);
-    await assumeAndRequireParityTableOwner(target);
-    if (args.mode === "census") await requireReadOnly(target, "supabaseUrl");
+    return await withParityOwnerSession(target, args.mode === "census", async (fencedTarget) => {
+      const g1 = await readParityCensus(neon, fencedTarget, tenant!);
+      if (!g1.equal || !g1.proof) {
+        output({ status: "mismatch", mode: args.mode, sourceSha: args.expectedSourceSha, census: publicCensusReceipt(g1) });
+        return 3;
+      }
+      if (!generationMatches(g1, args.expectedTargetGeneration)) {
+        output({
+          status: "refused",
+          code: "target_generation_mismatch",
+          mode: args.mode,
+          sourceSha: args.expectedSourceSha,
+          census: publicCensusReceipt(g1),
+        });
+        return 1;
+      }
+      if (args.mode === "census") {
+        output({ status: "equal", mode: args.mode, sourceSha: args.expectedSourceSha, census: publicCensusReceipt(g1) });
+        return 0;
+      }
 
-    const g1 = await readParityCensus(neon, target, tenant!);
-    if (!g1.equal || !g1.proof) {
-      output({ status: "mismatch", mode: args.mode, sourceSha: args.expectedSourceSha, census: publicCensusReceipt(g1) });
-      return 3;
-    }
-    if (!generationMatches(g1, args.expectedTargetGeneration)) {
+      // G2 performs its own fresh census and source recheck in the write transaction.
+      const result = await writeCurrentParityProof(neon, fencedTarget, tenant!, args.expectedTargetGeneration);
+      if (!generationMatches(result.census, args.expectedTargetGeneration))
+        throw new OwnerBufferedOperatorRefusal("target_generation_postcondition_failed");
       output({
-        status: "refused",
-        code: "target_generation_mismatch",
+        status: result.outcome === "unchanged" ? "unchanged" : "written",
         mode: args.mode,
         sourceSha: args.expectedSourceSha,
-        census: publicCensusReceipt(g1),
+        outcome: result.outcome,
+        writtenAt: result.writtenAt,
+        census: publicCensusReceipt(result.census),
       });
-      return 1;
-    }
-    if (args.mode === "census") {
-      output({ status: "equal", mode: args.mode, sourceSha: args.expectedSourceSha, census: publicCensusReceipt(g1) });
       return 0;
-    }
-
-    // G2 performs its own fresh census and source recheck in the write transaction.
-    const result = await writeCurrentParityProof(neon, target, tenant!, args.expectedTargetGeneration);
-    if (!generationMatches(result.census, args.expectedTargetGeneration))
-      throw new OwnerBufferedOperatorRefusal("target_generation_postcondition_failed");
-    output({
-      status: result.outcome === "unchanged" ? "unchanged" : "written",
-      mode: args.mode,
-      sourceSha: args.expectedSourceSha,
-      outcome: result.outcome,
-      writtenAt: result.writtenAt,
-      census: publicCensusReceipt(result.census),
     });
-    return 0;
   } catch (error) {
     const code = error instanceof OwnerBufferedOperatorRefusal || error instanceof ParityCensusRefusal ||
       error instanceof CredentialRefusal ? error.code : "operator_failed";
