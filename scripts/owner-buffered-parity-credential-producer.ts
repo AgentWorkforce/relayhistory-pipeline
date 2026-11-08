@@ -377,16 +377,33 @@ async function writeProducerOutput(document: string): Promise<void> {
   });
 }
 
-if (import.meta.main) {
-  const cancellation = new AbortController();
-  const cancel = () => cancellation.abort();
+/** Bind process signals and the actual fd 1 stream to one cancellation signal. */
+export function bindProcessCancellation(): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
   // Keep handling repeated cooperative signals until the owned child group is
   // gone; a second signal must not restore the default exit and orphan it.
   process.on("SIGINT", cancel);
   process.on("SIGTERM", cancel);
   process.on("SIGHUP", cancel);
+  // A FIFO peer close may not be observable until the final write. Every CLI
+  // therefore retains its independent hard wall even with these early hooks.
   process.stdout.once("close", cancel);
   process.stdout.once("error", cancel);
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      process.removeListener("SIGINT", cancel);
+      process.removeListener("SIGTERM", cancel);
+      process.removeListener("SIGHUP", cancel);
+      process.stdout.removeListener("close", cancel);
+      process.stdout.removeListener("error", cancel);
+    },
+  };
+}
+
+if (import.meta.main) {
+  const cancellation = bindProcessCancellation();
   try {
     const args = parseProducerArgs(process.argv.slice(2));
     const document = await ownerParityCredentialDocument(
@@ -398,10 +415,6 @@ if (import.meta.main) {
     process.stderr.write(JSON.stringify({ status: "refused", code: producerErrorCode(error) }) + "\n");
     process.exitCode = 1;
   } finally {
-    process.removeListener("SIGINT", cancel);
-    process.removeListener("SIGTERM", cancel);
-    process.removeListener("SIGHUP", cancel);
-    process.stdout.removeListener("close", cancel);
-    process.stdout.removeListener("error", cancel);
+    cancellation.dispose();
   }
 }

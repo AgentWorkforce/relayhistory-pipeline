@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
 import {
   OWNER_PARITY_CREDENTIAL_TARGET as TARGET,
   ownerParityCredentialDocument,
@@ -169,6 +170,28 @@ describe("owner-buffered parity credential producer", () => {
     }
   });
 
+  test("supervised runner bounds a leader exit whose descendant retains stdout", async () => {
+    const retainedStdout = `
+      const { spawn } = require("node:child_process");
+      const child = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],
+        { stdio: ["ignore", "inherit", "ignore"] });
+      child.unref();
+    `;
+    let groupPid = 0;
+    const started = performance.now();
+    try {
+      await expect(runSupervisedProducerCommand(
+        { executable: process.execPath, args: ["-e", retainedStdout], env: { PATH: process.env.PATH ?? "" } },
+        { timeoutMs: 100, killGraceMs: 50, onSpawn: (pid) => { groupPid = pid; } },
+      )).rejects.toThrow("credential_command_timeout");
+      expect(performance.now() - started).toBeLessThan(1_000);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(() => process.kill(-groupPid, 0)).toThrow();
+    } finally {
+      if (groupPid) try { process.kill(-groupPid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  });
+
   test("supervised runner kills on output overflow and caller cancellation", async () => {
     const outputFlood = `
       process.on("SIGTERM", () => {});
@@ -221,6 +244,43 @@ describe("owner-buffered parity credential producer", () => {
     } finally {
       if (groupPid) try { process.kill(-groupPid, "SIGKILL"); } catch { /* already gone */ }
     }
+  });
+
+  test("actual downstream pipe closure remains bounded without a pre-validation write", async () => {
+    const moduleUrl = new URL("../../../scripts/owner-buffered-parity-credential-producer.ts", import.meta.url).href;
+    const stubborn = "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)";
+    const source = `
+      const m = await import(${JSON.stringify(moduleUrl)});
+      const cancellation = m.bindProcessCancellation();
+      try {
+        await m.runSupervisedProducerCommand(
+          { executable: process.execPath, args: ["-e", ${JSON.stringify(stubborn)}], env: { PATH: process.env.PATH || "" } },
+          { timeoutMs: 100, killGraceMs: 50, signal: cancellation.signal }
+        );
+        process.exitCode = 3;
+      } catch (error) {
+        process.stderr.write(String(error && error.code || "unknown"));
+        process.exitCode = error && (error.code === "credential_command_cancelled" || error.code === "credential_command_timeout") ? 0 : 2;
+      } finally { cancellation.dispose(); }
+    `;
+    const child = spawn(process.execPath, ["-e", source], { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const started = performance.now();
+    const closed = new Promise<number | null>((resolve, reject) => {
+      const deadline = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error("downstream_close_deadline"));
+      }, 1_500);
+      child.once("close", (code) => { clearTimeout(deadline); resolve(code); });
+      child.once("error", reject);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    child.stdout.destroy();
+    expect(await closed).toBe(0);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(["credential_command_cancelled", "credential_command_timeout"]).toContain(stderr);
   });
 
   test("the standalone sink guard accepts only the intended pipe/socket shape", () => {
