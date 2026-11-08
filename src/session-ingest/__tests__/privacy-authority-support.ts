@@ -28,10 +28,11 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
   // lazyFix:false reproduces the pre-040000 state (that migration skipped; it touches nothing later ones depend on).
-  // pending:false / lazyFix:false reproduce the state without 041000 / 040000 (each skipped; nothing later depends on them).
+  // pending:false reproduces the pre-041000 snapshot: stop there, since later migrations (043700) require 041000.
   for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
     const path = "supabase/migrations/" + f;
-    if ((opts.lazyFix === false && path === LAZY_SOURCE_SQL) || (opts.pending === false && path === PENDING_SQL)) continue;
+    if (opts.pending === false && path === PENDING_SQL) break;
+    if (opts.lazyFix === false && path === LAZY_SOURCE_SQL) continue;
     await db.exec(read(path));
   }
   if (opts.pending !== false && opts.index !== false) await db.exec(read(INDEX_SQL));
