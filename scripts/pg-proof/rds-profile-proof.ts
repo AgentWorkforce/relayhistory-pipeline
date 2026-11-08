@@ -19,13 +19,14 @@
  * Exit 0 only if every case passes.
  */
 import { spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { inTransaction, openHoopDb, schemaVerdict } from "../../src/shared/db.ts";
 import { expectedSchema, generation, migrationProfile } from "../../src/hoopdb/migrate.ts";
 import { functionBoundaryEvidence } from "../../src/hoopdb/migrate-guards.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../src/hoopdb/session-bootstrap-chain.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const HOST = process.env.PGPROOF_HOST ?? "127.0.0.1";
@@ -41,12 +42,9 @@ const B = (f: string) => join(ROOT, "supabase/bootstrap", f);
 const FN_BOOT = B("rds_owner_function_default_revoke.sql");
 const ROLES_BOOT = B("rds_migration_roles.sql");
 const RT_BOOT = B("hoopdb_runtime_role_rds.sql");
-const PHASE1 = [
-  B("session_directory_search_worker.sql"),
-  B("session_token_verifier.sql"),
-  B("session_ingest_roles.sql"),
-  B("session_read_api_roles.sql"),
-];
+// Single-sourced bootstrap chain: the grant migration FAILs closed without
+// the bare consumer grantee (migrations never create roles).
+const PHASE1 = SESSION_BOOTSTRAP_FILES.map((f) => B(f.split("/").pop()!));
 const FIXED = [
   "anon", "authenticated", "service_role", "session_directory_search_worker",
   "session_token_verifier", "bulls96_session_ingest", "bulls96_session_ingest_seeder",
@@ -245,6 +243,47 @@ await check("rds profile: bootstraps and migrate are idempotent (rerun applies 0
   const m = migrate(RDS_ENV);
   const v = await verdict(RT);
   return [b.ok && m.exit === 0 && m.applied === 0 && v.ok, `boot=${b.ok} migrate=${fmt(m)} verdict=${fmt(v)}`];
+});
+await check("rds profile: the owner creates the consumer role via the bootstrap chain and promotes it; extras still refuse", async () => {
+  // N1: the trampoline never provisions search_consumer_runtime. The
+  // migration owner creates it with session_consumer_roles.sql (already run
+  // in boot()), keeping the unavoidable PG16+ ADMIN creator edge, then
+  // promotes it to the claimed LOGIN steady state — an ALTER that fails
+  // 42501 on a trampoline copy, because only the creator (or a superuser)
+  // may alter the role. The consumer file re-run converges on the claim,
+  // the trampoline re-run ignores the role, and any extra setting still
+  // refuses. A source guard pins the trampoline exclusion.
+  const consumerBoot = B("session_consumer_roles.sql");
+  const created = psql(DB, ["-f", consumerBoot]);
+  const login = await attempt(DB, `ALTER ROLE search_consumer_runtime LOGIN`, MASTER);
+  const timeout = await attempt(DB, `ALTER ROLE search_consumer_runtime SET statement_timeout = '60s'`, MASTER);
+  const converged = psql(DB, ["-f", consumerBoot]);
+  const extra = await attempt(DB, `ALTER ROLE search_consumer_runtime SET search_path = attacker`, MASTER);
+  const trampolineIgnores = psql(DB, ["-f", ROLES_BOOT]);
+  const refused = psql(DB, ["-f", consumerBoot]);
+  const reset = await attempt(DB, `ALTER ROLE search_consumer_runtime RESET search_path`, MASTER);
+  const again = psql(DB, ["-f", consumerBoot]);
+  // Restore the bare shape the later checks assume.
+  const bare = await attempt(DB, `ALTER ROLE search_consumer_runtime RESET statement_timeout`, MASTER);
+  const nologin = await attempt(DB, `ALTER ROLE search_consumer_runtime NOLOGIN`, MASTER);
+  const restored = psql(DB, ["-f", consumerBoot]);
+  const consumerEdges = await edges("search_consumer_runtime");
+  const edgeOk = consumerEdges.length === 1 &&
+    fmt(consumerEdges[0]) === fmt({ member: MASTER, grantor: "rdsadmin", grantor_oid: 10, admin: true, inherit: false, set: false });
+  // Executable SQL only: the trampoline's header and inventory comments name the role on purpose.
+  const trampolineSql = readFileSync(ROLES_BOOT, "utf8").split("\n").filter((l) => !/^\s*--/.test(l)).join("\n");
+  const trampolineSkipsConsumer = !trampolineSql.includes("search_consumer_runtime");
+  // Error capture: every psql re-run reports its SQLSTATE and first error
+  // line, so a false step names its failure in the proof output. `refused`
+  // must fail with the role file's own 28000, not any psql error (a missing
+  // file also exits non-zero).
+  const why = (r: { ok: boolean; out: string; sqlstate: string }) =>
+    r.ok ? "ok" : `${r.sqlstate}:${JSON.stringify((/^(?:psql:.*?)?(?:ERROR|FATAL|error):.*$/m.exec(r.out)?.[0] ?? r.out.split("\n")[0] ?? "").slice(0, 200))}`;
+  const refusedRight = !refused.ok && refused.sqlstate === "28000";
+  const ok = created.ok && login === "ok" && timeout === "ok" && converged.ok && extra === "ok" &&
+    trampolineIgnores.ok && refusedRight && reset === "ok" && again.ok &&
+    bare === "ok" && nologin === "ok" && restored.ok && edgeOk && trampolineSkipsConsumer;
+  return [ok, `created=${why(created)} login=${login} timeout=${timeout} converged=${why(converged)} extra_set=${extra} trampoline_ignores=${why(trampolineIgnores)} refused=${refusedRight}(${why(refused)}) reset=${reset} again=${why(again)} restored=${why(restored)} edge=${fmt(consumerEdges[0])} trampoline_skips=${trampolineSkipsConsumer}`];
 });
 await check("rds profile: the master can still rotate the runtime password (creator edge kept on purpose)", async () => {
   // A value is used only inside this disposable, trust-auth server; never a real credential.

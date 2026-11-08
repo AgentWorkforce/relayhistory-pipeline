@@ -14,6 +14,7 @@ import {prepareDelivery} from "../vendor/delivery/prepare.ts";
 import {rebindIngestGeneration} from "../../hoopdb/ingest-generation-rebind.ts";
 import {openGenerationOverlap,closeGenerationOverlap} from "../../hoopdb/ingest-generation-overlap.ts";
 import {TENANT,batch,record,scratchStore} from "./support.ts";
+import {SESSION_BOOTSTRAP_FILES} from "../../hoopdb/session-bootstrap-chain.ts";
 const url=process.env.SESSION_INGEST_TEST_PG_URL;
 const root=join(import.meta.dir,"../../..");
 const text=(p:string)=>readFileSync(join(root,p),"utf8").split("\n").filter(l=>!l.startsWith("\\")).join("\n");
@@ -29,7 +30,7 @@ async function fixture(){
  cleanup.push(async()=>{await pool.end();await admin.query("DROP DATABASE "+name+" WITH (FORCE)");await admin.end();});
  await pool.query(text("supabase/tests/supabase_shim.sql"));
  await pool.query("CREATE EXTENSION pg_trgm; CREATE EXTENSION btree_gin");
- for(const f of ["session_directory_search_worker.sql","session_token_verifier.sql","session_ingest_roles.sql","session_read_api_roles.sql"])await pool.query(text("supabase/bootstrap/"+f));
+ for(const f of SESSION_BOOTSTRAP_FILES)await pool.query(text(f));
  for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await pool.query(text("supabase/migrations/"+f));
  await pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now())");
  await pool.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status) VALUES('session_directory_search_worker',$1,'pass') ON CONFLICT(name) DO UPDATE SET generation=EXCLUDED.generation,status='pass'",[A]);

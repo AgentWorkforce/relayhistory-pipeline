@@ -79,9 +79,12 @@ Worker-first ordering.
 
 **SLOT 043885**, assigned by the registry keeper under a recorded registry exception. `migrate.ts` applies
 pending files in sorted order: `043880` (ingest bookkeeping cleanup), `043885` (this), `043890` (buffered
-search gate retired witness, landed after the slot was assigned). The migration was first drafted as
+search gate retired witness) and `043900` (session consumer function grants); the last two landed after the
+slot was assigned. The migration was first drafted as
 `053020`; the renumber changed only the slot header comment and the file names. The rollback chain follows
-the sorted order: `043890` rolls back first, and `043885` and `043880` refuse while it is applied.
+the sorted order: `043900` rolls back first, and `043890`, `043885` and `043880` refuse while it is
+applied; then `043890`, with `043885` and `043880` refusing; then `043885`; then `043880`. Neither `043890`
+nor `043900` touches the two functions `043885` replaces or the lazy policy table it puts a trigger on.
 
 The migration creates `sessions.ingest_generation_overlap_windows`, an append-only record with these rules:
 - Columns: `from_generation`, `to_generation`, `admit_during_apply`, `approval_sha256`, `opened_by`,
@@ -202,13 +205,13 @@ reduce to the old predicate while no window exists. But applying it is itself a 
 moves, and the window machinery does not exist until the migration commits.
 
 `migrate.ts` has no target-slot option. The first real migrate run after this lands therefore applies
-**every** pending slot in one window: `043850`..`043890`, including `043885`. That single window is the
+**every** pending slot in one window: `043850`..`043900`, including `043885`. That single window is the
 **one accepted outage** before overlap windows exist. Every window after it is overlap-protected.
 
 To keep that one window as short as possible:
 1. Merge (code only).
 2. Worker deploy of this code with `expectedGeneration = G_cur` and `overlapGeneration = G5`, where G5 is
-   the final composed generation of the source being applied (all pending slots through `043890`). Against
+   the final composed generation of the source being applied (all pending slots through `043900`). Against
    the unchanged database G_cur is admitted first. G5 is offered only after a 55000.
 3. Run the one owner-apply of all pending slots with the normal approval. No overlap window can be opened
    yet, because the table does not exist until `043885` commits inside this same run. Uploads are refused

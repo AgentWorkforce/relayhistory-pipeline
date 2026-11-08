@@ -16,6 +16,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { SESSION_BOOTSTRAP_FILES } from "../../src/hoopdb/session-bootstrap-chain.ts";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const argv = process.argv.slice(2);
@@ -84,7 +85,10 @@ ev("live-shape-seeded", { policy: G1, admissions: 965 });
 
 // ---- 2. W1: the real owner-apply flow from THIS checkout ----
 // New target prerequisites come from this checkout, never the historical base.
-await admin.query(await readFile(root + "/supabase/bootstrap/session_read_api_roles.sql", "utf8"));
+// Single-sourced bootstrap chain: owner-apply may reach the function-grants
+// migration, which FAILs closed without the bare consumer grantee.
+for (const f of SESSION_BOOTSTRAP_FILES)
+  await admin.query(await readFile(root + "/" + f, "utf8"));
 const pin = { sha: HEAD_SHA, generation: G2 };
 const wrapper = await M.op.wrapperSource();
 let w1: any;

@@ -185,7 +185,7 @@ function revisionConflict(originId: string, conflicts: RevisionConflict[], count
   return new DeliveryError("delivery_conflict", 409, "Delivery record revision was reused with different content", items[0], items, count);
 }
 
-function batchIdConflict(prepared: PreparedDelivery, currentDigest: string): DeliveryError {
+export function batchIdConflict(prepared: PreparedDelivery, currentDigest: string): DeliveryError {
   return new DeliveryError("delivery_conflict", 409, "Delivery batch identity was reused with different content", {
     type: "batch_id",
     originId: prepared.originId,

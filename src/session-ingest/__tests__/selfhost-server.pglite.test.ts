@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import { objectKey, type ObjectStore } from "../../shared/vendor.ts";
 import { IDENTITY_HEADER, encodeIdentity } from "../app.ts";
 import type { SqlRun } from "../ledger-sql.ts";
@@ -47,7 +48,8 @@ async function database(): Promise<{ db: PGlite; run: SqlRun; runAs: (role: stri
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   cleanups.push(() => db.close());
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read(`supabase/bootstrap/${f}.sql`));
+  // Single-sourced bootstrap chain: the grant migration FAILs closed without the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   for (const file of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await db.exec(read(`supabase/migrations/${file}`));
   await db.exec(sql("supabase/bootstrap/session_ingest_role.sql"));
   // PGlite is one connection: serialize so SET ROLE / RESET ROLE never interleave.

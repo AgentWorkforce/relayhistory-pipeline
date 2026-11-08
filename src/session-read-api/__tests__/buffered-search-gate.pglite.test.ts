@@ -17,6 +17,7 @@ import {deliveryAccount} from "../../session-ingest/vendor/delivery/prepare.ts";
 import {DELIVERY_MAPPING_VERSION} from "../../session-ingest/vendor/delivery/delivery-contracts.ts";
 import {TURN_KIND,TURN_ORIGIN_ID,turnRecordId} from "../../session-ingest/turns.ts";
 import {TENANT,scratchStore} from "../../session-ingest/__tests__/support.ts";
+import {SESSION_BOOTSTRAP_FILES} from "../../hoopdb/session-bootstrap-chain.ts";
 import {GATE_SQL,gateHeadParams,parseControlHead} from "../buffered-search-gate.ts";
 setDefaultTimeout(120000);
 
@@ -30,7 +31,9 @@ afterEach(async()=>{for(const close of open.splice(0).reverse())await close()});
 async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
+ // Single-sourced bootstrap chain: the grant migration FAILs closed without the
+ // bare consumer grantee, so provision it exactly like migrate's bootstrap step.
+ for(const f of SESSION_BOOTSTRAP_FILES)await db.exec(read(f));
  for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.exec(read("supabase/migrations/"+f));
  // The read role's approved shape (schema USAGE, the session_index column grant, RLS), as the operator applies it.
  await db.exec(psql("supabase/bootstrap/session_read_api_role.sql"));

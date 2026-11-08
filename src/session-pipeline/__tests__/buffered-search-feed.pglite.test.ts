@@ -8,6 +8,7 @@ import {PGlite} from "@electric-sql/pglite";
 import {btree_gin} from "@electric-sql/pglite/contrib/btree_gin";
 import {pg_trgm} from "@electric-sql/pglite/contrib/pg_trgm";
 import {sqlLedger} from "../../session-ingest/ledger-sql.ts";
+import {SESSION_BOOTSTRAP_FILES} from "../../hoopdb/session-bootstrap-chain.ts";
 import {sqlBufferedFeedSource} from "../buffered-search-feed.ts";
 import {BUFFERED_SEARCH_FEED_RUNTIME_ROLE as FEED_ROLE} from "../buffered-feed-role.ts";
 setDefaultTimeout(60000);
@@ -22,8 +23,9 @@ async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(db);
  const read=(path:string)=>readFileSync(join(root,path),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const name of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles"])
-  await db.exec(read("supabase/bootstrap/"+name+".sql"));
+ // Single-sourced bootstrap chain: the grant migration FAILs closed without the
+ // bare consumer grantee, so provision it exactly like migrate's bootstrap step.
+ for(const f of SESSION_BOOTSTRAP_FILES)await db.exec(read(f));
  for(const name of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())
   await db.exec(read("supabase/migrations/"+name));
  await db.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now());INSERT INTO sessions.__96bulls_role_validation(name,generation,status) VALUES('session_directory_search_worker','"+generation+"','pass') ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,status=excluded.status");
