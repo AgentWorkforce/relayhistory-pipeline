@@ -82,10 +82,11 @@ const QUOTED_KEY =
   /(?<!\\)(\\{0,16})(["'`])([A-Za-z0-9_. -]{1,64})\1\2([ \t]{0,16}(?:=>|[:=])[ \t]{0,16})/g;
 
 /**
- * How far the quoted key/value rule looks for a quoted value's closing quote before it
- * treats the value as over-long. A scan bound, not a storage bound (rule set 4): a value
- * that runs past it is redacted whole, up to its matching closing quote or, with none,
- * to the end of the input (line breaks do not end it), so no part of it is stored.
+ * How far the quoted key/value rule looks for a quoted value's matching closing quote,
+ * in UTF-16 units from the value's start and across line breaks, before it treats the
+ * value as over-long. A scan bound, not a storage bound (rule set 4): a value whose
+ * matching close is not within it is redacted whole, up to that close or, with none, to
+ * the end of the input (line breaks do not end it), so no part of it is stored.
  */
 export const MAX_QUOTED_VALUE = 4096;
 
@@ -115,30 +116,37 @@ function backslashesBefore(text: string, at: number): number {
  * line is redacted to the next whitespace. JSON literals and numbers are kept, as are
  * values already redacted and `op://` references.
  *
- * A value longer than `MAX_QUOTED_VALUE` (no closing quote and no line break within
- * it) is redacted whole, whatever it holds: up to its matching closing quote, found by
- * the same test past the bound, or to the end of the input when there is none. No line
- * break (CR, LF, CRLF, U+2028, U+2029, U+0085) ends it past the bound: a template
- * literal, an escaped line continuation or a malformed value can span lines, and a
- * tail left after a break would have no key for a later rule to find. Within the bound
- * a line break still ends the scan, as in rule set 3. A generated unquoted value longer
- * than the bound is redacted to its end too. The text
- * past the bound is walked once, and the redaction consumes it, so the pass stays
- * linear. With `overCap`, the span [key start, value end) of each over-long quoted value
- * and of each generated unquoted value of `MAX_QUOTED_VALUE` units or more is recorded.
+ * Rule set 4 caps the value's total length, not its line's: the value is over the bound
+ * when its matching closing quote (the same test) is not within `MAX_QUOTED_VALUE`
+ * UTF-16 units of its start, counted across line breaks (CR, LF, CRLF, U+2028, U+2029,
+ * U+0085) and the input continues past them. Such a value is redacted whole, whatever
+ * it holds: up to its matching closing quote, or to the end of the input when there is
+ * none. No line break ends it: a template literal, an escaped line continuation or a
+ * malformed value can span lines, and a tail left after a break would have no key for a
+ * later rule to find. A value whose matching close is within the bound, or whose input
+ * ends within it, is redacted exactly as rule set 3 did (to its close on the key's line,
+ * else to the next whitespace). A generated unquoted value longer than the bound is
+ * redacted to its end too.
+ *
+ * Linear: one forward walk per value from its start finds the close, the first line
+ * break and the bound together; the walk ends at the next quote of the value's own kind
+ * (quote and backslash depth), which every later value of that kind opens with, so the
+ * walks of one kind never overlap; past the bound the walk goes on to the close or the
+ * end and the redaction consumes it. With `overCap`, the span [key start, value end) of
+ * each over-long quoted value and of each generated unquoted value of `MAX_QUOTED_VALUE`
+ * units or more is recorded. With `prefix` (the text is a prefix of a longer input; for
+ * spans only, the output is not used), a quoted value still undecided at the end of the
+ * text (no close, and fewer than `MAX_QUOTED_VALUE` + 1 units of it seen) may be over
+ * the bound in the full input, so it is recorded open, to the end of the text.
  */
 function redactQuotedSecretValues(
   text: string,
   overCap?: Array<[number, number]>,
+  prefix = false,
 ): string {
   if (!/[:=]/.test(text)) return text;
   let out = "";
   let last = 0;
-  // Per quote kind (quote character and backslash count), the span a scan already
-  // walked without finding a closing quote. A later value of the same kind that starts
-  // inside it cannot close there either, so it is not walked again: every character is
-  // scanned at most once per kind and the pass stays linear.
-  const unclosed = new Map<string, [number, number]>();
   QUOTED_KEY.lastIndex = 0;
   for (let m = QUOTED_KEY.exec(text); m; m = QUOTED_KEY.exec(text)) {
     const end = m.index + m[0].length;
@@ -171,29 +179,32 @@ function redactQuotedSecretValues(
         }
         return text.length;
       };
-      const kind = `${quote}${bs}`;
-      const seen = unclosed.get(kind);
+      // One forward walk, counting UTF-16 units across line breaks: the matching close,
+      // the first line break before it, and whether the close is within the bound (its
+      // quote at most MAX_QUOTED_VALUE units past the value's start, as in rule set 3's
+      // scan; for an escaped quote its backslashes count as value units).
+      const limit = Math.min(text.length, valueStart + MAX_QUOTED_VALUE + 1);
+      let close = -1;
+      let lineEnd = -1;
       let i = valueStart;
-      valueEnd = -1;
-      const skipped = !!seen && valueStart >= seen[0] && valueStart < seen[1];
-      if (skipped) i = text.length;
-      while (i < text.length && i - valueStart <= MAX_QUOTED_VALUE) {
+      for (; i < limit; i += 1) {
         const c = text[i];
-        if (c === "\n" || c === "\r") break;
+        if (lineEnd === -1 && (c === "\n" || c === "\r")) lineEnd = i;
         if (c === quote && closesAt(i)) {
-          valueEnd = i - bs;
+          close = i;
           break;
         }
-        i += 1;
       }
-      if (valueEnd === -1 && !skipped && i - valueStart > MAX_QUOTED_VALUE) {
-        // Past the bound with no closing quote or line break: the whole rest of it, across lines.
+      if (close === -1 && (i - valueStart > MAX_QUOTED_VALUE || prefix)) {
+        // No matching close within the bound and the input goes on past it (or, for a
+        // prefix, may): the whole value, across lines, to its close or the end.
         longValue = true;
         valueEnd = restOfValue(i);
-      } else if (valueEnd === -1) {
-        if (i < text.length) unclosed.set(kind, [valueStart, i]);
-        else if (!skipped) unclosed.set(kind, [valueStart, text.length]);
-        // No closing quote on this line: redact up to the next whitespace.
+      } else if (close !== -1 && lineEnd === -1) {
+        valueEnd = close - bs;
+      } else {
+        // Within the bound, as rule set 3: no closing quote on this line: redact up to
+        // the next whitespace.
         const ws = text
           .slice(valueStart, valueStart + MAX_QUOTED_VALUE)
           .search(/\s/);
@@ -201,11 +212,6 @@ function redactQuotedSecretValues(
           ws === -1
             ? Math.min(text.length, valueStart + MAX_QUOTED_VALUE)
             : valueStart + ws;
-        // No whitespace within the bound and the value runs on past it: the rest of it.
-        if (valueEnd < text.length && ws === -1 && !/\s/.test(text[valueEnd] as string)) {
-          longValue = true;
-          valueEnd = restOfValue(valueEnd);
-        }
       }
     } else {
       // An unquoted value is taken only after a one-word key (no space: in
@@ -230,6 +236,11 @@ function redactQuotedSecretValues(
       }
     }
     const value = longValue ? "" : text.slice(valueStart, valueEnd);
+    // A prefix may end right at an open value: still recorded (open), with nothing to redact.
+    if (longValue && valueEnd <= valueStart) {
+      overCap?.push([m.index, valueEnd]);
+      continue;
+    }
     if (valueEnd <= valueStart || (!longValue && keepQuotedValue(value))) continue;
     // From the key start: a cut between key and value would leave the value with no key to match.
     if (longValue || overBound) overCap?.push([m.index, valueEnd]);
@@ -241,19 +252,27 @@ function redactQuotedSecretValues(
 }
 
 /**
- * The span [key start, value end) of every quoted secret value in `text` longer than the
- * quoted rule's scan bound, and of every generated unquoted value after a quoted key of
- * at least that length, as `redactQuotedSecretValues` finds them in `text` as given. The
- * rule redacts each whole, so a segmenter must not cut inside one: the segment after the
- * cut would hold the rest of the value with no key before it. Whether a value is over
- * the bound is decided by the first `MAX_QUOTED_VALUE` + 150 units from its key's start
- * (a key match is at most 132 units and up to 16 backslashes and the quote follow it,
- * then `MAX_QUOTED_VALUE` + 1 units of value), so a caller may pass a prefix of its text
- * that reaches that far past the last key it cares about.
+ * The span [key start, value end) of every quoted secret value in `text` whose matching
+ * closing quote is not within the quoted rule's scan bound (counted across line breaks),
+ * and of every generated unquoted value after a quoted key of at least that length, as
+ * `redactQuotedSecretValues` finds them. The rule redacts each whole, so a segmenter must
+ * not cut inside one: the segment after the cut would hold the rest of the value with no
+ * key before it. Whether a value is over the bound is decided by the first
+ * `MAX_QUOTED_VALUE` + 150 units from its key's start (a key match is at most 132 units
+ * and up to 16 backslashes and the quote follow it, then `MAX_QUOTED_VALUE` + 1 units of
+ * value, across lines).
+ *
+ * With `prefix: true` the text is taken as a prefix of a longer input: a quoted value
+ * the text ends inside before that decision (no matching close in what is seen) is
+ * reported as possibly over the bound, open to the end of the text (fail closed). A
+ * caller that passes its whole input leaves `prefix` false and gets exact spans.
  */
-export function overCapQuotedValueSpans(text: string): Array<[number, number]> {
+export function overCapQuotedValueSpans(
+  text: string,
+  options: { prefix?: boolean } = {},
+): Array<[number, number]> {
   const spans: Array<[number, number]> = [];
-  redactQuotedSecretValues(text, spans);
+  redactQuotedSecretValues(text, spans, options.prefix ?? false);
   return spans;
 }
 

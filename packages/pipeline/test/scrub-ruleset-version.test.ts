@@ -44,8 +44,10 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Updated before release (N1 delta review: longCut finds those values past the segment
   // bound too, so a key just below the bound is protected; the unquoted over-bound value
   // gets a span. N2: the line-confined narrowing is withdrawn, over-bound values run across
-  // line breaks). Version 4 has sealed no chunk: it is only on this unmerged branch.
-  4: "26bc71eef352db47b64ebc1b50d4fc1cd4f98afa3a7553f40e4e0e57cb418359",
+  // line breaks. N3: the bound caps the value's total length to its matching close across
+  // lines, not its key line's, and a run or cut window ending inside an undecided secret
+  // value fails closed). Version 4 has sealed no chunk: it is only on this unmerged branch.
+  4: "429200e870dea6b5602f6ffa6b7a577cf2016b27aa9d99e6a3e61b55e5ec612c",
 };
 
 const read = (rel: string) =>
