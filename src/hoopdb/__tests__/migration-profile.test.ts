@@ -865,10 +865,11 @@ describe("append-only renamed migrations: adopted in memory only when every chec
     // Without per-step shas nothing is adopted: both release names are missing.
     const { shas: _shas, ...noShas } = expected;
     expect(await schemaVerdict(noShas, transact(db))).toEqual({ ok: false, reason: "schema_pending", count: 2 });
-    // Another planned repair sha: the ingest row is not adopted by readiness either.
+    // Another planned repair sha: the ingest row is not adopted by readiness either, and
+    // the applied repair row no longer matches its planned sha (the migrator's checksum guard).
     expect(
       await schemaVerdict({ ...expected, shas: { ...expected.shas, [ingest!.repair]: "f".repeat(64) } }, transact(db)),
-    ).toEqual({ ok: false, reason: "schema_pending", count: 1 });
+    ).toEqual({ ok: false, reason: "schema_pending", count: 2 });
     // A wrong recorded sha on an original row is never adopted.
     await db.query(
       "UPDATE sessions.__96bulls_migrations SET sha256 = $1 WHERE name = $2",
