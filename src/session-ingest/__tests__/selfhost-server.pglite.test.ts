@@ -26,6 +26,8 @@ import {
 } from "../selfhost-server.ts";
 import { SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
 import { deliveryAccount } from "../vendor/delivery/prepare.ts";
+import { liveMachineId } from "../writer.ts";
+import { TURN_ORIGIN_ID } from "../turns.ts";
 
 setDefaultTimeout(60_000);
 
@@ -123,7 +125,7 @@ async function chunkKeys(store: ObjectStore): Promise<string[]> {
 }
 
 async function start(rc: { url: string }, over: NodeJS.ProcessEnv = {}) {
-  const { run } = await database();
+  const { run, db } = await database();
   const fs = scratchStore();
   cleanups.push(fs.done);
   // No assertIngestRole here: PGlite has no real login, and the SET ROLE harness is exactly what
@@ -140,7 +142,7 @@ async function start(rc: { url: string }, over: NodeJS.ProcessEnv = {}) {
   const service: SelfhostIngestService = await startSelfhostIngestService(env(rc.url, over), { host: "127.0.0.1", port: 0, build });
   cleanups.push(() => service.close());
   const url = (path: string) => `http://127.0.0.1:${service.port}${path}`;
-  return { service, url, store: fs.store };
+  return { service, url, store: fs.store, db };
 }
 
 const deliveryBody = async (id = "e1", over: Parameters<typeof batch>[1] = {}) =>
@@ -309,6 +311,148 @@ describe("self-host ingest edge over node:http", () => {
     // The edge closes the connection once the 413 is out; a client still uploading may see a reset instead.
     if (res instanceof Response) expect([res.status, await code(res)]).toEqual([413, "delivery_too_large"]);
     expect(await chunkKeys(store)).toEqual([]);
+  });
+});
+
+describe("per-session erase (RELAYHISTORY_SELFHOST_SESSION_SELECTION=true)", () => {
+  const ORIGIN_ID = "origin-1";
+  const SELECTION = "/v1/delivery/sessions/selection";
+  const machine = liveMachineId(TENANT.workspaceId, ORIGIN_ID, TENANT.userId);
+  const on = { RELAYHISTORY_SELFHOST_SESSION_SELECTION: "true" };
+  const pointer = (db: PGlite, session: string, machineId: string, ws = TENANT.workspaceId) =>
+    db.query(
+      `INSERT INTO sessions.session_index
+         (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
+          storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision)
+       VALUES ($1, $2, 'claude', $3, $4, $5, now(), now(), 's3', 'bucket', 'k/' || $3 || $4,
+               decode(repeat('ab', 32), 'hex'), 'jsonl', '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 2)`,
+      [TENANT.orgId, ws, session, machineId, TENANT.userId],
+    );
+  const directory = (db: PGlite, session: string) =>
+    db.query(
+      `INSERT INTO sessions.session_directory (org_id, workspace_id, harness, session_id, created_at, last_activity_at)
+       VALUES ($1, $2, 'claude', $3, now(), now())`,
+      [TENANT.orgId, TENANT.workspaceId, session],
+    );
+  const row = async (db: PGlite, session: string, machineId: string) =>
+    (await db.query<{ deleted_at: unknown; revision: string }>(
+      "SELECT deleted_at, revision::text FROM sessions.session_index WHERE session_id = $1 AND machine_id = $2 AND workspace_id = $3", [session, machineId, TENANT.workspaceId])).rows[0]!;
+  const selection = async (over: Record<string, unknown> = {}) =>
+    JSON.stringify({ account_id: await deliveryAccount(TENANT), origin_id: ORIGIN_ID, sessions: [{ source: "claude", session_id: "sess-1" }], enabled: false, ...over });
+
+  test("off by default: selection stays 501 and the fence is never reached", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc);
+    await pointer(db, "sess-1", machine);
+    const res = await post(url(SELECTION), await selection());
+    expect([res.status, await code(res)]).toEqual([501, "unsupported_by_backend"]);
+    expect((await row(db, "sess-1", machine)).deleted_at).toBeNull();
+    expect(rc.calls).toHaveLength(0);
+  });
+
+  test("an unexpected flag value refuses startup", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    await expect(start(rc, { RELAYHISTORY_SELFHOST_SESSION_SELECTION: "1" })).rejects.toThrow("RELAYHISTORY_SELFHOST_SESSION_SELECTION");
+  });
+
+  test("erases the caller's copy: pointer and directory tombstoned, other machine, session and workspace untouched", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody())).status).toBe(200);
+    await pointer(db, "sess-1", machine);
+    await pointer(db, "sess-1", "srv_other-machine");
+    await pointer(db, "sess-2", machine);
+    await pointer(db, "sess-1", machine, "ws-b");
+    await directory(db, "sess-1");
+    const res = await post(url(SELECTION), await selection());
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ updated: true });
+    const erased = await row(db, "sess-1", machine);
+    expect(erased.deleted_at).not.toBeNull();
+    // Past any manifest revision a queued event could carry: the revision fence can never undelete it.
+    expect(BigInt(erased.revision)).toBeGreaterThanOrEqual(9007199254740991n);
+    expect((await row(db, "sess-1", "srv_other-machine")).deleted_at).toBeNull();
+    expect((await row(db, "sess-2", machine)).deleted_at).toBeNull();
+    const other = await db.query<{ deleted_at: unknown }>("SELECT deleted_at FROM sessions.session_index WHERE workspace_id = 'ws-b'");
+    expect(other.rows[0]!.deleted_at).toBeNull();
+    // Another machine's copy is still live, so the directory row stays; its derived text is cleared.
+    const live = await db.query<{ deleted_at: unknown; short_summary: unknown }>("SELECT deleted_at, short_summary FROM sessions.session_directory WHERE session_id = 'sess-1'");
+    expect(live.rows[0]).toEqual({ deleted_at: null, short_summary: null });
+    const fence = await db.query("SELECT 1 FROM sessions.upload_deletions WHERE session_id = 'sess-1' AND origin_id = $1", [ORIGIN_ID]);
+    expect(fence.rows).toHaveLength(1);
+    // The last live copy gone, the directory row goes too (erased a different machine's copy with the same selection).
+    await db.query("DELETE FROM sessions.session_index WHERE machine_id = 'srv_other-machine'");
+    await post(url(SELECTION), await selection());
+    const gone = await db.query<{ deleted_at: unknown }>("SELECT deleted_at FROM sessions.session_directory WHERE session_id = 'sess-1'");
+    expect(gone.rows[0]!.deleted_at).not.toBeNull();
+  });
+
+  test("one selection erases every origin of the caller's session, relay turns included; another user's copy stays", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    const secondOrigin = liveMachineId(TENANT.workspaceId, "origin-2", TENANT.userId);
+    const turns = liveMachineId(TENANT.workspaceId, TURN_ORIGIN_ID, TENANT.userId);
+    const otherUser = liveMachineId(TENANT.workspaceId, "origin-2", "user-2");
+    for (const m of [machine, secondOrigin, turns, otherUser]) await pointer(db, "sess-1", m);
+    await db.query(
+      `INSERT INTO sessions.ingest_session_ownership (org_id, workspace_id, user_id, origin_id, source, session_id)
+       VALUES ($1, $2, $3, 'origin-2', 'claude', 'sess-1'), ($1, $2, 'user-2', 'origin-2', 'claude', 'sess-1')`,
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId],
+    );
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    for (const m of [machine, secondOrigin, turns]) expect((await row(db, "sess-1", m)).deleted_at).not.toBeNull();
+    expect((await row(db, "sess-1", otherUser)).deleted_at).toBeNull();
+    const fences = await db.query<{ user_id: string; origin_id: string }>("SELECT user_id, origin_id FROM sessions.upload_deletions WHERE session_id = 'sess-1' ORDER BY origin_id COLLATE \"C\"");
+    expect(fences.rows).toEqual(["origin-1", "origin-2", TURN_ORIGIN_ID].sort().map((origin_id) => ({ user_id: TENANT.userId, origin_id })));
+  });
+
+  test("a selection naming a session the caller has no pointer for changes no directory row", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", "srv_someone-else");
+    await directory(db, "sess-1");
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    expect((await row(db, "sess-1", "srv_someone-else")).deleted_at).toBeNull();
+    const d = await db.query<{ deleted_at: unknown }>("SELECT deleted_at FROM sessions.session_directory WHERE session_id = 'sess-1'");
+    expect(d.rows[0]!.deleted_at).toBeNull();
+  });
+
+  test("a stale retry of the original batch replays its receipt and writes nothing new", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db, store } = await start(rc, on);
+    const first = await post(url("/v1/delivery/batches"), await deliveryBody());
+    const receipt = ((await first.json()) as { receiptId: string }).receiptId;
+    await pointer(db, "sess-1", machine);
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    const keys = await chunkKeys(store);
+    const retry = await post(url("/v1/delivery/batches"), await deliveryBody());
+    expect([retry.status, ((await retry.json()) as { receiptId: string }).receiptId]).toEqual([200, receipt]);
+    expect(await chunkKeys(store)).toEqual(keys);
+    expect((await row(db, "sess-1", machine)).deleted_at).not.toBeNull();
+  });
+
+  test("enabled:true is refused 400 and the fence stays; bad account and scope are refused", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", machine);
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    const again = await post(url(SELECTION), await selection({ enabled: true }));
+    expect([again.status, await code(again)]).toEqual([400, "unsupported_by_backend"]);
+    expect((await db.query("SELECT 1 FROM sessions.upload_deletions WHERE session_id = 'sess-1' AND origin_id = $1", [ORIGIN_ID])).rows).toHaveLength(1);
+    const wrongAccount = await post(url(SELECTION), await selection({ account_id: "acct_someone_else" }));
+    expect(wrongAccount.status).toBe(403);
+    const unsigned = await fetch(url(SELECTION), { method: "POST", body: await selection(), headers: { "content-type": "application/json" } });
+    expect([unsigned.status, await code(unsigned)]).toEqual([401, "missing_authorization"]);
+  });
+
+  test("a token without rth:sync is refused before any fence is written", async () => {
+    const rc = await relaycontrol(() => active(["rth:read"]));
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", machine);
+    const res = await post(url(SELECTION), await selection());
+    expect([res.status, await code(res)]).toEqual([403, "forbidden"]);
+    expect((await db.query("SELECT 1 FROM sessions.upload_deletions")).rows).toHaveLength(0);
+    expect((await row(db, "sess-1", machine)).deleted_at).toBeNull();
   });
 });
 

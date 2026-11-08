@@ -146,8 +146,16 @@ the original sketch below in four ways:
 - Audience: introspection uses `aud = RELAYHISTORY_INGEST_ORIGIN`.
 - Served routes: only `POST /v1/delivery/batches`, `POST /v1/turns/batches`
   and `GET /v1/delivery/limits`.
-- Not served yet: recovery, selection, reset and onboarding answer 501
-  `unsupported_by_backend`.
+- Not served yet: recovery, reset and onboarding answer 501
+  `unsupported_by_backend`. Selection answers 501 too, unless
+  `RELAYHISTORY_SELFHOST_SESSION_SELECTION=true` (default off; needs migration
+  043910): then `enabled:false` is the per-session erase, one transaction that
+  fences every origin the caller uploaded the session from, and the relay-turns
+  origin, and tombstones those pointers and the directory row. `enabled:true`
+  answers 400. Unreadable through the read API, not bytes gone. It covers the
+  session-ingest upload path only; another user's copy is untouched, an origin
+  first used after the erase is not fenced, and a session not yet indexed has
+  no pointer to tombstone.
 
 At startup it admits only a real login of `bulls96_session_ingest` with the
 bootstrap's role shape. The original sketch:

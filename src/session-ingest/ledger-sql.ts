@@ -67,6 +67,7 @@ type LedgerFunction =
   | "ingest_acquire_slot"
   | "ingest_release_slot"
   | "ingest_set_session_uploads"
+  | "ingest_selfhost_set_session_uploads"
   | "ingest_reset_uploaded_sessions"
   | "ingest_fanout_fence"
   | "ingest_commit_revisions"
@@ -187,7 +188,7 @@ export function parseClaimResult(r: Record<string, unknown>): ClaimResult {
   }
 }
 
-export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAcceptanceMode;expectedGeneration?:string } = {}): Ledger {
+export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAcceptanceMode;expectedGeneration?:string;selfhostSelectionErase?:boolean } = {}): Ledger {
   if(options.acceptanceMode==="buffered"&&(typeof options.expectedGeneration!=="string"||!/^[a-f0-9]{64}$/.test(options.expectedGeneration)))throw new LedgerUnavailableError("ledger_generation_required");
   const buffered=(input:unknown)=>({...input as Record<string,unknown>,generation:options.expectedGeneration});
   const hex64 = (v: unknown) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
@@ -293,6 +294,13 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
       if (typeof r.released !== "boolean") throw new LedgerUnavailableError("ledger_bad_result");
     },
     async setSessionUploads(input: SelectionInput): Promise<void> {
+      if (options.selfhostSelectionErase) {
+        // The self-host erase front door: fence and tombstone every origin of the caller's session in one transaction. Only a disable is served.
+        if (input.enabled) throw new DeliveryError("unsupported_by_backend", 400, "Re-enabling an erased session is not served by the self-host session ingest");
+        const erased = (await call(run, "ingest_selfhost_set_session_uploads", input)) as Record<string, unknown>;
+        if (typeof erased.updated !== "number") throw new LedgerUnavailableError("ledger_bad_result");
+        return;
+      }
       const r = (await call(run, "ingest_set_session_uploads", options.acceptanceMode==="buffered"?buffered(input):input)) as Record<string, unknown>;
       if (typeof r.updated !== "number") throw new LedgerUnavailableError("ledger_bad_result");
     },

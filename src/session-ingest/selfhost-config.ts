@@ -6,6 +6,10 @@
  *   RELAYHISTORY_SELFHOST_INGEST     unset | "" | "false" (default: dormant) | exactly "true"; anything
  *                                    else is a startup error, so a typo never silently means either
  *   RELAYHISTORY_INGEST_PORT         listen port, default 8081 (parsed even when dormant)
+ *   RELAYHISTORY_SELFHOST_SESSION_SELECTION
+ *                                    unset | "" | "false" (default: off) | exactly "true"; anything else is a
+ *                                    startup error. Serves POST /v1/delivery/sessions/selection with enabled:false
+ *                                    (per-session erase) and needs migration 043910 applied.
  *
  * Enabled only (each missing or malformed value refuses startup, naming the variable, never the value):
  *   RELAYHISTORY_INGEST_ORIGIN       this edge's public origin, sent to relaycontrol as `aud` (must be the
@@ -37,6 +41,7 @@ import type pg from "pg";
 
 export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
 export const SELFHOST_INGEST_PORT_VAR = "RELAYHISTORY_INGEST_PORT";
+export const SELFHOST_SESSION_SELECTION_FLAG = "RELAYHISTORY_SELFHOST_SESSION_SELECTION";
 export const SELFHOST_INGEST_ORIGIN_VAR = "RELAYHISTORY_INGEST_ORIGIN";
 export const SELFHOST_INGEST_DATABASE_URL_VAR = "RELAYHISTORY_INGEST_DATABASE_URL";
 export const SELFHOST_INGEST_POOL_MAX_VAR = "RELAYHISTORY_INGEST_PG_POOL_MAX";
@@ -55,6 +60,8 @@ export interface SelfhostIngestSettings {
   keyRoot: string;
   maxPerUser: number;
   maxPerOrg: number;
+  /** RELAYHISTORY_SELFHOST_SESSION_SELECTION: serve the per-session erase route. Default off. */
+  sessionSelection: boolean;
 }
 
 export type SelfhostIngestConfig = { enabled: false; port: number } | ({ enabled: true } & SelfhostIngestSettings);
@@ -65,6 +72,14 @@ export function selfhostIngestEnabled(env: NodeJS.ProcessEnv = process.env): boo
   if (raw === undefined || raw === "" || raw === "false") return false;
   if (raw === "true") return true;
   throw new Error(`96bulls: ${SELFHOST_INGEST_FLAG} must be true or false`);
+}
+
+/** Exactly "true" enables; unset, empty or "false" is off; anything else throws (a typo never silently means either). */
+export function selfhostSessionSelectionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[SELFHOST_SESSION_SELECTION_FLAG];
+  if (raw === undefined || raw === "" || raw === "false") return false;
+  if (raw === "true") return true;
+  throw new Error(`96bulls: ${SELFHOST_SESSION_SELECTION_FLAG} must be true or false`);
 }
 
 function port(env: NodeJS.ProcessEnv): number {
@@ -127,6 +142,7 @@ function refuseHostedOnly(env: NodeJS.ProcessEnv): void {
 /** Parse everything once at startup. Errors name the variable, never its value. */
 export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): SelfhostIngestConfig {
   if (!selfhostIngestEnabled(env)) return { enabled: false, port: port(env) };
+  const sessionSelection = selfhostSessionSelectionEnabled(env);
   const policy = destinationPolicy(env);
   refuseHostedOnly(env);
   const originRaw = need(env, SELFHOST_INGEST_ORIGIN_VAR);
@@ -153,5 +169,6 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     keyRoot,
     maxPerUser: bounded(env, "INGEST_MAX_PER_USER", 4, 1, 1000),
     maxPerOrg: bounded(env, "INGEST_MAX_PER_ORG", 32, 1, 1000),
+    sessionSelection,
   };
 }
