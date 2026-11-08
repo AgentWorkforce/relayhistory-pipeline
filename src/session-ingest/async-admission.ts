@@ -314,8 +314,12 @@ const assertId = (c: PrivacyControlId) => {
 const atOrBelowMax = (j: Journal, c: PrivacyControlId) => j.ordered?.epoch === c.epoch && BigInt(c.version) <= BigInt(j.ordered.maxVersion);
 const raiseMax = (j: Journal, c: PrivacyControlId) => {
   if (j.ordered?.epoch !== c.epoch || BigInt(c.version) > BigInt(j.ordered.maxVersion)) j.ordered = { epoch: c.epoch, maxVersion: c.version };
-  // Anything at or below the new maximum can never newly apply: its ambiguity is moot.
-  j.ambiguous = j.ambiguous.filter((a) => { const [, e, v] = a.split(":"); return !(e === j.ordered!.epoch && BigInt(v!) <= BigInt(j.ordered!.maxVersion)); });
+  // SQL applies only version last+1 (ingest_apply_ordered_control), so a completed version proves every
+  // lower one of its epoch already applied before it, and is covered by the count this version made:
+  // their pending marks and ambiguity are subsumed (a delayed lower settler then no-ops).
+  const below = (id: string) => { const [, e, v] = id.split(":"); return e === j.ordered!.epoch && BigInt(v!) <= BigInt(j.ordered!.maxVersion); };
+  j.ambiguous = j.ambiguous.filter((a) => !below(a));
+  j.pending = j.pending.filter((p) => !below(p.id));
 };
 
 /**
@@ -354,9 +358,16 @@ export async function settlePrivacyControl(store: ObjectStore, keyRoot: string, 
     // carry the same (epoch, version) (a retry while the first is still in flight), and seq must
     // advance once per logical control, whichever settles first.
     const wasPending = j.pending.some((p) => p.id === id), wasAmbiguous = j.ambiguous.includes(id);
-    // Neither pending nor ambiguous any more: another settler already finished this control (it is now
-    // at or below the maximum), or it never applies (stale). Nothing left to count.
-    if (!wasPending && !wasAmbiguous && (outcome === "stale" || atOrBelowMax(j, control))) return { next: null, result: undefined };
+    // At or below the completed maximum: already counted, by this control's own earlier settler or by a
+    // higher version (which proves this one applied before it). Never count it again; just drop any
+    // leftover mark. Neither pending nor ambiguous and stale: it never applies; nothing to do.
+    if (atOrBelowMax(j, control)) {
+      if (!wasPending && !wasAmbiguous) return { next: null, result: undefined };
+      j.pending = j.pending.filter((p) => p.id !== id);
+      j.ambiguous = j.ambiguous.filter((a) => a !== id);
+      return { next: j, result: undefined };
+    }
+    if (!wasPending && !wasAmbiguous && outcome === "stale") return { next: null, result: undefined };
     j.pending = j.pending.filter((p) => p.id !== id);
     j.ambiguous = j.ambiguous.filter((a) => a !== id);
     // Ambiguous now (counted conservatively by a consumer, whatever this request saw at begin): only a

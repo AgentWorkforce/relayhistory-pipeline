@@ -173,6 +173,15 @@ compare-and-swap (If-Match / If-None-Match).
       settled, and any further settler (a retry that ran concurrently) is a no-op. So `seq`
       advances once per logical control whatever the settle order (tested both ways, with a
       witness between).
+    - **Lower versions are subsumed.** SQL applies only version `last+1`
+      (`ingest_apply_ordered_control`), so a completed version proves every lower version of its
+      epoch applied before it, inside the window its own count covers. Completing version `v`
+      clears every pending or ambiguous mark at or below `v`. A delayed lower settler then finds
+      its version at or below the maximum and no-ops, so an upload witnessed between them is not
+      refused (tested: v2 settles, U witnesses, then the delayed v1 settles; and the in-order
+      variant). Concurrent out-of-order settlements may count fewer than one per version. Never
+      zero, though: every upload witnessed before the first settlement is still refused, which is
+      the invariant the gate needs.
   - **abort, when it definitely did not apply:** a typed 4xx, or a database error carrying a real
     SQLSTATE (a single autocommit statement that errored rolled back). Only an ambiguous failure
     (connection class 08xxx, server shutdown 57P0x, a code-less transport drop) stays pending.

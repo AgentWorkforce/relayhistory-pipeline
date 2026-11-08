@@ -229,13 +229,55 @@ describe("privacy journal", () => {
     expect(await witnessPrivacyJournal(s, "96bulls", { ...TENANT, userId: "user-2" })).toBe(0);
   });
 
-  test("concurrent settlements each count (CAS), and the gate refuses exactly witnesses taken before them", async () => {
+  test("in-order settlements each count; the gate refuses exactly witnesses taken before them", async () => {
     const s = store();
     for (const v of [1, 2, 3, 4, 5]) await beginPrivacyControl(s, "96bulls", TENANT, o(v), T0);
-    await Promise.all([1, 2, 3, 4, 5].map((v) => settlePrivacyControl(s, "96bulls", TENANT, o(v), "new", "applied")));
+    for (const v of [1, 2, 3, 4, 5]) await settlePrivacyControl(s, "96bulls", TENANT, o(v), "new", "applied");
     expect((await j(s)).seq).toBe(5);
     await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 4, T0)).rejects.toMatchObject({ code: "delivery_privacy_superseded" });
     await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 5, T0)).resolves.toBeUndefined();
+  });
+
+  test("concurrent settlements (CAS, any order): every pending mark clears, seq advances at least once, a pre-witness is refused, the final witness admits", async () => {
+    const s = store();
+    for (const v of [1, 2, 3, 4, 5]) await beginPrivacyControl(s, "96bulls", TENANT, o(v), T0);
+    await Promise.all([5, 3, 1, 4, 2].map((v) => settlePrivacyControl(s, "96bulls", TENANT, o(v), "new", "applied")));
+    const after = await j(s);
+    expect(after.pending).toEqual([]);
+    expect(after.seq).toBeGreaterThanOrEqual(1);
+    expect(after.seq).toBeLessThanOrEqual(5);
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 0, T0)).rejects.toMatchObject({ code: "delivery_privacy_superseded" });
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, after.seq, T0)).resolves.toBeUndefined();
+  });
+
+  // Dogpatch round 5: contiguous versions settling out of order (SQL applies v1 before v2; v1's settlement is delayed).
+  for (const b1 of ["new", "unfinished"] as const) {
+    test(`P1 causal: v2 settles before a delayed v1 (v1 settler begun ${b1}); U witnessed between is admitted`, async () => {
+      const s = store();
+      expect(await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0)).toBe("new"); // A(v1): SQL applied, settlement delayed
+      if (b1 === "unfinished") expect(await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0 + 1)).toBe("unfinished");
+      expect(await beginPrivacyControl(s, "96bulls", TENANT, o(2), T0 + 2)).toBe("new"); // B(v2): SQL applied
+      await settlePrivacyControl(s, "96bulls", TENANT, o(2), "new", "applied");
+      expect(await j(s)).toMatchObject({ seq: 1, pending: [] }); // v1's mark is subsumed by v2
+      const witness = await witnessPrivacyJournal(s, "96bulls", TENANT); // U
+      await settlePrivacyControl(s, "96bulls", TENANT, o(1), b1, b1 === "new" ? "applied" : "replay"); // the delayed v1
+      expect((await j(s)).seq).toBe(witness);
+      await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, witness, T0 + 3)).resolves.toBeUndefined();
+    });
+  }
+
+  test("P1 causal, the other order: v1 settles then v2, with U between each: only uploads witnessed before a settle are refused", async () => {
+    const s = store();
+    await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0);
+    await beginPrivacyControl(s, "96bulls", TENANT, o(2), T0 + 1);
+    const u0 = await witnessPrivacyJournal(s, "96bulls", TENANT);
+    await settlePrivacyControl(s, "96bulls", TENANT, o(1), "new", "applied");
+    const u1 = await witnessPrivacyJournal(s, "96bulls", TENANT);
+    await settlePrivacyControl(s, "96bulls", TENANT, o(2), "new", "applied");
+    const u2 = await witnessPrivacyJournal(s, "96bulls", TENANT);
+    expect([u0, u1, u2]).toEqual([0, 1, 2]);
+    for (const u of [u0, u1]) await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, u, T0 + 3)).rejects.toMatchObject({ code: "delivery_privacy_superseded" });
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, u2, T0 + 3)).resolves.toBeUndefined();
   });
 
   // Dogpatch round 4: one ordered control carried by two concurrent requests (A first, B a retry while A is in flight).
