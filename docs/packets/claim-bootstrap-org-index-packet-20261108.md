@@ -260,6 +260,7 @@ any build until it finishes.
 
 ## Order of operations
 
+0. Do not start until the claim timeout-relief change's 30-minute post-change monitor has finished; one production change at a time (pipeline lead).
 1. Measure: run M0-M5 and record counts and sizes only. Confirm that M0's
    uncovered set matches the ten tables. Stop and re-plan if it does not.
 2. Pick a low-traffic window. Confirm M3 shows no long transactions.
@@ -334,6 +335,34 @@ For the generic plan that the function's `EXECUTE ... USING $1` can reuse, run
 - The SQL advisory gate in front of lazy bootstrap is still a separate follow-up.
 - Async admission (taking bootstrap off the claim request path) is still a separate follow-up.
 
+## Runtime safety: no live index-set comparison
+
+Verdict, from source on this branch: no runtime path compares the live
+PostgreSQL index set against an expected set. No component refuses work
+because an index exists that no migration names. There are no class (c)
+readers (compares at runtime and would trip). The only runtime index checks
+require that one specific named index exists (expected is a subset of the
+catalog), so an extra index cannot fail them.
+
+| Path | What it reads and compares | When it runs | Verdict |
+|---|---|---|---|
+| Ingest Worker readiness and preflight | `schemaVerdict` (`src/shared/db.ts:192-237`) checks that ledger names are a subset of `sessions.__96bulls_migrations` (:206-210), reads the generation marker (MARKER_SQL :169), runs the role, token-verifier, ingest-seed and ingest-role verify SQL (:219-222), then `SESSIONS_FUNCTION_GATE_SQL` (:134-151, `pg_proc` only). `waitForSchema` :244. Services import only `expectedSchema()`/`generation()` (`src/shared/worker.ts:39`, `src/hoopdb/indexer.ts:19`, `src/session-pipeline/consumer-bootstrap.ts:23`, `consumer-service.ts:37`, `src/alleyoop/ingest.ts:46`). `generation()` (`src/hoopdb/migrate.ts:322-350`) hashes migration and verify file contents, not the catalog. | Every Worker start and claim | No index read. Safe. |
+| Migrator guards | `migrationPreflight` (`src/hoopdb/migrate.ts:389-424`) calls the RDS-owner, runtime-role, function-boundary and CLI-history preflights, then `sequencePreflight` (:423). `sequencePreflight` (`src/hoopdb/migrate-guards.ts:990-1091`) never enumerates the catalog. It builds `seen` from the inventory of ledgered steps (:1046-1050). For each unledgered step, any inventoried object not in `seen` is probed by name with `exists()` (:928-984; an unqualified index is `pg_class` `relname=$1 AND relkind IN ('i','I')` at :945, any schema, fail closed on error) (:1051-1063). Every unledgered step needs a sentinel, and a sentinel that reports applied also counts (:1064-1083). Anything found raises `unledgered_schema` (:1084-1089). Direction: inventory(unledgered files) intersected with the catalog must be empty. `runtimeRoleViolations` `pg_class` reads (:528-752) are privilege checks on relkind r/p/v/m/f/S, which excludes indexes. | Only inside `runMigrations` (:488, under an advisory lock) and `inspectMigrations` (:430, read-only release planning), plus release and proof scripts. Not at Worker start, not on a schedule. | Class (b). Today every migration is ledgered, so nothing is probed. It trips only if a future unledgered migration literally names one of these indexes, or its sentinel reports applied. |
+| Generation fences F1-F4, reader, G4 census, role-validation markers, bootstrap verify SQL | The F1-F4 labels do not appear in `src/session-ingest` or `src/hoopdb`. Privacy and claim fences are SQL RPCs (`admission-consumer.ts:114-116`, `app.ts:407,443`, `deliver.ts:356`, `babysitter-retention.ts:343-397`, `ledger-sql.ts:307`), and none of them reads `pg_index`. The census (`src/session-ingest/bookkeeping-cleanup.ts:23,29,62`) goes through `ingest_bookkeeping_cleanup_gate` (`20261105043880_ingest_bookkeeping_cleanup.sql:114-116`), which calls `ingest_bookkeeping_cleanup_index_ok` (:89-96): an exact `pg_get_indexdef`, valid and ready check for the single index `babysitter_evidence_index_claim_idx`. The privacy-authority apply (`20261105041000_ingest_privacy_authority.sql:218-222`) requires `ingest_frozen_source_records_user_session` to be valid and ready. The markers are `MARKER_SQL` plus the role-validation table. Every bootstrap verify SQL loop over `sessions` `pg_class` filters relkind r/p/v/m/f or S (privilege checks), for example `session_ingest_verify.sql:104-110`, `session_ingest_seeder_verify.sql:38-44`, `session_token_verifier_verify.sql:63-71`, `session_read_api_role_verify.sql:68-80`, `session_consumer_role_verify.sql:158-386`, `session_directory_search_worker_verify.sql:203-216` (`pg_shdepend` for the worker role; indexes have no ACL or owner entry of their own). | Runtime | Class (a) for the verify SQL. The two named-index RPC checks require a named index to exist, so extra indexes and other names cannot trip them. Safe. |
+| Drift and schema-snapshot checks (CI, scripts, runbooks) | `scripts/pg-proof/role-proof.ts:355-395` hashes a catalog snapshot that includes indexes (:376-379), but only on a disposable PostgreSQL built from migrations (CI `.github/workflows/pg-proof.yml:93`). `src/hoopdb/__tests__/migration-profile.test.ts:1130-1176` checks that the fresh-DB catalog is a subset of the inventory. `src/hoopdb/search-index-contract.ts:727-783` (`bun run audit:search-indexes`, `search-index-audit.ts:24-58`) looks up the required `session_directory*` indexes by name. `src/migration/relayhistory-verify.ts:403-417` iterates source objects and requires the target to be a superset. Other script catalog reads are row-security, lock, ownership or privilege reads on named relations. | CI on fresh databases; operator CLIs on demand | None of them reports the new indexes on production. CI is blocking but never sees out-of-band indexes. The audit and verify CLIs are on-demand, exit non-zero only on missing or different required objects, and ignore extras. Caveat: if production were ever the source of `migration:verify` (for example a self-host move), a target without these indexes would report them missing. |
+
+Every other `pg_index`/`pg_indexes`/`pg_class` reader under `src` is class
+(a): `src/session-ingest/frontier-capture-source.ts:165-176` (relkind r/p/S),
+`src/session-pipeline/consumer-service.ts:965-970` and
+`src/search-features/source.ts:456` (row security of named relations),
+`src/migration/relayhistory-copy.ts:85-153` (uses unique indexes and
+time-leading btree indexes; the new ones are neither),
+`src/migration/relayhistory-neon-fence.ts:47-85`,
+`src/migration/neon-s3-erasure/authority.ts:146`, `src/proof/aws/probes.ts:71-84`
+and `src/smoke/e2e.ts:143`. `src/hoopdb/migration-sentinels.ts` runs only
+inside `sequencePreflight` (class (b)). Test-only readers run against
+disposable databases.
+
 ## Drift guard analysis and the catch-up migration (not written here)
 
 What these indexes do and do not trip today:
@@ -367,25 +396,50 @@ The trap for a later catch-up migration:
 
 What the catch-up should look like (design only, not written):
 
-- A registry slot from `migration-registry` (next free at time of writing is
-  believed to be 050000; confirm against the registry, keeping it contiguous).
-  It is non-concurrent because the migrator is transactional, which is fine on
-  fresh databases where the tables are small or empty.
-- Adopt or create, in a `DO` block:
-  - if `to_regclass('sessions.<name>')` exists, assert that
-    `pg_get_indexdef` equals the expected text and that `indisvalid AND indisready`
-    hold, otherwise `RAISE` (fail closed on INVALID or a different definition);
-  - if it does not exist, `EXECUTE` the plain `CREATE INDEX`.
-  - Keep the index names out of literal `CREATE INDEX <name>` text, for example
-    by building them with `format()` (the inventory skips names containing
-    `%`), so the preflight does not inventory them.
-- A sentinel keyed on something the migration itself creates (for example a
-  marker comment or function), not on the indexes. Then production reads as
-  "not applied, no pre-existing inventoried objects" and the adopt branch
-  runs.
-- This touches the migrator's safety guard and needs its own review of
-  `migrate-guards.ts` and `migration-sentinels.ts`, plus a fresh-DB test and an
-  adopt-path test where the index exists, is INVALID or differs.
+- File: `supabase/migrations/<future slot>_ingest_claim_bootstrap_org_indexes.sql`.
+  The slot is assigned by the layered agent from the registry when the schema window reopens; it is not 049000. Do not add placeholders.
+- Adopt or create, for each of the ten indexes:
+  - if an index with that name exists and its `pg_get_indexdef` equals the
+    expected definition and `indisvalid AND indisready` hold, adopt it
+    (record it and do not rebuild);
+  - if no index with that name exists, run
+    `CREATE INDEX IF NOT EXISTS <name> ON sessions.<table> (...)`
+    non-concurrently inside the migrator transaction (the migrator is
+    transactional; this is fine on fresh databases, where the tables are small
+    or empty);
+  - if an index with the same name exists with a different definition, or it
+    is INVALID or not ready, `RAISE` and refuse.
+- Ordering, given how the guard actually behaves: `sequencePreflight` never
+  lists the catalog, so the indexes are never "unledgered" by themselves. A
+  later migration that does not name them is unaffected, whether or not the
+  catch-up has landed. The only constraints are:
+  - the catch-up itself, while unledgered on production, trips
+    `unledgered_schema` if its text inventories these names or its sentinel
+    reports applied;
+  - any later migration that names these indexes must come after the catch-up
+    in the sequence. Once the catch-up is ledgered, its inventory goes into
+    `seen` (`migrate-guards.ts:1046-1050`) and later mentions are not probed.
+- The guard and the test pull in opposite directions, so `format()` hiding is
+  not enough:
+  - `inventoryOf` keeps string literals and dollar-quoted bodies, so a literal
+    name anywhere in the file, including inside `EXECUTE '...'`, is inventoried
+    and probed. On production it exists, so the step is refused.
+  - Building the name with `format('%I', ...)` skips the inventory (names
+    containing `%` are dropped, `migrate-guards.ts:884-886`). But then
+    `migration-profile.test.ts:1130-1176` (fresh-DB catalog must be a subset
+    of the inventory) fails, because the indexes exist on a fresh database and
+    no step inventories them.
+  - So the catch-up needs a reviewed guard change. One option is an explicit
+    adoptable-index allowance in `migrate-guards.ts`: an index named by an
+    unledgered step is accepted only when its live `pg_get_indexdef` matches
+    the step's definition exactly, and it is valid and ready. Anything else
+    still fails closed.
+- A sentinel keyed on something only the catch-up creates (not on the
+  indexes), so that production reads "not applied" before the run.
+- Tests: fresh DB (create path); adopt path where the index exists and matches;
+  refusal where it is INVALID, not ready or a different definition; the
+  inventory coverage test; and a guard test proving that a non-matching
+  same-name index still raises `unledgered_schema`.
 
 Approval: production index creation needs Khaliq's own word in the credentialed operator's session; this packet is informational.
 
