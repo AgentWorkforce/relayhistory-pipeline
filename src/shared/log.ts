@@ -20,6 +20,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "route", "correlation_id",
   // Closed values only (src/session-ingest/db-error-class.ts): never a message or stack.
   "db_error_class", "db_error_code", "db_error_basis", "error_name",
+  // Lock-wait alert line (session-ingest lockAlertFields): 55P03 / 57014 only.
+  "sqlstate",
 ]);
 
 export type Level = "debug" | "info" | "warn" | "error";

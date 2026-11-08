@@ -17,9 +17,11 @@
  */
 import { sha256Hex as digestHex } from "../../../../object-store/src/crypto.js";
 import {
+  MAX_QUOTED_VALUE,
   MAX_SCRUB_CHARS,
   exceedsScrubBound,
   isCardNumber,
+  overCapQuotedValueSpans,
   scrubText,
 } from "../scrub.js";
 import { PipelineError } from "./errors.js";
@@ -52,8 +54,28 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  *   high-entropy fallback only next to a secret name. Chunks sealed at 1 or 2
  *   may hold secrets these rules now catch. The segmenter's context check
  *   (`CUT_CONTEXT_CHARS`) is widened past the quoted rule's reach.
+ * - 4: version 3's rules, except that a quoted secret value whose matching
+ *   closing quote is not within the quoted rule's scan bound
+ *   (`MAX_QUOTED_VALUE`, 4096 UTF-16 code units of value, counted across line
+ *   breaks) is redacted whole: from its opening quote to its matching closing
+ *   quote or, with none, to the end of the input. No line break (CR, LF, CRLF,
+ *   U+2028, U+2029, U+0085) ends it, and the bound caps its total length, not
+ *   its first line's. Version 3 redacted only the first 4096 units, or up to
+ *   the first whitespace or line break, and stored the rest. A generated
+ *   unquoted value after a quoted key is likewise redacted to its end. No
+ *   segment boundary falls strictly between the start of such a value's key and
+ *   the value's end (a cut exactly at the key's start is allowed): `longCut`
+ *   looks `MAX_QUOTED_VALUE` + 256 units past the bound for them, so a key just
+ *   below or straddling it is seen; `safeCut` never ends a run at a line
+ *   boundary inside one; and a run that ends inside a secret value which is, or
+ *   may yet become, over the bound is not ended before a record or private-key
+ *   line (that line joins the run). Each search scans its window as a prefix
+ *   and takes a value still open at the window's end as open to the end (fail
+ *   closed). A string or chunk with no cut left outside them is refused. Output
+ *   for a value whose total length to its matching close is within the bound is
+ *   byte-identical to version 3.
  */
-export const SCRUB_RULESET_VERSION = 3;
+export const SCRUB_RULESET_VERSION = 4;
 
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";
@@ -75,8 +97,10 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
  * scrubbed together as one text, so a multi-line secret (a PEM private key)
  * is matched whole; a long run is cut into segments under `MAX_SCRUB_CHARS`
  * at line boundaries (never inside an open private-key block or between two
- * digit groups), so `scrubText` never truncates it. Line endings are kept;
- * `records` counts complete lines.
+ * digit groups, and never inside a quoted secret value past the quoted rule's
+ * scan bound, or one the run ends inside before that is decided, which runs
+ * across lines to its closing quote), so `scrubText`
+ * never truncates it. Line endings are kept; `records` counts complete lines.
  */
 export function scrubRecords(source: Uint8Array): {
   scrubbed: Uint8Array;
@@ -131,14 +155,39 @@ export function scrubRecords(source: Uint8Array): {
     return cutIsSafe(run + lookaheadAt(i), run.length, { checks: 0, candidates: 0 }).ok;
   };
   let boundaryChecks = 0;
+  /**
+   * Whether the run may end inside a quoted secret value past the quoted rule's scan
+   * bound (`overCapQuotedValueSpans`): such a value runs across lines to its closing
+   * quote or the end of the input, so ending the run here would leave the rest of it
+   * keyless in what follows. The bound caps the value's total length across lines, so
+   * a value the run ends inside may cross it only in lines the run has not reached,
+   * however short the run: the run is scanned as a prefix (`prefix: true`), and a
+   * secret value still open at its end without a decision is taken to be over the
+   * bound (fail closed: the next record or key line stays in the run). A run that is
+   * not open is flushed right after, so this scans each run once; only a run still open
+   * is scanned again at the next record or key line, at most `MAX_BOUNDARY_CHECKS`
+   * times per chunk, and past that the run is taken to be open.
+   */
+  const quotedOpenAtEnd = () => {
+    if (!run) return false;
+    if (quotedOpenChecks >= MAX_BOUNDARY_CHECKS) return true;
+    const spans = overCapQuotedValueSpans(run, { prefix: true });
+    const open = (spans[spans.length - 1]?.[1] ?? -1) >= run.length;
+    if (open) quotedOpenChecks += 1;
+    return open;
+  };
+  let quotedOpenChecks = 0;
   for (let i = 0; i < parts.length; i += 2) {
     const line = parts[i]!;
     const ending = parts[i + 1] ?? "";
     if (ending) records += 1;
-    // Inside an open private-key block a record line (two writers interleaving
-    // on one stream) stays in the run, so the key is redacted whole, as
+    const record = isRecord(line);
+    // Inside an open private-key block, or an over-bound quoted value the run has
+    // not closed, a record line (two writers interleaving on one stream, or a value
+    // spanning lines) stays in the run, so the key or value is redacted whole, as
     // whole-text scrubbing would; flushing here would store the rest of it.
-    if (!keyOpen && isRecord(line)) {
+    const quotedOpen = record && !keyOpen && quotedOpenAtEnd();
+    if (record && !keyOpen && !quotedOpen) {
       // The run's text may end in a keyword whose value is this record
       // (`DB_PASSWORD=` then `"<secret>"`). The record is scrubbed once, as a
       // record, and kept intact; if the boundary splits a match, the value the
@@ -155,7 +204,7 @@ export function scrubRecords(source: Uint8Array): {
     // starts its own segment and is matched whole). Before a line that would
     // take it past the limit, it ends at the latest safe line boundary (see
     // `safeCut`), carrying the lines after that cut into the next segment.
-    if (run && !keyOpen && privateKeyOpenAfter(line, false) && boundarySafe(i)) flush();
+    if (run && !keyOpen && privateKeyOpenAfter(line, false) && boundarySafe(i) && !quotedOpenAtEnd()) flush();
     else if (run && !keyOpen && run.length + next.length > MAX_SCRUB_CHARS) {
       // At least CUT_CONTEXT_CHARS of what follows, for the context check.
       let lookahead = next;
@@ -180,7 +229,8 @@ export function scrubRecords(source: Uint8Array): {
     // and the record that closes the block would otherwise carry what follows its footer
     // into the run as unscrubbed JSON. Record scrubbing leaves a lone footer string intact,
     // so the block still pairs and is redacted whole.
-    const piece = keyOpen && isRecord(line) ? scrubRecordLine(line) : line;
+    // The same holds for a record line kept inside an over-bound quoted value.
+    const piece = record && (keyOpen || quotedOpen) ? scrubRecordLine(line) : line;
     run += piece + ending;
     keyOpen = privateKeyOpenAfter(piece, keyOpen);
   }
@@ -309,6 +359,14 @@ const CUT_SEARCH_CHARS = 65_536;
  * whose key began more than 4096 characters before the cut was redacted only up
  * to its first space before the cut, and the rest was stored. Twice
  * `MAX_QUOTED_VALUE` leaves room for a later rule to reach a little further.
+ * From rule set 4 a quoted value whose matching close is not within
+ * `MAX_QUOTED_VALUE` units of its start (counted across line breaks) is redacted
+ * whole, however long, up to that close or the end of the input; line breaks do
+ * not end it. No bounded context check can see its key from a cut deep
+ * inside it, so both cut searches refuse every cut from the key start to the
+ * value end of such a value (`overCapQuotedValueSpans`): `longCut` after any
+ * whitespace (scanned past the bound so a key just below it is seen), `safeCut`
+ * at line boundaries.
  */
 const CUT_CONTEXT_CHARS = 8192;
 
@@ -328,11 +386,20 @@ function safeCut(run: string, lookahead: string): number {
   const budget: CutBudget = { checks: 0, candidates: 0 };
   const floor = Math.max(1, run.length - CUT_SEARCH_CHARS);
   const keys = keyBlockSpans(run);
+  // Over-bound quoted values (rule set 4), which run across lines: a value whose key is
+  // in the run is decided over the bound within MAX_QUOTED_VALUE + 150 units of its key
+  // (its total length to the matching close, across lines), which the lookahead (the
+  // overflowing line plus CUT_CONTEXT_CHARS = 8192) covers unless the chunk ends first.
+  // `text` is scanned as a prefix either way: a value it ends inside, decided or not,
+  // may run on past it, so it is open to Infinity (fail closed).
+  const longValues = overCapQuotedValueSpans(text, { prefix: true }).map(
+    ([start, end]): [number, number] => [start, end >= text.length ? Infinity : end],
+  );
   for (let cut = run.length; cut >= floor && withinBudget(budget); ) {
     // Never inside a key block, even one that closed before the overflowing line
     // (the context check cannot see a header more than CUT_CONTEXT_CHARS back):
     // go to the line boundary at or before its header.
-    const inside = keyBlockAround(keys, cut);
+    const inside = keyBlockAround(keys, cut) ?? keyBlockAround(longValues, cut);
     if (inside) {
       cut = run.lastIndexOf("\n", inside[0] - 1) + 1;
       if (cut === 0) break;
@@ -476,7 +543,15 @@ function scrubBounded(text: string): string {
  *  - follows whitespace (no rule but PEM matches across a non-whitespace boundary
  *    within one token, so a token is never split),
  *  - does not sit between two digit groups (cards, phone numbers),
- *  - is not inside a private-key block whose footer comes later, and
+ *  - is not inside a private-key block whose footer comes later,
+ *  - is not strictly between the key start and the end of a quoted secret value
+ *    longer than the quoted rule's scan bound, or of a generated unquoted value of
+ *    at least that length (`overCapQuotedValueSpans`, over the text up to
+ *    `MAX_QUOTED_VALUE` + 256 past the bound, so a value whose length passes the
+ *    bound only after it is seen too; rule set 4 redacts such a value whole, however
+ *    far it runs and across line breaks, so no bounded context check can see its key
+ *    from a cut deep inside, and earlier rules can shrink it under the bound in a
+ *    window; one still open past the look-ahead is taken to run to the end), and
  *  - leaves `CUT_CONTEXT_CHARS` on each side scrubbing identically together and
  *    apart, which also covers rules whose match spans a separator before the
  *    secret (`Bearer <token>`, `key = value`).
@@ -512,11 +587,32 @@ function longCut(text: string): number {
   const floor = Math.max(1, MAX_SCRUB_CHARS - CUT_SEARCH_CHARS);
   const budget: CutBudget = { checks: 0, candidates: 0 };
   const keys = keyBlockSpans(text.slice(0, top));
+  // Over-bound values whose key starts before `top`, found by looking past `top`: a
+  // value whose length passes the bound only after `top` (its key less than about 4,250
+  // units before `top`, or straddling it) must be protected too, or a cut could land in
+  // its key, at the seam or in the value and leave its tail keyless in the next segment.
+  // Whether a value is over the bound is decided within MAX_QUOTED_VALUE + 150 units of
+  // its key's start (`overCapQuotedValueSpans`, counted across lines); 256 leaves a
+  // margin, so every value whose key starts below `top` is decided inside the window.
+  // `text` is the whole rest of the input, so a window reaching its end is exact; a
+  // shorter one is scanned as a prefix, and a value still open at `look`, decided or
+  // not, runs on past it: treat it as open to the end (fail closed).
+  const look = Math.min(text.length, top + MAX_QUOTED_VALUE + 256);
+  const longValues = overCapQuotedValueSpans(text.slice(0, look), { prefix: look < text.length }).map(
+    ([start, end]): [number, number] => [start, end >= look ? text.length : end],
+  );
   for (let cut = top; cut >= floor && withinBudget(budget); cut--) {
     // Not inside a key block that closed below the bound either.
     const inside = keyBlockAround(keys, cut);
     if (inside) {
       cut = inside[0] + 1; // the loop's cut-- lands on the header's start
+      continue;
+    }
+    // Nor inside an over-long quoted secret value (it may run across lines to its
+    // closing quote or the end of the input): go to its key's start.
+    const long = keyBlockAround(longValues, cut);
+    if (long) {
+      cut = long[0] + 1;
       continue;
     }
     // Only at the end of a whitespace run (after whitespace, before text):

@@ -77,7 +77,53 @@ scrubs when it seals a chunk. For a client that cannot, the server's
   key, with `raw-sha256`, `raw-bytes`, `scrub-ruleset` and `scrub-version`
   metadata;
 - the response is the chunk entry and the `raw.scrub` marker
-  (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3) for the client's manifest.
+  (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3, 4 from rule set 4) for the client's manifest.
+  Rule set 4: a quoted secret value whose matching closing quote is not within
+  the quoted rule's 4096-unit scan bound (`MAX_QUOTED_VALUE` in `lib/scrub.ts`,
+  UTF-16 code units counted from the value's start across line breaks) is
+  replaced whole by `[REDACTED]`, up to that closing quote or, with none, to the
+  end of the input; rule set 3 stored the part past the bound in clear. A value
+  whose total length to its matching close is within the bound (multi-line
+  ones included), or whose input ends within it, scrubs byte-identically to
+  rule set 3.
+  - **Across line breaks.** The bound caps the value's total length, not its
+    first line's: CR, LF, CRLF, U+2028, U+2029 and U+0085 are ordinary value
+    units, so a value with a short first line that crosses the bound only after
+    one or more breaks is over the bound too. A template literal, an escaped
+    line continuation or a malformed transcript value that spans lines is
+    redacted to its closing quote (same quote, same escaping test; any supported
+    quote, backtick included) or the end of the input, and the text after the
+    closing quote is kept. Stopping at a line break would leave a keyless tail
+    that no later rule could identify. Consequence: an unclosed quote after a
+    secret key with no matching quote within 4096 units now redacts through the
+    next matching quote of the same kind, possibly on a much later line, or to
+    the end of the input. The scan is one forward walk per value and the
+    redaction consumes it, so the pass stays linear.
+  - **New refusals.** No segment boundary falls strictly between the start of
+    such a value's key and the value's end; a cut exactly at the key's start is
+    allowed. The same holds for a generated unquoted value of 4096 or more units
+    after a quoted key. `longCut` (long strings, cut after any whitespace) finds
+    these values (`overCapQuotedValueSpans`) in the text up to 4096 + 256 units
+    past the segment bound, which covers the longest key plus the scan's reach
+    (4096 + 150 units from the key's start), so a key just below the bound or
+    straddling it is protected too; one still open there, decided or not, is
+    taken to run to the end. `safeCut` (runs of text lines, cut at line
+    boundaries) skips line boundaries inside them, scanning the run and its
+    look-ahead as a prefix (a value open at its end is open to the end), and a
+    run that ends inside a secret value which is, or may yet become, over the
+    bound keeps a following record or private-key line instead of ending
+    before it (fail closed, at most 256 rescans per chunk). Values
+    within the bound get no such span; as in rule set 3 they rely on the
+    context check (`CUT_CONTEXT_CHARS`). When no cut outside them is left the
+    string is rejected with `chunk_string_too_long` (a run: `chunk_unsegmentable`),
+    which is non-retryable and holds no content. The session ingest (`src/session-ingest/oversize.ts`) replaces such
+    a string with its redaction marker before sealing, and the neon reader
+    (`src/migration/neon-s3-sync/neon-reader.ts`) truncates it to a prefix that
+    the sealer then scrubs.
+  - **Quoted keys only.** The whole-value rule covers values after a quoted key.
+    A rule set 5 follow-up covers the rest: unquoted keys (YAML, TOML, env,
+    kwargs), more than 16 spaces before the colon, `\u` escapes in the key, keys
+    longer than 64 characters, and an NBSP separator.
 
 The unscrubbed bytes are never written to storage. If the key already holds
 an object (identical bytes or not), it is kept and described from its own

@@ -35,6 +35,19 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Then the glued-prefix pass tries the relay_ rule first (its body may hold a `.`), so
   // `build-relay_…-sk-….tail` is no longer split at the `.` by the `sk-` rule.
   3: "e7607073a3afca3db6b015945f0b5fab256202f355b740f515987ec162bf3076",
+  // A quoted secret value past the quoted rule's 4096-unit scan bound is redacted whole
+  // (to its matching closing quote or the end of input; no line break ends it), not cut at
+  // the bound with the rest stored; a generated unquoted value after a quoted key likewise.
+  // The segmenter never cuts between such a value's key and its end (longCut, safeCut, and
+  // a run open in one keeps its next record or key line). Values within the bound scrub
+  // byte-identically to version 3.
+  // Updated before release (N1 delta review: longCut finds those values past the segment
+  // bound too, so a key just below the bound is protected; the unquoted over-bound value
+  // gets a span. N2: the line-confined narrowing is withdrawn, over-bound values run across
+  // line breaks. N3: the bound caps the value's total length to its matching close across
+  // lines, not its key line's, and a run or cut window ending inside an undecided secret
+  // value fails closed). Version 4 has sealed no chunk: it is only on this unmerged branch.
+  4: "429200e870dea6b5602f6ffa6b7a577cf2016b27aa9d99e6a3e61b55e5ec612c",
 };
 
 const read = (rel: string) =>
