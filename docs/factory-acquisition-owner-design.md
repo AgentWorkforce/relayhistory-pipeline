@@ -531,6 +531,9 @@ The JSON envelope has exactly three keys:
 verifies S and both digests. All A values are canonical strings, absent optionals `""`. A body-supplied public key,
 issuer class, identity header or scope cannot authorize anything. Historical assertions remain usable for exact
 receipt replay; this transport does not require the grant to be currently active as a preflight shortcut.
+Issuer rotation retains old pinned public verification keys while any encrypted publication outbox or reserved
+control revoke still references them, including historical receipt replay. An applied install is not sufficient
+reason to remove its key: its publication retry obligation can outlive control-intent reconciliation.
 
 The outer uncompressed body is at most **2,100,000 bytes** and the decoded batch at most **1,500,000 bytes**.
 Both declared and streamed byte counts are bounded. Reject padded/noncanonical base64url, malformed UTF-8 or JSON,
