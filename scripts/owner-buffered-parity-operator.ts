@@ -1,9 +1,12 @@
 /**
  * Root-only Option C G1/G2 operator.
  *
- * Credentials and the private tenant tuple arrive as one bounded JSON object on
- * a pipe or socket, never argv, environment, terminal, or a file:
+ * Credentials and, for single-tenant modes, the private tenant tuple arrive as
+ * one bounded JSON object on a pipe or socket, never argv, environment,
+ * terminal, or a file:
  *   {"neonUrl":"...","supabaseUrl":"...","tenant":{"orgId":"...","workspaceId":"...","userId":"..."}}
+ * Bulk input contains exactly neonUrl and supabaseUrl; its tenant set is read
+ * from the target ledger under the table-owner session.
  *
  * G1 (strictly read-only):
  *   <approved RAM-only credential pipe> | bun run scripts/owner-buffered-parity-operator.ts census \
@@ -14,10 +17,23 @@
  *     --expect-source-sha <merged-main-sha> --expect-target-generation <hex64> \
  *     --confirm-write owner-buffered-parity/v1
  *
- * Output is one aggregate JSON receipt. It contains a tenant hash, never the
- * org/workspace/user identifiers or database URLs. A write still requires the
- * operator to have Khaliq's direct production approval; the flag is an
- * accidental-execution guard, not approval by itself.
+ * Bulk G1+G2 (every distinct user with a live buffered outbox row):
+ *   <approved RAM-only credential pipe> | bun run scripts/owner-buffered-parity-operator.ts bulk \
+ *     --expect-source-sha <merged-main-sha> --expect-target-generation <hex64> \
+ *     --batch-size 25 --confirm-write owner-buffered-parity-bulk/v1
+ *
+ * Bulk enumeration is a read-only repeatable-read cursor. Only one bounded
+ * page is held in process memory. A stopped run is resumed by rerunning the
+ * same pinned command: completed tenants are idempotently reported unchanged,
+ * while the fresh cursor also includes buffered tenants added since the prior
+ * snapshot. Bulk output is aggregate counts only; tenant identifiers and
+ * per-tenant hashes never leave the process.
+ *
+ * Output is one aggregate JSON receipt. Single-tenant output contains a tenant
+ * hash; bulk output contains counts only. Neither contains org/workspace/user
+ * identifiers or database URLs. A write still requires the operator to have
+ * Khaliq's direct production approval; the flag is an accidental-execution
+ * guard, not approval by itself.
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -37,10 +53,27 @@ import {
   refuseCredentialEnv,
   sessionAffinityUrl,
 } from "../src/migration/stdin-credentials.ts";
+import type { Queryable } from "../src/migration/relayhistory-export.ts";
 
 const HEX40 = /^[0-9a-f]{40}$/u;
 const HEX64 = /^[0-9a-f]{64}$/u;
 const WRITE_CONFIRMATION = "owner-buffered-parity/v1";
+const BULK_WRITE_CONFIRMATION = "owner-buffered-parity-bulk/v1";
+const DEFAULT_BULK_BATCH_SIZE = 25;
+const MAX_BULK_BATCH_SIZE = 100;
+const BULK_CURSOR = "owner_buffered_parity_bulk_tenants";
+
+export const BULK_TARGET_GENERATION_SQL = `
+SELECT generation
+  FROM sessions.__96bulls_role_validation
+ WHERE name='session_directory_search_worker' AND status='pass'`;
+
+export const BULK_BUFFERED_TENANTS_SQL = `
+SELECT org_id,workspace_id,user_id
+  FROM (SELECT DISTINCT org_id,workspace_id,user_id
+          FROM sessions.ingest_buffer_outbox
+         WHERE state='buffered') AS buffered_tenants
+ ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",user_id COLLATE "C"`;
 
 export class OwnerBufferedOperatorRefusal extends Error {
   constructor(readonly code: string) {
@@ -49,16 +82,27 @@ export class OwnerBufferedOperatorRefusal extends Error {
   }
 }
 
-export interface OperatorArgs {
-  mode: "census" | "write";
+interface OperatorBaseArgs {
   expectedSourceSha: string;
   expectedTargetGeneration: string;
 }
 
+export interface SingleOperatorArgs extends OperatorBaseArgs {
+  mode: "census" | "write";
+}
+
+export interface BulkOperatorArgs extends OperatorBaseArgs {
+  mode: "bulk";
+  batchSize: number;
+}
+
+export type OperatorArgs = SingleOperatorArgs | BulkOperatorArgs;
+
 export function parseOperatorArgs(argv: readonly string[]): OperatorArgs {
   const [mode, ...rest] = argv;
-  if (mode !== "census" && mode !== "write") throw new OwnerBufferedOperatorRefusal("usage");
-  const allowed = new Set(["--expect-source-sha", "--expect-target-generation", "--confirm-write"]);
+  if (mode !== "census" && mode !== "write" && mode !== "bulk")
+    throw new OwnerBufferedOperatorRefusal("usage");
+  const allowed = new Set(["--expect-source-sha", "--expect-target-generation", "--confirm-write", "--batch-size"]);
   const values = new Map<string, string>();
   for (let i = 0; i < rest.length; i += 2) {
     const key = rest[i];
@@ -71,9 +115,18 @@ export function parseOperatorArgs(argv: readonly string[]): OperatorArgs {
   if (!HEX40.test(expectedSourceSha) || !HEX64.test(expectedTargetGeneration))
     throw new OwnerBufferedOperatorRefusal("usage");
   const confirmation = values.get("--confirm-write");
-  if (mode === "write" ? confirmation !== WRITE_CONFIRMATION : confirmation !== undefined)
+  if (mode === "write" ? confirmation !== WRITE_CONFIRMATION
+    : mode === "bulk" ? confirmation !== BULK_WRITE_CONFIRMATION
+    : confirmation !== undefined)
     throw new OwnerBufferedOperatorRefusal("usage");
-  return { mode, expectedSourceSha, expectedTargetGeneration };
+  const batchText = values.get("--batch-size");
+  if (mode !== "bulk" && batchText !== undefined) throw new OwnerBufferedOperatorRefusal("usage");
+  const batchSize = batchText === undefined ? DEFAULT_BULK_BATCH_SIZE : Number(batchText);
+  if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > MAX_BULK_BATCH_SIZE)
+    throw new OwnerBufferedOperatorRefusal("usage");
+  return mode === "bulk"
+    ? { mode, expectedSourceSha, expectedTargetGeneration, batchSize }
+    : { mode, expectedSourceSha, expectedTargetGeneration };
 }
 
 function parseTenant(value: unknown): ParityTenant {
@@ -166,6 +219,130 @@ function generationMatches(receipt: ParityCensusReceipt, expected: string): bool
   return receipt.proof !== null && receipt.proof.targetGeneration === expected;
 }
 
+export interface BulkParityCounts {
+  batches: number;
+  candidates: number;
+  g1Equal: number;
+  g1Mismatch: number;
+  tenantRefused: number;
+  inserted: number;
+  updated: number;
+  unchanged: number;
+}
+
+export interface BulkParityDependencies {
+  readCensus?: typeof readParityCensus;
+  writeProof?: typeof writeCurrentParityProof;
+}
+
+class BulkParityFatal extends OwnerBufferedOperatorRefusal {
+  constructor(code: string, readonly counts: BulkParityCounts) { super(code); }
+}
+
+function emptyBulkCounts(): BulkParityCounts {
+  return { batches: 0, candidates: 0, g1Equal: 0, g1Mismatch: 0, tenantRefused: 0,
+    inserted: 0, updated: 0, unchanged: 0 };
+}
+
+function bulkTenant(row: Record<string, unknown>): ParityTenant | null {
+  try {
+    return parseTenant({ orgId: row.org_id, workspaceId: row.workspace_id, userId: row.user_id });
+  } catch {
+    return null;
+  }
+}
+
+function fatalGeneration(code: string): boolean {
+  return code === "target_generation_mismatch" || code === "bulk_target_generation_mismatch" ||
+    code === "target_generation_postcondition_failed";
+}
+
+async function requireBulkGeneration(
+  targetOwner: Queryable,
+  expectedTargetGeneration: string,
+  counts: BulkParityCounts,
+): Promise<void> {
+  const rows = (await targetOwner.query<{ generation: unknown }>(BULK_TARGET_GENERATION_SQL)).rows;
+  if (rows.length !== 1 || rows[0]?.generation !== expectedTargetGeneration)
+    throw new BulkParityFatal("bulk_target_generation_mismatch", counts);
+}
+
+/**
+ * Enumerate one stable snapshot of every live buffered tenant, process only a
+ * bounded FETCH page at a time, and isolate tenant parity/CAS refusals. The
+ * writer's per-tenant repeatable-read transaction remains the authority.
+ */
+export async function runBulkParity(
+  neon: Queryable,
+  enumerator: Queryable,
+  targetOwner: Queryable,
+  expectedTargetGeneration: string,
+  batchSize: number,
+  dependencies: BulkParityDependencies = {},
+): Promise<BulkParityCounts> {
+  if (!HEX64.test(expectedTargetGeneration) || !Number.isSafeInteger(batchSize) ||
+      batchSize < 1 || batchSize > MAX_BULK_BATCH_SIZE)
+    throw new OwnerBufferedOperatorRefusal("bulk_arguments_invalid");
+  const counts = emptyBulkCounts();
+  const readCensus = dependencies.readCensus ?? readParityCensus;
+  const writeProof = dependencies.writeProof ?? writeCurrentParityProof;
+  await requireBulkGeneration(targetOwner, expectedTargetGeneration, counts);
+
+  await enumerator.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  try {
+    await enumerator.query("SET LOCAL statement_timeout = '30s'");
+    await enumerator.query("SET LOCAL idle_in_transaction_session_timeout = '10min'");
+    await enumerator.query(`DECLARE ${BULK_CURSOR} NO SCROLL CURSOR FOR ${BULK_BUFFERED_TENANTS_SQL}`);
+    for (;;) {
+      await requireBulkGeneration(targetOwner, expectedTargetGeneration, counts);
+      const rows = (await enumerator.query<Record<string, unknown>>(
+        `FETCH FORWARD ${batchSize} FROM ${BULK_CURSOR}`,
+      )).rows;
+      if (rows.length > batchSize) throw new OwnerBufferedOperatorRefusal("bulk_page_too_large");
+      if (rows.length === 0) break;
+      counts.batches++;
+      for (const row of rows) {
+        counts.candidates++;
+        const tenant = bulkTenant(row);
+        if (!tenant) { counts.tenantRefused++; continue; }
+        try {
+          const g1 = await readCensus(neon, targetOwner, tenant);
+          if (!g1.equal || !g1.proof) {
+            await requireBulkGeneration(targetOwner, expectedTargetGeneration, counts);
+            counts.g1Mismatch++;
+            continue;
+          }
+          if (!generationMatches(g1, expectedTargetGeneration))
+            throw new BulkParityFatal("bulk_target_generation_mismatch", counts);
+          counts.g1Equal++;
+          const result = await writeProof(neon, targetOwner, tenant, expectedTargetGeneration);
+          if (!generationMatches(result.census, expectedTargetGeneration))
+            throw new BulkParityFatal("target_generation_postcondition_failed", counts);
+          if (result.outcome === "insert") counts.inserted++;
+          else if (result.outcome === "update") counts.updated++;
+          else counts.unchanged++;
+        } catch (error) {
+          if (error instanceof BulkParityFatal) throw error;
+          if (error instanceof ParityCensusRefusal) {
+            if (fatalGeneration(error.code)) throw new BulkParityFatal(error.code, counts);
+            counts.tenantRefused++;
+            continue;
+          }
+          throw error;
+        }
+      }
+    }
+    await requireBulkGeneration(targetOwner, expectedTargetGeneration, counts);
+    await enumerator.query(`CLOSE ${BULK_CURSOR}`);
+    await enumerator.query("COMMIT");
+    return counts;
+  } catch (error) {
+    await enumerator.query("ROLLBACK").catch(() => undefined);
+    if (error instanceof BulkParityFatal) throw error;
+    throw new BulkParityFatal("bulk_enumeration_failed", counts);
+  }
+}
+
 function output(fields: Record<string, unknown>): void {
   process.stdout.write(JSON.stringify({
     at: new Date().toISOString(),
@@ -186,8 +363,10 @@ async function main(): Promise<number> {
   try {
     refuseCredentialEnv();
     verifyCheckout(args.expectedSourceSha);
-    const input = await readStdinCredentials(["neonUrl", "supabaseUrl", "tenant"]);
-    const tenant = parseTenant(input.tenant);
+    const input = await readStdinCredentials(
+      args.mode === "bulk" ? ["neonUrl", "supabaseUrl"] : ["neonUrl", "supabaseUrl", "tenant"],
+    );
+    const tenant = args.mode === "bulk" ? null : parseTenant(input.tenant);
     // Validate both complete URL identities and TLS policies before opening either connection.
     const neonUrl = sessionAffinityUrl(input.neonUrl, "neonUrl", "neon");
     const supabaseUrl = sessionAffinityUrl(input.supabaseUrl, "supabaseUrl", "supabase");
@@ -196,6 +375,33 @@ async function main(): Promise<number> {
 
     const neon = await connect(neonUrl, "neonUrl", "neon", "owner-buffered-g1-neon-readonly", true);
     clients.push(neon);
+    if (args.mode === "bulk") {
+      const enumerator = await connect(
+        supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-enumerator", true,
+      );
+      clients.push(enumerator);
+      const targetOwner = await connect(
+        supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-owner", false,
+      );
+      clients.push(targetOwner);
+      await requireParityTableOwner(targetOwner);
+      try {
+        const counts = await runBulkParity(
+          neon, enumerator, targetOwner, args.expectedTargetGeneration, args.batchSize,
+        );
+        output({ status: "complete", mode: "bulk", sourceSha: args.expectedSourceSha,
+          targetGeneration: args.expectedTargetGeneration, counts });
+        return 0;
+      } catch (error) {
+        if (error instanceof BulkParityFatal) {
+          output({ status: "refused", mode: "bulk", code: error.code,
+            sourceSha: args.expectedSourceSha, targetGeneration: args.expectedTargetGeneration, counts: error.counts });
+          return 1;
+        }
+        throw error;
+      }
+    }
+
     const target = await connect(
       supabaseUrl,
       "supabaseUrl",
@@ -205,7 +411,7 @@ async function main(): Promise<number> {
     );
     clients.push(target);
 
-    const g1 = await readParityCensus(neon, target, tenant);
+    const g1 = await readParityCensus(neon, target, tenant!);
     if (!g1.equal || !g1.proof) {
       output({ status: "mismatch", mode: args.mode, sourceSha: args.expectedSourceSha, census: publicCensusReceipt(g1) });
       return 3;
@@ -227,7 +433,7 @@ async function main(): Promise<number> {
 
     await requireParityTableOwner(target);
     // G2 performs its own fresh census and source recheck in the write transaction.
-    const result = await writeCurrentParityProof(neon, target, tenant, args.expectedTargetGeneration);
+    const result = await writeCurrentParityProof(neon, target, tenant!, args.expectedTargetGeneration);
     if (!generationMatches(result.census, args.expectedTargetGeneration))
       throw new OwnerBufferedOperatorRefusal("target_generation_postcondition_failed");
     output({
