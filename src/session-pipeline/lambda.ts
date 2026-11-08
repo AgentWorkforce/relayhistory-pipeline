@@ -33,8 +33,8 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * feeds accepted buffered stages into transcript_events (buffered-search-feed.ts); it is refused
  * unless BUFFERED_SEARCH_FEED_GATE_DECLARED equals the read gate's contract id
  * (BUFFERED_SEARCH_GATE_CONTRACT, "buffered-search-gate/v1"; the read Worker deploys with
- * READ_API_BUFFERED_SEARCH_GATE=on first), and needs SEARCH_INDEX_ENABLED=1 on the ClickHouse backend, the draft RPCs and the
- * origin columns (docs/proposals/buffered-search-feed*.draft.sql) applied.
+ * READ_API_BUFFERED_SEARCH_GATE=on first), and needs SEARCH_INDEX_ENABLED=1 on the ClickHouse backend, the feed RPCs
+ * (migration 20261105043870) and the origin columns (docs/proposals/buffered-search-feed.clickhouse.draft.sql) applied.
  */
 import pg from "pg";
 import {

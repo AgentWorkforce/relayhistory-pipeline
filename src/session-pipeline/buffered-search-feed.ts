@@ -40,8 +40,8 @@
  * and any later canonical pass (version = its wall clock) wins over them.
  *
  * Privacy and erasure. Only what the buffered GC's own retention authority keeps is indexed
- * (`sessions.ingest_buffer_gc_ordinals`, via the draft RPC
- * docs/proposals/buffered-search-feed.draft.sql); a stage that is not its batch's active,
+ * (`sessions.ingest_buffer_gc_ordinals`, via the feed RPC in
+ * supabase/migrations/20261105043870_buffered_search_feed_cursor.sql); a stage that is not its batch's active,
  * acknowledged, live outbox object is never indexed; a GC lease in flight or a fenced privacy
  * authority defers. After every ClickHouse write the stage is re-checked and rows of any
  * record retention no longer keeps are deleted (buffered-origin rows only). Deletes for
@@ -147,7 +147,7 @@ export function bufferedFeedConfig(env: NodeJS.ProcessEnv): BufferedFeedConfig {
   };
 }
 
-// ---------------------------------------------------------------- SQL source (draft RPCs)
+// ---------------------------------------------------------------- SQL source (043870 RPCs)
 
 export interface FeedTenant { orgId: string; workspaceId: string; userId: string }
 export interface StageCandidate { stageToken: string; createdAt: string; tenant: FeedTenant; originId: string; batchId: string }
@@ -189,7 +189,7 @@ function checkOrdinals(v: unknown): number[] {
   return v as number[];
 }
 
-/** The draft RPCs, one autocommit statement each (each its own short transaction). */
+/** The 043870 feed RPCs, one autocommit statement each (each its own short transaction). */
 export function sqlBufferedFeedSource(db: SqlExecutor): BufferedFeedSource {
   const call = async (name: "page" | "stage" | "advance", p: unknown): Promise<Record<string, unknown>> => {
     let value: unknown;

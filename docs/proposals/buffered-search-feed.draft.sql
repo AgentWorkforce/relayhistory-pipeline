@@ -1,9 +1,8 @@
--- DRAFT, NO MIGRATION SLOT. Buffered-stage search feed (INGEST_BUFFERED_SEARCH_FEED, default off).
---
--- Not under supabase/migrations on purpose: the registry keeper (layered-sessions-pipeline) assigns the
--- slot, and the function-boundary lane, ACL manifest, wrapper and verifiers are generated in that PR.
--- Applying this file to any real database needs Khaliq's separate OK in his own words. The PGlite suite
--- src/session-pipeline/__tests__/buffered-search-feed.pglite.test.ts applies it on top of every migration.
+-- MATERIALIZED in slot 043870: supabase/migrations/20261105043870_buffered_search_feed_cursor.sql
+-- (rollback supabase/rollbacks/20261105043870_buffered_search_feed_cursor.down.sql, lane
+-- scripts/sessions-function-boundary/lanes/buffered-search-feed.ts). The migration is authoritative;
+-- this draft is kept for history only and is not applied by any test. Do not apply it.
+-- Buffered-stage search feed (INGEST_BUFFERED_SEARCH_FEED, default off).
 --
 -- What it gives the session pipeline (service_role, like the large-read RPCs) and nothing else:
 --   buffered_search_feed_page(p)    keyset page of acknowledged, live, ACTIVE buffered stages after a

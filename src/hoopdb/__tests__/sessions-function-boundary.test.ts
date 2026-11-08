@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { generate, ACL_PATH, type Reader } from "../../../scripts/sessions-function-boundary/generate.ts";
+import { generate, ACL_PATH, GUARDS_PATH, type Reader } from "../../../scripts/sessions-function-boundary/generate.ts";
 import { LANES } from "../../../scripts/sessions-function-boundary/lanes/index.ts";
 import { ingestHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-history.ts";
 import { bufferedGcSingleCandidate } from "../../../scripts/sessions-function-boundary/lanes/buffered-gc-single-candidate.ts";
@@ -303,6 +303,33 @@ describe("unified sessions function-boundary generator", () => {
     expect(down.match(/DROP FUNCTION IF EXISTS/g)?.length).toBe(1);
     expect(down).toContain("DROP FUNCTION IF EXISTS sessions.buffered_search_gate_for(text, text, text, text, text, text, text, text, boolean, text, jsonb);");
     expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043860_buffered_search_gate.sql'");
+  });
+
+  test("043870 buffered search feed: three service_role SECDEF RPCs, ACL +3, runtime functions, no table grant", async () => {
+    const g = await generate(repo, LANES, VERIFIERS);
+    expect(g.summary.lanes["buffered-search-feed"]).toEqual({ functions: 3, replaces: 0, grants: 3 });
+    expect(LANES.find((l) => l.lane === "buffered-search-feed")?.migration).toBe("supabase/migrations/20261105043870_buffered_search_feed_cursor.sql");
+    const acl = JSON.parse(g.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    const mine = Object.entries(acl).filter(([k]) => k.startsWith("sessions.buffered_search_feed_"));
+    expect(Object.fromEntries(mine)).toEqual({
+      "sessions.buffered_search_feed_advance(jsonb)": ["<owner>:EXECUTE", "service_role:EXECUTE"],
+      "sessions.buffered_search_feed_page(jsonb)": ["<owner>:EXECUTE", "service_role:EXECUTE"],
+      "sessions.buffered_search_feed_stage(jsonb)": ["<owner>:EXECUTE", "service_role:EXECUTE"],
+    });
+    // service_role grants make them runtime application functions in the generated guards.
+    for (const sig of Object.keys(Object.fromEntries(mine))) expect(g.outputs[GUARDS_PATH]).toContain(JSON.stringify(sig));
+    const migration = readFileSync(join(root, "supabase/migrations/20261105043870_buffered_search_feed_cursor.sql"), "utf8");
+    // EXECUTE only: no table, sequence or schema privilege for any role.
+    expect(migration.match(/^GRANT .*$/gmu)).toEqual(["page", "stage", "advance"].map((f) => `GRANT EXECUTE ON FUNCTION sessions.buffered_search_feed_${f}(jsonb) TO service_role;`));
+    expect(migration).toContain("FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder, bulls96_read_api;");
+    expect(migration.match(/SET search_path = pg_catalog, sessions, pg_temp/g)?.length).toBe(3);
+    // Retention is CALLED from the GC authority, not re-derived.
+    expect(migration).toContain("v_retained:=sessions.ingest_buffer_gc_ordinals(act.stage_token);");
+    const down = readFileSync(join(root, "supabase/rollbacks/20261105043870_buffered_search_feed_cursor.down.sql"), "utf8");
+    expect(down).toContain("a later migration is applied");
+    expect(down.match(/DROP FUNCTION IF EXISTS/g)?.length).toBe(3);
+    expect(down).toContain("DROP TABLE IF EXISTS sessions.buffered_search_feed_cursors;");
+    expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043870_buffered_search_feed_cursor.sql'");
   });
 
   test("a stale SECDEF signature under a lane's prefix (an old arity) is dropped from the wrapper, not carried forward", async () => {

@@ -1,4 +1,4 @@
-/** The draft feed RPCs (docs/proposals/buffered-search-feed.draft.sql) on every migration in PGlite. */
+/** The feed RPCs (supabase/migrations/20261105043870_buffered_search_feed_cursor.sql) on every migration in PGlite. */
 import {orderedFixtureLedger,initializeFixtureSeatClock} from "../../session-ingest/__tests__/ordered-support.ts";
 import {afterEach,expect,setDefaultTimeout,test} from "bun:test";
 import {readFileSync,readdirSync} from "node:fs";
@@ -25,7 +25,6 @@ async function fixture(){
   await db.exec(read("supabase/bootstrap/"+name+".sql"));
  for(const name of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())
   await db.exec(read("supabase/migrations/"+name));
- await db.exec(read("docs/proposals/buffered-search-feed.draft.sql"));
  await db.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now());INSERT INTO sessions.__96bulls_role_validation(name,generation,status) VALUES('session_directory_search_worker','"+generation+"','pass') ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,status=excluded.status");
  const as=async(role:string,text:string,params:unknown[]=[])=>{
   await db.exec("BEGIN;SET LOCAL ROLE "+role);
