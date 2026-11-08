@@ -236,8 +236,10 @@ source-contract and whole-lane review conditions are unresolved.
 
 C3: recovered the original Book artifacts with exact pins dc068aef (v1 design),
 51d358b2 (v3 design), fd3f8908 (contract vectors) and 867f6b35 (bigint known
-answers). The two unmodified synthetic vector sets are now in docs/contracts,
-with their full SHA256 pins enforced by conformance tests. The original v3
+answers). The two unmodified synthetic vector sets use their author-published canonical
+paths under docs/handoffs/frontier-attester-20261107, merged from 3caccf36, with
+their full SHA256 pins enforced by conformance tests. Duplicate docs/contracts
+copies are removed; artifact bytes and known answers are unchanged. The original v3
 design is also published unmodified under docs/handoffs/frontier-attester-20261107
 with its 51d358b2 pin enforced by the same tests. These historical design/test
 artifacts grant no operational authority. The v3 design governs:
@@ -286,3 +288,9 @@ The unsupported-identifier regression causally fails with the old eligibility
 guard (a self-consistent synthetic Unicode maximum otherwise became READY),
 and passes with the fail-closed guard. The source was restored immediately
 after that negative experiment. This does not qualify real source coverage.
+
+Author publication consolidation: normal merge of 3caccf36 imports the original
+vector paths, README and SHA256SUMS. Byte comparison verified both artifact pairs
+identical before removing the duplicate paths. Tests now load the author paths
+with the same exact three source pins. This is provenance/path consolidation,
+not a change to the accepted reader API, planner hashing or coverage claims.

@@ -6,13 +6,13 @@ import { parseFrontierJson } from "../frontier-plan-input.ts";
 import { frontierUtf8TupleCompare } from "../frontier-order.ts";
 const root = new URL("../../../", import.meta.url);
 const fixture = (name: string, sha: string) => {
-  const bytes = readFileSync(new URL(`docs/contracts/${name}`, root));
+  const bytes = readFileSync(new URL(`docs/handoffs/frontier-attester-20261107/${name}`, root));
   if (createHash("sha256").update(bytes).digest("hex") !== sha) throw new Error("frontier_vector_pin_mismatch");
   return JSON.parse(bytes.toString("utf8"));
 };
-const vectors = fixture("frontier-attester-contract-v1.vectors.json", "fd3f8908524b708b24e1511dc88795eb365304f7e3d74cb6267f4491a3231abe");
-const design = fixture("../handoffs/frontier-attester-20261107/publication-frontier-attester-minimal-source-design-v3-20261107.json", "51d358b293790030dadcd5839358ac18109d570b2b6d05e97433b21efe5ec398");
-const bigint = fixture("frontier-attester-bigint-v1.vectors.json", "867f6b3567ad976c1a01f4fa7940e6b0ce89d4ae7d5454d45a484d1486eb3e38");
+const vectors = fixture("publication-frontier-contract-vectors-20261107.json", "fd3f8908524b708b24e1511dc88795eb365304f7e3d74cb6267f4491a3231abe");
+const design = fixture("publication-frontier-attester-minimal-source-design-v3-20261107.json", "51d358b293790030dadcd5839358ac18109d570b2b6d05e97433b21efe5ec398");
+const bigint = fixture("publication-frontier-component-bigint-known-answers-20261107.json", "867f6b3567ad976c1a01f4fa7940e6b0ce89d4ae7d5454d45a484d1486eb3e38");
 // These are codec vectors, never real inventory, a verifier, or approval.
 describe("pinned frontier codec conformance (not coverage verification)", () => {
   for (const v of [...vectors.positiveVectors, ...bigint.vectors]) {
