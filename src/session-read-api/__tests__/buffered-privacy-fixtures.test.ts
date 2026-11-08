@@ -128,7 +128,14 @@ async function request(c: CausalCase, path: string) {
         return typeof value === "function" ? value.bind(target) : value;
       },
     }) as OwnerBufferedDeps["store"];
-    const ownerBuffered: OwnerBufferedDeps = { enabled: true, reads, gate, store: observedStore, decompress: unzip };
+    const ownerBuffered: OwnerBufferedDeps = {
+      enabled: true,
+      workspaces: new Set([SCOPE.workspaceId]),
+      reads,
+      gate,
+      store: observedStore,
+      decompress: unzip,
+    };
     const app = createReadApi({
       verify: async () => ID,
       ch: { database: "fixture", async command() {}, async insert() {}, async select<T>() { return [] as T[]; } },
