@@ -842,6 +842,26 @@ describe("append-only renamed migrations: adopted in memory only when every chec
     expect((await snapshot(db)).marker).toEqual(before.marker);
   });
 
+  test("CLI authority at each original or current rename version refuses without ledger or marker writes", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    await recordedUnderOriginalNames(db);
+    await db.exec("CREATE SCHEMA supabase_migrations; CREATE TABLE supabase_migrations.schema_migrations(version text PRIMARY KEY)");
+    const before = await snapshot(db);
+    for (const alias of MIGRATION_RENAME_ALIASES) {
+      for (const name of [alias.ledger_name, alias.migration]) {
+        const version = name.slice("upstream:".length).split("_")[0]!;
+        await db.query("INSERT INTO supabase_migrations.schema_migrations(version) VALUES($1)", [version]);
+        expect((await failure(runMigrations(client(db), { profile: LOCAL })))?.code).toBe("mixed_migration_authority");
+        expect(await snapshot(db)).toEqual(before);
+        expect((await db.query("SELECT version FROM supabase_migrations.schema_migrations")).rows).toEqual([{ version }]);
+        await db.query("DELETE FROM supabase_migrations.schema_migrations WHERE version=$1", [version]);
+      }
+    }
+    expect((await runMigrations(client(db), { profile: LOCAL })).applied).toBe(0);
+    expect((await snapshot(db)).ledger).toEqual(before.ledger);
+  });
+
   test("readiness refuses original/current collisions and bad original hashes without changing physical history or marker", async () => {
     const db = await fresh();
     await runMigrations(client(db), { profile: LOCAL });

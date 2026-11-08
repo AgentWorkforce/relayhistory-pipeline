@@ -930,9 +930,19 @@ async function cliHistoryPreflight(
     throw err;
   }
   if (cliHistory) {
-    const versions = schema
+    const upstreamNames = new Set(schema
       .filter((st) => st.name.startsWith("upstream:"))
-      .map((st) => st.name.slice("upstream:".length).split("_")[0]!);
+      .map((st) => st.name));
+    // A released rename must not hide the CLI's separate authority. Include
+    // both versions only when this plan selects either spelling of the step.
+    for (const alias of MIGRATION_RENAME_ALIASES) {
+      if (upstreamNames.has(alias.migration) || upstreamNames.has(alias.ledger_name)) {
+        upstreamNames.add(alias.migration);
+        upstreamNames.add(alias.ledger_name);
+      }
+    }
+    const versions = [...new Set([...upstreamNames]
+      .map((name) => name.slice("upstream:".length).split("_")[0]!))].sort();
     let hit: { version: string }[];
     try {
       hit = (

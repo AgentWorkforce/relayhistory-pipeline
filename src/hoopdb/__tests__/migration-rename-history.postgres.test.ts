@@ -87,6 +87,22 @@ native("native PG17: released image ledger upgrades in place as unchanged non-CR
     expect(await schemaVerdict({...await expectedSchema(),dbMode:"selfhosted"},txn(runtime))).toEqual({ok:true});
    }
   }
+  // Original and current CLI versions are both a second authority. Every
+  // refusal leaves the physical ledger, ready marker and seeded pointer intact.
+  await owner.query("CREATE SCHEMA supabase_migrations; CREATE TABLE supabase_migrations.schema_migrations(version text PRIMARY KEY)");
+  for(const alias of MIGRATION_RENAME_ALIASES){
+   for(const name of [alias.ledger_name,alias.migration]){
+    const version=name.slice("upstream:".length).split("_")[0]!;
+    await owner.query("INSERT INTO supabase_migrations.schema_migrations(version) VALUES($1)",[version]);
+    const ledgerBefore=await liveRows(owner),markerBeforeCli=(await owner.query("SELECT * FROM sessions.__96bulls_role_validation")).rows;
+    expect((await rejected(runMigrations(sql(owner),{profile:next})))?.code).toBe("mixed_migration_authority");
+    expect(await liveRows(owner)).toEqual(ledgerBefore);
+    expect((await owner.query("SELECT * FROM sessions.__96bulls_role_validation")).rows).toEqual(markerBeforeCli);
+    expect(await selected(owner)).toEqual(preserved);
+    expect((await owner.query("SELECT version FROM supabase_migrations.schema_migrations")).rows).toEqual([{version}]);
+    await owner.query("DELETE FROM supabase_migrations.schema_migrations WHERE version=$1",[version]);
+   }
+  }
   // A checksum forgery on this isolated fixture is not adopted: readiness stays
   // schema_pending and the migrator refuses, without marker/ledger side effects.
   const a=MIGRATION_RENAME_ALIASES[0];await owner.query("UPDATE sessions.__96bulls_migrations SET sha256=$1 WHERE name=$2",["0".repeat(64),a.ledger_name]);
