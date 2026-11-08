@@ -48,6 +48,15 @@ const SCRUB_RULESETS: Record<number, string> = {
   // lines, not its key line's, and a run or cut window ending inside an undecided secret
   // value fails closed). Version 4 has sealed no chunk: it is only on this unmerged branch.
   4: "429200e870dea6b5602f6ffa6b7a577cf2016b27aa9d99e6a3e61b55e5ec612c",
+  // An over-cap quoted secret value is classified and redacted on the original text, by a
+  // pre-pass ahead of every other rule (version 4 measured it after the token rules had
+  // shrunk it under the bound and stored its later lines). The record path keeps key
+  // context: a non-empty string under a secret key is redacted at any depth, through
+  // arrays, in scrubJson/scrubRecord and the record-line tokenizer. From version 5 the
+  // segmenter markers also enclose scrubRecordLine, so the digest covers the record path.
+  // Output with no secret-keyed record value and no over-cap quoted value is
+  // byte-identical to version 4.
+  5: "50d5eacae1c3e706dba90c7a0a5e9e3b94346e0739072983415f8cbc5eed41ed",
 };
 
 const read = (rel: string) =>

@@ -77,7 +77,7 @@ scrubs when it seals a chunk. For a client that cannot, the server's
   key, with `raw-sha256`, `raw-bytes`, `scrub-ruleset` and `scrub-version`
   metadata;
 - the response is the chunk entry and the `raw.scrub` marker
-  (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3, 4 from rule set 4) for the client's manifest.
+  (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3, 4 from rule set 4, 5 from rule set 5) for the client's manifest.
   Rule set 4: a quoted secret value whose matching closing quote is not within
   the quoted rule's 4096-unit scan bound (`MAX_QUOTED_VALUE` in `lib/scrub.ts`,
   UTF-16 code units counted from the value's start across line breaks) is
@@ -121,9 +121,31 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     (`src/migration/neon-s3-sync/neon-reader.ts`) truncates it to a prefix that
     the sealer then scrubs.
   - **Quoted keys only.** The whole-value rule covers values after a quoted key.
-    A rule set 5 follow-up covers the rest: unquoted keys (YAML, TOML, env,
-    kwargs), more than 16 spaces before the colon, `\u` escapes in the key, keys
-    longer than 64 characters, and an NBSP separator.
+    A later follow-up (not rule set 5) covers the rest: unquoted keys (YAML,
+    TOML, env, kwargs), more than 16 spaces before the colon, `\u` escapes in
+    the key, keys longer than 64 characters, and an NBSP separator.
+
+  Rule set 5 closes two rule set 4 leaks; output for input with no secret-keyed
+  record value and no over-cap quoted value is byte-identical to rule set 4.
+  - **Over-cap measured on the original text.** Rule set 4 measured a quoted
+    secret value after the token rules had replaced its provider-shaped tokens
+    with `[REDACTED]`, so a value over the bound (say 130 `capy_` tokens and then
+    a line break and more text) could shrink under it and keep its later lines.
+    Rule set 5 runs an over-cap pass first, on the original text: it finds the
+    same values as the full quoted rule and redacts each over-bound one whole
+    (through a private-key footer when a key block opens inside it).
+  - **Key context on the record path.** `scrubJson`, `scrubRecord` and the
+    raw-chunk record-line tokenizer (`scrubRecordLine`) redact a non-empty
+    string under a secret key name (`isSecretKeyName`), at any depth and through
+    arrays, unless it is already `[REDACTED]` or an `op://` reference. Rule set
+    4 scrubbed each value alone and stored `{"password":"plain words"}` as it
+    was. Numbers, booleans and null are kept; an object under a secret key is
+    scrubbed by its own keys. The `<scrub-segmenter>` markers now also enclose
+    `scrubRecordLine`, so the pinned digest covers the record path.
+  - **Re-scrubbing rule set 4 output.** Rule set 5 over stored rule set 4
+    records catches the first leak (the key is still there). It cannot catch the
+    second: the stored value is already under the bound, so only the original
+    bytes can be re-scrubbed for it.
 
 The unscrubbed bytes are never written to storage. If the key already holds
 an object (identical bytes or not), it is kept and described from its own

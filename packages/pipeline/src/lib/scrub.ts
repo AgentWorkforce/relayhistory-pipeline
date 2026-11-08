@@ -143,6 +143,7 @@ function redactQuotedSecretValues(
   text: string,
   overCap?: Array<[number, number]>,
   prefix = false,
+  onlyOverCap = false,
 ): string {
   if (!/[:=]/.test(text)) return text;
   let out = "";
@@ -244,9 +245,23 @@ function redactQuotedSecretValues(
     if (valueEnd <= valueStart || (!longValue && keepQuotedValue(value))) continue;
     // From the key start: a cut between key and value would leave the value with no key to match.
     if (longValue || overBound) overCap?.push([m.index, valueEnd]);
+    QUOTED_KEY.lastIndex = Math.max(QUOTED_KEY.lastIndex, valueEnd);
+    // Rule set 5's first pass: only over-bound values are redacted, but every value the
+    // full pass would redact is still skipped, so both passes see the same keys.
+    if (onlyOverCap && !longValue && !overBound) continue;
+    // A private-key block opened inside the value and closed after it: the PEM rule would
+    // have paired them, so the redaction runs to its footer (or the end) as that rule's would.
+    if (onlyOverCap) {
+      const open = unclosedPrivateKeyStart(text.slice(valueStart, valueEnd));
+      if (open !== -1) {
+        PEM_END.lastIndex = valueEnd;
+        const footer = PEM_END.exec(text);
+        valueEnd = footer ? footer.index + footer[0].length : text.length;
+        QUOTED_KEY.lastIndex = Math.max(QUOTED_KEY.lastIndex, valueEnd);
+      }
+    }
     out += text.slice(last, valueStart) + REDACTED;
     last = valueEnd;
-    QUOTED_KEY.lastIndex = Math.max(QUOTED_KEY.lastIndex, valueEnd);
   }
   return last === 0 ? text : out + text.slice(last);
 }
@@ -274,6 +289,20 @@ export function overCapQuotedValueSpans(
   const spans: Array<[number, number]> = [];
   redactQuotedSecretValues(text, spans, options.prefix ?? false);
   return spans;
+}
+
+/**
+ * Rule set 5's first rule: every quoted secret value over the scan bound, and every
+ * generated unquoted value of `MAX_QUOTED_VALUE` units or more after a quoted key (the
+ * values `overCapQuotedValueSpans` reports), redacted whole on the text as given, before
+ * any other rule. Rule set 4 measured a value only after the token rules had run, and they
+ * can shrink it (each provider-shaped token becomes the shorter marker): a multi-line value
+ * over the bound in the input could fall under it, be taken for an ordinary value, and keep
+ * everything after its first line. Values within the bound are left to the quoted rule in
+ * its usual place, so text with no over-bound value scrubs exactly as in rule set 4.
+ */
+function redactOverCapQuotedValues(text: string): string {
+  return redactQuotedSecretValues(text, undefined, false, true);
 }
 
 /** The start of every literal-prefix rule (see the provider key prefixes). */
@@ -347,6 +376,9 @@ function looksGenerated(token: string): boolean {
 type Rule = [RegExp, Replacement] | ((text: string) => string);
 
 const SECRET_PATTERNS: Rule[] = [
+  // Rule set 5: over-bound quoted secret values, measured on the text before any rule
+  // below can shrink them. See `redactOverCapQuotedValues`.
+  redactOverCapQuotedValues,
   // PEM private keys (PKCS#1/#8, EC, OpenSSH, encrypted) and armored PGP private key
   // blocks (`-----BEGIN PGP PRIVATE KEY BLOCK-----`), each up to its footer.
   [
@@ -763,20 +795,44 @@ export function scrubText(value: string): string {
 }
 
 /**
+ * Whether a string value under a key that names a secret (`isSecretKeyName`) is redacted
+ * whole, whatever it holds (rule set 5): every non-empty value but one already redacted or
+ * a 1Password reference, the values the quoted key/value rule keeps. The record paths
+ * (`scrubJson`, and `scrubRecords` in `lib/pipeline/raw-chunks.ts`) scrub each value on
+ * its own, apart from its key, so they decide on the key first, as the quoted rule does
+ * in text; rule set 4 kept such a value unless it matched a rule by itself.
+ */
+export function redactsSecretKeyedValue(value: string): boolean {
+  return value !== "" && !keepQuotedValue(value);
+}
+
+/** Whether a record key names a secret, for `redactsSecretKeyedValue` (the key as written, trimmed). */
+export const isSecretRecordKey = (key: string) => isSecretKeyName(key.trim());
+
+/**
  * Scrub every string value **and key** of a JSON value, and card numbers among its
  * numbers. Two keys that become identical after scrubbing are both kept: later ones get
  * a ` (2)`, ` (3)`… suffix, so no value is silently overwritten and no input is
  * rejected (a rejected record would wedge the push that carries it).
+ *
+ * Key context first (rule set 5): a string under a key that names a secret
+ * (`isSecretRecordKey`, the source key), directly or in arrays under it, at any depth,
+ * is redacted whole (`redactsSecretKeyedValue`) before it is scrubbed on its own. An
+ * object under such a key is scrubbed by its own keys.
  */
 export function scrubJson<T>(value: T): T {
+  return scrubJsonValue(value, false);
+}
+
+function scrubJsonValue<T>(value: T, secretKeyed: boolean): T {
   if (typeof value === "string") {
-    return scrubText(value) as T;
+    return (secretKeyed && redactsSecretKeyedValue(value) ? REDACTED : scrubText(value)) as T;
   }
   if (typeof value === "number") {
     return scrubNumber(value) as T;
   }
   if (Array.isArray(value)) {
-    return value.map((item) => scrubJson(item)) as T;
+    return value.map((item) => scrubJsonValue(item, secretKeyed)) as T;
   }
   if (value && typeof value === "object") {
     const output: Record<string, unknown> = {};
@@ -791,7 +847,7 @@ export function scrubJson<T>(value: T): T {
         name = `${base} (${n})`;
         nextSuffix.set(base, n + 1);
       }
-      output[name] = scrubJson(item);
+      output[name] = scrubJsonValue(item, isSecretRecordKey(key));
     }
     return output as T;
   }

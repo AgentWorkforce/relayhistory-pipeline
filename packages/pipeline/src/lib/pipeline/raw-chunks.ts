@@ -21,7 +21,9 @@ import {
   MAX_SCRUB_CHARS,
   exceedsScrubBound,
   isCardNumber,
+  isSecretRecordKey,
   overCapQuotedValueSpans,
+  redactsSecretKeyedValue,
   scrubText,
 } from "../scrub.js";
 import { PipelineError } from "./errors.js";
@@ -74,8 +76,25 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  *   closed). A string or chunk with no cut left outside them is refused. Output
  *   for a value whose total length to its matching close is within the bound is
  *   byte-identical to version 3.
+ * - 5: version 4's rules and segmenter, with two leaks closed. First, an
+ *   over-cap quoted secret value is now classified and redacted on the original
+ *   text, by a pre-pass that runs before every other rule: version 4 measured
+ *   the value only after the token rules had replaced embedded tokens with
+ *   `[REDACTED]`, which could shrink it below `MAX_QUOTED_VALUE` and leave a
+ *   trailing line stored. A private-key block that opens inside such a value
+ *   and closes after it is redacted through its footer. Second, the record path
+ *   keeps key context: `scrubJson`/`scrubRecord` and the record-line tokenizer
+ *   (`scrubRecordLine`) redact a non-empty string value under a secret key
+ *   (`isSecretKeyName`, at any depth, through arrays) unless it is already
+ *   `[REDACTED]` or an `op://` reference, the same keep rule as the text rule;
+ *   version 4 scrubbed each value on its own and stored, say,
+ *   `{"password":"plain words"}` as it was. Numbers, booleans and null under a
+ *   secret key are kept, and an object under one is scrubbed by its own keys.
+ *   The segmenter pin now also covers `scrubRecordLine`. Output for input with
+ *   no secret-keyed record value and no over-cap quoted value is
+ *   byte-identical to version 4.
  */
-export const SCRUB_RULESET_VERSION = 4;
+export const SCRUB_RULESET_VERSION = 5;
 
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";
@@ -624,7 +643,6 @@ function longCut(text: string): number {
   }
   return 0;
 }
-// </scrub-segmenter>
 
 /**
  * Scrub a text of any length, whole: segments of at most `MAX_SCRUB_CHARS`
@@ -673,6 +691,16 @@ interface ObjectKeys {
 }
 
 /**
+ * One open container while a record is rewritten: its keys (null for an array) and
+ * whether the value being read sits under a key that names a secret (rule set 5): for an
+ * object, its last key did; an array takes it from the key it is the value of.
+ */
+interface Container {
+  keys: ObjectKeys | null;
+  secret: boolean;
+}
+
+/**
  * Rewrite the string and number tokens of one valid JSON line. The line was
  * already parsed, so tokens can be found without a full grammar: a string runs
  * to its first unescaped quote, a number is a maximal run of number chars.
@@ -681,21 +709,32 @@ interface ObjectKeys {
  * in the same object gets a ` (2)`, ` (3)`… suffix, so two keys that scrub to
  * the same name both stay readable. A key the source itself repeated is kept
  * as the source had it.
+ *
+ * Key context first, as in `scrubJson` (rule set 5): a string value under a key
+ * that names a secret (`isSecretRecordKey`, the decoded source key), directly or
+ * in arrays under it, at any depth, is redacted whole (`redactsSecretKeyedValue`)
+ * before it is scrubbed as a token on its own.
  */
 function scrubRecordLine(line: string): string {
-  // One entry per open container; null for an array.
-  const stack: (ObjectKeys | null)[] = [];
+  // One entry per open container.
+  const stack: Container[] = [];
   let out = "";
   let i = 0;
   while (i < line.length) {
     const ch = line[i]!;
-    const top = stack[stack.length - 1];
+    const container = stack[stack.length - 1];
+    const top = container?.keys;
     if (ch === '"') {
       let j = i + 1;
       while (line[j] !== '"') j += line[j] === "\\" ? 2 : 1;
       const literal = line.slice(i, j + 1);
       const value = JSON.parse(literal) as string;
-      const scrubbed = scrubStringToken(literal, value);
+      const isKey = !!top?.expectKey;
+      const scrubbed =
+        !isKey && container?.secret && redactsSecretKeyedValue(value)
+          ? REDACTED
+          : scrubStringToken(literal, value);
+      if (isKey) container!.secret = isSecretRecordKey(value);
       let name = scrubbed;
       if (top?.expectKey) {
         const repeated = top.source.has(value);
@@ -725,12 +764,15 @@ function scrubRecordLine(line: string): string {
     } else {
       if (ch === "{")
         stack.push({
-          emitted: new Set(),
-          source: new Set(),
-          nextSuffix: new Map(),
-          expectKey: true,
+          keys: {
+            emitted: new Set(),
+            source: new Set(),
+            nextSuffix: new Map(),
+            expectKey: true,
+          },
+          secret: false,
         });
-      else if (ch === "[") stack.push(null);
+      else if (ch === "[") stack.push({ keys: null, secret: container?.secret ?? false });
       else if (ch === "}" || ch === "]") stack.pop();
       else if (ch === "," && top) top.expectKey = true;
       out += ch;
@@ -739,6 +781,7 @@ function scrubRecordLine(line: string): string {
   }
   return out;
 }
+// </scrub-segmenter>
 
 // Ported from relayhistory-cloud #258 (df0eafe): one zstd frame workerd can always write.
 type ZstdCompress = (input: Uint8Array) => Uint8Array;
