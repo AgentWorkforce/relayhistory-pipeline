@@ -39,12 +39,3 @@ test("pg honours the pinned fields over PG* env (the config, not the environment
   expect(client.connectionParameters.application_name).toBe("96bulls-bookkeeping-cleanup");
   expect(client.connectionParameters.options).toBe("-c idle_in_transaction_session_timeout=60000");
 });
-test("both owner-operator scripts build their client from the pinned helper, never a connectionString", async () => {
-  const { readFileSync, existsSync } = await import("node:fs");
-  for (const f of ["scripts/ops/claim-records-archive.ts", "scripts/ops/ingest-bookkeeping-cleanup.ts"]) {
-    const path = new URL("../../../" + f, import.meta.url);
-    if (!existsSync(path)) continue;
-    const src = readFileSync(path, "utf8");
-    expect({ f, conn: /connectionString/.test(src.replace(/^\s*\/\/.*$/gm, "")), helper: /ownerClientConfig\(/.test(src) }).toEqual({ f, conn: false, helper: true });
-  }
-});

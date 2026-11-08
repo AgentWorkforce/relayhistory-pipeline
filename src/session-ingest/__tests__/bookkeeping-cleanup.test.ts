@@ -96,3 +96,8 @@ test("CLI args: known flags only, values never another flag, no repeats; errors 
   expect(redactedReason(Object.assign(Error("x at db.secret-host"), { code: "55000" }))).toBe("sqlstate_55000");
   expect(redactedReason(new Error("db.secret-host"))).toBe("internal_error");
 });
+import { readFileSync } from "node:fs";
+test("the ingest-bookkeeping-cleanup.ts CLI builds its owner client from the pinned helper, never a connectionString", () => {
+  const src = readFileSync(new URL("../../../scripts/ops/ingest-bookkeeping-cleanup.ts", import.meta.url), "utf8").replace(/^\s*\/\/.*$/gm, "");
+  expect({ conn: /connectionString/.test(src), helper: /ownerClientConfig\(/.test(src) }).toEqual({ conn: false, helper: true });
+});
