@@ -79,7 +79,7 @@ jobs:
         run: bunx tsc --noEmit -p tsconfig.json
       - name: Unit tests (stack)
         run: bun test --timeout 30000
-      # The ingest Worker on a database migrated only to the G4 set (through 043800; no 043850-043880).
+      # The ingest Worker on a database migrated only to the G4 set (through 043800; none of the post-G4 migrations, 043850 onward).
       # g4-only-schema.pglite.test.ts already ran above (it pins its own cutoff); these are the existing
       # default-flag ingest suites re-run with the test-only cutoff (src/session-ingest/__tests__/pglite-schema.ts).
       - name: Unit tests (ingest on the G4-only migration set)
