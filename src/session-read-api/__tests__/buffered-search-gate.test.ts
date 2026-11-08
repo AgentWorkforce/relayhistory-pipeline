@@ -2,27 +2,36 @@
  * The per-hit R2 privacy gate for buffered-origin rows (buffered-search-gate.ts):
  * every fail-closed case drops the hit, the positive case keeps it, canonical
  * rows are untouched, and the control head is asked for the hit's OWNER.
- * The G2 parity table (sessions.owner_buffered_parity) and the buffered ledger
- * are stubbed through AdmissionStore; the head producer through a stub binding.
+ * The ledger verdicts (sessions.buffered_search_gate_for, 043860) are stubbed
+ * through GateStore; the head producer through a stub binding. The reader's
+ * SQL behaviour is proven in buffered-search-gate.pglite.test.ts.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ClickHouseError, type ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
+import { logLine } from "../../shared/log.ts";
+import { REPEATABLE_READ_FLAG, repeatableReadEnabled, TENANT_SETTINGS_SQL, tenantBeginSql } from "../liveness.ts";
+import { requestTenantRunner } from "../../../packages/session-read-worker/src/index.ts";
 import {
-  ADMISSIONS_SQL,
   CONTROL_HEAD_PATH,
+  GATE_SQL,
+  GATE_SQL_REASONS,
+  MAX_GATE_HITS,
   MAX_GATE_OWNERS,
-  PARITY_SQL,
   createBufferedSearchGate,
+  droppedTotal,
   parseBufferedSearchGate,
   parseControlHead,
   refKey,
   serviceBindingControlHeads,
-  sqlAdmissionStore,
-  type Admission,
+  sqlGateStore,
   type AdmissionRef,
-  type AdmissionStore,
+  type GateSqlReason,
+  type GateStore,
   type GateRow,
+  type SessionReadControlHead,
   type Owner,
   type ServiceBinding,
 } from "../buffered-search-gate.ts";
@@ -70,27 +79,23 @@ function binding(answer: (owner: Owner, req: Request) => Response | Promise<Resp
   return { b, requests };
 }
 
-const goodAdmission = (userId: string): Admission => ({ claimUserId: userId, admissionEpoch: EPOCH, admissionVersion: "7", versionConsistent: true, deleted: false, resetBehind: false });
+type Verdict = GateSqlReason | "admission_unknown_reason" | null;
 
-function store(over: { admission?: (ref: AdmissionRef) => Admission | undefined; parity?: Set<string>; failAdmissions?: boolean; failParity?: boolean } = {}) {
-  const calls = { admissions: [] as AdmissionRef[][], parity: [] as string[][] };
-  const s: AdmissionStore = {
-    async admissions(org, ws, refs) {
+/** A stub GateStore: per-ref verdict (default visible; undefined = no row), records each call. */
+function store(over: { verdict?: (ref: AdmissionRef, head: SessionReadControlHead) => Verdict | undefined; fail?: boolean } = {}) {
+  const calls: { owner: string; head: SessionReadControlHead; refs: AdmissionRef[] }[] = [];
+  const s: GateStore = {
+    async verdicts(org, ws, owner, h, refs) {
       expect([org, ws]).toEqual([ORG, WS]);
-      calls.admissions.push(refs);
-      if (over.failAdmissions) throw new Error("permission denied");
-      const out = new Map<string, Admission>();
+      calls.push({ owner, head: h, refs });
+      if (over.fail) throw new Error("permission denied for function buffered_search_gate_for");
+      const out = new Map<string, Verdict>();
       for (const ref of refs) {
-        const a = over.admission ? over.admission(ref) : goodAdmission(ref.userId);
-        if (a) out.set(refKey(ref), a);
+        expect(ref.userId).toBe(owner);
+        const v = over.verdict ? over.verdict(ref, h) : null;
+        if (v !== undefined) out.set(refKey(ref), v);
       }
       return out;
-    },
-    async parity(org, ws, userIds) {
-      expect([org, ws]).toEqual([ORG, WS]);
-      calls.parity.push(userIds);
-      if (over.failParity) throw new Error("relation does not exist");
-      return new Set(userIds.filter((u) => (over.parity ?? new Set(userIds)).has(u)));
     },
   };
   return { s, calls };
@@ -161,8 +166,10 @@ describe("the gate: positive case and owner identity", () => {
     expect(req.headers.get("x-relayhistory-org-id")).toBe(ORG);
     expect(req.headers.get("x-relayhistory-workspace-id")).toBe(WS);
     expect(req.headers.get("x-relayhistory-user-id")).toBe("u-2");
-    expect(r.st.calls.admissions[0]).toEqual([{ claimToken: CLAIM, userId: "u-2", source: "codex", sessionId: "s-1" }]);
-    expect(r.st.calls.parity[0]).toEqual(["u-2"]);
+    expect(r.st.calls).toHaveLength(1);
+    expect(r.st.calls[0]!.owner).toBe("u-2");
+    expect(r.st.calls[0]!.head.sourceControlVersion).toBe("7");
+    expect(r.st.calls[0]!.refs).toEqual([{ claimToken: CLAIM, userId: "u-2", source: "codex", sessionId: "s-1" }]);
   });
 
   test("one head per distinct owner per page; each owner is judged on its own head", async () => {
@@ -171,6 +178,8 @@ describe("the gate: positive case and owner identity", () => {
     expect(r.ids).toEqual(["e-1", "e-3"]);
     expect(r.dropped).toEqual({ control_pending: 2 });
     expect(r.bind.requests.map((q) => q.headers.get("x-relayhistory-user-id")).sort()).toEqual(["u-2", "u-3"]);
+    // A pending owner gets no gate call; the other owner gets exactly one, with only its hits.
+    expect(r.st.calls.map((c) => [c.owner, c.refs.length])).toEqual([["u-2", 2]]);
   });
 
   test("no caching across requests: a second page asks again", async () => {
@@ -181,11 +190,20 @@ describe("the gate: positive case and owner identity", () => {
     expect(bind.requests).toHaveLength(2);
   });
 
-  test("a hit cannot borrow another user's admission: the claim must be the owner's", async () => {
-    const st = store({ admission: () => goodAdmission("u-9") });
+  test("a hit cannot borrow another user's admission: no reader row for the claim drops it", async () => {
+    // The reader joins the claim on (pinned org, pinned workspace, owner); another user's claim yields no row.
+    const st = store({ verdict: () => undefined });
     const r = await run([buffered("e-1", "u-2")], { st });
     expect(r.ids).toEqual([]);
-    expect(r.dropped).toEqual({ admission_owner_mismatch: 1 });
+    expect(r.dropped).toEqual({ admission_missing: 1 });
+  });
+
+  test("a verdict for another session than the hit's does not keep the hit", async () => {
+    // Keys bind (claim, owner, source, session): a row for session s-2 never matches a hit on s-1.
+    const st = store();
+    st.s.verdicts = async (_o, _w, owner) => new Map([[refKey({ claimToken: CLAIM, userId: owner, source: "codex", sessionId: "s-2" }), null]]);
+    const r = await run([buffered("e-1", "u-2", CLAIM, "s-1")], { st });
+    expect(r.dropped).toEqual({ admission_missing: 1 });
   });
 });
 
@@ -195,13 +213,12 @@ describe("the gate: canonical rows are untouched", () => {
     expect(r.ids).toEqual(["c-1", "c-2"]);
     expect(r.buffered).toBe(0);
     expect(r.bind.requests).toHaveLength(0);
-    expect(r.st.calls.admissions).toHaveLength(0);
-    expect(r.st.calls.parity).toHaveLength(0);
+    expect(r.st.calls).toHaveLength(0);
   });
 
   test("canonical rows survive every buffered failure, in page order", async () => {
     const bind = binding(() => new Response("nope", { status: 503 }));
-    const r = await run([canonical("c-1"), buffered("e-1"), canonical("c-2")], { bind, st: store({ failAdmissions: true, failParity: true }) });
+    const r = await run([canonical("c-1"), buffered("e-1"), canonical("c-2")], { bind, st: store({ fail: true }) });
     expect(r.ids).toEqual(["c-1", "c-2"]);
     expect(r.buffered).toBe(1);
   });
@@ -223,17 +240,21 @@ describe("the gate: every fail-closed case drops the hit", () => {
     ["a tenant mismatch (reader echoed)", { bind: binding((o) => Response.json(head(o, { tenant: { orgId: ORG, workspaceId: WS, userId: "u-1" } }))) }, "control_head_unavailable"],
     ["no binding configured", { noBinding: true }, "control_head_unavailable"],
     ["pending", { bind: binding((o) => Response.json(head(o, { pending: true }))) }, "control_pending"],
-    ["head epoch differs from the admission epoch", { st: store({ admission: (r) => ({ ...goodAdmission(r.userId), admissionEpoch: OTHER_EPOCH }) }) }, "admission_epoch_mismatch"],
-    ["admission epoch unknown (policy identity mismatch)", { st: store({ admission: (r) => ({ ...goodAdmission(r.userId), admissionEpoch: null }) }) }, "admission_epoch_mismatch"],
-    ["head version differs from the admission version", { bind: binding((o) => Response.json(head(o, { sourceControlVersion: "8" }))) }, "admission_version_mismatch"],
-    ["admission version missing", { st: store({ admission: (r) => ({ ...goodAdmission(r.userId), admissionVersion: null }) }) }, "admission_version_mismatch"],
-    ["ACK decisions disagree with the claim's version", { st: store({ admission: (r) => ({ ...goodAdmission(r.userId), versionConsistent: false }) }) }, "admission_version_mismatch"],
-    ["no admission row for the claim", { st: store({ admission: () => undefined }) }, "admission_missing"],
-    ["the ledger read fails", { st: store({ failAdmissions: true }) }, "admission_unavailable"],
-    ["no G2 parity row", { st: store({ parity: new Set() }) }, "parity_missing"],
-    ["the parity read fails (043700 not applied)", { st: store({ failParity: true }) }, "parity_unavailable"],
-    ["deleted (upload_deletions / frozen source deletions)", { st: store({ admission: (r) => ({ ...goodAdmission(r.userId), deleted: true }) }) }, "deleted"],
-    ["reset since admission (behind upload_resets)", { st: store({ admission: (r) => ({ ...goodAdmission(r.userId), resetBehind: true }) }) }, "reset"],
+    ["no admission row for the claim", { st: store({ verdict: () => undefined }) }, "admission_missing"],
+    ["the gate call fails (043860 not applied, role or pin refusal)", { st: store({ fail: true }) }, "admission_unavailable"],
+    ["an unknown reason from the reader", { st: store({ verdict: () => "admission_unknown_reason" }) }, "admission_unknown_reason"],
+    ...([
+      "admission_epoch_mismatch",
+      "admission_version_mismatch",
+      "admission_session_mismatch",
+      "gate_closed",
+      "parity_missing",
+      "parity_stale",
+      "deleted",
+      "batch_not_buffered",
+      "reset",
+      "superseded",
+    ] as const).map((reason): [string, Parameters<typeof run>[1], string] => [`reader verdict ${reason}`, { st: store({ verdict: () => reason }) }, reason]),
   ];
   test.each(cases)("%s", async (_name, opts, reason) => {
     const r = await run([buffered("e-1")], opts);
@@ -252,9 +273,9 @@ describe("the gate: every fail-closed case drops the hit", () => {
     expect(aborted).toBe(true);
   });
 
-  test("a ledger read slower than the deadline drops the hit", async () => {
+  test("a gate call slower than the deadline drops the hit", async () => {
     const st = store();
-    st.s.admissions = () => new Promise(() => {});
+    st.s.verdicts = () => new Promise(() => {});
     const r = await run([buffered("e-1")], { st, deadlineMs: 50 });
     expect(r.dropped).toEqual({ admission_unavailable: 1 });
   });
@@ -266,13 +287,19 @@ describe("the gate: every fail-closed case drops the hit", () => {
     expect(r.bind.requests).toHaveLength(0);
   });
 
+  test("an empty source or session is dropped before any call and does not poison the owner's other hits", async () => {
+    const r = await run([buffered("e-1", "u-2", CLAIM, ""), { ...buffered("e-2"), source: "" }, buffered("e-3")]);
+    expect(r.ids).toEqual(["e-3"]);
+    expect(r.dropped).toEqual({ claim_token_invalid: 2 });
+  });
+
   test("owner fan-out is bounded: hits of owners past the cap are dropped, never checked", async () => {
     const rows = Array.from({ length: MAX_GATE_OWNERS + 3 }, (_, i) => buffered(`e-${i}`, `u-${i}`));
     const r = await run(rows);
     expect(r.ids).toHaveLength(MAX_GATE_OWNERS);
     expect(r.dropped).toEqual({ owner_fanout: 3 });
     expect(r.bind.requests).toHaveLength(MAX_GATE_OWNERS);
-    expect(r.st.calls.parity[0]).toHaveLength(MAX_GATE_OWNERS);
+    expect(r.st.calls).toHaveLength(MAX_GATE_OWNERS);
   });
 });
 
@@ -306,7 +333,7 @@ describe("the read API with the gate", () => {
       liveness: memoryLiveness({ createdAt: { "codex\u0000s-1": Date.parse("2026-10-01T00:00:00Z") } }).liveness,
       completeSinceMs: 0,
       log: (f) => logs.push(f),
-      ...(gate ? { bufferedSearchGate: createBufferedSearchGate({ controlHeads: serviceBindingControlHeads(bind.b), store: store({ parity: new Set(["u-2"]) }).s }) } : {}),
+      ...(gate ? { bufferedSearchGate: createBufferedSearchGate({ controlHeads: serviceBindingControlHeads(bind.b), store: store({ verdict: (ref) => (ref.userId === "u-2" ? null : "parity_missing") }).s }) } : {}),
     });
     return { get: (p: string) => app.request(p, { headers: { authorization: "Bearer good" } }), logs, bind };
   }
@@ -379,7 +406,13 @@ describe("the read API with the gate", () => {
     expect(queries.find((q) => q.includes("bytes_before"))).toContain("origin, origin_claim_token");
     // The response shape carries no origin field.
     expect(Object.keys(b.events[0])).not.toContain("origin");
-    expect(on.logs.find((l) => l.reason === "buffered_gate")).toMatchObject({ buffered_checked: 2, buffered_dropped: { parity_missing: 1 } });
+    // The per-reason drops stay structured inside the page; the log field is their integer sum.
+    const gateLog = on.logs.find((l) => l.reason === "buffered_gate")!;
+    expect(gateLog).toMatchObject({ buffered_checked: 2, buffered_dropped: 1 });
+    // The REAL producer fields through the real log sanitizer: both counts survive as integers.
+    const emitted = JSON.parse(logLine("info", "request", gateLog));
+    expect([emitted.buffered_checked, emitted.buffered_dropped]).toEqual([2, 1]);
+    expect([Number.isInteger(emitted.buffered_checked), Number.isInteger(emitted.buffered_dropped)]).toEqual([true, true]);
     expect(on.bind.requests.map((q) => q.headers.get("x-relayhistory-user-id")).sort()).toEqual(["u-2", "u-3"]);
   });
 
@@ -395,6 +428,14 @@ describe("the read API with the gate", () => {
 });
 
 describe("configuration and SQL", () => {
+  test("droppedTotal: the per-reason drop counts summed to one non-negative integer", () => {
+    expect(droppedTotal({})).toBe(0);
+    expect(droppedTotal({ parity_missing: 1 })).toBe(1);
+    expect(droppedTotal({ parity_missing: 2, origin_unknown: 3, owner_fanout: 4 })).toBe(9);
+    // Never anything but integer counts: a hostile value cannot reach the log through the sum.
+    expect(droppedTotal({ parity_missing: 2, origin_unknown: -5, owner_fanout: 1.5, control_pending: Number.NaN } as never)).toBe(2);
+  });
+
   test("READ_API_BUFFERED_SEARCH_GATE: only 'on' enables", () => {
     expect(parseBufferedSearchGate(undefined)).toBe(false);
     expect(parseBufferedSearchGate("")).toBe(false);
@@ -416,39 +457,139 @@ describe("configuration and SQL", () => {
     expect(buildCandidateQuery("db", input, "legacy").query).not.toContain("origin");
   });
 
-  test("the SQL store binds the verified tenant and the hit's owner, and maps the ledger row", async () => {
+  const owner = { orgId: ORG, workspaceId: WS, userId: "u-2" };
+  const parsed = (over: Record<string, unknown> = {}) => parseControlHead(head(owner, over), owner)!;
+  function recordingRunner(answer: (params: unknown[]) => unknown[] = () => []) {
     const seen: { orgId: string; ws: string; text: string; params: unknown[] }[] = [];
     const runner: TenantRunner = async (orgId, ws, work) => work({
       async query<R>(text: string, params?: unknown[]) {
         seen.push({ orgId, ws, text, params: params ?? [] });
-        if (text === PARITY_SQL) return { rows: [{ user_id: "u-2" }] as R[] };
-        return { rows: [{ claim_token: CLAIM, user_id: "u-2", source: "codex", session_id: "s-1", claim_user_id: "u-2", admission_epoch: EPOCH, admission_version: "7", version_consistent: true, deleted: false, reset_behind: false }] as R[] };
+        return { rows: answer(params ?? []) as R[] };
       },
     });
-    const s = sqlAdmissionStore(runner);
-    const ref = { claimToken: CLAIM, userId: "u-2", source: "codex", sessionId: "s-1" };
-    const got = await s.admissions(ORG, WS, [ref]);
-    expect(got.get(refKey(ref))).toEqual(goodAdmission("u-2"));
-    expect(await s.parity(ORG, WS, ["u-2", "u-3"])).toEqual(new Set(["u-2"]));
-    expect(seen[0]).toMatchObject({ orgId: ORG, ws: WS, text: ADMISSIONS_SQL });
-    expect(seen[0]!.params.slice(0, 2)).toEqual([ORG, WS]);
-    expect(JSON.parse(seen[0]!.params[2] as string)).toEqual([{ claim_token: CLAIM, user_id: "u-2", source: "codex", session_id: "s-1" }]);
-    expect(seen[1]!.params).toEqual([ORG, WS, ["u-2", "u-3"]]);
-    // The claim join is bound to the owner, and every blocker defaults closed.
-    expect(ADMISSIONS_SQL).toContain("a.user_id = refs.user_id");
-    expect(ADMISSIONS_SQL).toContain("a.reset_epoch IS NULL OR");
-    expect(ADMISSIONS_SQL).toContain("lp.source_identity_sha256 = a.source_identity_sha256");
-    expect(ADMISSIONS_SQL).toContain("ingest_frozen_source_deletions");
+    return { runner, seen };
+  }
+  const ref = { claimToken: CLAIM, userId: "u-2", source: "codex", sessionId: "s-1" };
+
+  test("the SQL store makes one reader call for the owner, with the full head tuple, and maps the verdicts", async () => {
+    const { runner, seen } = recordingRunner(() => [
+      { claim_token: CLAIM, source: "codex", session_id: "s-1", drop_reason: null },
+      { claim_token: CLAIM_2, source: "codex", session_id: "s-1", drop_reason: "parity_stale" },
+      { claim_token: CLAIM, source: "codex", session_id: "s-3", drop_reason: "something_new" },
+    ]);
+    const got = await sqlGateStore(runner).verdicts(ORG, WS, "u-2", parsed(), [ref, { ...ref, claimToken: CLAIM_2 }, { ...ref, sessionId: "s-3" }]);
+    expect(got.get(refKey(ref))).toBeNull();
+    expect(got.get(refKey({ ...ref, claimToken: CLAIM_2 }))).toBe("parity_stale");
+    expect(got.get(refKey({ ...ref, sessionId: "s-3" }))).toBe("admission_unknown_reason");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ orgId: ORG, ws: WS, text: GATE_SQL });
+    expect(seen[0]!.params.slice(0, 10)).toEqual([ORG, WS, "u-2", EPOCH, EPOCH, "7", DIGEST, "selection", false, BASELINE]);
+    expect(JSON.parse(seen[0]!.params[10] as string)).toEqual([
+      { claim_token: CLAIM, source: "codex", session_id: "s-1" },
+      { claim_token: CLAIM_2, source: "codex", session_id: "s-1" },
+      { claim_token: CLAIM, source: "codex", session_id: "s-3" },
+    ]);
   });
 
-  test("a NULL blocker from SQL reads as blocked", async () => {
-    const runner: TenantRunner = async (_o, _w, work) => work({
-      async query<R>() {
-        return { rows: [{ claim_token: CLAIM, user_id: "u-2", source: "codex", session_id: "s-1", claim_user_id: "u-2", admission_epoch: EPOCH, admission_version: "7", version_consistent: null, deleted: null, reset_behind: null }] as R[] };
+  test("a no-head control head is passed in 043700's encoding (four NULLs, not pending)", async () => {
+    const { runner, seen } = recordingRunner();
+    await sqlGateStore(runner).verdicts(ORG, WS, "u-2", parsed({ sourceControlVersion: "0", sourceControlEpoch: null, sourceControlDigest: null, sourceControlKind: null }), [ref]);
+    expect(seen[0]!.params.slice(3, 10)).toEqual([EPOCH, null, null, null, null, false, BASELINE]);
+  });
+
+  test("more hits than the reader's cap are split into calls of at most MAX_GATE_HITS in one transaction", async () => {
+    const { runner, seen } = recordingRunner();
+    const refs = Array.from({ length: MAX_GATE_HITS + 1 }, (_, i) => ({ ...ref, sessionId: `s-${i}` }));
+    await sqlGateStore(runner).verdicts(ORG, WS, "u-2", parsed(), refs);
+    expect(seen.map((q) => (JSON.parse(q.params[10] as string) as unknown[]).length)).toEqual([MAX_GATE_HITS, 1]);
+    expect(MAX_GATE_HITS).toBe(500);
+  });
+
+  test("the gate's only SQL is a SELECT from sessions.buffered_search_gate_for(: no direct ledger-table read", async () => {
+    const { runner, seen } = recordingRunner();
+    const st = sqlGateStore(runner);
+    const gate = createBufferedSearchGate({ controlHeads: serviceBindingControlHeads(binding().b), store: st });
+    await gate.filter(ORG, WS, [buffered("e-1", "u-2"), buffered("e-2", "u-3", CLAIM_2), canonical("c-1")]);
+    await st.verdicts(ORG, WS, "u-2", parsed({ sourceControlVersion: "0", sourceControlEpoch: null, sourceControlDigest: null, sourceControlKind: null }), [ref]);
+    expect(seen.length).toBe(3);
+    for (const q of seen) {
+      const sql = q.text.trim();
+      expect(sql.startsWith("SELECT")).toBe(true);
+      expect(sql).toMatch(/\bFROM sessions\.buffered_search_gate_for\(/u);
+      expect(sql.match(/\bFROM\b/giu)).toHaveLength(1);
+      expect(sql).not.toMatch(/ingest_claim_attempts|ingest_lazy|owner_buffered_parity|upload_deletions|upload_resets|ingest_frozen_source_deletions|;/u);
+    }
+    // The module's source names no other SQL statement.
+    const source = await Bun.file(new URL("../buffered-search-gate.ts", import.meta.url)).text();
+    expect(source.match(/\bq\.query</gu)).toHaveLength(1);
+    expect(source).not.toMatch(/FROM sessions\.(?!buffered_search_gate_for\()/u);
+  });
+
+  test("an empty ref list makes no call", async () => {
+    const { runner, seen } = recordingRunner();
+    expect((await sqlGateStore(runner).verdicts(ORG, WS, "u-2", parsed(), [])).size).toBe(0);
+    expect(seen).toHaveLength(0);
+  });
+});
+
+test("GATE_SQL_REASONS is exactly the set of drop reasons 043860 can return", () => {
+  const sql = readFileSync(join(import.meta.dir, "../../../supabase/migrations/20261105043860_buffered_search_gate.sql"), "utf8");
+  const body = sql.slice(sql.indexOf("AS $gate$"), sql.lastIndexOf("$gate$;"));
+  const returned = new Set([
+    ...[...body.matchAll(/THEN '([a-z_]+)'/g)].map((m) => m[1]),
+    ...[...body.matchAll(/v_gate := '([a-z_]+)'/g)].map((m) => m[1]),
+  ]);
+  expect([...returned].sort()).toEqual([...GATE_SQL_REASONS].sort());
+});
+
+describe("READ_API_REPEATABLE_READ (Worker tenant transaction isolation, default off)", () => {
+  test("only exactly \"1\" (trimmed) enables; unset, \"0\" and anything else stay off", () => {
+    expect(REPEATABLE_READ_FLAG).toBe("READ_API_REPEATABLE_READ");
+    for (const off of [undefined, "", "0", " 0 ", "true", "on", "yes", "2", "01"]) expect(repeatableReadEnabled(off)).toBe(false);
+    for (const on of ["1", " 1 ", "1\n"]) expect(repeatableReadEnabled(on)).toBe(true);
+    expect(tenantBeginSql(false)).toBe("BEGIN READ ONLY");
+    expect(tenantBeginSql(true)).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  });
+
+  // A fake pg client recording every statement the Worker's runner sends.
+  const fakeClient = (log: string[], failOn?: string) =>
+    ({
+      async query(text: string) {
+        log.push(text);
+        if (failOn && text === failOn) throw new Error("boom");
+        return { rows: [{ n: 1 }] };
       },
+      async end() {},
+    }) as never;
+
+  const runTwoChunks = async (options?: { repeatableRead?: boolean }) => {
+    const log: string[] = [];
+    const runner = options === undefined ? requestTenantRunner(async () => fakeClient(log)) : requestTenantRunner(async () => fakeClient(log), options);
+    const rows = await runner.run("org-1", "ws-1", async (q) => {
+      await q.query("SELECT 'chunk-1'");
+      return (await q.query<{ n: number }>("SELECT 'chunk-2'")).rows;
     });
-    const ref = { claimToken: CLAIM, userId: "u-2", source: "codex", sessionId: "s-1" };
-    const a = (await sqlAdmissionStore(runner).admissions(ORG, WS, [ref])).get(refKey(ref))!;
-    expect(a).toMatchObject({ versionConsistent: false, deleted: true, resetBehind: true });
+    await runner.close();
+    return { log, rows };
+  };
+
+  test("off (no option, or repeatableRead false): BEGIN READ ONLY, the pre-flag behaviour", async () => {
+    for (const options of [undefined, {}, { repeatableRead: false }]) {
+      const { log, rows } = await runTwoChunks(options);
+      expect(rows).toEqual([{ n: 1 }]);
+      expect(log).toEqual(["BEGIN READ ONLY", TENANT_SETTINGS_SQL, "SELECT 'chunk-1'", "SELECT 'chunk-2'", "COMMIT"]);
+    }
+  });
+
+  test("on: one REPEATABLE READ READ ONLY transaction holds every statement of the work", async () => {
+    const { log } = await runTwoChunks({ repeatableRead: true });
+    expect(log).toEqual(["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", TENANT_SETTINGS_SQL, "SELECT 'chunk-1'", "SELECT 'chunk-2'", "COMMIT"]);
+  });
+
+  test("on: an error in the work rolls back and rejects (the gate then drops that owner's hits)", async () => {
+    const log: string[] = [];
+    const runner = requestTenantRunner(async () => fakeClient(log, "SELECT 'chunk-2'"), { repeatableRead: true });
+    await expect(runner.run("org-1", "ws-1", async (q) => { await q.query("SELECT 'chunk-1'"); await q.query("SELECT 'chunk-2'"); })).rejects.toThrow("boom");
+    expect(log).toEqual(["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", TENANT_SETTINGS_SQL, "SELECT 'chunk-1'", "SELECT 'chunk-2'", "ROLLBACK"]);
   });
 });

@@ -8,7 +8,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { ClickHouseError } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
-import { createBufferedSearchGate, type AdmissionStore, type ControlHeads } from "../buffered-search-gate.ts";
+import { createBufferedSearchGate, type GateStore, type ControlHeads } from "../buffered-search-gate.ts";
 import { decodeCursor } from "../cursor.ts";
 import { readEventPage, type PageDeps } from "../page.ts";
 import type { EventQuery } from "../queries.ts";
@@ -77,7 +77,7 @@ suite("origin marker on ClickHouse", () => {
 
   test("gate wired: buffered rows reach the gate, which judges each one", async () => {
     const heads: ControlHeads = async () => null; // every head unavailable
-    const store: AdmissionStore = { admissions: async () => new Map(), parity: async () => new Set() };
+    const store: GateStore = { verdicts: async () => new Map() };
     const deps: PageDeps = { ch, liveness: liveness(), bufferedGate: createBufferedSearchGate({ controlHeads: heads, store }) };
     const page = await readEventPage(deps, q());
     expect(page.events.map((e) => e.eventId).sort()).toEqual(["c-1", "p-1"]);

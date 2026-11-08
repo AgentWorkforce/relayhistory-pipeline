@@ -82,8 +82,9 @@ The new profile needs schema-owner review before any real installation:
   identity/canonical/deletion and directory identity/epoch/readiness columns
   referenced by the state query. Reader state and index calls use
   `TenantRunner`; the derived index has the same forced `tenant_only` RLS, so
-  the reader login must be NOSUPERUSER NOBYPASSRLS (the self-host read service
-  refuses to start otherwise).
+  the reader login must be a real login as exactly `bulls96_read_api`, in the
+  bootstrap's shape (the read service and a Postgres-bound Lambda refuse to
+  start otherwise; see `lambda.ts` `assertReaderRole`).
 - Existing legacy role grants do not establish these privileges. A missing
   privilege fails; this code never broadens a live role to work around it.
 
