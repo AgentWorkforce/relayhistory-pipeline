@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, test } from "vitest";
-import { CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, renderDeployConfig, RenderError } from "./render-deploy-config.ts";
+import { ALL_WORKSPACES, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, renderDeployConfig, RenderError } from "./render-deploy-config.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const TEMPLATE = readFileSync(here("../wrangler.jsonc"), "utf8");
@@ -71,8 +71,8 @@ describe("deploy config render, owner_buffered=on", () => {
   test("refuses: no canary workspace, *, malformed or duplicate ids, ids off the directory list, missing bucket or region", () => {
     const refused: Array<[Partial<typeof ON>, RegExp]> = [
       [{ ownerBufferedWorkspaces: "" }, /at least one canary/],
-      [{ ownerBufferedWorkspaces: "*" }, /not allowed/],
-      [{ ownerBufferedWorkspaces: "ws-canary-1,*" }, /not allowed/],
+      [{ ownerBufferedWorkspaces: "*" }, /exactly "\*"/],
+      [{ ownerBufferedWorkspaces: "ws-canary-1,*" }, /cannot be mixed/],
       [{ ownerBufferedWorkspaces: "ws-canary-1,,ws-canary-2" }, /workspace ids/],
       [{ ownerBufferedWorkspaces: "ws canary" }, /workspace ids/],
       [{ ownerBufferedWorkspaces: "ws-canary-1,ws-canary-1" }, /twice/],
@@ -90,6 +90,51 @@ describe("deploy config render, owner_buffered=on", () => {
     expect(() => renderDeployConfig(bound, ON)).toThrow(/must not declare services/);
     const flagged = TEMPLATE.replace('"CLICKHOUSE_DATABASE"', '"RELAYHISTORY_READ_OWNER_BUFFERED": "true",\n    "CLICKHOUSE_DATABASE"');
     expect(() => renderDeployConfig(flagged, ON)).toThrow(/leave RELAYHISTORY_READ_OWNER_BUFFERED unset/);
+  });
+});
+
+describe("deploy config render, all-workspaces mode (owner_buffered_workspaces=*)", () => {
+  const ALL = { ...ON, ownerBufferedWorkspaces: "*", directoryWorkspaces: "*" };
+
+  test('"*" with a directory allowlist of "*" renders READ_API_OWNER_BUFFERED_WORKSPACES="*"; everything else as a canary on-render', () => {
+    expect(ALL_WORKSPACES).toBe("*");
+    for (const over of [{}, { ownerBufferedWorkspaces: " * ", directoryWorkspaces: " * " }]) {
+      const config = parse(renderDeployConfig(TEMPLATE, { ...ALL, ...over }));
+      expect(config.vars.READ_API_OWNER_BUFFERED_WORKSPACES).toBe("*");
+      expect(config.vars.RELAYHISTORY_READ_OWNER_BUFFERED).toBe("true");
+      expect(config.services).toEqual([{ ...CONTROL_HEAD_BINDING }]);
+      const canary = parse(renderDeployConfig(TEMPLATE, { ...ON, directoryWorkspaces: "*" }));
+      expect({ ...config.vars, READ_API_OWNER_BUFFERED_WORKSPACES: "x" }).toEqual({ ...canary.vars, READ_API_OWNER_BUFFERED_WORKSPACES: "x" });
+      expect({ ...config, vars: undefined }).toEqual({ ...canary, vars: undefined });
+    }
+  });
+
+  test("ambiguous all-workspaces configs are refused with a clear error", () => {
+    const refused: Array<[Partial<typeof ON>, RegExp]> = [
+      // "*" without the directory allowlist being "*" (explicit list, unset, or a list containing "*").
+      [{ directoryWorkspaces: "ws-canary-1,ws-canary-2" }, /needs SESSION_READ_DIRECTORY_WORKSPACES to be exactly "\*"/],
+      [{ directoryWorkspaces: "" }, /needs SESSION_READ_DIRECTORY_WORKSPACES to be exactly "\*"/],
+      [{ directoryWorkspaces: undefined }, /needs SESSION_READ_DIRECTORY_WORKSPACES to be exactly "\*"/],
+      [{ directoryWorkspaces: "*,ws-canary-1" }, /needs SESSION_READ_DIRECTORY_WORKSPACES to be exactly "\*"/],
+      // "*" mixed with ids, or repeated, even when the directory allowlist is "*".
+      [{ ownerBufferedWorkspaces: "*,ws-canary-1" }, /cannot be mixed/],
+      [{ ownerBufferedWorkspaces: "ws-canary-1, *" }, /cannot be mixed/],
+      [{ ownerBufferedWorkspaces: "*,*" }, /cannot be mixed/],
+      // The mode does not relax the S3 requirements.
+      [{ s3Bucket: "" }, /SESSION_READ_INGEST_S3_BUCKET/],
+      [{ s3Region: "" }, /SESSION_READ_INGEST_S3_REGION/],
+    ];
+    for (const [over, message] of refused) expect(() => renderDeployConfig(TEMPLATE, { ...ALL, ...over }), JSON.stringify(over)).toThrow(message);
+    // "*" with owner_buffered off (or no mode) is the existing ambiguous-dispatch refusal.
+    for (const ownerBuffered of [undefined, "", "off"]) {
+      expect(() => renderDeployConfig(TEMPLATE, { ...ALL, ownerBuffered })).toThrow(/owner_buffered is off/);
+    }
+  });
+
+  test("an explicit canary list still validates exactly as before with a directory allowlist of * or a list", () => {
+    expect(parse(renderDeployConfig(TEMPLATE, ON)).vars.READ_API_OWNER_BUFFERED_WORKSPACES).toBe("ws-canary-1,ws-canary-2");
+    expect(parse(renderDeployConfig(TEMPLATE, { ...ON, directoryWorkspaces: "*" })).vars.READ_API_OWNER_BUFFERED_WORKSPACES).toBe("ws-canary-1,ws-canary-2");
+    expect(() => renderDeployConfig(TEMPLATE, { ...ON, directoryWorkspaces: "ws-canary-1" })).toThrow(/not on SESSION_READ_DIRECTORY_WORKSPACES/);
   });
 });
 

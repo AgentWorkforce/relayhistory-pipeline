@@ -11,7 +11,7 @@ import type pg from "pg";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createClickHouseClient, type ClickHouseClient } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { row } from "../../../src/session-read-api/__tests__/support.ts";
-import { boundedClickHouse, connectPg, handle, type Env } from "../src/index.ts";
+import { boundedClickHouse, connectPg, handle, ownerBufferedDeps, type Env } from "../src/index.ts";
 
 type TestEnv = Env & {
   TEST_PG_ADMIN: Hyperdrive;
@@ -179,6 +179,38 @@ describe("entry and configuration", () => {
     const bound = await call(`/v1/events?workspace=${t.ws}&q=x`, { ...on, HISTORY_CONTROL_HEAD: binding });
     expect(bound.status).not.toBe(503);
     expect(calls).toHaveLength(0);
+  });
+
+  test("all-workspaces mode (READ_API_OWNER_BUFFERED_WORKSPACES=*): parsed as *, still needs the flag, keys and binding; default stays none", () => {
+    const run = (async () => {
+      throw new Error("no database in this test");
+    }) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: "*" } as Env, run)?.workspaces).toBe("*");
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: " * " } as Env, run)?.workspaces).toBe("*");
+    // Unset (the default deploy) is none, never all; "*" mixed with ids is a literal id no workspace has.
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: undefined } as Env, run)?.workspaces).toEqual(new Set());
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: "ws-a,*" } as Env, run)?.workspaces).toEqual(new Set(["ws-a", "*"]));
+    // "*" alone does not turn the feature on: flag off or S3 keys missing is still undefined.
+    for (const over of [{ RELAYHISTORY_READ_OWNER_BUFFERED: undefined }, { RELAYHISTORY_READ_OWNER_BUFFERED: "false" }, { INGEST_S3_BUCKET: "" }, { PIPELINE_RAW_S3_ACCESS_KEY_ID: undefined }]) {
+      expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: "*", ...over } as Env, run), JSON.stringify(over)).toBeUndefined();
+    }
+  });
+
+  test("all-workspaces mode without the HISTORY_CONTROL_HEAD binding is the same 503; bound, it is not refused", async () => {
+    const t = tenant();
+    const call = async (over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions?workspace=${t.ws}`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const all = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "*", READ_API_DIRECTORY_WORKSPACES: "*", INGEST_S3_BUCKET: "ingest-bucket-example" };
+    const unbound = await call(all);
+    expect(unbound.status).toBe(503);
+    expect((await body(unbound)).error.code).toBe("backend_unavailable");
+    const binding = { fetch: async () => new Response("{}", { status: 503 }) } as unknown as Fetcher;
+    expect((await call({ ...all, HISTORY_CONTROL_HEAD: binding })).status).not.toBe(503);
   });
 
   test("Supabase or ClickHouse down is a 503 the caller falls back from, never a page without erasure checks", async () => {

@@ -11,8 +11,16 @@
  *     (relayhistory-cloud's named entrypoint, control-head contract v5; pinned here, never an
  *     input, so no dispatch can point the privacy authority at another Worker);
  *   - vars: RELAYHISTORY_READ_OWNER_BUFFERED=true, READ_API_OWNER_BUFFERED_WORKSPACES (the
- *     canary allowlist, explicit ids only, each also on READ_API_DIRECTORY_WORKSPACES),
- *     INGEST_S3_BUCKET and INGEST_S3_REGION (from GitHub environment variables).
+ *     canary allowlist: explicit ids, each also on READ_API_DIRECTORY_WORKSPACES, or the
+ *     all-workspaces mode below), INGEST_S3_BUCKET and INGEST_S3_REGION (from GitHub
+ *     environment variables).
+ *
+ * All-workspaces mode: owner_buffered_workspaces is exactly "*" and SESSION_READ_DIRECTORY_WORKSPACES
+ * is itself exactly "*"; renders READ_API_OWNER_BUFFERED_WORKSPACES="*". Refused: "*" mixed with
+ * ids, "*" while the directory allowlist is an explicit list (or unset), "*" with owner_buffered
+ * off. The mode only widens the workspace allowlist; every buffered response still passes the
+ * per-user privacy gate (the caller's own G2 parity row, rule 4, in
+ * sessions.owner_buffered_read_scope, and the control-head authority gate).
  * The S3 credentials are the Worker's existing PIPELINE_RAW_S3_ACCESS_KEY_ID /
  * _SECRET_ACCESS_KEY secrets (wrangler secret put); the workflow checks they exist by name.
  *
@@ -60,10 +68,13 @@ const WORKSPACE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const BUCKET = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
 const REGION = /^[a-z]{2}(-[a-z]+)+-\d$/;
 
+/** The all-workspaces value of owner_buffered_workspaces (valid only with a directory allowlist of "*"). */
+export const ALL_WORKSPACES = "*";
+
 /** A canary list: comma-separated explicit workspace ids, no "*", no blanks, no duplicates. */
 export function parseCanaryWorkspaces(raw: string): string[] {
   const ids = raw.split(",").map((v) => v.trim());
-  if (ids.some((id) => id === "*")) throw new RenderError('owner_buffered_workspaces must list workspace ids; "*" is not allowed for the canary');
+  if (ids.some((id) => id === "*")) throw new RenderError('owner_buffered_workspaces lists workspace ids or is exactly "*" (all-workspaces mode); "*" cannot be mixed with ids');
   if (ids.some((id) => !WORKSPACE_ID.test(id))) throw new RenderError("owner_buffered_workspaces must be comma-separated workspace ids (letters, digits, _ . : -)");
   if (new Set(ids).size !== ids.length) throw new RenderError("owner_buffered_workspaces lists a workspace twice");
   return ids;
@@ -88,10 +99,12 @@ export function renderDeployConfig(template: string, inputs: RenderInputs): stri
   }
   if (mode !== "on") throw new RenderError('owner_buffered must be "off" or "on"');
 
-  if (!workspacesRaw) throw new RenderError("owner_buffered=on needs owner_buffered_workspaces (at least one canary workspace id)");
-  const workspaces = parseCanaryWorkspaces(workspacesRaw);
+  if (!workspacesRaw) throw new RenderError('owner_buffered=on needs owner_buffered_workspaces (at least one canary workspace id, or exactly "*" for all workspaces)');
   const directory = (inputs.directoryWorkspaces ?? "").trim();
-  if (directory !== "*") {
+  const all = workspacesRaw === ALL_WORKSPACES;
+  if (all && directory !== ALL_WORKSPACES) throw new RenderError('owner_buffered_workspaces="*" (all-workspaces mode) needs SESSION_READ_DIRECTORY_WORKSPACES to be exactly "*"; with an explicit directory list, list the canary ids instead');
+  const workspaces = all ? [ALL_WORKSPACES] : parseCanaryWorkspaces(workspacesRaw);
+  if (!all && directory !== ALL_WORKSPACES) {
     const listed = new Set(directory.split(",").map((v) => v.trim()).filter(Boolean));
     const missing = workspaces.filter((id) => !listed.has(id));
     if (missing.length) throw new RenderError(`${missing.length} owner_buffered_workspaces id(s) are not on SESSION_READ_DIRECTORY_WORKSPACES; owner-buffered is served only where both allow`);
@@ -136,7 +149,8 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     });
     writeFileSync(here("../wrangler.deploy.jsonc"), out);
     const on = ((process.env.OWNER_BUFFERED ?? "").trim() || "off") === "on";
-    console.log(on ? `deploy config: owner-buffered ON, ${CONTROL_HEAD_BINDING.binding} -> ${CONTROL_HEAD_BINDING.service}#${CONTROL_HEAD_BINDING.entrypoint}` : "deploy config: owner-buffered off (Hyperdrive id only)");
+    const all = (process.env.OWNER_BUFFERED_WORKSPACES ?? "").trim() === ALL_WORKSPACES;
+    console.log(on ? `deploy config: owner-buffered ON (${all ? "all workspaces" : "canary list"}), ${CONTROL_HEAD_BINDING.binding} -> ${CONTROL_HEAD_BINDING.service}#${CONTROL_HEAD_BINDING.entrypoint}` : "deploy config: owner-buffered off (Hyperdrive id only)");
   } catch (error) {
     console.error(`::error::${error instanceof RenderError ? error.message : "render failed"}`);
     process.exit(1);
