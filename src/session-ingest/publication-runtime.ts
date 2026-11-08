@@ -9,29 +9,35 @@ import{awsJsonCall}from'../session-pipeline/aws-json.ts';
 import{createS3Eraser,type PreservedVersionEraser}from'../migration/neon-s3-erasure/eraser.ts';
 import{SemanticPostgresExecutor}from'../search-features/semantic-copy-postgres.ts';
 import{gcPoolConfig,bufferedKeyAllowed}from'./buffered-gc-job.ts';
+import{deployTargetValue,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,EC2_INSTANCE_ID}from'../shared/deploy-target.ts';
 import{publicationRpc}from'./publication-rpc.ts';
 import{canonicalPublicationTick}from'./publication-job.ts';
 import{publicationGcLedger,collectPublicationObject}from'./publication-gc.ts';
 import type{PublicationTarget}from'./publication-protocol.ts';
 import type{AwsCredentials}from'../../packages/object-store/src/sigv4.ts';
 const no=(code:string):never=>{throw Object.assign(Error('publication_'+code),{code:'publication_'+code});};
-export interface PublicationRuntimeConfig{bucket:string;region:'us-east-1';keyRoot:'96bulls';generation:string;secretArn:string;kmsKeyArn:string;instanceProfileArn:string;roleName:string;budgetMs:number;candidateLimit:number;gcLimit:number}
+export interface PublicationRuntimeConfig{bucket:string;region:'us-east-1';accountId:string;supabaseProjectRef:string;instanceId:string;keyRoot:'96bulls';generation:string;secretArn:string;kmsKeyArn:string;instanceProfileArn:string;roleName:string;budgetMs:number;candidateLimit:number;gcLimit:number}
 export function publicationRuntimeConfig(env:NodeJS.ProcessEnv):PublicationRuntimeConfig{
  const need=(k:string)=>{if(!env[k])no('config_required');return env[k]!};
  if(env.AWS_REGION!=='us-east-1'||env.HOOPDB_DB_MODE!=='supabase')no('target_required');
  const bucket=need('INGEST_PUBLISH_BUCKET'),generation=need('INGEST_PUBLISH_EXPECT_GENERATION'),secretArn=need('INGEST_PUBLISH_SECRET_ARN'),kmsKeyArn=need('INGEST_PUBLISH_KMS_KEY_ARN'),instanceProfileArn=need('INGEST_PUBLISH_INSTANCE_PROFILE_ARN'),roleName=need('INGEST_PUBLISH_ROLE_NAME');
+ // Deployment identity is explicit operator configuration with no default target.
+ const target=(name:string,pattern:RegExp)=>deployTargetValue(env,name,pattern,reason=>no(reason==='required'?'config_required':'target_invalid'));
+ const accountId=target('INGEST_PUBLISH_AWS_ACCOUNT_ID',AWS_ACCOUNT_ID),supabaseProjectRef=target('INGEST_PUBLISH_SUPABASE_PROJECT_REF',SUPABASE_PROJECT_REF),instanceId=target('INGEST_PUBLISH_INSTANCE_ID',EC2_INSTANCE_ID);
  if(!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)||!/^[a-f0-9]{64}$/.test(generation)||
-  !/^arn:aws:secretsmanager:us-east-1:941433935742:secret:96bulls\/[A-Za-z0-9_./-]+\/(?:canonical-publisher|buffered-gc)-[A-Za-z0-9]{6}$/.test(secretArn)||
-  !/^arn:aws:kms:us-east-1:941433935742:key\/[a-f0-9-]{36}$/.test(kmsKeyArn)||
-  !/^arn:aws:iam::941433935742:instance-profile\/[A-Za-z0-9_+=,.@/-]{1,512}$/.test(instanceProfileArn)||!/^[A-Za-z0-9_+=,.@-]{1,64}$/.test(roleName))no('target_invalid');
+  !new RegExp(`^arn:aws:secretsmanager:us-east-1:${accountId}:secret:96bulls/[A-Za-z0-9_./-]+/(?:canonical-publisher|buffered-gc)-[A-Za-z0-9]{6}$`).test(secretArn)||
+  !new RegExp(`^arn:aws:kms:us-east-1:${accountId}:key/[a-f0-9-]{36}$`).test(kmsKeyArn)||
+  !new RegExp(`^arn:aws:iam::${accountId}:instance-profile/[A-Za-z0-9_+=,.@/-]{1,512}$`).test(instanceProfileArn)||!/^[A-Za-z0-9_+=,.@-]{1,64}$/.test(roleName))no('target_invalid');
  const budgetMs=Number(env.INGEST_PUBLISH_BUDGET_MS??'1200000'),candidateLimit=Number(env.INGEST_PUBLISH_BATCH_LIMIT??'1'),gcLimit=Number(env.INGEST_PUBLICATION_GC_LIMIT??'20');
  if(!Number.isSafeInteger(budgetMs)||budgetMs<5000||budgetMs>3600000||!Number.isInteger(candidateLimit)||candidateLimit<1||candidateLimit>20||!Number.isInteger(gcLimit)||gcLimit<1||gcLimit>100)no('budget_invalid');
- return{bucket,region:'us-east-1',keyRoot:'96bulls',generation,secretArn,kmsKeyArn,instanceProfileArn,roleName,budgetMs,candidateLimit,gcLimit};
+ return{bucket,region:'us-east-1',accountId,supabaseProjectRef,instanceId,keyRoot:'96bulls',generation,secretArn,kmsKeyArn,instanceProfileArn,roleName,budgetMs,candidateLimit,gcLimit};
 }
 export function publicationEnabled(env:NodeJS.ProcessEnv,mode:'publish'|'gc'):boolean{
  const v=env[mode==='publish'?'INGEST_PUBLISH_ENABLED':'INGEST_PUBLICATION_GC_ENABLED']??'false';if(v!=='true'&&v!=='false')no('enabled_invalid');return v==='true';
 }
 function generationKey(key:string):boolean{const loc=parseSessionKey(key),g=loc&&parseUploadGenerationPrefix(loc.prefix??'');return!!g&&/^96bulls\/[A-Za-z0-9._-]{1,128}$/.test(g.base);}
+/** The generation-qualified PUT/erase scope, shared with publication-portable.ts. */
+export const publicationGenerationKey=generationKey;
 function readKey(key:string):boolean{if(bufferedKeyAllowed(key))return true;const loc=parseSessionKey(key);return!!loc&&!!loc.prefix&&(/^96bulls\/[A-Za-z0-9._-]{1,128}$/.test(loc.prefix)||generationKey(key));}
 export function scopedPublicationStore(raw:ObjectStore):ObjectStore{
  return new Proxy(raw,{get(t,k){
@@ -56,12 +62,12 @@ export async function runCanonicalPublicationRuntime(env:NodeJS.ProcessEnv,mode:
  let pool:pg.Pool|undefined;
  try{
   const fetcher=(async(input:Parameters<typeof fetch>[0],init?:RequestInit)=>{signal.throwIfAborted();return(overrides.fetcher??fetch)(input,{...init,signal:AbortSignal.any([signal,AbortSignal.timeout(30000),...(init?.signal?[init.signal]:[])])});})as typeof fetch;
-  const managed=imdsCredentials({instanceId:'i-070f91abb67aa60de',accountId:'941433935742',region:'us-east-1',instanceProfileArn:config.instanceProfileArn,roleName:config.roleName},overrides.fetcher?{fetcher:overrides.fetcher}:{});
+  const managed=imdsCredentials({instanceId:config.instanceId,accountId:config.accountId,region:'us-east-1',instanceProfileArn:config.instanceProfileArn,roleName:config.roleName},overrides.fetcher?{fetcher:overrides.fetcher}:{});
   const credentials=()=>overrides.credentials?overrides.credentials(signal):managed(signal);
   const secret=overrides.secret?await overrides.secret(config,fetcher):await(async()=>{
    const r=await awsJsonCall<{SecretString?:string}>({service:'secretsmanager',target:'secretsmanager.GetSecretValue',region:config.region,body:{SecretId:config.secretArn},credentials:await credentials(),fetcher,timeoutMs:5000});if(!r.SecretString)no('secret_empty');return r.SecretString!;
   })();signal.throwIfAborted();
-  pool=(overrides.pool??(c=>new pg.Pool(c)))({...gcPoolConfig(secret),max:4,application_name:'96bulls-canonical-publication'});pool.on('error',()=>{});
+  pool=(overrides.pool??(c=>new pg.Pool(c)))({...gcPoolConfig(secret,config.supabaseProjectRef),max:4,application_name:'96bulls-canonical-publication'});pool.on('error',()=>{});
   const sql=new SemanticPostgresExecutor(pool),read=new SemanticPostgresExecutor(pool,true),context=()=>({signal,deadline:Math.min(deadline,Date.now()+1800)});
   const who=(await read.queryBounded<{me:string;session:string}>('SELECT current_user AS me,session_user AS session',[],context())).rows[0];
   if(who?.me!=='bulls96_session_ingest'||who.session!=='bulls96_session_ingest')no('database_role');

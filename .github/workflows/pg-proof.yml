@@ -12,7 +12,7 @@ permissions:
 jobs:
   real-postgres:
     name: real PostgreSQL ${{ matrix.pg }}
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -50,6 +50,20 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: psql client
         run: psql --version
+      - name: RDS setup refuses PostgreSQL 15 before changing roles
+        if: matrix.pg == '15'
+        run: |
+          for file in rds_owner_function_default_revoke.sql rds_migration_roles.sql hoopdb_runtime_role_rds.sql; do
+            if psql -X -h 127.0.0.1 -p 5432 -U postgres -d postgres \
+              -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -v migration_owner=postgres \
+              -v runtime_role=g7_rds_version_probe -v runtime_login=false \
+              -f "supabase/bootstrap/$file" > rds-version-refusal.log 2>&1; then
+              echo "RDS setup unexpectedly accepted PostgreSQL 15: $file"
+              exit 1
+            fi
+            grep -Eq 'ERROR:[[:space:]]+0A000:' rds-version-refusal.log
+            echo "$file refused PostgreSQL 15 with SQLSTATE 0A000" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
       # Before the role proofs, which lock the superuser down. The suite creates
       # and drops its own database, so it leaves nothing behind for them.
       - name: SearchIndexAdapter conformance (postgres adapter, real server)
@@ -98,9 +112,77 @@ jobs:
             auth-upgrade-pg${{ matrix.pg }}.json
             auth-upgrade-pg${{ matrix.pg }}.log
 
+  rds-emulated-postgres:
+    # The managed-RDS HoopDb profile (HOOPDB_DB_MODE=rds) on disposable PostgreSQL 16/17
+    # whose bootstrap superuser is named rdsadmin, so PostgreSQL's automatic PG16+
+    # creator edges carry rdsadmin as grantor, as on RDS. An emulation, not RDS: the
+    # live RDS gates are listed in the bootstrap runbook.
+    name: managed-RDS profile (emulated, PostgreSQL ${{ matrix.pg }})
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          # Disposable container: trust auth means no credential exists anywhere.
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_USER: rdsadmin
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rdsadmin -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED), RDS emulation PostgreSQL ${{ matrix.pg }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Prove the rds profile, its drift refusals and its mode binding
+        env:
+          PGPROOF_HOST: 127.0.0.1
+          PGPROOF_PORT: "5432"
+          PGPROOF_SUPERUSER: rdsadmin
+          PGPROOF_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          PGPROOF_OUT: rds-profile-proof.json
+        run: |
+          set -o pipefail
+          bun scripts/pg-proof/rds-profile-proof.ts 2>&1 | tee rds-profile-proof.log
+      - name: Check the results file names this head
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          jq -e --arg head "$EXPECTED" --argjson major ${{ matrix.pg }} \
+            '.head == $head and .tracked_tree_clean == true and .pg_major == $major and .bootstrap_superuser == "rdsadmin" and .failed == 0 and .passed >= 21 and (.cases | all(.pass))' rds-profile-proof.json
+          jq -r '"\(.passed) passed, \(.failed) failed on PostgreSQL \(.pg_version) (rds emulation) at \(.head)"' rds-profile-proof.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rds-profile-proof-pg${{ matrix.pg }}
+          path: |
+            rds-profile-proof.json
+            rds-profile-proof.log
+
   brief-postgres:
     name: brief publication PostgreSQL ${{ matrix.pg }}
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -139,9 +221,90 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test src/session-pipeline/__tests__/brief-documents.postgres.test.ts
+      - name: Prove the lazy claim reads the seat clock without serializing other users' claims (043500)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
+      - name: Prove the acquisition installer login refuses a superuser SET SESSION AUTHORIZATION (pg_stat_activity usename)
+        env:
+          ACQUISITION_LOGIN_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          # pg-proof checks out the PR head; heads predating 67d1786d (#370) lack this test. Remove once no open PR predates 67d1786d.
+          if [ ! -f src/acquisition/__tests__/db-login.postgres.test.ts ]; then
+            echo "::warning title=pg-proof::db-login.postgres.test.ts absent at this head (PR predates #370); forward-merge main to run the installer login proof"
+            exit 0
+          fi
+          bun test --timeout 300000 src/acquisition/__tests__/db-login.postgres.test.ts
+      # Service containers cannot take server flags, so the 53200 causal proof gets its own disposable,
+      # loopback-only, trust-auth container (same image as the service above, no credential anywhere).
+      - name: Start a lock-constrained PostgreSQL for the 043500 advisory-footprint proof
+        id: pg_lock_constrained
+        env:
+          PG_LOCK_NAME: pg-lock-constrained-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pg }}
+        run: |
+          # Per-run/per-matrix name and an OS-assigned loopback port: concurrent matrix jobs on a persistent
+          # self-hosted runner must not collide on a container name or host port.
+          docker run -d --name "$PG_LOCK_NAME" -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1:0:5432 \
+            postgres:${{ matrix.pg }} -c max_locks_per_transaction=64 -c max_connections=20
+          port="$(docker port "$PG_LOCK_NAME" 5432/tcp | head -n1)"; port="${port##*:}"
+          case "$port" in ''|*[!0-9]*) echo "could not read the assigned host port"; docker logs "$PG_LOCK_NAME"; exit 1;; esac
+          echo "port=$port" >> "$GITHUB_OUTPUT"
+          for i in $(seq 1 60); do docker exec "$PG_LOCK_NAME" pg_isready -U postgres -h 127.0.0.1 && exit 0; sleep 2; done
+          docker logs "$PG_LOCK_NAME"; exit 1
+      - name: Prove bounded advisory locks never exhaust a constrained lock table (043500, no 53200)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:${{ steps.pg_lock_constrained.outputs.port }}/postgres
+          CLAIM_CLOCK_LOCK_EXPECT_CONSTRAINED: "1"
+        run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
+      - name: Remove the lock-constrained PostgreSQL
+        if: always()
+        env:
+          PG_LOCK_NAME: pg-lock-constrained-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pg }}
+        run: docker rm -f "$PG_LOCK_NAME" || true
+  acquisition-owner-postgres:
+    name: acquisition owner contract PostgreSQL ${{ matrix.pg }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          # Disposable container: trust auth means no credential exists anywhere.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED), PostgreSQL ${{ matrix.pg }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Prove the dormant acquisition owner contract (docs/ingest-acquisition-owner.md)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: bun test --timeout 120000 src/session-ingest/__tests__/acquisition-owner.postgres.test.ts
   consumer-lease:
     name: canonical consumer lease proof (PG ${{ matrix.pg }})
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -168,7 +331,9 @@ jobs:
         env:
           PROOF_DISPOSABLE: "1"
         run: |
-          set -o pipefail
-          bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |
-            tee consumer-lease-pg${{ matrix.pg }}.log
-          grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}.log
+          set -euo pipefail
+          for scheme in legacy-prefix-v1 scope-v1; do
+            PROOF_PARTITION_SCHEME="$scheme" bun scripts/proof-canonical-consumer-lease.ts 5432 2>&1 |
+              tee consumer-lease-pg${{ matrix.pg }}-$scheme.log
+            grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}-$scheme.log
+          done

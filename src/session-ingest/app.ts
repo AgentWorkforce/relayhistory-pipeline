@@ -37,7 +37,10 @@ import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { LedgerUnavailableError } from "./ledger.ts";
+import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
+import { AcquisitionRefusedError } from "./acquisition-refusal.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
 import { parseTurnBatch } from "./turns.ts";
@@ -125,6 +128,13 @@ export interface IngestAppDeps {
    * build it from the sealed Supabase copy (refuses, never guesses, when unsealed).
    */
   custodySource?: "relayhistory" | "shadow" | "frozen-supabase";
+  /**
+   * C3 privacy authority (INGEST_PRIVACY_AUTHORITY). "neon" (default): today's Neon-first controls, the
+   * Supabase mirror routes, and relayhistory's Neon witness accepted. "supabase" (needs frozen-supabase):
+   * only the Supabase-authority control routes; every relayhistory-built (Neon) custody envelope and the
+   * legacy mirror routes are refused, because Neon's heads are no longer the authority.
+   */
+  privacyAuthority?: "neon" | "supabase";
 }
 
 type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined } };
@@ -206,10 +216,51 @@ function errorBody(c: Context<Env>, code: string, message: string, extra: Record
   return { error: { code, message, ...extra }, correlationId: c.get("correlationId") ?? "" };
 }
 
+/** The 503 diagnosis on the route's log line: stage, cause code and, for a database cause,
+ * the closed diagnosis (heuristic class, safe code, basis; never a message). A raw ledger
+ * error that reached the route outside a delivery stage is reported the same way.
+ * Diagnostic only. */
+function unavailableFields(error: unknown): Record<string, unknown> {
+  if (error instanceof IngestUnavailable) return { stage: error.stage, error_code: error.cause_code, ...dbFields(error.db) };
+  if (error instanceof LedgerUnavailableError) return { error_code: error.code, ...dbFields(error.db) };
+  return {};
+}
+
+/** Lock/timeout alert stages (runbooks/history-620-operations.md, "Lock-wait alert"). The two
+ * Worker-side seat-clock callers: `lazy_claim` (stage "claim" in buffered mode =
+ * ingest_claim_buffered_batch) and `staged_ack` (stage "buffer_receipt" = ingest_commit_buffered_batch).
+ * Plus `staged_intent` (stage "buffer_intent" = ingest_prepare_buffer_stage): it takes no seat-clock lock,
+ * but it waits on the same fence, batch and stage-intent rows the staged ACK holds FOR UPDATE, so a
+ * long ACK surfaces there first. set_live / control_changed / lazy_clear have no Worker call site; they
+ * alert from the operator/DB logs. */
+export type LockAlertStage = "lazy_claim" | "staged_ack" | "staged_intent" | "set_live" | "control_changed" | "lazy_clear";
+const LOCK_ALERT_SQLSTATES = new Set(["55P03", "57014"]);
+
+/** The one alert line for a 55P03 (lock_not_available) / 57014 (query_canceled) ledger failure on a
+ * lock-alert stage: `{ route, stage, sqlstate }` and nothing else (no tenant data, no ids). Diagnostic only. */
+export function lockAlertFields(error: unknown, acceptanceMode: string | undefined): { route: "ingest.lock_alert"; stage: LockAlertStage; sqlstate: string } | undefined {
+  if (!(error instanceof IngestUnavailable)) return undefined;
+  const sqlstate = error.db?.db_error_code;
+  if (sqlstate === undefined || !LOCK_ALERT_SQLSTATES.has(sqlstate)) return undefined;
+  const stage: LockAlertStage | undefined =
+    error.stage === "claim" && acceptanceMode === "buffered" ? "lazy_claim"
+      : error.stage === "buffer_receipt" ? "staged_ack"
+      : error.stage === "buffer_intent" ? "staged_intent"
+      : undefined;
+  return stage ? { route: "ingest.lock_alert", stage, sqlstate } : undefined;
+}
+
+function dbFields(db: DbErrorDiagnosis | undefined): Record<string, unknown> {
+  return db ? { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis } : {};
+}
+
 function failure(c: Context<Env>, error: unknown) {
   const safe = error instanceof DeliveryError ? error : new DeliveryError("delivery_unavailable", 503, "Durable delivery is temporarily unavailable");
   // A busy refusal is retryable and wrote nothing durable; tell the client when (relayhistory's header).
   if (safe instanceof DeliveryBusyError) c.header("Retry-After", String(safe.retryAfterSeconds));
+  // Acquisition refusal (design §5.6): the refused sessions sit beside `error`, not inside it.
+  if (safe instanceof AcquisitionRefusedError)
+    return c.json({ ...errorBody(c, safe.code, safe.message), refused: safe.refused.map((r) => ({ source: r.source, sessionId: r.sessionId, code: r.code })) }, 409);
   return c.json(
     errorBody(c, safe.code, safe.message, {
       ...(safe.conflict ? { conflict: safe.conflict } : {}),
@@ -251,10 +302,12 @@ function identifier(v: unknown): v is string {
   return typeof v === "string" && v.length > 0 && new TextEncoder().encode(v).length <= 512 && !/[\x00-\x1f\x7f]/.test(v) && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(v);
 }
 
-export function parseSelection(body: unknown): { account_id: string; origin_id: string; sessions: { source: string; session_id: string }[]; enabled: boolean } {
+export function parseSelection(body: unknown): { account_id: string; expected_user_id?: string; origin_id: string; sessions: { source: string; session_id: string }[]; enabled: boolean } {
   if (!isObject(body)) invalid("Expected upload selection");
   const b = body as Record<string, unknown>;
-  exactKeys(b, ["account_id", "origin_id", "sessions", "enabled"]);
+  const expectedUser = Object.hasOwn(b, "expected_user_id");
+  exactKeys(b, ["account_id", "origin_id", "sessions", "enabled", ...(expectedUser ? ["expected_user_id"] : [])]);
+  if (expectedUser && !identifier(b.expected_user_id)) invalid("Invalid expected upload user");
   if (!identifier(b.origin_id) || typeof b.enabled !== "boolean" || !Array.isArray(b.sessions) || b.sessions.length < 1 || b.sessions.length > 2048)
     invalid("Invalid upload selection");
   for (const x of b.sessions as unknown[]) {
@@ -277,6 +330,9 @@ export function createIngestApp(deps: IngestAppDeps) {
   const app = new Hono<Env>();
   const emit = deps.log ?? ((fields) => log.info("session ingest", fields));
   const custodyMode = deps.custodySource ?? "relayhistory";
+  const privacyAuthority = deps.privacyAuthority ?? "neon";
+  if (privacyAuthority !== "neon" && (privacyAuthority !== "supabase" || custodyMode !== "frozen-supabase"))
+    throw new Error("session ingest: privacyAuthority=supabase requires custodySource=frozen-supabase");
   const frozenWitness = async (input: FrozenWitnessInput): Promise<CurrentCustodyPacket> => {
     if (!deps.deliver.ledger.frozenWitness) throw new IngestUnavailable("fence", "custody_source_unavailable");
     return deps.deliver.ledger.frozenWitness(input);
@@ -320,6 +376,8 @@ export function createIngestApp(deps: IngestAppDeps) {
       const contentType=c.req.header("content-type")?.split(";")[0]?.trim();
       const privateWire=contentType===CURRENT_CUSTODY_CONTENT_TYPE||contentType===RECOVERY_CONTENT_TYPE;
       if(privateWire&&(deps.deliver.acceptanceMode!=="buffered"||!["","identity"].includes(c.req.header("content-encoding")?.trim().toLowerCase()??"")))throw new IngestUnavailable("fence","custody_wire_unavailable");
+      // C3: under Supabase privacy authority a relayhistory-built (Neon) witness is stale by definition.
+      if(privateWire&&privacyAuthority==="supabase")throw new IngestUnavailable("fence","privacy_authority_moved");
       body = c.req.raw.body ? await readBounded(c.req.raw.body, privateWire?PRIVATE_CUSTODY_BYTES:MAX_DELIVERY_BYTES) : new Uint8Array();
     } catch (error) {
       return failure(c, error);
@@ -399,11 +457,13 @@ export function createIngestApp(deps: IngestAppDeps) {
       emit({
         ...fields,
         outcome: code,
-        ...(error instanceof IngestUnavailable ? { stage: error.stage, error_code: error.cause_code } : {}),
+        ...unavailableFields(error),
         ...(error instanceof DeliveryError && error.conflictCount ? { count: error.conflictCount } : {}),
         duration_ms: Date.now() - started,
         bytes_raw: read.bytes,
       });
+      const lockAlert = lockAlertFields(error, deps.deliver.acceptanceMode);
+      if (lockAlert) emit(lockAlert);
       return failure(c, error);
     }
   };
@@ -434,7 +494,9 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json({ ...result.receipt, limits: { ...result.receipt.limits, contentEncodings: contentEncodings() } });
     } catch (error) {
       const code = error instanceof DeliveryError ? error.code : "delivery_unavailable";
-      emit({ ...fields, outcome: code, ...(error instanceof IngestUnavailable ? { stage: error.stage, error_code: error.cause_code } : {}), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
+      emit({ ...fields, outcome: code, ...unavailableFields(error), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
+      const lockAlert = lockAlertFields(error, deps.deliver.acceptanceMode);
+      if (lockAlert) emit(lockAlert);
       return failure(c, error);
     }
   });
@@ -447,6 +509,8 @@ export function createIngestApp(deps: IngestAppDeps) {
     try {
       const input = parseSelection(await jsonOf(c));
       await requireDeliveryAccount(identity, input.account_id);
+      if (input.expected_user_id !== undefined && input.expected_user_id !== identity.userId)
+        throw new DeliveryError("delivery_user_mismatch", 403, "Upload selection does not match authenticated user");
       const selection={
         tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId },
         originId: input.origin_id,
@@ -530,6 +594,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   app.post("/v1/custody/control/begin", async (c) => {
     const identity = c.get("identity");
     try {
+      if (privacyAuthority !== "neon") throw new IngestUnavailable("fence", "privacy_authority_moved");
       if (!deps.deliver.ledger.sourceControlBegin) throw new IngestUnavailable("fence", "control_unavailable");
       const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control");
       exactKeys(b as Record<string, unknown>, ["epoch", "kind", "payload"]);
@@ -545,6 +610,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   app.post("/v1/custody/control/complete", async (c) => {
     const identity = c.get("identity");
     try {
+      if (privacyAuthority !== "neon") throw new IngestUnavailable("fence", "privacy_authority_moved");
       if (!deps.deliver.ledger.sourceControlComplete) throw new IngestUnavailable("fence", "control_unavailable");
       const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control completion");
       const v = b as Record<string, unknown>;exactKeys(v, ["epoch", "version", "digest", "kind", "outcome"]);
@@ -555,6 +621,43 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json(r);
     } catch (error) {
       emit({ route: "custody.control.complete", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+
+  // C3 Supabase-first privacy authority: relayhistory (DELIVERY_CUSTODY_SOURCE_MODE=supabase-authority) begins
+  // here (head + frozen privacy written, Neon never called), writes the unchanged ordered fence, then completes here.
+  app.post("/v1/custody/authority/begin", async (c) => {
+    const identity = c.get("identity");
+    try {
+      if (privacyAuthority !== "supabase" || !deps.deliver.ledger.privacyAuthorityBegin) throw new IngestUnavailable("fence", "privacy_authority_unavailable");
+      const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control");
+      exactKeys(b as Record<string, unknown>, ["epoch", "kind", "payload"]);
+      const v = b as Record<string, unknown>;
+      if (typeof v.epoch !== "string") invalid("Invalid control epoch");
+      const head = await deps.deliver.ledger.privacyAuthorityBegin({ epoch: v.epoch as string, kind: controlKind(v.kind), payload: v.payload,
+        tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId } });
+      emit({ route: "custody.authority.begin", outcome: head.apply ? "begun" : "pending_replay", org_id: identity.orgId });
+      return c.json(head);
+    } catch (error) {
+      emit({ route: "custody.authority.begin", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+  app.post("/v1/custody/authority/complete", async (c) => {
+    const identity = c.get("identity");
+    try {
+      if (privacyAuthority !== "supabase" || !deps.deliver.ledger.privacyAuthorityComplete) throw new IngestUnavailable("fence", "privacy_authority_unavailable");
+      const b = await jsonOf(c);if (!isObject(b)) invalid("Expected control completion");
+      const v = b as Record<string, unknown>;exactKeys(v, ["epoch", "version", "digest", "kind", "outcome"]);
+      if (v.outcome !== "applied" && v.outcome !== "replay" && v.outcome !== "stale") invalid("Invalid control outcome");
+      if (typeof v.epoch !== "string" || typeof v.version !== "string" || typeof v.digest !== "string") invalid("Invalid control");
+      const r = await deps.deliver.ledger.privacyAuthorityComplete({ epoch: v.epoch as string, version: v.version as string, digest: v.digest as string, kind: controlKind(v.kind),
+        outcome: v.outcome as "applied" | "replay" | "stale", tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId } });
+      emit({ route: "custody.authority.complete", outcome: r.superseded ? "superseded" : "completed", org_id: identity.orgId });
+      return c.json(r);
+    } catch (error) {
+      emit({ route: "custody.authority.complete", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
       return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
     }
   });

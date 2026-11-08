@@ -57,8 +57,15 @@ const TRANSIENT_SCOPE=[["55000","replay capture: source epoch missing"],["55P03"
 const rollbacks=()=>readdirSync(join(root,"supabase/rollbacks")).filter(f=>f.endsWith(".down.sql")).sort();
 /** Roll back every later upstream lane first (descending), then 032000, as the gap-free ledger requires. */
 const down=async(x:X)=>{
- for(const f of rollbacks().filter(f=>f>`${FILE}.down.sql`&&/^\d{14}_/.test(f)).reverse())await x.pg.exec(readFileSync(join(root,"supabase/rollbacks",f),"utf8"));
- await x.pg.exec(readFileSync(join(root,`supabase/rollbacks/${FILE}.down.sql`),"utf8"));
+ try {
+  for(const f of rollbacks().filter(f=>f>`${FILE}.down.sql`&&/^\d{14}_/.test(f)).reverse())await x.pg.exec(readFileSync(join(root,"supabase/rollbacks",f),"utf8"));
+  await x.pg.exec(readFileSync(join(root,`supabase/rollbacks/${FILE}.down.sql`),"utf8"));
+ } catch (error) {
+  // 039's explicit transaction must be released after an expected refusal,
+  // before the test removes its synthetic later-migration guard and retries.
+  await x.pg.exec("ROLLBACK");
+  throw error;
+ }
 };
 const migrate=(x:X)=>runMigrations(x.db,{profile:{mode:"local",shim:true,bootstrap:true,verify:true,runtimeRole:"postgres"}});
 
@@ -296,6 +303,8 @@ test("order: 032000 sorts and applies directly after 031000 and does not depend 
 
 test("down restores the previous bodies verbatim and the old behaviour; reapply restores the fixes",async()=>{
  const x=await fresh();
+ const ledger=async()=>(await x.pg.query<{name:string;sha256:string}>('SELECT name,sha256 FROM sessions.__96bulls_migrations ORDER BY name COLLATE "C"')).rows;
+ const beforeLedger=await ledger();
  await addScope(x,"unmeasured",0,0);
  expect(await route(x,"unmeasured")).toEqual({delegated:false});
  // Later-migration guard: refused (55000) while a later upstream step is ledgered.
@@ -320,6 +329,8 @@ test("down restores the previous bodies verbatim and the old behaviour; reapply 
  expect(await prosrc(x,FNS[0])).toBe(body(`${FILE}.sql`,"route_session_large_read","route"));
  expect(await prosrc(x,FNS[1])).toBe(body(`${FILE}.sql`,"discover_session_large_reads","discover"));
  expect(await prosrc(x,FNS[2])).toBe(body(`${FILE}.sql`,"claim_session_large_read","claim"));
+ expect(await ledger()).toEqual(beforeLedger);
  // A second migrate is a no-op.
  await migrate(x);
+ expect(await ledger()).toEqual(beforeLedger);
 },PGLITE_TEST_TIMEOUT*4);

@@ -1,0 +1,56 @@
+/** Read-only generation census: no row locks, no updates, no rebind. */
+import {execFileSync} from "node:child_process";
+import {readFileSync} from "node:fs";
+import {createHash} from "node:crypto";
+import pg from "pg";
+import {parseCliLogin} from "../../scripts/schema-release-owner-operator-plan.ts";
+import {ownerApplySourceFiles} from "../../scripts/schema-release-owner-apply.ts";
+import {generation} from "../../src/hoopdb/migrate.ts";
+import {ROLE_VALIDATION_TABLE,ROLE_VALIDATION_NAME} from "../../src/shared/db.ts";
+import {SUPABASE_PROD_CA_2021} from "../../src/session-pipeline/supabase-ca.ts";
+const ROOT="/home/khaliqgant/Projects/AgentWorkforce/sessions-pipeline-worktrees/root-readonly-release-f9409ccb-20261107";
+const SHA="f9409ccb9e46c3f100cf3017847d8ed62bc716c7",G1="78c7b28e5ebce7f5f534a1f3f41a55845251e950b6c4c49f676f2bda358c91d6",G2="e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",PROJECT="pyamkrhoyszgzirqqffq",HOST="aws-0-us-east-1.pooler.supabase.com";
+const no=(code:string):never=>{throw Object.assign(new Error(code),{code});};
+const env=Object.fromEntries(["PATH","HOME","XDG_CONFIG_HOME","XDG_DATA_HOME","DBUS_SESSION_BUS_ADDRESS"].flatMap(k=>process.env[k]?[[k,process.env[k]!]]:[]));
+const run=(exe:string,args:string[])=>execFileSync(exe,args,{cwd:ROOT,env,encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:30000,maxBuffer:65536});
+function source(){
+ if(run("git",["rev-parse","HEAD"]).trim()!==SHA)no("source_mismatch");
+ const files=[...run("git",["diff","HEAD","--name-only","-z"]).split("\0"),...run("git",["ls-files","--others","--exclude-standard","-z"]).split("\0")].filter(Boolean);
+ ownerApplySourceFiles(files,files.includes("supabase/.temp/cli-latest")?readFileSync(ROOT+"/supabase/.temp/cli-latest","utf8"):undefined);
+}
+async function main(){
+ source();if(await generation()!==G2)no("source_generation");
+ const sql=readFileSync(ROOT+"/.96bulls/role-inventory/supabase-nonsystem-catalog-census-draft-20261107.sql","utf8");
+ const sqlSha256="6eb326424b3737f3a90f321c8f6e21fcc217bb07d0f34d1eaa476796843b5943";
+ if(createHash("sha256").update(sql).digest("hex")!==sqlSha256)no("sql_sha_mismatch");
+ const begins=[...sql.matchAll(/BEGIN READ ONLY;/g)],ends=[...sql.matchAll(/ROLLBACK;/g)];
+ if(begins.length!==1||ends.length!==1||begins[0].index!>=ends[0].index!)no("sql_block_shape");
+ const body=sql.slice(begins[0].index!+"BEGIN READ ONLY;".length,ends[0].index!);
+ const cli="/home/khaliqgant/.local/bin/supabase";if(run(cli,["--version"]).trim()!=="2.122.0")no("cli_version");
+ let raw=run(cli,["db","dump","--linked","--project-ref",PROJECT,"--dry-run"]);const login=parseCliLogin(raw);raw="";
+ const c=new pg.Client({host:HOST,port:5432,database:"postgres",user:"cli_login_postgres."+PROJECT,password:login.password,ssl:{ca:SUPABASE_PROD_CA_2021,rejectUnauthorized:true,servername:HOST},connectionTimeoutMillis:10000,query_timeout:5000,options:"-c default_transaction_read_only=on -c statement_timeout=3000 -c lock_timeout=250 -c idle_in_transaction_session_timeout=10000",application_name:"96bulls-nonsystem-catalog-census-readonly"});login.password="";c.on("error",()=>{});
+ const startedAt=new Date().toISOString();let connected=false,began=false,phase="connect",censusExecuted=false;let targetPreflight:any=null;
+ const base=()=>({version:1,kind:"supabase_nonsystem_catalog_census_readonly",startedAt,sqlSha256,sourceSha:SHA,project:PROJECT,targetPreflight,censusExecuted,productionWrites:false});
+ try{
+  await c.connect();connected=true;phase="target_preflight";await c.query("BEGIN READ ONLY");began=true;await c.query("SET LOCAL ROLE postgres");
+  targetPreflight=(await c.query("SELECT current_user='postgres' AND session_user='cli_login_postgres' AND current_database()='postgres' AND current_setting('transaction_read_only')='on' AND (SELECT pg_get_userbyid(nspowner)='postgres' FROM pg_namespace WHERE nspname='sessions') AS expected_owner_readonly_target")).rows[0];
+  if(targetPreflight?.expected_owner_readonly_target!==true)no("target_preflight_refused");
+  phase="census";const censusStartedAt=new Date().toISOString();censusExecuted=true;
+  const rs:any=await c.query(body);const selects=(Array.isArray(rs)?rs:[rs]).filter((r:any)=>r.command==="SELECT");
+  if(selects.length!==1||selects[0].rows.length!==1||Object.keys(selects[0].rows[0]).join()!=="catalog_census")no("result_shape");
+  const resultRows=selects[0].rows, q=resultRows[0].catalog_census;
+  if(!q||Object.keys(q).sort().join()!=="migration_ledger,relations,route_guard")no("result_shape");
+  const g=q.route_guard;
+  if(!g||Object.keys(g).sort().join()!==["effective_role","source_login","read_only","ledger_select_visible","ledger_not_rls_filtered","ok"].sort().join()||g.effective_role!=="postgres"||g.source_login!=="cli_login_postgres"||g.read_only!==true||g.ledger_select_visible!==true||g.ledger_not_rls_filtered!==true||g.ok!==true)no("route_guard_refused");
+  if(!Array.isArray(q.relations)||q.relations.length>20000||!Array.isArray(q.migration_ledger)||q.migration_ledger.length>2000)no("inventory_shape");
+  for(const r of q.relations){
+   if(!r||Object.keys(r).sort().join()!==["schema_name","relation_name","qualified_name","relkind","column_count","relrowsecurity","owner_role","approximate_rows"].sort().join()||!["schema_name","relation_name","owner_role"].every(k=>typeof r[k]==="string"&&r[k].length>0&&r[k].length<=128)||typeof r.qualified_name!=="string"||r.qualified_name.length>520||!["r","i","S","t","v","m","c","f","p","I"].includes(r.relkind)||!Number.isInteger(r.column_count)||r.column_count<0||r.column_count>1600||typeof r.relrowsecurity!=="boolean"||!Number.isFinite(r.approximate_rows)||r.approximate_rows< -1)no("relation_shape");
+  }
+  for(const m of q.migration_ledger){if(!m||Object.keys(m).sort().join()!=="checksum,name"||typeof m.name!=="string"||m.name.length<1||m.name.length>1024||typeof m.checksum!=="string"||!/^[0-9a-f]{64}$/.test(m.checksum))no("ledger_shape");}
+  const censusCompletedAt=new Date().toISOString();await c.query("ROLLBACK");began=false;source();
+  const output={...base(),status:"observed_catalog",censusStartedAt,censusCompletedAt,resultRows,completedAt:new Date().toISOString()};const text=JSON.stringify(output);
+  if(Buffer.byteLength(text)>4*1024*1024)no("result_size_bound");console.log(text);
+ }catch(e:any){const x=e?.code;const code=typeof x==="string"&&/^[A-Za-z0-9_]{1,64}$/.test(x)?x:"catalog_census_failed";console.log(JSON.stringify({...base(),status:"refused",code,phase,result:"UNKNOWN",completedAt:new Date().toISOString()}));process.exitCode=1;}
+ finally{if(connected&&began)await c.query("ROLLBACK").catch(()=>{});await c.end().catch(()=>{});}
+}
+main().catch(e=>{const x=e?.code;const code=typeof x==="string"&&/^[A-Za-z0-9_]{1,64}$/.test(x)?x:"catalog_census_failed";console.log(JSON.stringify({status:"refused",code,result:"UNKNOWN",productionWrites:false}));process.exitCode=1;});

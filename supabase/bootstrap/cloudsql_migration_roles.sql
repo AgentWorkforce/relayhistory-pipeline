@@ -5,9 +5,9 @@
 -- creates a role. PostgreSQL documents that the creator cannot revoke that grant.
 -- https://www.postgresql.org/docs/17/role-attributes.html
 --
--- Use a disposable CREATEROLE trampoline instead: it creates the six fixed NOLOGIN
--- roles (the session ingest's two included: 20261102010000 verifies them and never
--- creates a role), then the migration owner drops the trampoline. DROP ROLE removes the
+-- Use a disposable CREATEROLE trampoline instead: it creates the fixed NOLOGIN
+-- roles, including the ingest, project-events and read API roles. Their migrations only
+-- verify roles; they never create them. The migration owner then drops the trampoline. DROP ROLE removes the
 -- trampoline's automatic memberships, leaving every target membership-free. The
 -- trampoline and every target are created in this one transaction, so any refusal rolls
 -- the entire operation back.
@@ -50,7 +50,14 @@ BEGIN
     'session_directory_search_worker'::name,
     'session_token_verifier'::name,
     'bulls96_session_ingest'::name,
-    'bulls96_session_ingest_seeder'::name
+    'bulls96_session_ingest_seeder'::name,
+    'bulls96_canonical_feature_producer'::name,
+    'bulls96_read_api'::name,
+    'bulls96_project_events'::name,
+    'bulls96_privacy_eraser'::name,
+    'bulls96_babysitter_retention'::name,
+    'bulls96_acquisition_installer'::name,
+    'buffered_search_feed_runtime'::name
   ] LOOP
     SELECT * INTO v_row FROM pg_roles WHERE rolname = v_role;
     IF NOT FOUND THEN
@@ -127,6 +134,34 @@ BEGIN
       CREATE ROLE bulls96_session_ingest_seeder
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_read_api') THEN
+      CREATE ROLE bulls96_read_api
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_privacy_eraser') THEN
+      CREATE ROLE bulls96_privacy_eraser
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_project_events') THEN
+      CREATE ROLE bulls96_project_events
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_canonical_feature_producer') THEN
+      CREATE ROLE bulls96_canonical_feature_producer
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_babysitter_retention') THEN
+      CREATE ROLE bulls96_babysitter_retention
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_acquisition_installer') THEN
+      CREATE ROLE bulls96_acquisition_installer
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'buffered_search_feed_runtime') THEN
+      CREATE ROLE buffered_search_feed_runtime
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
     RESET ROLE;
     DROP ROLE bulls96_cloudsql_role_seed;
   END IF;
@@ -139,7 +174,12 @@ BEGIN
      WHERE target.rolname IN (
        'anon', 'authenticated', 'service_role', 'session_directory_search_worker',
        'session_token_verifier',
-       'bulls96_session_ingest', 'bulls96_session_ingest_seeder'
+       'bulls96_session_ingest', 'bulls96_session_ingest_seeder',
+       'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events',
+       'bulls96_privacy_eraser',
+       'bulls96_babysitter_retention',
+       'bulls96_acquisition_installer',
+       'buffered_search_feed_runtime'
      )
   ) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',

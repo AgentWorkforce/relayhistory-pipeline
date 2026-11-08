@@ -11,7 +11,7 @@ import type pg from "pg";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createClickHouseClient, type ClickHouseClient } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { row } from "../../../src/session-read-api/__tests__/support.ts";
-import { boundedClickHouse, connectPg, handle, type Env } from "../src/index.ts";
+import { boundedClickHouse, connectPg, handle, ownerBufferedDeps, type Env } from "../src/index.ts";
 
 type TestEnv = Env & {
   TEST_PG_ADMIN: Hyperdrive;
@@ -148,6 +148,69 @@ describe("entry and configuration", () => {
     const noOrigin = await call({ READ_API_ORIGIN: "" });
     expect(noOrigin.status).toBe(401);
     expect((await body(noOrigin)).error.code).toBe("not_configured");
+  });
+
+  test("owner-buffered on without the HISTORY_CONTROL_HEAD binding refuses every request with a 503; off or bound, it does not", async () => {
+    const t = tenant();
+    const calls: string[] = [];
+    const binding = { fetch: async (input: RequestInfo | URL) => (calls.push(String(input)), new Response("{}", { status: 503 })) } as unknown as Fetcher;
+    const call = async (path: string, over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}${path}`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const on = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: t.ws, READ_API_DIRECTORY_WORKSPACES: t.ws, INGEST_S3_BUCKET: "ingest-bucket-example" };
+    for (const flag of ["true", "1", " true "]) {
+      for (const unbound of [{}, { HISTORY_CONTROL_HEAD: undefined }, { HISTORY_CONTROL_HEAD: {} as unknown as Fetcher }]) {
+        for (const path of [`/v1/events?workspace=${t.ws}&q=x`, `/v1/sessions?workspace=${t.ws}`, `/v1/sessions/s-x/turns?workspace=${t.ws}&source=claude`]) {
+          const r = await call(path, { ...on, RELAYHISTORY_READ_OWNER_BUFFERED: flag, ...unbound });
+          expect(r.status, `${flag} ${path}`).toBe(503);
+          expect((await body(r)).error.code).toBe("backend_unavailable");
+        }
+      }
+    }
+    // Off (the default deploy) never needs the binding and never calls it.
+    for (const flag of [undefined, "", "false", "0"]) {
+      const r = await call(`/v1/events?workspace=${t.ws}&q=x`, { ...on, RELAYHISTORY_READ_OWNER_BUFFERED: flag });
+      expect(r.status, String(flag)).not.toBe(503);
+    }
+    // On and bound: the config check passes (the request is not refused for configuration).
+    const bound = await call(`/v1/events?workspace=${t.ws}&q=x`, { ...on, HISTORY_CONTROL_HEAD: binding });
+    expect(bound.status).not.toBe(503);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("all-workspaces mode (READ_API_OWNER_BUFFERED_WORKSPACES=*): parsed as *, still needs the flag, keys and binding; default stays none", () => {
+    const run = (async () => {
+      throw new Error("no database in this test");
+    }) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: "*" } as Env, run)?.workspaces).toBe("*");
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: " * " } as Env, run)?.workspaces).toBe("*");
+    // Unset (the default deploy) is none, never all; "*" mixed with ids is a literal id no workspace has.
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: undefined } as Env, run)?.workspaces).toEqual(new Set());
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: "ws-a,*" } as Env, run)?.workspaces).toEqual(new Set(["ws-a", "*"]));
+    // "*" alone does not turn the feature on: flag off or S3 keys missing is still undefined.
+    for (const over of [{ RELAYHISTORY_READ_OWNER_BUFFERED: undefined }, { RELAYHISTORY_READ_OWNER_BUFFERED: "false" }, { INGEST_S3_BUCKET: "" }, { PIPELINE_RAW_S3_ACCESS_KEY_ID: undefined }]) {
+      expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: "*", ...over } as Env, run), JSON.stringify(over)).toBeUndefined();
+    }
+  });
+
+  test("all-workspaces mode without the HISTORY_CONTROL_HEAD binding is the same 503; bound, it is not refused", async () => {
+    const t = tenant();
+    const call = async (over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions?workspace=${t.ws}`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const all = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "*", READ_API_DIRECTORY_WORKSPACES: "*", INGEST_S3_BUCKET: "ingest-bucket-example" };
+    const unbound = await call(all);
+    expect(unbound.status).toBe(503);
+    expect((await body(unbound)).error.code).toBe("backend_unavailable");
+    const binding = { fetch: async () => new Response("{}", { status: 503 }) } as unknown as Fetcher;
+    expect((await call({ ...all, HISTORY_CONTROL_HEAD: binding })).status).not.toBe(503);
   });
 
   test("Supabase or ClickHouse down is a 503 the caller falls back from, never a page without erasure checks", async () => {
@@ -352,7 +415,52 @@ describe("reads through ClickHouse and Supabase", () => {
 });
 
 describe("directory list and activity (P3b)", () => {
-  test("off the canary allowlist every workspace falls back; on it, 501 until migration 20261105029000 exists", async () => {
+  test("brief titles: off unless READ_API_BRIEF_TITLES_WORKSPACES names the workspace; on, the tenant's titles only", async () => {
+    const t = tenant();
+    const other = tenant();
+    const bearer = await token(t);
+    // The same (codex, t-1) key holds a brief in this tenant and in a foreign one.
+    for (const [org, ws, title] of [[t.org, t.ws, "Tenant title"], [other.org, other.ws, "Foreign title"]] as const)
+      await owner(async (c) => {
+        await c.query(
+          `INSERT INTO sessions.session_index
+             (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
+              storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, title)
+           VALUES ($1, $2, 'codex', 't-1', 'm-1', 'u-1', now(), now(), 'fs', 'bucket', $3,
+                   decode(repeat('ab', 32), 'hex'), 'jsonl', '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1, 'pointer title')`,
+          [org, ws, `manifest/${org}/${ws}/t-1`],
+        );
+        await c.query(
+          `INSERT INTO sessions.session_briefs (org_id, workspace_id, harness, session_id, status, revision, source_revisions,
+             title, description, state, brief_revision, brief_source_revisions, brief_fingerprint, scrub_ruleset, scrub_version,
+             prompt_version, engine_version, model, generated_at)
+           VALUES ($1, $2, 'codex', 't-1', 'ready', 1, '{"m-1":1}', $3, 'A description.', 'completed', 1, '{"m-1":1}',
+                   repeat('e', 64), 'relayhistory-scrub', 1, 'session-summary-v3', 'session-brief-v3', 'gpt-5.6-luna', now())`,
+          [org, ws, title],
+        );
+      });
+    const call = async (over: Partial<Env> = {}) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions/titles?workspace=${t.ws}&key=codex:t-1`, { headers: { authorization: `Bearer ${bearer}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    for (const over of [{}, { READ_API_BRIEF_TITLES_WORKSPACES: "" }, { READ_API_BRIEF_TITLES_WORKSPACES: "ws-someone-else" }, { READ_API_DIRECTORY_WORKSPACES: "*" }]) {
+      const r = await call(over);
+      expect(r.status).toBe(501);
+      expect((await body(r)).error.reason).toBe("brief_titles_workspace_not_enabled");
+    }
+    // With migration 20261105043000 applied (global-setup runs every migration): only this
+    // tenant's brief title, never the foreign tenant's for the same key.
+    for (const allow of [t.ws, `ws-other,${t.ws}`, "*"]) {
+      const r = await call({ READ_API_BRIEF_TITLES_WORKSPACES: allow });
+      expect(r.status).toBe(200);
+      expect(r.headers.get("x-relayhistory-workspace-id")).toBe(t.ws);
+      expect((await body(r)).titles).toEqual([{ source: "codex", sessionId: "t-1", title: "Tenant title" }]);
+    }
+  });
+
+  test("off the canary allowlist every workspace falls back; on it, the directory serves the tenant only", async () => {
     const t = tenant();
     const bearer = await token(t);
     const call = async (path: string, over: Partial<Env> = {}) => {
@@ -370,12 +478,27 @@ describe("directory list and activity (P3b)", () => {
         expect((await body(r)).error.reason).toBe("directory_workspace_not_enabled");
       }
     }
+    // With migration 20261105034000 applied (global-setup runs every migration).
+    await owner((c) =>
+      c.query(
+        `INSERT INTO sessions.session_directory (org_id, workspace_id, harness, session_id, created_at, last_activity_at, task_title)
+         VALUES ($1, $2, 'codex', 'd-1', '2026-10-01T05:00:00Z', '2026-10-01T06:00:00Z', 'Directory session')`,
+        [t.org, t.ws],
+      ),
+    );
     for (const allow of [t.ws, `ws-other,${t.ws}`, "*"]) {
-      for (const path of [list, activity]) {
-        const r = await call(path, { READ_API_DIRECTORY_WORKSPACES: allow });
-        expect(r.status).toBe(501);
-        expect((await body(r)).error.reason).toBe("directory_not_migrated");
-      }
+      const r = await call(list, { READ_API_DIRECTORY_WORKSPACES: allow });
+      expect(r.status).toBe(200);
+      expect(r.headers.get("x-relayhistory-workspace-id")).toBe(t.ws);
+      const b = await body(r);
+      expect(b.sessions.map((s: { sessionId: string }) => s.sessionId)).toEqual(["d-1"]);
+      expect(b.sessions[0]).toMatchObject({ source: "codex", taskTitle: "Directory session", summarySource: "task_title" });
+      const a = await call(activity, { READ_API_DIRECTORY_WORKSPACES: allow });
+      expect(a.status).toBe(200);
+      expect((await body(a)).days).toEqual([
+        { date: "2026-10-01", total: 1, bySource: { codex: 1 } },
+        { date: "2026-10-02", total: 0, bySource: {} },
+      ]);
     }
     // Timing: the same allowlist, then the canonical S3 source (no raw-store secrets here).
     const timing = `/v1/sessions/s-1/timing?workspace=${t.ws}&source=codex`;
@@ -385,6 +508,14 @@ describe("directory list and activity (P3b)", () => {
     const on = await call(timing, { READ_API_DIRECTORY_WORKSPACES: t.ws });
     expect(on.status).toBe(501);
     expect((await body(on)).error.reason).toBe("timing_not_configured");
+    // Another tenant's token never sees it.
+    const other = tenant();
+    const otherBearer = await token(other);
+    const ctx = createExecutionContext();
+    const r = await handle(new Request(`${ORIGIN}/v1/sessions?workspace=${other.ws}`, { headers: { authorization: `Bearer ${otherBearer}` } }), { ...E, READ_API_DIRECTORY_WORKSPACES: "*" }, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(r.status).toBe(200);
+    expect((await body(r)).sessions).toEqual([]);
   });
 });
 

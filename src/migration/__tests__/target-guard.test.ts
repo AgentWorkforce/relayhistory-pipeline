@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { supabaseProjectRef, writeMode } from "../target-guard.ts";
 
-const REF = "pyamkrhoyszgzirqqffq";
+const REF = "qrstuvwxyzabcdefghij";
 const OTHER = "abcdefghijklmnopqrst";
 const DIRECT = `postgres://postgres:x@db.${REF}.supabase.co:5432/postgres`;
 const POOLED = `postgres://postgres.${REF}:x@aws-0-us-east-1.pooler.supabase.com:6543/postgres`;

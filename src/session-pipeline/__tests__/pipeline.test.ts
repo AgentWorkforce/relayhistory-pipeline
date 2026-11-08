@@ -31,6 +31,14 @@ import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
 import { RECONCILE_DEADLINE_MS, lambdaEnv, reconcileRecent } from "../lambda.ts";
+import { PGlite } from "@electric-sql/pglite";
+import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
+import { createSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
+import { composeSearchService } from "../../shared/search-composition.ts";
+import { createPostgresSearchIndex, TENANT_SETTINGS_SQL, type TenantSqlRunner } from "@rhc/search-index/postgres.ts";
+import { writerTransactionSql } from "../transaction-sql.ts";
+import { createReadApi, AuthError } from "../../session-read-api/app.ts";
+import type { SearchProjectionState } from "../search-adapter.ts";
 
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -213,8 +221,234 @@ function fakeSupabase(live: () => string[], busy: () => boolean = () => false, c
   return { tx, calls, transact: async <T>(work: (tx: SqlExecutor) => Promise<T>) => work(tx) };
 }
 
+/** The in-process PGlite as a superuser test database: one transaction per tenant call. */
+const pgliteTenants = (db: PGlite): TenantSqlRunner => (orgId, workspaceId, work) =>
+  db.transaction(async tx => { await tx.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]); return work(tx); });
+
 function searchDeps(ch: ClickHouseClient, transact: SearchIndexDeps["transact"], limits?: SearchIndexDeps["limits"]): SearchIndexDeps {
   return { transact, reader, store, ch, prefixFor: (org) => `96bulls/${org}`, now: () => NOW, ...(limits ? { limits } : {}) };
+}
+
+test("registered Postgres projection serves the actual read API, fences stale writes, refuses partials and erases only its tenant", async () => {
+  const db = new PGlite({ extensions: { pg_trgm } });
+  await db.exec("CREATE EXTENSION pg_trgm");
+  let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "İstanbul hello"), event("r2", "1", Date.parse(AT) + 1, "hello two")])];
+  const sb = fakeSupabase(() => keys);
+  let complete = false, at = NOW;
+  const state: SearchProjectionState = {
+    async fromMs() { return 0; },
+    async record(tx, actual, value) { expect(tx).toBe(sb.tx); expect(actual).toEqual(scope); complete = value.complete; },
+    async partials(tenant) { expect(tenant).toEqual({ orgId: scope.orgId, workspaceId: scope.workspaceId }); return { sessions: complete ? [] : [scope.sessionId], overflow: false }; },
+  };
+  const registry = createSearchIndexRegistry();
+  const adapter = composeSearchService({ registry, state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer", pgliteTenants(db));
+  const index = adapter.index;
+  await index.ensureSchema(); // explicit test bootstrap, never service startup
+  const deps: SearchIndexDeps = { transact: sb.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => at };
+  const tenant = { orgId: scope.orgId, workspaceId: scope.workspaceId };
+  const query = () => index.query({ tenant, order: "asc", limit: 100 });
+  const app = createReadApi({ adapter, completeSinceMs: 0,
+    verify: async token => { if (token !== "fixture") throw new AuthError(401, "invalid_token", "invalid token"); return { ...tenant, userId: "user_1", scopes: ["rth:read"] }; },
+    liveness: { async erased() { return new Set(); }, async sessionStart() { return { pointers: 1, live: 1, createdAtMs: Date.parse(AT) }; }, async livePointerSessions(_o, _w, ids) { return new Set(ids); } },
+  });
+  const get = (path: string, auth = true) => app.request(path, { headers: auth ? { authorization: "Bearer fixture" } : {} });
+  try {
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 2 });
+    expect((await query()).hits).toHaveLength(2);
+    expect((await get(`/v1/events?workspace=${scope.workspaceId}&q=hello`, false)).status).toBe(401);
+    expect((await get("/v1/events?workspace=other&q=hello")).status).toBe(403);
+    const first = await get(`/v1/sessions/${scope.sessionId}/events?workspace=${scope.workspaceId}&limit=1`);
+    expect(first.status).toBe(200);
+    const page = await first.json() as any;
+    expect(page.events).toHaveLength(1); expect(page.nextCursor).toBeString();
+    const second = await get(`/v1/sessions/${scope.sessionId}/events?workspace=${scope.workspaceId}&limit=1&cursor=${encodeURIComponent(page.nextCursor)}`);
+    expect((await second.json() as any).events[0].eventId).not.toBe(page.events[0].eventId);
+    const search = await get(`/v1/events?workspace=${scope.workspaceId}&q=${encodeURIComponent("i̇stanbul")}&limit=10&org=other`);
+    expect(search.status).toBe(200); expect((await search.json() as any).events).toHaveLength(1);
+    const stored = await index.scanFingerprints({ ...tenant, source: scope.harness, sessionIds: [scope.sessionId] }, { fromMs: 0, limit: 100 });
+    const original = (await query()).hits[0]!;
+    await index.upsert([{ ...original, fingerprint: "newer", version: NOW.getTime() + 1, content: "newer", taskRefId: "", deliveryRecordId: "" }]);
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: false, inserted: 0, deleted: 0, reasons: ["search_version_conflict"] });
+    expect((await get(`/v1/events?workspace=${scope.workspaceId}&q=hello`)).status).toBe(501);
+    expect((await index.scanFingerprints({ ...tenant, source: scope.harness, sessionIds: [scope.sessionId] }, { fromMs: 0, limit: 100 })).rows).toHaveLength(stored.rows.length);
+    at = new Date(NOW.getTime() + 2);
+    keys = [await writeSession("srv_bb", [event("r1", "2", Date.parse(AT), "hello edited")], 2)];
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 1, deleted: 1 });
+    const current = (await query()).hits[0]!;
+    await index.upsert([{ ...current, workspaceId: "other", fingerprint: "other", version: at.getTime(), taskRefId: "", deliveryRecordId: "" }]);
+    keys = [await writeSession("srv_bb", [event("r1", "3", Date.parse(AT), "not scrubbed")], 3, { scrubbed: false })];
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: false, deleted: 0 });
+    expect((await query()).hits).toHaveLength(1);
+    keys = [];
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect((await query()).hits).toHaveLength(0);
+    expect((await index.query({ tenant: { ...tenant, workspaceId: "other" }, order: "asc", limit: 100 })).hits).toHaveLength(1);
+  } finally { await db.close(); }
+}, 30_000);
+
+test("forced tenant RLS on transcript_events: a non-superuser writer's scope pass still writes and erases; readers see only their tenant; a tampered policy refuses bootstrap", async () => {
+  const db = new PGlite({ extensions: { pg_trgm } });
+  // Synthetic isolated roles only: PGlite's default login is a superuser,
+  // which RLS never binds, so every bound statement below runs as one of these.
+  await db.exec(`CREATE EXTENSION pg_trgm; CREATE ROLE search_owner; CREATE ROLE search_reader;
+    DO $$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO search_owner', current_database()); END $$`);
+  const asOwner = async <T>(work: () => Promise<T>) => { await db.exec("SET ROLE search_owner"); try { return await work(); } finally { await db.exec("RESET ROLE"); } };
+  const bootstrap = createPostgresSearchIndex({ client: db });
+  await asOwner(async () => {
+    await bootstrap.ensureSchema(); // the owner bootstrap: FORCE binds this owner too
+    await bootstrap.ensureSchema(); // idempotent
+    await db.exec("GRANT USAGE ON SCHEMA search_index TO search_reader; GRANT SELECT ON search_index.transcript_events TO search_reader");
+  });
+  let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "hello one"), event("r2", "1", Date.parse(AT) + 1, "hello two")])];
+  const sb = fakeSupabase(() => keys);
+  const state: SearchProjectionState = {
+    async fromMs() { return 0; },
+    async record() {},
+    async partials() { return { sessions: [], overflow: false }; },
+  };
+  // The writer runtime's binding (lambda.ts): index SQL joins the pass's one
+  // transaction, here as the non-superuser owner. Metadata SQL stays on the fake.
+  const writer = writerTransactionSql(db);
+  const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: writer.sql }, "writer");
+  const pass = <T>(work: () => Promise<T>) => db.transaction(async tx => { await tx.exec("SET LOCAL ROLE search_owner"); return writer.run(tx, work); });
+  const deps: SearchIndexDeps = { transact: work => pass(() => sb.transact(work)), reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW };
+  // The read service's runner (liveness.ts poolTenantRunner) as the read role.
+  const tenantRunner: TenantSqlRunner = (orgId, workspaceId, work) => db.transaction(async tx => {
+    await tx.exec("SET LOCAL ROLE search_reader");
+    await tx.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]);
+    return work(tx);
+  });
+  const readerIndex = createPostgresSearchIndex({ client: db, tenantRunner });
+  const tenant = { orgId: scope.orgId, workspaceId: scope.workspaceId };
+  const other = { orgId: "org_2", workspaceId: scope.workspaceId };
+  const hits = async (t: typeof tenant) => (await readerIndex.query({ tenant: t, order: "asc", limit: 100 })).hits.map(h => [h.orgId, h.eventId]);
+  const unfiltered = (role: string, settings?: typeof tenant) => db.transaction(async tx => {
+    await tx.exec(`SET LOCAL ROLE ${role}`);
+    if (settings) await tx.query(TENANT_SETTINGS_SQL, [settings.orgId, settings.workspaceId]);
+    return (await tx.query<{ org_id: string }>("SELECT org_id FROM search_index.transcript_events ORDER BY org_id")).rows.map(r => r.org_id);
+  });
+  try {
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 2 });
+    const [first] = (await readerIndex.query({ tenant, order: "asc", limit: 1 })).hits;
+    // One writer transaction, two tenants: each statement binds its own tenant.
+    expect(await pass(() => adapter.index.upsert([
+      { ...first!, ...other, eventId: "b1", fingerprint: "b1", version: 1, taskRefId: "", deliveryRecordId: "" },
+      { ...first!, eventId: "a3", fingerprint: "a3", version: 1, taskRefId: "", deliveryRecordId: "" },
+    ]))).toEqual({ written: 2 });
+    expect((await hits(tenant)).map(([org]) => org)).toEqual([scope.orgId, scope.orgId, scope.orgId]);
+    expect(await hits(other)).toEqual([["org_2", "b1"]]);
+    // Without any WHERE clause the policy alone isolates: the reader sees only the
+    // bound tenant, nothing with no settings, and FORCE binds the owner as well.
+    expect(await unfiltered("search_reader", other)).toEqual(["org_2"]);
+    expect(await unfiltered("search_reader")).toEqual([]);
+    expect(await unfiltered("search_owner")).toEqual([]);
+    expect(await unfiltered("search_reader", { ...tenant, workspaceId: "ws_other" })).toEqual([]);
+    // A writer with no open transaction cannot carry the settings to its
+    // statement. Every call throws rather than writing, reading or erasing
+    // nothing: an erase that matched no row under RLS would lose the erasure.
+    const unbound = { code: "unavailable", detail: "tenant_unbound" };
+    const stored = async () => (await db.query<{ org_id: string }>("SELECT org_id FROM search_index.transcript_events ORDER BY org_id")).rows.length;
+    const before = await stored();
+    await expect(asOwner(() => bootstrap.upsert([{ ...first!, eventId: "loose", fingerprint: "loose", version: 1, taskRefId: "", deliveryRecordId: "" }]))).rejects.toMatchObject(unbound);
+    await expect(asOwner(() => bootstrap.query({ tenant, order: "asc", limit: 10 }))).rejects.toMatchObject(unbound);
+    await expect(asOwner(() => bootstrap.eraseScope({ ...tenant, source: scope.harness, sessionIds: [scope.sessionId] }))).rejects.toMatchObject(unbound);
+    await expect(asOwner(() => bootstrap.deleteEvents(tenant, [first!]))).rejects.toMatchObject(unbound);
+    expect(await stored()).toBe(before);
+    // Settings bound to one tenant never admit a write that moves a row to another.
+    await expect(db.transaction(async tx => {
+      await tx.exec("SET LOCAL ROLE search_owner");
+      await tx.query(TENANT_SETTINGS_SQL, [tenant.orgId, tenant.workspaceId]);
+      await tx.query("UPDATE search_index.transcript_events SET org_id = 'org_2'");
+    })).rejects.toMatchObject({ code: "42501" });
+    // Erasure through the pass removes only this tenant's scope.
+    keys = [];
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect(await hits(tenant)).toEqual([]);
+    expect(await hits(other)).toEqual([["org_2", "b1"]]);
+    // Drift is refused at bootstrap: an added permissive policy, a rewritten
+    // tenant_only, a narrowed command. Lifting FORCE is re-forced, then verified.
+    for (const [tamper, undo] of [
+      ["CREATE POLICY extra ON search_index.transcript_events USING (true)", "DROP POLICY extra ON search_index.transcript_events"],
+      ["ALTER POLICY tenant_only ON search_index.transcript_events USING (true)", "DROP POLICY tenant_only ON search_index.transcript_events"],
+      ["DROP POLICY tenant_only ON search_index.transcript_events; CREATE POLICY tenant_only ON search_index.transcript_events FOR SELECT USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))", "DROP POLICY tenant_only ON search_index.transcript_events"],
+    ] as const) {
+      await db.exec(tamper);
+      await expect(asOwner(() => bootstrap.ensureSchema())).rejects.toMatchObject({ code: "schema_missing", detail: "tenant_policy_mismatch" });
+      await db.exec(undo);
+      await asOwner(() => bootstrap.ensureSchema());
+    }
+    await db.exec("ALTER TABLE search_index.transcript_events NO FORCE ROW LEVEL SECURITY");
+    await asOwner(() => bootstrap.ensureSchema());
+    expect((await db.query("SELECT relforcerowsecurity AS forced FROM pg_class WHERE oid = 'search_index.transcript_events'::regclass")).rows).toEqual([{ forced: true }]);
+    expect(await hits(other)).toEqual([["org_2", "b1"]]);
+    // The reason the read service refuses a superuser login: RLS never binds it.
+    expect(await unfiltered("postgres")).toEqual(["org_2"]);
+  } finally { await db.close(); }
+}, 30_000);
+
+for (const failure of ["none", "throw", "invalid count"] as const) {
+  test(`portable reconciliation batches 5001 stale positions with second-batch failure: ${failure}`, async () => {
+    const db = new PGlite({ extensions: { pg_trgm } });
+    await db.exec("CREATE EXTENSION pg_trgm");
+    const keys = [await writeSession("srv_bb", [event("current", "1", Date.parse(AT), "current")])];
+    const sb = fakeSupabase(() => keys);
+    const records: boolean[] = [];
+    let metadataWrites = 0;
+    const state: SearchProjectionState = {
+      async fromMs() { return 0; },
+      async record(_tx, _scope, value) { records.push(value.complete); },
+      async partials() { return { sessions: records.at(-1) === true ? [] : [scope.sessionId], overflow: false }; },
+    };
+    const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer", pgliteTenants(db));
+    const tenant = { orgId: scope.orgId, workspaceId: scope.workspaceId };
+    const deps: SearchIndexDeps = {
+      transact: sb.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW,
+      async writeEvents() { metadataWrites++; return { written: true }; },
+      async writeCatalog() { return { written: true }; },
+    };
+    try {
+      await adapter.index.ensureSchema(); // in-process test database only
+      expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 1 });
+      const current = (await adapter.index.query({ tenant, order: "asc", limit: 1 })).hits[0]!;
+      const stale = Array.from({ length: 5001 }, (_, i) => ({ ...current, eventId: `stale-${i}`, fingerprint: `stale-${i}`, version: NOW.getTime(), taskRefId: "", deliveryRecordId: "" }));
+      await adapter.index.upsert(stale.slice(0, 5000));
+      await adapter.index.upsert(stale.slice(5000));
+      records.length = 0;
+      metadataWrites = 0;
+      const deleteEvents = adapter.index.deleteEvents.bind(adapter.index);
+      const sizes: number[] = [];
+      adapter.index.deleteEvents = async (actualTenant, positions) => {
+        expect(actualTenant).toEqual(tenant);
+        sizes.push(positions.length);
+        if (sizes.length === 2 && failure === "throw") throw new Error("second batch failed");
+        const result = await deleteEvents(actualTenant, positions);
+        if (sizes.length === 2 && failure === "invalid count") return { deleted: positions.length + 1 };
+        return result;
+      };
+      const scan = () => adapter.index.scanFingerprints({ ...tenant, source: scope.harness, sessionIds: [scope.sessionId] }, { fromMs: 0, limit: 10_000 });
+      if (failure === "none") {
+        expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 0, deleted: 5001 });
+        expect(sizes).toEqual([5000, 1]);
+        expect(records).toEqual([true]);
+        expect(metadataWrites).toBe(1);
+        expect((await scan()).rows.map(row => row.eventId)).toEqual([current.eventId]);
+        return;
+      }
+      await expect(indexSearchScope(scope, deps)).rejects.toThrow(failure === "throw" ? "second batch failed" : "search delete result invalid");
+      expect(sizes).toEqual([5000, 1]);
+      // Index calls may commit independently of metadata. A failed later batch
+      // must never advance completeness; a fresh retry rescans what remains.
+      expect(records).toEqual([]);
+      expect(metadataWrites).toBe(0);
+      expect(await state.partials(tenant, { limit: 10 })).toEqual({ sessions: [scope.sessionId], overflow: false });
+      expect((await scan()).rows).toHaveLength(failure === "throw" ? 2 : 1);
+      expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 0, deleted: failure === "throw" ? 1 : 0 });
+      expect(sizes).toEqual(failure === "throw" ? [5000, 1, 1] : [5000, 1]);
+      expect(records).toEqual([true]);
+      expect(metadataWrites).toBe(1);
+      expect((await scan()).rows.map(row => row.eventId)).toEqual([current.eventId]);
+    } finally { await db.close(); }
+  }, 30_000);
 }
 
 describe("search index from S3", () => {

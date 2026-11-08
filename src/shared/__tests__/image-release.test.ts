@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { githubJSON, REPOSITORY, validateRequest, verifyAncestry, verifySourceCI } from "../../../scripts/check-image-release.mjs";
+import { assertExpectedCI, githubJSON, REPOSITORY, validateRequest, verifyAncestry, verifySourceCI } from "../../../scripts/check-image-release.mjs";
 const sha = "a".repeat(40);
 const env = () => ({ GITHUB_REPOSITORY: REPOSITORY, GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_REF: "refs/heads/main", GITHUB_ACTOR: "khaliqgant", GITHUB_TRIGGERING_ACTOR: "khaliqgant", GITHUB_WORKFLOW_REF: `${REPOSITORY}/.github/workflows/publish-image.yml@refs/heads/main`, GITHUB_SHA: "b".repeat(40), SOURCE_SHA: sha, CONFIRM: "publish 96bulls-services", APPROVAL_NOTE: "Approved in operator chat" });
 const run = () => ({ id: 123, run_attempt: 1, head_sha: sha, head_branch: "main", event: "push", repository: { full_name: REPOSITORY }, head_repository: { full_name: REPOSITORY }, status: "completed", conclusion: "success" });
@@ -13,6 +13,13 @@ test("refuses publication from the duplicate import even under the same owner", 
  const duplicate = "AgentWorkforce/sessions-pipeline-oss";
  expect(() => validateRequest({ ...env(), GITHUB_REPOSITORY: duplicate, GITHUB_WORKFLOW_REF: `${duplicate}/.github/workflows/publish-image.yml@refs/heads/main` })).toThrow("dispatcher or workflow identity");
 });
+test("publishes only from the renamed canonical repository", () => expect(REPOSITORY).toBe("AgentWorkforce/relayhistory-pipeline"));
+for (const name of ["AgentWorkforce/sessions-pipeline", "AgentWorkforce/sessions-pipeline-cloud", "fork/relayhistory-pipeline", "agentworkforce/relayhistory-pipeline", "AgentWorkforce/relayhistory-pipeline-oss"]) {
+ test(`refuses publication or CI identity from unrelated repository ${name}`, async () => {
+  expect(() => validateRequest({ ...env(), GITHUB_REPOSITORY: name, GITHUB_WORKFLOW_REF: `${name}/.github/workflows/publish-image.yml@refs/heads/main` })).toThrow("dispatcher or workflow identity");
+  await expect(verifySourceCI(sha, api([{ ...run(), repository: { full_name: name }, head_repository: { full_name: name } }]))).rejects.toThrow("no official main CI run");
+ });
+}
 for (const [field, value] of Object.entries({ GITHUB_REPOSITORY: "fork/sessions-pipeline", GITHUB_EVENT_NAME: "push", GITHUB_REF: "refs/heads/topic", GITHUB_ACTOR: "another-actor", GITHUB_TRIGGERING_ACTOR: "another-actor", GITHUB_WORKFLOW_REF: `${REPOSITORY}/.github/workflows/other.yml@refs/heads/main`, CONFIRM: "publish", GITHUB_SHA: "bad" })) {
   test(`refuses foreign ${field}`, () => expect(() => validateRequest({ ...env(), [field]: value })).toThrow());
 }
@@ -29,6 +36,19 @@ for (const failingCommand of ["fetch", "cat-file", "merge-base"]) {
  });
 }
 test("accepts only the latest exact-source successful main run and its jobs", async () => expect(await verifySourceCI(sha, api())).toBe(123));
+test("private ancestry fetch uses only ephemeral process authentication", () => {
+ const calls: {args:string[];options:any}[]=[];
+ verifyAncestry(sha, (_command:string,args:string[],options:any)=>{calls.push({args,options});}, "fixture-token-only");
+ expect(calls.map(c=>c.args[0])).toEqual(["fetch","cat-file","merge-base"]);
+ expect(calls[0].options.env.GIT_CONFIG_VALUE_0).toBe(`AUTHORIZATION: basic ${Buffer.from("x-access-token:fixture-token-only").toString("base64")}`);
+ expect(calls.every(c=>!c.args.join(" ").includes("fixture-token-only"))).toBe(true);
+ expect(calls.slice(1).every(c=>c.options.env===undefined)).toBe(true);
+});
+test("a new CI run after signing cannot authorize copying the older signed release", () => {
+ expect(()=>assertExpectedCI(123,undefined)).not.toThrow();
+ expect(()=>assertExpectedCI(123,"123")).not.toThrow();
+ for(const expected of ["124","","0"," 123"]) expect(()=>assertExpectedCI(123,expected)).toThrow("changed after signing");
+});
 test("refuses green CI from the duplicate import", async () => {
  const duplicate = { full_name: "AgentWorkforce/sessions-pipeline-oss" };
  await expect(verifySourceCI(sha, api([{ ...run(), repository: duplicate, head_repository: duplicate }]))).rejects.toThrow("no official main CI run");
@@ -100,8 +120,8 @@ test("documented verification stops if build provenance fails", () => {
  const block=doc.match(/```bash\n([\s\S]*?)```/)?.[1]; expect(block).toBeDefined();
  const dir=mkdtempSync(join(tmpdir(),"image-verification-"));
  try {
-  const script=`n=0; gh() { n=$((n+1)); if [[ $n == 1 ]]; then return 42; fi; echo unexpected-later-check; }; jq() { echo unexpected-later-check; };\n${block}`;
-  const result=Bun.spawnSync(["bash","-c",script],{cwd:dir,env:{PATH:process.env.PATH??"",image:"test",source_sha:sha,workflow_sha:sha,ci_run_id:"123"},stdout:"pipe",stderr:"pipe"});
+  const script=`node() { return 42; }; cosign() { echo unexpected-later-check; };\n${block}\necho unexpected-later-check`;
+  const result=Bun.spawnSync(["bash","-c",script],{cwd:dir,env:{PATH:process.env.PATH??"",image:"ghcr.io/agentworkforce/96bulls-services@sha256:"+"c".repeat(64),source_sha:sha,workflow_sha:sha,ci_run_id:"123",publish_run_id:"456",publish_run_attempt:"1",receipt_dir:dir},stdout:"pipe",stderr:"pipe"});
   expect(result.exitCode).toBe(42);expect(result.stdout.toString()).not.toContain("unexpected-later-check");
  } finally {rmSync(dir,{recursive:true,force:true});}
 });

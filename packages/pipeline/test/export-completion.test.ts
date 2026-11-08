@@ -44,7 +44,7 @@ beforeAll(async () => {
     readFileSync(
       supabase("bootstrap/session_ingest_roles.sql"),
       "utf8",
-    ),
+    ) + "\n" + readFileSync(supabase("bootstrap/session_read_api_roles.sql"), "utf8"),
   );
   for (const file of readdirSync(supabase("migrations/")).sort())
     await pg.exec(readFileSync(supabase(`migrations/${file}`), "utf8"));

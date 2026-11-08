@@ -90,7 +90,7 @@ beforeAll(async () => {
     await readFile(
       join(SUPABASE, "bootstrap/session_ingest_roles.sql"),
       "utf8",
-    ),
+    ) + "\n" + (await readFile(join(SUPABASE, "bootstrap/session_read_api_roles.sql"), "utf8")),
   );
   for (const file of (await readdir(join(SUPABASE, "migrations")))
     .filter((f) => f.endsWith(".sql"))

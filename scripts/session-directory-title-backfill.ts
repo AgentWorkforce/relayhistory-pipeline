@@ -20,12 +20,14 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import pg from "pg";
-import { parseCliLogin } from "./schema-release-owner-operator-plan.ts";
+import { parseCliLogin } from "../src/shared/supabase-cli-login.ts";
+import { requiredSupabaseProjectRef } from "../src/shared/deploy-target.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
 import { sessionReadOnly } from "../src/migration/neon-s3-sync/neon-reader.ts";
 import { backfillDirectoryTitles } from "../src/hoopdb/session-directory-title-backfill.ts";
 
-const REF = "pyamkrhoyszgzirqqffq", HOST = "aws-0-us-east-1.pooler.supabase.com", CLI = process.env.SUPABASE_CLI ?? "/home/khaliqgant/.local/bin/supabase";
+// The Supabase project is explicit operator configuration (SUPABASE_PROJECT_REF), read only when connecting.
+const HOST = "aws-0-us-east-1.pooler.supabase.com", CLI = process.env.SUPABASE_CLI ?? "/home/khaliqgant/.local/bin/supabase";
 const args = process.argv.slice(2);
 const flag = (k: string) => args.includes(k);
 const val = (k: string) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : undefined; };
@@ -38,7 +40,8 @@ const { neonUrl } = JSON.parse(readFileSync(0, "utf8").split("\n")[0] || "{}") a
 if (!/^postgres(ql)?:\/\/[^@]+@[^/]+\.neon\.tech\//.test(neonUrl ?? "")) { console.error("neonUrl (a Neon connection string) required on stdin"); process.exit(64); }
 
 const neon = new pg.Client({ connectionString: neonUrl, ssl: { rejectUnauthorized: true }, application_name: "p3b-title-backfill-readonly" });
-const login = parseCliLogin(execFileSync(CLI, ["db", "dump", "--linked", "--project-ref", REF, "--dry-run"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }));
+const REF = requiredSupabaseProjectRef(process.env);
+const login = parseCliLogin(execFileSync(CLI, ["db", "dump", "--linked", "--project-ref", REF, "--dry-run"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }), REF);
 const supa = new pg.Client({ host: HOST, port: 5432, database: "postgres", user: `cli_login_postgres.${REF}`, password: login.password,
   ssl: { ca: SUPABASE_PROD_CA_2021, rejectUnauthorized: true, servername: HOST }, options: "-c statement_timeout=60000 -c lock_timeout=5000", application_name: "p3b-title-backfill" });
 login.password = "";

@@ -93,7 +93,8 @@ export class SeedProofIndex {
   }
   async addPointer(pointer:SeedPointer,deps:ProofDeps,budget?:SeedProofBudget) {
     if (this.state() !== "building") fail("seed_index_not_building");
-    if (budget && (Date.now() > budget.deadlineAtMs || !Number.isSafeInteger(budget.maxRecords) || budget.maxRecords < 0 || !Number.isSafeInteger(budget.maxEvidenceBytes) || budget.maxEvidenceBytes < 1)) fail("seed_proof_bound");
+    if (budget && Date.now() > budget.deadlineAtMs) fail("seed_proof_deadline");
+    if (budget && (!Number.isSafeInteger(budget.maxRecords) || budget.maxRecords < 0 || !Number.isSafeInteger(budget.maxEvidenceBytes) || budget.maxEvidenceBytes < 1)) fail("seed_proof_bound");
     if (pointer.org_id !== this.orgId || pointer.bucket !== deps.bucket ||
         pointer.storage_provider !== deps.provider || !["ndjson","jsonl","sqlite-rows"].includes(pointer.raw_format) ||
         !/^[a-f0-9]{64}$/.test(pointer.content_sha256) ||

@@ -249,11 +249,12 @@ try{
   try{
    let poolChecked=false,storeChecked=false;
    const result=await runBufferedGcJob({AWS_REGION:"us-east-1",HOOPDB_DB_MODE:"supabase",INGEST_GC_ENABLED:"true",INGEST_GC_BUCKET:bucket,
-    INGEST_GC_KMS_KEY_ARN:"arn:aws:kms:us-east-1:941433935742:key/11111111-1111-4111-8111-111111111111",
-    INGEST_GC_SECRET_ARN:"arn:aws:secretsmanager:us-east-1:941433935742:secret:96bulls/proof/buffered-gc-abcdef",INGEST_GC_EXPECT_GENERATION:expected,INGEST_GC_BATCH_LIMIT:"20"},{
-    secret:async()=>JSON.stringify({hoopdb_url:"postgresql://bulls96_session_ingest.pyamkrhoyszgzirqqffq:synthetic-unused@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require"}),
+    INGEST_GC_AWS_ACCOUNT_ID:"111122223333",INGEST_GC_SUPABASE_PROJECT_REF:"abcdefghijklmnopqrst",
+    INGEST_GC_KMS_KEY_ARN:"arn:aws:kms:us-east-1:111122223333:key/11111111-1111-4111-8111-111111111111",
+    INGEST_GC_SECRET_ARN:"arn:aws:secretsmanager:us-east-1:111122223333:secret:96bulls/proof/buffered-gc-abcdef",INGEST_GC_EXPECT_GENERATION:expected,INGEST_GC_BATCH_LIMIT:"20"},{
+    secret:async()=>JSON.stringify({hoopdb_url:"postgresql://bulls96_session_ingest.abcdefghijklmnopqrst:synthetic-unused@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require"}),
     pool:c=>{assert(c.host==="aws-0-us-east-1.pooler.supabase.com"&&c.port===5432&&(c.ssl as any).rejectUnauthorized===true,"job_pinned_tls");poolChecked=true;return new pg.Pool({...cfg("buffer_gc_runtime_fixture","bulls96_session_ingest"),max:2})},
-    store:c=>{assert(c.serverSideEncryption==="aws:kms"&&c.sseKmsKeyId?.includes("941433935742"),"job_sse_kms");storeChecked=true;return auditStore},
+    store:c=>{assert(c.serverSideEncryption==="aws:kms"&&c.sseKmsKeyId?.includes("111122223333"),"job_sse_kms");storeChecked=true;return auditStore},
     eraser:()=>eraser
    });
    assert(result.finished>=1&&poolChecked&&storeChecked,"job_real_finished");
@@ -269,9 +270,10 @@ try{
    await lock.query("BEGIN;UPDATE sessions.__96bulls_role_validation SET status='pass'");
    const start=Date.now(),before=proof.requests;
    const error=await runBufferedGcJob({AWS_REGION:"us-east-1",HOOPDB_DB_MODE:"supabase",INGEST_GC_ENABLED:"true",INGEST_GC_BUCKET:bucket,
-    INGEST_GC_KMS_KEY_ARN:"arn:aws:kms:us-east-1:941433935742:key/11111111-1111-4111-8111-111111111111",
-    INGEST_GC_SECRET_ARN:"arn:aws:secretsmanager:us-east-1:941433935742:secret:96bulls/proof/buffered-gc-abcdef",INGEST_GC_EXPECT_GENERATION:expected},{
-    secret:async()=>JSON.stringify({hoopdb_url:"postgresql://bulls96_session_ingest.pyamkrhoyszgzirqqffq:synthetic-unused@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require"}),
+    INGEST_GC_AWS_ACCOUNT_ID:"111122223333",INGEST_GC_SUPABASE_PROJECT_REF:"abcdefghijklmnopqrst",
+    INGEST_GC_KMS_KEY_ARN:"arn:aws:kms:us-east-1:111122223333:key/11111111-1111-4111-8111-111111111111",
+    INGEST_GC_SECRET_ARN:"arn:aws:secretsmanager:us-east-1:111122223333:secret:96bulls/proof/buffered-gc-abcdef",INGEST_GC_EXPECT_GENERATION:expected},{
+    secret:async()=>JSON.stringify({hoopdb_url:"postgresql://bulls96_session_ingest.abcdefghijklmnopqrst:synthetic-unused@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require"}),
     pool:()=>new pg.Pool({...cfg("buffer_gc_runtime_fixture","bulls96_session_ingest"),application_name:"gc-job-bounded",max:2}),
     store:()=>auditStore,eraser:()=>eraser
    }).then(()=>null,e=>e);

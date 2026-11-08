@@ -242,7 +242,7 @@ beforeAll(async () => {
     await readFile(
       join(ROOT_DIR, "supabase/bootstrap/session_ingest_roles.sql"),
       "utf8",
-    ),
+    ) + "\n" + (await readFile(join(ROOT_DIR, "supabase/bootstrap/session_read_api_roles.sql"), "utf8")),
   );
   for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
     for (const file of (await readdir(join(ROOT_DIR, dir)))

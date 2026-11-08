@@ -93,6 +93,29 @@ The derived index has its own schema (`search_index`, configurable); transcript
 text never goes in the metadata directory, `session_directory` (decision 0002).
 Key columns use `COLLATE "C"` to preserve cursor order. `ensureSchema` requires
 pg_trgm to be installed already and performs DDL only when explicitly called.
+The table has forced row-level security with a `tenant_only` policy (the same
+shape as `projection_state`): rows are visible and writable only where
+`org_id`/`workspace_id` equal the transaction's `bulls96_read.org_id`/
+`bulls96_read.workspace_id` settings. `ensureSchema` creates it and verifies it
+exactly, refusing drift with `schema_missing (tenant_policy_mismatch)`. Every
+tenant-scoped statement binds its own tenant: through the configured
+`tenantRunner` (a reader's tenant transaction), or else by setting the settings
+on the client just before the statement, which only holds inside an open
+transaction (a writer's scope pass). The adapter checks that the settings held
+and otherwise throws `unavailable (tenant_unbound)`, so a bare pool never reads,
+deletes or erases nothing and reports success. Deletes also report, from the
+deleting statement, that they were bound and removed every matching row they
+saw, and an erase then confirms no scope row is left; a shortfall throws
+`unavailable (delete_incomplete)` (retryable). A superuser or `BYPASSRLS` role
+skips the policy.
+
+Under RLS the trigram GIN indexes are not used for `q`: `LIKE` (`textlike`) is
+not leakproof, so PostgreSQL will not evaluate it before the policy, and a
+search filters the tenant's rows from the scope index instead. Search cost is
+therefore linear in one tenant's size (about 20-27 ms per query at 200,000 rows
+in one tenant on PostgreSQL 17, against 2 s `statement_timeout`). That is
+accepted at self-host scale for now; a tenant-scoped search path that keeps
+trigram acceleration is a follow-up.
 
 This adapter does not replace RelayHistory's existing transcript search path.
 Selecting which service owns self-host transcript queries, migrating any data,

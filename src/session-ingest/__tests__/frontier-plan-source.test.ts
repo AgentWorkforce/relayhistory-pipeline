@@ -103,16 +103,16 @@ describe("frontier seed source evidence", () => {
 
     const expired = await fixture();
     const reader = expired.deps.reader;
-    expired.deps.reader = { ...reader, async read(key) { await new Promise(resolve => setTimeout(resolve, 5)); return reader.read(key); } };
-    await expect(captureSeedScopeExportEvidence(expired.sql, expired.deps, expired.versioning, { ...expired.input, deadlineMs: 1 }))
+    expired.deps.reader = { ...reader, async read(key) { await new Promise(resolve => setTimeout(resolve, 40)); return reader.read(key); } };
+    await expect(captureSeedScopeExportEvidence(expired.sql, expired.deps, expired.versioning, { ...expired.input, deadlineMs: 20 }))
       .rejects.toMatchObject({ code: "seed_proof_deadline" });
 
     const versioningExpired = await fixture();
     versioningExpired.versioning.read = async () => {
-      await new Promise(resolve => setTimeout(resolve, 5));
+      await new Promise(resolve => setTimeout(resolve, 40));
       return "Enabled";
     };
-    await expect(captureSeedScopeExportEvidence(versioningExpired.sql, versioningExpired.deps, versioningExpired.versioning, { ...versioningExpired.input, deadlineMs: 1 }))
+    await expect(captureSeedScopeExportEvidence(versioningExpired.sql, versioningExpired.deps, versioningExpired.versioning, { ...versioningExpired.input, deadlineMs: 20 }))
       .rejects.toMatchObject({ code: "frontier_seed_deadline" });
 
     const resumed = await fixture();
@@ -165,8 +165,8 @@ describe("frontier seed source evidence", () => {
 
     const deadline = await fixture();
     const reader = deadline.deps.reader;
-    deadline.deps.reader = { ...reader, async read(key) { await new Promise(resolve => setTimeout(resolve, 5)); return reader.read(key); } };
-    await expect(captureSeedScopeExportEvidence(deadline.sql, deadline.deps, deadline.versioning, { ...deadline.input, maxDurationMs: 1 }))
+    deadline.deps.reader = { ...reader, async read(key) { await new Promise(resolve => setTimeout(resolve, 40)); return reader.read(key); } };
+    await expect(captureSeedScopeExportEvidence(deadline.sql, deadline.deps, deadline.versioning, { ...deadline.input, maxDurationMs: 20 }))
       .rejects.toMatchObject({ code: "seed_proof_deadline" });
   });
 });

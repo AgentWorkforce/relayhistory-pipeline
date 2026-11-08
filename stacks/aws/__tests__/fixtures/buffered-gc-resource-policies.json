@@ -1,0 +1,116 @@
+{
+  "key": [
+    {
+      "Sid": "BufferedGcDataViaS3",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::111122223333:role/synthetic-buffered-gc"
+      },
+      "Action": [
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:CallerAccount": "111122223333",
+          "kms:ViaService": "s3.us-east-1.amazonaws.com"
+        },
+        "StringLike": {
+          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::synthetic-transcripts-111122223333/96bulls/*/buffered-batches/v1/ws=*/m=srv_*"
+        }
+      }
+    },
+    {
+      "Sid": "BufferedGcNeverCanonicalCrypto",
+      "Effect": "Deny",
+      "Principal": {
+        "AWS": "arn:aws:iam::111122223333:role/synthetic-buffered-gc"
+      },
+      "Action": [
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::synthetic-transcripts-111122223333/96bulls/*/upload-generations/*"
+        }
+      }
+    }
+  ],
+  "bucket": [
+    {
+      "Sid": "BufferedGcCannotDeleteOutsideBuffer",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion"
+      ],
+      "NotResource": "arn:aws:s3:::synthetic-transcripts-111122223333/96bulls/*/buffered-batches/v1/ws=*/m=srv_*/b=*.staged.ndjson.zst",
+      "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::111122223333:role/synthetic-buffered-gc"
+        }
+      }
+    },
+    {
+      "Sid": "BufferedGcCannotPlainDeleteBarrier",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::synthetic-transcripts-111122223333/*",
+      "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::111122223333:role/synthetic-buffered-gc"
+        }
+      }
+    },
+    {
+      "Sid": "BufferedGcCannotAccessCanonical",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": "arn:aws:s3:::synthetic-transcripts-111122223333/96bulls/*/upload-generations/*",
+      "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::111122223333:role/synthetic-buffered-gc"
+        }
+      }
+    },
+    {
+      "Sid": "BufferedGcCannotListCanonicalVersions",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:ListBucketVersions",
+      "Resource": "arn:aws:s3:::synthetic-transcripts-111122223333",
+      "Condition": {
+        "ArnEquals": {
+          "aws:PrincipalArn": "arn:aws:iam::111122223333:role/synthetic-buffered-gc"
+        },
+        "StringLike": {
+          "s3:prefix": "96bulls/*/upload-generations/*"
+        }
+      }
+    }
+  ],
+  "deleteException": {
+    "Sid": "OnlyTheEraserDeletes",
+    "Effect": "Deny",
+    "Principal": "*",
+    "Action": [
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion"
+    ],
+    "Resource": "arn:aws:s3:::synthetic-transcripts-111122223333/*",
+    "Condition": {
+      "ArnNotEquals": {
+        "aws:PrincipalArn": [
+          "arn:aws:iam::111122223333:user/synthetic-eraser",
+          "arn:aws:iam::111122223333:role/synthetic-buffered-gc"
+        ]
+      }
+    }
+  }
+}

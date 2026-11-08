@@ -6,7 +6,10 @@
 -- S3 objects are (session-timing-source.ts SESSION_POINTERS_SQL, the query of
 -- sessions.session_directory_pointers). So this role may read the id/time and
 -- object-pointer columns of the pointer table and nothing else: no content, no
--- titles, no metadata, no other table, no function, no writes.
+-- titles, no metadata, no other table, no writes. Its function grants are made
+-- by migration 20261105034000 (EXECUTE on sessions.list_session_directory_for /
+-- session_directory_activity_for, the directory list and activity pinned to the
+-- same tenant settings), not here.
 --
 --   role      LOGIN NOINHERIT NOBYPASSRLS; no SUPERUSER, CREATEDB, CREATEROLE or
 --             REPLICATION; read-only transactions; statement_timeout 2s.
@@ -23,6 +26,10 @@
 --             (TENANT_SETTINGS_SQL). A setting never set on the connection is NULL;
 --             after a transaction-local set_config ends it reads as '' on that pooled
 --             connection. Neither matches a row: org_id and workspace_id are never NULL or ''.
+--
+-- The bare role is created NOLOGIN before migrate by session_read_api_roles.sql (the
+-- migration's grant needs it); this file then makes it LOGIN. The CREATE below remains
+-- for a database whose migrate predates that bootstrap.
 --
 -- Idempotent. Run as `postgres` (Supabase) after the HoopDb migrations; set the
 -- password separately (never in this file), then verify:

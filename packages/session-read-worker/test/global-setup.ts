@@ -14,7 +14,7 @@
  * READ_WORKER_TEST_PG_URL (a superuser URL). Everything it creates is dropped
  * in teardown. Test-only credentials, generated here, never written to disk.
  */
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -44,6 +44,45 @@ const read = (path: string) => readFileSync(join(root, path), "utf8");
 /** psql meta-commands (\set) are not SQL. */
 const sql = (path: string) => read(path).split("\n").filter((l) => !l.startsWith("\\")).join("\n");
 const id = () => randomBytes(8).toString("hex");
+
+/**
+ * A synthetic relaycontrol introspection endpoint, so the relaycontrol suite
+ * drives workerd's real fetch (test/relaycontrol-real-fetch.test.ts). Behaviour
+ * is chosen by the base path; the secret and ids are synthetic.
+ */
+const RELAYCONTROL_TEST_SECRET = "synthetic-relaycontrol-secret";
+export function relaycontrolIntrospect(req: IncomingMessage, res: ServerResponse) {
+  const chunks: Buffer[] = [];
+  req.on("data", (c: Buffer) => chunks.push(c));
+  req.on("end", () => {
+    const base = (req.url ?? "").replace(/\/internal\/v1\/auth\/introspect$/, "");
+    if (base === "/rc-redirect") {
+      res.writeHead(302, { location: "/rc-ok/internal/v1/auth/introspect" }).end();
+      return;
+    }
+    if (req.headers.authorization !== `Bearer ${RELAYCONTROL_TEST_SECRET}`) {
+      res.writeHead(401).end();
+      return;
+    }
+    if (base === "/rc-bad-request") {
+      res.writeHead(400).end();
+      return;
+    }
+    if (base === "/rc-large") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ active: false, reason: "x".repeat(20 * 1024) }));
+      return;
+    }
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { aud: string };
+    const now = Math.floor(Date.now() / 1000);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      active: true, sub: "u-real", email: null, principal_type: "desktop-user", machine_id: null,
+      org: "org-real", workspace: "ws-real", scopes: ["rth:read"], aud: body.aud,
+      iat: now, exp: now + 600, token_id: "tokid_real",
+    }));
+  });
+}
 
 export default async function setup(project: TestProject) {
   const chUrl = process.env.READ_API_TEST_CLICKHOUSE_URL;
@@ -81,6 +120,7 @@ export default async function setup(project: TestProject) {
   // The disposable database replays the ingest ledger too; provision its
   // restricted roles through the same privileged bootstrap used by migrate.
   await db.query(read("supabase/bootstrap/session_ingest_roles.sql"));
+  await db.query(read("supabase/bootstrap/session_read_api_roles.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await db.query(read(`supabase/migrations/${file}`));
   await db.query(sql("supabase/bootstrap/session_read_api_role.sql"));
   // Roles are cluster-wide: the password is per run, so a stale one never logs in.
@@ -111,6 +151,8 @@ export default async function setup(project: TestProject) {
     if (req.url === "/.well-known/jwks.json") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ keys: [publicJwk] }));
+    } else if (req.method === "POST" && req.url?.endsWith("/internal/v1/auth/introspect")) {
+      relaycontrolIntrospect(req, res);
     } else {
       res.writeHead(404).end();
     }

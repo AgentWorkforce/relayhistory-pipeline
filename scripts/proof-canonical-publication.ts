@@ -137,9 +137,9 @@ try{
  await check('actual permanent runtime validates compiled schema and dedicated role before publish and generation GC',async()=>{
   const f=await fixture();await f.deliver();
   const env={AWS_REGION:'us-east-1',HOOPDB_DB_MODE:'supabase',INGEST_PUBLISH_ENABLED:'true',INGEST_PUBLICATION_GC_ENABLED:'true',
-   INGEST_PUBLISH_BUCKET:bucket,INGEST_PUBLISH_EXPECT_GENERATION:expected,INGEST_PUBLISH_SECRET_ARN:'arn:aws:secretsmanager:us-east-1:941433935742:secret:96bulls/test/canonical-publisher-abcdef',
-   INGEST_PUBLISH_KMS_KEY_ARN:'arn:aws:kms:us-east-1:941433935742:key/12345678-1234-1234-1234-123456789abc',INGEST_PUBLISH_INSTANCE_PROFILE_ARN:'arn:aws:iam::941433935742:instance-profile/owned-fixture',INGEST_PUBLISH_ROLE_NAME:'owned-fixture',INGEST_PUBLISH_BUDGET_MS:'30000'};
-  const overrides={credentials:async()=>credentials,secret:async()=>JSON.stringify({hoopdb_url:'postgresql://bulls96_session_ingest.pyamkrhoyszgzirqqffq:synthetic-unused@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require'}),
+   INGEST_PUBLISH_BUCKET:bucket,INGEST_PUBLISH_EXPECT_GENERATION:expected,INGEST_PUBLISH_AWS_ACCOUNT_ID:'111122223333',INGEST_PUBLISH_SUPABASE_PROJECT_REF:'abcdefghijklmnopqrst',INGEST_PUBLISH_INSTANCE_ID:'i-0123456789abcdef0',INGEST_PUBLISH_SECRET_ARN:'arn:aws:secretsmanager:us-east-1:111122223333:secret:96bulls/test/canonical-publisher-abcdef',
+   INGEST_PUBLISH_KMS_KEY_ARN:'arn:aws:kms:us-east-1:111122223333:key/12345678-1234-1234-1234-123456789abc',INGEST_PUBLISH_INSTANCE_PROFILE_ARN:'arn:aws:iam::111122223333:instance-profile/owned-fixture',INGEST_PUBLISH_ROLE_NAME:'owned-fixture',INGEST_PUBLISH_BUDGET_MS:'30000'};
+  const overrides={credentials:async()=>credentials,secret:async()=>JSON.stringify({hoopdb_url:'postgresql://bulls96_session_ingest.abcdefghijklmnopqrst:synthetic-unused@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require'}),
    pool:()=>new pg.Pool({...cfg(database,'bulls96_session_ingest'),max:4}),store:()=>store,eraser:()=>eraser};
   const compiled=process.env.PUBLICATION_COMPILED_BUNDLE;
   if(compiled&&!compiled.startsWith('/home/khaliqgant/relay-briefs/canonical-publication-'))throw Error('owned_bundle_path');
