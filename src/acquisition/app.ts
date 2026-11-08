@@ -5,73 +5,41 @@
  *
  *   native (Desktop -> History, desktop-user principal, scope rth:acquire)
  *     POST /v1/acquisition/native/installations | claims | revocations | rebinds
- *     GET  /v1/acquisition/native/status?installationId=&source=&sessionIds=a,b
+ *     GET  /v1/acquisition/native/status?installationId=&source=&sessionIds=a&sessionIds=b (repeated, never comma-split)
  *   ops (Cloud issuer -> History, per-workspace service principal, scope acquisition:operate)
  *     POST /v1/acquisition/ops/install | revoke | rebind | status
  *
- * Auth mirrors the session-ingest edge (#316): Bearer only, the #313
- * relaycontrol client with aud = ACQUISITION_ORIGIN compared by normalized
- * origin, identity only from the introspection answer, fail closed (503) when
- * introspection is unavailable. No client header is forwarded anywhere. The
+ * Auth: Bearer only, verified by this service's own introspection client
+ * (verifier.ts: #313 wire contract, per-route prefix / principal_type / scope,
+ * aud = ACQUISITION_ORIGIN compared by normalized origin), identity only from
+ * the introspection answer, fail closed (503) when introspection is
+ * unavailable. Every ops refusal is 403 not_authorized (contract P2), including
+ * a missing bearer; native mirrors the edge (401 for a missing or refused token). No client header is forwarded anywhere. The
  * bearer, the installation proof, G and key material are never logged: the
  * logger receives only allowlisted fields built here.
  */
 import { Hono, type Context } from "hono";
-import {
-  isRelaycontrolToken,
-  normalizedAudience,
-  RELAYCONTROL_PRINCIPAL_TYPE,
-  RelaycontrolRejectedError,
-  type RelaycontrolIntrospector,
-} from "@rhc/auth/relaycontrol.ts";
+import { RelaycontrolRejectedError } from "@rhc/auth/relaycontrol.ts";
 import { log as sharedLog, type Level } from "../shared/log.ts";
 import { httpForError, type Installer } from "./installer.ts";
 import { INSTALLATION_PROOF_HEADER, NativeRefusal, requestedInstallationId, type NativeIdentity, type NativeIssuer } from "./native-issuer.ts";
 import type { AcquisitionKind } from "./validation.ts";
+import { ACQUISITION_POLICIES, tokenFitsGroup, type AcquisitionGroup, type AcquisitionPrincipal, type Authenticator } from "./verifier.ts";
 
-export const NATIVE_SCOPE = "rth:acquire";
-export const OPS_SCOPE = "acquisition:operate";
-export const NATIVE_PRINCIPAL = "desktop-user";
-export const OPS_PRINCIPAL = "service";
+export const NATIVE_SCOPE = ACQUISITION_POLICIES.native.scope;
+export const OPS_SCOPE = ACQUISITION_POLICIES.ops.scope;
+export const NATIVE_PRINCIPAL = ACQUISITION_POLICIES.native.principalType;
+export const OPS_PRINCIPAL = ACQUISITION_POLICIES.ops.principalType;
 export const MAX_BODY_BYTES = 64 * 1024;
+/**
+ * Request-target (path + query) cap in UTF-8 bytes of the percent-encoded
+ * target; over it is 414 request_uri_too_long, independent of the 500-id cap.
+ * Below Node's default 16 KiB header-block limit (which would answer 431 first).
+ */
+export const MAX_REQUEST_TARGET_BYTES = 8 * 1024;
 const CORRELATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
-export type AcquisitionGroup = "native" | "ops";
-
-/** The introspected caller. principalType is relaycontrol's principal_type. */
-export interface AcquisitionPrincipal {
-  readonly userId: string;
-  readonly orgId: string;
-  readonly workspaceId: string | undefined;
-  readonly scopes: readonly string[];
-  readonly principalType: string;
-}
-
-/**
- * Token -> principal. Throws RelaycontrolRejectedError (token refused) or
- * anything else (introspection unavailable: 503, fail closed).
- */
-export interface Authenticator {
-  authenticate(token: string): Promise<AcquisitionPrincipal>;
-}
-
-/**
- * The production adapter over the shared #313 client, used exactly as the
- * session-ingest edge uses it. That client admits only principal_type
- * "desktop-user" and only the scopes in RELAYCONTROL_SCOPE_ALLOWLIST
- * (rth:read, rth:sync), so today every acquisition request fails closed with
- * 403 until its owner extends both (docs/acquisition-exchange.md).
- */
-export function relaycontrolAuthenticator(introspector: RelaycontrolIntrospector, origin: string): Authenticator {
-  return {
-    async authenticate(token) {
-      const auth = await introspector.verifyRelaycontrolToken(token, { aud: origin });
-      if (normalizedAudience(auth.historyOrigin ?? "") !== normalizedAudience(origin) || auth.migration)
-        throw new RelaycontrolRejectedError("aud_mismatch");
-      return { userId: auth.userId, orgId: auth.orgId, workspaceId: auth.workspaceId, scopes: [...auth.scopes], principalType: RELAYCONTROL_PRINCIPAL_TYPE };
-    },
-  };
-}
+export type { AcquisitionGroup, AcquisitionPrincipal, Authenticator };
 
 export type AcquisitionLog = (level: Level, message: string, fields: Record<string, unknown>) => void;
 
@@ -100,7 +68,7 @@ type Env = { Variables: { correlationId: string } };
 type Answer = { status: number; body: unknown };
 
 class HttpRefusal extends Error {
-  constructor(readonly status: 400 | 401 | 403 | 404 | 413 | 415 | 503, readonly code: string) {
+  constructor(readonly status: 400 | 401 | 403 | 404 | 413 | 414 | 415 | 503, readonly code: string) {
     super(code);
     this.name = "HttpRefusal";
   }
@@ -165,6 +133,8 @@ export function createAcquisitionApp(deps: AcquisitionAppDeps) {
     try {
       if (!deps.enabled || !deps.groupEnabled) {
         answer = { status: 503, body: { error: { code: "acquisition_disabled" } } };
+      } else if (requestTargetBytes(c.req.url) > MAX_REQUEST_TARGET_BYTES) {
+        answer = { status: 414, body: { error: { code: "request_uri_too_long" } } };
       } else if (!known) {
         answer = { status: 404, body: { error: { code: "not_found" } } };
       } else {
@@ -192,6 +162,11 @@ export function createAcquisitionApp(deps: AcquisitionAppDeps) {
   return app;
 }
 
+function requestTargetBytes(raw: string): number {
+  const url = new URL(raw);
+  return Buffer.byteLength(url.pathname + url.search, "utf8");
+}
+
 function errorCode(body: object): string | undefined {
   const error = (body as { error?: { code?: unknown; reason?: unknown } }).error;
   if (!error) return undefined;
@@ -206,35 +181,36 @@ function refusalAnswer(error: unknown, group: AcquisitionGroup): Answer {
 
 /** Steps: bearer, token shape, introspection, principal type, workspace, scope. */
 async function authenticate(c: Context<Env>, authenticator: Authenticator, group: AcquisitionGroup): Promise<AcquisitionPrincipal> {
-  // Ops: every token/audience/scope refusal is 403 not_authorized (contract P2); native mirrors the edge (401).
+  // Ops: every refusal, a missing bearer included, is 403 not_authorized (contract P2); native mirrors the edge (401).
   const rejected = () => (group === "ops" ? new HttpRefusal(403, "not_authorized") : new HttpRefusal(401, "unauthorized"));
   const token = bearer(c.req.header("Authorization"));
-  if (!token) throw new HttpRefusal(401, "unauthorized");
-  if (!isRelaycontrolToken(token)) throw rejected();
+  if (!token) throw rejected();
+  // Per-route token class: ops takes only sh_wk_, native only sh_at_; the other is refused before introspection.
+  if (!tokenFitsGroup(token, group)) throw rejected();
   let principal: AcquisitionPrincipal;
   try {
-    principal = await authenticator.authenticate(token);
+    principal = await authenticator.authenticate(token, group);
   } catch (error) {
     if (error instanceof RelaycontrolRejectedError) throw rejected();
     throw new HttpRefusal(503, "introspection_unavailable");
   }
-  const wantPrincipal = group === "ops" ? OPS_PRINCIPAL : NATIVE_PRINCIPAL;
-  const wantScope = group === "ops" ? OPS_SCOPE : NATIVE_SCOPE;
-  if (principal.principalType !== wantPrincipal || !principal.workspaceId || !principal.scopes.includes(wantScope))
+  const policy = ACQUISITION_POLICIES[group];
+  if (principal.principalType !== policy.principalType || !principal.workspaceId || !principal.scopes.includes(policy.scope))
     throw new HttpRefusal(403, "not_authorized");
+  if (group === "native" && !principal.userId) throw new HttpRefusal(403, "not_authorized");
   return principal;
 }
 
 async function nativeRoute(c: Context<Env>, issuer: NativeIssuer | null, route: string, principal: AcquisitionPrincipal): Promise<Answer> {
   if (!issuer) throw new HttpRefusal(503, "acquisition_disabled");
-  const identity: NativeIdentity = { orgId: principal.orgId, workspaceId: principal.workspaceId!, userId: principal.userId };
+  const identity: NativeIdentity = { orgId: principal.orgId, workspaceId: principal.workspaceId!, userId: principal.userId! };
   if (route === "POST installations") return { status: 200, body: await issuer.registerInstallation(identity, await jsonBody(c)) };
   const proof = c.req.header(INSTALLATION_PROOF_HEADER) ?? null;
   if (route === "GET status") {
     const url = new URL(c.req.url);
     const installation = await issuer.proveInstallation(identity, requestedInstallationId({ installationId: url.searchParams.get("installationId") }), proof);
-    const listed = url.searchParams.getAll("sessionIds").flatMap((v) => v.split(","));
-    const sessionIds = [...listed, ...url.searchParams.getAll("sessionId")];
+    // Session ids are opaque: one id per repeated parameter, never split (an id may contain a comma).
+    const sessionIds = [...url.searchParams.getAll("sessionIds"), ...url.searchParams.getAll("sessionId")];
     return { status: 200, body: { result: await issuer.status(identity, installation, { source: url.searchParams.get("source"), sessionIds }) } };
   }
   const body = await jsonBody(c);

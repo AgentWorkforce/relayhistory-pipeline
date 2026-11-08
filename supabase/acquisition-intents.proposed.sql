@@ -2,14 +2,35 @@
 -- PgAcquisitionStore). NOT a migration: deliberately outside supabase/migrations so no
 -- migrator picks it up. The SQL lane (feat/ingest-acquisition-owner-20261107) folds it
 -- into its migration, assigns the registry slot, and owns the role creation and the
--- boundary/pg-proof tests. Never apply this file directly to any database.
+-- boundary/pg-proof tests. NEVER APPLY THIS FILE DIRECTLY TO ANY DATABASE.
 --
--- Trust model: only bulls96_acquisition_installer (the role in ACQUISITION_DATABASE_URL)
--- may read or write these tables. Every other runtime role is explicitly revoked. G is
--- stored only as AES-256-GCM ciphertext (ACQUISITION_INTENT_KEY, held by the service);
--- the installation proof is stored only as its domain-separated SHA-256.
+-- Conventions (supabase/migrations/20261105042000_babysitter_evidence_retention.sql):
+-- plain transactional DDL (no IF NOT EXISTS, no CONCURRENTLY); the role is checked, never
+-- created or altered here: absent -> 42704, can log in / elevated / a member of any role
+-- -> 55000; every runtime role is revoked explicitly; USAGE on schema sessions is granted;
+-- no allow-all row policies.
+--
+-- ============================================================================================
+-- DEVIATION from design §6 (PR #314 docs/factory-acquisition-owner-design.md), SQL lane to rule
+-- ============================================================================================
+-- §6 has the installer role reach state only through SECURITY DEFINER functions on tables
+-- with row level security enabled and no policies. PgAcquisitionStore instead issues plain
+-- DML, so this proposal grants the role column-scoped table privileges and does NOT enable
+-- row level security: enabling it would require allow-all policies for the role, which the
+-- convention forbids. Isolation therefore rests on the grants alone (every other role is
+-- revoked; no DELETE, no TRUNCATE, UPDATE only on the columns the store writes). Preferred end
+-- state, if the SQL lane rules for §6: wrap each PgAcquisitionStore statement in a SECURITY
+-- DEFINER function (SET search_path=pg_catalog,pg_temp; GRANT EXECUTE to the role only),
+-- ENABLE ROW LEVEL SECURITY with no policies, and drop the table grants below. The service
+-- code changes only inside PgAcquisitionStore. Mirrored in docs/acquisition-exchange.md.
+-- ============================================================================================
+--
+-- Trust model: only bulls96_acquisition_installer (the role in ACQUISITION_DATABASE_URL,
+-- NOLOGIN until the operator step) may read or write these tables. G is stored only as
+-- AES-256-GCM ciphertext (ACQUISITION_INTENT_KEY, held by the service); the installation
+-- proof is stored only as its domain-separated SHA-256.
 
-CREATE TABLE IF NOT EXISTS sessions.ingest_acquisition_native_installations (
+CREATE TABLE sessions.ingest_acquisition_native_installations (
   installation_id uuid PRIMARY KEY,
   request_uuid    uuid NOT NULL UNIQUE,                 -- client idempotency key (P3a)
   org_id          text NOT NULL,
@@ -22,7 +43,7 @@ CREATE TABLE IF NOT EXISTS sessions.ingest_acquisition_native_installations (
   created_at      timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
-CREATE TABLE IF NOT EXISTS sessions.ingest_acquisition_native_intents (
+CREATE TABLE sessions.ingest_acquisition_native_intents (
   operation_uuid        uuid PRIMARY KEY,               -- install: also the grant id
   kind                  text NOT NULL CHECK (kind IN ('install', 'revoke', 'rebind')),
   installation_id       uuid NOT NULL REFERENCES sessions.ingest_acquisition_native_installations(installation_id),
@@ -38,54 +59,48 @@ CREATE TABLE IF NOT EXISTS sessions.ingest_acquisition_native_intents (
   request_sha256        text NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
   grant_ciphertext      bytea,                          -- install only: AES-256-GCM(G) || tag
   grant_nonce           bytea CHECK (grant_nonce IS NULL OR octet_length(grant_nonce) = 12),
-  status                text NOT NULL CHECK (status IN ('reserved', 'pending', 'applied', 'refused', 'void')),
+  status                text NOT NULL CHECK (status IN ('reserved', 'pending', 'applied', 'refused', 'void', 'stuck')),
   refusal_code          text,
   result                text,                           -- SQL result as text (bigints exact)
   client_operation_uuid uuid UNIQUE,                    -- revoke: the Desktop operationUuid that activated it
   activation_reason     text CHECK (activation_reason IN ('explicit_exclude', 'installation_retired', 'session_removed')),
+  attempts              integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),  -- failed sends (stuck at MAX_SEND_ATTEMPTS)
+  next_attempt_at       timestamptz NOT NULL DEFAULT clock_timestamp(),    -- reconciler backoff
+  reservation           text CHECK (reservation IN ('signed', 'no_epoch', 'sign_failed')),
   created_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
   updated_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
   CHECK ((kind = 'install') = (grant_ciphertext IS NOT NULL AND grant_nonce IS NOT NULL)),
   CHECK (kind = 'install' OR target_grant_id IS NOT NULL),
-  CHECK (status <> 'reserved' OR kind = 'revoke')
+  CHECK (status <> 'reserved' OR kind = 'revoke'),
+  CHECK (reservation IS NULL OR kind = 'install')
 );
 
--- Exactly one reserved (pre-signed) revoke per installed grant.
-CREATE UNIQUE INDEX IF NOT EXISTS ingest_acquisition_native_intents_one_revoke
+-- At most one revoke (reserved, or signed at revocation time) per installed grant.
+CREATE UNIQUE INDEX ingest_acquisition_native_intents_one_revoke
   ON sessions.ingest_acquisition_native_intents (target_grant_id) WHERE kind = 'revoke';
-CREATE INDEX IF NOT EXISTS ingest_acquisition_native_intents_pending_revokes
-  ON sessions.ingest_acquisition_native_intents (created_at) WHERE kind = 'revoke' AND status = 'pending';
-CREATE INDEX IF NOT EXISTS ingest_acquisition_native_intents_by_installation
+-- The reconciler's due queue (every kind): next_attempt_at, then creation order.
+CREATE INDEX ingest_acquisition_native_intents_due
+  ON sessions.ingest_acquisition_native_intents (next_attempt_at, created_at) WHERE status = 'pending';
+CREATE INDEX ingest_acquisition_native_intents_by_installation
   ON sessions.ingest_acquisition_native_intents (installation_id, kind);
 
-ALTER TABLE sessions.ingest_acquisition_native_installations ENABLE ROW LEVEL SECURITY;
-ALTER TABLE sessions.ingest_acquisition_native_installations FORCE ROW LEVEL SECURITY;
-ALTER TABLE sessions.ingest_acquisition_native_intents ENABLE ROW LEVEL SECURITY;
-ALTER TABLE sessions.ingest_acquisition_native_intents FORCE ROW LEVEL SECURITY;
-
--- Revoke from every runtime role (skipping roles absent on this deployment), then grant
--- the installer exactly the DML PgAcquisitionStore issues. No DELETE, no TRUNCATE.
-DO $$
-DECLARE
-  v_role text;
+DO $acquisition_role$
+DECLARE r pg_roles%ROWTYPE;
 BEGIN
-  FOREACH v_role IN ARRAY ARRAY['public', 'anon', 'authenticated', 'service_role', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder'] LOOP
-    IF v_role = 'public' THEN
-      REVOKE ALL ON sessions.ingest_acquisition_native_installations, sessions.ingest_acquisition_native_intents FROM PUBLIC;
-    ELSIF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
-      EXECUTE format('REVOKE ALL ON sessions.ingest_acquisition_native_installations, sessions.ingest_acquisition_native_intents FROM %I', v_role);
-    END IF;
-  END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_acquisition_installer') THEN
-    GRANT SELECT, INSERT, UPDATE (retired_at) ON sessions.ingest_acquisition_native_installations TO bulls96_acquisition_installer;
-    GRANT SELECT, INSERT, UPDATE (status, refusal_code, result, client_operation_uuid, activation_reason, updated_at)
-      ON sessions.ingest_acquisition_native_intents TO bulls96_acquisition_installer;
-  ELSE
-    RAISE EXCEPTION 'bulls96_acquisition_installer role must exist (created by the SQL lane migration)';
-  END IF;
-END $$;
+ SELECT * INTO r FROM pg_roles WHERE rolname='bulls96_acquisition_installer';
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='42704',MESSAGE='acquisition: role bulls96_acquisition_installer absent; run the role bootstrap first';END IF;
+ -- NOLOGIN here; LOGIN only by the separate operator step. A pre-existing role that can log in,
+ -- is elevated or inherits another role's privileges is refused rather than silently granted.
+ IF r.rolcanlogin OR r.rolsuper OR r.rolbypassrls OR r.rolinherit OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication
+  OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=r.oid) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: role bulls96_acquisition_installer can log in, is elevated or is a member';END IF;
+END $acquisition_role$;
 
-CREATE POLICY ingest_acquisition_native_installations_installer ON sessions.ingest_acquisition_native_installations
-  FOR ALL TO bulls96_acquisition_installer USING (true) WITH CHECK (true);
-CREATE POLICY ingest_acquisition_native_intents_installer ON sessions.ingest_acquisition_native_intents
-  FOR ALL TO bulls96_acquisition_installer USING (true) WITH CHECK (true);
+REVOKE ALL ON sessions.ingest_acquisition_native_installations,sessions.ingest_acquisition_native_intents
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder,bulls96_acquisition_installer;
+GRANT USAGE ON SCHEMA sessions TO bulls96_acquisition_installer;
+-- Exactly the DML PgAcquisitionStore issues (DEVIATION above). No DELETE, no TRUNCATE.
+GRANT SELECT, INSERT, UPDATE (retired_at) ON sessions.ingest_acquisition_native_installations TO bulls96_acquisition_installer;
+GRANT SELECT, INSERT,
+ UPDATE (status, refusal_code, result, client_operation_uuid, activation_reason, attempts, next_attempt_at, reservation, updated_at)
+ ON sessions.ingest_acquisition_native_intents TO bulls96_acquisition_installer;

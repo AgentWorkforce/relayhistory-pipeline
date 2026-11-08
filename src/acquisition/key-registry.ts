@@ -35,7 +35,11 @@ export function rawPublicKey(key: KeyObject): Buffer {
   return Buffer.from(der.subarray(SPKI_ED25519_PREFIX.byteLength));
 }
 
-/** ACQUISITION_PINNED_KEYS: a JSON array of {issuerKeyId, issuerClass, publicKeyBase64}; ids unique. */
+/**
+ * ACQUISITION_PINNED_KEYS: a JSON array of {issuerKeyId, issuerClass, publicKeyBase64}.
+ * Ids are unique, and so are public keys: one key pinned under two ids (of the same or
+ * different classes) would let a native-issued S verify as cloud-issued, so it is refused.
+ */
 export function parsePinnedKeys(raw: string, name = "ACQUISITION_PINNED_KEYS"): IssuerRegistry {
   let parsed: unknown;
   try {
@@ -45,6 +49,7 @@ export function parsePinnedKeys(raw: string, name = "ACQUISITION_PINNED_KEYS"): 
   }
   if (!Array.isArray(parsed) || parsed.length === 0) throw new Error(`96bulls: ${name} must be a non-empty JSON array`);
   const registry = new Map<string, IssuerKey>();
+  const publicKeys = new Set<string>();
   for (const entry of parsed) {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`96bulls: ${name} entries must be objects`);
     const keys = Object.keys(entry).sort().join(",");
@@ -54,7 +59,11 @@ export function parsePinnedKeys(raw: string, name = "ACQUISITION_PINNED_KEYS"): 
     if (issuerClass !== "cloud" && issuerClass !== "native") throw new Error(`96bulls: ${name} issuerClass must be cloud or native`);
     if (typeof publicKeyBase64 !== "string") throw new Error(`96bulls: ${name} publicKeyBase64 must be a string`);
     if (registry.has(issuerKeyId)) throw new Error(`96bulls: ${name} has a duplicate issuerKeyId`);
-    registry.set(issuerKeyId, Object.freeze({ ownerKind: issuerClass, publicKey: ed25519PublicKey(strictBase64(publicKeyBase64, 32, name)) }));
+    const raw32 = strictBase64(publicKeyBase64, 32, name);
+    const canonical = raw32.toString("hex");
+    if (publicKeys.has(canonical)) throw new Error(`96bulls: ${name} pins the same public key under two issuerKeyIds`);
+    publicKeys.add(canonical);
+    registry.set(issuerKeyId, Object.freeze({ ownerKind: issuerClass, publicKey: ed25519PublicKey(raw32) }));
   }
   return registry;
 }

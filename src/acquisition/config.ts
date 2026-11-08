@@ -9,7 +9,11 @@
  *   ACQUISITION_OPS_ENABLED        the private operations port (same strict boolean; default off)
  *   ACQUISITION_ORIGIN             this service's origin, exactly scheme://host[:port]; the introspection aud
  *   ACQUISITION_PORT               native listener, default 8080
- *   ACQUISITION_OPS_PORT           operations listener, default 8081 (must differ)
+ *   ACQUISITION_OPS_PORT           operations listener, default 8082 (must differ; 8081 is the worker
+ *                                  health port the proof NetworkPolicy opens VPC-wide)
+ *   ACQUISITION_OPS_HOST           operations bind address, default 127.0.0.1; exposing it further needs a
+ *                                  NetworkPolicy change (docs). The native listener binds 0.0.0.0.
+ *   (The port and host variables are read and validated even when ACQUISITION_ENABLED is off.)
  *   ACQUISITION_PINNED_KEYS        JSON [{issuerKeyId, issuerClass:"cloud"|"native", publicKeyBase64}]
  *   ACQUISITION_ISSUER_KEY_ID      native only: this issuer's pinned native-class key id
  *   ACQUISITION_ISSUER_PRIVATE_KEY native only: PKCS8 PEM or base64 32-byte seed; read once, never logged
@@ -21,6 +25,7 @@
  * Errors name the variable, never its value.
  */
 import type { KeyObject } from "node:crypto";
+import { isIP } from "node:net";
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { createIssuerSigner, parseIssuerPrivateKey, parsePinnedKeys, type IssuerSigner } from "./key-registry.ts";
@@ -34,6 +39,7 @@ export interface AcquisitionLiveConfig {
   readonly opsEnabled: boolean;
   readonly port: number;
   readonly opsPort: number;
+  readonly opsHost: string;
   readonly origin: string;
   readonly registry: IssuerRegistry;
   readonly databaseUrl: string;
@@ -43,7 +49,7 @@ export interface AcquisitionLiveConfig {
   readonly signer: IssuerSigner | null;
   readonly intentKey: Buffer | null;
 }
-export type AcquisitionConfig = { readonly enabled: false; readonly port: number; readonly opsPort: number } | AcquisitionLiveConfig;
+export type AcquisitionConfig = { readonly enabled: false; readonly port: number; readonly opsPort: number; readonly opsHost: string } | AcquisitionLiveConfig;
 
 /** Exactly "true" enables; unset, empty or "false" is off; anything else throws. */
 export function strictFlag(env: NodeJS.ProcessEnv, name: string): boolean {
@@ -81,8 +87,20 @@ export function intentKey(raw: string): Buffer {
   return key;
 }
 
+/** An IPv4/IPv6 literal bind address (no hostnames: the bind must not depend on DNS). */
+export function bindHost(env: NodeJS.ProcessEnv, name: string, fallback: string): string {
+  const raw = env[name]?.trim();
+  if (raw === undefined || raw === "") return fallback;
+  if (isIP(raw) === 0) throw new Error(`96bulls: ${name} must be an IP address literal`);
+  return raw;
+}
+
 export function acquisitionConfig(env: NodeJS.ProcessEnv = process.env): AcquisitionConfig {
-  const ports = { port: port(env, "ACQUISITION_PORT", 8080), opsPort: port(env, "ACQUISITION_OPS_PORT", 8081) };
+  const ports = {
+    port: port(env, "ACQUISITION_PORT", 8080),
+    opsPort: port(env, "ACQUISITION_OPS_PORT", 8082),
+    opsHost: bindHost(env, "ACQUISITION_OPS_HOST", "127.0.0.1"),
+  };
   if (ports.port === ports.opsPort) throw new Error("96bulls: ACQUISITION_PORT and ACQUISITION_OPS_PORT must differ");
   if (!strictFlag(env, ACQUISITION_FLAG)) return { enabled: false, ...ports };
   const nativeEnabled = strictFlag(env, "ACQUISITION_NATIVE_ENABLED");

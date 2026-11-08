@@ -51,3 +51,18 @@ test("key parsing: pinned keys, seed and PEM private keys, signer pinned as nati
   expect(() => parsePinnedKeys("[]")).toThrow();
   expect(() => parsePinnedKeys(JSON.stringify([{ issuerKeyId: "k", issuerClass: "other", publicKeyBase64: "" }]))).toThrow();
 });
+
+test("key parsing: one public key pinned under two issuerKeyIds is refused, across and within classes", () => {
+  const entries = JSON.parse(pinnedKeysJson) as Array<{ issuerKeyId: string; issuerClass: string; publicKeyBase64: string }>;
+  const cloud = entries.find((e) => e.issuerClass === "cloud")!;
+  const native = entries.find((e) => e.issuerClass === "native")!;
+  // The native key re-pinned as a second cloud id would let a native-issued S verify as cloud-issued.
+  const crossClass = [cloud, native, { issuerKeyId: "cloud-key-2", issuerClass: "cloud", publicKeyBase64: native.publicKeyBase64 }];
+  expect(() => parsePinnedKeys(JSON.stringify(crossClass))).toThrow(/same public key under two issuerKeyIds/);
+  const sameClass = [cloud, native, { issuerKeyId: "native-key-2", issuerClass: "native", publicKeyBase64: native.publicKeyBase64 }];
+  expect(() => parsePinnedKeys(JSON.stringify(sameClass))).toThrow(/same public key under two issuerKeyIds/);
+  // The message names neither the key nor the ids' material.
+  try { parsePinnedKeys(JSON.stringify(crossClass)); } catch (e) { expect(String(e)).not.toContain(native.publicKeyBase64); }
+  // Distinct keys still parse.
+  expect(parsePinnedKeys(pinnedKeysJson).size).toBe(2);
+});

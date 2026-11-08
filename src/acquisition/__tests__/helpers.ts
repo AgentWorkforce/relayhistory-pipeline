@@ -84,6 +84,8 @@ export class FakeSql implements AcquisitionSqlExecutor {
   readonly failures: Array<{ fn?: SqlFunction; error: unknown }> = [];
   /** Raw text override for status (bigint tests). */
   statusText: string | null = null;
+  /** The epoch an install lands at (default current + 1); returning null omits ownerEpoch from the result. */
+  installEpoch: ((current: bigint) => bigint | null) | null = null;
 
   failNext(error: unknown, fn?: SqlFunction) {
     this.failures.push({ fn, error });
@@ -107,9 +109,11 @@ export class FakeSql implements AcquisitionSqlExecutor {
     const k = key(p.sessionId);
     const current = this.sessions.get(k);
     if (fn === "install") {
-      const epoch = (BigInt(current?.ownerEpoch ?? "0") + 1n).toString();
+      const landed = this.installEpoch ? this.installEpoch(BigInt(current?.ownerEpoch ?? "0")) : BigInt(current?.ownerEpoch ?? "0") + 1n;
+      const epoch = (landed ?? BigInt(current?.ownerEpoch ?? "0") + 1n).toString();
       this.sessions.set(k, { state: "active", revision: String(p.revision), tombstoneRevision: null, ownerEpoch: epoch, ownerKind: String(p.ownerKind), grantId: String(p.operationUuid) });
-      return `{"outcome":"installed","grantId":${JSON.stringify(p.operationUuid)},"ownerEpoch":${epoch},"revision":${p.revision},"state":"active"}`;
+      const epochField = landed === null ? "" : `"ownerEpoch":${epoch},`;
+      return `{"outcome":"installed","grantId":${JSON.stringify(p.operationUuid)},${epochField}"revision":${p.revision},"state":"active"}`;
     }
     if (fn === "revoke") {
       const revision = (BigInt(current?.revision ?? "0") > BigInt(String(p.revision)) ? current!.revision : String(p.revision));
@@ -135,7 +139,7 @@ export const opsPrincipal = (over: Partial<AcquisitionPrincipal> = {}): Acquisit
 export class FakeAuthenticator implements Authenticator {
   readonly tokens = new Map<string, AcquisitionPrincipal>();
   async authenticate(token: string): Promise<AcquisitionPrincipal> {
-    if (token === "sh_at_down") throw new Error("introspection timeout");
+    if (token.endsWith("_down")) throw new Error("introspection timeout");
     const p = this.tokens.get(token);
     if (!p) throw new RelaycontrolRejectedError("inactive");
     return p;
@@ -152,21 +156,22 @@ export function captureLog() {
 
 export function nativeHarness() {
   const sql = new FakeSql();
-  const store = new MemoryAcquisitionStore();
+  const clock = { now: 1_000_000 };
+  const store = new MemoryAcquisitionStore(() => clock.now);
   const signer = createIssuerSigner(NATIVE_KEY_ID, nativeKey, registry);
-  const issuer = new NativeIssuer({ store, sql: new AcquisitionSql(sql), signer, intentKey: intentKeyBytes });
+  const issuer = new NativeIssuer({ store, sql: new AcquisitionSql(sql), signer, intentKey: intentKeyBytes, now: () => clock.now });
   const auth = new FakeAuthenticator();
   auth.tokens.set("sh_at_alice", principal());
   const captured = captureLog();
   const app = createAcquisitionApp({ enabled: true, group: "native", groupEnabled: true, authenticator: auth, issuer, log: captured.log });
-  return { sql, store, issuer, auth, app, captured, signer };
+  return { sql, store, issuer, auth, app, captured, signer, clock };
 }
 
 export function opsHarness() {
   const sql = new FakeSql();
   const installer = new Installer(new AcquisitionSql(sql), registryOfClass(registry, "cloud"));
   const auth = new FakeAuthenticator();
-  auth.tokens.set("sh_at_ops", opsPrincipal());
+  auth.tokens.set("sh_wk_ops", opsPrincipal());
   const captured = captureLog();
   const app = createAcquisitionApp({ enabled: true, group: "ops", groupEnabled: true, authenticator: auth, installer, log: captured.log });
   return { sql, installer, auth, app, captured };

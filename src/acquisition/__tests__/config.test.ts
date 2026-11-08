@@ -8,10 +8,20 @@ const live = {
 };
 
 test("default off: nothing else is read", () => {
-  expect(acquisitionConfig({})).toEqual({ enabled: false, port: 8080, opsPort: 8081 });
+  expect(acquisitionConfig({})).toEqual({ enabled: false, port: 8080, opsPort: 8082, opsHost: "127.0.0.1" });
   expect(acquisitionConfig({ ACQUISITION_ENABLED: "false", ACQUISITION_PINNED_KEYS: "garbage" }).enabled).toBe(false);
   expect(() => acquisitionConfig({ ACQUISITION_ENABLED: "yes" })).toThrow();
   expect(() => acquisitionConfig({ ACQUISITION_PORT: "9000", ACQUISITION_OPS_PORT: "9000" })).toThrow();
+});
+
+test("ops listener: loopback bind and port 8082 by default (8081 is the VPC-open worker health port)", () => {
+  const c = acquisitionConfig(live);
+  expect([c.port, c.opsPort, c.opsHost]).toEqual([8080, 8082, "127.0.0.1"]);
+  expect(acquisitionConfig({ ACQUISITION_OPS_HOST: "10.0.0.5" }).opsHost).toBe("10.0.0.5");
+  expect(acquisitionConfig({ ACQUISITION_OPS_HOST: "::1" }).opsHost).toBe("::1");
+  // Read and validated even while disabled; a hostname is refused (no DNS-dependent bind).
+  expect(() => acquisitionConfig({ ACQUISITION_OPS_HOST: "ops.internal" })).toThrow(/ACQUISITION_OPS_HOST/);
+  expect(() => acquisitionConfig({ ACQUISITION_OPS_PORT: "8080" })).toThrow();
 });
 
 test("enabled: required variables, native needs signer + intent key, sub-flags default off", () => {
