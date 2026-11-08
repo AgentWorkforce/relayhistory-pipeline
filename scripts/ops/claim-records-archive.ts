@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import pg from "pg";
 import { createS3Store } from "../../packages/object-store/src/index.ts";
 import { archiveClaimAttemptRecords } from "../../src/session-ingest/claim-records-archive.ts";
+import { redactedReason } from "./claim-records-archive-reason.ts";
 import { ownerClientConfig } from "../../src/shared/owner-pg-config.ts";
 let client: pg.Client | undefined;
 try {
@@ -34,10 +35,6 @@ try {
   const report = await archiveClaimAttemptRecords({ sql: { query: (s, p) => client!.query(s, p) }, store, keyRoot: "96bulls", limit, maxPages, execute }, after);
   console.log(JSON.stringify({ mode: execute ? "execute" : "dry-run", ...report }));
 } catch (e) {
-  // A closed, redacted reason only: a pg error message or stack can carry the DB host.
-  const code = (e as { code?: unknown } | null)?.code;
-  console.log(JSON.stringify({ refused: typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? "sqlstate_" + code
-    : (e as { name?: unknown })?.name === "OwnerUrlError" && typeof code === "string" ? code
-    : e instanceof Error && /^[a-z_]{1,64}$/.test(e.message) ? e.message : "internal_error" }));
+  console.log(JSON.stringify({ refused: redactedReason(e) }));
   process.exitCode = 1;
 } finally { await client?.end().catch(() => {}); }
