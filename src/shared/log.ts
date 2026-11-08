@@ -22,7 +22,25 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "db_error_class", "db_error_code", "db_error_basis", "error_name",
   // Lock-wait alert line (session-ingest lockAlertFields): 55P03 / 57014 only.
   "sqlstate",
+  // Read API buffered search gate (src/session-read-api/app.ts gatedPage): bounded counts only,
+  // see BOUNDED_COUNT_FIELDS.
+  "buffered_checked", "buffered_dropped",
 ]);
+
+/**
+ * Count fields that are emitted only as non-negative integers clamped to a ceiling. Anything else
+ * (a string, a fraction, NaN, a negative or non-number value) is dropped, so these fields can
+ * never carry free text or an identifier.
+ */
+export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
+  ["buffered_checked", 100_000],
+  ["buffered_dropped", 100_000],
+]);
+
+function boundedCount(v: unknown, max: number): number | undefined {
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 0) return undefined;
+  return Math.min(v, max);
+}
 
 export type Level = "debug" | "info" | "warn" | "error";
 const service = process.env.OTEL_SERVICE_NAME ?? "96bulls";
@@ -34,6 +52,12 @@ function filter(fields: Record<string, unknown>): Record<string, unknown> {
   for (const [k, v] of Object.entries(fields)) {
     if (!ALLOWED_LOG_FIELDS.has(k)) continue;
     if (v === undefined) continue;
+    const max = BOUNDED_COUNT_FIELDS.get(k);
+    if (max !== undefined) {
+      const n = boundedCount(v, max);
+      if (n !== undefined) out[k] = n;
+      continue;
+    }
     // Strings are scrubbed again before emit as a backstop; ids never match a rule.
     out[k] = typeof v === "string" ? scrubText(v).slice(0, 256) : v;
   }
