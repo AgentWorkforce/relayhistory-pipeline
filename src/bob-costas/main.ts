@@ -1,12 +1,15 @@
 import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
 import { runWorker } from "../shared/worker.ts";
 import { bobCostasHandler } from "./handler.ts";
-import { summarizerFromEnv } from "./summarizer.ts";
+import { summarizerFromEnv } from "./model-summarizer.ts";
+import { log } from "../shared/log.ts";
 import { keyringFromEnv } from "../shared/keyring.ts";
 import { summarySweep } from "./sweep.ts";
 
 const raw = lockerStore();
+// BOB_COSTAS_MODEL / OPENAI_BASE_URL are validated here, so a bad value fails at startup.
 const summarizer = summarizerFromEnv();
+log.info("bob costas summariser", { stage: "summary", model_id: summarizer.id });
 // Summaries are stored encrypted in the Locker; refuse to start without a keyring.
 const keyring = await keyringFromEnv();
 await runWorker({

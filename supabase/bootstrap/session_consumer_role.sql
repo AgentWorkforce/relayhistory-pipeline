@@ -46,6 +46,37 @@ DO $role$
 DECLARE
   v_name text := 'search_consumer_runtime';
   r pg_roles%ROWTYPE;
+  v_created boolean := false;
+  v_probe record;
+  v_password_present boolean;
+  v_probe_source constant text := $expected_probe$
+DECLARE caller_oid oid; target_oid oid; target_login boolean; present boolean;
+BEGIN
+  SELECT oid INTO caller_oid FROM pg_catalog.pg_roles
+    WHERE rolname=session_user AND rolcreaterole AND NOT rolsuper AND NOT rolbypassrls;
+  IF caller_oid IS NULL OR current_setting('role') <> 'none'
+     OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE pid=pg_backend_pid() AND usename=session_user)
+     OR (SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname IN ('sessions','search_index') AND nspowner=caller_oid) <> 2 THEN
+    RAISE EXCEPTION USING ERRCODE='42501', MESSAGE='consumer credential probe: caller refused';
+  END IF;
+  SELECT oid,rolcanlogin,rolpassword IS NOT NULL INTO target_oid,target_login,present
+    FROM pg_catalog.pg_authid WHERE rolname='search_consumer_runtime';
+  IF target_oid IS NULL OR target_login THEN
+    RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='consumer credential probe: bare fixed role required';
+  END IF;
+  IF current_setting('server_version_num')::integer >= 160000 THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members WHERE roleid=target_oid AND member=caller_oid
+                   AND admin_option AND NOT inherit_option AND NOT set_option) THEN
+      RAISE EXCEPTION USING ERRCODE='42501', MESSAGE='consumer credential probe: creator authority required';
+    END IF;
+  ELSE
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members WHERE roleid=target_oid AND member=caller_oid AND admin_option) THEN
+      RAISE EXCEPTION USING ERRCODE='42501', MESSAGE='consumer credential probe: creator authority required';
+    END IF;
+  END IF;
+  RETURN present;
+END
+$expected_probe$;
   v_version integer := current_setting('server_version_num')::integer;
 BEGIN
   -- Never create or elevate a privileged/built-in name under this file: a
@@ -60,6 +91,7 @@ BEGIN
   SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
   IF NOT FOUND THEN
     CREATE ROLE search_consumer_runtime LOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    v_created := true;
     SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
   END IF;
   -- An existing role is otherwise never altered: it must match the spec,
@@ -108,33 +140,56 @@ BEGIN
         MESSAGE = format('bootstrap %s: refusing to promote a role with pre-existing settings', v_name),
         HINT = 'Nothing was changed. Reset the role settings by hand (an operator decision), then rerun.';
     END IF;
-    -- A preset credential would turn the promotion into an already-usable
-    -- account (the operator sets the password after this file, via
-    -- \password). pg_authid carries the true password where the invoker may
-    -- read it (every superuser path, including PGlite, whose pg_roles view
-    -- masks every role with a placeholder). A non-superuser owner cannot read
-    -- pg_authid and falls back to the pg_roles presence bit, which is exact
-    -- on real Postgres (NULL vs masked). Validity is unsensitive and checked
-    -- directly either way.
+    -- pg_roles.rolpassword is ALWAYS masked, including a NULL credential.
+    -- Read pg_authid directly where authorized. A non-superuser requires the
+    -- explicit fixed-role operator helper, validated below before invocation.
+    -- Missing/changed code or ACLs refuse; no catalog-wide SELECT is granted.
     IF r.rolvaliduntil IS NOT NULL THEN
       RAISE EXCEPTION USING ERRCODE = '55000',
         MESSAGE = format('bootstrap %s: refusing to promote a role with a pre-existing validity', v_name),
-        HINT = 'Nothing was changed. Reset the credential by hand (an operator decision), then rerun.';
+        HINT = 'Nothing was changed. Investigate the existing credential; do not clear it to bypass promotion admission.';
     END IF;
     BEGIN
       PERFORM 1 FROM pg_authid a WHERE a.oid = r.oid AND a.rolpassword IS NOT NULL;
       IF FOUND THEN
         RAISE EXCEPTION USING ERRCODE = '55000',
           MESSAGE = format('bootstrap %s: refusing to promote a role with a pre-existing password', v_name),
-          HINT = 'Nothing was changed. Reset the credential by hand (an operator decision), then rerun.';
+          HINT = 'Nothing was changed. Investigate the existing credential; do not clear it to bypass promotion admission.';
       END IF;
     EXCEPTION WHEN insufficient_privilege THEN
-      IF r.rolpassword IS NOT NULL THEN
-        RAISE EXCEPTION USING ERRCODE = '55000',
-          MESSAGE = format('bootstrap %s: refusing to promote a role with a pre-existing password', v_name),
-          HINT = 'Nothing was changed. Reset the credential by hand (an operator decision), then rerun.';
+      SELECT p.*, n.nspowner AS schema_owner, n.nspacl AS schema_acl INTO v_probe
+        FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+       WHERE n.nspname='session_consumer_bootstrap_private' AND p.proname='consumer_has_password'
+         AND p.pronargs=0;
+      IF NOT FOUND OR NOT v_probe.prosecdef OR v_probe.prorettype <> 'boolean'::regtype
+         OR v_probe.prokind <> 'f' OR v_probe.provolatile <> 's' OR v_probe.proisstrict OR v_probe.proleakproof
+         OR v_probe.proparallel <> 'u' OR v_probe.proretset OR v_probe.prosupport <> 0
+         OR v_probe.pronargdefaults <> 0 OR v_probe.prosrc <> v_probe_source
+         OR v_probe.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]
+         OR v_probe.prolang <> (SELECT oid FROM pg_catalog.pg_language WHERE lanname='plpgsql')
+         OR v_probe.proowner <> v_probe.schema_owner
+         OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE oid=v_probe.proowner AND rolsuper)
+         OR (SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace=v_probe.pronamespace) <> 1
+         OR EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE relnamespace=v_probe.pronamespace)
+         OR EXISTS (SELECT 1 FROM pg_catalog.aclexplode(COALESCE(v_probe.proacl,pg_catalog.acldefault('f',v_probe.proowner))) a
+                     WHERE a.grantee <> v_probe.proowner AND NOT (a.grantee=current_user::regrole AND a.privilege_type='EXECUTE' AND NOT a.is_grantable))
+         OR EXISTS (SELECT 1 FROM pg_catalog.aclexplode(COALESCE(v_probe.schema_acl,pg_catalog.acldefault('n',v_probe.schema_owner))) a
+                     WHERE a.grantee <> v_probe.schema_owner AND NOT (a.grantee=current_user::regrole AND a.privilege_type='USAGE' AND NOT a.is_grantable)) THEN
+        RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='consumer bootstrap: trusted credential probe unavailable',
+          HINT='A privileged operator must install the exact session_consumer_credential_probe.sql prerequisite. No role was promoted.';
+      END IF;
+      EXECUTE 'SELECT session_consumer_bootstrap_private.consumer_has_password()' INTO v_password_present;
+      IF v_password_present IS DISTINCT FROM false THEN
+        RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='consumer bootstrap: refusing a pre-existing or unknown password';
       END IF;
     END;
+  ELSIF NOT v_created THEN
+    -- An existing LOGIN must already carry the exact operator claim. Do not
+    -- bless an unrelated LOGIN by writing the timeout marker for the first time.
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting WHERE setrole=r.oid AND setdatabase=0 AND setconfig=ARRAY['statement_timeout=60s']::text[])
+       OR EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting WHERE setrole=r.oid AND NOT (setdatabase=0 AND setconfig=ARRAY['statement_timeout=60s']::text[])) THEN
+      RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='consumer bootstrap: existing LOGIN lacks the exact operator claim';
+    END IF;
   END IF;
 END
 $role$;

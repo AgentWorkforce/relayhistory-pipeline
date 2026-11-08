@@ -400,6 +400,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105043890_buffered_search_gate_retired_witness.sql` | replacement: buffered_search_gate_for hides claims with an ingest_bookkeeping_retired_claims tombstone (drop reason retired) |
 | `upstream:20261105043900_session_consumer_function_grants.sql` | twelve search_consumer_runtime EXECUTEs (composed writer path) |
 | `upstream:20261105043910_selfhost_session_selection_erase.sql` | function sessions.ingest_selfhost_set_session_uploads |
+| `upstream:20261105044000_read_api_tokens.sql` | table sessions.read_api_tokens |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
@@ -965,3 +966,15 @@ bootstraps before its sorted migration files.
 and effective inherited-vs-switch privileges on disposable PG15/16/17. It refuses
 existing verifier/authenticator/directory roles and requires explicit disposable
 cluster opt-in. The new proof runs before the general role proof in CI.
+
+
+### Non-superuser consumer credential check
+
+Before the first `SERVICE=session-pipeline-consumer-bootstrap` promotion by a
+non-superuser owner, follow
+[`selfhost-consumer-credential-probe.md`](../docs/selfhost-consumer-credential-probe.md).
+PostgreSQL masks even an absent password in `pg_roles`; a separate privileged
+operator installs the narrowly scoped fixed-role presence probe. This does not
+replace the owner's explicit CREATEROLE/creator-ADMIN prerequisite or grant
+catalog access. Missing helpers and unsupported managed-provider authority fail
+closed; never clear a credential or change ownership to bypass the gate.

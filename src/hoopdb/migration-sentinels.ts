@@ -208,6 +208,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "twelve search_consumer_runtime EXECUTEs (composed writer path)",
     sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'",
   },
+  "upstream:20261105044000_read_api_tokens.sql": {
+    evidence: "table sessions.read_api_tokens",
+    sql: relation("sessions.read_api_tokens"),
+  },
 };
 
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */
