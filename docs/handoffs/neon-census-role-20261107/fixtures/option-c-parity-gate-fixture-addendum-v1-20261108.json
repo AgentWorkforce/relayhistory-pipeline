@@ -1,0 +1,177 @@
+{
+  "base": {
+    "admission": {
+      "epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+      "version": "7"
+    },
+    "cutoverEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+    "head": {
+      "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+      "pending": false,
+      "version": "7"
+    },
+    "org": "fixture-org",
+    "proof": {
+      "deletionSetSha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+      "explicitNoHead": false,
+      "head": {
+        "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+        "epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "version": "7"
+      },
+      "org": "fixture-org",
+      "resetSetSha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "targetGeneration": "4444444444444444444444444444444444444444444444444444444444444444",
+      "targetOrderedLineageSha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "user": "fixture-user",
+      "workspace": "fixture-workspace"
+    },
+    "sourceDeletionSetSha256": "5555555555555555555555555555555555555555555555555555555555555555",
+    "sourceResetSetSha256": "6666666666666666666666666666666666666666666666666666666666666666",
+    "targetDeletionSetSha256": "5555555555555555555555555555555555555555555555555555555555555555",
+    "targetGeneration": "4444444444444444444444444444444444444444444444444444444444444444",
+    "targetLatestReceipt": {
+      "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+      "version": "7"
+    },
+    "targetOrderedLineageSha256": "7777777777777777777777777777777777777777777777777777777777777777",
+    "targetReceiptVersionsContiguousFromOne": true,
+    "targetResetSetSha256": "6666666666666666666666666666666666666666666666666666666666666666",
+    "user": "fixture-user",
+    "workspace": "fixture-workspace"
+  },
+  "boundaries": [
+    "All hash values are synthetic valid hex64, not source-computed PG digests or production evidence.",
+    "Runtime RPC tests drive proof-row binding/currenthead/generation/receipt negatives. Census/writer tests drive fullset/hash mismatch refusal before a proof can be recorded.",
+    "Target lineage digest is over target contiguous receipts and bound to latest source head; do not invent an unavailable historical Neon hash chain.",
+    "Proof write is a separate production operation, never a side effect of read-only census.",
+    "No automatically relabeling old proof after generation/head move."
+  ],
+  "cases": [
+    {
+      "emitBuffered": true,
+      "id": "exact-current-user-proof-positive",
+      "patch": {}
+    },
+    {
+      "emitBuffered": false,
+      "id": "proof-absent",
+      "patch": {
+        "proof": null
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "proof-foreign-user",
+      "patch": {
+        "proof.user": "foreign-user"
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "proof-foreign-workspace",
+      "patch": {
+        "proof.workspace": "foreign-workspace"
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "proof-foreign-org",
+      "patch": {
+        "proof.org": "foreign-org"
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "proof-foreign-epoch",
+      "patch": {
+        "proof.epoch": "2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "proof-stale-target-generation",
+      "patch": {
+        "targetGeneration": "8888888888888888888888888888888888888888888888888888888888888888"
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "proof-stale-head-after-new-admission",
+      "patch": {
+        "admission.version": "8",
+        "head.version": "8",
+        "targetLatestReceipt.version": "8"
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "proof-wrong-head-digest",
+      "patch": {
+        "head.digest": "9999999999999999999999999999999999999999999999999999999999999999"
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "proof-nohead-not-established",
+      "patch": {
+        "admission.version": "0",
+        "head": null,
+        "proof.explicitNoHead": false,
+        "proof.head": null,
+        "targetLatestReceipt": null
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "target-control-lineage-gap",
+      "patch": {
+        "targetReceiptVersionsContiguousFromOne": false
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "target-receipt-behind-source",
+      "patch": {
+        "targetLatestReceipt.version": "6"
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "target-receipt-digest-mismatch",
+      "patch": {
+        "targetLatestReceipt.digest": "9999999999999999999999999999999999999999999999999999999999999999"
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "full-deletion-set-mismatch",
+      "patch": {
+        "targetDeletionSetSha256": "9999999999999999999999999999999999999999999999999999999999999999"
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "full-reset-set-mismatch",
+      "patch": {
+        "targetResetSetSha256": "9999999999999999999999999999999999999999999999999999999999999999"
+      }
+    },
+    {
+      "emitBuffered": false,
+      "id": "proof-target-lineage-digest-mismatch",
+      "patch": {
+        "targetOrderedLineageSha256": "9999999999999999999999999999999999999999999999999999999999999999"
+      }
+    }
+  ],
+  "contractCommit": "a10f2990",
+  "contractSha256": "b4e35f6b6cf91d723b39bc04c0d05f65e56c300e809a8918ec59ead2e250e07a",
+  "extendsFixtureSha256": "25bbbdfaeb579afb5ca7bbf72ba02d5d3525d22e26de289914214ca1abd519a7",
+  "patchConvention": "Dot keys replace exactly one base field. Plain object key replaces that field; no fallback/defaulting to current values.",
+  "status": "SYNTHETIC_VECTOR_ADDENDUM_NOT_IMPLEMENTATION_TEST",
+  "version": 1
+}
