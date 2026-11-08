@@ -1,0 +1,15 @@
+{
+  "exitCode": 0,
+  "result": {
+    "status": "owner_apply_verified",
+    "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+    "generation": "e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",
+    "ledgerSha256": "502349fe27871cb12de3fb93d8b02c3a1ece691ad500c1d7a6b2176dbed66502",
+    "applied": 21,
+    "skipped": 35
+  },
+  "stdoutLineCount": 29,
+  "completedAt": "2026-11-07T22:31:04.058852+00:00",
+  "automaticRetry": false,
+  "startedAt": "2026-11-07T22:23:13.412914+00:00"
+}

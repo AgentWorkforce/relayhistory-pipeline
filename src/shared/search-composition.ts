@@ -15,7 +15,9 @@ export interface SearchComposition {
 export function composeSearchService(composition: SearchComposition, input: SearchFactoryInput, role: "writer" | "reader", tenantRunner?: TenantRunner): SearchServiceBinding {
   const registered = composition.registry.registered();
   const backend = composition.registry.select(input.env, registered);
-  const options = { ...input, extras: composition.extras };
+  // A reader's tenant runner also carries the index's tenant-scoped statements,
+  // so forced row-level security sees the caller's tenant on each of them.
+  const options = { ...input, extras: composition.extras, ...(tenantRunner ? { tenantRunner } : {}) };
   const index = composition.registry.create(input.env, options, registered);
   const binding = { index, state: composition.state({ ...options, backend, role, tenantRunner }) };
   assertSearchServiceBinding(binding, backend);

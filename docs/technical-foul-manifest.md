@@ -5,7 +5,8 @@ ruleset and its test corpus so the Rust port in desktop-core can detect drift.
 
 It records the ruleset version (`SCRUB_RULESET_VERSION`), the digest of
 `lib/scrub.ts` plus the `<scrub-segmenter>` block of `lib/pipeline/raw-chunks.ts`
-(the same digest `test/scrub-ruleset-version.test.ts` pins), the segmenter digest
+(from rule set 5 the block also holds the record-line tokenizer `scrubRecordLine`,
+so the digest covers the stored-record path; the same digest `test/scrub-ruleset-version.test.ts` pins), the segmenter digest
 alone, the digest of `test/fixtures/scrub-secret-corpus.json` (the same digest
 `test/scrub-secret-corpus.test.ts` pins), the redaction token and
 `MAX_SCRUB_CHARS`. All digests are sha256 over LF-normalised text.

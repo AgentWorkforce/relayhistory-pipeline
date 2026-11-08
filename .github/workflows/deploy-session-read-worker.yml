@@ -12,11 +12,36 @@ name: deploy session-read-worker
 #   SESSION_READ_TIMING_ASSUME_NO_TURNS  optional "true" (runbook, "Session timing")
 # Environment secret: CLOUDFLARE_API_TOKEN (Workers Scripts:Edit, Hyperdrive:Read).
 #
+# Owner-buffered reads (Option C, src/session-read-api/owner-buffered.ts), default off.
+# A dispatch without inputs (or owner_buffered=off) renders exactly the config deployed
+# before these inputs existed: no service binding, no flag. owner_buffered=on renders
+# (scripts/render-deploy-config.ts) the HISTORY_CONTROL_HEAD service binding to
+# relayhistory-api's named entrypoint SessionReadPrivacyControls (pinned in the script),
+# RELAYHISTORY_READ_OWNER_BUFFERED=true, READ_API_OWNER_BUFFERED_WORKSPACES from the
+# owner_buffered_workspaces input (explicit ids, each also on
+# SESSION_READ_DIRECTORY_WORKSPACES), and, from environment variables required only then:
+#   SESSION_READ_INGEST_S3_BUCKET  the ingest bucket holding buffered-batches/ (INGEST_S3_BUCKET)
+#   SESSION_READ_INGEST_S3_REGION  its region (INGEST_S3_REGION)
+# The S3 credentials are the Worker's PIPELINE_RAW_S3_ACCESS_KEY_ID / _SECRET_ACCESS_KEY
+# secrets (wrangler secret put; GetObject + kms:Decrypt on buffered-batches/ is a separate
+# IAM grant); an on deploy refuses to run unless both exist. Every later dispatch without
+# inputs turns the feature off again.
+#
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
 # are never handled here: they are set with `wrangler secret put` from 1Password
 # and survive deploys. This workflow checks that they exist, by name only.
 on:
   workflow_dispatch:
+    inputs:
+      owner_buffered:
+        description: Owner-buffered reads (Option C). off = exactly the default deploy
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+      owner_buffered_workspaces:
+        description: Canary workspace ids, comma-separated (required when on; empty = none)
+        type: string
+        default: ""
 permissions:
   contents: read
 concurrency:
@@ -46,6 +71,11 @@ jobs:
       DIRECTORY_WORKSPACES: ${{ vars.SESSION_READ_DIRECTORY_WORKSPACES }}
       BRIEF_TITLES_WORKSPACES: ${{ vars.SESSION_READ_BRIEF_TITLES_WORKSPACES }}
       TIMING_ASSUME_NO_TURNS: ${{ vars.SESSION_READ_TIMING_ASSUME_NO_TURNS }}
+      # Owner-buffered (default off); inputs reach the shell only through env.
+      OWNER_BUFFERED: ${{ inputs.owner_buffered }}
+      OWNER_BUFFERED_WORKSPACES: ${{ inputs.owner_buffered_workspaces }}
+      OWNER_BUFFERED_S3_BUCKET: ${{ vars.SESSION_READ_INGEST_S3_BUCKET }}
+      OWNER_BUFFERED_S3_REGION: ${{ vars.SESSION_READ_INGEST_S3_REGION }}
     defaults:
       run:
         working-directory: packages/session-read-worker
@@ -87,11 +117,20 @@ jobs:
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/hyperdrive/configs/$HYPERDRIVE_ID" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             | bun run scripts/check-hyperdrive-config.ts
-      - name: Render the deploy config (Hyperdrive id only)
+      - name: Render the deploy config (Hyperdrive id; owner-buffered binding and vars only when on)
         run: |
           grep -q '"id": "00000000000000000000000000000000"' wrangler.jsonc
-          sed 's/"id": "00000000000000000000000000000000"/"id": "'"$HYPERDRIVE_ID"'"/' wrangler.jsonc > wrangler.deploy.jsonc
+          bun run scripts/render-deploy-config.ts
           grep -q "\"id\": \"$HYPERDRIVE_ID\"" wrangler.deploy.jsonc
+      - name: Check the owner-buffered Worker secrets exist (names only; on only)
+        if: inputs.owner_buffered == 'on'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          names="$(bunx wrangler secret list --config wrangler.deploy.jsonc --format json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).map(x=>x.name).sort().join(" ")))')"
+          for n in PIPELINE_RAW_S3_ACCESS_KEY_ID PIPELINE_RAW_S3_SECRET_ACCESS_KEY; do
+            case " $names " in *" $n "*) ;; *) echo "::error::Worker secret $n is not set; owner-buffered reads would be silently off. Refusing to deploy owner_buffered=on"; exit 1 ;; esac
+          done
       - name: Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
