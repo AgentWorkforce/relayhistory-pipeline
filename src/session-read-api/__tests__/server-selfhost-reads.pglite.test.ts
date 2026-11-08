@@ -42,7 +42,7 @@ const INTROSPECT_SECRET = "synthetic-introspect-secret";
 const AT = Date.parse("2026-11-01T10:00:00.000Z");
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const ORG = "org_1", WS = "ws_1", SOURCE = "codex", SESSION = "sess_1";
-const location = { prefix: `96bulls/${ORG}`, workspaceId: WS, machineId: "srv_bb", harness: SOURCE, sessionId: SESSION, startDate: "2026-11-01" };
+const locationFor = (org: string) => ({ prefix: `96bulls/${org}`, workspaceId: WS, machineId: "srv_bb", harness: SOURCE, sessionId: SESSION, startDate: "2026-11-01" });
 
 // ---------------------------------------------------------------------------
 // Loopback stubs: S3 (MinIO stand-in), relaycontrol introspection, a JWKS.
@@ -66,6 +66,10 @@ const objects = new Map<string, Uint8Array>();
 let s3: Stub;
 let introspect: Stub;
 let jwks: Stub;
+let gcsToken: Stub;
+const GCS_ACCESS_TOKEN = "synthetic-gcs-access-token";
+/** The Authorization header of every object request (S3 SigV4 or the GCS bearer). */
+const objectAuth: string[] = [];
 /** What the introspection stub answers, by token. */
 const answers = new Map<string, (body: { token: string; aud: string; workspace?: string }, res: ServerResponse) => void>();
 const introspectBodies: Array<{ token: string; aud: string; workspace?: string; authorization?: string }> = [];
@@ -119,19 +123,20 @@ class PglitePool {
   async end() {}
 }
 
-async function pointerRow(manifest: ManifestV1, over: { org?: string; ws?: string; deleted?: boolean } = {}) {
+/** A pointer row of `org` naming the objects written under `objectsOrg`'s key prefix (default org_1). */
+async function pointerRow(manifest: ManifestV1, over: { org?: string; ws?: string; deleted?: boolean; provider?: string; objectsOrg?: string } = {}) {
   await supa.query(
     `INSERT INTO sessions.session_index
        (org_id, workspace_id, harness, session_id, canonical_session_id, machine_id, user_id, created_at, last_activity_at,
         storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, deleted_at)
-     VALUES ($1, $2, 'codex', 'sess_1', NULL, 'srv_bb', 'user_1', $3::timestamptz, $3::timestamptz, 's3', 'bucket', $4, decode($5, 'hex'), 'ndjson', $6, 1,
+     VALUES ($1, $2, 'codex', 'sess_1', NULL, 'srv_bb', 'user_1', $3::timestamptz, $3::timestamptz, $8, 'bucket', $4, decode($5, 'hex'), 'ndjson', $6, 1,
              CASE WHEN $7 THEN now() END)`,
-    [over.org ?? ORG, over.ws ?? WS, new Date(AT).toISOString(), manifestKey(location), manifest.raw.content_sha256, TRACE, over.deleted ?? false],
+    [over.org ?? ORG, over.ws ?? WS, new Date(AT).toISOString(), manifestKey(locationFor(over.objectsOrg ?? ORG)), manifest.raw.content_sha256, TRACE, over.deleted ?? false, over.provider ?? "s3"],
   );
 }
 
 /** A delivery stream with events, markers, a catalog record, the legacy coverage marker and one live turn. */
-function deliveryLines() {
+function deliveryLines(org = ORG) {
   const line = (record_id: string, kind: string, origin_id: string, payload: Record<string, unknown>, at = AT) => ({
     kind, origin_id, record_id, revision: "1", operation: "upsert", received_at: new Date(at).toISOString(), payload,
   });
@@ -141,17 +146,17 @@ function deliveryLines() {
     line("k1", "session_marker", "origin-1", { marker_uid: "mk1", kind: "task_started", turn_id: "turn-1", ts_ms: AT + 900 }),
     line("k2", "session_marker", "origin-1", { marker_uid: "mk2", kind: "task_complete", turn_id: "turn-1", ts_ms: AT + 9_500 }),
     line("c1", "session", "origin-1", { title: "Fix the flaky test", cwd: "/repo", git_branch: "main", agent_name: "Ada" }),
-    line("legacy:scope:coverage", "legacy_scope", "legacy:scope", { version: 1, org_id: ORG, workspace_id: WS, source: SOURCE, session_id: SESSION, tables: ["conversation_turns", "session_links", "session_outcomes"] }),
+    line("legacy:scope:coverage", "legacy_scope", "legacy:scope", { version: 1, org_id: org, workspace_id: WS, source: SOURCE, session_id: SESSION, tables: ["conversation_turns", "session_links", "session_outcomes"] }),
     {
       kind: TURN_KIND, origin_id: TURN_ORIGIN_ID, record_id: turnRecordId(WS, SOURCE, SESSION, 0), revision: "1793000000000000", operation: "upsert", received_at: "2026-11-01T10:00:10.000Z",
-      payload: { id: "7f1c6a52-6a43-4c2e-9b44-1d3c2a6b9e01", org_id: ORG, workspace_id: WS, source: SOURCE, session_id: SESSION, turn_index: 0, session_owner: "user_1", role: "assistant",
+      payload: { id: "7f1c6a52-6a43-4c2e-9b44-1d3c2a6b9e01", org_id: org, workspace_id: WS, source: SOURCE, session_id: SESSION, turn_index: 0, session_owner: "user_1", role: "assistant",
         content: "live turn 0", actor_name: "Ada", actor_role: "owner", metadata_json: JSON.stringify({ nativeCli: "codex" }), ts: "2026-11-01T10:00:09.000Z", tagged: true },
     },
   ];
 }
 
-async function writeSession(): Promise<ManifestV1> {
-  const lines = deliveryLines();
+async function writeSession(location = locationFor(ORG)): Promise<ManifestV1> {
+  const lines = deliveryLines(location.prefix.split("/")[1]);
   const raw = new TextEncoder().encode(lines.map((r) => JSON.stringify(r)).join("\n") + "\n");
   const stored = new Uint8Array(zstdCompressSync(raw));
   const sha = await sha256Hex(raw);
@@ -199,8 +204,12 @@ beforeAll(async () => {
   await pointerRow(manifest);
   // Another org's and another workspace's pointer to the same objects: RLS must keep them out.
   await pointerRow(manifest, { org: "org_2" });
+  // org_3 keeps its session in a GCS Locker (served by the same loopback stub as a GCS emulator).
+  const gcsManifest = await writeSession(locationFor("org_3"));
+  await pointerRow(gcsManifest, { org: "org_3", objectsOrg: "org_3", provider: "gcs" });
 
   s3 = await listen((req, res) => {
+    objectAuth.push(req.headers.authorization ?? "");
     const url = new URL(req.url ?? "/", "http://s3.test");
     const key = decodeURIComponent(url.pathname).replace(/^\/bucket\//u, "");
     const body = url.pathname.startsWith("/bucket/") ? objects.get(key) : undefined;
@@ -217,6 +226,10 @@ beforeAll(async () => {
     answer(body, res);
   });
   jwks = await listen((_req, res) => json(res, 200, { keys: [] }));
+  gcsToken = await listen((req, res) => {
+    if (req.headers["metadata-flavor"] !== "Google") return json(res, 403, {});
+    json(res, 200, { access_token: GCS_ACCESS_TOKEN, expires_in: 3600, token_type: "Bearer" });
+  });
 
   pg.Pool = PglitePool as unknown as typeof pg.Pool;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -229,8 +242,8 @@ beforeAll(async () => {
 afterAll(async () => {
   pg.Pool = RealPool;
   globalThis.fetch = realFetch;
-  for (const stub of [s3, introspect, jwks]) stub?.server.closeAllConnections?.();
-  await Promise.all([s3, introspect, jwks].map((stub) => stub && new Promise<void>((r) => stub.server.close(() => r()))));
+  for (const stub of [s3, introspect, jwks, gcsToken]) stub?.server.closeAllConnections?.();
+  await Promise.all([s3, introspect, jwks, gcsToken].map((stub) => stub && new Promise<void>((r) => stub.server.close(() => r()))));
   await supa?.close();
 });
 
@@ -240,6 +253,8 @@ afterEach(async () => {
   servicePorts = new Set();
   resetSharedRelaycontrolIntrospectors();
   answers.clear();
+  for (const stub of [s3, introspect, jwks, gcsToken]) stub.hits.length = 0;
+  objectAuth.length = 0;
 });
 
 function baseEnv(over: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
@@ -277,7 +292,8 @@ async function start(env: NodeJS.ProcessEnv) {
   // Startup traffic (none expected) is not a request's.
   outbound = [];
   introspectBodies.length = 0;
-  for (const stub of [s3, introspect, jwks]) stub.hits.length = 0;
+  for (const stub of [s3, introspect, jwks, gcsToken]) stub.hits.length = 0;
+  objectAuth.length = 0;
   connects = 0;
   return (path: string, token?: string) =>
     fetch(`http://127.0.0.1:${service.port}${path}`, token === undefined ? {} : { headers: { authorization: `Bearer ${token}` } });
@@ -482,6 +498,57 @@ describe("startup and wiring rules", () => {
     const reasons = [];
     for (const path of ROUTES) reasons.push((await code(await get(path, token)))?.reason);
     expect(reasons).toEqual(["timing_not_configured", "turns_not_configured", "turns_not_configured", "catalog_not_configured"]);
+    expect(s3.hits).toEqual([]);
+  });
+
+  test.each([[undefined], [""], ["false"], ["TRUE"]])(
+    "static key layout (PIPELINE_ORG_FROM_PREFIX=%p) refuses startup: the forged org_2 pointer to org_1's objects is never served",
+    async (flag) => {
+      // org_2's session_index row names org_1's manifest (beforeAll). With a static layout only the
+      // shared base prefix would be checked, so the service must not start at all.
+      const before = PglitePool.created;
+      await expect(startReadApiService(baseEnv({ PIPELINE_ORG_FROM_PREFIX: flag }), { host: "127.0.0.1", port: 0 })).rejects.toThrow(
+        "LOCKER_BUCKET needs PIPELINE_ORG_FROM_PREFIX=true",
+      );
+      expect(PglitePool.created).toBe(before + 1); // the pool opened for reader admission, then closed
+      expect(s3.hits).toEqual([]);
+      expect(introspect.hits).toEqual([]);
+    },
+  );
+
+  test("GCS Locker: every object read and token fetch goes only to the configured loopback endpoints", async () => {
+    const token = "sh_at_synthetic-gcs";
+    answers.set(token, (_b, res) => json(res, 200, active({ org: "org_3", token_id: "tokid_gcs" })));
+    const get = await start(baseEnv({
+      LOCKER_PROVIDER: "gcs",
+      LOCKER_ENDPOINT: `http://127.0.0.1:${s3.port}`,
+      LOCKER_GCS_TOKEN_URI: `http://127.0.0.1:${gcsToken.port}/computeMetadata/v1/instance/service-accounts/default/token`,
+      LOCKER_ACCESS_KEY_ID: undefined,
+      LOCKER_SECRET_ACCESS_KEY: undefined,
+      LOCKER_REGION: undefined,
+    }));
+    for (const path of ROUTES) {
+      const r = await get(path, token);
+      expect([path, r.status]).toEqual([path, 200]);
+    }
+    expect(s3.hits.some((h) => h.startsWith("GET /bucket/96bulls/org_3/"))).toBe(true);
+    expect(gcsToken.hits.length).toBeGreaterThan(0);
+    // Objects were fetched with the token the configured token URI issued.
+    expect(objectAuth.length).toBeGreaterThan(0);
+    for (const auth of objectAuth) expect(auth).toBe(`Bearer ${GCS_ACCESS_TOKEN}`);
+    // Zero calls anywhere else: no storage.googleapis.com, no 169.254.169.254, no JWKS.
+    const allowed = new Set([`http://127.0.0.1:${introspect.port}`, `http://127.0.0.1:${s3.port}`, `http://127.0.0.1:${gcsToken.port}`]);
+    expect(outbound.length).toBeGreaterThan(0);
+    for (const url of outbound) expect([url, allowed.has(new URL(url).origin)]).toEqual([url, true]);
+  }, 60_000);
+
+  test.each([
+    [{ LOCKER_ENDPOINT: "https://storage.example.com" }, "GCS LOCKER_ENDPOINT must be the official HTTPS API or loopback emulator"],
+    [{ LOCKER_GCS_TOKEN_URI: "http://metadata.example.com/token" }, "LOCKER_GCS_TOKEN_URI is not the GKE metadata server or loopback"],
+    [{ LOCKER_ACCESS_KEY_ID: "synthetic" }, "GCS Locker uses Workload Identity"],
+  ] as Array<[Record<string, string | undefined>, string]>)("GCS Locker with %p refuses startup", async (over, message) => {
+    const env = baseEnv({ LOCKER_PROVIDER: "gcs", LOCKER_ENDPOINT: `http://127.0.0.1:${s3.port}`, LOCKER_ACCESS_KEY_ID: undefined, LOCKER_SECRET_ACCESS_KEY: undefined, ...over });
+    await expect(startReadApiService(env, { host: "127.0.0.1", port: 0 })).rejects.toThrow(message);
     expect(s3.hits).toEqual([]);
   });
 

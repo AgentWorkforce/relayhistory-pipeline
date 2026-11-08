@@ -17,7 +17,9 @@
  *   LOCKER_ENDPOINT           s3: e.g. http://minio:9000 (path-style); gcs: the official API or a loopback emulator
  *   LOCKER_REGION             s3: default us-east-1
  *   LOCKER_ACCESS_KEY_ID / LOCKER_SECRET_ACCESS_KEY   s3 only, from the secret store
- *   PIPELINE_KEY_PREFIX / PIPELINE_ORG_FROM_PREFIX    the key layout the ingest writes
+ *   LOCKER_GCS_TOKEN_URI      gcs only: the GKE metadata server (default) or a loopback stand-in
+ *   PIPELINE_ORG_FROM_PREFIX  must be exactly "true" (startup refuses otherwise): see below
+ *   PIPELINE_KEY_PREFIX       the base of the org-derived key layout the ingest writes
  *   READ_API_TIMING_ASSUME_NO_TURNS                   as on the Worker (exactly "true")
  *
  * LOCKER_BUCKET set but no usable store (an S3 selection without keys, an
@@ -25,6 +27,14 @@
  * variable only. Pointer rows are the authorization boundary: an object is read
  * only through a live pointer the tenant-bound read role returned, and
  * canonicalSnapshot rechecks tenant, bucket, provider, digest and key prefix.
+ *
+ * Org binding: manifests carry no org, so only the org-derived key layout
+ * (`<PIPELINE_KEY_PREFIX>/<org>/...`, checked by prefixAllowed) ties an object to
+ * the caller's org. With a static layout prefixAllowed checks only the shared
+ * base, and another org's pointer row naming this org's manifest would be
+ * served. So, as src/session-pipeline/lambda.ts does, the org-derived layout is
+ * required: PIPELINE_ORG_FROM_PREFIX must be exactly "true" whenever
+ * LOCKER_BUCKET is set, and the reader always runs with it on.
  */
 import { zstdDecompressSync } from "node:zlib";
 import { rawStoreFromEnv } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
@@ -59,7 +69,12 @@ function lockerRawEnv(env: NodeJS.ProcessEnv): RawEnv {
           PIPELINE_RAW_S3_ACCESS_KEY_ID: env.LOCKER_ACCESS_KEY_ID || undefined,
           PIPELINE_RAW_S3_SECRET_ACCESS_KEY: env.LOCKER_SECRET_ACCESS_KEY || undefined,
         }
-      : {}),
+      : {
+          // GCS: the configured API endpoint (e.g. a loopback emulator) and token source.
+          // Unmapped, the adapter falls back to storage.googleapis.com and 169.254.169.254.
+          PIPELINE_RAW_S3_ENDPOINT: env.LOCKER_ENDPOINT || undefined,
+          PIPELINE_RAW_GCS_TOKEN_URI: env.LOCKER_GCS_TOKEN_URI?.trim() || undefined,
+        }),
   } as RawEnv;
 }
 
@@ -77,10 +92,12 @@ export function serviceCanonicalDeps(
   fetcher: typeof fetch = (input, init) => fetch(input, init),
 ): ServiceCanonicalDeps | undefined {
   if (!env.LOCKER_BUCKET?.trim()) return undefined;
+  if (env.PIPELINE_ORG_FROM_PREFIX !== "true")
+    throw new Error("session read api: LOCKER_BUCKET needs PIPELINE_ORG_FROM_PREFIX=true (the org-prefix layout binds each object to its org)");
   const rawEnv = lockerRawEnv(env);
   if (!rawStoreFromEnv(rawEnv, fetcher))
     throw new Error("session read api: LOCKER_BUCKET is set but LOCKER_* does not configure a readable store");
-  const prefix = { PIPELINE_KEY_PREFIX: env.PIPELINE_KEY_PREFIX || undefined, PIPELINE_ORG_FROM_PREFIX: env.PIPELINE_ORG_FROM_PREFIX || undefined };
+  const prefix = { PIPELINE_KEY_PREFIX: env.PIPELINE_KEY_PREFIX || undefined, PIPELINE_ORG_FROM_PREFIX: "true" };
   const pointers = sqlCanonicalPointers(run);
   async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows> {
     // Every object read of this request is aborted at the route's deadline.
