@@ -2,16 +2,20 @@
  * stopping publication never turns off cleanup of already admitted private bytes.
  */
 import{publicationEnabled,runCanonicalPublicationRuntime}from'./publication-runtime.ts';
+import{runPortablePublicationRuntime}from'./publication-portable.ts';
+import{publicationTargetKind}from'./publication-target.ts';
 export async function publicationMain(args=process.argv.slice(2),env=process.env){
  if(args.some(x=>!['--gc','--continuous'].includes(x)))throw Error('publication_arguments');
  const mode=args.includes('--gc')?'gc':'publish';
  if(!publicationEnabled(env,mode))return{enabled:false};
+ // Explicit target (publication-target.ts): unset/"aws" is the hosted runtime unchanged.
+ const run=publicationTargetKind(env)==='portable'?runPortablePublicationRuntime:runCanonicalPublicationRuntime;
  const controller=new AbortController(),stop=()=>controller.abort();
  process.once('SIGTERM',stop);process.once('SIGINT',stop);
  let cycles=0;
  try{do{
   controller.signal.throwIfAborted();
-  const counts=await runCanonicalPublicationRuntime(env,mode,{},controller.signal);cycles++;
+  const counts=await run(env,mode,{},controller.signal);cycles++;
   console.log(JSON.stringify({kind:'canonical-publication',mode,healthy:true,...counts}));
   if(!args.includes('--continuous'))break;
   if('examined'in counts&&Number(counts.examined)>0)continue;
