@@ -14,6 +14,9 @@ import { fileURLToPath } from "node:url";
 import {
   adoptRenamedLedgerRows,
   functionBoundaryEvidence,
+  guardError,
+  MIGRATION_RENAME_ALIASES,
+  renameAliasRepairMissing,
   migrationChecksumAlias,
   migrationChecksumMatches,
   RUNTIME_APPLICATION_FUNCTIONS,
@@ -353,9 +356,13 @@ export async function generation(): Promise<string> {
 /** What readiness requires of HoopDb for this image (see schemaVerdict). */
 export async function expectedSchema(): Promise<ExpectedSchema> {
   const mode = process.env.HOOPDB_DB_MODE;
+  const steps = await schemaSteps();
   return {
-    names: await expectedMigrationNames(),
+    names: steps.map((s) => s.name),
     generation: await generation(),
+    // Per-step file sha256 (the same digest generation() takes), for readiness to
+    // adopt renamed ledger rows exactly as the migrator does.
+    shas: Object.fromEntries(await stepSha256s(steps)),
     ...(["local", "selfhosted", "cloudsql", "supabase", "rds"].includes(mode ?? "")
       ? { dbMode: mode as MigrationProfile["mode"] }
       : {}),
@@ -400,6 +407,16 @@ async function migrationPreflight(client: MigrationClient, profile: MigrationPro
   const renameAliases = adoptRenamedLedgerRows(ledger, (name) => stepShas.get(name));
   for (const alias of renameAliases)
     log.info("adopted renamed migration ledger row", alias);
+  // An exact original row left unadopted only because its pinned forward repair is not
+  // planned with its exact sha says so, instead of the generic ledger_unknown_step.
+  for (const a of MIGRATION_RENAME_ALIASES)
+    if (ledger.get(a.ledger_name) === a.ledger_sha && !ledger.has(a.migration) &&
+        stepShas.get(a.migration) === a.accepted_as_alias_of &&
+        renameAliasRepairMissing(a, (name) => stepShas.get(name)))
+      throw guardError(
+        "ledger_alias_repair_missing",
+        `released migration ${a.ledger_name} requires its exact forward repair`,
+      );
   // A HoopDb built from the old vendored pin cannot be moved forward in place:
   // upstream changed 20261025000600 after it was applied there. Say so plainly.
   if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {

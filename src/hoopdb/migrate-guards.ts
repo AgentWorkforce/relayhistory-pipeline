@@ -50,8 +50,12 @@ export const MIGRATION_CHECKSUM_ALIASES = [
 // statement equal apart from the provenance header, except that the original ingest
 // ledger also granted the seed RPCs to bulls96_session_ingest_seeder, which
 // 20261104040000_ingest_s3_proof_seed (always on this image, after both) REVOKEs ALL,
-// so the end schema is identical. Earlier drafts of the original file (other shas) are
-// not adopted, and any future edit of a release file fails closed.
+// so the end schema is identical. That REVOKE is the forward repair the ingest row
+// depends on: it is adopted only while `repair` is in the plan with exactly
+// `repair_sha` (ported from #396). Earlier drafts of the original file (other shas) are
+// not adopted, and any future edit of a release or repair file fails closed.
+// The original file bytes are pinned by the fixtures in
+// __tests__/fixtures/released-migration-history/.
 export const MIGRATION_RENAME_ALIASES = [
   {
     ledger_name: "upstream:20261103010000_session_directory_event_metadata.sql",
@@ -68,6 +72,9 @@ export const MIGRATION_RENAME_ALIASES = [
     migration: "upstream:20261104022000_session_ingest_ledger.sql",
     accepted_as_alias_of:
       "69f4157ea3a615344aa1b383fc6af7405c1ff9f1568e7c8ab97e58fbc78fe1b5",
+    repair: "upstream:20261104040000_ingest_s3_proof_seed.sql",
+    repair_sha:
+      "18ea54ed1aa50e5ea44bab01a65177e2fc9c92919ac23b973f820e8af8b75b86",
   },
 ] as const;
 
@@ -100,10 +107,23 @@ export function migrationChecksumAlias(
 }
 
 /**
+ * True when `alias` pins a forward repair that is not in the plan with its exact sha
+ * (`fileSha` returns undefined for a step that is not planned).
+ */
+export function renameAliasRepairMissing(
+  alias: (typeof MIGRATION_RENAME_ALIASES)[number],
+  fileSha: (name: string) => string | undefined,
+): boolean {
+  return "repair" in alias && fileSha(alias.repair) !== alias.repair_sha;
+}
+
+/**
  * Adopts, in `ledger` only, each MIGRATION_RENAME_ALIASES row whose four values all
- * match and whose release name is not already recorded: the original key is replaced
- * by the release name, keeping the recorded sha. Anything else is left untouched for
- * sequencePreflight to refuse (ledger_unknown_step / migration_changed). Never writes.
+ * match, whose pinned forward repair (if any) is planned with its exact sha, and whose
+ * release name is not already recorded: the original key is replaced by the release
+ * name, keeping the recorded sha. Anything else is left untouched for
+ * sequencePreflight to refuse (ledger_unknown_step / migration_changed), and readiness
+ * keeps reporting the release name as missing. Never writes.
  */
 export function adoptRenamedLedgerRows(
   ledger: Map<string, string>,
@@ -114,7 +134,8 @@ export function adoptRenamedLedgerRows(
     if (
       ledger.get(a.ledger_name) !== a.ledger_sha ||
       ledger.has(a.migration) ||
-      fileSha(a.migration) !== a.accepted_as_alias_of
+      fileSha(a.migration) !== a.accepted_as_alias_of ||
+      renameAliasRepairMissing(a, fileSha)
     )
       continue;
     ledger.delete(a.ledger_name);

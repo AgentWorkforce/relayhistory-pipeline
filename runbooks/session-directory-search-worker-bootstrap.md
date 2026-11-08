@@ -918,6 +918,11 @@ Renamed migrations are adopted only through `MIGRATION_RENAME_ALIASES` (`migrate
 never by editing `sessions.__96bulls_migrations`: an original-name row is read as its release
 name in memory, only when both pinned shas match, logged and shown in the release plan and
 `--activation-check`; any other original name or sha still refuses as `ledger_unknown_step`.
+The ingest row is adopted only while `20261104040000_ingest_s3_proof_seed.sql` (which revokes
+the original's seed grants) is planned with its pinned sha, else `ledger_alias_repair_missing`.
+Readiness (`schemaVerdict`) applies the same in-memory adoption; unadopted rows stay `schema_pending`.
+The original file bytes and the released ledger are pinned as test fixtures
+(`src/hoopdb/__tests__/fixtures/released-migration-history/`).
 
 ### Auth verifier append-only upgrade and membership
 
