@@ -18,17 +18,20 @@
  * refusal, and the exact committed grant set.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import pg from "pg";
 import { composeSearchService } from "../../shared/search-composition.ts";
 import { postgresSearchState } from "../postgres-search-state.ts";
 import { writerTransactionSql } from "../transaction-sql.ts";
+import { sessionsFunctionAclPreview } from "../../hoopdb/migrate-guards.ts";
 import {
   assertRuntimeIdentity,
   reconcileTombstonedScopes,
   writerComposition,
 } from "../consumer-service.ts";
+import type { TenantRunner } from "../../session-read-api/liveness.ts";
 import {
   bootstrapCheckOwner,
   bootstrapLock,
@@ -64,16 +67,51 @@ async function files(): Promise<{ role: string; verify: string }> {
   return { role: stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")), verify: stripPsqlMeta(readFileSync(VERIFY_SQL, "utf8")) };
 }
 
+/**
+ * Self-provisioning for CI and reruns: the test database gains the migrated
+ * schema (shim, bootstrap roles, every Supabase + HoopDb migration) when it
+ * is absent, exactly like the PGlite migratedPg fixture but on real
+ * Postgres. The migrator's own PUBLIC-EXECUTE revoke runs too, mirroring the
+ * hardening migrate performs before this bootstrap ever runs.
+ */
+const repoRoot = join(import.meta.dir, "../../..");
+const readSql = (path: string): string =>
+  readFileSync(join(repoRoot, path), "utf8")
+    .split("\n")
+    .filter((line) => !line.startsWith("\\"))
+    .join("\n");
+
+async function ensureProvisioned(pool: pg.Pool): Promise<void> {
+  const { rows } = await pool.query<{ r: string | null }>(
+    `SELECT to_regclass('sessions.session_index') AS r`,
+  );
+  if (rows[0]?.r) return;
+  await pool.query(readSql("supabase/tests/supabase_shim.sql"));
+  await pool.query("CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin");
+  for (const file of [
+    "supabase/bootstrap/session_directory_search_worker.sql",
+    "supabase/bootstrap/session_token_verifier.sql",
+    "supabase/bootstrap/session_ingest_roles.sql",
+    "supabase/bootstrap/session_read_api_roles.sql",
+  ])
+    await pool.query(readSql(file));
+  for (const file of readdirSync(join(repoRoot, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort())
+    await pool.query(readSql(`supabase/migrations/${file}`));
+  for (const file of readdirSync(join(repoRoot, "src/hoopdb/migrations")).filter((f) => f.endsWith(".sql")).sort())
+    await pool.query(readSql(`src/hoopdb/migrations/${file}`));
+  await pool.query("REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC");
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY, sha256 text NOT NULL);
+     CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY, generation text, status text, updated_at timestamptz DEFAULT now())`,
+  );
+}
+
 describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => {
   let pool: pg.Pool;
 
   beforeAll(async () => {
     pool = ownerPool();
-    await pool.query("CREATE EXTENSION IF NOT EXISTS pg_trgm");
-    await pool.query(
-      `CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY, sha256 text NOT NULL);
-       CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY, generation text, status text, updated_at timestamptz DEFAULT now())`,
-    );
+    await ensureProvisioned(pool);
   });
 
   afterAll(async () => {
@@ -85,16 +123,21 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
     await pool.end();
   });
 
-  async function bootstrapOnce(): Promise<void> {
-    const client = await pool.connect();
+  // Models serve(): one outer transaction around every owner step, so a
+  // failed verify rolls back role, grants, policies and tables together.
+  async function bootstrapInTx(
+    client: pg.PoolClient,
+    overrides?: { verifyRole?: (o: ReturnType<typeof asSql>) => Promise<void> },
+  ): Promise<void> {
+    const db = asSql(client);
+    const binding = composeSearchService(
+      writerComposition(BACKEND, 0),
+      { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: writerTransactionSql(db).sql, secrets: {} },
+      "writer",
+    );
+    const { role, verify } = await files();
+    await client.query("BEGIN");
     try {
-      const db = asSql(client);
-      const binding = composeSearchService(
-        writerComposition(BACKEND, 0),
-        { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: writerTransactionSql(db).sql, secrets: {} },
-        "writer",
-      );
-      const { role, verify } = await files();
       await runBootstrap({
         owner: db,
         lock: () => bootstrapLock(db),
@@ -103,13 +146,88 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
         ensureProjectionState: (o) => postgresSearchState({ backendId: BACKEND, fromMs: 0 }).ensureSchema(o),
         ensureServiceTables,
         ensureRole: (o) => o.query(role).then(() => {}),
-        verifyRole: (o) => o.query(verify).then(() => {}),
+        verifyRole: overrides?.verifyRole ?? ((o) => o.query(verify).then(() => {})),
         generation: "native-test",
       });
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async function bootstrapOnce(): Promise<void> {
+    const client = await pool.connect();
+    try {
+      await bootstrapInTx(client);
     } finally {
       client.release();
     }
   }
+
+  // Drop a leftover writer install (grants and policies first: DROP ROLE
+  // refuses while anything depends on the role). Tables go too, so the
+  // rollback below can prove the bootstrap recreated nothing.
+  async function dropWriterInstall(client: pg.PoolClient): Promise<void> {
+    const { rows } = await client.query<{ n: string }>(
+      `SELECT count(*) AS n FROM pg_roles WHERE rolname='search_consumer_runtime'`,
+    );
+    if (rows[0]?.n === "0") {
+      await client.query(`DROP TABLE IF EXISTS sessions.search_consumer_pending, sessions.search_consumer_progress`);
+      return;
+    }
+    for (const table of [
+      "session_index", "session_index_ext", "session_directory", "session_directory_users",
+      "session_directory_machines", "session_briefs", "session_directory_event_pending",
+      "session_directory_event_times", "repos", "repo_names",
+    ])
+      await client.query(`DROP POLICY IF EXISTS search_consumer_trusted ON sessions.${table}`);
+    await client.query(`REVOKE ALL ON SCHEMA sessions, search_index FROM search_consumer_runtime`);
+    await client.query(`REVOKE ALL ON ALL TABLES IN SCHEMA sessions, search_index FROM search_consumer_runtime`);
+    await client.query(`REVOKE ALL ON ALL FUNCTIONS IN SCHEMA sessions, search_index FROM search_consumer_runtime`);
+    await client.query(`DROP TABLE IF EXISTS sessions.search_consumer_pending, sessions.search_consumer_progress`);
+    await client.query(`DROP ROLE search_consumer_runtime`);
+  }
+
+  // Runs first: it starts from no role and no service tables (dropping any
+  // leftovers from an earlier run), so the rollback can prove everything the
+  // bootstrap created is gone.
+  test("a failed verify rolls the full bootstrap back atomically", async () => {
+    const client = await pool.connect();
+    try {
+      await dropWriterInstall(client);
+      const { verify } = await files();
+      // The whole bootstrap runs inside one transaction (exactly like
+      // serve): the role, grants, policies and service tables install, then
+      // an injected drift makes the real verify fail, and the rollback must
+      // remove everything the bootstrap created.
+      await expect(
+        bootstrapInTx(client, {
+          verifyRole: async (o) => {
+            await o.query(`GRANT TRUNCATE ON sessions.search_consumer_pending TO search_consumer_runtime`);
+            await o.query(verify);
+          },
+        }),
+      ).rejects.toThrow("forbidden grant sessions.search_consumer_pending TRUNCATE");
+      const gone = await client.query(
+        `SELECT count(*)::int AS n FROM pg_roles WHERE rolname='search_consumer_runtime'`,
+      );
+      expect(gone.rows[0]).toMatchObject({ n: 0 });
+      const tables = await client.query(
+        `SELECT count(*)::int AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname='sessions' AND c.relname IN ('search_consumer_pending', 'search_consumer_progress')`,
+      );
+      expect(tables.rows[0]).toMatchObject({ n: 0 });
+      // And the same bootstrap converges cleanly on retry.
+      await bootstrapInTx(client);
+      const back = await client.query(
+        `SELECT count(*)::int AS n FROM pg_roles WHERE rolname='search_consumer_runtime'`,
+      );
+      expect(back.rows[0]).toMatchObject({ n: 1 });
+    } finally {
+      client.release();
+    }
+  }, 180_000);
 
   test("bootstrap converges twice: role, grants, policies, verify", async () => {
     await bootstrapOnce();
@@ -155,22 +273,6 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
     expect(missing.rows[0]).toMatchObject({ n: 1 }); // the install test's role, untouched by refusals
   }, 120_000);
 
-  test("verify failure rolls back atomically", async () => {
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      // A stray extra grant is drift: verify names it, the rollback removes it.
-      await client.query(`GRANT TRUNCATE ON sessions.search_consumer_pending TO search_consumer_runtime`);
-      const { verify } = await files();
-      await expect(client.query(verify)).rejects.toThrow("unlisted grant sessions.search_consumer_pending TRUNCATE");
-      await client.query("ROLLBACK");
-      const { verify: again } = await files();
-      await client.query(again); // passes after the rollback
-    } finally {
-      client.release();
-    }
-  }, 120_000);
-
   test("assertRuntimeIdentity refuses the owner session_user", async () => {
     const client = await pool.connect();
     try {
@@ -184,10 +286,34 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
 describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgres", () => {
   let wpool: pg.Pool;
   let admin: pg.Pool;
+  let writerRun: TenantRunner;
+
+  /** Writer-side tenant transaction: the search tables are gated by the
+   * tenant_only policies, so every writer write binds the GUCs first. */
+  function tenantRunner(pool: pg.Pool): TenantRunner {
+    return async (orgId, workspaceId, work) => {
+      const c = await pool.connect();
+      try {
+        await c.query("BEGIN");
+        await c.query("SELECT set_config('bulls96_read.org_id',$1,true),set_config('bulls96_read.workspace_id',$2,true)", [orgId, workspaceId]);
+        try {
+          const out = await work(asSql(c));
+          await c.query("COMMIT");
+          return out;
+        } catch (error) {
+          await c.query("ROLLBACK");
+          throw error;
+        }
+      } finally {
+        c.release();
+      }
+    };
+  }
 
   beforeAll(async () => {
     wpool = new pg.Pool({ connectionString: writerUrl });
     admin = ownerPool();
+    writerRun = tenantRunner(wpool);
     await admin.query(
       `INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id)
        VALUES($1,'w','h','wlive','m','u',now(),now(),'s3','b','96bulls/pgtest/wlive.json','00000000-0000-0000-0000-000000000000')
@@ -200,10 +326,12 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
        ON CONFLICT DO NOTHING`,
       [ORG],
     );
-    await wpool.query(
-      `INSERT INTO search_index.projection_state(backend_id,org_id,workspace_id,source,session_id,canonical_session_id,source_epoch,coverage_from_ms,revision,row_count,complete,updated_at)
-       VALUES($1,$2,'w','h','wdead','wdead',3,0,1,4,true,now()) ON CONFLICT DO NOTHING`,
-      [BACKEND, ORG],
+    await writerRun(ORG, "w", (tx) =>
+      tx.query(
+        `INSERT INTO search_index.projection_state(backend_id,org_id,workspace_id,source,session_id,canonical_session_id,source_epoch,coverage_from_ms,revision,row_count,complete,updated_at)
+         VALUES($1,$2,'w','h','wdead','wdead',3,0,1,4,true,now()) ON CONFLICT DO NOTHING`,
+        [BACKEND, ORG],
+      ),
     );
     await admin.query(
       `INSERT INTO search_index.transcript_events(org_id,workspace_id,ts_ms,session_id,source,machine_id,kind,event_id,type,user_id,actor_name,actor_role,subagent_id,project_id,task_title,task_ref,task_ref_id,tags,files_touched,tool_name,tool_status,delivery_record_id,content,content_bytes,content_prefix_folded,task_title_folded,fingerprint,version)
@@ -240,27 +368,115 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
     }
   }, 120_000);
 
+  test("pointer upsert and tombstone run as the role (trigger INSERT needs no extra grant)", async () => {
+    const client = await wpool.connect();
+    try {
+      // A live pointer upsert fires sessions.session_directory_events_changed
+      // as the writer: the trigger INSERTs the dirty marker, so this fails
+      // 42501 without the event_pending INSERT grant.
+      const payload = (revision: number, deletedAt: string | null) =>
+        JSON.stringify([
+          {
+            org_id: ORG, workspace_id: "w", harness: "h", session_id: "wtrig", machine_id: "m",
+            user_id: "u", created_at: new Date().toISOString(), last_activity_at: new Date().toISOString(),
+            storage_provider: "s3", bucket: "b", manifest_key: "96bulls/pgtest/wtrig.json",
+            trace_id: "00000000-0000-0000-0000-000000000000", revision, deleted_at: deletedAt,
+          },
+        ]);
+      const live = await client.query(`SELECT applied FROM sessions.upsert_session_index($1::jsonb)`, [payload(1, null)]);
+      expect(live.rows[0]).toMatchObject({ applied: true });
+      const mark = await client.query(
+        `SELECT dirty FROM sessions.session_directory_event_pending WHERE org_id=$1 AND source_session_id='wtrig'`,
+        [ORG],
+      );
+      expect(mark.rows[0]).toMatchObject({ dirty: true });
+      // Tombstone the same pointer: the trigger path fires again and the
+      // pointer row carries deleted_at.
+      const tombed = await client.query(`SELECT applied FROM sessions.upsert_session_index($1::jsonb)`, [payload(2, new Date().toISOString())]);
+      expect(tombed.rows[0]).toMatchObject({ applied: true });
+      const gone = await client.query(
+        `SELECT deleted_at IS NOT NULL AS tombed FROM sessions.session_index WHERE org_id=$1 AND session_id='wtrig'`,
+        [ORG],
+      );
+      expect(gone.rows[0]).toMatchObject({ tombed: true });
+    } finally {
+      client.release();
+    }
+  }, 120_000);
+
   test("tombstone retire runs as the role and converges", async () => {
     const client = await wpool.connect();
     try {
       const db = asSql(client);
       // Erase wdead the way indexSearchScope does, then the backstop retires
-      // the residue itself: nothing re-sent, state row gone.
-      await client.query(`DELETE FROM search_index.transcript_events WHERE org_id=$1 AND session_id='wdead'`, [ORG]);
-      await client.query(
-        `INSERT INTO search_index.projection_state(backend_id,org_id,workspace_id,source,session_id,canonical_session_id,source_epoch,coverage_from_ms,revision,row_count,complete,updated_at)
-         VALUES($1,$2,'w','h','wdead','wdead',3,0,1,0,true,now())
-         ON CONFLICT(backend_id,org_id,workspace_id,source,session_id) DO UPDATE SET row_count=0, complete=true`,
-        [BACKEND, ORG],
+      // the residue itself: nothing re-sent, state row gone. The search
+      // writes bind the tenant GUCs; the backstop's tenant enumeration runs
+      // on the plain writer connection (sessions writer policy, no GUCs).
+      await writerRun(ORG, "w", (tx) =>
+        tx.query(`DELETE FROM search_index.transcript_events WHERE org_id=$1 AND session_id='wdead'`, [ORG]),
+      );
+      await writerRun(ORG, "w", (tx) =>
+        tx.query(
+          `INSERT INTO search_index.projection_state(backend_id,org_id,workspace_id,source,session_id,canonical_session_id,source_epoch,coverage_from_ms,revision,row_count,complete,updated_at)
+           VALUES($1,$2,'w','h','wdead','wdead',3,0,1,0,true,now())
+           ON CONFLICT(backend_id,org_id,workspace_id,source,session_id) DO UPDATE SET row_count=0, complete=true`,
+          [BACKEND, ORG],
+        ),
       );
       const sent: string[] = [];
-      const out = await reconcileTombstonedScopes(db, BACKEND, "96bulls/pgtest", 100, async (b) => {
+      const out = await reconcileTombstonedScopes(db, writerRun, BACKEND, "96bulls/pgtest", 100, async (b) => {
         sent.push(b);
       });
       expect(out).toMatchObject({ tombstoned: 0, overflow: false });
       expect(sent).toHaveLength(0);
-      const left = await client.query(`SELECT count(*)::int AS n FROM search_index.projection_state WHERE backend_id=$1 AND session_id='wdead'`, [BACKEND]);
+      const left = await writerRun(ORG, "w", (tx) =>
+        tx.query<{ n: number }>(`SELECT count(*)::int AS n FROM search_index.projection_state WHERE backend_id=$1 AND session_id='wdead'`, [BACKEND]),
+      );
       expect(left.rows[0]).toMatchObject({ n: 0 });
+    } finally {
+      client.release();
+    }
+  }, 120_000);
+
+  test("writer executes exactly the eight pointer functions, nothing else in sessions", async () => {
+    const fns = await wpool.query<{ fn: string }>(
+      `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p
+       WHERE p.pronamespace = to_regnamespace('sessions')
+         AND has_function_privilege('search_consumer_runtime', p.oid, 'EXECUTE')
+       ORDER BY 1`,
+    );
+    expect(fns.rows.map((r) => r.fn)).toEqual([
+      "sessions.applied_repo_evidence(jsonb,jsonb)",
+      "sessions.canonical_remote(text)",
+      "sessions.clean_root_commit(text)",
+      "sessions.lock_repo_catalog(text)",
+      "sessions.resolve_repo(text,text,text,timestamp with time zone)",
+      "sessions.session_index_batch(jsonb)",
+      "sessions.session_publication_is_managed(text,text,text,text,text)",
+      "sessions.upsert_session_index(jsonb)",
+    ]);
+  }, 120_000);
+
+  test("function ACL drift is exactly the eight consumer EXECUTE grants", async () => {
+    // Blast-radius receipt for the boundary workstream: these EXECUTE grants
+    // sit outside the migrator's function-ACL manifest (B2), so the receipt
+    // pins that the drift is exactly these eight and nothing else. Missing
+    // runtime grants are installed by migrate itself, not by this bootstrap.
+    const client = await admin.connect();
+    try {
+      const preview = await sessionsFunctionAclPreview(asSql(client), "service_role", true);
+      expect(preview.function_acl_drift_extra.sort()).toEqual(
+        [
+          "sessions.applied_repo_evidence(jsonb,jsonb)",
+          "sessions.canonical_remote(text)",
+          "sessions.clean_root_commit(text)",
+          "sessions.lock_repo_catalog(text)",
+          "sessions.resolve_repo(text,text,text,timestamp with time zone)",
+          "sessions.session_index_batch(jsonb)",
+          "sessions.session_publication_is_managed(text,text,text,text,text)",
+          "sessions.upsert_session_index(jsonb)",
+        ].map((fn) => `${fn}: search_consumer_runtime:EXECUTE`),
+      );
     } finally {
       client.release();
     }
@@ -306,6 +522,7 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
       "sessions.session_directory INSERT",
       "sessions.session_directory SELECT",
       "sessions.session_directory UPDATE",
+      "sessions.session_directory_event_pending INSERT",
       "sessions.session_directory_event_pending SELECT",
       "sessions.session_directory_event_pending UPDATE",
       "sessions.session_directory_event_times DELETE",

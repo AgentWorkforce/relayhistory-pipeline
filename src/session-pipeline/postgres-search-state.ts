@@ -43,12 +43,12 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
       const expected = normalize("org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true)");
       const tenant = rows.find((r) => r.name === "tenant_only");
       if (!tenant || tenant.command !== "*" || tenant.roles !== "{0}" || !tenant.permissive || normalize(tenant.qual ?? "") !== expected || normalize(tenant.check ?? "") !== expected) throw new Error("search state tenant policy mismatch");
-      // The self-host bootstrap adds exactly one more policy: the transparent
-      // writer policy for search_consumer_runtime (PERMISSIVE USING(true), no
-      // other grantee). It does not weaken tenant isolation for any other
-      // role, but any other policy shape still fails closed here.
-      const extras = rows.filter((r) => r.name !== "tenant_only");
-      if (extras.length > 1 || (extras.length === 1 && (extras[0]!.name !== "search_consumer_trusted" || extras[0]!.command !== "*" || extras[0]!.roles !== "search_consumer_runtime" || !extras[0]!.permissive || normalize(extras[0]!.qual ?? "") !== "true" || normalize(extras[0]!.check ?? "") !== "true"))) throw new Error("search state tenant policy mismatch");
+      // Exactly one policy may exist: a writer-targeted extra (the removed
+      // search_consumer_trusted policy, or any other) would both collide
+      // with #330's exact-one-policy check and widen the tenant gate, so it
+      // fails closed here. The writer binds the tenant GUCs per scope
+      // instead (every search write runs inside a tenant transaction).
+      if (rows.length !== 1) throw new Error("search state tenant policy mismatch");
     },
     async fromMs() { return fromMs; },
     async record(tx, scope, value) {

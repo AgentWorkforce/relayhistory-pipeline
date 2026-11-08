@@ -12,10 +12,12 @@
 --   * EXECUTE on the three pointer functions, including the SECURITY DEFINER
 --     session_publication_is_managed (the writer must call it; verify
 --     allowlists exactly this one and no other SECURITY DEFINER function);
---   * a transparent RLS policy on every RLS-enabled table the writer
---     touches: the member-read policies name only `authenticated`, so
---     without these the writer sees 0 rows and reports complete wrongly.
---     Same shape as the migrator's trusted policy, scoped to this role.
+--   * a transparent RLS policy on every sessions table the writer touches
+--     (the member-read policies name only `authenticated`, so without
+--     these the writer sees 0 rows and reports complete wrongly; same
+--     shape as the migrator's trusted policy, scoped to this role). No
+--     writer policy on the search_index tables: those writes always run
+--     with the tenant GUCs bound per scope, under tenant_only policies.
 --
 -- Run as the schema owner INSIDE the bootstrap's single transaction (the
 -- bootstrap holds the advisory lock and rolls everything back on failure).
@@ -130,10 +132,18 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_users TO sear
 GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_machines TO search_consumer_runtime;
 GRANT SELECT ON sessions.session_briefs TO search_consumer_runtime;
 
--- Directory event watermarks (the erased and live-complete branches).
+-- Directory event watermarks (the erased and live-complete branches). INSERT on
+-- event_pending is required because the AFTER trigger on session_index
+-- (sessions.session_directory_events_changed, SECURITY INVOKER) inserts the
+-- dirty marker as the writer: without INSERT every pointer write fails 42501.
+-- Only that invoker trigger writes extra tables from the writer's statements;
+-- every other trigger reachable from the writer's writes is SECURITY DEFINER
+-- (replay, history sync, seed, publication guard, brief documents) or touches
+-- only the NEW row (project_name, tombstone), except event_times_forget,
+-- whose DELETE the writer is already granted below.
 REVOKE ALL ON sessions.session_directory_event_pending FROM search_consumer_runtime;
 REVOKE ALL ON sessions.session_directory_event_times FROM search_consumer_runtime;
-GRANT SELECT, UPDATE ON sessions.session_directory_event_pending TO search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE ON sessions.session_directory_event_pending TO search_consumer_runtime;
 GRANT SELECT, INSERT, DELETE ON sessions.session_directory_event_times TO search_consumer_runtime;
 
 -- Search write surface. DELETE on transcript_events is required: the adapter
@@ -170,7 +180,9 @@ DECLARE
     'sessions.session_directory_event_pending',
     'sessions.session_directory_event_times',
     'sessions.repos',
-    'sessions.repo_names',
+    'sessions.repo_names'
+  ];
+  v_search_tables text[] := ARRAY[
     'search_index.transcript_events',
     'search_index.projection_state'
   ];
@@ -179,6 +191,11 @@ BEGIN
   FOREACH v_table IN ARRAY v_tables LOOP
     EXECUTE format('DROP POLICY IF EXISTS search_consumer_trusted ON %s', v_table);
     EXECUTE format('CREATE POLICY search_consumer_trusted ON %s AS PERMISSIVE FOR ALL TO search_consumer_runtime USING (true) WITH CHECK (true)', v_table);
+  END LOOP;
+  -- A previous install may have left a writer policy on the search tables;
+  -- drop it so the tenant_only policies are the only gate. None is created.
+  FOREACH v_table IN ARRAY v_search_tables LOOP
+    EXECUTE format('DROP POLICY IF EXISTS search_consumer_trusted ON %s', v_table);
   END LOOP;
 END
 $policies$;

@@ -29,7 +29,7 @@
  * reconciling real canonical events.
  */
 import { createServer } from "node:http";
-import { writeFileSync } from "node:fs";
+import { unlinkSync, writeFileSync } from "node:fs";
 import { log } from "../shared/log.ts";
 import { integer } from "../shared/env.ts";
 import { inTransaction, type HoopDb } from "../shared/db.ts";
@@ -85,7 +85,7 @@ const MAX_DELAY_MS = 60 * 60_000;
 
 export interface ConsumerTickIo {
   /** List recent manifests and hand each reconcile body to `send`. */
-  reconcile: (send: (body: string) => Promise<void>, since: Date) => Promise<{ enqueued: number; complete: boolean }>;
+  reconcile: (send: (body: string) => Promise<void>, since: Date) => Promise<{ enqueued: number; complete: boolean; nextCursor?: string }>;
   /** Check projection_state freshness against the pointer; send bodies for stale sessions. */
   checkFreshness: (send: (body: string) => Promise<void>) => Promise<{ stale: number; tombstoned: number; overflow: boolean }>;
   /**
@@ -116,6 +116,20 @@ export interface ConsumerTickSummary {
   failedKeys: string[];
   requeuedKeys: string[];
   failedItems: { key: string; etag?: string; version?: string }[];
+  /**
+   * Keys actually sent to consume this tick (post-dedupe). Success is computed
+   * over exactly these: a body dedupe skipped was never consumed and must not
+   * be deleted as succeeded.
+   */
+  consumedKeys: string[];
+  /**
+   * Requeued keys with the revision actually consumed (carried from the
+   * consumed body, not the etag-less requeue callback body), so busy-retry
+   * accounting never nulls a known revision.
+   */
+  requeuedItems: { key: string; etag?: string; version?: string }[];
+  /** Listing resume point when the reconcile link did not complete. */
+  nextCursor?: string;
 }
 
 /** Manifest key carried by a reconcile body, or null when the body is not one. */
@@ -165,6 +179,17 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
     bodies.push(body);
   });
   const consumable = io.dedupe ? await io.dedupe(bodies) : bodies;
+  // Identities actually consumed this tick (post-dedupe), with the revision
+  // carried on each body. A requeue callback only hands back the key, so the
+  // map below restores the consumed revision for busy-retry accounting.
+  const consumedKeys: string[] = [];
+  const consumedMetas = new Map<string, { etag?: string; version?: string }>();
+  for (const body of consumable) {
+    const meta = reconcileMeta(body);
+    if (meta === null) continue;
+    consumedKeys.push(meta.key);
+    if (!consumedMetas.has(meta.key)) consumedMetas.set(meta.key, { etag: meta.etag, version: meta.version });
+  }
   const stamp = io.now?.() ?? Date.now();
   const records: QueueRecord[] = consumable.map((body, i) => ({ messageId: `reconcile-${stamp}-${i}`, body }));
   const bodyById = new Map(records.map((record, i) => [record.messageId, consumable[i]!]));
@@ -194,10 +219,28 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
     }
     if (io.pending.length < MAX_PENDING_ROWS) io.pending.push(bodyById.get(record.messageId)!);
   });
+  const requeuedItems: { key: string; etag?: string; version?: string }[] = [];
   for (const body of io.requeued) {
     const meta = reconcileMeta(body);
-    if (meta !== null) requeuedKeys.push(meta.key);
-    if (io.pending.length < MAX_PENDING_ROWS) io.pending.push(body);
+    if (meta !== null) {
+      requeuedKeys.push(meta.key);
+      // The requeue callback hands back an etag-less body; carry the revision
+      // actually consumed so busy-retry accounting never nulls a known one.
+      const carried = consumedMetas.get(meta.key);
+      requeuedItems.push({
+        key: meta.key,
+        ...(carried?.etag !== undefined ? { etag: carried.etag } : {}),
+        ...(carried?.version !== undefined ? { version: carried.version } : {}),
+      });
+      if (io.pending.length < MAX_PENDING_ROWS) {
+        // Park the consumed (revision-carrying) body, not the etag-less
+        // requeue callback body, so the next tick still sees the revision.
+        const carriedBody = consumable.find((b) => reconcileMeta(b)?.key === meta.key);
+        io.pending.push(carriedBody ?? body);
+      }
+    } else if (io.pending.length < MAX_PENDING_ROWS) {
+      io.pending.push(body);
+    }
   }
   io.requeued.length = 0;
   if (io.pending.length >= MAX_PENDING_ROWS)
@@ -222,6 +265,9 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
     failedKeys,
     requeuedKeys,
     failedItems,
+    consumedKeys,
+    requeuedItems,
+    ...(link.nextCursor === undefined ? {} : { nextCursor: link.nextCursor }),
   };
 }
 
@@ -346,9 +392,14 @@ export async function storePending(
 ): Promise<void> {
   for (const row of rows) {
     await db.query(
+      // A failure body without a revision never nulls the recorded one: the
+      // etag/version columns keep the previously carried revision so the next
+      // revive comparison still sees the real last revision.
       `INSERT INTO sessions.search_consumer_pending(backend_id,manifest_key,manifest_etag,manifest_version,attempts,next_at,last_error_code,dead,updated_at)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       ON CONFLICT(backend_id,manifest_key) DO UPDATE SET manifest_etag=excluded.manifest_etag,manifest_version=excluded.manifest_version,
+       ON CONFLICT(backend_id,manifest_key) DO UPDATE SET
+         manifest_etag=COALESCE(excluded.manifest_etag,sessions.search_consumer_pending.manifest_etag),
+         manifest_version=COALESCE(excluded.manifest_version,sessions.search_consumer_pending.manifest_version),
          attempts=excluded.attempts,next_at=excluded.next_at,last_error_code=excluded.last_error_code,dead=excluded.dead,updated_at=excluded.updated_at`,
       [backendId, row.manifestKey, row.manifestEtag ?? null, row.manifestVersion ?? null, row.attempts, row.nextAt.toISOString(), row.lastErrorCode, row.dead, now.toISOString()],
     );
@@ -375,6 +426,130 @@ export async function loadPendingMap(db: SqlExecutor, backendId: string, keys: s
   );
   for (const row of rows) out.set(row.k, { attempts: row.attempts, dead: row.dead, etag: row.etag, version: row.version });
   return out;
+}
+
+/**
+ * Dead-letter skip rule: a dead row is skipped unless the body carries a NEW
+ * revision (a genuinely new manifest revives the key). An etag-less body
+ * never revives: without a revision it cannot prove it is newer, so it stays
+ * skipped instead of resurrecting the dead row.
+ */
+export function shouldSkipDeadLetter(
+  row: KnownPending | undefined,
+  meta: { key: string; etag?: string; version?: string } | null,
+): boolean {
+  if (meta === null || !row?.dead) return false;
+  const carried = meta.etag !== undefined || meta.version !== undefined;
+  if (!carried) return true;
+  return (row.etag ?? null) === (meta.etag ?? null) && (row.version ?? null) === (meta.version ?? null);
+}
+
+/**
+ * Freshness/tombstone backoff gate: bodies whose pending row has not come
+ * due yet are not re-sent this tick (their next_at backoff keeps working).
+ * Returns the gated send plus a skipped count for logging. Skipped bodies
+ * still count in the stale/tombstoned totals, so a backing-off session
+ * blocks completion exactly like a failure does.
+ */
+export function gateDeferredSends(
+  deferred: Set<string>,
+  send: (body: string) => Promise<void>,
+): { send: (body: string) => Promise<void>; skipped: () => number } {
+  let skipped = 0;
+  return {
+    send: async (body) => {
+      const meta = reconcileMeta(body);
+      if (meta && deferred.has(meta.key)) {
+        skipped += 1;
+        return;
+      }
+      await send(body);
+    },
+    skipped: () => skipped,
+  };
+}
+
+/**
+ * The tick's durable dead-letter filter: drop bodies this tick must not
+ * consume (dead rows with an unchanged or absent revision). Runs after
+ * collection, before consume, so a skipped body is neither consumed nor
+ * deleted as succeeded.
+ */
+export function makeDedupe(db: SqlExecutor, backendId: string): (bodies: string[]) => Promise<string[]> {
+  return async (bodies: string[]): Promise<string[]> => {
+    const keys = [...new Set(bodies.map((b) => reconcileMeta(b)?.key).filter((k): k is string => k !== null))];
+    const known = await loadPendingMap(db, backendId, keys);
+    let skipped = 0;
+    const survivors = bodies.filter((body) => {
+      if (shouldSkipDeadLetter(known.get(reconcileMeta(body)?.key ?? ""), reconcileMeta(body))) {
+        skipped += 1;
+        return false;
+      }
+      return true;
+    });
+    if (skipped) log.info("pipeline consumer tick skips dead letters", { skipped });
+    return survivors;
+  };
+}
+
+/**
+ * Pending keys whose backoff has not elapsed yet. Freshness and tombstone
+ * re-sends skip these: without the gate every tick re-sent a failing key and
+ * its next_at backoff never slowed the retry loop. Bounded: past the cap the
+ * tail re-sends early (no worse than today), and the cap is far above any
+ * real backlog.
+ */
+export const MAX_DEFERRED_KEYS = 100_000;
+
+export async function loadPendingDeferred(db: SqlExecutor, backendId: string, now: Date): Promise<Set<string>> {
+  const { rows } = await db.query<{ manifest_key: string }>(
+    `SELECT manifest_key FROM sessions.search_consumer_pending
+     WHERE backend_id=$1 AND next_at>$2::timestamptz ORDER BY next_at LIMIT $3::int`,
+    [backendId, now.toISOString(), MAX_DEFERRED_KEYS],
+  );
+  return new Set(rows.map((r) => r.manifest_key));
+}
+
+/** A persisted reconcile-listing resume point, bound to the fixed since/window that produced it. */
+export interface ReconcileCursor {
+  cursor: string;
+  since: Date;
+  lookbackMinutes: number;
+}
+
+export async function loadReconcileCursor(db: SqlExecutor, backendId: string): Promise<ReconcileCursor | null> {
+  const { rows } = await db.query<{ cursor: string | null; since: string | null; window: number | null }>(
+    `SELECT reconcile_cursor AS cursor, reconcile_since AS since, reconcile_window_minutes AS window
+     FROM sessions.search_consumer_progress WHERE backend_id=$1`,
+    [backendId],
+  );
+  const row = rows[0];
+  if (!row?.cursor || !row.since || row.window === null) return null;
+  return { cursor: row.cursor, since: new Date(row.since), lookbackMinutes: Number(row.window) };
+}
+
+export async function storeReconcileCursor(
+  db: SqlExecutor,
+  backendId: string,
+  state: ReconcileCursor | null,
+  at: Date,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO sessions.search_consumer_progress(backend_id,last_complete_at,reconcile_cursor,reconcile_since,reconcile_window_minutes,updated_at)
+     VALUES($1,NULL,$2,$3,$4,$5)
+     ON CONFLICT(backend_id) DO UPDATE SET reconcile_cursor=excluded.reconcile_cursor,
+       reconcile_since=excluded.reconcile_since,reconcile_window_minutes=excluded.reconcile_window_minutes,updated_at=excluded.updated_at`,
+    [backendId, state?.cursor ?? null, state?.since.toISOString() ?? null, state?.lookbackMinutes ?? null, at.toISOString()],
+  );
+}
+
+/** A healthy start clears a stale UNHEALTHY marker (missing file is not an error). */
+export function clearUnhealthyFile(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if ((error as { code?: string })?.code !== "ENOENT") throw error;
+  }
 }
 
 export async function deletePending(db: SqlExecutor, backendId: string, manifestKeys: string[]): Promise<void> {
@@ -442,7 +617,9 @@ export async function reconcileStaleProjections(
       if (!partial.overflow) break;
       if (page + 1 >= MAX_STALE_PAGES) {
         overflow = true;
-        log.warn("pipeline consumer stale backlog overflow; cursor resumes next tick", { after });
+        // The stale cursor is tick-local by design: next tick restarts the
+        // listing from scratch (bounded and idempotent) instead of resuming.
+        log.warn("pipeline consumer stale backlog overflow; restarts from scratch next tick", { after });
         break;
       }
     }
@@ -462,80 +639,109 @@ export const MAX_TOMBSTONE_PAGES = 64;
  * so a crash between them leaves erased content searchable with no live
  * pointer row for reconcileRecent or partials to find.
  *
+ * Tenant GUCs, not a writer RLS policy, gate the search tables: every pass
+ * runs inside the tenant's transaction (exactly as #330's writer path does),
+ * so #330's exact-one-policy verify keeps passing and the writer can never
+ * write across tenants. The tenant enumeration itself is cross-tenant and
+ * uses the sessions-table writer policy (no GUCs involved).
+ *
  * Three behaviors keep this convergent instead of a permanent resend loop:
- * 1. Erasure residue retires atomically: a tombstone whose projection state
- *    is complete with row_count 0 and whose scope holds no transcript rows
- *    is fully erased, so its residue state row is deleted in one statement
- *    (never re-sent). The row has no reader: partials only lists live
- *    pointers.
+ * 1. Erasure residue retires atomically per tenant: a tombstone whose
+ *    projection state is complete with row_count 0 and whose scope holds no
+ *    transcript rows is fully erased, so its residue state row is deleted in
+ *    one statement (never re-sent). The row has no reader: partials only
+ *    lists live pointers.
  * 2. The re-send set filters that residue out: only tombstones with an
  *    incomplete state, a state that still counts rows, or leftover transcript
  *    rows are re-sent, while the transcript EXISTS check is kept.
- * 3. Re-sends page by manifest-key cursor with an overflow contract, so the
- *    same first LIMIT rows are not selected forever while later scopes
- *    starve and the high-water mark never advances.
+ * 3. Re-sends page by manifest-key cursor per tenant with an overflow
+ *    contract, so the same first LIMIT rows are not selected forever while
+ *    later scopes starve and the high-water mark never advances. The cursor
+ *    is per-tick (not persisted): past MAX_TOMBSTONE_PAGES in one tenant the
+ *    tick reports overflow and resumes from scratch next tick, which is
+ *    bounded and idempotent (documented follow-up if a tenant ever exceeds
+ *    pages-per-tick backlog in production).
  */
 export async function reconcileTombstonedScopes(
   db: SqlExecutor,
+  runInTenant: TenantRunner,
   backendId: string,
   keyPrefix: string,
   limit: number,
   send: (body: string) => Promise<void>,
 ): Promise<{ tombstoned: number; overflow: boolean }> {
-  const { rows: retiredRows } = await db.query<{ n: string }>(
-    `WITH retired AS (
-       DELETE FROM search_index.projection_state s
-       USING sessions.session_index p
-       WHERE s.backend_id = $1
-         AND s.org_id = p.org_id AND s.workspace_id = p.workspace_id
-         AND s.source = p.harness AND s.session_id = coalesce(p.canonical_session_id, p.session_id)
-         AND p.deleted_at IS NOT NULL AND p.manifest_key LIKE $2 ESCAPE '\\'
-         AND s.complete AND s.row_count = 0
-         AND NOT EXISTS (SELECT 1 FROM search_index.transcript_events t
-           WHERE t.org_id = p.org_id AND t.workspace_id = p.workspace_id
-             AND t.source = p.harness AND t.session_id = coalesce(p.canonical_session_id, p.session_id))
-       RETURNING 1)
-     SELECT count(*) AS n FROM retired`,
-    [backendId, `${likeEscape(keyPrefix)}/%`],
+  const { rows: tenants } = await db.query<{ orgId: string; workspaceId: string }>(
+    `SELECT DISTINCT org_id AS "orgId", workspace_id AS "workspaceId"
+     FROM sessions.session_index WHERE deleted_at IS NOT NULL`,
   );
-  const retired = Number(retiredRows[0]?.n ?? 0);
-  if (retired > 0) log.info("pipeline consumer tombstone residue retired", { retired });
   let tombstoned = 0;
   let overflow = false;
-  let cursor: string | null = null;
-  for (let page = 0; ; page += 1) {
-    const pageRows: { rows: { manifest_key: string | null }[] } = await db.query(
-      `SELECT DISTINCT p.manifest_key FROM sessions.session_index p
-       WHERE p.deleted_at IS NOT NULL AND p.manifest_key LIKE $3 ESCAPE '\\'
-         AND ($4::text IS NULL OR p.manifest_key > $4)
-         AND (EXISTS (SELECT 1 FROM search_index.projection_state s
-                WHERE s.backend_id=$1 AND s.org_id=p.org_id AND s.workspace_id=p.workspace_id
-                  AND s.source=p.harness AND s.session_id=coalesce(p.canonical_session_id,p.session_id)
-                  AND (NOT s.complete OR s.row_count > 0))
-           OR EXISTS (SELECT 1 FROM search_index.transcript_events t
-                WHERE t.org_id=p.org_id AND t.workspace_id=p.workspace_id
-                  AND t.source=p.harness AND t.session_id=coalesce(p.canonical_session_id,p.session_id)))
-       ORDER BY p.manifest_key LIMIT $2`,
-      [backendId, limit, `${likeEscape(keyPrefix)}/%`, cursor],
-    );
-    const rows = pageRows.rows;
-    if (rows.length === 0) break;
-    let last: string | null = null;
-    for (const { manifest_key } of rows) {
-      if (!manifest_key) continue;
-      last = manifest_key;
-      tombstoned += 1;
-      await send(reconcileBody(manifest_key));
-    }
-    if (rows.length < limit) break;
-    // A null key can never advance the cursor; without a non-null key the
-    // next page would repeat this one, so stop instead of looping.
-    if (last === null) break;
-    cursor = last;
-    if (page + 1 >= MAX_TOMBSTONE_PAGES) {
+  for (const tenant of tenants) {
+    const out = await runInTenant(tenant.orgId, tenant.workspaceId, async (tx) => {
+      const retired = await tx.query<{ n: string }>(
+        `WITH retired AS (
+           DELETE FROM search_index.projection_state s
+           USING sessions.session_index p
+           WHERE s.backend_id = $1
+             AND s.org_id = $2 AND s.workspace_id = $3
+             AND s.org_id = p.org_id AND s.workspace_id = p.workspace_id
+             AND s.source = p.harness AND s.session_id = coalesce(p.canonical_session_id, p.session_id)
+             AND p.deleted_at IS NOT NULL AND p.manifest_key LIKE $4 ESCAPE '\\'
+             AND s.complete AND s.row_count = 0
+             AND NOT EXISTS (SELECT 1 FROM search_index.transcript_events t
+               WHERE t.org_id = p.org_id AND t.workspace_id = p.workspace_id
+                 AND t.source = p.harness AND t.session_id = coalesce(p.canonical_session_id, p.session_id))
+           RETURNING 1)
+         SELECT count(*) AS n FROM retired`,
+        [backendId, tenant.orgId, tenant.workspaceId, `${likeEscape(keyPrefix)}/%`],
+      );
+      let sent = 0;
+      let capped = false;
+      let cursor: string | null = null;
+      for (let page = 0; ; page += 1) {
+        const pageRows: { rows: { manifest_key: string | null }[] } = await tx.query(
+          `SELECT DISTINCT p.manifest_key FROM sessions.session_index p
+           WHERE p.deleted_at IS NOT NULL AND p.org_id = $5 AND p.workspace_id = $6
+             AND p.manifest_key LIKE $3 ESCAPE '\\'
+             AND ($4::text IS NULL OR p.manifest_key > $4)
+             AND (EXISTS (SELECT 1 FROM search_index.projection_state s
+                    WHERE s.backend_id=$1 AND s.org_id=p.org_id AND s.workspace_id=p.workspace_id
+                      AND s.source=p.harness AND s.session_id=coalesce(p.canonical_session_id,p.session_id)
+                      AND (NOT s.complete OR s.row_count > 0))
+               OR EXISTS (SELECT 1 FROM search_index.transcript_events t
+                    WHERE t.org_id=p.org_id AND t.workspace_id=p.workspace_id
+                      AND t.source=p.harness AND t.session_id=coalesce(p.canonical_session_id,p.session_id)))
+           ORDER BY p.manifest_key LIMIT $2`,
+          [backendId, limit, `${likeEscape(keyPrefix)}/%`, cursor, tenant.orgId, tenant.workspaceId],
+        );
+        const rows = pageRows.rows;
+        if (rows.length === 0) break;
+        let last: string | null = null;
+        for (const { manifest_key } of rows) {
+          if (!manifest_key) continue;
+          last = manifest_key;
+          sent += 1;
+          await send(reconcileBody(manifest_key));
+        }
+        if (rows.length < limit) break;
+        // A null key can never advance the cursor; without a non-null key the
+        // next page would repeat this one, so stop instead of looping.
+        if (last === null) break;
+        cursor = last;
+        if (page + 1 >= MAX_TOMBSTONE_PAGES) {
+          capped = true;
+          break;
+        }
+      }
+      return { retired: Number(retired.rows[0]?.n ?? 0), sent, capped, cursor };
+    });
+    if (out.retired > 0) log.info("pipeline consumer tombstone residue retired", { retired: out.retired });
+    tombstoned += out.sent;
+    if (out.capped) {
       overflow = true;
-      log.warn("pipeline consumer tombstone backlog overflow; cursor resumes next tick", { cursor, tombstoned });
-      break;
+      // The tombstone cursor is tick-local by design: next tick restarts the
+      // listing from scratch (bounded and idempotent) instead of resuming.
+      log.warn("pipeline consumer tombstone backlog overflow; restarts from scratch next tick", { cursor: out.cursor, tombstoned });
     }
   }
   return { tombstoned, overflow };
@@ -608,6 +814,9 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   const db = supabasePool(config.secret.hoopdb_url, 4, tls);
   await assertRuntimeIdentity(db);
   await assertServiceSchema(db);
+  // A healthy start clears a stale UNHEALTHY marker from an earlier crash
+  // loop; without this the marker is sticky across restarts.
+  clearUnhealthyFile(config.unhealthyFile);
   const composition = writerComposition(config.backendId, config.floorMs);
   const writerSql = writerTransactionSql(db);
   const tenantRunner = writerTenantRunner(db);
@@ -674,62 +883,58 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
         const lookbackMs = config.lookbackMinutes * 60_000;
         try {
           const mark = await loadHighWaterMark(db, config.backendId);
-          const since = computeSince(now, lookbackMs, mark);
+          // An interrupted listing resumes its own fixed since/window instead
+          // of restarting: the stored cursor is only reused while the window
+          // matches, so a config change restarts the listing from scratch.
+          const stored = await loadReconcileCursor(db, config.backendId);
+          const resume = stored !== null && stored.lookbackMinutes === config.lookbackMinutes;
+          const since = resume && stored !== null ? stored.since : computeSince(now, lookbackMs, mark);
           const due = await loadPendingDue(db, config.backendId, MAX_PENDING_ROWS, new Date(now));
+          // Freshness and tombstone re-sends skip keys still inside their
+          // backoff: without the gate every tick re-sent a failing key and
+          // next_at never slowed the retry loop.
+          const deferred = await loadPendingDeferred(db, config.backendId, new Date(now));
           const pending: string[] = [];
           const requeued: string[] = [];
           // Dead letters stay dead unless a NEW etag/version arrives (a genuinely
-          // new revision revives the key; the same revision never resurrects).
-          const dedupe = async (bodies: string[]): Promise<string[]> => {
-            const keys = [...new Set(bodies.map((b) => reconcileMeta(b)?.key).filter((k): k is string => k !== null))];
-            const known = await loadPendingMap(db, config.backendId, keys);
-            let skipped = 0;
-            const survivors = bodies.filter((body) => {
-              const meta = reconcileMeta(body);
-              if (!meta) return true;
-              const row = known.get(meta.key);
-              if (row?.dead && (row.etag ?? null) === (meta.etag ?? null) && (row.version ?? null) === (meta.version ?? null)) {
-                skipped += 1;
-                return false;
-              }
-              return true;
-            });
-            if (skipped) log.info("pipeline consumer tick skips dead letters", { skipped });
-            return survivors;
-          };
-          const metaByKey = new Map<string, { etag?: string; version?: string }>();
+          // new revision revives the key; the same revision never resurrects,
+          // and an etag-less body never revives at all).
+          const dedupe = makeDedupe(db, config.backendId);
           const summary = await runConsumerTick(
             {
               reconcile: async (send, _since) => {
                 for (const row of due) {
-                  metaByKey.set(row.manifestKey, { etag: row.manifestEtag ?? undefined, version: row.manifestVersion ?? undefined });
                   await send(reconcileBody(row.manifestKey, row.manifestEtag, row.manifestVersion));
                 }
-                const link = await reconcileRecent({ db, store: raw.store, keyPrefix: config.keyPrefix, send, since });
-                return { enqueued: link.enqueued + due.length, complete: link.complete };
+                const link = await reconcileRecent({
+                  db,
+                  store: raw.store,
+                  keyPrefix: config.keyPrefix,
+                  send,
+                  since,
+                  ...(resume && stored !== null ? { cursor: stored.cursor } : {}),
+                });
+                return { enqueued: link.enqueued + due.length, complete: link.complete, ...(link.nextCursor === undefined ? {} : { nextCursor: link.nextCursor }) };
               },
               checkFreshness: async (send) => {
+                const staleGated = gateDeferredSends(deferred, send);
                 const freshness = await reconcileStaleProjections(
                   db,
                   (tenant, after) => binding.state.partials(tenant, { limit: 1000, ...(after === undefined ? {} : { after }) }),
                   config.keyPrefix,
-                  async (body) => {
-                    const meta = reconcileMeta(body);
-                    if (meta) metaByKey.set(meta.key, { etag: meta.etag, version: meta.version });
-                    await send(body);
-                  },
+                  staleGated.send,
                 );
+                const tombGated = gateDeferredSends(deferred, send);
                 const tombstones = await reconcileTombstonedScopes(
                   db,
+                  tenantRunner,
                   config.backendId,
                   config.keyPrefix,
                   MAX_PENDING_ROWS,
-                  async (body) => {
-                    const meta = reconcileMeta(body);
-                    if (meta) metaByKey.set(meta.key, { etag: meta.etag, version: meta.version });
-                    await send(body);
-                  },
+                  tombGated.send,
                 );
+                const deferredSkipped = staleGated.skipped() + tombGated.skipped();
+                if (deferredSkipped) log.info("pipeline consumer tick defers backoff retries", { deferredSkipped });
                 return { stale: freshness.stale, tombstoned: tombstones.tombstoned, overflow: freshness.overflow || tombstones.overflow };
               },
               dedupe,
@@ -750,15 +955,16 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
           const at = new Date(now);
           const failedKeys = new Set(summary.failedKeys);
           const requeuedKeys = new Set(summary.requeuedKeys);
-          const failedItems = new Map(summary.failedItems.map((item) => [item.key, item]));
           const known = await loadPendingMap(
             db,
             config.backendId,
             [...new Set([...summary.failedKeys, ...summary.requeuedKeys])],
           );
-          // Success clears any row, including dead ones: a successful consume
-          // is the only thing that may clear a dead letter.
-          const succeeded = [...metaByKey.keys()].filter((k) => !failedKeys.has(k) && !requeuedKeys.has(k));
+          // Success is computed over exactly the keys actually consumed this
+          // tick: a body dedupe skipped was never consumed, so it stays (a
+          // successful consume is the only thing that may clear a row,
+          // including a dead letter).
+          const succeeded = summary.consumedKeys.filter((k) => !failedKeys.has(k) && !requeuedKeys.has(k));
           await deletePending(db, config.backendId, succeeded);
           const store: PendingOutcome[] = [];
           for (const item of summary.failedItems) {
@@ -777,19 +983,19 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
               dead: attempts > MAX_ATTEMPTS,
             });
           }
-          for (const key of summary.requeuedKeys) {
-            if (failedKeys.has(key)) continue; // failure accounting already stored it
-            const prev = known.get(key);
+          for (const item of summary.requeuedItems) {
+            if (failedKeys.has(item.key)) continue; // failure accounting already stored it
+            const prev = known.get(item.key);
             const { attempts: requeuedAttempts, dead: requeuedDead } = scoreRequeuedAttempt(
               prev === undefined
                 ? undefined
                 : { attempts: prev.attempts, dead: prev.dead, etag: prev.etag, version: prev.version },
-              metaByKey.get(key),
+              { etag: item.etag, version: item.version },
             );
             store.push({
-              manifestKey: key,
-              manifestEtag: metaByKey.get(key)?.etag,
-              manifestVersion: metaByKey.get(key)?.version,
+              manifestKey: item.key,
+              manifestEtag: item.etag,
+              manifestVersion: item.version,
               attempts: requeuedAttempts,
               nextAt: new Date(now + 60_000),
               lastErrorCode: "scope_busy",
@@ -797,7 +1003,17 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
             });
           }
           await storePending(db, config.backendId, store, at);
-          if (summary.complete) await storeHighWaterMark(db, config.backendId, at);
+          if (summary.complete) {
+            await storeHighWaterMark(db, config.backendId, at);
+            await storeReconcileCursor(db, config.backendId, null, at);
+          } else if (summary.nextCursor !== undefined) {
+            await storeReconcileCursor(
+              db,
+              config.backendId,
+              { cursor: summary.nextCursor, since, lookbackMinutes: config.lookbackMinutes },
+              at,
+            );
+          }
           // Attempts are persisted above, so rethrowing still converges: the
           // failure counter below counts this tick, and five in a row exit.
           if (summary.batchError !== undefined) throw summary.batchError;

@@ -122,9 +122,15 @@ export async function ensureServiceTables(owner: SqlExecutor): Promise<void> {
     next_at timestamptz NOT NULL, last_error_code text NOT NULL DEFAULT '',
     dead boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL,
     PRIMARY KEY(backend_id,manifest_key))`);
+  await owner.query(`CREATE INDEX IF NOT EXISTS search_consumer_pending_due_idx
+    ON sessions.search_consumer_pending(backend_id,next_at)`);
   await owner.query(`CREATE TABLE IF NOT EXISTS sessions.search_consumer_progress(
     backend_id text NOT NULL PRIMARY KEY,
-    last_complete_at timestamptz, updated_at timestamptz NOT NULL)`);
+    last_complete_at timestamptz, updated_at timestamptz NOT NULL,
+    reconcile_cursor text, reconcile_since timestamptz, reconcile_window_minutes integer)`);
+  // A rerun against a table created before the cursor columns existed.
+  for (const column of ["reconcile_cursor text", "reconcile_since timestamptz", "reconcile_window_minutes integer"])
+    await owner.query(`ALTER TABLE sessions.search_consumer_progress ADD COLUMN IF NOT EXISTS ${column}`);
 }
 
 export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never> {
@@ -182,9 +188,11 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     }
   } finally {
     client.release();
+    // The pool must close on the failure path too: without this a failed
+    // one-shot Job holds its socket open instead of exiting.
+    await db.end().catch(() => {});
   }
   log.info("pipeline consumer schema bootstrapped", { generation: expected.generation, backendId: config.backendId });
-  await db.end();
   process.exit(0);
   throw new Error("unreachable");
 }

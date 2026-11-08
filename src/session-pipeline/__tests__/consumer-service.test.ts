@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
@@ -23,12 +24,17 @@ import {
 } from "../consumer-bootstrap.ts";
 import {
   assertServiceSchema,
+  clearUnhealthyFile,
   computeSince,
   deletePending,
+  gateDeferredSends,
   HIGH_WATER_MARGIN_MS,
   loadHighWaterMark,
+  loadPendingDeferred,
   loadPendingDue,
   loadPendingMap,
+  loadReconcileCursor,
+  makeDedupe,
   MAX_ATTEMPTS,
   MAX_CONSECUTIVE_TICK_FAILURES,
   nextFailureCount,
@@ -38,13 +44,16 @@ import {
   reconcileTombstonedScopes,
   retryDelayMs,
   runConsumerTick,
+  shouldSkipDeadLetter,
   storeHighWaterMark,
   storePending,
+  storeReconcileCursor,
   scoreFailedAttempt,
   scoreRequeuedAttempt,
   writerComposition,
   type ConsumerTickIo,
 } from "../consumer-service.ts";
+import { reconcileRecent } from "../lambda.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { TenantRunner } from "../../session-read-api/liveness.ts";
 
@@ -315,6 +324,178 @@ describe("consumer tick", () => {
     expect(summary).toMatchObject({ tombstoned: 1, complete: false });
     expect(io.calls[0]).toContain(`{"reconcile":{"key":"tombed"}}`);
   });
+  test("succeeded identities cover only consumed bodies, never skipped ones", async () => {
+    const io = tickIo(ok, [
+      `{"reconcile":{"key":"skipped"}}`,
+      `{"reconcile":{"key":"consumed","etag":"e1"}}`,
+    ]);
+    // The skipped body was never consumed, so it must not count as succeeded.
+    io.dedupe = async (bodies) => bodies.filter((b) => !b.includes("skipped"));
+    const summary = await runConsumerTick(io, new Date());
+    expect(summary.consumedKeys).toEqual(["consumed"]);
+    expect(summary).toMatchObject({ collected: 2, failed: 0, complete: true });
+  });
+  test("requeues carry the consumed revision and park the revision body", async () => {
+    const io = tickIo(ok, [`{"reconcile":{"key":"hot","etag":"e3"}}`]);
+    io.consume = async (records) => {
+      for (const record of records) io.requeued.push(JSON.stringify({ reconcile: { key: "hot" } }));
+      return ok();
+    };
+    const summary = await runConsumerTick(io, new Date());
+    expect(summary.requeuedKeys).toEqual(["hot"]);
+    // The etag-less callback body is replaced by the consumed revision for
+    // both accounting and the parked retry.
+    expect(summary.requeuedItems).toEqual([{ key: "hot", etag: "e3" }]);
+    expect(io.pending).toEqual([`{"reconcile":{"key":"hot","etag":"e3"}}`]);
+  });
+  test("reconcile cursor passes through the tick summary", async () => {
+    const io = tickIo(ok);
+    io.reconcile = async (send) => {
+      await send(`{"reconcile":{"key":"a"}}`);
+      return { enqueued: 1, complete: false, nextCursor: "c1" };
+    };
+    const summary = await runConsumerTick(io, new Date());
+    expect(summary.nextCursor).toBe("c1");
+    expect(summary).toMatchObject({ complete: false, overflow: true });
+  });
+});
+
+describe("dead-letter skip rule", () => {
+  test("etag-less bodies never revive a dead row; a new revision does", () => {
+    const dead = { attempts: 25, dead: true, etag: "e1", version: null };
+    // Same revision: skip. Etag-less: skip (it cannot prove it is newer).
+    expect(shouldSkipDeadLetter(dead, { key: "k", etag: "e1" })).toBe(true);
+    expect(shouldSkipDeadLetter(dead, { key: "k" })).toBe(true);
+    // New revision: revive. Live rows and non-reconcile bodies: keep.
+    expect(shouldSkipDeadLetter(dead, { key: "k", etag: "e2" })).toBe(false);
+    expect(shouldSkipDeadLetter({ attempts: 1, dead: false, etag: "e1", version: null }, { key: "k", etag: "e1" })).toBe(false);
+    expect(shouldSkipDeadLetter(dead, null)).toBe(false);
+    expect(shouldSkipDeadLetter(undefined, { key: "k" })).toBe(false);
+  });
+  test("makeDedupe drops dead same-revision and etag-less bodies on real rows", async () => {
+    await withMigrated(async (_pg, db) => {
+      await ensureServiceTables(db);
+      const at = new Date("2026-11-01T12:00:00Z");
+      const past = new Date(at.getTime() - 1000);
+      await storePending(db, "b", [
+        { manifestKey: "k-dead-same", manifestEtag: "e1", attempts: 25, nextAt: past, lastErrorCode: "x", dead: true },
+        { manifestKey: "k-dead-diff", manifestEtag: "e1", attempts: 25, nextAt: past, lastErrorCode: "x", dead: true },
+        { manifestKey: "k-live", manifestEtag: "e1", attempts: 2, nextAt: past, lastErrorCode: "x", dead: false },
+      ], at);
+      const out = await makeDedupe(db, "b")([
+        `{"reconcile":{"key":"k-dead-same","etag":"e1"}}`,
+        `{"reconcile":{"key":"k-dead-same"}}`,
+        `{"reconcile":{"key":"k-dead-diff","etag":"e2"}}`,
+        `{"reconcile":{"key":"k-live","etag":"e1"}}`,
+        `{"reconcile":{"key":"k-new"}}`,
+      ]);
+      expect(out).toEqual([
+        `{"reconcile":{"key":"k-dead-diff","etag":"e2"}}`,
+        `{"reconcile":{"key":"k-live","etag":"e1"}}`,
+        `{"reconcile":{"key":"k-new"}}`,
+      ]);
+    });
+  }, 120_000);
+  test("failure storage keeps the recorded revision when the failure body has none", async () => {
+    await withMigrated(async (_pg, db) => {
+      await ensureServiceTables(db);
+      const at = new Date("2026-11-01T12:00:00Z");
+      await storePending(db, "b", [
+        { manifestKey: "k", manifestEtag: "e9", manifestVersion: "v9", attempts: 3, nextAt: new Date(at.getTime() - 1000), lastErrorCode: "x", dead: false },
+      ], at);
+      // The retry body carries no revision; the recorded one must survive.
+      await storePending(db, "b", [
+        { manifestKey: "k", attempts: 4, nextAt: new Date(at.getTime() + 60_000), lastErrorCode: "y", dead: false },
+      ], at);
+      expect(await loadPendingMap(db, "b", ["k"])).toEqual(new Map([["k", { attempts: 4, dead: false, etag: "e9", version: "v9" }]]));
+    });
+  }, 120_000);
+  test("deferred rows are gated from re-sends but still load", async () => {
+    await withMigrated(async (_pg, db) => {
+      await ensureServiceTables(db);
+      const at = new Date("2026-11-01T12:00:00Z");
+      await storePending(db, "b", [
+        { manifestKey: "k-due", attempts: 1, nextAt: new Date(at.getTime() - 1000), lastErrorCode: "x", dead: false },
+        { manifestKey: "k-wait", attempts: 1, nextAt: new Date(at.getTime() + 60_000), lastErrorCode: "x", dead: false },
+      ], at);
+      expect(await loadPendingDeferred(db, "b", at)).toEqual(new Set(["k-wait"]));
+      const sent: string[] = [];
+      const gated = gateDeferredSends(new Set(["k-wait"]), async (body) => { sent.push(body); });
+      await gated.send(`{"reconcile":{"key":"k-wait"}}`);
+      await gated.send(`{"reconcile":{"key":"k-due","etag":"e1"}}`);
+      expect(sent).toEqual([`{"reconcile":{"key":"k-due","etag":"e1"}}`]);
+      expect(gated.skipped()).toBe(1);
+    });
+  }, 120_000);
+  test("reconcile cursor round-trips per backend and clears on completion", async () => {
+    await withMigrated(async (_pg, db) => {
+      await ensureServiceTables(db);
+      const at = new Date("2026-11-02T00:00:00Z");
+      expect(await loadReconcileCursor(db, "b")).toBeNull();
+      await storeReconcileCursor(db, "b", { cursor: "c1", since: new Date("2026-11-01T00:00:00Z"), lookbackMinutes: 30 }, at);
+      expect(await loadReconcileCursor(db, "b")).toEqual({ cursor: "c1", since: new Date("2026-11-01T00:00:00Z"), lookbackMinutes: 30 });
+      await storeReconcileCursor(db, "b", null, at);
+      expect(await loadReconcileCursor(db, "b")).toBeNull();
+    });
+  }, 120_000);
+});
+
+describe("reconcile listing resume", () => {
+  test("an interrupted listing resumes from its stored cursor without resending", async () => {
+    await withMigrated(async (_pg, db) => {
+      await ensureServiceTables(db);
+      const key = (session: string) => `p/testorg/v1/ws=w/m=m/h=h/d=2026/11/01/s=${session}/manifest.json`;
+      const item = (session: string, etag: string) => ({
+        key: key(session),
+        size: 1,
+        lastModified: new Date("2026-11-02T00:00:00Z"),
+        version: { eTag: `"${etag}"` },
+        metadata: {},
+      });
+      const pages: Record<string, { items: unknown[]; nextCursor?: string }> = {
+        "": { items: [item("a", "e1"), item("b", "e2")], nextCursor: "c1" },
+        c1: { items: [item("c", "e3")] },
+      };
+      const store = {
+        list: async (_prefix: unknown, cursor?: string) => pages[cursor ?? ""] ?? { items: [] },
+        head: async (_key: unknown) => undefined,
+      } as unknown as Parameters<typeof reconcileRecent>[0]["store"];
+      const emptyDb = { query: async <R>() => ({ rows: [] as R[] }) };
+      const since = new Date("2026-11-01T00:00:00Z");
+      const at = new Date("2026-11-02T01:00:00Z");
+      // First link lists one page and stops: cursor persisted, fixed since.
+      const sent1: string[] = [];
+      const link1 = await reconcileRecent({ db: emptyDb, store, keyPrefix: "p/testorg", send: async (b) => { sent1.push(b); }, since, maxPages: 1 });
+      expect(link1.complete).toBe(false);
+      expect(link1.nextCursor).toBe("c1");
+      expect(sent1).toHaveLength(2);
+      await storeReconcileCursor(db, "b", { cursor: link1.nextCursor!, since, lookbackMinutes: 30 }, at);
+      // Next tick resumes the stored cursor with the same since: only the
+      // tail page is listed, and the chain completes.
+      const stored = await loadReconcileCursor(db, "b");
+      expect(stored).toMatchObject({ cursor: "c1", lookbackMinutes: 30 });
+      const sent2: string[] = [];
+      const link2 = await reconcileRecent({
+        db: emptyDb, store, keyPrefix: "p/testorg",
+        send: async (b) => { sent2.push(b); },
+        since: stored!.since, cursor: stored!.cursor,
+      });
+      expect(link2.complete).toBe(true);
+      expect(sent2).toHaveLength(1);
+      expect(sent2[0]).toContain(key("c"));
+    });
+  }, 120_000);
+});
+
+describe("unhealthy marker", () => {
+  test("a healthy start clears the marker and tolerates a missing file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "consumer-unhealthy-"));
+    const file = join(dir, "unhealthy");
+    writeFileSync(file, "stale\n");
+    clearUnhealthyFile(file);
+    expect(existsSync(file)).toBe(false);
+    clearUnhealthyFile(file); // missing file is not an error
+  });
 });
 
 describe("pending key", () => {
@@ -554,6 +735,10 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
     // creates the same shape the migrator does.
     await pg.exec(`CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY, sha256 text NOT NULL);
       CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY, generation text, status text, updated_at timestamptz DEFAULT now());`);
+    // Mirror the migrator hardening (migrate.ts hardenAndCheck): PUBLIC
+    // EXECUTE on sessions functions is revoked before this bootstrap ever
+    // runs, so verify sees the production shape, not raw DDL defaults.
+    await pg.exec(`REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC`);
     const state = postgresSearchState({ backendId: "test-backend", fromMs: 0 });
     await state.ensureSchema(db);
     await ensureServiceTables(db);
@@ -567,7 +752,10 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       const roleSql = readFileSync(ROLE_SQL, "utf8");
       const verifySql = readFileSync(VERIFY_SQL, "utf8");
       expect(stripPsqlMeta(roleSql)).not.toMatch(/^\\s*\\\\/m);
-      expect(roleSql).not.toMatch(/^\s*(BEGIN|COMMIT)\s*;/m);
+      // The bootstrap files hold no transaction of their own: any of these
+      // would end serve()'s outer transaction early and split the atomic run.
+      expect(roleSql).not.toMatch(/^\s*(BEGIN|START\s+TRANSACTION|SAVEPOINT|COMMIT|END|ROLLBACK)\s*;/mi);
+      expect(stripPsqlMeta(readFileSync(VERIFY_SQL, "utf8"))).not.toMatch(/^\s*(BEGIN|START\s+TRANSACTION|SAVEPOINT|COMMIT|END|ROLLBACK)\s*;/mi);
       // PGlite runs scripts via exec; the bootstrap sends the same stripped text in one query.
       await pg.exec(stripPsqlMeta(roleSql));
       await pg.exec(stripPsqlMeta(verifySql)); // throws on any drift; NOTICE on pass
@@ -580,6 +768,39 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       expect(seen.rows[0]).toMatchObject({ n: 0 });
       // No password assertion: the password is set separately by the operator,
       // and PGlite stores an 8-char placeholder for every role regardless.
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("search writes without tenant GUCs are refused; with GUCs they land", async () => {
+    const { pg } = await installed();
+    try {
+      const roleSql = readFileSync(ROLE_SQL, "utf8");
+      const verifySql = readFileSync(VERIFY_SQL, "utf8");
+      await pg.exec(stripPsqlMeta(roleSql));
+      await pg.exec(stripPsqlMeta(verifySql));
+      // No writer policy exists on the search tables: the writer sees and
+      // writes projection_state only through the tenant_only policy, so an
+      // unbound write fails instead of landing cross-tenant.
+      await pg.exec(`SET ROLE search_consumer_runtime`);
+      const write = `INSERT INTO search_index.projection_state(backend_id,org_id,workspace_id,source,session_id,canonical_session_id,source_epoch,coverage_from_ms,revision,row_count,complete,updated_at)
+        VALUES('test-backend','o2','w','h','s','s',3,0,1,0,false,now())`;
+      let code: string | undefined;
+      try {
+        await pg.exec(write);
+      } catch (error) {
+        code = (error as { code?: string })?.code;
+      }
+      expect(code).toBe("42501");
+      // The same write with the tenant's GUCs bound lands (one
+      // transaction: the settings are transaction-local).
+      await pg.exec(`BEGIN; SELECT set_config('bulls96_read.org_id','o2',true),set_config('bulls96_read.workspace_id','w',true); ${write}; COMMIT`);
+      // Count back as the owner (RLS-blind): the GUC-less writer connection
+      // cannot see the row it just wrote, which is the tenant gate working.
+      await pg.exec(`RESET ROLE`);
+      const seen = await pg.query(`SELECT count(*)::int AS n FROM search_index.projection_state WHERE org_id='o2'`);
+      expect(seen.rows[0]).toMatchObject({ n: 1 });
     } finally {
       await pg.close();
     }
@@ -700,7 +921,7 @@ describe("tombstone backstop and freshness (PGlite, real partials, real migratio
   }, 180_000);
 
   test("a tombstoned session with leftover rows is re-sent until erased", async () => {
-    const { pg, db } = await fixture();
+    const { pg, db, runner } = await fixture();
     try {
       await pg.exec(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id,deleted_at)
         VALUES('o','w','h','s','m','u',now(),now(),'s3','b','96bulls/o/manifest.json','00000000-0000-0000-0000-000000000000',now());
@@ -710,7 +931,7 @@ describe("tombstone backstop and freshness (PGlite, real partials, real migratio
       await writer.record(asDb(pg), { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s" },
         { revision: 1, rows: 4, complete: true, at: new Date(), canonicalSessionId: "s" });
       const sent: string[] = [];
-      const out = await reconcileTombstonedScopes(db, "test-backend", "96bulls/o", 1000, async (b) => {
+      const out = await reconcileTombstonedScopes(db, runner, "test-backend", "96bulls/o", 1000, async (b) => {
         sent.push(b);
       });
       expect(out).toMatchObject({ tombstoned: 1, overflow: false });
@@ -722,7 +943,7 @@ describe("tombstone backstop and freshness (PGlite, real partials, real migratio
       await pg.exec(`DELETE FROM search_index.transcript_events;`);
       await writer.record(asDb(pg), { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s" },
         { revision: 1, rows: 0, complete: true, at: new Date(), canonicalSessionId: "s" });
-      const retired = await reconcileTombstonedScopes(db, "test-backend", "96bulls/o", 1000, async (b) => {
+      const retired = await reconcileTombstonedScopes(db, runner, "test-backend", "96bulls/o", 1000, async (b) => {
         sent.push(b);
       });
       expect(retired).toMatchObject({ tombstoned: 0, overflow: false });
@@ -730,7 +951,7 @@ describe("tombstone backstop and freshness (PGlite, real partials, real migratio
       const remaining = await pg.query(`SELECT count(*)::int AS n FROM search_index.projection_state`);
       expect(remaining.rows[0]).toMatchObject({ n: 0 });
       // Steady state: quiet.
-      const clean = await reconcileTombstonedScopes(db, "test-backend", "96bulls/o", 1000, async () => {});
+      const clean = await reconcileTombstonedScopes(db, runner, "test-backend", "96bulls/o", 1000, async () => {});
       expect(clean).toMatchObject({ tombstoned: 0, overflow: false });
     } finally {
       await pg.close();
@@ -738,7 +959,7 @@ describe("tombstone backstop and freshness (PGlite, real partials, real migratio
   }, 180_000);
 
   test("ten thousand erasure residues retire with no resend and no manual delete", async () => {
-    const { pg, db } = await fixture();
+    const { pg, db, runner } = await fixture();
     try {
       const N = 10_001;
       const chunk = 1000;
@@ -756,7 +977,7 @@ describe("tombstone backstop and freshness (PGlite, real partials, real migratio
           VALUES ${states.join(",")};`);
       }
       const sent: string[] = [];
-      const out = await reconcileTombstonedScopes(db, "test-backend", "96bulls/o", 1000, async (b) => {
+      const out = await reconcileTombstonedScopes(db, runner, "test-backend", "96bulls/o", 1000, async (b) => {
         sent.push(b);
       });
       // The residue retires instead of resending: the same backlog selected
