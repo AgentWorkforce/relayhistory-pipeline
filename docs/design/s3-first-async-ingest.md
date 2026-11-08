@@ -364,7 +364,9 @@ header); no stored receipt continues the unchanged synchronous path (custody ACK
 `x-relay-admission` header); a ledger without `frozenReceipt` is 503
 `custody_source_unavailable`. Callers without the opt-in are unaffected. **Deploy order:** this
 flag must be `on` in the ingest Worker before relayhistory-cloud opts any org into queued-v1
-admission.
+admission. The Cloudflare stack renders it from the stack input
+`sessionIngest.syncAdmissionFrozenReceipt: "on"` (buffered acceptance with `custodySource:
+"frozen-supabase"` only; omit for `off`, which renders no var).
 
 Steps:
 1. **IAM: none.** The srv-writer resources are unchanged. `96bulls/*/v1/ws=*/m=srv_*` matches
