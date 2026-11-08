@@ -49,7 +49,8 @@ test("an incompatible binding or malformed ack cannot acknowledge input", async 
 const schedules = [
   ["reconcile", "reconcile"], ["brief", "brief"],
   ["analysis-cache", "analysisCache"], ["analysis-cache-reconcile", "analysisCacheReconcile"],
-  ["semantic-copy", "semanticCopy"],
+  ["semantic-copy", "semanticCopy"], ["buffered-search-feed", "bufferedSearchFeed"],
+  ["buffered-erasure-delete", "bufferedErasureDelete"],
 ] as const;
 
 const invalidSchedules: unknown[] = ["unknown", "", " ", "RECONCILE", "__proto__", null, false, 0, [], {}, ["brief"]];
