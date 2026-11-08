@@ -51,8 +51,8 @@ function batchRecords(tag = "") {
 }
 
 /** An in-memory transcript_events speaking the statements both indexers send. */
-function fakeClickHouse() {
-  const rows: IndexRow[] = [];
+function fakeClickHouse(opts: { originColumns?: boolean } = {}) {
+  const rows: (IndexRow & { origin?: string; origin_claim_token?: string })[] = [];
   const tsMs = (r: IndexRow) => Date.parse(`${r.ts.replace(" ", "T")}Z`);
   const identity = (r: IndexRow) => [r.org_id, r.workspace_id, tsMs(r), r.session_id, r.source, r.machine_id, r.kind, r.event_id].join("|");
   const final = () => {
@@ -70,17 +70,19 @@ function fakeClickHouse() {
         for (let i = rows.length - 1; i >= 0; i--) { const r = rows[i]!; if (r.org_id === p.org && r.workspace_id === p.workspace && r.source === p.source && (r.session_id === p.session || r.session_id === p.canonical)) rows.splice(i, 1); }
         return;
       }
-      const bufferedOnly = query.includes("startsWith(fingerprint, 'bf')");
+      const bufferedOnly = query.includes("startsWith(fingerprint, 'bf')") && query.includes("origin = 'buffered'");
       const tuples = [...query.matchAll(/\(('(?:[^'\\]|\\.)*'(?:,'(?:[^'\\]|\\.)*')*),(\d+)\)/g)].map((m) => [...m[1]!.matchAll(/'((?:[^'\\]|\\.)*)'/g)].map((s) => s[1]!).concat(m[2]!));
       for (const [org, session, ws, machine, source, kind, eventId, ms] of tuples)
         for (let i = rows.length - 1; i >= 0; i--) {
           const r = rows[i]!;
-          if (r.org_id === org && r.session_id === session && r.workspace_id === ws && r.machine_id === machine && r.source === source && r.kind === kind && sha(r.event_id) === eventId && tsMs(r) === Number(ms) && (!bufferedOnly || r.fingerprint.startsWith("bf")))
+          if (r.org_id === org && r.session_id === session && r.workspace_id === ws && r.machine_id === machine && r.source === source && r.kind === kind && sha(r.event_id) === eventId && tsMs(r) === Number(ms) && (!bufferedOnly || (r.fingerprint.startsWith("bf") && r.origin === "buffered")))
             rows.splice(i, 1);
         }
     },
     async select<T>(query: string, options?: { params?: Record<string, unknown> }) {
       if (query.includes("search_ingest_state")) return [] as T[];
+      if (query.includes("system.columns"))
+        return (opts.originColumns === false ? [] : [{ name: "origin", type: "LowCardinality(String)", default_expression: "'canonical'" }, { name: "origin_claim_token", type: "String", default_expression: "''" }]) as T[];
       const p = options!.params!;
       return final()
         .filter((r) => r.org_id === p.org && (r.session_id === p.session || r.session_id === p.canonical) && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from))
@@ -121,6 +123,7 @@ function canonicalDeps(store: ObjectStore, ch: ClickHouseClient, keys: string[],
 }
 const scopeOf = (g: Group): SessionScope => ({ orgId: ORG, workspaceId: layoutComponent(WS), harness: layoutComponent(g.source), sessionId: layoutComponent(g.sessionId) });
 
+const claims = new Map<string, string>();
 /** Stage the batch exactly as deliver.ts does in buffered mode; ordinals = record indexes. */
 async function stageBatch(store: ObjectStore, records = batchRecords(), claim = randomUUID()) {
   const grouped = groupRecords(records, RECEIVED);
@@ -128,6 +131,7 @@ async function stageBatch(store: ObjectStore, records = batchRecords(), claim = 
     { claim_token: claim, batch_digest: sha(claim), received_at: RECEIVED.toISOString(), org_id: ORG, workspace_id: WS, origin_id: ORIGIN, user_id: USER },
     grouped.groups, grouped.index);
   await putBufferedStage(store, prepared);
+  claims.set(prepared.spec.key, claim);
   return { grouped, prepared, decoded: await readBufferedStage(store, prepared.spec, zstd) };
 }
 
@@ -160,13 +164,13 @@ function memorySource(stages: { candidate: StageCandidate; key?: string; state: 
 function liveState(prepared: Awaited<ReturnType<typeof stageBatch>>["prepared"], token: string, createdAt: string, retained?: number[]): StageState {
   return {
     found: true, status: "live", reason: null, retained: retained ?? prepared.spec.groupOrdinals.flat().sort((a, b) => a - b),
-    tenant: { orgId: ORG, workspaceId: WS, userId: USER }, originId: ORIGIN, batchId: "batch-1",
+    tenant: { orgId: ORG, workspaceId: WS, userId: USER }, originId: ORIGIN, batchId: "batch-1", claimToken: claims.get(prepared.spec.key)!,
     stage: { ...prepared.spec, stageToken: token, createdAt },
   };
 }
 const feedDeps = (source: BufferedFeedSource, store: ObjectStore, ch: ClickHouseClient): BufferedFeedDeps =>
   ({ source, store, ch, keyRoot: "96bulls", now: () => NOW, sleep: async () => {} });
-const shape = (r: IndexRow) => { const { version: _v, fingerprint: _f, ...rest } = r; return rest; };
+const shape = (r: IndexRow & { origin?: string; origin_claim_token?: string }) => { const { version: _v, fingerprint: _f, origin: _o, origin_claim_token: _t, ...rest } = r; return rest; };
 const byIdentity = (a: IndexRow, b: IndexRow) => `${a.session_id}|${a.kind}|${a.event_id}`.localeCompare(`${b.session_id}|${b.kind}|${b.event_id}`);
 
 describe("buffered-stage search feed", () => {
@@ -189,6 +193,9 @@ describe("buffered-stage search feed", () => {
     expect(ours.map((r) => r.fingerprint.slice(2))).toEqual(theirs.map((r) => r.fingerprint.slice(2)));
     expect(ours.every((r) => r.fingerprint.startsWith("bf"))).toBe(true);
     expect(theirs.every((r) => r.fingerprint.startsWith("s3"))).toBe(true);
+    // The read gate's marker: origin and the stage's ORIGINAL claim token; canonical rows name neither.
+    expect(ours.every((r) => r.origin === "buffered" && r.origin_claim_token === decoded.header.claim_token)).toBe(true);
+    expect(theirs.every((r) => !("origin" in r) && !("origin_claim_token" in r))).toBe(true);
     // Deterministic version: the stage's received_at.
     expect(new Set(ours.map((r) => r.version))).toEqual(new Set([RECEIVED.getTime()]));
     // The layout-encoded session keeps its RelayHistory id; the no-session record is in _none/_origin.
@@ -227,7 +234,7 @@ describe("buffered-stage search feed", () => {
     calls = 0; retained = all; recheck = all.filter((o) => !noSession.includes(o) && !sess2.includes(o));
     // A canonical row with the same identity as a buffered one is never touched by that delete.
     const target = ch.final().find((r) => r.session_id === NO_SESSION_ID)!;
-    ch.rows.push({ ...target, fingerprint: "s3canonical", version: NOW });
+    ch.rows.push({ ...target, fingerprint: "s3canonical", version: NOW, origin: "canonical", origin_claim_token: "" });
     const out = await feedBufferedStageByKey(prepared.spec.key, feedDeps(source, store, ch.ch));
     expect(out).toMatchObject({ outcome: "indexed", rows: 6, deleted: 2 });
     expect(ch.rows.filter((r) => r.session_id === "sess-2" || (r.session_id === NO_SESSION_ID && r.fingerprint.startsWith("bf")))).toEqual([]);
@@ -379,15 +386,37 @@ describe("buffered-stage search feed", () => {
   test("lambda env: a malformed feed setting disarms only the feed, never the shared runtime", () => {
     const base = { AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "bucket", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs" };
     expect(lambdaEnv(base).bufferedSearchFeed).toMatchObject({ enabled: false });
-    expect(lambdaEnv({ ...base, INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toMatchObject({ enabled: true });
-    expect(lambdaEnv({ ...base, INGEST_BUFFERED_SEARCH_FEED: "1" }).bufferedSearchFeed).toBeUndefined();
-    expect(lambdaEnv({ ...base, INGEST_BUFFERED_SEARCH_FEED: "on", INGEST_BUFFERED_SEARCH_FEED_RATE: "999" }).bufferedSearchFeed).toBeUndefined();
+    const gate = { READ_API_BUFFERED_SEARCH_GATE: "on" };
+    expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toMatchObject({ enabled: true });
+    // Without the read gate declared the feed is refused, and the shared runtime still builds.
+    expect(lambdaEnv({ ...base, INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toBeUndefined();
+    expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "1" }).bufferedSearchFeed).toBeUndefined();
+    expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on", INGEST_BUFFERED_SEARCH_FEED_RATE: "999" }).bufferedSearchFeed).toBeUndefined();
+  });
+
+  test("refuses to write without the origin columns; a claim token that disagrees with SQL is skipped", async () => {
+    const store = newStore();
+    const { prepared } = await stageBatch(store);
+    const t = "00000000-0000-4000-8000-000000000008";
+    const entry = (state: () => StageState) => [{ candidate: { stageToken: t, createdAt: "x", tenant: { orgId: ORG, workspaceId: WS, userId: USER }, originId: ORIGIN, batchId: "b" }, state }];
+    const bare = fakeClickHouse({ originColumns: false });
+    await expect(feedBufferedStageByKey(prepared.spec.key, feedDeps(memorySource(entry(() => liveState(prepared, t, "x"))).source, store, bare.ch))).rejects.toMatchObject({ code: "origin_columns_missing" });
+    expect(bare.rows).toEqual([]);
+    const ch = fakeClickHouse();
+    const forged = memorySource(entry(() => ({ ...liveState(prepared, t, "x"), claimToken: randomUUID() })));
+    expect(await feedBufferedStageByKey(prepared.spec.key, feedDeps(forged.source, store, ch.ch))).toEqual({ outcome: "skipped", reason: "stage_claim_mismatch" });
+    expect(ch.rows).toEqual([]);
   });
 
   test("config: default off; only the literal 'on' arms it; bounds refuse", () => {
     expect(bufferedFeedConfig({})).toMatchObject({ enabled: false, pageSize: 50, stagesPerSecond: 5, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "backfill-20261105" });
-    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on" }).enabled).toBe(true);
-    for (const v of ["1", "true", "ON", "yes"]) expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: v })).toThrow("must be off or on");
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", READ_API_BUFFERED_SEARCH_GATE: "on" }).enabled).toBe(true);
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", READ_API_BUFFERED_SEARCH_GATE: " ON " }).enabled).toBe(true);
+    // Coupled to the read-side gate: buffered rows must never be served without it.
+    for (const gate of [undefined, "", "off", "1", "true"])
+      expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", READ_API_BUFFERED_SEARCH_GATE: gate })).toThrow(expect.objectContaining({ code: "read_gate_not_declared" }));
+    expect(bufferedFeedConfig({ READ_API_BUFFERED_SEARCH_GATE: "off" }).enabled).toBe(false);
+    for (const v of ["1", "true", "ON", "yes"]) expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: v, READ_API_BUFFERED_SEARCH_GATE: "on" })).toThrow(expect.objectContaining({ code: "config_flag_invalid" }));
     expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_PAGE: "500" })).toThrow();
     expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_RATE: "0" })).toThrow();
     expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SINCE: "yesterday" })).toThrow();

@@ -30,8 +30,10 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * (migration 20261105022000 columns); SEARCH_INDEX_ENABLED alone never does
  * (docs/session-desktop-catalog.md, Activation blockers).
  * INGEST_BUFFERED_SEARCH_FEED=on (only the literal "on"; default "off", anything else refuses)
- * feeds accepted buffered stages into transcript_events (buffered-search-feed.ts); it needs
- * SEARCH_INDEX_ENABLED=1 on the ClickHouse backend and the draft RPCs applied.
+ * feeds accepted buffered stages into transcript_events (buffered-search-feed.ts); it is refused
+ * unless READ_API_BUFFERED_SEARCH_GATE=on is declared too (the read Worker deploys with the gate
+ * first), and needs SEARCH_INDEX_ENABLED=1 on the ClickHouse backend, the draft RPCs and the
+ * origin columns (docs/proposals/buffered-search-feed*.draft.sql) applied.
  */
 import pg from "pg";
 import {
@@ -54,7 +56,7 @@ import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { searchIndexLimits } from "./search-index.ts";
-import { bufferedFeedConfig, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
+import { BufferedFeedError, bufferedFeedConfig, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
@@ -119,7 +121,11 @@ export interface LambdaEnv {
  */
 function bufferedFeedEnv(env: NodeJS.ProcessEnv): BufferedFeedConfig | undefined {
   try { return bufferedFeedConfig(env); }
-  catch { log.warn("buffered search feed disarmed", { stage: "buffered-search-feed", reason: "config_invalid" }); return undefined; }
+  catch (error) {
+    // Refused, not degraded: nothing is written, and every scheduled run reports ok=false.
+    log.error("buffered search feed refused", { stage: "buffered-search-feed", reason: error instanceof BufferedFeedError ? error.code : "config_invalid" });
+    return undefined;
+  }
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition): LambdaEnv {

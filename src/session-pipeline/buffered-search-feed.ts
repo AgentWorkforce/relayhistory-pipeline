@@ -15,12 +15,20 @@
  * `user_id`). The parity test writes the same group through `writeGroups` and compares with
  * `indexSearchScope`'s rows.
  *
- * Provenance marker. No column is added: buffered-origin rows carry the fingerprint prefix
- * `bf` (BUFFERED_FINGERPRINT_PREFIX) where the canonical S3 indexer writes `s3` and the Neon
- * tail a bare md5. The query-time privacy check identifies them by
- * `startsWith(fingerprint, 'bf')`. Because `bf` never equals `s3`, the first canonical pass
- * over the same events rewrites them once with its newer `version` and they stop being
- * buffered-origin.
+ * Provenance marker. Every row written here has `origin = 'buffered'` and
+ * `origin_claim_token` = the stage's ORIGINAL claim token (a GC replacement keeps it), the two
+ * columns the read-side gate (#338, buffered-search-gate.ts) reads; every other writer leaves
+ * the column default `origin = 'canonical'`. The columns come from
+ * docs/proposals/buffered-search-feed.clickhouse.draft.sql (the vendored schema.ts is not
+ * edited); the feeder checks system.columns and refuses to write without them. The fingerprint
+ * also carries the prefix `bf` (canonical S3 `s3`, Neon tail bare md5): that is the writer-side
+ * marker indexSearchScope reads in its existing scan, so its delete pass leaves buffered-only
+ * rows alone. Because `bf` never equals `s3`, the first canonical pass over the same events
+ * rewrites them once with its newer `version` (origin back to canonical).
+ *
+ * Arming. INGEST_BUFFERED_SEARCH_FEED=on is refused unless the deployment also declares
+ * READ_API_BUFFERED_SEARCH_GATE=on: buffered rows served by a reader without the gate would
+ * bypass the per-hit privacy check, so the read Worker must be deployed with the gate first.
  *
  * Idempotency. The row identity is ClickHouse's sort key (org, workspace, ts, session, source,
  * machine, kind, event_id), all derived from the record; `version` is the stage's
@@ -61,6 +69,9 @@ import type { SessionScope } from "./pointer.ts";
 
 /** Fingerprint prefix of every buffered-origin row (`s3` canonical S3, bare md5 Neon tail). */
 export const BUFFERED_FINGERPRINT_PREFIX = "bf";
+/** The read-side gate's marker values and columns (#338 buffered-search-gate.ts ORIGIN_*). */
+export const ORIGIN_BUFFERED = "buffered";
+export const ORIGIN_COLUMNS = { origin: { type: "LowCardinality(String)", default: "'canonical'" }, origin_claim_token: { type: "String", default: "''" } } as const;
 /** The buffered cutover: the first buffered acceptance in production. */
 export const BUFFERED_FEED_DEFAULT_SINCE = "2026-11-05T05:33:45.000Z";
 export const BUFFERED_FEED_DEFAULT_CURSOR = "backfill-20261105";
@@ -90,20 +101,27 @@ export interface BufferedFeedConfig {
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
 
-/** Only the literals `off` (default) and `on`; every other value refuses, so a typo never arms it. */
+/** The read gate's own parse (#338 parseBufferedSearchGate): exactly "on", trimmed, any case. */
+export const readGateDeclared = (raw: string | undefined) => (raw ?? "").trim().toLowerCase() === "on";
+
+/**
+ * Only the literals `off` (default) and `on`; every other value refuses, so a typo never arms it.
+ * `on` is refused unless READ_API_BUFFERED_SEARCH_GATE=on is declared for the deployment too.
+ */
 export function bufferedFeedConfig(env: NodeJS.ProcessEnv): BufferedFeedConfig {
   const flag = env.INGEST_BUFFERED_SEARCH_FEED ?? "off";
-  if (flag !== "off" && flag !== "on") throw new Error("session pipeline: INGEST_BUFFERED_SEARCH_FEED must be off or on");
+  if (flag !== "off" && flag !== "on") throw new BufferedFeedError("config_flag_invalid");
+  if (flag === "on" && !readGateDeclared(env.READ_API_BUFFERED_SEARCH_GATE)) throw new BufferedFeedError("read_gate_not_declared");
   const int = (name: string, fallback: number, min: number, max: number) => {
     const raw = env[name];
     if (raw === undefined || raw === "") return fallback;
-    if (!/^\d{1,6}$/.test(raw) || Number(raw) < min || Number(raw) > max) throw new Error(`session pipeline: ${name} must be ${min}-${max}`);
+    if (!/^\d{1,6}$/.test(raw) || Number(raw) < min || Number(raw) > max) throw new BufferedFeedError(`config_${name.slice("INGEST_BUFFERED_SEARCH_FEED_".length).toLowerCase()}_invalid`);
     return Number(raw);
   };
   const since = env.INGEST_BUFFERED_SEARCH_FEED_SINCE || BUFFERED_FEED_DEFAULT_SINCE;
-  if (!ISO.test(since) || !Number.isFinite(Date.parse(since))) throw new Error("session pipeline: INGEST_BUFFERED_SEARCH_FEED_SINCE must be an ISO UTC instant");
+  if (!ISO.test(since) || !Number.isFinite(Date.parse(since))) throw new BufferedFeedError("config_since_invalid");
   const cursor = env.INGEST_BUFFERED_SEARCH_FEED_CURSOR || BUFFERED_FEED_DEFAULT_CURSOR;
-  if (!/^[a-z][a-z0-9-]{0,62}$/.test(cursor)) throw new Error("session pipeline: INGEST_BUFFERED_SEARCH_FEED_CURSOR is malformed");
+  if (!/^[a-z][a-z0-9-]{0,62}$/.test(cursor)) throw new BufferedFeedError("config_cursor_invalid");
   return {
     enabled: flag === "on",
     pageSize: int("INGEST_BUFFERED_SEARCH_FEED_PAGE", 50, 1, 200),
@@ -128,6 +146,8 @@ export interface StageState {
   tenant?: FeedTenant;
   originId?: string;
   batchId?: string;
+  /** The stage's original admission (ingest_claim_attempts); the read gate looks it up. */
+  claimToken?: string;
   stage?: BufferedStageSpec & { stageToken: string; createdAt: string };
 }
 export interface FeedPage { after: { createdAt: string; stageToken: string } | null; stages: StageCandidate[] }
@@ -190,7 +210,7 @@ export function sqlBufferedFeedSource(db: SqlExecutor): BufferedFeedSource {
       const s = r.stage;
       if (!obj(s) || !str(s.stageToken) || !UUID.test(s.stageToken) || !str(s.key) || !str(s.sha256) || !/^[0-9a-f]{64}$/.test(s.sha256) ||
           !Number.isSafeInteger(s.bytes) || (s.bytes as number) < 1 || (s.bytes as number) > BUFFER_STAGE_MAX_BYTES ||
-          !Array.isArray(s.groupOrdinals) || !str(s.createdAt) || !str(r.originId) || !str(r.batchId)) bad("sql_stage_spec");
+          !Array.isArray(s.groupOrdinals) || !str(s.createdAt) || !str(r.originId) || !str(r.batchId) || !str(r.claimToken) || !UUID.test(r.claimToken)) bad("sql_stage_spec");
       const spec = s as Record<string, unknown>;
       const groupOrdinals = (spec.groupOrdinals as unknown[]).map(checkOrdinals);
       if ("stageToken" in ref && spec.stageToken !== ref.stageToken) bad("sql_stage_identity");
@@ -200,6 +220,7 @@ export function sqlBufferedFeedSource(db: SqlExecutor): BufferedFeedSource {
         tenant: checkTenant(r.tenant),
         originId: r.originId as string,
         batchId: r.batchId as string,
+        claimToken: r.claimToken as string,
         stage: { stageToken: spec.stageToken as string, key: spec.key as string, sha256: spec.sha256 as string, bytes: spec.bytes as number, groupOrdinals, createdAt: spec.createdAt as string },
       };
     },
@@ -213,8 +234,10 @@ export function sqlBufferedFeedSource(db: SqlExecutor): BufferedFeedSource {
 
 // ---------------------------------------------------------------- projection
 
+/** An index row as the feeder writes it: the canonical shape plus the read gate's origin marker. */
+export type BufferedIndexRow = IndexRow & { origin: typeof ORIGIN_BUFFERED; origin_claim_token: string };
 /** One projected row and the original claim ordinals of the record it came from. */
-export interface BufferedRow { row: IndexRow; ordinals: number[] }
+export interface BufferedRow { row: BufferedIndexRow; ordinals: number[] }
 
 export interface StageProjection {
   rows: BufferedRow[];
@@ -264,8 +287,8 @@ export function projectBufferedStage(decoded: DecodedBufferedStage, retained: Re
     for (const { table, row } of projected.rows) {
       if (table !== "convergence_events") continue;
       const canonicalRow = { ...row, session_id: row.delivery_record_id ? sessionId : row.session_id, user_id: row.user_id ?? userId };
-      const indexRow = toIndexRow(projectedToNeonRow(canonicalRow, scope, userId), version);
-      indexRow.fingerprint = BUFFERED_FINGERPRINT_PREFIX + indexRow.fingerprint.replace(/^s3/, "");
+      const base = toIndexRow(projectedToNeonRow(canonicalRow, scope, userId), version);
+      const indexRow: BufferedIndexRow = { ...base, fingerprint: BUFFERED_FINGERPRINT_PREFIX + base.fingerprint.replace(/^s3/, ""), origin: ORIGIN_BUFFERED, origin_claim_token: header.claim_token };
       const recordId = String(row.delivery_record_id ?? row.event_id);
       out.push({ row: indexRow, ordinals: byRecord.get(recordId) ?? [] });
     }
@@ -274,6 +297,21 @@ export function projectBufferedStage(decoded: DecodedBufferedStage, retained: Re
 }
 
 // ---------------------------------------------------------------- ClickHouse
+
+/**
+ * The origin columns exist with exactly the read gate's definitions. Without them an insert
+ * would either fail or (on a server that drops unknown JSON fields) land rows as canonical.
+ */
+export async function assertOriginColumns(ch: ClickHouseClient): Promise<void> {
+  const rows = await ch.select<{ name: string; type: string; default_expression: string }>(
+    `SELECT name, type, default_expression FROM system.columns
+     WHERE database = currentDatabase() AND table = {table:String} AND name IN ('origin', 'origin_claim_token')`,
+    { params: { table: EVENTS_TABLE }, timeoutMs: 10_000 });
+  for (const [name, want] of Object.entries(ORIGIN_COLUMNS)) {
+    const got = rows.find((r) => r.name === name);
+    if (!got || got.type !== want.type || got.default_expression !== want.default) throw new BufferedFeedError("origin_columns_missing");
+  }
+}
 
 /** Delete exact buffered-origin rows only: a canonical row with the same identity is never touched. */
 export async function deleteBufferedRows(ch: ClickHouseClient, rows: readonly IndexRow[], maxKeys = 500): Promise<number> {
@@ -285,7 +323,7 @@ export async function deleteBufferedRows(ch: ClickHouseClient, rows: readonly In
     await ch.command(
       `DELETE FROM ${EVENTS_TABLE}
        WHERE (org_id, session_id, workspace_id, machine_id, source, kind, lower(hex(SHA256(event_id))), toUnixTimestamp64Milli(ts))
-         IN [${literals.join(",")}] AND startsWith(fingerprint, '${BUFFERED_FINGERPRINT_PREFIX}')`,
+         IN [${literals.join(",")}] AND origin = '${ORIGIN_BUFFERED}' AND startsWith(fingerprint, '${BUFFERED_FINGERPRINT_PREFIX}')`,
       { settings: { lightweight_deletes_sync: 2, max_query_size: 1_048_576 }, timeoutMs: 60_000 },
     );
   }
@@ -308,6 +346,17 @@ export interface BufferedFeedDeps {
   flushBytes?: number;
 }
 
+const originChecked = new WeakMap<ClickHouseClient, Promise<void>>();
+/** Once per client: a failed check is not cached, so a later invocation re-checks after the DDL. */
+function originReady(ch: ClickHouseClient): Promise<void> {
+  let held = originChecked.get(ch);
+  if (!held) {
+    held = assertOriginColumns(ch).catch((error) => { originChecked.delete(ch); throw error; });
+    originChecked.set(ch, held);
+  }
+  return held;
+}
+
 const defaultDecompress = (b: Uint8Array) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: BUFFER_STAGE_MAX_BYTES }));
 
 interface Loaded { state: StageState; projection: StageProjection }
@@ -315,6 +364,7 @@ interface Loaded { state: StageState; projection: StageProjection }
 /** Check the stage's tenant on every axis before its bytes are projected. */
 function assertStageTenant(state: StageState, decoded: DecodedBufferedStage, keyRoot: string) {
   const t = state.tenant!, h = decoded.header;
+  if (h.claim_token !== state.claimToken) throw new BufferedFeedError("stage_claim_mismatch");
   const prefix = `${keyRoot}/${t.orgId}/buffered-batches/v1/ws=${layoutComponent(t.workspaceId)}/m=${liveMachineId(t.workspaceId, state.originId!, t.userId)}/`;
   if (h.org_id !== t.orgId || h.workspace_id !== t.workspaceId || h.user_id !== t.userId || h.origin_id !== state.originId || !state.stage!.key.startsWith(prefix))
     throw new BufferedFeedError("stage_tenant_mismatch");
@@ -349,6 +399,7 @@ async function loadLive(state: StageState, deps: BufferedFeedDeps, fromMs: numbe
 
 /** Insert, then re-check each stage and delete rows of records retention no longer keeps. */
 async function writeAndRecheck(loaded: Loaded[], deps: BufferedFeedDeps): Promise<{ rows: number; deleted: number }> {
+  await originReady(deps.ch);
   const batch = deps.insertBatch ?? 5_000;
   const all = loaded.flatMap((l) => l.projection.rows.map((r) => r.row));
   for (let i = 0; i < all.length; i += batch) await deps.ch.insert(EVENTS_TABLE, all.slice(i, i + batch), { timeoutMs: 60_000 });

@@ -122,7 +122,7 @@ BEGIN
  END IF;
  RETURN jsonb_build_object('found',true,'status',v_status,'reason',v_reason,'retained',v_retained,
   'tenant',jsonb_build_object('orgId',s.org_id,'workspaceId',s.workspace_id,'userId',s.user_id),
-  'originId',s.origin_id,'batchId',s.batch_id,
+  'originId',s.origin_id,'batchId',s.batch_id,'claimToken',s.claim_token,
   'stage',jsonb_build_object('stageToken',s.stage_token,'key',s.stage_key,'sha256',s.stage_sha256,'bytes',s.stage_bytes,
    'groupOrdinals',s.group_ordinals,'createdAt',to_char(s.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')));
 END $stage$;
