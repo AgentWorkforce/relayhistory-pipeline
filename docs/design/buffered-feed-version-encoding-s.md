@@ -37,23 +37,36 @@ src/session-pipeline/__tests__/buffered-feed-version.clickhouse.test.ts (#382).
 
 **Legacy minimum, L:**
 - Taken from the pending counts-only production read (authorized; it is run by the credentialed operator only). It
-  should return, for `origin='canonical'`: `min(version)`, `count()` and `countIf(version < 1e12)`.
+  should return, for `origin='canonical'`: `min(version)`, `count()`, `countIf(version = 0)` and
+  `countIf(version < 1e12)`.
 - The same read should also return, for `origin='buffered'`: `count()` and `max(version)`.
 - **Recommendation: exclude, or separately count, version 0.** The proof synthetic rows have version 0. If any exist,
   `min` = 0, which proves nothing.
+- **Activation gate (schema-owner ruling Q1, section 9):** `L_pinned` may be pinned only if the read proves canonical
+  `count() > 0`, `countIf(version = 0) = 0`, `countIf(version < 1e12) = 0` and buffered `count() = 0`. Any zero or
+  low-domain canonical row, or any existing buffered row, blocks activation. Such rows need a separate, reviewed
+  remediation; this design does not authorize one.
 
 **What the buffered band must satisfy:**
-- (B1) `0 < version_b < L_pinned`, where `L_pinned` = the proved L, pinned as a source constant
-  (`BUFFERED_VERSION_CEILING`) with the read's date. The encoder refuses outside this range with
+- (B1) `0 < version_b < L_pinned`, where `L_pinned` = the exact positive canonical minimum proved by the read, with
+  no safety factor, pinned as a source constant (`BUFFERED_VERSION_CEILING`) with the read's date, and only once the
+  activation gate above has passed. The encoder refuses outside this range with
   `buffered_version_out_of_band`.
 - At L ≥ 1.7357e12 (the `T` stand-in `LEGACY_LOW`), S reaches the ceiling only around the year 57,000 (`T`
   pure-bounds test).
 - (B2) No buffered row already in the table sits above the band. The feeder is "not enabled anywhere" (PR #383 body),
-  but the read must confirm `count(origin='buffered') = 0`. Otherwise every legacy-ms buffered row must be removed
-  before the flag goes on.
-- (B3) Future canonical writers keep writing raw-ms `now()`. Nothing enforces this: RHC does not validate the domain
-  (r-feed-version.md section 7), and a CH CONSTRAINT would be a schema change, which is frozen. So B3 is a review rule
-  for `search-index.ts` and `reconcile.ts`.
+  but the read must confirm `count(origin='buffered') = 0`. Otherwise activation is blocked: any existing buffered
+  row needs a separate, reviewed remediation before the flag can go on (ruling Q1).
+- (B3) Future canonical writers keep writing raw-ms `now()`, never a value below `L_pinned`. RHC does not validate the
+  domain today (r-feed-version.md section 7), and a CH CONSTRAINT would be a schema change, which is frozen. A review
+  rule alone is insufficient (ruling R1). B3 is enforced by:
+  - One shared RHC canonical-version guard, used by backfill and by reconcile/`toIndexRow`, and by the vendored pipeline
+    copy (`indexSearchScope` in `search-index.ts`, `reconcileSession` in `vendor/search-index/reconcile.ts`). It refuses
+    any version that is not a safe integer, is not positive, or is below `L_pinned`.
+  - A census/CI guard that enumerates every direct writer of `transcript_events.version` and fails if any writer
+    bypasses the shared guard.
+  - This is RHC source work in a separate PR, owned by the relayhistory-cloud-owner lane. It is a prerequisite for
+    activation (section 10), not part of the S PR.
 
 ## 2. Strict total order source
 
@@ -138,6 +151,9 @@ The owner's requirement (a): strict total order for every divergent stage, or a 
   - Backfill sets `summary.blocked = "same_second_pending"` and stops before the stage, using the existing `blocked`
     break at `F` l.524.
   - This is bounded by the sibling's `expires_at` (`clock_timestamp()+120s`, 20261105043850 l.1262).
+  - Ruling Q8: the 120 s bound is accepted only with tests proving that a retry after expiry reaches a deterministic
+    terminal classification (written, or `same_second_tie` refused). Retry counts and DLQ arrivals for the keep-up
+    queue are documented as observable signals (section 3 Observability).
 - `siblings > 0 && pending = 0`: refused, deterministically.
   - Intents are never deleted (`ON DELETE RESTRICT`, PR #383 body), so a retry cannot change the answer.
   - No CH insert for this stage. Other stages on the page proceed: they go into `loaded`, while the refused one does not.
@@ -151,7 +167,8 @@ The owner's requirement (a): strict total order for every divergent stage, or a 
   `{siblings, firstSeen, revisits, state}` and no content.
 - If the ledger write fails, the code throws and the cursor stays (`F` l.539 runs after `flush`).
 - Alternative: hold the cursor until a human acts. It is rejected because one tie would stall all buffered indexing.
-  That is open question Q3.
+  Ruling Q3 (section 9): accepted. The cursor advances only after the durable ledger write and readback. The refusal
+  stays outstanding, the run stays `ok: false`, and it is not coverage (R3).
 - Keep-up never records the ledger; it logs and returns `skipped`. The backfill or tail cursor is the single authority
   that classifies the stage, so a keep-up skip never counts as coverage.
 
@@ -160,15 +177,21 @@ The owner's requirement (a): strict total order for every divergent stage, or a 
   consumer.ts l.92-93. Per run: `log.info("buffered search feed run", {reasons, state, ok})` at lambda.ts l.668-670.
 - Add:
   - `log.warn` with `reason: "same_second_tie"` and the counts, with no tokens in content fields.
-  - The run state `caught_up_with_refusals`, with `ok: false` while new refusals were recorded this run.
+  - The run state `caught_up_with_refusals`, with `ok: false` while any refusal was recorded this run or is still
+    outstanding in the ledger (R3).
   - An EMF metric following the only existing pattern (`96Bulls/BufferedGc`, src/session-ingest/buffered-gc-lambda.ts
-    l.11): `96Bulls/BufferedSearchFeed` `SameSecondRefused` (count) and `TieRefusedOutstanding` (gauge).
-- The alarm is a cloud resource, so it needs Khaliq's OK.
+    l.11): `96Bulls/BufferedSearchFeed` `SameSecondRefused` (count) and `TieRefusedOutstanding` (gauge). The gauge is
+    computed from the durable ledger, not from per-run state.
+  - Keep-up retry/DLQ observability (ruling Q8): requeue attempts for `same_second_pending` are logged with the stage
+    age, and arrivals on the keep-up DLQ are counted, so a stage that never reaches a terminal classification is visible.
+- The alarm is a cloud resource, so it needs Khaliq's OK. Ruling Q9/R4: the durable outstanding gauge and the alarm
+  must both exist before enable.
 
 **What the system shows for a refused stage:**
 - **Prior visible rows:** unchanged. Canonical rows always outrank by B1. Earlier-second buffered rows of the same
-  identities stay visible. If a sibling was written first (it was alone at its check), its rows stay visible. The
-  ledger records "sibling visible, this stage refused".
+  identities stay visible. If a sibling was written first (it was alone at its check), its rows stay visible exactly
+  as written (ruling Q4). The ledger records "sibling visible, this stage refused", naming the newer sibling as the
+  refused one.
 - **Newer retained evidence:** not indexed. The ledger, the metric and `ok: false` say so explicitly, and the stage is
   never reported as "indexed" or "covered".
 - **Replay:** re-running keep-up or backfill on the refused stage gives the same PG answer, so nothing is written.
@@ -189,6 +212,9 @@ The owner's requirement (a): strict total order for every divergent stage, or a 
 - After N revisits (proposed N = 24, hourly cadence) the state becomes `refused_terminal`. It stays in the outstanding
   gauge until publication.
 - A refused stage is never auto-indexed. No path reports eventual success.
+- Mutual refusal (both siblings refused, section 2) is accepted by the schema owner as the fail-closed availability
+  trade-off (ruling Q9/R4), conditional on `ok: false`, the durable outstanding gauge and the alarm existing before
+  enable. It is never called covered.
 
 ## 4. Feeder hardening (c)/(d)
 
@@ -261,18 +287,35 @@ The owner's requirement (a): strict total order for every divergent stage, or a 
 5. Reconcile `deleteRows`, then a still-live replay (blocker 3): under S, after a later canonical re-insert, canonical
    wins in both orders. The resurrection itself is asserted as owned by the privacy fence or #383, not by the encoding.
 6. GC replacement in a new second resolves the tie (`resolved_replaced`).
+7. Canonical version=0/low-domain activation refusal (ruling Q1): with a canonical row at version 0, or at a
+   low-domain value below 1e12, or with any existing buffered row, the activation check refuses to arm the feeder
+   and no buffered row is written. Causal: the same fixture without the offending row arms and writes.
+8. Late-ack revisit (ruling Q7/R2): a stage registered before the cursor and acknowledged after it passed is
+   revisited by the durable late-ack strategy and classified (written or refused), never left behind the cursor.
+   Causal: with the revisit disabled the stage stays unclassified. Lands with the late-ack PR.
+
+**New, RHC shared writer guard (separate RHC PR, ruling R1):**
+- The shared canonical-version guard refuses a non-safe integer, 0, a negative value and a value below `L_pinned`, and
+  accepts raw-ms `now()`. Each refusal is asserted through backfill, reconcile/`toIndexRow` and the vendored pipeline
+  copy.
+- Causal: the census/CI guard fails on a fixture writer that bypasses the shared guard and passes once it is routed
+  through it.
 
 **New, pglite (src/session-pipeline/__tests__/buffered-search-feed.pglite.test.ts, which already inserts stages with an
 explicit `created_at`, l.49):**
 - 050000 `sameSecond` counts: same tuple and same second → 1. Different user or origin → 0. Expired preparing → 0.
-  Unexpired preparing → pending 1. Retired → counted.
+  Unexpired preparing → pending 1. Retired → counted. GC parent or replacement of the same lineage in the same second
+  → counted (ruling Q2).
 - Grants unchanged.
 
 **New, unit (`buffered-search-feed.test.ts`, fake source):**
 - The grammar (1-5 digits, no fraction, Feb 30 all refused).
 - Page keyset ties and duplicates; candidate/stage binding mismatch.
 - Encoder band edges (0, `L_pinned`).
-- Pending → requeue/blocked. Terminal → ledger, then advance. Ledger failure → no advance.
+- Pending → requeue/blocked. Terminal → ledger, then advance. Ledger failure → no advance. Ledger readback mismatch →
+  no advance.
+- Retry after the sibling's 120 s expiry reaches a deterministic terminal classification (ruling Q8).
+- A run with an outstanding refusal reports `ok: false` even when it recorded no new refusal (R3).
 - Bounded revisit → `refused_terminal`.
 - Log and metric fields contain no content.
 
@@ -300,8 +343,8 @@ explicit `created_at`, l.49):**
     written.
 - **Stays frozen:**
   - CH schema: no ORDER BY, column, or constraint change.
-  - Canonical writers (raw ms, B3).
-  - Applying 050000 and the B2 purge.
+  - Canonical writers (raw ms, B3). The shared RHC guard is separate RHC source work (section 1, B3).
+  - Applying 050000 and any B2 or low-domain canonical remediation.
   - Enabling the feeder or the erasure lane in any environment.
   - The feeder login bootstrap.
   - Any CloudWatch alarm.
@@ -312,32 +355,50 @@ explicit `created_at`, l.49):**
 - **Q1. L source.** Is `min(version) WHERE origin='canonical' AND version > 0` (with version 0 counted separately)
   acceptable as the proof, pinned with a safety factor?
   - Recommend: yes. Pin `L_pinned = proved min`, with no factor needed, because S sits about 1,000 times lower.
+  - Ruling: accepted with condition (gated on the read in section 1; section 9).
 - **Q2. Sibling scope.** Should the stage's own batch lineage (GC parent or replacement, same `batch_id`) count as
   siblings?
   - Recommend: count them (fail closed). A same-second GC replacement is implausible, and over-refusal is visible.
+  - Ruling: accepted (section 9).
 - **Q3. Cursor policy on terminal refusal.** Advance with a durable ledger record and the metric, or hold?
   - Recommend: advance after the ledger write is read back. Holding stalls everything behind one tie.
+  - Ruling: accepted with condition (refusal stays `ok: false` and is not coverage; section 9).
 - **Q4. Visible first-writer sibling.** When A was written alone and B is later refused, keep A or delete A's rows
   exactly?
   - Recommend: keep. A is committed retained evidence, the CH table holds no tie, and the ledger records it.
+  - Ruling: accepted (keep A exactly; ledger states the newer sibling was refused; section 9).
 - **Q5. One flag or three** (encoding, guard (c), ledger)?
   - Recommend: one, because the guard and ledger have no meaning without S, and "each new behaviour gets its own flag"
     is met by a single new flag that is off by default.
+  - Ruling: accepted (section 9).
 - **Q6. Refusal granularity.** Whole stage, or only overlapping identities (by reading the sibling's S3 object)?
   - Recommend: whole stage now. Measure frequency with a counts-only read of same-second sibling pairs since cutover
     before refining.
+  - Ruling: accepted with condition (the counts-only tie-frequency measurement is required before enable; section 9).
 - **Q7. Pre-existing gap.** `page` lists only acknowledged stages (`M870` l.162). A stage registered at t1 and
   acknowledged after the cursor passed t1 is never revisited by the backfill. Keep-up covers it, but a keep-up skip
   does not count as coverage.
-  - Recommend: track it as a separate item. Bound it by holding the cursor at `now() − 120 s − margin`, past the
-    preparing expiry. It is independent of the encoding but relevant to VR's "never classify unindexed as covered".
+  - Recommend (superseded): track it as a separate item. Bound it by holding the cursor at `now() − 120 s − margin`,
+    past the preparing expiry. It is independent of the encoding but relevant to VR's "never classify unindexed as
+    covered".
+  - Ruling: rejected as closure. A fixed margin does not bound late acknowledgment (R2). A durable late-ack revisit or
+    watermark strategy is required. It may land in a separate PR, but feeder activation stays blocked until it lands
+    and proves that an acknowledged stage cannot fall permanently behind the cursor. A keep-up skip is not coverage.
 - **Q8. Keep-up requeue is unbounded** (lambda.ts l.348-354: DelaySeconds with no attempt count).
   - Recommend: rely on the 120 s preparing expiry bound for `same_second_pending`, and document it. No attempt counter
     is needed for this design.
+  - Ruling: accepted with condition (tests prove a retry after expiry reaches a deterministic terminal classification;
+    retry/DLQ observability documented in section 3; section 9).
+- **Q9. Mutual refusal.** Both same-second siblings can be refused (section 2, R4). Accept this as the fail-closed
+  availability trade-off?
+  - Recommend: accept, with `ok: false`, the durable outstanding gauge and an alarm; never report it as covered.
+  - Ruling: accepted with condition (`ok: false`, durable outstanding gauge and alarm exist before enable; never called
+    covered, never auto-indexed; section 9).
 
 ## 8. Residuals recorded by the verify peer (codex-relayhistory-verify-replica, relay message 245248035358314496)
 
-These are open. Nothing in sections 1-7 presents them as closed.
+These were open when recorded. Each item's status below follows the schema-owner ruling (section 9). None is
+presented as closed by implementation; conditions marked as prerequisites remain unmet until section 10 records them.
 
 - **R1. L is evidence, not an invariant.** Pinning the observed positive canonical minimum describes current rows. It
   is not a lower bound for every future canonical writer, import, reconcile pass or clock. The S PR must document the
@@ -345,14 +406,72 @@ These are open. Nothing in sections 1-7 presents them as closed.
   `L_pinned`) and the consequence of a future below-L canonical value: that row loses to any buffered row of the same
   identity with a higher S value, so the publication is no longer guaranteed to outrank. A review rule on
   `search-index.ts` and `reconcile.ts` is the only enforcement while the ClickHouse schema is frozen.
+  - Status: accepted with condition. The review rule alone is ruled insufficient. Replaced by the shared RHC
+    canonical-version guard plus a census/CI guard (section 1, B3), RHC source work in a separate PR owned by the
+    relayhistory-cloud-owner lane, and a prerequisite for activation (section 10).
 - **R2. A fixed margin does not bound late acknowledgment.** Holding the cursor at `now() - 120 s - margin` does not
   cover a stage whose `created_at` is older than the cursor and whose acknowledgment arrives arbitrarily late, unless a
   maximum acknowledgment delay is proved. A keep-up skip is not coverage. The S PR must either ship a durable revisit or
   watermark strategy for late acknowledgments, or state the source liveness gap explicitly. It must not claim
   completion by margin.
+  - Status: fixed margin rejected as closure. A durable late-ack revisit or watermark strategy is required (may be a
+    separate PR); feeder activation is blocked until it lands with proof (Q7, section 10).
 - **R3. A refusal is not coverage.** A run that recorded or still carries an unresolved refusal stays `ok: false`, and
   the refusal stays outstanding, until the stage is actually resolved (publication, erasure, replacement). Advancing the
   cursor after the ledger write does not close the refusal.
+  - Status: accepted. The cursor advances only after durable ledger write and readback; the refusal stays `ok: false`
+    and is not coverage (Q3, section 3).
 - **R4. Mutual refusal availability.** Both same-second siblings can be refused (section 2). This is fail-closed, but
   the availability trade-off needs the schema owner's explicit agreement before code.
+  - Status: accepted with condition. Explicitly accepted as the fail-closed availability trade-off, conditional on
+    `ok: false`, a durable outstanding gauge and an alarm existing before enable; never called covered, never
+    auto-indexed (Q9, section 9).
 - No ClickHouse, SQL, apply or flag action follows from this document. #382 stays a diagnosis PR. No Path R dependency.
+
+## 9. Schema-owner ruling (2026-11-08) and incorporated conditions
+
+Source: schema-owner ruling on #385, relay message 245252322769489920 (relayhistory-cloud-owner, 2026-11-08).
+Overall: conditional accept of S plus the PG same-second refusal. The implementation and review-ready claim stays
+blocked until the conditions below are incorporated. #382 remains diagnostic only.
+
+| Item | Ruling (one line) | Status | Reflected in |
+| --- | --- | --- | --- |
+| Q1 | Pin the exact positive canonical minimum, no factor, only if the read proves canonical count>0, countIf(version=0)=0, countIf(version<1e12)=0 and buffered count=0; any zero/low canonical or existing buffered row blocks activation and needs separate reviewed remediation. | accepted with condition | 1 (L, B1, B2), 5 (test 7), 7, 10 |
+| Q2 | Include GC parent/replacement lineage as siblings. | accepted | 5 (pglite), 7 |
+| Q3 | Advance only after durable ledger write and readback; the outstanding refusal remains ok:false and is not coverage (R3). | accepted with condition | 3 (Cursor, Observability), 5, 7, 8 |
+| Q4 | Keep the first-written sibling A exactly; the ledger states the newer sibling was refused. | accepted | 3 (What the system shows), 7 |
+| Q5 | One default-off flag, `INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION`. | accepted | 6, 7 |
+| Q6 | Whole-stage refusal; the counts-only tie-frequency measurement is required before enable. | accepted with condition | 7, 10 |
+| Q7 | Fixed margin rejected as closure; a durable late-ack revisit/watermark strategy is required (may be a separate PR) and feeder activation stays blocked until it lands and proves an acknowledged stage cannot fall permanently behind the cursor. | rejected (replaced by a required strategy) | 5 (test 8), 7, 8 (R2), 10 |
+| Q8 | 120 s pending expiry accepted only if tests prove a retry after expiry reaches a deterministic terminal classification; document retry/DLQ observability. | accepted with condition | 3 (Refuse, Observability), 5 (unit), 7, 10 |
+| Q9 | Mutual refusal explicitly accepted as the fail-closed availability trade-off, conditional on ok:false, a durable outstanding gauge and an alarm existing before enable; never called covered or auto-indexed. | accepted with condition | 3 (Observability, Recovery), 7, 8 (R4), 10 |
+| R1 | Review-rule-only B3 is insufficient; add one shared RHC canonical-version guard (backfill, reconcile/toIndexRow, vendored pipeline copy) refusing non-safe/nonpositive or below-L_pinned values, plus a census/CI guard for every direct writer; RHC source work, separate PR. | accepted with condition (review rule rejected) | 1 (B3), 5 (RHC guard tests), 6, 8, 10 |
+| R2 | Same as Q7: durable late-ack revisit/watermark required; no completion by margin. | rejected as closure (replaced by a required strategy) | 7 (Q7), 8, 10 |
+| R3 | A refusal is not coverage; ok:false while outstanding. | accepted | 3, 5, 8 |
+| R4 | Same as Q9: mutual refusal accepted as the fail-closed trade-off under the stated conditions. | accepted with condition | 3, 7 (Q9), 8, 10 |
+
+Accepted unchanged: feeder hardening (c)/(d) (section 4), the exact createdAt grammar (d1), binding the page candidate
+to the stage RPC result (d2), the strict keyset (d3), the B1 encoder refusal (section 1), one-flag arming (section 6)
+and the test plan (section 5). The ruling adds two causal tests, both now in section 5: canonical version=0/low-domain
+activation refusal (test 7) and the shared writer guard (RHC guard tests).
+
+## 10. Activation prerequisites
+
+In order. Each item must be recorded as met, with its evidence, before the next one is relied on.
+
+- [ ] 1. Operator counts-only read result: canonical count>0, countIf(version=0)=0, countIf(version<1e12)=0, buffered
+  count=0. Otherwise stop: separate reviewed remediation first (Q1).
+- [ ] 2. RHC shared canonical-version guard PR merged, with the census/CI guard over every direct writer (R1;
+  relayhistory-cloud-owner lane).
+- [ ] 3. Durable late-ack revisit/watermark strategy landed, with proof that an acknowledged stage cannot fall
+  permanently behind the cursor (Q7/R2).
+- [ ] 4. Counts-only tie-frequency measurement of same-second sibling pairs recorded (Q6).
+- [ ] 5. Durable `TieRefusedOutstanding` gauge and its alarm exist (Q9/R4; the alarm is a cloud resource and needs
+  Khaliq's OK).
+- [ ] 6. Expiry-to-terminal tests green: a retry after the 120 s pending expiry reaches a deterministic terminal
+  classification (Q8).
+- [ ] 7. Flag flip of `INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION`: only on Khaliq's word. It is not this lane's
+  authority.
+
+No code, apply or flag authority follows from the ruling or from this document. The revised docs head goes to the
+schema owner before any semantic code is started.
