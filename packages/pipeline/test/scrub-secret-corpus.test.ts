@@ -18,7 +18,7 @@ import { MAX_SCRUB_CHARS, scrubJson, scrubRecord, scrubText } from "../src/lib/s
 
 /** sha256 of the corpus. Update in both repos together when the corpus changes. */
 const CORPUS_SHA256 =
-  "6d5823b9d96412ddf17c01a34091bee3f75bdda3ca211a19689523008c2b2313";
+  "dff7001535b92c6e78584e1ebc7daea6fc4b1ea108137b4ac36bc77598845bbe";
 
 const CORPUS_PATH = fileURLToPath(
   new URL("./fixtures/scrub-secret-corpus.json", import.meta.url).href,

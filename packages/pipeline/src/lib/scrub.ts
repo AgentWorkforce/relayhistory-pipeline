@@ -177,6 +177,8 @@ function redactQuotedSecretValues(
   multiLine = false,
 ): string {
   if (!/[:=]/.test(text)) return text;
+  const pemBlocks = onlyOverCap ? privateKeyBlockSpans(text) : [];
+  let pemBlockIndex = 0;
   let out = "";
   let last = 0;
   QUOTED_KEY.lastIndex = 0;
@@ -249,19 +251,22 @@ function redactQuotedSecretValues(
       // A short or word-like unquoted password after a quoted key is kept too.
       if (bs > 0 || (m[3] as string).includes(" ")) continue;
       valueStart = end;
-      const bare = /^[^\s"'`,;{}[\]\\]+/.exec(
+      const barePrefix = /^[^\s"'`,;{}[\]\\]+/.exec(
         text.slice(end, end + MAX_QUOTED_VALUE),
       );
-      if (!bare || NON_SECRET_BARE.test(bare[0]) || !looksGenerated(bare[0]))
-        continue;
-      valueEnd = end + bare[0].length;
-      if (bare[0].length === MAX_QUOTED_VALUE) {
+      if (!barePrefix) continue;
+      valueEnd = end + barePrefix[0].length;
+      if (barePrefix[0].length === MAX_QUOTED_VALUE) {
         // Past the bound: to the end of the token, not the first MAX_QUOTED_VALUE of it.
         const rest = /[^\s"'`,;{}[\]\\]*/y;
         rest.lastIndex = valueEnd;
         valueEnd += (rest.exec(text) as RegExpExecArray)[0].length;
         overBound = true;
       }
+      // Classify the complete token. A numeric-looking capped prefix may have a generated
+      // tail beyond the bound; deciding from the prefix would incorrectly keep that tail.
+      const bare = text.slice(end, valueEnd);
+      if (NON_SECRET_BARE.test(bare) || !looksGenerated(bare)) continue;
     }
     const value = longValue ? "" : text.slice(valueStart, valueEnd);
     // A prefix may end right at an open value: still recorded (open), with nothing to redact.
@@ -276,6 +281,18 @@ function redactQuotedSecretValues(
     // Rule set 5's first pass: only over-bound values are redacted, but every value the
     // full pass would redact is still skipped, so both passes see the same keys.
     if (onlyOverCap && !longValue && !overBound) continue;
+    // If a PEM block opened before this value and its footer is inside the value, leave
+    // the value intact for the immediately following PEM rule. Removing the footer here
+    // would make that rule treat the block as unterminated and redact trailing history.
+    if (onlyOverCap) {
+      while (
+        pemBlockIndex < pemBlocks.length &&
+        (pemBlocks[pemBlockIndex] as [number, number])[1] <= valueStart
+      )
+        pemBlockIndex += 1;
+      const pem = pemBlocks[pemBlockIndex];
+      if (pem && pem[0] < valueStart && pem[1] <= valueEnd) continue;
+    }
     // A private-key block opened inside the value and closed after it: the PEM rule would
     // have paired them, so the redaction runs to its footer (or the end) as that rule's would.
     if (onlyOverCap) {
@@ -751,6 +768,22 @@ const TRUNCATION_NOTE = "[relayhistory: truncated";
 
 const PEM_BEGIN = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
 const PEM_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
+
+/** Complete private-key spans, paired exactly as the PEM replacement rule pairs them. */
+function privateKeyBlockSpans(text: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  let pos = 0;
+  for (;;) {
+    PEM_BEGIN.lastIndex = pos;
+    const begin = PEM_BEGIN.exec(text);
+    if (!begin) return spans;
+    PEM_END.lastIndex = begin.index + begin[0].length;
+    const end = PEM_END.exec(text);
+    if (!end) return spans;
+    pos = end.index + end[0].length;
+    spans.push([begin.index, pos]);
+  }
+}
 
 /**
  * Start of the first private-key block in `text` that the PEM rule cannot
