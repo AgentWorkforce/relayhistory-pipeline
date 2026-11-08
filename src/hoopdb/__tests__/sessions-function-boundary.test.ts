@@ -213,21 +213,23 @@ describe("unified sessions function-boundary generator", () => {
     expect(summary["canonical-feature-consumer"]).toEqual({ functions: 2, replaces: 0, grants: 1 });
   });
 
-  test("043700 owner buffered read: two read-api-callable SECDEF readers, an owner-only scope helper, ACL +3", async () => {
+  test("043700 owner buffered read: two read-api-callable SECDEF readers, owner-only scope and parity helpers, ACL +4", async () => {
     const g = await generate(repo, LANES, VERIFIERS);
-    expect(g.summary.lanes["owner-buffered-read"]).toEqual({ functions: 3, replaces: 0, grants: 2 });
+    expect(g.summary.lanes["owner-buffered-read"]).toEqual({ functions: 4, replaces: 0, grants: 2 });
     expect(LANES.find((l) => l.lane === "owner-buffered-read")?.migration).toBe("supabase/migrations/20261105043700_owner_buffered_read.sql");
     const acl = JSON.parse(g.outputs[ACL_PATH]!).functions as Record<string, string[]>;
-    const mine = Object.entries(acl).filter(([k]) => /^sessions\.(owner_buffered_read_scope|buffered_sessions_for|buffered_session_stages_for)\(/.test(k));
+    const mine = Object.entries(acl).filter(([k]) => /^sessions\.(owner_buffered_read_scope|owner_buffered_parity_expected|buffered_sessions_for|buffered_session_stages_for)\(/.test(k));
     expect(Object.fromEntries(mine)).toEqual({
-      "sessions.owner_buffered_read_scope(text)": ["<owner>:EXECUTE"],
-      "sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer)": ["<owner>:EXECUTE", "bulls96_read_api:EXECUTE"],
-      "sessions.buffered_session_stages_for(text,text,text)": ["<owner>:EXECUTE", "bulls96_read_api:EXECUTE"],
+      "sessions.owner_buffered_read_scope(text,text,text,text,text,boolean)": ["<owner>:EXECUTE"],
+      "sessions.owner_buffered_parity_expected(text,text,text,text,bigint,text)": ["<owner>:EXECUTE"],
+      "sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,boolean)": ["<owner>:EXECUTE", "bulls96_read_api:EXECUTE"],
+      "sessions.buffered_session_stages_for(text,text,text,text,text,text,text,boolean)": ["<owner>:EXECUTE", "bulls96_read_api:EXECUTE"],
     });
     // Hand-written down path (no generated rollback), same guard shape as 034000/043000.
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043700_owner_buffered_read.down.sql"), "utf8");
     expect(down).toContain("a later migration is applied");
-    expect(down.match(/DROP FUNCTION IF EXISTS/g)?.length).toBe(3);
+    expect(down.match(/DROP FUNCTION IF EXISTS/g)?.length).toBe(4);
+    expect(down).toContain("DROP TABLE IF EXISTS sessions.owner_buffered_parity;");
     expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043700_owner_buffered_read.sql'");
   });
 });

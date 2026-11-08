@@ -1682,14 +1682,17 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // Later lanes roll back first and remove their own ledger rows; only then
     // 043700 (owner buffered read) is the latest: 043000 refuses (55000) while it is applied.
     const ownerReadFns = async () =>
-      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE proname IN ('owner_buffered_read_scope','buffered_sessions_for','buffered_session_stages_for')")).rows[0]!.n;
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE proname IN ('owner_buffered_read_scope','owner_buffered_parity_expected','buffered_sessions_for','buffered_session_stages_for')")).rows[0]!.n;
+    const parityTable = async () => relation("sessions.owner_buffered_parity");
     expect(await names()).toContain(N);
-    expect(await ownerReadFns()).toBe(3);
+    expect(await ownerReadFns()).toBe(4);
+    expect(await parityTable()).toBe("sessions.owner_buffered_parity");
     expect((await failure(rollback("20261105043000_brief_titles.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(H);
     await rollback("20261105043700_owner_buffered_read.down.sql");
     expect(await names()).not.toContain(N);
     expect(await ownerReadFns()).toBe(0);
+    expect(await parityTable()).toBeNull();
     // Then 043000 (F2 brief titles) is the latest: 042000, 041000, 040000 and 039000 all refuse
     // (55000) while it is applied, so it rolls back first.
     expect(await names()).toContain(H);
@@ -1800,8 +1803,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // 035000 through 039000, 040000 (lazy source tables) and 041000 (privacy authority); the post-validation
     // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    // Up again: 041000's exact source-table list is back in both lazy functions, and 043700's three functions.
-    expect(await ownerReadFns()).toBe(3);
+    // Up again: 041000's exact source-table list is back in both lazy functions, and 043700's four functions and parity table.
+    expect(await ownerReadFns()).toBe(4);
+    expect(await parityTable()).toBe("sessions.owner_buffered_parity");
     expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
