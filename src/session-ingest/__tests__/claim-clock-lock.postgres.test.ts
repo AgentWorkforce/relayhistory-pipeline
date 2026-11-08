@@ -358,15 +358,17 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     await warm(x, y, z);
     const before = BigInt(await lastSeat());
     const xs = [`b1-x-${serial}-0`, `b1-x-${serial}-1`], ys = [`b1-y-${serial}-0`, `b1-y-${serial}-1`];
-    const px = await capture("ingest_commit_buffered_batch", x, `b1x-${serial}`, xs), py = await capture("ingest_commit_buffered_batch", y, `b1y-${serial}`, ys);
+    const px = await capture("ingest_commit_buffered_batch", x, `b1x-${serial}`, xs, { origin: `b1-ox-${serial}` }), py = await capture("ingest_commit_buffered_batch", y, `b1y-${serial}`, ys, { origin: `b1-oy-${serial}` });
     const hx = await hold(COMMIT, px);
     expect((await hx.done).ok).toBe(true);
     const hy = await hold(COMMIT, py);
     await waitBlockedBy(hy.pid, hx.pid);
     // Claim Z: since 043800 the staged ACK holds the clock FOR NO KEY UPDATE, which does not conflict with Z's KEY
     // SHARE, so Z completes while X still holds the clock and Y is queued behind X (lock_timeout bounds a regression).
+    // X, Y and Z use different origins because the 043800 ACK also holds the origin advisory lock, so a same-origin
+    // claim would queue on it (that case is D1).
     await expectAck043800();
-    const hz = await hold(CLAIM, await capture("ingest_claim_buffered_batch", z, `b1z-${serial}`, [`b1-z-${serial}`]), "SET LOCAL lock_timeout=750");
+    const hz = await hold(CLAIM, await capture("ingest_claim_buffered_batch", z, `b1z-${serial}`, [`b1-z-${serial}`], { origin: `b1-oz-${serial}` }), "SET LOCAL lock_timeout=750");
     expect(await hz.done).toMatchObject({ ok: true }); await finish(hz, "COMMIT");
     expect(await settled(hy.done, 200)).toBe(false);
     await finish(hx, "COMMIT");
