@@ -3,12 +3,17 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import {
+  ADMISSION_DLQ,
+  ADMISSION_QUEUE,
+  ADMISSION_RESOURCES,
   COMPATIBILITY_DATE,
   FANOUT_DLQ,
   INBOX_AUTHORITY_MODE,
   INBOX_CANDIDATE_KEY_ROOT,
   SESSION_INGEST_RESOURCES,
   SESSION_INGEST_WORKER,
+  admissionConsumerProps,
+  assertAdmissionConsumer,
   assertFanoutConsumer,
   assertNoSecretLiterals,
   assertPrivateWorker,
@@ -17,6 +22,7 @@ import {
   externalQueue,
   fanoutConsumerProps,
   secretsStoreSecret,
+  sessionIngestResources,
   sessionIngestVars,
   sessionIngestWorkerProps,
   type SessionIngestInputs,
@@ -269,9 +275,81 @@ describe("session ingest worker: deploy plan contract", () => {
     expect(() => check(plan({ "session-ingest": "update" }).replace("Plan: 1 to update", "Plan: 2 to update"))).toThrow(/summary/);
   });
 
+  it("async admission: the three admission resources all-or-none, only when declared", () => {
+    const all = sessionIngestResources(true);
+    expect(all).toEqual([...SESSION_INGEST_RESOURCES, ...ADMISSION_RESOURCES]);
+    const allCreates = Object.fromEntries(all.map((r) => [r, "create"]));
+    const checkWith = (compact: string) => assertSessionIngestPlanContract(compact, compact.split("\n").map((l) => (l.startsWith("[") ? `  ${l}` : l)).join("\n"), true);
+    expect(checkWith(plan(allCreates, all))).toBe("session ingest rollout");
+    // An existing stage adding admission: three creates; the Worker binding update is its own phase.
+    expect(checkWith(plan(Object.fromEntries(ADMISSION_RESOURCES.map((r) => [r, "create"])), all))).toBe("session ingest rollout");
+    expect(checkWith(plan({ "session-ingest": "update" }, all))).toBe("session ingest update");
+    expect(() => check(plan(allCreates, all))).toThrow(/unexpected resource session-ingest-admission/);
+    expect(() => checkWith(plan(allCreates, all.filter((r) => r !== "session-ingest-admission-consumer")))).toThrow(/missing resource session-ingest-admission-consumer/);
+    expect(() => checkWith(plan(creates))).toThrow(/missing resource session-ingest-admission/);
+    expect(() => checkWith(plan({ "session-ingest-admission": "delete" }, all))).toThrow(/forbidden action/);
+    // Adding admission to a deployed stage: the three creates + the Worker's in-place binding update.
+    const addition = { ...Object.fromEntries(ADMISSION_RESOURCES.map((r) => [r, "create"])), "session-ingest": "update" };
+    expect(checkWith(plan(addition, all))).toBe("async admission addition");
+    expect(() => check(plan({ "session-ingest": "update", "session-ingest-fanout-consumer": "create" }))).toThrow(/neither a rollout/);
+    for (const extra of [{ "session-ingest-fanout": "update" }, { "session-ingest-fanout-consumer": "update" }, { "session-ingest-admission-consumer": "update" }])
+      expect(() => checkWith(plan({ ...addition, ...extra }, all))).toThrow(/neither a rollout/);
+    expect(() => checkWith(plan({ "session-ingest-admission": "create", "session-ingest": "update" }, all))).toThrow(/neither a rollout/);
+  });
+
   it("refuses a detailed plan that shows a credential (a secret value in state)", () => {
     const ok = plan({ "session-ingest": "update" });
     for (const leak of ['  "type": "secret_text"', "  AKIAABCDEFGHIJKLMNOP", '  "x": "postgresql://bulls96_session_ingest:pw@pooler/postgres"', "  -----BEGIN RSA PRIVATE KEY-----"])
       expect(() => check(ok, `${ok}${leak}\n`)).toThrow(/credential/);
+  });
+});
+
+describe("session ingest: S3-first async admission (default off)", () => {
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0 };
+  const admissionQueue = { Type: "Cloudflare.Queues.Queue", queueName: ADMISSION_QUEUE };
+
+  it("absent asyncAdmission: vars, props and the resource list are exactly today's", () => {
+    expect(Object.keys(sessionIngestVars(buffered))).not.toContain("INGEST_ASYNC_ADMISSION");
+    expect(Object.keys(props(buffered).env)).not.toContain("INGEST_ADMISSION");
+    expect(Object.keys(props(inputs).env)).not.toContain("INGEST_ASYNC_ADMISSION");
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+    expect(sessionIngestResources(false)).toBe(SESSION_INGEST_RESOURCES);
+  });
+
+  it("is refused outside buffered acceptance and for any value but on/drain", () => {
+    for (const bad of [{ ...inputs, asyncAdmission: "on" }, { ...buffered, asyncAdmission: "yes" }, { ...buffered, asyncAdmission: true }])
+      expect(() => assertSessionIngestInputs(bad, refuse)).toThrow(/asyncAdmission/);
+    for (const mode of ["on", "drain"] as const) expect(() => assertSessionIngestInputs({ ...buffered, asyncAdmission: mode }, refuse)).not.toThrow();
+  });
+
+  it("on/drain: the var and the INGEST_ADMISSION binding, and the binding only together with the input", () => {
+    for (const mode of ["on", "drain"] as const) {
+      const p = sessionIngestWorkerProps({ ...buffered, asyncAdmission: mode }, { ...bindings, INGEST_ADMISSION: admissionQueue }) as unknown as { env: Record<string, unknown> };
+      expect(p.env.INGEST_ASYNC_ADMISSION).toBe(mode);
+      expect(p.env.INGEST_ADMISSION).toBe(admissionQueue);
+      expect(p.env.INGEST_FANOUT).toBe(bindings.INGEST_FANOUT);
+      expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+    }
+    expect(() => sessionIngestWorkerProps({ ...buffered, asyncAdmission: "on" }, bindings)).toThrow(/INGEST_ADMISSION/);
+    expect(() => sessionIngestWorkerProps(buffered, { ...bindings, INGEST_ADMISSION: admissionQueue })).toThrow(/INGEST_ADMISSION/);
+  });
+
+  it("the consumer is this Worker, batch 1, 20 retries, concurrency 4, its own DLQ", () => {
+    const c = admissionConsumerProps("qid");
+    expect(c).toEqual({ queueId: "qid", scriptName: SESSION_INGEST_WORKER, deadLetterQueue: ADMISSION_DLQ, settings: { batchSize: 1, maxRetries: 20, maxConcurrency: 4 } });
+    expect(() => assertAdmissionConsumer(c, refuse)).not.toThrow();
+    expect(() => assertAdmissionConsumer({ ...c, deadLetterQueue: FANOUT_DLQ }, refuse)).toThrow(/dead-letter/);
+    expect(() => assertAdmissionConsumer({ ...c, scriptName: "other" }, refuse)).toThrow(/ingest Worker/);
+    expect(() => assertAdmissionConsumer({ ...c, settings: { ...c.settings, maxConcurrency: 64 } }, refuse)).toThrow(/settings/);
+    expect(() => assertAdmissionConsumer({ ...c, settings: { ...c.settings, maxWaitTimeMs: 1 } as never }, refuse)).toThrow(/settings/);
+  });
+
+  it("the stage declares the admission queues with no pause prop, the fanout queues unchanged", () => {
+    const s = src("../session-ingest.ts");
+    expect(s).toContain('Cloudflare.Queues.Queue("session-ingest-admission-dlq", { name: ADMISSION_DLQ } as never)');
+    expect(s).toContain('Cloudflare.Queues.Queue("session-ingest-admission", { name: ADMISSION_QUEUE } as never)');
+    expect(s).toContain('Cloudflare.Queues.Queue("session-ingest-fanout", { name: FANOUT_QUEUE, ...(p.acceptanceMode === "buffered" ? { deliveryPaused: true } : {}) } as never)');
+    expect(s).toContain("assertAdmissionConsumer(ac, refuse)");
+    expect([ADMISSION_QUEUE, ADMISSION_DLQ]).toEqual(["96bulls-session-ingest-admission", "96bulls-session-ingest-admission-dlq"]);
   });
 });

@@ -7,7 +7,7 @@ import * as queues from "@distilled.cloud/cloudflare/queues";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
-import { FANOUT_QUEUE, FANOUT_DLQ } from "./session-ingest.ts";
+import { ADMISSION_DLQ, ADMISSION_QUEUE, FANOUT_QUEUE, FANOUT_DLQ } from "./session-ingest.ts";
 export class BufferedQueueRefusal extends Error {
   constructor(readonly code: string) {
     super("buffered queue refused: " + code);
@@ -45,6 +45,21 @@ function props(input: any): string {
     no("captured_paused_props");
   return name!;
 }
+/**
+ * The async admission queue + DLQ (declared only with sessionIngest.asyncAdmission): the official
+ * lifecycle, never paused and never PATCHed here, with the same ownership/identity refusals as the
+ * paused queues. The fanout queues above stay paused-only; no path here can unpause them.
+ */
+const admissionNames = new Map([
+  ["session-ingest-admission", ADMISSION_QUEUE],
+  ["session-ingest-admission-dlq", ADMISSION_DLQ],
+]);
+function admissionProps(input: any): string {
+  const name = admissionNames.get(input.id);
+  if (!name || input.news?.name !== name || input.news?.deliveryPaused !== undefined)
+    no("captured_admission_props");
+  return name!;
+}
 function exact(row: QueueObserved, queueId: string, name: string) {
   if (row.queueId !== queueId || row.queueName !== name) no("queue_identity");
   return row;
@@ -57,6 +72,44 @@ export function pausedQueueService(
 ) {
   const bounded = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.timeout(deadlineMs));
+  const paused = pausedOnly(base, api, expectedAccountId, bounded);
+  const admission = {
+    diff: Effect.fn(function* (input: any) {
+      admissionProps(input);
+      return yield* base.diff(input);
+    }),
+    read: Effect.fn(function* (input: any) {
+      const result = yield* base.read(input);
+      if (!result) return undefined;
+      if (!id(result.accountId) || result.accountId !== expectedAccountId || !id(result.queueId) || result.queueName !== admissionNames.get(input.id))
+        no("queue_identity");
+      return result;
+    }),
+    reconcile: Effect.fn(function* (input: any) {
+      const name = admissionProps(input);
+      const accountId = input.output?.accountId;
+      if (accountId !== undefined && !id(accountId)) no("queue_identity");
+      if (!id(expectedAccountId) || (accountId !== undefined && accountId !== expectedAccountId)) no("queue_identity");
+      // Never adopt an unowned queue just because its physical name matches.
+      const existing = yield* bounded(api.list(expectedAccountId));
+      const matches = existing.filter((q) => q.queueName === name);
+      if (matches.length > 1 || (input.output && matches.length !== 1) || (!input.output && matches.length) ||
+          (input.output && matches.some((q) => q.queueId !== input.output.queueId)))
+        no("unowned_queue_prerequisite");
+      const result = yield* base.reconcile(input);
+      if (!id(result.accountId) || result.accountId !== expectedAccountId || !id(result.queueId) || result.queueName !== name) no("queue_identity");
+      if (input.output && input.output.queueId !== result.queueId) no("owned_queue_changed");
+      const observed = exact(yield* bounded(api.get(result.accountId, result.queueId)), result.queueId, name);
+      if (!input.output && (observed.consumersTotalCount !== 0 || observed.producersTotalCount !== 0)) no("initial_queue_not_empty");
+      return result;
+    }),
+  };
+  const route = (method: "diff" | "read" | "reconcile") => (input: any) =>
+    admissionNames.has(input?.id) ? admission[method](input) : paused[method](input);
+  return { ...paused, diff: route("diff"), read: route("read"), reconcile: route("reconcile") };
+}
+
+function pausedOnly(base: any, api: BufferedQueueApi, expectedAccountId: string, bounded: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, any, R>) {
   return {
     ...base,
     version: (base.version ?? 0) + 1,
