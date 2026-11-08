@@ -461,6 +461,47 @@ describe("privacy fences: a control that lands before the consumer admits", () =
     expect(await tenantKeys(s.store)).toEqual([]);
   });
 
+  test("#392 erase (RELAYHISTORY_SELFHOST_SESSION_SELECTION) in async mode: an erase before admission keeps the batch out; re-enable is still the 400; uploads after it stay unstored", async () => {
+    const s = await start({ RELAYHISTORY_SELFHOST_SESSION_SELECTION: "true" });
+    const selection = async (enabled: boolean) => post(s.url("/v1/delivery/sessions/selection"), JSON.stringify({
+      account_id: await deliveryAccount(TENANT), origin_id: "origin-1", sessions: [{ source: "claude", session_id: "sess-1" }], enabled }));
+    // Queued with no SQL, then the user erases the session before the consumer runs.
+    expect((await post(s.url("/v1/delivery/batches"), await deliveryBody("erase-pre"))).status).toBe(200);
+    expect(s.sql.calls).toBe(0);
+    const erased = await selection(false);
+    expect(erased.status).toBe(200);
+    expect(await erased.json()).toEqual({ updated: true });
+    // Re-enable answers #392's own 400 in async mode too (never the journal's 503), with no SQL.
+    const calls = s.sql.calls;
+    const reEnable = await selection(true);
+    expect([reEnable.status, await errorCode(reEnable)]).toEqual([400, "unsupported_by_backend"]);
+    expect(s.sql.calls).toBe(calls);
+    await drain(s);
+    const line = s.logs.map((l) => JSON.parse(l)).find((l) => l.route === "ingest.admission");
+    expect(line.outcome).toBe("admitted");
+    expect(["replay_fast", "accepted_all_deleted"]).toContain(line.error_code);
+    expect(await tenantKeys(s.store)).toEqual([]);
+    // A stale retry of the same session after the erase: queued, then filtered by the fence, never stored.
+    expect((await post(s.url("/v1/delivery/batches"), await deliveryBody("erase-post"))).status).toBe(200);
+    await drain(s);
+    expect(await tenantKeys(s.store)).toEqual([]);
+    // Another session is unaffected.
+    expect((await post(s.url("/v1/delivery/batches"), await deliveryBody("other", {}, { session_id: "sess-other" }))).status).toBe(200);
+    await drain(s);
+    expect((await tenantKeys(s.store)).length).toBeGreaterThan(0);
+  });
+
+  test("#392 erase in sync mode is unchanged by this feature (the same answers)", async () => {
+    const s = await start({ RELAYHISTORY_SELFHOST_SESSION_SELECTION: "true", SELFHOST_INGEST_ADMISSION: undefined });
+    const body = async (enabled: boolean) => JSON.stringify({ account_id: await deliveryAccount(TENANT), origin_id: "origin-1", sessions: [{ source: "claude", session_id: "sess-1" }], enabled });
+    expect((await post(s.url("/v1/delivery/batches"), await deliveryBody("s1"))).status).toBe(200);
+    expect((await post(s.url("/v1/delivery/sessions/selection"), await body(false))).status).toBe(200);
+    const re = await post(s.url("/v1/delivery/sessions/selection"), await body(true));
+    expect([re.status, await errorCode(re)]).toEqual([400, "unsupported_by_backend"]);
+    // And the admission status read stays unserved in sync.
+    expect((await fetch(s.url("/v1/delivery/admission?originId=origin-1&receiptId=rhr_" + "a".repeat(64)), { headers: { authorization: `Bearer ${TOKEN}` } })).status).toBe(501);
+  });
+
   test("a reset between upload and admission refuses it (delivery_privacy_superseded); an upload after the reset is admitted", async () => {
     const s = await start();
     expect((await post(s.url("/v1/delivery/batches"), await deliveryBody("pre"))).status).toBe(200);

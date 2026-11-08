@@ -173,6 +173,12 @@ export interface IngestAppDeps {
 export interface SelfhostAdmissionHooks {
   /** The verified identity bound to exactly this Request, or undefined. */
   identityOf: (request: Request) => IngestIdentity | undefined;
+  /**
+   * The self-host erase ledger (RELAYHISTORY_SELFHOST_SESSION_SELECTION, ledger-sql.ts selfhostSelectionErase)
+   * refuses every re-enable with a 400 before any SQL, so a non-ordered re-enable goes to it unjournaled
+   * (it can never apply) instead of the journal's 503. Never set with a ledger that can apply a re-enable.
+   */
+  reEnableRefusedByLedger?: boolean;
 }
 
 type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined; journalWitness: { tenant: string; seq: number } | undefined } };
@@ -663,7 +669,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       let controlAck;
       // A re-enable lifts a tombstone: an upload that began before it must not be admitted after it.
       // (A disable needs no journal: the consumer's claim already filters a deleted session.)
-      const journal = <T>(run: () => Promise<T>, outcomeOf: (r: T) => "applied" | "replay" | "stale") => !input.enabled ? run()
+      const journal = <T>(run: () => Promise<T>, outcomeOf: (r: T) => "applied" | "replay" | "stale") => !input.enabled || (selfhostAdmission?.reEnableRefusedByLedger === true && !identity.control) ? run()
         : journaled(selection.tenant, identity.control, run, outcomeOf);
       {const t={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
        if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("selection",t,input.origin_id)));

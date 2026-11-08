@@ -15,7 +15,11 @@
  *   POST /v1/turns/batches     rth:sync   (app.ts, unchanged handler)
  *   GET  /v1/delivery/limits   rth:sync   (app.ts, unchanged handler)
  *   POST /v1/auth/token/refresh  401 refresh_not_supported, always (see SELFHOST_REFRESH_PATH)
- *   any other /v1 path         501 unsupported_by_backend (selection, reset, recovery, custody,
+ *   POST /v1/delivery/sessions/selection  rth:sync, only with RELAYHISTORY_SELFHOST_SESSION_SELECTION=true:
+ *                              per-session erase (enabled:false; enabled:true answers 400 unsupported_by_backend). The app.ts handler is
+ *                              unchanged; the ledger's setSessionUploads fences and tombstones every origin of the caller's session in one transaction
+ *                              (migration 043910). 404 afterwards means unreadable, not bytes gone.
+ *   any other /v1 path         501 unsupported_by_backend (reset, recovery, custody,
  *                              onboarding are relayhistory-internal and not served self-host)
  *
  * Bindings, Node instead of Cloudflare:
@@ -77,8 +81,8 @@ export const SELFHOST_INGEST_ROUTES: Readonly<Record<string, "GET" | "POST">> = 
   "/v1/delivery/limits": "GET",
 });
 
-/** SELFHOST_INGEST_ADMISSION=async|drain only: plus the hosted admission status read (S3 only, rth:sync, tenant from the verified identity). */
-export const SELFHOST_ADMISSION_ROUTES: Readonly<Record<string, "GET" | "POST">> = Object.freeze({ ...SELFHOST_INGEST_ROUTES, "/v1/delivery/admission": "GET" });
+/** SELFHOST_INGEST_ADMISSION=async|drain only: the hosted admission status read (S3 only, rth:sync, tenant from the verified identity). */
+export const SELFHOST_ADMISSION_STATUS_PATH = "/v1/delivery/admission";
 
 /**
  * The Desktop's refresh call. A self-host session has nothing to refresh (the read API's login passes the
@@ -102,9 +106,13 @@ async function drainSmallBody(req: IncomingMessage): Promise<void> {
   });
 }
 
+export const SELFHOST_SESSION_SELECTION_PATH = "/v1/delivery/sessions/selection";
+
 /** One assembled ingest: the app, the per-request verifier, readiness and teardown. */
 export interface SelfhostIngestRuntime {
   app: FetchApp;
+  /** The routes this runtime serves, by exact raw pathname (the base set, plus selection when enabled). */
+  routes: Readonly<Record<string, "GET" | "POST">>;
   /** Verifies one Authorization header value; throws AuthError to refuse. */
   verify(authorization: string | undefined): Promise<IngestIdentity>;
   /** Hands the verified identity to the app for exactly this Request object. */
@@ -115,8 +123,6 @@ export interface SelfhostIngestRuntime {
   admissionMode?: "sync" | "async" | "drain";
   /** SELFHOST_INGEST_ADMISSION=async|drain only: the consumer's status (for the probes). */
   admission?: () => SelfhostAdmissionStatus;
-  /** Routes served (SELFHOST_INGEST_ROUTES when absent). */
-  routes?: Readonly<Record<string, "GET" | "POST">>;
 }
 
 export interface RuntimeParts {
@@ -137,10 +143,11 @@ export interface SelfhostRuntimeOptions {
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission">, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+  const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   const deliver: DeliverDeps = {
-    ledger: sqlLedger(parts.run, { acceptanceMode: "canonical" }),
+    ledger: sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection }),
     acceptanceMode: "canonical",
     target: { store: parts.store, keyRoot: settings.keyRoot },
     // Slot TTL past any request this process serves, so a lost release frees itself (Worker: 90).
@@ -153,11 +160,12 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     if (!identity) throw new AuthError(401, "missing_authorization", "missing Authorization header");
     return identity;
   };
+  const routes = sessionSelection ? Object.freeze({ ...SELFHOST_INGEST_ROUTES, [SELFHOST_SESSION_SELECTION_PATH]: "POST" as const }) : SELFHOST_INGEST_ROUTES;
   const admission = settings.admission;
   if (!admission) {
     // SELFHOST_INGEST_ADMISSION=sync (the default): exactly the app this file always built.
     const app = createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields) });
-    return { app, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close, admissionMode: "sync" };
+    return { app, routes, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close, admissionMode: "sync" };
   }
   const mode = admission.mode === "async" ? "on" as const : "drain" as const;
   const consumer: SelfhostAdmissionConsumer = selfhostAdmissionConsumer({
@@ -176,7 +184,9 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
       // consumer start on a fresh upload without waiting for the next scan; it never throws.
       enqueue: async (message) => { if (message.key.startsWith(inboxRoot)) consumer.notify(message.key); },
       ...(options.nowMs ? { nowMs: options.nowMs } : {}),
-      selfhost: { identityOf: (request) => verified.get(request) },
+      // The #392 erase ledger answers a re-enable with its own 400 before any SQL; let it, rather than the
+      // journal's 503 (a disable needs no journal: the consumer's claim filters the session).
+      selfhost: { identityOf: (request) => verified.get(request), reEnableRefusedByLedger: sessionSelection },
     },
   });
   if (options.startConsumer !== false) consumer.start();
@@ -193,7 +203,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     close: async () => { await consumer.stop(); await parts.close(); },
     admissionMode: admission.mode,
     admission: () => consumer.status(),
-    routes: SELFHOST_ADMISSION_ROUTES,
+    routes: Object.freeze({ ...routes, [SELFHOST_ADMISSION_STATUS_PATH]: "GET" as const }),
   };
 }
 
@@ -442,7 +452,7 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
           await drainSmallBody(req);
           return sendJson(req, res, 401, envelope("refresh_not_supported", "this session cannot be refreshed; sign in again", correlationId), { "www-authenticate": "Bearer", "x-correlation-id": correlationId });
         }
-        const method = (runtime.routes ?? SELFHOST_INGEST_ROUTES)[path];
+        const method = runtime.routes[path];
         if (!method) {
           if (path.startsWith("/v1/"))
             return sendJson(req, res, 501, envelope("unsupported_by_backend", "this route is not served by the self-host session ingest", correlationId, { reason: "route_not_served_selfhost" }), { "x-correlation-id": correlationId });
