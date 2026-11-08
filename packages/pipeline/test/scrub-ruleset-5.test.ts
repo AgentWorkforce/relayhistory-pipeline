@@ -21,6 +21,12 @@
  *    secret context, so a string below it was kept unless its own key was a secret name.
  *    The context now runs through every descendant, in `scrubJson` and the raw-chunk
  *    record-line tokenizer alike.
+ * 5. Escaped line separators in an `op://` value (exact-head review of ff5fc268). A value
+ *    starting `op://` was kept unless it held a literal line separator, so one that held
+ *    it as an escape sequence (`op://vault/item\nSECRETTAIL`, the two characters `\` and
+ *    `n`, in nested or escaped JSON) was kept tail and all, in `scrubText`, `scrubJson`
+ *    and `scrubRecords`. Only a complete one-line reference (`OP_REFERENCE`, the whole
+ *    value) is kept now; any other value starting `op://` is redacted whole.
  *
  * Every value here is synthetic; `SECRETTAIL`/`SECRETTAILMARK` mark the bytes that must
  * not survive.
@@ -31,6 +37,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_QUOTED_VALUE,
   MAX_SCRUB_CHARS,
+  OP_REFERENCE,
   scrubJson,
   scrubRecord,
   scrubText,
@@ -385,4 +392,114 @@ describe("rule set 5: secret context runs through composite values (blocker 2)",
     const line = `${JSON.stringify({ password: { a: ["x"] }, after: "kept", list: [{ b: "kept" }] })}\n${JSON.stringify({ c: "kept" })}\n`;
     expect(records(line)).toBe(`${JSON.stringify({ password: { a: [R] }, after: "kept", list: [{ b: "kept" }] })}\n${JSON.stringify({ c: "kept" })}\n`);
   });
+});
+
+describe("rule set 5: only a strict one-line op:// reference is kept (escaped separators)", () => {
+  /** The quote that opens a value at JSON escaping depth `d`: 2^d - 1 backslashes, then `"`. */
+  const q = (d: number) => `${"\\".repeat(2 ** d - 1)}"`;
+  /** `body` as the value of `api_key`, `d` levels deep in `{"content":"…"}` strings; `eoi` drops every closing quote and brace. */
+  const doc = (d: number, body: string, eoi: boolean) => {
+    let inner = `{${q(d)}api_key${q(d)}:${q(d)}${body}${eoi ? "" : `${q(d)}}`}`;
+    for (let k = d - 1; k >= 0; k -= 1) inner = `{${q(k)}content${q(k)}:${q(k)}${inner}${eoi ? "" : `${q(k)}}`}`;
+    return inner;
+  };
+  /** An escape sequence written at depth `d`: each backslash doubled `d` times. */
+  const at = (d: number, esc: string) => esc.replace(/\\/g, "\\".repeat(2 ** d));
+  /** Long input for scrubLong: plain lines past the scrub bound, then the document. */
+  const PAD = `${"lorem ipsum dolor sit amet\n".repeat(Math.ceil(MAX_SCRUB_CHARS / 27) + 10)}`;
+  const parses = (t: string) => {
+    try {
+      JSON.parse(t);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /** One document through scrubText, scrubLong, scrubJson, scrubRecord and scrubRecords. */
+  const allPaths = (text: string, expected: string) => {
+    expect(scrubText(text)).toBe(expected);
+    expect(scrubLong(text)).toBe(expected);
+    const long = scrubLong(PAD + text);
+    expect(long.length).toBeLessThan(PAD.length + text.length + 1);
+    expect(long).toBe(PAD + expected);
+    expect(scrubJson({ content: text })).toEqual({ content: expected });
+    expect(scrubRecord({ trace: { content: text } })).toEqual({ trace: { content: expected } });
+    const record = { type: "user", message: { content: [{ type: "tool_result", content: text }] } };
+    expect(records(`${JSON.stringify(record)}\n`)).toBe(
+      `${JSON.stringify({ ...record, message: { content: [{ type: "tool_result", content: expected }] } })}\n`,
+    );
+    if (parses(text) && parses(expected)) {
+      expect(scrubJson(JSON.parse(text))).toEqual(JSON.parse(expected));
+      expect(records(`${text}\n`)).toBe(`${JSON.stringify(JSON.parse(expected))}\n`);
+    }
+    if (expected !== text) {
+      const outs = [scrubText(text), long, records(`${text}\n`), records(`${JSON.stringify(record)}\n`)];
+      outs.push(JSON.stringify(scrubJson({ content: text })), JSON.stringify(scrubRecord({ trace: { content: text } })));
+      for (const out of outs) expect(out).not.toContain("SECRETTAIL");
+    }
+  };
+  /** The key-context path: the decoded value under a secret key, in every record function. */
+  const keyed = (value: string, kept: boolean) => {
+    const out = kept ? value : R;
+    expect(scrubJson({ api_key: value })).toEqual({ api_key: out });
+    expect(scrubRecord({ trace: { api_key: value } })).toEqual({ trace: { api_key: out } });
+    expect(records(`${JSON.stringify({ api_key: value })}\n`)).toBe(`${JSON.stringify({ api_key: out })}\n`);
+    expect(scrubText(`"api_key": "${value}"`)).toBe(`"api_key": "${out}"`);
+    expect(scrubLong(`${PAD}"api_key": "${value}"`)).toBe(`${PAD}"api_key": "${out}"`);
+  };
+
+  const separators: Array<[string, string, string]> = [
+    ["LF", "\n", "\\n"],
+    ["CR", "\r", "\\r"],
+    ["CRLF", "\r\n", "\\r\\n"],
+    ["U+2028", " ", "\\u2028"],
+    ["U+2029", " ", "\\u2029"],
+    ["U+0085", "\u0085", "\\u0085"],
+  ];
+  // [label, body at depth d]: every one must be redacted whole.
+  const nonconforming: Array<[string, (d: number) => string]> = [];
+  for (const [name, literal, esc] of separators) {
+    nonconforming.push([`a literal ${name}`, () => `op://vault/item${literal}SECRETTAIL`]);
+    nonconforming.push([`an encoded ${name} (${esc})`, (d) => `op://vault/item${at(d, esc)}SECRETTAIL`]);
+  }
+  // An inner (escaped) quote at depth d has 2^(d+1) - 1 backslashes; an escaped backslash 2^(d+1).
+  nonconforming.push(["an escaped quote", (d) => `op://vault/item${"\\".repeat(2 ** (d + 1) - 1)}"SECRETTAIL`]);
+  nonconforming.push(["an escaped backslash", (d) => `op://vault/item${"\\".repeat(2 ** (d + 1))}SECRETTAIL`]);
+  nonconforming.push(["a double space", () => "op://vault/item  SECRETTAIL"]);
+  nonconforming.push(["a tab", () => "op://vault/item\tSECRETTAIL"]);
+  nonconforming.push(["a trailing space", () => "op://vault/item SECRETTAIL "]);
+  nonconforming.push(["no item segment", () => "op://SECRETTAIL"]);
+
+  for (const [label, body] of nonconforming) {
+    for (const d of [0, 1, 2]) {
+      for (const eoi of [false, true]) {
+        it(`redacts an op:// value with ${label}, depth ${d}, ${eoi ? "EOI" : "terminated"}, in every path`, () => {
+          allPaths(doc(d, body(d), eoi), doc(d, R, eoi));
+        });
+      }
+    }
+  }
+
+  // The decoded value under a secret key (scrubJson, scrubRecord, scrubRecords), literal and encoded.
+  for (const [name, literal, esc] of separators) {
+    for (const [form, value] of [["literal", `op://vault/item${literal}SECRETTAIL`], ["encoded", `op://vault/item${esc}SECRETTAIL`]]) {
+      it(`key context: redacts a ${form} ${name} op:// value in every path`, () => keyed(value as string, false));
+    }
+  }
+  for (const [label, value] of [
+    ["an escaped quote", 'op://vault/item\\"SECRETTAIL'],
+    ["a backslash", "op://vault/item\\SECRETTAIL"],
+    ["a double space", "op://vault/item  SECRETTAIL"],
+  ]) {
+    it(`key context: redacts an op:// value with ${label} in every path`, () => keyed(value as string, false));
+  }
+
+  for (const ref of ["op://vault/item/field", "op://Engineering/cloudflare/credential", "op://My Vault/item name/field"]) {
+    it(`keeps ${ref} byte for byte at depths 0, 1, 2 (terminated) and under a secret key, in every path`, () => {
+      expect(OP_REFERENCE.test(ref)).toBe(true);
+      for (const d of [0, 1, 2]) allPaths(doc(d, ref, false), doc(d, ref, false));
+      keyed(ref, true);
+    });
+  }
 });

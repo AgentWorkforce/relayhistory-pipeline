@@ -11,6 +11,9 @@
  *   over-bound value, a quoted secret value within the bound that holds a line break, or
  *   one with no matching close (`unsplittableQuotedValueSpans` with `prefix: true`): rule
  *   set 5 redacts those whole, where rule set 4 stopped at the first line's whitespace.
+ *   It also differs where a quoted secret value starts with `op://` but is not a strict
+ *   one-line reference (`OP_REFERENCE`): rule set 5 redacts it whole where rule set 4
+ *   kept it, so output must then equal rule set 4's with `op://` neutralised.
  * - Records: random `scrubJson` objects, objects and arrays nested under secret keys
  *   included. With no secret key at any depth output must be byte-identical; with secret
  *   keys, only the values below them may differ.
@@ -70,6 +73,8 @@ function markers() {
 }
 
 const CAPY = "capy_" + "Ab1".repeat(12);
+/** Stands in for `op://` (same length, so no bound moves) when rule set 4 must not keep an `op://` value. */
+const OP_NEUTRAL = "op:~~";
 
 describe("rule set 4 vs 5 (differential fuzz)", () => {
   it("runs against the frozen rule set 4 source", () => {
@@ -96,6 +101,7 @@ describe("rule set 4 vs 5 (differential fuzz)", () => {
     let multiLine = 0;
     let multiLineDiffer = 0;
     let shrinkCases = 0;
+    let opDiffer = 0;
     for (let k = 0; k < INPUTS; k += 1) {
       const mk = markers();
       const filler = (n: number) => {
@@ -152,15 +158,25 @@ describe("rule set 4 vs 5 (differential fuzz)", () => {
         multiLineDiffer += 1;
         continue;
       }
+      // Rule set 5 keeps only a strict one-line `op://` reference (`OP_REFERENCE`); rule
+      // set 4 kept any value starting `op://`. No atom here holds a `/` past `op://`, so no
+      // generated value is a strict reference and every quoted `op://` value is redacted
+      // whole: exactly rule set 4's output for the same text with `op://` neutralised (so
+      // rule set 4 redacts those values as ordinary ones), mapped back.
+      if (text.includes("op://") && b === v4(text.replaceAll("op://", OP_NEUTRAL)).replaceAll(OP_NEUTRAL, "op://")) {
+        opDiffer += 1;
+        continue;
+      }
       unexpected += 1;
-      if (!first) first = `input ${k} (seed ${SEED}), ${text.length} units, no over-bound, multi-line or unclosed value`;
+      if (!first) first = `input ${k} (seed ${SEED}), ${text.length} units, no over-bound, multi-line, unclosed or non-strict op:// value`;
     }
-    console.log(`scrub v4/v5 text fuzz: ${INPUTS} inputs, ${shrinkCases} shrinkable over-cap values, ${withSpan} with an over-bound value, ${multiLine} with a multi-line value within the bound, ${differ} differ from rule set 4 (${multiLineDiffer} only by a multi-line or unclosed value), ${unexpected} unexpected, ${leaked} re-emitting a redacted marker`);
+    console.log(`scrub v4/v5 text fuzz: ${INPUTS} inputs, ${shrinkCases} shrinkable over-cap values, ${withSpan} with an over-bound value, ${multiLine} with a multi-line value within the bound, ${differ} differ from rule set 4 (${multiLineDiffer} only by a multi-line or unclosed value, ${opDiffer} only by a non-strict op:// value), ${unexpected} unexpected, ${leaked} re-emitting a redacted marker`);
     expect(unexpected, first).toBe(0);
     expect(leaked, first).toBe(0);
     expect(withSpan).toBeGreaterThan(0);
     expect(multiLine).toBeGreaterThan(0);
     expect(multiLineDiffer).toBeGreaterThan(0);
+    expect(opDiffer).toBeGreaterThan(0);
     expect(differ).toBeGreaterThan(0);
   }, 300_000);
 

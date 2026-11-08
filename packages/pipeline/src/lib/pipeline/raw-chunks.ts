@@ -86,7 +86,7 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  *   keeps key context: `scrubJson`/`scrubRecord` and the record-line tokenizer
  *   (`scrubRecordLine`) redact a non-empty string value under a secret key
  *   (`isSecretKeyName`, at any depth, through arrays) unless it is already
- *   `[REDACTED]` or an `op://` reference, the same keep rule as the text rule;
+ *   `[REDACTED]` or a strict `op://` reference, the same keep rule as the text rule;
  *   version 4 scrubbed each value on its own and stored, say,
  *   `{"password":"plain words"}` as it was. The secret context runs through
  *   every descendant of a secret-keyed value, objects as well as arrays
@@ -96,12 +96,16 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  *   across every line break or, with none, to the end of the input, whatever
  *   its length: version 4 redacted a value within the bound only to its close
  *   on the key's line, else to the next whitespace, and stored its later
- *   lines. A value starting `op://` is kept only on one line. The segmenter
- *   never cuts inside such a multi-line value either
+ *   lines. A value starting `op://` is kept only when the whole value is a
+ *   complete one-line reference (`OP_REFERENCE`: no backslash, so no escaped
+ *   line separator or quote, no quote, control character, tab or double
+ *   space); any other is redacted whole, in the text rule and the record paths
+ *   alike. The segmenter never cuts inside such a multi-line value either
  *   (`unsplittableQuotedValueSpans`). The segmenter pin now also covers
  *   `scrubRecordLine`. Output for input with no secret-keyed record value, no
- *   over-cap quoted value and no quoted secret value left unclosed or open
- *   across a line break is byte-identical to version 4.
+ *   over-cap quoted value, no quoted secret value left unclosed or open across
+ *   a line break, and no quoted secret value that starts with `op://` but is
+ *   not a strict reference is byte-identical to version 4.
  */
 export const SCRUB_RULESET_VERSION = 5;
 

@@ -100,15 +100,24 @@ const NON_SECRET_BARE =
 const isLineBreak = (c: string | undefined) =>
   c === "\n" || c === "\r" || c === "\u2028" || c === "\u2029" || c === "\u0085";
 
-const LINE_BREAK = /[\n\r\u2028\u2029\u0085]/;
+/**
+ * A complete one-line 1Password reference, the whole value: `op://`, then two or more
+ * `/`-separated segments (vault, item, optional section and field), each one or more
+ * runs of ASCII letters, digits, `.`, `_` or `-` joined by single spaces. No backslash,
+ * quote, control character, line separator, escape sequence (`\n`, `\u2028`, …), tab,
+ * double space, or leading or trailing space in a segment.
+ */
+export const OP_REFERENCE =
+  /^op:\/\/[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+)*(?:\/[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+)*)+$/;
 
 /**
- * Values the quoted key/value rule keeps: already redacted, or a 1Password reference.
- * A reference is one line: a value that starts with `op://` and holds a line separator
- * is not one, and is redacted whole (rule set 5), so `op://` cannot carry later lines.
+ * Values the quoted key/value rule keeps: already redacted, or a 1Password reference
+ * (`OP_REFERENCE`, the whole value). Rule set 5 keeps nothing else that starts with
+ * `op://`: such a value is redacted whole. A value that held a line separator as an
+ * escape sequence (a backslash then `n`, `r`, `u2028`, … in nested or escaped JSON) was
+ * kept as a one-line reference before, tail included; a backslash is never part of one.
  */
-const keepQuotedValue = (value: string) =>
-  value === REDACTED || (value.startsWith("op://") && !LINE_BREAK.test(value));
+const keepQuotedValue = (value: string) => value === REDACTED || OP_REFERENCE.test(value);
 
 /** Number of backslashes immediately before `at`. */
 function backslashesBefore(text: string, at: number): number {
@@ -125,7 +134,8 @@ function backslashesBefore(text: string, at: number): number {
  * (`'token' => <generated>`). A quoted value ends at the matching closing quote: a
  * quote escaped once more than the opening one (an inner quote) does not end it, and
  * nor does one preceded by an escaped backslash. JSON literals and numbers are kept, as
- * are values already redacted and (one-line) `op://` references, and an empty value.
+ * are values already redacted, complete one-line `op://` references (`OP_REFERENCE`, the
+ * whole value; any other value starting `op://` is redacted whole), and an empty value.
  *
  * Rule set 5: every quoted value is redacted whole, whatever its length: through its
  * matching closing quote, across every line break (CR, LF, CRLF, U+2028, U+2029,
@@ -832,7 +842,8 @@ export function scrubText(value: string): string {
 /**
  * Whether a string value under a key that names a secret (`isSecretKeyName`) is redacted
  * whole, whatever it holds (rule set 5): every non-empty value but one already redacted or
- * a (one-line) 1Password reference, the values the quoted key/value rule keeps. The record paths
+ * a complete one-line 1Password reference (`OP_REFERENCE`, the whole value), the values
+ * the quoted key/value rule keeps. The record paths
  * (`scrubJson`, and `scrubRecords` in `lib/pipeline/raw-chunks.ts`) scrub each value on
  * its own, apart from its key, so they decide on the key first, as the quoted rule does
  * in text; rule set 4 kept such a value unless it matched a rule by itself.

@@ -61,7 +61,10 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Updated before release (PASS gate blockers 1 and 2: multi-line or unclosed quoted
   // secret values within the bound are redacted whole and never cut inside; secret context
   // runs through composite values, objects as well as arrays).
-  5: "a7e5ecd06e85c7475a7a377549700aba7478bed9bd9fadd55aa6ecccb4b26af5",
+  // Updated before release (exact-head review of ff5fc268: a value starting `op://` is kept
+  // only when the whole value is a strict one-line reference, OP_REFERENCE; one holding an
+  // escaped line separator, a backslash, a quote, a tab or a double space is redacted whole).
+  5: "c00bcc301b9c153a334cde49b9525ff48fd232d6e724cd76882064ab882ebf54",
 };
 
 const read = (rel: string) =>
