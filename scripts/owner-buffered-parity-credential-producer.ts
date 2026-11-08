@@ -8,6 +8,7 @@
  * a terminal or regular file is refused before either credential is acquired.
  *
  * Usage (source-only until Root's post-G4 execution gates pass):
+ *   SUPABASE_PROJECT_REF=<reviewed-target> \
  *   bun run scripts/owner-buffered-parity-credential-producer.ts \
  *     --expect-source-sha <the reviewed merge SHA> | \
  *   bun run scripts/owner-buffered-parity-operator.ts bulk \
@@ -18,6 +19,7 @@
  * remains in process memory and is never logged.
  */
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fstatSync } from "node:fs";
 import {
   CredentialRefusal,
@@ -25,6 +27,7 @@ import {
   refuseCredentialEnv,
 } from "../src/migration/stdin-credentials.ts";
 import { parseCliLogin } from "../src/shared/supabase-cli-login.ts";
+import { requiredSupabaseProjectRef } from "../src/shared/deploy-target.ts";
 
 export const OWNER_PARITY_CREDENTIAL_TARGET = {
   git: "/usr/bin/git",
@@ -37,7 +40,9 @@ export const OWNER_PARITY_CREDENTIAL_TARGET = {
   neonHost: "ep-floral-pond-apkvat38.c-7.us-east-1.aws.neon.tech",
   supabaseCli: "/home/khaliqgant/.local/bin/supabase",
   supabaseCliVersion: "2.122.0",
-  supabaseProject: "pyamkrhoyszgzirqqffq",
+  // Exact production project pin without publishing the project reference in
+  // engine source. The raw value is explicit operator configuration.
+  supabaseProjectSha256: "963aa096d6944d19073ec6e37b2dd5162ed1f014d1743c2d55b508f066f6977c",
   supabaseHost: "aws-0-us-east-1.pooler.supabase.com",
 } as const;
 
@@ -107,6 +112,25 @@ export function requireProducerEnvironment(env: Record<string, string | undefine
     if (env[key] !== undefined) throw new CredentialRefusal(`credential_env_refused.${key}`);
 }
 
+/** Validate explicit operator target configuration against the reviewed hash. */
+export function pinnedSupabaseProjectRef(
+  env: Record<string, string | undefined>,
+  expectedSha256 = OWNER_PARITY_CREDENTIAL_TARGET.supabaseProjectSha256,
+): string {
+  let projectRef: string;
+  try {
+    projectRef = requiredSupabaseProjectRef(env);
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    return refuse(code === "supabase_project_ref_invalid"
+      ? "supabase_project_ref_invalid" : "supabase_project_ref_required");
+  }
+  if (!/^[0-9a-f]{64}$/u.test(expectedSha256) ||
+      createHash("sha256").update(projectRef).digest("hex") !== expectedSha256)
+    refuse("supabase_target_pin");
+  return projectRef;
+}
+
 function decode(value: string, code: string): string {
   try {
     return decodeURIComponent(value);
@@ -155,15 +179,15 @@ export function pinnedNeonReadonlyUrl(raw: string): string {
 }
 
 /** Parse the reviewed CLI reply and rebuild the fixed session-pooler 5432 URL. */
-export function pinnedSupabaseOwnerUrl(raw: string): string {
+export function pinnedSupabaseOwnerUrl(raw: string, projectRef: string): string {
   let login: { password: string };
   try {
-    login = parseCliLogin(raw, OWNER_PARITY_CREDENTIAL_TARGET.supabaseProject);
+    login = parseCliLogin(raw, projectRef);
   } catch {
     return refuse("supabase_cli_reply_refused");
   }
   const pinned = new URL(`postgresql://${OWNER_PARITY_CREDENTIAL_TARGET.supabaseHost}:5432/postgres`);
-  pinned.username = `cli_login_postgres.${OWNER_PARITY_CREDENTIAL_TARGET.supabaseProject}`;
+  pinned.username = `cli_login_postgres.${projectRef}`;
   pinned.password = login.password;
   login.password = "";
   pinned.searchParams.set("sslmode", "verify-full");
@@ -323,9 +347,11 @@ export async function ownerParityCredentialDocument(
   env: Record<string, string | undefined> = process.env,
   output: OutputStat = fstatSync(1),
   signal?: AbortSignal,
+  expectedSupabaseProjectSha256 = OWNER_PARITY_CREDENTIAL_TARGET.supabaseProjectSha256,
 ): Promise<string> {
   requireRamOnlyProducerOutput(output);
   requireProducerEnvironment(env);
+  const supabaseProject = pinnedSupabaseProjectRef(env, expectedSupabaseProjectSha256);
   const childEnv = childEnvironment(env);
   await requireProducerCheckout(expectedSourceSha, runner, childEnv, signal);
   if ((await runner({ executable: OWNER_PARITY_CREDENTIAL_TARGET.neonctl, args: ["--version"], env: childEnv }, signal)).trim() !== OWNER_PARITY_CREDENTIAL_TARGET.neonctlVersion)
@@ -349,10 +375,10 @@ export async function ownerParityCredentialDocument(
   neonRaw = "";
   let supabaseRaw = await runner({
     executable: OWNER_PARITY_CREDENTIAL_TARGET.supabaseCli,
-    args: ["db", "dump", "--linked", "--project-ref", OWNER_PARITY_CREDENTIAL_TARGET.supabaseProject, "--dry-run"],
+    args: ["db", "dump", "--linked", "--project-ref", supabaseProject, "--dry-run"],
     env: childEnv,
   }, signal);
-  const supabaseUrl = pinnedSupabaseOwnerUrl(supabaseRaw);
+  const supabaseUrl = pinnedSupabaseOwnerUrl(supabaseRaw, supabaseProject);
   supabaseRaw = "";
   const document = JSON.stringify({ neonUrl, supabaseUrl });
   if (Buffer.byteLength(document) > MAX_STDIN_CREDENTIAL_BYTES) refuse("credential_document_limit");

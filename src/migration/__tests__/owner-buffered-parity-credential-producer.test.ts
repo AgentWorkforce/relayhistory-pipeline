@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   OWNER_PARITY_CREDENTIAL_TARGET as TARGET,
   ownerParityCredentialDocument,
   parseProducerArgs,
   pinnedNeonReadonlyUrl,
+  pinnedSupabaseProjectRef,
   pinnedSupabaseOwnerUrl,
   producerErrorCode,
   requireRamOnlyProducerOutput,
@@ -25,6 +27,9 @@ const outputStat = (kind: "terminal" | "file" | "fifo" | "socket" | "directory" 
   isSocket: () => kind === "socket",
 });
 const SOURCE = "a".repeat(40);
+const REF = "abcdefghijklmnopqrst";
+const TEST_PROJECT_SHA256 = createHash("sha256").update(REF).digest("hex");
+const ENV = { HOME: "/synthetic", PATH: "/bin", SUPABASE_PROJECT_REF: REF };
 const neonUrl = (overrides: Partial<{ role: string; host: string; database: string; query: string; password: string }> = {}) => {
   const role = overrides.role ?? TARGET.neonRole;
   const host = overrides.host ?? TARGET.neonHost;
@@ -37,7 +42,7 @@ const neonUrl = (overrides: Partial<{ role: string; host: string; database: stri
   return url.toString();
 };
 const cliLogin = (password = "synthetic-supabase-password") => [
-  `PGHOST=db.${TARGET.supabaseProject}.supabase.co`,
+  `PGHOST=db.${REF}.supabase.co`,
   "PGPORT=5432",
   "PGUSER=cli_login_postgres",
   `PGPASSWORD=${password}`,
@@ -55,14 +60,14 @@ describe("owner-buffered parity credential producer", () => {
         return command.executable === TARGET.neonctl ? TARGET.neonctlVersion : TARGET.supabaseCliVersion;
       return command.executable === TARGET.neonctl ? JSON.stringify(neonUrl()) : cliLogin();
     };
-    const document = JSON.parse(await ownerParityCredentialDocument(SOURCE, runner, { HOME: "/synthetic", PATH: "/bin" }, PIPE));
+    const document = JSON.parse(await ownerParityCredentialDocument(SOURCE, runner, ENV, PIPE, undefined, TEST_PROJECT_SHA256));
     expect(Object.keys(document).sort()).toEqual(["neonUrl", "supabaseUrl"]);
     const neon = new URL(document.neonUrl);
     expect({ user: decodeURIComponent(neon.username), host: neon.hostname, port: neon.port, db: neon.pathname, mode: neon.searchParams.get("sslmode") })
       .toEqual({ user: TARGET.neonRole, host: TARGET.neonHost, port: "5432", db: `/${TARGET.neonDatabase}`, mode: "verify-full" });
     const supabase = new URL(document.supabaseUrl);
     expect({ user: decodeURIComponent(supabase.username), host: supabase.hostname, port: supabase.port, db: supabase.pathname, mode: supabase.searchParams.get("sslmode") })
-      .toEqual({ user: `cli_login_postgres.${TARGET.supabaseProject}`, host: TARGET.supabaseHost, port: "5432", db: "/postgres", mode: "verify-full" });
+      .toEqual({ user: `cli_login_postgres.${REF}`, host: TARGET.supabaseHost, port: "5432", db: "/postgres", mode: "verify-full" });
     expect(calls.map(({ executable, args }) => [executable, ...args])).toEqual([
       [TARGET.git, "rev-parse", "HEAD"],
       [TARGET.git, "status", "--porcelain"],
@@ -70,9 +75,22 @@ describe("owner-buffered parity credential producer", () => {
       [TARGET.supabaseCli, "--version"],
       [TARGET.neonctl, "connection-string", TARGET.neonBranch, "--project-id", TARGET.neonProject,
         "--role-name", TARGET.neonRole, "--database-name", TARGET.neonDatabase, "--output", "json", "--no-color"],
-      [TARGET.supabaseCli, "db", "dump", "--linked", "--project-ref", TARGET.supabaseProject, "--dry-run"],
+      [TARGET.supabaseCli, "db", "dump", "--linked", "--project-ref", REF, "--dry-run"],
     ]);
     expect(calls.every((call) => Object.keys(call.env).sort().join() === "HOME,PATH")).toBeTrue();
+  });
+
+  test("requires the explicit Supabase target and matches its reviewed digest before any command", async () => {
+    expect(pinnedSupabaseProjectRef(ENV, TEST_PROJECT_SHA256)).toBe(REF);
+    expect(() => pinnedSupabaseProjectRef({}, TEST_PROJECT_SHA256)).toThrow("supabase_project_ref_required");
+    expect(() => pinnedSupabaseProjectRef({ SUPABASE_PROJECT_REF: "bad" }, TEST_PROJECT_SHA256))
+      .toThrow("supabase_project_ref_invalid");
+    expect(() => pinnedSupabaseProjectRef({ SUPABASE_PROJECT_REF: "zyxwvutsrqponmlkjihg" }, TEST_PROJECT_SHA256))
+      .toThrow("supabase_target_pin");
+    let ran = false;
+    await expect(ownerParityCredentialDocument(SOURCE, async () => { ran = true; return ""; }, {}, PIPE, undefined, TEST_PROJECT_SHA256))
+      .rejects.toThrow("supabase_project_ref_required");
+    expect(ran).toBeFalse();
   });
 
   test.each([
@@ -96,13 +114,13 @@ describe("owner-buffered parity credential producer", () => {
       if (command.args[0] === "rev-parse") return "b".repeat(40);
       return "";
     };
-    await expect(ownerParityCredentialDocument(SOURCE, runner, {}, PIPE))
+    await expect(ownerParityCredentialDocument(SOURCE, runner, ENV, PIPE, undefined, TEST_PROJECT_SHA256))
       .rejects.toThrow("producer_checkout_pin_mismatch");
     expect(calls).toEqual(["rev-parse HEAD", "status --porcelain"]);
   });
 
   test("refuses a Supabase CLI reply outside the exact direct-login tuple", () => {
-    expect(() => pinnedSupabaseOwnerUrl(cliLogin().replace("PGPORT=5432", "PGPORT=6543")))
+    expect(() => pinnedSupabaseOwnerUrl(cliLogin().replace("PGPORT=5432", "PGPORT=6543"), REF))
       .toThrow("supabase_cli_reply_refused");
   });
 
@@ -114,13 +132,13 @@ describe("owner-buffered parity credential producer", () => {
     [outputStat("unknown"), "producer_stdout_not_pipe_or_socket"],
   ])("refuses a persistent or visible output before any credential command", async (output, code) => {
     let ran = false;
-    await expect(ownerParityCredentialDocument(SOURCE, async () => { ran = true; return ""; }, {}, output)).rejects.toThrow(code);
+    await expect(ownerParityCredentialDocument(SOURCE, async () => { ran = true; return ""; }, ENV, output, undefined, TEST_PROJECT_SHA256)).rejects.toThrow(code);
     expect(ran).toBeFalse();
   });
 
   test("refuses credential-bearing environment state before any command", async () => {
     let ran = false;
-    await expect(ownerParityCredentialDocument(SOURCE, async () => { ran = true; return ""; }, { NEON_API_KEY: "not-logged" }, PIPE))
+    await expect(ownerParityCredentialDocument(SOURCE, async () => { ran = true; return ""; }, { ...ENV, NEON_API_KEY: "not-logged" }, PIPE, undefined, TEST_PROJECT_SHA256))
       .rejects.toThrow("credential_env_refused.NEON_API_KEY");
     expect(ran).toBeFalse();
   });
@@ -132,7 +150,7 @@ describe("owner-buffered parity credential producer", () => {
       if (command === 1) return SOURCE;
       if (command === 2) return "";
       return "4.17.0";
-    }, {}, PIPE)).rejects.toThrow("neonctl_version");
+    }, ENV, PIPE, undefined, TEST_PROJECT_SHA256)).rejects.toThrow("neonctl_version");
     expect(producerErrorCode(new Error("private child stderr"))).toBe("credential_producer_failed");
   });
 
@@ -146,7 +164,7 @@ describe("owner-buffered parity credential producer", () => {
       if (command === 4) return TARGET.supabaseCliVersion;
       if (command === 5) return JSON.stringify(neonUrl({ password: "n".repeat(40_000) }));
       return cliLogin("s".repeat(30_000));
-    }, {}, PIPE)).rejects.toThrow("credential_document_limit");
+    }, ENV, PIPE, undefined, TEST_PROJECT_SHA256)).rejects.toThrow("credential_document_limit");
   });
 
   test("supervised runner enforces a hard wall and kills a stubborn process group", async () => {
