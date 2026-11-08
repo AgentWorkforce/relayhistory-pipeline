@@ -1093,14 +1093,14 @@ export function transcriptLifecycleRules(options: { admissionInbox?: boolean } =
 }
 
 /** The async-ingest inbox prefix (src/session-ingest/async-admission.ts INBOX_NAMESPACE): never a tenant root. */
-export const ADMISSION_INBOX_PREFIX = `${TENANT_KEY_BASE}/admission-inbox/`;
+export const ADMISSION_INBOX_PREFIX = `${TENANT_KEY_BASE}/.admission-inbox/`;
 /** Expiration days for the inbox's current versions; the bucket-wide noncurrent rule then purges them. */
 export const ADMISSION_INBOX_EXPIRATION_DAYS = 7;
 /**
  * Bounds an async-ingest inbox object whose admission message was lost past the DLQ (admitted or
  * refused inboxes are tombstoned by the consumer and purged as noncurrent versions within 48 h).
- * The prefix is the dedicated inbox namespace only: tenant data lives under `96bulls/<org>/`, and the
- * ingest refuses an org named `admission-inbox`.
+ * The prefix is the dedicated inbox namespace only: tenant data lives under `96bulls/<org>/`, and no org
+ * id may start with "." (tenants.ts ORG_RE, writer.ts assertTenantSegment), so `.admission-inbox` is never an org.
  */
 export const ADMISSION_INBOX_LIFECYCLE_RULE = {
   ID: "expire-admission-inbox",

@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 import { formatDeclaredPropertyYaml } from "alchemy/Cli/PropertyDiff";
 import { validateAwsInputs, type AwsInputs } from "../inputs.ts";
 import { SESSION_PIPELINE_RESOURCES } from "../session-pipeline.ts";
+import { resolveTenantOrgs } from "../tenants.ts";
+import { assertTenantSegment } from "../../../src/session-ingest/writer.ts";
 import {
   ADMISSION_INBOX_LIFECYCLE_RULE,
   ADMISSION_INBOX_PREFIX,
@@ -37,18 +39,30 @@ describe("admission inbox lifecycle rule", () => {
     const rules = transcriptLifecycleRules({ admissionInbox: true });
     expect(JSON.stringify(rules.slice(0, 3))).toBe(JSON.stringify(TODAY));
     expect(rules).toHaveLength(4);
-    expect(rules[3]).toEqual({ ID: "expire-admission-inbox", Status: "Enabled", Filter: { Prefix: "96bulls/admission-inbox/" }, Expiration: { Days: 7 } });
+    expect(rules[3]).toEqual({ ID: "expire-admission-inbox", Status: "Enabled", Filter: { Prefix: "96bulls/.admission-inbox/" }, Expiration: { Days: 7 } });
     const noncurrent = rules.find((r) => "NoncurrentVersionExpiration" in r)! as { NoncurrentVersionExpiration: { NoncurrentDays: number } };
     expect((noncurrent.NoncurrentVersionExpiration.NoncurrentDays + 1) * 24).toBeLessThanOrEqual(ERASURE_SLA_HOURS);
   });
 
   it("can never match tenant data: the prefix is exactly the dedicated inbox namespace", () => {
-    expect(ADMISSION_INBOX_PREFIX).toBe("96bulls/admission-inbox/");
+    expect(ADMISSION_INBOX_PREFIX).toBe("96bulls/.admission-inbox/");
     expect(ADMISSION_INBOX_LIFECYCLE_RULE.Filter.Prefix).toBe(ADMISSION_INBOX_PREFIX);
     for (const tenantKey of ["96bulls/org-a/v1/ws=w/m=srv_x/h=claude/d=2026/11/08/s=s/manifest.json", "96bulls/org-a/buffered-batches/v1/ws=w/m=srv_x/b=1.staged.ndjson.zst", "96bulls/org-a/live-batches/v1/x"])
       expect(tenantKey.startsWith(ADMISSION_INBOX_PREFIX)).toBe(false);
-    expect("96bulls/admission-inbox/org-a/v1/ws=w/m=srv_x/r=ab/a=1-0.ndjson.zst".startsWith(ADMISSION_INBOX_PREFIX)).toBe(true);
+    expect("96bulls/.admission-inbox/org-a/v1/ws=w/m=srv_x/r=ab/a=1-0.ndjson.zst".startsWith(ADMISSION_INBOX_PREFIX)).toBe(true);
     expect(["", "96bulls", "96bulls/"]).not.toContain(ADMISSION_INBOX_LIFECYCLE_RULE.Filter.Prefix);
+  });
+
+  it("cannot equal any 96bulls/<org>/ for an org id either the stack or the ingest accepts", () => {
+    const segment = ADMISSION_INBOX_PREFIX.split("/")[1]!;
+    expect(ADMISSION_INBOX_PREFIX.split("/")).toEqual(["96bulls", ".admission-inbox", ""]);
+    expect(segment.startsWith(".")).toBe(true);
+    // The stack's ORG_RE (tenants.ts) and the ingest's tenant segment check (writer.ts) both refuse it.
+    expect(() => resolveTenantOrgs({ tenantOrgIds: [segment] })).toThrow(/not a valid org id/);
+    expect(() => assertTenantSegment("96bulls", segment)).toThrow();
+    // The undotted name IS a valid org id: the reason the root carries the dot.
+    expect(() => resolveTenantOrgs({ tenantOrgIds: ["admission-inbox"] })).not.toThrow();
+    expect(() => assertTenantSegment("96bulls", "admission-inbox")).not.toThrow();
   });
 });
 
