@@ -1,6 +1,6 @@
 /**
  * Opt-in OWNED PostgreSQL (SESSION_INGEST_TEST_PG_URL, loopback fixture only): two-connection proof of
- * 20261105043920. The self-host erase takes the user's fence lock before reading ownership, so a claim holding
+ * 20261105044010. The self-host erase takes the user's fence lock before reading ownership, so a claim holding
  * that lock finishes first and the origin it adds is erased with the rest. PGlite has one connection and cannot
  * show this.
  */
@@ -23,7 +23,7 @@ const SESSION = "sess-lock";
 const { orgId, workspaceId, userId } = TENANT;
 const machine = (origin: string) => liveMachineId(workspaceId, origin, userId);
 
-describe.skipIf(!url)("043920 self-host erase takes the fence lock (owned PostgreSQL)", () => {
+describe.skipIf(!url)("044010 self-host erase takes the fence lock (owned PostgreSQL)", () => {
   let admin: pg.Client, pool: pg.Pool, name: string;
   beforeAll(async () => {
     admin = new pg.Client({ connectionString: url });
