@@ -173,7 +173,8 @@ describe("consumer service config", () => {
     const secret = JSON.stringify({ hoopdb_url: "postgresql://o@h/db", clickhouse: { url: "http://ch", user: "u", password: "p", database: "d" } });
     expect(() => parseConsumerSecret(secret)).toThrow("must not carry a clickhouse block");
   });
-  test("only the postgres backend is accepted", () => {
+  test("only the postgres and opensearch backends are accepted", () => {
+    expect(consumerServiceConfig(env({ SEARCH_INDEX_BACKEND: "opensearch" }))).toMatchObject({ enabled: true, searchBackend: "opensearch" });
     expect(() => consumerServiceConfig(env({ SEARCH_INDEX_BACKEND: undefined }))).toThrow(
       "SEARCH_INDEX_BACKEND must be postgres",
     );
@@ -1383,6 +1384,31 @@ describe("tombstone backstop and freshness (PGlite, real partials, real migratio
       // Steady state: quiet.
       const clean = await reconcileTombstonedScopes(db, runner, "test-backend", "96bulls/o", 1000, async () => {});
       expect(clean).toMatchObject({ tombstoned: 0, overflow: false });
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("opensearch: no state row re-sends, an erased residue stays retained and quiet", async () => {
+    const { pg, db, runner } = await fixture();
+    try {
+      await pg.exec(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id,deleted_at)
+        VALUES('o','w','h','s','m','u',now(),now(),'s3','b','96bulls/o/manifest.json','00000000-0000-0000-0000-000000000000',now());`);
+      const writer = postgresSearchState({ backendId: "test-backend", fromMs: 0 });
+      const sent: string[] = [];
+      const first = await reconcileTombstonedScopes(db, runner, "test-backend", "96bulls/o", 1000, async (b) => {
+        sent.push(b);
+      }, false);
+      expect(first).toMatchObject({ tombstoned: 1, overflow: false });
+      expect(sent).toEqual([JSON.stringify({ reconcile: { key: "96bulls/o/manifest.json" } })]);
+      await writer.record(asDb(pg), { orgId: "o", workspaceId: "w", harness: "h", sessionId: "s" },
+        { revision: 1, rows: 0, complete: true, at: new Date(), canonicalSessionId: "s" });
+      const after = await reconcileTombstonedScopes(db, runner, "test-backend", "96bulls/o", 1000, async () => {
+        throw new Error("nothing should be re-sent");
+      }, false);
+      expect(after).toMatchObject({ tombstoned: 0, overflow: false });
+      const remaining = await pg.query(`SELECT count(*)::int AS n FROM search_index.projection_state`);
+      expect(remaining.rows[0]).toMatchObject({ n: 1 });
     } finally {
       await pg.close();
     }

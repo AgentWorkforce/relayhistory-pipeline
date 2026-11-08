@@ -1,0 +1,102 @@
+name: opensearch-proof
+# Real OpenSearch 2 and Elasticsearch 8 (disposable single-node containers, security
+# off, no credential anywhere, no hosted service): the shared SearchIndexAdapter
+# conformance suite against the opensearch backend in each dialect, then the in-process
+# upload -> scrub -> index -> search -> erase proof (scripts/opensearch-proof/e2e.ts).
+# Each run uploads a machine-verifiable JSON (head SHA, server, each case) and its log.
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real-search-server:
+    name: real ${{ matrix.dialect }} (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dialect: opensearch
+            image: opensearchproject/opensearch:2.17.1
+            # The OpenSearch entrypoint maps dotted env names to settings.
+            env: >-
+              -e discovery.type=single-node
+              -e DISABLE_SECURITY_PLUGIN=true
+              -e DISABLE_INSTALL_DEMO_CONFIG=true
+              -e cluster.routing.allocation.disk.threshold_enabled=false
+              -e OPENSEARCH_JAVA_OPTS=-Xms1g\ -Xmx1g
+          - dialect: elasticsearch
+            image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+            env: >-
+              -e discovery.type=single-node
+              -e xpack.security.enabled=false
+              -e cluster.routing.allocation.disk.threshold_enabled=false
+              -e ES_JAVA_OPTS=-Xms1g\ -Xmx1g
+    steps:
+      # The literal PR head commit, not the synthetic merge ref, as in ci.yml.
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED), ${{ matrix.dialect }} ${{ matrix.image }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      # docker run rather than a service container: the two images read different
+      # dotted env names, and a service's env cannot vary its keys per matrix entry.
+      - name: Start the disposable server (loopback only)
+        run: |
+          docker run -d --name search -p 127.0.0.1:9200:9200 ${{ matrix.env }} "${{ matrix.image }}"
+          for i in $(seq 1 90); do
+            if curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null 2>&1; then
+              curl -fsS http://127.0.0.1:9200/ | jq -r '"server: \(.version.distribution // "elasticsearch") \(.version.number)"' | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs --tail 200 search
+          exit 1
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: SearchIndexAdapter conformance (opensearch backend, ${{ matrix.dialect }} dialect, real server)
+        env:
+          SEARCH_INDEX_OPENSEARCH_TEST_URL: http://127.0.0.1:9200
+          SEARCH_INDEX_OPENSEARCH_TEST_DIALECT: ${{ matrix.dialect }}
+        run: |
+          set -o pipefail
+          bun run --filter @96bulls/pipeline test test/search-index-opensearch-real.test.ts 2>&1 | tee conformance-${{ matrix.dialect }}.log
+      - name: End-to-end proof (upload, scrub, index, search, erase)
+        env:
+          SEARCH_INDEX_OPENSEARCH_TEST_URL: http://127.0.0.1:9200
+          SEARCH_INDEX_OPENSEARCH_TEST_DIALECT: ${{ matrix.dialect }}
+          OPENSEARCH_PROOF_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          OPENSEARCH_PROOF_OUT: opensearch-proof-${{ matrix.dialect }}.json
+        run: |
+          set -o pipefail
+          bun scripts/opensearch-proof/e2e.ts 2>&1 | tee opensearch-proof-${{ matrix.dialect }}.log
+      - name: Check the results file names this head and this dialect
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          f=opensearch-proof-${{ matrix.dialect }}.json
+          jq -e --arg head "$EXPECTED" --arg dialect "${{ matrix.dialect }}" \
+            '.head == $head and .dialect == $dialect and .distribution == $dialect and .failed == 0 and .passed == 19 and (.cases | all(.pass))' "$f"
+          jq -r '"\(.passed) passed, \(.failed) failed on \(.distribution) \(.server_version) at \(.head)"' "$f" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Server log on failure
+        if: failure()
+        run: docker logs --tail 300 search
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opensearch-proof-${{ matrix.dialect }}
+          path: |
+            opensearch-proof-${{ matrix.dialect }}.json
+            opensearch-proof-${{ matrix.dialect }}.log
+            conformance-${{ matrix.dialect }}.log
