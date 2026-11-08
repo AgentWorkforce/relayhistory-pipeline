@@ -255,6 +255,19 @@ update). For an immediate stop, run
 `aws events disable-rule --name 96bulls-aws-sessions-prod-session-brief`.
 Then reconcile the inputs, since the next capture would show the drift.
 
+## Buffered search feed
+
+The stack defines a one-minute EventBridge rule for the buffered search feed. It stays DISABLED, and neither
+feed variable is set, until `transcriptStore.sessionPipeline.bufferedSearchFeed` is
+`{ enabled: true, gateDeclared: "buffered-search-gate/v1" }` with `searchIndex: true`. `gateDeclared` is an
+operator's assertion that the read Worker is already deployed and verified with the gate on; the deployment
+does not prove it. No credential is wired here: the feeder reads `buffered_search_feed_database_url` and
+`buffered_search_feed_database_ca_pem` from the pipeline secret and stays off without a valid login.
+
+Rolling out this rule alone creates only the DISABLED schedule and its permission. Arming it is a production
+step that needs Khaliq's explicit OK and follows the buffered search activation order: ClickHouse columns,
+read gate verified, then feeder. Do not arm it before the later-erasure delete lane for ClickHouse exists.
+
 ## Repo tag rename (one time, before the read API rollout)
 
 3f8494c renamed the repository, so the stack-wide tag `96bulls:repo` changes

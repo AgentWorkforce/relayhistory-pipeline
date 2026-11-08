@@ -111,7 +111,7 @@ function asSql(client: pg.PoolClient): {
  * genuine. Mirrors the labelled seam in
  * buffered-feed-login.postgres.test.ts.
  */
-function asSeamedSql(client: pg.PoolClient, systemUser: string | null = "SCRAM-SHA-256/search_consumer_runtime"): {
+function asSeamedSql(client: pg.PoolClient, systemUser: string | null = "SCRAM-SHA-256:search_consumer_runtime"): {
   query: <R>(text: string, params?: unknown[]) => Promise<{ rows: R[] }>;
 } {
   const inner = asSql(client);

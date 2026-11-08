@@ -236,8 +236,11 @@ export async function enqueueAdmission(target: AsyncAdmissionTarget, tenant: Led
 
 // ---- privacy journal ----
 //
-// One object per (org, workspace, user). `seq` only ever grows; it counts the user's resets and
-// re-enables that applied (or may have applied). A control first records itself `pending` (before
+// One object per (org, workspace, user). `seq` is a monotonic privacy-transition watermark: it only
+// ever grows, and it grows after every reset / re-enable that applied (or may have applied), but it is
+// NOT a count of them: settlements of the same or contiguous versions can coalesce into one step
+// (a completed version subsumes lower ones). The gate needs only "seq moved since the witness". A
+// control first records itself `pending` (before
 // its SQL); after the SQL it completes (pending removed, seq + 1) or aborts (it definitely did not
 // apply). An upload witnesses `seq` BEFORE its body is read; the consumer, after its claim, waits
 // while a control is pending and refuses when `seq` has grown since.
@@ -355,8 +358,8 @@ export async function settlePrivacyControl(store: ObjectStore, keyRoot: string, 
   const id = idOf(control);
   await editJournal(store, keyRoot, tenant, (j) => {
     // Decided on the CURRENT journal, not on what this request saw at begin: several requests can
-    // carry the same (epoch, version) (a retry while the first is still in flight), and seq must
-    // advance once per logical control, whichever settles first.
+    // carry the same (epoch, version) (a retry while the first is still in flight), and the watermark
+    // must move at most once for it, whichever settles first.
     const wasPending = j.pending.some((p) => p.id === id), wasAmbiguous = j.ambiguous.includes(id);
     // At or below the completed maximum: already counted, by this control's own earlier settler or by a
     // higher version (which proves this one applied before it). Never count it again; just drop any

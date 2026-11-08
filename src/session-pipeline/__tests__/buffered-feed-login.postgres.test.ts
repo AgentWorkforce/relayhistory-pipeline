@@ -59,6 +59,8 @@ const profile: MigrationProfile = { mode: "local", shim: true, bootstrap: true, 
 const READ = "bulls96_read_api";
 const GATE_NAME = "upstream:20261105043860_buffered_search_gate.sql";
 const FEED_NAME = "upstream:20261105043870_buffered_search_feed_cursor.sql";
+const BK_NAME = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
+const CG_NAME = "upstream:20261105043900_session_consumer_function_grants.sql";
 const FEED_FNS = ["sessions.buffered_search_feed_advance(jsonb)", "sessions.buffered_search_feed_page(jsonb)", "sessions.buffered_search_feed_stage(jsonb)"];
 const GATE_FN = "sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)";
 const FEED_GUARD = "buffered search feed: caller is not the buffered_search_feed_runtime login";
@@ -229,7 +231,7 @@ describe.skipIf(!fixtureUrl)("buffered search gate/feed migrations and the feede
     }
   }, 60000);
 
-  test("(a) 043860 and 043870 apply via runMigrations; 043870 rolls back before 043860; up again", async () => {
+  test("(a) 043860 and 043870 apply via runMigrations; later steps, then 043870, roll back before 043860; up again", async () => {
     const before = await ledger();
     expect(before).toEqual(expect.arrayContaining([GATE_NAME, FEED_NAME]));
     expect(await validationsPass()).toBe(true);
@@ -245,6 +247,8 @@ describe.skipIf(!fixtureUrl)("buffered search gate/feed migrations and the feede
       return file;
     };
     const laterFiles = later.map(downFile);
+    // The known order, documented: 043880 and 043900 are the steps after 043870 here.
+    expect(later).toEqual(expect.arrayContaining([BK_NAME, CG_NAME]));
     for (const [i, step] of later.entries()) {
       expect([step, await down(laterFiles[i]!)]).toEqual([step, { code: "accepted" }]);
       expect(await ledger()).not.toContain(step);
@@ -279,7 +283,8 @@ describe.skipIf(!fixtureUrl)("buffered search gate/feed migrations and the feede
     expect(await gateFn()).toBeNull();
     expect(sorted(await ledger())).toEqual(sorted(before.filter((n) => n !== GATE_NAME && n !== FEED_NAME && !later.includes(n))));
 
-    // Up again: both reapply through the migrator (prerequisites already present), verify passes, ACL restored.
+    // Up again: 043860, 043870 and every later step reapply through the migrator (prerequisites already present),
+    // the ledger equals before, verify passes, ACL restored.
     await migrate();
     expect(sorted(await ledger())).toEqual(sorted(before));
     expect(await validationsPass()).toBe(true);

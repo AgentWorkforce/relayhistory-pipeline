@@ -105,7 +105,7 @@ const asDb = (pg: PGlite): SqlExecutor => ({
  * buffered-feed-login.postgres.test.ts. The real (unseamed) signals are
  * covered by session-consumer-writer.postgres.test.ts on real Postgres.
  */
-const asIdentityDb = (pg: PGlite, backendUser = CONSUMER_RUNTIME_ROLE, systemUser: string | null = `SCRAM-SHA-256/${CONSUMER_RUNTIME_ROLE}`): SqlExecutor => {
+const asIdentityDb = (pg: PGlite, backendUser = CONSUMER_RUNTIME_ROLE, systemUser: string | null = `SCRAM-SHA-256:${CONSUMER_RUNTIME_ROLE}`): SqlExecutor => {
   const inner = asDb(pg);
   return {
     query: async <R>(text: string, params?: unknown[]): Promise<{ rows: R[] }> => {
@@ -980,8 +980,10 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       consumerLoginRefusalMessage("backend_user"),
       consumerLoginRefusalMessage("system_user"),
     ]) {
-      expect(message).not.toContain("search_consumer_runtime");
-      expect(message).not.toContain("postgres");
+      // Static strings plus the public role constant: no URL, secret or
+      // credential value can appear in a refusal.
+      expect(message).not.toMatch(/:\/\//);
+      expect(message).not.toMatch(/secret|credential|private key/i);
     }
   });
 
@@ -1027,7 +1029,7 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       // and current_user genuine while the backend authenticated as someone
       // else: the seam simulates that backend signal here (real-Postgres
       // coverage lives in session-consumer-writer.postgres.test.ts).
-      const spoofed = asIdentityDb(pg, "postgres", `SCRAM-SHA-256/${CONSUMER_RUNTIME_ROLE}`);
+      const spoofed = asIdentityDb(pg, "postgres", `SCRAM-SHA-256:${CONSUMER_RUNTIME_ROLE}`);
       await expect(assertRuntimeIdentity(spoofed)).rejects.toThrow("foreign authenticated backend identity");
     } finally {
       await pg.close();

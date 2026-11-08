@@ -396,6 +396,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105043850_ingest_acquisition_owner.sql` | table sessions.ingest_acquisition_owners |
 | `upstream:20261105043860_buffered_search_gate.sql` | function sessions.buffered_search_gate_for |
 | `upstream:20261105043870_buffered_search_feed_cursor.sql` | table sessions.buffered_search_feed_cursors (needs the `buffered_search_feed_runtime` role from the role bootstrap: absent fails closed `42704`, elevated/member/unexpected member `55000`) |
+| `upstream:20261105043880_ingest_bookkeeping_cleanup.sql` | table sessions.ingest_bookkeeping_retired_claims + Babysitter register carries the retirement interlock |
 | `upstream:20261105043900_session_consumer_function_grants.sql` | twelve search_consumer_runtime EXECUTEs (composed writer path) |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
