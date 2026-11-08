@@ -1,0 +1,288 @@
+{
+  "version": 1,
+  "status": "G2_WINDOW_VERIFIED_ACCEPTANCE_RESUMED_INTERMITTENT_CLAIM_TIMEOUTS_REMAIN",
+  "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "schemaGeneration": "e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",
+  "captureGenerationIsSchemaGeneration": false,
+  "capturedPlanSha256": "95d9012c2183758fd4a81a05f887a8b395c4287e1b9ef37f7d9e7f55a3c7554e",
+  "capturedCaptureSha256": "695aa5bfcf18646aabf9081c6028662017d42d94d0e4629a283e5b215f479c50",
+  "lastRetainedG1": "78c7b28e5ebce7f5f534a1f3f41a55845251e950b6c4c49f676f2bda358c91d6",
+  "freshG1MarkerPolicyAdmissionsProof": {
+    "status": "PREAPPLY_PASS_2026-11-07T22:21:07Z",
+    "receipt": "approved-window-preapply-g1-census.json",
+    "sha256": "8331d453a51543b0e75aa57492996bea8761024349caa941d2147c2b0c6a7894",
+    "admissionsAtG1": 1031,
+    "unexpectedAdmissions": 0,
+    "historicalPreApplyOnly": true
+  },
+  "preWindowRoleAttributesMembershipSettingsProof": {
+    "status": "PASS_13_PRESENT_NO_CATALOG_VIOLATIONS",
+    "receipt": "approved-role-bootstrap-verification.json",
+    "sha256": "15b01a1d79e4723fe8e636aef5b54111010f0636afd68a581174652fafc3b9a1",
+    "scope": "catalog attributes/memberships/settings only; not full effective privileges/phase2 proof",
+    "missing": []
+  },
+  "privilegedBootstrapAuthorizationIfNeeded": {
+    "status": "DIRECTLY_AUTHORIZED_COMMITTED_VERIFIED",
+    "receipt": "approved-role-bootstrap-result.json",
+    "sha256": "c344b597b2bc31b3f79a7ae183bf985a93ba41e07449adbe59d4f337e14e850e",
+    "scriptSha256": "c957ae416d707d471b576bea93dee07f2035fb8b930bacaff4207d63ffc0b478"
+  },
+  "full21MigrationRehearsalAndMeasuredOutageBudget": {
+    "fixtureStatus": "PASS_21_SCHEMA_5_PHASE2",
+    "summary": "rehearsal-summary.json",
+    "summarySha256": "213962668c8c63ecc1a4503f09cc460af35746bb054ce87eab4a5df667ea779c",
+    "result": "window21-rehearsal-result.json",
+    "resultSha256": "058f617f93ae0175f71459277959157da0afb81675421f0a0d6159de1c1fc0c8",
+    "applyWallMs": 2893.33557,
+    "productionOutageBudget": "MISSING_RUNTIME_REPLACEMENT_AND_PRODUCTION_DATA_TIMING"
+  },
+  "preWindowTrafficGcHealthEvidence": null,
+  "worker": {
+    "candidateSource": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+    "currentDeployedSourceAndVersion": null,
+    "compatibilityDeltaReview": {
+      "status": "PASS_WITH_ONE_EXPLICIT_LEAD_EXCEPTION_RETAINED_CONFIG_ONLY",
+      "receipt": "worker-compatibility-receipt.json",
+      "sha256": "8aeb39de56d450862729b708e9832d6fc01ea75f02ee7d1c861ae64e06d561aa",
+      "leadDispositionMessage": "244908112388333568",
+      "callerConfigEvidence": "relayhistory-api TURNS_WRITE_PATH current value: UNKNOWN, accepted risk",
+      "allNewPathsDefaultOff": false
+    },
+    "semanticInputsSha256": null,
+    "nativePlanSha256": null,
+    "provenanceSha256": null,
+    "bundleSha256": null,
+    "qualifiedMemoryBroker": null,
+    "readiness": {
+      "status": "APPLY_READY_WAITING_SCHEMA_COMMITTED_PASS_G2_NOW_NOTIFIED",
+      "receiptSha256": "014f189ee2e8d57b49fb848eb835f6a7fd5ca5c9cc8c15d10c9b03bfc5498254",
+      "releaseOwnerNotified": "244952112955813888",
+      "deploymentNotYetProved": true
+    },
+    "latestApplyReport": {
+      "status": "UNKNOWN_HOLD_NO_RETRY",
+      "receiptPrefix": "ee6f0c6e",
+      "leadMessage": "244953681824702464",
+      "independentlyReconciledByRoot": false,
+      "receiptSha256": "ee6f0c6ed5043c79a91ebbdda1afb1f252c38fe83b8f6d34f02a876a84cc8766",
+      "releaseOwnerMessage": "244953697937571840",
+      "reportedCounts": {
+        "WorkerPUT": 0,
+        "StateStorePUTAcknowledged200": 1,
+        "otherCFWrites": 0
+      },
+      "qualification": "Peer-reported receipt; current remote state not independently reconciled by Root."
+    },
+    "reconciliation": {
+      "status": "B_NOT_APPLIED_THIS_ATTEMPT",
+      "receipt": "g2-f940-unknown-reconciliation-20261107T223941Z.json",
+      "sha256": "98b3e9bf20f34393739d2727fd6d96b9b0c80b5dc933f3a6da3328e0376658e3",
+      "activeGeneration": "78c7b28e5ebce7f5f534a1f3f41a55845251e950b6c4c49f676f2bda358c91d6"
+    },
+    "replacementPrepare": {
+      "status": "CAPTURE_AND_LIVE_STATE_AUTHORITY_QUALIFIED_NOT_APPLIED",
+      "receipt": "g2-f940-apply-check-20261107T224202Z.json",
+      "sha256": "6e9c4719ee005bcec30d027d98bbf66513dd72b770e047fc9ea6bd5b5edf0cf6"
+    },
+    "deployedG2": {
+      "status": "VERIFIED_DEPLOYED_G2_CODE_AND_20_BINDINGS",
+      "receipt": "g2-f940-after-apply-verify-20261107T225141Z.json",
+      "sha256": "8f0460433c72ac37f9e4fe8276e5643776180fa3befa8b35b0b228541e53cb4e",
+      "activeVersionId": "f858a219-55a2-46d6-97a4-b2c899c4833b",
+      "trafficPercentage": 100
+    }
+  },
+  "bufferedGc": {
+    "candidateSource": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+    "zipSha256": null,
+    "immutableS3Version": null,
+    "templateSha256": "1cc115091b443e31bc8c98bd2d213b163cfa5a95b19dfe49d73446c88c7e2150",
+    "currentTemplateAndPreservedParametersProof": null,
+    "reviewedChangeSetIdAndSha256": null,
+    "currentAwsOperatorIdentityAndWrapperPin": null,
+    "requiredExplicitInputs": {
+      "AwsAccountId": "941433935742",
+      "SupabaseProjectRef": "pyamkrhoyszgzirqqffq"
+    },
+    "retainedOnlyTargetHistory": {
+      "receipt": "retained-aws-targets.json",
+      "sha256": "a59e72559a6742e97d9d4eaaec9d5f0f669f6c5c05fb2fdf00e8d0553a8ec51c",
+      "freshProviderPreimageRequired": true
+    },
+    "executorAvailability": {
+      "status": "USER_RETRIGGERED_NATIVE_AWS_STATUS_SUCCESS_SESSION_CLOSED",
+      "receipt": "approved-window-aws-user-retry-result.json",
+      "sha256": "9816ec74e6ee3a494ea073182364b2c94d4e8410b96064c8138a60eef9998508",
+      "awsLambdaMutationRequested": false,
+      "credentialsPersisted": false,
+      "futureLoginRequired": true
+    },
+    "windowDisposition": {
+      "status": "DEFERRED_BY_LEAD",
+      "message": "244948358983348224",
+      "guard": "G1 ingest_buffer_gc_claim requires generation before candidate/lease work; G2 marker refuses G1 claims",
+      "noBacklogClaim": true
+    }
+  },
+  "publisherAndPublicationGc": {
+    "candidateSource": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+    "activeRuntimeInventory": {
+      "status": "LEAD_DOCUMENTED_INACTIVE_NO_LIVE_DEPLOYMENT_EVIDENCED",
+      "leadDispositionMessage": "244908112388333568",
+      "noFreshProcessInventoryClaim": true,
+      "basis": "Nov4 migration host app_enabled=false; Nov7 publisher deployment NOT_VERIFIED",
+      "releaseOwnerConditionalCheck": "If a running canonical publisher is found, it must be redeployed at G2 or stopped before rebind; this record does not authorize either action"
+    },
+    "host": null,
+    "launcher": null,
+    "managedRoleProfile": null,
+    "preservedEnablement": null,
+    "artifactSha256": null,
+    "reviewedReplacementCommand": {
+      "status": "NOT_APPLICABLE_UNDER_DOCUMENTED_INACTIVE_DISPOSITION",
+      "ifRunningFound": "HOLD until exact reviewed G2 replacement or stop path and applicable authorization are supplied"
+    },
+    "retainedCandidateNotDeploymentProof": true,
+    "windowPlan": "NO_PUBLISHER_REDEPLOY_UNLESS_RUNNING_PUBLISHER_FOUND",
+    "boundedReadOnlyActivityEvidence": {
+      "receipt": "publisher-activity-result.json",
+      "sha256": "8aae951f892362d70623e44f0aab0a6d4a302c1e8f546730f0d537ad4b358b9f",
+      "interval": "2026-11-07T19:52:02.517Z..2026-11-07T19:52:02.618Z",
+      "matchingDbBackends": 0,
+      "attemptRows": 0,
+      "objectRows": 0,
+      "qualification": "NO_ACTIVITY_SAMPLE_NOT_PROCESS_ABSENCE_OR_DEPLOYMENT_PROOF"
+    }
+  },
+  "otherGenerationBoundConsumers": {
+    "indexerAndSessionPipelineInventory": null,
+    "replacementOrDocumentedInactiveDecision": null,
+    "reviewedDeploymentCaptures": null
+  },
+  "approvalQuotePlaceholder": "FINAL_EXECUTION_TARGETS_SHA256 is computed only after all readiness slots are resolved; do not use this draft digest as a substitute",
+  "productionWritesPerformed": true,
+  "missingRuntimeAndHealthPins": [
+    "preWindowTrafficGcHealthEvidence",
+    "worker.currentDeployedSourceAndVersion",
+    "worker.semanticInputsSha256",
+    "worker.nativePlanSha256",
+    "worker.provenanceSha256",
+    "worker.bundleSha256",
+    "worker.qualifiedMemoryBroker",
+    "bufferedGc.zipSha256",
+    "bufferedGc.immutableS3Version",
+    "bufferedGc.currentTemplateAndPreservedParametersProof",
+    "bufferedGc.reviewedChangeSetIdAndSha256",
+    "bufferedGc.currentAwsOperatorIdentityAndWrapperPin",
+    "publisherAndPublicationGc.host",
+    "publisherAndPublicationGc.launcher",
+    "publisherAndPublicationGc.managedRoleProfile",
+    "publisherAndPublicationGc.preservedEnablement",
+    "publisherAndPublicationGc.artifactSha256",
+    "otherGenerationBoundConsumers.indexerAndSessionPipelineInventory",
+    "otherGenerationBoundConsumers.replacementOrDocumentedInactiveDecision",
+    "otherGenerationBoundConsumers.reviewedDeploymentCaptures"
+  ],
+  "readOnlyAggregateDiagnostic": {
+    "receipt": "ingest-aggregate-v2-result.json",
+    "sha256": "e54a299c17781ad0b63150d8cd57fb98ec4be7313314b5ec2ab5f09b1236cb32",
+    "status": "OBSERVED_ONE_SAMPLE_NOT_HEALTH_OR_CAUSE_PROOF",
+    "interval": "2026-11-07T19:48:47.928Z..2026-11-07T19:48:48.025Z",
+    "pairedTailReceipt": {
+      "status": "COLLECTED_NO_TIME_OVERLAP_UNPAIRED_ONLY",
+      "receipt": "ingest-unpaired-tail-receipt.json",
+      "sha256": "4e77499fb02e73e42c24dd7ad1e9884c33b85dfabec7e42dd3b4b0d500fc1c54",
+      "start": "2026-11-07T19:49:16.645893Z",
+      "durationSeconds": 30.002,
+      "http200": 42,
+      "http503": 5,
+      "http429": 2,
+      "correlationClaim": false
+    }
+  },
+  "originalPlanCaptureFreshness": "EXPIRED_AT_2026-11-07T19:47:10.129Z_REPLAN_RECAPTURE_REQUIRED",
+  "orgCohortDiagnostic": {
+    "status": "ORG_SCOPE_NOT_UNIQUELY_QUALIFIED",
+    "exactlyOneOrgMatched": false,
+    "cohortExecuted": false,
+    "result": "UNKNOWN",
+    "receipt": "org-publication-cohort-result.json",
+    "sha256": "4193c08c328b0d43674c15e0df62a5b15507889957169f2194c3c6291240a658"
+  },
+  "directUserSchemaWindowAuthorization": {
+    "quote": "schema window approved",
+    "recordedAt": "2026-11-07T22:03:09.811837+00:00",
+    "source": "direct user message in migration-handover-agent session",
+    "schemaApplyAlreadyPerformed": true
+  },
+  "productionWritesScope": "Approved role bootstrap, canonical schema apply and one generation rebind by Root; reviewed Worker deployment by release owner. GC deferred, publisher unchanged.",
+  "currentRefreshedPlanCapture": {
+    "planSha256": "95d9012c2183758fd4a81a05f887a8b395c4287e1b9ef37f7d9e7f55a3c7554e",
+    "planAt": "2026-11-07T22:02:57.580Z",
+    "captureSha256": "695aa5bfcf18646aabf9081c6028662017d42d94d0e4629a283e5b215f479c50",
+    "captureAt": "2026-11-07T22:04:06.494Z",
+    "captureGeneration": "c9bc7700eaf8b9aeacf15bca9c0a7a781c30ceccbffc5b3286c602623b1b7042",
+    "earliestExpiry": "2026-11-07T23:02:57.580000Z",
+    "receipt": "approved-window-refresh-receipt.json",
+    "sha256": "0ab7eec9ba4fdc6a3e81511ed1d09946de969224767539c80c36758de229f90c"
+  },
+  "schemaApply": {
+    "status": "owner_apply_verified",
+    "receipt": "approved-window-schema-apply-result.json",
+    "sha256": "d690c2b2eaf95f8612bd4b052a54ca87de3c7db7ada53ec00b7aa5926aea25d7",
+    "applied": 21,
+    "skipped": 35,
+    "ledgerSha256": "502349fe27871cb12de3fb93d8b02c3a1ece691ad500c1d7a6b2176dbed66502",
+    "completedAt": "2026-11-07T22:31:04.058852+00:00"
+  },
+  "rebind": {
+    "status": "COMMITTED_G2_POSTCENSUS_PASS",
+    "dryRunPerformed": true,
+    "executePerformed": true,
+    "automaticRetry": false,
+    "dryRunReceipt": "approved-window-rebind-dry-result.json",
+    "executeReceipt": "approved-window-rebind-execute-result.json",
+    "executeReceiptSha256": "83716c6b1c703380c13fd466c30c4b25e9c7f2863d9f3cdbfc8f0feb417943da",
+    "completedAt": "2026-11-07T22:53:23.636256+00:00",
+    "admissionsRebound": 1031,
+    "censusReceipt": "approved-window-post-rebind-g2-census.json",
+    "censusReceiptSha256": "ce0fccaaffa72468c399398acf5d3897ec2a856d1447fed1afbff41023cef6e5",
+    "unexpectedAdmissions": 0
+  },
+  "postRebindUploadSample": {
+    "receipt": "post-rebind-dual-worker-120s-sample.json",
+    "sha256": "bc058ed2e2e31416e6ef33c1f377cefec77206e88e49f65937fadab5ee8257db",
+    "private": {
+      "total": 116,
+      "http200": 101,
+      "http503": 12,
+      "http429": 3
+    },
+    "public": {
+      "total": 78,
+      "http200": 64,
+      "http503": 12,
+      "http429": 2
+    },
+    "observedGenerationErrors": 0,
+    "privateClaimLockTimeouts": 8,
+    "privateClaimStatementTimeouts": 4,
+    "completeFix": false
+  },
+  "postWindowClaimStatistics": {
+    "receipt": "post-window-claim-stats-result.json",
+    "sha256": "4a9fd9da38b291cec3ca24bc848d2321a37a0ae0743e55a14c2f9503b384471a",
+    "nestedCapture": "disabled_track_top",
+    "functionCapture": "disabled_track_none",
+    "configurationChanged": false
+  },
+  "postWindowLockWaitSamples": {
+    "status": "FIVE_READONLY_SAMPLES_COMPLETED",
+    "rawReceipt": "post-window-lockwait-final-five-results.json",
+    "sha256": "93e2e59a34b6fb08c6908b6152a41a625494ff06287aeab609e73fbae6792b4f",
+    "sqlSha256": "2486bf707ef7b415d73313375a7f381f68179144d0ef51491a6c23a8a13ea1da",
+    "observed": "ingest-to-ingest blocking; receipt-seat-clock relation context; active claim DataFileRead near5s",
+    "unproven": "per-user-only root cause, complete503cause, backlog decay or full recovery"
+  }
+}
