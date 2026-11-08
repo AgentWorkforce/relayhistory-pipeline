@@ -66,7 +66,7 @@ const SCRUB_RULESETS: Record<number, string> = {
   // escaped line separator, a backslash, a quote, a tab or a double space is redacted whole).
   // Updated before release (exact-head review of 0f9b2416: an op:// reference has exactly three
   // or four segments; two, or five or more, are redacted whole).
-  5: "ed8d5c35bfddbcdbe03416c03e08b3d0a0bbcf7c276bc08fe12f14d8756ee933",
+  5: "595fecdf98a2a309a53131d3c797af0f449f0c65a2c19cc789eed961081b6a07",
 };
 
 const read = (rel: string) =>
