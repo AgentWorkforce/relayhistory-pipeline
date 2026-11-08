@@ -163,6 +163,17 @@ describe("canonical frontier read-only planner", () => {
     expect(one.planSha256).toMatch(/^[a-f0-9]{64}$/);
   });
 
+  test("unsupported non-ASCII or surrogate identifiers HOLD without changing planner order", () => {
+    for (const id of ["\u{10000}", "\ue000", "\ud800", "bad id"]) {
+      const capture = readyCapture();
+      const maximum = capture.origins[0]!.recordMaxima[0]!;
+      maximum.recordId = id;
+      maximum.exportEvidenceSha256 = frontierRecordExportEvidenceSha256(maximum);
+      refreshOriginHashes(capture); reseal(capture);
+      expect(evaluate(capture)).toMatchObject({ status: "hold", reasons: expect.arrayContaining(["unknown_legacy_fact"]) });
+    }
+  });
+
   test("sampled, stale, or unknown legacy evidence holds instead of inventing completeness", () => {
     const incomplete = readyCapture();
     incomplete.origins[0]!.scans[0]!.complete = false;

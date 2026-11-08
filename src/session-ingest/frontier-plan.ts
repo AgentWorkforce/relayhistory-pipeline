@@ -325,7 +325,7 @@ function validTime(value: unknown): value is string {
 function validText(value: unknown, maxBytes: number, emptyOk = false): value is string {
   return typeof value === "string" && (emptyOk || value.length > 0) && Buffer.byteLength(value) <= maxBytes && !CONTROL.test(value);
 }
-function validId(value: unknown, emptyOk = false): value is string { return validText(value, 512, emptyOk); }
+function validId(value: unknown, emptyOk = false): value is string { return validText(value, 512, emptyOk) && /^[!-~]*$/.test(value); }
 function nonNegative(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) >= 0; }
 function validDecimal(value: unknown, zeroOk = true): value is string {
   return typeof value === "string" && DECIMAL.test(value) && BigInt(value) <= MAX_INT64 && (zeroOk || value !== "0");

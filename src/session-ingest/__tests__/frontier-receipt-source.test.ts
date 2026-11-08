@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { captureFrontierReceiptSource, frontierReceiptDomainSha256, RECEIPT_CAPTURE_IDENTITY_SQL, RECEIPT_CAPTURE_PAGE_SQL, RECEIPT_CAPTURE_PROTOCOL, type FrontierReceiptReadRequest } from "../frontier-receipt-source.ts";
+import { captureFrontierReceiptSource, frontierReceiptDomainSha256, FRONTIER_RECEIPT_READER_ROLE, RECEIPT_CAPTURE_IDENTITY_SQL, RECEIPT_CAPTURE_PAGE_SQL, RECEIPT_CAPTURE_PROTOCOL, type FrontierReceiptReadRequest } from "../frontier-receipt-source.ts";
 import { frontierSha256 } from "../frontier-plan.ts";
 import type { FrontierCaptureSql } from "../frontier-capture-source.ts";
 const h = (x: string) => frontierSha256(x);
 const tenant = { orgId: "fixture-org", workspaceId: "fixture-ws", userId: "fixture-user", originId: "fixture-origin" };
-const input: FrontierReceiptReadRequest = { tenant, generation: h("gen"), profileId: "11111111-1111-4111-8111-111111111111", profileSha256: h("profile"), functionSha256: h("function"),
+const input: FrontierReceiptReadRequest = { tenant, generation: h("gen"), profileId: "11111111-1111-4111-8111-111111111111", profileSha256: h("profile"), functionSha256: h("function"), functionOwner: "fixture_schema_owner",
   bounds: { pageLimit: 1, maxPages: 4, maxDecisions: 10, maxBytes: 20_000, maxDurationMs: 10_000 } };
 const authority = { sourceIdentitySha256: h("source"), sourceGenerationSha256: h("generation"), sourceHead: "a".repeat(40), controlEpoch: h("control"), privacyBaselineSha256: h("privacy"), privacyVersion: "3" };
 const winner = { tenant, recordId: "record", revision: "7", revisionId: "revision", source: "copilot", sessionId: "synthetic-session", seat: "12", bodyAccepted: true, candidateDigest: "a".repeat(64), firstDigest: "a".repeat(64) };
@@ -13,8 +13,8 @@ function fixture() {
   const calls: Array<{ text: string; params?: unknown[] }> = [];
   const records = [winner, loser];
   let index = 0, transaction = 0;
-  const identity: Record<string, unknown> = { read_only: "on", isolation: "repeatable read", role: "bulls96_session_ingest_seeder", superuser: false, inherit: false, create_role: false,
-    create_db: false, replication: false, bypass_rls: false, security_definer: true, volatility: "s", config: ["search_path=pg_catalog, pg_temp"], function_owner: "postgres", definition_sha256: input.functionSha256 };
+  const identity: Record<string, unknown> = { read_only: "on", isolation: "repeatable read", role: FRONTIER_RECEIPT_READER_ROLE, superuser: false, inherit: false, create_role: false,
+    create_db: false, replication: false, bypass_rls: false, can_login: false, security_definer: true, volatility: "s", config: ["search_path=pg_catalog, pg_temp"], function_owner: input.functionOwner, definition_sha256: input.functionSha256 };
   const f = { calls, records, identity, mutate: (_: Record<string, unknown>, _page: number, _transaction: number) => {},
     db: { async query(text: string, params?: unknown[]) {
       calls.push({ text, params });
@@ -42,6 +42,7 @@ describe("bounded receipt source capability client (synthetic SQL only)", () => 
   test("retains losing equal-revision candidate, reads terminal empty page and fresh closure", async () => {
     const f = fixture(); const capture = await captureFrontierReceiptSource(f.db, input);
     expect(capture.decisions).toEqual([winner, loser]);
+    expect(capture.functionOwner).toBe(input.functionOwner);
     expect(capture.scan).toMatchObject({ pageItemCounts: [1, 1, 0], itemCount: 2, pagesRead: 3, complete: true, terminalCursor: null });
     expect(f.calls.filter(c => c.text === RECEIPT_CAPTURE_IDENTITY_SQL)).toHaveLength(2);
     expect(f.calls.filter(c => c.text === RECEIPT_CAPTURE_PAGE_SQL)).toHaveLength(4);
@@ -55,8 +56,8 @@ describe("bounded receipt source capability client (synthetic SQL only)", () => 
     expect((await captureFrontierReceiptSource(f.db, input)).scan.pageItemCounts).toEqual([0]);
     expect(f.calls.filter(c => c.text === RECEIPT_CAPTURE_PAGE_SQL)).toHaveLength(2);
   });
-  for (const [field, value] of Object.entries({ role: "postgres", superuser: true, inherit: true, create_role: true, create_db: true, replication: true, bypass_rls: true, read_only: "off", isolation: "read committed",
-    definition_sha256: h("unreviewed"), volatility: "v", security_definer: false, config: ["search_path=public"], function_owner: "bulls96_session_ingest_seeder" })) {
+  for (const [field, value] of Object.entries({ role: "postgres", superuser: true, inherit: true, create_role: true, create_db: true, replication: true, bypass_rls: true, can_login: true, read_only: "off", isolation: "read committed",
+    definition_sha256: h("unreviewed"), volatility: "v", security_definer: false, config: ["search_path=public"], function_owner: "unqualified_owner" })) {
     test(`refuses capability drift ${field} before any receipt page`, async () => {
       const f = fixture(); f.identity[field] = value;
       await refused(f, "frontier_receipt_capability");
@@ -143,12 +144,38 @@ describe("bounded receipt source capability client (synthetic SQL only)", () => 
     const f = fixture(); const request = structuredClone(input); const original = f.db.query;
     f.db.query = async (text, params) => {
       const result = await original(text, params);
-      if (text.startsWith("BEGIN")) { request.tenant.orgId = "other-org"; request.generation = h("other"); request.bounds.pageLimit = 1000; }
+      if (text.startsWith("BEGIN")) { request.tenant.orgId = "other-org"; request.generation = h("other"); request.functionOwner = "other_owner"; request.bounds.pageLimit = 1000; }
       return result as never;
     };
     const result = await captureFrontierReceiptSource(f.db, request);
     expect(result.tenant).toEqual(tenant); expect(result.generation).toBe(input.generation);
-    expect(result.scan.pageLimit).toBe(1);
+    expect(result.scan.pageLimit).toBe(1); expect(result.functionOwner).toBe(input.functionOwner);
+  });
+  for (const role of ["bulls96_session_ingest_seeder", "bulls96_session_ingest"]) {
+    test(`refuses reused runtime role ${role}`, async () => {
+      const f = fixture(); f.identity.role = role;
+      await refused(f, "frontier_receipt_capability");
+      expect(f.calls.some(c => c.text === RECEIPT_CAPTURE_PAGE_SQL)).toBe(false);
+    });
+  }
+  test("requires independently qualified owner and at most 120 seconds", async () => {
+    const f = fixture();
+    for (const request of [
+      { ...input, functionOwner: FRONTIER_RECEIPT_READER_ROLE },
+      { ...input, functionOwner: "bulls96_session_ingest_seeder" },
+      { ...input, functionOwner: "bulls96_session_ingest" },
+      { ...input, functionOwner: "unqualified owner" },
+      { ...input, bounds: { ...input.bounds, maxDurationMs: 120_001 } },
+    ]) await expect(captureFrontierReceiptSource(f.db, request)).rejects.toMatchObject({ code: "frontier_receipt_input" });
+    expect(f.calls).toHaveLength(0);
+    expect((await captureFrontierReceiptSource(f.db, { ...input, bounds: { ...input.bounds, maxDurationMs: 120_000 } })).decisions).toHaveLength(2);
+  });
+  test("unsupported identifier encodings refuse before SQL", async () => {
+    const f = fixture();
+    for (const userId of ["\u{10000}", "\ue000", "\ud800", "bad id"]) {
+      await expect(captureFrontierReceiptSource(f.db, { ...input, tenant: { ...tenant, userId } })).rejects.toMatchObject({ code: "frontier_receipt_input" });
+    }
+    expect(f.calls).toHaveLength(0);
   });
   test("invalid limits and unknown input fail before SQL", async () => {
     const f = fixture();

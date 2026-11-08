@@ -30,13 +30,17 @@ complete origin, or live capture. There is no executable installer or DDL here.
 
 The fixed surface is
 `sessions.ingest_scoped_publication_receipt_capture_v1(jsonb)`, STABLE SECURITY
-DEFINER, owned by postgres, with search_path exactly `pg_catalog, pg_temp`.
+DEFINER, owned by the independently qualified schema owner, with search_path
+exactly `pg_catalog, pg_temp`. The client requires a functionOwner pin separate
+from the definition digest; the owner is not learned from the RPC response.
 The client verifies the independently reviewed function-definition SHA against
-catalogs in each of two read-only transactions. The only accepted client role
-is the existing restricted `bulls96_session_ingest_seeder` (no superuser,
-inheritance, creation, replication or RLS bypass). No new LOGIN role is proposed.
-The role currently lacks this capability: deployment requires its own later
-review and authorized installation, not a changed client credential.
+catalogs in each of two read-only transactions. The only proposed client role
+is the dedicated NOLOGIN
+`bulls96_frontier_receipt_reader` (no superuser, inheritance, creation,
+replication, RLS bypass or LOGIN). Seeder and publisher reuse is refused,
+including their use as the function owner. This is an inert source expectation:
+no role or grant is created here. Capability deployment requires its own later
+review and authorized installation; there is no credential fallback.
 
 The RPC must enforce an **owner-installed immutable capture profile** before
 reading. The profile binds its UUID and exact digest, allowed authenticated
@@ -150,7 +154,8 @@ best-effort ROLLBACK after a BEGIN send, including during the fresh closure
 transaction. The eventual real caller must discard an uncertain/broken
 connection if cleanup cannot establish idle; this client makes no idle or
 transport-health claim after a failure. Its effective-role catalog check is not
-a claim of human/process identity: seeder is NOLOGIN, so its trusted installation/profile must bind and
+a claim of human/process identity: the dedicated reader is NOLOGIN, so its
+trusted installation/profile must bind and
 guard the actual session principal and permitted role transition. Reusing a
 shared credential does not authenticate a publication-plan owner label.
 
@@ -211,3 +216,73 @@ retains two unrelated existing shellcheck findings (SC2100 and SC2034); excludin
 those known baseline findings leaves the added job clean. The real database and
 MinIO job has not been executed on this merged head locally; CI must provide
 that separate evidence, and its success will still not qualify a live producer.
+
+## Reconciliation decisions and codec conformance
+
+C1: select a dedicated NOLOGIN receipt-reader boundary, not a seeder-reuse waiver.
+The proposed source name is bulls96_frontier_receipt_reader; activating or
+granting it is not part of this client PR. Group the read RPC, immutable capture
+profile and reader boundary with the 049000 prerequisite bundle, subject to the
+registry/implementation owner's explicit source inventory and lock/ACL review.
+This follows v3 source_plan_reuse_C3's separate qualified least-privilege receipt
+adapter prerequisite and leaves the reviewed 050000 writer boundary unchanged.
+Do not implicitly broaden 050000 permissions or guess a new 053000 allocation.
+No SQL is added here; layered-sessions-pipeline owns that implementation.
+
+C2: keep the planner in #374. After this source lane passes its complete reviews
+and checks and merges, 049000 imports the planner from main; no second vendored
+copy or independent planner landing. No merge is performed while the remaining
+source-contract and whole-lane review conditions are unresolved.
+
+C3: recovered the original Book artifacts with exact pins dc068aef (v1 design),
+51d358b2 (v3 design), fd3f8908 (contract vectors) and 867f6b35 (bigint known
+answers). The two unmodified synthetic vector sets are now in docs/contracts,
+with their full SHA256 pins enforced by conformance tests. The original v3
+design is also published unmodified under docs/handoffs/frontier-attester-20261107
+with its 51d358b2 pin enforced by the same tests. These historical design/test
+artifacts grant no operational authority. The v3 design governs:
+its source_plan_reuse_C3 explicitly retains the planner's exact existing output
+hashes and ordering and retires the v2 column-domain/length-framing proposal.
+Do not prepend a new domain or silently re-sort the planner's output. V3 audit
+objects bind their own protocol field and use the existing canonical JSON hash;
+new audit identity arrays use field-by-field raw UTF8 order. Their comparator is
+shared with the receipt RPC cursor, not substituted for planner ordering.
+
+Both published positive component vectors, both >2^53/int64max decimal-string
+vectors, and the v3 audit example match the existing codec's exact bytes/hashes.
+Literal JavaScript bigint remains unsupported; canonical decimal STRING input
+is the contract, with no unsafe Number coercion. The punctuation ordering vector
+proves the planner's encoded-tuple order and new audit raw-field order intentionally
+differ. Unsupported nonASCII, whitespace/control and lone-surrogate identifiers
+now HOLD in planner eligibility and refuse in receipt input. This is fail-closed
+eligibility, not a silent output-hash rewrite or a Unicode-support amendment.
+
+Conformance here covers byte/hash behavior, strict duplicate/unsafe-number JSON
+rejection, ordering and unsupported identifiers. The remaining typed audit-schema,
+whole-user/S4 coverage, independent verifier and approval cases in fd3f8908 still
+belong to their consuming implementation; they are not claimed to pass because
+four synthetic codec vectors pass. The receipt wire-domain digest is a distinct
+page-inventory commitment, never a replacement for READY's frontier columns or
+an attester/verifier approval.
+
+The source reader duration cap is now 120000ms. This bounds requested capture
+time, not the complete job or network cancellation; its eventual caller must
+pass its remaining overall budget and reserve transport/cleanup margin.
+Function-definition hashes must be qualified for the actual PostgreSQL version;
+no cross-version equality with a raw SQL-file hash is asserted. complete=true
+means the client observed EOF, exact count/digest and fresh closure under its
+pinned capability; it does not supply the absent SQL domain-completeness proof,
+byte evidence, trusted profile installation or v3 independent-verifier result.
+The test-only outcomes ledger and fixture attestation table remain disposable
+fixtures, not a production audit/identity-retention design.
+
+Reconciliation validation: focused byte/reader/planner/canary/seed suites run
+through aw-heavy; the prior 855f8513 PG/MinIO receipt remains historical evidence
+only until this new head's CI completes. No missing-producer HOLD was relaxed.
+
+Final source validation for this reconciliation: 98 tests, 0 failures, 380
+assertions across six focused suites, with root TypeScript and diff checks.
+The unsupported-identifier regression causally fails with the old eligibility
+guard (a self-consistent synthetic Unicode maximum otherwise became READY),
+and passes with the fail-closed guard. The source was restored immediately
+after that negative experiment. This does not qualify real source coverage.
