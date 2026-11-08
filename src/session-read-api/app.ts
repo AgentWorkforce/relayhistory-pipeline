@@ -78,7 +78,7 @@ import {
   type DirectoryListArgs,
   type DirectoryListRow,
 } from "./directory.ts";
-import type { BufferedSearchGate } from "./buffered-search-gate.ts";
+import { droppedTotal, type BufferedSearchGate } from "./buffered-search-gate.ts";
 import {
   BUFFERED_HEADER,
   BUFFERED_IDS_HEADER,
@@ -464,11 +464,11 @@ export function createReadApi(deps: ReadApiDeps) {
 
   const pageDeps = () => ({ ch: deps.ch, adapter: deps.adapter, completeSinceMs: deps.completeSinceMs, liveness: deps.liveness, timeoutMs: deps.timeoutMs, bufferedGate: deps.bufferedSearchGate });
 
-  /** Gate telemetry: counts and closed-enum reasons only, never ids or content. */
+  /** Gate telemetry: two integer counts only (checked, and the per-reason drops summed), never ids or content. */
   async function gatedPage(c: Context, input: EventQuery) {
     const page = await readEventPage(pageDeps(), input);
     if (page.buffered && page.buffered.checked > 0)
-      log({ route: c.req.routePath, reason: "buffered_gate", buffered_checked: page.buffered.checked, buffered_dropped: page.buffered.dropped, correlation_id: c.get("correlationId") });
+      log({ route: c.req.routePath, reason: "buffered_gate", buffered_checked: page.buffered.checked, buffered_dropped: droppedTotal(page.buffered.dropped), correlation_id: c.get("correlationId") });
     return page;
   }
 

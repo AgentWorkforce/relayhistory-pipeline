@@ -11,6 +11,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ClickHouseError, type ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
+import { logLine } from "../../shared/log.ts";
 import { REPEATABLE_READ_FLAG, repeatableReadEnabled, TENANT_SETTINGS_SQL, tenantBeginSql } from "../liveness.ts";
 import { requestTenantRunner } from "../../../packages/session-read-worker/src/index.ts";
 import {
@@ -20,6 +21,7 @@ import {
   MAX_GATE_HITS,
   MAX_GATE_OWNERS,
   createBufferedSearchGate,
+  droppedTotal,
   parseBufferedSearchGate,
   parseControlHead,
   refKey,
@@ -404,7 +406,13 @@ describe("the read API with the gate", () => {
     expect(queries.find((q) => q.includes("bytes_before"))).toContain("origin, origin_claim_token");
     // The response shape carries no origin field.
     expect(Object.keys(b.events[0])).not.toContain("origin");
-    expect(on.logs.find((l) => l.reason === "buffered_gate")).toMatchObject({ buffered_checked: 2, buffered_dropped: { parity_missing: 1 } });
+    // The per-reason drops stay structured inside the page; the log field is their integer sum.
+    const gateLog = on.logs.find((l) => l.reason === "buffered_gate")!;
+    expect(gateLog).toMatchObject({ buffered_checked: 2, buffered_dropped: 1 });
+    // The REAL producer fields through the real log sanitizer: both counts survive as integers.
+    const emitted = JSON.parse(logLine("info", "request", gateLog));
+    expect([emitted.buffered_checked, emitted.buffered_dropped]).toEqual([2, 1]);
+    expect([Number.isInteger(emitted.buffered_checked), Number.isInteger(emitted.buffered_dropped)]).toEqual([true, true]);
     expect(on.bind.requests.map((q) => q.headers.get("x-relayhistory-user-id")).sort()).toEqual(["u-2", "u-3"]);
   });
 
@@ -420,6 +428,14 @@ describe("the read API with the gate", () => {
 });
 
 describe("configuration and SQL", () => {
+  test("droppedTotal: the per-reason drop counts summed to one non-negative integer", () => {
+    expect(droppedTotal({})).toBe(0);
+    expect(droppedTotal({ parity_missing: 1 })).toBe(1);
+    expect(droppedTotal({ parity_missing: 2, origin_unknown: 3, owner_fanout: 4 })).toBe(9);
+    // Never anything but integer counts: a hostile value cannot reach the log through the sum.
+    expect(droppedTotal({ parity_missing: 2, origin_unknown: -5, owner_fanout: 1.5, control_pending: Number.NaN } as never)).toBe(2);
+  });
+
   test("READ_API_BUFFERED_SEARCH_GATE: only 'on' enables", () => {
     expect(parseBufferedSearchGate(undefined)).toBe(false);
     expect(parseBufferedSearchGate("")).toBe(false);

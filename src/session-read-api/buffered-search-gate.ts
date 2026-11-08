@@ -324,6 +324,17 @@ export type DropReason =
   | "admission_unknown_reason"
   | GateSqlReason;
 
+/**
+ * The log scalar for a page's per-reason drop counts: the sum of the closed-enum counts. Only
+ * non-negative integer counts are added, so the result is always a non-negative integer (log.ts
+ * clamps `buffered_dropped` to its ceiling). The per-reason object itself is never logged.
+ */
+export function droppedTotal(dropped: Partial<Record<DropReason, number>>): number {
+  let total = 0;
+  for (const n of Object.values(dropped)) if (typeof n === "number" && Number.isInteger(n) && n > 0) total += n;
+  return total;
+}
+
 export interface GateResult<R> {
   kept: R[];
   /** Buffered hits checked (kept or dropped); canonical rows are not counted. */
