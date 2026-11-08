@@ -63,6 +63,7 @@ const BULK_WRITE_CONFIRMATION = "owner-buffered-parity-bulk/v1";
 const DEFAULT_BULK_BATCH_SIZE = 25;
 const MAX_BULK_BATCH_SIZE = 100;
 const BULK_CURSOR = "owner_buffered_parity_bulk_tenants";
+const BULK_CURSOR_KEEPALIVE_SQL = "SELECT 1 AS owner_buffered_bulk_keepalive";
 
 export const BULK_TARGET_GENERATION_SQL = `
 SELECT generation
@@ -231,6 +232,10 @@ export interface BulkParityCounts {
   unchanged: number;
 }
 
+export function bulkCompletionStatus(counts: BulkParityCounts): "complete" | "partial" {
+  return counts.g1Mismatch === 0 && counts.tenantRefused === 0 ? "complete" : "partial";
+}
+
 export interface BulkParityDependencies {
   readCensus?: typeof readParityCensus;
   writeProof?: typeof writeCurrentParityProof;
@@ -304,32 +309,42 @@ export async function runBulkParity(
       counts.batches++;
       for (const row of rows) {
         counts.candidates++;
-        const tenant = bulkTenant(row);
-        if (!tenant) { counts.tenantRefused++; continue; }
         try {
-          const g1 = await readCensus(neon, targetOwner, tenant);
-          if (!g1.equal || !g1.proof) {
-            await requireBulkGeneration(targetOwner, expectedTargetGeneration, counts);
-            counts.g1Mismatch++;
-            continue;
-          }
-          if (!generationMatches(g1, expectedTargetGeneration))
-            throw new BulkParityFatal("bulk_target_generation_mismatch", counts);
-          counts.g1Equal++;
-          const result = await writeProof(neon, targetOwner, tenant, expectedTargetGeneration);
-          if (!generationMatches(result.census, expectedTargetGeneration))
-            throw new BulkParityFatal("target_generation_postcondition_failed", counts);
-          if (result.outcome === "insert") counts.inserted++;
-          else if (result.outcome === "update") counts.updated++;
-          else counts.unchanged++;
-        } catch (error) {
-          if (error instanceof BulkParityFatal) throw error;
-          if (error instanceof ParityCensusRefusal) {
-            if (fatalGeneration(error.code)) throw new BulkParityFatal(error.code, counts);
+          const tenant = bulkTenant(row);
+          if (!tenant) {
             counts.tenantRefused++;
-            continue;
+          } else {
+            try {
+              const g1 = await readCensus(neon, targetOwner, tenant);
+              if (!g1.equal || !g1.proof) {
+                await requireBulkGeneration(targetOwner, expectedTargetGeneration, counts);
+                counts.g1Mismatch++;
+              } else {
+                if (!generationMatches(g1, expectedTargetGeneration))
+                  throw new BulkParityFatal("bulk_target_generation_mismatch", counts);
+                counts.g1Equal++;
+                const result = await writeProof(neon, targetOwner, tenant, expectedTargetGeneration);
+                if (!generationMatches(result.census, expectedTargetGeneration))
+                  throw new BulkParityFatal("target_generation_postcondition_failed", counts);
+                if (result.outcome === "insert") counts.inserted++;
+                else if (result.outcome === "update") counts.updated++;
+                else counts.unchanged++;
+              }
+            } catch (error) {
+              if (error instanceof BulkParityFatal) throw error;
+              if (error instanceof ParityCensusRefusal) {
+                if (fatalGeneration(error.code)) throw new BulkParityFatal(error.code, counts);
+                counts.tenantRefused++;
+              } else {
+                throw error;
+              }
+            }
           }
-          throw error;
+        } finally {
+          // FETCH pages may take many minutes to process. Touch the read-only
+          // cursor transaction after every tenant so its idle timeout cannot
+          // deterministically expire between bounded pages.
+          await enumerator.query(BULK_CURSOR_KEEPALIVE_SQL);
         }
       }
     }
@@ -390,9 +405,10 @@ async function main(): Promise<number> {
         const counts = await runBulkParity(
           neon, enumerator, targetOwner, args.expectedTargetGeneration, args.batchSize,
         );
-        output({ status: "complete", mode: "bulk", sourceSha: args.expectedSourceSha,
+        const status = bulkCompletionStatus(counts);
+        output({ status, mode: "bulk", sourceSha: args.expectedSourceSha,
           targetGeneration: args.expectedTargetGeneration, counts });
-        return 0;
+        return status === "complete" ? 0 : 3;
       } catch (error) {
         if (error instanceof BulkParityFatal) {
           output({ status: "refused", mode: "bulk", code: error.code,

@@ -3,6 +3,7 @@ import { ParityCensusRefusal, type ParityCensusReceipt, type ParityTenant } from
 import {
   BULK_BUFFERED_TENANTS_SQL,
   OwnerBufferedOperatorRefusal,
+  bulkCompletionStatus,
   parseOperatorArgs,
   publicCensusReceipt,
   runBulkParity,
@@ -148,6 +149,7 @@ describe("owner-buffered parity bulk runner", () => {
     expect(statements[0]).toContain("REPEATABLE READ READ ONLY");
     expect(statements.some((sql) => sql.includes(BULK_BUFFERED_TENANTS_SQL))).toBeTrue();
     expect(statements.filter((sql) => sql === "FETCH FORWARD 2 FROM owner_buffered_parity_bulk_tenants")).toHaveLength(3);
+    expect(statements.filter((sql) => sql === "SELECT 1 AS owner_buffered_bulk_keepalive")).toHaveLength(3);
     expect(statements.at(-1)).toBe("COMMIT");
     expect(JSON.stringify(counts)).not.toContain("private-");
   });
@@ -170,6 +172,7 @@ describe("owner-buffered parity bulk runner", () => {
     );
     expect(seen).toEqual(["private-user-2", "private-user-3"]);
     expect(counts).toMatchObject({ candidates: 3, g1Equal: 2, g1Mismatch: 1, tenantRefused: 1, inserted: 1 });
+    expect(bulkCompletionStatus(counts)).toBe("partial");
   });
 
   test("generation drift aborts the run and rolls back enumeration", async () => {
@@ -227,6 +230,39 @@ describe("owner-buffered parity bulk runner", () => {
     expect(await run()).toMatchObject({ inserted: 2, unchanged: 0 });
     pass++;
     expect(await run()).toMatchObject({ inserted: 0, unchanged: 2 });
+  });
+
+  test("mid-run enumeration failure resumes past the committed prefix on rerun", async () => {
+    const proved = new Set<string>();
+    let fetches = 0;
+    const interrupted: Queryable = { async query<T>(sql: string) {
+      if (sql.startsWith("FETCH FORWARD")) {
+        fetches++;
+        if (fetches === 1) return { rows: [row(1)] as T[] };
+        throw new Error("simulated_cursor_failure");
+      }
+      return { rows: [] as T[] };
+    } };
+    const dependencies = {
+      readCensus: async (_n: Queryable, _t: Queryable, candidate: ParityTenant) => equalReceipt(candidate),
+      writeProof: async (_n: Queryable, _t: Queryable, candidate: ParityTenant) => {
+        const outcome = proved.has(candidate.userId) ? "unchanged" as const : "insert" as const;
+        proved.add(candidate.userId);
+        return { census: equalReceipt(candidate), outcome, writtenAt: "now" };
+      },
+    };
+    await expect(runBulkParity(
+      { query: async <T>() => ({ rows: [] as T[] }) }, interrupted, targetOwner(), GENERATION, 1, dependencies,
+    )).rejects.toThrow("bulk_enumeration_failed");
+    expect([...proved]).toEqual(["private-user-1"]);
+
+    const resumed = await runBulkParity(
+      { query: async <T>() => ({ rows: [] as T[] }) }, enumerator([[row(1)], [row(2)], []], []),
+      targetOwner(), GENERATION, 1, dependencies,
+    );
+    expect(resumed).toMatchObject({ candidates: 2, inserted: 1, unchanged: 1 });
+    expect([...proved]).toEqual(["private-user-1", "private-user-2"]);
+    expect(bulkCompletionStatus(resumed)).toBe("complete");
   });
 });
 
