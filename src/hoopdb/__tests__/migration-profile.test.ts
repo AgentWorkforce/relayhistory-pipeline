@@ -2600,7 +2600,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8")))).toBeNull();
     await db.exec(`ALTER ROLE search_consumer_runtime SET search_path = attacker`);
     expect(await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"), "utf8")))).toBeNull();
-    expect((await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8"))))?.code).toBe("55000");
+    // The consumer file owns the claimed-shape refusal now: its 28000 shape error, not the trampoline 55000.
+    expect((await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8"))))?.code).toBe("28000");
     // The added prerequisite shares the existing fail-closed, never-repair contract.
     await db.exec("RESET ROLE; ALTER ROLE bulls96_read_api INHERIT; SET ROLE migration_owner");
     expect((await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"), "utf8"))))?.code).toBe("55000");
