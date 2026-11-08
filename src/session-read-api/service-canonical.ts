@@ -23,6 +23,8 @@
  *   PIPELINE_ORG_FROM_PREFIX  must be exactly "true" (startup refuses otherwise): see below
  *   PIPELINE_KEY_PREFIX       the base of the org-derived key layout the ingest writes
  *   READ_API_TIMING_ASSUME_NO_TURNS                   as on the Worker (exactly "true")
+ *   READ_API_TURNS_ASSUME_NO_LEGACY                   exactly "true": this deployment never had a Neon source, so a
+ *                             scope with no legacy export marker serves its canonical turns instead of 501 turns_unknown
  *
  * The store is built by src/shared/locker.ts buildLockerStore, the builder
  * every other service uses, so credentials, provider selection and egress rules
@@ -103,7 +105,7 @@ export async function serviceCanonicalDeps(
   }
   return {
     timing: { state: pointers.state, source, assumeNoTurns: env.READ_API_TIMING_ASSUME_NO_TURNS?.trim() === "true" },
-    turns: { harnesses: sqlSessionHarnesses(run), source },
+    turns: { harnesses: sqlSessionHarnesses(run), source, assumeNoLegacy: env.READ_API_TURNS_ASSUME_NO_LEGACY === "true" },
     catalog: { state: pointers.state, source },
   };
 }
