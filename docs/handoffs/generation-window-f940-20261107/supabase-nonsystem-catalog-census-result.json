@@ -1,0 +1,4735 @@
+{
+  "version": 1,
+  "kind": "supabase_nonsystem_catalog_census_readonly",
+  "startedAt": "2026-11-07T21:14:23.353Z",
+  "sqlSha256": "6eb326424b3737f3a90f321c8f6e21fcc217bb07d0f34d1eaa476796843b5943",
+  "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "project": "pyamkrhoyszgzirqqffq",
+  "targetPreflight": {
+    "expected_owner_readonly_target": true
+  },
+  "censusExecuted": true,
+  "productionWrites": false,
+  "status": "observed_catalog",
+  "censusStartedAt": "2026-11-07T21:14:24.212Z",
+  "censusCompletedAt": "2026-11-07T21:14:24.581Z",
+  "resultRows": [
+    {
+      "catalog_census": {
+        "relations": [
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "amr_id_pk",
+            "qualified_name": "auth.amr_id_pk",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 5,
+            "relation_name": "audit_log_entries",
+            "qualified_name": "auth.audit_log_entries",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "audit_log_entries_pkey",
+            "qualified_name": "auth.audit_log_entries_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "audit_logs_instance_id_idx",
+            "qualified_name": "auth.audit_logs_instance_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "confirmation_token_idx",
+            "qualified_name": "auth.confirmation_token_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 25,
+            "relation_name": "custom_oauth_providers",
+            "qualified_name": "auth.custom_oauth_providers",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "custom_oauth_providers_created_at_idx",
+            "qualified_name": "auth.custom_oauth_providers_created_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "custom_oauth_providers_enabled_idx",
+            "qualified_name": "auth.custom_oauth_providers_enabled_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "custom_oauth_providers_identifier_idx",
+            "qualified_name": "auth.custom_oauth_providers_identifier_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "custom_oauth_providers_identifier_key",
+            "qualified_name": "auth.custom_oauth_providers_identifier_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "custom_oauth_providers_pkey",
+            "qualified_name": "auth.custom_oauth_providers_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "custom_oauth_providers_provider_type_idx",
+            "qualified_name": "auth.custom_oauth_providers_provider_type_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "email_change_token_current_idx",
+            "qualified_name": "auth.email_change_token_current_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "email_change_token_new_idx",
+            "qualified_name": "auth.email_change_token_new_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "factor_id_created_at_idx",
+            "qualified_name": "auth.factor_id_created_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 17,
+            "relation_name": "flow_state",
+            "qualified_name": "auth.flow_state",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "flow_state_created_at_idx",
+            "qualified_name": "auth.flow_state_created_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "flow_state_pkey",
+            "qualified_name": "auth.flow_state_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 9,
+            "relation_name": "identities",
+            "qualified_name": "auth.identities",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "identities_email_idx",
+            "qualified_name": "auth.identities_email_idx",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "identities_pkey",
+            "qualified_name": "auth.identities_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "identities_provider_id_provider_unique",
+            "qualified_name": "auth.identities_provider_id_provider_unique",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "identities_user_id_idx",
+            "qualified_name": "auth.identities_user_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "idx_auth_code",
+            "qualified_name": "auth.idx_auth_code",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "idx_oauth_client_states_created_at",
+            "qualified_name": "auth.idx_oauth_client_states_created_at",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "idx_user_id_auth_method",
+            "qualified_name": "auth.idx_user_id_auth_method",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "idx_users_created_at_desc",
+            "qualified_name": "auth.idx_users_created_at_desc",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "idx_users_email",
+            "qualified_name": "auth.idx_users_email",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "idx_users_last_sign_in_at_desc",
+            "qualified_name": "auth.idx_users_last_sign_in_at_desc",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "idx_users_name",
+            "qualified_name": "auth.idx_users_name",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 5,
+            "relation_name": "instances",
+            "qualified_name": "auth.instances",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "instances_pkey",
+            "qualified_name": "auth.instances_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 5,
+            "relation_name": "mfa_amr_claims",
+            "qualified_name": "auth.mfa_amr_claims",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "mfa_amr_claims_session_id_authentication_method_pkey",
+            "qualified_name": "auth.mfa_amr_claims_session_id_authentication_method_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "mfa_challenge_created_at_idx",
+            "qualified_name": "auth.mfa_challenge_created_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 7,
+            "relation_name": "mfa_challenges",
+            "qualified_name": "auth.mfa_challenges",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "mfa_challenges_pkey",
+            "qualified_name": "auth.mfa_challenges_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 13,
+            "relation_name": "mfa_factors",
+            "qualified_name": "auth.mfa_factors",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "mfa_factors_last_challenged_at_key",
+            "qualified_name": "auth.mfa_factors_last_challenged_at_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "mfa_factors_pkey",
+            "qualified_name": "auth.mfa_factors_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "mfa_factors_user_friendly_name_unique",
+            "qualified_name": "auth.mfa_factors_user_friendly_name_unique",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "mfa_factors_user_id_idx",
+            "qualified_name": "auth.mfa_factors_user_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 7,
+            "relation_name": "mfa_recovery_code_sets",
+            "qualified_name": "auth.mfa_recovery_code_sets",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "mfa_recovery_code_sets_mfa_factor_id_key",
+            "qualified_name": "auth.mfa_recovery_code_sets_mfa_factor_id_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "mfa_recovery_code_sets_pkey",
+            "qualified_name": "auth.mfa_recovery_code_sets_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "mfa_recovery_code_sets_user_id_key",
+            "qualified_name": "auth.mfa_recovery_code_sets_user_id_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 5,
+            "relation_name": "mfa_recovery_codes",
+            "qualified_name": "auth.mfa_recovery_codes",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "mfa_recovery_codes_pkey",
+            "qualified_name": "auth.mfa_recovery_codes_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "mfa_recovery_codes_set_id_idx",
+            "qualified_name": "auth.mfa_recovery_codes_set_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "oauth_auth_pending_exp_idx",
+            "qualified_name": "auth.oauth_auth_pending_exp_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 17,
+            "relation_name": "oauth_authorizations",
+            "qualified_name": "auth.oauth_authorizations",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "oauth_authorizations_authorization_code_key",
+            "qualified_name": "auth.oauth_authorizations_authorization_code_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "oauth_authorizations_authorization_id_key",
+            "qualified_name": "auth.oauth_authorizations_authorization_id_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "oauth_authorizations_pkey",
+            "qualified_name": "auth.oauth_authorizations_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 4,
+            "relation_name": "oauth_client_states",
+            "qualified_name": "auth.oauth_client_states",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "oauth_client_states_pkey",
+            "qualified_name": "auth.oauth_client_states_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 13,
+            "relation_name": "oauth_clients",
+            "qualified_name": "auth.oauth_clients",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "oauth_clients_deleted_at_idx",
+            "qualified_name": "auth.oauth_clients_deleted_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "oauth_clients_pkey",
+            "qualified_name": "auth.oauth_clients_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 6,
+            "relation_name": "oauth_consents",
+            "qualified_name": "auth.oauth_consents",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "oauth_consents_active_client_idx",
+            "qualified_name": "auth.oauth_consents_active_client_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "oauth_consents_active_user_client_idx",
+            "qualified_name": "auth.oauth_consents_active_user_client_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "oauth_consents_pkey",
+            "qualified_name": "auth.oauth_consents_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "oauth_consents_user_client_unique",
+            "qualified_name": "auth.oauth_consents_user_client_unique",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "oauth_consents_user_order_idx",
+            "qualified_name": "auth.oauth_consents_user_order_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 8,
+            "relation_name": "one_time_tokens",
+            "qualified_name": "auth.one_time_tokens",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "one_time_tokens_pkey",
+            "qualified_name": "auth.one_time_tokens_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "one_time_tokens_relates_to_hash_idx",
+            "qualified_name": "auth.one_time_tokens_relates_to_hash_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "one_time_tokens_token_hash_hash_idx",
+            "qualified_name": "auth.one_time_tokens_token_hash_hash_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "one_time_tokens_user_id_token_type_key",
+            "qualified_name": "auth.one_time_tokens_user_id_token_type_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "reauthentication_token_idx",
+            "qualified_name": "auth.reauthentication_token_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "recovery_token_idx",
+            "qualified_name": "auth.recovery_token_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 9,
+            "relation_name": "refresh_tokens",
+            "qualified_name": "auth.refresh_tokens",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "S",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 3,
+            "relation_name": "refresh_tokens_id_seq",
+            "qualified_name": "auth.refresh_tokens_id_seq",
+            "relrowsecurity": false,
+            "approximate_rows": 1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "refresh_tokens_instance_id_idx",
+            "qualified_name": "auth.refresh_tokens_instance_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "refresh_tokens_instance_id_user_id_idx",
+            "qualified_name": "auth.refresh_tokens_instance_id_user_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "refresh_tokens_parent_idx",
+            "qualified_name": "auth.refresh_tokens_parent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "refresh_tokens_pkey",
+            "qualified_name": "auth.refresh_tokens_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "refresh_tokens_session_id_revoked_idx",
+            "qualified_name": "auth.refresh_tokens_session_id_revoked_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "refresh_tokens_token_unique",
+            "qualified_name": "auth.refresh_tokens_token_unique",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "refresh_tokens_updated_at_idx",
+            "qualified_name": "auth.refresh_tokens_updated_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 9,
+            "relation_name": "saml_providers",
+            "qualified_name": "auth.saml_providers",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "saml_providers_entity_id_key",
+            "qualified_name": "auth.saml_providers_entity_id_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "saml_providers_pkey",
+            "qualified_name": "auth.saml_providers_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "saml_providers_sso_provider_id_idx",
+            "qualified_name": "auth.saml_providers_sso_provider_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 8,
+            "relation_name": "saml_relay_states",
+            "qualified_name": "auth.saml_relay_states",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "saml_relay_states_created_at_idx",
+            "qualified_name": "auth.saml_relay_states_created_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "saml_relay_states_for_email_idx",
+            "qualified_name": "auth.saml_relay_states_for_email_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "saml_relay_states_pkey",
+            "qualified_name": "auth.saml_relay_states_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "saml_relay_states_sso_provider_id_idx",
+            "qualified_name": "auth.saml_relay_states_sso_provider_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "schema_migrations",
+            "qualified_name": "auth.schema_migrations",
+            "relrowsecurity": true,
+            "approximate_rows": 82
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "schema_migrations_pkey",
+            "qualified_name": "auth.schema_migrations_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 82
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 8,
+            "relation_name": "scim_tokens",
+            "qualified_name": "auth.scim_tokens",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "scim_tokens_expires_at_idx",
+            "qualified_name": "auth.scim_tokens_expires_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "scim_tokens_pkey",
+            "qualified_name": "auth.scim_tokens_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "scim_tokens_revoked_at_idx",
+            "qualified_name": "auth.scim_tokens_revoked_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "scim_tokens_sso_provider_id_idx",
+            "qualified_name": "auth.scim_tokens_sso_provider_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "scim_tokens_token_hash_key",
+            "qualified_name": "auth.scim_tokens_token_hash_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 10,
+            "relation_name": "scim_users",
+            "qualified_name": "auth.scim_users",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 3,
+            "relation_name": "scim_users_created_at_idx",
+            "qualified_name": "auth.scim_users_created_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "scim_users_deleted_at_idx",
+            "qualified_name": "auth.scim_users_deleted_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "scim_users_external_id_key",
+            "qualified_name": "auth.scim_users_external_id_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "scim_users_id_idx",
+            "qualified_name": "auth.scim_users_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "scim_users_pkey",
+            "qualified_name": "auth.scim_users_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "scim_users_sso_provider_id_idx",
+            "qualified_name": "auth.scim_users_sso_provider_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 3,
+            "relation_name": "scim_users_updated_at_idx",
+            "qualified_name": "auth.scim_users_updated_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "scim_users_user_id_idx",
+            "qualified_name": "auth.scim_users_user_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 3,
+            "relation_name": "scim_users_user_name_idx",
+            "qualified_name": "auth.scim_users_user_name_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "scim_users_user_name_key",
+            "qualified_name": "auth.scim_users_user_name_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 15,
+            "relation_name": "sessions",
+            "qualified_name": "auth.sessions",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "sessions_not_after_idx",
+            "qualified_name": "auth.sessions_not_after_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "sessions_oauth_client_id_idx",
+            "qualified_name": "auth.sessions_oauth_client_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "sessions_pkey",
+            "qualified_name": "auth.sessions_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "sessions_user_id_idx",
+            "qualified_name": "auth.sessions_user_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 5,
+            "relation_name": "sso_domains",
+            "qualified_name": "auth.sso_domains",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "sso_domains_domain_idx",
+            "qualified_name": "auth.sso_domains_domain_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "sso_domains_pkey",
+            "qualified_name": "auth.sso_domains_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "sso_domains_sso_provider_id_idx",
+            "qualified_name": "auth.sso_domains_sso_provider_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 5,
+            "relation_name": "sso_providers",
+            "qualified_name": "auth.sso_providers",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "sso_providers_pkey",
+            "qualified_name": "auth.sso_providers_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "sso_providers_resource_id_idx",
+            "qualified_name": "auth.sso_providers_resource_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "sso_providers_resource_id_pattern_idx",
+            "qualified_name": "auth.sso_providers_resource_id_pattern_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "unique_phone_factor_per_user",
+            "qualified_name": "auth.unique_phone_factor_per_user",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "user_id_created_at_idx",
+            "qualified_name": "auth.user_id_created_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 35,
+            "relation_name": "users",
+            "qualified_name": "auth.users",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "users_email_partial_key",
+            "qualified_name": "auth.users_email_partial_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 2,
+            "relation_name": "users_instance_id_email_idx",
+            "qualified_name": "auth.users_instance_id_email_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "users_instance_id_idx",
+            "qualified_name": "auth.users_instance_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "users_is_anonymous_idx",
+            "qualified_name": "auth.users_is_anonymous_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "users_phone_key",
+            "qualified_name": "auth.users_phone_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "users_pkey",
+            "qualified_name": "auth.users_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 6,
+            "relation_name": "webauthn_challenges",
+            "qualified_name": "auth.webauthn_challenges",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "webauthn_challenges_expires_at_idx",
+            "qualified_name": "auth.webauthn_challenges_expires_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "webauthn_challenges_pkey",
+            "qualified_name": "auth.webauthn_challenges_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "webauthn_challenges_user_id_idx",
+            "qualified_name": "auth.webauthn_challenges_user_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 14,
+            "relation_name": "webauthn_credentials",
+            "qualified_name": "auth.webauthn_credentials",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "webauthn_credentials_credential_id_key",
+            "qualified_name": "auth.webauthn_credentials_credential_id_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "webauthn_credentials_pkey",
+            "qualified_name": "auth.webauthn_credentials_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_auth_admin",
+            "schema_name": "auth",
+            "column_count": 1,
+            "relation_name": "webauthn_credentials_user_id_idx",
+            "qualified_name": "auth.webauthn_credentials_user_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "v",
+            "owner_role": "postgres",
+            "schema_name": "extensions",
+            "column_count": 49,
+            "relation_name": "pg_stat_statements",
+            "qualified_name": "extensions.pg_stat_statements",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "v",
+            "owner_role": "postgres",
+            "schema_name": "extensions",
+            "column_count": 2,
+            "relation_name": "pg_stat_statements_info",
+            "qualified_name": "extensions.pg_stat_statements_info",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "history",
+            "column_count": 3,
+            "relation_name": "__history_migrations",
+            "qualified_name": "history.__history_migrations",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "history",
+            "column_count": 1,
+            "relation_name": "__history_migrations_pkey",
+            "qualified_name": "history.__history_migrations_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "history",
+            "column_count": 4,
+            "relation_name": "__history_readiness",
+            "qualified_name": "history.__history_readiness",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "history",
+            "column_count": 1,
+            "relation_name": "__history_readiness_pkey",
+            "qualified_name": "history.__history_readiness_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "history",
+            "column_count": 6,
+            "relation_name": "probe_connections",
+            "qualified_name": "history.probe_connections",
+            "relrowsecurity": false,
+            "approximate_rows": 384
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "history",
+            "column_count": 2,
+            "relation_name": "probe_connections_org_seen",
+            "qualified_name": "history.probe_connections_org_seen",
+            "relrowsecurity": false,
+            "approximate_rows": 384
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "history",
+            "column_count": 3,
+            "relation_name": "probe_connections_pkey",
+            "qualified_name": "history.probe_connections_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 384
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_realtime_admin",
+            "schema_name": "realtime",
+            "column_count": 1,
+            "relation_name": "ix_realtime_subscription_entity",
+            "qualified_name": "realtime.ix_realtime_subscription_entity",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "p",
+            "owner_role": "supabase_realtime_admin",
+            "schema_name": "realtime",
+            "column_count": 10,
+            "relation_name": "messages",
+            "qualified_name": "realtime.messages",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "I",
+            "owner_role": "supabase_realtime_admin",
+            "schema_name": "realtime",
+            "column_count": 2,
+            "relation_name": "messages_inserted_at_topic_index",
+            "qualified_name": "realtime.messages_inserted_at_topic_index",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "I",
+            "owner_role": "supabase_realtime_admin",
+            "schema_name": "realtime",
+            "column_count": 2,
+            "relation_name": "messages_pkey",
+            "qualified_name": "realtime.messages_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_realtime_admin",
+            "schema_name": "realtime",
+            "column_count": 1,
+            "relation_name": "pk_subscription",
+            "qualified_name": "realtime.pk_subscription",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_admin",
+            "schema_name": "realtime",
+            "column_count": 2,
+            "relation_name": "schema_migrations",
+            "qualified_name": "realtime.schema_migrations",
+            "relrowsecurity": false,
+            "approximate_rows": 91
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_admin",
+            "schema_name": "realtime",
+            "column_count": 1,
+            "relation_name": "schema_migrations_pkey",
+            "qualified_name": "realtime.schema_migrations_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 91
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_realtime_admin",
+            "schema_name": "realtime",
+            "column_count": 9,
+            "relation_name": "subscription",
+            "qualified_name": "realtime.subscription",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "S",
+            "owner_role": "supabase_realtime_admin",
+            "schema_name": "realtime",
+            "column_count": 3,
+            "relation_name": "subscription_id_seq",
+            "qualified_name": "realtime.subscription_id_seq",
+            "relrowsecurity": false,
+            "approximate_rows": 1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_realtime_admin",
+            "schema_name": "realtime",
+            "column_count": 5,
+            "relation_name": "subscription_subscription_id_entity_filters_action_filter_selec",
+            "qualified_name": "realtime.subscription_subscription_id_entity_filters_action_filter_selec",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "c",
+            "owner_role": "supabase_realtime_admin",
+            "schema_name": "realtime",
+            "column_count": 4,
+            "relation_name": "user_defined_filter",
+            "qualified_name": "realtime.user_defined_filter",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "c",
+            "owner_role": "supabase_realtime_admin",
+            "schema_name": "realtime",
+            "column_count": 6,
+            "relation_name": "wal_column",
+            "qualified_name": "realtime.wal_column",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "c",
+            "owner_role": "supabase_realtime_admin",
+            "schema_name": "realtime",
+            "column_count": 4,
+            "relation_name": "wal_rls",
+            "qualified_name": "realtime.wal_rls",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "__96bulls_migrations",
+            "qualified_name": "sessions.__96bulls_migrations",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "__96bulls_migrations_pkey",
+            "qualified_name": "sessions.__96bulls_migrations_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "__96bulls_role_validation",
+            "qualified_name": "sessions.__96bulls_role_validation",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "__96bulls_role_validation_pkey",
+            "qualified_name": "sessions.__96bulls_role_validation_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 19,
+            "relation_name": "auth_sessions",
+            "qualified_name": "sessions.auth_sessions",
+            "relrowsecurity": true,
+            "approximate_rows": 163417
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "auth_sessions_access_token_hash_key",
+            "qualified_name": "sessions.auth_sessions_access_token_hash_key",
+            "relrowsecurity": false,
+            "approximate_rows": 163417
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "auth_sessions_family_idx",
+            "qualified_name": "sessions.auth_sessions_family_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 163417
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "auth_sessions_org_idx",
+            "qualified_name": "sessions.auth_sessions_org_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 163417
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "auth_sessions_pkey",
+            "qualified_name": "sessions.auth_sessions_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 163417
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "auth_sessions_refresh_token_hash_key",
+            "qualified_name": "sessions.auth_sessions_refresh_token_hash_key",
+            "relrowsecurity": false,
+            "approximate_rows": 163417
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "auth_token_verifier_policy",
+            "qualified_name": "sessions.auth_token_verifier_policy",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "auth_token_verifier_policy_pkey",
+            "qualified_name": "sessions.auth_token_verifier_policy_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "backfill_activation_ready",
+            "qualified_name": "sessions.backfill_activation_ready",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "backfill_activation_ready_pkey",
+            "qualified_name": "sessions.backfill_activation_ready_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 7,
+            "relation_name": "claimless_uses",
+            "qualified_name": "sessions.claimless_uses",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "claimless_uses_pkey",
+            "qualified_name": "sessions.claimless_uses_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "claimless_window_activations",
+            "qualified_name": "sessions.claimless_window_activations",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "claimless_window_activations_pkey",
+            "qualified_name": "sessions.claimless_window_activations_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "export_deferred_sessions",
+            "qualified_name": "sessions.export_deferred_sessions",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "export_deferred_sessions_open_idx",
+            "qualified_name": "sessions.export_deferred_sessions_open_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "export_deferred_sessions_pkey",
+            "qualified_name": "sessions.export_deferred_sessions_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 12,
+            "relation_name": "ingest_batches",
+            "qualified_name": "sessions.ingest_batches",
+            "relrowsecurity": true,
+            "approximate_rows": 237366
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_batches_pkey",
+            "qualified_name": "sessions.ingest_batches_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 238379
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_buffer_admission",
+            "qualified_name": "sessions.ingest_buffer_admission",
+            "relrowsecurity": true,
+            "approximate_rows": 974
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_buffer_admission_pkey",
+            "qualified_name": "sessions.ingest_buffer_admission_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 974
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 10,
+            "relation_name": "ingest_buffer_outbox",
+            "qualified_name": "sessions.ingest_buffer_outbox",
+            "relrowsecurity": true,
+            "approximate_rows": 234823
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_buffer_outbox_pkey",
+            "qualified_name": "sessions.ingest_buffer_outbox_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 234823
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 15,
+            "relation_name": "ingest_claim_attempts",
+            "qualified_name": "sessions.ingest_claim_attempts",
+            "relrowsecurity": true,
+            "approximate_rows": 239531
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_claim_attempts_batch_idx",
+            "qualified_name": "sessions.ingest_claim_attempts_batch_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 239531
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_claim_attempts_pkey",
+            "qualified_name": "sessions.ingest_claim_attempts_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 239531
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 10,
+            "relation_name": "ingest_control_receipts",
+            "qualified_name": "sessions.ingest_control_receipts",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "ingest_control_receipts_pkey",
+            "qualified_name": "sessions.ingest_control_receipts_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 9,
+            "relation_name": "ingest_custody_global",
+            "qualified_name": "sessions.ingest_custody_global",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_custody_global_pkey",
+            "qualified_name": "sessions.ingest_custody_global_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 15,
+            "relation_name": "ingest_custody_imports",
+            "qualified_name": "sessions.ingest_custody_imports",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_custody_imports_import_token_key",
+            "qualified_name": "sessions.ingest_custody_imports_import_token_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_custody_imports_pkey",
+            "qualified_name": "sessions.ingest_custody_imports_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_custody_pages",
+            "qualified_name": "sessions.ingest_custody_pages",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "ingest_custody_pages_pkey",
+            "qualified_name": "sessions.ingest_custody_pages_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 21,
+            "relation_name": "ingest_custody_records",
+            "qualified_name": "sessions.ingest_custody_records",
+            "relrowsecurity": true,
+            "approximate_rows": 3318662
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "ingest_custody_records_import",
+            "qualified_name": "sessions.ingest_custody_records_import",
+            "relrowsecurity": false,
+            "approximate_rows": 3318662
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "ingest_custody_records_import_token_source_key_sha256_key",
+            "qualified_name": "sessions.ingest_custody_records_import_token_source_key_sha256_key",
+            "relrowsecurity": false,
+            "approximate_rows": 3318662
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_custody_records_pkey",
+            "qualified_name": "sessions.ingest_custody_records_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 3318662
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "ingest_fence_owners",
+            "qualified_name": "sessions.ingest_fence_owners",
+            "relrowsecurity": true,
+            "approximate_rows": 81
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "ingest_fence_owners_pkey",
+            "qualified_name": "sessions.ingest_fence_owners_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 81
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 7,
+            "relation_name": "ingest_fence_versions",
+            "qualified_name": "sessions.ingest_fence_versions",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_fence_versions_pkey",
+            "qualified_name": "sessions.ingest_fence_versions_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 9,
+            "relation_name": "ingest_frozen_source_completeness",
+            "qualified_name": "sessions.ingest_frozen_source_completeness",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_frozen_source_completeness_pkey",
+            "qualified_name": "sessions.ingest_frozen_source_completeness_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_frozen_source_deletions",
+            "qualified_name": "sessions.ingest_frozen_source_deletions",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_frozen_source_deletions_pkey",
+            "qualified_name": "sessions.ingest_frozen_source_deletions_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_frozen_source_org_seals",
+            "qualified_name": "sessions.ingest_frozen_source_org_seals",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_frozen_source_org_seals_pkey",
+            "qualified_name": "sessions.ingest_frozen_source_org_seals_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_frozen_source_receipts",
+            "qualified_name": "sessions.ingest_frozen_source_receipts",
+            "relrowsecurity": true,
+            "approximate_rows": 33175
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_frozen_source_receipts_pkey",
+            "qualified_name": "sessions.ingest_frozen_source_receipts_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 33175
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 14,
+            "relation_name": "ingest_frozen_source_records",
+            "qualified_name": "sessions.ingest_frozen_source_records",
+            "relrowsecurity": true,
+            "approximate_rows": 8038821
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_frozen_source_records_pkey",
+            "qualified_name": "sessions.ingest_frozen_source_records_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 8038821
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "ingest_frozen_source_resets",
+            "qualified_name": "sessions.ingest_frozen_source_resets",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_frozen_source_resets_pkey",
+            "qualified_name": "sessions.ingest_frozen_source_resets_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 14,
+            "relation_name": "ingest_lazy_ack_decisions",
+            "qualified_name": "sessions.ingest_lazy_ack_decisions",
+            "relrowsecurity": true,
+            "approximate_rows": 27355820
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "ingest_lazy_ack_decisions_pkey",
+            "qualified_name": "sessions.ingest_lazy_ack_decisions_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 27355820
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "ingest_lazy_native_current_owner",
+            "qualified_name": "sessions.ingest_lazy_native_current_owner",
+            "relrowsecurity": false,
+            "approximate_rows": 15592271
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 20,
+            "relation_name": "ingest_lazy_native_slots",
+            "qualified_name": "sessions.ingest_lazy_native_slots",
+            "relrowsecurity": true,
+            "approximate_rows": 15592271
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_lazy_native_slots_pkey",
+            "qualified_name": "sessions.ingest_lazy_native_slots_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 15592271
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 11,
+            "relation_name": "ingest_lazy_policy",
+            "qualified_name": "sessions.ingest_lazy_policy",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_lazy_policy_pkey",
+            "qualified_name": "sessions.ingest_lazy_policy_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 8,
+            "relation_name": "ingest_lazy_user_seals",
+            "qualified_name": "sessions.ingest_lazy_user_seals",
+            "relrowsecurity": true,
+            "approximate_rows": 51
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "ingest_lazy_user_seals_pkey",
+            "qualified_name": "sessions.ingest_lazy_user_seals_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 51
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "ingest_publication_attempt_stage_idx",
+            "qualified_name": "sessions.ingest_publication_attempt_stage_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 21,
+            "relation_name": "ingest_publication_attempts",
+            "qualified_name": "sessions.ingest_publication_attempts",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_publication_attempts_pkey",
+            "qualified_name": "sessions.ingest_publication_attempts_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_publication_deferrals",
+            "qualified_name": "sessions.ingest_publication_deferrals",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_publication_deferrals_pkey",
+            "qualified_name": "sessions.ingest_publication_deferrals_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 11,
+            "relation_name": "ingest_publication_frontiers",
+            "qualified_name": "sessions.ingest_publication_frontiers",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_publication_frontiers_pkey",
+            "qualified_name": "sessions.ingest_publication_frontiers_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 16,
+            "relation_name": "ingest_publication_generations",
+            "qualified_name": "sessions.ingest_publication_generations",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_publication_generations_pkey",
+            "qualified_name": "sessions.ingest_publication_generations_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_publication_generations_prefix_key",
+            "qualified_name": "sessions.ingest_publication_generations_prefix_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 21,
+            "relation_name": "ingest_publication_heads",
+            "qualified_name": "sessions.ingest_publication_heads",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "ingest_publication_heads_org_id_workspace_id_physical_sourc_key",
+            "qualified_name": "sessions.ingest_publication_heads_org_id_workspace_id_physical_sourc_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_publication_heads_pkey",
+            "qualified_name": "sessions.ingest_publication_heads_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 9,
+            "relation_name": "ingest_publication_images",
+            "qualified_name": "sessions.ingest_publication_images",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_publication_images_manifest_key_key",
+            "qualified_name": "sessions.ingest_publication_images_manifest_key_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "ingest_publication_images_pkey",
+            "qualified_name": "sessions.ingest_publication_images_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 12,
+            "relation_name": "ingest_publication_objects",
+            "qualified_name": "sessions.ingest_publication_objects",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "ingest_publication_objects_cleanup_idx",
+            "qualified_name": "sessions.ingest_publication_objects_cleanup_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_publication_objects_pkey",
+            "qualified_name": "sessions.ingest_publication_objects_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 9,
+            "relation_name": "ingest_receipt_ord_seats",
+            "qualified_name": "sessions.ingest_receipt_ord_seats",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "ingest_receipt_ord_seats_pkey",
+            "qualified_name": "sessions.ingest_receipt_ord_seats_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_receipt_record_heads",
+            "qualified_name": "sessions.ingest_receipt_record_heads",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_receipt_record_heads_pkey",
+            "qualified_name": "sessions.ingest_receipt_record_heads_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 8,
+            "relation_name": "ingest_receipt_seat_clock",
+            "qualified_name": "sessions.ingest_receipt_seat_clock",
+            "relrowsecurity": true,
+            "approximate_rows": 1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_receipt_seat_clock_pkey",
+            "qualified_name": "sessions.ingest_receipt_seat_clock_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 8,
+            "relation_name": "ingest_receipt_seats",
+            "qualified_name": "sessions.ingest_receipt_seats",
+            "relrowsecurity": true,
+            "approximate_rows": 25697212
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_receipt_seats_pkey",
+            "qualified_name": "sessions.ingest_receipt_seats_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 25697212
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_receipt_seats_seat_key",
+            "qualified_name": "sessions.ingest_receipt_seats_seat_key",
+            "relrowsecurity": false,
+            "approximate_rows": 25697212
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 14,
+            "relation_name": "ingest_record_revisions",
+            "qualified_name": "sessions.ingest_record_revisions",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_record_revisions_pkey",
+            "qualified_name": "sessions.ingest_record_revisions_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_record_revisions_session_idx",
+            "qualified_name": "sessions.ingest_record_revisions_session_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 11,
+            "relation_name": "ingest_seed_captures",
+            "qualified_name": "sessions.ingest_seed_captures",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_seed_captures_pkey",
+            "qualified_name": "sessions.ingest_seed_captures_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_seed_fence_baselines",
+            "qualified_name": "sessions.ingest_seed_fence_baselines",
+            "relrowsecurity": true,
+            "approximate_rows": 51
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "ingest_seed_fence_baselines_pkey",
+            "qualified_name": "sessions.ingest_seed_fence_baselines_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 51
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "ingest_seed_source_epochs",
+            "qualified_name": "sessions.ingest_seed_source_epochs",
+            "relrowsecurity": true,
+            "approximate_rows": 136862
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "ingest_seed_source_epochs_pkey",
+            "qualified_name": "sessions.ingest_seed_source_epochs_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 136862
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_session_ownership",
+            "qualified_name": "sessions.ingest_session_ownership",
+            "relrowsecurity": true,
+            "approximate_rows": 47735
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_session_ownership_pkey",
+            "qualified_name": "sessions.ingest_session_ownership_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 47735
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 12,
+            "relation_name": "ingest_source_control_heads",
+            "qualified_name": "sessions.ingest_source_control_heads",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "ingest_source_control_heads_pkey",
+            "qualified_name": "sessions.ingest_source_control_heads_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "ingest_stage_gc_scan_idx",
+            "qualified_name": "sessions.ingest_stage_gc_scan_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 237673
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 29,
+            "relation_name": "ingest_stage_intents",
+            "qualified_name": "sessions.ingest_stage_intents",
+            "relrowsecurity": true,
+            "approximate_rows": 239493
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "ingest_stage_intents_claim_token_stage_key_key",
+            "qualified_name": "sessions.ingest_stage_intents_claim_token_stage_key_key",
+            "relrowsecurity": false,
+            "approximate_rows": 239493
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "ingest_stage_intents_cleanup_idx",
+            "qualified_name": "sessions.ingest_stage_intents_cleanup_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 239493
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_stage_intents_pkey",
+            "qualified_name": "sessions.ingest_stage_intents_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 239493
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "ingest_stage_intents_stage_key_key",
+            "qualified_name": "sessions.ingest_stage_intents_stage_key_key",
+            "relrowsecurity": false,
+            "approximate_rows": 239493
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "ingest_tenant_slots",
+            "qualified_name": "sessions.ingest_tenant_slots",
+            "relrowsecurity": true,
+            "approximate_rows": 5
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "ingest_tenant_slots_org_expiry_idx",
+            "qualified_name": "sessions.ingest_tenant_slots_org_expiry_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 5
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "ingest_tenant_slots_pkey",
+            "qualified_name": "sessions.ingest_tenant_slots_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 5
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 13,
+            "relation_name": "machines",
+            "qualified_name": "sessions.machines",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "machines_pkey",
+            "qualified_name": "sessions.machines_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "manifest_readiness",
+            "qualified_name": "sessions.manifest_readiness",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "manifest_readiness_pkey",
+            "qualified_name": "sessions.manifest_readiness_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "migration_assertion_chunks",
+            "qualified_name": "sessions.migration_assertion_chunks",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "migration_assertion_chunks_expires_idx",
+            "qualified_name": "sessions.migration_assertion_chunks_expires_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "migration_assertion_chunks_pkey",
+            "qualified_name": "sessions.migration_assertion_chunks_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 10,
+            "relation_name": "migration_assertion_uses",
+            "qualified_name": "sessions.migration_assertion_uses",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "migration_assertion_uses_expires_idx",
+            "qualified_name": "sessions.migration_assertion_uses_expires_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "migration_assertion_uses_grant_idx",
+            "qualified_name": "sessions.migration_assertion_uses_grant_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "migration_assertion_uses_nonce_key",
+            "qualified_name": "sessions.migration_assertion_uses_nonce_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "migration_assertion_uses_pkey",
+            "qualified_name": "sessions.migration_assertion_uses_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 10,
+            "relation_name": "migration_base_read_uses",
+            "qualified_name": "sessions.migration_base_read_uses",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "migration_base_read_uses_expires_idx",
+            "qualified_name": "sessions.migration_base_read_uses_expires_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "migration_base_read_uses_nonce_key",
+            "qualified_name": "sessions.migration_base_read_uses_nonce_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "migration_base_read_uses_pkey",
+            "qualified_name": "sessions.migration_base_read_uses_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 10,
+            "relation_name": "migration_ingest_audit",
+            "qualified_name": "sessions.migration_ingest_audit",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "migration_ingest_audit_grant_idx",
+            "qualified_name": "sessions.migration_ingest_audit_grant_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "S",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "migration_ingest_audit_id_seq",
+            "qualified_name": "sessions.migration_ingest_audit_id_seq",
+            "relrowsecurity": false,
+            "approximate_rows": 1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "migration_ingest_audit_pkey",
+            "qualified_name": "sessions.migration_ingest_audit_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 18,
+            "relation_name": "pipeline_dead_letters",
+            "qualified_name": "sessions.pipeline_dead_letters",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "pipeline_dead_letters_pkey",
+            "qualified_name": "sessions.pipeline_dead_letters_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_dead_letters_session_idx",
+            "qualified_name": "sessions.pipeline_dead_letters_session_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "pipeline_dead_letters_state_idx",
+            "qualified_name": "sessions.pipeline_dead_letters_state_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "pipeline_dead_letters_trace_idx",
+            "qualified_name": "sessions.pipeline_dead_letters_trace_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "p",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 14,
+            "relation_name": "pipeline_events",
+            "qualified_name": "sessions.pipeline_events",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 14,
+            "relation_name": "pipeline_events_2026_11",
+            "qualified_name": "sessions.pipeline_events_2026_11",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_events_2026_11_stage_at_idx",
+            "qualified_name": "sessions.pipeline_events_2026_11_stage_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_events_2026_11_trace_id_at_idx",
+            "qualified_name": "sessions.pipeline_events_2026_11_trace_id_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 14,
+            "relation_name": "pipeline_events_2026_12",
+            "qualified_name": "sessions.pipeline_events_2026_12",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_events_2026_12_stage_at_idx",
+            "qualified_name": "sessions.pipeline_events_2026_12_stage_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_events_2026_12_trace_id_at_idx",
+            "qualified_name": "sessions.pipeline_events_2026_12_trace_id_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 14,
+            "relation_name": "pipeline_events_2027_01",
+            "qualified_name": "sessions.pipeline_events_2027_01",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_events_2027_01_stage_at_idx",
+            "qualified_name": "sessions.pipeline_events_2027_01_stage_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_events_2027_01_trace_id_at_idx",
+            "qualified_name": "sessions.pipeline_events_2027_01_trace_id_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 14,
+            "relation_name": "pipeline_events_default",
+            "qualified_name": "sessions.pipeline_events_default",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_events_default_stage_at_idx",
+            "qualified_name": "sessions.pipeline_events_default_stage_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_events_default_trace_id_at_idx",
+            "qualified_name": "sessions.pipeline_events_default_trace_id_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "I",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_events_failures_idx",
+            "qualified_name": "sessions.pipeline_events_failures_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "I",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_events_trace_idx",
+            "qualified_name": "sessions.pipeline_events_trace_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 17,
+            "relation_name": "pipeline_jobs",
+            "qualified_name": "sessions.pipeline_jobs",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "pipeline_jobs_claim_idx",
+            "qualified_name": "sessions.pipeline_jobs_claim_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "S",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "pipeline_jobs_id_seq",
+            "qualified_name": "sessions.pipeline_jobs_id_seq",
+            "relrowsecurity": false,
+            "approximate_rows": 1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "pipeline_jobs_pkey",
+            "qualified_name": "sessions.pipeline_jobs_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "pipeline_jobs_session_idx",
+            "qualified_name": "sessions.pipeline_jobs_session_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "pipeline_jobs_session_uuid_idx",
+            "qualified_name": "sessions.pipeline_jobs_session_uuid_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "pipeline_jobs_trace_idx",
+            "qualified_name": "sessions.pipeline_jobs_trace_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "repo_names",
+            "qualified_name": "sessions.repo_names",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "repo_names_pkey",
+            "qualified_name": "sessions.repo_names_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "repo_names_repo_idx",
+            "qualified_name": "sessions.repo_names_repo_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 14,
+            "relation_name": "repos",
+            "qualified_name": "sessions.repos",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "repos_merged_idx",
+            "qualified_name": "sessions.repos_merged_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "repos_owner_idx",
+            "qualified_name": "sessions.repos_owner_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "repos_pkey",
+            "qualified_name": "sessions.repos_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "repos_root_uq",
+            "qualified_name": "sessions.repos_root_uq",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_brief_attempts",
+            "qualified_name": "sessions.session_brief_attempts",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "session_brief_attempts_day_idx",
+            "qualified_name": "sessions.session_brief_attempts_day_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_brief_attempts_pkey",
+            "qualified_name": "sessions.session_brief_attempts_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 13,
+            "relation_name": "session_brief_wakeups",
+            "qualified_name": "sessions.session_brief_wakeups",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "session_brief_wakeups_due_idx",
+            "qualified_name": "sessions.session_brief_wakeups_due_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "session_brief_wakeups_evidence_idx",
+            "qualified_name": "sessions.session_brief_wakeups_evidence_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "session_brief_wakeups_pkey",
+            "qualified_name": "sessions.session_brief_wakeups_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 29,
+            "relation_name": "session_briefs",
+            "qualified_name": "sessions.session_briefs",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "session_briefs_pkey",
+            "qualified_name": "sessions.session_briefs_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 62,
+            "relation_name": "session_directory",
+            "qualified_name": "sessions.session_directory",
+            "relrowsecurity": true,
+            "approximate_rows": 137885
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_directory_agent_recent_idx",
+            "qualified_name": "sessions.session_directory_agent_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 506
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 7,
+            "relation_name": "session_directory_agents",
+            "qualified_name": "sessions.session_directory_agents",
+            "relrowsecurity": true,
+            "approximate_rows": 521
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_agents_pkey",
+            "qualified_name": "sessions.session_directory_agents_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 521
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_directory_agents_recent_idx",
+            "qualified_name": "sessions.session_directory_agents_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 521
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "session_directory_catalog_rollout",
+            "qualified_name": "sessions.session_directory_catalog_rollout",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "session_directory_catalog_rollout_pkey",
+            "qualified_name": "sessions.session_directory_catalog_rollout_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_created_recent_idx",
+            "qualified_name": "sessions.session_directory_created_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 137881
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_directory_event_pending",
+            "qualified_name": "sessions.session_directory_event_pending",
+            "relrowsecurity": true,
+            "approximate_rows": 136738
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "session_directory_event_pending_dirty_idx",
+            "qualified_name": "sessions.session_directory_event_pending_dirty_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 136738
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "session_directory_event_pending_pkey",
+            "qualified_name": "sessions.session_directory_event_pending_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 136738
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_event_times",
+            "qualified_name": "sessions.session_directory_event_times",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_event_times_pkey",
+            "qualified_name": "sessions.session_directory_event_times_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_event_times_window_idx",
+            "qualified_name": "sessions.session_directory_event_times_window_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "session_directory_event_unready_idx",
+            "qualified_name": "sessions.session_directory_event_unready_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 137881
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_events_recent_idx",
+            "qualified_name": "sessions.session_directory_events_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 137881
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_harness_recent_idx",
+            "qualified_name": "sessions.session_directory_harness_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 137881
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_directory_machines",
+            "qualified_name": "sessions.session_directory_machines",
+            "relrowsecurity": true,
+            "approximate_rows": 151802
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_machines_pkey",
+            "qualified_name": "sessions.session_directory_machines_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 151802
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_directory_machines_recent_idx",
+            "qualified_name": "sessions.session_directory_machines_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 151802
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_no_project_recent_idx",
+            "qualified_name": "sessions.session_directory_no_project_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 133101
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_org_recent_idx",
+            "qualified_name": "sessions.session_directory_org_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 137881
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "session_directory_pkey",
+            "qualified_name": "sessions.session_directory_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 137885
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_directory_project_name_recent_idx",
+            "qualified_name": "sessions.session_directory_project_name_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 5084
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_directory_project_recent_idx",
+            "qualified_name": "sessions.session_directory_project_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 4781
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_directory_relationships",
+            "qualified_name": "sessions.session_directory_relationships",
+            "relrowsecurity": true,
+            "approximate_rows": 11411
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "session_directory_relationships_child_idx",
+            "qualified_name": "sessions.session_directory_relationships_child_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 10707
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_relationships_pkey",
+            "qualified_name": "sessions.session_directory_relationships_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 11411
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 7,
+            "relation_name": "session_directory_resurrection_fences",
+            "qualified_name": "sessions.session_directory_resurrection_fences",
+            "relrowsecurity": true,
+            "approximate_rows": 1169
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_resurrection_fences_pkey",
+            "qualified_name": "sessions.session_directory_resurrection_fences_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 1169
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "session_directory_rollout",
+            "qualified_name": "sessions.session_directory_rollout",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "session_directory_rollout_pkey",
+            "qualified_name": "sessions.session_directory_rollout_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "session_directory_search_token_policy",
+            "qualified_name": "sessions.session_directory_search_token_policy",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "session_directory_search_token_policy_pkey",
+            "qualified_name": "sessions.session_directory_search_token_policy_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "session_directory_session_lookup_idx",
+            "qualified_name": "sessions.session_directory_session_lookup_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 137885
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_directory_state_recent_idx",
+            "qualified_name": "sessions.session_directory_state_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 137881
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "session_directory_tenant_project_text_trgm_idx",
+            "qualified_name": "sessions.session_directory_tenant_project_text_trgm_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 5084
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "session_directory_tenant_project_trgm_idx",
+            "qualified_name": "sessions.session_directory_tenant_project_trgm_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 4781
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "session_directory_tenant_search_trgm_idx",
+            "qualified_name": "sessions.session_directory_tenant_search_trgm_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 7129
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_directory_users",
+            "qualified_name": "sessions.session_directory_users",
+            "relrowsecurity": true,
+            "approximate_rows": 137810
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_users_pkey",
+            "qualified_name": "sessions.session_directory_users_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 137810
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_directory_users_recent_idx",
+            "qualified_name": "sessions.session_directory_users_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 137810
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_directory_workspace_recent_idx",
+            "qualified_name": "sessions.session_directory_workspace_recent_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 137881
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 41,
+            "relation_name": "session_index",
+            "qualified_name": "sessions.session_index",
+            "relrowsecurity": true,
+            "approximate_rows": 157751
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_index_canonical_live",
+            "qualified_name": "sessions.session_index_canonical_live",
+            "relrowsecurity": false,
+            "approximate_rows": 151557
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 14,
+            "relation_name": "session_index_ext",
+            "qualified_name": "sessions.session_index_ext",
+            "relrowsecurity": true,
+            "approximate_rows": 157620
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_index_ext_pkey",
+            "qualified_name": "sessions.session_index_ext_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 157620
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "session_index_ext_session_uuid_key",
+            "qualified_name": "sessions.session_index_ext_session_uuid_key",
+            "relrowsecurity": false,
+            "approximate_rows": 157620
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 5,
+            "relation_name": "session_index_pkey",
+            "qualified_name": "sessions.session_index_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 157751
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 17,
+            "relation_name": "session_summaries",
+            "qualified_name": "sessions.session_summaries",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "session_summaries_pkey",
+            "qualified_name": "sessions.session_summaries_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 13,
+            "relation_name": "session_verdicts",
+            "qualified_name": "sessions.session_verdicts",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "S",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 3,
+            "relation_name": "session_verdicts_id_seq",
+            "qualified_name": "sessions.session_verdicts_id_seq",
+            "relrowsecurity": false,
+            "approximate_rows": 1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 7,
+            "relation_name": "session_verdicts_org_id_workspace_id_harness_session_id_mac_key",
+            "qualified_name": "sessions.session_verdicts_org_id_workspace_id_harness_session_id_mac_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "session_verdicts_pkey",
+            "qualified_name": "sessions.session_verdicts_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "si_harness",
+            "qualified_name": "sessions.si_harness",
+            "relrowsecurity": false,
+            "approximate_rows": 151557
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "si_machine",
+            "qualified_name": "sessions.si_machine",
+            "relrowsecurity": false,
+            "approximate_rows": 151557
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "si_org_recent",
+            "qualified_name": "sessions.si_org_recent",
+            "relrowsecurity": false,
+            "approximate_rows": 151557
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 7,
+            "relation_name": "si_project",
+            "qualified_name": "sessions.si_project",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "si_remote",
+            "qualified_name": "sessions.si_remote",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 7,
+            "relation_name": "si_repo",
+            "qualified_name": "sessions.si_repo",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 2,
+            "relation_name": "si_session",
+            "qualified_name": "sessions.si_session",
+            "relrowsecurity": false,
+            "approximate_rows": 157751
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 7,
+            "relation_name": "si_state",
+            "qualified_name": "sessions.si_state",
+            "relrowsecurity": false,
+            "approximate_rows": 151557
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 1,
+            "relation_name": "si_trace",
+            "qualified_name": "sessions.si_trace",
+            "relrowsecurity": false,
+            "approximate_rows": 157751
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 7,
+            "relation_name": "si_user_recent",
+            "qualified_name": "sessions.si_user_recent",
+            "relrowsecurity": false,
+            "approximate_rows": 151557
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "si_ws_recent",
+            "qualified_name": "sessions.si_ws_recent",
+            "relrowsecurity": false,
+            "approximate_rows": 151557
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 7,
+            "relation_name": "upload_deletions",
+            "qualified_name": "sessions.upload_deletions",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "upload_deletions_pkey",
+            "qualified_name": "sessions.upload_deletions_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 8,
+            "relation_name": "upload_erasure_rearm",
+            "qualified_name": "sessions.upload_erasure_rearm",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 7,
+            "relation_name": "upload_erasure_rearm_pkey",
+            "qualified_name": "sessions.upload_erasure_rearm_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 6,
+            "relation_name": "upload_resets",
+            "qualified_name": "sessions.upload_resets",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "upload_resets_pkey",
+            "qualified_name": "sessions.upload_resets_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "postgres",
+            "schema_name": "sessions",
+            "column_count": 4,
+            "relation_name": "upload_resets_user_time_idx",
+            "qualified_name": "sessions.upload_resets_user_time_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "bname",
+            "qualified_name": "storage.bname",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 13,
+            "relation_name": "bucket_lifecycle_states",
+            "qualified_name": "storage.bucket_lifecycle_states",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 2,
+            "relation_name": "bucket_lifecycle_states_due_idx",
+            "qualified_name": "storage.bucket_lifecycle_states_due_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "bucket_lifecycle_states_pkey",
+            "qualified_name": "storage.bucket_lifecycle_states_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 14,
+            "relation_name": "buckets",
+            "qualified_name": "storage.buckets",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 7,
+            "relation_name": "buckets_analytics",
+            "qualified_name": "storage.buckets_analytics",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "buckets_analytics_pkey",
+            "qualified_name": "storage.buckets_analytics_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "buckets_analytics_unique_name_idx",
+            "qualified_name": "storage.buckets_analytics_unique_name_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "buckets_pkey",
+            "qualified_name": "storage.buckets_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 4,
+            "relation_name": "buckets_vectors",
+            "qualified_name": "storage.buckets_vectors",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "buckets_vectors_pkey",
+            "qualified_name": "storage.buckets_vectors_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 3,
+            "relation_name": "idx_multipart_uploads_list",
+            "qualified_name": "storage.idx_multipart_uploads_list",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 2,
+            "relation_name": "idx_objects_bucket_id_name",
+            "qualified_name": "storage.idx_objects_bucket_id_name",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 2,
+            "relation_name": "idx_objects_bucket_id_name_lower",
+            "qualified_name": "storage.idx_objects_bucket_id_name_lower",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 2,
+            "relation_name": "idx_objects_current_version",
+            "qualified_name": "storage.idx_objects_current_version",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 2,
+            "relation_name": "idx_objects_delete_markers",
+            "qualified_name": "storage.idx_objects_delete_markers",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 2,
+            "relation_name": "idx_objects_null_version",
+            "qualified_name": "storage.idx_objects_null_version",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 5,
+            "relation_name": "lifecycle_abandoned_artifacts",
+            "qualified_name": "storage.lifecycle_abandoned_artifacts",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "lifecycle_abandoned_artifacts_attempted_at_idx",
+            "qualified_name": "storage.lifecycle_abandoned_artifacts_attempted_at_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 2,
+            "relation_name": "lifecycle_abandoned_artifacts_pkey",
+            "qualified_name": "storage.lifecycle_abandoned_artifacts_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 4,
+            "relation_name": "migrations",
+            "qualified_name": "storage.migrations",
+            "relrowsecurity": true,
+            "approximate_rows": 74
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "migrations_name_key",
+            "qualified_name": "storage.migrations_name_key",
+            "relrowsecurity": false,
+            "approximate_rows": 74
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "migrations_pkey",
+            "qualified_name": "storage.migrations_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 74
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "name_prefix_search",
+            "qualified_name": "storage.name_prefix_search",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 15,
+            "relation_name": "objects",
+            "qualified_name": "storage.objects",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 6,
+            "relation_name": "objects_archived_due_idx",
+            "qualified_name": "storage.objects_archived_due_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 3,
+            "relation_name": "objects_archived_order_uq",
+            "qualified_name": "storage.objects_archived_order_uq",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 3,
+            "relation_name": "objects_bucket_id_name_version_key",
+            "qualified_name": "storage.objects_bucket_id_name_version_key",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "objects_pkey",
+            "qualified_name": "storage.objects_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 10,
+            "relation_name": "s3_multipart_uploads",
+            "qualified_name": "storage.s3_multipart_uploads",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 10,
+            "relation_name": "s3_multipart_uploads_parts",
+            "qualified_name": "storage.s3_multipart_uploads_parts",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "s3_multipart_uploads_parts_pkey",
+            "qualified_name": "storage.s3_multipart_uploads_parts_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "s3_multipart_uploads_pkey",
+            "qualified_name": "storage.s3_multipart_uploads_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 9,
+            "relation_name": "vector_indexes",
+            "qualified_name": "storage.vector_indexes",
+            "relrowsecurity": true,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 2,
+            "relation_name": "vector_indexes_name_bucket_id_idx",
+            "qualified_name": "storage.vector_indexes_name_bucket_id_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_storage_admin",
+            "schema_name": "storage",
+            "column_count": 1,
+            "relation_name": "vector_indexes_pkey",
+            "qualified_name": "storage.vector_indexes_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "v",
+            "owner_role": "supabase_admin",
+            "schema_name": "vault",
+            "column_count": 9,
+            "relation_name": "decrypted_secrets",
+            "qualified_name": "vault.decrypted_secrets",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "r",
+            "owner_role": "supabase_admin",
+            "schema_name": "vault",
+            "column_count": 8,
+            "relation_name": "secrets",
+            "qualified_name": "vault.secrets",
+            "relrowsecurity": false,
+            "approximate_rows": -1
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_admin",
+            "schema_name": "vault",
+            "column_count": 1,
+            "relation_name": "secrets_name_idx",
+            "qualified_name": "vault.secrets_name_idx",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          },
+          {
+            "relkind": "i",
+            "owner_role": "supabase_admin",
+            "schema_name": "vault",
+            "column_count": 1,
+            "relation_name": "secrets_pkey",
+            "qualified_name": "vault.secrets_pkey",
+            "relrowsecurity": false,
+            "approximate_rows": 0
+          }
+        ],
+        "route_guard": {
+          "ok": true,
+          "read_only": true,
+          "source_login": "cli_login_postgres",
+          "effective_role": "postgres",
+          "ledger_select_visible": true,
+          "ledger_not_rls_filtered": true
+        },
+        "migration_ledger": [
+          {
+            "name": "96bulls:0001_96bulls_observability.sql",
+            "checksum": "b9d059c426982d4a2ece264932a9a4d841d29afdf2e6b8457436766ba7a430a8"
+          },
+          {
+            "name": "96bulls:0002_session_ext_and_summaries.sql",
+            "checksum": "2fee02abb8cb680a9c089ee58caf71dda82894a91ba218e99c915ec6e0525568"
+          },
+          {
+            "name": "96bulls:0003_fanout_ledger.sql",
+            "checksum": "cccdd28c9be9f675307af848f39453d770a45ddb375a43b82c046aba7ff618c7"
+          },
+          {
+            "name": "96bulls:0004_summary_pointers.sql",
+            "checksum": "fe351f30fbda78ecfd6d58e681e573354bbe28906d870293b99da34fe96b2e94"
+          },
+          {
+            "name": "upstream:20261025000000_sessions_index.sql",
+            "checksum": "6bfdb4c3b74edab105494203d6c40d10395e9934927b38dce80857b65b8874a3"
+          },
+          {
+            "name": "upstream:20261025000100_repo_identity.sql",
+            "checksum": "3b1d74f6b584d11c7e7e79333cdaa16d4e08a26eda2a24469670ee4dfc28c13a"
+          },
+          {
+            "name": "upstream:20261025000200_scrub_quarantine.sql",
+            "checksum": "97ec2f033cb9ed04570b15de50a577341ee2a8564107855cd09e2cef8c7f4398"
+          },
+          {
+            "name": "upstream:20261025000300_upsert_keep_on_null.sql",
+            "checksum": "1753922494e2cf0c3321c4fcf241b367257d6243d005c8dd1f91b0e05a649910"
+          },
+          {
+            "name": "upstream:20261025000600_pipeline_queue.sql",
+            "checksum": "41f1600691dba2de10ad1c906cbcddf5ed05cb4497c5d39d19fafdec44177042"
+          },
+          {
+            "name": "upstream:20261030000000_relayhistory_machines_compat.sql",
+            "checksum": "22fe48a3eb4e43dcff26a2bc4fcd7feb7051d3f49dd96af857de0eb68e29f227"
+          },
+          {
+            "name": "upstream:20261030010000_session_directory.sql",
+            "checksum": "2427948e076846d9d6aaf48ec775f718eac57da512f1a9a09cfff516848fa2f8"
+          },
+          {
+            "name": "upstream:20261030020000_session_directory_short_summary.sql",
+            "checksum": "b0ddc7de8c4cff9454638c52563f37f1e1380ed577e2a7535f67ddc2c0b758ce"
+          },
+          {
+            "name": "upstream:20261031000000_migration_assertion_ledger.sql",
+            "checksum": "0683aca3dca8333744ee0521cacfcab8b94c512cf8b1284f4aa0271208d40689"
+          },
+          {
+            "name": "upstream:20261031000100_manifest_readiness.sql",
+            "checksum": "1ff0225812140ef6623bd973a11b860b8eb1b9ebab4f48ed1dc4de20242242d6"
+          },
+          {
+            "name": "upstream:20261031001000_session_directory_reads_expand.sql",
+            "checksum": "6957cd17a52ac225df91330e02514253ae7ffd772418e4b02b522d929a20ec15"
+          },
+          {
+            "name": "upstream:20261101000000_migration_ingest_audit_base_read.sql",
+            "checksum": "44813425c598946d8f25b78f7997ee69be757483efee4819eae25aa20198acea"
+          },
+          {
+            "name": "upstream:20261101000200_claimless_window_activations.sql",
+            "checksum": "6dde334252bc90dd70c83b1c870878f3ea6ebbafe3c1bc5903eb178f26bd5d1a"
+          },
+          {
+            "name": "upstream:20261101050000_session_directory_list.sql",
+            "checksum": "a849ea8cc630587e67d4d85f09a2f35c6d0cd2052bbff40b99ee5274776e3f40"
+          },
+          {
+            "name": "upstream:20261102000000_session_briefs.sql",
+            "checksum": "688ee72451756386897c75e36ade834b2dc313a3eddda7ab5ce9a47d2ca40af2"
+          },
+          {
+            "name": "upstream:20261102010000_session_directory_canonical_ids.sql",
+            "checksum": "06addaf7b8a1d5f4d8ce30e9ebefe4ecfd2941b560bddf2c568bda772ee28dee"
+          },
+          {
+            "name": "upstream:20261102020000_session_brief_state.sql",
+            "checksum": "5bd8f34617393742968fa2018d04a64e0f3838a6afb4a65d14537986d8be7d87"
+          },
+          {
+            "name": "upstream:20261104020000_auth_sessions.sql",
+            "checksum": "0439742d3ec57bef9defb34363a2fce31f3a0e11e736e4dc3c8e2cb1af10724e"
+          },
+          {
+            "name": "upstream:20261104020100_auth_session_verify.sql",
+            "checksum": "7d19005b5ee6a3bc3593291c619cac8ecbbb50445c3c5ce2f8b0602ae913fe9d"
+          },
+          {
+            "name": "upstream:20261104021000_session_directory_event_metadata.sql",
+            "checksum": "4fb1337524c8335dd5bd507f60ea896a41a031ace0c7a2da8a8f7dedc1245e01"
+          },
+          {
+            "name": "upstream:20261104022000_session_ingest_ledger.sql",
+            "checksum": "69f4157ea3a615344aa1b383fc6af7405c1ff9f1568e7c8ab97e58fbc78fe1b5"
+          },
+          {
+            "name": "upstream:20261104030000_ingest_fence_ownership.sql",
+            "checksum": "68ce19d7eeb965335060c4fd62cad37b174735d612e9e3cb69cd4108ab67d806"
+          },
+          {
+            "name": "upstream:20261104040000_ingest_s3_proof_seed.sql",
+            "checksum": "18ea54ed1aa50e5ea44bab01a65177e2fc9c92919ac23b973f820e8af8b75b86"
+          },
+          {
+            "name": "upstream:20261104050000_buffered_upload_receipts.sql",
+            "checksum": "72a818602630276be6d77a4e5cb88cbe9e58102836c6a2f942753cf03805c6d3"
+          },
+          {
+            "name": "upstream:20261104051000_ingest_buffer_gc.sql",
+            "checksum": "c581a1e4451a380682e8ea3debef5e17914763871809c32827ab0d997cc8afb4"
+          },
+          {
+            "name": "upstream:20261104052000_ordered_ingest_controls.sql",
+            "checksum": "559efd2e82b3d595539bb081153abfda8f12e0a445e21ab1bf8f0d28c5f76b3d"
+          },
+          {
+            "name": "upstream:20261104053000_ingest_first_ack_seats.sql",
+            "checksum": "50a4f3e910f34319cc9c3381e135e168086a9306a896ad9230a6c31e569f7388"
+          },
+          {
+            "name": "upstream:20261104054000_ingest_custody_baseline.sql",
+            "checksum": "bcfacc776cc95705cd99ab8661723a25191b6899849f6b3f9c4629ccd5b03acf"
+          },
+          {
+            "name": "upstream:20261104055000_lazy_current_custody.sql",
+            "checksum": "3bf238706e71ed1bbeaefbfb592edd6fd40f8f30240e856827250f124ba419cc"
+          },
+          {
+            "name": "upstream:20261104060000_ingest_canonical_publication.sql",
+            "checksum": "0e92fd9a8a9bb61e5000ca6dcd1b0ea28fe2fe46eb0784059c083bff4d7dbb8a"
+          },
+          {
+            "name": "upstream:20261105010000_frozen_source_custody.sql",
+            "checksum": "e61dac0c513efbe5b3614d2c4ec44b842cfff25aed361963f43c4db7c069dbe4"
+          }
+        ]
+      }
+    }
+  ],
+  "completedAt": "2026-11-07T21:14:24.674Z"
+}

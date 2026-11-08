@@ -225,7 +225,12 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     the value's closing quote, and the text after it is kept; one that holds a
     header whose footer is after it is redacted through that footer with its
     closing quote kept (rule set 5 dropped the quote, and the quoted rule then
-    redacted to the end). Within the bound, rule set 5 kept the part of such a
+    redacted to the end). When a quote lies between that value and the footer,
+    the footer may be inside a later quoted value whose key the redaction
+    removed, so the closing quote is not kept: the quoted rule then redacts what
+    follows the footer as part of the value (and when the redaction also starts
+    at a header before the value, it runs to the end of the input), so no rest
+    of a secret value is kept without its key. Within the bound, rule set 5 kept the part of such a
     value after the footer; it is redacted too. The segmenter is unchanged:
     no cut falls between a key block's header and its footer, nor inside the
     value.

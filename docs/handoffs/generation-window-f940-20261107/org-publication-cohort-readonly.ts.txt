@@ -1,0 +1,57 @@
+/** Read-only generation census: no row locks, no updates, no rebind. */
+import {execFileSync} from "node:child_process";
+import {readFileSync} from "node:fs";
+import {createHash} from "node:crypto";
+import pg from "pg";
+import {parseCliLogin} from "../../scripts/schema-release-owner-operator-plan.ts";
+import {ownerApplySourceFiles} from "../../scripts/schema-release-owner-apply.ts";
+import {generation} from "../../src/hoopdb/migrate.ts";
+import {ROLE_VALIDATION_TABLE,ROLE_VALIDATION_NAME} from "../../src/shared/db.ts";
+import {SUPABASE_PROD_CA_2021} from "../../src/session-pipeline/supabase-ca.ts";
+const ROOT="/home/khaliqgant/Projects/AgentWorkforce/sessions-pipeline-worktrees/root-readonly-release-f9409ccb-20261107";
+const SHA="f9409ccb9e46c3f100cf3017847d8ed62bc716c7",G1="78c7b28e5ebce7f5f534a1f3f41a55845251e950b6c4c49f676f2bda358c91d6",G2="e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",PROJECT="pyamkrhoyszgzirqqffq",HOST="aws-0-us-east-1.pooler.supabase.com";
+const no=(code:string):never=>{throw Object.assign(new Error(code),{code});};
+const env=Object.fromEntries(["PATH","HOME","XDG_CONFIG_HOME","XDG_DATA_HOME","DBUS_SESSION_BUS_ADDRESS"].flatMap(k=>process.env[k]?[[k,process.env[k]!]]:[]));
+const run=(exe:string,args:string[])=>execFileSync(exe,args,{cwd:ROOT,env,encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:30000,maxBuffer:65536});
+function source(){
+ if(run("git",["rev-parse","HEAD"]).trim()!==SHA)no("source_mismatch");
+ const files=[...run("git",["diff","HEAD","--name-only","-z"]).split("\0"),...run("git",["ls-files","--others","--exclude-standard","-z"]).split("\0")].filter(Boolean);
+ ownerApplySourceFiles(files,files.includes("supabase/.temp/cli-latest")?readFileSync(ROOT+"/supabase/.temp/cli-latest","utf8"):undefined);
+}
+async function main(){
+ source();if(await generation()!==G2)no("source_generation");
+ const input=JSON.parse(readFileSync(0,"utf8"));if(!input||typeof input!=="object"||Array.isArray(input)||Object.keys(input).sort().join()!=="userId,workspaceId"||typeof input.workspaceId!=="string"||typeof input.userId!=="string"||createHash("sha256").update(JSON.stringify([input.workspaceId,input.userId])).digest("hex")!=="434d966121c88c5924542e2b6dff005add979fd7dce35c3ed63d51b460c8a547")no("scope_binding");
+ const sql=readFileSync(ROOT+"/.96bulls/role-inventory/the reporting customer-org-publication-cohort-draft-20261107.sql","utf8");const sqlSha256="bc431aa6f55eefc755126f5d7a8536c4b72e1f7ede9ff9c40ee65bd6c39481fd";
+ if(createHash("sha256").update(sql).digest("hex")!==sqlSha256)no("sql_sha_mismatch");
+ const cli="/home/khaliqgant/.local/bin/supabase";if(run(cli,["--version"]).trim()!=="2.122.0")no("cli_version");
+ let raw=run(cli,["db","dump","--linked","--project-ref",PROJECT,"--dry-run"]);const login=parseCliLogin(raw);raw="";
+ const c=new pg.Client({host:HOST,port:5432,database:"postgres",user:"cli_login_postgres."+PROJECT,password:login.password,ssl:{ca:SUPABASE_PROD_CA_2021,rejectUnauthorized:true,servername:HOST},connectionTimeoutMillis:10000,query_timeout:5000,options:"-c default_transaction_read_only=on -c statement_timeout=3000 -c lock_timeout=250 -c idle_in_transaction_session_timeout=10000",application_name:"96bulls-org-publication-cohort-readonly"});login.password="";c.on("error",()=>{});
+ const startedAt=new Date().toISOString();let connected=false,began=false,phase="connect",exactlyOneOrgMatched:boolean|null=null;let preflightRows:any[]=[];
+ const tables=["sessions.ingest_fence_owners","sessions.ingest_batches","sessions.ingest_stage_intents","sessions.ingest_publication_attempts","sessions.ingest_buffer_outbox"];
+ const base=()=>({version:1,kind:"org_publication_cohort_readonly",sourceSha:SHA,sqlSha256,startedAt,orgResolution:{exactlyOneOrgMatched,source:"durable ingest_fence_owners exact workspace/user scope; no external org-directory freshness claim"},preflightRows,executionRole:"postgres/sessioncli, READ ONLY",productionWrites:false});
+ try{
+  await c.connect();connected=true;await c.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");began=true;await c.query("SET LOCAL ROLE postgres");await c.query("SET LOCAL statement_timeout='3s'; SET LOCAL lock_timeout='250ms'");phase="preflight";
+  const pf=(await c.query("SELECT current_user='postgres' AND session_user='cli_login_postgres' AND current_database()='postgres' AND current_setting('transaction_read_only')='on' AND (SELECT pg_get_userbyid(nspowner)='postgres' FROM pg_namespace WHERE nspname='sessions') AS expected_owner_route,(SELECT bool_and(has_table_privilege(current_user,x,'SELECT')) FROM unnest($1::text[]) x) AS tables_visible,(SELECT bool_or(row_security_active(x::regclass)) FROM unnest($1::text[]) x) AS any_rls_active",[tables])).rows;
+  if(pf.length!==1||Object.keys(pf[0]).sort().join()!=="any_rls_active,expected_owner_route,tables_visible"||Object.values(pf[0]).some(x=>typeof x!=="boolean"))no("preflight_shape");preflightRows=pf;
+  if(pf[0].expected_owner_route!==true||pf[0].tables_visible!==true||pf[0].any_rls_active!==false){console.log(JSON.stringify({...base(),status:"preflight_refused",cohortExecuted:false,result:"UNKNOWN",completedAt:new Date().toISOString()}));return;}
+  phase="org_resolution";
+  const resolved=(await c.query("SELECT DISTINCT org_id FROM sessions.ingest_fence_owners WHERE workspace_id=$1 AND user_id=$2 ORDER BY org_id LIMIT 2",[input.workspaceId,input.userId])).rows;
+  exactlyOneOrgMatched=resolved.length===1;
+  if(!exactlyOneOrgMatched){console.log(JSON.stringify({...base(),status:"org_resolution_refused",cohortExecuted:false,result:"UNKNOWN",completedAt:new Date().toISOString()}));return;}
+  let org=resolved[0].org_id;if(typeof org!=="string"||org.length===0||org.length>128)no("resolved_scope_shape");
+  phase="cohort";const queryStartedAt=new Date().toISOString();const result=await c.query(sql,[org]);org="";resolved.length=0;
+  if(result.rows.length!==1||Object.keys(result.rows[0]).join()!=="aggregate")no("aggregate_shape");const a=result.rows[0].aggregate;
+  const top=["input_scope_valid","cohorts","oldest_unpublished_ack_age_bucket","pending_unacknowledged_batches","all_time_staged_batches_missing_record_metadata","future_ack_timestamps"];
+  if(!a||typeof a!=="object"||Array.isArray(a)||Object.keys(a).sort().join()!==top.sort().join()||a.input_scope_valid!==true)no("aggregate_columns");
+  const integer=(n:unknown)=>Number.isSafeInteger(n)&&(n as number)>=0;
+  for(const key of ["pending_unacknowledged_batches","all_time_staged_batches_missing_record_metadata","future_ack_timestamps"])if(!integer(a[key]))no("aggregate_count");
+  if(!["none_with_known_record_metadata","future_unknown","lt1h","1to24h","1to7d","7to30d","ge30d"].includes(a.oldest_unpublished_ack_age_bucket))no("aggregate_bucket");
+  const keys=["label","staged_ack_batches","staged_batches_missing_record_metadata","fully_published_staged_batches","staged_batches_with_unpublished_records","partially_published_staged_batches","unpublished_batches_without_active_buffer_pointer","acknowledged_stage_records","historically_published_stage_records","stage_records_without_publication_evidence","suppressed_batches","direct_canonical_batches_not_assessed_for_record_count"];
+  if(!Array.isArray(a.cohorts)||a.cohorts.length!==2||a.cohorts.map((r:any)=>r.label).sort().join()!=="24h,7d")no("cohort_shape");
+  for(const r of a.cohorts){if(!r||typeof r!=="object"||Array.isArray(r)||Object.keys(r).sort().join()!==keys.sort().join()||Object.entries(r).some(([k,v])=>k!=="label"&&!integer(v)))no("cohort_counts");}
+  const queryCompletedAt=new Date().toISOString();await c.query("ROLLBACK");began=false;source();
+  console.log(JSON.stringify({...base(),status:"observed_org_cohorts",cohortExecuted:true,queryStartedAt,queryCompletedAt,resultRows:result.rows,completedAt:new Date().toISOString(),qualification:"Org-level ACK/publication metadata cohorts only; missing metadata explicitly unknown, no individual user readback or present visibility proof"}));
+ }catch(e:any){const x=e?.code;const code=typeof x==="string"&&/^[A-Za-z0-9_]{1,64}$/.test(x)?x:"cohort_failed";console.log(JSON.stringify({...base(),status:"refused",code,phase,result:"UNKNOWN",completedAt:new Date().toISOString()}));process.exitCode=1;}
+ finally{if(connected&&began)await c.query("ROLLBACK").catch(()=>{});await c.end().catch(()=>{});}
+}
+main().catch(e=>{const x=e?.code;const code=typeof x==="string"&&/^[A-Za-z0-9_]{1,64}$/.test(x)?x:"cohort_failed";console.log(JSON.stringify({status:"refused",code,productionWrites:false}));process.exitCode=1;});

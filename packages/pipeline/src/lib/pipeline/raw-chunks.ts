@@ -115,8 +115,9 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  *   redacted from the header through the value's closing quote (version 5 took
  *   the footer with the value, and the private-key rule then redacted from the
  *   header to the end of the input), and one holding a header whose footer is
- *   after it is redacted through that footer with its closing quote kept. The
- *   segmenter is unchanged. Output for input with no unquoted secret value of
+ *   after it is redacted through that footer with its closing quote kept (not
+ *   kept when a quote lies between, as the footer may be inside a later quoted
+ *   value whose key the redaction removed). The segmenter is unchanged. Output for input with no unquoted secret value of
  *   `MAX_QUOTED_VALUE` units or more and no private-key boundary inside a
  *   quoted secret value is byte-identical to version 5.
  */

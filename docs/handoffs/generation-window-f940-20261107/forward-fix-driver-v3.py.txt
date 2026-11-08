@@ -1,0 +1,48 @@
+"""Exact local apply guard; existing 1P state credential and Wrangler OAuth in RAM/stdin only."""
+from pathlib import Path
+import hashlib,importlib.util,json,os,re,sys,tempfile
+from datetime import datetime,timezone
+R=Path('/Users/khaliqgant/relay-briefs');T=Path('/Users/khaliqgant/Projects/AgentWorkforce/worktrees/sessions-pipeline-release-f940-kjg')
+def require(v):
+ if not v:raise ValueError('refused')
+def main():
+ require(len(sys.argv)==4 and sys.argv[1] in ('--prepare','--apply'))
+ mode=sys.argv[1];require(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()==sys.argv[2]);guard=R/'g2-f940-forward-plan-apply-transport-guard-20261107.ts';require(hashlib.sha256(guard.read_bytes()).hexdigest()==sys.argv[3])
+ helper=R/'g2-f940-kjg-local-readonly-capture-build-driver-20261107.py';require(hashlib.sha256(helper.read_bytes()).hexdigest()=='14d24e80cd2aba21bc3bfd4b911aedd02123af787b60e2c8de78e6093a86a33e')
+ spec=importlib.util.spec_from_file_location('bounded',helper);d=importlib.util.module_from_spec(spec);spec.loader.exec_module(d)
+ for file,pin in [(Path(d.OP),d.OP_SHA),(Path(d.PYTHON),d.PYTHON_SHA),(Path(d.CA_FILE),d.CA_SHA),(Path(d.HEAVY),d.HEAVY_SHA)]:require(hashlib.sha256(file.read_bytes()).hexdigest()==pin)
+ config=T/'.96bulls/cf-sessions-prod/cloudflare-inputs.json';public=d.parse((R/'g2-f940-kjg-cloudflare-inputs-20261107.json').read_bytes())
+ approval={'decision':'approved','by':'Khaliq Gant','date':'2026-11-07','quote':'ok so make the full fix','execution':'ssh-sf-frame-retained-plan','capture':{'provenanceSha256':'6e2fb9a20a9fd7403267688938e161415231b67d4597aa85cbbb5f78bf0e9a4d','planSha256':'36fa30b0ad611f622b70ff15c7065cbb59985d5d21abaecb0a40dda44ba97d91','inputsSha256':d.INPUTS,'sourceCommit':d.SOURCE}}
+ desired={**public,'approval':approval};previous={**public,'approval':{**approval,'capture':{**approval['capture'],'provenanceSha256':'aa794147f330cda735015cae6f2cadf86fa1dd18c6f939713dffe35add91b1c4','planSha256':'54e0ed241e7ed2dad0d31c8cc7098bcd888ac9f23060031bbc062e4b130dfd5a'}}};require(not config.is_symlink() and d.parse(config.read_bytes()) in (public,desired,previous))
+ if mode=='--prepare':config.write_text(json.dumps(desired,indent=2)+'\n');config.chmod(0o600)
+ else:require(d.parse(config.read_bytes())==desired)
+ rec={'kind':'g2_apply_credential_driver','mode':mode,'at':datetime.now(timezone.utc).isoformat(),'sourceSha256':sys.argv[2],'guardSha256':sys.argv[3],'outcome':'REFUSED_BEFORE_OPERATOR','credentialsPersisted':False,'phase':'existing_state_credential_read'}
+ try:
+  env={'PATH':'/opt/homebrew/bin:/usr/bin:/bin','HOME':str(Path.home()),'USER':'khaliqgant'}
+  state=d.parse(d.command([d.OP,'read','op://6hmhqxvcbcmhh24yahdflbbkge/5cdiyw266fcw25iqe2zcepefla/bootstrap_recovery','--account','C33CTNNS4RFQRAIYU4BQ3P3KFI','--no-newline'],45,env=env,stdout_limit=8192))
+  if isinstance(state,str):state=d.parse(state.encode())
+  require(state.get('accountId')==d.ACCOUNT and state.get('url')==d.STATE_URL and re.fullmatch('[0-9a-f]{64}',state.get('authToken','')))
+  rec['phase']='existing_wrangler_oauth_read';node='/Users/khaliqgant/.local/share/mise/installs/node/22.23.2/bin/node';w=Path('/Users/khaliqgant/.local/share/mise/installs/node/22.23.2/lib/node_modules/wrangler')
+  require(hashlib.sha256((w/'bin/wrangler.js').read_bytes()).hexdigest()=='780661a508810f3b65786895b1ca9aacbc4f55d329ae6b8c1e49ec8433569f77')
+  env={'PATH':str(Path(node).parent)+':/usr/bin:/bin','HOME':str(Path.home()),'USER':'khaliqgant','CI':'true','BROWSER':'false','NO_COLOR':'1','WRANGLER_WRITE_LOGS':'false','WRANGLER_SEND_METRICS':'false'}
+  previous=Path.cwd()
+  with tempfile.TemporaryDirectory(prefix='g2-apply-oauth-') as isolated:
+   try:os.chdir(isolated);oauth=d.parse(d.command([node,str(w/'bin/wrangler.js'),'auth','token','--json'],45,env=env,stdout_limit=8192))
+   finally:os.chdir(previous)
+  require(oauth.get('type')=='oauth' and isinstance(oauth.get('token'),str) and 16<=len(oauth['token'])<=4096)
+  payload=json.dumps({'accountId':d.ACCOUNT,'apiToken':oauth['token'],'stateUrl':d.STATE_URL,'stateToken':state['authToken']}).encode()+b'\n'
+  rec['phase']='guard_check' if mode=='--prepare' else 'guard_apply'
+  output=R/('g2-f940-apply-'+('check-' if mode=='--prepare' else 'execution-')+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'.json')
+  os.chdir(T);args=[str(R/'pr308-kjg-tools/bun-1.4.2'),'--no-env-file',str(guard),'--check' if mode=='--prepare' else '--apply',sys.argv[3],str(output)]
+  env={'PATH':str(R/'pr308-kjg-tools')+':/opt/homebrew/bin:/usr/bin:/bin','HOME':str(Path.home()),'CI':'true'}
+  try:d.command([d.HEAVY,'--',*args],650,env=env,input_bytes=payload,heavy_wrapper=True)
+  except Exception:require(output.exists())
+  result=d.parse(output.read_bytes());rec['outcome']=result['outcome'];rec['operatorReceipt']=str(output);rec['operatorReceiptSha256']=hashlib.sha256(output.read_bytes()).hexdigest()
+ except Exception:rec['failureClass']='closed_phase_refusal'
+ finally:
+  path=R/('g2-f940-apply-driver-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'.json')
+  with path.open('x') as f:os.chmod(path,0o600);json.dump(rec,f,indent=2);f.write('\n')
+ print(json.dumps(rec));return 0 if rec['outcome'] in ('CAPTURE_AND_LIVE_STATE_AUTHORITY_QUALIFIED_NOT_APPLIED','OPERATOR_COMPLETED_READBACK_PENDING') else 2
+if __name__=='__main__':
+ try:sys.exit(main())
+ except Exception:print('{"outcome":"REFUSED_LOCAL_PREFLIGHT","credentialsPersisted":false}');sys.exit(2)

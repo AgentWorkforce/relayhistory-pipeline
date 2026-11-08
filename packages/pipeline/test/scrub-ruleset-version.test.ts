@@ -76,7 +76,11 @@ const SCRUB_RULESETS: Record<number, string> = {
   // its footer is redacted through the value's close, not to the end of the input. The
   // segmenter is unchanged. Output with neither shape is byte-identical to version 5
   // (test/scrub-v5-v6-fuzz.test.ts).
-  6: "b8eab18e9bca240ed6beb870fe975e6579bfd89957be8142ba65afa6b11e1ce5",
+  // Updated before release (forward merge of main with #354, which had edited version 5 in
+  // place and re-pinned it to 595fecdf…; 5 stays the shipped ed8d5c35…): a header in a
+  // quoted secret value whose footer is inside a later quoted value no longer leaves the
+  // rest of that later value keyless (the close is not put back when a quote lies between).
+  6: "e14dfdfd09e6965b2e3ce6b32eb9b356c649914fd349a5adadd81b6c409da72d",
 };
 
 const read = (rel: string) =>

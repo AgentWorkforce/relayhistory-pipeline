@@ -15,9 +15,24 @@
  *    within-bound value holding the footer (rule set 5 kept the value's tail after the
  *    footer) and a block opened inside a value and closed after it.
  *
+ * 3. Found while forward-merging main (#354): a quoted secret value holding a header
+ *    whose footer is inside a LATER quoted secret value (`"password": "…-----BEGIN …" …
+ *    "token": "…-----END …-----SECRETTAIL"`). Redacting to that footer removes the later
+ *    value's key; putting this value's closing quote back then left the rest of the later
+ *    value (`SECRETTAIL`) with no key in view, and it was kept (rule set 5 and #354 did not
+ *    keep it). When a quote lies between the value and the footer, the close is no longer
+ *    put back (or, with a header before the value too, the redaction runs to the end).
+ *
+ * PR #354 made the fixes for 1 and 2 in place under version 5 with tests in
+ * scrub-ruleset-5.test.ts; those tests are folded in here (its `"token": <digits>` kept
+ * assertion is superseded: rule set 6 redacts any bare value at or over the bound), and
+ * scrub-ruleset-5.test.ts now runs against the frozen rule set 5 source.
+ *
  * Every value here is synthetic; `SECRETTAIL` marks bytes that must not survive,
  * `KEEPTRAIL`/`HISTORY_TAIL` bytes that must.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   MAX_QUOTED_VALUE,
@@ -93,6 +108,11 @@ describe("rule set 6: a bare value after a quoted secret key is classified whole
   it("an over-cap digit run followed by a long generated tail is redacted whole (cross-checked against #354)", () => {
     const tail = "Q7xK2mP9vR4tW8nB3cY6".repeat(310);
     allPaths(`"token": ${"7".repeat(MAX_QUOTED_VALUE)}${tail} after`, `"token": ${R} after`, ["after"]);
+    // #354's reproduction: a 4096-unit digit prefix, then a long alphanumeric tail.
+    const prefix = "0123456789".repeat(409) + "012345";
+    expect(prefix.length).toBe(MAX_QUOTED_VALUE);
+    const tail354 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".repeat(100);
+    allPaths(`"token": ${prefix}${tail354} after`, `"token": ${R} after`, ["after"]);
   });
 
   it("within the bound, literals and numbers stay kept", () => {
@@ -179,4 +199,79 @@ describe("rule set 6: private-key boundaries around an over-cap quoted value (de
     const text = `${H}\n"password": "${value}" HISTORY_TAIL`;
     expect(unsplittableQuotedValueSpans(text).some(([a, b]) => a <= H.length + 1 && b >= text.length - 14)).toBe(true);
   });
+});
+
+describe("rule set 6: a private-key footer inside a later quoted secret value (defect 3)", () => {
+  const h = "-----BEGIN PRIVATE KEY-----";
+  const f = "-----END PRIVATE KEY-----";
+  for (const q of ['"', "'", "`"]) {
+    for (const [label, n] of [["within the bound", 3], ["over the bound", MAX_QUOTED_VALUE + 1]] as const) {
+      it(`header in one ${q}-quoted value, footer in the next, ${label}: the next value's rest is not kept`, () => {
+        const later = `${q}token${q}: ${q}${"a".repeat(n)}${f}SECRETTAIL${q}`;
+        const text = `${q}password${q}: ${q}abc${h}\n${BODY}${q} KEEPMID ${later} KEEPTRAIL`;
+        for (const out of [scrubText(text), scrubLong(text), scrubLong(PAD + text), records(`${text}\n`)]) {
+          noKeyMaterial(out, label);
+          expect(out.startsWith(`${q}password${q}: ${q}${R}`) || out.startsWith(`${PAD}${q}password${q}: ${q}${R}`)).toBe(true);
+        }
+        const json = JSON.stringify(scrubJson({ content: text }));
+        noKeyMaterial(json, `scrubJson ${label}`);
+      });
+    }
+  }
+
+  it("with a header before the value too: redacted to the end of the input", () => {
+    const later = `"token": "${"a".repeat(MAX_QUOTED_VALUE + 1)}${F}SECRETTAIL${"Q7xK2mP9vR4tW8nB3cY6".repeat(3)}"`;
+    const text = `before KEEPTRAIL\n${H}\n${BODY}\n"password": "${F}${H}\nSECRETTAIL" mid ${later} after`;
+    expect(scrubText(text)).toBe(`before KEEPTRAIL\n${R}`);
+    expect(scrubLong(text)).toBe(`before KEEPTRAIL\n${R}`);
+    // The raw record path redacts through the line's end, its line break included.
+    for (const out of [scrubLong(PAD + text), records(`${text}\n`), JSON.stringify(scrubJson({ content: text }))]) {
+      noKeyMaterial(out, "path");
+      expect(out.includes("mid") || out.includes("after")).toBe(false);
+    }
+  });
+
+  it("a footer after the value with no quote between still keeps the text after it", () => {
+    const text = `"password": "${"a".repeat(MAX_QUOTED_VALUE + 1)}\n${H}\n${BODY}" ${BODY}\n${F}\nKEEPTRAIL`;
+    allPaths(text, `"password": "${R}"\nKEEPTRAIL`, ["KEEPTRAIL"]);
+  });
+});
+
+describe("rule set 6: the shared corpus's record cases through the raw-chunk record path", () => {
+  // The shared corpus test (kept identical in relayhistory-cloud) runs record cases through
+  // scrubJson and scrubRecord; the record-line tokenizer lives only here, so it is run here.
+  const corpus = JSON.parse(
+    readFileSync(fileURLToPath(new URL("./fixtures/scrub-secret-corpus.json", import.meta.url).href), "utf8"),
+  ) as {
+    generators: Record<string, { prefix?: string; parts: [string, number | string][] }>;
+    cases: { id: string; input: string; expected: string; record?: boolean; expectedRecord?: string }[];
+  };
+  // Deterministic synthetic fill: the record-line tokenizer is what is under test here; the
+  // corpus test fills the same cases with fresh random values.
+  const fill = (s: string) =>
+    s.replace(/\{\{([a-z0-9_]+)\}\}/g, (_m, name: string) => {
+      const g = corpus.generators[name];
+      if (!g) throw new Error(`unknown placeholder ${name}`);
+      let body = "";
+      for (const [kind, n] of g.parts) body += kind === "lit" ? String(n) : "Zq7".repeat(Number(n)).slice(0, Number(n));
+      return JSON.stringify(`${g.prefix ?? ""}${body}`).slice(1, -1);
+    });
+  const cases = corpus.cases.filter((c) => c.record);
+
+  // Moved from scrub-ruleset-5.test.ts: the corpus holds rule set 6 cases, run here against
+  // the current source (scrub-ruleset-5.test.ts runs the frozen rule set 5 source).
+  it("has record cases for both leaks", () => {
+    expect(cases.length).toBeGreaterThanOrEqual(5);
+  });
+
+  for (const c of cases) {
+    it(c.id, () => {
+      const input = fill(c.input);
+      const expected = fill(c.expectedRecord ?? c.expected);
+      const out = records(`${input}\n`);
+      expect(out).not.toContain("SECRETTAIL");
+      expect(out).toBe(`${expected}\n`);
+      expect(records(out)).toBe(out);
+    });
+  }
 });

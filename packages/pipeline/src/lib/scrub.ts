@@ -314,17 +314,29 @@ function redactQuotedSecretValues(
     const closeLength = quote === '"' || quote === "'" || quote === "`" ? bs + 1 : 0;
     const closeEnd = Math.min(text.length, valueEnd + closeLength);
     let redactEnd = valueEnd;
+    // Whether the closing quote taken with a redaction to a footer is put back (below).
+    let restoreClose = !fromHeader;
     if (toFooter) {
       PEM_END.lastIndex = closeEnd;
       const footer = PEM_END.exec(text);
       redactEnd = footer ? footer.index + footer[0].length : text.length;
+      // A footer after a quote may be inside a later quoted value (`"token": "...-----END
+      // ...-----SECRET"`), whose key this redaction removes: the rest of that value would
+      // be kept with no key in view. Then, as rule set 5 did, the close is not put back, so
+      // the quoted rule takes what follows the footer as part of this still-open value;
+      // when this value's key goes too (a header before it), nothing would take that rest,
+      // so the redaction runs to the end of the input, as rule set 5's did.
+      if (footer && /["'`]/.test(text.slice(closeEnd, footer.index))) {
+        restoreClose = false;
+        if (fromHeader) redactEnd = text.length;
+      }
     } else if (fromHeader) redactEnd = closeEnd;
     out += text.slice(last, valueStart);
     if (fromHeader) out = out.slice(0, pem.at);
     out += REDACTED;
     // The key and opening quote are kept and the closing quote was taken: put it back, or
     // the quoted rule would find the value unclosed and redact the rest of the input.
-    if (!fromHeader && redactEnd > valueEnd) out += text.slice(valueEnd, closeEnd);
+    if (restoreClose && redactEnd > valueEnd) out += text.slice(valueEnd, closeEnd);
     last = redactEnd;
     pemFrom = redactEnd;
     // After a footer, nothing is open; otherwise a header before the value stays open.
@@ -427,7 +439,11 @@ export function unsplittableQuotedValueSpans(
  * header before it is redacted from that header through the value's closing quote; one
  * holding a header whose footer is after it, through that footer. Rule set 5 took the
  * footer with the value, and the private-key rule then redacted from the header to the
- * end of the input.
+ * end of the input. When a quote lies between the value and that later footer, the footer
+ * may be inside another quoted value whose key the redaction removes, so the rest of that
+ * value is never kept: the closing quote is not put back (the quoted rule then takes the
+ * rest as part of this value), or, when the redaction also starts at a header before the
+ * value, it runs to the end of the input.
  */
 function redactOverCapQuotedValues(text: string): string {
   return redactQuotedSecretValues(text, undefined, false, true);
