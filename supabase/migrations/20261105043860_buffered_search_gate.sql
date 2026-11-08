@@ -15,8 +15,8 @@
 --     <head tuple> = p_cutover_epoch, p_head_epoch, p_head_version, p_head_digest, p_head_kind,
 --                    p_head_pending, p_privacy_baseline_sha256 (exactly 20261105043700's encoding)
 --     RETURNS TABLE(claim_token, source, session_id, drop_reason)
---   Role guard: refuses 42501 unless the caller is bulls96_read_api (SET ROLE or session user;
---   inside a definer function current_setting('role') still names the caller's role).
+--   Role guard: refuses 42501 unless the caller is the genuine bulls96_read_api login: session_user
+--   is bulls96_read_api AND current_setting('role') is 'none' or unset (a member's SET ROLE is refused).
 --   Tenant pins: refuses 42501 unless bulls96_read.org_id and bulls96_read.workspace_id are set
 --   (transaction-local, bound by the read API from the verified identity) and equal p_org_id and
 --   p_workspace_id. The owner is an argument, not a pin: in a shared workspace the hit's owner is
@@ -78,7 +78,7 @@
 -- then the keep predicate shared by buffered_sessions_for and buffered_session_stages_for), and
 -- where this gate checks it (line numbers in this file) or why it does not.
 --   Scope
---     caller is bulls96_read_api ................................ L204 (42501)
+--     caller is the bulls96_read_api login, no SET ROLE ......... L204 (42501)
 --     org/workspace = transaction pins .......................... L207 (42501)
 --     user = the pinned reader (043700) ......................... DIFFERENT BY DESIGN: owner is a
 --         parameter (L342: claim must be (pins, owner)); see THREAT MODEL below
@@ -124,20 +124,20 @@
 -- active, acknowledged one would pass here and be hidden by 043700. Closing it needs the hit's
 -- stage (ingest_stage_intents by claim_token); it is out of this follow-up's scope.
 --
--- THREAT MODEL. p_owner_user_id is a parameter, not a pin: the reader of a shared workspace sees
--- hits owned by other users, and the gate judges each against its owner. Only bulls96_read_api may
--- call (L204), only inside the verified (org, workspace) pins (L207); a different tenant is
--- 42501. Within that tenant a caller may name ANY user. What it can learn per call: for each
--- supplied (claim_token, source, session_id), whether that claim token is a claim of (org, ws,
--- owner) (a row or no row), and, only for such a claim, one drop reason, which can reveal the
--- owner's gate/parity state, whether the session is deleted or reset, the batch's state and
--- whether a later fence superseded it. It returns no content, no timestamps and no other claim.
--- The claim token bounds this: rows exist only for a token that IS a claim of that owner in the
--- pinned tenant (L342); tokens are random v4 UUIDs, stored only in the ledger and in the
--- owner's transcript_events rows, so a caller without a token learns nothing (no row, no reason)
--- and cannot enumerate users, sessions or deletions. The Worker only passes tokens and owners
--- taken from transcript_events rows the reader's own tenant-scoped search returned, and reports
--- only aggregate drop counts to logs, never per-hit reasons to the client.
+-- THREAT MODEL. p_owner_user_id is a parameter, not a pin: the reader of a shared workspace sees hits
+-- owned by other users, and the gate judges each against its owner. Only the genuine login
+-- bulls96_read_api may call (L204: session_user, role 'none'; SET ROLE into it is 42501), only in the
+-- verified (org, workspace) pins (L207); another tenant is 42501. Within that tenant a caller may
+-- name ANY user. What it can learn per call: for each supplied (claim_token, source, session_id),
+-- whether that claim token is a claim of (org, ws, owner) (a row or no row), and, only for such a
+-- claim, one drop reason, which can reveal the owner's gate/parity state, whether the session is
+-- deleted or reset, the batch's state and whether a later fence superseded it. It returns no content,
+-- no timestamps and no other claim. The claim token bounds this: rows exist only for a token that IS
+-- a claim of that owner in the pinned tenant (L342); tokens are random v4 UUIDs, stored only in the
+-- ledger and in the owner's transcript_events rows, so a caller without a token learns nothing (no
+-- row, no reason) and cannot enumerate users, sessions or deletions. The Worker only passes tokens
+-- and owners taken from transcript_events rows the reader's own tenant-scoped search returned, and
+-- reports only aggregate drop counts to logs, never per-hit reasons to the client.
 --
 -- Locks. STABLE, read-only, no row lock, no advisory lock, no write: AccessShareLock only, inside
 -- the read API's READ ONLY transactions under the read role's 2 s statement_timeout. The parity
@@ -201,7 +201,7 @@ DECLARE
   par sessions.owner_buffered_parity%ROWTYPE;
   x record;
 BEGIN
-  IF coalesce(nullif(current_setting('role', true), 'none'), session_user::text) IS DISTINCT FROM 'bulls96_read_api' THEN
+  IF session_user::text IS DISTINCT FROM 'bulls96_read_api' OR coalesce(current_setting('role', true), 'none') <> 'none' THEN
     RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'buffered search gate: caller is not the read api role';
   END IF;
   IF v_org IS NULL OR v_ws IS NULL OR p_org_id IS DISTINCT FROM v_org OR p_workspace_id IS DISTINCT FROM v_ws THEN

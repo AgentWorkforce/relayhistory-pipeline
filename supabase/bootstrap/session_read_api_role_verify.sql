@@ -1,11 +1,23 @@
 -- Read-only verification of the session read API role (session_read_api_role.sql).
 -- Raises, listing every problem, unless the role has exactly the approved shape:
--- attributes, no memberships, exactly the approved column SELECT on session_index and
+-- attributes, no memberships and no members (inbound, below), exactly the approved column SELECT on session_index and
 -- schema USAGE as its effective privileges in schema sessions, EXECUTE on no sessions
 -- SECURITY DEFINER function but the two tenant-setting directory reads of
 -- 20261105034000 (sessions.list_session_directory_for, session_directory_activity_for;
 -- allowed, not required, so this also passes before that migration), and the
 -- tenant-bound RLS policy on session_index.
+--
+-- Inbound membership: any role granted bulls96_read_api could SET ROLE to it and call the
+-- read API's SECURITY DEFINER functions (e.g. probe the owner gate status through
+-- sessions.buffered_search_gate_for), so the role must have no member. On PG16+ the only
+-- tolerated member row is the Supabase creator edge that PostgreSQL adds itself when
+-- Supabase's non-superuser `postgres` (CREATEROLE) creates the role: member `postgres`,
+-- grantor the superuser `supabase_admin`, admin_option true, inherit_option false,
+-- set_option false, and only with hoopdb.db_mode=supabase bound (on Supabase run this file
+-- with PGOPTIONS='-c hoopdb.db_mode=supabase'). That edge can neither SET ROLE to the role
+-- nor inherit its privileges. It is the same predicate as
+-- supabase/bootstrap/acquisition_installer_verify.sql (#332) and session_read_api_roles.sql.
+-- Before PG16 pg_auth_members has no inherit_option / set_option columns, so any member fails.
 \set ON_ERROR_STOP 1
 DO $verify$
 DECLARE
@@ -13,6 +25,7 @@ DECLARE
   v_problems text[] := ARRAY[]::text[];
   v_row record;
   v_qual text;
+  v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
 BEGIN
   SELECT * INTO v_role FROM pg_roles WHERE rolname = 'bulls96_read_api';
   IF NOT FOUND THEN
@@ -33,6 +46,20 @@ BEGIN
   FOR v_row IN SELECT g.rolname FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid WHERE m.member = v_role.oid LOOP
     v_problems := array_append(v_problems, (format('member of %I', v_row.rolname))::text);
   END LOOP;
+  IF current_setting('server_version_num')::int >= 160000 THEN
+    FOR v_row IN EXECUTE 'SELECT u.rolname, g.rolname AS grantor, g.rolsuper AS grantor_super, a.admin_option, a.inherit_option, a.set_option FROM pg_auth_members a JOIN pg_roles u ON u.oid = a.member JOIN pg_roles g ON g.oid = a.grantor WHERE a.roleid = $1' USING v_role.oid LOOP
+      IF v_mode = 'supabase' AND v_row.rolname = 'postgres' AND v_row.grantor = 'supabase_admin' AND v_row.grantor_super
+         AND v_row.admin_option AND NOT v_row.inherit_option AND NOT v_row.set_option THEN
+        NULL; -- Supabase PG16+ creator edge: ADMIN only, no SET, no INHERIT
+      ELSE
+        v_problems := array_append(v_problems, (format('granted to %I', v_row.rolname))::text);
+      END IF;
+    END LOOP;
+  ELSE
+    FOR v_row IN SELECT u.rolname FROM pg_auth_members m JOIN pg_roles u ON u.oid = m.member WHERE m.roleid = v_role.oid LOOP
+      v_problems := array_append(v_problems, (format('granted to %I', v_row.rolname))::text);
+    END LOOP;
+  END IF;
 
   -- Effective table privileges in sessions, however obtained.
   FOR v_row IN

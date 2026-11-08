@@ -60,21 +60,28 @@ async function fixture(){
   if(r.status!==200)throw new Error("upload "+r.status+" "+await r.text());
   return batchId;
  }
- /** Run sql as `role` in a READ ONLY transaction with the read API's tenant pins (null = unset). */
- const asReader=async(sql:string,params:unknown[]=[],bind:{org?:string|null;ws?:string|null}={},role="bulls96_read_api")=>{
-  await db.exec("BEGIN READ ONLY");
+ /** Run sql as `role` in a READ ONLY transaction with the read API's tenant pins (null = unset).
+  *  Default: a genuine login of `role` (SET SESSION AUTHORIZATION: session_user = role, role GUC 'none'),
+  *  as the Worker's Hyperdrive connection is. With `via`, the session is the login `via` and the
+  *  transaction then runs SET LOCAL ROLE `role` (a member assuming the role). PGlite does not restore
+  *  session_user on RESET or ROLLBACK, so the superuser is reinstated explicitly. */
+ const asReader=async(sql:string,params:unknown[]=[],bind:{org?:string|null;ws?:string|null}={},role="bulls96_read_api",via?:string)=>{
+  await db.exec("SET SESSION AUTHORIZATION "+(via??role));
   try{
-   const org=bind.org===undefined?TENANT.orgId:bind.org,ws=bind.ws===undefined?TENANT.workspaceId:bind.ws;
-   if(org!==null)await db.query("SELECT set_config('bulls96_read.org_id',$1,true)",[org]);
-   if(ws!==null)await db.query("SELECT set_config('bulls96_read.workspace_id',$1,true)",[ws]);
-   await db.exec("SET LOCAL ROLE "+role);
-   const r=await db.query(sql,params as never);await db.exec("COMMIT");return r.rows as any[];
-  }catch(e){await db.exec("ROLLBACK");throw e}
+   await db.exec("BEGIN READ ONLY");
+   try{
+    const org=bind.org===undefined?TENANT.orgId:bind.org,ws=bind.ws===undefined?TENANT.workspaceId:bind.ws;
+    if(org!==null)await db.query("SELECT set_config('bulls96_read.org_id',$1,true)",[org]);
+    if(ws!==null)await db.query("SELECT set_config('bulls96_read.workspace_id',$1,true)",[ws]);
+    if(via!==undefined)await db.exec("SET LOCAL ROLE "+role);
+    const r=await db.query(sql,params as never);await db.exec("COMMIT");return r.rows as any[];
+   }catch(e){await db.exec("ROLLBACK");throw e}
+  }finally{await db.exec("SET SESSION AUTHORIZATION postgres")}
  };
  const hp=(h:Head)=>[h.cutover,h.epoch,h.version,h.digest,h.kind,h.pending,h.baseline];
  /** The reader for the owner's hits, exactly as the Worker calls it (GATE_SQL). */
- const gate=async(hits:Hit[]|unknown,h:Head,o:{owner?:string;org?:string;ws?:string;bind?:{org?:string|null;ws?:string|null};role?:string}={})=>
-  asReader(GATE_SQL,[o.org??TENANT.orgId,o.ws??TENANT.workspaceId,o.owner??TENANT.userId,...hp(h),JSON.stringify(hits)],o.bind??{},o.role);
+ const gate=async(hits:Hit[]|unknown,h:Head,o:{owner?:string;org?:string;ws?:string;bind?:{org?:string|null;ws?:string|null};role?:string;via?:string}={})=>
+  asReader(GATE_SQL,[o.org??TENANT.orgId,o.ws??TENANT.workspaceId,o.owner??TENANT.userId,...hp(h),JSON.stringify(hits)],o.bind??{},o.role,o.via);
  /** The verdict of one hit (undefined = no row). */
  const verdict=async(hit:Hit,h:Head,o={})=>{const r=await gate([hit],h,o);expect(r.length).toBeLessThanOrEqual(1);return r.length?r[0].drop_reason as string|null:undefined};
  /** The claim token whose immutable records hold (source, session). */
@@ -163,6 +170,59 @@ test("caller and pin refusals: other roles, a later stray grant, missing or mism
  expect([e?.code,e?.message]).toEqual(["42501","buffered search gate: caller is not the read api role"]);
  for(const o of [{bind:{org:null}},{bind:{ws:null}},{bind:{org:""}},{ws:"ws-b"},{org:"org-b"},{bind:{ws:"ws-b"}}])
   expect([o,await code(f.gate([h],at(7),o))]).toEqual([o,"42501"]);
+});
+
+test("caller identity: the genuine bulls96_read_api login passes; SET ROLE into it by a member is 42501 and reveals no gate status",async()=>{
+ const f=await healthy();const h=await f.hit(S(1));
+ // Genuine login: session_user is the read role and no SET ROLE is in effect (role GUC 'none').
+ expect(await f.asReader("SELECT session_user::text AS s,current_setting('role') AS r")).toEqual([{s:"bulls96_read_api",r:"none"}]);
+ expect(await f.gate([h],at(7))).toEqual([{claim_token:h.claim_token,source:"claude",session_id:S(1),drop_reason:null}]);
+ // A gate-closed owner is visible as such to the genuine login only.
+ const closed=at(7,D3,{pending:true});
+ expect(await f.verdict(h,closed)).toBe("gate_closed");
+ // A LOGIN granted bulls96_read_api (the membership the bootstrap and verifier now refuse) assumes it.
+ await f.db.exec("CREATE ROLE gate_probe_member LOGIN NOINHERIT;GRANT bulls96_read_api TO gate_probe_member");
+ expect(await f.asReader("SELECT session_user::text AS s,current_user::text AS c,current_setting('role') AS r",[],{},"bulls96_read_api","gate_probe_member"))
+  .toEqual([{s:"gate_probe_member",c:"bulls96_read_api",r:"bulls96_read_api"}]);
+ for(const head of [at(7),closed,NONE]){
+  const e=await f.gate([h],head,{via:"gate_probe_member"}).then((rows)=>({rows}),(e)=>e) as any;
+  expect([e?.code,e?.message,e?.rows]).toEqual(["42501","buffered search gate: caller is not the read api role",undefined]);
+ }
+ // The read login itself running a (no-op) SET ROLE to its own name is not the genuine-login shape either.
+ const self=await f.gate([h],at(7),{via:"bulls96_read_api"}).then(()=>null,(e)=>e) as any;
+ expect([self?.code,self?.message]).toEqual(["42501","buffered search gate: caller is not the read api role"]);
+ // A superuser session that SETs ROLE to bulls96_read_api is refused too (session_user is not the read login).
+ const su=await f.gate([h],at(7),{via:"postgres"}).then(()=>null,(e)=>e) as any;
+ expect(su?.code).toBe("42501");
+});
+
+test("verifier: a member of bulls96_read_api (anyone who could SET ROLE into it) fails session_read_api_role_verify.sql",async()=>{
+ const f=await fixture();
+ const VERIFY=psql("supabase/bootstrap/session_read_api_role_verify.sql");
+ await f.db.exec(VERIFY);
+ await f.db.exec("CREATE ROLE verify_probe_member LOGIN NOINHERIT;GRANT bulls96_read_api TO verify_probe_member");
+ const e=await f.db.exec(VERIFY).then(()=>null,(e)=>e) as any;
+ expect(e?.code).toBe("P0001");
+ expect(e?.message).toContain("granted to verify_probe_member");
+ // Even a non-assumable ADMIN-only edge is refused outside hoopdb.db_mode=supabase (it must also be
+ // the frozen Supabase creator edge: member postgres, grantor supabase_admin).
+ await f.db.exec("REVOKE bulls96_read_api FROM verify_probe_member;GRANT bulls96_read_api TO verify_probe_member WITH ADMIN TRUE, INHERIT FALSE, SET FALSE");
+ expect(await code(f.db.exec(VERIFY))).toBe("P0001");
+ await f.db.exec("BEGIN;SELECT set_config('hoopdb.db_mode','supabase',true)");
+ expect(await code(f.db.exec(VERIFY))).toBe("P0001");
+ await f.db.exec("ROLLBACK");
+ await f.db.exec("REVOKE bulls96_read_api FROM verify_probe_member");
+ await f.db.exec(VERIFY);
+ // The bare-role bootstrap refuses an inbound member as well (55000), changing nothing.
+ await f.db.exec("GRANT bulls96_read_api TO verify_probe_member");
+ const BOOTSTRAP=readFileSync(join(root,"supabase/bootstrap/session_read_api_roles.sql"),"utf8");
+ expect(await code(f.db.exec(BOOTSTRAP))).toBe("55000");
+ await f.db.exec("REVOKE bulls96_read_api FROM verify_probe_member");
+ // The one tolerated edge, Supabase PG16+'s creator edge (member postgres, grantor the superuser
+ // supabase_admin, ADMIN without INHERIT or SET, hoopdb.db_mode=supabase), needs a non-bootstrap
+ // CREATEROLE postgres that PGlite cannot model; it is the predicate of acquisition_installer_verify.sql.
+ await f.db.exec(VERIFY);
+ await f.db.exec(BOOTSTRAP);
 });
 
 test("malformed input returns no rows (the Worker drops every hit), never an error",async()=>{
