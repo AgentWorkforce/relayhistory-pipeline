@@ -187,7 +187,10 @@ export async function runAcceptance(stack: StackSession, log: (c: Check) => void
       last = `list=${list.status}`;
       const search = await read(`/v1/events?q=${uploadA.marker}&limit=20`, tokenA);
       last += ` search=${search.status}:${search.json?.error?.reason ?? ""}`;
-      if (list.status === 200 && has(list, uploadA.sessionId) && search.status === 200 && hasEvent(search, uploadA.marker)) return "consumer indexed the upload into directory and search";
+      // The turns are a second origin, so a second manifest: the session lists before they are indexed.
+      const turns = await read(`/v1/sessions/${uploadA.sessionId}/turns?source=${SOURCE}`, tokenA);
+      last += ` turns=${turns.status}:${(turns.json?.turns ?? []).length}`;
+      if (list.status === 200 && has(list, uploadA.sessionId) && search.status === 200 && hasEvent(search, uploadA.marker) && (turns.json?.turns ?? []).length === 2) return "consumer indexed both uploads into directory, search and turns";
       if (Date.now() > deadline) throw new Failed(`not processed within 240s: ${last}`);
       await sleep(5_000);
     }
