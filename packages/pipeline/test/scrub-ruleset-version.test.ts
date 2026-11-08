@@ -68,6 +68,8 @@ const SCRUB_RULESETS: Record<number, string> = {
   // escaped line separator, a backslash, a quote, a tab or a double space is redacted whole).
   // Updated before release (exact-head review of 0f9b2416: an op:// reference has exactly three
   // or four segments; two, or five or more, are redacted whole).
+  // Main carried interim in-place re-pins 595fecdf… and 848c490b… of rule set 5 that were never
+  // deployed; the chained-PEM fix from #362 is part of rule set 6.
   5: "ed8d5c35bfddbcdbe03416c03e08b3d0a0bbcf7c276bc08fe12f14d8756ee933",
   // Version 6: an unquoted value after a quoted secret key is classified whole (version 5
   // classified its first MAX_QUOTED_VALUE units, so 4096 digits then a tail were kept) and

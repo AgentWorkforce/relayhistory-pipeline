@@ -40,7 +40,9 @@
  * PR #354 edited lib/scrub.ts in place under version 5 and added two tests here asserting
  * the new behaviour (a bare value classified whole, a PEM footer inside an over-cap value);
  * rule set 6 ships those fixes, so they live in scrub-ruleset-6.test.ts, as does the shared
- * corpus's record-path run (the corpus holds rule set 6 cases).
+ * corpus's record-path run (the corpus holds rule set 6 cases). Likewise #362's chained-PEM
+ * test (the frozen rule set 5 source redacts that input to the end), now in
+ * scrub-ruleset-6.test.ts.
  */
 import { describe, expect, it, vi } from "vitest";
 import * as currentChunks from "../src/lib/pipeline/raw-chunks.js";

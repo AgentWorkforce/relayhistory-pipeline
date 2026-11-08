@@ -28,6 +28,12 @@
  *    between, the close was put back and the rest of that credential, glued to the footer,
  *    was kept with its label gone. See scrub-ruleset-6-later-unquoted.test.ts.
  *
+ * 5. Merged from main (#362, cb01a9c2): a second header opened inside an over-cap value
+ *    after the footer of a header before it, whose own footer lies past the value. Main
+ *    carried this as an in-place, never-deployed re-pin of rule set 5 (848c490b); rule set
+ *    6's pairing already redacts through that footer, and its test lives here, with the
+ *    defect 4 interaction (that footer inside a later unquoted credential).
+ *
  * PR #354 made the fixes for 1 and 2 in place under version 5 with tests in
  * scrub-ruleset-5.test.ts; those tests are folded in here (its `"token": <digits>` kept
  * assertion is superseded: rule set 6 redacts any bare value at or over the bound), and
@@ -240,6 +246,53 @@ describe("rule set 6: a private-key footer inside a later quoted secret value (d
     const text = `"password": "${"a".repeat(MAX_QUOTED_VALUE + 1)}\n${H}\n${BODY}" ${BODY}\n${F}\nKEEPTRAIL`;
     allPaths(text, `"password": "${R}"\nKEEPTRAIL`, ["KEEPTRAIL"]);
   });
+});
+
+describe("rule set 6: a chained private-key header inside a quoted secret value (#362)", () => {
+  const h = "-----BEGIN PRIVATE KEY-----";
+  const f = "-----END PRIVATE KEY-----";
+
+  // Moved from main's scrub-ruleset-5.test.ts (#362, cb01a9c2): there it ran against the
+  // frozen rule set 5 source too, which redacts this input to the end (KEEPTRAIL lost); the
+  // behaviour is that of main's undeployed in-place re-pin 848c490b, made part of rule set 6.
+  it("does not erase a following PEM header while leaving its body visible", () => {
+    const first = `${"A".repeat(MAX_QUOTED_VALUE + 1)}-----END PRIVATE KEY-----`;
+    const input =
+      `-----BEGIN PRIVATE KEY-----\n"password": "${first}\n` +
+      `-----BEGIN PRIVATE KEY-----"\nSECRETBODY\n-----END PRIVATE KEY-----\nKEEPTRAIL`;
+    const out = scrubText(input);
+    expect(out).not.toContain("SECRETBODY");
+    expect(out).not.toContain("BEGIN PRIVATE KEY");
+    expect(out).not.toContain("END PRIVATE KEY");
+    expect(out).toContain("KEEPTRAIL");
+    expect(scrubLong(input)).toBe(out);
+    expect(records(`${input}\n`)).toBe(`${out}\n`);
+  });
+
+  // The #362 shape (a header before the value, its footer then a second header inside the
+  // value) whose second footer is inside a later UNQUOTED credential (defect 4): the
+  // redaction runs from the first header through the second footer and the run glued to
+  // it, within the bound and over it.
+  const CONTEXTS = ["token=", "Authorization: Bearer ", "https://example.test/cb?access_token="];
+  for (const [label, n] of [["within the bound", 3], ["over the bound", MAX_QUOTED_VALUE + 1]] as const) {
+    for (const context of CONTEXTS) {
+      it(`chained header ${label}, second footer inside a later ${JSON.stringify(context)} credential`, () => {
+        const text = `KEEPHEAD\n${h}\n"password": "${"a".repeat(n)}${f}\n${h}"\n${BODY}\n${context}abc${f}SECRETTAIL KEEPTRAIL`;
+        allPaths(text, `KEEPHEAD\n${R} KEEPTRAIL`, ["KEEPHEAD", "KEEPTRAIL"]);
+      });
+
+      it(`chained header ${label}, a quote glued to the second footer in ${JSON.stringify(context)}: to the end`, () => {
+        const text = `KEEPHEAD\n${h}\n"password": "${"a".repeat(n)}${f}\n${h}"\n${BODY}\n${context}abc${f}SECRET"TAIL KEEPTRAIL`;
+        expect(scrubText(text)).toBe(`KEEPHEAD\n${R}`);
+        expect(scrubLong(text)).toBe(`KEEPHEAD\n${R}`);
+        // The raw record path redacts through the line's end, its line break included.
+        for (const out of [scrubLong(PAD + text), records(`${text}\n`), JSON.stringify(scrubJson({ content: text }))]) {
+          noKeyMaterial(out, label);
+          expect(out.includes("SECRET") || out.includes("TAIL") || out.includes("KEEPTRAIL")).toBe(false);
+        }
+      });
+    }
+  }
 });
 
 describe("rule set 6: the shared corpus's record cases through the raw-chunk record path", () => {
