@@ -25,6 +25,8 @@ const text = (path: string) => readFileSync(resolve(root, path), "utf8");
 const INDEX_JOB = "scripts/ops/ingest-bookkeeping-cleanup/phase_a_index.sql";
 const indexStatements = text(INDEX_JOB).split("\n").filter((l) => !l.startsWith("--")).join("\n").split(";").map((s) => s.trim()).filter((s) => s.startsWith("CREATE INDEX"));
 const NAME = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql", ROLLBACK = "supabase/rollbacks/20261105043880_ingest_bookkeeping_cleanup.down.sql";
+/** 043890 replaces the search gate to read 043880's tombstones; it is later, so its down must run first. */
+const GR_NAME = "upstream:20261105043890_buffered_search_gate_retired_witness.sql", GR_ROLLBACK = "supabase/rollbacks/20261105043890_buffered_search_gate_retired_witness.down.sql";
 const epoch = "3".repeat(64), identity = "c".repeat(64), hex = (c: string) => c.repeat(64);
 const profile: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: true, runtimeRole: "postgres" };
 type Current = { revision: number; digest?: string };
@@ -220,6 +222,10 @@ describe.skipIf(!url)("ingest bookkeeping cleanup 043880 (Phase A) on owned PG17
     const at = original.indexOf("CREATE FUNCTION sessions.ingest_babysitter_retention_register(p jsonb)");
     const end = original.indexOf("END $register$;", at) + "END ".length;
     const body = original.slice(original.indexOf("$register$", at) + "$register$".length, end);
+    // 043880's down is refused while the later 043890 is applied; 043890's own down (no tombstones yet) goes first.
+    await expect(pool.query(text(ROLLBACK))).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("a later migration is applied") });
+    await pool.query(text(GR_ROLLBACK));
+    expect((await one("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1", [GR_NAME])).n).toBe(0);
     await pool.query(text(ROLLBACK));
     const restored = await regSrc();
     try { expect(restored.prosrc).toBe(body); } catch (e) { await migrate(); throw e; }
@@ -231,6 +237,7 @@ describe.skipIf(!url)("ingest bookkeeping cleanup 043880 (Phase A) on owned PG17
     await pool.query(indexStatements[0]!);
     expect(await regSrc()).toEqual(before);
     expect((await one("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1", [NAME])).n).toBe(1);
+    expect((await one("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1", [GR_NAME])).n).toBe(1);
   }, 120000);
 
   test("Phase A: only terminal claims lose their decisions; each condition is causal", async () => {
@@ -419,8 +426,18 @@ describe.skipIf(!url)("ingest bookkeeping cleanup 043880 (Phase A) on owned PG17
 
   test("the down is refused once any claim was retired (registration must stay closed)", async () => {
     expect((await one("SELECT count(*)::int n FROM sessions.ingest_bookkeeping_retired_claims")).n).toBeGreaterThan(0);
-    await expect(pool.query(text(ROLLBACK))).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("claims were retired") });
+    // 043890's down is refused first (the gate must keep hiding retired claims) ...
+    await expect(pool.query(text(GR_ROLLBACK))).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("claims were retired") });
+    await expect(pool.query(text(ROLLBACK))).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("a later migration is applied") });
+    // ... and 043880's own tombstone guard still holds with 043890's ledger row out of the way (rolled back, never committed).
+    const c = await connect();
+    try {
+      await c.query("BEGIN");
+      await c.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1", [GR_NAME]);
+      await expect(c.query(text(ROLLBACK))).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("claims were retired") });
+    } finally { await release(c); }
     expect((await one("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1", [NAME])).n).toBe(1);
+    expect((await one("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1", [GR_NAME])).n).toBe(1);
   }, 60000);
 
 });
