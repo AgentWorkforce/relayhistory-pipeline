@@ -135,6 +135,9 @@ Request (exact keys, refused otherwise, with `identifier` rules from `app.ts` l.
   - Have `ingest_privacy_authority_begin` return `replayed: true` when the `FOUND` branch at migration l.413-414 is taken.
   - Until that ships, the route **must not** claim detection. In that state it returns `replayed: null`, and control
     treats a replay as "same count, same job".
+- **Per-session erase ships separately.** The per-session erase (`sessions:[{source,session_id}]`) ships as a separate,
+  held, default-off PR. It covers ClickHouse rows, S3 copies, buffered/staged copies, search docs, directory rows and
+  PR evidence, under the same fence and witness as reset, consistent with the R2 v5.3 privacy gate.
 - **Concurrency.**
   - **Same user, same `request_id`, in flight:** a second call while the head is pending with the same digest gets the
     pending head back (`apply:false`, migration l.488-493). The route re-drives fence and complete, which is safe because
@@ -265,16 +268,55 @@ gone" signal, and the response must not imply one.
 
 ## 7. Open questions (Khaliq / lead)
 
-1. Reachability. How does control reach the ingest Worker: a service binding or a dedicated ingress? Should the route
-   live on the ingest Worker at all, or on relayhistory-api? The repo does not record control's runtime.
-2. Read principal. How does control poll the read API for another user's sessions (section 4.5)?
+Q1, Q2, Q7 and Q8 are decided below (direction from relay-control draft PR #48, section 4). Q3-Q6 and Q9 stay open.
+
+### Q1. Reachability: how does control reach the ingest Worker, and should the route live there at all?
+
+**Decided: a dedicated private ingress on the existing ingest Worker.**
+
+- **Host.** The route stays on the ingest Worker (section 4.1). There is no new service, and it does not move to
+  relayhistory-api.
+- **Ingress.** It is a dedicated private ingress that carries an operator credential (section 4.2). It is not reachable
+  through the public upload path, and the Worker's existing routes gain no new exposure.
+- **Flag.** The default-off flag is proposed as `OPERATOR_ERASE_ENABLED`. Section 1 names it
+  `OPERATOR_SESSION_ERASE_ENABLED`, and the implementation PR fixes the final name. Either way the behaviour keeps
+  its own flag, and only the literal `"1"` turns it on.
+
+### Q2. Read principal: how does control poll the read API for another user's sessions?
+
+**Decided: a control-class read principal, verified through the existing relaycontrol token introspection.**
+
+- **Verification.** It uses the same introspection path as the `sh_at_` acceptance in #313. The pipeline mints nothing,
+  adds no JWKS and runs no second verifier.
+- **Token class.** The class is NEW. It needs pipeline-lead's ruling before implementation, and it needs its own flag
+  and review on the read API (section 4.5).
+
+### Q7. Membership attestation: should control sign one, or should the pipeline rely on control's check alone?
+
+**Decided: a control-signed short-lived attestation, verified through the same introspection.**
+
+- **Flow.** Relay-control issues the attestation and the operator presents it. The pipeline verifies it through the
+  same introspection as Q2.
+- **No local evaluation.** The pipeline never evaluates membership itself (section 6).
+- **Bounds.** Expiry is bounded, and the proposal is 5 minutes. The attestation is bound to the request's org and
+  workspace, and a mismatch is refused.
+
+### Q8. Audit: should the pipeline persist `actor_ref` durably, or log it only?
+
+**Decided: persist it durably, beside `request_id`.**
+
+- **Migration.** `actor_ref` is stored in the same migration that extends `ingest_frozen_source_resets` for replay
+  detectability (section 4.4). The slot is assigned at implementation, by the registry keeper when the implementation PR
+  opens.
+- **Emission.** `ingest_privacy_authority_begin` emits the capped session list and `replayed: true` from that same
+  row.
+
+### Still open
+
 3. Pointer-less sessions. What does completion mean for backfilled sessions that have no pointer row?
 4. Should a `request_id` reused across different tenants be refused (409) instead of being logged?
 5. Unknown user. Should the pipeline answer 200 `count:0` (recommended) or 404?
 6. Former members. Who closes the gap for users who have left the workspace (section 5)?
-7. Membership attestation. Should control sign a membership attestation, or should the pipeline rely on control's
-   check alone?
-8. Audit. Should the pipeline persist `actor_ref` durably, or log it only?
 9. Who owns the future migration (replay flag, capped session list, distinct SQLSTATEs), and which registry slot does
    it take?
 
