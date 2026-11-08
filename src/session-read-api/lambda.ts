@@ -20,6 +20,10 @@
  * Login needs the relaycontrol introspection above, else 503; this entry wires no
  * canonical source, so catalog answers 501 `catalog_not_configured`, and the
  * Function URL handler is GET-only, so login is 405 here).
+ *
+ * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED, owner-buffered.ts) are
+ * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
+ * them, so the flag has no effect here.
  */
 import pg from "pg";
 import { log } from "../shared/log.ts";

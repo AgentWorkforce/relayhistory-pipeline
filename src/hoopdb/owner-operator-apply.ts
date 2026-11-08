@@ -23,12 +23,14 @@ export const OWNER_APPLY = {
   owner: "postgres",
   login: "cli_login_postgres",
   database: "postgres",
-  // Window #2 starts from the verified Window #1 ledger (35 rows).
-  // Fresh read-only owner proof on 2026-11-05 20:05Z matched this exact
-  // digest. Reject earlier baselines rather than allowing migration gaps.
+  // The next window starts from the verified G3 ledger (57 rows).
+  // The 2026-11-08 02:58:31Z 3485338f owner_apply_verified receipt
+  // (SHA256 8d4e08a176d87614e7f3980ac2fcb57e3143ae3cb5c1a83ce10893a6d677604c,
+  // 1 applied / 56 skipped) records this digest. Reject earlier baselines
+  // (G2 502349fe..., pre-G2 3173f2df...) rather than allowing gaps.
   // This pin is not production apply approval; source, plan, capture and
   // human approval bindings remain mandatory.
-  ledger: "3173f2df7f749fd79c340286f3284d91d8f5a8b988b7f1b1a11e01c3a3307641",
+  ledger: "7c9eac7c58d508af213282e237245ad0ea1f99353940d9772b6acff3c1bba1b0",
   protocol: "owner-schema-apply-v1",
   execution: "ssh-sf-frame-owner-schema-apply",
   maxAgeMs: 3600000,

@@ -225,6 +225,30 @@ function unavailableFields(error: unknown): Record<string, unknown> {
   return {};
 }
 
+/** Lock/timeout alert stages (runbooks/history-620-operations.md, "Lock-wait alert"). The two
+ * Worker-side seat-clock callers: `lazy_claim` (stage "claim" in buffered mode =
+ * ingest_claim_buffered_batch) and `staged_ack` (stage "buffer_receipt" = ingest_commit_buffered_batch).
+ * Plus `staged_intent` (stage "buffer_intent" = ingest_prepare_buffer_stage): it takes no seat-clock lock,
+ * but it waits on the same fence, batch and stage-intent rows the staged ACK holds FOR UPDATE, so a
+ * long ACK surfaces there first. set_live / control_changed / lazy_clear have no Worker call site; they
+ * alert from the operator/DB logs. */
+export type LockAlertStage = "lazy_claim" | "staged_ack" | "staged_intent" | "set_live" | "control_changed" | "lazy_clear";
+const LOCK_ALERT_SQLSTATES = new Set(["55P03", "57014"]);
+
+/** The one alert line for a 55P03 (lock_not_available) / 57014 (query_canceled) ledger failure on a
+ * lock-alert stage: `{ route, stage, sqlstate }` and nothing else (no tenant data, no ids). Diagnostic only. */
+export function lockAlertFields(error: unknown, acceptanceMode: string | undefined): { route: "ingest.lock_alert"; stage: LockAlertStage; sqlstate: string } | undefined {
+  if (!(error instanceof IngestUnavailable)) return undefined;
+  const sqlstate = error.db?.db_error_code;
+  if (sqlstate === undefined || !LOCK_ALERT_SQLSTATES.has(sqlstate)) return undefined;
+  const stage: LockAlertStage | undefined =
+    error.stage === "claim" && acceptanceMode === "buffered" ? "lazy_claim"
+      : error.stage === "buffer_receipt" ? "staged_ack"
+      : error.stage === "buffer_intent" ? "staged_intent"
+      : undefined;
+  return stage ? { route: "ingest.lock_alert", stage, sqlstate } : undefined;
+}
+
 function dbFields(db: DbErrorDiagnosis | undefined): Record<string, unknown> {
   return db ? { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis } : {};
 }
@@ -432,6 +456,8 @@ export function createIngestApp(deps: IngestAppDeps) {
         duration_ms: Date.now() - started,
         bytes_raw: read.bytes,
       });
+      const lockAlert = lockAlertFields(error, deps.deliver.acceptanceMode);
+      if (lockAlert) emit(lockAlert);
       return failure(c, error);
     }
   };
@@ -463,6 +489,8 @@ export function createIngestApp(deps: IngestAppDeps) {
     } catch (error) {
       const code = error instanceof DeliveryError ? error.code : "delivery_unavailable";
       emit({ ...fields, outcome: code, ...unavailableFields(error), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
+      const lockAlert = lockAlertFields(error, deps.deliver.acceptanceMode);
+      if (lockAlert) emit(lockAlert);
       return failure(c, error);
     }
   });

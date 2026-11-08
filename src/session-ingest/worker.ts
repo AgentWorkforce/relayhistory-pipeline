@@ -26,6 +26,8 @@
  *                              off, and only with INGEST_SUBREQUEST_CAP set (below)
  *   INGEST_SUBREQUEST_CAP      required for routing: this Worker's PROVEN effective subrequest cap
  *   INGEST_SUBREQUEST_REDIRECTS  worst-case redirects per S3 fetch (0..20, default 20)
+ *   INGEST_STAGE_LATENCY_LOG   unset/off (default) | on (any case): one `ingest.stage_latency` line
+ *                              per deliver stage { stage, outcome, duration_ms, sqlstate } (deliver.ts)
  *   SESSIONS_NEON_EXIT         unset/false (default) | true: refuse every Neon edge at startup
  *                              (replica, NEON_REPLICA binding, a custody source other than
  *                              frozen-supabase in buffered mode); docs/neon-exit-edge-map.md
@@ -44,6 +46,7 @@ import { createIngestApp } from "./app.ts";
 import { sqlLedger } from "./ledger-sql.ts";
 import type { ReplicaMode, ReplicaSink, NeonReplicaMessage } from "./replica.ts";
 import { fanout, type FanoutMessage } from "./staging.ts";
+import type { StageLatencyFields } from "./deliver.ts";
 import type { WriteTarget } from "./writer.ts";
 import { routingFlag } from "./babysitter-retention.ts";
 
@@ -83,6 +86,8 @@ export interface IngestWorkerEnv {
   INGEST_SUBREQUEST_CAP?: string;
   /** Worst-case redirects one S3 fetch may follow (0..20; default 20, the fetch maximum). */
   INGEST_SUBREQUEST_REDIRECTS?: string;
+  /** "on" (any case): per-stage latency lines (deliver.ts StageLatencyFields). Default off. */
+  INGEST_STAGE_LATENCY_LOG?: string;
 }
 
 interface SecretBinding {
@@ -138,6 +143,8 @@ export interface IngestSettings {
   subrequestRedirects?: number;
   /** INGEST_EXPECT_GENERATION, when set: every Babysitter evidence write is fenced on it. */
   retentionGeneration?: string;
+  /** INGEST_STAGE_LATENCY_LOG=on: per-stage latency lines. Absent (the default): none. */
+  stageLatencyLog?: true;
 }
 
 /** The settings, or null while any required one is missing (every request is then 503 not_configured). */
@@ -185,6 +192,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(env.INGEST_SUBREQUEST_CAP ? { subrequestCap: bounded(env.INGEST_SUBREQUEST_CAP, 1, 10_000_000, "INGEST_SUBREQUEST_CAP") } : {}),
     ...(env.INGEST_SUBREQUEST_REDIRECTS ? { subrequestRedirects: bounded(env.INGEST_SUBREQUEST_REDIRECTS, 0, 20, "INGEST_SUBREQUEST_REDIRECTS") } : {}),
     ...(/^[0-9a-f]{64}$/.test(env.INGEST_EXPECT_GENERATION ?? "") ? { retentionGeneration: env.INGEST_EXPECT_GENERATION! } : {}),
+    ...(routingFlag(env.INGEST_STAGE_LATENCY_LOG) ? { stageLatencyLog: true as const } : {}),
   };
 }
 
@@ -247,6 +255,8 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: (
       ...(settings.subrequestCap !== undefined ? { subrequestCap: settings.subrequestCap } : {}),
       ...(settings.subrequestRedirects !== undefined ? { subrequestRedirects: settings.subrequestRedirects } : {}),
       ...(settings.retentionGeneration !== undefined ? { retentionGeneration: settings.retentionGeneration } : {}),
+      // Default off: per-stage latency lines through the same allowlisted logger as the route line.
+      ...(settings.stageLatencyLog ? { stageLatency: (fields: StageLatencyFields) => log.info("session ingest", { ...fields }) } : {}),
     },
     onboarding: { run },
   });

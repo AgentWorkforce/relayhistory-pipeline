@@ -12,6 +12,8 @@ import { LANES } from "../../../scripts/sessions-function-boundary/lanes/index.t
 import { ingestHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-history.ts";
 import { bufferedGcSingleCandidate } from "../../../scripts/sessions-function-boundary/lanes/buffered-gc-single-candidate.ts";
 import { lazySourceTables, originalBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-source-tables.ts";
+import { lazyClaimClockNarrowing, originalBodies as originalClaimClockBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-claim-clock-narrowing.ts";
+import { lazyAckClockNoKeyUpdate, originalBodies as originalAckClockBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-ack-clock-no-key-update.ts";
 import { privacyAuthority, originalLazyBodies, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
 import { createHash } from "node:crypto";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
@@ -60,6 +62,8 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105040000_ingest_lazy_source_tables.down.sql",
       "supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql",
       "supabase/rollbacks/20261105042000_babysitter_evidence_retention.down.sql",
+      "supabase/rollbacks/20261105043500_lazy_claim_clock_narrowing.down.sql",
+      "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql",
     ]);
   });
 
@@ -94,6 +98,50 @@ describe("unified sessions function-boundary generator", () => {
       expect(down).toContain(body);
       expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(body));
     }
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 043500 lazy claim clock narrowing changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== lazyClaimClockNarrowing), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105043500_lazy_claim_clock_narrowing.down.sql";
+    for (const [path, value] of Object.entries(without.outputs)) expect(withLane.outputs[path]).toBe(value);
+    expect(withLane.summary.lanes["lazy-claim-clock-narrowing"]).toEqual({ functions: 0, replaces: 2, grants: 0 });
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, lazyClaimClockNarrowing.migration!), "utf8")).digest("hex"));
+    const bodies = originalClaimClockBodies(readFileSync(join(root, "supabase/migrations/20261104055000_lazy_current_custody.sql"), "utf8"));
+    expect(bodies).toHaveLength(2);
+    for (const body of bodies) {
+      expect(down).toContain(body);
+      expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(body));
+    }
+    expect(down).not.toContain("lazy-native-origin-v1");
+    expect(down).toContain("pg_advisory_xact_lock(961996,1)");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 043800 staged-ACK clock NO KEY UPDATE changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== lazyAckClockNoKeyUpdate), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql";
+    for (const [path, value] of Object.entries(without.outputs)) expect(withLane.outputs[path]).toBe(value);
+    expect(Object.keys(withLane.outputs).filter((p) => !(p in without.outputs))).toEqual([downPath]);
+    expect(withLane.summary.boundarySHA).toBe(without.summary.boundarySHA);
+    expect(withLane.summary.lanes["lazy-ack-clock-no-key-update"]).toEqual({ functions: 0, replaces: 1, grants: 0 });
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, lazyAckClockNoKeyUpdate.migration!), "utf8")).digest("hex"));
+    const bodies = originalAckClockBodies(readFileSync(join(root, "supabase/migrations/20261105043500_lazy_claim_clock_narrowing.sql"), "utf8"));
+    expect(bodies).toHaveLength(1);
+    expect(down).toContain(bodies[0]!);
+    expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(bodies[0]!));
+    expect(down).toContain("WHERE singleton FOR UPDATE;v_last:=c.last_seat;");
+    expect(down).not.toContain("FOR NO KEY UPDATE");
+    expect(down).not.toContain("FUNCTION sessions.ingest_lazy_records"); // only the ACK is restored (its comment names the claim fn)
+    expect(down).toContain("pg_advisory_xact_lock(961996,1)");
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");
     expect(down.trim().endsWith("COMMIT;")).toBe(true);
@@ -211,5 +259,44 @@ describe("unified sessions function-boundary generator", () => {
     expect(LANES.find((l) => l.lane === "canonical-project-events")?.migration).toBe("supabase/migrations/20261105033000_canonical_project_events.sql");
     expect(summary["read-api"]).toEqual({ functions: 3, replaces: 0, grants: 2 });
     expect(summary["canonical-feature-consumer"]).toEqual({ functions: 2, replaces: 0, grants: 1 });
+  });
+
+  test("043700 owner buffered read: two read-api-callable SECDEF readers, owner-only scope and parity helpers, ACL +4", async () => {
+    const g = await generate(repo, LANES, VERIFIERS);
+    expect(g.summary.lanes["owner-buffered-read"]).toEqual({ functions: 4, replaces: 0, grants: 2 });
+    expect(LANES.find((l) => l.lane === "owner-buffered-read")?.migration).toBe("supabase/migrations/20261105043700_owner_buffered_read.sql");
+    const acl = JSON.parse(g.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    const mine = Object.entries(acl).filter(([k]) => /^sessions\.(owner_buffered_read_scope|owner_buffered_parity_expected|buffered_sessions_for|buffered_session_stages_for)\(/.test(k));
+    expect(Object.fromEntries(mine)).toEqual({
+      "sessions.owner_buffered_read_scope(text,text,text,text,text,text,boolean,text)": ["<owner>:EXECUTE"],
+      "sessions.owner_buffered_parity_expected(text,text,text,text,bigint,text,text)": ["<owner>:EXECUTE"],
+      "sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)": ["<owner>:EXECUTE", "bulls96_read_api:EXECUTE"],
+      "sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)": ["<owner>:EXECUTE", "bulls96_read_api:EXECUTE"],
+    });
+    // Hand-written down path (no generated rollback), same guard shape as 034000/043000.
+    const down = readFileSync(join(root, "supabase/rollbacks/20261105043700_owner_buffered_read.down.sql"), "utf8");
+    expect(down).toContain("a later migration is applied");
+    expect(down.match(/DROP FUNCTION IF EXISTS/g)?.length).toBe(4);
+    expect(down).toContain("DROP TABLE IF EXISTS sessions.owner_buffered_parity;");
+    expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043700_owner_buffered_read.sql'");
+  });
+
+  test("a stale SECDEF signature under a lane's prefix (an old arity) is dropped from the wrapper, not carried forward", async () => {
+    const dir = scratch();
+    try {
+      const wrapper = "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql";
+      const stale = "sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,boolean)";
+      const clean = readFileSync(join(dir, wrapper), "utf8");
+      const current = "'sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)'";
+      expect(clean).toContain(current);
+      expect(clean).not.toContain("'" + stale + "'");
+      writeFileSync(join(dir, wrapper), clean.replace(current, "'" + stale + "',\n    " + current));
+      expect(readFileSync(join(dir, wrapper), "utf8")).toContain("'" + stale + "'");
+      const out = (await generate(reader(dir), LANES, VERIFIERS)).outputs[wrapper]!;
+      expect(out).not.toContain("'" + stale + "'");
+      expect(out).toContain(current);
+      expect(out).toBe(clean);
+      expect((await run({ root: dir, check: true })).drift).toEqual([wrapper]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
