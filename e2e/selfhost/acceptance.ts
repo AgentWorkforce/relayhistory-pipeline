@@ -244,7 +244,15 @@ export async function runAcceptance(stack: StackSession, log: (c: Check) => void
       if (Date.now() > deadline) throw new Failed("read API did not recover within 120s");
       await sleep(2_000);
     }
-    const reads = await readA("after restart");
+    // The object store and pools come back on their own schedule; a 503 here is a retry, not lost data.
+    let reads = "";
+    const readDeadline = Date.now() + 120_000;
+    for (;;) {
+      try { reads = await readA("after restart"); break; } catch (error) {
+        if (!(error instanceof Failed) || !/: 503/u.test(error.message) || Date.now() > readDeadline) throw error;
+        await sleep(3_000);
+      }
+    }
     // The original upload is idempotent: same receipt, same stored objects.
     let retry = await ingest("/v1/delivery/batches", tokenA, uploadA.body);
     for (let i = 0; i < 12 && retry.status === 503; i++) {

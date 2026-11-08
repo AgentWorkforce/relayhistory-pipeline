@@ -72,10 +72,7 @@ GRANT SELECT (org_id, workspace_id, harness, session_id, event_projection_ready,
 DROP POLICY IF EXISTS session_directory_read_api ON sessions.session_directory;
 CREATE POLICY session_directory_read_api ON sessions.session_directory
   AS PERMISSIVE FOR SELECT TO bulls96_read_api
-  USING (
-    org_id = current_setting('bulls96_read.org_id', true)
-    AND workspace_id = current_setting('bulls96_read.workspace_id', true)
-  );
+  USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true));
 
 DROP POLICY IF EXISTS session_index_read_api ON sessions.session_index;
 CREATE POLICY session_index_read_api ON sessions.session_index
