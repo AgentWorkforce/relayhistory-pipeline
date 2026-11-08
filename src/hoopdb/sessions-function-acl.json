@@ -325,6 +325,30 @@
     "sessions.ingest_batch_key(jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_bookkeeping_claim_lock_key(uuid)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_bookkeeping_cleanup_audit_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_bookkeeping_cleanup_configure(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_bookkeeping_cleanup_decisions(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_bookkeeping_cleanup_gate(text,boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_bookkeeping_cleanup_index_ok(text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_bookkeeping_cleanup_try_lock(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_bookkeeping_retired_claims_guard()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_bounded(jsonb,integer,integer)": [
       "<owner>:EXECUTE"
     ],
