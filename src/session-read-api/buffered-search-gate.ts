@@ -21,22 +21,39 @@
  *      answered 200 with exactly the producer's shape (relayhistory-cloud
  *      private-session-read-controls.ts @ a06a58f9) and an exact tenant echo;
  *   2. the head is not `pending`;
- *   3. the row's ORIGINAL admission (sessions.ingest_claim_attempts by claim
- *      token, owned by the same org/workspace/user) has an epoch and version,
- *      and they equal the head's `controlEpoch` and `sourceControlVersion`.
- *      The epoch is the immutable ingest_lazy_policy.control_epoch, accepted
- *      only when the policy's source_identity_sha256 equals the claim's; the
- *      version is the claim's source_control_version, and every lazy ACK
- *      decision of the claim must carry the same version;
- *   4. the owner has a G2 parity row (sessions.owner_buffered_parity);
- *   5. the hit's (owner, origin, source, session) is not in
- *      sessions.ingest_frozen_source_deletions or sessions.upload_deletions,
- *      and the owner's upload_resets count still equals the claim's
- *      reset_epoch (no reset since admission).
+ *   3. sessions.buffered_search_gate_for (one SECURITY DEFINER reader,
+ *      supabase/migrations/20261105043860_buffered_search_gate.sql), called
+ *      once per owner with that owner's head, returns a NULL drop_reason for
+ *      the hit. It judges, for the claim of the same org/workspace/user:
+ *      a. ADMISSION: the immutable ingest_lazy_policy.control_epoch (only when
+ *         the policy's source_identity_sha256 equals the claim's) equals
+ *         `controlEpoch`; the claim's source_control_version equals the head
+ *         version (0 without a head) and every lazy ACK decision agrees;
+ *      b. BINDING: the claim's immutable original records
+ *         (ingest_claim_attempts.records, not retired) hold exactly the hit's
+ *         (source, session_id); a claim token cannot vouch for another session;
+ *      c. GATE AND G2 PARITY, exactly as 20261105043700's
+ *         owner_buffered_read_scope: head epoch = cutover epoch, privacy
+ *         authority not fenced, an unexpired policy with this control epoch and
+ *         baseline, and an owner_buffered_parity row whose cutover epoch,
+ *         baseline, full head tuple (or no_head), target generation,
+ *         deletion/reset digests and target lineage equal the passed head and
+ *         sessions.owner_buffered_parity_expected recomputed now;
+ *      d. DELETIONS AND RESETS: (owner, source, session) is in neither
+ *         upload_deletions nor ingest_frozen_source_deletions under ANY origin,
+ *         and the owner's upload_resets count still equals the claim's
+ *         reset_epoch.
+ *
+ * The Worker role (bulls96_read_api) never reads the gate tables directly: it
+ * has no grant on them (043700 revokes owner_buffered_parity from it). GATE_SQL
+ * is the only SQL here, and 043860 must be applied before
+ * READ_API_BUFFERED_SEARCH_GATE is set to on; without it every call fails and
+ * every buffered hit is dropped.
  *
  * Control heads are fetched once per distinct owner per request (in parallel,
  * at most MAX_GATE_OWNERS; hits of further owners are dropped) and never
- * cached across requests. The gate only removes rows: the page may shrink, its
+ * cached across requests; each owner's gate call follows its head, so one
+ * owner's worst case is two deadlines. The gate only removes rows: the page may shrink, its
  * cursor is the one the unfiltered page computed.
  */
 import type { SqlQuery, TenantRunner } from "./liveness.ts";
@@ -170,113 +187,93 @@ export interface AdmissionRef {
   sessionId: string;
 }
 
-/** The original admission of one AdmissionRef, as the buffered ledger records it. */
-export interface Admission {
-  /** The claim's owning user (must equal the hit's user_id). */
-  claimUserId: string;
-  /** ingest_lazy_policy.control_epoch when the claim's source identity matches the policy's; else null. */
-  admissionEpoch: string | null;
-  /** The claim's source_control_version as a decimal string; null when absent. */
-  admissionVersion: string | null;
-  /** Every lazy ACK decision of the claim carries the claim's version. */
-  versionConsistent: boolean;
-  /** In upload_deletions or ingest_frozen_source_deletions for (owner, origin, source, session). */
-  deleted: boolean;
-  /** The owner's upload_resets count differs from the claim's reset_epoch (or the epoch is missing). */
-  resetBehind: boolean;
-}
-
 export const refKey = (r: AdmissionRef) => `${r.claimToken}\u0000${r.userId}\u0000${r.source}\u0000${r.sessionId}`;
 
-/** The buffered ledger reads the gate needs. Bound to the verified (org, workspace). */
-export interface AdmissionStore {
-  /** Admissions found, keyed by refKey; a ref without a matching claim of this tenant is absent. */
-  admissions(orgId: string, workspaceId: string, refs: AdmissionRef[]): Promise<Map<string, Admission>>;
-  /** The subset of `userIds` with a G2 parity row in this workspace. */
-  parity(orgId: string, workspaceId: string, userIds: string[]): Promise<Set<string>>;
-}
+/** The reasons sessions.buffered_search_gate_for may return (NULL = visible). */
+export const GATE_SQL_REASONS = [
+  "admission_epoch_mismatch",
+  "admission_version_mismatch",
+  "admission_session_mismatch",
+  "gate_closed",
+  "parity_missing",
+  "parity_stale",
+  "deleted",
+  "reset",
+] as const;
+export type GateSqlReason = (typeof GATE_SQL_REASONS)[number];
 
 /**
- * One statement over the refs. The claim must belong to this org and
- * workspace AND to the ref's user (the hit's owner): a hit cannot borrow
- * another user's admission. Missing authority (no policy row, identity
- * mismatch, NULL version or reset_epoch) yields a NULL or `true` blocker, so
- * the gate drops the hit.
+ * The gate's ledger verdicts for ONE owner's hits, judged against that owner's
+ * (non-pending) control head. Keyed by refKey; a ref with no verdict is absent
+ * (no claim of this tenant and owner, or the reader refused the input). Value
+ * null = visible. Bound to the verified (org, workspace).
  */
-export const ADMISSIONS_SQL = `WITH refs AS (
-  SELECT r.claim_token, r.user_id, r.source, r.session_id
-    FROM jsonb_to_recordset($3::jsonb) AS r(claim_token uuid, user_id text, source text, session_id text)
-), lp AS (
-  SELECT p.control_epoch, p.source_identity_sha256 FROM sessions.ingest_lazy_policy AS p WHERE p.singleton
-)
-SELECT refs.claim_token::text AS claim_token, refs.user_id, refs.source, refs.session_id,
-       a.user_id AS claim_user_id,
-       (SELECT lp.control_epoch FROM lp
-         WHERE a.source_identity_sha256 IS NOT NULL AND lp.source_identity_sha256 = a.source_identity_sha256) AS admission_epoch,
-       a.source_control_version::text AS admission_version,
-       NOT EXISTS (SELECT 1 FROM sessions.ingest_lazy_ack_decisions AS d
-                    WHERE d.claim_token = a.claim_token
-                      AND d.source_control_version IS DISTINCT FROM a.source_control_version) AS version_consistent,
-       (EXISTS (SELECT 1 FROM sessions.upload_deletions AS ud
-                 WHERE ud.org_id = a.org_id AND ud.workspace_id = a.workspace_id AND ud.user_id = a.user_id
-                   AND ud.origin_id = a.origin_id AND ud.source = refs.source AND ud.session_id = refs.session_id)
-        OR EXISTS (SELECT 1 FROM sessions.ingest_frozen_source_deletions AS fd
-                    WHERE fd.org_id = a.org_id AND fd.workspace_id = a.workspace_id AND fd.user_id = a.user_id
-                      AND fd.origin_id = a.origin_id AND fd.source = refs.source AND fd.session_id = refs.session_id)) AS deleted,
-       (a.reset_epoch IS NULL OR a.reset_epoch IS DISTINCT FROM
-         (SELECT count(*) FROM sessions.upload_resets AS ur
-           WHERE ur.org_id = a.org_id AND ur.workspace_id = a.workspace_id AND ur.user_id = a.user_id)) AS reset_behind
-  FROM refs
-  JOIN sessions.ingest_claim_attempts AS a
-    ON a.claim_token = refs.claim_token AND a.org_id = $1 AND a.workspace_id = $2 AND a.user_id = refs.user_id`;
+export interface GateStore {
+  verdicts(orgId: string, workspaceId: string, ownerUserId: string, head: SessionReadControlHead, refs: AdmissionRef[]): Promise<Map<string, GateSqlReason | "admission_unknown_reason" | null>>;
+}
 
-/** The G2 parity rows (sessions.owner_buffered_parity, declared by pipeline PR #328 / slot 043700). */
-export const PARITY_SQL = `SELECT DISTINCT p.user_id FROM sessions.owner_buffered_parity AS p
- WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.user_id = ANY($3::text[])`;
+/** Hits per reader call; sessions.buffered_search_gate_for returns no rows above 500. */
+export const MAX_GATE_HITS = 500;
 
-interface AdmissionRow {
+/**
+ * The ONLY SQL the gate runs. bulls96_read_api holds no grant on the buffered
+ * ledger tables; it holds EXECUTE on this one SECURITY DEFINER reader
+ * (20261105043860_buffered_search_gate.sql), which refuses any other caller and
+ * any tenant but the transaction's bound one.
+ */
+export const GATE_SQL = `SELECT claim_token, source, session_id, drop_reason
+  FROM sessions.buffered_search_gate_for($1, $2, $3, $4, $5, $6, $7, $8, $9::boolean, $10, $11::jsonb)`;
+
+/** The reader's head arguments, in 20261105043700's encoding (no head = four NULLs). */
+export function gateHeadParams(head: SessionReadControlHead): [string, string | null, string | null, string | null, string | null, boolean, string] {
+  const noHead = head.sourceControlVersion === "0";
+  return [
+    head.controlEpoch,
+    noHead ? null : head.sourceControlEpoch,
+    noHead ? null : head.sourceControlVersion,
+    noHead ? null : head.sourceControlDigest,
+    noHead ? null : head.sourceControlKind,
+    head.pending,
+    head.privacyBaselineSha256,
+  ];
+}
+
+interface GateSqlRow {
   claim_token: string;
-  user_id: string;
   source: string;
   session_id: string;
-  claim_user_id: string;
-  admission_epoch: string | null;
-  admission_version: string | null;
-  version_consistent: boolean;
-  deleted: boolean;
-  reset_behind: boolean;
+  drop_reason: string | null;
 }
 
+const isGateSqlReason = (v: string): v is GateSqlReason => (GATE_SQL_REASONS as readonly string[]).includes(v);
+
 /**
- * The store over the read role's tenant-bound transactions. NOTE: the read
- * role holds no grant on the buffered ledger today, so until a SECURITY
- * DEFINER reader for these predicates lands (it needs a migration slot), each
- * call fails and the gate drops every buffered hit. That is the intended
- * fail-closed behaviour, not a fallback.
+ * The store over the read role's tenant-bound READ ONLY transactions: one
+ * transaction per owner. Any error (043860 not applied, a role or pin
+ * refusal, a timeout) rejects, and the gate drops that owner's hits.
  */
-export function sqlAdmissionStore(run: TenantRunner): AdmissionStore {
+export function sqlGateStore(run: TenantRunner): GateStore {
   return {
-    async admissions(orgId, workspaceId, refs) {
-      const out = new Map<string, Admission>();
+    async verdicts(orgId, workspaceId, ownerUserId, head, refs) {
+      const out = new Map<string, GateSqlReason | "admission_unknown_reason" | null>();
       if (refs.length === 0) return out;
-      const payload = JSON.stringify(refs.map((r) => ({ claim_token: r.claimToken, user_id: r.userId, source: r.source, session_id: r.sessionId })));
-      const { rows } = await run(orgId, workspaceId, (q: SqlQuery) => q.query<AdmissionRow>(ADMISSIONS_SQL, [orgId, workspaceId, payload]));
+      // One READ ONLY transaction per owner; one call per MAX_GATE_HITS hits (an event page is
+      // at most 1000 rows, so at most two calls), all in that transaction.
+      const chunks: AdmissionRef[][] = [];
+      for (let i = 0; i < refs.length; i += MAX_GATE_HITS) chunks.push(refs.slice(i, i + MAX_GATE_HITS));
+      const rows = await run(orgId, workspaceId, async (q: SqlQuery) => {
+        const all: GateSqlRow[] = [];
+        for (const chunk of chunks) {
+          const hits = JSON.stringify(chunk.map((r) => ({ claim_token: r.claimToken, source: r.source, session_id: r.sessionId })));
+          all.push(...(await q.query<GateSqlRow>(GATE_SQL, [orgId, workspaceId, ownerUserId, ...gateHeadParams(head), hits])).rows);
+        }
+        return all;
+      });
       for (const r of rows) {
-        out.set(refKey({ claimToken: r.claim_token, userId: r.user_id, source: r.source, sessionId: r.session_id }), {
-          claimUserId: r.claim_user_id,
-          admissionEpoch: r.admission_epoch,
-          admissionVersion: r.admission_version,
-          versionConsistent: r.version_consistent === true,
-          deleted: r.deleted !== false,
-          resetBehind: r.reset_behind !== false,
-        });
+        const reason = r.drop_reason === null ? null : isGateSqlReason(r.drop_reason) ? r.drop_reason : "admission_unknown_reason";
+        out.set(refKey({ claimToken: r.claim_token, userId: ownerUserId, source: r.source, sessionId: r.session_id }), reason);
       }
       return out;
-    },
-    async parity(orgId, workspaceId, userIds) {
-      if (userIds.length === 0) return new Set();
-      const { rows } = await run(orgId, workspaceId, (q: SqlQuery) => q.query<{ user_id: string }>(PARITY_SQL, [orgId, workspaceId, userIds]));
-      return new Set(rows.map((r) => r.user_id));
     },
   };
 }
@@ -300,13 +297,8 @@ export type DropReason =
   | "control_pending"
   | "admission_unavailable"
   | "admission_missing"
-  | "admission_owner_mismatch"
-  | "admission_epoch_mismatch"
-  | "admission_version_mismatch"
-  | "parity_unavailable"
-  | "parity_missing"
-  | "deleted"
-  | "reset";
+  | "admission_unknown_reason"
+  | GateSqlReason;
 
 export interface GateResult<R> {
   kept: R[];
@@ -323,8 +315,8 @@ export interface BufferedSearchGate {
 export interface GateDeps {
   /** Absent (binding not configured) = no head is ever available, so every buffered hit drops. */
   controlHeads?: ControlHeads;
-  store: AdmissionStore;
-  /** Per control-head call, and per ledger read. Default CONTROL_HEAD_DEADLINE_MS. */
+  store: GateStore;
+  /** Per control-head call, and per owner's gate call. Default CONTROL_HEAD_DEADLINE_MS. */
   deadlineMs?: number;
   maxOwners?: number;
 }
@@ -369,7 +361,9 @@ export function createBufferedSearchGate(deps: GateDeps): BufferedSearchGate {
         if (r.origin === ORIGIN_CANONICAL) return true;
         if (r.origin !== ORIGIN_BUFFERED) { drop("origin_unknown"); return false; }
         const token = r.origin_claim_token ?? "";
-        if (!CLAIM_TOKEN.test(token) || !r.user_id) { drop("claim_token_invalid"); return false; }
+        // An empty owner, source or session cannot be bound to a claim (and the gate SQL refuses
+        // the whole call for it, which would drop this owner's other hits too).
+        if (!CLAIM_TOKEN.test(token) || !r.user_id || !r.source || !r.session_id) { drop("claim_token_invalid"); return false; }
         return { claimToken: token, userId: r.user_id, source: r.source, sessionId: r.session_id };
       });
       const refs = verdict.filter((v): v is AdmissionRef => typeof v === "object");
@@ -385,34 +379,31 @@ export function createBufferedSearchGate(deps: GateDeps): BufferedSearchGate {
         if (typeof v === "object" && !owners.includes(v.userId)) { drop("owner_fanout"); verdict[i] = false; }
       }
 
-      // One head per owner, the ledger reads, all concurrently; each failure is a drop.
-      const uniqueRefs = [...new Map(checked.map((r) => [refKey(r), r])).values()];
-      const [heads, admissions, parity] = await Promise.all([
-        Promise.all(owners.map((userId) => deps.controlHeads
-          ? settle(deadlineMs, (signal) => deps.controlHeads!({ orgId, workspaceId, userId }, signal))
-          : Promise.resolve(undefined))),
-        settle(deadlineMs, () => deps.store.admissions(orgId, workspaceId, uniqueRefs)),
-        settle(deadlineMs, () => deps.store.parity(orgId, workspaceId, owners)),
-      ]);
-      const headOf = new Map(owners.map((userId, i) => [userId, heads[i] ?? null]));
+      // Per owner, concurrently: the head, then ONE gate call judged on that head.
+      // Every failure drops that owner's hits.
+      const byOwner = new Map(owners.map((userId) => [userId, [...new Map(checked.filter((r) => r.userId === userId).map((r) => [refKey(r), r])).values()]]));
+      type OwnerOutcome = { drop: DropReason } | { verdicts: Map<string, GateSqlReason | "admission_unknown_reason" | null> };
+      const outcomes = await Promise.all(owners.map(async (userId): Promise<OwnerOutcome> => {
+        const head = deps.controlHeads
+          ? await settle(deadlineMs, (signal) => deps.controlHeads!({ orgId, workspaceId, userId }, signal))
+          : undefined;
+        if (!head) return { drop: "control_head_unavailable" };
+        if (head.pending) return { drop: "control_pending" };
+        const verdicts = await settle(deadlineMs, () => deps.store.verdicts(orgId, workspaceId, userId, head, byOwner.get(userId)!));
+        return verdicts ? { verdicts } : { drop: "admission_unavailable" };
+      }));
+      const outcomeOf = new Map(owners.map((userId, i) => [userId, outcomes[i]!]));
 
       for (let i = 0; i < verdict.length; i++) {
         const ref = verdict[i];
         if (typeof ref !== "object") continue;
         verdict[i] = false;
-        const head = headOf.get(ref.userId);
-        if (!head) { drop("control_head_unavailable"); continue; }
-        if (head.pending) { drop("control_pending"); continue; }
-        if (!admissions) { drop("admission_unavailable"); continue; }
-        const a = admissions.get(refKey(ref));
-        if (!a) { drop("admission_missing"); continue; }
-        if (a.claimUserId !== ref.userId) { drop("admission_owner_mismatch"); continue; }
-        if (a.admissionEpoch === null || a.admissionEpoch !== head.controlEpoch) { drop("admission_epoch_mismatch"); continue; }
-        if (!a.versionConsistent || !isControlVersion(a.admissionVersion) || a.admissionVersion !== head.sourceControlVersion) { drop("admission_version_mismatch"); continue; }
-        if (!parity) { drop("parity_unavailable"); continue; }
-        if (!parity.has(ref.userId)) { drop("parity_missing"); continue; }
-        if (a.deleted) { drop("deleted"); continue; }
-        if (a.resetBehind) { drop("reset"); continue; }
+        const outcome = outcomeOf.get(ref.userId)!;
+        if ("drop" in outcome) { drop(outcome.drop); continue; }
+        const key = refKey(ref);
+        if (!outcome.verdicts.has(key)) { drop("admission_missing"); continue; }
+        const reason = outcome.verdicts.get(key);
+        if (reason !== null) { drop(reason ?? "admission_missing"); continue; }
         verdict[i] = true;
       }
       return { kept: rows.filter((_, i) => verdict[i] === true), buffered, dropped };

@@ -68,7 +68,7 @@ import {
   createBufferedSearchGate,
   parseBufferedSearchGate,
   serviceBindingControlHeads,
-  sqlAdmissionStore,
+  sqlGateStore,
   type BufferedSearchGate,
   type ServiceBinding,
 } from "../../../src/session-read-api/buffered-search-gate.ts";
@@ -310,7 +310,7 @@ export function bufferedSearchGate(env: Env, run: TenantRunner): BufferedSearchG
   if (!parseBufferedSearchGate(env.READ_API_BUFFERED_SEARCH_GATE)) return undefined;
   const binding: ServiceBinding | undefined = typeof env.HISTORY_CONTROL_HEAD?.fetch === "function" ? env.HISTORY_CONTROL_HEAD : undefined;
   if (!binding) log("warn", "buffered search gate on without HISTORY_CONTROL_HEAD: buffered rows are dropped", {});
-  return createBufferedSearchGate({ controlHeads: binding ? serviceBindingControlHeads(binding) : undefined, store: sqlAdmissionStore(run) });
+  return createBufferedSearchGate({ controlHeads: binding ? serviceBindingControlHeads(binding) : undefined, store: sqlGateStore(run) });
 }
 
 /**

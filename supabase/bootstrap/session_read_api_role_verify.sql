@@ -74,6 +74,7 @@ BEGIN
      WHERE n.nspname = 'sessions' AND p.prosecdef AND has_function_privilege(v_role.oid, p.oid, 'EXECUTE')
        AND p.oid::regprocedure::text NOT IN (
          'sessions.babysitter_evidence_page_for(text,jsonb)',
+         'sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)',
          'sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)',
          'sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)',
          'sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
