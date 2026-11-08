@@ -17,7 +17,7 @@
  * authenticated CLIs return the two short-lived values in child stdout, which
  * remains in process memory and is never logged.
  */
-import { execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { fstatSync } from "node:fs";
 import {
   CredentialRefusal,
@@ -69,7 +69,16 @@ export interface ProducerCommand {
   env: Record<string, string>;
 }
 
-export type ProducerRunner = (command: ProducerCommand) => string;
+export type ProducerRunner = (command: ProducerCommand, signal?: AbortSignal) => Promise<string>;
+
+export interface SupervisedRunnerOptions {
+  timeoutMs?: number;
+  killGraceMs?: number;
+  maxOutputBytes?: number;
+  signal?: AbortSignal;
+  /** Test/receipt hook; never receives command output. */
+  onSpawn?: (pid: number) => void;
+}
 
 export interface ProducerArgs {
   expectedSourceSha: string;
@@ -168,57 +177,162 @@ function childEnvironment(env: Record<string, string | undefined>): Record<strin
   );
 }
 
-export function defaultProducerRunner(command: ProducerCommand): string {
-  try {
-    return execFileSync(command.executable, [...command.args], {
-      cwd: process.cwd(),
-      env: command.env,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 40_000,
-      maxBuffer: 64 * 1024,
+/**
+ * Run one CLI in its own process group. Timeout, output overflow and caller
+ * cancellation terminate the whole group, escalate to SIGKILL, and stop
+ * waiting after a second bounded grace even if a child mishandles SIGTERM.
+ */
+export function runSupervisedProducerCommand(
+  command: ProducerCommand,
+  options: SupervisedRunnerOptions = {},
+): Promise<string> {
+  if (process.platform === "win32")
+    return Promise.reject(new OwnerParityCredentialProducerRefusal("credential_runner_platform"));
+  const timeoutMs = options.timeoutMs ?? 40_000;
+  const killGraceMs = options.killGraceMs ?? 250;
+  const maxOutputBytes = options.maxOutputBytes ?? 64 * 1024;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || !Number.isInteger(killGraceMs) || killGraceMs < 1 ||
+      !Number.isInteger(maxOutputBytes) || maxOutputBytes < 1)
+    return Promise.reject(new OwnerParityCredentialProducerRefusal("credential_runner_bounds"));
+  if (options.signal?.aborted)
+    return Promise.reject(new OwnerParityCredentialProducerRefusal("credential_command_cancelled"));
+
+  return new Promise((resolve, reject) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(command.executable, [...command.args], {
+        cwd: process.cwd(),
+        env: command.env,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch {
+      reject(new OwnerParityCredentialProducerRefusal("credential_command_failed"));
+      return;
+    }
+    if (!child.pid) {
+      child.once("error", () => undefined);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+      reject(new OwnerParityCredentialProducerRefusal("credential_command_failed"));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    let refusal: OwnerParityCredentialProducerRefusal | undefined;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let stopTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const killGroup = (signal: NodeJS.Signals) => {
+      try {
+        process.kill(-child.pid!, signal);
+      } catch {
+        try { child.kill(signal); } catch { /* already gone */ }
+      }
+    };
+    const groupAlive = () => {
+      try { process.kill(-child.pid!, 0); return true; } catch { return false; }
+    };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      if (killTimer) clearTimeout(killTimer);
+      if (stopTimer) clearTimeout(stopTimer);
+      options.signal?.removeEventListener("abort", onAbort);
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+      chunks.length = 0;
+    };
+    const finish = (error?: OwnerParityCredentialProducerRefusal, output?: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(output ?? "");
+    };
+    const terminate = (code: string) => {
+      if (refusal || settled) return;
+      refusal = new OwnerParityCredentialProducerRefusal(code);
+      chunks.length = 0;
+      killGroup("SIGTERM");
+      if (!groupAlive()) return finish(refusal);
+      killTimer = setTimeout(() => killGroup("SIGKILL"), killGraceMs);
+      stopTimer = setTimeout(() => finish(refusal), killGraceMs * 2);
+    };
+    const onAbort = () => terminate("credential_command_cancelled");
+    const timeout = setTimeout(() => terminate("credential_command_timeout"), timeoutMs);
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    try { options.onSpawn?.(child.pid); } catch { terminate("credential_command_failed"); }
+    if (options.signal?.aborted) onAbort();
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      if (refusal || settled) return;
+      const value = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      bytes += value.length;
+      if (bytes > maxOutputBytes) return terminate("credential_command_output_limit");
+      chunks.push(value);
     });
-  } catch {
-    return refuse("credential_command_failed");
-  }
+    // Drain but never retain or expose child stderr; it can contain provider details.
+    child.stderr?.on("data", () => undefined);
+    child.once("error", () => terminate("credential_command_failed"));
+    child.once("close", (code) => {
+      // A group descendant can survive the leader's clean SIGTERM exit. Keep
+      // the scheduled group SIGKILL and bounded stop timer on every refusal.
+      if (refusal) return groupAlive() ? undefined : finish(refusal);
+      if (code !== 0) return terminate("credential_command_failed");
+      // A successful leader must not leave a background descendant holding
+      // the owned process group after its output has been accepted.
+      if (groupAlive()) return terminate("credential_command_lingering_process");
+      finish(undefined, Buffer.concat(chunks, bytes).toString("utf8"));
+    });
+  });
+}
+
+export function defaultProducerRunner(command: ProducerCommand, signal?: AbortSignal): Promise<string> {
+  return runSupervisedProducerCommand(command, { signal });
 }
 
 /** Refuse a different or dirty checkout before either credential-producing command. */
-export function requireProducerCheckout(
+export async function requireProducerCheckout(
   expectedSourceSha: string,
   runner: ProducerRunner,
   env: Record<string, string>,
-): void {
+  signal?: AbortSignal,
+): Promise<void> {
   if (!/^[0-9a-f]{40}$/u.test(expectedSourceSha)) refuse("producer_source_pin");
-  const head = runner({
+  const head = (await runner({
     executable: OWNER_PARITY_CREDENTIAL_TARGET.git,
     args: ["rev-parse", "HEAD"],
     env,
-  }).trim();
-  const dirty = runner({
+  }, signal)).trim();
+  const dirty = (await runner({
     executable: OWNER_PARITY_CREDENTIAL_TARGET.git,
     args: ["status", "--porcelain"],
     env,
-  }).trim();
+  }, signal)).trim();
   if (head !== expectedSourceSha || dirty) refuse("producer_checkout_pin_mismatch");
 }
 
 /** Acquire both values only after the output sink and environment are proven safe. */
-export function ownerParityCredentialDocument(
+export async function ownerParityCredentialDocument(
   expectedSourceSha: string,
   runner: ProducerRunner = defaultProducerRunner,
   env: Record<string, string | undefined> = process.env,
   output: OutputStat = fstatSync(1),
-): string {
+  signal?: AbortSignal,
+): Promise<string> {
   requireRamOnlyProducerOutput(output);
   requireProducerEnvironment(env);
   const childEnv = childEnvironment(env);
-  requireProducerCheckout(expectedSourceSha, runner, childEnv);
-  if (runner({ executable: OWNER_PARITY_CREDENTIAL_TARGET.neonctl, args: ["--version"], env: childEnv }).trim() !== OWNER_PARITY_CREDENTIAL_TARGET.neonctlVersion)
+  await requireProducerCheckout(expectedSourceSha, runner, childEnv, signal);
+  if ((await runner({ executable: OWNER_PARITY_CREDENTIAL_TARGET.neonctl, args: ["--version"], env: childEnv }, signal)).trim() !== OWNER_PARITY_CREDENTIAL_TARGET.neonctlVersion)
     refuse("neonctl_version");
-  if (runner({ executable: OWNER_PARITY_CREDENTIAL_TARGET.supabaseCli, args: ["--version"], env: childEnv }).trim() !== OWNER_PARITY_CREDENTIAL_TARGET.supabaseCliVersion)
+  if ((await runner({ executable: OWNER_PARITY_CREDENTIAL_TARGET.supabaseCli, args: ["--version"], env: childEnv }, signal)).trim() !== OWNER_PARITY_CREDENTIAL_TARGET.supabaseCliVersion)
     refuse("supabase_cli_version");
-  let neonRaw = runner({
+  let neonRaw = await runner({
     executable: OWNER_PARITY_CREDENTIAL_TARGET.neonctl,
     args: [
       "connection-string",
@@ -230,14 +344,14 @@ export function ownerParityCredentialDocument(
       "--no-color",
     ],
     env: childEnv,
-  });
+  }, signal);
   const neonUrl = pinnedNeonReadonlyUrl(neonRaw);
   neonRaw = "";
-  let supabaseRaw = runner({
+  let supabaseRaw = await runner({
     executable: OWNER_PARITY_CREDENTIAL_TARGET.supabaseCli,
     args: ["db", "dump", "--linked", "--project-ref", OWNER_PARITY_CREDENTIAL_TARGET.supabaseProject, "--dry-run"],
     env: childEnv,
-  });
+  }, signal);
   const supabaseUrl = pinnedSupabaseOwnerUrl(supabaseRaw);
   supabaseRaw = "";
   const document = JSON.stringify({ neonUrl, supabaseUrl });
@@ -251,12 +365,43 @@ export function producerErrorCode(error: unknown): string {
   return /^[A-Za-z0-9_.-]{1,96}$/u.test(code) ? code : "credential_producer_failed";
 }
 
+async function writeProducerOutput(document: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const onError = () => reject(new OwnerParityCredentialProducerRefusal("producer_output_closed"));
+    process.stdout.once("error", onError);
+    process.stdout.write(document + "\n", (error) => {
+      process.stdout.removeListener("error", onError);
+      if (error) reject(new OwnerParityCredentialProducerRefusal("producer_output_closed"));
+      else resolve();
+    });
+  });
+}
+
 if (import.meta.main) {
+  const cancellation = new AbortController();
+  const cancel = () => cancellation.abort();
+  // Keep handling repeated cooperative signals until the owned child group is
+  // gone; a second signal must not restore the default exit and orphan it.
+  process.on("SIGINT", cancel);
+  process.on("SIGTERM", cancel);
+  process.on("SIGHUP", cancel);
+  process.stdout.once("close", cancel);
+  process.stdout.once("error", cancel);
   try {
     const args = parseProducerArgs(process.argv.slice(2));
-    process.stdout.write(ownerParityCredentialDocument(args.expectedSourceSha) + "\n");
+    const document = await ownerParityCredentialDocument(
+      args.expectedSourceSha, defaultProducerRunner, process.env, fstatSync(1), cancellation.signal,
+    );
+    if (cancellation.signal.aborted) refuse("credential_command_cancelled");
+    await writeProducerOutput(document);
   } catch (error) {
     process.stderr.write(JSON.stringify({ status: "refused", code: producerErrorCode(error) }) + "\n");
     process.exitCode = 1;
+  } finally {
+    process.removeListener("SIGINT", cancel);
+    process.removeListener("SIGTERM", cancel);
+    process.removeListener("SIGHUP", cancel);
+    process.stdout.removeListener("close", cancel);
+    process.stdout.removeListener("error", cancel);
   }
 }

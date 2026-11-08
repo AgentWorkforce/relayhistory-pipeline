@@ -7,6 +7,7 @@ import {
   pinnedSupabaseOwnerUrl,
   producerErrorCode,
   requireRamOnlyProducerOutput,
+  runSupervisedProducerCommand,
   type ProducerCommand,
 } from "../../../scripts/owner-buffered-parity-credential-producer.ts";
 
@@ -43,9 +44,9 @@ const cliLogin = (password = "synthetic-supabase-password") => [
 ].join("\n");
 
 describe("owner-buffered parity credential producer", () => {
-  test("emits exactly the two pinned verify-full URLs after fixed CLI commands", () => {
+  test("emits exactly the two pinned verify-full URLs after fixed CLI commands", async () => {
     const calls: ProducerCommand[] = [];
-    const runner = (command: ProducerCommand) => {
+    const runner = async (command: ProducerCommand) => {
       calls.push(command);
       if (command.executable === TARGET.git)
         return command.args[0] === "rev-parse" ? SOURCE : "";
@@ -53,7 +54,7 @@ describe("owner-buffered parity credential producer", () => {
         return command.executable === TARGET.neonctl ? TARGET.neonctlVersion : TARGET.supabaseCliVersion;
       return command.executable === TARGET.neonctl ? JSON.stringify(neonUrl()) : cliLogin();
     };
-    const document = JSON.parse(ownerParityCredentialDocument(SOURCE, runner, { HOME: "/synthetic", PATH: "/bin" }, PIPE));
+    const document = JSON.parse(await ownerParityCredentialDocument(SOURCE, runner, { HOME: "/synthetic", PATH: "/bin" }, PIPE));
     expect(Object.keys(document).sort()).toEqual(["neonUrl", "supabaseUrl"]);
     const neon = new URL(document.neonUrl);
     expect({ user: decodeURIComponent(neon.username), host: neon.hostname, port: neon.port, db: neon.pathname, mode: neon.searchParams.get("sslmode") })
@@ -84,18 +85,18 @@ describe("owner-buffered parity credential producer", () => {
     expect(() => pinnedNeonReadonlyUrl(input)).toThrow(code);
   });
 
-  test("requires one exact source pin and a clean matching checkout before either credential command", () => {
+  test("requires one exact source pin and a clean matching checkout before either credential command", async () => {
     expect(parseProducerArgs(["--expect-source-sha", SOURCE])).toEqual({ expectedSourceSha: SOURCE });
     expect(() => parseProducerArgs([])).toThrow("producer_usage");
     expect(() => parseProducerArgs(["--expect-source-sha", "main"])).toThrow("producer_usage");
     const calls: string[] = [];
-    const runner = (command: ProducerCommand) => {
+    const runner = async (command: ProducerCommand) => {
       calls.push(command.args.join(" "));
       if (command.args[0] === "rev-parse") return "b".repeat(40);
       return "";
     };
-    expect(() => ownerParityCredentialDocument(SOURCE, runner, {}, PIPE))
-      .toThrow("producer_checkout_pin_mismatch");
+    await expect(ownerParityCredentialDocument(SOURCE, runner, {}, PIPE))
+      .rejects.toThrow("producer_checkout_pin_mismatch");
     expect(calls).toEqual(["rev-parse HEAD", "status --porcelain"]);
   });
 
@@ -110,33 +111,33 @@ describe("owner-buffered parity credential producer", () => {
     [outputStat("directory"), "producer_stdout_not_pipe_or_socket"],
     [outputStat("block"), "producer_stdout_not_pipe_or_socket"],
     [outputStat("unknown"), "producer_stdout_not_pipe_or_socket"],
-  ])("refuses a persistent or visible output before any credential command", (output, code) => {
+  ])("refuses a persistent or visible output before any credential command", async (output, code) => {
     let ran = false;
-    expect(() => ownerParityCredentialDocument(SOURCE, () => { ran = true; return ""; }, {}, output)).toThrow(code);
+    await expect(ownerParityCredentialDocument(SOURCE, async () => { ran = true; return ""; }, {}, output)).rejects.toThrow(code);
     expect(ran).toBeFalse();
   });
 
-  test("refuses credential-bearing environment state before any command", () => {
+  test("refuses credential-bearing environment state before any command", async () => {
     let ran = false;
-    expect(() => ownerParityCredentialDocument(SOURCE, () => { ran = true; return ""; }, { NEON_API_KEY: "not-logged" }, PIPE))
-      .toThrow("credential_env_refused.NEON_API_KEY");
+    await expect(ownerParityCredentialDocument(SOURCE, async () => { ran = true; return ""; }, { NEON_API_KEY: "not-logged" }, PIPE))
+      .rejects.toThrow("credential_env_refused.NEON_API_KEY");
     expect(ran).toBeFalse();
   });
 
-  test("version drift and private command failures expose only bounded refusal codes", () => {
+  test("version drift and private command failures expose only bounded refusal codes", async () => {
     let command = 0;
-    expect(() => ownerParityCredentialDocument(SOURCE, () => {
+    await expect(ownerParityCredentialDocument(SOURCE, async () => {
       command++;
       if (command === 1) return SOURCE;
       if (command === 2) return "";
       return "4.17.0";
-    }, {}, PIPE)).toThrow("neonctl_version");
+    }, {}, PIPE)).rejects.toThrow("neonctl_version");
     expect(producerErrorCode(new Error("private child stderr"))).toBe("credential_producer_failed");
   });
 
-  test("refuses a combined document larger than the operator stdin bound", () => {
+  test("refuses a combined document larger than the operator stdin bound", async () => {
     let command = 0;
-    expect(() => ownerParityCredentialDocument(SOURCE, () => {
+    await expect(ownerParityCredentialDocument(SOURCE, async () => {
       command++;
       if (command === 1) return SOURCE;
       if (command === 2) return "";
@@ -144,7 +145,82 @@ describe("owner-buffered parity credential producer", () => {
       if (command === 4) return TARGET.supabaseCliVersion;
       if (command === 5) return JSON.stringify(neonUrl({ password: "n".repeat(40_000) }));
       return cliLogin("s".repeat(30_000));
-    }, {}, PIPE)).toThrow("credential_document_limit");
+    }, {}, PIPE)).rejects.toThrow("credential_document_limit");
+  });
+
+  test("supervised runner enforces a hard wall and kills a stubborn process group", async () => {
+    const stubbornGroup = `
+      const { spawn } = require("node:child_process");
+      spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: "ignore" });
+      setInterval(() => {}, 1000);
+    `;
+    let groupPid = 0;
+    const started = performance.now();
+    try {
+      await expect(runSupervisedProducerCommand(
+        { executable: process.execPath, args: ["-e", stubbornGroup], env: { PATH: process.env.PATH ?? "" } },
+        { timeoutMs: 100, killGraceMs: 50, onSpawn: (pid) => { groupPid = pid; } },
+      )).rejects.toThrow("credential_command_timeout");
+      expect(performance.now() - started).toBeLessThan(1_000);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(() => process.kill(-groupPid, 0)).toThrow();
+    } finally {
+      if (groupPid) try { process.kill(-groupPid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  });
+
+  test("supervised runner kills on output overflow and caller cancellation", async () => {
+    const outputFlood = `
+      process.on("SIGTERM", () => {});
+      process.stdout.write("x".repeat(8192));
+      setInterval(() => {}, 1000);
+    `;
+    await expect(runSupervisedProducerCommand(
+      { executable: process.execPath, args: ["-e", outputFlood], env: { PATH: process.env.PATH ?? "" } },
+      { timeoutMs: 5_000, killGraceMs: 50, maxOutputBytes: 1_024 },
+    )).rejects.toThrow("credential_command_output_limit");
+
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 75);
+    try {
+      await expect(runSupervisedProducerCommand(
+        { executable: process.execPath, args: ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], env: { PATH: process.env.PATH ?? "" } },
+        { timeoutMs: 5_000, killGraceMs: 50, signal: abort.signal },
+      )).rejects.toThrow("credential_command_cancelled");
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  test("supervised runner returns only bounded successful stdout", async () => {
+    await expect(runSupervisedProducerCommand(
+      { executable: process.execPath, args: ["-e", "process.stdout.write('synthetic-output')"], env: { PATH: process.env.PATH ?? "" } },
+      { timeoutMs: 1_000, killGraceMs: 50, maxOutputBytes: 1_024 },
+    )).resolves.toBe("synthetic-output");
+    await expect(runSupervisedProducerCommand(
+      { executable: "/synthetic/missing-credential-cli", args: [], env: {} },
+      { timeoutMs: 1_000, killGraceMs: 50, maxOutputBytes: 1_024 },
+    )).rejects.toThrow("credential_command_failed");
+  });
+
+  test("supervised runner refuses and kills a descendant left by a successful leader", async () => {
+    const lingering = `
+      const { spawn } = require("node:child_process");
+      const child = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: "ignore" });
+      child.unref();
+      process.stdout.write("synthetic-output");
+    `;
+    let groupPid = 0;
+    try {
+      await expect(runSupervisedProducerCommand(
+        { executable: process.execPath, args: ["-e", lingering], env: { PATH: process.env.PATH ?? "" } },
+        { timeoutMs: 1_000, killGraceMs: 50, maxOutputBytes: 1_024, onSpawn: (pid) => { groupPid = pid; } },
+      )).rejects.toThrow("credential_command_lingering_process");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(() => process.kill(-groupPid, 0)).toThrow();
+    } finally {
+      if (groupPid) try { process.kill(-groupPid, "SIGKILL"); } catch { /* already gone */ }
+    }
   });
 
   test("the standalone sink guard accepts only the intended pipe/socket shape", () => {
