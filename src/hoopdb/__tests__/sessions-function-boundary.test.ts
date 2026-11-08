@@ -13,6 +13,7 @@ import { ingestHistory } from "../../../scripts/sessions-function-boundary/lanes
 import { bufferedGcSingleCandidate } from "../../../scripts/sessions-function-boundary/lanes/buffered-gc-single-candidate.ts";
 import { lazySourceTables, originalBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-source-tables.ts";
 import { lazyClaimClockNarrowing, originalBodies as originalClaimClockBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-claim-clock-narrowing.ts";
+import { lazyAckClockNoKeyUpdate, originalBodies as originalAckClockBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-ack-clock-no-key-update.ts";
 import { privacyAuthority, originalLazyBodies, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
 import { createHash } from "node:crypto";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
@@ -62,6 +63,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql",
       "supabase/rollbacks/20261105042000_babysitter_evidence_retention.down.sql",
       "supabase/rollbacks/20261105043500_lazy_claim_clock_narrowing.down.sql",
+      "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql",
     ]);
   });
 
@@ -116,6 +118,29 @@ describe("unified sessions function-boundary generator", () => {
       expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(body));
     }
     expect(down).not.toContain("lazy-native-origin-v1");
+    expect(down).toContain("pg_advisory_xact_lock(961996,1)");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 043800 staged-ACK clock NO KEY UPDATE changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== lazyAckClockNoKeyUpdate), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql";
+    for (const [path, value] of Object.entries(without.outputs)) expect(withLane.outputs[path]).toBe(value);
+    expect(Object.keys(withLane.outputs).filter((p) => !(p in without.outputs))).toEqual([downPath]);
+    expect(withLane.summary.boundarySHA).toBe(without.summary.boundarySHA);
+    expect(withLane.summary.lanes["lazy-ack-clock-no-key-update"]).toEqual({ functions: 0, replaces: 1, grants: 0 });
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, lazyAckClockNoKeyUpdate.migration!), "utf8")).digest("hex"));
+    const bodies = originalAckClockBodies(readFileSync(join(root, "supabase/migrations/20261105043500_lazy_claim_clock_narrowing.sql"), "utf8"));
+    expect(bodies).toHaveLength(1);
+    expect(down).toContain(bodies[0]!);
+    expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(bodies[0]!));
+    expect(down).toContain("WHERE singleton FOR UPDATE;v_last:=c.last_seat;");
+    expect(down).not.toContain("FOR NO KEY UPDATE");
+    expect(down).not.toContain("FUNCTION sessions.ingest_lazy_records"); // only the ACK is restored (its comment names the claim fn)
     expect(down).toContain("pg_advisory_xact_lock(961996,1)");
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");
