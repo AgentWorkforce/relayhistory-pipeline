@@ -451,16 +451,19 @@ console.log(
 // The opt-in suite creates/drops its own random database and refuses non-loopback hosts.
 await check("owner-buffered v5.3: 043700 RPCs + read consumer release fixtures", async () => {
   const fixtureHashes = {
+    contract: createHash("sha256").update(readFileSync(join(ROOT,
+      "docs/handoffs/neon-census-role-20261107/r2-control-head-contract-v5.3-CURRENT.md"))).digest("hex"),
     causal: createHash("sha256").update(readFileSync(join(ROOT,
       "docs/handoffs/neon-census-role-20261107/fixtures/option-c-authority-gate-causal-fixtures-v3-20261108.json"))).digest("hex"),
     parity: createHash("sha256").update(readFileSync(join(ROOT,
       "docs/handoffs/neon-census-role-20261107/fixtures/option-c-parity-gate-fixture-addendum-v1-20261108.json"))).digest("hex"),
   };
   const expected = {
+    contract: "9f8a755027f1768d4122ec8b90607b87068cd6b5d495172886fe66cc65d204ab",
     causal: "25bbbdfaeb579afb5ca7bbf72ba02d5d3525d22e26de289914214ca1abd519a7",
     parity: "f1a31a65b05fd535df0aab4eaa7210aab28efddb98c7e5de118866dd7a8a7120",
   };
-  if (fixtureHashes.causal !== expected.causal || fixtureHashes.parity !== expected.parity)
+  if (fixtureHashes.contract !== expected.contract || fixtureHashes.causal !== expected.causal || fixtureHashes.parity !== expected.parity)
     return [false, `fixture hash mismatch: ${fmt(fixtureHashes)}`];
   const child = spawnSync(process.execPath, [
     "test", "src/session-read-api/__tests__/buffered-privacy.postgres.test.ts",
