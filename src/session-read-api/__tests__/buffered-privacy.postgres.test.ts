@@ -94,8 +94,42 @@ describe.skipIf(!url)("043700 + PR B fixtures on actual PostgreSQL", () => {
     const proof = await db.query<{ name: string | null }>(
       "SELECT to_regclass('sessions.owner_buffered_parity')::text AS name",
     );
-    // v5.3 authorizes the table name and semantics, but leaves columns/PK/CAS to the migration owner.
     expect(proof.rows[0]?.name).toBe("sessions.owner_buffered_parity");
+  });
+
+  test("PR A publishes the authoritative scalar G2 storage shape and tenant primary key", async () => {
+    const columns = await db.query<{ name: string; type: string; not_null: boolean }>(`
+      SELECT a.attname AS name, pg_catalog.format_type(a.atttypid,a.atttypmod) AS type,
+             a.attnotnull AS not_null
+        FROM pg_catalog.pg_attribute AS a
+       WHERE a.attrelid='sessions.owner_buffered_parity'::regclass
+         AND a.attnum > 0 AND NOT a.attisdropped
+       ORDER BY a.attnum`);
+    expect(columns.rows).toEqual([
+      { name: "org_id", type: "text", not_null: true },
+      { name: "workspace_id", type: "text", not_null: true },
+      { name: "user_id", type: "text", not_null: true },
+      { name: "cutover_epoch", type: "text", not_null: true },
+      { name: "head_epoch", type: "text", not_null: false },
+      { name: "head_version", type: "bigint", not_null: false },
+      { name: "head_digest", type: "text", not_null: false },
+      { name: "head_kind", type: "text", not_null: false },
+      { name: "no_head", type: "boolean", not_null: true },
+      { name: "privacy_baseline_sha256", type: "text", not_null: true },
+      { name: "deletion_set_digest", type: "text", not_null: true },
+      { name: "reset_set_digest", type: "text", not_null: true },
+      { name: "target_lineage_digest", type: "text", not_null: true },
+      { name: "target_generation", type: "text", not_null: true },
+      { name: "written_at", type: "timestamp with time zone", not_null: true },
+    ]);
+    const primaryKey = await db.query<{ columns: string[] }>(`
+      SELECT array_agg(a.attname ORDER BY k.ordinality)::text[] AS columns
+        FROM pg_catalog.pg_constraint AS c
+        CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ordinality)
+        JOIN pg_catalog.pg_attribute AS a ON a.attrelid=c.conrelid AND a.attnum=k.attnum
+       WHERE c.conrelid='sessions.owner_buffered_parity'::regclass AND c.contype='p'
+       GROUP BY c.oid`);
+    expect(primaryKey.rows).toEqual([{ columns: ["org_id", "workspace_id", "user_id"] }]);
   });
 
   test("PR A seam 2: buffered_sessions_for returns the immutable admission witness", async () => {
