@@ -9,6 +9,7 @@ import {
   evaluateParityCensus,
   planProofWrite,
   readParityCensus,
+  validParityTenant,
   writeProofRowCas,
   writeCurrentParityProof,
   type OwnerBufferedParityProof,
@@ -40,6 +41,33 @@ const read = (path: string) => readFileSync(join(root, path), "utf8");
 const psql = (path: string) => read(path).split("\n").filter((line) => !line.startsWith("\\")).join("\n");
 
 describe("Option C G1 census", () => {
+  test("ledger-valid empty workspace and 512-byte identifiers pass G1 and G2", async () => {
+    const edgeTenant = { orgId: "é".repeat(256), workspaceId: "", userId: "ü".repeat(256) };
+    expect(validParityTenant(edgeTenant)).toBeTrue();
+    expect(validParityTenant({ ...edgeTenant, orgId: "é".repeat(257) })).toBeFalse();
+    expect(validParityTenant({ ...edgeTenant, userId: "bad\nuser" })).toBeFalse();
+    const sourceRow = {
+      cutover_status: "active", control_epoch: H("1"), privacy_baseline_sha256: H("2"),
+      head: { epoch: H("1"), version: "7", digest: H("3"), kind: "selection", pending: false },
+      deletion_count: "0", deletion_set_sha256: H("5"), reset_count: "0", reset_set_sha256: H("6"),
+    };
+    const targetRow = {
+      control_epoch: H("1"), privacy_baseline_sha256: H("2"), target_generation: H("4"), receipts_contiguous: true,
+      latest_receipt: { epoch: H("1"), version: "7", digest: H("3"), kind: "selection" },
+      target_lineage_digest: H("7"), deletion_set_sha256: H("5"), reset_set_sha256: H("6"),
+    };
+    const neon: Queryable = { async query<T>(sql: string) {
+      return { rows: (sql.includes("delivery_cutover_status") ? [sourceRow] : []) as T[] };
+    } };
+    const target: Queryable = { async query<T>(sql: string) {
+      if (sql.includes("WITH policy")) return { rows: [targetRow] as T[] };
+      if (sql.includes("INSERT INTO sessions.owner_buffered_parity")) return { rows: [{ written_at: "now" }] as T[] };
+      return { rows: [] as T[] };
+    } };
+    expect(await readParityCensus(neon, target, edgeTenant)).toMatchObject({ equal: true });
+    expect(await writeCurrentParityProof(neon, target, edgeTenant, H("4"))).toMatchObject({ outcome: "insert" });
+  });
+
   test("emits a proof tuple only for exact parity", () => {
     const receipt = evaluateParityCensus(BASE);
     expect(receipt.equal).toBe(true);
