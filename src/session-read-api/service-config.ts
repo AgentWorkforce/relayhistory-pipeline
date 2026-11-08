@@ -10,6 +10,13 @@
  *   RELAYHISTORY_READ_API_SECRET    enabled only: the read API secret JSON, the same shape the Lambda
  *                                   reads from Secrets Manager (lambda.ts parseReadApiSecret), injected
  *                                   from the secret store; never on disk
+ *   SEARCH_INDEX_BACKEND            enabled only: postgres (default; no ClickHouse, no Lambda) | clickhouse
+ *                                   (the hosted binding, needs the secret's clickhouse block); anything else,
+ *                                   including a name with no implementation in this build, fails startup
+ *   SEARCH_INDEX_POSTGRES_BACKEND_ID  enabled + postgres: the projection-state backend id the search writer
+ *                                   records under (required; not a credential)
+ *   SESSION_POSTGRES_TLS_PROFILE    enabled: required explicitly (supabase | custom-ca with
+ *                                   SESSION_POSTGRES_CA_FILE / SESSION_POSTGRES_CA_SHA256); no implicit default
  *
  * Dormant (flag off): nothing else is read or required; the process starts and
  * answers 503 not_configured on every route but /healthz. Enabled: the secret is
@@ -23,6 +30,7 @@ import { destinationPolicy } from "../shared/destination-url.ts";
 export const READ_API_SERVICE_FLAG = "RELAYHISTORY_SELFHOST_READ_API";
 export const READ_API_PORT_VAR = "RELAYHISTORY_READ_API_PORT";
 export const READ_API_SECRET_VAR = "RELAYHISTORY_READ_API_SECRET";
+export const SEARCH_BACKEND_ID_VAR = "SEARCH_INDEX_POSTGRES_BACKEND_ID";
 
 export type ReadApiServiceConfig =
   | { enabled: false; port: number }
