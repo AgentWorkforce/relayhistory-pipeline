@@ -235,9 +235,12 @@ describe("quoted secret values past the scan bound (rule set 4)", () => {
   });
 
   it("treats an unquoted value of exactly 4096 units as rule set 3 did", () => {
-    // Low entropy: kept as is, at, below and above 4096 units.
-    for (const n of [CAP - 1, CAP, CAP + 1]) {
-      expect(scrubText(`'token' => ${solid(n)} end`)).toBe(`'token' => ${solid(n)} end`);
+    // Low entropy: kept as is below 4096 units. Rule set 6: at or over 4096 units an
+    // unquoted value is redacted whole, whatever it holds (rule set 5 classified only its
+    // first 4096 units, so 4096 digits then a tail were kept; see scrub-ruleset-6.test.ts).
+    expect(scrubText(`'token' => ${solid(CAP - 1)} end`)).toBe(`'token' => ${solid(CAP - 1)} end`);
+    for (const n of [CAP, CAP + 1]) {
+      expect(scrubText(`'token' => ${solid(n)} end`)).toBe(`'token' => ${R} end`);
     }
     // Generated: redacted whole at exactly 4096 units.
     const chunk = "aB3dE5fG7hJ9kL1mN2pQ4rS6tU8wX0yZ";
@@ -267,8 +270,11 @@ describe("quoted secret values past the scan bound (rule set 4)", () => {
       expect(scrub.overCapQuotedValueSpans(input)).toEqual([[2, input.length - 6]]);
     }
     expect(scrub.overCapQuotedValueSpans(`'token' => ${chunk.repeat(8)}; next`)).toEqual([]);
-    // Low entropy: not taken, so no span either.
-    expect(scrub.overCapQuotedValueSpans(`'token' => ${solid(CAP * 2)}; next`)).toEqual([]);
+    // Low entropy below the bound: not taken, so no span either. Rule set 6: at or over
+    // the bound it is taken whatever it holds, so it has a span (rule set 5: none).
+    expect(scrub.overCapQuotedValueSpans(`'token' => ${solid(CAP - 1)}; next`)).toEqual([]);
+    const lowEntropy = `'token' => ${solid(CAP * 2)}; next`;
+    expect(scrub.overCapQuotedValueSpans(lowEntropy)).toEqual([[0, lowEntropy.length - 6]]);
   });
 
   it("leaves no byte of the value in output for every shape", () => {

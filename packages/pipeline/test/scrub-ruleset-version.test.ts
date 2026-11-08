@@ -67,6 +67,14 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Updated before release (exact-head review of 0f9b2416: an op:// reference has exactly three
   // or four segments; two, or five or more, are redacted whole).
   5: "ed8d5c35bfddbcdbe03416c03e08b3d0a0bbcf7c276bc08fe12f14d8756ee933",
+  // Version 6: an unquoted value after a quoted secret key is classified whole (version 5
+  // classified its first MAX_QUOTED_VALUE units, so 4096 digits then a tail were kept) and
+  // one of MAX_QUOTED_VALUE units or more is redacted whole; the over-cap first pass keeps
+  // private-key header/footer pairs intact, so a header before a quoted secret value holding
+  // its footer is redacted through the value's close, not to the end of the input. The
+  // segmenter is unchanged. Output with neither shape is byte-identical to version 5
+  // (test/scrub-v5-v6-fuzz.test.ts).
+  6: "b8eab18e9bca240ed6beb870fe975e6579bfd89957be8142ba65afa6b11e1ce5",
 };
 
 const read = (rel: string) =>

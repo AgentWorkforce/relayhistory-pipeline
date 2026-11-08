@@ -92,7 +92,16 @@ const QUOTED_KEY =
  */
 export const MAX_QUOTED_VALUE = 4096;
 
-/** JSON literals and numbers after a quoted secret key are not secrets (`"max_token": 512`). */
+/**
+ * An unquoted value after a quoted key: up to whitespace (a line break included), a quote,
+ * a backslash or a delimiter (`,;{}[]`). Sticky, matched in place from the value's start.
+ */
+const BARE_VALUE = /[^\s"'`,;{}[\]\\]*/y;
+
+/**
+ * JSON literals and numbers after a quoted secret key are not secrets (`"max_token": 512`).
+ * Tested only on a whole unquoted value within the bound (rule set 6).
+ */
 const NON_SECRET_BARE =
   /^(?:true|false|null|undefined|none|-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)$/i;
 
@@ -153,8 +162,11 @@ function backslashesBefore(text: string, at: number): number {
  * malformed value can span lines, and a tail left after a break would have no key for a
  * later rule to find. A value whose matching close is within the bound, or whose input
  * ends within it, is redacted the same way from rule set 5 (rule set 4 redacted it as
- * rule set 3 did). A generated unquoted value longer than the bound is redacted to its
- * end too.
+ * rule set 3 did). An unquoted value is classified whole, to its real end (rule set 6;
+ * rule set 5 classified its first `MAX_QUOTED_VALUE` units, so 4096 digits then a tail
+ * passed as a number and the tail was kept): one of `MAX_QUOTED_VALUE` units or more is
+ * redacted whole, whatever it holds; a shorter one is kept when it is a JSON literal, a
+ * number or not generated-looking.
  *
  * Linear: one forward walk per value from its start finds the close, whether a line
  * break precedes it, and the bound together; the walk ends at the next quote of the
@@ -179,6 +191,9 @@ function redactQuotedSecretValues(
   if (!/[:=]/.test(text)) return text;
   let out = "";
   let last = 0;
+  // First pass only: the private-key pairing over the text kept so far (see below).
+  let pemFrom = 0;
+  let pem = { open: false, at: -1, closedOuter: false };
   QUOTED_KEY.lastIndex = 0;
   for (let m = QUOTED_KEY.exec(text); m; m = QUOTED_KEY.exec(text)) {
     const end = m.index + m[0].length;
@@ -249,19 +264,16 @@ function redactQuotedSecretValues(
       // A short or word-like unquoted password after a quoted key is kept too.
       if (bs > 0 || (m[3] as string).includes(" ")) continue;
       valueStart = end;
-      const bare = /^[^\s"'`,;{}[\]\\]+/.exec(
-        text.slice(end, end + MAX_QUOTED_VALUE),
-      );
-      if (!bare || NON_SECRET_BARE.test(bare[0]) || !looksGenerated(bare[0]))
-        continue;
-      valueEnd = end + bare[0].length;
-      if (bare[0].length === MAX_QUOTED_VALUE) {
-        // Past the bound: to the end of the token, not the first MAX_QUOTED_VALUE of it.
-        const rest = /[^\s"'`,;{}[\]\\]*/y;
-        rest.lastIndex = valueEnd;
-        valueEnd += (rest.exec(text) as RegExpExecArray)[0].length;
-        overBound = true;
-      }
+      // Rule set 6: the whole value, to its real end, before any decision. Rule set 5
+      // classified only its first MAX_QUOTED_VALUE units, so 4096 digits then a tail
+      // passed as a number (or a low-entropy prefix) and the tail was stored.
+      BARE_VALUE.lastIndex = end;
+      const bare = (BARE_VALUE.exec(text) as RegExpExecArray)[0];
+      if (!bare) continue;
+      valueEnd = end + bare.length;
+      // Past the bound: redacted whole, whatever it holds (no literal, number or entropy test).
+      overBound = bare.length >= MAX_QUOTED_VALUE;
+      if (!overBound && (NON_SECRET_BARE.test(bare) || !looksGenerated(bare))) continue;
     }
     const value = longValue ? "" : text.slice(valueStart, valueEnd);
     // A prefix may end right at an open value: still recorded (open), with nothing to redact.
@@ -273,24 +285,87 @@ function redactQuotedSecretValues(
     // From the key start: a cut between key and value would leave the value with no key to match.
     if (longValue || overBound || (multiLine && lineValue)) overCap?.push([m.index, valueEnd]);
     QUOTED_KEY.lastIndex = Math.max(QUOTED_KEY.lastIndex, valueEnd);
-    // Rule set 5's first pass: only over-bound values are redacted, but every value the
-    // full pass would redact is still skipped, so both passes see the same keys.
-    if (onlyOverCap && !longValue && !overBound) continue;
-    // A private-key block opened inside the value and closed after it: the PEM rule would
-    // have paired them, so the redaction runs to its footer (or the end) as that rule's would.
-    if (onlyOverCap) {
-      const open = unclosedPrivateKeyStart(text.slice(valueStart, valueEnd));
-      if (open !== -1) {
-        PEM_END.lastIndex = valueEnd;
-        const footer = PEM_END.exec(text);
-        valueEnd = footer ? footer.index + footer[0].length : text.length;
-        QUOTED_KEY.lastIndex = Math.max(QUOTED_KEY.lastIndex, valueEnd);
-      }
+    if (!onlyOverCap) {
+      out += text.slice(last, valueStart) + REDACTED;
+      last = valueEnd;
+      continue;
     }
-    out += text.slice(last, valueStart) + REDACTED;
-    last = valueEnd;
+    // Rule set 5's first pass: only over-bound values are redacted, but every value the
+    // full pass would redact is still skipped, so both passes see the same keys. Rule set
+    // 6: so is a value of any length that holds a private-key boundary the PEM rule would
+    // pair across the value's edge, as below.
+    //
+    // The PEM rule runs on this pass's output and pairs each header with the next footer,
+    // left to right (`pairPrivateKeys`), so redacting a value must leave it no header or
+    // footer whose partner was inside the value. `pem` is that pairing over the text this
+    // pass keeps, up to the value's start.
+    pem = pairPrivateKeys(text.slice(pemFrom, valueStart), pem.open, pem.at, out.length + pemFrom - last);
+    pemFrom = valueStart;
+    const inside = pairPrivateKeys(text.slice(valueStart, valueEnd), pem.open, -1, 0);
+    // A header before the value whose footer is inside it (rule set 5 took the footer with
+    // the value and the PEM rule then redacted from the header to the end of the input):
+    // the redaction starts at that header and runs through the value's closing quote.
+    const fromHeader = inside.closedOuter;
+    // A header inside the value whose footer is after it: the redaction runs to that footer
+    // (or the end), as the PEM rule's would.
+    const toFooter = inside.at !== -1;
+    if (!longValue && !overBound && !fromHeader && !toFooter) continue;
+    // The value's closing quote (its backslashes and the quote), when it has one.
+    const closeLength = quote === '"' || quote === "'" || quote === "`" ? bs + 1 : 0;
+    const closeEnd = Math.min(text.length, valueEnd + closeLength);
+    let redactEnd = valueEnd;
+    if (toFooter) {
+      PEM_END.lastIndex = closeEnd;
+      const footer = PEM_END.exec(text);
+      redactEnd = footer ? footer.index + footer[0].length : text.length;
+    } else if (fromHeader) redactEnd = closeEnd;
+    out += text.slice(last, valueStart);
+    if (fromHeader) out = out.slice(0, pem.at);
+    out += REDACTED;
+    // The key and opening quote are kept and the closing quote was taken: put it back, or
+    // the quoted rule would find the value unclosed and redact the rest of the input.
+    if (!fromHeader && redactEnd > valueEnd) out += text.slice(valueEnd, closeEnd);
+    last = redactEnd;
+    pemFrom = redactEnd;
+    // After a footer, nothing is open; otherwise a header before the value stays open.
+    pem = { open: !toFooter && inside.open, at: pem.at, closedOuter: false };
+    QUOTED_KEY.lastIndex = Math.max(QUOTED_KEY.lastIndex, redactEnd);
   }
   return last === 0 ? text : out + text.slice(last);
+}
+
+/**
+ * Pair private-key headers and footers in `s` left to right, as the PEM rule does (each
+ * header with the next footer after it), starting `open` when a header before `s` (at
+ * `at` in the caller's output) is still waiting for its footer. Returns whether a header
+ * is open after `s` and where it starts (`base` + its index in `s`, or `at` when it is the
+ * header from before `s`; -1 when that one is from before and `at` was -1), and whether a
+ * footer in `s` closed the header that was open before it.
+ */
+function pairPrivateKeys(
+  s: string,
+  open: boolean,
+  at: number,
+  base: number,
+): { open: boolean; at: number; closedOuter: boolean } {
+  let closedOuter = false;
+  let outer = open;
+  let pos = 0;
+  for (;;) {
+    const re = open ? PEM_END : PEM_BEGIN;
+    re.lastIndex = pos;
+    const m = re.exec(s);
+    if (!m) return { open, at: open ? at : -1, closedOuter };
+    pos = m.index + m[0].length;
+    if (open) {
+      if (outer) closedOuter = true;
+      outer = false;
+      open = false;
+    } else {
+      open = true;
+      at = base + m.index;
+    }
+  }
 }
 
 /**
@@ -346,6 +421,13 @@ export function unsplittableQuotedValueSpans(
  * over the bound in the input could fall under it, be taken for an ordinary value, and keep
  * everything after its first line. Values within the bound are left to the quoted rule in
  * its usual place (which, from rule set 5, also redacts them whole across lines).
+ *
+ * Rule set 6: the private-key rule runs next, on this rule's output, so this rule keeps
+ * its header/footer pairing intact. A value (of any length) holding the footer of a
+ * header before it is redacted from that header through the value's closing quote; one
+ * holding a header whose footer is after it, through that footer. Rule set 5 took the
+ * footer with the value, and the private-key rule then redacted from the header to the
+ * end of the input.
  */
 function redactOverCapQuotedValues(text: string): string {
   return redactQuotedSecretValues(text, undefined, false, true);
@@ -423,7 +505,8 @@ type Rule = [RegExp, Replacement] | ((text: string) => string);
 
 const SECRET_PATTERNS: Rule[] = [
   // Rule set 5: over-bound quoted secret values, measured on the text before any rule
-  // below can shrink them. See `redactOverCapQuotedValues`.
+  // below can shrink them; rule set 6: and values that hold a private-key boundary
+  // paired across their edge. See `redactOverCapQuotedValues`.
   redactOverCapQuotedValues,
   // PEM private keys (PKCS#1/#8, EC, OpenSSH, encrypted) and armored PGP private key
   // blocks (`-----BEGIN PGP PRIVATE KEY BLOCK-----`), each up to its footer.
