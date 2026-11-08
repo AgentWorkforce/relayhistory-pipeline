@@ -215,10 +215,10 @@ Each rule is applied in one bounded statement per page, under the settings and g
 
 | table | delete row iff ALL of | never if |
 |---|---|---|
-| decisions | claim batch `state='committed'` AND `committed_at <= now()-min_age`; NOT EXISTS stage intent of the claim with `cleanup_state<>'redacted'`; NOT EXISTS `babysitter_evidence_index.claim_token = claim` | phase flag off; dry run |
+| decisions | claim batch `state='committed'` AND `committed_at <= now()-min_age`; NOT EXISTS stage intent of the claim with `cleanup_state<>'redacted'`; NOT EXISTS `babysitter_evidence_index.claim_token = claim`, re-checked under the claim's exclusive interlock lock, which also writes the irreversible registration-closed marker (§3.5) | phase flag off; dry run; a Babysitter registration for the claim in flight (skipped, counted) |
 | seats | `created_at <= now()-min_age`; NOT EXISTS decision / slot `current_seat_key` / head winner / ord seat referencing it | required FK-side indexes missing (§5.3) |
 | native slots | (none) | always |
-| custody | `import_token IS NULL` (live-witness kind); NOT EXISTS slot `current_legacy_key` / head `legacy_key_sha256` / ord seat `legacy_custody_key_sha256` referencing it | required indexes missing; imported kind |
+| custody | `import_token IS NULL` (live-witness kind); its native slot's `initialized_at <= now()-min_age` (the custody row is inserted in the same transaction as its slot; no slot means kept); NOT EXISTS slot `current_legacy_key` / head `legacy_key_sha256` / ord seat `legacy_custody_key_sha256` referencing it | required indexes missing; imported kind |
 | frozen | **Phase C, not implemented.** Proposed: native slot for the key exists AND (`session_id IS NULL` OR the row's `(org,ws,user,origin,source,session)` ∈ `ingest_frozen_source_owned_sessions`) AND shadow mode is off AND it runs through the privacy authority | always, until Phase C is approved |
 
 Why each condition is necessary (the matching causal negative test is in §8):
@@ -233,17 +233,20 @@ Why each condition is necessary (the matching causal negative test is in §8):
   - Every decision reader requires a live stage, so dropping this condition breaks the
     publication claim, GC and the history plan. The test shows `ingest_buffer_gc_ordinals` and
     `ingest_receipt_seats_for_stage` raising once a live stage's decisions are removed.
-- **Decisions, no Babysitter row:** the reader looks decisions up by claim token, with no stage
-  needed. Delete tombstones are permanent.
-  - `ingest_babysitter_retention_register` checks only `ingest_attempt_epochs`, which does not
-    require a pending batch. A slow worker could, in principle, register after another worker
-    committed the same claim (see U6).
-  - `min_age` (default 7 days, far longer than the 120 s stage lease and the Worker request
-    lifetime) covers that window.
+- **Decisions, no Babysitter row, and registration closed:** the reader looks decisions up by
+  claim token, with no stage needed. Delete tombstones are permanent.
+  - `ingest_babysitter_retention_register` (042000 l.263-290, 375-381) checks only
+    `ingest_attempt_epochs`. It has no pending-batch requirement and no deadline, so a valid
+    registration for an old committed claim can arrive at any time.
+  - The absence of an evidence row is therefore not a proof by itself, and age is not one either.
+    The rule is backed by a database interlock (§3.5): retirement is irreversible and serialized
+    with registration on a per-claim lock, so registration fails once retirement begins.
+    `min_age` stays only as an operational margin.
 - **Seats, unreferenced:** the FKs would refuse the delete anyway. The predicate keeps a page from
   failing, and it keeps the slot's **current** seat (needed by the next ignored candidate's
   `first_digest` drift check). Monotonicity is shown in §1.2.
-- **Custody, live kind and detached:** monotonic (§1.4). The imported kind is excluded because
+- **Custody, live kind, aged and detached:** monotonic (§1.4). It ages like seats; the age is its
+  slot's `initialized_at`. The imported kind is excluded because
   `ingest_custody_complete`'s coverage count and the import evidence describe the full imported
   set.
 - **Frozen, owned-session coverage:** this keeps the reset union of 041000 unchanged (§3.3).
@@ -311,6 +314,42 @@ becomes deletable only after the decisions or slot state referencing it are gone
 - The reclaim is therefore bounded by how much of the backlog has been drained (published and
   GC-redacted). The size of the backlog is UNKNOWN U3.
 
+### 3.5 Babysitter registration interlock (decision retirement is irreversible)
+
+`babysitter_evidence_page_for` (042000 l.782-787) serves a candidate only if the claim's decision
+exists. Registration has no deadline. A decision deleted before a later or concurrent
+registration would make that registered evidence invisible. Timing does not close this. The draft
+closes it with state plus serialization:
+
+1. **Marker:** `sessions.ingest_bookkeeping_retired_claims(claim_token)`. It is insert-only: a
+   statement trigger refuses UPDATE, DELETE and TRUNCATE. The cleanup inserts it **in the same
+   transaction** that deletes the claim's decisions. If that transaction rolls back, both roll back.
+2. **Lock:** a per-claim advisory key, `ingest_bookkeeping_claim_lock_key(claim)`.
+   - The cleanup takes it **exclusively with `pg_try_advisory_xact_lock`** and never waits. A
+     claim whose lock is held is skipped and counted (`skippedClaims`), so the run is not `done`.
+   - After acquiring the lock, the cleanup re-checks `babysitter_evidence_index` in a new statement,
+     so a registration that committed in between is seen.
+3. **Registration:** `ingest_babysitter_retention_register` is replaced by
+   `CREATE OR REPLACE` in the new SQL. The 042000 file is untouched. The body is verbatim except one
+   block placed right after `ingest_attempt_epochs`, before any write:
+   - it takes the claim's lock **shared**, so registrations never block each other;
+   - then, in a new statement, it refuses with `55000 ... registration closed` if the marker exists.
+
+Both orders are safe:
+
+- **Registration first:** it holds the shared lock until commit. The cleanup's try-lock fails, so
+  the claim is skipped. After the registration commits, the evidence row blocks retirement.
+- **Cleanup first:** it holds the exclusive lock until commit. The registration waits on that lock,
+  then sees the committed marker and fails. Nothing invisible is ever registered.
+
+Deadlocks are impossible. The cleanup never waits: it uses try-locks, SKIP LOCKED and
+`lock_timeout`. Registration waits only on a cleanup transaction, which holds no lock registration
+needs first. Each retired claim holds one advisory lock until commit, so a page is capped at 200
+claims to keep the shared lock table bounded.
+
+A refused late registration is the correct outcome. That claim's ACK decision is already gone, so
+the reader could never have served its evidence.
+
 ---
 
 ## 4. ACK and replay safety
@@ -362,7 +401,20 @@ The terminal conditions are final states (§2), so no lock is needed to hold the
     seat is current, so not a candidate. Any such seat is skipped anyway.
 - RI checks on seat and custody deletes. With the §5.3 indexes these are index probes. They find
   no referencing row (by the predicate), so they lock nothing.
+- per claim (Phase A only), the Babysitter interlock lock, by try-lock (§3.5). Ingest claims and
+  ACKs never take it. Only Babysitter registration does, shared.
 - `lock_timeout = 100ms` (function `SET`) as a backstop.
+- **Skips are never lost.** Every page returns `skipped` (rows of claims whose lock was busy, plus
+  rows `SKIP LOCKED` passed over), `end` (keyset exhausted) and `done = end AND skipped = 0`.
+  - The operator reports `done=true` only when a run reached the end with zero skips across all
+    its pages.
+  - Otherwise it reports `incomplete` (`locked`, `busy` or `max_pages`) and `resumeFrom`: the
+    cursor of the earliest page that skipped anything, where null means from the start.
+  - A page with `next=null` that is not `end` is refused rather than restarting the keyset.
+- **Index gates check definitions.** Each required index must be live, valid, ready, **and** its
+  `pg_get_indexdef` must equal the exact expected definition: columns, order, opclass and
+  collation, predicate, uniqueness, method. A same-name drifted index is refused.
+  - The operator index file has no `IF NOT EXISTS`, so building over a drifted name fails loudly.
 
 ### 5.3 Bounds
 
@@ -467,7 +519,15 @@ Two independent flags must both say go:
 
    It is changed only by the owner-only `ingest_bookkeeping_cleanup_configure`. A disabled or
    dry-run setting deletes nothing. A dry run still returns exact per-page eligibility counts.
-2. **The operator tool** (`scripts/ops/ingest-bookkeeping-cleanup.ts`) runs a dry run unless given
+2. **The operator tool** (`scripts/ops/ingest-bookkeeping-cleanup.ts`; the owner connection uses
+   discrete pinned pg fields from `src/shared/owner-pg-config.ts`:
+   - no `connectionString`;
+   - TLS verified against the pinned Supabase CA;
+   - a fixed `application_name`;
+   - no PG* environment or `.pgpass` fallback.
+
+   It parses arguments strictly and prints only a closed reason on failure.) It runs a dry run
+   unless given
    `--execute`.
 
 Other properties:
@@ -570,9 +630,38 @@ size.
 **Operator tool:** dry run by default; it pages with the cursor, refuses malformed results, and
 `--execute` is still a no-op while SQL `enabled=false`.
 
-**Mutation proof:** each predicate was removed in turn from a copy of the draft (live stage,
-Babysitter, `min_age` for decisions; current slot and age for seats; imported kind, both guards,
-and current slot for custody). Every mutant fails at least one test. The test file accepts
+**Babysitter interlock (§3.5), causal both ways:**
+
+- **Sequential:** a control claim registered before cleanup keeps its decisions and is served by
+  the real reader. A cleaned claim's later registration is refused (55000).
+- **Proof by violation:** with 042000's original register restored inside a rolled-back
+  transaction, the same registration succeeds, but the reader serves nothing for it.
+- **Two-connection race:**
+  - registration uncommitted during the cleanup page: the claim is skipped (no wait), then kept
+    by its evidence row;
+  - cleanup uncommitted during registration: registration blocks on the claim lock, then fails.
+
+**Index drift:**
+
+- A same-name wrong index (wrong column, or wrong predicate) is refused by both gates, and the
+  probe it should serve does not use it.
+- Rebuilding over a drifted name fails with `42P07`.
+
+**Skips:** a seat held `FOR KEY SHARE`, or a decision row held `FOR UPDATE`, across one multi-page
+operator run yields `done=false`, `incomplete=locked`. The run's `resumeFrom` revisits the row,
+and a second run deletes it and reports `done`.
+
+**Mutation proof:** each of 15 safety elements was removed in turn from a copy of the draft:
+
+- decisions: live stage, Babysitter, `min_age`;
+- seats: current slot, age;
+- custody: imported kind (both guards), current slot, age;
+- the register refusal and the register lock;
+- the cleanup claim lock and the marker;
+- the index-definition check;
+- seat/custody and decision skip counting.
+
+Every mutant fails at least one test. The test file accepts
 `BOOKKEEPING_CLEANUP_DRAFT_SQL` only for this purpose.
 
 Still to do before slot assignment: a function-boundary lane, ACL JSON, and a guarded down file
@@ -595,10 +684,9 @@ with a reapply round trip, mirroring 039000's test. A proof at the seat-index wr
   evidently live (15.6M slots). Not verified.
 - **U5, current-legacy share.** How many slots still point at their live-witness custody row? Not
   derivable from source.
-- **U6, Babysitter registration.** Is Babysitter routing on in production
-  (`babysitterRetention`), and how large is `babysitter_evidence_index`? Can a delayed
-  registration for an already-committed claim actually happen in the Worker's retry model? The
-  7-day `min_age` assumes such a window is bounded by request and lease lifetimes (minutes).
+- **U6, Babysitter routing.** Is Babysitter routing on in production (`babysitterRetention`),
+  and how large is `babysitter_evidence_index`? This affects only the reclaim (claims with evidence
+  are kept). Correctness no longer depends on it, because of the interlock in §3.5.
 - **U7, Supabase capability.** Is `pg_repack` available on this project and plan, and can the
   provisioned disk be reduced? Without downsizing, reclaim means headroom, not a smaller disk.
 - **U8, ACK cost of Phase B indexes.** What extra latency do they add under the global seat-clock

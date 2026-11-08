@@ -107,6 +107,54 @@ describe.skipIf(!url)("ingest bookkeeping cleanup (draft) on owned PG17", () => 
     await pool.query("UPDATE sessions.ingest_batches SET committed_at=clock_timestamp()-$2::interval WHERE batch_id=$1", [s.batchId, o.age ?? "8 days"]);
   }
   const ageSeats = () => pool.query("UPDATE sessions.ingest_receipt_seats SET created_at=clock_timestamp()-interval '8 days'");
+  // Fixture only: custody age is its slot's initialized_at (the cleanup itself never writes slots).
+  const ageSlots = () => pool.query("UPDATE sessions.ingest_lazy_native_slots SET initialized_at=clock_timestamp()-interval '8 days'");
+  const plan = async (q: string) => {
+    const c = await connect();
+    try { await c.query("BEGIN;SET LOCAL enable_seqscan=off"); return (await c.query("EXPLAIN " + q)).rows.map((r) => r["QUERY PLAN"]).join("\n"); }
+    finally { await release(c); }
+  };
+  const txSql = { transaction: async <T>(work: (q: (s: string, p: unknown[]) => Promise<{ rows: Record<string, unknown>[] }>) => Promise<T>) => {
+    const c = await connect();
+    try { await c.query("BEGIN"); const r = await work((s, p) => c.query(s, p as never) as never); await c.query("COMMIT"); return r; }
+    finally { await release(c); }
+  } };
+  const waitForBlocker = async (waiter: number, blocker: number) => {
+    const end = Date.now() + 4000;
+    while (Date.now() < end) {
+      if (((await pool.query("SELECT pg_blocking_pids($1) AS pids", [waiter])).rows[0].pids as number[]).includes(blocker)) return;
+      await Bun.sleep(10);
+    }
+    throw Error("expected_fixture_lock_wait_missing");
+  };
+  const pid = async (c: PoolClient) => (await c.query("SELECT pg_backend_pid() AS pid")).rows[0].pid as number;
+  /** A real, bucketless Babysitter DELETE candidate for the claim's own first record (accepted digest). */
+  const registration = async (s: Seed) => {
+    const a = await one(`SELECT a.origin_id,a.batch_id,b.digest,r FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_batches b
+      ON b.org_id=a.org_id AND b.workspace_id=a.workspace_id AND b.origin_id=a.origin_id AND b.batch_id=a.batch_id
+      CROSS JOIN LATERAL jsonb_array_elements(a.records) r WHERE a.claim_token=$1 ORDER BY (r->>'ord')::int LIMIT 1`, [s.claim]);
+    return { tenant: s.tenant, originId: a.origin_id, batchId: a.batch_id, batchDigest: a.digest, claimToken: s.claim, generation, resetEpoch: 0, buckets: [],
+      records: [{ bucket: null, originId: a.origin_id, recordId: a.r.record_id, revision: String(a.r.revision), revisionId: a.r.revision_id, digest: a.r.digest,
+        operation: "delete", kind: "turn_receipt", source: a.r.source, sessionId: a.r.session_id, line: null, expiresAtMs: null }] };
+  };
+  const register = async (c: PoolClient, body: unknown) => {
+    await c.query("SET LOCAL ROLE bulls96_session_ingest");
+    try { return (await c.query("SELECT sessions.ingest_babysitter_retention_register($1::jsonb) r", [JSON.stringify(body)])).rows[0].r; }
+    finally { await c.query("RESET ROLE").catch(() => {}); }
+  };
+  /** The real Babysitter reader (read-API role, tenant-bound): the served tombstones for this record. */
+  const served = async (s: Seed, recordId: string, inTx?: PoolClient) => {
+    const c = inTx ?? await connect();
+    try {
+      if (!inTx) await c.query("BEGIN READ ONLY");
+      await c.query("SET LOCAL ROLE bulls96_read_api");
+      await c.query("SELECT set_config('bulls96_read.org_id',$1,true),set_config('bulls96_read.workspace_id',$2,true)", [s.tenant.orgId, s.tenant.workspaceId]);
+      const v = (await c.query("SELECT sessions.babysitter_evidence_page_for($1,$2::jsonb) AS v", [s.tenant.workspaceId,
+        JSON.stringify({ kind: "turn_receipt", source: null, sessionId: null, after: null, limit: 101, includeDeleted: true })])).rows[0].v;
+      await c.query("RESET ROLE");
+      return (v.rows as Array<{ recordId: string }>).filter((r) => r.recordId === recordId);
+    } finally { if (!inTx) await release(c); }
+  };
 
   beforeAll(async () => {
     admin = new pg.Client({ connectionString: url }); await admin.connect();
@@ -126,6 +174,8 @@ describe.skipIf(!url)("ingest bookkeeping cleanup (draft) on owned PG17", () => 
     await pool.query("SELECT sessions.ingest_receipt_seat_initialize($1::jsonb)", [JSON.stringify({ protocol: "delivery-acceptance-floor-v1", controlEpoch: epoch,
       capturedAt: "2026-11-04T00:00:00.000000Z", sourceSequences: ["sessions.delivery_catalog_acceptance_seq", "sessions.delivery_projection_acceptance_seq"].map((sequenceRegclass, i) => ({ sequenceRegclass, sequenceOid: String(i + 1), allocatedHighWater: "9007199254740993", isCalled: true, incrementBy: "1", cycle: false })),
       allocatedHighWater: "9007199254740993", generation, sourceIdentitySha256: identity, sourceProofSha256: hex("d") })]);
+    // The read role's schema USAGE is its operator step (supabase/bootstrap/session_read_api_role.sql), not a migration.
+    await pool.query("GRANT USAGE ON SCHEMA sessions TO bulls96_read_api");
     // The draft is loaded AFTER the real migrations, exactly as a registered slot would be.
     await pool.query(text(DRAFT));
     console.log(JSON.stringify({ proof: "bookkeeping-cleanup-fixture", serverVersionNum: version, generation, draft: DRAFT }));
@@ -141,7 +191,17 @@ describe.skipIf(!url)("ingest bookkeeping cleanup (draft) on owned PG17", () => 
     expect(s).toEqual({ enabled: false, dry_run: true, decisions_enabled: false, seats_enabled: false, custody_enabled: false, min_age: "7 days" });
     // Phase A refuses (even a dry run) until its index exists.
     await expect(decisions(false)).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("phase A index") });
+    // A same-name index with the WRONG definition is refused, and the probe it should serve does seq-scan.
+    await pool.query("CREATE INDEX babysitter_evidence_index_claim_idx ON sessions.babysitter_evidence_index(user_id)");
+    await expect(decisions(false)).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("phase A index") });
+    // (No other index LEADS with claim_token: the probe can only scan, never seek, until the exact index exists.)
+    const probe = "SELECT 1 FROM sessions.babysitter_evidence_index WHERE claim_token='00000000-0000-0000-0000-000000000001'";
+    expect(await plan(probe)).not.toContain("using babysitter_evidence_index_claim_idx");
+    // The operator file has no IF NOT EXISTS: building over the drifted name fails loudly instead of keeping it.
+    await expect(pool.query(indexStatements[0]!)).rejects.toMatchObject({ code: "42P07" });
+    await pool.query("DROP INDEX sessions.babysitter_evidence_index_claim_idx");
     await pool.query(indexStatements[0]!);
+    expect(await plan(probe)).toContain("using babysitter_evidence_index_claim_idx");
     expect((await decisions(false)).mode).toBe("dry-run");
     // statement_timeout must be bounded by the caller: unset (0) and >5s are refused.
     await expect(page("decisions", { after: null, rowBudget: 500, execute: false }, null)).rejects.toMatchObject({ code: "55000" });
@@ -228,7 +288,23 @@ describe.skipIf(!url)("ingest bookkeeping cleanup (draft) on owned PG17", () => 
   }, 60000);
 
   test("Phase B seats: unreferenced, non-current, aged seats only; the current seat and FK stay authoritative", async () => {
-    for (const s of indexStatements.slice(1)) await pool.query(s);
+    // All other exact Phase B indexes plus ONE same-name wrong one: the gate refuses, and the RI/predicate
+    // probe that index should serve seq-scans (the hazard the definition check closes).
+    const wrong = "CREATE INDEX ingest_lazy_ack_decisions_seat_key_idx ON sessions.ingest_lazy_ack_decisions(ord)";
+    await pool.query(wrong);
+    for (const s of indexStatements.slice(2)) await pool.query(s);
+    await expect(seats(false)).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("phase B indexes") });
+    await expect(custody(false)).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("phase B indexes") });
+    expect(await plan("SELECT 1 FROM sessions.ingest_lazy_ack_decisions WHERE seat_key_sha256=repeat('a',64)")).toContain("Seq Scan");
+    await pool.query("DROP INDEX sessions.ingest_lazy_ack_decisions_seat_key_idx");
+    await pool.query(indexStatements[1]!);
+    expect(await plan("SELECT 1 FROM sessions.ingest_lazy_ack_decisions WHERE seat_key_sha256=repeat('a',64)")).not.toContain("Seq Scan");
+    // A wrong PREDICATE on the same name is drift too.
+    await pool.query("DROP INDEX sessions.ingest_lazy_native_slots_current_seat_idx");
+    await pool.query("CREATE INDEX ingest_lazy_native_slots_current_seat_idx ON sessions.ingest_lazy_native_slots(current_seat_key) WHERE current_owner IS NOT NULL");
+    await expect(seats(false)).rejects.toMatchObject({ code: "55000" });
+    await pool.query("DROP INDEX sessions.ingest_lazy_native_slots_current_seat_idx");
+    await pool.query(indexStatements[2]!);
     const t = { ...TENANT, userId: "bk-seat-user" };
     const first = await seed([{ id: "s-rec", revision: 1 }], t);
     const firstSeat = (await one("SELECT seat_key_sha256 k FROM sessions.ingest_lazy_ack_decisions WHERE claim_token=$1", [first.claim])).k as string;
@@ -294,7 +370,16 @@ describe.skipIf(!url)("ingest bookkeeping cleanup (draft) on owned PG17", () => 
     await pool.query(`INSERT INTO sessions.ingest_custody_records(key_sha256,import_token,page,source_key_sha256,org_id,workspace_id,user_id,origin_id,record_id,revision,
       digest,source,session_id,metadata,reset_epoch,fence_epoch,baseline_fingerprint) VALUES(repeat('9',64),$1,0,repeat('8',64),'bk-import-org','ws','u','o','r',1,
       repeat('7',64),'claude','s','{}',0,0,repeat('6',64))`, [imp]);
+    // Give it an old, unrelated slot so ONLY its kind keeps it (age and references would otherwise allow it).
+    await pool.query(`INSERT INTO sessions.ingest_lazy_native_slots(key_sha256,key_material,org_id,workspace_id,origin_id,record_id,source_identity_sha256,
+      control_epoch,initialized_witness_sha256,initialized_at) SELECT encode(sha256(convert_to(m::text,'UTF8')),'hex'),m,'bk-import-org','ws','o','r',repeat('c',64),
+      repeat('3',64),repeat('5',64),clock_timestamp()-interval '30 days' FROM (SELECT jsonb_build_array('global-native-custody-v1','bk-import-org','ws','o','r') m) q`);
     await allOn();
+    // Inside min_age (slot just initialized) a detached row is kept: custody ages like seats.
+    const young = await custody(true);
+    expect(young.blocked.young).toBeGreaterThanOrEqual(1);
+    expect(await custodyRow(detached)).toBe(1);
+    await ageSlots();
     const run = await custody(true);
     expect(run.blocked.currentSlot).toBeGreaterThanOrEqual(1); expect(run.blocked.imported).toBe(1);
     // Nothing is locked here, so every eligible row is deleted: an imported row may never count as eligible.
@@ -332,22 +417,45 @@ describe.skipIf(!url)("ingest bookkeeping cleanup (draft) on owned PG17", () => 
       expect(r.deleted).toBeGreaterThanOrEqual(1);
       expect(await decisionRows(s.claim!)).toBe(0);
     } finally { await release(holder); }
-    // A seat whose row is KEY SHARE-locked (what an ACK inserting a reference holds) is skipped at once.
+    // A seat whose row is KEY SHARE-locked (what an ACK inserting a reference holds) is skipped at once, and a
+    // single multi-page operator run that skipped it can NOT report done: it says incomplete and where to resume.
     const t = { ...TENANT, userId: "bk-skip-user" };
     const a = await seed([{ id: "k-rec", revision: 1 }], t);
     const seatA = (await one("SELECT seat_key_sha256 k FROM sessions.ingest_lazy_ack_decisions WHERE claim_token=$1", [a.claim])).k as string;
     await terminal(a); await seed([{ id: "k-rec", revision: 2 }], t); await decisions(true); await ageSeats();
+    const seatRow = () => count("SELECT count(*) n FROM sessions.ingest_receipt_seats WHERE key_sha256=$1", [seatA]);
+    const run = (phase: "seats" | "decisions", after: unknown = null) => runBookkeepingCleanup({ sql: txSql, phase, limit: phase === "seats" ? 1 : 500,
+      maxPages: 10000, execute: true, pauseMs: 0, statementTimeoutMs: 3000, after });
     const share = await connect();
+    let held;
     try {
       await share.query("BEGIN");
       await share.query("SELECT 1 FROM sessions.ingest_receipt_seats WHERE key_sha256=$1 FOR KEY SHARE", [seatA]);
       const started = Date.now();
-      await seats(true);
-      expect(Date.now() - started).toBeLessThan(2000);
-      expect(await count("SELECT count(*) n FROM sessions.ingest_receipt_seats WHERE key_sha256=$1", [seatA])).toBe(1);
+      held = await run("seats");
+      expect(Date.now() - started).toBeLessThan(10000);
+      expect(held).toMatchObject({ done: false, incomplete: "locked", next: null });
+      expect(held.skipped).toBeGreaterThanOrEqual(1);
+      expect(held.pages).toBeGreaterThan(1);
+      expect(await seatRow()).toBe(1);
     } finally { await release(share); }
-    await seats(true);
-    expect(await count("SELECT count(*) n FROM sessions.ingest_receipt_seats WHERE key_sha256=$1", [seatA])).toBe(0);
+    // The resume cursor revisits the skipped seat: the rerun deletes it and only then reports done.
+    expect(await run("seats", held!.resumeFrom)).toMatchObject({ done: true, incomplete: null, skipped: 0 });
+    expect(await seatRow()).toBe(0);
+    // Same for decisions: one locked decision row of a terminal claim keeps the run incomplete.
+    const d = await seed([{ id: "k-dec-1" }, { id: "k-dec-2" }]);
+    await terminal(d);
+    const lock = await connect();
+    let heldD;
+    try {
+      await lock.query("BEGIN");
+      await lock.query("SELECT 1 FROM sessions.ingest_lazy_ack_decisions WHERE claim_token=$1 AND ord=0 FOR UPDATE", [d.claim]);
+      heldD = await run("decisions");
+      expect(heldD).toMatchObject({ done: false, incomplete: "locked" });
+      expect(await decisionRows(d.claim!)).toBe(1);
+    } finally { await release(lock); }
+    expect(await run("decisions", heldD!.resumeFrom)).toMatchObject({ done: true, skipped: 0 });
+    expect(await decisionRows(d.claim!)).toBe(0);
     // One cleaner per phase: a held phase lock answers busy instead of waiting.
     const other = await connect();
     try {
@@ -355,6 +463,85 @@ describe.skipIf(!url)("ingest bookkeeping cleanup (draft) on owned PG17", () => 
       await other.query("SELECT sessions.ingest_bookkeeping_cleanup_try_lock('decisions')");
       expect(await decisions(true)).toEqual({ phase: "decisions", busy: true });
     } finally { await release(other); }
+    await configure();
+  }, 120000);
+
+  test("P1 sequential: retired decisions close registration; without the interlock a registration would be invisible", async () => {
+    await configure({ enabled: true, dryRun: false, decisions: true });
+    const control = await seed([{ id: "p1-control" }]), victim = await seed([{ id: "p1-victim" }]);
+    await terminal(control); await terminal(victim);
+    const controlReg = await registration(control), victimReg = await registration(victim);
+    // Control (no cleanup of this claim): a committed registration is served by the reader...
+    const c0 = await connect();
+    try { await c0.query("BEGIN"); await register(c0, controlReg); await c0.query("COMMIT"); } finally { await release(c0); }
+    await decisions(true);
+    expect(await decisionRows(control.claim!)).toBeGreaterThan(0);   // ...and keeps its decisions (evidence row present)
+    expect(await served(control, controlReg.records[0]!.recordId)).toHaveLength(1);
+    // Victim: cleanup retires it first, irreversibly. A later registration for it is REFUSED.
+    expect(await decisionRows(victim.claim!)).toBe(0);
+    expect(await count("SELECT count(*) n FROM sessions.ingest_bookkeeping_retired_claims WHERE claim_token=$1", [victim.claim])).toBe(1);
+    await expect(pool.query("DELETE FROM sessions.ingest_bookkeeping_retired_claims")).rejects.toMatchObject({ code: "55000" });
+    const c1 = await connect();
+    try {
+      await c1.query("BEGIN");
+      await expect(register(c1, victimReg)).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("registration closed") });
+    } finally { await release(c1); }
+    expect(await count("SELECT count(*) n FROM sessions.babysitter_evidence_index WHERE claim_token=$1", [victim.claim])).toBe(0);
+    // Proof by violation: with 042000's original register (no interlock), the same call SUCCEEDS but the
+    // reader cannot serve it, because the decision it needs is gone. Rolled back.
+    const original = text("supabase/migrations/20261105042000_babysitter_evidence_retention.sql");
+    const at = original.indexOf("CREATE FUNCTION sessions.ingest_babysitter_retention_register(p jsonb)");
+    const body = original.slice(at, original.indexOf("END $register$;", at) + "END $register$;".length).replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION");
+    const c2 = await connect();
+    try {
+      await c2.query("BEGIN");
+      await c2.query(body);
+      expect(await register(c2, victimReg)).toMatchObject({ objects: [] });
+      expect(await count("SELECT count(*) n FROM sessions.babysitter_evidence_index WHERE claim_token=$1", [victim.claim])).toBe(0); // other conn: uncommitted
+      expect(await served(victim, victimReg.records[0]!.recordId, c2)).toHaveLength(0);
+      expect(await served(control, controlReg.records[0]!.recordId, c2)).toHaveLength(1);
+    } finally { await release(c2); }
+    await configure();
+  }, 120000);
+
+  test("P1 race, both orders: registration in flight => cleanup skips the claim; cleanup in flight => registration waits, then fails", async () => {
+    await configure({ enabled: true, dryRun: false, decisions: true });
+    // Order 1: register (uncommitted) BEFORE the cleanup evaluates NOT EXISTS.
+    const z = await seed([{ id: "p1-race-z" }]); await terminal(z);
+    const zReg = await registration(z), before = await decisionRows(z.claim!);
+    const r = await connect();
+    try {
+      await r.query("BEGIN");
+      await register(r, zReg);
+      const started = Date.now();
+      const page1 = await decisions(true);
+      expect(Date.now() - started).toBeLessThan(2000);                  // try-lock: skipped, not waited
+      expect(page1).toMatchObject({ done: false });
+      expect(page1.skippedClaims).toBeGreaterThanOrEqual(1);
+      expect(await decisionRows(z.claim!)).toBe(before);
+      await r.query("COMMIT");
+    } finally { await release(r); }
+    expect((await decisions(true)).blocked.babysitter).toBeGreaterThanOrEqual(1);
+    expect(await decisionRows(z.claim!)).toBe(before);
+    expect(await served(z, zReg.records[0]!.recordId)).toHaveLength(1);
+    expect(await count("SELECT count(*) n FROM sessions.ingest_bookkeeping_retired_claims WHERE claim_token=$1", [z.claim])).toBe(0);
+    // Order 2: the cleanup retires (uncommitted) BEFORE the registration; the registration blocks on the
+    // claim lock, then sees the committed retirement and fails. Nothing invisible is ever registered.
+    const w = await seed([{ id: "p1-race-w" }]); await terminal(w);
+    const wReg = await registration(w);
+    const cl = await connect(), rg = await connect();
+    try {
+      await cl.query("BEGIN;SET LOCAL statement_timeout=3000");
+      const res = (await cl.query("SELECT sessions.ingest_bookkeeping_cleanup_decisions($1::jsonb) r", [JSON.stringify({ after: null, rowBudget: 5000, execute: true })])).rows[0].r;
+      expect(res.deleted).toBeGreaterThanOrEqual(1);
+      await rg.query("BEGIN;SET LOCAL lock_timeout='5s'");
+      const pending = register(rg, wReg).then(() => "ok", (e) => e.code + ":" + e.message);
+      await waitForBlocker(await pid(rg), await pid(cl));
+      await cl.query("COMMIT");
+      expect(await pending).toBe("55000:babysitter retention: claim decisions retired; registration closed");
+    } finally { await release(cl); await release(rg); }
+    expect(await decisionRows(w.claim!)).toBe(0);
+    expect(await count("SELECT count(*) n FROM sessions.babysitter_evidence_index WHERE claim_token=$1", [w.claim])).toBe(0);
     await configure();
   }, 120000);
 

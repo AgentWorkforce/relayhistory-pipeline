@@ -6,6 +6,10 @@
  * stays a refusal (55000) until the owner has also enabled the phase in SQL. Two switches, both required.
  * A busy phase lock stops the run: it never waits for another cleaner. Any malformed result, or a
  * cursor that does not strictly advance, stops the run before the next page.
+ * Skips are never lost: SQL counts rows it could not take (SKIP LOCKED, or a claim whose Babysitter
+ * registration was in flight). `done` is true ONLY when the keyset was exhausted with zero skips over the
+ * whole run. Otherwise `incomplete` says why and `resumeFrom` is the cursor of the earliest page that
+ * skipped something (null = from the start), so a rerun with --after revisits every skipped row.
  * Output is counts and the resume cursor only. No row content is ever returned or logged.
  */
 export type CleanupPhase = "decisions" | "seats" | "custody" | "frozen";
@@ -17,7 +21,8 @@ export interface CleanupOptions {
 }
 export interface CleanupReport {
   phase: CleanupPhase; mode: "dry-run" | "execute" | "census"; pages: number; scannedRows: number; eligibleRows: number;
-  deleted: number; busy: boolean; done: boolean; next: unknown; blocked: Record<string, number>;
+  deleted: number; skipped: number; busy: boolean; done: boolean; incomplete: null | "locked" | "busy" | "max_pages";
+  next: unknown; resumeFrom: unknown; blocked: Record<string, number>;
 }
 export class BookkeepingCleanupError extends Error { constructor(readonly code: string) { super("bookkeeping cleanup refused: " + code); } }
 const no = (code: string): never => { throw new BookkeepingCleanupError(code); };
@@ -55,7 +60,8 @@ export async function runBookkeepingCleanup(o: CleanupOptions): Promise<CleanupR
   assertCursor(o.phase, o.after);
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const report: CleanupReport = { phase: o.phase, mode: o.phase === "frozen" ? "census" : o.execute ? "execute" : "dry-run", pages: 0, scannedRows: 0,
-    eligibleRows: 0, deleted: 0, busy: false, done: false, next: o.after ?? null, blocked: {} };
+    eligibleRows: 0, deleted: 0, skipped: 0, busy: false, done: false, incomplete: null, next: o.after ?? null, resumeFrom: null, blocked: {} };
+  let skippedAt: { cursor: unknown } | null = null, reachedEnd = false;
   for (let i = 0; i < o.maxPages; i++) {
     if (i > 0 && o.pauseMs > 0) await sleep(o.pauseMs);
     const r = await o.sql.transaction(async (q) => {
@@ -63,17 +69,58 @@ export async function runBookkeepingCleanup(o: CleanupOptions): Promise<CleanupR
       return (await q(`SELECT sessions.ingest_bookkeeping_cleanup_${FN[o.phase]}($1::jsonb) AS r`, [JSON.stringify(body(o, report.next))])).rows[0]?.r;
     }) as Record<string, unknown> | undefined;
     if (!r || typeof r !== "object" || r.phase !== o.phase) no("result_shape");
-    if (r!.busy === true) { report.busy = true; break; }
+    if (r!.busy === true) { report.busy = true; report.incomplete = "busy"; break; }
     if (r!.busy !== undefined && r!.busy !== false) no("result_shape");
-    if (r!.mode !== report.mode || !nat(r!.scannedRows) || typeof r!.done !== "boolean") no("result_shape");
+    if (r!.mode !== report.mode || !nat(r!.scannedRows) || typeof r!.done !== "boolean" || typeof r!.end !== "boolean" || !nat(r!.skipped)
+      || r!.done !== (r!.end === true && r!.skipped === 0) || (!o.execute && r!.skipped !== 0)) no("result_shape");
     const eligible = o.phase === "frozen" ? r!.bothConditions : r!.eligibleRows, deleted = o.phase === "frozen" ? 0 : r!.deleted;
     if (!nat(eligible) || !nat(deleted) || (!o.execute && deleted !== 0) || (deleted as number) > (eligible as number)) no("result_counts");
     if (r!.next !== null) { assertCursor(o.phase, r!.next); if (!advanced(o.phase, report.next, r!.next)) no("cursor_order"); }
+    if ((r!.skipped as number) > 0 && skippedAt === null) skippedAt = { cursor: report.next };
     report.pages++; report.scannedRows += r!.scannedRows as number; report.eligibleRows += eligible as number; report.deleted += deleted as number;
+    report.skipped += r!.skipped as number;
     const blocked = (o.phase === "frozen" ? { slotInitialized: r!.slotInitialized, ownedCovered: r!.ownedCovered } : r!.blocked) as Record<string, unknown> | undefined;
     for (const [k, v] of Object.entries(blocked ?? {})) { if (!nat(v)) no("result_counts"); report.blocked[k] = (report.blocked[k] ?? 0) + (v as number); }
-    if (r!.done === true || r!.next === null) { report.done = true; report.next = null; break; }
+    // SQL guarantees next=null only at the end of the keyset; anything else would restart from the start.
+    if (r!.next === null && r!.end !== true) no("result_shape");
+    if (r!.end === true) { reachedEnd = true; report.next = null; break; }
     report.next = r!.next;
   }
+  if (!report.busy) {
+    if (skippedAt !== null) { report.incomplete = "locked"; report.resumeFrom = skippedAt.cursor; }
+    else if (!reachedEnd) { report.incomplete = "max_pages"; report.resumeFrom = report.next; }
+    else report.done = true;
+  } else report.resumeFrom = skippedAt?.cursor ?? report.next;
   return report;
+}
+
+/** Strict CLI parsing: known flags only, each value-taking flag needs a real value (never another --flag,
+ * so `--after --execute` is refused rather than reading "--execute" as the cursor), no repeats. */
+export interface CleanupArgs { phase: CleanupPhase; limit: number; maxPages: number; pauseMs: number; statementTimeoutMs: number; after: unknown; execute: boolean }
+export function parseCleanupArgs(argv: string[]): CleanupArgs {
+  const valued = new Set(["phase", "limit", "max-pages", "pause-ms", "timeout-ms", "after"]), got = new Map<string, string>();
+  let execute = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === "--execute") { if (execute) no("args_repeat"); execute = true; continue; }
+    if (!a.startsWith("--") || !valued.has(a.slice(2))) no("args_unknown");
+    const k = a.slice(2), v = argv[i + 1];
+    if (got.has(k)) no("args_repeat");
+    if (v === undefined || v.startsWith("--")) no("args_value");
+    got.set(k, v!); i++;
+  }
+  const phase = got.get("phase") as CleanupPhase | undefined;
+  if (!phase || !(phase in FN)) no("args_phase");
+  const int = (k: string, d: string) => { const v = got.get(k) ?? d; if (!/^[0-9]{1,6}$/.test(v)) no("args_" + k); return Number(v); };
+  let after: unknown = null;
+  if (got.has("after")) { try { after = JSON.parse(got.get("after")!); } catch { no("args_after"); } assertCursor(phase!, after); }
+  return { phase: phase!, limit: int("limit", phase === "decisions" ? "2000" : "1000"), maxPages: int("max-pages", "1"), pauseMs: int("pause-ms", "500"),
+    statementTimeoutMs: int("timeout-ms", "3000"), after, execute };
+}
+/** A closed, redacted reason for any failure: a SQLSTATE, or our own refusal code. Never a message or stack. */
+export function redactedReason(e: unknown): string {
+  const code = (e as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return "sqlstate_" + code;
+  if ((e instanceof BookkeepingCleanupError) || (e as { name?: unknown })?.name === "OwnerUrlError") return String(code);
+  return "internal_error";
 }
