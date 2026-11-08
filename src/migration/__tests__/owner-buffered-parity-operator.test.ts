@@ -108,6 +108,9 @@ describe("owner-buffered parity bulk runner", () => {
           ('private-org-1','private-ws-1','private-user-1','buffered'),
           ('private-org-2','private-ws-2','private-user-2','buffered'),
           ('private-org-3','private-ws-3','private-user-3','erased');`);
+      const maxBytesUser = "é".repeat(256);
+      await db.query("INSERT INTO sessions.ingest_buffer_outbox VALUES($1,$2,$3,'buffered')",
+        ["private-org-0", "", maxBytesUser]);
       const queryable: Queryable = { query: async <T>(sql: string, params?: unknown[]) =>
         (params?.length ? db.query(sql, params as never) : db.query(sql)) as Promise<{ rows: T[] }> };
       const seen: string[] = [];
@@ -120,8 +123,8 @@ describe("owner-buffered parity bulk runner", () => {
           }),
         },
       );
-      expect(seen).toEqual(["private-user-1", "private-user-2"]);
-      expect(counts).toMatchObject({ batches: 2, candidates: 2, inserted: 2 });
+      expect(seen).toEqual([maxBytesUser, "private-user-1", "private-user-2"]);
+      expect(counts).toMatchObject({ batches: 3, candidates: 3, inserted: 3, tenantRefused: 0 });
     } finally {
       await db.close();
     }

@@ -41,6 +41,7 @@ import pg from "pg";
 import {
   ParityCensusRefusal,
   readParityCensus,
+  validParityTenant,
   writeCurrentParityProof,
   type ParityCensusReceipt,
   type ParityTenant,
@@ -136,7 +137,7 @@ function parseTenant(value: unknown): ParityTenant {
   if (Object.keys(row).sort().join(",") !== "orgId,userId,workspaceId")
     throw new OwnerBufferedOperatorRefusal("tenant_invalid");
   const tenant = { orgId: row.orgId, workspaceId: row.workspaceId, userId: row.userId };
-  if (!Object.values(tenant).every((part) => typeof part === "string" && part.length >= 1 && part.length <= 128))
+  if (!validParityTenant(tenant as ParityTenant))
     throw new OwnerBufferedOperatorRefusal("tenant_invalid");
   return tenant as ParityTenant;
 }
