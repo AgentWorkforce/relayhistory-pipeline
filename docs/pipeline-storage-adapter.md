@@ -77,15 +77,16 @@ scrubs when it seals a chunk. For a client that cannot, the server's
   key, with `raw-sha256`, `raw-bytes`, `scrub-ruleset` and `scrub-version`
   metadata;
 - the response is the chunk entry and the `raw.scrub` marker
-  (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3, 4 from rule set 4) for the client's manifest.
+  (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3, 4 from rule set 4, 5 from rule set 5) for the client's manifest.
   Rule set 4: a quoted secret value whose matching closing quote is not within
   the quoted rule's 4096-unit scan bound (`MAX_QUOTED_VALUE` in `lib/scrub.ts`,
   UTF-16 code units counted from the value's start across line breaks) is
   replaced whole by `[REDACTED]`, up to that closing quote or, with none, to the
   end of the input; rule set 3 stored the part past the bound in clear. A value
   whose total length to its matching close is within the bound (multi-line
-  ones included), or whose input ends within it, scrubs byte-identically to
-  rule set 3.
+  ones included), or whose input ends within it, scrubbed byte-identically to
+  rule set 3 under rule set 4; rule set 5 redacts such a value whole when it
+  holds a line break or has no close (below).
   - **Across line breaks.** The bound caps the value's total length, not its
     first line's: CR, LF, CRLF, U+2028, U+2029 and U+0085 are ordinary value
     units, so a value with a short first line that crosses the bound only after
@@ -103,7 +104,8 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     such a value's key and the value's end; a cut exactly at the key's start is
     allowed. The same holds for a generated unquoted value of 4096 or more units
     after a quoted key. `longCut` (long strings, cut after any whitespace) finds
-    these values (`overCapQuotedValueSpans`) in the text up to 4096 + 256 units
+    these values (`overCapQuotedValueSpans`; `unsplittableQuotedValueSpans` since
+    rule set 5) in the text up to 4096 + 256 units
     past the segment bound, which covers the longest key plus the scan's reach
     (4096 + 150 units from the key's start), so a key just below the bound or
     straddling it is protected too; one still open there, decided or not, is
@@ -112,18 +114,93 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     look-ahead as a prefix (a value open at its end is open to the end), and a
     run that ends inside a secret value which is, or may yet become, over the
     bound keeps a following record or private-key line instead of ending
-    before it (fail closed, at most 256 rescans per chunk). Values
-    within the bound get no such span; as in rule set 3 they rely on the
-    context check (`CUT_CONTEXT_CHARS`). When no cut outside them is left the
+    before it (fail closed, at most 256 rescans per chunk). Under rule set 4,
+    values within the bound got no such span and relied, as in rule set 3, on
+    the context check (`CUT_CONTEXT_CHARS`); rule set 5 gives a multi-line or
+    unclosed one a span too. When no cut outside them is left the
     string is rejected with `chunk_string_too_long` (a run: `chunk_unsegmentable`),
     which is non-retryable and holds no content. The session ingest (`src/session-ingest/oversize.ts`) replaces such
     a string with its redaction marker before sealing, and the neon reader
     (`src/migration/neon-s3-sync/neon-reader.ts`) truncates it to a prefix that
     the sealer then scrubs.
   - **Quoted keys only.** The whole-value rule covers values after a quoted key.
-    A rule set 5 follow-up covers the rest: unquoted keys (YAML, TOML, env,
-    kwargs), more than 16 spaces before the colon, `\u` escapes in the key, keys
-    longer than 64 characters, and an NBSP separator.
+    A later follow-up (not rule set 5) covers the rest: unquoted keys (YAML,
+    TOML, env, kwargs), more than 16 spaces before the colon, `\u` escapes in
+    the key, keys longer than 64 characters, and an NBSP separator.
+
+  Rule set 5 closes five rule set 4 leaks; output for input with no secret-keyed
+  record value, no over-cap quoted value, no quoted secret value that holds a
+  line break or has no matching close, and no quoted secret value that starts
+  with `op://` but is not a strict reference (below) is byte-identical to rule
+  set 4.
+  - **Over-cap measured on the original text.** Rule set 4 measured a quoted
+    secret value after the token rules had replaced its provider-shaped tokens
+    with `[REDACTED]`, so a value over the bound (say 130 `capy_` tokens and then
+    a line break and more text) could shrink under it and keep its later lines.
+    Rule set 5 runs an over-cap pass first, on the original text: it finds the
+    same values as the full quoted rule and redacts each over-bound one whole
+    (through a private-key footer when a key block opens inside it).
+  - **Key context on the record path.** `scrubJson`, `scrubRecord` and the
+    raw-chunk record-line tokenizer (`scrubRecordLine`) redact a non-empty
+    string under a secret key name (`isSecretKeyName`), at any depth and through
+    arrays, unless it is already `[REDACTED]` or a strict `op://` reference. Rule set
+    4 scrubbed each value alone and stored `{"password":"plain words"}` as it
+    was. Numbers, booleans and null are kept. The `<scrub-segmenter>` markers
+    now also enclose `scrubRecordLine`, so the pinned digest covers the record
+    path.
+  - **Secret context through composite values.** The secret context of a
+    secret-keyed value runs through every descendant: in
+    `{"password":{"value":"..."}}`, `{"token":{"nested":{"deeper":"..."}}}` or
+    `{"credentials":[{"value":"..."}]}` every string below the secret key is
+    redacted, whatever its own key is named, in `scrubJson`/`scrubRecord` and
+    `scrubRecordLine` alike. The structure is kept (keys are still scrubbed and
+    de-duplicated), as are numbers, booleans, null, empty strings, `[REDACTED]`
+    and strict `op://` references; a sibling of the secret key is scrubbed by its own
+    keys only. The context resets at the end of the secret-keyed value.
+    `scrubText` over a raw JSON line does not parse it: there a composite under
+    a secret key is still left to the token rules (the quoted rule needs a
+    quoted value).
+  - **Multi-line quoted values within the bound.** A quoted secret value
+    within the 4096-unit bound that holds a line break (CR, LF, CRLF, U+2028,
+    U+2029, U+0085) before its matching close, or has no matching close, is
+    redacted whole: through its close, or to the end of the input. Rule set 4
+    redacted it only up to the first whitespace (rule set 3's fallback) and
+    kept the rest, later lines included; that fallback is gone. The empty
+    value, `[REDACTED]` and strict `op://` exceptions remain (see below), as do unquoted values and
+    the over-cap first pass. The segmenter protects such a value as it does an
+    over-bound one (`unsplittableQuotedValueSpans`): no `longCut` or `safeCut`
+    falls strictly between its key's start and its value's end, and a window
+    scanned as a prefix (`prefix: true`) takes a value still open at its end
+    as open to the end (fail closed). A value on one line that closes within
+    the bound scrubs as in rule set 4.
+  - **Only a strict `op://` reference is kept.** The quoted rule
+    (`scrubText`, at every escaping depth) and the record paths (`scrubJson`,
+    `scrubRecord`, `scrubRecordLine`, through `redactsSecretKeyedValue`) keep
+    a value that starts with `op://` only when the whole value is a complete
+    one-line 1Password reference (`OP_REFERENCE` in `lib/scrub.ts`):
+    `^op://SEG(/SEG)+$`, where each segment is one or more runs of ASCII
+    letters, digits, `.`, `_` or `-` joined by single spaces
+    (`op://vault/item/field`, `op://My Vault/item name/field`). Any other
+    value starting `op://` is redacted whole: one holding a backslash (so any
+    escape sequence, such as an escaped line separator `\n`, `\r`, `\u2028`,
+    `\u2029`, `\u0085`, or an escaped quote), a quote, a control character or
+    line separator, a tab, a double space, a leading or trailing space in a
+    segment, or no item segment. Before this, a value was kept unless it held a
+    literal line separator, so in nested or escaped JSON
+    (`{"api_key":"op://vault/item\nTAIL"}`, the text holding a backslash then
+    `n`; a tool result) the separator was stored as an escape and the tail was
+    kept. A quoted value with no matching
+    close still runs to the end of the input, and is kept only when all of it
+    up to there matches the grammar (nothing follows it).
+  - **Repeated source keys.** `scrubRecordLine` writes a key the source repeats
+    in one object under the name its first occurrence got, so a repeated key
+    that scrubs to `[REDACTED] (2)` no longer lands on the first key's
+    `[REDACTED]` after parsing.
+  - **Re-scrubbing rule set 4 output.** Rule set 5 over stored rule set 4
+    records catches the first leak (the key is still there) and the composite
+    one (the secret key is still above the value). The second leak's stored
+    value is already under the bound, but it still holds the line break after
+    which rule set 4 stopped, so the multi-line rule redacts it whole too.
 
 The unscrubbed bytes are never written to storage. If the key already holds
 an object (identical bytes or not), it is kept and described from its own
