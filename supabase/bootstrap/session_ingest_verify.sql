@@ -52,6 +52,7 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_publication_register_objects(jsonb)',
  'sessions.ingest_release_slot(jsonb)',
  'sessions.ingest_reset_uploaded_sessions(jsonb)',
+ 'sessions.ingest_selfhost_set_session_uploads(jsonb)',
  'sessions.ingest_set_session_uploads(jsonb)',
  'sessions.ingest_source_control_begin(jsonb)',
  'sessions.ingest_source_control_complete(jsonb)',

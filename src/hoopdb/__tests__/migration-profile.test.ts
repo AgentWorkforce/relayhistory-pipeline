@@ -1923,6 +1923,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const W = "upstream:20261105043860_buffered_search_gate.sql";
     const X = "upstream:20261105043870_buffered_search_feed_cursor.sql";
     const CG = "upstream:20261105043900_session_consumer_function_grants.sql";
+    const SE = "upstream:20261105043910_selfhost_session_selection_erase.sql";
     const BK = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
@@ -1931,7 +1932,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -1973,7 +1974,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105043900 (consumer function grants) applies last: earlier downs refuse (55000)
+    // 20261105043910 (self-host per-session erase) is the newest: its down drops the function, and
+    // 20261105043900's down refuses (55000) while it is applied.
+    expect((await failure(rollback("20261105043900_session_consumer_function_grants.down.sql")))?.code).toBe("55000");
+    await rollback("20261105043910_selfhost_session_selection_erase.down.sql");
+    expect(await names()).not.toContain(SE);
+    expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
+    // 20261105043900 (consumer function grants) is then the latest: earlier downs refuse (55000)
     // while it is applied; its own down revokes the twelve search_consumer_runtime
     // EXECUTEs and marks the validation pending.
     const writerGrants = async () =>
