@@ -83,6 +83,33 @@ half-done, so retry the aborted call (the switch or the backfill page).
   set-based statements over all installed scopes (`ingest_history_invalidate_installed`), not a
   per-scope loop; indexer writes wait for it behind the SHARE lock.
 
+## Lock-wait alert (55P03 / 57014)
+
+The ingest Worker writes one extra log line when a buffered lazy claim or a staged ACK fails with
+SQLSTATE 55P03 (`lock_not_available`, e.g. the 2s `lock_timeout`) or 57014 (`query_canceled`,
+statement timeout): `route` = `ingest.lock_alert`, `stage` = `lazy_claim`
+(`ingest_claim_buffered_batch`) or `staged_ack` (`ingest_commit_buffered_batch`), and `sqlstate`.
+It carries no tenant data and no ids. The request's own 503 line is unchanged (`route`
+`delivery.batches` / `turns.batches` / `delivery.recovery`, `outcome` `delivery_unavailable`,
+`stage` `claim` or `buffer_receipt`, `error_code`, `db_error_code`). `set_live`, control changes
+and `lazy_clear` have no Worker call site; for them use the operator session or database log
+(SQLSTATE in the error), with the same three stage names `set_live`, `control_changed`, `lazy_clear`.
+
+Alert when any of these is true:
+
+- more than 1% of `commit_buffered_batch` calls fail with 55P03 or 57014 over 5 minutes (numerator:
+  `ingest.lock_alert` lines with `stage=staged_ack`; denominator: buffered requests that reached
+  `buffer_receipt`, i.e. successful batch/recovery lines plus 503 lines with `stage=buffer_receipt`);
+- any 55P03 on `set_live`, `control_changed` or `lazy_clear` (operator or database log);
+- more than 1% of claim-path requests return 503 over 5 minutes (`outcome=delivery_unavailable`
+  with `stage=claim`, divided by all batch, turns and recovery requests).
+
+No Workers analytics or Logpush observer is named in these runbooks, so the alert is not wired
+yet. It is to be wired by the release owner in the G3 window, using the fields `route`, `stage`,
+`sqlstate`, `outcome` and `db_error_code`. A sustained `lazy_claim` 55P03 with a single origin
+lock holder is expected same-origin serialization (see the lock order above): check the
+uploader for overlapping same-origin uploads before treating it as an incident.
+
 ## Pointer-reference tracking
 
 The `session_index` pointer-reference trigger is dormant until armed, so the legacy indexer pays
