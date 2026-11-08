@@ -337,3 +337,52 @@ jobs:
               tee consumer-lease-pg${{ matrix.pg }}-$scheme.log
             grep -q "ALL PASS" consumer-lease-pg${{ matrix.pg }}-$scheme.log
           done
+  buffered-feed-login-postgres:
+    name: buffered search feed login and gate PostgreSQL ${{ matrix.pg }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          # Disposable container: trust auth means no credential exists anywhere.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED), PostgreSQL ${{ matrix.pg }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      # Migrates its own scratch database (043860 + 043870 up/down/up); the owner-buffered privacy
+      # fixtures already run in real-postgres via scripts/pg-proof/role-proof.ts, so they are not repeated here.
+      - name: Prove the buffered search feed RPCs admit only the runtime login and gate_for only the read API role (043860, 043870)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          # pg-proof checks out the PR head; heads predating this job lack the test. Remove once no open PR predates it.
+          if [ ! -f src/session-pipeline/__tests__/buffered-feed-login.postgres.test.ts ]; then
+            echo "::warning title=pg-proof::buffered-feed-login.postgres.test.ts absent at this head; forward-merge main to run the feed login proof"
+            exit 0
+          fi
+          bun test --timeout 300000 src/session-pipeline/__tests__/buffered-feed-login.postgres.test.ts
