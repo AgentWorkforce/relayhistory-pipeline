@@ -390,11 +390,38 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105041000_ingest_privacy_authority.sql` | table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix) |
 | `upstream:20261105042000_babysitter_evidence_retention.sql` | table sessions.babysitter_retention_objects |
 | `upstream:20261105043000_brief_titles.sql` | column sessions.session_briefs.origin |
+| `upstream:20261105043500_lazy_claim_clock_narrowing.sql` | replacement: lazy claim reads the seat clock under KEY SHARE with one advisory lock per (org, workspace, origin) |
+| `upstream:20261105043700_owner_buffered_read.sql` | function sessions.buffered_sessions_for |
+| `upstream:20261105043800_lazy_ack_clock_no_key_update.sql` | replacement: staged ACK locks the seat clock FOR NO KEY UPDATE (claims' KEY SHARE no longer queues behind it), then the bounded origin advisory lock before any slot |
+| `upstream:20261105043850_ingest_acquisition_owner.sql` | table sessions.ingest_acquisition_owners |
+| `upstream:20261105043860_buffered_search_gate.sql` | function sessions.buffered_search_gate_for |
+| `upstream:20261105043870_buffered_search_feed_cursor.sql` | table sessions.buffered_search_feed_cursors (needs the `buffered_search_feed_runtime` role from the role bootstrap: absent fails closed `42704`, elevated/member/unexpected member `55000`) |
+| `upstream:20261105043880_ingest_bookkeeping_cleanup.sql` | table sessions.ingest_bookkeeping_retired_claims + Babysitter register carries the retirement interlock |
+| `upstream:20261105043890_buffered_search_gate_retired_witness.sql` | replacement: buffered_search_gate_for hides claims with an ingest_bookkeeping_retired_claims tombstone (drop reason retired) |
+| `upstream:20261105043900_session_consumer_function_grants.sql` | twelve search_consumer_runtime EXECUTEs (composed writer path) |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
 | `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |
 | `96bulls:0004_summary_pointers.sql`                            | DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)                                          |
+
+**Buffered search feed role (`20261105043870`).** `buffered_search_feed_runtime` is created
+`NOLOGIN NOINHERIT` by `supabase/bootstrap/session_ingest_roles.sql` and its RDS and Cloud SQL
+variants (reserved in `hoopdb_runtime_role_rds.sql`), exactly like `bulls96_acquisition_installer`.
+The migration gives it `USAGE` on `sessions` and `EXECUTE` on the three feed RPCs only (no table
+right); each RPC admits only the genuine login (`session_user` is the role, role setting `none`).
+`hoopdb-migrate` runs the generated `supabase/bootstrap/buffered_search_feed_runtime_verify.sql` as
+the last phase 2 verifier. `supabase/bootstrap/buffered_search_feed_runtime_role.sql` grants LOGIN
+with the 5s/2s/10s timeout profile; run the verifier before and after it.
+`supabase/bootstrap/buffered_search_feed_runtime_role_nologin.sql` reverts it (NOLOGIN, password cleared,
+timeouts reset; same Khaliq OK, feeder flag off and credential dropped first; the verifier accepts the
+resulting bare profile). NOLOGIN and the cleared password stop new authentication only; pooled
+connections already open keep working, so treat the revert as runtime disarm only once the feeder
+flag is off and in-flight feed invocations have finished. The rollback revokes the
+schema `USAGE` and keeps the role. Applying the migration, the LOGIN step and provisioning the
+feeder's credential (secret fields `buffered_search_feed_database_url` /
+`buffered_search_feed_database_ca_pem`, password from 1Password, never on disk) each need Khaliq's
+separate, explicit OK; no deploy workflow sets them, and without them the feeder stays off.
 
 For each ALTER or replacement step (`20261025000300`, `20261030000000`,
 `20261102010000`, `20261102020000`, `0003`, `0004`),
@@ -517,7 +544,9 @@ config fails closed.
     the catalog gate. `cloudsql_migration_roles.sql` uses and drops a disposable
     CREATEROLE trampoline; dropping it removes PostgreSQL 16+ automatic creator
     memberships and leaves `anon`, `authenticated`, `service_role`, and the NOLOGIN
-    Worker membership-free. The Cloud SQL `service_role` is NOBYPASSRLS and exists only
+    Worker membership-free. The consumer role is not trampolined: the migration
+    owner provisions it with `session_consumer_roles.sql` and keeps the ADMIN
+    creator edge (N1). The Cloud SQL `service_role` is NOBYPASSRLS and exists only
     to satisfy shared migration grants; the GCP runtime never connects as it. The
     canonical verifier then proves the Worker role and grants.
   - **Amazon RDS for PostgreSQL (`rds` mode):** the same shape with AWS's internal
@@ -722,19 +751,28 @@ catalog shows that shape (`rds_profile_unproven`).
 **Order, as the migration owner, connected to the HoopDb database:**
 
 1. `rds_owner_function_default_revoke.sql`: the owner's exact global function default.
-2. `rds_migration_roles.sql`: the twelve fixed NOLOGIN roles (the Cloud SQL set,
-   including `bulls96_privacy_eraser` and `bulls96_babysitter_retention` required by
+2. `rds_migration_roles.sql`: the fixed NOLOGIN roles (the Cloud SQL set
+   minus the consumer role below, including `bulls96_privacy_eraser` and
+   `bulls96_babysitter_retention` required by
    041000 and 042000) through a disposable CREATEROLE
    trampoline, so they are membership-free (by design, afterwards only `rdsadmin` can alter
    or drop them).
-3. `hoopdb_runtime_role_rds.sql -v migration_owner=<owner> -v runtime_role=<role>
+3. `session_consumer_roles.sql`: the session-pipeline consumer's bare NOLOGIN
+   role, created directly by the migration owner (same pattern as the runtime
+   role in step 4), keeping the owner's unavoidable PG16+ ADMIN creator edge
+   so the owner can promote it to LOGIN after migrate. The trampoline
+   deliberately never provisions it: a trampoline copy would leave the owner
+   unable to promote it (42501), and the membership recheck would refuse the
+   edge.
+4. `hoopdb_runtime_role_rds.sql -v migration_owner=<owner> -v runtime_role=<role>
    -v runtime_login=true`: the runtime LOGIN role, PUBLIC TEMPORARY revoked, CONNECT
    granted, in one transaction. Then set its password from 1Password (never on
    disk).
-4. The phase 1 verifiers `session_directory_search_worker.sql`,
+5. The phase 1 files `session_directory_search_worker.sql`,
    `session_token_verifier.sql`, `session_ingest_roles.sql`, `session_read_api_roles.sql`
-   (here they only verify the existing roles).
-5. The migrator: `HOOPDB_DB_MODE=rds`, `HOOPDB_SUPABASE_SHIM=false` (or unset),
+   (here they only verify the existing roles) and the `session_consumer_roles.sql`
+   re-run (converges on the step-3 role).
+6. The migrator: `HOOPDB_DB_MODE=rds`, `HOOPDB_SUPABASE_SHIM=false` (or unset),
    `HOOPDB_ROLE_BOOTSTRAP` unset, `HOOPDB_RUNTIME_ROLE=<role>`,
    `HOOPDB_RUNTIME_ROLE_LOGIN=true`, `HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke`.
    Generation, ledger, sequence, checksum, exact-ACL and phase 2 checks are unchanged.
@@ -755,20 +793,22 @@ mode uses `global-default-revoke`).
   and `rdsadmin` is the recorded grantor of the master's PG16+ creator edges.
 - The master's attributes and memberships (`rds_superuser`, no SUPERUSER, CREATEROLE), that
   the master owns the customer-provisioned database, and that `rdsadmin` is the only SUPERUSER.
-- Steps 1-5 pass on the target engine version and parameter group, and the canonical
+- Steps 1-6 pass on the target engine version and parameter group, and the canonical
   readiness gate passes as the runtime role over TLS.
 - Rotating the runtime password as the master through the approved operator path,
   with 1Password as the system of record, keeps the exact creator edge. No rotation
   tool or live rotation proof is supplied here. IAM database authentication is NOT supported: it
   needs `rds_iam` membership, which the allowlist refuses.
 - `pg_trgm` and `btree_gin` are creatable by the master on the target version.
-- Snapshot restore and major-version upgrade keep the role graph so steps 1-5 rerun clean.
+- Snapshot restore and major-version upgrade keep the role graph so steps 1-6 rerun clean.
 - Post-migrate activation scripts that `ALTER ROLE` a fixed role to LOGIN
   (`session_ingest_role.sql`, `session_read_api_role.sql`,
   `canonical_project_events_role.sql`, `privacy_eraser_role.sql`,
   `babysitter_retention_role.sql`) cannot run as the master on trampoline-created
   roles (no ADMIN; 42501). Those LOGIN roles need a reviewed RDS path before activation
   (same structural question as Cloud SQL); migrate and readiness do not depend on them.
+  The consumer's `session_consumer_role.sql` is the exception: the owner created the
+  role in step 3, so the promotion runs as the master.
 
 **RDS activation needs its own reviewed path.** With this bootstrap's membership-free
 fixed-role graph, the customer migration owner has no ADMIN path to alter or drop

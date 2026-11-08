@@ -1,0 +1,138 @@
+{
+  "kind": "dual_worker_same_window_120s_closed_counts",
+  "startedAt": "2026-11-07T22:54:12.995162+00:00",
+  "finishedAt": "2026-11-07T22:56:13.827360+00:00",
+  "wallDurationSeconds": 120.047,
+  "stopReason": "duration_complete",
+  "sourceSha256": "12f1e979de63724d96e59042fdeaa24fd917afd3253855673233d41dcea9a76c",
+  "rawEventsOrErrorsPersisted": false,
+  "elapsedQualification": "runtimeWallTime is total only when emitted; logged duration_ms is a stage duration, not total public request latency; unknown is retained",
+  "countsAreSampleNotTenantCorrelation": true,
+  "workers": {
+    "relayhistory-api": {
+      "eventsParsed": 395,
+      "deliveryPostRequests": 78,
+      "responseStatuses": {
+        "503": 12,
+        "200": 64,
+        "429": 2
+      },
+      "errorClosedFieldRequestCounts": {
+        "503:outcome=forwarded": 12,
+        "429:outcome=forwarded": 2
+      },
+      "errorTemplateRequestCounts": {
+        "503:delivery forward": 12,
+        "429:delivery forward": 2
+      },
+      "errorTemplateKeywordRequestCounts": {
+        "503:forward": 12,
+        "429:forward": 2
+      },
+      "runtimeWallTimeBucketsByStatus": {
+        "503": {
+          "<5s": 7,
+          "5-12s": 5
+        },
+        "200": {
+          "<5s": 49,
+          "5-12s": 15
+        },
+        "429": {
+          "<5s": 2
+        }
+      },
+      "errorLoggedStageDurationBucketsByStatus": {
+        "503": {
+          "<5s": 8,
+          "5-12s": 5
+        },
+        "429": {
+          "<5s": 2
+        }
+      },
+      "errorClosedSignatures": {
+        "503:outcome=forwarded": 12,
+        "429:outcome=forwarded": 2
+      },
+      "errorsWithoutStructuredLogs": {},
+      "errorsWithoutClosedClassificationFields": {},
+      "exitCode": 0,
+      "cliAuthenticationError": false,
+      "prefixBytesDiscarded": 0,
+      "unparsedTrailingBytes": 0
+    },
+    "96bulls-session-ingest": {
+      "eventsParsed": 116,
+      "deliveryPostRequests": 116,
+      "responseStatuses": {
+        "503": 12,
+        "200": 101,
+        "429": 3
+      },
+      "errorClosedFieldRequestCounts": {
+        "503:db_error_class=timeout": 12,
+        "503:db_error_class=unknown": 12,
+        "503:stage=claim": 12,
+        "503:db_error_basis=message": 8,
+        "503:error_code=ledger_lock_timeout": 8,
+        "503:outcome=delivery_unavailable": 12,
+        "503:error_name=TypeError": 12,
+        "503:error_code=db_error": 12,
+        "503:db_error_code=55P03": 8,
+        "503:db_error_basis=none": 12,
+        "429:db_error_class=unknown": 3,
+        "429:error_name=TypeError": 3,
+        "429:error_code=db_error": 3,
+        "429:outcome=delivery_busy": 3,
+        "429:db_error_basis=none": 3,
+        "503:error_code=ledger_timeout": 4,
+        "503:db_error_basis=code": 4,
+        "503:db_error_code=57014": 4
+      },
+      "errorTemplateRequestCounts": {
+        "503:session ingest": 12,
+        "503:session ingest db error": 12,
+        "429:session ingest": 3,
+        "429:session ingest db error": 3
+      },
+      "errorTemplateKeywordRequestCounts": {
+        "503:ingest": 12,
+        "429:ingest": 3
+      },
+      "runtimeWallTimeBucketsByStatus": {
+        "503": {
+          "<5s": 8,
+          "5-12s": 4
+        },
+        "200": {
+          "<5s": 81,
+          "5-12s": 20
+        },
+        "429": {
+          "<5s": 3
+        }
+      },
+      "errorLoggedStageDurationBucketsByStatus": {
+        "503": {
+          "<5s": 8,
+          "5-12s": 4
+        },
+        "429": {
+          "<5s": 3
+        }
+      },
+      "errorClosedSignatures": {
+        "503:db_error_basis=message,db_error_basis=none,db_error_class=timeout,db_error_class=unknown,db_error_code=55P03,error_code=db_error,error_code=ledger_lock_timeout,error_name=TypeError,outcome=delivery_unavailable,stage=claim": 8,
+        "429:db_error_basis=none,db_error_class=unknown,error_code=db_error,error_name=TypeError,outcome=delivery_busy": 3,
+        "503:db_error_basis=code,db_error_basis=none,db_error_class=timeout,db_error_class=unknown,db_error_code=57014,error_code=db_error,error_code=ledger_timeout,error_name=TypeError,outcome=delivery_unavailable,stage=claim": 4
+      },
+      "errorsWithoutStructuredLogs": {},
+      "errorsWithoutClosedClassificationFields": {},
+      "exitCode": 0,
+      "cliAuthenticationError": false,
+      "prefixBytesDiscarded": 0,
+      "unparsedTrailingBytes": 0
+    }
+  }
+}

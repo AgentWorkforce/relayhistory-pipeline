@@ -89,6 +89,19 @@ export interface DeliverDeps {
   subrequestRedirects?: number;
   /** The current compiled schema generation (INGEST_EXPECT_GENERATION); every evidence write is fenced on it. Routing is inactive without it. */
   retentionGeneration?: string;
+  /**
+   * INGEST_STAGE_LATENCY_LOG=on: one `StageLatencyFields` line per deliver stage, successes and
+   * failures alike. Unset (the default): no line, no behaviour change.
+   */
+  stageLatency?: StageLatencyObserver;
+  /**
+   * Async admission only (async-admission.ts): runs AFTER a `claimed`/`resume` claim and BEFORE
+   * any slot, S3 write or receipt, and throws to refuse. The consumer uses it for the
+   * upload-time privacy fence (a reset or re-enable that started after the upload refuses
+   * the batch). Never set on the request path. A replay / replay_fast claim never calls it:
+   * those admit nothing new.
+   */
+  admissionGate?: () => Promise<void>;
 }
 
 /** Whether this deployment routes Babysitter upserts to retention buckets (see `DeliverDeps.babysitterRetention`). */
@@ -172,7 +185,7 @@ function revisionConflict(originId: string, conflicts: RevisionConflict[], count
   return new DeliveryError("delivery_conflict", 409, "Delivery record revision was reused with different content", items[0], items, count);
 }
 
-function batchIdConflict(prepared: PreparedDelivery, currentDigest: string): DeliveryError {
+export function batchIdConflict(prepared: PreparedDelivery, currentDigest: string): DeliveryError {
   return new DeliveryError("delivery_conflict", 409, "Delivery batch identity was reused with different content", {
     type: "batch_id",
     originId: prepared.originId,
@@ -182,13 +195,49 @@ function batchIdConflict(prepared: PreparedDelivery, currentDigest: string): Del
   });
 }
 
-async function stage<T>(name: string, work: () => Promise<T>): Promise<T> {
+/** One per-stage latency line (INGEST_STAGE_LATENCY_LOG=on; `DeliverDeps.stageLatency`): the deliver stage
+ * name, how it ended, its wall time and, for a ledger (database) failure, the SQLSTATE. Closed values
+ * only: no tenant data, no ids, no messages. Diagnostic only. */
+export interface StageLatencyFields {
+  route: "ingest.stage_latency";
+  stage: string;
+  /** ok | refused (a typed DeliveryError, e.g. 403 P0W01 or 409) | unavailable (the 503 IngestUnavailable). */
+  outcome: "ok" | "refused" | "unavailable";
+  duration_ms: number;
+  /** Present only for a database failure with a syntactically valid SQLSTATE (db-error-class.ts). */
+  sqlstate?: string;
+}
+export type StageLatencyObserver = (fields: StageLatencyFields) => void;
+
+const SQLSTATE_SHAPE = /^[0-9A-Z]{5}$/;
+
+/** The observer never changes the delivery: a throwing observer is ignored. */
+function observeStage(observe: StageLatencyObserver | undefined, fields: StageLatencyFields): void {
+  if (!observe) return;
+  try { observe(fields); } catch { /* diagnostic only */ }
+}
+
+async function runStage<T>(name: string, work: () => Promise<T>, observe?: StageLatencyObserver): Promise<T> {
+  const t0 = observe ? Date.now() : 0;
   try {
-    return await work();
+    const value = await work();
+    observeStage(observe, { route: "ingest.stage_latency", stage: name, outcome: "ok", duration_ms: Date.now() - t0 });
+    return value;
   } catch (error) {
-    if (error instanceof DeliveryError) throw error;
-    throw new IngestUnavailable(name, causeCode(error), error instanceof LedgerUnavailableError ? error.db : undefined);
+    // IngestUnavailable is itself a DeliveryError (503): rethrown unchanged as before, but labelled unavailable.
+    const passthrough = error instanceof DeliveryError;
+    const db = error instanceof LedgerUnavailableError || error instanceof IngestUnavailable ? error.db : undefined;
+    const sqlstate = db && SQLSTATE_SHAPE.test(db.db_error_code) ? db.db_error_code : undefined;
+    const outcome = passthrough && !(error instanceof IngestUnavailable) ? "refused" : "unavailable";
+    observeStage(observe, { route: "ingest.stage_latency", stage: name, outcome, duration_ms: Date.now() - t0, ...(sqlstate ? { sqlstate } : {}) });
+    if (passthrough) throw error;
+    throw new IngestUnavailable(name, causeCode(error), db);
   }
+}
+
+/** The stage wrapper bound to this delivery's observer (undefined, the default: no latency lines). */
+function stagesFor(deps: Pick<DeliverDeps, "stageLatency">) {
+  return <T>(name: string, work: () => Promise<T>): Promise<T> => runStage(name, work, deps.stageLatency);
 }
 
 export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batch: HistoryExportBatch): Promise<DeliverResult> {
@@ -212,6 +261,7 @@ export async function deliverPrepared(deps: DeliverDeps, tenant: LedgerTenant, p
 }
 
 async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prepared: PreparedDelivery, started: number, firstTiming: "prepare" | "precheck"): Promise<DeliverResult> {
+  const stage = stagesFor(deps);
   const now = deps.now ?? (() => new Date());
   const timing: Record<string, number> = {};
   let t = started;
@@ -249,6 +299,7 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
   if (claim.kind === "replay_fast")
     return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
 
+  if (deps.admissionGate) await stage("admission_gate", deps.admissionGate);
   // The deletion filter (records of sessions the user deleted from this origin are
   // acknowledged, not stored) and the replay fast path (records already stored at or
   // above their revision are acknowledged, not written again).
@@ -286,6 +337,7 @@ async function writeAndCommit(
   mark: (name: string) => void,
   now: () => Date,
 ): Promise<DeliverResult> {
+  const stage = stagesFor(deps);
   const machineId = liveMachineId(tenant.workspaceId, prepared.originId, tenant.userId);
   let written: WriteResult | null = null;
   let staged = false;

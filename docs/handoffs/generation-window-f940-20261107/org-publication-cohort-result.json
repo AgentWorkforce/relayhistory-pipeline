@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "kind": "org_publication_cohort_readonly",
+  "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "sqlSha256": "bc431aa6f55eefc755126f5d7a8536c4b72e1f7ede9ff9c40ee65bd6c39481fd",
+  "startedAt": "2026-11-07T20:12:23.033Z",
+  "orgResolution": {
+    "exactlyOneOrgMatched": false,
+    "source": "durable ingest_fence_owners exact workspace/user scope; no external org-directory freshness claim"
+  },
+  "preflightRows": [
+    {
+      "expected_owner_route": true,
+      "tables_visible": true,
+      "any_rls_active": false
+    }
+  ],
+  "executionRole": "postgres/sessioncli, READ ONLY",
+  "productionWrites": false,
+  "status": "org_resolution_refused",
+  "cohortExecuted": false,
+  "result": "UNKNOWN",
+  "completedAt": "2026-11-07T20:12:24.138Z"
+}

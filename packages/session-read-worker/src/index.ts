@@ -20,10 +20,36 @@
  * and timing canary allowlist; unset = none), READ_API_BRIEF_TITLES_WORKSPACES (the
  * brief-titles allowlist; unset = none), READ_API_TIMING_ASSUME_NO_TURNS, and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
- * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve).
+ * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve), and
+ * RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS with RELAYCONTROL_INTROSPECT_URL /
+ * RELAYCONTROL_INTROSPECT_SECRET (relaycontrol `sh_at_` tokens; default off,
+ * unset in wrangler.jsonc).
+ *
+ * Owner-only buffered reads (src/session-read-api/owner-buffered.ts, Option C):
+ * RELAYHISTORY_READ_OWNER_BUFFERED (default off; only "1" or "true" enables), with
+ * INGEST_S3_BUCKET / INGEST_S3_REGION naming the ingest bucket that holds the
+ * buffered-batches/ stage objects, read with the PIPELINE_RAW_S3_ACCESS_KEY_ID /
+ * _SECRET_ACCESS_KEY principal (GetObject + kms:Decrypt on buffered-batches/ is a
+ * separate IAM grant). Off, or any of those missing: no buffered read, every route
+ * exactly as without the flag. Every buffered response passes the privacy authority gate,
+ * the HISTORY_CONTROL_HEAD service binding to relayhistory-cloud's named entrypoint
+ * SessionReadPrivacyControls (pinned with `entrypoint` in wrangler config; never a public
+ * route), R2 control-head contract v5, wire frozen at relayhistory-cloud #328 a06a58f9:
+ * GET /v1/session-read/control-head, no query string, no body, identity only in
+ * x-relayhistory-org-id / -workspace-id / -user-id from the verified token, 2 s deadline,
+ * no-store both ways, no caching. Flag on with the binding absent: every request answers 503
+ * backend_unavailable (logged missing_HISTORY_CONTROL_HEAD), the same fail-closed rule as a missing
+ * Hyperdrive binding. READ_API_OWNER_BUFFERED_WORKSPACES is the owner-buffered canary allowlist (on
+ * top of READ_API_DIRECTORY_WORKSPACES; unset = none; "*" = all-workspaces mode, which the deploy
+ * render accepts only with READ_API_DIRECTORY_WORKSPACES="*" and which never bypasses the per-user
+ * privacy gate). READ_API_OWNER_BUFFERED_EVENTS=on (default off; any value but unset/empty/"on" answers
+ * 503) adds owner-buffered session events on GET /v1/sessions/:sessionId/events with `source`; it
+ * has no effect without the owner-buffered flag and allowlists. Flag, allowlist, bucket and binding are
+ * all unset in wrangler.jsonc; only the deploy workflow's owner_buffered=on render
+ * (scripts/render-deploy-config.ts) adds them.
  */
 import pg from "pg";
-import { decompress } from "fzstd";
+import { Decompress, decompress } from "fzstd";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
@@ -38,9 +64,20 @@ import { createClickHouseClient, type ClickHouseClient, type RequestOptions } fr
 import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-read-api/app.ts";
 import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
 import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
-import { relayAuthVerifier } from "../../../src/session-read-api/auth.ts";
-import { sqlLiveness, TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
+import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
+import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
+import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
+import {
+  createBufferedSearchGate,
+  parseBufferedSearchGate,
+  serviceBindingControlHeads,
+  sqlGateStore,
+  type BufferedSearchGate,
+  type ServiceBinding,
+} from "../../../src/session-read-api/buffered-search-gate.ts";
+import { createS3Store } from "../../../src/shared/vendor.ts";
+import { boundedStreamDecompress, ownerBufferedEnabled, ownerBufferedEventsEnabled, serviceBindingControlHead, sqlOwnerBufferedReads, type OwnerBufferedDeps } from "../../../src/session-read-api/owner-buffered.ts";
 
 export interface Env extends CanonicalEnv {
   SUPABASE: Hyperdrive;
@@ -60,8 +97,56 @@ export interface Env extends CanonicalEnv {
   READ_API_BABYSITTER_EVIDENCE?: string;
   /** The ingest key root the retention buckets live under (default 96bulls). */
   READ_API_BABYSITTER_KEY_ROOT?: string;
+  /**
+   * The per-hit R2 privacy gate for buffered-origin search rows: only "on" enables; default off
+   * (src/session-read-api/buffered-search-gate.ts). It reads the same privacy authority as
+   * owner-buffered reads, the HISTORY_CONTROL_HEAD binding below; on without it, every
+   * buffered-origin row is dropped.
+   */
+  READ_API_BUFFERED_SEARCH_GATE?: string;
+  /**
+   * Tenant read transactions at REPEATABLE READ: only "1" enables; unset/"0" (default) keeps
+   * `BEGIN READ ONLY` at READ COMMITTED (see requestTenantRunner).
+   */
+  READ_API_REPEATABLE_READ?: string;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
+  /** Exactly "true" also accepts relaycontrol `sh_at_` tokens; default off. */
+  RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS?: string;
+  RELAYCONTROL_INTROSPECT_URL?: string;
+  RELAYCONTROL_INTROSPECT_SECRET?: string;
+  /** Owner-only buffered reads (Option C): only "1" or "true" enables; default off. */
+  RELAYHISTORY_READ_OWNER_BUFFERED?: string;
+  /**
+   * Owner-buffered session events (GET /v1/sessions/:sessionId/events with `source`): unset or
+   * empty = off (default), exactly "on" enables, any other value refuses every request (503,
+   * logged missing_READ_API_OWNER_BUFFERED_EVENTS). No effect unless
+   * RELAYHISTORY_READ_OWNER_BUFFERED is on and the workspace is on both allowlists.
+   */
+  READ_API_OWNER_BUFFERED_EVENTS?: string;
+  /** The owner-buffered canary allowlist (parseDirectoryWorkspaces syntax); unset/empty = none. */
+  READ_API_OWNER_BUFFERED_WORKSPACES?: string;
+  /** The ingest bucket holding buffered-batches/ stage objects (owner-buffered reads only). */
+  INGEST_S3_BUCKET?: string;
+  /** Its region; default us-east-1. */
+  INGEST_S3_REGION?: string;
+  /**
+   * The privacy authority for owner-buffered reads: a service binding to relayhistory-cloud's
+   * named entrypoint SessionReadPrivacyControls (control-head contract v5, frozen wire
+   * #328 a06a58f9, GET /v1/session-read/control-head). Unbound = every buffered read fenced.
+   */
+  HISTORY_CONTROL_HEAD?: Fetcher;
+}
+
+/** The read verifier's config from Worker env; the introspection URL passes the https/loopback rule. */
+export function workerAuthConfig(env: Env): AuthConfig {
+  const config: AuthConfig = { origin: env.READ_API_ORIGIN?.trim() || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL?.trim() || undefined, issuer: env.RELAYAUTH_ISSUER?.trim() || undefined };
+  if (env.RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS === "true") {
+    const url = env.RELAYCONTROL_INTROSPECT_URL?.trim() || undefined;
+    if (url) assertDestinationUrl("RELAYCONTROL_INTROSPECT_URL", url, destinationPolicy({}));
+    config.relaycontrol = { url, secret: env.RELAYCONTROL_INTROSPECT_SECRET?.trim() || undefined };
+  }
+  return config;
 }
 
 const SERVICE = "96bulls-session-read-worker";
@@ -120,14 +205,27 @@ export function clickHouseConfig(env: Env) {
  * Hyperdrive guidance is a client per request (Hyperdrive pools the origin
  * connections), closed after the response. Checks are serialized on the one
  * client, so two transactions never interleave on it.
+ *
+ * Isolation (READ_API_REPEATABLE_READ, default off): off, each transaction is
+ * `BEGIN READ ONLY` at READ COMMITTED, so every statement takes its own
+ * snapshot. On ("1"), it is REPEATABLE READ READ ONLY: every statement reads
+ * ONE snapshot (taken at its first statement), so a check that issues several
+ * statements (the buffered search gate's 500-hit chunks, the owner-buffered
+ * scope then list) judges them all against the same database state. Every
+ * consumer only reads, and a read-only REPEATABLE READ transaction never fails
+ * serialization. It is flagged because Hyperdrive's handling of it is unproven.
  */
-export function requestTenantRunner(connect: () => Promise<pg.Client>): { run: TenantRunner; close(): Promise<void> } {
+export function requestTenantRunner(
+  connect: () => Promise<pg.Client>,
+  options: { repeatableRead?: boolean } = {},
+): { run: TenantRunner; close(): Promise<void> } {
+  const begin = tenantBeginSql(options.repeatableRead === true);
   let client: Promise<pg.Client> | undefined;
   let tail: Promise<unknown> = Promise.resolve();
   const run: TenantRunner = (orgId, workspaceId, work) => {
     const next = tail.then(async () => {
       const c = await (client ??= connect());
-      await c.query("BEGIN READ ONLY");
+      await c.query(begin);
       try {
         await c.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]);
         const q: SqlQuery = {
@@ -195,21 +293,35 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   if (request.method !== "GET") return json(405, "method_not_allowed", "GET only", { allow: "GET" });
   let ch: ClickHouseClient;
   let completeSinceMs: number;
+  let authConfig: AuthConfig;
   try {
     completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
+    authConfig = workerAuthConfig(env);
     ch = boundedClickHouse(createClickHouseClient(clickHouseConfig(env), overrides.fetcher));
     if (!overrides.connect && !env.SUPABASE?.connectionString) throw new ConfigError("SUPABASE");
+    // Owner-buffered on needs its privacy authority bound; refuse every request rather than run
+    // a deploy whose flag says on and whose gate can only fence.
+    if (ownerBufferedEnabled(env.RELAYHISTORY_READ_OWNER_BUFFERED) && typeof env.HISTORY_CONTROL_HEAD?.fetch !== "function") throw new ConfigError("HISTORY_CONTROL_HEAD");
+    // The events flag accepts only unset/empty or "on"; anything else is a misconfigured deploy.
+    try {
+      ownerBufferedEventsEnabled(env.READ_API_OWNER_BUFFERED_EVENTS);
+    } catch {
+      throw new ConfigError("READ_API_OWNER_BUFFERED_EVENTS");
+    }
   } catch (error) {
     // Configuration errors name a field, never a value.
     log("error", "read worker not configured", { error_code: error instanceof ConfigError ? `missing_${error.field}` : (error as { name?: string })?.name ?? "config" });
     return json(503, "backend_unavailable", "read backend unavailable");
   }
-  const tenant = requestTenantRunner(overrides.connect ?? hyperdriveClient(env.SUPABASE));
+  const tenant = requestTenantRunner(overrides.connect ?? hyperdriveClient(env.SUPABASE), {
+    repeatableRead: repeatableReadEnabled(env.READ_API_REPEATABLE_READ),
+  });
   const app = createReadApi({
     timing: timingDeps(env, tenant.run, overrides.fetcher),
     turns: turnsDeps(env, tenant.run, overrides.fetcher),
     babysitter: babysitterEvidenceDeps(env, tenant.run, overrides.fetcher),
-    verify: relayAuthVerifier({ origin: env.READ_API_ORIGIN?.trim() || undefined, jwksUrl: env.RELAYAUTH_JWKS_URL?.trim() || undefined, issuer: env.RELAYAUTH_ISSUER?.trim() || undefined }),
+    ownerBuffered: ownerBufferedDeps(env, tenant.run, overrides.fetcher),
+    verify: readApiVerifier(authConfig),
     ch,
     liveness: sqlLiveness(tenant.run),
     directory: sqlDirectory(tenant.run),
@@ -217,6 +329,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     briefTitles: sqlBriefTitles(tenant.run),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
+    bufferedSearchGate: bufferedSearchGate(env, tenant.run),
     log: (fields) => log("info", "session read", fields),
   });
   try {
@@ -224,6 +337,17 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   } finally {
     ctx.waitUntil(tenant.close());
   }
+}
+
+/**
+ * The buffered search gate, per request (control heads are never cached across requests).
+ * Off unless READ_API_BUFFERED_SEARCH_GATE=on.
+ */
+export function bufferedSearchGate(env: Env, run: TenantRunner): BufferedSearchGate | undefined {
+  if (!parseBufferedSearchGate(env.READ_API_BUFFERED_SEARCH_GATE)) return undefined;
+  const binding: ServiceBinding | undefined = typeof env.HISTORY_CONTROL_HEAD?.fetch === "function" ? env.HISTORY_CONTROL_HEAD : undefined;
+  if (!binding) log("warn", "buffered search gate on without HISTORY_CONTROL_HEAD: buffered rows are dropped", {});
+  return createBufferedSearchGate({ controlHeads: binding ? serviceBindingControlHeads(binding) : undefined, store: sqlGateStore(run) });
 }
 
 /**
@@ -283,6 +407,41 @@ export function babysitterEvidenceDeps(env: Env, run: TenantRunner, fetcher: typ
   const storeFor = (signal: AbortSignal) =>
     rawStoreFromEnv(env, ((input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal })) as typeof fetch)?.store;
   return sqlEvidenceDeps(run as never, storeFor as never, (body) => readAll(body as never) /* the bound fetch aborts the body stream too */, (bytes) => decompress(bytes), (key) => objectKey(key) as never, keyRoot);
+}
+
+/**
+ * Owner-only buffered reads (Option C): the two SECURITY DEFINER readers through the read role
+ * (tenant-bound, user bound per call) and GetObject on the ingest bucket's buffered-batches/
+ * stage objects, gated by the HISTORY_CONTROL_HEAD binding (absent with the flag on: handle()
+ * answers 503 before this runs; the gate still fences if it ever is). Served only to
+ * workspaces on READ_API_OWNER_BUFFERED_WORKSPACES (and the directory allowlist). Undefined unless RELAYHISTORY_READ_OWNER_BUFFERED is "1"/"true", the bucket
+ * is named and the raw-store keys exist.
+ */
+export function ownerBufferedDeps(env: Env, run: TenantRunner, fetcher: typeof fetch = (input, init) => fetch(input, init)): OwnerBufferedDeps | undefined {
+  if (!ownerBufferedEnabled(env.RELAYHISTORY_READ_OWNER_BUFFERED)) return undefined;
+  const bucket = env.INGEST_S3_BUCKET?.trim();
+  const accessKeyId = env.PIPELINE_RAW_S3_ACCESS_KEY_ID;
+  const secretAccessKey = env.PIPELINE_RAW_S3_SECRET_ACCESS_KEY;
+  if (!bucket || !accessKeyId || !secretAccessKey) return undefined;
+  return {
+    enabled: true,
+    workspaces: parseDirectoryWorkspaces(env.READ_API_OWNER_BUFFERED_WORKSPACES),
+    reads: sqlOwnerBufferedReads(run),
+    gate: serviceBindingControlHead(env.HISTORY_CONTROL_HEAD),
+    store: createS3Store({ bucket, region: env.INGEST_S3_REGION?.trim() || "us-east-1", credentials: { accessKeyId, secretAccessKey }, fetch: fetcher }),
+    decompress: boundedStreamDecompress(Decompress) /* stops at the bound; fzstd's one-shot form with a fixed buffer silently truncates */,
+    // Session events from buffered stages only with READ_API_OWNER_BUFFERED_EVENTS=on (handle() refused any other value).
+    ...(ownerBufferedEventsFlag(env) ? { events: true } : {}),
+  };
+}
+
+/** READ_API_OWNER_BUFFERED_EVENTS as a boolean; a refused value is off here (handle() already answered 503 for it). */
+function ownerBufferedEventsFlag(env: Env): boolean {
+  try {
+    return ownerBufferedEventsEnabled(env.READ_API_OWNER_BUFFERED_EVENTS);
+  } catch {
+    return false;
+  }
 }
 
 export default {

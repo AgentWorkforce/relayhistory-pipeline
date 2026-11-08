@@ -2,7 +2,6 @@
  * No environment reads, provider requests, clients or resources are created. */
 import type {
   ClickHouseClient,
-  QueryParams,
 } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import {
   featureVersion,
@@ -12,6 +11,7 @@ import {
   type FeatureReference,
 } from "./source.ts";
 import { BRIEF_FEATURES_TABLE } from "./brief-schema.ts";
+import { featureRetirementCommands } from "./feature-retirement.ts";
 export class BriefFeatureError extends Error {
   constructor(readonly reason: string) {
     super("Brief feature publication refused");
@@ -157,27 +157,9 @@ export async function publishBriefFeatureSnapshots(
   deps.signal?.throwIfAborted();
   try {
     await deps.ch.insert(BRIEF_FEATURES_TABLE, rows);
-    const erased = rows.filter((r) => r.deleted === 1);
-    if (erased.length) {
-      const params: QueryParams = {},
-        where = erased.map((r, n) => {
-          for (const [f, k] of [
-            ["org_id", "o"],
-            ["workspace_id", "w"],
-            ["source", "h"],
-            ["session_id", "s"],
-            ["version", "v"],
-          ] as const)
-            params[k + n] = r[f] as string;
-          return `(org_id={o${n}:String} AND workspace_id={w${n}:String} AND source={h${n}:String} AND session_id={s${n}:String} AND version<{v${n}:UInt64})`;
-        });
-      await deps.ch.command(
-        `DELETE FROM ${BRIEF_FEATURES_TABLE} WHERE ${where.join(" OR ")}`,
-        {
-          params,
-          settings: { lightweight_deletes_sync: 2, max_query_size: 1048576 },
-        },
-      );
+    for (const command of featureRetirementCommands(BRIEF_FEATURES_TABLE, rows)) {
+      deps.signal?.throwIfAborted();
+      await deps.ch.command(command.query, command.options);
     }
     deps.signal?.throwIfAborted();
     const current = await readFeatureSnapshots(

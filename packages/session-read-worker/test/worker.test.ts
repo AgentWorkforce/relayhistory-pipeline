@@ -11,7 +11,7 @@ import type pg from "pg";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createClickHouseClient, type ClickHouseClient } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { row } from "../../../src/session-read-api/__tests__/support.ts";
-import { boundedClickHouse, connectPg, handle, type Env } from "../src/index.ts";
+import { boundedClickHouse, connectPg, handle, ownerBufferedDeps, type Env } from "../src/index.ts";
 
 type TestEnv = Env & {
   TEST_PG_ADMIN: Hyperdrive;
@@ -148,6 +148,101 @@ describe("entry and configuration", () => {
     const noOrigin = await call({ READ_API_ORIGIN: "" });
     expect(noOrigin.status).toBe(401);
     expect((await body(noOrigin)).error.code).toBe("not_configured");
+  });
+
+  test("owner-buffered on without the HISTORY_CONTROL_HEAD binding refuses every request with a 503; off or bound, it does not", async () => {
+    const t = tenant();
+    const calls: string[] = [];
+    const binding = { fetch: async (input: RequestInfo | URL) => (calls.push(String(input)), new Response("{}", { status: 503 })) } as unknown as Fetcher;
+    const call = async (path: string, over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}${path}`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const on = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: t.ws, READ_API_DIRECTORY_WORKSPACES: t.ws, INGEST_S3_BUCKET: "ingest-bucket-example" };
+    for (const flag of ["true", "1", " true "]) {
+      for (const unbound of [{}, { HISTORY_CONTROL_HEAD: undefined }, { HISTORY_CONTROL_HEAD: {} as unknown as Fetcher }]) {
+        for (const path of [`/v1/events?workspace=${t.ws}&q=x`, `/v1/sessions?workspace=${t.ws}`, `/v1/sessions/s-x/turns?workspace=${t.ws}&source=claude`]) {
+          const r = await call(path, { ...on, RELAYHISTORY_READ_OWNER_BUFFERED: flag, ...unbound });
+          expect(r.status, `${flag} ${path}`).toBe(503);
+          expect((await body(r)).error.code).toBe("backend_unavailable");
+        }
+      }
+    }
+    // Off (the default deploy) never needs the binding and never calls it.
+    for (const flag of [undefined, "", "false", "0"]) {
+      const r = await call(`/v1/events?workspace=${t.ws}&q=x`, { ...on, RELAYHISTORY_READ_OWNER_BUFFERED: flag });
+      expect(r.status, String(flag)).not.toBe(503);
+    }
+    // On and bound: the config check passes (the request is not refused for configuration).
+    const bound = await call(`/v1/events?workspace=${t.ws}&q=x`, { ...on, HISTORY_CONTROL_HEAD: binding });
+    expect(bound.status).not.toBe(503);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("all-workspaces mode (READ_API_OWNER_BUFFERED_WORKSPACES=*): parsed as *, still needs the flag, keys and binding; default stays none", () => {
+    const run = (async () => {
+      throw new Error("no database in this test");
+    }) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: "*" } as Env, run)?.workspaces).toBe("*");
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: " * " } as Env, run)?.workspaces).toBe("*");
+    // Unset (the default deploy) is none, never all; "*" mixed with ids is a literal id no workspace has.
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: undefined } as Env, run)?.workspaces).toEqual(new Set());
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: "ws-a,*" } as Env, run)?.workspaces).toEqual(new Set(["ws-a", "*"]));
+    // "*" alone does not turn the feature on: flag off or S3 keys missing is still undefined.
+    for (const over of [{ RELAYHISTORY_READ_OWNER_BUFFERED: undefined }, { RELAYHISTORY_READ_OWNER_BUFFERED: "false" }, { INGEST_S3_BUCKET: "" }, { PIPELINE_RAW_S3_ACCESS_KEY_ID: undefined }]) {
+      expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_WORKSPACES: "*", ...over } as Env, run), JSON.stringify(over)).toBeUndefined();
+    }
+  });
+
+  test("READ_API_OWNER_BUFFERED_EVENTS: only \"on\" sets events; unset/empty leaves the deps unchanged; any other value is a 503 before any read", async () => {
+    const run = (async () => {
+      throw new Error("no database in this test");
+    }) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "ws-a", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    const keysOf = (d: object | undefined) => Object.keys(d ?? {}).sort();
+    const base = ownerBufferedDeps({ ...E, ...keys } as Env, run);
+    expect(base).toBeDefined();
+    expect("events" in base!).toBe(false);
+    for (const flag of [undefined, ""]) {
+      const d = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_EVENTS: flag } as Env, run);
+      expect(keysOf(d), String(flag)).toEqual(keysOf(base));
+      expect("events" in d!).toBe(false);
+    }
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_EVENTS: "on" } as Env, run)?.events).toBe(true);
+    // The events flag alone never enables owner-buffered reads.
+    expect(ownerBufferedDeps({ ...E, ...keys, RELAYHISTORY_READ_OWNER_BUFFERED: undefined, READ_API_OWNER_BUFFERED_EVENTS: "on" } as Env, run)).toBeUndefined();
+
+    const t = tenant();
+    const call = async (over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions/s-x/events?workspace=${t.ws}&source=claude`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    for (const bad of ["true", "1", "ON", " on", "off", "yes"]) {
+      const r = await call({ READ_API_OWNER_BUFFERED_EVENTS: bad });
+      expect(r.status, bad).toBe(503);
+      expect((await body(r)).error.code).toBe("backend_unavailable");
+    }
+  });
+
+  test("all-workspaces mode without the HISTORY_CONTROL_HEAD binding is the same 503; bound, it is not refused", async () => {
+    const t = tenant();
+    const call = async (over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions?workspace=${t.ws}`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const all = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "*", READ_API_DIRECTORY_WORKSPACES: "*", INGEST_S3_BUCKET: "ingest-bucket-example" };
+    const unbound = await call(all);
+    expect(unbound.status).toBe(503);
+    expect((await body(unbound)).error.code).toBe("backend_unavailable");
+    const binding = { fetch: async () => new Response("{}", { status: 503 }) } as unknown as Fetcher;
+    expect((await call({ ...all, HISTORY_CONTROL_HEAD: binding })).status).not.toBe(503);
   });
 
   test("Supabase or ClickHouse down is a 503 the caller falls back from, never a page without erasure checks", async () => {

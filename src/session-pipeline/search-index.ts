@@ -51,6 +51,8 @@ import { scopeLockKey, type SessionScope } from "./pointer.ts";
 import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
 import { adapterProjectionIo, type SearchProjectionIo, type SearchServiceBinding } from "./search-adapter.ts";
+/** Kept in sync with buffered-search-feed.ts (not imported: that module pulls in the ingest stage reader). */
+const BUFFERED_FINGERPRINT_PREFIX = "bf";
 
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
 
@@ -327,6 +329,10 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
         const current = wanted.get(key);
         for (const c of list) {
           if (!regenerable.has(c.kind)) continue;
+          // A buffered-origin row (buffered-search-feed.ts) holds a record S3 manifests do not carry
+          // yet: absent from S3 is not "retracted". It is replaced once canonical carries the same
+          // event; erasure of the session (no live pointer, above) still removes it.
+          if (!current && c.fingerprint.startsWith(BUFFERED_FINGERPRINT_PREFIX)) continue;
           if (!current || current.session_id !== c.sessionId || current.workspace_id !== c.workspaceId || tsMillis(`${current.ts.replace(" ", "T")}Z`) !== c.tsMs)
             deletes.push(c);
         }

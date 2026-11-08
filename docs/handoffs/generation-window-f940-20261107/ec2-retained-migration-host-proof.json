@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-04T02:55:56.700124+00:00",
+  "instance_id": "i-070f91abb67aa60de",
+  "instance_type": "r7i.2xlarge",
+  "vcpus": 8,
+  "memory_gib": 64,
+  "command_status": "Success",
+  "output": "active\nenabled\nNextElapseUSecRealtime=Wed 2026-11-04 07:47:43 UTC\nActiveState=active\nCPUs=8\nMemoryKiB=64778588\n25.0.18\n",
+  "same_instance_retained": true,
+  "expiry_utc": "2026-11-04T07:47:43Z",
+  "app_enabled": false,
+  "application_access_policy": false
+}

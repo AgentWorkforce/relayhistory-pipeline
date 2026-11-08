@@ -12,7 +12,7 @@
 import type { PipelineRuntimeAdapter } from "../runtime/contracts.js";
 import { createWorkerRuntime, type WorkSource } from "../runtime/workers.js";
 import type { SearchIndexAdapter } from "../search-index/contracts.js";
-import { createPostgresSearchIndex, type SqlClient } from "../search-index/postgres.js";
+import { createPostgresSearchIndex, type SqlClient, type TenantSqlRunner } from "../search-index/postgres.js";
 import {
   createOpenSearchSearchIndex,
   MAX_OPENSEARCH_TIMEOUT_MS,
@@ -36,6 +36,9 @@ export interface SearchFactoryInput {
   readonly env: Readonly<Record<string, string | undefined>>;
   /** The HoopDb (or a dedicated) Postgres for the postgres backend. */
   readonly sql?: SqlClient;
+  /** Tenant transactions for the postgres backend's tenant-scoped statements
+   * (a reader's pool runner). Omitted: the statements bind the tenant on `sql`. */
+  readonly tenantRunner?: TenantSqlRunner;
   readonly secrets?: Readonly<Record<string, string | undefined>>;
   /** Composition-specific clients (ClickHouse client, AWS credential provider, fetch). */
   readonly extras?: Readonly<Record<string, unknown>>;
@@ -57,6 +60,7 @@ function registerPostgres(registry: SearchIndexRegistry): void {
       if (!input.sql) throw new Error("SEARCH_INDEX_BACKEND=postgres needs a Postgres client");
       return createPostgresSearchIndex({
         client: input.sql,
+        ...(input.tenantRunner ? { tenantRunner: input.tenantRunner } : {}),
         ...(input.env.SEARCH_INDEX_POSTGRES_SCHEMA ? { schema: input.env.SEARCH_INDEX_POSTGRES_SCHEMA } : {}),
       });
     },
