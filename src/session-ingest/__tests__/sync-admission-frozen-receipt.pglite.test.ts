@@ -12,6 +12,7 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { sqlLedger } from "../ledger-sql.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import type { Ledger } from "../ledger.ts";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SIGNATURE_HEADER, signRequest, SYNC_SCOPE, type IngestIdentity } from "../app.ts";
 import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY, ADMISSION_QUEUED, syncAdmissionFrozenReceiptMode, type AdmissionMessage, type AsyncAdmissionMode } from "../async-admission.ts";
@@ -31,7 +32,7 @@ async function fixture() {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } }); open.push(() => db.close());
   const read = (p: string) => readFileSync(join(root, p), "utf8");
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
+  for (const file of SESSION_BOOTSTRAP_FILES) await db.exec(read(file));
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await db.exec(read("supabase/migrations/" + f));
   await db.exec("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','" + generation + "','pass')");
   const owner = async (name: string, p: unknown) => (await db.query("SELECT sessions." + name + "($1::jsonb) AS r", [JSON.stringify(p)])).rows[0];

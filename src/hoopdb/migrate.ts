@@ -901,9 +901,19 @@ async function cliHistoryPreflight(
     throw err;
   }
   if (cliHistory) {
-    const versions = schema
+    const upstreamNames = new Set(schema
       .filter((st) => st.name.startsWith("upstream:"))
-      .map((st) => st.name.slice("upstream:".length).split("_")[0]!);
+      .map((st) => st.name));
+    // Renaming a released file must not hide a second migration authority.
+    // Check both version spellings whenever either member is in this plan.
+    for (const alias of RELEASED_MIGRATION_NAME_ALIASES) {
+      if (upstreamNames.has(alias.current) || upstreamNames.has(alias.original)) {
+        upstreamNames.add(alias.original);
+        upstreamNames.add(alias.current);
+      }
+    }
+    const versions = [...new Set([...upstreamNames]
+      .map((name) => name.slice("upstream:".length).split("_")[0]!))].sort();
     let hit: { version: string }[];
     try {
       hit = (

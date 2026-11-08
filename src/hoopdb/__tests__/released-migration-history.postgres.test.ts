@@ -53,6 +53,19 @@ native("native PG17: released image ledger upgrades in place as unchanged non-CR
   const relationOwners=(await owner.query("SELECT c.relname,c.relkind,c.relowner FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='sessions' ORDER BY c.relname")).rows;
   expect((await owner.query("SELECT has_function_privilege('bulls96_session_ingest_seeder','sessions.ingest_seed_records(jsonb)','EXECUTE') AS ok")).rows[0]?.ok).toBe(true);
   const rawBinding=migrationLedgerSha256(new Map((await liveRows(owner)).map(r=>[r.name,r.sha256])));
+  // Both released and renamed CLI versions remain a second authority. Refuse
+  // before changing the physical history, seeded data, or readiness marker.
+  await owner.query("CREATE SCHEMA supabase_migrations; CREATE TABLE supabase_migrations.schema_migrations(version text PRIMARY KEY)");
+  const markerBeforeCli=(await owner.query("SELECT * FROM sessions.__96bulls_role_validation")).rows;
+  const cliVersions=[...new Set(RELEASED_MIGRATION_NAME_ALIASES.flatMap(a=>[a.original,a.current].map(name=>name.slice("upstream:".length).split("_")[0]!)))];
+  for(const version of cliVersions){
+   await owner.query("INSERT INTO supabase_migrations.schema_migrations(version) VALUES($1)",[version]);
+   expect((await rejected(runMigrations(sql(owner),{profile:next,expectedLedgerSha256:rawBinding})))?.code).toBe("mixed_migration_authority");
+   expect(await liveRows(owner)).toEqual(rows);
+   expect(await selected(owner)).toEqual(preserved);
+   expect((await owner.query("SELECT * FROM sessions.__96bulls_role_validation")).rows).toEqual(markerBeforeCli);
+   await owner.query("DELETE FROM supabase_migrations.schema_migrations WHERE version=$1",[version]);
+  }
   const applied=await runMigrations(sql(owner),{profile:next,expectedLedgerSha256:rawBinding});
   expect(applied.applied).toBeGreaterThan(0);
   expect(await selected(owner)).toEqual(preserved);

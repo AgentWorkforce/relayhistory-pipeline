@@ -111,6 +111,31 @@ async function oldDatabase() {
   return db;
 }
 
+test("CLI history under either released or current version refuses without changing history, data or marker", async () => {
+  const db = await oldDatabase();
+  await db.exec("CREATE SCHEMA supabase_migrations; CREATE TABLE supabase_migrations.schema_migrations(version text PRIMARY KEY)");
+  const physicalBefore = await stored(db);
+  const dataBefore = (await db.query("SELECT * FROM sessions.session_index")).rows;
+  const markerBefore = (await db.query("SELECT * FROM sessions.__96bulls_role_validation")).rows;
+  const versions = [...new Set(RELEASED_MIGRATION_NAME_ALIASES.flatMap(alias =>
+    [alias.original, alias.current].map(name => name.slice("upstream:".length).split("_")[0]!)))];
+  expect(versions.sort()).toEqual(["20261102010000", "20261103010000", "20261104021000", "20261104022000"]);
+  expect(markerBefore).toHaveLength(1);
+  expect(markerBefore[0]?.status).toBe("pending");
+  const originals = new Map<string, string>(RELEASED_MIGRATION_NAME_ALIASES.map(alias => [alias.current, alias.original]));
+  const releasedSteps = (await plan(SELFHOSTED))
+    .map(step => ({ ...step, name: originals.get(step.name) ?? step.name }))
+    .filter(step => physicalBefore.some(row => row.name === step.name));
+  for (const steps of [undefined, releasedSteps]) for (const version of versions) {
+    await db.query("INSERT INTO supabase_migrations.schema_migrations(version) VALUES($1)", [version]);
+    expect((await failure(runMigrations(client(db), { profile: SELFHOSTED, steps })))?.code).toBe("mixed_migration_authority");
+    expect(await stored(db)).toEqual(physicalBefore);
+    expect((await db.query("SELECT * FROM sessions.session_index")).rows).toEqual(dataBefore);
+    expect((await db.query("SELECT * FROM sessions.__96bulls_role_validation")).rows).toEqual(markerBefore);
+    await db.query("DELETE FROM supabase_migrations.schema_migrations WHERE version=$1", [version]);
+  }
+});
+
 test("real released history upgrades through every repair, preserves rows/owners/physical ledger, and reruns cleanly", async () => {
   const db = await oldDatabase();
   const physical = await stored(db);

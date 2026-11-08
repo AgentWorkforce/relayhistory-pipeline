@@ -29,7 +29,9 @@ requires a matching new image/generation and its ordinary verifier run.
 
 A wrong hash, unknown step, old/current name collision, gap in either lane,
 changed current target or missing/changed forward seed repair refuses before
-writes. All later migrations still execute in order. The marker becomes PASS
+writes. Supabase CLI authority checks include both the original and current
+version of every selected alias; either spelling refuses before changing the
+physical ledger, data or readiness marker. All later migrations still execute in order. The marker becomes PASS
 only after the complete ordinary function ACL and role verification. A failure
 at the repair leaves the generation pending; a normal retry resumes from the
 actual committed ledger. Readiness recognizes old names only after checking
