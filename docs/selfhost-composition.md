@@ -81,6 +81,7 @@ no rewriting.
 | 3 | `GET /v1/sessions`, `/v1/sessions/*`, `GET /v1/events`, `GET /v1/digest/*` | session-read-api | read routes; read-api answers non-GET with 405 |
 | 4 | `/v1/delivery/*`, `/v1/turns/*` | session-ingest | `POST /v1/delivery/batches`, `GET /v1/delivery/limits`, `POST /v1/delivery/recovery`, `POST /v1/delivery/sessions/{selection,reset}`, `POST /v1/turns/batches` |
 | 5 | `/v1/onboarding/*` | session-ingest | `POST /v1/onboarding/heartbeat`, `GET /v1/onboarding/connection` |
+| 5a | `POST /v1/auth/token/refresh` (exact) | session-ingest | always 401 `refresh_not_supported`. Required: without it the Desktop's refresh gets this table's 404, which it treats as an outage, and uploads stop when the token expires |
 | 6 | anything else, including `/healthz`, `/readyz`, `/health`, `/v1/custody/*` | **none (404 at the edge)** | probes and custody are internal |
 
 Requirements on the router:
