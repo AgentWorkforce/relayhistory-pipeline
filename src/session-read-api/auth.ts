@@ -28,6 +28,13 @@ export interface AuthConfig {
    * refuses those tokens (401 not_configured); RelayAuth tokens are unaffected.
    */
   relaycontrol?: { url?: string; secret?: string };
+  /**
+   * READ_API_AUTH_MODE=relaycontrol_only (lambda.ts readApiAuthConfig): only
+   * `sh_at_` tokens through relaycontrol; relayAuthVerifier is never built, so
+   * no JWKS is fetched and every other bearer is 401 with no outbound call.
+   * Absent: the default dual path, unchanged.
+   */
+  mode?: "relaycontrol_only";
 }
 
 export function relayAuthVerifier(config: AuthConfig, verify = verifyAgentRelayToken): Verifier {
@@ -105,11 +112,20 @@ export function relaycontrolVerifier(
  * `sh_at_` bearer goes to relaycontrol and nothing else does; every other
  * bearer, and every bearer with the flag off, takes relayAuthVerifier
  * unchanged (which refuses a `sh_at_` bearer as invalid_token, as before).
+ * With `mode: "relaycontrol_only"` the RelayAuth verifier is never constructed:
+ * relaycontrolVerifier alone answers, refusing a non-`sh_at_` bearer (401
+ * invalid_token) before any network call.
  */
 export function readApiVerifier(
   config: AuthConfig,
   deps: { verify?: typeof verifyAgentRelayToken; introspector?: Parameters<typeof relaycontrolVerifier>[1] } = {},
 ): Verifier {
+  if (config.mode === "relaycontrol_only") {
+    // readApiAuthConfig refuses these at startup; a hand-built config must not carry them either.
+    if (config.jwksUrl || config.issuer || !config.relaycontrol)
+      throw new Error("session read api: relaycontrol_only takes relaycontrol introspection and no RelayAuth settings");
+    return relaycontrolVerifier(config, deps.introspector);
+  }
   const relayAuth = relayAuthVerifier(config, deps.verify);
   if (!config.relaycontrol) return relayAuth;
   const relaycontrol = relaycontrolVerifier(config, deps.introspector);

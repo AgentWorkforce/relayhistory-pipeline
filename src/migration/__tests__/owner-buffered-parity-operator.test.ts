@@ -3,12 +3,14 @@ import { ParityCensusRefusal, type ParityCensusReceipt, type ParityTenant } from
 import {
   BULK_BUFFERED_TENANTS_SQL,
   OwnerBufferedOperatorRefusal,
-  assumeAndRequireParityTableOwner,
   bulkCompletionStatus,
   parseOperatorArgs,
   publicCensusReceipt,
   runBulkParity,
+  withBulkParityOwnerSessions,
+  withParityOwnerSession,
 } from "../../../scripts/owner-buffered-parity-operator.ts";
+import type { ConnectedOwnerClient } from "../../hoopdb/owner-operator-apply.ts";
 import type { Queryable } from "../relayhistory-export.ts";
 import { PGlite } from "@electric-sql/pglite";
 
@@ -16,57 +18,113 @@ const SHA = "a".repeat(40);
 const GENERATION = "b".repeat(64);
 
 describe("owner-buffered parity Supabase owner route", () => {
-  const identity = (overrides: Partial<{ login: string; actor: string; owner: string }> = {}) => ({
-    login: "cli_login_postgres", actor: "postgres", owner: "postgres", ...overrides,
+  type Failure = "" | "set_role" | "wrong_login" | "wrong_current" | "reset_owner" | "table_owner";
+  function ownerRouteClient(label: string, pid: number, failure: Failure = "") {
+    const calls: string[] = [];
+    let sessionRole = "cli_login_postgres";
+    let role = sessionRole;
+    let inTransaction = false;
+    let defaultReadOnly = false;
+    const client: ConnectedOwnerClient = {
+      async connect() { calls.push(`${label}:connect`); },
+      async query<T>(sql: string) {
+        calls.push(`${label}:${sql}`);
+        if (sql === "SET SESSION ROLE postgres") {
+          if (failure === "set_role") throw new Error("synthetic role failure");
+          sessionRole = "postgres";
+          role = "postgres";
+          return { rows: [] as T[] };
+        }
+        if (sql.startsWith("BEGIN")) inTransaction = true;
+        if (sql === "RESET ROLE") role = failure === "reset_owner" ? "postgres" : "cli_login_postgres";
+        if (sql === "SET LOCAL ROLE postgres") role = "postgres";
+        if (sql === "ROLLBACK") {
+          inTransaction = false;
+          role = sessionRole;
+        }
+        if (sql === "SET default_transaction_read_only = on") defaultReadOnly = true;
+        if (sql.includes('AS "schemaOwner"')) return { rows: [{
+          owner: failure === "wrong_current" ? "cli_login_postgres" : role,
+          login: failure === "wrong_login" ? "other_login" : "cli_login_postgres",
+          db: "postgres", role: role === "cli_login_postgres" ? "none" : role,
+          pid, ro: inTransaction || defaultReadOnly ? "on" : "off", schemaOwner: "postgres",
+        }] as T[] };
+        if (sql.includes("current_setting('role') AS role")) return { rows: [{
+          owner: role, login: "cli_login_postgres", db: "postgres",
+          role: role === "cli_login_postgres" ? "none" : role,
+          pid, ro: inTransaction || defaultReadOnly ? "on" : "off",
+        }] as T[] };
+        if (sql.includes("c.relname='owner_buffered_parity'")) return { rows: [{
+          login: "cli_login_postgres", actor: role,
+          owner: failure === "table_owner" ? "other_owner" : "postgres",
+        }] as T[] };
+        if (sql.includes("current_setting('default_transaction_read_only')"))
+          return { rows: [{ ro: defaultReadOnly ? "on" : "off" }] as T[] };
+        return { rows: [] as T[] };
+      },
+      async end() { calls.push(`${label}:end`); },
+    };
+    return { calls, client };
+  }
+
+  const callIndex = (calls: string[], text: string) => calls.findIndex((call) => call.includes(text));
+  const expectFenced = (calls: string[], ledger: string) => {
+    const index = callIndex(calls, ledger);
+    expect(index).toBeGreaterThan(0);
+    expect(calls[index - 1]).toContain('AS "schemaOwner"');
+    expect(calls[index + 1]).toContain('AS "schemaOwner"');
+  };
+
+  test("causally fences both bulk sessions before their first ledger access", async () => {
+    const enumerator = ownerRouteClient("enumerator", 41);
+    const writer = ownerRouteClient("writer", 42);
+    await withBulkParityOwnerSessions(enumerator.client, writer.client, async (read, write) => {
+      await read.query("SELECT enumerator_first_ledger_access");
+      await write.query("SELECT writer_first_ledger_access");
+    });
+    for (const route of [enumerator, writer]) {
+      expect(route.calls[0]).toBe(`${route === enumerator ? "enumerator" : "writer"}:connect`);
+      expect(callIndex(route.calls, "SET SESSION ROLE postgres")).toBeLessThan(callIndex(route.calls, "RESET ROLE"));
+      expect(callIndex(route.calls, "RESET ROLE")).toBeLessThan(callIndex(route.calls, "SET LOCAL ROLE postgres"));
+      expect(callIndex(route.calls, "SET LOCAL ROLE postgres")).toBeLessThan(callIndex(route.calls, "c.relname='owner_buffered_parity'"));
+      expect(route.calls.at(-1)).toBe(`${route === enumerator ? "enumerator" : "writer"}:end`);
+    }
+    expect(callIndex(enumerator.calls, "default_transaction_read_only = on"))
+      .toBeLessThan(callIndex(enumerator.calls, "enumerator_first_ledger_access"));
+    expect(writer.calls.some((call) => call.includes("default_transaction_read_only = on"))).toBeFalse();
+    expect(callIndex(writer.calls, "c.relname='owner_buffered_parity'"))
+      .toBeLessThan(callIndex(writer.calls, "writer_first_ledger_access"));
+    expectFenced(enumerator.calls, "enumerator_first_ledger_access");
+    expectFenced(writer.calls, "writer_first_ledger_access");
   });
 
-  test("switches to postgres before verifying the exact login, effective role, and table owner", async () => {
-    const statements: string[] = [];
-    const client: Queryable = { async query<T>(sql: string) {
-      statements.push(sql);
-      return { rows: (sql === "SET ROLE postgres" ? [] : [identity()]) as T[] };
-    } };
-    await expect(assumeAndRequireParityTableOwner(client)).resolves.toBeUndefined();
-    expect(statements[0]).toBe("SET ROLE postgres");
-    expect(statements[1]).toContain("session_user AS login");
-    expect(statements[1]).toContain("current_user AS actor");
-  });
+  test.each([{ readOnly: true, label: "census" }, { readOnly: false, label: "write" }] as const)(
+    "single $label mode fences the target and applies the expected readonly policy",
+    async ({ readOnly, label }) => {
+      const route = ownerRouteClient(label, 43);
+      await withParityOwnerSession(route.client, readOnly, (target) =>
+        target.query("SELECT single_first_ledger_access"));
+      expect(callIndex(route.calls, "c.relname='owner_buffered_parity'"))
+        .toBeLessThan(callIndex(route.calls, "single_first_ledger_access"));
+      expect(route.calls.some((call) => call.includes("default_transaction_read_only = on"))).toBe(readOnly);
+      expect(route.calls.at(-1)).toBe(`${label}:end`);
+      expectFenced(route.calls, "single_first_ledger_access");
+    },
+  );
 
-  test("refuses a wrong session login", async () => {
-    const client: Queryable = { async query<T>(sql: string) {
-      return { rows: (sql === "SET ROLE postgres" ? [] : [identity({ login: "other_login" })]) as T[] };
-    } };
-    await expect(assumeAndRequireParityTableOwner(client)).rejects.toThrow("target_owner_identity_refused");
-  });
-
-  test("refuses when SET ROLE postgres fails", async () => {
-    const client: Queryable = { async query<T>(sql: string) {
-      if (sql === "SET ROLE postgres") throw new Error("synthetic role failure");
-      return { rows: [identity()] as T[] };
-    } };
-    await expect(assumeAndRequireParityTableOwner(client)).rejects.toThrow("target_owner_set_role_refused");
-  });
-
-  test("refuses a current_user mismatch", async () => {
-    const client: Queryable = { async query<T>(sql: string) {
-      return { rows: (sql === "SET ROLE postgres" ? [] : [identity({ actor: "cli_login_postgres" })]) as T[] };
-    } };
-    await expect(assumeAndRequireParityTableOwner(client)).rejects.toThrow("target_owner_identity_refused");
-  });
-
-  test("refuses when postgres is not the parity table owner", async () => {
-    const client: Queryable = { async query<T>(sql: string) {
-      return { rows: (sql === "SET ROLE postgres" ? [] : [identity({ owner: "other_owner" })]) as T[] };
-    } };
-    await expect(assumeAndRequireParityTableOwner(client)).rejects.toThrow("target_owner_identity_refused");
-  });
-
-  test("sanitizes an unverifiable identity query", async () => {
-    const client: Queryable = { async query<T>(sql: string) {
-      if (sql !== "SET ROLE postgres") throw new Error("synthetic private database detail");
-      return { rows: [] as T[] };
-    } };
-    await expect(assumeAndRequireParityTableOwner(client)).rejects.toThrow("target_owner_identity_unverifiable");
+  test.each([
+    ["set_role", "synthetic role failure"],
+    ["wrong_login", "owner_session_identity"],
+    ["wrong_current", "owner_session_identity"],
+    ["reset_owner", "owner_reset_baseline"],
+    ["table_owner", "target_owner_identity_refused"],
+  ] as const)("refuses %s before application work", async (failure, code) => {
+    const route = ownerRouteClient("refused", 44, failure);
+    let worked = false;
+    await expect(withParityOwnerSession(route.client, false, async () => { worked = true; }))
+      .rejects.toThrow(code);
+    expect(worked).toBeFalse();
+    expect(route.calls.at(-1)).toBe("refused:end");
   });
 });
 
