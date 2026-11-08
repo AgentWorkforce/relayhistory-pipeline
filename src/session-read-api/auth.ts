@@ -16,6 +16,7 @@ import {
 } from "@rhc/auth/relaycontrol.ts";
 import { AuthError, type Verifier } from "./app.ts";
 import type { LoginExchange } from "./selfhost.ts";
+import { hashToken, isAccessBearer, normalizedOrigin, type SelfIssuedDeps, type TokenStore } from "./self-issued.ts";
 
 export interface AuthConfig {
   /** This service's origin, e.g. https://xyz.lambda-url.us-east-1.on.aws. Unset: every token is refused. */
@@ -38,7 +39,9 @@ export interface AuthConfig {
    * no JWKS is fetched and every other bearer is 401 with no outbound call.
    * Absent: the default dual path, unchanged.
    */
-  mode?: "relaycontrol_only";
+  mode?: "relaycontrol_only" | "self_issued";
+  /** READ_API_AUTH_MODE=self_issued only: the origin (normalized), internal secrets and access TTL. */
+  selfIssued?: Pick<SelfIssuedDeps, "audience" | "internalSecrets" | "accessTtlSeconds">;
 }
 
 /** The read path's positive introspection cache when READ_API_INTROSPECT_POSITIVE_TTL_MS is unset (the hosted behaviour). */
@@ -152,6 +155,27 @@ export function readApiVerifier(
   if (!config.relaycontrol) return relayAuth;
   const relaycontrol = relaycontrolVerifier(config, deps.introspector);
   return (bearer, request) => (isRelaycontrolToken(bearer) ? relaycontrol(bearer, request) : relayAuth(bearer, request));
+}
+
+/**
+ * READ_API_AUTH_MODE=self_issued: only this service's own access and service tokens. The hash is
+ * looked up on every request and nothing is cached, so a deleted row is refused at once. Identity
+ * is only the row's. Any store failure, including a statement timeout, denies with 503 (retryable;
+ * a 401 would tell a client to drop a good token) and serves nothing.
+ */
+export function selfIssuedVerifier(store: TokenStore, audience: string, now: () => number = Date.now): Verifier {
+  return async (bearer) => {
+    if (!isAccessBearer(bearer)) throw new AuthError(401, "invalid_token", "token is not valid");
+    const hash = await hashToken(bearer);
+    let row;
+    try {
+      row = await store.verify(hash, new Date(now()));
+    } catch {
+      throw new AuthError(503, "token_store_unavailable", "the token store is unavailable");
+    }
+    if (!row || normalizedOrigin(row.audience) !== audience) throw new AuthError(401, "invalid_token", "token is not valid");
+    return { userId: row.userId, orgId: row.orgId, workspaceId: row.workspaceId, scopes: row.scopes };
+  };
 }
 
 /**
