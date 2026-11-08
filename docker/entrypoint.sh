@@ -11,5 +11,7 @@ case "${SERVICE:-}" in
   bob-costas)       exec bun run /app/src/bob-costas/main.ts ;;
   session-brief)    exec bun run /app/src/session-brief/main.ts ;;
   session-read-api) exec bun run /app/src/session-read-api/server.ts ;;
+  session-pipeline-consumer) exec bun run /app/src/session-pipeline/consumer-service.ts ;;
+  session-pipeline-consumer-bootstrap) exec bun run /app/src/session-pipeline/consumer-bootstrap.ts ;;
   *) echo "96bulls: unknown SERVICE='${SERVICE:-}'" >&2; exit 2 ;;
 esac

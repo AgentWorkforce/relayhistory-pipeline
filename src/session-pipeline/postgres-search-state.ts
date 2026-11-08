@@ -32,13 +32,23 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
             WITH CHECK(org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true));
         END IF;
       END $policy$`);
-      const { rows } = await owner.query<{ name: string; command: string; roles: string; permissive: boolean; qual: string; check: string }>(
-        `SELECT polname AS name,polcmd::text AS command,polroles::text AS roles,polpermissive AS permissive,
+      const { rows } = await owner.query<{ name: string; command: string; roles: string; permissive: boolean; qual: string | null; check: string | null }>(
+        `SELECT polname AS name,polcmd::text AS command,
+          CASE WHEN polroles = '{0}' THEN '{0}'
+               ELSE (SELECT string_agg(r.rolname, ',' ORDER BY r.rolname) FROM pg_roles r WHERE r.oid = ANY(polroles)) END AS roles,
+          polpermissive AS permissive,
           pg_get_expr(polqual,polrelid) AS qual,pg_get_expr(polwithcheck,polrelid) AS check
          FROM pg_policy WHERE polrelid=$1::regclass`, [table]);
       const normalize = (value: string) => value.replace(/\s+|::text|\(|\)/g, "");
       const expected = normalize("org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true)");
-      if (rows.length !== 1 || rows[0]!.name !== "tenant_only" || rows[0]!.command !== "*" || rows[0]!.roles !== "{0}" || !rows[0]!.permissive || normalize(rows[0]!.qual ?? "") !== expected || normalize(rows[0]!.check ?? "") !== expected) throw new Error("search state tenant policy mismatch");
+      const tenant = rows.find((r) => r.name === "tenant_only");
+      if (!tenant || tenant.command !== "*" || tenant.roles !== "{0}" || !tenant.permissive || normalize(tenant.qual ?? "") !== expected || normalize(tenant.check ?? "") !== expected) throw new Error("search state tenant policy mismatch");
+      // The self-host bootstrap adds exactly one more policy: the transparent
+      // writer policy for search_consumer_runtime (PERMISSIVE USING(true), no
+      // other grantee). It does not weaken tenant isolation for any other
+      // role, but any other policy shape still fails closed here.
+      const extras = rows.filter((r) => r.name !== "tenant_only");
+      if (extras.length > 1 || (extras.length === 1 && (extras[0]!.name !== "search_consumer_trusted" || extras[0]!.command !== "*" || extras[0]!.roles !== "search_consumer_runtime" || !extras[0]!.permissive || normalize(extras[0]!.qual ?? "") !== "true" || normalize(extras[0]!.check ?? "") !== "true"))) throw new Error("search state tenant policy mismatch");
     },
     async fromMs() { return fromMs; },
     async record(tx, scope, value) {
@@ -56,6 +66,7 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
     async partials(tenant, input) {
       if (!reader) throw new Error("search state tenant reader missing");
       if (!tenant.orgId || !tenant.workspaceId || !Number.isInteger(input.limit) || input.limit < 1 || input.limit > 1000) throw new Error("search state query invalid");
+      if (input.after !== undefined && (typeof input.after !== "string" || input.after.length === 0)) throw new Error("search state query invalid");
       const { rows } = await reader(tenant.orgId, tenant.workspaceId, tx => tx.query<{ session_id: string }>(
         `SELECT DISTINCT coalesce(p.canonical_session_id,p.session_id) AS session_id
          FROM sessions.session_index p
@@ -63,11 +74,12 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
          LEFT JOIN sessions.session_directory d ON d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id=coalesce(p.canonical_session_id,p.session_id)
          WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.deleted_at IS NULL
            AND ($4::text IS NULL OR p.session_id=$4 OR coalesce(p.canonical_session_id,p.session_id)=$4)
+           AND ($7::text IS NULL OR coalesce(p.canonical_session_id,p.session_id) > $7)
            AND (s.complete IS DISTINCT FROM true OR d.event_projection_ready IS DISTINCT FROM true
              OR s.canonical_session_id IS DISTINCT FROM coalesce(p.canonical_session_id,p.session_id)
              OR s.source_epoch IS DISTINCT FROM d.event_projection_epoch OR s.coverage_from_ms IS DISTINCT FROM $5::bigint)
          ORDER BY session_id LIMIT $6`,
-        [tenant.orgId, tenant.workspaceId, backendId, input.sessionId ?? null, fromMs, input.limit + 1]));
+        [tenant.orgId, tenant.workspaceId, backendId, input.sessionId ?? null, fromMs, input.limit + 1, input.after ?? null]));
       return { sessions: rows.slice(0, input.limit).map(r => r.session_id), overflow: rows.length > input.limit };
     },
   };
