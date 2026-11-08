@@ -265,11 +265,13 @@ describe("enabled", () => {
     expect((await fetch(url("/healthz"))).status).toBe(200);
   });
 
-  test("the Lambda's own assembly starts without a database and authenticates first", async () => {
+  test("the Lambda's own assembly (SEARCH_INDEX_BACKEND=clickhouse) starts without a database and authenticates first", async () => {
     const { url } = await start({
       ...env,
+      SEARCH_INDEX_BACKEND: "clickhouse",
+      SESSION_POSTGRES_TLS_PROFILE: "supabase",
       RELAYHISTORY_READ_API_SECRET: JSON.stringify({
-        supabase_url: "postgresql://reader@db.example.invalid:5432/postgres",
+        supabase_url: "postgresql://reader:pw@db.example.invalid:5432/postgres",
         clickhouse: { url: "https://ch.example.invalid:8443", user: "reader", password: "p", database: "relay_search" },
       }),
       READ_API_COMPLETE_SINCE: "epoch",
@@ -282,11 +284,12 @@ describe("enabled", () => {
   });
 
   test("startup fails on the Lambda's own checks (bad secret, missing history floor)", async () => {
-    await expect(startReadApiService({ ...env, READ_API_COMPLETE_SINCE: "epoch", RELAYHISTORY_READ_API_SECRET: "not json" }, LOOPBACK)).rejects.toThrow(
+    await expect(startReadApiService({ ...env, SEARCH_INDEX_POSTGRES_BACKEND_ID: "selfhost-pg", SESSION_POSTGRES_TLS_PROFILE: "supabase", READ_API_COMPLETE_SINCE: "epoch", RELAYHISTORY_READ_API_SECRET: "not json" }, LOOPBACK)).rejects.toThrow(
       "session read api secret is not JSON",
     );
-    await expect(
-      startReadApiService({ ...env, RELAYHISTORY_READ_API_SECRET: JSON.stringify({ supabase_url: "postgresql://r@h/p" }) }, LOOPBACK),
-    ).rejects.toThrow("READ_API_COMPLETE_SINCE");
+    for (const search of [{ SEARCH_INDEX_BACKEND: "clickhouse" }, { SEARCH_INDEX_POSTGRES_BACKEND_ID: "selfhost-pg" }])
+      await expect(
+        startReadApiService({ ...env, ...search, SESSION_POSTGRES_TLS_PROFILE: "supabase", RELAYHISTORY_READ_API_SECRET: JSON.stringify({ supabase_url: "postgresql://r:pw@h/p" }) }, LOOPBACK),
+      ).rejects.toThrow("READ_API_COMPLETE_SINCE");
   });
 });

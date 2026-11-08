@@ -4,11 +4,13 @@
  * see service-config.ts and docs/session-read-api-design.md ("Self-host
  * SERVICE").
  *
- * Enabled, the app is assembled exactly as the Lambda assembles it
- * (lambda.ts readAppFromSecret: same secret shape, verifier, search binding,
- * read-role pool and env), once at startup, so a bad configuration fails the
- * process instead of the first request. Like the Lambda and the Worker it
- * answers GET, plus exactly one POST route: `POST /v1/cli/login`, whose JSON
+ * Enabled, the app is assembled by the Lambda's own assembly (lambda.ts
+ * readAppFromSecret: same secret shape, verifier, read-role pool and env) under
+ * the service entry's rules, once at startup, so a bad configuration fails the
+ * process instead of the first request. Search is selected by
+ * SEARCH_INDEX_BACKEND (default postgres here, so no ClickHouse or Lambda is
+ * needed; clickhouse keeps the hosted binding); see selfhostSearchComposition.
+ * Like the Lambda and the Worker it answers GET, plus exactly one POST route: `POST /v1/cli/login`, whose JSON
  * body is the only request body ever read. It is buffered here with a hard
  * cap (LOGIN_BODY_CAP_BYTES, 413 beyond it) before the app sees it; every
  * other request body is drained, never read.
@@ -17,11 +19,33 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Hono } from "hono";
 import { errorFields, log } from "../shared/log.ts";
-import { readAppFromSecret } from "./lambda.ts";
-import { readApiServiceConfig } from "./service-config.ts";
+import { createPostgresSearchComposition, type SearchComposition } from "../shared/search-composition.ts";
+import { parseCompleteSince } from "./config.ts";
+import { readAppFromSecret, serviceSearchBackend } from "./lambda.ts";
+import { readApiServiceConfig, SEARCH_BACKEND_ID_VAR } from "./service-config.ts";
 
 type FetchApp = { fetch(req: Request): Response | Promise<Response> };
 export type ReadAppBuilder = (secret: string, env: NodeJS.ProcessEnv) => Promise<{ app: FetchApp; close(): Promise<void> }>;
+
+/**
+ * The service's search composition, chosen by SEARCH_INDEX_BACKEND through the
+ * adapter registry (never hard-wired): postgres (the default here) composes the
+ * registry's Postgres SearchIndexAdapter with epoch-fenced Postgres
+ * completeness state for SEARCH_INDEX_POSTGRES_BACKEND_ID, covering history from
+ * READ_API_COMPLETE_SINCE; clickhouse returns none (the Lambda's ClickHouse
+ * client, from the secret). Unknown or unrunnable names refuse startup, naming
+ * the variable only.
+ */
+export function selfhostSearchComposition(env: NodeJS.ProcessEnv): SearchComposition | undefined {
+  if (serviceSearchBackend(env) !== "postgres") return undefined;
+  const backendId = env[SEARCH_BACKEND_ID_VAR]?.trim();
+  if (!backendId) throw new Error(`96bulls: SEARCH_INDEX_BACKEND=postgres needs ${SEARCH_BACKEND_ID_VAR}`);
+  return createPostgresSearchComposition({ backendId, fromMs: parseCompleteSince(env.READ_API_COMPLETE_SINCE) });
+}
+
+/** The production builder: the Lambda's assembly under the service entry's rules, with the selected search composition. */
+export const selfhostReadApp: ReadAppBuilder = async (secret, env) =>
+  await readAppFromSecret(secret, env, selfhostSearchComposition(env), { entry: "service" });
 
 const errorJson = (code: string, message: string) => ({ error: { code, message } });
 
@@ -155,7 +179,7 @@ export async function startReadApiService(
   options: { host?: string; port?: number; build?: ReadAppBuilder } = {},
 ): Promise<ReadApiService> {
   const config = readApiServiceConfig(env);
-  const built = config.enabled ? await (options.build ?? readAppFromSecret)(config.secret, env) : null;
+  const built = config.enabled ? await (options.build ?? selfhostReadApp)(config.secret, env) : null;
   const server = readApiHttpServer(readApiServiceApp(built?.app ?? null), { readLoginBody: built !== null });
   try {
     await new Promise<void>((resolve, reject) => {

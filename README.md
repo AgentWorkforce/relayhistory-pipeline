@@ -136,6 +136,9 @@ bare-origin matches, and the RelayAuth URL is never used as an audience.
 | `RELAYHISTORY_SELFHOST_READ_API` | session-read-api | unset (dormant: `/healthz` only, every other route 503) | `true`/`false` only | `true` once `RELAYHISTORY_READ_API_SECRET` and the read API env above are set |
 | `RELAYHISTORY_READ_API_SECRET` | session-read-api | required when enabled | the Lambda secret's JSON shape (`parseReadApiSecret`) | from the secret store (1Password), never on disk |
 | `RELAYHISTORY_READ_API_PORT` | session-read-api | `8080` (parsed even when dormant) | TCP port 1-65535 | `8080` |
+| `SEARCH_INDEX_BACKEND` | session-read-api (enabled) | `postgres` (no ClickHouse, no Lambda env) | `postgres` or `clickhouse` (registry names; anything else, or a name with no implementation in this build, fails startup naming only the variable) | `postgres`; `clickhouse` keeps the hosted binding and needs the secret's `clickhouse` block |
+| `SEARCH_INDEX_POSTGRES_BACKEND_ID` | session-read-api (enabled, postgres) | required | `[a-zA-Z0-9._-]{1,128}` | the projection-state backend id your search writer records under; coverage is from `READ_API_COMPLETE_SINCE` |
+| `SESSION_POSTGRES_TLS_PROFILE` | session-read-api (enabled) | required explicitly (no implicit Supabase pin) | `supabase`, or `custom-ca` with `SESSION_POSTGRES_CA_FILE`/`SESSION_POSTGRES_CA_SHA256` (docs/portable-lambda-runtime.md) | `custom-ca` with your Postgres CA bundle |
 | `ALLOW_IN_CLUSTER_HTTP` | courier, ingest, read API, session-brief | `false` | `true`/`false` only | `true` on in-cluster pods that use `*.svc` URLs |
 
 Hosted values that are not runtime destinations of a self-host: the vendored
