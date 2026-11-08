@@ -35,7 +35,9 @@ The default search registry (`createSearchIndexRegistry`) contains only
 Postgres. It backs `createPostgresSearchComposition` and is the registry the
 Lambda composition ABI (`src/lambda-artifact/composition.ts`) exports.
 `createOpenSearchCapableSearchIndexRegistry` adds OpenSearch and is opt-in: the
-ABI does not export it, and no shipped entry point uses it. The default runtime
+ABI does not export it. The self-host read API and the self-host pipeline
+consumer use it (through `src/shared/opensearch-composition.ts`) only when
+`SEARCH_INDEX_BACKEND=opensearch`. The default runtime
 registry contains only the worker runtime. Recognizing a provider name does not
 install that implementation. Creating an unregistered adapter fails. Each entry
 point declares the implementations it can run. Workers refuse
@@ -43,12 +45,11 @@ point declares the implementations it can run. Workers refuse
 allow `clickhouse` plus the names their composition's registry holds, so they
 refuse `opensearch` with no composition or with any composition built on the
 ABI's registry (`src/session-pipeline/__tests__/lambda-search-backends.test.ts`).
-A future composition that runs OpenSearch must choose the opensearch-capable
+Any other composition that runs OpenSearch must choose the opensearch-capable
 registry explicitly, as a reviewed change.
 
 ClickHouse, Lambda, Cloud Run and Terse implementation ownership, distribution
-and service integration, and wiring OpenSearch into an entry point, are separate
-follow-ups. This foundation
+and service integration are separate follow-ups. This foundation
 does not select their repository placement or advertise them as Helm profiles.
 
 ## SearchIndexAdapter
@@ -188,10 +189,10 @@ dialect.
   are reachable.
 - Errors map to `SearchIndexError` codes without backend text: 404 index →
   `schema_missing`, 429/5xx/network/timeout → retryable `unavailable`.
-- Auth: `none`, `basic` (password from the secret loader), `sigv4` (not
-  implemented: construction fails `unsupported`). `basic` needs an `https` URL
-  unless the host is loopback (`localhost`, `127.0.0.0/8`, `::1`). Otherwise
-  construction fails `invalid_argument` (detail `basic_auth_needs_https`), so
+- Auth: `none`, `basic` (password from the secret loader), `sigv4` (service
+  `es`, EKS Pod Identity credentials supplied by the composition). `basic` and
+  `sigv4` need an `https` URL unless the host is loopback (`localhost`, `127.0.0.0/8`, `::1`). Otherwise
+  construction fails `invalid_argument` (detail `basic_auth_needs_https` or `sigv4_needs_https`), so
   credentials never cross a network in cleartext. `CA_FILE` needs Bun.
 
 `.github/workflows/opensearch-proof.yml` runs the shared conformance suite and an
@@ -305,13 +306,14 @@ components retain their existing timing checks.
 
 | Variable | Recognized names | Current entry-point behavior |
 | --- | --- | --- |
-| `SEARCH_INDEX_BACKEND` | `postgres`, `clickhouse`, `opensearch` | workers allow `postgres`; the existing Lambda entries allow `clickhouse`, plus `postgres` with a composition from the ABI; no shipped entry allows `opensearch` |
+| `SEARCH_INDEX_BACKEND` | `postgres`, `clickhouse`, `opensearch` | workers allow `postgres`; the existing Lambda entries allow `clickhouse`, plus `postgres` with a composition from the ABI; the self-host read API (`postgres` default, `clickhouse`, `opensearch`) and the self-host pipeline consumer (`postgres`, `opensearch`, no default) allow `opensearch` with Postgres projection state |
 | `PIPELINE_RUNTIME` | `workers`, `lambda`, `cloudrun`, `terse` | workers allow `workers`; the existing Lambda entry allows `lambda` |
 | `SEARCH_INDEX_POSTGRES_SCHEMA` | SQL identifier | `search_index` unless explicitly configured; validated when constructing the adapter |
 | `SEARCH_INDEX_OPENSEARCH_URL` | `http(s)://host[:port][/path]` | required when `SEARCH_INDEX_BACKEND=opensearch`; creation fails without it. No credentials, query or fragment in the URL |
 | `SEARCH_INDEX_OPENSEARCH_DIALECT` | `opensearch`, `elasticsearch` | `opensearch` |
 | `SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX` | lower-case `[a-z0-9][a-z0-9_-]*` | `relayhistory` (index `relayhistory-transcript-events`) |
-| `SEARCH_INDEX_OPENSEARCH_AUTH` | `none`, `basic`, `sigv4` | `none`; `basic` needs an `https` or loopback URL; `sigv4` is not implemented and fails at creation |
+| `SEARCH_INDEX_OPENSEARCH_AUTH` | `none`, `basic`, `sigv4` | `none`; `basic` and `sigv4` need an `https` or loopback URL; `sigv4` signs for service `es` with EKS Pod Identity credentials (service entries only) |
+| `SEARCH_INDEX_OPENSEARCH_AWS_REGION` | AWS region name | required for `sigv4` |
 | `SEARCH_INDEX_OPENSEARCH_USERNAME` | string without `:` | required for `basic` |
 | `SEARCH_INDEX_OPENSEARCH_PASSWORD` | secret, from the secret loader (`secrets`), never env | required for `basic` |
 | `SEARCH_INDEX_OPENSEARCH_CA_FILE` | path to a PEM bundle | unset; https only, Bun runtime only |

@@ -46,7 +46,8 @@ describe("shipped Lambda entries refuse SEARCH_INDEX_BACKEND=opensearch", () => 
   test("control: an explicitly opensearch-capable composition is what widens the allow list", async () => {
     const capable: SearchComposition = { registry: createOpenSearchCapableSearchIndexRegistry(), state: () => { throw new Error("composition reached"); } };
     expect(pipelineEntry.lambdaEnv({ ...base, ...opensearch }, capable).searchBackend).toBe("opensearch");
-    // Past backend selection, the read api reaches the composition (no connection is made: the pool is lazy).
-    await expect(readApiEntry.readAppFromSecret(secret, { ...opensearch, READ_API_COMPLETE_SINCE: "epoch" }, capable)).rejects.toThrow("composition reached");
+    // Past backend selection the read api reaches its reader-role check against the unreachable database.
+    const error = await readApiEntry.readAppFromSecret(secret, { ...opensearch, READ_API_COMPLETE_SINCE: "epoch" }, capable).then(() => null, (e: Error) => e);
+    expect(error?.message).not.toContain("not allowed");
   });
 });

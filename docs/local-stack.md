@@ -227,7 +227,7 @@ unset or `postgres`). The `opensearch` backend (OpenSearch or Elasticsearch) is
 configured with `SEARCH_INDEX_BACKEND=opensearch`, `SEARCH_INDEX_OPENSEARCH_URL`
 (required), `SEARCH_INDEX_OPENSEARCH_DIALECT` (`opensearch` or `elasticsearch`),
 `SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX`, `SEARCH_INDEX_OPENSEARCH_AUTH` (`none`,
-`basic`; `sigv4` is not implemented), `SEARCH_INDEX_OPENSEARCH_USERNAME`, the
+`basic`, or `sigv4` with EKS Pod Identity and `SEARCH_INDEX_OPENSEARCH_AWS_REGION`), `SEARCH_INDEX_OPENSEARCH_USERNAME`, the
 `SEARCH_INDEX_OPENSEARCH_PASSWORD` secret, `SEARCH_INDEX_OPENSEARCH_CA_FILE` and
 `SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS` (see
 `docs/search-and-runtime-adapters.md`). `basic` is accepted only when

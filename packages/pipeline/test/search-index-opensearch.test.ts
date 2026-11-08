@@ -485,16 +485,38 @@ describe("opensearch adapter schema and dialects", () => {
     expect(() => createOpenSearchSearchIndex({ url: BASE, fetch: fake(() => new Response(null)).fetch })).not.toThrow();
   });
 
-  it("refuses SigV4 at construction (not implemented)", () => {
-    let error: unknown;
-    try {
-      createOpenSearchSearchIndex({ url: BASE, auth: { kind: "sigv4" } });
-    } catch (e) {
-      error = e;
+  it("signs every request with SigV4 for the es service", async () => {
+    const credentials = async () => ({ accessKeyId: "AKIDEXAMPLE", secretAccessKey: "sekret", sessionToken: "tok" });
+    const { calls, fetch } = fake(() => new Response(null, { status: 200 }));
+    await createOpenSearchSearchIndex({ url: "https://search.example.com", fetch, auth: { kind: "sigv4", region: "us-west-2", credentials } }).health();
+    const headers = calls[0]!.headers as unknown as Headers;
+    expect(headers.get("authorization")).toMatch(/^AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE\/\d{8}\/us-west-2\/es\/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=[0-9a-f]{64}$/);
+    expect(headers.get("x-amz-security-token")).toBe("tok");
+  });
+
+  it("refuses SigV4 over cleartext off the machine and maps credential failures without their text", async () => {
+    const credentials = async () => ({ accessKeyId: "a", secretAccessKey: "b" });
+    for (const [config, detail] of [
+      [{ url: BASE, auth: { kind: "sigv4", region: "us-west-2", credentials } }, "sigv4_needs_https"],
+      [{ url: "https://search.example.com", auth: { kind: "sigv4", region: "", credentials } }, "sigv4_config"],
+    ] as const) {
+      let error: unknown;
+      try {
+        createOpenSearchSearchIndex(config as never);
+      } catch (e) {
+        error = e;
+      }
+      expect(error).toBeInstanceOf(SearchIndexError);
+      expect((error as SearchIndexError).detail).toBe(detail);
     }
+    const failing = async () => {
+      throw new Error("credential-endpoint-detail");
+    };
+    const adapter = createOpenSearchSearchIndex({ url: "https://search.example.com", fetch: fake(() => new Response(null)).fetch, auth: { kind: "sigv4", region: "us-west-2", credentials: failing } });
+    const error = await adapter.ensureSchema().then(() => null, (e: unknown) => e);
     expect(error).toBeInstanceOf(SearchIndexError);
-    expect((error as SearchIndexError).code).toBe("unsupported");
-    expect((error as SearchIndexError).detail).toBe("sigv4_not_implemented");
+    expect((error as SearchIndexError).detail).toBe("credentials");
+    expect(String((error as Error).message)).not.toContain("credential-endpoint-detail");
   });
 
   it("refuses a CA bundle on plain http or where fetch cannot take one", () => {
@@ -542,9 +564,11 @@ describe("opensearch env parsing", () => {
       expect(parsed.requestTimeoutMs).toBe(Number(good));
       expect(() => createOpenSearchSearchIndex(parsed)).not.toThrow();
     }
-    expect(() =>
-      createOpenSearchCapableSearchIndexRegistry().create({ SEARCH_INDEX_BACKEND: "opensearch" }, { env: { SEARCH_INDEX_OPENSEARCH_URL: BASE, SEARCH_INDEX_OPENSEARCH_AUTH: "sigv4" } }),
-    ).toThrow(/sigv4_not_implemented/);
+    const sigv4Env = { SEARCH_INDEX_OPENSEARCH_URL: "https://search.example.com", SEARCH_INDEX_OPENSEARCH_AUTH: "sigv4" };
+    expect(() => openSearchConfigFromInput({ env: sigv4Env })).toThrow(/SEARCH_INDEX_OPENSEARCH_AWS_REGION/);
+    expect(() => openSearchConfigFromInput({ env: { ...sigv4Env, SEARCH_INDEX_OPENSEARCH_AWS_REGION: "us-west-2" } })).toThrow(/credential provider/);
+    const credentials = async () => ({ accessKeyId: "a", secretAccessKey: "b" });
+    expect(openSearchConfigFromInput({ env: { ...sigv4Env, SEARCH_INDEX_OPENSEARCH_AWS_REGION: "us-west-2" }, extras: { awsCredentials: credentials } }).auth).toMatchObject({ kind: "sigv4", region: "us-west-2" });
   });
 });
 

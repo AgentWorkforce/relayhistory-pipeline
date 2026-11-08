@@ -189,11 +189,11 @@ function searchBackend(env: NodeJS.ProcessEnv, composition?: SearchComposition, 
 /**
  * The self-host service's search selection before any composition exists:
  * SEARCH_INDEX_BACKEND unset or "" is postgres; otherwise exactly a name this
- * entry can run (postgres, clickhouse). Anything else is an AdapterConfigError
+ * entry can run (postgres, clickhouse, opensearch). Anything else is an AdapterConfigError
  * that names the variable and the allowed names, never the value.
  */
-export function serviceSearchBackend(env: NodeJS.ProcessEnv): "postgres" | "clickhouse" {
-  return validateAdapterEnv(env, { runtime: PIPELINE_RUNTIMES, runtimeDefault: "workers", search: ["postgres", "clickhouse"], searchDefault: "postgres" }).search as "postgres" | "clickhouse";
+export function serviceSearchBackend(env: NodeJS.ProcessEnv): "postgres" | "clickhouse" | "opensearch" {
+  return validateAdapterEnv(env, { runtime: PIPELINE_RUNTIMES, runtimeDefault: "workers", search: ["postgres", "clickhouse", "opensearch"], searchDefault: "postgres" }).search as "postgres" | "clickhouse" | "opensearch";
 }
 
 /**

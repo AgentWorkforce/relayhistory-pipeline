@@ -11,6 +11,7 @@
  */
 import type { PipelineRuntimeAdapter } from "../runtime/contracts.js";
 import { createWorkerRuntime, type WorkSource } from "../runtime/workers.js";
+import type { AwsCredentials } from "../../../object-store/src/sigv4.js";
 import type { SearchIndexAdapter } from "../search-index/contracts.js";
 import { createPostgresSearchIndex, type SqlClient, type TenantSqlRunner } from "../search-index/postgres.js";
 import {
@@ -98,7 +99,13 @@ export function openSearchConfigFromInput(input: SearchFactoryInput): OpenSearch
       throw new Error("SEARCH_INDEX_OPENSEARCH_AUTH=basic needs SEARCH_INDEX_OPENSEARCH_USERNAME and the SEARCH_INDEX_OPENSEARCH_PASSWORD secret");
     }
     auth = { kind: "basic", username, password };
-  } else if (authKind === "sigv4") auth = { kind: "sigv4" };
+  } else if (authKind === "sigv4") {
+    const region = value("AWS_REGION");
+    const credentials = input.extras?.awsCredentials as (() => Promise<AwsCredentials>) | undefined;
+    if (!region) throw new Error("SEARCH_INDEX_OPENSEARCH_AUTH=sigv4 needs SEARCH_INDEX_OPENSEARCH_AWS_REGION");
+    if (typeof credentials !== "function") throw new Error("SEARCH_INDEX_OPENSEARCH_AUTH=sigv4 needs a composition that supplies an AWS credential provider");
+    auth = { kind: "sigv4", region, credentials };
+  }
   else throw new Error("SEARCH_INDEX_OPENSEARCH_AUTH must be one of none, basic, sigv4");
   const caFile = value("CA_FILE");
   let ca: string | undefined;

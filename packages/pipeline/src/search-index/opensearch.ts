@@ -51,13 +51,18 @@ import {
   type SearchQuery,
   type SearchScope,
 } from "./contracts.js";
+// The S3 signer, generalized by service. Imported by source like the other
+// object-store primitives in this package (destinations/local.ts).
+import { signRequest, type AwsCredentials } from "../../../object-store/src/sigv4.js";
+import { sha256Hex } from "../../../object-store/src/crypto.js";
+import { cachedProvider } from "../../../object-store/src/core.js";
 
 export type OpenSearchDialect = "opensearch" | "elasticsearch";
 export const OPENSEARCH_DIALECTS: readonly OpenSearchDialect[] = ["opensearch", "elasticsearch"];
 export type OpenSearchAuth =
   | { readonly kind: "none" }
   | { readonly kind: "basic"; readonly username: string; readonly password: string }
-  | { readonly kind: "sigv4" };
+  | { readonly kind: "sigv4"; readonly region: string; readonly credentials: () => Promise<AwsCredentials> };
 
 export type FetchLike = (input: string, init: RequestInit & { tls?: { ca?: string } }) => Promise<Response>;
 
@@ -383,6 +388,7 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_OPENSEARCH_TIMEOUT_MS) throw new SearchIndexError("invalid_argument", false, "timeout");
   const auth = config.auth ?? { kind: "none" };
   let authorization: string | undefined;
+  let sigv4: { region: string; credentials: () => Promise<AwsCredentials> } | undefined;
   if (auth.kind === "basic") {
     if (!auth.username || auth.username.includes(":") || typeof auth.password !== "string" || !auth.password) {
       throw new SearchIndexError("invalid_argument", false, "basic_auth");
@@ -395,10 +401,16 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
     const bytes = new TextEncoder().encode(`${auth.username}:${auth.password}`);
     authorization = `Basic ${btoa(String.fromCharCode(...bytes))}`;
   } else if (auth.kind === "sigv4") {
-    // TODO(sigv4): sign requests with AWS SigV4 (service "es"/"aoss") for
-    // Amazon OpenSearch Service. Not implemented: refuse at construction so a
-    // misconfigured install never sends unsigned requests.
-    throw new SearchIndexError("unsupported", false, "sigv4_not_implemented");
+    // Amazon OpenSearch Service (service "es"). The session token is a bearer
+    // secret too: never send it in cleartext off the machine.
+    if (typeof auth.region !== "string" || !/^[a-z0-9-]{1,32}$/.test(auth.region) || typeof auth.credentials !== "function") {
+      throw new SearchIndexError("invalid_argument", false, "sigv4_config");
+    }
+    const { protocol, hostname } = new URL(base);
+    if (protocol !== "https:" && !isLoopbackHost(hostname)) {
+      throw new SearchIndexError("invalid_argument", false, "sigv4_needs_https");
+    }
+    sigv4 = { region: auth.region, credentials: cachedProvider(auth.credentials) };
   } else if (auth.kind !== "none") {
     throw new SearchIndexError("invalid_argument", false, "auth");
   }
@@ -439,12 +451,30 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
       headers["content-type"] = "application/json";
       payload = JSON.stringify(body);
     }
+    let signed: Headers | undefined;
+    if (sigv4) {
+      signed = new Headers(headers);
+      try {
+        await signRequest({
+          method,
+          url: new URL(`${base}/${path}`),
+          headers: signed,
+          payloadSha256: await sha256Hex(payload ?? ""),
+          region: sigv4.region,
+          service: "es",
+          credentials: await sigv4.credentials(),
+        });
+      } catch {
+        // The credential source's message is not ours to echo.
+        throw new SearchIndexError("unavailable", true, "credentials");
+      }
+    }
     let response: Response;
     let text: string;
     try {
       response = await doFetch(`${base}/${path}`, {
         method,
-        headers,
+        headers: signed ?? headers,
         body: payload,
         redirect: "error",
         signal,
