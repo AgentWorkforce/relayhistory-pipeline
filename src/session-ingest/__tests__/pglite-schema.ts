@@ -19,14 +19,23 @@ import type { PGlite } from "@electric-sql/pglite";
 export const REPO_ROOT = join(import.meta.dir, "../../..");
 /** The last migration of the G4 set (55 files plus bootstrap). */
 export const G4_LAST_MIGRATION = "20261105043800_lazy_ack_clock_no_key_update.sql";
-/** The migrations G4 excludes: #332, #338, #339, #327 and #384 (in that file order). */
-export const POST_G4_MIGRATIONS = [
-  "20261105043850_ingest_acquisition_owner.sql",
-  "20261105043860_buffered_search_gate.sql",
-  "20261105043870_buffered_search_feed_cursor.sql",
-  "20261105043880_ingest_bookkeeping_cleanup.sql",
-  "20261105043890_buffered_search_gate_retired_witness.sql",
-] as const;
+/** Every supabase/migrations/*.sql filename under `root`, sorted (the migrator's apply order). */
+export function sortedMigrations(root = REPO_ROOT): string[] {
+  return readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort();
+}
+/**
+ * The migrations G4 excludes, DERIVED: every sorted migration after G4_LAST_MIGRATION. A migration
+ * that lands on main after the cutoff joins this list (and so the G4 suite's absence checks and
+ * function-body scan) automatically; g4-only-schema.pglite.test.ts pins the expected names so that
+ * drift is a visible test failure, never a silent skip. At the time of writing: 043850 (#332),
+ * 043860 (#338), 043870 (#339), 043880 (#327) and 043890 (#384).
+ */
+export const POST_G4_MIGRATIONS: readonly string[] = (() => {
+  const all = sortedMigrations();
+  const g4Index = all.indexOf(G4_LAST_MIGRATION);
+  if (g4Index < 0) throw new Error(`G4_LAST_MIGRATION names no migration: ${G4_LAST_MIGRATION}`);
+  return Object.freeze(all.slice(g4Index + 1));
+})();
 export const BOOTSTRAPS = ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"] as const;
 
 /**
@@ -34,7 +43,7 @@ export const BOOTSTRAPS = ["session_directory_search_worker", "session_token_ver
  * HOOPDB_MIGRATE_UNTIL environment variable, if set. `null`: every migration, whatever the environment.
  */
 export function migrationFiles(root = REPO_ROOT, until?: string | null): string[] {
-  const all = readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort();
+  const all = sortedMigrations(root);
   const cut = until === undefined ? process.env.HOOPDB_MIGRATE_UNTIL || null : until;
   if (cut === null) return all;
   const at = all.indexOf(cut);

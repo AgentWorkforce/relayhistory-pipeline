@@ -2,7 +2,8 @@
  * The session-ingest Worker on a G4-only database: supabase/migrations up to and including
  * 20261105043800_lazy_ack_clock_no_key_update.sql (plus bootstrap), WITHOUT 043850 (#332
  * acquisition owner), 043860 (#338 buffered search gate), 043870 (#339 buffered search feed
- * cursor) and 043880 (#327 bookkeeping cleanup). The app runs with the Worker's default flags
+ * cursor), 043880 (#327 bookkeeping cleanup), 043890 (#384) and any later migration (pglite-schema.ts
+ * derives POST_G4_MIGRATIONS from the sorted list). The app runs with the Worker's default flags
  * (canonical acceptance, async admission / babysitter routing / replica off, relayhistory
  * custody), and the buffered acceptance mode it is cut over to; every main sync ingest path
  * (acceptBatch inline + staged fan-out, slots, selection / reset, ordered controls, the
@@ -11,7 +12,7 @@
  * Async admission is proven elsewhere on G4; here one smoke case only.
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import { PGlite } from "@electric-sql/pglite";
@@ -82,6 +83,19 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
     expect(g4).toHaveLength(55);
     expect(g4.at(-1)).toBe(G4_LAST_MIGRATION);
     for (const f of POST_G4_MIGRATIONS) { expect(all).toContain(f); expect(g4).not.toContain(f); }
+    // POST_G4_MIGRATIONS is derived; it must equal exactly the files after the cutoff, read fresh here.
+    const files = readdirSync(join(REPO_ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort();
+    expect([...POST_G4_MIGRATIONS]).toEqual(files.slice(files.indexOf(G4_LAST_MIGRATION) + 1));
+    expect([...g4, ...POST_G4_MIGRATIONS]).toEqual(files);
+    // Drift alarm: a migration landing on main after G4 fails here, so its G4 impact is reviewed (the
+    // absence checks and the function-body scan below already include it through the derived list).
+    expect([...POST_G4_MIGRATIONS]).toEqual([
+      "20261105043850_ingest_acquisition_owner.sql",
+      "20261105043860_buffered_search_gate.sql",
+      "20261105043870_buffered_search_feed_cursor.sql",
+      "20261105043880_ingest_bookkeeping_cleanup.sql",
+      "20261105043890_buffered_search_gate_retired_witness.sql",
+    ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
     expect(OBJECTS.replacedFunctions).toEqual(["ingest_babysitter_retention_register", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish"]);
