@@ -2,7 +2,7 @@
  * Real-PostgreSQL proof of the managed-RDS HoopDb profile (HOOPDB_DB_MODE=rds).
  *
  * Runs against ONE disposable PostgreSQL 16+ server whose BOOTSTRAP superuser (oid 10)
- * is named rdsadmin (CI: a postgres:17 service container with POSTGRES_USER=rdsadmin;
+ * is named rdsadmin (CI: postgres:16/17 service containers with POSTGRES_USER=rdsadmin;
  * locally: `initdb -U rdsadmin`). That is what makes PostgreSQL's automatic PG16+
  * creator edge carry rdsadmin as grantor, as it does on RDS. Never point it at a real
  * database: it creates and drops roles and databases. Trust auth only.
@@ -51,6 +51,7 @@ const FIXED = [
   "anon", "authenticated", "service_role", "session_directory_search_worker",
   "session_token_verifier", "bulls96_session_ingest", "bulls96_session_ingest_seeder",
   "bulls96_canonical_feature_producer", "bulls96_read_api", "bulls96_project_events",
+  "bulls96_privacy_eraser", "bulls96_babysitter_retention",
 ];
 const RDS_ENV = {
   HOOPDB_DB_MODE: "rds",
@@ -137,9 +138,19 @@ async function edges(role: string) {
 // ---------------------------------------------------------------------------
 // Preconditions: the emulation is only meaningful with rdsadmin as oid 10 on PG16+.
 // ---------------------------------------------------------------------------
+const actualHead = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" });
+const PROOF_HEAD = actualHead.stdout?.trim() ?? "";
+const cleanTracked = [[], ["--cached"]].every((flags) =>
+  spawnSync("git", ["diff", ...flags, "--quiet"], { cwd: ROOT }).status === 0,
+);
+if (actualHead.status !== 0 || !/^[0-9a-f]{40}$/.test(PROOF_HEAD) || !cleanTracked ||
+    (process.env.PGPROOF_HEAD !== undefined && process.env.PGPROOF_HEAD !== PROOF_HEAD)) {
+  console.error("rds-profile-proof requires a clean tracked checkout at PGPROOF_HEAD; no database connection was made");
+  process.exit(2);
+}
 const head = (await sql("postgres", "SELECT current_setting('server_version_num')::int AS v, current_setting('server_version') AS s, (SELECT rolname FROM pg_roles WHERE oid = 10) AS boot")).rows[0];
 const MAJOR = (head.v / 10000) | 0;
-console.log(`# PostgreSQL ${head.s}, bootstrap superuser ${head.boot}, head ${process.env.PGPROOF_HEAD ?? "unknown"}`);
+console.log(`# PostgreSQL ${head.s}, bootstrap superuser ${head.boot}, head ${PROOF_HEAD}`);
 if (head.boot !== "rdsadmin" || SUPER !== "rdsadmin" || MAJOR < 16) {
   console.error("rds-profile-proof needs PostgreSQL 16+ initialized with bootstrap superuser rdsadmin (POSTGRES_USER=rdsadmin / initdb -U rdsadmin)");
   process.exit(2);
@@ -336,7 +347,7 @@ await check("drift refused: a runtime role created by a different rds_superuser 
   return [bootRt.sqlstate === "55000" && m.exit !== 0 && m.code === "runtime_role_unsafe", `bootstrap=${bootRt.sqlstate} migrate=${fmt(m)}`];
 });
 
-for (const role of ["bulls96_read_api", "bulls96_project_events"]) {
+for (const role of ["bulls96_read_api", "bulls96_project_events", "bulls96_privacy_eraser", "bulls96_babysitter_retention"]) {
   await check(`drift refused: ${role} with INHERIT, or with a member, is refused by rds_migration_roles.sql and left as found`, async () => {
     await sql(DB, `ALTER ROLE ${role} INHERIT`);
     const inherit = psql(DB, ["-f", ROLES_BOOT]);
@@ -360,6 +371,17 @@ for (const role of ["bulls96_read_api", "bulls96_project_events"]) {
 // ---------------------------------------------------------------------------
 // 5. Bootstrap negative paths.
 // ---------------------------------------------------------------------------
+await check("runtime bootstrap refuses every fixed role and its reserved trampoline name before changing the database ACL", async () => {
+  const before = (await sql(DB, "SELECT datacl::text AS acl FROM pg_database WHERE datname = current_database()")).rows[0];
+  const attempts = [...FIXED, "bulls96_rds_role_seed"].map((role) => {
+    const r = psql(DB, ["-v", `migration_owner=${MASTER}`, "-v", `runtime_role=${role}`, "-v", "runtime_login=false", "-f", RT_BOOT]);
+    return { role, refused: r.sqlstate === "55000" && r.out.includes("invalid role name") };
+  });
+  const after = (await sql(DB, "SELECT datacl::text AS acl FROM pg_database WHERE datname = current_database()")).rows[0];
+  const seed = (await sql(DB, "SELECT count(*)::int AS n FROM pg_roles WHERE rolname = 'bulls96_rds_role_seed'")).rows[0].n;
+  return [attempts.every((r) => r.refused) && fmt(before) === fmt(after) && seed === 0,
+    fmt({ attempts, database_acl_unchanged: fmt(before) === fmt(after), seed })];
+});
 await check("bootstraps refuse: wrong owner input, non-owned database, stale trampoline, unsafe fixed role, superuser caller", async () => {
   const wrongOwner = psql(DB, ["-v", `migration_owner=${OTHER}`, "-v", `runtime_role=${RT}`, "-v", "runtime_login=true", "-f", RT_BOOT]).sqlstate;
   await sql("postgres", `CREATE DATABASE ${DB}_other OWNER ${OTHER}`);
@@ -408,7 +430,8 @@ await check("integrity: generation is profile-independent (rds and selfhosted re
 
 const failed = cases.filter((c) => !c.pass).length;
 const results = {
-  head: process.env.PGPROOF_HEAD ?? "unknown",
+  head: PROOF_HEAD,
+  tracked_tree_clean: cleanTracked,
   pg_version: head.s,
   pg_major: MAJOR,
   bootstrap_superuser: head.boot,

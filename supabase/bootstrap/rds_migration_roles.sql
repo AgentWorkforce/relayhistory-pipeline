@@ -10,7 +10,7 @@
 -- service_role cannot be created at all without BYPASSRLS.
 -- https://www.postgresql.org/docs/17/role-attributes.html
 --
--- Use a disposable CREATEROLE trampoline instead: it creates the ten fixed NOLOGIN
+-- Use a disposable CREATEROLE trampoline instead: it creates the twelve fixed NOLOGIN
 -- roles, the same set as cloudsql_migration_roles.sql (ingest, canonical producer,
 -- project-events and read API included; their migrations only verify roles), then the migration owner drops the trampoline. DROP ROLE removes the
 -- trampoline's automatic memberships, leaving every target membership-free, so the
@@ -41,6 +41,10 @@ DECLARE
   v_problems text[] := '{}';
   v_missing boolean := false;
 BEGIN
+  IF current_setting('server_version_num')::int < 160000 THEN
+    RAISE EXCEPTION USING ERRCODE = '0A000',
+      MESSAGE = 'RDS role bootstrap requires PostgreSQL 16 or later';
+  END IF;
   SELECT * INTO v_row FROM pg_roles WHERE rolname = v_owner;
   IF v_row.rolsuper OR NOT v_row.rolcreaterole THEN
     RAISE EXCEPTION USING ERRCODE = '42501',
@@ -71,7 +75,9 @@ BEGIN
     'bulls96_session_ingest_seeder'::name,
     'bulls96_canonical_feature_producer'::name,
     'bulls96_read_api'::name,
-    'bulls96_project_events'::name
+    'bulls96_project_events'::name,
+    'bulls96_privacy_eraser'::name,
+    'bulls96_babysitter_retention'::name
   ] LOOP
     SELECT * INTO v_row FROM pg_roles WHERE rolname = v_role;
     IF NOT FOUND THEN
@@ -160,6 +166,14 @@ BEGIN
       CREATE ROLE bulls96_project_events
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_privacy_eraser') THEN
+      CREATE ROLE bulls96_privacy_eraser
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_babysitter_retention') THEN
+      CREATE ROLE bulls96_babysitter_retention
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
     RESET ROLE;
     DROP ROLE bulls96_rds_role_seed;
   END IF;
@@ -173,7 +187,8 @@ BEGIN
        'anon', 'authenticated', 'service_role', 'session_directory_search_worker',
        'session_token_verifier',
        'bulls96_session_ingest', 'bulls96_session_ingest_seeder',
-       'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events'
+       'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events',
+       'bulls96_privacy_eraser', 'bulls96_babysitter_retention'
      )
   ) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',

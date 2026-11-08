@@ -1,6 +1,6 @@
 /** Production schema release pins. No environment/credential fallback. */
 export const SCHEMA_RELEASE = {
-  repository: "AgentWorkforce/sessions-pipeline",
+  repository: "AgentWorkforce/relayhistory-pipeline",
   environment: "session-schema-production",
   project: "pyamkrhoyszgzirqqffq",
   host: "aws-0-us-east-1.pooler.supabase.com",

@@ -4,7 +4,8 @@
 -- The selfhosted hoopdb_runtime_role.sql refuses a non-superuser creator (42501), and
 -- the RDS master is not a superuser. Unlike the fixed NOLOGIN roles
 -- (rds_migration_roles.sql), the runtime LOGIN role must stay manageable by the master
--- so its password can be set and rotated from the secret manager. So the master creates
+-- so its password can be set and rotated through the approved operator path, with
+-- 1Password as the system of record. So the master creates
 -- it directly, and PostgreSQL 16+ records the unavoidable creator edge:
 --   member = the migration owner, grantor = rdsadmin (SUPERUSER),
 --   ADMIN true, INHERIT false, SET false.
@@ -17,7 +18,7 @@
 -- owned objects, no member except that exact creator edge. No workload role: on RDS its
 -- edge would be granted by the non-superuser master, which the migrator refuses
 -- (HOOPDB_RUNTIME_WORKLOAD_ROLE is refused in rds mode). It never sets a password: the
--- credential is provisioned separately (secret manager), never on disk. An existing role
+-- credential is provisioned separately from 1Password, never on disk. An existing role
 -- is only verified (55000 on any difference, nothing changed).
 --
 -- Database ACL, as in selfhosted: REVOKE TEMPORARY ON DATABASE <this database> FROM
@@ -51,6 +52,10 @@ DECLARE
   v_version int := current_setting('server_version_num')::int;
   v_public_temp boolean;
 BEGIN
+  IF v_version < 160000 THEN
+    RAISE EXCEPTION USING ERRCODE = '0A000',
+      MESSAGE = 'RDS runtime role bootstrap requires PostgreSQL 16 or later';
+  END IF;
   IF v_owner IS DISTINCT FROM current_user::text THEN
     RAISE EXCEPTION USING ERRCODE = '42501',
       MESSAGE = format('RDS runtime role bootstrap: run as the migration owner %I (connected as %I)', v_owner, current_user);
@@ -66,6 +71,9 @@ BEGIN
   IF v_role !~ '^[A-Za-z_][A-Za-z0-9_$-]{0,62}$'
      OR v_role IN ('session_directory_search_worker', 'session_token_verifier',
                    'bulls96_session_ingest', 'bulls96_session_ingest_seeder',
+                   'bulls96_canonical_feature_producer', 'bulls96_read_api',
+                   'bulls96_project_events', 'bulls96_privacy_eraser',
+                   'bulls96_babysitter_retention', 'bulls96_rds_role_seed',
                    'anon', 'authenticated', 'service_role', 'rdsadmin', 'rds_superuser')
      OR v_role = v_owner THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('RDS runtime role bootstrap: invalid role name %L', v_role);
