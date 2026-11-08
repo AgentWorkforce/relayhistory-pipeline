@@ -964,3 +964,15 @@ bootstraps before its sorted migration files.
 and effective inherited-vs-switch privileges on disposable PG15/16/17. It refuses
 existing verifier/authenticator/directory roles and requires explicit disposable
 cluster opt-in. The new proof runs before the general role proof in CI.
+
+
+### Non-superuser consumer credential check
+
+Before the first `SERVICE=session-pipeline-consumer-bootstrap` promotion by a
+non-superuser owner, follow
+[`selfhost-consumer-credential-probe.md`](../docs/selfhost-consumer-credential-probe.md).
+PostgreSQL masks even an absent password in `pg_roles`; a separate privileged
+operator installs the narrowly scoped fixed-role presence probe. This does not
+replace the owner's explicit CREATEROLE/creator-ADMIN prerequisite or grant
+catalog access. Missing helpers and unsupported managed-provider authority fail
+closed; never clear a credential or change ownership to bypass the gate.
