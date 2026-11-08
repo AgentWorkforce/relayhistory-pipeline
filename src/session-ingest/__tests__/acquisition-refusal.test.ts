@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
-import { ACQUISITION_ENROLLED_SOURCES, ACQUISITION_REFUSAL_CODES, AcquisitionRefusedError, acquisitionRefusalFrom } from "../acquisition-refusal.ts";
+import { ACQUISITION_REFUSAL_CODES, AcquisitionRefusedError, acquisitionRefusalFrom } from "../acquisition-refusal.ts";
 import { sqlLedger } from "../ledger-sql.ts";
 import type { ClaimInput } from "../ledger.ts";
 import { DeliveryError } from "../vendor/delivery/delivery-contracts.ts";
@@ -29,6 +29,15 @@ describe("acquisitionRefusalFrom: closed parse", () => {
     }
   });
 
+  test("owner_changed with an empty sessionId (publication of an enrolled source without a session) is the 409, not a 503", () => {
+    // Exactly what ingest_acquisition_publication_epoch raises when the publication record has no session id.
+    const detail = [{ source: "droid", sessionId: "", code: "owner_changed" }];
+    const r = acquisitionRefusalFrom(pgError("owner_changed", detail));
+    expect(r).toBeInstanceOf(AcquisitionRefusedError);
+    expect([r!.status, r!.code]).toEqual([409, "acquisition_refused"]);
+    expect(r!.refused).toEqual(detail);
+  });
+
   test("a mixed batch names every refused session in DETAIL order", () => {
     const list = [one("not_owner", "droid", "a"), one("owner_draining", "droid", "b"), one("session_required")];
     expect(acquisitionRefusalFrom(pgError("not_owner", list))!.refused).toEqual(list);
@@ -46,7 +55,9 @@ describe("acquisitionRefusalFrom: closed parse", () => {
       pgError("owner_unknown", [{ ...one("owner_unknown"), extra: 1 }]),
       pgError("owner_unknown", [{ source: "droid", sessionId: 1, code: "owner_unknown" }]),
       pgError("owner_unknown", [one("owner_unknown"), one("session_busy")]), // unknown code inside
-      pgError("owner_unknown", [{ source: "droid", sessionId: "", code: "owner_unknown" }]), // only session_required has no session
+      pgError("owner_unknown", [{ source: "droid", sessionId: "", code: "owner_unknown" }]), // only session_required/owner_changed may lack a session
+      pgError("not_owner", [{ source: "droid", sessionId: "", code: "not_owner" }], "42501"),
+      pgError("owner_changed", [{ source: "", sessionId: "", code: "owner_changed" }]), // a source is still required
       pgError("session_required", [{ source: "droid", sessionId: "x", code: "session_required" }]),
       pgError("owner_unknown", [], "55000", "not json"),
       pgError("owner_unknown", [], "55000", JSON.stringify({ source: "droid" })),
@@ -83,7 +94,7 @@ describe("ledger-sql: the refusal crosses the ledger boundary as the 409", () =>
   });
 });
 
-describe("HTTP: 409 acquisition_refused at claim and at commit; limits advertise enrolled sources", () => {
+describe("HTTP: 409 acquisition_refused at claim and at commit; limits unchanged", () => {
   const cleanups: (() => void)[] = [];
   afterEach(() => cleanups.splice(0).forEach((f) => f()));
   const good = encodeIdentity({ ...TENANT, scopes: [SYNC_SCOPE] });
@@ -125,10 +136,10 @@ describe("HTTP: 409 acquisition_refused at claim and at commit; limits advertise
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe("delivery_unavailable");
   });
 
-  test("GET /v1/delivery/limits advertises the enrolled sources: none (dormant)", async () => {
-    expect(ACQUISITION_ENROLLED_SOURCES).toEqual([]);
+  test("GET /v1/delivery/limits is unchanged: no acquisition field (advertising enrolled sources is not in this change)", async () => {
     const res = await app(new MemoryLedger()).fetch(new Request("https://x/v1/delivery/limits", { headers: { [IDENTITY_HEADER]: good } }));
-    expect(((await res.json()) as { acquisitionEnrolledSources: unknown }).acquisitionEnrolledSources).toEqual([]);
+    const json = (await res.json()) as Record<string, unknown>;
+    expect(Object.keys(json).sort()).toEqual(["contentEncodings", "maxRecords", "maxRequestBytes"]);
+    expect("acquisitionEnrolledSources" in json).toBe(false);
   });
 });
-

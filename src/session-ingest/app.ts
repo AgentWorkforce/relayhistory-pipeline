@@ -40,7 +40,7 @@ import { deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } fr
 import { LedgerUnavailableError } from "./ledger.ts";
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
-import { ACQUISITION_ENROLLED_SOURCES, AcquisitionRefusedError } from "./acquisition-refusal.ts";
+import { AcquisitionRefusedError } from "./acquisition-refusal.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
 import { parseTurnBatch } from "./turns.ts";
@@ -406,8 +406,7 @@ export function createIngestApp(deps: IngestAppDeps) {
     }
   });
 
-  // acquisitionEnrolledSources: Desktop holds these sources' records until it has a grant (design §5.6). Empty: dormant.
-  app.get("/v1/delivery/limits", (c) => c.json({ ...DELIVERY_LIMITS, contentEncodings: contentEncodings(), acquisitionEnrolledSources: [...ACQUISITION_ENROLLED_SOURCES] }));
+  app.get("/v1/delivery/limits", (c) => c.json({ ...DELIVERY_LIMITS, contentEncodings: contentEncodings() }));
 
   // One acceptance path for the public delivery shape and the private turns shape: the
   // same custody (relayhistory witness, shadow, or frozen-supabase), claim, buffer and receipt.

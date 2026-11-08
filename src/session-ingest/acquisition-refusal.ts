@@ -12,18 +12,16 @@ import { DeliveryError } from "./vendor/delivery/delivery-contracts.ts";
  * suppresses records), 401/403/412/423 (stalls the install), 404/410, 429 or a
  * partial 2xx. Today's Desktop retries this 409 as transient.
  *
- * DORMANT: the database raises these only for an enrolled (org, workspace, source),
- * and no source is enrolled; `ACQUISITION_ENROLLED_SOURCES` is empty.
+ * DORMANT: the database raises these only while the owner-only hooks flag
+ * (`sessions.ingest_acquisition_hooks_switch.enabled`, default false) is on and only
+ * for an enrolled (org, workspace, source). Advertising enrolled sources to Desktop
+ * (GET /v1/delivery/limits) is deliberately not part of this change.
  *
  * Parsing is closed: only our own exact message, an expected SQLSTATE, and a
  * well-formed, bounded DETAIL become a 409. Anything else stays the ledger's 503.
  * The refused list echoes only the caller's own (source, sessionId) pairs; it is
  * returned to the caller and never logged.
  */
-
-/** The sources whose records Desktop must hold until it has a grant (GET /v1/delivery/limits).
- * Empty: enrollment is an owner step behind Khaliq's explicit OK and ships with Desktop's P2. */
-export const ACQUISITION_ENROLLED_SOURCES: readonly string[] = Object.freeze([]);
 
 /** Refusal code -> the SQLSTATE the database raises it with (`ingest_acquisition_refuse`). */
 const REFUSAL_SQLSTATE: ReadonlyMap<string, string> = new Map([
@@ -82,8 +80,9 @@ export function acquisitionRefusalFrom(error: unknown): AcquisitionRefusedError 
       const { source, sessionId, code } = item as Record<string, unknown>;
       if (typeof source !== "string" || typeof sessionId !== "string" || typeof code !== "string") return undefined;
       if (source === "" || source.length > MAX_FIELD || sessionId.length > MAX_FIELD || !REFUSAL_SQLSTATE.has(code)) return undefined;
-      // Only session_required names a source without a session.
-      if ((sessionId === "") !== (code === "session_required")) return undefined;
+      // session_required always names a source without a session; owner_changed may (a publication
+      // whose enrolled source has no session id, ingest_acquisition_publication_epoch). No other code may.
+      if (sessionId === "" ? code !== "session_required" && code !== "owner_changed" : code === "session_required") return undefined;
       refused.push(Object.freeze({ source, sessionId, code }));
     }
     if (refused[0]!.code !== first) return undefined;

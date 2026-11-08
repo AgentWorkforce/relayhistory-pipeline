@@ -204,6 +204,9 @@
     "sessions.ingest_acquisition_grant_hash(text,text,text,text,text,text)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_acquisition_hooks_live()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_acquisition_install(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_acquisition_installer:EXECUTE"
@@ -242,6 +245,9 @@
     "sessions.ingest_acquisition_revoke(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_acquisition_installer:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_set_hooks(boolean)": [
+      "<owner>:EXECUTE"
     ],
     "sessions.ingest_acquisition_sorted(jsonb)": [
       "<owner>:EXECUTE"

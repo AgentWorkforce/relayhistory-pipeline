@@ -4,20 +4,30 @@
 -- scripts/sessions-function-boundary/lanes/acquisition-owner.ts):
 -- supabase/rollbacks/20261105052000_ingest_acquisition_owner.down.sql. Runbook: docs/ingest-acquisition-owner.md.
 --
--- DORMANT. Applying this changes no answer for any source:
+-- DORMANT BEHIND A FLAG. Applying this changes no answer for any source:
+--   * Flag sessions.ingest_acquisition_hooks_switch.enabled (default false; owner-only setter
+--     sessions.ingest_acquisition_set_hooks(boolean), no role may call it) gates every hook-side acquisition step.
+--     While it is false each replaced hook behaves as its prior body: no enrollment-gate row lock, no advisory
+--     lock, no admission and no new failure path, and a request carrying an `acquisition` key is refused as
+--     malformed exactly as before. The only residual cost is an ACCESS SHARE relation lock on the one-row switch
+--     table (the flag read), which waits only while the owner flips the flag or runs DDL on that table.
 --   * sessions.ingest_acquisition_switch.install_enabled is false: every install refuses `disabled`.
---   * sessions.ingest_acquisition_enrollment is empty: no (org, workspace, source) is protected, so every hook
---     below keeps today's behaviour. The only new cost on an unenrolled write is one shared row lock on
---     sessions.ingest_acquisition_enrollment_gate (design §4.8), which is busy (40001) only while an owner-run
---     enroll_begin is waiting for writers to drain.
---   * enroll_begin/enroll_complete are granted to no role; only the owner runs them, under a separate explicit OK.
+--   * enroll_begin refuses `hooks_disabled` until the flag is on, and the flag cannot be turned off while any
+--     enrollment row exists, so data alone never arms a hook and an armed source is never silently unprotected.
+--   * enroll_begin/enroll_complete/set_hooks are granted to no role; only the owner runs them, under a separate
+--     explicit OK. Rollback: the generated rollback refuses (55000) while the flag is on; turn it off first.
 --   * bulls96_acquisition_installer (NOLOGIN from the role bootstrap) may run install/revoke/rebind/status only.
 --
--- Plain transactional DDL. The step-8 freshness and backfill scans read existing (org_id, workspace_id, ...)
+-- Plain transactional DDL (no CONCURRENTLY: the migrator applies this file in one transaction). The step-8
+-- freshness and backfill scans read existing (org_id, workspace_id, ...)
 -- primary keys; any extra index they need is a CONCURRENTLY operator step with no slot (design §8.3).
 --
 -- Every replaced hook below is the CURRENT body (20261104055000 / 20261104060000) with only the acquisition
 -- calls inserted; each replaced body is listed in the lane manifest so the rollback restores it byte-for-byte.
+
+-- Fail fast instead of queueing live readers/writers behind a blocked DDL lock (migrate.ts applies
+-- each file in one transaction, so SET LOCAL lasts exactly as long as this file).
+SET LOCAL lock_timeout='5s';
 DO $acquisition_creator$
 DECLARE me oid;
 BEGIN
@@ -51,6 +61,10 @@ CREATE TABLE sessions.ingest_acquisition_switch(          -- dormant: install re
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  install_enabled boolean NOT NULL DEFAULT false,changed_at timestamptz NOT NULL DEFAULT clock_timestamp());
 INSERT INTO sessions.ingest_acquisition_switch DEFAULT VALUES;
+CREATE TABLE sessions.ingest_acquisition_hooks_switch(    -- flag: hook-side acquisition off until true
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ enabled boolean NOT NULL DEFAULT false,changed_at timestamptz NOT NULL DEFAULT clock_timestamp());
+INSERT INTO sessions.ingest_acquisition_hooks_switch DEFAULT VALUES;
 CREATE TABLE sessions.ingest_acquisition_enrollment_gate( -- §4.8 interlock row; never deleted
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),generation bigint NOT NULL DEFAULT 0 CHECK(generation>=0));
 INSERT INTO sessions.ingest_acquisition_enrollment_gate DEFAULT VALUES;
@@ -104,11 +118,18 @@ CREATE TABLE sessions.ingest_acquisition_operations(      -- idempotency ledger 
  org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
  revision bigint NOT NULL CHECK(revision>0),request_sha256 text NOT NULL CHECK(request_sha256~'^[0-9a-f]{64}$'),
  result jsonb NOT NULL CHECK(jsonb_typeof(result)='object'),created_at timestamptz NOT NULL DEFAULT clock_timestamp());
-ALTER TABLE sessions.ingest_claim_attempts ADD COLUMN acquisition jsonb NOT NULL DEFAULT '[]'
- CHECK(jsonb_typeof(acquisition)='array');                -- admitted [{source,session_id,owner_epoch,grant_id}]
-ALTER TABLE sessions.ingest_publication_heads ADD COLUMN acquisition_epoch bigint NOT NULL DEFAULT 0 CHECK(acquisition_epoch>=0);
+-- Hot tables. Constant defaults: no table rewrite. The CHECKs are added NOT VALID (enforced for every new or updated
+-- row; existing rows hold the default and satisfy them), so the ACCESS EXCLUSIVE lock (bounded by lock_timeout
+-- above) is not held for a validation scan. The operator runs VALIDATE CONSTRAINT later (SHARE UPDATE EXCLUSIVE,
+-- readers and writers keep running); see docs/ingest-acquisition-owner.md.
+ALTER TABLE sessions.ingest_claim_attempts ADD COLUMN acquisition jsonb NOT NULL DEFAULT '[]',
+ ADD CONSTRAINT ingest_claim_attempts_acquisition_check
+  CHECK(jsonb_typeof(acquisition)='array')NOT VALID;       -- admitted [{source,session_id,owner_epoch,grant_id}]
+ALTER TABLE sessions.ingest_publication_heads ADD COLUMN acquisition_epoch bigint NOT NULL DEFAULT 0,
+ ADD CONSTRAINT ingest_publication_heads_acquisition_epoch_check CHECK(acquisition_epoch>=0)NOT VALID;
 
 ALTER TABLE sessions.ingest_acquisition_switch ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions.ingest_acquisition_hooks_switch ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.ingest_acquisition_enrollment_gate ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.ingest_acquisition_enrollment ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.ingest_acquisition_owners ENABLE ROW LEVEL SECURITY;
@@ -117,7 +138,7 @@ ALTER TABLE sessions.ingest_acquisition_grant_origins ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.ingest_acquisition_revoked_grants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.ingest_acquisition_revoked_lineages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE sessions.ingest_acquisition_operations ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON sessions.ingest_acquisition_switch,sessions.ingest_acquisition_enrollment_gate,
+REVOKE ALL ON sessions.ingest_acquisition_switch,sessions.ingest_acquisition_hooks_switch,sessions.ingest_acquisition_enrollment_gate,
  sessions.ingest_acquisition_enrollment,sessions.ingest_acquisition_owners,sessions.ingest_acquisition_grants,
  sessions.ingest_acquisition_grant_origins,sessions.ingest_acquisition_revoked_grants,
  sessions.ingest_acquisition_revoked_lineages,sessions.ingest_acquisition_operations
@@ -152,6 +173,47 @@ EXCEPTION WHEN lock_not_available THEN
  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='acquisition: session_busy';
 END $gate$;
 
+-- The flag read, first in every hook-side internal. Statement 1 takes ACCESS SHARE on the switch table (held to the
+-- end of the transaction, so the owner's set_hooks cannot flip the flag under a caller that read it); statement 2
+-- reads the row with a snapshot taken after that lock. Under READ COMMITTED it takes no row lock. Under REPEATABLE
+-- READ/SERIALIZABLE the read is FOR SHARE, so a flag flipped after the caller's snapshot raises PostgreSQL's own
+-- 40001 instead of returning the stale value. Missing row = off.
+CREATE FUNCTION sessions.ingest_acquisition_hooks_live() RETURNS boolean
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $hooks_live$
+DECLARE v_enabled boolean;
+BEGIN
+ PERFORM 1 FROM sessions.ingest_acquisition_hooks_switch WHERE false;
+ IF current_setting('transaction_isolation')='read committed' THEN
+  SELECT enabled INTO v_enabled FROM sessions.ingest_acquisition_hooks_switch WHERE singleton;
+ ELSE
+  SELECT enabled INTO v_enabled FROM sessions.ingest_acquisition_hooks_switch WHERE singleton FOR SHARE;
+ END IF;
+ RETURN coalesce(v_enabled,false);
+END $hooks_live$;
+
+-- Owner-only flag setter (no grants). ACCESS EXCLUSIVE on the switch table waits out every transaction that read
+-- the flag (busy past lock_timeout = 55000 hooks_not_quiescent), so no hook straddles a flip. Turning the flag off
+-- is refused while any enrollment row exists (enroll_begin holds the row FOR SHARE, so it cannot race this).
+-- Update the flag only through this function.
+CREATE FUNCTION sessions.ingest_acquisition_set_hooks(p_enabled boolean) RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp SET lock_timeout='5s' AS $set_hooks$
+DECLARE v_enabled boolean;
+BEGIN
+ IF p_enabled IS NULL THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='acquisition: invalid_request';END IF;
+ BEGIN
+  LOCK TABLE sessions.ingest_acquisition_hooks_switch IN ACCESS EXCLUSIVE MODE;
+ EXCEPTION WHEN lock_not_available THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: hooks_not_quiescent';
+ END;
+ SELECT enabled INTO v_enabled FROM sessions.ingest_acquisition_hooks_switch WHERE singleton;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: hooks switch row missing';END IF;
+ IF v_enabled=p_enabled THEN RETURN v_enabled;END IF;
+ IF NOT p_enabled AND EXISTS(SELECT 1 FROM sessions.ingest_acquisition_enrollment) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: hooks_enrolled';END IF;
+ UPDATE sessions.ingest_acquisition_hooks_switch SET enabled=p_enabled,changed_at=clock_timestamp() WHERE singleton;
+ RETURN p_enabled;
+END $set_hooks$;
+
 -- Sorted, distinct [source, session] pairs of a jsonb pair array (any order, duplicates allowed).
 CREATE FUNCTION sessions.ingest_acquisition_sorted(p_pairs jsonb) RETURNS jsonb
 LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $sorted$
@@ -162,6 +224,7 @@ $sorted$;
 -- Hook-side LE + LA (§4.5): the gate, then the enrollment rows of the batch's sources FOR SHARE NOWAIT, then
 -- pg_try_advisory_xact_lock_shared per enrolled session in (source, session) COLLATE "C" order. Unenrolled pairs
 -- take no LA. p_exclusive is for the control functions (one pair, no gate: they read enrollment themselves).
+-- With the hooks flag off the shared form returns before taking anything.
 CREATE FUNCTION sessions.ingest_acquisition_lock(p_org text,p_ws text,p_pairs jsonb,p_exclusive boolean) RETURNS void
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lock$
 DECLARE x record;
@@ -173,6 +236,7 @@ BEGIN
   END LOOP;
   RETURN;
  END IF;
+ IF NOT sessions.ingest_acquisition_hooks_live() THEN RETURN;END IF; -- flag off: no gate, no LA
  PERFORM sessions.ingest_acquisition_gate();
  BEGIN
   PERFORM 1 FROM sessions.ingest_acquisition_enrollment e
@@ -191,8 +255,10 @@ BEGIN
 END $lock$;
 
 -- Raise a batch refusal: the first refusal's SQLSTATE and code, DETAIL = every [{source,sessionId,code}] (§5.6).
+-- VOLATILE on purpose: it exists for its side effect (raising). An IMMUTABLE or STABLE function with constant
+-- arguments may be evaluated once at plan time or folded, which must never happen to a refusal.
 CREATE FUNCTION sessions.ingest_acquisition_refuse(p_refused jsonb) RETURNS void
-LANGUAGE plpgsql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $refuse$
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $refuse$
 DECLARE v_code text;
 BEGIN
  IF p_refused IS NULL OR jsonb_array_length(p_refused)=0 THEN RETURN;END IF;
@@ -211,6 +277,10 @@ DECLARE v_pairs jsonb:=sessions.ingest_acquisition_sorted(p_pairs);v_acq jsonb:=
  e jsonb;v_ps text;v_pi text;x record;o sessions.ingest_acquisition_owners%ROWTYPE;g sessions.ingest_acquisition_grants%ROWTYPE;
  v_entry jsonb;v_code text;v_refused jsonb:='[]';v_snap jsonb:='[]';
 BEGIN
+ IF NOT sessions.ingest_acquisition_hooks_live() THEN -- flag off: no admission (the caller already refused the key)
+  IF v_acq<>'[]'::jsonb THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='acquisition: acquisition_unexpected';END IF;
+  RETURN '[]'::jsonb;
+ END IF;
  IF jsonb_typeof(v_acq)<>'array' OR jsonb_array_length(v_acq)>500 THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='acquisition: invalid_request';END IF;
  -- Strict entry validation, never normalized (§5.1).
@@ -276,6 +346,7 @@ CREATE FUNCTION sessions.ingest_acquisition_fenced(p_org text,p_ws text,p_snapsh
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $fenced$
 BEGIN
  IF p_mode NOT IN('admit','publish') THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='acquisition: invalid_request';END IF;
+ IF NOT sessions.ingest_acquisition_hooks_live() THEN RETURN '[]'::jsonb;END IF; -- flag off: never refuses
  RETURN (SELECT coalesce(jsonb_agg(jsonb_build_object('source',q->>0,'sessionId',q->>1,'code','owner_changed')
    ORDER BY (q->>0) COLLATE "C",(q->>1) COLLATE "C"),'[]'::jsonb)
   FROM jsonb_array_elements(sessions.ingest_acquisition_sorted(p_pairs)) q
@@ -295,6 +366,7 @@ CREATE FUNCTION sessions.ingest_acquisition_publication_epoch(p_org text,p_ws te
 RETURNS bigint LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $epoch$
 DECLARE v_epoch bigint;
 BEGIN
+ IF NOT sessions.ingest_acquisition_hooks_live() THEN RETURN 0;END IF; -- flag off: today's heads, no gate
  PERFORM sessions.ingest_acquisition_gate();
  IF NOT EXISTS(SELECT 1 FROM sessions.ingest_acquisition_enrollment n
    WHERE n.org_id=p_org AND n.workspace_id=p_ws AND n.source=p_source) THEN RETURN 0;END IF;
@@ -315,6 +387,7 @@ CREATE FUNCTION sessions.ingest_acquisition_publish_check(p_org text,p_ws text,p
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $publish$
 DECLARE v_pairs jsonb;v_refused jsonb;
 BEGIN
+ IF NOT sessions.ingest_acquisition_hooks_live() THEN RETURN;END IF; -- flag off: no gate, no recheck
  v_pairs:=(SELECT coalesce(jsonb_agg(jsonb_build_array(h->>'source',h->>'sessionId')),'[]'::jsonb)
   FROM jsonb_array_elements(coalesce(p_heads,'[]'::jsonb)) h WHERE NOT(h->>'source'='_none' AND h->>'sessionId'='_origin'));
  PERFORM sessions.ingest_acquisition_lock(p_org,p_ws,v_pairs,false);
@@ -336,6 +409,7 @@ CREATE FUNCTION sessions.ingest_acquisition_pointer_owner(p_org text,p_ws text,p
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $pointer$
 DECLARE o sessions.ingest_acquisition_owners%ROWTYPE;
 BEGIN
+ IF NOT sessions.ingest_acquisition_hooks_live() THEN RETURN NULL;END IF; -- flag off: today's guard, no gate
  PERFORM sessions.ingest_acquisition_gate();
  IF NOT EXISTS(SELECT 1 FROM sessions.ingest_acquisition_enrollment n
    WHERE n.org_id=p_org AND n.workspace_id=p_ws AND sessions.ingest_publication_component(n.source)=p_harness) THEN
@@ -682,6 +756,8 @@ BEGIN
 END $status$;
 
 -- §4.8 enroll_begin (owner-run, no role): wait for every LE holder by updating the gate row, then mark enrolling.
+-- Refused (55000 hooks_disabled) unless the hooks flag is on; the flag row is held FOR SHARE so set_hooks cannot
+-- turn it off until this transaction ends.
 CREATE FUNCTION sessions.ingest_acquisition_enroll_begin(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $enroll_begin$
 DECLARE v_gen bigint;v_state text;
@@ -694,6 +770,12 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='acquisition: invalid_request';
  END;
  IF current_setting('lock_timeout')='0' THEN PERFORM set_config('lock_timeout','5s',true);END IF;
+ BEGIN
+  PERFORM 1 FROM sessions.ingest_acquisition_hooks_switch WHERE singleton AND enabled FOR SHARE;
+  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: hooks_disabled';END IF;
+ EXCEPTION WHEN lock_not_available THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: hooks_not_quiescent';
+ END;
  BEGIN
   UPDATE sessions.ingest_acquisition_enrollment_gate SET generation=generation+1 WHERE singleton RETURNING generation INTO v_gen;
  EXCEPTION WHEN lock_not_available THEN
@@ -776,7 +858,8 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: explicit buffered witness required';END IF;
   PERFORM sessions.ingest_require_role('bulls96_session_ingest');
   IF p_mode NOT IN ('buffered','canonical') THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: invalid publication mode'; END IF;
-  PERFORM sessions.ingest_exact_keys(p-'acquisition',
+  -- Flag off: an `acquisition` key is malformed input, exactly as before this migration.
+  PERFORM sessions.ingest_exact_keys(CASE WHEN sessions.ingest_acquisition_hooks_live() THEN p-'acquisition' ELSE p END,
     ARRAY['tenant', 'originId', 'batchId', 'batchDigest', 'receiptId', 'sessions', 'records']);
   k := sessions.ingest_batch_key(p);
   IF jsonb_typeof(p -> 'receiptId') IS DISTINCT FROM 'string'
@@ -1245,7 +1328,7 @@ BEGIN
   v_fenced:=sessions.ingest_attempt_fenced(k.org_id,k.workspace_id,k.user_id,k.origin_id,v_epochs,v_pairs);
   PERFORM sessions.ingest_acquisition_lock(k.org_id,k.workspace_id,v_pairs,false);
   PERFORM sessions.ingest_acquisition_refuse(sessions.ingest_acquisition_fenced(k.org_id,k.workspace_id,
-    coalesce((SELECT c.acquisition FROM sessions.ingest_claim_attempts c WHERE c.claim_token::text=p->>'claimToken'),'[]'::jsonb),v_pairs,'admit'));
+    coalesce((SELECT c.acquisition FROM sessions.ingest_claim_attempts c WHERE c.claim_token=(p->>'claimToken')::uuid),'[]'::jsonb),v_pairs,'admit'));
   SELECT EXISTS(SELECT 1 FROM jsonb_array_elements(v_fenced) AS x(pair)
     WHERE NOT EXISTS(SELECT 1 FROM sessions.upload_deletions AS d
       WHERE d.org_id=k.org_id AND d.workspace_id=k.workspace_id AND d.user_id=k.user_id
@@ -1622,6 +1705,7 @@ END $guard$;
 -- no role (owner-run); bulls96_session_ingest reaches the internals only through the replaced definer hooks.
 REVOKE ALL ON FUNCTION sessions.ingest_acquisition_lock_key(text,text,text,text,text),
  sessions.ingest_acquisition_grant_hash(text,text,text,text,text,text),sessions.ingest_acquisition_gate(),
+ sessions.ingest_acquisition_hooks_live(),sessions.ingest_acquisition_set_hooks(boolean),
  sessions.ingest_acquisition_sorted(jsonb),sessions.ingest_acquisition_lock(text,text,jsonb,boolean),
  sessions.ingest_acquisition_refuse(jsonb),sessions.ingest_acquisition_admit(text,text,text,text,jsonb,jsonb,jsonb),
  sessions.ingest_acquisition_fenced(text,text,jsonb,jsonb,text),

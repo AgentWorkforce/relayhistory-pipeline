@@ -112,7 +112,7 @@ async function waitForBlocker(pool:pg.Pool,waiter:()=>Promise<number|undefined>,
  throw Error("expected_fixture_lock_wait_missing");
 }
 const INSTALLER="bulls96_acquisition_installer";
-const TABLES=["switch","enrollment_gate","enrollment","owners","grants","grant_origins","revoked_grants","revoked_lineages","operations"];
+const TABLES=["switch","hooks_switch","enrollment_gate","enrollment","owners","grants","grant_origins","revoked_grants","revoked_lineages","operations"];
 async function acquisitionState(pool:pg.Pool){
  const out:Record<string,unknown>={};
  for(const t of TABLES)out[t]=(await pool.query(`SELECT coalesce(jsonb_agg(to_jsonb(x) ORDER BY to_jsonb(x)::text),'[]') j FROM sessions.ingest_acquisition_${t} x`)).rows[0].j;
@@ -124,7 +124,7 @@ const enroll=async(pool:pg.Pool,s:Scope)=>{
 };
 const status=(pool:pg.Pool,s:Scope,ids:string[])=>rpc(pool,INSTALLER,"ingest_acquisition_status",{orgId:s.org,workspaceId:s.ws,source:s.src,sessionIds:ids});
 
-describe.skipIf(!url)("§3 vectors (no database)",()=>{
+describe("§3 vectors (no database)",()=>{
  test("grant hash and request digest vectors, Ed25519 evidence over A",()=>{
   const g=G("0123456789abcdef"),id="00000000-0000-4000-8000-000000000001";
   expect(grantHash("org_test","ws_test","droid","sess-0001",id,g)).toBe("eca3f7669845e8b736db441074fcbaa51183bfb167f7cc71003d4d564496d227");
@@ -175,7 +175,7 @@ describe.skipIf(!url)("acquisition control plane on actual PostgreSQL",()=>{
  });
 
  test("dormant defaults: switch off, no enrollment, gate 0; install refuses disabled with zero writes",async()=>{
-  expect(await acquisitionState(pool)).toMatchObject({switch:[{singleton:true,install_enabled:false}],enrollment_gate:[{singleton:true,generation:0}],
+  expect(await acquisitionState(pool)).toMatchObject({switch:[{singleton:true,install_enabled:false}],hooks_switch:[{singleton:true,enabled:false}],enrollment_gate:[{singleton:true,generation:0}],
    enrollment:[],owners:[],grants:[],grant_origins:[],revoked_grants:[],revoked_lineages:[],operations:[]});
   expect((await pool.query("SELECT count(*)::int n FROM sessions.ingest_claim_attempts WHERE acquisition<>'[]'")).rows[0].n).toBe(0);
   await zeroWrite(()=>install(installBody(S,{session:"dormant-1"})),refusal("55000","disabled"));
@@ -183,6 +183,32 @@ describe.skipIf(!url)("acquisition control plane on actual PostgreSQL",()=>{
   await zeroWrite(()=>rpc(pool,null,"ingest_acquisition_install",body(installBody(S,{session:"dormant-1"}))),refusal("42501","not_installer"));
   await zeroWrite(()=>rpc(pool,null,"ingest_acquisition_status",{orgId:S.org,workspaceId:S.ws,source:S.src,sessionIds:["x"]}),refusal("42501","not_installer"));
  });
+
+ test("hooks flag: off by default; enroll_begin hooks_disabled; set_hooks owner-only, drains readers, refuses disarm while enrolled",async()=>{
+  const live=async()=>(await pool.query("SELECT sessions.ingest_acquisition_hooks_live() l")).rows[0].l;
+  const setHooks=async(on:boolean|null)=>(await pool.query("SELECT sessions.ingest_acquisition_set_hooks($1) r",[on])).rows[0].r;
+  const asRole=async(role:string,sql:string)=>{const c=await hold(pool);try{await c.c.query("SET LOCAL ROLE "+role);return (await c.c.query(sql)).rows;}finally{await c.rollback();}};
+  expect(await live()).toBe(false);
+  await zeroWrite(()=>rpc(pool,null,"ingest_acquisition_enroll_begin",{orgId:S.org,workspaceId:S.ws,source:S.src}),refusal("55000","hooks_disabled"));
+  for(const role of[INSTALLER,"bulls96_session_ingest"])for(const sql of["SELECT sessions.ingest_acquisition_set_hooks(true)","SELECT sessions.ingest_acquisition_hooks_live()"])
+   await expect(asRole(role,sql)).rejects.toMatchObject({code:"42501"});
+  await expect(setHooks(null)).rejects.toMatchObject(refusal("22023","invalid_request"));
+  expect(await setHooks(true)).toBe(true);expect(await setHooks(true)).toBe(true);expect(await live()).toBe(true);
+  // A transaction that read the flag holds ACCESS SHARE until it ends: set_hooks waits it out (5s), then refuses.
+  const reader=await hold(pool);
+  try{await reader.c.query("SELECT sessions.ingest_acquisition_hooks_live()");
+   await expect(setHooks(false)).rejects.toMatchObject(refusal("55000","hooks_not_quiescent"));
+  }finally{await reader.rollback();}
+  // Disarm is refused while any enrollment row exists (here an uncommitted begin, which then rolls back).
+  const c=await hold(pool);
+  try{expect((await c.c.query("SELECT sessions.ingest_acquisition_enroll_begin($1::jsonb) r",[JSON.stringify({orgId:S.org,workspaceId:S.ws,source:S.src})])).rows[0].r)
+    .toEqual({state:"enrolling",generation:"1"});
+   await expect(c.c.query("SELECT sessions.ingest_acquisition_set_hooks(false)")).rejects.toMatchObject(refusal("55000","hooks_enrolled"));
+  }finally{await c.rollback();}
+  expect(await acquisitionState(pool)).toMatchObject({hooks_switch:[{enabled:true}],enrollment_gate:[{generation:0}],enrollment:[]});
+  // With no enrollment the flag can go back off and on.
+  expect(await setHooks(false)).toBe(false);expect(await live()).toBe(false);expect(await setHooks(true)).toBe(true);
+ },30000);
 
  test("request shape and digest: invalid_request and request_digest_mismatch, byte-exact, zero writes",async()=>{
   const ok=installBody(S,{session:"shape-1"});const bad:Array<Record<string,unknown>>=[
@@ -472,8 +498,8 @@ async function ingest(prefix:string,withAcquisition=true){
  return {pool,run,calls,deliver,holdNext,frontier,pubClaim,pointer};
 }
 
-describe.skipIf(!url)("unenrolled sources are byte-identical to main through every hooked path",()=>{
- test("same workload, with and without the migration: identical RPC results and ledger rows",async()=>{
+describe.skipIf(!url)("flag off, and flag on with unenrolled sources, are byte-identical to main through every hooked path",()=>{
+ test("same workload: migration with flag off, migration with flag on, no migration: identical RPC results and ledger rows",async()=>{
   // Stage objects embed the per-attempt stage token, so their digest/key differ run to run; mask those and order
   // rows after masking. Record digests, revisions, states, receipts and pointer results stay compared byte-for-byte.
   const normalize=(v:unknown)=>{
@@ -499,6 +525,8 @@ describe.skipIf(!url)("unenrolled sources are byte-identical to main through eve
    return normalize({calls:f.calls,tables});
   };
   const withMigration=await workload(await ingest("acq_identity_a",true));
+  const armed=await ingest("acq_identity_c",true);await armed.pool.query("SELECT sessions.ingest_acquisition_set_hooks(true)");
+  const withFlag=await workload(armed);
   const main=await workload(await ingest("acq_identity_b",false));
   expect(new Set((withMigration as any).calls.map((c:any)=>c.fn))).toEqual(new Set(["ingest_claim_buffered_batch","ingest_prepare_buffer_stage",
    "ingest_commit_buffered_batch","ingest_publication_claim"]));
@@ -507,6 +535,29 @@ describe.skipIf(!url)("unenrolled sources are byte-identical to main through eve
   for(const k of["ingest_batches","ingest_claim_attempts","ingest_session_ownership","ingest_publication_heads","session_index","ingest_stage_intents"])
    expect(t[k].length).toBeGreaterThan(0);
   expect(withMigration).toEqual(main);
+  expect(withFlag).toEqual(main);
+ },360000);
+
+ test("flag off: hooks take no gate (writes proceed while the gate row is locked); acquisition key stays malformed; enroll_begin hooks_disabled",async()=>{
+  const f=await ingest("acq_flag_off");await f.frontier();
+  const g=await hold(f.pool);
+  try{await g.c.query("SELECT 1 FROM sessions.ingest_acquisition_enrollment_gate FOR UPDATE");
+   expect((await f.deliver([record({record_id:"ff-1"})],{batch_id:"ff-batch-1"})).outcome).toBe("accepted_buffered");
+   expect((await f.pointer({harness:"claude",session:"ff-legacy-1"})).rows[0].applied).toBe(true);
+   expect((await f.pubClaim("ff-batch-1")).heads.length).toBeGreaterThan(0);
+   // Control: armed, the same held gate row makes the claim busy (503), so the assertions above are meaningful.
+   await f.pool.query("SELECT sessions.ingest_acquisition_set_hooks(true)");
+   const busy=await f.deliver([record({record_id:"ff-2",session_id:"ff-s-2"})],{batch_id:"ff-batch-2"}).then(()=>undefined,x=>x);
+   expect(busy).not.toBeInstanceOf(AcquisitionRefusedError);expect(busy).toMatchObject({status:503});
+   await f.pool.query("SELECT sessions.ingest_acquisition_set_hooks(false)");
+  }finally{await g.rollback();}
+  const e=await f.deliver([record({record_id:"ff-3",session_id:"ff-s-3"})],{batch_id:"ff-batch-3",
+   acquisition:[{source:"claude",sessionId:"ff-s-3",grantId:uuid(),ownerEpoch:"1",grant:G("a")}]}).then(()=>undefined,x=>x);
+  expect(e).toBeDefined();expect(e).not.toBeInstanceOf(AcquisitionRefusedError);
+  expect((await f.pool.query("SELECT count(*)::int n FROM sessions.ingest_claim_attempts WHERE batch_id='ff-batch-3'")).rows[0].n).toBe(0);
+  await expect(rpc(f.pool,null,"ingest_acquisition_enroll_begin",{orgId:TENANT.orgId,workspaceId:TENANT.workspaceId,source:"claude"}))
+   .rejects.toMatchObject(refusal("55000","hooks_disabled"));
+  expect((await f.pool.query("SELECT count(*)::int n FROM sessions.ingest_acquisition_enrollment")).rows[0].n).toBe(0);
  },240000);
 });
 
@@ -525,6 +576,7 @@ describe.skipIf(!url)("enrolled source through the actual hooks (edge 409 refusa
   expect(await rows()).toEqual(before);
  };
  beforeAll(async()=>{f=await ingest("acq_hooks");await f.frontier();
+  await f.pool.query("SELECT sessions.ingest_acquisition_set_hooks(true)");
   await rpc(f.pool,null,"ingest_acquisition_enroll_begin",{orgId:S.org,workspaceId:S.ws,source:S.src});
   await rpc(f.pool,null,"ingest_acquisition_enroll_complete",{orgId:S.org,workspaceId:S.ws,source:S.src});
   await f.pool.query("UPDATE sessions.ingest_acquisition_switch SET install_enabled=true");
@@ -589,6 +641,49 @@ describe.skipIf(!url)("enrolled source through the actual hooks (edge 409 refusa
    prepareBufferStage:async(input)=>{await rpc(f.pool,INSTALLER,"ingest_acquisition_revoke",revokeBody(S,{session:"h-4",revision:"2",target:p.operationUuid,epoch:"1",lineage:B}));return l.prepareBufferStage!(input);}})}).then(()=>undefined,x=>x);
   expect(e).toBeInstanceOf(AcquisitionRefusedError);expect(e.refused).toEqual([{source:"claude",sessionId:"h-4",code:"owner_changed"}]);
   expect((await f.pool.query("SELECT count(*)::int n FROM sessions.ingest_stage_intents")).rows[0].n).toBe(stagesBefore);
+ },30000);
+
+ test("claim ↔ enroll (two connections): claim mid-admission makes enroll_begin not_quiescent; uncommitted begin makes the claim busy (503), never a 409",async()=>{
+  const enrolled=async()=>(await f.pool.query("SELECT count(*)::int n FROM sessions.ingest_acquisition_enrollment WHERE source='codex'")).rows[0].n;
+  const begin=JSON.stringify({orgId:S.org,workspaceId:S.ws,source:"codex"});
+  const h=f.holdNext("ingest_claim_buffered_batch");
+  const delivering=f.deliver([record({record_id:"ce-1",source:"codex",session_id:"ce-s-1"})],{batch_id:"ce-batch-1"});
+  await h.reached;
+  const c=await hold(f.pool);
+  try{await c.c.query("SET LOCAL lock_timeout='200ms'");
+   await expect(c.c.query("SELECT sessions.ingest_acquisition_enroll_begin($1::jsonb)",[begin])).rejects.toMatchObject(refusal("55000","enrollment_not_quiescent"));
+  }finally{await c.rollback();}
+  h.release();expect((await delivering).outcome).toBe("accepted_buffered");
+  expect(await enrolled()).toBe(0);
+  const c2=await hold(f.pool);
+  try{expect((await c2.c.query("SELECT sessions.ingest_acquisition_enroll_begin($1::jsonb) r",[begin])).rows[0].r).toMatchObject({state:"enrolling"});
+   const e=await f.deliver([record({record_id:"ce-2",source:"codex",session_id:"ce-s-2"})],{batch_id:"ce-batch-2"}).then(()=>undefined,x=>x);
+   expect(e).not.toBeInstanceOf(AcquisitionRefusedError);expect(e).toMatchObject({status:503});
+  }finally{await c2.rollback();}
+  expect(await enrolled()).toBe(0);
+  expect((await f.deliver([record({record_id:"ce-2",source:"codex",session_id:"ce-s-2"})],{batch_id:"ce-batch-2"})).outcome).toBe("accepted_buffered");
+ },30000);
+
+ test("commit ↔ owner change: revoke before commit → owner_changed 409, nothing committed; commit mid-flight makes revoke busy, then both succeed in order",async()=>{
+  const committed=async(b:string)=>(await f.pool.query("SELECT (SELECT count(*) FROM sessions.ingest_buffer_outbox WHERE batch_id=$1)::int o,(SELECT count(*) FROM sessions.ingest_batches WHERE batch_id=$1 AND state='committed')::int b",[b])).rows[0];
+  const B=uuid();const p=installBody(S,{session:"h-5",user:TENANT.userId,origin:"origin-1",lineage:B});
+  await rpc(f.pool,INSTALLER,"ingest_acquisition_install",body(p));
+  const entry={source:"claude",sessionId:"h-5",grantId:p.operationUuid,ownerEpoch:"1",grant:p.g};
+  const e=await f.deliver([record({record_id:"cm-1",session_id:"h-5"})],{batch_id:"cm-batch-1",acquisition:[entry],ledger:l=>({...l,
+   commitBuffered:async(input)=>{await rpc(f.pool,INSTALLER,"ingest_acquisition_revoke",revokeBody(S,{session:"h-5",revision:"2",target:p.operationUuid,epoch:"1",lineage:B}));return l.commitBuffered!(input);}})}).then(()=>undefined,x=>x);
+  expect(e).toBeInstanceOf(AcquisitionRefusedError);expect({status:e.status,refused:e.refused}).toEqual({status:409,refused:[{source:"claude",sessionId:"h-5",code:"owner_changed"}]});
+  expect(await committed("cm-batch-1")).toEqual({o:0,b:0});
+  const B2=uuid();const q=installBody(S,{session:"h-6",user:TENANT.userId,origin:"origin-1",lineage:B2});
+  await rpc(f.pool,INSTALLER,"ingest_acquisition_install",body(q));
+  const h=f.holdNext("ingest_commit_buffered_batch");
+  const delivering=f.deliver([record({record_id:"cm-2",session_id:"h-6"})],{batch_id:"cm-batch-2",
+   acquisition:[{source:"claude",sessionId:"h-6",grantId:q.operationUuid,ownerEpoch:"1",grant:q.g}]});
+  await h.reached;
+  const r=revokeBody(S,{session:"h-6",revision:"2",target:q.operationUuid,epoch:"1",lineage:B2});
+  await expect(rpc(f.pool,INSTALLER,"ingest_acquisition_revoke",r)).rejects.toMatchObject(refusal("40001","session_busy"));
+  h.release();expect((await delivering).outcome).toBe("accepted_buffered");
+  expect(await committed("cm-batch-2")).toEqual({o:1,b:1});
+  expect(await rpc(f.pool,INSTALLER,"ingest_acquisition_revoke",r)).toMatchObject({outcome:"draining",ownerEpoch:"1"});
  },30000);
 
  test("§4.8 enrollment_interlock_writer_during_uncommitted_begin (both orders) on the legacy pointer guard",async()=>{

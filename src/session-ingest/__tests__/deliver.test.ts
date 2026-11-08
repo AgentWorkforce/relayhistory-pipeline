@@ -388,7 +388,7 @@ describe("HTTP contract", () => {
   test("limits, and every unmigrated /v1 route is 501 unsupported_by_backend", async () => {
     const a = app();
     const limits = await a.fetch(new Request("https://x/v1/delivery/limits", { headers: { [IDENTITY_HEADER]: good } }));
-    expect(await limits.json()).toEqual({ maxRecords: 500, maxRequestBytes: MAX_DELIVERY_BYTES, contentEncodings: ["zstd", "gzip"], acquisitionEnrolledSources: [] });
+    expect(await limits.json()).toEqual({ maxRecords: 500, maxRequestBytes: MAX_DELIVERY_BYTES, contentEncodings: ["zstd", "gzip"] });
     const other = await a.fetch(new Request("https://x/v1/sessions", { headers: { [IDENTITY_HEADER]: good } }));
     expect([other.status, ((await other.json()) as { error: { code: string } }).error.code]).toEqual([501, "unsupported_by_backend"]);
   });
