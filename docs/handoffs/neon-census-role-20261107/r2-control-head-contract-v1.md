@@ -1,6 +1,6 @@
-# R2 control-head contract v3 (supersedes v2 dbe56a03 / v1 54ce8bc5) (Option C privacy gate) — 2026-11-08
+# R2 control-head contract v4 (supersedes v3 / v2 dbe56a03 / v1 54ce8bc5) (Option C privacy gate) — 2026-11-08
 
-Pinned by pipeline-lead. Producer: relayhistory-cloud (relayhistory-cloud-owner). Consumer: sessions-pipeline session read Worker (layered-sessions-pipeline). Adversarial: neonexit-review-dogpatch, codex-relay-desktop-find-prior (fixtures v2 `b5846258…`).
+Pinned by pipeline-lead. Producer: relayhistory-cloud (relayhistory-cloud-owner). Consumer: sessions-pipeline session read Worker (layered-sessions-pipeline). Adversarial: neonexit-review-dogpatch, codex-relay-desktop-find-prior (fixtures v3 `25bbbdfa…`, 26 cases).
 
 ## Transport
 - Cloudflare **named-entrypoint service binding only**: relayhistory-api exports a distinct `WorkerEntrypoint` class (e.g. `ControlHeadEntrypoint`); the read Worker's binding `HISTORY_CONTROL_HEAD` pins `entrypoint = "ControlHeadEntrypoint"`. The public default `fetch` handler must **never** dispatch this handler; every public path for it answers 404. Header absence (`cf-connecting-ip`, hostname) is NOT a capability check. Integration negatives required: a real public request is refused; a default-entrypoint binding is refused.
@@ -25,7 +25,7 @@ Pinned by pipeline-lead. Producer: relayhistory-cloud (relayhistory-cloud-owner)
 }
 ```
 - Source: `cutover` from the DATABASE `delivery_cutover_state` / status (must be ACTIVE and equal the configured `DELIVERY_CUTOVER` epoch, else `503 cutover_mismatch`), and `head` from `sessions.delivery_cutover_control_heads` for exactly (org, workspace, user) — read-only, **same statement / snapshot** for both, `statement_timeout` ≤ 2 s. A non-null head whose epoch differs from the cutover epoch is answered `503 head_epoch_mismatch` (never filtered to null, never returned as visible-eligible). Any `kind` other than `selection`/`reset` → `503 unknown_control_kind` (a new kind needs a contract bump).
-- `head = null` means **no control row exists for this user in this cutover epoch** (selection, reset, and any other control kind all write this head per 0078). Missing user/workspace is not an error: it is `head: null`.
+- `head = null` means **no control row exists for this exact (org, workspace, user)** (scope-exact; a foreign-epoch row is refused with 503, never reported as absence) (selection, reset, and any other control kind all write this head per 0078). Missing user/workspace is not an error: it is `head: null`.
 - Epochs are lowercase **hex64** (Neon 0078 CHECK). Versions are **decimal strings** (consumer parses as BigInt, never JS Number).
 - No caching (`cache-control: no-store`); no cross-request memoization.
 
@@ -34,13 +34,14 @@ Pinned by pipeline-lead. Producer: relayhistory-cloud (relayhistory-cloud-owner)
 
 ## Consumer rule (sessions-pipeline read API; not part of the producer)
 A buffered row/stage is visible only if **all** hold:
-1. Response 200, exact echo of (org, workspace, user), `contract` matches, `cutover.mode == "ingest"`.
+1. Response 200, exact echo of (org, workspace, user), `contract` matches, `cutover.mode == "ingest"` and `cutover.status == "active"` (shape constants).
 2. `head == null` **or** (`head.pending == false` **and** `head.epoch == cutover.epoch`).
 3. The row's immutable **admission** witness satisfies the rule below. Admission VERSION = `source_control_version` on the original `ingest_claim_attempts` / `ingest_lazy_ack_decisions` row (via the stage's original `claim_token`; GC kept-row mapping must preserve the original admission, never a replacement stage). Admission EPOCH is not stored on those rows: derive it from the immutable `ingest_lazy_policy.control_epoch` (identity rotation refused at 055000:113-131) joined and verified against the claim's source identity, OR 043700 persists `source_control_epoch` on new claims/decisions — the PR must state which and test it, including GC child provenance. Rule:
    - `head == null` → admission epoch == `cutover.epoch` and admission version == `"0"`;
    - `head != null` → admission epoch == `head.epoch` **and** admission version == `head.version` (no control of any kind since admission).
    - Absent/NULL admission witness → hidden.
-4. Checked **after** the S3 fetch and before any byte is emitted (no streaming before the gate), for every buffered list row, metadata and turns response.
+4. **Mandatory per-user G2 parity proof:** an owner-written Supabase row for this exact (org, workspace, user) exists whose proof is bound to: the cutover epoch; the current head tuple (epoch, version, digest) or an explicit no-head proof; the full current deletion-set and reset-set digests plus the ordered-control lineage digest (Neon heads vs contiguous Supabase `ingest_control_receipts`); and the current target schema generation. Missing, stale (head or generation moved), or mismatched → hidden. Workspace canary selection is NOT a substitute (covers pre-cutover controls that left no head). Default: no rows (nobody visible).
+5. Checked **after** the S3 fetch and before any byte is emitted (no streaming before the gate), for every buffered list row, metadata and turns response.
 
 Consequence (documented, accepted): a user who issued any selection/reset after uploading loses buffered visibility of sessions admitted before that control until they are canonically published. This is a constrained visibility contract, not the full customer fix.
 
