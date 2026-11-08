@@ -10,6 +10,7 @@
  *   POST /v1/delivery/batches  rth:sync   (app.ts, unchanged handler)
  *   POST /v1/turns/batches     rth:sync   (app.ts, unchanged handler)
  *   GET  /v1/delivery/limits   rth:sync   (app.ts, unchanged handler)
+ *   POST /v1/auth/token/refresh  401 refresh_not_supported, always (see SELFHOST_REFRESH_PATH)
  *   POST /v1/delivery/sessions/selection  rth:sync, only with RELAYHISTORY_SELFHOST_SESSION_SELECTION=true:
  *                              per-session erase (enabled:false; enabled:true answers 400 unsupported_by_backend). The app.ts handler is
  *                              unchanged; the ledger's setSessionUploads becomes fence + tombstone in one transaction
@@ -62,9 +63,31 @@ export const SELFHOST_INGEST_ROUTES: Readonly<Record<string, "GET" | "POST">> = 
   "/v1/delivery/limits": "GET",
 });
 
-/** One assembled ingest: the app, the per-request verifier, readiness and teardown. */
+/**
+ * The Desktop's refresh call. A self-host session has nothing to refresh (the read API's login passes the
+ * sh_at_ token through and repeats it as refreshToken), so the only honest answer is that this credential
+ * cannot be refreshed. It has to be a 401: the Desktop treats 400/401/403 as a refused refresh, which marks
+ * the upload as needing sign-in and starts its renewal from relaycontrol. A 404 or 501 reads as an outage it
+ * keeps retrying, so uploads would stop for good once the first token expired. No bearer is sent here and
+ * none is read; the answer is the same for every caller.
+ */
+export const SELFHOST_REFRESH_PATH = "/v1/auth/token/refresh";
+/** A refresh body is one small JSON object. Past this it is not read, and the connection closes after the answer. */
+const REFRESH_DRAIN_BYTES = 8 * 1024;
+
+/** Discards a small declared body, so the client finishes sending and can read the answer rather than a reset. */
+async function drainSmallBody(req: IncomingMessage): Promise<void> {
+  if (!(Number(req.headers["content-length"]) <= REFRESH_DRAIN_BYTES) || req.complete) return;
+  await new Promise<void>((resolve) => {
+    req.once("end", resolve);
+    req.once("close", resolve);
+    req.resume();
+  });
+}
+
 export const SELFHOST_SESSION_SELECTION_PATH = "/v1/delivery/sessions/selection";
 
+/** One assembled ingest: the app, the per-request verifier, readiness and teardown. */
 export interface SelfhostIngestRuntime {
   app: FetchApp;
   /** The routes this runtime serves, by exact raw pathname (the base set, plus selection when enabled). */
@@ -318,6 +341,12 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
         }
         if (!runtime)
           return sendJson(req, res, 503, envelope("not_configured", "the session ingest is not enabled", correlationId), { "retry-after": "60", "x-correlation-id": correlationId });
+        if (path === SELFHOST_REFRESH_PATH) {
+          if (req.method !== "POST")
+            return sendJson(req, res, 405, envelope("method_not_allowed", "POST only", correlationId), { allow: "POST", "x-correlation-id": correlationId });
+          await drainSmallBody(req);
+          return sendJson(req, res, 401, envelope("refresh_not_supported", "this session cannot be refreshed; sign in again", correlationId), { "www-authenticate": "Bearer", "x-correlation-id": correlationId });
+        }
         const method = runtime.routes[path];
         if (!method) {
           if (path.startsWith("/v1/"))

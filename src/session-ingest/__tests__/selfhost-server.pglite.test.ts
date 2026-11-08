@@ -288,6 +288,21 @@ describe("self-host ingest edge over node:http", () => {
     expect((await fetch(url("/readyz"))).status).toBe(200);
   });
 
+  test("token refresh is a 401 the Desktop reads as a refused refresh, with no introspection", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, store } = await start(rc);
+    // The Desktop's own call: no bearer, a small JSON body holding the refresh token.
+    const res = await fetch(url("/v1/auth/token/refresh"), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ refreshToken: TOKEN }) });
+    const text = await res.text();
+    expect([res.status, res.headers.get("www-authenticate")]).toEqual([401, "Bearer"]);
+    expect((JSON.parse(text) as { error: { code: string } }).error.code).toBe("refresh_not_supported");
+    expect(text).not.toContain(TOKEN);
+    const wrong = await fetch(url("/v1/auth/token/refresh"));
+    expect([wrong.status, wrong.headers.get("allow")]).toEqual([405, "POST"]);
+    expect(rc.calls).toHaveLength(0);
+    expect(await chunkKeys(store)).toEqual([]);
+  });
+
   test("an oversized body is 413 after auth, and nothing is written", async () => {
     const rc = await relaycontrol(() => active(["rth:sync"]));
     const { url, store } = await start(rc);
@@ -432,6 +447,13 @@ describe("dormant and configuration", () => {
     const res = await fetch(url("/v1/delivery/batches"), { method: "POST", body: "{}" });
     expect([res.status, await code(res)]).toEqual([503, "not_configured"]);
     expect(built).toBe(false);
+  });
+
+  test("dormant: token refresh is 503 not_configured, so a Desktop never reads it as a refused sign-in", async () => {
+    const service = await startSelfhostIngestService({}, { host: "127.0.0.1", port: 0 });
+    cleanups.push(() => service.close());
+    const res = await fetch(`http://127.0.0.1:${service.port}/v1/auth/token/refresh`, { method: "POST", body: "{}" });
+    expect([res.status, await code(res)]).toEqual([503, "not_configured"]);
   });
 
   test("strict flag, required settings, hosted-only settings refused; errors never echo values", () => {
