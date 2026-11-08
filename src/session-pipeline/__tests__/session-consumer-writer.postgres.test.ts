@@ -49,6 +49,7 @@ import {
   MAX_PENDING_ROWS,
 } from "../consumer-service.ts";
 import { processBatch } from "../consumer.ts";
+import { INGEST_LOGIN_PG16_SQL } from "../../session-ingest/ingest-login.ts";
 import { droppedFanout, scopeLockKey, type PointerDeps, type ScopeLock, type SessionScope } from "../pointer.ts";
 import type { SearchIndexDeps } from "../search-index.ts";
 import { reconcileRecent, transaction } from "../lambda.ts";
@@ -98,6 +99,26 @@ function asSql(client: pg.PoolClient): {
     query: async <R>(text: string, params?: unknown[]): Promise<{ rows: R[] }> => {
       const r = await client.query(text, params as unknown[]);
       return { rows: r.rows as R[] };
+    },
+  };
+}
+
+/**
+ * TEST SEAM (labelled): the test clusters use trust auth, which leaves
+ * system_user NULL on PG16+. The seam answers only that one statement with
+ * a password-auth identity; the base login statement runs for real, so
+ * session_user, current_user, role_setting and the backend usename stay
+ * genuine. Mirrors the labelled seam in
+ * buffered-feed-login.postgres.test.ts.
+ */
+function asSeamedSql(client: pg.PoolClient, systemUser: string | null = "SCRAM-SHA-256/search_consumer_runtime"): {
+  query: <R>(text: string, params?: unknown[]) => Promise<{ rows: R[] }>;
+} {
+  const inner = asSql(client);
+  return {
+    query: async <R>(text: string, params?: unknown[]): Promise<{ rows: R[] }> => {
+      if (text === INGEST_LOGIN_PG16_SQL) return { rows: [{ system_user: systemUser } as R] };
+      return inner.query<R>(text, params);
     },
   };
 }
@@ -423,7 +444,7 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
       try {
         const client = await pinned.connect();
         try {
-          await expect(assertRuntimeIdentity(asSql(client))).rejects.toThrow("refusing to run as session_user");
+          await expect(assertRuntimeIdentity(asSql(client))).rejects.toThrow("foreign session_user");
         } finally {
           client.release();
         }
@@ -519,7 +540,7 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
     try {
       const seen = await client.query(`SELECT count(*)::int AS n FROM sessions.session_index WHERE org_id=$1`, [ORG]);
       expect(seen.rows[0].n).toBeGreaterThanOrEqual(2);
-      await expect(assertRuntimeIdentity(asSql(client))).resolves.toBeUndefined();
+      await expect(assertRuntimeIdentity(asSeamedSql(client))).resolves.toBeUndefined();
       const refused = await bootstrapCheckOwner(asSql(client)).then(
         () => null,
         (e: unknown) => e as { code?: string; message?: string },
@@ -570,12 +591,48 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
   test("a genuine writer login passes admission", async () => {
     // The BYPASSRLS negative runs in PGlite (only a BYPASSRLS role may flip
     // the attribute, which the CREATEROLE owner is not): here the genuine
-    // writer login must pass with the pinned shape.
+    // writer login must pass with the pinned shape. The labelled seam answers
+    // only the trust-NULL system_user; the backend usename is genuinely the
+    // writer's.
     const client = await wpool.connect();
     try {
-      await assertRuntimeIdentity(asSql(client));
+      await assertRuntimeIdentity(asSeamedSql(client));
     } finally {
       client.release();
+    }
+  }, 120_000);
+
+  test("a superuser spoof behind SET SESSION AUTHORIZATION refuses at the backend identity", async () => {
+    // A superuser's SET SESSION AUTHORIZATION leaves session_user and
+    // current_user naming the writer, so only the backend usename signal
+    // catches it — the new check the shared login assertion adds. A
+    // dedicated client is used and closed: the spoofed identity would
+    // otherwise leak into the pool.
+    const probe = new pg.Client({ connectionString: ownerUrl });
+    try {
+      await probe.connect();
+      const [{ rolsuper }] = (
+        await probe.query(`SELECT rolsuper FROM pg_roles WHERE rolname = current_user`)
+      ).rows as Array<{ rolsuper: boolean }>;
+      if (!rolsuper) {
+        // A non-superuser cannot spoof at all: the server refuses first.
+        await expect(probe.query(`SET SESSION AUTHORIZATION search_consumer_runtime`)).rejects.toMatchObject({
+          code: "42501",
+        });
+        return;
+      }
+      await probe.query(`SET SESSION AUTHORIZATION search_consumer_runtime`);
+      const me = (await probe.query(`SELECT session_user AS s, current_user AS c`)).rows[0] as {
+        s: string;
+        c: string;
+      };
+      expect(me).toMatchObject({ s: "search_consumer_runtime", c: "search_consumer_runtime" });
+      const client = probe as unknown as pg.PoolClient;
+      await expect(assertRuntimeIdentity(asSeamedSql(client))).rejects.toThrow(
+        "foreign authenticated backend identity",
+      );
+    } finally {
+      await probe.end();
     }
   }, 120_000);
 

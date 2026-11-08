@@ -73,9 +73,14 @@ export async function bootstrapLock(owner: SqlExecutor): Promise<void> {
 
 /**
  * Owner proof, not a superuser demand: the invoker must own the schemas it
- * writes and be able to create the dedicated role. A CNPG hoop owner or an
- * RDS CREATEROLE owner passes; a bare reader or an unrelated role fails here,
- * before any DDL.
+ * writes and be able to create the dedicated role. A CNPG hoop owner or a
+ * managed-platform CREATEROLE owner passes; a bare reader or an unrelated
+ * role fails here, before any DDL. On RDS and Cloud SQL the owner creates
+ * search_consumer_runtime itself through the bootstrap chain
+ * (supabase/bootstrap/session_consumer_roles.sql, same pattern as
+ * hoopdb_runtime_role_rds.sql) and keeps the unavoidable ADMIN creator edge:
+ * the managed-platform trampolines deliberately never provision the consumer
+ * role, because a trampoline copy would leave the owner unable to promote it.
  */
 export async function bootstrapCheckOwner(owner: SqlExecutor): Promise<void> {
   const { rows } = await owner.query<{ ok: boolean; canCreateRole: boolean }>(

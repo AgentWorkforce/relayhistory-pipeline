@@ -45,6 +45,8 @@ import {
   reconcileMeta,
   reconcileStaleProjections,
   reconcileTombstonedScopes,
+  consumerLoginRefusalMessage,
+  CONSUMER_RUNTIME_ROLE,
   refuseStartupOptions,
   retryDelayMs,
   runConsumerTick,
@@ -53,12 +55,15 @@ import {
   storeHighWaterMark,
   storePending,
   storeReconcileCursor,
-  systemUserIdentifies,
   scoreFailedAttempt,
   scoreRequeuedAttempt,
   writerComposition,
   type ConsumerTickIo,
 } from "../consumer-service.ts";
+import {
+  INGEST_LOGIN_IDENTITY_SQL,
+  INGEST_LOGIN_PG16_SQL,
+} from "../../session-ingest/ingest-login.ts";
 import { refuseEnvOptions, reconcileRecent, supabasePool } from "../lambda.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { TenantRunner } from "../../session-read-api/liveness.ts";
@@ -87,6 +92,32 @@ const asDb = (pg: PGlite): SqlExecutor => ({
     return { rows: r.rows as R[] };
   },
 });
+
+/**
+ * TEST SEAM (labelled): PGlite leaves pg_stat_activity.usename and
+ * system_user NULL on every backend (probed: SET SESSION AUTHORIZATION
+ * rewrites session_user/current_user but neither signal follows), so a
+ * genuine simulated login can never pass the shared login-identity
+ * assertion there. This wraps the executor and answers the two shared
+ * login-identity statements with the given backend identity, while every
+ * other statement — role attributes, both membership directions, server
+ * version — runs against the real catalog. Mirrors the labelled seam in
+ * buffered-feed-login.postgres.test.ts. The real (unseamed) signals are
+ * covered by session-consumer-writer.postgres.test.ts on real Postgres.
+ */
+const asIdentityDb = (pg: PGlite, backendUser = CONSUMER_RUNTIME_ROLE, systemUser: string | null = `SCRAM-SHA-256/${CONSUMER_RUNTIME_ROLE}`): SqlExecutor => {
+  const inner = asDb(pg);
+  return {
+    query: async <R>(text: string, params?: unknown[]): Promise<{ rows: R[] }> => {
+      if (text === INGEST_LOGIN_IDENTITY_SQL) {
+        const real = await inner.query<Record<string, unknown>>(text, params);
+        return { rows: real.rows.map((row) => ({ ...row, backend_user: backendUser })) as R[] };
+      }
+      if (text === INGEST_LOGIN_PG16_SQL) return { rows: [{ system_user: systemUser } as R] };
+      return inner.query<R>(text, params);
+    },
+  };
+};
 
 describe("consumer service flag", () => {
   for (const raw of [undefined, "", "false"]) {
@@ -931,13 +962,27 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
     }
   }, 180_000);
 
-  test("systemUserIdentifies matches only a genuine same-user auth method", () => {
-    expect(systemUserIdentifies(null, "w")).toBe(true);
-    expect(systemUserIdentifies("", "w")).toBe(true);
-    expect(systemUserIdentifies("search_consumer_runtime", "search_consumer_runtime")).toBe(true);
-    expect(systemUserIdentifies("SCRAM-SHA-256/search_consumer_runtime", "search_consumer_runtime")).toBe(true);
-    expect(systemUserIdentifies("other", "search_consumer_runtime")).toBe(false);
-    expect(systemUserIdentifies("SCRAM-SHA-256/other", "search_consumer_runtime")).toBe(false);
+  test("login refusal taxonomy names the property, never a value", () => {
+    expect(consumerLoginRefusalMessage("login_unreadable")).toBe("pipeline consumer: cannot determine session_user");
+    expect(consumerLoginRefusalMessage("session_user")).toContain("session_user");
+    expect(consumerLoginRefusalMessage("current_user")).toContain("current_user");
+    expect(consumerLoginRefusalMessage("set_role")).toBe("pipeline consumer: refusing to run with SET ROLE active");
+    expect(consumerLoginRefusalMessage("backend_user")).toBe(
+      "pipeline consumer: refusing to run with a foreign authenticated backend identity",
+    );
+    expect(consumerLoginRefusalMessage("system_user")).toBe(
+      "pipeline consumer: refusing to run without a password-authenticated identity",
+    );
+    for (const message of [
+      consumerLoginRefusalMessage("session_user"),
+      consumerLoginRefusalMessage("current_user"),
+      consumerLoginRefusalMessage("set_role"),
+      consumerLoginRefusalMessage("backend_user"),
+      consumerLoginRefusalMessage("system_user"),
+    ]) {
+      expect(message).not.toContain("search_consumer_runtime");
+      expect(message).not.toContain("postgres");
+    }
   });
 
   // PGlite's RESET SESSION AUTHORIZATION is a no-op (probed: the session
@@ -948,9 +993,57 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
     try {
       await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
       // SET SESSION AUTHORIZATION rewrites the session identity the way a
-      // real login does, including session_user.
+      // real login does, including session_user. The labelled seam answers
+      // the two auth-identity signals PGlite leaves NULL; everything else
+      // runs against the real catalog.
       await pg.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
-      await assertRuntimeIdentity(asDb(pg));
+      await assertRuntimeIdentity(asIdentityDb(pg));
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("startup refuses SET ROLE even when both names match the writer", async () => {
+    const { pg } = await installed();
+    try {
+      await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      await pg.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
+      // Both names match, but role_setting names the writer: the shared
+      // login assertion refuses before any backend-identity signal matters,
+      // so no seam is needed.
+      await pg.exec(`SET ROLE search_consumer_runtime`);
+      await expect(assertRuntimeIdentity(asDb(pg))).rejects.toThrow("SET ROLE active");
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("startup refuses a foreign backend identity behind a genuine session", async () => {
+    const { pg } = await installed();
+    try {
+      await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      await pg.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
+      // A superuser's SET SESSION AUTHORIZATION spoof leaves session_user
+      // and current_user genuine while the backend authenticated as someone
+      // else: the seam simulates that backend signal here (real-Postgres
+      // coverage lives in session-consumer-writer.postgres.test.ts).
+      const spoofed = asIdentityDb(pg, "postgres", `SCRAM-SHA-256/${CONSUMER_RUNTIME_ROLE}`);
+      await expect(assertRuntimeIdentity(spoofed)).rejects.toThrow("foreign authenticated backend identity");
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("startup refuses a trust-auth login with no authenticated identity", async () => {
+    const { pg } = await installed();
+    try {
+      await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      await pg.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
+      // Trust auth leaves system_user NULL on PG16+: no method proves the
+      // identity, so the gate refuses. (PG15 has no system_user signal and
+      // keeps working; PGlite is PG18.)
+      const trusted = asIdentityDb(pg, CONSUMER_RUNTIME_ROLE, null);
+      await expect(assertRuntimeIdentity(trusted)).rejects.toThrow("password-authenticated identity");
     } finally {
       await pg.close();
     }
@@ -977,7 +1070,7 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       // by name alone, so the gate checks the attribute instead.
       await bypass.exec(`ALTER ROLE search_consumer_runtime BYPASSRLS`);
       await bypass.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
-      await expect(assertRuntimeIdentity(asDb(bypass))).rejects.toThrow("BYPASSRLS");
+      await expect(assertRuntimeIdentity(asIdentityDb(bypass))).rejects.toThrow("BYPASSRLS");
     } finally {
       await bypass.close();
     }
@@ -988,9 +1081,38 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       // on a genuine login, so the gate checks pg_auth_members instead.
       await drifted.exec(`CREATE ROLE widen_nobody LOGIN; GRANT widen_nobody TO search_consumer_runtime`);
       await drifted.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
-      await expect(assertRuntimeIdentity(asDb(drifted))).rejects.toThrow("inherited memberships");
+      await expect(assertRuntimeIdentity(asIdentityDb(drifted))).rejects.toThrow("inherited memberships");
     } finally {
       await drifted.close();
+    }
+  }, 180_000);
+
+  test("startup tolerates exactly the owner's ADMIN creator edge, nothing else granted to the writer", async () => {
+    const { pg } = await installed();
+    try {
+      await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      // The owner-created shape every platform provisions: a member WITH
+      // ADMIN but neither INHERIT nor SET. PGlite's superuser creates
+      // without the edge, so the test grants the exact shape by hand.
+      await pg.exec(
+        `CREATE ROLE edge_owner LOGIN CREATEROLE; GRANT search_consumer_runtime TO edge_owner WITH ADMIN OPTION, INHERIT FALSE, SET FALSE`,
+      );
+      await pg.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
+      await assertRuntimeIdentity(asIdentityDb(pg));
+      // An INHERIT member refuses, even with ADMIN ...
+      await pg.exec(`GRANT search_consumer_runtime TO edge_owner WITH ADMIN OPTION, INHERIT TRUE, SET FALSE`);
+      await expect(assertRuntimeIdentity(asIdentityDb(pg))).rejects.toThrow("non-creator membership grant");
+      await pg.exec(`REVOKE search_consumer_runtime FROM edge_owner`);
+      await pg.exec(
+        `GRANT search_consumer_runtime TO edge_owner WITH ADMIN OPTION, INHERIT FALSE, SET FALSE`,
+      );
+      await assertRuntimeIdentity(asIdentityDb(pg));
+      // ... and so does a member without ADMIN.
+      await pg.exec(`REVOKE search_consumer_runtime FROM edge_owner`);
+      await pg.exec(`GRANT search_consumer_runtime TO edge_owner`);
+      await expect(assertRuntimeIdentity(asIdentityDb(pg))).rejects.toThrow("non-creator membership grant");
+    } finally {
+      await pg.close();
     }
   }, 180_000);
 

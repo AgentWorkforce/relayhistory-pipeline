@@ -61,6 +61,10 @@ import {
 } from "./pointer.ts";
 import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
+import {
+  ingestLoginIdentity,
+  type IngestLoginIdentityRefusal,
+} from "../session-ingest/ingest-login.ts";
 import { refuseEnvOptions, reconcileRecent, supabasePool, transaction } from "./lambda.ts";
 import {
   CONSUMER_BACKEND_ID_VAR,
@@ -961,16 +965,9 @@ export async function assertServiceSchema(db: SqlExecutor): Promise<void> {
 }
 
 /**
- * Does an authenticated identity string name exactly this login role? The
- * server leaves system_user empty when the auth method provides no identity
- * (trust/peer here), so an empty value is unavailable, not a refusal.
+ * The dedicated writer login this gate admits.
  */
-export function systemUserIdentifies(systemUser: unknown, role: string): boolean {
-  if (systemUser === null || systemUser === undefined) return true;
-  const text = String(systemUser);
-  if (text === "") return true;
-  return text === role || text.endsWith(`/${role}`);
-}
+export const CONSUMER_RUNTIME_ROLE = "search_consumer_runtime";
 
 /**
  * The Deployment must hold the dedicated writer URL: an owner, superuser or
@@ -983,55 +980,80 @@ export function systemUserIdentifies(systemUser: unknown, role: string): boolean
  * a superuser or BYPASSRLS login skips without any error: every tenant's
  * rows would become visible. Refuse such a login at startup rather than
  * tick with isolation resting on WHERE clauses alone, and refuse any
- * attribute or inherited-membership drift off the pinned role shape. Any
- * failure to read the role (no row, a query error) also refuses. Mirrors
- * #330's assertReaderRole, plus the writer's pinned attributes.
+ * attribute or membership drift off the pinned role shape. Any failure to
+ * read the role (no row, a query error) also refuses. Mirrors #330's
+ * assertReaderRole, plus the writer's pinned attributes.
+ *
+ * The authenticated-identity core is the shared ingest login assertion
+ * (src/session-ingest/ingest-login.ts): session_user and current_user name
+ * the writer, no SET ROLE is active, this backend's pg_stat_activity usename
+ * names the writer (refusing a superuser's SET SESSION AUTHORIZATION spoof),
+ * and on PG16+ system_user carries a method-prefixed writer identity
+ * (refusing trust auth, which proves no authenticated identity). Refusals
+ * name the failed property only, never a value.
  */
 export async function assertRuntimeIdentity(db: SqlExecutor): Promise<void> {
-  // system_user is a bare-word expression, not a reliably catalogued
-  // function: its presence in pg_proc does not prove the expression exists
-  // on any given server version. Evaluate it and treat "does not exist"
-  // (42703/42883, e.g. PG15) as absent — skip, exactly like an empty
-  // system_user. Any other error still fails: the gate must not silently
-  // lose its authenticated-identity signal.
-  let systemUser: unknown;
-  try {
-    const probe = await db.query<{ systemUser: unknown }>(`SELECT system_user AS "systemUser"`);
-    systemUser = probe.rows[0]?.systemUser;
-  } catch (error) {
-    if ((error as { code?: unknown }).code !== "42703" && (error as { code?: unknown }).code !== "42883") throw error;
-    systemUser = undefined;
-  }
-  const { rows } = await db.query<{ sessionUser: unknown; user: unknown; super: unknown; bypass: unknown; createdb: unknown; createrole: unknown; replication: unknown; inherit: unknown }>(
-    `SELECT session_user AS "sessionUser", current_user AS user,
-       r.rolsuper AS super, r.rolbypassrls AS bypass,
+  const refusal = await ingestLoginIdentity(
+    (text) => db.query<Record<string, unknown>>(text).then((r) => ({ rows: r.rows })),
+    CONSUMER_RUNTIME_ROLE,
+  );
+  if (refusal !== null) throw new Error(consumerLoginRefusalMessage(refusal));
+  const { rows } = await db.query<{ super: unknown; bypass: unknown; createdb: unknown; createrole: unknown; replication: unknown; inherit: unknown }>(
+    `SELECT r.rolsuper AS super, r.rolbypassrls AS bypass,
        r.rolcreatedb AS createdb, r.rolcreaterole AS createrole,
        r.rolreplication AS replication, r.rolinherit AS inherit
      FROM pg_roles r WHERE r.rolname = current_user`,
   );
   const me = rows[0];
-  if (rows.length !== 1 || !me || typeof me.user !== "string" || typeof me.sessionUser !== "string")
-    throw new Error("pipeline consumer: cannot determine session_user");
-  const who = JSON.stringify(me.user.slice(0, 63));
-  // Both names must be the writer: SET ROLE changes current_user only,
-  // whether issued as SQL or smuggled as a startup GUC (PGOPTIONS role=),
-  // so a privileged login hiding behind the writer role still refuses here.
-  // (A startup session_authorization is clobbered by the authenticated
-  // identity server-side and cannot spoof session_user.)
-  if (me.sessionUser !== "search_consumer_runtime" || me.user !== "search_consumer_runtime")
-    throw new Error(`pipeline consumer: refusing to run as session_user ${JSON.stringify(me.sessionUser.slice(0, 63))}; use the search_consumer_runtime URL`);
-  if (!systemUserIdentifies(systemUser, "search_consumer_runtime"))
-    throw new Error(`pipeline consumer: refusing to run with foreign authenticated identity ${who}`);
+  if (rows.length !== 1 || !me) throw new Error("pipeline consumer: cannot determine session_user");
+  const who = JSON.stringify(CONSUMER_RUNTIME_ROLE);
   if (me.super !== false) throw new Error(`pipeline consumer: refusing to run as SUPERUSER ${who}`);
   if (me.bypass !== false) throw new Error(`pipeline consumer: refusing to run as BYPASSRLS ${who}`);
   if (me.createdb !== false || me.createrole !== false || me.replication !== false || me.inherit !== false)
     throw new Error(`pipeline consumer: refusing to run with drifted attributes ${who}`);
-  // Inherited memberships would silently widen the writer: it holds its
-  // grants directly and must inherit none.
-  const membership = await db.query(
+  // The writer holds its grants directly and must inherit none: any role it
+  // is a member of would silently widen it.
+  const outgoing = await db.query(
     `SELECT 1 FROM pg_auth_members WHERE member = (SELECT oid FROM pg_roles WHERE rolname = current_user) LIMIT 1`,
   );
-  if (membership.rows.length > 0) throw new Error(`pipeline consumer: refusing to run with inherited memberships ${who}`);
+  if (outgoing.rows.length > 0) throw new Error(`pipeline consumer: refusing to run with inherited memberships ${who}`);
+  // The other direction tolerates exactly the owner's unavoidable ADMIN
+  // creator edge (no INHERIT, no SET): the migration owner creates the role
+  // through the bootstrap chain on every platform. Anything else granted to
+  // the writer — an INHERIT/SET member, or a member without ADMIN — refuses.
+  const version = await db.query<{ v: number }>(`SELECT current_setting('server_version_num')::int AS v`);
+  const incoming = await db.query<{ admin: unknown; inherit: unknown; set: unknown }>(
+    (version.rows[0]?.v ?? 0) >= 160000
+      ? `SELECT a.admin_option AS admin, a.inherit_option AS inherit, a.set_option AS set
+           FROM pg_auth_members a WHERE a.roleid = (SELECT oid FROM pg_roles WHERE rolname = current_user)`
+      : `SELECT a.admin_option AS admin, false AS inherit, false AS set
+           FROM pg_auth_members a WHERE a.roleid = (SELECT oid FROM pg_roles WHERE rolname = current_user)`,
+  );
+  for (const row of incoming.rows) {
+    if (row.admin !== true || row.inherit !== false || row.set !== false)
+      throw new Error(`pipeline consumer: refusing to run with a non-creator membership grant ${who}`);
+  }
+}
+
+/**
+ * Names the failed login property only, never a role name, URL or
+ * credential. Exported so tests pin the refusal taxonomy.
+ */
+export function consumerLoginRefusalMessage(refusal: IngestLoginIdentityRefusal): string {
+  switch (refusal) {
+    case "login_unreadable":
+      return "pipeline consumer: cannot determine session_user";
+    case "session_user":
+      return `pipeline consumer: refusing to run as a foreign session_user; use the ${CONSUMER_RUNTIME_ROLE} URL`;
+    case "current_user":
+      return `pipeline consumer: refusing to run with a foreign current_user; use the ${CONSUMER_RUNTIME_ROLE} URL`;
+    case "set_role":
+      return "pipeline consumer: refusing to run with SET ROLE active";
+    case "backend_user":
+      return "pipeline consumer: refusing to run with a foreign authenticated backend identity";
+    case "system_user":
+      return "pipeline consumer: refusing to run without a password-authenticated identity";
+  }
 }
 
 /**

@@ -482,7 +482,7 @@ jobs:
             await sup.query(sql("supabase/tests/supabase_shim.sql"));
             // Single-sourced bootstrap chain: the grant migration FAILs
             // without a grantee (migrations never create roles), so the T0
-            // setup provisions it exactly like migrate's bootstrap step. hoop
+            // setup provisions it exactly like the migrate bootstrap step. hoop
             // provisions the consumer bare role itself: it must own the role
             // (the rollback test drops it), and the bootstrap guard pins the
             // invoker edge.

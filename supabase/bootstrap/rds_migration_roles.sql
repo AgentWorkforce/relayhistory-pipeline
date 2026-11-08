@@ -10,15 +10,20 @@
 -- service_role cannot be created at all without BYPASSRLS.
 -- https://www.postgresql.org/docs/17/role-attributes.html
 --
--- Use a disposable CREATEROLE trampoline instead: it creates the thirteen fixed NOLOGIN
+-- Use a disposable CREATEROLE trampoline instead: it creates the fixed NOLOGIN
 -- roles, the same set as cloudsql_migration_roles.sql (ingest, canonical producer,
--- project-events, read API and session-pipeline consumer runtime included; their
+-- project-events and read API included; their
 -- migrations only verify roles), then the migration owner drops the trampoline. DROP ROLE removes the
 -- trampoline's automatic memberships, leaving every target membership-free, so the
 -- existing strict verifiers and historical migration guards pass unchanged. The
 -- trampoline and every target are created in this one transaction, so any refusal rolls
 -- the entire operation back. Consequence (by design): nobody but rdsadmin can later
 -- alter or drop these NOLOGIN roles.
+--
+-- search_consumer_runtime is NOT in that set: the migration owner creates it
+-- directly with supabase/bootstrap/session_consumer_roles.sql (like the runtime
+-- LOGIN role below), keeping the owner's ADMIN creator edge so the owner can
+-- promote it. A trampoline copy would leave it manageable only by rdsadmin.
 --
 -- service_role is deliberately NOBYPASSRLS, as on Cloud SQL: there is no Supabase or
 -- PostgREST service-role runtime on RDS; the role exists only because the shared schema
@@ -41,7 +46,6 @@ DECLARE
   v_row record;
   v_problems text[] := '{}';
   v_missing boolean := false;
-  v_claimed boolean := false;
 BEGIN
   IF current_setting('server_version_num')::int < 160000 THEN
     RAISE EXCEPTION USING ERRCODE = '0A000',
@@ -80,7 +84,6 @@ BEGIN
     'bulls96_project_events'::name,
     'bulls96_privacy_eraser'::name,
     'bulls96_babysitter_retention'::name,
-    'search_consumer_runtime'::name,
     'bulls96_acquisition_installer'::name,
     'buffered_search_feed_runtime'::name
   ] LOOP
@@ -89,27 +92,16 @@ BEGIN
       v_missing := true;
       CONTINUE;
     END IF;
-    -- Claimed-LOGIN steady state (operator promoted the consumer role after
-    -- the writer went live): every later re-run must converge instead of
-    -- refusing the claim. Accept exactly the claim marker (LOGIN, no other
-    -- attributes, precisely the one global 60s row) and at most the invoker's
-    -- creator edge; anything else stays a problem below. Mirrors
-    -- session_consumer_roles.sql (RDS requires PG16+, so no version branch).
-    v_claimed := v_role = 'search_consumer_runtime' AND v_row.rolcanlogin
-      AND NOT (v_row.rolinherit OR v_row.rolbypassrls OR v_row.rolsuper OR v_row.rolcreatedb OR v_row.rolcreaterole OR v_row.rolreplication)
-      AND (SELECT count(*) FROM pg_db_role_setting WHERE setrole = v_row.oid) = 1
-      AND EXISTS (
-        SELECT 1 FROM pg_db_role_setting
-         WHERE setrole = v_row.oid AND setdatabase = 0
-           AND setconfig = ARRAY['statement_timeout=60s']::text[]
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM pg_auth_members a
-         WHERE (a.roleid = v_row.oid OR a.member = v_row.oid)
-           AND NOT (a.roleid = v_row.oid AND a.member = (SELECT oid FROM pg_roles WHERE rolname = v_owner)
-                    AND a.admin_option AND NOT a.inherit_option AND NOT a.set_option)
-      );
-    IF v_row.rolcanlogin AND NOT v_claimed THEN v_problems := array_append(v_problems, format('%I has LOGIN', v_role)::text); END IF;
+    -- search_consumer_runtime is deliberately NOT in this inventory: the
+    -- migration owner creates it directly with
+    -- supabase/bootstrap/session_consumer_roles.sql (same pattern as
+    -- hoopdb_runtime_role_rds.sql), keeping the unavoidable PG16+ ADMIN
+    -- creator edge so the owner can promote it to LOGIN. A trampoline would
+    -- create it in the disposable seed context, and the final membership
+    -- recheck below would then refuse the owner's promotion path, so the
+    -- trampoline must never provision it. Its claimed-LOGIN steady state
+    -- converges in session_consumer_roles.sql instead.
+    IF v_row.rolcanlogin THEN v_problems := array_append(v_problems, format('%I has LOGIN', v_role)::text); END IF;
     IF v_row.rolinherit THEN v_problems := array_append(v_problems, format('%I has INHERIT', v_role)::text); END IF;
     IF v_row.rolbypassrls THEN v_problems := array_append(v_problems, format('%I has BYPASSRLS', v_role)::text); END IF;
     IF v_row.rolsuper THEN v_problems := array_append(v_problems, format('%I has SUPERUSER', v_role)::text); END IF;
@@ -119,7 +111,7 @@ BEGIN
     IF EXISTS (
       SELECT 1 FROM pg_auth_members
        WHERE roleid = v_row.oid OR member = v_row.oid
-    ) AND NOT v_claimed THEN
+    ) THEN
       v_problems := array_append(v_problems, format('%I has a role membership', v_role)::text);
     END IF;
     IF v_role = 'session_directory_search_worker' AND (
@@ -132,7 +124,7 @@ BEGIN
     ) THEN
       v_problems := array_append(v_problems, 'session_directory_search_worker has unexpected role settings'::text);
     END IF;
-    IF v_role <> 'session_directory_search_worker' AND NOT v_claimed AND EXISTS (
+    IF v_role <> 'session_directory_search_worker' AND EXISTS (
       SELECT 1 FROM pg_db_role_setting WHERE setrole = v_row.oid
     ) THEN
       v_problems := array_append(v_problems, format('%I has role settings', v_role)::text);
@@ -199,10 +191,9 @@ BEGIN
       CREATE ROLE bulls96_babysitter_retention
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'search_consumer_runtime') THEN
-      CREATE ROLE search_consumer_runtime
-        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
-    END IF;
+    -- search_consumer_runtime is never created here (see the inventory note
+    -- above): the migration owner provisions it with
+    -- session_consumer_roles.sql so the owner's ADMIN creator edge survives.
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_acquisition_installer') THEN
       CREATE ROLE bulls96_acquisition_installer
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
@@ -226,7 +217,6 @@ BEGIN
        'bulls96_session_ingest', 'bulls96_session_ingest_seeder',
        'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events',
        'bulls96_privacy_eraser', 'bulls96_babysitter_retention',
-       'search_consumer_runtime',
        'bulls96_acquisition_installer',
        'buffered_search_feed_runtime'
      )

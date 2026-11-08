@@ -2498,6 +2498,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         "utf8",
       )}`,
     );
+    // N1: the consumer role is never trampolined. The migration owner
+    // provisions it with session_consumer_roles.sql, keeping the unavoidable
+    // ADMIN creator edge so the owner can promote it to LOGIN later.
+    await db.exec(
+      `SET ROLE migration_owner; ${readFileSync(
+        join(root, "supabase/bootstrap/session_consumer_roles.sql"),
+        "utf8",
+      )}`,
+    );
     // No superuser role bootstrap may fill a missing Cloud SQL prerequisite here.
     const targets = await db.query<{
       rolname: string;
@@ -2514,7 +2523,17 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         ORDER BY 1`,
     );
     expect(targets.rows).toHaveLength(15);
-    expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
+    const trampolined = targets.rows.filter(r => r.rolname !== "search_consumer_runtime");
+    expect(trampolined).toHaveLength(14);
+    expect(trampolined.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
+    // The owner-created consumer carries exactly the creator edge: the owner
+    // as member WITH ADMIN, neither INHERIT nor SET.
+    const consumerEdge = await db.query(
+      `SELECT m.rolname AS member, a.admin_option AS admin, a.inherit_option AS inherit, a.set_option AS set
+         FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+        WHERE a.roleid = (SELECT oid FROM pg_roles WHERE rolname = 'search_consumer_runtime')`,
+    );
+    expect(consumerEdge.rows).toEqual([{ member: "migration_owner", admin: true, inherit: false, set: false }]);
     const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
     const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);
     expect(targets.rows.map(r => r.rolname).sort()).toEqual([...prerequisites].sort());
@@ -2544,17 +2563,18 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
         `SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_cloudsql_role_seed'`,
       ),
     ).toMatchObject({ rows: [] });
-    // Claimed-LOGIN steady state: after the operator promotes the consumer
-    // role, the trampoline re-run converges; an extra setting still refuses.
-    await db.exec("RESET ROLE");
+    // Claimed-LOGIN steady state: the operator promotes the consumer role to
+    // LOGIN with exactly the 60s marker, and the consumer file re-run
+    // converges. Promoting as the owner that created it is the N1 proof: a
+    // trampoline copy would refuse these ALTERs with 42501. An extra setting
+    // still refuses, and the trampoline re-run ignores the role.
+    await db.exec("SET ROLE migration_owner");
     await db.exec(`ALTER ROLE search_consumer_runtime LOGIN`);
     await db.exec(`ALTER ROLE search_consumer_runtime SET statement_timeout = '60s'`);
-    await db.exec("SET ROLE migration_owner");
-    expect(await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"), "utf8")))).toBeNull();
-    await db.exec("RESET ROLE");
+    expect(await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8")))).toBeNull();
     await db.exec(`ALTER ROLE search_consumer_runtime SET search_path = attacker`);
-    await db.exec("SET ROLE migration_owner");
-    expect((await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"), "utf8"))))?.code).toBe("55000");
+    expect(await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"), "utf8")))).toBeNull();
+    expect((await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8"))))?.code).toBe("55000");
     // The added prerequisite shares the existing fail-closed, never-repair contract.
     await db.exec("RESET ROLE; ALTER ROLE bulls96_read_api INHERIT; SET ROLE migration_owner");
     expect((await failure(db.exec(readFileSync(join(root, "supabase/bootstrap/cloudsql_migration_roles.sql"), "utf8"))))?.code).toBe("55000");

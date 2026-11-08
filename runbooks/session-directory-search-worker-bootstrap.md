@@ -542,7 +542,9 @@ config fails closed.
     the catalog gate. `cloudsql_migration_roles.sql` uses and drops a disposable
     CREATEROLE trampoline; dropping it removes PostgreSQL 16+ automatic creator
     memberships and leaves `anon`, `authenticated`, `service_role`, and the NOLOGIN
-    Worker membership-free. The Cloud SQL `service_role` is NOBYPASSRLS and exists only
+    Worker membership-free. The consumer role is not trampolined: the migration
+    owner provisions it with `session_consumer_roles.sql` and keeps the ADMIN
+    creator edge (N1). The Cloud SQL `service_role` is NOBYPASSRLS and exists only
     to satisfy shared migration grants; the GCP runtime never connects as it. The
     canonical verifier then proves the Worker role and grants.
   - **Amazon RDS for PostgreSQL (`rds` mode):** the same shape with AWS's internal
@@ -747,19 +749,28 @@ catalog shows that shape (`rds_profile_unproven`).
 **Order, as the migration owner, connected to the HoopDb database:**
 
 1. `rds_owner_function_default_revoke.sql`: the owner's exact global function default.
-2. `rds_migration_roles.sql`: the twelve fixed NOLOGIN roles (the Cloud SQL set,
-   including `bulls96_privacy_eraser` and `bulls96_babysitter_retention` required by
+2. `rds_migration_roles.sql`: the fixed NOLOGIN roles (the Cloud SQL set
+   minus the consumer role below, including `bulls96_privacy_eraser` and
+   `bulls96_babysitter_retention` required by
    041000 and 042000) through a disposable CREATEROLE
    trampoline, so they are membership-free (by design, afterwards only `rdsadmin` can alter
    or drop them).
-3. `hoopdb_runtime_role_rds.sql -v migration_owner=<owner> -v runtime_role=<role>
+3. `session_consumer_roles.sql`: the session-pipeline consumer's bare NOLOGIN
+   role, created directly by the migration owner (same pattern as the runtime
+   role in step 4), keeping the owner's unavoidable PG16+ ADMIN creator edge
+   so the owner can promote it to LOGIN after migrate. The trampoline
+   deliberately never provisions it: a trampoline copy would leave the owner
+   unable to promote it (42501), and the membership recheck would refuse the
+   edge.
+4. `hoopdb_runtime_role_rds.sql -v migration_owner=<owner> -v runtime_role=<role>
    -v runtime_login=true`: the runtime LOGIN role, PUBLIC TEMPORARY revoked, CONNECT
    granted, in one transaction. Then set its password from 1Password (never on
    disk).
-4. The phase 1 verifiers `session_directory_search_worker.sql`,
+5. The phase 1 files `session_directory_search_worker.sql`,
    `session_token_verifier.sql`, `session_ingest_roles.sql`, `session_read_api_roles.sql`
-   (here they only verify the existing roles).
-5. The migrator: `HOOPDB_DB_MODE=rds`, `HOOPDB_SUPABASE_SHIM=false` (or unset),
+   (here they only verify the existing roles) and the `session_consumer_roles.sql`
+   re-run (converges on the step-3 role).
+6. The migrator: `HOOPDB_DB_MODE=rds`, `HOOPDB_SUPABASE_SHIM=false` (or unset),
    `HOOPDB_ROLE_BOOTSTRAP` unset, `HOOPDB_RUNTIME_ROLE=<role>`,
    `HOOPDB_RUNTIME_ROLE_LOGIN=true`, `HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke`.
    Generation, ledger, sequence, checksum, exact-ACL and phase 2 checks are unchanged.
@@ -780,20 +791,22 @@ mode uses `global-default-revoke`).
   and `rdsadmin` is the recorded grantor of the master's PG16+ creator edges.
 - The master's attributes and memberships (`rds_superuser`, no SUPERUSER, CREATEROLE), that
   the master owns the customer-provisioned database, and that `rdsadmin` is the only SUPERUSER.
-- Steps 1-5 pass on the target engine version and parameter group, and the canonical
+- Steps 1-6 pass on the target engine version and parameter group, and the canonical
   readiness gate passes as the runtime role over TLS.
 - Rotating the runtime password as the master through the approved operator path,
   with 1Password as the system of record, keeps the exact creator edge. No rotation
   tool or live rotation proof is supplied here. IAM database authentication is NOT supported: it
   needs `rds_iam` membership, which the allowlist refuses.
 - `pg_trgm` and `btree_gin` are creatable by the master on the target version.
-- Snapshot restore and major-version upgrade keep the role graph so steps 1-5 rerun clean.
+- Snapshot restore and major-version upgrade keep the role graph so steps 1-6 rerun clean.
 - Post-migrate activation scripts that `ALTER ROLE` a fixed role to LOGIN
   (`session_ingest_role.sql`, `session_read_api_role.sql`,
   `canonical_project_events_role.sql`, `privacy_eraser_role.sql`,
   `babysitter_retention_role.sql`) cannot run as the master on trampoline-created
   roles (no ADMIN; 42501). Those LOGIN roles need a reviewed RDS path before activation
   (same structural question as Cloud SQL); migrate and readiness do not depend on them.
+  The consumer's `session_consumer_role.sql` is the exception: the owner created the
+  role in step 3, so the promotion runs as the master.
 
 **RDS activation needs its own reviewed path.** With this bootstrap's membership-free
 fixed-role graph, the customer migration owner has no ADMIN path to alter or drop

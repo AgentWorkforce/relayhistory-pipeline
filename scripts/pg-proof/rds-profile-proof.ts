@@ -19,7 +19,7 @@
  * Exit 0 only if every case passes.
  */
 import { spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
@@ -244,23 +244,37 @@ await check("rds profile: bootstraps and migrate are idempotent (rerun applies 0
   const v = await verdict(RT);
   return [b.ok && m.exit === 0 && m.applied === 0 && v.ok, `boot=${b.ok} migrate=${fmt(m)} verdict=${fmt(v)}`];
 });
-await check("rds profile: trampoline re-run converges on an operator-claimed consumer role; extras still refuse", async () => {
-  // The operator promotion (LOGIN + exactly the 60s marker) is the claimed
-  // steady state every later deploy sees: the trampoline must accept it on
-  // re-run, and still refuse any extra setting.
-  await sql(DB, `ALTER ROLE search_consumer_runtime LOGIN`, MASTER);
-  await sql(DB, `ALTER ROLE search_consumer_runtime SET statement_timeout = '60s'`, MASTER);
-  const claimed = psql(DB, ["-f", ROLES_BOOT]);
+await check("rds profile: the owner creates the consumer role via the bootstrap chain and promotes it; extras still refuse", async () => {
+  // N1: the trampoline never provisions search_consumer_runtime. The
+  // migration owner creates it with session_consumer_roles.sql (already run
+  // in boot()), keeping the unavoidable PG16+ ADMIN creator edge, then
+  // promotes it to the claimed LOGIN steady state — an ALTER that fails
+  // 42501 on a trampoline copy, because only the creator (or a superuser)
+  // may alter the role. The consumer file re-run converges on the claim,
+  // the trampoline re-run ignores the role, and any extra setting still
+  // refuses. A source guard pins the trampoline exclusion.
+  const consumerBoot = B("supabase/bootstrap/session_consumer_roles.sql");
+  const created = psql(DB, ["-f", consumerBoot]);
+  const login = await attempt(DB, `ALTER ROLE search_consumer_runtime LOGIN`, MASTER);
+  const timeout = await attempt(DB, `ALTER ROLE search_consumer_runtime SET statement_timeout = '60s'`, MASTER);
+  const converged = psql(DB, ["-f", consumerBoot]);
   const extra = await attempt(DB, `ALTER ROLE search_consumer_runtime SET search_path = attacker`, MASTER);
-  const refused = psql(DB, ["-f", ROLES_BOOT]);
+  const trampolineIgnores = psql(DB, ["-f", ROLES_BOOT]);
+  const refused = psql(DB, ["-f", consumerBoot]);
   const reset = await attempt(DB, `ALTER ROLE search_consumer_runtime RESET search_path`, MASTER);
-  const again = psql(DB, ["-f", ROLES_BOOT]);
+  const again = psql(DB, ["-f", consumerBoot]);
   // Restore the bare shape the later checks assume.
   const bare = await attempt(DB, `ALTER ROLE search_consumer_runtime RESET statement_timeout`, MASTER);
   const nologin = await attempt(DB, `ALTER ROLE search_consumer_runtime NOLOGIN`, MASTER);
-  const restored = psql(DB, ["-f", ROLES_BOOT]);
-  return [claimed.ok && extra === "ok" && !refused.ok && reset === "ok" && again.ok && bare === "ok" && nologin === "ok" && restored.ok,
-    `claimed=${claimed.ok} extra_set=${extra} refused=${!refused.ok} reset=${reset} again=${again.ok} restored=${restored.ok}`];
+  const restored = psql(DB, ["-f", consumerBoot]);
+  const consumerEdges = await edges("search_consumer_runtime");
+  const edgeOk = consumerEdges.length === 1 &&
+    fmt(consumerEdges[0]) === fmt({ member: MASTER, grantor: "rdsadmin", grantor_oid: 10, admin: true, inherit: false, set: false });
+  const trampolineSkipsConsumer = !readFileSync(ROLES_BOOT, "utf8").includes("search_consumer_runtime");
+  const ok = created.ok && login === "ok" && timeout === "ok" && converged.ok && extra === "ok" &&
+    trampolineIgnores.ok && !refused.ok && reset === "ok" && again.ok &&
+    bare === "ok" && nologin === "ok" && restored.ok && edgeOk && trampolineSkipsConsumer;
+  return [ok, `created=${created.ok} login=${login} timeout=${timeout} converged=${converged.ok} extra_set=${extra} trampoline_ignores=${trampolineIgnores.ok} refused=${!refused.ok} reset=${reset} again=${again.ok} restored=${restored.ok} edge=${fmt(consumerEdges[0])} trampoline_skips=${trampolineSkipsConsumer}`];
 });
 await check("rds profile: the master can still rotate the runtime password (creator edge kept on purpose)", async () => {
   // A value is used only inside this disposable, trust-auth server; never a real credential.
