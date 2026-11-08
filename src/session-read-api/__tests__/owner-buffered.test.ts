@@ -627,6 +627,22 @@ describe("readOwnerBufferedList (gated)", () => {
     expect(await reason(readOwnerBufferedList(deps({ store: store(), gate: fencedGate() }), SCOPE, { limit: 1 }))).toBe("gate_status");
     expect(await reason(readOwnerBufferedList(deps({ store: store(), gate: scriptedGate(authority("7"), authority("8")) }), SCOPE, { limit: 1 }))).toBe("gate_moved");
   });
+  test("presence runs between the RPC and the final observation, only for admitted ids; a move during it is fenced", async () => {
+    const order: string[] = [];
+    const { reads } = scriptedReads({ list: [bufferedRow(), bufferedRow({ session_id: "old", admission_version: "5" }), bufferedRow({ session_id: "live" })] });
+    const answers = [authority("7"), authority("7")];
+    const gate = { async observe() { order.push("observe"); return answers.shift()!; } };
+    const presence = async (ids: string[]) => {
+      order.push(`presence:${ids.join(",")}`);
+      return new Set(["live"]);
+    };
+    const rows = await readOwnerBufferedList(deps({ store: store(), reads, gate }), SCOPE, { limit: 10 }, presence);
+    expect(order).toEqual(["observe", `presence:${SESSION},live`, "observe"]);
+    expect(rows.map((r) => [r.session_id, r.visible, r.live])).toEqual([[SESSION, true, false], ["old", false, false], ["live", true, true]]);
+    const moved = scriptedGate(authority("7"), authority("8"));
+    expect(await reason(readOwnerBufferedList(deps({ store: store(), reads: scriptedReads({ list: [bufferedRow()] }).reads, gate: moved }), SCOPE, { limit: 1 }, presence))).toBe("gate_moved");
+    expect(moved.calls).toHaveLength(2);
+  });
 });
 
 describe("sqlOwnerBufferedReads", () => {

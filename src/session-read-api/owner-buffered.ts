@@ -910,15 +910,28 @@ export async function readOwnerBufferedTurns(deps: OwnerBufferedDeps, scope: Buf
 }
 
 /**
- * GATED. One page of the caller's buffered sessions: observe, list, observe again (fenced
- * unless identical). Rows whose admission fails the final head are returned with
- * `visible: false`: they advance the buffered position but are never shown.
+ * GATED. One page of the caller's buffered sessions: observe, list, the caller's canonical
+ * presence await (`presence`, e.g. live pointers), then observe again (fenced unless
+ * identical). The final observation runs after every await of the read, so nothing the caller
+ * emits from the result waits on I/O after it. Rows whose admission fails the final head are
+ * returned with `visible: false`: they advance the buffered position but are never shown.
+ * `live` is the presence answer for a visible row (canonical wins). Presence is asked only for
+ * rows admitted under the first observation; admission depends only on the observation's
+ * (cutoverEpoch, head), which the final gate requires to be identical.
  */
-export async function readOwnerBufferedList(deps: OwnerBufferedDeps, scope: BufferedScope, args: { cursor?: BufferedListPosition; limit: number }): Promise<Array<BufferedSessionRow & { visible: boolean }>> {
+export async function readOwnerBufferedList(
+  deps: OwnerBufferedDeps,
+  scope: BufferedScope,
+  args: { cursor?: BufferedListPosition; limit: number },
+  presence?: (sessionIds: string[]) => Promise<ReadonlySet<string>>,
+): Promise<Array<BufferedSessionRow & { visible: boolean; live: boolean }>> {
   const first = await deps.gate.observe(scope);
   const rows = await deps.reads.list(scope, first, args);
+  const candidates = [...new Set(rows.filter((r) => admissionVisible(first, r)).map((r) => r.session_id))];
+  const live: ReadonlySet<string> = presence && candidates.length ? await presence(candidates) : new Set<string>();
+  // Final gate: after the RPC and the presence await, immediately before the caller emits.
   const authority = await finalGate(deps, scope, first);
-  return rows.map((r) => ({ ...r, visible: admissionVisible(authority, r) }));
+  return rows.map((r) => ({ ...r, visible: admissionVisible(authority, r), live: live.has(r.session_id) }));
 }
 
 /** Turn rows of a buffered session (the canonical live-turn projection, one harness), scrubbed. */

@@ -546,8 +546,8 @@ export function createReadApi(deps: ReadApiDeps) {
    * newest first, canonical first on equal timestamps; a buffered session whose id has a
    * live canonical pointer (any harness) or is on the canonical page is never shown
    * ("canonical wins"; pointers decide nothing else). The cursor carries both positions.
-   * Buffered rows come only through readOwnerBufferedList (authority observed before and after
-   * the RPC); a row whose admission fails the final head advances the buffered position but is
+   * Buffered rows come only through readOwnerBufferedList (authority observed before the RPC
+   * and again after the RPC and the live-pointer await, immediately before emit); a row whose admission fails the final head advances the buffered position but is
    * never shown. Fenced: the canonical page alone with X-Relayhistory-Buffered: fenced. Any
    * other buffered failure: the canonical page alone, logged `buffered_list_error`. A row of
    * another user is a 500.
@@ -573,13 +573,12 @@ export function createReadApi(deps: ReadApiDeps) {
     const cursor: BufferedListCursor | undefined = inCursor.buffered ??
       (inCursor.canonical ? { ts: cursorTsKey(inCursor.canonical.lastActivityAt), sessionId: "", source: "" } : undefined);
     try {
-      const rows = await readOwnerBufferedList(ob, bufferedScope(identity), { cursor, limit: bLimit });
-      const visible = rows.filter((r) => r.visible);
-      const pointed = visible.length
-        ? await deps.liveness.livePointerSessions(identity.orgId, identity.workspaceId, [...new Set(visible.map((r) => r.session_id))])
-        : new Set<string>();
+      // The live-pointer await runs inside the gated read, before its final authority check;
+      // from here to the response nothing awaits.
+      const rows = await readOwnerBufferedList(ob, bufferedScope(identity), { cursor, limit: bLimit }, (ids) =>
+        deps.liveness.livePointerSessions(identity.orgId, identity.workspaceId, ids));
       const onPage = new Set(canonical.map((r) => `${r.harness}\u0000${r.session_id}`));
-      for (const r of visible) if (!pointed.has(r.session_id) && !onPage.has(`${r.source}\u0000${r.session_id}`)) shown.add(`${r.source}\u0000${r.session_id}`);
+      for (const r of rows) if (r.visible && !r.live && !onPage.has(`${r.source}\u0000${r.session_id}`)) shown.add(`${r.source}\u0000${r.session_id}`);
       buffered = rows;
       consulted = true;
     } catch (error) {

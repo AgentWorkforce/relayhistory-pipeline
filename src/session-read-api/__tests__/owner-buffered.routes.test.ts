@@ -8,9 +8,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { AuthError, createReadApi, type TurnsDeps, type VerifiedIdentity } from "../app.ts";
 import { decodeCompositeListCursor, encodeCompositeListCursor, type Directory, type DirectoryListRow } from "../directory.ts";
-import { BufferedFenced, sqlOwnerBufferedReads, type ControlHeadGate, type OwnerBufferedDeps, type OwnerBufferedReads } from "../owner-buffered.ts";
+import { BufferedFenced, serviceBindingControlHead, sqlOwnerBufferedReads, type ControlHeadGate, type OwnerBufferedDeps, type OwnerBufferedReads } from "../owner-buffered.ts";
 import { memoryLiveness } from "./support.ts";
-import { E1, SESSION, authority, bufferedRow, fencedGate, putStage, scratch, scriptedGate, scriptedReads, turn, unzip } from "./owner-buffered-support.ts";
+import { E1, SESSION, authority, bufferedRow, fencedGate, headBody, putStage, scratch, scriptedGate, scriptedReads, turn, unzip } from "./owner-buffered-support.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] };
 const cleanup: Array<() => void> = [];
@@ -48,6 +48,7 @@ interface Harness {
   pointers?: Array<{ harness: string; pointers: number; live: number }>;
   liveSessions?: Record<string, number>;
   noOwnerBuffered?: boolean;
+  livePointers?: (sessionIds: string[]) => Promise<Set<string>>;
 }
 function api(h: Harness = {}) {
   const logs: Record<string, unknown>[] = [];
@@ -82,7 +83,9 @@ function api(h: Harness = {}) {
       return ID;
     },
     ch: { database: "relay_search", async command() {}, async insert() {}, async select() { throw new Error("no ClickHouse in these tests"); } } as never,
-    liveness: memoryLiveness({ createdAt: h.liveSessions }).liveness,
+    liveness: h.livePointers
+      ? { ...memoryLiveness({ createdAt: h.liveSessions }).liveness, livePointerSessions: (_o: string, _w: string, ids: string[]) => h.livePointers!(ids) }
+      : memoryLiveness({ createdAt: h.liveSessions }).liveness,
     completeSinceMs: 0,
     log: (f) => logs.push(f),
     directory,
@@ -144,6 +147,60 @@ describe("GET /v1/sessions with owner buffered rows", () => {
     const r = await get(L);
     expect(r.headers.get("x-relayhistory-buffered")).toBe("fenced");
     expect((await json(r)).sessions).toHaveLength(1);
+  });
+
+  describe("causal interleaving: the final control-head check runs after the live-pointer await", () => {
+    const ok = (b: unknown) => new Response(JSON.stringify(b), { status: 200, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
+    /** The real binding gate over a mutable producer answer; live-pointer lookup blocks until released. */
+    function interleaved(change: (() => Response) | null) {
+      let respond: () => Response = () => ok(headBody());
+      const observed: string[] = [];
+      const gate = serviceBindingControlHead({ fetch: async () => (observed.push("observe"), respond()) });
+      let release!: () => void;
+      const released = new Promise<void>((r) => (release = r));
+      let entered!: () => void;
+      const blocked = new Promise<void>((r) => (entered = r));
+      const livePointers = async () => {
+        observed.push("liveness");
+        entered();
+        await released;
+        return new Set<string>();
+      };
+      const harness = api({ gate, livePointers, reads: scriptedReads({ list: [bufferedRow()] }).reads });
+      const run = async () => {
+        const pending = harness.get(L);
+        await blocked;
+        if (change) respond = change; // the head moves while liveness is blocked
+        release();
+        return { r: await pending, observed, logs: harness.logs };
+      };
+      return run;
+    }
+    const changes: Array<[string, () => Response, string]> = [
+      ["new version", () => ok(headBody({ sourceControlVersion: "8" })), "gate_moved"],
+      ["pending=true", () => ok(headBody({ pending: true })), "gate_pending"],
+      ["503", () => new Response("{}", { status: 503, headers: { "cache-control": "no-store" } }), "gate_status"],
+    ];
+    for (const [name, change, gateReason] of changes)
+      test(`head changes while liveness is blocked (${name}): fenced, no buffered rows`, async () => {
+        const { r, observed, logs } = await interleaved(change)();
+        expect(observed).toEqual(["observe", "liveness", "observe"]);
+        expect(r.status).toBe(200);
+        expect(r.headers.get("x-relayhistory-buffered")).toBe("fenced");
+        expect(r.headers.get("x-relayhistory-buffered-ids")).toBeNull();
+        const body = await json(r);
+        expect(body.sessions.map((s: any) => s.sessionId)).toEqual(["s-1"]);
+        expect(JSON.stringify(body)).not.toContain(SESSION);
+        expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", gate: gateReason }));
+      });
+    test("mirror: nothing changes while liveness is blocked: the buffered row is emitted", async () => {
+      const { r, observed } = await interleaved(null)();
+      expect(observed).toEqual(["observe", "liveness", "observe"]);
+      expect(r.status).toBe(200);
+      expect(r.headers.get("x-relayhistory-buffered")).toBeNull();
+      expect(r.headers.get("x-relayhistory-buffered-ids")).not.toBeNull();
+      expect((await json(r)).sessions.map((s: any) => s.sessionId)).toContain(SESSION);
+    });
   });
 
   test("hidden admissions (ABA, NULL) are never listed", async () => {
