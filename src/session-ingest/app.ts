@@ -36,7 +36,9 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
-import { deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { assertWithinBudget, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { assertTenantSegment } from "./writer.ts";
+import { ADMISSION_ACCEPT_HEADER, ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_QUEUED, admissionStatus, enqueueAdmission, raisePrivacyWatermark, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
@@ -134,6 +136,14 @@ export interface IngestAppDeps {
    * legacy mirror routes are refused, because Neon's heads are no longer the authority.
    */
   privacyAuthority?: "neon" | "supabase";
+  /**
+   * S3-first async admission (INGEST_ASYNC_ADMISSION; async-admission.ts). Absent or mode "off":
+   * nothing changes. "on": a batch whose caller sends `x-relay-ingest-admission: queued-v1` (and
+   * no private custody envelope) is ACKed after the inbox PUT + queue send, with no Supabase call;
+   * every reset / re-enable raises the privacy journal first. "drain": no new async ACK, the
+   * journal is still raised (the consumer is still admitting). Buffered acceptance only.
+   */
+  asyncAdmission?: { mode: AsyncAdmissionMode; enqueue: (message: AdmissionMessage) => Promise<void>; nowMs?: () => number };
 }
 
 type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined } };
@@ -326,6 +336,18 @@ export function createIngestApp(deps: IngestAppDeps) {
   const app = new Hono<Env>();
   const emit = deps.log ?? ((fields) => log.info("session ingest", fields));
   const custodyMode = deps.custodySource ?? "relayhistory";
+  const asyncMode: AsyncAdmissionMode = deps.asyncAdmission?.mode ?? "off";
+  if (asyncMode !== "off" && deps.deliver.acceptanceMode !== "buffered") throw new Error("session ingest: async admission requires buffered acceptance");
+  const nowMs = deps.asyncAdmission?.nowMs ?? Date.now;
+  /** Before a reset or a re-enable reaches SQL (async-admission.ts privacy journal). Fail closed: no journal, no control. */
+  const raiseJournal = async (tenant: { orgId: string; workspaceId: string; userId: string }) => {
+    if (asyncMode === "off") return;
+    try {
+      await raisePrivacyWatermark(deps.deliver.target.store, deps.deliver.target.keyRoot, tenant, nowMs());
+    } catch {
+      throw new IngestUnavailable("privacy_journal", "privacy_journal_unavailable");
+    }
+  };
   const privacyAuthority = deps.privacyAuthority ?? "neon";
   if (privacyAuthority !== "neon" && (privacyAuthority !== "supabase" || custodyMode !== "frozen-supabase"))
     throw new Error("session ingest: privacyAuthority=supabase requires custodySource=frozen-supabase");
@@ -434,12 +456,30 @@ export function createIngestApp(deps: IngestAppDeps) {
   // same custody (relayhistory witness, shadow, or frozen-supabase), claim, buffer and receipt.
   const acceptBatch = async (c: Context<Env>, route: string, parse: (value: unknown, identity: IngestIdentity) => HistoryExportBatch) => {
     const started = Date.now();
+    // The upload's start, in the same clock the privacy journal uses: taken before any IO.
+    const receivedAtMs = nowMs();
     const identity = c.get("identity");
     const read: BodyRead = { bytes: 0, wireBytes: 0, encoding: "identity" };
     const fields: Record<string, unknown> = { route, org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") };
     try {
       const batch = parse(await jsonOf(c, read), identity);
       const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
+      // Async admission: no Supabase call. Only for a caller that accepts the queued ACK, and never for a
+      // relayhistory-built custody envelope (whose ACK header must come from the claim).
+      if (asyncMode === "on" && !c.get("custody") && c.req.header(ADMISSION_ACCEPT_HEADER)?.trim() === ADMISSION_ACCEPT_VALUE) {
+        const prepared = await prepareDelivery({ orgId: tenant.orgId, workspaceId: tenant.workspaceId }, batch);
+        try { assertTenantSegment(deps.deliver.target.keyRoot, tenant.orgId); } catch { throw new IngestUnavailable("precheck", "tenant_not_a_segment"); }
+        assertWithinBudget(deps.deliver, prepared.records, new Date(receivedAtMs));
+        try {
+          await enqueueAdmission({ store: deps.deliver.target.store, keyRoot: deps.deliver.target.keyRoot, enqueue: deps.asyncAdmission!.enqueue }, tenant, prepared, receivedAtMs);
+        } catch (error) {
+          if (error instanceof DeliveryError) throw error;
+          throw new IngestUnavailable("admission_enqueue", "admission_enqueue_failed");
+        }
+        emit({ ...fields, outcome: "accepted_queued", count: prepared.records.length, duration_ms: Date.now() - started, bytes_raw: read.bytes });
+        c.header(ADMISSION_HEADER, ADMISSION_QUEUED);
+        return c.json({ ...prepared.receipt, limits: { ...DELIVERY_LIMITS, contentEncodings: contentEncodings() } });
+      }
       if (!c.get("custody") && custodyMode === "frozen-supabase") c.set("custody", await frozenWitness(await batchWitnessInput(tenant, batch)));
       else if (c.get("custody")) await shadow(route, c.get("custody")!, () => batchWitnessInput(tenant, batch));
       const custody=c.get("custody");
@@ -514,6 +554,9 @@ export function createIngestApp(deps: IngestAppDeps) {
         enabled: input.enabled,
       };
       let controlAck;
+      // A re-enable lifts a tombstone: an upload that started before it must not be admitted after it.
+      // (A disable needs no journal: the consumer's claim already filters a deleted session.)
+      if (input.enabled) await raiseJournal(selection.tenant);
       {const t={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
        if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("selection",t,input.origin_id)));
        else if(identity.control&&c.get("custody"))await shadow("delivery.sessions.selection",c.get("custody")!,()=>controlWitnessInput("selection",t,input.origin_id));}
@@ -537,6 +580,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       await requireDeliveryAccount(identity, input.account_id);
       const tenant={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
       let deleted:number,controlAck;
+      await raiseJournal(tenant);
       {const t={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
        if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("reset",t,null)));
        else if(identity.control&&c.get("custody"))await shadow("delivery.sessions.reset",c.get("custody")!,()=>controlWitnessInput("reset",t,null));}
@@ -655,6 +699,19 @@ export function createIngestApp(deps: IngestAppDeps) {
     } catch (error) {
       emit({ route: "custody.authority.complete", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
       return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("fence", "ledger"));
+    }
+  });
+
+  // Async admission status (S3 only): admitted | refused (with its code) | pending.
+  app.get("/v1/delivery/admission", async (c) => {
+    const identity = c.get("identity");
+    try {
+      const originId = c.req.query("originId") ?? "", receiptId = c.req.query("receiptId") ?? "";
+      if (!identifier(originId) || !/^rhr_[0-9a-f]{64}$/.test(receiptId)) invalid("Invalid admission query");
+      return c.json(await admissionStatus(deps.deliver.target.store, deps.deliver.target.keyRoot, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, originId, receiptId));
+    } catch (error) {
+      emit({ route: "delivery.admission", outcome: error instanceof DeliveryError ? error.code : "delivery_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("admission_status", "store"));
     }
   });
 
