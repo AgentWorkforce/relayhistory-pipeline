@@ -127,11 +127,14 @@ bare-origin matches, and the RelayAuth URL is never used as an audience.
 | `AUTH_AUDIENCE` | courier (local key), ingest | `relayhistory` | string | `relayhistory` |
 | `RELAYAUTH_JWKS_URL` | ingest | `http://127.0.0.1:$INGEST_PORT/.well-known/jwks.json` (self-served local key) | transport rule when set | `http://relayauth.relayauth.svc:8787/.well-known/jwks.json` (flag) |
 | `RELAYHISTORY_ORIGIN` | ingest | unset (legacy shared audience accepted) | exact bare origin + transport rule | the origin couriers mint for, e.g. `http://<release>-alleyoop-ingest.<ns>.svc:8080` (flag) |
-| `RELAYAUTH_JWKS_URL`, `RELAYAUTH_ISSUER` | read API (Lambda) | `https://relayauth.dev/.well-known/jwks.json`, `https://relayauth.dev` (vendored defaults) | JWKS: transport rule when set | your RelayAuth JWKS and issuer |
+| `RELAYAUTH_JWKS_URL`, `RELAYAUTH_ISSUER` | read API (Lambda, session-read-api) | `https://relayauth.dev/.well-known/jwks.json`, `https://relayauth.dev` (vendored defaults) | JWKS: transport rule when set | your RelayAuth JWKS and issuer |
 | `READ_API_ORIGIN` | read API | unset (every request 401) | exact audience | the read API's own origin |
 | `OPENAI_BASE_URL` | session-brief | `https://api.openai.com/v1` (calls `<base>/responses`) | transport rule (the request carries `OPENAI_API_KEY`) | an OpenAI-compatible gateway, e.g. `http://llm-gateway.ai.svc:4000/v1` (flag) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | unset: no export | not validated (no credential) | your collector, e.g. `http://otel-collector.observability.svc:4318` |
 | `LOCKER_ENDPOINT` | all | S3 for `LOCKER_REGION` | GCS mode: own stricter check (`src/shared/locker-selection.ts`) | MinIO Service or object store |
+| `RELAYHISTORY_SELFHOST_READ_API` | session-read-api | unset (dormant: `/healthz` only, every other route 503) | `true`/`false` only | `true` once `RELAYHISTORY_READ_API_SECRET` and the read API env above are set |
+| `RELAYHISTORY_READ_API_SECRET` | session-read-api | required when enabled | the Lambda secret's JSON shape (`parseReadApiSecret`) | from the secret store (1Password), never on disk |
+| `RELAYHISTORY_READ_API_PORT` | session-read-api | `8080` (parsed even when dormant) | TCP port 1-65535 | `8080` |
 | `ALLOW_IN_CLUSTER_HTTP` | courier, ingest, read API, session-brief | `false` | `true`/`false` only | `true` on in-cluster pods that use `*.svc` URLs |
 
 Hosted values that are not runtime destinations of a self-host: the vendored

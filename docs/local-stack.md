@@ -21,6 +21,12 @@ services, same env contract, same migrations.
 | `96b-telemetry-init` | alpine | one-shot: opens the telemetry volume for the collector's uid |
 | `96b-otel-collector` | otel/opentelemetry-collector-contrib | OTLP in; spans to `/telemetry/spans.jsonl` (port 14318) |
 
+The services image also carries `SERVICE=session-read-api` (the session read
+API over HTTP, `src/session-read-api/server.ts`). The local stack does not run
+it, and it is default-off (`RELAYHISTORY_SELFHOST_READ_API`). Dormant, it
+answers `/healthz` only. See "Self-host SERVICE" in
+`docs/session-read-api-design.md`.
+
 Every worker blocks at start until HoopDb answers and the migration ledger is
 complete, so apply order does not matter (the same rule the Kubernetes chart
 uses via `/readyz`).
