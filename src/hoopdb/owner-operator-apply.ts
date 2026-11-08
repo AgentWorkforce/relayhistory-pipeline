@@ -23,13 +23,15 @@ export const OWNER_APPLY = {
   owner: "postgres",
   login: "cli_login_postgres",
   database: "postgres",
-  // The next window starts from the verified G2 ledger (56 rows).
-  // The 2026-11-07 22:31:04Z f9409ccb owner_apply_verified receipt
-  // (SHA256 d690c2b2eaf95f8612bd4b052a54ca87de3c7db7ada53ec00b7aa5926aea25d7)
-  // records this digest. Reject earlier baselines rather than allowing gaps.
+  // The next window starts from the verified G3 ledger (G2 plus the one
+  // G3 step). The 2026-11-08 02:58:31Z 3485338f
+  // owner_apply_verified receipt (1 applied / 56 skipped; SHA256
+  // 8d4e08a176d87614e7f3980ac2fcb57e3143ae3cb5c1a83ce10893a6d677604c)
+  // records this digest. This is the sole pin: the G2 ledger and any other
+  // baseline are refused rather than allowing gaps; there is no override.
   // This pin is not production apply approval; source, plan, capture and
   // human approval bindings remain mandatory.
-  ledger: "502349fe27871cb12de3fb93d8b02c3a1ece691ad500c1d7a6b2176dbed66502",
+  ledger: "7c9eac7c58d508af213282e237245ad0ea1f99353940d9772b6acff3c1bba1b0",
   protocol: "owner-schema-apply-v1",
   execution: "ssh-sf-frame-owner-schema-apply",
   maxAgeMs: 3600000,

@@ -13,6 +13,7 @@ import {
   applyOwnerRelease,
 } from "../owner-operator-apply.ts";
 import { ownerApplyArgs, ownerApplySourceFiles } from "../../../scripts/schema-release-owner-apply.ts";
+import { inputsDigest } from "../../../stacks/aws/deploy-guard.ts";
 const pin = { sha: "a".repeat(40), generation: "b".repeat(64) },
   now = Date.now();
 function boundary() {
@@ -330,10 +331,86 @@ test("backend identity drift refuses the next canonical SQL before submission", 
   expect(x.calls.some((q) => q.includes("CREATE TABLE"))).toBe(false);
 });
 
-test("the next owner window requires the verified 56-step G2 ledger", () => {
-  expect(A.ledger).toBe(
-    "502349fe27871cb12de3fb93d8b02c3a1ece691ad500c1d7a6b2176dbed66502",
-  );
+const G2_LEDGER = "502349fe27871cb12de3fb93d8b02c3a1ece691ad500c1d7a6b2176dbed66502",
+  G3_LEDGER = "7c9eac7c58d508af213282e237245ad0ea1f99353940d9772b6acff3c1bba1b0",
+  UNRELATED_LEDGER = digest("unrelated owner ledger fixture");
+const refusedLedgers = [G2_LEDGER, UNRELATED_LEDGER];
+const ledgerHash = (v: unknown) => inputsDigest(JSON.stringify({ value: v }));
+function recordingClient() {
+  const sql: string[] = [];
+  return { sql, client: { query: async (q: string) => { sql.push(q); return { rows: [] }; } } };
+}
+async function applyRefusal(x: Awaited<ReturnType<typeof evidence>>, over: { planText?: string; captureText?: string; approvalText?: string }, code: string) {
+  const r = recordingClient();
+  let sourceRechecks = 0;
+  await expect(applyOwnerRelease(r.client, 42, {
+    pin, planText: over.planText ?? x.planText, captureText: over.captureText ?? x.captureText,
+    approvalText: over.approvalText ?? JSON.stringify(x.approval), wrapper: x.wrapper,
+    recheckSource: async () => { sourceRechecks++; },
+  })).rejects.toThrow(code);
+  expect(r.sql).toEqual([]);
+  expect(sourceRechecks).toBe(0);
+}
+
+test("the next owner window requires the sole verified G3 ledger", () => {
+  expect(A.ledger).toBe(G3_LEDGER);
+  expect(Object.values(A).filter((v) => v === G2_LEDGER)).toEqual([]);
+});
+
+test("the sole G3 ledger is accepted with unchanged source/generation/plan/capture/approval gates", async () => {
+  const x = await evidence();
+  expect(JSON.parse(x.planText).ledgerSha256).toBe(G3_LEDGER);
+  expect(x.capture.ledgerSha256).toBe(G3_LEDGER);
+  expect(x.approval.ledgerSha256).toBe(G3_LEDGER);
+  const ok = validateOwnerApply(x.planText, x.captureText, JSON.stringify(x.approval), pin, x.wrapper, now);
+  expect(ok.capture.captureGeneration).toBe(x.capture.captureGeneration);
+  expect(ok.plan.ledgerSha256).toBe(G3_LEDGER);
+  for (const changed of [{ sourceSha: "e".repeat(40) }, { generation: "e".repeat(64) }, { planSha256: "f".repeat(64) },
+    { captureSha256: "f".repeat(64) }, { captureGeneration: "f".repeat(64) }, { decision: "pending" }])
+    expect(() => validateOwnerApply(x.planText, x.captureText, JSON.stringify({ ...x.approval, ...changed }), pin, x.wrapper, now))
+      .toThrow("owner_manual_exception_required");
+  expect(() => validateOwnerApply(x.planText, x.captureText, JSON.stringify(x.approval), { ...pin, sha: "e".repeat(40) }, x.wrapper, now))
+    .toThrow("owner_plan_binding");
+  expect(() => validateOwnerApply(x.planText, x.captureText, JSON.stringify(x.approval), { ...pin, generation: "e".repeat(64) }, x.wrapper, now))
+    .toThrow("owner_plan_binding");
+});
+
+test.each(refusedLedgers)("a plan carrying a non-G3 ledger (%s) is refused before capture and before any SQL", async (ledger) => {
+  const x = await evidence(),
+    planText = JSON.stringify({ ...JSON.parse(x.planText), ledgerSha256: ledger });
+  expect(() => validateReadonlyPlan(planText, pin, now)).toThrow("owner_plan_binding");
+  expect(() => validateOwnerApply(planText, x.captureText, JSON.stringify(x.approval), pin, x.wrapper, now)).toThrow("owner_plan_binding");
+  await applyRefusal(x, { planText }, "owner_plan_binding");
+});
+
+test.each(refusedLedgers)("a capture carrying a non-G3 ledger (%s) is refused before any SQL", async (ledger) => {
+  const x = await evidence(),
+    plan = JSON.parse(x.planText);
+  expect(() => ownerCapture(x.planText, plan, pin, { ...plan, ledgerSha256: ledger, existingBoundary: boundary() }, x.wrapper, new Date(now)))
+    .toThrow("owner_fresh_plan_drift");
+  const { captureGeneration: _, ...body } = { ...x.capture, ledgerSha256: ledger },
+    captureText = JSON.stringify({ ...body, captureGeneration: ledgerHash(body) }),
+    approvalText = JSON.stringify({ ...x.approval, captureSha256: digest(captureText), captureGeneration: ledgerHash(body) });
+  expect(() => validateOwnerApply(x.planText, captureText, approvalText, pin, x.wrapper, now)).toThrow("owner_capture_binding");
+  await applyRefusal(x, { captureText, approvalText }, "owner_capture_binding");
+});
+
+test.each(refusedLedgers)("an approval carrying a non-G3 ledger (%s) is refused before any SQL", async (ledger) => {
+  const x = await evidence(),
+    approvalText = JSON.stringify({ ...x.approval, ledgerSha256: ledger });
+  expect(() => validateOwnerApply(x.planText, x.captureText, approvalText, pin, x.wrapper, now)).toThrow("owner_manual_exception_required");
+  await applyRefusal(x, { approvalText }, "owner_manual_exception_required");
+});
+
+test.each(refusedLedgers)("a self-consistent plan/capture/approval set on a non-G3 ledger (%s) is refused before any SQL", async (ledger) => {
+  const x = await evidence(),
+    planText = JSON.stringify({ ...JSON.parse(x.planText), ledgerSha256: ledger }),
+    { captureGeneration: _, ...body } = { ...x.capture, ledgerSha256: ledger, planSha256: digest(planText) },
+    captureText = JSON.stringify({ ...body, captureGeneration: ledgerHash(body) }),
+    approvalText = JSON.stringify({ ...x.approval, ledgerSha256: ledger, planSha256: digest(planText),
+      captureSha256: digest(captureText), captureGeneration: ledgerHash(body) });
+  expect(() => validateOwnerApply(planText, captureText, approvalText, pin, x.wrapper, now)).toThrow("owner_plan_binding");
+  await applyRefusal(x, { planText, captureText, approvalText }, "owner_plan_binding");
 });
 
 test("a capture from the pre-G2 ledger cannot authorize the next window", async () => {
