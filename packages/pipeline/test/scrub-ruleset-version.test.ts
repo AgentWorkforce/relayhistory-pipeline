@@ -64,7 +64,9 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Updated before release (exact-head review of ff5fc268: a value starting `op://` is kept
   // only when the whole value is a strict one-line reference, OP_REFERENCE; one holding an
   // escaped line separator, a backslash, a quote, a tab or a double space is redacted whole).
-  5: "c00bcc301b9c153a334cde49b9525ff48fd232d6e724cd76882064ab882ebf54",
+  // Updated before release (exact-head review of 0f9b2416: an op:// reference has exactly three
+  // or four segments; two, or five or more, are redacted whole).
+  5: "ed8d5c35bfddbcdbe03416c03e08b3d0a0bbcf7c276bc08fe12f14d8756ee933",
 };
 
 const read = (rel: string) =>

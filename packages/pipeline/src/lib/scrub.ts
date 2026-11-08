@@ -101,14 +101,15 @@ const isLineBreak = (c: string | undefined) =>
   c === "\n" || c === "\r" || c === "\u2028" || c === "\u2029" || c === "\u0085";
 
 /**
- * A complete one-line 1Password reference, the whole value: `op://`, then two or more
- * `/`-separated segments (vault, item, optional section and field), each one or more
+ * A complete one-line 1Password reference, the whole value: `op://`, then exactly three or
+ * four `/`-separated segments (`vault/item/field` or `vault/item/section/field`; two, or
+ * five or more, are no reference and no query string is allowed), each one or more
  * runs of ASCII letters, digits, `.`, `_` or `-` joined by single spaces. No backslash,
  * quote, control character, line separator, escape sequence (`\n`, `\u2028`, …), tab,
  * double space, or leading or trailing space in a segment.
  */
 export const OP_REFERENCE =
-  /^op:\/\/[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+)*(?:\/[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+)*)+$/;
+  /^op:\/\/[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+)*(?:\/[A-Za-z0-9._-]+(?: [A-Za-z0-9._-]+)*){2,3}$/;
 
 /**
  * Values the quoted key/value rule keeps: already redacted, or a 1Password reference
