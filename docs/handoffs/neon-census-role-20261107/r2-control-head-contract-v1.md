@@ -1,4 +1,4 @@
-# R2 control-head contract v2 (supersedes v1 54ce8bc5) (Option C privacy gate) — 2026-11-08
+# R2 control-head contract v3 (supersedes v2 dbe56a03 / v1 54ce8bc5) (Option C privacy gate) — 2026-11-08
 
 Pinned by pipeline-lead. Producer: relayhistory-cloud (relayhistory-cloud-owner). Consumer: sessions-pipeline session read Worker (layered-sessions-pipeline). Adversarial: neonexit-review-dogpatch, codex-relay-desktop-find-prior (fixtures v2 `b5846258…`).
 
@@ -20,11 +20,11 @@ Pinned by pipeline-lead. Producer: relayhistory-cloud (relayhistory-cloud-owner)
   "contract": "r2-control-head/v1",
   "org": "<echo>", "workspace": "<echo>", "user": "<echo>",
   "cutover": { "epoch": "<hex64>", "mode": "ingest", "status": "active" },
-  "head": null | { "epoch": "<hex64>", "version": "<decimal string>", "digest": "<hex64>", "kind": "selection|reset|...", "pending": true|false },
+  "head": null | { "epoch": "<hex64>", "version": "<decimal string>", "digest": "<hex64>", "kind": "selection" | "reset", "pending": true|false },
   "observedAt": "<RFC3339 UTC>"
 }
 ```
-- Source: `cutover` from the DATABASE `delivery_cutover_state` / status (must be ACTIVE and equal the configured `DELIVERY_CUTOVER` epoch, else `503 cutover_mismatch`), and `head` from `sessions.delivery_cutover_control_heads` for exactly (org, workspace, user) — read-only, **same statement / snapshot** for both, `statement_timeout` ≤ 2 s. A non-null head is returned as-is even if its epoch differs from the cutover epoch (never filtered to null).
+- Source: `cutover` from the DATABASE `delivery_cutover_state` / status (must be ACTIVE and equal the configured `DELIVERY_CUTOVER` epoch, else `503 cutover_mismatch`), and `head` from `sessions.delivery_cutover_control_heads` for exactly (org, workspace, user) — read-only, **same statement / snapshot** for both, `statement_timeout` ≤ 2 s. A non-null head whose epoch differs from the cutover epoch is answered `503 head_epoch_mismatch` (never filtered to null, never returned as visible-eligible). Any `kind` other than `selection`/`reset` → `503 unknown_control_kind` (a new kind needs a contract bump).
 - `head = null` means **no control row exists for this user in this cutover epoch** (selection, reset, and any other control kind all write this head per 0078). Missing user/workspace is not an error: it is `head: null`.
 - Epochs are lowercase **hex64** (Neon 0078 CHECK). Versions are **decimal strings** (consumer parses as BigInt, never JS Number).
 - No caching (`cache-control: no-store`); no cross-request memoization.
@@ -36,7 +36,7 @@ Pinned by pipeline-lead. Producer: relayhistory-cloud (relayhistory-cloud-owner)
 A buffered row/stage is visible only if **all** hold:
 1. Response 200, exact echo of (org, workspace, user), `contract` matches, `cutover.mode == "ingest"`.
 2. `head == null` **or** (`head.pending == false` **and** `head.epoch == cutover.epoch`).
-3. The row's immutable **admission** witness (from `ingest_claim_attempts` / `ingest_lazy_ack_decisions` via the stage's original `claim_token`; GC kept-row mapping must preserve the original admission, never a replacement stage) satisfies:
+3. The row's immutable **admission** witness satisfies the rule below. Admission VERSION = `source_control_version` on the original `ingest_claim_attempts` / `ingest_lazy_ack_decisions` row (via the stage's original `claim_token`; GC kept-row mapping must preserve the original admission, never a replacement stage). Admission EPOCH is not stored on those rows: derive it from the immutable `ingest_lazy_policy.control_epoch` (identity rotation refused at 055000:113-131) joined and verified against the claim's source identity, OR 043700 persists `source_control_epoch` on new claims/decisions — the PR must state which and test it, including GC child provenance. Rule:
    - `head == null` → admission epoch == `cutover.epoch` and admission version == `"0"`;
    - `head != null` → admission epoch == `head.epoch` **and** admission version == `head.version` (no control of any kind since admission).
    - Absent/NULL admission witness → hidden.
