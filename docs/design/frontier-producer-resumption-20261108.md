@@ -144,8 +144,13 @@ requirements. Customer custody queries are not repeated for this source work.
 
 The client accepts an exclusive idle connection supplied by its eventual caller;
 the generic SQL interface cannot prove connection ownership or cancel a stalled
-transport. Its effective-role catalog check is not a claim of human/process
-identity: seeder is NOLOGIN, so its trusted installation/profile must bind and
+transport. Mark a transaction attempted before awaiting BEGIN, because the
+server may have accepted it when its response is lost. Failure always attempts
+best-effort ROLLBACK after a BEGIN send, including during the fresh closure
+transaction. The eventual real caller must discard an uncertain/broken
+connection if cleanup cannot establish idle; this client makes no idle or
+transport-health claim after a failure. Its effective-role catalog check is not
+a claim of human/process identity: seeder is NOLOGIN, so its trusted installation/profile must bind and
 guard the actual session principal and permitted role transition. Reusing a
 shared credential does not authenticate a publication-plan owner label.
 
@@ -169,3 +174,16 @@ repository has no npm lockfile. Its own Bun 1.4.2 frozen-lock install then succe
 The focused client/planner/export/canary/seed-proof suite passed 80/0, and root tsc --noEmit
 passed. SQL responses are injected synthetic metadata; this is not PostgreSQL,
 provider, live producer or hosted-history acceptance evidence.
+
+## Narrow BEGIN-response cleanup follow-up
+
+Independent component review identified that recording an open transaction only
+after BEGIN returns skips cleanup when the response is lost. The client now
+records the attempt before awaiting BEGIN. Three causal tests cover response
+loss in the first and second transactions and loss followed by failed rollback;
+all three failed on baseline 1076147b (unchanged 9438a2e7 client) before the fix. There is no automatic retry, fallback
+or success/idle claim. Connection disposal remains a required real-caller
+integration step, not a capability supplied by this generic SQL client.
+
+Final follow-up validation: 83/0 tests, 323 assertions across the same five
+focused suites; root TypeScript and diff checks pass. Tests remain synthetic.

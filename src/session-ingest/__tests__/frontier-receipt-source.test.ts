@@ -100,6 +100,30 @@ describe("bounded receipt source capability client (synthetic SQL only)", () => 
     f.db.query = async (text, params) => { if (text === RECEIPT_CAPTURE_PAGE_SQL) throw new Error("secret server text"); return query(text, params) as never; };
     await refused(f, "frontier_receipt_unavailable");
   });
+  for (const failedBegin of [1, 2]) {
+    test(`lost BEGIN response ${failedBegin} still attempts rollback without retry`, async () => {
+      const f = fixture(); const original = f.db.query; let begins = 0;
+      f.db.query = async (text, params) => {
+        // The transaction takes effect before the transport loses its response.
+        const result = await original(text, params);
+        if (text.startsWith("BEGIN") && ++begins === failedBegin) throw new Error("lost BEGIN response");
+        return result as never;
+      };
+      await refused(f, "frontier_receipt_unavailable");
+      expect(begins).toBe(failedBegin);
+      expect(f.calls.filter(c => c.text === "ROLLBACK")).toHaveLength(1);
+    });
+  }
+  test("lost BEGIN plus failed rollback stays unavailable without retry or idle claim", async () => {
+    const f = fixture(); const original = f.db.query;
+    f.db.query = async (text, params) => {
+      const result = await original(text, params);
+      if (text.startsWith("BEGIN") || text === "ROLLBACK") throw new Error("broken transport private detail");
+      return result as never;
+    };
+    await refused(f, "frontier_receipt_unavailable");
+    expect(f.calls.map(c => c.text)).toEqual(["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", "ROLLBACK"]);
+  });
   test("deadline stops before the next RPC", async () => {
     const f = fixture(); const original = f.db.query;
     f.db.query = async (text, params) => {

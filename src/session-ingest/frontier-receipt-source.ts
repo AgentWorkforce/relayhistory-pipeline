@@ -108,6 +108,8 @@ interface Page {
  * Runs only fixed SELECTs in owned read-only transactions. A final EMPTY page,
  * independently reported domain count+digest, opening/closing authority and a
  * fresh second-transaction closure are all mandatory. A limit is never EOF.
+ * On failure the eventual caller must discard an uncertain/broken connection;
+ * best-effort ROLLBACK is not proof that its transport is healthy and idle.
  * The SQL capability is still a required source/installation prerequisite.
  */
 export async function captureFrontierReceiptSource(db: FrontierCaptureSql, input: FrontierReceiptReadRequest): Promise<FrontierReceiptSourceCapture> {
@@ -122,9 +124,13 @@ export async function captureFrontierReceiptSource(db: FrontierCaptureSql, input
   b = input.bounds;
   const startedAt = new Date().toISOString(), start = performance.now();
   const check = () => { if (performance.now() - start > b.maxDurationMs) fail("frontier_receipt_deadline"); };
-  let inTransaction = false, byteCount = 0;
+  let transactionAttempted = false, byteCount = 0;
   const begin = async () => {
-    check(); await db.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); inTransaction = true;
+    check();
+    // BEGIN may take effect even if its response is lost. Cleanup must be
+    // attempted after any send, not only after an acknowledged response.
+    transactionAttempted = true;
+    await db.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     await db.query("SET LOCAL statement_timeout = 3000; SET LOCAL lock_timeout = 250; SET LOCAL TimeZone = 'UTC'; SET LOCAL search_path = pg_catalog, pg_temp");
     const rows = (await db.query<Record<string, unknown>>(RECEIPT_CAPTURE_IDENTITY_SQL)).rows;
     const r = rows[0];
@@ -169,12 +175,12 @@ export async function captureFrontierReceiptSource(db: FrontierCaptureSql, input
       after = p.next;
     }
     if (decisions.length !== opening!.decisionCount || frontierReceiptDomainSha256(decisions) !== opening!.decisionsSha256) fail("frontier_receipt_coverage");
-    await db.query("COMMIT"); inTransaction = false;
+    await db.query("COMMIT"); transactionAttempted = false;
     // A repeatable-read snapshot alone cannot prove the authority still holds.
     await begin();
     const closing = await page(null, 1);
     if (!equal(signature(opening!), signature(closing))) fail("frontier_receipt_changed");
-    await db.query("COMMIT"); inTransaction = false; check();
+    await db.query("COMMIT"); transactionAttempted = false; check();
     const finishedAt = new Date().toISOString();
     if (Date.parse(finishedAt) < Date.parse(startedAt)) fail("frontier_receipt_clock");
     return { protocol: RECEIPT_CAPTURE_PROTOCOL, tenant: input.tenant, generation: input.generation, profileId: input.profileId,
@@ -185,7 +191,7 @@ export async function captureFrontierReceiptSource(db: FrontierCaptureSql, input
         pageChainSha256: frontierSha256(hashes), itemsSha256: frontierReceiptDecisionsSha256(decisions), openingStateSha256: frontierSha256(opening!.authority),
         closingStateSha256: frontierSha256(closing.authority), terminalCursor: null, complete: true } };
   } catch (error) {
-    if (inTransaction) await db.query("ROLLBACK").catch(() => undefined);
+    if (transactionAttempted) await db.query("ROLLBACK").catch(() => undefined);
     if (error instanceof FrontierReceiptSourceError) throw error;
     // Connection/RPC/permission failures never leak raw server text or fall back.
     fail("frontier_receipt_unavailable");
