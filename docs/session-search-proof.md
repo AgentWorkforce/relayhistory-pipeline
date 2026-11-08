@@ -175,6 +175,57 @@ real ingest next.
   relevance judgments, so nDCG needs Stage 2 or a labelled set. Hybrid is an appendix.
 - The 30-day keyword cap and four pools of today's dashboard are not reproduced.
 
+## OpenSearch and Elasticsearch backend proof
+
+`.github/workflows/opensearch-proof.yml` (on pull requests and `workflow_dispatch`)
+proves the `opensearch` search backend on real servers, one matrix entry per dialect.
+Each entry starts one disposable single-node container bound to `127.0.0.1:9200`, with
+security off and no credential anywhere, and uses no hosted service:
+
+| Dialect | Image | Container settings |
+| --- | --- | --- |
+| `opensearch` | `opensearchproject/opensearch:2.17.1` | `discovery.type=single-node`, `DISABLE_SECURITY_PLUGIN=true`, `DISABLE_INSTALL_DEMO_CONFIG=true`, `cluster.routing.allocation.disk.threshold_enabled=false`, `OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g` |
+| `elasticsearch` | `docker.elastic.co/elasticsearch/elasticsearch:8.15.3` | `discovery.type=single-node`, `xpack.security.enabled=false`, `cluster.routing.allocation.disk.threshold_enabled=false`, `ES_JAVA_OPTS=-Xms1g -Xmx1g` |
+
+It then runs:
+
+1. The shared `SearchIndexAdapter` conformance suite plus OpenSearch-specific parity
+   cases: `test/search-index-opensearch-real.test.ts`. The cases are rewrite after
+   delete; a 500-character `q` containing one `İ` across window boundaries;
+   `'a'.repeat(500)`, `'İ'.repeat(500)` (folds to 1,000 code points) and
+   `'ab'.repeat(250)` against `matchesQuery`; and a scan past `max_result_window`.
+2. `scripts/opensearch-proof/e2e.ts`, in one process: records carrying a content
+   marker and the placeholder secrets from `src/concourse/seed.ts` pass through the
+   pipeline scrubber into a zstd chunk and manifest in a temp-directory store;
+   the same three repetitive or maximal `q` are checked against `matchesQuery` in a
+   separate tenant that is then deleted; `indexSearchScope` indexes the scope through
+   the opensearch-capable registry with `SEARCH_INDEX_BACKEND=opensearch`; the marker query returns the event; no
+   placeholder secret is found by query or in any stored `_source`; with the live
+   pointers gone, `indexSearchScope` erases the scope, the query is empty and
+   `_count` for the tenant is 0. It writes a JSON result (head, dialect, server
+   version, each case). The job requires exactly 19 passing cases and that the detected
+   distribution matches the dialect. Detection uses `version.distribution`, or the
+   `X-Elastic-Product` header, and is `unknown` otherwise.
+
+The basic-auth and failure paths are covered by the fake-`fetch` unit tests
+(`test/search-index-opensearch.test.ts`). To run the proof locally against any
+disposable server:
+
+```sh
+docker run -d --rm --name search -p 127.0.0.1:9200:9200 \
+  -e discovery.type=single-node -e DISABLE_SECURITY_PLUGIN=true \
+  -e DISABLE_INSTALL_DEMO_CONFIG=true opensearchproject/opensearch:2.17.1
+# or: -e discovery.type=single-node -e xpack.security.enabled=false \
+#     docker.elastic.co/elasticsearch/elasticsearch:8.15.3   (and DIALECT=elasticsearch)
+export SEARCH_INDEX_OPENSEARCH_TEST_URL=http://127.0.0.1:9200
+export SEARCH_INDEX_OPENSEARCH_TEST_DIALECT=opensearch   # or elasticsearch
+bun run --filter @96bulls/pipeline test test/search-index-opensearch-real.test.ts
+bun scripts/opensearch-proof/e2e.ts
+```
+
+Not proven here: authenticated or TLS servers, managed services (Amazon OpenSearch
+Service, Elastic Cloud), multi-node clusters, SigV4 (not implemented), and scale.
+
 ## Vendor capability matrix
 
 Read 2026-10-31. ObsessionDB live items are from obsession-agent, read-only on its dev
