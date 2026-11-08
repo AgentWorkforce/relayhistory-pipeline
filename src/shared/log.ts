@@ -42,6 +42,20 @@ function boundedCount(v: unknown, max: number): number | undefined {
   return Math.min(v, max);
 }
 
+/**
+ * The one field rule shared by log lines (logLine/emit) and span attributes (telemetry.ts
+ * spanAttrs): the value to emit for `key`, or undefined to drop it. A key off the allowlist is
+ * dropped; a BOUNDED_COUNT_FIELDS key survives only as a clamped non-negative integer; a string
+ * is scrubbed and truncated. Other values pass through (callers narrow further by type).
+ */
+export function sanitizeLogField(key: string, value: unknown): unknown {
+  if (!ALLOWED_LOG_FIELDS.has(key) || value === undefined) return undefined;
+  const max = BOUNDED_COUNT_FIELDS.get(key);
+  if (max !== undefined) return boundedCount(value, max);
+  // Strings are scrubbed again before emit as a backstop; ids never match a rule.
+  return typeof value === "string" ? scrubText(value).slice(0, 256) : value;
+}
+
 export type Level = "debug" | "info" | "warn" | "error";
 const service = process.env.OTEL_SERVICE_NAME ?? "96bulls";
 const deployment = process.env.DEPLOYMENT ?? "selfhost";
@@ -50,16 +64,8 @@ const deploymentId = process.env.DEPLOYMENT_ID ?? "local";
 function filter(fields: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(fields)) {
-    if (!ALLOWED_LOG_FIELDS.has(k)) continue;
-    if (v === undefined) continue;
-    const max = BOUNDED_COUNT_FIELDS.get(k);
-    if (max !== undefined) {
-      const n = boundedCount(v, max);
-      if (n !== undefined) out[k] = n;
-      continue;
-    }
-    // Strings are scrubbed again before emit as a backstop; ids never match a rule.
-    out[k] = typeof v === "string" ? scrubText(v).slice(0, 256) : v;
+    const safe = sanitizeLogField(k, v);
+    if (safe !== undefined) out[k] = safe;
   }
   return out;
 }
