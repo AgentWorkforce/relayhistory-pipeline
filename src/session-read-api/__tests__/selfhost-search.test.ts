@@ -117,6 +117,32 @@ describe("SEARCH_INDEX_BACKEND=postgres (the service default)", () => {
   });
 });
 
+describe("a fresh self-host before the search owner bootstrap and reader grants", () => {
+  test("a missing relation (42P01) or missing SELECT grant (42501) answers 503 backend_unavailable, naming nothing", async () => {
+    for (const code of ["42P01", "42501"]) {
+      sql = [];
+      const fail = async (text: string, params?: unknown[]) => {
+        sql.push({ text, params });
+        if (text.includes("search_index")) throw Object.assign(new Error(`relation "search_index".x: ${code}`), { code });
+        return { rows: [] };
+      };
+      pg.Pool = class extends RecordingPool {
+        override query = fail;
+        override async connect() { return { query: fail, release() {} }; }
+      } as unknown as typeof pg.Pool;
+      const built = await readApiDepsFromSecret(ENV.RELAYHISTORY_READ_API_SECRET, ENV, selfhostSearchComposition(ENV), { entry: "service" });
+      const app = createReadApi({ ...built.deps, verify: async () => ({ userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] }) });
+      const r = await app.request("/v1/events?workspace=ws-a&q=hello&limit=10", { headers: { authorization: "Bearer synthetic" } });
+      expect(r.status).toBe(503);
+      const text = await r.text();
+      expect(JSON.parse(text).error.code).toBe("backend_unavailable");
+      expect(text).not.toContain("search_index");
+      expect(text).not.toContain(code);
+      await built.close();
+    }
+  });
+});
+
 describe("SEARCH_INDEX_BACKEND selection", () => {
   test("an unknown or unrunnable name refuses startup naming the variable, never the value", async () => {
     for (const value of ["nope-synthetic-value", "opensearch", "elasticsearch", "Postgres"]) {
