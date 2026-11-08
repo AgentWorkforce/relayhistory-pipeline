@@ -21,6 +21,14 @@
  *   `api_key` and `token`) and LOSES `HISTORY_TAIL`/`KEEPTRAIL` (defect 2) in `scrubText`,
  *   `scrubJson` and `scrubRecords`; rule set 6 does neither.
  *
+ * - A private-key header inside a quoted secret value whose footer is inside a LATER
+ *   credential (`token=…`, `key: …`, `Bearer …`, `?access_token=…`, a quoted JSON value,
+ *   a bare token): the marker allowance above does not apply to that value. Rule set 6
+ *   never emits any byte of its secret part (a random prefix, `SECRETTAIL` and a random
+ *   tail per input, glued to the footer), so it redacts at least as much of it as rule
+ *   set 5, in `scrubText`, `scrubJson` and `scrubRecords`. The pre-fix rule set 6 source
+ *   (`fixtures/scrub-ruleset-6-prefix-f6a97053.ts`) leaked it; the count is reported.
+ *
  * 2,000 inputs each by default; SCRUB_FUZZ_INPUTS raises it, SCRUB_FUZZ_SEED changes the seed.
  *
  * Rule set 5 is frozen in `fixtures/scrub-ruleset-5.ts`: byte for byte
@@ -45,6 +53,7 @@ import {
   scrubText as v6,
 } from "../src/lib/scrub.js";
 import { scrubRecords as v6RecordsRaw } from "../src/lib/pipeline/raw-chunks.js";
+import { scrubText as v6PreFix } from "./fixtures/scrub-ruleset-6-prefix-f6a97053.js";
 
 /** sha256 of fixtures/scrub-ruleset-5.ts (LF line endings), rule set 5's scrub.ts at 62a7996d. */
 const V5_FIXTURE_SHA256 = "8fbf9136b61d8fae03f076f87e514f910bfcfc03841313f550f5bdcb861d4de1";
@@ -221,6 +230,90 @@ describe("rule set 5 vs 6 (differential fuzz)", () => {
     expect(bareDiffer).toBeGreaterThan(0);
     expect(pemDiffer).toBeGreaterThan(0);
   }, 300_000);
+
+  it(`never keeps a later credential's rest after a private-key footer (${INPUTS} inputs)`, () => {
+    const { rnd, pick } = rng(SEED ^ 0x2c3d);
+    const ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const TOKEN = `${ALNUM}._~+/=-`;
+    const rand = (n: number, cs = ALNUM) => Array.from({ length: n }, () => cs[rnd(cs.length)]).join("");
+    const h = "-----BEGIN PRIVATE KEY-----";
+    const f = "-----END PRIVATE KEY-----";
+    // The first value: key, separator, quote (the closing quote is the opening one).
+    const firsts: Array<[string, string]> = [
+      ['"password": ', '"'],
+      ["'token' => ", "'"],
+      ["`secret`: ", "`"],
+      ['\\"api_key\\": ', '\\"'],
+      ['"client_secret":', '"'],
+    ];
+    // Later contexts: label, and the closing text after the secret (a quoted value's quote).
+    const laters: Array<[string, string]> = [
+      ["token=", ""],
+      ["DB_PASSWORD=", ""],
+      ["api_key: ", ""],
+      ["Authorization: Bearer ", ""],
+      ["https://example.test/cb?access_token=", ""],
+      ["https://example.test/cb?x=1&refresh_token=", ""],
+      ["--token ", ""],
+      ["", ""],
+      ['"token": "', '"'],
+      ["'secret': '", "'"],
+      ['\\"token\\": \\"', '\\"'],
+      ['"note": "', '"'],
+    ];
+    const words = () => Array.from({ length: rnd(4) }, () => pick(["lorem", "KEEPMID", "a b", "\n", "x=1", ",", "{", "}", ":"])).join(" ");
+
+    let inputs = 0;
+    let leaked = 0;
+    let v5Kept = 0;
+    let preFixLeaked = 0;
+    let recordsChecked = 0;
+    let first = "";
+    for (let k = 0; k < INPUTS; k += 1) {
+      const [key, q] = pick(firsts);
+      const [label, close] = pick(laters);
+      const pre = rnd(3) ? rand(8 + rnd(12), TOKEN.replace(/-/g, "")) : "";
+      const tail = rand(8 + rnd(32), TOKEN.replace(/-/g, ""));
+      const secret = `SECRETTAIL${tail}`;
+      const longValue = rnd(8) === 0;
+      const valueHead = longValue ? "a".repeat(MAX_QUOTED_VALUE + 1) : rand(rnd(20));
+      // Sometimes a header before the value whose footer is in the value (redacted from there).
+      const before = rnd(6) === 0 ? `${pick(["", "lead KEEPHEAD\n"])}-----BEGIN RSA PRIVATE KEY-----\nQUJD\n` : "";
+      const valueOpen = before ? "-----END RSA PRIVATE KEY----- " : "";
+      const body = rnd(2) ? `\n${rand(1 + rnd(40))}` : "";
+      const middle = pick([" ", " KEEPMID ", `\n${words()}\n`, ` ${words()} `]);
+      const after = pick([" KEEPTRAIL", "\nKEEPTRAIL", "", " KEEPTRAIL\n\"user\": \"bob\"", ", KEEPTRAIL"]);
+      const text = `${pick(["", "{", "x "])}${before}${key}${q}${valueOpen}${valueHead}${h}${body}${q}${middle}${label}${pre}${f}${secret}${close}${after}`;
+      inputs += 1;
+      const outs: Array<[string, string, string]> = [
+        ["scrubText", v5(text), v6(text)],
+        ["scrubJson", (v5Json({ content: text }) as { content: string }).content, (v6Json({ content: text }) as { content: string }).content],
+      ];
+      if (k % 4 === 0) {
+        recordsChecked += 1;
+        outs.push(["scrubRecords raw", v5Records(`${text}\n`), v6Records(`${text}\n`)]);
+        const line = `${JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: text }] } })}\n`;
+        outs.push(["scrubRecords record", v5Records(line), v6Records(line)]);
+      }
+      // Bytes of the later value's secret part: the prefix (when long enough to be
+      // unambiguous), SECRETTAIL and every 8-unit window of the random tail.
+      const parts = [...(pre.length >= 8 ? [pre] : []), "SECRETTAIL"];
+      for (let i = 0; i + 8 <= tail.length; i += 4) parts.push(tail.slice(i, i + 8));
+      const keeps = (out: string) => parts.some((p) => out.includes(p) || out.includes(JSON.stringify(p).slice(1, -1)));
+      if (keeps(v6PreFix(text))) preFixLeaked += 1;
+      for (const [path, a, b] of outs) {
+        if (keeps(a)) v5Kept += 1;
+        if (keeps(b)) {
+          leaked += 1;
+          if (!first) first = `input ${k} (seed ${SEED}) ${path}: ${JSON.stringify(text.slice(0, 300))}`;
+        }
+      }
+    }
+    console.log(`scrub v6 later-credential fuzz: ${inputs} inputs (${recordsChecked} also through scrubRecords), ${leaked} keeping a byte of the later value's secret (pre-fix rule set 6 source: ${preFixLeaked} inputs; rule set 5: ${v5Kept} outputs)`);
+    expect(leaked, first).toBe(0);
+    // The generator reaches the shape that leaked before the fix.
+    expect(preFixLeaked).toBeGreaterThan(0);
+  }, 600_000);
 
   it(`scrubs ${INPUTS} random records as rule set 5 does, except the two corrected shapes`, () => {
     const { rnd, pick } = rng(SEED ^ 0x5a5a);

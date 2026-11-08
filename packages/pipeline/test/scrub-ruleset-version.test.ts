@@ -80,7 +80,11 @@ const SCRUB_RULESETS: Record<number, string> = {
   // place and re-pinned it to 595fecdf…; 5 stays the shipped ed8d5c35…): a header in a
   // quoted secret value whose footer is inside a later quoted value no longer leaves the
   // rest of that later value keyless (the close is not put back when a quote lies between).
-  6: "e14dfdfd09e6965b2e3ce6b32eb9b356c649914fd349a5adadd81b6c409da72d",
+  // Updated before release (review of f6a97053, defect 4): with no quote between, a footer
+  // inside a later unquoted credential (`token=…`, `Bearer …`, `?access_token=…`) no longer
+  // leaves the rest of that credential, glued to the footer, without its label; the run is
+  // redacted with the footer, or to the end of the input when it holds a quote.
+  6: "28edb23b9ff94299d530213a04026210eb848399475b740e026ecc85980b3a11",
 };
 
 const read = (rel: string) =>

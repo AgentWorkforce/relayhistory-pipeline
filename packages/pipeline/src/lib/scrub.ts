@@ -98,6 +98,9 @@ export const MAX_QUOTED_VALUE = 4096;
  */
 const BARE_VALUE = /[^\s"'`,;{}[\]\\]*/y;
 
+/** The run of non-whitespace from a position (rule set 6: the rest of a token glued to a private-key footer). */
+const GLUED_RUN = /\S*/y;
+
 /**
  * JSON literals and numbers after a quoted secret key are not secrets (`"max_token": 512`).
  * Tested only on a whole unquoted value within the bound (rule set 6).
@@ -329,6 +332,23 @@ function redactQuotedSecretValues(
       if (footer && /["'`]/.test(text.slice(closeEnd, footer.index))) {
         restoreClose = false;
         if (fromHeader) redactEnd = text.length;
+      } else if (redactEnd < text.length) {
+        // With no quote between, the footer may be inside a later UNQUOTED credential
+        // (`token=…`, `Bearer …`, `?access_token=…`, a bare token) whose label this
+        // redaction removes: the rest of that value, glued to the footer, would be kept
+        // with no label for its own rule to find. So the redaction also takes the run of
+        // non-whitespace glued to the footer, up to a private-key header that starts in it
+        // (that block is the PEM rule's). A quote in that run may open or close a value
+        // whose extent cannot be told here: then, as rule set 5's did, the redaction runs
+        // to the end of the input.
+        GLUED_RUN.lastIndex = redactEnd;
+        let glued = (GLUED_RUN.exec(text) as RegExpExecArray)[0];
+        // A header holds a space, so one can start in the run only at its very end.
+        if (glued.endsWith("-----BEGIN")) {
+          PEM_BEGIN_AT.lastIndex = redactEnd + glued.length - 10;
+          if (PEM_BEGIN_AT.test(text)) glued = glued.slice(0, -10);
+        }
+        redactEnd = /["'`]/.test(glued) ? text.length : redactEnd + glued.length;
       }
     } else if (fromHeader) redactEnd = closeEnd;
     out += text.slice(last, valueStart);
@@ -443,7 +463,10 @@ export function unsplittableQuotedValueSpans(
  * may be inside another quoted value whose key the redaction removes, so the rest of that
  * value is never kept: the closing quote is not put back (the quoted rule then takes the
  * rest as part of this value), or, when the redaction also starts at a header before the
- * value, it runs to the end of the input.
+ * value, it runs to the end of the input. With no quote between, the footer may be inside
+ * a later unquoted credential (`token=…`, `Bearer …`, `?access_token=…`) whose label the
+ * redaction removes: the run of non-whitespace glued to the footer is redacted with it
+ * (to the end of the input when that run holds a quote), so none of it is kept unlabelled.
  */
 function redactOverCapQuotedValues(text: string): string {
   return redactQuotedSecretValues(text, undefined, false, true);
@@ -850,6 +873,8 @@ const TRUNCATION_NOTE = "[relayhistory: truncated";
 
 const PEM_BEGIN = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
 const PEM_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/g;
+/** `PEM_BEGIN`, matched in place. */
+const PEM_BEGIN_AT = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/y;
 
 /**
  * Start of the first private-key block in `text` that the PEM rule cannot

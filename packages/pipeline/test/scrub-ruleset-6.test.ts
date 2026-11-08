@@ -23,6 +23,11 @@
  *    keep it). When a quote lies between the value and the footer, the close is no longer
  *    put back (or, with a header before the value too, the redaction runs to the end).
  *
+ * 4. Found in review of f6a97053: the same with the footer inside a later UNQUOTED
+ *    credential (`token=…`, `Authorization: Bearer …`, `?access_token=…`). With no quote
+ *    between, the close was put back and the rest of that credential, glued to the footer,
+ *    was kept with its label gone. See scrub-ruleset-6-later-unquoted.test.ts.
+ *
  * PR #354 made the fixes for 1 and 2 in place under version 5 with tests in
  * scrub-ruleset-5.test.ts; those tests are folded in here (its `"token": <digits>` kept
  * assertion is superseded: rule set 6 redacts any bare value at or over the bound), and
