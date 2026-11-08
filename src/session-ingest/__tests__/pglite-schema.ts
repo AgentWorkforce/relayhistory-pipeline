@@ -1,5 +1,6 @@
 /**
- * TEST-ONLY schema helper for the PGlite suites: the Supabase shim, the four role bootstraps
+ * TEST-ONLY schema helper for the PGlite suites: the Supabase shim, the role bootstrap chain
+ * (SESSION_BOOTSTRAP_FILES, the list migrate.ts plan() runs)
  * and the sorted supabase/migrations, optionally cut off at one migration.
  *
  * HOOPDB_MIGRATE_UNTIL=<migration filename> (or `{ until }`) applies the migrations up to and
@@ -15,6 +16,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { PGlite } from "@electric-sql/pglite";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 export const REPO_ROOT = join(import.meta.dir, "../../..");
 /** The last migration of the G4 set (55 files plus bootstrap). */
@@ -28,7 +30,7 @@ export function sortedMigrations(root = REPO_ROOT): string[] {
  * that lands on main after the cutoff joins this list (and so the G4 suite's absence checks and
  * function-body scan) automatically; g4-only-schema.pglite.test.ts pins the expected names so that
  * drift is a visible test failure, never a silent skip. At the time of writing: 043850 (#332),
- * 043860 (#338), 043870 (#339), 043880 (#327) and 043890 (#384).
+ * 043860 (#338), 043870 (#339), 043880 (#327), 043890 (#384) and 043900 (#336).
  */
 export const POST_G4_MIGRATIONS: readonly string[] = (() => {
   const all = sortedMigrations();
@@ -36,7 +38,6 @@ export const POST_G4_MIGRATIONS: readonly string[] = (() => {
   if (g4Index < 0) throw new Error(`G4_LAST_MIGRATION names no migration: ${G4_LAST_MIGRATION}`);
   return Object.freeze(all.slice(g4Index + 1));
 })();
-export const BOOTSTRAPS = ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"] as const;
 
 /**
  * The sorted migration filenames, cut off (inclusive) at `until`. `until` omitted (undefined): the
@@ -56,7 +57,7 @@ export async function applySupabaseSchema(db: Pick<PGlite, "exec">, options: { u
   const root = options.root ?? REPO_ROOT;
   const read = (p: string) => readFileSync(join(root, p), "utf8");
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of BOOTSTRAPS) await db.exec(read(`supabase/bootstrap/${f}.sql`));
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   const files = migrationFiles(root, options.until);
   for (const f of files) await db.exec(read(`supabase/migrations/${f}`));
   return files;

@@ -2,7 +2,8 @@
  * The session-ingest Worker on a G4-only database: supabase/migrations up to and including
  * 20261105043800_lazy_ack_clock_no_key_update.sql (plus bootstrap), WITHOUT 043850 (#332
  * acquisition owner), 043860 (#338 buffered search gate), 043870 (#339 buffered search feed
- * cursor), 043880 (#327 bookkeeping cleanup), 043890 (#384) and any later migration (pglite-schema.ts
+ * cursor), 043880 (#327 bookkeeping cleanup), 043890 (#384), 043900 (#336 consumer function grants,
+ * EXECUTE grants only) and any later migration (pglite-schema.ts
  * derives POST_G4_MIGRATIONS from the sorted list). The app runs with the Worker's default flags
  * (canonical acceptance, async admission / babysitter routing / replica off, relayhistory
  * custody), and the buffered acceptance mode it is cut over to; every main sync ingest path
@@ -98,6 +99,7 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105043870_buffered_search_feed_cursor.sql",
       "20261105043880_ingest_bookkeeping_cleanup.sql",
       "20261105043890_buffered_search_gate_retired_witness.sql",
+      "20261105043900_session_consumer_function_grants.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
