@@ -5,7 +5,7 @@
  * claim; same-key racers serialize and the loser takes the P0W01 ownership path, never 23505/40001.
  * Claim/commit payloads are captured from the real deliverBatch -> sqlLedger path and replayed on held connections.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import pg, { type PoolClient } from "pg";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -41,6 +41,9 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
   let admin: pg.Client, pool: pg.Pool, name: string, generation: string;
   let scratch: ReturnType<typeof scratchStore>, serial = 0;
   const sessions = new Set<PoolClient>();
+  /** Held transactions not yet finished; afterEach cancels and rolls them back so a failed assertion never leaks an open
+   *  transaction (and its locks) into the next test. */
+  const open = new Set<Held>();
   const connect = async () => { const c = await pool.connect(); sessions.add(c); return c; };
   const release = async (c: PoolClient) => { await c.query("ROLLBACK").catch(() => {}); sessions.delete(c); c.release(); };
   const tenant = (label: string): Tenant => ({ ...TENANT, userId: `clock-${label}-${++serial}` });
@@ -76,6 +79,13 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     const r = await raw(t, id, ids, opts);
     return deliverBatch({ ledger: ledgerFor(), acceptanceMode: "buffered", target: { store: scratch.store, keyRoot: "96bulls" }, custody: await custody(t, r, opts) } as never, t, r);
   }
+  /** Real completed deliveries that COMMIT the first-claim bookkeeping before any held-claim experiment: the org's
+   *  ingest_buffer_admission row (ingest_lazy_begin INSERT ... ON CONFLICT DO NOTHING keyed by org_id -- an
+   *  uncommitted first insert makes every other claimant of the org wait on that xid, which is NOT the seat clock) and
+   *  each user's fence owner / seed baseline / privacy seal. Held claims then contend only on what 043500 changes. */
+  async function warm(...ts: Tenant[]) {
+    for (const t of ts) expect((await deliver(t, `warm-${t.userId}`, [`warm-${t.userId}`])).outcome).toBe("accepted_buffered");
+  }
   /** The exact jsonb the real path sends to `fn`; the delivery stops there (nothing of that call executes). */
   async function capture(fn: "ingest_claim_buffered_batch" | "ingest_commit_buffered_batch", t: Tenant, id: string, ids: string[], opts: Opts = {}) {
     let payload: string | undefined;
@@ -90,10 +100,16 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     const client = await connect();
     const pid = (await client.query("SELECT pg_backend_pid() AS pid")).rows[0].pid as number;
     await client.query(`BEGIN;${settings};SET LOCAL ROLE bulls96_session_ingest`);
+    const held = { client, pid } as Held; open.add(held);
     const done = client.query(sql, [payload]).then((r) => ({ ok: true as const, result: r.rows[0].result }), (e: any) => ({ ok: false as const, code: String(e.code), message: String(e.message) }));
-    return { client, pid, done };
+    held.done = done; return held;
   }
-  const finish = async (h: Held, verb: "COMMIT" | "ROLLBACK") => { try { await h.client.query(verb); } finally { await release(h.client); } };
+  const finish = async (h: Held, verb: "COMMIT" | "ROLLBACK") => { open.delete(h); try { await h.client.query(verb); } finally { await release(h.client); } };
+  afterEach(async () => {
+    const left = [...open]; open.clear();
+    for (const h of left) await pool.query("SELECT pg_cancel_backend($1)", [h.pid]).catch(() => {});
+    for (const h of left) { await h.done; await release(h.client); }
+  });
   const settled = async (p: Promise<unknown>, ms: number) => Promise.race([p.then(() => true), Bun.sleep(ms).then(() => false)]);
   const waitFor = async (what: string, sql: string, params: unknown[]) => {
     const end = Date.now() + 5000;
@@ -136,7 +152,8 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
 
   test("A1: while X holds an open claim, Y's claim of a different key proceeds; with the 055000 bodies it queues on the clock (55P03 under lock_timeout)", async () => {
     const run = async () => {
-      const x = await tenant("a1x"), y = await tenant("a1y");
+      const x = tenant("a1x"), y = tenant("a1y");
+      await warm(x, y);
       const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `a1x-${serial}`, [`a1-x-${serial}`]));
       expect((await hx.done).ok).toBe(true);
       const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `a1y-${serial}`, [`a1-y-${serial}`]), "SET LOCAL lock_timeout=750");
@@ -155,6 +172,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
 
   test("A2: same owned key -- Y waits on the per-key advisory lock, then gets P0W01 (never 23505/40001); one slot, one custody row", async () => {
     const x = tenant("a2x"), y = tenant("a2y"), rid = `a2-${serial}`, cur = await current(x, rid);
+    await warm(x, y);
     const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `a2x-${serial}`, [rid], { current: cur }));
     expect((await hx.done).ok).toBe(true);
     const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `a2y-${serial}`, [rid], { current: cur }));
@@ -169,6 +187,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
 
   test("A2b: same source-absent key -- Y waits, then finds X's NULL-owned slot and CONTINUEs (pre-fix race: 23505)", async () => {
     const x = tenant("a2bx"), y = tenant("a2by"), rid = `a2b-${serial}`;
+    await warm(x, y);
     const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `a2bx-${serial}`, [rid]));
     expect((await hx.done).ok).toBe(true);
     const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `a2by-${serial}`, [rid]));
@@ -181,6 +200,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
 
   test("A3: X rolls back -- Y initializes the slot (owner NULL until a non-suppressed ACK); Y's staged ACK then owns it", async () => {
     const x = tenant("a3x"), y = tenant("a3y"), rid = `a3-${serial}`;
+    await warm(x, y);
     const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `a3x-${serial}`, [rid]));
     expect((await hx.done).ok).toBe(true);
     const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `a3y-${serial}`, [rid]));
@@ -197,6 +217,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     const codes: string[] = [];
     for (let i = 0; i < 50; i++) {
       const x = tenant("a4x"), y = tenant("a4y"), a = `a4-${serial}-a`, b = `a4-${serial}-b`;
+      await warm(x, y);
       const [px, py] = await Promise.all([capture("ingest_claim_buffered_batch", x, `a4x-${serial}`, [a, b]), capture("ingest_claim_buffered_batch", y, `a4y-${serial}`, [b, a])]);
       const [hx, hy] = await Promise.all([hold(CLAIM, px), hold(CLAIM, py)]);
       const [rx, ry] = await Promise.all([hx.done.then(async (r) => { await finish(hx, "COMMIT"); return r; }), hy.done.then(async (r) => { await finish(hy, "COMMIT"); return r; })]);
@@ -206,8 +227,9 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
   }, 300000);
 
   test("B1: staged commits serialize on the clock with contiguous seats; a claim's KEY SHARE vs an allocator per the final lock mode", async () => {
-    const before = BigInt(await lastSeat());
     const x = tenant("b1x"), y = tenant("b1y"), z = tenant("b1z");
+    await warm(x, y, z);
+    const before = BigInt(await lastSeat());
     const xs = [`b1-x-${serial}-0`, `b1-x-${serial}-1`], ys = [`b1-y-${serial}-0`, `b1-y-${serial}-1`];
     const px = await capture("ingest_commit_buffered_batch", x, `b1x-${serial}`, xs), py = await capture("ingest_commit_buffered_batch", y, `b1y-${serial}`, ys);
     const hx = await hold(COMMIT, px);
@@ -228,8 +250,9 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
   }, 60000);
 
   test("B2: two suppressed claims run concurrently (the second never waits for the first), no 40P01, last_seat unchanged", async () => {
-    const before = await lastSeat();
     const x = tenant("b2x"), y = tenant("b2y");
+    await warm(x, y);
+    const before = await lastSeat();
     const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `b2x-${serial}`, [`b2-x-${serial}`], { fenced: true }));
     expect(await hx.done).toMatchObject({ ok: true });
     const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `b2y-${serial}`, [`b2-y-${serial}`], { fenced: true }));
@@ -239,19 +262,25 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect((await pool.query("SELECT buffer_receipt_kind k,state FROM sessions.ingest_batches WHERE batch_id IN($1,$2) ORDER BY batch_id", [`b2x-${serial}`, `b2y-${serial}`])).rows)
       .toEqual([{ k: "suppressed", state: "committed" }, { k: "suppressed", state: "committed" }]);
     // Concurrent fire, both directions, repeated.
-    const codes: string[] = [];
+    expect(await lastSeat()).toBe(before);
+    const codes: string[] = [], seats: string[] = [];
     for (let i = 0; i < 20; i++) {
       const a = tenant("b2a"), b = tenant("b2b");
+      await warm(a, b);
+      const round = await lastSeat();
       const [pa, pb] = await Promise.all([capture("ingest_claim_buffered_batch", a, `b2a-${serial}`, [`b2-a-${serial}`], { fenced: true }), capture("ingest_claim_buffered_batch", b, `b2b-${serial}`, [`b2-b-${serial}`], { fenced: true })]);
       const hs = await Promise.all([hold(CLAIM, pa), hold(CLAIM, pb)]);
       for (const r of await Promise.all(hs.map((h) => h.done.then(async (r) => { await finish(h, "COMMIT"); return r; })))) codes.push(r.ok ? "ok" : r.code);
+      if (await lastSeat() !== round) seats.push(round);
     }
     expect(codes.filter((c) => c !== "ok")).toEqual([]);
-    expect(await lastSeat()).toBe(before);
+    expect(seats).toEqual([]);
   }, 120000);
 
   test("U4: a buffered claim never commits a non-suppressed receipt inside the claim transaction", async () => {
-    const x = tenant("u4"), staged = `u4s-${serial}`, suppressed = `u4p-${serial}`;
+    const x = tenant("u4");
+    await warm(x);
+    const staged = `u4s-${serial}`, suppressed = `u4p-${serial}`;
     const row = async (id: string) => (await pool.query("SELECT state,buffer_receipt_kind k FROM sessions.ingest_batches WHERE batch_id=$1", [id])).rows;
     const h = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, staged, [`u4-s-${serial}`]));
     expect((await h.done).ok).toBe(true); await finish(h, "COMMIT");
@@ -263,6 +292,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
 
   test("2c: the suppressed ACK path writes no tuple (nothing for history tracking / retire-fence triggers) and allocates no seat", async () => {
     const x = tenant("c2"), id = `c2-${serial}`;
+    await warm(x);
     const h = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, id, [`c2-${serial}`], { fenced: true }));
     expect((await h.done).ok).toBe(true); await finish(h, "COMMIT");
     const before = await lastSeat();
