@@ -14,8 +14,9 @@
  *                                   runtime-role URL for the reconciler; never a
  *                                   reader URL). A clickhouse block is refused:
  *                                   the hosted binding has no place here
- *   SEARCH_INDEX_BACKEND                      enabled only: postgres (the only self-host
- *                                   backend; anything else fails startup)
+ *   SEARCH_INDEX_BACKEND                      enabled only: postgres | opensearch (managed
+ *                                   AWS index, SEARCH_INDEX_OPENSEARCH_*; projection state
+ *                                   stays in Postgres); anything else fails startup
  *   SEARCH_INDEX_POSTGRES_BACKEND_ID          enabled only: the projection-state backend id
  *                                   the search writer records under (required;
  *                                   not a credential). Format is validated by the
@@ -69,11 +70,14 @@ export interface ConsumerSecret {
   search?: unknown;
 }
 
+export type ConsumerSearchBackend = "postgres" | "opensearch";
+
 export type ConsumerServiceConfig =
   | { enabled: false }
   | {
       enabled: true;
       secret: ConsumerSecret;
+      searchBackend: ConsumerSearchBackend;
       backendId: string;
       /** Coverage floor shared with the reader (partials treats any other floor as stale). */
       floorMs: number;
@@ -127,7 +131,7 @@ export function consumerServiceConfig(env: NodeJS.ProcessEnv = process.env): Con
   if (profile !== "supabase" && profile !== "custom-ca")
     throw new Error(`96bulls: ${CONSUMER_SERVICE_FLAG}=true needs ${CONSUMER_TLS_PROFILE_VAR} to be supabase or custom-ca`);
   const backend = env[CONSUMER_BACKEND_VAR];
-  if (backend !== "postgres") throw new Error(`96bulls: ${CONSUMER_BACKEND_VAR} must be postgres for the self-host consumer`);
+  if (backend !== "postgres" && backend !== "opensearch") throw new Error(`96bulls: ${CONSUMER_BACKEND_VAR} must be postgres or opensearch for the self-host consumer`);
   const backendId = env[CONSUMER_BACKEND_ID_VAR];
   if (!backendId) throw new Error(`96bulls: ${CONSUMER_SERVICE_FLAG}=true needs ${CONSUMER_BACKEND_ID_VAR}`);
   const keyPrefix = env[CONSUMER_KEY_PREFIX_VAR];
@@ -148,5 +152,5 @@ export function consumerServiceConfig(env: NodeJS.ProcessEnv = process.env): Con
   // The writer must record the reader's floor or partials lists every session as stale.
   const floorMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   const unhealthyFile = env.CONSUMER_UNHEALTHY_FILE ?? "/tmp/session-pipeline-consumer.unhealthy";
-  return { enabled: true, secret: parseConsumerSecret(secretText), backendId, floorMs, keyPrefix, lookbackMinutes, everyMinutes, fanout, unhealthyFile };
+  return { enabled: true, secret: parseConsumerSecret(secretText), searchBackend: backend, backendId, floorMs, keyPrefix, lookbackMinutes, everyMinutes, fanout, unhealthyFile };
 }
