@@ -1450,6 +1450,59 @@ describe("per-step catalog sentinels", () => {
     await db.exec(INBOUND[0]![1]);
     expect((await failure(db.exec(readFileSync(BOOTSTRAP, "utf8"))))?.code).toBe("55000");
   });
+
+  // PGlite is PostgreSQL 16+, and server_version_num is a read-only preset GUC, so the pre-16 branches are
+  // exercised by pinning the version the file reads to 150000 (exactly one substitution each). Everything else
+  // runs as shipped. CI's real PostgreSQL 15 job covers the unsimulated path.
+  const pre16 = (sql: string, from: string, to: string) => {
+    expect(sql.split(from).length).toBe(2);
+    return sql.replace(from, to);
+  };
+  const BOOTSTRAP_PRE16 = () =>
+    pre16(readFileSync(BOOTSTRAP, "utf8"), "v_version int := current_setting('server_version_num')::int;", "v_version int := 150000;");
+  const PRE16_MEMBERS: [string, string, string][] = [
+    ["a LOGIN member", `CREATE ROLE g6_attacker LOGIN; GRANT ${INSTALLER} TO g6_attacker`, "g6_attacker"],
+    ["the exact Supabase creator edge (no creator-edge exception before PG16)", SUPABASE_EDGE, "postgres"],
+    ["two members (the first by rolname is named)", `CREATE ROLE "Zz Attacker" LOGIN; CREATE ROLE g6_attacker LOGIN; GRANT ${INSTALLER} TO "Zz Attacker", g6_attacker`, `"Zz Attacker"`],
+  ];
+  for (const [label, sql, named] of PRE16_MEMBERS)
+    test(`installer inbound membership, simulated pre-16 (${label}): the role bootstrap refuses 55000 naming the member`, async () => {
+      const { db } = await acquisitionPrefix();
+      await db.exec(sql);
+      const error = await failure(db.exec(BOOTSTRAP_PRE16()));
+      expect(error?.code).toBe("55000");
+      expect(error?.message).toBe(`bootstrap ${INSTALLER}: the role has an unexpected member ${named}`);
+    });
+
+  test("installer inbound membership, simulated pre-16: with no member, the bootstrap and the 043850 admission block pass", async () => {
+    const { db, path } = await acquisitionPrefix();
+    expect(await failure(db.exec(BOOTSTRAP_PRE16()))).toBeNull();
+    const migration = pre16(readFileSync(path, "utf8"), "IF current_setting('server_version_num')::int>=160000 THEN", "IF 150000>=160000 THEN");
+    await db.exec("BEGIN");
+    await db.exec(migration);
+    await db.exec("COMMIT");
+    expect(await installerGrants(db)).toBe(4);
+  });
+
+  test("installer inbound membership, simulated pre-16: the 043850 admission block refuses any member 55000 before any RPC grant", async () => {
+    const { db, path } = await acquisitionPrefix();
+    await db.exec(SUPABASE_EDGE);
+    const migration = pre16(readFileSync(path, "utf8"), "IF current_setting('server_version_num')::int>=160000 THEN", "IF 150000>=160000 THEN");
+    await db.exec("BEGIN");
+    const error = await failure(db.exec(migration));
+    await db.exec("ROLLBACK");
+    expect(error?.code).toBe("55000");
+    expect(error?.message).toBe(`acquisition: role ${INSTALLER} has an unexpected member`);
+    expect(await installerGrants(db)).toBe(0);
+  });
+
+  test("installer inbound membership (PG16+ path): the bootstrap names the member", async () => {
+    const { db } = await acquisitionPrefix();
+    await db.exec(INBOUND[0]![1]);
+    expect((await failure(db.exec(readFileSync(BOOTSTRAP, "utf8"))))?.message).toBe(
+      `bootstrap ${INSTALLER}: the role has an unexpected member g6_attacker`,
+    );
+  });
 });
 
 test("the runbook's sentinel table documents every schema step", async () => {

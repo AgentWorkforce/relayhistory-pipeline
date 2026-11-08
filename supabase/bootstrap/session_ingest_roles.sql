@@ -78,7 +78,8 @@ BEGIN
     -- SET ROLE to it and call the SECURITY DEFINER acquisition RPCs directly. Only Supabase's PG16+
     -- creator edge is tolerated, and only where this file itself would have admitted Supabase's postgres
     -- as the creator: it is SET FALSE and INHERIT FALSE, so it can neither SET ROLE nor inherit the
-    -- grants. Before PG16 (no inherit_option/set_option) every member is refused.
+    -- grants. Before PG16 (no inherit_option/set_option) every member is refused. Both paths name the
+    -- member in the 55000 message.
     IF v_name = 'bulls96_acquisition_installer' THEN
       IF v_version >= 160000 THEN
         FOR v_member IN EXECUTE 'SELECT u.rolname, g.rolname AS grantor, g.rolsuper AS grantor_super, a.admin_option, a.inherit_option, a.set_option
@@ -94,10 +95,19 @@ BEGIN
               HINT = 'Nothing was changed. Revoke the membership by hand (no login may be a member of the installer), then rerun.';
           END IF;
         END LOOP;
-      ELSIF EXISTS (SELECT 1 FROM pg_auth_members WHERE roleid = r.oid) THEN
-        RAISE EXCEPTION USING ERRCODE = '55000',
-          MESSAGE = format('bootstrap %s: the role has an unexpected member', v_name),
-          HINT = 'Nothing was changed. Revoke the membership by hand (no login may be a member of the installer), then rerun.';
+      ELSE
+        -- Before PG16 every member is unexpected; name the first one (by rolname, for determinism).
+        -- LEFT JOIN: a member row is refused even if its role cannot be resolved (as the old EXISTS did).
+        SELECT coalesce(u.rolname::text, 'oid ' || a.member::text) AS rolname INTO v_member
+          FROM pg_auth_members a LEFT JOIN pg_roles u ON u.oid = a.member
+         WHERE a.roleid = r.oid
+         ORDER BY u.rolname, a.member
+         LIMIT 1;
+        IF FOUND THEN
+          RAISE EXCEPTION USING ERRCODE = '55000',
+            MESSAGE = format('bootstrap %s: the role has an unexpected member %I', v_name, v_member.rolname),
+            HINT = 'Nothing was changed. Revoke the membership by hand (no login may be a member of the installer), then rerun.';
+        END IF;
       END IF;
     END IF;
   END LOOP;
