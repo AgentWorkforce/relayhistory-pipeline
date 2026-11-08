@@ -312,7 +312,7 @@ reviewed cutover, not a mode flip.
 | new `scripts/pg-proof/shared-db-proof.ts` plus `.github/workflows/pg-proof.yml` job | two-service denial, poisoning, restore | low | none |
 | `runbooks/session-directory-search-worker-bootstrap.md` | "Shared RDS database" section | low | none |
 | `supabase/history-migrations/*`, `src/history-db/migrate.ts` | excluded from shared install pending Q5 | n/a | none |
-| `scripts/private-state-bootstrap.ts`, `docs/private-state-bootstrap.md` | none. This is the Alchemy/Cloudflare control-state store, not Postgres | none | none |
+| `scripts/private-state-bootstrap.ts` | none. This is the Alchemy/Cloudflare control-state store, not Postgres | none | none |
 
 ## 8. Open questions for infra
 

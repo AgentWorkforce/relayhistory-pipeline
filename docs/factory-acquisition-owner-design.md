@@ -269,7 +269,12 @@ NOWAIT`, then `pg_try_advisory_xact_lock_shared(hashtextextended(concat_ws(chr(3
 (M:20261104030000:96). `LP`: the same try-lock over
 `'96bulls:acquisition-physical',org,ws,physical_source,physical_session`, after `LA`. Hooks read owner rows under
 `LA` and never lock them; install, revoke, rebind and drain take only `LA`, then `LP` exclusive, then the owner row
-`FOR UPDATE`. `LA`/`LP` are never waited on (`40001 session_busy`), so no cycle exists. Reset and selection (`L0`,
+`FOR UPDATE`. Install, revoke and rebind first take two global try-locks with no scope in the key: `LO` over
+`'96bulls:acquisition-operation',operationUuid`, then (install: its own grant id; revoke: `targetGrantId`) `LT` over
+`'96bulls:acquisition-target',grantId`, so the same operation uuid or grant id in another scope cannot race past the
+per-scope locks; they require READ COMMITTED (else `22023 invalid_request`) so the replay and target re-reads after
+the locks see a twin that committed first. `LO`/`LT`/`LA`/`LP` are never waited on (`40001 session_busy`), so no cycle
+exists. Reset and selection (`L0`,
 `L1`) and buffered GC (`L1` per candidate, M:20261104055000:1557) take no `LA`, so privacy and cleanup are never
 blocked. The pointer guard keeps its pointer → user `NOWAIT` order (M:20261104060000:417-424), taking `LP` shared
 itself (a legacy caller holds no `LA`).

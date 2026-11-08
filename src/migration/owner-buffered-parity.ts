@@ -11,6 +11,8 @@ import type { Queryable } from "./relayhistory-export.ts";
 
 const HEX64 = /^[0-9a-f]{64}$/u;
 const DECIMAL = /^(0|[1-9][0-9]*)$/u;
+const IDENTIFIER_CONTROL = /[\u0000-\u001f\u007f]/u;
+const MAX_IDENTIFIER_BYTES = 512;
 
 const DELETION_SET_DIGEST = `encode(sha256(convert_to(jsonb_build_array(
   'owner-buffered-deletion-set-v1',$1::text,$2::text,$3::text,
@@ -68,6 +70,14 @@ export interface ParityTenant {
   orgId: string;
   workspaceId: string;
   userId: string;
+}
+
+/** Match sessions.ingest_identifier: workspace may be empty; every other tenant key may not. */
+export function validParityTenant(tenant: ParityTenant): boolean {
+  const valid = (value: unknown, emptyOk: boolean): value is string =>
+    typeof value === "string" && (emptyOk || value.length > 0) &&
+    new TextEncoder().encode(value).byteLength <= MAX_IDENTIFIER_BYTES && !IDENTIFIER_CONTROL.test(value);
+  return valid(tenant.orgId, false) && valid(tenant.workspaceId, true) && valid(tenant.userId, false);
 }
 
 export interface ControlHead {
@@ -371,7 +381,7 @@ export async function readParityCensus(
   target: Queryable,
   tenant: ParityTenant,
 ): Promise<ParityCensusReceipt> {
-  if (!validTenant(tenant)) throw new ParityCensusRefusal("tenant_invalid");
+  if (!validParityTenant(tenant)) throw new ParityCensusRefusal("tenant_invalid");
   const params = [tenant.orgId, tenant.workspaceId, tenant.userId];
   const sourceA = await readOnly<NeonCensusRow>(neon, NEON_OWNER_BUFFERED_CENSUS_SQL, params, "neon");
   const destination = await readOnly<TargetCensusRow>(target, TARGET_OWNER_BUFFERED_CENSUS_SQL, targetParams(tenant, sourceA), "target");
@@ -390,7 +400,7 @@ export async function writeCurrentParityProof(
   tenant: ParityTenant,
   expectedTargetGeneration?: string,
 ): Promise<{ census: ParityCensusReceipt; outcome: ProofWritePlan; writtenAt: unknown | null }> {
-  if (!validTenant(tenant)) throw new ParityCensusRefusal("tenant_invalid");
+  if (!validParityTenant(tenant)) throw new ParityCensusRefusal("tenant_invalid");
   const params = [tenant.orgId, tenant.workspaceId, tenant.userId];
   await targetOwner.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
   try {
@@ -417,18 +427,13 @@ export async function writeCurrentParityProof(
   }
 }
 
-function validTenant(tenant: ParityTenant): boolean {
-  return [tenant.orgId, tenant.workspaceId, tenant.userId]
-    .every((value) => typeof value === "string" && value.length >= 1 && value.length <= 128);
-}
-
 function validReceipt(receipt: ControlReceipt): boolean {
   return HEX64.test(receipt.epoch) && DECIMAL.test(receipt.version) && receipt.version !== "0" &&
     HEX64.test(receipt.digest) && (receipt.kind === "selection" || receipt.kind === "reset");
 }
 
 function validInput(input: ParityCensusInput): boolean {
-  return validTenant(input.tenant) && HEX64.test(input.controlEpoch) &&
+  return validParityTenant(input.tenant) && HEX64.test(input.controlEpoch) &&
     HEX64.test(input.privacyBaselineSha256) && HEX64.test(input.targetControlEpoch) &&
     HEX64.test(input.targetPrivacyBaselineSha256) && HEX64.test(input.targetGeneration) &&
     HEX64.test(input.sourceDeletionSetSha256) && HEX64.test(input.sourceResetSetSha256) &&
