@@ -25,6 +25,7 @@ DECLARE
   v_problems text[] := ARRAY[]::text[];
   v_row record;
   v_qual text;
+  v_directory_qual constant text := '((org_id = current_setting(''bulls96_read.org_id''::text, true)) AND (workspace_id = current_setting(''bulls96_read.workspace_id''::text, true)))';
   v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
 BEGIN
   SELECT * INTO v_role FROM pg_roles WHERE rolname = 'bulls96_read_api';
@@ -136,14 +137,33 @@ BEGIN
      OR v_qual NOT LIKE '%current_setting(''bulls96_read.workspace_id''::text, true)%' THEN
     v_problems := array_append(v_problems, ('policy session_index_read_api is not bound to the tenant settings')::text);
   END IF;
+  -- Column grants expose directory metadata directly, so the policy must
+  -- actually enforce both tenant settings. Merely mentioning their names
+  -- also accepts an OR/true bypass. Older roles without these optional grants
+  -- still pass, but any granted directory access requires enabled RLS and
+  -- the exact predicate installed by session_read_api_role.sql.
+  IF EXISTS (SELECT 1 FROM pg_attribute a
+              WHERE a.attrelid = 'sessions.session_directory'::regclass
+                AND a.attnum > 0 AND NOT a.attisdropped
+                AND has_column_privilege(v_role.oid, a.attrelid, a.attnum, 'SELECT')) THEN
+    IF NOT (SELECT relrowsecurity FROM pg_class WHERE oid = 'sessions.session_directory'::regclass) THEN
+      v_problems := array_append(v_problems, ('RLS is off on sessions.session_directory')::text);
+    END IF;
+    SELECT pg_get_expr(p.polqual, p.polrelid) INTO v_qual
+      FROM pg_policy p
+     WHERE p.polrelid = 'sessions.session_directory'::regclass AND p.polname = 'session_directory_read_api'
+       AND p.polpermissive AND p.polcmd = 'r' AND p.polroles = ARRAY[v_role.oid];
+    IF v_qual IS DISTINCT FROM v_directory_qual THEN
+      v_problems := array_append(v_problems, ('policy session_directory_read_api is missing or differs from the tenant predicate')::text);
+    END IF;
+  END IF;
   FOR v_row IN
     SELECT p.polrelid::regclass::text AS rel, p.polname FROM pg_policy p
      WHERE v_role.oid = ANY(p.polroles)
        AND NOT (p.polname = 'session_index_read_api' AND p.polrelid = 'sessions.session_index'::regclass)
        AND NOT (p.polname = 'session_directory_read_api' AND p.polrelid = 'sessions.session_directory'::regclass
                 AND p.polpermissive AND p.polcmd = 'r' AND p.polroles = ARRAY[v_role.oid]
-                AND pg_get_expr(p.polqual, p.polrelid) LIKE '%current_setting(''bulls96_read.org_id''::text, true)%'
-                AND pg_get_expr(p.polqual, p.polrelid) LIKE '%current_setting(''bulls96_read.workspace_id''::text, true)%')
+                AND pg_get_expr(p.polqual, p.polrelid) = v_directory_qual)
   LOOP
     v_problems := array_append(v_problems, (format('unapproved policy %s on %s', v_row.polname, v_row.rel))::text);
   END LOOP;

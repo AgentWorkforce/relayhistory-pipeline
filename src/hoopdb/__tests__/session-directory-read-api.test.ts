@@ -266,6 +266,20 @@ describe("list_session_directory_for / session_directory_activity_for", () => {
       "DROP POLICY session_directory_read_api ON sessions.session_directory; CREATE POLICY session_directory_read_api ON sessions.session_directory FOR SELECT TO bulls96_read_api USING (true)",
       "DROP POLICY session_directory_read_api ON sessions.session_directory; CREATE POLICY session_directory_read_api ON sessions.session_directory FOR SELECT TO bulls96_read_api USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))",
     );
+    for (const predicate of [
+      "true OR (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))",
+      "org_id = current_setting('bulls96_read.org_id', true) OR workspace_id = current_setting('bulls96_read.workspace_id', true)",
+    ]) {
+      await verifyFails(
+        `DROP POLICY session_directory_read_api ON sessions.session_directory; CREATE POLICY session_directory_read_api ON sessions.session_directory FOR SELECT TO bulls96_read_api USING (${predicate})`,
+        "DROP POLICY session_directory_read_api ON sessions.session_directory; CREATE POLICY session_directory_read_api ON sessions.session_directory FOR SELECT TO bulls96_read_api USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))",
+      );
+    }
+    await verifyFails("ALTER TABLE sessions.session_directory DISABLE ROW LEVEL SECURITY", "ALTER TABLE sessions.session_directory ENABLE ROW LEVEL SECURITY");
+    await verifyFails(
+      "DROP POLICY session_directory_read_api ON sessions.session_directory",
+      "CREATE POLICY session_directory_read_api ON sessions.session_directory FOR SELECT TO bulls96_read_api USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))",
+    );
   }, 120_000);
 
   test("ACLs are exactly the manifest's, and the read role verifier passes with them", async () => {
