@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import pg from "pg";
 import { createSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
 import type { SearchEventDocument } from "@rhc/search-index/contracts.ts";
+import { TENANT_SETTINGS_SQL } from "@rhc/search-index/postgres.ts";
 import { lambdaEnv, runtimeFromSecret } from "../lambda.ts";
 import { indexSearchScope } from "../search-index.ts";
 
@@ -109,6 +110,10 @@ for (const capacity of [1, 2]) {
       for (const query of pool.queries.filter(query => query.text.startsWith('DELETE FROM "search_index".'))) {
         const metadata = pool.queries.find(other => other.client === query.client && other.text.includes("SELECT p.manifest_key"))!;
         expect(query.params![0]).toBe(metadata.params![0]); expect(query.params![1]).toBe(metadata.params![1]);
+        // Forced RLS: the statement right before it on the same connection binds
+        // this pass's tenant, so concurrent passes never share or inherit one.
+        const own = pool.queries.filter(other => other.client === query.client);
+        expect(own[own.indexOf(query) - 1]).toEqual({ client: query.client, text: TENANT_SETTINGS_SQL, params: [metadata.params![0], metadata.params![1]] });
       }
       expect(pool.queries.filter(query => query.text === "COMMIT")).toHaveLength(capacity);
       expect(pool.queries.filter(query => query.text === "ROLLBACK")).toHaveLength(0);

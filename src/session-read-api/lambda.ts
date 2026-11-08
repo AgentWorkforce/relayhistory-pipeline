@@ -35,7 +35,7 @@ import { readApiVerifier, relaycontrolLogin, type AuthConfig } from "./auth.ts";
 import { parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
-import { poolTenantRunner, sqlLiveness } from "./liveness.ts";
+import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
 
 export interface ReadApiSecret {
   clickhouse?: { url: string; user: string; password: string; database: string };
@@ -142,6 +142,35 @@ function readerPoolTarget(url: string, entry: ReadAppEntry): pg.PoolConfig {
   return { connectionString: target.toString() };
 }
 
+/** Closed refusal codes for a read login that row-level security would not bind. */
+export type ReaderRoleRefusal = "reader_role_unknown" | "reader_role_superuser" | "reader_role_bypassrls";
+
+/** Names the role and the failed property only; never the URL or a credential. */
+export class ReaderRoleError extends Error {
+  constructor(readonly code: ReaderRoleRefusal, role?: string) {
+    super(`session read api: ${code}${role ? ` (role ${JSON.stringify(role.slice(0, 63))})` : ""}`);
+    this.name = "ReaderRoleError";
+  }
+}
+
+/**
+ * Self-host reader admission. Tenant isolation on search_index.projection_state
+ * and transcript_events is forced row-level security (bulls96_read.* settings,
+ * `tenant_only`), which a superuser or BYPASSRLS login skips without any error:
+ * every tenant's rows would become visible. Refuse such a login at startup
+ * rather than serve with isolation resting on WHERE clauses alone. Any failure
+ * to read the role (no row, a query error) also refuses.
+ */
+export async function assertReaderRole(sql: SqlQuery): Promise<void> {
+  const { rows } = await sql.query<{ role: unknown; rolsuper: unknown; rolbypassrls: unknown }>(
+    "SELECT current_user AS role, r.rolsuper, r.rolbypassrls FROM pg_roles r WHERE r.rolname = current_user",
+  );
+  const me = rows[0];
+  if (rows.length !== 1 || !me || typeof me.role !== "string") throw new ReaderRoleError("reader_role_unknown");
+  if (me.rolsuper !== false) throw new ReaderRoleError("reader_role_superuser", me.role);
+  if (me.rolbypassrls !== false) throw new ReaderRoleError("reader_role_bypassrls", me.role);
+}
+
 async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition): Promise<App> {
   const region = env.AWS_REGION;
   const secretArn = env.SESSION_READ_API_SECRET_ARN;
@@ -191,6 +220,11 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   try {
+  // Directory, liveness and Postgres search isolation is forced RLS. Checked on
+  // the service always and on any portable (Postgres) search binding; the hosted
+  // ClickHouse Lambda's read role is verified by its own bootstrap
+  // (supabase/bootstrap/session_read_api_role_verify.sql).
+  if (entry === "service" || backend !== "clickhouse") await assertReaderRole(pool);
   const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", poolTenantRunner(pool as never));
   if (adapter && await adapter.state.fromMs(new Date()) > completeSinceMs) throw new Error("read history floor is below search coverage");
   const authConfig = readApiAuthConfig(env);

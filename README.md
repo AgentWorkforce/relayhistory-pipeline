@@ -134,7 +134,7 @@ bare-origin matches, and the RelayAuth URL is never used as an audience.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | unset: no export | not validated (no credential) | your collector, e.g. `http://otel-collector.observability.svc:4318` |
 | `LOCKER_ENDPOINT` | all | S3 for `LOCKER_REGION` | GCS mode: own stricter check (`src/shared/locker-selection.ts`) | MinIO Service or object store |
 | `RELAYHISTORY_SELFHOST_READ_API` | session-read-api | unset (dormant: `/healthz` only, every other route 503) | `true`/`false` only | `true` once `RELAYHISTORY_READ_API_SECRET` and the read API env above are set |
-| `RELAYHISTORY_READ_API_SECRET` | session-read-api | required when enabled | the Lambda secret's JSON shape (`parseReadApiSecret`) | from the secret store (1Password), never on disk |
+| `RELAYHISTORY_READ_API_SECRET` | session-read-api | required when enabled | the Lambda secret's JSON shape (`parseReadApiSecret`); the `supabase_url` login must be `NOSUPERUSER NOBYPASSRLS` (checked at startup; tenant isolation is forced RLS) | from the secret store (1Password), never on disk |
 | `RELAYHISTORY_READ_API_PORT` | session-read-api | `8080` (parsed even when dormant) | TCP port 1-65535 | `8080` |
 | `SEARCH_INDEX_BACKEND` | session-read-api (enabled) | `postgres` (no ClickHouse, no Lambda env) | `postgres` or `clickhouse` (registry names; anything else, or a name with no implementation in this build, fails startup naming only the variable) | `postgres`; `clickhouse` keeps the hosted binding and needs the secret's `clickhouse` block |
 | `SEARCH_INDEX_POSTGRES_BACKEND_ID` | session-read-api (enabled, postgres) | required | `[a-zA-Z0-9._-]{1,128}` | the projection-state backend id your search writer records under; coverage is from `READ_API_COMPLETE_SINCE` |

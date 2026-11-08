@@ -35,6 +35,8 @@ import { PGlite } from "@electric-sql/pglite";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { createSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
 import { composeSearchService } from "../../shared/search-composition.ts";
+import { createPostgresSearchIndex, TENANT_SETTINGS_SQL, type TenantSqlRunner } from "@rhc/search-index/postgres.ts";
+import { writerTransactionSql } from "../transaction-sql.ts";
 import { createReadApi, AuthError } from "../../session-read-api/app.ts";
 import type { SearchProjectionState } from "../search-adapter.ts";
 
@@ -277,6 +279,99 @@ test("registered Postgres projection serves the actual read API, fences stale wr
     expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, reasons: ["erased"] });
     expect((await query()).hits).toHaveLength(0);
     expect((await index.query({ tenant: { ...tenant, workspaceId: "other" }, order: "asc", limit: 100 })).hits).toHaveLength(1);
+  } finally { await db.close(); }
+}, 30_000);
+
+test("forced tenant RLS on transcript_events: a non-superuser writer's scope pass still writes and erases; readers see only their tenant; a tampered policy refuses bootstrap", async () => {
+  const db = new PGlite({ extensions: { pg_trgm } });
+  // Synthetic isolated roles only: PGlite's default login is a superuser,
+  // which RLS never binds, so every bound statement below runs as one of these.
+  await db.exec(`CREATE EXTENSION pg_trgm; CREATE ROLE search_owner; CREATE ROLE search_reader;
+    DO $$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO search_owner', current_database()); END $$`);
+  const asOwner = async <T>(work: () => Promise<T>) => { await db.exec("SET ROLE search_owner"); try { return await work(); } finally { await db.exec("RESET ROLE"); } };
+  const bootstrap = createPostgresSearchIndex({ client: db });
+  await asOwner(async () => {
+    await bootstrap.ensureSchema(); // the owner bootstrap: FORCE binds this owner too
+    await bootstrap.ensureSchema(); // idempotent
+    await db.exec("GRANT USAGE ON SCHEMA search_index TO search_reader; GRANT SELECT ON search_index.transcript_events TO search_reader");
+  });
+  let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "hello one"), event("r2", "1", Date.parse(AT) + 1, "hello two")])];
+  const sb = fakeSupabase(() => keys);
+  const state: SearchProjectionState = {
+    async fromMs() { return 0; },
+    async record() {},
+    async partials() { return { sessions: [], overflow: false }; },
+  };
+  // The writer runtime's binding (lambda.ts): index SQL joins the pass's one
+  // transaction, here as the non-superuser owner. Metadata SQL stays on the fake.
+  const writer = writerTransactionSql(db);
+  const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: writer.sql }, "writer");
+  const pass = <T>(work: () => Promise<T>) => db.transaction(async tx => { await tx.exec("SET LOCAL ROLE search_owner"); return writer.run(tx, work); });
+  const deps: SearchIndexDeps = { transact: work => pass(() => sb.transact(work)), reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW };
+  // The read service's runner (liveness.ts poolTenantRunner) as the read role.
+  const tenantRunner: TenantSqlRunner = (orgId, workspaceId, work) => db.transaction(async tx => {
+    await tx.exec("SET LOCAL ROLE search_reader");
+    await tx.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]);
+    return work(tx);
+  });
+  const readerIndex = createPostgresSearchIndex({ client: db, tenantRunner });
+  const tenant = { orgId: scope.orgId, workspaceId: scope.workspaceId };
+  const other = { orgId: "org_2", workspaceId: scope.workspaceId };
+  const hits = async (t: typeof tenant) => (await readerIndex.query({ tenant: t, order: "asc", limit: 100 })).hits.map(h => [h.orgId, h.eventId]);
+  const unfiltered = (role: string, settings?: typeof tenant) => db.transaction(async tx => {
+    await tx.exec(`SET LOCAL ROLE ${role}`);
+    if (settings) await tx.query(TENANT_SETTINGS_SQL, [settings.orgId, settings.workspaceId]);
+    return (await tx.query<{ org_id: string }>("SELECT org_id FROM search_index.transcript_events ORDER BY org_id")).rows.map(r => r.org_id);
+  });
+  try {
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 2 });
+    const [first] = (await readerIndex.query({ tenant, order: "asc", limit: 1 })).hits;
+    // One writer transaction, two tenants: each statement binds its own tenant.
+    expect(await pass(() => adapter.index.upsert([
+      { ...first!, ...other, eventId: "b1", fingerprint: "b1", version: 1, taskRefId: "", deliveryRecordId: "" },
+      { ...first!, eventId: "a3", fingerprint: "a3", version: 1, taskRefId: "", deliveryRecordId: "" },
+    ]))).toEqual({ written: 2 });
+    expect((await hits(tenant)).map(([org]) => org)).toEqual([scope.orgId, scope.orgId, scope.orgId]);
+    expect(await hits(other)).toEqual([["org_2", "b1"]]);
+    // Without any WHERE clause the policy alone isolates: the reader sees only the
+    // bound tenant, nothing with no settings, and FORCE binds the owner as well.
+    expect(await unfiltered("search_reader", other)).toEqual(["org_2"]);
+    expect(await unfiltered("search_reader")).toEqual([]);
+    expect(await unfiltered("search_owner")).toEqual([]);
+    expect(await unfiltered("search_reader", { ...tenant, workspaceId: "ws_other" })).toEqual([]);
+    // A writer with no open transaction cannot carry the settings to its
+    // statement: the write is refused and the read is empty (fails closed).
+    await expect(asOwner(() => bootstrap.upsert([{ ...first!, eventId: "loose", fingerprint: "loose", version: 1, taskRefId: "", deliveryRecordId: "" }]))).rejects.toMatchObject({ code: "unavailable", detail: "sqlstate_42" });
+    expect(await asOwner(() => bootstrap.query({ tenant, order: "asc", limit: 10 }))).toEqual({ hits: [] });
+    // Settings bound to one tenant never admit a write that moves a row to another.
+    await expect(db.transaction(async tx => {
+      await tx.exec("SET LOCAL ROLE search_owner");
+      await tx.query(TENANT_SETTINGS_SQL, [tenant.orgId, tenant.workspaceId]);
+      await tx.query("UPDATE search_index.transcript_events SET org_id = 'org_2'");
+    })).rejects.toMatchObject({ code: "42501" });
+    // Erasure through the pass removes only this tenant's scope.
+    keys = [];
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect(await hits(tenant)).toEqual([]);
+    expect(await hits(other)).toEqual([["org_2", "b1"]]);
+    // Drift is refused at bootstrap: an added permissive policy, a rewritten
+    // tenant_only, a narrowed command. Lifting FORCE is re-forced, then verified.
+    for (const [tamper, undo] of [
+      ["CREATE POLICY extra ON search_index.transcript_events USING (true)", "DROP POLICY extra ON search_index.transcript_events"],
+      ["ALTER POLICY tenant_only ON search_index.transcript_events USING (true)", "DROP POLICY tenant_only ON search_index.transcript_events"],
+      ["DROP POLICY tenant_only ON search_index.transcript_events; CREATE POLICY tenant_only ON search_index.transcript_events FOR SELECT USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))", "DROP POLICY tenant_only ON search_index.transcript_events"],
+    ] as const) {
+      await db.exec(tamper);
+      await expect(asOwner(() => bootstrap.ensureSchema())).rejects.toMatchObject({ code: "schema_missing", detail: "tenant_policy_mismatch" });
+      await db.exec(undo);
+      await asOwner(() => bootstrap.ensureSchema());
+    }
+    await db.exec("ALTER TABLE search_index.transcript_events NO FORCE ROW LEVEL SECURITY");
+    await asOwner(() => bootstrap.ensureSchema());
+    expect((await db.query("SELECT relforcerowsecurity AS forced FROM pg_class WHERE oid = 'search_index.transcript_events'::regclass")).rows).toEqual([{ forced: true }]);
+    expect(await hits(other)).toEqual([["org_2", "b1"]]);
+    // The reason the read service refuses a superuser login: RLS never binds it.
+    expect(await unfiltered("postgres")).toEqual(["org_2"]);
   } finally { await db.close(); }
 }, 30_000);
 

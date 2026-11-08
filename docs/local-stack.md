@@ -30,8 +30,10 @@ binding; anything else fails startup), and it also requires
 `SEARCH_INDEX_POSTGRES_BACKEND_ID` (with `postgres`) and an explicit
 `SESSION_POSTGRES_TLS_PROFILE` (env table below). With `postgres`, search answers
 503 `backend_unavailable` until the search schema owner bootstrap and the read
-role's grants have run; see "Postgres search prerequisites" under "Self-host
-SERVICE" in `docs/session-read-api-design.md`.
+role's grants have run. The read login must be `NOSUPERUSER NOBYPASSRLS` (both
+search tables have forced tenant row-level security); the service checks this
+at startup and refuses otherwise. See "Postgres search prerequisites" under
+"Self-host SERVICE" in `docs/session-read-api-design.md`.
 
 Every worker blocks at start until HoopDb answers and the migration ledger is
 complete, so apply order does not matter (the same rule the Kubernetes chart

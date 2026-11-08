@@ -9,7 +9,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import pg from "pg";
 import { createReadApi } from "../app.ts";
-import { readApiDepsFromSecret } from "../lambda.ts";
+import { TENANT_SETTINGS_SQL } from "../liveness.ts";
+import { assertReaderRole, readApiDepsFromSecret } from "../lambda.ts";
 import { selfhostSearchComposition, startReadApiService, type ReadApiService } from "../server.ts";
 
 const LOOPBACK = { host: "127.0.0.1", port: 0 };
@@ -26,14 +27,22 @@ type Recorded = { text: string; params?: unknown[] };
 let configs: pg.PoolConfig[] = [];
 let sql: Recorded[] = [];
 const RealPool = pg.Pool;
+const ROLE_SQL = "FROM pg_roles r WHERE r.rolname = current_user";
+type RoleRow = { role: string; rolsuper: boolean; rolbypassrls: boolean };
+const READER: RoleRow = { role: "search_reader", rolsuper: false, rolbypassrls: false };
+let roleRows: RoleRow[] = [READER];
+let roleChecks = 0;
 
-/** Records the pool config and every statement; answers every query with no rows. */
+/** The startup role check reads `roleRows`; every other query answers no rows. */
+const answer = async (text: string) => ({ rows: text.includes(ROLE_SQL) ? roleRows : [] });
+
+/** Records the pool config and every statement other than the startup role check. */
 class RecordingPool {
   constructor(config: pg.PoolConfig) { configs.push(config); }
   on() { return this; }
-  async query(text: string, params?: unknown[]) { sql.push({ text, params }); return { rows: [] }; }
+  async query(text: string, params?: unknown[]) { if (text.includes(ROLE_SQL)) roleChecks++; else sql.push({ text, params }); return answer(text); }
   async connect() {
-    return { query: async (text: string, params?: unknown[]) => { sql.push({ text, params }); return { rows: [] }; }, release() {} };
+    return { query: async (text: string, params?: unknown[]) => { sql.push({ text, params }); return answer(text); }, release() {} };
   }
   async end() {}
 }
@@ -42,6 +51,8 @@ const running: ReadApiService[] = [];
 beforeEach(() => {
   configs = [];
   sql = [];
+  roleRows = [READER];
+  roleChecks = 0;
   pg.Pool = RecordingPool as unknown as typeof pg.Pool;
 });
 afterEach(async () => {
@@ -104,10 +115,12 @@ describe("SEARCH_INDEX_BACKEND=postgres (the service default)", () => {
     // Completeness from the Postgres projection state under the configured backend id, in the caller's tenant only.
     const partials = sql.find(s => s.text.includes('"search_index".projection_state'));
     expect(partials?.params?.slice(0, 3)).toEqual(["org-a", "ws-a", "selfhost-pg"]);
-    // The query went to the Postgres search index, bound to the same tenant.
-    const search = sql.filter(s => s.text.includes('FROM "search_index"."transcript_events"'));
-    expect(search).toHaveLength(1);
-    expect(search[0]!.params?.slice(0, 3)).toEqual(["org-a", "ws-a", "%hello%"]);
+    // The query went to the Postgres search index, bound to the same tenant,
+    // inside a tenant transaction whose settings name that tenant (forced RLS).
+    const at = sql.findIndex(s => s.text.includes('FROM "search_index"."transcript_events"'));
+    expect(sql.filter(s => s.text.includes('FROM "search_index"."transcript_events"'))).toHaveLength(1);
+    expect(sql[at]!.params?.slice(0, 3)).toEqual(["org-a", "ws-a", "%hello%"]);
+    expect(sql.slice(at - 2, at).map(s => [s.text, s.params])).toEqual([["BEGIN READ ONLY", undefined], [TENANT_SETTINGS_SQL, ["org-a", "ws-a"]]]);
     // A caller's ?workspace= can never widen the tenant: a different workspace is refused before any SQL.
     sql = [];
     const other = await app.request("/v1/events?workspace=ws-b&q=hello&limit=10", { headers: { authorization: "Bearer synthetic" } });
@@ -124,7 +137,7 @@ describe("a fresh self-host before the search owner bootstrap and reader grants"
       const fail = async (text: string, params?: unknown[]) => {
         sql.push({ text, params });
         if (text.includes("search_index")) throw Object.assign(new Error(`relation "search_index".x: ${code}`), { code });
-        return { rows: [] };
+        return answer(text);
       };
       pg.Pool = class extends RecordingPool {
         override query = fail;
@@ -140,6 +153,50 @@ describe("a fresh self-host before the search owner bootstrap and reader grants"
       expect(text).not.toContain(code);
       await built.close();
     }
+  });
+});
+
+describe("reader admission: the read login must be bound by row-level security", () => {
+  test("a superuser or BYPASSRLS login refuses startup naming the role and the property, never the URL", async () => {
+    for (const [row, code] of [
+      [{ ...READER, rolsuper: true }, "reader_role_superuser"],
+      [{ ...READER, rolbypassrls: true }, "reader_role_bypassrls"],
+      [{ ...READER, rolsuper: true, rolbypassrls: true }, "reader_role_superuser"],
+    ] as const) {
+      roleRows = [row];
+      const error = await startReadApiService(ENV, LOOPBACK).then(() => null, (e: Error) => e);
+      expect(error).toMatchObject({ name: "ReaderRoleError", code });
+      expect(error!.message).toBe(`session read api: ${code} (role "search_reader")`);
+      for (const secret of ["pw", "db.selfhost.internal", "postgresql:"]) expect(error!.message).not.toContain(secret);
+    }
+    expect(sql).toEqual([]); // refused before any search, state or directory SQL
+  });
+
+  test("an unreadable role (no row, unexpected shape, query failure) refuses rather than admits", async () => {
+    for (const rows of [[], [{ role: "search_reader" }], [{ ...READER, rolbypassrls: null }], [READER, READER]] as unknown as RoleRow[][]) {
+      roleRows = rows;
+      const error = await startReadApiService(ENV, LOOPBACK).then(() => null, (e: Error) => e);
+      expect(error?.name).toBe("ReaderRoleError");
+    }
+    const boom = Object.assign(new Error("permission denied for table pg_authid"), { code: "42501" });
+    await expect(assertReaderRole({ query: async () => { throw boom; } })).rejects.toBe(boom);
+  });
+
+  test("a NOSUPERUSER NOBYPASSRLS login is admitted; the hosted ClickHouse Lambda does not run the check, a Postgres-bound one does", async () => {
+    const get = await start(ENV);
+    expect(await (await get("/healthz")).json()).toEqual({ ok: true, enabled: true });
+    expect(roleChecks).toBe(1); // once, at startup, on the read pool
+    roleRows = [{ ...READER, rolbypassrls: true }];
+    const built = await readApiDepsFromSecret(JSON.stringify({
+      supabase_url: PG_URL,
+      clickhouse: { url: "https://ch.example.invalid:8443", user: "reader", password: "p", database: "relay_search" },
+    }), { READ_API_COMPLETE_SINCE: "epoch" });
+    expect(roleChecks).toBe(1); // the hosted ClickHouse binding: unchanged
+    await built.close();
+    // A Lambda composed with the portable Postgres binding is checked as well.
+    const lambdaPg = { READ_API_COMPLETE_SINCE: "epoch", SEARCH_INDEX_BACKEND: "postgres", SEARCH_INDEX_POSTGRES_BACKEND_ID: "selfhost-pg" };
+    await expect(readApiDepsFromSecret(ENV.RELAYHISTORY_READ_API_SECRET, lambdaPg, selfhostSearchComposition(lambdaPg))).rejects.toMatchObject({ code: "reader_role_bypassrls" });
+    expect(roleChecks).toBe(2);
   });
 });
 

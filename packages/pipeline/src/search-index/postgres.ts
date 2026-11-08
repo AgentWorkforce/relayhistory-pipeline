@@ -15,6 +15,16 @@
  * here runs DDL except `ensureSchema`, an explicit operator step, and it
  * never creates the extension (the HoopDb bootstrap does).
  *
+ * Tenancy is enforced twice: every statement filters on org_id/workspace_id,
+ * and the table has forced row-level security with the same `tenant_only`
+ * policy as `projection_state` (session-pipeline/postgres-search-state.ts):
+ * rows are visible and writable only where org_id/workspace_id equal the
+ * transaction's `bulls96_read.org_id`/`bulls96_read.workspace_id` settings.
+ * Each tenant-scoped statement runs with those settings bound to its own
+ * tenant (see `tenantRunner`); with none bound, the policy shows no rows and
+ * refuses every write. A superuser or BYPASSRLS role skips the policy, so the
+ * read service refuses such a login at startup (session-read-api/lambda.ts).
+ *
  * The client is anything with `query(text, params) -> { rows }`: a `pg` Pool
  * or PGlite. Ordering uses COLLATE "C" so the cursor order is code-point
  * order, identical to the other adapters.
@@ -39,15 +49,34 @@ import {
   type SearchPage,
   type SearchQuery,
   type SearchScope,
+  type SearchTenant,
 } from "./contracts.js";
 
 export interface SqlClient {
   query<T = Record<string, unknown>>(text: string, params?: unknown[]): Promise<{ rows: T[] }>;
 }
 
+/** Runs `work` in one transaction with the tenant settings bound to exactly
+ * this tenant (structurally session-read-api/liveness.ts TenantRunner). */
+export type TenantSqlRunner = <T>(orgId: string, workspaceId: string, work: (client: SqlClient) => Promise<T>) => Promise<T>;
+
+/** The same settings, transaction-local, that the `tenant_only` policy reads. */
+export const TENANT_SETTINGS_SQL =
+  "SELECT set_config('bulls96_read.org_id', $1, true), set_config('bulls96_read.workspace_id', $2, true)";
+
 export interface PostgresSearchIndexConfig {
   readonly id?: string;
   readonly client: SqlClient;
+  /**
+   * Runs each tenant-scoped statement (query, scan, upsert, delete, erase) in
+   * its own tenant transaction, e.g. the read service's pool runner. Without
+   * one, each such statement is preceded on `client` by TENANT_SETTINGS_SQL
+   * for its tenant. That holds only when `client` is one open transaction (the
+   * writer's scope pass via writerTransactionSql); on a bare pool or outside a
+   * transaction the transaction-local settings lapse before the statement and
+   * the policy shows nothing and refuses writes: it fails closed, never open.
+   */
+  readonly tenantRunner?: TenantSqlRunner;
   /** Schema of the derived index. Default `search_index`. */
   readonly schema?: string;
   readonly table?: string;
@@ -183,9 +212,15 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
   const table = `"${schema}"."${tableName}"`;
   const db = config.client;
 
-  async function run<T>(text: string, params: unknown[], context?: SearchCallContext): Promise<T[]> {
+  /** `tenant` set: the statement runs with that tenant's settings bound
+   * (config.tenantRunner, else TENANT_SETTINGS_SQL first on the same client). */
+  async function run<T>(text: string, params: unknown[], context?: SearchCallContext, tenant?: SearchTenant): Promise<T[]> {
     checkSignal(context);
     try {
+      if (!tenant) return (await db.query<T>(text, params)).rows;
+      if (config.tenantRunner)
+        return (await config.tenantRunner(tenant.orgId, tenant.workspaceId, (client) => client.query<T>(text, params))).rows;
+      await db.query(TENANT_SETTINGS_SQL, [tenant.orgId, tenant.workspaceId]);
       return (await db.query<T>(text, params)).rows;
     } catch (error) {
       const code = (error as { code?: unknown })?.code;
@@ -240,7 +275,38 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
         `CREATE INDEX IF NOT EXISTS "${tableName}_content_trgm" ON ${table} USING gin (content_prefix_folded ${ops})`,
         `CREATE INDEX IF NOT EXISTS "${tableName}_title_trgm" ON ${table} USING gin (task_title_folded ${ops})`,
       ];
+      // Forced RLS binds the owner too; the policy is created once and then
+      // verified exactly, so a tampered or added policy refuses the bootstrap.
+      const tenantExpr = `org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true)`;
+      statements.push(
+        `ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`,
+        `ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`,
+        `DO $policy$ BEGIN
+          IF NOT EXISTS(SELECT 1 FROM pg_policies WHERE schemaname='${schema}' AND tablename='${tableName}' AND policyname='tenant_only') THEN
+            CREATE POLICY tenant_only ON ${table} USING(${tenantExpr}) WITH CHECK(${tenantExpr});
+          END IF;
+        END $policy$`,
+      );
       for (const statement of statements) await run(statement, [], context);
+      const flags = await run<{ enabled: boolean; forced: boolean }>(
+        `SELECT relrowsecurity AS enabled, relforcerowsecurity AS forced FROM pg_class WHERE oid=$1::regclass`,
+        [table],
+        context,
+      );
+      const policies = await run<{ name: string; command: string; roles: string; permissive: boolean; qual: string | null; check: string | null }>(
+        `SELECT polname AS name, polcmd::text AS command, polroles::text AS roles, polpermissive AS permissive,
+                pg_get_expr(polqual, polrelid) AS qual, pg_get_expr(polwithcheck, polrelid) AS check
+           FROM pg_policy WHERE polrelid=$1::regclass`,
+        [table],
+        context,
+      );
+      const normalize = (value: string) => value.replace(/\s+|::text|\(|\)/g, "");
+      const expected = normalize(tenantExpr);
+      const [policy] = policies;
+      if (!flags[0]?.enabled || !flags[0].forced || policies.length !== 1 || policy!.name !== "tenant_only" ||
+          policy!.command !== "*" || policy!.roles !== "{0}" || !policy!.permissive ||
+          normalize(policy!.qual ?? "") !== expected || normalize(policy!.check ?? "") !== expected)
+        throw new SearchIndexError("schema_missing", false, "tenant_policy_mismatch");
     },
 
     async upsert(docs, context) {
@@ -254,33 +320,45 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
         const held = newest.get(key);
         if (!held || held.version <= doc.version) newest.set(key, doc);
       }
-      const records = [...newest.values()].map(toRecord);
+      // The policy admits one tenant per statement: one statement per tenant.
+      const byTenant = new Map<string, { tenant: SearchTenant; records: ReturnType<typeof toRecord>[] }>();
+      for (const doc of newest.values()) {
+        const key = JSON.stringify([doc.orgId, doc.workspaceId]);
+        const group = byTenant.get(key) ?? { tenant: { orgId: doc.orgId, workspaceId: doc.workspaceId }, records: [] };
+        group.records.push(toRecord(doc));
+        byTenant.set(key, group);
+      }
       const assign = [...COLUMNS.slice(8), "content", "content_bytes", "content_prefix_folded", "task_title_folded", "fingerprint", "version"]
         .map((c) => `${c} = excluded.${c}`)
         .join(", ");
-      const rows = await run<{ n: string | number }>(
-        `WITH input AS (
-           SELECT * FROM jsonb_to_recordset($1::jsonb) AS x(
-             org_id text, workspace_id text, ts_ms bigint, session_id text, source text, machine_id text,
-             kind text, event_id text, type text, user_id text, actor_name text, actor_role text,
-             subagent_id text, project_id text, task_title text, task_ref text, task_ref_id text,
-             tags jsonb, files_touched jsonb, tool_name text, tool_status text, delivery_record_id text,
-             content text, content_bytes integer, content_prefix_folded text, task_title_folded text,
-             fingerprint text, version bigint)
-         ), written AS (
-           INSERT INTO ${table} (${COLUMNS.join(", ")}, content, content_bytes, content_prefix_folded, task_title_folded, fingerprint, version, indexed_at)
-           SELECT ${COLUMNS.map((c) => (c === "tags" || c === "files_touched" ? `ARRAY(SELECT jsonb_array_elements_text(${c}))` : c)).join(", ")},
-                  content, content_bytes, content_prefix_folded, task_title_folded, fingerprint, version, now()
-             FROM input
-           ON CONFLICT (org_id, workspace_id, ${KEY}) DO UPDATE SET ${assign}, indexed_at = now()
-             WHERE ${table}.version <= excluded.version
-           RETURNING 1
-         )
-         SELECT count(*) AS n FROM written`,
-        [JSON.stringify(records)],
-        context,
-      );
-      return { written: Number(rows[0]?.n ?? 0) };
+      let written = 0;
+      for (const { tenant, records } of byTenant.values()) {
+        const rows = await run<{ n: string | number }>(
+          `WITH input AS (
+             SELECT * FROM jsonb_to_recordset($1::jsonb) AS x(
+               org_id text, workspace_id text, ts_ms bigint, session_id text, source text, machine_id text,
+               kind text, event_id text, type text, user_id text, actor_name text, actor_role text,
+               subagent_id text, project_id text, task_title text, task_ref text, task_ref_id text,
+               tags jsonb, files_touched jsonb, tool_name text, tool_status text, delivery_record_id text,
+               content text, content_bytes integer, content_prefix_folded text, task_title_folded text,
+               fingerprint text, version bigint)
+           ), written AS (
+             INSERT INTO ${table} (${COLUMNS.join(", ")}, content, content_bytes, content_prefix_folded, task_title_folded, fingerprint, version, indexed_at)
+             SELECT ${COLUMNS.map((c) => (c === "tags" || c === "files_touched" ? `ARRAY(SELECT jsonb_array_elements_text(${c}))` : c)).join(", ")},
+                    content, content_bytes, content_prefix_folded, task_title_folded, fingerprint, version, now()
+               FROM input
+             ON CONFLICT (org_id, workspace_id, ${KEY}) DO UPDATE SET ${assign}, indexed_at = now()
+               WHERE ${table}.version <= excluded.version
+             RETURNING 1
+           )
+           SELECT count(*) AS n FROM written`,
+          [JSON.stringify(records)],
+          context,
+          tenant,
+        );
+        written += Number(rows[0]?.n ?? 0);
+      }
+      return { written };
     },
 
     async deleteEvents(tenant, positions, context) {
@@ -311,6 +389,7 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
           ),
         ],
         context,
+        tenant,
       );
       return { deleted: Number(rows[0]?.n ?? 0) };
     },
@@ -321,6 +400,7 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
         `DELETE FROM ${table} WHERE org_id = $1 AND workspace_id = $2 AND source = $3 AND session_id = ANY($4::text[])`,
         [scope.orgId, scope.workspaceId, scope.source, [...scope.sessionIds]],
         context,
+        scope,
       );
     },
 
@@ -335,6 +415,7 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
           ORDER BY ${KEY} LIMIT $6`,
         [scope.orgId, scope.workspaceId, scope.source, [...scope.sessionIds], options.fromMs, options.limit + 1],
         context,
+        scope,
       );
       const truncated = rows.length > options.limit;
       return {
@@ -389,6 +470,7 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
           WHERE ${where.join(" AND ")} ORDER BY ${order} LIMIT ${limit}`,
         params,
         context,
+        query.tenant,
       );
       const hits = rows.slice(0, query.limit).map(toHit);
       const more = rows.length > query.limit;

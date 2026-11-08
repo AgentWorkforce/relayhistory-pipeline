@@ -93,6 +93,16 @@ The derived index has its own schema (`search_index`, configurable); transcript
 text never goes in the metadata directory, `session_directory` (decision 0002).
 Key columns use `COLLATE "C"` to preserve cursor order. `ensureSchema` requires
 pg_trgm to be installed already and performs DDL only when explicitly called.
+The table has forced row-level security with a `tenant_only` policy (the same
+shape as `projection_state`): rows are visible and writable only where
+`org_id`/`workspace_id` equal the transaction's `bulls96_read.org_id`/
+`bulls96_read.workspace_id` settings. `ensureSchema` creates it and verifies it
+exactly, refusing drift with `schema_missing (tenant_policy_mismatch)`. Every
+tenant-scoped statement binds its own tenant: through the configured
+`tenantRunner` (a reader's tenant transaction), or else by setting the settings
+on the client just before the statement, which only holds inside an open
+transaction (a writer's scope pass). With no tenant bound, reads are empty and
+writes are refused. A superuser or `BYPASSRLS` role skips the policy.
 
 This adapter does not replace RelayHistory's existing transcript search path.
 Selecting which service owns self-host transcript queries, migrating any data,
