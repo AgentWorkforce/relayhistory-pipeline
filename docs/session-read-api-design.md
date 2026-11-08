@@ -186,3 +186,35 @@ The wire is whatever #328 at a06a58f9 emits, and the parser's key set and consta
 - the control head is observed for exactly that (org, workspace, user).
 
 Tested in `src/session-read-api/__tests__/owner-buffered.routes.test.ts`.
+
+**Buffered search gate (`READ_API_BUFFERED_SEARCH_GATE`, default off).** With the flag exactly `on`, every buffered-origin hit in a workspace search passes `src/session-read-api/buffered-search-gate.ts` before it is emitted. The Worker role (`bulls96_read_api`) never reads the gate tables directly; it has no grants on them. The only SQL the gate sends is one call per owner to the SECURITY DEFINER function `sessions.buffered_search_gate_for` (migration `20261105043860_buffered_search_gate.sql`, EXECUTE granted to `bulls96_read_api` only). The function checks six things. First, admission at the observed head. Second, that the claim's live (not retired) records cover the hit's (source, session_id). Third, the same gate-closed and G2 parity rules as 043700, recomputed through `owner_buffered_parity_expected`. Fourth, deletions under any origin. Fifth, 043700's batch predicate and rule 5(c): the claim's `ingest_batches` row must exist, be the owner's with the claim's digest, and be committed, buffered and accepted; the claim and its per-session epochs entry must be at the owner's current reset count; and no reset may be at or after the batch's `committed_at`. Sixth, latest admission: the claim's epochs entry for the session must be unambiguous and still equal the session's `ingest_fence_versions` epoch on the claim's origin, otherwise the hit drops as `superseded`. The function returns one verdict per hit, and a missing verdict or any error drops the hit. The Worker runs each owner's calls (chunks of up to 500 hits) in one read-only transaction; its isolation is set by `READ_API_REPEATABLE_READ` (below). Migration 043860 must be applied before the flag is set to `on`; without it every gated call fails and every buffered hit is dropped, which fails closed but empties the buffered results.
+
+The gate mirrors the admission conditions 043700 applies at read time. The migration header carries the same table with line numbers.
+
+| 043700 condition | Gate verdict |
+| --- | --- |
+| Caller is `bulls96_read_api`; org/workspace equal the transaction pins | 42501 refusal |
+| User is the pinned reader | Different by design: the owner is a parameter and the claim must belong to (pins, owner); see the threat model below |
+| Head, baseline and hit shapes | Malformed input returns no rows |
+| Authority not fenced; head not pending; head epoch is the cutover; policy unexpired with this epoch and baseline | `gate_closed` |
+| G2 parity row present; full tuple, receipts, generation and digests match | `parity_missing` / `parity_stale` |
+| Admission epoch (policy epoch via the claim's identity) and version (head version, 0 without a head); ACK decisions agree | `admission_epoch_mismatch` / `admission_version_mismatch` |
+| Claim records are an array, not retired, and hold (source, session_id) | `admission_session_mismatch` |
+| Batch row: owner, digest, `committed`, `buffered`, `committed_at` set | `batch_not_buffered` (a missing row also drops) |
+| Claim reset epoch and the entry's reset epoch equal the reset count; no reset at or after `committed_at` (rule 5(c)) | `reset` |
+| Epochs entry present and unambiguous, and equal to the current fence version | `superseded` |
+| `upload_deletions` (same or any origin) and frozen deletions (any origin) | `deleted` |
+| Outbox active stage, stage acknowledged and not redacted, stage identity rows, `group_ordinals` shape, GC ancestor chain | Not mirrored. These are per-stage conditions and the hit names a claim, not a stage (residual divergence) |
+| Group and ordinal shape, single-session group, live-ordinal count, lazy ACK native-slot owner | Not mirrored. These are per-group or per-ordinal conditions and the hit carries no ordinal (residual divergence) |
+| Published exclusion (`ingest_publication_heads`) | Inapplicable. It is list dedupe so the canonical copy wins; the detail reader does not apply it |
+
+Threat model. The owner is a parameter, not a pin, because a reader in a shared workspace sees hits owned by other users. Only `bulls96_read_api` may call the function, and only inside the verified (org, workspace) pins. Within that tenant a caller may name any user. For each supplied (claim_token, source, session_id), the caller learns whether the token is a claim of that owner (a row or no row). Only for such a claim does it also get one drop reason, which can reveal:
+
+- the owner's gate and parity state;
+- whether the session is deleted or reset;
+- the batch state;
+- whether the claim was superseded.
+
+The function returns no content, no timestamps and no other claim. The claim token is what bounds this. Tokens are random v4 UUIDs held only in the ledger and in the owner's `transcript_events` rows (never in API responses). A caller without a token gets no row, so it cannot enumerate users, sessions or deletions. The Worker only passes tokens and owners taken from rows the reader's own tenant-scoped search returned. It logs only aggregate drop counts and never returns per-hit reasons to the client.
+
+**Read transaction isolation (`READ_API_REPEATABLE_READ`, default off).** Every Worker read (timing, turns, babysitter evidence, owner-buffered, liveness, directory, brief titles and the buffered search gate) runs in a tenant-bound read-only transaction opened by `requestTenantRunner`. Unset, `0` or any value other than exactly `1` keeps `BEGIN READ ONLY` at READ COMMITTED, the behaviour before this flag. `1` opens `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`. Read-only REPEATABLE READ transactions never fail serialization. The flag exists because Hyperdrive's handling of it is not yet proven. With the flag off, the two chunks of up to 500 hits in one owner's gate call each see their own snapshot. Each chunk is still one statement judged against one consistent state and still fails closed on that state, so no hit passes a check it failed. But a commit between the chunks (a deletion, reset or fence bump, say) can leave hits of the same owner on one page judged against different states: an earlier chunk may admit a hit that a later chunk would have dropped. With the flag on, both chunks share the transaction's one snapshot, so the page is judged against a single state.
