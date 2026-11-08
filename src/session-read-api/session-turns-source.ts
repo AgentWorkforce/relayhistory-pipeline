@@ -7,7 +7,10 @@
  *
  * Exactness, or a TurnsInputError the route turns into a 501 (Cloud reads relayhistory):
  *   - every harness scope read must carry the export's legacy coverage marker
- *     (`turns_unknown`): without it Neon may hold turns S3 has never seen;
+ *     (`turns_unknown`): without it Neon may hold turns S3 has never seen. A
+ *     self-host deployment that never had a Neon source says so with
+ *     READ_API_TURNS_ASSUME_NO_LEGACY=true (service-canonical.ts) and is served
+ *     its canonical turns without the marker;
  *   - an exported string the export had to cut (`turns_truncated`);
  *   - with `source`, a live row whose public attribution needs Neon's event
  *     tables (an untagged turn stored under its owner) (`turns_attribution`).
@@ -110,10 +113,10 @@ function liveAttribution(row: Record<string, unknown>): string | null {
  * The turn rows of a session in one workspace from its harness snapshots, with
  * relayhistory's `source` selection when given. Throws TurnsInputError.
  */
-export function turnRows(identity: Omit<CanonicalIdentity, "source">, snapshots: Array<{ harness: string; snapshot: CanonicalRows }>, source: string | undefined): Record<string, unknown>[] {
+export function turnRows(identity: Omit<CanonicalIdentity, "source">, snapshots: Array<{ harness: string; snapshot: CanonicalRows }>, source: string | undefined, options: { assumeNoLegacy?: boolean } = {}): Record<string, unknown>[] {
   const byId = new Map<string, Record<string, unknown>>();
   for (const { harness, snapshot } of snapshots) {
-    if (!snapshot.legacyCoverage) throw new TurnsInputError("turns_unknown");
+    if (!snapshot.legacyCoverage && !options.assumeNoLegacy) throw new TurnsInputError("turns_unknown");
     for (const { table, row } of snapshot.rows) {
       if (table !== "conversation_turns") continue;
       if (row.session_id !== identity.sessionId || row.workspace_id !== identity.workspaceId || row.org_id !== identity.orgId) throw new TurnsInputError("turn_scope");
