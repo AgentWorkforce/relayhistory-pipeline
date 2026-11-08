@@ -71,6 +71,14 @@ describe("release-owner G2 parity matrix pinned for 043700", () => {
   for (const c of parity.cases) {
     test(c.id, () => expect(parityVisible(c)).toBe(c.emitBuffered));
   }
+  test("v5.3 privacy baseline mismatch is hidden", () => {
+    expect(parityVisible({ id: "v5.3-baseline", emitBuffered: false,
+      patch: { "proof.privacyBaselineSha256": "9".repeat(64) } })).toBe(false);
+  });
+  test("v5.3 head kind mismatch is hidden", () => {
+    expect(parityVisible({ id: "v5.3-kind", emitBuffered: false,
+      patch: { "proof.head.kind": "reset" } })).toBe(false);
+  });
 });
 
 const ID: VerifiedIdentity = { ...SCOPE, scopes: ["rth:read"] };

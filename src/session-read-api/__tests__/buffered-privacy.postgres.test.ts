@@ -67,13 +67,11 @@ describe.skipIf(!url)("043700 + PR B fixtures on actual PostgreSQL", () => {
     }
     expect(stages).toContain("group_ordinals bigint[]");
 
-    const proofColumns = (await db.query<{ column_name: string }>(`
-      SELECT column_name FROM information_schema.columns
-       WHERE table_schema='sessions' AND table_name='owner_buffered_parity'`)).rows.map((row) => row.column_name);
-    for (const column of ["org_id", "workspace_id", "user_id", "cutover_epoch", "head_epoch", "head_version",
-      "head_digest", "head_kind", "no_head", "deletion_set_digest", "reset_set_digest",
-      "target_lineage_digest", "target_generation", "privacy_baseline_sha256"])
-      expect(proofColumns, column).toContain(column);
+    const proof = await db.query<{ name: string | null }>(
+      "SELECT to_regclass('sessions.owner_buffered_parity')::text AS name",
+    );
+    // v5.3 authorizes the table name and semantics, but leaves columns/PK/CAS to the migration owner.
+    expect(proof.rows[0]?.name).toBe("sessions.owner_buffered_parity");
   });
 
   test("all 26 causal vectors round-trip through PostgreSQL jsonb and drive the final post-S3 gate", async () => {

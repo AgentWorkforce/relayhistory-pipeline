@@ -128,9 +128,20 @@ export function patched(base: Record<string, unknown>, patch: Record<string, Jso
   return out;
 }
 
+/** Materialize the v5.3-only baseline and head-kind bindings around the frozen v4 addendum. */
+export function parityState(c: ParityCase): Record<string, any> {
+  const base = structuredClone(parity.base) as Record<string, any>;
+  base.privacyBaselineSha256 = BASELINE;
+  base.proof.privacyBaselineSha256 = BASELINE;
+  if (base.head) base.head.kind = "selection";
+  if (base.proof.head) base.proof.head.kind = "selection";
+  if (base.targetLatestReceipt) base.targetLatestReceipt.kind = "selection";
+  return patched(base, c.patch);
+}
+
 /** The frozen rule-3/rule-4 fixture oracle; production enforcement belongs to 043700 SQL. */
 export function parityVisible(c: ParityCase): boolean {
-  const s = patched(parity.base, c.patch);
+  const s = parityState(c);
   const proof = s.proof as Record<string, any> | null;
   const head = s.head as Record<string, any> | null;
   const proofHead = proof?.head as Record<string, any> | null | undefined;
@@ -140,10 +151,11 @@ export function parityVisible(c: ParityCase): boolean {
   const headMatches = head === null
     ? proof.explicitNoHead === true && proofHead === null && receipt === null && s.admission.version === "0"
     : proof.explicitNoHead === false && proofHead && receipt &&
-      ["epoch", "version", "digest"].every((key) => same(proofHead[key], head[key]) && same(receipt[key], head[key]));
+      ["epoch", "version", "digest", "kind"].every((key) => same(proofHead[key], head[key]) && same(receipt[key], head[key]));
   return Boolean(headMatches &&
     proof.org === s.org && proof.workspace === s.workspace && proof.user === s.user &&
     proof.epoch === s.cutoverEpoch && s.admission.epoch === s.cutoverEpoch &&
+    proof.privacyBaselineSha256 === s.privacyBaselineSha256 &&
     proof.targetGeneration === s.targetGeneration &&
     s.targetReceiptVersionsContiguousFromOne === true &&
     proof.deletionSetSha256 === s.sourceDeletionSetSha256 && proof.deletionSetSha256 === s.targetDeletionSetSha256 &&
