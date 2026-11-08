@@ -1,7 +1,7 @@
 /**
  * Native-Postgres proof for the self-host writer contract.
- * Runs against real Postgres only (PGlite cannot express RLS FORCE, the
- * creator edge, or SET ROLE denial faithfully); skipped without a URL.
+ * Runs against real Postgres only (PGlite cannot express the creator
+ * edge or SET ROLE denial faithfully); skipped without a URL.
  *
  *   SESSION_PIPELINE_TEST_PG_URL          owner URL of a database with every
  *                                         Supabase + HoopDb migration applied
@@ -130,8 +130,16 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
 
   afterAll(async () => {
     await pool.query(`DELETE FROM sessions.session_index WHERE org_id=$1`, [ORG]);
-    await pool.query(`DELETE FROM search_index.transcript_events WHERE org_id=$1`, [ORG]).catch(() => {});
-    await pool.query(`DELETE FROM search_index.projection_state WHERE backend_id=$1`, [BACKEND]).catch(() => {});
+    // Forced RLS filters even the table owner, so the search-table residue
+    // cleanup binds the tenant GUCs first: without them the DELETE silently
+    // removes nothing and the next run inherits rows. ORG/BACKEND are
+    // file constants, safe to inline (multi-statement cleanup takes no
+    // parameters under the simple protocol).
+    await pool.query(
+      `BEGIN; SELECT set_config('bulls96_read.org_id','${ORG}',true),set_config('bulls96_read.workspace_id','w',true);
+       DELETE FROM search_index.transcript_events WHERE org_id='${ORG}';
+       DELETE FROM search_index.projection_state WHERE backend_id='${BACKEND}'; COMMIT`,
+    ).catch(() => {});
     await pool.query(`DELETE FROM sessions.search_consumer_pending WHERE backend_id=$1`, [BACKEND]).catch(() => {});
     await pool.query(`DELETE FROM sessions.search_consumer_progress WHERE backend_id=$1`, [BACKEND]).catch(() => {});
     await pool.end();
@@ -371,8 +379,13 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
   afterAll(async () => {
     await wpool.end();
     await admin.query(`DELETE FROM sessions.session_index WHERE org_id=$1`, [ORG]);
-    await admin.query(`DELETE FROM search_index.transcript_events WHERE org_id=$1`, [ORG]).catch(() => {});
-    await admin.query(`DELETE FROM search_index.projection_state WHERE backend_id=$1`, [BACKEND]).catch(() => {});
+    // Same forced-RLS owner-blindness as the owner block: bind the tenant
+    // GUCs or the search-table DELETEs silently remove nothing.
+    await admin.query(
+      `BEGIN; SELECT set_config('bulls96_read.org_id','${ORG}',true),set_config('bulls96_read.workspace_id','w',true);
+       DELETE FROM search_index.transcript_events WHERE org_id='${ORG}';
+       DELETE FROM search_index.projection_state WHERE backend_id='${BACKEND}'; COMMIT`,
+    ).catch(() => {});
     await admin.query(`DELETE FROM sessions.search_consumer_pending WHERE backend_id=$1`, [BACKEND]).catch(() => {});
     await admin.query(`DELETE FROM sessions.search_consumer_progress WHERE backend_id=$1`, [BACKEND]).catch(() => {});
     await admin.end();

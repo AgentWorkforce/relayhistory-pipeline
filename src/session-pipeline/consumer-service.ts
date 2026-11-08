@@ -180,28 +180,45 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
     bodies.push(body);
   });
   const consumable = io.dedupe ? await io.dedupe(bodies) : bodies;
-  // Identities actually consumed this tick (post-dedupe), with the revision
-  // carried on each body. A requeue callback only hands back the key, so the
-  // map below restores the consumed revision for busy-retry accounting. The
-  // same key can arrive twice in one tick (a due retry first, then the
-  // listing's current revision): last wins, because the listing carries the
-  // newest revision and scoring the stale one would dead-letter the wrong
-  // cycle.
+  const stamp = io.now?.() ?? Date.now();
+  const allRecords: QueueRecord[] = consumable.map((body, i) => ({ messageId: `reconcile-${stamp}-${i}`, body }));
+  // One invocation per key, last wins, before consume: a due retry (stale
+  // revision) followed by the listing's current revision must resolve to the
+  // newer outcome, or a failed stale record defeats the successful current
+  // one and parks/scores the wrong revision. Non-reconcile bodies have no
+  // key and always pass through. Message ids are rebuilt so every
+  // downstream map stays consistent.
+  const seenKeys = new Set<string>();
+  const records: QueueRecord[] = [];
+  for (let i = allRecords.length - 1; i >= 0; i--) {
+    const key = reconcileMeta(allRecords[i]!.body)?.key;
+    if (key !== undefined) {
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+    }
+    records.unshift(allRecords[i]!);
+  }
+  for (let i = 0; i < records.length; i++) records[i]!.messageId = `reconcile-${stamp}-${i}`;
+  // Rebuilt after the id reassignment: the pre-collapse map still points the
+  // reused ids at first-seen bodies, which would score and park the stale
+  // revision. Records carry their own (last-wins) body; the map follows it.
+  const bodyById = new Map(records.map((record) => [record.messageId, record.body]));
+  // Identities actually consumed this tick (post-dedupe, post-collapse),
+  // with the revision carried on each body. A requeue callback only hands
+  // back the key, so the map restores the consumed revision for busy-retry
+  // accounting.
   const consumedKeys: string[] = [];
   const consumedMetas = new Map<string, { etag?: string; version?: string }>();
-  for (const body of consumable) {
-    const meta = reconcileMeta(body);
+  for (const record of records) {
+    const meta = reconcileMeta(bodyById.get(record.messageId)!);
     if (meta === null) continue;
     consumedKeys.push(meta.key);
     consumedMetas.set(meta.key, { etag: meta.etag, version: meta.version });
   }
   const lastBodyForKey = (key: string): string | undefined => {
-    for (let i = consumable.length - 1; i >= 0; i--) if (reconcileMeta(consumable[i])?.key === key) return consumable[i];
+    for (let i = records.length - 1; i >= 0; i--) if (reconcileMeta(bodyById.get(records[i]!.messageId)!)?.key === key) return records[i]!.body;
     return undefined;
   };
-  const stamp = io.now?.() ?? Date.now();
-  const records: QueueRecord[] = consumable.map((body, i) => ({ messageId: `reconcile-${stamp}-${i}`, body }));
-  const bodyById = new Map(records.map((record, i) => [record.messageId, consumable[i]!]));
   let batchError: unknown;
   let failed: Set<string>;
   try {
@@ -895,6 +912,18 @@ export async function assertSearchTenantGate(db: SqlExecutor): Promise<void> {
     }));
     if (shaped.length !== 1 || !isTenantOnlyPolicy(shaped[0]!))
       throw new Error(`pipeline consumer: search tenant gate missing on ${table}; refusing to tick unscoped`);
+    // The policy shape alone does not prove the gate is active: RLS can be
+    // disabled (or left non-forced so the table owner bypasses it) while the
+    // policy row sits in the catalog. Refuse unless row security is enabled
+    // and forced.
+    const { rows: flags } = await db.query<{ rls: boolean; force: boolean }>(
+      `SELECT c.relrowsecurity AS rls, c.relforcerowsecurity AS force
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1 AND c.relname = $2`,
+      [schema, name],
+    );
+    if (flags.length !== 1 || !flags[0]!.rls || !flags[0]!.force)
+      throw new Error(`pipeline consumer: row security not enforced on ${table}; refusing to tick unscoped`);
   }
 }
 
@@ -906,6 +935,18 @@ export async function assertServiceSchema(db: SqlExecutor): Promise<void> {
         `pipeline consumer: ${table} is missing; run SERVICE=session-pipeline-consumer-bootstrap first`,
       );
   }
+}
+
+/**
+ * Does an authenticated identity string name exactly this login role? The
+ * server leaves system_user empty when the auth method provides no identity
+ * (trust/peer here), so an empty value is unavailable, not a refusal.
+ */
+export function systemUserIdentifies(systemUser: unknown, role: string): boolean {
+  if (systemUser === null || systemUser === undefined) return true;
+  const text = String(systemUser);
+  if (text === "") return true;
+  return text === role || text.endsWith(`/${role}`);
 }
 
 /**
@@ -924,17 +965,31 @@ export async function assertServiceSchema(db: SqlExecutor): Promise<void> {
  * #330's assertReaderRole, plus the writer's pinned attributes.
  */
 export async function assertRuntimeIdentity(db: SqlExecutor): Promise<void> {
-  const { rows } = await db.query<{ user: unknown; super: unknown; bypass: unknown; createdb: unknown; createrole: unknown; replication: unknown; inherit: unknown }>(
-    `SELECT current_user AS user, r.rolsuper AS super, r.rolbypassrls AS bypass,
+  // system_user exists only on newer servers (absent through PG15): probe the
+  // catalog so one static query never 42703s on an older server. Absent means
+  // skip, exactly like an empty system_user.
+  const { rows: procRows } = await db.query<{ has: boolean }>(
+    `SELECT count(*) > 0 AS has FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE p.proname = 'system_user' AND n.nspname = 'pg_catalog'`,
+  );
+  const systemCol = procRows[0]?.has === true ? `, system_user AS "systemUser"` : ``;
+  const { rows } = await db.query<{ sessionUser: unknown; user: unknown; systemUser?: unknown; super: unknown; bypass: unknown; createdb: unknown; createrole: unknown; replication: unknown; inherit: unknown }>(
+    `SELECT session_user AS "sessionUser", current_user AS user${systemCol},
+       r.rolsuper AS super, r.rolbypassrls AS bypass,
        r.rolcreatedb AS createdb, r.rolcreaterole AS createrole,
        r.rolreplication AS replication, r.rolinherit AS inherit
      FROM pg_roles r WHERE r.rolname = current_user`,
   );
   const me = rows[0];
-  if (rows.length !== 1 || !me || typeof me.user !== "string") throw new Error("pipeline consumer: cannot determine current_user");
+  if (rows.length !== 1 || !me || typeof me.user !== "string" || typeof me.sessionUser !== "string")
+    throw new Error("pipeline consumer: cannot determine session_user");
   const who = JSON.stringify(me.user.slice(0, 63));
-  if (me.user !== "search_consumer_runtime")
-    throw new Error(`pipeline consumer: refusing to run as ${who}; use the search_consumer_runtime URL`);
+  // Both names must be the writer: SET ROLE changes current_user only, so a
+  // privileged login hiding behind the writer role still refuses here.
+  if (me.sessionUser !== "search_consumer_runtime" || me.user !== "search_consumer_runtime")
+    throw new Error(`pipeline consumer: refusing to run as session_user ${JSON.stringify(me.sessionUser.slice(0, 63))}; use the search_consumer_runtime URL`);
+  if (!systemUserIdentifies(me.systemUser, "search_consumer_runtime"))
+    throw new Error(`pipeline consumer: refusing to run with foreign authenticated identity ${who}`);
   if (me.super !== false) throw new Error(`pipeline consumer: refusing to run as SUPERUSER ${who}`);
   if (me.bypass !== false) throw new Error(`pipeline consumer: refusing to run as BYPASSRLS ${who}`);
   if (me.createdb !== false || me.createrole !== false || me.replication !== false || me.inherit !== false)
@@ -945,6 +1000,18 @@ export async function assertRuntimeIdentity(db: SqlExecutor): Promise<void> {
     `SELECT 1 FROM pg_auth_members WHERE member = (SELECT oid FROM pg_roles WHERE rolname = current_user) LIMIT 1`,
   );
   if (membership.rows.length > 0) throw new Error(`pipeline consumer: refusing to run with inherited memberships ${who}`);
+}
+
+/**
+ * Startup options (PGOPTIONS / ?options=) can smuggle session GUCs such as
+ * role=... past authentication, so the login the identity gate sees is not
+ * the login that was authenticated. node-pg takes options only from the
+ * connection string (it does not read PGOPTIONS), so refusing the parameter
+ * in the configured URL closes the class.
+ */
+export function refuseStartupOptions(url: string): void {
+  if (new URL(url).searchParams.has("options"))
+    throw new Error("pipeline consumer: refusing a database URL with startup options");
 }
 
 export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never> {
@@ -969,6 +1036,9 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     await new Promise(() => {});
     throw new Error("unreachable");
   }
+  // Dormant never opens a database, so a smuggled ?options= there is inert;
+  // the live path below refuses it before any pool is created.
+  refuseStartupOptions(config.secret.hoopdb_url);
   // runWorker opens its own pool from HOOPDB_URL for the live gates: it must
   // be the same identity that writes, never a second role or database.
   if (env.HOOPDB_URL && env.HOOPDB_URL !== config.secret.hoopdb_url)

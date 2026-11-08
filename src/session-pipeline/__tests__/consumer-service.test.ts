@@ -45,6 +45,7 @@ import {
   reconcileMeta,
   reconcileStaleProjections,
   reconcileTombstonedScopes,
+  refuseStartupOptions,
   retryDelayMs,
   runConsumerTick,
   selectResumeCursor,
@@ -52,6 +53,7 @@ import {
   storeHighWaterMark,
   storePending,
   storeReconcileCursor,
+  systemUserIdentifies,
   scoreFailedAttempt,
   scoreRequeuedAttempt,
   writerComposition,
@@ -269,6 +271,22 @@ describe("consumer tick", () => {
     const summary = await runConsumerTick(io, new Date());
     expect(summary).toMatchObject({ requeued: 1, pending: 1, complete: false });
     expect(summary.requeuedKeys).toEqual(["hot"]);
+  });
+  test("a newer successful revision beats an older failed one for the same key", async () => {
+    // Pre-consume collapse keeps only the last invocation per key, so the
+    // failure below names the consumed (newer) revision only: per-key outcome
+    // is the final revision's, and the tick completes.
+    const io = tickIo(async (records) => {
+      const failures = records
+        .filter((r) => r.body.includes('"e1"'))
+        .map((r) => ({ itemIdentifier: r.messageId }));
+      return { batchItemFailures: failures };
+    }, [`{"reconcile":{"key":"k","etag":"e1"}}`, `{"reconcile":{"key":"k","etag":"e2"}}`]);
+    const summary = await runConsumerTick(io, new Date());
+    expect(summary.failedKeys).toEqual([]);
+    expect(summary.consumedKeys).toEqual(["k"]);
+    expect(summary).toMatchObject({ failed: 0, complete: true });
+    expect(io.pending).toEqual([]);
   });
   test("dedupe drops dead bodies before consume", async () => {
     const io = tickIo(ok, [`{"reconcile":{"key":"dead"}}`, `{"reconcile":{"key":"live"}}`]);
@@ -840,30 +858,75 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
     }
   }, 180_000);
 
-  test("startup refuses a BYPASSRLS or membership-drifted writer login", async () => {
+  test("systemUserIdentifies matches only a genuine same-user auth method", () => {
+    expect(systemUserIdentifies(null, "w")).toBe(true);
+    expect(systemUserIdentifies("", "w")).toBe(true);
+    expect(systemUserIdentifies("search_consumer_runtime", "search_consumer_runtime")).toBe(true);
+    expect(systemUserIdentifies("SCRAM-SHA-256/search_consumer_runtime", "search_consumer_runtime")).toBe(true);
+    expect(systemUserIdentifies("other", "search_consumer_runtime")).toBe(false);
+    expect(systemUserIdentifies("SCRAM-SHA-256/other", "search_consumer_runtime")).toBe(false);
+  });
+
+  // PGlite's RESET SESSION AUTHORIZATION is a no-op (probed: the session
+  // identity stays rewritten), so each identity scenario gets its own
+  // database instead of reusing one connection across SET/RESET pairs.
+  test("a genuine writer login passes admission", async () => {
     const { pg } = await installed();
     try {
       await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
-      const db = asDb(pg);
-      await pg.exec(`SET ROLE search_consumer_runtime`);
-      await assertRuntimeIdentity(db); // pinned shape passes
-      await pg.exec(`RESET ROLE`);
-      // An owner later ALTERs BYPASSRLS: startup must refuse the login even
-      // though the name is unchanged and it is not a superuser.
-      await pg.exec(`ALTER ROLE search_consumer_runtime BYPASSRLS`);
-      await pg.exec(`SET ROLE search_consumer_runtime`);
-      await expect(assertRuntimeIdentity(db)).rejects.toThrow("BYPASSRLS");
-      await pg.exec(`RESET ROLE`);
-      await pg.exec(`ALTER ROLE search_consumer_runtime NOBYPASSRLS`);
-      // An inherited membership widens the writer: refuse that too.
-      await pg.exec(`CREATE ROLE widen_nobody LOGIN; GRANT widen_nobody TO search_consumer_runtime`);
-      await pg.exec(`SET ROLE search_consumer_runtime`);
-      await expect(assertRuntimeIdentity(db)).rejects.toThrow("inherited memberships");
-      await pg.exec(`RESET ROLE`);
+      // SET SESSION AUTHORIZATION rewrites the session identity the way a
+      // real login does, including session_user.
+      await pg.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
+      await assertRuntimeIdentity(asDb(pg));
     } finally {
       await pg.close();
     }
   }, 180_000);
+
+  test("startup refuses a smuggled writer identity behind SET ROLE", async () => {
+    const { pg } = await installed();
+    try {
+      await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      // An owner login hiding behind SET ROLE refuses: session_user is the
+      // owner even while current_user names the writer.
+      await pg.exec(`SET ROLE search_consumer_runtime`);
+      await expect(assertRuntimeIdentity(asDb(pg))).rejects.toThrow("session_user");
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("startup refuses a BYPASSRLS or membership-drifted writer login", async () => {
+    const { pg: bypass } = await installed();
+    try {
+      await bypass.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      // A writer with BYPASSRLS is indistinguishable from the runtime login
+      // by name alone, so the gate checks the attribute instead.
+      await bypass.exec(`ALTER ROLE search_consumer_runtime BYPASSRLS`);
+      await bypass.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
+      await expect(assertRuntimeIdentity(asDb(bypass))).rejects.toThrow("BYPASSRLS");
+    } finally {
+      await bypass.close();
+    }
+    const { pg: drifted } = await installed();
+    try {
+      await drifted.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      // A writer that inherited a second role via GRANT keeps the writer name
+      // on a genuine login, so the gate checks pg_auth_members instead.
+      await drifted.exec(`CREATE ROLE widen_nobody LOGIN; GRANT widen_nobody TO search_consumer_runtime`);
+      await drifted.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
+      await expect(assertRuntimeIdentity(asDb(drifted))).rejects.toThrow("inherited memberships");
+    } finally {
+      await drifted.close();
+    }
+  }, 180_000);
+
+  test("startup refuses a database URL carrying startup options", () => {
+    expect(() => refuseStartupOptions("postgres://writer:secret@db:5432/hoop?options=-c%20role%3Dwriter")).toThrow(
+      "startup options",
+    );
+    expect(() => refuseStartupOptions("postgres://writer:secret@db:5432/hoop")).not.toThrow();
+  });
 
   test("the tenant gate refuses boot unless both search tables carry exactly tenant_only", async () => {
     const { pg } = await installed();
@@ -883,6 +946,11 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       await pg.exec(`CREATE POLICY tenant_only ON search_index.transcript_events AS PERMISSIVE FOR ALL TO PUBLIC
         USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))
         WITH CHECK (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))`);
+      // A tenant_only-shaped policy without enforced row security is a gate
+      // billboard, not a gate: refuse until RLS is enabled and forced.
+      await expect(assertSearchTenantGate(db)).rejects.toThrow("row security not enforced");
+      await pg.exec(`ALTER TABLE search_index.transcript_events ENABLE ROW LEVEL SECURITY`);
+      await pg.exec(`ALTER TABLE search_index.transcript_events FORCE ROW LEVEL SECURITY`);
       // A permissive TO PUBLIC policy ORs with tenant_only and widens the
       // tenant without naming the role: refuse that too.
       await pg.exec(`CREATE POLICY open_all ON search_index.projection_state AS PERMISSIVE FOR ALL TO PUBLIC USING (true) WITH CHECK (true)`);
@@ -902,6 +970,22 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
     try {
       await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
       await pg.exec(`CREATE POLICY open_all ON search_index.projection_state AS PERMISSIVE FOR ALL TO PUBLIC USING (true) WITH CHECK (true)`);
+      await expect(pg.exec(stripPsqlMeta(readFileSync(VERIFY_SQL, "utf8")))).rejects.toThrow("non-tenant policy");
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("verify refuses a tenant_only-shaped policy with a widened USING", async () => {
+    const { pg } = await installed();
+    try {
+      await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      // Keep the name and shape, widen the predicate: a LIKE/substring
+      // verifier would still pass, the exact-expression verifier must not.
+      await pg.exec(`DROP POLICY tenant_only ON search_index.projection_state`);
+      await pg.exec(`CREATE POLICY tenant_only ON search_index.projection_state AS PERMISSIVE FOR ALL TO PUBLIC
+        USING (true OR (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true)))
+        WITH CHECK (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))`);
       await expect(pg.exec(stripPsqlMeta(readFileSync(VERIFY_SQL, "utf8")))).rejects.toThrow("non-tenant policy");
     } finally {
       await pg.close();

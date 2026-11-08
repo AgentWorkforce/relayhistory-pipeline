@@ -14,6 +14,7 @@ DECLARE
   r pg_roles%ROWTYPE;
   v_oid oid;
   v_bad text;
+  v_table text;
   v_extra text;
 BEGIN
   SELECT * INTO r FROM pg_roles WHERE rolname = v_role;
@@ -287,24 +288,38 @@ BEGIN
       RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: extra writer-targeted policy on %s', v_role, v_bad);
     END IF;
   END LOOP;
-  -- Every policy on the search tables must be exactly the tenant gate. A
-  -- writer-targeted policy would collide with #330's exact-one-policy check
-  -- while widening the gate, and a permissive TO PUBLIC policy ORs with
-  -- tenant_only and gives the writer cross-tenant visibility without ever
-  -- naming the role (roles @> ARRAY[v_role] does not match PUBLIC). Zero
-  -- policies passes too: pre-#330 transcript_events has no row gate yet,
-  -- and the serve-time tenant gate refuses to tick until it lands.
-  FOR v_bad IN
-    SELECT format('%s.%s', p.schemaname, p.tablename) || ' ' || p.policyname FROM pg_policies p
-    WHERE p.schemaname = 'search_index' AND p.tablename IN ('transcript_events', 'projection_state')
-  LOOP
-    IF NOT EXISTS (SELECT 1 FROM pg_policies q
-                   WHERE format('%s.%s', q.schemaname, q.tablename) || ' ' || q.policyname = v_bad
-                     AND q.policyname = 'tenant_only' AND q.cmd = 'ALL'
-                     AND q.permissive = 'PERMISSIVE' AND q.roles = '{public}'::name[]
-                     AND q.qual LIKE '%bulls96_read.org_id%' AND q.qual LIKE '%bulls96_read.workspace_id%'
-                     AND q.with_check LIKE '%bulls96_read.org_id%' AND q.with_check LIKE '%bulls96_read.workspace_id%') THEN
-      RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: non-tenant policy %s', v_role, v_bad);
+  -- Every policy on the search tables must be exactly the tenant gate, by
+  -- canonical expression (not substring): a writer-targeted policy would
+  -- collide with #330's exact-one-policy check, and a permissive TO PUBLIC
+  -- policy ORs with tenant_only and gives the writer cross-tenant
+  -- visibility without ever naming the role. A USING (true OR (...)) shape
+  -- passes a substring test but fails here. Zero policies passes too:
+  -- pre-#330 transcript_events has no row gate yet, and the serve-time
+  -- tenant gate refuses to tick until it lands. But a present gate must be
+  -- active: RLS enabled and forced, so a DISABLE with the policy row still
+  -- catalogued (or a non-forced table the owner bypasses) fails closed.
+  FOR v_table IN SELECT unnest(ARRAY['search_index.transcript_events', 'search_index.projection_state']) LOOP
+    FOR v_bad IN
+      SELECT q.policyname FROM pg_policies q
+      WHERE format('%s.%s', q.schemaname, q.tablename) = v_table
+    LOOP
+      IF NOT EXISTS (SELECT 1 FROM pg_policies q
+                     WHERE format('%s.%s', q.schemaname, q.tablename) = v_table AND q.policyname = v_bad
+                       AND q.policyname = 'tenant_only' AND q.cmd = 'ALL'
+                       AND q.permissive = 'PERMISSIVE' AND q.roles = '{public}'::name[]
+                       AND replace(replace(replace(replace(q.qual, ' ', ''), '(', ''), ')', ''), '::text', '')
+                         = 'org_id=current_setting''bulls96_read.org_id'',trueANDworkspace_id=current_setting''bulls96_read.workspace_id'',true'
+                       AND replace(replace(replace(replace(q.with_check, ' ', ''), '(', ''), ')', ''), '::text', '')
+                         = 'org_id=current_setting''bulls96_read.org_id'',trueANDworkspace_id=current_setting''bulls96_read.workspace_id'',true') THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: non-tenant policy %s on %s', v_role, v_bad, v_table);
+      END IF;
+    END LOOP;
+    IF EXISTS (SELECT 1 FROM pg_policies q
+               WHERE format('%s.%s', q.schemaname, q.tablename) = v_table)
+       AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                       WHERE format('%s.%s', n.nspname, c.relname) = v_table
+                         AND c.relrowsecurity AND c.relforcerowsecurity) THEN
+      RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: row security not enforced on %s', v_role, v_table);
     END IF;
   END LOOP;
 
