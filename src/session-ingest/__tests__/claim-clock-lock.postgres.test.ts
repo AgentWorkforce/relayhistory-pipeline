@@ -116,7 +116,11 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     while (Date.now() < end) { if ((await pool.query(sql, params)).rows[0].ok) return; await Bun.sleep(10); }
     throw Error("expected_fixture_wait_missing:" + what);
   };
-  const waitBlockedBy = (waiter: number, blocker: number) => waitFor("blocker", "SELECT $2::int=ANY(pg_blocking_pids($1)) AS ok", [waiter, blocker]);
+  // Recursive blocker ancestry: a waiter may queue behind another waiter (e.g. claim Z behind the queued allocator Y)
+  // rather than directly behind the holder.
+  const waitBlockedBy = (waiter: number, blocker: number) => waitFor("blocker",
+    "WITH RECURSIVE a(pid) AS(SELECT unnest(pg_blocking_pids($1::int)) UNION SELECT unnest(pg_blocking_pids(a.pid)) FROM a) SELECT $2::int IN(SELECT pid FROM a) AS ok",
+    [waiter, blocker]);
   const waitAdvisory = (pid: number) => waitFor("advisory", "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted) AS ok", [pid]);
   const slots = async (rid: string) => (await pool.query("SELECT current_owner FROM sessions.ingest_lazy_native_slots WHERE record_id=$1", [rid])).rows;
   const custodyRows = async (rid: string) => Number((await pool.query("SELECT count(*) n FROM sessions.ingest_custody_records WHERE record_id=$1", [rid])).rows[0].n);
@@ -143,6 +147,9 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     await pool.query("SELECT sessions.ingest_receipt_seat_initialize($1::jsonb)", [JSON.stringify({ protocol: "delivery-acceptance-floor-v1", controlEpoch: epoch,
       capturedAt: "2026-11-04T00:00:00.000000Z", sourceSequences: ["sessions.delivery_catalog_acceptance_seq", "sessions.delivery_projection_acceptance_seq"].map((sequenceRegclass, i) => ({ sequenceRegclass, sequenceOid: String(i + 1), allocatedHighWater: "9007199254740993", isCalled: true, incrementBy: "1", cycle: false })),
       allocatedHighWater: "9007199254740993", generation, sourceIdentitySha256: identity, sourceProofSha256: "d".repeat(64) })]);
+    // Commit the org's ingest_buffer_admission row once with a real completed delivery: a first claimant's uncommitted
+    // admission insert would otherwise make every other claimant of the org wait on its xid (not the seat clock).
+    await warm(tenant("org"));
   }, 180000);
   afterAll(async () => {
     for (const c of sessions) await release(c);
@@ -303,7 +310,8 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
       const w0 = (await c.query(writes)).rows[0].n;
       await c.query("SELECT sessions.ingest_lazy_ack_batch(to_jsonb(b)) FROM sessions.ingest_batches b WHERE batch_id=$1", [id]);
       expect((await c.query(writes)).rows[0].n).toBe(w0);
-      expect((await c.query("SELECT mode FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='relation' AND relation='sessions.ingest_receipt_seat_clock'::regclass")).rows.map((r) => r.mode)).toEqual(["RowShareLock"]);
+      expect((await c.query("SELECT mode FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='relation' AND relation='sessions.ingest_receipt_seat_clock'::regclass ORDER BY mode")).rows.map((r) => r.mode))
+        .toEqual(["AccessShareLock", "RowShareLock"]); // plain read (lazy_guard) + the KEY SHARE row lock; nothing stronger
       await c.query("CREATE TEMP TABLE __probe(x int);INSERT INTO __probe VALUES(1)");
       expect(BigInt((await c.query(writes)).rows[0].n)).toBeGreaterThan(BigInt(w0));
     } finally { await release(c); }
