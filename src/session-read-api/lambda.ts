@@ -146,33 +146,133 @@ function readerPoolTarget(url: string, entry: ReadAppEntry): pg.PoolConfig {
   return { connectionString: target.toString() };
 }
 
-/** Closed refusal codes for a read login that row-level security would not bind. */
-export type ReaderRoleRefusal = "reader_role_unknown" | "reader_role_superuser" | "reader_role_bypassrls";
+/** The read login the bootstrap provisions (supabase/bootstrap/session_read_api_role.sql); the RLS policies name it. */
+export const READ_API_ROLE = "bulls96_read_api";
 
-/** Names the role and the failed property only; never the URL or a credential. */
+/**
+ * The role's pinned settings (session_read_api_role.sql `ALTER ROLE ... SET`; session_read_api_role_verify.sql
+ * requires rolconfig to contain both). The pool also sends statement_timeout=2000 as a startup option, so
+ * the live session must show exactly these values.
+ */
+export const READER_SETTINGS = Object.freeze({ statement_timeout: "2s", default_transaction_read_only: "on" });
+
+/** Closed refusal codes for a read login that row-level security would not bind. */
+export type ReaderRoleRefusal =
+  | "reader_role_unknown" | "reader_role_session_user" | "reader_role_current_user" | "reader_role_set_role"
+  | "reader_role_system_user" | "reader_role_superuser" | "reader_role_bypassrls" | "reader_role_attributes"
+  | "reader_role_membership" | "reader_role_members" | "reader_role_settings";
+
+/** Names the failed property only; never an observed role name, the URL or a credential. */
 export class ReaderRoleError extends Error {
-  constructor(readonly code: ReaderRoleRefusal, role?: string) {
-    super(`session read api: ${code}${role ? ` (role ${JSON.stringify(role.slice(0, 63))})` : ""}`);
+  constructor(readonly code: ReaderRoleRefusal) {
+    super(`session read api: ${code} (the read login must be ${READ_API_ROLE})`);
     this.name = "ReaderRoleError";
   }
 }
 
+/** The live session and the role's shape in one row (pattern: src/session-ingest/selfhost-server.ts INGEST_LOGIN_SQL). */
+export const READER_LOGIN_SQL = `SELECT session_user::text AS session_user, current_user::text AS current_user,
+  current_setting('role') AS role_setting, current_setting('server_version_num')::int AS server_version,
+  current_setting('statement_timeout') AS statement_timeout,
+  current_setting('default_transaction_read_only') AS default_transaction_read_only,
+  r.rolsuper, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolinherit, r.rolcanlogin, r.rolconfig,
+  (SELECT count(*)::int FROM pg_auth_members m WHERE m.member = r.oid) AS memberships,
+  (SELECT count(*)::int FROM pg_auth_members m WHERE m.roleid = r.oid) AS members
+  FROM pg_roles r WHERE r.rolname = current_user`;
 /**
- * Self-host reader admission. Tenant isolation on search_index.projection_state
- * and transcript_events is forced row-level security (bulls96_read.* settings,
- * `tenant_only`), which a superuser or BYPASSRLS login skips without any error:
- * every tenant's rows would become visible. Refuse such a login at startup
- * rather than serve with isolation resting on WHERE clauses alone. Any failure
- * to read the role (no row, a query error) also refuses.
+ * PG16+ only: system_user, inherit_option and set_option do not exist earlier. LEFT JOINs, so an edge
+ * whose member or grantor cannot be named is still listed, and then refused.
  */
-export async function assertReaderRole(sql: SqlQuery): Promise<void> {
-  const { rows } = await sql.query<{ role: unknown; rolsuper: unknown; rolbypassrls: unknown }>(
-    "SELECT current_user AS role, r.rolsuper, r.rolbypassrls FROM pg_roles r WHERE r.rolname = current_user",
-  );
-  const me = rows[0];
-  if (rows.length !== 1 || !me || typeof me.role !== "string") throw new ReaderRoleError("reader_role_unknown");
-  if (me.rolsuper !== false) throw new ReaderRoleError("reader_role_superuser", me.role);
-  if (me.rolbypassrls !== false) throw new ReaderRoleError("reader_role_bypassrls", me.role);
+export const READER_PG16_SQL = `SELECT system_user::text AS system_user,
+  (SELECT coalesce(json_agg(json_build_object('member', u.rolname, 'grantor', g.rolname, 'grantor_super', g.rolsuper,
+     'admin_option', a.admin_option, 'inherit_option', a.inherit_option, 'set_option', a.set_option)), '[]'::json)
+   FROM pg_auth_members a LEFT JOIN pg_roles u ON u.oid = a.member LEFT JOIN pg_roles g ON g.oid = a.grantor
+   WHERE a.roleid = (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS member_edges`;
+
+export interface ReaderProvider {
+  /** SESSION_POSTGRES_TLS_PROFILE is supabase (the Lambda's implicit default included). */
+  supabase: boolean;
+}
+
+/**
+ * The one reverse membership edge permitted, on PG16+ with a Supabase provider only: Supabase's
+ * non-superuser `postgres` (CREATEROLE) created the role (session_read_api_roles.sql allows exactly
+ * that creator), so PostgreSQL 16 recorded `postgres` as a member granted by `supabase_admin`, WITH
+ * ADMIN, INHERIT FALSE, SET FALSE: it may administer the role's grants but never assume or inherit it.
+ * The same edge src/session-ingest/selfhost-server.ts permits for the ingest login.
+ */
+function supabaseCreatorEdge(edge: unknown): boolean {
+  if (!edge || typeof edge !== "object") return false;
+  const e = edge as Record<string, unknown>;
+  return e.member === "postgres" && e.grantor === "supabase_admin" && e.grantor_super === true
+    && e.admin_option === true && e.inherit_option === false && e.set_option === false;
+}
+
+/**
+ * The admission decision over the live rows (pure, so a real-login row can be tested where PGlite has
+ * no login). `pg16` is the READER_PG16_SQL row, required when server_version >= 160000. null admits.
+ */
+export function readerLoginRefusal(login: Record<string, unknown> | undefined, pg16: Record<string, unknown> | undefined, provider: ReaderProvider): ReaderRoleRefusal | null {
+  if (!login) return "reader_role_unknown";
+  // Identity: a real login as the role, never another login that SET ROLE into it.
+  if (login.session_user !== READ_API_ROLE) return "reader_role_session_user";
+  if (login.current_user !== READ_API_ROLE) return "reader_role_current_user";
+  if (login.role_setting !== "none") return "reader_role_set_role";
+  const version = login.server_version;
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 100000) return "reader_role_unknown";
+  const modern = version >= 160000;
+  if (modern) {
+    if (!pg16) return "reader_role_unknown";
+    // "<auth method>:<authenticated identity>"; NULL means trust auth, which proves nothing.
+    const su = pg16.system_user;
+    const colon = typeof su === "string" ? su.indexOf(":") : -1;
+    if (typeof su !== "string" || colon < 1 || su.slice(colon + 1) !== READ_API_ROLE) return "reader_role_system_user";
+  }
+  // Shape: the bootstrap's LOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION.
+  if (login.rolsuper !== false) return "reader_role_superuser";
+  if (login.rolbypassrls !== false) return "reader_role_bypassrls";
+  if (login.rolcreaterole !== false || login.rolcreatedb !== false || login.rolreplication !== false || login.rolinherit !== false || login.rolcanlogin !== true)
+    return "reader_role_attributes";
+  // Membership in both directions: a member of no role (the verifier's rule), and no role a member
+  // of it but the Supabase creator edge.
+  if (login.memberships !== 0) return "reader_role_membership";
+  if (typeof login.members !== "number") return "reader_role_unknown";
+  if (modern) {
+    const edges = pg16!.member_edges;
+    if (!Array.isArray(edges) || edges.length !== login.members || !edges.every((edge) => provider.supabase && supabaseCreatorEdge(edge))) return "reader_role_members";
+  } else if (login.members !== 0) return "reader_role_members";
+  // Settings: the role pins both (the verifier's `rolconfig @>`; other entries are allowed, as there),
+  // and the live session shows exactly those values.
+  const config = login.rolconfig;
+  if (!Array.isArray(config)) return "reader_role_settings";
+  for (const [k, v] of Object.entries(READER_SETTINGS)) {
+    if (!config.includes(`${k}=${v}`)) return "reader_role_settings";
+    if (login[k] !== v) return "reader_role_settings";
+  }
+  return null;
+}
+
+/**
+ * Reader admission (the self-host service, and any portable Postgres search binding). Tenant isolation
+ * on sessions.session_index and the search tables is row-level security, which a superuser, BYPASSRLS
+ * or otherwise different login skips or changes without any error. So the pool's session must be a
+ * real login as exactly bulls96_read_api (session_user, current_user, no SET ROLE, and on PG16+
+ * system_user), with the bootstrap's role shape, no membership edge in either direction (but the
+ * Supabase creator edge) and the pinned settings. Any mismatch or failure to read the rows refuses
+ * startup; the error names the failed property only. A query error propagates unchanged.
+ */
+export async function assertReaderRole(sql: SqlQuery, provider: ReaderProvider = { supabase: false }): Promise<void> {
+  const { rows } = await sql.query<Record<string, unknown>>(READER_LOGIN_SQL);
+  if (rows.length !== 1) throw new ReaderRoleError("reader_role_unknown");
+  const login = rows[0];
+  let pg16: Record<string, unknown> | undefined;
+  if (typeof login?.server_version === "number" && login.server_version >= 160000) {
+    const extra = await sql.query<Record<string, unknown>>(READER_PG16_SQL);
+    if (extra.rows.length !== 1) throw new ReaderRoleError("reader_role_unknown");
+    pg16 = extra.rows[0];
+  }
+  const refusal = readerLoginRefusal(login, pg16, provider);
+  if (refusal) throw new ReaderRoleError(refusal);
 }
 
 async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition): Promise<App> {
@@ -228,7 +328,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // the service always and on any portable (Postgres) search binding; the hosted
   // ClickHouse Lambda's read role is verified by its own bootstrap
   // (supabase/bootstrap/session_read_api_role_verify.sql).
-  if (entry === "service" || backend !== "clickhouse") await assertReaderRole(pool);
+  // Supabase provider: the TLS profile, whose unset default (the Lambda's) is supabase too.
+  if (entry === "service" || backend !== "clickhouse") await assertReaderRole(pool, { supabase: (env.SESSION_POSTGRES_TLS_PROFILE ?? "supabase") === "supabase" });
   const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", poolTenantRunner(pool as never));
   if (adapter && await adapter.state.fromMs(new Date()) > completeSinceMs) throw new Error("read history floor is below search coverage");
   const authConfig = readApiAuthConfig(env);
