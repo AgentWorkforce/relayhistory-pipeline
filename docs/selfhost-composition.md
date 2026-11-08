@@ -290,15 +290,41 @@ upload routes are served. Roll back `async` -> `drain` -> wait for
 `<root>/*/v1/ws=*/m=srv_*`. The three dot-prefixed roots are disjoint from every
 tenant prefix, because no org id may start with a dot.
 
-| Prefix / key | Written by | Operations |
-| --- | --- | --- |
-| `<root>/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<machine>/r=<receipt>/a=<ms>-<nonce>.ndjson.zst` (the upload) | request path (async only); consumer | PutObject create-only (`If-None-Match: *`; on 412 the adapter runs HeadObject, plus GetObject if the digest metadata is missing, to accept identical bytes); GetObject (consumer); PutObject **unconditional overwrite** with a small tombstone after the terminal outcome. Never DeleteObject. |
-| `…/r=<receipt>/outcome-admitted.json`, `outcome-refused.json` | consumer | PutObject overwrite; GetObject (status route) |
-| `<root>/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<user hash>/privacy-journal.json` | request path (read), consumer (read; conditional write only when it completes a stranded pending control) | GetObject; PutObject with `If-None-Match: *` or `If-Match: <etag>`. Self-host serves no journaled control today, so it is normally only read. |
-| `<root>/.admission-inbox` (listing) | consumer | ListBucket with prefix `<root>/.admission-inbox` |
-| `<root>/.admission-dlq/<same path as the inbox key>.json` | consumer | PutObject overwrite; ListBucket with prefix `<root>/.admission-dlq`; DeleteObject (best effort, after a later admission; also the operator's redrive) |
-| `<root>/.admission-probe/v1/ws=probe/m=srv_<random>/probe.json` | startup gate, once per process start | PutObject create-only, a refused second create (with the HeadObject reconcile above), PutObject `If-Match` twice (one must be refused), GetObject, then DeleteObject best effort. If DeleteObject is denied, one ~60-byte object per start stays; startup still succeeds. Any other failure refuses startup. |
-| tenant data `<root>/<org>/…` | consumer (and the request path in `sync` / `drain`) | exactly the synchronous path's set (chunks, manifests, pointers; GetObject, HeadObject, conditional PutObject). Canonical acceptance stages nothing, so there is no `buffered-batches` stage prefix. |
+Today the request path and the consumer are one process with ONE Locker
+credential, so that credential needs the union of the two role tables below.
+They are split so that a future separate consumer SERVICE can take a narrower
+grant. `J` is the privacy journal,
+`<root>/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<sha256(ws,user)[0:32]>/privacy-journal.json`.
+It is the ONLY privacy object in the store: the deletion fences, reset counts
+and control heads live in SQL (read by the claim), and nothing else in S3 is
+consulted during admission.
+
+*Request-path role (`async` uploads; `drain` and `sync` uploads use the synchronous tenant-data set instead):*
+
+| Prefix / key | Operations |
+| --- | --- |
+| `J` (the upload's witness, read before the body) | GetObject. A missing object must answer 404 (needs `s3:ListBucket`, below). |
+| `<root>/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<machine>/r=<receipt>/a=<ms>-<nonce>.ndjson.zst` | PutObject create-only (`If-None-Match: *`). On a 412 the adapter runs HeadObject, plus GetObject when the digest metadata is missing, to accept identical bytes. |
+| `…/r=<receipt>/outcome-admitted.json`, `outcome-refused.json` | GetObject (the `GET /v1/delivery/admission` status read) |
+
+*Consumer role (`async` and `drain`):*
+
+| Prefix / key | Operations |
+| --- | --- |
+| `<root>/.admission-inbox` | ListBucket with prefix `<root>/.admission-inbox` |
+| the inbox object | GetObject; PutObject **unconditional overwrite** with a small tombstone after the terminal outcome. Never DeleteObject. |
+| `…/r=<receipt>/outcome-admitted.json`, `outcome-refused.json` | PutObject overwrite |
+| `J` (the post-claim privacy gate) | GetObject. PutObject with `If-Match: <etag>` (or `If-None-Match: *` on a missing journal) only to complete a control left pending for more than 120 s. Self-host serves no journaled control today, so this write does not happen in practice, but grant it. |
+| `<root>/.admission-dlq/<inbox path minus .ndjson.zst>.json` | ListBucket with prefix `<root>/.admission-dlq`; PutObject overwrite (the dead-letter marker); DeleteObject (best effort after a later admission; also the operator's redrive) |
+| tenant data `<root>/<org>/…` | exactly the synchronous path's set (chunks, manifests, pointers: GetObject, HeadObject, conditional PutObject). Canonical acceptance stages nothing, so there is no `buffered-batches` stage prefix. |
+
+*Startup gate (whichever role starts with `async` or `drain`; once per process start):*
+
+| Key | Operations |
+| --- | --- |
+| `<root>/.admission-probe/v1/ws=probe/m=srv_<random>/probe.json` | PutObject create-only; a second create that must be refused (with the HeadObject reconcile above); PutObject `If-Match` twice (the stale one must be refused); GetObject; DeleteObject best effort. If DeleteObject is denied, one ~60-byte object per start remains and startup still succeeds. Any other failure refuses startup. |
+
+*Operator (not a service role):* DeleteObject on `<root>/.admission-dlq/…` to redrive.
 
 Backend notes:
 
