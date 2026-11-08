@@ -40,7 +40,9 @@
  * no-store both ways, no caching. Flag on with the binding absent: every request answers 503
  * backend_unavailable (logged missing_HISTORY_CONTROL_HEAD), the same fail-closed rule as a missing
  * Hyperdrive binding. READ_API_OWNER_BUFFERED_WORKSPACES is the owner-buffered canary allowlist (on
- * top of READ_API_DIRECTORY_WORKSPACES; unset = none). Flag, allowlist, bucket and binding are
+ * top of READ_API_DIRECTORY_WORKSPACES; unset = none; "*" = all-workspaces mode, which the deploy
+ * render accepts only with READ_API_DIRECTORY_WORKSPACES="*" and which never bypasses the per-user
+ * privacy gate). Flag, allowlist, bucket and binding are
  * all unset in wrangler.jsonc; only the deploy workflow's owner_buffered=on render
  * (scripts/render-deploy-config.ts) adds them.
  */
