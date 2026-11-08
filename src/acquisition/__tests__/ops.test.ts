@@ -83,6 +83,19 @@ test("every SQL error code maps per the contract table (ops shape)", async () =>
   expect(httpForError(Object.assign(new Error("syntax"), { code: "42601" }), "ops").status).toBe(500);
   expect(httpForError(Object.assign(new Error("connection lost"), { code: "08006" }), "ops").status).toBe(503);
   expect(classifySqlError(Object.assign(new Error("acquisition: Not A Code"), { code: "55000" })).name).toBe("AcquisitionSqlDefect");
+  // A well-formed lowercase code that is not in that SQLSTATE's contract list is a defect (500), not a refusal:
+  // unknown (future) codes, and known codes paired with the wrong SQLSTATE.
+  for (const [sqlstate, code] of [["55000", "future_contract_code"], ["22023", "future_contract_code"], ["55000", "session_busy"], ["40001", "owner_draining"], ["42501", "invalid_request"], ["22023", "constructor"]] as const) {
+    const err = Object.assign(new Error(`acquisition: ${code}`), { code: sqlstate });
+    expect([sqlstate, code, classifySqlError(err).name]).toEqual([sqlstate, code, "AcquisitionSqlDefect"]);
+    expect([sqlstate, code, httpForError(err, "ops").status]).toEqual([sqlstate, code, 500]);
+    const h = opsHarness();
+    h.sql.failNext(pgError(sqlstate, code));
+    const r = await call(h.app, "POST", `${P}/install`, { token: "sh_wk_ops", body: envelope("install", cloudInstall()) });
+    expect([sqlstate, code, r.status]).toEqual([sqlstate, code, 500]);
+  }
+  // A contract code under a non-contract SQLSTATE stays a defect too.
+  expect(classifySqlError(Object.assign(new Error("acquisition: owner_draining"), { code: "toString" })).name).not.toBe("AcquisitionSqlError");
   // Native shape for the same refusal.
   expect(httpForError(pgError("55000", "owner_draining"), "native")).toEqual({ status: 409, body: { error: { code: "acquisition_refused", reason: "owner_draining", retryable: false } } });
 });

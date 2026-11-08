@@ -120,19 +120,25 @@ export function isRetryableCode(code: string): boolean {
   return code === "session_busy";
 }
 
-/** Classify a driver error. Only `acquisition: <code>` with a contract SQLSTATE becomes a refusal. */
+/** A contract violation by the SQL side (unknown SQLSTATE, or a code not in its SQLSTATE's list): 500, not retryable. */
+export class AcquisitionSqlDefect extends Error {
+  constructor() {
+    super("unexpected acquisition SQL error");
+    this.name = "AcquisitionSqlDefect";
+  }
+}
+
+/** Classify a driver error. Only `acquisition: <code>` with that code in its SQLSTATE's contract list becomes a refusal. */
 export function classifySqlError(error: unknown): AcquisitionSqlError | AcquisitionUnavailableError | Error {
-  if (error instanceof AcquisitionSqlError || error instanceof AcquisitionUnavailableError || error instanceof AcquisitionUnexpectedResult) return error;
+  // Already classified (AcquisitionSql.run classifies before httpForError sees it): a defect stays a defect (500).
+  if (error instanceof AcquisitionSqlError || error instanceof AcquisitionUnavailableError || error instanceof AcquisitionUnexpectedResult || error instanceof AcquisitionSqlDefect) return error;
   const e = error as { code?: unknown; message?: unknown };
   const sqlstate = typeof e?.code === "string" ? e.code : "";
   const match = typeof e?.message === "string" ? /^acquisition: ([a-z_]{1,64})$/.exec(e.message) : null;
-  if (match && SQL_ERROR_CODES[sqlstate]) return new AcquisitionSqlError(sqlstate, match[1]!);
+  // The code must belong to that SQLSTATE's contract list; an unknown or mis-paired code is a defect (500).
+  if (match && Object.hasOwn(SQL_ERROR_CODES, sqlstate) && SQL_ERROR_CODES[sqlstate]!.includes(match[1]!)) return new AcquisitionSqlError(sqlstate, match[1]!);
   // A Postgres SQLSTATE outside connection/resource classes is a defect, not an outage.
-  if (/^[0-9A-Z]{5}$/.test(sqlstate) && !/^(08|53|57|58)/.test(sqlstate)) {
-    const defect = new Error("unexpected acquisition SQL error");
-    defect.name = "AcquisitionSqlDefect";
-    return defect;
-  }
+  if (/^[0-9A-Z]{5}$/.test(sqlstate) && !/^(08|53|57|58)/.test(sqlstate)) return new AcquisitionSqlDefect();
   return new AcquisitionUnavailableError();
 }
 

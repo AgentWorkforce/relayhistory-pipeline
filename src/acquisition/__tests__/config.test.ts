@@ -1,11 +1,14 @@
 import { expect, test } from "bun:test";
 import { REFUSED_ISSUER_ENV, acquisitionConfig } from "../config.ts";
 import { parsePinnedKeys } from "../key-registry.ts";
+import { SUPABASE_PROD_CA_2021 } from "../../session-pipeline/supabase-ca.ts";
 import { NATIVE_SEED_HEX, cloudPinnedEntry, nativePinnedEntry, pinnedKeysJson } from "./helpers.ts";
 
+// A complete installer login: user, non-empty password, host, database; TLS CA pinned separately.
 const live = {
   ACQUISITION_ENABLED: "true", ACQUISITION_ORIGIN: "https://history.example.test", RELAYCONTROL_INTROSPECT_URL: "https://relaycontrol.example.test/v1/introspect",
-  RELAYCONTROL_INTROSPECT_SECRET: "x", ACQUISITION_PINNED_KEYS: pinnedKeysJson, ACQUISITION_DATABASE_URL: "postgres://u@db.example.test/h",
+  RELAYCONTROL_INTROSPECT_SECRET: "x", ACQUISITION_PINNED_KEYS: pinnedKeysJson,
+  ACQUISITION_DATABASE_URL: "postgresql://bulls96_acquisition_installer:pw-test-only@db.example.test:5432/history", ACQUISITION_DATABASE_CA_PEM: SUPABASE_PROD_CA_2021,
 };
 
 test("default off: nothing else is read", () => {
@@ -28,7 +31,7 @@ test("ops listener: loopback bind and port 8082 by default (8081 is the VPC-open
 test("enabled: required variables, ops sub-flag default off, no signer or intent key in the config", () => {
   const c = acquisitionConfig(live);
   expect(c.enabled && c.opsEnabled).toBe(false);
-  expect(Object.keys(c).sort()).toEqual(["databaseUrl", "enabled", "introspectSecret", "introspectUrl", "opsEnabled", "opsHost", "opsPort", "origin", "port", "registry"]);
+  expect(Object.keys(c).sort()).toEqual(["database", "enabled", "introspectSecret", "introspectUrl", "opsEnabled", "opsHost", "opsPort", "origin", "port", "registry"]);
   const o = acquisitionConfig({ ...live, ACQUISITION_OPS_ENABLED: "true" });
   expect(o.enabled && o.opsEnabled).toBe(true);
   for (const k of Object.keys(live).filter((k) => k !== "ACQUISITION_ENABLED"))
@@ -100,7 +103,7 @@ test("verify-only: no service module can sign, and the removed variables are rea
   const { readdirSync, readFileSync } = await import("node:fs");
   const dir = new URL("..", import.meta.url).pathname;
   const files = readdirSync(dir).filter((f) => f.endsWith(".ts")).sort();
-  expect(files).toEqual(["app.ts", "config.ts", "installer.ts", "key-registry.ts", "main.ts", "validation.ts", "verifier.ts"]);
+  expect(files).toEqual(["app.ts", "config.ts", "db-login.ts", "installer.ts", "key-registry.ts", "main.ts", "validation.ts", "verifier.ts"]);
   const removed = [...REFUSED_ISSUER_ENV, "ACQUISITION_NATIVE_ENABLED"];
   for (const f of files) {
     const src = readFileSync(dir + f, "utf8");

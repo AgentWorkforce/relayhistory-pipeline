@@ -149,8 +149,18 @@ even when disabled. The issuer-era variables are checked for presence only and r
 | `RELAYCONTROL_INTROSPECT_URL` | enabled | #313 introspection endpoint; checked against the destination policy. |
 | `RELAYCONTROL_INTROSPECT_SECRET` | enabled | #313 service secret (secret; 1Password). |
 | `ACQUISITION_PINNED_KEYS` | enabled | JSON array of `{issuerKeyId, issuerClass:"cloud", publicKeyBase64}` (raw 32-byte Ed25519). Only `cloud`-class keys are accepted; a `native`-class entry (or any other class) is refused at startup (see "Tracked gap: native receiver contract"). Ids are unique and one public key may not be pinned under two ids; startup fails otherwise. |
-| `ACQUISITION_DATABASE_URL` | enabled | Postgres URL for role `bulls96_acquisition_installer` (secret). |
+| `ACQUISITION_DATABASE_URL` | enabled | Installer login, exactly `postgresql://user:password@host[:port]/database` (secret; 1Password). The user must be `bulls96_acquisition_installer` (or the pooler form `bulls96_acquisition_installer.<tenant>`), the password non-empty, and the only allowed parameter is `sslmode=verify-full`; `sslmode=disable`/`no-verify`/anything else, `options`, `application_name` or any other parameter refuses startup. Parsed into discrete pg fields (`src/acquisition/db-login.ts`, reusing `src/shared/owner-pg-config.ts`), never passed as a `connectionString`, so no `PG*` variable or `.pgpass` is consulted. `application_name` is fixed (`96bulls-acquisition-installer`) and `options` is fixed to `-c statement_timeout=5s -c lock_timeout=2s -c idle_in_transaction_session_timeout=10s`. |
+| `ACQUISITION_DATABASE_CA_PEM` | enabled | PEM CA certificate for the database; TLS is always verify-full against it (server name = URL host). A private key or unparseable PEM refuses startup. |
 | `DESTINATION_*` | as the shared policy | `src/shared/destination-url.ts` policy for the introspection URL. |
+
+**Installer login check.** With `ACQUISITION_OPS_ENABLED=true`, before the ops listener starts
+(and so before `/healthz` answers), the service reads the live session and refuses to start
+unless: `session_user` and `current_user` are exactly `bulls96_acquisition_installer`, the
+`role` setting is `none` (no `SET ROLE`), on PG16+ `system_user` is `<method>:bulls96_acquisition_installer`
+(NULL, i.e. trust auth, is refused), the role is not superuser, `BYPASSRLS`, `CREATEROLE`,
+`CREATEDB`, `REPLICATION` or `INHERIT`, it is a member of no role, and the effective
+`statement_timeout` / `lock_timeout` / `idle_in_transaction_session_timeout` are `5s` / `2s` /
+`10s`. Refusals name only the failed property (`96bulls: acquisition installer login refused: <code>`).
 
 ## Authentication
 
@@ -213,7 +223,9 @@ rebinds to be native-class, so `ops/rebind` cannot succeed with a cloud key (403
 Only `session_busy` and transport-class failures are `retryable:true`; `revision_cas_lost`,
 `stale_revision`, `predecessor_mismatch`, `operation_conflict`, `origin_cas_lost` and every
 55000 code are `retryable:false` (re-read status, build a new operation). The stable code is
-the message after `acquisition: `; a message outside the contract is a defect (500).
+the message after `acquisition: `; a message outside the contract, or a well-formed code that is
+not in its SQLSTATE's list above (an unknown future code, or a known code under another
+SQLSTATE), is a defect (500, not retryable), never a 4xx/409 refusal.
 
 ## Logging
 

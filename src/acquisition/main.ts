@@ -13,6 +13,7 @@ import { assertDestinationUrl, destinationPolicy } from "../shared/destination-u
 import { errorFields, log } from "../shared/log.ts";
 import { createAcquisitionApp, type AcquisitionGroup } from "./app.ts";
 import { acquisitionConfig } from "./config.ts";
+import { assertInstallerLogin } from "./db-login.ts";
 import { AcquisitionSql, Installer, pgAcquisitionExecutor } from "./installer.ts";
 import { registryOfClass } from "./key-registry.ts";
 import { createAcquisitionVerifier } from "./verifier.ts";
@@ -79,8 +80,20 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<void>
     servers.push(await listen(createAcquisitionApp({ enabled: false, group: "native" }), config.port, NATIVE_HOST, "native", "dormant"));
     servers.push(await listen(createAcquisitionApp({ enabled: false, group: "ops" }), config.opsPort, config.opsHost, "ops", "dormant"));
   } else {
-    pool = new pg.Pool({ connectionString: config.databaseUrl, max: 5 });
+    // Discrete pinned fields only (db-login.ts): never a connectionString, so no URL parameter,
+    // PG* variable or .pgpass can change TLS, the login or the role.
+    pool = new pg.Pool({ ...config.database, max: 5 });
     pool.on("error", (err) => log.warn("acquisition pool error", errorFields(err)));
+    // The ops listener only starts (and reports healthy) once the live session is exactly the
+    // installer login with the expected role shape; otherwise startup fails.
+    if (config.opsEnabled) {
+      try {
+        await assertInstallerLogin(pool);
+      } catch (err) {
+        await pool.end().catch(() => undefined);
+        throw err;
+      }
+    }
     const sql = new AcquisitionSql(pgAcquisitionExecutor(pool));
     const authenticator = createAcquisitionVerifier({
       url: config.introspectUrl,

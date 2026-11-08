@@ -28,7 +28,12 @@
  *                                  dedicated receiver class/scope is designed in a follow-up PR; issuing side
  *                                  owned by relay-control (layered-control). Do not restore pipeline signing
  *                                  or trust cloud-class issuance for native.
- *   ACQUISITION_DATABASE_URL       Postgres URL for role bulls96_acquisition_installer (never logged)
+ *   ACQUISITION_DATABASE_URL       postgresql://user:password@host[:port]/database for the installer login
+ *                                  (user bulls96_acquisition_installer or its pooler form <role>.<tenant>;
+ *                                  non-empty password; only ?sslmode=verify-full allowed, every other
+ *                                  parameter refused). Parsed into a discrete pg config, never a
+ *                                  connectionString (db-login.ts). Never logged.
+ *   ACQUISITION_DATABASE_CA_PEM    PEM CA certificate the database TLS is verified against (verify-full)
  *   RELAYCONTROL_INTROSPECT_URL    relaycontrol base URL (#313; https, loopback or in-cluster per destination policy)
  *   RELAYCONTROL_INTROSPECT_SECRET the dedicated introspection secret
  *
@@ -37,6 +42,8 @@
 import { isIP } from "node:net";
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
+import type { ClientConfig } from "pg";
+import { installerClientConfig } from "./db-login.ts";
 import { parsePinnedKeys } from "./key-registry.ts";
 import type { IssuerRegistry } from "./validation.ts";
 
@@ -68,7 +75,8 @@ export interface AcquisitionLiveConfig {
   readonly opsHost: string;
   readonly origin: string;
   readonly registry: IssuerRegistry;
-  readonly databaseUrl: string;
+  /** Discrete pinned pg config for the installer login (db-login.ts); holds the password, never log it. */
+  readonly database: ClientConfig;
   readonly introspectUrl: string;
   readonly introspectSecret: string;
 }
@@ -132,7 +140,7 @@ export function acquisitionConfig(env: NodeJS.ProcessEnv = process.env): Acquisi
     ...ports,
     origin,
     registry,
-    databaseUrl: required(env, "ACQUISITION_DATABASE_URL"),
+    database: installerClientConfig(required(env, "ACQUISITION_DATABASE_URL"), required(env, "ACQUISITION_DATABASE_CA_PEM")),
     introspectUrl,
     introspectSecret: required(env, "RELAYCONTROL_INTROSPECT_SECRET"),
   };
