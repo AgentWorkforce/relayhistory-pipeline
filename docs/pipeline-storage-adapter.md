@@ -178,14 +178,16 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     `scrubRecord`, `scrubRecordLine`, through `redactsSecretKeyedValue`) keep
     a value that starts with `op://` only when the whole value is a complete
     one-line 1Password reference (`OP_REFERENCE` in `lib/scrub.ts`):
-    `^op://SEG(/SEG)+$`, where each segment is one or more runs of ASCII
+    `^op://SEG(/SEG){2,3}$`: exactly `vault/item/field` or
+    `vault/item/section/field`; anything else, including two segments or five
+    or more, is redacted. Each segment is one or more runs of ASCII
     letters, digits, `.`, `_` or `-` joined by single spaces
     (`op://vault/item/field`, `op://My Vault/item name/field`). Any other
     value starting `op://` is redacted whole: one holding a backslash (so any
     escape sequence, such as an escaped line separator `\n`, `\r`, `\u2028`,
     `\u2029`, `\u0085`, or an escaped quote), a quote, a control character or
     line separator, a tab, a double space, a leading or trailing space in a
-    segment, or no item segment. Before this, a value was kept unless it held a
+    segment, a query string, or too few or too many segments. Before this, a value was kept unless it held a
     literal line separator, so in nested or escaped JSON
     (`{"api_key":"op://vault/item\nTAIL"}`, the text holding a backslash then
     `n`; a tool result) the separator was stored as an escape and the tail was

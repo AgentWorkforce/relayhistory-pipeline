@@ -394,6 +394,25 @@ describe("rule set 5: secret context runs through composite values (blocker 2)",
   });
 });
 
+// Self-adversarial set: each is no strict reference and must be redacted whole (SECRET marks a tail).
+const ADVERSARIAL: Array<[string, string]> = [
+  ["one segment (op://vault)", "op://vault"],
+  ["one segment (op://SECRET)", "op://SECRET"],
+  ["a query suffix", "op://v/i/f?attribute=otp"],
+  ["a trailing slash", "op://v/i/f/"],
+  ["an empty segment after the vault", "op://v//i/f"],
+  ["three slashes after the scheme", "op:///v/i/f"],
+  ["an empty segment in the middle", "op://v/i//f"],
+  ["a percent-encoded slash", "op://v/i/f%2Fsecret"],
+  ["a percent-encoded space", "op://v/i/f%20x"],
+  ["an uppercase scheme", "OP://v/i/f"],
+  ["a scheme without slashes", "op:vault/item/field"],
+  ["leading whitespace", " op://v/i/f"],
+  ["trailing whitespace", "op://v/i/f "],
+  ["a leading space inside a segment", "op:// v/i/f"],
+  ["a non-ASCII segment", "op://v/i/f\u00efeld"],
+];
+
 describe("rule set 5: only a strict one-line op:// reference is kept (escaped separators)", () => {
   /** The quote that opens a value at JSON escaping depth `d`: 2^d - 1 backslashes, then `"`. */
   const q = (d: number) => `${"\\".repeat(2 ** d - 1)}"`;
@@ -470,6 +489,14 @@ describe("rule set 5: only a strict one-line op:// reference is kept (escaped se
   nonconforming.push(["a tab", () => "op://vault/item\tSECRETTAIL"]);
   nonconforming.push(["a trailing space", () => "op://vault/item SECRETTAIL "]);
   nonconforming.push(["no item segment", () => "op://SECRETTAIL"]);
+  // The grammar is exactly vault/item/field or vault/item/section/field: 2 or 5+ segments are no reference.
+  nonconforming.push(["two segments", () => "op://vault/item"]);
+  nonconforming.push(["five segments", () => "op://vault/item/section/field/SECRETTAIL"]);
+  nonconforming.push(["six segments", () => "op://vault/item/section/field/x/SECRETTAIL"]);
+  nonconforming.push(["a long tail", () => "op://a/b/c/d/e/f/SECRETTAIL"]);
+  for (const [label, v] of ADVERSARIAL) nonconforming.push([label, () => v]);
+  // Depth 0 decodes `\/` to `/`; the tail has five segments so the decoded value is no reference either way (op://v\/i\/f/SECRET decodes to a legitimate four-segment reference).
+  nonconforming.push(["a backslash-escaped slash", (d) => `op://v${at(d, "\\/")}i${at(d, "\\/")}f/x/SECRET`]);
 
   for (const [label, body] of nonconforming) {
     for (const d of [0, 1, 2]) {
@@ -491,15 +518,45 @@ describe("rule set 5: only a strict one-line op:// reference is kept (escaped se
     ["an escaped quote", 'op://vault/item\\"SECRETTAIL'],
     ["a backslash", "op://vault/item\\SECRETTAIL"],
     ["a double space", "op://vault/item  SECRETTAIL"],
+    ["two segments", "op://vault/item"],
+    ["five segments", "op://vault/item/section/field/SECRETTAIL"],
+    ["six segments", "op://vault/item/section/field/x/SECRETTAIL"],
+    ["a long tail", "op://a/b/c/d/e/f/SECRETTAIL"],
+    ...ADVERSARIAL,
+    ["a backslash-escaped slash", "op://v\\/i\\/f/x/SECRET"],
+    ["a literal newline", "op://v/i/f\nSECRET"],
+    ["a literal CR", "op://v/i/f\rSECRET"],
   ]) {
     it(`key context: redacts an op:// value with ${label} in every path`, () => keyed(value as string, false));
   }
 
-  for (const ref of ["op://vault/item/field", "op://Engineering/cloudflare/credential", "op://My Vault/item name/field"]) {
+  for (const ref of ["op://vault/item/field", "op://Engineering/cloudflare/credential", "op://My Vault/item name/field", "op://vault/item/section/field"]) {
     it(`keeps ${ref} byte for byte at depths 0, 1, 2 (terminated) and under a secret key, in every path`, () => {
       expect(OP_REFERENCE.test(ref)).toBe(true);
       for (const d of [0, 1, 2]) allPaths(doc(d, ref, false), doc(d, ref, false));
       keyed(ref, true);
     });
   }
+});
+
+describe("OP_REFERENCE grammar: exactly three or four segments", () => {
+  it.each(["op://vault/item/field", "op://vault/item/section/field", "op://My Vault/item name/section 2/field"])("accepts %s", (ref) => {
+    expect(OP_REFERENCE.test(ref)).toBe(true);
+  });
+  it.each([
+    "op://vault",
+    "op://vault/item",
+    "op://vault/item/section/field/SECRETTAIL",
+    "op://vault/item/section/field/x/SECRETTAIL",
+    "op://a/b/c/d/e/f/SECRETTAIL",
+    "op://vault/item/field?attr=otp",
+    ...ADVERSARIAL.map(([, v]) => v),
+    "op://v\\/i\\/f/x/SECRET",
+    "op://v/i/f\nSECRET",
+    "op://v/i/f\rSECRET",
+    "op://vault/item/field/",
+    "op://vault//field",
+  ])("rejects %s", (ref) => {
+    expect(OP_REFERENCE.test(ref)).toBe(false);
+  });
 });
