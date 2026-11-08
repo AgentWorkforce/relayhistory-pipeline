@@ -59,20 +59,23 @@ CREATE TABLE sessions.ingest_acquisition_native_intents (
   request_sha256        text NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
   grant_ciphertext      bytea,                          -- install only: AES-256-GCM(G) || tag
   grant_nonce           bytea CHECK (grant_nonce IS NULL OR octet_length(grant_nonce) = 12),
-  status                text NOT NULL CHECK (status IN ('reserved', 'pending', 'applied', 'refused', 'void', 'stuck')),
+  status                text NOT NULL CHECK (status IN ('reserved', 'pending', 'applied', 'refused', 'void')),
   refusal_code          text,
   result                text,                           -- SQL result as text (bigints exact)
   client_operation_uuid uuid UNIQUE,                    -- revoke: the Desktop operationUuid that activated it
   activation_reason     text CHECK (activation_reason IN ('explicit_exclude', 'installation_retired', 'session_removed')),
-  attempts              integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),  -- failed sends (stuck at MAX_SEND_ATTEMPTS)
+  attempts              integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),  -- failed sends (stalled, never terminal, at MAX_SEND_ATTEMPTS)
   next_attempt_at       timestamptz NOT NULL DEFAULT clock_timestamp(),    -- reconciler backoff
   reservation           text CHECK (reservation IN ('signed', 'no_epoch', 'sign_failed')),
+  cancel_reason         text CHECK (cancel_reason IN ('explicit_exclude', 'installation_retired', 'session_removed')),  -- install: revoke on outcome
+  lease_until           timestamptz,                    -- per-intent send lease (claimSend compare-and-set)
   created_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
   updated_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
   CHECK ((kind = 'install') = (grant_ciphertext IS NOT NULL AND grant_nonce IS NOT NULL)),
   CHECK (kind = 'install' OR target_grant_id IS NOT NULL),
   CHECK (status <> 'reserved' OR kind = 'revoke'),
-  CHECK (reservation IS NULL OR kind = 'install')
+  CHECK (reservation IS NULL OR kind = 'install'),
+  CHECK (cancel_reason IS NULL OR kind = 'install')
 );
 
 -- At most one revoke (reserved, or signed at revocation time) per installed grant.
@@ -100,7 +103,9 @@ REVOKE ALL ON sessions.ingest_acquisition_native_installations,sessions.ingest_a
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder,bulls96_acquisition_installer;
 GRANT USAGE ON SCHEMA sessions TO bulls96_acquisition_installer;
 -- Exactly the DML PgAcquisitionStore issues (DEVIATION above). No DELETE, no TRUNCATE.
+-- UPDATE (retired_at) also lets createInstallIntent take SELECT ... FOR SHARE on the installation.
 GRANT SELECT, INSERT, UPDATE (retired_at) ON sessions.ingest_acquisition_native_installations TO bulls96_acquisition_installer;
 GRANT SELECT, INSERT,
- UPDATE (status, refusal_code, result, client_operation_uuid, activation_reason, attempts, next_attempt_at, reservation, updated_at)
+ UPDATE (status, refusal_code, result, client_operation_uuid, activation_reason, attempts, next_attempt_at, reservation,
+         cancel_reason, lease_until, updated_at)
  ON sessions.ingest_acquisition_native_intents TO bulls96_acquisition_installer;

@@ -107,7 +107,11 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<void>
         if (running) return;
         running = true;
         issuer.reconcile().then(
-          (r) => { if (r.sent || r.retry) log.info("acquisition reconcile", { count: r.sent, reason: `retry=${r.retry}` }); },
+          (r) => {
+            if (r.sent || r.retry) log.info("acquisition reconcile", { count: r.sent, reason: `retry=${r.retry}` });
+            // Stalled intents are never dropped (their SQL may have committed): alert, they keep retrying.
+            if (r.stalled) log.warn("acquisition reconcile stalled", { count: r.stalled, reason: "max_send_attempts" });
+          },
           (err) => log.warn("acquisition reconcile failed", errorFields(err)),
         ).finally(() => { running = false; });
       }, RECONCILE_INTERVAL_MS);

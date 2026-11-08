@@ -270,16 +270,16 @@ test("session removal and retirement activate the reserved revoke with no networ
   expect(await offline.removeSession(inst.installationId, c1.r.json.grantId)).toBe(true);
   expect(h.sql.calls.length).toBe(sqlBefore);
   // Still selected: the reconciler skips it and sends nothing.
-  expect(await h.issuer.reconcile({ stillSelected: async () => true })).toEqual({ sent: 0, skipped: 1, retry: 0, stuck: 0 });
+  expect(await h.issuer.reconcile({ stillSelected: async () => true })).toEqual({ sent: 0, skipped: 1, retry: 0, stalled: 0 });
   expect(h.sql.calls.length).toBe(sqlBefore);
-  expect(await h.issuer.reconcile()).toEqual({ sent: 0, skipped: 0, retry: 0, stuck: 0 }); // a skip defers it, uncounted
+  expect(await h.issuer.reconcile()).toEqual({ sent: 0, skipped: 0, retry: 0, stalled: 0 }); // a skip defers it, uncounted
   h.clock.now += 30_000;
-  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stuck: 0 });
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
   const revoke = h.sql.calls.at(-1)!;
   expect([revoke.fn, revoke.p.targetGrantId]).toEqual(["revoke", c1.r.json.grantId]);
   // Retirement activates the rest in one step; reconciler sends only revokes.
   expect(await offline.retireInstallation(inst.installationId)).toBe(1);
-  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stuck: 0 });
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
   expect(h.sql.calls.at(-1)!.p.targetGrantId).toBe(c2.r.json.grantId);
   expect(h.sql.calls.filter((x) => x.fn === "install").length).toBe(2);
   // A retired installation is no longer proven.
@@ -317,7 +317,7 @@ test("key rotation must retain the native key while a reserved revoke still refe
   assertKeysRetained(registry, await h.store.outstandingIssuerKeyIds(), "native");
   // Once the reserved revoke has been activated and sent, nothing references the key: it may be dropped.
   expect(await h.issuer.retireInstallation(inst.installationId)).toBe(1);
-  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stuck: 0 });
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
   expect((await h.store.outstandingIssuerKeyIds()).size).toBe(0);
   assertKeysRetained(rotated, await h.store.outstandingIssuerKeyIds(), "native");
 });
@@ -346,20 +346,22 @@ test("Postgres store extracts issuerKeyId as the last U+001F field (PGlite)", as
 const fieldsOf = (A: Uint8Array) => Buffer.from(A).toString("utf8").split("\u001f").slice(1);
 const down = () => Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
 
-test("reserved revoke is signed against the epoch the install RESULT reports (epoch+5), not an assumed epoch+1", async () => {
+test("reserved revoke is signed against the epoch the install RESULT reports (the design's exactly expectedOwnerEpoch+1)", async () => {
+  // The design mandates expectedOwnerEpoch = current and a landed epoch of exactly +1, so the
+  // reserved revoke's epoch is deterministic; the issuer still signs from the result's epoch.
   const h = nativeHarness();
-  h.sql.installEpoch = (current) => current + 5n;
   const inst = await register(h);
   const c = await claim(h, inst);
-  expect([c.r.status, c.r.json.ownerEpoch]).toEqual([200, "5"]);
+  expect(h.sql.calls.find((x) => x.fn === "install")!.p.expectedOwnerEpoch).toBe("0");
+  expect([c.r.status, c.r.json.ownerEpoch]).toEqual([200, "1"]);
   expect(h.store.intents.get(c.body.operationUuid)!.reservation).toBe("signed");
   const reserved = [...h.store.intents.values()].filter((i) => i.kind === "revoke");
   expect(reserved.length).toBe(1);
-  expect([reserved[0]!.status, fieldsOf(reserved[0]!.assertion)[7], fieldsOf(reserved[0]!.assertion)[5]]).toEqual(["reserved", "5", "2"]);
+  expect([reserved[0]!.status, fieldsOf(reserved[0]!.assertion)[7], fieldsOf(reserved[0]!.assertion)[5]]).toEqual(["reserved", "1", "2"]);
   const body = { operationUuid: randomUUID(), installationId: inst.installationId, source: "droid", sessionId: "sess-1", targetGrantId: c.body.operationUuid };
   const r = await call(h.app, "POST", `${P}/revocations`, { token: "sh_at_alice", proof: inst.proof, body });
   expect(r.status).toBe(200);
-  expect(h.sql.calls.filter((x) => x.fn === "revoke").map((x) => x.p.targetOwnerEpoch)).toEqual(["5"]);
+  expect(h.sql.calls.filter((x) => x.fn === "revoke").map((x) => x.p.targetOwnerEpoch)).toEqual(["1"]);
 });
 
 test("an install result without ownerEpoch is not pre-signed (recorded no_epoch); revoke then signs against the authority row", async () => {
@@ -388,9 +390,9 @@ test("reconciler resends a pending install and a pending rebind (same bytes, aft
   const c = await claim(h, inst);
   expect(c.r.status).toBe(503);
   expect(h.store.intents.get(c.body.operationUuid)!).toMatchObject({ status: "pending", attempts: 1 });
-  expect(await h.issuer.reconcile()).toEqual({ sent: 0, skipped: 0, retry: 0, stuck: 0 }); // backing off
+  expect(await h.issuer.reconcile()).toEqual({ sent: 0, skipped: 0, retry: 0, stalled: 0 }); // backing off
   h.clock.now += 30_000;
-  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stuck: 0 });
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
   const installs = h.sql.calls.filter((x) => x.fn === "install");
   expect([installs.length, new Set(installs.map((x) => x.p.evidenceSha256)).size]).toEqual([2, 1]);
   expect([...h.store.intents.values()].filter((i) => i.kind === "revoke" && i.status === "reserved").length).toBe(1);
@@ -405,13 +407,13 @@ test("reconciler resends a pending install and a pending rebind (same bytes, aft
   const other = await call(h.app, "POST", `${P}/rebinds`, { token: "sh_at_alice", proof: inst.proof, body: { ...base, operationUuid: randomUUID() } });
   expect(other.json.error.reason).toBe("session_busy");
   h.clock.now += 30_000;
-  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stuck: 0 });
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
   const again = await call(h.app, "POST", `${P}/rebinds`, { token: "sh_at_alice", proof: inst.proof, body: first });
   expect([again.status, again.json.outcome]).toEqual([200, "replay"]);
   expect(h.sql.calls.filter((x) => x.fn === "rebind_origin").length).toBe(2);
 });
 
-test("bounded attempts: an install that keeps failing becomes stuck, leaves key retention, and a revoke still proceeds", async () => {
+test("stalled, never terminal: an install failing MAX_SEND_ATTEMPTS times keeps its key and keeps retrying (alerted), replays answer 503, a revoke still proceeds", async () => {
   const h = nativeHarness();
   const inst = await register(h);
   h.sql.failNext(down(), "install");
@@ -424,28 +426,44 @@ test("bounded attempts: an install that keeps failing becomes stuck, leaves key 
     h.sql.failNext(pgError("40001", "session_busy"), "install");
     results.push(await h.issuer.reconcile());
   }
-  expect(results.at(-2)).toEqual({ sent: 0, skipped: 0, retry: 1, stuck: 0 });
-  expect(results.at(-1)).toEqual({ sent: 0, skipped: 0, retry: 0, stuck: 1 });
-  expect(h.store.intents.get(c.body.operationUuid)!).toMatchObject({ status: "stuck", attempts: 8 });
-  expect((await h.store.outstandingIssuerKeyIds()).size).toBe(0);
-  h.clock.now += 3_600_000;
-  expect(await h.issuer.reconcile()).toEqual({ sent: 0, skipped: 0, retry: 0, stuck: 0 });
-  expect(h.sql.calls.filter((x) => x.fn === "install").length).toBe(8);
+  expect(results.at(-2)).toEqual({ sent: 0, skipped: 0, retry: 1, stalled: 0 });
+  expect(results.at(-1)).toEqual({ sent: 0, skipped: 0, retry: 1, stalled: 1 }); // the caller alerts
+  expect(h.store.intents.get(c.body.operationUuid)!).toMatchObject({ status: "pending", attempts: 8, leaseUntil: null });
+  // Its SQL may have committed: the intent, its G and its key stay (G recovery by replay remains possible).
+  expect(h.store.intents.get(c.body.operationUuid)!.grantCiphertext).not.toBeNull();
+  expect([...(await h.store.outstandingIssuerKeyIds())]).toEqual(["native-key-1"]);
+  // Still retried, at the 1 h cap.
+  h.clock.now += 3_599_999;
+  expect(await h.issuer.reconcile()).toEqual({ sent: 0, skipped: 0, retry: 0, stalled: 0 });
+  h.clock.now += 1;
+  h.sql.failNext(down(), "install");
+  expect(await h.issuer.reconcile()).toEqual({ sent: 0, skipped: 0, retry: 1, stalled: 1 });
+  expect(h.sql.calls.filter((x) => x.fn === "install").length).toBe(9);
+  // A replay before it is due answers retryable 503 (no attempt spent), never a terminal refusal.
   const replay = await call(h.app, "POST", `${P}/claims`, { token: "sh_at_alice", proof: inst.proof, body: c.body });
-  expect([replay.status, replay.json]).toEqual([409, { error: { code: "acquisition_refused", reason: "operation_stuck", retryable: false } }]);
-  // Revoke is not session_busy forever. The authority does not hold this grant -> 409 grant_not_installed.
+  expect([replay.status, replay.json]).toEqual([503, { error: { code: "acquisition_unavailable", retryable: true } }]);
+  expect(h.store.intents.get(c.body.operationUuid)!.attempts).toBe(9);
+  // Revoke is not session_busy forever. The authority does not hold this grant -> 409 grant_not_installed,
+  // and the exclude is recorded on the install so a late apply creates its revoke active.
   const body = { operationUuid: randomUUID(), installationId: inst.installationId, source: "droid", sessionId: "sess-1", targetGrantId: c.body.operationUuid };
   const none = await call(h.app, "POST", `${P}/revocations`, { token: "sh_at_alice", proof: inst.proof, body });
   expect([none.status, none.json.error.reason]).toEqual([409, "grant_not_installed"]);
+  expect(h.store.intents.get(c.body.operationUuid)!.cancelReason).toBe("explicit_exclude");
   // The grant did land (the answer was lost): the revoke signs against the authority row and is sent.
   h.sql.sessions.set("droid/sess-1", { state: "active", revision: "1", tombstoneRevision: null, ownerEpoch: "7", ownerKind: "native", grantId: c.body.operationUuid });
   const ok = await call(h.app, "POST", `${P}/revocations`, { token: "sh_at_alice", proof: inst.proof, body: { ...body, operationUuid: randomUUID() } });
   expect([ok.status, ok.json.outcome]).toEqual([200, "draining"]);
   expect(h.sql.calls.filter((x) => x.fn === "revoke").map((x) => [x.p.targetOwnerEpoch, x.p.revision])).toEqual([["7", "2"]]);
+  // The install's resend later answers: applied, and the existing revoke is kept (one revoke per grant).
+  h.clock.now += 3_600_000;
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
+  expect(h.store.intents.get(c.body.operationUuid)!.status).toBe("applied");
+  expect([...h.store.intents.values()].filter((i) => i.kind === "revoke" && i.targetGrantId === c.body.operationUuid).map((i) => i.status)).toEqual(["applied"]);
+  expect((await h.store.outstandingIssuerKeyIds()).size).toBe(0);
   expect(leaks(allLogs(h))).toEqual([]);
 });
 
-test("no starvation: 100 poisoned pending revokes do not block a later revoke; each is bounded and ends stuck", async () => {
+test("no starvation: 100 poisoned pending revokes do not block a later revoke; each stays pending (stalled, alerted) and keeps its key", async () => {
   const h = nativeHarness();
   const a = await register(h);
   for (let i = 0; i < 100; i++) expect((await claim(h, a, { sessionId: `sess-p${i}` })).r.status).toBe(200);
@@ -457,19 +475,156 @@ test("no starvation: 100 poisoned pending revokes do not block a later revoke; e
   const good = await claim(h, b, { sessionId: "sess-good" });
   expect(await h.issuer.retireInstallation(b.installationId)).toBe(1);
   const first = await h.issuer.reconcile({ limit: 100 });
-  expect(first).toEqual({ sent: 0, skipped: 0, retry: 100, stuck: 0 });
+  expect(first).toEqual({ sent: 0, skipped: 0, retry: 100, stalled: 0 });
   const second = await h.issuer.reconcile({ limit: 100 }); // the poisoned ones are backing off: the later revoke is next
-  expect(second).toEqual({ sent: 1, skipped: 0, retry: 0, stuck: 0 });
+  expect(second).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
   expect(h.sql.calls.filter((x) => x.fn === "revoke").map((x) => x.p.targetGrantId)).toEqual([good.body.operationUuid]);
-  let stuckTotal = 0;
+  const passes = [];
   for (let pass = 0; pass < 10; pass++) {
     h.clock.now += 3_600_000;
-    stuckTotal += (await h.issuer.reconcile({ limit: 100 })).stuck;
+    passes.push(await h.issuer.reconcile({ limit: 100 }));
   }
-  expect(stuckTotal).toBe(100);
-  expect([...h.store.intents.values()].filter((i) => i.kind === "revoke" && i.status === "stuck").length).toBe(100);
+  // Attempts 2..11: stalled from the 8th failure on, every pass after that.
+  expect(passes.map((p) => p.stalled)).toEqual([0, 0, 0, 0, 0, 0, 100, 100, 100, 100]);
+  expect(passes.at(-1)).toEqual({ sent: 0, skipped: 0, retry: 100, stalled: 100 });
+  const poisoned = [...h.store.intents.values()].filter((i) => i.kind === "revoke" && i.status === "pending");
+  expect([poisoned.length, new Set(poisoned.map((i) => i.attempts))]).toEqual([100, new Set([11])]);
   expect(h.sql.calls.filter((x) => x.fn === "revoke").length).toBe(1); // a bad stored intent never reaches SQL
+  expect([...(await h.store.outstandingIssuerKeyIds())]).toEqual(["native-key-1"]);
+});
+
+// ------------------------------------------------------------ lifecycle races (F1) and the send lease (F3)
+
+const revokesOf = (h: H, grantId: string) => [...h.store.intents.values()].filter((i) => i.kind === "revoke" && i.targetGrantId === grantId);
+
+test("lost install response: the reconciler resends the same bytes, the SQL replays, the install is applied and its revoke reserved", async () => {
+  const h = nativeHarness();
+  const inst = await register(h);
+  h.sql.loseNext("install");
+  const c = await claim(h, inst);
+  expect(c.r.status).toBe(503);
+  expect(h.sql.sessions.get("droid/sess-1")!.grantId).toBe(c.body.operationUuid); // it committed
+  expect(h.store.intents.get(c.body.operationUuid)!).toMatchObject({ status: "pending", attempts: 1, leaseUntil: null });
+  expect(revokesOf(h, c.body.operationUuid).length).toBe(0);
+  h.clock.now += 30_000;
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
+  const installs = h.sql.calls.filter((x) => x.fn === "install");
+  expect([installs.length, new Set(installs.map((x) => x.p.evidenceSha256)).size]).toEqual([2, 1]);
+  expect(h.store.intents.get(c.body.operationUuid)!.status).toBe("applied");
+  const reserved = revokesOf(h, c.body.operationUuid);
+  expect([reserved.length, reserved[0]!.status, fieldsOf(reserved[0]!.assertion)[7]]).toEqual([1, "reserved", "1"]);
+  const replay = await call(h.app, "POST", `${P}/claims`, { token: "sh_at_alice", proof: inst.proof, body: c.body });
+  expect([replay.status, replay.json.grantId, replay.json.ownerEpoch]).toEqual([200, c.body.operationUuid, "1"]);
+  secrets.add(replay.json.grant);
+});
+
+test("retirement after a lost install response: the late apply creates the revoke ACTIVE (installation_retired) and the reconciler sends it", async () => {
+  const h = nativeHarness();
+  const inst = await register(h);
+  h.sql.loseNext("install");
+  const c = await claim(h, inst);
+  expect(c.r.status).toBe(503);
+  // No reserved revoke exists yet: retirement records the cancel on the pending install.
+  expect(await h.issuer.retireInstallation(inst.installationId)).toBe(1);
+  expect(h.store.intents.get(c.body.operationUuid)!.cancelReason).toBe("installation_retired");
+  h.clock.now += 30_000;
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 }); // the install replays
+  const [revoke] = revokesOf(h, c.body.operationUuid);
+  expect([revoke!.status, revoke!.activationReason]).toEqual(["pending", "installation_retired"]);
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
+  expect(h.sql.calls.filter((x) => x.fn === "revoke").map((x) => [x.p.targetGrantId, x.p.targetOwnerEpoch])).toEqual([[c.body.operationUuid, "1"]]);
+  expect(h.sql.sessions.get("droid/sess-1")!.state).toBe("draining");
   expect((await h.store.outstandingIssuerKeyIds()).size).toBe(0);
+});
+
+test("session removal of a still-pending install records it; the late apply creates the revoke active (session_removed)", async () => {
+  const h = nativeHarness();
+  const inst = await register(h);
+  h.sql.loseNext("install");
+  const c = await claim(h, inst);
+  expect(c.r.status).toBe(503);
+  expect(await h.issuer.removeSession(inst.installationId, c.body.operationUuid)).toBe(true);
+  expect(await h.issuer.removeSession("other-installation", c.body.operationUuid)).toBe(false); // scoped to its installation
+  expect(await h.issuer.removeSession(inst.installationId, randomUUID())).toBe(false);
+  expect(h.store.intents.get(c.body.operationUuid)!.cancelReason).toBe("session_removed");
+  h.clock.now += 30_000;
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
+  const [revoke] = revokesOf(h, c.body.operationUuid);
+  expect([revoke!.status, revoke!.activationReason]).toEqual(["pending", "session_removed"]);
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
+  expect(h.sql.calls.filter((x) => x.fn === "revoke").map((x) => x.p.targetGrantId)).toEqual([c.body.operationUuid]);
+});
+
+test("retirement while a claim awaits status: createInstallIntent refuses it (403 installation_not_proven), no intent, no install sent", async () => {
+  const h = nativeHarness();
+  const inst = await register(h);
+  const held = h.sql.hold("status");
+  const pending = claim(h, inst);
+  await held.reached;
+  expect(await h.issuer.retireInstallation(inst.installationId)).toBe(0);
+  held.release();
+  const c = await pending;
+  expect([c.r.status, c.r.json]).toEqual([403, { error: { code: "installation_not_proven" } }]);
+  expect(h.store.intents.has(c.body.operationUuid)).toBe(false);
+  expect(h.sql.calls.filter((x) => x.fn === "install").length).toBe(0);
+});
+
+test("retirement while the install SQL is in flight: the apply creates the revoke active and the reconciler sends it", async () => {
+  const h = nativeHarness();
+  const inst = await register(h);
+  const held = h.sql.hold("install");
+  const pending = claim(h, inst);
+  await held.reached;
+  expect(await h.issuer.retireInstallation(inst.installationId)).toBe(1);
+  held.release();
+  const c = await pending;
+  expect(c.r.status).toBe(200);
+  const [revoke] = revokesOf(h, c.body.operationUuid);
+  expect([revoke!.status, revoke!.activationReason]).toEqual(["pending", "installation_retired"]);
+  expect(await h.issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
+  expect(h.sql.calls.filter((x) => x.fn === "revoke").map((x) => x.p.targetGrantId)).toEqual([c.body.operationUuid]);
+});
+
+test("send lease: concurrent replays and the reconciler never send one intent twice at once, and do not spend attempts", async () => {
+  const h = nativeHarness();
+  const inst = await register(h);
+  const body = { operationUuid: randomUUID(), installationId: inst.installationId, source: "droid", sessionId: "sess-1", originId: "origin_a" };
+  const post = () => call(h.app, "POST", `${P}/claims`, { token: "sh_at_alice", proof: inst.proof, body });
+  const held = h.sql.hold("install");
+  const first = post();
+  await held.reached;
+  // attempts is still 0 (no backoff applies): only the lease stops these from sending.
+  const replays = await Promise.all([post(), post(), post()]);
+  expect(replays.map((r) => [r.status, r.json])).toEqual(Array(3).fill([503, { error: { code: "acquisition_unavailable", retryable: true } }]));
+  expect(await h.issuer.reconcile()).toEqual({ sent: 0, skipped: 0, retry: 0, stalled: 0 }); // leased: not due
+  expect(h.store.intents.get(body.operationUuid)!.attempts).toBe(0);
+  expect(h.sql.calls.filter((x) => x.fn === "install").length).toBe(1);
+  held.release();
+  const answered = await first;
+  expect(answered.status).toBe(200);
+  secrets.add(answered.json.grant);
+  expect(h.store.intents.get(body.operationUuid)!.leaseUntil).toBeNull();
+  const again = await post();
+  expect([again.status, again.json.outcome, again.json.grant]).toEqual([200, "replay", answered.json.grant]);
+  expect(h.sql.calls.filter((x) => x.fn === "install").length).toBe(1);
+});
+
+test("send lease (memory store): CAS, released by the outcome, and reclaimable once it expires (a crashed sender)", async () => {
+  const h = nativeHarness();
+  const inst = await register(h);
+  h.sql.failNext(down(), "install");
+  const c = await claim(h, inst);
+  const op = c.body.operationUuid;
+  expect(await h.store.claimSend(op, 1_000)).toBeNull(); // backing off
+  h.clock.now += 30_000;
+  const lease = (await h.store.claimSend(op, 1_000))!;
+  expect(lease.leaseUntil).toBe(h.clock.now + 1_000);
+  expect(await h.store.claimSend(op, 1_000)).toBeNull();
+  expect(await h.store.dueIntents(10)).toEqual([]);
+  h.clock.now += 1_000;
+  expect((await h.store.claimSend(op, 1_000))!.leaseUntil).toBe(h.clock.now + 1_000); // expired: taken over
+  expect(await h.store.markRetry(op)).toBe("pending");
+  expect(h.store.intents.get(op)!.leaseUntil).toBeNull();
 });
 
 test("proposed DDL (PGlite): role checks 42704/55000, installer-only grants, and PgAcquisitionStore end to end", async () => {
@@ -518,16 +673,15 @@ test("proposed DDL (PGlite): role checks 42704/55000, installer-only grants, and
     const inst = await issuer.registerInstallation(id, { requestUuid: randomUUID(), originId: "origin_a", installationProof: newProof() });
     const installation = (await store.getInstallation(inst.installationId))!;
 
-    // epoch+5 install: applied and its reserved revoke inserted in one transaction.
-    fake.installEpoch = (c) => c + 5n;
+    // An install (landing at expectedOwnerEpoch+1): applied and its reserved revoke inserted in one transaction.
     const op = randomUUID();
     const answer = await issuer.claim(id, installation, { operationUuid: op, installationId: inst.installationId, source: "droid", sessionId: "s1", originId: "origin_a" });
     secrets.add(String(answer.grant));
-    expect([answer.ownerEpoch, (await store.getIntent(op))!.reservation]).toEqual(["5", "signed"]);
+    expect([answer.ownerEpoch, (await store.getIntent(op))!.reservation]).toEqual(["1", "signed"]);
     const reserved = (await store.reservedRevokeFor(op))!;
-    expect([reserved.status, Buffer.from(reserved.assertion).toString("utf8").split("\u001f")[8]]).toEqual(["reserved", "5"]);
+    expect([reserved.status, Buffer.from(reserved.assertion).toString("utf8").split("\u001f")[8]]).toEqual(["reserved", "1"]);
 
-    // A failing install: bounded retries, then stuck and out of key retention.
+    // A failing install: backoff, then stalled at MAX_SEND_ATTEMPTS but never terminal, keys retained.
     const bad = randomUUID();
     fake.failNext(Object.assign(new Error("down"), { code: "ECONNREFUSED" }), "install");
     await expect(issuer.claim(id, installation, { operationUuid: bad, installationId: inst.installationId, source: "droid", sessionId: "s2", originId: "origin_a" })).rejects.toThrow();
@@ -535,15 +689,44 @@ test("proposed DDL (PGlite): role checks 42704/55000, installer-only grants, and
     expect([after1.status, after1.attempts, after1.nextAttemptAt - Date.now() > 20_000]).toEqual(["pending", 1, true]);
     expect((await store.dueIntents(10)).map((i) => i.operationUuid)).toEqual([]); // backing off
     for (let i = 1; i < MAX_SEND_ATTEMPTS; i++) await store.markRetry(bad);
-    expect((await store.getIntent(bad))!).toMatchObject({ status: "stuck", attempts: MAX_SEND_ATTEMPTS });
-    expect(await store.markRetry(bad)).toBe("stuck"); // terminal: no further counting
-    expect([...(await store.outstandingIssuerKeyIds())]).toEqual(["native-key-1"]); // only the reserved revoke
+    expect((await store.getIntent(bad))!).toMatchObject({ status: "pending", attempts: MAX_SEND_ATTEMPTS, leaseUntil: null });
+    expect(await store.markRetry(bad)).toBe("pending"); // still counted, still pending
+    expect((await store.getIntent(bad))!.attempts).toBe(MAX_SEND_ATTEMPTS + 1);
+    expect([...(await store.outstandingIssuerKeyIds())]).toEqual(["native-key-1"]); // reserved revoke + stalled install
 
-    // Retirement activates the reserved revoke; it is due at once and the reconciler sends it.
-    expect(await issuer.retireInstallation(inst.installationId)).toBe(1);
+    // Send lease (CAS): a pending intent not yet due cannot be claimed; once due, exactly one claimSend wins.
+    expect(await store.claimSend(bad, 300_000)).toBeNull();
+    await db.exec("RESET ROLE");
+    await db.query("UPDATE sessions.ingest_acquisition_native_intents SET next_attempt_at = clock_timestamp() - interval '1 second' WHERE operation_uuid = $1", [bad]);
+    await db.exec("SET ROLE bulls96_acquisition_installer");
+    const lease = (await store.claimSend(bad, 300_000))!;
+    expect(lease.leaseUntil! - Date.now()).toBeGreaterThan(200_000);
+    expect(await store.claimSend(bad, 300_000)).toBeNull(); // held
+    expect((await store.dueIntents(10)).map((i) => i.operationUuid)).toEqual([]); // leased rows are not due
+    expect(await store.markRetry(bad)).toBe("pending"); // releases the lease and backs off
+    expect((await store.getIntent(bad))!.leaseUntil).toBeNull();
+    expect(await store.claimSend(bad, 300_000)).toBeNull(); // backoff gates the next claim
+
+    // Retirement: cancels the pending install and activates the reserved revoke (one transaction).
+    expect(await issuer.retireInstallation(inst.installationId)).toBe(2);
+    expect((await store.getIntent(bad))!.cancelReason).toBe("installation_retired");
     expect((await store.dueIntents(10)).map((i) => i.operationUuid)).toEqual([reserved.operationUuid]);
-    expect(await issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stuck: 0 });
-    expect(fake.calls.filter((c) => c.fn === "revoke").map((c) => c.p.targetOwnerEpoch)).toEqual(["5"]);
+    expect(await issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
+    expect(fake.calls.filter((c) => c.fn === "revoke").map((c) => c.p.targetOwnerEpoch)).toEqual(["1"]);
+    // A claim after retirement is fenced by createInstallIntent; a replay of an existing op is still answered.
+    await expect(store.createInstallIntent({ ...(await store.getIntent(op))!, operationUuid: randomUUID() } as never)).rejects.toMatchObject({ code: "installation_retired" });
+    expect((await store.createInstallIntent({ ...(await store.getIntent(op))! } as never)).created).toBe(false);
+
+    // The cancelled install's late answer: applied, and its revoke inserted pending (installation_retired), sent next pass.
+    await db.exec("RESET ROLE");
+    await db.query("UPDATE sessions.ingest_acquisition_native_intents SET next_attempt_at = clock_timestamp() - interval '1 second' WHERE operation_uuid = $1", [bad]);
+    await db.exec("SET ROLE bulls96_acquisition_installer");
+    expect(await issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
+    expect((await store.getIntent(bad))!.status).toBe("applied");
+    const lateRevoke = (await store.reservedRevokeFor(bad))!;
+    expect([lateRevoke.status, lateRevoke.activationReason]).toEqual(["pending", "installation_retired"]);
+    expect(await issuer.reconcile()).toEqual({ sent: 1, skipped: 0, retry: 0, stalled: 0 });
+    expect(fake.calls.filter((c) => c.fn === "revoke").map((c) => c.p.targetGrantId)).toEqual([op, bad]);
     expect((await store.outstandingIssuerKeyIds()).size).toBe(0);
   } finally {
     await db.close();

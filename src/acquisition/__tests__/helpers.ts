@@ -76,7 +76,10 @@ type Row = { state: string; revision: string; tombstoneRevision: string | null; 
 /**
  * A tiny in-memory model of the four §3.1 functions. Returns jsonb TEXT as
  * Postgres prints it (bigints as bare numbers). `failNext` injects a driver
- * error ({code: sqlstate, message}) for the next call to a function.
+ * error ({code: sqlstate, message}) for the next call to a function (not
+ * applied); `loseNext` applies the next call and then loses its response;
+ * `hold` parks the next call until released. Install is idempotent by
+ * operationUuid like the SQL: a resend answers the same result as `replay`.
  */
 export class FakeSql implements AcquisitionSqlExecutor {
   readonly calls: Array<{ fn: SqlFunction; p: Readonly<Record<string, unknown>> }> = [];
@@ -84,17 +87,51 @@ export class FakeSql implements AcquisitionSqlExecutor {
   readonly failures: Array<{ fn?: SqlFunction; error: unknown }> = [];
   /** Raw text override for status (bigint tests). */
   statusText: string | null = null;
-  /** The epoch an install lands at (default current + 1); returning null omits ownerEpoch from the result. */
+  /** The epoch an install lands at (default current + 1, the design contract); returning null omits ownerEpoch from the result. */
   installEpoch: ((current: bigint) => bigint | null) | null = null;
+  /** Install results by operationUuid (the SQL's idempotency). */
+  readonly installed = new Map<string, string>();
+  private readonly losses: SqlFunction[] = [];
+  private readonly holds: Array<{ fn: SqlFunction; arrived: () => void; gate: Promise<void> }> = [];
 
   failNext(error: unknown, fn?: SqlFunction) {
     this.failures.push({ fn, error });
   }
 
+  /** The next call to `fn` commits, then its response is lost (a connection reset). */
+  loseNext(fn: SqlFunction) {
+    this.losses.push(fn);
+  }
+
+  /** Park the next call to `fn` before it applies: `reached` resolves when it arrives, `release` lets it run. */
+  hold(fn: SqlFunction): { reached: Promise<void>; release: () => void } {
+    let arrived!: () => void, release!: () => void;
+    const reached = new Promise<void>((r) => (arrived = r));
+    const gate = new Promise<void>((r) => (release = r));
+    this.holds.push({ fn, arrived, gate });
+    return { reached, release };
+  }
+
   async call(fn: SqlFunction, p: Readonly<Record<string, unknown>>): Promise<string> {
     this.calls.push({ fn, p });
+    const h = this.holds.findIndex((x) => x.fn === fn);
+    if (h >= 0) {
+      const held = this.holds.splice(h, 1)[0]!;
+      held.arrived();
+      await held.gate;
+    }
     const i = this.failures.findIndex((f) => f.fn === undefined || f.fn === fn);
     if (i >= 0) throw this.failures.splice(i, 1)[0]!.error;
+    const out = this.apply(fn, p);
+    const l = this.losses.indexOf(fn);
+    if (l >= 0) {
+      this.losses.splice(l, 1);
+      throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+    }
+    return out;
+  }
+
+  private apply(fn: SqlFunction, p: Readonly<Record<string, unknown>>): string {
     const key = (sessionId: unknown) => `${String(p.source)}/${String(sessionId)}`;
     if (fn === "status") {
       if (this.statusText !== null) return this.statusText;
@@ -109,11 +146,15 @@ export class FakeSql implements AcquisitionSqlExecutor {
     const k = key(p.sessionId);
     const current = this.sessions.get(k);
     if (fn === "install") {
+      const prior = this.installed.get(String(p.operationUuid));
+      if (prior) return prior.replace(`"outcome":"installed"`, `"outcome":"replay"`);
       const landed = this.installEpoch ? this.installEpoch(BigInt(current?.ownerEpoch ?? "0")) : BigInt(current?.ownerEpoch ?? "0") + 1n;
       const epoch = (landed ?? BigInt(current?.ownerEpoch ?? "0") + 1n).toString();
       this.sessions.set(k, { state: "active", revision: String(p.revision), tombstoneRevision: null, ownerEpoch: epoch, ownerKind: String(p.ownerKind), grantId: String(p.operationUuid) });
       const epochField = landed === null ? "" : `"ownerEpoch":${epoch},`;
-      return `{"outcome":"installed","grantId":${JSON.stringify(p.operationUuid)},${epochField}"revision":${p.revision},"state":"active"}`;
+      const result = `{"outcome":"installed","grantId":${JSON.stringify(p.operationUuid)},${epochField}"revision":${p.revision},"state":"active"}`;
+      this.installed.set(String(p.operationUuid), result);
+      return result;
     }
     if (fn === "revoke") {
       const revision = (BigInt(current?.revision ?? "0") > BigInt(String(p.revision)) ? current!.revision : String(p.revision));

@@ -18,8 +18,17 @@
  * revoke then signs against the authority's current row. Activation
  * (explicit exclude, session removal, installation retirement) is a local
  * row update. The reconciler resends every due pending intent (install,
- * rebind, revoke; revokes never while still selected) with bounded backoff;
- * after MAX_SEND_ATTEMPTS an intent is `stuck` (terminal, 409 operation_stuck).
+ * rebind, revoke; revokes never while still selected) with capped backoff. A
+ * failed send is never terminal (the SQL may have committed): after
+ * MAX_SEND_ATTEMPTS the intent is only stalled (alerted; still retried, still
+ * holding its key; an explicit revoke of a stalled install may proceed).
+ * Every send holds the intent's store lease (claimSend), so concurrent
+ * replays and reconcilers never send one intent twice at once.
+ *
+ * Cancellation ordering: retirement and session removal of a still-pending
+ * install record a cancel on it (store-serialized with its apply), so the
+ * revoke is created active when its outcome arrives; a claim whose
+ * installation is retired after proof is refused by createInstallIntent.
  */
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
@@ -43,7 +52,9 @@ import type { IssuerSigner } from "./key-registry.ts";
 import {
   decryptGrant,
   encryptGrant,
+  MAX_SEND_ATTEMPTS,
   RETRY_BASE_MS,
+  SEND_LEASE_MS,
   StoreConflict,
   type AcquisitionStore,
   type ActivationReason,
@@ -155,7 +166,8 @@ const plusOne = (decimal: string) => (BigInt(decimal) + 1n).toString();
 const asString = (v: unknown): string | null => (typeof v === "string" ? v : null);
 /** A canonical non-negative int64 decimal string, else null. */
 const int64 = (v: unknown): string | null => (typeof v === "string" && /^(0|[1-9][0-9]{0,18})$/.test(v) && BigInt(v) <= MAX_BIGINT ? v : null);
-const stuck = () => refused("operation_stuck");
+/** A pending intent past MAX_SEND_ATTEMPTS failures: alerted and revocable, still retried (never terminal). */
+const isStalled = (record: IntentRecord) => record.status === "pending" && record.attempts >= MAX_SEND_ATTEMPTS;
 
 export interface NativeIssuerOptions {
   readonly store: AcquisitionStore;
@@ -257,9 +269,16 @@ export class NativeIssuer {
     });
     const sealed = encryptGrant(this.intentKey, G, operationUuid, installation.installationId);
     // The reserved revoke is signed only once the install result names the epoch (send -> reserveRevoke).
-    const { record, created } = await this.store.createInstallIntent(this.newIntent("install", install, scope, installation.installationId, null, originId, sealed));
-    if (!created) return this.replayClaim(record, installation, scope, originId);
-    return this.claimAnswer(await this.send(record), installation);
+    let created: { record: IntentRecord; created: boolean };
+    try {
+      // Refused if the installation was retired while status was awaited (after proveInstallation).
+      created = await this.store.createInstallIntent(this.newIntent("install", install, scope, installation.installationId, null, originId, sealed));
+    } catch (error) {
+      if (error instanceof StoreConflict && error.code === "installation_retired") throw notProven();
+      throw error;
+    }
+    if (!created.created) return this.replayClaim(created.record, installation, scope, originId);
+    return this.claimAnswer(await this.sendLeased(created.record), installation);
   }
 
   private async replayClaim(existing: IntentRecord, installation: InstallationRecord, scope: GrantScope, originId: string) {
@@ -269,13 +288,12 @@ export class NativeIssuer {
       existing.originId === originId;
     if (!same) throw refused("operation_conflict");
     const wasApplied = existing.status === "applied";
-    return this.claimAnswer(await this.sendIfDue(existing), installation, wasApplied);
+    return this.claimAnswer(await this.sendLeased(existing), installation, wasApplied);
   }
 
   /** `replay`: the install had already been applied before this request, so the answer is an exact replay. */
   private claimAnswer(record: IntentRecord, installation: InstallationRecord, replay = false): Record<string, unknown> {
     if (record.status === "refused") throw refused(record.refusalCode ?? "operation_conflict");
-    if (record.status === "stuck") throw stuck();
     if (record.status !== "applied" || !record.result || !record.grantCiphertext || !record.grantNonce) throw new AcquisitionUnavailableError();
     if (record.installationId !== installation.installationId) throw refused("operation_conflict");
     const result = JSON.parse(record.result) as Record<string, unknown>;
@@ -309,15 +327,18 @@ export class NativeIssuer {
     let activated: IntentRecord;
     try {
       if (reserved && reserved.status !== "void") activated = await this.store.activateRevoke(reserved.operationUuid, "explicit_exclude", clientOperationUuid);
-      else if (!reserved && (install.status === "stuck" || install.reservation !== "signed")) activated = await this.unreservedRevoke(install, clientOperationUuid);
+      else if (!reserved && (install.status === "pending" || install.reservation !== "signed")) activated = await this.unreservedRevoke(install, clientOperationUuid);
       else throw notAuthorized();
     } catch (error) {
       if (error instanceof StoreConflict) throw refused("operation_conflict");
+      // A stalled install whose grant has not landed (yet): record the exclude so a late apply
+      // creates its revoke active, then answer grant_not_installed as before.
+      if (error instanceof NativeRefusal && error.body.error.reason === "grant_not_installed" && install.status === "pending")
+        await this.store.cancelGrant(install.installationId, install.operationUuid, "explicit_exclude");
       throw error;
     }
-    const record = await this.sendIfDue(activated);
+    const record = await this.sendLeased(activated);
     if (record.status === "refused") throw refused(record.refusalCode ?? "operation_conflict");
-    if (record.status === "stuck") throw stuck();
     if (record.status !== "applied" || !record.result) throw new AcquisitionUnavailableError();
     const r = JSON.parse(record.result) as Record<string, unknown>;
     const outcome = prior ? "replay" : asString(r.outcome);
@@ -326,23 +347,23 @@ export class NativeIssuer {
 
   /**
    * The applied install of `grantId` issued to this installation for this
-   * session, else 403/409. `allowStuck` (revocation only): a stuck install is
-   * returned too, since its grant may have landed and must stay revocable.
+   * session, else 403/409. `allowStalled` (revocation only): a stalled pending
+   * install is returned too, since its grant may have landed and must stay
+   * revocable; a pending one not yet stalled is 409 session_busy (retryable).
    */
-  private async ownedInstall(identity: NativeIdentity, installation: InstallationRecord, grantId: string, source: string, sessionId: string, allowStuck = false): Promise<IntentRecord> {
+  private async ownedInstall(identity: NativeIdentity, installation: InstallationRecord, grantId: string, source: string, sessionId: string, allowStalled = false): Promise<IntentRecord> {
     const install = await this.store.getIntent(grantId);
     if (!install || install.kind !== "install" || install.installationId !== installation.installationId) throw notAuthorized();
     if (install.orgId !== identity.orgId || install.workspaceId !== identity.workspaceId || install.source !== source || install.sessionId !== sessionId)
       throw new NativeRefusal(403, { error: { code: "target_mismatch" } });
+    if (install.status === "pending" && allowStalled && isStalled(install)) return install;
     if (install.status === "pending") throw refused("session_busy");
-    if (install.status === "stuck" && allowStuck) return install;
-    if (install.status === "stuck") throw stuck();
     if (install.status !== "applied") throw notAuthorized();
     return install;
   }
 
   /**
-   * Revoke a grant that has no reserved revoke (its install is stuck, or its
+   * Revoke a grant that has no reserved revoke (its install is stalled, or its
    * result carried no epoch): sign now against the authority's current row,
    * only if that row is this grant (else 409 grant_not_installed).
    */
@@ -378,8 +399,7 @@ export class NativeIssuer {
     if (existing) {
       if (existing.kind !== "rebind" || existing.installationId !== installation.installationId || existing.targetGrantId !== grantId || existing.originId !== newOriginId)
         throw refused("operation_conflict");
-      if (existing.status === "stuck") throw stuck();
-      return this.rebindAnswer(await this.sendIfDue(existing), true);
+      return this.rebindAnswer(await this.sendLeased(existing), true);
     }
     if (await this.store.pendingRebindFor(grantId, operationUuid)) throw refused("session_busy");
     const oldOriginId = await this.store.currentOrigin(grantId);
@@ -396,12 +416,11 @@ export class NativeIssuer {
     });
     const { record, created } = await this.store.createRebindIntent(this.newIntent("rebind", payload, scope, installation.installationId, grantId, newOriginId, null));
     if (!created && (record.installationId !== installation.installationId || record.originId !== newOriginId)) throw refused("operation_conflict");
-    return this.rebindAnswer(await this.send(record), !created);
+    return this.rebindAnswer(await this.sendLeased(record), !created);
   }
 
   private rebindAnswer(record: IntentRecord, replay: boolean): Record<string, unknown> {
     if (record.status === "refused") throw refused(record.refusalCode ?? "operation_conflict");
-    if (record.status === "stuck") throw stuck();
     if (record.status !== "applied" || !record.result) throw new AcquisitionUnavailableError();
     const r = JSON.parse(record.result) as Record<string, unknown>;
     return { outcome: replay ? "replay" : asString(r.outcome), revision: asString(r.revision), ownerEpoch: asString(r.ownerEpoch) };
@@ -429,35 +448,41 @@ export class NativeIssuer {
 
   // ------------------------------------------------------------ durable cleanup
 
-  /** Membership removal: activate the grant's reserved revoke. Local only: no network, no private key. */
+  /**
+   * Membership removal: activate the grant's reserved revoke, or, while its
+   * install is still pending (in flight, lost response, stalled), record the
+   * removal on the install so its revoke is created active when the outcome
+   * arrives. Local only: no network, no private key.
+   */
   async removeSession(installationId: string, grantId: string): Promise<boolean> {
-    const reserved = await this.store.reservedRevokeFor(grantId);
-    if (!reserved || reserved.installationId !== installationId || reserved.status !== "reserved") return false;
-    await this.store.activateRevoke(reserved.operationUuid, "session_removed", null);
-    return true;
+    return (await this.store.cancelGrant(installationId, grantId, "session_removed")) !== "none";
   }
 
-  /** Installation retirement: retire and activate every reserved revoke of it, one transaction. */
+  /** Installation retirement, one transaction: retire, cancel its pending installs, activate its reserved revokes. */
   retireInstallation(installationId: string): Promise<number> {
     return this.store.retireInstallation(installationId);
   }
 
   /**
    * Resend due pending intents (install, rebind, revoke) exactly as stored,
-   * oldest-due first, one attempt each per pass. A failure counts toward
-   * MAX_SEND_ATTEMPTS and backs the intent off behind the queue; at the cap
-   * it is `stuck`. A revoke whose installation is still selected for that
-   * session is skipped (deferred, not counted): the default `stillSelected`
-   * is true unless the installation is retired or the revoke was activated by
-   * an explicit exclude or a session removal.
+   * oldest-due first, at most `limit` per pass, one attempt each. A failure
+   * backs the intent off behind the queue (capped) and keeps it pending;
+   * `stalled` counts those of this pass that have failed MAX_SEND_ATTEMPTS or
+   * more times (the caller alerts). An intent leased by another sender is
+   * skipped. A pending install is resent even if cancelled (its SQL may have
+   * committed; a resend replays the outcome and activates its revoke). A
+   * revoke whose installation is still selected for that session is skipped
+   * (deferred, not counted as a failure): the default `stillSelected` is true
+   * unless the installation is retired or the revoke was activated by an
+   * explicit exclude or a session removal.
    */
-  async reconcile(options: { limit?: number; stillSelected?: (record: IntentRecord) => Promise<boolean> } = {}): Promise<{ sent: number; skipped: number; retry: number; stuck: number }> {
+  async reconcile(options: { limit?: number; stillSelected?: (record: IntentRecord) => Promise<boolean> } = {}): Promise<{ sent: number; skipped: number; retry: number; stalled: number }> {
     const stillSelected = options.stillSelected ?? (async (record: IntentRecord) => {
       if (record.activationReason === "explicit_exclude" || record.activationReason === "session_removed") return false;
       const installation = await this.store.getInstallation(record.installationId);
       return installation !== null && installation.retiredAt === null;
     });
-    let sent = 0, skipped = 0, retry = 0, stuckCount = 0;
+    let sent = 0, skipped = 0, retry = 0, stalled = 0;
     for (const record of await this.store.dueIntents(options.limit ?? 100)) {
       if (record.status !== "pending") continue;
       if (record.kind === "revoke" && (await stillSelected(record))) {
@@ -465,17 +490,23 @@ export class NativeIssuer {
         skipped += 1;
         continue;
       }
-      let status: string | undefined;
-      try {
-        status = (await this.send(record)).status;
-      } catch {
-        status = (await this.store.getIntent(record.operationUuid))?.status; // counted by send; same bytes next pass
+      const leased = await this.store.claimSend(record.operationUuid, SEND_LEASE_MS);
+      if (!leased) {
+        skipped += 1; // another sender holds it (or it was answered meanwhile)
+        continue;
       }
-      if (status === "stuck") stuckCount += 1;
-      else if (status === "pending") retry += 1;
-      else sent += 1;
+      let after: IntentRecord | null;
+      try {
+        after = await this.send(leased);
+      } catch {
+        after = await this.store.getIntent(record.operationUuid); // counted by send; same bytes next pass
+      }
+      if (after?.status === "pending") {
+        retry += 1;
+        if (isStalled(after)) stalled += 1;
+      } else sent += 1;
     }
-    return { sent, skipped, retry, stuck: stuckCount };
+    return { sent, skipped, retry, stalled };
   }
 
   // ------------------------------------------------------------ internals
@@ -493,24 +524,29 @@ export class NativeIssuer {
   }
 
   /**
-   * Request-path send. A pending intent that already failed and is not yet due
-   * is not sent: client replays must not spend the bounded attempt budget
-   * faster than the backoff (8 quick retries in a short outage would otherwise
-   * strand it as stuck). It answers 503 acquisition_unavailable (retryable);
-   * the reconciler or a later replay sends it when due. A fresh intent
-   * (attempts 0) is always sent.
+   * Request-path send under the intent's store lease (claimSend). Not sent, and
+   * answered 503 acquisition_unavailable (retryable) without counting an
+   * attempt, when another request or reconciler holds the lease, or when it
+   * already failed and is not yet due (client replays must not outrun the
+   * backoff). If another sender answered it meanwhile, that answer is returned.
    */
-  private async sendIfDue(record: IntentRecord): Promise<IntentRecord> {
-    if (record.status === "pending" && record.attempts > 0 && record.nextAttemptAt > this.now()) throw new AcquisitionUnavailableError();
-    return this.send(record);
+  private async sendLeased(record: IntentRecord): Promise<IntentRecord> {
+    if (record.status !== "pending") return record;
+    const leased = await this.store.claimSend(record.operationUuid, SEND_LEASE_MS);
+    if (!leased) {
+      const current = await this.store.getIntent(record.operationUuid);
+      if (current && current.status !== "pending") return current;
+      throw new AcquisitionUnavailableError();
+    }
+    return this.send(leased);
   }
 
   /**
    * Send a pending intent's stored A/S unchanged (never re-signed) and record
    * the outcome: a result -> applied (an install also reserves its revoke);
    * a non-retryable refusal -> refused (terminal); anything else (a bad
-   * stored intent, session_busy, transport) is counted by markRetry (bounded,
-   * then `stuck`) and surfaced.
+   * stored intent, session_busy, transport) is counted by markRetry (backoff,
+   * still pending) and surfaced. The caller holds the intent's lease.
    */
   private async send(record: IntentRecord): Promise<IntentRecord> {
     if (record.status !== "pending") return record;

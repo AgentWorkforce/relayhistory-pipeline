@@ -147,7 +147,9 @@ prerequisites below land (after layered-control's relaycontrol #20 / #22), every
 acquisition request fails closed:
 
 1. `rth:acquire` must be included in Desktop-issued session scopes. Sessions issued before
-   that change do not carry it and must be re-issued.
+   that change do not carry it: a control token refresh keeps the scopes stored with the
+   session, so only the next Desktop sign-in issues a token with the new scope (see "401 vs
+   403").
 2. The acquisition origin (`ACQUISITION_ORIGIN`) must be listed in
    `SELFHOST_INTROSPECT_AUDIENCES` on each deployment.
 
@@ -208,7 +210,8 @@ did not install. The proof is never echoed, stored or logged.
 | malformed body, 22023 | 400 | `{error:{code}}` (`invalid_request`, `request_digest_mismatch`, ...) |
 | unknown key, bad signature, wrong issuer class, 42501 | 403 | `{error:{code}}` (`not_authorized`, `not_owner`, `target_mismatch`, ...) |
 | 55000, 40001 | 409 | ops `{error:{code, retryable}}`; native `{error:{code:"acquisition_refused", reason, retryable}}` |
-| native intent exhausted its retries / explicit revoke of a grant that is not live | 409 | native `{error:{code:"acquisition_refused", reason:"operation_stuck" \| "grant_not_installed", retryable:false}}` |
+| explicit revoke of a grant that is not live | 409 | native `{error:{code:"acquisition_refused", reason:"grant_not_installed", retryable:false}}` |
+| native intent leased by another sender, or failed and not yet due (stalled included) | 503 | `{error:{code:"acquisition_unavailable", retryable:true}}` |
 | request target over 8 KiB | 414 | `{error:{code:"request_uri_too_long"}}` |
 | database / transport failure | 503 | `{error:{code:"acquisition_unavailable", retryable:true}}` |
 | introspection unavailable | 503 | `{error:{code:"introspection_unavailable"}}` |
@@ -255,14 +258,30 @@ the route (for POST, JSON parsing precedes the proof check, field validation fol
 | 403 | `not_authorized` | revoke/rebind of a grant this installation did not install, or a rebind without the session's G | revocations, rebinds |
 | 403 | `target_mismatch` | revoke names a session or source other than the grant's | revocations |
 | 403 | SQL 42501 code (`not_owner`, ...) | the SQL owner check refused | claims, revocations, rebinds |
-| 409 | `acquisition_refused` + `reason`, `retryable` | SQL 55000/40001 (`session_busy` retryable; others not), `operation_conflict`, `operation_stuck`, `grant_not_installed` | claims, revocations, rebinds |
+| 409 | `acquisition_refused` + `reason`, `retryable` | SQL 55000/40001 (`session_busy` retryable; others not), `operation_conflict`, `grant_not_installed` | claims, revocations, rebinds |
 | 503 | `acquisition_unavailable` (`retryable:true`) | database or transport failure (the intent stays pending), or a replay of a failed intent before its backoff elapses (not sent); `Retry-After: 5` | all but installations |
 | 500 | `internal_error` | a SQL message outside the contract (a defect) | claims, revocations, rebinds |
 
 **401 vs 403.** 401 means the bearer is missing or not a valid relaycontrol token, so Desktop
-should sign in again. 403 means the bearer is valid but the request is not allowed: wrong
-principal or scope, a bad installation proof, or not the grant's owner. Re-signing in does not
-fix a 403. (Ops differs: every ops authentication refusal is 403, a missing bearer included.)
+should sign in again. 403 means the bearer is valid but the request is not allowed. Two kinds
+of 403 need different handling:
+
+- **Sign-in remediation: `403 not_authorized` from the bearer check** (the `not_authorized` row
+  above with "valid bearer"). The usual cause is a Desktop token issued before `rth:acquire`
+  was added to Desktop session scopes. A control token refresh does not help, because it keeps
+  the scopes stored with the session; the next Desktop sign-in issues a token with the new
+  scope. Desktop does **one** normal setup re-auth (the ordinary sign-in flow, user visible)
+  and retries once; if the retry is still refused it holds (no acquisition, reports the
+  state) and does not loop. There is no silent scope elevation: the service never widens a
+  token, and Desktop never requests the scope outside that normal sign-in.
+- **Proof and ownership 403s** (`installation_not_proven`, the route-level `not_authorized` for
+  a grant this installation did not install, `target_mismatch`, SQL 42501 codes such as
+  `not_owner`): signing in again does **not** fix these. They mean the installation proof,
+  the installation's state (unknown, retired, another principal's) or grant ownership is
+  wrong; Desktop re-registers its installation or stops presenting the grant, and does not
+  trigger a re-auth for them.
+
+(Ops differs: every ops authentication refusal is 403, a missing bearer included.)
 
 **Retry-After.** `503 acquisition_disabled` carries `Retry-After: 60`; every other 503 carries
 `Retry-After: 5`. 413 and 415 apply only to request bodies (the POST routes).
@@ -280,34 +299,64 @@ AES-256-GCM ciphertext with AAD `domain US operationUuid US installationId`.
 When an install is **applied**, the **same intent-store transaction** that records the result
 stores a **reserved, pre-signed revoke** of that grant: `targetGrantId` = the grant,
 `targetOwnerEpoch` = the `ownerEpoch` the install result reports, and `revision` = the result's
-revision + 1 (§4.2; SQL takes `greatest(revision, p.revision)`). Signing from the result
-epoch matters because the SQL install can raise the epoch above the claim-time value (tested
-with epoch + 5). If the result carries no `ownerEpoch`, or signing fails, **no** revoke is
-pre-signed and the install records `reservation = "no_epoch"` (or `"sign_failed"`).
+revision + 1 (§4.2; SQL takes `greatest(revision, p.revision)`). The design fixes the epoch:
+the claim sends `expectedOwnerEpoch` = the current epoch from status and the install lands at
+exactly `expectedOwnerEpoch + 1` (tests use that contract). The reserved revoke's epoch is
+therefore deterministic, but the issuer still signs from the epoch the result reports, never
+from an assumed value, so a result that disagrees is not silently re-derived. If the result
+carries no `ownerEpoch`, or signing fails, **no** revoke is pre-signed and the install records
+`reservation = "no_epoch"` (or `"sign_failed"`).
 Activation of a reserved revoke needs no network and no private key; it is a local row update:
 
 - explicit permanent exclude (`POST .../revocations`): activated and sent immediately;
 - session membership removal (`NativeIssuer.removeSession`);
-- installation retirement (`NativeIssuer.retireInstallation`, which activates every reserved
-  revoke of the installation in one transaction).
+- installation retirement (`NativeIssuer.retireInstallation`, which retires the installation,
+  cancels its pending installs and activates every reserved revoke of it in one transaction).
+
+**Cancellation ordering.** An install whose outcome is not yet known (in flight, response
+lost, stalled) has no reserved revoke yet, and its SQL may have committed. Removal and
+retirement therefore record the cancel on the pending install itself (`cancel_reason`). The
+store serializes this with the install's apply on the install row: the apply updates that row
+first and reads `cancel_reason`, so whichever commits first, the revoke is inserted already
+**pending** (active, with that reason) instead of `reserved`, and the reconciler sends it. A
+pending install is still resent after a cancel, because the SQL is idempotent by
+`operationUuid` and a resend of the same bytes replays the outcome. A claim whose installation
+is retired while the claim awaits status is refused when its intent is created
+(`createInstallIntent` takes `FOR SHARE` on the installation row and rechecks `retired_at`):
+`403 installation_not_proven`, nothing sent.
 
 An explicit revoke of an install **without** a reservation (`no_epoch`, `sign_failed`, or a
-stuck install whose grant may have landed) reads the authority status row and signs a revoke
+stalled install whose grant may have landed) reads the authority status row and signs a revoke
 against its current `ownerEpoch`/`revision`, only if the row's `grantId` is that install;
-otherwise `409 grant_not_installed` (retry after status shows the grant). Removal and
-retirement cannot clean such an install up by themselves: it needs that explicit revoke.
+otherwise `409 grant_not_installed` (retry after status shows the grant). For a stalled
+install, that refusal also records the exclude as its cancel, so a later apply creates its
+revoke active. An **applied** install with `no_epoch`/`sign_failed` has no revoke row:
+removal and retirement cannot clean it up by themselves, and after retirement the explicit
+revoke is refused by the proof check (known limitation; a SQL install result always carries
+`ownerEpoch`).
 
 A reconciler (`main.ts`, every 30 s while native is enabled) resends **every** due pending
 intent, installs and rebinds as well as revokes, byte-for-byte. Each failed send increments
-`attempts` and sets `next_attempt_at` with bounded exponential backoff
-(`min(30 s * 2^(attempts-1), 1 h)`). After 8 attempts the intent becomes **`stuck`**
-(terminal): replays of it answer `409 operation_stuck`, it is no longer sent, and it no longer
-holds an issuer key for retention. Due intents are taken in `next_attempt_at, created_at`
-order, so a run of failing intents backs off and cannot starve later ones. A client replay
-(same `operationUuid`) of an intent that already failed and is not yet due is **not** sent; it
-answers `503 acquisition_unavailable`, so quick client retries cannot spend the attempt budget
-faster than the backoff. (The gate compares the app clock with the database's
-`next_attempt_at`; small clock skew only shifts when a replay is sent.) A revoke whose
+`attempts` and sets `next_attempt_at` with capped exponential backoff
+(`min(30 s * 2^(attempts-1), 1 h)`). A failed send is **never terminal**, because its SQL may
+have committed (a lost response): dropping the intent would drop its encrypted G (no recovery
+by replay) and its key retention. After 8 attempts (`MAX_SEND_ATTEMPTS`) the intent is
+**stalled**: still pending, still resent hourly, still holding its issuer key; the reconciler
+counts it and `main.ts` logs `acquisition reconcile stalled` at warn (alert on it). An
+explicit revoke of a stalled install may proceed (above); a rebind of its grant still answers
+`409 session_busy`, and a replay of the claim sends it when due (else `503`). Due intents are taken in `next_attempt_at, created_at` order, so a
+run of failing intents backs off and cannot starve later ones.
+
+**Send lease.** Every send (request path or reconciler) first takes the intent's lease: a
+single-statement compare-and-set that sets `lease_until` = now + 5 min only if the intent is
+pending, unleased (or its lease expired) and due (`attempts` = 0 or `next_attempt_at` passed).
+The outcome (applied, refused, retry) clears it. So concurrent client replays and reconcilers
+never send one intent at once, even at `attempts` = 0: a replay that does not get the lease
+answers `503 acquisition_unavailable` (retryable) without spending an attempt, and the
+reconciler skips it. A sender that dies holding the lease delays the intent by at most the
+lease; a send that outlives its lease can at worst overlap one resend of the same bytes, which
+the SQL's `operationUuid` idempotency absorbs. (The lease and the due check use the database
+clock in Postgres; small skew against the app clock only shifts timing.) A revoke whose
 installation is still selected for the session is deferred by 30 s, not resent. A refused
 install voids its reserved revoke. Desktop's reversible exclude remains a local hold (stop
 presenting the grant), not a server revoke (contract P3, F5).
@@ -322,9 +371,9 @@ the control intents are applied. Rotation is additive: pin the new key, switch
 after nothing references it.
 
 Enforced here: with native enabled, startup reads the distinct `issuerKeyId` (last A field)
-of every `reserved` or `pending` intent (not `stuck`) and refuses to start (before listening) if any is
-missing from the pinned set or pinned under another class (`assertKeysRetained`). Applied,
-refused, void and stuck intents no longer hold a key. Cloud-issued outbox and receipt-replay state
+of every `reserved` or `pending` intent (stalled ones included) and refuses to start (before
+listening) if any is missing from the pinned set or pinned under another class
+(`assertKeysRetained`). Applied, refused and void intents no longer hold a key. Cloud-issued outbox and receipt-replay state
 lives outside this service (Cloud side and the SQL lane), so this service cannot check the
 cloud-class set; operators must keep those keys pinned until the owner confirms the outbox
 and replay window is drained.

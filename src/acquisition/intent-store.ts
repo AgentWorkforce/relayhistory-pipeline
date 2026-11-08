@@ -14,9 +14,19 @@
  *   result with no usable epoch gets no reservation, recorded on the install
  *   (`reservation`); an explicit revoke then signs against the authority row.
  * - A pending intent that keeps failing (transport, session_busy, a bad stored
- *   intent) is retried with bounded exponential backoff and, after
- *   MAX_SEND_ATTEMPTS, becomes `stuck`: terminal for the reconciler, not
- *   outstanding for key retention, and no longer blocks a later revoke/rebind.
+ *   intent) is retried with exponential backoff capped at RETRY_CAP_MS. A
+ *   failure is never a definitive outcome (the SQL call may have committed), so
+ *   the intent stays `pending` with its exact bytes and its issuer key until a
+ *   result or a refusal: after MAX_SEND_ATTEMPTS it is only *stalled* (alerted,
+ *   and an explicit revoke of a stalled install may proceed), never terminal.
+ * - Every send holds a per-intent lease (claimSend, a compare-and-set on
+ *   lease_until): concurrent request replays and reconcilers in other
+ *   processes cannot send the same intent at once or bypass the backoff.
+ * - Cancellation ordering: retirement and session removal of a grant whose
+ *   install is still pending record `cancel_reason` on the install, under the
+ *   same row serialization as markInstallApplied, so the revoke is inserted
+ *   `pending` (active) when the install's outcome arrives. A new install
+ *   intent locks its installation row and is refused once it is retired.
  * - A refused intent is never edited again; a new attempt is a new operationUuid.
  * - G is stored only as AES-256-GCM ciphertext under ACQUISITION_INTENT_KEY,
  *   with the operation and installation as associated data.
@@ -25,7 +35,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 
 export type IntentKind = "install" | "revoke" | "rebind";
-export type IntentStatus = "reserved" | "pending" | "applied" | "refused" | "void" | "stuck";
+export type IntentStatus = "reserved" | "pending" | "applied" | "refused" | "void";
 /** install only: whether its reserved revoke was pre-signed (null until applied). */
 export type Reservation = "signed" | "no_epoch" | "sign_failed";
 export type ActivationReason = "explicit_exclude" | "installation_retired" | "session_removed";
@@ -66,17 +76,31 @@ export interface IntentRecord {
   readonly result: string | null;
   readonly clientOperationUuid: string | null;
   readonly activationReason: ActivationReason | null;
-  /** Failed sends counted toward MAX_SEND_ATTEMPTS. */
+  /** Failed sends (never capped; at MAX_SEND_ATTEMPTS the intent is stalled and alerted). */
   readonly attempts: number;
   /** Epoch ms before which the reconciler does not resend. */
   readonly nextAttemptAt: number;
   readonly reservation: Reservation | null;
+  /**
+   * install only: the grant must be revoked once the install's outcome is known
+   * (the installation was retired, or the session removed / explicitly excluded,
+   * while the install was still pending). Its revoke is then inserted active.
+   */
+  readonly cancelReason: ActivationReason | null;
+  /** Epoch ms until which a sender holds this intent (claimSend); null when free. */
+  readonly leaseUntil: number | null;
 }
 
-export type NewIntent = Omit<IntentRecord, "status" | "refusalCode" | "result" | "clientOperationUuid" | "activationReason" | "attempts" | "nextAttemptAt" | "reservation">;
+export type NewIntent = Omit<IntentRecord, "status" | "refusalCode" | "result" | "clientOperationUuid" | "activationReason" | "attempts" | "nextAttemptAt" | "reservation" | "cancelReason" | "leaseUntil">;
 
-/** Bounded retry policy for pending intents (reconciler and client retries alike). */
+// Retry policy for pending intents (reconciler and client retries alike).
+/** Failed sends after which a still-pending intent is reported stalled (alert); it keeps retrying. */
 export const MAX_SEND_ATTEMPTS = 8;
+/**
+ * A send lease. Longer than any SQL call is expected to take; if a call outlives
+ * it, a second sender may resend the same bytes, which the SQL replays exactly.
+ */
+export const SEND_LEASE_MS = 300_000;
 export const RETRY_BASE_MS = 30_000;
 export const RETRY_CAP_MS = 3_600_000;
 /** Backoff after the n-th failure (n >= 1): base * 2^(n-1), capped. */
@@ -90,12 +114,20 @@ export interface AcquisitionStore {
 
   // Intents (§4.2).
   getIntent(operationUuid: string): Promise<IntentRecord | null>;
-  /** A pending install. Returns the existing intent on a duplicate operationUuid. */
+  /**
+   * A pending install. Returns the existing intent on a duplicate operationUuid.
+   * Holds the installation row (shared) while inserting and throws
+   * StoreConflict("installation_retired") if it is retired: retirement either
+   * commits first (refused here) or waits and then cancels this install.
+   */
   createInstallIntent(install: NewIntent): Promise<{ record: IntentRecord; created: boolean }>;
   /**
    * One transaction: pending install -> applied with `result` and the
-   * reservation outcome, and (when signed) its reserved revoke inserted.
-   * No-op unless the install is still pending.
+   * reservation outcome, and (when signed) its revoke inserted: `reserved`, or
+   * `pending` with activation_reason = cancel_reason when the install was
+   * cancelled meanwhile. A grant that already has a revoke (an explicit revoke
+   * of a stalled install) keeps it (activated if cancelled). No-op unless the
+   * install is still pending.
    */
   markInstallApplied(operationUuid: string, result: string, reservedRevoke: NewIntent | null, reservation: Reservation): Promise<void>;
   /**
@@ -114,10 +146,24 @@ export interface AcquisitionStore {
   markApplied(operationUuid: string, result: string): Promise<void>;
   /**
    * A failed send of a pending intent: attempts += 1, next attempt after
-   * retryDelayMs(attempts); at MAX_SEND_ATTEMPTS it becomes `stuck`.
-   * Returns the status after the update.
+   * retryDelayMs(attempts) (capped), lease released. It stays pending: a failed
+   * send is not a definitive outcome. Returns the status after the update.
    */
   markRetry(operationUuid: string): Promise<IntentStatus | null>;
+  /**
+   * Compare-and-set send lease: only if the intent is pending, not leased (or
+   * the lease expired) and due (never failed, or next_attempt_at reached), set
+   * lease_until = now + leaseMs and return it; else null. Every mark* releases it.
+   */
+  claimSend(operationUuid: string, leaseMs: number): Promise<IntentRecord | null>;
+  /**
+   * Cancel the grant `grantId` of `installationId` (session removal, or an
+   * explicit revoke that found the grant not installed yet): if its install is
+   * still pending, record cancel_reason ("cancelled"); otherwise activate its
+   * reserved revoke ("activated"), else "none". Serialized with
+   * markInstallApplied on the install row.
+   */
+  cancelGrant(installationId: string, grantId: string, reason: ActivationReason): Promise<"cancelled" | "activated" | "none">;
   /** Push a pending intent's next attempt out without counting an attempt (reconciler skip). */
   deferIntent(operationUuid: string, delayMs: number): Promise<void>;
   /** pending -> refused (terminal). A refused install voids its reserved revoke in the same transaction. */
@@ -128,18 +174,22 @@ export interface AcquisitionStore {
   currentOrigin(grantId: string): Promise<string | null>;
   /** Which of `grantIds` were installed by `installationId` through this issuer. */
   grantsOfInstallation(installationId: string, grantIds: readonly string[]): Promise<Set<string>>;
-  /** Mark retired and activate every reserved revoke of its grants, in one transaction. Returns the count activated. */
+  /**
+   * One transaction: mark retired, cancel every pending install of it, and
+   * activate every reserved revoke of its grants. Returns installs cancelled +
+   * revokes activated.
+   */
   retireInstallation(installationId: string): Promise<number>;
   /**
-   * Pending intents of every kind that are due (nextAttemptAt <= now), by
+   * Pending, unleased intents of every kind that are due (nextAttemptAt <= now), by
    * nextAttemptAt then creation: FIFO, and a failing intent moves behind the
    * queue (backoff), so a poisoned backlog cannot starve later intents.
    */
   dueIntents(limit: number): Promise<IntentRecord[]>;
   /**
    * Distinct issuerKeyId (the last A field) of every intent that may still be
-   * sent or replayed: reserved revokes and pending operations (`stuck` is
-   * terminal and excluded). Key rotation must retain these public keys
+   * sent or replayed: reserved revokes and pending operations (stalled ones
+   * included). Key rotation must retain these public keys
    * (§9 key retention).
    */
   outstandingIssuerKeyIds(): Promise<Set<string>>;
@@ -152,7 +202,7 @@ export function assertionIssuerKeyId(assertion: Uint8Array): string {
 }
 
 export class StoreConflict extends Error {
-  constructor(readonly code: "operation_conflict" | "installation_conflict") {
+  constructor(readonly code: "operation_conflict" | "installation_conflict" | "installation_retired") {
     super(code);
     this.name = "StoreConflict";
   }
@@ -226,12 +276,14 @@ export class MemoryAcquisitionStore implements AcquisitionStore {
     return this.intents.get(operationUuid) ?? null;
   }
   private fresh(intent: NewIntent, status: IntentStatus): IntentRecord {
-    return Object.freeze({ ...intent, status, refusalCode: null, result: null, clientOperationUuid: null, activationReason: null, attempts: 0, nextAttemptAt: this.now(), reservation: null });
+    return Object.freeze({ ...intent, status, refusalCode: null, result: null, clientOperationUuid: null, activationReason: null, attempts: 0, nextAttemptAt: this.now(), reservation: null, cancelReason: null, leaseUntil: null });
   }
   async createInstallIntent(install: NewIntent) {
     this.note("createInstallIntent");
     const existing = this.intents.get(install.operationUuid);
     if (existing) return { record: existing, created: false };
+    const installation = this.installations.get(install.installationId);
+    if (!installation || installation.retiredAt !== null) throw new StoreConflict("installation_retired");
     this.intents.set(install.operationUuid, this.fresh(install, "pending"));
     return { record: this.intents.get(install.operationUuid)!, created: true };
   }
@@ -239,10 +291,19 @@ export class MemoryAcquisitionStore implements AcquisitionStore {
     this.note("markInstallApplied");
     const current = this.intents.get(operationUuid);
     if (!current || current.kind !== "install" || current.status !== "pending") return;
-    if (reservedRevoke && (this.intents.has(reservedRevoke.operationUuid) || [...this.intents.values()].some((i) => i.kind === "revoke" && i.targetGrantId === operationUuid)))
+    const cancel = current.cancelReason;
+    const existingRevoke = [...this.intents.values()].find((i) => i.kind === "revoke" && i.targetGrantId === operationUuid) ?? null;
+    if (reservedRevoke && !existingRevoke && this.intents.has(reservedRevoke.operationUuid))
       throw new StoreConflict("operation_conflict"); // the transaction rolls back: still pending
-    this.update(operationUuid, { status: "applied", result, reservation });
-    if (reservedRevoke) this.intents.set(reservedRevoke.operationUuid, this.fresh(reservedRevoke, "reserved"));
+    this.update(operationUuid, { status: "applied", result, reservation, leaseUntil: null });
+    if (existingRevoke) {
+      // An explicit revoke of the stalled install already exists: keep it (one revoke per grant).
+      if (cancel && existingRevoke.status === "reserved") this.update(existingRevoke.operationUuid, { status: "pending", activationReason: cancel });
+    } else if (reservedRevoke) {
+      this.intents.set(reservedRevoke.operationUuid, cancel
+        ? Object.freeze({ ...this.fresh(reservedRevoke, "pending"), activationReason: cancel })
+        : this.fresh(reservedRevoke, "reserved"));
+    }
   }
   async createRevokeIntent(revoke: NewIntent, clientOperationUuid: string) {
     this.note("createRevokeIntent");
@@ -284,7 +345,7 @@ export class MemoryAcquisitionStore implements AcquisitionStore {
   async markApplied(operationUuid: string, result: string) {
     this.note("markApplied");
     const current = this.intents.get(operationUuid);
-    if (current && (current.status === "pending" || current.status === "applied")) this.update(operationUuid, { status: "applied", result });
+    if (current && (current.status === "pending" || current.status === "applied")) this.update(operationUuid, { status: "applied", result, leaseUntil: null });
   }
   async markRetry(operationUuid: string) {
     this.note("markRetry");
@@ -292,8 +353,31 @@ export class MemoryAcquisitionStore implements AcquisitionStore {
     if (!current) return null;
     if (current.status !== "pending") return current.status;
     const attempts = current.attempts + 1;
-    this.update(operationUuid, { attempts, nextAttemptAt: this.now() + retryDelayMs(attempts), status: attempts >= MAX_SEND_ATTEMPTS ? "stuck" : "pending" });
+    this.update(operationUuid, { attempts, nextAttemptAt: this.now() + retryDelayMs(attempts), leaseUntil: null });
     return this.intents.get(operationUuid)!.status;
+  }
+  async claimSend(operationUuid: string, leaseMs: number) {
+    this.note("claimSend");
+    const current = this.intents.get(operationUuid);
+    const now = this.now();
+    if (!current || current.status !== "pending") return null;
+    if (current.leaseUntil !== null && current.leaseUntil > now) return null;
+    if (current.attempts > 0 && current.nextAttemptAt > now) return null;
+    this.update(operationUuid, { leaseUntil: now + leaseMs });
+    return this.intents.get(operationUuid)!;
+  }
+  async cancelGrant(installationId: string, grantId: string, reason: ActivationReason) {
+    this.note("cancelGrant");
+    const install = this.intents.get(grantId);
+    if (!install || install.kind !== "install" || install.installationId !== installationId) return "none" as const;
+    if (install.status === "pending") {
+      if (install.cancelReason === null) this.update(grantId, { cancelReason: reason });
+      return "cancelled" as const;
+    }
+    const revoke = [...this.intents.values()].find((i) => i.kind === "revoke" && i.targetGrantId === grantId && i.installationId === installationId && i.status === "reserved");
+    if (!revoke) return "none" as const;
+    this.update(revoke.operationUuid, { status: "pending", activationReason: reason });
+    return "activated" as const;
   }
   async deferIntent(operationUuid: string, delayMs: number) {
     this.note("deferIntent");
@@ -304,7 +388,7 @@ export class MemoryAcquisitionStore implements AcquisitionStore {
     this.note("markRefused");
     const current = this.intents.get(operationUuid);
     if (!current || current.status !== "pending") return;
-    this.update(operationUuid, { status: "refused", refusalCode: code });
+    this.update(operationUuid, { status: "refused", refusalCode: code, leaseUntil: null });
     if (current.kind === "install")
       for (const i of this.intents.values())
         if (i.kind === "revoke" && i.targetGrantId === operationUuid && i.status === "reserved") this.update(i.operationUuid, { status: "void" });
@@ -332,6 +416,11 @@ export class MemoryAcquisitionStore implements AcquisitionStore {
     if (!inst.retiredAt) this.installations.set(installationId, Object.freeze({ ...inst, retiredAt: new Date().toISOString() }));
     let count = 0;
     for (const i of [...this.intents.values()])
+      if (i.kind === "install" && i.installationId === installationId && i.status === "pending") {
+        if (i.cancelReason === null) this.update(i.operationUuid, { cancelReason: "installation_retired" });
+        count += 1;
+      }
+    for (const i of [...this.intents.values()])
       if (i.kind === "revoke" && i.installationId === installationId && i.status === "reserved") {
         this.update(i.operationUuid, { status: "pending", activationReason: "installation_retired" });
         count += 1;
@@ -342,7 +431,7 @@ export class MemoryAcquisitionStore implements AcquisitionStore {
     this.note("dueIntents");
     const now = this.now();
     // Array.prototype.sort is stable: equal nextAttemptAt keeps insertion (creation) order.
-    return [...this.intents.values()].filter((i) => i.status === "pending" && i.nextAttemptAt <= now).sort((a, b) => a.nextAttemptAt - b.nextAttemptAt).slice(0, limit);
+    return [...this.intents.values()].filter((i) => i.status === "pending" && i.nextAttemptAt <= now && (i.leaseUntil === null || i.leaseUntil <= now)).sort((a, b) => a.nextAttemptAt - b.nextAttemptAt).slice(0, limit);
   }
   async outstandingIssuerKeyIds() {
     this.note("outstandingIssuerKeyIds");
@@ -384,7 +473,7 @@ export function pgSqlClient(pool: { query: (text: string, params?: unknown[]) =>
 const INSTALLATIONS = "sessions.ingest_acquisition_native_installations";
 const INTENTS = "sessions.ingest_acquisition_native_intents";
 const INTENT_COLUMNS =
-  "operation_uuid::text, kind, installation_id::text, org_id, workspace_id, source, session_id, target_grant_id::text, origin_id, assertion, signature, evidence_sha256, request_sha256, grant_ciphertext, grant_nonce, status, refusal_code, result, client_operation_uuid::text, activation_reason, attempts, (extract(epoch FROM next_attempt_at) * 1000)::float8 AS next_attempt_ms, reservation";
+  "operation_uuid::text, kind, installation_id::text, org_id, workspace_id, source, session_id, target_grant_id::text, origin_id, assertion, signature, evidence_sha256, request_sha256, grant_ciphertext, grant_nonce, status, refusal_code, result, client_operation_uuid::text, activation_reason, attempts, (extract(epoch FROM next_attempt_at) * 1000)::float8 AS next_attempt_ms, reservation, cancel_reason, (extract(epoch FROM lease_until) * 1000)::float8 AS lease_until_ms";
 const INSTALLATION_COLUMNS = "installation_id::text, request_uuid::text, org_id, workspace_id, user_id, origin_id, label, proof_sha256, retired_at::text";
 
 type Row = Record<string, unknown>;
@@ -403,6 +492,8 @@ function intentRow(r: Row): IntentRecord {
     status: r.status as IntentStatus, refusalCode: strOrNull(r.refusal_code), result: strOrNull(r.result),
     clientOperationUuid: strOrNull(r.client_operation_uuid), activationReason: strOrNull(r.activation_reason) as ActivationReason | null,
     attempts: Number(r.attempts), nextAttemptAt: Number(r.next_attempt_ms), reservation: strOrNull(r.reservation) as Reservation | null,
+    cancelReason: strOrNull(r.cancel_reason) as ActivationReason | null,
+    leaseUntil: r.lease_until_ms === null || r.lease_until_ms === undefined ? null : Number(r.lease_until_ms),
   });
 }
 function installationRow(r: Row): InstallationRecord {
@@ -450,20 +541,53 @@ export class PgAcquisitionStore implements AcquisitionStore {
     return this.one(`SELECT ${INTENT_COLUMNS} FROM ${INTENTS} WHERE operation_uuid=$1`, [operationUuid]);
   }
   async createInstallIntent(install: NewIntent) {
-    const r = await this.db.query(INSERT_INTENT, intentParams(install, "pending"));
-    return { record: (await this.getIntent(install.operationUuid))!, created: r.rows.length > 0 };
+    const created = await this.db.transaction(async (tx) => {
+      // FOR SHARE conflicts with retireInstallation's UPDATE of this row (the FK's KEY SHARE does
+      // not): retirement either committed first (refused here) or waits for this insert and then
+      // cancels the new pending install in its own transaction.
+      const inst = await tx.query<Row>(`SELECT retired_at FROM ${INSTALLATIONS} WHERE installation_id=$1 FOR SHARE`, [install.installationId]);
+      if (!inst.rows[0] || inst.rows[0].retired_at !== null) {
+        const dup = await tx.query(`SELECT 1 FROM ${INTENTS} WHERE operation_uuid=$1`, [install.operationUuid]);
+        if (dup.rows.length > 0) return false; // an existing intent replays as before
+        throw new StoreConflict("installation_retired");
+      }
+      const r = await tx.query(INSERT_INTENT, intentParams(install, "pending"));
+      return r.rows.length > 0;
+    });
+    return { record: (await this.getIntent(install.operationUuid))!, created };
   }
   async markInstallApplied(operationUuid: string, result: string, reservedRevoke: NewIntent | null, reservation: Reservation) {
     await this.db.transaction(async (tx) => {
-      const r = await tx.query(
-        `UPDATE ${INTENTS} SET status='applied', result=$2, reservation=$3, updated_at=clock_timestamp()
-         WHERE operation_uuid=$1 AND kind='install' AND status='pending' RETURNING operation_uuid`,
+      // The install row lock orders this against retireInstallation/cancelGrant: whichever commits
+      // first, the other sees it (READ COMMITTED re-reads the updated row / takes a new snapshot).
+      const r = await tx.query<Row>(
+        `UPDATE ${INTENTS} SET status='applied', result=$2, reservation=$3, lease_until=NULL, updated_at=clock_timestamp()
+         WHERE operation_uuid=$1 AND kind='install' AND status='pending' RETURNING cancel_reason`,
         [operationUuid, result, reservation],
       );
-      if (r.rows.length === 0 || !reservedRevoke) return;
-      // A conflict (the grant already has a revoke) rolls the applied mark back: still pending.
-      const rv = await tx.query(INSERT_INTENT, intentParams(reservedRevoke, "reserved"));
-      if (rv.rows.length === 0) throw new StoreConflict("operation_conflict");
+      if (r.rows.length === 0) return;
+      const cancel = strOrNull(r.rows[0]!.cancel_reason);
+      if (reservedRevoke) {
+        const rv = await tx.query(
+          `INSERT INTO ${INTENTS}(operation_uuid, kind, installation_id, org_id, workspace_id, source, session_id, target_grant_id, origin_id,
+             assertion, signature, evidence_sha256, request_sha256, grant_ciphertext, grant_nonce, status, activation_reason)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT DO NOTHING RETURNING operation_uuid`,
+          [...intentParams(reservedRevoke, cancel ? "pending" : "reserved"), cancel],
+        );
+        if (rv.rows.length > 0) return;
+      }
+      // No new row: the grant already has a revoke (explicit revoke of a stalled install) -> keep it;
+      // anything else (an operation_uuid collision) rolls the applied mark back: still pending.
+      const existing = await tx.query(`SELECT 1 FROM ${INTENTS} WHERE kind='revoke' AND target_grant_id=$1`, [operationUuid]);
+      if (existing.rows.length === 0) {
+        if (reservedRevoke) throw new StoreConflict("operation_conflict");
+        return;
+      }
+      if (cancel)
+        await tx.query(
+          `UPDATE ${INTENTS} SET status='pending', activation_reason=$2, updated_at=clock_timestamp() WHERE kind='revoke' AND target_grant_id=$1 AND status='reserved'`,
+          [operationUuid, cancel],
+        );
     });
   }
   async createRevokeIntent(revoke: NewIntent, clientOperationUuid: string) {
@@ -511,20 +635,48 @@ export class PgAcquisitionStore implements AcquisitionStore {
     return record;
   }
   async markApplied(operationUuid: string, result: string) {
-    await this.db.query(`UPDATE ${INTENTS} SET status='applied', result=$2, updated_at=clock_timestamp() WHERE operation_uuid=$1 AND status IN('pending','applied')`, [operationUuid, result]);
+    await this.db.query(`UPDATE ${INTENTS} SET status='applied', result=$2, lease_until=NULL, updated_at=clock_timestamp() WHERE operation_uuid=$1 AND status IN('pending','applied')`, [operationUuid, result]);
   }
   async markRetry(operationUuid: string) {
     // SET expressions read the pre-update row: attempts there is the count before this failure.
+    // least(attempts, 62) keeps power() finite however long an intent stays pending.
     const r = await this.db.query<Row>(
-      `UPDATE ${INTENTS} SET attempts = attempts + 1,
-         status = CASE WHEN attempts + 1 >= $2 THEN 'stuck' ELSE status END,
-         next_attempt_at = clock_timestamp() + make_interval(secs => least($3::float8 * power(2, attempts), $4::float8) / 1000),
+      `UPDATE ${INTENTS} SET attempts = attempts + 1, lease_until = NULL,
+         next_attempt_at = clock_timestamp() + make_interval(secs => least($2::float8 * power(2, least(attempts, 62)), $3::float8) / 1000),
          updated_at = clock_timestamp()
        WHERE operation_uuid=$1 AND status='pending' RETURNING status`,
-      [operationUuid, MAX_SEND_ATTEMPTS, RETRY_BASE_MS, RETRY_CAP_MS],
+      [operationUuid, RETRY_BASE_MS, RETRY_CAP_MS],
     );
     if (r.rows[0]) return r.rows[0].status as IntentStatus;
     return (await this.getIntent(operationUuid))?.status ?? null;
+  }
+  claimSend(operationUuid: string, leaseMs: number) {
+    // One statement: the row lock makes it a compare-and-set across processes.
+    return this.one(
+      `UPDATE ${INTENTS} SET lease_until = clock_timestamp() + make_interval(secs => $2::float8 / 1000), updated_at = clock_timestamp()
+       WHERE operation_uuid=$1 AND status='pending' AND (lease_until IS NULL OR lease_until <= clock_timestamp())
+         AND (attempts = 0 OR next_attempt_at <= clock_timestamp())
+       RETURNING ${INTENT_COLUMNS}`,
+      [operationUuid, leaseMs],
+    );
+  }
+  async cancelGrant(installationId: string, grantId: string, reason: ActivationReason) {
+    return this.db.transaction(async (tx) => {
+      // Same install row as markInstallApplied: if it applied first, this UPDATE re-reads it (no
+      // longer pending) and the next statement's fresh snapshot sees the reserved revoke it inserted.
+      const c = await tx.query(
+        `UPDATE ${INTENTS} SET cancel_reason=COALESCE(cancel_reason, $3), updated_at=clock_timestamp()
+         WHERE operation_uuid=$2 AND kind='install' AND installation_id=$1 AND status='pending' RETURNING 1`,
+        [installationId, grantId, reason],
+      );
+      if (c.rows.length > 0) return "cancelled" as const;
+      const a = await tx.query(
+        `UPDATE ${INTENTS} SET status='pending', activation_reason=$3, updated_at=clock_timestamp()
+         WHERE kind='revoke' AND target_grant_id=$2 AND installation_id=$1 AND status='reserved' RETURNING 1`,
+        [installationId, grantId, reason],
+      );
+      return a.rows.length > 0 ? ("activated" as const) : ("none" as const);
+    });
   }
   async deferIntent(operationUuid: string, delayMs: number) {
     await this.db.query(
@@ -536,7 +688,7 @@ export class PgAcquisitionStore implements AcquisitionStore {
   async markRefused(operationUuid: string, code: string) {
     await this.db.transaction(async (tx) => {
       const r = await tx.query<Row>(
-        `UPDATE ${INTENTS} SET status='refused', refusal_code=$2, updated_at=clock_timestamp() WHERE operation_uuid=$1 AND status='pending' RETURNING kind`,
+        `UPDATE ${INTENTS} SET status='refused', refusal_code=$2, lease_until=NULL, updated_at=clock_timestamp() WHERE operation_uuid=$1 AND status='pending' RETURNING kind`,
         [operationUuid, code],
       );
       if (r.rows[0]?.kind === "install")
@@ -567,18 +719,26 @@ export class PgAcquisitionStore implements AcquisitionStore {
   }
   async retireInstallation(installationId: string) {
     return this.db.transaction(async (tx) => {
+      // Order: installation row (waits for an in-flight createInstallIntent's FOR SHARE), then the
+      // pending installs (each waits for an in-flight markInstallApplied), then reserved revokes.
       await tx.query(`UPDATE ${INSTALLATIONS} SET retired_at=COALESCE(retired_at, clock_timestamp()) WHERE installation_id=$1`, [installationId]);
+      const c = await tx.query(
+        `UPDATE ${INTENTS} SET cancel_reason=COALESCE(cancel_reason, 'installation_retired'), updated_at=clock_timestamp()
+         WHERE kind='install' AND installation_id=$1 AND status='pending' RETURNING operation_uuid`,
+        [installationId],
+      );
       const r = await tx.query(
         `UPDATE ${INTENTS} SET status='pending', activation_reason='installation_retired', updated_at=clock_timestamp()
          WHERE kind='revoke' AND installation_id=$1 AND status='reserved' RETURNING operation_uuid`,
         [installationId],
       );
-      return r.rows.length;
+      return c.rows.length + r.rows.length;
     });
   }
   async dueIntents(limit: number) {
     const r = await this.db.query<Row>(
       `SELECT ${INTENT_COLUMNS} FROM ${INTENTS} WHERE status='pending' AND next_attempt_at <= clock_timestamp()
+         AND (lease_until IS NULL OR lease_until <= clock_timestamp())
        ORDER BY next_attempt_at, created_at, operation_uuid LIMIT $1`,
       [limit],
     );
