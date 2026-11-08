@@ -6,9 +6,12 @@
  *
  * Proves, on a real server, for 20261105043860_buffered_search_gate and 20261105043870_buffered_search_feed_cursor:
  *  (a) both apply through runMigrations (local profile: shim, bootstrap, every upstream migration, verify);
- *      down/up: 043860's down is refused (55000) while 043870 is applied and drops nothing; 043870's down then
- *      043860's down remove exactly their objects, ledger rows and the runtime role's schema USAGE; a second
- *      runMigrations reapplies both with every role validation 'pass'.
+ *      down/up: every applied upstream step after 043870 (today 043890 then 043880) is first rolled back in
+ *      DESCENDING order from its supabase/rollbacks/<step>.down.sql (a missing file fails the test; 043880's down is
+ *      refused (55000) while 043890 is applied), so 043870 is the latest step; then 043860's down is refused (55000)
+ *      while 043870 is applied and drops nothing; 043870's down then 043860's down remove exactly their objects,
+ *      ledger rows and the runtime role's schema USAGE; a second runMigrations reapplies every rolled-back step with
+ *      the ledger equal to before and every role validation 'pass'.
  *  (b) the login guard: the three feed RPCs raise 42501 unless session_user is buffered_search_feed_runtime with
  *      no SET ROLE (the creator, the creator under SET ROLE, and bulls96_read_api are refused); the genuine
  *      runtime login is admitted. buffered_search_gate_for admits only bulls96_read_api (with its tenant pins).
@@ -40,7 +43,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import pg from "pg";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ownedLoopbackFixture } from "../../shared/__tests__/owned-loopback-fixture.ts";
 import { runMigrations, type MigrationProfile } from "../../hoopdb/migrate.ts";
@@ -56,6 +59,8 @@ const profile: MigrationProfile = { mode: "local", shim: true, bootstrap: true, 
 const READ = "bulls96_read_api";
 const GATE_NAME = "upstream:20261105043860_buffered_search_gate.sql";
 const FEED_NAME = "upstream:20261105043870_buffered_search_feed_cursor.sql";
+const BK_NAME = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
+const GR_NAME = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
 const FEED_FNS = ["sessions.buffered_search_feed_advance(jsonb)", "sessions.buffered_search_feed_page(jsonb)", "sessions.buffered_search_feed_stage(jsonb)"];
 const GATE_FN = "sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)";
 const FEED_GUARD = "buffered search feed: caller is not the buffered_search_feed_runtime login";
@@ -226,12 +231,34 @@ describe.skipIf(!fixtureUrl)("buffered search gate/feed migrations and the feede
     }
   }, 60000);
 
-  test("(a) 043860 and 043870 apply via runMigrations; 043870 rolls back before 043860; up again", async () => {
+  test("(a) 043860 and 043870 apply via runMigrations; later steps, then 043870, roll back before 043860; up again", async () => {
     const before = await ledger();
     expect(before).toEqual(expect.arrayContaining([GATE_NAME, FEED_NAME]));
     expect(await validationsPass()).toBe(true);
-    // 043870 must be the latest upstream step, or its own down is (correctly) refused too.
-    expect(before.filter((n) => n.startsWith("upstream:")).sort().at(-1)).toBe(FEED_NAME);
+    // Every down refuses (55000) while a later upstream step is applied, so the steps after 043870 go first, latest
+    // first, each from its committed rollback file. Names compare as COLLATE "C" in the guards; the default JS sort
+    // (UTF-16 code units) orders these ASCII names identically.
+    const upstream = () => ledger().then((ns) => ns.filter((n) => n.startsWith("upstream:")).sort());
+    const later = (await upstream()).filter((n) => n > FEED_NAME).reverse();
+    const downFile = (step: string) => {
+      const file = step.slice("upstream:".length).replace(/\.sql$/, ".down.sql");
+      if (!existsSync(join(root, "supabase/rollbacks", file)))
+        throw new Error(`upstream step ${step} is applied after ${FEED_NAME} but has no rollback supabase/rollbacks/${file}`);
+      return file;
+    };
+    const laterFiles = later.map(downFile);
+    // The order today, documented: 043890 goes before 043880, whose down is refused (55000, nothing changes) while
+    // 043890 is applied.
+    expect(later).toEqual(expect.arrayContaining([GR_NAME, BK_NAME]));
+    expect(later.indexOf(GR_NAME)).toBeLessThan(later.indexOf(BK_NAME));
+    expect(await down(downFile(BK_NAME))).toEqual({ code: "55000", message: "bookkeeping cleanup: a later migration is applied; roll it back first" });
+    expect(await ledger()).toEqual(expect.arrayContaining([BK_NAME, GR_NAME]));
+    for (const [i, step] of later.entries()) {
+      expect([step, await down(laterFiles[i]!)]).toEqual([step, { code: "accepted" }]);
+      expect(await ledger()).not.toContain(step);
+    }
+    // 043870 must now be the latest upstream step, or its own down is (correctly) refused too.
+    expect((await upstream()).at(-1)).toBe(FEED_NAME);
     await assertAcl();
     const gateFn = async () => (await one("SELECT to_regprocedure($1::text)::text AS r", [GATE_FN])).r as string | null;
     const feedFns = async () => (await one("SELECT count(to_regprocedure(f))::int AS n FROM unnest($1::text[]) f", [FEED_FNS])).n as number;
@@ -258,9 +285,10 @@ describe.skipIf(!fixtureUrl)("buffered search gate/feed migrations and the feede
     expect(await down("20261105043860_buffered_search_gate.down.sql")).toEqual({ code: "accepted" });
     expect(await ledger()).not.toContain(GATE_NAME);
     expect(await gateFn()).toBeNull();
-    expect(sorted(await ledger())).toEqual(sorted(before.filter((n) => n !== GATE_NAME && n !== FEED_NAME)));
+    expect(sorted(await ledger())).toEqual(sorted(before.filter((n) => n !== GATE_NAME && n !== FEED_NAME && !later.includes(n))));
 
-    // Up again: both reapply through the migrator (prerequisites already present), verify passes, ACL restored.
+    // Up again: 043860, 043870 and every later step reapply through the migrator (prerequisites already present),
+    // the ledger equals before, verify passes, ACL restored.
     await migrate();
     expect(sorted(await ledger())).toEqual(sorted(before));
     expect(await validationsPass()).toBe(true);
