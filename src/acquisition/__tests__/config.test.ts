@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { acquisitionConfig } from "../config.ts";
+import { REFUSED_ISSUER_ENV, acquisitionConfig } from "../config.ts";
+import { parsePinnedKeys } from "../key-registry.ts";
 import { NATIVE_SEED_HEX, pinnedKeysJson } from "./helpers.ts";
 
 const live = {
@@ -24,16 +25,83 @@ test("ops listener: loopback bind and port 8082 by default (8081 is the VPC-open
   expect(() => acquisitionConfig({ ACQUISITION_OPS_PORT: "8080" })).toThrow();
 });
 
-test("enabled: required variables, native needs signer + intent key, sub-flags default off", () => {
+test("enabled: required variables, ops sub-flag default off, no signer or intent key in the config", () => {
   const c = acquisitionConfig(live);
-  expect(c.enabled && [c.nativeEnabled, c.opsEnabled, c.signer, c.intentKey]).toEqual([false, false, null, null]);
+  expect(c.enabled && c.opsEnabled).toBe(false);
+  expect(Object.keys(c).sort()).toEqual(["databaseUrl", "enabled", "introspectSecret", "introspectUrl", "opsEnabled", "opsHost", "opsPort", "origin", "port", "registry"]);
+  const o = acquisitionConfig({ ...live, ACQUISITION_OPS_ENABLED: "true" });
+  expect(o.enabled && o.opsEnabled).toBe(true);
   for (const k of Object.keys(live).filter((k) => k !== "ACQUISITION_ENABLED"))
     expect(() => acquisitionConfig({ ...live, [k]: undefined })).toThrow();
   expect(() => acquisitionConfig({ ...live, ACQUISITION_ORIGIN: "https://history.example.test/path" })).toThrow();
-  expect(() => acquisitionConfig({ ...live, ACQUISITION_NATIVE_ENABLED: "true" })).toThrow();
-  const n = acquisitionConfig({ ...live, ACQUISITION_NATIVE_ENABLED: "true", ACQUISITION_ISSUER_KEY_ID: "native-key-1",
-    ACQUISITION_ISSUER_PRIVATE_KEY: Buffer.from(NATIVE_SEED_HEX, "hex").toString("base64"), ACQUISITION_INTENT_KEY: Buffer.alloc(32, 1).toString("base64") });
-  expect(n.enabled && n.signer?.issuerKeyId).toBe("native-key-1");
-  // The parsed config never serializes the private key.
-  expect(JSON.stringify(n).includes(Buffer.from(NATIVE_SEED_HEX, "hex").toString("base64"))).toBe(false);
+});
+
+test("verify-only: any issuer-era variable refuses startup, enabled or not, without echoing its value", () => {
+  const seed = Buffer.from(NATIVE_SEED_HEX, "hex").toString("base64");
+  expect(REFUSED_ISSUER_ENV).toEqual(["ACQUISITION_ISSUER_PRIVATE_KEY", "ACQUISITION_ISSUER_KEY_ID", "ACQUISITION_INTENT_KEY"]);
+  for (const name of REFUSED_ISSUER_ENV)
+    for (const base of [{}, { ACQUISITION_ENABLED: "false" }, live])
+      for (const value of [seed, ""]) {
+        let message = "";
+        try { acquisitionConfig({ ...base, [name]: value }); } catch (e) { message = String(e); }
+        expect([name, message]).toEqual([name, `Error: 96bulls: ${name} is set but the acquisition service is verify-only (relaycontrol is the sole issuer); remove it`]);
+      }
+  // The pre-rework native config (switch + key + key id + intent key) is refused, not silently ignored.
+  const legacy = { ...live, ACQUISITION_NATIVE_ENABLED: "true", ACQUISITION_ISSUER_KEY_ID: "native-key-1", ACQUISITION_ISSUER_PRIVATE_KEY: seed, ACQUISITION_INTENT_KEY: Buffer.alloc(32, 1).toString("base64") };
+  expect(() => acquisitionConfig(legacy)).toThrow(/verify-only/);
+  try { acquisitionConfig(legacy); } catch (e) { expect(String(e)).not.toContain(seed); }
+  for (const v of ["true", "yes", "1"])
+    for (const base of [{}, live]) expect(() => acquisitionConfig({ ...base, ACQUISITION_NATIVE_ENABLED: v })).toThrow(/ACQUISITION_NATIVE_ENABLED is not supported.*verify-only/);
+  // Unset, empty or "false" is the off state and still starts.
+  for (const v of [undefined, "", "false"]) expect(acquisitionConfig({ ...live, ACQUISITION_NATIVE_ENABLED: v }).enabled).toBe(true);
+});
+
+test("pinned keys: parsed, malformed refused, one public key under two issuerKeyIds refused across and within classes", () => {
+  expect([...parsePinnedKeys(pinnedKeysJson).keys()].sort()).toEqual(["native-key-1", "test-key-1"]);
+  expect(() => parsePinnedKeys("[]")).toThrow();
+  expect(() => parsePinnedKeys("not json")).toThrow();
+  expect(() => parsePinnedKeys(JSON.stringify([{ issuerKeyId: "k", issuerClass: "other", publicKeyBase64: "" }]))).toThrow();
+  const entries = JSON.parse(pinnedKeysJson) as Array<{ issuerKeyId: string; issuerClass: string; publicKeyBase64: string }>;
+  const cloud = entries.find((e) => e.issuerClass === "cloud")!;
+  const native = entries.find((e) => e.issuerClass === "native")!;
+  expect(() => parsePinnedKeys(JSON.stringify([cloud, { ...cloud, publicKeyBase64: native.publicKeyBase64 }]))).toThrow(/duplicate issuerKeyId/);
+  const crossClass = [cloud, native, { issuerKeyId: "cloud-key-2", issuerClass: "cloud", publicKeyBase64: native.publicKeyBase64 }];
+  expect(() => parsePinnedKeys(JSON.stringify(crossClass))).toThrow(/same public key under two issuerKeyIds/);
+  const sameClass = [cloud, native, { issuerKeyId: "native-key-2", issuerClass: "native", publicKeyBase64: native.publicKeyBase64 }];
+  expect(() => parsePinnedKeys(JSON.stringify(sameClass))).toThrow(/same public key under two issuerKeyIds/);
+  try { parsePinnedKeys(JSON.stringify(crossClass)); } catch (e) { expect(String(e)).not.toContain(native.publicKeyBase64); }
+});
+
+test("verify-only: no service module can sign, and the removed variables are read only by the refusal check", async () => {
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const dir = new URL("..", import.meta.url).pathname;
+  const files = readdirSync(dir).filter((f) => f.endsWith(".ts")).sort();
+  expect(files).toEqual(["app.ts", "config.ts", "installer.ts", "key-registry.ts", "main.ts", "validation.ts", "verifier.ts"]);
+  const removed = [...REFUSED_ISSUER_ENV, "ACQUISITION_NATIVE_ENABLED"];
+  for (const f of files) {
+    const src = readFileSync(dir + f, "utf8");
+    // No private-key parsing, signing, HMAC or symmetric encryption primitive anywhere in the service.
+    for (const banned of [/createPrivateKey/, /generateKeyPair/, /createSign\b/, /createHmac/, /createCipheriv/, /\bsign\s*\(/, /subtle\./, /\bimport\s*\{[^}]*\bsign\b[^}]*\}\s*from\s*"node:crypto"/])
+      expect([f, banned.source, banned.test(src)]).toEqual([f, banned.source, false]);
+    // No issuer-era module or symbol survives.
+    for (const gone of ["native-issuer", "intent-store", "NativeIssuer", "createIssuerSigner", "parseIssuerPrivateKey", "IssuerSigner", "intentKey", "assertKeysRetained"])
+      expect([f, gone, src.includes(gone)]).toEqual([f, gone, false]);
+    // The removed variables appear only in config.ts's refusal list/check (and its doc comment).
+    if (f !== "config.ts") for (const name of removed) expect([f, name, src.includes(name)]).toEqual([f, name, false]);
+  }
+  const config = readFileSync(dir + "config.ts", "utf8");
+  const body = config.slice(config.indexOf("export function acquisitionConfig"));
+  for (const name of removed) expect([name, body.includes(name)]).toEqual([name, false]);
+  // The key registry exposes public-key helpers only.
+  expect(Object.keys(await import("../key-registry.ts")).sort()).toEqual(["ed25519PublicKey", "parsePinnedKeys", "rawPublicKey", "registryOfClass"]);
+});
+
+test("verify-only: the refusal check reads only the removed names, and a clean environment never touches a value", () => {
+  const reads: string[] = [];
+  const env = new Proxy({ ...live, ACQUISITION_OPS_ENABLED: "true" } as NodeJS.ProcessEnv, { get: (t, k) => { reads.push(String(k)); return t[String(k)]; } });
+  const c = acquisitionConfig(env);
+  expect(c.enabled).toBe(true);
+  // Each removed name is looked up exactly once (the presence check) and nothing derived from it reaches the config.
+  for (const name of [...REFUSED_ISSUER_ENV, "ACQUISITION_NATIVE_ENABLED"]) expect([name, reads.filter((r) => r === name).length]).toEqual([name, 1]);
+  expect(JSON.stringify(c, (_k, v) => (v instanceof Map ? [...v.keys()] : v))).not.toMatch(/ISSUER_PRIVATE|INTENT_KEY|signer/i);
 });

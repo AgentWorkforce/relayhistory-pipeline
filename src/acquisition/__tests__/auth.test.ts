@@ -1,12 +1,14 @@
 // Auth refusal matrix: fake authenticator for the route rules, and the real
 // acquisition verifier (verifier.ts, fake fetch) for every cell of
-// prefix x principal_type x scope x route, audience, timeout and outages.
+// prefix x principal_type x scope on the ops route, audience, timeout and
+// outages. The service is verify-only: there is no native route group.
 import { expect, test } from "bun:test";
 import { createAcquisitionApp } from "../app.ts";
-import { createAcquisitionVerifier, type AcquisitionGroup } from "../verifier.ts";
-import { FakeAuthenticator, ORIGIN, call, captureLog, leaks, nativeHarness, opsHarness, opsPrincipal, principal, secrets } from "./helpers.ts";
+import { createAcquisitionVerifier } from "../verifier.ts";
+import { FakeAuthenticator, ORIGIN, call, captureLog, leaks, opsHarness, opsPrincipal, principal, secrets } from "./helpers.ts";
 
 const NATIVE_STATUS = "/v1/acquisition/native/status?installationId=00000000-0000-4000-8000-0000000000aa&source=droid&sessionIds=s1";
+const FORMER_NATIVE = [["POST", "/v1/acquisition/native/installations"], ["POST", "/v1/acquisition/native/claims"], ["POST", "/v1/acquisition/native/revocations"], ["POST", "/v1/acquisition/native/rebinds"], ["GET", NATIVE_STATUS]] as const;
 const OPS_STATUS = "/v1/acquisition/ops/status";
 const opsBody = { orgId: "org_test", workspaceId: "ws_test", source: "droid", sessionIds: ["s1"] };
 
@@ -29,26 +31,28 @@ test("group flag off: 503 acquisition_disabled", async () => {
   expect((await call(app, "POST", OPS_STATUS, { token: "sh_wk_ops", body: opsBody })).status).toBe(503);
 });
 
-test("native refusal matrix", async () => {
-  const h = nativeHarness();
-  h.auth.tokens.set("sh_at_noscope", principal({ scopes: ["rth:sync"] }));
-  h.auth.tokens.set("sh_at_service", principal({ principalType: "service" }));
-  h.auth.tokens.set("sh_at_nows", principal({ workspaceId: undefined }));
-  h.auth.tokens.set("sh_wk_alice", principal()); // valid desktop principal behind the ops token class
-  expect((await call(h.app, "GET", NATIVE_STATUS)).status).toBe(401); // no token
-  expect((await call(h.app, "GET", NATIVE_STATUS, { headers: { Authorization: "Basic abc" } })).status).toBe(401);
-  expect((await call(h.app, "GET", NATIVE_STATUS, { token: "not-a-relaycontrol-token" })).status).toBe(401);
-  expect((await call(h.app, "GET", NATIVE_STATUS, { token: "sh_at_unknown" })).status).toBe(401); // rejected (bad aud etc.)
-  expect((await call(h.app, "GET", NATIVE_STATUS, { token: "sh_wk_alice" })).status).toBe(401); // sh_wk_ never reaches introspection on native
-  for (const t of ["sh_at_noscope", "sh_at_service", "sh_at_nows"]) {
-    const r = await call(h.app, "GET", NATIVE_STATUS, { token: t });
-    expect([t, r.status, r.json]).toEqual([t, 403, { error: { code: "not_authorized" } }]);
-  }
-  const down = await call(h.app, "GET", NATIVE_STATUS, { token: "sh_at_down" });
-  expect([down.status, down.json]).toEqual([503, { error: { code: "introspection_unavailable" } }]);
-  expect(down.headers.get("Retry-After")).toBe("5");
+test("verify-only: no native routes; the dormant listener is 503, the ops listener 404, neither authenticates", async () => {
+  const dormant = createAcquisitionApp({ enabled: false, group: "native", log: () => {} });
+  const h = opsHarness();
+  let introspected = 0;
+  const counting = { authenticate: async (t: string) => { introspected++; return h.auth.authenticate(t); } };
+  const ops = createAcquisitionApp({ enabled: true, group: "ops", groupEnabled: true, authenticator: counting, installer: h.installer, log: () => {} });
+  h.auth.tokens.set("sh_at_alice", principal());
+  for (const [method, path] of FORMER_NATIVE)
+    for (const token of ["sh_at_alice", "sh_wk_ops"]) {
+      const body = method === "POST" ? {} : undefined;
+      const d = await call(dormant, method, path, { token, body });
+      expect([path, d.status, d.json]).toEqual([path, 503, { error: { code: "acquisition_disabled" } }]);
+      const o = await call(ops, method, path, { token, body });
+      expect([path, o.status, o.json]).toEqual([path, 404, { error: { code: "not_found" } }]);
+    }
+  expect(introspected).toBe(0);
   expect(h.sql.calls.length).toBe(0);
-  expect(h.store.calls.length).toBe(0);
+  // A valid-looking native claim body against the ops listener is still 404: nothing reads, verifies or signs it.
+  const claim = await call(ops, "POST", "/v1/acquisition/native/claims", { token: "sh_at_alice", body: { installationId: "00000000-0000-4000-8000-0000000000aa", source: "droid", sessionId: "s1" }, headers: { "X-Acquisition-Installation-Proof": "p" } });
+  expect([claim.status, claim.json, claim.text.includes("signature"), claim.text.includes("assertion")]).toEqual([404, { error: { code: "not_found" } }, false, false]);
+  expect([introspected, h.sql.calls.length]).toEqual([0, 0]);
+  expect((await call(dormant, "GET", "/healthz")).json).toEqual({ ok: true, enabled: false, group: "native" });
 });
 
 test("ops refusal matrix: only a service principal with acquisition:operate", async () => {
@@ -81,7 +85,7 @@ const TOKENS = { sh_at_: "sh_at_realtoken", sh_wk_: "sh_wk_realtoken" } as const
 for (const t of Object.values(TOKENS)) secrets.add(t);
 
 type Sent = { url: string; body: Record<string, unknown>; authorization: string | null };
-function realApp(group: AcquisitionGroup, answer: (body: Record<string, unknown>) => Response | Promise<Response>, timeoutMs = 50) {
+function realApp(answer: (body: Record<string, unknown>) => Response | Promise<Response>, timeoutMs = 50) {
   const captured = captureLog();
   const sent: Sent[] = [];
   const authenticator = createAcquisitionVerifier({
@@ -99,83 +103,62 @@ function realApp(group: AcquisitionGroup, answer: (body: Record<string, unknown>
       ]);
     }) as unknown as typeof fetch,
   });
-  if (group === "native") {
-    const h = nativeHarness();
-    const app = createAcquisitionApp({ enabled: true, group, groupEnabled: true, authenticator, issuer: h.issuer, log: captured.log });
-    return { app, captured, sent, touched: () => h.sql.calls.length + h.store.calls.length };
-  }
   const h = opsHarness();
-  const app = createAcquisitionApp({ enabled: true, group, groupEnabled: true, authenticator, installer: h.installer, log: captured.log });
+  const app = createAcquisitionApp({ enabled: true, group: "ops", groupEnabled: true, authenticator, installer: h.installer, log: captured.log });
   return { app, captured, sent, touched: () => h.sql.calls.length };
 }
+/** An active introspection answer for the ops route's service principal (no sub). */
 const active = (over: Record<string, unknown> = {}) => Response.json({
-  active: true, sub: "user_test", email: null, principal_type: "desktop-user", machine_id: null, org: "org_test", workspace: "ws_test",
-  scopes: ["rth:acquire", "rth:sync"], aud: ORIGIN + "/", iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 600, token_id: "tok_1", ...over,
+  active: true, email: null, principal_type: "service", machine_id: null, org: "org_test", workspace: "ws_test",
+  scopes: ["acquisition:operate"], aud: ORIGIN + "/", iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 600, token_id: "tok_1", ...over,
 });
-const request = (group: AcquisitionGroup, app: Parameters<typeof call>[0], token: string) =>
-  group === "native" ? call(app, "GET", NATIVE_STATUS, { token }) : call(app, "POST", OPS_STATUS, { token, body: opsBody });
+const request = (app: Parameters<typeof call>[0], token: string) => call(app, "POST", OPS_STATUS, { token, body: opsBody });
 
-const passed = (group: AcquisitionGroup, res: { status: number; json: unknown }) =>
-  group === "native"
-    ? res.status === 403 && JSON.stringify(res.json) === JSON.stringify({ error: { code: "installation_not_proven" } })
-    : res.status === 200;
-
-test("verifier matrix: prefix x principal_type x scope x route", async () => {
+test("verifier matrix: prefix x principal_type x scope (ops route)", async () => {
   const prefixes = ["sh_at_", "sh_wk_"] as const;
   const principals = ["desktop-user", "service", "agent", "", undefined];
   const scopeSets = [["rth:acquire"], ["acquisition:operate"], ["rth:acquire", "acquisition:operate"], ["rth:read"], []];
   let cells = 0;
-  for (const group of ["native", "ops"] as const)
-    for (const prefix of prefixes)
-      for (const principalType of principals)
-        for (const scopes of scopeSets) {
-          const want = group === "native"
-            ? { prefix: "sh_at_", principalType: "desktop-user", scope: "rth:acquire", refused: 401 }
-            : { prefix: "sh_wk_", principalType: "service", scope: "acquisition:operate", refused: 403 };
-          const answer = { principal_type: principalType, scopes, ...(principalType === "service" ? { sub: undefined } : {}) };
-          const r = realApp(group, () => active(answer));
-          const res = await request(group, r.app, TOKENS[prefix]);
-          let expected: number;
-          if (prefix !== want.prefix) expected = want.refused; // wrong token class: refused before introspection
-          else if (principalType === undefined || principalType === "" || principalType === "agent") expected = want.refused; // unknown: fail closed
-          else if (principalType !== want.principalType || !scopes.includes(want.scope)) expected = 403;
-          else expected = 200;
-          const label = `${group} ${prefix} ${String(principalType)} [${scopes.join(",")}]`;
-          // A pass reaches the route: native status then asks for the installation proof
-          // (403 installation_not_proven), ops status answers 200. Every auth refusal touches no SQL.
-          if (expected === 200) expect([label, passed(group, res)]).toEqual([label, true]);
-          else {
-            expect([label, res.status]).toEqual([label, expected]);
-            expect([label, r.touched()]).toEqual([label, 0]);
-          }
-          expect([label, r.sent.length]).toEqual([label, prefix === want.prefix ? 1 : 0]);
-          cells++;
-        }
-  expect(cells).toBe(2 * 2 * 5 * 5);
+  for (const prefix of prefixes)
+    for (const principalType of principals)
+      for (const scopes of scopeSets) {
+        const answer = { principal_type: principalType, scopes, ...(principalType === "desktop-user" ? { sub: "user_test" } : {}) };
+        const r = realApp(() => active(answer));
+        const res = await request(r.app, TOKENS[prefix]);
+        // Every refusal is 403 (contract P2): wrong token class (before introspection), unknown
+        // principal_type (fail closed), a desktop-user principal, or a missing acquisition:operate scope.
+        const expected = prefix === "sh_wk_" && principalType === "service" && scopes.includes("acquisition:operate") ? 200 : 403;
+        const label = `${prefix} ${String(principalType)} [${scopes.join(",")}]`;
+        expect([label, res.status]).toEqual([label, expected]);
+        if (expected !== 200) expect([label, r.touched()]).toEqual([label, 0]);
+        expect([label, r.sent.length]).toEqual([label, prefix === "sh_wk_" ? 1 : 0]);
+        cells++;
+      }
+  expect(cells).toBe(2 * 5 * 5);
 });
 
 test("verifier: #313 wire contract (path, secret header, body has only token and aud = ACQUISITION_ORIGIN)", async () => {
-  const r = realApp("ops", () => active({ principal_type: "service", scopes: ["acquisition:operate"], sub: undefined }));
-  await request("ops", r.app, TOKENS.sh_wk_);
+  const r = realApp(() => active());
+  await request(r.app, TOKENS.sh_wk_);
   expect(r.sent).toEqual([{ url: "https://relaycontrol.example.test/base/internal/v1/auth/introspect", body: { token: TOKENS.sh_wk_, aud: ORIGIN }, authorization: `Bearer ${INTROSPECT_SECRET}` }]);
 });
 
 test("verifier: echoed aud must equal ACQUISITION_ORIGIN by normalized origin", async () => {
-  for (const [aud, status] of [[ORIGIN, 200], [ORIGIN.toUpperCase() + "/x", 200], ["https://other.example.test", 401], ["https://history.example.test:8443", 401], ["not a url", 401]] as const) {
-    const r = realApp("native", () => active({ aud }));
-    const res = await request("native", r.app, TOKENS.sh_at_);
-    expect([aud, passed("native", res) ? 200 : res.status]).toEqual([aud, status]);
+  for (const [aud, status] of [[ORIGIN, 200], [ORIGIN.toUpperCase() + "/x", 200], ["https://other.example.test", 403], ["https://history.example.test:8443", 403], ["not a url", 403]] as const) {
+    const r = realApp(() => active({ aud }));
+    const res = await request(r.app, TOKENS.sh_wk_);
+    expect([aud, res.status]).toEqual([aud, status]);
   }
 });
 
 test("verifier: inactive, expired, desktop-user without sub; outages and malformed answers are 503", async () => {
   const now = Math.floor(Date.now() / 1000);
   for (const [answer, status] of [
-    [() => Response.json({ active: false }), 401],
-    [() => active({ exp: now - 1 }), 401],
-    [() => active({ sub: undefined }), 503],
+    [() => Response.json({ active: false }), 403],
+    [() => active({ exp: now - 1 }), 403],
+    [() => active({ principal_type: "desktop-user", scopes: ["acquisition:operate"] }), 503],
     [() => active({ workspace: undefined }), 503],
-    [() => active({ scopes: "rth:acquire" }), 503],
+    [() => active({ scopes: "acquisition:operate" }), 503],
     [() => new Response("x".repeat(17 * 1024), { status: 200 }), 503],
     [() => new Response("{not json", { status: 200 }), 503],
     [() => new Response(null, { status: 401 }), 503],
@@ -184,8 +167,8 @@ test("verifier: inactive, expired, desktop-user without sub; outages and malform
     [() => { throw new TypeError("network"); }, 503],
     [() => new Promise<Response>(() => {}), 503],
   ] as const) {
-    const r = realApp("native", answer as () => Response, 30);
-    const res = await request("native", r.app, TOKENS.sh_at_);
+    const r = realApp(answer as () => Response, 30);
+    const res = await request(r.app, TOKENS.sh_wk_);
     expect(res.status).toBe(status);
     if (status === 503) expect(res.json).toEqual({ error: { code: "introspection_unavailable" } });
     expect(r.touched()).toBe(0);

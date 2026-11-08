@@ -1,34 +1,34 @@
 /**
- * HTTP surface of the acquisition exchange (SERVICE=acquisition). Two route
- * groups, each mounted on its OWN listener (main.ts) so the private operations
- * port is never reachable through the Desktop ingress:
+ * HTTP surface of the acquisition exchange (SERVICE=acquisition). Verify-only:
+ * the pipeline never mints, signs or stores acquisition credentials;
+ * relaycontrol is the sole issuer. One route group serves requests:
  *
- *   native (Desktop -> History, desktop-user principal, scope rth:acquire)
- *     POST /v1/acquisition/native/installations | claims | revocations | rebinds
- *     GET  /v1/acquisition/native/status?installationId=&source=&sessionIds=a&sessionIds=b (repeated, never comma-split)
- *   ops (Cloud issuer -> History, per-workspace service principal, scope acquisition:operate)
+ *   ops (relaycontrol issuer -> History, per-workspace service principal, scope acquisition:operate)
  *     POST /v1/acquisition/ops/install | revoke | rebind | status
+ *     Each mutation carries an assertion signed by relaycontrol; installer.ts verifies it
+ *     against the pinned cloud-class keys (#322 verifier) and forwards it to the SQL installer.
+ *
+ * main.ts mounts ops on its OWN private listener. The other listener
+ * (ACQUISITION_PORT) is a dormant app: /healthz, and 503 acquisition_disabled
+ * for everything else. There is no native (Desktop-facing) route group.
  *
  * Auth: Bearer only, verified by this service's own introspection client
  * (verifier.ts: #313 wire contract, per-route prefix / principal_type / scope,
  * aud = ACQUISITION_ORIGIN compared by normalized origin), identity only from
  * the introspection answer, fail closed (503) when introspection is
  * unavailable. Every ops refusal is 403 not_authorized (contract P2), including
- * a missing bearer; native mirrors the edge (401 for a missing or refused token). No client header is forwarded anywhere. The
- * bearer, the installation proof, G and key material are never logged: the
- * logger receives only allowlisted fields built here.
+ * a missing bearer. No client header is forwarded anywhere. The bearer, the
+ * signature and key material are never logged: the logger receives only
+ * allowlisted fields built here.
  */
 import { Hono, type Context } from "hono";
 import { RelaycontrolRejectedError } from "@rhc/auth/relaycontrol.ts";
 import { log as sharedLog, type Level } from "../shared/log.ts";
 import { httpForError, type Installer } from "./installer.ts";
-import { INSTALLATION_PROOF_HEADER, NativeRefusal, requestedInstallationId, type NativeIdentity, type NativeIssuer } from "./native-issuer.ts";
 import type { AcquisitionKind } from "./validation.ts";
 import { ACQUISITION_POLICIES, tokenFitsGroup, type AcquisitionGroup, type AcquisitionPrincipal, type Authenticator } from "./verifier.ts";
 
-export const NATIVE_SCOPE = ACQUISITION_POLICIES.native.scope;
 export const OPS_SCOPE = ACQUISITION_POLICIES.ops.scope;
-export const NATIVE_PRINCIPAL = ACQUISITION_POLICIES.native.principalType;
 export const OPS_PRINCIPAL = ACQUISITION_POLICIES.ops.principalType;
 export const MAX_BODY_BYTES = 64 * 1024;
 /**
@@ -44,16 +44,8 @@ export type { AcquisitionGroup, AcquisitionPrincipal, Authenticator };
 export type AcquisitionLog = (level: Level, message: string, fields: Record<string, unknown>) => void;
 
 export type AcquisitionAppDeps =
+  /** Dormant: /healthz, every other route 503 acquisition_disabled. The only shape for the native listener. */
   | { readonly enabled: false; readonly group: AcquisitionGroup; readonly log?: AcquisitionLog }
-  | {
-      readonly enabled: true;
-      readonly group: "native";
-      /** ACQUISITION_NATIVE_ENABLED; false answers 503 acquisition_disabled. */
-      readonly groupEnabled: boolean;
-      readonly authenticator: Authenticator;
-      readonly issuer: NativeIssuer | null;
-      readonly log?: AcquisitionLog;
-    }
   | {
       readonly enabled: true;
       readonly group: "ops";
@@ -68,13 +60,12 @@ type Env = { Variables: { correlationId: string } };
 type Answer = { status: number; body: unknown };
 
 class HttpRefusal extends Error {
-  constructor(readonly status: 400 | 401 | 403 | 404 | 413 | 414 | 415 | 503, readonly code: string) {
+  constructor(readonly status: 400 | 403 | 404 | 413 | 414 | 415 | 503, readonly code: string) {
     super(code);
     this.name = "HttpRefusal";
   }
 }
 
-const NATIVE_ROUTES = new Set(["POST installations", "POST claims", "POST revocations", "POST rebinds", "GET status"]);
 const OPS_ROUTES = new Set(["POST install", "POST revoke", "POST rebind", "POST status"]);
 
 function bearer(header: string | undefined): string | null {
@@ -127,7 +118,7 @@ export function createAcquisitionApp(deps: AcquisitionAppDeps) {
   app.all("*", async (c) => {
     const started = Date.now();
     const route = c.req.path.startsWith(prefix) ? `${c.req.method} ${c.req.path.slice(prefix.length)}` : "";
-    const known = (group === "native" ? NATIVE_ROUTES : OPS_ROUTES).has(route);
+    const known = group === "ops" && OPS_ROUTES.has(route);
     const fields: Record<string, unknown> = { route: known ? `${group} ${route}` : "unknown", correlation_id: c.get("correlationId"), kind: group };
     let answer: Answer;
     try {
@@ -138,12 +129,10 @@ export function createAcquisitionApp(deps: AcquisitionAppDeps) {
       } else if (!known) {
         answer = { status: 404, body: { error: { code: "not_found" } } };
       } else {
-        const principal = await authenticate(c, deps.authenticator, group);
+        const principal = await authenticate(c, deps.authenticator);
         fields.org_id = principal.orgId;
         fields.workspace_id = principal.workspaceId;
-        answer = deps.group === "native"
-          ? await nativeRoute(c, deps.issuer, route, principal)
-          : await opsRoute(c, deps.installer, route, principal);
+        answer = await opsRoute(c, deps.installer, route, principal);
       }
     } catch (error) {
       answer = refusalAnswer(error, group);
@@ -175,17 +164,17 @@ function errorCode(body: object): string | undefined {
 
 function refusalAnswer(error: unknown, group: AcquisitionGroup): Answer {
   if (error instanceof HttpRefusal) return { status: error.status, body: { error: { code: error.code } } };
-  if (error instanceof NativeRefusal) return { status: error.status, body: error.body };
   return httpForError(error, group);
 }
 
-/** Steps: bearer, token shape, introspection, principal type, workspace, scope. */
-async function authenticate(c: Context<Env>, authenticator: Authenticator, group: AcquisitionGroup): Promise<AcquisitionPrincipal> {
-  // Ops: every refusal, a missing bearer included, is 403 not_authorized (contract P2); native mirrors the edge (401).
-  const rejected = () => (group === "ops" ? new HttpRefusal(403, "not_authorized") : new HttpRefusal(401, "unauthorized"));
+/** Steps: bearer, token shape, introspection, principal type, workspace, scope. Ops only. */
+async function authenticate(c: Context<Env>, authenticator: Authenticator): Promise<AcquisitionPrincipal> {
+  const group = "ops" as const;
+  // Every refusal, a missing bearer included, is 403 not_authorized (contract P2).
+  const rejected = () => new HttpRefusal(403, "not_authorized");
   const token = bearer(c.req.header("Authorization"));
   if (!token) throw rejected();
-  // Per-route token class: ops takes only sh_wk_, native only sh_at_; the other is refused before introspection.
+  // Token class: ops takes only sh_wk_; anything else is refused before introspection.
   if (!tokenFitsGroup(token, group)) throw rejected();
   let principal: AcquisitionPrincipal;
   try {
@@ -197,28 +186,7 @@ async function authenticate(c: Context<Env>, authenticator: Authenticator, group
   const policy = ACQUISITION_POLICIES[group];
   if (principal.principalType !== policy.principalType || !principal.workspaceId || !principal.scopes.includes(policy.scope))
     throw new HttpRefusal(403, "not_authorized");
-  if (group === "native" && !principal.userId) throw new HttpRefusal(403, "not_authorized");
   return principal;
-}
-
-async function nativeRoute(c: Context<Env>, issuer: NativeIssuer | null, route: string, principal: AcquisitionPrincipal): Promise<Answer> {
-  if (!issuer) throw new HttpRefusal(503, "acquisition_disabled");
-  const identity: NativeIdentity = { orgId: principal.orgId, workspaceId: principal.workspaceId!, userId: principal.userId! };
-  if (route === "POST installations") return { status: 200, body: await issuer.registerInstallation(identity, await jsonBody(c)) };
-  const proof = c.req.header(INSTALLATION_PROOF_HEADER) ?? null;
-  if (route === "GET status") {
-    const url = new URL(c.req.url);
-    const installation = await issuer.proveInstallation(identity, requestedInstallationId({ installationId: url.searchParams.get("installationId") }), proof);
-    // Session ids are opaque: one id per repeated parameter, never split (an id may contain a comma).
-    const sessionIds = [...url.searchParams.getAll("sessionIds"), ...url.searchParams.getAll("sessionId")];
-    return { status: 200, body: { result: await issuer.status(identity, installation, { source: url.searchParams.get("source"), sessionIds }) } };
-  }
-  const body = await jsonBody(c);
-  // P3a: prove possession before ANY intent-store or SQL read.
-  const installation = await issuer.proveInstallation(identity, requestedInstallationId(body), proof);
-  if (route === "POST claims") return { status: 200, body: await issuer.claim(identity, installation, body) };
-  if (route === "POST revocations") return { status: 200, body: await issuer.revoke(identity, installation, body) };
-  return { status: 200, body: await issuer.rebind(identity, installation, body) };
 }
 
 async function opsRoute(c: Context<Env>, installer: Installer | null, route: string, principal: AcquisitionPrincipal): Promise<Answer> {

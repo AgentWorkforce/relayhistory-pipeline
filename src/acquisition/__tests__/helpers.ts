@@ -1,8 +1,10 @@
 /**
  * Test fixtures. Keys are the public RFC 8032 test vectors (key 1 = the cloud
- * issuer of the §3 vectors, key 2 = the native issuer): never deployed keys.
+ * issuer of the §3 vectors, key 2 = a native-class key the ops port must
+ * refuse): never deployed keys. Signing here only stands in for relaycontrol,
+ * the sole issuer; the service under test only verifies.
  */
-import { createPrivateKey, createPublicKey, randomBytes, sign } from "node:crypto";
+import { createPrivateKey, createPublicKey, sign } from "node:crypto";
 import {
   acquisitionAssertionBytes,
   acquisitionAssertionDigests,
@@ -11,9 +13,7 @@ import {
 } from "../../session-ingest/acquisition-assertion.ts";
 import { createAcquisitionApp, type AcquisitionPrincipal, type Authenticator } from "../app.ts";
 import { AcquisitionSql, Installer, type AcquisitionSqlExecutor, type SqlFunction } from "../installer.ts";
-import { MemoryAcquisitionStore } from "../intent-store.ts";
-import { createIssuerSigner, rawPublicKey, registryOfClass } from "../key-registry.ts";
-import { NativeIssuer } from "../native-issuer.ts";
+import { rawPublicKey, registryOfClass } from "../key-registry.ts";
 import { RelaycontrolRejectedError } from "@rhc/auth/relaycontrol.ts";
 
 const PKCS8 = "302e020100300506032b657004220420";
@@ -32,7 +32,6 @@ export const pinnedKeysJson = JSON.stringify([
   { issuerKeyId: CLOUD_KEY_ID, issuerClass: "cloud", publicKeyBase64: rawPublicKey(createPublicKey(cloudKey)).toString("base64") },
   { issuerKeyId: NATIVE_KEY_ID, issuerClass: "native", publicKeyBase64: rawPublicKey(createPublicKey(nativeKey)).toString("base64") },
 ]);
-export const intentKeyBytes = Buffer.alloc(32, 7);
 
 export const ORG = "org_test";
 export const WS = "ws_test";
@@ -40,13 +39,7 @@ export const USER = "user_test";
 export const ORIGIN = "https://history.example.test";
 
 /** Every secret a log line must never contain, filled in as tests run. */
-export const secrets = new Set<string>([CLOUD_SEED_HEX, NATIVE_SEED_HEX, intentKeyBytes.toString("base64"), intentKeyBytes.toString("hex")]);
-
-export function newProof(): string {
-  const proof = randomBytes(32).toString("base64url");
-  secrets.add(proof);
-  return proof;
-}
+export const secrets = new Set<string>([CLOUD_SEED_HEX, NATIVE_SEED_HEX]);
 
 // ---------------------------------------------------------------- signed envelopes
 
@@ -176,7 +169,7 @@ export const principal = (over: Partial<AcquisitionPrincipal> = {}): Acquisition
 export const opsPrincipal = (over: Partial<AcquisitionPrincipal> = {}): AcquisitionPrincipal =>
   principal({ userId: "svc_cloud", scopes: ["acquisition:operate"], principalType: "service", ...over });
 
-/** Tokens -> principals; "sh_at_down" simulates an outage; anything else is rejected. */
+/** Tokens -> principals; a token ending "_down" simulates an outage; anything else is rejected. */
 export class FakeAuthenticator implements Authenticator {
   readonly tokens = new Map<string, AcquisitionPrincipal>();
   async authenticate(token: string): Promise<AcquisitionPrincipal> {
@@ -195,19 +188,6 @@ export function captureLog() {
 
 // ---------------------------------------------------------------- harness
 
-export function nativeHarness() {
-  const sql = new FakeSql();
-  const clock = { now: 1_000_000 };
-  const store = new MemoryAcquisitionStore(() => clock.now);
-  const signer = createIssuerSigner(NATIVE_KEY_ID, nativeKey, registry);
-  const issuer = new NativeIssuer({ store, sql: new AcquisitionSql(sql), signer, intentKey: intentKeyBytes, now: () => clock.now });
-  const auth = new FakeAuthenticator();
-  auth.tokens.set("sh_at_alice", principal());
-  const captured = captureLog();
-  const app = createAcquisitionApp({ enabled: true, group: "native", groupEnabled: true, authenticator: auth, issuer, log: captured.log });
-  return { sql, store, issuer, auth, app, captured, signer, clock };
-}
-
 export function opsHarness() {
   const sql = new FakeSql();
   const installer = new Installer(new AcquisitionSql(sql), registryOfClass(registry, "cloud"));
@@ -218,10 +198,9 @@ export function opsHarness() {
   return { sql, installer, auth, app, captured };
 }
 
-export async function call(app: { request: (path: string, init?: RequestInit) => Response | Promise<Response> }, method: string, path: string, opts: { token?: string; body?: unknown; proof?: string; headers?: Record<string, string> } = {}) {
+export async function call(app: { request: (path: string, init?: RequestInit) => Response | Promise<Response> }, method: string, path: string, opts: { token?: string; body?: unknown; headers?: Record<string, string> } = {}) {
   const headers: Record<string, string> = { ...(opts.headers ?? {}) };
   if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
-  if (opts.proof) headers["X-Acquisition-Installation-Proof"] = opts.proof;
   if (opts.body !== undefined) headers["Content-Type"] ??= "application/json";
   const res = await app.request(path, { method, headers, body: opts.body === undefined ? undefined : typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body) });
   const text = await res.text();
