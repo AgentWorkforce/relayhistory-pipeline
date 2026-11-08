@@ -1,6 +1,6 @@
 # Acquisition cleanup debt
 
-Operator runbook for native acquisition installs that could not reserve a revoke (PR #331, `src/acquisition/`). It is a source-level checklist: the tables are only a proposal (`supabase/acquisition-intents.proposed.sql`, never applied directly), and this runbook grants no permission to apply DDL, deploy, enable the service or touch credentials. Enablement stays behind `ACQUISITION_ENABLED` and `ACQUISITION_NATIVE_ENABLED` (`src/acquisition/config.ts`, `docs/acquisition-exchange.md`).
+Operator runbook for native acquisition installs that could not reserve a revoke (PR #331, `src/acquisition/`). It is a source-level checklist: the tables are only a proposal (`supabase/acquisition-intents.proposed.sql`, never applied directly), and this runbook grants no permission to apply DDL, deploy, enable the service or touch credentials. Enablement stays behind `ACQUISITION_ENABLED` and `ACQUISITION_NATIVE_ENABLED` (`src/acquisition/config.ts`, `docs/acquisition-exchange.md`). The HELD Q3 Cloud publication receiver has its own default-off flag, `ACQUISITION_CLOUD_PUBLICATION_ENABLED` (`runbooks/acquisition-cloud-publication.md`).
 
 ## 1. What cleanup debt is, and why it is never dropped
 

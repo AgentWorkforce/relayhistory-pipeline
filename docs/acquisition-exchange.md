@@ -11,7 +11,7 @@ The A/S codec and verifier are the peer module `src/session-ingest/acquisition-a
 Code: `src/acquisition/` (`app.ts` routes and auth, `config.ts` env, `installer.ts` SQL
 adapter, error table and ops handler, `native-issuer.ts` P3/P3a, `intent-store.ts` durable
 intents, `key-registry.ts` pinned keys and signer, `verifier.ts` acquisition token verifier,
-`main.ts` listeners and reconciler).
+`cloud-batches.ts` the HELD Q3 publication receiver, `main.ts` listeners and reconciler).
 Proposed DDL: `supabase/acquisition-intents.proposed.sql` (not a migration; never applied by
 this branch). It follows the babysitter migration conventions (role guard, REVOKE from every
 known role, column-scoped grants) and carries a **DEVIATION** block from design §6 for the SQL
@@ -40,8 +40,12 @@ This answers the Cloud phase-2 publisher. It changes no deployed name or source 
      - It is part of contract v1, specified in PR #314 §9 ("Private Cloud publication port (Q3,
        implementation contract v1)", head d72a664bab17): a three-field wrapper with a strict
        ordinary durable receipt, scoped separately from P2.
-     - It is **not implemented on this branch**. Its handler, ingress binding and tests land in
-       a follow-up source PR on top of this service. Until then it answers `404 not_found` here.
+     - It is implemented on the **ops listener only** (`src/acquisition/cloud-batches.ts`) and is
+       **HELD**: behind its own flag `ACQUISITION_CLOUD_PUBLICATION_ENABLED`, default `false`,
+       independent of `ACQUISITION_OPS_ENABLED`. With the flag off it answers a static
+       `503 acquisition_disabled`; with the flag on but its config incomplete, `503
+       acquisition_cloud_unconfigured`. On the native (Desktop) listener the path is `404`.
+       Operator runbook and refusal matrix: `runbooks/acquisition-cloud-publication.md`.
    - Auth for both:
      - `Authorization: Bearer <token>`, introspected by the deployment's relaycontrol, which is
        the token issuer.
@@ -51,9 +55,12 @@ This answers the Cloud phase-2 publisher. It changes no deployed name or source 
      - Envelopes must be signed by a `cloud`-class key in `ACQUISITION_PINNED_KEYS`.
 3. **Canonical path and fallback.**
    - The canonical phase-2 path is authenticated HTTPS to `ACQUISITION_ORIGIN` +
-     `/v1/acquisition/ops/*`, plus `/v1/acquisition/cloud/batches` once the follow-up lands.
+     `/v1/acquisition/ops/*`, plus `/v1/acquisition/cloud/batches` once its flag is enabled.
    - There is no alternate transport, no service binding, no legacy publisher, no provider key,
-     no generic user token, no ingest-HMAC or `rth:sync` path, and no fallback.
+     no generic user token, no caller-facing ingest-HMAC or `rth:sync` path, and no fallback.
+     (The Q3 receiver itself signs its private hop to Ingest with the existing edge signer and
+     `ACQUISITION_CLOUD_INGEST_SIGNING_KEY`; that HMAC authenticates the internal hop only and
+     is never accepted from, or exposed to, the caller.)
    - A missing receiver or missing configuration is refused, never retried elsewhere.
 
 ### Verifier in use
@@ -67,7 +74,7 @@ policy:
 | Route group | Token prefix | principal_type | Scope |
 |---|---|---|---|
 | native | `sh_at_` | `desktop-user` | `rth:acquire` |
-| ops (and the future Q3 route) | `sh_wk_` (§9.1 per-workspace service token) | `service` | `acquisition:operate` |
+| ops (and the Q3 `cloud/batches` route) | `sh_wk_` (§9.1 per-workspace service token) | `service` | `acquisition:operate` |
 
 - A token with the other group's prefix is refused before introspection.
 - The real `principal_type` is returned; an unknown or absent one is refused (fail closed).
@@ -85,7 +92,7 @@ the Desktop ingress:
 | Listener | Env | Routes | Exposure |
 |---|---|---|---|
 | native | `ACQUISITION_PORT` (0.0.0.0:8080) | `/v1/acquisition/native/*`, `/healthz` | Desktop ingress (same as uploads) |
-| ops | `ACQUISITION_OPS_HOST`:`ACQUISITION_OPS_PORT` (127.0.0.1:8082) | `/v1/acquisition/ops/*`, `/healthz` | loopback only by default |
+| ops | `ACQUISITION_OPS_HOST`:`ACQUISITION_OPS_PORT` (127.0.0.1:8082) | `/v1/acquisition/ops/*`, `/v1/acquisition/cloud/batches` (HELD), `/healthz` | loopback only by default |
 
 The native listener binds `0.0.0.0`. The ops listener binds `ACQUISITION_OPS_HOST`, default
 `127.0.0.1`, and its port defaults to **8082** because 8081 is the VPC worker health port
@@ -95,6 +102,8 @@ only the Cloud caller; it is never routed through the Desktop ingress.
 
 Every route on a listener answers `503 {"error":{"code":"acquisition_disabled"}}` (with
 `Retry-After: 60`) unless `ACQUISITION_ENABLED=true` and the listener's group flag is true.
+`/v1/acquisition/cloud/batches` uses `ACQUISITION_CLOUD_PUBLICATION_ENABLED` instead of the
+ops group flag (both still under `ACQUISITION_ENABLED`).
 `/healthz` always answers `{ok, enabled, group}`.
 
 ## Environment
@@ -111,6 +120,9 @@ even when disabled. No other variable is read. Booleans are strict
 | `ACQUISITION_ENABLED` | - | Master flag, default `false`. |
 | `ACQUISITION_NATIVE_ENABLED` | - | Native exchange group, default `false`. |
 | `ACQUISITION_OPS_ENABLED` | - | Operations port group, default `false`. |
+| `ACQUISITION_CLOUD_PUBLICATION_ENABLED` | - | Q3 Cloud publication receiver (`POST /v1/acquisition/cloud/batches`, ops listener), default `false`, **HELD**. Read only when `ACQUISITION_ENABLED=true`; an invalid value fails startup. A missing receiver variable below never fails startup: the route answers `503 acquisition_cloud_unconfigured` and startup logs the missing variable names. |
+| `ACQUISITION_CLOUD_INGEST_ORIGIN` | cloud publication | Private Ingest origin (`scheme://host[:port]`, no path) that receives `POST /v1/delivery/batches`; checked against the destination policy. Never caller-supplied. |
+| `ACQUISITION_CLOUD_INGEST_SIGNING_KEY` | cloud publication | The session-ingest edge HMAC key (secret; 1Password) used to sign the internal hop. |
 | `ACQUISITION_PORT` / `ACQUISITION_OPS_PORT` | always | Listener ports, default 8080 / 8082 (8081 is the worker health port), must differ. |
 | `ACQUISITION_OPS_HOST` | always | Ops bind address (IP literal), default `127.0.0.1`. Anything else needs a NetworkPolicy change. |
 | `ACQUISITION_ORIGIN` | enabled | This service's public origin (URL, origin only). Sent as `aud` to relaycontrol and compared by normalized origin. |
@@ -121,7 +133,7 @@ even when disabled. No other variable is read. Booleans are strict
 | `ACQUISITION_ISSUER_KEY_ID` | native | The native issuer's key id; must be a `native` entry in `ACQUISITION_PINNED_KEYS` whose public key matches the private key (checked at startup). |
 | `ACQUISITION_ISSUER_PRIVATE_KEY` | native | Ed25519 private key: PKCS8 PEM or base64 32-byte seed (secret). |
 | `ACQUISITION_INTENT_KEY` | native | base64 of 32 bytes; AES-256-GCM key for G at rest (secret). |
-| `DESTINATION_*` | as the shared policy | `src/shared/destination-url.ts` policy for the introspection URL. |
+| `DESTINATION_*` | as the shared policy | `src/shared/destination-url.ts` policy for the introspection URL and `ACQUISITION_CLOUD_INGEST_ORIGIN`. |
 
 ## Authentication
 
@@ -176,6 +188,14 @@ decimal string, exact beyond 2^53. Every response carries `X-Correlation-Id` and
 The envelope is verified by the peer verifier against the cloud-class pinned keys. Note:
 the peer codec requires rebinds to be native-issued, so `ops/rebind` cannot succeed with a
 cloud key (403); rebind is effectively native-only.
+
+### Q3 Cloud publication port (HELD)
+
+`POST /v1/acquisition/cloud/batches`, ops listener, `ACQUISITION_CLOUD_PUBLICATION_ENABLED`
+(default off). Body `{v:1, install:{payload, signature}, batchBodyBase64url}` (max 2,100,000
+bytes; decoded batch max 1,500,000 bytes, max 500 records). A 200 is the ordinary
+`DeliveryReceipt` from Ingest, byte for byte (no `{result}` wrapper). The full binding rules
+and refusal matrix are in `runbooks/acquisition-cloud-publication.md`.
 
 ### Native exchange (P3 + P3a)
 

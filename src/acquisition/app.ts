@@ -8,6 +8,9 @@
  *     GET  /v1/acquisition/native/status?installationId=&source=&sessionIds=a&sessionIds=b (repeated, never comma-split)
  *   ops (Cloud issuer -> History, per-workspace service principal, scope acquisition:operate)
  *     POST /v1/acquisition/ops/install | revoke | rebind | status
+ *     POST /v1/acquisition/cloud/batches  (Q3 §9 Cloud publication receiver, HELD:
+ *       ACQUISITION_CLOUD_PUBLICATION_ENABLED, default off; ops listener only,
+ *       never the Desktop ingress; see cloud-batches.ts)
  *
  * Auth: Bearer only, verified by this service's own introspection client
  * (verifier.ts: #313 wire contract, per-route prefix / principal_type / scope,
@@ -21,6 +24,7 @@
 import { Hono, type Context } from "hono";
 import { RelaycontrolRejectedError } from "@rhc/auth/relaycontrol.ts";
 import { log as sharedLog, type Level } from "../shared/log.ts";
+import { CLOUD_BATCHES_PATH, CloudBatchRefusal, MAX_CLOUD_ENVELOPE_BYTES, type CloudBatchReceiver } from "./cloud-batches.ts";
 import { httpForError, type Installer } from "./installer.ts";
 import { INSTALLATION_PROOF_HEADER, NativeRefusal, requestedInstallationId, type NativeIdentity, type NativeIssuer } from "./native-issuer.ts";
 import type { AcquisitionKind } from "./validation.ts";
@@ -43,6 +47,16 @@ export type { AcquisitionGroup, AcquisitionPrincipal, Authenticator };
 
 export type AcquisitionLog = (level: Level, message: string, fields: Record<string, unknown>) => void;
 
+/**
+ * The Q3 Cloud publication receiver as mounted: disabled (flag off, the default), unconfigured
+ * (flag on but required config missing) or ready. Only "ready" ever makes an upstream call; the
+ * other two answer a static 503 and never fall back to another publisher or credential.
+ */
+export type CloudPublicationGate =
+  | { readonly state: "disabled" }
+  | { readonly state: "unconfigured" }
+  | { readonly state: "ready"; readonly receiver: CloudBatchReceiver };
+
 export type AcquisitionAppDeps =
   | { readonly enabled: false; readonly group: AcquisitionGroup; readonly log?: AcquisitionLog }
   | {
@@ -61,6 +75,8 @@ export type AcquisitionAppDeps =
       readonly groupEnabled: boolean;
       readonly authenticator: Authenticator;
       readonly installer: Installer | null;
+      /** Q3 receiver; absent means disabled. Independent of groupEnabled (ACQUISITION_OPS_ENABLED). */
+      readonly cloud?: CloudPublicationGate;
       readonly log?: AcquisitionLog;
     };
 
@@ -82,11 +98,19 @@ function bearer(header: string | undefined): string | null {
   return match ? match[1]! : null;
 }
 
-/** The body, at most MAX_BODY_BYTES, as parsed JSON. */
-async function jsonBody(c: Context<Env>): Promise<unknown> {
+function requireJsonContentType(c: Context<Env>): void {
   if ((c.req.header("Content-Type") ?? "").split(";")[0]!.trim().toLowerCase() !== "application/json") throw new HttpRefusal(415, "unsupported_media_type");
+}
+
+/** A declared Content-Length over `limit` (or not a decimal) is refused before anything else is read. */
+function requireDeclaredWithin(c: Context<Env>, limit: number): void {
   const declared = c.req.header("Content-Length");
-  if (declared !== undefined && (!/^[0-9]+$/.test(declared) || Number(declared) > MAX_BODY_BYTES)) throw new HttpRefusal(413, "payload_too_large");
+  if (declared !== undefined && (!/^[0-9]+$/.test(declared) || Number(declared) > limit)) throw new HttpRefusal(413, "payload_too_large");
+}
+
+/** The raw body, at most `limit` streamed bytes; the rest is cancelled, never buffered. */
+async function boundedBytes(c: Context<Env>, limit: number): Promise<Buffer> {
+  requireDeclaredWithin(c, limit);
   const chunks: Uint8Array[] = [];
   let total = 0;
   const reader = c.req.raw.body?.getReader();
@@ -95,14 +119,21 @@ async function jsonBody(c: Context<Env>): Promise<unknown> {
       const { done, value } = await reader.read();
       if (done) break;
       total += value.byteLength;
-      if (total > MAX_BODY_BYTES) {
+      if (total > limit) {
         await reader.cancel().catch(() => {});
         throw new HttpRefusal(413, "payload_too_large");
       }
       chunks.push(value);
     }
+  return Buffer.concat(chunks);
+}
+
+/** The body, at most MAX_BODY_BYTES, as parsed JSON. */
+async function jsonBody(c: Context<Env>): Promise<unknown> {
+  requireJsonContentType(c);
+  const bytes = await boundedBytes(c, MAX_BODY_BYTES);
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    return JSON.parse(bytes.toString("utf8"));
   } catch {
     throw new HttpRefusal(400, "invalid_request");
   }
@@ -123,6 +154,63 @@ export function createAcquisitionApp(deps: AcquisitionAppDeps) {
   });
 
   app.get("/healthz", (c) => c.json({ ok: true, enabled: deps.enabled, group }));
+
+  // Q3 §9: the private Cloud publication port exists on the ops listener only. On the native
+  // (Desktop) listener this path falls through to the catch-all 404 below.
+  if (group === "ops") {
+    app.post(CLOUD_BATCHES_PATH, async (c) => {
+      const started = Date.now();
+      const fields: Record<string, unknown> = { route: "cloud POST batches", correlation_id: c.get("correlationId"), kind: "cloud" };
+      let status: number;
+      let body: Uint8Array | object;
+      let retryAfter: string | undefined;
+      try {
+        const cloud = deps.enabled ? (deps as Extract<AcquisitionAppDeps, { group: "ops"; enabled: true }>).cloud : undefined;
+        if (!deps.enabled || !cloud || cloud.state === "disabled") throw new HttpRefusal(503, "acquisition_disabled");
+        if (cloud.state !== "ready") throw new HttpRefusal(503, "acquisition_cloud_unconfigured");
+        if (requestTargetBytes(c.req.url) > MAX_REQUEST_TARGET_BYTES) throw new HttpRefusal(414, "request_uri_too_long");
+        requireJsonContentType(c);
+        const encoding = c.req.header("Content-Encoding")?.trim().toLowerCase();
+        if (encoding && encoding !== "identity") throw new HttpRefusal(415, "unsupported_media_type");
+        // An oversized declared body may be refused before authentication (§9.1).
+        requireDeclaredWithin(c, MAX_CLOUD_ENVELOPE_BYTES);
+        const principal = await authenticate(c, deps.authenticator, "ops");
+        fields.org_id = principal.orgId;
+        fields.workspace_id = principal.workspaceId;
+        const envelope = await boundedBytes(c, MAX_CLOUD_ENVELOPE_BYTES);
+        const answer = await cloud.receiver.publish(envelope, { orgId: principal.orgId, workspaceId: principal.workspaceId! }, c.get("correlationId"));
+        status = answer.status;
+        body = answer.body;
+        retryAfter = answer.retryAfter;
+        // Allowlisted fields only (src/shared/log.ts): the record count and the upstream status code.
+        if (answer.upstreamStatus !== undefined) fields.reason = `upstream_${answer.upstreamStatus}`;
+        if (answer.recordCount !== undefined) fields.count = answer.recordCount;
+        if (status !== 200) fields.error_code = upstreamErrorCode(answer.body);
+      } catch (error) {
+        if (error instanceof HttpRefusal || error instanceof CloudBatchRefusal) {
+          status = error.status;
+          body = { error: { code: error.code } };
+        } else {
+          status = 503;
+          body = { error: { code: "service_unavailable" } };
+          fields.error_name = error instanceof Error ? error.name : "unknown";
+        }
+        fields.error_code = (body as { error: { code: string } }).error.code;
+      }
+      fields.status = status;
+      fields.outcome = status < 300 ? "ok" : status >= 500 ? "error" : "refused";
+      fields.duration_ms = Date.now() - started;
+      emit(status >= 500 ? "warn" : "info", "acquisition request", fields);
+      if (retryAfter !== undefined) c.header("Retry-After", retryAfter);
+      else if (status === 503) c.header("Retry-After", fields.error_code === "acquisition_disabled" ? "60" : "5");
+      if (body instanceof Uint8Array) {
+        // Upstream bytes (the receipt or an ordinary ingest error) pass through verbatim.
+        c.header("Content-Type", "application/json");
+        return c.body(body as Uint8Array<ArrayBuffer>, status as 200);
+      }
+      return c.json(body, status as 200);
+    });
+  }
 
   app.all("*", async (c) => {
     const started = Date.now();
@@ -160,6 +248,16 @@ export function createAcquisitionApp(deps: AcquisitionAppDeps) {
     return c.json(answer.body as object, answer.status as 200);
   });
   return app;
+}
+
+/** The static code of an upstream error body, for the log only; never the body itself. */
+function upstreamErrorCode(body: Uint8Array): string | undefined {
+  try {
+    const code = errorCode(JSON.parse(Buffer.from(body).toString("utf8")) as object);
+    return code && /^[a-z0-9_]{1,64}$/.test(code) ? code : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function requestTargetBytes(raw: string): number {

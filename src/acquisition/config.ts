@@ -21,6 +21,15 @@
  *   ACQUISITION_DATABASE_URL       Postgres URL for role bulls96_acquisition_installer (never logged)
  *   RELAYCONTROL_INTROSPECT_URL    relaycontrol base URL (#313; https, loopback or in-cluster per destination policy)
  *   RELAYCONTROL_INTROSPECT_SECRET the dedicated introspection secret
+ *   ACQUISITION_CLOUD_PUBLICATION_ENABLED  the Q3 Cloud publication receiver, POST /v1/acquisition/cloud/batches
+ *                                  on the ops (private) listener (same strict boolean; default off; HELD).
+ *                                  Its receiver config below is read only when it is true; a missing or
+ *                                  invalid value does NOT stop startup: the route answers 503
+ *                                  acquisition_cloud_unconfigured and the other groups keep working.
+ *   ACQUISITION_CLOUD_INGEST_ORIGIN       the private session-ingest origin (bare scheme://host[:port], destination
+ *                                  policy); the receiver POSTs only to <origin>/v1/delivery/batches
+ *   ACQUISITION_CLOUD_INGEST_SIGNING_KEY  the ingest HMAC key (session-ingest signRequest); never logged
+ *   (The Cloud issuer registry is the cloud-class subset of ACQUISITION_PINNED_KEYS; none pinned = unconfigured.)
  *
  * Errors name the variable, never its value.
  */
@@ -28,10 +37,27 @@ import type { KeyObject } from "node:crypto";
 import { isIP } from "node:net";
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
-import { createIssuerSigner, parseIssuerPrivateKey, parsePinnedKeys, type IssuerSigner } from "./key-registry.ts";
+import { createIssuerSigner, parseIssuerPrivateKey, parsePinnedKeys, registryOfClass, type IssuerSigner } from "./key-registry.ts";
 import type { IssuerRegistry } from "./validation.ts";
 
 export const ACQUISITION_FLAG = "ACQUISITION_ENABLED";
+export const CLOUD_PUBLICATION_FLAG = "ACQUISITION_CLOUD_PUBLICATION_ENABLED";
+export const CLOUD_INGEST_ORIGIN = "ACQUISITION_CLOUD_INGEST_ORIGIN";
+export const CLOUD_INGEST_SIGNING_KEY = "ACQUISITION_CLOUD_INGEST_SIGNING_KEY";
+
+/** The ingest HMAC key, held in a closure: the config object never serializes it. */
+export interface IngestSigningKey {
+  reveal(): string;
+}
+
+/**
+ * The Q3 receiver's state. "disabled": flag off (default). "unconfigured": flag on but a
+ * required value is missing or invalid; `missing` names the variables, never their values.
+ */
+export type CloudPublicationConfig =
+  | { readonly state: "disabled" }
+  | { readonly state: "unconfigured"; readonly missing: readonly string[] }
+  | { readonly state: "ready"; readonly ingestOrigin: string; readonly signingKey: IngestSigningKey; readonly registry: IssuerRegistry };
 
 export interface AcquisitionLiveConfig {
   readonly enabled: true;
@@ -48,6 +74,7 @@ export interface AcquisitionLiveConfig {
   /** Present iff nativeEnabled. */
   readonly signer: IssuerSigner | null;
   readonly intentKey: Buffer | null;
+  readonly cloudPublication: CloudPublicationConfig;
 }
 export type AcquisitionConfig = { readonly enabled: false; readonly port: number; readonly opsPort: number; readonly opsHost: string } | AcquisitionLiveConfig;
 
@@ -95,6 +122,36 @@ export function bindHost(env: NodeJS.ProcessEnv, name: string, fallback: string)
   return raw;
 }
 
+function signingKeyHolder(value: string): IngestSigningKey {
+  return Object.freeze({ reveal: () => value, toJSON: () => "[redacted]" });
+}
+
+/**
+ * ACQUISITION_CLOUD_PUBLICATION_ENABLED and its receiver config. Read only under the
+ * master flag; never throws for a missing/invalid receiver value (the route refuses).
+ */
+export function cloudPublicationConfig(env: NodeJS.ProcessEnv, registry: IssuerRegistry): CloudPublicationConfig {
+  if (!strictFlag(env, CLOUD_PUBLICATION_FLAG)) return { state: "disabled" };
+  const missing: string[] = [];
+  const originRaw = env[CLOUD_INGEST_ORIGIN]?.trim() ?? "";
+  let ingestOrigin = "";
+  try {
+    if (!originRaw) throw new Error("missing");
+    const url = assertDestinationUrl(CLOUD_INGEST_ORIGIN, originRaw, destinationPolicy(env), { allowPath: false });
+    // Exactly scheme://host[:port]: no path, no trailing slash, already lowercase.
+    if (url.origin !== originRaw) throw new Error("not an origin");
+    ingestOrigin = url.origin;
+  } catch {
+    missing.push(CLOUD_INGEST_ORIGIN);
+  }
+  const key = env[CLOUD_INGEST_SIGNING_KEY]?.trim() ?? "";
+  if (!key) missing.push(CLOUD_INGEST_SIGNING_KEY);
+  const cloud = registryOfClass(registry, "cloud");
+  if (cloud.size === 0) missing.push("ACQUISITION_PINNED_KEYS (no cloud-class key)");
+  if (missing.length) return { state: "unconfigured", missing };
+  return { state: "ready", ingestOrigin, signingKey: signingKeyHolder(key), registry: cloud };
+}
+
 export function acquisitionConfig(env: NodeJS.ProcessEnv = process.env): AcquisitionConfig {
   const ports = {
     port: port(env, "ACQUISITION_PORT", 8080),
@@ -129,5 +186,6 @@ export function acquisitionConfig(env: NodeJS.ProcessEnv = process.env): Acquisi
     introspectSecret: required(env, "RELAYCONTROL_INTROSPECT_SECRET"),
     signer,
     intentKey: key,
+    cloudPublication: cloudPublicationConfig(env, registry),
   };
 }

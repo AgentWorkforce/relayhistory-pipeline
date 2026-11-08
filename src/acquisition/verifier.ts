@@ -13,7 +13,7 @@
  *
  *   route   token prefix   principal_type   scope
  *   native  sh_at_         desktop-user     rth:acquire
- *   ops     sh_wk_         service          acquisition:operate   (Q3 cloud/batches: same row when built)
+ *   ops     sh_wk_         service          acquisition:operate   (also the Q3 cloud/batches route, HELD)
  *
  * The real principal_type is returned; an unknown or absent one is refused
  * (fail closed). Scopes are returned raw (no allowlist): the route check in

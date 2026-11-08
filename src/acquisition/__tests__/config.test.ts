@@ -37,3 +37,38 @@ test("enabled: required variables, native needs signer + intent key, sub-flags d
   // The parsed config never serializes the private key.
   expect(JSON.stringify(n).includes(Buffer.from(NATIVE_SEED_HEX, "hex").toString("base64"))).toBe(false);
 });
+
+test("Q3 cloud publication: default off, read only under the master flag, refuses (never throws) on missing config", () => {
+  const key = "test-ingest-signing-key-not-real";
+  const cloudEnv = { ACQUISITION_CLOUD_PUBLICATION_ENABLED: "true", ACQUISITION_CLOUD_INGEST_ORIGIN: "https://ingest.example.test", ACQUISITION_CLOUD_INGEST_SIGNING_KEY: key };
+  const state = (env: Record<string, string | undefined>) => {
+    const c = acquisitionConfig(env);
+    return c.enabled ? c.cloudPublication : null;
+  };
+  // Default off; the master flag off means the cloud flag is not even read.
+  expect(state(live)).toEqual({ state: "disabled" });
+  expect(state({ ...live, ACQUISITION_CLOUD_PUBLICATION_ENABLED: "false" })).toEqual({ state: "disabled" });
+  expect(acquisitionConfig({ ACQUISITION_CLOUD_PUBLICATION_ENABLED: "garbage" }).enabled).toBe(false);
+  expect(() => acquisitionConfig({ ...live, ACQUISITION_CLOUD_PUBLICATION_ENABLED: "1" })).toThrow(/ACQUISITION_CLOUD_PUBLICATION_ENABLED/);
+  // Ready: bare origin, signing key, cloud-class registry subset only.
+  const ready = state({ ...live, ...cloudEnv });
+  expect(ready?.state).toBe("ready");
+  if (ready?.state !== "ready") throw new Error("unreachable");
+  expect(ready.ingestOrigin).toBe("https://ingest.example.test");
+  expect([...ready.registry.values()].every((k) => k.ownerKind === "cloud")).toBe(true);
+  expect(ready.signingKey.reveal()).toBe(key);
+  expect(JSON.stringify(acquisitionConfig({ ...live, ...cloudEnv })).includes(key)).toBe(false);
+  // Missing / invalid values: unconfigured with the variable names only (never the values).
+  const missing = (over: Record<string, string | undefined>) => {
+    const s = state({ ...live, ...cloudEnv, ...over });
+    return s?.state === "unconfigured" ? s.missing : s?.state;
+  };
+  expect(missing({ ACQUISITION_CLOUD_INGEST_ORIGIN: undefined })).toEqual(["ACQUISITION_CLOUD_INGEST_ORIGIN"]);
+  expect(missing({ ACQUISITION_CLOUD_INGEST_SIGNING_KEY: " " })).toEqual(["ACQUISITION_CLOUD_INGEST_SIGNING_KEY"]);
+  for (const bad of ["https://ingest.example.test/v1/delivery/batches", "https://ingest.example.test/", "http://ingest.example.test",
+    "https://u:p@ingest.example.test", "https://INGEST.example.test", "not a url"])
+    expect(missing({ ACQUISITION_CLOUD_INGEST_ORIGIN: bad })).toEqual(["ACQUISITION_CLOUD_INGEST_ORIGIN"]);
+  expect(missing({ ACQUISITION_CLOUD_INGEST_ORIGIN: "http://127.0.0.1:8787" })).toBe("ready");
+  const nativeOnly = JSON.stringify(JSON.parse(pinnedKeysJson).filter((k: { issuerClass: string }) => k.issuerClass === "native"));
+  expect(missing({ ACQUISITION_PINNED_KEYS: nativeOnly })).toEqual(["ACQUISITION_PINNED_KEYS (no cloud-class key)"]);
+});

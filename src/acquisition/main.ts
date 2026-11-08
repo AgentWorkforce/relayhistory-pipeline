@@ -9,7 +9,8 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import pg from "pg";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { errorFields, log } from "../shared/log.ts";
-import { createAcquisitionApp, type AcquisitionGroup } from "./app.ts";
+import { createAcquisitionApp, type AcquisitionGroup, type CloudPublicationGate } from "./app.ts";
+import { createCloudBatchReceiver } from "./cloud-batches.ts";
 import { acquisitionConfig } from "./config.ts";
 import { AcquisitionSql, Installer, pgAcquisitionExecutor } from "./installer.ts";
 import { PgAcquisitionStore, pgSqlClient } from "./intent-store.ts";
@@ -104,7 +105,15 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<void>
     // Cloud-class keys only on the ops port; a native-class key is refused there.
     const installer = config.opsEnabled ? new Installer(sql, registryOfClass(config.registry, "cloud")) : null;
     servers.push(await listen(createAcquisitionApp({ enabled: true, group: "native", groupEnabled: config.nativeEnabled, authenticator, issuer }), config.port, NATIVE_HOST, "native", config.nativeEnabled ? "enabled" : "dormant"));
-    servers.push(await listen(createAcquisitionApp({ enabled: true, group: "ops", groupEnabled: config.opsEnabled, authenticator, installer }), config.opsPort, config.opsHost, "ops", config.opsEnabled ? "enabled" : "dormant"));
+    // Q3 §9 Cloud publication receiver (HELD, ACQUISITION_CLOUD_PUBLICATION_ENABLED default off).
+    // Independent of ACQUISITION_OPS_ENABLED; an incomplete config refuses (503), never falls back.
+    const publication = config.cloudPublication;
+    const cloud: CloudPublicationGate = publication.state === "ready"
+      ? { state: "ready", receiver: createCloudBatchReceiver({ registry: publication.registry, ingestOrigin: publication.ingestOrigin, signingKey: publication.signingKey }) }
+      : { state: publication.state };
+    if (publication.state === "unconfigured")
+      log.warn("acquisition cloud publication unconfigured", { kind: "cloud", reason: publication.missing.join(",") });
+    servers.push(await listen(createAcquisitionApp({ enabled: true, group: "ops", groupEnabled: config.opsEnabled, authenticator, installer, cloud }), config.opsPort, config.opsHost, "ops", config.opsEnabled ? "enabled" : "dormant"));
     if (issuer) {
       let running = false;
       timer = setInterval(() => {
