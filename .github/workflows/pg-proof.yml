@@ -225,6 +225,10 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
+      - name: Prove the acquisition installer login refuses a superuser SET SESSION AUTHORIZATION (pg_stat_activity usename)
+        env:
+          ACQUISITION_LOGIN_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: bun test --timeout 300000 src/acquisition/__tests__/db-login.postgres.test.ts
       # Service containers cannot take server flags, so the 53200 causal proof gets its own disposable,
       # loopback-only, trust-auth container (same image as the service above, no credential anywhere).
       - name: Start a lock-constrained PostgreSQL for the 043500 advisory-footprint proof
