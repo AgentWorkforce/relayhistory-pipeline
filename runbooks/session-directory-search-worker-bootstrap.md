@@ -553,8 +553,10 @@ config fails closed.
   - **Amazon RDS for PostgreSQL (`rds` mode):** the same shape with AWS's internal
     `rdsadmin` as the trust root (`RDS_PLATFORM_SUPERUSERS`, exactly `rdsadmin`, only
     while SUPERUSER, never the owner). The master runs
-    `rds_owner_function_default_revoke.sql`. Every other CREATE-capable role, any second
-    superuser and any other `rds_superuser` member stay covered. Aurora is not covered.
+    `rds_owner_function_default_revoke.sql`, which sets the exact default for itself and
+    for `rds_superuser` (NOLOGIN, not SUPERUSER, and CREATE-capable on `sessions`, so not
+    excluded). Every other CREATE-capable role, any second superuser and any other
+    `rds_superuser` member stay covered. Aurora is not covered.
 - **Exact default ACL:** the migration owner's `pg_default_acl` row with
   `defaclnamespace = 0` and `defaclobjtype = 'f'` must normalize to EXACTLY
   `{<self>:EXECUTE}`: owner EXECUTE, no grant option, no other grantee. Merely "PUBLIC
@@ -751,7 +753,8 @@ catalog shows that shape (`rds_profile_unproven`).
 
 **Order, as the migration owner, connected to the HoopDb database:**
 
-1. `rds_owner_function_default_revoke.sql`: the owner's exact global function default.
+1. `rds_owner_function_default_revoke.sql`: the exact global function default for the
+   owner and for `rds_superuser`, set together or not at all.
 2. `rds_migration_roles.sql`: the fixed NOLOGIN roles (the Cloud SQL set
    minus the consumer role below, including `bulls96_privacy_eraser` and
    `bulls96_babysitter_retention` required by
@@ -778,6 +781,25 @@ catalog shows that shape (`rds_profile_unproven`).
    `HOOPDB_RUNTIME_ROLE_LOGIN=true`, `HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke`.
    Generation, ledger, sequence, checksum, exact-ACL and phase 2 checks are unchanged.
 
+**Existing installs must re-apply step 1 once (#389).** Before this change the file set
+only the master's default. On a real instance `rds_superuser` has effective CREATE on
+`sessions` once the schema exists, so the first migrate passed and every later migrate
+fails `function_boundary_unproven`. As the master, connected to the HoopDb database,
+either re-run the idempotent file (it refuses, changing nothing, on a poisoned existing
+default) or run this one statement:
+
+```sql
+ALTER DEFAULT PRIVILEGES FOR ROLE rds_superuser REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+```
+
+The default is per database, so a new HoopDb database needs it too. Afterwards
+`pg_default_acl` shows `{rds_superuser:EXECUTE:false}` for that role (global, functions)
+and the migrator completes with nothing pending. The log line carries only the error
+code (the log allowlist forbids free text); to see which role the gate names, run the
+migrator once with `DEBUG=1`, which prints the catalog evidence (role names and booleans,
+no credentials) to stderr. Do not exclude `rds_superuser` from the gate: the default is
+the control.
+
 **Proof:** `scripts/pg-proof/rds-profile-proof.ts` (CI job `rds-emulated-postgres`), against
 disposable PostgreSQL 16/17 servers whose bootstrap superuser is named `rdsadmin`.
 The proof verifies the actual Git checkout against the requested head and refuses
@@ -786,7 +808,10 @@ and uploads its own version-specific receipt. Emulation limits:
 no `rds.*` parameters or parameter groups, no RDS extension allow-list, no IAM
 authentication, no RDS-specific catalog hooks, and vanilla PostgreSQL refuses
 `CREATE EVENT TRIGGER` to `rds_superuser` members where RDS allows it (irrelevant here: rds
-mode uses `global-default-revoke`).
+mode uses `global-default-revoke`). `rds_superuser`'s effective CREATE on `sessions` is a
+direct schema grant in the proof, because vanilla PostgreSQL cannot reproduce how RDS
+provides it (a membership would be a cycle with the master); the proof shows the catalog
+result and a second migrate, not AWS's mechanism.
 
 **Live RDS gates still needed (the emulation claims none of them):**
 
@@ -794,6 +819,8 @@ mode uses `global-default-revoke`).
   and `rdsadmin` is the recorded grantor of the master's PG16+ creator edges.
 - The master's attributes and memberships (`rds_superuser`, no SUPERUSER, CREATEROLE), that
   the master owns the customer-provisioned database, and that `rdsadmin` is the only SUPERUSER.
+- `rds_superuser` is NOLOGIN and not SUPERUSER, and a second migrate on the same database
+  passes.
 - Steps 1-6 pass on the target engine version and parameter group, and the canonical
   readiness gate passes as the runtime role over TLS.
 - Rotating the runtime password as the master through the approved operator path,
