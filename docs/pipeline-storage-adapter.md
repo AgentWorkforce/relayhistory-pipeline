@@ -84,8 +84,9 @@ scrubs when it seals a chunk. For a client that cannot, the server's
   replaced whole by `[REDACTED]`, up to that closing quote or, with none, to the
   end of the input; rule set 3 stored the part past the bound in clear. A value
   whose total length to its matching close is within the bound (multi-line
-  ones included), or whose input ends within it, scrubs byte-identically to
-  rule set 3.
+  ones included), or whose input ends within it, scrubbed byte-identically to
+  rule set 3 under rule set 4; rule set 5 redacts such a value whole when it
+  holds a line break or has no close (below).
   - **Across line breaks.** The bound caps the value's total length, not its
     first line's: CR, LF, CRLF, U+2028, U+2029 and U+0085 are ordinary value
     units, so a value with a short first line that crosses the bound only after
@@ -103,7 +104,8 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     such a value's key and the value's end; a cut exactly at the key's start is
     allowed. The same holds for a generated unquoted value of 4096 or more units
     after a quoted key. `longCut` (long strings, cut after any whitespace) finds
-    these values (`overCapQuotedValueSpans`) in the text up to 4096 + 256 units
+    these values (`overCapQuotedValueSpans`; `unsplittableQuotedValueSpans` since
+    rule set 5) in the text up to 4096 + 256 units
     past the segment bound, which covers the longest key plus the scan's reach
     (4096 + 150 units from the key's start), so a key just below the bound or
     straddling it is protected too; one still open there, decided or not, is
@@ -112,9 +114,10 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     look-ahead as a prefix (a value open at its end is open to the end), and a
     run that ends inside a secret value which is, or may yet become, over the
     bound keeps a following record or private-key line instead of ending
-    before it (fail closed, at most 256 rescans per chunk). Values
-    within the bound get no such span; as in rule set 3 they rely on the
-    context check (`CUT_CONTEXT_CHARS`). When no cut outside them is left the
+    before it (fail closed, at most 256 rescans per chunk). Under rule set 4,
+    values within the bound got no such span and relied, as in rule set 3, on
+    the context check (`CUT_CONTEXT_CHARS`); rule set 5 gives a multi-line or
+    unclosed one a span too. When no cut outside them is left the
     string is rejected with `chunk_string_too_long` (a run: `chunk_unsegmentable`),
     which is non-retryable and holds no content. The session ingest (`src/session-ingest/oversize.ts`) replaces such
     a string with its redaction marker before sealing, and the neon reader
@@ -125,8 +128,9 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     TOML, env, kwargs), more than 16 spaces before the colon, `\u` escapes in
     the key, keys longer than 64 characters, and an NBSP separator.
 
-  Rule set 5 closes two rule set 4 leaks; output for input with no secret-keyed
-  record value and no over-cap quoted value is byte-identical to rule set 4.
+  Rule set 5 closes four rule set 4 leaks; output for input with no secret-keyed
+  record value, no over-cap quoted value and no quoted secret value that holds a
+  line break or has no matching close is byte-identical to rule set 4.
   - **Over-cap measured on the original text.** Rule set 4 measured a quoted
     secret value after the token rules had replaced its provider-shaped tokens
     with `[REDACTED]`, so a value over the bound (say 130 `capy_` tokens and then
@@ -139,17 +143,44 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     string under a secret key name (`isSecretKeyName`), at any depth and through
     arrays, unless it is already `[REDACTED]` or an `op://` reference. Rule set
     4 scrubbed each value alone and stored `{"password":"plain words"}` as it
-    was. Numbers, booleans and null are kept; an object under a secret key is
-    scrubbed by its own keys. The `<scrub-segmenter>` markers now also enclose
-    `scrubRecordLine`, so the pinned digest covers the record path.
+    was. Numbers, booleans and null are kept. The `<scrub-segmenter>` markers
+    now also enclose `scrubRecordLine`, so the pinned digest covers the record
+    path.
+  - **Secret context through composite values.** The secret context of a
+    secret-keyed value runs through every descendant: in
+    `{"password":{"value":"..."}}`, `{"token":{"nested":{"deeper":"..."}}}` or
+    `{"credentials":[{"value":"..."}]}` every string below the secret key is
+    redacted, whatever its own key is named, in `scrubJson`/`scrubRecord` and
+    `scrubRecordLine` alike. The structure is kept (keys are still scrubbed and
+    de-duplicated), as are numbers, booleans, null, empty strings, `[REDACTED]`
+    and `op://` references; a sibling of the secret key is scrubbed by its own
+    keys only. The context resets at the end of the secret-keyed value.
+    `scrubText` over a raw JSON line does not parse it: there a composite under
+    a secret key is still left to the token rules (the quoted rule needs a
+    quoted value).
+  - **Multi-line quoted values within the bound.** A quoted secret value
+    within the 4096-unit bound that holds a line break (CR, LF, CRLF, U+2028,
+    U+2029, U+0085) before its matching close, or has no matching close, is
+    redacted whole: through its close, or to the end of the input. Rule set 4
+    redacted it only up to the first whitespace (rule set 3's fallback) and
+    kept the rest, later lines included; that fallback is gone. The empty
+    value, `[REDACTED]` and `op://` exceptions remain (an `op://` value holding
+    a line break is no reference and is redacted), as do unquoted values and
+    the over-cap first pass. The segmenter protects such a value as it does an
+    over-bound one (`unsplittableQuotedValueSpans`): no `longCut` or `safeCut`
+    falls strictly between its key's start and its value's end, and a window
+    scanned as a prefix (`prefix: true`) takes a value still open at its end
+    as open to the end (fail closed). A value on one line that closes within
+    the bound scrubs as in rule set 4.
   - **Repeated source keys.** `scrubRecordLine` writes a key the source repeats
     in one object under the name its first occurrence got, so a repeated key
     that scrubs to `[REDACTED] (2)` no longer lands on the first key's
     `[REDACTED]` after parsing.
   - **Re-scrubbing rule set 4 output.** Rule set 5 over stored rule set 4
-    records catches the first leak (the key is still there). It cannot catch the
-    second: the stored value is already under the bound, so only the original
-    bytes can be re-scrubbed for it.
+    records catches the first leak (the key is still there) and the composite
+    one (the secret key is still above the value). The second leak's stored
+    value is already under the bound, but it still holds the line break after
+    which rule set 4 stopped, so the multi-line rule redacts it whole too.
 
 The unscrubbed bytes are never written to storage. If the key already holds
 an object (identical bytes or not), it is kept and described from its own

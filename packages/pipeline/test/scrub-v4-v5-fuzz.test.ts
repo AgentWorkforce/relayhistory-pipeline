@@ -5,11 +5,15 @@
  *
  * - Text: random quoted-key/value inputs, including over-cap multi-line values made of
  *   many shrinkable `capy_` tokens (which rule set 4 measured only after the token rules
- *   had shrunk them) and values whose total length lands either side of the bound. Output
- *   must be byte-identical unless the original text holds an over-bound value
- *   (`overCapQuotedValueSpans`).
- * - Records: random `scrubJson` objects. With no secret key at any depth output must be
- *   byte-identical; with secret keys, only those values may differ.
+ *   had shrunk them), values whose total length lands either side of the bound, and
+ *   values within the bound that span line breaks (CR, LF, CRLF, U+2028, U+2029, U+0085)
+ *   or are left unclosed. Output must be byte-identical unless the original text holds an
+ *   over-bound value, a quoted secret value within the bound that holds a line break, or
+ *   one with no matching close (`unsplittableQuotedValueSpans` with `prefix: true`): rule
+ *   set 5 redacts those whole, where rule set 4 stopped at the first line's whitespace.
+ * - Records: random `scrubJson` objects, objects and arrays nested under secret keys
+ *   included. With no secret key at any depth output must be byte-identical; with secret
+ *   keys, only the values below them may differ.
  * - Both: every input carries unique marker words; any marker absent from rule set 4's
  *   output must be absent from rule set 5's (rule set 5 never re-emits a redacted byte).
  *
@@ -24,7 +28,13 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { scrubJson as v4Json, scrubText as v4 } from "./fixtures/scrub-ruleset-4.js";
-import { isSecretKeyName, overCapQuotedValueSpans, scrubJson as v5Json, scrubText as v5 } from "../src/lib/scrub.js";
+import {
+  isSecretKeyName,
+  overCapQuotedValueSpans,
+  scrubJson as v5Json,
+  scrubText as v5,
+  unsplittableQuotedValueSpans,
+} from "../src/lib/scrub.js";
 
 /** sha256 of fixtures/scrub-ruleset-4.ts (LF line endings), rule set 4's scrub.ts at 5cc6e9db. */
 const V4_FIXTURE_SHA256 = "b0eb083bda55524542ce7ba04ccaecfc01d7891f13fb50a14a06fd61c80761ce";
@@ -70,7 +80,7 @@ describe("rule set 4 vs 5 (differential fuzz)", () => {
     expect(createHash("sha256").update(fixture).digest("hex")).toBe(V4_FIXTURE_SHA256);
   });
 
-  it(`scrubs ${INPUTS} random texts as rule set 4 does, except over-bound values, never re-emitting a redacted marker`, () => {
+  it(`scrubs ${INPUTS} random texts as rule set 4 does, except over-bound, multi-line or unclosed values, never re-emitting a redacted marker`, () => {
     const { rnd, pick } = rng(SEED);
     const keys = ['"password"', "'token'", "`secret`", '\\"api_key\\"', '\\\\\\"auth\\\\\\"', '"name"', '"access_token"', '"db password"', '"note"'];
     const seps = [": ", ":", " = ", " => ", "="];
@@ -83,6 +93,8 @@ describe("rule set 4 vs 5 (differential fuzz)", () => {
     let first = "";
     let differ = 0;
     let withSpan = 0;
+    let multiLine = 0;
+    let multiLineDiffer = 0;
     let shrinkCases = 0;
     for (let k = 0; k < INPUTS; k += 1) {
       const mk = markers();
@@ -126,18 +138,29 @@ describe("rule set 4 vs 5 (differential fuzz)", () => {
         leaked += 1;
         if (!first) first = `input ${k} (seed ${SEED}): re-emitted ${reEmitted.length} marker(s)`;
       }
-      const spans = overCapQuotedValueSpans(text).length > 0;
-      if (spans) withSpan += 1;
+      const overBound = overCapQuotedValueSpans(text).length;
+      if (overBound > 0) withSpan += 1;
+      // Rule set 5 also redacts whole a value within the bound that holds a line break
+      // (an extra span here) or has no matching close (open to the end as a prefix).
+      const whole = unsplittableQuotedValueSpans(text, { prefix: true });
+      const lineOrOpen = whole.length > overBound || (whole.at(-1)?.[1] ?? -1) >= text.length;
+      if (unsplittableQuotedValueSpans(text).length > overBound) multiLine += 1;
       if (a === b) continue;
       differ += 1;
-      if (spans) continue;
+      if (overBound > 0) continue;
+      if (lineOrOpen) {
+        multiLineDiffer += 1;
+        continue;
+      }
       unexpected += 1;
-      if (!first) first = `input ${k} (seed ${SEED}), ${text.length} units, no over-bound value`;
+      if (!first) first = `input ${k} (seed ${SEED}), ${text.length} units, no over-bound, multi-line or unclosed value`;
     }
-    console.log(`scrub v4/v5 text fuzz: ${INPUTS} inputs, ${shrinkCases} shrinkable over-cap values, ${withSpan} with an over-bound value, ${differ} differ from rule set 4, ${unexpected} unexpected, ${leaked} re-emitting a redacted marker`);
+    console.log(`scrub v4/v5 text fuzz: ${INPUTS} inputs, ${shrinkCases} shrinkable over-cap values, ${withSpan} with an over-bound value, ${multiLine} with a multi-line value within the bound, ${differ} differ from rule set 4 (${multiLineDiffer} only by a multi-line or unclosed value), ${unexpected} unexpected, ${leaked} re-emitting a redacted marker`);
     expect(unexpected, first).toBe(0);
     expect(leaked, first).toBe(0);
     expect(withSpan).toBeGreaterThan(0);
+    expect(multiLine).toBeGreaterThan(0);
+    expect(multiLineDiffer).toBeGreaterThan(0);
     expect(differ).toBeGreaterThan(0);
   }, 300_000);
 
@@ -152,10 +175,12 @@ describe("rule set 4 vs 5 (differential fuzz)", () => {
     let first = "";
     let differ = 0;
     let withSecret = 0;
+    let nestedUnderSecret = 0;
     for (let k = 0; k < INPUTS; k += 1) {
       const mk = markers();
       const allowSecret = rnd(2) === 0;
       let hasSecret = false;
+      let nested = false;
       const str = () => {
         const r = rnd(6);
         return r === 0 ? mk.next() : r === 1 ? `${pick(strAtoms)} ${mk.next()}` : pick(strAtoms);
@@ -167,16 +192,23 @@ describe("rule set 4 vs 5 (differential fuzz)", () => {
         const o: Record<string, unknown> = {};
         for (let i = rnd(4); i >= 0; i -= 1) {
           let key = pick(plainKeys);
+          let secret = false;
           if (allowSecret && rnd(3) === 0) {
             key = pick(secretKeys);
             hasSecret = true;
+            secret = true;
           }
-          o[key] = node(depth + 1);
+          // Under a secret key, an object (with plain keys, so only the inherited secret
+          // context can redact it) half the time.
+          const child = secret && rnd(2) === 0 ? { [pick(plainKeys)]: node(depth + 1), [pick(plainKeys)]: str() } : node(depth + 1);
+          if (secret && child && typeof child === "object" && !Array.isArray(child)) nested = true;
+          o[key] = child;
         }
         return o;
       };
       const input = node(0);
       if (hasSecret) withSecret += 1;
+      if (nested) nestedUnderSecret += 1;
       const a = JSON.stringify(v4Json(input));
       const b = JSON.stringify(v5Json(input));
       const reEmitted = mk.all.filter((m) => !a.includes(m) && b.includes(m));
@@ -190,11 +222,12 @@ describe("rule set 4 vs 5 (differential fuzz)", () => {
       unexpected += 1;
       if (!first) first = `record ${k} (seed ${SEED}): differs with no secret key`;
     }
-    console.log(`scrub v4/v5 record fuzz: ${INPUTS} records, ${withSecret} with a secret key, ${differ} differ from rule set 4, ${unexpected} unexpected, ${leaked} re-emitting a redacted marker`);
+    console.log(`scrub v4/v5 record fuzz: ${INPUTS} records, ${withSecret} with a secret key, ${nestedUnderSecret} with an object under one, ${differ} differ from rule set 4, ${unexpected} unexpected, ${leaked} re-emitting a redacted marker`);
     expect(isSecretKeyName("password")).toBe(true);
     expect(unexpected, first).toBe(0);
     expect(leaked, first).toBe(0);
     expect(withSecret).toBeGreaterThan(0);
+    expect(nestedUnderSecret).toBeGreaterThan(0);
     expect(differ).toBeGreaterThan(0);
   }, 300_000);
 });

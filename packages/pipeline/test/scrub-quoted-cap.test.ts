@@ -6,13 +6,14 @@
  * line does not keep it within the bound. Rule set 3 redacted only the first 4096 units
  * (or up to the first space or line break in them) and stored the rest. The bound is a
  * scan bound only; a value whose total length to its close is within it scrubs as in
- * rule set 3 (checked against the frozen rule set 3 source).
+ * rule set 3 when it is on one line and closed. Rule set 5: a quoted secret value within the bound that holds a line break, or
+ * has no matching close, is redacted whole too (to its close, or to the end of input);
+ * rule set 4 stopped those at the first whitespace and kept the rest.
  */
 import { describe, expect, it } from "vitest";
 import * as scrub from "../src/lib/scrub.js";
 import { MAX_SCRUB_CHARS, scrubText } from "../src/lib/scrub.js";
 import { canScrubLong, scrubLong, scrubRecords } from "../src/lib/pipeline/raw-chunks.js";
-import { scrubText as v3 } from "./fixtures/scrub-ruleset-3.js";
 
 /** `MAX_QUOTED_VALUE` in lib/scrub.ts. */
 const CAP = scrub.MAX_QUOTED_VALUE;
@@ -39,9 +40,10 @@ describe("quoted secret values past the scan bound (rule set 4)", () => {
   it("keeps rule set 3 output for a value exactly at the bound", () => {
     expect(scrubText(`{"password": "${solid(CAP)}"}`)).toBe(`{"password": "${R}"}`);
     expect(scrubText(`{"password": "${spaced(CAP)}"}`)).toBe(`{"password": "${R}"}`);
-    // Unterminated at the end of input, within the bound: up to the next whitespace.
+    // Unterminated at the end of input, within the bound: to the end of input (rule set 5;
+    // rule set 4 stopped at the next whitespace and kept " tail").
     expect(scrubText(`"token": "${solid(CAP)}`)).toBe(`"token": "${R}`);
-    expect(scrubText(`"token": "${solid(100)} tail`)).toBe(`"token": "${R} tail`);
+    expect(scrubText(`"token": "${solid(100)} tail`)).toBe(`"token": "${R}`);
   });
 
   it("redacts a value one unit over the bound whole", () => {
@@ -186,7 +188,7 @@ describe("quoted secret values past the scan bound (rule set 4)", () => {
     }
   });
 
-  it("keeps rule set 3 output for a multi-line value whose total length to its close is within the bound", () => {
+  it("redacts a multi-line value whose total length to its close is within the bound whole (rule set 5)", () => {
     for (const [key, q] of QUOTES) {
       for (const [name, nl] of BREAKS) {
         const label = `${key} ${name}`;
@@ -198,21 +200,26 @@ describe("quoted secret values past the scan bound (rule set 4)", () => {
           expect(value.length).toBe(total);
           for (const after of [`${q} after${nl}"user": "ops"`, `${q}`]) {
             const input = `${key}: ${q}${value}${after}`;
-            expect(scrubText(input), `${label} ${first}/${total}`).toBe(v3(input));
+            // Rule set 4 kept rule set 3's output here (up to the first whitespace).
+            expect(scrubText(input), `${label} ${first}/${total}`).toBe(`${key}: ${q}${R}${after}`);
             expect(scrub.overCapQuotedValueSpans(input), label).toEqual([]);
+            // Not over the bound, but never cut inside by the segmenter (key to value end).
+            const start = input.indexOf(q, key.length) + q.length;
+            expect(scrub.unsplittableQuotedValueSpans(input), label).toEqual([[0, start + value.length]]);
           }
         }
         // One unit more is over the bound in total, though every line is short.
         const over = `${key}: ${q}${solid(5)}${nl}${spaced(top + 1 - 5 - nl.length)}${q} after`;
         expect(scrubText(over), label).toBe(`${key}: ${q}${R}${q} after`);
-        // An unclosed value whose input ends within the bound: rule set 3 too.
+        // An unclosed value whose input ends within the bound: to the end of input.
         const ends = `${key}: ${q}short${nl}${spaced(CAP - 100)}`;
-        expect(scrubText(ends), label).toBe(v3(ends));
+        expect(scrubText(ends), label).toBe(`${key}: ${q}${R}`);
       }
     }
     // A line break inside the bound with the close past it no longer ends the value.
     expect(scrubText(`"password": "${solid(CAP - 1)}\n${solid(CAP * 2)} kept"`)).toBe(`"password": "${R}"`);
-    expect(scrubText(`"password": "${solid(100)}\nnext line kept"`)).toBe(`"password": "${R}\nnext line kept"`);
+    // Within the bound: the next line, up to its close, is part of the value (rule set 5).
+    expect(scrubText(`"password": "${solid(100)}\nnext line kept"`)).toBe(`"password": "${R}"`);
   });
 
   it("redacts a value whose surrogate pair straddles the bound whole, leaving no lone surrogate", () => {
@@ -526,9 +533,10 @@ describe("raw-chunk runs never end inside an over-bound value (rule set 4)", () 
         if (between.startsWith("{")) expect(out).toBe(`x${nl}\`secret\`: \`${R}\` after the close${nl}{"b": 2}${nl}`);
       }
     }
-    // Within the bound in total, the same shape scrubs as rule set 3 did (to the next whitespace).
+    // Within the bound in total, the value is redacted whole to its close (rule set 5;
+    // rule set 4 scrubbed as rule set 3, to the next whitespace, and kept the lines after).
     const within = `x\n\`secret\`: \`short\n{"a": 1}\nmore\` after\n{"b": 2}\n`;
-    expect(dec(scrubRecords(enc(within)).scrubbed)).toBe(`x\n\`secret\`: \`${R}\n{"a": 1}\nmore\` after\n{"b": 2}\n`);
+    expect(dec(scrubRecords(enc(within)).scrubbed)).toBe(`x\n\`secret\`: \`${R}\` after\n{"b": 2}\n`);
   });
 
   it("cuts a long run before the key line of a value that crosses the bound only after a break", () => {

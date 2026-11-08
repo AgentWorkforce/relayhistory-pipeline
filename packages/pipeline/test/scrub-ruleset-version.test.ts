@@ -54,11 +54,14 @@ const SCRUB_RULESETS: Record<number, string> = {
   // context: a non-empty string under a secret key is redacted at any depth, through
   // arrays, in scrubJson/scrubRecord and the record-line tokenizer. From version 5 the
   // segmenter markers also enclose scrubRecordLine, so the digest covers the record path.
-  // Output with no secret-keyed record value and no over-cap quoted value is
-  // byte-identical to version 4.
+  // Output with no secret-keyed record value, no over-cap quoted value and no quoted
+  // secret value left unclosed or open across a line break is byte-identical to version 4.
   // Updated before release (repeated source keys: scrubRecordLine writes a key the source
   // repeats under its first written name, never another key's). Version 5 has sealed no chunk.
-  5: "b7834070de68bae1e20f4758081a3e1ee5fdd9003ebda6b38628afb7774b1dc2",
+  // Updated before release (PASS gate blockers 1 and 2: multi-line or unclosed quoted
+  // secret values within the bound are redacted whole and never cut inside; secret context
+  // runs through composite values, objects as well as arrays).
+  5: "a7e5ecd06e85c7475a7a377549700aba7478bed9bd9fadd55aa6ecccb4b26af5",
 };
 
 const read = (rel: string) =>

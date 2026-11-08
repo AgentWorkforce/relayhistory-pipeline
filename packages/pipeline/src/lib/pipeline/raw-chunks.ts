@@ -22,9 +22,9 @@ import {
   exceedsScrubBound,
   isCardNumber,
   isSecretRecordKey,
-  overCapQuotedValueSpans,
   redactsSecretKeyedValue,
   scrubText,
+  unsplittableQuotedValueSpans,
 } from "../scrub.js";
 import { PipelineError } from "./errors.js";
 import {
@@ -88,11 +88,20 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  *   (`isSecretKeyName`, at any depth, through arrays) unless it is already
  *   `[REDACTED]` or an `op://` reference, the same keep rule as the text rule;
  *   version 4 scrubbed each value on its own and stored, say,
- *   `{"password":"plain words"}` as it was. Numbers, booleans and null under a
- *   secret key are kept, and an object under one is scrubbed by its own keys.
- *   The segmenter pin now also covers `scrubRecordLine`. Output for input with
- *   no secret-keyed record value and no over-cap quoted value is
- *   byte-identical to version 4.
+ *   `{"password":"plain words"}` as it was. The secret context runs through
+ *   every descendant of a secret-keyed value, objects as well as arrays
+ *   (`{"password":{"value":"…"}}` is redacted below `value` too); the keys
+ *   and structure are kept, as are numbers, booleans and null. Third, every
+ *   quoted secret value is redacted whole, through its matching closing quote
+ *   across every line break or, with none, to the end of the input, whatever
+ *   its length: version 4 redacted a value within the bound only to its close
+ *   on the key's line, else to the next whitespace, and stored its later
+ *   lines. A value starting `op://` is kept only on one line. The segmenter
+ *   never cuts inside such a multi-line value either
+ *   (`unsplittableQuotedValueSpans`). The segmenter pin now also covers
+ *   `scrubRecordLine`. Output for input with no secret-keyed record value, no
+ *   over-cap quoted value and no quoted secret value left unclosed or open
+ *   across a line break is byte-identical to version 4.
  */
 export const SCRUB_RULESET_VERSION = 5;
 
@@ -117,8 +126,8 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
  * is matched whole; a long run is cut into segments under `MAX_SCRUB_CHARS`
  * at line boundaries (never inside an open private-key block or between two
  * digit groups, and never inside a quoted secret value past the quoted rule's
- * scan bound, or one the run ends inside before that is decided, which runs
- * across lines to its closing quote), so `scrubText`
+ * scan bound or holding a line break, or one the run ends inside before its
+ * close, which runs across lines to its closing quote), so `scrubText`
  * never truncates it. Line endings are kept; `records` counts complete lines.
  */
 export function scrubRecords(source: Uint8Array): {
@@ -175,14 +184,12 @@ export function scrubRecords(source: Uint8Array): {
   };
   let boundaryChecks = 0;
   /**
-   * Whether the run may end inside a quoted secret value past the quoted rule's scan
-   * bound (`overCapQuotedValueSpans`): such a value runs across lines to its closing
-   * quote or the end of the input, so ending the run here would leave the rest of it
-   * keyless in what follows. The bound caps the value's total length across lines, so
-   * a value the run ends inside may cross it only in lines the run has not reached,
-   * however short the run: the run is scanned as a prefix (`prefix: true`), and a
-   * secret value still open at its end without a decision is taken to be over the
-   * bound (fail closed: the next record or key line stays in the run). A run that is
+   * Whether the run may end inside a quoted secret value (`unsplittableQuotedValueSpans`):
+   * every such value runs across lines to its closing quote or the end of the input
+   * (rule set 5, whatever its length), so ending the run here would leave the rest of it
+   * keyless in what follows. The run is scanned as a prefix (`prefix: true`), and a
+   * secret value with no matching close in it is taken to run on past its end (fail
+   * closed: the next record or key line stays in the run). A run that is
    * not open is flushed right after, so this scans each run once; only a run still open
    * is scanned again at the next record or key line, at most `MAX_BOUNDARY_CHECKS`
    * times per chunk, and past that the run is taken to be open.
@@ -190,7 +197,7 @@ export function scrubRecords(source: Uint8Array): {
   const quotedOpenAtEnd = () => {
     if (!run) return false;
     if (quotedOpenChecks >= MAX_BOUNDARY_CHECKS) return true;
-    const spans = overCapQuotedValueSpans(run, { prefix: true });
+    const spans = unsplittableQuotedValueSpans(run, { prefix: true });
     const open = (spans[spans.length - 1]?.[1] ?? -1) >= run.length;
     if (open) quotedOpenChecks += 1;
     return open;
@@ -383,7 +390,9 @@ const CUT_SEARCH_CHARS = 65_536;
  * whole, however long, up to that close or the end of the input; line breaks do
  * not end it. No bounded context check can see its key from a cut deep
  * inside it, so both cut searches refuse every cut from the key start to the
- * value end of such a value (`overCapQuotedValueSpans`): `longCut` after any
+ * value end of such a value, and (rule set 5) of every quoted secret value
+ * within the bound that holds a line break, which is redacted whole across its
+ * lines too (`unsplittableQuotedValueSpans`): `longCut` after any
  * whitespace (scanned past the bound so a key just below it is seen), `safeCut`
  * at line boundaries.
  */
@@ -405,13 +414,14 @@ function safeCut(run: string, lookahead: string): number {
   const budget: CutBudget = { checks: 0, candidates: 0 };
   const floor = Math.max(1, run.length - CUT_SEARCH_CHARS);
   const keys = keyBlockSpans(run);
-  // Over-bound quoted values (rule set 4), which run across lines: a value whose key is
-  // in the run is decided over the bound within MAX_QUOTED_VALUE + 150 units of its key
-  // (its total length to the matching close, across lines), which the lookahead (the
-  // overflowing line plus CUT_CONTEXT_CHARS = 8192) covers unless the chunk ends first.
-  // `text` is scanned as a prefix either way: a value it ends inside, decided or not,
-  // may run on past it, so it is open to Infinity (fail closed).
-  const longValues = overCapQuotedValueSpans(text, { prefix: true }).map(
+  // Over-bound quoted values (rule set 4) and multi-line ones within the bound (rule set
+  // 5), which run across lines: a value whose key is in the run is decided over the bound
+  // within MAX_QUOTED_VALUE + 150 units of its key (its total length to the matching
+  // close, across lines), which the lookahead (the overflowing line plus
+  // CUT_CONTEXT_CHARS = 8192) covers unless the chunk ends first. `text` is scanned as a
+  // prefix either way: a value it ends inside, closed or not, may run on past it, so it
+  // is open to Infinity (fail closed).
+  const longValues = unsplittableQuotedValueSpans(text, { prefix: true }).map(
     ([start, end]): [number, number] => [start, end >= text.length ? Infinity : end],
   );
   for (let cut = run.length; cut >= floor && withinBudget(budget); ) {
@@ -564,8 +574,9 @@ function scrubBounded(text: string): string {
  *  - does not sit between two digit groups (cards, phone numbers),
  *  - is not inside a private-key block whose footer comes later,
  *  - is not strictly between the key start and the end of a quoted secret value
- *    longer than the quoted rule's scan bound, or of a generated unquoted value of
- *    at least that length (`overCapQuotedValueSpans`, over the text up to
+ *    longer than the quoted rule's scan bound or (rule set 5) holding a line break,
+ *    or of a generated unquoted value of at least that length
+ *    (`unsplittableQuotedValueSpans`, over the text up to
  *    `MAX_QUOTED_VALUE` + 256 past the bound, so a value whose length passes the
  *    bound only after it is seen too; rule set 4 redacts such a value whole, however
  *    far it runs and across line breaks, so no bounded context check can see its key
@@ -611,13 +622,14 @@ function longCut(text: string): number {
   // units before `top`, or straddling it) must be protected too, or a cut could land in
   // its key, at the seam or in the value and leave its tail keyless in the next segment.
   // Whether a value is over the bound is decided within MAX_QUOTED_VALUE + 150 units of
-  // its key's start (`overCapQuotedValueSpans`, counted across lines); 256 leaves a
+  // its key's start (`unsplittableQuotedValueSpans`, counted across lines); 256 leaves a
   // margin, so every value whose key starts below `top` is decided inside the window.
   // `text` is the whole rest of the input, so a window reaching its end is exact; a
   // shorter one is scanned as a prefix, and a value still open at `look`, decided or
   // not, runs on past it: treat it as open to the end (fail closed).
   const look = Math.min(text.length, top + MAX_QUOTED_VALUE + 256);
-  const longValues = overCapQuotedValueSpans(text.slice(0, look), { prefix: look < text.length }).map(
+  // A multi-line value within the bound ends within that window too, or is open at it.
+  const longValues = unsplittableQuotedValueSpans(text.slice(0, look), { prefix: look < text.length }).map(
     ([start, end]): [number, number] => [start, end >= look ? text.length : end],
   );
   for (let cut = top; cut >= floor && withinBudget(budget); cut--) {
@@ -627,8 +639,8 @@ function longCut(text: string): number {
       cut = inside[0] + 1; // the loop's cut-- lands on the header's start
       continue;
     }
-    // Nor inside an over-long quoted secret value (it may run across lines to its
-    // closing quote or the end of the input): go to its key's start.
+    // Nor inside an over-long or multi-line quoted secret value (it runs across lines to
+    // its closing quote or the end of the input): go to its key's start.
     const long = keyBlockAround(longValues, cut);
     if (long) {
       cut = long[0] + 1;
@@ -696,12 +708,16 @@ interface ObjectKeys {
 
 /**
  * One open container while a record is rewritten: its keys (null for an array) and
- * whether the value being read sits under a key that names a secret (rule set 5): for an
- * object, its last key did; an array takes it from the key it is the value of.
+ * whether the value being read sits under a key that names a secret (rule set 5).
+ * `inherited` is whether the container itself is (below) the value of such a key: it is
+ * set on `{`/`[` from the parent's current `secret` and never changes. An array's
+ * `secret` is its `inherited`; an object's is `inherited` or its last key's name, so the
+ * secret context runs through every descendant, objects as well as arrays.
  */
 interface Container {
   keys: ObjectKeys | null;
   secret: boolean;
+  inherited: boolean;
 }
 
 /**
@@ -716,8 +732,8 @@ interface Container {
  *
  * Key context first, as in `scrubJson` (rule set 5): a string value under a key
  * that names a secret (`isSecretRecordKey`, the decoded source key), directly or
- * in arrays under it, at any depth, is redacted whole (`redactsSecretKeyedValue`)
- * before it is scrubbed as a token on its own.
+ * anywhere below it, in arrays and objects alike, at any depth, is redacted whole
+ * (`redactsSecretKeyedValue`) before it is scrubbed as a token on its own.
  */
 function scrubRecordLine(line: string): string {
   // One entry per open container.
@@ -738,7 +754,7 @@ function scrubRecordLine(line: string): string {
         !isKey && container?.secret && redactsSecretKeyedValue(value)
           ? REDACTED
           : scrubStringToken(literal, value);
-      if (isKey) container!.secret = isSecretRecordKey(value);
+      if (isKey) container!.secret = container!.inherited || isSecretRecordKey(value);
       let name = scrubbed;
       if (top?.expectKey) {
         const written = top.source.get(value);
@@ -767,6 +783,8 @@ function scrubRecordLine(line: string): string {
           : lexeme;
       i = j;
     } else {
+      // A container below a secret key inherits that key's context (rule set 5).
+      const inherited = container?.secret ?? false;
       if (ch === "{")
         stack.push({
           keys: {
@@ -775,9 +793,10 @@ function scrubRecordLine(line: string): string {
             nextSuffix: new Map(),
             expectKey: true,
           },
-          secret: false,
+          secret: inherited,
+          inherited,
         });
-      else if (ch === "[") stack.push({ keys: null, secret: container?.secret ?? false });
+      else if (ch === "[") stack.push({ keys: null, secret: inherited, inherited });
       else if (ch === "}" || ch === "]") stack.pop();
       else if (ch === "," && top) top.expectKey = true;
       out += ch;
