@@ -100,6 +100,7 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105043880_ingest_bookkeeping_cleanup.sql",
       "20261105043890_buffered_search_gate_retired_witness.sql",
       "20261105043900_session_consumer_function_grants.sql",
+      "20261105043910_selfhost_session_selection_erase.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

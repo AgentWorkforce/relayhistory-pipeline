@@ -2360,6 +2360,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
 
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
+    // 043910 is newer, so 043900's down refuses until it is rolled back.
+    const newerDown = readFileSync(join(root, "supabase/rollbacks/20261105043910_selfhost_session_selection_erase.down.sql"), "utf8");
     const grantRow = `SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043900_session_consumer_function_grants.sql'`;
     const holds = async (db: PGlite) =>
       (await db.query<{ holds: boolean }>(
@@ -2379,6 +2381,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await db.exec(ET_BOOT);
       await runMigrations(client(db), { profile: SUPA_ET });
       expect(await holds(db)).toBe(true);
+      await db.exec(newerDown);
       expect(await failure(db.exec(down))).toBeNull();
       expect(await holds(db)).toBe(false);
       expect((await db.query<{ n: number }>(grantRow)).rows[0].n).toBe(0);
@@ -2391,6 +2394,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await runMigrations(client(db), { profile: SUPA_ET });
       await db.exec(`DROP OWNED BY search_consumer_runtime`);
       await db.exec(`DROP ROLE search_consumer_runtime`);
+      await db.exec(newerDown);
       expect(await failure(db.exec(down))).toBeNull();
       expect((await db.query<{ n: number }>(grantRow)).rows[0].n).toBe(0);
     }
