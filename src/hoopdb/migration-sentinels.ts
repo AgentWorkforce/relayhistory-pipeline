@@ -50,8 +50,8 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   },
   "upstream:20261105043700_owner_buffered_read.sql": { evidence: "function sessions.buffered_sessions_for", sql: "SELECT to_regprocedure('sessions.buffered_sessions_for(text,timestamptz,text,text,integer,text,text,text,text,text,boolean,text)') IS NOT NULL AS applied" },
   "upstream:20261105043800_lazy_ack_clock_no_key_update.sql": {
-    evidence: "replacement: staged ACK locks the seat clock FOR NO KEY UPDATE (claims' KEY SHARE no longer queues behind it)",
-    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_ack_batch(jsonb)') AND NOT prosecdef AND prosrc LIKE '%WHERE singleton FOR NO KEY UPDATE;%') AS applied",
+    evidence: "replacement: staged ACK locks the seat clock FOR NO KEY UPDATE (claims' KEY SHARE no longer queues behind it), then the bounded origin advisory lock before any slot",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_ack_batch(jsonb)') AND NOT prosecdef AND prosrc LIKE '%WHERE singleton FOR NO KEY UPDATE;%' AND prosrc LIKE '%pg_advisory_xact_lock(hashtextextended(jsonb_build_array(''96bulls:lazy-native-origin-v1'',p->>''org_id'',p->>''workspace_id'',p->>''origin_id'')::text,0));%') AS applied",
   },
   "upstream:20261105024000_session_brief_documents.sql": { evidence: "table sessions.session_brief_document_outbox", sql: relation("sessions.session_brief_document_outbox") },
   "upstream:20261105025000_canonical_feature_journal.sql": { evidence: "table sessions.canonical_feature_journal", sql: relation("sessions.canonical_feature_journal") },

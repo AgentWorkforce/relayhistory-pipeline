@@ -31,7 +31,12 @@ before any write, each claim takes exactly one transaction advisory lock keyed
 
 Since 043800 the staged ACK (`ingest_lazy_ack_batch`) takes the clock `FOR NO KEY UPDATE`: it writes
 `last_seat` only, so staged ACKs still serialize with each other and with every `FOR SHARE` /
-`FOR UPDATE` holder, but a claim's `KEY SHARE` no longer queues behind an in-flight ACK.
+`FOR UPDATE` holder, but a claim's `KEY SHARE` no longer queues behind an in-flight ACK. Right after
+the clock, and before any stage-row or native-slot lock, the staged ACK takes the same
+`'96bulls:lazy-native-origin-v1'` advisory lock as the claim for its one (org, workspace, origin).
+The ACK lock order is therefore fence -> clock -> origin -> slot, the same as the claim's, so an
+ACK and a same-origin claim of another user cannot deadlock on native slots. A same-origin claim
+that runs while a staged ACK is in flight waits for that ACK's transaction on the origin lock.
 
 ## Kill switch (usable at any time, including after installs)
 

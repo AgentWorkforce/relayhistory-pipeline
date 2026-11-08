@@ -1,4 +1,5 @@
-/** Replacement-only lane (slot 043800): the staged ACK locks the seat clock FOR NO KEY UPDATE, not FOR UPDATE. ACLs unchanged. */
+/** Replacement-only lane (slot 043800): the staged ACK locks the seat clock FOR NO KEY UPDATE, not FOR UPDATE, then the bounded origin
+ *  advisory lock (fence -> clock -> origin -> slot). ACLs unchanged. */
 import { createHash } from "node:crypto";
 import type { LaneContext, LaneManifest } from "../types.ts";
 
