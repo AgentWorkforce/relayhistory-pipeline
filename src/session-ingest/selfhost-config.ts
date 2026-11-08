@@ -24,6 +24,17 @@
  *   INGEST_MAX_PER_USER / INGEST_MAX_PER_ORG   in-flight batch slots, defaults 4 / 32 (same as the Worker)
  *   RELAYHISTORY_INGEST_PG_POOL_MAX  pool size, 1..32, default 4
  *
+ *   SELFHOST_INGEST_ADMISSION        unset | "" | "sync" (default: today's synchronous path, unchanged) |
+ *                                    "async" | "drain" (selfhost-admission.ts). Config only: no request
+ *                                    header can select it. async: the upload is ACKed after one create-only
+ *                                    inbox PUT, with no SQL on the request path, and an in-process consumer
+ *                                    admits it. drain: the synchronous path again, while the consumer keeps
+ *                                    admitting what is already in the inbox (the rollback step)
+ *   With async or drain only:
+ *   SELFHOST_ADMISSION_CONCURRENCY   admissions in flight in this process, 1..32, default 4
+ *   SELFHOST_ADMISSION_SCAN_MS       the inbox ListBucket scan interval, 1000..600000, default 15000
+ *   SELFHOST_ADMISSION_MAX_ATTEMPTS  attempts before an inbox object is dead-lettered, 1..100, default 20
+ *
  * Refused when enabled (they describe hosted-only edges this process does not have):
  * INGEST_ACCEPTANCE_MODE other than canonical, INGEST_INLINE_MAX_SESSIONS (no fan-out queue: every
  * batch is written inline, see selfhost-server.ts), INGEST_REPLICA_MODE other than off,
@@ -44,6 +55,16 @@ export const SELFHOST_INGEST_DEFAULT_PORT = 8081;
 /** The only login the ledger's SECURITY DEFINER functions admit (supabase/bootstrap/session_ingest_role.sql). */
 export const SELFHOST_INGEST_ROLE = "bulls96_session_ingest";
 
+export const SELFHOST_INGEST_ADMISSION_VAR = "SELFHOST_INGEST_ADMISSION";
+
+/** SELFHOST_INGEST_ADMISSION=async|drain; absent for sync (the default). */
+export interface SelfhostAdmissionSettings {
+  mode: "async" | "drain";
+  concurrency: number;
+  scanIntervalMs: number;
+  maxAttempts: number;
+}
+
 export interface SelfhostIngestSettings {
   port: number;
   /** Normalized origin (scheme + host + non-default port). */
@@ -55,6 +76,8 @@ export interface SelfhostIngestSettings {
   keyRoot: string;
   maxPerUser: number;
   maxPerOrg: number;
+  /** Present only for SELFHOST_INGEST_ADMISSION=async|drain. */
+  admission?: SelfhostAdmissionSettings;
 }
 
 export type SelfhostIngestConfig = { enabled: false; port: number } | ({ enabled: true } & SelfhostIngestSettings);
@@ -87,6 +110,19 @@ function need(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name]?.trim();
   if (!value) throw new Error(`96bulls: ${SELFHOST_INGEST_FLAG}=true needs ${name}`);
   return value;
+}
+
+/** SELFHOST_INGEST_ADMISSION: exactly sync (or unset / empty), async or drain; anything else refuses startup. */
+export function selfhostAdmissionSettings(env: NodeJS.ProcessEnv): SelfhostAdmissionSettings | undefined {
+  const raw = env[SELFHOST_INGEST_ADMISSION_VAR];
+  if (raw === undefined || raw === "" || raw === "sync") return undefined;
+  if (raw !== "async" && raw !== "drain") throw new Error(`96bulls: ${SELFHOST_INGEST_ADMISSION_VAR} must be sync, async or drain`);
+  return {
+    mode: raw,
+    concurrency: bounded(env, "SELFHOST_ADMISSION_CONCURRENCY", 4, 1, 32),
+    scanIntervalMs: bounded(env, "SELFHOST_ADMISSION_SCAN_MS", 15_000, 1_000, 600_000),
+    maxAttempts: bounded(env, "SELFHOST_ADMISSION_MAX_ATTEMPTS", 20, 1, 100),
+  };
 }
 
 /** Discrete fields from the sanitized URL (the read API service's rule): user, password and database required. */
@@ -143,6 +179,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   need(env, "LOCKER_BUCKET");
   const keyRoot = env.INGEST_KEY_ROOT?.trim() || "96bulls";
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(keyRoot)) throw new Error("96bulls: INGEST_KEY_ROOT must be a single key segment");
+  const admission = selfhostAdmissionSettings(env);
   return {
     enabled: true,
     port: port(env),
@@ -153,5 +190,6 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     keyRoot,
     maxPerUser: bounded(env, "INGEST_MAX_PER_USER", 4, 1, 1000),
     maxPerOrg: bounded(env, "INGEST_MAX_PER_ORG", 32, 1, 1000),
+    ...(admission ? { admission } : {}),
   };
 }

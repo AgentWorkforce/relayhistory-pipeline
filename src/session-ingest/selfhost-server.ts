@@ -29,6 +29,17 @@
  *   NEON_REPLICA   -> none (refused by config)
  *   INGEST_SIGNING_KEY (relayhistory HMAC) -> replaced by relaycontrol introspection (selfhost-auth.ts)
  *
+ * SELFHOST_INGEST_ADMISSION (selfhost-config.ts; default sync, config only, never a header):
+ *   sync   (default) everything above, byte for byte: nothing below is constructed.
+ *   async  POST /v1/delivery/batches and /v1/turns/batches answer the hosted queued receipt
+ *          (x-relay-admission {"version":1,"state":"queued"}) after ONE create-only inbox PUT. The request
+ *          path makes no SQL call at all (and never falls back to the synchronous path: a failure is a 503
+ *          with nothing acknowledged). The authorization dependency is unchanged: one relaycontrol
+ *          introspection per request, no positive cache. An in-process consumer (selfhost-admission.ts)
+ *          admits the inbox through the hosted admitMessage. Startup refuses a Locker backend that does not
+ *          honour conditional writes (locker.ts assertConditionalWrites). /readyz follows the consumer.
+ *   drain  the synchronous request path again, while the consumer keeps admitting the inbox.
+ *
  * Auth runs in this wrapper BEFORE the request body is read: an unauthenticated
  * or unscoped caller never gets the edge to buffer MAX_DELIVERY_BYTES. The
  * verified identity reaches the app only through a WeakMap keyed by the exact
@@ -41,10 +52,13 @@ import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
 import pg from "pg";
 import { errorFields, log } from "../shared/log.ts";
-import { buildLockerStore } from "../shared/locker.ts";
+import { assertConditionalWrites, buildLockerStore } from "../shared/locker.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
 import { AuthError } from "../session-read-api/app.ts";
 import { createIngestApp, IDENTITY_HEADER, SIGNATURE_HEADER, type IngestIdentity } from "./app.ts";
+import { ADMISSION_ACCEPT_VALUE, INBOX_NAMESPACE } from "./async-admission.ts";
+import type { DeliverDeps } from "./deliver.ts";
+import { selfhostAdmissionConsumer, type SelfhostAdmissionConsumer, type SelfhostAdmissionOptions, type SelfhostAdmissionStatus } from "./selfhost-admission.ts";
 import { sqlLedger } from "./ledger-sql.ts";
 import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
@@ -90,6 +104,8 @@ export interface SelfhostIngestRuntime {
   bind(request: Request, identity: IngestIdentity): void;
   ready(): Promise<boolean>;
   close(): Promise<void>;
+  /** SELFHOST_INGEST_ADMISSION=async|drain only: the consumer's status (for /readyz). */
+  admission?: () => SelfhostAdmissionStatus;
 }
 
 export interface RuntimeParts {
@@ -100,27 +116,72 @@ export interface RuntimeParts {
   close: () => Promise<void>;
 }
 
+/** Test seams for the async consumer; production passes none. */
+export interface SelfhostRuntimeOptions {
+  nowMs?: () => number;
+  /** false: build the consumer but do not start its scan loop (a test drives scan() / settle()). */
+  startConsumer?: boolean;
+  onConsumer?: (consumer: SelfhostAdmissionConsumer) => void;
+  log?: SelfhostAdmissionOptions["log"];
+}
+
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg">, parts: RuntimeParts): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission">, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const verified = new WeakMap<Request, IngestIdentity>();
-  const app = createIngestApp({
-    identify: (request) => {
-      const identity = verified.get(request);
-      // Unreachable through the wrapper; a direct app.fetch without bind() is refused, never trusted.
-      if (!identity) throw new AuthError(401, "missing_authorization", "missing Authorization header");
-      return identity;
-    },
-    deliver: {
-      ledger: sqlLedger(parts.run, { acceptanceMode: "canonical" }),
-      acceptanceMode: "canonical",
-      target: { store: parts.store, keyRoot: settings.keyRoot },
-      // Slot TTL past any request this process serves, so a lost release frees itself (Worker: 90).
-      slots: { maxPerUser: settings.maxPerUser, maxPerOrg: settings.maxPerOrg, ttlSeconds: 90 },
-      // inlineMaxSessions unset: always inline, so `fanout` is never needed (see the header).
-    },
-    log: (fields) => log.info("session ingest", fields),
+  const deliver: DeliverDeps = {
+    ledger: sqlLedger(parts.run, { acceptanceMode: "canonical" }),
+    acceptanceMode: "canonical",
+    target: { store: parts.store, keyRoot: settings.keyRoot },
+    // Slot TTL past any request this process serves, so a lost release frees itself (Worker: 90).
+    slots: { maxPerUser: settings.maxPerUser, maxPerOrg: settings.maxPerOrg, ttlSeconds: 90 },
+    // inlineMaxSessions unset: always inline, so `fanout` is never needed (see the header).
+  };
+  const identify = (request: Request) => {
+    const identity = verified.get(request);
+    // Unreachable through the wrapper; a direct app.fetch without bind() is refused, never trusted.
+    if (!identity) throw new AuthError(401, "missing_authorization", "missing Authorization header");
+    return identity;
+  };
+  const admission = settings.admission;
+  if (!admission) {
+    // SELFHOST_INGEST_ADMISSION=sync (the default): exactly the app this file always built.
+    const app = createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields) });
+    return { app, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close };
+  }
+  const mode = admission.mode === "async" ? "on" as const : "drain" as const;
+  const consumer: SelfhostAdmissionConsumer = selfhostAdmissionConsumer({
+    mode, deliver, concurrency: admission.concurrency, scanIntervalMs: admission.scanIntervalMs, maxAttempts: admission.maxAttempts,
+    ...(options.nowMs ? { nowMs: options.nowMs } : {}), ...(options.log ? { log: options.log } : {}),
   });
-  return { app, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close };
+  options.onConsumer?.(consumer);
+  const inboxRoot = `${settings.keyRoot}/${INBOX_NAMESPACE}/`;
+  const app = createIngestApp({
+    identify,
+    deliver,
+    log: (fields) => log.info("session ingest", fields),
+    asyncAdmission: {
+      mode,
+      // No queue: the inbox PUT is the record, and the consumer's scan is the authority. This only lets the
+      // consumer start on a fresh upload without waiting for the next scan; it never throws.
+      enqueue: async (message) => { if (message.key.startsWith(inboxRoot)) consumer.notify(message.key); },
+      ...(options.nowMs ? { nowMs: options.nowMs } : {}),
+      selfhost: { identityOf: (request) => verified.get(request) },
+    },
+  });
+  if (options.startConsumer !== false) consumer.start();
+  return {
+    app,
+    verify: parts.verify,
+    // The opt-in is this deployment's config, stamped on the identity the wrapper verified; no request
+    // header or body can set it (the identity header is stripped and never parsed here).
+    bind: (request, identity) => void verified.set(request, mode === "on" ? { ...identity, admission: ADMISSION_ACCEPT_VALUE } : identity),
+    // async: uploads need only the store, so readiness is the consumer's (its scans prove the store answers);
+    // the database's health shows as consumer backlog, never as refused uploads. drain: the synchronous
+    // request path needs the database too.
+    ready: async () => consumer.status().healthy && (mode === "on" || await parts.ready()),
+    close: async () => { await consumer.stop(); await parts.close(); },
+    admission: () => consumer.status(),
+  };
 }
 
 /**
@@ -262,6 +323,11 @@ export async function assertIngestRole(run: SqlRun, provider: IngestProvider): P
   if (refusal) throw new IngestLoginError(refusal);
 }
 
+/** Disjoint from every tenant prefix (leading dot) and inside the srv-writer `<root>/*\/v1/ws=*\/m=srv_*` shape. */
+export function conditionalWriteProbeKey(keyRoot: string, nonce: string = crypto.randomUUID().replace(/-/g, "")): string {
+  return `${keyRoot}/.admission-probe/v1/ws=probe/m=srv_${nonce}/probe.json`;
+}
+
 export type RuntimeBuilder = (settings: SelfhostIngestSettings, env: NodeJS.ProcessEnv) => Promise<SelfhostIngestRuntime>;
 
 /** Production: pg pool, Locker store, relaycontrol introspection with no positive cache. */
@@ -279,6 +345,9 @@ export const productionRuntime: RuntimeBuilder = async (settings, env) => {
   try {
     await assertIngestRole(run, { supabase: env.SESSION_POSTGRES_TLS_PROFILE === "supabase" });
     const store = buildLockerStore(env).store as unknown as ObjectStore;
+    // Async admission needs create-only and compare-and-swap PUTs (the inbox, the privacy journal): prove the
+    // backend honours them, or refuse to start. Never run for sync (the default).
+    if (settings.admission) await assertConditionalWrites(store, conditionalWriteProbeKey(settings.keyRoot));
     const verify = relaycontrolIngestIdentity(settings, selfhostIntrospector(settings, env));
     return selfhostIngestRuntime(settings, {
       run,
@@ -327,7 +396,9 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
         if (req.method === "GET" && path === "/healthz") return sendJson(req, res, 200, { ok: true, enabled: runtime !== null });
         if (req.method === "GET" && path === "/readyz") {
           const ok = runtime ? await runtime.ready() : false;
-          return sendJson(req, res, ok ? 200 : 503, { ok, enabled: runtime !== null });
+          // Async admission only: the consumer's counters (numbers and a closed state; no key, no tenant).
+          const a = runtime?.admission?.();
+          return sendJson(req, res, ok ? 200 : 503, { ok, enabled: runtime !== null, ...(a ? { admission: { state: a.state, backlog: a.backlog, oldestAgeMs: a.oldestAgeMs, deadLetters: a.deadLetters, inFlight: a.inFlight, lastScanAgeMs: a.lastScanAgeMs } } : {}) });
         }
         if (!runtime)
           return sendJson(req, res, 503, envelope("not_configured", "the session ingest is not enabled", correlationId), { "retry-after": "60", "x-correlation-id": correlationId });

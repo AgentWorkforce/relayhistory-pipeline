@@ -147,7 +147,7 @@ export interface IngestAppDeps {
    * every reset / re-enable raises the privacy journal first. "drain": no new async ACK, the
    * journal is still raised (the consumer is still admitting). Buffered acceptance only.
    */
-  asyncAdmission?: { mode: AsyncAdmissionMode; enqueue: (message: AdmissionMessage) => Promise<void>; nowMs?: () => number };
+  asyncAdmission?: { mode: AsyncAdmissionMode; enqueue: (message: AdmissionMessage) => Promise<void>; nowMs?: () => number; selfhost?: SelfhostAdmissionHooks };
   /**
    * INGEST_SYNC_ADMISSION_FROZEN_RECEIPT (async-admission.ts). Absent or "off": nothing changes. "on":
    * under frozen-supabase custody, a batch whose SIGNED identity carries `admission: queued-v1` but did
@@ -157,6 +157,22 @@ export interface IngestAppDeps {
    * pre-forward read for such a caller.
    */
   syncAdmissionFrozenReceipt?: SyncAdmissionFrozenReceiptMode;
+}
+
+/**
+ * Self-host only (selfhost-server.ts, SELFHOST_INGEST_ADMISSION); the hosted Worker never sets it, and
+ * without it every line below behaves exactly as before. With it:
+ *   - canonical acceptance is allowed (the self-host ingest is canonical). Control routes stay
+ *     fail-closed: `journaled` refuses every non-ordered reset / re-enable before SQL (503), and the
+ *     self-host wrapper does not route them at all;
+ *   - the pre-body journal witness is taken for the identity the wrapper ALREADY verified (relaycontrol
+ *     introspection runs before any body byte), never from a request header;
+ *   - no synchronous fallback: with mode "on", a batch that cannot take the queued path (its witness
+ *     failed, or anything else) is a 503, so the request path never reaches SQL.
+ */
+export interface SelfhostAdmissionHooks {
+  /** The verified identity bound to exactly this Request, or undefined. */
+  identityOf: (request: Request) => IngestIdentity | undefined;
 }
 
 type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined; journalWitness: { tenant: string; seq: number } | undefined } };
@@ -365,7 +381,8 @@ export function createIngestApp(deps: IngestAppDeps) {
   const emit = deps.log ?? ((fields) => log.info("session ingest", fields));
   const custodyMode = deps.custodySource ?? "relayhistory";
   const asyncMode: AsyncAdmissionMode = deps.asyncAdmission?.mode ?? "off";
-  if (asyncMode !== "off" && deps.deliver.acceptanceMode !== "buffered") throw new Error("session ingest: async admission requires buffered acceptance");
+  const selfhostAdmission = deps.asyncAdmission?.selfhost;
+  if (asyncMode !== "off" && deps.deliver.acceptanceMode !== "buffered" && !selfhostAdmission) throw new Error("session ingest: async admission requires buffered acceptance");
   const nowMs = deps.asyncAdmission?.nowMs ?? Date.now;
   const syncFrozenReceipt = deps.syncAdmissionFrozenReceipt === "on";
   /**
@@ -447,7 +464,8 @@ export function createIngestApp(deps: IngestAppDeps) {
     const path = new URL(c.req.url).pathname;
     if (asyncMode === "on" && c.req.method === "POST" && (path === "/v1/delivery/batches" || path === "/v1/turns/batches")) {
       try {
-        const claimed = bindingIdentity(c.req.raw);
+        const claimed = selfhostAdmission ? selfhostAdmission.identityOf(c.req.raw) : bindingIdentity(c.req.raw);
+        if (!claimed) throw new Error("no_identity");
         if (claimed.admission === ADMISSION_ACCEPT_VALUE) {
           const tenant = { orgId: claimed.orgId, workspaceId: claimed.workspaceId, userId: claimed.userId };
           c.set("journalWitness", { tenant: JSON.stringify(tenant), seq: await witnessPrivacyJournal(deps.deliver.target.store, deps.deliver.target.keyRoot, tenant) });
@@ -552,6 +570,8 @@ export function createIngestApp(deps: IngestAppDeps) {
         c.header(ADMISSION_HEADER, ADMISSION_QUEUED);
         return c.json({ ...prepared.receipt, limits: { ...DELIVERY_LIMITS, contentEncodings: contentEncodings() } });
       }
+      // Self-host "on": never a synchronous fallback (that would put SQL back on the request path).
+      if (asyncMode === "on" && selfhostAdmission) throw new IngestUnavailable("admission_witness", witness ? "admission_not_queueable" : "privacy_journal_unavailable");
       // INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: a queued-v1 caller's relayhistory skipped its pre-forward legacy-receipt
       // read, so a batch that fell back here gets the consumer's read first (admission-consumer.ts), before any claim.
       if (syncFrozenReceipt && identity.admission === ADMISSION_ACCEPT_VALUE && custodyMode === "frozen-supabase") {
