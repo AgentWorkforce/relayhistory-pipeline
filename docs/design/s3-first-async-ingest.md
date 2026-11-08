@@ -358,7 +358,7 @@ failed. Under `frozen-supabase` custody that path builds the frozen witness and 
 reads the frozen legacy (pre-cutover) receipt, while relayhistory skips its own pre-forward
 legacy-receipt read for an opted-in request. With the flag `on`, such a request first runs the
 consumer's read (`frozenReceipt`): a stored receipt with the same batch digest answers 200 with
-that receipt (`legacy_replay`) and the header `x-relay-admission: {"version":1,"state":"legacy-replay"}`, one with another digest answers the claim's own 409
+that receipt (`legacy_replay`; a stored receipt without a string `receiptId` gets the prepared receipt's id) and the header `x-relay-admission: {"version":1,"state":"legacy-replay"}`, one with another digest answers the claim's own 409
 `delivery_conflict` (`batch_id`), both with no witness, claim, delivery or custody ACK header (the 409 carries no `x-relay-admission`
 header); no stored receipt continues the unchanged synchronous path (custody ACK header, no
 `x-relay-admission` header); a ledger without `frozenReceipt` is 503

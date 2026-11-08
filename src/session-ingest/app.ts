@@ -563,7 +563,8 @@ export function createIngestApp(deps: IngestAppDeps) {
           // No claim, so no custody ACK header; the admission header names the legacy replay instead.
           emit({ ...fields, outcome: "legacy_replay", count: prepared.records.length, duration_ms: Date.now() - started, bytes_raw: read.bytes });
           c.header(ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY);
-          return c.json({ ...stored.receipt, limits: { ...DELIVERY_LIMITS, contentEncodings: contentEncodings() } });
+          // receiptId is supplied explicitly: a stored receipt without a string one falls back to the prepared receipt's id.
+          return c.json({ ...stored.receipt, receiptId: typeof stored.receipt.receiptId === "string" ? stored.receipt.receiptId : prepared.receipt.receiptId, limits: { ...DELIVERY_LIMITS, contentEncodings: contentEncodings() } });
         }
       }
       if (!c.get("custody") && custodyMode === "frozen-supabase") c.set("custody", await frozenWitness(await batchWitnessInput(tenant, batch)));

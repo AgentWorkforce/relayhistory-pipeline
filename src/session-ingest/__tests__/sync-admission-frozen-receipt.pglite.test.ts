@@ -41,8 +41,8 @@ async function fixture() {
   const run = async (s: string, p: unknown[] = []) => { await db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest"); try { const r = await db.query(s, p as never); await db.exec("COMMIT"); return r as never; } catch (e) { await db.exec("ROLLBACK"); throw e; } };
   const fs = scratchStore(); open.push(fs.done);
   /** A legacy (pre-cutover) receipt for this batch, stored with `digest`. */
-  const legacy = async (b: HistoryExportBatch, digest: string) => {
-    const receipt = { protocolVersion: 1, batchId: b.batch_id, acceptanceLevel: "durable", acceptedRevisionIds: b.records.map((r) => r.revision_id), unsupportedRevisionIds: [], receiptId: "rhr_legacy" };
+  const legacy = async (b: HistoryExportBatch, digest: string, withReceiptId = true) => {
+    const receipt = { protocolVersion: 1, batchId: b.batch_id, acceptanceLevel: "durable", acceptedRevisionIds: b.records.map((r) => r.revision_id), unsupportedRevisionIds: [], ...(withReceiptId ? { receiptId: "rhr_legacy" } : {}) };
     await db.query("INSERT INTO sessions.ingest_frozen_source_receipts VALUES($1,$2,$3,$4,$5,$6)", [TENANT.orgId, TENANT.workspaceId, b.origin_id, b.batch_id, digest, JSON.stringify(receipt)]);
     return receipt;
   };
@@ -107,12 +107,32 @@ describe.each(["off", "on-witness-failed", "drain"] as const)("flag on, queued-v
     expect(res.status).toBe(200);
     const { limits, ...body } = (await res.json()) as Record<string, unknown>;
     expect(body).toEqual(receipt);
+    expect(body.receiptId).toBe("rhr_legacy");
     expect(limits).toEqual(await t.limits());
     expect(limits).toMatchObject({ ...DELIVERY_LIMITS });
     expect(t.calls).toEqual(["frozenReceipt"]);
     expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).toBeNull();
     expect(res.headers.get(ADMISSION_HEADER)).toBe('{"version":1,"state":"legacy-replay"}');
     expect(res.headers.get(ADMISSION_HEADER)).toBe(ADMISSION_LEGACY_REPLAY);
+    expect(t.sent).toHaveLength(0);
+    expect(route(t.logs).map((l) => l.outcome)).toEqual(["legacy_replay"]);
+  });
+
+  test("(a2) stored legacy receipt without receiptId, same digest: 200 whose receiptId is the prepared receipt's; no witness, claim, delivery or custody ACK", async () => {
+    const t = await setup({ mode });
+    const b = await batch([record({ record_id: "r1" })], { batch_id: "legacy-no-receipt-id" });
+    const stored = await t.legacy(b, await digestOf(b), false);
+    expect("receiptId" in stored).toBe(false);
+    const expected = (await prepareDelivery(TENANT, b)).receipt.receiptId;
+    expect(typeof expected).toBe("string");
+    const res = await t.post(b);
+    expect(res.status).toBe(200);
+    const { limits, ...body } = (await res.json()) as Record<string, unknown>;
+    expect(body).toEqual({ ...stored, receiptId: expected });
+    expect(limits).toEqual(await t.limits());
+    expect(t.calls).toEqual(["frozenReceipt"]);
+    expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).toBeNull();
+    expect(res.headers.get(ADMISSION_HEADER)).toBe('{"version":1,"state":"legacy-replay"}');
     expect(t.sent).toHaveLength(0);
     expect(route(t.logs).map((l) => l.outcome)).toEqual(["legacy_replay"]);
   });
