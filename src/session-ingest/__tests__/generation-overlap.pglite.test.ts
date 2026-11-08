@@ -1,5 +1,5 @@
 /**
- * Zero-503 schema windows (migration 20261105053020, docs/design/zero-503-schema-windows.md), on PGlite over
+ * Zero-503 schema windows (migration 20261105043885, docs/design/zero-503-schema-windows.md), on PGlite over
  * EVERY migration: the bounded overlap keeps an old Worker admitting while readiness moves to the next
  * generation, a Worker at the next generation admits after the rebind, the old one is refused once the window
  * closes or expires, and the window is owner-only, explicit, append-only and never a downgrade.
@@ -146,6 +146,41 @@ test("an expired window for another pair admits nothing and does not block a reb
  await f.marker(B,"pass");
  expect(await rebindIngestGeneration(f.client,{from:A,to:B})).toMatchObject({policy:"rebound",overlapClosed:false});
  await f.ok(f.worker(B));
+});
+
+test("no downgrade at the rebind (dogpatch P1 causal probe): A -> B, then marker back at A, rebind B -> A is refused and an A Worker stays refused; an expired A -> B window does not weaken it",async()=>{
+ const f=await fixture();
+ // An expired A -> B window (closed as 'expired', never 'rebind') must not matter.
+ await f.db.query("INSERT INTO sessions.ingest_generation_overlap_windows(from_generation,to_generation,admit_during_apply,approval_sha256,opened_by,opened_at,expires_at) VALUES($1,$2,false,$3,'t',clock_timestamp()-interval '2 minutes',clock_timestamp()-interval '1 second')",[A,B,APPROVAL]);
+ await f.marker(B,"pass");
+ expect(await rebindIngestGeneration(f.client,{from:A,to:B})).toMatchObject({policy:"rebound"});
+ expect((await f.db.query("SELECT closed_reason FROM sessions.ingest_generation_overlap_windows")).rows).toEqual([{closed_reason:"expired"}]);
+ expect((await f.db.query("SELECT generation,successor FROM sessions.ingest_generation_overlap_retired")).rows).toEqual([{generation:A,successor:B}]);
+ // Readiness goes back to A (e.g. an older image is re-applied): the rebind back must refuse.
+ await f.marker(A,"pass");
+ expect(await err(rebindIngestGeneration(f.client,{from:B,to:A}))).toContain("target_generation_retired");
+ // Even bypassing the rebind helper, the policy itself refuses a retired generation (DB-side).
+ const pol=(await f.db.query("SELECT source_identity_sha256 s,control_epoch e,privacy_baseline_sha256 p,retention_contract_sha256 r,source_proof_sha256 q,valid_until v FROM sessions.ingest_lazy_policy")).rows[0] as any;
+ expect(await err(f.owner("ingest_lazy_policy_set",{baselineMode:"lazy-current",generation:A,sourceIdentitySha256:pol.s,controlEpoch:pol.e,privacyBaselineSha256:pol.p,retentionContractSha256:pol.r,sourceProofSha256:pol.q,validUntil:new Date(pol.v).toISOString(),issuer:"relayhistory-cloud"}))).toContain("generation already retired");
+ expect(await err(f.db.query("UPDATE sessions.ingest_lazy_policy SET generation=$1",[A]))).toContain("generation already retired");
+ expect((await f.db.query("SELECT generation FROM sessions.ingest_lazy_policy")).rows).toEqual([{generation:B}]);
+ // The retired A Worker is refused although readiness says A.
+ expect((await f.refused(f.worker(A))).code).toBe("ledger_sqlstate_55000");
+ // A window can never name A again either.
+ await f.marker(B,"pass");
+ expect(await err(openGenerationOverlap(f.client,{from:B,to:A,ttlSeconds:60,admitDuringApply:false,approvalSha256:APPROVAL}))).toContain("generation already retired");
+ // The retirement record is append-only.
+ expect(await err(f.db.query("DELETE FROM sessions.ingest_generation_overlap_retired"))).toContain("append-only");
+ expect(await err(f.db.query("UPDATE sessions.ingest_generation_overlap_retired SET successor=NULL"))).toContain("append-only");
+});
+
+test("open requires exactly one lazy custody policy at from (dogpatch P2): a missing policy refuses",async()=>{
+ const f=await fixture();
+ await f.db.query("DELETE FROM sessions.ingest_lazy_policy");
+ expect(await err(openGenerationOverlap(f.client,{from:A,to:B,ttlSeconds:600,admitDuringApply:false,approvalSha256:APPROVAL}))).toContain("custody policy is not at from");
+ expect((await f.db.query("SELECT count(*)::int n FROM sessions.ingest_generation_overlap_windows")).rows[0]).toEqual({n:0});
+ // Deleting the policy retired its generation too: it can never be reinstated.
+ expect((await f.db.query("SELECT generation,successor FROM sessions.ingest_generation_overlap_retired")).rows).toEqual([{generation:A,successor:null}]);
 });
 
 test("owner-only: the ingest role cannot open, close, read or edit a window; a granted non-owner is still refused 42501",async()=>{

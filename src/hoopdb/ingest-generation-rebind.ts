@@ -10,7 +10,7 @@
  * Idempotent: rerunning after success changes nothing. It refuses unless readiness PASS is for `to`,
  * the policy is at `from` (or already `to`), and every admission row is at `from` or `to`.
  *
- * Generation overlap (20261105053020, docs/design/zero-503-schema-windows.md): when installed, an open
+ * Generation overlap (20261105043885, docs/design/zero-503-schema-windows.md): when installed, an open
  * overlap window must be exactly (from -> to); it is locked BEFORE the policy (the ingest lock order is
  * window -> policy, so this cannot deadlock with an admitted upload) and closed in this same transaction.
  * Before that migration is applied the rebind behaves exactly as before.
@@ -41,6 +41,9 @@ export async function rebindIngestGeneration(client: MigrationClient, opts: { fr
       // A live window for another pair is a stop; an expired one admits nothing and is left for the next open's sweep.
       if (w && !matches && !w.expired) refuse("overlap_window_mismatch");
       open = matches;
+      // No downgrade (also enforced by the policy trigger): a generation the policy already left is never a target.
+      const retired = (await client.query<{ r: boolean }>("SELECT EXISTS(SELECT 1 FROM sessions.ingest_generation_overlap_retired WHERE generation=$1) AS r", [to])).rows[0]!.r;
+      if (retired) refuse("target_generation_retired");
     }
     const pol = (await client.query<any>(`SELECT generation, source_identity_sha256, control_epoch, privacy_baseline_sha256,
         retention_contract_sha256, source_proof_sha256, valid_until FROM sessions.ingest_lazy_policy WHERE singleton FOR UPDATE`)).rows[0];

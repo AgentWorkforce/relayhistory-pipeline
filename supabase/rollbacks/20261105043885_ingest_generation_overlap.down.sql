@@ -1,5 +1,6 @@
 -- Generated: restore the exact 050000 ingest_require_generation and 055000 ingest_lazy_guard (strict PASS
--- equality, no overlap window), then drop the overlap window table and its four owner-only functions.
+-- equality, no overlap window), then drop the policy retirement trigger, both overlap tables and the six
+-- owner-only functions.
 -- Owner/ACL of the two restored helpers stay unchanged. Close any open window first (it stops admitting
 -- the moment the restored bodies commit either way). Code only: running it against a hosted database
 -- needs the user's OK. Explicit transaction: guard, marker fence, replacement and ledger removal are atomic.
@@ -10,10 +11,10 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF to_regclass('sessions.__96bulls_migrations')IS NULL OR to_regclass('sessions.__96bulls_role_validation')IS NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='generation overlap: migration ledger/marker required';END IF;
  LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
- IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105053020_ingest_generation_overlap.sql')
+ IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105043885_ingest_generation_overlap.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='generation overlap: a later migration is applied; roll it back first';END IF;
- SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105053020_ingest_generation_overlap.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'da2fcd5011ea2c7ac99d05191ec0113714b50f21645489562188657a464a4a07'
+ SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043885_ingest_generation_overlap.sql' FOR UPDATE;
+ IF NOT FOUND OR v_sha<>'fc099b29dafce74daaf3670524ae0b23cd058b8eb4105de3d9ad4b0b629680c7'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='generation overlap: own applied checksum required';END IF;
  UPDATE sessions.__96bulls_role_validation SET status='pending',updated_at=clock_timestamp() WHERE name='session_directory_search_worker';
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='generation overlap: validation marker required';END IF;
@@ -44,10 +45,14 @@ BEGIN
   AND retention_contract_sha256=pol.retention_contract_sha256 AND valid_until>clock_timestamp() FOR SHARE;
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: buffered admission closed';END IF;
 END $lazy_guard$;
+DROP TRIGGER ingest_generation_overlap_policy_retire ON sessions.ingest_lazy_policy;
 DROP TABLE sessions.ingest_generation_overlap_windows;
+DROP TABLE sessions.ingest_generation_overlap_retired;
 DROP FUNCTION sessions.ingest_generation_overlap_immutable();
+DROP FUNCTION sessions.ingest_generation_overlap_retired_immutable();
+DROP FUNCTION sessions.ingest_generation_overlap_policy_retire();
 DROP FUNCTION sessions.ingest_generation_overlap_admits(text,text,text);
 DROP FUNCTION sessions.ingest_generation_overlap_open(jsonb);
 DROP FUNCTION sessions.ingest_generation_overlap_close(jsonb);
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105053020_ingest_generation_overlap.sql' AND sha256='da2fcd5011ea2c7ac99d05191ec0113714b50f21645489562188657a464a4a07';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043885_ingest_generation_overlap.sql' AND sha256='fc099b29dafce74daaf3670524ae0b23cd058b8eb4105de3d9ad4b0b629680c7';
 COMMIT;

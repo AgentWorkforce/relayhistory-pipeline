@@ -1,7 +1,7 @@
 # Zero-503 schema windows: bounded generation overlap
 
 Status: code and tests only (draft PR). Nothing is applied, deployed, opened or rebound by this change.
-Applying migration `20261105053020`, opening a window on a real database, and any Worker deploy each still
+Applying migration `20261105043885`, opening a window on a real database, and any Worker deploy each still
 need Khaliq's explicit OK in his own words.
 
 ## 1. The failure mode
@@ -75,11 +75,11 @@ Worker-first ordering.
 
 ## 2. The overlap protocol
 
-### 2.1 Database: one owner-opened, time-bounded window (migration `20261105053020`)
+### 2.1 Database: one owner-opened, time-bounded window (migration `20261105043885`)
 
-**NEW SLOT 053020.** It is the next free slot after the landed `043870`: `043880` and `043890` are taken, and
-`049000`/`050000`/`051000` are named design lanes. The registry keeper should confirm it. Note that any
-later migration must sort after `053020` once `053020` is applied (`sequencePreflight`, lane prefix rule).
+**SLOT 043885**, assigned by the registry keeper. `migrate.ts` applies pending files in sorted order, so the
+migration sits between the landed `043880` (ingest bookkeeping cleanup) and the unlanded `043890` and applies
+next. It was first drafted as `043885`; the renumber changed only the slot header comment and the file names.
 
 The migration creates `sessions.ingest_generation_overlap_windows`, an append-only record with these rules:
 - Columns: `from_generation`, `to_generation`, `admit_during_apply`, `approval_sha256`, `opened_by`,
@@ -89,7 +89,17 @@ The migration creates `sessions.ingest_generation_overlap_windows`, an append-on
 - A trigger blocks every UPDATE except the single close, and blocks DELETE.
 - RLS is on and every grant is revoked.
 
-It also adds four owner-only functions. None of them is granted to a runtime role, and the generator-checked
+It also creates `sessions.ingest_generation_overlap_retired`, the DB-side no-downgrade record:
+- A trigger on `sessions.ingest_lazy_policy` (`ingest_generation_overlap_policy_retire`) records every
+  generation the custody policy leaves. That covers an UPDATE to a new generation (the rebind, or any other
+  owner write through `ingest_lazy_policy_set`) and a DELETE.
+- The same trigger refuses setting the policy to a recorded generation (55000 `generation already retired`).
+- The record is append-only (its own trigger blocks UPDATE and DELETE), with RLS on and every grant revoked.
+- Since the caller generation must equal the policy generation (F3/F4), a retired generation can never be
+  admitted again. This holds whatever the readiness marker says, and whether a window was ever opened,
+  closed or left to expire.
+
+It adds six owner-only functions. None of them is granted to a runtime role, and the generator-checked
 ACL manifest shows `<owner>:EXECUTE` only.
 
 - `ingest_generation_overlap_open(p)`:
@@ -97,9 +107,9 @@ ACL manifest shows `<owner>:EXECUTE` only.
   - Takes the migrator advisory lock `(961996,1)`.
   - Requires exactly `{from, to, ttlSeconds, admitDuringApply, approvalSha256}`: explicit hex64 values,
     `from ≠ to`, TTL from 60 s to 14400 s, and a boolean.
-  - Requires the marker to be PASS for `from` and the lazy policy to be at `from`.
-  - Refuses a `to` that was ever a window's `from`, and a `from` that a rebind already retired. This is the
-    no-downgrade rule.
+  - Requires the marker to be PASS for `from`, and exactly one lazy custody policy at `from`. A missing
+    policy is a refusal.
+  - Refuses either end if it is a retired generation, and refuses a `to` that was ever a window's `from`.
   - Sweeps expired windows (closes them as `expired`) and refuses while another window is open.
 - `ingest_generation_overlap_close(p)`:
   - Owner only. Reason is `owner` or `rebind`. A rebind close requires PASS and the policy to be at `to`.
@@ -138,7 +148,8 @@ Properties:
 - **No wildcard.** The window names two explicit generations. The predicate compares for equality only.
 - **Bounded.** Only the window's single `from` is ever added. The unverified pending `to` is never admitted.
   A window cannot bridge to any generation other than the marker's.
-- **No downgrade.** A retired `from` can never come back.
+- **No downgrade.** A generation the policy left can never come back, through a window or a rebind. This
+  is enforced at the policy write itself, not only when a window opens.
 - **Owner-only.** Opening, closing and reading are owner-only.
 - **Auto-expiry.** The CHECK, the trigger and the read-time `expires_at > clock_timestamp()` together mean
   the window cannot be extended.
@@ -150,10 +161,13 @@ Properties:
 - When the overlap table exists, it locks the open window `FOR UPDATE` *before* the policy, which matches
   the ingest lock order (window → policy) and so cannot deadlock with an admitted upload. The real-PG test
   proves this.
-- It refuses a window that is not exactly `(from → to)`.
+- It refuses a live window that is not exactly `(from → to)`. An expired one admits nothing and is left for
+  the next open's sweep.
+- It refuses a target generation that is already retired (`target_generation_retired`), under the same
+  advisory lock. The policy trigger enforces the same rule again inside the transaction.
 - It moves the policy and admissions as before.
 - It closes the window (`rebind`) in the same transaction and reports `overlapClosed`.
-- Before `053020` exists, it behaves exactly as before.
+- Before `043885` exists, it behaves exactly as before.
 
 ### 2.3 Worker: an explicit set of at most two generations
 
@@ -181,22 +195,22 @@ Properties:
 
 ### 3.1 Shipping this change without the outage it fixes
 
-`053020` is additive and accepts every old caller. It creates new objects, and the two replaced helpers
+`043885` is additive and accepts every old caller. It creates new objects, and the two replaced helpers
 reduce to the old predicate while no window exists. But applying it is itself a schema window: `generation()`
 moves, and the window machinery does not exist until the migration commits. **Its own window therefore
 cannot be zero.** It can be made as short as the apply.
 
 1. Merge (code only).
 2. Worker deploy of this code with `expectedGeneration = G_cur` and `overlapGeneration = G5`, where G5 is
-   the generation of the source containing `053020`. Against the unchanged database G_cur is admitted
+   the generation of the source containing `043885`. Against the unchanged database G_cur is admitted
    first. G5 is offered only after a 55000.
-3. Apply `053020` **alone**, the smallest possible apply, with the normal approval. Uploads are refused
+3. Apply `043885` **alone**, the smallest possible apply, with the normal approval. Uploads are refused
    from the pending write until step 4, as today. The Worker PUT is no longer inside this interval.
 4. Run the rebind `G_cur → G5` immediately after PASS. The step-2 Worker switches to G5 on its next request
    with one internal retry. No Worker PUT is needed to recover.
 5. At leisure, Worker deploy with `expectedGeneration = G5` and no overlap.
 
-Alternative: fold `053020` into the next window that is needed anyway. It is the last window with an outage
+Alternative: fold `043885` into the next window that is needed anyway. It is the last window with an outage
 either way.
 
 ### 3.2 Every later window (G → H): zero 503 from the fence
@@ -204,8 +218,9 @@ either way.
 1. **Worker first.** Deploy with `expectedGeneration = G` and `overlapGeneration = H`. There is no behaviour
    change while the database is at G.
 2. **Open.** Immediately before the apply, run
-   `bun scripts/ingest-generation-overlap.ts open --from G --to H --ttl-seconds <apply+runtime+margin> --approval-sha <approval.json sha256> --admit-during-apply`
-   (or `--no-admit-during-apply`, see §4). The approved owner-apply can instead open it under its own lock
+   `bun scripts/ingest-generation-overlap.ts open --from G --to H --ttl-seconds <apply+runtime+margin> --approval-sha <approval.json sha256>`.
+   `admitDuringApply` is **off by default**. Add `--admit-during-apply` only after a full-union rehearsal
+   under concurrent synthetic uploads (§4). The approved owner-apply can instead open it under its own lock
    through `generationOverlapIntegration` (`src/hoopdb/ingest-generation-overlap.ts`). That fixed entry is a
    separate reviewed change, and the stock CLI is not modified here.
 3. **Apply.** Use the normal owner-apply. Marker `(H, pending)` → `(H, pass)`. Uploads continue at G
@@ -227,7 +242,7 @@ that covers steps 3–5. The maximum is 4 h.
   such schema must keep G's RPC contract: function signatures, `ingest_exact_keys` shapes and result shapes.
   The owned-fixture rehearsal (`scripts/pg-proof/window*-rehearsal.ts` pattern) must prove old-Worker
   uploads across the full union before the window is approved. If a migration breaks the contract, use an
-  expand/contract pair across two windows. `--no-admit-during-apply` limits exposure to the
+  expand/contract pair across two windows. The default (`admitDuringApply` off) limits exposure to the
   phase-2-verified final schema, at the cost of a refusal interval as long as the apply.
 - **Requests that straddle the rebind instant.** A batch claimed at G before the rebind commits and staged
   or committed after it gets one 55000/40001. The attempt is bound to G, and F4 now sees policy H. The
@@ -242,8 +257,9 @@ that covers steps 3–5. The maximum is 4 h.
     3 times (`migrate.ts` `ROLE_CHECK_DEADLOCK_ATTEMPTS`), then fails, which leaves the marker pending and
     the window admitting G until it expires.
 
-  Rehearse the exact union under synthetic concurrent uploads before choosing `true`. If that is not
-  rehearsed, `false` is the conservative choice: refusals then last only from the pending write to PASS.
+  `admitDuringApply` is therefore **off by default** in the CLI and the owner-apply integration. Turning it
+  on requires a full rehearsal of the exact migration union under synthetic concurrent uploads. With it off,
+  refusals last only from the pending write to PASS.
   The Worker PUT, the GC replacement and the rebind wait are no longer inside the refusal interval.
 - **Scope.** Only the two runtime ingest roles are bridged. The canonical publisher and history paths keep
   exact PASS. The non-lazy (pre-policy) admission path keeps exact PASS. Production uses the lazy policy,
@@ -269,6 +285,14 @@ that covers steps 3–5. The maximum is 4 h.
     Readiness must be PASS for `from`. One open window at a time. Append-only (no extension, no retarget,
     no delete). The 4 h CHECK holds. A mismatched window refuses the rebind. No downgrade (H → G refused).
     A forward window H → I is allowed.
+  - Reverse-rebind probe (review P1), with an expired G → H window:
+    - rebind G → H, then the marker goes back to G;
+    - rebind H → G is refused (`target_generation_retired`);
+    - a direct `ingest_lazy_policy_set` and a raw policy UPDATE to G are refused;
+    - a G Worker stays refused;
+    - a window naming G is refused;
+    - the retired record is append-only.
+  - Missing-policy negative (review P2): `open` with no lazy policy is refused and records nothing.
   - Worker configuration parsing and the `sqlLedger` set validation.
 - `src/session-ingest/__tests__/generation-overlap.postgres.test.ts` (real PostgreSQL 17, opt-in via
   `SESSION_INGEST_TEST_PG_URL`):
@@ -278,8 +302,8 @@ that covers steps 3–5. The maximum is 4 h.
   - an upload admitted during the apply held open while the phase-2 PASS write runs under
     `lock_timeout=1s`: the write does not wait.
   - An expired window for another pair does not block a rebind. This one is in the PGlite suite.
-- `src/hoopdb/__tests__/sessions-function-boundary.test.ts`: the lane adds four owner-only functions, every
+- `src/hoopdb/__tests__/sessions-function-boundary.test.ts`: the lane adds six owner-only functions, every
   role verifier is byte-identical with and without the lane, and the generated rollback contains the exact
   050000/055000 bodies.
-- `src/hoopdb/__tests__/migration-profile.test.ts`: the down/reapply chain. 043870 refuses under 053020,
-  053020's down restores the strict fences and drops its objects, and the next migrate reinstalls it.
+- `src/hoopdb/__tests__/migration-profile.test.ts`: the down/reapply chain. 043880 and 043870 refuse under 043885,
+  043885's down restores the strict fences and drops its objects, and the next migrate reinstalls it.

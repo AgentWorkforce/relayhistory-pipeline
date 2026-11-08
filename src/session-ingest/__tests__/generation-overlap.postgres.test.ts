@@ -1,5 +1,5 @@
 /**
- * Opt-in, owned real PostgreSQL proof of the zero-503 generation overlap (20261105053020): the full schema,
+ * Opt-in, owned real PostgreSQL proof of the zero-503 generation overlap (20261105043885): the full schema,
  * the real Worker ledger and deliver path, the owner window, the rebind, and the lock behaviour PGlite cannot
  * show (a close/rebind waits for an in-flight admitted upload instead of deadlocking or cutting it off).
  * SESSION_INGEST_TEST_PG_URL=postgres://postgres@127.0.0.1:<port>/postgres  (a throwaway superuser database)

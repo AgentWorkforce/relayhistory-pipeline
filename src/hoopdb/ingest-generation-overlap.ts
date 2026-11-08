@@ -1,5 +1,5 @@
 /**
- * Owner-side helpers for the bounded generation overlap (migration 20261105053020; design
+ * Owner-side helpers for the bounded generation overlap (migration 20261105043885; design
  * docs/design/zero-503-schema-windows.md).
  *
  * The owner opens ONE window (from = the current PASS generation, to = the generation the apply is about
@@ -28,7 +28,7 @@ export function validateOverlapOpen(input: OverlapOpenInput): void {
   if (typeof input.admitDuringApply !== "boolean") refuse("invalid_admit_during_apply");
 }
 
-/** True once 20261105053020 is installed (the rebind and the open helpers degrade/refuse on this). */
+/** True once 20261105043885 is installed (the rebind and the open helpers degrade/refuse on this). */
 export async function overlapInstalled(client: MigrationClient): Promise<boolean> {
   const r = await client.query<{ t: string | null }>(`SELECT to_regclass('${OVERLAP_TABLE}')::text AS t`);
   return r.rows[0]?.t != null;
@@ -62,10 +62,10 @@ export async function generationOverlapStatus(client: MigrationClient): Promise<
  * bound to the approved target generation and approval digest. Not wired into any stock CLI: a fixed entry
  * that uses it is its own reviewed change.
  */
-export function generationOverlapIntegration(client: MigrationClient, opts: { from: string; ttlSeconds: number; admitDuringApply: boolean }): OwnerApplyIntegration {
+export function generationOverlapIntegration(client: MigrationClient, opts: { from: string; ttlSeconds: number; admitDuringApply?: boolean }): OwnerApplyIntegration {
   return Object.freeze({
     beforeWrite: async (context: { generation: string; approvalSha256: string }) => {
-      await openGenerationOverlap(client, { from: opts.from, to: context.generation, ttlSeconds: opts.ttlSeconds, admitDuringApply: opts.admitDuringApply, approvalSha256: context.approvalSha256 });
+      await openGenerationOverlap(client, { from: opts.from, to: context.generation, ttlSeconds: opts.ttlSeconds, admitDuringApply: opts.admitDuringApply === true, approvalSha256: context.approvalSha256 });
     },
   });
 }

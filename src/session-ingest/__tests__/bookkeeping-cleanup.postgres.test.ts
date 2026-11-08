@@ -26,6 +26,7 @@ const text = (path: string) => readFileSync(resolve(root, path), "utf8");
 // Overridable only so a mutation run can prove each predicate is load-bearing (see the PR evidence).
 const DRAFT = process.env.BOOKKEEPING_CLEANUP_DRAFT_SQL ?? "docs/proposals/ingest-bookkeeping-cleanup.draft.sql";
 const INDEXES = "docs/proposals/ingest-bookkeeping-cleanup.indexes.draft.sql";
+const PHASE_A_DOWN = "supabase/rollbacks/20261105043880_ingest_bookkeeping_cleanup.down.sql";
 const indexStatements = text(INDEXES).split("\n").filter((l) => !l.startsWith("--")).join("\n").split(";").map((s) => s.trim()).filter((s) => s.startsWith("CREATE INDEX"));
 const epoch = "3".repeat(64), identity = "c".repeat(64), hex = (c: string) => c.repeat(64);
 const profile: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: true, runtimeRole: "postgres" };
@@ -176,7 +177,10 @@ describe.skipIf(!url)("ingest bookkeeping cleanup (draft) on owned PG17", () => 
       allocatedHighWater: "9007199254740993", generation, sourceIdentitySha256: identity, sourceProofSha256: hex("d") })]);
     // The read role's schema USAGE is its operator step (supabase/bootstrap/session_read_api_role.sql), not a migration.
     await pool.query("GRANT USAGE ON SCHEMA sessions TO bulls96_read_api");
-    // The draft is loaded AFTER the real migrations, exactly as a registered slot would be.
+    // The draft is the full Phase A+B+C proposal; its Phase A is registered as 043880, which it supersedes on this
+    // scratch database. 043880's own guarded down (a never-used install, 043880 the latest) removes it first,
+    // then the draft is loaded AFTER the real migrations, exactly as a registered slot would be.
+    await pool.query(text(PHASE_A_DOWN));
     await pool.query(text(DRAFT));
     console.log(JSON.stringify({ proof: "bookkeeping-cleanup-fixture", serverVersionNum: version, generation, draft: DRAFT }));
   }, 180000);

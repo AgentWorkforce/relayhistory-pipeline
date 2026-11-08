@@ -1,9 +1,11 @@
 /**
- * Operator CLI for the bounded generation overlap (migration 20261105053020; docs/design/zero-503-schema-windows.md).
+ * Operator CLI for the bounded generation overlap (migration 20261105043885; docs/design/zero-503-schema-windows.md).
  * Owner, production Supabase via the CLI temp login + SET ROLE postgres, exactly as scripts/ingest-generation-rebind.ts.
  *   bun scripts/ingest-generation-overlap.ts status
  *   bun scripts/ingest-generation-overlap.ts open --from <PASS64hex> --to <target64hex> --ttl-seconds <60..14400> \
- *       --approval-sha <approval.json sha256> (--admit-during-apply | --no-admit-during-apply)
+ *       --approval-sha <approval.json sha256> [--admit-during-apply]
+ * admitDuringApply is OFF unless --admit-during-apply is given; turn it on only after a full-union rehearsal
+ * under concurrent synthetic uploads (docs/design/zero-503-schema-windows.md section 4).
  *   bun scripts/ingest-generation-overlap.ts close --from <64hex> --to <64hex>
  * Run `open` immediately BEFORE the owner-apply (readiness must still be PASS for --from). The rebind closes the
  * window itself; `close` is the owner's early stop. Prints only the window record. Opening a window on a real
@@ -22,8 +24,7 @@ if (cmd !== "status" && cmd !== "open" && cmd !== "close") { console.log(JSON.st
 const from = get("--from") ?? "", to = get("--to") ?? "";
 let openInput: Parameters<typeof openGenerationOverlap>[1] | undefined;
 if (cmd === "open") {
-  const admit = a.includes("--admit-during-apply"), noAdmit = a.includes("--no-admit-during-apply");
-  if (admit === noAdmit) { console.log(JSON.stringify({ status: "refused", code: "admit_during_apply_choice_required" })); process.exit(2); }
+  const admit = a.includes("--admit-during-apply");
   openInput = { from, to, ttlSeconds: Number(get("--ttl-seconds")), admitDuringApply: admit, approvalSha256: get("--approval-sha") ?? "" };
   try { validateOverlapOpen(openInput); } catch (e) { console.log(JSON.stringify({ status: "refused", code: (e as { code?: string }).code })); process.exit(2); }
 }

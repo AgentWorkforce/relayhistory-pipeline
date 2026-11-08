@@ -69,21 +69,23 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105043500_lazy_claim_clock_narrowing.down.sql",
       "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql",
       "supabase/rollbacks/20261105043850_ingest_acquisition_owner.down.sql",
-      "supabase/rollbacks/20261105053020_ingest_generation_overlap.down.sql",
+      "supabase/rollbacks/20261105043880_ingest_bookkeeping_cleanup.down.sql",
+      "supabase/rollbacks/20261105043885_ingest_generation_overlap.down.sql",
     ]);
   });
 
-  test("the 053020 generation overlap adds owner-only functions, grants no runtime role anything, and derives its exact guarded rollback", async () => {
+  test("the 043885 generation overlap adds six owner-only functions, grants no runtime role anything, and derives its exact guarded rollback", async () => {
     const withLane = await generate(repo, LANES, VERIFIERS);
     const without = await generate(repo, LANES.filter((l) => l !== ingestGenerationOverlap), VERIFIERS);
-    const downPath = "supabase/rollbacks/20261105053020_ingest_generation_overlap.down.sql";
-    expect(withLane.summary.lanes["ingest-generation-overlap"]).toEqual({ functions: 4, replaces: 2, grants: 0 });
+    const downPath = "supabase/rollbacks/20261105043885_ingest_generation_overlap.down.sql";
+    expect(withLane.summary.lanes["ingest-generation-overlap"]).toEqual({ functions: 6, replaces: 2, grants: 0 });
     // Every role verifier is byte-identical with and without the lane: no runtime capability changes.
     for (const v of VERIFIERS) expect(withLane.outputs[v.path]).toBe(without.outputs[v.path]);
     const acl = JSON.parse(withLane.outputs["src/hoopdb/sessions-function-acl.json"]!).functions as Record<string, string[]>;
     const mine = Object.keys(acl).filter((k) => k.startsWith("sessions.ingest_generation_overlap_")).sort();
     expect(mine).toEqual(["sessions.ingest_generation_overlap_admits(text,text,text)", "sessions.ingest_generation_overlap_close(jsonb)",
-      "sessions.ingest_generation_overlap_immutable()", "sessions.ingest_generation_overlap_open(jsonb)"]);
+      "sessions.ingest_generation_overlap_immutable()", "sessions.ingest_generation_overlap_open(jsonb)",
+      "sessions.ingest_generation_overlap_policy_retire()", "sessions.ingest_generation_overlap_retired_immutable()"]);
     for (const k of [...mine, "sessions.ingest_require_generation(text)", "sessions.ingest_lazy_guard(text)"]) expect(acl[k]).toEqual(["<owner>:EXECUTE"]);
     const down = withLane.outputs[downPath]!;
     expect(down).toContain(createHash("sha256").update(readFileSync(join(root, ingestGenerationOverlap.migration!), "utf8")).digest("hex"));
