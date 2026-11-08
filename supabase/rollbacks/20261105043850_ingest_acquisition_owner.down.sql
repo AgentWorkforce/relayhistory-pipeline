@@ -14,7 +14,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105043850_ingest_acquisition_owner.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043850_ingest_acquisition_owner.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'ef07dd8d94f965afdeb8ff6059daeff79913c5f564de8e4a173c070514a00d63'
+ IF NOT FOUND OR v_sha<>'7d8447681465ae87c54b61e6d4aa615b4f97af98c489a9f13d18b934c03b6275'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: own applied checksum required';END IF;
  LOCK TABLE sessions.ingest_acquisition_switch,sessions.ingest_acquisition_hooks_switch,
   sessions.ingest_acquisition_enrollment_gate,sessions.ingest_acquisition_enrollment,
@@ -873,6 +873,7 @@ DROP FUNCTION sessions.ingest_acquisition_enroll_complete(jsonb),
  sessions.ingest_acquisition_rebind_origin(jsonb),
  sessions.ingest_acquisition_revoke(jsonb),
  sessions.ingest_acquisition_install(jsonb),
+ sessions.ingest_acquisition_operation_lock(uuid,uuid),
  sessions.ingest_acquisition_control_lock(text,text,text,text),
  sessions.ingest_acquisition_replay(uuid,text,text),
  sessions.ingest_acquisition_request(jsonb,text),
@@ -899,6 +900,6 @@ ALTER TABLE sessions.ingest_publication_heads DROP COLUMN acquisition_epoch;
 ALTER TABLE sessions.ingest_claim_attempts DROP COLUMN acquisition;
 -- The schema USAGE this migration granted the control role goes with it (the role itself is kept).
 REVOKE USAGE ON SCHEMA sessions FROM bulls96_acquisition_installer;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043850_ingest_acquisition_owner.sql' AND sha256='ef07dd8d94f965afdeb8ff6059daeff79913c5f564de8e4a173c070514a00d63';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043850_ingest_acquisition_owner.sql' AND sha256='7d8447681465ae87c54b61e6d4aa615b4f97af98c489a9f13d18b934c03b6275';
 -- The NOLOGIN role bulls96_acquisition_installer is KEPT, as every lane keeps its cluster roles (033000).
 COMMIT;

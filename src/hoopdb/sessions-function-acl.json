@@ -225,6 +225,9 @@
     "sessions.ingest_acquisition_lock_key(text,text,text,text,text)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_acquisition_operation_lock(uuid,uuid)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_acquisition_pointer_owner(text,text,text,text)": [
       "<owner>:EXECUTE"
     ],

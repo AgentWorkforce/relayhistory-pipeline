@@ -14,6 +14,7 @@ import {sqlLedger} from "../ledger-sql.ts";
 import {deliverBatch} from "../deliver.ts";
 import {deliveryAccount} from "../vendor/delivery/prepare.ts";
 import {AcquisitionRefusedError} from "../acquisition-refusal.ts";
+import {runMigrations,type MigrationProfile} from "../../hoopdb/migrate.ts";
 import {batch,record,TENANT} from "./support.ts";
 import {orderedFixtureLedger,initializeFixtureSeatClock} from "./ordered-support.ts";
 import type {ObjectStore} from "../../shared/vendor.ts";
@@ -454,6 +455,130 @@ describe.skipIf(!url)("acquisition control plane on actual PostgreSQL",()=>{
    [S.org,S.ws,JSON.stringify([{source:S.src,session_id:"lin-h1",owner_epoch:"1",grant_id:i1.operationUuid}]),JSON.stringify([[S.src,"lin-h1"]])])).rows[0];
   expect(fenced).toEqual({a:[{source:S.src,sessionId:"lin-h1",code:"owner_changed"}],p:[]});
  });
+
+ // Reviewer batch P2-a/P2-b, two connections under READ COMMITTED. c1 runs the first call and holds its transaction
+ // open; c2's call, while that global LO/LT claim is unresolved, is 40001 session_busy at once (try-locks: c2 never
+ // waits), with no xid in c2 and every acquisition table unchanged. After c1 commits or rolls back, c2 retries in the
+ // same transaction (READ COMMITTED: a fresh snapshot). A refused retry runs inside a savepoint; after ROLLBACK TO it
+ // c2 must have no xid (any write, row lock included, assigns one; `xidFree` is false only for an install loser that
+ // legitimately passed its enrollment FOR SHARE) and, once c2 ends, the tables equal the post-winner state.
+ type Call={fn:string;p:unknown};
+ const call=(c:Call):[string,unknown[]]=>[`SELECT sessions.${c.fn}($1::jsonb) r`,[JSON.stringify(c.p)]];
+ type Outcome={r:unknown}|{code:string;message:string};
+ const attempt=(c:pg.PoolClient,x:Call):Promise<Outcome>=>c.query(...call(x)).then(r=>({r:r.rows[0].r}),(e:any)=>({code:e.code as string,message:e.message as string}));
+ const xid=async(c:pg.PoolClient)=>(await c.query("SELECT pg_current_xact_id_if_assigned()::text x")).rows[0].x;
+ async function race(first:Call,second:Call,end:"commit"|"rollback"="commit",xidFree=true){
+  const c1=await hold(pool),c2=await hold(pool);
+  try{
+   await c1.c.query("SET LOCAL ROLE "+INSTALLER);await c2.c.query("SET LOCAL ROLE "+INSTALLER+";SAVEPOINT loser");
+   const won=(await c1.c.query(...call(first))).rows[0].r;
+   const before=await acquisitionState(pool);
+   expect(await attempt(c2.c,second)).toEqual(refusal("40001","session_busy"));
+   await c2.c.query("ROLLBACK TO SAVEPOINT loser");expect(await xid(c2.c)).toBeNull();
+   expect(await acquisitionState(pool)).toEqual(before);
+   await(end==="commit"?c1.commit():c1.rollback());
+   const settled=await acquisitionState(pool);
+   const lost=await attempt(c2.c,second);
+   if("code" in lost){
+    await c2.c.query("ROLLBACK TO SAVEPOINT loser");
+    if(xidFree)expect(await xid(c2.c)).toBeNull();
+    await c2.rollback();
+    expect(await acquisitionState(pool)).toEqual(settled);
+   }else await c2.commit();
+   return {won,lost};
+  }finally{await c1.rollback();await c2.rollback();}
+ }
+ const S2:Scope={...S,src:"droid-lo"};
+ const opSource=async(op:string)=>(await pool.query("SELECT source FROM sessions.ingest_acquisition_operations WHERE operation_uuid=$1",[op])).rows;
+ /** Hooks and the install switch on, S and S2 enrolled (idempotent, so each race test also runs alone). */
+ const ready=async()=>{
+  await pool.query("SELECT sessions.ingest_acquisition_set_hooks(true)");
+  await pool.query("UPDATE sessions.ingest_acquisition_switch SET install_enabled=true");
+  for(const s of[S,S2])if(!(await pool.query("SELECT 1 FROM sessions.ingest_acquisition_enrollment WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND state='enrolled'",[s.org,s.ws,s.src])).rows.length)
+   await enroll(pool,s);
+ };
+
+ test("P2-a operationUuid is global (two connections, both orders): the same uuid in another scope is session_busy while the first is unresolved, then 40001 operation_conflict with no side effect; an identical request replays",async()=>{
+  await ready();
+  for(const [a,b] of[[S,S2],[S2,S]] as const){
+   const op=uuid(),session="lo-"+op.slice(0,8);
+   const {won,lost}=await race({fn:"ingest_acquisition_install",p:body(installBody(a,{op,session}))},
+    {fn:"ingest_acquisition_install",p:body(installBody(b,{op,session}))});
+   expect(won).toMatchObject({outcome:"installed",grantId:op});
+   expect(lost).toEqual(refusal("40001","operation_conflict"));
+   expect(await opSource(op)).toEqual([{source:a.src}]);
+   expect((await status(pool,b,[session]))[0]).toMatchObject({state:null,revision:"0",grantId:null});
+  }
+  for(const [a,b] of[[S,S2],[S2,S]] as const){
+   const op=uuid(),session="lor-"+op.slice(0,8),lineage=uuid();
+   const {won,lost}=await race({fn:"ingest_acquisition_revoke",p:revokeBody(a,{op,session,revision:"1",target:uuid(),epoch:"1",lineage})},
+    {fn:"ingest_acquisition_revoke",p:revokeBody(b,{op,session,revision:"1",target:uuid(),epoch:"1",lineage})});
+   expect(won).toMatchObject({outcome:"revoked_pending"});
+   expect(lost).toEqual(refusal("40001","operation_conflict"));
+   expect(await opSource(op)).toEqual([{source:a.src}]);
+  }
+  // The identical request, busy behind LO, replays the committed result; a different digest in the same scope
+  // (another session) is operation_conflict.
+  const op=uuid(),p=body(installBody(S,{op,session:"lo-replay"}));
+  const {won,lost}=await race({fn:"ingest_acquisition_install",p},{fn:"ingest_acquisition_install",p});
+  expect(lost).toEqual({r:{...won,outcome:"replay"}});
+  const op3=uuid();
+  const d=await race({fn:"ingest_acquisition_install",p:body(installBody(S,{op:op3,session:"lo-dg1"}))},
+   {fn:"ingest_acquisition_install",p:body(installBody(S,{op:op3,session:"lo-dg2"}))});
+  expect(d.lost).toEqual(refusal("40001","operation_conflict"));
+  expect((await status(pool,S,["lo-dg2"]))[0]).toMatchObject({state:null,grantId:null});
+  // If the first rolls back, the retry proceeds as a new operation in its own scope.
+  const op2=uuid();
+  const r=await race({fn:"ingest_acquisition_install",p:body(installBody(S,{op:op2,session:"lo-rb"}))},
+   {fn:"ingest_acquisition_install",p:body(installBody(S2,{op:op2,session:"lo-rb"}))},"rollback");
+  expect(r.lost).toEqual({r:{outcome:"installed",grantId:op2,ownerEpoch:"1",revision:"1",state:"active"}});
+  expect(await opSource(op2)).toEqual([{source:S2.src}]);
+ },60000);
+
+ test("P2-b contradictory revoke-before-install (two connections, both orders): the second scope is session_busy on LT, then 42501 target_mismatch with no side effect; the winner's fence stands",async()=>{
+  await ready();
+  for(const [a,b] of[[S,S2],[S2,S]] as const){
+   const target=uuid(),lineage=uuid(),session="rc-"+target.slice(0,8),lose=revokeBody(b,{session,revision:"3",target,epoch:"1",lineage});
+   const {won,lost}=await race({fn:"ingest_acquisition_revoke",p:revokeBody(a,{session,revision:"3",target,epoch:"1",lineage})},
+    {fn:"ingest_acquisition_revoke",p:lose});
+   expect(won).toEqual({outcome:"revoked_pending",revision:"0",ownerEpoch:"0",state:null});
+   expect(lost).toEqual(refusal("42501","target_mismatch"));
+   expect((await pool.query("SELECT source FROM sessions.ingest_acquisition_revoked_grants WHERE grant_id=$1",[target])).rows).toEqual([{source:a.src}]);
+   expect((await pool.query("SELECT count(*)::int n FROM sessions.ingest_acquisition_revoked_lineages WHERE source=$1 AND session_id=$2",[b.src,session])).rows[0].n).toBe(0);
+   expect(await opSource(lose.operationUuid)).toEqual([]);
+   // Sequentially the loser is still target_mismatch, and the target never installs in either scope.
+   await zeroWrite(()=>revoke(lose),refusal("42501","target_mismatch"));
+   for(const s of[a,b])await zeroWrite(()=>install(installBody(s,{op:target,session,lineage:uuid()})),refusal("55000","revoked_before_install"));
+  }
+  // If the first rolls back, the retried revoke-before-install stands in its own scope.
+  const target=uuid(),lineage=uuid();
+  const r=await race({fn:"ingest_acquisition_revoke",p:revokeBody(S,{session:"rc-rb",revision:"3",target,epoch:"1",lineage})},
+   {fn:"ingest_acquisition_revoke",p:revokeBody(S2,{session:"rc-rb",revision:"3",target,epoch:"1",lineage})},"rollback");
+  expect(r.lost).toEqual({r:{outcome:"revoked_pending",revision:"0",ownerEpoch:"0",state:null}});
+  expect((await pool.query("SELECT source FROM sessions.ingest_acquisition_revoked_grants WHERE grant_id=$1",[target])).rows).toEqual([{source:S2.src}]);
+ },60000);
+
+ test("P2-b install vs revoke of one grant id across scopes (two connections, both orders): session_busy on LT, then revoked_before_install / target_mismatch with no side effect",async()=>{
+  await ready();
+  // Revoke first: the install of the target uuid (another scope) is busy on LT, then its retry sees the committed fence.
+  const t1=uuid();
+  const a=await race({fn:"ingest_acquisition_revoke",p:revokeBody(S,{session:"ri-1",revision:"1",target:t1,epoch:"1",lineage:uuid()})},
+   {fn:"ingest_acquisition_install",p:body(installBody(S2,{op:t1,session:"ri-1"}))},"commit",false);
+  expect(a.won).toMatchObject({outcome:"revoked_pending"});
+  expect(a.lost).toEqual(refusal("55000","revoked_before_install"));
+  expect(await opSource(t1)).toEqual([]);
+  expect((await status(pool,S2,["ri-1"]))[0]).toMatchObject({state:null,grantId:null});
+  // Install first: a revoke naming that grant id from another scope is busy on LT, then its retry finds the grant:
+  // target_mismatch, no fence in either scope.
+  const t2=uuid(),lineage=uuid();
+  const b=await race({fn:"ingest_acquisition_install",p:body(installBody(S,{op:t2,session:"ri-2",lineage}))},
+   {fn:"ingest_acquisition_revoke",p:revokeBody(S2,{session:"ri-2",revision:"2",target:t2,epoch:"1",lineage})});
+  expect(b.won).toMatchObject({outcome:"installed",grantId:t2});
+  expect(b.lost).toEqual(refusal("42501","target_mismatch"));
+  expect((await status(pool,S,["ri-2"]))[0]).toMatchObject({state:"active",grantId:t2});
+  expect((await pool.query("SELECT count(*)::int n FROM sessions.ingest_acquisition_revoked_grants WHERE grant_id=$1",[t2])).rows[0].n).toBe(0);
+  expect((await pool.query("SELECT count(*)::int n FROM sessions.ingest_acquisition_revoked_lineages WHERE lineage_id=$1",[lineage])).rows[0].n).toBe(0);
+ },60000);
 });
 
 /** Ingest fixture (as publication.postgres.test.ts): buffered delivery through the actual hooks. */
@@ -774,4 +899,66 @@ describe.skipIf(!url)("inbound installer membership is refused by the role boots
    expect((await d.pool.query("SELECT to_regclass('sessions.ingest_acquisition_owners')::text r")).rows[0].r).toBeNull();
   }finally{await drop();}
  },180000);
+
+ // Reviewer batch P1(c): the same attack against the full migrate path (runMigrations, verify on). PG16+ grants the
+ // attacker INHERIT FALSE, SET TRUE (nothing implicit, SET ROLE allowed); PG15 has no per-grant options, so the
+ // attacker is NOINHERIT with a plain GRANT (the same effect). A member added after 043850 ran is invisible to its
+ // admission block, so phase 2's acquisition verifier is what keeps the marker from PASS when the bootstrap is off.
+ test("full migrate path: a SET ROLE-capable LOGIN member is refused 55000 by the bootstrap (fresh: zero grants, no tables) and by the acquisition verifier (bootstrap off); marker never PASS; after REVOKE both migrate and the verifier runs",async()=>{
+  const PROFILE:MigrationProfile={mode:"local",shim:true,bootstrap:true,verify:true,runtimeRole:"postgres"};
+  const VERIFIER=readFileSync(join(root,"supabase/bootstrap/acquisition_installer_verify.sql"),"utf8");
+  const blank=async(prefix:string):Promise<Db>=>{
+   if(!admin){admin=new pg.Client({connectionString:url});await admin.connect();}
+   const name=prefix+"_"+uuid().replaceAll("-","");await admin.query("CREATE DATABASE "+name);
+   const u=new URL(url!);u.pathname="/"+name;
+   const d={pool:new pg.Pool({connectionString:u.href,max:4}),name,dir:mkdtempSync(join(tmpdir(),"acq-"))};dbs.push(d);
+   await d.pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");return d;
+  };
+  /** One runMigrations; `verified` = the acquisition verifier's exact SQL was sent. */
+  const migrate=async(d:Db,profile:MigrationProfile=PROFILE)=>{
+   const c=await d.pool.connect();let verified=false;
+   const client={query:async(text:string,params?:unknown[])=>{if(text===VERIFIER)verified=true;return c.query(text,params);}};
+   try{const error=await runMigrations(client as never,{profile}).then(()=>null,(e:any)=>({code:e.code,message:e.message}));return {error,verified};}
+   finally{c.release();}
+  };
+  const marker=async(d:Db)=>(await d.pool.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows.map(r=>r.status);
+  const owners=async(d:Db)=>(await d.pool.query("SELECT to_regclass('sessions.ingest_acquisition_owners')::text r")).rows[0].r;
+  const BOOT={code:"55000",message:`bootstrap ${INSTALLER}: the role has an unexpected member ${ATTACKER}`};
+  const VERIFY={code:"55000",message:"acquisition installer has an unexpected member"};
+
+  const done=await blank("acq_mig_done");
+  expect(await migrate(done)).toEqual({error:null,verified:true});
+  expect(await marker(done)).toEqual(["pass"]);expect(await installerGrants(done.pool)).toBe(4);
+  const pg16=Number((await admin!.query("SHOW server_version_num")).rows[0].server_version_num)>=160000;
+  await admin!.query(pg16?`CREATE ROLE ${ATTACKER} LOGIN;GRANT ${INSTALLER} TO ${ATTACKER} WITH INHERIT FALSE, SET TRUE`
+   :`CREATE ROLE ${ATTACKER} LOGIN NOINHERIT;GRANT ${INSTALLER} TO ${ATTACKER}`);
+  try{
+   expect(await members(done.pool)).toEqual([ATTACKER]);
+   const c=await connectAs(done);
+   try{
+    await expect(c.query("SELECT sessions.ingest_acquisition_status('{}'::jsonb)")).rejects.toMatchObject({code:"42501"});
+    await c.query("SET ROLE "+INSTALLER);
+    expect((await c.query("SELECT session_user::text s,current_user::text u")).rows[0]).toEqual({s:ATTACKER,u:INSTALLER});
+    await c.query("SELECT sessions.ingest_acquisition_status($1::jsonb)",[JSON.stringify({orgId:"org_test",workspaceId:"ws_test",source:"droid",sessionIds:["x"]})]);
+   }finally{await c.end();}
+   // Migrated database: the role bootstrap refuses first.
+   expect(await migrate(done)).toEqual({error:BOOT,verified:false});
+   expect(await marker(done)).toEqual(["pending"]);
+   // Bootstrap off: every schema step is ledgered, so phase 2 runs and its last step, the acquisition verifier, refuses.
+   expect(await migrate(done,{...PROFILE,bootstrap:false})).toEqual({error:VERIFY,verified:true});
+   expect(await marker(done)).toEqual(["pending"]);expect(await installerGrants(done.pool)).toBe(4);
+   // Fresh database: the bootstrap refuses before any schema step; no RPC grant, no acquisition table, marker pending.
+   const fresh=await blank("acq_mig_fresh");
+   expect(await migrate(fresh)).toEqual({error:BOOT,verified:false});
+   expect(await installerGrants(fresh.pool)).toBe(0);expect(await owners(fresh)).toBeNull();
+   expect(await marker(fresh)).toEqual(["pending"]);
+   // REVOKE the membership: both databases migrate, the verifier runs, and the marker passes.
+   await admin!.query(`REVOKE ${INSTALLER} FROM ${ATTACKER}`);
+   expect(await members(done.pool)).toEqual([]);
+   for(const d of[done,fresh]){
+    expect(await migrate(d)).toEqual({error:null,verified:true});
+    expect(await marker(d)).toEqual(["pass"]);expect(await installerGrants(d.pool)).toBe(4);expect(await owners(d)).toBe("sessions.ingest_acquisition_owners");
+   }
+  }finally{await drop();}
+ },600000);
 });

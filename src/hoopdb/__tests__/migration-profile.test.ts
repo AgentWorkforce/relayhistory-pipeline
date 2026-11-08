@@ -1503,6 +1503,174 @@ describe("per-step catalog sentinels", () => {
       `bootstrap ${INSTALLER}: the role has an unexpected member g6_attacker`,
     );
   });
+
+  // Reviewer batch P1(b): the acquisition installer verifier is phase 2's last step, so a member added after
+  // 043850 ran (which the per-migration admission block can no longer see) keeps the marker pending.
+  const ACQ_VERIFY = "verify:acquisition_installer";
+  const MARKER = "SELECT status FROM sessions.__96bulls_role_validation WHERE name = 'session_directory_search_worker'";
+  const marker = async (db: PGlite) => (await db.query<{ status: string }>(MARKER)).rows[0]?.status;
+  const VERIFIER = join(root, "supabase/bootstrap/acquisition_installer_verify.sql");
+  // INHERIT FALSE, SET TRUE: the member gains nothing implicitly but can SET ROLE to the installer.
+  const SET_ONLY_MEMBER = `CREATE ROLE g6_attacker LOGIN; GRANT ${INSTALLER} TO g6_attacker WITH INHERIT FALSE, SET TRUE`;
+
+  test("acquisition installer verifier: wired as the last phase 2 step of every verifying plan, absent with verify off", async () => {
+    for (const profile of [LOCAL, { ...LOCAL, bootstrap: false }, { ...LOCAL, mode: "selfhosted" as const, shim: false, bootstrap: false }]) {
+      const verify = (await plan(profile)).filter((st) => st.name.startsWith("verify:")).map((st) => st.name);
+      expect(verify.at(-1)).toBe(ACQ_VERIFY);
+      expect(verify.filter((n) => n === ACQ_VERIFY)).toHaveLength(1);
+      expect((await plan(profile)).find((st) => st.name === ACQ_VERIFY)?.path).toBe(VERIFIER);
+    }
+    expect((await plan({ ...LOCAL, verify: false })).some((st) => st.name.startsWith("verify:"))).toBe(false);
+  });
+
+  test("acquisition installer verifier, full migrate path: a SET-only LOGIN member is refused 55000 by the bootstrap, then by the verifier with the bootstrap off; the marker stays pending; removing it passes", async () => {
+    const db = await fresh();
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await marker(db)).toBe("pass");
+    const grants = await installerGrants(db);
+    expect(grants).toBe(4);
+    await db.exec(SET_ONLY_MEMBER);
+    const can = (await db.query<{ set: boolean; usage: boolean }>(
+      `SELECT pg_has_role('g6_attacker', '${INSTALLER}', 'SET') AS set, pg_has_role('g6_attacker', '${INSTALLER}', 'USAGE') AS usage`,
+    )).rows[0];
+    expect(can).toEqual({ set: true, usage: false });
+    const boot = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(boot?.code).toBe("55000");
+    expect(boot?.message).toBe(`bootstrap ${INSTALLER}: the role has an unexpected member g6_attacker`);
+    expect(await marker(db)).toBe("pending");
+    // Every schema step is ledgered, so with the bootstrap off only phase 2 runs: the acquisition verifier refuses.
+    const seen: string[] = [];
+    const verifierOnly = await failure(runMigrations(client(db), {
+      profile: { ...LOCAL, bootstrap: false },
+      beforeVerify: async () => { seen.push("verify"); },
+    }));
+    expect(verifierOnly?.code).toBe("55000");
+    expect(verifierOnly?.message).toBe("acquisition installer has an unexpected member");
+    expect(seen.length).toBe((await plan(LOCAL)).filter((st) => st.name.startsWith("verify:")).length);
+    expect(await marker(db)).toBe("pending");
+    expect(await installerGrants(db)).toBe(grants);
+    await db.exec("DROP ROLE g6_attacker");
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await marker(db)).toBe("pass");
+  });
+
+  test("acquisition installer verifier, fresh database: a member that predates the first migrate is refused 55000 by the bootstrap with zero installer grants and no acquisition tables", async () => {
+    const db = await fresh();
+    await db.exec(`CREATE ROLE ${INSTALLER} NOLOGIN NOINHERIT; ${SET_ONLY_MEMBER}`);
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error?.code).toBe("55000");
+    expect(error?.message).toBe(`bootstrap ${INSTALLER}: the role has an unexpected member g6_attacker`);
+    expect(await installerGrants(db)).toBe(0);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_acquisition_owners')::text r")).rows[0]!.r).toBeNull();
+    expect((await snapshot(db)).marker?.every((r) => (r as { status: string }).status === "pending") ?? true).toBe(true);
+    await db.exec("DROP ROLE g6_attacker");
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await installerGrants(db)).toBe(4);
+    expect(await marker(db)).toBe("pass");
+  });
+
+  test("acquisition installer verifier: the exact Supabase creator edge passes only with hoopdb.db_mode=supabase", async () => {
+    const db = await fresh();
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    await db.exec(SUPABASE_EDGE);
+    const verify = async (mode: string) => {
+      await db.exec("BEGIN");
+      try {
+        await db.query("SELECT set_config('hoopdb.db_mode', $1, true)", [mode]);
+        return await failure(db.exec(readFileSync(VERIFIER, "utf8")));
+      } finally { await db.exec("ROLLBACK"); }
+    };
+    expect(await verify("supabase")).toBeNull();
+    for (const mode of ["local", "selfhosted", ""])
+      expect(await verify(mode)).toMatchObject({ code: "55000", message: "acquisition installer has an unexpected member" });
+  });
+
+  // Reviewer batch P2-a: operationUuid is global. The same uuid replayed in another scope is operation_conflict
+  // (40001) before any write, whatever the scope. The concurrent (held-open) cases are in the real-PostgreSQL suite.
+  test("acquisition operationUuid and target grant id are global: the same uuid or target in another scope, one after the other, is operation_conflict / target_mismatch / revoked_before_install with zero writes; non-READ COMMITTED is invalid_request", async () => {
+    const db = await fresh();
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    const US = "\x1f";
+    const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+    const FIELDS = ["operationUuid", "orgId", "workspaceId", "source", "sessionId", "revision", "expectedRevision", "expectedOwnerEpoch",
+      "expectedPredecessorGrantId", "ownerKind", "ownerUserId", "ownerOriginId", "bindingUuid", "installationId", "grantSha256", "expiresAt", "issuerKeyId"];
+    const install = (op: string, source: string) => {
+      const g = "rhg_" + "0123456789abcdef".repeat(4);
+      const p: Record<string, string> = { operationUuid: op, orgId: "org_test", workspaceId: "ws_test", source, sessionId: "sess-op-1",
+        revision: "1", expectedRevision: "0", expectedOwnerEpoch: "0", expectedPredecessorGrantId: "", ownerKind: "cloud",
+        ownerUserId: "user_test", ownerOriginId: "origin_test", bindingUuid: crypto.randomUUID(), installationId: "",
+        grantSha256: sha(["relayhistory-acquisition-grant-v1", "org_test", "ws_test", source, "sess-op-1", op, g].join(US)),
+        expiresAt: "", issuerKeyId: "test-key-1" };
+      const a = ["relayhistory-acquisition-assertion-install-v1", ...FIELDS.map((f) => p[f])].join(US);
+      const evidenceSha256 = sha("synthetic-evidence" + US + a);
+      return { ...p, evidenceSha256, requestSha256: sha(["relayhistory-acquisition-request-v1", sha(a), evidenceSha256].join(US)) };
+    };
+    const TABLES = ["owners", "grants", "grant_origins", "revoked_grants", "revoked_lineages", "operations"];
+    const state = async () => {
+      const out: Record<string, unknown> = {};
+      for (const t of TABLES)
+        out[t] = (await db.query<{ j: unknown }>(`SELECT coalesce(jsonb_agg(to_jsonb(x) ORDER BY to_jsonb(x)::text), '[]') j FROM sessions.ingest_acquisition_${t} x`)).rows[0]!.j;
+      return out;
+    };
+    await db.exec("SELECT sessions.ingest_acquisition_set_hooks(true); UPDATE sessions.ingest_acquisition_switch SET install_enabled = true");
+    for (const source of ["droid", "codex"]) {
+      const scope = JSON.stringify({ orgId: "org_test", workspaceId: "ws_test", source });
+      await db.query("SELECT sessions.ingest_acquisition_enroll_begin($1::jsonb)", [scope]);
+      await db.query("SELECT sessions.ingest_acquisition_enroll_complete($1::jsonb)", [scope]);
+    }
+    const revoke = (op: string, source: string, session: string, target: string, lineage: string) => {
+      const p: Record<string, string> = { operationUuid: op, orgId: "org_test", workspaceId: "ws_test", source, sessionId: session,
+        revision: "1", targetGrantId: target, targetOwnerEpoch: "1", targetOwnerKind: "cloud", targetBindingUuid: lineage,
+        targetInstallationId: "", issuerKeyId: "test-key-1" };
+      const a = ["relayhistory-acquisition-assertion-revoke-v1", ...REVOKE_FIELDS.map((f) => p[f])].join(US);
+      const evidenceSha256 = sha("synthetic-evidence" + US + a);
+      return { ...p, evidenceSha256, requestSha256: sha(["relayhistory-acquisition-request-v1", sha(a), evidenceSha256].join(US)) };
+    };
+    const REVOKE_FIELDS = ["operationUuid", "orgId", "workspaceId", "source", "sessionId", "revision", "targetGrantId",
+      "targetOwnerEpoch", "targetOwnerKind", "targetBindingUuid", "targetInstallationId", "issuerKeyId"];
+    const asInstaller = async (body: Record<string, string>, fn = "install", iso = "") => {
+      await db.exec(`BEGIN${iso ? " ISOLATION LEVEL " + iso : ""}; SET LOCAL ROLE ${INSTALLER}`);
+      try {
+        const r = (await db.query<{ r: unknown }>(`SELECT sessions.ingest_acquisition_${fn}($1::jsonb) r`, [JSON.stringify(body)])).rows[0]!.r;
+        await db.exec("COMMIT");
+        return r;
+      } catch (error) { await db.exec("ROLLBACK"); throw error; }
+    };
+    const op = crypto.randomUUID();
+    const first = install(op, "droid");
+    expect(await asInstaller(first)).toMatchObject({ outcome: "installed", grantId: op });
+    const before = await state();
+    expect(await failure(asInstaller(install(op, "codex")))).toMatchObject({ code: "40001", message: "acquisition: operation_conflict" });
+    expect(await state()).toEqual(before);
+    // The original request still replays, and a fresh uuid installs in the other scope.
+    expect(await asInstaller(first)).toMatchObject({ outcome: "replay", grantId: op });
+    // The same scope with any other field (here a new binding) is also operation_conflict.
+    expect(await failure(asInstaller(install(op, "droid")))).toMatchObject({ code: "40001", message: "acquisition: operation_conflict" });
+    expect(await asInstaller(install(crypto.randomUUID(), "codex"))).toMatchObject({ outcome: "installed" });
+    // Revoke-vs-revoke: the same operation uuid in another scope is operation_conflict; the same target grant id
+    // (revoke-before-install) from another scope is target_mismatch; neither writes a fence or an operation.
+    const rop = crypto.randomUUID(), target = crypto.randomUUID(), lineage = crypto.randomUUID();
+    const r1 = revoke(rop, "droid", "sess-rv-1", target, lineage);
+    expect(await asInstaller(r1, "revoke")).toEqual({ outcome: "revoked_pending", revision: "0", ownerEpoch: "0", state: null });
+    const held = await state();
+    expect(await failure(asInstaller(revoke(rop, "codex", "sess-rv-1", crypto.randomUUID(), lineage), "revoke"))).toMatchObject({ code: "40001", message: "acquisition: operation_conflict" });
+    expect(await failure(asInstaller(revoke(crypto.randomUUID(), "codex", "sess-rv-1", target, lineage), "revoke"))).toMatchObject({ code: "42501", message: "acquisition: target_mismatch" });
+    expect(await state()).toEqual(held);
+    expect(await asInstaller(r1, "revoke")).toMatchObject({ outcome: "replay" });
+    // Install-vs-revoke on one grant id: the revoked target never installs in either scope; a revoke from another
+    // scope naming an installed grant is target_mismatch.
+    for (const source of ["droid", "codex"])
+      expect(await failure(asInstaller(install(target, source)))).toMatchObject({ code: "55000", message: "acquisition: revoked_before_install" });
+    expect(await state()).toEqual(held);
+    expect(await failure(asInstaller(revoke(crypto.randomUUID(), "codex", "sess-op-1", op, first.bindingUuid), "revoke"))).toMatchObject({ code: "42501", message: "acquisition: target_mismatch" });
+    expect(await state()).toEqual(held);
+    // A retained snapshot (REPEATABLE READ / SERIALIZABLE) is refused before any lock or write.
+    for (const iso of ["REPEATABLE READ", "SERIALIZABLE"]) {
+      expect(await failure(asInstaller(install(crypto.randomUUID(), "codex"), "install", iso))).toMatchObject({ code: "22023", message: "acquisition: invalid_request" });
+      expect(await failure(asInstaller(revoke(crypto.randomUUID(), "codex", "sess-rv-2", crypto.randomUUID(), lineage), "revoke", iso))).toMatchObject({ code: "22023", message: "acquisition: invalid_request" });
+    }
+    expect(await state()).toEqual(held);
+  });
 });
 
 test("the runbook's sentinel table documents every schema step", async () => {

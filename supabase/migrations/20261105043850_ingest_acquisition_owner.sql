@@ -160,7 +160,11 @@ REVOKE ALL ON sessions.ingest_acquisition_switch,sessions.ingest_acquisition_hoo
 -- ---------------------------------------------------------------------------------------------------------------
 -- Owner-only internals (SECURITY INVOKER; EXECUTE revoked from every role). They run only inside the existing
 -- SECURITY DEFINER entrypoints and the control functions below, as the owner. Lock order (design §4.5): a hook's
--- existing locks, then LE (gate), then LA, then LP; LA/LP are try-locks and are never waited on.
+-- existing locks, then LE (gate), then LA, then LP; LA/LP are try-locks and are never waited on. The control
+-- functions (install/revoke/rebind) first take, in this fixed order, LO (the operation uuid,
+-- '96bulls:acquisition-operation') and LT (the target grant id, '96bulls:acquisition-target'; install and revoke
+-- only), then LA, then LP (ingest_acquisition_operation_lock). LO/LT are try-locks too (40001 session_busy, never
+-- waited on, never a raw 55P03), and hooks never take them, so LO/LT add no lock wait and cannot form a cycle.
 -- ---------------------------------------------------------------------------------------------------------------
 
 -- §4.5 lock keys. concat_ws keeps an empty workspace in position; identifiers carry no control character.
@@ -548,6 +552,27 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='acquisition: session_busy';END IF;
 END $control_lock$;
 
+-- §3.1 cross-scope serialisation, taken before ingest_acquisition_control_lock. Lock order: LO (operation uuid),
+-- then LT (target grant id; NULL = none), then LA, then LP. LO/LT are global (no org/workspace/session in the key),
+-- so a same-uuid twin in another scope, or a second install/revoke naming the same grant id in another scope, cannot
+-- race past the per-scope locks. They are try-locks: while another transaction holds the claim unresolved the caller
+-- gets 40001 session_busy (retryable, before any write and before any xid), never a wait, a lock_timeout or a raw
+-- 55P03. The control functions require READ COMMITTED (else 22023 invalid_request, before any lock or write): the
+-- caller's next statement after these locks then takes a fresh snapshot, so the replay re-check sees a twin that
+-- committed first (stored replay or 40001 operation_conflict) and the revoke target re-read sees its grant or fence
+-- (42501 target_mismatch). A retained REPEATABLE READ/SERIALIZABLE snapshot could miss that twin and surface a raw
+-- 23505 or serialization failure instead, so it is refused rather than documented.
+CREATE FUNCTION sessions.ingest_acquisition_operation_lock(p_op uuid,p_target uuid) RETURNS void
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $operation_lock$
+BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='acquisition: invalid_request';END IF;
+ IF NOT pg_try_advisory_xact_lock(sessions.ingest_acquisition_lock_key('96bulls:acquisition-operation','','',p_op::text,''))
+  OR (p_target IS NOT NULL
+   AND NOT pg_try_advisory_xact_lock(sessions.ingest_acquisition_lock_key('96bulls:acquisition-target','','',p_target::text,''))) THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='acquisition: session_busy';END IF;
+END $operation_lock$;
+
 CREATE FUNCTION sessions.ingest_acquisition_install(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $install$
 DECLARE v_req text;v_res jsonb;v_op uuid;v_org text;v_ws text;v_src text;v_sess text;v_psrc text;v_psess text;
@@ -562,7 +587,9 @@ BEGIN
  v_org:=p->>'orgId';v_ws:=p->>'workspaceId';v_src:=p->>'source';v_sess:=p->>'sessionId';v_rev:=(p->>'revision')::bigint;
  v_lineage:=nullif(p->>'bindingUuid','')::uuid;
  IF v_lineage IS NULL THEN v_lineage:=(p->>'installationId')::uuid;END IF;
- -- 2. Exact replay or operation_conflict.
+ -- 2. LO on the operation uuid, LT on the grant id it creates (= operationUuid), then exact replay or
+ -- operation_conflict under them: a twin of any scope that committed first is seen here.
+ PERFORM sessions.ingest_acquisition_operation_lock(v_op,v_op);
  v_res:=sessions.ingest_acquisition_replay(v_op,'install',v_req);
  IF v_res IS NOT NULL THEN RETURN v_res;END IF;
  -- 3. An enrolled source.
@@ -650,7 +677,8 @@ DECLARE v_req text;v_res jsonb;v_op uuid;v_target uuid;v_org text;v_ws text;v_sr
  o sessions.ingest_acquisition_owners%ROWTYPE;g sessions.ingest_acquisition_grants%ROWTYPE;
  c sessions.ingest_acquisition_grants%ROWTYPE;rg sessions.ingest_acquisition_revoked_grants%ROWTYPE;v_found boolean;
 BEGIN
- -- Install steps 1-2 (no switch: a revoke is always accepted) and 4-5.
+ -- Install steps 1-2 (no switch: a revoke is always accepted) and 4-5. Locks: LO (operationUuid), LT
+ -- (targetGrantId), then LA, then LP; the replay runs under LO and again under LA.
  PERFORM sessions.ingest_acquisition_require_installer();
  PERFORM sessions.ingest_acquisition_request(p,'revoke');
  v_req:=p->>'requestSha256';v_op:=(p->>'operationUuid')::uuid;v_target:=(p->>'targetGrantId')::uuid;
@@ -658,6 +686,7 @@ BEGIN
  v_kind:=p->>'targetOwnerKind';v_epoch:=(p->>'targetOwnerEpoch')::bigint;
  v_bind:=nullif(p->>'targetBindingUuid','')::uuid;v_inst:=nullif(p->>'targetInstallationId','')::uuid;
  v_lineage:=coalesce(v_bind,v_inst);
+ PERFORM sessions.ingest_acquisition_operation_lock(v_op,v_target);
  v_res:=sessions.ingest_acquisition_replay(v_op,'revoke',v_req);
  IF v_res IS NOT NULL THEN RETURN v_res;END IF;
  PERFORM sessions.ingest_acquisition_control_lock(v_org,v_ws,v_src,v_sess);
@@ -684,6 +713,13 @@ BEGIN
    owner_kind,binding_uuid,installation_id,revision,evidence_sha256)
   VALUES(v_target,v_org,v_ws,v_src,v_sess,v_epoch,v_kind,v_bind,v_inst,v_rev,p->>'evidenceSha256')
   ON CONFLICT(grant_id) DO NOTHING;
+  -- Re-read after the insert: a conflicting row (written by any scope; LT makes this unreachable under READ
+  -- COMMITTED) or a row this snapshot cannot see is target_mismatch, raised before any fence or operation row.
+  SELECT * INTO rg FROM sessions.ingest_acquisition_revoked_grants WHERE grant_id=v_target;
+  IF NOT FOUND OR rg.org_id<>v_org OR rg.workspace_id<>v_ws OR rg.source<>v_src OR rg.session_id<>v_sess
+   OR rg.owner_epoch<>v_epoch OR rg.owner_kind<>v_kind OR rg.binding_uuid IS DISTINCT FROM v_bind
+   OR rg.installation_id IS DISTINCT FROM v_inst THEN
+   RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='acquisition: target_mismatch';END IF;
   v_outcome:='revoked_pending';
  END IF;
  -- 4. Lineage fence (§4.9), on both paths; drain the current grant of that lineage, whichever grant it is.
@@ -716,6 +752,8 @@ BEGIN
  PERFORM sessions.ingest_acquisition_request(p,'rebind');
  v_req:=p->>'requestSha256';v_op:=(p->>'operationUuid')::uuid;
  v_org:=p->>'orgId';v_ws:=p->>'workspaceId';v_src:=p->>'source';v_sess:=p->>'sessionId';v_rev:=(p->>'revision')::bigint;
+ -- LO (operationUuid), replay under it, then LA, LP and the replay again (no LT: rebind creates no grant id).
+ PERFORM sessions.ingest_acquisition_operation_lock(v_op,NULL);
  v_res:=sessions.ingest_acquisition_replay(v_op,'rebind',v_req);
  IF v_res IS NOT NULL THEN RETURN v_res;END IF;
  PERFORM sessions.ingest_acquisition_control_lock(v_org,v_ws,v_src,v_sess);
@@ -1726,7 +1764,7 @@ REVOKE ALL ON FUNCTION sessions.ingest_acquisition_lock_key(text,text,text,text,
  sessions.ingest_acquisition_publish_check(text,text,jsonb),sessions.ingest_acquisition_pointer_owner(text,text,text,text),
  sessions.ingest_acquisition_require_installer(),sessions.ingest_acquisition_fields(text),
  sessions.ingest_acquisition_request(jsonb,text),sessions.ingest_acquisition_replay(uuid,text,text),
- sessions.ingest_acquisition_control_lock(text,text,text,text),
+ sessions.ingest_acquisition_control_lock(text,text,text,text),sessions.ingest_acquisition_operation_lock(uuid,uuid),
  sessions.ingest_acquisition_install(jsonb),sessions.ingest_acquisition_revoke(jsonb),
  sessions.ingest_acquisition_rebind_origin(jsonb),sessions.ingest_acquisition_status(jsonb),
  sessions.ingest_acquisition_enroll_begin(jsonb),sessions.ingest_acquisition_enroll_complete(jsonb)

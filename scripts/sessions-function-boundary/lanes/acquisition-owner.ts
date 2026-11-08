@@ -128,6 +128,7 @@ export const acquisitionOwner: LaneManifest = {
     "sessions.ingest_acquisition_request(jsonb,text)": own(false),
     "sessions.ingest_acquisition_replay(uuid,text,text)": own(false),
     "sessions.ingest_acquisition_control_lock(text,text,text,text)": own(false),
+    "sessions.ingest_acquisition_operation_lock(uuid,uuid)": own(false),
     "sessions.ingest_acquisition_install(jsonb)": own(true, INSTALLER),
     "sessions.ingest_acquisition_revoke(jsonb)": own(true, INSTALLER),
     "sessions.ingest_acquisition_rebind_origin(jsonb)": own(true, INSTALLER),
