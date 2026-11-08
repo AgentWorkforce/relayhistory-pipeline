@@ -6,6 +6,7 @@ import pg from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { log } from "./log.ts";
 import { required } from "./env.ts";
+import { effectiveMigrationLedger, RELEASED_MIGRATION_NAME_ALIASES } from "../hoopdb/released-migration-history.ts";
 
 export interface HoopDb extends SqlExecutor {
   pool: pg.Pool;
@@ -203,9 +204,21 @@ export async function schemaVerdict(
       await tx.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
       await tx.query("SELECT set_config('hoopdb.db_mode', $1, true)", [expected.dbMode ?? "unspecified"]);
       stage = "ledger";
-      const have = new Set(
+      let have = new Set(
         (await tx.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((r) => r.name),
       );
+      // Current histories keep the cheap original query. Released old names
+      // additionally require their exact recorded hashes; the physical ledger
+      // and its owner-plan binding are never changed by this view.
+      const originalNames = RELEASED_MIGRATION_NAME_ALIASES.map((alias) => alias.original);
+      if (originalNames.some((name) => have.has(name))) {
+        const physical = new Map([...have].map((name) => [name, ""]));
+        const rows = await tx.query<{ name: string; sha256: string }>(
+          "SELECT name, sha256 FROM sessions.__96bulls_migrations WHERE name = ANY($1::text[])", [originalNames],
+        );
+        for (const row of rows.rows) physical.set(row.name, row.sha256);
+        have = new Set(effectiveMigrationLedger(physical).keys());
+      }
       // The role shim, bootstrap and verify steps are not schema; the marker covers verify.
       const missing = expected.names.filter((n) => !isPrerequisiteStep(n) && !have.has(n));
       if (missing.length) return { ok: false, reason: "schema_pending", count: missing.length };

@@ -1,6 +1,6 @@
 # Upload fence generation release
 
-Apply the release union in append order: existing main auth migrations 20261104020000/20261104020100, then20261104021000 event metadata,20261104022000 ingest ledger,20261104030000 repair. The formerly unlanded event/ingest files retain their original statement bodies and provenance names in comments. No applied auth migration bytes change. Never adopt a database containing an unreleased old filename by guessing a checksum or marking it applied.
+Apply the release union in append order: existing main auth migrations 20261104020000/20261104020100, then 20261104021000 event metadata, 20261104022000 ingest ledger, and the 20261104030000 repair. No applied auth migration bytes change. The original event/ingest filenames also shipped in services image 070fe6fd; that exact released history has the narrowly pinned, non-rewriting procedure in [released-migration-history.md](released-migration-history.md). Never guess a checksum or mark an unexecuted migration applied. Other unknown histories still refuse.
 
 The repair preserves non-fenced committed revisions, removes previously reinserted fenced replay entries, and backfills session ownership. New tables contain metadata only and have RLS with no direct runtime table grants. Existing authenticated binding/role contracts stay unchanged; three internal helpers are owner-only and part of both exact ACL manifests.
 

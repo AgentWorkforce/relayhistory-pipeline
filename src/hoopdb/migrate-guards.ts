@@ -8,6 +8,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { MIGRATION_SENTINELS } from "./migration-sentinels.ts";
+import { effectiveMigrationLedger, RELEASED_MIGRATION_NAME_ALIASES } from "./released-migration-history.ts";
 
 export interface GuardClient {
   query<R = Record<string, unknown>>(
@@ -990,8 +991,15 @@ async function exists(
 export async function sequencePreflight(
   client: GuardClient,
   schemaSteps: GuardStep[],
-  ledger: Map<string, string>,
-): Promise<void> {
+  physicalLedger: Map<string, string>,
+): Promise<Map<string, string>> {
+  const ledger = effectiveMigrationLedger(physicalLedger);
+  for (const alias of RELEASED_MIGRATION_NAME_ALIASES) {
+    if (!physicalLedger.has(alias.original) || !("repair" in alias)) continue;
+    const repair = schemaSteps.find((step) => step.name === alias.repair);
+    if (!repair || createHash("sha256").update(await readFile(repair.path, "utf8")).digest("hex") !== alias.repairSha256)
+      throw guardError("ledger_alias_repair_missing", `released migration ${alias.original} requires its exact forward repair`);
+  }
   const names = schemaSteps.map((s) => s.name);
   const known = new Set(names);
   const isSchema = (n: string) =>
@@ -1086,6 +1094,7 @@ export async function sequencePreflight(
       "unledgered_schema",
       `objects of unrecorded migrations already exist: ${found.slice(0, 5).join("; ")}${found.length > 5 ? `; and ${found.length - 5} more` : ""}. Nothing is imported or marked, see the runbook decision point`,
     );
+  return ledger;
 }
 
 // ---------------------------------------------------------------------------

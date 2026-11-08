@@ -37,6 +37,7 @@ import {
 import { log } from "../shared/log.ts";
 import { optional } from "../shared/env.ts";
 import { SESSION_BOOTSTRAP_FILES } from "./session-bootstrap-chain.ts";
+import { effectiveMigrationLedger, RELEASED_MIGRATION_NAME_ALIASES } from "./released-migration-history.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 // The relayhistory-cloud sessions migrations, moved into this repo by #1/#6 (provenance: supabase/README.md).
@@ -315,7 +316,8 @@ export async function expectedMigrationNames(): Promise<string[]> {
 
 /**
  * The migration-set generation: sha256 over every schema step (name and file sha256)
- * plus every phase 2 verifier (verify:buffered_search_feed_runtime last), which define the approved grants. Independent of the
+ * plus every phase 2 verifier (verify:buffered_search_feed_runtime last) and
+ * the released-name alias registry, which bind approved grants and history. Independent of the
  * shim/bootstrap/verify flags, so the migrator, an external verifier and every reader
  * compute the same value for the same image.
  */
@@ -346,6 +348,7 @@ export async function generation(): Promise<string> {
         .update(await readFile(s.path, "utf8"))
         .digest("hex"),
     ]);
+  parts.push(["history:released-migration-name-aliases", createHash("sha256").update(JSON.stringify(RELEASED_MIGRATION_NAME_ALIASES)).digest("hex")]);
   return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }
 
@@ -420,8 +423,8 @@ async function migrationPreflight(client: MigrationClient, profile: MigrationPro
       );
   }
   await cliHistoryPreflight(client, schema);
-  await sequencePreflight(client, schema, ledger);
-  return { ledger, runtime };
+  const effectiveLedger = await sequencePreflight(client, schema, ledger);
+  return { ledger, effectiveLedger, runtime };
 }
 export function migrationLedgerSha256(ledger: Map<string, string>): string {
   return createHash("sha256").update(JSON.stringify([...ledger].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest("hex");
@@ -431,8 +434,8 @@ export async function inspectMigrations(client: MigrationClient, profile: Migrat
   if (profile.mode !== "supabase" || profile.shim || profile.bootstrap || !profile.verify)
     throw profileError("release_profile", "release inspection requires Supabase, verifier enabled, shim/bootstrap disabled");
   const steps = await schemaSteps();
-  const { ledger } = await migrationPreflight(client, profile, steps);
-  const acl = await sessionsFunctionAclPreview(client, profile.runtimeRole, steps.some(s => !ledger.has(s.name)));
+  const { ledger, effectiveLedger } = await migrationPreflight(client, profile, steps);
+  const acl = await sessionsFunctionAclPreview(client, profile.runtimeRole, steps.some(s => !effectiveLedger.has(s.name)));
   if (acl.function_acl_drift_extra.length || acl.function_acl_missing_refused.length)
     throw profileError("function_acl_drift", "release inspection refused ACL drift");
   // Prerequisites only, no provisioning. Authoritative migration/phase-2 SQL still
@@ -470,7 +473,7 @@ export async function inspectMigrations(client: MigrationClient, profile: Migrat
   for (const step of steps) inventory.push({
     name: step.name,
     sha256: createHash("sha256").update(await readFile(step.path, "utf8")).digest("hex"),
-    pending: !ledger.has(step.name),
+    pending: !effectiveLedger.has(step.name),
   });
   return { generation: await generation(), ledgerSha256: migrationLedgerSha256(ledger), inventory, acl };
 }
@@ -500,11 +503,16 @@ export async function runMigrations(
       (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
     );
     // Read-only preflight, all under the lock: nothing below writes until every check passes.
-    const { ledger, runtime } = await migrationPreflight(client, profile, schema);
+    const { ledger, effectiveLedger, runtime } = await migrationPreflight(client, profile, schema);
     if (opts.expectedLedgerSha256 !== undefined &&
         migrationLedgerSha256(ledger) !== opts.expectedLedgerSha256)
       throw profileError("release_ledger_changed", "database ledger changed since the approved read-only plan");
     if (opts.beforeWrite) await opts.beforeWrite();
+    for (const alias of RELEASED_MIGRATION_NAME_ALIASES) {
+      if (ledger.has(alias.original)) log.info("recognized released migration name", {
+        migration: alias.original, ledger_sha: alias.originalSha256, accepted_as_alias_of: alias.current,
+      });
+    }
     await client.query("CREATE SCHEMA IF NOT EXISTS sessions");
     await client.query(`CREATE TABLE IF NOT EXISTS ${MIGRATION_LEDGER} (
       name text PRIMARY KEY,
@@ -639,7 +647,7 @@ export async function runMigrations(
         continue;
       }
       const sha = createHash("sha256").update(sql).digest("hex");
-      const seen = ledger.get(step.name);
+      const seen = effectiveLedger.get(step.name);
       if (seen && migrationChecksumMatches(step.name, seen, sha)) {
         const alias = migrationChecksumAlias(step.name, seen, sha);
         if (alias) log.info("accepted historical migration checksum", alias);
@@ -929,13 +937,7 @@ async function pendingMigrationsExist(
     `SELECT to_regclass('${MIGRATION_LEDGER}')::text AS t`,
   );
   if (!has.rows[0]?.t) return true;
-  const done = new Set(
-    (
-      await client.query<{ name: string }>(
-        `SELECT name FROM ${MIGRATION_LEDGER}`,
-      )
-    ).rows.map((r) => r.name),
-  );
+  const done = effectiveMigrationLedger(await readLedger(client));
   return (await expectedMigrationNames()).some((n) => !done.has(n));
 }
 
