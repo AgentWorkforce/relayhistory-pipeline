@@ -1973,7 +1973,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105043900 (consumer function grants) applies last: earlier downs refuse (55000)
+    // 20261105054000 (read API tokens) applies last: its own down drops the table first.
+    expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
+    expect((await failure(rollback("20261105043900_session_consumer_function_grants.down.sql")))?.code).toBe("55000");
+    await rollback("20261105054000_read_api_tokens.down.sql");
+    expect(await relation("sessions.read_api_tokens")).toBeNull();
+    // 20261105043900 (consumer function grants) is then the latest: earlier downs refuse (55000)
     // while it is applied; its own down revokes the twelve search_consumer_runtime
     // EXECUTEs and marks the validation pending.
     const writerGrants = async () =>
@@ -2353,6 +2358,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
 
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
+    // The read API tokens migration applies after the grants, so it rolls back first.
+    const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105054000_read_api_tokens.down.sql"), "utf8");
     const grantRow = `SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043900_session_consumer_function_grants.sql'`;
     const holds = async (db: PGlite) =>
       (await db.query<{ holds: boolean }>(
@@ -2372,6 +2379,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await db.exec(ET_BOOT);
       await runMigrations(client(db), { profile: SUPA_ET });
       expect(await holds(db)).toBe(true);
+      expect(await failure(db.exec(readTokensDown))).toBeNull();
       expect(await failure(db.exec(down))).toBeNull();
       expect(await holds(db)).toBe(false);
       expect((await db.query<{ n: number }>(grantRow)).rows[0].n).toBe(0);
@@ -2384,6 +2392,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await runMigrations(client(db), { profile: SUPA_ET });
       await db.exec(`DROP OWNED BY search_consumer_runtime`);
       await db.exec(`DROP ROLE search_consumer_runtime`);
+      expect(await failure(db.exec(readTokensDown))).toBeNull();
       expect(await failure(db.exec(down))).toBeNull();
       expect((await db.query<{ n: number }>(grantRow)).rows[0].n).toBe(0);
     }

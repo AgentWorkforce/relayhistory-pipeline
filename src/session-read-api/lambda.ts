@@ -46,6 +46,7 @@ import {
   READ_API_INTROSPECT_POSITIVE_TTL_MS_MAX,
   readApiVerifier,
   relaycontrolLogin,
+  selfIssuedVerifier,
   type AuthConfig,
 } from "./auth.ts";
 import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
@@ -53,6 +54,14 @@ import { assertDestinationUrl, destinationPolicy } from "../shared/destination-u
 import { parseCompleteSince } from "./config.ts";
 import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
 import { serviceCanonicalDeps } from "./service-canonical.ts";
+import {
+  ACCESS_TTL_SECONDS_DEFAULT,
+  ACCESS_TTL_SECONDS_MAX,
+  ACCESS_TTL_SECONDS_MIN,
+  INTERNAL_SECRET_MIN_LENGTH,
+  normalizedOrigin,
+  sqlTokenStore,
+} from "./self-issued.ts";
 
 export interface ReadApiSecret {
   clickhouse?: { url: string; user: string; password: string; database: string };
@@ -87,11 +96,74 @@ export const READ_API_AUTH_MODE_VAR = "READ_API_AUTH_MODE";
  * takes relaycontrol `sh_at_` tokens only. Anything else refuses startup. Never
  * echoes the value.
  */
-export function readApiAuthMode(env: NodeJS.ProcessEnv = process.env): "default" | "relaycontrol_only" {
+export function readApiAuthMode(env: NodeJS.ProcessEnv = process.env): "default" | "relaycontrol_only" | "self_issued" {
   const raw = env[READ_API_AUTH_MODE_VAR];
   if (raw === undefined || raw === "") return "default";
-  if (raw === "relaycontrol_only") return "relaycontrol_only";
-  throw new Error(`session read api: ${READ_API_AUTH_MODE_VAR} must be unset, "" or "relaycontrol_only"`);
+  if (raw === "relaycontrol_only" || raw === "self_issued") return raw;
+  throw new Error(`session read api: ${READ_API_AUTH_MODE_VAR} must be unset, "", "relaycontrol_only" or "self_issued"`);
+}
+
+export const READ_API_INTERNAL_SECRET_VAR = "READ_API_INTERNAL_SECRET";
+export const READ_API_INTERNAL_SECRET_PREVIOUS_VAR = "READ_API_INTERNAL_SECRET_PREVIOUS";
+export const READ_API_ACCESS_TOKEN_TTL_VAR = "READ_API_ACCESS_TOKEN_TTL_SECONDS";
+export const READ_API_CORS_ORIGINS_VAR = "READ_API_CORS_ALLOWED_ORIGINS";
+
+function internalSecret(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const raw = env[name];
+  if (raw === undefined || raw === "") return undefined;
+  // The route compares the exact bearer, so a padded secret could never match.
+  if (raw !== raw.trim()) throw new Error(`session read api: ${name} must not have leading or trailing whitespace`);
+  if (raw.length < INTERNAL_SECRET_MIN_LENGTH) throw new Error(`session read api: ${name} must be at least ${INTERNAL_SECRET_MIN_LENGTH} characters`);
+  return raw;
+}
+
+/** READ_API_ACCESS_TOKEN_TTL_SECONDS: unset is 300; otherwise a decimal integer within the bounds. */
+function accessTtlSeconds(env: NodeJS.ProcessEnv): number {
+  const raw = env[READ_API_ACCESS_TOKEN_TTL_VAR];
+  if (raw === undefined) return ACCESS_TTL_SECONDS_DEFAULT;
+  const value = /^[1-9][0-9]{0,4}$/u.test(raw) ? Number(raw) : Number.NaN;
+  if (!(value >= ACCESS_TTL_SECONDS_MIN && value <= ACCESS_TTL_SECONDS_MAX))
+    throw new Error(`session read api: ${READ_API_ACCESS_TOKEN_TTL_VAR} must be an integer from ${ACCESS_TTL_SECONDS_MIN} to ${ACCESS_TTL_SECONDS_MAX}`);
+  return value;
+}
+
+/**
+ * self_issued: this service's own tokens only. Anything that would leave it serving another token
+ * family or unable to bind audience refuses startup. Errors name variables, never values.
+ */
+function selfIssuedAuthConfig(env: NodeJS.ProcessEnv): AuthConfig {
+  const mode = `${READ_API_AUTH_MODE_VAR}=self_issued`;
+  for (const name of ["RELAYAUTH_JWKS_URL", "RELAYAUTH_ISSUER", "RELAYCONTROL_INTROSPECT_URL", "RELAYCONTROL_INTROSPECT_SECRET"] as const)
+    if (env[name]?.trim()) throw new Error(`session read api: ${mode} refuses ${name}; unset it`);
+  for (const name of ["RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS", "RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC"] as const)
+    if (env[name] === "true") throw new Error(`session read api: ${mode} refuses ${name}=true`);
+  const raw = env.READ_API_ORIGIN?.trim();
+  const audience = raw ? normalizedOrigin(raw) : null;
+  if (!audience) throw new Error(`session read api: ${mode} needs READ_API_ORIGIN set to an origin`);
+  const current = internalSecret(env, READ_API_INTERNAL_SECRET_VAR);
+  if (!current) throw new Error(`session read api: ${mode} needs ${READ_API_INTERNAL_SECRET_VAR}`);
+  const previous = internalSecret(env, READ_API_INTERNAL_SECRET_PREVIOUS_VAR);
+  if (previous === current) throw new Error(`session read api: ${READ_API_INTERNAL_SECRET_PREVIOUS_VAR} must differ from ${READ_API_INTERNAL_SECRET_VAR}`);
+  return {
+    origin: raw,
+    mode: "self_issued",
+    selfIssued: { audience, internalSecrets: previous ? [current, previous] : [current], accessTtlSeconds: accessTtlSeconds(env) },
+  };
+}
+
+const CORS_LOOPBACK = /^http:\/\/(localhost|127\.0\.0\.1)(:[0-9]+)?$/u;
+
+/**
+ * READ_API_CORS_ALLOWED_ORIGINS: comma-separated exact browser origins. Unset or blank is no CORS.
+ * A wildcard, a path, or plain http off loopback refuses startup. Never echoes the value.
+ */
+export function readApiCorsOrigins(env: NodeJS.ProcessEnv = process.env): ReadonlySet<string> {
+  const values = (env[READ_API_CORS_ORIGINS_VAR] ?? "").split(",").map((v) => v.trim()).filter(Boolean);
+  for (const value of values) {
+    if (value.includes("*") || normalizedOrigin(value) !== value || !(value.startsWith("https://") || CORS_LOOPBACK.test(value)))
+      throw new Error(`session read api: ${READ_API_CORS_ORIGINS_VAR} must list exact https origins (http only on loopback), with no wildcard or path`);
+  }
+  return new Set(values);
 }
 
 export const READ_API_INTROSPECT_POSITIVE_TTL_MS_VAR = "READ_API_INTROSPECT_POSITIVE_TTL_MS";
@@ -151,6 +223,7 @@ function relaycontrolOnlyAuthConfig(
 export function readApiAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig {
   const policy = destinationPolicy(env);
   const positiveTtlMs = readApiIntrospectPositiveTtlMs(env);
+  if (readApiAuthMode(env) === "self_issued") return selfIssuedAuthConfig(env);
   if (readApiAuthMode(env) === "relaycontrol_only") return relaycontrolOnlyAuthConfig(env, policy, positiveTtlMs);
   const jwksUrl = env.RELAYAUTH_JWKS_URL?.trim() || undefined;
   if (jwksUrl) assertDestinationUrl("RELAYAUTH_JWKS_URL", jwksUrl, policy);
@@ -398,6 +471,10 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const target = readerPoolTarget(secret.supabase_url, entry);
   // Env only: a bad auth setting (including READ_API_AUTH_MODE) refuses before the pool opens.
   const authConfig = readApiAuthConfig(env);
+  // The Function URL handler is GET-only and could never serve the token routes.
+  if (authConfig.mode === "self_issued" && entry !== "service")
+    throw new Error("session read api: READ_API_AUTH_MODE=self_issued is served only by the self-host service");
+  const corsAllowedOrigins = entry === "service" ? readApiCorsOrigins(env) : undefined;
   const pool = new pg.Pool({
     ...target,
     max: 2,
@@ -433,8 +510,10 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
-    ...(canonical ? { timing: canonical.timing, turns: canonical.turns } : {}),
-    ...(selfhostReadApi ? { selfhost: { login: relaycontrolLogin(authConfig), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),
+    ...(canonical ? { timing: canonical.timing, turns: canonical.turns, eventMessageIds: canonical.turns } : {}),
+    ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),
+    ...(corsAllowedOrigins?.size ? { corsAllowedOrigins } : {}),
+    ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),
     log: (fields) => log.info("session read", fields),
   };
   return { deps, authConfig, close: () => pool.end() };
@@ -447,7 +526,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
 export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition, options: ReadAppOptions = {}): Promise<{ app: App; close(): Promise<void> }> {
   const { deps, authConfig, close } = await readApiDepsFromSecret(secretText, env, composition, options);
   try {
-    return { app: createReadApi({ verify: readApiVerifier(authConfig), ...deps }), close };
+    const verify = deps.selfIssued ? selfIssuedVerifier(deps.selfIssued.store, deps.selfIssued.audience) : readApiVerifier(authConfig);
+    return { app: createReadApi({ verify, ...deps }), close };
   } catch (error) { await close(); throw error; }
 }
 

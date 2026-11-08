@@ -108,6 +108,7 @@ import {
   parseLoginBody,
   type SelfhostDeps,
 } from "./selfhost.ts";
+import { registerSelfIssuedRoutes, type SelfIssuedDeps } from "./self-issued.ts";
 
 /**
  * The only scopes POST /v1/cli/login advertises (next to LOGIN_MAX_TTL_MS, selfhost.ts). This backend
@@ -182,6 +183,15 @@ export interface ReadApiDeps {
    * GET /v1/sessions/:id/catalog. Absent = neither route exists and nothing else changes.
    */
   selfhost?: SelfhostDeps;
+  /** READ_API_AUTH_MODE=self_issued only (self-issued.ts): the token routes. Absent = none exist. */
+  selfIssued?: SelfIssuedDeps;
+  /**
+   * Service entry with the canonical store only: `includeMessageId=true` on session events, filled from the
+   * session's canonical objects. Absent: the parameter keeps its 501, so the Lambda and Worker are unchanged.
+   */
+  eventMessageIds?: Pick<TurnsDeps, "source" | "deadlineMs">;
+  /** READ_API_CORS_ALLOWED_ORIGINS, service entry only: exact origins GET read routes answer CORS for. Absent/empty = no CORS. */
+  corsAllowedOrigins?: ReadonlySet<string>;
 }
 
 export interface TurnsDeps {
@@ -311,8 +321,8 @@ function single(c: Context, name: string): string | undefined {
 /** Parameters this phase never serves: their presence routes the call back to relayhistory. */
 const UNSUPPORTED_PARAMS = ["taskRef", "noTaskRef", "tag", "agent", "noProject", "projectContains", "includeMessageId", "search", "kinds"];
 
-function rejectUnsupported(c: Context): void {
-  for (const p of UNSUPPORTED_PARAMS) if (c.req.queries(p)?.length) throw unsupported(`param_${p}`);
+function rejectUnsupported(c: Context, served: readonly string[] = []): void {
+  for (const p of UNSUPPORTED_PARAMS) if (!served.includes(p) && c.req.queries(p)?.length) throw unsupported(`param_${p}`);
 }
 
 function attestWorkspace(c: Context, identity: VerifiedIdentity): void {
@@ -362,7 +372,8 @@ export function createReadApi(deps: ReadApiDeps) {
    * validated and otherwise unused. Token values and scopes are never logged.
    */
   const selfhost = deps.selfhost;
-  if (selfhost) {
+  if (selfhost?.login) {
+    const exchange = selfhost.login;
     const now = selfhost.now ?? (() => Date.now());
     const loginError = (c: Context, status: 400 | 401 | 403 | 413 | 503, code: string, message: string) => {
       if (status === 503) c.header("Retry-After", "1");
@@ -382,7 +393,7 @@ export function createReadApi(deps: ReadApiDeps) {
         }
         let grant;
         try {
-          grant = await selfhost.login(token);
+          grant = await exchange(token);
         } catch (error) {
           const e = error instanceof AuthError ? error : new AuthError(503, "relaycontrol_unavailable", "token introspection is unavailable");
           return loginError(c, e.status, e.code, e.message);
@@ -414,6 +425,37 @@ export function createReadApi(deps: ReadApiDeps) {
         });
       },
     );
+  }
+
+  if (deps.selfIssued) registerSelfIssuedRoutes(app as never, deps.selfIssued, log);
+
+  /**
+   * Browser reads (relay-webapp): exact allowlisted origins only, GET read routes only, bearer
+   * header only, so never credentials and never the token routes. A preflight is answered here,
+   * before the bearer middleware; an origin off the list gets no allow headers and the browser
+   * refuses the response.
+   */
+  const corsOrigins = deps.corsAllowedOrigins;
+  if (corsOrigins && corsOrigins.size > 0) {
+    const readRoute = (path: string) => !path.startsWith("/v1/cli/") && !path.startsWith("/v1/auth/");
+    app.use("/v1/*", async (c, next) => {
+      const origin = c.req.header("origin");
+      const allowed = origin !== undefined && corsOrigins.has(origin) && readRoute(c.req.path);
+      c.header("Vary", "Origin");
+      if (allowed) {
+        c.header("Access-Control-Allow-Origin", origin);
+        c.header("Access-Control-Expose-Headers", "X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation");
+      }
+      if (c.req.method === "OPTIONS") {
+        if (allowed) {
+          c.header("Access-Control-Allow-Methods", "GET");
+          c.header("Access-Control-Allow-Headers", "authorization, x-correlation-id");
+          c.header("Access-Control-Max-Age", "600");
+        }
+        return c.body(null, 204);
+      }
+      await next();
+    });
   }
 
   app.use("/v1/*", async (c, next) => {
@@ -565,12 +607,50 @@ export function createReadApi(deps: ReadApiDeps) {
   const cursorTransition = () =>
     new HttpError(409, "cursor_backend_transition", "the cursor was issued by another backend for this session; restart pagination without a cursor", "cursor_backend_transition");
 
+  /**
+   * relayhistory's `messageId` (record.payload.message_id, null when the record has none) for one
+   * page of a session's events. The search store does not hold it, so it comes from the session's
+   * canonical objects, tenant-bound like every canonical read and under the same deadline. `source`
+   * is required because a canonical identity names one harness. A refused read is a 501: a page of
+   * missing ids would look like messages that have none.
+   */
+  async function withMessageIds<E extends { eventId: string; machineId: string; kind: string }>(identity: VerifiedIdentity, sessionId: string, source: string | undefined, events: E[]): Promise<Array<E & { messageId: string | null }>> {
+    if (events.length === 0) return [];
+    if (source === undefined) throw unsupported("message_id_source_required");
+    const canonical = deps.eventMessageIds!;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let snapshot: CanonicalRows;
+    try {
+      snapshot = await Promise.race([
+        canonical.source({ orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source }, controller.signal),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new CanonicalReadError("deadline"));
+            controller.abort();
+          }, canonical.deadlineMs ?? 3000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    const key = (eventId: unknown, machineId: unknown, kind: unknown) => JSON.stringify([eventId, machineId, kind]);
+    const ids = new Map<string, string>();
+    for (const { table, row } of snapshot.rows) {
+      if (table !== "convergence_events") continue;
+      const payload = (row.record as { payload?: { message_id?: unknown } } | undefined)?.payload;
+      if (typeof payload?.message_id === "string") ids.set(key(row.event_id, row.machine_id, row.kind), payload.message_id);
+    }
+    return events.map((event) => ({ ...event, messageId: ids.get(key(event.eventId, event.machineId, event.kind)) ?? null }));
+  }
+
   app.get("/v1/sessions/:sessionId/events", async (c) => {
     try {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
-      rejectUnsupported(c);
+      rejectUnsupported(c, deps.eventMessageIds ? ["includeMessageId"] : []);
       for (const p of ["q", "since", "until", "kind", "session", "project"]) if (c.req.queries(p)?.length) throw unsupported(`param_${p}`);
+      const includeMessageId = deps.eventMessageIds !== undefined && single(c, "includeMessageId") === "true";
       const sessionId = c.req.param("sessionId");
       if (!sessionId || sessionId.length > MAX_ID_CHARS) throw bad("sessionId is not valid");
       const source = single(c, "source") || undefined;
@@ -610,8 +690,10 @@ export function createReadApi(deps: ReadApiDeps) {
         c,
         { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, order, limit, maxContent, cursor },
       );
-      return c.json({ sessionId, events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+      const events = includeMessageId ? await withMessageIds(identity, sessionId, source, page.events) : page.events;
+      return c.json({ sessionId, events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
+      if (error instanceof CanonicalReadError) return fail(c, unsupported(`message_id_canonical_${error.reason}`));
       return fail(c, error);
     }
   });

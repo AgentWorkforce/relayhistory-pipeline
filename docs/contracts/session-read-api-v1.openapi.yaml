@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Session Read API
-  version: 1.1.0
+  version: 1.2.0
   license:
     name: Apache-2.0
     identifier: Apache-2.0
@@ -220,6 +220,7 @@ paths:
         - {name: order, in: query, schema: {type: string, enum: [asc, desc]}}
         - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 1000, default: 200}}
         - {name: maxContent, in: query, description: Truncate event content to this many characters., schema: {type: integer, minimum: 1}}
+        - {name: includeMessageId, in: query, description: "true adds messageId to each event. Requires source. Self-host service with the canonical store only; elsewhere 501.", schema: {type: boolean}}
         - $ref: "#/components/parameters/cursor"
       responses:
         "200":
@@ -594,3 +595,4 @@ components:
         toolName: {type: [string, "null"]}
         toolStatus: {type: [string, "null"]}
         filesTouched: {type: array, items: {type: string}}
+        messageId: {type: [string, "null"], description: "Present with includeMessageId=true; null when the record has none. Use it to remove duplicates."}

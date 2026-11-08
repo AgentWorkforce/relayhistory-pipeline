@@ -13,7 +13,8 @@
  * With LOCKER_BUCKET set, timing, turns, metadata and catalog read canonical
  * S3 (service-canonical.ts); READ_API_AUTH_MODE=relaycontrol_only removes the
  * RelayAuth verifier entirely (lambda.ts readApiAuthConfig, auth.ts).
- * Like the Lambda and the Worker it answers GET, plus exactly one POST route: `POST /v1/cli/login`, whose JSON
+ * Like the Lambda and the Worker it answers GET, plus one POST route, `POST /v1/cli/login` (READ_API_AUTH_MODE=self_issued
+ * adds the token routes of self-issued.ts; READ_API_CORS_ALLOWED_ORIGINS adds OPTIONS preflight), whose JSON
  * body is the only request body ever read. It is buffered here with a hard
  * cap (LOGIN_BODY_CAP_BYTES, 413 beyond it) before the app sees it; every
  * other request body is drained, never read.
@@ -24,7 +25,8 @@ import { Hono } from "hono";
 import { errorFields, log } from "../shared/log.ts";
 import { createPostgresSearchComposition, type SearchComposition } from "../shared/search-composition.ts";
 import { parseCompleteSince } from "./config.ts";
-import { readAppFromSecret, serviceSearchBackend } from "./lambda.ts";
+import { readApiAuthMode, readApiCorsOrigins, readAppFromSecret, serviceSearchBackend } from "./lambda.ts";
+import { TOKEN_ROUTE_PATHS } from "./self-issued.ts";
 import { readApiServiceConfig, SEARCH_BACKEND_ID_VAR } from "./service-config.ts";
 
 type FetchApp = { fetch(req: Request): Response | Promise<Response> };
@@ -58,7 +60,7 @@ const LOGIN_PATH = "/v1/cli/login";
 const LOGIN_BODY_CAP_BYTES = 8 * 1024;
 
 /** The routes the service answers: `/healthz` always, then the read API (enabled) or 503 (dormant). */
-export function readApiServiceApp(app: FetchApp | null): Hono {
+export function readApiServiceApp(app: FetchApp | null, routes: { tokenRoutes?: boolean; cors?: boolean } = {}): Hono {
   const service = new Hono();
   service.get("/healthz", (c) => c.json({ ok: true, enabled: app !== null }));
   if (!app) {
@@ -73,7 +75,10 @@ export function readApiServiceApp(app: FetchApp | null): Hono {
   service.all("*", (c) => {
     // c.req.path is percent-decoded; the raw pathname must match too, the same check readApiHttpServer uses to read the body.
     const login = c.req.path === LOGIN_PATH && new URL(c.req.url).pathname === LOGIN_PATH;
-    if (c.req.method === "GET" || (login && c.req.method === "POST")) return app.fetch(c.req.raw);
+    const url = new URL(c.req.url).pathname;
+    const tokenRoute = routes.tokenRoutes === true && TOKEN_ROUTE_PATHS.includes(c.req.path) && TOKEN_ROUTE_PATHS.includes(url);
+    if (c.req.method === "GET" || (login && c.req.method === "POST") || (tokenRoute && c.req.method === "POST") || (routes.cors === true && c.req.method === "OPTIONS")) return app.fetch(c.req.raw);
+    if (tokenRoute) return c.json(errorJson("method_not_allowed", "POST only"), 405, { allow: "POST" });
     return login
       ? c.json(errorJson("method_not_allowed", "GET or POST only"), 405, { allow: "GET, POST" })
       : c.json(errorJson("method_not_allowed", "GET only"), 405, { allow: "GET" });
@@ -122,13 +127,14 @@ function readCappedBody(req: IncomingMessage, cap: number): Promise<Buffer | "to
  * request the body is drained, never read. Bodies and header values are never
  * logged.
  */
-export function readApiHttpServer(handler: FetchApp, options: { readLoginBody?: boolean } = {}): Server {
+export function readApiHttpServer(handler: FetchApp, options: { readLoginBody?: boolean; tokenRoutes?: boolean } = {}): Server {
   return createServer((req, res) => {
     void (async () => {
       try {
         const url = `http://localhost${req.url?.startsWith("/") ? req.url : "/"}`;
         let body: Buffer | undefined;
-        if (options.readLoginBody === true && req.method === "POST" && new URL(url).pathname === LOGIN_PATH) {
+        const pathname = new URL(url).pathname;
+        if (req.method === "POST" && ((options.readLoginBody === true && pathname === LOGIN_PATH) || (options.tokenRoutes === true && TOKEN_ROUTE_PATHS.includes(pathname)))) {
           const read = await readCappedBody(req, LOGIN_BODY_CAP_BYTES);
           if (read === "too_large") {
             // The app is never called; the connection is closed once the 413 is out so the rest of the upload is not consumed.
@@ -183,7 +189,9 @@ export async function startReadApiService(
 ): Promise<ReadApiService> {
   const config = readApiServiceConfig(env);
   const built = config.enabled ? await (options.build ?? selfhostReadApp)(config.secret, env) : null;
-  const server = readApiHttpServer(readApiServiceApp(built?.app ?? null), { readLoginBody: built !== null });
+  const tokenRoutes = built !== null && readApiAuthMode(env) === "self_issued";
+  const cors = built !== null && readApiCorsOrigins(env).size > 0;
+  const server = readApiHttpServer(readApiServiceApp(built?.app ?? null, { tokenRoutes, cors }), { readLoginBody: built !== null, tokenRoutes });
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
