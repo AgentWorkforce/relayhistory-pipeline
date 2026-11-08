@@ -127,6 +127,17 @@ Per-stage latency (default off): with `INGEST_STAGE_LATENCY_LOG=on` the Worker w
 `route` = `ingest.stage_latency` line per deliver stage with `stage`, `outcome` (`ok`, `refused`,
 `unavailable`), `duration_ms` and, for a database failure, `sqlstate`; no tenant data, no ids.
 
+Claim lock-wait busy (default off): with `INGEST_CLAIM_LOCK_BUSY=on` a claim (any acceptance
+mode) whose statement loses its lock wait (55P03 or 40P01, `error_code` `ledger_lock_timeout`)
+answers 429 `delivery_busy` with `Retry-After` 5-10 s instead of the 503. The lower bound is the
+role `statement_timeout` (5 s), so the retry lands after the holding claim has committed or been
+cancelled. The statement rolled back, so nothing was written; the retry is the same idempotent claim,
+and the admission consumer retries it after the same delay. The route line keeps `stage` `claim`,
+`error_code` and `db_error_code`, with `outcome` `delivery_busy`. The `ingest.lock_alert`
+`lazy_claim` line still fires. 57014 (`ledger_timeout`) and every other cause stay 503. With
+the flag on, the 503 claim-path alert above no longer counts 55P03. Watch `outcome=delivery_busy`
+with `stage=claim`, or the `lazy_claim` lock alert. Unset or `off`: unchanged.
+
 No Workers analytics or Logpush observer is named in these runbooks, so the alert is not wired
 yet. It is to be wired by the release owner in the G3 window, using the fields `route`, `stage`,
 `sqlstate`, `outcome` and `db_error_code`. A sustained `lazy_claim` 55P03 with a single origin
