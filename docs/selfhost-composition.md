@@ -203,8 +203,10 @@ Order (plain Postgres or CNPG, `HOOPDB_DB_MODE=selfhosted`):
    the logins usable:
    - `session_ingest_role.sql`, then set the password, then
      `session_ingest_role_verify.sql`.
-   - `session_read_api_role.sql` (LOGIN, timeouts, tenant RLS policy), then the
-     password, then `session_read_api_role_verify.sql`.
+   - `session_read_api_role.sql` (LOGIN, timeouts, tenant RLS policies, and the
+     id and epoch columns of `sessions.session_directory` that Postgres search's
+     completeness check needs), then the password, then
+     `session_read_api_role_verify.sql`.
    - The search schema owner runs `ensureSchema` for `search_index` and
      `projection_state`, and grants the read role `USAGE`/`SELECT` (read-api
      design, "Postgres search prerequisites").
