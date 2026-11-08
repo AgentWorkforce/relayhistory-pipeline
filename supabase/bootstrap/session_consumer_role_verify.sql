@@ -25,12 +25,21 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: role attributes drifted', v_role);
   END IF;
   -- Same creator-edge tolerance as the role file: exactly the invoker's
-  -- admin-only membership, nothing else.
-  IF EXISTS (SELECT 1 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
-             WHERE (a.roleid = r.oid OR a.member = r.oid)
-               AND NOT (a.roleid = r.oid AND m.rolname = current_user AND a.admin_option
-                        AND NOT a.inherit_option AND NOT a.set_option)) THEN
-    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: role membership drifted', v_role);
+  -- admin-only membership, nothing else. pg_auth_members only carries the
+  -- inherit/set columns on PG16+, so older servers check the admin flag.
+  IF current_setting('server_version_num')::integer >= 160000 THEN
+    IF EXISTS (SELECT 1 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+               WHERE (a.roleid = r.oid OR a.member = r.oid)
+                 AND NOT (a.roleid = r.oid AND m.rolname = current_user AND a.admin_option
+                          AND NOT a.inherit_option AND NOT a.set_option)) THEN
+      RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: role membership drifted', v_role);
+    END IF;
+  ELSE
+    IF EXISTS (SELECT 1 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+               WHERE (a.roleid = r.oid OR a.member = r.oid)
+                 AND NOT (a.roleid = r.oid AND m.rolname = current_user AND a.admin_option)) THEN
+      RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: role membership drifted', v_role);
+    END IF;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role AND rolconfig IS NOT NULL
                   AND EXISTS (SELECT 1 FROM unnest(rolconfig) u WHERE u = 'statement_timeout=60s')) THEN

@@ -288,15 +288,44 @@ jobs:
         with:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
+      - name: Create the CREATEROLE owner database (production-shaped)
+        env:
+          PG_SUPER_URL: postgres://postgres@127.0.0.1:5432/postgres
+          PG_OWNER_URL: postgres://postgres@127.0.0.1:5432/consumer336
+        run: |
+          bun -e '
+            import pg from "pg";
+            import { readFileSync } from "node:fs";
+            const admin = new pg.Pool({ connectionString: process.env.PG_SUPER_URL });
+            await admin.query("CREATE ROLE hoop LOGIN CREATEROLE");
+            await admin.query("CREATE DATABASE consumer336 OWNER hoop");
+            await admin.end();
+            // Base roles once, as the superuser: the shim service_role
+            // carries BYPASSRLS, which the hoop owner cannot create. The
+            // suite skips these when its sentinel roles already exist.
+            const db = new pg.Pool({ connectionString: process.env.PG_OWNER_URL });
+            const sql = (p) => readFileSync(p, "utf8").split("\n").filter((l) => !l.startsWith("\\")).join("\n");
+            await db.query(sql("supabase/tests/supabase_shim.sql"));
+            for (const f of [
+              "supabase/bootstrap/session_directory_search_worker.sql",
+              "supabase/bootstrap/session_token_verifier.sql",
+              "supabase/bootstrap/session_ingest_roles.sql",
+              "supabase/bootstrap/session_read_api_roles.sql",
+            ]) await db.query(sql(f));
+            await db.query("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+            await db.query("CREATE EXTENSION IF NOT EXISTS btree_gin");
+            await db.end();
+          '
       - name: Prove the owner bootstrap, dedicated role, and writer surface on real Postgres
         env:
           # The native suite self-provisions the migrated schema when it is
           # absent, then bootstraps and proves the role exactly as written.
-          # Trust auth means neither URL carries a credential. The CREATEROLE
-          # non-superuser owner path is proved on local PG17 (PR body); CI
-          # runs the same file as the container superuser on 15/16/17.
-          SESSION_PIPELINE_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
-          SESSION_PIPELINE_TEST_WRITER_PG_URL: postgres://search_consumer_runtime@127.0.0.1:5432/postgres
+          # Trust auth means neither URL carries a credential. The bootstrap
+          # runs as the CREATEROLE non-superuser owner, exactly like the
+          # operator model (a superuser creator gets no membership edge to
+          # pin, so the suite would prove less as postgres).
+          SESSION_PIPELINE_TEST_PG_URL: postgres://hoop@127.0.0.1:5432/consumer336
+          SESSION_PIPELINE_TEST_WRITER_PG_URL: postgres://search_consumer_runtime@127.0.0.1:5432/consumer336
         run: bun test --timeout 300000 src/session-pipeline/__tests__/session-consumer-writer.postgres.test.ts
   consumer-lease:
     name: canonical consumer lease proof (PG ${{ matrix.pg }})

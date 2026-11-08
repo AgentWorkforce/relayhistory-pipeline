@@ -81,20 +81,34 @@ const readSql = (path: string): string =>
     .filter((line) => !line.startsWith("\\"))
     .join("\n");
 
+const BASE_ROLE_FILES = [
+  "supabase/bootstrap/session_directory_search_worker.sql",
+  "supabase/bootstrap/session_token_verifier.sql",
+  "supabase/bootstrap/session_ingest_roles.sql",
+  "supabase/bootstrap/session_read_api_roles.sql",
+];
+
 async function ensureProvisioned(pool: pg.Pool): Promise<void> {
   const { rows } = await pool.query<{ r: string | null }>(
     `SELECT to_regclass('sessions.session_index') AS r`,
   );
   if (rows[0]?.r) return;
-  await pool.query(readSql("supabase/tests/supabase_shim.sql"));
+  // The shim's service_role carries BYPASSRLS, which only a superuser can
+  // create: when the base roles are absent the connected user must be a
+  // superuser (CI pre-provisions them in its setup step, so the owner run
+  // skips this branch). The owner then installs the trusted extensions and
+  // the migration chain itself.
+  const base = await pool.query<{ n: string }>(
+    `SELECT count(*) AS n FROM pg_roles WHERE rolname IN ('service_role', 'anon', 'authenticated')`,
+  );
+  if (base.rows[0]?.n !== "3") {
+    const [{ rolsuper }] = (await pool.query(`SELECT rolsuper FROM pg_roles WHERE rolname = current_user`)).rows as { rolsuper: boolean }[];
+    if (!rolsuper)
+      throw new Error("writer proof needs its base roles once (service_role/anon/authenticated, incl BYPASSRLS): apply supabase_shim + the four bootstrap role files as a superuser, then rerun");
+    await pool.query(readSql("supabase/tests/supabase_shim.sql"));
+    for (const file of BASE_ROLE_FILES) await pool.query(readSql(file));
+  }
   await pool.query("CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin");
-  for (const file of [
-    "supabase/bootstrap/session_directory_search_worker.sql",
-    "supabase/bootstrap/session_token_verifier.sql",
-    "supabase/bootstrap/session_ingest_roles.sql",
-    "supabase/bootstrap/session_read_api_roles.sql",
-  ])
-    await pool.query(readSql(file));
   for (const file of readdirSync(join(repoRoot, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort())
     await pool.query(readSql(`supabase/migrations/${file}`));
   for (const file of readdirSync(join(repoRoot, "src/hoopdb/migrations")).filter((f) => f.endsWith(".sql")).sort())
@@ -236,16 +250,29 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
     expect(role.rows[0]).toMatchObject({ rolcanlogin: true, rolsuper: false });
     const usage = await pool.query(`SELECT has_schema_privilege('search_consumer_runtime','sessions','USAGE') AS u`);
     expect(usage.rows[0]).toMatchObject({ u: true });
-    // Exactly the creator edge, nothing else.
-    const members = await pool.query(
-      `SELECT m.rolname AS member, a.admin_option, a.inherit_option, a.set_option
-       FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
-       WHERE a.roleid = (SELECT oid FROM pg_roles WHERE rolname='search_consumer_runtime')`,
-    );
-    expect(members.rowCount).toBe(1);
-    expect(members.rows[0].admin_option).toBe(true);
-    expect(members.rows[0].inherit_option).toBe(false);
-    expect(members.rows[0].set_option).toBe(false);
+    // The creator edge, pinned exactly where the catalog allows. A
+    // superuser creator gets no automatic admin-membership edge (so CI must
+    // bootstrap as the CREATEROLE owner, like the operator model), and
+    // pg_auth_members only carries inherit_option/set_option on PG16+, so
+    // older servers get the portable invariant instead of the exact shape.
+    const [{ n: versionNum }] = (await pool.query(`SELECT current_setting('server_version_num')::int AS n`)).rows as { n: number }[];
+    const [{ rolsuper }] = (await pool.query(`SELECT rolsuper FROM pg_roles WHERE rolname = current_user`)).rows as { rolsuper: boolean }[];
+    if (!rolsuper && versionNum >= 160000) {
+      const members = await pool.query(
+        `SELECT m.rolname AS member, a.admin_option, a.inherit_option, a.set_option
+         FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+         WHERE a.roleid = (SELECT oid FROM pg_roles WHERE rolname='search_consumer_runtime')`,
+      );
+      expect(members.rowCount).toBe(1);
+      expect(members.rows[0]).toMatchObject({ admin_option: true, inherit_option: false, set_option: false });
+    } else {
+      const edges = await pool.query(
+        `SELECT a.admin_option FROM pg_auth_members a
+         WHERE a.roleid = (SELECT oid FROM pg_roles WHERE rolname='search_consumer_runtime')`,
+      );
+      expect(edges.rowCount).toBeLessThanOrEqual(1);
+      for (const edge of edges.rows) expect(edge.admin_option).toBe(true);
+    }
   }, 180_000);
 
   test("the advisory lock names hashtextextended (typo fails 42883)", async () => {

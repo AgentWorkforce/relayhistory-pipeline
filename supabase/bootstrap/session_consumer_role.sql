@@ -33,6 +33,7 @@ DO $role$
 DECLARE
   v_name text := 'search_consumer_runtime';
   r pg_roles%ROWTYPE;
+  v_version integer := current_setting('server_version_num')::integer;
 BEGIN
   -- Never create or elevate a privileged/built-in name under this file: a
   -- future edit renaming v_name to one of these must fail closed here,
@@ -56,16 +57,28 @@ BEGIN
   END IF;
   -- The creator edge: whoever creates the role unavoidably becomes its
   -- member WITH ADMIN OPTION but no INHERIT and no SET (observed on real
-  -- PG17 for CREATEROLE owners and superusers alike). Tolerate exactly that
-  -- row when the member is the invoker; the writer itself must never be a
-  -- member of another role, and any other membership fails closed.
-  IF EXISTS (SELECT 1 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
-             WHERE (a.roleid = r.oid OR a.member = r.oid)
-               AND NOT (a.roleid = r.oid AND m.rolname = current_user AND a.admin_option
-                        AND NOT a.inherit_option AND NOT a.set_option)) THEN
-    RAISE EXCEPTION USING ERRCODE = '55000',
-      MESSAGE = format('bootstrap %s: the role has memberships beyond the creator edge', v_name),
-      HINT = 'Nothing was changed. Revoke the membership by hand (an operator decision), then rerun.';
+  -- PG16+ for CREATEROLE owners and superusers alike; on PG15 the edge
+  -- carries only the admin flag, and the catalog lacks the other columns).
+  -- Tolerate exactly that row when the member is the invoker; the writer
+  -- itself must never be a member of another role, and any other membership
+  -- fails closed.
+  IF v_version >= 160000 THEN
+    IF EXISTS (SELECT 1 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+               WHERE (a.roleid = r.oid OR a.member = r.oid)
+                 AND NOT (a.roleid = r.oid AND m.rolname = current_user AND a.admin_option
+                          AND NOT a.inherit_option AND NOT a.set_option)) THEN
+      RAISE EXCEPTION USING ERRCODE = '55000',
+        MESSAGE = format('bootstrap %s: the role has memberships beyond the creator edge', v_name),
+        HINT = 'Nothing was changed. Revoke the membership by hand (an operator decision), then rerun.';
+    END IF;
+  ELSE
+    IF EXISTS (SELECT 1 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+               WHERE (a.roleid = r.oid OR a.member = r.oid)
+                 AND NOT (a.roleid = r.oid AND m.rolname = current_user AND a.admin_option)) THEN
+      RAISE EXCEPTION USING ERRCODE = '55000',
+        MESSAGE = format('bootstrap %s: the role has memberships beyond the creator edge', v_name),
+        HINT = 'Nothing was changed. Revoke the membership by hand (an operator decision), then rerun.';
+    END IF;
   END IF;
 END
 $role$;
