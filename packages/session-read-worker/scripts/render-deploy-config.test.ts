@@ -268,6 +268,25 @@ describe("deploy config render, owner_buffered_events", () => {
     expect(flagged).not.toBe(TEMPLATE);
     expect(() => renderDeployConfig(flagged, { ...ON, ownerBufferedEvents: "on" })).toThrow(/leave READ_API_OWNER_BUFFERED_EVENTS unset/);
   });
+
+  test("a template that predeclares READ_API_OWNER_BUFFERED_EVENTS is refused in every mode and for every events value", () => {
+    const flagged = TEMPLATE.replace(/"vars"\s*:\s*\{/, `"vars": { "${OWNER_BUFFERED_EVENTS_VAR}": "on",`);
+    expect(flagged).not.toBe(TEMPLATE);
+    const dispatches: Record<string, RenderInputs> = {
+      "default path (owner_buffered off, gate off)": { hyperdriveId: HD, ownerBuffered: "off" },
+      "gate-only path (owner_buffered off, gate on)": { hyperdriveId: HD, ownerBuffered: "off", bufferedSearchGate: "on" },
+      "valid owner_buffered=on": ON,
+    };
+    for (const [name, base] of Object.entries(dispatches)) {
+      for (const ownerBufferedEvents of [undefined, "", "off", "on"]) {
+        const inputs = { ...base, ownerBufferedEvents };
+        const label = JSON.stringify({ name, ownerBufferedEvents });
+        expect(() => renderDeployConfig(flagged, inputs), label).toThrow(RenderError);
+        expect(() => renderDeployConfig(flagged, inputs), label).toThrow(/must leave READ_API_OWNER_BUFFERED_EVENTS unset/);
+        if (ownerBufferedEvents !== "on" || base === ON) expect(() => renderDeployConfig(TEMPLATE, inputs), label).not.toThrow();
+      }
+    }
+  });
 });
 
 describe("deploy workflow wiring", () => {

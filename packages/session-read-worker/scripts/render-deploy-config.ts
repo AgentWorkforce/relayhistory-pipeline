@@ -37,7 +37,8 @@
  * READ_API_OWNER_BUFFERED_EVENTS=on (the Worker enables it only on exactly "on") to the
  * owner_buffered=on render. owner_buffered_events=off (the default, empty = off) changes nothing:
  * every render is byte-identical to the render before this input existed. Refused: any value other
- * than off/on, on with owner_buffered off, and a template that already declares the var.
+ * than off/on, on with owner_buffered off, and a template that already declares the var (in every
+ * mode and for every owner_buffered_events value, including the default and gate-only renders).
  *
  * The binding is production-scoped by living only in this production deploy's on-render, not in
  * wrangler.jsonc: a wrangler `env` block would rename the script (legacy_env appends -<env>) and
@@ -131,6 +132,14 @@ function leaveUnset(vars: Record<string, string>, keys: readonly string[]): void
   }
 }
 
+/** Refuses a template whose vars already declare the events flag, in every mode; an unparsable template is left to the paths that parse it. */
+function refusePredeclaredEvents(template: string, hyperdriveId: string): void {
+  const parsed = ts.parseConfigFileTextToJson("wrangler.jsonc", renderDefault(template, hyperdriveId));
+  if (parsed.error) return;
+  const vars = (parsed.config as JsoncConfig | undefined)?.vars;
+  if (vars !== null && typeof vars === "object" && OWNER_BUFFERED_EVENTS_VAR in vars) throw new RenderError(`wrangler.jsonc must leave ${OWNER_BUFFERED_EVENTS_VAR} unset`);
+}
+
 export function renderDeployConfig(template: string, inputs: RenderInputs): string {
   if (!/^[0-9a-f]{32}$/.test(inputs.hyperdriveId) || /^0+$/.test(inputs.hyperdriveId)) throw new RenderError("SESSION_READ_HYPERDRIVE_ID must be the Hyperdrive config id (32 hex)");
   if (!template.includes(HYPERDRIVE_PLACEHOLDER)) throw new RenderError("wrangler.jsonc has no Hyperdrive placeholder");
@@ -141,6 +150,7 @@ export function renderDeployConfig(template: string, inputs: RenderInputs): stri
   const eventsMode = (inputs.ownerBufferedEvents ?? "").trim() || "off";
   if (eventsMode !== "off" && eventsMode !== "on") throw new RenderError('owner_buffered_events must be "off" or "on"');
   const events = eventsMode === "on";
+  refusePredeclaredEvents(template, inputs.hyperdriveId);
   const workspacesRaw = (inputs.ownerBufferedWorkspaces ?? "").trim();
   if (events && mode !== "on") throw new RenderError("owner_buffered_events=on needs owner_buffered=on; refusing a flag that would have no effect");
   if (mode === "off") {
