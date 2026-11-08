@@ -89,9 +89,10 @@ async function database(prefix:string,withAcquisition=true):Promise<Db>{
  return d;
 }
 afterAll(async()=>{
- for(const d of dbs.splice(0)){await d.pool.end();await admin!.query("DROP DATABASE "+d.name+" WITH (FORCE)");rmSync(d.dir,{recursive:true,force:true});}
+ for(const d of dbs.splice(0))await dispose(d);
  await admin?.end();
 },60000);
+async function dispose(d:Db){await d.pool.end();await admin!.query("DROP DATABASE "+d.name+" WITH (FORCE)");rmSync(d.dir,{recursive:true,force:true});}
 
 /** One RPC in its own transaction as `role`; `hold` keeps it open (returns commit/rollback). */
 async function rpc(pool:pg.Pool,role:string|null,fn:string,p:unknown,iso=""){
@@ -923,10 +924,16 @@ describe.skipIf(!url)("inbound installer membership is refused by the role boots
   };
   const marker=async(d:Db)=>(await d.pool.query("SELECT status FROM sessions.__96bulls_role_validation WHERE name='session_directory_search_worker'")).rows.map(r=>r.status);
   const owners=async(d:Db)=>(await d.pool.query("SELECT to_regclass('sessions.ingest_acquisition_owners')::text r")).rows[0].r;
+  // The phase 2 role verifiers are cluster-wide by design (session_directory_search_worker_verify.sql: any pg_shdepend
+  // reference to the role from another database fails closed; production keeps one migrated database per cluster). So
+  // before each verifying migrate, every other database this file created (earlier tests run sequentially and are done)
+  // is dropped, and the cluster holds exactly the databases under test. The verifiers themselves are unchanged.
+  const only=async(...keep:Db[])=>{for(const d of dbs.filter(x=>!keep.includes(x))){dbs.splice(dbs.indexOf(d),1);await dispose(d);}
+   expect((await admin!.query("SELECT count(*)::int n FROM pg_database WHERE datname LIKE 'acq\\_%'")).rows[0].n).toBe(keep.length);};
   const BOOT={code:"55000",message:`bootstrap ${INSTALLER}: the role has an unexpected member ${ATTACKER}`};
   const VERIFY={code:"55000",message:"acquisition installer has an unexpected member"};
 
-  const done=await blank("acq_mig_done");
+  const done=await blank("acq_mig_done");await only(done);
   expect(await migrate(done)).toEqual({error:null,verified:true});
   expect(await marker(done)).toEqual(["pass"]);expect(await installerGrants(done.pool)).toBe(4);
   const pg16=Number((await admin!.query("SHOW server_version_num")).rows[0].server_version_num)>=160000;
@@ -952,10 +959,13 @@ describe.skipIf(!url)("inbound installer membership is refused by the role boots
    expect(await migrate(fresh)).toEqual({error:BOOT,verified:false});
    expect(await installerGrants(fresh.pool)).toBe(0);expect(await owners(fresh)).toBeNull();
    expect(await marker(fresh)).toEqual(["pending"]);
-   // REVOKE the membership: both databases migrate, the verifier runs, and the marker passes.
+   // REVOKE the membership: both databases migrate, the verifier runs, and the marker passes. fresh holds no
+   // reference to the worker yet (its bootstrap was refused before any schema step), so done verifies beside it; done
+   // is then dropped so fresh verifies alone (two migrated databases in one cluster fail the worker verifier closed).
    await admin!.query(`REVOKE ${INSTALLER} FROM ${ATTACKER}`);
    expect(await members(done.pool)).toEqual([]);
    for(const d of[done,fresh]){
+    if(d===fresh)await only(fresh);
     expect(await migrate(d)).toEqual({error:null,verified:true});
     expect(await marker(d)).toEqual(["pass"]);expect(await installerGrants(d.pool)).toBe(4);expect(await owners(d)).toBe("sessions.ingest_acquisition_owners");
    }
