@@ -123,7 +123,7 @@ executes, after Khaliq's own OK in his own words; `[missing]` = not in source on
   - The checks use `src/acquisition/db-login.ts:97-112` (LOGIN_SQL, SYSTEM_USER_SQL, MEMBERS_SQL).
   - The connection user may be `<role>.<tenant>` (`POOLER_USER`, `buffered-feed-login.ts:45`). Whether the real
     pooler then reports `backend_user`/`system_user` as the bare base role is not proven by source.
-  - A mismatch fails closed (the feeder refuses), but the proof itself is an operator step (section 8, step 9).
+  - A mismatch fails closed (the feeder refuses), but the proof itself is an operator step (section 8, step 10).
   - 043860 likewise checks only `session_user` for `bulls96_read_api` (`043860...sql:204-206`).
 
 ## 5. Privacy binding
@@ -187,9 +187,17 @@ The clone has no installed dependencies, so the tests below were not executed fo
   - `src/hoopdb/__tests__/sessions-function-boundary.test.ts`
 - CI coverage:
   - `ci.yml` unit-tests runs a real ClickHouse service and the package test scripts (`.github/workflows/ci.yml:24-73`).
-  - `pg-proof.yml` has no job naming the 043860/043870 tests or `buffered-feed-login` against real PostgreSQL
-    (L1-330). Real-PG proof of the feed RPC login guard is `[missing]`. `db-login.postgres.test.ts` covers the
-    shared installer identity queries (L233-237).
+  - `pg-proof.yml` had no job for the 043860/043870 tests or `buffered-feed-login` against real PostgreSQL on
+    main at c858e7fe (L1-330). `db-login.postgres.test.ts` covers the shared installer identity queries
+    (L233-237).
+  - `scripts/pg-proof/role-proof.ts` (around L469) already runs
+    `src/session-pipeline/__tests__/buffered-privacy.postgres.test.ts` inside the pg-proof real-postgres job, so
+    the 043700 owner-buffered privacy guard already has real-PG CI on main.
+  - Real-PG proof of the feed RPC login guard is `[pending #376]`. PR #376 (branch
+    `ci/pg-proof-buffered-feed-gate-login-20261108`, head 5c0dc470) adds
+    `src/session-pipeline/__tests__/buffered-feed-login.postgres.test.ts` and a pg-proof job
+    `buffered-feed-login-postgres` (PostgreSQL 15/16/17) covering 043860+043870 up/down/up and the feed RPC login
+    guard. It becomes closed when #376 merges.
 - Operator-side validation, run read-only by the operator lane only:
   - Both role verifiers, before and after each role step (section 4).
   - Sentinel rows for 043860/043870 in the migration ledger.
@@ -211,8 +219,12 @@ The clone has no installed dependencies, so the tests below were not executed fo
   - It drops the three RPCs and the cursor table (L25-28), so cursor positions are lost. A reapply restarts from
     `since`, and ClickHouse folds identical rows (L3-5).
   - It revokes schema USAGE (L30) and deletes its ledger row (L31-35). Run it with `psql -1 -v ON_ERROR_STOP=1` (L17-18).
-  - The role is KEPT (L6). Any LOGIN granted by the role script stays until reverted. There is no NOLOGIN revert
-    script `[missing]`.
+  - The role is KEPT (L6). Any LOGIN granted by the role script stays until reverted. A NOLOGIN revert script is
+    `[pending #375]`. PR #375 (branch `ops/buffered-feed-runtime-nologin-revert-20261108`, head 6a53ef07) adds
+    `supabase/bootstrap/buffered_search_feed_runtime_role_nologin.sql` (`ALTER ROLE ... NOLOGIN NOINHERIT PASSWORD
+    NULL` inside a transaction, refusing with SQLSTATE 55000 if the role is missing) and a runbook note that
+    NOLOGIN stops new authentication only (pooled connections keep working). Treat the revert as a disarm only
+    once the feeder flag is off and in-flight invocations have finished.
 - 043860 down (`supabase/rollbacks/20261105043860_buffered_search_gate.down.sql`):
   - Turn the gate off first (L3-5).
   - It is refused with 55000 if a later migration such as 043870 is applied (L15-20), so roll back 043870 first.
@@ -232,15 +244,16 @@ Each step is an independent gate. Nothing here is executed from this packet.
 3. [missing] An EventBridge schedule (and/or notification) for `buffered-search-feed`, and Lambda env/secret wiring, in `stacks/aws` (section 2).
 4. [missing] Scope-bound feeder source if a tenant/session canary is wanted (section 10).
 5. [missing] A later-erasure delete lane for buffered ClickHouse rows (section 5).
-6. [operator: needs Khaliq OK] Publish and deploy an image containing c858e7fe. The deployed image 8bb18be5 excludes both PRs.
-7. [operator: needs Khaliq OK] Apply 043860 to the real database as the original creator, then run `session_read_api_role_verify.sql`.
-8. [operator: needs Khaliq OK] Apply the ClickHouse origin-column DDL. It must precede the gate (section 3).
-9. [operator: needs Khaliq OK] Prove on the actual pooler, read-only, that `backend_user`/`system_user` report the base role for each login used. Any mismatch fails closed (dogpatch precondition; section 4).
-10. [operator: needs Khaliq OK] Prove the G2 parity / control-head prerequisites for each owner meant to become visible (section 11).
-11. [operator: needs Khaliq OK] Dispatch the read Worker deploy with `buffered_search_gate=on`. Verify the gate is live and that buffered hits drop or pass as expected.
-12. [operator: needs Khaliq OK] Run the role bootstrap. Apply 043870, then run `buffered_search_feed_runtime_verify.sql` (NOLOGIN profile).
-13. [operator: needs Khaliq OK] Run `buffered_search_feed_runtime_role.sql` (LOGIN). Run the verifier before and after. Load the credential from 1Password into the secret fields.
-14. [operator: needs Khaliq OK] Set `BUFFERED_SEARCH_FEED_GATE_DECLARED=buffered-search-gate/v1`, choose the scope values (section 10), and flip `INGEST_BUFFERED_SEARCH_FEED=on`. Only after step 11 is verified.
+6. [pending #375/#376] NOLOGIN revert script and real-PG CI for the feed login guard (sections 7 and 8).
+7. [operator: needs Khaliq OK] Publish and deploy an image containing c858e7fe. The deployed image 8bb18be5 excludes both PRs.
+8. [operator: needs Khaliq OK] Apply 043860 to the real database as the original creator, then run `session_read_api_role_verify.sql`.
+9. [operator: needs Khaliq OK] Apply the ClickHouse origin-column DDL. It must precede the gate (section 3).
+10. [operator: needs Khaliq OK] Prove on the actual pooler, read-only, that `backend_user`/`system_user` report the base role for each login used. Any mismatch fails closed (dogpatch precondition; section 4).
+11. [operator: needs Khaliq OK] Prove the G2 parity / control-head prerequisites for each owner meant to become visible (section 11).
+12. [operator: needs Khaliq OK] Dispatch the read Worker deploy with `buffered_search_gate=on`. Verify the gate is live and that buffered hits drop or pass as expected.
+13. [operator: needs Khaliq OK] Run the role bootstrap. Apply 043870, then run `buffered_search_feed_runtime_verify.sql` (NOLOGIN profile).
+14. [operator: needs Khaliq OK] Run `buffered_search_feed_runtime_role.sql` (LOGIN). Run the verifier before and after. Load the credential from 1Password into the secret fields.
+15. [operator: needs Khaliq OK] Set `BUFFERED_SEARCH_FEED_GATE_DECLARED=buffered-search-gate/v1`, choose the scope values (section 10), and flip `INGEST_BUFFERED_SEARCH_FEED=on`. Only after step 12 is verified.
 
 Khaliq's rule applies throughout: no canary until the full privacy gate exists. Items 2-5 and the
 residual divergence in section 5 bear on whether the gate is "full"; that call is not made here.
@@ -254,7 +267,7 @@ residual divergence in section 5 bear on whether the gate is "full"; that call i
 5. Is the residual 043700 per-stage/ordinal divergence acceptable for "full privacy gate", given that later erasure is not yet deleted from ClickHouse?
 6. Should `READ_API_REPEATABLE_READ=1` accompany the gate (Hyperdrive behaviour unproven, `design.md:222`)?
 7. How does the operator confirm that every later Worker deploy keeps `buffered_search_gate=on` while the feeder is on?
-8. Is a NOLOGIN revert script for `buffered_search_feed_runtime` required before any LOGIN step?
+8. Is a NOLOGIN revert script for `buffered_search_feed_runtime` required before any LOGIN step? (script now proposed in #375; whether it must land before any LOGIN step stays Khaliq's call)
 
 ## 10. Scope binding
 
