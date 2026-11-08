@@ -267,11 +267,13 @@ const isGateSqlReason = (v: string): v is GateSqlReason => (GATE_SQL_REASONS as 
  * refusal, a timeout) rejects, and the gate drops that owner's hits.
  *
  * Snapshot: each reader call is one STABLE statement, so it judges its hits
- * against one snapshot. The Worker's runner (requestTenantRunner) opens
- * REPEATABLE READ READ ONLY, so the chunks of one owner also share a single
- * snapshot. Under a READ COMMITTED runner (the Lambda's poolTenantRunner,
- * where the gate is not wired) each chunk would take its own snapshot; every
- * verdict would still be self-consistent, but two chunks could differ.
+ * against one snapshot. With READ_API_REPEATABLE_READ=1 the Worker's runner
+ * (requestTenantRunner) opens REPEATABLE READ READ ONLY, so the chunks of one
+ * owner also share a single snapshot. With it off (the default, READ
+ * COMMITTED, as in the Lambda's poolTenantRunner) each chunk takes its own
+ * snapshot: every chunk still fails closed against the state it saw, so no
+ * hit passes a check it failed, but a commit between two chunks can make
+ * hits of one owner on one page be judged against different states.
  */
 export function sqlGateStore(run: TenantRunner): GateStore {
   return {
@@ -279,8 +281,8 @@ export function sqlGateStore(run: TenantRunner): GateStore {
       const out = new Map<string, GateSqlReason | "admission_unknown_reason" | null>();
       if (refs.length === 0) return out;
       // One READ ONLY transaction per owner; one call per MAX_GATE_HITS hits (an event page is
-      // at most 1000 rows, so at most two calls), all in that transaction and, under the
-      // Worker's REPEATABLE READ runner, all on that transaction's one snapshot.
+      // at most 1000 rows, so at most two calls), all in that transaction and, with
+      // READ_API_REPEATABLE_READ=1, all on that transaction's one snapshot.
       const chunks: AdmissionRef[][] = [];
       for (let i = 0; i < refs.length; i += MAX_GATE_HITS) chunks.push(refs.slice(i, i + MAX_GATE_HITS));
       const rows = await run(orgId, workspaceId, async (q: SqlQuery) => {

@@ -11,6 +11,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ClickHouseError, type ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
+import { REPEATABLE_READ_FLAG, repeatableReadEnabled, TENANT_SETTINGS_SQL, tenantBeginSql } from "../liveness.ts";
+import { requestTenantRunner } from "../../../packages/session-read-worker/src/index.ts";
 import {
   CONTROL_HEAD_PATH,
   GATE_SQL,
@@ -522,4 +524,56 @@ test("GATE_SQL_REASONS is exactly the set of drop reasons 043860 can return", ()
     ...[...body.matchAll(/v_gate := '([a-z_]+)'/g)].map((m) => m[1]),
   ]);
   expect([...returned].sort()).toEqual([...GATE_SQL_REASONS].sort());
+});
+
+describe("READ_API_REPEATABLE_READ (Worker tenant transaction isolation, default off)", () => {
+  test("only exactly \"1\" (trimmed) enables; unset, \"0\" and anything else stay off", () => {
+    expect(REPEATABLE_READ_FLAG).toBe("READ_API_REPEATABLE_READ");
+    for (const off of [undefined, "", "0", " 0 ", "true", "on", "yes", "2", "01"]) expect(repeatableReadEnabled(off)).toBe(false);
+    for (const on of ["1", " 1 ", "1\n"]) expect(repeatableReadEnabled(on)).toBe(true);
+    expect(tenantBeginSql(false)).toBe("BEGIN READ ONLY");
+    expect(tenantBeginSql(true)).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  });
+
+  // A fake pg client recording every statement the Worker's runner sends.
+  const fakeClient = (log: string[], failOn?: string) =>
+    ({
+      async query(text: string) {
+        log.push(text);
+        if (failOn && text === failOn) throw new Error("boom");
+        return { rows: [{ n: 1 }] };
+      },
+      async end() {},
+    }) as never;
+
+  const runTwoChunks = async (options?: { repeatableRead?: boolean }) => {
+    const log: string[] = [];
+    const runner = options === undefined ? requestTenantRunner(async () => fakeClient(log)) : requestTenantRunner(async () => fakeClient(log), options);
+    const rows = await runner.run("org-1", "ws-1", async (q) => {
+      await q.query("SELECT 'chunk-1'");
+      return (await q.query<{ n: number }>("SELECT 'chunk-2'")).rows;
+    });
+    await runner.close();
+    return { log, rows };
+  };
+
+  test("off (no option, or repeatableRead false): BEGIN READ ONLY, the pre-flag behaviour", async () => {
+    for (const options of [undefined, {}, { repeatableRead: false }]) {
+      const { log, rows } = await runTwoChunks(options);
+      expect(rows).toEqual([{ n: 1 }]);
+      expect(log).toEqual(["BEGIN READ ONLY", TENANT_SETTINGS_SQL, "SELECT 'chunk-1'", "SELECT 'chunk-2'", "COMMIT"]);
+    }
+  });
+
+  test("on: one REPEATABLE READ READ ONLY transaction holds every statement of the work", async () => {
+    const { log } = await runTwoChunks({ repeatableRead: true });
+    expect(log).toEqual(["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", TENANT_SETTINGS_SQL, "SELECT 'chunk-1'", "SELECT 'chunk-2'", "COMMIT"]);
+  });
+
+  test("on: an error in the work rolls back and rejects (the gate then drops that owner's hits)", async () => {
+    const log: string[] = [];
+    const runner = requestTenantRunner(async () => fakeClient(log, "SELECT 'chunk-2'"), { repeatableRead: true });
+    await expect(runner.run("org-1", "ws-1", async (q) => { await q.query("SELECT 'chunk-1'"); await q.query("SELECT 'chunk-2'"); })).rejects.toThrow("boom");
+    expect(log).toEqual(["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", TENANT_SETTINGS_SQL, "SELECT 'chunk-1'", "SELECT 'chunk-2'", "ROLLBACK"]);
+  });
 });

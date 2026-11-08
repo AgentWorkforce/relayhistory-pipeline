@@ -64,7 +64,7 @@ import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
 import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
-import { sqlLiveness, TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
+import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
 import {
   createBufferedSearchGate,
@@ -102,6 +102,11 @@ export interface Env extends CanonicalEnv {
    * buffered-origin row is dropped.
    */
   READ_API_BUFFERED_SEARCH_GATE?: string;
+  /**
+   * Tenant read transactions at REPEATABLE READ: only "1" enables; unset/"0" (default) keeps
+   * `BEGIN READ ONLY` at READ COMMITTED (see requestTenantRunner).
+   */
+  READ_API_REPEATABLE_READ?: string;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
   /** Exactly "true" also accepts relaycontrol `sh_at_` tokens; default off. */
@@ -190,20 +195,28 @@ export function clickHouseConfig(env: Env) {
  * A TenantRunner over one lazily connected pg client for the request. The
  * Hyperdrive guidance is a client per request (Hyperdrive pools the origin
  * connections), closed after the response. Checks are serialized on the one
- * client, so two transactions never interleave on it. Each transaction is
- * REPEATABLE READ READ ONLY: every statement in it reads ONE snapshot (taken
- * at its first statement), so a check that issues several statements (the
- * buffered search gate's 500-hit chunks, the owner-buffered scope then list)
- * judges them all against the same database state. Every consumer only reads,
- * and a read-only REPEATABLE READ transaction never fails serialization.
+ * client, so two transactions never interleave on it.
+ *
+ * Isolation (READ_API_REPEATABLE_READ, default off): off, each transaction is
+ * `BEGIN READ ONLY` at READ COMMITTED, so every statement takes its own
+ * snapshot. On ("1"), it is REPEATABLE READ READ ONLY: every statement reads
+ * ONE snapshot (taken at its first statement), so a check that issues several
+ * statements (the buffered search gate's 500-hit chunks, the owner-buffered
+ * scope then list) judges them all against the same database state. Every
+ * consumer only reads, and a read-only REPEATABLE READ transaction never fails
+ * serialization. It is flagged because Hyperdrive's handling of it is unproven.
  */
-export function requestTenantRunner(connect: () => Promise<pg.Client>): { run: TenantRunner; close(): Promise<void> } {
+export function requestTenantRunner(
+  connect: () => Promise<pg.Client>,
+  options: { repeatableRead?: boolean } = {},
+): { run: TenantRunner; close(): Promise<void> } {
+  const begin = tenantBeginSql(options.repeatableRead === true);
   let client: Promise<pg.Client> | undefined;
   let tail: Promise<unknown> = Promise.resolve();
   const run: TenantRunner = (orgId, workspaceId, work) => {
     const next = tail.then(async () => {
       const c = await (client ??= connect());
-      await c.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      await c.query(begin);
       try {
         await c.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]);
         const q: SqlQuery = {
@@ -285,7 +298,9 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     log("error", "read worker not configured", { error_code: error instanceof ConfigError ? `missing_${error.field}` : (error as { name?: string })?.name ?? "config" });
     return json(503, "backend_unavailable", "read backend unavailable");
   }
-  const tenant = requestTenantRunner(overrides.connect ?? hyperdriveClient(env.SUPABASE));
+  const tenant = requestTenantRunner(overrides.connect ?? hyperdriveClient(env.SUPABASE), {
+    repeatableRead: repeatableReadEnabled(env.READ_API_REPEATABLE_READ),
+  });
   const app = createReadApi({
     timing: timingDeps(env, tenant.run, overrides.fetcher),
     turns: turnsDeps(env, tenant.run, overrides.fetcher),
