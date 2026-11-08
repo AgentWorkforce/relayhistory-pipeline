@@ -11,7 +11,7 @@ import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
 import { relaycontrolLogin, type AuthConfig } from "../auth.ts";
 import type { CanonicalIdentity } from "../canonical.ts";
 import type { CanonicalRows } from "../session-timing-source.ts";
-import { CATALOG_MAX_ITEMS, catalogFromCanonical, parseSelfhostReadApi, type CatalogDeps, type SelfhostDeps } from "../selfhost.ts";
+import { CATALOG_MAX_ITEMS, catalogFromCanonical, parseSelfhostLoginSync, parseSelfhostReadApi, type CatalogDeps, type SelfhostDeps } from "../selfhost.ts";
 import { readAppFromSecret } from "../lambda.ts";
 import { memoryLiveness } from "./support.ts";
 
@@ -313,6 +313,39 @@ describe("POST /v1/cli/login", () => {
     const r401 = await expired.login({ agentRelayToken: TOKEN });
     expect(r401.status).toBe(401);
     expect((await json(r401)).error.code).toBe("token_expired");
+  });
+
+  test("Pattern A (syncServed): rth:sync is advertised only when introspection granted it", async () => {
+    const granted = (scopes: string[]) => relaycontrolLogin(config, stub(() => Response.json(active({ scopes }))).introspector);
+    const both = await api({ selfhost: { syncServed: true, login: granted(["rth:read", "rth:sync"]) } }).login({ agentRelayToken: TOKEN });
+    expect(both.status).toBe(200);
+    expect((await json(both)).scopes).toEqual(["rth:read", "rth:sync"]);
+    // Not granted: not advertised, even with the edge serving sync.
+    const readOnly = await api({ selfhost: { syncServed: true, login: granted(["rth:read"]) } }).login({ agentRelayToken: TOKEN });
+    expect((await json(readOnly)).scopes).toEqual(["rth:read"]);
+    // Unknown spellings never become rth:sync (the introspector's allowlist, then this handler's).
+    const odd = await api({ selfhost: { syncServed: true, login: granted(["rth:read", "RTH:SYNC", "rth:sync:all"]) } }).login({ agentRelayToken: TOKEN });
+    expect((await json(odd)).scopes).toEqual(["rth:read"]);
+    // A sync-only grant still cannot log in: login is the read surface and requires rth:read.
+    const syncOnly = await api({ selfhost: { syncServed: true, login: granted(["rth:sync"]) } }).login({ agentRelayToken: TOKEN });
+    expect([syncOnly.status, (await json(syncOnly)).error.code]).toEqual([403, "forbidden"]);
+  });
+
+  test("parseSelfhostLoginSync: strict, needs the self-host read API, never echoes", () => {
+    expect(parseSelfhostLoginSync({})).toBe(false);
+    expect(parseSelfhostLoginSync({ RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC: "false" })).toBe(false);
+    expect(parseSelfhostLoginSync({ RELAYHISTORY_SELFHOST_READ_API: "true", RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC: "true" })).toBe(true);
+    expect(() => parseSelfhostLoginSync({ RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC: "true" })).toThrow(/needs RELAYHISTORY_SELFHOST_READ_API=true/);
+    for (const bad of ["TRUE", "1", "secret-ish"]) {
+      let message = "";
+      try {
+        parseSelfhostLoginSync({ RELAYHISTORY_SELFHOST_READ_API: "true", RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC: bad });
+      } catch (error) {
+        message = String(error);
+      }
+      expect(message).toContain("must be unset");
+      expect(message).not.toContain("secret-ish");
+    }
   });
 
   test("GET on the login path is not a login", async () => {

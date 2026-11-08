@@ -13,6 +13,7 @@ case "${SERVICE:-}" in
   session-brief)    exec bun run /app/src/session-brief/main.ts ;;
   acquisition)      exec bun run /app/src/acquisition/main.ts ;;
   session-read-api) exec bun run /app/src/session-read-api/server.ts ;;
+  session-ingest)   exec bun run /app/src/session-ingest/selfhost-server.ts ;;
   session-publication) exec bun run /app/src/session-ingest/publication-service.ts --continuous ;;
   *) echo "96bulls: unknown SERVICE='${SERVICE:-}'" >&2; exit 2 ;;
 esac

@@ -112,6 +112,8 @@ import {
  * relaycontrol refuses mode=sync when the login reply lacks `rth:sync`.
  */
 const SERVED_SCOPES = ["rth:read"] as const;
+/** Pattern A (SelfhostDeps.syncServed): the self-host ingest edge serves sync for this origin. */
+const SERVED_SCOPES_WITH_SYNC = ["rth:read", "rth:sync"] as const;
 
 export interface VerifiedIdentity {
   userId: string;
@@ -383,8 +385,10 @@ export function createReadApi(deps: ReadApiDeps) {
         const at = now();
         const expiresAtMs = Math.min(grant.expiresAtMs, at + LOGIN_MAX_TTL_MS);
         if (!(expiresAtMs > at)) return loginError(c, 401, "token_expired", "token has expired");
-        // Read-only backend: advertise only the scopes served here (never rth:sync), after canary and expiry.
-        const scopes = grant.identity.scopes.filter((s) => (SERVED_SCOPES as readonly string[]).includes(s));
+        // Advertise only the scopes served here, after canary and expiry: never rth:sync, unless the
+        // self-host ingest edge serves it (syncServed) AND introspection granted it.
+        const served: readonly string[] = selfhost.syncServed === true ? SERVED_SCOPES_WITH_SYNC : SERVED_SCOPES;
+        const scopes = grant.identity.scopes.filter((s) => served.includes(s));
         if (scopes.length === 0) return loginError(c, 403, "forbidden", "missing required scope: rth:read");
         const expiresAt = new Date(expiresAtMs).toISOString();
         log({ route: "/v1/cli/login", reason: "cli_login", status: 200, workspace_id: grant.identity.workspaceId, correlation_id: c.get("correlationId") });
