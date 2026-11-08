@@ -24,6 +24,14 @@
  * The S3 credentials are the Worker's existing PIPELINE_RAW_S3_ACCESS_KEY_ID /
  * _SECRET_ACCESS_KEY secrets (wrangler secret put); the workflow checks they exist by name.
  *
+ * buffered_search_gate=on (src/session-read-api/buffered-search-gate.ts, PR #338): the per-hit
+ * privacy gate for buffered-origin search rows. Adds vars READ_API_BUFFERED_SEARCH_GATE=on (the
+ * Worker enables the gate only on exactly "on") and the same pinned HISTORY_CONTROL_HEAD binding
+ * the gate reads; independent of owner_buffered (no workspace list, no S3). With owner_buffered=on
+ * as well the binding is rendered once. buffered_search_gate=off (the default, empty = off) changes
+ * nothing: every render is byte-identical to the render before this input existed. Refused: any
+ * value other than off/on, and a template that already declares services, env or the gate var.
+ *
  * The binding is production-scoped by living only in this production deploy's on-render, not in
  * wrangler.jsonc: a wrangler `env` block would rename the script (legacy_env appends -<env>) and
  * does not inherit hyperdrive/vars/services, so it would either deploy a second Worker or
@@ -31,7 +39,8 @@
  *
  * CLI: reads wrangler.jsonc and the env below, writes wrangler.deploy.jsonc, prints no value.
  *   HYPERDRIVE_ID, OWNER_BUFFERED (off|on; empty = off), OWNER_BUFFERED_WORKSPACES,
- *   OWNER_BUFFERED_S3_BUCKET, OWNER_BUFFERED_S3_REGION, DIRECTORY_WORKSPACES.
+ *   OWNER_BUFFERED_S3_BUCKET, OWNER_BUFFERED_S3_REGION, DIRECTORY_WORKSPACES,
+ *   BUFFERED_SEARCH_GATE (off|on; empty = off).
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -46,6 +55,9 @@ export const CONTROL_HEAD_BINDING = Object.freeze({
   entrypoint: "SessionReadPrivacyControls",
 });
 
+/** The buffered search gate flag (#338 index.ts Env; parseBufferedSearchGate accepts only "on"). */
+export const BUFFERED_SEARCH_GATE_VAR = "READ_API_BUFFERED_SEARCH_GATE";
+
 export interface RenderInputs {
   hyperdriveId: string;
   /** The workflow_dispatch input; "" (no input) = off. */
@@ -55,6 +67,8 @@ export interface RenderInputs {
   s3Region?: string;
   /** READ_API_DIRECTORY_WORKSPACES as deployed; owner-buffered is served only where both lists allow. */
   directoryWorkspaces?: string;
+  /** The buffered_search_gate workflow_dispatch input; "" (no input) = off. */
+  bufferedSearchGate?: string;
 }
 
 export class RenderError extends Error {
@@ -88,14 +102,39 @@ function renderDefault(template: string, hyperdriveId: string): string {
     .join("\n");
 }
 
+type JsoncConfig = Record<string, unknown> & { vars?: Record<string, string>; services?: unknown; env?: unknown };
+
+/** The default render parsed, refusing a template that already binds services or declares env. */
+function parseRendered(template: string, hyperdriveId: string): JsoncConfig {
+  const parsed = ts.parseConfigFileTextToJson("wrangler.jsonc", renderDefault(template, hyperdriveId));
+  if (parsed.error) throw new RenderError("wrangler.jsonc is not valid JSONC");
+  const config = parsed.config as JsoncConfig;
+  if (config.services !== undefined || config.env !== undefined) throw new RenderError("wrangler.jsonc must not declare services or env; the binding is added here only");
+  return config;
+}
+
+function leaveUnset(vars: Record<string, string>, keys: readonly string[]): void {
+  for (const k of keys) {
+    if (k in vars) throw new RenderError(`wrangler.jsonc must leave ${k} unset`);
+  }
+}
+
 export function renderDeployConfig(template: string, inputs: RenderInputs): string {
   if (!/^[0-9a-f]{32}$/.test(inputs.hyperdriveId) || /^0+$/.test(inputs.hyperdriveId)) throw new RenderError("SESSION_READ_HYPERDRIVE_ID must be the Hyperdrive config id (32 hex)");
   if (!template.includes(HYPERDRIVE_PLACEHOLDER)) throw new RenderError("wrangler.jsonc has no Hyperdrive placeholder");
+  const gateMode = (inputs.bufferedSearchGate ?? "").trim() || "off";
+  if (gateMode !== "off" && gateMode !== "on") throw new RenderError('buffered_search_gate must be "off" or "on"');
+  const gate = gateMode === "on";
   const mode = (inputs.ownerBuffered ?? "").trim() || "off";
   const workspacesRaw = (inputs.ownerBufferedWorkspaces ?? "").trim();
   if (mode === "off") {
     if (workspacesRaw) throw new RenderError("owner_buffered_workspaces is set but owner_buffered is off; refusing an ambiguous dispatch");
-    return renderDefault(template, inputs.hyperdriveId);
+    if (!gate) return renderDefault(template, inputs.hyperdriveId);
+    // Gate only: the pinned binding and the flag, nothing owner-buffered.
+    const config = parseRendered(template, inputs.hyperdriveId);
+    const vars = config.vars ?? {};
+    leaveUnset(vars, [BUFFERED_SEARCH_GATE_VAR]);
+    return `${JSON.stringify({ ...config, services: [{ ...CONTROL_HEAD_BINDING }], vars: { ...vars, [BUFFERED_SEARCH_GATE_VAR]: "on" } }, null, 2)}\n`;
   }
   if (mode !== "on") throw new RenderError('owner_buffered must be "off" or "on"');
 
@@ -114,14 +153,10 @@ export function renderDeployConfig(template: string, inputs: RenderInputs): stri
   const region = (inputs.s3Region ?? "").trim();
   if (!REGION.test(region)) throw new RenderError("owner_buffered=on needs SESSION_READ_INGEST_S3_REGION (e.g. us-east-1)");
 
-  const parsed = ts.parseConfigFileTextToJson("wrangler.jsonc", renderDefault(template, inputs.hyperdriveId));
-  if (parsed.error) throw new RenderError("wrangler.jsonc is not valid JSONC");
-  const config = parsed.config as Record<string, unknown> & { vars?: Record<string, string>; services?: unknown; env?: unknown };
-  if (config.services !== undefined || config.env !== undefined) throw new RenderError("wrangler.jsonc must not declare services or env; the binding is added here only");
+  const config = parseRendered(template, inputs.hyperdriveId);
   const vars = config.vars ?? {};
-  for (const k of ["RELAYHISTORY_READ_OWNER_BUFFERED", "READ_API_OWNER_BUFFERED_WORKSPACES", "INGEST_S3_BUCKET", "INGEST_S3_REGION"]) {
-    if (k in vars) throw new RenderError(`wrangler.jsonc must leave ${k} unset`);
-  }
+  leaveUnset(vars, ["RELAYHISTORY_READ_OWNER_BUFFERED", "READ_API_OWNER_BUFFERED_WORKSPACES", "INGEST_S3_BUCKET", "INGEST_S3_REGION"]);
+  if (gate) leaveUnset(vars, [BUFFERED_SEARCH_GATE_VAR]);
   const rendered = {
     ...config,
     services: [{ ...CONTROL_HEAD_BINDING }],
@@ -131,6 +166,8 @@ export function renderDeployConfig(template: string, inputs: RenderInputs): stri
       READ_API_OWNER_BUFFERED_WORKSPACES: workspaces.join(","),
       INGEST_S3_BUCKET: bucket,
       INGEST_S3_REGION: region,
+      // One binding serves both readers; the gate adds only its flag.
+      ...(gate ? { [BUFFERED_SEARCH_GATE_VAR]: "on" } : {}),
     },
   };
   return `${JSON.stringify(rendered, null, 2)}\n`;
@@ -146,11 +183,15 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       s3Bucket: process.env.OWNER_BUFFERED_S3_BUCKET,
       s3Region: process.env.OWNER_BUFFERED_S3_REGION,
       directoryWorkspaces: process.env.DIRECTORY_WORKSPACES,
+      bufferedSearchGate: process.env.BUFFERED_SEARCH_GATE,
     });
     writeFileSync(here("../wrangler.deploy.jsonc"), out);
     const on = ((process.env.OWNER_BUFFERED ?? "").trim() || "off") === "on";
     const all = (process.env.OWNER_BUFFERED_WORKSPACES ?? "").trim() === ALL_WORKSPACES;
-    console.log(on ? `deploy config: owner-buffered ON (${all ? "all workspaces" : "canary list"}), ${CONTROL_HEAD_BINDING.binding} -> ${CONTROL_HEAD_BINDING.service}#${CONTROL_HEAD_BINDING.entrypoint}` : "deploy config: owner-buffered off (Hyperdrive id only)");
+    const gate = ((process.env.BUFFERED_SEARCH_GATE ?? "").trim() || "off") === "on";
+    const binding = `${CONTROL_HEAD_BINDING.binding} -> ${CONTROL_HEAD_BINDING.service}#${CONTROL_HEAD_BINDING.entrypoint}`;
+    console.log(on ? `deploy config: owner-buffered ON (${all ? "all workspaces" : "canary list"}), ${binding}` : gate ? "deploy config: owner-buffered off" : "deploy config: owner-buffered off (Hyperdrive id only)");
+    if (gate) console.log(`deploy config: buffered search gate ON, ${BUFFERED_SEARCH_GATE_VAR}=on, ${binding}${on ? " (shared with owner-buffered, rendered once)" : ""}`);
   } catch (error) {
     console.error(`::error::${error instanceof RenderError ? error.message : "render failed"}`);
     process.exit(1);

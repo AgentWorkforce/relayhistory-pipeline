@@ -185,3 +185,5 @@ The wire is whatever #328 at a06a58f9 emits, and the parser's key set and consta
 - the control head is observed for exactly that (org, workspace, user).
 
 Tested in `src/session-read-api/__tests__/owner-buffered.routes.test.ts`.
+
+**Buffered search gate deploy input.** `READ_API_BUFFERED_SEARCH_GATE` (#338, `src/session-read-api/buffered-search-gate.ts`; only `on` enables) reads the same `HISTORY_CONTROL_HEAD` binding. Both are unset in `wrangler.jsonc`. Only a deploy dispatch with `buffered_search_gate=on` renders them: the flag `on` plus the pinned binding, rendered once when `owner_buffered=on` too. The gate needs no workspace list and no S3 vars. `off` (the default) renders byte-identically to a deploy without the input. Deploy the gate before the buffered search feeder (#339) is enabled. The dispatch is Khaliq's call (runbooks/sessions-prod-session-read-worker.md, "Buffered search gate").
