@@ -99,6 +99,7 @@ test("current ledger/source/gen/plan/capture/wrapper/manual exception are exact 
     { execution: "future-github" },
     { sourceSha: "e".repeat(40) },
     { ledgerSha256: "f".repeat(64) },
+    { ledgerSha256: "502349fe27871cb12de3fb93d8b02c3a1ece691ad500c1d7a6b2176dbed66502" },
     { ledgerSha256: "3173f2df7f749fd79c340286f3284d91d8f5a8b988b7f1b1a11e01c3a3307641" },
     { planSha256: "f".repeat(64) },
     { captureSha256: "f".repeat(64) },
@@ -330,10 +331,23 @@ test("backend identity drift refuses the next canonical SQL before submission", 
   expect(x.calls.some((q) => q.includes("CREATE TABLE"))).toBe(false);
 });
 
-test("the next owner window requires the verified 56-step G2 ledger", () => {
+test("the next owner window requires the verified 57-step G3 ledger", () => {
   expect(A.ledger).toBe(
-    "502349fe27871cb12de3fb93d8b02c3a1ece691ad500c1d7a6b2176dbed66502",
+    "7c9eac7c58d508af213282e237245ad0ea1f99353940d9772b6acff3c1bba1b0",
   );
+});
+
+test("a plan, capture or approval from the G2 ledger cannot authorize the next window", async () => {
+  const x = await evidence(),
+    p = JSON.parse(x.planText);
+  const g2 = { ledgerSha256: "502349fe27871cb12de3fb93d8b02c3a1ece691ad500c1d7a6b2176dbed66502" };
+  expect(() => validateReadonlyPlan(JSON.stringify({ ...p, ...g2 }), pin, now)).toThrow("owner_plan_binding");
+  expect(() => validateOwnerApply(
+    x.planText, JSON.stringify({ ...x.capture, ...g2 }), JSON.stringify(x.approval), pin, x.wrapper, now,
+  )).toThrow("owner_capture_binding");
+  expect(() => validateOwnerApply(
+    x.planText, JSON.stringify(x.capture), JSON.stringify({ ...x.approval, ...g2 }), pin, x.wrapper, now,
+  )).toThrow();
 });
 
 test("a capture from the pre-G2 ledger cannot authorize the next window", async () => {
