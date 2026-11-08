@@ -1,8 +1,9 @@
 /**
  * Opt-in OWNED PostgreSQL (SESSION_INGEST_TEST_PG_URL, loopback fixture only): two/three-connection proof of
  * 20261105043500_lazy_claim_clock_narrowing. Claims read the singleton seat clock under KEY SHARE and serialize
- * per native slot key on a sorted transaction advisory lock, so a claim no longer queues behind another user's
- * claim; same-key racers serialize and the loser takes the P0W01 ownership path, never 23505/40001.
+ * per (org, workspace, origin) on ONE transaction advisory lock, so a claim of another origin no longer queues
+ * behind it; same-origin claims serialize and a same-key loser takes the P0W01 ownership path, never 23505/40001.
+ * F1/F2 bound the advisory footprint (one lock per claim, never one per record: 53200 safety).
  * Claim/commit payloads are captured from the real deliverBatch -> sqlLedger path and replayed on held connections.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
@@ -34,7 +35,7 @@ const text = (path: string) => readFileSync(join(root, path), "utf8").split("\n"
 const CLAIM = "SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS result";
 const COMMIT = "SELECT sessions.ingest_commit_buffered_batch($1::jsonb) AS result";
 type Tenant = typeof TENANT;
-type Opts = { current?: SourceCurrentRecord | null; fenced?: boolean; revision?: number };
+type Opts = { current?: SourceCurrentRecord | null; fenced?: boolean; revision?: number; origin?: string };
 type Held = { client: PoolClient; pid: number; done: Promise<{ ok: true; result: any } | { ok: false; code: string; message: string }> };
 
 describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)", () => {
@@ -72,7 +73,8 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
       operation: r.operation, catalogAcceptedSeq: null, projectionAcceptedSeq: "17" };
   }
   async function raw(t: Tenant, id: string, ids: string[], opts: Opts) {
-    return batch(ids.map((rid) => record({ record_id: rid, revision: opts.revision ?? 2, session_id: rid + "-s" })), { batch_id: id, account_id: await deliveryAccount(t) });
+    const origin = opts.origin ? { origin_id: opts.origin } : {};
+    return batch(ids.map((rid) => record({ record_id: rid, revision: opts.revision ?? 2, session_id: rid + "-s", ...origin })), { batch_id: id, account_id: await deliveryAccount(t), ...origin });
   }
   /** Full real delivery (claim, stage, staged ACK). */
   async function deliver(t: Tenant, id: string, ids: string[], opts: Opts = {}) {
@@ -125,7 +127,14 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
   const slots = async (rid: string) => (await pool.query("SELECT current_owner FROM sessions.ingest_lazy_native_slots WHERE record_id=$1", [rid])).rows;
   const custodyRows = async (rid: string) => Number((await pool.query("SELECT count(*) n FROM sessions.ingest_custody_records WHERE record_id=$1", [rid])).rows[0].n);
   const lastSeat = async () => (await pool.query("SELECT last_seat::text s FROM sessions.ingest_receipt_seat_clock WHERE singleton")).rows[0].s as string;
-  const ackClockMode = async () => /WHERE singleton FOR NO KEY UPDATE;/.test((await pool.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0].prosrc) ? "no key update" : "update";
+  /** pg_advisory_xact_lock(bigint) as pg_locks shows it: classid = high 32 bits, objid = low 32 bits, objsubid = 1. */
+  const originLock = async (origin: string) => (await pool.query(
+    "SELECT ((k>>32)&4294967295)::text classid,(k&4294967295)::text objid FROM(SELECT hashtextextended(jsonb_build_array('96bulls:lazy-native-origin-v1',$1::text,$2::text,$3::text)::text,0) k)s",
+    [TENANT.orgId, TENANT.workspaceId, origin])).rows[0] as { classid: string; objid: string };
+  const advisory = async (pids: number[]) => (await pool.query(
+    "SELECT pid,classid::text::bigint::text classid,objid::text::bigint::text objid,objsubid,mode,granted FROM pg_locks WHERE locktype='advisory' AND pid=ANY($1::int[]) ORDER BY pid,classid,objid",
+    [pids])).rows as { pid: number; classid: string; objid: string; objsubid: number; mode: string; granted: boolean }[];
+  const ids500 = (label: string) => Array.from({ length: 500 }, (_, i) => `${label}-${serial}-${i}`);
 
   beforeAll(async () => {
     admin = new pg.Client({ connectionString: url }); await admin.connect();
@@ -134,7 +143,8 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     name = "claim_clock_" + crypto.randomUUID().replaceAll("-", "");
     await admin.query("CREATE DATABASE " + name);
     const target = new URL(url!); target.pathname = "/" + name;
-    pool = new pg.Pool({ connectionString: target.href, max: 12 });
+    // 16 + admin stays within the constrained pg-proof server (max_connections=20, superuser connections).
+    pool = new pg.Pool({ connectionString: target.href, max: 16 });
     scratch = scratchStore();
     await pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");
     const c = await connect(); try { await runMigrations(c, { profile }); } finally { await release(c); }
@@ -157,13 +167,13 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     if (admin) { if (name) await admin.query("DROP DATABASE IF EXISTS " + name + " WITH(FORCE)"); await admin.end(); }
   }, 30000);
 
-  test("A1: while X holds an open claim, Y's claim of a different key proceeds; with the 055000 bodies it queues on the clock (55P03 under lock_timeout)", async () => {
+  test("A1: while X holds an open claim, Y's claim from a DIFFERENT origin proceeds; with the 055000 bodies it queues on the clock (55P03 under lock_timeout)", async () => {
     const run = async () => {
       const x = tenant("a1x"), y = tenant("a1y");
       await warm(x, y);
-      const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `a1x-${serial}`, [`a1-x-${serial}`]));
+      const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `a1x-${serial}`, [`a1-x-${serial}`], { origin: `a1-ox-${serial}` }));
       expect((await hx.done).ok).toBe(true);
-      const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `a1y-${serial}`, [`a1-y-${serial}`]), "SET LOCAL lock_timeout=750");
+      const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `a1y-${serial}`, [`a1-y-${serial}`], { origin: `a1-oy-${serial}` }), "SET LOCAL lock_timeout=750");
       const y1 = await hy.done;
       await finish(hy, "COMMIT"); await finish(hx, "COMMIT");
       return y1;
@@ -177,7 +187,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect((await pool.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.ingest_lazy_records(jsonb)'::regprocedure")).rows[0].prosrc).toContain("lazy-native-origin-v1");
   }, 60000);
 
-  test("A2: same owned key -- Y waits on the per-key advisory lock, then gets P0W01 (never 23505/40001); one slot, one custody row", async () => {
+  test("A2: same owned key -- Y waits on the origin advisory lock, then gets P0W01 (never 23505/40001); one slot, one custody row", async () => {
     const x = tenant("a2x"), y = tenant("a2y"), rid = `a2-${serial}`, cur = await current(x, rid);
     await warm(x, y);
     const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `a2x-${serial}`, [rid], { current: cur }));
@@ -192,7 +202,8 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect(await custodyRows(rid)).toBe(1);
   }, 60000);
 
-  test("A2b: same source-absent key -- Y waits, then finds X's NULL-owned slot and CONTINUEs (pre-fix race: 23505)", async () => {
+  // Pre-fix (055000) Y queued on the clock FOR UPDATE instead (55P03 under the 2s lock_timeout when loaded).
+  test("A2b: same source-absent key -- Y waits on the origin advisory lock, then finds X's NULL-owned slot and CONTINUEs", async () => {
     const x = tenant("a2bx"), y = tenant("a2by"), rid = `a2b-${serial}`;
     await warm(x, y);
     const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `a2bx-${serial}`, [rid]));
@@ -220,6 +231,87 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect(await slots(rid)).toEqual([{ current_owner: y.userId }]);
   }, 60000);
 
+  test("A3b: same origin, overlapping keys -- Y serializes behind X on the one origin lock; one slot per key, no double owner", async () => {
+    const x = tenant("a3bx"), y = tenant("a3by"), origin = `a3b-o-${serial}`, k = [0, 1, 2].map((i) => `a3b-${serial}-${i}`);
+    await warm(x, y);
+    const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `a3bx-${serial}`, [k[0]!, k[1]!], { origin }));
+    expect((await hx.done).ok).toBe(true);
+    const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `a3by-${serial}`, [k[1]!, k[2]!], { origin }));
+    await waitAdvisory(hy.pid); await waitBlockedBy(hy.pid, hx.pid);
+    expect(await settled(hy.done, 200)).toBe(false);
+    await finish(hx, "COMMIT");
+    expect(await hy.done).toMatchObject({ ok: true });
+    await finish(hy, "COMMIT");
+    for (const rid of k) expect(await slots(rid)).toEqual([{ current_owner: null }]);
+    // Staged ACKs then own: X its keys, Y only the key nobody owns (the shared key is X's: Y gets P0W01, 403).
+    expect((await deliver(x, `a3bx2-${serial}`, [k[0]!, k[1]!], { origin, revision: 3 })).outcome).toBe("accepted_buffered");
+    const y2 = await deliver(y, `a3by2-${serial}`, [k[1]!, k[2]!], { origin, revision: 3 }).then(() => null, (e: any) => e);
+    expect(y2?.status).toBe(403);
+    expect((await deliver(y, `a3by3-${serial}`, [k[2]!], { origin, revision: 3 })).outcome).toBe("accepted_buffered");
+    expect([await slots(k[0]!), await slots(k[1]!), await slots(k[2]!)]).toEqual([[{ current_owner: x.userId }], [{ current_owner: x.userId }], [{ current_owner: y.userId }]]);
+  }, 60000);
+
+  test("F1: a 500-record claim holds exactly ONE advisory lock (the origin key); another origin never waits on it, the same origin does", async () => {
+    const x = tenant("f1x"), y = tenant("f1y"), z = tenant("f1z"), origin = `f1-o-${serial}`;
+    await warm(x, y, z);
+    const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `f1x-${serial}`, ids500("f1x"), { origin }));
+    expect(await hx.done).toMatchObject({ ok: true });
+    const want = await originLock(origin);
+    const locks = await advisory([hx.pid]);
+    expect(locks.length).toBeLessThanOrEqual(1); // upper bound: the origin lock only (the fence is a row lock)
+    expect(locks).toEqual([{ pid: hx.pid, classid: want.classid, objid: want.objid, objsubid: 1, mode: "ExclusiveLock", granted: true }]);
+    const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `f1y-${serial}`, [`f1-y-${serial}`], { origin: `f1-other-${serial}` }));
+    expect(await settled(hy.done, 2000)).toBe(true);
+    expect(await hy.done).toMatchObject({ ok: true });
+    const hz = await hold(CLAIM, await capture("ingest_claim_buffered_batch", z, `f1z-${serial}`, [`f1-z-${serial}`], { origin }));
+    await waitAdvisory(hz.pid); await waitBlockedBy(hz.pid, hx.pid);
+    expect(await settled(hz.done, 200)).toBe(false);
+    await finish(hx, "COMMIT");
+    expect(await hz.done).toMatchObject({ ok: true });
+    await finish(hz, "COMMIT"); await finish(hy, "COMMIT");
+  }, 120000);
+
+  test("F2: K simultaneously held 500-record claims never raise 53200; total advisory locks <= K (causal when K*500 exceeds the measured lock capacity)", async () => {
+    const show = async (n: string) => Number((await pool.query("SHOW " + n)).rows[0][n]);
+    const names = ["max_locks_per_transaction", "max_connections", "max_prepared_transactions", "autovacuum_max_workers", "max_worker_processes", "max_wal_senders", "superuser_reserved_connections"];
+    const cfg: Record<string, number> = {};
+    for (const n of names) cfg[n] = await show(n);
+    // Lock table sizing as PostgreSQL computes it (MaxBackends includes the reserves); recorded only -- the shared
+    // hash has slack beyond it, so capacity is MEASURED below, never inferred from this number.
+    const maxBackends = cfg.max_connections! + cfg.autovacuum_max_workers! + 1 + cfg.max_worker_processes! + cfg.max_wal_senders!;
+    const nominalLockTable = cfg.max_locks_per_transaction! * (maxBackends + cfg.max_prepared_transactions!);
+    // Measured capacity: advisory locks one transaction can take before 53200 (rolled back at once; nothing else
+    // runs on this disposable fixture server meanwhile). Pre-fix, K claims of 500 keys took K*500 such entries.
+    const maxHeld = 10, cap = (maxHeld + 1) * 500, chunk = 100;
+    const probe = await connect(); let capacity = 0, probeCode = "none";
+    try {
+      await probe.query("BEGIN");
+      for (; capacity < cap; capacity += chunk) {
+        const e = await probe.query("SELECT count(pg_advisory_xact_lock(k)) FROM generate_series($1::bigint,$2::bigint) k", [-9e15 + capacity, -9e15 + capacity + chunk - 1]).then(() => null, (x: any) => x);
+        if (e) { probeCode = String(e.code); break; }
+      }
+    } finally { await release(probe); }
+    const constrained = probeCode === "53200";
+    if (!constrained) expect(probeCode).toBe("none");
+    const k = constrained ? Math.floor(capacity / 500) + 1 : 3;
+    console.log(JSON.stringify({ proof: "claim-clock-lock-53200", ...cfg, maxBackends, nominalLockTable, measuredAdvisoryCapacity: constrained ? `<${capacity + chunk}` : `>=${cap}`,
+      constrained, heldClaims: k, preFixAdvisoryFootprint: k * 500 }));
+    if (constrained) expect(k * 500).toBeGreaterThan(capacity + chunk - 1);
+    expect(k).toBeLessThanOrEqual(maxHeld);
+    const ts = Array.from({ length: k }, (_, i) => tenant(`f2-${i}`));
+    await warm(...ts);
+    const payloads: string[] = [];
+    for (const [i, t] of ts.entries()) payloads.push(await capture("ingest_claim_buffered_batch", t, `f2-${i}-${serial}`, ids500(`f2-${i}`), { origin: `f2-o${i}-${serial}` }));
+    const hs = await Promise.all(payloads.map((p) => hold(CLAIM, p)));
+    const results = await Promise.all(hs.map((h) => h.done));
+    // All K claims hold their transactions (and locks) open here, simultaneously.
+    const locks = await advisory(hs.map((h) => h.pid));
+    expect(results.map((r) => (r.ok ? "ok" : r.code))).toEqual(Array(k).fill("ok"));
+    expect(locks.length).toBeLessThanOrEqual(k);
+    expect(new Set(locks.map((l) => l.pid)).size).toBe(locks.length);
+    for (const h of hs) await finish(h, "ROLLBACK");
+  }, 300000);
+
   test("A4: 50 rounds of concurrent claims over the same two keys in reversed order never deadlock (no 40P01)", async () => {
     const codes: string[] = [];
     for (let i = 0; i < 50; i++) {
@@ -243,10 +335,10 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect((await hx.done).ok).toBe(true);
     const hy = await hold(COMMIT, py);
     await waitBlockedBy(hy.pid, hx.pid);
-    // Claim Z: KEY SHARE does not conflict with NO KEY UPDATE (2d) but does with FOR UPDATE (e1 only).
+    // Claim Z: the staged ACK holds the clock FOR UPDATE (043500 keeps it), which conflicts with Z's KEY SHARE.
+    expect((await pool.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0].prosrc).toContain("WHERE singleton FOR UPDATE;");
     const hz = await hold(CLAIM, await capture("ingest_claim_buffered_batch", z, `b1z-${serial}`, [`b1-z-${serial}`]));
-    if ((await ackClockMode()) === "no key update") expect(await settled(hz.done, 2000)).toBe(true);
-    else { await waitBlockedBy(hz.pid, hx.pid); expect(await settled(hz.done, 200)).toBe(false); }
+    await waitBlockedBy(hz.pid, hx.pid); expect(await settled(hz.done, 200)).toBe(false);
     await finish(hx, "COMMIT");
     expect(await hy.done).toMatchObject({ ok: true }); await finish(hy, "COMMIT");
     expect(await hz.done).toMatchObject({ ok: true }); await finish(hz, "COMMIT");
@@ -256,13 +348,13 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect(await lastSeat()).toBe(rows.at(-1)!.seat);
   }, 60000);
 
-  test("B2: two suppressed claims run concurrently (the second never waits for the first), no 40P01, last_seat unchanged", async () => {
+  test("B2: two suppressed claims from different origins run concurrently (the second never waits for the first), no 40P01, last_seat unchanged", async () => {
     const x = tenant("b2x"), y = tenant("b2y");
     await warm(x, y);
     const before = await lastSeat();
-    const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `b2x-${serial}`, [`b2-x-${serial}`], { fenced: true }));
+    const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `b2x-${serial}`, [`b2-x-${serial}`], { fenced: true, origin: `b2-ox-${serial}` }));
     expect(await hx.done).toMatchObject({ ok: true });
-    const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `b2y-${serial}`, [`b2-y-${serial}`], { fenced: true }));
+    const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `b2y-${serial}`, [`b2-y-${serial}`], { fenced: true, origin: `b2-oy-${serial}` }));
     expect(await settled(hy.done, 2000)).toBe(true);
     expect(await hy.done).toMatchObject({ ok: true });
     await finish(hy, "COMMIT"); await finish(hx, "COMMIT");
@@ -275,7 +367,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
       const a = tenant("b2a"), b = tenant("b2b");
       await warm(a, b);
       const round = await lastSeat();
-      const [pa, pb] = await Promise.all([capture("ingest_claim_buffered_batch", a, `b2a-${serial}`, [`b2-a-${serial}`], { fenced: true }), capture("ingest_claim_buffered_batch", b, `b2b-${serial}`, [`b2-b-${serial}`], { fenced: true })]);
+      const [pa, pb] = await Promise.all([capture("ingest_claim_buffered_batch", a, `b2a-${serial}`, [`b2-a-${serial}`], { fenced: true, origin: `b2-oa-${serial}` }), capture("ingest_claim_buffered_batch", b, `b2b-${serial}`, [`b2-b-${serial}`], { fenced: true, origin: `b2-ob-${serial}` })]);
       const hs = await Promise.all([hold(CLAIM, pa), hold(CLAIM, pb)]);
       for (const r of await Promise.all(hs.map((h) => h.done.then(async (r) => { await finish(h, "COMMIT"); return r; })))) codes.push(r.ok ? "ok" : r.code);
       if (await lastSeat() !== round) seats.push(round);

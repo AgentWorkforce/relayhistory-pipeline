@@ -61,7 +61,7 @@ const batchRow = async (f: Fixture, id: string) =>
 const count = async (f: Fixture, table: string, rid: string) =>
   (await f.db.query<{ n: number }>(`SELECT count(*)::int n FROM sessions.${table} WHERE record_id=$1`, [rid])).rows[0]!.n;
 
-test("043500 is applied: lazy_records holds KEY SHARE + the per-key advisory namespace; ack_batch returns suppressed above the exclusive clock lock", async () => {
+test("043500 is applied: lazy_records holds KEY SHARE + the origin advisory namespace; ack_batch returns suppressed above the exclusive clock lock", async () => {
   const f = await fixture();
   const src = async (sig: string) => (await f.db.query<{ s: string; d: boolean }>(`SELECT prosrc s,prosecdef d FROM pg_proc WHERE oid='sessions.${sig}'::regprocedure`)).rows[0]!;
   const records = await src("ingest_lazy_records(jsonb)"), ack = await src("ingest_lazy_ack_batch(jsonb)");
@@ -95,6 +95,31 @@ test("lazy_records fails closed (40001) outside READ COMMITTED; the same claim s
     expect(String(e?.message)).toContain("lazy records require read committed");
   }
   expect((await f.run("SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS r", [payload]) as any).rows[0].r.kind).toBeDefined();
+});
+
+test("lock footprint: a 500-record claim holds exactly ONE advisory lock, the (org, ws, origin) key split as pg_advisory_xact_lock(bigint)", async () => {
+  const f = await fixture();
+  let payload: unknown;
+  const ids = Array.from({ length: 500 }, (_, i) => `fp-${i}`);
+  const raw = await batch(ids.map((rid) => record({ record_id: rid, revision: 2, session_id: rid + "-s" })), { batch_id: "fp", account_id: await deliveryAccount(X) });
+  const custody = await witness(f, X, raw);
+  const capture = sqlLedger(async (sql, params) => {
+    if (sql.includes("ingest_claim_buffered_batch")) { payload = params[0]; throw Object.assign(Error("captured"), { code: "XXCAP" }); }
+    return f.run(sql, params as unknown[]);
+  }, { acceptanceMode: "buffered", expectedGeneration: generation });
+  await expect(deliverBatch({ ...f.deps, ledger: capture, custody } as never, X, raw)).rejects.toBeDefined();
+  expect(typeof payload).toBe("string");
+  const locks = "SELECT classid::text::bigint::text classid,objid::text::bigint::text objid,objsubid,mode,granted FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid()";
+  const want = (await f.db.query<{ classid: string; objid: string }>("SELECT ((k>>32)&4294967295)::text classid,(k&4294967295)::text objid FROM(SELECT hashtextextended(jsonb_build_array('96bulls:lazy-native-origin-v1',$1::text,$2::text,$3::text)::text,0) k)s",
+    [X.orgId, X.workspaceId, raw.origin_id])).rows[0]!;
+  await f.db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest");
+  try {
+    expect((await f.db.query(locks)).rows).toEqual([]);
+    expect(((await f.db.query<{ r: any }>("SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS r", [payload])).rows[0]!.r).kind).toBe("claimed");
+    const held = (await f.db.query(locks)).rows;
+    expect(held.length).toBeLessThanOrEqual(1); // upper bound: never one per record
+    expect(held).toEqual([{ ...want, objsubid: 1, mode: "ExclusiveLock", granted: true }]);
+  } finally { await f.db.exec("ROLLBACK"); }
 });
 
 test("U4: a buffered claim never commits a non-suppressed receipt inside the claim transaction", async () => {

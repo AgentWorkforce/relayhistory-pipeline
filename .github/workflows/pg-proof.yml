@@ -225,6 +225,18 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
+      # Service containers cannot take server flags, so the 53200 causal proof gets its own disposable,
+      # loopback-only, trust-auth container (same image as the service above, no credential anywhere).
+      - name: Start a lock-constrained PostgreSQL for the 043500 advisory-footprint proof
+        run: |
+          docker run -d --name pg-lock-constrained -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1:5433:5432 \
+            postgres:${{ matrix.pg }} -c max_locks_per_transaction=64 -c max_connections=20
+          for i in $(seq 1 60); do docker exec pg-lock-constrained pg_isready -U postgres -h 127.0.0.1 && exit 0; sleep 2; done
+          docker logs pg-lock-constrained; exit 1
+      - name: Prove bounded advisory locks never exhaust a constrained lock table (043500, no 53200)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5433/postgres
+        run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
   consumer-lease:
     name: canonical consumer lease proof (PG ${{ matrix.pg }})
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
