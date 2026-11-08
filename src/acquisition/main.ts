@@ -88,7 +88,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<void>
       origin: config.origin,
       validateUrl: (url) => assertDestinationUrl("RELAYCONTROL_INTROSPECT_URL", url, destinationPolicy(env)),
     });
-    // Cloud-class keys only on the ops port; a native-class key is refused there.
+    // Cloud-class keys only on the ops port. parsePinnedKeys already refuses native-class
+    // entries at startup; registryOfClass stays as a defensive filter.
     const installer = config.opsEnabled ? new Installer(sql, registryOfClass(config.registry, "cloud")) : null;
     servers.push(await listen(createAcquisitionApp({ enabled: false, group: "native" }), config.port, NATIVE_HOST, "native", "dormant"));
     servers.push(await listen(createAcquisitionApp({ enabled: true, group: "ops", groupEnabled: config.opsEnabled, authenticator, installer }), config.opsPort, config.opsHost, "ops", config.opsEnabled ? "enabled" : "dormant"));

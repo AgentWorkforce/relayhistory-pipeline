@@ -1,8 +1,8 @@
 /**
  * The installer side: the four SQL entrypoints of §3.1 behind one adapter,
  * the stable SQL error contract mapped to HTTP, and the operations-port
- * handler (verify a Cloud-issued envelope, compute digests, call SQL, pass
- * the result through).
+ * handler (verify an envelope of cloud-owner assertions signed by relaycontrol,
+ * compute digests, call SQL, pass the result through).
  *
  * Bigints: every function is called as `...::text`, so the result never goes
  * through pg's JSON.parse; parseSqlJson keeps every integer literal as its
@@ -259,7 +259,7 @@ export function statusRequest(body: unknown): { orgId: string; workspaceId: stri
   return { orgId, workspaceId, source, sessionIds: sessionIds as string[] };
 }
 
-/** The operations port: Cloud-issued envelopes only, scoped to the token's workspace. */
+/** The operations port: cloud-owner assertions signed by relaycontrol only, scoped to the token's workspace. */
 export class Installer {
   /** `registry` must already be the cloud-class subset (registryOfClass). */
   constructor(private readonly sql: AcquisitionSql, private readonly registry: IssuerRegistry) {}

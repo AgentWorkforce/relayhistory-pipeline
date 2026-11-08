@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { REFUSED_ISSUER_ENV, acquisitionConfig } from "../config.ts";
 import { parsePinnedKeys } from "../key-registry.ts";
-import { NATIVE_SEED_HEX, pinnedKeysJson } from "./helpers.ts";
+import { NATIVE_SEED_HEX, cloudPinnedEntry, nativePinnedEntry, pinnedKeysJson } from "./helpers.ts";
 
 const live = {
   ACQUISITION_ENABLED: "true", ACQUISITION_ORIGIN: "https://history.example.test", RELAYCONTROL_INTROSPECT_URL: "https://relaycontrol.example.test/v1/introspect",
@@ -56,20 +56,44 @@ test("verify-only: any issuer-era variable refuses startup, enabled or not, with
   for (const v of [undefined, "", "false"]) expect(acquisitionConfig({ ...live, ACQUISITION_NATIVE_ENABLED: v }).enabled).toBe(true);
 });
 
-test("pinned keys: parsed, malformed refused, one public key under two issuerKeyIds refused across and within classes", () => {
-  expect([...parsePinnedKeys(pinnedKeysJson).keys()].sort()).toEqual(["native-key-1", "test-key-1"]);
+const NATIVE_REFUSED = "Error: 96bulls: ACQUISITION_PINNED_KEYS issuerClass must be cloud; native-class keys are refused (no native issuer; relaycontrol is the sole issuer)";
+
+test("pinned keys: parsed, malformed refused, one public key under two issuerKeyIds refused", () => {
+  expect([...parsePinnedKeys(pinnedKeysJson).entries()].map(([id, k]) => [id, k.ownerKind])).toEqual([["test-key-1", "cloud"]]);
   expect(() => parsePinnedKeys("[]")).toThrow();
   expect(() => parsePinnedKeys("not json")).toThrow();
-  expect(() => parsePinnedKeys(JSON.stringify([{ issuerKeyId: "k", issuerClass: "other", publicKeyBase64: "" }]))).toThrow();
-  const entries = JSON.parse(pinnedKeysJson) as Array<{ issuerKeyId: string; issuerClass: string; publicKeyBase64: string }>;
-  const cloud = entries.find((e) => e.issuerClass === "cloud")!;
-  const native = entries.find((e) => e.issuerClass === "native")!;
-  expect(() => parsePinnedKeys(JSON.stringify([cloud, { ...cloud, publicKeyBase64: native.publicKeyBase64 }]))).toThrow(/duplicate issuerKeyId/);
-  const crossClass = [cloud, native, { issuerKeyId: "cloud-key-2", issuerClass: "cloud", publicKeyBase64: native.publicKeyBase64 }];
-  expect(() => parsePinnedKeys(JSON.stringify(crossClass))).toThrow(/same public key under two issuerKeyIds/);
-  const sameClass = [cloud, native, { issuerKeyId: "native-key-2", issuerClass: "native", publicKeyBase64: native.publicKeyBase64 }];
-  expect(() => parsePinnedKeys(JSON.stringify(sameClass))).toThrow(/same public key under two issuerKeyIds/);
-  try { parsePinnedKeys(JSON.stringify(crossClass)); } catch (e) { expect(String(e)).not.toContain(native.publicKeyBase64); }
+  expect(() => parsePinnedKeys(JSON.stringify([{ ...cloudPinnedEntry, issuerClass: "other" }]))).toThrow(/issuerClass must be cloud$/);
+  const cloud = cloudPinnedEntry;
+  const otherKey = nativePinnedEntry.publicKeyBase64;
+  expect(() => parsePinnedKeys(JSON.stringify([cloud, { ...cloud, publicKeyBase64: otherKey }]))).toThrow(/duplicate issuerKeyId/);
+  const twoIds = [cloud, { issuerKeyId: "cloud-key-2", issuerClass: "cloud", publicKeyBase64: cloud.publicKeyBase64 }];
+  expect(() => parsePinnedKeys(JSON.stringify(twoIds))).toThrow(/same public key under two issuerKeyIds/);
+  try { parsePinnedKeys(JSON.stringify(twoIds)); } catch (e) { expect(String(e)).not.toContain(cloud.publicKeyBase64); }
+});
+
+test("pinned keys: native-class entries are refused at startup (alone, mixed, any order), never echoing values", () => {
+  const cases = {
+    alone: [nativePinnedEntry],
+    cloudFirst: [cloudPinnedEntry, nativePinnedEntry],
+    nativeFirst: [nativePinnedEntry, cloudPinnedEntry],
+    // A native-class entry pinning the cloud key: refused on class, before the duplicate-key check.
+    nativeWithCloudKey: [cloudPinnedEntry, { ...nativePinnedEntry, publicKeyBase64: cloudPinnedEntry.publicKeyBase64 }],
+  };
+  for (const [label, entries] of Object.entries(cases)) {
+    const raw = JSON.stringify(entries);
+    let parseMessage = "";
+    try { parsePinnedKeys(raw); } catch (e) { parseMessage = String(e); }
+    expect([label, parseMessage]).toEqual([label, NATIVE_REFUSED]);
+    // Startup path: acquisitionConfig with the service enabled refuses the same way.
+    let startupMessage = "";
+    try { acquisitionConfig({ ...live, ACQUISITION_PINNED_KEYS: raw }); } catch (e) { startupMessage = String(e); }
+    expect([label, startupMessage]).toEqual([label, NATIVE_REFUSED]);
+    for (const m of [parseMessage, startupMessage])
+      for (const secret of [nativePinnedEntry.publicKeyBase64, cloudPinnedEntry.publicKeyBase64, nativePinnedEntry.issuerKeyId, cloudPinnedEntry.issuerKeyId, NATIVE_SEED_HEX])
+        expect([label, m.includes(secret)]).toEqual([label, false]);
+  }
+  // Disabled: ACQUISITION_PINNED_KEYS is not read at all (default off is unchanged).
+  expect(acquisitionConfig({ ACQUISITION_PINNED_KEYS: JSON.stringify([nativePinnedEntry]) }).enabled).toBe(false);
 });
 
 test("verify-only: no service module can sign, and the removed variables are read only by the refusal check", async () => {

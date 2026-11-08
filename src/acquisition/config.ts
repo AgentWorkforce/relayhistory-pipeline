@@ -19,8 +19,15 @@
  *   ACQUISITION_OPS_HOST           operations bind address, default 127.0.0.1; exposing it further needs a
  *                                  NetworkPolicy change (docs). The dormant listener binds 0.0.0.0.
  *   (The port and host variables are read and validated even when ACQUISITION_ENABLED is off.)
- *   ACQUISITION_PINNED_KEYS        JSON [{issuerKeyId, issuerClass:"cloud"|"native", publicKeyBase64}]: relaycontrol's
- *                                  published public keys; the ops port verifies only against the cloud-class ones
+ *   ACQUISITION_PINNED_KEYS        JSON [{issuerKeyId, issuerClass:"cloud", publicKeyBase64}]: relaycontrol's
+ *                                  published public keys. Only cloud-class keys are accepted; a native-class
+ *                                  entry refuses startup (no native issuer; relaycontrol is the sole issuer).
+ *                                  Tracked gap: native (Desktop) install/rebind/revoke assertions from
+ *                                  relaycontrol cannot use the ops route unchanged (cloud-class Installer;
+ *                                  ops rebind always 403). Native enrollment stays unimplemented until a
+ *                                  dedicated receiver class/scope is designed in a follow-up PR; issuing side
+ *                                  owned by relay-control (layered-control). Do not restore pipeline signing
+ *                                  or trust cloud-class issuance for native.
  *   ACQUISITION_DATABASE_URL       Postgres URL for role bulls96_acquisition_installer (never logged)
  *   RELAYCONTROL_INTROSPECT_URL    relaycontrol base URL (#313; https, loopback or in-cluster per destination policy)
  *   RELAYCONTROL_INTROSPECT_SECRET the dedicated introspection secret

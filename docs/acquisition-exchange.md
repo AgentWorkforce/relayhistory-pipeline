@@ -21,6 +21,9 @@ design:
   rebind, and any pre-signed or reserved revoke.
 - The pipeline only verifies (relaycontrol introspection, or relaycontrol's published keys
   pinned in `ACQUISITION_PINNED_KEYS`) and forwards to the privileged installer.
+- `ACQUISITION_PINNED_KEYS` accepts only `cloud`-class keys. A `native`-class entry is refused
+  at startup (alone or mixed with valid cloud entries): there is no native issuer class, and
+  relaycontrol is the sole issuer.
 - The SQL installer boundary (#332, migration `20261105043850`) does not itself authenticate
   signatures; this service's verification is what stands in front of it.
 
@@ -31,6 +34,18 @@ off), and so does `ACQUISITION_NATIVE_ENABLED` set to anything but empty or `fal
 native URLs (`/v1/acquisition/native/*`) are not served: `404 not_found` on the ops listener,
 `503 acquisition_disabled` on the dormant listener. Native Desktop enrollment moves to
 relaycontrol; its issuing endpoint, scope and audience contract is owned by layered-control.
+
+### Tracked gap: native receiver contract
+
+relaycontrol emitting native (Desktop) install, rebind or revoke assertions cannot use the ops
+route unchanged: `main.ts` constructs the `Installer` with the cloud class only, and
+`ops/rebind` is documented as always 403 because rebind was native-only. Native Desktop
+enrollment remains unimplemented until a concrete issuer and receiver path exists.
+
+- Issuing side owner: relay-control (layered-control).
+- Receiver path (a dedicated verification class and scope) is to be designed in a follow-up PR
+  in this repo.
+- Do not restore pipeline signing, and do not broadly trust cloud-class issuance for native.
 
 ## Cloud reachability (pinned for phase 2)
 
@@ -133,7 +148,7 @@ even when disabled. The issuer-era variables are checked for presence only and r
 | `ACQUISITION_ORIGIN` | enabled | This service's public origin (URL, origin only). Sent as `aud` to relaycontrol and compared by normalized origin. |
 | `RELAYCONTROL_INTROSPECT_URL` | enabled | #313 introspection endpoint; checked against the destination policy. |
 | `RELAYCONTROL_INTROSPECT_SECRET` | enabled | #313 service secret (secret; 1Password). |
-| `ACQUISITION_PINNED_KEYS` | enabled | JSON array of `{issuerKeyId, issuerClass:"cloud"\|"native", publicKeyBase64}` (raw 32-byte Ed25519). Ids are unique and one public key may not be pinned under two ids (same or different class); startup fails otherwise. The ops port uses only `cloud` keys. |
+| `ACQUISITION_PINNED_KEYS` | enabled | JSON array of `{issuerKeyId, issuerClass:"cloud", publicKeyBase64}` (raw 32-byte Ed25519). Only `cloud`-class keys are accepted; a `native`-class entry (or any other class) is refused at startup (see "Tracked gap: native receiver contract"). Ids are unique and one public key may not be pinned under two ids; startup fails otherwise. |
 | `ACQUISITION_DATABASE_URL` | enabled | Postgres URL for role `bulls96_acquisition_installer` (secret). |
 | `DESTINATION_*` | as the shared policy | `src/shared/destination-url.ts` policy for the introspection URL. |
 

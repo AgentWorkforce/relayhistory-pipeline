@@ -28,10 +28,11 @@ export const registry = new Map<string, TrustedAcquisitionIssuer>([
   [CLOUD_KEY_ID, { ownerKind: "cloud", publicKey: createPublicKey(cloudKey) }],
   [NATIVE_KEY_ID, { ownerKind: "native", publicKey: createPublicKey(nativeKey) }],
 ]);
-export const pinnedKeysJson = JSON.stringify([
-  { issuerKeyId: CLOUD_KEY_ID, issuerClass: "cloud", publicKeyBase64: rawPublicKey(createPublicKey(cloudKey)).toString("base64") },
-  { issuerKeyId: NATIVE_KEY_ID, issuerClass: "native", publicKeyBase64: rawPublicKey(createPublicKey(nativeKey)).toString("base64") },
-]);
+/** A valid ACQUISITION_PINNED_KEYS value: cloud-class only (native-class entries refuse startup). */
+export const cloudPinnedEntry = { issuerKeyId: CLOUD_KEY_ID, issuerClass: "cloud", publicKeyBase64: rawPublicKey(createPublicKey(cloudKey)).toString("base64") };
+/** A native-class entry, for the negative tests only: parsePinnedKeys must refuse it. */
+export const nativePinnedEntry = { issuerKeyId: NATIVE_KEY_ID, issuerClass: "native", publicKeyBase64: rawPublicKey(createPublicKey(nativeKey)).toString("base64") };
+export const pinnedKeysJson = JSON.stringify([cloudPinnedEntry]);
 
 export const ORG = "org_test";
 export const WS = "ws_test";
