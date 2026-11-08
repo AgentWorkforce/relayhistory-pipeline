@@ -11,6 +11,7 @@ import {awsJsonCall,lambdaCredentials} from "../session-pipeline/aws-json.ts";
 import {SUPABASE_PROD_CA_2021} from "../session-pipeline/supabase-ca.ts";
 import {deployTargetValue,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF} from "../shared/deploy-target.ts";
 import {bufferedGcTick,sqlBufferedGcLedger,BufferedGcError,BufferedGcDiagnostics} from "./buffered-gc.ts";
+import{ingestLoginIdentity}from"./ingest-login.ts";
 export interface GcJobConfig {region:"us-east-1";accountId:string;supabaseProjectRef:string;bucket:string;kmsKeyArn:string;secretArn:string;expectedGeneration:string;limit:number;budgetMs:number}
 function no(code:string):never{throw new BufferedGcError(code)}
 export function gcJobConfig(env:NodeJS.ProcessEnv):GcJobConfig{
@@ -96,8 +97,8 @@ export async function runBufferedGcJob(env:NodeJS.ProcessEnv,overrides:GcJobOver
   const sql=new SemanticPostgresExecutor(pool),read=new SemanticPostgresExecutor(pool,true);
   const context=()=>({signal:controller.signal,deadline:Math.min(deadline,Date.now()+1800)});
   diagnostics.phase("role_check");
-  const who=(await read.queryBounded<{me:string;session:string}>("SELECT current_user AS me,session_user AS session",[],context())).rows[0];
-  if(who?.me!=="bulls96_session_ingest"||who.session!=="bulls96_session_ingest")no("database_role");
+  // A genuine login as the ingest role (ingest-login.ts), not SET ROLE or SET SESSION AUTHORIZATION.
+  if(await ingestLoginIdentity(q=>read.queryBounded<Record<string,unknown>>(q,[],context())))no("database_role");
   diagnostics.phase("readiness");
   await read.queryBounded("SET LOCAL hoopdb.db_mode='supabase';"+Object.values(assets.verifiers).join("\n"),[],context());
   diagnostics.phase("store_setup");

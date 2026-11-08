@@ -4,6 +4,7 @@ import {runBufferedGcJob,type GcJobOverrides} from '../buffered-gc-job.ts';
 import {handler} from '../buffered-gc-lambda.ts';
 import {SemanticPostgresExecutor} from '../../search-features/semantic-copy-postgres.ts';
 import {derivedSchemaAssets} from '../../session-pipeline/derived-schema.ts';
+import {INGEST_LOGIN_IDENTITY_SQL,INGEST_LOGIN_PG16_SQL} from '../ingest-login.ts';
 import type {BufferedGcTicket} from '../buffered-protocol.ts';
 
 const uuid=(n:number)=>'00000000-0000-4000-8000-'+String(n).padStart(12,'0');
@@ -27,9 +28,11 @@ function queries(failAt?:string,failure=error()){
  const calls:string[]=[];
  const query=spyOn(SemanticPostgresExecutor.prototype,'queryBounded').mockImplementation(async(sql:string)=>{
   calls.push(sql);
-  const phase=sql.startsWith('SELECT current_user')?'role_check':sql.startsWith('SET LOCAL hoopdb.db_mode')?'readiness':sql.includes('ingest_buffer_gc_claim')?'claim':'other';
+  const phase=sql===INGEST_LOGIN_IDENTITY_SQL||sql===INGEST_LOGIN_PG16_SQL?'role_check':sql.startsWith('SET LOCAL hoopdb.db_mode')?'readiness':sql.includes('ingest_buffer_gc_claim')?'claim':'other';
   if(phase===failAt)throw failure;
-  return {rows:phase==='role_check'?[{me:'bulls96_session_ingest',session:'bulls96_session_ingest'}]:phase==='claim'?[{result:{tickets:[]}}]:[]};
+  // A genuine login as recorded from real PostgreSQL 17 (ingest-login.test.ts).
+  const login=sql===INGEST_LOGIN_PG16_SQL?{system_user:'scram-sha-256:bulls96_session_ingest'}:{session_user:'bulls96_session_ingest',current_user:'bulls96_session_ingest',role_setting:'none',server_version:170011,backend_user:'bulls96_session_ingest'};
+  return {rows:phase==='role_check'?[login]:phase==='claim'?[{result:{tickets:[]}}]:[]};
  });restore.push(()=>query.mockRestore());return calls;
 }
 function factories(end:()=>Promise<void>=async()=>{}):GcJobOverrides{

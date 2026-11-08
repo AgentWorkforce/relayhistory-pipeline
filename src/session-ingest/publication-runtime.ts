@@ -11,6 +11,7 @@ import{SemanticPostgresExecutor}from'../search-features/semantic-copy-postgres.t
 import{gcPoolConfig,bufferedKeyAllowed}from'./buffered-gc-job.ts';
 import{deployTargetValue,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,EC2_INSTANCE_ID}from'../shared/deploy-target.ts';
 import{publicationRpc}from'./publication-rpc.ts';
+import{ingestLoginIdentity}from'./ingest-login.ts';
 import{canonicalPublicationTick}from'./publication-job.ts';
 import{publicationGcLedger,collectPublicationObject}from'./publication-gc.ts';
 import type{PublicationTarget}from'./publication-protocol.ts';
@@ -67,8 +68,8 @@ export async function runCanonicalPublicationRuntime(env:NodeJS.ProcessEnv,mode:
   })();signal.throwIfAborted();
   pool=(overrides.pool??(c=>new pg.Pool(c)))({...gcPoolConfig(secret,config.supabaseProjectRef),max:4,application_name:'96bulls-canonical-publication'});pool.on('error',()=>{});
   const sql=new SemanticPostgresExecutor(pool),read=new SemanticPostgresExecutor(pool,true),context=()=>({signal,deadline:Math.min(deadline,Date.now()+1800)});
-  const who=(await read.queryBounded<{me:string;session:string}>('SELECT current_user AS me,session_user AS session',[],context())).rows[0];
-  if(who?.me!=='bulls96_session_ingest'||who.session!=='bulls96_session_ingest')no('database_role');
+  // A genuine login as the ingest role (ingest-login.ts), not SET ROLE or SET SESSION AUTHORIZATION.
+  if(await ingestLoginIdentity(q=>read.queryBounded<Record<string,unknown>>(q,[],context())))no('database_role');
   await read.queryBounded("SET LOCAL hoopdb.db_mode='supabase';"+Object.values(assets.verifiers).join('\n'),[],context());
   const target:PublicationTarget=config;
   const raw=scopedPublicationStore((overrides.store??createS3Store)({bucket:config.bucket,region:config.region,credentials,serverSideEncryption:'aws:kms',sseKmsKeyId:config.kmsKeyArn,fetch:fetcher}));
