@@ -24,6 +24,7 @@ const EXPECTED: Record<string, string[]> = {
   "session-brief": ["run", "/app/src/session-brief/main.ts"],
   "session-read-api": ["run", "/app/src/session-read-api/server.ts"],
   "session-publication": ["run", "/app/src/session-ingest/publication-service.ts", "--continuous"],
+  acquisition: ["run", "/app/src/acquisition/main.ts"],
 };
 
 let bin = "";
