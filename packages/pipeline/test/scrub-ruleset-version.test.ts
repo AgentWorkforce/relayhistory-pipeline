@@ -36,11 +36,12 @@ const SCRUB_RULESETS: Record<number, string> = {
   // `build-relay_…-sk-….tail` is no longer split at the `.` by the `sk-` rule.
   3: "e7607073a3afca3db6b015945f0b5fab256202f355b740f515987ec162bf3076",
   // A quoted secret value past the quoted rule's 4096-unit scan bound is redacted whole
-  // (to its closing quote, or to the end of its line or input), not cut at the bound with
-  // the rest stored; a generated unquoted value after a quoted key likewise. The
-  // segmenter's longCut never cuts inside such a value. Values within the bound scrub
+  // (to its closing quote, or to its first line break or the end of input), not cut at the
+  // bound with the rest stored; a generated unquoted value after a quoted key likewise. The
+  // segmenter's longCut never cuts between such a value's key and its end. Values within
+  // the bound scrub
   // byte-identically to version 3.
-  4: "cb6d6589d2c89d4eb79e798e8429d5443cdce34f9d7f06e631f366ac42bbcf83",
+  4: "6fe2084c78bac7398b7db1cae84d0f7745c99220d472f594fcb0f9bce9996375",
 };
 
 const read = (rel: string) =>

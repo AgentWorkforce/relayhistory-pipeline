@@ -1,7 +1,8 @@
 /**
  * Rule set 4: a quoted secret value longer than the quoted rule's scan bound
  * (`MAX_QUOTED_VALUE`, 4096 UTF-16 code units in `lib/scrub.ts`) is redacted whole, up to
- * its closing quote or, with none, to the end of its line or of the input. Rule set 3
+ * its closing quote or, with none, to the first line break (LF, CRLF or lone CR) or the
+ * end of the input. U+2028 and U+0085 are not line breaks to it. Rule set 3
  * redacted only the first 4096 units (or up to the first space in them) and stored the
  * rest in clear. The bound is a scan bound only; values within it scrub as in rule set 3.
  */
@@ -93,6 +94,41 @@ describe("quoted secret values past the scan bound (rule set 4)", () => {
     }
   });
 
+  it("stops at a lone CR too, but not at U+2028 or U+0085 (not line breaks to the scan)", () => {
+    // LF, CRLF and a lone CR end the value; the rest of the line after the break is kept.
+    expect(scrubText(`"password": "${solid(CAP + 5)}\rafter line"`)).toBe(`"password": "${R}\rafter line"`);
+    // U+2028 and U+0085 are ordinary value units: the value runs on to its closing quote.
+    for (const sep of ["\u2028", "\u0085"]) {
+      const input = `"password": "${solid(CAP + 5)}${sep}after line" kept`;
+      expect(scrubText(input)).toBe(`"password": "${R}" kept`);
+      expect(scrub.overCapQuotedValueSpans(input)).toEqual([[0, input.length - 6]]);
+    }
+  });
+
+  it("redacts a value whose surrogate pair straddles the bound whole, leaving no lone surrogate", () => {
+    const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    for (const before of [CAP - 2, CAP - 1, CAP]) {
+      const input = `"password": "${solid(before)}\u{1F600}" kept`;
+      const out = scrubText(input);
+      expect(out).toBe(`"password": "${R}" kept`);
+      expect(lone.test(out)).toBe(false);
+      // CAP - 2 + 2 units is within the bound (rule set 3 path); the others are over it.
+      expect(scrub.overCapQuotedValueSpans(input).length).toBe(before === CAP - 2 ? 0 : 1);
+    }
+  });
+
+  it("treats an unquoted value of exactly 4096 units as rule set 3 did", () => {
+    // Low entropy: kept as is, at, below and above 4096 units.
+    for (const n of [CAP - 1, CAP, CAP + 1]) {
+      expect(scrubText(`'token' => ${solid(n)} end`)).toBe(`'token' => ${solid(n)} end`);
+    }
+    // Generated: redacted whole at exactly 4096 units.
+    const chunk = "aB3dE5fG7hJ9kL1mN2pQ4rS6tU8wX0yZ";
+    const value = chunk.repeat(CAP / chunk.length);
+    expect(value.length).toBe(CAP);
+    expect(scrubText(`'token' => ${value} end`)).toBe(`'token' => ${R} end`);
+  });
+
   it("redacts an over-bound op:// reference rather than keeping it", () => {
     expect(scrubText(`"password": "op://${solid(CAP * 2)}"`)).toBe(`"password": "${R}"`);
     expect(scrubText(`"password": "op://vault/item/field"`)).toBe(
@@ -128,7 +164,7 @@ describe("rule set 4 stays linear", () => {
       let start = performance.now();
       const spans = scrub.overCapQuotedValueSpans(input);
       let ms = performance.now() - start;
-      expect(spans).toEqual([[14, 14 + MiB]]);
+      expect(spans).toEqual([[1, 14 + MiB]]);
       expect(ms, `span scan took ${ms.toFixed(0)} ms`).toBeLessThan(2_000);
       start = performance.now();
       const out = scrubText(input);
@@ -168,6 +204,20 @@ describe("the segmenter never cuts inside an over-bound value (rule set 4)", () 
     const out = scrubLong(text);
     expect(out).toBe(`${head}"password": "${R}" tail words here`);
     expectNoFragment(out, value, "segmented");
+  });
+
+  it("does not cut between the key and an over-bound value (the key/value seam)", () => {
+    // Reviewer probe: earlier rules shrink each capy_ token to [REDACTED], and a cut
+    // in the separator after the key left the value keyless in the next segment, so
+    // the tail of the value was stored. The protected span starts at the key.
+    const marker = "SECRETTAILMARK";
+    const tokens = `${"capy_" + "Ab1".repeat(10)} `.repeat(260);
+    const head = "lorem ipsum dolor ".repeat(Math.floor((MAX_SCRUB_CHARS - 5000) / 18));
+    const text = `${head}"password": "${tokens}${marker} ${tokens}" end words`;
+    expect(text.length).toBeGreaterThan(MAX_SCRUB_CHARS);
+    const out = scrubLong(text);
+    expect(out.includes(marker)).toBe(false);
+    expect(out.endsWith(`"password": "${R}" end words`)).toBe(true);
   });
 
   it("refuses a text whose only cuts fall inside an over-bound value", () => {

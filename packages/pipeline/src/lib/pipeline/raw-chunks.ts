@@ -56,10 +56,12 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  * - 4: version 3's rules, except that a quoted secret value longer than the
  *   quoted rule's scan bound (`MAX_QUOTED_VALUE`, 4096 UTF-16 code units) is
  *   redacted whole: from its opening quote to its closing quote or, with none,
- *   to the end of its line or of the input. Version 3 redacted only the first
- *   4096 units (or up to the first whitespace in them) and stored the rest. A
+ *   to its first line break (LF, CRLF or lone CR) or the end of the input.
+ *   Version 3 redacted only the first 4096 units (or up to the first
+ *   whitespace in them) and stored the rest. A
  *   generated unquoted value after a quoted key is likewise redacted to its
- *   end. The segmenter never cuts inside such a value (`longCut`). Output for
+ *   end. The segmenter never cuts between such a value's key and its end
+ *   (`longCut`), and refuses the string when no other cut is left. Output for
  *   values within the bound is byte-identical to version 3.
  */
 export const SCRUB_RULESET_VERSION = 4;
@@ -319,8 +321,10 @@ const CUT_SEARCH_CHARS = 65_536;
  * to its first space before the cut, and the rest was stored. Twice
  * `MAX_QUOTED_VALUE` leaves room for a later rule to reach a little further.
  * From rule set 4 a quoted value past `MAX_QUOTED_VALUE` is redacted whole,
- * however long: `longCut` does not cut inside one (`overCapQuotedValueSpans`),
- * and a run is cut only at line boundaries, which no quoted value spans.
+ * however long, up to the closing quote or the first line break (LF, CR).
+ * `longCut` cuts a long string after any whitespace, so it refuses every cut
+ * from the key start to the value end of such a value (`overCapQuotedValueSpans`);
+ * a run (`safeCut`) is cut only at line boundaries, which no such value crosses.
  */
 const CUT_CONTEXT_CHARS = 8192;
 
@@ -489,9 +493,10 @@ function scrubBounded(text: string): string {
  *    within one token, so a token is never split),
  *  - does not sit between two digit groups (cards, phone numbers),
  *  - is not inside a private-key block whose footer comes later,
- *  - is not inside a quoted secret value longer than the quoted rule's scan bound
- *    (`overCapQuotedValueSpans`; rule set 4 redacts such a value whole, however far
- *    it runs, so no bounded context check can see its key from a cut deep inside), and
+ *  - is not between the key and the end of a quoted secret value longer than the
+ *    quoted rule's scan bound (`overCapQuotedValueSpans`; rule set 4 redacts such a
+ *    value whole, however far it runs, so no bounded context check can see its key
+ *    from a cut deep inside), and
  *  - leaves `CUT_CONTEXT_CHARS` on each side scrubbing identically together and
  *    apart, which also covers rules whose match spans a separator before the
  *    secret (`Bearer <token>`, `key = value`).

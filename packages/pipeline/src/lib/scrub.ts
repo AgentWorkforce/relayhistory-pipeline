@@ -117,10 +117,12 @@ function backslashesBefore(text: string, at: number): number {
  *
  * A value longer than `MAX_QUOTED_VALUE` (no closing quote and no line break within
  * it) is redacted whole, whatever it holds: up to its closing quote, found by the same
- * test past the bound, or to the end of its line or of the input when there is none. A
- * generated unquoted value longer than the bound is redacted to its end too. The text
+ * test past the bound, or to its first line break (LF or CR; not U+2028 or U+0085) or
+ * the end of the input when there is none. A generated unquoted value longer than the
+ * bound is redacted to its end too. The text
  * past the bound is walked once, and the redaction consumes it, so the pass stays
- * linear. With `overCap`, each over-long quoted value's span [start, end) is recorded.
+ * linear. With `overCap`, each over-long quoted value's span [key start, value end) is
+ * recorded.
  */
 function redactQuotedSecretValues(
   text: string,
@@ -222,7 +224,8 @@ function redactQuotedSecretValues(
         valueEnd += (rest.exec(text) as RegExpExecArray)[0].length;
       }
     }
-    if (longValue) overCap?.push([valueStart, valueEnd]);
+    // From the key start: a cut between key and value would leave the value with no key to match.
+    if (longValue) overCap?.push([m.index, valueEnd]);
     const value = longValue ? "" : text.slice(valueStart, valueEnd);
     if (valueEnd <= valueStart || (!longValue && keepQuotedValue(value))) continue;
     out += text.slice(last, valueStart) + REDACTED;

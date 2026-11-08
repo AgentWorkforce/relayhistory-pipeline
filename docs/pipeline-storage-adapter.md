@@ -80,9 +80,26 @@ scrubs when it seals a chunk. For a client that cannot, the server's
   (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3, 4 from rule set 4) for the client's manifest.
   Rule set 4: a quoted secret value longer than the quoted rule's 4096-unit scan
   bound (`MAX_QUOTED_VALUE` in `lib/scrub.ts`) is replaced whole by `[REDACTED]`,
-  up to its closing quote or, with none, to the end of its line or of the input;
-  rule set 3 stored the part past the bound in clear. Values within the bound
-  scrub byte-identically to rule set 3.
+  up to its closing quote or, with none, to the first line break (LF, CRLF or a
+  lone CR) or the end of the input; rule set 3 stored the part past the bound in
+  clear. Values within the bound scrub byte-identically to rule set 3.
+  - **Line-confined, a narrowing.** The agreed wording redacts the whole
+    remainder of the value, to its closing quote or the end of the input. Rule
+    set 4 stops at a line break instead, so the segmenter can keep cutting runs at line boundaries; text after
+    the break is scrubbed by the other rules as usual. U+2028 and U+0085 are not
+    line breaks to it. This narrowing needs relayscrubber-lead's acceptance.
+  - **New refusals.** The segmenter does not cut inside such a value, from its key
+    to its end (`overCapQuotedValueSpans`). `longCut` (long strings, cut after any
+    whitespace) refuses those cuts; when no other cut is left the string is
+    rejected with `chunk_string_too_long`, which is non-retryable and holds no
+    content. The session ingest (`src/session-ingest/oversize.ts`) replaces such
+    a string with its redaction marker before sealing, and the neon reader
+    (`src/migration/neon-s3-sync/neon-reader.ts`) truncates it to a prefix that
+    the sealer then scrubs.
+  - **Quoted keys only.** The whole-value rule covers values after a quoted key.
+    A rule set 5 follow-up covers the rest: unquoted keys (YAML, TOML, env,
+    kwargs), more than 16 spaces before the colon, `\u` escapes in the key, keys
+    longer than 64 characters, and an NBSP separator.
 
 The unscrubbed bytes are never written to storage. If the key already holds
 an object (identical bytes or not), it is kept and described from its own

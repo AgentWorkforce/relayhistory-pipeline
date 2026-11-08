@@ -31,6 +31,27 @@ describe("fitForScrub", () => {
     expect(out.payload.note).not.toContain(KEY);
   });
 
+  test("rule set 4: a string cut only inside an over-bound quoted value becomes the marker; the refusal holds no content", () => {
+    // Every whitespace in the string falls inside one quoted secret value longer than
+    // MAX_QUOTED_VALUE, which rule set 4 never splits, so the segmenter refuses it.
+    const value = "zeta kappa omicron SECRETTAILMARK ".repeat(Math.ceil((MAX_SCRUB_CHARS + 1024) / 34));
+    const text = `"password": "${value}"`;
+    let error: unknown;
+    try {
+      scrubRecords(enc(liveLine({ ...base, payload: { text } }, "t") + "\n"));
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toMatchObject({ code: "chunk_string_too_long", retryable: false });
+    expect((error as Error).message).not.toContain("SECRETTAILMARK");
+    expect((error as Error).message).not.toContain("zeta");
+    const fitted = fitForScrub({ ...base, payload: { text, n: 1 } });
+    const out = dec(scrubRecords(enc(liveLine(fitted, "t") + "\n")).scrubbed);
+    expect(JSON.parse(out).payload.text).toBe(oversizeRedaction(text.length));
+    expect(JSON.parse(out).payload.n).toBe(1);
+    expect(out).not.toContain("SECRETTAILMARK");
+  });
+
   test("a long text scrubLong can cut is left whole for it, and scrubbed", () => {
     const text = Array.from({ length: 60_000 }, (_, i) => (i % 997 === 0 ? KEY : `w${i}`)).join(" ");
     expect(text.length).toBeGreaterThan(MAX_SCRUB_CHARS);
