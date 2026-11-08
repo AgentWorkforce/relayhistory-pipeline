@@ -106,8 +106,22 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  *   over-cap quoted value, no quoted secret value left unclosed or open across
  *   a line break, and no quoted secret value that starts with `op://` but is
  *   not a strict reference is byte-identical to version 4.
+ * - 6: an unquoted value after a quoted secret key is classified whole, to its
+ *   real end: version 5 classified its first `MAX_QUOTED_VALUE` units, so 4096
+ *   digits then an alphanumeric tail passed as a number and the tail was
+ *   stored. One of `MAX_QUOTED_VALUE` units or more is now redacted whole,
+ *   whatever it holds. The over-cap first pass keeps private-key boundaries
+ *   paired: a quoted secret value holding the footer of a header before it is
+ *   redacted from the header through the value's closing quote (version 5 took
+ *   the footer with the value, and the private-key rule then redacted from the
+ *   header to the end of the input), and one holding a header whose footer is
+ *   after it is redacted through that footer with its closing quote kept (not
+ *   kept when a quote lies between, as the footer may be inside a later quoted
+ *   value whose key the redaction removed). The segmenter is unchanged. Output for input with no unquoted secret value of
+ *   `MAX_QUOTED_VALUE` units or more and no private-key boundary inside a
+ *   quoted secret value is byte-identical to version 5.
  */
-export const SCRUB_RULESET_VERSION = 5;
+export const SCRUB_RULESET_VERSION = 6;
 
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";

@@ -47,6 +47,12 @@ is never built, no JWKS is fetched, and a `RELAYAUTH_JWKS_URL` or
 "Self-host canonical reads and `relaycontrol_only`" in
 `docs/session-read-api-design.md`.
 
+The services image also carries `SERVICE=session-publication` (the canonical publisher,
+`src/session-ingest/publication-service.ts --continuous`, default-off on
+`INGEST_PUBLISH_ENABLED`, probes on `WORKER_HEALTH_PORT`). The local stack does
+not run it either. The per-SERVICE ports, probes, single-origin routing and
+role order are in `docs/selfhost-composition.md`.
+
 Every worker blocks at start until HoopDb answers and the migration ledger is
 complete, so apply order does not matter (the same rule the Kubernetes chart
 uses via `/readyz`).
