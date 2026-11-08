@@ -388,6 +388,7 @@ export async function writeCurrentParityProof(
   neon: Queryable,
   targetOwner: Queryable,
   tenant: ParityTenant,
+  expectedTargetGeneration?: string,
 ): Promise<{ census: ParityCensusReceipt; outcome: ProofWritePlan; writtenAt: unknown | null }> {
   if (!validTenant(tenant)) throw new ParityCensusRefusal("tenant_invalid");
   const params = [tenant.orgId, tenant.workspaceId, tenant.userId];
@@ -405,6 +406,8 @@ export async function writeCurrentParityProof(
     if (sourceSnapshotKey(sourceA) !== sourceSnapshotKey(sourceB)) throw new ParityCensusRefusal("neon_changed_during_census");
     const census = evaluateParityCensus(censusInput(tenant, sourceB, destination));
     if (!census.equal || !census.proof) throw new ParityCensusRefusal(`parity_mismatch:${census.mismatches.join(",")}`);
+    if (expectedTargetGeneration !== undefined && census.proof.targetGeneration !== expectedTargetGeneration)
+      throw new ParityCensusRefusal("target_generation_mismatch");
     const result = await writeProofRowCas(targetOwner, prior, census.proof);
     await targetOwner.query("COMMIT");
     return { census, ...result };
