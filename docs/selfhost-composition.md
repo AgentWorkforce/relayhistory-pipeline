@@ -1,0 +1,214 @@
+# Self-host composition: one image, one public origin
+
+Status (2026-11-08): contract and dispatcher only. Nothing here is deployed, and
+no chart, stack or migration changes come with it. Every service named below is
+default-off. This is the handoff contract for whoever builds the stack
+(infra-kind-stack or another orchestrator).
+
+A self-host runs without RelayAuth and without the legacy relayhistory-cloud
+Worker. History is served by the `sessions-*` services in this repository. The
+user's relaycontrol (Control) is the only identity authority: it issues the
+`sh_at_` user tokens and answers introspection.
+
+## 1. The image and its SERVICEs
+
+There is one image (`docker/services.Dockerfile`), and `SERVICE=` picks the
+process (`docker/entrypoint.sh`). A value that is unset, empty or unknown exits
+2 and runs nothing. `src/shared/__tests__/docker-entrypoint.test.ts` pins the
+whole table.
+
+| SERVICE | Kind | Entry | Port | Probes |
+| --- | --- | --- | --- | --- |
+| `hoopdb-migrate` | Job (one-shot, idempotent) | `src/hoopdb/migrate.ts` | none | exit code |
+| `locker-init` | Job (one-shot) | `src/locker/init.ts` | none | exit code |
+| `alleyoop-ingest` | Deployment | `src/alleyoop/ingest.ts` | pipeline routes (local stack: 18080) | see `docs/local-stack.md` |
+| `alleyoop-courier`, `hoopdb-indexer`, `referee`, `bob-costas`, `session-brief` | Deployment (worker) | `src/<name>/...` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz` (`src/shared/worker.ts` `serveHealth`) |
+| `session-read-api` | Deployment (HTTP) | `src/session-read-api/server.ts` | `RELAYHISTORY_READ_API_PORT`, default 8080 | `GET /healthz` (200 `{"ok":true,"enabled":false\|true}`) |
+| `session-publication` | Deployment (worker) | `src/session-ingest/publication-service.ts --continuous` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz` (below) |
+| *(session-ingest)* | Deployment (HTTP) | **not in this image yet** | contract in section 3 | `GET /healthz` |
+
+The worker port serves probes only. It must never be reachable from outside
+the cluster.
+
+### `SERVICE=session-publication`
+
+This is the canonical publisher (`publication-main.ts`, `--continuous`)
+wrapped as a long-running container with the worker probe shape. It is off
+unless `INGEST_PUBLISH_ENABLED` is exactly `true`. Unset or `false` is
+dormant; any other value fails startup.
+
+- **Dormant.** It does no config, credential, database or store work. The
+  process stays up, both probes answer 200 `{"ok":true,"enabled":false}`, and
+  SIGTERM exits 0. Rollouts complete, and enabling it later is an env change.
+- **Enabled.** `publicationRuntimeConfig` is validated before the probe port
+  opens, so a bad or missing target is a startup failure (exit 1, with a JSON
+  error line carrying only a code).
+  - `/healthz` answers 200 `{"ok":true,"enabled":true,"reason":"starting"|"ok"}`
+    while the last cycle ended (or the service started) within
+    `INGEST_PUBLISH_BUDGET_MS` (default 1 200 000) + 5 s idle wait + 60 s.
+    Past that it answers 503 `loop_stalled`.
+  - `/readyz` answers 503 `starting` until the first healthy cycle, then 200.
+  - A failed cycle exits 1, and the orchestrator restarts the container.
+    SIGTERM/SIGINT cancel owned IO and exit 0.
+- Publication GC (`publication-main.ts --gc`, `INGEST_PUBLICATION_GC_ENABLED`)
+  is separately armed and is **not** dispatched here.
+- **Target selection. Read this before enabling.** `INGEST_PUBLICATION_TARGET`
+  picks the runtime. Unset or `aws` is the existing host runtime, which requires
+  `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, IMDSv2 instance
+  credentials, a Secrets Manager secret and the `INGEST_PUBLISH_*` target
+  identity (`publication-runtime.ts`). On a plain kind or CNPG stack that fails
+  startup with `publication_target_required`. Set `portable` instead
+  (`publication-portable.ts`): an S3-compatible endpoint (MinIO) with static
+  keys, a `bulls96_session_ingest` Postgres URL and an explicit
+  `SESSION_POSTGRES_TLS_PROFILE`. The variables, Secret keys, role and grants,
+  the owner-written `sessions.ingest_publication_frontiers` rows and the
+  versioned-bucket requirement are listed in that file's header. Until the
+  frontier rows exist, an enabled portable publisher runs but finds nothing to
+  publish.
+
+## 2. One public origin
+
+A single public origin (for example `https://sessions.example.test`) fronts
+everything. The router is the cluster's ingress or reverse proxy (an Ingress,
+Gateway API HTTPRoute, Caddy, nginx, or anything else). No new proxy service is
+needed. Rules are evaluated in order, first match wins, on the exact path with
+no rewriting.
+
+| # | Match | Upstream | Notes |
+| - | --- | --- | --- |
+| 1 | `POST /v1/cli/login` (exact) | session-read-api | the only read-api POST; 8 KiB body cap |
+| 2 | `GET /v1/delivery/records` (exact) | session-read-api | babysitter evidence. It must win over rule 4. Default 501 `delivery_records_not_configured` |
+| 3 | `GET /v1/sessions`, `/v1/sessions/*`, `GET /v1/events`, `GET /v1/digest/*` | session-read-api | read routes; read-api answers non-GET with 405 |
+| 4 | `/v1/delivery/*`, `/v1/turns/*` | session-ingest | `POST /v1/delivery/batches`, `GET /v1/delivery/limits`, `POST /v1/delivery/recovery`, `POST /v1/delivery/sessions/{selection,reset}`, `POST /v1/turns/batches` |
+| 5 | `/v1/onboarding/*` | session-ingest | `POST /v1/onboarding/heartbeat`, `GET /v1/onboarding/connection` |
+| 6 | anything else, including `/healthz`, `/readyz`, `/health`, `/v1/custody/*` | **none (404 at the edge)** | probes and custody are internal |
+
+Requirements on the router:
+
+- **Strip client-supplied trust headers.** Before forwarding, the router must
+  remove `x-relay-ingest-identity` and `x-relay-ingest-signature` from every
+  request. Today's ingest app takes tenancy from those headers, which only the
+  relayhistory Worker sets in hosted mode. A forwarded client copy would be a
+  tenant assertion.
+- Send the original `Host` or `X-Forwarded-Host`. Do not rewrite paths: the
+  ingest signature covers the path, and read-api matches `/v1/cli/login` exactly
+  (a trailing slash is 405).
+- Pass request bodies through unbuffered, or allow at least the ingest's
+  `MAX_DELIVERY_BYTES` (2 MiB on the wire). Keep `Content-Encoding` (gzip and zstd are decoded by
+  the ingest).
+- Terminate TLS at the edge. Upstream hops may be plain http to Service DNS
+  names only when the service sets `ALLOW_IN_CLUSTER_HTTP=true`.
+- Internal-only, never routed publicly: every probe port (8081, plus read-api
+  `/healthz`), `/v1/custody/*`, and `hoopdb-migrate`.
+
+### Control audience
+
+`READ_API_ORIGIN` is the public origin exactly: scheme and host, no path, no
+trailing slash. Control must be configured with that same string as this
+History origin. A read bearer or login token is introspected with
+`aud = READ_API_ORIGIN`, and introspection must return
+`historyOrigin === READ_API_ORIGIN`. Otherwise the request gets 401
+`wrong_audience` or `unauthorized`. One origin means one audience, and the
+session-ingest service must check the same value.
+
+Read-api auth env:
+
+- `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`
+- `RELAYCONTROL_INTROSPECT_URL`, which passes the transport rule
+  (`ALLOW_IN_CLUSTER_HTTP`)
+- `RELAYCONTROL_INTROSPECT_SECRET`, injected from the secret store
+
+There is no switch to turn RelayAuth verification off. With `RELAYAUTH_JWKS_URL`
+and `RELAYAUTH_ISSUER` unset, the verifier falls back to the hosted RelayAuth
+defaults (`lambda.ts` `readApiAuthConfig`). Those tokens are still bound to
+`aud = READ_API_ORIGIN`, so the hosted issuer would have to mint one for this
+self-host origin. This is a residual trust in hosted RelayAuth. A self-host
+that wants Control as its only authority needs a read-api change. This PR does
+not make it.
+
+**Known gap.** The `/v1/cli/login` response advertises only `rth:read`
+(`docs/session-read-api-design.md` section 2a), so relaycontrol refuses
+`mode=sync` against this origin. A single origin that also syncs needs the
+login to advertise `rth:sync` when an ingest is configured. That is a
+read-api change, not made here.
+
+## 3. session-ingest contract (to be built)
+
+`src/session-ingest/app.ts` serves the delivery contract today as a Cloudflare
+Worker behind relayhistory (`worker.ts`). No image SERVICE runs it. A
+self-host `SERVICE=session-ingest` must:
+
+1. Listen on its own port. 8090 is suggested, and the port is the router's
+   upstream. It answers `GET /healthz`, default-off like read-api.
+2. Authenticate the client's own bearer itself, since there is no relayhistory
+   in front. It should take a relaycontrol `sh_at_` token through the same
+   introspection, with `aud = READ_API_ORIGIN`, and require `rth:sync` for
+   writes (`rth:read` for `GET /v1/onboarding/connection`). It must never
+   accept `x-relay-ingest-identity` from the network.
+3. Connect as `bulls96_session_ingest` and write the canonical S3 layout that
+   `session-publication` reads.
+
+## 4. Postgres roles and order
+
+Every service gets its own login and its own Secret. No service connects as
+the migration owner.
+
+| Consumer | Role | Where it is set |
+| --- | --- | --- |
+| `hoopdb-migrate` | the database superuser / migration owner | `HOOPDB_URL` (Job only) |
+| workers (`hoopdb-indexer`, `referee`, `bob-costas`, `session-brief`, `alleyoop-*`) | `HOOPDB_RUNTIME_ROLE` (exact app ACL from `migrate-guards.ts`) | `HOOPDB_URL` |
+| `session-read-api` | `bulls96_read_api`: `LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS`, read-only, and not owner of the search schema (checked at startup) | `supabase_url` inside `RELAYHISTORY_READ_API_SECRET` (JSON) |
+| session-ingest, `session-publication` | `bulls96_session_ingest` (the publisher refuses any other `current_user`) | ingest: its Secret; publisher: `hoopdb_url` in the Secrets Manager secret `INGEST_PUBLISH_SECRET_ARN` |
+
+Order (plain Postgres or CNPG, `HOOPDB_DB_MODE=selfhosted`):
+
+1. **Postgres up**, with `pg_trgm` and `btree_gin` available.
+2. **`SERVICE=hoopdb-migrate`** (Job), as the superuser:
+   - `HOOPDB_DB_MODE=selfhosted`
+   - `HOOPDB_SUPABASE_SHIM=true|false` (explicit)
+   - `HOOPDB_ROLE_BOOTSTRAP` (defaults to the shim choice)
+   - `HOOPDB_RUNTIME_ROLE`, `HOOPDB_RUNTIME_ROLE_LOGIN`
+   - `HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke`
+
+   With the role bootstrap on, the migrator itself creates the bare NOLOGIN
+   roles first: the search worker, the token verifier,
+   `session_ingest_roles.sql` and `session_read_api_roles.sql`. Then it applies
+   the migrations, and then the read-only verifies. With the bootstrap off, an
+   operator runs those four `supabase/bootstrap/*.sql` files as the superuser
+   **before** this Job. Migrations verify the roles and fail closed (42704) if
+   they are absent.
+3. **Bootstrap roles (post-migrate, operator, superuser).** This step makes
+   the logins usable:
+   - `session_ingest_role.sql`, then set the password, then
+     `session_ingest_role_verify.sql`.
+   - `session_read_api_role.sql` (LOGIN, timeouts, tenant RLS policy), then the
+     password, then `session_read_api_role_verify.sql`.
+   - The search schema owner runs `ensureSchema` for `search_index` and
+     `projection_state`, and grants the read role `USAGE`/`SELECT` (read-api
+     design, "Postgres search prerequisites").
+   - The search worker marker
+     (`runbooks/session-directory-search-worker-bootstrap.md`).
+
+   Passwords go straight from the secret store into the Secrets. They are
+   never written to disk or into a file in this repository.
+4. **Services.** Workers block on `/readyz` until the ledger is complete, so
+   their own order does not matter. Start `session-read-api` and
+   session-ingest after step 3: read-api checks `pg_roles` for its login at
+   startup and refuses `reader_role_superuser` / `reader_role_bypassrls`.
+   `session-publication` comes last (dormant by default).
+
+## 5. Env, Secret and CA names
+
+Every flag is strict: exactly `true` enables, unset or `false` is off, and
+anything else fails startup.
+
+| SERVICE | Flag | Required when enabled | Secret material (from the secret store, never on disk) |
+| --- | --- | --- | --- |
+| `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT` | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
+| `session-publication` | `INGEST_PUBLISH_ENABLED` | `INGEST_PUBLISH_{BUCKET,EXPECT_GENERATION,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,INSTANCE_ID,SECRET_ARN,KMS_KEY_ARN,INSTANCE_PROFILE_ARN,ROLE_NAME}`, `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, optional `INGEST_PUBLISH_BUDGET_MS`, `INGEST_PUBLISH_BATCH_LIMIT`, `WORKER_HEALTH_PORT` | none in env: IMDSv2 plus Secrets Manager (see the caveat in section 1) |
+| workers | per service (`docs/local-stack.md`) | `HOOPDB_URL`, `WORKER_HEALTH_PORT` | `HOOPDB_URL` password |
+
+CA: `SESSION_POSTGRES_TLS_PROFILE=custom-ca` with `SESSION_POSTGRES_CA_FILE`
+(a mounted file, at most 128 KiB) and `SESSION_POSTGRES_CA_SHA256` (64 hex
+characters, pinned). A mismatch fails startup. `supabase` selects the pinned
+Supabase CA. There is no implicit default for the service.

@@ -3,6 +3,7 @@ import { ParityCensusRefusal, type ParityCensusReceipt, type ParityTenant } from
 import {
   BULK_BUFFERED_TENANTS_SQL,
   OwnerBufferedOperatorRefusal,
+  assumeAndRequireParityTableOwner,
   bulkCompletionStatus,
   parseOperatorArgs,
   publicCensusReceipt,
@@ -13,6 +14,61 @@ import { PGlite } from "@electric-sql/pglite";
 
 const SHA = "a".repeat(40);
 const GENERATION = "b".repeat(64);
+
+describe("owner-buffered parity Supabase owner route", () => {
+  const identity = (overrides: Partial<{ login: string; actor: string; owner: string }> = {}) => ({
+    login: "cli_login_postgres", actor: "postgres", owner: "postgres", ...overrides,
+  });
+
+  test("switches to postgres before verifying the exact login, effective role, and table owner", async () => {
+    const statements: string[] = [];
+    const client: Queryable = { async query<T>(sql: string) {
+      statements.push(sql);
+      return { rows: (sql === "SET ROLE postgres" ? [] : [identity()]) as T[] };
+    } };
+    await expect(assumeAndRequireParityTableOwner(client)).resolves.toBeUndefined();
+    expect(statements[0]).toBe("SET ROLE postgres");
+    expect(statements[1]).toContain("session_user AS login");
+    expect(statements[1]).toContain("current_user AS actor");
+  });
+
+  test("refuses a wrong session login", async () => {
+    const client: Queryable = { async query<T>(sql: string) {
+      return { rows: (sql === "SET ROLE postgres" ? [] : [identity({ login: "other_login" })]) as T[] };
+    } };
+    await expect(assumeAndRequireParityTableOwner(client)).rejects.toThrow("target_owner_identity_refused");
+  });
+
+  test("refuses when SET ROLE postgres fails", async () => {
+    const client: Queryable = { async query<T>(sql: string) {
+      if (sql === "SET ROLE postgres") throw new Error("synthetic role failure");
+      return { rows: [identity()] as T[] };
+    } };
+    await expect(assumeAndRequireParityTableOwner(client)).rejects.toThrow("target_owner_set_role_refused");
+  });
+
+  test("refuses a current_user mismatch", async () => {
+    const client: Queryable = { async query<T>(sql: string) {
+      return { rows: (sql === "SET ROLE postgres" ? [] : [identity({ actor: "cli_login_postgres" })]) as T[] };
+    } };
+    await expect(assumeAndRequireParityTableOwner(client)).rejects.toThrow("target_owner_identity_refused");
+  });
+
+  test("refuses when postgres is not the parity table owner", async () => {
+    const client: Queryable = { async query<T>(sql: string) {
+      return { rows: (sql === "SET ROLE postgres" ? [] : [identity({ owner: "other_owner" })]) as T[] };
+    } };
+    await expect(assumeAndRequireParityTableOwner(client)).rejects.toThrow("target_owner_identity_refused");
+  });
+
+  test("sanitizes an unverifiable identity query", async () => {
+    const client: Queryable = { async query<T>(sql: string) {
+      if (sql !== "SET ROLE postgres") throw new Error("synthetic private database detail");
+      return { rows: [] as T[] };
+    } };
+    await expect(assumeAndRequireParityTableOwner(client)).rejects.toThrow("target_owner_identity_unverifiable");
+  });
+});
 
 describe("owner-buffered parity operator arguments", () => {
   test("pins census to source and target generation", () => {
