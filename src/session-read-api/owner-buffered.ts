@@ -39,10 +39,14 @@
  * sourceControlEpoch is not controlEpoch is fenced. Each row's or stage's immutable admission
  * (epoch, version) is then compared with the final head (BigInt on decimal strings); NULL or
  * absent admission is hidden. The only exported read paths (readOwnerBufferedList,
- * readOwnerBufferedTurns) run that gate; the raw stage read is module-private.
+ * readOwnerBufferedTurns, readOwnerBufferedEvents) run that gate; the raw stage read is
+ * module-private.
  *
- * Buffered turn text is scrubbed at read time (scrubBufferedText). Rollout 1 serves no
- * buffered events (session events stay canonical-only).
+ * Buffered turn text is scrubbed at read time (scrubBufferedText). Buffered events
+ * (readOwnerBufferedEvents) are served only on GET /v1/sessions/:sessionId/events with `source`,
+ * and only with READ_API_OWNER_BUFFERED_EVENTS=on as well (default off; ownerBufferedEventsEnabled):
+ * the same gated read, projected by canonical-projection.ts projectEventRows (the one projection
+ * both readers run), scrubbed and tenant-checked per row. GET /v1/events stays canonical-only.
  *
  * Erasure, reset and fence gating come only from the RPCs, the recheck after the S3 fetch and
  * the authority gate, never from canonical liveness. Canonical liveness (pointers) is used only
@@ -51,6 +55,10 @@
 import type { TenantRunner } from "./liveness.ts";
 import { TenantMismatchError } from "./page.ts";
 import { canonicalLiveTurns } from "./canonical-turns.ts";
+import { projectEventRows } from "./canonical-projection.ts";
+import type { EventRow } from "./queries.ts";
+import { liveMachineId } from "../session-ingest/writer.ts";
+import { CONVERGENCE_EVENT_KIND, deliveryMachine } from "../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import { turnRows } from "./session-turns-source.ts";
 import { BUFFER_STAGE_MAX_BYTES, readBufferedStage } from "../session-ingest/staging.ts";
 import { bufferedOrdinalSelection } from "../session-ingest/buffered-protocol.ts";
@@ -70,6 +78,28 @@ export const BUFFERED_IDS_HEADER = "X-Relayhistory-Buffered-Ids";
 export function ownerBufferedEnabled(raw: string | undefined): boolean {
   const value = raw?.trim();
   return value === "1" || value === "true";
+}
+
+export const OWNER_BUFFERED_EVENTS_FLAG = "READ_API_OWNER_BUFFERED_EVENTS";
+
+/** READ_API_OWNER_BUFFERED_EVENTS holds a value other than unset, empty or "on". Names the field, never the value. */
+export class OwnerBufferedEventsFlagError extends Error {
+  constructor() {
+    super(`${OWNER_BUFFERED_EVENTS_FLAG} must be unset or "on"`);
+    this.name = "OwnerBufferedEventsFlagError";
+  }
+}
+
+/**
+ * READ_API_OWNER_BUFFERED_EVENTS: unset or empty is off, exactly "on" enables, anything else
+ * throws OwnerBufferedEventsFlagError (the Worker refuses the deploy's requests, as it refuses
+ * owner-buffered on without its binding). On has no effect unless owner-buffered reads are on
+ * and the workspace is on both allowlists (app.ts ownerBufferedFor).
+ */
+export function ownerBufferedEventsEnabled(raw: string | undefined): boolean {
+  if (raw === undefined || raw === "") return false;
+  if (raw === "on") return true;
+  throw new OwnerBufferedEventsFlagError();
 }
 
 /** The caller: org and workspace from the verified token, user from its verified subject. */
@@ -426,6 +456,11 @@ export interface OwnerBufferedDeps {
    * the output would exceed `maxBytes`, never buffering past it. The worker streams fzstd.
    */
   decompress: (bytes: Uint8Array, maxBytes: number) => Uint8Array;
+  /**
+   * READ_API_OWNER_BUFFERED_EVENTS=on: the session events route may serve buffered events.
+   * Absent or false: it never does (every events response exactly as without the flag).
+   */
+  events?: boolean;
 }
 
 /** One stage object: the compressed and the decompressed bound (staging.ts BUFFER_STAGE_MAX_BYTES). */
@@ -896,6 +931,33 @@ export type OwnerBufferedTurns =
  * stages fold through normalizeRelayhistoryRecords. Throws TenantMismatchError on a foreign stage.
  */
 export async function readOwnerBufferedTurns(deps: OwnerBufferedDeps, scope: BufferedScope, source: string, sessionId: string): Promise<OwnerBufferedTurns> {
+  const read = await readGatedSession(deps, scope, source, sessionId);
+  if (read === null || "unverifiedBeforeCandidate" in read) return read;
+  if (read.erased) return { erased: true, rows: [] };
+  return { erased: false, rows: bufferedTurnRows(scope, source, sessionId, read.records) };
+}
+
+type GatedSession =
+  | null
+  | { unverifiedBeforeCandidate: string }
+  | { erased: true }
+  | {
+      erased: false;
+      /** Every kept stage's records folded together (revisions and tombstones across stages). */
+      records: RelayhistoryStreamRecord[];
+      /** The stages' origins in stage order (the first is the canonical parts[0] equivalent). */
+      origins: string[];
+      /** The visible stages' admission version (all equal the final head's). */
+      admissionVersion: string;
+    };
+
+/**
+ * GATED, module-private. The one gated read behind readOwnerBufferedTurns and
+ * readOwnerBufferedEvents: observe, stages, S3 fetch, recheck, observe again (fenced unless
+ * identical; this is the last I/O), then every kept stage's admission against the final head.
+ * Its result is plain records; callers only compute from them.
+ */
+async function readGatedSession(deps: OwnerBufferedDeps, scope: BufferedScope, source: string, sessionId: string): Promise<GatedSession> {
   let first: AuthorityHead;
   let initial: BufferedStageRow[];
   try {
@@ -908,11 +970,92 @@ export async function readOwnerBufferedTurns(deps: OwnerBufferedDeps, scope: Buf
   if (initial.length === 0) return null;
   const raw = await readStagesUngated(deps, scope, first, source, sessionId, initial);
   const authority = await finalGate(deps, scope, first);
-  if (raw.kind === "erased") return { erased: true, rows: [] };
+  if (raw.kind === "erased") return { erased: true };
   if (raw.kind === "changed") return null;
   if (!raw.stages.every(({ row }) => admissionVisible(authority, row))) return null;
+  const origins = [...new Set(raw.stages.flatMap((s) => s.records.map((r) => r.origin_id)))];
   const records = normalizeRelayhistoryRecords(raw.stages.flatMap((s) => s.records));
-  return { erased: false, rows: bufferedTurnRows(scope, source, sessionId, records) };
+  return { erased: false, records, origins, admissionVersion: raw.stages[0]?.row.admission_version ?? "0" };
+}
+
+export type OwnerBufferedEvents =
+  | null /** not a visible buffered session of this caller: the route's existing answer */
+  /** The authority refused before any buffered candidate was found: the route's existing answer. */
+  | { unverifiedBeforeCandidate: string }
+  | { erased: true; rows: [] }
+  | { erased: false; rows: EventRow[] };
+
+/** The buffered stages project to no event row, or the projection refused them: hidden. */
+export class BufferedProjectionFailed extends Error {
+  constructor(readonly reason: string) {
+    super("buffered projection failed");
+    this.name = "BufferedProjectionFailed";
+  }
+}
+
+/**
+ * GATED. The caller's buffered event rows for one session (all of them; the route pages them with
+ * page.ts readBufferedEventPage): readGatedSession, then canonical-projection.ts projectEventRows,
+ * the projection readCanonicalScope runs, grouped the way the publication would be: direct
+ * convergence_event lines per origin (machine liveMachineId(workspace, origin, user), the
+ * manifest machine staging/publication derives), activity records together under the first
+ * stage's origin (canonical parts[0]). Records were folded across stages first. Version: the
+ * stages' admission version (the final head's). Identity comes only from the gated scope: every
+ * row's org, workspace, user, session and source must be the caller's and this session's, and its
+ * machine one of this session's origins' machines, else TenantMismatchError. Text fields are
+ * scrubbed (scrubBufferedText; task_ref through scrubJson) before return. Rows carry no stage
+ * key, ordinal or raw line. A version beyond Number's safe range is clamped for the (unemitted)
+ * index-row version. A projection failure: BufferedProjectionFailed (the route hides the session).
+ */
+export async function readOwnerBufferedEvents(deps: OwnerBufferedDeps, scope: BufferedScope, source: string, sessionId: string): Promise<OwnerBufferedEvents> {
+  const read = await readGatedSession(deps, scope, source, sessionId);
+  if (read === null || "unverifiedBeforeCandidate" in read) return read;
+  if (read.erased) return { erased: true, rows: [] };
+  // The projection's index-row version is the admission version. It never reaches an EventRow
+  // (the response has no version field), so a version past Number's safe range, still exact and
+  // compared as BigInt by the gate above, is clamped here rather than hiding a visible session.
+  const exact = Number(read.admissionVersion);
+  const version = Number.isSafeInteger(exact) ? exact : Number.MAX_SAFE_INTEGER;
+  return { erased: false, rows: bufferedEventRows(scope, source, sessionId, read.records, read.origins, version) };
+}
+
+type ProjectedIndexRow = Extract<ReturnType<typeof projectEventRows>, { events: unknown }>["events"][number]["indexRow"];
+
+/** The read API's event row of a projected index row (the shape ClickHouse and the portable index return). */
+export function eventRowFromIndex(row: ProjectedIndexRow): EventRow {
+  return {
+    org_id: row.org_id, workspace_id: row.workspace_id, ts_ms: Date.parse(`${row.ts.replace(" ", "T")}Z`), session_id: row.session_id,
+    source: row.source, machine_id: row.machine_id, kind: row.kind, event_id: row.event_id, type: row.type, user_id: row.user_id,
+    actor_name: row.actor_name, actor_role: row.actor_role, subagent_id: row.subagent_id, project_id: row.project_id,
+    task_title: row.task_title, task_ref: row.task_ref, tags: [...row.tags], files_touched: [...row.files_touched],
+    tool_name: row.tool_name, tool_status: row.tool_status, content: row.content, in_budget: 1,
+  };
+}
+
+function bufferedEventRows(scope: BufferedScope, source: string, sessionId: string, records: RelayhistoryStreamRecord[], origins: string[], version: number): EventRow[] {
+  const ws = scope.workspaceId;
+  const machines = new Set(origins.flatMap((o) => [liveMachineId(ws, o, scope.userId), deliveryMachine(ws, o)]));
+  const direct = new Map<string, RelayhistoryStreamRecord[]>();
+  const activity: RelayhistoryStreamRecord[] = [];
+  for (const r of records) {
+    if (r.kind === CONVERGENCE_EVENT_KIND) direct.set(r.origin_id, [...(direct.get(r.origin_id) ?? []), r]);
+    else activity.push(r);
+  }
+  const groups = [...direct].map(([origin, recs]) => ({ origin, records: recs }));
+  if (activity.length > 0 && origins[0] !== undefined) groups.push({ origin: origins[0], records: activity });
+  const projectionScope = { orgId: scope.orgId, workspaceId: ws, harness: source, sessionId };
+  // Keyed as readCanonicalScope keys its rows: the last projection of an event wins.
+  const byKey = new Map<string, EventRow>();
+  for (const group of groups) {
+    const projected = projectEventRows(group.records, projectionScope, { sessionId, machineId: liveMachineId(ws, group.origin, scope.userId), userId: scope.userId }, version);
+    if ("error" in projected) throw new BufferedProjectionFailed((projected.error as { code?: unknown })?.code === undefined ? "projection_failed" : String((projected.error as { code: unknown }).code));
+    for (const { indexRow } of projected.events) {
+      if (indexRow.org_id !== scope.orgId || indexRow.workspace_id !== ws || indexRow.user_id !== scope.userId ||
+          indexRow.session_id !== sessionId || indexRow.source !== source || !machines.has(indexRow.machine_id)) throw new TenantMismatchError();
+      byKey.set(JSON.stringify([indexRow.machine_id, indexRow.source, indexRow.kind, indexRow.event_id]), scrubEventRow(eventRowFromIndex(indexRow)));
+    }
+  }
+  return [...byKey.values()];
 }
 
 /**
@@ -999,5 +1142,25 @@ function scrubTurnRow(row: Record<string, unknown>): Record<string, unknown> {
     content: typeof row.content === "string" ? scrubBufferedText(row.content) : row.content,
     actor_name: typeof row.actor_name === "string" ? scrubBufferedText(row.actor_name) : row.actor_name,
     metadata: row.metadata && typeof row.metadata === "object" ? scrubDeep(scrubJson(row.metadata)) : row.metadata,
+  };
+}
+
+/** A buffered event row with its free text scrubbed: content, actor name, task title, task_ref, tags, files touched. */
+function scrubEventRow(row: EventRow): EventRow {
+  let taskRef = row.task_ref;
+  try {
+    const parsed = JSON.parse(taskRef) as unknown;
+    taskRef = JSON.stringify(scrubDeep(scrubJson(parsed)));
+  } catch {
+    taskRef = scrubBufferedText(taskRef);
+  }
+  return {
+    ...row,
+    content: scrubBufferedText(row.content),
+    actor_name: scrubBufferedText(row.actor_name),
+    task_title: scrubBufferedText(row.task_title),
+    task_ref: taskRef,
+    tags: row.tags.map(scrubBufferedText),
+    files_touched: row.files_touched.map(scrubBufferedText),
   };
 }

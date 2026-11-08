@@ -55,6 +55,23 @@ export const FANOUT_DLQ = "96bulls-session-ingest-fanout-dlq";
 /** One batch's fan-out per invocation; retried with backoff, then dead-lettered. */
 export const FANOUT_BATCH_SIZE = 1;
 export const FANOUT_MAX_RETRIES = 10;
+/**
+ * S3-first async admission (docs/design/s3-first-async-ingest.md): its own queue, never paused
+ * (the paused fanout queue guards canonical drain; admission must run while drain stays closed).
+ * Declared only with `asyncAdmission`; absent, the stage is byte-identical to before.
+ */
+export const ADMISSION_QUEUE = "96bulls-session-ingest-admission";
+export const ADMISSION_DLQ = "96bulls-session-ingest-admission-dlq";
+export const ADMISSION_BATCH_SIZE = 1;
+export const ADMISSION_MAX_RETRIES = 20;
+/** The admission consumer's database budget: concurrent claims, not uploads. */
+export const ADMISSION_MAX_CONCURRENCY = 4;
+/**
+ * Message retention on BOTH admission queues: Cloudflare's maximum (14 days). An acknowledged upload's
+ * message, and its DLQ record, must outlive an operator redrive window. Alchemy's Queue cannot express
+ * it, so the buffered Queue provider PATCHes exactly this value after create and requires the readback.
+ */
+export const ADMISSION_RETENTION_SECONDS = 1209600;
 /** Secrets Store secret names (values created out of band from 1Password). */
 export const S3_ACCESS_KEY_SECRET = "96bulls-session-ingest-s3-access-key-id";
 export const S3_SECRET_KEY_SECRET = "96bulls-session-ingest-s3-secret-access-key";
@@ -68,6 +85,18 @@ export const SESSION_INGEST_RESOURCES = [
   "session-ingest",
   "session-ingest-fanout-consumer",
 ] as const;
+
+/** The three extra resources of an `asyncAdmission` stage: all or none. */
+export const ADMISSION_RESOURCES = [
+  "session-ingest-admission-dlq",
+  "session-ingest-admission",
+  "session-ingest-admission-consumer",
+] as const;
+
+/** The stage's resources: the four, plus the admission three when async admission is declared. */
+export function sessionIngestResources(withAdmission = false): readonly string[] {
+  return withAdmission ? [...SESSION_INGEST_RESOURCES, ...ADMISSION_RESOURCES] : SESSION_INGEST_RESOURCES;
+}
 
 export type ReplicaMode = "off" | "queue";
 
@@ -109,6 +138,11 @@ export interface SessionIngestInputs {
   neonReplicaQueue?: string;
   /** Default-off S3 inbox authority. Presence is an all-or-nothing managed selection. */
   authority?: InboxAuthorityDeploymentInputs;
+  /**
+   * S3-first async admission (INGEST_ASYNC_ADMISSION), buffered acceptance only. Present: the admission
+   * queue + DLQ + consumer, the INGEST_ADMISSION binding and the var. Omit for none (the default).
+   */
+  asyncAdmission?: "on" | "drain";
 }
 
 const HEX32 = /^[0-9a-f]{32}$/;
@@ -124,7 +158,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -210,6 +244,8 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
   if (v.replicaMode === "queue" && v.neonReplicaQueue === undefined) refuse('sessionIngest.replicaMode "queue" needs neonReplicaQueue');
   if (v.replicaMode !== "queue" && v.neonReplicaQueue !== undefined) refuse('sessionIngest.neonReplicaQueue is bound only with replicaMode "queue"');
   inboxAuthority(v.authority, refuse);
+  if (v.asyncAdmission !== undefined && (!(v.asyncAdmission === "on" || v.asyncAdmission === "drain") || v.acceptanceMode !== "buffered"))
+    refuse('sessionIngest.asyncAdmission must be "on" or "drain", in buffered mode only (omit for none)');
 }
 
 /** A producer binding to a queue this stack does not own (no state row: never created, changed or deleted here). */
@@ -238,6 +274,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.custodySource ? { INGEST_CUSTODY_SOURCE: p.custodySource } : {}),
     ...(p.privacyAuthority ? { INGEST_PRIVACY_AUTHORITY: p.privacyAuthority } : {}),
     ...inboxAuthorityVars(p.authority, (why) => { throw new Error(why); }),
+    ...(p.asyncAdmission ? { INGEST_ASYNC_ADMISSION: p.asyncAdmission } : {}),
   };
 }
 
@@ -246,7 +283,9 @@ export function sessionIngestVars(p: SessionIngestInputs) {
  * resource, the Hyperdrive lookup), so the pure invariants can be checked on
  * exactly what is deployed.
  */
-export function sessionIngestWorkerProps(p: SessionIngestInputs, bindings: { HYPERDRIVE: unknown; INGEST_FANOUT: unknown }) {
+export function sessionIngestWorkerProps(p: SessionIngestInputs, bindings: { HYPERDRIVE: unknown; INGEST_FANOUT: unknown; INGEST_ADMISSION?: unknown }) {
+  if ((p.asyncAdmission !== undefined) !== (bindings.INGEST_ADMISSION !== undefined))
+    throw new Error("the INGEST_ADMISSION binding is declared exactly when sessionIngest.asyncAdmission is");
   return {
     name: SESSION_INGEST_WORKER,
     main: "src/session-ingest/worker.ts",
@@ -264,6 +303,7 @@ export function sessionIngestWorkerProps(p: SessionIngestInputs, bindings: { HYP
       ...sessionIngestVars(p),
       HYPERDRIVE: bindings.HYPERDRIVE,
       INGEST_FANOUT: bindings.INGEST_FANOUT,
+      ...(p.asyncAdmission ? { INGEST_ADMISSION: bindings.INGEST_ADMISSION } : {}),
       S3_ACCESS_KEY_ID: secretsStoreSecret(p.secretsStoreId, S3_ACCESS_KEY_SECRET),
       S3_SECRET_ACCESS_KEY: secretsStoreSecret(p.secretsStoreId, S3_SECRET_KEY_SECRET),
       INGEST_SIGNING_KEY: secretsStoreSecret(p.secretsStoreId, SIGNING_KEY_SECRET),
@@ -342,7 +382,24 @@ export function fanoutConsumerProps(queueId: unknown) {
   return { queueId, scriptName: SESSION_INGEST_WORKER, deadLetterQueue: FANOUT_DLQ, settings: fanoutConsumerSettings() };
 }
 
-export type SessionIngestPlanPhase = "session ingest rollout" | "session ingest update" | "post-apply";
+export function admissionConsumerSettings() {
+  return { batchSize: ADMISSION_BATCH_SIZE, maxRetries: ADMISSION_MAX_RETRIES, maxConcurrency: ADMISSION_MAX_CONCURRENCY };
+}
+
+/** The admission consumer: this Worker, single-message batches, bounded retries and concurrency, its own DLQ. */
+export function assertAdmissionConsumer(c: { scriptName: unknown; deadLetterQueue: unknown; settings?: { batchSize?: number; maxRetries?: number; maxConcurrency?: number } }, refuse: (why: string) => never) {
+  if (c.scriptName !== SESSION_INGEST_WORKER) refuse("the admission queue's consumer must be the ingest Worker");
+  if (c.deadLetterQueue !== ADMISSION_DLQ) refuse(`the admission consumer must dead-letter to ${ADMISSION_DLQ}`);
+  const s = c.settings ?? {};
+  if (s.batchSize !== ADMISSION_BATCH_SIZE || s.maxRetries !== ADMISSION_MAX_RETRIES || s.maxConcurrency !== ADMISSION_MAX_CONCURRENCY || Object.keys(s).length !== 3)
+    refuse(`the admission consumer's settings must be exactly ${JSON.stringify(admissionConsumerSettings())}`);
+}
+
+export function admissionConsumerProps(queueId: unknown) {
+  return { queueId, scriptName: SESSION_INGEST_WORKER, deadLetterQueue: ADMISSION_DLQ, settings: admissionConsumerSettings() };
+}
+
+export type SessionIngestPlanPhase = "session ingest rollout" | "session ingest update" | "async admission addition" | "post-apply";
 
 /**
  * The deploy plan contract (same `Plan:` summary and `[resource] action` line
@@ -352,7 +409,8 @@ export type SessionIngestPlanPhase = "session ingest rollout" | "session ingest 
  * creates and updates together. The detailed plan must list the same actions
  * and must not show a credential.
  */
-export function assertSessionIngestPlanContract(planText: string, detailedPlanText: string): SessionIngestPlanPhase {
+export function assertSessionIngestPlanContract(planText: string, detailedPlanText: string, withAdmission = false): SessionIngestPlanPhase {
+  const resources = sessionIngestResources(withAdmission);
   const refuse = (why: string): never => {
     throw new Error(`96bulls: ${SESSION_INGEST_STAGE} plan contract refused: ${why}. Nothing was changed.`);
   };
@@ -366,8 +424,8 @@ export function assertSessionIngestPlanContract(planText: string, detailedPlanTe
       if (ops.has(m[1]!)) refuse(`${label} plan: resource ${m[1]} appears more than once`);
       ops.set(m[1]!, m[2]!);
     }
-    for (const r of ops.keys()) if (!(SESSION_INGEST_RESOURCES as readonly string[]).includes(r)) refuse(`${label} plan: unexpected resource ${r}`);
-    for (const r of SESSION_INGEST_RESOURCES) if (!ops.has(r)) refuse(`${label} plan: missing resource ${r}`);
+    for (const r of ops.keys()) if (!resources.includes(r)) refuse(`${label} plan: unexpected resource ${r}`);
+    for (const r of resources) if (!ops.has(r)) refuse(`${label} plan: missing resource ${r}`);
     for (const [r, a] of ops) if (a !== "create" && a !== "update" && a !== "noop") refuse(`${label} plan: ${r} has forbidden action ${a}`);
     const counts = new Map<string, number>();
     for (const a of ops.values()) if (a !== "noop") counts.set(a, (counts.get(a) ?? 0) + 1);
@@ -385,7 +443,7 @@ export function assertSessionIngestPlanContract(planText: string, detailedPlanTe
   const compact = parse(planText, "compact");
   const detailed = parse(detailedPlanText, "detailed");
   if (compact.summary !== detailed.summary) refuse("compact and detailed plan summaries differ");
-  for (const r of SESSION_INGEST_RESOURCES) if (compact.ops.get(r) !== detailed.ops.get(r)) refuse(`compact and detailed plans disagree on ${r}`);
+  for (const r of resources) if (compact.ops.get(r) !== detailed.ops.get(r)) refuse(`compact and detailed plans disagree on ${r}`);
   // A credential in the planned props would be one Alchemy state now holds.
   if (/secret_text|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|postgres(?:ql)?:\/\/[^\s"]*:[^\s"@]*@/.test(detailedPlanText))
     refuse("the detailed plan shows a credential value or a secret_text binding");
@@ -393,6 +451,11 @@ export function assertSessionIngestPlanContract(planText: string, detailedPlanTe
   if (actions.every((a) => a === "noop")) return "post-apply";
   if (actions.every((a) => a === "create" || a === "noop")) return "session ingest rollout";
   if (actions.every((a) => a === "update" || a === "noop")) return "session ingest update";
+  // Adding async admission to a deployed stage: exactly the three admission creates plus the Worker's
+  // in-place update (its new binding and var); the fanout queues and their consumer stay untouched.
+  if (withAdmission && ADMISSION_RESOURCES.every((r) => compact.ops.get(r) === "create") && compact.ops.get("session-ingest") === "update" &&
+      SESSION_INGEST_RESOURCES.every((r) => r === "session-ingest" || compact.ops.get(r) === "noop"))
+    return "async admission addition";
   return refuse(`action set is neither a rollout (creates only) nor an update (in-place only): ${[...compact.ops].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ")}`);
 }
 
@@ -404,9 +467,13 @@ export const sessionIngestStage = (p: SessionIngestInputs) =>
     };
     const dlq = yield* Cloudflare.Queues.Queue("session-ingest-fanout-dlq", { name: FANOUT_DLQ, ...(p.acceptanceMode === "buffered" ? { deliveryPaused: true } : {}) } as never);
     const fanout = yield* Cloudflare.Queues.Queue("session-ingest-fanout", { name: FANOUT_QUEUE, ...(p.acceptanceMode === "buffered" ? { deliveryPaused: true } : {}) } as never);
+    // Async admission: its own queue + DLQ, never paused (declared only with asyncAdmission).
+    const admissionDlq = p.asyncAdmission ? yield* Cloudflare.Queues.Queue("session-ingest-admission-dlq", { name: ADMISSION_DLQ } as never) : undefined;
+    const admission = p.asyncAdmission ? yield* Cloudflare.Queues.Queue("session-ingest-admission", { name: ADMISSION_QUEUE } as never) : undefined;
     const props = sessionIngestWorkerProps(p, {
       HYPERDRIVE: Cloudflare.Hyperdrive.lookup("HYPERDRIVE", { hyperdriveId: p.hyperdriveId }),
       INGEST_FANOUT: fanout,
+      ...(admission ? { INGEST_ADMISSION: admission } : {}),
     });
     assertPrivateWorker(props, refuse);
     assertNoSecretLiterals(props.env, refuse);
@@ -420,5 +487,15 @@ export const sessionIngestStage = (p: SessionIngestInputs) =>
       scriptName: (worker as unknown as { workerName: string }).workerName,
       deadLetterQueue: dlq.queueName,
     } as never);
+    if (admission && admissionDlq) {
+      const ac = admissionConsumerProps(admission.queueId);
+      assertAdmissionConsumer(ac, refuse);
+      yield* Cloudflare.Queues.Consumer("session-ingest-admission-consumer", {
+        ...ac,
+        scriptName: (worker as unknown as { workerName: string }).workerName,
+        deadLetterQueue: admissionDlq.queueName,
+      } as never);
+      return { workerName: SESSION_INGEST_WORKER, fanoutQueue: FANOUT_QUEUE, fanoutDlq: FANOUT_DLQ, admissionQueue: ADMISSION_QUEUE, admissionDlq: ADMISSION_DLQ };
+    }
     return { workerName: SESSION_INGEST_WORKER, fanoutQueue: FANOUT_QUEUE, fanoutDlq: FANOUT_DLQ };
   });

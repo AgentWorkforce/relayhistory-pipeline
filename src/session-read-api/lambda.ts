@@ -19,7 +19,11 @@
  * GET /v1/sessions/:id/catalog; unset/""/"false" off; anything else fails startup.
  * Login needs the relaycontrol introspection above, else 503; this entry wires no
  * canonical source, so catalog answers 501 `catalog_not_configured`, and the
- * Function URL handler is GET-only, so login is 405 here).
+ * Function URL handler is GET-only, so login is 405 here; the self-host service
+ * entry, `entry: "service"`, wires the canonical source from LOCKER_*, see
+ * service-canonical.ts). READ_API_AUTH_MODE (unset/"" = the default dual path;
+ * exactly "relaycontrol_only" = no RelayAuth verifier at all, see
+ * readApiAuthConfig).
  *
  * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED, owner-buffered.ts) are
  * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
@@ -40,6 +44,7 @@ import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
 import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
+import { serviceCanonicalDeps } from "./service-canonical.ts";
 
 export interface ReadApiSecret {
   clickhouse?: { url: string; user: string; password: string; database: string };
@@ -66,13 +71,53 @@ export function parseReadApiSecret(text: string, requireClickHouse = true): Read
 
 export { parseCompleteSince };
 
+export const READ_API_AUTH_MODE_VAR = "READ_API_AUTH_MODE";
+
+/**
+ * READ_API_AUTH_MODE: unset or "" is the default (RelayAuth, plus relaycontrol
+ * when RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true); exactly "relaycontrol_only"
+ * takes relaycontrol `sh_at_` tokens only. Anything else refuses startup. Never
+ * echoes the value.
+ */
+export function readApiAuthMode(env: NodeJS.ProcessEnv = process.env): "default" | "relaycontrol_only" {
+  const raw = env[READ_API_AUTH_MODE_VAR];
+  if (raw === undefined || raw === "") return "default";
+  if (raw === "relaycontrol_only") return "relaycontrol_only";
+  throw new Error(`session read api: ${READ_API_AUTH_MODE_VAR} must be unset, "" or "relaycontrol_only"`);
+}
+
+/**
+ * relaycontrol_only (a self-host without RelayAuth): the verifier never builds
+ * the RelayAuth path, so no JWKS is ever fetched and a bearer without the
+ * `sh_at_` prefix is 401 before any outbound call. A RelayAuth setting next to
+ * it is a contradiction and refuses startup, as does a missing piece of the
+ * relaycontrol introspection (so the mode can never silently fall back to 401
+ * not_configured on every request). Errors name variables, never values.
+ */
+function relaycontrolOnlyAuthConfig(env: NodeJS.ProcessEnv, policy: ReturnType<typeof destinationPolicy>): AuthConfig {
+  const mode = `${READ_API_AUTH_MODE_VAR}=relaycontrol_only`;
+  for (const name of ["RELAYAUTH_JWKS_URL", "RELAYAUTH_ISSUER"] as const)
+    if (env[name]?.trim()) throw new Error(`session read api: ${mode} refuses ${name}; unset it`);
+  if (env.RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS !== "true")
+    throw new Error(`session read api: ${mode} needs RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`);
+  const origin = env.READ_API_ORIGIN?.trim() || undefined;
+  const url = env.RELAYCONTROL_INTROSPECT_URL?.trim() || undefined;
+  const secret = env.RELAYCONTROL_INTROSPECT_SECRET?.trim() || undefined;
+  for (const [name, value] of [["READ_API_ORIGIN", origin], ["RELAYCONTROL_INTROSPECT_URL", url], ["RELAYCONTROL_INTROSPECT_SECRET", secret]] as const)
+    if (!value) throw new Error(`session read api: ${mode} needs ${name}`);
+  assertDestinationUrl("RELAYCONTROL_INTROSPECT_URL", url!, policy);
+  return { origin: env.READ_API_ORIGIN || undefined, mode: "relaycontrol_only", relaycontrol: { url, secret } };
+}
+
 /**
  * The verifier's destinations from env, validated with the shared transport
  * rule. Unset JWKS/issuer fall back to the hosted RelayAuth defaults in
- * packages/pipeline/src/env.ts; a self-host sets both.
+ * packages/pipeline/src/env.ts; a self-host sets both, or sets
+ * READ_API_AUTH_MODE=relaycontrol_only and neither.
  */
 export function readApiAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig {
   const policy = destinationPolicy(env);
+  if (readApiAuthMode(env) === "relaycontrol_only") return relaycontrolOnlyAuthConfig(env, policy);
   const jwksUrl = env.RELAYAUTH_JWKS_URL?.trim() || undefined;
   if (jwksUrl) assertDestinationUrl("RELAYAUTH_JWKS_URL", jwksUrl, policy);
   const config: AuthConfig = { origin: env.READ_API_ORIGIN || undefined, jwksUrl, issuer: env.RELAYAUTH_ISSUER };
@@ -317,6 +362,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const tls = postgresTlsOptions(env);
   const secret = parseReadApiSecret(secretText, backend === "clickhouse");
   const target = readerPoolTarget(secret.supabase_url, entry);
+  // Env only: a bad auth setting (including READ_API_AUTH_MODE) refuses before the pool opens.
+  const authConfig = readApiAuthConfig(env);
   const pool = new pg.Pool({
     ...target,
     max: 2,
@@ -340,7 +387,10 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   if (entry === "service" || backend !== "clickhouse") await assertReaderRole(pool, { supabase: (env.SESSION_POSTGRES_TLS_PROFILE ?? "supabase") === "supabase" });
   const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", poolTenantRunner(pool as never));
   if (adapter && await adapter.state.fromMs(new Date()) > completeSinceMs) throw new Error("read history floor is below search coverage");
-  const authConfig = readApiAuthConfig(env);
+  // The self-host service only: canonical S3 (LOCKER_*) behind timing, turns,
+  // metadata and catalog. The hosted Lambda never builds it (those routes keep
+  // their 501 `*_not_configured` there).
+  const canonical = entry === "service" ? await serviceCanonicalDeps(env, poolTenantRunner(pool as never)) : undefined;
   const deps: Omit<ReadApiDeps, "verify"> = {
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
@@ -349,7 +399,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
-    ...(selfhostReadApi ? { selfhost: { login: relaycontrolLogin(authConfig), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),
+    ...(canonical ? { timing: canonical.timing, turns: canonical.turns } : {}),
+    ...(selfhostReadApi ? { selfhost: { login: relaycontrolLogin(authConfig), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),
     log: (fields) => log.info("session read", fields),
   };
   return { deps, authConfig, close: () => pool.end() };

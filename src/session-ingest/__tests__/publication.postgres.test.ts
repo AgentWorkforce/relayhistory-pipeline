@@ -9,6 +9,7 @@ import {readFileSync,readdirSync,mkdtempSync,rmSync} from "node:fs";
 import {join} from "node:path";
 import {tmpdir} from "node:os";
 import {zstdDecompressSync}from "node:zlib";
+import {createHash}from "node:crypto";
 import {createFsStore} from "../../../packages/object-store/src/fs.ts";
 import {sqlLedger} from "../ledger-sql.ts";
 import {deliverBatch} from "../deliver.ts";
@@ -21,11 +22,13 @@ import type {ObjectStore} from "../../shared/vendor.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 const url=process.env.SESSION_INGEST_TEST_PG_URL;
 const GEN="a".repeat(64);
+const FRONTIER_CAPTURE="4".repeat(64),FRONTIER_PLAN="5".repeat(64),FRONTIER_EVIDENCE="6".repeat(64);
+const CANARY_PLAN_ID="77777777-7777-4777-8777-777777777777";
 const root=join(import.meta.dir,"../../..");
 const read=(p:string)=>readFileSync(join(root,p),"utf8").split("\n").filter(l=>!l.startsWith("\\")).join("\n");
 const clean:Array<()=>Promise<void>>=[];
 afterEach(async()=>{for(const f of clean.splice(0).reverse())await f();},30000);
-async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"})]){
+async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"})],guard=false){
  const admin=new pg.Client({connectionString:url});await admin.connect();const name="publisher_"+crypto.randomUUID().replaceAll("-","");
  await admin.query("CREATE DATABASE "+name);const u=new URL(url!);u.pathname="/"+name;
  const pool=new pg.Pool({connectionString:u.href});const dir=mkdtempSync(join(tmpdir(),"publisher-"));
@@ -39,6 +42,15 @@ async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"}
  await pool.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until,control_epoch)VALUES($1,$2,$2,$3,clock_timestamp()+interval'1 hour',repeat('3',64))",[TENANT.orgId,"a".repeat(64),GEN]);
  await initializeFixtureSeatClock(pool,GEN);
  if(frontier)await pool.query("INSERT INTO sessions.ingest_publication_frontiers VALUES($1,$2,$3,'origin-1',$4,$4,clock_timestamp()+interval'1 hour','synthetic','us-east-1','96bulls',$5)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,"b".repeat(64),GEN]);
+ if(guard){
+  await pool.query(read("src/session-ingest/__tests__/fixtures/publication-canary-guard.sql"));
+  if(frontier)await pool.query(`INSERT INTO sessions.proof_publication_frontier_attestations(
+   org_id,workspace_id,user_id,origin_id,capture_id,frontier_plan_sha256,frontier_evidence_sha256,
+   source_frontier_sha256,record_maxima_sha256,valid_until,target_bucket,target_region,key_root,schema_generation)
+   SELECT org_id,workspace_id,user_id,origin_id,$1,$2,$3,source_frontier_sha256,record_maxima_sha256,
+    valid_until,target_bucket,target_region,key_root,schema_generation FROM sessions.ingest_publication_frontiers`,
+   [FRONTIER_CAPTURE,FRONTIER_PLAN,FRONTIER_EVIDENCE]);
+ }
  const run=async(t:string,p:unknown[])=>{const c=await pool.connect();try{await c.query("SET ROLE bulls96_session_ingest");return await c.query(t,p);}finally{await c.query("RESET ROLE");c.release();}};
  const ledger=orderedFixtureLedger(sqlLedger(run,{acceptanceMode:"buffered",expectedGeneration:GEN}),pool);
  const store=createFsStore({root:dir}) as unknown as ObjectStore;
@@ -57,9 +69,69 @@ async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"}
  const claim=()=>call("ingest_publication_claim",{stageToken:stage,keyRoot:"96bulls",bucket:"synthetic",region:"us-east-1"});
  const target={bucket:"synthetic",region:"us-east-1",keyRoot:"96bulls",generation:GEN};
  const rpc=publicationRpc({queryBounded:async(q:string,p:unknown[],ctx:{signal:AbortSignal})=>{ctx.signal.throwIfAborted();return run(q,p);}}as never,target);
- return {pool,run,ledger,store,stage,call,claim,promote,target,rpc};
+ const canaryCreatedAt=new Date(Date.now()-1000).toISOString(),canaryExpiresAt=new Date(Date.now()+60_000).toISOString();
+ const inspect=()=>call("proof_publication_canary_inspect",{stageToken:stage,bucket:target.bucket,region:target.region,keyRoot:target.keyRoot,generation:GEN});
+ const guarded=(inspection:any,overrides:Record<string,unknown>={})=>{
+  const ownerId=String(overrides.ownerId??"offline-managed-canary"),planId=String(overrides.planId??CANARY_PLAN_ID);
+  const expiresAt=String(overrides.expiresAt??canaryExpiresAt);
+  const planJson=JSON.stringify({version:1,planId,ownerId,createdAt:canaryCreatedAt,expiresAt,
+   tenant:{orgId:inspection.expected.tenant.orgId,workspaceId:inspection.expected.tenant.workspaceId},target,
+   limits:{maxStages:1,maxRecordsPerStage:10,maxSessionsPerStage:4,maxStageMs:30000,maxPlanMs:60000,maxReads:128,maxReadBytes:33554432,maxPuts:128,maxPutBytes:33554432},
+   stages:[{stageToken:inspection.expected.stageToken,tenant:{orgId:inspection.expected.tenant.orgId,workspaceId:inspection.expected.tenant.workspaceId},
+    userId:inspection.expected.tenant.userId,originId:inspection.expected.originId,sha256:inspection.expected.stage.sha256,bytes:Number(inspection.expected.stage.bytes)}]});
+  return call("proof_publication_canary_claim",{planId,ownerId,planJson,planDigest:createHash("sha256").update(planJson).digest("hex"),expiresAt,
+   inspectionSha256:inspection.evidenceDigest,expected:inspection.expected,bucket:target.bucket,region:target.region,keyRoot:target.keyRoot,generation:GEN,
+   ...Object.fromEntries(Object.entries(overrides).filter(([key])=>!["ownerId","planId","expiresAt"].includes(key)))});
+ };
+ return {pool,run,ledger,store,stage,call,claim,promote,target,rpc,inspect,guarded};
 }
 describe.skipIf(!url)("background publisher actual PostgreSQL admission",()=>{
+ test("managed canary inspect and guarded claim bind exact owner-plan evidence with no ordinary-claim bypass",async()=>{
+  const d=await fixture(true,[record({record_id:"guarded-r1"})],true);
+  await expect(d.run("SELECT count(*) FROM sessions.ingest_stage_intents",[])).rejects.toMatchObject({code:"42501"});
+  await expect(d.claim()).rejects.toMatchObject({code:"42501"});
+  const inspected=await d.inspect();expect(inspected).toMatchObject({decision:"eligible",expected:{
+   stageToken:d.stage,tenant:{orgId:TENANT.orgId,workspaceId:TENANT.workspaceId,userId:TENANT.userId},originId:"origin-1",
+   frontier:{captureId:FRONTIER_CAPTURE,planSha256:FRONTIER_PLAN,evidenceSha256:FRONTIER_EVIDENCE}}});
+  await expect(d.guarded(inspected,{planJson:"{}"})).rejects.toMatchObject({code:"22023"});
+  const claimed=await d.guarded(inspected);expect(claimed.binding).toMatchObject({
+   planId:CANARY_PLAN_ID,ownerId:"offline-managed-canary",stageToken:d.stage,evidenceDigest:inspected.evidenceDigest});
+  expect(claimed.binding.planDigest).toMatch(/^[a-f0-9]{64}$/);
+  expect(claimed.ticket).toMatchObject({stageToken:d.stage,tenant:{...TENANT},originId:"origin-1",schemaGeneration:GEN});
+  const retried=await d.guarded(inspected);expect(retried.ticket.attemptToken).toBe(claimed.ticket.attemptToken);
+  await expect(d.guarded(inspected,{ownerId:"different-owner"})).rejects.toMatchObject({code:"40001"});
+  expect((await d.pool.query("SELECT count(*)::int n FROM sessions.proof_publication_canary_bindings WHERE attempt_token=$1",[claimed.ticket.attemptToken])).rows[0].n).toBe(1);
+ },15000);
+ test("guarded claim mismatch rolls back binding and every ordinary-claim side effect",async()=>{
+  const d=await fixture(true,[record({record_id:"guard-mismatch"})],true),inspected=await d.inspect();
+  const forged=structuredClone(inspected);forged.expected.stage.sha256="e".repeat(64);
+  await expect(d.guarded(forged)).rejects.toMatchObject({code:"40001"});
+  expect((await d.pool.query("SELECT count(*)::int n FROM sessions.proof_publication_canary_bindings")).rows[0].n).toBe(0);
+  expect((await d.pool.query("SELECT count(*)::int n FROM sessions.ingest_publication_attempts")).rows[0].n).toBe(0);
+  expect((await d.pool.query("SELECT count(*)::int n FROM sessions.ingest_publication_heads")).rows[0].n).toBe(0);
+  expect((await d.pool.query("SELECT publication_state FROM sessions.ingest_batches")).rows[0].publication_state).toBe("buffered");
+ },15000);
+ test("frontier mutation waits behind guarded binding and invalidates the resulting lease",async()=>{
+  const d=await fixture(true,[record({record_id:"guard-race"})],true),inspected=await d.inspect();
+  await d.pool.query(`CREATE FUNCTION public.pause_canary_binding()RETURNS trigger LANGUAGE plpgsql AS $p$
+   BEGIN PERFORM pg_advisory_xact_lock(960600);RETURN NEW;END$p$;
+   CREATE TRIGGER pause_canary_binding BEFORE INSERT ON sessions.proof_publication_canary_bindings
+   FOR EACH ROW EXECUTE FUNCTION public.pause_canary_binding()`);
+  const gate=await d.pool.connect();await gate.query("BEGIN;SELECT pg_advisory_xact_lock(960600)");
+  const claiming=d.guarded(inspected);
+  let waiting=false;
+  for(let i=0;i<100&&!waiting;i++){
+   const q=await d.pool.query("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event='advisory' AND query LIKE '%proof_publication_canary_claim%') waiting");
+   waiting=q.rows[0].waiting;if(!waiting)await new Promise(r=>setTimeout(r,10));
+  }
+  expect(waiting).toBe(true);
+  const mutation=d.pool.query("UPDATE sessions.ingest_publication_frontiers SET source_frontier_sha256=$1",["e".repeat(64)]);
+  await new Promise(r=>setTimeout(r,50));await gate.query("COMMIT");gate.release();
+  const claimed=await claiming;await mutation;
+  expect(claimed.ticket.stageToken).toBe(d.stage);
+  await expect(d.rpc.heartbeat(claimed.ticket,new AbortController().signal)).rejects.toMatchObject({code:"55000"});
+  expect((await d.pool.query("SELECT source_frontier_sha256 FROM sessions.ingest_publication_frontiers")).rows[0].source_frontier_sha256).toBe("e".repeat(64));
+ },15000);
  test("frontier absence refuses despite a durable buffered receipt",async()=>{
   const d=await fixture(false);await expect(d.claim()).rejects.toMatchObject({code:"55000"});
   expect((await d.pool.query("SELECT publication_state FROM sessions.ingest_batches")).rows[0].publication_state).toBe("buffered");

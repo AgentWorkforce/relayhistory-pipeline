@@ -19,6 +19,7 @@ import {
   turn,
   unzip,
 } from "./owner-buffered-support.ts";
+import { TURN_ORIGIN_ID } from "../../session-ingest/turns.ts";
 import {
   admission,
   causal,
@@ -89,12 +90,15 @@ const summaryKeys = [
   "totalInputTokens", "totalOutputTokens", "totalReasoningTokens", "userIds", "workState",
 ].sort();
 
-async function request(c: CausalCase, path: string) {
+/** One buffered session_event record (the events route projects it; the turns route ignores it). */
+const sessionEvent = { kind: "session_event", origin_id: TURN_ORIGIN_ID, record_id: "ev-1", revision: "1", operation: "upsert", received_at: "2026-11-05T12:00:00Z", payload: { text: "buffered event 1", ts_ms: 1_793_000_000_000, role: "user" } };
+
+async function request(c: CausalCase, path: string, opts: { events?: boolean } = {}) {
   const scratchStore = scratch();
   const calls: string[] = [];
   try {
     const witness = admission(c);
-    const stored = await putStage(scratchStore.store, 1, [turn(0)], {
+    const stored = await putStage(scratchStore.store, 1, opts.events ? [sessionEvent] : [turn(0)], {
       admission: { epoch: witness.admission_epoch, version: witness.admission_version },
     });
     const stage = { ...stored.row, ...witness };
@@ -135,6 +139,7 @@ async function request(c: CausalCase, path: string) {
       gate,
       store: observedStore,
       decompress: unzip,
+      ...(opts.events ? { events: true } : {}),
     };
     const app = createReadApi({
       verify: async () => ID,
@@ -158,7 +163,7 @@ function expectPostS3(calls: string[]) {
   expect(calls.indexOf("gate-2")).toBeGreaterThan(calls.indexOf("s3"));
 }
 
-describe("all 26 causal vectors through buffered list, turns, and metadata", () => {
+describe("all 26 causal vectors through buffered list, turns, metadata and events", () => {
   for (const c of causal.cases) {
     test(c.id, async () => {
       const visible = c.required.finalBufferedContentEmitted;
@@ -191,6 +196,22 @@ describe("all 26 causal vectors through buffered list, turns, and metadata", () 
       } else {
         expect([404, 501, 503]).toContain(result.response.status);
         expect(JSON.stringify(result.body)).not.toContain("buffered 0");
+      }
+      if (sqlEligible(c)) expectPostS3(result.calls);
+
+      // READ_API_OWNER_BUFFERED_EVENTS=on: the same gate decides the session events route.
+      result = await request(c, `/v1/sessions/${SESSION}/events?workspace=${SCOPE.workspaceId}&source=claude`, { events: true });
+      if (visible) {
+        expect(result.response.status).toBe(200);
+        expect(result.body.events.map((row: any) => row.content)).toEqual(["buffered event 1"]);
+        expect(result.response.headers.get("x-relayhistory-buffered")).toBe("1");
+      } else {
+        expect([200, 503]).toContain(result.response.status);
+        expect(JSON.stringify(result.body)).not.toContain("buffered event 1");
+        if (result.response.status === 200) {
+          expect(result.body.events).toEqual([]);
+          expect(result.response.headers.get("x-relayhistory-buffered")).toBeNull();
+        }
       }
       if (sqlEligible(c)) expectPostS3(result.calls);
     });

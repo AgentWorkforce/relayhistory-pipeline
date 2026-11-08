@@ -39,7 +39,19 @@ the role's attributes, its memberships in both directions and its pinned
 settings at startup, and refuses otherwise (`reader_role_<property>`). See "Postgres search prerequisites" under
 "Self-host SERVICE" in `docs/session-read-api-design.md`.
 
-It also carries `SERVICE=session-publication` (the canonical publisher,
+A self-host runs this service with no RelayAuth and no relayhistory-cloud.
+With `LOCKER_BUCKET` set, it serves `GET /v1/sessions/:id/timing`, `/turns`,
+`/metadata` and `/catalog` from the session's canonical objects in the Locker.
+It reads the same `LOCKER_*` names the other services read; MinIO is
+`LOCKER_ENDPOINT=http://minio:9000`. With `LOCKER_BUCKET` unset, those routes
+keep their 501 `*_not_configured`. `READ_API_AUTH_MODE=relaycontrol_only`
+accepts relaycontrol `sh_at_` tokens only. In that mode the RelayAuth verifier
+is never built, no JWKS is fetched, and a `RELAYAUTH_JWKS_URL` or
+`RELAYAUTH_ISSUER` setting refuses startup. Env table below; details in
+"Self-host canonical reads and `relaycontrol_only`" in
+`docs/session-read-api-design.md`.
+
+The services image also carries `SERVICE=session-publication` (the canonical publisher,
 `src/session-ingest/publication-service.ts --continuous`, default-off on
 `INGEST_PUBLISH_ENABLED`, probes on `WORKER_HEALTH_PORT`). The local stack does
 not run it either. The per-SERVICE ports, probes, single-origin routing and
@@ -107,13 +119,18 @@ keep their path unchanged either way.
 
 | Env | Where | Meaning |
 | --- | --- | --- |
-| `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS` | ingest, read API (Lambda and Worker) | Exactly `true` enables; anything else is off. Off, a `sh_at_` bearer is refused exactly as before. |
+| `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS` | ingest, read API (Lambda, Worker and the self-host SERVICE) | Exactly `true` enables; anything else is off. Off, a `sh_at_` bearer is refused exactly as before. |
 | `RELAYCONTROL_INTROSPECT_URL` | same | Relaycontrol's base URL, configuration only. Same transport rule as every destination: https, loopback, or `http` to an in-cluster Service name with `ALLOW_IN_CLUSTER_HTTP=true` (the Worker: https or loopback only). |
 | `RELAYCONTROL_INTROSPECT_SECRET` | same | The dedicated service secret, sent as `Authorization: Bearer`. From the secret store only, never a file. |
 | `RELAYHISTORY_SELFHOST_READ_API` | read API | Exactly `true` adds `POST /v1/cli/login` (pass-through `sh_at_` exchange through the introspection above, no refresh) and `GET /v1/sessions/:id/catalog`; unset/`""`/`false` off; anything else fails startup. See docs/session-read-api-design.md §2a. |
 | `SEARCH_INDEX_BACKEND` | session-read-api (enabled) | `postgres` (default; no ClickHouse, any known `PIPELINE_RUNTIME`) or `clickhouse` (hosted binding; needs the secret's `clickhouse` block). Anything else, including a name with no implementation in this build (`opensearch`), fails startup; the error names the variable, never the value. |
 | `SEARCH_INDEX_POSTGRES_BACKEND_ID` | session-read-api (enabled, `postgres`) | Required, `[a-zA-Z0-9._-]{1,128}`: the projection-state backend id the search writer records under. Coverage is `READ_API_COMPLETE_SINCE`. Not a credential. |
 | `SESSION_POSTGRES_TLS_PROFILE` | session-read-api (enabled) | Required explicitly (the Lambda's implicit `supabase` default does not apply): `supabase`, or `custom-ca` with `SESSION_POSTGRES_CA_FILE` and `SESSION_POSTGRES_CA_SHA256` (docs/portable-lambda-runtime.md). The pool gets discrete host/port/database/user/password from the secret's URL; URL `sslmode`/`options` never reach pg, and a URL without user, password or database fails startup. |
+| `READ_API_AUTH_MODE` | session-read-api (and the Lambda, which nothing hosted sets it on; the Worker ignores it) | Unset or `""`: the default (RelayAuth, plus relaycontrol when enabled above). Exactly `relaycontrol_only`: `sh_at_` tokens only, and the RelayAuth verifier is never built, so no JWKS fetch happens and any other bearer is 401 `invalid_token` with no outbound call. In this mode startup also requires `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`, `READ_API_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL` and `RELAYCONTROL_INTROSPECT_SECRET`, and refuses a non-blank `RELAYAUTH_JWKS_URL` or `RELAYAUTH_ISSUER`. Any other value fails startup. |
+| `LOCKER_BUCKET`, `LOCKER_PROVIDER`, `LOCKER_ENDPOINT`, `LOCKER_REGION`, `LOCKER_ACCESS_KEY_ID`, `LOCKER_SECRET_ACCESS_KEY`, `LOCKER_GCS_TOKEN_URI` | session-read-api (enabled) | The canonical store behind `/timing`, `/turns`, `/metadata` and `/catalog`. The names mean the same as for the other services, and the store is built by the same `buildLockerStore`: static keys from the secret store (MinIO), or, with no keys, EKS Pod Identity (`AWS_CONTAINER_CREDENTIALS_FULL_URI` and `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, refreshed before expiry). For `gcs`, `LOCKER_ENDPOINT` (the official API or a loopback emulator) and `LOCKER_GCS_TOKEN_URI` (the GKE metadata server by default, or loopback) are both honoured. `LOCKER_BUCKET` unset: those routes answer 501 `*_not_configured`. Set without a usable store: startup fails. |
+| `PIPELINE_ORG_FROM_PREFIX`, `PIPELINE_KEY_PREFIX` | session-read-api (with `LOCKER_BUCKET`) | `PIPELINE_ORG_FROM_PREFIX` must be exactly `true`, or startup fails. The org-prefix key layout is the only thing that binds an object to its org, so a static layout is refused, as in the session pipeline Lambda. `PIPELINE_KEY_PREFIX` must match the ingest's key layout. |
+| `READ_API_DIRECTORY_WORKSPACES` | read API | The canary allowlist for directory, timing, turns, catalog and login: comma-separated workspace ids or `*`. Unset means none (501 `*_workspace_not_enabled`). |
+| `READ_API_TIMING_ASSUME_NO_TURNS` | read API (Worker, self-host SERVICE) | Exactly `true`: time a session that has no legacy turn evidence as having no turns. Otherwise such a session is 501 `timing_turns_unknown`. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to

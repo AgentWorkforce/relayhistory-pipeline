@@ -42,7 +42,9 @@
  * Hyperdrive binding. READ_API_OWNER_BUFFERED_WORKSPACES is the owner-buffered canary allowlist (on
  * top of READ_API_DIRECTORY_WORKSPACES; unset = none; "*" = all-workspaces mode, which the deploy
  * render accepts only with READ_API_DIRECTORY_WORKSPACES="*" and which never bypasses the per-user
- * privacy gate). Flag, allowlist, bucket and binding are
+ * privacy gate). READ_API_OWNER_BUFFERED_EVENTS=on (default off; any value but unset/empty/"on" answers
+ * 503) adds owner-buffered session events on GET /v1/sessions/:sessionId/events with `source`; it
+ * has no effect without the owner-buffered flag and allowlists. Flag, allowlist, bucket and binding are
  * all unset in wrangler.jsonc; only the deploy workflow's owner_buffered=on render
  * (scripts/render-deploy-config.ts) adds them.
  */
@@ -75,7 +77,7 @@ import {
   type ServiceBinding,
 } from "../../../src/session-read-api/buffered-search-gate.ts";
 import { createS3Store } from "../../../src/shared/vendor.ts";
-import { boundedStreamDecompress, ownerBufferedEnabled, serviceBindingControlHead, sqlOwnerBufferedReads, type OwnerBufferedDeps } from "../../../src/session-read-api/owner-buffered.ts";
+import { boundedStreamDecompress, ownerBufferedEnabled, ownerBufferedEventsEnabled, serviceBindingControlHead, sqlOwnerBufferedReads, type OwnerBufferedDeps } from "../../../src/session-read-api/owner-buffered.ts";
 
 export interface Env extends CanonicalEnv {
   SUPABASE: Hyperdrive;
@@ -115,6 +117,13 @@ export interface Env extends CanonicalEnv {
   RELAYCONTROL_INTROSPECT_SECRET?: string;
   /** Owner-only buffered reads (Option C): only "1" or "true" enables; default off. */
   RELAYHISTORY_READ_OWNER_BUFFERED?: string;
+  /**
+   * Owner-buffered session events (GET /v1/sessions/:sessionId/events with `source`): unset or
+   * empty = off (default), exactly "on" enables, any other value refuses every request (503,
+   * logged missing_READ_API_OWNER_BUFFERED_EVENTS). No effect unless
+   * RELAYHISTORY_READ_OWNER_BUFFERED is on and the workspace is on both allowlists.
+   */
+  READ_API_OWNER_BUFFERED_EVENTS?: string;
   /** The owner-buffered canary allowlist (parseDirectoryWorkspaces syntax); unset/empty = none. */
   READ_API_OWNER_BUFFERED_WORKSPACES?: string;
   /** The ingest bucket holding buffered-batches/ stage objects (owner-buffered reads only). */
@@ -293,6 +302,12 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     // Owner-buffered on needs its privacy authority bound; refuse every request rather than run
     // a deploy whose flag says on and whose gate can only fence.
     if (ownerBufferedEnabled(env.RELAYHISTORY_READ_OWNER_BUFFERED) && typeof env.HISTORY_CONTROL_HEAD?.fetch !== "function") throw new ConfigError("HISTORY_CONTROL_HEAD");
+    // The events flag accepts only unset/empty or "on"; anything else is a misconfigured deploy.
+    try {
+      ownerBufferedEventsEnabled(env.READ_API_OWNER_BUFFERED_EVENTS);
+    } catch {
+      throw new ConfigError("READ_API_OWNER_BUFFERED_EVENTS");
+    }
   } catch (error) {
     // Configuration errors name a field, never a value.
     log("error", "read worker not configured", { error_code: error instanceof ConfigError ? `missing_${error.field}` : (error as { name?: string })?.name ?? "config" });
@@ -415,7 +430,18 @@ export function ownerBufferedDeps(env: Env, run: TenantRunner, fetcher: typeof f
     gate: serviceBindingControlHead(env.HISTORY_CONTROL_HEAD),
     store: createS3Store({ bucket, region: env.INGEST_S3_REGION?.trim() || "us-east-1", credentials: { accessKeyId, secretAccessKey }, fetch: fetcher }),
     decompress: boundedStreamDecompress(Decompress) /* stops at the bound; fzstd's one-shot form with a fixed buffer silently truncates */,
+    // Session events from buffered stages only with READ_API_OWNER_BUFFERED_EVENTS=on (handle() refused any other value).
+    ...(ownerBufferedEventsFlag(env) ? { events: true } : {}),
   };
+}
+
+/** READ_API_OWNER_BUFFERED_EVENTS as a boolean; a refused value is off here (handle() already answered 503 for it). */
+function ownerBufferedEventsFlag(env: Env): boolean {
+  try {
+    return ownerBufferedEventsEnabled(env.READ_API_OWNER_BUFFERED_EVENTS);
+  } catch {
+    return false;
+  }
 }
 
 export default {

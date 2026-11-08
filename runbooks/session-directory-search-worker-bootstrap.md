@@ -410,7 +410,12 @@ The migration gives it `USAGE` on `sessions` and `EXECUTE` on the three feed RPC
 right); each RPC admits only the genuine login (`session_user` is the role, role setting `none`).
 `hoopdb-migrate` runs the generated `supabase/bootstrap/buffered_search_feed_runtime_verify.sql` as
 the last phase 2 verifier. `supabase/bootstrap/buffered_search_feed_runtime_role.sql` grants LOGIN
-with the 5s/2s/10s timeout profile; run the verifier before and after it. The rollback revokes the
+with the 5s/2s/10s timeout profile; run the verifier before and after it.
+`supabase/bootstrap/buffered_search_feed_runtime_role_nologin.sql` reverts it (NOLOGIN, password cleared,
+timeouts reset; same Khaliq OK, feeder flag off and credential dropped first; the verifier accepts the
+resulting bare profile). NOLOGIN and the cleared password stop new authentication only; pooled
+connections already open keep working, so treat the revert as runtime disarm only once the feeder
+flag is off and in-flight feed invocations have finished. The rollback revokes the
 schema `USAGE` and keeps the role. Applying the migration, the LOGIN step and provisioning the
 feeder's credential (secret fields `buffered_search_feed_database_url` /
 `buffered_search_feed_database_ca_pem`, password from 1Password, never on disk) each need Khaliq's

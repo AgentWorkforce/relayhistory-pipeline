@@ -30,6 +30,12 @@ name: deploy session-read-worker
 # IAM grant); an on deploy refuses to run unless both exist. Every later dispatch without
 # inputs turns the feature off again.
 #
+# owner_buffered_events=on (valid only with owner_buffered=on; the render refuses it otherwise)
+# adds READ_API_OWNER_BUFFERED_EVENTS=on: owner-buffered session events on
+# GET /v1/sessions/:sessionId/events with `source`. off (or no input) renders exactly the
+# owner_buffered render without it. Turning it on is a production change: dispatch is Khaliq's
+# call. Every later dispatch without the input turns it off again.
+#
 # Buffered search gate (src/session-read-api/buffered-search-gate.ts, PR #338), default off.
 # buffered_search_gate=off (or no input) changes nothing: the render is byte-identical to the one
 # before this input existed. buffered_search_gate=on renders READ_API_BUFFERED_SEARCH_GATE=on and
@@ -54,6 +60,11 @@ on:
         description: 'Canary workspace ids, comma-separated, or exactly "*" for all workspaces (only if SESSION_READ_DIRECTORY_WORKSPACES is "*"); required when on'
         type: string
         default: ""
+      owner_buffered_events:
+        description: Owner-buffered session events (GET /v1/sessions/:id/events with source); valid only with owner_buffered=on. off = exactly the owner_buffered render
+        type: choice
+        options: ["off", "on"]
+        default: "off"
       buffered_search_gate:
         description: Per-hit privacy gate for buffered search hits (#338); needs no other input. off = exactly the default deploy
         type: choice
@@ -93,6 +104,8 @@ jobs:
       OWNER_BUFFERED_WORKSPACES: ${{ inputs.owner_buffered_workspaces }}
       OWNER_BUFFERED_S3_BUCKET: ${{ vars.SESSION_READ_INGEST_S3_BUCKET }}
       OWNER_BUFFERED_S3_REGION: ${{ vars.SESSION_READ_INGEST_S3_REGION }}
+      # Owner-buffered session events (default off); the render refuses on without owner_buffered=on.
+      OWNER_BUFFERED_EVENTS: ${{ inputs.owner_buffered_events }}
       # Buffered search gate (default off); renders the flag and the pinned binding when on.
       BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}
     defaults:

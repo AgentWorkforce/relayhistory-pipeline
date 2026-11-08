@@ -739,15 +739,16 @@ describe("sqlOwnerBufferedReads", () => {
 describe("no ungated path", () => {
   test("the module exports only gated readers of buffered content", () => {
     const names = Object.keys(ownerBuffered);
-    for (const hidden of ["readStagesUngated", "finalGate", "bufferedTurnRows", "redactQuotedTail", "scrubTurnRow", "scrubDeep", "sameAuthority", "specOf"])
+    for (const hidden of ["readStagesUngated", "finalGate", "bufferedTurnRows", "redactQuotedTail", "scrubTurnRow", "scrubDeep", "sameAuthority", "specOf", "readGatedSession", "bufferedEventRows", "scrubEventRow"])
       expect(names).not.toContain(hidden);
-    expect(names.filter((n) => /^read/u.test(n)).sort()).toEqual(["readOwnerBufferedList", "readOwnerBufferedTurns"]);
+    expect(names.filter((n) => /^read/u.test(n)).sort()).toEqual(["readOwnerBufferedEvents", "readOwnerBufferedList", "readOwnerBufferedTurns"]);
   });
   test("app.ts reaches buffered content only through the gated readers", () => {
     const app = readFileSync(join(import.meta.dir, "..", "app.ts"), "utf8");
     expect(app).not.toMatch(/readBufferedStage|readStagesUngated|\.reads\.(list|stages)\(|sqlOwnerBufferedReads/u);
     expect(app).toContain("readOwnerBufferedTurns(");
     expect(app).toContain("readOwnerBufferedList(");
+    expect(app).toContain("readOwnerBufferedEvents(");
   });
 });
 
