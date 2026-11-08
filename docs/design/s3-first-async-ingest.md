@@ -145,40 +145,45 @@ the user issued after uploading. Two cases matter:
 A disable alone is safe without anything new: the consumer's claim filters the deleted session.
 
 **The privacy journal.** One S3 object per (org, workspace, user):
-`…/m=srv_<sha(ws,user)>/privacy-journal.json`. It holds `{v:2, seq, pending[], done[], ordered?}`,
-and every edit is a compare-and-swap (If-Match / If-None-Match).
+`…/m=srv_<sha(ws,user)>/privacy-journal.json`. It holds
+`{v:3, seq, pending[], ambiguous[], ordered?:{epoch,maxVersion}}`, and every edit is a
+compare-and-swap (If-Match / If-None-Match).
 
 - **Witness (upload).** The request path reads `seq` BEFORE the body is read, for the identity
   the request claims. It keeps the witness only if the verified identity names the same tenant.
   The inbox header stores the witness.
-- **Controls.** `/v1/delivery/sessions/reset` (always) and `/v1/delivery/sessions/selection`
-  with `enabled: true` are journaled in modes `on` and `drain`:
-  - **begin, BEFORE the SQL:** record the control `pending`. If the journal cannot be written,
-    answer 503 and never call SQL (fail closed).
-  - **complete, AFTER the SQL applied:** remove the pending mark, `seq + 1`, remember the id. A
-    completion failure answers 503 so the caller retries; SQL replays and completion runs again.
-  - **abort, when it definitely did not apply:** a typed 4xx refusal; a database error carrying a
-    real SQLSTATE (a single autocommit statement that errored rolled back); or an ordered control
-    the SQL answered `stale`. Drop the pending mark; seq is unchanged.
-  - Only an ambiguous failure (connection class 08xxx, server shutdown 57P0x, a code-less
-    transport drop) leaves it pending. Without the abort rule, a control the buffered SQL always
-    refuses (a non-ordered one) would leave pending marks that the consumer later completes
-    conservatively, refusing uploads for nothing.
-- **Control identity (no advance on replay).**
-  - An ordered control is `(epoch, version)`. A version at or below the completed maximum is a
-    replay or stale, and changes nothing.
-  - A legacy reset is its `request_id`, which SQL keeps idempotent forever. Its completion writes
-    a durable create-only marker `…/reset-<sha256(request_id)>.json` (one per id, never evicted)
-    before the journal edit, so a replay after any number of other controls never advances `seq`.
-    Causal test: R0, 256 other resets, U, R0 replayed, U admitted. With the marker disabled the
-    test fails.
-  - A legacy re-enable has no idempotency key, so every one is new; the cost is over-refusal on
-    a literal double submit.
+- **Controls: ordered only.** Async admission runs only in buffered acceptance. There the SQL
+  routes every reset or selection to `ingest_apply_ordered_control`, which requires the
+  control, so a non-ordered reset or re-enable can never apply. In modes `on` / `drain` it is
+  refused before SQL, with the same 503 the SQL would give. A disable is not journaled and is
+  unchanged.
+- **Ordered resets and re-enables** are journaled by their `(epoch, version)`:
+  - **begin, BEFORE the SQL** (fail closed: no journal, no control). The result is one of:
+    - `unfinished`: an earlier attempt is still pending;
+    - `done`: a version at or below the completed maximum, which SQL can only replay or answer
+      stale;
+    - `ambiguous`: see below;
+    - `new`: now pending.
+  - **settle, AFTER the SQL, with SQL's own outcome:**
+    - `new` / `unfinished`: `applied` or `replay` gives `seq + 1`; `stale` aborts.
+    - `ambiguous`: `applied` gives `seq + 1`; `replay` / `stale` resolve with no change.
+    - A settlement failure answers 503; the retry replays and settles.
+  - **abort, when it definitely did not apply:** a typed 4xx, or a database error carrying a real
+    SQLSTATE (a single autocommit statement that errored rolled back). Only an ambiguous failure
+    (connection class 08xxx, server shutdown 57P0x, a code-less transport drop) stays pending.
 - **Gate (consumer, AFTER its claim, before any write).**
   - A fresh pending control means retry in 15 s; never admit across it.
-  - A pending control older than 120 s (its Worker died between SQL and completion) is completed
-    by the consumer itself (`seq + 1`), because it may have applied.
+  - A pending control older than 120 s (its Worker died between SQL and settlement) is counted by
+    the consumer itself (`seq + 1`) and kept **ambiguous**, because it may or may not have
+    applied. Its next attempt asks SQL:
+    - `replay`: it had applied, and the count stands.
+    - `applied`: it had not, and applies now, so `seq` advances again and uploads witnessed
+      before that apply are refused.
+    - A later completed version supersedes the ambiguity, since the earlier version can then
+      never newly apply.
   - Then refuse (`delivery_privacy_superseded`) iff `seq > witness`.
+- **No evictable state.** Replay knowledge is the never-decreasing `maxVersion` plus SQL's
+  outcome flag. The `ambiguous` set only holds stranded controls not yet superseded.
 
 Why it is sufficient, for an upload U (witness taken at its request entry, before its body) and
 a control C:
@@ -201,10 +206,14 @@ after the control's response), so it is admitted (tested). A refused batch's con
 admitted. A later NEW submission of the same batch carries its own witness, as a synchronous
 retry after a control would.
 
-**Mutation evidence** (PGlite, real SQL):
+**Causal tests and mutation evidence:**
 - Remove the journal: the reset and re-enable tests fail.
 - Take the witness after the body: the P0 stalled-stream test fails.
 - Advance on a replay: the P1-b test fails.
+- Drop the ambiguity marker: the stranded-control tests fail. Those tests cover R applied and
+  stranded, then 256 later controls, then U, then R replayed, with U admitted; R applied and
+  stranded, then replayed with SQL answering `replay`, with U admitted; and the inverse, R never
+  applied, then replayed with SQL answering `applied`, with U refused.
 
 **Read-time gate (R2 contract v5.3).** It is untouched and still re-verifies at display.
 Nothing under `.admission-inbox/` is readable through any read path:
@@ -298,7 +307,11 @@ the DLQ, its bytes remain under `96bulls/.admission-inbox/<org>/…`. `scripts/a
 is read-only: credentials come from the environment only, and it needs `s3:ListBucket`. It
 rebuilds the exact admission message for every inbox object that still holds content and is
 older than a threshold (`pendingAdmissions`), and prints one JSON line each for the operator to
-publish to the admission queue. Two properties make this safe:
+publish to the admission queue. Every argument that reaches the S3 host is validated strictly
+(region `^[a-z]{2}(-[a-z]+)+-\d$`, a plain bucket name, a plain org id). The S3 transport itself
+also refuses a region or bucket that could alter the request host, before any request is made.
+The `--org` scan is slash-bounded (`org-a` never matches `org-ab`). Two properties make this
+safe:
 - Tombstones and markers are told apart by size, an invariant enforced at encode: an inbox is
   always at least 256 bytes and a tombstone never is.
 - Over-sending is harmless: a terminal object acks, and a re-run admission replays the claim.

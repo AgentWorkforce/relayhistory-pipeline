@@ -109,15 +109,6 @@ const userDir = (keyRoot: string, tenant: LedgerTenant) =>
 export function journalKey(keyRoot: string, tenant: LedgerTenant): string {
   return `${userDir(keyRoot, tenant)}/privacy-journal.json`;
 }
-/**
- * A completed legacy reset's durable identity (one create-only object per request id, never evicted):
- * SQL keeps a reset idempotent by request id forever, so its replay must never advance seq, however
- * many controls came between. The journal stays small; only this marker grows with resets.
- */
-export function resetMarkerKey(keyRoot: string, tenant: LedgerTenant, requestId: string): string {
-  return `${userDir(keyRoot, tenant)}/reset-${sha256Hex(JSON.stringify(["admission-reset-v1", requestId]))}.json`;
-}
-
 // ---- inbox object ----
 
 interface InboxHeader {
@@ -245,26 +236,34 @@ export async function enqueueAdmission(target: AsyncAdmissionTarget, tenant: Led
 
 // ---- privacy journal ----
 //
-// One object per (org, workspace, user). `seq` only ever grows; it counts the user's COMPLETED
-// resets and re-enables. A control first records itself `pending` (before its SQL), then, after its
-// SQL, completes: pending removed, seq + 1, id remembered in `done`. An upload witnesses `seq`
-// BEFORE its body is read; the consumer, after its claim, refuses it when `seq` has grown since
-// (a control completed after the upload began) and waits while any control is pending. A replayed
-// control (its id already done) changes nothing, so it never refuses later uploads.
+// One object per (org, workspace, user). `seq` only ever grows; it counts the user's resets and
+// re-enables that applied (or may have applied). A control first records itself `pending` (before
+// its SQL); after the SQL it completes (pending removed, seq + 1) or aborts (it definitely did not
+// apply). An upload witnesses `seq` BEFORE its body is read; the consumer, after its claim, waits
+// while a control is pending and refuses when `seq` has grown since.
+//
+// Only ORDERED controls are journaled: buffered acceptance (the only mode async admission runs in)
+// routes every reset/selection to `ingest_apply_ordered_control`, which refuses a non-ordered one,
+// so app.ts refuses those before SQL. An ordered control's identity is (epoch, version); SQL's own
+// answer (applied | replay | stale) is the replay knowledge, so nothing here is evictable state:
+//   - version <= the completed maximum (same epoch): already applied or superseded -> "done";
+//   - a pending mark the consumer had to complete after its Worker died is kept as `ambiguous`
+//     (seq already counted it); its next attempt asks SQL: "applied" (it had NOT applied before)
+//     advances seq again, "replay" / "stale" do not.
 
 export const PENDING_TTL_MS = 120_000;
-const DONE_IDS = 256;
 interface PendingControl { id: string; startMs: number }
-interface Journal { v: 2; seq: number; pending: PendingControl[]; done: string[]; ordered?: { epoch: string; maxVersion: string } }
+interface Journal { v: 3; seq: number; pending: PendingControl[]; ambiguous: string[]; ordered?: { epoch: string; maxVersion: string } }
 const JOURNAL_ATTEMPTS = 8;
-const emptyJournal = (): Journal => ({ v: 2, seq: 0, pending: [], done: [] });
+const emptyJournal = (): Journal => ({ v: 3, seq: 0, pending: [], ambiguous: [] });
+const DECIMAL = /^[0-9]{1,19}$/;
 
 function validJournal(v: unknown): v is Journal {
-  if (!isObject(v) || v.v !== 2 || !Number.isSafeInteger(v.seq) || (v.seq as number) < 0 || !Array.isArray(v.pending) || !Array.isArray(v.done)) return false;
+  if (!isObject(v) || v.v !== 3 || !Number.isSafeInteger(v.seq) || (v.seq as number) < 0 || !Array.isArray(v.pending) || !Array.isArray(v.ambiguous)) return false;
   if (!(v.pending as unknown[]).every((p) => isObject(p) && typeof p.id === "string" && Number.isSafeInteger(p.startMs))) return false;
-  if (!(v.done as unknown[]).every((d) => typeof d === "string")) return false;
+  if (!(v.ambiguous as unknown[]).every((d) => typeof d === "string")) return false;
   const o = v.ordered as Record<string, unknown> | undefined;
-  return o === undefined || (isObject(o) && typeof o.epoch === "string" && typeof o.maxVersion === "string" && /^[0-9]{1,19}$/.test(o.maxVersion));
+  return o === undefined || (isObject(o) && typeof o.epoch === "string" && typeof o.maxVersion === "string" && DECIMAL.test(o.maxVersion));
 }
 
 async function readJournal(store: ObjectStore, key: string): Promise<{ journal: Journal; version?: string }> {
@@ -306,63 +305,65 @@ export async function witnessPrivacyJournal(store: ObjectStore, keyRoot: string,
   return (await readJournal(store, journalKey(keyRoot, tenant))).journal.seq;
 }
 
+/** An ordered privacy control's logical identity (control-protocol.ts): its epoch and version. */
+export interface PrivacyControlId { epoch: string; version: string }
+const idOf = (c: PrivacyControlId) => `o:${c.epoch}:${c.version}`;
+const assertId = (c: PrivacyControlId) => {
+  if (typeof c.epoch !== "string" || !c.epoch || typeof c.version !== "string" || !DECIMAL.test(c.version)) throw new Error("privacy_control_id_invalid");
+};
+const atOrBelowMax = (j: Journal, c: PrivacyControlId) => j.ordered?.epoch === c.epoch && BigInt(c.version) <= BigInt(j.ordered.maxVersion);
+const raiseMax = (j: Journal, c: PrivacyControlId) => {
+  if (j.ordered?.epoch !== c.epoch || BigInt(c.version) > BigInt(j.ordered.maxVersion)) j.ordered = { epoch: c.epoch, maxVersion: c.version };
+  // Anything at or below the new maximum can never newly apply: its ambiguity is moot.
+  j.ambiguous = j.ambiguous.filter((a) => { const [, e, v] = a.split(":"); return !(e === j.ordered!.epoch && BigInt(v!) <= BigInt(j.ordered!.maxVersion)); });
+};
+
 /**
- * A privacy control's logical identity: an ordered control's (epoch, version); a legacy reset's
- * request id (SQL-idempotent forever); a legacy re-enable has no idempotency key, so every one is new.
+ * begin, BEFORE the control's SQL (fail closed: a failure must refuse the control):
+ *   "unfinished" an earlier attempt is still pending (its completion may not have landed);
+ *   "done"       at or below the completed maximum: SQL can only replay or answer stale;
+ *   "ambiguous"  completed conservatively by a consumer; SQL's answer resolves it;
+ *   "new"        now pending.
  */
-export type PrivacyControlId =
-  | { kind: "ordered"; epoch: string; version: string }
-  | { kind: "reset"; requestId: string }
-  | { kind: "enable"; nonce: string };
-const idOf = (c: PrivacyControlId) => c.kind === "ordered" ? `o:${c.epoch}:${c.version}` : c.kind === "reset" ? `r:${c.requestId}` : `e:${c.nonce}`;
-
-/** begin: "done" (a replay: change nothing), "unfinished" (an earlier attempt is still pending), or "new" (now pending). */
-export type ControlBegin = "done" | "unfinished" | "new";
-
-async function resetCompleted(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, control: PrivacyControlId): Promise<boolean> {
-  if (control.kind !== "reset") return false;
-  return (await store.head(objectKey(resetMarkerKey(keyRoot, tenant, control.requestId)))) !== undefined;
-}
-
-/** BEFORE the control's SQL. Fail closed: a failure must refuse the control. */
+export type ControlBegin = "done" | "unfinished" | "ambiguous" | "new";
 export async function beginPrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, control: PrivacyControlId, nowMs: number): Promise<ControlBegin> {
+  assertId(control);
   const id = idOf(control);
-  const replayedReset = await resetCompleted(store, keyRoot, tenant, control);
   return editJournal<ControlBegin>(store, keyRoot, tenant, (j) => {
-    // An earlier attempt still pending is unfinished (its completion may not have landed), whatever else is known.
     if (j.pending.some((p) => p.id === id)) return { next: null, result: "unfinished" };
-    if (replayedReset || j.done.includes(id)) return { next: null, result: "done" };
-    if (control.kind === "ordered" && j.ordered?.epoch === control.epoch && BigInt(control.version) <= BigInt(j.ordered.maxVersion)) return { next: null, result: "done" };
+    if (atOrBelowMax(j, control)) return { next: null, result: "done" };
+    if (j.ambiguous.includes(id)) return { next: null, result: "ambiguous" };
     j.pending.push({ id, startMs: nowMs });
     return { next: j, result: "new" };
   });
 }
 
-/** AFTER the control's SQL applied (or answered replay for an attempt this journal had pending): seq + 1. */
-export async function completePrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, control: PrivacyControlId): Promise<void> {
+/**
+ * After the control's SQL answered. `outcome` is SQL's: "applied" (it changed the fence now),
+ * "replay" (it had already applied), "stale" (superseded; it never applies).
+ *   new / unfinished: applied or replay -> seq + 1 (this journal had not counted it); stale -> abort.
+ *   ambiguous:        applied -> seq + 1 (the conservative count was for an attempt that never
+ *                     applied); replay / stale -> resolved, seq unchanged (already counted, or never applies).
+ */
+export async function settlePrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, control: PrivacyControlId, begun: ControlBegin, outcome: "applied" | "replay" | "stale"): Promise<void> {
+  assertId(control);
+  if (begun === "done") return;
   const id = idOf(control);
-  // The durable reset identity first: if the journal edit below fails, a retry finds the id pending
-  // (unfinished) and completes it; a later replay finds the marker and never advances.
-  if (control.kind === "reset") {
-    try {
-      await store.put(objectKey(resetMarkerKey(keyRoot, tenant, control.requestId)), encoder.encode(JSON.stringify({ v: 1, kind: "admission-reset-done" })), { ifNoneMatch: true, contentType: "application/json" });
-    } catch (error) {
-      if (!isObjectStoreError(error, "already_exists") && !isObjectStoreError(error, "precondition_failed")) throw error;
-    }
-  }
   await editJournal(store, keyRoot, tenant, (j) => {
-    if (j.done.includes(id) && !j.pending.some((p) => p.id === id)) return { next: null, result: undefined };
+    const wasPending = j.pending.some((p) => p.id === id), wasAmbiguous = j.ambiguous.includes(id);
     j.pending = j.pending.filter((p) => p.id !== id);
-    j.seq += 1;
-    j.done = [...j.done.filter((d) => d !== id), id].slice(-DONE_IDS);
-    if (control.kind === "ordered" && (j.ordered?.epoch !== control.epoch || BigInt(control.version) > BigInt(j.ordered.maxVersion)))
-      j.ordered = { epoch: control.epoch, maxVersion: control.version };
+    j.ambiguous = j.ambiguous.filter((a) => a !== id);
+    const counted = begun === "ambiguous" ? outcome === "applied" : outcome !== "stale";
+    if (counted) j.seq += 1;
+    if (outcome !== "stale") raiseMax(j, control);
+    if (!counted && !wasPending && !wasAmbiguous && outcome === "stale") return { next: null, result: undefined };
     return { next: j, result: undefined };
   });
 }
 
-/** The control definitely did not apply (a typed refusal, or SQL answered stale): drop its pending mark, seq unchanged. */
+/** The control definitely did not apply (a typed refusal, or a SQL error that rolled back): drop its pending mark, seq unchanged. */
 export async function abortPrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, control: PrivacyControlId): Promise<void> {
+  assertId(control);
   const id = idOf(control);
   await editJournal(store, keyRoot, tenant, (j) => {
     if (!j.pending.some((p) => p.id === id)) return { next: null, result: undefined };
@@ -373,8 +374,9 @@ export async function abortPrivacyControl(store: ObjectStore, keyRoot: string, t
 
 /**
  * The consumer's post-claim gate. A fresh pending control: wait (retry). A pending control older
- * than PENDING_TTL_MS (its Worker died between SQL and completion): completed conservatively here
- * (seq + 1), because it may have applied. Then refuse iff seq grew since the upload's witness.
+ * than PENDING_TTL_MS (its Worker died between SQL and settlement): counted conservatively here
+ * (seq + 1) and kept `ambiguous`, so its next attempt lets SQL say whether it had applied. Then
+ * refuse iff seq grew since the upload's witness.
  */
 export async function assertNoLaterPrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, witnessSeq: number, nowMs: number): Promise<void> {
   const seq = await editJournal<number | "pending">(store, keyRoot, tenant, (j) => {
@@ -383,7 +385,7 @@ export async function assertNoLaterPrivacyControl(store: ObjectStore, keyRoot: s
     if (stale.length === 0) return { next: null, result: j.seq };
     j.pending = [];
     j.seq += 1;
-    j.done = [...j.done.filter((d) => !stale.some((p) => p.id === d)), ...stale.map((p) => p.id)].slice(-DONE_IDS);
+    j.ambiguous = [...new Set([...j.ambiguous, ...stale.map((p) => p.id)])];
     return { next: j, result: j.seq };
   });
   if (seq === "pending") throw new PrivacyControlPending();
@@ -446,12 +448,14 @@ const INBOX_ATTEMPT = /\/r=[0-9a-f]{64}\/a=\d{15}-[0-9a-f]{16}\.ndjson\.zst$/;
 export async function* pendingAdmissions(store: ObjectStore, keyRoot: string, opts: { nowMs: number; olderThanMs: number; orgId?: string }): AsyncGenerator<AdmissionMessage> {
   if (opts.orgId !== undefined) assertInboxTenant(keyRoot, opts.orgId);
   const prefix = `${keyRoot}/${INBOX_NAMESPACE}${opts.orgId !== undefined ? `/${opts.orgId}` : ""}`;
+  // Slash-bounded: org-a must never match org-ab (a store lists by string prefix).
+  const bounded = prefix + "/";
   let cursor: string | undefined;
   do {
     const page = await store.list(objectKey(prefix), cursor);
     for (const item of page.items) {
       const key = String(item.key);
-      if (!INBOX_ATTEMPT.test(key) || item.size < INBOX_MIN_BYTES) continue;
+      if (!key.startsWith(bounded) || !INBOX_ATTEMPT.test(key) || item.size < INBOX_MIN_BYTES) continue;
       if (opts.nowMs - item.lastModified.getTime() < opts.olderThanMs) continue;
       yield { v: 1, kind: "ingest-admission", key };
     }

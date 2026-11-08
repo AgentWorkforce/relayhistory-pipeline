@@ -11,7 +11,7 @@ import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC
 import { admitMessage, backoffSeconds } from "../admission-consumer.ts";
 import {
   ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, PENDING_TTL_MS, abortPrivacyControl, assertNoLaterPrivacyControl, asyncAdmissionMode, beginPrivacyControl,
-  completePrivacyControl, decodeInbox, encodeInbox, enqueueAdmission, inboxKey, journalKey, witnessPrivacyJournal, type AdmissionMessage,
+  decodeInbox, encodeInbox, enqueueAdmission, inboxKey, journalKey, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage,
 } from "../async-admission.ts";
 import { LedgerUnavailableError, type Ledger } from "../ledger.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
@@ -106,6 +106,24 @@ describe("request path", () => {
     expect(ledger.claims).toHaveLength(1);
   });
 
+  test("a non-ordered reset or re-enable is refused before SQL while async admission is on (buffered SQL refuses them anyway)", async () => {
+    const s = store();
+    const ledger = new MemoryLedger();
+    let calls = 0;
+    ledger.resetUploadedSessions = async () => { calls++; return 0; };
+    ledger.setSessionUploads = async () => { calls++; };
+    const a = app(s, async () => {}, ledger);
+    const { deliveryAccount } = await import("../vendor/delivery/prepare.ts");
+    const account = await deliveryAccount(TENANT);
+    const h = { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity(identity) };
+    expect((await a.request("/v1/delivery/sessions/reset", { method: "POST", headers: h, body: JSON.stringify({ account_id: account, request_id: "r", confirmation: "DELETE ALL SESSIONS" }) })).status).toBe(503);
+    expect((await a.request("/v1/delivery/sessions/selection", { method: "POST", headers: h, body: JSON.stringify({ account_id: account, origin_id: "o", sessions: [{ source: "claude", session_id: "s" }], enabled: true }) })).status).toBe(503);
+    expect(calls).toBe(0);
+    // A disable is not journaled and still reaches the ledger exactly as with async off.
+    expect((await a.request("/v1/delivery/sessions/selection", { method: "POST", headers: h, body: JSON.stringify({ account_id: account, origin_id: "o", sessions: [{ source: "claude", session_id: "s" }], enabled: false }) })).status).toBe(200);
+    expect(calls).toBe(1);
+  });
+
   test("a journal witness failure falls back to the synchronous path, never a refusal", async () => {
     const s = store();
     const broken = { ...s, getObject: async () => { throw Object.assign(new Error("s3 down"), { code: "transient" }); } } as typeof s;
@@ -121,10 +139,11 @@ describe("request path", () => {
     const ledger = new MemoryLedger();
     let resets = 0;
     ledger.resetUploadedSessions = async () => { resets++; return 0; };
+    (ledger as MemoryLedger & Ledger).applyOrderedControl = async () => { resets++; throw new Error("must not be reached"); };
     const broken = { ...s, getObject: async () => { throw Object.assign(new Error("s3 down"), { code: "transient" }); } } as typeof s;
     const a = app(broken, async () => {}, ledger);
     const { deliveryAccount } = await import("../vendor/delivery/prepare.ts");
-    const res = await a.request("/v1/delivery/sessions/reset", { method: "POST", headers: { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity(identity) }, body: JSON.stringify({ account_id: await deliveryAccount(TENANT), request_id: "r", confirmation: "DELETE ALL SESSIONS" }) });
+    const res = await a.request("/v1/delivery/sessions/reset", { method: "POST", headers: { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity({ ...identity, control: { epoch: "e".repeat(64), version: "1", digest: "d".repeat(64), kind: "reset" } } as never) }, body: JSON.stringify({ account_id: await deliveryAccount(TENANT), request_id: "r", confirmation: "DELETE ALL SESSIONS" }) });
     expect(res.status).toBe(503);
     expect(resets).toBe(0);
   });
@@ -184,88 +203,101 @@ describe("inbox object", () => {
 
 describe("privacy journal", () => {
   const j = async (s: ReturnType<typeof store>) => JSON.parse(new TextDecoder().decode(await readAll((await s.getObject(objectKey(journalKey("96bulls", TENANT)))).body)));
-  const reset = (requestId: string) => ({ kind: "reset" as const, requestId });
+  const E = "e".repeat(64);
+  const o = (version: number | string) => ({ epoch: E, version: String(version) });
+  const run = async (s: ReturnType<typeof store>, c: ReturnType<typeof o>, outcome: "applied" | "replay" | "stale", now = T0) => {
+    const begun = await beginPrivacyControl(s, "96bulls", TENANT, c, now);
+    await settlePrivacyControl(s, "96bulls", TENANT, c, begun, outcome);
+    return begun;
+  };
 
-  test("seq advances only on completion; replays and aborts change nothing; per user", async () => {
+  test("seq advances once per applied control; a replay or stale answer, an abort and a re-run change nothing; per user", async () => {
     const s = store();
     expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(0);
-    expect(await beginPrivacyControl(s, "96bulls", TENANT, reset("a"), T0)).toBe("new");
+    expect(await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0)).toBe("new");
     expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(0);
-    expect(await beginPrivacyControl(s, "96bulls", TENANT, reset("a"), T0 + 1)).toBe("unfinished");
-    await completePrivacyControl(s, "96bulls", TENANT, reset("a"));
+    expect(await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0 + 1)).toBe("unfinished");
+    await settlePrivacyControl(s, "96bulls", TENANT, o(1), "unfinished", "applied");
     expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(1);
-    // The same request id again: SQL replays it, the journal does not move.
-    expect(await beginPrivacyControl(s, "96bulls", TENANT, reset("a"), T0 + 2)).toBe("done");
-    await completePrivacyControl(s, "96bulls", TENANT, reset("a"));
+    for (const v of [1, 0]) expect(await run(s, o(v), "replay")).toBe("done");
     expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(1);
-    // A definite refusal: pending dropped, seq unchanged.
-    expect(await beginPrivacyControl(s, "96bulls", TENANT, reset("b"), T0)).toBe("new");
-    await abortPrivacyControl(s, "96bulls", TENANT, reset("b"));
+    expect(await run(s, o(2), "stale")).toBe("new"); // superseded: never applies
+    expect(await beginPrivacyControl(s, "96bulls", TENANT, o(3), T0)).toBe("new");
+    await abortPrivacyControl(s, "96bulls", TENANT, o(3));
     expect((await j(s)).pending).toEqual([]);
     expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(1);
     expect(await witnessPrivacyJournal(s, "96bulls", { ...TENANT, userId: "user-2" })).toBe(0);
   });
 
-  test("ordered controls: a version at or below the completed maximum is a replay (or stale), never an advance", async () => {
+  test("concurrent settlements each count (CAS), and the gate refuses exactly witnesses taken before them", async () => {
     const s = store();
-    const o = (version: string) => ({ kind: "ordered" as const, epoch: "e".repeat(64), version });
-    expect(await beginPrivacyControl(s, "96bulls", TENANT, o("5"), T0)).toBe("new");
-    await completePrivacyControl(s, "96bulls", TENANT, o("5"));
-    for (const v of ["5", "4"]) expect(await beginPrivacyControl(s, "96bulls", TENANT, o(v), T0)).toBe("done");
-    expect(await beginPrivacyControl(s, "96bulls", TENANT, o("6"), T0)).toBe("new");
-    await completePrivacyControl(s, "96bulls", TENANT, o("6"));
-    expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(2);
-  });
-
-  test("concurrent completions each count (CAS), and the gate refuses exactly witnesses taken before them", async () => {
-    const s = store();
-    for (const id of ["1", "2", "3", "4", "5"]) await beginPrivacyControl(s, "96bulls", TENANT, reset(id), T0);
-    await Promise.all(["1", "2", "3", "4", "5"].map((id) => completePrivacyControl(s, "96bulls", TENANT, reset(id))));
+    for (const v of [1, 2, 3, 4, 5]) await beginPrivacyControl(s, "96bulls", TENANT, o(v), T0);
+    await Promise.all([1, 2, 3, 4, 5].map((v) => settlePrivacyControl(s, "96bulls", TENANT, o(v), "new", "applied")));
     expect((await j(s)).seq).toBe(5);
     await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 4, T0)).rejects.toMatchObject({ code: "delivery_privacy_superseded" });
     await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 5, T0)).resolves.toBeUndefined();
   });
 
-  test("the gate waits on a fresh pending control and completes a stale one conservatively", async () => {
+  test("the gate waits on a fresh pending control and counts a stale one conservatively, keeping it ambiguous", async () => {
     const s = store();
-    await beginPrivacyControl(s, "96bulls", TENANT, reset("x"), T0);
+    await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0);
     await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 0, T0 + 1000)).rejects.toMatchObject({ code: "privacy_control_pending" });
     await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 0, T0 + PENDING_TTL_MS + 1)).rejects.toMatchObject({ code: "delivery_privacy_superseded" });
-    expect((await j(s))).toMatchObject({ seq: 1, pending: [] });
+    expect(await j(s)).toMatchObject({ seq: 1, pending: [], ambiguous: [`o:${E}:1`] });
   });
 
-  test("P1 causal: a legacy reset replayed after more than 256 other controls still never advances seq", async () => {
-    const s = store();
-    const ledger = new MemoryLedger();
-    const a = createIngestApp({ identify: (req) => bindingIdentity(req), log: () => {}, deliver: { ledger, acceptanceMode: "buffered", target: { store: s, keyRoot: "96bulls" } }, asyncAdmission: { mode: "on", enqueue: async () => {}, nowMs: () => T0 } });
-    const { deliveryAccount } = await import("../vendor/delivery/prepare.ts");
-    const account = await deliveryAccount(TENANT);
-    const resetRoute = (requestId: string) => a.request("/v1/delivery/sessions/reset", { method: "POST", headers: { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity(identity) }, body: JSON.stringify({ account_id: account, request_id: requestId, confirmation: "DELETE ALL SESSIONS" }) });
-    expect((await resetRoute("R0")).status).toBe(200);
-    for (let i = 1; i <= 256; i++) expect((await resetRoute(`other-${i}`)).status).toBe(200);
-    const witness = await witnessPrivacyJournal(s, "96bulls", TENANT); // U's witness after all 257 controls
-    expect(witness).toBe(257);
-    expect((await j(s)).done).not.toContain("r:R0"); // evicted from the bounded in-journal list
-    expect((await resetRoute("R0")).status).toBe(200); // the replay
-    expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(257);
-    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, witness, T0)).resolves.toBeUndefined();
-  }, 60_000);
+  // Dogpatch round 3, P1-a: R applied in SQL, its Worker died before settling; a consumer counted it.
+  const strandedApplied = async (s: ReturnType<typeof store>) => {
+    expect(await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0)).toBe("new"); // R: SQL applies, then the Worker dies
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 0, T0 + PENDING_TTL_MS + 1)).rejects.toThrow(); // the consumer counts R
+    expect((await j(s)).seq).toBe(1);
+  };
 
-  test("a control SQL refused with a SQLSTATE is aborted (no pending left to complete later); an ambiguous failure stays pending", async () => {
+  test("P1-a causal: an applied-then-stranded R, then 256 later controls, then U, then R replayed: U is admitted", async () => {
     const s = store();
-    const ledger = new MemoryLedger();
+    await strandedApplied(s);
+    for (let v = 2; v <= 257; v++) expect(await run(s, o(v), "applied")).toBe("new");
+    const witness = await witnessPrivacyJournal(s, "96bulls", TENANT); // U
+    expect(witness).toBe(257);
+    expect(await run(s, o(1), "stale")).toBe("done"); // R replayed: below the maximum, SQL can only answer stale/replay
+    expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(257);
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, witness, T0 + PENDING_TTL_MS + 2)).resolves.toBeUndefined();
+  });
+
+  test("P1-a causal: an applied-then-stranded R replayed with no later control: SQL says replay, seq does not move, U admitted", async () => {
+    const s = store();
+    await strandedApplied(s);
+    const witness = await witnessPrivacyJournal(s, "96bulls", TENANT);
+    expect(await run(s, o(1), "replay")).toBe("ambiguous");
+    expect(await j(s)).toMatchObject({ seq: 1, ambiguous: [] });
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, witness, T0 + PENDING_TTL_MS + 2)).resolves.toBeUndefined();
+  });
+
+  test("P1-a inverse: a stranded R that NEVER applied, replayed later, applies then: seq advances and U (witnessed before) is refused", async () => {
+    const s = store();
+    expect(await beginPrivacyControl(s, "96bulls", TENANT, o(1), T0)).toBe("new"); // R: the Worker dies BEFORE its SQL ran
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 0, T0 + PENDING_TTL_MS + 1)).rejects.toThrow();
+    const witness = await witnessPrivacyJournal(s, "96bulls", TENANT); // U, after the conservative count, before the real apply
+    expect(await run(s, o(1), "applied")).toBe("ambiguous"); // the replay is R's first real application
+    expect((await j(s)).seq).toBe(witness + 1);
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, witness, T0 + PENDING_TTL_MS + 2)).rejects.toMatchObject({ code: "delivery_privacy_superseded" });
+  });
+
+  test("a control SQL refused with a SQLSTATE is aborted (no pending left to count later); an ambiguous failure stays pending", async () => {
+    const s = store();
+    const ledger = new MemoryLedger() as MemoryLedger & Ledger;
     const a = createIngestApp({ identify: (req) => bindingIdentity(req), log: () => {}, deliver: { ledger, acceptanceMode: "buffered", target: { store: s, keyRoot: "96bulls" } }, asyncAdmission: { mode: "on", enqueue: async () => {}, nowMs: () => T0 } });
     const { deliveryAccount } = await import("../vendor/delivery/prepare.ts");
     const account = await deliveryAccount(TENANT);
-    const send = () => a.request("/v1/delivery/sessions/selection", { method: "POST", headers: { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity(identity) }, body: JSON.stringify({ account_id: account, origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s" }], enabled: true }) });
-    // Buffered SQL refuses a non-ordered control (22023): definitely rolled back.
-    ledger.setSessionUploads = async () => { throw new LedgerUnavailableError("ledger_input_refused", { db_error_class: "other", db_error_code: "22023", db_error_basis: "code" } as never); };
-    expect((await send()).status).toBe(503);
+    const send = (version: string) => a.request("/v1/delivery/sessions/selection", { method: "POST", headers: { "content-type": "application/json",
+      [IDENTITY_HEADER]: encodeIdentity({ ...identity, control: { epoch: E, version, digest: "d".repeat(64), kind: "selection" } } as never) },
+      body: JSON.stringify({ account_id: account, origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s" }], enabled: true }) });
+    ledger.applyOrderedControl = async () => { throw new LedgerUnavailableError("ledger_sqlstate_55000", { db_error_class: "other", db_error_code: "55000", db_error_basis: "code" } as never); };
+    expect((await send("1")).status).toBe(503);
     expect((await j(s)).pending).toEqual([]);
     await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 0, T0 + PENDING_TTL_MS + 1)).resolves.toBeUndefined();
-    // A dropped connection: it may have committed, so the mark stays (and is completed conservatively later).
-    ledger.setSessionUploads = async () => { throw new LedgerUnavailableError("ledger_connection", { db_error_class: "transport", db_error_code: "ECONNRESET", db_error_basis: "code" } as never); };
-    expect((await send()).status).toBe(503);
+    ledger.applyOrderedControl = async () => { throw new LedgerUnavailableError("ledger_connection", { db_error_class: "transport", db_error_code: "ECONNRESET", db_error_basis: "code" } as never); };
+    expect((await send("2")).status).toBe(503);
     expect((await j(s)).pending).toHaveLength(1);
   });
 
@@ -340,7 +372,7 @@ describe("consumer", () => {
   test("a pending privacy control is a retry with a short delay, never a refusal or an admission", async () => {
     const q = await queued();
     const ledger = new MemoryLedger();
-    await beginPrivacyControl(q.s, "96bulls", TENANT, { kind: "reset", requestId: "p" }, T0 + 5000);
+    await beginPrivacyControl(q.s, "96bulls", TENANT, { epoch: "e".repeat(64), version: "1" }, T0 + 5000);
     ledger.prepareBufferStage = async () => { throw new Error("must not be reached"); };
     expect(await admitMessage(deps(q.s, ledger), q.message, 1)).toMatchObject({ action: "retry", code: "privacy_control_pending", delaySeconds: 15 });
   });
@@ -359,13 +391,35 @@ describe("durable recovery (the queue is not the authority)", () => {
     const done = await enqueue("done");
     await tombstoneInbox(s, done);
     const other = await enqueue("other-org", { orgId: "org-b", workspaceId: "ws-b", userId: "user-9" });
+    const prefixTwin = await enqueue("prefix-twin", { orgId: "org-ab", workspaceId: "ws-a", userId: "user-1" });
     // Journals and outcome markers live under the same prefix and are never listed as work.
-    await beginPrivacyControl(s, "96bulls", TENANT, { kind: "reset", requestId: "x" }, T0);
+    await beginPrivacyControl(s, "96bulls", TENANT, { epoch: "e".repeat(64), version: "1" }, T0);
     const now = Date.now();
-    expect((await recoverLines(s, { keyRoot: "96bulls", nowMs: now + 3_600_000, olderThanMs: 60_000 })).map((l) => JSON.parse(l).key).sort()).toEqual([other, pending].sort());
+    expect((await recoverLines(s, { keyRoot: "96bulls", nowMs: now + 3_600_000, olderThanMs: 60_000 })).map((l) => JSON.parse(l).key).sort()).toEqual([other, pending, prefixTwin].sort());
+    // --org org-a is slash-bounded: org-ab's objects are not org-a's.
     expect(await recoverLines(s, { keyRoot: "96bulls", nowMs: now + 3_600_000, olderThanMs: 60_000, orgId: "org-a" })).toEqual([JSON.stringify({ v: 1, kind: "ingest-admission", key: pending })]);
+    expect(await recoverLines(s, { keyRoot: "96bulls", nowMs: now + 3_600_000, olderThanMs: 60_000, orgId: "org-ab" })).toEqual([JSON.stringify({ v: 1, kind: "ingest-admission", key: prefixTwin })]);
     // Too fresh: an upload still in its normal queue window is left to the queue.
     expect(await recoverLines(s, { keyRoot: "96bulls", nowMs: now, olderThanMs: 60_000 })).toEqual([]);
+  });
+});
+
+describe("recovery CLI: nothing reaches a host it should not", () => {
+  test("strict --region / --bucket / --org, and the S3 transport itself refuses a host-altering region or bucket with zero fetches", async () => {
+    const { parseRecoverArgs } = await import("../../../scripts/admission-inbox-recover.ts");
+    const ok = parseRecoverArgs(["--bucket", "synthetic-transcripts-111122223333", "--region", "us-east-1", "--org", "org-a"]);
+    expect(ok).toMatchObject({ bucket: "synthetic-transcripts-111122223333", region: "us-east-1", orgId: "org-a", olderThanMs: 3_600_000 });
+    for (const region of ["us-east-1@evil.example/x", "us-east-1.evil.example", "127.0.0.1", "localhost", "us-east-1:443", "US-EAST-1", ""])
+      expect(() => parseRecoverArgs(["--bucket", "b-bucket", "--region", region])).toThrow("--region");
+    for (const bucket of ["evil.example/x", "a@b", "127.0.0.1", "x..y", "UPPER", "a", ""])
+      expect(() => parseRecoverArgs(["--bucket", bucket])).toThrow("--bucket");
+    expect(() => parseRecoverArgs(["--bucket", "b-bucket", "--org", "org/a"])).toThrow("--org");
+    const { createS3Store } = await import("../../shared/vendor.ts");
+    let fetches = 0;
+    const spy = (async () => { fetches++; return new Response("", { status: 500 }); }) as unknown as typeof fetch;
+    for (const [bucket, region] of [["b-bucket", "us-east-1@evil.example/x"], ["b-bucket", "127.0.0.1:8080"], ["evil.example/x", "us-east-1"], ["a@127.0.0.1", "us-east-1"]])
+      expect(() => createS3Store({ bucket, region, credentials: { accessKeyId: "k", secretAccessKey: "s" }, fetch: spy } as never)).toThrow();
+    expect(fetches).toBe(0);
   });
 });
 

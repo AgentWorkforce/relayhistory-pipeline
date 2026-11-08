@@ -14,7 +14,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { sqlLedger } from "../ledger-sql.ts";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
 import { admitMessage } from "../admission-consumer.ts";
-import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, PENDING_TTL_MS, beginPrivacyControl, completePrivacyControl, type AdmissionMessage, type AsyncAdmissionMode } from "../async-admission.ts";
+import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, PENDING_TTL_MS, beginPrivacyControl, settlePrivacyControl, type AdmissionMessage, type AsyncAdmissionMode } from "../async-admission.ts";
 import type { Ledger } from "../ledger.ts";
 import { deliveryAccount } from "../vendor/delivery/prepare.ts";
 import { orderedFixtureLedger, initializeFixtureSeatClock } from "./ordered-support.ts";
@@ -53,13 +53,27 @@ async function fixture(mode: AsyncAdmissionMode = "on") {
   const app = createIngestApp({ identify: (req) => bindingIdentity(req), deliver, log: () => {}, asyncAdmission: { mode, enqueue: async (m) => { queue.push(m); }, nowMs: () => clock } });
   const id = (accept: boolean) => ({ [IDENTITY_HEADER]: encodeIdentity({ ...identity, ...(accept ? { admission: ADMISSION_ACCEPT_VALUE } : {}) }) });
   const post = async (b: unknown, accept = true, body?: BodyInit) => app.request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json", ...id(accept) }, body: body ?? JSON.stringify({ protocolVersion: 1, batch: b }), ...(body ? { duplex: "half" } : {}) } as RequestInit);
-  const control = async (path: string, body: unknown) => app.request(path, { method: "POST", headers: { "content-type": "application/json", ...id(false) }, body: JSON.stringify(body) });
+  // Buffered SQL accepts only ORDERED controls (as relayhistory sends them): next version, digest as SQL computes it.
+  const ordered = async (kind: "selection" | "reset", payload: unknown, version?: string) => {
+    const r = await db.query("SELECT coalesce((SELECT max(version) FROM sessions.ingest_control_receipts WHERE org_id=$2 AND workspace_id=$3 AND user_id=$4 AND epoch=$1),0)::text AS v,encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',$1::text,$2::text,$3::text,$4::text,$5::text,$6::jsonb)::text,'UTF8')),'hex') AS d",
+      [epoch, TENANT.orgId, TENANT.workspaceId, TENANT.userId, kind, JSON.stringify(payload)]);
+    const row = r.rows[0] as { v: string; d: string };
+    return { epoch, version: version ?? (BigInt(row.v) + 1n).toString(), digest: row.d, kind };
+  };
+  let lastControl: { version: string } | undefined;
+  const control = async (path: string, body: Record<string, any>, version?: string) => {
+    const kind = path.endsWith("/reset") ? "reset" as const : "selection" as const;
+    const payload = kind === "reset" ? { request_id: body.request_id } : { origin_id: body.origin_id, sessions: body.sessions.map((x: { source: string; session_id: string }) => ({ source: x.source, session_id: x.session_id })), enabled: body.enabled };
+    const ctl = await ordered(kind, payload, version);
+    lastControl = ctl;
+    return app.request(path, { method: "POST", headers: { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity({ ...identity, control: ctl } as never) }, body: JSON.stringify(body) });
+  };
   const consume = async (m: AdmissionMessage, attempts = 1, consumerMode: AsyncAdmissionMode = mode) =>
     admitMessage({ mode: consumerMode, deliver, custodySource: "relayhistory", decompress: zstd, nowMs: () => clock }, m, attempts);
   const outbox = async (batchId: string) => (await db.query("SELECT o.active_stage_token FROM sessions.ingest_buffer_outbox o WHERE o.batch_id=$1", [batchId])).rows[0]?.active_stage_token as string | undefined;
   const status = async (originId: string, receiptId: string) => (await app.request(`/v1/delivery/admission?originId=${originId}&receiptId=${receiptId}`, { headers: id(false) })).json() as Promise<{ state: string; code?: string }>;
-  const reset = async (requestId: string) => control("/v1/delivery/sessions/reset", { account_id: await deliveryAccount(TENANT), request_id: requestId, confirmation: "DELETE ALL SESSIONS" });
-  return { db, app, post, control, reset, consume, queue, outbox, status, ledgerCalls: () => ledgerCalls, tick: (ms: number) => { clock += ms; }, now: () => clock, target, deliver };
+  const reset = async (requestId: string, version?: string) => control("/v1/delivery/sessions/reset", { account_id: await deliveryAccount(TENANT), request_id: requestId, confirmation: "DELETE ALL SESSIONS" }, version);
+  return { db, app, post, control, reset, ordered, lastVersion: () => lastControl!.version, consume, queue, outbox, status, ledgerCalls: () => ledgerCalls, tick: (ms: number) => { clock += ms; }, now: () => clock, target, deliver };
 }
 
 test("ACK needs no ledger call; the consumer admits through the real buffered path; a retry replays", async () => {
@@ -189,10 +203,13 @@ test("P0 causal: an upload whose body is still streaming while a reset completes
 test("P1-b: an idempotent reset replay never refuses an upload taken after the original reset", async () => {
   const f = await fixture();
   expect((await f.reset("r-1")).status).toBe(200);
+  const v1 = f.lastVersion();
   f.tick(1000);
   await f.post(await batch([record({ record_id: "between" })], { batch_id: "between-1" }));
   f.tick(1000);
-  expect((await f.reset("r-1")).status).toBe(200); // the same request id: SQL replays it
+  const replay = await f.reset("r-1", v1); // relayhistory re-sends the same ordered control: SQL replays it
+  expect(replay.status).toBe(200);
+  expect(((await replay.json()) as { control: { outcome: string } }).control.outcome).toBe("replay");
   expect(await f.consume(f.queue[0]!)).toMatchObject({ action: "ack", outcome: "admitted" });
   expect(await f.outbox("between-1")).toBeString();
   // A NEW reset still refuses what was uploaded before it.
@@ -205,14 +222,16 @@ test("P1-b: an idempotent reset replay never refuses an upload taken after the o
 test("a control in flight makes the consumer wait; a stale pending one (its Worker died) completes conservatively", async () => {
   const f = await fixture();
   await f.post(await batch([record({ record_id: "w1" })], { batch_id: "wait-1" }));
-  expect(await beginPrivacyControl(f.target.store, f.target.keyRoot, TENANT, { kind: "reset", requestId: "in-flight" }, f.now())).toBe("new");
+  const inFlight = { epoch, version: "900" };
+  expect(await beginPrivacyControl(f.target.store, f.target.keyRoot, TENANT, inFlight, f.now())).toBe("new");
   expect(await f.consume(f.queue[0]!)).toMatchObject({ action: "retry", code: "privacy_control_pending" });
   expect(await f.outbox("wait-1")).toBeUndefined();
   // Its Worker died between SQL and completion: past the TTL the consumer completes it itself, and refuses.
   f.tick(PENDING_TTL_MS + 1);
   expect(await f.consume(f.queue[0]!, 2)).toMatchObject({ action: "ack", outcome: "refused", code: "delivery_privacy_superseded" });
-  // A control that does complete: the next upload (witnessed after it) is admitted.
-  await completePrivacyControl(f.target.store, f.target.keyRoot, TENANT, { kind: "reset", requestId: "in-flight" });
+  // Its next attempt: SQL says it had applied (replay), so the conservative count stands and nothing advances again.
+  expect(await beginPrivacyControl(f.target.store, f.target.keyRoot, TENANT, inFlight, f.now())).toBe("ambiguous");
+  await settlePrivacyControl(f.target.store, f.target.keyRoot, TENANT, inFlight, "ambiguous", "replay");
   await f.post(await batch([record({ record_id: "w2" })], { batch_id: "wait-2" }));
   expect(await f.consume(f.queue[1]!)).toMatchObject({ action: "ack", outcome: "admitted" });
 });
@@ -241,4 +260,14 @@ test("P2: the opt-in is honoured only inside the identity; a sibling caller with
   // An identity carrying any other admission value is refused outright (it is signed input).
   const bad = await f.app.request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity({ ...identity, admission: "queued-v2" } as never) }, body: "{}" });
   expect(bad.status).toBe(401);
+});
+
+test("legacy (non-ordered) privacy controls are refused before SQL while async admission is on (buffered SQL would refuse them)", async () => {
+  const f = await fixture();
+  const res = await f.app.request("/v1/delivery/sessions/reset", { method: "POST", headers: { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity(identity) },
+    body: JSON.stringify({ account_id: await deliveryAccount(TENANT), request_id: "legacy", confirmation: "DELETE ALL SESSIONS" }) });
+  expect(res.status).toBe(503);
+  // Nothing journaled, so nothing can later be completed conservatively.
+  await f.post(await batch([record({ record_id: "after-legacy" })], { batch_id: "after-legacy" }));
+  expect(await f.consume(f.queue[0]!)).toMatchObject({ action: "ack", outcome: "admitted" });
 });

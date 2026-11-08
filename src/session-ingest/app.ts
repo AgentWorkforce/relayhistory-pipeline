@@ -38,7 +38,7 @@ import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { assertWithinBudget, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
 import { assertTenantSegment } from "./writer.ts";
-import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, completePrivacyControl, enqueueAdmission, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode, type PrivacyControlId } from "./async-admission.ts";
+import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, enqueueAdmission, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
@@ -360,13 +360,16 @@ export function createIngestApp(deps: IngestAppDeps) {
   const nowMs = deps.asyncAdmission?.nowMs ?? Date.now;
   /**
    * A reset or re-enable, bracketed by the privacy journal (async-admission.ts) while async admission
-   * may have uploads in flight (on / drain): pending BEFORE the SQL (fail closed: no journal, no
-   * control), completed (seq + 1) after it applied, aborted when it definitely did not. A replay of a
-   * control the journal already completed changes nothing. `applied` reads the SQL answer.
+   * may have uploads in flight (on / drain). Only ORDERED controls: buffered SQL refuses any other
+   * (ingest_apply_ordered_control requires the control), so one is refused here before SQL with the
+   * same 503. begin BEFORE the SQL (fail closed: no journal, no control); after it, settle with
+   * SQL's own outcome (applied | replay | stale), or abort when it definitely did not apply.
    */
-  const journaled = async <T>(tenant: { orgId: string; workspaceId: string; userId: string }, id: PrivacyControlId, run: () => Promise<T>, applied: (r: T) => boolean = () => true): Promise<T> => {
+  const journaled = async <T>(tenant: { orgId: string; workspaceId: string; userId: string }, control: OrderedControl | undefined, run: () => Promise<T>, outcomeOf: (r: T) => "applied" | "replay" | "stale"): Promise<T> => {
     if (asyncMode === "off") return run();
+    if (!control) throw new IngestUnavailable("privacy_journal", "control_unordered");
     const { store, keyRoot } = deps.deliver.target;
+    const id = { epoch: control.epoch, version: control.version };
     let begun;
     try { begun = await beginPrivacyControl(store, keyRoot, tenant, id, nowMs()); } catch { throw new IngestUnavailable("privacy_journal", "privacy_journal_unavailable"); }
     let result: T;
@@ -374,19 +377,16 @@ export function createIngestApp(deps: IngestAppDeps) {
       result = await run();
     } catch (error) {
       // Definitely not applied (a typed 4xx, or a SQL error with a SQLSTATE: the statement rolled back):
-      // drop the pending mark, or the consumer would later complete it conservatively and refuse uploads.
-      // Anything ambiguous (a dropped connection) stays pending: TTL, then conservative completion.
+      // drop the pending mark. Anything ambiguous (a dropped connection) stays pending: TTL, then the
+      // consumer counts it conservatively and keeps it ambiguous for SQL to resolve on replay.
       if (begun === "new" && definitelyNotApplied(error)) await abortPrivacyControl(store, keyRoot, tenant, id).catch(() => {});
       throw error;
     }
-    if (begun !== "done") {
-      try {
-        if (applied(result)) await completePrivacyControl(store, keyRoot, tenant, id);
-        else await abortPrivacyControl(store, keyRoot, tenant, id);
-      } catch {
-        // Applied but not completed: answer 503 so the caller retries (SQL replays; completion runs again).
-        throw new IngestUnavailable("privacy_journal", "privacy_journal_completion");
-      }
+    try {
+      await settlePrivacyControl(store, keyRoot, tenant, id, begun, outcomeOf(result));
+    } catch {
+      // Applied but not settled: answer 503 so the caller retries (SQL replays; settlement runs again).
+      throw new IngestUnavailable("privacy_journal", "privacy_journal_completion");
     }
     return result;
   };
@@ -618,8 +618,8 @@ export function createIngestApp(deps: IngestAppDeps) {
       let controlAck;
       // A re-enable lifts a tombstone: an upload that began before it must not be admitted after it.
       // (A disable needs no journal: the consumer's claim already filters a deleted session.)
-      const journal = <T>(run: () => Promise<T>, applied?: (r: T) => boolean) => !input.enabled ? run()
-        : journaled(selection.tenant, identity.control ? { kind: "ordered", epoch: identity.control.epoch, version: identity.control.version } : { kind: "enable", nonce: crypto.randomUUID() }, run, applied);
+      const journal = <T>(run: () => Promise<T>, outcomeOf: (r: T) => "applied" | "replay" | "stale") => !input.enabled ? run()
+        : journaled(selection.tenant, identity.control, run, outcomeOf);
       {const t={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
        if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("selection",t,input.origin_id)));
        else if(identity.control&&c.get("custody"))await shadow("delivery.sessions.selection",c.get("custody")!,()=>controlWitnessInput("selection",t,input.origin_id));}
@@ -627,9 +627,9 @@ export function createIngestApp(deps: IngestAppDeps) {
       if(identity.control){
         if(identity.control.kind!=="selection"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
         const control=identity.control;
-        const result=await journal(async()=>orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...selection,control:{...control,kind:"selection"},...(custody?{custody}:{})}),control),(r)=>r.control.outcome!=="stale");
+        const result=await journal(async()=>orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...selection,control:{...control,kind:"selection"},...(custody?{custody}:{})}),control),(r)=>r.control.outcome);
         controlAck=result.control;custodyHeader(c,result.custodyAck);
-      }else await journal(()=>deps.deliver.ledger.setSessionUploads(selection));
+      }else await journal(()=>deps.deliver.ledger.setSessionUploads(selection),()=>"applied");
       emit({ route: "delivery.sessions.selection", outcome: controlAck?"control_"+controlAck.outcome:input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
       return c.json({ updated: true,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
@@ -644,8 +644,8 @@ export function createIngestApp(deps: IngestAppDeps) {
       await requireDeliveryAccount(identity, input.account_id);
       const tenant={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
       let deleted:number,controlAck;
-      const journal = <T>(run: () => Promise<T>, applied?: (r: T) => boolean) =>
-        journaled(tenant, identity.control ? { kind: "ordered", epoch: identity.control.epoch, version: identity.control.version } : { kind: "reset", requestId: input.request_id }, run, applied);
+      const journal = <T>(run: () => Promise<T>, outcomeOf: (r: T) => "applied" | "replay" | "stale") =>
+        journaled(tenant, identity.control, run, outcomeOf);
       {const t={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
        if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("reset",t,null)));
        else if(identity.control&&c.get("custody"))await shadow("delivery.sessions.reset",c.get("custody")!,()=>controlWitnessInput("reset",t,null));}
@@ -653,9 +653,9 @@ export function createIngestApp(deps: IngestAppDeps) {
       if(identity.control){
         if(identity.control.kind!=="reset"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
         const control=identity.control;
-        const result=await journal(async()=>orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({tenant,requestId:input.request_id,control:{...control,kind:"reset"},...(custody?{custody}:{})}),control),(r)=>r.control.outcome!=="stale");
+        const result=await journal(async()=>orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({tenant,requestId:input.request_id,control:{...control,kind:"reset"},...(custody?{custody}:{})}),control),(r)=>r.control.outcome);
         deleted=result.deleted!;controlAck=result.control;custodyHeader(c,result.custodyAck);
-      }else deleted=await journal(()=>deps.deliver.ledger.resetUploadedSessions(tenant,input.request_id));
+      }else deleted=await journal(()=>deps.deliver.ledger.resetUploadedSessions(tenant,input.request_id),()=>"applied");
       emit({ route: "delivery.sessions.reset", outcome: controlAck?"control_"+controlAck.outcome:"reset", org_id: identity.orgId, deleted });
       return c.json({ reset: true, deleted,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {

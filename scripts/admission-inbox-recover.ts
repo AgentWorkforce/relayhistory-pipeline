@@ -12,7 +12,8 @@
  *     (CloudShell / a role session; never a file), with s3:ListBucket on the transcripts bucket
  *   bun run scripts/admission-inbox-recover.ts --bucket <name> [--region us-east-1] [--org <org>] [--older-than-minutes 60]
  *
- * It writes nothing and prints only object keys (tenant ids and hashes, no content).
+ * It writes nothing and prints only object keys (tenant ids and hashes, no content). Every argument
+ * that reaches the request host is validated strictly before any credential is read.
  */
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { pendingAdmissions } from "../src/session-ingest/async-admission.ts";
@@ -23,25 +24,44 @@ export async function recoverLines(store: ObjectStore, opts: { keyRoot: string; 
   return out;
 }
 
-function arg(name: string, fallback?: string): string | undefined {
-  const i = process.argv.indexOf(`--${name}`);
-  return i >= 0 ? process.argv[i + 1] : fallback;
+const REGION = /^[a-z]{2}(-[a-z]+)+-\d$/;
+const BUCKET = /^(?!.*\.\.)(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
+const ORG = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+export interface RecoverArgs { bucket: string; region: string; orgId?: string; olderThanMs: number }
+
+/** Strict CLI parsing: a region/bucket that is not a plain AWS name never reaches the S3 host. */
+export function parseRecoverArgs(argv: string[]): RecoverArgs {
+  const arg = (name: string, fallback?: string) => {
+    const i = argv.indexOf(`--${name}`);
+    return i >= 0 ? argv[i + 1] : fallback;
+  };
+  const bucket = arg("bucket") ?? "", region = arg("region", "us-east-1")!, org = arg("org"), minutes = Number(arg("older-than-minutes", "60"));
+  if (!BUCKET.test(bucket)) throw new Error("--bucket must be a plain S3 bucket name");
+  if (!REGION.test(region)) throw new Error("--region must be an AWS region name like us-east-1");
+  if (org !== undefined && !ORG.test(org)) throw new Error("--org must be an org id");
+  if (!Number.isFinite(minutes) || minutes < 0) throw new Error("--older-than-minutes must be a non-negative number");
+  return { bucket, region, ...(org !== undefined ? { orgId: org } : {}), olderThanMs: minutes * 60_000 };
 }
 
 if (import.meta.main) {
-  const bucket = arg("bucket");
-  const accessKeyId = process.env.AWS_ACCESS_KEY_ID, secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
-  if (!bucket || !accessKeyId || !secretAccessKey) {
-    console.error("usage: --bucket <name> [--region r] [--org o] [--older-than-minutes n]; AWS_* credentials in the environment");
+  let args: RecoverArgs;
+  try {
+    args = parseRecoverArgs(process.argv);
+  } catch (error) {
+    console.error(`${(error as Error).message}\nusage: --bucket <name> [--region r] [--org o] [--older-than-minutes n]; AWS_* credentials in the environment`);
     process.exit(2);
   }
-  const minutes = Number(arg("older-than-minutes", "60"));
-  if (!Number.isFinite(minutes) || minutes < 0) throw new Error("--older-than-minutes must be a non-negative number");
+  const accessKeyId = process.env.AWS_ACCESS_KEY_ID, secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+  if (!accessKeyId || !secretAccessKey) {
+    console.error("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY must be set in the environment");
+    process.exit(2);
+  }
   const store = createS3Store({
-    bucket,
-    region: arg("region", "us-east-1")!,
+    bucket: args.bucket,
+    region: args.region,
     credentials: { accessKeyId, secretAccessKey, ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}) },
   }) as unknown as ObjectStore;
-  for (const line of await recoverLines(store, { keyRoot: "96bulls", nowMs: Date.now(), olderThanMs: minutes * 60_000, ...(arg("org") ? { orgId: arg("org")! } : {}) }))
+  for (const line of await recoverLines(store, { keyRoot: "96bulls", nowMs: Date.now(), olderThanMs: args.olderThanMs, ...(args.orgId ? { orgId: args.orgId } : {}) }))
     process.stdout.write(line + "\n");
 }
