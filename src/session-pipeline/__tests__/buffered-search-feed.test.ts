@@ -19,6 +19,7 @@ import {
   BUFFERED_FEED_DEFAULT_SINCE,
   bufferedFeedConfig,
   bufferedFeedGateRefusal,
+  deleteBufferedRows,
   feedBufferedStageByKey,
   projectBufferedStage,
   runBufferedFeed,
@@ -72,14 +73,23 @@ function fakeClickHouse(opts: { originColumns?: boolean } = {}) {
         for (let i = rows.length - 1; i >= 0; i--) { const r = rows[i]!; if (r.org_id === p.org && r.workspace_id === p.workspace && r.source === p.source && (r.session_id === p.session || r.session_id === p.canonical)) rows.splice(i, 1); }
         return;
       }
-      const bufferedOnly = query.includes("startsWith(fingerprint, 'bf')") && query.includes("origin = 'buffered'");
-      const tuples = [...query.matchAll(/\(('(?:[^'\\]|\\.)*'(?:,'(?:[^'\\]|\\.)*')*),(\d+)\)/g)].map((m) => [...m[1]!.matchAll(/'((?:[^'\\]|\\.)*)'/g)].map((s) => s[1]!).concat(m[2]!));
-      for (const [org, session, ws, machine, source, kind, eventId, ms] of tuples)
+      // Canonical deleteRows: 8-member identity tuples. deleteBufferedRows: the identity plus the
+      // exact provenance (origin_claim_token, fingerprint, version) and origin = 'buffered'.
+      const bound = query.includes("origin_claim_token, fingerprint, version)") && query.includes("origin = 'buffered'");
+      expect(query).not.toContain("startsWith(");
+      const token = /'((?:[^'\\]|\\.)*)'|(\d+)/g;
+      const tuples = [...query.slice(query.indexOf("IN [")).matchAll(/\(((?:'(?:[^'\\]|\\.)*'|\d+)(?:,(?:'(?:[^'\\]|\\.)*'|\d+))*)\)/g)]
+        .map((m) => [...m[1]!.matchAll(token)].map((t) => t[1] ?? t[2]!));
+      for (const t of tuples) {
+        expect(t.length).toBe(bound ? 11 : 8);
+        const [org, session, ws, machine, source, kind, eventId, ms, claim, fingerprint, version] = t;
         for (let i = rows.length - 1; i >= 0; i--) {
           const r = rows[i]!;
-          if (r.org_id === org && r.session_id === session && r.workspace_id === ws && r.machine_id === machine && r.source === source && r.kind === kind && sha(r.event_id) === eventId && tsMs(r) === Number(ms) && (!bufferedOnly || (r.fingerprint.startsWith("bf") && r.origin === "buffered")))
+          if (r.org_id === org && r.session_id === session && r.workspace_id === ws && r.machine_id === machine && r.source === source && r.kind === kind && sha(r.event_id) === eventId && tsMs(r) === Number(ms) &&
+              (!bound || (r.origin === "buffered" && r.origin_claim_token === claim && r.fingerprint === fingerprint && r.version === Number(version))))
             rows.splice(i, 1);
         }
+      }
     },
     async select<T>(query: string, options?: { params?: Record<string, unknown> }) {
       if (query.includes("search_ingest_state")) return [] as T[];
@@ -241,6 +251,64 @@ describe("buffered-stage search feed", () => {
     expect(out).toMatchObject({ outcome: "indexed", rows: 6, deleted: 2 });
     expect(ch.rows.filter((r) => r.session_id === "sess-2" || (r.session_id === NO_SESSION_ID && r.fingerprint.startsWith("bf")))).toEqual([]);
     expect(ch.rows.filter((r) => r.fingerprint === "s3canonical").length).toBe(1);
+  });
+
+  test("two-claim interleaving: a stale claim's cleanup never removes a newer claim's row that already advanced the cursor", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    // Two claims of the SAME records (same event identities, same version, same fingerprint body):
+    // older claim A and newer claim C differ only in their claim token.
+    const a = await stageBatch(store, batchRecords(), "00000000-0000-4000-8000-00000000000a");
+    const c = await stageBatch(store, batchRecords(), "00000000-0000-4000-8000-00000000000c");
+    const tokenA = "00000000-0000-4000-8000-0000000000a1", tokenC = "00000000-0000-4000-8000-0000000000c1";
+    const tenant = { orgId: ORG, workspaceId: WS, userId: USER };
+    const cSource = memorySource([{ candidate: { stageToken: tokenC, createdAt: "2026-11-07T11:31:00.000000Z", tenant, originId: ORIGIN, batchId: "batch-1" }, key: c.prepared.spec.key,
+      state: () => liveState(c.prepared, tokenC, "2026-11-07T11:31:00.000000Z") }]);
+    let aCalls = 0;
+    let cSummary: Awaited<ReturnType<typeof runBufferedFeed>> | null = null;
+    const aSource = memorySource([{ candidate: { stageToken: tokenA, createdAt: "2026-11-07T11:30:00.000000Z", tenant, originId: ORIGIN, batchId: "batch-1" }, key: a.prepared.spec.key,
+      state: () => {
+        aCalls += 1;
+        if (aCalls === 1) return liveState(a.prepared, tokenA, "2026-11-07T11:30:00.000000Z");
+        // A has inserted. Before A's recheck runs, C becomes the batch's active stage and runs to
+        // completion: insert, recheck, cursor advance.
+        return { ...liveState(a.prepared, tokenA, "2026-11-07T11:30:00.000000Z", []), status: "gone", reason: "stage_not_active" } as StageState;
+      } }]);
+    // Drive the interleaving from inside A's recheck call (A's insert has already landed).
+    const recheck = aSource.source.stage.bind(aSource.source);
+    aSource.source.stage = async (ref) => {
+      if (aCalls === 1 && "stageToken" in ref) {
+        expect(ch.rows.filter((r) => r.origin_claim_token === claims.get(a.prepared.spec.key)).length).toBe(6);
+        cSummary = await runBufferedFeed(feedDeps(cSource.source, store, ch.ch), { pageSize: 10, stagesPerSecond: 50, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "tail", budgetMs: 60_000 });
+      }
+      return recheck(ref);
+    };
+    const out = await feedBufferedStageByKey(a.prepared.spec.key, feedDeps(aSource.source, store, ch.ch));
+    // C ran fully inside A's window and advanced past its stage.
+    expect(cSummary).toMatchObject({ indexed: 1, rows: 6, deleted: 0 });
+    expect(cSource.cursor.after).toEqual({ createdAt: "2026-11-07T11:31:00.000000Z", stageToken: tokenC });
+    // A rechecked stale and cleaned up its own six rows ...
+    expect(out).toEqual({ outcome: "indexed", rows: 6, deleted: 6 });
+    expect(ch.rows.filter((r) => r.origin_claim_token === claims.get(a.prepared.spec.key))).toEqual([]);
+    // ... and every one of C's rows survives, physically and in the folded view the reader sees.
+    const cRows = ch.rows.filter((r) => r.origin_claim_token === claims.get(c.prepared.spec.key));
+    expect(cRows.length).toBe(6);
+    expect(ch.final().length).toBe(6);
+    expect(ch.final().every((r) => (r as { origin_claim_token?: string }).origin_claim_token === claims.get(c.prepared.spec.key))).toBe(true);
+  });
+
+  test("buffered cleanup refuses a row without a bound buffered provenance and never issues a prefix delete", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const { decoded } = await stageBatch(store);
+    const [row] = projectBufferedStage(decoded, new Set(decoded.spec.groupOrdinals.flat()), "96bulls").rows.map((r) => r.row);
+    const sent: string[] = [];
+    const spy: ClickHouseClient = { ...ch.ch, async command(q, o) { sent.push(q); return ch.ch.command(q, o); } };
+    for (const bad of [{ ...row!, origin_claim_token: "" }, { ...row!, fingerprint: "bf" }, { ...row!, fingerprint: `s3${row!.fingerprint.slice(2)}` }, { ...row!, version: 0 }, { ...row!, origin: "canonical" }])
+      await expect(deleteBufferedRows(spy, [bad as never])).rejects.toMatchObject({ code: "delete_provenance_unbound" });
+    expect(sent).toEqual([]);
+    await deleteBufferedRows(spy, [row!]);
+    expect(sent.length).toBe(1);
+    expect(sent[0]).toContain("origin_claim_token, fingerprint, version)");
+    expect(sent[0]).toContain(`'${row!.origin_claim_token}','${row!.fingerprint}',${row!.version})`);
   });
 
   test("redacted/GC'd stages are skipped and passed; pending/deferred keep-up requeues; deferred blocks the backfill cursor", async () => {

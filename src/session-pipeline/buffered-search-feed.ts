@@ -44,7 +44,9 @@
  * supabase/migrations/20261105043870_buffered_search_feed_cursor.sql); a stage that is not its batch's active,
  * acknowledged, live outbox object is never indexed; a GC lease in flight or a fenced privacy
  * authority defers. After every ClickHouse write the stage is re-checked and rows of any
- * record retention no longer keeps are deleted (buffered-origin rows only). Deletes for
+ * record retention no longer keeps are deleted: only the exact physical rows this claim wrote
+ * (origin, origin_claim_token, fingerprint and version all bound; never a prefix match), so a
+ * stale claim's cleanup never removes a newer claim's row for the same event. Deletes for
  * erasure that happens LATER (session delete/reset/GC) are a separate lane; until it lands the
  * query-time check keeps deleted sessions out.
  *
@@ -328,17 +330,30 @@ export async function assertOriginColumns(ch: ClickHouseClient): Promise<void> {
   }
 }
 
-/** Delete exact buffered-origin rows only: a canonical row with the same identity is never touched. */
-export async function deleteBufferedRows(ch: ClickHouseClient, rows: readonly IndexRow[], maxKeys = 500): Promise<number> {
+/**
+ * Delete exactly the physical rows one claim wrote, never another writer's. Each key binds the
+ * event identity AND the full buffered provenance the row was written with: origin 'buffered',
+ * its exact `origin_claim_token`, its exact `fingerprint` and its exact `version`. A newer claim's
+ * row for the same event (a different claim token, or a different fingerprint/version) and a
+ * canonical row with the same identity are never matched, so a stale claim's cleanup cannot
+ * remove a row a newer claim has already written and advanced the cursor past. Rows that do not
+ * carry a buffered provenance are refused (no unbound delete is ever issued).
+ */
+export async function deleteBufferedRows(ch: ClickHouseClient, rows: readonly BufferedIndexRow[], maxKeys = 500): Promise<number> {
   const { createHash } = await import("node:crypto");
+  for (const r of rows)
+    if (r.origin !== ORIGIN_BUFFERED || !UUID.test(r.origin_claim_token) || !isBufferedOriginFingerprint(r.fingerprint) || r.fingerprint.length <= BUFFERED_FINGERPRINT_PREFIX.length || !Number.isSafeInteger(r.version) || r.version <= 0)
+      throw new BufferedFeedError("delete_provenance_unbound");
   for (let i = 0; i < rows.length; i += maxKeys) {
     const literals = rows.slice(i, i + maxKeys).map((r) =>
       arrayLiteral([tuple(r.org_id, r.session_id, r.workspace_id, r.machine_id, r.source, r.kind,
-        createHash("sha256").update(r.event_id).digest("hex"), tsMillis(`${r.ts.replace(" ", "T")}Z`))]).slice(1, -1));
+        createHash("sha256").update(r.event_id).digest("hex"), tsMillis(`${r.ts.replace(" ", "T")}Z`),
+        r.origin_claim_token, r.fingerprint, r.version)]).slice(1, -1));
     await ch.command(
       `DELETE FROM ${EVENTS_TABLE}
-       WHERE (org_id, session_id, workspace_id, machine_id, source, kind, lower(hex(SHA256(event_id))), toUnixTimestamp64Milli(ts))
-         IN [${literals.join(",")}] AND origin = '${ORIGIN_BUFFERED}' AND startsWith(fingerprint, '${BUFFERED_FINGERPRINT_PREFIX}')`,
+       WHERE (org_id, session_id, workspace_id, machine_id, source, kind, lower(hex(SHA256(event_id))), toUnixTimestamp64Milli(ts),
+              origin_claim_token, fingerprint, version)
+         IN [${literals.join(",")}] AND origin = '${ORIGIN_BUFFERED}'`,
       { settings: { lightweight_deletes_sync: 2, max_query_size: 1_048_576 }, timeoutMs: 60_000 },
     );
   }
@@ -418,7 +433,8 @@ async function writeAndRecheck(loaded: Loaded[], deps: BufferedFeedDeps): Promis
   const batch = deps.insertBatch ?? 5_000;
   const all = loaded.flatMap((l) => l.projection.rows.map((r) => r.row));
   for (let i = 0; i < all.length; i += batch) await deps.ch.insert(EVENTS_TABLE, all.slice(i, i + batch), { timeoutMs: 60_000 });
-  const stale: IndexRow[] = [];
+  // Only this invocation's own rows (its claim token, fingerprint and version) are ever cleaned up.
+  const stale: BufferedIndexRow[] = [];
   for (const l of loaded) {
     if (!l.projection.rows.length) continue;
     const now = await deps.source.stage({ stageToken: l.state.stage!.stageToken });
