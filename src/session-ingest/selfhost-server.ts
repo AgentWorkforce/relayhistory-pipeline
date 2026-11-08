@@ -11,7 +11,11 @@
  *   POST /v1/turns/batches     rth:sync   (app.ts, unchanged handler)
  *   GET  /v1/delivery/limits   rth:sync   (app.ts, unchanged handler)
  *   POST /v1/auth/token/refresh  401 refresh_not_supported, always (see SELFHOST_REFRESH_PATH)
- *   any other /v1 path         501 unsupported_by_backend (selection, reset, recovery, custody,
+ *   POST /v1/delivery/sessions/selection  rth:sync, only with RELAYHISTORY_SELFHOST_SESSION_SELECTION=true:
+ *                              per-session erase (enabled:false; enabled:true answers 400 unsupported_by_backend). The app.ts handler is
+ *                              unchanged; the ledger's setSessionUploads fences and tombstones every origin of the caller's session in one transaction
+ *                              (migration 043910). 404 afterwards means unreadable, not bytes gone.
+ *   any other /v1 path         501 unsupported_by_backend (reset, recovery, custody,
  *                              onboarding are relayhistory-internal and not served self-host)
  *
  * Bindings, Node instead of Cloudflare:
@@ -81,9 +85,13 @@ async function drainSmallBody(req: IncomingMessage): Promise<void> {
   });
 }
 
+export const SELFHOST_SESSION_SELECTION_PATH = "/v1/delivery/sessions/selection";
+
 /** One assembled ingest: the app, the per-request verifier, readiness and teardown. */
 export interface SelfhostIngestRuntime {
   app: FetchApp;
+  /** The routes this runtime serves, by exact raw pathname (the base set, plus selection when enabled). */
+  routes: Readonly<Record<string, "GET" | "POST">>;
   /** Verifies one Authorization header value; throws AuthError to refuse. */
   verify(authorization: string | undefined): Promise<IngestIdentity>;
   /** Hands the verified identity to the app for exactly this Request object. */
@@ -101,7 +109,8 @@ export interface RuntimeParts {
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg">, parts: RuntimeParts): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection">>, parts: RuntimeParts): SelfhostIngestRuntime {
+  const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   const app = createIngestApp({
     identify: (request) => {
@@ -111,7 +120,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
       return identity;
     },
     deliver: {
-      ledger: sqlLedger(parts.run, { acceptanceMode: "canonical" }),
+      ledger: sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection }),
       acceptanceMode: "canonical",
       target: { store: parts.store, keyRoot: settings.keyRoot },
       // Slot TTL past any request this process serves, so a lost release frees itself (Worker: 90).
@@ -120,7 +129,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     },
     log: (fields) => log.info("session ingest", fields),
   });
-  return { app, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close };
+  const routes = sessionSelection ? Object.freeze({ ...SELFHOST_INGEST_ROUTES, [SELFHOST_SESSION_SELECTION_PATH]: "POST" as const }) : SELFHOST_INGEST_ROUTES;
+  return { app, routes, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close };
 }
 
 /**
@@ -337,7 +347,7 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
           await drainSmallBody(req);
           return sendJson(req, res, 401, envelope("refresh_not_supported", "this session cannot be refreshed; sign in again", correlationId), { "www-authenticate": "Bearer", "x-correlation-id": correlationId });
         }
-        const method = SELFHOST_INGEST_ROUTES[path];
+        const method = runtime.routes[path];
         if (!method) {
           if (path.startsWith("/v1/"))
             return sendJson(req, res, 501, envelope("unsupported_by_backend", "this route is not served by the self-host session ingest", correlationId, { reason: "route_not_served_selfhost" }), { "x-correlation-id": correlationId });

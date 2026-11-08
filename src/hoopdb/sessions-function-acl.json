@@ -832,6 +832,10 @@
     "sessions.ingest_seed_source_changed()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_selfhost_set_session_uploads(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.ingest_session_pairs(jsonb)": [
       "<owner>:EXECUTE"
     ],

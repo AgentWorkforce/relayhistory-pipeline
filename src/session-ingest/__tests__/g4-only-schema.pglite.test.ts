@@ -100,6 +100,7 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105043880_ingest_bookkeeping_cleanup.sql",
       "20261105043890_buffered_search_gate_retired_witness.sql",
       "20261105043900_session_consumer_function_grants.sql",
+      "20261105043910_selfhost_session_selection_erase.sql",
       // A new table and read API functions only; no ingest path touches them.
       "20261105044000_read_api_tokens.sql",
     ]);
