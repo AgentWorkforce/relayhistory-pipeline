@@ -447,6 +447,37 @@ console.log(
   `# PostgreSQL ${version}, head ${process.env.PGPROOF_HEAD ?? "unknown"}`,
 );
 
+// Run the release-owner's exact Option C vectors before this proof changes cluster roles.
+// The opt-in suite creates/drops its own random database and refuses non-loopback hosts.
+await check("owner-buffered v5.3: 043700 RPCs + read consumer release fixtures", async () => {
+  const fixtureHashes = {
+    causal: createHash("sha256").update(readFileSync(join(ROOT,
+      "docs/handoffs/neon-census-role-20261107/fixtures/option-c-authority-gate-causal-fixtures-v3-20261108.json"))).digest("hex"),
+    parity: createHash("sha256").update(readFileSync(join(ROOT,
+      "docs/handoffs/neon-census-role-20261107/fixtures/option-c-parity-gate-fixture-addendum-v1-20261108.json"))).digest("hex"),
+  };
+  const expected = {
+    causal: "25bbbdfaeb579afb5ca7bbf72ba02d5d3525d22e26de289914214ca1abd519a7",
+    parity: "f1a31a65b05fd535df0aab4eaa7210aab28efddb98c7e5de118866dd7a8a7120",
+  };
+  if (fixtureHashes.causal !== expected.causal || fixtureHashes.parity !== expected.parity)
+    return [false, `fixture hash mismatch: ${fmt(fixtureHashes)}`];
+  const child = spawnSync(process.execPath, [
+    "test", "src/session-read-api/__tests__/buffered-privacy.postgres.test.ts",
+  ], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      SESSION_INGEST_TEST_PG_URL: url(SUPER, "postgres"),
+    },
+    encoding: "utf8",
+    maxBuffer: 20 * 1024 * 1024,
+  });
+  const output = `${child.stdout ?? ""}\n${child.stderr ?? ""}`.trim();
+  const summary = output.split("\n").filter(Boolean).slice(-3).join(" | ");
+  return [child.status === 0, `exit=${child.status ?? "signal"} ${fmt(fixtureHashes)} ${summary}`];
+});
+
 // Clean slate: this harness's own databases and roles from any earlier run.
 for (const d of (
   await sql(
