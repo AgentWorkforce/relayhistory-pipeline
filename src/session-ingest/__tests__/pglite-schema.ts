@@ -19,12 +19,13 @@ import type { PGlite } from "@electric-sql/pglite";
 export const REPO_ROOT = join(import.meta.dir, "../../..");
 /** The last migration of the G4 set (55 files plus bootstrap). */
 export const G4_LAST_MIGRATION = "20261105043800_lazy_ack_clock_no_key_update.sql";
-/** The migrations G4 excludes: #332, #338, #339 and #327 (in that file order). */
+/** The migrations G4 excludes: #332, #338, #339, #327 and #384 (in that file order). */
 export const POST_G4_MIGRATIONS = [
   "20261105043850_ingest_acquisition_owner.sql",
   "20261105043860_buffered_search_gate.sql",
   "20261105043870_buffered_search_feed_cursor.sql",
   "20261105043880_ingest_bookkeeping_cleanup.sql",
+  "20261105043890_buffered_search_gate_retired_witness.sql",
 ] as const;
 export const BOOTSTRAPS = ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"] as const;
 
