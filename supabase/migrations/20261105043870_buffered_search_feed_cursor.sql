@@ -4,7 +4,7 @@
 --
 -- The session pipeline's buffered-stage search feed (INGEST_BUFFERED_SEARCH_FEED, default off;
 -- src/session-pipeline/buffered-search-feed.ts) feeds each accepted buffered stage's RETAINED lines
--- into ClickHouse transcript_events. It needs, as service_role (like the large-read RPCs), and nothing else:
+-- into ClickHouse transcript_events. It needs, as its own login buffered_search_feed_runtime, and nothing else:
 --
 --   sessions.buffered_search_feed_cursors   named keyset cursors (one per backfill/tail). RLS on; no
 --                                           role but the owner holds any privilege on it.
@@ -33,9 +33,20 @@
 -- Schema version. Applying this migration changes the migration-set generation()
 -- (src/hoopdb/migrate.ts); see 20261105043700's note on the buffered Worker's captured generation.
 --
--- Roles. Never creates or alters a role. Grants no table privilege. EXECUTE on the three feed
--- functions to service_role only (src/hoopdb/sessions-function-acl.json +3 entries, lane
--- scripts/sessions-function-boundary/lanes/buffered-search-feed.ts). The functions run as their
+-- Roles. Never creates or alters a role. The feed's runtime role buffered_search_feed_runtime is
+-- provisioned NOLOGIN by supabase/bootstrap/session_ingest_roles.sql (and the cloudsql/rds role
+-- bootstraps); LOGIN only by the operator step supabase/bootstrap/buffered_search_feed_runtime_role.sql,
+-- which needs Khaliq's explicit OK. Fail closed, as 20261105043850 does for its installer: 42704 if the
+-- role is absent, 55000 if it is elevated, a member of another role, or has any member other than
+-- Supabase's PG16+ creator edge. Grants no table privilege; USAGE on schema sessions and EXECUTE on the
+-- three feed functions to buffered_search_feed_runtime only (src/hoopdb/sessions-function-acl.json
+-- +3 entries, lane scripts/sessions-function-boundary/lanes/buffered-search-feed.ts; phase 2 verifier
+-- supabase/bootstrap/buffered_search_feed_runtime_verify.sql). service_role holds nothing here.
+-- Every function admits only the genuine login: session_user is buffered_search_feed_runtime AND
+-- current_setting('role') is 'none' (the 20261105043860 guard), else 42501. current_user cannot be
+-- pinned: inside SECURITY DEFINER it is the owner. The backend identity (pg_stat_activity usename,
+-- system_user) is not checked here, as the acquisition RPCs do not; the feeder asserts it client-side
+-- before arming (src/session-pipeline/buffered-feed-login.ts). The functions run as their
 -- owner, which must also own the ledger tables they read and the owner-only helpers they call
 -- (ingest_buffer_gc_ordinals, ingest_exact_keys, ingest_bounded).
 --
@@ -66,10 +77,32 @@ BEGIN
   OR to_regclass('sessions.buffered_search_feed_cursors') IS NOT NULL
   OR to_regprocedure('sessions.buffered_search_feed_page(jsonb)') IS NOT NULL
   OR to_regprocedure('sessions.buffered_search_feed_stage(jsonb)') IS NOT NULL
-  OR to_regprocedure('sessions.buffered_search_feed_advance(jsonb)') IS NOT NULL
-  OR NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
-  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='buffered search feed: requires original creator, the buffered ledger, 20261105041000 and service_role';END IF;
+  OR to_regprocedure('sessions.buffered_search_feed_advance(jsonb)') IS NOT NULL THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='buffered search feed: requires original creator, the buffered ledger and 20261105041000';END IF;
 END $buffered_search_feed_creator$;
+
+-- The runtime role, mirroring 20261105043850's $acquisition_role$ exactly: absent is 42704; elevated, a
+-- member of another role, or any inbound member is 55000, before any grant. Another login that is a member
+-- OF the role could SET ROLE to it; the functions' session_user guard refuses that too, and this keeps the
+-- grant set from ever being reachable through membership. The only tolerated member is Supabase's PG16+
+-- creator edge (postgres, granted by superuser supabase_admin, ADMIN TRUE, INHERIT FALSE, SET FALSE: the
+-- verifier's predicate). Before PG16 every member is refused.
+DO $buffered_search_feed_role$
+DECLARE r pg_roles%ROWTYPE; m record;
+BEGIN
+ SELECT * INTO r FROM pg_roles WHERE rolname='buffered_search_feed_runtime';
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='42704',MESSAGE='buffered search feed: role buffered_search_feed_runtime absent; run the role bootstrap first';END IF;
+ IF r.rolsuper OR r.rolbypassrls OR r.rolinherit OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication
+  OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=r.oid) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='buffered search feed: role buffered_search_feed_runtime exists elevated or is a member';END IF;
+ IF current_setting('server_version_num')::int>=160000 THEN
+  FOR m IN EXECUTE 'SELECT u.rolname,g.rolname AS grantor,g.rolsuper AS grantor_super,a.admin_option,a.inherit_option,a.set_option FROM pg_auth_members a JOIN pg_roles u ON u.oid=a.member JOIN pg_roles g ON g.oid=a.grantor WHERE a.roleid=$1' USING r.oid LOOP
+   IF m.rolname='postgres' AND m.grantor='supabase_admin' AND m.grantor_super AND m.admin_option AND NOT m.inherit_option AND NOT m.set_option THEN NULL;
+   ELSE RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='buffered search feed: role buffered_search_feed_runtime has an unexpected member';END IF;
+  END LOOP;
+ ELSIF EXISTS(SELECT 1 FROM pg_auth_members WHERE roleid=r.oid) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='buffered search feed: role buffered_search_feed_runtime has an unexpected member';END IF;
+END $buffered_search_feed_role$;
 
 CREATE TABLE sessions.buffered_search_feed_cursors(
  name text PRIMARY KEY CHECK(name~'^[a-z][a-z0-9-]{0,62}$'),
@@ -83,7 +116,8 @@ CREATE TABLE sessions.buffered_search_feed_cursors(
 );
 ALTER TABLE sessions.buffered_search_feed_cursors ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.buffered_search_feed_cursors
-  FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder, bulls96_read_api;
+  FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder, bulls96_read_api,
+       buffered_search_feed_runtime;
 -- Default privileges may have granted the new table to another role at creation: strip every
 -- non-owner grantee. The feed reaches it only through the SECURITY DEFINER functions below.
 DO $cursor_acl$
@@ -105,6 +139,9 @@ CREATE FUNCTION sessions.buffered_search_feed_page(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, sessions, pg_temp SET lock_timeout='2s' AS $page$
 DECLARE v_name text;v_since timestamptz;v_limit int;c sessions.buffered_search_feed_cursors%ROWTYPE;v_rows jsonb;
 BEGIN
+ -- Admission (the 20261105043860 guard): only the genuine buffered_search_feed_runtime login, no SET ROLE.
+ IF session_user::text IS DISTINCT FROM 'buffered_search_feed_runtime' OR coalesce(current_setting('role', true), 'none') <> 'none' THEN
+  RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='buffered search feed: caller is not the buffered_search_feed_runtime login';END IF;
  PERFORM sessions.ingest_exact_keys(p,ARRAY['cursor','since','limit']);
  IF jsonb_typeof(p->'cursor') IS DISTINCT FROM 'string' OR p->>'cursor'!~'^[a-z][a-z0-9-]{0,62}$'
   OR jsonb_typeof(p->'since') IS DISTINCT FROM 'string' OR p->>'since'!~'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$' THEN
@@ -138,6 +175,9 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, session
 DECLARE s sessions.ingest_stage_intents%ROWTYPE;act sessions.ingest_stage_intents%ROWTYPE;o sessions.ingest_buffer_outbox%ROWTYPE;
  v_status text;v_reason text;v_retained jsonb:='[]';v_batch boolean;v_fenced boolean;
 BEGIN
+ -- Admission (the 20261105043860 guard): only the genuine buffered_search_feed_runtime login, no SET ROLE.
+ IF session_user::text IS DISTINCT FROM 'buffered_search_feed_runtime' OR coalesce(current_setting('role', true), 'none') <> 'none' THEN
+  RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='buffered search feed: caller is not the buffered_search_feed_runtime login';END IF;
  IF p IS NULL OR jsonb_typeof(p)<>'object' OR (SELECT count(*) FROM jsonb_object_keys(p))<>1 THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='buffered search feed: exactly one of stageToken, stageKey';END IF;
  IF p ? 'stageToken' THEN
@@ -197,6 +237,9 @@ CREATE FUNCTION sessions.buffered_search_feed_advance(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, sessions, pg_temp SET lock_timeout='2s' AS $advance$
 DECLARE v_created timestamptz;v_token uuid;v_indexed int;v_skipped int;
 BEGIN
+ -- Admission (the 20261105043860 guard): only the genuine buffered_search_feed_runtime login, no SET ROLE.
+ IF session_user::text IS DISTINCT FROM 'buffered_search_feed_runtime' OR coalesce(current_setting('role', true), 'none') <> 'none' THEN
+  RAISE EXCEPTION USING ERRCODE='42501',MESSAGE='buffered search feed: caller is not the buffered_search_feed_runtime login';END IF;
  PERFORM sessions.ingest_exact_keys(p,ARRAY['cursor','createdAt','stageToken','indexed','skipped']);
  IF jsonb_typeof(p->'cursor') IS DISTINCT FROM 'string' OR p->>'cursor'!~'^[a-z][a-z0-9-]{0,62}$'
   OR jsonb_typeof(p->'createdAt') IS DISTINCT FROM 'string' OR p->>'createdAt'!~'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$'
@@ -212,13 +255,16 @@ END $advance$;
 
 REVOKE ALL ON FUNCTION sessions.buffered_search_feed_page(jsonb)
   FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder;
-GRANT EXECUTE ON FUNCTION sessions.buffered_search_feed_page(jsonb) TO service_role;
+GRANT EXECUTE ON FUNCTION sessions.buffered_search_feed_page(jsonb) TO buffered_search_feed_runtime;
 REVOKE ALL ON FUNCTION sessions.buffered_search_feed_stage(jsonb)
   FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder;
-GRANT EXECUTE ON FUNCTION sessions.buffered_search_feed_stage(jsonb) TO service_role;
+GRANT EXECUTE ON FUNCTION sessions.buffered_search_feed_stage(jsonb) TO buffered_search_feed_runtime;
 REVOKE ALL ON FUNCTION sessions.buffered_search_feed_advance(jsonb)
   FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder;
-GRANT EXECUTE ON FUNCTION sessions.buffered_search_feed_advance(jsonb) TO service_role;
+GRANT EXECUTE ON FUNCTION sessions.buffered_search_feed_advance(jsonb) TO buffered_search_feed_runtime;
+
+-- USAGE on the schema, no CREATE: the phase 2 verifier's contract, as 20261105043850 grants its installer.
+GRANT USAGE ON SCHEMA sessions TO buffered_search_feed_runtime;
 
 -- As in 20261105043860: strip EXECUTE from every other grantee present at creation (default
 -- privileges, a pre-existing runtime role).
@@ -236,7 +282,7 @@ BEGIN
         CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) AS a
         JOIN pg_roles AS r ON r.oid = a.grantee
        WHERE p.oid = v_fn AND a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner
-         AND r.rolname <> 'service_role'
+         AND r.rolname <> 'buffered_search_feed_runtime'
     LOOP
       EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I', v_fn, v_grantee);
     END LOOP;

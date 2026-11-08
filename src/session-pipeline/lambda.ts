@@ -35,6 +35,10 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * (BUFFERED_SEARCH_GATE_CONTRACT, "buffered-search-gate/v1"; the read Worker deploys with
  * READ_API_BUFFERED_SEARCH_GATE=on first), and needs SEARCH_INDEX_ENABLED=1 on the ClickHouse backend, the feed RPCs
  * (migration 20261105043870) and the origin columns (docs/proposals/buffered-search-feed.clickhouse.draft.sql) applied.
+ * It also needs its own login: the secret fields buffered_search_feed_database_url and
+ * buffered_search_feed_database_ca_pem (the buffered_search_feed_runtime LOGIN, buffered-feed-login.ts). Without
+ * them, or if malformed, the feed stays off; every pooled backend passes the live login check before its first feed
+ * RPC, and a refusal indexes nothing. Provisioning that LOGIN and credential needs Khaliq's explicit OK.
  */
 import pg from "pg";
 import {
@@ -59,6 +63,7 @@ import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { searchIndexLimits } from "./search-index.ts";
 import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
+import { BUFFERED_FEED_CA_FIELD, BUFFERED_FEED_URL_FIELD, bufferedFeedClientConfig, loginCheckedFeedExecutor } from "./buffered-feed-login.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
 import type { PipelineRuntimeRegistry } from "@rhc/adapters/defaults.ts";
@@ -88,6 +93,13 @@ interface PipelineSecret {
   clickhouse?: { url: string; user: string; password: string; database: string };
   openai_api_key?: string;
   search?: unknown;
+  /**
+   * The buffered search feeder's own login (buffered_search_feed_runtime) and its CA. Carried raw and
+   * validated only when INGEST_BUFFERED_SEARCH_FEED=on (buffered-feed-login.ts); absent leaves the feed
+   * off. Provisioning the LOGIN and this credential needs Khaliq's explicit OK; no deploy wiring sets it.
+   */
+  buffered_search_feed_database_url?: unknown;
+  buffered_search_feed_database_ca_pem?: unknown;
 }
 
 export interface LambdaEnv {
@@ -191,6 +203,25 @@ export function parseSecret(text: string): PipelineSecret {
   if (v.openai_api_key !== undefined && (typeof v.openai_api_key !== "string" || !v.openai_api_key.trim()))
     throw new Error("session pipeline secret openai_api_key must be a non-empty string when present");
   return v as PipelineSecret;
+}
+
+/**
+ * The feeder's pinned login config, or undefined (feed disarmed, logged by reason, never a value):
+ * both secret fields absent is "feeder_login_absent"; anything malformed is "feeder_login_invalid".
+ */
+function bufferedFeedLogin(secret: PipelineSecret): pg.ClientConfig | undefined {
+  const url = secret.buffered_search_feed_database_url, ca = secret.buffered_search_feed_database_ca_pem;
+  if (url === undefined && ca === undefined) {
+    log.warn("buffered search feed disarmed", { stage: "buffered-search-feed", reason: "feeder_login_absent" });
+    return undefined;
+  }
+  try { return bufferedFeedClientConfig(url, ca); }
+  catch (error) {
+    const msg = error instanceof Error ? error.message : "";
+    const field = msg.includes(BUFFERED_FEED_CA_FIELD) ? BUFFERED_FEED_CA_FIELD : msg.includes(BUFFERED_FEED_URL_FIELD) ? BUFFERED_FEED_URL_FIELD : "unknown";
+    log.error("buffered search feed disarmed", { stage: "buffered-search-feed", reason: "feeder_login_invalid", error_code: field });
+    return undefined;
+  }
 }
 
 /**
@@ -347,8 +378,16 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
   if (env.bufferedSearchFeed?.enabled) {
     // Writes the legacy transcript_events table only; a portable search backend has no buffered feed.
     // Missing prerequisites disarm only this feed, never the shared runtime.
-    if (deps.search?.ch) deps.bufferedFeed = { source: sqlBufferedFeedSource(db), store, ch: deps.search.ch, keyRoot: env.keyPrefix };
-    else log.warn("buffered search feed disarmed", { stage: "buffered-search-feed", reason: "clickhouse_search_required" });
+    // The feed RPCs admit only the buffered_search_feed_runtime login, so the feed never runs on the shared
+    // hoopdb pool: it gets its own pinned single-connection pool, and every backend passes the login check
+    // (buffered-feed-login.ts) before its first feed RPC. No login fields: the feed stays off.
+    const feedConfig = deps.search?.ch ? bufferedFeedLogin(secret) : undefined;
+    if (!deps.search?.ch) log.warn("buffered search feed disarmed", { stage: "buffered-search-feed", reason: "clickhouse_search_required" });
+    else if (feedConfig) {
+      const feedPool = new pg.Pool({ ...feedConfig, max: 1, idleTimeoutMillis: 60_000 });
+      feedPool.on("error", (err) => log.error("buffered search feed pool error", { stage: "buffered-search-feed", error_code: (err as { code?: string }).code ?? "pool_error" }));
+      deps.bufferedFeed = { source: sqlBufferedFeedSource(loginCheckedFeedExecutor(feedPool)), store, ch: deps.search.ch, keyRoot: env.keyPrefix };
+    }
   }
   if (env.replayPagesEnabled) {
     // This stage needs scoped Put/Get on normalized read artifacts in addition to raw reads.

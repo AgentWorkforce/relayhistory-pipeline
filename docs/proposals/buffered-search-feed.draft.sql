@@ -2,6 +2,9 @@
 -- (rollback supabase/rollbacks/20261105043870_buffered_search_feed_cursor.down.sql, lane
 -- scripts/sessions-function-boundary/lanes/buffered-search-feed.ts). The migration is authoritative;
 -- this draft is kept for history only and is not applied by any test. Do not apply it.
+-- Superseded on roles: the migration grants the RPCs to the dedicated buffered_search_feed_runtime
+-- login (not service_role), admits only that genuine login (session_user, no SET ROLE), and fails
+-- closed 42704/55000 on a missing or unsafe role (PR #339 review P2).
 -- Buffered-stage search feed (INGEST_BUFFERED_SEARCH_FEED, default off).
 --
 -- What it gives the session pipeline (service_role, like the large-read RPCs) and nothing else:

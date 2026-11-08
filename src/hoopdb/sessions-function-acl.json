@@ -49,15 +49,15 @@
     ],
     "sessions.buffered_search_feed_advance(jsonb)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "buffered_search_feed_runtime:EXECUTE"
     ],
     "sessions.buffered_search_feed_page(jsonb)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "buffered_search_feed_runtime:EXECUTE"
     ],
     "sessions.buffered_search_feed_stage(jsonb)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "buffered_search_feed_runtime:EXECUTE"
     ],
     "sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)": [
       "<owner>:EXECUTE",

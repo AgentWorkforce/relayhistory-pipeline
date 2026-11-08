@@ -197,6 +197,8 @@ export function sqlBufferedFeedSource(db: SqlExecutor): BufferedFeedSource {
     let value: unknown;
     try { value = (await db.query<{ r: unknown }>(`SELECT sessions.buffered_search_feed_${name}($1::jsonb) AS r`, [JSON.stringify(p)])).rows[0]?.r; }
     catch (error) {
+      // A refused feeder login (buffered-feed-login.ts) keeps its own code and is not retried.
+      if (error instanceof BufferedFeedError) throw error;
       const code = (error as { code?: unknown } | null)?.code;
       // Serialization, lock and statement timeouts are transient: the page or message retries.
       const sqlstate = typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? code : "unknown";

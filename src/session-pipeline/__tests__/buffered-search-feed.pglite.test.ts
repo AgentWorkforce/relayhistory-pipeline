@@ -9,6 +9,7 @@ import {btree_gin} from "@electric-sql/pglite/contrib/btree_gin";
 import {pg_trgm} from "@electric-sql/pglite/contrib/pg_trgm";
 import {sqlLedger} from "../../session-ingest/ledger-sql.ts";
 import {sqlBufferedFeedSource} from "../buffered-search-feed.ts";
+import {BUFFERED_SEARCH_FEED_RUNTIME_ROLE as FEED_ROLE} from "../buffered-feed-role.ts";
 setDefaultTimeout(60000);
 const root=join(import.meta.dir,"../../.."),open:PGlite[]=[];
 afterEach(async()=>{for(const db of open.splice(0))await db.close()});
@@ -54,8 +55,19 @@ async function fixture(){
   return {batch,token,key};
  }
  const disable=()=>ledger.setSessionUploads({tenant,originId:origin,sessions:[["claude","gone"]],enabled:false});
- const service={query:(text:string,params?:unknown[])=>as("service_role",text,params) as never};
- return {db,as,stage,disable,source:sqlBufferedFeedSource(service)};
+ /** Run sql as a genuine login of `role` (SET SESSION AUTHORIZATION: session_user = role, role GUC 'none'),
+  *  or, with `via`, as the login `via` that then runs SET LOCAL ROLE `role`. PGlite does not restore
+  *  session_user on RESET or ROLLBACK, so the superuser is reinstated explicitly. */
+ const login=async(role:string,text:string,params:unknown[]=[],via?:string)=>{
+  await db.exec("SET SESSION AUTHORIZATION "+(via??role));
+  try{
+   await db.exec("BEGIN");
+   try{if(via!==undefined)await db.exec("SET LOCAL ROLE "+role);const r=await db.query(text,params as never);await db.exec("COMMIT");return r}
+   catch(e){await db.exec("ROLLBACK");throw e}
+  }finally{await db.exec("SET SESSION AUTHORIZATION postgres")}
+ };
+ const feeder={query:(text:string,params?:unknown[])=>login(FEED_ROLE,text,params) as never};
+ return {db,as,login,stage,disable,source:sqlBufferedFeedSource(feeder)};
 }
 
 test("page lists only acknowledged, live, active stages after the cursor, in keyset order; advance is monotonic",async()=>{
@@ -114,12 +126,34 @@ test("stage: retention comes from the GC authority; redacted, retired, preparing
  await expect(f.source.stage({stageKey:"96bulls/org-a/live-batches/v1/x"})).rejects.toMatchObject({code:"sql_22023"});
 });
 
-test("only service_role may call the feed RPCs; the cursor table is not readable",async()=>{
+test("only the genuine buffered_search_feed_runtime login may call the feed RPCs; the cursor table is not readable",async()=>{
  const f=await fixture();
- for(const role of ["authenticated","anon","bulls96_read_api","bulls96_session_ingest"]){
-  await expect(f.as(role,"SELECT sessions.buffered_search_feed_page($1::jsonb)",[JSON.stringify({cursor:"x",since:SINCE,limit:1})])).rejects.toMatchObject({code:"42501"});
-  await expect(f.as(role,"SELECT sessions.buffered_search_feed_stage($1::jsonb)",[JSON.stringify({stageToken:randomUUID()})])).rejects.toMatchObject({code:"42501"});
+ const page=["SELECT sessions.buffered_search_feed_page($1::jsonb) AS r",[JSON.stringify({cursor:"x",since:SINCE,limit:1})]] as const;
+ const stage=["SELECT sessions.buffered_search_feed_stage($1::jsonb) AS r",[JSON.stringify({stageToken:randomUUID()})]] as const;
+ const advance=["SELECT sessions.buffered_search_feed_advance($1::jsonb) AS r",[JSON.stringify({cursor:"x",to:{createdAt:"2026-11-06T00:00:00.000000Z",stageToken:randomUUID()},indexed:0,skipped:0})]] as const;
+ // The genuine login: session_user is the feed role, no SET ROLE in effect.
+ expect((await f.login(FEED_ROLE,"SELECT session_user::text AS s,current_user::text AS c,current_setting('role') AS r")).rows).toEqual([{s:FEED_ROLE,c:FEED_ROLE,r:"none"}]);
+ expect((await f.login(FEED_ROLE,...page)).rows).toHaveLength(1);
+ const code=(p:Promise<unknown>)=>p.then(()=>"accepted",(e:any)=>e?.code);
+ for(const [sql,params] of [page,stage,advance]){
+  // service_role (the previous grantee), non-member logins and the ingest/read roles: no EXECUTE, or not the login.
+  for(const role of ["service_role","authenticated","anon","bulls96_read_api","bulls96_session_ingest"])
+   expect([role,await code(f.login(role,sql,[...params]))]).toEqual([role,"42501"]);
+  // A superuser session that SETs ROLE to the feed role: session_user is not the feed login.
+  expect(["postgres via SET ROLE",await code(f.login(FEED_ROLE,sql,[...params],"postgres"))]).toEqual(["postgres via SET ROLE","42501"]);
+  // The feed login running a (no-op) SET ROLE to its own name is not the genuine-login shape either.
+  expect(["self SET ROLE",await code(f.login(FEED_ROLE,sql,[...params],FEED_ROLE))]).toEqual(["self SET ROLE","42501"]);
  }
- await expect(f.as("service_role","SELECT * FROM sessions.buffered_search_feed_cursors")).rejects.toMatchObject({code:"42501"});
- await expect(f.as("service_role","SELECT * FROM sessions.ingest_stage_intents")).rejects.toMatchObject({code:"42501"});
+ // A LOGIN granted the feed role (the membership the bootstrap and verifier refuse) that SETs ROLE into it.
+ await f.db.exec("CREATE ROLE feed_probe_member LOGIN NOINHERIT;GRANT "+FEED_ROLE+" TO feed_probe_member");
+ expect((await f.login(FEED_ROLE,"SELECT session_user::text AS s,current_user::text AS c",[],"feed_probe_member")).rows).toEqual([{s:"feed_probe_member",c:FEED_ROLE}]);
+ for(const [sql,params] of [page,stage,advance]){
+  const e=await f.login(FEED_ROLE,sql,[...params],"feed_probe_member").then(()=>null,(e:any)=>e);
+  expect([e?.code,e?.message]).toEqual(["42501","buffered search feed: caller is not the buffered_search_feed_runtime login"]);
+ }
+ // The feed role reads neither the cursor table nor the ledger directly.
+ for(const role of [FEED_ROLE,"service_role"]){
+  await expect(f.login(role,"SELECT * FROM sessions.buffered_search_feed_cursors")).rejects.toMatchObject({code:"42501"});
+  await expect(f.login(role,"SELECT * FROM sessions.ingest_stage_intents")).rejects.toMatchObject({code:"42501"});
+ }
 });

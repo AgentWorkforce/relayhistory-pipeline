@@ -395,12 +395,25 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105043800_lazy_ack_clock_no_key_update.sql` | replacement: staged ACK locks the seat clock FOR NO KEY UPDATE (claims' KEY SHARE no longer queues behind it), then the bounded origin advisory lock before any slot |
 | `upstream:20261105043850_ingest_acquisition_owner.sql` | table sessions.ingest_acquisition_owners |
 | `upstream:20261105043860_buffered_search_gate.sql` | function sessions.buffered_search_gate_for |
-| `upstream:20261105043870_buffered_search_feed_cursor.sql` | table sessions.buffered_search_feed_cursors |
+| `upstream:20261105043870_buffered_search_feed_cursor.sql` | table sessions.buffered_search_feed_cursors (needs the `buffered_search_feed_runtime` role from the role bootstrap: absent fails closed `42704`, elevated/member/unexpected member `55000`) |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
 | `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |
 | `96bulls:0004_summary_pointers.sql`                            | DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)                                          |
+
+**Buffered search feed role (`20261105043870`).** `buffered_search_feed_runtime` is created
+`NOLOGIN NOINHERIT` by `supabase/bootstrap/session_ingest_roles.sql` and its RDS and Cloud SQL
+variants (reserved in `hoopdb_runtime_role_rds.sql`), exactly like `bulls96_acquisition_installer`.
+The migration gives it `USAGE` on `sessions` and `EXECUTE` on the three feed RPCs only (no table
+right); each RPC admits only the genuine login (`session_user` is the role, role setting `none`).
+`hoopdb-migrate` runs the generated `supabase/bootstrap/buffered_search_feed_runtime_verify.sql` as
+the last phase 2 verifier. `supabase/bootstrap/buffered_search_feed_runtime_role.sql` grants LOGIN
+with the 5s/2s/10s timeout profile; run the verifier before and after it. The rollback revokes the
+schema `USAGE` and keeps the role. Applying the migration, the LOGIN step and provisioning the
+feeder's credential (secret fields `buffered_search_feed_database_url` /
+`buffered_search_feed_database_ca_pem`, password from 1Password, never on disk) each need Khaliq's
+separate, explicit OK; no deploy workflow sets them, and without them the feeder stays off.
 
 For each ALTER or replacement step (`20261025000300`, `20261030000000`,
 `20261102010000`, `20261102020000`, `0003`, `0004`),

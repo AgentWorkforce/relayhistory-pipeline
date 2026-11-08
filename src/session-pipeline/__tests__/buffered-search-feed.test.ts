@@ -12,7 +12,9 @@ import type { IndexRow } from "../vendor/search-index/rows.ts";
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
 import { indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
 import { processBatch } from "../consumer.ts";
-import { createPipelineLambdaHandler, lambdaEnv } from "../lambda.ts";
+import { createPipelineLambdaHandler, lambdaEnv, runtimeFromSecret } from "../lambda.ts";
+import { SUPABASE_PROD_CA_2021 } from "../supabase-ca.ts";
+import { BUFFERED_SEARCH_FEED_RUNTIME_ROLE } from "../buffered-feed-role.ts";
 import { BUFFERED_SEARCH_GATE_CONTRACT } from "../../session-read-api/buffered-search-gate.ts";
 import type { SessionScope } from "../pointer.ts";
 import {
@@ -465,6 +467,28 @@ describe("buffered-stage search feed", () => {
     expect(lambdaEnv({ ...base, INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toBeUndefined();
     expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "1" }).bufferedSearchFeed).toBeUndefined();
     expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on", INGEST_BUFFERED_SEARCH_FEED_RATE: "999" }).bufferedSearchFeed).toBeUndefined();
+  });
+
+  test("lambda runtime: the feed arms only with its own valid login fields; absent or malformed leaves it off", () => {
+    const base = { AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "bucket", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs",
+      SEARCH_INDEX_ENABLED: "1", INGEST_BUFFERED_SEARCH_FEED: "on", BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT };
+    const clickhouse = { url: "https://ch.synthetic.invalid", user: "u", password: "p", database: "d" };
+    const feedUrl = `postgresql://${BUFFERED_SEARCH_FEED_RUNTIME_ROLE}:pw-test-only@db.synthetic.invalid:5432/history`;
+    const armed = (extra: Record<string, unknown>, env: Record<string, string> = base) =>
+      runtimeFromSecret(lambdaEnv(env), JSON.stringify({ hoopdb_url: "postgresql://synthetic.invalid/fixture", clickhouse, ...extra }), "fixture-generation").deps.bufferedFeed !== undefined;
+    // Flag on, gate declared, ClickHouse present, but no feeder login: the feed stays off (never the shared pool).
+    expect(armed({})).toBe(false);
+    // Malformed or partial login fields disarm it too.
+    expect(armed({ buffered_search_feed_database_url: feedUrl })).toBe(false);
+    expect(armed({ buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 })).toBe(false);
+    expect(armed({ buffered_search_feed_database_url: feedUrl + "?sslmode=disable", buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 })).toBe(false);
+    expect(armed({ buffered_search_feed_database_url: feedUrl.replace(`${BUFFERED_SEARCH_FEED_RUNTIME_ROLE}:`, "service_role:"), buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 })).toBe(false);
+    expect(armed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: "not a pem" })).toBe(false);
+    // Valid fields arm it (pools connect lazily; the login check runs before the first feed RPC).
+    expect(armed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 })).toBe(true);
+    // Flag off: valid fields still build nothing.
+    const { INGEST_BUFFERED_SEARCH_FEED: _, ...off } = base;
+    expect(armed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 }, off)).toBe(false);
   });
 
   test("refuses to write without the origin columns; a claim token that disagrees with SQL is skipped", async () => {
