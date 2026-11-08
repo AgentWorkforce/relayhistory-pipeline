@@ -320,7 +320,7 @@ In CI (source; the clone has no installed dependencies, so nothing was executed 
   the pre-merge branch (based on c858e7fe) did not yet contain `frontier-plan.postgres.test.ts` from #374. The
   branch was forward-merged with `main` 06764c94 (head 92c380a2). #377 was merged at 16:36:14Z (main f196f637)
   while the `unit-tests` check on 92c380a2 was still in progress; the other 24 checks on 92c380a2 were green.
-  Terminal `unit-tests` result on 92c380a2: PENDING at packet time (watcher running; updated when terminal).
+  Terminal `unit-tests` result on 92c380a2: SUCCESS (terminal green on 92c380a27fe824852df7cfae5f54f5ed88d0dde9, 26 checks, observed 2026-11-08T16:59Z; CI result on the pre-merge head, not a deploy or runtime qualification).
 - Not covered by CI `[missing]`:
   - The events path against real PostgreSQL RPCs, real S3 and a real control head. `pg-proof.yml` has no Path R
     job. The 043700 privacy guard's real-PG test predates #377.
