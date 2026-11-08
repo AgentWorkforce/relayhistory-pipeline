@@ -6,25 +6,37 @@
  * published canonically: its bytes are zstd stage objects under buffered-batches/ (staging.ts)
  * and its ledger rows sit in sessions.ingest_buffer_outbox. Migration 20261105043700 (PR A)
  * adds SECURITY DEFINER readers, EXECUTE to bulls96_read_api only, that apply the buffered
- * GC's keep predicate and the per-user parity rule at read time and bind the user from
+ * GC's keep predicate and the frozen deletion/reset hides at read time and bind the user from
  * `bulls96_read.user_id`, which this module sets from the verified identity in the same
  * READ ONLY transaction. They are called with named arguments, so parameter order is free:
  *
  *   sessions.buffered_sessions_for(p_workspace, p_cursor_ts, p_cursor_session, p_cursor_source,
- *     p_limit, p_cutover_epoch, p_head_epoch, p_head_version, p_head_digest, p_head_pending)
+ *     p_limit, p_cutover_epoch, p_head_epoch, p_head_version, p_head_digest, p_head_kind,
+ *     p_head_pending, p_privacy_baseline_sha256)
  *   sessions.buffered_session_stages_for(p_workspace, p_source, p_session_id,
- *     p_cutover_epoch, p_head_epoch, p_head_version, p_head_digest, p_head_pending)
+ *     p_cutover_epoch, p_head_epoch, p_head_version, p_head_digest, p_head_kind,
+ *     p_head_pending, p_privacy_baseline_sha256)
  *
- * Both refuse with SQLSTATE 55006 'buffered read fenced'; that maps to BufferedFenced here,
- * in one place (rethrowBuffered).
+ * Both readers pass the observed privacy baseline and head kind on to PR A's
+ * sessions.owner_buffered_read_scope, which gates on the caller's per-user G2 parity row
+ * (sessions.owner_buffered_parity, rule 4: mandatory). PR A b87ad189 does not have
+ * p_privacy_baseline_sha256 / p_head_kind on the three functions, nor group_ordinals in the
+ * stage reader's result; PR A must add them before any enablement. The SQL-side hides (frozen
+ * deletions, upload_deletions, upload_resets) live in PR A.
  *
- * Authority (R2 control-head contract v4): the head is never taken from the client. It is
- * observed through the Cloudflare named-entrypoint service binding HISTORY_CONTROL_HEAD
- * (ControlHeadGate) for exactly the verified (org, workspace, user), with a 2.5 s deadline and
- * no caching. Every buffered response observes it twice: before the RPCs (their head
- * parameters) and again after every S3 read and RPC recheck, before any byte is emitted. Any
- * failure, any difference between the two observations, a pending head or a head epoch that
- * differs from the cutover epoch is fenced. Each row's or stage's immutable admission
+ * Every reader error is fenced, in one place (rethrowBuffered): SQLSTATE 55006 'buffered read
+ * fenced', 57014 (statement_timeout) and any other RPC or connection error. Never a 500.
+ *
+ * Authority (R2 control-head contract v5, wire frozen at relayhistory-cloud #328 a06a58f9 by
+ * lead 245002086845415424, after wire v5.1 (lead 245001538553413632)):
+ * the head is never taken from the client. It is observed through the Cloudflare service
+ * binding HISTORY_CONTROL_HEAD (named entrypoint SessionReadPrivacyControls) with
+ * GET /v1/session-read/control-head for exactly the verified (org, workspace, user), carried
+ * in x-relayhistory-* headers, with a 2 s deadline and no caching. Every buffered response
+ * observes it twice: before the RPCs (their head parameters) and again after every S3 read and
+ * RPC recheck, before any byte is emitted. Any failure, any difference between the two
+ * observations (head, controlEpoch, privacy baseline), a pending head or a non-zero head whose
+ * sourceControlEpoch is not controlEpoch is fenced. Each row's or stage's immutable admission
  * (epoch, version) is then compared with the final head (BigInt on decimal strings); NULL or
  * absent admission is hidden. The only exported read paths (readOwnerBufferedList,
  * readOwnerBufferedTurns) run that gate; the raw stage read is module-private.
@@ -70,7 +82,8 @@ export interface BufferedScope {
 /**
  * The buffered read is fenced: the privacy authority could not be observed, answered
  * anything but a valid active non-pending head for exactly this caller, moved during the
- * request, or the RPC refused (55006). Retryable. `reason` is for logs only.
+ * request, or the RPC refused or failed (55006, 57014, any reader error). Retryable. `reason`
+ * is for logs only.
  */
 export class BufferedFenced extends Error {
   constructor(readonly reason: string = "fenced") {
@@ -79,28 +92,43 @@ export class BufferedFenced extends Error {
   }
 }
 
-/** The one mapping from a reader error to BufferedFenced (SQLSTATE 55006 or the RPC's message). */
+/** The RPC's explicit refusal (SQLSTATE 55006 or its message). */
 export function isBufferedFencedError(error: unknown): boolean {
   if (error instanceof BufferedFenced) return true;
   const e = error as { code?: unknown; message?: unknown } | null;
   return !!e && (e.code === "55006" || e.message === "buffered read fenced");
 }
 
+/** SQLSTATE 57014 query_canceled (the per-transaction statement_timeout). */
+export function isBufferedTimeoutError(error: unknown): boolean {
+  const e = error as { code?: unknown } | null;
+  return !!e && typeof e === "object" && e.code === "57014";
+}
+
+/**
+ * The one mapping from a reader error: everything the transaction throws is fenced (not
+ * visible, retryable), never a generic error. `reason` distinguishes them in logs only.
+ */
 function rethrowBuffered(error: unknown): never {
   if (error instanceof BufferedFenced) throw error;
   if (isBufferedFencedError(error)) throw new BufferedFenced("rpc_fenced");
-  throw error;
+  if (isBufferedTimeoutError(error)) throw new BufferedFenced("rpc_timeout");
+  throw new BufferedFenced("rpc_error");
 }
 
 // ---------------------------------------------------------------------------------------------
-// Authority gate (R2 control-head contract v4)
+// Authority gate (control-head contract v5, relayhistory-cloud #328 transport)
 // ---------------------------------------------------------------------------------------------
 
-export const CONTROL_HEAD_CONTRACT = "r2-control-head/v1";
-export const CONTROL_HEAD_PATH = "/internal/v1/privacy/control-head";
+export const CONTROL_HEAD_PATH = "/v1/session-read/control-head";
 /** The binding ignores the host; only the path selects the handler on the pinned entrypoint. */
 export const CONTROL_HEAD_URL = `https://history-control-head.internal${CONTROL_HEAD_PATH}`;
-export const CONTROL_HEAD_DEADLINE_MS = 2500;
+/** Identity headers; set only from the verified token, never from caller input. */
+export const CONTROL_HEAD_USER_HEADER = "x-relayhistory-user-id";
+export const CONTROL_HEAD_ORG_HEADER = "x-relayhistory-org-id";
+export const CONTROL_HEAD_WORKSPACE_HEADER = "x-relayhistory-workspace-id";
+/** Contract v5: 2 s total consumer deadline; timeout = not visible. */
+export const CONTROL_HEAD_DEADLINE_MS = 2000;
 /** Largest response body read from the binding; anything longer is malformed. */
 const CONTROL_HEAD_MAX_BODY = 16 * 1024;
 
@@ -109,10 +137,20 @@ const HEX64 = /^[0-9a-f]{64}$/u;
 const DECIMAL = /^(?:0|[1-9][0-9]{0,18})$/u;
 const BIGINT_MAX = 9223372036854775807n;
 const isDecimal = (v: unknown): v is string => typeof v === "string" && DECIMAL.test(v) && BigInt(v) <= BIGINT_MAX;
+const isHex64 = (v: unknown): v is string => typeof v === "string" && HEX64.test(v);
 
-/** One validated observation: the active cutover epoch and the caller's head (null: no control row). */
+/**
+ * One validated control-head observation. `cutoverEpoch` is controlEpoch (== cutover.epoch;
+ * a head's epoch is sourceControlEpoch, which must equal it). `head` is null exactly for the
+ * explicit no-head tuple (sourceControlVersion "0", null source epoch, digest and kind).
+ * `privacyBaselineSha256` is validated (hex64), takes part in the two-lookup consistency check
+ * and is passed to both readers as p_privacy_baseline_sha256 (PR A's G2 parity gate).
+ * Every other key of the wire is a constant or the caller's own identity, so equality of two
+ * AuthorityHeads is deep equality of the two 200 bodies.
+ */
 export interface AuthorityHead {
   cutoverEpoch: string;
+  privacyBaselineSha256: string;
   head: null | { epoch: string; version: string; digest: string; kind: "selection" | "reset"; pending: false };
 }
 
@@ -121,45 +159,89 @@ export interface ControlHeadGate {
   observe(scope: BufferedScope): Promise<AuthorityHead>;
 }
 
-const exactKeys = (v: unknown, keys: readonly string[], optional: readonly string[] = []): v is Record<string, unknown> => {
+const exactKeys = (v: unknown, keys: readonly string[]): v is Record<string, unknown> => {
   if (!v || typeof v !== "object" || Array.isArray(v)) return false;
   const present = Object.keys(v);
-  return keys.every((k) => present.includes(k)) && present.every((k) => keys.includes(k) || optional.includes(k));
+  return present.length === keys.length && keys.every((k) => present.includes(k));
 };
 
 /**
- * The consumer rule's items 1 and 2: a 200 body with exactly the contract keys, the contract
- * constant, an exact echo of the caller, cutover ingest/active with a hex64 epoch, and a head
- * that is null or { hex64 epoch equal to the cutover epoch, decimal version, hex64 digest,
- * selection|reset, pending false }. Anything else is fenced.
+ * THE control-head wire table: the one place that names the exact 200 key set (top level and
+ * nested) and its constants. Every key is required; any other key, top level or nested, fences.
+ * Wire freeze (lead 245002086845415424): the wire is exactly what relayhistory-cloud #328 head
+ * a06a58f9 emits; this table moves with the producer, and nothing else in the parser names keys
+ * or constants. Any key the producer adds fences every read until this table moves.
+ */
+export const CONTROL_HEAD_WIRE = {
+  top: [
+    "protocol", "version", "issuer", "tenant", "controlEpoch", "cutover", "privacyBaselineSha256",
+    "sourceControlEpoch", "sourceControlVersion", "sourceControlDigest", "sourceControlKind", "pending",
+  ],
+  nested: {
+    tenant: ["orgId", "workspaceId", "userId"],
+    cutover: ["epoch", "status", "mode"],
+  },
+  constants: { protocol: "relay-session-read-control-head-v1", version: 1, issuer: "relayhistory-cloud" },
+  cutoverConstants: { status: "active", mode: "ingest" },
+} as const;
+/** The top-level key list of CONTROL_HEAD_WIRE. */
+export const CONTROL_HEAD_V5_KEYS = CONTROL_HEAD_WIRE.top;
+
+/** Exact-key check of the whole body against CONTROL_HEAD_WIRE (top level and every nested object). */
+function wireShapeOk(body: unknown): body is Record<string, unknown> {
+  if (!exactKeys(body, CONTROL_HEAD_WIRE.top)) return false;
+  return Object.entries(CONTROL_HEAD_WIRE.nested).every(([key, keys]) => exactKeys(body[key], keys));
+}
+const matchesConstants = (v: Record<string, unknown>, constants: Readonly<Record<string, unknown>>) =>
+  Object.entries(constants).every(([k, want]) => v[k] === want);
+
+/** Identifier bound of the wire (the producer answers 403 otherwise). */
+export const CONTROL_HEAD_IDENTIFIER_MAX_BYTES = 512;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+/** An identifier the producer accepts: 1..512 UTF-8 bytes, equal to its trim(), no U+0000-001F / U+007F. */
+export const isControlHeadIdentifier = (v: unknown): v is string =>
+  typeof v === "string" && v.length > 0 && new TextEncoder().encode(v).byteLength <= CONTROL_HEAD_IDENTIFIER_MAX_BYTES && v.trim() === v && !CONTROL_CHARS.test(v);
+
+/**
+ * Strict parse of the frozen wire (relayhistory-cloud #328 @ a06a58f9, lead 245002086845415424;
+ * R2 control-head contract v5 semantics). The keys and constants are
+ * CONTROL_HEAD_WIRE's, exactly. tenant is an exact echo of the caller; cutover is
+ * {epoch == controlEpoch, status "active", mode "ingest"}; controlEpoch and
+ * privacyBaselineSha256 are hex64; sourceControlVersion is a decimal string 0..2^63-1 (never a
+ * Number). Version "0": sourceControlEpoch, digest and kind all null, pending false (no head).
+ * Version > 0: sourceControlEpoch == controlEpoch (else gate_epoch, never "no head"), digest
+ * hex64, kind selection|reset, pending boolean. pending true is fenced. Anything else is fenced.
  */
 export function parseControlHeadResponse(body: unknown, scope: BufferedScope): AuthorityHead {
   const fail = (reason: string): never => {
     throw new BufferedFenced(reason);
   };
-  if (!exactKeys(body, ["contract", "org", "workspace", "user", "cutover", "head"], ["observedAt"])) return fail("gate_shape");
-  if (body.contract !== CONTROL_HEAD_CONTRACT) fail("gate_contract");
-  if (body.org !== scope.orgId || body.workspace !== scope.workspaceId || body.user !== scope.userId) fail("gate_echo");
-  if (body.observedAt !== undefined && typeof body.observedAt !== "string") fail("gate_shape");
-  const cutover = body.cutover;
-  if (!exactKeys(cutover, ["epoch", "mode", "status"])) return fail("gate_shape");
-  if (cutover.mode !== "ingest" || cutover.status !== "active") fail("gate_cutover");
-  if (typeof cutover.epoch !== "string" || !HEX64.test(cutover.epoch)) fail("gate_shape");
-  const cutoverEpoch = cutover.epoch as string;
-  const head = body.head;
-  if (head === null) return { cutoverEpoch, head: null };
-  if (!exactKeys(head, ["epoch", "version", "digest", "kind", "pending"])) return fail("gate_shape");
-  if (typeof head.epoch !== "string" || !HEX64.test(head.epoch)) fail("gate_shape");
-  if (!isDecimal(head.version)) fail("gate_shape");
-  if (typeof head.digest !== "string" || !HEX64.test(head.digest)) fail("gate_shape");
-  if (head.kind !== "selection" && head.kind !== "reset") fail("gate_shape");
-  if (typeof head.pending !== "boolean") fail("gate_shape");
-  if (head.pending) fail("gate_pending");
-  if (head.epoch !== cutoverEpoch) fail("gate_epoch");
-  return {
-    cutoverEpoch,
-    head: { epoch: head.epoch as string, version: head.version as string, digest: head.digest as string, kind: head.kind as "selection" | "reset", pending: false },
-  };
+  if (!wireShapeOk(body)) return fail("gate_shape");
+  if (!matchesConstants(body, CONTROL_HEAD_WIRE.constants)) fail("gate_shape");
+  const tenant = body.tenant as Record<string, unknown>;
+  const cutover = body.cutover as Record<string, unknown>;
+  if (typeof tenant.orgId !== "string" || typeof tenant.workspaceId !== "string" || typeof tenant.userId !== "string") fail("gate_shape");
+  if (tenant.orgId !== scope.orgId || tenant.workspaceId !== scope.workspaceId || tenant.userId !== scope.userId) fail("gate_echo");
+  if (!isHex64(body.controlEpoch) || !isHex64(body.privacyBaselineSha256) || !isDecimal(body.sourceControlVersion)) fail("gate_shape");
+  if (!matchesConstants(cutover, CONTROL_HEAD_WIRE.cutoverConstants) || !isHex64(cutover.epoch)) fail("gate_shape");
+  if (typeof body.pending !== "boolean") fail("gate_shape");
+  const { sourceControlEpoch: sourceEpoch, sourceControlDigest: digest, sourceControlKind: kind } = body;
+  if (sourceEpoch !== null && !isHex64(sourceEpoch)) fail("gate_shape");
+  if (digest !== null && !isHex64(digest)) fail("gate_shape");
+  if (kind !== null && kind !== "selection" && kind !== "reset") fail("gate_shape");
+  if (body.pending) fail("gate_pending");
+  const controlEpoch = body.controlEpoch as string;
+  if (cutover.epoch !== controlEpoch) fail("gate_epoch");
+  const version = body.sourceControlVersion as string;
+  const base = { cutoverEpoch: controlEpoch, privacyBaselineSha256: body.privacyBaselineSha256 as string };
+  if (version === "0") {
+    if (sourceEpoch !== null || digest !== null || kind !== null) fail("gate_shape");
+    return { ...base, head: null };
+  }
+  // A non-zero head at a foreign (or no) epoch is fenced, never read as "no head".
+  if (sourceEpoch !== controlEpoch) fail("gate_epoch");
+  if (digest === null || kind === null) return fail("gate_shape");
+  return { ...base, head: { epoch: controlEpoch, version, digest: digest as string, kind: kind as "selection" | "reset", pending: false } };
 }
 
 /** The Cloudflare service binding surface used here (a Fetcher). */
@@ -168,28 +250,46 @@ export interface ControlHeadBinding {
 }
 
 /**
- * The gate over the HISTORY_CONTROL_HEAD named-entrypoint service binding (the entrypoint is
- * pinned in the Worker's wrangler config, never a public route). Unbound, non-200, over the
- * deadline, over-long, not JSON or invalid: fenced. The request carries only the verified
- * tenant. No caching or memoization: every observe() is one binding call.
+ * The gate over the HISTORY_CONTROL_HEAD service binding (named entrypoint
+ * SessionReadPrivacyControls on relayhistory-cloud, pinned in the Worker's wrangler config,
+ * never a public route): GET /v1/session-read/control-head, no query string, no body,
+ * identity only in the x-relayhistory-{org,workspace,user}-id headers from the verified
+ * scope, 2 s total deadline. No caching: the request says `cache-control: no-store`, a 200
+ * must carry a `cache-control` with the `no-store` token (the producer sends `private, no-store`)
+ * and nothing is memoized (every observe() is one binding call). Unbound, an identifier the
+ * producer would refuse (see isControlHeadIdentifier), any non-200 (its error body, flat or the
+ * nested 503 {version,error:{code}}, is never parsed), a 200 without no-store, over the deadline,
+ * over-long, not JSON or invalid: fenced.
  */
 export function serviceBindingControlHead(binding: ControlHeadBinding | undefined, options: { deadlineMs?: number } = {}): ControlHeadGate {
   const deadlineMs = options.deadlineMs ?? CONTROL_HEAD_DEADLINE_MS;
   return {
     async observe(scope) {
       if (!binding || typeof binding.fetch !== "function") throw new BufferedFenced("gate_unbound");
+      // The producer answers 403 to an identifier it refuses; fence locally, without the call.
+      if (![scope.orgId, scope.workspaceId, scope.userId].every(isControlHeadIdentifier)) throw new BufferedFenced("gate_identity");
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
       const work = (async () => {
         const res = await binding.fetch(CONTROL_HEAD_URL, {
-          method: "POST",
-          headers: { "content-type": "application/json", accept: "application/json" },
-          body: JSON.stringify({ contract: CONTROL_HEAD_CONTRACT, org: scope.orgId, workspace: scope.workspaceId, user: scope.userId }),
+          method: "GET",
+          headers: {
+            accept: "application/json",
+            "cache-control": "no-store",
+            [CONTROL_HEAD_USER_HEADER]: scope.userId,
+            [CONTROL_HEAD_ORG_HEADER]: scope.orgId,
+            [CONTROL_HEAD_WORKSPACE_HEADER]: scope.workspaceId,
+          },
           signal: controller.signal,
         });
         if (res.status !== 200) {
           await res.body?.cancel().catch(() => undefined);
           throw new BufferedFenced("gate_status");
+        }
+        const cacheControl = res.headers.get("cache-control") ?? "";
+        if (!cacheControl.split(",").some((t) => t.trim().toLowerCase() === "no-store")) {
+          await res.body?.cancel().catch(() => undefined);
+          throw new BufferedFenced("gate_cache");
         }
         const raw = await res.text();
         if (raw.length > CONTROL_HEAD_MAX_BODY) throw new BufferedFenced("gate_shape");
@@ -222,8 +322,10 @@ export function serviceBindingControlHead(binding: ControlHeadBinding | undefine
   };
 }
 
+/** The two-lookup consistency check: every field of both observations must agree. */
 const sameAuthority = (a: AuthorityHead, b: AuthorityHead) =>
   a.cutoverEpoch === b.cutoverEpoch &&
+  a.privacyBaselineSha256 === b.privacyBaselineSha256 &&
   (a.head === null ? b.head === null : b.head !== null && a.head.epoch === b.head.epoch && a.head.version === b.head.version && a.head.digest === b.head.digest && a.head.kind === b.head.kind);
 
 /** An immutable admission witness from the RPC; either part may be NULL (unknown). */
@@ -244,14 +346,22 @@ export function admissionVisible(authority: AuthorityHead, admission: Admission)
   return epoch === authority.head.epoch && BigInt(version) === BigInt(authority.head.version);
 }
 
-/** The RPC head parameters (p_cutover_epoch .. p_head_pending) of one observation. */
+/**
+ * The RPC authority parameters of one observation. No head: p_head_epoch, p_head_version,
+ * p_head_digest and p_head_kind NULL, p_head_pending FALSE (never NULL, never "0"). Head present:
+ * p_head_epoch is controlEpoch (== sourceControlEpoch), p_head_version the exact decimal string,
+ * p_head_digest, p_head_kind ('selection' | 'reset') and p_head_pending as observed.
+ * p_cutover_epoch is controlEpoch; p_privacy_baseline_sha256 is the observed baseline (hex64).
+ */
 export function headParams(a: AuthorityHead) {
   return {
     cutoverEpoch: a.cutoverEpoch,
     headEpoch: a.head?.epoch ?? null,
     headVersion: a.head?.version ?? null,
     headDigest: a.head?.digest ?? null,
-    headPending: a.head ? a.head.pending : null,
+    headKind: a.head?.kind ?? null,
+    headPending: a.head ? a.head.pending : false,
+    privacyBaselineSha256: a.privacyBaselineSha256,
   };
 }
 
@@ -317,8 +427,9 @@ export const BUFFERED_STAGE_MAX_BYTES = BUFFER_STAGE_MAX_BYTES;
 /**
  * The memory bound of one buffered detail read: the total of the stages' compressed sizes and,
  * separately, of their decompressed sizes for one session. Over it the session is hidden (the
- * route's existing 501), never served partially. 32 MiB keeps the raw bytes plus their parsed
- * records well inside a Worker isolate's 128 MB.
+ * route's existing 501), never served partially. Peak memory per read is roughly the packed
+ * stage, its decoder window, the decoded chunks and their concatenation (each <= 16 MiB) plus
+ * the parsed records of up to 32 MiB of decoded text. Not measured against an isolate limit.
  */
 export const BUFFERED_SESSION_MAX_BYTES = 32 * 1024 * 1024;
 
@@ -333,13 +444,82 @@ export class BufferedTooLarge extends Error {
 /** A push-style decompressor (fzstd's Decompress): `ondata` per output chunk, synchronously. */
 export type StreamDecompressor = new (ondata: (chunk: Uint8Array, final?: boolean) => unknown) => { push(chunk: Uint8Array, final?: boolean): unknown };
 
+const ZSTD_MAGIC = 0xfd2fb528;
+const readLE = (b: Uint8Array, at: number, n: number): number => {
+  let v = 0;
+  for (let i = n - 1; i >= 0; i--) v = v * 256 + b[at + i]!;
+  return v;
+};
+
 /**
- * OwnerBufferedDeps.decompress over a streaming decompressor: output chunks are counted as they
- * arrive and the stream is abandoned (BufferedTooLarge) the moment the total passes `maxBytes`,
- * so at most one chunk (a zstd block, <= 128 KiB) is ever held past the bound.
+ * Walks every zstd frame header before any decoding (fzstd allocates each frame's window from
+ * its header, before the first output chunk): a frame content size or window size above
+ * `maxBytes` is BufferedTooLarge; a truncated or reserved structure is an error. Skippable
+ * frames are skipped; blocks are walked only to find the next frame. Allocates nothing.
+ */
+export function assertZstdFramesWithin(bytes: Uint8Array, maxBytes: number): void {
+  const bad = (): never => {
+    throw new Error("buffered_zstd_invalid");
+  };
+  let at = 0;
+  while (at < bytes.byteLength) {
+    if (at + 4 > bytes.byteLength) bad();
+    const magic = readLE(bytes, at, 4);
+    if (magic >>> 4 === 0x184d2a5) {
+      if (at + 8 > bytes.byteLength) bad();
+      at += 8 + readLE(bytes, at + 4, 4);
+      if (at > bytes.byteLength) bad();
+      continue;
+    }
+    if (magic !== ZSTD_MAGIC || at + 5 > bytes.byteLength) bad();
+    const fhd = bytes[at + 4]!;
+    at += 5;
+    if (fhd & 0x08) bad(); // reserved bit
+    const singleSegment = (fhd & 0x20) !== 0;
+    const checksum = (fhd & 0x04) !== 0;
+    const dictBytes = [0, 1, 2, 4][fhd & 0x03]!;
+    const fcsFlag = fhd >> 6;
+    const fcsBytes = fcsFlag === 0 ? (singleSegment ? 1 : 0) : [0, 2, 4, 8][fcsFlag]!;
+    let window = -1;
+    if (!singleSegment) {
+      if (at + 1 > bytes.byteLength) bad();
+      const wd = bytes[at]!;
+      const base = 2 ** (10 + (wd >> 3));
+      window = base + (base / 8) * (wd & 7);
+      at += 1;
+    }
+    at += dictBytes;
+    if (at + fcsBytes > bytes.byteLength) bad();
+    if (fcsBytes > 0) {
+      const fcs = readLE(bytes, at, fcsBytes) + (fcsBytes === 2 ? 256 : 0);
+      if (fcs > maxBytes) throw new BufferedTooLarge();
+      if (singleSegment) window = fcs;
+    }
+    if (window > maxBytes) throw new BufferedTooLarge();
+    at += fcsBytes;
+    for (;;) {
+      if (at + 3 > bytes.byteLength) bad();
+      const bh = readLE(bytes, at, 3);
+      const type = (bh >> 1) & 3;
+      if (type === 3) bad();
+      at += 3 + (type === 1 ? 1 : bh >>> 3);
+      if (at > bytes.byteLength) bad();
+      if (bh & 1) break;
+    }
+    if (checksum) at += 4;
+    if (at > bytes.byteLength) bad();
+  }
+}
+
+/**
+ * OwnerBufferedDeps.decompress over a streaming decompressor: every frame header is checked
+ * first (assertZstdFramesWithin, so no window above the bound is ever allocated), then output
+ * chunks are counted as they arrive and the stream is abandoned (BufferedTooLarge) the moment
+ * the total passes `maxBytes`, so at most one chunk (a zstd block, <= 128 KiB) is held past it.
  */
 export function boundedStreamDecompress(Stream: StreamDecompressor): OwnerBufferedDeps["decompress"] {
   return (bytes, maxBytes) => {
+    assertZstdFramesWithin(bytes, maxBytes);
     const chunks: Uint8Array[] = [];
     let total = 0;
     const stream = new Stream((chunk) => {
@@ -363,14 +543,21 @@ export const BUFFERED_LIST_MAX_LIMIT = 100;
 export const BUFFERED_STATEMENT_TIMEOUT_MS = 2000;
 
 export const BUFFERED_USER_SQL = "SELECT set_config('bulls96_read.user_id', $1, true)";
-const HEAD_ARGS = "p_cutover_epoch => $2, p_head_epoch => $3, p_head_version => $4::text, p_head_digest => $5, p_head_pending => $6::boolean";
+const HEAD_ARGS =
+  "p_cutover_epoch => $2, p_head_epoch => $3, p_head_version => $4::text, p_head_digest => $5, p_head_kind => $6, " +
+  "p_head_pending => $7::boolean, p_privacy_baseline_sha256 => $8";
 export const BUFFERED_SESSIONS_SQL =
   `SELECT source, session_id, first_ts, last_ts, stage_count, bytes, user_id, admission_epoch, admission_version::text AS admission_version, ` +
   `to_char(last_ts AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_ts ` +
-  `FROM sessions.buffered_sessions_for(p_workspace => $1, ${HEAD_ARGS}, p_cursor_ts => $7::timestamptz, p_cursor_session => $8, p_cursor_source => $9, p_limit => $10::integer)`;
+  `FROM sessions.buffered_sessions_for(p_workspace => $1, ${HEAD_ARGS}, p_cursor_ts => $9::timestamptz, p_cursor_session => $10, p_cursor_source => $11, p_limit => $12::integer)`;
+/**
+ * group_ordinals is required: kept_ordinals name original claim ordinals and only the stage's
+ * group_ordinals map them to object lines (bufferedOrdinalSelection) and bind the object
+ * (readBufferedStage). PR A's buffered_session_stages_for must return it.
+ */
 export const BUFFERED_STAGES_SQL =
   `SELECT batch_id, stage_key, stage_sha256, stage_bytes, group_indexes, group_ordinals, kept_ordinals, reset_epoch, accepted_at, admission_epoch, admission_version::text AS admission_version ` +
-  `FROM sessions.buffered_session_stages_for(p_workspace => $1, ${HEAD_ARGS}, p_source => $7, p_session_id => $8)`;
+  `FROM sessions.buffered_session_stages_for(p_workspace => $1, ${HEAD_ARGS}, p_source => $9, p_session_id => $10)`;
 
 export function statementTimeoutSql(ms: number = BUFFERED_STATEMENT_TIMEOUT_MS): string {
   if (!Number.isSafeInteger(ms) || ms < 1 || ms > 30_000) throw new Error("buffered statement timeout out of range");
@@ -460,7 +647,7 @@ export function sqlOwnerBufferedReads(run: TenantRunner, options: { statementTim
   };
   const head = (a: AuthorityHead) => {
     const h = headParams(a);
-    return [h.cutoverEpoch, h.headEpoch, h.headVersion, h.headDigest, h.headPending];
+    return [h.cutoverEpoch, h.headEpoch, h.headVersion, h.headDigest, h.headKind, h.headPending, h.privacyBaselineSha256];
   };
   return {
     async list(scope, authority, args) {

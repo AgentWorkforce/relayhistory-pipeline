@@ -32,10 +32,12 @@
  * _SECRET_ACCESS_KEY principal (GetObject + kms:Decrypt on buffered-batches/ is a
  * separate IAM grant). Off, or any of those missing: no buffered read, every route
  * exactly as without the flag. Every buffered response passes the privacy authority gate,
- * the HISTORY_CONTROL_HEAD named-entrypoint service binding (relayhistory-api's
- * control-head entrypoint, pinned with `entrypoint` in wrangler config; never a public
- * route): POST /internal/v1/privacy/control-head with the verified tenant only, 2.5 s
- * deadline, no caching. Unbound: every buffered read is fenced. Flag, bucket and binding
+ * the HISTORY_CONTROL_HEAD service binding to relayhistory-cloud's named entrypoint
+ * SessionReadPrivacyControls (pinned with `entrypoint` in wrangler config; never a public
+ * route), R2 control-head contract v5, wire frozen at relayhistory-cloud #328 a06a58f9:
+ * GET /v1/session-read/control-head, no query string, no body, identity only in
+ * x-relayhistory-org-id / -workspace-id / -user-id from the verified token, 2 s deadline,
+ * no-store both ways, no caching. Unbound: every buffered read is fenced. Flag, bucket and binding
  * are all unset in wrangler.jsonc.
  */
 import pg from "pg";
@@ -92,8 +94,9 @@ export interface Env extends CanonicalEnv {
   /** Its region; default us-east-1. */
   INGEST_S3_REGION?: string;
   /**
-   * The privacy authority for owner-buffered reads: a named-entrypoint service binding to
-   * relayhistory-api's control-head entrypoint. Unbound = every buffered read fenced.
+   * The privacy authority for owner-buffered reads: a service binding to relayhistory-cloud's
+   * named entrypoint SessionReadPrivacyControls (control-head contract v5, frozen wire
+   * #328 a06a58f9, GET /v1/session-read/control-head). Unbound = every buffered read fenced.
    */
   HISTORY_CONTROL_HEAD?: Fetcher;
 }

@@ -19,17 +19,27 @@ export const E1 = "1".repeat(64);
 export const E2 = "2".repeat(64);
 export const DIGEST = "3".repeat(64);
 
+/** Synthetic privacy baseline (hex). */
+export const BASELINE = "4".repeat(64);
+
 export function authority(version: string | null, epoch = E1, cutover = E1): AuthorityHead {
-  return { cutoverEpoch: cutover, head: version === null ? null : { epoch, version, digest: DIGEST, kind: "selection", pending: false } };
+  return { cutoverEpoch: cutover, privacyBaselineSha256: BASELINE, head: version === null ? null : { epoch, version, digest: DIGEST, kind: "selection", pending: false } };
 }
 
-/** A contract-v4 response body for SCOPE; `over` replaces top-level keys. */
-export function headBody(over: Record<string, unknown> = {}, head: Record<string, unknown> | null = { epoch: E1, version: "7", digest: DIGEST, kind: "selection", pending: false }) {
+/**
+ * A frozen-wire (relayhistory-cloud #328 @ a06a58f9) 200 body for SCOPE with head version 7, in
+ * the producer's key order; `over` replaces top-level keys. Synthetic identifiers only.
+ */
+export function headBody(over: Record<string, unknown> = {}) {
   return {
-    contract: "r2-control-head/v1", org: SCOPE.orgId, workspace: SCOPE.workspaceId, user: SCOPE.userId,
-    cutover: { epoch: E1, mode: "ingest", status: "active" }, head, observedAt: "2026-11-08T00:00:00.000Z", ...over,
+    protocol: "relay-session-read-control-head-v1", version: 1, issuer: "relayhistory-cloud",
+    tenant: { orgId: SCOPE.orgId, workspaceId: SCOPE.workspaceId, userId: SCOPE.userId },
+    controlEpoch: E1, cutover: { epoch: E1, status: "active", mode: "ingest" }, privacyBaselineSha256: BASELINE, sourceControlEpoch: E1,
+    sourceControlVersion: "7", sourceControlDigest: DIGEST, sourceControlKind: "selection", pending: false, ...over,
   };
 }
+/** The frozen-wire "no head" body: version "0", null source epoch, digest and kind, pending false. */
+export const noHeadBody = (over: Record<string, unknown> = {}) => headBody({ sourceControlEpoch: null, sourceControlVersion: "0", sourceControlDigest: null, sourceControlKind: null, ...over });
 
 /** A scripted gate: one answer per observe() (the last repeats); an Error answer is thrown. */
 export function scriptedGate(...answers: Array<AuthorityHead | Error>): ControlHeadGate & { calls: BufferedScope[] } {

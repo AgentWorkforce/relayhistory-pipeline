@@ -8,6 +8,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { createRequire } from "node:module";
+import { zstdCompressSync } from "node:zlib";
 import * as ownerBuffered from "../owner-buffered.ts";
 import {
   BUFFERED_SESSIONS_SQL,
@@ -17,11 +19,15 @@ import {
   BUFFERED_STAGE_MAX_BYTES,
   BufferedFenced,
   BufferedTooLarge,
-  CONTROL_HEAD_CONTRACT,
+  CONTROL_HEAD_V5_KEYS,
+  CONTROL_HEAD_WIRE,
+  CONTROL_HEAD_DEADLINE_MS,
   CONTROL_HEAD_PATH,
   admissionVisible,
+  assertZstdFramesWithin,
   boundedStreamDecompress,
   ownerBufferedEnabled,
+  headParams,
   parseControlHeadResponse,
   readOwnerBufferedList,
   readOwnerBufferedTurns,
@@ -33,7 +39,7 @@ import {
 } from "../owner-buffered.ts";
 import { TenantMismatchError } from "../page.ts";
 import { objectKey } from "../../shared/vendor.ts";
-import { DIGEST, E1, E2, SCOPE, SESSION, authority, bufferedRow, deps, fencedGate, headBody, putStage, scratch, scriptedGate, scriptedReads, turn, unzip as unzipBounded } from "./owner-buffered-support.ts";
+import { BASELINE, DIGEST, E1, E2, SCOPE, SESSION, authority, bufferedRow, deps, fencedGate, headBody, noHeadBody, putStage, scratch, scriptedGate, scriptedReads, turn, unzip as unzipBounded } from "./owner-buffered-support.ts";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => {
@@ -60,27 +66,49 @@ describe("flag", () => {
   });
 });
 
-describe("control-head gate (HISTORY_CONTROL_HEAD binding)", () => {
+describe("control-head gate (HISTORY_CONTROL_HEAD binding, frozen wire #328 a06a58f9)", () => {
   const binding = (respond: (url: string, init?: RequestInit) => Promise<Response> | Response) => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     return { calls, fetch: async (url: string, init?: RequestInit) => (calls.push({ url, init }), respond(url, init)) };
   };
-  const ok = (b: unknown) => new Response(JSON.stringify(b), { status: 200, headers: { "content-type": "application/json" } });
+  const ok = (b: unknown) => new Response(JSON.stringify(b), { status: 200, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
+  const parseReason = (b: unknown) => {
+    try {
+      parseControlHeadResponse(b, SCOPE);
+    } catch (e) {
+      return e instanceof BufferedFenced ? e.reason : "other";
+    }
+    return "parsed";
+  };
 
-  test("POSTs only the verified tenant to the pinned path and returns the head; never caches", async () => {
+  test("GETs the pinned path, no query, identity only in the x-relayhistory headers, no body; 2 s; never caches", async () => {
     const b = binding(() => ok(headBody()));
     const gate = serviceBindingControlHead(b);
     expect(await gate.observe(SCOPE)).toEqual(authority("7"));
     await gate.observe(SCOPE);
     expect(b.calls).toHaveLength(2);
-    expect(new URL(b.calls[0]!.url).pathname).toBe(CONTROL_HEAD_PATH);
-    expect(b.calls[0]!.init?.method).toBe("POST");
-    expect(JSON.parse(String(b.calls[0]!.init?.body))).toEqual({ contract: CONTROL_HEAD_CONTRACT, org: "org-a", workspace: "ws-a", user: "u-1" });
-    expect(Object.keys((b.calls[0]!.init?.headers ?? {}) as object).map((k) => k.toLowerCase()).sort()).toEqual(["accept", "content-type"]);
+    expect(CONTROL_HEAD_PATH).toBe("/v1/session-read/control-head");
+    expect(CONTROL_HEAD_DEADLINE_MS).toBe(2000);
+    const url = new URL(b.calls[0]!.url);
+    expect(url.pathname).toBe(CONTROL_HEAD_PATH);
+    expect(url.search).toBe("");
+    expect(b.calls[0]!.init?.method).toBe("GET");
+    expect(b.calls[0]!.init?.body).toBeUndefined();
+    expect(b.calls[0]!.init?.headers).toEqual({
+      accept: "application/json", "cache-control": "no-store",
+      "x-relayhistory-user-id": "u-1", "x-relayhistory-org-id": "org-a", "x-relayhistory-workspace-id": "ws-a",
+    });
+    await reason(gate.observe({ orgId: "org-b", workspaceId: "ws-b", userId: "u-9" }));
+    expect(b.calls[2]!.init?.headers).toMatchObject({ "x-relayhistory-user-id": "u-9", "x-relayhistory-org-id": "org-b", "x-relayhistory-workspace-id": "ws-b" });
   });
 
-  test("head null with an active cutover is a valid observation", async () => {
-    expect(await serviceBindingControlHead(binding(() => ok(headBody({}, null)))).observe(SCOPE)).toEqual(authority(null));
+  test("no head: version 0, null digest, null kind, pending false", async () => {
+    expect(await serviceBindingControlHead(binding(() => ok(noHeadBody()))).observe(SCOPE)).toEqual(authority(null));
+    expect(parseControlHeadResponse(headBody({ sourceControlKind: "reset" }), SCOPE).head?.kind).toBe("reset");
+    // the spec's exact large-decimal head round-trips without Number
+    expect(parseControlHeadResponse(headBody({ sourceControlVersion: "9007199254740993" }), SCOPE).head?.version).toBe("9007199254740993");
+    expect(CONTROL_HEAD_WIRE.top).toHaveLength(12);
+    expect(Object.keys(headBody()).sort()).toEqual([...CONTROL_HEAD_WIRE.top].sort());
   });
 
   // fixtures v3: authority-gate-* (every one: finalBufferedContentEmitted false).
@@ -88,11 +116,34 @@ describe("control-head gate (HISTORY_CONTROL_HEAD binding)", () => {
     expect(await reason(serviceBindingControlHead(undefined).observe(SCOPE))).toBe("gate_unbound");
     expect(await reason(serviceBindingControlHead({} as never).observe(SCOPE))).toBe("gate_unbound");
   });
+  test("identifiers: 1..512 UTF-8 bytes, equal to trim(), no control characters; otherwise fenced without a binding call", async () => {
+    const b = binding(() => ok(headBody()));
+    const gate = serviceBindingControlHead(b);
+    for (const over of [{ userId: "" }, { orgId: "o".repeat(513) }, { workspaceId: "\u00e9".repeat(257) }, { userId: " u-1" }, { userId: "u-1\n" }, { orgId: "org\u0000a" }, { workspaceId: "ws\u007fa" }, { userId: "u\u001f1" }])
+      expect(await reason(gate.observe({ ...SCOPE, ...over }))).toBe("gate_identity");
+    expect(b.calls).toHaveLength(0);
+    // exactly 512 bytes is accepted (and echoed)
+    const id = "\u00e9".repeat(256);
+    const ok512 = serviceBindingControlHead(binding(() => ok(headBody({ tenant: { orgId: SCOPE.orgId, workspaceId: SCOPE.workspaceId, userId: id } }))));
+    expect((await ok512.observe({ ...SCOPE, userId: id })).head?.version).toBe("7");
+  });
   test("authority-gate-non2xx: any status but 200 is fenced (including 2xx other than 200)", async () => {
-    for (const status of [204, 201, 404, 500, 503]) {
-      const r = status === 204 ? new Response(null, { status }) : new Response(JSON.stringify(headBody()), { status });
+    for (const status of [204, 201, 304, 400, 404, 405, 500, 503]) {
+      const r = status === 204 || status === 304 ? new Response(null, { status }) : new Response(JSON.stringify(status < 300 ? headBody() : { error: "x" }), { status });
       expect(await reason(serviceBindingControlHead(binding(() => r)).observe(SCOPE))).toBe("gate_status");
     }
+    // wire v5.1: 403 for a refused identity; 503 with the producer's nested error body (not parsed).
+    const errs: Array<[number, unknown]> = [[403, { error: "invalid_owner_context" }], [404, { error: "read_route_not_allowed" }], [405, { error: "read_only" }], [503, { version: 1, error: { code: "control_head_unavailable" } }], [503, headBody()]];
+    for (const [status, body] of errs)
+      expect(await reason(serviceBindingControlHead(binding(() => new Response(JSON.stringify(body), { status, headers: { "cache-control": "private, no-store" } }))).observe(SCOPE))).toBe("gate_status");
+  });
+  test("a 200 without a no-store cache-control is fenced", async () => {
+    for (const cc of [null, "", "max-age=600", "private", "no-cache", "no-storex", "public, max-age=0"]) {
+      const headers: Record<string, string> = cc === null ? {} : { "cache-control": cc };
+      expect(`${cc} -> ${await reason(serviceBindingControlHead(binding(() => new Response(JSON.stringify(headBody()), { status: 200, headers }))).observe(SCOPE))}`).toBe(`${cc} -> gate_cache`);
+    }
+    for (const cc of ["no-store", "private, no-store", "No-Store", "no-cache,no-store"])
+      expect((await serviceBindingControlHead(binding(() => new Response(JSON.stringify(headBody()), { status: 200, headers: { "cache-control": cc } }))).observe(SCOPE)).head?.version).toBe("7");
   });
   test("authority-gate-timeout: a binding past the deadline is fenced and aborted", async () => {
     let aborted = false;
@@ -104,50 +155,117 @@ describe("control-head gate (HISTORY_CONTROL_HEAD binding)", () => {
     expect(await reason(serviceBindingControlHead(binding(() => Promise.reject(new Error("boom")))).observe(SCOPE))).toBe("gate_error");
   });
   test("authority-gate-invalid-response: non-JSON, oversized, missing/extra keys, bad types", async () => {
+    const without = (k: string) => {
+      const b: Record<string, unknown> = headBody();
+      delete b[k];
+      return b;
+    };
     const cases: Array<[unknown, string]> = [
       ["not json", "gate_shape"],
       [JSON.stringify({ ...headBody(), pad: "x".repeat(20_000) }), "gate_shape"],
-      [headBody({ extra: 1 }), "gate_shape"],
-      [{ ...headBody(), head: undefined }, "gate_shape"],
       [[headBody()], "gate_shape"],
-      [headBody({ contract: "r2-control-head/v2" }), "gate_contract"],
-      [headBody({ cutover: { epoch: E1, mode: "ingest", status: "draining" } }), "gate_cutover"],
-      [headBody({ cutover: { epoch: E1, mode: "legacy", status: "active" } }), "gate_cutover"],
-      [headBody({ cutover: { epoch: "1".repeat(63), mode: "ingest", status: "active" } }), "gate_shape"],
-      [headBody({ cutover: { epoch: E1.toUpperCase().replace(/1/gu, "A"), mode: "ingest", status: "active" } }), "gate_shape"],
-      [headBody({}, { epoch: E1, version: 7, digest: DIGEST, kind: "selection", pending: false }), "gate_shape"],
-      [headBody({}, { epoch: E1, version: "07", digest: DIGEST, kind: "selection", pending: false }), "gate_shape"],
-      [headBody({}, { epoch: E1, version: "-1", digest: DIGEST, kind: "selection", pending: false }), "gate_shape"],
-      [headBody({}, { epoch: E1, version: "9223372036854775808", digest: DIGEST, kind: "selection", pending: false }), "gate_shape"],
-      [headBody({}, { epoch: E1, version: "7", digest: "x", kind: "selection", pending: false }), "gate_shape"],
-      [headBody({}, { epoch: E1, version: "7", digest: DIGEST, kind: "delete", pending: false }), "gate_shape"],
-      [headBody({}, { epoch: E1, version: "7", digest: DIGEST, kind: "selection", pending: "false" }), "gate_shape"],
-      [headBody({}, { epoch: E1, version: "7", digest: DIGEST, kind: "selection", pending: false, extra: 1 }), "gate_shape"],
-      [headBody({ observedAt: 5 }), "gate_shape"],
+      ["null", "gate_shape"],
+      [headBody({ extra: 1 }), "gate_shape"],
+      // keys outside the wire table are extras
+      ...["observedAt", "phase", "error", "headEpoch"].map((k): [unknown, string] => [headBody({ [k]: "x" }), "gate_shape"]),
+      // constants of the frozen wire
+      [headBody({ protocol: "relay-session-read-control-head-v2" }), "gate_shape"],
+      [headBody({ protocol: "" }), "gate_shape"],
+      [headBody({ protocol: null }), "gate_shape"],
+      [headBody({ version: "1" }), "gate_shape"],
+      [headBody({ version: 2 }), "gate_shape"],
+      [headBody({ version: null }), "gate_shape"],
+      [headBody({ issuer: "relayhistory-cloud " }), "gate_shape"],
+      [headBody({ issuer: "other" }), "gate_shape"],
+      // cutover {epoch == controlEpoch, status active, mode ingest}, exact keys
+      [headBody({ cutover: { epoch: E1, status: "draining", mode: "ingest" } }), "gate_shape"],
+      [headBody({ cutover: { epoch: E1, status: "active", mode: "read" } }), "gate_shape"],
+      [headBody({ cutover: { epoch: "1".repeat(63), status: "active", mode: "ingest" } }), "gate_shape"],
+      [headBody({ cutover: { epoch: null, status: "active", mode: "ingest" } }), "gate_shape"],
+      [headBody({ cutover: { epoch: E1, status: "active" } }), "gate_shape"],
+      [headBody({ cutover: { epoch: E1, status: "active", mode: "ingest", phase: "ingest" } }), "gate_shape"],
+      [headBody({ cutover: null }), "gate_shape"],
+      [headBody({ cutover: { epoch: E2, status: "active", mode: "ingest" } }), "gate_epoch"],
+      [noHeadBody({ cutover: { epoch: E2, status: "active", mode: "ingest" } }), "gate_epoch"],
+      // sourceControlEpoch: == controlEpoch with a head (foreign or null epoch never reads as no head), null without
+      [headBody({ sourceControlEpoch: null }), "gate_epoch"],
+      [headBody({ sourceControlEpoch: E2 }), "gate_epoch"],
+      [headBody({ sourceControlEpoch: "1".repeat(63) }), "gate_shape"],
+      [noHeadBody({ sourceControlEpoch: E1 }), "gate_shape"],
+      [noHeadBody({ sourceControlEpoch: E2 }), "gate_shape"],
+      [headBody({ controlEpoch: E2 }), "gate_epoch"],
+      [headBody({ sourceControlVersion: "12345678901234567890" }), "gate_shape"],
+      [headBody({ tenant: { orgId: "org-a", workspaceId: "ws-a", userId: "u-1", headEpoch: E1 } }), "gate_shape"],
+      ...CONTROL_HEAD_V5_KEYS.map((k): [unknown, string] => [without(k), "gate_shape"]),
+      [headBody({ controlEpoch: "1".repeat(63) }), "gate_shape"],
+      [headBody({ controlEpoch: "A".repeat(64) }), "gate_shape"],
+      [headBody({ controlEpoch: null }), "gate_shape"],
+      [headBody({ privacyBaselineSha256: "4".repeat(63) }), "gate_shape"],
+      [headBody({ privacyBaselineSha256: null }), "gate_shape"],
+      [headBody({ sourceControlVersion: 7 }), "gate_shape"],
+      [headBody({ sourceControlVersion: "07" }), "gate_shape"],
+      [headBody({ sourceControlVersion: "-1" }), "gate_shape"],
+      [headBody({ sourceControlVersion: "9223372036854775808" }), "gate_shape"],
+      [headBody({ sourceControlVersion: null }), "gate_shape"],
+      [headBody({ sourceControlDigest: "x" }), "gate_shape"],
+      [headBody({ sourceControlDigest: null }), "gate_shape"],
+      [headBody({ sourceControlKind: "other" }), "gate_shape"],
+      [headBody({ sourceControlKind: "Selection" }), "gate_shape"],
+      [headBody({ sourceControlKind: null }), "gate_shape"],
+      [headBody({ pending: "false" }), "gate_shape"],
+      [headBody({ pending: null }), "gate_shape"],
+      [headBody({ tenant: { orgId: "org-a", workspaceId: "ws-a" } }), "gate_shape"],
+      [headBody({ tenant: { orgId: "org-a", workspaceId: "ws-a", userId: "u-1", extra: 1 } }), "gate_shape"],
+      [headBody({ tenant: { orgId: "org-a", workspaceId: "ws-a", userId: 1 } }), "gate_shape"],
+      [headBody({ tenant: null }), "gate_shape"],
+      [noHeadBody({ sourceControlDigest: DIGEST }), "gate_shape"],
+      [noHeadBody({ sourceControlKind: "selection" }), "gate_shape"],
+      [noHeadBody({ sourceControlKind: "other" }), "gate_shape"],
     ];
     for (const [b, want] of cases) {
       const raw = typeof b === "string" ? b : JSON.stringify(b);
-      expect(`${raw.slice(0, 60)} -> ${await reason(serviceBindingControlHead(binding(() => new Response(raw, { status: 200 }))).observe(SCOPE))}`).toBe(`${raw.slice(0, 60)} -> ${want}`);
+      expect(`${raw.slice(-240)} -> ${await reason(serviceBindingControlHead(binding(() => new Response(raw, { status: 200, headers: { "cache-control": "private, no-store" } }))).observe(SCOPE))}`).toBe(`${raw.slice(-240)} -> ${want}`);
     }
   });
-  test("authority-gate-wrong-user / wrong-workspace / wrong-origin (org): an echo of anyone else is fenced", async () => {
-    for (const over of [{ user: "u-2" }, { workspace: "ws-b" }, { org: "org-b" }, { user: "U-1" }, { user: "u-1 " }])
-      expect(await reason(serviceBindingControlHead(binding(() => ok(headBody(over)))).observe(SCOPE))).toBe("gate_echo");
+  test("authority-gate-wrong-user / wrong-workspace / wrong-origin (org): a tenant echo of anyone else is fenced", async () => {
+    const t = { orgId: "org-a", workspaceId: "ws-a", userId: "u-1" };
+    for (const over of [{ userId: "u-2" }, { workspaceId: "ws-b" }, { orgId: "org-b" }, { userId: "U-1" }, { userId: "u-1 " }])
+      expect(await reason(serviceBindingControlHead(binding(() => ok(headBody({ tenant: { ...t, ...over } })))).observe(SCOPE))).toBe("gate_echo");
+    expect(parseReason(noHeadBody({ tenant: { ...t, userId: "u-2" } }))).toBe("gate_echo");
   });
-  test("authority-gate-wrong-epoch: head epoch other than the cutover epoch is fenced", () => {
-    expect(() => parseControlHeadResponse(headBody({}, { epoch: E2, version: "7", digest: DIGEST, kind: "selection", pending: false }), SCOPE)).toThrow(BufferedFenced);
-    try {
-      parseControlHeadResponse(headBody({}, { epoch: E2, version: "7", digest: DIGEST, kind: "reset", pending: false }), SCOPE);
-    } catch (e) {
-      expect((e as BufferedFenced).reason).toBe("gate_epoch");
+  test("authority-gate-wrong-epoch: the head epoch is controlEpoch (== sourceControlEpoch); an admission at another epoch is hidden", () => {
+    const a = parseControlHeadResponse(headBody({ controlEpoch: E2, sourceControlEpoch: E2, cutover: { epoch: E2, status: "active", mode: "ingest" } }), SCOPE);
+    expect(a).toMatchObject({ cutoverEpoch: E2, head: { epoch: E2, version: "7" } });
+    expect(admissionVisible(a, { admission_epoch: E1, admission_version: "7" })).toBe(false);
+    expect(admissionVisible(a, { admission_epoch: E2, admission_version: "7" })).toBe(true);
+  });
+  test("direct-consumer-must-enforce-final-gate: a pending head is fenced (with or without a head)", () => {
+    expect(() => parseControlHeadResponse(headBody({ pending: true, sourceControlVersion: "8" }), SCOPE)).toThrow("buffered read fenced");
+    expect(parseReason(headBody({ pending: true }))).toBe("gate_pending");
+    expect(parseReason(noHeadBody({ pending: true }))).toBe("gate_pending");
+  });
+  test("head-none-without-proven-current-epoch: no hex64 controlEpoch is fenced", () => {
+    for (const controlEpoch of [null, "", "0"]) expect(parseReason(noHeadBody({ controlEpoch, cutover: { epoch: controlEpoch, status: "active", mode: "ingest" } }))).toBe("gate_shape");
+  });
+  test("two-lookup consistency: baseline, controlEpoch or head drift between observations is gate_moved", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [turn(0)]);
+    const variants: Array<Record<string, unknown>> = [
+      { privacyBaselineSha256: "5".repeat(64) },
+      { controlEpoch: E2, sourceControlEpoch: E2, cutover: { epoch: E2, status: "active", mode: "ingest" } },
+      { sourceControlVersion: "8" },
+      { sourceControlDigest: "6".repeat(64) },
+      { sourceControlKind: "reset" },
+      { sourceControlEpoch: null, sourceControlVersion: "0", sourceControlDigest: null, sourceControlKind: null },
+    ];
+    for (const second of variants) {
+      let n = 0;
+      const gate = serviceBindingControlHead(binding(() => ok(n++ === 0 ? headBody() : headBody(second))));
+      const got = await reason(readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[st.row]] }).reads, gate }), SCOPE, "claude", SESSION));
+      expect(`${JSON.stringify(second)} -> ${got}`).toBe(`${JSON.stringify(second)} -> gate_moved`);
     }
-  });
-  test("direct-consumer-must-enforce-final-gate: a pending head is fenced", () => {
-    expect(() => parseControlHeadResponse(headBody({}, { epoch: E1, version: "8", digest: DIGEST, kind: "selection", pending: true }), SCOPE)).toThrow("buffered read fenced");
-  });
-  test("head-none-without-proven-current-epoch: no active cutover epoch is fenced", () => {
-    for (const cutover of [null, { epoch: null, mode: "ingest", status: "active" }])
-      expect(() => parseControlHeadResponse(headBody({ cutover }, null), SCOPE)).toThrow(BufferedFenced);
+    const steady = serviceBindingControlHead(binding(() => ok(headBody())));
+    expect(await readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[st.row]] }).reads, gate: steady }), SCOPE, "claude", SESSION)).not.toBeNull();
   });
 });
 
@@ -409,23 +527,64 @@ describe("byte bounds on detail reads (hidden, never partial)", () => {
     expect(bounds[2]!).toBeLessThan(BUFFERED_STAGE_MAX_BYTES);
   });
 
+  /** One zstd frame: single segment, 1-byte content size, one raw last block. */
+  const rawFrame = (payload: number[]) => new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0x20, payload.length, ((payload.length << 3) | 1) & 0xff, (payload.length << 3) >> 8, 0, ...payload]);
   test("boundedStreamDecompress: concatenates chunks within the bound; stops at the first chunk past it", () => {
     let pushedAfterStop = 0;
     class FakeStream {
       constructor(private readonly ondata: (chunk: Uint8Array, final?: boolean) => unknown) {}
       push(input: Uint8Array) {
-        for (let i = 0; i < input.byteLength; i++) {
-          this.ondata(new Uint8Array([input[i]!, input[i]!]), i === input.byteLength - 1);
+        const payload = input.subarray(9);
+        for (let i = 0; i < payload.byteLength; i++) {
+          this.ondata(new Uint8Array([payload[i]!, payload[i]!]), i === payload.byteLength - 1);
           pushedAfterStop += 1;
         }
       }
     }
     const d = boundedStreamDecompress(FakeStream);
-    expect([...d(new Uint8Array([1, 2, 3]), 6)]).toEqual([1, 1, 2, 2, 3, 3]);
+    expect([...d(rawFrame([1, 2, 3]), 6)]).toEqual([1, 1, 2, 2, 3, 3]);
     pushedAfterStop = 0;
-    expect(() => d(new Uint8Array([1, 2, 3, 4, 5]), 5)).toThrow(BufferedTooLarge);
-    // chunks 1 and 2 (4 bytes) fit; chunk 3 (6 bytes) is past 5: the stream stops there.
+    // header (content size 5) passes; the fake doubles each byte, so chunks 1 and 2 (4 bytes)
+    // fit and chunk 3 (6 bytes) is past 5: the stream stops there.
+    expect(() => d(rawFrame([1, 2, 3, 4, 5]), 5)).toThrow(BufferedTooLarge);
     expect(pushedAfterStop).toBe(2);
+  });
+
+  test("zstd frame headers over the bound are refused before the decoder sees them (N3)", () => {
+    let constructed = 0;
+    class Never {
+      constructor() {
+        constructed += 1;
+      }
+      push() {}
+    }
+    const d = boundedStreamDecompress(Never);
+    const MiB = 1024 * 1024;
+    // single segment, 8-byte content size of 1 GiB, then an empty raw last block.
+    const bigFcs = new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0xe0, 0, 0, 0, 0x40, 0, 0, 0, 0, 1, 0, 0]);
+    // not single segment, no content size, window descriptor 2^(10+21) = 2 GiB.
+    const bigWindow = new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0x00, 21 << 3, 1, 0, 0]);
+    // a small first frame followed by an oversized second one.
+    const second = new Uint8Array([...rawFrame([1]), ...bigWindow]);
+    for (const frame of [bigFcs, bigWindow, second]) expect(() => d(frame, 16 * MiB)).toThrow(BufferedTooLarge);
+    for (const junk of [new Uint8Array([1, 2, 3]), new Uint8Array([0x28, 0xb5, 0x2f, 0xfd]), rawFrame([1, 2]).subarray(0, 10), new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0x20, 1, 7, 0, 0, 9])])
+      expect(() => d(junk, 16 * MiB)).toThrow("buffered_zstd_invalid");
+    expect(constructed).toBe(0);
+    // skippable frame then a real one passes the walk.
+    const skippable = new Uint8Array([0x50, 0x2a, 0x4d, 0x18, 2, 0, 0, 0, 9, 9]);
+    expect(() => assertZstdFramesWithin(new Uint8Array([...skippable, ...rawFrame([1, 2])]), 2)).not.toThrow();
+    expect(() => assertZstdFramesWithin(rawFrame([1, 2, 3]), 2)).toThrow(BufferedTooLarge);
+  });
+
+  test("real fzstd over real zstd output (single and multi frame) passes the header walk", () => {
+    // The Worker's own fzstd (packages/session-read-worker dependency), resolved from there.
+    const FzstdDecompress = createRequire(join(import.meta.dir, "../../../packages/session-read-worker/package.json"))("fzstd").Decompress as ownerBuffered.StreamDecompressor;
+    const a = new Uint8Array(zstdCompressSync(Buffer.from("x".repeat(200_000))));
+    const b = new Uint8Array(zstdCompressSync(Buffer.from("hello")));
+    const d = boundedStreamDecompress(FzstdDecompress);
+    expect(d(a, 200_000).byteLength).toBe(200_000);
+    expect(new TextDecoder().decode(d(new Uint8Array([...b, ...b]), 10))).toBe("hellohello");
+    expect(() => d(a, 199_999)).toThrow(BufferedTooLarge);
   });
 });
 
@@ -498,15 +657,35 @@ describe("sqlOwnerBufferedReads", () => {
     expect(seen.map((s) => s.sql)).toEqual(["SET LOCAL statement_timeout = 2000", BUFFERED_USER_SQL, BUFFERED_SESSIONS_SQL]);
     expect(seen[1]!.params).toEqual(["u-1"]);
     expect(seen[2]).toMatchObject({ org: "org-a", ws: "ws-a" });
-    expect(seen[2]!.params).toEqual(["ws-a", E1, E1, "9007199254740993", DIGEST, false, "2026-11-05T12:05:00.000000Z", "s", "codex", 100]);
-    for (const p of ["p_workspace => $1", "p_cutover_epoch => $2", "p_head_epoch => $3", "p_head_version => $4::text", "p_head_digest => $5", "p_head_pending => $6::boolean", "p_limit => $10::integer"])
+    expect(seen[2]!.params).toEqual(["ws-a", E1, E1, "9007199254740993", DIGEST, "selection", false, BASELINE, "2026-11-05T12:05:00.000000Z", "s", "codex", 100]);
+    for (const p of ["p_workspace => $1", "p_cutover_epoch => $2", "p_head_epoch => $3", "p_head_version => $4::text", "p_head_digest => $5", "p_head_kind => $6", "p_head_pending => $7::boolean", "p_privacy_baseline_sha256 => $8", "p_cursor_ts => $9::timestamptz", "p_limit => $12::integer"])
       expect(BUFFERED_SESSIONS_SQL).toContain(p);
   });
-  test("head none passes NULL head params", async () => {
+  test("both readers name the same authority args, baseline and kind included", () => {
+    for (const p of ["p_cutover_epoch => $2", "p_head_epoch => $3", "p_head_version => $4::text", "p_head_digest => $5", "p_head_kind => $6", "p_head_pending => $7::boolean", "p_privacy_baseline_sha256 => $8"])
+      expect(BUFFERED_STAGES_SQL).toContain(p);
+    expect(BUFFERED_STAGES_SQL).toContain("p_source => $9, p_session_id => $10)");
+    expect(BUFFERED_SESSIONS_SQL.match(/=> \$/g)!.length).toBe(12);
+    expect(BUFFERED_STAGES_SQL.match(/=> \$/g)!.length).toBe(10);
+  });
+  test("head none: NULL epoch/version/digest/kind, pending FALSE (never NULL, never '0'), baseline passed", async () => {
     const { run, seen } = runner([]);
-    await sqlOwnerBufferedReads(run).stages(SCOPE, authority(null), "claude", SESSION);
-    expect(seen[2]!.params).toEqual(["ws-a", E1, null, null, null, null, "claude", SESSION]);
-    expect(BUFFERED_STAGES_SQL).toContain("p_source => $7, p_session_id => $8");
+    const a = parseControlHeadResponse(noHeadBody(), SCOPE);
+    expect(headParams(a)).toEqual({ cutoverEpoch: E1, headEpoch: null, headVersion: null, headDigest: null, headKind: null, headPending: false, privacyBaselineSha256: BASELINE });
+    await sqlOwnerBufferedReads(run).stages(SCOPE, a, "claude", SESSION);
+    expect(seen[2]!.params).toEqual(["ws-a", E1, null, null, null, null, false, BASELINE, "claude", SESSION]);
+    await sqlOwnerBufferedReads(run).list(SCOPE, a, { limit: 5 });
+    expect(seen[5]!.params).toEqual(["ws-a", E1, null, null, null, null, false, BASELINE, null, null, null, 5]);
+  });
+  test("head present: epoch = controlEpoch, exact version string, digest, kind and baseline from the wire", async () => {
+    for (const kind of ["selection", "reset"] as const) {
+      const baseline = "a".repeat(64);
+      const a = parseControlHeadResponse(headBody({ sourceControlKind: kind, sourceControlVersion: "9223372036854775807", privacyBaselineSha256: baseline }), SCOPE);
+      expect(headParams(a)).toEqual({ cutoverEpoch: E1, headEpoch: E1, headVersion: "9223372036854775807", headDigest: DIGEST, headKind: kind, headPending: false, privacyBaselineSha256: baseline });
+      const { run, seen } = runner([]);
+      await sqlOwnerBufferedReads(run).stages(SCOPE, a, "claude", SESSION);
+      expect(seen[2]!.params).toEqual(["ws-a", E1, E1, "9223372036854775807", DIGEST, kind, false, baseline, "claude", SESSION]);
+    }
   });
   test("a row of another user is a TenantMismatchError (500), never a page", async () => {
     const { run } = runner([sessionRaw({ user_id: "u-2" })]);
@@ -521,6 +700,23 @@ describe("sqlOwnerBufferedReads", () => {
   test("SQLSTATE 55006 from the RPC is BufferedFenced(rpc_fenced)", async () => {
     const err = Object.assign(new Error("buffered read fenced"), { code: "55006" });
     expect(await reason(sqlOwnerBufferedReads(runner(err).run).stages(SCOPE, authority("7"), "claude", SESSION))).toBe("rpc_fenced");
+  });
+  test("57014 (statement_timeout) and any other RPC error are fenced on both readers, never a generic error", async () => {
+    const cases: Array<[Error, string]> = [
+      [Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }), "rpc_timeout"],
+      [Object.assign(new Error("function sessions.buffered_sessions_for does not exist"), { code: "42883" }), "rpc_error"],
+      [Object.assign(new Error("permission denied"), { code: "42501" }), "rpc_error"],
+      [new Error("connection terminated unexpectedly"), "rpc_error"],
+    ];
+    for (const [err, want] of cases) {
+      const reads = sqlOwnerBufferedReads(runner(err).run);
+      expect(await reason(reads.stages(SCOPE, authority("7"), "claude", SESSION))).toBe(want);
+      expect(await reason(reads.list(SCOPE, authority("7"), { limit: 5 }))).toBe(want);
+    }
+    const failingRun = (async () => {
+      throw new Error("pool exhausted");
+    }) as never;
+    expect(await reason(sqlOwnerBufferedReads(failingRun).list(SCOPE, authority("7"), { limit: 5 }))).toBe("rpc_error");
   });
 });
 

@@ -232,6 +232,18 @@ describe("GET /v1/sessions with owner buffered rows", () => {
     expect(JSON.stringify(await json(r))).not.toContain(SESSION);
   });
 
+  test("RPC timeout (57014) or any RPC error is fenced, never a 500: canonical page with the fenced header", async () => {
+    for (const [err, gate] of [[Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }), "rpc_timeout"], [new Error("connection terminated"), "rpc_error"]] as const) {
+      const run = (async (_o: string, _w: string, work: (q: unknown) => Promise<unknown>) =>
+        work({ async query(sql: string) { if (sql.includes("buffered_sessions_for")) throw err; return { rows: [] }; } })) as never;
+      const { get, logs } = api({ reads: sqlOwnerBufferedReads(run) });
+      const r = await get(L);
+      expect(r.status).toBe(200);
+      expect(r.headers.get("x-relayhistory-buffered")).toBe("fenced");
+      expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", gate }));
+    }
+  });
+
   test("flag off, no deps, or workspace not allowlisted: gate never called, bytes as without the feature", async () => {
     const base = await json(await api({ noOwnerBuffered: true }).get(L));
     for (const h of [{ enabled: false }, { noOwnerBuffered: true }]) {
@@ -312,6 +324,36 @@ describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => 
         const text = await r.text();
         expect(JSON.parse(text).error).toMatchObject({ code: "buffered_fenced", reason: "buffered_fenced" });
         expect(text).not.toContain("FENCED-CONTENT");
+      }
+    }
+  });
+
+  test("RPC timeout (57014) or any RPC error on the stage reader is fenced, never a 500: 501 before a candidate, 503 at the recheck", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [turn(0, { content: "RPC-ERROR-CONTENT" })]);
+    for (const err of [Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }), Object.assign(new Error("function does not exist"), { code: "42883" })]) {
+      for (const path of [T, M]) {
+        // First stages() call fails: nothing known, answered as main (501), logged buffered_unverified.
+        const first = (async (_o: string, _w: string, work: (q: unknown) => Promise<unknown>) =>
+          work({ async query(sql: string) { if (sql.includes("buffered_session_stages_for")) throw err; return { rows: [] }; } })) as never;
+        const { get, logs } = api({ store: s, reads: sqlOwnerBufferedReads(first) });
+        const r1 = await get(path);
+        expect(r1.status).toBe(501);
+        expect(logs.some((l) => l.reason === "buffered_unverified")).toBe(true);
+        // The recheck fails after a candidate was found: 503 buffered_fenced, no bytes.
+        let n = 0;
+        const recheck: OwnerBufferedReads = {
+          list: async () => [],
+          stages: async (scope, a, source, id) => {
+            if (n++ === 0) return [st.row];
+            return sqlOwnerBufferedReads(first).stages(scope, a, source, id);
+          },
+        };
+        const r2 = await api({ store: s, reads: recheck }).get(path);
+        expect(r2.status).toBe(503);
+        const text = await r2.text();
+        expect(JSON.parse(text).error).toMatchObject({ code: "buffered_fenced" });
+        expect(text).not.toContain("RPC-ERROR-CONTENT");
       }
     }
   });
