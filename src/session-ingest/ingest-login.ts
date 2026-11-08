@@ -17,8 +17,8 @@
  * system_user (trust auth) proves no authenticated identity and refuses.
  *
  * Callers: the hosted canonical publisher (publication-runtime.ts), the hosted buffered GC
- * (buffered-gc-job.ts) and, later, the portable publisher and the self-host ingest server
- * (#366, #363 rebase onto this). Role shape, membership and timeout profile are not
+ * (buffered-gc-job.ts), the portable publisher (publication-portable.ts) and, later, the
+ * self-host ingest server (#363 rebases onto this). Role shape, membership and timeout profile are not
  * re-checked here: those callers run the phase-2 verifiers (session_ingest_verify.sql)
  * right after this assertion. Approach mirrors #363's ingestLoginRefusal (head 58fdbb10).
  *

@@ -37,6 +37,8 @@ export function publicationEnabled(env:NodeJS.ProcessEnv,mode:'publish'|'gc'):bo
  const v=env[mode==='publish'?'INGEST_PUBLISH_ENABLED':'INGEST_PUBLICATION_GC_ENABLED']??'false';if(v!=='true'&&v!=='false')no('enabled_invalid');return v==='true';
 }
 function generationKey(key:string):boolean{const loc=parseSessionKey(key),g=loc&&parseUploadGenerationPrefix(loc.prefix??'');return!!g&&/^96bulls\/[A-Za-z0-9._-]{1,128}$/.test(g.base);}
+/** The generation-qualified PUT/erase scope, shared with publication-portable.ts. */
+export const publicationGenerationKey=generationKey;
 function readKey(key:string):boolean{if(bufferedKeyAllowed(key))return true;const loc=parseSessionKey(key);return!!loc&&!!loc.prefix&&(/^96bulls\/[A-Za-z0-9._-]{1,128}$/.test(loc.prefix)||generationKey(key));}
 export function scopedPublicationStore(raw:ObjectStore):ObjectStore{
  return new Proxy(raw,{get(t,k){

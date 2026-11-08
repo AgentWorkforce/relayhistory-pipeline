@@ -52,13 +52,19 @@ dormant; any other value fails startup.
     SIGTERM/SIGINT cancel owned IO and exit 0.
 - Publication GC (`publication-main.ts --gc`, `INGEST_PUBLICATION_GC_ENABLED`)
   is separately armed and is **not** dispatched here.
-- **Portability caveat. Read this before enabling.** The runtime is the
-  existing host runtime and is unchanged. It requires `AWS_REGION=us-east-1`,
-  `HOOPDB_DB_MODE=supabase`, IMDSv2 instance credentials, a Secrets Manager
-  secret and the `INGEST_PUBLISH_*` target identity
-  (`publication-runtime.ts`). A plain kind or CNPG self-host therefore fails
-  startup with `publication_target_required` once the flag is on. On such a
-  stack, ship it dormant until a portable runtime exists.
+- **Target selection. Read this before enabling.** `INGEST_PUBLICATION_TARGET`
+  picks the runtime. Unset or `aws` is the existing host runtime, which requires
+  `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, IMDSv2 instance
+  credentials, a Secrets Manager secret and the `INGEST_PUBLISH_*` target
+  identity (`publication-runtime.ts`). On a plain kind or CNPG stack that fails
+  startup with `publication_target_required`. Set `portable` instead
+  (`publication-portable.ts`): an S3-compatible endpoint (MinIO) with static
+  keys, a `bulls96_session_ingest` Postgres URL and an explicit
+  `SESSION_POSTGRES_TLS_PROFILE`. The variables, Secret keys, role and grants,
+  the owner-written `sessions.ingest_publication_frontiers` rows and the
+  versioned-bucket requirement are listed in that file's header. Until the
+  frontier rows exist, an enabled portable publisher runs but finds nothing to
+  publish.
 
 ## 2. One public origin
 
@@ -187,8 +193,9 @@ Order (plain Postgres or CNPG, `HOOPDB_DB_MODE=selfhosted`):
    never written to disk or into a file in this repository.
 4. **Services.** Workers block on `/readyz` until the ledger is complete, so
    their own order does not matter. Start `session-read-api` and
-   session-ingest after step 3: read-api checks `pg_roles` for its login at
-   startup and refuses `reader_role_superuser` / `reader_role_bypassrls`.
+   session-ingest after step 3: read-api admits its login at startup (a real
+   `bulls96_read_api` login: session identity, attributes, memberships both
+   ways, pinned settings) and refuses otherwise with `reader_role_<property>`.
    `session-publication` comes last (dormant by default).
 
 ## 5. Env, Secret and CA names

@@ -77,7 +77,7 @@ scrubs when it seals a chunk. For a client that cannot, the server's
   key, with `raw-sha256`, `raw-bytes`, `scrub-ruleset` and `scrub-version`
   metadata;
 - the response is the chunk entry and the `raw.scrub` marker
-  (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3, 4 from rule set 4, 5 from rule set 5) for the client's manifest.
+  (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3, 4 from rule set 4, 5 from rule set 5, 6 from rule set 6) for the client's manifest.
   Rule set 4: a quoted secret value whose matching closing quote is not within
   the quoted rule's 4096-unit scan bound (`MAX_QUOTED_VALUE` in `lib/scrub.ts`,
   UTF-16 code units counted from the value's start across line breaks) is
@@ -203,6 +203,37 @@ scrubs when it seals a chunk. For a client that cannot, the server's
     one (the secret key is still above the value). The second leak's stored
     value is already under the bound, but it still holds the line break after
     which rule set 4 stopped, so the multi-line rule redacts it whole too.
+
+  Rule set 6 corrects two rule set 5 defects; output for input with no unquoted
+  secret value of 4096 units or more and no private-key boundary inside a
+  quoted secret value is byte-identical to rule set 5
+  (`test/scrub-v5-v6-fuzz.test.ts`).
+  - **Unquoted values classified whole.** An unquoted value after a quoted
+    secret key (`"password": 0000…`) is read to its real end before it is
+    classified. Rule set 5 classified its first 4096 units only, so 4096 digits
+    then an alphanumeric tail passed as a number and the tail was stored. One
+    of 4096 units or more is now redacted whole, whatever it holds (a pure
+    number that long included); a shorter one is kept when it is a JSON
+    literal, a number or not generated-looking, as before. Number lexemes in a
+    parsed JSON record are still kept.
+  - **Private-key boundaries kept paired.** The over-cap first pass runs before
+    the private-key rule, which pairs each header with the next footer. Rule
+    set 5 took a footer inside an over-cap value with the value, so a header
+    before that value was paired with nothing and everything from it to the end
+    of the input was redacted. Now a quoted secret value (of any length) that
+    holds the footer of a header before it is redacted from that header through
+    the value's closing quote, and the text after it is kept; one that holds a
+    header whose footer is after it is redacted through that footer with its
+    closing quote kept (rule set 5 dropped the quote, and the quoted rule then
+    redacted to the end). When a quote lies between that value and the footer,
+    the footer may be inside a later quoted value whose key the redaction
+    removed, so the closing quote is not kept: the quoted rule then redacts what
+    follows the footer as part of the value (and when the redaction also starts
+    at a header before the value, it runs to the end of the input), so no rest
+    of a secret value is kept without its key. Within the bound, rule set 5 kept the part of such a
+    value after the footer; it is redacted too. The segmenter is unchanged:
+    no cut falls between a key block's header and its footer, nor inside the
+    value.
 
 The unscrubbed bytes are never written to storage. If the key already holds
 an object (identical bytes or not), it is kept and described from its own

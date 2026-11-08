@@ -2,7 +2,8 @@
  *
  * Pure decisions over rows recorded from real PostgreSQL 15.19, 16.15 and 17.11 (official
  * postgres images, scram-sha-256, loopback, 2026-11-08) always run. The live suite runs the
- * same probes, and the hosted publication and buffered GC runtimes themselves, against real servers when
+ * same probes, and the hosted publication, hosted buffered GC and portable publication
+ * runtimes themselves, against real servers when
  * INGEST_LOGIN_TEST_PG_URLS lists disposable owner URLs (comma-separated, loopback only).
  * It creates bulls96_session_ingest with a fixture-only password if absent.
  */
@@ -11,6 +12,7 @@ import pg from "pg";
 import { ingestLoginIdentity, ingestLoginIdentityRefusal, INGEST_LOGIN_IDENTITY_SQL } from "../ingest-login.ts";
 import { runCanonicalPublicationRuntime } from "../publication-runtime.ts";
 import { runBufferedGcJob } from "../buffered-gc-job.ts";
+import { runPortablePublicationRuntime } from "../publication-portable.ts";
 
 const R = "bulls96_session_ingest";
 // Recorded rows: [login row, PG16+ row].
@@ -157,6 +159,41 @@ describe.skipIf(!URLS.length)("genuine login against real PostgreSQL", () => {
       const gcError = await runBufferedGcJob(gcEnv, { assets, secret, store, pool: pool(false) }).then(() => null, (e) => e);
       expect(gcError?.code).not.toBe("database_role");
       expect(queries.some((q) => q.includes("verifier-1"))).toBe(true);
+    });
+
+    test(`${target(url).port}: the portable runtime refuses a superuser SET SESSION AUTHORIZATION pool before verifiers, store or RPC; a genuine login passes identity`, async () => {
+      await ensureRole(url);
+      const u = target(url), database = u.pathname.slice(1) || "postgres";
+      const env = {
+        INGEST_PUBLISH_ENABLED: "true", INGEST_PUBLICATION_TARGET: "portable", INGEST_PUBLISH_BUCKET: "selfhost-sessions", INGEST_PUBLISH_EXPECT_GENERATION: "a".repeat(64),
+        INGEST_PUBLISH_S3_ENDPOINT: "http://127.0.0.1:9", INGEST_PUBLISH_S3_REGION: "us-east-1", INGEST_PUBLISH_S3_ACCESS_KEY_ID: "publisher-fixture",
+        INGEST_PUBLISH_S3_SECRET_ACCESS_KEY: "publisher-fixture-secret-only", INGEST_PUBLISH_DATABASE_URL: `postgresql://${R}:${PW}@${u.host}/${database}`,
+        HOOPDB_DB_MODE: "selfhosted", SESSION_POSTGRES_TLS_PROFILE: "supabase",
+      };
+      const queries: string[] = [];
+      const assets = async () => ({ expected: { names: ["x"], generation: "a".repeat(64) }, verifiers: { searchWorker: "SELECT 'verifier-1';", tokenVerifier: "SELECT 2;", ingestSeeder: "SELECT 3;", ingest: "SELECT 4;" } }) as any;
+      let stores = 0;
+      const store = () => { stores++; throw Object.assign(Error("stop"), { code: "stop_at_store" }); };
+      // The loopback fixture server has no TLS: the factory keeps every validated field but ssl.
+      const plain = (c: pg.PoolConfig, as?: { user: string; password: string }) => {
+        const pool = new pg.Pool({ ...c, ssl: false, ...(as ?? {}) });
+        if (as) pool.on("connect", (client) => { client.query(`SET SESSION AUTHORIZATION ${R}`); });
+        const original = pool.connect.bind(pool) as any;
+        (pool as any).connect = (cb: any) => original((e: any, client: any, done: any) => {
+          if (client && !client.__traced) { const q = client.query.bind(client); client.query = (x: any, ...r: any[]) => { queries.push(typeof x === "string" ? x : x.text); return q(x, ...r); }; client.__traced = true; }
+          cb(e, client, done);
+        });
+        return pool;
+      };
+      const owner = new URL(url);
+      await expect(runPortablePublicationRuntime(env, "publish", { assets, store, pool: (c) => plain(c, { user: decodeURIComponent(owner.username), password: decodeURIComponent(owner.password) }) })).rejects.toMatchObject({ code: "publication_database_role" });
+      expect(stores).toBe(0);
+      expect(queries.some((q) => q.includes("verifier-1"))).toBe(false);
+      queries.length = 0;
+      // Genuine login: identity passes, the (stub) verifiers run, and the run stops at the store factory.
+      await expect(runPortablePublicationRuntime(env, "publish", { assets, store, pool: (c) => plain(c) })).rejects.toMatchObject({ code: "stop_at_store" });
+      expect(queries.some((q) => q.includes("verifier-1"))).toBe(true);
+      expect(stores).toBe(1);
     });
   }
 });
