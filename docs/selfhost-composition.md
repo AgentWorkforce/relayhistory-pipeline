@@ -193,8 +193,9 @@ Order (plain Postgres or CNPG, `HOOPDB_DB_MODE=selfhosted`):
    never written to disk or into a file in this repository.
 4. **Services.** Workers block on `/readyz` until the ledger is complete, so
    their own order does not matter. Start `session-read-api` and
-   session-ingest after step 3: read-api checks `pg_roles` for its login at
-   startup and refuses `reader_role_superuser` / `reader_role_bypassrls`.
+   session-ingest after step 3: read-api admits its login at startup (a real
+   `bulls96_read_api` login: session identity, attributes, memberships both
+   ways, pinned settings) and refuses otherwise with `reader_role_<property>`.
    `session-publication` comes last (dormant by default).
 
 ## 5. Env, Secret and CA names
