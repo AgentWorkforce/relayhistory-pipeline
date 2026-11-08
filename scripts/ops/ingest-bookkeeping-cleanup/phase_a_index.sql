@@ -1,4 +1,4 @@
--- Post-apply operator job for 20261105043600 (NOT a migration: CREATE INDEX CONCURRENTLY cannot run in the
+-- Post-apply operator job for 20261105043880 (NOT a migration: CREATE INDEX CONCURRENTLY cannot run in the
 -- migrator's transaction; same pattern as scripts/ops/c3-privacy-authority/ingest_privacy_authority_index.sql).
 -- Run outside a transaction, ONLY under Khaliq's explicit apply OK. sessions.ingest_bookkeeping_cleanup_*
 -- refuses (55000) until this index exists, is valid and ready, AND its pg_get_indexdef is exactly

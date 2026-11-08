@@ -108,7 +108,7 @@ export async function generate(read: Reader, lanes: readonly LaneManifest[], ver
   for (const l of lanes)
     for (const [sig, f] of Object.entries(l.functions)) acl.functions[sig] = ["<owner>:EXECUTE", ...f.grants.map((r) => r + ":EXECUTE")];
   // Checked only after EVERY lane's owned entries are back: a lane may replace a function another lane
-  // owns (043600 replaces 042000's register), and lane order must not decide whether that entry exists yet.
+  // owns (043880 replaces 042000's register), and lane order must not decide whether that entry exists yet.
   for (const l of lanes)
     for (const sig of Object.keys(l.replaces)) if (!acl.functions[sig]) fail(`${l.lane}: replaced function ${sig} has no original ACL entry`);
   acl.functions = Object.fromEntries(Object.entries(acl.functions).sort(([a], [b]) => byCodeUnit(a, b)));
@@ -118,7 +118,7 @@ export async function generate(read: Reader, lanes: readonly LaneManifest[], ver
   wrapper = wrapper.replace(/v_manifest jsonb := \$manifest\$[\s\S]*?\$manifest\$::jsonb;/,
     () => "v_manifest jsonb := $manifest$" + JSON.stringify(acl.functions) + "$manifest$::jsonb;");
   const secdefBlock = listBlock(wrapper, /v_secdef text\[\] := ARRAY\[([\s\S]*?)\]::text\[\];/, "boundary SECDEF");
-  const secdefs = quotedItems(secdefBlock[1]!, "'").filter((k) => !laneDefined(k));
+  const secdefs = quotedItems(secdefBlock[1]!, "'").filter((k) => !ownedOrPrefixed(k) && !laneDefined(k));
   for (const l of lanes) {
     for (const [sig, f] of Object.entries(l.functions)) if (f.secdef) secdefs.push(sig);
     for (const [sig, f] of Object.entries(l.replaces)) if (f.secdef) secdefs.push(sig);

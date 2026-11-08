@@ -151,7 +151,7 @@ describe("history floor and erasure", () => {
 
   test("a search cursor page that reaches the floor ends cleanly with a relayhistory continuation, never a 501", async () => {
     const cand = { ts_ms: Date.parse("2026-09-02T00:00:00Z"), session_id: "s-1", source: "codex", machine_id: "m-1", kind: "message", event_id: "e-9" };
-    const newest = [{ ...cand, org_id: "org-a", workspace_id: "ws-a", type: "assistant", user_id: "u-1", actor_name: "", actor_role: "", subagent_id: "", project_id: "", task_title: "", task_ref: "", tags: [], files_touched: [], tool_name: "", tool_status: "", content: "needle", in_budget: 1 }];
+    const newest = [{ ...cand, org_id: "org-a", workspace_id: "ws-a", type: "assistant", user_id: "u-1", actor_name: "", actor_role: "", subagent_id: "", project_id: "", task_title: "", task_ref: "", tags: [], files_touched: [], tool_name: "", tool_status: "", content: "needle", in_budget: 1, origin: "canonical", origin_claim_token: "" }];
     const { ch, eventQueries } = stubCh({ candidates: [cand], newest });
     const { get, logs } = api({ ch, completeSinceMs: floor });
     const cursor = encodeCursor({ tsMs: Date.parse("2026-09-03T00:00:00Z"), sessionId: "s-1", source: "codex", machineId: "m-1", kind: "message", eventId: "e-10" });

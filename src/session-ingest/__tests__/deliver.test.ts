@@ -654,11 +654,17 @@ describe("deletion fences written by relayhistory (review High 2 / Medium: fence
     const res = await a.fetch(new Request(`https://x${path}`, { method: "POST", body, headers: signedHeaders(identity, "POST", path, enc(body)) }));
     return { res, ledger };
   }
-  test("selection: relayhistory's body and answer; the ledger gets this user's sessions", async () => {
+  test.each([false, true])("selection: optional expected user %s preserves the body and authenticated ledger tenant", async (withUser) => {
     const account_id = (await batch([])).account_id;
-    const { res, ledger } = await post("/v1/delivery/sessions/selection", { account_id, origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
+    const { res, ledger } = await post("/v1/delivery/sessions/selection", { account_id, ...(withUser ? { expected_user_id: identity.userId } : {}), origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
     expect([res.status, await res.json()]).toEqual([200, { updated: true }]);
     expect(ledger.selections).toEqual([{ tenant: TENANT, originId: "origin-1", sessions: [["claude", "s1"]], enabled: false }]);
+  });
+  test.each(["another-user", null, "", 7, "user-1\u0000", "x".repeat(513)])("selection: invalid expected user %j never changes consent", async (expected_user_id) => {
+    const { res, ledger } = await post("/v1/delivery/sessions/selection", { account_id: (await batch([])).account_id, expected_user_id, origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
+    expect(res.status).toBe(expected_user_id === "another-user" ? 403 : 400);
+    expect(ledger.selections).toEqual([]);
+    expect(ledger.deleted.size).toBe(0);
   });
   test("selection: another tenant's account id is 403, a malformed body 400, nothing written", async () => {
     const wrong = await post("/v1/delivery/sessions/selection", { account_id: "relayhistory:other", origin_id: "o", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
@@ -666,6 +672,22 @@ describe("deletion fences written by relayhistory (review High 2 / Medium: fence
     expect(wrong.ledger.selections).toEqual([]);
     const bad = await post("/v1/delivery/sessions/selection", { account_id: (await batch([])).account_id, origin_id: "o", sessions: [], enabled: false });
     expect(bad.res.status).toBe(400);
+    const unknown = await post("/v1/delivery/sessions/selection", { account_id: (await batch([])).account_id, expected_user_id: identity.userId, origin_id: "o", sessions: [{ source: "claude", session_id: "s1" }], enabled: false, unexpected: true });
+    expect(unknown.res.status).toBe(400);
+    expect(unknown.ledger.selections).toEqual([]);
+  });
+  test.each(["relayhistory", "frozen-supabase"] as const)("selection: expected user is checked before ordered control or custody on %s", async (custodySource) => {
+    const { deps, ledger } = setup();
+    let witnessCalls = 0, controlCalls = 0;
+    ledger.frozenWitness = async () => { witnessCalls++; throw new Error("must not read custody"); };
+    ledger.applyOrderedControl = async () => { controlCalls++; throw new Error("must not apply control"); };
+    const a = createIngestApp({ deliver: deps, log: () => {}, signingKey: SIGNING_KEY, custodySource });
+    const controlIdentity = { ...identity, control: { epoch: "e".repeat(64), version: "1", digest: "d".repeat(64), kind: "selection" } };
+    const path = "/v1/delivery/sessions/selection";
+    const body = JSON.stringify({ account_id: (await batch([])).account_id, expected_user_id: "another-user", origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
+    const res = await a.fetch(new Request(`https://x${path}`, { method: "POST", body, headers: signedHeaders(controlIdentity, "POST", path, enc(body)) }));
+    expect(res.status).toBe(403);
+    expect([witnessCalls, controlCalls, ledger.selections.length, ledger.deleted.size]).toEqual([0, 0, 0, 0]);
   });
   test("reset: needs the typed confirmation, answers relayhistory's shape", async () => {
     const account_id = (await batch([])).account_id;

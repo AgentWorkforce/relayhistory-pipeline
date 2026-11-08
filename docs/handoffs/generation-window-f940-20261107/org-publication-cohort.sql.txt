@@ -1,0 +1,96 @@
+-- SOURCE DRAFT ONLY; DO NOT RUN without exact route/project/org qualification.
+-- One parameterized SELECT. Bind $1 = the reporting customer's currently verified org_id; never
+-- interpolate it, log it, put it in argv, or return identifiers.
+-- Existing owner transport must BEGIN READ ONLY; SET LOCAL ROLE postgres;
+-- SET LOCAL statement_timeout='3s'; SET LOCAL lock_timeout='250ms';
+-- verify current_user=postgres/session_user=cli_login_postgres, target project,
+-- SELECT privilege and inactive RLS on all four tables below; then this query;
+-- ROLLBACK. Failed/timeout/masked preflight => UNKNOWN, never zero.
+-- Cohorts use durable batch ACK committed_at, not publication timestamps.
+-- canonical publication_state changes at CLAIM, so it is not publication proof.
+WITH params AS MATERIALIZED (
+ SELECT $1::text AS org_id, transaction_timestamp() AS observed_at
+), batches AS MATERIALIZED (
+ SELECT b.org_id,b.workspace_id,b.origin_id,b.batch_id,b.user_id,b.digest,
+        b.state,b.claimed_at,b.committed_at,b.publication_state,b.buffer_receipt_kind
+ FROM sessions.ingest_batches b JOIN params p ON b.org_id=p.org_id
+ WHERE p.org_id<>'' AND length(p.org_id)<=128
+), acknowledged_ordinals AS MATERIALIZED (
+ SELECT DISTINCT b.org_id,b.workspace_id,b.origin_id,b.batch_id,b.user_id,b.digest,
+        (o.value::text)::integer AS ordinal
+ FROM batches b JOIN sessions.ingest_stage_intents s
+   USING(org_id,workspace_id,origin_id,batch_id,user_id,digest)
+ CROSS JOIN LATERAL jsonb_array_elements(s.group_ordinals) g(value)
+ CROSS JOIN LATERAL jsonb_array_elements(g.value) o(value)
+ WHERE b.state='committed' AND b.buffer_receipt_kind='staged'
+   AND s.receipt_state='acknowledged' AND s.parent_stage_token IS NULL
+), published_ordinals AS MATERIALIZED (
+ SELECT DISTINCT b.org_id,b.workspace_id,b.origin_id,b.batch_id,b.user_id,b.digest,
+        (o.value::text)::integer AS ordinal
+ FROM batches b JOIN sessions.ingest_publication_attempts a
+   USING(org_id,workspace_id,origin_id,batch_id,user_id,digest)
+ CROSS JOIN LATERAL jsonb_array_elements(a.accepted_ordinals) o(value)
+ WHERE a.state='published' AND a.published_at IS NOT NULL
+), record_counts AS MATERIALIZED (
+ SELECT a.org_id,a.workspace_id,a.origin_id,a.batch_id,a.user_id,a.digest,
+        count(*) AS ack_records,
+        count(p.ordinal) AS published_records
+ FROM acknowledged_ordinals a LEFT JOIN published_ordinals p
+   USING(org_id,workspace_id,origin_id,batch_id,user_id,digest,ordinal)
+ GROUP BY a.org_id,a.workspace_id,a.origin_id,a.batch_id,a.user_id,a.digest
+), classified AS MATERIALIZED (
+ SELECT b.*,r.ack_records,r.published_records,
+        b.state='committed' AND b.buffer_receipt_kind='staged' AS staged_ack,
+        EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox o
+         WHERE o.org_id=b.org_id AND o.workspace_id=b.workspace_id
+           AND o.origin_id=b.origin_id AND o.batch_id=b.batch_id
+           AND o.user_id=b.user_id AND o.digest=b.digest
+           AND o.state='buffered' AND o.active_stage_token IS NOT NULL) AS active_buffer_pointer
+ FROM batches b LEFT JOIN record_counts r
+   USING(org_id,workspace_id,origin_id,batch_id,user_id,digest)
+), windows(label,span) AS (
+ VALUES('24h',interval '24 hours'),('7d',interval '7 days')
+), cohorts AS (
+ SELECT w.label,
+        count(*) FILTER(WHERE c.staged_ack) AS staged_ack_batches,
+        count(*) FILTER(WHERE c.staged_ack AND c.ack_records IS NULL) AS staged_batches_missing_record_metadata,
+        count(*) FILTER(WHERE c.staged_ack AND c.published_records=c.ack_records AND c.ack_records>0) AS fully_published_staged_batches,
+        count(*) FILTER(WHERE c.staged_ack AND c.published_records<c.ack_records) AS staged_batches_with_unpublished_records,
+        count(*) FILTER(WHERE c.staged_ack AND c.published_records>0 AND c.published_records<c.ack_records) AS partially_published_staged_batches,
+        count(*) FILTER(WHERE c.staged_ack AND c.published_records<c.ack_records AND NOT c.active_buffer_pointer) AS unpublished_batches_without_active_buffer_pointer,
+        coalesce(sum(c.ack_records) FILTER(WHERE c.staged_ack),0) AS acknowledged_stage_records,
+        coalesce(sum(c.published_records) FILTER(WHERE c.staged_ack),0) AS historically_published_stage_records,
+        coalesce(sum(c.ack_records-c.published_records) FILTER(WHERE c.staged_ack),0) AS stage_records_without_publication_evidence,
+        count(*) FILTER(WHERE c.state='committed' AND c.buffer_receipt_kind='suppressed') AS suppressed_batches,
+        count(*) FILTER(WHERE c.state='committed' AND c.buffer_receipt_kind IS NULL AND c.publication_state='canonical') AS direct_canonical_batches_not_assessed_for_record_count
+ FROM windows w CROSS JOIN params p LEFT JOIN classified c
+   ON c.committed_at>=p.observed_at-w.span AND c.committed_at<=p.observed_at
+ GROUP BY w.label
+), oldest AS (
+ SELECT min(c.committed_at) FILTER(WHERE c.staged_ack AND c.published_records<c.ack_records) AS first_unpublished,
+        count(*) FILTER(WHERE c.state='pending') AS pending_unacknowledged_batches,
+        count(*) FILTER(WHERE c.staged_ack AND c.ack_records IS NULL) AS all_time_staged_batches_missing_record_metadata,
+        count(*) FILTER(WHERE c.committed_at>p.observed_at) AS future_ack_timestamps
+ FROM classified c CROSS JOIN params p
+)
+SELECT jsonb_build_object(
+ 'input_scope_valid',p.org_id<>'' AND length(p.org_id)<=128,
+ 'cohorts',coalesce((SELECT jsonb_agg(to_jsonb(c) ORDER BY c.label) FROM cohorts c),'[]'::jsonb),
+ 'oldest_unpublished_ack_age_bucket',CASE
+   WHEN o.first_unpublished IS NULL THEN 'none_with_known_record_metadata'
+   WHEN o.first_unpublished>p.observed_at THEN 'future_unknown'
+   WHEN o.first_unpublished>p.observed_at-interval '1 hour' THEN 'lt1h'
+   WHEN o.first_unpublished>p.observed_at-interval '24 hours' THEN '1to24h'
+   WHEN o.first_unpublished>p.observed_at-interval '7 days' THEN '1to7d'
+   WHEN o.first_unpublished>p.observed_at-interval '30 days' THEN '7to30d'
+   ELSE 'ge30d' END,
+ 'pending_unacknowledged_batches',o.pending_unacknowledged_batches,
+ 'all_time_staged_batches_missing_record_metadata',o.all_time_staged_batches_missing_record_metadata,
+ 'future_ack_timestamps',o.future_ack_timestamps
+) AS aggregate
+FROM oldest o CROSS JOIN params p;
+-- Published counts are historical proof, not proof of present visibility.
+-- Unpublished counts are not automatically a stuck backlog: privacy erasure,
+-- stale/suppressed records and retired source objects require separate review.
+-- Deduplication by batch+ordinal prevents retry attempts from multiplying counts.
+-- Missing acknowledged-stage metadata is UNKNOWN, explicitly counted separately.

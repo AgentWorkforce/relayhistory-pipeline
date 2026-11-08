@@ -1,0 +1,18 @@
+{
+  "startedAt": "2026-11-07T22:10:52.830918+00:00",
+  "completedAt": "2026-11-07T22:10:53.101074+00:00",
+  "helperSha256": "54188cfc553d8b7e6e509a8355200aa4c84f5903daace5e1decefd5d85a08773",
+  "exitCode": 2,
+  "rows": [
+    {
+      "status": "refused",
+      "reason": "cache_expired_or_expiring",
+      "mutationMethodsInvoked": false,
+      "newLogin": false,
+      "credentialFilesWritten": false
+    }
+  ],
+  "awsMutationAttempted": false,
+  "newLogin": false,
+  "credentialFilesWritten": false
+}

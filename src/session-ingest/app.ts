@@ -40,6 +40,7 @@ import { deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } fr
 import { LedgerUnavailableError } from "./ledger.ts";
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
+import { AcquisitionRefusedError } from "./acquisition-refusal.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
 import { parseTurnBatch } from "./turns.ts";
@@ -225,6 +226,30 @@ function unavailableFields(error: unknown): Record<string, unknown> {
   return {};
 }
 
+/** Lock/timeout alert stages (runbooks/history-620-operations.md, "Lock-wait alert"). The two
+ * Worker-side seat-clock callers: `lazy_claim` (stage "claim" in buffered mode =
+ * ingest_claim_buffered_batch) and `staged_ack` (stage "buffer_receipt" = ingest_commit_buffered_batch).
+ * Plus `staged_intent` (stage "buffer_intent" = ingest_prepare_buffer_stage): it takes no seat-clock lock,
+ * but it waits on the same fence, batch and stage-intent rows the staged ACK holds FOR UPDATE, so a
+ * long ACK surfaces there first. set_live / control_changed / lazy_clear have no Worker call site; they
+ * alert from the operator/DB logs. */
+export type LockAlertStage = "lazy_claim" | "staged_ack" | "staged_intent" | "set_live" | "control_changed" | "lazy_clear";
+const LOCK_ALERT_SQLSTATES = new Set(["55P03", "57014"]);
+
+/** The one alert line for a 55P03 (lock_not_available) / 57014 (query_canceled) ledger failure on a
+ * lock-alert stage: `{ route, stage, sqlstate }` and nothing else (no tenant data, no ids). Diagnostic only. */
+export function lockAlertFields(error: unknown, acceptanceMode: string | undefined): { route: "ingest.lock_alert"; stage: LockAlertStage; sqlstate: string } | undefined {
+  if (!(error instanceof IngestUnavailable)) return undefined;
+  const sqlstate = error.db?.db_error_code;
+  if (sqlstate === undefined || !LOCK_ALERT_SQLSTATES.has(sqlstate)) return undefined;
+  const stage: LockAlertStage | undefined =
+    error.stage === "claim" && acceptanceMode === "buffered" ? "lazy_claim"
+      : error.stage === "buffer_receipt" ? "staged_ack"
+      : error.stage === "buffer_intent" ? "staged_intent"
+      : undefined;
+  return stage ? { route: "ingest.lock_alert", stage, sqlstate } : undefined;
+}
+
 function dbFields(db: DbErrorDiagnosis | undefined): Record<string, unknown> {
   return db ? { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis } : {};
 }
@@ -233,6 +258,9 @@ function failure(c: Context<Env>, error: unknown) {
   const safe = error instanceof DeliveryError ? error : new DeliveryError("delivery_unavailable", 503, "Durable delivery is temporarily unavailable");
   // A busy refusal is retryable and wrote nothing durable; tell the client when (relayhistory's header).
   if (safe instanceof DeliveryBusyError) c.header("Retry-After", String(safe.retryAfterSeconds));
+  // Acquisition refusal (design §5.6): the refused sessions sit beside `error`, not inside it.
+  if (safe instanceof AcquisitionRefusedError)
+    return c.json({ ...errorBody(c, safe.code, safe.message), refused: safe.refused.map((r) => ({ source: r.source, sessionId: r.sessionId, code: r.code })) }, 409);
   return c.json(
     errorBody(c, safe.code, safe.message, {
       ...(safe.conflict ? { conflict: safe.conflict } : {}),
@@ -274,10 +302,12 @@ function identifier(v: unknown): v is string {
   return typeof v === "string" && v.length > 0 && new TextEncoder().encode(v).length <= 512 && !/[\x00-\x1f\x7f]/.test(v) && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(v);
 }
 
-export function parseSelection(body: unknown): { account_id: string; origin_id: string; sessions: { source: string; session_id: string }[]; enabled: boolean } {
+export function parseSelection(body: unknown): { account_id: string; expected_user_id?: string; origin_id: string; sessions: { source: string; session_id: string }[]; enabled: boolean } {
   if (!isObject(body)) invalid("Expected upload selection");
   const b = body as Record<string, unknown>;
-  exactKeys(b, ["account_id", "origin_id", "sessions", "enabled"]);
+  const expectedUser = Object.hasOwn(b, "expected_user_id");
+  exactKeys(b, ["account_id", "origin_id", "sessions", "enabled", ...(expectedUser ? ["expected_user_id"] : [])]);
+  if (expectedUser && !identifier(b.expected_user_id)) invalid("Invalid expected upload user");
   if (!identifier(b.origin_id) || typeof b.enabled !== "boolean" || !Array.isArray(b.sessions) || b.sessions.length < 1 || b.sessions.length > 2048)
     invalid("Invalid upload selection");
   for (const x of b.sessions as unknown[]) {
@@ -432,6 +462,8 @@ export function createIngestApp(deps: IngestAppDeps) {
         duration_ms: Date.now() - started,
         bytes_raw: read.bytes,
       });
+      const lockAlert = lockAlertFields(error, deps.deliver.acceptanceMode);
+      if (lockAlert) emit(lockAlert);
       return failure(c, error);
     }
   };
@@ -463,6 +495,8 @@ export function createIngestApp(deps: IngestAppDeps) {
     } catch (error) {
       const code = error instanceof DeliveryError ? error.code : "delivery_unavailable";
       emit({ ...fields, outcome: code, ...unavailableFields(error), duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
+      const lockAlert = lockAlertFields(error, deps.deliver.acceptanceMode);
+      if (lockAlert) emit(lockAlert);
       return failure(c, error);
     }
   });
@@ -475,6 +509,8 @@ export function createIngestApp(deps: IngestAppDeps) {
     try {
       const input = parseSelection(await jsonOf(c));
       await requireDeliveryAccount(identity, input.account_id);
+      if (input.expected_user_id !== undefined && input.expected_user_id !== identity.userId)
+        throw new DeliveryError("delivery_user_mismatch", 403, "Upload selection does not match authenticated user");
       const selection={
         tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId },
         originId: input.origin_id,

@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import pg from "pg";
 import { readAppFromSecret } from "../lambda.ts";
 import { poolTenantRunner } from "../liveness.ts";
+import { readerLoginAnswer } from "./reader-login-support.ts";
 import { partialSessionsInWorkspace, readEventPage, type Liveness } from "../page.ts";
 import { createPostgresSearchComposition } from "../../shared/search-composition.ts";
 import type { SearchServiceBinding } from "../../session-pipeline/search-adapter.ts";
@@ -13,6 +14,8 @@ async function readerOptions(url: string): Promise<pg.PoolConfig> {
   let options: pg.PoolConfig | undefined;
   pg.Pool = class extends RealPool {
     constructor(config: pg.PoolConfig) { super(config); options = config; }
+    // Only the startup reader-role admission check queries; answer it unconnected.
+    override query = (async (text: string) => ({ rows: readerLoginAnswer(text) ?? [] })) as never;
   } as typeof pg.Pool;
   try {
     const reader = await readAppFromSecret(JSON.stringify({ supabase_url: url }), {

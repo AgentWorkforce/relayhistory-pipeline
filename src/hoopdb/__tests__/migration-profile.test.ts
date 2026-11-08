@@ -1370,6 +1370,337 @@ describe("per-step catalog sentinels", () => {
       expect(error?.message).toContain(`(${name})`);
       expect(await snapshot(hidden)).toEqual(before);
     });
+
+  // dogpatch P1: a login that is a member OF bulls96_acquisition_installer could SET ROLE to it and call the
+  // SECURITY DEFINER acquisition RPCs directly. Both the role bootstrap and the 043850 admission block refuse
+  // any inbound member except Supabase's PG16+ creator edge (postgres, granted by superuser supabase_admin,
+  // ADMIN TRUE, INHERIT FALSE, SET FALSE). PGlite is PostgreSQL 16+, so the edge itself is exercised here.
+  const ACQ = "upstream:20261105043850_ingest_acquisition_owner.sql";
+  const INSTALLER = "bulls96_acquisition_installer";
+  // PGlite's bootstrap superuser is postgres, and PG16+ records every superuser grant as made by the bootstrap
+  // superuser, so the Supabase catalog shape (grantor supabase_admin, Supabase's bootstrap superuser) is forged
+  // by a superuser catalog UPDATE of the grantor. Test fixture only.
+  const creatorEdge = (opts: string, grantorSuper = true) =>
+    `CREATE ROLE supabase_admin SUPERUSER NOLOGIN; SET ROLE supabase_admin; GRANT ${INSTALLER} TO postgres WITH ${opts}; RESET ROLE;
+     UPDATE pg_auth_members SET grantor = 'supabase_admin'::regrole WHERE roleid = '${INSTALLER}'::regrole AND member = 'postgres'::regrole;` +
+    (grantorSuper ? "" : " ALTER ROLE supabase_admin NOSUPERUSER;");
+  const SUPABASE_EDGE = creatorEdge("ADMIN TRUE, INHERIT FALSE, SET FALSE");
+  const INBOUND: [string, string][] = [
+    ["a LOGIN member", `CREATE ROLE g6_attacker LOGIN; GRANT ${INSTALLER} TO g6_attacker`],
+    ["a NOLOGIN member", `CREATE ROLE g6_attacker NOLOGIN; GRANT ${INSTALLER} TO g6_attacker WITH INHERIT FALSE, SET TRUE`],
+    ["the creator-edge shape with SET TRUE", creatorEdge("ADMIN TRUE, INHERIT FALSE, SET TRUE")],
+    ["the creator-edge shape with INHERIT TRUE", creatorEdge("ADMIN TRUE, INHERIT TRUE, SET FALSE")],
+    ["the creator-edge shape without ADMIN", creatorEdge("ADMIN FALSE, INHERIT FALSE, SET FALSE")],
+    ["the creator-edge shape granted by a non-superuser supabase_admin", creatorEdge("ADMIN TRUE, INHERIT FALSE, SET FALSE", false)],
+    ["the creator edge plus a LOGIN member", `${SUPABASE_EDGE} CREATE ROLE g6_attacker LOGIN; GRANT ${INSTALLER} TO g6_attacker`],
+  ];
+  const acquisitionPrefix = async () => {
+    const steps = (await plan(LOCAL)).filter(
+      (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+    );
+    const i = steps.findIndex((st) => st.name === ACQ);
+    expect(i).toBeGreaterThan(0);
+    return { db: await prefix(i - 1, i), path: steps[i]!.path };
+  };
+  const applyAcquisition = async (db: PGlite, path: string) => {
+    await db.exec("BEGIN");
+    try { await db.exec(readFileSync(path, "utf8")); await db.exec("COMMIT"); }
+    catch (error) { await db.exec("ROLLBACK"); throw error; }
+  };
+  const installerGrants = async (db: PGlite) =>
+    (await db.query<{ n: number }>(
+      "SELECT count(*)::int n FROM pg_proc p, aclexplode(p.proacl) a WHERE a.grantee = $1::regrole AND a.privilege_type = 'EXECUTE'",
+      [INSTALLER],
+    )).rows[0]!.n;
+  const BOOTSTRAP = join(root, "supabase/bootstrap/session_ingest_roles.sql");
+
+  for (const [label, sql] of INBOUND) {
+    test(`installer inbound membership (${label}): the role bootstrap refuses 55000`, async () => {
+      const { db } = await acquisitionPrefix();
+      await db.exec(sql);
+      const error = await failure(db.exec(readFileSync(BOOTSTRAP, "utf8")));
+      expect(error?.code).toBe("55000");
+      expect(error?.message).toContain(`bootstrap ${INSTALLER}: the role has an unexpected member`);
+    });
+
+    test(`installer inbound membership (${label}): the 043850 admission block refuses 55000 before any RPC grant`, async () => {
+      const { db, path } = await acquisitionPrefix();
+      await db.exec(sql);
+      const error = await failure(applyAcquisition(db, path));
+      expect(error?.code).toBe("55000");
+      expect(error?.message).toBe(`acquisition: role ${INSTALLER} has an unexpected member`);
+      expect(await installerGrants(db)).toBe(0);
+      expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_acquisition_owners')::text r")).rows[0]!.r).toBeNull();
+    });
+  }
+
+  test("installer inbound membership: the exact Supabase PG16+ creator edge is accepted by the bootstrap and the 043850 admission block", async () => {
+    const { db, path } = await acquisitionPrefix();
+    await db.exec(SUPABASE_EDGE);
+    expect(await failure(db.exec(readFileSync(BOOTSTRAP, "utf8")))).toBeNull();
+    expect(await failure(applyAcquisition(db, path))).toBeNull();
+    expect(await installerGrants(db)).toBe(4);
+  });
+
+  test("installer inbound membership: with no member, the bootstrap and the 043850 admission block pass; adding a member afterwards makes the bootstrap refuse", async () => {
+    const { db, path } = await acquisitionPrefix();
+    expect(await failure(db.exec(readFileSync(BOOTSTRAP, "utf8")))).toBeNull();
+    expect(await failure(applyAcquisition(db, path))).toBeNull();
+    expect(await installerGrants(db)).toBe(4);
+    await db.exec(INBOUND[0]![1]);
+    expect((await failure(db.exec(readFileSync(BOOTSTRAP, "utf8"))))?.code).toBe("55000");
+  });
+
+  // PGlite is PostgreSQL 16+, and server_version_num is a read-only preset GUC, so the pre-16 branches are
+  // exercised by pinning the version the file reads to 150000 (exactly one substitution each). Everything else
+  // runs as shipped. CI's real PostgreSQL 15 job covers the unsimulated path.
+  const pre16 = (sql: string, from: string, to: string) => {
+    expect(sql.split(from).length).toBe(2);
+    return sql.replace(from, to);
+  };
+  const BOOTSTRAP_PRE16 = () =>
+    pre16(readFileSync(BOOTSTRAP, "utf8"), "v_version int := current_setting('server_version_num')::int;", "v_version int := 150000;");
+  const PRE16_MEMBERS: [string, string, string][] = [
+    ["a LOGIN member", `CREATE ROLE g6_attacker LOGIN; GRANT ${INSTALLER} TO g6_attacker`, "g6_attacker"],
+    ["the exact Supabase creator edge (no creator-edge exception before PG16)", SUPABASE_EDGE, "postgres"],
+    ["two members (the first by rolname is named)", `CREATE ROLE "Zz Attacker" LOGIN; CREATE ROLE g6_attacker LOGIN; GRANT ${INSTALLER} TO "Zz Attacker", g6_attacker`, `"Zz Attacker"`],
+  ];
+  for (const [label, sql, named] of PRE16_MEMBERS)
+    test(`installer inbound membership, simulated pre-16 (${label}): the role bootstrap refuses 55000 naming the member`, async () => {
+      const { db } = await acquisitionPrefix();
+      await db.exec(sql);
+      const error = await failure(db.exec(BOOTSTRAP_PRE16()));
+      expect(error?.code).toBe("55000");
+      expect(error?.message).toBe(`bootstrap ${INSTALLER}: the role has an unexpected member ${named}`);
+    });
+
+  test("installer inbound membership, simulated pre-16: with no member, the bootstrap and the 043850 admission block pass", async () => {
+    const { db, path } = await acquisitionPrefix();
+    expect(await failure(db.exec(BOOTSTRAP_PRE16()))).toBeNull();
+    const migration = pre16(readFileSync(path, "utf8"), "IF current_setting('server_version_num')::int>=160000 THEN", "IF 150000>=160000 THEN");
+    await db.exec("BEGIN");
+    await db.exec(migration);
+    await db.exec("COMMIT");
+    expect(await installerGrants(db)).toBe(4);
+  });
+
+  test("installer inbound membership, simulated pre-16: the 043850 admission block refuses any member 55000 before any RPC grant", async () => {
+    const { db, path } = await acquisitionPrefix();
+    await db.exec(SUPABASE_EDGE);
+    const migration = pre16(readFileSync(path, "utf8"), "IF current_setting('server_version_num')::int>=160000 THEN", "IF 150000>=160000 THEN");
+    await db.exec("BEGIN");
+    const error = await failure(db.exec(migration));
+    await db.exec("ROLLBACK");
+    expect(error?.code).toBe("55000");
+    expect(error?.message).toBe(`acquisition: role ${INSTALLER} has an unexpected member`);
+    expect(await installerGrants(db)).toBe(0);
+  });
+
+  test("installer inbound membership (PG16+ path): the bootstrap names the member", async () => {
+    const { db } = await acquisitionPrefix();
+    await db.exec(INBOUND[0]![1]);
+    expect((await failure(db.exec(readFileSync(BOOTSTRAP, "utf8"))))?.message).toBe(
+      `bootstrap ${INSTALLER}: the role has an unexpected member g6_attacker`,
+    );
+  });
+
+  // Reviewer batch P1(b): the acquisition installer verifier is phase 2's last step, so a member added after
+  // 043850 ran (which the per-migration admission block can no longer see) keeps the marker pending.
+  const ACQ_VERIFY = "verify:acquisition_installer";
+  const MARKER = "SELECT status FROM sessions.__96bulls_role_validation WHERE name = 'session_directory_search_worker'";
+  const marker = async (db: PGlite) => (await db.query<{ status: string }>(MARKER)).rows[0]?.status;
+  const VERIFIER = join(root, "supabase/bootstrap/acquisition_installer_verify.sql");
+  // INHERIT FALSE, SET TRUE: the member gains nothing implicitly but can SET ROLE to the installer.
+  const SET_ONLY_MEMBER = `CREATE ROLE g6_attacker LOGIN; GRANT ${INSTALLER} TO g6_attacker WITH INHERIT FALSE, SET TRUE`;
+
+  const FEED_VERIFY = "verify:buffered_search_feed_runtime";
+  test("acquisition installer verifier: wired in phase 2 of every verifying plan, just before the buffered feed runtime verifier (last); absent with verify off", async () => {
+    for (const profile of [LOCAL, { ...LOCAL, bootstrap: false }, { ...LOCAL, mode: "selfhosted" as const, shim: false, bootstrap: false }]) {
+      const verify = (await plan(profile)).filter((st) => st.name.startsWith("verify:")).map((st) => st.name);
+      expect(verify.slice(-2)).toEqual([ACQ_VERIFY, FEED_VERIFY]);
+      expect(verify.filter((n) => n === ACQ_VERIFY)).toHaveLength(1);
+      expect(verify.filter((n) => n === FEED_VERIFY)).toHaveLength(1);
+      expect((await plan(profile)).find((st) => st.name === ACQ_VERIFY)?.path).toBe(VERIFIER);
+      expect((await plan(profile)).find((st) => st.name === FEED_VERIFY)?.path).toBe(join(root, "supabase/bootstrap/buffered_search_feed_runtime_verify.sql"));
+    }
+    expect((await plan({ ...LOCAL, verify: false })).some((st) => st.name.startsWith("verify:"))).toBe(false);
+  });
+
+  test("acquisition installer verifier, full migrate path: a SET-only LOGIN member is refused 55000 by the bootstrap, then by the verifier with the bootstrap off; the marker stays pending; removing it passes", async () => {
+    const db = await fresh();
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await marker(db)).toBe("pass");
+    const grants = await installerGrants(db);
+    expect(grants).toBe(4);
+    await db.exec(SET_ONLY_MEMBER);
+    const can = (await db.query<{ set: boolean; usage: boolean }>(
+      `SELECT pg_has_role('g6_attacker', '${INSTALLER}', 'SET') AS set, pg_has_role('g6_attacker', '${INSTALLER}', 'USAGE') AS usage`,
+    )).rows[0];
+    expect(can).toEqual({ set: true, usage: false });
+    const boot = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(boot?.code).toBe("55000");
+    expect(boot?.message).toBe(`bootstrap ${INSTALLER}: the role has an unexpected member g6_attacker`);
+    expect(await marker(db)).toBe("pending");
+    // Every schema step is ledgered, so with the bootstrap off only phase 2 runs: the acquisition verifier refuses.
+    const seen: string[] = [];
+    const verifierOnly = await failure(runMigrations(client(db), {
+      profile: { ...LOCAL, bootstrap: false },
+      beforeVerify: async () => { seen.push("verify"); },
+    }));
+    expect(verifierOnly?.code).toBe("55000");
+    expect(verifierOnly?.message).toBe("acquisition installer has an unexpected member");
+    // Phase 2 stops at the acquisition verifier: every verifier up to and including it ran (the buffered feed
+    // runtime verifier, after it, did not).
+    const verifyNames = (await plan(LOCAL)).filter((st) => st.name.startsWith("verify:")).map((st) => st.name);
+    expect(seen.length).toBe(verifyNames.indexOf("verify:acquisition_installer") + 1);
+    expect(await marker(db)).toBe("pending");
+    expect(await installerGrants(db)).toBe(grants);
+    await db.exec("DROP ROLE g6_attacker");
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await marker(db)).toBe("pass");
+  });
+
+  test("buffered feed runtime verifier, full migrate path: a SET-only LOGIN member is refused 55000 by the bootstrap, then by the last verifier with the bootstrap off; removing it passes", async () => {
+    const FEED = "buffered_search_feed_runtime";
+    const db = await fresh();
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await marker(db)).toBe("pass");
+    await db.exec(`CREATE ROLE g6_feed_attacker LOGIN; GRANT ${FEED} TO g6_feed_attacker WITH INHERIT FALSE, SET TRUE`);
+    const boot = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(boot?.code).toBe("55000");
+    expect(boot?.message).toBe(`bootstrap ${FEED}: the role has an unexpected member g6_feed_attacker`);
+    expect(await marker(db)).toBe("pending");
+    const seen: string[] = [];
+    const verifierOnly = await failure(runMigrations(client(db), {
+      profile: { ...LOCAL, bootstrap: false },
+      beforeVerify: async () => { seen.push("verify"); },
+    }));
+    expect(verifierOnly?.code).toBe("55000");
+    expect(verifierOnly?.message).toBe("buffered search feed runtime has an unexpected member");
+    expect(seen.length).toBe((await plan(LOCAL)).filter((st) => st.name.startsWith("verify:")).length);
+    expect(await marker(db)).toBe("pending");
+    await db.exec("DROP ROLE g6_feed_attacker");
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await marker(db)).toBe("pass");
+  });
+
+  test("acquisition installer verifier, fresh database: a member that predates the first migrate is refused 55000 by the bootstrap with zero installer grants and no acquisition tables", async () => {
+    const db = await fresh();
+    await db.exec(`CREATE ROLE ${INSTALLER} NOLOGIN NOINHERIT; ${SET_ONLY_MEMBER}`);
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error?.code).toBe("55000");
+    expect(error?.message).toBe(`bootstrap ${INSTALLER}: the role has an unexpected member g6_attacker`);
+    expect(await installerGrants(db)).toBe(0);
+    expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_acquisition_owners')::text r")).rows[0]!.r).toBeNull();
+    expect((await snapshot(db)).marker?.every((r) => (r as { status: string }).status === "pending") ?? true).toBe(true);
+    await db.exec("DROP ROLE g6_attacker");
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await installerGrants(db)).toBe(4);
+    expect(await marker(db)).toBe("pass");
+  });
+
+  test("acquisition installer verifier: the exact Supabase creator edge passes only with hoopdb.db_mode=supabase", async () => {
+    const db = await fresh();
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    await db.exec(SUPABASE_EDGE);
+    const verify = async (mode: string) => {
+      await db.exec("BEGIN");
+      try {
+        await db.query("SELECT set_config('hoopdb.db_mode', $1, true)", [mode]);
+        return await failure(db.exec(readFileSync(VERIFIER, "utf8")));
+      } finally { await db.exec("ROLLBACK"); }
+    };
+    expect(await verify("supabase")).toBeNull();
+    for (const mode of ["local", "selfhosted", ""])
+      expect(await verify(mode)).toMatchObject({ code: "55000", message: "acquisition installer has an unexpected member" });
+  });
+
+  // Reviewer batch P2-a: operationUuid is global. The same uuid replayed in another scope is operation_conflict
+  // (40001) before any write, whatever the scope. The concurrent (held-open) cases are in the real-PostgreSQL suite.
+  test("acquisition operationUuid and target grant id are global: the same uuid or target in another scope, one after the other, is operation_conflict / target_mismatch / revoked_before_install with zero writes; non-READ COMMITTED is invalid_request", async () => {
+    const db = await fresh();
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    const US = "\x1f";
+    const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+    const FIELDS = ["operationUuid", "orgId", "workspaceId", "source", "sessionId", "revision", "expectedRevision", "expectedOwnerEpoch",
+      "expectedPredecessorGrantId", "ownerKind", "ownerUserId", "ownerOriginId", "bindingUuid", "installationId", "grantSha256", "expiresAt", "issuerKeyId"];
+    const install = (op: string, source: string) => {
+      const g = "rhg_" + "0123456789abcdef".repeat(4);
+      const p: Record<string, string> = { operationUuid: op, orgId: "org_test", workspaceId: "ws_test", source, sessionId: "sess-op-1",
+        revision: "1", expectedRevision: "0", expectedOwnerEpoch: "0", expectedPredecessorGrantId: "", ownerKind: "cloud",
+        ownerUserId: "user_test", ownerOriginId: "origin_test", bindingUuid: crypto.randomUUID(), installationId: "",
+        grantSha256: sha(["relayhistory-acquisition-grant-v1", "org_test", "ws_test", source, "sess-op-1", op, g].join(US)),
+        expiresAt: "", issuerKeyId: "test-key-1" };
+      const a = ["relayhistory-acquisition-assertion-install-v1", ...FIELDS.map((f) => p[f])].join(US);
+      const evidenceSha256 = sha("synthetic-evidence" + US + a);
+      return { ...p, evidenceSha256, requestSha256: sha(["relayhistory-acquisition-request-v1", sha(a), evidenceSha256].join(US)) };
+    };
+    const TABLES = ["owners", "grants", "grant_origins", "revoked_grants", "revoked_lineages", "operations"];
+    const state = async () => {
+      const out: Record<string, unknown> = {};
+      for (const t of TABLES)
+        out[t] = (await db.query<{ j: unknown }>(`SELECT coalesce(jsonb_agg(to_jsonb(x) ORDER BY to_jsonb(x)::text), '[]') j FROM sessions.ingest_acquisition_${t} x`)).rows[0]!.j;
+      return out;
+    };
+    await db.exec("SELECT sessions.ingest_acquisition_set_hooks(true); UPDATE sessions.ingest_acquisition_switch SET install_enabled = true");
+    for (const source of ["droid", "codex"]) {
+      const scope = JSON.stringify({ orgId: "org_test", workspaceId: "ws_test", source });
+      await db.query("SELECT sessions.ingest_acquisition_enroll_begin($1::jsonb)", [scope]);
+      await db.query("SELECT sessions.ingest_acquisition_enroll_complete($1::jsonb)", [scope]);
+    }
+    const revoke = (op: string, source: string, session: string, target: string, lineage: string) => {
+      const p: Record<string, string> = { operationUuid: op, orgId: "org_test", workspaceId: "ws_test", source, sessionId: session,
+        revision: "1", targetGrantId: target, targetOwnerEpoch: "1", targetOwnerKind: "cloud", targetBindingUuid: lineage,
+        targetInstallationId: "", issuerKeyId: "test-key-1" };
+      const a = ["relayhistory-acquisition-assertion-revoke-v1", ...REVOKE_FIELDS.map((f) => p[f])].join(US);
+      const evidenceSha256 = sha("synthetic-evidence" + US + a);
+      return { ...p, evidenceSha256, requestSha256: sha(["relayhistory-acquisition-request-v1", sha(a), evidenceSha256].join(US)) };
+    };
+    const REVOKE_FIELDS = ["operationUuid", "orgId", "workspaceId", "source", "sessionId", "revision", "targetGrantId",
+      "targetOwnerEpoch", "targetOwnerKind", "targetBindingUuid", "targetInstallationId", "issuerKeyId"];
+    const asInstaller = async (body: Record<string, string>, fn = "install", iso = "") => {
+      await db.exec(`BEGIN${iso ? " ISOLATION LEVEL " + iso : ""}; SET LOCAL ROLE ${INSTALLER}`);
+      try {
+        const r = (await db.query<{ r: unknown }>(`SELECT sessions.ingest_acquisition_${fn}($1::jsonb) r`, [JSON.stringify(body)])).rows[0]!.r;
+        await db.exec("COMMIT");
+        return r;
+      } catch (error) { await db.exec("ROLLBACK"); throw error; }
+    };
+    const op = crypto.randomUUID();
+    const first = install(op, "droid");
+    expect(await asInstaller(first)).toMatchObject({ outcome: "installed", grantId: op });
+    const before = await state();
+    expect(await failure(asInstaller(install(op, "codex")))).toMatchObject({ code: "40001", message: "acquisition: operation_conflict" });
+    expect(await state()).toEqual(before);
+    // The original request still replays, and a fresh uuid installs in the other scope.
+    expect(await asInstaller(first)).toMatchObject({ outcome: "replay", grantId: op });
+    // The same scope with any other field (here a new binding) is also operation_conflict.
+    expect(await failure(asInstaller(install(op, "droid")))).toMatchObject({ code: "40001", message: "acquisition: operation_conflict" });
+    expect(await asInstaller(install(crypto.randomUUID(), "codex"))).toMatchObject({ outcome: "installed" });
+    // Revoke-vs-revoke: the same operation uuid in another scope is operation_conflict; the same target grant id
+    // (revoke-before-install) from another scope is target_mismatch; neither writes a fence or an operation.
+    const rop = crypto.randomUUID(), target = crypto.randomUUID(), lineage = crypto.randomUUID();
+    const r1 = revoke(rop, "droid", "sess-rv-1", target, lineage);
+    expect(await asInstaller(r1, "revoke")).toEqual({ outcome: "revoked_pending", revision: "0", ownerEpoch: "0", state: null });
+    const held = await state();
+    expect(await failure(asInstaller(revoke(rop, "codex", "sess-rv-1", crypto.randomUUID(), lineage), "revoke"))).toMatchObject({ code: "40001", message: "acquisition: operation_conflict" });
+    expect(await failure(asInstaller(revoke(crypto.randomUUID(), "codex", "sess-rv-1", target, lineage), "revoke"))).toMatchObject({ code: "42501", message: "acquisition: target_mismatch" });
+    expect(await state()).toEqual(held);
+    expect(await asInstaller(r1, "revoke")).toMatchObject({ outcome: "replay" });
+    // Install-vs-revoke on one grant id: the revoked target never installs in either scope; a revoke from another
+    // scope naming an installed grant is target_mismatch.
+    for (const source of ["droid", "codex"])
+      expect(await failure(asInstaller(install(target, source)))).toMatchObject({ code: "55000", message: "acquisition: revoked_before_install" });
+    expect(await state()).toEqual(held);
+    expect(await failure(asInstaller(revoke(crypto.randomUUID(), "codex", "sess-op-1", op, first.bindingUuid), "revoke"))).toMatchObject({ code: "42501", message: "acquisition: target_mismatch" });
+    expect(await state()).toEqual(held);
+    // A retained snapshot (REPEATABLE READ / SERIALIZABLE) is refused before any lock or write.
+    for (const iso of ["REPEATABLE READ", "SERIALIZABLE"]) {
+      expect(await failure(asInstaller(install(crypto.randomUUID(), "codex"), "install", iso))).toMatchObject({ code: "22023", message: "acquisition: invalid_request" });
+      expect(await failure(asInstaller(revoke(crypto.randomUUID(), "codex", "sess-rv-2", crypto.randomUUID(), lineage), "revoke", iso))).toMatchObject({ code: "22023", message: "acquisition: invalid_request" });
+    }
+    expect(await state()).toEqual(held);
+  });
 });
 
 test("the runbook's sentinel table documents every schema step", async () => {
@@ -1630,20 +1961,25 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const Z = "upstream:20261105040000_ingest_lazy_source_tables.sql";
     const Y = "upstream:20261105041000_ingest_privacy_authority.sql";
     const H = "upstream:20261105043000_brief_titles.sql";
-    const BK = "upstream:20261105043600_ingest_bookkeeping_cleanup.sql";
+    const N = "upstream:20261105043500_lazy_claim_clock_narrowing.sql";
+    const O = "upstream:20261105043700_owner_buffered_read.sql";
+    const Q = "upstream:20261105043800_lazy_ack_clock_no_key_update.sql";
+    const W = "upstream:20261105043860_buffered_search_gate.sql";
+    const X = "upstream:20261105043870_buffered_search_feed_cursor.sql";
+    const BK = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, BK]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, BK]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
@@ -1679,15 +2015,99 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // Later lanes roll back first and remove their own ledger rows; only then
-    // 043600 (ingest bookkeeping cleanup, Phase A) is the latest: 043000 refuses (55000) while it is
+    // 043880 (ingest bookkeeping cleanup, Phase A) is the latest: 043870 refuses (55000) while it is
     // applied, so it rolls back first; its down restores 042000's exact Babysitter register.
     expect(await names()).toContain(BK);
-    expect((await failure(rollback("20261105043000_brief_titles.down.sql")))?.code).toBe("55000");
-    expect(await names()).toContain(H);
-    await rollback("20261105043600_ingest_bookkeeping_cleanup.down.sql");
+    expect((await failure(rollback("20261105043870_buffered_search_feed_cursor.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(X);
+    await rollback("20261105043880_ingest_bookkeeping_cleanup.down.sql");
     expect(await names()).not.toContain(BK);
     expect(await relation("sessions.ingest_bookkeeping_retired_claims")).toBeNull();
+    // 043870 (buffered search feed cursor) is the latest: 043860 and 043850 refuse (55000) while it is applied;
+    // its own down drops only the three feed functions, the cursor table and its ledger row (the validation stays as it was).
+    const feedFns = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE oid IN (to_regprocedure('sessions.buffered_search_feed_page(jsonb)'), to_regprocedure('sessions.buffered_search_feed_stage(jsonb)'), to_regprocedure('sessions.buffered_search_feed_advance(jsonb)'))")).rows[0]!.n;
+    expect(await names()).toContain(X);
+    expect(await feedFns()).toBe(3);
+    expect(await relation("sessions.buffered_search_feed_cursors")).toBe("sessions.buffered_search_feed_cursors");
+    expect((await failure(rollback("20261105043860_buffered_search_gate.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105043850_ingest_acquisition_owner.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([W, "upstream:20261105043850_ingest_acquisition_owner.sql"]));
+    await rollback("20261105043870_buffered_search_feed_cursor.down.sql");
+    expect(await names()).not.toContain(X);
+    expect(await feedFns()).toBe(0);
+    expect(await relation("sessions.buffered_search_feed_cursors")).toBeNull();
+    // The down revokes the runtime role's schema USAGE and keeps the role itself.
+    expect((await db.query<{ u: boolean | null }>("SELECT (SELECT has_schema_privilege(r.oid, 'sessions', 'USAGE') FROM pg_roles r WHERE r.rolname = 'buffered_search_feed_runtime') AS u")).rows[0]!.u).toBe(false);
+    expect(await passed()).toBe(true);
+    // 043860 (buffered search gate reader) is then the latest: 043800 and 043700 refuse (55000) while it is applied;
+    // its own down drops only the one function and its ledger row (the validation stays as it was).
+    const gateFn = async () =>
+      (await db.query<{ r: string | null }>("SELECT to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)')::text r")).rows[0]?.r ?? null;
+    expect(await names()).toContain(W);
+    expect(await gateFn()).not.toBeNull();
+    expect((await failure(rollback("20261105043800_lazy_ack_clock_no_key_update.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105043700_owner_buffered_read.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([O, Q]));
+    await rollback("20261105043860_buffered_search_gate.down.sql");
+    expect(await names()).not.toContain(W);
+    expect(await gateFn()).toBeNull();
+    expect(await passed()).toBe(true);
+    // Later lanes roll back first and remove their own ledger rows; only then
+    // 043850 (acquisition owner, dormant) is the latest: 043000 refuses while it is applied.
+    const AQ = "upstream:20261105043850_ingest_acquisition_owner.sql";
+    expect(await names()).toContain(AQ);
+    expect((await failure(rollback("20261105043000_brief_titles.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(H);
+    await rollback("20261105043850_ingest_acquisition_owner.down.sql");
+    expect(await names()).not.toContain(AQ);
+    expect(await relation("sessions.ingest_acquisition_owners")).toBeNull();
+    // 043800 (staged-ACK clock NO KEY UPDATE) is the latest: 043700 and 043500 refuse (55000) while it is
+    // applied; its own down restores the exact 043500 ACK body (clock FOR UPDATE) and marks the validation pending.
+    const lazyAck = async () =>
+      (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0]!.s;
+    expect(await names()).toContain(Q);
+    expect(await lazyAck()).toContain("WHERE singleton FOR NO KEY UPDATE;");
+    expect((await failure(rollback("20261105043700_owner_buffered_read.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(O);
+    expect((await failure(rollback("20261105043500_lazy_claim_clock_narrowing.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(N);
+    await rollback("20261105043800_lazy_ack_clock_no_key_update.down.sql");
+    expect(await names()).not.toContain(Q);
+    expect(await passed()).toBe(false);
+    expect(await lazyAck()).not.toContain("FOR NO KEY UPDATE");
+    expect(await lazyAck()).toContain("WHERE singleton FOR UPDATE;");
+    expect(await lazyAck()).toContain("WHERE singleton FOR KEY SHARE;");
+    // 043700 (owner buffered read) is then the latest: 043500 and 043000 refuse (55000) while it is applied;
+    // its own down removes its four functions and parity table.
+    const ownerReadFns = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE proname IN ('owner_buffered_read_scope','owner_buffered_parity_expected','buffered_sessions_for','buffered_session_stages_for')")).rows[0]!.n;
+    const parityTable = async () => relation("sessions.owner_buffered_parity");
+    expect(await names()).toContain(O);
+    expect(await ownerReadFns()).toBe(4);
+    expect(await parityTable()).toBe("sessions.owner_buffered_parity");
+    expect((await failure(rollback("20261105043500_lazy_claim_clock_narrowing.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(N);
+    expect((await failure(rollback("20261105043000_brief_titles.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(H);
+    await rollback("20261105043700_owner_buffered_read.down.sql");
+    expect(await names()).not.toContain(O);
+    expect(await ownerReadFns()).toBe(0);
+    expect(await parityTable()).toBeNull();
+    // 043500 (lazy claim clock narrowing, a non-1000 step between 043000 and 044000) is then the latest: 043000
+    // refuses (55000) while it is applied; its own down restores the exact 055000 bodies and marks the
+    // validation pending, and the reapply below restores PASS.
+    const lazyRecords = async () =>
+      (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_lazy_records(jsonb)'::regprocedure")).rows[0]!.s;
+    expect(await names()).toContain(N);
+    expect(await lazyRecords()).toContain("lazy-native-origin-v1");
+    expect((await failure(rollback("20261105043000_brief_titles.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(H);
+    await rollback("20261105043500_lazy_claim_clock_narrowing.down.sql");
+    expect(await names()).not.toContain(N);
+    expect(await passed()).toBe(false);
+    expect(await lazyRecords()).not.toContain("lazy-native-origin-v1");
+    expect(await lazyRecords()).toContain("WHERE singleton FOR UPDATE;");
     // Then 043000 (F2 brief titles) is the latest: 042000, 041000, 040000 and 039000 all refuse
     // (55000) while it is applied, so it rolls back first.
     expect(await names()).toContain(H);
@@ -1798,9 +2218,18 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // 035000 through 039000, 040000 (lazy source tables) and 041000 (privacy authority); the post-validation
     // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
-    // Up again: 041000's exact source-table list is back in both lazy functions.
+    // Up again: 041000's exact source-table list is back in both lazy functions, 043500's lazy claim
+    // narrowing is back, 043700's four functions and parity table, 043800's staged-ACK NO KEY UPDATE,
+    // 043860's gate reader and 043870's feed functions and cursor table.
+    expect(await lazyRecords()).toContain("lazy-native-origin-v1");
+    expect(await gateFn()).not.toBeNull();
+    expect(await feedFns()).toBe(3);
+    expect(await relation("sessions.buffered_search_feed_cursors")).toBe("sessions.buffered_search_feed_cursors");
+    expect(await lazyAck()).toContain("WHERE singleton FOR NO KEY UPDATE;");
+    expect(await ownerReadFns()).toBe(4);
+    expect(await parityTable()).toBe("sessions.owner_buffered_parity");
     expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, BK]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
@@ -1962,10 +2391,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'bulls96_acquisition_installer', 'buffered_search_feed_runtime')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(12);
+    expect(targets.rows).toHaveLength(14);
     expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
     const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
     const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);
