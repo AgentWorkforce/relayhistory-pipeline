@@ -143,5 +143,5 @@ export function scratch() {
 }
 
 export function deps(over: Partial<OwnerBufferedDeps> & { store: ObjectStore }): OwnerBufferedDeps {
-  return { enabled: true, reads: scriptedReads().reads, gate: scriptedGate(authority("7")), decompress: unzip, ...over };
+  return { enabled: true, workspaces: "*", reads: scriptedReads().reads, gate: scriptedGate(authority("7")), decompress: unzip, ...over };
 }

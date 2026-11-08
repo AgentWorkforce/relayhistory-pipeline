@@ -45,6 +45,8 @@ interface Harness {
   store?: OwnerBufferedDeps["store"];
   rows?: Array<DirectoryListRow & { cursor_ts?: string }>;
   workspaces?: ReadonlySet<string> | "*" | undefined;
+  /** READ_API_OWNER_BUFFERED_WORKSPACES; default "*" (the directory allowlist decides). */
+  obWorkspaces?: ReadonlySet<string> | "*";
   pointers?: Array<{ harness: string; pointers: number; live: number }>;
   liveSessions?: Record<string, number>;
   noOwnerBuffered?: boolean;
@@ -72,6 +74,7 @@ function api(h: Harness = {}) {
   };
   const ownerBuffered: OwnerBufferedDeps | undefined = h.noOwnerBuffered ? undefined : {
     enabled: h.enabled ?? true,
+    workspaces: h.obWorkspaces ?? "*",
     reads: h.reads ?? scriptedReads().reads,
     gate: h.gate ?? scriptedGate(authority("7")),
     store: h.store ?? store(),
@@ -320,6 +323,27 @@ describe("GET /v1/sessions with owner buffered rows", () => {
     const gate = scriptedGate(authority("7"));
     const r = await api({ workspaces: "*", gate, reads: scriptedReads({ list: [bufferedRow()] }).reads }).get(L);
     expect(r.headers.get("x-relayhistory-buffered-ids")).toBe(`claude:${SESSION}`);
+  });
+
+  test("the owner-buffered canary allowlist is required on top of the directory allowlist", async () => {
+    const base = await json(await api({ noOwnerBuffered: true }).get(L));
+    // Directory-enabled workspace, but not on READ_API_OWNER_BUFFERED_WORKSPACES: exactly as without the flag.
+    for (const obWorkspaces of [new Set<string>(), new Set(["ws-b"])]) {
+      const gate = scriptedGate(authority("7"));
+      const r = await api({ obWorkspaces, gate, reads: scriptedReads({ list: [bufferedRow()] }).reads }).get(L);
+      expect(strip(await json(r))).toEqual(strip(base));
+      expect(r.headers.get("x-relayhistory-buffered-ids")).toBeNull();
+      expect(gate.calls).toHaveLength(0);
+    }
+    // On both lists: served.
+    const gate = scriptedGate(authority("7"));
+    const r = await api({ obWorkspaces: new Set(["ws-a"]), gate, reads: scriptedReads({ list: [bufferedRow()] }).reads }).get(L);
+    expect(r.headers.get("x-relayhistory-buffered-ids")).toBe(`claude:${SESSION}`);
+    // On the owner-buffered list but not the directory list: still 501, gate never called.
+    const gate2 = scriptedGate(authority("7"));
+    const r2 = await api({ workspaces: new Set(["ws-b"]), obWorkspaces: new Set(["ws-a"]), gate: gate2 }).get(L);
+    expect(r2.status).toBe(501);
+    expect(gate2.calls).toHaveLength(0);
   });
 });
 
