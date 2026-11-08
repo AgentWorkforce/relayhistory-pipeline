@@ -78,7 +78,7 @@ describe("request path", () => {
     const res = await post(app(s, async () => { throw new Error("queue down"); }), await batch([record({ record_id: "r1", payload: { text: "private words" } })]));
     expect(res.status).toBe(503);
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe("delivery_unavailable");
-    const keys = (await s.list(objectKey("96bulls/admission-inbox/org-a"))).items.map((i) => String(i.key));
+    const keys = (await s.list(objectKey("96bulls/.admission-inbox/org-a"))).items.map((i) => String(i.key));
     expect(keys).toHaveLength(1);
     expect(await text(s, keys[0]!)).not.toContain("private words");
   });
@@ -87,7 +87,7 @@ describe("request path", () => {
     const s = store();
     const res = await post(app(s), await batch([record({ record_id: "r1" })], { account_id: "acct_wrong" }));
     expect(res.status).toBe(403);
-    expect((await s.list(objectKey("96bulls/admission-inbox"))).items).toHaveLength(0);
+    expect((await s.list(objectKey("96bulls/.admission-inbox"))).items).toHaveLength(0);
   });
 
   test("a private custody envelope never takes the async path", async () => {
@@ -118,7 +118,7 @@ describe("inbox object", () => {
     const prepared = await prepareDelivery(TENANT, b);
     const key = await enqueueAdmission({ store: s, keyRoot: "96bulls", enqueue: async () => {}, nonce: () => "0123456789abcdef" }, TENANT, prepared, T0);
     expect(key).toBe(inboxKey("96bulls", TENANT, "origin-1", prepared.receipt.receiptId, T0, "0123456789abcdef"));
-    expect(key.startsWith("96bulls/admission-inbox/org-a/v1/ws=ws-a/m=srv_")).toBe(true);
+    expect(key.startsWith("96bulls/.admission-inbox/org-a/v1/ws=ws-a/m=srv_")).toBe(true);
     const raw = await text(s, key);
     expect(raw).not.toContain("abcdEFGHijklMNOPqrstUVWXyz0123456789abcd");
     const bytes = new TextEncoder().encode(raw);
@@ -144,6 +144,14 @@ describe("inbox object", () => {
     const decoded = await decodeInbox("96bulls", key, zstd(encodeInbox(TENANT, prepared, T0)));
     expect(decoded?.prepared.records.map((r) => [r.record_id, r.revision_id, r.revision, r.digest, r.source, r.session_id, r.kind, r.operation]))
       .toEqual(prepared.records.map((r) => [r.record_id, r.revision_id, r.revision, r.digest, r.source, r.session_id, r.kind, r.operation]));
+  });
+
+  test("the inbox root can never be a tenant prefix (no org id may start with a dot)", async () => {
+    const { assertTenantSegment } = await import("../writer.ts");
+    expect(() => assertTenantSegment("96bulls", ".admission-inbox")).toThrow();
+    const key = inboxKey("96bulls", TENANT, "origin-1", "rhr_" + "a".repeat(64), T0, "0123456789abcdef");
+    expect(key.startsWith("96bulls/.admission-inbox/org-a/")).toBe(true);
+    expect(objectKey(key)).toBe(key as never);
   });
 
   test("an empty prepared batch round-trips", async () => {
@@ -191,7 +199,7 @@ describe("consumer", () => {
     ledger.claim = async () => { throw new LedgerUnavailableError("ledger_lock_timeout", { db_error_class: "lock_timeout", db_error_code: "55P03", db_error_basis: "sqlstate" } as never); };
     const r = await admitMessage(deps(q.s, ledger), q.message, 3);
     expect(r).toMatchObject({ action: "retry", delaySeconds: 60, code: "ledger_lock_timeout", stage: "claim" });
-    expect((await q.s.list(objectKey("96bulls/admission-inbox"))).items.filter((i) => String(i.key).includes("outcome-"))).toHaveLength(0);
+    expect((await q.s.list(objectKey("96bulls/.admission-inbox"))).items.filter((i) => String(i.key).includes("outcome-"))).toHaveLength(0);
     expect([1, 2, 3, 6, 20].map(backoffSeconds)).toEqual([15, 30, 60, 300, 300]);
   });
 

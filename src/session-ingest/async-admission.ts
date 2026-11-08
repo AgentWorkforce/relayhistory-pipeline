@@ -50,7 +50,12 @@ export const ADMISSION_ACCEPT_VALUE = "queued-v1";
 export const ADMISSION_HEADER = "x-relay-admission";
 export const ADMISSION_QUEUED = JSON.stringify({ version: 1, state: "queued" });
 
-export const INBOX_NAMESPACE = "admission-inbox";
+/**
+ * A leading `.` keeps the inbox disjoint from every tenant prefix `<keyRoot>/<org>/`: no org id
+ * may start with `.` (writer.ts assertTenantSegment, stacks/aws/tenants.ts ORG_RE), so the
+ * prefix lifecycle rule on `<keyRoot>/.admission-inbox/` can never match tenant data.
+ */
+export const INBOX_NAMESPACE = ".admission-inbox";
 /** An inbox older than this is refused (`admission_expired`) rather than admitted: the
  * prefix lifecycle (7 days) must never expire a journal an unadmitted upload still needs. */
 export const INBOX_MAX_AGE_MS = 6 * 24 * 3600 * 1000;
@@ -78,11 +83,9 @@ export class AdmissionRefused extends DeliveryError {
 
 function assertInboxTenant(keyRoot: string, orgId: string) {
   assertTenantSegment(keyRoot, orgId);
-  // The lifecycle rule expires `<keyRoot>/admission-inbox/`; an org of that name would share it.
-  if (orgId === INBOX_NAMESPACE) throw new DeliveryError("delivery_unavailable", 503, "Durable delivery is temporarily unavailable");
 }
 
-/** `<keyRoot>/admission-inbox/<org>/v1/ws=<ws>/m=srv_<…>/` — inside the srv-writer `…/v1/ws=*\/m=srv_*` grant. */
+/** `<keyRoot>/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<…>/` — inside the srv-writer `…/v1/ws=*\/m=srv_*` grant. */
 function inboxDir(keyRoot: string, tenant: LedgerTenant, machine: string): string {
   return `${keyRoot}/${INBOX_NAMESPACE}/${tenant.orgId}/v1/ws=${layoutComponent(tenant.workspaceId)}/m=${machine}`;
 }

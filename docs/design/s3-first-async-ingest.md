@@ -69,7 +69,7 @@ on still answers relayhistory's current code synchronously, and relayhistory can
 ## (b) Idempotency, dedupe, replay and conflicts
 
 - One inbox object per request attempt:
-  `96bulls/admission-inbox/<org>/v1/ws=<ws>/m=srv_<machine>/r=<receipt hex>/a=<receivedAtMs>-<nonce>.ndjson.zst`.
+  `96bulls/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<machine>/r=<receipt hex>/a=<receivedAtMs>-<nonce>.ndjson.zst`.
   The `r=` directory is content-addressed by the receipt id. The attempt suffix exists because
   the privacy gate judges each attempt by its own start time.
 - Dedupe is the claim's, unchanged: the same `(org, workspace, origin, batch_id)` with the same
@@ -223,10 +223,11 @@ acceptance and the `INGEST_ADMISSION` binding. Without the binding the Worker re
 
 Steps:
 
-1. AWS: add the lifecycle rule `expire-admission-inbox` (Prefix `96bulls/admission-inbox/`,
+1. AWS: add the lifecycle rule `expire-admission-inbox` (Prefix `96bulls/.admission-inbox/`,
    Expiration 7 days) to the transcripts bucket. The existing noncurrent rule then purges.
    No IAM change: the srv-writer grant `96bulls/*/v1/ws=*/m=srv_*` and the KMS context
-   `96bulls/*` already cover the inbox keys. Org id `admission-inbox` is refused.
+   `96bulls/*` already cover the inbox keys. The leading `.` keeps the prefix disjoint from every
+   tenant prefix: no org id may start with `.` (`assertTenantSegment`, the stack's `ORG_RE`).
 2. Cloudflare stack: queue `96bulls-session-ingest-admission` + DLQ
    `96bulls-session-ingest-admission-dlq`, **not paused** (separate from the paused buffered
    fanout queue, whose pause guards canonical drain and is untouched). Consumer = the ingest
