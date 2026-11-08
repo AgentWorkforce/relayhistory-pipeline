@@ -59,6 +59,8 @@ const PRODUCER_CREDENTIAL_ENV = [
 interface OutputStat {
   isCharacterDevice(): boolean;
   isFile(): boolean;
+  isFIFO(): boolean;
+  isSocket(): boolean;
 }
 
 export interface ProducerCommand {
@@ -87,6 +89,7 @@ export function parseProducerArgs(argv: readonly string[]): ProducerArgs {
 export function requireRamOnlyProducerOutput(stat: OutputStat = fstatSync(1)): void {
   if (stat.isCharacterDevice()) refuse("producer_stdout_is_a_terminal");
   if (stat.isFile()) refuse("producer_stdout_is_a_file");
+  if (!stat.isFIFO() && !stat.isSocket()) refuse("producer_stdout_not_pipe_or_socket");
 }
 
 export function requireProducerEnvironment(env: Record<string, string | undefined> = process.env): void {

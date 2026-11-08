@@ -10,7 +10,18 @@ import {
   type ProducerCommand,
 } from "../../../scripts/owner-buffered-parity-credential-producer.ts";
 
-const PIPE = { isCharacterDevice: () => false, isFile: () => false };
+const PIPE = {
+  isCharacterDevice: () => false,
+  isFile: () => false,
+  isFIFO: () => true,
+  isSocket: () => false,
+};
+const outputStat = (kind: "terminal" | "file" | "fifo" | "socket" | "directory" | "block" | "unknown") => ({
+  isCharacterDevice: () => kind === "terminal",
+  isFile: () => kind === "file",
+  isFIFO: () => kind === "fifo",
+  isSocket: () => kind === "socket",
+});
 const SOURCE = "a".repeat(40);
 const neonUrl = (overrides: Partial<{ role: string; host: string; database: string; query: string; password: string }> = {}) => {
   const role = overrides.role ?? TARGET.neonRole;
@@ -94,8 +105,11 @@ describe("owner-buffered parity credential producer", () => {
   });
 
   test.each([
-    [{ isCharacterDevice: () => true, isFile: () => false }, "producer_stdout_is_a_terminal"],
-    [{ isCharacterDevice: () => false, isFile: () => true }, "producer_stdout_is_a_file"],
+    [outputStat("terminal"), "producer_stdout_is_a_terminal"],
+    [outputStat("file"), "producer_stdout_is_a_file"],
+    [outputStat("directory"), "producer_stdout_not_pipe_or_socket"],
+    [outputStat("block"), "producer_stdout_not_pipe_or_socket"],
+    [outputStat("unknown"), "producer_stdout_not_pipe_or_socket"],
   ])("refuses a persistent or visible output before any credential command", (output, code) => {
     let ran = false;
     expect(() => ownerParityCredentialDocument(SOURCE, () => { ran = true; return ""; }, {}, output)).toThrow(code);
@@ -135,5 +149,6 @@ describe("owner-buffered parity credential producer", () => {
 
   test("the standalone sink guard accepts only the intended pipe/socket shape", () => {
     expect(() => requireRamOnlyProducerOutput(PIPE)).not.toThrow();
+    expect(() => requireRamOnlyProducerOutput(outputStat("socket"))).not.toThrow();
   });
 });
