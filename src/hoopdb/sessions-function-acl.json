@@ -433,6 +433,18 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_generation_overlap_admits(text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_generation_overlap_close(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_generation_overlap_immutable()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_generation_overlap_open(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_history_active()": [
       "<owner>:EXECUTE"
     ],

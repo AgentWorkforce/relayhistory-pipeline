@@ -1966,19 +1966,20 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const Q = "upstream:20261105043800_lazy_ack_clock_no_key_update.sql";
     const W = "upstream:20261105043860_buffered_search_gate.sql";
     const X = "upstream:20261105043870_buffered_search_feed_cursor.sql";
+    const V = "upstream:20261105053020_ingest_generation_overlap.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, V]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, V]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
@@ -2014,7 +2015,26 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 043870 (buffered search feed cursor) is the latest: 043860 and 043850 refuse (55000) while it is applied;
+    // 053020 (generation overlap) is the latest: 043870 refuses (55000) while it is applied; its own down
+    // restores the exact strict 050000 ingest_require_generation and 055000 ingest_lazy_guard, drops the window
+    // table and its four functions, and marks the validation pending (the fence bodies changed).
+    const overlapFns = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'ingest_generation_overlap_%'")).rows[0]!.n;
+    const fenceSrc = async () =>
+      (await db.query<{ s: string }>("SELECT string_agg(prosrc, '' ORDER BY oid) s FROM pg_proc WHERE oid IN ('sessions.ingest_require_generation(text)'::regprocedure, 'sessions.ingest_lazy_guard(text)'::regprocedure)")).rows[0]!.s;
+    expect(await names()).toContain(V);
+    expect(await overlapFns()).toBe(4);
+    expect(await fenceSrc()).toContain("ingest_generation_overlap_admits");
+    expect((await failure(rollback("20261105043870_buffered_search_feed_cursor.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(X);
+    await rollback("20261105053020_ingest_generation_overlap.down.sql");
+    expect(await names()).not.toContain(V);
+    expect(await overlapFns()).toBe(0);
+    expect(await relation("sessions.ingest_generation_overlap_windows")).toBeNull();
+    expect(await fenceSrc()).not.toContain("ingest_generation_overlap");
+    expect(await fenceSrc()).toContain("AND generation=p_expected AND status='pass' FOR SHARE;");
+    expect(await passed()).toBe(false);
+    // 043870 (buffered search feed cursor) is then the latest: 043860 and 043850 refuse (55000) while it is applied;
     // its own down drops only the three feed functions, the cursor table and its ledger row (the validation stays as it was).
     const feedFns = async () =>
       (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE oid IN (to_regprocedure('sessions.buffered_search_feed_page(jsonb)'), to_regprocedure('sessions.buffered_search_feed_stage(jsonb)'), to_regprocedure('sessions.buffered_search_feed_advance(jsonb)'))")).rows[0]!.n;
@@ -2030,7 +2050,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.buffered_search_feed_cursors")).toBeNull();
     // The down revokes the runtime role's schema USAGE and keeps the role itself.
     expect((await db.query<{ u: boolean | null }>("SELECT (SELECT has_schema_privilege(r.oid, 'sessions', 'USAGE') FROM pg_roles r WHERE r.rolname = 'buffered_search_feed_runtime') AS u")).rows[0]!.u).toBe(false);
-    expect(await passed()).toBe(true);
+    expect(await passed()).toBe(false); // still pending from 053020's down; this down leaves the validation as it was
     // 043860 (buffered search gate reader) is then the latest: 043800 and 043700 refuse (55000) while it is applied;
     // its own down drops only the one function and its ledger row (the validation stays as it was).
     const gateFn = async () =>
@@ -2043,7 +2063,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105043860_buffered_search_gate.down.sql");
     expect(await names()).not.toContain(W);
     expect(await gateFn()).toBeNull();
-    expect(await passed()).toBe(true);
+    expect(await passed()).toBe(false); // still pending from 053020's down
     // Later lanes roll back first and remove their own ledger rows; only then
     // 043850 (acquisition owner, dormant) is the latest: 043000 refuses while it is applied.
     const AQ = "upstream:20261105043850_ingest_acquisition_owner.sql";
@@ -2211,8 +2231,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
     // Up again: 041000's exact source-table list is back in both lazy functions, 043500's lazy claim
     // narrowing is back, 043700's four functions and parity table, 043800's staged-ACK NO KEY UPDATE,
-    // 043860's gate reader and 043870's feed functions and cursor table.
+    // 043860's gate reader, 043870's feed functions and cursor table and 053020's overlap fence.
     expect(await lazyRecords()).toContain("lazy-native-origin-v1");
+    expect(await overlapFns()).toBe(4);
+    expect(await fenceSrc()).toContain("ingest_generation_overlap_admits");
     expect(await gateFn()).not.toBeNull();
     expect(await feedFns()).toBe(3);
     expect(await relation("sessions.buffered_search_feed_cursors")).toBe("sessions.buffered_search_feed_cursors");
@@ -2220,7 +2242,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await ownerReadFns()).toBe(4);
     expect(await parityTable()).toBe("sessions.owner_buffered_parity");
     expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, V]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
