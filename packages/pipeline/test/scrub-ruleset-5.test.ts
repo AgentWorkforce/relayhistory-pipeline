@@ -188,6 +188,12 @@ describe("rule set 5: over-cap values are measured on the original text (leak 2)
     expect(records(`${line}\n`)).toBe(
       `${JSON.stringify({ type: "tool_result", content: out })}\n`,
     );
+
+    const withSuffix = `-----BEGIN PRIVATE KEY-----\n"password": "${value}SECRETTAIL" KEEPTRAIL`;
+    const suffixOut = scrubText(withSuffix);
+    expect(suffixOut).not.toContain("SECRETTAIL");
+    expect(suffixOut).toContain("KEEPTRAIL");
+    expect(scrubLong(withSuffix)).toBe(suffixOut);
   });
 });
 

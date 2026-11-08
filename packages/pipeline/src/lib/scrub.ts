@@ -291,7 +291,16 @@ function redactQuotedSecretValues(
       )
         pemBlockIndex += 1;
       const pem = pemBlocks[pemBlockIndex];
-      if (pem && pem[0] < valueStart && pem[1] <= valueEnd) continue;
+      if (pem && pem[0] < valueStart && pem[1] <= valueEnd) {
+        // Keep the block through its footer for the PEM rule, but redact any remainder
+        // of this secret-keyed value now: after the PEM replacement the key is gone, so
+        // a later quoted pass could no longer recognize that suffix as secret.
+        if (pem[1] < valueEnd) {
+          out += text.slice(last, pem[1]) + REDACTED;
+          last = valueEnd;
+        }
+        continue;
+      }
     }
     // A private-key block opened inside the value and closed after it: the PEM rule would
     // have paired them, so the redaction runs to its footer (or the end) as that rule's would.
