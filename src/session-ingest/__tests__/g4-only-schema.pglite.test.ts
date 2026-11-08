@@ -9,7 +9,10 @@
  * (acceptBatch inline + staged fan-out, slots, selection / reset, ordered controls, the
  * claim / stage / commit RPC set, #332's acquisition refusal mapping) runs against it while an
  * undefined-object guard (SQLSTATE 42883 / 42P01 / 42703 / 42704) watches every statement.
- * Async admission is proven elsewhere on G4; here one smoke case only.
+ * Async admission is proven elsewhere on G4; here one smoke case only. Frozen-supabase custody with
+ * the real deploy settings (stack vars -> ingestSettings -> ingestApp, drain, the sync frozen receipt) is
+ * g4-deploy-settings.pglite.test.ts; #387's frozen-fallback matrix also runs on G4 in
+ * sync-admission-frozen-receipt.pglite.test.ts.
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
