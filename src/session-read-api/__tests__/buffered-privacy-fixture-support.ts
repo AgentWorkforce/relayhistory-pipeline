@@ -8,6 +8,11 @@ import {
   type AuthorityHead,
   type BufferedScope,
 } from "../owner-buffered.ts";
+import {
+  bufferedParityVisible,
+  type OwnerBufferedParityProof,
+  type ParityCensusInput,
+} from "../../migration/owner-buffered-parity.ts";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface CausalCase {
@@ -139,26 +144,39 @@ export function parityState(c: ParityCase): Record<string, any> {
   return patched(base, c.patch);
 }
 
-/** The frozen rule-3/rule-4 fixture oracle; production enforcement belongs to 043700 SQL. */
+/** Adapt the frozen addendum into the G1/G2 owner's schema-independent v5.3 predicate. */
 export function parityVisible(c: ParityCase): boolean {
   const s = parityState(c);
-  const proof = s.proof as Record<string, any> | null;
-  const head = s.head as Record<string, any> | null;
-  const proofHead = proof?.head as Record<string, any> | null | undefined;
-  const receipt = s.targetLatestReceipt as Record<string, any> | null;
-  if (!proof) return false;
-  const same = (a: unknown, b: unknown) => a === b;
-  const headMatches = head === null
-    ? proof.explicitNoHead === true && proofHead === null && receipt === null && s.admission.version === "0"
-    : proof.explicitNoHead === false && proofHead && receipt &&
-      ["epoch", "version", "digest", "kind"].every((key) => same(proofHead[key], head[key]) && same(receipt[key], head[key]));
-  return Boolean(headMatches &&
-    proof.org === s.org && proof.workspace === s.workspace && proof.user === s.user &&
-    proof.epoch === s.cutoverEpoch && s.admission.epoch === s.cutoverEpoch &&
-    proof.privacyBaselineSha256 === s.privacyBaselineSha256 &&
-    proof.targetGeneration === s.targetGeneration &&
-    s.targetReceiptVersionsContiguousFromOne === true &&
-    proof.deletionSetSha256 === s.sourceDeletionSetSha256 && proof.deletionSetSha256 === s.targetDeletionSetSha256 &&
-    proof.resetSetSha256 === s.sourceResetSetSha256 && proof.resetSetSha256 === s.targetResetSetSha256 &&
-    proof.targetOrderedLineageSha256 === s.targetOrderedLineageSha256);
+  const tenant = { orgId: s.org, workspaceId: s.workspace, userId: s.user };
+  const head = s.head as ParityCensusInput["head"];
+  const current: ParityCensusInput = {
+    tenant,
+    controlEpoch: s.cutoverEpoch,
+    privacyBaselineSha256: s.privacyBaselineSha256,
+    head,
+    sourceDeletionSetSha256: s.sourceDeletionSetSha256,
+    sourceResetSetSha256: s.sourceResetSetSha256,
+    targetControlEpoch: s.cutoverEpoch,
+    targetPrivacyBaselineSha256: s.privacyBaselineSha256,
+    targetGeneration: s.targetGeneration,
+    targetLatestReceipt: s.targetLatestReceipt,
+    targetReceiptVersionsContiguousFromOne: s.targetReceiptVersionsContiguousFromOne,
+    targetDeletionSetSha256: s.targetDeletionSetSha256,
+    targetResetSetSha256: s.targetResetSetSha256,
+    targetLineageDigest: s.targetOrderedLineageSha256,
+  };
+  const raw = s.proof as Record<string, any> | null;
+  const proof: OwnerBufferedParityProof | null = raw === null ? null : {
+    contract: "owner-buffered-parity/v1",
+    tenant: { orgId: raw.org, workspaceId: raw.workspace, userId: raw.user },
+    controlEpoch: raw.epoch,
+    privacyBaselineSha256: raw.privacyBaselineSha256,
+    explicitNoHead: raw.explicitNoHead,
+    head: raw.head,
+    deletionSetSha256: raw.deletionSetSha256,
+    resetSetSha256: raw.resetSetSha256,
+    targetLineageDigest: raw.targetOrderedLineageSha256,
+    targetGeneration: raw.targetGeneration,
+  };
+  return bufferedParityVisible(s.admission, current, proof);
 }
