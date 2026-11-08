@@ -158,9 +158,19 @@ even when disabled. The issuer-era variables are checked for presence only and r
 unless: `session_user` and `current_user` are exactly `bulls96_acquisition_installer`, the
 `role` setting is `none` (no `SET ROLE`), on PG16+ `system_user` is `<method>:bulls96_acquisition_installer`
 (NULL, i.e. trust auth, is refused), the role is not superuser, `BYPASSRLS`, `CREATEROLE`,
-`CREATEDB`, `REPLICATION` or `INHERIT`, it is a member of no role, and the effective
+`CREATEDB`, `REPLICATION` or `INHERIT`, it is a member of no role (`role_membership`), the role
+itself has no member (`role_members`, see below), and the effective
 `statement_timeout` / `lock_timeout` / `idle_in_transaction_session_timeout` are `5s` / `2s` /
 `10s`. Refusals name only the failed property (`96bulls: acquisition installer login refused: <code>`).
+
+Inbound edges are checked as well as outgoing ones because any LOGIN granted `bulls96_acquisition_installer`
+could `SET ROLE` to it and call the SECURITY DEFINER installer RPCs. On PG16+ the only tolerated
+member row is the Supabase creator edge that PostgreSQL adds itself when Supabase's
+non-superuser `postgres` (CREATEROLE) creates the role: member `postgres`, grantor the superuser
+`supabase_admin`, `admin_option` true, `inherit_option` false, `set_option` false. That edge
+can neither `SET ROLE` to the installer nor inherit its privileges. It is the same predicate as the
+installer role verifier and bootstrap (`supabase/bootstrap/acquisition_installer_verify.sql`, #332). Before PG16 `pg_auth_members` has no
+`inherit_option` / `set_option` columns, so any member refuses startup.
 
 ## Authentication
 

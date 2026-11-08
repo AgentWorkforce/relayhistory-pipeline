@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { SUPABASE_PROD_CA_2021 } from "../../session-pipeline/supabase-ca.ts";
 import { acquisitionConfig } from "../config.ts";
 import {
-  ACQUISITION_APPLICATION_NAME, ACQUISITION_INSTALLER_ROLE, INSTALLER_OPTIONS, InstallerLoginError, LOGIN_SQL, SYSTEM_USER_SQL,
+  ACQUISITION_APPLICATION_NAME, ACQUISITION_INSTALLER_ROLE, INSTALLER_OPTIONS, InstallerLoginError, LOGIN_SQL, MEMBERS_SQL, SYSTEM_USER_SQL,
   assertInstallerLogin, installerClientConfig, type LoginQuery,
 } from "../db-login.ts";
 import { pinnedKeysJson } from "./helpers.ts";
@@ -91,16 +91,21 @@ test("startup config: the installer login is required and pinned through acquisi
 const healthy = {
   session_user: ACQUISITION_INSTALLER_ROLE, current_user: ACQUISITION_INSTALLER_ROLE, role_setting: "none", server_version: 160004,
   statement_timeout: "5s", lock_timeout: "2s", idle_in_transaction_session_timeout: "10s",
-  rolsuper: false, rolbypassrls: false, rolcreaterole: false, rolcreatedb: false, rolreplication: false, rolinherit: false, memberships: 0,
+  rolsuper: false, rolbypassrls: false, rolcreaterole: false, rolcreatedb: false, rolreplication: false, rolinherit: false, memberships: 0, members: 0,
 };
 
-function fakeDb(row: Record<string, unknown> | null, systemUser: unknown = `scram-sha-256:${ACQUISITION_INSTALLER_ROLE}`) {
+function fakeDb(
+  row: Record<string, unknown> | null,
+  systemUser: unknown = `scram-sha-256:${ACQUISITION_INSTALLER_ROLE}`,
+  memberRows: Record<string, unknown>[] = [],
+) {
   const seen: string[] = [];
   const db: LoginQuery = {
     async query<T>(text: string) {
       seen.push(text);
       if (text === LOGIN_SQL) return { rows: (row ? [row] : []) as T[] };
       if (text === SYSTEM_USER_SQL) return { rows: [{ system_user: systemUser }] as T[] };
+      if (text === MEMBERS_SQL) return { rows: memberRows as T[] };
       throw new Error("unexpected statement");
     },
   };
@@ -116,10 +121,10 @@ async function loginRefusal(row: Record<string, unknown> | null, systemUser?: un
 test("live login: the exact installer identity with the expected shape is accepted (PG16+ and PG15)", async () => {
   const pg16 = fakeDb(healthy);
   await assertInstallerLogin(pg16.db);
-  expect(pg16.seen).toEqual([LOGIN_SQL, SYSTEM_USER_SQL]);
+  expect(pg16.seen).toEqual([LOGIN_SQL, SYSTEM_USER_SQL, MEMBERS_SQL]);
   const pg15 = fakeDb({ ...healthy, server_version: 150008 });
   await assertInstallerLogin(pg15.db);
-  expect(pg15.seen).toEqual([LOGIN_SQL]); // system_user does not exist before PG16
+  expect(pg15.seen).toEqual([LOGIN_SQL]); // system_user and the PG16 member columns do not exist before PG16
 });
 
 test("live login negatives: wrong identity, SET ROLE, privileged role shape or timeout profile refuse startup", async () => {
@@ -151,4 +156,68 @@ test("live login negatives: wrong identity, SET ROLE, privileged role shape or t
   try { await assertInstallerLogin(broken); } catch (e) { err = e; }
   expect(String(err)).toBe("InstallerLoginError: 96bulls: acquisition installer login refused: login_unreadable");
   expect(String(new InstallerLoginError("session_user"))).not.toContain("postgres");
+});
+
+// ---------------------------------------------------------------- inbound memberships (dogpatch P1)
+// A LOGIN granted the installer role could SET ROLE to it and call the SECURITY DEFINER RPCs,
+// so the installer must have no member. The only tolerated edge is the Supabase PG16+ creator
+// edge (postgres, granted by the superuser supabase_admin, ADMIN only, no SET, no INHERIT).
+
+const CREATOR_EDGE = Object.freeze({
+  member: "postgres", grantor: "supabase_admin", grantor_super: true, admin_option: true, inherit_option: false, set_option: false,
+});
+
+async function membersRefusal(row: Record<string, unknown>, memberRows: Record<string, unknown>[]): Promise<string> {
+  const { db } = fakeDb(row, `scram-sha-256:${ACQUISITION_INSTALLER_ROLE}`, memberRows);
+  try { await assertInstallerLogin(db); } catch (e) { return e instanceof InstallerLoginError ? e.code : `other: ${String(e)}`; }
+  return "accepted";
+}
+
+test("inbound only: a member of the installer role refuses startup even with no outgoing membership", async () => {
+  const attacker = { member: "acq_attacker", grantor: "postgres", grantor_super: true, admin_option: false, inherit_option: true, set_option: true };
+  // PG16+: the row is read and refused.
+  expect(await membersRefusal({ ...healthy, memberships: 0, members: 1 }, [attacker])).toBe("role_members");
+  // Before PG16 any member refuses (no inherit/set columns to tell the creator edge apart).
+  expect(await membersRefusal({ ...healthy, server_version: 150008, memberships: 0, members: 1 }, [])).toBe("role_members");
+});
+
+test("outbound only: an installer that is a member of another role refuses startup with no inbound row", async () => {
+  expect(await membersRefusal({ ...healthy, memberships: 1, members: 0 }, [])).toBe("role_membership");
+  expect(await membersRefusal({ ...healthy, server_version: 150008, memberships: 1, members: 0 }, [])).toBe("role_membership");
+});
+
+test("the exact Supabase PG16+ creator edge is accepted; before PG16 it is refused", async () => {
+  const pg16 = fakeDb({ ...healthy, members: 1 }, `scram-sha-256:${ACQUISITION_INSTALLER_ROLE}`, [{ ...CREATOR_EDGE }]);
+  await assertInstallerLogin(pg16.db);
+  expect(pg16.seen).toEqual([LOGIN_SQL, SYSTEM_USER_SQL, MEMBERS_SQL]);
+  expect(await membersRefusal({ ...healthy, server_version: 150008, members: 1 }, [{ ...CREATOR_EDGE }])).toBe("role_members");
+});
+
+test("creator-edge look-alikes refuse startup", async () => {
+  const cases: Array<[string, Record<string, unknown>[], number?]> = [
+    ["SET option true", [{ ...CREATOR_EDGE, set_option: true }]],
+    ["INHERIT option true", [{ ...CREATOR_EDGE, inherit_option: true }]],
+    ["no ADMIN option", [{ ...CREATOR_EDGE, admin_option: false }]],
+    ["grantor not superuser", [{ ...CREATOR_EDGE, grantor_super: false }]],
+    ["other grantor", [{ ...CREATOR_EDGE, grantor: "postgres" }]],
+    ["other member", [{ ...CREATOR_EDGE, member: "supabase_admin" }]],
+    ["creator edge plus another member", [{ ...CREATOR_EDGE }, { ...CREATOR_EDGE, member: "acq_attacker", admin_option: false, set_option: true }], 2],
+    ["option read as a string", [{ ...CREATOR_EDGE, set_option: "false" }]],
+    ["count and rows disagree", [{ ...CREATOR_EDGE }], 2],
+    ["count says member, rows empty", [], 1],
+  ];
+  for (const [label, rows, count] of cases)
+    expect([label, await membersRefusal({ ...healthy, members: count ?? rows.length }, rows)]).toEqual([label, "role_members"]);
+  // An unreadable count or a failing member query refuses as unreadable.
+  expect(await membersRefusal({ ...healthy, members: "0" }, [])).toBe("login_unreadable");
+  const failing: LoginQuery = {
+    async query<T>(text: string) {
+      if (text === LOGIN_SQL) return { rows: [healthy] as T[] };
+      if (text === SYSTEM_USER_SQL) return { rows: [{ system_user: `scram-sha-256:${ACQUISITION_INSTALLER_ROLE}` }] as T[] };
+      throw new Error("permission denied");
+    },
+  };
+  let err: unknown;
+  try { await assertInstallerLogin(failing); } catch (e) { err = e; }
+  expect(err instanceof InstallerLoginError && err.code).toBe("login_unreadable");
 });
