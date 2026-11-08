@@ -12,7 +12,9 @@
  * Env: READ_API_ORIGIN (this function's URL origin; unset = every request 401),
  * READ_API_COMPLETE_SINCE (ISO timestamp from which ClickHouse history is
  * complete, or "epoch"; required), RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER
- * (optional overrides).
+ * (optional overrides), RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS (exactly "true"
+ * also accepts relaycontrol `sh_at_` tokens; default off) with
+ * RELAYCONTROL_INTROSPECT_URL / RELAYCONTROL_INTROSPECT_SECRET.
  */
 import pg from "pg";
 import { log } from "../shared/log.ts";
@@ -24,7 +26,7 @@ import { createClickHouseClient } from "../session-pipeline/vendor/search-index/
 import { createReadApi, parseDirectoryWorkspaces } from "./app.ts";
 import { sqlDirectory } from "./directory.ts";
 import { sqlBriefTitles } from "./brief-titles.ts";
-import { relayAuthVerifier, type AuthConfig } from "./auth.ts";
+import { readApiVerifier, type AuthConfig } from "./auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
 import { poolTenantRunner, sqlLiveness } from "./liveness.ts";
@@ -63,7 +65,15 @@ export function readApiAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthCon
   const policy = destinationPolicy(env);
   const jwksUrl = env.RELAYAUTH_JWKS_URL?.trim() || undefined;
   if (jwksUrl) assertDestinationUrl("RELAYAUTH_JWKS_URL", jwksUrl, policy);
-  return { origin: env.READ_API_ORIGIN || undefined, jwksUrl, issuer: env.RELAYAUTH_ISSUER };
+  const config: AuthConfig = { origin: env.READ_API_ORIGIN || undefined, jwksUrl, issuer: env.RELAYAUTH_ISSUER };
+  // Relaycontrol introspection (default off): only exactly "true" enables. The
+  // URL is configuration only and passes the same transport rule.
+  if (env.RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS === "true") {
+    const url = env.RELAYCONTROL_INTROSPECT_URL?.trim() || undefined;
+    if (url) assertDestinationUrl("RELAYCONTROL_INTROSPECT_URL", url, policy);
+    config.relaycontrol = { url, secret: env.RELAYCONTROL_INTROSPECT_SECRET?.trim() || undefined };
+  }
+  return config;
 }
 
 type App = ReturnType<typeof createReadApi>;
@@ -122,7 +132,7 @@ export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessE
   const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", poolTenantRunner(pool as never));
   if (adapter && await adapter.state.fromMs(new Date()) > completeSinceMs) throw new Error("read history floor is below search coverage");
   const app = createReadApi({
-    verify: relayAuthVerifier(readApiAuthConfig(env)),
+    verify: readApiVerifier(readApiAuthConfig(env)),
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
     directory: sqlDirectory(poolTenantRunner(pool as never)),

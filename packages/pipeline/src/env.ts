@@ -55,6 +55,16 @@ export interface Bindings {
   /** As upstream env.ts: accepted grants, comma-separated `grantId=planDigest`. */
   RELAYHISTORY_MIGRATION_GRANTS?: string;
   ALLOW_INTERIM_RELAYAUTH_BEARER?: string;
+  /**
+   * 96BullSessions: relaycontrol user access tokens (`sh_at_`) through
+   * relaycontrol's introspection (auth/relaycontrol.ts). Only exactly "true"
+   * enables; default off. Needs both RELAYCONTROL_INTROSPECT_* values.
+   */
+  RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS?: string;
+  /** In-cluster relaycontrol base URL; configuration only, never from a request. */
+  RELAYCONTROL_INTROSPECT_URL?: string;
+  /** The dedicated introspection service secret (never a user token). */
+  RELAYCONTROL_INTROSPECT_SECRET?: string;
   ENVIRONMENT?: string;
   // Request logs leave the Worker only when the key is set (see lib/logger.ts).
   POSTHOG_API_KEY?: string;
