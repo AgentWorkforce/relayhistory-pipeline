@@ -150,7 +150,14 @@ the original sketch below in four ways:
   `unsupported_by_backend`.
 
 At startup it admits only a real login of `bulls96_session_ingest` with the
-bootstrap's role shape. The original sketch:
+bootstrap's role shape.
+
+`SELFHOST_INGEST_ADMISSION=async` (default `sync`) moves the database off the
+upload request path: one create-only inbox PUT, then the hosted queued receipt,
+with an in-process consumer that admits the inbox. It also serves
+`GET /v1/delivery/admission` (rule 4 already routes it here), and `/readyz`
+follows the consumer instead of the database. Every upload still makes one
+relaycontrol introspection call. See `docs/selfhost-async-admission.md`. The original sketch:
 
 1. Listen on its own port. 8090 is suggested, and the port is the router's
    upstream. It answers `GET /healthz`, default-off like read-api.
@@ -223,8 +230,44 @@ anything else fails startup.
 | --- | --- | --- | --- |
 | `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT` | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
 | `session-publication` | `INGEST_PUBLISH_ENABLED` | `INGEST_PUBLISH_{BUCKET,EXPECT_GENERATION,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,INSTANCE_ID,SECRET_ARN,KMS_KEY_ARN,INSTANCE_PROFILE_ARN,ROLE_NAME}`, `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, optional `INGEST_PUBLISH_BUDGET_MS`, `INGEST_PUBLISH_BATCH_LIMIT`, `WORKER_HEALTH_PORT` | none in env: IMDSv2 plus Secrets Manager (see the caveat in section 1) |
-| `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP` | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys |
+| `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS` | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys |
 | workers | per service (`docs/local-stack.md`) | `HOOPDB_URL`, `WORKER_HEALTH_PORT` | `HOOPDB_URL` password |
+
+### session-ingest admission mode (config contract)
+
+`SELFHOST_INGEST_ADMISSION` is `sync` (the default; unset or empty is the same),
+`async` or `drain`. Any other value fails startup. The knobs
+`SELFHOST_ADMISSION_CONCURRENCY` (1..32, default 4), `SELFHOST_ADMISSION_SCAN_MS`
+(1000..600000, default 15000) and `SELFHOST_ADMISSION_MAX_ATTEMPTS` (1..100,
+default 20) are read only in `async` and `drain`. The mode is never taken from a
+request. Semantics: `docs/selfhost-async-admission.md`.
+
+Once enabled, both `GET /healthz` and `GET /readyz` pin the effective mode:
+
+```json
+{ "ok": true, "enabled": true, "admission": "sync" }
+```
+
+In `async` and `drain` they also report the consumer:
+
+```json
+{ "ok": true, "enabled": true, "admission": "async",
+  "consumer": { "ok": true, "state": "ok", "backlog": 0, "oldestAgeMs": null,
+                "deadLettered": 0, "inFlight": 0, "lastScanAgeMs": 1200 } }
+```
+
+- `admission`: exactly `sync`, `async` or `drain`. The chart compares it with
+  the value it set and refuses the rollout on a mismatch. An image older than
+  this contract reports no `admission` field.
+- `consumer.state`: `starting` (no scan has completed yet), `ok`, `stale` (no
+  successful scan for max(3 × scan interval, 60 s)) or `stopped`. `consumer.ok`
+  is true only for `ok`. `oldestAgeMs` is `null` when the backlog is empty.
+- `/healthz` stays 200 whatever the consumer says (liveness).
+- `/readyz` status:
+  - `sync`: 200 iff the ledger answers `SELECT 1` (unchanged);
+  - `async`: 200 iff `consumer.ok` (the database is not on the upload path);
+  - `drain`: 200 iff both.
+- A dormant edge (`RELAYHISTORY_SELFHOST_INGEST` unset) reports neither field.
 
 CA: `SESSION_POSTGRES_TLS_PROFILE=custom-ca` with `SESSION_POSTGRES_CA_FILE`
 (a mounted file, at most 128 KiB) and `SESSION_POSTGRES_CA_SHA256` (64 hex

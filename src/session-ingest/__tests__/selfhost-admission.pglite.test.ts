@@ -189,6 +189,12 @@ const errorCode = async (res: Response) => ((await res.json()) as { error: { cod
 const drain = async (s: Started) => { await s.consumer().scan(); await s.consumer().settle(); };
 
 describe("SELFHOST_INGEST_ADMISSION=sync (the default) is today's server", () => {
+  test("sync does not serve the admission status read (501, as before)", async () => {
+    const s = await start({ SELFHOST_INGEST_ADMISSION: undefined });
+    const res = await fetch(s.url("/v1/delivery/admission?originId=origin-1&receiptId=rhr_" + "a".repeat(64)), { headers: { authorization: `Bearer ${TOKEN}` } });
+    expect([res.status, await errorCode(res)]).toEqual([501, "unsupported_by_backend"]);
+  });
+
   test("unset and explicit sync answer the same bytes, write synchronously, build no consumer and no inbox", async () => {
     const answers: { status: number; body: string; headers: string[]; ready: string; inbox: number; tenant: number; consumer: boolean }[] = [];
     for (const mode of [undefined, "sync", ""]) {
@@ -204,7 +210,8 @@ describe("SELFHOST_INGEST_ADMISSION=sync (the default) is today's server", () =>
     }
     expect(answers[0]!.status).toBe(200);
     expect(answers[0]!.headers).not.toContain(ADMISSION_HEADER);
-    expect(answers[0]!.ready).toBe(JSON.stringify({ ok: true, enabled: true }));
+    // The probes pin the effective mode (the chart refuses an image that does not report it).
+    expect(answers[0]!.ready).toBe(JSON.stringify({ ok: true, enabled: true, admission: "sync" }));
     expect(answers[0]!.inbox).toBe(0);
     expect(answers[0]!.tenant).toBeGreaterThan(0);
     expect(answers[0]!.consumer).toBe(false);
@@ -245,7 +252,14 @@ describe("async request path: no SQL, one create-only inbox PUT, the hosted queu
 
     const status = await s.consumer().status();
     expect(status.backlog).toBe(1); // notified by the request path
+    // The hosted status read, from S3 only: pending until the consumer admits.
+    const receiptId = JSON.parse(body).receiptId as string;
+    const admission = (q = `originId=origin-1&receiptId=${receiptId}`) => fetch(s.url(`/v1/delivery/admission?${q}`), { headers: { authorization: `Bearer ${TOKEN}` } });
+    expect(await (await admission()).json()).toEqual({ receiptId, state: "pending" });
+    expect((await admission("originId=origin-1&receiptId=nope")).status).toBe(400);
+    expect(s.sql.calls).toBe(0);
     await drain(s);
+    expect(await (await admission()).json()).toEqual({ receiptId, state: "admitted" });
     expect(s.sql.calls).toBeGreaterThan(0);
     expect((await tenantKeys(s.store)).length).toBeGreaterThan(0);
     expect(await outcomes(s.store)).toEqual(["outcome-admitted.json"]);
@@ -324,7 +338,7 @@ describe("async request path: no SQL, one create-only inbox PUT, the hosted queu
     expect(res.status).toBe(200);
     expect(res.headers.get(ADMISSION_HEADER)).toBeNull();
     const a = await start();
-    for (const path of ["/v1/delivery/sessions/reset", "/v1/delivery/sessions/selection", "/v1/delivery/admission"]) {
+    for (const path of ["/v1/delivery/sessions/reset", "/v1/delivery/sessions/selection", "/v1/delivery/recovery"]) {
       const r = await post(a.url(path), "{}");
       expect([path, r.status]).toEqual([path, 501]);
     }
@@ -401,8 +415,8 @@ describe("the consumer", () => {
     expect(s.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 1 });
     // The bytes are never deleted by the consumer.
     expect((await inboxObjects(s.store))[0]!.size).toBeGreaterThanOrEqual(INBOX_MIN_BYTES);
-    const ready = await (await fetch(s.url("/readyz"))).json() as { admission: { deadLetters: number } };
-    expect(ready.admission.deadLetters).toBe(1);
+    const ready = await (await fetch(s.url("/readyz"))).json() as { consumer: { deadLettered: number } };
+    expect(ready.consumer.deadLettered).toBe(1);
     const attempts = () => s.logs.map((l) => JSON.parse(l)).filter((l) => l.route === "ingest.admission").length;
     const before = attempts();
     await drain(s);
@@ -518,18 +532,24 @@ describe("readiness and telemetry", () => {
     const s = await start();
     const first = await fetch(s.url("/readyz"));
     expect(first.status).toBe(503);
-    expect(((await first.json()) as { admission: { state: string } }).admission.state).toBe("starting");
+    expect(await first.json()).toMatchObject({ ok: false, admission: "async", consumer: { ok: false, state: "starting" } });
     await drain(s);
     const ok = await fetch(s.url("/readyz"));
     expect(ok.status).toBe(200);
-    expect(await ok.json()).toEqual({ ok: true, enabled: true, admission: { state: "ok", backlog: 0, oldestAgeMs: null, deadLetters: 0, inFlight: 0, lastScanAgeMs: 0 } });
+    const consumer = { ok: true, state: "ok", backlog: 0, oldestAgeMs: null, deadLettered: 0, inFlight: 0, lastScanAgeMs: 0 };
+    expect(await ok.json()).toEqual({ ok: true, enabled: true, admission: "async", consumer });
+    // Liveness carries the same pinned fields and stays 200.
+    expect(await (await fetch(s.url("/healthz"))).json()).toEqual({ ok: true, enabled: true, admission: "async", consumer });
     // The store stops answering lists: uploads still work (they are not gated on the DB), readiness goes stale.
     s.faults.list = () => true;
     s.tick(61_000);
     await drain(s);
     const stale = await fetch(s.url("/readyz"));
     expect(stale.status).toBe(503);
-    expect(((await stale.json()) as { admission: { state: string } }).admission.state).toBe("stale");
+    expect(await stale.json()).toMatchObject({ ok: false, admission: "async", consumer: { ok: false, state: "stale" } });
+    const live = await fetch(s.url("/healthz"));
+    expect(live.status).toBe(200);
+    expect(await live.json()).toMatchObject({ ok: true, admission: "async", consumer: { ok: false, state: "stale" } });
     expect(s.logs.some((l) => JSON.parse(l).outcome === "scan_failed")).toBe(true);
   });
 
@@ -541,9 +561,9 @@ describe("readiness and telemetry", () => {
     await drain(s);
     const r = await fetch(s.url("/readyz"));
     expect(r.status).toBe(200);
-    const body = (await r.json()) as { admission: { backlog: number; oldestAgeMs: number } };
-    expect(body.admission.backlog).toBe(1);
-    expect(body.admission.oldestAgeMs).toBeGreaterThanOrEqual(5_000);
+    const body = (await r.json()) as { consumer: { backlog: number; oldestAgeMs: number } };
+    expect(body.consumer.backlog).toBe(1);
+    expect(body.consumer.oldestAgeMs).toBeGreaterThanOrEqual(5_000);
     const scanLine = s.logs.map((l) => JSON.parse(l)).filter((l) => l.route === "ingest.admission_consumer").at(-1);
     expect(scanLine).toMatchObject({ outcome: "ok", admission_backlog: 1, admission_dead_letters: 0 });
   });
@@ -558,6 +578,28 @@ describe("readiness and telemetry", () => {
     await drain(s);
     const text = s.logs.join("\n");
     for (const needle of [TOKEN, SECRET, ".admission-inbox", "96bulls/", "hello", "sess-1", "quiet"]) expect([needle, text.includes(needle)]).toEqual([needle, false]);
+  });
+
+  test("both probes pin the effective mode for all three values; a dormant edge reports none", async () => {
+    const seen: Record<string, unknown>[] = [];
+    for (const mode of ["sync", "async", "drain"]) {
+      const s = await start({ SELFHOST_INGEST_ADMISSION: mode });
+      if (mode !== "sync") await drain(s);
+      for (const path of ["/healthz", "/readyz"]) {
+        const body = (await (await fetch(s.url(path))).json()) as Record<string, unknown>;
+        expect([mode, path, body.admission]).toEqual([mode, path, mode]);
+        expect([mode, path, "consumer" in body]).toEqual([mode, path, mode !== "sync"]);
+        if (mode !== "sync") expect(Object.keys(body.consumer as object).sort()).toEqual(["backlog", "deadLettered", "inFlight", "lastScanAgeMs", "ok", "oldestAgeMs", "state"]);
+        seen.push(body);
+      }
+    }
+    const dormant = await startSelfhostIngestService({ SELFHOST_INGEST_ADMISSION: "async" }, { host: "127.0.0.1", port: 0 });
+    cleanups.push(() => dormant.close());
+    for (const path of ["/healthz", "/readyz"]) {
+      const body = (await (await fetch(`http://127.0.0.1:${dormant.port}${path}`)).json()) as Record<string, unknown>;
+      expect(body).toEqual({ ok: path === "/healthz", enabled: false });
+    }
+    expect(seen).toHaveLength(6);
   });
 
   test("drain: the synchronous request path, while the consumer finishes the inbox", async () => {

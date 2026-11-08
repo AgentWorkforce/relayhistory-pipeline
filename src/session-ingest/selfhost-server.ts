@@ -5,8 +5,12 @@
  * (RELAYHISTORY_SELFHOST_INGEST, selfhost-config.ts); the hosted Worker
  * (worker.ts) is unchanged and never imports this file.
  *
- *   GET  /healthz              liveness, always 200 { ok, enabled }
+ *   GET  /healthz              liveness, always 200 { ok, enabled, admission? , consumer? }
  *   GET  /readyz               enabled and the ledger answers SELECT 1: 200; otherwise 503
+ *                              (SELFHOST_INGEST_ADMISSION=async: the admission consumer's health instead; below)
+ *                              Both probes pin the effective mode once enabled: `admission` is "sync" | "async" |
+ *                              "drain", and async / drain add `consumer` { ok, state, backlog, oldestAgeMs,
+ *                              deadLettered, inFlight, lastScanAgeMs }. A dormant edge reports neither.
  *   POST /v1/delivery/batches  rth:sync   (app.ts, unchanged handler)
  *   POST /v1/turns/batches     rth:sync   (app.ts, unchanged handler)
  *   GET  /v1/delivery/limits   rth:sync   (app.ts, unchanged handler)
@@ -73,6 +77,9 @@ export const SELFHOST_INGEST_ROUTES: Readonly<Record<string, "GET" | "POST">> = 
   "/v1/delivery/limits": "GET",
 });
 
+/** SELFHOST_INGEST_ADMISSION=async|drain only: plus the hosted admission status read (S3 only, rth:sync, tenant from the verified identity). */
+export const SELFHOST_ADMISSION_ROUTES: Readonly<Record<string, "GET" | "POST">> = Object.freeze({ ...SELFHOST_INGEST_ROUTES, "/v1/delivery/admission": "GET" });
+
 /**
  * The Desktop's refresh call. A self-host session has nothing to refresh (the read API's login passes the
  * sh_at_ token through and repeats it as refreshToken), so the only honest answer is that this credential
@@ -104,8 +111,12 @@ export interface SelfhostIngestRuntime {
   bind(request: Request, identity: IngestIdentity): void;
   ready(): Promise<boolean>;
   close(): Promise<void>;
-  /** SELFHOST_INGEST_ADMISSION=async|drain only: the consumer's status (for /readyz). */
+  /** The effective SELFHOST_INGEST_ADMISSION mode, pinned on both probes ("sync" when absent). */
+  admissionMode?: "sync" | "async" | "drain";
+  /** SELFHOST_INGEST_ADMISSION=async|drain only: the consumer's status (for the probes). */
   admission?: () => SelfhostAdmissionStatus;
+  /** Routes served (SELFHOST_INGEST_ROUTES when absent). */
+  routes?: Readonly<Record<string, "GET" | "POST">>;
 }
 
 export interface RuntimeParts {
@@ -146,7 +157,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   if (!admission) {
     // SELFHOST_INGEST_ADMISSION=sync (the default): exactly the app this file always built.
     const app = createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields) });
-    return { app, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close };
+    return { app, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close, admissionMode: "sync" };
   }
   const mode = admission.mode === "async" ? "on" as const : "drain" as const;
   const consumer: SelfhostAdmissionConsumer = selfhostAdmissionConsumer({
@@ -180,7 +191,9 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     // request path needs the database too.
     ready: async () => consumer.status().healthy && (mode === "on" || await parts.ready()),
     close: async () => { await consumer.stop(); await parts.close(); },
+    admissionMode: admission.mode,
     admission: () => consumer.status(),
+    routes: SELFHOST_ADMISSION_ROUTES,
   };
 }
 
@@ -392,6 +405,20 @@ function sendJson(req: IncomingMessage, res: ServerResponse, status: number, bod
   });
 }
 
+/**
+ * The pinned probe fields (the chart's config contract, docs/selfhost-composition.md section 5): the effective
+ * admission mode once enabled, and in async / drain the consumer's counters (numbers and a closed state; no
+ * key, no tenant). An image that predates SELFHOST_INGEST_ADMISSION reports no `admission` field at all.
+ */
+function probeFields(runtime: SelfhostIngestRuntime | null): Record<string, unknown> {
+  if (!runtime) return {};
+  const c = runtime.admission?.();
+  return {
+    admission: runtime.admissionMode ?? "sync",
+    ...(c ? { consumer: { ok: c.healthy, state: c.state, backlog: c.backlog, oldestAgeMs: c.oldestAgeMs, deadLettered: c.deadLetters, inFlight: c.inFlight, lastScanAgeMs: c.lastScanAgeMs } } : {}),
+  };
+}
+
 const envelope = (code: string, message: string, correlationId: string, extra: Record<string, unknown> = {}) => ({ error: { code, message, ...extra }, correlationId });
 
 /** node:http in front of the runtime (null: dormant). */
@@ -402,12 +429,10 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
       try {
         const url = new URL(`http://localhost${req.url?.startsWith("/") ? req.url : "/"}`);
         const path = url.pathname;
-        if (req.method === "GET" && path === "/healthz") return sendJson(req, res, 200, { ok: true, enabled: runtime !== null });
+        if (req.method === "GET" && path === "/healthz") return sendJson(req, res, 200, { ok: true, enabled: runtime !== null, ...probeFields(runtime) });
         if (req.method === "GET" && path === "/readyz") {
           const ok = runtime ? await runtime.ready() : false;
-          // Async admission only: the consumer's counters (numbers and a closed state; no key, no tenant).
-          const a = runtime?.admission?.();
-          return sendJson(req, res, ok ? 200 : 503, { ok, enabled: runtime !== null, ...(a ? { admission: { state: a.state, backlog: a.backlog, oldestAgeMs: a.oldestAgeMs, deadLetters: a.deadLetters, inFlight: a.inFlight, lastScanAgeMs: a.lastScanAgeMs } } : {}) });
+          return sendJson(req, res, ok ? 200 : 503, { ok, enabled: runtime !== null, ...probeFields(runtime) });
         }
         if (!runtime)
           return sendJson(req, res, 503, envelope("not_configured", "the session ingest is not enabled", correlationId), { "retry-after": "60", "x-correlation-id": correlationId });
@@ -417,7 +442,7 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
           await drainSmallBody(req);
           return sendJson(req, res, 401, envelope("refresh_not_supported", "this session cannot be refreshed; sign in again", correlationId), { "www-authenticate": "Bearer", "x-correlation-id": correlationId });
         }
-        const method = SELFHOST_INGEST_ROUTES[path];
+        const method = (runtime.routes ?? SELFHOST_INGEST_ROUTES)[path];
         if (!method) {
           if (path.startsWith("/v1/"))
             return sendJson(req, res, 501, envelope("unsupported_by_backend", "this route is not served by the self-host session ingest", correlationId, { reason: "route_not_served_selfhost" }), { "x-correlation-id": correlationId });

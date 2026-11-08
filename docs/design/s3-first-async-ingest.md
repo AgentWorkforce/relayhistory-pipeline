@@ -4,6 +4,8 @@ Status: implemented behind `INGEST_ASYNC_ADMISSION` (default `off`). Merging the
 nothing in production. Turning it on also needs the stack (PR #367), relayhistory and queue
 retention steps listed under "Rollout".
 
+Self-host (no queue, no Supabase, canonical ledger): [`docs/selfhost-async-admission.md`](../selfhost-async-admission.md).
+
 Code:
 - `src/session-ingest/async-admission.ts`: request path, inbox, privacy journal, outcomes.
 - `src/session-ingest/admission-consumer.ts`: the queue consumer.
