@@ -253,7 +253,7 @@ await check("rds profile: the owner creates the consumer role via the bootstrap 
   // may alter the role. The consumer file re-run converges on the claim,
   // the trampoline re-run ignores the role, and any extra setting still
   // refuses. A source guard pins the trampoline exclusion.
-  const consumerBoot = B("supabase/bootstrap/session_consumer_roles.sql");
+  const consumerBoot = B("session_consumer_roles.sql");
   const created = psql(DB, ["-f", consumerBoot]);
   const login = await attempt(DB, `ALTER ROLE search_consumer_runtime LOGIN`, MASTER);
   const timeout = await attempt(DB, `ALTER ROLE search_consumer_runtime SET statement_timeout = '60s'`, MASTER);
@@ -270,11 +270,20 @@ await check("rds profile: the owner creates the consumer role via the bootstrap 
   const consumerEdges = await edges("search_consumer_runtime");
   const edgeOk = consumerEdges.length === 1 &&
     fmt(consumerEdges[0]) === fmt({ member: MASTER, grantor: "rdsadmin", grantor_oid: 10, admin: true, inherit: false, set: false });
-  const trampolineSkipsConsumer = !readFileSync(ROLES_BOOT, "utf8").includes("search_consumer_runtime");
+  // Executable SQL only: the trampoline's header and inventory comments name the role on purpose.
+  const trampolineSql = readFileSync(ROLES_BOOT, "utf8").split("\n").filter((l) => !/^\s*--/.test(l)).join("\n");
+  const trampolineSkipsConsumer = !trampolineSql.includes("search_consumer_runtime");
+  // Error capture: every psql re-run reports its SQLSTATE and first error
+  // line, so a false step names its failure in the proof output. `refused`
+  // must fail with the role file's own 28000, not any psql error (a missing
+  // file also exits non-zero).
+  const why = (r: { ok: boolean; out: string; sqlstate: string }) =>
+    r.ok ? "ok" : `${r.sqlstate}:${JSON.stringify((/^(?:psql:.*?)?(?:ERROR|FATAL|error):.*$/m.exec(r.out)?.[0] ?? r.out.split("\n")[0] ?? "").slice(0, 200))}`;
+  const refusedRight = !refused.ok && refused.sqlstate === "28000";
   const ok = created.ok && login === "ok" && timeout === "ok" && converged.ok && extra === "ok" &&
-    trampolineIgnores.ok && !refused.ok && reset === "ok" && again.ok &&
+    trampolineIgnores.ok && refusedRight && reset === "ok" && again.ok &&
     bare === "ok" && nologin === "ok" && restored.ok && edgeOk && trampolineSkipsConsumer;
-  return [ok, `created=${created.ok} login=${login} timeout=${timeout} converged=${converged.ok} extra_set=${extra} trampoline_ignores=${trampolineIgnores.ok} refused=${!refused.ok} reset=${reset} again=${again.ok} restored=${restored.ok} edge=${fmt(consumerEdges[0])} trampoline_skips=${trampolineSkipsConsumer}`];
+  return [ok, `created=${why(created)} login=${login} timeout=${timeout} converged=${why(converged)} extra_set=${extra} trampoline_ignores=${why(trampolineIgnores)} refused=${refusedRight}(${why(refused)}) reset=${reset} again=${why(again)} restored=${why(restored)} edge=${fmt(consumerEdges[0])} trampoline_skips=${trampolineSkipsConsumer}`];
 });
 await check("rds profile: the master can still rotate the runtime password (creator edge kept on purpose)", async () => {
   // A value is used only inside this disposable, trust-auth server; never a real credential.
