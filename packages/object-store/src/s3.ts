@@ -66,6 +66,13 @@ class S3Transport implements Transport {
   readonly #fetch: typeof fetch;
 
   constructor(config: S3Config) {
+    // Both become part of the request host (`<bucket>.s3.<region>.amazonaws.com`): anything outside
+    // these characters (`@`, `/`, `:`, `?`, `#`, whitespace...) could redirect a SigV4-signed request
+    // to another host. Refused before any credential is read or any request is made.
+    if (!/^[a-z0-9][a-z0-9.-]{0,62}$/.test(config.bucket) || config.bucket.includes(".."))
+      throw new ObjectStoreError("invalid_argument", BACKEND, "bucket must be a lowercase S3 bucket name");
+    if (config.endpoint === undefined && !/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(config.region))
+      throw new ObjectStoreError("invalid_argument", BACKEND, "region must be lowercase letters, digits and dashes");
     this.#config = config;
     this.#credentials = cachedProvider(config.credentials);
     this.#fetch = config.fetch ?? ((...a) => fetch(...a));
