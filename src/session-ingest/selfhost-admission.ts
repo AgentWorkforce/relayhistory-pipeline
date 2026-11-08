@@ -136,9 +136,10 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     const t0 = Date.now();
     try {
       const dead = await listDeadLetters(scanAt);
+      // No age threshold (and so no dependence on this pod's clock agreeing with the store's): every pending object.
       const seen = new Set<string>();
       let live = 0;
-      for await (const m of pendingAdmissions(store, keyRoot, { nowMs: scanAt, olderThanMs: 0 })) {
+      for await (const m of pendingAdmissions(store, keyRoot, { nowMs: scanAt, olderThanMs: Number.NEGATIVE_INFINITY })) {
         if (dead.has(m.key)) { live++; marked.add(m.key); if (!inflight.has(m.key)) entries.delete(m.key); continue; }
         seen.add(m.key);
         if (!entries.has(m.key)) entries.set(m.key, { attempts: 0, notBefore: 0, addedAt: scanAt, receivedAtMs: receivedAtOf(m.key) });

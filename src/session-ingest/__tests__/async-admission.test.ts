@@ -16,6 +16,7 @@ import {
 import { LedgerUnavailableError, type Ledger } from "../ledger.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { CURRENT_CUSTODY_CONTENT_TYPE } from "../custody-protocol.ts";
+import { TURN_KIND, TURN_ORIGIN_ID, parseTurnBatch, turnRecordId } from "../turns.ts";
 import { MemoryLedger, TENANT, batch, record, scratchStore } from "./support.ts";
 
 const cleanups: (() => void)[] = [];
@@ -198,6 +199,27 @@ describe("inbox object", () => {
     expect(prepared.records).toHaveLength(0);
     const key = inboxKey("96bulls", TENANT, "origin-1", prepared.receipt.receiptId, T0, "0123456789abcdef");
     expect((await decodeInbox("96bulls", key, zstd(encodeInbox(TENANT, prepared, T0, 0))))?.prepared.records).toHaveLength(0);
+  });
+
+  test("a turns batch (conversation_turn, the fixed turns origin) round-trips; the turn kind under any other origin is refused", async () => {
+    const SESSION = "7b0f5a8e-1c2d-4e3f-8a9b-0c1d2e3f4a5b";
+    const record_id = turnRecordId(TENANT.workspaceId, "claude", SESSION, 0);
+    const revision = 1_793_000_000_000_000;
+    const turn = { schema_version: 1, origin_id: TURN_ORIGIN_ID, record_id, revision_id: `turnrev:${record_id.slice(5)}:${revision}`, revision, kind: TURN_KIND, source: "claude", session_id: SESSION, operation: "upsert",
+      payload: { id: "00000000-aaaa-4bbb-8ccc-dddddddddddd", org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, source: "claude", session_id: SESSION, turn_index: 0, session_owner: TENANT.userId,
+        role: "user", content: "turn 0", actor_name: "Ada", actor_role: "owner", metadata_json: JSON.stringify({ nativeCli: "claude", relaySession: { sessionId: SESSION } }), ts: "2026-11-05T12:00:00.123Z", tagged: true } };
+    const raw = { schema_version: 1, origin_id: TURN_ORIGIN_ID, batch_id: "turns-1", job_id: "relayhistory-turns", generation: 1, destination_id: "relayhistory", instance_id: "relayhistory-api",
+      account_id: (await batch([])).account_id, mapping_version: (await batch([])).mapping_version, records: [turn] };
+    const prepared = await prepareDelivery(TENANT, parseTurnBatch({ protocolVersion: 1, batch: raw }, identity));
+    expect(prepared.records.map((r) => r.kind)).toEqual([TURN_KIND]);
+    const key = inboxKey("96bulls", TENANT, TURN_ORIGIN_ID, prepared.receipt.receiptId, T0, "0123456789abcdef");
+    const decoded = await decodeInbox("96bulls", key, zstd(encodeInbox(TENANT, prepared, T0, 0)));
+    expect(decoded?.prepared.records.map((r) => [r.kind, r.record_id, r.digest])).toEqual(prepared.records.map((r) => [r.kind, r.record_id, r.digest]));
+    // The same turn kind smuggled under a delivery origin never decodes.
+    const delivery = await prepareDelivery(TENANT, await batch([record({ record_id: "d1" })]));
+    const forged = { ...delivery, records: delivery.records.map((r) => ({ ...r, kind: TURN_KIND as never })) };
+    const dkey = inboxKey("96bulls", TENANT, "origin-1", delivery.receipt.receiptId, T0, "0123456789abcdef");
+    await expect(decodeInbox("96bulls", dkey, zstd(encodeInbox(TENANT, forged, T0, 0)))).rejects.toThrow();
   });
 });
 

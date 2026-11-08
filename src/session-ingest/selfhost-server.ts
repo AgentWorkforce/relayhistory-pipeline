@@ -328,6 +328,15 @@ export function conditionalWriteProbeKey(keyRoot: string, nonce: string = crypto
   return `${keyRoot}/.admission-probe/v1/ws=probe/m=srv_${nonce}/probe.json`;
 }
 
+/**
+ * SELFHOST_INGEST_ADMISSION=async|drain only: the inbox (create-only) and the privacy journal (compare-and-swap)
+ * need conditional writes the backend really honours, so prove them once or refuse to start. Sync (the default)
+ * never touches the store here.
+ */
+export async function admissionStartupGate(settings: Pick<SelfhostIngestSettings, "keyRoot" | "admission">, store: ObjectStore): Promise<void> {
+  if (settings.admission) await assertConditionalWrites(store, conditionalWriteProbeKey(settings.keyRoot));
+}
+
 export type RuntimeBuilder = (settings: SelfhostIngestSettings, env: NodeJS.ProcessEnv) => Promise<SelfhostIngestRuntime>;
 
 /** Production: pg pool, Locker store, relaycontrol introspection with no positive cache. */
@@ -347,7 +356,7 @@ export const productionRuntime: RuntimeBuilder = async (settings, env) => {
     const store = buildLockerStore(env).store as unknown as ObjectStore;
     // Async admission needs create-only and compare-and-swap PUTs (the inbox, the privacy journal): prove the
     // backend honours them, or refuse to start. Never run for sync (the default).
-    if (settings.admission) await assertConditionalWrites(store, conditionalWriteProbeKey(settings.keyRoot));
+    await admissionStartupGate(settings, store);
     const verify = relaycontrolIngestIdentity(settings, selfhostIntrospector(settings, env));
     return selfhostIngestRuntime(settings, {
       run,
