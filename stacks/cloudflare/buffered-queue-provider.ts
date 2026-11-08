@@ -7,7 +7,7 @@ import * as queues from "@distilled.cloud/cloudflare/queues";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
-import { ADMISSION_DLQ, ADMISSION_QUEUE, FANOUT_QUEUE, FANOUT_DLQ } from "./session-ingest.ts";
+import { ADMISSION_DLQ, ADMISSION_QUEUE, ADMISSION_RETENTION_SECONDS, FANOUT_QUEUE, FANOUT_DLQ } from "./session-ingest.ts";
 export class BufferedQueueRefusal extends Error {
   constructor(readonly code: string) {
     super("buffered queue refused: " + code);
@@ -32,6 +32,8 @@ export interface BufferedQueueApi {
     queueId: string,
   ): Effect.Effect<QueueObserved, any, any>;
   pause(accountId: string, queueId: string): Effect.Effect<unknown, any, any>;
+  /** Admission queues only: exactly `{ settings: { message_retention_period: ADMISSION_RETENTION_SECONDS } }`, never a pause. */
+  retain(accountId: string, queueId: string): Effect.Effect<unknown, any, any>;
 }
 const id = (v: unknown): v is string =>
   typeof v === "string" && /^[0-9a-f]{32}$/u.test(v);
@@ -101,6 +103,16 @@ export function pausedQueueService(
       if (input.output && input.output.queueId !== result.queueId) no("owned_queue_changed");
       const observed = exact(yield* bounded(api.get(result.accountId, result.queueId)), result.queueId, name);
       if (!input.output && (observed.consumersTotalCount !== 0 || observed.producersTotalCount !== 0)) no("initial_queue_not_empty");
+      // Never paused: an observed pause refuses (nothing here can resume it, and nothing here pauses).
+      if (observed.settings?.deliveryPaused === true) no("admission_queue_paused");
+      // Retention: the Cloudflare maximum, pinned and read back. Idempotent: no PATCH when it already holds.
+      if (observed.settings?.messageRetentionPeriod !== ADMISSION_RETENTION_SECONDS) {
+        yield* bounded(api.retain(result.accountId, result.queueId));
+        const final = exact(yield* bounded(api.get(result.accountId, result.queueId)), result.queueId, name);
+        if (final.settings?.messageRetentionPeriod !== ADMISSION_RETENTION_SECONDS) no("retention_not_observed");
+        if (final.settings?.deliveryPaused === true) no("admission_queue_paused");
+        if (!input.output && (final.consumersTotalCount !== 0 || final.producersTotalCount !== 0)) no("initial_queue_not_empty");
+      }
       return result;
     }),
   };
@@ -219,6 +231,12 @@ export const liveBufferedQueueApi: BufferedQueueApi = {
       accountId,
       queueId,
       settings: { deliveryPaused: true },
+    }),
+  retain: (accountId, queueId) =>
+    queues.patchQueue({
+      accountId,
+      queueId,
+      settings: { messageRetentionPeriod: ADMISSION_RETENTION_SECONDS },
     }),
 };
 /** Overrides only the live Queue registration; Worker/Consumer stay official. */

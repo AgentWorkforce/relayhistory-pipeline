@@ -7,14 +7,17 @@
 import { test, expect } from "bun:test";
 import * as Effect from "effect/Effect";
 import { guardOperatorFetch } from "../../../scripts/private-ingest-operator.ts";
-import { pausedQueueService } from "../buffered-queue-provider.ts";
-import { ADMISSION_DLQ, ADMISSION_QUEUE, FANOUT_DLQ, FANOUT_QUEUE, SESSION_INGEST_WORKER } from "../session-ingest.ts";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
+import * as Redacted from "effect/Redacted";
+import { Credentials, apiTokenCredentials } from "@distilled.cloud/cloudflare/Credentials";
+import { liveBufferedQueueApi, pausedQueueService } from "../buffered-queue-provider.ts";
+import { ADMISSION_DLQ, ADMISSION_QUEUE, ADMISSION_RETENTION_SECONDS, FANOUT_DLQ, FANOUT_QUEUE, SESSION_INGEST_WORKER } from "../session-ingest.ts";
 
 const account = "a".repeat(32), qid = "b".repeat(32);
 
 function admissionFixture(mode = "ok") {
   const order: string[] = [];
-  let created = false;
+  let created = false, retention: number | undefined = mode === "retained" ? ADMISSION_RETENTION_SECONDS : undefined;
   const value = (name: string) => ({ accountId: account, queueId: qid, queueName: name });
   const base = {
     version: 0,
@@ -25,28 +28,68 @@ function admissionFixture(mode = "ok") {
   };
   const api = {
     list: () => Effect.sync(() => (mode === "unowned" ? [{ queueId: "f".repeat(32), queueName: ADMISSION_QUEUE, consumersTotalCount: 0, producersTotalCount: 0 }] : [])),
-    get: () => Effect.sync(() => { order.push("read"); return { queueId: qid, queueName: ADMISSION_QUEUE, settings: {}, consumersTotalCount: mode === "busy" ? 1 : 0, producersTotalCount: 0 }; }),
+    get: () => Effect.sync(() => {
+      order.push("read");
+      return { queueId: qid, queueName: ADMISSION_QUEUE, settings: { messageRetentionPeriod: retention, ...(mode === "paused" ? { deliveryPaused: true } : {}) },
+        consumersTotalCount: mode === "busy" ? 1 : 0, producersTotalCount: 0 };
+    }),
     pause: () => Effect.sync(() => { order.push("pause"); }),
+    retain: () => Effect.sync(() => { order.push("retain"); if (mode === "ignored") return; retention = mode === "wrong" ? 345600 : ADMISSION_RETENTION_SECONDS; }),
   };
   return { order, service: pausedQueueService(base, api as never, account) as any };
 }
 const admissionRequest = { id: "session-ingest-admission", news: { name: ADMISSION_QUEUE } };
 
-test("admission queue: official lifecycle, never paused, ownership refusals kept", async () => {
+test("admission queue: official create, then retention PATCHed and read back; never paused; ownership refusals kept", async () => {
   const x = admissionFixture();
   const row = await Effect.runPromise(x.service.reconcile(admissionRequest));
   expect(row).toEqual({ accountId: account, queueId: qid, queueName: ADMISSION_QUEUE });
-  expect(x.order).toEqual(["create", "read"]);
+  expect(x.order).toEqual(["create", "read", "retain", "read"]);
   await Effect.runPromise(x.service.diff(admissionRequest));
   expect(x.order).toContain("base-diff:session-ingest-admission");
   expect(await Effect.runPromise(x.service.read({ id: "session-ingest-admission" }))).toEqual(row);
   expect(x.order).not.toContain("pause");
-  for (const mode of ["unowned", "busy"]) {
+  // Idempotent: retention already pinned, so no PATCH.
+  const held = admissionFixture("retained");
+  await Effect.runPromise(held.service.reconcile(admissionRequest));
+  expect(held.order).toEqual(["create", "read"]);
+  for (const mode of ["unowned", "busy", "paused", "ignored", "wrong"]) {
     const y = admissionFixture(mode);
     await expect(Effect.runPromise(y.service.reconcile(admissionRequest))).rejects.toThrow();
     expect(y.order).not.toContain("pause");
     if (mode === "unowned") expect(y.order).toEqual([]);
   }
+  await expect(Effect.runPromise(admissionFixture("ignored").service.reconcile(admissionRequest))).rejects.toThrow("retention_not_observed");
+  await expect(Effect.runPromise(admissionFixture("paused").service.reconcile(admissionRequest))).rejects.toThrow("admission_queue_paused");
+});
+
+test("real pinned SDK: admission create -> PATCH exactly the retention -> GET readback, through the operator guard", async () => {
+  const secrets = { accountId: account, apiToken: "synthetic-api-token", stateUrl: "https://alchemy-state-store-96bulls.fixture.workers.dev", stateToken: "synthetic-state-token" };
+  let retention: number | undefined;
+  const order: string[] = [];
+  const transport: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const u = new URL(String(input)), method = init?.method ?? "GET";
+    order.push(method);
+    const result = () => ({ queue_id: qid, queue_name: ADMISSION_QUEUE, settings: { delivery_paused: false, ...(retention ? { message_retention_period: retention } : {}) }, consumers_total_count: 0, producers_total_count: 0 });
+    if (method === "GET" && u.pathname.endsWith("/queues")) return Response.json({ success: true, result: [], result_info: { page: 1, per_page: 100, count: 0, total_count: 0 } });
+    if (method === "PATCH") {
+      expect(await new Response(init?.body).json()).toEqual({ settings: { message_retention_period: ADMISSION_RETENTION_SECONDS } });
+      retention = ADMISSION_RETENTION_SECONDS;
+    }
+    return Response.json({ success: true, result: result() });
+  }) as typeof fetch;
+  // The retained operator's guard sits in front of the SDK, as in a real deploy.
+  const guarded = guardOperatorFetch(secrets, "deploy", transport, "buffered", true);
+  await guarded("https://api.cloudflare.com/client/v4/accounts/" + account + "/queues/" + qid); // observe the owned id
+  const base = { version: 0, reconcile: () => Effect.succeed({ accountId: account, queueId: qid, queueName: ADMISSION_QUEUE }) };
+  const service = pausedQueueService(base, liveBufferedQueueApi, account) as any;
+  await Effect.runPromise(service.reconcile(admissionRequest).pipe(
+    Effect.provideService(Credentials, Effect.succeed(apiTokenCredentials({ apiToken: Redacted.make("synthetic-token-not-authorized") }))),
+    Effect.provide(FetchHttpClient.layer),
+    Effect.provideService(FetchHttpClient.Fetch, guarded),
+  ));
+  expect(retention).toBe(ADMISSION_RETENTION_SECONDS);
+  expect(order).toEqual(["GET", "GET", "GET", "PATCH", "GET"]);
 });
 
 test("admission queue: any pause prop, a wrong name or a fanout name refuses; fanout stays paused-only; delete forbidden", async () => {
@@ -88,11 +131,24 @@ test("operator: admission calls only with a buffered asyncAdmission capture; nev
   await expect(withAdmission(root + "/" + aid + "/consumers", consumer(FANOUT_DLQ))).rejects.toThrow("consumer_scope");
   await expect(withAdmission(root + "/" + fid + "/consumers", consumer(ADMISSION_DLQ))).rejects.toThrow("consumer_scope");
   await withAdmission(root + "/" + fid + "/consumers", consumer(FANOUT_DLQ));
-  // An admission queue is never PATCHed (paused or not); the fanout pause stays true-only.
+  // An admission queue is never paused (true or false); the fanout pause stays true-only.
   for (const settings of [{ delivery_paused: true }, { delivery_paused: false }])
-    await expect(withAdmission(root + "/" + aid, { method: "PATCH", body: JSON.stringify({ settings }) })).rejects.toThrow("queue_pause_scope");
+    await expect(withAdmission(root + "/" + aid, { method: "PATCH", body: JSON.stringify({ settings }) })).rejects.toThrow("queue_retention_scope");
   await expect(withAdmission(root + "/" + fid, { method: "PATCH", body: JSON.stringify({ settings: { delivery_paused: false } }) })).rejects.toThrow("queue_pause_scope");
   await withAdmission(root + "/" + fid, { method: "PATCH", body: JSON.stringify({ settings: { delivery_paused: true } }) });
   await expect(withAdmission(root, post("some-other-queue"))).rejects.toThrow("queue_scope");
-  expect(calls.filter((c) => c.startsWith("PATCH"))).toEqual(["PATCH queues/" + fid]);
+  // Retention: exactly the pinned body on an admission queue, nothing else, nowhere else.
+  const retain = { settings: { message_retention_period: ADMISSION_RETENTION_SECONDS } };
+  await withAdmission(root + "/" + aid, { method: "PATCH", body: JSON.stringify(retain) });
+  for (const body of [
+    { settings: { message_retention_period: 345600 } },
+    { settings: { message_retention_period: ADMISSION_RETENTION_SECONDS, delivery_paused: false } },
+    { settings: { message_retention_period: ADMISSION_RETENTION_SECONDS }, queue_name: ADMISSION_QUEUE },
+    { settings: { message_retention_period: String(ADMISSION_RETENTION_SECONDS) } },
+    { settings: {} },
+  ])
+    await expect(withAdmission(root + "/" + aid, { method: "PATCH", body: JSON.stringify(body) })).rejects.toThrow("queue_retention_scope");
+  await expect(withAdmission(root + "/" + fid, { method: "PATCH", body: JSON.stringify(retain) })).rejects.toThrow("queue_pause_scope");
+  await expect(plain(root + "/" + aid, { method: "PATCH", body: JSON.stringify(retain) })).rejects.toThrow();
+  expect(calls.filter((c) => c.startsWith("PATCH"))).toEqual(["PATCH queues/" + fid, "PATCH queues/" + aid]);
 });

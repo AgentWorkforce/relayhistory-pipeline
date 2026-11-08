@@ -51,6 +51,7 @@ import {
   FANOUT_DLQ,
   ADMISSION_QUEUE,
   ADMISSION_DLQ,
+  ADMISSION_RETENTION_SECONDS,
   sessionIngestResources,
   admissionConsumerSettings,
   S3_ACCESS_KEY_SECRET,
@@ -490,9 +491,22 @@ export function guardOperatorFetch(
           b.dead_letter_queue !== dlq
         )
           refuse("consumer_scope");
+      } else if (
+        method === "PATCH" &&
+        asyncAdmission &&
+        [ADMISSION_QUEUE, ADMISSION_DLQ].includes(queueIds.get(q[1]!)!)
+      ) {
+        // Admission queues: only the pinned retention, byte-exact. Never a pause, never anything else.
+        if (
+          JSON.stringify(b) !==
+          JSON.stringify({
+            settings: { message_retention_period: ADMISSION_RETENTION_SECONDS },
+          })
+        )
+          refuse("queue_retention_scope");
       } else if (method === "PATCH") {
         if (acceptanceMode !== "buffered") refuse("queue_pause_scope");
-        // Only the fanout queues are ever paused; an admission queue is never PATCHed.
+        // Only the fanout queues are ever paused; an admission queue is never paused.
         if (![FANOUT_QUEUE, FANOUT_DLQ].includes(queueIds.get(q[1]!)!))
           refuse("queue_pause_scope");
         if (

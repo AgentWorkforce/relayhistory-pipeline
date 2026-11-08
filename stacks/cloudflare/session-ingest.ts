@@ -66,6 +66,12 @@ export const ADMISSION_BATCH_SIZE = 1;
 export const ADMISSION_MAX_RETRIES = 20;
 /** The admission consumer's database budget: concurrent claims, not uploads. */
 export const ADMISSION_MAX_CONCURRENCY = 4;
+/**
+ * Message retention on BOTH admission queues: Cloudflare's maximum (14 days). An acknowledged upload's
+ * message, and its DLQ record, must outlive an operator redrive window. Alchemy's Queue cannot express
+ * it, so the buffered Queue provider PATCHes exactly this value after create and requires the readback.
+ */
+export const ADMISSION_RETENTION_SECONDS = 1209600;
 /** Secrets Store secret names (values created out of band from 1Password). */
 export const S3_ACCESS_KEY_SECRET = "96bulls-session-ingest-s3-access-key-id";
 export const S3_SECRET_KEY_SECRET = "96bulls-session-ingest-s3-secret-access-key";
