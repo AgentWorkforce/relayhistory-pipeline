@@ -7,7 +7,8 @@
     ],
     "sessions.applied_repo_evidence(jsonb,jsonb)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.auth_session_resolve(text,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
@@ -115,7 +116,8 @@
     ],
     "sessions.canonical_remote(text)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.capture_session_replay_pages(text,text,text,text)": [
       "<owner>:EXECUTE",
@@ -142,7 +144,8 @@
     ],
     "sessions.clean_root_commit(text)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.commit_search_feature_copy(text,text,uuid,bigint,text,jsonb,timestamp with time zone)": [
       "<owner>:EXECUTE",
@@ -744,7 +747,8 @@
     ],
     "sessions.legacy_remote(text)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.list_session_directory(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)": [
       "<owner>:EXECUTE",
@@ -760,7 +764,8 @@
     ],
     "sessions.lock_repo_catalog(text)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.member_of(text,text[])": [
       "<owner>:EXECUTE",
@@ -821,7 +826,8 @@
     "sessions.repo_live(text,uuid)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE",
-      "authenticated:EXECUTE"
+      "authenticated:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.repo_visibility_ids(text,uuid)": [
       "<owner>:EXECUTE",
@@ -838,7 +844,8 @@
     ],
     "sessions.resolve_repo(text,text,text,timestamp with time zone)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.retry_session_brief_documents(uuid,text)": [
       "<owner>:EXECUTE",
@@ -979,7 +986,8 @@
     ],
     "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.session_directory_tombstone_clears_catalog()": [
       "<owner>:EXECUTE"
@@ -1036,7 +1044,8 @@
     ],
     "sessions.session_index_batch(jsonb)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.session_index_scrub_sticky()": [
       "<owner>:EXECUTE",
@@ -1044,11 +1053,13 @@
     ],
     "sessions.session_publication_is_managed(text,text,text,text,text)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.session_publication_lock(jsonb)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.session_publication_probe(jsonb)": [
       "<owner>:EXECUTE",
@@ -1087,7 +1098,8 @@
     ],
     "sessions.upsert_session_index(jsonb)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ]
   }
 }

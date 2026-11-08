@@ -1281,7 +1281,8 @@ describe("per-step catalog sentinels", () => {
       readFileSync(
         join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
-      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
+      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8") +
+        "\n" + readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8"),
     );
     for (let i = 0; i <= upTo; i++)
       await db.exec(readFileSync(steps[i]!.path, "utf8"));
@@ -1338,7 +1339,8 @@ describe("per-step catalog sentinels", () => {
       readFileSync(
         join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
-      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
+      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8") +
+        "\n" + readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8"),
     );
     for (const st of steps) {
       expect(await sentinel(db, st.name), `${st.name} before`).toBe(false);
@@ -1456,7 +1458,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       readFileSync(
         join(root, "supabase/bootstrap/session_ingest_roles.sql"),
         "utf8",
-      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8"),
+      ) + "\n" + readFileSync(join(root, "supabase/bootstrap/session_read_api_roles.sql"), "utf8") +
+        "\n" + readFileSync(join(root, "supabase/bootstrap/session_consumer_roles.sql"), "utf8"),
     );
     await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
     return db;
@@ -1681,7 +1684,21 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 043800 (staged-ACK clock NO KEY UPDATE) is the latest: 043700 and 043500 refuse (55000) while it is
+    // 20261108000000 (consumer function grants) is the latest: 043800 refuses (55000)
+    // while it is applied; its own down revokes the twelve search_consumer_runtime
+    // EXECUTEs and marks the validation pending.
+    const W = "upstream:20261108000000_session_consumer_function_grants.sql";
+    const writerGrants = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'")).rows[0]!.n;
+    expect(await names()).toContain(W);
+    expect(await writerGrants()).toBe(12);
+    expect((await failure(rollback("20261105043800_lazy_ack_clock_no_key_update.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(Q);
+    await rollback("20261108000000_session_consumer_function_grants.down.sql");
+    expect(await names()).not.toContain(W);
+    expect(await writerGrants()).toBe(0);
+    expect(await passed()).toBe(false);
+    // 043800 (staged-ACK clock NO KEY UPDATE) is then the latest: 043700 and 043500 refuse (55000) while it is
     // applied; its own down restores the exact 043500 ACK body (clock FOR UPDATE) and marks the validation pending.
     const lazyAck = async () =>
       (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0]!.s;
@@ -2006,10 +2023,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'search_consumer_runtime')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(12);
+    expect(targets.rows).toHaveLength(13);
     expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
     const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
     const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);
@@ -2603,6 +2620,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
             "utf8",
           ),
         );
+        await db.exec(
+          readFileSync(
+            join(
+              root,
+              "supabase/bootstrap/session_consumer_roles.sql",
+            ),
+            "utf8",
+          ),
+        );
         await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
         await db.exec(
           readFileSync(
@@ -2653,6 +2679,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               join(
                 root,
                 "supabase/bootstrap/session_read_api_roles.sql",
+              ),
+              "utf8",
+            ),
+          );
+          await db.exec(
+            readFileSync(
+              join(
+                root,
+                "supabase/bootstrap/session_consumer_roles.sql",
               ),
               "utf8",
             ),

@@ -10,9 +10,10 @@
 -- service_role cannot be created at all without BYPASSRLS.
 -- https://www.postgresql.org/docs/17/role-attributes.html
 --
--- Use a disposable CREATEROLE trampoline instead: it creates the twelve fixed NOLOGIN
+-- Use a disposable CREATEROLE trampoline instead: it creates the thirteen fixed NOLOGIN
 -- roles, the same set as cloudsql_migration_roles.sql (ingest, canonical producer,
--- project-events and read API included; their migrations only verify roles), then the migration owner drops the trampoline. DROP ROLE removes the
+-- project-events, read API and session-pipeline consumer runtime included; their
+-- migrations only verify roles), then the migration owner drops the trampoline. DROP ROLE removes the
 -- trampoline's automatic memberships, leaving every target membership-free, so the
 -- existing strict verifiers and historical migration guards pass unchanged. The
 -- trampoline and every target are created in this one transaction, so any refusal rolls
@@ -77,7 +78,8 @@ BEGIN
     'bulls96_read_api'::name,
     'bulls96_project_events'::name,
     'bulls96_privacy_eraser'::name,
-    'bulls96_babysitter_retention'::name
+    'bulls96_babysitter_retention'::name,
+    'search_consumer_runtime'::name
   ] LOOP
     SELECT * INTO v_row FROM pg_roles WHERE rolname = v_role;
     IF NOT FOUND THEN
@@ -174,6 +176,10 @@ BEGIN
       CREATE ROLE bulls96_babysitter_retention
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'search_consumer_runtime') THEN
+      CREATE ROLE search_consumer_runtime
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
     RESET ROLE;
     DROP ROLE bulls96_rds_role_seed;
   END IF;
@@ -188,7 +194,8 @@ BEGIN
        'session_token_verifier',
        'bulls96_session_ingest', 'bulls96_session_ingest_seeder',
        'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events',
-       'bulls96_privacy_eraser', 'bulls96_babysitter_retention'
+       'bulls96_privacy_eraser', 'bulls96_babysitter_retention',
+       'search_consumer_runtime'
      )
   ) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',

@@ -172,6 +172,10 @@ BEGIN
         ('sessions.session_directory_users', 'UPDATE'), ('sessions.session_directory_users', 'DELETE'),
         ('sessions.session_directory_machines', 'SELECT'), ('sessions.session_directory_machines', 'INSERT'),
         ('sessions.session_directory_machines', 'UPDATE'), ('sessions.session_directory_machines', 'DELETE'),
+        ('sessions.session_directory_agents', 'SELECT'), ('sessions.session_directory_agents', 'INSERT'),
+        ('sessions.session_directory_agents', 'UPDATE'), ('sessions.session_directory_agents', 'DELETE'),
+        ('sessions.session_directory_relationships', 'SELECT'), ('sessions.session_directory_relationships', 'INSERT'),
+        ('sessions.session_directory_relationships', 'UPDATE'), ('sessions.session_directory_relationships', 'DELETE'),
         ('sessions.session_briefs', 'SELECT'),
         ('sessions.repos', 'SELECT'), ('sessions.repos', 'INSERT'), ('sessions.repos', 'UPDATE'),
         ('sessions.repo_names', 'SELECT'), ('sessions.repo_names', 'INSERT'), ('sessions.repo_names', 'UPDATE'),
@@ -179,6 +183,8 @@ BEGIN
         ('sessions.session_directory_event_pending', 'UPDATE'),
         ('sessions.session_directory_event_times', 'SELECT'), ('sessions.session_directory_event_times', 'INSERT'),
         ('sessions.session_directory_event_times', 'DELETE'),
+        ('sessions.session_directory_resurrection_fences', 'SELECT'),
+        ('sessions.pipeline_jobs', 'INSERT'),
         ('sessions.__96bulls_migrations', 'SELECT'), ('sessions.__96bulls_role_validation', 'SELECT'),
         ('search_index.transcript_events', 'SELECT'), ('search_index.transcript_events', 'INSERT'),
         ('search_index.transcript_events', 'UPDATE'), ('search_index.transcript_events', 'DELETE'),
@@ -191,11 +197,15 @@ BEGIN
         ('sessions.upsert_session_index(jsonb)', 'EXECUTE'),
         ('sessions.session_index_batch(jsonb)', 'EXECUTE'),
         ('sessions.session_publication_is_managed(text,text,text,text,text)', 'EXECUTE'),
+        ('sessions.session_publication_lock(jsonb)', 'EXECUTE'),
         ('sessions.applied_repo_evidence(jsonb,jsonb)', 'EXECUTE'),
         ('sessions.canonical_remote(text)', 'EXECUTE'),
         ('sessions.clean_root_commit(text)', 'EXECUTE'),
         ('sessions.lock_repo_catalog(text)', 'EXECUTE'),
-        ('sessions.resolve_repo(text,text,text,timestamp with time zone)', 'EXECUTE')
+        ('sessions.resolve_repo(text,text,text,timestamp with time zone)', 'EXECUTE'),
+        ('sessions.repo_live(text,uuid)', 'EXECUTE'),
+        ('sessions.legacy_remote(text)', 'EXECUTE'),
+        ('sessions.session_directory_search_text(text,text,text,text,text,text,text,text)', 'EXECUTE')
     )
     -- held.grantee is a role name (or 'PUBLIC' for grantee 0): the writer's
     -- own rows must all be allowlisted, and any PUBLIC row in its schemas is
@@ -234,20 +244,23 @@ BEGIN
 
   -- Named function execution only: the allowlisted pointer functions plus the
   -- repo-catalog helpers the pointer upsert calls as the writer. The
-  -- publication guard is SECURITY DEFINER and the writer must call it, so it
-  -- is allowlisted exactly; no other SECURITY DEFINER function may execute.
+  -- publication guard and its lock are SECURITY DEFINER and the writer must
+  -- call both (every pointer upsert runs through withPublicationAuthority),
+  -- so they are allowlisted exactly; no other SECURITY DEFINER function may
+  -- execute.
   FOR v_bad IN
     SELECT p.oid::regprocedure::text FROM pg_proc p
     WHERE p.pronamespace = to_regnamespace('sessions')
-      AND p.proname IN ('session_index_batch', 'session_publication_is_managed', 'upsert_session_index',
-        'applied_repo_evidence', 'canonical_remote', 'clean_root_commit', 'lock_repo_catalog', 'resolve_repo')
+      AND p.proname IN ('session_index_batch', 'session_publication_is_managed', 'session_publication_lock', 'upsert_session_index',
+        'applied_repo_evidence', 'canonical_remote', 'clean_root_commit', 'lock_repo_catalog', 'resolve_repo', 'session_directory_search_text',
+        'repo_live', 'legacy_remote')
       AND NOT has_function_privilege(v_role, p.oid, 'EXECUTE')
   LOOP
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: missing EXECUTE on %s', v_role, v_bad);
   END LOOP;
   SELECT p.oid::regprocedure::text INTO v_bad FROM pg_proc p
     WHERE p.pronamespace IN (to_regnamespace('sessions'), to_regnamespace('search_index')) AND p.prosecdef
-      AND p.proname <> 'session_publication_is_managed'
+      AND p.proname NOT IN ('session_publication_is_managed', 'session_publication_lock')
       AND has_function_privilege(v_role, p.oid, 'EXECUTE') LIMIT 1;
   IF FOUND THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: executes SECURITY DEFINER %s', v_role, v_bad);
@@ -259,8 +272,11 @@ BEGIN
   FOR v_bad IN
     SELECT format('%s.%s', n.nspname, c.relname) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = 'sessions' AND c.relname IN ('session_index', 'session_index_ext', 'session_directory',
-        'session_directory_users', 'session_directory_machines', 'session_briefs',
+        'session_directory_users', 'session_directory_machines',
+        'session_directory_agents', 'session_directory_relationships', 'session_briefs',
         'session_directory_event_pending', 'session_directory_event_times',
+        'session_directory_resurrection_fences',
+        'pipeline_jobs',
         'repos', 'repo_names',
         'search_consumer_pending', 'search_consumer_progress')
   LOOP

@@ -928,26 +928,22 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
     expect(() => refuseStartupOptions("postgres://writer:secret@db:5432/hoop")).not.toThrow();
   });
 
-  test("the tenant gate refuses boot unless both search tables carry exactly tenant_only", async () => {
+  test("the tenant gate activates on the composed bootstrap and refuses a disabled or widened gate", async () => {
     const { pg } = await installed();
     try {
       await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
       const db = asDb(pg);
+      // P1-a activation: the composed ensureSchema provisions exactly
+      // tenant_only with forced RLS on both search tables, so the gate
+      // passes with no staging. (pg_policies is visible to the writer
+      // through its table grants: this also proves the gate can read its
+      // own catalog.)
       await pg.exec(`SET ROLE search_consumer_runtime`);
-      // transcript_events has no policies at all in this tree (pre-#330) and
-      // projection_state carries tenant_only: the gate refuses, because an
-      // ungated search table would tick unscoped. (pg_policies is visible
-      // to the writer through its table grants: this also proves the gate
-      // can read its own catalog.)
-      await expect(assertSearchTenantGate(db)).rejects.toThrow("search_index.transcript_events");
+      await assertSearchTenantGate(db);
       await pg.exec(`RESET ROLE`);
-      // transcript_events gains its forced gate with #330; stage the exact
-      // shape here so the rest of the test proves the gate, not the absence.
-      await pg.exec(`CREATE POLICY tenant_only ON search_index.transcript_events AS PERMISSIVE FOR ALL TO PUBLIC
-        USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))
-        WITH CHECK (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))`);
       // A tenant_only-shaped policy without enforced row security is a gate
       // billboard, not a gate: refuse until RLS is enabled and forced.
+      await pg.exec(`ALTER TABLE search_index.transcript_events DISABLE ROW LEVEL SECURITY`);
       await expect(assertSearchTenantGate(db)).rejects.toThrow("row security not enforced");
       await pg.exec(`ALTER TABLE search_index.transcript_events ENABLE ROW LEVEL SECURITY`);
       await pg.exec(`ALTER TABLE search_index.transcript_events FORCE ROW LEVEL SECURITY`);

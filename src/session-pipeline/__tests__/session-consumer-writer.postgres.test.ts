@@ -19,18 +19,50 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
+import { zstdCompressSync } from "node:zlib";
 import pg from "pg";
+import { createFsStore } from "../../../packages/object-store/src/fs.ts";
+import { sha256Hex } from "../../../packages/object-store/src/crypto.ts";
 import { composeSearchService } from "../../shared/search-composition.ts";
 import { postgresSearchState } from "../postgres-search-state.ts";
 import { writerTransactionSql } from "../transaction-sql.ts";
 import { sessionsFunctionAclPreview } from "../../hoopdb/migrate-guards.ts";
 import {
   assertRuntimeIdentity,
+  assertSearchTenantGate,
+  collectFreshnessSend,
+  makeDedupe,
   reconcileTombstonedScopes,
+  runConsumerTick,
   writerComposition,
+  writerTenantRunner,
+  MAX_PENDING_ROWS,
 } from "../consumer-service.ts";
+import { processBatch } from "../consumer.ts";
+import { droppedFanout, scopeLockKey, type PointerDeps, type ScopeLock, type SessionScope } from "../pointer.ts";
+import type { SearchIndexDeps } from "../search-index.ts";
+import { reconcileRecent, transaction } from "../lambda.ts";
+import { inTransaction, type HoopDb } from "../../shared/db.ts";
+import { expectedSchema } from "../../hoopdb/migrate.ts";
+import { composeSearchService } from "../../shared/search-composition.ts";
+import {
+  computeContentSha256,
+  manifestKey,
+  objectKey,
+  objectStoreManifestReader,
+  prefixAllowed,
+  prefixOrgResolver,
+  rawChunkKey,
+  type ChunkEntry,
+  type ManifestV1,
+  type ObjectStore,
+  type RelayhistoryStreamRecord,
+  type SessionLocation,
+} from "../../shared/vendor.ts";
 import type { TenantRunner } from "../../session-read-api/liveness.ts";
 import {
   bootstrapCheckOwner,
@@ -86,6 +118,9 @@ const BASE_ROLE_FILES = [
   "supabase/bootstrap/session_token_verifier.sql",
   "supabase/bootstrap/session_ingest_roles.sql",
   "supabase/bootstrap/session_read_api_roles.sql",
+  // Mirrors migrate's bootstrap-before-schema order: the consumer grant
+  // migration needs the bare role to exist (migrations never create roles).
+  "supabase/bootstrap/session_consumer_roles.sql",
 ];
 
 async function ensureProvisioned(pool: pg.Pool): Promise<void> {
@@ -201,7 +236,8 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
     for (const table of [
       "session_index", "session_index_ext", "session_directory", "session_directory_users",
       "session_directory_machines", "session_briefs", "session_directory_event_pending",
-      "session_directory_event_times", "repos", "repo_names",
+      "session_directory_event_times", "session_directory_agents", "session_directory_relationships",
+      "session_directory_resurrection_fences", "pipeline_jobs", "repos", "repo_names",
     ])
       await client.query(`DROP POLICY IF EXISTS search_consumer_trusted ON sessions.${table}`);
     await client.query(`REVOKE ALL ON SCHEMA sessions, search_index FROM search_consumer_runtime`);
@@ -368,11 +404,15 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
         [BACKEND, ORG],
       ),
     );
-    await admin.query(
-      `INSERT INTO search_index.transcript_events(org_id,workspace_id,ts_ms,session_id,source,machine_id,kind,event_id,type,user_id,actor_name,actor_role,subagent_id,project_id,task_title,task_ref,task_ref_id,tags,files_touched,tool_name,tool_status,delivery_record_id,content,content_bytes,content_prefix_folded,task_title_folded,fingerprint,version)
-       VALUES($1,'w',1,'wdead','h','m','message','e1','user','u','user','r','','','t','ref','ref1','{}','{}','','','', 'x',1,'x','t','fp',1)
-       ON CONFLICT DO NOTHING`,
-      [ORG],
+    // Forced tenant_only RLS binds the owner too: the transcript seed goes
+    // through the writer with the tenant GUCs, like every production write.
+    await writerRun(ORG, "w", (tx) =>
+      tx.query(
+        `INSERT INTO search_index.transcript_events(org_id,workspace_id,ts_ms,session_id,source,machine_id,kind,event_id,type,user_id,actor_name,actor_role,subagent_id,project_id,task_title,task_ref,task_ref_id,tags,files_touched,tool_name,tool_status,delivery_record_id,content,content_bytes,content_prefix_folded,task_title_folded,fingerprint,version)
+         VALUES($1,'w',1,'wdead','h','m','message','e1','user','u','user','r','','','t','ref','ref1','{}','{}','','','', 'x',1,'x','t','fp',1)
+         ON CONFLICT DO NOTHING`,
+        [ORG],
+      ),
     );
   });
 
@@ -490,7 +530,12 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
     }
   }, 120_000);
 
-  test("writer executes exactly the eight pointer functions, nothing else in sessions", async () => {
+  test("writer executes exactly the twelve composed-path functions, nothing else in sessions", async () => {
+    // The closed call-graph of the production tick (pointer upsert through
+    // the publication-authority retry, directory projection, repo catalog):
+    // the e2e proves the writer 42501s without any one of these, and the
+    // static closure in the merge notes proves no other sessions function is
+    // reachable.
     const fns = await wpool.query<{ fn: string }>(
       `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p
        WHERE p.pronamespace = to_regnamespace('sessions')
@@ -501,34 +546,29 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
       "sessions.applied_repo_evidence(jsonb,jsonb)",
       "sessions.canonical_remote(text)",
       "sessions.clean_root_commit(text)",
+      "sessions.legacy_remote(text)",
       "sessions.lock_repo_catalog(text)",
+      "sessions.repo_live(text,uuid)",
       "sessions.resolve_repo(text,text,text,timestamp with time zone)",
+      "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)",
       "sessions.session_index_batch(jsonb)",
       "sessions.session_publication_is_managed(text,text,text,text,text)",
+      "sessions.session_publication_lock(jsonb)",
       "sessions.upsert_session_index(jsonb)",
     ]);
   }, 120_000);
 
-  test("function ACL drift is exactly the eight consumer EXECUTE grants", async () => {
-    // Blast-radius receipt for the boundary workstream: these EXECUTE grants
-    // sit outside the migrator's function-ACL manifest (B2), so the receipt
-    // pins that the drift is exactly these eight and nothing else. Missing
-    // runtime grants are installed by migrate itself, not by this bootstrap.
+  test("function ACL drift is zero: the twelve consumer grants are manifest-authorized", async () => {
+    // B2 receipt: the twelve EXECUTE grants now sit inside the migrator's
+    // function-ACL manifest (installed by the grant migration on every
+    // migrate), so the boundary preview must report no extras. Any new
+    // writer grant outside the manifest fails here. Missing runtime grants
+    // are installed by migrate itself, not by this bootstrap, so only
+    // extras are pinned.
     const client = await admin.connect();
     try {
       const preview = await sessionsFunctionAclPreview(asSql(client), "service_role", true);
-      expect(preview.function_acl_drift_extra.sort()).toEqual(
-        [
-          "sessions.applied_repo_evidence(jsonb,jsonb)",
-          "sessions.canonical_remote(text)",
-          "sessions.clean_root_commit(text)",
-          "sessions.lock_repo_catalog(text)",
-          "sessions.resolve_repo(text,text,text,timestamp with time zone)",
-          "sessions.session_index_batch(jsonb)",
-          "sessions.session_publication_is_managed(text,text,text,text,text)",
-          "sessions.upsert_session_index(jsonb)",
-        ].map((fn) => `${fn}: search_consumer_runtime:EXECUTE`),
-      );
+      expect(preview.function_acl_drift_extra).toEqual([]);
     } finally {
       client.release();
     }
@@ -556,6 +596,7 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
       "search_index.transcript_events UPDATE",
       "sessions.__96bulls_migrations SELECT",
       "sessions.__96bulls_role_validation SELECT",
+      "sessions.pipeline_jobs INSERT",
       "sessions.repo_names INSERT",
       "sessions.repo_names SELECT",
       "sessions.repo_names UPDATE",
@@ -574,6 +615,10 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
       "sessions.session_directory INSERT",
       "sessions.session_directory SELECT",
       "sessions.session_directory UPDATE",
+      "sessions.session_directory_agents DELETE",
+      "sessions.session_directory_agents INSERT",
+      "sessions.session_directory_agents SELECT",
+      "sessions.session_directory_agents UPDATE",
       "sessions.session_directory_event_pending INSERT",
       "sessions.session_directory_event_pending SELECT",
       "sessions.session_directory_event_pending UPDATE",
@@ -584,6 +629,11 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
       "sessions.session_directory_machines INSERT",
       "sessions.session_directory_machines SELECT",
       "sessions.session_directory_machines UPDATE",
+      "sessions.session_directory_relationships DELETE",
+      "sessions.session_directory_relationships INSERT",
+      "sessions.session_directory_relationships SELECT",
+      "sessions.session_directory_relationships UPDATE",
+      "sessions.session_directory_resurrection_fences SELECT",
       "sessions.session_directory_users DELETE",
       "sessions.session_directory_users INSERT",
       "sessions.session_directory_users SELECT",
@@ -597,4 +647,175 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
       "sessions.session_index_ext UPDATE",
     ]);
   }, 120_000);
+
+  test("the serve-time gate activates on the composed bootstrap with no staging", async () => {
+    // P1-a activation: the composed ensureSchema provisions exactly
+    // tenant_only with forced RLS on both search tables, so the gate the
+    // service runs at startup passes here with nothing staged. The writer
+    // reads its own gate catalogs through its table grants. (The owner
+    // block's bootstrap already ran: this block logs in as its product.)
+    const client = await wpool.connect();
+    try {
+      await assertSearchTenantGate(asSql(client));
+    } finally {
+      client.release();
+    }
+  }, 120_000);
+
+  test("composed writer e2e: a reconcile body through processBatch lands the projection", async () => {
+    // This test runs LAST in the file (bun runs in file order): the sibling
+    // seeds (wlive/wdead) have already served the tests that need them, so
+    // their session state is cleared here to give the tick a pristine
+    // database. complete:true below is then genuine, not masked by harness
+    // dirt. If a later test needs the seeds, move this test after it.
+    await admin.query(`DELETE FROM sessions.session_index WHERE org_id=$1 AND session_id IN ('wlive','wdead')`, [ORG]);
+    await admin.query(`DELETE FROM search_index.projection_state WHERE backend_id=$1 AND session_id IN ('wlive','wdead')`, [BACKEND]);
+    // Serve-identical composition on the writer pool: the ledgered writer
+    // binding, the pass-scoped writer SQL, and the writer's own tenant
+    // runner (every tenant statement binds the GUCs as the runtime role).
+    const wdb: HoopDb = {
+      pool: wpool,
+      query: async (text, params) => ({ rows: (await wpool.query(text, params as never[])).rows as Record<string, unknown>[] }),
+      end: async () => {},
+    };
+    const writerSql = writerTransactionSql(wpool);
+    const tenantRunner = writerTenantRunner(wdb);
+    const binding = composeSearchService(
+      writerComposition(BACKEND, 0),
+      { env: { SEARCH_INDEX_BACKEND: "postgres", SEARCH_INDEX_POSTGRES_BACKEND_ID: BACKEND }, sql: writerSql.sql, secrets: {} },
+      "writer",
+      tenantRunner,
+    );
+    const expected = await expectedSchema();
+    // The operator step the lock requires: the worker bootstrap marked
+    // pass at this generation (runbooks/session-directory-search-worker-bootstrap.md).
+    // Without it every pointer lock fails "generation not ready", in
+    // production exactly as here.
+    await admin.query(
+      `INSERT INTO sessions.__96bulls_role_validation(name, generation, status) VALUES ('session_directory_search_worker', $1, 'pass')
+       ON CONFLICT (name) DO UPDATE SET generation = EXCLUDED.generation, status = 'pass', updated_at = now()`,
+      [expected.generation],
+    );
+    // The object-store driver is orthogonal (pipeline.test.ts proves the
+    // same indexSearchScope driver-independent on a file store); the
+    // composed Postgres path is what's under proof here.
+    const root = await mkdtemp(join(tmpdir(), "96bulls-consumer-e2e-"));
+    try {
+      const store: ObjectStore = createFsStore({ root });
+      const reader = objectStoreManifestReader(store, { provider: "s3", bucket: "b" });
+      const location: SessionLocation = {
+        prefix: "96bulls/pgtest", workspaceId: "w", machineId: "m", harness: "h", sessionId: "we2e", startDate: "2026-11-02",
+      };
+      const at = "2026-11-02T10:00:00.000Z";
+      const stream: RelayhistoryStreamRecord[] = [
+        {
+          kind: "session_event", origin_id: "desktop-origin", record_id: "e1", revision: "1",
+          operation: "upsert", received_at: at, payload: { ts_ms: Date.parse("2026-11-02T10:00:01Z"), text: "first", role: "assistant" },
+        },
+        {
+          kind: "session_event", origin_id: "desktop-origin", record_id: "e2", revision: "1",
+          operation: "upsert", received_at: at, payload: { ts_ms: Date.parse("2026-11-02T10:00:02Z"), text: "second", role: "assistant" },
+        },
+      ];
+      const source = new TextEncoder().encode(`${stream.map((r) => JSON.stringify(r)).join("\n")}\n`);
+      const stored = new Uint8Array(zstdCompressSync(source));
+      const sha = await sha256Hex(source);
+      const chunk: ChunkEntry = {
+        seq: 0, epoch: 0, start_offset: 0, bytes: source.byteLength, stored_bytes: stored.byteLength,
+        sha256: sha, sha256_8: sha.slice(0, 8), stored_sha256: await sha256Hex(stored),
+        stored_raw_bytes: source.byteLength, raw_sha256: sha, compression: "zstd", records: stream.length,
+      };
+      await store.put(rawChunkKey(location, chunk.seq, 0, sha, "ndjson"), stored, {});
+      const manifest: ManifestV1 = {
+        schema_v: 1, layout: "v1", trace_id: "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18", revision: 1,
+        created_at: at, updated_at: at,
+        session: { workspace_id: "w", machine_id: "m", harness: "h", session_id: "we2e", started_at: at },
+        writer: { delivery_instance_id: "m", plugin_version: "test" },
+        raw: {
+          owner: "m", state: "open", updated_at: at, format: "ndjson", compression: "zstd",
+          scrub: { ruleset: "relayhistory-scrub", version: 1 }, chunk_count: 1,
+          raw_bytes: chunk.bytes, stored_bytes: chunk.stored_bytes, content_sha256: await computeContentSha256([chunk]),
+          epoch: 0, epochs: [{ epoch: 0, opened_at: at, reason: "initial", first_seq: chunk.seq, opened_by: "m" }],
+          next_offset: source.byteLength, chunks: [chunk],
+        },
+        extensions: { "96bulls": { user_id: "u" } },
+      } as ManifestV1;
+      const key = manifestKey(location);
+      await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)), { contentType: "application/json" });
+
+      const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
+      const pointer: PointerDeps = {
+        db: wdb,
+        lock: ((scope: SessionScope, work: () => Promise<never>) =>
+          transaction(wdb, async (tx) => {
+            await tx.query("SET LOCAL lock_timeout = '30s'");
+            await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [scopeLockKey(scope)]);
+            return work();
+          })) as ScopeLock,
+        reader,
+        exists: async (k) => (await store.head(objectKey(k))) !== undefined,
+        orgs: prefixOrgResolver,
+        allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
+        fanout: droppedFanout,
+        publication: {
+          schemaGeneration: expected.generation,
+          transact: (work) =>
+            inTransaction(wdb, async (tx) => {
+              await tx.query("SET LOCAL statement_timeout='5s';SET LOCAL lock_timeout='1s'");
+              return work(tx);
+            }),
+        },
+      };
+      const search: SearchIndexDeps = {
+        transact: (work) => transaction(wdb, (tx) => writerSql.run(tx, () => work(tx))),
+        reader,
+        store,
+        adapter: binding,
+        prefixFor: (orgId) => `96bulls/${orgId}`,
+      };
+      const bodies: string[] = [];
+      const io = {
+        reconcile: async (send: (body: string) => Promise<void>) => {
+          const body = JSON.stringify({ reconcile: { key, etag: "e1" } });
+          bodies.push(body);
+          await send(body);
+          return { enqueued: 1, complete: true };
+        },
+        checkFreshness: async (send: (body: string) => Promise<void>) => {
+          const collected = await collectFreshnessSend(
+            wdb, BACKEND, "96bulls",
+            (tenant, after) => binding.state.partials(tenant, { limit: 1000, ...(after === undefined ? {} : { after }) }),
+            tenantRunner, MAX_PENDING_ROWS, new Set<string>(), send,
+          );
+          return { stale: collected.stale, tombstoned: collected.tombstoned, overflow: collected.overflow };
+        },
+        dedupe: makeDedupe(wdb, BACKEND),
+        consume: (records: { messageId: string; body: string }[]) =>
+          processBatch(records, { pointer, search, requeue: async () => {} }),
+        pending: [] as string[],
+        requeued: [] as string[],
+        now: () => new Date(),
+      };
+      const summary = await runConsumerTick(io, new Date());
+      expect(summary.failedKeys).toEqual([]);
+      // The harness siblings (wlive/wdead) ride the same freshness send and
+      // are ignored (legacy keys); the e2e key must be among the consumed.
+      expect(summary.consumedKeys).toContain(key);
+      expect(summary).toMatchObject({ failed: 0, requeued: 0, pending: 0, stale: 0, tombstoned: 0, complete: true });
+      // The pointer landed, both transcript rows landed in the writer's
+      // tenant, and the projection recorded complete.
+      const ptr = await admin.query(`SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND session_id='we2e'`, [ORG]);
+      expect(ptr.rows[0]).toMatchObject({ manifest_key: key });
+      const seen = await writerRun(ORG, "w", (tx) =>
+        tx.query(`SELECT count(*)::int AS n FROM search_index.transcript_events WHERE session_id='we2e'`),
+      );
+      expect(seen.rows[0]).toMatchObject({ n: 2 });
+      const proj = await writerRun(ORG, "w", (tx) =>
+        tx.query(`SELECT complete FROM search_index.projection_state WHERE backend_id=$1 AND session_id='we2e'`, [BACKEND]),
+      );
+      expect(proj.rows[0]).toMatchObject({ complete: true });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 300_000);
 });

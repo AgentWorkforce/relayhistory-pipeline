@@ -71,6 +71,12 @@ const INGEST_ROLE_VERIFY = join(ROOT,"supabase/bootstrap/session_ingest_verify.s
 // 20261105034000 verifies it and fails closed if absent (42704); it never creates it.
 // session_read_api_role.sql (after migrate, operator) keeps LOGIN, settings and RLS.
 const READ_API_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_read_api_roles.sql");
+// The session pipeline consumer role (search_consumer_runtime), bare: the same
+// contract, its own file. The consumer grant migration installs the twelve
+// function EXECUTEs; this step only provisions the NOLOGIN role so the grants
+// have a grantee on every migrate. session_consumer_role.sql (after migrate,
+// operator) promotes it to LOGIN and owns the table grants, RLS and verify.
+const CONSUMER_ROLES_BOOTSTRAP = join(ROOT, "supabase/bootstrap/session_consumer_roles.sql");
 // Phase 2, after every migration: the role's exact direct-grant allowlist. Read-only, any
 // role that reads the catalogs; runs everywhere, on every migrate, never ledgered.
 // The one phase 2 source, shared with the live readiness gate (src/shared/db.ts).
@@ -294,6 +300,7 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
           },
           { name: "bootstrap:session_ingest_roles", path: INGEST_BOOTSTRAP },
           { name: "bootstrap:session_read_api_roles", path: READ_API_BOOTSTRAP },
+          { name: "bootstrap:session_consumer_roles", path: CONSUMER_ROLES_BOOTSTRAP },
         ]
       : []),
     ...(await schemaSteps()),

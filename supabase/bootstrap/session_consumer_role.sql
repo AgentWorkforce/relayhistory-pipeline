@@ -9,9 +9,12 @@
 --     sessions.* call fails 42501);
 --   * exactly the table DML below (session_index_ext and the directory
 --     membership tables are written directly, not only through functions);
---   * EXECUTE on the three pointer functions, including the SECURITY DEFINER
+--   * EXECUTE on the pointer functions, including the SECURITY DEFINER
 --     session_publication_is_managed (the writer must call it; verify
---     allowlists exactly this one and no other SECURITY DEFINER function);
+--     allowlists exactly this one and no other SECURITY DEFINER function)
+--     and session_publication_lock (every pointer upsert runs through
+--     withPublicationAuthority, which locks as the writer even for
+--     unmanaged manifests);
 --   * a transparent RLS policy on every sessions table the writer touches
 --     (the member-read policies name only `authenticated`, so without
 --     these the writer sees 0 rows and reports complete wrongly; same
@@ -51,8 +54,12 @@ BEGIN
     CREATE ROLE search_consumer_runtime LOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
   END IF;
-  -- An existing role is never altered: it must already match the spec.
-  IF NOT r.rolcanlogin OR r.rolinherit OR r.rolbypassrls OR r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication THEN
+  -- An existing role is otherwise never altered: it must match the spec,
+  -- except for LOGIN, where the migrate-provisioned bare NOLOGIN role
+  -- (supabase/bootstrap/session_consumer_roles.sql) is promoted by the
+  -- ALTER ROLE LOGIN below as the operator-authorized claim. Anything else
+  -- fails closed.
+  IF r.rolinherit OR r.rolbypassrls OR r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = format('bootstrap %s: the role exists with different attributes', v_name),
       HINT = 'Nothing was changed. Fix or drop the role by hand (an operator decision), then rerun.';
@@ -85,9 +92,11 @@ END
 $role$;
 -- PostgreSQL 16+ lets only a superuser name SUPERUSER or REPLICATION in ALTER
 -- ROLE, even as NOSUPERUSER/NOREPLICATION (and BYPASSRLS needs BYPASSRLS).
--- CREATE ROLE above sets the safe attributes; here only LOGIN NOINHERIT are
--- re-asserted, and session_consumer_role_verify.sql fails if an existing role
--- has SUPERUSER, CREATEDB, CREATEROLE, REPLICATION, BYPASSRLS or INHERIT.
+-- CREATE ROLE above sets the safe attributes; here LOGIN NOINHERIT are
+-- (re-)asserted, which also promotes the migrate-provisioned bare NOLOGIN
+-- role to the dedicated LOGIN exactly once, by running this operator step.
+-- session_consumer_role_verify.sql fails if an existing role has SUPERUSER,
+-- CREATEDB, CREATEROLE, REPLICATION, BYPASSRLS or INHERIT.
 ALTER ROLE search_consumer_runtime LOGIN NOINHERIT;
 -- Backstop matching the writer transactions' own SET LOCAL (60s); the pointer
 -- publication sets tighter locals per statement.
@@ -114,29 +123,48 @@ GRANT SELECT, INSERT, UPDATE ON sessions.session_index_ext TO search_consumer_ru
 REVOKE ALL ON FUNCTION sessions.upsert_session_index(jsonb) FROM search_consumer_runtime;
 REVOKE ALL ON FUNCTION sessions.session_index_batch(jsonb) FROM search_consumer_runtime;
 REVOKE ALL ON FUNCTION sessions.session_publication_is_managed(text, text, text, text, text) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.session_publication_lock(jsonb) FROM search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.upsert_session_index(jsonb) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.session_index_batch(jsonb) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.session_publication_is_managed(text, text, text, text, text) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.session_publication_lock(jsonb) TO search_consumer_runtime;
 
 -- Repo catalog the pointer upsert maintains through these invoker helpers
 -- (upsert_session_index calls them as the writer, so they need EXECUTE plus
--- the table DML below, not SECURITY DEFINER).
+-- the table DML below, not SECURITY DEFINER). resolve_repo reads repo_live,
+-- and the directory project_name trigger reads legacy_remote, so both are
+-- in the set: the e2e proves the writer 42501s without them.
 REVOKE ALL ON FUNCTION sessions.applied_repo_evidence(jsonb, jsonb) FROM search_consumer_runtime;
 REVOKE ALL ON FUNCTION sessions.canonical_remote(text) FROM search_consumer_runtime;
 REVOKE ALL ON FUNCTION sessions.clean_root_commit(text) FROM search_consumer_runtime;
 REVOKE ALL ON FUNCTION sessions.lock_repo_catalog(text) FROM search_consumer_runtime;
 REVOKE ALL ON FUNCTION sessions.resolve_repo(text, text, text, timestamp with time zone) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.repo_live(text, uuid) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.legacy_remote(text) FROM search_consumer_runtime;
+-- The directory projector rebuilds search_text inline through this immutable
+-- SQL helper (not SECURITY DEFINER); without EXECUTE every pointer upsert
+-- fails 42501 after the lock succeeds.
+REVOKE ALL ON FUNCTION sessions.session_directory_search_text(text, text, text, text, text, text, text, text) FROM search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.applied_repo_evidence(jsonb, jsonb) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.canonical_remote(text) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.clean_root_commit(text) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.lock_repo_catalog(text) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.resolve_repo(text, text, text, timestamp with time zone) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.repo_live(text, uuid) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.legacy_remote(text) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.session_directory_search_text(text, text, text, text, text, text, text, text) TO search_consumer_runtime;
 REVOKE ALL ON sessions.repos FROM search_consumer_runtime;
 REVOKE ALL ON sessions.repo_names FROM search_consumer_runtime;
 GRANT SELECT, INSERT, UPDATE ON sessions.repos TO search_consumer_runtime;
 GRANT SELECT, INSERT, UPDATE ON sessions.repo_names TO search_consumer_runtime;
 
 -- Directory projection + tombstone propagation (direct DML, not functions).
+-- The projector reads resurrection fences to gate stale resurrections, so the
+-- writer holds SELECT plus the transparent policy there (same trusted model
+-- as the other directory tables: the writer sees every tenant's fences, and
+-- must, or a stale manifest resurrects a fenced tombstone).
+REVOKE ALL ON sessions.session_directory_resurrection_fences FROM search_consumer_runtime;
+GRANT SELECT ON sessions.session_directory_resurrection_fences TO search_consumer_runtime;
 REVOKE ALL ON sessions.session_directory FROM search_consumer_runtime;
 REVOKE ALL ON sessions.session_directory_users FROM search_consumer_runtime;
 REVOKE ALL ON sessions.session_directory_machines FROM search_consumer_runtime;
@@ -144,7 +172,20 @@ REVOKE ALL ON sessions.session_briefs FROM search_consumer_runtime;
 GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory TO search_consumer_runtime;
 GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_users TO search_consumer_runtime;
 GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_machines TO search_consumer_runtime;
+REVOKE ALL ON sessions.session_directory_agents FROM search_consumer_runtime;
+REVOKE ALL ON sessions.session_directory_relationships FROM search_consumer_runtime;
+-- The catalog write diffs existing edges first (INSERT ... SELECT and the
+-- drop CTEs read the tables they maintain), so the writer holds SELECT too.
+GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_agents TO search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_relationships TO search_consumer_runtime;
 GRANT SELECT ON sessions.session_briefs TO search_consumer_runtime;
+
+-- Fanout enqueue: the publication-authority retry runs the pointer upsert with a
+-- real Postgres queue (not the dropped fanout), so every upsert INSERTs its
+-- fanout stages into sessions.pipeline_jobs. INSERT-only: the writer never
+-- reads, claims or deletes queue rows.
+REVOKE ALL ON sessions.pipeline_jobs FROM search_consumer_runtime;
+GRANT INSERT ON sessions.pipeline_jobs TO search_consumer_runtime;
 
 -- Directory event watermarks (the erased and live-complete branches). INSERT on
 -- event_pending is required because the AFTER trigger on session_index
@@ -190,9 +231,13 @@ DECLARE
     'sessions.session_directory',
     'sessions.session_directory_users',
     'sessions.session_directory_machines',
+    'sessions.session_directory_agents',
+    'sessions.session_directory_relationships',
     'sessions.session_briefs',
     'sessions.session_directory_event_pending',
     'sessions.session_directory_event_times',
+    'sessions.session_directory_resurrection_fences',
+    'sessions.pipeline_jobs',
     'sessions.repos',
     'sessions.repo_names'
   ];
