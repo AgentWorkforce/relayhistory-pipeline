@@ -27,7 +27,9 @@ test("public Postgres index writes roll back with later metadata failure in the 
       await tx.query("INSERT INTO fixture_metadata VALUES(true)");
       throw failure;
     }))).rejects.toBe(failure);
-    expect((await index.query({ tenant, order: "asc", limit: 1 })).hits).toEqual([]);
+    expect((await db.query("SELECT * FROM search_index.transcript_events")).rows).toEqual([]);
+    // Outside the pass the bare client cannot carry tenant settings: refused, not empty.
+    await expect(index.query({ tenant, order: "asc", limit: 1 })).rejects.toMatchObject({ code: "unavailable", detail: "tenant_unbound" });
     expect((await db.query("SELECT * FROM fixture_metadata")).rows).toEqual([]);
   } finally { await db.close(); }
 }, 30_000);

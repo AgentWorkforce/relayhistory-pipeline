@@ -116,7 +116,7 @@ export async function generate(read: Reader, lanes: readonly LaneManifest[], ver
   wrapper = wrapper.replace(/v_manifest jsonb := \$manifest\$[\s\S]*?\$manifest\$::jsonb;/,
     () => "v_manifest jsonb := $manifest$" + JSON.stringify(acl.functions) + "$manifest$::jsonb;");
   const secdefBlock = listBlock(wrapper, /v_secdef text\[\] := ARRAY\[([\s\S]*?)\]::text\[\];/, "boundary SECDEF");
-  const secdefs = quotedItems(secdefBlock[1]!, "'").filter((k) => !laneDefined(k));
+  const secdefs = quotedItems(secdefBlock[1]!, "'").filter((k) => !ownedOrPrefixed(k) && !laneDefined(k));
   for (const l of lanes) {
     for (const [sig, f] of Object.entries(l.functions)) if (f.secdef) secdefs.push(sig);
     for (const [sig, f] of Object.entries(l.replaces)) if (f.secdef) secdefs.push(sig);

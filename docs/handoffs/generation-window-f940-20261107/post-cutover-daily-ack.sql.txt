@@ -1,0 +1,44 @@
+-- SOURCE-ONLY ALL-ORG aggregate variant. $1=cutoff UTC, $2=frozen end UTC.
+-- Full SELECT/no RLS visibility and exact target must be qualified externally.
+-- Existing owner read-only transaction, 3s statement/250ms lock timeout, rollback.
+-- Counts include all visible orgs with no org identifiers or grouping in output.
+-- A timeout/refusal is UNKNOWN, never zero. Current rows are not immutable history.
+WITH params AS MATERIALIZED (
+ SELECT $1::timestamptz AS start_at,$2::timestamptz AS end_at,
+        $2::timestamptz>$1::timestamptz AND $2::timestamptz-$1::timestamptz<=interval '14 days' AS valid
+), days AS (
+ SELECT day::date AS day_utc FROM params p,
+ LATERAL generate_series(date_trunc('day',p.start_at AT TIME ZONE 'UTC'),
+                         date_trunc('day',p.end_at AT TIME ZONE 'UTC'),interval '1 day') day
+ WHERE p.valid
+), acks AS (
+ SELECT (b.committed_at AT TIME ZONE 'UTC')::date AS day_utc,
+        count(*) AS durable_ack_batches,
+        count(*) FILTER(WHERE b.buffer_receipt_kind='staged') AS staged_ack_batches,
+        count(*) FILTER(WHERE b.buffer_receipt_kind='suppressed') AS suppressed_ack_batches,
+        count(*) FILTER(WHERE b.publication_state='buffered') AS still_buffered_ack_batches,
+        count(*) FILTER(WHERE b.publication_state='canonical' AND b.buffer_receipt_kind='staged') AS canonical_claim_or_publish_staged_batches,
+        max(b.committed_at) AS newest_ack
+ FROM sessions.ingest_batches b CROSS JOIN params p
+ WHERE p.valid AND b.state='committed' AND b.committed_at>=p.start_at AND b.committed_at<p.end_at
+ GROUP BY 1
+), observed AS (
+ SELECT d.day_utc,coalesce(a.durable_ack_batches,0) AS durable_ack_batches,
+        coalesce(a.staged_ack_batches,0) AS staged_ack_batches,
+        coalesce(a.suppressed_ack_batches,0) AS suppressed_ack_batches,
+        coalesce(a.still_buffered_ack_batches,0) AS still_buffered_ack_batches,
+        coalesce(a.canonical_claim_or_publish_staged_batches,0) AS canonical_claim_or_publish_staged_batches,
+        CASE WHEN a.newest_ack IS NULL THEN 'none_in_window'
+          WHEN a.newest_ack>p.end_at THEN 'future_unknown'
+          WHEN a.newest_ack>p.end_at-interval '1 hour' THEN 'lt1h'
+          WHEN a.newest_ack>p.end_at-interval '24 hours' THEN '1to24h'
+          WHEN a.newest_ack>p.end_at-interval '7 days' THEN '1to7d'
+          ELSE 'ge7d' END AS newest_ingest_ack_age_at_end
+ FROM days d CROSS JOIN params p LEFT JOIN acks a USING(day_utc)
+)
+SELECT jsonb_build_object('input_scope_valid',p.valid,
+ 'days',coalesce((SELECT jsonb_agg(to_jsonb(o) ORDER BY o.day_utc) FROM observed o),'[]'::jsonb)) AS aggregate
+FROM params p;
+-- Canonical state alone is NOT published proof (claim changes it first).
+-- Compare daily receipt/ACK counts as triage only. Stores are separate snapshots,
+-- clocks/delays differ; no equality/inequality establishes exact batch lineage.

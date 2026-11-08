@@ -63,6 +63,10 @@ try {
     INSERT INTO sessions.session_directory VALUES('org-a','ws-a','codex','s',1,true),('org-b','ws-a','codex','s',1,true);
     CREATE ROLE portable_read LOGIN;`);
   const index = rt.deps.search.adapter.index;
+  // The index's tenant-scoped calls bind their tenant on the writer's open
+  // scope transaction (forced RLS); outside one they refuse (tenant_unbound).
+  const pass = work => rt.deps.search.transact(() => work());
+  await assert.rejects(index.query({ tenant: { orgId: "org-a", workspaceId: "ws-a" }, order: "asc", limit: 1 }), error => error.detail === "tenant_unbound");
   await index.ensureSchema();
   const state = pipeline.postgresSearchState(config);
   await state.ensureSchema(db);
@@ -72,9 +76,9 @@ try {
   catch (error) { await client.query("ROLLBACK"); throw error; }
   finally { client.release(); }
   const doc = { orgId: "org-a", workspaceId: "ws-a", tsMs: 1000, sessionId: "s", source: "codex", machineId: "m", kind: "history", eventId: "e1", type: "history", userId: "u", actorName: "", actorRole: "", subagentId: "", projectId: "p", taskTitle: "", taskRef: "{}", taskRefId: "", tags: [], filesTouched: [], toolName: "", toolStatus: "", deliveryRecordId: "", content: "İstanbul hello", fingerprint: "f1", version: 1 };
-  assert.equal((await index.upsert([doc, { ...doc, eventId: "e2", tsMs: 1001 }, { ...doc, orgId: "org-b" }, { ...doc, workspaceId: "ws-b" }])).written, 4);
-  assert.equal((await index.upsert([{ ...doc, content: "stale", version: 0 }])).written, 0);
-  assert.equal((await index.query({ tenant: scope, order: "asc", limit: 100, q: "i̇stanbul" })).hits.length, 2);
+  assert.equal((await pass(() => index.upsert([doc, { ...doc, eventId: "e2", tsMs: 1001 }, { ...doc, orgId: "org-b" }, { ...doc, workspaceId: "ws-b" }]))).written, 4);
+  assert.equal((await pass(() => index.upsert([{ ...doc, content: "stale", version: 0 }]))).written, 0);
+  assert.equal((await pass(() => index.query({ tenant: scope, order: "asc", limit: 100, q: "i̇stanbul" }))).hits.length, 2);
   checks.push("registered-postgres-actual-search-unicode-version-tenant");
   await db.query("GRANT USAGE ON SCHEMA sessions,search_index TO portable_read; GRANT SELECT ON ALL TABLES IN SCHEMA sessions,search_index TO portable_read");
   const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -118,10 +122,10 @@ try {
   assert.deepEqual(await handler({ brief: true }), { ok: true });
   assert.deepEqual(await handler({ analysisCache: true }), { ok: true });
   checks.push("installed-sqs-partial-and-default-off-schedules");
-  await index.eraseScope({ orgId: "org-a", workspaceId: "ws-a", source: "codex", sessionIds: ["s"] });
-  assert.equal((await index.query({ tenant: scope, order: "asc", limit: 100 })).hits.length, 0);
-  assert.equal((await index.query({ tenant: { orgId: "org-b", workspaceId: "ws-a" }, order: "asc", limit: 100 })).hits.length, 1);
-  assert.equal((await index.query({ tenant: { orgId: "org-a", workspaceId: "ws-b" }, order: "asc", limit: 100 })).hits.length, 1);
+  await pass(() => index.eraseScope({ orgId: "org-a", workspaceId: "ws-a", source: "codex", sessionIds: ["s"] }));
+  assert.equal((await pass(() => index.query({ tenant: scope, order: "asc", limit: 100 }))).hits.length, 0);
+  assert.equal((await pass(() => index.query({ tenant: { orgId: "org-b", workspaceId: "ws-a" }, order: "asc", limit: 100 }))).hits.length, 1);
+  assert.equal((await pass(() => index.query({ tenant: { orgId: "org-a", workspaceId: "ws-b" }, order: "asc", limit: 100 }))).hits.length, 1);
   checks.push("synchronous-tenant-scoped-erasure");
   console.log(JSON.stringify({ proof: "portable-lambda-local-pg17-v1", sourceSha: pipelineManifest.sourceSha, sourceStatus: pipelineManifest.sourceStatus, node: process.version, platform: process.platform, arch: process.arch, generation: assets.expected.generation, checks, ok: true, cloudProof: false, provider: "postgres-only; OpenSearch/Lambda-platform conformance remains separate" }));
 } finally {

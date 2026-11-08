@@ -47,6 +47,14 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.canonical_feature_changed(jsonb,jsonb,jsonb,jsonb,jsonb)": [
       "<owner>:EXECUTE"
     ],
@@ -760,6 +768,12 @@
       "authenticated:EXECUTE"
     ],
     "sessions.migration_ingest_audit_append_only()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.owner_buffered_parity_expected(text,text,text,text,bigint,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.owner_buffered_read_scope(text,text,text,text,text,text,boolean,text)": [
       "<owner>:EXECUTE"
     ],
     "sessions.pipeline_dead_letters_observability()": [

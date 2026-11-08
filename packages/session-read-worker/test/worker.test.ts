@@ -150,6 +150,37 @@ describe("entry and configuration", () => {
     expect((await body(noOrigin)).error.code).toBe("not_configured");
   });
 
+  test("owner-buffered on without the HISTORY_CONTROL_HEAD binding refuses every request with a 503; off or bound, it does not", async () => {
+    const t = tenant();
+    const calls: string[] = [];
+    const binding = { fetch: async (input: RequestInfo | URL) => (calls.push(String(input)), new Response("{}", { status: 503 })) } as unknown as Fetcher;
+    const call = async (path: string, over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}${path}`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const on = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: t.ws, READ_API_DIRECTORY_WORKSPACES: t.ws, INGEST_S3_BUCKET: "ingest-bucket-example" };
+    for (const flag of ["true", "1", " true "]) {
+      for (const unbound of [{}, { HISTORY_CONTROL_HEAD: undefined }, { HISTORY_CONTROL_HEAD: {} as unknown as Fetcher }]) {
+        for (const path of [`/v1/events?workspace=${t.ws}&q=x`, `/v1/sessions?workspace=${t.ws}`, `/v1/sessions/s-x/turns?workspace=${t.ws}&source=claude`]) {
+          const r = await call(path, { ...on, RELAYHISTORY_READ_OWNER_BUFFERED: flag, ...unbound });
+          expect(r.status, `${flag} ${path}`).toBe(503);
+          expect((await body(r)).error.code).toBe("backend_unavailable");
+        }
+      }
+    }
+    // Off (the default deploy) never needs the binding and never calls it.
+    for (const flag of [undefined, "", "false", "0"]) {
+      const r = await call(`/v1/events?workspace=${t.ws}&q=x`, { ...on, RELAYHISTORY_READ_OWNER_BUFFERED: flag });
+      expect(r.status, String(flag)).not.toBe(503);
+    }
+    // On and bound: the config check passes (the request is not refused for configuration).
+    const bound = await call(`/v1/events?workspace=${t.ws}&q=x`, { ...on, HISTORY_CONTROL_HEAD: binding });
+    expect(bound.status).not.toBe(503);
+    expect(calls).toHaveLength(0);
+  });
+
   test("Supabase or ClickHouse down is a 503 the caller falls back from, never a page without erasure checks", async () => {
     const t = tenant();
     await insert([ev(t, { id: "d-1", session: "s-down", ts: "2026-10-23 08:00:00.000" })]);

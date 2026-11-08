@@ -42,11 +42,17 @@
  *   facts, session_outcomes, the digest narrative cache), and this backend never
  *   answers approximately.
  *
+ * Self-host routes (RELAYHISTORY_SELFHOST_READ_API=true only; selfhost.ts; unregistered when off):
+ *   POST /v1/cli/login              relaycontrol `sh_at_` token in the body, introspected; answers
+ *                                   that same token as the access token (pass-through, no minting)
+ *   GET /v1/sessions/:id/catalog    catalog, children and commit links from canonical S3
+ *
  * Auth: a RelayAuth assertion JWT minted for THIS service's origin with scope
  * `rth:read` (verifyAgentRelayToken: RS256, JWKS, issuer, exact audience).
  * Org and workspace come only from the verified claims.
  */
 import { Hono, type Context } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
 import { CursorError, decodeCursor } from "./cursor.ts";
@@ -61,13 +67,52 @@ import {
   DIRECTORY_LIST_MAX_LIMIT,
   DirectoryError,
   activityDays,
+  decodeCompositeListCursor,
   decodeListCursor,
   directoryPage,
+  encodeCompositeListCursor,
+  sessionFromDirectoryRow,
+  type BufferedListCursor,
+  type DirectoryCursor,
   type Directory,
   type DirectoryListArgs,
+  type DirectoryListRow,
 } from "./directory.ts";
 import type { BufferedSearchGate } from "./buffered-search-gate.ts";
+import {
+  BUFFERED_HEADER,
+  BUFFERED_IDS_HEADER,
+  BUFFERED_LIST_MAX_LIMIT,
+  BufferedFenced,
+  BufferedTooLarge,
+  bufferedIdsHeader,
+  bufferedSessionSummary,
+  cursorTsKey,
+  mergeListPage,
+  readOwnerBufferedList,
+  readOwnerBufferedTurns,
+  type BufferedScope,
+  type BufferedSessionRow,
+  type OwnerBufferedDeps,
+} from "./owner-buffered.ts";
 import { BRIEF_TITLES_MAX_KEYS, BriefTitlesError, briefTitleEntries, type BriefTitleKey, type BriefTitles } from "./brief-titles.ts";
+import {
+  CatalogInputError,
+  EMPTY_CATALOG,
+  LOGIN_MAX_BODY_BYTES,
+  LOGIN_MAX_TTL_MS,
+  LoginBodyError,
+  catalogFromCanonical,
+  parseLoginBody,
+  type SelfhostDeps,
+} from "./selfhost.ts";
+
+/**
+ * The only scopes POST /v1/cli/login advertises (next to LOGIN_MAX_TTL_MS, selfhost.ts). This backend
+ * has no write routes, so a client holding `rth:sync` must not believe sync is available here;
+ * relaycontrol refuses mode=sync when the login reply lacks `rth:sync`.
+ */
+const SERVED_SCOPES = ["rth:read"] as const;
 
 export interface VerifiedIdentity {
   userId: string;
@@ -121,6 +166,18 @@ export interface ReadApiDeps {
    * Requires the ClickHouse binding.
    */
   bufferedSearchGate?: BufferedSearchGate;
+  /**
+   * Owner-only buffered reads (owner-buffered.ts), RELAYHISTORY_READ_OWNER_BUFFERED. Consulted
+   * only when `enabled === true`; otherwise every route behaves exactly as without it. Every
+   * buffered response passes the HISTORY_CONTROL_HEAD authority gate; no request header is
+   * ever an authority.
+   */
+  ownerBuffered?: OwnerBufferedDeps;
+  /**
+   * RELAYHISTORY_SELFHOST_READ_API=true only (selfhost.ts): registers POST /v1/cli/login and
+   * GET /v1/sessions/:id/catalog. Absent = neither route exists and nothing else changes.
+   */
+  selfhost?: SelfhostDeps;
 }
 
 export interface TurnsDeps {
@@ -283,6 +340,76 @@ export function createReadApi(deps: ReadApiDeps) {
 
   app.get("/health", (c) => c.json({ ok: true }));
 
+  /**
+   * POST /v1/cli/login (self-host only). Registered BEFORE the /v1/* bearer middleware: the
+   * token arrives in the body, and this handler answers without calling next(), so that
+   * middleware never runs for it. Body `{ agentRelayToken, label? }`; the token must be a
+   * relaycontrol `sh_at_` token and is introspected exactly as a relaycontrol read bearer is
+   * (auth.ts relaycontrolLogin). Pass-through: the access token IS the presented token, so
+   * nothing is minted, signed or stored, and every later read authenticates it through the
+   * same introspection. accessTokenExpiresAt = min(token exp, now + 15 min) is advisory: the
+   * server keeps accepting the token until relaycontrol's own exp or revocation. There is no
+   * refresh route: refreshToken repeats the access token with the same expiry, and a client
+   * logs in again. A workspace off the reads' canary allowlist (READ_API_DIRECTORY_WORKSPACES)
+   * is refused with 501 `login_workspace_not_enabled`, after introspection. The reply's `scopes`
+   * is the token's scopes filtered to SERVED_SCOPES; a token with none of them is 403 `forbidden`
+   * after the canary and expiry checks (relaycontrolLogin already refuses no `rth:read` with the
+   * same 403 during introspection; this is the handler's own fail-closed check). The label is
+   * validated and otherwise unused. Token values and scopes are never logged.
+   */
+  const selfhost = deps.selfhost;
+  if (selfhost) {
+    const now = selfhost.now ?? (() => Date.now());
+    const loginError = (c: Context, status: 400 | 401 | 403 | 413 | 503, code: string, message: string) => {
+      if (status === 503) c.header("Retry-After", "1");
+      log({ route: "/v1/cli/login", reason: "cli_login_refused", code, status, correlation_id: c.get("correlationId") });
+      return c.json({ error: { code, message }, correlationId: c.get("correlationId") }, status);
+    };
+    app.post(
+      "/v1/cli/login",
+      bodyLimit({ maxSize: LOGIN_MAX_BODY_BYTES, onError: (c) => loginError(c, 413, "body_too_large", "body is too large") }),
+      async (c) => {
+        let token: string;
+        try {
+          token = parseLoginBody(await c.req.text()).agentRelayToken;
+        } catch (error) {
+          if (error instanceof LoginBodyError) return loginError(c, 400, error.code, error.message);
+          return loginError(c, 400, "invalid_body", "body must be a JSON object");
+        }
+        let grant;
+        try {
+          grant = await selfhost.login(token);
+        } catch (error) {
+          const e = error instanceof AuthError ? error : new AuthError(503, "relaycontrol_unavailable", "token introspection is unavailable");
+          return loginError(c, e.status, e.code, e.message);
+        }
+        // Fail closed: the reads' canary allowlist applies before any success (no workspace header on refusal).
+        try {
+          requireCanary(grant.identity, "login");
+        } catch (error) {
+          return fail(c, error);
+        }
+        const at = now();
+        const expiresAtMs = Math.min(grant.expiresAtMs, at + LOGIN_MAX_TTL_MS);
+        if (!(expiresAtMs > at)) return loginError(c, 401, "token_expired", "token has expired");
+        // Read-only backend: advertise only the scopes served here (never rth:sync), after canary and expiry.
+        const scopes = grant.identity.scopes.filter((s) => (SERVED_SCOPES as readonly string[]).includes(s));
+        if (scopes.length === 0) return loginError(c, 403, "forbidden", "missing required scope: rth:read");
+        const expiresAt = new Date(expiresAtMs).toISOString();
+        log({ route: "/v1/cli/login", reason: "cli_login", status: 200, workspace_id: grant.identity.workspaceId, correlation_id: c.get("correlationId") });
+        c.header("X-Relayhistory-Workspace-Id", grant.identity.workspaceId);
+        return c.json({
+          accessToken: token,
+          accessTokenExpiresAt: expiresAt,
+          refreshToken: token,
+          refreshTokenExpiresAt: expiresAt,
+          tokenType: "Bearer",
+          scopes,
+        });
+      },
+    );
+  }
+
   app.use("/v1/*", async (c, next) => {
     const header = c.req.header("authorization") ?? "";
     const m = /^Bearer\s+(\S+)$/i.exec(header);
@@ -309,6 +436,10 @@ export function createReadApi(deps: ReadApiDeps) {
     const correlationId = c.get("correlationId") as string;
     const identity = c.get("identity") as VerifiedIdentity | undefined;
     if (error instanceof HttpError) {
+      if (error.code === "buffered_fenced") {
+        c.header("Retry-After", "1");
+        log({ route: c.req.routePath, reason: "buffered_fenced", status: 503, correlation_id: correlationId });
+      }
       if (error.status === 501) log({ route: c.req.routePath, reason: error.reason, status: 501, correlation_id: correlationId });
       return c.json({ error: { code: error.code, message: error.message, ...(error.reason ? { reason: error.reason } : {}) }, correlationId }, error.status as never);
     }
@@ -355,6 +486,54 @@ export function createReadApi(deps: ReadApiDeps) {
     }
     if (!continuing && (await partialSessions(pageDeps(), identity.orgId, sessionId, identity.workspaceId)).length > 0) throw unsupported("session_partial");
     return "ok";
+  }
+
+  /**
+   * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED): the deps when the flag is on,
+   * the token carries a user, and the token's workspace is on both READ_API_DIRECTORY_WORKSPACES
+   * and the owner-buffered canary allowlist READ_API_OWNER_BUFFERED_WORKSPACES (each "*" or
+   * listing it; unset/empty = none). Otherwise undefined and the caller's route runs exactly as
+   * without the flag.
+   */
+  function ownerBufferedFor(identity: VerifiedIdentity): OwnerBufferedDeps | undefined {
+    const ob = deps.ownerBuffered;
+    if (!ob || ob.enabled !== true || !identity.userId) return undefined;
+    const listed = (allowed: ReadonlySet<string> | "*" | undefined) => !!allowed && (allowed === "*" || allowed.has(identity.workspaceId));
+    if (!listed(deps.directoryWorkspaces) || !listed(ob.workspaces)) return undefined;
+    return ob;
+  }
+  const bufferedScope = (identity: VerifiedIdentity): BufferedScope => ({ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId });
+  const bufferedFenced = () => new HttpError(503, "buffered_fenced", "buffered read fenced; retry", "buffered_fenced");
+
+  /**
+   * The caller's buffered turn rows of one session for a detail route, through the gated path
+   * (readOwnerBufferedTurns: authority observed before the RPCs and again after every S3 read,
+   * before any byte). Authority unavailable before any buffered candidate was found: logged,
+   * null (the route's existing 501, exactly as without the flag). Fenced once a candidate was
+   * found: 503 buffered_fenced. Over the byte bounds: logged `buffered_too_large`, null. A
+   * tenant mismatch is a 500; any other failure is logged and answers null.
+   */
+  async function bufferedTurns(c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string) {
+    try {
+      const served = await readOwnerBufferedTurns(ob, bufferedScope(identity), source, sessionId);
+      if (served && "unverifiedBeforeCandidate" in served) {
+        log({ route: c.req.routePath, reason: "buffered_unverified", gate: served.unverifiedBeforeCandidate, correlation_id: c.get("correlationId") });
+        return null;
+      }
+      return served;
+    } catch (error) {
+      if (error instanceof BufferedTooLarge) {
+        log({ route: c.req.routePath, reason: "buffered_too_large", correlation_id: c.get("correlationId") });
+        return null;
+      }
+      if (error instanceof BufferedFenced) {
+        log({ route: c.req.routePath, reason: "buffered_fenced", gate: error.reason, correlation_id: c.get("correlationId") });
+        throw bufferedFenced();
+      }
+      if (error instanceof TenantMismatchError || error instanceof HttpError) throw error;
+      log({ route: c.req.routePath, reason: "buffered_detail_error", error_code: (error as { name?: string })?.name ?? "error", correlation_id: c.get("correlationId") });
+      return null;
+    }
   }
 
   app.get("/v1/sessions/:sessionId/events", async (c) => {
@@ -448,7 +627,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "catalog" | "login"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -477,6 +656,79 @@ export function createReadApi(deps: ReadApiDeps) {
 
   /** Repeated values, deduplicated and empty values dropped (relayhistory readSessionListFilters). */
   const repeated = (c: Context, name: string) => [...new Set((c.req.queries(name) ?? []).filter(Boolean))];
+
+  /**
+   * The list page as canonical rows UNION the caller's buffered sessions (owner-buffered.ts),
+   * newest first, canonical first on equal timestamps; a buffered session whose id has a
+   * live canonical pointer (any harness) or is on the canonical page is never shown
+   * ("canonical wins"; pointers decide nothing else). The cursor carries both positions.
+   * Buffered rows come only through readOwnerBufferedList (authority observed before the RPC
+   * and again after the RPC and the live-pointer await, immediately before emit); a row whose admission fails the final head advances the buffered position but is
+   * never shown. Fenced: the canonical page alone with X-Relayhistory-Buffered: fenced. Any
+   * other buffered failure: the canonical page alone, logged `buffered_list_error`. A row of
+   * another user is a 500.
+   */
+  async function bufferedListPage(
+    c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps,
+    canonicalRows: Array<DirectoryListRow & { cursor_ts?: string }>,
+    q: { limit: number; sources: string[]; notSources: string[]; bounds: Record<"lastTsAfter" | "lastTsBefore" | "firstTsAfter" | "firstTsBefore", Date | undefined> },
+  ) {
+    directoryPage(canonicalRows, identity, q.limit); // tenant and shape checks, as the canonical-only page
+    const canonical = canonicalRows.map((r) => {
+      if (typeof r.cursor_ts !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/u.test(r.cursor_ts)) throw new DirectoryError("parse");
+      return r as DirectoryListRow & { cursor_ts: string };
+    });
+    const incoming = decodeCompositeListCursor(single(c, "cursor"));
+    const inCursor = incoming === undefined || typeof incoming === "string" ? {} : incoming;
+    const bLimit = Math.min(q.limit + 1, BUFFERED_LIST_MAX_LIMIT);
+    let buffered: BufferedSessionRow[] = [];
+    let consulted = false;
+    let fenced = false;
+    const shown = new Set<string>();
+    // No buffered position yet: start at the canonical position, ties included.
+    const cursor: BufferedListCursor | undefined = inCursor.buffered ??
+      (inCursor.canonical ? { ts: cursorTsKey(inCursor.canonical.lastActivityAt), sessionId: "", source: "" } : undefined);
+    try {
+      // The live-pointer await runs inside the gated read, before its final authority check;
+      // from here to the response nothing awaits.
+      const rows = await readOwnerBufferedList(ob, bufferedScope(identity), { cursor, limit: bLimit }, (ids) =>
+        deps.liveness.livePointerSessions(identity.orgId, identity.workspaceId, ids));
+      const onPage = new Set(canonical.map((r) => `${r.harness}\u0000${r.session_id}`));
+      for (const r of rows) if (r.visible && !r.live && !onPage.has(`${r.source}\u0000${r.session_id}`)) shown.add(`${r.source}\u0000${r.session_id}`);
+      buffered = rows;
+      consulted = true;
+    } catch (error) {
+      if (error instanceof TenantMismatchError) throw error;
+      if (error instanceof BufferedFenced) {
+        fenced = true;
+        log({ route: c.req.routePath, reason: "buffered_fenced", gate: error.reason, correlation_id: c.get("correlationId") });
+      } else log({ route: c.req.routePath, reason: "buffered_list_error", error_code: (error as { name?: string })?.name ?? "error", correlation_id: c.get("correlationId") });
+    }
+    const { sources, notSources, bounds } = q;
+    const eligible = (r: BufferedSessionRow) => {
+      if (!shown.has(`${r.source}\u0000${r.session_id}`)) return false;
+      if (sources.length && !sources.includes(r.source)) return false;
+      if (notSources.includes(r.source)) return false;
+      const first = Date.parse(r.first_ts);
+      const last = Date.parse(r.last_ts);
+      if (bounds.lastTsAfter && last < bounds.lastTsAfter.getTime()) return false;
+      if (bounds.lastTsBefore && last >= bounds.lastTsBefore.getTime()) return false;
+      if (bounds.firstTsAfter && first < bounds.firstTsAfter.getTime()) return false;
+      if (bounds.firstTsBefore && first >= bounds.firstTsBefore.getTime()) return false;
+      return true;
+    };
+    const merged = mergeListPage({ canonical, buffered, bufferedFull: consulted && buffered.length >= bLimit, eligible, limit: q.limit });
+    const canonicalPos: DirectoryCursor | undefined = merged.lastCanonical ?? inCursor.canonical;
+    const bufferedPos: BufferedListCursor | undefined = merged.lastBuffered ?? inCursor.buffered;
+    const nextCursor = merged.hasMore && (canonicalPos || bufferedPos) ? encodeCompositeListCursor(canonicalPos, bufferedPos) : null;
+    const bufferedItems = merged.items.flatMap((i) => (i.kind === "buffered" ? [i.row] : []));
+    if (fenced) c.header(BUFFERED_HEADER, "fenced");
+    if (bufferedItems.length) c.header(BUFFERED_IDS_HEADER, bufferedIdsHeader(bufferedItems));
+    return {
+      sessions: merged.items.map((i) => (i.kind === "canonical" ? sessionFromDirectoryRow(i.row) : bufferedSessionSummary(i.row, identity.userId))),
+      nextCursor,
+    };
+  }
 
   app.get("/v1/sessions", async (c) => {
     try {
@@ -514,7 +766,12 @@ export function createReadApi(deps: ReadApiDeps) {
       if (limit > DIRECTORY_LIST_MAX_LIMIT) throw unsupported("limit");
       if ([...sources, ...notSources].some((v) => !HARNESS_NAME.test(v))) throw unsupported("source_format");
       if (projectContains !== undefined && projectContains.trim() === "") throw unsupported("project_contains");
-      const cursor = decodeListCursor(single(c, "cursor"));
+      // Buffered rows: only the caller's own; agent/projectContains are not derivable without S3.
+      const ob = ownerBufferedFor(identity);
+      const withBuffered = ob !== undefined && !agent && !projectContains && (users.length === 0 || users.includes(identity.userId));
+      // The composite cursor exists only on the buffered path; otherwise main's decoder, exactly.
+      const composite = withBuffered ? decodeCompositeListCursor(single(c, "cursor")) : undefined;
+      const cursor = withBuffered ? (typeof composite === "object" ? composite.canonical : composite) : decodeListCursor(single(c, "cursor"));
       if (cursor === "foreign") throw new CursorError("foreign_cursor");
       if (cursor === "invalid") throw new CursorError("invalid_cursor");
       if (sources.length) args.sources = sources;
@@ -526,6 +783,10 @@ export function createReadApi(deps: ReadApiDeps) {
       if (cursor) args.cursor = cursor;
       const rows = await directory.list(identity.orgId, identity.workspaceId, args);
       if (rows === null) throw unsupported("directory_not_migrated");
+      if (withBuffered) {
+        const union = await bufferedListPage(c, identity, ob, rows, { limit, sources, notSources, bounds });
+        return c.json({ sessions: union.sessions, nextCursor: union.nextCursor, correlationId: c.get("correlationId") });
+      }
       const page = directoryPage(rows, identity, limit);
       return c.json({ sessions: page.sessions, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
@@ -693,9 +954,18 @@ export function createReadApi(deps: ReadApiDeps) {
     const states = await turns.harnesses(scope);
     if (states.length > MAX_TURN_HARNESSES) throw unsupported("turns_harness_bound");
     const selected = source === undefined ? states : states.filter((h) => h.harness === source);
-    if (!selected.some((h) => h.pointers > 0)) throw unsupported("turns_no_pointers");
+    if (!selected.some((h) => h.pointers > 0)) {
+      // Owner-only buffered (flag on): the caller's own kept buffered stages, `source` required.
+      const ob = ownerBufferedFor(identity);
+      if (ob && source !== undefined) {
+        const served = await bufferedTurns(c, identity, ob, sessionId, source);
+        // Stages that project to no turn: the existing answer (Cloud falls back).
+        if (served && (served.erased || served.rows.length > 0)) return { ...served, buffered: true };
+      }
+      throw unsupported("turns_no_pointers");
+    }
     const live = selected.filter((h) => h.live > 0);
-    if (live.length === 0) return { rows: [] as Record<string, unknown>[], erased: true };
+    if (live.length === 0) return { rows: [] as Record<string, unknown>[], erased: true, buffered: false };
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -708,7 +978,7 @@ export function createReadApi(deps: ReadApiDeps) {
           }, turns.deadlineMs ?? 3000);
         }),
       ]);
-      return { rows: turnRows(scope, snapshots, source), erased: false };
+      return { rows: turnRows(scope, snapshots, source), erased: false, buffered: false };
     } finally {
       clearTimeout(timer);
     }
@@ -724,7 +994,8 @@ export function createReadApi(deps: ReadApiDeps) {
   app.get("/v1/sessions/:sessionId/turns", async (c) => {
     try {
       const identity = c.get("identity");
-      const { rows, erased } = await sessionTurns(c, identity);
+      const { rows, erased, buffered } = await sessionTurns(c, identity);
+      if (buffered) c.header(BUFFERED_HEADER, "1");
       const body = { sessionId: c.req.param("sessionId"), turns: turnsResponse(rows), correlationId: c.get("correlationId") };
       log({ route: c.req.routePath, reason: erased ? "turns_erased" : "turns_served", turns: body.turns.length, correlation_id: c.get("correlationId") });
       return c.json(body);
@@ -737,7 +1008,8 @@ export function createReadApi(deps: ReadApiDeps) {
     try {
       const identity = c.get("identity");
       const sessionId = c.req.param("sessionId");
-      const { rows, erased } = await sessionTurns(c, identity);
+      const { rows, erased, buffered } = await sessionTurns(c, identity);
+      if (buffered) c.header(BUFFERED_HEADER, "1");
       const metadata = metadataResponse(rows);
       log({ route: c.req.routePath, reason: erased ? "metadata_erased" : metadata ? "metadata_served" : "metadata_none", correlation_id: c.get("correlationId") });
       if (!metadata)
@@ -772,6 +1044,73 @@ export function createReadApi(deps: ReadApiDeps) {
       return fail(c, error);
     }
   });
+
+  /**
+   * GET /v1/sessions/:id/catalog (self-host only): `workspace=` and `source=` (exactly once)
+   * as the timing route, same canary allowlist, same canonical S3 read (selfhost.ts
+   * catalogFromCanonical). `catalog` is the session's latest delivered catalog record,
+   * `children` its relationship edges, `commitLinks` its delivered commit links; `parents` is
+   * always empty (a parent edge lives with the parent session's objects). A session with no
+   * pointer is 404 `not_found` (reason `catalog_no_pointers`), the answer relaycontrol maps to
+   * an empty catalog; erased is the empty catalog. The 404 is in-workspace only: it is
+   * reachable strictly after attestWorkspace and requireCanary pass and the canonical source
+   * is wired, so a caller outside the workspace still gets its 401/403/501 and never learns
+   * whether a session id exists.
+   */
+  if (selfhost) {
+    app.get("/v1/sessions/:sessionId/catalog", async (c) => {
+      try {
+        const identity = c.get("identity");
+        attestWorkspace(c, identity);
+        requireCanary(identity, "catalog");
+        const sources = c.req.queries("source") ?? [];
+        const source = sources[0]?.trim();
+        if (sources.length !== 1 || !source) throw bad("source must be supplied exactly once and be non-empty");
+        if (source.length > MAX_ID_CHARS) throw bad("source is not valid");
+        const catalog = selfhost.catalog;
+        if (!catalog) throw unsupported("catalog_not_configured");
+        const sessionId = c.req.param("sessionId");
+        if (!sessionId || sessionId.length > MAX_ID_CHARS) throw unsupported("catalog_session_id");
+        const scope: CanonicalIdentity = { orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId };
+        const state = await catalog.state(scope);
+        if (state.pointers === 0) {
+          log({ route: c.req.routePath, reason: "catalog_no_pointers", status: 404, correlation_id: c.get("correlationId") });
+          throw new HttpError(404, "not_found", `No catalog found for session ${sessionId}`, "catalog_no_pointers");
+        }
+        let payload = EMPTY_CATALOG;
+        if (state.live > 0) {
+          const controller = new AbortController();
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const snapshot = await Promise.race([
+              catalog.source(scope, controller.signal),
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(() => {
+                  reject(new CanonicalReadError("deadline"));
+                  controller.abort();
+                }, catalog.deadlineMs ?? 3000);
+              }),
+            ]);
+            payload = catalogFromCanonical(scope, snapshot);
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+        log({
+          route: c.req.routePath,
+          reason: state.live === 0 ? "catalog_erased" : "catalog_served",
+          children: payload.children.length,
+          commit_links: payload.commitLinks.length,
+          correlation_id: c.get("correlationId"),
+        });
+        return c.json({ workspaceId: identity.workspaceId, ...payload });
+      } catch (error) {
+        if (error instanceof CanonicalReadError) return fail(c, unsupported(`catalog_canonical_${error.reason}`));
+        if (error instanceof CatalogInputError) return fail(c, unsupported(`catalog_${error.reason}`));
+        return fail(c, error);
+      }
+    });
+  }
 
   app.notFound((c) => c.json({ error: { code: "unsupported_by_backend", message: "route not served by this backend", reason: "route" }, correlationId: c.get("correlationId") }, 501));
 

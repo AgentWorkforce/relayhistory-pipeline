@@ -24,9 +24,28 @@
  * RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS with RELAYCONTROL_INTROSPECT_URL /
  * RELAYCONTROL_INTROSPECT_SECRET (relaycontrol `sh_at_` tokens; default off,
  * unset in wrangler.jsonc).
+ *
+ * Owner-only buffered reads (src/session-read-api/owner-buffered.ts, Option C):
+ * RELAYHISTORY_READ_OWNER_BUFFERED (default off; only "1" or "true" enables), with
+ * INGEST_S3_BUCKET / INGEST_S3_REGION naming the ingest bucket that holds the
+ * buffered-batches/ stage objects, read with the PIPELINE_RAW_S3_ACCESS_KEY_ID /
+ * _SECRET_ACCESS_KEY principal (GetObject + kms:Decrypt on buffered-batches/ is a
+ * separate IAM grant). Off, or any of those missing: no buffered read, every route
+ * exactly as without the flag. Every buffered response passes the privacy authority gate,
+ * the HISTORY_CONTROL_HEAD service binding to relayhistory-cloud's named entrypoint
+ * SessionReadPrivacyControls (pinned with `entrypoint` in wrangler config; never a public
+ * route), R2 control-head contract v5, wire frozen at relayhistory-cloud #328 a06a58f9:
+ * GET /v1/session-read/control-head, no query string, no body, identity only in
+ * x-relayhistory-org-id / -workspace-id / -user-id from the verified token, 2 s deadline,
+ * no-store both ways, no caching. Flag on with the binding absent: every request answers 503
+ * backend_unavailable (logged missing_HISTORY_CONTROL_HEAD), the same fail-closed rule as a missing
+ * Hyperdrive binding. READ_API_OWNER_BUFFERED_WORKSPACES is the owner-buffered canary allowlist (on
+ * top of READ_API_DIRECTORY_WORKSPACES; unset = none). Flag, allowlist, bucket and binding are
+ * all unset in wrangler.jsonc; only the deploy workflow's owner_buffered=on render
+ * (scripts/render-deploy-config.ts) adds them.
  */
 import pg from "pg";
-import { decompress } from "fzstd";
+import { Decompress, decompress } from "fzstd";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
@@ -53,6 +72,8 @@ import {
   type BufferedSearchGate,
   type ServiceBinding,
 } from "../../../src/session-read-api/buffered-search-gate.ts";
+import { createS3Store } from "../../../src/shared/vendor.ts";
+import { boundedStreamDecompress, ownerBufferedEnabled, serviceBindingControlHead, sqlOwnerBufferedReads, type OwnerBufferedDeps } from "../../../src/session-read-api/owner-buffered.ts";
 
 export interface Env extends CanonicalEnv {
   SUPABASE: Hyperdrive;
@@ -74,18 +95,31 @@ export interface Env extends CanonicalEnv {
   READ_API_BABYSITTER_KEY_ROOT?: string;
   /**
    * The per-hit R2 privacy gate for buffered-origin search rows: only "on" enables; default off
-   * (src/session-read-api/buffered-search-gate.ts). On without SESSION_READ_PRIVACY_CONTROLS,
-   * every buffered-origin row is dropped.
+   * (src/session-read-api/buffered-search-gate.ts). It reads the same privacy authority as
+   * owner-buffered reads, the HISTORY_CONTROL_HEAD binding below; on without it, every
+   * buffered-origin row is dropped.
    */
   READ_API_BUFFERED_SEARCH_GATE?: string;
-  /** Service binding to relayhistory-cloud, entrypoint SessionReadPrivacyControls (not in wrangler.jsonc yet). */
-  SESSION_READ_PRIVACY_CONTROLS?: ServiceBinding;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
   /** Exactly "true" also accepts relaycontrol `sh_at_` tokens; default off. */
   RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS?: string;
   RELAYCONTROL_INTROSPECT_URL?: string;
   RELAYCONTROL_INTROSPECT_SECRET?: string;
+  /** Owner-only buffered reads (Option C): only "1" or "true" enables; default off. */
+  RELAYHISTORY_READ_OWNER_BUFFERED?: string;
+  /** The owner-buffered canary allowlist (parseDirectoryWorkspaces syntax); unset/empty = none. */
+  READ_API_OWNER_BUFFERED_WORKSPACES?: string;
+  /** The ingest bucket holding buffered-batches/ stage objects (owner-buffered reads only). */
+  INGEST_S3_BUCKET?: string;
+  /** Its region; default us-east-1. */
+  INGEST_S3_REGION?: string;
+  /**
+   * The privacy authority for owner-buffered reads: a service binding to relayhistory-cloud's
+   * named entrypoint SessionReadPrivacyControls (control-head contract v5, frozen wire
+   * #328 a06a58f9, GET /v1/session-read/control-head). Unbound = every buffered read fenced.
+   */
+  HISTORY_CONTROL_HEAD?: Fetcher;
 }
 
 /** The read verifier's config from Worker env; the introspection URL passes the https/loopback rule. */
@@ -236,6 +270,9 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     authConfig = workerAuthConfig(env);
     ch = boundedClickHouse(createClickHouseClient(clickHouseConfig(env), overrides.fetcher));
     if (!overrides.connect && !env.SUPABASE?.connectionString) throw new ConfigError("SUPABASE");
+    // Owner-buffered on needs its privacy authority bound; refuse every request rather than run
+    // a deploy whose flag says on and whose gate can only fence.
+    if (ownerBufferedEnabled(env.RELAYHISTORY_READ_OWNER_BUFFERED) && typeof env.HISTORY_CONTROL_HEAD?.fetch !== "function") throw new ConfigError("HISTORY_CONTROL_HEAD");
   } catch (error) {
     // Configuration errors name a field, never a value.
     log("error", "read worker not configured", { error_code: error instanceof ConfigError ? `missing_${error.field}` : (error as { name?: string })?.name ?? "config" });
@@ -246,6 +283,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     timing: timingDeps(env, tenant.run, overrides.fetcher),
     turns: turnsDeps(env, tenant.run, overrides.fetcher),
     babysitter: babysitterEvidenceDeps(env, tenant.run, overrides.fetcher),
+    ownerBuffered: ownerBufferedDeps(env, tenant.run, overrides.fetcher),
     verify: readApiVerifier(authConfig),
     ch,
     liveness: sqlLiveness(tenant.run),
@@ -270,8 +308,8 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
  */
 export function bufferedSearchGate(env: Env, run: TenantRunner): BufferedSearchGate | undefined {
   if (!parseBufferedSearchGate(env.READ_API_BUFFERED_SEARCH_GATE)) return undefined;
-  const binding = env.SESSION_READ_PRIVACY_CONTROLS;
-  if (!binding) log("warn", "buffered search gate on without SESSION_READ_PRIVACY_CONTROLS: buffered rows are dropped", {});
+  const binding: ServiceBinding | undefined = typeof env.HISTORY_CONTROL_HEAD?.fetch === "function" ? env.HISTORY_CONTROL_HEAD : undefined;
+  if (!binding) log("warn", "buffered search gate on without HISTORY_CONTROL_HEAD: buffered rows are dropped", {});
   return createBufferedSearchGate({ controlHeads: binding ? serviceBindingControlHeads(binding) : undefined, store: sqlAdmissionStore(run) });
 }
 
@@ -332,6 +370,30 @@ export function babysitterEvidenceDeps(env: Env, run: TenantRunner, fetcher: typ
   const storeFor = (signal: AbortSignal) =>
     rawStoreFromEnv(env, ((input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal })) as typeof fetch)?.store;
   return sqlEvidenceDeps(run as never, storeFor as never, (body) => readAll(body as never) /* the bound fetch aborts the body stream too */, (bytes) => decompress(bytes), (key) => objectKey(key) as never, keyRoot);
+}
+
+/**
+ * Owner-only buffered reads (Option C): the two SECURITY DEFINER readers through the read role
+ * (tenant-bound, user bound per call) and GetObject on the ingest bucket's buffered-batches/
+ * stage objects, gated by the HISTORY_CONTROL_HEAD binding (absent with the flag on: handle()
+ * answers 503 before this runs; the gate still fences if it ever is). Served only to
+ * workspaces on READ_API_OWNER_BUFFERED_WORKSPACES (and the directory allowlist). Undefined unless RELAYHISTORY_READ_OWNER_BUFFERED is "1"/"true", the bucket
+ * is named and the raw-store keys exist.
+ */
+export function ownerBufferedDeps(env: Env, run: TenantRunner, fetcher: typeof fetch = (input, init) => fetch(input, init)): OwnerBufferedDeps | undefined {
+  if (!ownerBufferedEnabled(env.RELAYHISTORY_READ_OWNER_BUFFERED)) return undefined;
+  const bucket = env.INGEST_S3_BUCKET?.trim();
+  const accessKeyId = env.PIPELINE_RAW_S3_ACCESS_KEY_ID;
+  const secretAccessKey = env.PIPELINE_RAW_S3_SECRET_ACCESS_KEY;
+  if (!bucket || !accessKeyId || !secretAccessKey) return undefined;
+  return {
+    enabled: true,
+    workspaces: parseDirectoryWorkspaces(env.READ_API_OWNER_BUFFERED_WORKSPACES),
+    reads: sqlOwnerBufferedReads(run),
+    gate: serviceBindingControlHead(env.HISTORY_CONTROL_HEAD),
+    store: createS3Store({ bucket, region: env.INGEST_S3_REGION?.trim() || "us-east-1", credentials: { accessKeyId, secretAccessKey }, fetch: fetcher }),
+    decompress: boundedStreamDecompress(Decompress) /* stops at the bound; fzstd's one-shot form with a fixed buffer silently truncates */,
+  };
 }
 
 export default {

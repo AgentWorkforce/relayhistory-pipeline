@@ -1,6 +1,6 @@
 /** The 55P03 / 57014 lock-wait alert line (runbooks/history-620-operations.md, "Lock-wait alert"):
  * one `{ route: "ingest.lock_alert", stage, sqlstate }` line per failed request on the lazy claim or
- * the staged ACK, through the injected logger; nothing else changes (status, envelope, route line). */
+ * the staged ACK (and, since 043800, the staged-intent call that queues behind it), through the injected logger; nothing else changes (status, envelope, route line). */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createIngestApp, IDENTITY_HEADER, lockAlertFields, SYNC_SCOPE } from "../app.ts";
 import { IngestUnavailable } from "../deliver.ts";
@@ -82,6 +82,15 @@ describe("lock-wait alert line (55P03 / 57014)", () => {
     expect(r.logged.find((f) => f.route === "delivery.recovery")).toMatchObject({ stage: "claim", error_code: "ledger_lock_timeout", db_error_code: "55P03" });
   });
 
+  test("staged_intent: prepare_buffer_stage 55P03 -> one { route, stage: staged_intent, sqlstate } line; 503 unchanged", async () => {
+    const thrown = await ledgerError("55P03");
+    const r = await recovery((l) => { l.prepareBufferStage = async () => { throw thrown; }; });
+    expect(r.status).toBe(503);
+    expect(r.json.error?.code).toBe("delivery_unavailable");
+    expect(r.logged.filter((f) => f.route === "ingest.lock_alert")).toEqual([{ route: "ingest.lock_alert", stage: "staged_intent", sqlstate: "55P03" }]);
+    expect(r.logged.find((f) => f.route === "delivery.recovery")).toMatchObject({ stage: "buffer_intent", error_code: "ledger_lock_timeout", db_error_code: "55P03" });
+  });
+
   test("no alert line for other SQLSTATEs, other stages, or a non-buffered claim", async () => {
     const deadlock = await ledgerError("40P01");
     const r = await recovery((l) => { l.claim = async () => { throw deadlock; }; });
@@ -93,6 +102,9 @@ describe("lock-wait alert line (55P03 / 57014)", () => {
     expect(lockAlertFields(new IngestUnavailable("buffer_receipt", "ledger_timeout", d57), undefined)).toEqual({ route: "ingest.lock_alert", stage: "staged_ack", sqlstate: "57014" });
     expect(lockAlertFields(new IngestUnavailable("claim", "ledger_lock_timeout", d55), undefined)).toBeUndefined(); // legacy ingest_claim_batch
     expect(lockAlertFields(new IngestUnavailable("commit", "ledger_timeout", d57), "buffered")).toBeUndefined();
+    expect(lockAlertFields(new IngestUnavailable("buffer_intent", "ledger_timeout", d57), "buffered")).toEqual({ route: "ingest.lock_alert", stage: "staged_intent", sqlstate: "57014" });
+    expect(lockAlertFields(new IngestUnavailable("buffer_intent", "ledger_lock_timeout"), "buffered")).toBeUndefined(); // no SQLSTATE: no alert
+    expect(lockAlertFields(new IngestUnavailable("buffer_put", "ledger_timeout", d57), "buffered")).toBeUndefined();
     expect(lockAlertFields(new IngestUnavailable("claim", "ledger_lock_timeout"), "buffered")).toBeUndefined();
     expect(lockAlertFields(Object.assign(new Error(""), { code: "55P03" }), "buffered")).toBeUndefined();
   });
