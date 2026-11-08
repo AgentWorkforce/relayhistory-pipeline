@@ -22,13 +22,17 @@
  *      private-session-read-controls.ts @ a06a58f9) and an exact tenant echo;
  *   2. the head is not `pending`;
  *   3. sessions.buffered_search_gate_for (one SECURITY DEFINER reader,
- *      supabase/migrations/20261105043860_buffered_search_gate.sql), called
+ *      supabase/migrations/20261105043860_buffered_search_gate.sql, replaced
+ *      by 20261105043890_buffered_search_gate_retired_witness.sql), called
  *      once per owner with that owner's head, returns a NULL drop_reason for
  *      the hit. It judges, for the claim of the same org/workspace/user:
  *      a. ADMISSION: the immutable ingest_lazy_policy.control_epoch (only when
  *         the policy's source_identity_sha256 equals the claim's) equals
- *         `controlEpoch`; the claim's source_control_version equals the head
- *         version (0 without a head) and every lazy ACK decision agrees;
+ *         `controlEpoch`; the claim was not retired by the 043880 bookkeeping
+ *         cleanup (no ingest_bookkeeping_retired_claims tombstone, else
+ *         `retired`: its lazy ACK decisions are deleted, so they can no longer
+ *         witness the version); the claim's source_control_version equals the
+ *         head version (0 without a head) and every lazy ACK decision agrees;
  *      b. BINDING: the claim's immutable original records
  *         (ingest_claim_attempts.records, not retired) hold exactly the hit's
  *         (source, session_id); a claim token cannot vouch for another session;
@@ -214,6 +218,7 @@ export const refKey = (r: AdmissionRef) => `${r.claimToken}\u0000${r.userId}\u00
 /** The reasons sessions.buffered_search_gate_for may return (NULL = visible). */
 export const GATE_SQL_REASONS = [
   "admission_epoch_mismatch",
+  "retired",
   "admission_version_mismatch",
   "admission_session_mismatch",
   "gate_closed",
