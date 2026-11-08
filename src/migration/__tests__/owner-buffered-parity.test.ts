@@ -240,7 +240,7 @@ describe("pipeline-lead G2 write ruling", () => {
     const neon = new PGlite();
     try {
       await target.exec(read("supabase/tests/supabase_shim.sql"));
-      for (const file of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"])
+      for (const file of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles", "session_consumer_roles"])
         await target.exec(read(`supabase/bootstrap/${file}.sql`));
       for (const file of readdirSync(join(root, "supabase/migrations")).filter((name) => name.endsWith(".sql")).sort())
         await target.exec(read(`supabase/migrations/${file}`));

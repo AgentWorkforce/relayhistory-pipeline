@@ -35,7 +35,7 @@ beforeAll(async () => {
     "session_directory_search_worker.sql",
     "session_token_verifier.sql",
     "session_ingest_roles.sql",
-    "session_read_api_roles.sql",
+    "session_read_api_roles.sql", "session_consumer_roles.sql",
   ])
     await pool.query(sql("supabase/bootstrap/" + file));
   for (const file of readdirSync(join(root, "supabase/migrations"))

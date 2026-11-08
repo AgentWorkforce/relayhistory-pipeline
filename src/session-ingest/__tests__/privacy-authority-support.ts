@@ -27,7 +27,7 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   const closers: Array<() => unknown> = [() => db.close()];
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
+  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles", "session_consumer_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
   // lazyFix:false reproduces the pre-040000 state (that migration skipped; it touches nothing later ones depend on).
   // pending:false reproduces the state without 041000; 043700's creator precondition requires 041000's ingest_privacy_authority,
   // so it is skipped with it, while 042000/043000/043500 still apply.

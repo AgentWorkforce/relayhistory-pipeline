@@ -33,7 +33,7 @@ async function fixture(admit=true,boundary=false){
  cleanup.push(async()=>{await pool.end();await admin.query("DROP DATABASE "+name);await admin.end();rmSync(dir,{recursive:true,force:true});});
  await pool.query(text("supabase/tests/supabase_shim.sql"));
  await pool.query("CREATE EXTENSION pg_trgm; CREATE EXTENSION btree_gin");
- for(const f of ["session_directory_search_worker.sql","session_token_verifier.sql","session_ingest_roles.sql","session_read_api_roles.sql"])await pool.query(text("supabase/bootstrap/"+f));
+ for(const f of ["session_directory_search_worker.sql","session_token_verifier.sql","session_ingest_roles.sql","session_read_api_roles.sql", "session_consumer_roles.sql"])await pool.query(text("supabase/bootstrap/"+f));
  if(boundary)await pool.query(text("supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql").replaceAll(":'runtime_role'","'service_role'"));
  for(const f of readdirSync(join(root,"supabase/migrations")).sort()){
   let s=text("supabase/migrations/"+f);

@@ -33,7 +33,7 @@ describe.skipIf(!url)("043700 + PR B fixtures on actual PostgreSQL", () => {
     await db.connect();
     await db.query("SET TIME ZONE 'UTC'; CREATE SCHEMA sessions; CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin");
     await db.query(sql("supabase/tests/supabase_shim.sql"));
-    for (const file of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"])
+    for (const file of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles", "session_consumer_roles"])
       await db.query(sql(`supabase/bootstrap/${file}.sql`));
     for (const file of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort())
       await db.query(sql(`supabase/migrations/${file}`));

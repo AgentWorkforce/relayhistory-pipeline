@@ -59,7 +59,7 @@ import {
   writerComposition,
   type ConsumerTickIo,
 } from "../consumer-service.ts";
-import { reconcileRecent } from "../lambda.ts";
+import { refuseEnvOptions, reconcileRecent, supabasePool } from "../lambda.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { TenantRunner } from "../../session-read-api/liveness.ts";
 
@@ -398,6 +398,33 @@ describe("consumer tick", () => {
     expect(io.pending).toEqual([`{"reconcile":{"key":"hot","etag":"e2"}}`]);
     expect(summary).toMatchObject({ failed: 0, requeued: 1, complete: false });
   });
+  test("an unversioned freshness re-send never discards the listing revision", async () => {
+    // Production order per tick: due, listing, then freshness. A due retry
+    // (e1), the listing's current revision (e2), then a revision-less
+    // freshness re-send of the same key: the collapse must keep e2 (a busy
+    // or failure parks and scores e2), not the last-positioned unversioned
+    // body.
+    const io = tickIo(
+      ok,
+      [
+        `{"reconcile":{"key":"hot","etag":"e1"}}`,
+        `{"reconcile":{"key":"hot","etag":"e2"}}`,
+      ],
+      [`{"reconcile":{"key":"hot"}}`],
+    );
+    const consumed: string[][] = [];
+    io.consume = async (records) => {
+      consumed.push(records.map((r) => r.body));
+      for (const record of records) io.requeued.push(JSON.stringify({ reconcile: { key: "hot" } }));
+      return ok();
+    };
+    const summary = await runConsumerTick(io, new Date());
+    expect(consumed).toEqual([[`{"reconcile":{"key":"hot","etag":"e2"}}`]]);
+    expect(summary.requeuedKeys).toEqual(["hot"]);
+    expect(summary.requeuedItems).toEqual([{ key: "hot", etag: "e2" }]);
+    expect(io.pending).toEqual([`{"reconcile":{"key":"hot","etag":"e2"}}`]);
+    expect(summary).toMatchObject({ failed: 0, requeued: 1, complete: false });
+  });
 });
 
 describe("dead-letter skip rule", () => {
@@ -647,6 +674,7 @@ async function migratedPg(): Promise<PGlite> {
     "supabase/bootstrap/session_token_verifier.sql",
     "supabase/bootstrap/session_ingest_roles.sql",
     "supabase/bootstrap/session_read_api_roles.sql",
+    "supabase/bootstrap/session_consumer_roles.sql",
   ])
     await pg.exec(read(f));
   for (const f of readdirSync(join(repoRoot, "supabase/migrations")).sort())
@@ -928,6 +956,40 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
     expect(() => refuseStartupOptions("postgres://writer:secret@db:5432/hoop")).not.toThrow();
   });
 
+  test("startup refuses a set PGOPTIONS environment fallback", () => {
+    // node-pg resolves a missing pool options from PGOPTIONS, so a set
+    // variable fails loudly instead of being silently shadowed by the pin.
+    expect(() => refuseEnvOptions({ PGOPTIONS: "-c role=search_consumer_runtime" })).toThrow(
+      "PGOPTIONS",
+    );
+    expect(() => refuseEnvOptions({ PGOPTIONS: "" })).not.toThrow();
+    expect(() => refuseEnvOptions({})).not.toThrow();
+  });
+
+  test("the writer pool pins options and refuses PGOPTIONS", async () => {
+    // Structural half: a non-empty options shadows the environment in
+    // node-pg's resolution, so ambient PGOPTIONS can never reach a pooled
+    // connection. save/restore the variable: the factory reads the ambient
+    // process environment, not the injectable serve env.
+    const saved = process.env.PGOPTIONS;
+    try {
+      delete process.env.PGOPTIONS;
+      const db = supabasePool("postgres://writer:secret@db:5432/hoop", 1);
+      try {
+        expect((db.pool as unknown as { options?: { options?: unknown } }).options?.options).toContain(
+          "idle_in_transaction_session_timeout",
+        );
+      } finally {
+        await db.end();
+      }
+      process.env.PGOPTIONS = "-c role=search_consumer_runtime";
+      expect(() => supabasePool("postgres://writer:secret@db:5432/hoop", 1)).toThrow("PGOPTIONS");
+    } finally {
+      if (saved === undefined) delete process.env.PGOPTIONS;
+      else process.env.PGOPTIONS = saved;
+    }
+  });
+
   test("the tenant gate activates on the composed bootstrap and refuses a disabled or widened gate", async () => {
     const { pg } = await installed();
     try {
@@ -991,7 +1053,10 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
   test("a pre-existing elevated role fails the bootstrap", async () => {
     const { pg } = await installed();
     try {
-      await pg.exec(`CREATE ROLE search_consumer_runtime SUPERUSER LOGIN;`);
+      // installed() provisions the bare role (plus the migration's twelve
+      // EXECUTEs, which block DROP ROLE); elevate it in place so the
+      // bootstrap meets the pre-existing elevated shape it must refuse.
+      await pg.exec(`ALTER ROLE search_consumer_runtime SUPERUSER LOGIN`);
       const roleSql = readFileSync(ROLE_SQL, "utf8");
       await expect(pg.exec(stripPsqlMeta(roleSql))).rejects.toThrow("different attributes");
     } finally {
@@ -1013,6 +1078,10 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       expect(swapped).not.toBe(roleSql);
       const pg = await migratedPg();
       try {
+        // migratedPg provisions the bare role (plus the migration's twelve
+        // EXECUTEs, which block DROP ROLE); revoke and drop it so the
+        // no-side-effect assertion below is exact.
+        await pg.exec(`REVOKE ALL ON ALL FUNCTIONS IN SCHEMA sessions FROM search_consumer_runtime; DROP ROLE search_consumer_runtime`);
         await expect(pg.exec(stripPsqlMeta(swapped))).rejects.toThrow("reserved role name");
         // The refused script aborts its own transaction; roll back so the
         // no-side-effect assertion runs on a clean session.

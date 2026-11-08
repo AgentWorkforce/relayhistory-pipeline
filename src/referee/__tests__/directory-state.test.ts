@@ -29,6 +29,7 @@ test("a classified state is projected into the directory", async () => {
   await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
   await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   await db.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
+  await db.exec(read("supabase/bootstrap/session_consumer_roles.sql"));
   for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
     for (const file of readdirSync(join(root, dir))
       .filter((f) => f.endsWith(".sql"))

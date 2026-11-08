@@ -61,7 +61,7 @@ import {
 } from "./pointer.ts";
 import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
-import { reconcileRecent, supabasePool, transaction } from "./lambda.ts";
+import { refuseEnvOptions, reconcileRecent, supabasePool, transaction } from "./lambda.ts";
 import {
   CONSUMER_BACKEND_ID_VAR,
   consumerServiceConfig,
@@ -182,21 +182,46 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
   const consumable = io.dedupe ? await io.dedupe(bodies) : bodies;
   const stamp = io.now?.() ?? Date.now();
   const allRecords: QueueRecord[] = consumable.map((body, i) => ({ messageId: `reconcile-${stamp}-${i}`, body }));
-  // One invocation per key, last wins, before consume: a due retry (stale
-  // revision) followed by the listing's current revision must resolve to the
-  // newer outcome, or a failed stale record defeats the successful current
-  // one and parks/scores the wrong revision. Non-reconcile bodies have no
-  // key and always pass through. Message ids are rebuilt so every
-  // downstream map stays consistent.
+  // One invocation per key before consume, preferring the newest
+  // revision-bearing body: a due retry (stale revision) followed by the
+  // listing's current revision must resolve to the newer outcome, or a
+  // failed stale record defeats the successful current one and parks/scores
+  // the wrong revision. Freshness and tombstone re-sends carry no revision;
+  // a purely positional last-wins would let such an unversioned duplicate
+  // discard the listing's newer revision (and park/score nothing on a busy
+  // or failure), so among bodies for one key the last revision-bearing body
+  // wins, falling back to the last body when none carries a revision.
+  // Non-reconcile bodies have no key and always pass through. Message ids
+  // are rebuilt so every downstream map stays consistent.
+  const hasRevision = (body: string): boolean => {
+    const meta = reconcileMeta(body);
+    return meta !== null && (meta.etag !== undefined || meta.version !== undefined);
+  };
+  const lastIndex = new Map<string, number>();
+  for (let i = 0; i < allRecords.length; i++) {
+    const key = reconcileMeta(allRecords[i]!.body)?.key;
+    if (key !== undefined) lastIndex.set(key, i);
+  }
   const seenKeys = new Set<string>();
   const records: QueueRecord[] = [];
-  for (let i = allRecords.length - 1; i >= 0; i--) {
+  for (let i = 0; i < allRecords.length; i++) {
     const key = reconcileMeta(allRecords[i]!.body)?.key;
-    if (key !== undefined) {
-      if (seenKeys.has(key)) continue;
-      seenKeys.add(key);
+    if (key === undefined) {
+      records.push(allRecords[i]!);
+      continue;
     }
-    records.unshift(allRecords[i]!);
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    let kept = lastIndex.get(key)!;
+    if (!hasRevision(allRecords[kept]!.body)) {
+      for (let j = kept - 1; j >= 0; j--) {
+        if (reconcileMeta(allRecords[j]!.body)?.key === key && hasRevision(allRecords[j]!.body)) {
+          kept = j;
+          break;
+        }
+      }
+    }
+    records.push(allRecords[kept]!);
   }
   for (let i = 0; i < records.length; i++) records[i]!.messageId = `reconcile-${stamp}-${i}`;
   // Rebuilt after the id reassignment: the pre-collapse map still points the
@@ -711,14 +736,12 @@ export const MAX_TOMBSTONE_PAGES = 64;
  * so a crash between them leaves erased content searchable with no live
  * pointer row for reconcileRecent or partials to find.
  *
- * Gating, per table, in this tree: projection_state carries the forced
- * tenant_only RLS policy and every pass runs inside the tenant's GUC-bound
- * transaction (exactly as #330's writer path does), so no writer policy can
- * ever widen it. transcript_events has NO row gate in this tree (no RLS is
- * enabled on it; table grants govern), and gains its forced tenant_only
- * gate with #330 — until then the serve-time tenant gate refuses to tick
- * at all. The tenant enumeration itself is cross-tenant and uses the
- * sessions-table writer policy (no GUCs involved).
+ * Gating, per table: both search tables carry the forced tenant_only RLS
+ * policy from the composed ensureSchema, and every pass runs inside the
+ * tenant's GUC-bound transaction, so no writer policy can ever widen them.
+ * The serve-time tenant gate refuses to tick unless both tables carry
+ * exactly tenant_only. The tenant enumeration itself is cross-tenant and
+ * uses the sessions-table writer policy (no GUCs involved).
  *
  * Three behaviors keep this convergent instead of a permanent resend loop:
  * 1. Erasure residue retires atomically per tenant: a tombstone whose
@@ -885,11 +908,11 @@ export function nextFailureCount(previous: number, failed: boolean): number {
 /** Fail-closed startup gate: the owner bootstrap must have created the writer's tables. */
 /**
  * The search tables must carry exactly the tenant gate before the tick
- * runs: without tenant_only, transcript_events has no row gate at all in
- * this tree (its forced RLS lands with #330), and a writer policy or a
- * permissive TO PUBLIC policy would widen the tenant the GUCs bind. The
- * writer reads this catalog view with only its table grants; an invisible
- * or drifted gate refuses boot rather than ticking unscoped.
+ * runs: the composed ensureSchema provisions forced tenant_only on both,
+ * and a writer policy or a permissive TO PUBLIC policy would widen the
+ * tenant the GUCs bind. The writer reads this catalog view with only its
+ * table grants; an invisible or drifted gate refuses boot rather than
+ * ticking unscoped.
  */
 export async function assertSearchTenantGate(db: SqlExecutor): Promise<void> {
   for (const table of ["search_index.transcript_events", "search_index.projection_state"]) {
@@ -965,16 +988,22 @@ export function systemUserIdentifies(systemUser: unknown, role: string): boolean
  * #330's assertReaderRole, plus the writer's pinned attributes.
  */
 export async function assertRuntimeIdentity(db: SqlExecutor): Promise<void> {
-  // system_user exists only on newer servers (absent through PG15): probe the
-  // catalog so one static query never 42703s on an older server. Absent means
-  // skip, exactly like an empty system_user.
-  const { rows: procRows } = await db.query<{ has: boolean }>(
-    `SELECT count(*) > 0 AS has FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-     WHERE p.proname = 'system_user' AND n.nspname = 'pg_catalog'`,
-  );
-  const systemCol = procRows[0]?.has === true ? `, system_user AS "systemUser"` : ``;
-  const { rows } = await db.query<{ sessionUser: unknown; user: unknown; systemUser?: unknown; super: unknown; bypass: unknown; createdb: unknown; createrole: unknown; replication: unknown; inherit: unknown }>(
-    `SELECT session_user AS "sessionUser", current_user AS user${systemCol},
+  // system_user is a bare-word expression, not a reliably catalogued
+  // function: its presence in pg_proc does not prove the expression exists
+  // on any given server version. Evaluate it and treat "does not exist"
+  // (42703/42883, e.g. PG15) as absent — skip, exactly like an empty
+  // system_user. Any other error still fails: the gate must not silently
+  // lose its authenticated-identity signal.
+  let systemUser: unknown;
+  try {
+    const probe = await db.query<{ systemUser: unknown }>(`SELECT system_user AS "systemUser"`);
+    systemUser = probe.rows[0]?.systemUser;
+  } catch (error) {
+    if ((error as { code?: unknown }).code !== "42703" && (error as { code?: unknown }).code !== "42883") throw error;
+    systemUser = undefined;
+  }
+  const { rows } = await db.query<{ sessionUser: unknown; user: unknown; super: unknown; bypass: unknown; createdb: unknown; createrole: unknown; replication: unknown; inherit: unknown }>(
+    `SELECT session_user AS "sessionUser", current_user AS user,
        r.rolsuper AS super, r.rolbypassrls AS bypass,
        r.rolcreatedb AS createdb, r.rolcreaterole AS createrole,
        r.rolreplication AS replication, r.rolinherit AS inherit
@@ -984,11 +1013,14 @@ export async function assertRuntimeIdentity(db: SqlExecutor): Promise<void> {
   if (rows.length !== 1 || !me || typeof me.user !== "string" || typeof me.sessionUser !== "string")
     throw new Error("pipeline consumer: cannot determine session_user");
   const who = JSON.stringify(me.user.slice(0, 63));
-  // Both names must be the writer: SET ROLE changes current_user only, so a
-  // privileged login hiding behind the writer role still refuses here.
+  // Both names must be the writer: SET ROLE changes current_user only,
+  // whether issued as SQL or smuggled as a startup GUC (PGOPTIONS role=),
+  // so a privileged login hiding behind the writer role still refuses here.
+  // (A startup session_authorization is clobbered by the authenticated
+  // identity server-side and cannot spoof session_user.)
   if (me.sessionUser !== "search_consumer_runtime" || me.user !== "search_consumer_runtime")
     throw new Error(`pipeline consumer: refusing to run as session_user ${JSON.stringify(me.sessionUser.slice(0, 63))}; use the search_consumer_runtime URL`);
-  if (!systemUserIdentifies(me.systemUser, "search_consumer_runtime"))
+  if (!systemUserIdentifies(systemUser, "search_consumer_runtime"))
     throw new Error(`pipeline consumer: refusing to run with foreign authenticated identity ${who}`);
   if (me.super !== false) throw new Error(`pipeline consumer: refusing to run as SUPERUSER ${who}`);
   if (me.bypass !== false) throw new Error(`pipeline consumer: refusing to run as BYPASSRLS ${who}`);
@@ -1003,16 +1035,22 @@ export async function assertRuntimeIdentity(db: SqlExecutor): Promise<void> {
 }
 
 /**
- * Startup options (PGOPTIONS / ?options=) can smuggle session GUCs such as
- * role=... past authentication, so the login the identity gate sees is not
- * the login that was authenticated. node-pg takes options only from the
- * connection string (it does not read PGOPTIONS), so refusing the parameter
- * in the configured URL closes the class.
+ * Startup options (?options=) can smuggle session GUCs such as role=... past
+ * authentication, so the login the identity gate sees is not the login that
+ * was authenticated. Refusing the parameter in the configured URL closes the
+ * URL half of the class.
  */
 export function refuseStartupOptions(url: string): void {
   if (new URL(url).searchParams.has("options"))
     throw new Error("pipeline consumer: refusing a database URL with startup options");
 }
+
+/**
+ * The environment half of startup-option smuggling lives with pool creation
+ * (refuseEnvOptions in lambda.ts): serve() calls it here so a set PGOPTIONS
+ * fails loudly at startup, while the pool pin shadows the environment
+ * structurally. PGlite never reads this variable.
+ */
 
 export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never> {
   const config = consumerServiceConfig(env);
@@ -1036,9 +1074,10 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     await new Promise(() => {});
     throw new Error("unreachable");
   }
-  // Dormant never opens a database, so a smuggled ?options= there is inert;
-  // the live path below refuses it before any pool is created.
+  // Dormant never opens a database, so smuggled startup options there are
+  // inert; the live path below refuses both halves before any pool is created.
   refuseStartupOptions(config.secret.hoopdb_url);
+  refuseEnvOptions(env);
   // runWorker opens its own pool from HOOPDB_URL for the live gates: it must
   // be the same identity that writes, never a second role or database.
   if (env.HOOPDB_URL && env.HOOPDB_URL !== config.secret.hoopdb_url)
@@ -1084,7 +1123,10 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     exists: async (key) => (await raw.store.head(objectKey(key))) !== undefined,
     orgs: prefixOrgResolver,
     allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
-    // Terminal consumer: fanout is always dropped (config refuses postgres).
+    // Terminal consumer: no hosted fanout (config refuses postgres); the
+    // publication-authority retry runs the pointer upsert with a real Postgres
+    // queue instead, so every managed write INSERTs its fanout stages into
+    // sessions.pipeline_jobs (INSERT-only for the writer).
     fanout: droppedFanout,
     publication: {
       schemaGeneration: expected.generation,

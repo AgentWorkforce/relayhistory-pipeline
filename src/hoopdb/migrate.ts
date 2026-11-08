@@ -451,9 +451,9 @@ export async function inspectMigrations(client: MigrationClient, profile: Migrat
   // verifies the complete role contract, including memberships and effective grants.
   const roles = (await client.query<{rolname:string; safe:boolean}>(
     "SELECT rolname, NOT (rolcanlogin OR rolinherit OR rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication) AS safe FROM pg_roles WHERE rolname = ANY($1::text[])",
-    [["session_directory_search_worker", "session_token_verifier"]])).rows;
-  if (roles.length !== 2 || roles.some(r => !r.safe))
-    throw profileError("bootstrap_prerequisite", "operator-provisioned search/token bare roles absent or unsafe");
+    [["session_directory_search_worker", "session_token_verifier", "search_consumer_runtime"]])).rows;
+  if (roles.length !== 3 || roles.some(r => !r.safe))
+    throw profileError("bootstrap_prerequisite", "operator-provisioned search/token/consumer bare roles absent or unsafe");
   const inventory = [];
   for (const step of steps) inventory.push({
     name: step.name,

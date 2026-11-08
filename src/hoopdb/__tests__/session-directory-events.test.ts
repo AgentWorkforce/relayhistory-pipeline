@@ -179,7 +179,8 @@ describe("directory event writer fencing", () => {
     );
     await db.exec(
       read("supabase/bootstrap/session_ingest_roles.sql") +
-      "\n" + read("supabase/bootstrap/session_read_api_roles.sql"),
+      "\n" + read("supabase/bootstrap/session_read_api_roles.sql") +
+      "\n" + read("supabase/bootstrap/session_consumer_roles.sql"),
     );
     for (const f of readdirSync(join(root, "supabase/migrations")).sort())
       await db.exec(read(`supabase/migrations/${f}`));

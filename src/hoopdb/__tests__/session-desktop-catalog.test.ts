@@ -24,6 +24,7 @@ async function database(before?: string) {
   await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
   await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   await db.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
+  await db.exec(read("supabase/bootstrap/session_consumer_roles.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort())
     if (before === undefined || file < before)
       await db.exec(read("supabase/migrations/" + file));

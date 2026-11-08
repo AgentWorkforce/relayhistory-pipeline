@@ -31,6 +31,12 @@ import { composeSearchService } from "../../shared/search-composition.ts";
 import { postgresSearchState } from "../postgres-search-state.ts";
 import { writerTransactionSql } from "../transaction-sql.ts";
 import { sessionsFunctionAclPreview } from "../../hoopdb/migrate-guards.ts";
+import { postgresPipelineQueue, type StageMessage } from "../../shared/vendor.ts";
+import { projectSessionDirectory } from "../../hoopdb/session-directory-projector.ts";
+import {
+  writeDirectoryCatalog,
+  type DirectoryCatalog,
+} from "../../hoopdb/session-directory-catalog.ts";
 import {
   assertRuntimeIdentity,
   assertSearchTenantGate,
@@ -352,6 +358,62 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
       client.release();
     }
   }, 120_000);
+
+  test("ambient PGOPTIONS cannot smuggle GUCs into a pooled writer connection", async () => {
+    // P1-a: node-pg resolves a missing pool `options` from PGOPTIONS. The
+    // writer pools pin a non-empty options (mirroring owner-pg-config),
+    // which shadows the environment. With a hostile role spoof set, the
+    // connection still authenticates as the login. This is the critical
+    // case on PG15, where no system_user signal exists to catch the spoof
+    // any other way. Without the pin this fails at connect (the server
+    // honors the spoofed role for a non-member login with 42501).
+    const login = new URL(ownerUrl!).username;
+    const saved = process.env.PGOPTIONS;
+    try {
+      process.env.PGOPTIONS = "-c role=search_consumer_runtime";
+      const pinned = new pg.Pool({
+        connectionString: ownerUrl,
+        options: "-c idle_in_transaction_session_timeout=60000",
+      });
+      try {
+        const me = await pinned.query(`SELECT session_user, current_user`);
+        expect(me.rows[0]).toMatchObject({ session_user: login, current_user: login });
+      } finally {
+        await pinned.end();
+      }
+    } finally {
+      if (saved === undefined) delete process.env.PGOPTIONS;
+      else process.env.PGOPTIONS = saved;
+    }
+  }, 120_000);
+
+  test("the identity gate refuses an owner login even with a PGOPTIONS role spoof", async () => {
+    // The spoof reaches the session as current_user only (session_user
+    // stays the login), so the both-names-must-match gate refuses. A
+    // startup session_authorization cannot spoof at all: the server
+    // clobbers it with the authenticated identity on every version probed.
+    const saved = process.env.PGOPTIONS;
+    try {
+      process.env.PGOPTIONS = "-c role=search_consumer_runtime";
+      const pinned = new pg.Pool({
+        connectionString: ownerUrl,
+        options: "-c idle_in_transaction_session_timeout=60000",
+      });
+      try {
+        const client = await pinned.connect();
+        try {
+          await expect(assertRuntimeIdentity(asSql(client))).rejects.toThrow("refusing to run as session_user");
+        } finally {
+          client.release();
+        }
+      } finally {
+        await pinned.end();
+      }
+    } finally {
+      if (saved === undefined) delete process.env.PGOPTIONS;
+      else process.env.PGOPTIONS = saved;
+    }
+  }, 120_000);
 });
 
 describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgres", () => {
@@ -532,10 +594,15 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
 
   test("writer executes exactly the twelve composed-path functions, nothing else in sessions", async () => {
     // The closed call-graph of the production tick (pointer upsert through
-    // the publication-authority retry, directory projection, repo catalog):
-    // the e2e proves the writer 42501s without any one of these, and the
-    // static closure in the merge notes proves no other sessions function is
-    // reachable.
+    // the publication-authority retry, directory projection, repo catalog).
+    // Reachability, precisely: eight fail 42501 in the composed e2e below
+    // (pointer upsert + projection with the seed shapes); lock_repo_catalog,
+    // resolve_repo and repo_live are reached only by a direct upsert
+    // carrying git fields (the e2e seeds carry none, so resolve_repo
+    // returns before the catalog lock); session_publication_is_managed is
+    // reachable by code path only (srv_ machine prefix, pointer.ts).
+    // The static closure in the merge notes proves no other sessions
+    // function is reachable.
     const fns = await wpool.query<{ fn: string }>(
       `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p
        WHERE p.pronamespace = to_regnamespace('sessions')
@@ -561,13 +628,14 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
   test("function ACL drift is zero: the twelve consumer grants are manifest-authorized", async () => {
     // B2 receipt: the twelve EXECUTE grants now sit inside the migrator's
     // function-ACL manifest (installed by the grant migration on every
-    // migrate), so the boundary preview must report no extras. Any new
-    // writer grant outside the manifest fails here. Missing runtime grants
-    // are installed by migrate itself, not by this bootstrap, so only
-    // extras are pinned.
+    // migrate), so the boundary preview for the role that holds them must
+    // report no extras: any thirteenth writer grant outside the manifest
+    // fails here. Missing is not pinned for a non-runtime role (the
+    // migrator installs runtime grants itself); the twelve-installed side
+    // is pinned by the exact-grant test above.
     const client = await admin.connect();
     try {
-      const preview = await sessionsFunctionAclPreview(asSql(client), "service_role", true);
+      const preview = await sessionsFunctionAclPreview(asSql(client), "search_consumer_runtime", true);
       expect(preview.function_acl_drift_extra).toEqual([]);
     } finally {
       client.release();
@@ -647,6 +715,113 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
       "sessions.session_index_ext UPDATE",
     ]);
   }, 120_000);
+
+  test("each search-sessions table grant is load-bearing: revoke, exercise the production path, 42501", async () => {
+    // H1: the four table grants are accepted only with a code path and a
+    // live refusal. Each block revokes one grant, runs the smallest
+    // production-path operation that touches it as the writer, and expects
+    // 42501 naming the table; the grant is restored in the same block so
+    // the later tests (and the e2e) converge. Residue from the successful
+    // projection is deleted at the end so the e2e's staleness assertions
+    // stay exact.
+    const adminClient = await admin.connect();
+    const w = await wpool.connect();
+    const key = { orgId: ORG, workspaceId: "w", harness: "h", sessionId: "wgrant" };
+    const catalog: DirectoryCatalog = {
+      models: [], agentNames: [], projectKey: null, projectKeyMethod: null,
+      projectId: null, gitRepo: null, gitBranch: null, initialCommit: null,
+      originator: null, agentVersion: null, relationships: [],
+    };
+    try {
+      // Seed a live pointer, then project it so a directory row exists for
+      // the catalog writes below.
+      await adminClient.query(
+        `INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id)
+         VALUES($1,'w','h','wgrant','m','u',now(),now(),'s3','b','96bulls/pgtest/wgrant.json','00000000-0000-0000-0000-000000000000')
+         ON CONFLICT DO NOTHING`,
+        [ORG],
+      );
+      await writerRun(ORG, "w", (tx) => projectSessionDirectory(tx, key));
+      const epoch = await writerRun(ORG, "w", (tx) =>
+        tx.query<{ e: string }>(
+          `SELECT event_projection_epoch::text AS e FROM sessions.session_directory WHERE org_id=$1 AND session_id='wgrant'`,
+          [ORG],
+        ),
+      );
+      // pipeline_jobs INSERT: the publication-authority retry queues fanout
+      // on the writer's own transaction (hoopdb/index.ts authority path), so
+      // the exact statement that path issues is exercised here.
+      await adminClient.query(`REVOKE INSERT ON sessions.pipeline_jobs FROM search_consumer_runtime`);
+      try {
+        const raw = await wpool.connect();
+        try {
+          await raw.query("BEGIN");
+          const msg = { v: 1, stage: "object-landed", workKey: "grant-proof",
+            ctx: { traceId: crypto.randomUUID(), orgId: ORG, workspaceId: "w", sessionId: "x", machineId: "m" }, payload: {} } as StageMessage;
+          const refused = await postgresPipelineQueue(asSql(raw)).send(msg).then(
+            () => null,
+            (error: { code?: unknown; message?: unknown }) => error,
+          );
+          expect(refused).toMatchObject({ code: "42501" });
+          expect(String(refused?.message ?? "")).toContain("pipeline_jobs");
+          await raw.query("ROLLBACK");
+        } finally {
+          raw.release();
+        }
+      } finally {
+        await adminClient.query(`GRANT INSERT ON sessions.pipeline_jobs TO search_consumer_runtime`);
+      }
+      // resurrection_fences SELECT: every directory projection evaluates the
+      // resurrection gate (session-directory-projector.ts).
+      await adminClient.query(`REVOKE SELECT ON sessions.session_directory_resurrection_fences FROM search_consumer_runtime`);
+      try {
+        const refused = await writerRun(ORG, "w", (tx) => projectSessionDirectory(tx, key)).then(
+          () => null,
+          (error: { code?: unknown; message?: unknown }) => error,
+        );
+        expect(refused).toMatchObject({ code: "42501" });
+        expect(String(refused?.message ?? "")).toContain("resurrection_fences");
+      } finally {
+        await adminClient.query(`GRANT SELECT ON sessions.session_directory_resurrection_fences TO search_consumer_runtime`);
+      }
+      // agents + relationships RW: the catalog write diffs existing edges
+      // after a pointer write (session-directory-catalog.ts via the search
+      // write path).
+      await adminClient.query(`REVOKE ALL ON sessions.session_directory_agents FROM search_consumer_runtime`);
+      try {
+        const refused = await writerRun(ORG, "w", (tx) =>
+          writeDirectoryCatalog(tx, key, catalog, { expectedEpoch: epoch.rows[0]!.e }),
+        ).then(
+          () => null,
+          (error: { code?: unknown; message?: unknown }) => error,
+        );
+        expect(refused).toMatchObject({ code: "42501" });
+        expect(String(refused?.message ?? "")).toContain("session_directory_agents");
+      } finally {
+        await adminClient.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_agents TO search_consumer_runtime`);
+      }
+      await adminClient.query(`REVOKE ALL ON sessions.session_directory_relationships FROM search_consumer_runtime`);
+      try {
+        const refused = await writerRun(ORG, "w", (tx) =>
+          writeDirectoryCatalog(tx, key, catalog, { expectedEpoch: epoch.rows[0]!.e }),
+        ).then(
+          () => null,
+          (error: { code?: unknown; message?: unknown }) => error,
+        );
+        expect(refused).toMatchObject({ code: "42501" });
+        expect(String(refused?.message ?? "")).toContain("session_directory_relationships");
+      } finally {
+        await adminClient.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_relationships TO search_consumer_runtime`);
+      }
+    } finally {
+      await adminClient.query(`DELETE FROM sessions.session_directory_agents WHERE org_id=$1 AND session_id='wgrant'`, [ORG]).catch(() => {});
+      await adminClient.query(`DELETE FROM sessions.session_directory_relationships WHERE org_id=$1 AND session_id='wgrant'`, [ORG]).catch(() => {});
+      await adminClient.query(`DELETE FROM sessions.session_directory WHERE org_id=$1 AND session_id='wgrant'`, [ORG]).catch(() => {});
+      await adminClient.query(`DELETE FROM sessions.session_index WHERE org_id=$1 AND session_id='wgrant'`, [ORG]).catch(() => {});
+      w.release();
+      adminClient.release();
+    }
+  }, 180_000);
 
   test("the serve-time gate activates on the composed bootstrap with no staging", async () => {
     // P1-a activation: the composed ensureSchema provisions exactly

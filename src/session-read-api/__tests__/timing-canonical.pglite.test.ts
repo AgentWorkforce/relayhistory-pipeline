@@ -96,6 +96,7 @@ beforeAll(async () => {
   await supa.exec(read("supabase/bootstrap/session_token_verifier.sql"));
   await supa.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
   await supa.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
+  await supa.exec(read("supabase/bootstrap/session_consumer_roles.sql"));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await supa.exec(read(`supabase/migrations/${file}`));
   await supa.exec(psql("supabase/bootstrap/session_read_api_role.sql"));
   await supa.exec(psql("supabase/bootstrap/session_read_api_role_verify.sql"));

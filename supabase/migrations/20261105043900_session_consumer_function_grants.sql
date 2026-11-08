@@ -4,11 +4,13 @@
 -- projection and catalog write, repo catalog, publication lock). On a real
 -- migrate the bare role always exists first: the migrate bootstrap step
 -- (supabase/bootstrap/session_consumer_roles.sql) provisions it wherever the
--- migrator may, and on Supabase/RDS the runbook provisions it as postgres
--- before migrate runs. Hand-rolled test fixtures that loop the migration
--- chain without the lane role files skip these grants instead of failing;
--- the exact-equality drift check (every non-local mode) still refuses a
--- migrate whose grants are missing for any other reason.
+-- migrator may, and on Cloud SQL / RDS / Supabase the operator provisions it
+-- before migrate runs (trampoline bootstrap or runbook). A missing role fails
+-- closed here instead of skipping: the migrator would otherwise ledger this
+-- step without installing anything, and provisioning the role later would not
+-- self-repair (the step is already ledgered). Hand-rolled test fixtures that
+-- loop the migration chain must run the lane bootstrap role file first, like
+-- the migrator plan does.
 --
 -- Source of truth: src/hoopdb/sessions-function-acl.json and its Supabase
 -- copy in hoopdb_sessions_function_boundary_supabase.sql. GRANT is
@@ -16,8 +18,8 @@
 DO $consumer_grants$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'search_consumer_runtime') THEN
-    RAISE NOTICE 'session consumer grants: role absent, skipping (fixture without the lane bootstrap)';
-    RETURN;
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = 'session consumer grants: bare role search_consumer_runtime is absent; provision it (migrate bootstrap step, Cloud SQL / RDS trampoline, or Supabase runbook) and rerun';
   END IF;
   GRANT EXECUTE ON FUNCTION sessions.upsert_session_index(jsonb) TO search_consumer_runtime;
   GRANT EXECUTE ON FUNCTION sessions.session_index_batch(jsonb) TO search_consumer_runtime;

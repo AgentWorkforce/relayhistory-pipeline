@@ -34,7 +34,7 @@ afterEach(async()=>{for(const close of open.splice(0).reverse())await close()});
 async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
+ for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles", "session_consumer_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
  for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.exec(read("supabase/migrations/"+f));
  // The read role's approved shape (schema USAGE, the session_index column grant, RLS), as the operator applies it.
  await db.exec(psql("supabase/bootstrap/session_read_api_role.sql"));

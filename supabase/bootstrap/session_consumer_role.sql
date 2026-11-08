@@ -19,10 +19,9 @@
 --     (the member-read policies name only `authenticated`, so without
 --     these the writer sees 0 rows and reports complete wrongly; same
 --     shape as the migrator's trusted policy, scoped to this role). No
---     writer policy on the search_index tables: projection_state writes run
---     with the tenant GUCs bound per scope under its forced tenant_only
---     policy, and transcript_events has no RLS in this tree (grants govern;
---     its forced tenant_only gate lands with #330).
+--     writer policy on the search_index tables: both carry forced
+--     tenant_only from the composed ensureSchema, and every search write
+--     binds the tenant GUCs per scope.
 --
 -- Run as the schema owner INSIDE the bootstrap's single transaction (the
 -- bootstrap holds the advisory lock and rolls everything back on failure).
@@ -133,7 +132,9 @@ GRANT EXECUTE ON FUNCTION sessions.session_publication_lock(jsonb) TO search_con
 -- (upsert_session_index calls them as the writer, so they need EXECUTE plus
 -- the table DML below, not SECURITY DEFINER). resolve_repo reads repo_live,
 -- and the directory project_name trigger reads legacy_remote, so both are
--- in the set: the e2e proves the writer 42501s without them.
+-- in the set: a direct upsert carrying git fields 42501s without the
+-- lock/resolve/live trio (the composed e2e seeds carry no git fields, so
+-- resolve_repo returns before the catalog lock).
 REVOKE ALL ON FUNCTION sessions.applied_repo_evidence(jsonb, jsonb) FROM search_consumer_runtime;
 REVOKE ALL ON FUNCTION sessions.canonical_remote(text) FROM search_consumer_runtime;
 REVOKE ALL ON FUNCTION sessions.clean_root_commit(text) FROM search_consumer_runtime;
