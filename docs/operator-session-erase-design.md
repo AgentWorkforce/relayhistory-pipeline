@@ -66,9 +66,9 @@ That is the same answer as a fresh reset. Section 4.4 closes this gap.
 - **Startup checks** follow the `worker.ts` l.233-235 pattern. With `OPERATOR_SESSION_ERASE_ENABLED=1` and
   `INGEST_PRIVACY_AUTHORITY` not `supabase`, the Worker throws at startup. The operator verifier key must also be configured
   (section 4.2).
-- **Reachability is an open question (Q1).** The ingest Worker has no route, custom domain or workers.dev URL today.
-  Control would need either a service binding (same account) or a dedicated authenticated ingress. This doc does not
-  choose, because the repo does not say where control runs.
+- **Reachability (decided, Q1).** The ingest Worker has no route, custom domain or workers.dev URL today.
+  Control reaches it through a dedicated private ingress on the ingest Worker, authenticated with the operator
+  credential and gated behind `OPERATOR_SESSION_ERASE_ENABLED` (section 7, Q1).
 - **Orchestration.** The route runs, in-Worker, the same three steps relayhistory-api runs today. It uses the existing
   ledger methods (`ledger.ts` l.190-194): `privacyAuthorityBegin` → `frozenWitness` + `applyOrderedControl`
   (the reset fence) → `privacyAuthorityComplete`. It adds no SQL path for the fence itself.
@@ -161,12 +161,13 @@ Control's job stays `pending` until the read API answers **404** for every targe
      never "done".
    - It needs a fresh read after the reset's pointer tombstones (section 3).
 3. **What control does not know** is the session ids. That is why the reset response carries them. v1 does not add a new
-   pipeline "is user X empty" endpoint, because the two read-API calls above are enough once the read principal (Q2)
-   exists.
+   pipeline "is user X empty" endpoint, because the two read-API calls above are enough once the read principal
+   (section 7, Q2) exists.
 
-**Gap (Q2):** the read API accepts only an end-user `rth:read` token for the workspace (`app.ts` l.114, l.419-420).
-Control has no such principal for another user's sessions. Polling needs either a read-only control service principal
-on the read API (with its own flag and review) or a narrow status route. This doc does not resolve it.
+**Gap (resolved by Q2):** the read API accepts only an end-user `rth:read` token for the workspace (`app.ts` l.114,
+l.419-420). Control has no such principal for another user's sessions. The section 7 Q2 decision closes it with a
+control-class read principal verified through relaycontrol introspection: no mint, no JWKS, no second verifier. It is
+a NEW principal class, so it needs the lead's ruling before implementation.
 
 ### 4.6 What 404 does and does not mean
 
@@ -241,7 +242,8 @@ gone" signal, and the response must not imply one.
   - flag and authority mode;
   - authority active (in SQL).
   The pipeline cannot re-check membership, because it has no membership data. That is a stated reliance on control
-  (Q7: should the signed identity carry a control-issued membership attestation with an expiry?).
+  (Q7 decided: control signs a short-lived attestation, 5 minutes, bound to org and workspace and verified via the same
+  introspection; section 7, Q7).
 - **Cross-workspace isolation.**
   - Every authority statement binds `(org, ws, user)` from the signed tenant.
   - 404 and `count:0` bodies are identical for every unknown tenant.
@@ -253,8 +255,8 @@ gone" signal, and the response must not imply one.
   - `org_id`, `workspace_id`, `request_id`, `actor_ref`;
   - `count`, `replayed`, `correlationId`.
 
-  The durable audit stays control's job row. Q8 asks whether the pipeline should also persist `actor_ref` beside the
-  reset row.
+  The durable audit stays control's job row. Per the Q8 decision (section 7), `actor_ref` is also persisted beside
+  `request_id` in the replay-detectability migration; the slot is assigned at implementation.
 - **Bounds.**
   - Body at most 4 KiB.
   - One user per request.
@@ -278,9 +280,8 @@ Q1, Q2, Q7 and Q8 are decided below (direction from relay-control draft PR #48, 
   relayhistory-api.
 - **Ingress.** It is a dedicated private ingress that carries an operator credential (section 4.2). It is not reachable
   through the public upload path, and the Worker's existing routes gain no new exposure.
-- **Flag.** The default-off flag is proposed as `OPERATOR_ERASE_ENABLED`. Section 1 names it
-  `OPERATOR_SESSION_ERASE_ENABLED`, and the implementation PR fixes the final name. Either way the behaviour keeps
-  its own flag, and only the literal `"1"` turns it on.
+- **Flag.** The default-off flag is `OPERATOR_SESSION_ERASE_ENABLED` (section 1). The behaviour keeps its own flag,
+  and only the literal `"1"` turns it on.
 
 ### Q2. Read principal: how does control poll the read API for another user's sessions?
 
