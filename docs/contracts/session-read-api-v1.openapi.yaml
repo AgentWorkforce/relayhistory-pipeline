@@ -1,0 +1,560 @@
+openapi: 3.1.0
+info:
+  title: Session Read API
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    The read API clients use to render session data: relay-webapp (browser),
+    relay-desktop and the agent-relay MCP. One contract for list, turns, search
+    and activity. Versioning: additive changes bump the minor version; a
+    breaking change gets a new `/v2` path and a new file.
+
+    ## Tenancy
+
+    Every credential is bound to exactly one user, org and workspace, stored
+    with the token. Org and workspace come only from the verified credential,
+    never from a request field. Every read route requires `workspace=` equal to
+    the credential's workspace, or answers 403 `forbidden`; there is no org-wide
+    or cross-org credential and no route that widens one.
+
+    ## Token model (`READ_API_AUTH_MODE=self_issued`)
+
+    Opaque random tokens, stored only as the SHA-256 hash of the full token
+    string, checked against this service's own database on every request, so
+    revocation is immediate. Control is not called on a read.
+
+    | Prefix    | What                                   | Lifetime                                        |
+    | --------- | -------------------------------------- | ----------------------------------------------- |
+    | `rth_at_` | user access token, sent as the bearer  | 1 hour by default (`READ_API_ACCESS_TOKEN_TTL_SECONDS`) |
+    | `rth_rt_` | user refresh token, rotated on use     | 90 days                                         |
+    | `rth_st_` | operator service token (no refresh)    | 90 days by default, 365 at most                 |
+
+    The only scope is `rth:read`. `READ_API_AUTH_MODE=relaycontrol_only` stays
+    available as a temporary mode: the bearer is the Control `sh_at_` token and
+    each read is introspected.
+
+    Control is consulted at two points only: login, and every refresh. A member
+    removed from the org or workspace therefore loses access when their current
+    access token expires. A Control outage affects only login and refresh: reads
+    with an unexpired access token keep working, and a refresh that Control
+    cannot confirm fails closed with 503 and rotates nothing.
+
+    ## The three clients
+
+    - **relay-desktop**: holds the access and refresh token pair and refreshes
+      directly with `POST /v1/auth/token/refresh`.
+    - **agent-relay MCP**: reads on behalf of one specific user. It gets that
+      user's `rth_at_`/`rth_rt_` pair through the Control handoff. It must never
+      hold an `rth_st_` service token or the bootstrap secret, and no broader
+      credential exists for it to hold.
+    - **relay-webapp (browser)**: page scripts receive only an `rth_at_` access
+      token and call the GET read routes directly, with the deployment's origin
+      on the CORS allowlist. The refresh token stays server side (Control or the
+      webapp backend performs the refresh and hands the page a new access
+      token). Login, refresh and revoke answer no CORS headers, so page scripts
+      cannot call them. Credentials are bearer headers only; CORS never allows
+      cookies.
+
+    ## What Control provides
+
+    Control owns the membership decision and the handoff; the read API owns the
+    tokens.
+
+    1. **Handoff.** After checking membership, Control calls
+       `POST /v1/cli/login` with the user's `sh_at_` token, whose audience is the
+       read API origin, and returns to the client:
+       `{ readApiBaseUrl, accessToken, accessTokenExpiresAt, refreshToken?,
+       refreshTokenExpiresAt?, tokenType, scopes, orgId, workspaceId }`. For a
+       browser client it withholds `refreshToken` and `refreshTokenExpiresAt` and
+       keeps them server side.
+    2. **Membership confirmation on refresh.** Control implements the route in
+       `x-control-membership` below, authenticated with the same
+       `RELAYCONTROL_INTROSPECT_SECRET` used for introspection. Until it exists,
+       the read API answers every refresh 503 `relaycontrol_unavailable`.
+
+    ## Operator bootstrap (standalone, no Control)
+
+    `POST /internal/tokens`, authenticated with `READ_API_BOOTSTRAP_SECRET`,
+    mints an `rth_st_` service token for one org and workspace. `/internal/*`
+    must not be exposed outside the cluster or operator network.
+
+    ## Compatibility
+
+    Non-2xx bodies are `{ error: { code, message, reason? }, correlationId }`.
+    A 501 `unsupported_by_backend` means this backend cannot answer that request
+    exactly; `reason` names why. A client with a fallback backend uses it; one
+    without shows the data as unavailable.
+x-control-membership:
+  description: >-
+    The route Control implements so the read API can confirm membership on every
+    refresh. Authenticated with `Authorization: Bearer
+    <RELAYCONTROL_INTROSPECT_SECRET>`. It carries no user token, because a
+    refresh presents only the refresh token.
+  request:
+    method: POST
+    url: "{RELAYCONTROL_INTROSPECT_URL}/internal/v1/auth/membership"
+    body:
+      sub: The user id recorded at login (introspection `sub`).
+      org: The org id recorded at login.
+      workspace: The workspace id recorded at login.
+      aud: The read API origin (READ_API_ORIGIN).
+  responses:
+    "200 active": "{ active: true, sub, org, workspace, scopes: [..., 'rth:read'], aud }; sub, org, workspace and aud must echo the request exactly, and scopes must include rth:read"
+    "200 inactive": "{ active: false, reason }; the read API revokes the session and answers 401 token_revoked"
+    otherwise: >-
+      Any other status, a 3xx, a timeout, a body over 16 KiB or a body that is
+      not this shape is unavailable: the read API answers 503
+      relaycontrol_unavailable, retryable, and rotates nothing.
+servers:
+  - url: "{readApiBaseUrl}"
+    variables:
+      readApiBaseUrl:
+        default: https://read-api.example.com
+        description: Returned by the Control handoff.
+security:
+  - bearer: []
+tags:
+  - name: read
+    description: Session data. CORS applies only to these routes.
+  - name: auth
+    description: Token exchange, refresh and revocation. Never CORS-enabled.
+  - name: internal
+    description: Operator routes. Not for clients.
+paths:
+  /v1/sessions:
+    get:
+      tags: [read]
+      operationId: listSessions
+      summary: List the workspace's sessions, newest activity first.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 50}}
+        - $ref: "#/components/parameters/cursor"
+        - {name: source, in: query, description: Harness to include; repeat for several., schema: {type: string}}
+        - {name: notSource, in: query, description: Harness to exclude; repeat for several., schema: {type: string}}
+        - {name: user, in: query, description: User id; repeat for several (at most 20)., schema: {type: string}}
+        - {name: agent, in: query, schema: {type: string, maxLength: 200}}
+        - {name: projectContains, in: query, schema: {type: string, maxLength: 200}}
+        - {name: lastTsAfter, in: query, schema: {type: string, format: date-time}}
+        - {name: lastTsBefore, in: query, schema: {type: string, format: date-time}}
+        - {name: firstTsAfter, in: query, schema: {type: string, format: date-time}}
+        - {name: firstTsBefore, in: query, schema: {type: string, format: date-time}}
+      responses:
+        "200":
+          description: One page of sessions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions, nextCursor, correlationId]
+                properties:
+                  sessions: {type: array, items: {$ref: "#/components/schemas/SessionSummary"}}
+                  nextCursor: {type: [string, "null"]}
+                  correlationId: {type: string}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/sessions/activity:
+    get:
+      tags: [read]
+      operationId: sessionActivity
+      summary: Sessions per UTC day; a session counts on every day from its first to its last activity.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - {name: since, in: query, required: true, schema: {type: string, format: date-time}}
+        - {name: until, in: query, required: true, description: At most 92 UTC days after since., schema: {type: string, format: date-time}}
+      responses:
+        "200":
+          description: One entry per UTC day in the range.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [since, until, days, correlationId]
+                properties:
+                  since: {type: string, format: date-time}
+                  until: {type: string, format: date-time}
+                  days:
+                    type: array
+                    items:
+                      type: object
+                      required: [date, total, bySource]
+                      properties:
+                        date: {type: string, format: date}
+                        total: {type: integer}
+                        bySource: {type: object, additionalProperties: {type: integer}}
+                  correlationId: {type: string}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/sessions/{sessionId}/turns:
+    get:
+      tags: [read]
+      operationId: sessionTurns
+      summary: The session's conversation turns.
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - $ref: "#/components/parameters/workspace"
+        - {name: source, in: query, description: Limit to one harness., schema: {type: string}}
+      responses:
+        "200":
+          description: The turns; empty for an erased session.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessionId, turns, correlationId]
+                properties:
+                  sessionId: {type: string}
+                  turns: {type: array, items: {$ref: "#/components/schemas/Turn"}}
+                  correlationId: {type: string}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/sessions/{sessionId}/metadata:
+    get:
+      tags: [read]
+      operationId: sessionMetadata
+      summary: Metadata derived from the session's turns.
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - $ref: "#/components/parameters/workspace"
+        - {name: source, in: query, schema: {type: string}}
+      responses:
+        "200":
+          description: The metadata.
+          content:
+            application/json:
+              schema: {type: object}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/sessions/{sessionId}/events:
+    get:
+      tags: [read]
+      operationId: sessionEvents
+      summary: One session's events, paged.
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - $ref: "#/components/parameters/workspace"
+        - {name: source, in: query, schema: {type: string}}
+        - {name: order, in: query, schema: {type: string, enum: [asc, desc]}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 1000, default: 200}}
+        - {name: maxContent, in: query, description: Truncate event content to this many characters., schema: {type: integer, minimum: 1}}
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: One page of events.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessionId, events, nextCursor, correlationId]
+                properties:
+                  sessionId: {type: string}
+                  events: {type: array, items: {$ref: "#/components/schemas/Event"}}
+                  nextCursor: {type: [string, "null"]}
+                  correlationId: {type: string}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/events:
+    get:
+      tags: [read]
+      operationId: searchEvents
+      summary: Workspace transcript search (`q`), or in-session reads (`session`).
+      description: >-
+        Workspace search is newest first and at most 100 per page. A page that
+        reaches the history floor carries `X-Sessions-Read-Continuation:
+        history_floor` and a `continuation` object.
+      parameters:
+        - $ref: "#/components/parameters/workspace"
+        - {name: q, in: query, description: Search text. Required without session., schema: {type: string, maxLength: 500}}
+        - {name: session, in: query, description: Session id. Required without q., schema: {type: string, maxLength: 512}}
+        - {name: source, in: query, schema: {type: string}}
+        - {name: project, in: query, schema: {type: string}}
+        - {name: kind, in: query, schema: {type: string}}
+        - {name: since, in: query, schema: {type: string, format: date-time}}
+        - {name: until, in: query, schema: {type: string, format: date-time}}
+        - {name: order, in: query, schema: {type: string, enum: [asc, desc]}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1}}
+        - {name: maxContent, in: query, schema: {type: integer, minimum: 1}}
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: One page of events.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events, nextCursor, correlationId]
+                properties:
+                  events: {type: array, items: {$ref: "#/components/schemas/Event"}}
+                  nextCursor: {type: [string, "null"]}
+                  continuation:
+                    type: object
+                    required: [backend, reason, until]
+                    properties:
+                      backend: {type: string}
+                      reason: {type: string}
+                      until: {type: string}
+                  correlationId: {type: string}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/cli/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Exchange a Control `sh_at_` token for a session.
+      description: >-
+        The token is introspected once, with the read API origin as audience. In
+        `relaycontrol_only` mode the reply echoes the presented token (nothing is
+        minted); in `self_issued` mode it is a new `rth_at_`/`rth_rt_` pair.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [agentRelayToken]
+              properties:
+                agentRelayToken: {type: string, maxLength: 4096}
+                label: {type: string, maxLength: 128}
+      responses:
+        "200": {$ref: "#/components/responses/TokenPair"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/auth/token/refresh:
+    post:
+      tags: [auth]
+      operationId: refresh
+      summary: Rotate a refresh token (`self_issued` mode). Control confirms membership first.
+      description: >-
+        The presented refresh token stops working on success. 401 means sign in
+        again; 503 is retryable, and the refresh token stays valid.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [refreshToken]
+              properties:
+                refreshToken: {type: string, maxLength: 4096}
+      responses:
+        "200": {$ref: "#/components/responses/TokenPair"}
+        default: {$ref: "#/components/responses/Error"}
+  /v1/auth/token/revoke:
+    post:
+      tags: [auth]
+      operationId: revoke
+      summary: Revoke the session a token belongs to (`self_issued` mode).
+      description: Takes the token in the body or as the bearer. Revokes access and refresh together.
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                token: {type: string, maxLength: 4096}
+      responses:
+        "200":
+          description: Whether a live session was revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked: {type: boolean}
+        default: {$ref: "#/components/responses/Error"}
+  /internal/tokens:
+    post:
+      tags: [internal]
+      operationId: mintServiceToken
+      summary: Mint an `rth_st_` service token for one org and workspace.
+      description: The token is returned once. Not refreshable.
+      security:
+        - bootstrap: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [orgId, workspaceId, label]
+              properties:
+                orgId: {type: string}
+                workspaceId: {type: string}
+                userId: {type: string, description: Recorded as the token's user. Defaults to read-api-service.}
+                label: {type: string, maxLength: 128}
+                expiresInDays: {type: integer, minimum: 1, maximum: 365, default: 90}
+      responses:
+        "201":
+          description: The new token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, token, label, scopes, orgId, workspaceId, expiresAt, tokenType]
+                properties:
+                  id: {type: string}
+                  token: {type: string}
+                  label: {type: string}
+                  scopes: {type: array, items: {type: string}}
+                  orgId: {type: string}
+                  workspaceId: {type: string}
+                  expiresAt: {type: string, format: date-time}
+                  tokenType: {type: string, enum: [Bearer]}
+        default: {$ref: "#/components/responses/Error"}
+  /internal/tokens/revoke:
+    post:
+      tags: [internal]
+      operationId: revokeOrgTokens
+      summary: Revoke one token by id, or every token of an org.
+      security:
+        - bootstrap: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [orgId]
+              properties:
+                orgId: {type: string}
+                id: {type: string, description: Omit to revoke every token of the org.}
+      responses:
+        "200":
+          description: How many sessions were revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoked]
+                properties:
+                  revoked: {type: integer}
+        default: {$ref: "#/components/responses/Error"}
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: "`rth_at_` or `rth_st_` in `self_issued` mode; `sh_at_` in `relaycontrol_only` mode."
+    bootstrap:
+      type: http
+      scheme: bearer
+      description: The deployment's READ_API_BOOTSTRAP_SECRET.
+  parameters:
+    workspace:
+      name: workspace
+      in: query
+      required: true
+      description: Must equal the credential's workspace; anything else is 403.
+      schema: {type: string}
+    sessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema: {type: string, maxLength: 512}
+    cursor:
+      name: cursor
+      in: query
+      description: The `nextCursor` of the previous page, passed back unchanged.
+      schema: {type: string}
+  responses:
+    TokenPair:
+      description: A session. Scopes contain `rth:read`.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType, scopes]
+            properties:
+              sessionId: {type: string, description: Present in self_issued mode.}
+              accessToken: {type: string}
+              accessTokenExpiresAt: {type: string, format: date-time}
+              refreshToken: {type: string}
+              refreshTokenExpiresAt: {type: string, format: date-time}
+              tokenType: {type: string, enum: [Bearer]}
+              scopes: {type: array, items: {type: string}}
+              orgId: {type: string, description: Present in self_issued mode.}
+              workspaceId: {type: string, description: Present in self_issued mode.}
+    Error:
+      description: >-
+        401 missing_authorization, invalid_token, token_revoked; 403 forbidden
+        (wrong workspace or no rth:read); 400 bad_request; 501
+        unsupported_by_backend with a reason; 503 backend_unavailable,
+        token_store_unavailable or relaycontrol_unavailable (retryable).
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+                  reason: {type: string}
+              correlationId: {type: string}
+  schemas:
+    SessionSummary:
+      type: object
+      required: [sessionId, source, userIds, machineIds, firstTs, lastTs, eventCount, models]
+      properties:
+        sessionId: {type: string}
+        source: {type: string, description: The harness.}
+        title: {type: [string, "null"], maxLength: 90}
+        userIds: {type: array, items: {type: string}}
+        projectId: {type: [string, "null"]}
+        machineIds: {type: array, items: {type: string}}
+        firstTs: {type: string, format: date-time}
+        lastTs: {type: string, format: date-time}
+        workState: {type: [string, "null"]}
+        eventCount: {type: integer}
+        kinds: {type: array, items: {type: string}}
+        models: {type: array, items: {type: string}}
+        taskTitle: {type: [string, "null"]}
+        totalCostUsdMicros: {type: [integer, "null"]}
+        totalInputTokens: {type: integer}
+        totalOutputTokens: {type: integer}
+        catalog: {type: object, description: Present once the session's catalog is projected.}
+    Turn:
+      type: object
+      required: [id, sessionId, sessionOwner, turnIndex, role, content, actorName, actorRole, metadata, ts]
+      properties:
+        id: {type: string}
+        sessionId: {type: string}
+        sessionOwner: {type: string}
+        turnIndex: {type: integer}
+        role: {type: string}
+        content: {type: string}
+        actorName: {type: string}
+        actorRole: {type: string}
+        metadata: {type: object}
+        ts: {type: string}
+    Event:
+      type: object
+      required: [eventId, sessionId, source, kind, type, ts, machineId, contentTruncated, tags, filesTouched]
+      properties:
+        eventId: {type: string}
+        userId: {type: [string, "null"]}
+        sessionId: {type: string}
+        source: {type: string}
+        kind: {type: string}
+        type: {type: string}
+        ts: {type: string, format: date-time}
+        actorName: {type: [string, "null"]}
+        actorRole: {type: [string, "null"]}
+        subagentId: {type: [string, "null"]}
+        machineId: {type: string}
+        projectId: {type: [string, "null"]}
+        taskRef: {type: object}
+        taskTitle: {type: [string, "null"]}
+        content: {type: [string, "null"]}
+        contentTruncated: {type: boolean}
+        tags: {type: array, items: {type: string}}
+        toolName: {type: [string, "null"]}
+        toolStatus: {type: [string, "null"]}
+        filesTouched: {type: array, items: {type: string}}
