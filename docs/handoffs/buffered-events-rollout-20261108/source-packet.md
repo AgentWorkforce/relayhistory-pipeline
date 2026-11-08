@@ -193,11 +193,11 @@ The clone has no installed dependencies, so the tests below were not executed fo
   - `scripts/pg-proof/role-proof.ts` (around L469) already runs
     `src/session-pipeline/__tests__/buffered-privacy.postgres.test.ts` inside the pg-proof real-postgres job, so
     the 043700 owner-buffered privacy guard already has real-PG CI on main.
-  - Real-PG proof of the feed RPC login guard is `[pending #376]`. PR #376 (branch
+  - Real-PG proof of the feed RPC login guard is `[merged: #376 -> main 10ea7942]`. PR #376 (branch
     `ci/pg-proof-buffered-feed-gate-login-20261108`, head 5c0dc470) adds
     `src/session-pipeline/__tests__/buffered-feed-login.postgres.test.ts` and a pg-proof job
     `buffered-feed-login-postgres` (PostgreSQL 15/16/17) covering 043860+043870 up/down/up and the feed RPC login
-    guard. It becomes closed when #376 merges.
+    guard. #376 merged on terminal green; it is on `main` from 10ea7942 (also in f196f637).
 - Operator-side validation, run read-only by the operator lane only:
   - Both role verifiers, before and after each role step (section 4).
   - Sentinel rows for 043860/043870 in the migration ledger.
@@ -220,7 +220,7 @@ The clone has no installed dependencies, so the tests below were not executed fo
     `since`, and ClickHouse folds identical rows (L3-5).
   - It revokes schema USAGE (L30) and deletes its ledger row (L31-35). Run it with `psql -1 -v ON_ERROR_STOP=1` (L17-18).
   - The role is KEPT (L6). Any LOGIN granted by the role script stays until reverted. A NOLOGIN revert script is
-    `[pending #375]`. PR #375 (branch `ops/buffered-feed-runtime-nologin-revert-20261108`, head 6a53ef07) adds
+    `[merged: #375 -> main 06764c94]`. PR #375 (branch `ops/buffered-feed-runtime-nologin-revert-20261108`, head 6a53ef07) adds
     `supabase/bootstrap/buffered_search_feed_runtime_role_nologin.sql` (`ALTER ROLE ... NOLOGIN NOINHERIT PASSWORD
     NULL` inside a transaction, refusing with SQLSTATE 55000 if the role is missing) and a runbook note that
     NOLOGIN stops new authentication only (pooled connections keep working). Treat the revert as a disarm only
@@ -244,7 +244,7 @@ Each step is an independent gate. Nothing here is executed from this packet.
 3. [missing] An EventBridge schedule (and/or notification) for `buffered-search-feed`, and Lambda env/secret wiring, in `stacks/aws` (section 2).
 4. [missing] Scope-bound feeder source if a tenant/session canary is wanted (section 10).
 5. [missing] A later-erasure delete lane for buffered ClickHouse rows (section 5).
-6. [pending #375/#376] NOLOGIN revert script and real-PG CI for the feed login guard (sections 7 and 8).
+6. [merged] #375 (06764c94) NOLOGIN revert script and #376 (10ea7942) real-PG CI for the feed login guard (sections 7 and 8); the script is on `main`, nothing is applied in production.
 7. [operator: needs Khaliq OK] Publish and deploy an image containing c858e7fe. The deployed image 8bb18be5 excludes both PRs.
 8. [operator: needs Khaliq OK] Apply 043860 to the real database as the original creator, then run `session_read_api_role_verify.sql`.
 9. [operator: needs Khaliq OK] Apply the ClickHouse origin-column DDL. It must precede the gate (section 3).
