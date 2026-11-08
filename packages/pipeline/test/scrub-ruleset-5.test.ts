@@ -160,6 +160,41 @@ describe("rule set 5: over-cap values are measured on the original text (leak 2)
     const out = JSON.stringify(scrubJson({ content: `"password": "${SHRINKABLE}" after` }));
     expect(out).not.toContain("SECRETTAILMARK");
   });
+
+  it("classifies a complete over-cap bare token before the numeric and entropy checks", () => {
+    const prefix = "0123456789".repeat(409) + "012345";
+    const tail = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".repeat(100);
+    const input = `"token": ${prefix}${tail} after`;
+    expect(prefix.length).toBe(MAX_QUOTED_VALUE);
+    expect(scrubText(input)).toBe(`"token": ${R} after`);
+    expect(scrubLong(input)).toBe(`"token": ${R} after`);
+    const line = JSON.stringify({ type: "tool_result", content: input });
+    expect(records(`${line}\n`)).toBe(
+      `${JSON.stringify({ type: "tool_result", content: `"token": ${R} after` })}\n`,
+    );
+    const number = `"token": ${"1".repeat(MAX_QUOTED_VALUE + 100)} after`;
+    expect(scrubText(number)).toBe(number);
+  });
+
+  it("preserves a prior PEM footer for the PEM rule and keeps trailing history", () => {
+    const value = `${"A".repeat(MAX_QUOTED_VALUE + 1)}-----END PRIVATE KEY-----`;
+    const input = `-----BEGIN PRIVATE KEY-----\n"password": "${value}" KEEPTRAIL`;
+    const out = scrubText(input);
+    expect(out).toContain("KEEPTRAIL");
+    expect(out).not.toContain("BEGIN PRIVATE KEY");
+    expect(out).not.toContain("END PRIVATE KEY");
+    expect(scrubLong(input)).toBe(out);
+    const line = JSON.stringify({ type: "tool_result", content: input });
+    expect(records(`${line}\n`)).toBe(
+      `${JSON.stringify({ type: "tool_result", content: out })}\n`,
+    );
+
+    const withSuffix = `-----BEGIN PRIVATE KEY-----\n"password": "${value}SECRETTAIL" KEEPTRAIL`;
+    const suffixOut = scrubText(withSuffix);
+    expect(suffixOut).not.toContain("SECRETTAIL");
+    expect(suffixOut).toContain("KEEPTRAIL");
+    expect(scrubLong(withSuffix)).toBe(suffixOut);
+  });
 });
 
 describe("rule set 5: the shared corpus's record cases through the raw-chunk record path", () => {
