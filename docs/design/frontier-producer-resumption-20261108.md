@@ -187,3 +187,27 @@ integration step, not a capability supplied by this generic SQL client.
 
 Final follow-up validation: 83/0 tests, 323 assertions across the same five
 focused suites; root TypeScript and diff checks pass. Tests remain synthetic.
+
+## Consolidation of existing prep lanes
+
+Draft #374 resumes the retained frontier/canary lineage rather than creating a
+second implementation. It incorporates draft #321 at exact c6ff786e by a normal
+merge, including de7f12d7's deterministic deadline tests and c6ff786e's real
+PostgreSQL 15/16/17 publication/frontier job with versioned MinIO. The deadline
+comment reflects the later seed-proof error-classification fix. The workflow
+adds a comment explaining the intentional embedded-JavaScript shell quoting.
+Current main's role, acquisition and constrained-lock proof jobs, triggers,
+permissions and runner choices remain unchanged; only the new job is inserted.
+
+The older frontier/canary branches and #321 are historical source inputs to this
+resumed lane. This records content consolidation, not a branch deletion, PR
+closure or merge-to-main decision. Coordinate overlapping publication fixtures
+with #336 by normal main forward-merges when either lands. This PR has no SQL,
+and does not implement or change the assigned 049000/050000 design lanes.
+
+Merged-source validation: 83/0 focused tests, 326 assertions; root TypeScript and
+diff checks pass. Workflow syntax validates with actionlint. Full actionlint
+retains two unrelated existing shellcheck findings (SC2100 and SC2034); excluding
+those known baseline findings leaves the added job clean. The real database and
+MinIO job has not been executed on this merged head locally; CI must provide
+that separate evidence, and its success will still not qualify a live producer.
