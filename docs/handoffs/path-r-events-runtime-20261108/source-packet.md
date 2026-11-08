@@ -6,8 +6,10 @@ branch-versus-main delta is unchanged). Every `path:Lx` below is a line in the #
 tree as it will land. This packet is documentation. It activates nothing, recommends no
 activation, and is not an approval. Production identifiers are written as "redacted". No credential value
 appears here. Tags: `[source-ready]` = present and default-off in #377's source; `[pending #377 merge]` = true
-once #377 is on `main`; `[operator: needs Khaliq OK]` = a production step that only the operator lane executes,
-after Khaliq's own OK in his own words; `[missing]` = not in source.
+once #377 is on `main`; `[operator: needs Khaliq OK]` = a production step that only the credentialed operator
+lane executes under the authorization that lane holds directly from Khaliq in his own words. This packet does not
+verify, grant, transfer or request any such authorization; where an executor session already holds it, the
+remaining gate is readiness and execution evidence, not a new approval. `[missing]` = not in source.
 
 ## 1. Scope and status
 
@@ -125,6 +127,10 @@ source stays 8bb18be5 until Khaliq says otherwise.
   - Both jobs run only on `refs/heads/main` (L80, L87), so Path R cannot be dispatched until #377 is merged.
   - It checks out `github.sha` (L115-118) and runs in the `session-read-worker` environment (L90). The
     concurrency group is `session-read-worker-production` (L75-77).
+  - For a `workflow_dispatch` on `main`, `github.sha` resolves to the tip of `main` at dispatch time, which is
+    mutable. Before treating a run as the Path R source, record the run's resolved `head_sha` and verify it equals
+    f196f637 (or that `packages/session-read-worker/` and `src/session-read-api/` in that tree are identical to
+    f196f637's). Never assume `main` still equals f196f637.
   - The `checks` job reuses `session-read-worker-checks.yml` (L79-83): Worker typecheck including the render
     vitest, Worker tests in workerd, and a wrangler dry-run bundle.
   - The Worker is bundled from that main checkout by `wrangler deploy` (L166-176). It is not built from the
@@ -341,14 +347,18 @@ Each step is an independent gate. Nothing here is executed from this packet.
 2. [done] #377 merged to `main` f196f637 (section 1). The deploy workflow runs only from `main` (section 2);
    any dispatch is `[operator: needs Khaliq OK]` and is not requested by this packet.
 3. [operator: needs Khaliq OK] G4: verify 043700 is applied in production (migration-handover-agent lane).
-4. [operator: needs Khaliq OK] G2: parity rows for each canary owner. Bulk G2 has not run.
+   verify-replica (245226715025592320) reports that the G4 executor session already holds direct authorization;
+   not verified here, so the remaining gate is G4 READY and the PASS evidence, not an approval via this packet.
+4. [operator: needs Khaliq OK] G2: parity rows for each canary owner. Bulk G2 has not run. Same note as step 3
+   for the reviewed bulk G2 executor.
 5. [operator: needs Khaliq OK] Owner-buffered prerequisites: the S3/KMS grant on `buffered-batches/`, the
    raw-store Worker secrets, and relayhistory-cloud exporting `SessionReadPrivacyControls` (section 5).
 6. [operator: needs Khaliq OK] Choose the canary workspace ids: an explicit list, never `*`, each also on
    `SESSION_READ_DIRECTORY_WORKSPACES`.
 7. [operator: needs Khaliq OK] Dispatch *deploy session-read-worker* from `main` with `owner_buffered=on`, the
    explicit `owner_buffered_workspaces`, `owner_buffered_events=on` and `buffered_search_gate=off`.
-   `INGEST_BUFFERED_SEARCH_FEED` stays off.
+   `INGEST_BUFFERED_SEARCH_FEED` stays off. Record the run's resolved `head_sha` and check it against f196f637
+   (section 2). Bundle, config, binding and rollback receipts belong to the read-Worker actor.
 8. [operator: needs Khaliq OK] Run the read-only post-deploy checks (section 7).
 9. [operator: needs Khaliq OK] Roll back by re-dispatching with `owner_buffered_events=off`, or without inputs
    (section 4).
