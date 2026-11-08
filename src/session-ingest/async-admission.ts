@@ -103,10 +103,19 @@ export function inboxKey(keyRoot: string, tenant: LedgerTenant, originId: string
   return `${receiptDir(keyRoot, tenant, originId, receiptId)}/a=${String(receivedAtMs).padStart(15, "0")}-${nonce}.ndjson.zst`;
 }
 export const outcomeKey = (dir: string, outcome: "admitted" | "refused") => `${dir}/outcome-${outcome}.json`;
-/** Per (org, workspace, user): the privacy journal every reset / re-enable raises first. */
+const userDir = (keyRoot: string, tenant: LedgerTenant) =>
+  inboxDir(keyRoot, tenant, `srv_${sha256Hex(JSON.stringify(["admission-user-v1", tenant.workspaceId, tenant.userId])).slice(0, 32)}`);
+/** Per (org, workspace, user): the privacy journal every reset / re-enable brackets. */
 export function journalKey(keyRoot: string, tenant: LedgerTenant): string {
-  const machine = `srv_${sha256Hex(JSON.stringify(["admission-user-v1", tenant.workspaceId, tenant.userId])).slice(0, 32)}`;
-  return `${inboxDir(keyRoot, tenant, machine)}/privacy-journal.json`;
+  return `${userDir(keyRoot, tenant)}/privacy-journal.json`;
+}
+/**
+ * A completed legacy reset's durable identity (one create-only object per request id, never evicted):
+ * SQL keeps a reset idempotent by request id forever, so its replay must never advance seq, however
+ * many controls came between. The journal stays small; only this marker grows with resets.
+ */
+export function resetMarkerKey(keyRoot: string, tenant: LedgerTenant, requestId: string): string {
+  return `${userDir(keyRoot, tenant)}/reset-${sha256Hex(JSON.stringify(["admission-reset-v1", requestId]))}.json`;
 }
 
 // ---- inbox object ----
@@ -144,7 +153,10 @@ export function encodeInbox(tenant: LedgerTenant, prepared: PreparedDelivery, re
   const raw = new Uint8Array(prefix.byteLength + scrubbed.byteLength);
   raw.set(prefix);
   raw.set(scrubbed, prefix.byteLength);
-  return rawZstdFrame(raw);
+  const framed = rawZstdFrame(raw);
+  // The recovery scan tells content from tombstones by size: keep that true by construction.
+  if (framed.byteLength < INBOX_MIN_BYTES || TOMBSTONE.byteLength >= INBOX_MIN_BYTES) throw new Error("admission_inbox_size_invariant");
+  return framed;
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -307,13 +319,20 @@ const idOf = (c: PrivacyControlId) => c.kind === "ordered" ? `o:${c.epoch}:${c.v
 /** begin: "done" (a replay: change nothing), "unfinished" (an earlier attempt is still pending), or "new" (now pending). */
 export type ControlBegin = "done" | "unfinished" | "new";
 
+async function resetCompleted(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, control: PrivacyControlId): Promise<boolean> {
+  if (control.kind !== "reset") return false;
+  return (await store.head(objectKey(resetMarkerKey(keyRoot, tenant, control.requestId)))) !== undefined;
+}
+
 /** BEFORE the control's SQL. Fail closed: a failure must refuse the control. */
 export async function beginPrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, control: PrivacyControlId, nowMs: number): Promise<ControlBegin> {
   const id = idOf(control);
+  const replayedReset = await resetCompleted(store, keyRoot, tenant, control);
   return editJournal<ControlBegin>(store, keyRoot, tenant, (j) => {
-    if (j.done.includes(id)) return { next: null, result: "done" };
-    if (control.kind === "ordered" && j.ordered?.epoch === control.epoch && BigInt(control.version) <= BigInt(j.ordered.maxVersion)) return { next: null, result: "done" };
+    // An earlier attempt still pending is unfinished (its completion may not have landed), whatever else is known.
     if (j.pending.some((p) => p.id === id)) return { next: null, result: "unfinished" };
+    if (replayedReset || j.done.includes(id)) return { next: null, result: "done" };
+    if (control.kind === "ordered" && j.ordered?.epoch === control.epoch && BigInt(control.version) <= BigInt(j.ordered.maxVersion)) return { next: null, result: "done" };
     j.pending.push({ id, startMs: nowMs });
     return { next: j, result: "new" };
   });
@@ -322,6 +341,15 @@ export async function beginPrivacyControl(store: ObjectStore, keyRoot: string, t
 /** AFTER the control's SQL applied (or answered replay for an attempt this journal had pending): seq + 1. */
 export async function completePrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, control: PrivacyControlId): Promise<void> {
   const id = idOf(control);
+  // The durable reset identity first: if the journal edit below fails, a retry finds the id pending
+  // (unfinished) and completes it; a later replay finds the marker and never advances.
+  if (control.kind === "reset") {
+    try {
+      await store.put(objectKey(resetMarkerKey(keyRoot, tenant, control.requestId)), encoder.encode(JSON.stringify({ v: 1, kind: "admission-reset-done" })), { ifNoneMatch: true, contentType: "application/json" });
+    } catch (error) {
+      if (!isObjectStoreError(error, "already_exists") && !isObjectStoreError(error, "precondition_failed")) throw error;
+    }
+  }
   await editJournal(store, keyRoot, tenant, (j) => {
     if (j.done.includes(id) && !j.pending.some((p) => p.id === id)) return { next: null, result: undefined };
     j.pending = j.pending.filter((p) => p.id !== id);
@@ -400,6 +428,35 @@ export async function admissionStatus(store: ObjectStore, keyRoot: string, tenan
 /** Retire the inbox content after a terminal outcome: the old version becomes noncurrent (the bucket's 1-day purge). */
 export async function tombstoneInbox(store: ObjectStore, key: string): Promise<void> {
   await store.put(objectKey(key), TOMBSTONE, { contentType: "application/zstd" });
+}
+
+// ---- durable recovery: the queue is not the authority ----
+
+/** A pending inbox is never smaller than this (its header alone is larger); tombstones and markers always are. */
+export const INBOX_MIN_BYTES = 256;
+const INBOX_ATTEMPT = /\/r=[0-9a-f]{64}\/a=\d{15}-[0-9a-f]{16}\.ndjson\.zst$/;
+
+/**
+ * Every acknowledged inbox object that still holds content (not tombstoned) and is older than
+ * `olderThanMs`, as the admission message that re-drives it. Built from S3 alone, so an expired or
+ * lost queue message never strands an acknowledged upload: the operator re-sends these (a message
+ * for an already-terminal object just acks, and a re-run admission replays the claim). `orgId`
+ * narrows the scan to one tenant.
+ */
+export async function* pendingAdmissions(store: ObjectStore, keyRoot: string, opts: { nowMs: number; olderThanMs: number; orgId?: string }): AsyncGenerator<AdmissionMessage> {
+  if (opts.orgId !== undefined) assertInboxTenant(keyRoot, opts.orgId);
+  const prefix = `${keyRoot}/${INBOX_NAMESPACE}${opts.orgId !== undefined ? `/${opts.orgId}` : ""}`;
+  let cursor: string | undefined;
+  do {
+    const page = await store.list(objectKey(prefix), cursor);
+    for (const item of page.items) {
+      const key = String(item.key);
+      if (!INBOX_ATTEMPT.test(key) || item.size < INBOX_MIN_BYTES) continue;
+      if (opts.nowMs - item.lastModified.getTime() < opts.olderThanMs) continue;
+      yield { v: 1, kind: "ingest-admission", key };
+    }
+    cursor = page.nextCursor;
+  } while (cursor);
 }
 
 export async function readInbox(store: ObjectStore, key: string, decompress: (b: Uint8Array) => Uint8Array): Promise<Uint8Array | null> {

@@ -280,6 +280,18 @@ function failure(c: Context<Env>, error: unknown) {
   );
 }
 
+/**
+ * Whether a failed privacy-control call certainly changed nothing: a typed refusal, or a database error
+ * carrying a real SQLSTATE (a single autocommit statement that errored rolled back). Connection-class
+ * (08xxx), server-shutdown (57P0x) and code-less transport failures are ambiguous.
+ */
+export function definitelyNotApplied(error: unknown): boolean {
+  if (error instanceof DeliveryError && !(error instanceof IngestUnavailable)) return error.status < 500;
+  const db = error instanceof LedgerUnavailableError || error instanceof IngestUnavailable ? error.db : undefined;
+  const code = db?.db_error_code ?? "";
+  return /^[0-9A-Z]{5}$/.test(code) && !code.startsWith("08") && !code.startsWith("57P0");
+}
+
 /** The buffered body as a Request again, for `boundedJson` (decoding per Content-Encoding). */
 function bufferedRequest(c: Context<Env>): Request {
   return new Request(c.req.raw.url, { method: c.req.raw.method, headers: c.req.raw.headers, body: c.get("body") });
@@ -357,8 +369,10 @@ export function createIngestApp(deps: IngestAppDeps) {
     try {
       result = await run();
     } catch (error) {
-      // A typed refusal (4xx) never applied; anything else may have: leave it pending (TTL, then conservative).
-      if (begun === "new" && error instanceof DeliveryError && error.status < 500) await abortPrivacyControl(store, keyRoot, tenant, id).catch(() => {});
+      // Definitely not applied (a typed 4xx, or a SQL error with a SQLSTATE: the statement rolled back):
+      // drop the pending mark, or the consumer would later complete it conservatively and refuse uploads.
+      // Anything ambiguous (a dropped connection) stays pending: TTL, then conservative completion.
+      if (begun === "new" && definitelyNotApplied(error)) await abortPrivacyControl(store, keyRoot, tenant, id).catch(() => {});
       throw error;
     }
     if (begun !== "done") {

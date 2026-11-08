@@ -157,14 +157,21 @@ and every edit is a compare-and-swap (If-Match / If-None-Match).
     answer 503 and never call SQL (fail closed).
   - **complete, AFTER the SQL applied:** remove the pending mark, `seq + 1`, remember the id. A
     completion failure answers 503 so the caller retries; SQL replays and completion runs again.
-  - **abort, when it definitely did not apply:** a typed 4xx refusal, or an ordered control the
-    SQL answered `stale`. Drop the pending mark; seq is unchanged.
-  - Any other failure leaves it pending.
+  - **abort, when it definitely did not apply:** a typed 4xx refusal; a database error carrying a
+    real SQLSTATE (a single autocommit statement that errored rolled back); or an ordered control
+    the SQL answered `stale`. Drop the pending mark; seq is unchanged.
+  - Only an ambiguous failure (connection class 08xxx, server shutdown 57P0x, a code-less
+    transport drop) leaves it pending. Without the abort rule, a control the buffered SQL always
+    refuses (a non-ordered one) would leave pending marks that the consumer later completes
+    conservatively, refusing uploads for nothing.
 - **Control identity (no advance on replay).**
   - An ordered control is `(epoch, version)`. A version at or below the completed maximum is a
     replay or stale, and changes nothing.
-  - A legacy reset is its `request_id`, SQL-idempotent forever, remembered in `done` (the last
-    256).
+  - A legacy reset is its `request_id`, which SQL keeps idempotent forever. Its completion writes
+    a durable create-only marker `…/reset-<sha256(request_id)>.json` (one per id, never evicted)
+    before the journal edit, so a replay after any number of other controls never advances `seq`.
+    Causal test: R0, 256 other resets, U, R0 replayed, U admitted. With the marker disabled the
+    test fails.
   - A legacy re-enable has no idempotency key, so every one is new; the cost is over-refusal on
     a literal double submit.
 - **Gate (consumer, AFTER its claim, before any write).**
@@ -286,9 +293,17 @@ Cloudflare maximum; a post-create setting, PR #367). A DLQ redrive at any age re
 check, so a redrive after a reset refuses the pre-reset uploads. The P1-a causal test runs:
 200, twenty transient failures (max retries), eight days later a redrive, admitted.
 
-If a message is ever lost past the DLQ, its bytes remain under
-`96bulls/.admission-inbox/<org>/…`. An operator can list that prefix with a credential allowed to list the bucket
-and re-send `{v:1, kind:"ingest-admission", key}` for any non-tombstone object.
+**Durable recovery: the queue is not the authority.** If a message is ever lost or expires past
+the DLQ, its bytes remain under `96bulls/.admission-inbox/<org>/…`. `scripts/admission-inbox-recover.ts`
+is read-only: credentials come from the environment only, and it needs `s3:ListBucket`. It
+rebuilds the exact admission message for every inbox object that still holds content and is
+older than a threshold (`pendingAdmissions`), and prints one JSON line each for the operator to
+publish to the admission queue. Two properties make this safe:
+- Tombstones and markers are told apart by size, an invariant enforced at encode: an inbox is
+  always at least 256 bytes and a tombstone never is.
+- Over-sending is harmless: a terminal object acks, and a re-run admission replays the claim.
+
+Tested: pending objects are listed; tombstoned, fresh and journal/marker objects are not.
 
 Hygiene: tombstones, outcome markers and journals are small objects that accumulate. That is
 acceptable at current volumes. A future rule may expire only tombstones and outcomes (for

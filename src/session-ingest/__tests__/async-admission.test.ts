@@ -234,6 +234,41 @@ describe("privacy journal", () => {
     expect((await j(s))).toMatchObject({ seq: 1, pending: [] });
   });
 
+  test("P1 causal: a legacy reset replayed after more than 256 other controls still never advances seq", async () => {
+    const s = store();
+    const ledger = new MemoryLedger();
+    const a = createIngestApp({ identify: (req) => bindingIdentity(req), log: () => {}, deliver: { ledger, acceptanceMode: "buffered", target: { store: s, keyRoot: "96bulls" } }, asyncAdmission: { mode: "on", enqueue: async () => {}, nowMs: () => T0 } });
+    const { deliveryAccount } = await import("../vendor/delivery/prepare.ts");
+    const account = await deliveryAccount(TENANT);
+    const resetRoute = (requestId: string) => a.request("/v1/delivery/sessions/reset", { method: "POST", headers: { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity(identity) }, body: JSON.stringify({ account_id: account, request_id: requestId, confirmation: "DELETE ALL SESSIONS" }) });
+    expect((await resetRoute("R0")).status).toBe(200);
+    for (let i = 1; i <= 256; i++) expect((await resetRoute(`other-${i}`)).status).toBe(200);
+    const witness = await witnessPrivacyJournal(s, "96bulls", TENANT); // U's witness after all 257 controls
+    expect(witness).toBe(257);
+    expect((await j(s)).done).not.toContain("r:R0"); // evicted from the bounded in-journal list
+    expect((await resetRoute("R0")).status).toBe(200); // the replay
+    expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(257);
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, witness, T0)).resolves.toBeUndefined();
+  }, 60_000);
+
+  test("a control SQL refused with a SQLSTATE is aborted (no pending left to complete later); an ambiguous failure stays pending", async () => {
+    const s = store();
+    const ledger = new MemoryLedger();
+    const a = createIngestApp({ identify: (req) => bindingIdentity(req), log: () => {}, deliver: { ledger, acceptanceMode: "buffered", target: { store: s, keyRoot: "96bulls" } }, asyncAdmission: { mode: "on", enqueue: async () => {}, nowMs: () => T0 } });
+    const { deliveryAccount } = await import("../vendor/delivery/prepare.ts");
+    const account = await deliveryAccount(TENANT);
+    const send = () => a.request("/v1/delivery/sessions/selection", { method: "POST", headers: { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity(identity) }, body: JSON.stringify({ account_id: account, origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s" }], enabled: true }) });
+    // Buffered SQL refuses a non-ordered control (22023): definitely rolled back.
+    ledger.setSessionUploads = async () => { throw new LedgerUnavailableError("ledger_input_refused", { db_error_class: "other", db_error_code: "22023", db_error_basis: "code" } as never); };
+    expect((await send()).status).toBe(503);
+    expect((await j(s)).pending).toEqual([]);
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 0, T0 + PENDING_TTL_MS + 1)).resolves.toBeUndefined();
+    // A dropped connection: it may have committed, so the mark stays (and is completed conservatively later).
+    ledger.setSessionUploads = async () => { throw new LedgerUnavailableError("ledger_connection", { db_error_class: "transport", db_error_code: "ECONNRESET", db_error_basis: "code" } as never); };
+    expect((await send()).status).toBe(503);
+    expect((await j(s)).pending).toHaveLength(1);
+  });
+
   test("an unreadable journal fails closed (never read as seq 0)", async () => {
     const s = store();
     await s.put(objectKey(journalKey("96bulls", TENANT)), new TextEncoder().encode("{}"), { contentType: "application/json" });
@@ -308,6 +343,29 @@ describe("consumer", () => {
     await beginPrivacyControl(q.s, "96bulls", TENANT, { kind: "reset", requestId: "p" }, T0 + 5000);
     ledger.prepareBufferStage = async () => { throw new Error("must not be reached"); };
     expect(await admitMessage(deps(q.s, ledger), q.message, 1)).toMatchObject({ action: "retry", code: "privacy_control_pending", delaySeconds: 15 });
+  });
+});
+
+describe("durable recovery (the queue is not the authority)", () => {
+  test("the S3 scan rebuilds exactly the pending, old-enough inbox messages; tombstoned and fresh ones are skipped", async () => {
+    const { recoverLines } = await import("../../../scripts/admission-inbox-recover.ts");
+    const { tombstoneInbox } = await import("../async-admission.ts");
+    const s = store();
+    const enqueue = async (id: string, tenant = TENANT) => {
+      const prepared = await prepareDelivery(tenant, await batch([record({ record_id: id })], { batch_id: id, ...(tenant !== TENANT ? { account_id: await (await import("../vendor/delivery/prepare.ts")).deliveryAccount(tenant) } : {}) }));
+      return enqueueAdmission({ store: s, keyRoot: "96bulls", enqueue: async () => {} }, tenant, prepared, T0, 0);
+    };
+    const pending = await enqueue("pending");
+    const done = await enqueue("done");
+    await tombstoneInbox(s, done);
+    const other = await enqueue("other-org", { orgId: "org-b", workspaceId: "ws-b", userId: "user-9" });
+    // Journals and outcome markers live under the same prefix and are never listed as work.
+    await beginPrivacyControl(s, "96bulls", TENANT, { kind: "reset", requestId: "x" }, T0);
+    const now = Date.now();
+    expect((await recoverLines(s, { keyRoot: "96bulls", nowMs: now + 3_600_000, olderThanMs: 60_000 })).map((l) => JSON.parse(l).key).sort()).toEqual([other, pending].sort());
+    expect(await recoverLines(s, { keyRoot: "96bulls", nowMs: now + 3_600_000, olderThanMs: 60_000, orgId: "org-a" })).toEqual([JSON.stringify({ v: 1, kind: "ingest-admission", key: pending })]);
+    // Too fresh: an upload still in its normal queue window is left to the queue.
+    expect(await recoverLines(s, { keyRoot: "96bulls", nowMs: now, olderThanMs: 60_000 })).toEqual([]);
   });
 });
 
