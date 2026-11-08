@@ -11,7 +11,7 @@
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { SearchIndexError, assertPosition, comparePositions, type SearchHit, type SearchPosition } from "@rhc/search-index/contracts.ts";
 import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
-import { encodeCursor, type EventPosition } from "./cursor.ts";
+import { encodeBufferedCursor, encodeCursor, type EventPosition } from "./cursor.ts";
 import type { BufferedSearchGate, DropReason } from "./buffered-search-gate.ts";
 import {
   READ_SETTINGS,
@@ -362,12 +362,7 @@ async function readAdapterPage(deps: PageDeps, input: EventQuery): Promise<Event
     if (input.cursor && !advances(page.next, input.cursor) || previous && comparePositions(page.next, previous) !== 0 && !advances(page.next, previous)) throw new SearchIndexError("unavailable", true);
   }
   const rows = page.hits.map(eventRow);
-  let bytes = 0;
-  let cut = rows.length;
-  for (let i = 0; i < rows.length; i++) {
-    if (i > 0 && bytes > PAGE_BYTE_BUDGET) { cut = i; break; }
-    bytes += Buffer.byteLength(rows[i]!.content, "utf8") + ROW_OVERHEAD_BYTES;
-  }
+  const cut = budgetCut(rows);
   const kept = rows.slice(0, cut);
   const nextCursor = cut < rows.length ? encodeCursor(rowPosition(kept[kept.length - 1]!)) : page.next ? encodeCursor(page.next) : null;
   const distinct = new Map<string, SessionKey>();
@@ -380,4 +375,45 @@ async function readAdapterPage(deps: PageDeps, input: EventQuery): Promise<Event
 async function assertCoverage(deps: PageDeps): Promise<void> {
   const fromMs = await deadline(deps, () => deps.adapter!.state.fromMs(new Date()));
   if (!Number.isSafeInteger(fromMs) || fromMs < 0 || fromMs > (deps.completeSinceMs ?? 0)) throw new SearchIndexError("unavailable", true, "coverage_changed");
+}
+
+/**
+ * The page byte budget's cut (readAdapterPage and readBufferedEventPage): the index of the first
+ * row not kept. The first row is always kept; a later row is cut once the kept rows' content
+ * bytes plus ROW_OVERHEAD_BYTES each exceed PAGE_BYTE_BUDGET.
+ */
+export function budgetCut(rows: readonly EventRow[]): number {
+  let bytes = 0;
+  for (let i = 0; i < rows.length; i++) {
+    if (i > 0 && bytes > PAGE_BYTE_BUDGET) return i;
+    bytes += Buffer.byteLength(rows[i]!.content, "utf8") + ROW_OVERHEAD_BYTES;
+  }
+  return rows.length;
+}
+
+/**
+ * One page of an owner-buffered session's projected rows (owner-buffered.ts
+ * readOwnerBufferedEvents; every row is already gated, scrubbed and tenant-checked). The same
+ * full sort key and order as the canonical page (comparePositions: ts in ms, then session,
+ * source, machine, kind, event id by code point, the ClickHouse/portable index order), rows
+ * strictly after the cursor, `limit` rows, then the same byte-budget cut as readAdapterPage.
+ * A page that the limit or the budget cuts carries a buffered cursor (encodeBufferedCursor) at
+ * its last kept row; the last page carries none. Erasure is the buffered gate's, not Supabase
+ * liveness: nothing here asks liveness.
+ */
+export function readBufferedEventPage(rows: readonly EventRow[], input: Pick<EventQuery, "order" | "limit" | "maxContent" | "cursor">): EventPage {
+  const sign = input.order === "desc" ? -1 : 1;
+  const cursor = input.cursor;
+  const sorted = rows
+    .filter((row) => !cursor || sign * comparePositions(rowPosition(row), cursor) > 0)
+    .sort((a, b) => sign * comparePositions(rowPosition(a), rowPosition(b)));
+  const limited = sorted.slice(0, input.limit);
+  const cut = budgetCut(limited);
+  const kept = limited.slice(0, cut);
+  const more = cut < limited.length || sorted.length > limited.length;
+  return {
+    events: kept.map((row) => shapeRow(row, input.maxContent)),
+    nextCursor: more && kept.length > 0 ? encodeBufferedCursor(rowPosition(kept[kept.length - 1]!)) : null,
+    erasedDropped: 0,
+  };
 }

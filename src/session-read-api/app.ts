@@ -55,8 +55,8 @@ import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
-import { CursorError, decodeCursor } from "./cursor.ts";
-import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readEventPage, type Liveness } from "./page.ts";
+import { CursorError, decodeBackendCursor, decodeCursor } from "./cursor.ts";
+import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readBufferedEventPage, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
 import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
@@ -90,7 +90,9 @@ import {
   cursorTsKey,
   mergeListPage,
   readOwnerBufferedList,
+  readOwnerBufferedEvents,
   readOwnerBufferedTurns,
+  BufferedProjectionFailed,
   type BufferedScope,
   type BufferedSessionRow,
   type OwnerBufferedDeps,
@@ -481,8 +483,12 @@ export function createReadApi(deps: ReadApiDeps) {
    * a partial session (`needs_full = 1`) → 501 `session_partial` when
    * pagination starts (no cursor), so the caller reads it from relayhistory.
    */
-  async function sessionGate(identity: VerifiedIdentity, sessionId: string, source: string | undefined, continuing: boolean): Promise<"empty" | "ok"> {
-    const start = await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source);
+  async function sessionGate(
+    identity: VerifiedIdentity, sessionId: string, source: string | undefined, continuing: boolean,
+    /** The same sessionStart answer when the owner-buffered events branch already asked it (one call per request). */
+    known?: Awaited<ReturnType<Liveness["sessionStart"]>>,
+  ): Promise<"empty" | "ok"> {
+    const start = known ?? (await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source));
     if (start.pointers > 0 && start.live === 0) return "empty";
     if (deps.completeSinceMs > 0) {
       if (start.createdAtMs === null) throw unsupported("history_floor_unknown_session");
@@ -517,14 +523,20 @@ export function createReadApi(deps: ReadApiDeps) {
    * found: 503 buffered_fenced. Over the byte bounds: logged `buffered_too_large`, null. A
    * tenant mismatch is a 500; any other failure is logged and answers null.
    */
-  async function bufferedTurns(c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string) {
+  const bufferedTurns = (c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string) =>
+    bufferedDetail(c, () => readOwnerBufferedTurns(ob, bufferedScope(identity), source, sessionId));
+  /** The caller's buffered event rows of one session (readOwnerBufferedEvents), with bufferedTurns' outcomes. */
+  const bufferedEvents = (c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string) =>
+    bufferedDetail(c, () => readOwnerBufferedEvents(ob, bufferedScope(identity), source, sessionId));
+
+  async function bufferedDetail<T extends object>(c: Context, read: () => Promise<T | null | { unverifiedBeforeCandidate: string }>): Promise<T | null> {
     try {
-      const served = await readOwnerBufferedTurns(ob, bufferedScope(identity), source, sessionId);
+      const served = await read();
       if (served && "unverifiedBeforeCandidate" in served) {
         log({ route: c.req.routePath, reason: "buffered_unverified", gate: served.unverifiedBeforeCandidate, correlation_id: c.get("correlationId") });
         return null;
       }
-      return served;
+      return served as T | null;
     } catch (error) {
       if (error instanceof BufferedTooLarge) {
         log({ route: c.req.routePath, reason: "buffered_too_large", correlation_id: c.get("correlationId") });
@@ -535,10 +547,23 @@ export function createReadApi(deps: ReadApiDeps) {
         throw bufferedFenced();
       }
       if (error instanceof TenantMismatchError || error instanceof HttpError) throw error;
+      if (error instanceof BufferedProjectionFailed) {
+        log({ route: c.req.routePath, reason: "buffered_projection_failed", error_code: error.reason, correlation_id: c.get("correlationId") });
+        return null;
+      }
       log({ route: c.req.routePath, reason: "buffered_detail_error", error_code: (error as { name?: string })?.name ?? "error", correlation_id: c.get("correlationId") });
       return null;
     }
   }
+
+  /**
+   * A cursor issued by one backend (canonical or owner-buffered) presented while the other now
+   * serves this session. Refused rather than restarted, skipped or continued: a buffered position
+   * continued on canonical rows would skip the partial-session check and could read a canonical
+   * transcript that is not yet complete against the buffered set (docs/session-read-api-design.md).
+   */
+  const cursorTransition = () =>
+    new HttpError(409, "cursor_backend_transition", "the cursor was issued by another backend for this session; restart pagination without a cursor", "cursor_backend_transition");
 
   app.get("/v1/sessions/:sessionId/events", async (c) => {
     try {
@@ -552,8 +577,34 @@ export function createReadApi(deps: ReadApiDeps) {
       const order = single(c, "order") === "desc" ? "desc" : "asc";
       const limit = clampLimit(single(c, "limit"), EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT);
       const maxContent = positiveInt(single(c, "maxContent"));
-      const cursor = decodeCursor(single(c, "cursor"));
-      if ((await sessionGate(identity, sessionId, source, cursor !== undefined)) === "empty")
+      const rawCursor = single(c, "cursor");
+      // Owner-buffered events (READ_API_OWNER_BUFFERED_EVENTS=on on top of owner-buffered reads and
+      // both allowlists, `source` given): decided before sessionGate, on the pointer count alone.
+      // Any canonical pointer: canonical serves the whole response and no buffered read runs.
+      let start: Awaited<ReturnType<Liveness["sessionStart"]>> | undefined;
+      const ob = source !== undefined ? ownerBufferedFor(identity) : undefined;
+      if (ob?.events === true && source !== undefined) {
+        const presented = decodeBackendCursor(rawCursor);
+        start = await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source);
+        if (start.pointers === 0) {
+          const served = await bufferedEvents(c, identity, ob, sessionId, source);
+          if (served && (served.erased || served.rows.length > 0)) {
+            if (served.erased) {
+              c.header(BUFFERED_HEADER, "1");
+              return c.json({ sessionId, events: [], nextCursor: null, correlationId: c.get("correlationId") });
+            }
+            if (presented?.backend === "canonical") throw cursorTransition();
+            const page = readBufferedEventPage(served.rows, { order, limit, maxContent, cursor: presented?.position });
+            c.header(BUFFERED_HEADER, "1");
+            log({ route: c.req.routePath, reason: "buffered_events_served", events: page.events.length, correlation_id: c.get("correlationId") });
+            return c.json({ sessionId, events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+          }
+        }
+        // Hidden, or canonical now serves: a buffered cursor cannot continue here.
+        if (presented?.backend === "buffered") throw cursorTransition();
+      }
+      const cursor = decodeCursor(rawCursor);
+      if ((await sessionGate(identity, sessionId, source, cursor !== undefined, start)) === "empty")
         return c.json({ sessionId, events: [], nextCursor: null, correlationId: c.get("correlationId") });
       const page = await gatedPage(
         c,
