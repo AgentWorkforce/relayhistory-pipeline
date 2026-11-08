@@ -1090,33 +1090,43 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
   }, 180_000);
 
   test("startup tolerates exactly the owner's ADMIN creator edge, nothing else granted to the writer", async () => {
-    const { pg } = await installed();
-    try {
-      await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
-      // The owner-created shape every platform provisions: a member WITH
-      // ADMIN but neither INHERIT nor SET. PGlite's superuser creates
-      // without the edge, so the test grants the exact shape by hand.
-      await pg.exec(
-        `CREATE ROLE edge_owner LOGIN CREATEROLE; GRANT search_consumer_runtime TO edge_owner WITH ADMIN OPTION, INHERIT FALSE, SET FALSE`,
-      );
-      await pg.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
-      await assertRuntimeIdentity(asIdentityDb(pg));
-      // An INHERIT member refuses, even with ADMIN ...
-      await pg.exec(`GRANT search_consumer_runtime TO edge_owner WITH ADMIN OPTION, INHERIT TRUE, SET FALSE`);
-      await expect(assertRuntimeIdentity(asIdentityDb(pg))).rejects.toThrow("non-creator membership grant");
-      await pg.exec(`REVOKE search_consumer_runtime FROM edge_owner`);
-      await pg.exec(
-        `GRANT search_consumer_runtime TO edge_owner WITH ADMIN OPTION, INHERIT FALSE, SET FALSE`,
-      );
-      await assertRuntimeIdentity(asIdentityDb(pg));
-      // ... and so does a member without ADMIN.
-      await pg.exec(`REVOKE search_consumer_runtime FROM edge_owner`);
-      await pg.exec(`GRANT search_consumer_runtime TO edge_owner`);
-      await expect(assertRuntimeIdentity(asIdentityDb(pg))).rejects.toThrow("non-creator membership grant");
-    } finally {
-      await pg.close();
-    }
-  }, 180_000);
+    // PGlite's RESET SESSION AUTHORIZATION is a no-op (see above): once the
+    // session is the writer it cannot GRANT/REVOKE, so every membership shape
+    // is staged as the superuser on its own database before switching.
+    // The owner-created shape every platform provisions: a member WITH ADMIN
+    // but neither INHERIT nor SET. PGlite's superuser creates without the
+    // edge, so each scenario grants its exact shape by hand.
+    const scenario = async (grant: string, check: (db: SqlExecutor) => Promise<void>) => {
+      const { pg } = await installed();
+      try {
+        await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+        await pg.exec(`CREATE ROLE edge_owner LOGIN CREATEROLE; ${grant}`);
+        await pg.exec(`SET SESSION AUTHORIZATION search_consumer_runtime`);
+        await check(asIdentityDb(pg));
+      } finally {
+        await pg.close();
+      }
+    };
+    await scenario(
+      `GRANT search_consumer_runtime TO edge_owner WITH ADMIN OPTION, INHERIT FALSE, SET FALSE`,
+      (db) => assertRuntimeIdentity(db),
+    );
+    // An INHERIT member refuses, even with ADMIN ...
+    await scenario(
+      `GRANT search_consumer_runtime TO edge_owner WITH ADMIN OPTION, INHERIT TRUE, SET FALSE`,
+      (db) => expect(assertRuntimeIdentity(db)).rejects.toThrow("non-creator membership grant"),
+    );
+    // ... as does a SET member ...
+    await scenario(
+      `GRANT search_consumer_runtime TO edge_owner WITH ADMIN OPTION, INHERIT FALSE, SET TRUE`,
+      (db) => expect(assertRuntimeIdentity(db)).rejects.toThrow("non-creator membership grant"),
+    );
+    // ... and a member without ADMIN.
+    await scenario(
+      `GRANT search_consumer_runtime TO edge_owner`,
+      (db) => expect(assertRuntimeIdentity(db)).rejects.toThrow("non-creator membership grant"),
+    );
+  }, 600_000);
 
   test("startup refuses a database URL carrying startup options", () => {
     expect(() => refuseStartupOptions("postgres://writer:secret@db:5432/hoop?options=-c%20role%3Dwriter")).toThrow(
