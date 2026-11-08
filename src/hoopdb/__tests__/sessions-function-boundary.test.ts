@@ -48,6 +48,7 @@ describe("unified sessions function-boundary generator", () => {
     expect(c.outputs).toEqual(a.outputs);
     expect(Object.keys(a.outputs).sort()).toEqual([
       "src/hoopdb/migrate-guards.ts", "src/hoopdb/sessions-function-acl.json",
+      "supabase/bootstrap/acquisition_installer_verify.sql",
       "supabase/bootstrap/babysitter_retention_verify.sql",
       "supabase/bootstrap/canonical_project_events_verify.sql",
       "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql",
@@ -60,6 +61,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105040000_ingest_lazy_source_tables.down.sql",
       "supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql",
       "supabase/rollbacks/20261105042000_babysitter_evidence_retention.down.sql",
+      "supabase/rollbacks/20261105052000_ingest_acquisition_owner.down.sql",
     ]);
   });
 

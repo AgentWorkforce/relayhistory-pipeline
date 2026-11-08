@@ -53,4 +53,13 @@ export const VERIFIERS: readonly VerifierTarget[] = [
     render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
     transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_babysitter_retention").replaceAll("session ingest", "babysitter retention"),
   },
+  {
+    // The Factory acquisition control role (provisional slot 052000): only install/revoke/rebind/status.
+    role: "bulls96_acquisition_installer",
+    path: "supabase/bootstrap/acquisition_installer_verify.sql",
+    template: "supabase/bootstrap/session_ingest_verify.sql",
+    pattern: /v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
+    render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
+    transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_acquisition_installer").replaceAll("session ingest", "acquisition installer"),
+  },
 ];

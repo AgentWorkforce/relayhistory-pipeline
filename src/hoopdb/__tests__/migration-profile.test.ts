@@ -1679,7 +1679,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // Later lanes roll back first and remove their own ledger rows; only then
-    // 043000 (F2 brief titles) is the latest: 042000, 041000, 040000 and 039000 all refuse
+    // 052000 (acquisition owner, dormant) is the latest: 043000 refuses while it is applied.
+    const AQ = "upstream:20261105052000_ingest_acquisition_owner.sql";
+    expect(await names()).toContain(AQ);
+    expect((await failure(rollback("20261105043000_brief_titles.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(H);
+    await rollback("20261105052000_ingest_acquisition_owner.down.sql");
+    expect(await names()).not.toContain(AQ);
+    expect(await relation("sessions.ingest_acquisition_owners")).toBeNull();
+    // 043000 (F2 brief titles) is then the latest: 042000, 041000, 040000 and 039000 all refuse
     // (55000) while it is applied, so it rolls back first.
     expect(await names()).toContain(H);
     expect((await failure(rollback("20261105042000_babysitter_evidence_retention.down.sql")))?.code).toBe("55000");
@@ -1953,10 +1961,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'bulls96_acquisition_installer')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(12);
+    expect(targets.rows).toHaveLength(13);
     expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
     const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
     const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);

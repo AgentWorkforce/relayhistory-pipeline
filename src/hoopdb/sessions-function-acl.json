@@ -180,6 +180,76 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_acquisition_admit(text,text,text,text,jsonb,jsonb,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_control_lock(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_enroll_begin(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_enroll_complete(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_fenced(text,text,jsonb,jsonb,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_fields(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_gate()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_grant_hash(text,text,text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_install(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_acquisition_installer:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_lock(text,text,jsonb,boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_lock_key(text,text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_pointer_owner(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_publication_epoch(text,text,text,text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_publish_check(text,text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_rebind_origin(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_acquisition_installer:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_refuse(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_replay(uuid,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_request(jsonb,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_require_installer()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_revoke(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_acquisition_installer:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_sorted(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_acquisition_status(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_acquisition_installer:EXECUTE"
+    ],
     "sessions.ingest_apply_ordered_control(jsonb,text)": [
       "<owner>:EXECUTE"
     ],

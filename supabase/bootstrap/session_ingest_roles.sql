@@ -19,6 +19,9 @@
 --             bulls96_babysitter_retention   the E3 erasure phase's registry login: EXECUTE on the
 --                                            retention claim/fence/complete RPCs only (20261105042000;
 --                                            made LOGIN by babysitter_retention_role.sql)
+--             bulls96_acquisition_installer  the Factory acquisition installer: USAGE on sessions and
+--                                            EXECUTE on install/revoke/rebind/status only (20261105052000;
+--                                            made LOGIN by acquisition_installer_role.sql)
 --   attrs     NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
 --   members   member of none.
 --   run as    a superuser (CNPG `postgres`); a CREATEROLE role on PostgreSQL 15 and
@@ -39,7 +42,7 @@ DECLARE
   v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
   v_version int := current_setting('server_version_num')::int;
 BEGIN
-  FOREACH v_name IN ARRAY ARRAY['bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention'] LOOP
+  FOREACH v_name IN ARRAY ARRAY['bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'bulls96_acquisition_installer'] LOOP
     SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
     IF NOT FOUND THEN
       SELECT rolsuper, rolcreaterole INTO v_me FROM pg_roles WHERE rolname = current_user;
