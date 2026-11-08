@@ -142,6 +142,7 @@ Migration `supabase/migrations/20261104022000_session_ingest_ledger.sql`. It nev
   - The commit rechecks the fences. A tombstone or reset that landed after the claim queues that session in `upload_erasure_rearm` for another erasure sweep. That replaces the per-user lock Neon used to serialize resets against deliveries.
   - `upload_cleanup_ready()` is not ported: it is permanently true.
 - **`ingest_tenant_slots`** are per-tenant concurrency leases (section 5).
+- **Acquisition owner (dormant):** an enrolled `(org, workspace, source)` admits only the grant-holding owner of each session, and the edge answers a refusal with a typed 409. Nothing is enrolled and the switch is off. See `docs/ingest-acquisition-owner.md`.
 
 ## 4. Neon replica (transition only)
 
@@ -215,3 +216,31 @@ Migration `supabase/migrations/20261104022000_session_ingest_ledger.sql`. It nev
 1. 96BullSessions: the erasure job reading `sessions.upload_erasure_rearm` (Supabase) as well as Neon's tombstones. While relayhistory writes every tombstone to Neon too, the Neon sweep already revisits those sessions every pass, so the re-arm table is a second signal, not the only one.
 2. relay-desktop: drain an existing quarantine without regenerating, and stop regenerating on auto-include. Neither is needed for the cutover.
 3. When relayhistory's front door is retired: Desktop calls the ingest's `selection` / `reset` routes directly (they exist, and are what #265 calls today).
+
+## 8. Self-host SERVICE (`SERVICE=session-ingest`, default off)
+
+Self-host runs without RelayAuth and without relayhistory-cloud, so there is no front door to sign `x-relay-ingest-identity`. `src/session-ingest/selfhost-server.ts` serves the same Hono app (`app.ts`, unchanged handlers) over node:http in the services image. The hosted Worker never imports it, and nothing on the hosted path changes.
+
+| | hosted Worker | self-host SERVICE |
+|---|---|---|
+| identity | relayhistory's HMAC-signed `x-relay-ingest-identity` | the Desktop's own `sh_at_` bearer, introspected by relaycontrol on **every** request (`selfhost-auth.ts`, no positive cache), `aud` = `RELAYHISTORY_INGEST_ORIGIN`, `rth:sync` required |
+| ledger | Hyperdrive, role `bulls96_session_ingest` | `pg.Pool` as `bulls96_session_ingest` (discrete fields from `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE` required), admitted at startup only as a real login of that role (see "Startup admission") |
+| store | S3 srv-writer key, SSE-KMS | the Locker store (`src/shared/locker.ts`: MinIO keys, EKS Pod Identity, or GCS) under `INGEST_KEY_ROOT` (default `96bulls`) |
+| INGEST_FANOUT | Cloudflare Queue for batches over `INGEST_INLINE_MAX_SESSIONS` | **none**: a Node process has no subrequest budget, so every batch is written inline before the receipt. Nothing is staged, so there is no outbox to lose; an interrupted request leaves a pending claim that the Desktop's retry resumes |
+| acceptance | canonical or buffered | canonical only. Buffered, staging, the Neon replica, custody sources, privacy authority and `INGEST_SIGNING_KEY` are refused at startup |
+| routes | every `app.ts` route | `POST /v1/delivery/batches`, `POST /v1/turns/batches`, `GET /v1/delivery/limits`, `GET /healthz`, `GET /readyz`. Any other `/v1` path is 501 `unsupported_by_backend` before auth |
+
+- **Auth comes before the body.** The wrapper verifies the bearer before it reads a body byte. A caller without a token or without `rth:sync` cannot make the edge buffer 2 MiB.
+- **Header-spoofing proof.** `x-relay-ingest-identity` and `x-relay-ingest-signature` are never read; they are dropped before the app sees the request. The verified identity reaches the app only through a WeakMap keyed by the exact `Request` object, so the ingress needs no header stripping (`selfhost-server.pglite.test.ts`, the "causal" test).
+- **Startup admission** (`assertIngestRole`, the pattern of the acquisition installer's `assertInstallerLogin`; the rules of `supabase/bootstrap/session_ingest_verify.sql`). The edge refuses to start unless all of these hold:
+  - Identity: `session_user` and `current_user` are both `bulls96_session_ingest`, and `current_setting('role')` is `none`. A privileged or member login that runs `SET ROLE bulls96_session_ingest` is refused. A superuser login that runs `SET SESSION AUTHORIZATION bulls96_session_ingest` makes `session_user` and `current_user` the role and leaves `role` at `none`, so this backend's `pg_stat_activity.usename`, which is fixed at authentication, must also be the role. On PG15 that is the only signal. On PostgreSQL 16+ (from `server_version_num`), `system_user` is non-NULL and is `<auth method>:bulls96_session_ingest`.
+  - Role shape: not SUPERUSER, BYPASSRLS, CREATEROLE, CREATEDB, REPLICATION or INHERIT.
+  - Membership, both directions: the role is a member of no role, and no role is a member of it. The only exception is PG16+ on a declared Supabase (`SESSION_POSTGRES_TLS_PROFILE=supabase`, the runtime stand-in for the verifier's `hoopdb.db_mode='supabase'`). There, PostgreSQL records Supabase's non-superuser `postgres` as a member of every role it creates: granted by superuser `supabase_admin`, WITH ADMIN, INHERIT FALSE, SET FALSE. That edge cannot assume the role and is admitted. The same edge with SET or INHERIT, from another grantor, or off Supabase is refused. A Supabase deployment on `custom-ca` must revoke the edge as `supabase_admin`.
+  - Settings: no per-database role setting, `rolconfig` exactly the profile pinned by `session_ingest_role.sql` (5s statement, 2s lock, 10s idle-in-transaction), and the live session shows the same values. The pool sends that profile as its startup `options`.
+  Any failure, including a failed query, refuses with a code that names the property, never an observed value. PGlite has no real login, so the decision (`ingestLoginRefusal`) is tested over rows captured from real scram logins on postgres:15, 16 and 17. The live PGlite test proves the SET ROLE session that the old check admitted is now refused.
+- **Fail closed.** If relaycontrol is unreachable, answers 5xx, answers 401 to our secret or returns a malformed answer, the edge returns a retryable 503 `relaycontrol_unavailable` and writes nothing. A revoked token is refused on the next request.
+- **Pattern A login.** The self-host read API's `POST /v1/cli/login` advertises `rth:sync` only with `RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC=true` (which needs `RELAYHISTORY_SELFHOST_READ_API=true`), and only when introspection granted `rth:sync`. This edge never trusts that reply.
+- **Health.** `/healthz` is liveness and always returns 200 `{ ok, enabled }`. `/readyz` returns 200 only when the edge is enabled and the ledger answers `SELECT 1`. A dormant edge is NotReady by design, so no traffic reaches a process that would answer 503. Introspection is not probed, because probing it needs a token.
+- **Not served self-host yet:** selection, reset, recovery, custody and onboarding. On hosted they are relayhistory-internal. Desktop selection and reset against a self-host origin get a 501 until a self-host design for deletion fences lands.
+
+Env (Secret-injected values are marked *): `SERVICE=session-ingest`, `RELAYHISTORY_SELFHOST_INGEST=true`, `RELAYHISTORY_INGEST_PORT` (default 8081), `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYCONTROL_INTROSPECT_SECRET`*, `RELAYHISTORY_INGEST_DATABASE_URL`*, `SESSION_POSTGRES_TLS_PROFILE` (+ `SESSION_POSTGRES_CA_FILE`/`_SHA256` for custom-ca), `LOCKER_BUCKET` / `LOCKER_ENDPOINT` / `LOCKER_REGION` / `LOCKER_ACCESS_KEY_ID`* / `LOCKER_SECRET_ACCESS_KEY`* (or Pod Identity / `LOCKER_PROVIDER=gcs`), optional `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER` / `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX` (1..32, default 4), and `ALLOW_IN_CLUSTER_HTTP` for plain-http in-cluster relaycontrol.

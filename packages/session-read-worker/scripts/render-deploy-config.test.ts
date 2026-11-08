@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, test } from "vitest";
-import { CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, renderDeployConfig, RenderError } from "./render-deploy-config.ts";
+import { ALL_WORKSPACES, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const TEMPLATE = readFileSync(here("../wrangler.jsonc"), "utf8");
@@ -32,11 +32,11 @@ describe("deploy config render, defaults", () => {
     }
   });
 
-  test("wrangler.jsonc itself declares no service binding, no env and no owner-buffered var", () => {
+  test("wrangler.jsonc itself declares no service binding, no env and no owner-buffered or gate var", () => {
     const config = parse(TEMPLATE);
     expect(config.services).toBeUndefined();
     expect(config.env).toBeUndefined();
-    for (const k of ["RELAYHISTORY_READ_OWNER_BUFFERED", "READ_API_OWNER_BUFFERED_WORKSPACES", "INGEST_S3_BUCKET", "INGEST_S3_REGION"]) expect(config.vars[k]).toBeUndefined();
+    for (const k of ["RELAYHISTORY_READ_OWNER_BUFFERED", "READ_API_OWNER_BUFFERED_WORKSPACES", "INGEST_S3_BUCKET", "INGEST_S3_REGION", "READ_API_BUFFERED_SEARCH_GATE"]) expect(config.vars[k]).toBeUndefined();
     expect(TEMPLATE).toContain(HYPERDRIVE_PLACEHOLDER);
   });
 
@@ -71,8 +71,8 @@ describe("deploy config render, owner_buffered=on", () => {
   test("refuses: no canary workspace, *, malformed or duplicate ids, ids off the directory list, missing bucket or region", () => {
     const refused: Array<[Partial<typeof ON>, RegExp]> = [
       [{ ownerBufferedWorkspaces: "" }, /at least one canary/],
-      [{ ownerBufferedWorkspaces: "*" }, /not allowed/],
-      [{ ownerBufferedWorkspaces: "ws-canary-1,*" }, /not allowed/],
+      [{ ownerBufferedWorkspaces: "*" }, /exactly "\*"/],
+      [{ ownerBufferedWorkspaces: "ws-canary-1,*" }, /cannot be mixed/],
       [{ ownerBufferedWorkspaces: "ws-canary-1,,ws-canary-2" }, /workspace ids/],
       [{ ownerBufferedWorkspaces: "ws canary" }, /workspace ids/],
       [{ ownerBufferedWorkspaces: "ws-canary-1,ws-canary-1" }, /twice/],
@@ -93,10 +93,143 @@ describe("deploy config render, owner_buffered=on", () => {
   });
 });
 
+describe("deploy config render, all-workspaces mode (owner_buffered_workspaces=*)", () => {
+  const ALL = { ...ON, ownerBufferedWorkspaces: "*", directoryWorkspaces: "*" };
+
+  test('"*" with a directory allowlist of "*" renders READ_API_OWNER_BUFFERED_WORKSPACES="*"; everything else as a canary on-render', () => {
+    expect(ALL_WORKSPACES).toBe("*");
+    for (const over of [{}, { ownerBufferedWorkspaces: " * ", directoryWorkspaces: " * " }]) {
+      const config = parse(renderDeployConfig(TEMPLATE, { ...ALL, ...over }));
+      expect(config.vars.READ_API_OWNER_BUFFERED_WORKSPACES).toBe("*");
+      expect(config.vars.RELAYHISTORY_READ_OWNER_BUFFERED).toBe("true");
+      expect(config.services).toEqual([{ ...CONTROL_HEAD_BINDING }]);
+      const canary = parse(renderDeployConfig(TEMPLATE, { ...ON, directoryWorkspaces: "*" }));
+      expect({ ...config.vars, READ_API_OWNER_BUFFERED_WORKSPACES: "x" }).toEqual({ ...canary.vars, READ_API_OWNER_BUFFERED_WORKSPACES: "x" });
+      expect({ ...config, vars: undefined }).toEqual({ ...canary, vars: undefined });
+    }
+  });
+
+  test("ambiguous all-workspaces configs are refused with a clear error", () => {
+    const refused: Array<[Partial<typeof ON>, RegExp]> = [
+      // "*" without the directory allowlist being "*" (explicit list, unset, or a list containing "*").
+      [{ directoryWorkspaces: "ws-canary-1,ws-canary-2" }, /needs SESSION_READ_DIRECTORY_WORKSPACES to be exactly "\*"/],
+      [{ directoryWorkspaces: "" }, /needs SESSION_READ_DIRECTORY_WORKSPACES to be exactly "\*"/],
+      [{ directoryWorkspaces: undefined }, /needs SESSION_READ_DIRECTORY_WORKSPACES to be exactly "\*"/],
+      [{ directoryWorkspaces: "*,ws-canary-1" }, /needs SESSION_READ_DIRECTORY_WORKSPACES to be exactly "\*"/],
+      // "*" mixed with ids, or repeated, even when the directory allowlist is "*".
+      [{ ownerBufferedWorkspaces: "*,ws-canary-1" }, /cannot be mixed/],
+      [{ ownerBufferedWorkspaces: "ws-canary-1, *" }, /cannot be mixed/],
+      [{ ownerBufferedWorkspaces: "*,*" }, /cannot be mixed/],
+      // The mode does not relax the S3 requirements.
+      [{ s3Bucket: "" }, /SESSION_READ_INGEST_S3_BUCKET/],
+      [{ s3Region: "" }, /SESSION_READ_INGEST_S3_REGION/],
+    ];
+    for (const [over, message] of refused) expect(() => renderDeployConfig(TEMPLATE, { ...ALL, ...over }), JSON.stringify(over)).toThrow(message);
+    // "*" with owner_buffered off (or no mode) is the existing ambiguous-dispatch refusal.
+    for (const ownerBuffered of [undefined, "", "off"]) {
+      expect(() => renderDeployConfig(TEMPLATE, { ...ALL, ownerBuffered })).toThrow(/owner_buffered is off/);
+    }
+  });
+
+  test("an explicit canary list still validates exactly as before with a directory allowlist of * or a list", () => {
+    expect(parse(renderDeployConfig(TEMPLATE, ON)).vars.READ_API_OWNER_BUFFERED_WORKSPACES).toBe("ws-canary-1,ws-canary-2");
+    expect(parse(renderDeployConfig(TEMPLATE, { ...ON, directoryWorkspaces: "*" })).vars.READ_API_OWNER_BUFFERED_WORKSPACES).toBe("ws-canary-1,ws-canary-2");
+    expect(() => renderDeployConfig(TEMPLATE, { ...ON, directoryWorkspaces: "ws-canary-1" })).toThrow(/not on SESSION_READ_DIRECTORY_WORKSPACES/);
+  });
+});
+
+describe("deploy config render, buffered_search_gate", () => {
+  const GATE = { hyperdriveId: HD, bufferedSearchGate: "on" };
+  const ALL = { ...ON, ownerBufferedWorkspaces: "*", directoryWorkspaces: "*" };
+
+  test("gate off (no input, empty, off) is byte-identical to the render without the input, for every existing input combination", () => {
+    const combos: RenderInputs[] = [
+      { hyperdriveId: HD },
+      { hyperdriveId: HD, ownerBuffered: "", ownerBufferedWorkspaces: "", directoryWorkspaces: "ws-a" },
+      { hyperdriveId: HD, ownerBuffered: "off", directoryWorkspaces: "*" },
+      ON,
+      { ...ON, directoryWorkspaces: "*" },
+      ALL,
+    ];
+    for (const combo of combos) {
+      const without = renderDeployConfig(TEMPLATE, combo);
+      for (const bufferedSearchGate of [undefined, "", " ", "off", " off "]) {
+        const out = renderDeployConfig(TEMPLATE, { ...combo, bufferedSearchGate });
+        expect(out, JSON.stringify({ combo, bufferedSearchGate })).toBe(without);
+        expect(out).not.toContain(BUFFERED_SEARCH_GATE_VAR);
+      }
+    }
+    // And the no-owner-buffered default is still the old sed render.
+    expect(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, bufferedSearchGate: "off" })).toBe(sedRender(HD));
+  });
+
+  test("gate on alone adds exactly the pinned binding and READ_API_BUFFERED_SEARCH_GATE=on; nothing owner-buffered", () => {
+    expect(BUFFERED_SEARCH_GATE_VAR).toBe("READ_API_BUFFERED_SEARCH_GATE");
+    for (const bufferedSearchGate of ["on", " on "]) {
+      const config = parse(renderDeployConfig(TEMPLATE, { ...GATE, bufferedSearchGate }));
+      expect(config.services).toEqual([{ binding: "HISTORY_CONTROL_HEAD", service: "relayhistory-api", entrypoint: "SessionReadPrivacyControls" }]);
+      expect(config.vars.READ_API_BUFFERED_SEARCH_GATE).toBe("on");
+      for (const k of ["RELAYHISTORY_READ_OWNER_BUFFERED", "READ_API_OWNER_BUFFERED_WORKSPACES", "INGEST_S3_BUCKET", "INGEST_S3_REGION"]) expect(config.vars[k]).toBeUndefined();
+      const base = parse(sedRender(HD));
+      const { services: _s, vars, ...rest } = config;
+      const { vars: baseVars, ...baseRest } = base;
+      expect(rest).toEqual(baseRest);
+      expect(vars).toEqual({ ...baseVars, READ_API_BUFFERED_SEARCH_GATE: "on" });
+    }
+  });
+
+  test("gate on with owner_buffered=on (canary or all-workspaces) renders the binding once and both flags", () => {
+    for (const owner of [ON, ALL]) {
+      const without = parse(renderDeployConfig(TEMPLATE, owner));
+      const out = renderDeployConfig(TEMPLATE, { ...owner, bufferedSearchGate: "on" });
+      expect(out.split('"binding": "HISTORY_CONTROL_HEAD"').length).toBe(2);
+      const config = parse(out);
+      expect(config.services).toEqual([{ ...CONTROL_HEAD_BINDING }]);
+      expect(config.vars).toEqual({ ...without.vars, READ_API_BUFFERED_SEARCH_GATE: "on" });
+      expect({ ...config, vars: undefined }).toEqual({ ...without, vars: undefined });
+    }
+  });
+
+  test("gate on refuses: unknown values, a template that binds services, declares env or already sets the flag; owner-buffered refusals still apply", () => {
+    for (const bufferedSearchGate of ["ON", "true", "1", "yes", "on,off"]) {
+      expect(() => renderDeployConfig(TEMPLATE, { ...GATE, bufferedSearchGate })).toThrow(/buffered_search_gate must be "off" or "on"/);
+      expect(() => renderDeployConfig(TEMPLATE, { ...ON, bufferedSearchGate })).toThrow(/buffered_search_gate must be "off" or "on"/);
+    }
+    const bound = TEMPLATE.replace('"observability"', '"services": [{ "binding": "X", "service": "y" }],\n  "observability"');
+    const withEnv = TEMPLATE.replace('"observability"', '"env": { "production": {} },\n  "observability"');
+    const flagged = TEMPLATE.replace('"CLICKHOUSE_DATABASE"', '"READ_API_BUFFERED_SEARCH_GATE": "on",\n    "CLICKHOUSE_DATABASE"');
+    expect(flagged).not.toBe(TEMPLATE);
+    for (const inputs of [GATE, { ...ON, bufferedSearchGate: "on" }]) {
+      expect(() => renderDeployConfig(bound, inputs)).toThrow(/must not declare services/);
+      expect(() => renderDeployConfig(withEnv, inputs)).toThrow(/must not declare services or env/);
+      expect(() => renderDeployConfig(flagged, inputs)).toThrow(/leave READ_API_BUFFERED_SEARCH_GATE unset/);
+    }
+    for (const hyperdriveId of ["", "0".repeat(32)]) expect(() => renderDeployConfig(TEMPLATE, { ...GATE, hyperdriveId })).toThrow(/Hyperdrive/);
+    expect(() => renderDeployConfig(TEMPLATE, { ...GATE, ownerBufferedWorkspaces: "ws-a" })).toThrow(/owner_buffered is off/);
+    expect(() => renderDeployConfig(TEMPLATE, { ...ON, bufferedSearchGate: "on", s3Bucket: "" })).toThrow(/SESSION_READ_INGEST_S3_BUCKET/);
+  });
+
+  test("the CLI fails closed on a bad BUFFERED_SEARCH_GATE value, before writing anything", () => {
+    const cli = (env: Record<string, string>) => {
+      try {
+        return { code: 0, out: execFileSync("bun", ["run", here("./render-deploy-config.ts")], { env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", HYPERDRIVE_ID: HD, ...env }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) };
+      } catch (error) {
+        const e = error as { status?: number; stdout?: string; stderr?: string };
+        return { code: e.status ?? 1, out: `${e.stdout ?? ""}${e.stderr ?? ""}` };
+      }
+    };
+    const bad = cli({ BUFFERED_SEARCH_GATE: "yes" });
+    expect(bad.code).not.toBe(0);
+    expect(bad.out).toContain('buffered_search_gate must be "off" or "on"');
+  });
+});
+
 describe("deploy workflow wiring", () => {
   test("dispatch inputs default to off and none", () => {
     expect(WORKFLOW).toMatch(/owner_buffered:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
     expect(WORKFLOW).toMatch(/owner_buffered_workspaces:\n\s+description:[^\n]*\n\s+type: string\n\s+default: ""/);
+    expect(WORKFLOW).toMatch(/buffered_search_gate:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}");
   });
 
   test("inputs reach shell only through env, and the render runs this script", () => {
@@ -105,5 +238,6 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).not.toMatch(/^\s+sed 's\/"id"/m);
     // The deploy command is unchanged: no owner-buffered --var; the vars live in the on-render only.
     expect(WORKFLOW).not.toContain("--var \"RELAYHISTORY_READ_OWNER_BUFFERED");
+    expect(WORKFLOW).not.toContain("--var \"READ_API_BUFFERED_SEARCH_GATE");
   });
 });

@@ -16,6 +16,7 @@ import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts"
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
+import { feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } from "./buffered-search-feed.ts";
 
 export interface QueueRecord {
   messageId: string;
@@ -42,6 +43,12 @@ export interface ConsumerDeps {
    * another pass holds the session, so the event is neither lost nor failed.
    */
   requeue?: (manifestKey: string) => Promise<void>;
+  /**
+   * Absent by default (INGEST_BUFFERED_SEARCH_FEED=on only): a buffered-stage object event
+   * (`…/buffered-batches/v1/…`) feeds that stage into the search index instead of reaching the
+   * pointer stage, which ignores such keys anyway. Absent: exactly the previous behavior.
+   */
+  bufferedFeed?: BufferedFeedDeps;
 }
 
 const scopeId = (s: SessionScope) => JSON.stringify([s.orgId, s.workspaceId, s.harness, s.sessionId]);
@@ -71,6 +78,24 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
   const scopes = new Map<string, { scope: SessionScope; messageIds: string[]; manifestKey: string }>();
   for (const { event, messageIds } of byKey.values()) {
     const started = Date.now();
+    if (deps.bufferedFeed && isBufferedStageKey(event.key)) {
+      // KEEP-UP. A delete event is a GC removal: index-row deletes are their own lane, so it is a no-op here.
+      if (event.deleted) continue;
+      try {
+        const fed = await feedBufferedStageByKey(event.key, deps.bufferedFeed);
+        if (fed.outcome === "requeue") {
+          // The PUT lands before the receipt commits (or a GC lease is in flight): look again later.
+          if (!deps.requeue) throw new Error("buffered stage pending and no requeue");
+          await deps.requeue(event.key);
+        }
+        log.info("buffered stage search feed", { stage: "buffered-search-feed", outcome: fed.outcome,
+          ...(fed.outcome === "indexed" ? { count: fed.rows, deleted: fed.deleted } : { reason: fed.reason }), duration_ms: Date.now() - started });
+      } catch (error) {
+        log.error("buffered stage search feed failed", { stage: "buffered-search-feed", ...errorFields(error), duration_ms: Date.now() - started });
+        for (const id of messageIds) failed.add(id);
+      }
+      continue;
+    }
     try {
       const outcome = await indexPointer(event, deps.pointer);
       if (outcome.status === "ignored") {

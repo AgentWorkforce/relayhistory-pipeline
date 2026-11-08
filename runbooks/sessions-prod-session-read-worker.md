@@ -38,7 +38,8 @@ The same `b96e1:` cursors are issued and accepted. A cursor that the Lambda issu
 | `READ_API_BRIEF_TITLES_WORKSPACES` | GitHub env var `SESSION_READ_BRIEF_TITLES_WORKSPACES` | the F2 brief-titles allowlist (`GET /v1/sessions/titles`, docs/brief-titles.md); separate from the P3 canary; unset = 501 `brief_titles_workspace_not_enabled`, `*` = all |
 | `PIPELINE_RAW_S3_BUCKET`, `_REGION`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` (+ optional `_ENDPOINT`, `_SSE`), `PIPELINE_KEY_PREFIX`, `PIPELINE_ORG_FROM_PREFIX` | Worker secrets / vars | session timing's canonical S3 read: a GetObject-only key on the raw bucket, the same key layout the session-pipeline Lambda writes. Unset = timing answers 501 `timing_not_configured` |
 | `READ_API_TIMING_ASSUME_NO_TURNS` | GitHub env var `SESSION_READ_TIMING_ASSUME_NO_TURNS` | `true` only for canary workspaces a read-only count showed have no Neon `conversation_turns` (see "Session timing" below); unset = such sessions answer 501 `timing_turns_unknown` |
-| `RELAYHISTORY_READ_OWNER_BUFFERED`, `READ_API_OWNER_BUFFERED_WORKSPACES`, `INGEST_S3_BUCKET`, `INGEST_S3_REGION`, binding `HISTORY_CONTROL_HEAD` | rendered only by a `owner_buffered=on` dispatch (`scripts/render-deploy-config.ts`); bucket/region from GitHub env vars `SESSION_READ_INGEST_S3_BUCKET` / `SESSION_READ_INGEST_S3_REGION`; allowlist from the `owner_buffered_workspaces` input | Option C owner-buffered reads, default off. On adds the service binding to `relayhistory-api` entrypoint `SessionReadPrivacyControls` (pinned, not an input), the flag `true`, and the canary allowlist (explicit ids, each also on `SESSION_READ_DIRECTORY_WORKSPACES`; no `*`). S3 reads use the `PIPELINE_RAW_S3_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` Worker secrets (the on deploy refuses unless both exist); GetObject + kms:Decrypt on `buffered-batches/` is a separate IAM grant. Flag on without the binding = every request 503. Any later dispatch without inputs deploys it off again. Prerequisites (PR A migration, IAM grant, relayhistory-cloud exporting the entrypoint) are separate approvals |
+| `RELAYHISTORY_READ_OWNER_BUFFERED`, `READ_API_OWNER_BUFFERED_WORKSPACES`, `INGEST_S3_BUCKET`, `INGEST_S3_REGION`, binding `HISTORY_CONTROL_HEAD` | rendered only by a `owner_buffered=on` dispatch (`scripts/render-deploy-config.ts`); bucket/region from GitHub env vars `SESSION_READ_INGEST_S3_BUCKET` / `SESSION_READ_INGEST_S3_REGION`; allowlist from the `owner_buffered_workspaces` input | Option C owner-buffered reads, default off. On adds the service binding to `relayhistory-api` entrypoint `SessionReadPrivacyControls` (pinned, not an input), the flag `true`, and the canary allowlist (explicit ids, each also on `SESSION_READ_DIRECTORY_WORKSPACES`; or exactly `*`, see "Owner-buffered all-workspaces mode" below). S3 reads use the `PIPELINE_RAW_S3_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` Worker secrets (the on deploy refuses unless both exist); GetObject + kms:Decrypt on `buffered-batches/` is a separate IAM grant. Flag on without the binding = every request 503. Any later dispatch without inputs deploys it off again. Prerequisites (PR A migration, IAM grant, relayhistory-cloud exporting the entrypoint) are separate approvals |
+| `READ_API_BUFFERED_SEARCH_GATE`, binding `HISTORY_CONTROL_HEAD` | rendered only by a `buffered_search_gate=on` dispatch (`scripts/render-deploy-config.ts`) | Per-hit privacy gate for buffered-origin search hits (#338), default off; see "Buffered search gate" below |
 
 **Fail-closed defaults:**
 - With no origin, every `/v1` request gets a 401.
@@ -50,6 +51,33 @@ Cloud falls back to relayhistory on a 503.
 - `cancel_http_readonly_queries_on_client_close=1`
 - `max_threads=4`
 - `use_skip_indexes=1`
+
+## Owner-buffered all-workspaces mode
+
+Default off; nothing changes unless a dispatch asks for it. Dispatch *deploy session-read-worker* with `owner_buffered=on` and `owner_buffered_workspaces=*`. The render (`packages/session-read-worker/scripts/render-deploy-config.ts`) then sets `READ_API_OWNER_BUFFERED_WORKSPACES=*` next to `RELAYHISTORY_READ_OWNER_BUFFERED=true`, the `HISTORY_CONTROL_HEAD` binding and the S3 vars, exactly as a canary on-render.
+
+The render accepts `*` only when the GitHub env var `SESSION_READ_DIRECTORY_WORKSPACES` is itself exactly `*`. It refuses, before anything deploys:
+- `*` while `SESSION_READ_DIRECTORY_WORKSPACES` is a list or unset (list the canary ids instead);
+- `*` mixed with ids, or repeated (`*,ws-a`, `*,*`);
+- `*` with `owner_buffered=off` or no mode.
+
+An explicit canary list validates exactly as before.
+
+**Privacy invariant.** The mode widens the workspace allowlist only. Every buffered row is still served only to its owner, through the same per-user gate:
+- the SQL readers bind the verified user per call and gate on that user's own G2 parity row in `sessions.owner_buffered_parity` (rule 4, mandatory; `sessions.owner_buffered_read_scope`). Users without a G2 row stay hidden;
+- the `HISTORY_CONTROL_HEAD` authority gate is observed for exactly that (org, workspace, user).
+
+Tests: `src/session-read-api/__tests__/owner-buffered.routes.test.ts` ("all-workspaces mode does not bypass the per-user privacy gate").
+
+To turn it off, dispatch again without inputs. Prerequisites and approvals are the same as for a canary: the PR A migration, the S3/KMS grant, the binding and the deploy itself each need Khaliq's explicit OK.
+
+## Buffered search gate
+
+Default off; nothing changes unless a dispatch asks for it. Dispatch *deploy session-read-worker* with `buffered_search_gate=on`. The render then sets `READ_API_BUFFERED_SEARCH_GATE=on` and the same pinned `HISTORY_CONTROL_HEAD` binding (`relayhistory-api`, entrypoint `SessionReadPrivacyControls`; not an input). With `owner_buffered=on` as well, the binding is rendered once. The gate needs no workspace list and no S3 vars. The render refuses any value other than `off`/`on` and a `wrangler.jsonc` that already declares `services`, `env` or the flag. `off` (or no input) renders byte-identically to a deploy without the input.
+
+The gate drops every buffered-origin search hit it cannot prove visible (control head for the hit's owner, original admission, G2 parity row, deletions and resets; `src/session-read-api/buffered-search-gate.ts`). Order matters: deploy the gate **before** the buffered search feeder (#339) is enabled, so a buffered row is never served without it. The flag only has an effect once #338 is on `main`.
+
+Turning it on is a production deploy: dispatch is Khaliq's call. To turn it off, dispatch again without the input.
 
 ## Why Hyperdrive and not a direct TLS connection
 

@@ -2,7 +2,10 @@
  * Rule set 4 promise: a quoted value whose total length to its matching closing quote is
  * within the scan bound (`MAX_QUOTED_VALUE`, 4096 UTF-16 units, counted across line
  * breaks) scrubs byte-identically to rule set 3. This differential fuzz runs rule set 3's
- * `lib/scrub.ts` against the current one on random key/value inputs, including
+ * `lib/scrub.ts` against rule set 4's (the frozen `fixtures/scrub-ruleset-4.ts`; rule set
+ * 5 deliberately redacts multi-line and unclosed values within the bound whole, so the
+ * current `lib/scrub.ts` no longer keeps this promise, see `scrub-v4-v5-fuzz.test.ts`) on
+ * random key/value inputs, including
  * multi-line values whose first line is short and that cross the bound only after one or
  * more breaks (CR, LF, CRLF, U+2028, U+2029, U+0085), and values whose total length lands
  * either side of the bound. A difference is allowed only where rule set 4 reports an
@@ -20,7 +23,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { scrubText as v3 } from "./fixtures/scrub-ruleset-3.js";
-import { overCapQuotedValueSpans, scrubText as v4 } from "../src/lib/scrub.js";
+import { overCapQuotedValueSpans, scrubText as v4 } from "./fixtures/scrub-ruleset-4.js";
 
 /** sha256 of fixtures/scrub-ruleset-3.ts (LF line endings), rule set 3's scrub.ts at fc10bb03. */
 const V3_FIXTURE_SHA256 = "e912c396277d383ef07a77b5b3dbd54d9ad83e59d3d5d1bafdab62b2b619daa1";

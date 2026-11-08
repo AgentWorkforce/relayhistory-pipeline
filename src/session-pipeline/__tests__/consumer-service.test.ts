@@ -76,7 +76,7 @@ function env(overrides: Record<string, string | undefined> = {}): NodeJS.Process
     SEARCH_INDEX_BACKEND: "postgres",
     SEARCH_INDEX_POSTGRES_BACKEND_ID: "selfhost-pg",
     READ_API_COMPLETE_SINCE: "epoch",
-    PIPELINE_KEY_PREFIX: "96bulls/org_1",
+    PIPELINE_KEY_PREFIX: "96bulls",
     ...overrides,
   };
 }
@@ -108,7 +108,7 @@ describe("consumer service flag", () => {
 describe("consumer service config", () => {
   test("minimal valid config enables with the reader floor", () => {
     const config = consumerServiceConfig(env());
-    expect(config).toMatchObject({ enabled: true, backendId: "selfhost-pg", keyPrefix: "96bulls/org_1", floorMs: 0 });
+    expect(config).toMatchObject({ enabled: true, backendId: "selfhost-pg", keyPrefix: "96bulls", floorMs: 0 });
   });
   test("floor follows READ_API_COMPLETE_SINCE and refuses junk", () => {
     expect(consumerServiceConfig(env({ READ_API_COMPLETE_SINCE: "2026-01-01T00:00:00Z" }))).toMatchObject({
@@ -155,6 +155,18 @@ describe("consumer service config", () => {
       "SEARCH_INDEX_POSTGRES_BACKEND_ID",
     );
     expect(() => consumerServiceConfig(env({ PIPELINE_KEY_PREFIX: undefined }))).toThrow("PIPELINE_KEY_PREFIX");
+  });
+  test("a trailing org-shaped prefix segment fails startup instead of doubling the org", () => {
+    expect(() => consumerServiceConfig(env({ PIPELINE_KEY_PREFIX: "96bulls/org_1" }))).toThrow(
+      "PIPELINE_KEY_PREFIX must be the bare deployment base",
+    );
+    expect(() => consumerServiceConfig(env({ PIPELINE_KEY_PREFIX: "96bulls/org-a" }))).toThrow(
+      "PIPELINE_KEY_PREFIX must be the bare deployment base",
+    );
+    expect(consumerServiceConfig(env({ PIPELINE_KEY_PREFIX: "backups/96bulls" }))).toMatchObject({
+      keyPrefix: "backups/96bulls",
+    });
+    expect(consumerServiceConfig(env())).toMatchObject({ keyPrefix: "96bulls" });
   });
   test("fanout postgres is refused: the consumer is terminal", () => {
     expect(consumerServiceConfig(env())).toMatchObject({ enabled: true, fanout: "off" });

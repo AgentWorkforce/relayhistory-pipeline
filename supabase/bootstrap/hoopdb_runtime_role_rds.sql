@@ -73,7 +73,9 @@ BEGIN
                    'bulls96_session_ingest', 'bulls96_session_ingest_seeder',
                    'bulls96_canonical_feature_producer', 'bulls96_read_api',
                    'bulls96_project_events', 'bulls96_privacy_eraser',
-                   'bulls96_babysitter_retention', 'bulls96_rds_role_seed',
+                   'bulls96_babysitter_retention', 'bulls96_acquisition_installer',
+                   'buffered_search_feed_runtime',
+                   'bulls96_rds_role_seed',
                    'anon', 'authenticated', 'service_role', 'rdsadmin', 'rds_superuser')
      OR v_role = v_owner THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('RDS runtime role bootstrap: invalid role name %L', v_role);

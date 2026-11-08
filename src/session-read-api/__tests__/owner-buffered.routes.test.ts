@@ -5,10 +5,11 @@
  * erasure race, hidden admission), cross-user 500, flag/allowlist off (no gate call, bytes
  * unchanged), events never buffered, and the pre-v4 stored object regression.
  */
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "bun:test";
 import { AuthError, createReadApi, type TurnsDeps, type VerifiedIdentity } from "../app.ts";
 import { decodeCompositeListCursor, encodeCompositeListCursor, type Directory, type DirectoryListRow } from "../directory.ts";
-import { BufferedFenced, serviceBindingControlHead, sqlOwnerBufferedReads, type ControlHeadGate, type OwnerBufferedDeps, type OwnerBufferedReads } from "../owner-buffered.ts";
+import { BUFFERED_USER_SQL, BufferedFenced, serviceBindingControlHead, sqlOwnerBufferedReads, type ControlHeadGate, type OwnerBufferedDeps, type OwnerBufferedReads } from "../owner-buffered.ts";
 import { memoryLiveness } from "./support.ts";
 import { E1, SESSION, authority, bufferedRow, fencedGate, headBody, putStage, scratch, scriptedGate, scriptedReads, turn, unzip } from "./owner-buffered-support.ts";
 
@@ -51,6 +52,8 @@ interface Harness {
   liveSessions?: Record<string, number>;
   noOwnerBuffered?: boolean;
   livePointers?: (sessionIds: string[]) => Promise<Set<string>>;
+  /** The verified identity the token maps to; default ID. */
+  identity?: VerifiedIdentity;
 }
 function api(h: Harness = {}) {
   const logs: Record<string, unknown>[] = [];
@@ -83,7 +86,7 @@ function api(h: Harness = {}) {
   const app = createReadApi({
     verify: async (t) => {
       if (t !== "good") throw new AuthError(401, "invalid_token", "token is not valid");
-      return ID;
+      return h.identity ?? ID;
     },
     ch: { database: "relay_search", async command() {}, async insert() {}, async select() { throw new Error("no ClickHouse in these tests"); } } as never,
     liveness: h.livePointers
@@ -549,5 +552,110 @@ describe("regression: a stored pre-v4 buffered object with a partially redacted 
     const fenced = await api({ store: s, gate: scriptedGate(authority("7"), new BufferedFenced("gate_pending")), reads: scriptedReads({ stages: [[st.row]] }).reads }).get(T);
     expect(fenced.status).toBe(503);
     expect(await fenced.text()).not.toContain(SUFFIX);
+  });
+});
+
+/**
+ * All-workspaces mode: READ_API_OWNER_BUFFERED_WORKSPACES="*" with READ_API_DIRECTORY_WORKSPACES="*"
+ * (render-deploy-config.ts accepts "*" only then). The mode widens the workspace allowlist and
+ * nothing else: every buffered row still comes from the SECURITY DEFINER readers, which bind the
+ * verified user per call and gate on that user's own G2 parity row (rule 4, mandatory) in
+ * sessions.owner_buffered_read_scope, and from the control-head gate for exactly that user.
+ */
+describe("all-workspaces mode does not bypass the per-user privacy gate", () => {
+  const ALL = { workspaces: "*" as const, obWorkspaces: "*" as const };
+  const MIGRATION = readFileSync(new URL("../../../supabase/migrations/20261105043700_owner_buffered_read.sql", import.meta.url), "utf8");
+
+  /**
+   * A TenantRunner standing in for the read role: rows only for a user with a G2 parity row in
+   * this (org, workspace), as owner_buffered_read_scope's gate_open; records every binding.
+   */
+  function parityRunner(parity: Set<string>, stageRow?: unknown) {
+    const bound: Array<{ org: string; ws: string; user: unknown; sql: string; params: unknown[] }> = [];
+    const run = (async (org: string, ws: string, work: (q: unknown) => Promise<unknown>) => {
+      let user: unknown = null;
+      return work({
+        async query(sql: string, params: unknown[] = []) {
+          if (sql === BUFFERED_USER_SQL) user = params[0];
+          bound.push({ org, ws, user, sql, params });
+          const open = typeof user === "string" && parity.has(`${org}/${ws}/${user}`);
+          if (!open) return { rows: [] };
+          if (sql.includes("buffered_sessions_for")) return { rows: [{ ...bufferedRow(), user_id: user, first_ts: new Date("2026-11-05T12:00:00Z"), last_ts: new Date("2026-11-05T12:05:00Z") }] };
+          if (sql.includes("buffered_session_stages_for") && stageRow) return { rows: [stageRow] };
+          return { rows: [] };
+        },
+      });
+    }) as never;
+    return { run, bound };
+  }
+
+  test("a user without a G2 parity row sees no buffered row, turns or metadata in all-workspaces mode", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [turn(0)]);
+    const base = await json(await api({ ...ALL, noOwnerBuffered: true }).get(L));
+    // Parity exists only for another user and for this user in another workspace.
+    const { run, bound } = parityRunner(new Set(["org-a/ws-a/u-2", "org-a/ws-b/u-1"]), st.row);
+    const gate = scriptedGate(authority("7"));
+    const { get } = api({ ...ALL, gate, store: s, reads: sqlOwnerBufferedReads(run) });
+    const r = await get(L);
+    expect(r.status).toBe(200);
+    expect(strip(await json(r))).toEqual(strip(base));
+    expect(r.headers.get("x-relayhistory-buffered-ids")).toBeNull();
+    expect((await get(T)).status).toBe(501);
+    expect((await get(M)).status).not.toBe(200);
+    // Every reader call was bound to the verified user and the token's workspace, never a wildcard.
+    const rpcs = bound.filter((x) => x.sql.includes("sessions.buffered_"));
+    expect(rpcs.some((b) => b.sql.includes("buffered_sessions_for"))).toBe(true);
+    expect(rpcs.some((b) => b.sql.includes("buffered_session_stages_for"))).toBe(true);
+    for (const b of rpcs) {
+      expect([b.org, b.ws, b.user]).toEqual(["org-a", "ws-a", "u-1"]);
+      expect(b.params[0]).toBe("ws-a");
+    }
+    expect(bound.some((b) => b.ws === "*" || b.params.includes("*"))).toBe(false);
+    // The control-head gate is observed for exactly the caller.
+    for (const scope of gate.calls) expect(scope).toEqual({ orgId: "org-a", workspaceId: "ws-a", userId: "u-1" });
+  });
+
+  test("mirror: the same user with their own G2 parity row is served in all-workspaces mode", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [turn(0)]);
+    const { run } = parityRunner(new Set(["org-a/ws-a/u-1"]), st.row);
+    const { get } = api({ ...ALL, store: s, reads: sqlOwnerBufferedReads(run) });
+    const r = await get(L);
+    expect(r.headers.get("x-relayhistory-buffered-ids")).toBe(`claude:${SESSION}`);
+    const t = await get(T);
+    expect(t.status).toBe(200);
+    expect(t.headers.get("x-relayhistory-buffered")).toBe("1");
+  });
+
+  test("a token without a user gets no buffered read in all-workspaces mode: gate and readers never called", async () => {
+    const base = await json(await api({ ...ALL, noOwnerBuffered: true, identity: { ...ID, userId: "" } }).get(L));
+    const { run, bound } = parityRunner(new Set(["org-a/ws-a/u-1", "org-a/ws-a/"]));
+    const gate = scriptedGate(authority("7"));
+    const r = await api({ ...ALL, gate, identity: { ...ID, userId: "" }, reads: sqlOwnerBufferedReads(run) }).get(L);
+    expect(strip(await json(r))).toEqual(strip(base));
+    expect(r.headers.get("x-relayhistory-buffered-ids")).toBeNull();
+    expect(gate.calls).toHaveLength(0);
+    expect(bound).toHaveLength(0);
+  });
+
+  test("the authority gate still fences in all-workspaces mode", async () => {
+    const { run } = parityRunner(new Set(["org-a/ws-a/u-1"]));
+    const r = await api({ ...ALL, gate: fencedGate("gate_timeout"), reads: sqlOwnerBufferedReads(run) }).get(L);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("x-relayhistory-buffered")).toBe("fenced");
+    expect(r.headers.get("x-relayhistory-buffered-ids")).toBeNull();
+  });
+
+  test("gate source: both readers go through owner_buffered_read_scope, which requires the caller's own parity row and workspace", () => {
+    const scope = MIGRATION.slice(MIGRATION.indexOf("CREATE FUNCTION sessions.owner_buffered_read_scope("), MIGRATION.indexOf("$scope$;"));
+    expect(scope).toContain("FROM sessions.owner_buffered_parity AS bp");
+    expect(scope).toMatch(/WHERE bp\.org_id = v_org AND bp\.workspace_id = v_workspace AND bp\.user_id = v_user;\s+v_open := FOUND;/);
+    expect(scope).toContain("p_workspace_id IS DISTINCT FROM v_workspace");
+    for (const reader of ["buffered_sessions_for", "buffered_session_stages_for"]) {
+      const at = MIGRATION.indexOf(`CREATE FUNCTION sessions.${reader}(`);
+      expect(at).toBeGreaterThan(0);
+      expect(MIGRATION.slice(at, at + 2500)).toContain("FROM sessions.owner_buffered_read_scope(p_workspace,");
+    }
   });
 });

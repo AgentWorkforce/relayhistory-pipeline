@@ -26,8 +26,12 @@
  *                                   SESSION_POSTGRES_CA_SHA256). There is no implicit
  *                                   default here: the shared helper would otherwise
  *                                   silently pin the Supabase CA on a self-host install
- *   PIPELINE_KEY_PREFIX                       enabled: the deployment object prefix
- *                                   (e.g. `96bulls/org-id`), required
+ *   PIPELINE_KEY_PREFIX                       enabled: the bare deployment object base
+ *                                   (e.g. `96bulls`; the org is appended at
+ *                                   runtime as `<base>/<orgId>`), required.
+ *                                   A trailing org-shaped segment (e.g.
+ *                                   `96bulls/org_1`) fails startup: it would
+ *                                   double the org on every key
  *   PIPELINE_RECONCILE_LOOKBACK_MINUTES       reconcile window in minutes, default 30,
  *                                   minimum 1; must be greater than EVERY
  *   CONSUMER_RECONCILE_EVERY_MINUTES          poll cadence in minutes, default 5, minimum 1
@@ -128,6 +132,12 @@ export function consumerServiceConfig(env: NodeJS.ProcessEnv = process.env): Con
   if (!backendId) throw new Error(`96bulls: ${CONSUMER_SERVICE_FLAG}=true needs ${CONSUMER_BACKEND_ID_VAR}`);
   const keyPrefix = env[CONSUMER_KEY_PREFIX_VAR];
   if (!keyPrefix) throw new Error(`96bulls: ${CONSUMER_SERVICE_FLAG}=true needs ${CONSUMER_KEY_PREFIX_VAR}`);
+  // Org-from-prefix layout appends the org at runtime (`<base>/<orgId>`): a
+  // configured base that already ends in an org-shaped segment would double
+  // the org on every key, so fail startup instead of misrouting silently.
+  // The error names the variable, never the value.
+  if (/^org[-_][A-Za-z0-9_-]+$/.test(keyPrefix.split("/").pop() ?? ""))
+    throw new Error(`96bulls: ${CONSUMER_KEY_PREFIX_VAR} must be the bare deployment base; it must not end in an org-shaped segment`);
   const fanout = env.PIPELINE_FANOUT ?? "off";
   if (fanout !== "off") throw new Error("pipeline consumer: PIPELINE_FANOUT must be off (the self-host consumer fans out nothing)");
   const lookbackMinutes = strictMinutes(env, "PIPELINE_RECONCILE_LOOKBACK_MINUTES", 30);

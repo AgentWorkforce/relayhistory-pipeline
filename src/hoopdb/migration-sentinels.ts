@@ -43,6 +43,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "replacement: GC claim has its single-candidate advisory admission domain",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_buffer_gc_claim(jsonb)') AND prosecdef AND prosrc LIKE '%96bulls:buffer-gc-user-v1%') AS applied",
   },
+  "upstream:20261105043850_ingest_acquisition_owner.sql": { evidence: "table sessions.ingest_acquisition_owners", sql: relation("sessions.ingest_acquisition_owners") },
   "upstream:20261105043000_brief_titles.sql": { evidence: "column sessions.session_briefs.origin", sql: column("sessions.session_briefs", "origin") },
   "upstream:20261105043500_lazy_claim_clock_narrowing.sql": {
     evidence: "replacement: lazy claim reads the seat clock under KEY SHARE with one advisory lock per (org, workspace, origin)",
@@ -53,6 +54,8 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "replacement: staged ACK locks the seat clock FOR NO KEY UPDATE (claims' KEY SHARE no longer queues behind it), then the bounded origin advisory lock before any slot",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_ack_batch(jsonb)') AND NOT prosecdef AND prosrc LIKE '%WHERE singleton FOR NO KEY UPDATE;%' AND prosrc LIKE '%pg_advisory_xact_lock(hashtextextended(jsonb_build_array(''96bulls:lazy-native-origin-v1'',p->>''org_id'',p->>''workspace_id'',p->>''origin_id'')::text,0));%') AS applied",
   },
+  "upstream:20261105043860_buffered_search_gate.sql": { evidence: "function sessions.buffered_search_gate_for", sql: "SELECT to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)') IS NOT NULL AS applied" },
+  "upstream:20261105043870_buffered_search_feed_cursor.sql": { evidence: "table sessions.buffered_search_feed_cursors", sql: relation("sessions.buffered_search_feed_cursors") },
   "upstream:20261105024000_session_brief_documents.sql": { evidence: "table sessions.session_brief_document_outbox", sql: relation("sessions.session_brief_document_outbox") },
   "upstream:20261105025000_canonical_feature_journal.sql": { evidence: "table sessions.canonical_feature_journal", sql: relation("sessions.canonical_feature_journal") },
   "upstream:20261105026000_canonical_history_lineage.sql": { evidence: "table sessions.ingest_history_carriers", sql: relation("sessions.ingest_history_carriers") },
