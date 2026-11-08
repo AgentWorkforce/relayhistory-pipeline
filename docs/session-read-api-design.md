@@ -137,3 +137,23 @@ These are tracked in the neon-readers inventory lanes.
 2. **Phase C binding:** PostgREST JWT or a second member edge for the claim-bound RPCs. This goes to the HoopDb owner.
 3. **Phase B schema:** pipeline writes an `event_json` column (the #242 shape) into a `transcript_session_events` table ordered by `(org_id, session_id, ts…)`. This goes to the #121 owner.
 4. **`READ_API_COMPLETE_SINCE`:** the production value, from the backfill state.
+
+## 8. Owner-only buffered read (Option C)
+
+Code only, default off. `RELAYHISTORY_READ_OWNER_BUFFERED` enables it only when it is exactly `1` or `true`; unset or any other value leaves every route exactly as without the feature (no gate call, no SQL, no header). It is wired in the Worker only (`packages/session-read-worker`); the Lambda entry never builds the dependency. Code: `src/session-read-api/owner-buffered.ts`.
+
+**Who sees what.** A buffered row is served only to its owner: the token must carry a verified user, `workspace=` must equal the token's workspace, and the workspace must be on `READ_API_DIRECTORY_WORKSPACES` (`*` or a list; unset means none). The SQL readers bind the user from the verified identity (`bulls96_read.user_id`); any returned row or stage header for another org, workspace or user is a 500 (`cross_tenant`), never a page.
+
+**Authority gate.** Every buffered response passes the privacy authority twice: before the SQL read and again after the S3 fetch, before any byte is emitted. The authority is the `HISTORY_CONTROL_HEAD` named-entrypoint service binding: `POST /internal/v1/privacy/control-head` with `{contract:"r2-control-head/v1", org, workspace, user}` from the verified token only, a 2.5 s deadline and no caching. The response is validated strictly (contract, echo of org/workspace/user, `cutover` active ingest epoch, `head` null or `{epoch, version, digest, kind, pending}`); the two observations must be identical. Unbound, non-2xx, timeout, malformed, echo mismatch, pending head or a moved head all mean fenced. No request header is trusted for authority.
+
+**Admission.** The RPCs receive the observed head (`p_cutover_epoch`, `p_head_epoch`, `p_head_version` as text, `p_head_digest`, `p_head_pending`) and return each stage's immutable admission `(epoch, version)`. A stage is visible only when, with head null, its epoch equals the cutover epoch and its version is 0, or otherwise its epoch and version equal the head's (compared as exact decimals with BigInt). NULL admission is hidden. A session with any hidden stage is not served.
+
+**Routes.**
+
+- `GET /v1/sessions`: canonical rows UNION the caller's visible buffered rows, deduped by `(source, sessionId)` with canonical winning (also when a live pointer exists), newest first, one opaque composite cursor. `source`, `notSource`, `user` (only the caller) and the time bounds apply; `agent` or `projectContains` skip buffered rows for that request. Body unchanged; buffered rows fill every `sessionSummary` key. Header `X-Relayhistory-Buffered-Ids: <source>:<sessionId>,...` when the page holds buffered rows; fenced means buffered rows are dropped, the canonical page is still served and `X-Relayhistory-Buffered: fenced` is set.
+- `GET /v1/sessions/:id/turns` and `/metadata` (with `source`): only when no canonical pointer exists. Stages are fetched from S3 (`buffered-batches/`, sha256 and tenant checked), the keep predicate is rechecked after the fetch (erased: empty turns, metadata 404; an S3 404 is retried once), and the result carries `X-Relayhistory-Buffered: 1` and `Cache-Control: private, no-store`. Not owned, hidden or absent: 501 `turns_no_pointers` as today. Fenced: 503 `buffered_fenced` with `Retry-After: 1`.
+- Never on events, activity, timing, catalog, output, digest or delivery routes.
+
+**Read-time scrub.** Buffered stage objects carry no trustworthy scrub version, so every text field is scrubbed at read time with `scrubText` plus the v4 quoted-value rule: a quoted value under a secret key that is over 4096 units or unclosed is redacted in full (the remainder of an unclosed value is dropped). A ruleset version claimed in an object header never grants eligibility. `scrub.ts` is unchanged; the wrapper is marked TODO until v4 lands there.
+
+**Env and bindings (Worker).** `RELAYHISTORY_READ_OWNER_BUFFERED`, `INGEST_S3_BUCKET`, `INGEST_S3_REGION`, the existing raw-store key pair, and the `HISTORY_CONTROL_HEAD` binding. All unset in `wrangler.jsonc`. Enabling needs the PR A migration applied, the S3 GetObject and KMS grant, and the binding; each is a separate approval.

@@ -15,6 +15,10 @@
  * (optional overrides), RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS (exactly "true"
  * also accepts relaycontrol `sh_at_` tokens; default off) with
  * RELAYCONTROL_INTROSPECT_URL / RELAYCONTROL_INTROSPECT_SECRET.
+ *
+ * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED, owner-buffered.ts) are
+ * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
+ * them, so the flag has no effect here.
  */
 import pg from "pg";
 import { log } from "../shared/log.ts";
