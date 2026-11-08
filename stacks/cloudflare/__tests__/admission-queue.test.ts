@@ -40,12 +40,13 @@ function admissionFixture(mode = "ok") {
 }
 const admissionRequest = { id: "session-ingest-admission", news: { name: ADMISSION_QUEUE } };
 
-test("admission queue: official create, then retention PATCHed and read back; never paused; ownership refusals kept", async () => {
+test("admission queue: official create, then retention PATCHed, read back and persisted; never paused; ownership refusals kept", async () => {
   const x = admissionFixture();
   const row = await Effect.runPromise(x.service.reconcile(admissionRequest));
-  expect(row).toEqual({ accountId: account, queueId: qid, queueName: ADMISSION_QUEUE });
+  expect(row).toEqual({ accountId: account, queueId: qid, queueName: ADMISSION_QUEUE, messageRetentionPeriod: ADMISSION_RETENTION_SECONDS });
   expect(x.order).toEqual(["create", "read", "retain", "read"]);
-  await Effect.runPromise(x.service.diff(admissionRequest));
+  // A converged output plans no change.
+  expect(await Effect.runPromise(x.service.diff({ ...admissionRequest, output: row }))).toBeUndefined();
   expect(x.order).toContain("base-diff:session-ingest-admission");
   expect(await Effect.runPromise(x.service.read({ id: "session-ingest-admission" }))).toEqual(row);
   expect(x.order).not.toContain("pause");
@@ -61,6 +62,72 @@ test("admission queue: official create, then retention PATCHed and read back; ne
   }
   await expect(Effect.runPromise(admissionFixture("ignored").service.reconcile(admissionRequest))).rejects.toThrow("retention_not_observed");
   await expect(Effect.runPromise(admissionFixture("paused").service.reconcile(admissionRequest))).rejects.toThrow("admission_queue_paused");
+});
+
+/** A stateful synthetic cloud with one existing queue per admission id, at a given live retention. */
+function existingCloud(liveRetention: number | undefined) {
+  const live = new Map<string, number | undefined>([["d".repeat(32), liveRetention], ["e".repeat(32), liveRetention]]);
+  const ids: Record<string, { queueId: string; queueName: string }> = {
+    "session-ingest-admission": { queueId: "d".repeat(32), queueName: ADMISSION_QUEUE },
+    "session-ingest-admission-dlq": { queueId: "e".repeat(32), queueName: ADMISSION_DLQ },
+  };
+  const calls: string[] = [];
+  const nameOf = (queueId: string) => Object.values(ids).find((v) => v.queueId === queueId)!.queueName;
+  const base = {
+    version: 0,
+    diff: () => Effect.succeed(undefined),
+    read: (i: any) => Effect.succeed({ accountId: account, ...ids[i.id]! }),
+    reconcile: (i: any) => Effect.succeed({ accountId: account, ...ids[i.id]! }),
+    delete: () => Effect.void,
+  };
+  const api = {
+    list: () => Effect.succeed(Object.values(ids).map((v) => ({ ...v, consumersTotalCount: 1, producersTotalCount: 1 }))),
+    get: (_a: string, queueId: string) => Effect.sync(() => ({ queueId, queueName: nameOf(queueId), settings: { messageRetentionPeriod: live.get(queueId) }, consumersTotalCount: 1, producersTotalCount: 1 })),
+    pause: () => Effect.sync(() => { calls.push("pause"); }),
+    retain: (_a: string, queueId: string) => Effect.sync(() => { calls.push("retain:" + nameOf(queueId)); live.set(queueId, ADMISSION_RETENTION_SECONDS); }),
+  };
+  return { ids, live, calls, service: pausedQueueService(base, api as never, account) as any };
+}
+
+test.each(["session-ingest-admission", "session-ingest-admission-dlq"])(
+  "%s: state from before retention was pinned plans update -> PATCH + readback -> next plan noop",
+  async (logicalId) => {
+    const c = existingCloud(undefined);
+    const news = { name: logicalId === "session-ingest-admission" ? ADMISSION_QUEUE : ADMISSION_DLQ };
+    const oldOutput = { accountId: account, ...c.ids[logicalId]! };   // persisted by an earlier head: no retention
+    expect(await Effect.runPromise(c.service.diff({ id: logicalId, news, output: oldOutput }))).toEqual({ action: "update" });
+    const updated = await Effect.runPromise(c.service.reconcile({ id: logicalId, news, output: oldOutput }));
+    expect(updated.messageRetentionPeriod).toBe(ADMISSION_RETENTION_SECONDS);
+    expect(c.calls).toEqual(["retain:" + news.name]);
+    expect(await Effect.runPromise(c.service.diff({ id: logicalId, news, output: updated }))).toBeUndefined();
+    // Another reconcile is a no-op on the wire (idempotent).
+    await Effect.runPromise(c.service.reconcile({ id: logicalId, news, output: updated }));
+    expect(c.calls).toEqual(["retain:" + news.name]);
+  },
+);
+
+test.each(["session-ingest-admission", "session-ingest-admission-dlq"])(
+  "%s: live drift (state 14d, live default) surfaces in read and plans update",
+  async (logicalId) => {
+    const c = existingCloud(345600);
+    const news = { name: logicalId === "session-ingest-admission" ? ADMISSION_QUEUE : ADMISSION_DLQ };
+    const stateOutput = { accountId: account, ...c.ids[logicalId]!, messageRetentionPeriod: ADMISSION_RETENTION_SECONDS };
+    const refreshed = await Effect.runPromise(c.service.read({ id: logicalId, output: stateOutput }));
+    expect(refreshed.messageRetentionPeriod).toBe(345600);
+    expect(await Effect.runPromise(c.service.diff({ id: logicalId, news, output: refreshed }))).toEqual({ action: "update" });
+    const fixed = await Effect.runPromise(c.service.reconcile({ id: logicalId, news, output: refreshed }));
+    expect(fixed.messageRetentionPeriod).toBe(ADMISSION_RETENTION_SECONDS);
+    expect((await Effect.runPromise(c.service.read({ id: logicalId, output: fixed }))).messageRetentionPeriod).toBe(ADMISSION_RETENTION_SECONDS);
+    expect(c.calls).toEqual(["retain:" + news.name]);
+  },
+);
+
+test("fanout queues: diff/read/reconcile unchanged by the admission retention (no retain call, still pause-only)", async () => {
+  const c = existingCloud(undefined);
+  const out = { accountId: account, queueId: qid, queueName: FANOUT_QUEUE, deliveryPaused: true };
+  // A paused fanout output with no retention field: no update is planned on its account.
+  await expect(Effect.runPromise(c.service.diff({ id: "session-ingest-fanout", news: { name: FANOUT_QUEUE, deliveryPaused: true }, output: out }))).resolves.toBeUndefined();
+  expect(c.calls).toEqual([]);
 });
 
 test("real pinned SDK: admission create -> PATCH exactly the retention -> GET readback, through the operator guard", async () => {
@@ -151,4 +218,35 @@ test("operator: admission calls only with a buffered asyncAdmission capture; nev
   await expect(withAdmission(root + "/" + fid, { method: "PATCH", body: JSON.stringify(retain) })).rejects.toThrow("queue_pause_scope");
   await expect(plain(root + "/" + aid, { method: "PATCH", body: JSON.stringify(retain) })).rejects.toThrow();
   expect(calls.filter((c) => c.startsWith("PATCH"))).toEqual(["PATCH queues/" + fid, "PATCH queues/" + aid]);
+});
+
+test("real pinned SDK: the UPDATE path for an existing default-retention queue passes the operator guard (list, get, PATCH, get)", async () => {
+  const secrets = { accountId: account, apiToken: "synthetic-api-token", stateUrl: "https://alchemy-state-store-96bulls.fixture.workers.dev", stateToken: "synthetic-state-token" };
+  let retention = 345600;
+  const order: string[] = [];
+  const row = () => ({ queue_id: qid, queue_name: ADMISSION_DLQ, settings: { delivery_paused: false, message_retention_period: retention }, consumers_total_count: 1, producers_total_count: 0 });
+  const transport: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const u = new URL(String(input)), method = init?.method ?? "GET";
+    order.push(method);
+    if (method === "GET" && u.pathname.endsWith("/queues")) return Response.json({ success: true, result: [row()], result_info: { page: 1, per_page: 100, count: 1, total_count: 1 } });
+    if (method === "PATCH") {
+      expect(await new Response(init?.body).json()).toEqual({ settings: { message_retention_period: ADMISSION_RETENTION_SECONDS } });
+      retention = ADMISSION_RETENTION_SECONDS;
+    }
+    return Response.json({ success: true, result: row() });
+  }) as typeof fetch;
+  const guarded = guardOperatorFetch(secrets, "deploy", transport, "buffered", true);
+  const output = { accountId: account, queueId: qid, queueName: ADMISSION_DLQ };
+  const base = { version: 0, diff: () => Effect.succeed(undefined), reconcile: () => Effect.succeed(output) };
+  const service = pausedQueueService(base, liveBufferedQueueApi, account) as any;
+  const request = { id: "session-ingest-admission-dlq", news: { name: ADMISSION_DLQ }, output };
+  expect(await Effect.runPromise(service.diff(request))).toEqual({ action: "update" });
+  const updated = await Effect.runPromise(service.reconcile(request).pipe(
+    Effect.provideService(Credentials, Effect.succeed(apiTokenCredentials({ apiToken: Redacted.make("synthetic-token-not-authorized") }))),
+    Effect.provide(FetchHttpClient.layer),
+    Effect.provideService(FetchHttpClient.Fetch, guarded),
+  )) as any;
+  expect(updated.messageRetentionPeriod).toBe(ADMISSION_RETENTION_SECONDS);
+  expect(order).toEqual(["GET", "GET", "PATCH", "GET"]);
+  expect(await Effect.runPromise(service.diff({ ...request, output: updated }))).toBeUndefined();
 });

@@ -78,14 +78,23 @@ export function pausedQueueService(
   const admission = {
     diff: Effect.fn(function* (input: any) {
       admissionProps(input);
-      return yield* base.diff(input);
+      const ordinary = yield* base.diff(input);
+      if (ordinary?.action === "replace") return ordinary;
+      // Retention is persisted in the output (and refreshed by read): absent (state from before it was
+      // pinned) or drifted plans an in-place update, which reconcile converges and reads back.
+      if (input.output && input.output.messageRetentionPeriod !== ADMISSION_RETENTION_SECONDS)
+        return { action: "update" };
+      return ordinary;
     }),
     read: Effect.fn(function* (input: any) {
       const result = yield* base.read(input);
       if (!result) return undefined;
-      if (!id(result.accountId) || result.accountId !== expectedAccountId || !id(result.queueId) || result.queueName !== admissionNames.get(input.id))
+      const name = admissionNames.get(input.id);
+      if (!id(result.accountId) || result.accountId !== expectedAccountId || !id(result.queueId) || result.queueName !== name)
         no("queue_identity");
-      return result;
+      // Live retention, so drift shows in the next diff.
+      const observed = exact(yield* bounded(api.get(result.accountId, result.queueId)), result.queueId, name!);
+      return { ...result, messageRetentionPeriod: observed.settings?.messageRetentionPeriod ?? null };
     }),
     reconcile: Effect.fn(function* (input: any) {
       const name = admissionProps(input);
@@ -113,7 +122,8 @@ export function pausedQueueService(
         if (final.settings?.deliveryPaused === true) no("admission_queue_paused");
         if (!input.output && (final.consumersTotalCount !== 0 || final.producersTotalCount !== 0)) no("initial_queue_not_empty");
       }
-      return result;
+      // Persisted: the next diff compares it, so a converged queue plans noop.
+      return { ...result, messageRetentionPeriod: ADMISSION_RETENTION_SECONDS };
     }),
   };
   const route = (method: "diff" | "read" | "reconcile") => (input: any) =>

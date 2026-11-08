@@ -291,6 +291,9 @@ describe("session ingest worker: deploy plan contract", () => {
     // Adding admission to a deployed stage: the three creates + the Worker's in-place binding update.
     const addition = { ...Object.fromEntries(ADMISSION_RESOURCES.map((r) => [r, "create"])), "session-ingest": "update" };
     expect(checkWith(plan(addition, all))).toBe("async admission addition");
+    // Retention convergence on existing admission queues is an in-place update.
+    expect(checkWith(plan({ "session-ingest-admission": "update", "session-ingest-admission-dlq": "update" }, all))).toBe("session ingest update");
+    expect(() => checkWith(plan({ "session-ingest-admission": "update", "session-ingest-admission-consumer": "create" }, all))).toThrow(/neither a rollout/);
     expect(() => check(plan({ "session-ingest": "update", "session-ingest-fanout-consumer": "create" }))).toThrow(/neither a rollout/);
     for (const extra of [{ "session-ingest-fanout": "update" }, { "session-ingest-fanout-consumer": "update" }, { "session-ingest-admission-consumer": "update" }])
       expect(() => checkWith(plan({ ...addition, ...extra }, all))).toThrow(/neither a rollout/);
