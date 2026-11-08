@@ -8,6 +8,7 @@ import { publicationTargetKind } from "../publication-target.ts";
 import { portablePublicationConfig, portablePublicationSecrets, portablePoolConfig, publicationConfigForTarget, runPortablePublicationRuntime, HOSTED_ONLY_VARS } from "../publication-portable.ts";
 import { publicationRuntimeConfig } from "../publication-runtime.ts";
 import { publicationMain } from "../publication-main.ts";
+import { INGEST_LOGIN_IDENTITY_SQL, INGEST_LOGIN_PG16_SQL } from "../ingest-login.ts";
 
 const codeOf = (f: () => unknown) => { try { f(); } catch (e) { return (e as { code?: string }).code ?? (e as Error).message; } return "no_throw"; };
 const asyncCodeOf = (p: Promise<unknown>) => p.then(() => "resolved", (e: { code?: string; message?: string }) => e.code ?? e.message);
@@ -154,18 +155,28 @@ test("portable runtime: disabled does no work; enabled binds only configured end
   expect(poolConfig).toMatchObject({ host: "pg.example.test", user: "bulls96_session_ingest", database: "sessions" });
   expect(fetched).toEqual([]);
   // A pool login other than the ingest role is refused before any store or RPC work.
-  const fakePool = (me: string, session: string) => () => ({ options: { connectionTimeoutMillis: 1000 }, on() { return this; }, async end() {},
-    connect(cb: any) { cb(undefined, { on() {}, removeListener() {}, release() {}, query(q: any) { queueMicrotask(() => { if (/current_user/.test(q.text)) q.emit("row", { me, session }); q.emit("end"); }); } }); } }) as any;
+  // Identity rows as recorded from real PostgreSQL 16 (see ingest-login.test.ts).
+  const genuine = { session_user: "bulls96_session_ingest", current_user: "bulls96_session_ingest", role_setting: "none", server_version: 160015, backend_user: "bulls96_session_ingest" };
+  const fakePool = (login: Record<string, unknown>, systemUser: string | null) => () => ({ options: { connectionTimeoutMillis: 1000 }, on() { return this; }, async end() {},
+    connect(cb: any) { cb(undefined, { on() {}, removeListener() {}, release() {}, query(q: any) { queueMicrotask(() => {
+      if (q.text === INGEST_LOGIN_IDENTITY_SQL) q.emit("row", login); else if (q.text === INGEST_LOGIN_PG16_SQL) q.emit("row", { system_user: systemUser });
+      q.emit("end"); }); } }); } }) as any;
   let stores = 0;
-  for (const [me, session] of [["bulls96_session_ingest", "postgres"], ["postgres", "postgres"]])
-    expect(await asyncCodeOf(runPortablePublicationRuntime({ ...GOOD, INGEST_PUBLISH_ENABLED: "true" }, "publish", { assets, fetcher, pool: fakePool(me!, session!), store: () => { stores++; throw Error("x"); } }))).toBe("publication_database_role");
+  const refusedLogins: [Record<string, unknown>, string | null][] = [
+    [{ ...genuine, backend_user: "postgres" }, "scram-sha-256:postgres"], // superuser + SET SESSION AUTHORIZATION
+    [{ ...genuine, session_user: "postgres", role_setting: "bulls96_session_ingest", backend_user: "postgres" }, "scram-sha-256:postgres"], // SET ROLE
+    [genuine, null], // trust auth on PG16: no authenticated identity
+    [{ ...genuine, session_user: "postgres", current_user: "postgres", backend_user: "postgres" }, "scram-sha-256:postgres"],
+  ];
+  for (const [login, su] of refusedLogins)
+    expect(await asyncCodeOf(runPortablePublicationRuntime({ ...GOOD, INGEST_PUBLISH_ENABLED: "true" }, "publish", { assets, fetcher, pool: fakePool(login, su), store: () => { stores++; throw Error("x"); } }))).toBe("publication_database_role");
   expect(stores).toBe(0);
   // With the ingest login: the store factory sees the endpoint, region and static keys; no KMS, SSE only when configured.
   const seen: any[] = [];
   const stop = (c: any) => { seen.push(c); throw Object.assign(Error("stop"), { code: "stop_after_store_config" }); };
   for (const sse of [undefined, "AES256"]) {
     const env = { ...GOOD, INGEST_PUBLISH_ENABLED: "true", ...(sse ? { INGEST_PUBLISH_S3_SSE: sse } : {}) };
-    expect(await asyncCodeOf(runPortablePublicationRuntime(env, "publish", { assets, fetcher, pool: fakePool("bulls96_session_ingest", "bulls96_session_ingest"), store: stop }))).toBe("stop_after_store_config");
+    expect(await asyncCodeOf(runPortablePublicationRuntime(env, "publish", { assets, fetcher, pool: fakePool(genuine, "scram-sha-256:bulls96_session_ingest"), store: stop }))).toBe("stop_after_store_config");
   }
   expect(seen[0]).toMatchObject({ bucket: "selfhost-sessions", region: "us-east-1", endpoint: "https://minio.example.test", credentials: { accessKeyId: "publisher-fixture", secretAccessKey: "fixture-secret-only" } });
   expect(seen[0].serverSideEncryption).toBeUndefined();

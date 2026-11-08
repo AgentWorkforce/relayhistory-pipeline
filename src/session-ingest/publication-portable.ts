@@ -43,6 +43,7 @@ import{postgresConnectionString,postgresTlsOptions}from'../shared/postgres-tls.t
 import{assertDestinationUrl,destinationPolicy}from'../shared/destination-url.ts';
 import{publicationEnabled,scopedPublicationStore,publicationGenerationKey,publicationRuntimeConfig,type PublicationRuntimeConfig}from'./publication-runtime.ts';
 import{publicationTargetKind}from'./publication-target.ts';
+import{ingestLoginIdentity}from'./ingest-login.ts';
 import{publicationRpc}from'./publication-rpc.ts';
 import{canonicalPublicationTick}from'./publication-job.ts';
 import{publicationGcLedger,collectPublicationObject}from'./publication-gc.ts';
@@ -141,8 +142,9 @@ export async function runPortablePublicationRuntime(env:NodeJS.ProcessEnv,mode:'
   const secrets=portablePublicationSecrets(config,env,overrides.readFile);signal.throwIfAborted();
   pool=(overrides.pool??(c=>new pg.Pool(c)))(secrets.pool);pool.on('error',()=>{});
   const sql=new SemanticPostgresExecutor(pool),read=new SemanticPostgresExecutor(pool,true),context=()=>({signal,deadline:Math.min(deadline,Date.now()+1800)});
-  const who=(await read.queryBounded<{me:string;session:string}>('SELECT current_user AS me,session_user AS session',[],context())).rows[0];
-  if(who?.me!=='bulls96_session_ingest'||who.session!=='bulls96_session_ingest')no('database_role');
+  // A genuine login as the ingest role, before any verifier, store or RPC work: not SET ROLE and not a
+  // privileged backend's SET SESSION AUTHORIZATION (ingest-login.ts). Refusal is one code, no detail.
+  if(await ingestLoginIdentity(q=>read.queryBounded<Record<string,unknown>>(q,[],context())))no('database_role');
   // dbMode is one of DB_MODES (a fixed allowlist), never free text.
   await read.queryBounded(`SET LOCAL hoopdb.db_mode='${config.dbMode}';`+Object.values(assets.verifiers).join('\n'),[],context());
   const target:PublicationTarget={bucket:config.bucket,region:config.region,keyRoot:config.keyRoot,generation:config.generation};

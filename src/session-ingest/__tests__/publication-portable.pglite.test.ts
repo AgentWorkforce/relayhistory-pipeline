@@ -123,11 +123,13 @@ test("portable GC: retired generation is barriered in the same bucket and erased
   expect(marker.kind).toBe("upload-generation-redaction");
 });
 
-test("portable runtime refuses a superuser or foreign login before any publication RPC", async () => {
-  for (const role of ["postgres", "bulls96_session_ingest_seeder"]) {
-    const before = s3.requests.length;
-    await expect(runPortablePublicationRuntime(ENV, "publish", overrides({ pool: (c: any) => pgliteTestPool(db, role, c) }))).rejects.toMatchObject({ code: "publication_database_role" });
+test("portable runtime refuses a superuser, foreign login or SET SESSION AUTHORIZATION before any publication RPC", async () => {
+  // [session role, authenticated login]: the last is a superuser backend that ran SET SESSION AUTHORIZATION.
+  for (const [role, login] of [["postgres", "postgres"], ["bulls96_session_ingest_seeder", "bulls96_session_ingest_seeder"], ["bulls96_session_ingest", "postgres"]]) {
+    const before = s3.requests.length, attempts = (await owner("SELECT count(*)::int n FROM sessions.ingest_publication_attempts")).rows[0].n;
+    await expect(runPortablePublicationRuntime(ENV, "publish", overrides({ pool: (c: any) => pgliteTestPool(db, role!, c, login!) }))).rejects.toMatchObject({ code: "publication_database_role" });
     expect(s3.requests.length).toBe(before);
+    expect((await owner("SELECT count(*)::int n FROM sessions.ingest_publication_attempts")).rows[0].n).toBe(attempts);
   }
 });
 

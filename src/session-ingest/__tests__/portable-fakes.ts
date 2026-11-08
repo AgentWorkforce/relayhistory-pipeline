@@ -3,7 +3,11 @@
  * pgliteTestPool: a pg.Pool-shaped port over one PGlite instance. Connections are
  *   serialized (PGlite has one backend). Each acquired client runs as the given
  *   role via SET SESSION AUTHORIZATION, so current_user AND session_user are that
- *   role, as a real LOGIN would be; release rolls back and returns to postgres
+ *   role. PGlite cannot authenticate, so the two login-identity probes (ingest-login.ts)
+ *   are answered from PGlite's live session_user/current_user/role/version plus the
+ *   authenticated identity this fake claims (`authenticatedAs`, default the role):
+ *   pg_stat_activity usename and system_user "scram-sha-256:<authenticatedAs>", as
+ *   recorded from real PostgreSQL. Release rolls back and returns to postgres
  *   (PGlite single-user mode does not honour RESET SESSION AUTHORIZATION).
  * MinioShapedS3: a path-style S3-compatible fetch (PUT with If-None-Match / If-Match, GET,
  *   HEAD) that only answers its own bucket and refuses any request whose SigV4
@@ -12,9 +16,10 @@
 import pg from "pg";
 import { createHash } from "node:crypto";
 import type { PGlite } from "@electric-sql/pglite";
+import { INGEST_LOGIN_IDENTITY_SQL, INGEST_LOGIN_PG16_SQL } from "../ingest-login.ts";
 
-export function pgliteTestPool(db: PGlite, role: string, options: pg.PoolConfig = {}) {
-  if (!/^[a-z0-9_]{1,63}$/.test(role)) throw new Error("fixture role");
+export function pgliteTestPool(db: PGlite, role: string, options: pg.PoolConfig = {}, authenticatedAs: string = role) {
+  if (!/^[a-z0-9_]{1,63}$/.test(role) || !/^[a-z0-9_]{1,63}$/.test(authenticatedAs)) throw new Error("fixture role");
   let lock: Promise<void> = Promise.resolve();
   let ended = false;
   const releasing = new Set<Promise<void>>();
@@ -43,7 +48,11 @@ export function pgliteTestPool(db: PGlite, role: string, options: pg.PoolConfig 
             (async () => {
               try {
                 let rows: unknown[];
-                if (values && values.length) rows = (await db.query(text, values as never)).rows;
+                if (text === INGEST_LOGIN_IDENTITY_SQL) {
+                  const live = (await db.query<any>("SELECT session_user::text AS session_user, current_user::text AS current_user, current_setting('role') AS role_setting, current_setting('server_version_num')::int AS server_version")).rows[0];
+                  rows = [{ ...live, backend_user: authenticatedAs }];
+                } else if (text === INGEST_LOGIN_PG16_SQL) rows = [{ system_user: `scram-sha-256:${authenticatedAs}` }];
+                else if (values && values.length) rows = (await db.query(text, values as never)).rows;
                 else { const all = await db.exec(text); rows = all.at(-1)?.rows ?? []; }
                 for (const row of rows) q.emit("row", row);
                 q.emit("end");
