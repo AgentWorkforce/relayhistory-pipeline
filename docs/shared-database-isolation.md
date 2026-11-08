@@ -43,7 +43,7 @@ Objects we own or depend on outside `sessions` today:
 |---|---|---|
 | Extensions `pg_trgm`, `btree_gin` in `public` | `supabase/migrations/20261030010000_session_directory.sql:9`, `supabase/migrations/20261030020000_session_directory_short_summary.sql:177`; opclass use `public.gin_trgm_ops` at `20261030010000_session_directory.sql:134,138`, `20261030020000_session_directory_short_summary.sql:255,263`, `20261101050000_session_directory_list.sql:246` | Landed bytes are frozen. The platform admin pre-creates both extensions `WITH SCHEMA public`, owned by the admin, under the contract's "administrator-owned" extension namespace. Our `CREATE EXTENSION IF NOT EXISTS` then is a no-op. A proof must show that it is a no-op for a non-owner without CREATE on the database (open question Q4). |
 | Database ACL: `REVOKE TEMPORARY ON DATABASE ... FROM PUBLIC`, `GRANT CONNECT ON DATABASE ... TO <runtime>` | `supabase/bootstrap/hoopdb_runtime_role.sql:175-179`, `supabase/bootstrap/hoopdb_runtime_role_rds.sql:134-141` (requires our owner to own the database) | Removed from our bootstrap in shared mode. Database ACLs belong to the platform admin. We only verify them read-only (section 5). |
-| Global function defaults for several roles | `supabase/bootstrap/hoopdb_function_default_revoke.sql:94-97` (owner and every superuser), `rds_owner_function_default_revoke.sql:100-103`, `cloudsql_owner_function_default_revoke.sql:82-85` (current_user = master/owner) | Restricted to our owner role only (section 3). |
+| Global function defaults for several roles | `supabase/bootstrap/hoopdb_function_default_revoke.sql:94-97` (owner and every superuser), `rds_owner_function_default_revoke.sql:131-134` (master and `rds_superuser`), `cloudsql_owner_function_default_revoke.sql:82-85` (current_user = master/owner) | Restricted to our owner role only (section 3). |
 | Event trigger `hoopdb_sessions_function_boundary` and schema `hoopdb_boundary` | `supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql:466-475`; `src/hoopdb/migrate-guards.ts:1100-1103` | Supabase profile only (`src/hoopdb/migrate.ts:228`). This mode is not allowed in the shared RDS profile. An event trigger is database-wide and would fire for relaycontrol DDL. |
 | Schema `history` (History-feature track) | `supabase/history-migrations/0001_history_schema.sql:6`; `src/history-db/migrate.ts:21-23` | A second schema we own. This conflicts with the contract's History service (`relayhistory` / `history_owner`). Open question Q5. Until it is resolved, it is excluded from the shared install. |
 | Cluster-global role names | section 2 | Roles are cluster-wide, not per schema. See the collision analysis below. |
@@ -122,8 +122,9 @@ Before (database-wide, multiple owners):
 -- selfhosted, as superuser: for hoop AND every superuser (hoopdb_function_default_revoke.sql:95-97)
 ALTER DEFAULT PRIVILEGES FOR ROLE hoop     REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;  -- every rolsuper
--- rds, as the RDS master (rds_owner_function_default_revoke.sql:100-103)
+-- rds, as the RDS master, for itself AND rds_superuser (rds_owner_function_default_revoke.sql:131-134)
 ALTER DEFAULT PRIVILEGES FOR ROLE <rds master> REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE rds_superuser REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 -- cloudsql, as the owner (cloudsql_owner_function_default_revoke.sql:82-85): same shape
 ```
 
