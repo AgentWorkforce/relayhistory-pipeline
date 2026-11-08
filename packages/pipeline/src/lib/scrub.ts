@@ -295,6 +295,16 @@ function redactQuotedSecretValues(
         // Keep the block through its footer for the PEM rule, but redact any remainder
         // of this secret-keyed value now: after the PEM replacement the key is gone, so
         // a later quoted pass could no longer recognize that suffix as secret.
+        // If that remainder opens another PEM block whose footer is past the value, run
+        // through the footer too. Otherwise this pass would erase the second header and
+        // leave its body outside the quote with no header for the PEM rule to recognize.
+        const nextOpen = unclosedPrivateKeyStart(text.slice(pem[1], valueEnd));
+        if (nextOpen !== -1) {
+          PEM_END.lastIndex = pem[1] + nextOpen;
+          const footer = PEM_END.exec(text);
+          valueEnd = footer ? footer.index + footer[0].length : text.length;
+          QUOTED_KEY.lastIndex = Math.max(QUOTED_KEY.lastIndex, valueEnd);
+        }
         if (pem[1] < valueEnd) {
           out += text.slice(last, pem[1]) + REDACTED;
           last = valueEnd;

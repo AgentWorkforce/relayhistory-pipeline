@@ -195,6 +195,20 @@ describe("rule set 5: over-cap values are measured on the original text (leak 2)
     expect(suffixOut).toContain("KEEPTRAIL");
     expect(scrubLong(withSuffix)).toBe(suffixOut);
   });
+
+  it("does not erase a following PEM header while leaving its body visible", () => {
+    const first = `${"A".repeat(MAX_QUOTED_VALUE + 1)}-----END PRIVATE KEY-----`;
+    const input =
+      `-----BEGIN PRIVATE KEY-----\n"password": "${first}\n` +
+      `-----BEGIN PRIVATE KEY-----"\nSECRETBODY\n-----END PRIVATE KEY-----\nKEEPTRAIL`;
+    const out = scrubText(input);
+    expect(out).not.toContain("SECRETBODY");
+    expect(out).not.toContain("BEGIN PRIVATE KEY");
+    expect(out).not.toContain("END PRIVATE KEY");
+    expect(out).toContain("KEEPTRAIL");
+    expect(scrubLong(input)).toBe(out);
+    expect(records(`${input}\n`)).toBe(`${out}\n`);
+  });
 });
 
 describe("rule set 5: the shared corpus's record cases through the raw-chunk record path", () => {
