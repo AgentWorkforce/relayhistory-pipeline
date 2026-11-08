@@ -176,12 +176,17 @@ export function httpForError(error: unknown, group: "ops" | "native"): HttpAnswe
   return { status: 500, body: { error: { code: "internal_error" } } };
 }
 
+/** A session's state when the authority returns no row (or no state) for it: never a 500. */
+export const STATUS_UNKNOWN = "unknown";
+
 export interface StatusRow {
   sessionId: string;
+  /** The authority's state, or STATUS_UNKNOWN when it has no row for the session. */
   state: string;
   revision: string;
   tombstoneRevision: string | null;
-  ownerEpoch: string;
+  /** Strictly positive, or null when the session was never owned (the SQL's 0 / null): never "0". */
+  ownerEpoch: string | null;
   ownerKind: string | null;
   grantId: string | null;
 }
@@ -209,20 +214,31 @@ export class AcquisitionSql {
     const value = parseSqlJson(await this.run("status", p));
     const rows = Array.isArray(value) ? value : (value as { sessions?: unknown })?.sessions;
     if (!Array.isArray(rows)) throw new AcquisitionUnexpectedResult();
-    return rows.map((row) => {
+    const answered = rows.map((row): StatusRow => {
       if (row === null || typeof row !== "object") throw new AcquisitionUnexpectedResult();
       const r = row as Record<string, unknown>;
-      if (typeof r.sessionId !== "string" || typeof r.state !== "string") throw new AcquisitionUnexpectedResult();
+      if (typeof r.sessionId !== "string") throw new AcquisitionUnexpectedResult();
+      // No authority row for the session: state null/absent -> unknown (never a 500).
+      const state = r.state === null || r.state === undefined ? STATUS_UNKNOWN : r.state;
+      if (typeof state !== "string") throw new AcquisitionUnexpectedResult();
+      // Epoch 0 (the SQL's coalesce for a never-owned session) is not an epoch: null, never "0".
+      const epoch = decimalOrNull(r.ownerEpoch);
       return {
         sessionId: r.sessionId,
-        state: r.state,
+        state,
         revision: decimalOrNull(r.revision) ?? "0",
         tombstoneRevision: decimalOrNull(r.tombstoneRevision),
-        ownerEpoch: decimalOrNull(r.ownerEpoch) ?? "0",
+        ownerEpoch: epoch === null || epoch === "0" ? null : epoch,
         ownerKind: stringOrNull(r.ownerKind),
         grantId: stringOrNull(r.grantId),
       };
     });
+    // A requested session the authority omitted answers unknown, in request order after the rest.
+    const seen = new Set(answered.map((r) => r.sessionId));
+    for (const sessionId of p.sessionIds)
+      if (!seen.has(sessionId))
+        answered.push({ sessionId, state: STATUS_UNKNOWN, revision: "0", tombstoneRevision: null, ownerEpoch: null, ownerKind: null, grantId: null });
+    return answered;
   }
 }
 

@@ -23,7 +23,12 @@
  * MAX_SEND_ATTEMPTS the intent is only stalled (alerted; still retried, still
  * holding its key; an explicit revoke of a stalled install may proceed).
  * Every send holds the intent's store lease (claimSend), so concurrent
- * replays and reconcilers never send one intent twice at once.
+ * replays and reconcilers never send one intent twice at once; every
+ * completion presents the lease token it claimed, so a sender whose lease
+ * expired and was re-claimed cannot clear the successor's lease (a stale
+ * completion is a no-op, counted and reported via onStaleCompletion).
+ * An install whose result yields no reserved revoke is not applied: it stays
+ * pending as cleanup debt and is resent until its revoke is reserved.
  *
  * Cancellation ordering: retirement and session removal of a still-pending
  * install record a cancel on it (store-serialized with its apply), so the
@@ -59,6 +64,7 @@ import {
   type AcquisitionStore,
   type ActivationReason,
   type InstallationRecord,
+  type IntentKind,
   type IntentRecord,
   type NewIntent,
   type Reservation,
@@ -86,7 +92,11 @@ export class NativeRefusal extends Error {
 }
 const invalidRequest = () => new NativeRefusal(400, { error: { code: "invalid_request" } });
 const notProven = () => new NativeRefusal(403, { error: { code: "installation_not_proven" } });
-const notAuthorized = () => new NativeRefusal(403, { error: { code: "not_authorized" } });
+// Route-level ownership refusals (F8): `not_authorized` is the bearer scope check only (app.ts).
+/** The grant was not issued to this installation (unknown, not an install, another installation). */
+const notInstaller = () => new NativeRefusal(403, { error: { code: "not_installer" } });
+/** The installation cannot prove ownership of this grant (not applied/refused, no revocable state, wrong G). */
+const notOwner = () => new NativeRefusal(403, { error: { code: "not_owner" } });
 /** A SQL refusal on a native route: 22023 -> 400 {code}, 42501 -> 403 {code}, else 409 acquisition_refused. */
 const refused = (reason: string) =>
   SQL_ERROR_CODES["22023"]!.includes(reason)
@@ -166,6 +176,11 @@ const plusOne = (decimal: string) => (BigInt(decimal) + 1n).toString();
 const asString = (v: unknown): string | null => (typeof v === "string" ? v : null);
 /** A canonical non-negative int64 decimal string, else null. */
 const int64 = (v: unknown): string | null => (typeof v === "string" && /^(0|[1-9][0-9]{0,18})$/.test(v) && BigInt(v) <= MAX_BIGINT ? v : null);
+/** A canonical int64 decimal > 0, else null (0 is "never owned", not an epoch). */
+const positiveEpoch = (v: unknown): string | null => {
+  const e = int64(v);
+  return e === null || e === "0" ? null : e;
+};
 /** A pending intent past MAX_SEND_ATTEMPTS failures: alerted and revocable, still retried (never terminal). */
 const isStalled = (record: IntentRecord) => record.status === "pending" && record.attempts >= MAX_SEND_ATTEMPTS;
 
@@ -177,6 +192,23 @@ export interface NativeIssuerOptions {
   readonly intentKey: Uint8Array;
   /** Clock (ms) for the retry gate; must match the store's clock. Default Date.now. */
   readonly now?: () => number;
+  /** A completion whose lease was superseded (no-op). For logging/metrics; must not throw. */
+  readonly onStaleCompletion?: (event: StaleCompletion) => void;
+}
+
+/** A send completion that found its lease superseded by another sender; nothing was written. */
+export interface StaleCompletion {
+  readonly kind: IntentKind;
+  readonly completion: "applied" | "retry" | "refused";
+}
+
+interface SendOutcome {
+  /** The intent after the completion (re-read). */
+  readonly record: IntentRecord;
+  /** The completion was refused by the lease CAS (another sender holds the intent now). */
+  readonly stale: boolean;
+  /** The send failed (counted by markRetry unless stale); rethrown on the request path. */
+  readonly failure: { error: unknown } | null;
 }
 
 export class NativeIssuer {
@@ -185,6 +217,8 @@ export class NativeIssuer {
   private readonly now: () => number;
   private readonly signer: IssuerSigner;
   private readonly intentKey: Uint8Array;
+  private readonly onStaleCompletion: ((event: StaleCompletion) => void) | null;
+  private staleCount = 0;
 
   constructor(options: NativeIssuerOptions) {
     if (options.intentKey.byteLength !== 32) throw new Error("96bulls: ACQUISITION_INTENT_KEY must be 32 bytes");
@@ -193,6 +227,12 @@ export class NativeIssuer {
     this.signer = options.signer;
     this.intentKey = options.intentKey;
     this.now = options.now ?? Date.now;
+    this.onStaleCompletion = options.onStaleCompletion ?? null;
+  }
+
+  /** Completions dropped by the lease CAS since start (each a no-op). */
+  get staleCompletions(): number {
+    return this.staleCount;
   }
 
   get issuerKeyId(): string {
@@ -255,6 +295,7 @@ export class NativeIssuer {
 
     const [row] = await this.sql.status({ ...scope, sessionIds: [sessionId] });
     const currentRevision = row?.revision ?? "0";
+    // Server-internal: a never-owned session (status epoch null) is expected at epoch 0 by the SQL.
     const currentEpoch = row?.ownerEpoch ?? "0";
     const revision = plusOne(currentRevision);
     // The install advances the epoch; at int64 max it cannot (nor could its revoke target it).
@@ -297,6 +338,8 @@ export class NativeIssuer {
     if (record.status !== "applied" || !record.result || !record.grantCiphertext || !record.grantNonce) throw new AcquisitionUnavailableError();
     if (record.installationId !== installation.installationId) throw refused("operation_conflict");
     const result = JSON.parse(record.result) as Record<string, unknown>;
+    // A success epoch is strictly positive (Desktop rejects 0); an applied install without one is not answered.
+    if (positiveEpoch(result.ownerEpoch) === null) throw new AcquisitionUnavailableError();
     const G = decryptGrant(this.intentKey, record.grantCiphertext, record.grantNonce, record.operationUuid, record.installationId);
     return {
       outcome: replay ? "replay" : asString(result.outcome) ?? "installed",
@@ -328,7 +371,7 @@ export class NativeIssuer {
     try {
       if (reserved && reserved.status !== "void") activated = await this.store.activateRevoke(reserved.operationUuid, "explicit_exclude", clientOperationUuid);
       else if (!reserved && (install.status === "pending" || install.reservation !== "signed")) activated = await this.unreservedRevoke(install, clientOperationUuid);
-      else throw notAuthorized();
+      else throw notOwner(); // void reservation (refused install) or applied without a revoke row: nothing to revoke
     } catch (error) {
       if (error instanceof StoreConflict) throw refused("operation_conflict");
       // A stalled install whose grant has not landed (yet): record the exclude so a late apply
@@ -353,12 +396,12 @@ export class NativeIssuer {
    */
   private async ownedInstall(identity: NativeIdentity, installation: InstallationRecord, grantId: string, source: string, sessionId: string, allowStalled = false): Promise<IntentRecord> {
     const install = await this.store.getIntent(grantId);
-    if (!install || install.kind !== "install" || install.installationId !== installation.installationId) throw notAuthorized();
+    if (!install || install.kind !== "install" || install.installationId !== installation.installationId) throw notInstaller();
     if (install.orgId !== identity.orgId || install.workspaceId !== identity.workspaceId || install.source !== source || install.sessionId !== sessionId)
       throw new NativeRefusal(403, { error: { code: "target_mismatch" } });
     if (install.status === "pending" && allowStalled && isStalled(install)) return install;
     if (install.status === "pending") throw refused("session_busy");
-    if (install.status !== "applied") throw notAuthorized();
+    if (install.status !== "applied") throw notOwner();
     return install;
   }
 
@@ -370,7 +413,7 @@ export class NativeIssuer {
   private async unreservedRevoke(install: IntentRecord, clientOperationUuid: string): Promise<IntentRecord> {
     const scope: GrantScope = { orgId: install.orgId, workspaceId: install.workspaceId, source: install.source, sessionId: install.sessionId };
     const [row] = await this.sql.status({ ...scope, sessionIds: [install.sessionId] });
-    if (!row || row.grantId !== install.operationUuid) throw refused("grant_not_installed");
+    if (!row || row.grantId !== install.operationUuid || row.ownerEpoch === null) throw refused("grant_not_installed");
     const payload = acquisitionPayload("revoke", {
       operationUuid: randomUUID(), orgId: scope.orgId, workspaceId: scope.workspaceId, source: scope.source, sessionId: scope.sessionId,
       revision: plusOne(row.revision), targetGrantId: install.operationUuid, targetOwnerEpoch: row.ownerEpoch,
@@ -393,7 +436,7 @@ export class NativeIssuer {
 
     const install = await this.ownedInstall(identity, installation, grantId, source, sessionId);
     const G = decryptGrant(this.intentKey, install.grantCiphertext!, install.grantNonce!, install.operationUuid, install.installationId);
-    if (!sameHex(G, b.grant)) throw notAuthorized(); // §4.7: the installation must prove G
+    if (!sameHex(G, b.grant)) throw notOwner(); // §4.7: the installation must prove G
 
     const existing = await this.store.getIntent(operationUuid);
     if (existing) {
@@ -408,7 +451,7 @@ export class NativeIssuer {
 
     const scope: GrantScope = { orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId };
     const [row] = await this.sql.status({ ...scope, sessionIds: [sessionId] });
-    if (!row) throw new AcquisitionUnavailableError();
+    if (!row || row.ownerEpoch === null) throw new AcquisitionUnavailableError(); // never owned: nothing to rebind yet
     const payload = acquisitionPayload("rebind", {
       operationUuid, orgId: scope.orgId, workspaceId: scope.workspaceId, source, sessionId, revision: plusOne(row.revision),
       targetGrantId: grantId, targetOwnerEpoch: row.ownerEpoch, ownerUserId: identity.userId, installationId: installation.installationId,
@@ -423,6 +466,7 @@ export class NativeIssuer {
     if (record.status === "refused") throw refused(record.refusalCode ?? "operation_conflict");
     if (record.status !== "applied" || !record.result) throw new AcquisitionUnavailableError();
     const r = JSON.parse(record.result) as Record<string, unknown>;
+    if (positiveEpoch(r.ownerEpoch) === null) throw new AcquisitionUnavailableError(); // success epochs are strictly positive
     return { outcome: replay ? "replay" : asString(r.outcome), revision: asString(r.revision), ownerEpoch: asString(r.ownerEpoch) };
   }
 
@@ -439,7 +483,8 @@ export class NativeIssuer {
     const mine = await this.store.grantsOfInstallation(installation.installationId, grantIds);
     return {
       sessions: rows.map((r) => {
-        const own = r.grantId !== null && mine.has(r.grantId);
+        // A null (never-owned) epoch never qualifies as this installation's active grant.
+        const own = r.grantId !== null && r.ownerEpoch !== null && mine.has(r.grantId);
         // Another installation's or principal's grant id is not disclosed (§4.7 "owner undisclosed").
         return { ...r, grantId: own ? r.grantId : null, mine: own };
       }),
@@ -476,13 +521,13 @@ export class NativeIssuer {
    * unless the installation is retired or the revoke was activated by an
    * explicit exclude or a session removal.
    */
-  async reconcile(options: { limit?: number; stillSelected?: (record: IntentRecord) => Promise<boolean> } = {}): Promise<{ sent: number; skipped: number; retry: number; stalled: number }> {
+  async reconcile(options: { limit?: number; stillSelected?: (record: IntentRecord) => Promise<boolean> } = {}): Promise<{ sent: number; skipped: number; retry: number; stalled: number; stale: number }> {
     const stillSelected = options.stillSelected ?? (async (record: IntentRecord) => {
       if (record.activationReason === "explicit_exclude" || record.activationReason === "session_removed") return false;
       const installation = await this.store.getInstallation(record.installationId);
       return installation !== null && installation.retiredAt === null;
     });
-    let sent = 0, skipped = 0, retry = 0, stalled = 0;
+    let sent = 0, skipped = 0, retry = 0, stalled = 0, stale = 0;
     for (const record of await this.store.dueIntents(options.limit ?? 100)) {
       if (record.status !== "pending") continue;
       if (record.kind === "revoke" && (await stillSelected(record))) {
@@ -495,18 +540,25 @@ export class NativeIssuer {
         skipped += 1; // another sender holds it (or it was answered meanwhile)
         continue;
       }
-      let after: IntentRecord | null;
+      let outcome: SendOutcome;
       try {
-        after = await this.send(leased);
+        outcome = await this.send(leased);
       } catch {
-        after = await this.store.getIntent(record.operationUuid); // counted by send; same bytes next pass
+        // A store error while recording (e.g. a reserved-revoke uuid collision): same bytes next pass.
+        const current = await this.store.getIntent(record.operationUuid);
+        outcome = { record: current ?? leased, stale: false, failure: null };
       }
-      if (after?.status === "pending") {
-        retry += 1;
+      if (outcome.stale) {
+        stale += 1; // another sender took the lease over after ours expired: its completion counts, not ours
+        continue;
+      }
+      const after = outcome.record;
+      if (after.status === "pending") {
+        retry += 1; // a failed send, or cleanup debt (no reserved revoke yet); same bytes next pass
         if (isStalled(after)) stalled += 1;
       } else sent += 1;
     }
-    return { sent, skipped, retry, stalled };
+    return { sent, skipped, retry, stalled, stale };
   }
 
   // ------------------------------------------------------------ internals
@@ -538,7 +590,9 @@ export class NativeIssuer {
       if (current && current.status !== "pending") return current;
       throw new AcquisitionUnavailableError();
     }
-    return this.send(leased);
+    const outcome = await this.send(leased);
+    if (outcome.failure) throw outcome.failure.error;
+    return outcome.record;
   }
 
   /**
@@ -546,10 +600,19 @@ export class NativeIssuer {
    * the outcome: a result -> applied (an install also reserves its revoke);
    * a non-retryable refusal -> refused (terminal); anything else (a bad
    * stored intent, session_busy, transport) is counted by markRetry (backoff,
-   * still pending) and surfaced. The caller holds the intent's lease.
+   * still pending) and surfaced. An install whose result yields no reserved
+   * revoke stays pending (cleanup debt, counted and backed off by the store).
+   * The caller holds the intent's lease (`record.leaseToken`, from claimSend);
+   * every completion presents it, and a superseded one is a no-op (stale).
    */
-  private async send(record: IntentRecord): Promise<IntentRecord> {
-    if (record.status !== "pending") return record;
+  private async send(record: IntentRecord): Promise<SendOutcome> {
+    const token = record.leaseToken;
+    if (record.status !== "pending" || token === null) throw new Error("send requires a leased pending intent");
+    const done = async (completion: StaleCompletion["completion"], written: string, failure: SendOutcome["failure"]): Promise<SendOutcome> => {
+      const stale = written === "stale";
+      if (stale) this.noteStale({ kind: record.kind, completion });
+      return { record: (await this.store.getIntent(record.operationUuid))!, stale, failure };
+    };
     let result: Record<string, unknown>;
     try {
       const payload = payloadOf(record.kind, record.assertion);
@@ -557,20 +620,24 @@ export class NativeIssuer {
       if (digests.evidenceSha256 !== record.evidenceSha256 || digests.requestSha256 !== record.requestSha256) throw new Error("stored intent digests do not match");
       result = await this.sql.mutate(record.kind, { ...payload, evidenceSha256: digests.evidenceSha256, requestSha256: digests.requestSha256 });
     } catch (error) {
-      if (error instanceof AcquisitionSqlError && !isRetryableCode(error.code)) {
-        await this.store.markRefused(record.operationUuid, error.code);
-        return (await this.store.getIntent(record.operationUuid))!;
-      }
-      await this.store.markRetry(record.operationUuid);
-      throw error;
+      if (error instanceof AcquisitionSqlError && !isRetryableCode(error.code))
+        return done("refused", await this.store.markRefused(record.operationUuid, token, error.code), null);
+      return done("retry", await this.store.markRetry(record.operationUuid, token), { error });
     }
     if (record.kind === "install") {
       const { revoke, reservation } = this.reserveRevoke(record, result);
-      await this.store.markInstallApplied(record.operationUuid, JSON.stringify(result), revoke, reservation);
-    } else {
-      await this.store.markApplied(record.operationUuid, JSON.stringify(result));
+      return done("applied", await this.store.markInstallApplied(record.operationUuid, token, JSON.stringify(result), revoke, reservation), null);
     }
-    return (await this.store.getIntent(record.operationUuid))!;
+    return done("applied", await this.store.markApplied(record.operationUuid, token, JSON.stringify(result)), null);
+  }
+
+  private noteStale(event: StaleCompletion): void {
+    this.staleCount += 1;
+    try {
+      this.onStaleCompletion?.(event);
+    } catch {
+      // observability only
+    }
   }
 
   /**
@@ -581,7 +648,7 @@ export class NativeIssuer {
    * greatest(revision, p.revision), so a trailing value is harmless.
    */
   private reserveRevoke(install: IntentRecord, result: Record<string, unknown>): { revoke: NewIntent | null; reservation: Reservation } {
-    const epoch = int64(result.ownerEpoch);
+    const epoch = positiveEpoch(result.ownerEpoch); // an install always lands at an epoch >= 1
     if (epoch === null) return { revoke: null, reservation: "no_epoch" };
     const payload = payloadOf("install", install.assertion);
     const revision = int64(result.revision) ?? payload.revision!;

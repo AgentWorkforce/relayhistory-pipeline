@@ -69,6 +69,7 @@ CREATE TABLE sessions.ingest_acquisition_native_intents (
   reservation           text CHECK (reservation IN ('signed', 'no_epoch', 'sign_failed')),
   cancel_reason         text CHECK (cancel_reason IN ('explicit_exclude', 'installation_retired', 'session_removed')),  -- install: revoke on outcome
   lease_until           timestamptz,                    -- per-intent send lease (claimSend compare-and-set)
+  lease_token           uuid,                           -- minted per claimSend; every completion CASes on it (stale = no-op)
   created_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
   updated_at            timestamptz NOT NULL DEFAULT clock_timestamp(),
   CHECK ((kind = 'install') = (grant_ciphertext IS NOT NULL AND grant_nonce IS NOT NULL)),
@@ -107,5 +108,5 @@ GRANT USAGE ON SCHEMA sessions TO bulls96_acquisition_installer;
 GRANT SELECT, INSERT, UPDATE (retired_at) ON sessions.ingest_acquisition_native_installations TO bulls96_acquisition_installer;
 GRANT SELECT, INSERT,
  UPDATE (status, refusal_code, result, client_operation_uuid, activation_reason, attempts, next_attempt_at, reservation,
-         cancel_reason, lease_until, updated_at)
+         cancel_reason, lease_until, lease_token, updated_at)
  ON sessions.ingest_acquisition_native_intents TO bulls96_acquisition_installer;

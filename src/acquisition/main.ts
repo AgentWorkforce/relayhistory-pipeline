@@ -92,7 +92,11 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<void>
     });
     const store = new PgAcquisitionStore(pgSqlClient(pool));
     const issuer = config.nativeEnabled && config.signer && config.intentKey
-      ? new NativeIssuer({ store, sql, signer: config.signer, intentKey: config.intentKey })
+      ? new NativeIssuer({
+          store, sql, signer: config.signer, intentKey: config.intentKey,
+          // A sender whose lease expired and was taken over: its completion was dropped (CAS).
+          onStaleCompletion: (e) => log.warn("acquisition stale completion", { count: 1, kind: e.kind, reason: `${e.completion}_lease_superseded` }),
+        })
       : null;
     // §9 key retention: refuse to start if a rotation dropped a native key that a
     // reserved revoke or pending intent still carries (fail closed, before listening).
@@ -111,6 +115,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<void>
             if (r.sent || r.retry) log.info("acquisition reconcile", { count: r.sent, reason: `retry=${r.retry}` });
             // Stalled intents are never dropped (their SQL may have committed): alert, they keep retrying.
             if (r.stalled) log.warn("acquisition reconcile stalled", { count: r.stalled, reason: "max_send_attempts" });
+            if (r.stale) log.warn("acquisition reconcile stale", { count: r.stale, reason: "lease_superseded" });
           },
           (err) => log.warn("acquisition reconcile failed", errorFields(err)),
         ).finally(() => { running = false; });
