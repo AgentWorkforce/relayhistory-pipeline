@@ -12,6 +12,7 @@ import { LANES } from "../../../scripts/sessions-function-boundary/lanes/index.t
 import { ingestHistory } from "../../../scripts/sessions-function-boundary/lanes/ingest-history.ts";
 import { bufferedGcSingleCandidate } from "../../../scripts/sessions-function-boundary/lanes/buffered-gc-single-candidate.ts";
 import { lazySourceTables, originalBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-source-tables.ts";
+import { lazyClaimClockNarrowing, originalBodies as originalClaimClockBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-claim-clock-narrowing.ts";
 import { privacyAuthority, originalLazyBodies, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
 import { createHash } from "node:crypto";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
@@ -60,6 +61,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105040000_ingest_lazy_source_tables.down.sql",
       "supabase/rollbacks/20261105041000_ingest_privacy_authority.down.sql",
       "supabase/rollbacks/20261105042000_babysitter_evidence_retention.down.sql",
+      "supabase/rollbacks/20261105043500_lazy_claim_clock_narrowing.down.sql",
     ]);
   });
 
@@ -94,6 +96,27 @@ describe("unified sessions function-boundary generator", () => {
       expect(down).toContain(body);
       expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(body));
     }
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 043500 lazy claim clock narrowing changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== lazyClaimClockNarrowing), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105043500_lazy_claim_clock_narrowing.down.sql";
+    for (const [path, value] of Object.entries(without.outputs)) expect(withLane.outputs[path]).toBe(value);
+    expect(withLane.summary.lanes["lazy-claim-clock-narrowing"]).toEqual({ functions: 0, replaces: 2, grants: 0 });
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, lazyClaimClockNarrowing.migration!), "utf8")).digest("hex"));
+    const bodies = originalClaimClockBodies(readFileSync(join(root, "supabase/migrations/20261104055000_lazy_current_custody.sql"), "utf8"));
+    expect(bodies).toHaveLength(2);
+    for (const body of bodies) {
+      expect(down).toContain(body);
+      expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(body));
+    }
+    expect(down).not.toContain("lazy-native-origin-v1");
+    expect(down).toContain("pg_advisory_xact_lock(961996,1)");
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");
     expect(down.trim().endsWith("COMMIT;")).toBe(true);

@@ -221,6 +221,36 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test src/session-pipeline/__tests__/brief-documents.postgres.test.ts
+      - name: Prove the lazy claim reads the seat clock without serializing other users' claims (043500)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
+      # Service containers cannot take server flags, so the 53200 causal proof gets its own disposable,
+      # loopback-only, trust-auth container (same image as the service above, no credential anywhere).
+      - name: Start a lock-constrained PostgreSQL for the 043500 advisory-footprint proof
+        id: pg_lock_constrained
+        env:
+          PG_LOCK_NAME: pg-lock-constrained-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pg }}
+        run: |
+          # Per-run/per-matrix name and an OS-assigned loopback port: concurrent matrix jobs on a persistent
+          # self-hosted runner must not collide on a container name or host port.
+          docker run -d --name "$PG_LOCK_NAME" -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1:0:5432 \
+            postgres:${{ matrix.pg }} -c max_locks_per_transaction=64 -c max_connections=20
+          port="$(docker port "$PG_LOCK_NAME" 5432/tcp | head -n1)"; port="${port##*:}"
+          case "$port" in ''|*[!0-9]*) echo "could not read the assigned host port"; docker logs "$PG_LOCK_NAME"; exit 1;; esac
+          echo "port=$port" >> "$GITHUB_OUTPUT"
+          for i in $(seq 1 60); do docker exec "$PG_LOCK_NAME" pg_isready -U postgres -h 127.0.0.1 && exit 0; sleep 2; done
+          docker logs "$PG_LOCK_NAME"; exit 1
+      - name: Prove bounded advisory locks never exhaust a constrained lock table (043500, no 53200)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:${{ steps.pg_lock_constrained.outputs.port }}/postgres
+          CLAIM_CLOCK_LOCK_EXPECT_CONSTRAINED: "1"
+        run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
+      - name: Remove the lock-constrained PostgreSQL
+        if: always()
+        env:
+          PG_LOCK_NAME: pg-lock-constrained-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pg }}
+        run: docker rm -f "$PG_LOCK_NAME" || true
   consumer-lease:
     name: canonical consumer lease proof (PG ${{ matrix.pg }})
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
