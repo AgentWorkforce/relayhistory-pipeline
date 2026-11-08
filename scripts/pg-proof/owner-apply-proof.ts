@@ -4,6 +4,7 @@ import pg from "pg";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { SESSION_BOOTSTRAP_FILES } from "../../src/hoopdb/session-bootstrap-chain.ts";
 const root = fileURLToPath(new URL("../..", import.meta.url));
 if (process.argv.length !== 3 || process.argv[2] !== "--owned-fixture")
   throw Error("owned_fixture_argument_required");
@@ -63,12 +64,9 @@ await admin.query(
   "DROP SCHEMA IF EXISTS hoopdb_boundary CASCADE;DROP SCHEMA IF EXISTS sessions CASCADE;ALTER ROLE postgres SUPERUSER;SET ROLE postgres;CREATE SCHEMA sessions;GRANT CREATE ON SCHEMA public TO postgres;REVOKE TEMPORARY ON DATABASE postgres FROM PUBLIC;ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;",
 );
 await admin.query(await read("supabase/tests/supabase_shim.sql"));
-await admin.query(
-  await read("supabase/bootstrap/session_directory_search_worker.sql"),
-);
-await admin.query(await read("supabase/bootstrap/session_token_verifier.sql"));
-await admin.query(await read("supabase/bootstrap/session_ingest_roles.sql"));
-await admin.query(await read("supabase/bootstrap/session_read_api_roles.sql"));
+// Single-sourced bootstrap chain: the grant migration FAILs closed without
+// the bare consumer grantee.
+for (const f of SESSION_BOOTSTRAP_FILES) await admin.query(await read(f));
 await admin.query(
   "DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_runtime') THEN CREATE ROLE bulls96_runtime LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION; END IF; END $$",
 );

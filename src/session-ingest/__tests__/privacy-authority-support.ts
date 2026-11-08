@@ -12,6 +12,7 @@ import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import type { CurrentCustodyPacket } from "../custody-protocol.ts";
 import type { Queryable } from "../../migration/relayhistory-export.ts";
 import { TENANT, scratchStore } from "./support.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 export const ROOT = join(import.meta.dir, "../../..");
 export const generation = "a".repeat(64), epoch = "3".repeat(64), identity = "c".repeat(64), baseline = "a".repeat(64);
@@ -27,7 +28,7 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   const closers: Array<() => unknown> = [() => db.close()];
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles", "session_consumer_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   // lazyFix:false reproduces the pre-040000 state (that migration skipped; it touches nothing later ones depend on).
   // pending:false reproduces the state without 041000; 043700's creator precondition requires 041000's ingest_privacy_authority,
   // so it is skipped with it, while 042000/043000/043500 still apply.

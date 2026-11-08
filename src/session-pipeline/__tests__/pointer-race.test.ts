@@ -14,6 +14,7 @@ import type { HoopDb } from "../../shared/db.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 // Every Supabase and HoopDb migration in PGlite (the reviewer's repro on #121), so
 // the revision fence and the directory projection are the real SQL.
@@ -27,11 +28,7 @@ beforeEach(async () => {
   reader = objectStoreManifestReader(store, { provider: "s3", bucket: "bucket" });
   pg = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await pg.exec(readF("supabase/tests/supabase_shim.sql"));
-  await pg.exec(readF("supabase/bootstrap/session_directory_search_worker.sql"));
-  await pg.exec(readF("supabase/bootstrap/session_token_verifier.sql"));
-  await pg.exec(readF("supabase/bootstrap/session_ingest_roles.sql"));
-  await pg.exec(readF("supabase/bootstrap/session_read_api_roles.sql"));
-  await pg.exec(readF("supabase/bootstrap/session_consumer_roles.sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await pg.exec(readF(f));
   for (const f of readdirSync(join(repo, "supabase/migrations")).sort()) await pg.exec(readF(`supabase/migrations/${f}`));
   for (const f of readdirSync(join(repo, "src/hoopdb/migrations")).filter((x) => x.endsWith(".sql")).sort()) await pg.exec(readF(`src/hoopdb/migrations/${f}`));
 }, 120_000);

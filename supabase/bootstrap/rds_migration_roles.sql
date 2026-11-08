@@ -41,6 +41,7 @@ DECLARE
   v_row record;
   v_problems text[] := '{}';
   v_missing boolean := false;
+  v_claimed boolean := false;
 BEGIN
   IF current_setting('server_version_num')::int < 160000 THEN
     RAISE EXCEPTION USING ERRCODE = '0A000',
@@ -86,7 +87,27 @@ BEGIN
       v_missing := true;
       CONTINUE;
     END IF;
-    IF v_row.rolcanlogin THEN v_problems := array_append(v_problems, format('%I has LOGIN', v_role)::text); END IF;
+    -- Claimed-LOGIN steady state (operator promoted the consumer role after
+    -- the writer went live): every later re-run must converge instead of
+    -- refusing the claim. Accept exactly the claim marker (LOGIN, no other
+    -- attributes, precisely the one global 60s row) and at most the invoker's
+    -- creator edge; anything else stays a problem below. Mirrors
+    -- session_consumer_roles.sql (RDS requires PG16+, so no version branch).
+    v_claimed := v_role = 'search_consumer_runtime' AND v_row.rolcanlogin
+      AND NOT (v_row.rolinherit OR v_row.rolbypassrls OR v_row.rolsuper OR v_row.rolcreatedb OR v_row.rolcreaterole OR v_row.rolreplication)
+      AND (SELECT count(*) FROM pg_db_role_setting WHERE setrole = v_row.oid) = 1
+      AND EXISTS (
+        SELECT 1 FROM pg_db_role_setting
+         WHERE setrole = v_row.oid AND setdatabase = 0
+           AND setconfig = ARRAY['statement_timeout=60s']::text[]
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_auth_members a
+         WHERE (a.roleid = v_row.oid OR a.member = v_row.oid)
+           AND NOT (a.roleid = v_row.oid AND a.member = (SELECT oid FROM pg_roles WHERE rolname = v_owner)
+                    AND a.admin_option AND NOT a.inherit_option AND NOT a.set_option)
+      );
+    IF v_row.rolcanlogin AND NOT v_claimed THEN v_problems := array_append(v_problems, format('%I has LOGIN', v_role)::text); END IF;
     IF v_row.rolinherit THEN v_problems := array_append(v_problems, format('%I has INHERIT', v_role)::text); END IF;
     IF v_row.rolbypassrls THEN v_problems := array_append(v_problems, format('%I has BYPASSRLS', v_role)::text); END IF;
     IF v_row.rolsuper THEN v_problems := array_append(v_problems, format('%I has SUPERUSER', v_role)::text); END IF;
@@ -96,7 +117,7 @@ BEGIN
     IF EXISTS (
       SELECT 1 FROM pg_auth_members
        WHERE roleid = v_row.oid OR member = v_row.oid
-    ) THEN
+    ) AND NOT v_claimed THEN
       v_problems := array_append(v_problems, format('%I has a role membership', v_role)::text);
     END IF;
     IF v_role = 'session_directory_search_worker' AND (
@@ -109,7 +130,7 @@ BEGIN
     ) THEN
       v_problems := array_append(v_problems, 'session_directory_search_worker has unexpected role settings'::text);
     END IF;
-    IF v_role <> 'session_directory_search_worker' AND EXISTS (
+    IF v_role <> 'session_directory_search_worker' AND NOT v_claimed AND EXISTS (
       SELECT 1 FROM pg_db_role_setting WHERE setrole = v_row.oid
     ) THEN
       v_problems := array_append(v_problems, format('%I has role settings', v_role)::text);

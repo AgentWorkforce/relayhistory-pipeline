@@ -7,6 +7,7 @@ import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
 import pg from "pg";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 setDefaultTimeout(120_000);
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
@@ -31,13 +32,8 @@ beforeAll(async () => {
   pool = new pg.Pool({ connectionString: target.href, max: 4 });
   await pool.query(sql("supabase/tests/supabase_shim.sql"));
   await pool.query("CREATE EXTENSION pg_trgm; CREATE EXTENSION btree_gin");
-  for (const file of [
-    "session_directory_search_worker.sql",
-    "session_token_verifier.sql",
-    "session_ingest_roles.sql",
-    "session_read_api_roles.sql", "session_consumer_roles.sql",
-  ])
-    await pool.query(sql("supabase/bootstrap/" + file));
+  for (const file of SESSION_BOOTSTRAP_FILES)
+    await pool.query(sql(file));
   for (const file of readdirSync(join(root, "supabase/migrations"))
     .filter((file) => file.endsWith(".sql"))
     .sort())

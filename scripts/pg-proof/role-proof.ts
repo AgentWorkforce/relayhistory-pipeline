@@ -21,6 +21,7 @@ import { readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { SESSION_BOOTSTRAP_FILES } from "../../src/hoopdb/session-bootstrap-chain.ts";
 import {
   inTransaction,
   openHoopDb,
@@ -72,9 +73,8 @@ const TOKEN_VERIFIER_BOOT = join(
   ROOT,
   "supabase/bootstrap/session_token_verifier.sql",
 );
-// The session ingest roles: privileged, cluster-wide, before migrate (20261102010000 verifies).
-const INGEST_BOOT = join(ROOT, "supabase/bootstrap/session_ingest_roles.sql");
-const READ_API_BOOT = join(ROOT, "supabase/bootstrap/session_read_api_roles.sql");
+// The session ingest/read-API/consumer bare roles are provisioned from the
+// single-sourced SESSION_BOOTSTRAP_FILES chain (cluster bootstrap above).
 const RUNTIME_BOOT = join(ROOT, "supabase/bootstrap/hoopdb_runtime_role.sql");
 const SUPABASE_RUNTIME_BOOT = join(
   ROOT,
@@ -678,17 +678,11 @@ if (
   !psql("postgres", ["-f", join(ROOT, "supabase/tests/supabase_shim.sql")]).ok
 )
   throw new Error("shim setup failed");
-if (
-  !psql("postgres", ["-f", BOOT]).ok ||
-  !psql("postgres", ["-f", TOKEN_VERIFIER_BOOT]).ok
-)
-  throw new Error("role bootstrap failed");
-if (!psql("postgres", ["-f", BOOT]).ok)
-  throw new Error("worker bootstrap failed");
-if (!psql("postgres", ["-f", INGEST_BOOT]).ok)
-  throw new Error("session ingest roles bootstrap failed");
-if (!psql("postgres", ["-f", READ_API_BOOT]).ok)
-  throw new Error("session read api role bootstrap failed");
+// Single-sourced bootstrap chain (session-bootstrap-chain.ts): every full
+// chain needs the bare consumer grantee or the grants migration FAILs closed.
+for (const file of SESSION_BOOTSTRAP_FILES)
+  if (!psql("postgres", ["-f", join(ROOT, file)]).ok)
+    throw new Error(`role bootstrap failed: ${file}`);
 
 await fresh("g6_boot");
 await check(

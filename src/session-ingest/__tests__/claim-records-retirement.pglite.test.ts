@@ -10,6 +10,7 @@ import {pg_trgm} from "@electric-sql/pglite/contrib/pg_trgm";
 import {objectKey,readAll} from "../../shared/vendor.ts";
 import {archiveClaimAttemptRecords,assertCandidate,ClaimRecordsArchiveError} from "../claim-records-archive.ts";
 import {scratchStore} from "./support.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 setDefaultTimeout(60000);
 const root=join(import.meta.dir,"../../.."),open:Array<()=>unknown>=[];
 afterEach(async()=>{for(const f of open.splice(0).reverse())await f()});
@@ -19,7 +20,7 @@ async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());
  const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const n of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles", "session_consumer_roles"])await db.exec(read("supabase/bootstrap/"+n+".sql"));
+ for(const n of SESSION_BOOTSTRAP_FILES)await db.exec(read(n));
  for(const n of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.exec(read("supabase/migrations/"+n));
  await db.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation(name,generation,status) VALUES('session_directory_search_worker','"+generation+"','pass') ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,status='pass'");
  await db.query("INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until,control_epoch) VALUES($1,repeat('a',64),repeat('b',64),$2,clock_timestamp()+interval '1 hour',repeat('3',64))",[tenant.orgId,generation]);

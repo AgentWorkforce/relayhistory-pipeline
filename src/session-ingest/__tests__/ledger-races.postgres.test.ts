@@ -23,6 +23,7 @@ import { deliverBatch } from "../deliver.ts";
 import { fanout, type FanoutMessage } from "../staging.ts";
 import { batch, record, TENANT } from "./support.ts";
 import type { Ledger } from "../ledger.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 const migration =
@@ -73,13 +74,8 @@ async function database(repair = true, migrateSchema = true) {
   await pool.query("CREATE SCHEMA sessions");
   await pool.query(sql("supabase/tests/supabase_shim.sql"));
   await pool.query("CREATE EXTENSION pg_trgm; CREATE EXTENSION btree_gin");
-  for (const file of [
-    "session_directory_search_worker.sql",
-    "session_token_verifier.sql",
-    "session_ingest_roles.sql",
-    "session_read_api_roles.sql", "session_consumer_roles.sql",
-  ])
-    await pool.query(sql("supabase/bootstrap/" + file));
+  for (const file of SESSION_BOOTSTRAP_FILES)
+    await pool.query(sql(file));
   if (migrateSchema)
     for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
       if ("supabase/migrations/" + file !== migration)

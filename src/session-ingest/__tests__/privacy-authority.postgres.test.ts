@@ -16,6 +16,7 @@ import { activate, census, fence, syncOwned } from "../../migration/privacy-auth
 import { assertEraserIdentity, supabaseAuthority } from "../../migration/neon-s3-erasure/authority.ts";
 import { authorityUrl } from "../../migration/neon-s3-erasure/main.ts";
 import { pinnedPgClient } from "../../migration/stdin-credentials.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const errCode = (fn: () => unknown): string | null => {
   try {
@@ -52,7 +53,7 @@ async function database() {
   await pool.query("CREATE SCHEMA sessions");
   await pool.query(sql("supabase/tests/supabase_shim.sql"));
   await pool.query("CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin");
-  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles", "session_consumer_roles"]) await pool.query(sql("supabase/bootstrap/" + f + ".sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await pool.query(sql(f));
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await pool.query(sql("supabase/migrations/" + f));
   await pool.query(sql(INDEX_SQL));
   await pool.query("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','" + generation + "','pass')");

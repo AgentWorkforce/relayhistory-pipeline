@@ -10,6 +10,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { headParams, type AuthorityHead, type BufferedScope } from "../owner-buffered.ts";
 import { causal, consumerVisible, firstAuthority, parity, parityVisible, root, type CausalCase, type ParityCase } from "./buffered-privacy-fixture-support.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 const sql = (path: string) => readFileSync(join(root, path), "utf8");
@@ -33,8 +34,7 @@ describe.skipIf(!url)("043700 + PR B fixtures on actual PostgreSQL", () => {
     await db.connect();
     await db.query("SET TIME ZONE 'UTC'; CREATE SCHEMA sessions; CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin");
     await db.query(sql("supabase/tests/supabase_shim.sql"));
-    for (const file of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles", "session_consumer_roles"])
-      await db.query(sql(`supabase/bootstrap/${file}.sql`));
+    for (const file of SESSION_BOOTSTRAP_FILES) await db.query(sql(file));
     for (const file of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort())
       await db.query(sql(`supabase/migrations/${file}`));
     await db.query(sql("supabase/bootstrap/session_read_api_role.sql").split("\n")

@@ -21,6 +21,7 @@ import {DELIVERY_MAPPING_VERSION} from "../vendor/delivery/delivery-contracts.ts
 import {TURN_KIND,TURN_ORIGIN_ID,turnRecordId} from "../turns.ts";
 import {TENANT,scratchStore} from "./support.ts";
 import acl from "../../hoopdb/sessions-function-acl.json" with {type:"json"};
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 setDefaultTimeout(60000);
 
 const root=join(import.meta.dir,"../../.."),generation="4".repeat(64),epoch="1".repeat(64),identity="c".repeat(64),baseline="a".repeat(64);
@@ -34,7 +35,7 @@ afterEach(async()=>{for(const close of open.splice(0).reverse())await close()});
 async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles", "session_consumer_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
+ for(const f of SESSION_BOOTSTRAP_FILES)await db.exec(read(f));
  for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.exec(read("supabase/migrations/"+f));
  // The read role's approved shape (schema USAGE, the session_index column grant, RLS), as the operator applies it.
  await db.exec(psql("supabase/bootstrap/session_read_api_role.sql"));

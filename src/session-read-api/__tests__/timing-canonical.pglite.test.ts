@@ -22,6 +22,7 @@ import { canonicalSnapshot, type CanonicalDeps, type CanonicalIdentity } from ".
 import { poolTenantRunner } from "../liveness.ts";
 import { sqlCanonicalPointers, timingFromCanonical } from "../session-timing-source.ts";
 import { TimingInputError } from "../timing.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -92,11 +93,7 @@ let supa: PGlite;
 beforeAll(async () => {
   supa = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await supa.exec(read("supabase/tests/supabase_shim.sql"));
-  await supa.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
-  await supa.exec(read("supabase/bootstrap/session_token_verifier.sql"));
-  await supa.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
-  await supa.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
-  await supa.exec(read("supabase/bootstrap/session_consumer_roles.sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await supa.exec(read(f));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await supa.exec(read(`supabase/migrations/${file}`));
   await supa.exec(psql("supabase/bootstrap/session_read_api_role.sql"));
   await supa.exec(psql("supabase/bootstrap/session_read_api_role_verify.sql"));

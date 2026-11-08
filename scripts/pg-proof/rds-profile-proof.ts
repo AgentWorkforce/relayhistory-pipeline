@@ -26,6 +26,7 @@ import pg from "pg";
 import { inTransaction, openHoopDb, schemaVerdict } from "../../src/shared/db.ts";
 import { expectedSchema, generation, migrationProfile } from "../../src/hoopdb/migrate.ts";
 import { functionBoundaryEvidence } from "../../src/hoopdb/migrate-guards.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../src/hoopdb/session-bootstrap-chain.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const HOST = process.env.PGPROOF_HOST ?? "127.0.0.1";
@@ -41,12 +42,9 @@ const B = (f: string) => join(ROOT, "supabase/bootstrap", f);
 const FN_BOOT = B("rds_owner_function_default_revoke.sql");
 const ROLES_BOOT = B("rds_migration_roles.sql");
 const RT_BOOT = B("hoopdb_runtime_role_rds.sql");
-const PHASE1 = [
-  B("session_directory_search_worker.sql"),
-  B("session_token_verifier.sql"),
-  B("session_ingest_roles.sql"),
-  B("session_read_api_roles.sql"),
-];
+// Single-sourced bootstrap chain: the grant migration FAILs closed without
+// the bare consumer grantee (migrations never create roles).
+const PHASE1 = SESSION_BOOTSTRAP_FILES.map((f) => B(f.split("/").pop()!));
 const FIXED = [
   "anon", "authenticated", "service_role", "session_directory_search_worker",
   "session_token_verifier", "bulls96_session_ingest", "bulls96_session_ingest_seeder",
@@ -245,6 +243,24 @@ await check("rds profile: bootstraps and migrate are idempotent (rerun applies 0
   const m = migrate(RDS_ENV);
   const v = await verdict(RT);
   return [b.ok && m.exit === 0 && m.applied === 0 && v.ok, `boot=${b.ok} migrate=${fmt(m)} verdict=${fmt(v)}`];
+});
+await check("rds profile: trampoline re-run converges on an operator-claimed consumer role; extras still refuse", async () => {
+  // The operator promotion (LOGIN + exactly the 60s marker) is the claimed
+  // steady state every later deploy sees: the trampoline must accept it on
+  // re-run, and still refuse any extra setting.
+  await sql(DB, `ALTER ROLE search_consumer_runtime LOGIN`, MASTER);
+  await sql(DB, `ALTER ROLE search_consumer_runtime SET statement_timeout = '60s'`, MASTER);
+  const claimed = psql(DB, ["-f", ROLES_BOOT]);
+  const extra = await attempt(DB, `ALTER ROLE search_consumer_runtime SET search_path = attacker`, MASTER);
+  const refused = psql(DB, ["-f", ROLES_BOOT]);
+  const reset = await attempt(DB, `ALTER ROLE search_consumer_runtime RESET search_path`, MASTER);
+  const again = psql(DB, ["-f", ROLES_BOOT]);
+  // Restore the bare shape the later checks assume.
+  const bare = await attempt(DB, `ALTER ROLE search_consumer_runtime RESET statement_timeout`, MASTER);
+  const nologin = await attempt(DB, `ALTER ROLE search_consumer_runtime NOLOGIN`, MASTER);
+  const restored = psql(DB, ["-f", ROLES_BOOT]);
+  return [claimed.ok && extra === "ok" && !refused.ok && reset === "ok" && again.ok && bare === "ok" && nologin === "ok" && restored.ok,
+    `claimed=${claimed.ok} extra_set=${extra} refused=${!refused.ok} reset=${reset} again=${again.ok} restored=${restored.ok}`];
 });
 await check("rds profile: the master can still rotate the runtime password (creator edge kept on purpose)", async () => {
   // A value is used only inside this disposable, trust-auth server; never a real credential.

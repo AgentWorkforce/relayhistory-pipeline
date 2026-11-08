@@ -11,6 +11,7 @@ import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { projectSessionDirectory } from "../../hoopdb/session-directory-projector.ts";
 import { refereeHandler } from "../handler.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -25,11 +26,7 @@ test("a classified state is projected into the directory", async () => {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
-  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
-  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
-  await db.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
-  await db.exec(read("supabase/bootstrap/session_consumer_roles.sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
     for (const file of readdirSync(join(root, dir))
       .filter((f) => f.endsWith(".sql"))

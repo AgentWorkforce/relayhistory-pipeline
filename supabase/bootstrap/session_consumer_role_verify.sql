@@ -42,9 +42,20 @@ BEGIN
       RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: role membership drifted', v_role);
     END IF;
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role AND rolconfig IS NOT NULL
-                  AND EXISTS (SELECT 1 FROM unnest(rolconfig) u WHERE u = 'statement_timeout=60s')) THEN
+  -- Exact setting set: precisely the operator's one global row holding only
+  -- statement_timeout = 60s. rolconfig shows only the global row, so pin the
+  -- complete pg_db_role_setting set explicitly: ANY(timeout) would accept a
+  -- hostile global search_path beside the marker, and would miss a
+  -- database-specific row entirely (the global timeout still looks exact
+  -- while IN DATABASE settings hijack writer logins on that database).
+  IF NOT EXISTS (SELECT 1 FROM pg_db_role_setting
+                 WHERE setrole = r.oid AND setdatabase = 0
+                   AND setconfig = '{statement_timeout=60s}'::text[]) THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: statement_timeout is not 60s', v_role);
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_db_role_setting WHERE setrole = r.oid
+               AND NOT (setdatabase = 0 AND setconfig = '{statement_timeout=60s}'::text[])) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: unexpected extra role settings', v_role);
   END IF;
 
   -- Schema access: USAGE and nothing else.

@@ -62,6 +62,7 @@ import {
 import { refuseEnvOptions, reconcileRecent, supabasePool } from "../lambda.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { TenantRunner } from "../../session-read-api/liveness.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const SECRET = JSON.stringify({ hoopdb_url: "postgresql://owner:secret@postgres:5432/hoopdb" });
 
@@ -669,13 +670,7 @@ async function migratedPg(): Promise<PGlite> {
   const pg = new PGlite({ extensions: { btree_gin, pg_trgm } });
   const read = (p: string) => readFileSync(join(repoRoot, p), "utf8");
   await pg.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of [
-    "supabase/bootstrap/session_directory_search_worker.sql",
-    "supabase/bootstrap/session_token_verifier.sql",
-    "supabase/bootstrap/session_ingest_roles.sql",
-    "supabase/bootstrap/session_read_api_roles.sql",
-    "supabase/bootstrap/session_consumer_roles.sql",
-  ])
+  for (const f of SESSION_BOOTSTRAP_FILES)
     await pg.exec(read(f));
   for (const f of readdirSync(join(repoRoot, "supabase/migrations")).sort())
     await pg.exec(read(`supabase/migrations/${f}`));
@@ -834,7 +829,12 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       expect(stripPsqlMeta(roleSql)).not.toMatch(/^\\s*\\\\/m);
       // The bootstrap files hold no transaction of their own: any of these
       // would end serve()'s outer transaction early and split the atomic run.
-      expect(roleSql).not.toMatch(/^\s*(BEGIN|START\s+TRANSACTION|SAVEPOINT|COMMIT|END|ROLLBACK)\s*;/mi);
+      // A BEGIN...EXCEPTION...END sub-block is not one: it is savepoint-scoped
+      // and stays atomic inside the outer transaction, so strip those before
+      // asserting no top-level transaction control.
+      const noSubBlocks = (sql: string) =>
+        sql.replace(/BEGIN(?:(?!BEGIN|END;).)*?EXCEPTION(?:(?!BEGIN).)*?END;/gis, "");
+      expect(noSubBlocks(roleSql)).not.toMatch(/^\s*(BEGIN|START\s+TRANSACTION|SAVEPOINT|COMMIT|END|ROLLBACK)\s*;/mi);
       expect(stripPsqlMeta(readFileSync(VERIFY_SQL, "utf8"))).not.toMatch(/^\s*(BEGIN|START\s+TRANSACTION|SAVEPOINT|COMMIT|END|ROLLBACK)\s*;/mi);
       // PGlite runs scripts via exec; the bootstrap sends the same stripped text in one query.
       await pg.exec(stripPsqlMeta(roleSql));
@@ -848,6 +848,39 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       expect(seen.rows[0]).toMatchObject({ n: 0 });
       // No password assertion: the password is set separately by the operator,
       // and PGlite stores an 8-char placeholder for every role regardless.
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("verify pins the exact setting set: extra global or per-database settings refuse", async () => {
+    const { pg } = await installed();
+    try {
+      const roleSql = readFileSync(ROLE_SQL, "utf8");
+      const verifySql = readFileSync(VERIFY_SQL, "utf8");
+      await pg.exec(stripPsqlMeta(roleSql));
+      await pg.exec(stripPsqlMeta(verifySql)); // exact marker set passes
+      const dbName = (await pg.query<{ db: string }>(`SELECT current_database() AS db`)).rows[0].db;
+      // An extra global setting beside the marker refuses ...
+      await pg.exec(`ALTER ROLE search_consumer_runtime SET search_path = attacker, pg_catalog`);
+      let code: string | undefined;
+      try {
+        await pg.exec(stripPsqlMeta(verifySql));
+      } catch (error) {
+        code = (error as { code?: string })?.code;
+      }
+      expect(code).toBe("55000");
+      await pg.exec(`ALTER ROLE search_consumer_runtime RESET search_path`);
+      await pg.exec(stripPsqlMeta(verifySql)); // ... and passes again once reset
+      // ... as does a per-database setting the global pin would otherwise miss.
+      await pg.exec(`ALTER ROLE search_consumer_runtime IN DATABASE "${dbName}" SET search_path = attacker`);
+      let dbCode: string | undefined;
+      try {
+        await pg.exec(stripPsqlMeta(verifySql));
+      } catch (error) {
+        dbCode = (error as { code?: string })?.code;
+      }
+      expect(dbCode).toBe("55000");
     } finally {
       await pg.close();
     }

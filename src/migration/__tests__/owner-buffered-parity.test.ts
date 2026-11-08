@@ -15,6 +15,7 @@ import {
   type ParityCensusInput,
 } from "../owner-buffered-parity.ts";
 import type { Queryable } from "../relayhistory-export.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const H = (c: string) => c.repeat(64);
 const BASE: ParityCensusInput = {
@@ -240,8 +241,7 @@ describe("pipeline-lead G2 write ruling", () => {
     const neon = new PGlite();
     try {
       await target.exec(read("supabase/tests/supabase_shim.sql"));
-      for (const file of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles", "session_consumer_roles"])
-        await target.exec(read(`supabase/bootstrap/${file}.sql`));
+      for (const file of SESSION_BOOTSTRAP_FILES) await target.exec(read(file));
       for (const file of readdirSync(join(root, "supabase/migrations")).filter((name) => name.endsWith(".sql")).sort())
         await target.exec(read(`supabase/migrations/${file}`));
       await target.exec(psql("supabase/bootstrap/session_read_api_role.sql"));

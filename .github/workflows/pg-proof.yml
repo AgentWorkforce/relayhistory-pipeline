@@ -291,7 +291,8 @@ jobs:
       - name: Create the CREATEROLE owner database (production-shaped)
         env:
           PG_SUPER_URL: postgres://postgres@127.0.0.1:5432/postgres
-          PG_OWNER_URL: postgres://postgres@127.0.0.1:5432/consumer336
+          PG_SUPER_DB_URL: postgres://postgres@127.0.0.1:5432/consumer336
+          PG_HOOP_URL: postgres://hoop@127.0.0.1:5432/consumer336
         run: |
           bun -e '
             import pg from "pg";
@@ -301,20 +302,27 @@ jobs:
             await admin.query("CREATE DATABASE consumer336 OWNER hoop");
             await admin.end();
             // Base roles once, as the superuser: the shim service_role
-            // carries BYPASSRLS, which the hoop owner cannot create. The
-            // suite skips these when its sentinel roles already exist.
-            const db = new pg.Pool({ connectionString: process.env.PG_OWNER_URL });
+            // carries BYPASSRLS, which the hoop owner cannot create (and on
+            // PG16+ hoop cannot create the worker/verifier/ingest/read-api
+            // roles either). The suite skips these when its sentinel roles
+            // already exist.
+            const sup = new pg.Pool({ connectionString: process.env.PG_SUPER_DB_URL });
+            const hoop = new pg.Pool({ connectionString: process.env.PG_HOOP_URL });
+            const { SESSION_BOOTSTRAP_FILES } = await import("./src/hoopdb/session-bootstrap-chain.ts");
             const sql = (p) => readFileSync(p, "utf8").split("\n").filter((l) => !l.startsWith("\\")).join("\n");
-            await db.query(sql("supabase/tests/supabase_shim.sql"));
-            for (const f of [
-              "supabase/bootstrap/session_directory_search_worker.sql",
-              "supabase/bootstrap/session_token_verifier.sql",
-              "supabase/bootstrap/session_ingest_roles.sql",
-              "supabase/bootstrap/session_read_api_roles.sql",
-            ]) await db.query(sql(f));
-            await db.query("CREATE EXTENSION IF NOT EXISTS pg_trgm");
-            await db.query("CREATE EXTENSION IF NOT EXISTS btree_gin");
-            await db.end();
+            await sup.query(sql("supabase/tests/supabase_shim.sql"));
+            // Single-sourced bootstrap chain: the grant migration FAILs
+            // without a grantee (migrations never create roles), so the T0
+            // setup provisions it exactly like migrate's bootstrap step. hoop
+            // provisions the consumer bare role itself: it must own the role
+            // (the rollback test drops it), and the bootstrap guard pins the
+            // invoker edge.
+            for (const f of SESSION_BOOTSTRAP_FILES)
+              await (f.endsWith("session_consumer_roles.sql") ? hoop : sup).query(sql(f));
+            await sup.query("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+            await sup.query("CREATE EXTENSION IF NOT EXISTS btree_gin");
+            await sup.end();
+            await hoop.end();
           '
       - name: Prove the owner bootstrap, dedicated role, and writer surface on real Postgres
         env:

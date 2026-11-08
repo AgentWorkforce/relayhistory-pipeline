@@ -36,6 +36,7 @@ import {
   type StageQueueDeps,
 } from "../src/lib/pipeline/index.js";
 import { FakePipelineQueues } from "./support/pipeline-queues.js";
+import { SESSION_BOOTSTRAP_FILES } from "../../../src/hoopdb/session-bootstrap-chain.js";
 
 const SUPABASE = new URL("../../../supabase/", import.meta.url).href;
 const supabaseFile = (path: string) =>
@@ -139,24 +140,10 @@ const options = { url: "http://postgrest.local", token: "synthetic", fetcher };
 beforeAll(async () => {
   db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await db.exec(readFileSync(supabaseFile("tests/supabase_shim.sql"), "utf8"));
-  await db.exec(
-    readFileSync(
-      supabaseFile("bootstrap/session_directory_search_worker.sql"),
-      "utf8",
-    ),
-  );
-  await db.exec(
-    readFileSync(
-      supabaseFile("bootstrap/session_token_verifier.sql"),
-      "utf8",
-    ),
-  );
-  await db.exec(
-    readFileSync(
-      supabaseFile("bootstrap/session_ingest_roles.sql"),
-      "utf8",
-    ) + "\n" + readFileSync(supabaseFile("bootstrap/session_read_api_roles.sql"), "utf8"),
-  );
+  // Single-sourced bootstrap chain (session-bootstrap-chain.ts): the grant
+  // migration FAILs closed without the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES)
+    await db.exec(readFileSync(supabaseFile(f.replace(/^supabase\//, '')), "utf8"));
   for (const file of readdirSync(supabaseFile("migrations/")).sort())
     await db.exec(readFileSync(supabaseFile(`migrations/${file}`), "utf8"));
   await db.exec("SET ROLE service_role");

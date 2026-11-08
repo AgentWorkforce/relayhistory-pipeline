@@ -65,14 +65,21 @@ BEGIN
     END IF;
   END IF;
   -- Bare-role spec: non-login, non-superuser, non-replication, no bypass,
-  -- no createdb/createrole, no inherit. Owner and membership stay whatever
-  -- the creator set (a NOLOGIN role has no login to hijack and no grants to
-  -- inherit through yet).
+  -- no createdb/createrole, no inherit, and no role settings at all: a
+  -- hostile search_path (or any other setting) on the bare role would be
+  -- inherited by the promotion, so extras refuse here too. Owner and
+  -- membership stay whatever the creator set (a NOLOGIN role has no login
+  -- to hijack and no grants to inherit through yet).
   -- Claimed-role spec: the operator bootstrap promotes this same role to the
   -- dedicated LOGIN and records the claim as statement_timeout = 60s. Accept
-  -- exactly that shape (every other attribute still false, setting present)
-  -- so later migrates converge; refuse a LOGIN without the claim marker,
-  -- which was never promoted by the operator bootstrap.
+  -- exactly that shape (every other attribute still false, the complete
+  -- pg_db_role_setting set exactly one global row holding only the timeout,
+  -- no database-specific rows) so later migrates converge; refuse a LOGIN
+  -- without the claim marker, which was never promoted by the operator
+  -- bootstrap, and refuse any extra setting in either state (extras would
+  -- inherit into every genuine writer login). Passwords are the operator
+  -- file's business (it refuses a pre-existing one before the first LOGIN);
+  -- this file never touches them, only fails closed on shape drift.
   PERFORM 1 FROM pg_roles
    WHERE rolname = v_role
      AND rolsuper IS FALSE
@@ -81,14 +88,19 @@ BEGIN
      AND rolcreatedb IS FALSE
      AND rolcreaterole IS FALSE
      AND rolinherit IS FALSE
-     AND ((rolcanlogin IS FALSE)
+     AND ((rolcanlogin IS FALSE
+           AND NOT EXISTS (SELECT 1 FROM pg_db_role_setting s WHERE s.setrole = pg_roles.oid))
           OR (rolcanlogin IS TRUE
               AND EXISTS (SELECT 1 FROM pg_db_role_setting s
                            WHERE s.setrole = pg_roles.oid AND s.setdatabase = 0
-                             AND 'statement_timeout=60s' = ANY (s.setconfig))));
+                             AND s.setconfig = '{statement_timeout=60s}'::text[])
+              AND NOT EXISTS (SELECT 1 FROM pg_db_role_setting s
+                               WHERE s.setrole = pg_roles.oid
+                                 AND NOT (s.setdatabase = 0
+                                          AND s.setconfig = '{statement_timeout=60s}'::text[]))));
   IF NOT FOUND THEN
     RAISE EXCEPTION USING ERRCODE = '28000',
-      MESSAGE = 'consumer roles bootstrap: refusing to run with an unexpected ' || v_role || ' shape (want bare NOLOGIN, or operator-claimed LOGIN with the 60s timeout marker)';
+      MESSAGE = 'consumer roles bootstrap: refusing to run with an unexpected ' || v_role || ' shape (want bare NOLOGIN with no settings, or operator-claimed LOGIN with exactly the 60s timeout marker and nothing else)';
   END IF;
 END
 $consumer_roles$;

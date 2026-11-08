@@ -24,6 +24,7 @@ import type {
 } from "../engine/model.ts";
 import { briefConfig, type BriefConfig } from "../config.ts";
 import type { SessionSummaryState } from "../engine/summary-contract.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 export const root = join(import.meta.dir, "../../..");
 export const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -35,11 +36,7 @@ export const KEY = { orgId: "org-a", workspaceId: "ws-a", harness: "claude", ses
 export async function database(opts: { hoop?: boolean } = {}): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
-  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
-  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
-  await db.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
-  await db.exec(read("supabase/bootstrap/session_consumer_roles.sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort())
     await db.exec(read(`supabase/migrations/${file}`));
   if (opts.hoop !== false)

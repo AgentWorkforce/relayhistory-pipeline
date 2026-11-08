@@ -9,6 +9,7 @@ import {deliverBatch} from "../deliver.ts";
 import {prepareDelivery} from "../vendor/delivery/prepare.ts";
 import type {CurrentCustodyPacket} from "../custody-protocol.ts";
 import {TENANT,batch,record,scratchStore} from "./support.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 setDefaultTimeout(30000);
 const root=join(import.meta.dir,"../../.."),generation="a".repeat(64),epoch="3".repeat(64),identity="c".repeat(64),baseline="a".repeat(64);
 const open:Array<()=>Promise<unknown>|void>=[];
@@ -17,7 +18,7 @@ afterEach(async()=>{for(const close of open.splice(0).reverse())await close()});
 async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles", "session_consumer_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
+ for(const f of SESSION_BOOTSTRAP_FILES)await db.exec(read(f));
  for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.exec(read("supabase/migrations/"+f));
  await db.exec("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','"+generation+"','pass')");
  const owner=async(name:string,p:unknown)=>(await db.query("SELECT sessions."+name+"($1::jsonb) AS r",[JSON.stringify(p)])).rows[0]!.r as any;

@@ -22,6 +22,15 @@
 --     writer policy on the search_index tables: both carry forced
 --     tenant_only from the composed ensureSchema, and every search write
 --     binds the tenant GUCs per scope.
+--   * EXECUTE on sessions.session_publication_lock (any-scope): the lock
+--     function takes only a manifest body and delegates to
+--     ingest_publication_scope, which re-checks publication authority
+--     itself; the writer calls it exactly where the composed tick needs
+--     the lock. Accepted residual risk (recorded, reviewable): the grant
+--     itself is not tenant-scoped, so a bug that calls it outside the
+--     tick would run unscoped — bounded by review plus the as-role live
+--     42501 proofs, and any tenant-scoped tightening later needs no
+--     writer change.
 --
 -- Run as the schema owner INSIDE the bootstrap's single transaction (the
 -- bootstrap holds the advisory lock and rolls everything back on failure).
@@ -86,6 +95,46 @@ BEGIN
         MESSAGE = format('bootstrap %s: the role has memberships beyond the creator edge', v_name),
         HINT = 'Nothing was changed. Revoke the membership by hand (an operator decision), then rerun.';
     END IF;
+  END IF;
+  -- Promotion edge: the first LOGIN must start from a clean bare role. Refuse
+  -- any pre-existing setting (even statement_timeout itself: the claim marker
+  -- is recorded by this step, not inherited), because extras would survive
+  -- into every genuine writer login. An already-LOGIN role skips this edge:
+  -- reruns converge through the revoke-first grants below and the verify
+  -- file's exact-settings pin.
+  IF NOT r.rolcanlogin THEN
+    IF EXISTS (SELECT 1 FROM pg_db_role_setting WHERE setrole = r.oid) THEN
+      RAISE EXCEPTION USING ERRCODE = '55000',
+        MESSAGE = format('bootstrap %s: refusing to promote a role with pre-existing settings', v_name),
+        HINT = 'Nothing was changed. Reset the role settings by hand (an operator decision), then rerun.';
+    END IF;
+    -- A preset credential would turn the promotion into an already-usable
+    -- account (the operator sets the password after this file, via
+    -- \password). pg_authid carries the true password where the invoker may
+    -- read it (every superuser path, including PGlite, whose pg_roles view
+    -- masks every role with a placeholder). A non-superuser owner cannot read
+    -- pg_authid and falls back to the pg_roles presence bit, which is exact
+    -- on real Postgres (NULL vs masked). Validity is unsensitive and checked
+    -- directly either way.
+    IF r.rolvaliduntil IS NOT NULL THEN
+      RAISE EXCEPTION USING ERRCODE = '55000',
+        MESSAGE = format('bootstrap %s: refusing to promote a role with a pre-existing validity', v_name),
+        HINT = 'Nothing was changed. Reset the credential by hand (an operator decision), then rerun.';
+    END IF;
+    BEGIN
+      PERFORM 1 FROM pg_authid a WHERE a.oid = r.oid AND a.rolpassword IS NOT NULL;
+      IF FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '55000',
+          MESSAGE = format('bootstrap %s: refusing to promote a role with a pre-existing password', v_name),
+          HINT = 'Nothing was changed. Reset the credential by hand (an operator decision), then rerun.';
+      END IF;
+    EXCEPTION WHEN insufficient_privilege THEN
+      IF r.rolpassword IS NOT NULL THEN
+        RAISE EXCEPTION USING ERRCODE = '55000',
+          MESSAGE = format('bootstrap %s: refusing to promote a role with a pre-existing password', v_name),
+          HINT = 'Nothing was changed. Reset the credential by hand (an operator decision), then rerun.';
+      END IF;
+    END;
   END IF;
 END
 $role$;

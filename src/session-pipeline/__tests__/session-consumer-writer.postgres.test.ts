@@ -77,6 +77,7 @@ import {
   runBootstrap,
   stripPsqlMeta,
 } from "../consumer-bootstrap.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const ownerUrl = process.env.SESSION_PIPELINE_TEST_PG_URL;
 const writerUrl = process.env.SESSION_PIPELINE_TEST_WRITER_PG_URL;
@@ -111,6 +112,9 @@ async function files(): Promise<{ role: string; verify: string }> {
  * is absent, exactly like the PGlite migratedPg fixture but on real
  * Postgres. The migrator's own PUBLIC-EXECUTE revoke runs too, mirroring the
  * hardening migrate performs before this bootstrap ever runs.
+ * Fresh-cluster discipline: the writer role is cluster-global and the
+ * rollback test drops it, so reruns need a cluster where no other database
+ * holds the role's dependents (DROP ROLE refuses with cross-db 2BP01).
  */
 const repoRoot = join(import.meta.dir, "../../..");
 const readSql = (path: string): string =>
@@ -119,15 +123,10 @@ const readSql = (path: string): string =>
     .filter((line) => !line.startsWith("\\"))
     .join("\n");
 
-const BASE_ROLE_FILES = [
-  "supabase/bootstrap/session_directory_search_worker.sql",
-  "supabase/bootstrap/session_token_verifier.sql",
-  "supabase/bootstrap/session_ingest_roles.sql",
-  "supabase/bootstrap/session_read_api_roles.sql",
-  // Mirrors migrate's bootstrap-before-schema order: the consumer grant
-  // migration needs the bare role to exist (migrations never create roles).
-  "supabase/bootstrap/session_consumer_roles.sql",
-];
+// Single-sourced bootstrap chain (session-bootstrap-chain.ts): mirrors
+// migrate's bootstrap-before-schema order — the consumer grant migration
+// needs the bare role to exist (migrations never create roles).
+const BASE_ROLE_FILES: readonly string[] = SESSION_BOOTSTRAP_FILES;
 
 async function ensureProvisioned(pool: pg.Pool): Promise<void> {
   const { rows } = await pool.query<{ r: string | null }>(
@@ -137,17 +136,28 @@ async function ensureProvisioned(pool: pg.Pool): Promise<void> {
   // The shim's service_role carries BYPASSRLS, which only a superuser can
   // create: when the base roles are absent the connected user must be a
   // superuser (CI pre-provisions them in its setup step, so the owner run
-  // skips this branch). The owner then installs the trusted extensions and
-  // the migration chain itself.
+  // skips this branch). The bare consumer role needs no privilege to
+  // create, so the owner provisions just it when the shim is present but
+  // the role is not (CI setup versions that predate the roles file, or a
+  // database created before the grant migration existed).
   const base = await pool.query<{ n: string }>(
     `SELECT count(*) AS n FROM pg_roles WHERE rolname IN ('service_role', 'anon', 'authenticated')`,
+  );
+  const consumer = await pool.query<{ n: string }>(
+    `SELECT count(*) AS n FROM pg_roles WHERE rolname = 'search_consumer_runtime'`,
   );
   if (base.rows[0]?.n !== "3") {
     const [{ rolsuper }] = (await pool.query(`SELECT rolsuper FROM pg_roles WHERE rolname = current_user`)).rows as { rolsuper: boolean }[];
     if (!rolsuper)
-      throw new Error("writer proof needs its base roles once (service_role/anon/authenticated, incl BYPASSRLS): apply supabase_shim + the four bootstrap role files as a superuser, then rerun");
+      throw new Error("writer proof needs its base roles once (service_role/anon/authenticated, incl BYPASSRLS): apply supabase_shim + the five bootstrap role files as a superuser, then rerun");
     await pool.query(readSql("supabase/tests/supabase_shim.sql"));
     for (const file of BASE_ROLE_FILES) await pool.query(readSql(file));
+  } else if (consumer.rows[0]?.n !== "1") {
+    // The grant migration FAILs without a grantee and migrations never
+    // create roles, so the sentinel covers the bare role too: a present
+    // shim with an absent consumer role means the provisioner predates the
+    // roles file, and the owner (CREATEROLE suffices) closes the gap here.
+    await pool.query(readSql("supabase/bootstrap/session_consumer_roles.sql"));
   }
   await pool.query("CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin");
   for (const file of readdirSync(join(repoRoot, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort())
@@ -246,9 +256,20 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
       "session_directory_resurrection_fences", "pipeline_jobs", "repos", "repo_names",
     ])
       await client.query(`DROP POLICY IF EXISTS search_consumer_trusted ON sessions.${table}`);
-    await client.query(`REVOKE ALL ON SCHEMA sessions, search_index FROM search_consumer_runtime`);
-    await client.query(`REVOKE ALL ON ALL TABLES IN SCHEMA sessions, search_index FROM search_consumer_runtime`);
-    await client.query(`REVOKE ALL ON ALL FUNCTIONS IN SCHEMA sessions, search_index FROM search_consumer_runtime`);
+    // The search_index schema is operator-created (the role bootstrap makes
+    // it, not the migrations), so on a fresh database it may not exist yet:
+    // only revoke where the schema is present, or the cleanup itself fails
+    // 3F000 and the rollback test is order-dependent.
+    const schemas = (
+      await client.query<{ nspname: string }>(
+        `SELECT nspname FROM pg_namespace WHERE nspname IN ('sessions', 'search_index')`,
+      )
+    ).rows.map((r) => r.nspname);
+    for (const schema of schemas) {
+      await client.query(`REVOKE ALL ON SCHEMA ${schema} FROM search_consumer_runtime`);
+      await client.query(`REVOKE ALL ON ALL TABLES IN SCHEMA ${schema} FROM search_consumer_runtime`);
+      await client.query(`REVOKE ALL ON ALL FUNCTIONS IN SCHEMA ${schema} FROM search_consumer_runtime`);
+    }
     await client.query(`DROP TABLE IF EXISTS sessions.search_consumer_pending, sessions.search_consumer_progress`);
     await client.query(`DROP ROLE search_consumer_runtime`);
   }
