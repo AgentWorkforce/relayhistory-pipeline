@@ -13,6 +13,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { scrubRecords } from "../src/lib/pipeline/raw-chunks.js";
 import { MAX_SCRUB_CHARS, scrubJson, scrubRecord, scrubText } from "../src/lib/scrub.js";
 
 /** sha256 of the corpus. Update in both repos together when the corpus changes. */
@@ -156,6 +157,21 @@ describe("shared secret-scrubbing corpus", () => {
             expect(out.includes(SENTINEL), `${c.id} kept a sentinel on the record path`).toBe(false);
           expect(JSON.stringify(scrubJson(JSON.parse(viaJson))), `${c.id} record path is not idempotent`).toBe(viaJson);
           expect(scrubText(viaJson), `${c.id} record output rescanned`).toBe(viaJson);
+          // The record-line path: stored through scrubRecords (rule set 5), one line.
+          const enc = new TextEncoder();
+          const dec = new TextDecoder();
+          const line = scrubRecords(enc.encode(`${input}\n`)).scrubbed;
+          const viaLine = dec.decode(line).replace(/\n$/, "");
+          outputs.push(viaLine);
+          expect(viaLine.includes(SENTINEL), `${c.id} kept a sentinel on the record-line path`).toBe(false);
+          // The tokenizer keeps input formatting: compare only canonical compact JSON.
+          if (JSON.stringify(parsed) === input) {
+            expect(viaLine, `${c.id} (record-line path)`).toBe(expectedRecord);
+          }
+          expect(
+            Array.from(scrubRecords(line).scrubbed),
+            `${c.id} record-line path is not idempotent`,
+          ).toEqual(Array.from(line));
         }
         for (const out of outputs)
           for (const secret of secrets)
