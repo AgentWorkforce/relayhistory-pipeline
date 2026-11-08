@@ -73,7 +73,7 @@ export function createStack(): StackSession {
     return { status: r.status ?? 1, stdout: r.stdout ?? "" };
   };
   const hostPort = (service: string, port: string) => {
-    const out = compose(["port", service, port], { quiet: true }).stdout.trim();
+    const out = compose(["port", service, port], { quiet: true, allowFail: true }).stdout.trim();
     const value = out.slice(out.lastIndexOf(":") + 1);
     if (!/^\d+$/u.test(value)) throw new Error(`no host port for ${service}:${port}`);
     return value;

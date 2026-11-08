@@ -229,7 +229,10 @@ export async function runAcceptance(stack: StackSession, log: (c: Check) => void
 
   await step("durability.restart", async () => {
     stack.compose(["restart", "db", "minio", "session-ingest", "session-read-api", "session-pipeline-consumer"], { quiet: true });
-    stack.resolveUrls();
+    // A container still coming back has no published port yet.
+    for (let i = 0; ; i++) {
+      try { stack.resolveUrls(); break; } catch (error) { if (i >= 30) throw error; await sleep(2_000); }
+    }
     const deadline = Date.now() + 120_000;
     for (;;) {
       try {
