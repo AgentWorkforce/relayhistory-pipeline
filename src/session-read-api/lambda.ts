@@ -23,7 +23,9 @@
  * entry, `entry: "service"`, wires the canonical source from LOCKER_*, see
  * service-canonical.ts). READ_API_AUTH_MODE (unset/"" = the default dual path;
  * exactly "relaycontrol_only" = no RelayAuth verifier at all, see
- * readApiAuthConfig).
+ * readApiAuthConfig). READ_API_INTROSPECT_POSITIVE_TTL_MS (unset = 60000; an
+ * integer 0..60000, 0 = introspect every request; anything else fails startup,
+ * see readApiIntrospectPositiveTtlMs).
  *
  * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED, owner-buffered.ts) are
  * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
@@ -39,7 +41,13 @@ import { createClickHouseClient } from "../session-pipeline/vendor/search-index/
 import { createReadApi, parseDirectoryWorkspaces, type ReadApiDeps } from "./app.ts";
 import { sqlDirectory } from "./directory.ts";
 import { sqlBriefTitles } from "./brief-titles.ts";
-import { readApiVerifier, relaycontrolLogin, type AuthConfig } from "./auth.ts";
+import {
+  READ_API_INTROSPECT_POSITIVE_TTL_MS_DEFAULT,
+  READ_API_INTROSPECT_POSITIVE_TTL_MS_MAX,
+  readApiVerifier,
+  relaycontrolLogin,
+  type AuthConfig,
+} from "./auth.ts";
 import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
@@ -86,6 +94,27 @@ export function readApiAuthMode(env: NodeJS.ProcessEnv = process.env): "default"
   throw new Error(`session read api: ${READ_API_AUTH_MODE_VAR} must be unset, "" or "relaycontrol_only"`);
 }
 
+export const READ_API_INTROSPECT_POSITIVE_TTL_MS_VAR = "READ_API_INTROSPECT_POSITIVE_TTL_MS";
+
+/**
+ * READ_API_INTROSPECT_POSITIVE_TTL_MS: how long (ms) an admitted relaycontrol
+ * token is reused before it is introspected again, so the read path's
+ * revocation lag. Unset keeps 60000 (the hosted behaviour). Otherwise exactly
+ * a decimal integer 0..60000 (no sign, spaces, exponent or leading zero); 0
+ * introspects every request. Anything else, "" included, refuses startup.
+ * Parsed whether or not relaycontrol tokens are enabled. Never echoes the value.
+ */
+export function readApiIntrospectPositiveTtlMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[READ_API_INTROSPECT_POSITIVE_TTL_MS_VAR];
+  if (raw === undefined) return READ_API_INTROSPECT_POSITIVE_TTL_MS_DEFAULT;
+  const value = /^(0|[1-9][0-9]{0,4})$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isSafeInteger(value) || value < 0 || value > READ_API_INTROSPECT_POSITIVE_TTL_MS_MAX)
+    throw new Error(
+      `session read api: ${READ_API_INTROSPECT_POSITIVE_TTL_MS_VAR} must be unset or an integer from 0 to ${READ_API_INTROSPECT_POSITIVE_TTL_MS_MAX}`,
+    );
+  return value;
+}
+
 /**
  * relaycontrol_only (a self-host without RelayAuth): the verifier never builds
  * the RelayAuth path, so no JWKS is ever fetched and a bearer without the
@@ -94,7 +123,11 @@ export function readApiAuthMode(env: NodeJS.ProcessEnv = process.env): "default"
  * relaycontrol introspection (so the mode can never silently fall back to 401
  * not_configured on every request). Errors name variables, never values.
  */
-function relaycontrolOnlyAuthConfig(env: NodeJS.ProcessEnv, policy: ReturnType<typeof destinationPolicy>): AuthConfig {
+function relaycontrolOnlyAuthConfig(
+  env: NodeJS.ProcessEnv,
+  policy: ReturnType<typeof destinationPolicy>,
+  positiveTtlMs: number,
+): AuthConfig {
   const mode = `${READ_API_AUTH_MODE_VAR}=relaycontrol_only`;
   for (const name of ["RELAYAUTH_JWKS_URL", "RELAYAUTH_ISSUER"] as const)
     if (env[name]?.trim()) throw new Error(`session read api: ${mode} refuses ${name}; unset it`);
@@ -106,7 +139,7 @@ function relaycontrolOnlyAuthConfig(env: NodeJS.ProcessEnv, policy: ReturnType<t
   for (const [name, value] of [["READ_API_ORIGIN", origin], ["RELAYCONTROL_INTROSPECT_URL", url], ["RELAYCONTROL_INTROSPECT_SECRET", secret]] as const)
     if (!value) throw new Error(`session read api: ${mode} needs ${name}`);
   assertDestinationUrl("RELAYCONTROL_INTROSPECT_URL", url!, policy);
-  return { origin: env.READ_API_ORIGIN || undefined, mode: "relaycontrol_only", relaycontrol: { url, secret } };
+  return { origin: env.READ_API_ORIGIN || undefined, mode: "relaycontrol_only", relaycontrol: { url, secret, positiveTtlMs } };
 }
 
 /**
@@ -117,7 +150,8 @@ function relaycontrolOnlyAuthConfig(env: NodeJS.ProcessEnv, policy: ReturnType<t
  */
 export function readApiAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig {
   const policy = destinationPolicy(env);
-  if (readApiAuthMode(env) === "relaycontrol_only") return relaycontrolOnlyAuthConfig(env, policy);
+  const positiveTtlMs = readApiIntrospectPositiveTtlMs(env);
+  if (readApiAuthMode(env) === "relaycontrol_only") return relaycontrolOnlyAuthConfig(env, policy, positiveTtlMs);
   const jwksUrl = env.RELAYAUTH_JWKS_URL?.trim() || undefined;
   if (jwksUrl) assertDestinationUrl("RELAYAUTH_JWKS_URL", jwksUrl, policy);
   const config: AuthConfig = { origin: env.READ_API_ORIGIN || undefined, jwksUrl, issuer: env.RELAYAUTH_ISSUER };
@@ -126,7 +160,7 @@ export function readApiAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthCon
   if (env.RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS === "true") {
     const url = env.RELAYCONTROL_INTROSPECT_URL?.trim() || undefined;
     if (url) assertDestinationUrl("RELAYCONTROL_INTROSPECT_URL", url, policy);
-    config.relaycontrol = { url, secret: env.RELAYCONTROL_INTROSPECT_SECRET?.trim() || undefined };
+    config.relaycontrol = { url, secret: env.RELAYCONTROL_INTROSPECT_SECRET?.trim() || undefined, positiveTtlMs };
   }
   return config;
 }

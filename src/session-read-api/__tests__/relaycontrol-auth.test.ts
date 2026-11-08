@@ -6,10 +6,15 @@
  * Synthetic ids and secret only; relaycontrol is a stub fetch.
  */
 import { describe, expect, test } from "bun:test";
-import { createRelaycontrolIntrospector } from "@rhc/auth/relaycontrol.ts";
+import {
+  createRelaycontrolIntrospector,
+  resetSharedRelaycontrolIntrospectors,
+  sharedRelaycontrolIntrospector,
+  type RelaycontrolIntrospectorOptions,
+} from "@rhc/auth/relaycontrol.ts";
 import { AuthError, createReadApi, type Verifier } from "../app.ts";
-import { readApiVerifier, type AuthConfig } from "../auth.ts";
-import { readApiAuthConfig } from "../lambda.ts";
+import { READ_API_INTROSPECT_POSITIVE_TTL_MS_DEFAULT, readApiVerifier, relaycontrolLogin, type AuthConfig } from "../auth.ts";
+import { readApiAuthConfig, readApiIntrospectPositiveTtlMs } from "../lambda.ts";
 import { memoryLiveness } from "./support.ts";
 
 const ORIGIN = "https://read.example.test";
@@ -144,10 +149,128 @@ describe("readApiAuthConfig with the relaycontrol flag", () => {
 
   test("on: URL and secret carried; plain http needs the in-cluster flag and a Service name", () => {
     const on = { READ_API_ORIGIN: ORIGIN, RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS: "true", RELAYCONTROL_INTROSPECT_SECRET: "s" };
-    expect(readApiAuthConfig({ ...on, RELAYCONTROL_INTROSPECT_URL: "https://rc.example.test" }).relaycontrol).toEqual({ url: "https://rc.example.test", secret: "s" });
+    expect(readApiAuthConfig({ ...on, RELAYCONTROL_INTROSPECT_URL: "https://rc.example.test" }).relaycontrol).toEqual({ url: "https://rc.example.test", secret: "s", positiveTtlMs: 60_000 });
     const svc = "http://relaycontrol.relaycontrol.svc:8080";
     expect(() => readApiAuthConfig({ ...on, RELAYCONTROL_INTROSPECT_URL: svc })).toThrow(/RELAYCONTROL_INTROSPECT_URL must use https/);
     expect(readApiAuthConfig({ ...on, RELAYCONTROL_INTROSPECT_URL: svc, ALLOW_IN_CLUSTER_HTTP: "true" }).relaycontrol?.url).toBe(svc);
-    expect(readApiAuthConfig({ ...on }).relaycontrol).toEqual({ url: undefined, secret: "s" });
+    expect(readApiAuthConfig({ ...on }).relaycontrol).toEqual({ url: undefined, secret: "s", positiveTtlMs: 60_000 });
+  });
+});
+
+describe("READ_API_INTROSPECT_POSITIVE_TTL_MS (the read path's revocation lag)", () => {
+  const on = { READ_API_ORIGIN: ORIGIN, RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS: "true", RELAYCONTROL_INTROSPECT_URL: "https://rc.example.test", RELAYCONTROL_INTROSPECT_SECRET: "s" };
+  const only = { ...on, READ_API_AUTH_MODE: "relaycontrol_only" };
+
+  /** A relaycontrol stub whose answer can be flipped (revocation), on a controlled clock. */
+  function clocked() {
+    let clock = Date.now();
+    let revoked = false;
+    let fetches = 0;
+    const seen: RelaycontrolIntrospectorOptions[] = [];
+    const introspector = async (opts: RelaycontrolIntrospectorOptions) => {
+      seen.push(opts);
+      return createRelaycontrolIntrospector({
+        ...opts,
+        log: () => {},
+        now: () => clock,
+        fetch: (async () => {
+          fetches++;
+          return Response.json(revoked ? { active: false, reason: "inactive:revoked" } : active());
+        }) as typeof fetch,
+      });
+    };
+    return {
+      introspector,
+      seen,
+      fetches: () => fetches,
+      revoke: () => void (revoked = true),
+      advance: (ms: number) => void (clock += ms),
+    };
+  }
+
+  /** One verifier over one introspector, as the process keeps it. */
+  function verifierFor(positiveTtlMs: number | undefined, rc: ReturnType<typeof clocked>) {
+    let built: ReturnType<typeof rc.introspector> | undefined;
+    const once = (opts: RelaycontrolIntrospectorOptions) => (built ??= rc.introspector(opts));
+    const relaycontrol = positiveTtlMs === undefined ? { ...config.relaycontrol } : { ...config.relaycontrol, positiveTtlMs };
+    return readApiVerifier({ origin: ORIGIN, relaycontrol }, { introspector: once });
+  }
+
+  test("unset is 60000, in both auth modes, and is passed to the introspector explicitly", async () => {
+    expect(readApiIntrospectPositiveTtlMs({})).toBe(60_000);
+    expect(READ_API_INTROSPECT_POSITIVE_TTL_MS_DEFAULT).toBe(60_000);
+    expect(readApiAuthConfig(on).relaycontrol?.positiveTtlMs).toBe(60_000);
+    expect(readApiAuthConfig(only).relaycontrol?.positiveTtlMs).toBe(60_000);
+    const rc = clocked();
+    const verify = verifierFor(undefined, rc);
+    await verify(TOKEN, { workspace: "ws-a" });
+    await verify(TOKEN, { workspace: "ws-a" });
+    expect(rc.seen[0]?.positiveTtlMs).toBe(60_000);
+    // Negatives keep the client's own default (5 s, capped there): never passed, never lengthened.
+    expect(rc.seen[0]?.negativeTtlMs).toBeUndefined();
+    expect(rc.fetches()).toBe(1);
+  });
+
+  test("accepted values are carried into the relaycontrol config", () => {
+    for (const [raw, value] of [["0", 0], ["1", 1], ["5000", 5000], ["60000", 60_000]] as const) {
+      expect(readApiAuthConfig({ ...on, READ_API_INTROSPECT_POSITIVE_TTL_MS: raw }).relaycontrol?.positiveTtlMs).toBe(value);
+      expect(readApiAuthConfig({ ...only, READ_API_INTROSPECT_POSITIVE_TTL_MS: raw }).relaycontrol?.positiveTtlMs).toBe(value);
+    }
+  });
+
+  test("0: every request introspects (two requests, two fetches), and a revocation is refused on the next request", async () => {
+    const rc = clocked();
+    const verify = verifierFor(readApiAuthConfig({ ...on, READ_API_INTROSPECT_POSITIVE_TTL_MS: "0" }).relaycontrol?.positiveTtlMs, rc);
+    expect((await verify(TOKEN, { workspace: "ws-a" })).userId).toBe("u-1");
+    expect((await verify(TOKEN, { workspace: "ws-a" })).userId).toBe("u-1");
+    expect(rc.seen[0]?.positiveTtlMs).toBe(0);
+    expect(rc.fetches()).toBe(2);
+    rc.revoke();
+    expect(await refusal(verify, TOKEN, "ws-a")).toBe("401 unauthorized");
+    expect(rc.fetches()).toBe(3);
+  });
+
+  test("a revocation is observed once the TTL lapses, not before", async () => {
+    const rc = clocked();
+    const verify = verifierFor(10_000, rc);
+    await verify(TOKEN, { workspace: "ws-a" });
+    rc.revoke();
+    rc.advance(9_999);
+    expect((await verify(TOKEN, { workspace: "ws-a" })).userId).toBe("u-1"); // still inside the window
+    expect(rc.fetches()).toBe(1);
+    rc.advance(1);
+    expect(await refusal(verify, TOKEN, "ws-a")).toBe("401 unauthorized");
+    expect(rc.fetches()).toBe(2);
+  });
+
+  test("the login exchange is introspected with the same explicit TTL", async () => {
+    const rc = clocked();
+    const login = relaycontrolLogin({ origin: ORIGIN, relaycontrol: { ...config.relaycontrol, positiveTtlMs: 0 } }, rc.introspector);
+    await login(TOKEN);
+    expect(rc.seen[0]?.positiveTtlMs).toBe(0);
+  });
+
+  test("the process-wide introspector is never shared across different TTLs", async () => {
+    resetSharedRelaycontrolIntrospectors();
+    const base = { url: "https://rc.example.test", secret: "s", log: () => {} };
+    const hosted = await sharedRelaycontrolIntrospector({ ...base, positiveTtlMs: 60_000 });
+    expect(await sharedRelaycontrolIntrospector({ ...base, positiveTtlMs: 60_000 })).toBe(hosted);
+    expect(await sharedRelaycontrolIntrospector(base)).toBe(hosted); // unset is the same effective 60 s
+    expect(await sharedRelaycontrolIntrospector({ ...base, positiveTtlMs: 0 })).not.toBe(hosted);
+    resetSharedRelaycontrolIntrospectors();
+  });
+
+  test("invalid values refuse startup, flag on or off, without echoing the value", () => {
+    for (const raw of ["", " ", "-1", "60001", "100000", "1.5", "1e3", "0x10", "+5", " 5", "5 ", "05", "abc", "NaN", "Infinity"]) {
+      for (const env of [on, only, { READ_API_ORIGIN: ORIGIN }]) {
+        let message = "";
+        try {
+          readApiAuthConfig({ ...env, READ_API_INTROSPECT_POSITIVE_TTL_MS: raw });
+        } catch (error) {
+          message = (error as Error).message;
+        }
+        expect(message).toBe("session read api: READ_API_INTROSPECT_POSITIVE_TTL_MS must be unset or an integer from 0 to 60000");
+      }
+    }
   });
 });

@@ -543,14 +543,19 @@ export function createRelaycontrolIntrospector(
 const shared = new Map<string, RelaycontrolIntrospector>();
 
 /**
- * One introspector (and so one cache) per configured URL and secret for the
- * life of the process, for callers that read configuration per request (the
- * Hono middleware reads `c.env`). The map key is a digest, never the secret.
+ * One introspector (and so one cache) per configured URL, secret and
+ * effective cache TTLs for the life of the process, for callers that read
+ * configuration per request (the Hono middleware reads `c.env`). The map key is a digest, never the secret.
  */
 export async function sharedRelaycontrolIntrospector(
   opts: RelaycontrolIntrospectorOptions,
 ): Promise<RelaycontrolIntrospector> {
-  const key = await sha256Hex(`${opts.url.trim()}\n${opts.secret.trim()}`);
+  // The effective cache TTLs are part of the key: a caller asking for a
+  // shorter positive (or negative) window never reuses an introspector built
+  // with a longer one.
+  const positive = Math.min(opts.positiveTtlMs ?? DEFAULT_POSITIVE_TTL_MS, DEFAULT_POSITIVE_TTL_MS);
+  const negative = Math.min(opts.negativeTtlMs ?? DEFAULT_NEGATIVE_TTL_MS, DEFAULT_NEGATIVE_TTL_MS);
+  const key = await sha256Hex(`${opts.url.trim()}\n${opts.secret.trim()}\n${positive}\n${negative}`);
   let introspector = shared.get(key);
   if (!introspector) {
     introspector = createRelaycontrolIntrospector(opts);

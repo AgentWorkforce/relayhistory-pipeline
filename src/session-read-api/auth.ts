@@ -26,8 +26,12 @@ export interface AuthConfig {
    * Present only with RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true: relaycontrol
    * user access tokens (`sh_at_`) are introspected. A missing URL or secret
    * refuses those tokens (401 not_configured); RelayAuth tokens are unaffected.
+   * `positiveTtlMs` is READ_API_INTROSPECT_POSITIVE_TTL_MS (lambda.ts
+   * readApiIntrospectPositiveTtlMs): how long an admit is reused, 0..60000;
+   * absent is READ_API_INTROSPECT_POSITIVE_TTL_MS_DEFAULT (60000). It is always
+   * passed to the introspector explicitly, never inherited.
    */
-  relaycontrol?: { url?: string; secret?: string };
+  relaycontrol?: { url?: string; secret?: string; positiveTtlMs?: number };
   /**
    * READ_API_AUTH_MODE=relaycontrol_only (lambda.ts readApiAuthConfig): only
    * `sh_at_` tokens through relaycontrol; relayAuthVerifier is never built, so
@@ -35,6 +39,24 @@ export interface AuthConfig {
    * Absent: the default dual path, unchanged.
    */
   mode?: "relaycontrol_only";
+}
+
+/** The read path's positive introspection cache when READ_API_INTROSPECT_POSITIVE_TTL_MS is unset (the hosted behaviour). */
+export const READ_API_INTROSPECT_POSITIVE_TTL_MS_DEFAULT = 60_000;
+/** The largest positive TTL the read path accepts; relaycontrol.ts also caps at this. */
+export const READ_API_INTROSPECT_POSITIVE_TTL_MS_MAX = 60_000;
+
+/**
+ * The introspector options for the read path. The positive TTL is explicit;
+ * the negative TTL is left to the client's own default (5 s, capped there), so
+ * refusals are never cached longer than relaycontrol.ts already does.
+ */
+function introspectorOptions(
+  relaycontrol: NonNullable<AuthConfig["relaycontrol"]>,
+  url: string,
+  secret: string,
+): RelaycontrolIntrospectorOptions {
+  return { url, secret, positiveTtlMs: relaycontrol.positiveTtlMs ?? READ_API_INTROSPECT_POSITIVE_TTL_MS_DEFAULT };
 }
 
 export function relayAuthVerifier(config: AuthConfig, verify = verifyAgentRelayToken): Verifier {
@@ -89,7 +111,7 @@ export function relaycontrolVerifier(
       throw new AuthError(401, "not_configured", "this read API has no relaycontrol introspection configured");
     let auth;
     try {
-      const verifier = await introspector({ url, secret });
+      const verifier = await introspector(introspectorOptions(config.relaycontrol!, url, secret));
       auth = await verifier.verifyRelaycontrolToken(bearer, {
         aud: config.origin,
         ...(request?.workspace ? { workspace: request.workspace } : {}),
@@ -155,7 +177,7 @@ export function relaycontrolLogin(
     if (!isRelaycontrolToken(token)) throw new AuthError(401, "invalid_token", "token is not valid");
     let auth;
     try {
-      const verifier = await introspector({ url, secret });
+      const verifier = await introspector(introspectorOptions(config.relaycontrol, url, secret));
       auth = await verifier.verifyRelaycontrolToken(token, { aud: config.origin });
     } catch (error) {
       if (error instanceof RelaycontrolUnavailableError) throw new AuthError(503, error.code, error.message);
