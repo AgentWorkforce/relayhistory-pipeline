@@ -97,29 +97,43 @@ server query's execution cost or PG driver's response allocation.
 
 ## Remaining source work, owner and integration order
 
-Root owns the following work in this existing lane; no competing branch or new
-production permission request is needed to continue source development:
+Registry reconciliation (message 245189430090244096) confirms
+layered-sessions-pipeline is the 049000 source/implementation owner; Root owns
+program/review coordination and this retained client/capture lane. The canary
+owner remains migration-publish-canary-20261106. Root does not open a competing
+049000 implementation. The registry still marks 049000 DESIGN ONLY, with no
+migration bytes; this proposed client contract does not change that disposition.
 
-1. Implement/review the immutable capture-profile owner boundary and the exact
-   bounded current-candidate RPC above. Prove no direct table grants, runtime
-   profile installation, owner fallback, missing-join success or cross-scope
+The next source sequence is:
+
+1. Route the proposed immutable capture-profile/current-candidate RPC contract
+   to layered-sessions-pipeline for reconciliation with its 049000 design and
+   the separate 050000 attester design. That owner must resolve the capability's
+   placement and trust boundary before executable SQL. Root reviews and then
+   binds the client to the accepted exact interface. Prove no direct table
+   grants, runtime profile installation, owner fallback, missing-join success or cross-scope
    reads. Actual SQL capability/role installation remains a separate operation.
 2. Produce verified buffered-stage byte/export bindings and current native
    maxima, then reconcile them with the existing legacy capture. Enclose slow
    object evidence work with fresh receipt and source/privacy closure. Only
    then connect receipt evidence to `composeCanonicalFrontierCapture`. A reader
    page alone cannot promote a complete frontier or authenticate an input file.
-3. Complete the previously specified owner-installed raw-plan authority,
-   trusted frontier installation, durable whole-plan admission/reservation and
-   common ordinary/scoped claim interlock. Reuse the existing canary interface;
+3. Layered-sessions-pipeline owns the previously specified 049000 raw-plan
+   authority and atomic adapter; Root coordinates/reviews it alongside the
+   separate trusted frontier installation, durable whole-plan admission/
+   reservation and common ordinary/scoped claim interlock. Reuse the existing
+   canary interface;
    no global ordinary-claim revoke, timer-based release or live fixture seeding.
    Recheck current 043850 claim/acquisition bodies and 039000 GC, not obsolete
    historical line numbers. Test both contention orders with real connections.
 4. Use only the registry-confirmed 049000 allocation after the required ordered
    044000–048000 prefix exists, with unified/legacy generator composition and
    exact prior-body rollback. Those five prefix slots are absent on this pinned
-   main. Root asked the registry for its current owner/slot disposition before
-   adding executable migration SQL; no new slot is guessed here.
+   main. The confirmed slot is 20261105049000_scoped_publication_claim plus its
+   rollback. Existing draft #321 is PREP only and do-not-merge, with no migration
+   bytes; 050000 attester and 051000 bulk catch-up are separate design lanes.
+   No placeholder migration or new slot is added here. The lead owns landing
+   order; Root routes any proposed 049000 SQL to its implementation owner.
 
 The exact-origin row absence already observed read-only explains an unmet
 candidate prerequisite. It does not authorize writing a placeholder frontier,
