@@ -20,6 +20,7 @@ import {
   MAX_SCRUB_CHARS,
   exceedsScrubBound,
   isCardNumber,
+  overCapQuotedValueSpans,
   scrubText,
 } from "../scrub.js";
 import { PipelineError } from "./errors.js";
@@ -52,8 +53,16 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  *   high-entropy fallback only next to a secret name. Chunks sealed at 1 or 2
  *   may hold secrets these rules now catch. The segmenter's context check
  *   (`CUT_CONTEXT_CHARS`) is widened past the quoted rule's reach.
+ * - 4: version 3's rules, except that a quoted secret value longer than the
+ *   quoted rule's scan bound (`MAX_QUOTED_VALUE`, 4096 UTF-16 code units) is
+ *   redacted whole: from its opening quote to its closing quote or, with none,
+ *   to the end of its line or of the input. Version 3 redacted only the first
+ *   4096 units (or up to the first whitespace in them) and stored the rest. A
+ *   generated unquoted value after a quoted key is likewise redacted to its
+ *   end. The segmenter never cuts inside such a value (`longCut`). Output for
+ *   values within the bound is byte-identical to version 3.
  */
-export const SCRUB_RULESET_VERSION = 3;
+export const SCRUB_RULESET_VERSION = 4;
 
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";
@@ -309,6 +318,9 @@ const CUT_SEARCH_CHARS = 65_536;
  * whose key began more than 4096 characters before the cut was redacted only up
  * to its first space before the cut, and the rest was stored. Twice
  * `MAX_QUOTED_VALUE` leaves room for a later rule to reach a little further.
+ * From rule set 4 a quoted value past `MAX_QUOTED_VALUE` is redacted whole,
+ * however long: `longCut` does not cut inside one (`overCapQuotedValueSpans`),
+ * and a run is cut only at line boundaries, which no quoted value spans.
  */
 const CUT_CONTEXT_CHARS = 8192;
 
@@ -476,7 +488,10 @@ function scrubBounded(text: string): string {
  *  - follows whitespace (no rule but PEM matches across a non-whitespace boundary
  *    within one token, so a token is never split),
  *  - does not sit between two digit groups (cards, phone numbers),
- *  - is not inside a private-key block whose footer comes later, and
+ *  - is not inside a private-key block whose footer comes later,
+ *  - is not inside a quoted secret value longer than the quoted rule's scan bound
+ *    (`overCapQuotedValueSpans`; rule set 4 redacts such a value whole, however far
+ *    it runs, so no bounded context check can see its key from a cut deep inside), and
  *  - leaves `CUT_CONTEXT_CHARS` on each side scrubbing identically together and
  *    apart, which also covers rules whose match spans a separator before the
  *    secret (`Bearer <token>`, `key = value`).
@@ -512,11 +527,21 @@ function longCut(text: string): number {
   const floor = Math.max(1, MAX_SCRUB_CHARS - CUT_SEARCH_CHARS);
   const budget: CutBudget = { checks: 0, candidates: 0 };
   const keys = keyBlockSpans(text.slice(0, top));
+  // A value still open at `top` runs on past it: treat it as open to the end.
+  const longValues = overCapQuotedValueSpans(text.slice(0, top)).map(
+    ([start, end]): [number, number] => [start, end >= top ? text.length : end],
+  );
   for (let cut = top; cut >= floor && withinBudget(budget); cut--) {
     // Not inside a key block that closed below the bound either.
     const inside = keyBlockAround(keys, cut);
     if (inside) {
       cut = inside[0] + 1; // the loop's cut-- lands on the header's start
+      continue;
+    }
+    // Nor inside an over-long quoted secret value: go to its start.
+    const long = keyBlockAround(longValues, cut);
+    if (long) {
+      cut = long[0] + 1;
       continue;
     }
     // Only at the end of a whitespace run (after whitespace, before text):

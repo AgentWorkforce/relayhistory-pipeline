@@ -35,6 +35,12 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Then the glued-prefix pass tries the relay_ rule first (its body may hold a `.`), so
   // `build-relay_…-sk-….tail` is no longer split at the `.` by the `sk-` rule.
   3: "e7607073a3afca3db6b015945f0b5fab256202f355b740f515987ec162bf3076",
+  // A quoted secret value past the quoted rule's 4096-unit scan bound is redacted whole
+  // (to its closing quote, or to the end of its line or input), not cut at the bound with
+  // the rest stored; a generated unquoted value after a quoted key likewise. The
+  // segmenter's longCut never cuts inside such a value. Values within the bound scrub
+  // byte-identically to version 3.
+  4: "cb6d6589d2c89d4eb79e798e8429d5443cdce34f9d7f06e631f366ac42bbcf83",
 };
 
 const read = (rel: string) =>
