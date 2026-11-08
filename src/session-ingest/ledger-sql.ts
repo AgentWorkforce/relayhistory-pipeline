@@ -5,6 +5,7 @@ import {DeliveryError} from "./vendor/delivery/delivery-contracts.ts";
 import {orderedControl,orderedControlResult} from "./control-protocol.ts";
 import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { dbErrorDiagnosisFrom, dbErrorSnapshot, type DbErrorSnapshot } from "./db-error-class.ts";
+import { acquisitionRefusalFrom } from "./acquisition-refusal.ts";
 /**
  * The ledger over SQL: one call per claim and per commit, each to its
  * SECURITY DEFINER function (supabase/migrations/20261104022000_session_ingest_ledger.sql),
@@ -86,6 +87,9 @@ async function call(run: SqlRun, fn: LedgerFunction, input: unknown): Promise<un
     // One guarded snapshot for every consumer: a throwing getter/proxy cannot escape this path.
     const s = dbErrorSnapshot(error);
     if (s.code === "P0W01") throw new DeliveryError("forbidden", 403, "Delivery record belongs to another user");
+    // Acquisition owner refusal (claim, stage, commit): the typed 409 of design §5.6, never a 503.
+    const refusal = acquisitionRefusalFrom(error);
+    if (refusal) throw refusal;
     throw new LedgerUnavailableError(ledgerErrorCodeFrom(s), dbErrorDiagnosisFrom(s));
   }
   if (rows.length !== 1) throw new LedgerUnavailableError("ledger_bad_result");

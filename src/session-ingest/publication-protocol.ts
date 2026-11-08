@@ -7,6 +7,9 @@ export interface PublicationHead {
  previousKey:string|null;previousRawSha256:string|null;basePointer:Record<string,unknown>|null;
  source:string;sessionId:string;physicalWorkspace:string;physicalSource:string;physicalSession:string;machineId:string;
  fenceEpoch:string;resetEpoch:string;
+ /** Acquisition owner epoch (decimal string) the head was claimed under; present only for an enrolled
+  * source (docs/ingest-acquisition-owner.md). Absent today, so the ticket is unchanged. */
+ acquisitionEpoch?:string;
 }
 export interface PublicationTicket {
  schemaGeneration:string;attemptToken:string;leaseToken:string;leaseUntil:string;stageToken:string;stageVersion:string;outboxVersion:string;

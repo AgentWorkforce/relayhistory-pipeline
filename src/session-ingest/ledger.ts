@@ -67,7 +67,14 @@ export interface ClaimInput {
   sessions: [source: string, sessionId: string][];
   /** Every prepared record (retired kinds already dropped), in batch order. */
   records: LedgerRecord[];
+  /** Acquisition grants for enrolled sources (docs/ingest-acquisition-owner.md; design §5.1), sorted by
+   * (source, sessionId). Absent today: no source is enrolled and Desktop's wire field ships with P2.
+   * When absent the claim payload is byte-identical to before. */
+  acquisition?: AcquisitionEntry[];
 }
+
+/** One acquisition grant presented for one enrolled session (design §5.1). `ownerEpoch` is a decimal string. */
+export interface AcquisitionEntry { source: string; sessionId: string; grantId: string; ownerEpoch: string; grant: string }
 
 export interface RevisionConflict {
   recordId: string;

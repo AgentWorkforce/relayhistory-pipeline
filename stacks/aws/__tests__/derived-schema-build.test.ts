@@ -13,6 +13,7 @@ const verifierNames = [
   ["session_ingest_seeder_verify.sql", "verify:session_ingest_seeder"],
   ["session_ingest_verify.sql", "verify:session_ingest"],
   ["canonical_project_events_verify.sql", "verify:canonical_project_events"],
+  ["acquisition_installer_verify.sql", "verify:acquisition_installer"],
 ] as const;
 
 test("captured build/watch inputs reproduce the actual generation without expanding runtime verifiers", async () => {
