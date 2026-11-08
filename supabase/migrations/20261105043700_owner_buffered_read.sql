@@ -4,10 +4,14 @@
 -- session read API (bulls96-session-read-api, role bulls96_read_api) can show the UPLOADING user
 -- their own buffered sessions (list, turns, metadata; there is no events surface) before
 -- canonical publication (049000 -> 050000 -> 051000) exists. Built to the R2 control-head
--- contract v4 consumer rule (docs/handoffs/neon-census-role-20261107/r2-control-head-contract-v1.md):
+-- contract v5.3 consumer rule (docs/handoffs/neon-census-role-20261107/r2-control-head-contract-v5.3-CURRENT.md
+-- at fc7f7d21; wire frozen at relayhistory-cloud #328 a06a58f9): rules 1-3 (shape, not pending,
+-- exact admission), rule 4 (mandatory per-user G2 parity row, below) and rule 5 (frozen-source,
+-- upload_deletions and upload_resets hides, below, in addition to the parity check).
 --
 --   1. sessions.owner_buffered_read_scope(p_workspace_id, p_cutover_epoch, p_head_epoch,
---      p_head_version, p_head_digest, p_head_pending): role guard, user pin and the gate.
+--      p_head_version, p_head_digest, p_head_kind, p_head_pending, p_privacy_baseline_sha256):
+--      role guard, user pin and the gate.
 --      A copy of sessions.session_directory_read_api_scope (20261105034000) plus the NEW
 --      transaction-local setting bulls96_read.user_id, which the trusted read API binds from
 --      the verified identity exactly as it binds bulls96_read.org_id / workspace_id. Refuses
@@ -16,30 +20,35 @@
 --      sessions.ingest_privacy_authority.state = 'fenced', and on a MALFORMED head tuple.
 --      Not SECURITY DEFINER; owner-only EXECUTE (called by the two definer readers as owner).
 --      HEAD TUPLE. The read API passes the R2 control-head answer it fetched AFTER the S3 fetch
---      and before emitting any byte: the active cutover epoch, and the head (epoch, version,
---      digest, pending) or a NULL head. Shapes, checked here: epochs/digest ^[0-9a-f]{64}$;
---      version a decimal string ^[1-9][0-9]{0,18}$ within bigint (never a JS number: 2^53+1
---      must not round); the three head fields all NULL or all set; pending NOT NULL and false
---      when there is no head. Anything else is malformed: 55006.
+--      and before emitting any byte: the active cutover epoch (controlEpoch), the privacy
+--      baseline (privacyBaselineSha256), and the head (epoch, version, digest, kind, pending)
+--      or a NULL head. Shapes, checked here: epochs/digest/baseline ^[0-9a-f]{64}$ (baseline
+--      always required); version a decimal string ^[1-9][0-9]{0,18}$ within bigint (never a JS
+--      number: 2^53+1 must not round); kind 'selection' or 'reset'; the four head fields all
+--      NULL or all set; pending NOT NULL and false when there is no head. The ONLY visible
+--      no-head form is epoch/version/digest/kind NULL with pending false (the wire's "0"
+--      with null epoch/digest/kind). Anything else is malformed: 55006.
 --      GATE (a closed gate returns gate_open = false: the readers return nothing; no error, so a
 --      hidden reason is indistinguishable from "no buffered data"). Open only when ALL hold:
 --        - NOT p_head_pending, and p_head_epoch IS NULL or p_head_epoch = p_cutover_epoch;
 --        - the ingest_lazy_policy singleton exists, valid_until > clock_timestamp(), and its
---          (immutable, 20261104055000:113-131) control_epoch = p_cutover_epoch;
+--          (immutable, 20261104055000:26,113-131) control_epoch = p_cutover_epoch and
+--          privacy_baseline_sha256 = p_privacy_baseline_sha256;
 --        - G2 PARITY: a sessions.owner_buffered_parity row for exactly (org, workspace, user)
---          whose cutover_epoch = p_cutover_epoch; whose head tuple equals the passed head, or
---          no_head with a NULL head; whose target_generation = the current schema generation
+--          whose cutover_epoch = p_cutover_epoch; whose privacy_baseline_sha256 =
+--          p_privacy_baseline_sha256; whose head tuple (epoch, version, digest, kind) equals the
+--          passed head, or no_head with a NULL head; whose target_generation = the current schema generation
 --          (sessions.__96bulls_role_validation 'session_directory_search_worker' PASS, plain
 --          read); and whose deletion_set_digest, reset_set_digest and target_lineage_digest equal
 --          sessions.owner_buffered_parity_expected(...) recomputed now;
 --        - RECEIPTS: the user's sessions.ingest_control_receipts are exactly versions 1..V at the
---          cutover epoch with receipt V's digest = p_head_digest (V = head version), or none at
---          all with a NULL head; any receipt on another epoch, a gap, a missing tip or a
+--          cutover epoch with receipt V's digest = p_head_digest and receipt V's kind =
+--          p_head_kind (V = head version), or none at all with a NULL head; any receipt on another epoch, a gap, a missing tip or a
 --          different tip digest closes the gate.
 --      Required admission when open: epoch = p_cutover_epoch, version = head version (0 with a
 --      NULL head). Head epoch <> cutover epoch: nothing is visible.
 --   2. sessions.owner_buffered_parity_expected(p_org, p_workspace_id, p_user_id, p_cutover_epoch,
---      p_head_version, p_head_digest): the one canonical definition of the parity digests (owner-
+--      p_head_version, p_head_digest, p_head_kind): the one canonical definition of the parity digests (owner-
 --      only, not SECURITY DEFINER, STABLE, no write). A future owner-run proof writer and the
 --      tests use the same function; it is not a writer. Encodings (sha256 hex over the UTF-8
 --      jsonb text of the array):
@@ -55,7 +64,8 @@
 --                              the contiguous Supabase receipts 1..V bound to head V; it is NOT a
 --                              Neon history chain (none exists).
 --   3. sessions.buffered_sessions_for(p_workspace, p_cursor_ts, p_cursor_session, p_cursor_source,
---      p_limit, <head tuple>): the caller's own KEPT, ADMITTED buffered sessions, newest first.
+--      p_limit, <head tuple>; <head tuple> = p_cutover_epoch, p_head_epoch, p_head_version,
+--      p_head_digest, p_head_kind, p_head_pending, p_privacy_baseline_sha256): the caller's own KEPT, ADMITTED buffered sessions, newest first.
 --      PUBLISHED EXCLUSION: a (source, session_id) with a canonical pointer for the caller
 --      (sessions.ingest_publication_heads, 20261104060000, state 'live' or a current_key) is
 --      not listed, so a partly published session is never double-counted; canonical wins.
@@ -63,12 +73,40 @@
 --      back to buffered detail when canonical has nothing.
 --   4. sessions.buffered_session_stages_for(p_workspace, p_source, p_session_id, <head tuple>):
 --      for one owned, kept, admitted session, the S3 stage rows the read API fetches and
---      projects (turns and metadata).
+--      projects (turns and metadata), with the stage's full group_ordinals (jsonb, as stored on
+--      sessions.ingest_stage_intents.group_ordinals: an array of groups, each an array of
+--      original claim ordinals) so the read API can bind the object header to it.
 --   5. sessions.owner_buffered_parity: the per-user G2 parity proof table. Owner-written only:
 --      RLS on, every privilege revoked from PUBLIC and all app roles, no writer function in this
 --      migration, NO ROWS by default (nobody is visible until an owner-run proof write, a
 --      separate production operation with Khaliq's explicit OK). A proof is never relabeled:
---      when the head or the generation moves, the old row no longer matches and hides.
+--      when the head, the baseline or the generation moves, the old row no longer matches and
+--      hides.
+--      WRITER CONTRACT (for whoever writes the row; NOT a blind upsert, and this migration ships
+--      no writer or upsert function). The writer computes the expected tuple with
+--      owner_buffered_parity_expected (signature stable from here on), then:
+--        - absent row: INSERT ... ON CONFLICT (org_id, workspace_id, user_id) DO NOTHING;
+--          0 rows = refuse and re-read;
+--        - existing row: UPDATE only WHERE the tenant key matches AND (head_epoch, head_version,
+--          head_digest, head_kind, privacy_baseline_sha256, target_generation,
+--          deletion_set_digest, reset_set_digest, target_lineage_digest) IS NOT DISTINCT FROM
+--          the exact prior row the writer read in the same run AND (new head_version > prior
+--          head_version OR target_generation changed); 0 rows = refuse;
+--        - the same head tuple with different digests = refuse (divergence).
+--      written_at is audit only, never the compare-and-set key.
+--
+-- RULE 5 (defense in depth, inside the keep predicate, on top of the parity check). A record
+-- is not live, so its group/session is not returned, when:
+--   (a) (org, ws, user, source, session_id) is in sessions.ingest_frozen_source_deletions
+--       (20261105010000), for ANY origin (frozen deletions are not part of the parity digest);
+--   (b) (org, ws, user, source, session_id) is in sessions.upload_deletions (20261104022000),
+--       for ANY origin (the GC copy below matches the exact origin only);
+--   (c) the stage's batch was accepted (ingest_batches.committed_at) at or before the latest
+--       sessions.upload_resets.reset_at of the user, or the claim's admission reset epoch is
+--       NULL or is not the user's current reset count.
+-- A NULL source, session, committed_at or reset epoch hides. Frozen resets
+-- (ingest_frozen_source_resets) carry no time or epoch and predate the buffered ledger; they
+-- are not consulted here.
 --
 -- Per-row ADMISSION WITNESS (inside the keep predicate). Version = source_control_version on
 -- the ORIGINAL ingest_claim_attempts row reached through ingest_stage_intents.claim_token (and,
@@ -102,6 +140,10 @@
 -- write: every function here is STABLE and runs inside the read API's READ ONLY transactions,
 -- taking only AccessShareLock on the relations it reads. The read API sets statement_timeout
 -- per transaction (a STABLE function cannot SET LOCAL); the list is clamped to 1..100 rows.
+-- Cost. Every call recomputes the parity digests and the keep predicate over the user's whole
+-- buffered backlog (the cursor and LIMIT apply afterwards). That cost is bounded by the read
+-- role's 2 s statement_timeout (session_read_api_role_verify.sql) and the read API's SET LOCAL;
+-- a 57014 is "not visible". The user-keyed index below lands separately.
 --
 -- Index. None is created here: the migrator is transactional, and a plain CREATE INDEX on the
 -- hot outbox would take a SHARE lock that blocks claim/commit writes. The user-keyed index is
@@ -132,13 +174,13 @@ BEGIN
    WHERE n.nspname='sessions' AND c.relname IN('ingest_buffer_outbox','ingest_stage_intents','ingest_claim_attempts',
     'ingest_batches','upload_deletions','upload_resets','ingest_fence_versions','ingest_lazy_policy',
     'ingest_lazy_ack_decisions','ingest_lazy_native_slots','ingest_receipt_seat_clock','ingest_privacy_authority',
-    'ingest_control_receipts','ingest_publication_heads')
+    'ingest_control_receipts','ingest_publication_heads','ingest_frozen_source_deletions')
     AND c.relowner<>me)
   OR (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
    WHERE n.nspname='sessions' AND c.relkind='r' AND c.relname IN('ingest_buffer_outbox','ingest_stage_intents','ingest_claim_attempts',
     'ingest_batches','upload_deletions','upload_resets','ingest_fence_versions','ingest_lazy_policy',
     'ingest_lazy_ack_decisions','ingest_lazy_native_slots','ingest_receipt_seat_clock','ingest_privacy_authority',
-    'ingest_control_receipts','ingest_publication_heads'))<>14
+    'ingest_control_receipts','ingest_publication_heads','ingest_frozen_source_deletions'))<>15
   OR to_regclass('sessions.owner_buffered_parity') IS NOT NULL
   OR NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_read_api') THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='owner buffered read: requires original creator, the buffered ledger and bulls96_read_api';END IF;
@@ -153,7 +195,9 @@ CREATE TABLE sessions.owner_buffered_parity (
   head_epoch text CHECK (head_epoch ~ '^[0-9a-f]{64}$'),
   head_version bigint CHECK (head_version > 0),
   head_digest text CHECK (head_digest ~ '^[0-9a-f]{64}$'),
+  head_kind text CHECK (head_kind IN ('selection', 'reset')),
   no_head boolean NOT NULL,
+  privacy_baseline_sha256 text NOT NULL CHECK (privacy_baseline_sha256 ~ '^[0-9a-f]{64}$'),
   deletion_set_digest text NOT NULL CHECK (deletion_set_digest ~ '^[0-9a-f]{64}$'),
   reset_set_digest text NOT NULL CHECK (reset_set_digest ~ '^[0-9a-f]{64}$'),
   target_lineage_digest text NOT NULL CHECK (target_lineage_digest ~ '^[0-9a-f]{64}$'),
@@ -161,8 +205,9 @@ CREATE TABLE sessions.owner_buffered_parity (
   written_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   PRIMARY KEY (org_id, workspace_id, user_id),
   CONSTRAINT owner_buffered_parity_head_all_or_none CHECK (
-    (head_epoch IS NULL AND head_version IS NULL AND head_digest IS NULL AND no_head)
-    OR (head_epoch IS NOT NULL AND head_version IS NOT NULL AND head_digest IS NOT NULL AND NOT no_head))
+    (head_epoch IS NULL AND head_version IS NULL AND head_digest IS NULL AND head_kind IS NULL AND no_head)
+    OR (head_epoch IS NOT NULL AND head_version IS NOT NULL AND head_digest IS NOT NULL AND head_kind IS NOT NULL
+        AND NOT no_head))
 );
 ALTER TABLE sessions.owner_buffered_parity ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.owner_buffered_parity
@@ -186,10 +231,11 @@ $parity_acl$;
 
 -- The canonical parity digests and the receipt-lineage check (header, item 2). Plain snapshot
 -- reads only. receipts_ok: with a head, exactly versions 1..V at the cutover epoch and receipt
--- V's digest = p_head_digest; without a head, no receipt at all; never a receipt on another
--- epoch. target_generation is NULL when no PASS generation is recorded.
+-- V's digest = p_head_digest and kind = p_head_kind; without a head, no receipt at all and a
+-- NULL kind; never a receipt on another epoch. target_generation is NULL when no PASS generation is recorded.
 CREATE FUNCTION sessions.owner_buffered_parity_expected(
-  p_org text, p_workspace_id text, p_user_id text, p_cutover_epoch text, p_head_version bigint, p_head_digest text
+  p_org text, p_workspace_id text, p_user_id text, p_cutover_epoch text, p_head_version bigint, p_head_digest text,
+  p_head_kind text
 )
 RETURNS TABLE(deletion_set_digest text, reset_set_digest text, target_lineage_digest text,
               target_generation text, receipts_ok boolean)
@@ -202,6 +248,7 @@ DECLARE
   v_max bigint;
   v_other bigint;
   v_tip text;
+  v_tip_kind text;
   v_deletions jsonb;
   v_resets jsonb;
   v_lineage jsonb;
@@ -233,7 +280,7 @@ BEGIN
     INTO v_n, v_min, v_max, v_other, v_lineage
     FROM sessions.ingest_control_receipts AS r
    WHERE r.org_id = p_org AND r.workspace_id = p_workspace_id AND r.user_id = p_user_id;
-  SELECT r.digest INTO v_tip
+  SELECT r.digest, r.kind INTO v_tip, v_tip_kind
     FROM sessions.ingest_control_receipts AS r
    WHERE r.org_id = p_org AND r.workspace_id = p_workspace_id AND r.user_id = p_user_id
      AND r.epoch = p_cutover_epoch AND r.version = p_head_version;
@@ -247,8 +294,9 @@ BEGIN
                                                v_lineage)::text, 'UTF8')), 'hex'),
     v_gen,
     coalesce(v_other = 0 AND CASE
-      WHEN p_head_version IS NULL THEN p_head_digest IS NULL AND v_n = 0
+      WHEN p_head_version IS NULL THEN p_head_digest IS NULL AND p_head_kind IS NULL AND v_n = 0
       ELSE v_n = p_head_version AND v_min = 1 AND v_max = p_head_version AND v_tip = p_head_digest
+           AND v_tip_kind = p_head_kind
     END, false);
 END
 $parity_expected$;
@@ -259,7 +307,7 @@ $parity_expected$;
 -- NULL where it was never set: both refuse.
 CREATE FUNCTION sessions.owner_buffered_read_scope(
   p_workspace_id text, p_cutover_epoch text, p_head_epoch text, p_head_version text, p_head_digest text,
-  p_head_pending boolean
+  p_head_kind text, p_head_pending boolean, p_privacy_baseline_sha256 text
 )
 RETURNS TABLE(org_id text, workspace_id text, user_id text, gate_open boolean,
               admission_epoch text, admission_version bigint)
@@ -269,7 +317,8 @@ DECLARE
   v_org text := nullif(current_setting('bulls96_read.org_id', true), '');
   v_workspace text := nullif(current_setting('bulls96_read.workspace_id', true), '');
   v_user text := nullif(current_setting('bulls96_read.user_id', true), '');
-  v_has_head boolean := p_head_epoch IS NOT NULL OR p_head_version IS NOT NULL OR p_head_digest IS NOT NULL;
+  v_has_head boolean := p_head_epoch IS NOT NULL OR p_head_version IS NOT NULL OR p_head_digest IS NOT NULL
+                        OR p_head_kind IS NOT NULL;
   v_well_formed boolean;
   v_version bigint;
   v_open boolean;
@@ -290,10 +339,12 @@ BEGIN
       HINT = 'The privacy authority is fenced; the read API answers 503 buffered_fenced (retryable).';
   END IF;
   -- Shapes. CASE keeps the bigint range check behind the regex (no 22P02/22003 leak).
-  v_well_formed := coalesce(p_cutover_epoch ~ '^[0-9a-f]{64}$', false) AND p_head_pending IS NOT NULL
+  v_well_formed := coalesce(p_cutover_epoch ~ '^[0-9a-f]{64}$', false)
+    AND coalesce(p_privacy_baseline_sha256 ~ '^[0-9a-f]{64}$', false) AND p_head_pending IS NOT NULL
     AND CASE WHEN NOT v_has_head THEN NOT p_head_pending
              ELSE coalesce(p_head_epoch ~ '^[0-9a-f]{64}$', false)
                   AND coalesce(p_head_digest ~ '^[0-9a-f]{64}$', false)
+                  AND coalesce(p_head_kind IN ('selection', 'reset'), false)
                   AND CASE WHEN p_head_version ~ '^[1-9][0-9]{0,18}$'
                            THEN p_head_version::numeric <= 9223372036854775807 ELSE false END
         END;
@@ -309,7 +360,8 @@ BEGIN
   IF v_open THEN
     SELECT lp.* INTO pol FROM sessions.ingest_lazy_policy AS lp
      WHERE lp.singleton AND lp.valid_until > clock_timestamp();
-    v_open := FOUND AND pol.control_epoch = p_cutover_epoch;
+    v_open := FOUND AND pol.control_epoch = p_cutover_epoch
+      AND pol.privacy_baseline_sha256 = p_privacy_baseline_sha256;
   END IF;
   IF v_open THEN
     SELECT bp.* INTO par FROM sessions.owner_buffered_parity AS bp
@@ -319,13 +371,15 @@ BEGIN
   IF v_open THEN
     SELECT e.* INTO x
       FROM sessions.owner_buffered_parity_expected(v_org, v_workspace, v_user, p_cutover_epoch, v_version,
-                                                   p_head_digest) AS e;
+                                                   p_head_digest, p_head_kind) AS e;
     v_open := coalesce(x.receipts_ok AND x.target_generation IS NOT NULL
       AND par.cutover_epoch = p_cutover_epoch
+      AND par.privacy_baseline_sha256 = p_privacy_baseline_sha256
       AND par.no_head = NOT v_has_head
       AND par.head_epoch IS NOT DISTINCT FROM p_head_epoch
       AND par.head_version IS NOT DISTINCT FROM v_version
       AND par.head_digest IS NOT DISTINCT FROM p_head_digest
+      AND par.head_kind IS NOT DISTINCT FROM p_head_kind
       AND par.target_generation = x.target_generation
       AND par.deletion_set_digest = x.deletion_set_digest
       AND par.reset_set_digest = x.reset_set_digest
@@ -346,7 +400,8 @@ $scope$;
 -- every returned row matched. Errors: 22023 (partial cursor) and the scope's 42501 / 55006. No row lock, no advisory lock, no write.
 CREATE FUNCTION sessions.buffered_sessions_for(
   p_workspace text, p_cursor_ts timestamptz, p_cursor_session text, p_cursor_source text, p_limit integer,
-  p_cutover_epoch text, p_head_epoch text, p_head_version text, p_head_digest text, p_head_pending boolean
+  p_cutover_epoch text, p_head_epoch text, p_head_version text, p_head_digest text, p_head_kind text,
+  p_head_pending boolean, p_privacy_baseline_sha256 text
 )
 RETURNS TABLE(source text, session_id text, first_ts timestamptz, last_ts timestamptz,
               stage_count integer, bytes bigint, user_id text, admission_epoch text, admission_version text)
@@ -367,7 +422,8 @@ BEGIN
   SELECT sc.org_id, sc.workspace_id, sc.user_id, sc.gate_open, sc.admission_epoch, sc.admission_version
     INTO STRICT v_org, v_ws, v_user, v_open, v_adm_epoch, v_adm_version
     FROM sessions.owner_buffered_read_scope(p_workspace, p_cutover_epoch, p_head_epoch, p_head_version,
-                                              p_head_digest, p_head_pending) AS sc;
+                                              p_head_digest, p_head_kind, p_head_pending,
+                                              p_privacy_baseline_sha256) AS sc;
   IF (p_cursor_ts IS NULL) <> (p_cursor_session IS NULL) OR (p_cursor_ts IS NULL) <> (p_cursor_source IS NULL) THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'owner buffered read: cursor needs ts, session and source together';
   END IF;
@@ -396,7 +452,10 @@ BEGIN
     -- The pair must equal the gate's required (v_adm_epoch, v_adm_version): no control of
     -- any kind since admission. GC ORIGINAL CLAIM: every ancestor of a GC replacement stage
     -- (parent_stage_token chain, bounded at 64) carries this same claim_token, so a
-    -- replacement can never lend a newer claim's admission.
+    -- replacement can never lend a newer claim's admission. RULE 5(c): the claim's admission
+    -- reset epoch is set, and no upload_resets row of the user is at or after the batch's
+    -- acceptance (committed_at); a reset at or after acceptance hides the stage even when the
+    -- count check above still matches.
     SELECT s.stage_token, s.claim_token, s.origin_id, s.batch_id, s.stage_key, s.stage_sha256, s.stage_bytes,
            s.group_ordinals, s.reset_epoch, a.records, a.epochs, a.reset_epoch AS a_reset,
            b.committed_at AS accepted_at, a.source_control_version AS adm_version, ctl.pol_epoch AS adm_epoch
@@ -417,6 +476,10 @@ BEGIN
        AND jsonb_typeof(a.records) = 'array' AND jsonb_typeof(a.epochs) = 'array'
        AND jsonb_typeof(s.group_ordinals) = 'array'
        AND ctl.resets = s.reset_epoch
+       AND a.reset_epoch IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM sessions.upload_resets AS ur
+                        WHERE ur.org_id = v_org AND ur.workspace_id = v_ws AND ur.user_id = v_user
+                          AND (ur.reset_at IS NULL OR ur.reset_at >= b.committed_at))
        AND a.source_control_version IS NOT NULL AND a.source_identity_sha256 IS NOT NULL
        AND ctl.pol_identity IS NOT NULL AND ctl.pol_epoch IS NOT NULL
        AND a.source_identity_sha256 = ctl.pol_identity
@@ -475,6 +538,16 @@ BEGIN
             AND NOT EXISTS (SELECT 1 FROM sessions.upload_deletions AS d
                              WHERE d.org_id = v_org AND d.workspace_id = v_ws AND d.user_id = v_user
                                AND d.origin_id = st.origin_id AND d.source = rc.source AND d.session_id = rc.session_id)
+            -- RULE 5(a)/(b): a frozen source deletion or an upload_deletions entry of this
+            -- (user, source, session) under ANY origin hides the record (stricter than the GC's
+            -- exact-origin check above).
+            AND rc.source IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM sessions.ingest_frozen_source_deletions AS fd
+                             WHERE fd.org_id = v_org AND fd.workspace_id = v_ws AND fd.user_id = v_user
+                               AND fd.source = rc.source AND fd.session_id = rc.session_id)
+            AND NOT EXISTS (SELECT 1 FROM sessions.upload_deletions AS d2
+                             WHERE d2.org_id = v_org AND d2.workspace_id = v_ws AND d2.user_id = v_user
+                               AND d2.source = rc.source AND d2.session_id = rc.session_id)
             -- ingest_buffer_gc_ordinals ACK branch (lazy-current policy present): the native
             -- slot's current owner is the caller, with the same seat/digest/revision/session.
             AND (NOT ctl.lazy OR EXISTS (
@@ -546,15 +619,19 @@ $buffered_sessions$;
 -- whose JSON header lists groups as [source, sessionId], src/session-ingest/staging.ts) and
 -- to project only this session's kept lines: group_indexes are indexes into the object's
 -- header.groups (= stage group_ordinals positions) and kept_ordinals are the original claim
--- ordinals (group_ordinals[g][j] names line j of group g) still kept. Same keep predicate and
+-- ordinals (group_ordinals[g][j] names line j of group g) still kept. group_ordinals is the
+-- stage's whole stored group_ordinals (jsonb array of non-empty integer arrays; ragged, so
+-- not integer[][]), letting the read API check the object header's group count. Same keep predicate and
 -- scope as buffered_sessions_for. Not owned, absent, deleted, reset, redacted, not admitted at
 -- the required (epoch, version), or a closed gate all answer the same empty result. Errors: 22023 (missing source/session) and the scope's.
 CREATE FUNCTION sessions.buffered_session_stages_for(
   p_workspace text, p_source text, p_session_id text,
-  p_cutover_epoch text, p_head_epoch text, p_head_version text, p_head_digest text, p_head_pending boolean
+  p_cutover_epoch text, p_head_epoch text, p_head_version text, p_head_digest text, p_head_kind text,
+  p_head_pending boolean, p_privacy_baseline_sha256 text
 )
 RETURNS TABLE(batch_id text, stage_key text, stage_sha256 text, stage_bytes bigint,
-              group_indexes integer[], kept_ordinals integer[], reset_epoch bigint, accepted_at timestamptz,
+              group_indexes integer[], group_ordinals jsonb, kept_ordinals integer[], reset_epoch bigint,
+              accepted_at timestamptz,
               admission_epoch text, admission_version text)
 LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $buffered_stages$
@@ -572,7 +649,8 @@ BEGIN
   SELECT sc.org_id, sc.workspace_id, sc.user_id, sc.gate_open, sc.admission_epoch, sc.admission_version
     INTO STRICT v_org, v_ws, v_user, v_open, v_adm_epoch, v_adm_version
     FROM sessions.owner_buffered_read_scope(p_workspace, p_cutover_epoch, p_head_epoch, p_head_version,
-                                              p_head_digest, p_head_pending) AS sc;
+                                              p_head_digest, p_head_kind, p_head_pending,
+                                              p_privacy_baseline_sha256) AS sc;
   IF v_source IS NULL OR char_length(v_source) NOT BETWEEN 1 AND 64
      OR v_session IS NULL OR char_length(v_session) NOT BETWEEN 1 AND 255 THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'owner buffered read: source and session are required';
@@ -602,7 +680,10 @@ BEGIN
     -- The pair must equal the gate's required (v_adm_epoch, v_adm_version): no control of
     -- any kind since admission. GC ORIGINAL CLAIM: every ancestor of a GC replacement stage
     -- (parent_stage_token chain, bounded at 64) carries this same claim_token, so a
-    -- replacement can never lend a newer claim's admission.
+    -- replacement can never lend a newer claim's admission. RULE 5(c): the claim's admission
+    -- reset epoch is set, and no upload_resets row of the user is at or after the batch's
+    -- acceptance (committed_at); a reset at or after acceptance hides the stage even when the
+    -- count check above still matches.
     SELECT s.stage_token, s.claim_token, s.origin_id, s.batch_id, s.stage_key, s.stage_sha256, s.stage_bytes,
            s.group_ordinals, s.reset_epoch, a.records, a.epochs, a.reset_epoch AS a_reset,
            b.committed_at AS accepted_at, a.source_control_version AS adm_version, ctl.pol_epoch AS adm_epoch
@@ -623,6 +704,10 @@ BEGIN
        AND jsonb_typeof(a.records) = 'array' AND jsonb_typeof(a.epochs) = 'array'
        AND jsonb_typeof(s.group_ordinals) = 'array'
        AND ctl.resets = s.reset_epoch
+       AND a.reset_epoch IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM sessions.upload_resets AS ur
+                        WHERE ur.org_id = v_org AND ur.workspace_id = v_ws AND ur.user_id = v_user
+                          AND (ur.reset_at IS NULL OR ur.reset_at >= b.committed_at))
        AND a.source_control_version IS NOT NULL AND a.source_identity_sha256 IS NOT NULL
        AND ctl.pol_identity IS NOT NULL AND ctl.pol_epoch IS NOT NULL
        AND a.source_identity_sha256 = ctl.pol_identity
@@ -681,6 +766,16 @@ BEGIN
             AND NOT EXISTS (SELECT 1 FROM sessions.upload_deletions AS d
                              WHERE d.org_id = v_org AND d.workspace_id = v_ws AND d.user_id = v_user
                                AND d.origin_id = st.origin_id AND d.source = rc.source AND d.session_id = rc.session_id)
+            -- RULE 5(a)/(b): a frozen source deletion or an upload_deletions entry of this
+            -- (user, source, session) under ANY origin hides the record (stricter than the GC's
+            -- exact-origin check above).
+            AND rc.source IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM sessions.ingest_frozen_source_deletions AS fd
+                             WHERE fd.org_id = v_org AND fd.workspace_id = v_ws AND fd.user_id = v_user
+                               AND fd.source = rc.source AND fd.session_id = rc.session_id)
+            AND NOT EXISTS (SELECT 1 FROM sessions.upload_deletions AS d2
+                             WHERE d2.org_id = v_org AND d2.workspace_id = v_ws AND d2.user_id = v_user
+                               AND d2.source = rc.source AND d2.session_id = rc.session_id)
             -- ingest_buffer_gc_ordinals ACK branch (lazy-current policy present): the native
             -- slot's current owner is the caller, with the same seat/digest/revision/session.
             AND (NOT ctl.lazy OR EXISTS (
@@ -724,29 +819,30 @@ BEGIN
   )
   -- keep-predicate:end
   SELECT st.batch_id, st.stage_key, st.stage_sha256, st.stage_bytes,
-         array_agg(k.group_index ORDER BY k.group_index),
+         array_agg(k.group_index ORDER BY k.group_index), st.group_ordinals,
          (SELECT array_agg(o ORDER BY o) FROM kept AS k2 CROSS JOIN LATERAL unnest(k2.ords) AS o
            WHERE k2.stage_token = st.stage_token AND k2.source = v_source AND k2.session_id = v_session),
          st.reset_epoch, st.accepted_at, v_adm_epoch, v_adm_version::text
     FROM kept AS k
     JOIN stg AS st ON st.stage_token = k.stage_token
    WHERE k.source = v_source AND k.session_id = v_session
-   GROUP BY st.stage_token, st.batch_id, st.stage_key, st.stage_sha256, st.stage_bytes, st.reset_epoch, st.accepted_at
+   GROUP BY st.stage_token, st.batch_id, st.stage_key, st.stage_sha256, st.stage_bytes, st.group_ordinals,
+            st.reset_epoch, st.accepted_at
    ORDER BY st.accepted_at, st.batch_id COLLATE "C", st.stage_key COLLATE "C";
 END
 $buffered_stages$;
 
-REVOKE ALL ON FUNCTION sessions.owner_buffered_read_scope(text, text, text, text, text, boolean)
+REVOKE ALL ON FUNCTION sessions.owner_buffered_read_scope(text, text, text, text, text, text, boolean, text)
   FROM PUBLIC, anon, authenticated, service_role;
-REVOKE ALL ON FUNCTION sessions.owner_buffered_parity_expected(text, text, text, text, bigint, text)
+REVOKE ALL ON FUNCTION sessions.owner_buffered_parity_expected(text, text, text, text, bigint, text, text)
   FROM PUBLIC, anon, authenticated, service_role;
-REVOKE ALL ON FUNCTION sessions.buffered_sessions_for(text, timestamptz, text, text, integer, text, text, text, text, boolean)
+REVOKE ALL ON FUNCTION sessions.buffered_sessions_for(text, timestamptz, text, text, integer, text, text, text, text, text, boolean, text)
   FROM PUBLIC, anon, authenticated, service_role;
-REVOKE ALL ON FUNCTION sessions.buffered_session_stages_for(text, text, text, text, text, text, text, boolean)
+REVOKE ALL ON FUNCTION sessions.buffered_session_stages_for(text, text, text, text, text, text, text, text, boolean, text)
   FROM PUBLIC, anon, authenticated, service_role;
-GRANT EXECUTE ON FUNCTION sessions.buffered_sessions_for(text, timestamptz, text, text, integer, text, text, text, text, boolean)
+GRANT EXECUTE ON FUNCTION sessions.buffered_sessions_for(text, timestamptz, text, text, integer, text, text, text, text, text, boolean, text)
   TO bulls96_read_api;
-GRANT EXECUTE ON FUNCTION sessions.buffered_session_stages_for(text, text, text, text, text, text, text, boolean)
+GRANT EXECUTE ON FUNCTION sessions.buffered_session_stages_for(text, text, text, text, text, text, text, text, boolean, text)
   TO bulls96_read_api;
 
 -- As in 20261105034000: strip EXECUTE from every other grantee present at creation (default
@@ -758,10 +854,10 @@ DECLARE
   v_grantee text;
 BEGIN
   FOREACH v_fn IN ARRAY ARRAY[
-    'sessions.owner_buffered_read_scope(text, text, text, text, text, boolean)'::regprocedure,
-    'sessions.owner_buffered_parity_expected(text, text, text, text, bigint, text)'::regprocedure,
-    'sessions.buffered_sessions_for(text, timestamptz, text, text, integer, text, text, text, text, boolean)'::regprocedure,
-    'sessions.buffered_session_stages_for(text, text, text, text, text, text, text, boolean)'::regprocedure
+    'sessions.owner_buffered_read_scope(text, text, text, text, text, text, boolean, text)'::regprocedure,
+    'sessions.owner_buffered_parity_expected(text, text, text, text, bigint, text, text)'::regprocedure,
+    'sessions.buffered_sessions_for(text, timestamptz, text, text, integer, text, text, text, text, text, boolean, text)'::regprocedure,
+    'sessions.buffered_session_stages_for(text, text, text, text, text, text, text, text, boolean, text)'::regprocedure
   ] LOOP
     FOR v_grantee IN
       SELECT r.rolname
@@ -770,8 +866,8 @@ BEGIN
         JOIN pg_roles AS r ON r.oid = a.grantee
        WHERE p.oid = v_fn AND a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner
          AND NOT (r.rolname = 'bulls96_read_api'
-                  AND v_fn IN ('sessions.buffered_sessions_for(text, timestamptz, text, text, integer, text, text, text, text, boolean)'::regprocedure,
-                               'sessions.buffered_session_stages_for(text, text, text, text, text, text, text, boolean)'::regprocedure))
+                  AND v_fn IN ('sessions.buffered_sessions_for(text, timestamptz, text, text, integer, text, text, text, text, text, boolean, text)'::regprocedure,
+                               'sessions.buffered_session_stages_for(text, text, text, text, text, text, text, text, boolean, text)'::regprocedure))
     LOOP
       EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I', v_fn, v_grantee);
     END LOOP;

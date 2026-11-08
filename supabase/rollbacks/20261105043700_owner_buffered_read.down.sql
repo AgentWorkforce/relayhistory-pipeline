@@ -19,10 +19,10 @@ DO $rollback_guard$ DECLARE v_later boolean; BEGIN
   IF v_later THEN RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'owner buffered read: a later migration is applied; roll it back first'; END IF;
  END IF;
 END $rollback_guard$;
-DROP FUNCTION IF EXISTS sessions.buffered_session_stages_for(text, text, text, text, text, text, text, boolean);
-DROP FUNCTION IF EXISTS sessions.buffered_sessions_for(text, timestamptz, text, text, integer, text, text, text, text, boolean);
-DROP FUNCTION IF EXISTS sessions.owner_buffered_read_scope(text, text, text, text, text, boolean);
-DROP FUNCTION IF EXISTS sessions.owner_buffered_parity_expected(text, text, text, text, bigint, text);
+DROP FUNCTION IF EXISTS sessions.buffered_session_stages_for(text, text, text, text, text, text, text, text, boolean, text);
+DROP FUNCTION IF EXISTS sessions.buffered_sessions_for(text, timestamptz, text, text, integer, text, text, text, text, text, boolean, text);
+DROP FUNCTION IF EXISTS sessions.owner_buffered_read_scope(text, text, text, text, text, text, boolean, text);
+DROP FUNCTION IF EXISTS sessions.owner_buffered_parity_expected(text, text, text, text, bigint, text, text);
 DROP TABLE IF EXISTS sessions.owner_buffered_parity;
 DO $ledger$ BEGIN
  IF to_regclass('sessions.__96bulls_migrations') IS NOT NULL THEN
