@@ -12,6 +12,7 @@ import type { ClickHouseClient } from "../session-pipeline/vendor/search-index/c
 import { SearchIndexError, assertPosition, comparePositions, type SearchHit, type SearchPosition } from "@rhc/search-index/contracts.ts";
 import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
 import { encodeCursor, type EventPosition } from "./cursor.ts";
+import type { BufferedSearchGate, DropReason } from "./buffered-search-gate.ts";
 import {
   READ_SETTINGS,
   buildCandidateQuery,
@@ -86,6 +87,8 @@ export interface EventPage {
   nextCursor: string | null;
   /** Rows dropped because their session is erased (telemetry only). */
   erasedDropped: number;
+  /** Buffered-origin rows checked and dropped by the buffered search gate (telemetry only; absent when off). */
+  buffered?: { checked: number; dropped: Partial<Record<DropReason, number>> };
 }
 
 const nullable = (v: string | null | undefined) => (v === undefined || v === null || v === "" ? null : v);
@@ -147,10 +150,16 @@ export interface PageDeps {
   completeSinceMs?: number;
   liveness: Liveness;
   timeoutMs?: number;
+  /** READ_API_BUFFERED_SEARCH_GATE on: every buffered-origin row passes the R2 privacy gate (ClickHouse binding only). */
+  bufferedGate?: BufferedSearchGate;
 }
 
 export async function readEventPage(deps: PageDeps, input: EventQuery): Promise<EventPage> {
-  if (deps.adapter) return readAdapterPage(deps, input);
+  if (deps.adapter) {
+    // The portable hit carries no origin marker, so buffered rows cannot be told apart.
+    if (deps.bufferedGate) throw new Error("buffered search gate requires the ClickHouse binding");
+    return readAdapterPage(deps, input);
+  }
   if (!deps.ch) throw new Error("read search binding missing");
   const options = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
   const c = buildCandidateQuery(deps.ch.database, input);
@@ -158,7 +167,7 @@ export async function readEventPage(deps: PageDeps, input: EventQuery): Promise<
   const candidates = candidateRows.map(candidatePosition);
   if (candidates.length === 0) return { events: [], nextCursor: null, erasedDropped: 0 };
 
-  const n = buildNewestQuery(deps.ch.database, input, candidates);
+  const n = buildNewestQuery(deps.ch.database, input, candidates, { origin: deps.bufferedGate !== undefined });
   const rows = await deps.ch.select<EventRow>(n.query, { ...options, params: n.params });
 
   // Defense in depth: every row must belong to the verified tenant and the
@@ -183,10 +192,16 @@ export async function readEventPage(deps: PageDeps, input: EventQuery): Promise<
   for (const r of kept) distinct.set(keyOf({ source: r.source, sessionId: r.session_id }), { source: r.source, sessionId: r.session_id });
   const erased = distinct.size ? await deps.liveness.erased(input.orgId, input.workspaceId, [...distinct.values()]) : new Set<string>();
   const live = kept.filter((r) => !erased.has(keyOf({ source: r.source, sessionId: r.session_id })));
+  // The buffered gate only removes rows; nextCursor above is the unfiltered page's.
+  if (!deps.bufferedGate) {
+    return { events: live.map((r) => shapeRow(r, input.maxContent)), nextCursor, erasedDropped: kept.length - live.length };
+  }
+  const gated = await deps.bufferedGate.filter(input.orgId, input.workspaceId, live);
   return {
-    events: live.map((r) => shapeRow(r, input.maxContent)),
+    events: gated.kept.map((r) => shapeRow(r, input.maxContent)),
     nextCursor,
     erasedDropped: kept.length - live.length,
+    buffered: { checked: gated.buffered, dropped: gated.dropped },
   };
 }
 

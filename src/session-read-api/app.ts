@@ -66,6 +66,7 @@ import {
   type Directory,
   type DirectoryListArgs,
 } from "./directory.ts";
+import type { BufferedSearchGate } from "./buffered-search-gate.ts";
 import { BRIEF_TITLES_MAX_KEYS, BriefTitlesError, briefTitleEntries, type BriefTitleKey, type BriefTitles } from "./brief-titles.ts";
 
 export interface VerifiedIdentity {
@@ -113,6 +114,12 @@ export interface ReadApiDeps {
   turns?: TurnsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
   babysitter?: EvidenceDeps;
+  /**
+   * READ_API_BUFFERED_SEARCH_GATE=on: the per-hit R2 privacy gate (buffered-search-gate.ts) on
+   * every ClickHouse event page. Absent (the default) = pages are read exactly as before.
+   * Requires the ClickHouse binding.
+   */
+  bufferedSearchGate?: BufferedSearchGate;
 }
 
 export interface TurnsDeps {
@@ -257,6 +264,7 @@ function attestWorkspace(c: Context, identity: VerifiedIdentity): void {
 
 export function createReadApi(deps: ReadApiDeps) {
   if (Boolean(deps.ch) === Boolean(deps.adapter)) throw new Error("read API requires exactly one search service binding");
+  if (deps.bufferedSearchGate && !deps.ch) throw new Error("buffered search gate requires the ClickHouse binding");
   const app = new Hono<{ Variables: { identity: VerifiedIdentity; correlationId: string } }>();
   const log = deps.log ?? (() => {});
 
@@ -322,7 +330,15 @@ export function createReadApi(deps: ReadApiDeps) {
     return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId }, 503);
   };
 
-  const pageDeps = () => ({ ch: deps.ch, adapter: deps.adapter, completeSinceMs: deps.completeSinceMs, liveness: deps.liveness, timeoutMs: deps.timeoutMs });
+  const pageDeps = () => ({ ch: deps.ch, adapter: deps.adapter, completeSinceMs: deps.completeSinceMs, liveness: deps.liveness, timeoutMs: deps.timeoutMs, bufferedGate: deps.bufferedSearchGate });
+
+  /** Gate telemetry: counts and closed-enum reasons only, never ids or content. */
+  async function gatedPage(c: Context, input: EventQuery) {
+    const page = await readEventPage(pageDeps(), input);
+    if (page.buffered && page.buffered.checked > 0)
+      log({ route: c.req.routePath, reason: "buffered_gate", buffered_checked: page.buffered.checked, buffered_dropped: page.buffered.dropped, correlation_id: c.get("correlationId") });
+    return page;
+  }
 
   /**
    * Session reads: erased → empty page; history older than the floor → 501;
@@ -355,8 +371,8 @@ export function createReadApi(deps: ReadApiDeps) {
       const cursor = decodeCursor(single(c, "cursor"));
       if ((await sessionGate(identity, sessionId, source, cursor !== undefined)) === "empty")
         return c.json({ sessionId, events: [], nextCursor: null, correlationId: c.get("correlationId") });
-      const page = await readEventPage(
-        pageDeps(),
+      const page = await gatedPage(
+        c,
         { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, order, limit, maxContent, cursor },
       );
       return c.json({ sessionId, events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
@@ -390,7 +406,7 @@ export function createReadApi(deps: ReadApiDeps) {
         base.limit = clampLimit(single(c, "limit"), EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT);
         if ((await sessionGate(identity, sessionId, source, cursor !== undefined)) === "empty")
           return c.json({ events: [], nextCursor: null, correlationId: c.get("correlationId") });
-        const page = await readEventPage(pageDeps(), base);
+        const page = await gatedPage(c, base);
         return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
       }
 
@@ -413,7 +429,7 @@ export function createReadApi(deps: ReadApiDeps) {
         if (partials.overflow) throw unsupported("session_partial_unbounded");
         if (partials.sessions.length > 0) throw unsupported("session_partial");
       }
-      const page = await readEventPage(pageDeps(), base);
+      const page = await gatedPage(c, base);
       if (belowFloor && page.nextCursor === null) {
         // First page: nothing was issued yet, so the whole read falls back.
         if (cursor === undefined) throw unsupported("history_floor");

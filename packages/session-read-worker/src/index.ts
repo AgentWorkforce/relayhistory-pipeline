@@ -45,6 +45,14 @@ import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { sqlLiveness, TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
+import {
+  createBufferedSearchGate,
+  parseBufferedSearchGate,
+  serviceBindingControlHeads,
+  sqlAdmissionStore,
+  type BufferedSearchGate,
+  type ServiceBinding,
+} from "../../../src/session-read-api/buffered-search-gate.ts";
 
 export interface Env extends CanonicalEnv {
   SUPABASE: Hyperdrive;
@@ -64,6 +72,14 @@ export interface Env extends CanonicalEnv {
   READ_API_BABYSITTER_EVIDENCE?: string;
   /** The ingest key root the retention buckets live under (default 96bulls). */
   READ_API_BABYSITTER_KEY_ROOT?: string;
+  /**
+   * The per-hit R2 privacy gate for buffered-origin search rows: only "on" enables; default off
+   * (src/session-read-api/buffered-search-gate.ts). On without SESSION_READ_PRIVACY_CONTROLS,
+   * every buffered-origin row is dropped.
+   */
+  READ_API_BUFFERED_SEARCH_GATE?: string;
+  /** Service binding to relayhistory-cloud, entrypoint SessionReadPrivacyControls (not in wrangler.jsonc yet). */
+  SESSION_READ_PRIVACY_CONTROLS?: ServiceBinding;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
   /** Exactly "true" also accepts relaycontrol `sh_at_` tokens; default off. */
@@ -238,6 +254,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     briefTitles: sqlBriefTitles(tenant.run),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
+    bufferedSearchGate: bufferedSearchGate(env, tenant.run),
     log: (fields) => log("info", "session read", fields),
   });
   try {
@@ -245,6 +262,17 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   } finally {
     ctx.waitUntil(tenant.close());
   }
+}
+
+/**
+ * The buffered search gate, per request (control heads are never cached across requests).
+ * Off unless READ_API_BUFFERED_SEARCH_GATE=on.
+ */
+export function bufferedSearchGate(env: Env, run: TenantRunner): BufferedSearchGate | undefined {
+  if (!parseBufferedSearchGate(env.READ_API_BUFFERED_SEARCH_GATE)) return undefined;
+  const binding = env.SESSION_READ_PRIVACY_CONTROLS;
+  if (!binding) log("warn", "buffered search gate on without SESSION_READ_PRIVACY_CONTROLS: buffered rows are dropped", {});
+  return createBufferedSearchGate({ controlHeads: binding ? serviceBindingControlHeads(binding) : undefined, store: sqlAdmissionStore(run) });
 }
 
 /**

@@ -238,7 +238,7 @@ export function candidatePosition(r: CandidateRow): EventPosition {
  * there and issues a cursor); with maxContent only maxContent+1 code points are
  * read, which is exactly enough to decide and apply relayhistory's truncation.
  */
-export function buildNewestQuery(database: string, input: EventQuery, candidates: EventPosition[]): Built {
+export function buildNewestQuery(database: string, input: EventQuery, candidates: EventPosition[], options: { origin?: boolean } = {}): Built {
   if (candidates.length === 0) throw new Error("buildNewestQuery needs candidates");
   const params: QueryParams = { org: input.orgId, ws: input.workspaceId, lo: Math.min(...candidates.map((c) => c.tsMs)), hi: Math.max(...candidates.map((c) => c.tsMs)), budget: PAGE_BYTE_BUDGET };
   const keys = arrayLiteral(candidates.map((c) => tuple(c.tsMs, c.sessionId, c.source, c.machineId, c.kind, c.eventId)));
@@ -260,7 +260,10 @@ export function buildNewestQuery(database: string, input: EventQuery, candidates
     // A code point is at most 4 bytes.
     sizeExpr = "least(content_bytes, 4 * {mc:UInt32})";
   }
-  const cols = "org_id, workspace_id, ts, session_id, source, machine_id, kind, event_id, type, user_id, actor_name, actor_role, subagent_id, project_id, task_title, task_ref, tags, files_touched, tool_name, tool_status";
+  // The buffered-origin marker (buffered-search-gate.ts), read only while the gate is on, so
+  // the query is unchanged with the gate off and on a table without the columns.
+  const originCols = options.origin ? `, ${ORIGIN_COLUMNS}` : "";
+  const cols = `org_id, workspace_id, ts, session_id, source, machine_id, kind, event_id, type, user_id, actor_name, actor_role, subagent_id, project_id, task_title, task_ref, tags, files_touched, tool_name, tool_status${originCols}`;
   const newest = `SELECT ${cols}, content, content_bytes, version FROM ${qualifiedTable(database)}
 WHERE org_id = {org:String} AND workspace_id = {ws:String}
   AND ts >= fromUnixTimestamp64Milli({lo:Int64}, 'UTC') AND ts <= fromUnixTimestamp64Milli({hi:Int64}, 'UTC')
@@ -269,7 +272,7 @@ ORDER BY ${ord}, version DESC LIMIT 1 BY ${KEY_BY}`;
   const filtered = `SELECT ${cols}, ${contentExpr} AS content_eff, ${sizeExpr} + ${ROW_OVERHEAD_BYTES} AS eff_bytes FROM (${newest})${value.length ? ` WHERE ${value.join(" AND ")}` : ""}`;
   const windowed = `SELECT *, row_number() OVER w AS rn, sum(eff_bytes) OVER w - eff_bytes AS bytes_before FROM (${filtered})
 WINDOW w AS (ORDER BY ${ord} ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`;
-  const query = `SELECT org_id, workspace_id, toUnixTimestamp64Milli(ts) AS ts_ms, session_id, source, machine_id, kind, event_id, type, user_id, actor_name, actor_role, subagent_id, project_id, task_title, task_ref, tags, files_touched, tool_name, tool_status,
+  const query = `SELECT org_id, workspace_id, toUnixTimestamp64Milli(ts) AS ts_ms, session_id, source, machine_id, kind, event_id, type, user_id, actor_name, actor_role, subagent_id, project_id, task_title, task_ref, tags, files_touched, tool_name, tool_status${originCols},
   if(bytes_before <= {budget:UInt64} OR rn = 1, content_eff, '') AS content, toUInt8(bytes_before <= {budget:UInt64} OR rn = 1) AS in_budget
 FROM (${windowed}) ORDER BY ${ord}`;
   return { query, params };
@@ -298,7 +301,19 @@ export interface EventRow {
   tool_status: string;
   content: string;
   in_budget: number;
+  /** Present only when the buffered search gate selected it: 'canonical' | 'buffered'. */
+  origin?: string;
+  /** The buffered stage's original claim token; '' for canonical rows. */
+  origin_claim_token?: string;
 }
+
+/**
+ * The buffered-origin marker columns the buffered feed lane adds to
+ * `transcript_events` (declared contract; the DDL is that lane's):
+ *   origin             LowCardinality(String) DEFAULT 'canonical'
+ *   origin_claim_token String DEFAULT ''
+ */
+export const ORIGIN_COLUMNS = "origin, origin_claim_token";
 
 /**
  * Settings for every read: bounded time and result size. Read-only is the
