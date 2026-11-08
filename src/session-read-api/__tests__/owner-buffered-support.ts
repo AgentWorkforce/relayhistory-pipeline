@@ -10,7 +10,7 @@ import { objectKey, type ObjectStore } from "../../shared/vendor.ts";
 import { scratchStore } from "../../session-ingest/__tests__/support.ts";
 import { TURN_KIND, TURN_ORIGIN_ID, turnRecordId } from "../../session-ingest/turns.ts";
 import type { AuthorityHead, BufferedScope, BufferedSessionRow, BufferedStageRow, ControlHeadGate, OwnerBufferedDeps, OwnerBufferedReads } from "../owner-buffered.ts";
-import { BufferedFenced } from "../owner-buffered.ts";
+import { BufferedFenced, BufferedTooLarge } from "../owner-buffered.ts";
 
 export const SCOPE: BufferedScope = { orgId: "org-a", workspaceId: "ws-a", userId: "u-1" };
 export const SESSION = "sess-b1";
@@ -90,7 +90,15 @@ export async function putStage(store: ObjectStore, n: number, records: unknown[]
   };
 }
 
-export const unzip = (b: Uint8Array) => new Uint8Array(zstdDecompressSync(b));
+/** zstd with the deps' bounded-output contract: maxOutputLength stops past the bound (BufferedTooLarge). */
+export const unzip = (b: Uint8Array, maxBytes?: number) => {
+  try {
+    return new Uint8Array(zstdDecompressSync(b, maxBytes === undefined ? {} : { maxOutputLength: maxBytes }));
+  } catch (error) {
+    if (error instanceof RangeError) throw new BufferedTooLarge();
+    throw error;
+  }
+};
 
 /** Scripted readers: `stages` answers per call (the last repeats); every call is recorded. */
 export function scriptedReads(init: { list?: BufferedSessionRow[] | Error; stages?: Array<BufferedStageRow[] | Error> } = {}) {

@@ -224,8 +224,9 @@ const validBuffered = (b: unknown): b is [string, string, string] =>
   typeof b[2] === "string" && b[2].length >= 1 && b[2].length <= 255;
 
 /**
- * Both parts of a list cursor. undefined: no cursor; "foreign"/"invalid" as decodeListCursor.
- * A 4-element cursor's canonical part may be all-null (no canonical row consumed yet).
+ * Both parts of a list cursor (owner-buffered list only). undefined: no cursor; "foreign"/"invalid"
+ * as decodeListCursor. A 4-element cursor's canonical part may be all-null (no canonical row
+ * consumed yet).
  */
 export function decodeCompositeListCursor(raw: string | undefined): { canonical?: DirectoryCursor; buffered?: BufferedListCursor } | undefined | "foreign" | "invalid" {
   if (raw === undefined || raw === "") return undefined;
@@ -245,14 +246,27 @@ export function decodeCompositeListCursor(raw: string | undefined): { canonical?
 }
 
 /**
- * undefined: no cursor; "foreign": not ours; "invalid": ours but malformed. A composite
- * (owner-buffered) cursor answers its canonical part: undefined when no canonical row was
- * consumed yet, so a pagination that started with the flag on continues canonically if the
- * flag is turned off.
+ * undefined: no cursor; "foreign": not ours; "invalid": ours but malformed. Exactly main's
+ * canonical-only decoder: a composite (owner-buffered, 4-element) cursor is "invalid" here; only
+ * the list route with owner-buffered reads on decodes it (decodeCompositeListCursor).
  */
 export function decodeListCursor(raw: string | undefined): DirectoryCursor | undefined | "foreign" | "invalid" {
-  const d = decodeCompositeListCursor(raw);
-  return d === undefined || typeof d === "string" ? d : d.canonical;
+  if (raw === undefined || raw === "") return undefined;
+  if (!raw.startsWith(LIST_CURSOR_PREFIX)) return "foreign";
+  try {
+    const b64 = raw.slice(LIST_CURSOR_PREFIX.length).replace(/-/gu, "+").replace(/_/gu, "/");
+    const v = JSON.parse(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4)));
+    if (
+      Array.isArray(v) && v.length === 3 &&
+      typeof v[0] === "string" && CURSOR_TS.test(v[0]) && Number.isFinite(Date.parse(v[0])) &&
+      typeof v[1] === "string" && v[1].length >= 1 && v[1].length <= 255 &&
+      typeof v[2] === "string" && HARNESS_NAME.test(v[2])
+    )
+      return { lastActivityAt: v[0], sessionId: v[1], harness: v[2] };
+  } catch {
+    // fall through
+  }
+  return "invalid";
 }
 
 /** relayhistory lib/recall.ts MAX_SESSION_SUMMARY_CHARS and condenseTurn. */

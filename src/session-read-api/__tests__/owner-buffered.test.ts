@@ -13,10 +13,14 @@ import {
   BUFFERED_SESSIONS_SQL,
   BUFFERED_STAGES_SQL,
   BUFFERED_USER_SQL,
+  BUFFERED_SESSION_MAX_BYTES,
+  BUFFERED_STAGE_MAX_BYTES,
   BufferedFenced,
+  BufferedTooLarge,
   CONTROL_HEAD_CONTRACT,
   CONTROL_HEAD_PATH,
   admissionVisible,
+  boundedStreamDecompress,
   ownerBufferedEnabled,
   parseControlHeadResponse,
   readOwnerBufferedList,
@@ -25,10 +29,11 @@ import {
   serviceBindingControlHead,
   sqlOwnerBufferedReads,
   type AuthorityHead,
+  type BufferedStageRow,
 } from "../owner-buffered.ts";
 import { TenantMismatchError } from "../page.ts";
 import { objectKey } from "../../shared/vendor.ts";
-import { DIGEST, E1, E2, SCOPE, SESSION, authority, bufferedRow, deps, fencedGate, headBody, putStage, scratch, scriptedGate, scriptedReads, turn } from "./owner-buffered-support.ts";
+import { DIGEST, E1, E2, SCOPE, SESSION, authority, bufferedRow, deps, fencedGate, headBody, putStage, scratch, scriptedGate, scriptedReads, turn, unzip as unzipBounded } from "./owner-buffered-support.ts";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => {
@@ -187,9 +192,9 @@ describe("readOwnerBufferedTurns (gated)", () => {
     expect(calls.every((c) => c.authority === calls[0]!.authority && JSON.stringify(c.authority) === JSON.stringify(authority("7")))).toBe(true);
   });
 
-  test("first observation fenced: no RPC and no S3 read", async () => {
+  test("first observation fenced: no RPC and no S3 read; reported as unverified before any candidate (route keeps main's 501)", async () => {
     const { reads, calls } = scriptedReads({ stages: [[]] });
-    expect(await reason(readOwnerBufferedTurns(deps({ store: store(), reads, gate: fencedGate("gate_timeout") }), SCOPE, "claude", SESSION))).toBe("gate_timeout");
+    expect(await readOwnerBufferedTurns(deps({ store: store(), reads, gate: fencedGate("gate_timeout") }), SCOPE, "claude", SESSION)).toEqual({ unverifiedBeforeCandidate: "gate_timeout" });
     expect(calls).toHaveLength(0);
   });
 
@@ -251,18 +256,37 @@ describe("readOwnerBufferedTurns (gated)", () => {
     expect(await readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[seven.row]] }).reads, gate: gate() }), SCOPE, "claude", SESSION)).toBeNull();
   });
 
-  test("stale-native-row-after-source-deletion-cleared: the post-fetch recheck drops the stage, no content", async () => {
+  test("stale-native-row-after-source-deletion-cleared: a stage dropped at the post-fetch recheck hides the whole session", async () => {
     const s = store();
     const a = await putStage(s, 1, [turn(0, { content: "STALE-NATIVE-A" })]);
     const b = await putStage(s, 2, [turn(1, { content: "kept b" })]);
-    // The recheck no longer lists `a` (native custody moved): only `b` is served.
+    // The recheck no longer lists `a` (native custody moved): the session is hidden, `b` is not served alone.
     const out = await readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[a.row, b.row], [b.row]] }).reads }), SCOPE, "claude", SESSION);
     expect(JSON.stringify(out)).not.toContain("STALE-NATIVE-A");
-    expect(out && !out.erased && out.rows.map((r) => r.content)).toEqual(["kept b"]);
-    // A recheck row that changed (other kept ordinals, other admission) is not the fetched one.
+    expect(out).toBeNull();
+    // A recheck row that changed (other kept ordinals, other admission) is not the fetched one: hidden.
     const changed = { ...a.row, admission_version: "8" };
     const out2 = await readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[a.row], [changed]] }).reads }), SCOPE, "claude", SESSION);
-    expect(out2).toEqual({ erased: false, rows: [] });
+    expect(out2).toBeNull();
+  });
+
+  test("partial sessions: any stage added, removed or changed between fetch and recheck hides the whole session", async () => {
+    const s = store();
+    const a = await putStage(s, 1, [turn(0, { content: "PART-A" })]);
+    const b = await putStage(s, 2, [turn(1, { content: "PART-B" })]);
+    const variants: BufferedStageRow[][] = [
+      [a.row, b.row, { ...b.row, batch_id: "b-extra", stage_key: `${b.row.stage_key}.x` }],
+      [a.row, { ...b.row, kept_ordinals: [] }],
+      [a.row, { ...b.row, reset_epoch: "1" }],
+      [a.row, { ...b.row, stage_sha256: "e".repeat(64) }],
+      [a.row],
+    ];
+    for (const recheck of variants) {
+      const out = await readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[a.row, b.row], recheck] }).reads }), SCOPE, "claude", SESSION);
+      expect(out).toBeNull();
+    }
+    const same = await readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[a.row, b.row], [b.row, a.row]] }).reads }), SCOPE, "claude", SESSION);
+    expect(same && !same.erased && same.rows.map((r) => r.content)).toEqual(["PART-A", "PART-B"]);
   });
 
   test("erasure race: stages present before the fetch, none at the recheck -> erased (no rows)", async () => {
@@ -285,9 +309,10 @@ describe("readOwnerBufferedTurns (gated)", () => {
     const out = await readOwnerBufferedTurns(deps({ store: s, reads }), SCOPE, "claude", SESSION);
     expect(out && !out.erased && out.rows.map((r) => r.content)).toEqual(["B"]);
     expect(calls.filter((c) => c.fn === "stages")).toHaveLength(3);
+    // Still listed but missing twice: the fetched set ({b}) differs from the recheck ({a,b}), so the whole session is hidden.
     const again = scriptedReads({ stages: [[a.row, b.row]] });
     const out2 = await readOwnerBufferedTurns(deps({ store: s, reads: again.reads }), SCOPE, "claude", SESSION);
-    expect(out2 && !out2.erased && out2.rows.map((r) => r.content)).toEqual(["B"]);
+    expect(out2).toBeNull();
   });
 
   test("a stage header of another tenant or user is a TenantMismatchError", async () => {
@@ -330,6 +355,104 @@ describe("readOwnerBufferedTurns (gated)", () => {
     const out = await readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[row]] }).reads }), SCOPE, "claude", SESSION);
     expect(JSON.stringify(out)).not.toContain("DROPPED-LINE");
   });
+});
+
+describe("byte bounds on detail reads (hidden, never partial)", () => {
+  const MiB = 1024 * 1024;
+  test("constants: 16 MiB per stage (the writer's cap), 32 MiB per session", () => {
+    expect(BUFFERED_STAGE_MAX_BYTES).toBe(16 * MiB);
+    expect(BUFFERED_SESSION_MAX_BYTES).toBe(32 * MiB);
+  });
+
+  test("a stage row claiming more than 16 MiB compressed is BufferedTooLarge before any GetObject or recheck", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [turn(0, { content: "OVER-CAP" })]);
+    const { reads, calls } = scriptedReads({ stages: [[{ ...st.row, stage_bytes: BUFFERED_STAGE_MAX_BYTES + 1 }]] });
+    let decompressCalls = 0;
+    const d = deps({ store: s, reads, decompress: (b, m) => (decompressCalls++, unzipBounded(b, m)) });
+    await expect(readOwnerBufferedTurns(d, SCOPE, "claude", SESSION)).rejects.toBeInstanceOf(BufferedTooLarge);
+    expect(decompressCalls).toBe(0);
+    expect(calls.filter((c) => c.fn === "stages")).toHaveLength(1);
+  });
+
+  test("stages summing past the session bound (compressed) are BufferedTooLarge before any GetObject", async () => {
+    const s = store();
+    const a = await putStage(s, 1, [turn(0)]);
+    const b = await putStage(s, 2, [turn(1)]);
+    const half = BUFFERED_SESSION_MAX_BYTES / 2;
+    const rows = [{ ...a.row, stage_bytes: half }, { ...b.row, stage_bytes: half + 1 }];
+    let decompressCalls = 0;
+    const d = deps({ store: s, reads: scriptedReads({ stages: [rows] }).reads, decompress: (x, m) => (decompressCalls++, unzipBounded(x, m)) });
+    await expect(readOwnerBufferedTurns(d, SCOPE, "claude", SESSION)).rejects.toBeInstanceOf(BufferedTooLarge);
+    expect(decompressCalls).toBe(0);
+  });
+
+  test("an over-cap stage (decompresses past 16 MiB) is BufferedTooLarge; the decompressor is given the 16 MiB bound", async () => {
+    const s = store();
+    const bomb = await putStage(s, 1, [turn(0, { content: "x".repeat(BUFFERED_STAGE_MAX_BYTES + 1) })]);
+    expect(bomb.row.stage_bytes).toBeLessThan(MiB);
+    const bounds: number[] = [];
+    const d = deps({ store: s, reads: scriptedReads({ stages: [[bomb.row]] }).reads, decompress: (x, m) => (bounds.push(m), unzipBounded(x, m)) });
+    await expect(readOwnerBufferedTurns(d, SCOPE, "claude", SESSION)).rejects.toBeInstanceOf(BufferedTooLarge);
+    expect(bounds).toEqual([BUFFERED_STAGE_MAX_BYTES]);
+  });
+
+  test("the session bound shrinks the room for later stages: the third 12 MiB stage is BufferedTooLarge", async () => {
+    const s = store();
+    const big = (n: number) => putStage(s, n, [turn(0, { content: String(n).repeat(12 * MiB) })]);
+    const rows = [(await big(1)).row, (await big(2)).row, (await big(3)).row];
+    const bounds: number[] = [];
+    const d = deps({ store: s, reads: scriptedReads({ stages: [rows] }).reads, decompress: (x, m) => (bounds.push(m), unzipBounded(x, m)) });
+    await expect(readOwnerBufferedTurns(d, SCOPE, "claude", SESSION)).rejects.toBeInstanceOf(BufferedTooLarge);
+    expect(bounds).toHaveLength(3);
+    expect(bounds[0]).toBe(BUFFERED_STAGE_MAX_BYTES);
+    expect(bounds[2]!).toBeLessThan(BUFFERED_STAGE_MAX_BYTES);
+  });
+
+  test("boundedStreamDecompress: concatenates chunks within the bound; stops at the first chunk past it", () => {
+    let pushedAfterStop = 0;
+    class FakeStream {
+      constructor(private readonly ondata: (chunk: Uint8Array, final?: boolean) => unknown) {}
+      push(input: Uint8Array) {
+        for (let i = 0; i < input.byteLength; i++) {
+          this.ondata(new Uint8Array([input[i]!, input[i]!]), i === input.byteLength - 1);
+          pushedAfterStop += 1;
+        }
+      }
+    }
+    const d = boundedStreamDecompress(FakeStream);
+    expect([...d(new Uint8Array([1, 2, 3]), 6)]).toEqual([1, 1, 2, 2, 3, 3]);
+    pushedAfterStop = 0;
+    expect(() => d(new Uint8Array([1, 2, 3, 4, 5]), 5)).toThrow(BufferedTooLarge);
+    // chunks 1 and 2 (4 bytes) fit; chunk 3 (6 bytes) is past 5: the stream stops there.
+    expect(pushedAfterStop).toBe(2);
+  });
+});
+
+describe("parity addendum v1 (PR-B-scoped cases; PR B layer, stubbed reader; proof binding is PR A SQL)", () => {
+  // Transcribed from fixtures-v3/parity-addendum-v1-exact.json (synthetic vectors). The proof row
+  // binding itself is enforced by the PR A RPC (043700); here the reader result is stubbed and the
+  // PR B checks are exercised: the RPC refusing (no rows) hides, and a foreign tenant/user in what
+  // the stubbed reader returns fails closed (TenantMismatchError), never content.
+  const foreign = { user: { user_id: "foreign-user" }, workspace: { workspace_id: "foreign-workspace" }, org: { org_id: "foreign-org" } } as const;
+
+  test("exact-current-user-proof-positive (PR B layer, stubbed reader; proof binding is PR A SQL): served", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [turn(0, { content: "PROOF-POSITIVE" })]);
+    const out = await readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[st.row]] }).reads, gate: scriptedGate(authority("7")) }), SCOPE, "claude", SESSION);
+    expect(out && !out.erased && out.rows.map((r) => r.content)).toEqual(["PROOF-POSITIVE"]);
+  });
+
+  for (const [id, kind] of [["proof-foreign-user", "user"], ["proof-foreign-workspace", "workspace"], ["proof-foreign-org", "org"]] as const) {
+    test(`${id} (PR B layer, stubbed reader; proof binding is PR A SQL): not emitted`, async () => {
+      const s = store();
+      // The RPC refuses the foreign proof: no stage rows -> hidden (the route's existing 501).
+      expect(await readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[]] }).reads }), SCOPE, "claude", SESSION)).toBeNull();
+      // A stubbed reader that wrongly returned a stage of the foreign tenant/user: fail closed, no content.
+      const st = await putStage(s, 1, [turn(0, { content: `FOREIGN-${kind}` })], { header: foreign[kind] });
+      await expect(readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[st.row]] }).reads }), SCOPE, "claude", SESSION)).rejects.toBeInstanceOf(TenantMismatchError);
+    });
+  }
 });
 
 describe("readOwnerBufferedList (gated)", () => {

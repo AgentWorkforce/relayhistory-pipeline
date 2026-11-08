@@ -77,6 +77,7 @@ import {
   BUFFERED_IDS_HEADER,
   BUFFERED_LIST_MAX_LIMIT,
   BufferedFenced,
+  BufferedTooLarge,
   bufferedIdsHeader,
   bufferedSessionSummary,
   cursorTsKey,
@@ -391,13 +392,24 @@ export function createReadApi(deps: ReadApiDeps) {
   /**
    * The caller's buffered turn rows of one session for a detail route, through the gated path
    * (readOwnerBufferedTurns: authority observed before the RPCs and again after every S3 read,
-   * before any byte). Fenced: 503 buffered_fenced. A tenant mismatch is a 500; any other failure
-   * is logged and answers null (the route's existing answer).
+   * before any byte). Authority unavailable before any buffered candidate was found: logged,
+   * null (the route's existing 501, exactly as without the flag). Fenced once a candidate was
+   * found: 503 buffered_fenced. Over the byte bounds: logged `buffered_too_large`, null. A
+   * tenant mismatch is a 500; any other failure is logged and answers null.
    */
   async function bufferedTurns(c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string) {
     try {
-      return await readOwnerBufferedTurns(ob, bufferedScope(identity), source, sessionId);
+      const served = await readOwnerBufferedTurns(ob, bufferedScope(identity), source, sessionId);
+      if (served && "unverifiedBeforeCandidate" in served) {
+        log({ route: c.req.routePath, reason: "buffered_unverified", gate: served.unverifiedBeforeCandidate, correlation_id: c.get("correlationId") });
+        return null;
+      }
+      return served;
     } catch (error) {
+      if (error instanceof BufferedTooLarge) {
+        log({ route: c.req.routePath, reason: "buffered_too_large", correlation_id: c.get("correlationId") });
+        return null;
+      }
       if (error instanceof BufferedFenced) {
         log({ route: c.req.routePath, reason: "buffered_fenced", gate: error.reason, correlation_id: c.get("correlationId") });
         throw bufferedFenced();
@@ -639,7 +651,12 @@ export function createReadApi(deps: ReadApiDeps) {
       if (limit > DIRECTORY_LIST_MAX_LIMIT) throw unsupported("limit");
       if ([...sources, ...notSources].some((v) => !HARNESS_NAME.test(v))) throw unsupported("source_format");
       if (projectContains !== undefined && projectContains.trim() === "") throw unsupported("project_contains");
-      const cursor = decodeListCursor(single(c, "cursor"));
+      // Buffered rows: only the caller's own; agent/projectContains are not derivable without S3.
+      const ob = ownerBufferedFor(identity);
+      const withBuffered = ob !== undefined && !agent && !projectContains && (users.length === 0 || users.includes(identity.userId));
+      // The composite cursor exists only on the buffered path; otherwise main's decoder, exactly.
+      const composite = withBuffered ? decodeCompositeListCursor(single(c, "cursor")) : undefined;
+      const cursor = withBuffered ? (typeof composite === "object" ? composite.canonical : composite) : decodeListCursor(single(c, "cursor"));
       if (cursor === "foreign") throw new CursorError("foreign_cursor");
       if (cursor === "invalid") throw new CursorError("invalid_cursor");
       if (sources.length) args.sources = sources;
@@ -651,9 +668,7 @@ export function createReadApi(deps: ReadApiDeps) {
       if (cursor) args.cursor = cursor;
       const rows = await directory.list(identity.orgId, identity.workspaceId, args);
       if (rows === null) throw unsupported("directory_not_migrated");
-      const ob = ownerBufferedFor(identity);
-      // Buffered rows: only the caller's own; agent/projectContains are not derivable without S3.
-      if (ob && !agent && !projectContains && (users.length === 0 || users.includes(identity.userId))) {
+      if (withBuffered) {
         const union = await bufferedListPage(c, identity, ob, rows, { limit, sources, notSources, bounds });
         return c.json({ sessions: union.sessions, nextCursor: union.nextCursor, correlationId: c.get("correlationId") });
       }

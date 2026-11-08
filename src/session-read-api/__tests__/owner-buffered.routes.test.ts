@@ -7,7 +7,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { AuthError, createReadApi, type TurnsDeps, type VerifiedIdentity } from "../app.ts";
-import { decodeCompositeListCursor, type Directory, type DirectoryListRow } from "../directory.ts";
+import { decodeCompositeListCursor, encodeCompositeListCursor, type Directory, type DirectoryListRow } from "../directory.ts";
 import { BufferedFenced, sqlOwnerBufferedReads, type ControlHeadGate, type OwnerBufferedDeps, type OwnerBufferedReads } from "../owner-buffered.ts";
 import { memoryLiveness } from "./support.ts";
 import { E1, SESSION, authority, bufferedRow, fencedGate, putStage, scratch, scriptedGate, scriptedReads, turn, unzip } from "./owner-buffered-support.ts";
@@ -203,6 +203,26 @@ describe("GET /v1/sessions with owner buffered rows", () => {
     expect(seen).toEqual(["b-2", "b-1", "s-1"]);
   });
 
+  test("composite (4-part) cursor is accepted only with the flag on; flag off, no deps or other filters answer 400 as main", async () => {
+    const buffered = { ts: "2026-11-05T12:05:00.000000Z", sessionId: "x", source: "claude" };
+    const canonical = { lastActivityAt: "2026-10-02T03:04:05.123456Z", sessionId: "s-1", harness: "codex" };
+    for (const cursor of [encodeCompositeListCursor(undefined, buffered), encodeCompositeListCursor(canonical, buffered)]) {
+      const q = `${L}&cursor=${encodeURIComponent(cursor)}`;
+      for (const h of [{ enabled: false }, { noOwnerBuffered: true }]) {
+        const gate = scriptedGate(authority("7"));
+        const r = await api({ ...h, gate }).get(q);
+        expect(r.status).toBe(400);
+        expect(gate.calls).toHaveLength(0);
+      }
+      const main = await api({ noOwnerBuffered: true }).get(q);
+      const off = await api({ enabled: false }).get(q);
+      expect(strip(await json(off))).toEqual(strip(await json(main)));
+      // A filter that skips buffered rows takes main's cursor path too.
+      expect((await api({}).get(`${q}&user=u-2`)).status).toBe(400);
+      expect((await api({ reads: scriptedReads({ list: [] }).reads }).get(q)).status).toBe(200);
+    }
+  });
+
   test("another user's row from the RPC is a 500, never a page", async () => {
     const run = (async (_o: string, _w: string, work: (q: unknown) => Promise<unknown>) =>
       work({ async query(sql: string) { return { rows: sql.includes("buffered_sessions_for") ? [{ ...bufferedRow(), user_id: "u-2", first_ts: new Date(), last_ts: new Date() }] : [] }; } })) as never;
@@ -253,10 +273,36 @@ describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => 
     expect(await json(m)).toEqual({ nativeCli: "claude", nativeResumeId: null, sessionOwner: "u-1", originNode: "node-b" });
   });
 
-  test("fenced (gate failure or move): 503 buffered_fenced, retryable, no bytes", async () => {
+  test("gate down before the DB read: 501 turns_no_pointers exactly as main (flag off), logged buffered_unverified, no RPC", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [turn(0, { content: "UNVERIFIED-CONTENT" })]);
+    for (const path of [T, M]) {
+      const main = await api({ enabled: false }).get(path);
+      const mainBody = strip(await json(main));
+      for (const gateOf of [() => fencedGate("gate_unbound"), () => fencedGate("gate_timeout"), () => fencedGate("gate_shape")]) {
+        // A caller with no buffered stages, and one with stages: the gate failing first answers like main either way.
+        for (const stages of [[[]], [[st.row]]] as const) {
+          const { reads, calls } = scriptedReads({ stages: stages as never });
+          const { get, logs } = api({ store: s, gate: gateOf(), reads });
+          const r = await get(path);
+          expect(r.status).toBe(main.status);
+          expect(r.status).toBe(501);
+          expect(r.headers.get("retry-after")).toBeNull();
+          expect(r.headers.get("x-relayhistory-buffered")).toBeNull();
+          const text = await r.text();
+          expect(strip(JSON.parse(text))).toEqual(mainBody);
+          expect(text).not.toContain("UNVERIFIED-CONTENT");
+          expect(calls).toHaveLength(0);
+          expect(logs.some((l) => l.reason === "buffered_unverified")).toBe(true);
+        }
+      }
+    }
+  });
+
+  test("fenced after a buffered candidate was found (gate moved or failed at the final observation): 503 buffered_fenced, retryable, no bytes", async () => {
     const s = store();
     const st = await putStage(s, 1, [turn(0, { content: "FENCED-CONTENT" })]);
-    const gates = [() => fencedGate("gate_unbound"), () => fencedGate("gate_shape"), () => scriptedGate(authority("7"), authority("8")), () => scriptedGate(authority("7"), new BufferedFenced("gate_pending"))];
+    const gates = [() => scriptedGate(authority("7"), authority("8")), () => scriptedGate(authority("7"), new BufferedFenced("gate_pending")), () => scriptedGate(authority("7"), new BufferedFenced("gate_unbound"))];
     for (const gateOf of gates) {
       for (const path of [T, M]) {
         const { get } = api({ store: s, gate: gateOf(), reads: scriptedReads({ stages: [[st.row]] }).reads });
@@ -288,6 +334,21 @@ describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => 
     expect((await json(t)).turns).toEqual([]);
     const m = await api({ store: s, reads: scriptedReads({ stages: [[st.row], []] }).reads }).get(M);
     expect(m.status).toBe(404);
+  });
+
+  test("over the byte bounds: 501 turns_no_pointers (hidden, never partial), logged buffered_too_large", async () => {
+    const s = store();
+    const small = await putStage(s, 1, [turn(0, { content: "SMALL-STAGE" })]);
+    const bomb = await putStage(s, 2, [turn(1, { content: "y".repeat(16 * 1024 * 1024 + 1) })]);
+    for (const path of [T, M]) {
+      const { get, logs } = api({ store: s, reads: scriptedReads({ stages: [[small.row, bomb.row]] }).reads });
+      const r = await get(path);
+      expect(r.status).toBe(501);
+      const text = await r.text();
+      expect(JSON.parse(text).error.reason).toBe("turns_no_pointers");
+      expect(text).not.toContain("SMALL-STAGE");
+      expect(logs.some((l) => l.reason === "buffered_too_large")).toBe(true);
+    }
   });
 
   test("source is required for the buffered path; canonical pointers win; flag off never calls the gate", async () => {
@@ -362,7 +423,8 @@ describe("regression: a stored pre-v4 buffered object with a partially redacted 
       expect(r.status).toBe(501);
       expect(await r.text()).not.toContain(SUFFIX);
     }
-    const fenced = await api({ store: s, gate: fencedGate(), reads: scriptedReads({ stages: [[st.row]] }).reads }).get(T);
+    const fenced = await api({ store: s, gate: scriptedGate(authority("7"), new BufferedFenced("gate_pending")), reads: scriptedReads({ stages: [[st.row]] }).reads }).get(T);
     expect(fenced.status).toBe(503);
+    expect(await fenced.text()).not.toContain(SUFFIX);
   });
 });

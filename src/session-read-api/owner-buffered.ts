@@ -40,7 +40,7 @@ import type { TenantRunner } from "./liveness.ts";
 import { TenantMismatchError } from "./page.ts";
 import { canonicalLiveTurns } from "./canonical-turns.ts";
 import { turnRows } from "./session-turns-source.ts";
-import { readBufferedStage } from "../session-ingest/staging.ts";
+import { BUFFER_STAGE_MAX_BYTES, readBufferedStage } from "../session-ingest/staging.ts";
 import { bufferedOrdinalSelection } from "../session-ingest/buffered-protocol.ts";
 import { isObjectStoreError, type ObjectStore } from "../shared/vendor.ts";
 import {
@@ -305,7 +305,57 @@ export interface OwnerBufferedDeps {
   gate: ControlHeadGate;
   /** The buffered-batches store (INGEST_S3_BUCKET); GetObject only. */
   store: ObjectStore;
-  decompress: (bytes: Uint8Array) => Uint8Array;
+  /**
+   * zstd with a bounded output: must stop and throw BufferedTooLarge (or any error) as soon as
+   * the output would exceed `maxBytes`, never buffering past it. The worker streams fzstd.
+   */
+  decompress: (bytes: Uint8Array, maxBytes: number) => Uint8Array;
+}
+
+/** One stage object: the compressed and the decompressed bound (staging.ts BUFFER_STAGE_MAX_BYTES). */
+export const BUFFERED_STAGE_MAX_BYTES = BUFFER_STAGE_MAX_BYTES;
+/**
+ * The memory bound of one buffered detail read: the total of the stages' compressed sizes and,
+ * separately, of their decompressed sizes for one session. Over it the session is hidden (the
+ * route's existing 501), never served partially. 32 MiB keeps the raw bytes plus their parsed
+ * records well inside a Worker isolate's 128 MB.
+ */
+export const BUFFERED_SESSION_MAX_BYTES = 32 * 1024 * 1024;
+
+/** A stage or a session over its byte bound: the session is hidden. */
+export class BufferedTooLarge extends Error {
+  constructor() {
+    super("buffered session over its byte bound");
+    this.name = "BufferedTooLarge";
+  }
+}
+
+/** A push-style decompressor (fzstd's Decompress): `ondata` per output chunk, synchronously. */
+export type StreamDecompressor = new (ondata: (chunk: Uint8Array, final?: boolean) => unknown) => { push(chunk: Uint8Array, final?: boolean): unknown };
+
+/**
+ * OwnerBufferedDeps.decompress over a streaming decompressor: output chunks are counted as they
+ * arrive and the stream is abandoned (BufferedTooLarge) the moment the total passes `maxBytes`,
+ * so at most one chunk (a zstd block, <= 128 KiB) is ever held past the bound.
+ */
+export function boundedStreamDecompress(Stream: StreamDecompressor): OwnerBufferedDeps["decompress"] {
+  return (bytes, maxBytes) => {
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    const stream = new Stream((chunk) => {
+      total += chunk.byteLength;
+      if (total > maxBytes) throw new BufferedTooLarge();
+      chunks.push(chunk);
+    });
+    stream.push(bytes, true);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return out;
+  };
 }
 
 /** The RPC page bound (PR A clamps p_limit to 1..100). */
@@ -544,42 +594,61 @@ const sameStage = (a: BufferedStageRow, b: BufferedStageRow) =>
   a.admission_epoch === b.admission_epoch && a.admission_version === b.admission_version;
 
 type RawSessionRead =
-  | null /** no kept buffered stage: not a buffered session of this caller */
-  | { erased: true; stages: [] }
-  | { erased: false; stages: Array<{ row: BufferedStageRow; records: RelayhistoryStreamRecord[] }> };
+  | { kind: "erased" }
+  /** The kept set moved between the fetch and the recheck: the session is hidden. */
+  | { kind: "changed" }
+  | { kind: "stages"; stages: Array<{ row: BufferedStageRow; records: RelayhistoryStreamRecord[] }> };
 
 /**
- * MODULE-PRIVATE, UNGATED. The caller's kept stages of one session: stages() (null when empty),
- * GetObject through readBufferedStage, then stages() again with the same observation. Only
- * stages the recheck still lists unchanged are kept; an empty recheck is erased. An S3 404
- * re-asks stages() once and refetches what is still listed; a stage missing twice is omitted.
- * Never export this: readOwnerBufferedTurns is the gated path.
+ * MODULE-PRIVATE, UNGATED. The caller's kept stages of one session, given the first stages()
+ * answer (non-empty): GetObject through readBufferedStage with a bounded decompress, then
+ * stages() again with the same observation. The recheck must list exactly the fetched set
+ * (same stages, unchanged); an empty recheck is erased; any other difference is "changed"
+ * (hidden, never a partial session). An S3 404 re-asks stages() once and refetches what is
+ * still listed. Byte bounds: BUFFERED_STAGE_MAX_BYTES per stage, BUFFERED_SESSION_MAX_BYTES per
+ * session, compressed (checked before any GetObject) and decompressed; over either throws
+ * BufferedTooLarge. Never export this: readOwnerBufferedTurns is the gated path.
  */
-async function readStagesUngated(deps: OwnerBufferedDeps, scope: BufferedScope, authority: AuthorityHead, source: string, sessionId: string): Promise<RawSessionRead> {
-  const first = await deps.reads.stages(scope, authority, source, sessionId);
-  if (first.length === 0) return null;
+async function readStagesUngated(
+  deps: OwnerBufferedDeps, scope: BufferedScope, authority: AuthorityHead, source: string, sessionId: string, first: BufferedStageRow[],
+): Promise<RawSessionRead> {
+  assertCompressedBounds(first);
   let refreshed: BufferedStageRow[] | undefined;
+  let decompressed = 0;
+  const fetchOne = async (row: BufferedStageRow) => {
+    const stage = await readBufferedStage(deps.store, specOf(row), (bytes) => {
+      const room = Math.min(BUFFERED_STAGE_MAX_BYTES, BUFFERED_SESSION_MAX_BYTES - decompressed);
+      if (room <= 0) throw new BufferedTooLarge();
+      const out = deps.decompress(bytes, room);
+      if (out.byteLength > room) throw new BufferedTooLarge();
+      decompressed += out.byteLength;
+      return out;
+    });
+    return { row, stage };
+  };
   const fetched: Array<{ row: BufferedStageRow; stage: Awaited<ReturnType<typeof readBufferedStage>> }> = [];
   for (const row of first) {
     try {
-      fetched.push({ row, stage: await readBufferedStage(deps.store, specOf(row), deps.decompress) });
+      fetched.push(await fetchOne(row));
     } catch (error) {
       if (!isObjectStoreError(error, "not_found")) throw error;
       refreshed ??= await deps.reads.stages(scope, authority, source, sessionId);
+      assertCompressedBounds(refreshed);
       const again = refreshed.find((r) => r.stage_key === row.stage_key);
       if (!again) continue;
       try {
-        fetched.push({ row: again, stage: await readBufferedStage(deps.store, specOf(again), deps.decompress) });
+        fetched.push(await fetchOne(again));
       } catch (retryError) {
         if (!isObjectStoreError(retryError, "not_found")) throw retryError;
       }
     }
   }
   const recheck = await deps.reads.stages(scope, authority, source, sessionId);
-  if (recheck.length === 0) return { erased: true, stages: [] };
+  if (recheck.length === 0) return { kind: "erased" };
+  if (recheck.length !== fetched.length || !fetched.every(({ row }) => recheck.some((r) => sameStage(r, row))) ||
+      !recheck.every((r) => fetched.some(({ row }) => sameStage(r, row)))) return { kind: "changed" };
   const stages: Array<{ row: BufferedStageRow; records: RelayhistoryStreamRecord[] }> = [];
   for (const { row, stage } of fetched) {
-    if (!recheck.some((r) => sameStage(r, row))) continue;
     const h = stage.header;
     if (h.org_id !== scope.orgId || h.workspace_id !== scope.workspaceId || h.user_id !== scope.userId) throw new TenantMismatchError();
     const records: RelayhistoryStreamRecord[] = [];
@@ -594,7 +663,17 @@ async function readStagesUngated(deps: OwnerBufferedDeps, scope: BufferedScope, 
     }
     stages.push({ row, records });
   }
-  return { erased: false, stages };
+  return { kind: "stages", stages };
+}
+
+/** Before any GetObject: each stage and the session's sum of compressed sizes within bounds. */
+function assertCompressedBounds(rows: BufferedStageRow[]): void {
+  let total = 0;
+  for (const r of rows) {
+    if (!Number.isSafeInteger(r.stage_bytes) || r.stage_bytes > BUFFERED_STAGE_MAX_BYTES) throw new BufferedTooLarge();
+    total += r.stage_bytes;
+  }
+  if (total > BUFFERED_SESSION_MAX_BYTES) throw new BufferedTooLarge();
 }
 
 /** The final observation: after every S3 read and RPC, before any byte; must equal the first. */
@@ -606,21 +685,38 @@ async function finalGate(deps: OwnerBufferedDeps, scope: BufferedScope, first: A
 
 export type OwnerBufferedTurns =
   | null /** not a visible buffered session of this caller: the route's existing answer */
+  /**
+   * The authority (or the RPC's own fence) refused before any buffered candidate was found:
+   * nothing is known about this session, so the route answers as without the flag (501).
+   */
+  | { unverifiedBeforeCandidate: string }
   | { erased: true; rows: [] }
   | { erased: false; rows: Record<string, unknown>[] };
 
 /**
  * GATED. The caller's buffered turn rows for one session, scrubbed: observe, stages, S3 fetch,
  * recheck, observe again (fenced unless identical), then every kept stage's admission against
- * the final head. One hidden stage hides the session (null). Revisions and tombstones across
- * stages fold through normalizeRelayhistoryRecords. Throws BufferedFenced or TenantMismatchError.
+ * the final head. A fence before the first stages() answer is `unverifiedBeforeCandidate`
+ * (the route's existing answer); a fence once a candidate exists throws BufferedFenced (503).
+ * No stage, a kept set that moved during the read, or one hidden stage: null. Over the byte
+ * bounds: BufferedTooLarge (the route answers as hidden). Revisions and tombstones across
+ * stages fold through normalizeRelayhistoryRecords. Throws TenantMismatchError on a foreign stage.
  */
 export async function readOwnerBufferedTurns(deps: OwnerBufferedDeps, scope: BufferedScope, source: string, sessionId: string): Promise<OwnerBufferedTurns> {
-  const first = await deps.gate.observe(scope);
-  const raw = await readStagesUngated(deps, scope, first, source, sessionId);
+  let first: AuthorityHead;
+  let initial: BufferedStageRow[];
+  try {
+    first = await deps.gate.observe(scope);
+    initial = await deps.reads.stages(scope, first, source, sessionId);
+  } catch (error) {
+    if (error instanceof BufferedFenced) return { unverifiedBeforeCandidate: error.reason };
+    throw error;
+  }
+  if (initial.length === 0) return null;
+  const raw = await readStagesUngated(deps, scope, first, source, sessionId, initial);
   const authority = await finalGate(deps, scope, first);
-  if (raw === null) return null;
-  if (raw.erased) return { erased: true, rows: [] };
+  if (raw.kind === "erased") return { erased: true, rows: [] };
+  if (raw.kind === "changed") return null;
   if (!raw.stages.every(({ row }) => admissionVisible(authority, row))) return null;
   const records = normalizeRelayhistoryRecords(raw.stages.flatMap((s) => s.records));
   return { erased: false, rows: bufferedTurnRows(scope, source, sessionId, records) };

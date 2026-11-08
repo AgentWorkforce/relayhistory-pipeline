@@ -39,7 +39,7 @@
  * are all unset in wrangler.jsonc.
  */
 import pg from "pg";
-import { decompress } from "fzstd";
+import { Decompress, decompress } from "fzstd";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
@@ -59,7 +59,7 @@ import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/des
 import { sqlLiveness, TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
 import { createS3Store } from "../../../src/shared/vendor.ts";
-import { ownerBufferedEnabled, serviceBindingControlHead, sqlOwnerBufferedReads, type OwnerBufferedDeps } from "../../../src/session-read-api/owner-buffered.ts";
+import { boundedStreamDecompress, ownerBufferedEnabled, serviceBindingControlHead, sqlOwnerBufferedReads, type OwnerBufferedDeps } from "../../../src/session-read-api/owner-buffered.ts";
 
 export interface Env extends CanonicalEnv {
   SUPABASE: Hyperdrive;
@@ -351,7 +351,7 @@ export function ownerBufferedDeps(env: Env, run: TenantRunner, fetcher: typeof f
     reads: sqlOwnerBufferedReads(run),
     gate: serviceBindingControlHead(env.HISTORY_CONTROL_HEAD),
     store: createS3Store({ bucket, region: env.INGEST_S3_REGION?.trim() || "us-east-1", credentials: { accessKeyId, secretAccessKey }, fetch: fetcher }),
-    decompress: (bytes) => decompress(bytes),
+    decompress: boundedStreamDecompress(Decompress) /* stops at the bound; fzstd's one-shot form with a fixed buffer silently truncates */,
   };
 }
 
