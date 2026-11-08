@@ -192,7 +192,6 @@ async function connect(
   name: "neonUrl" | "supabaseUrl",
   trust: "neon" | "supabase",
   app: string,
-  readOnly: boolean,
 ): Promise<pg.Client> {
   const client = pinnedPgClient(pg, url, name, trust, {
     application_name: app,
@@ -201,20 +200,37 @@ async function connect(
     idle_in_transaction_session_timeout: 15_000,
   });
   await client.connect();
-  if (readOnly) {
-    await client.query("SET default_transaction_read_only = on");
-    const row = (await client.query<{ ro: string }>("SELECT current_setting('default_transaction_read_only') AS ro")).rows[0];
-    if (row?.ro !== "on") throw new OwnerBufferedOperatorRefusal(`${name}_not_read_only`);
-  }
   return client;
 }
 
-async function requireParityTableOwner(client: pg.Client): Promise<void> {
-  const row = (await client.query<{ actor: string; owner: string }>(`
-    SELECT current_user AS actor,pg_get_userbyid(c.relowner) AS owner
+async function requireReadOnly(client: Queryable, name: "neonUrl" | "supabaseUrl"): Promise<void> {
+  await client.query("SET default_transaction_read_only = on");
+  const row = (await client.query<{ ro: string }>(
+    "SELECT current_setting('default_transaction_read_only') AS ro",
+  )).rows[0];
+  if (row?.ro !== "on") throw new OwnerBufferedOperatorRefusal(`${name}_not_read_only`);
+}
+
+/** Assume and verify the one reviewed Supabase owner route before any ledger access. */
+export async function assumeAndRequireParityTableOwner(client: Queryable): Promise<void> {
+  try {
+    await client.query("SET ROLE postgres");
+  } catch {
+    throw new OwnerBufferedOperatorRefusal("target_owner_set_role_refused");
+  }
+  let rows: Array<{ login: string; actor: string; owner: string }>;
+  try {
+    rows = (await client.query<{ login: string; actor: string; owner: string }>(`
+    SELECT session_user AS login,current_user AS actor,pg_get_userbyid(c.relowner) AS owner
       FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-     WHERE n.nspname='sessions' AND c.relname='owner_buffered_parity' AND c.relkind='r'`)).rows[0];
-  if (!row || row.actor !== row.owner) throw new OwnerBufferedOperatorRefusal("target_not_parity_table_owner");
+     WHERE n.nspname='sessions' AND c.relname='owner_buffered_parity' AND c.relkind='r'`)).rows;
+  } catch {
+    throw new OwnerBufferedOperatorRefusal("target_owner_identity_unverifiable");
+  }
+  const row = rows[0];
+  if (rows.length !== 1 || row?.login !== "cli_login_postgres" ||
+      row.actor !== "postgres" || row.owner !== "postgres" || row.actor !== row.owner)
+    throw new OwnerBufferedOperatorRefusal("target_owner_identity_refused");
 }
 
 function generationMatches(receipt: ParityCensusReceipt, expected: string): boolean {
@@ -389,18 +405,21 @@ async function main(): Promise<number> {
     pinnedPgConfig(neonUrl, "neonUrl", "neon");
     pinnedPgConfig(supabaseUrl, "supabaseUrl", "supabase");
 
-    const neon = await connect(neonUrl, "neonUrl", "neon", "owner-buffered-g1-neon-readonly", true);
+    const neon = await connect(neonUrl, "neonUrl", "neon", "owner-buffered-g1-neon-readonly");
     clients.push(neon);
+    await requireReadOnly(neon, "neonUrl");
     if (args.mode === "bulk") {
       const enumerator = await connect(
-        supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-enumerator", true,
+        supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-enumerator",
       );
       clients.push(enumerator);
+      await assumeAndRequireParityTableOwner(enumerator);
+      await requireReadOnly(enumerator, "supabaseUrl");
       const targetOwner = await connect(
-        supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-owner", false,
+        supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-owner",
       );
       clients.push(targetOwner);
-      await requireParityTableOwner(targetOwner);
+      await assumeAndRequireParityTableOwner(targetOwner);
       try {
         const counts = await runBulkParity(
           neon, enumerator, targetOwner, args.expectedTargetGeneration, args.batchSize,
@@ -424,9 +443,10 @@ async function main(): Promise<number> {
       "supabaseUrl",
       "supabase",
       args.mode === "census" ? "owner-buffered-g1-target-readonly" : "owner-buffered-g2-target-owner",
-      args.mode === "census",
     );
     clients.push(target);
+    await assumeAndRequireParityTableOwner(target);
+    if (args.mode === "census") await requireReadOnly(target, "supabaseUrl");
 
     const g1 = await readParityCensus(neon, target, tenant!);
     if (!g1.equal || !g1.proof) {
@@ -448,7 +468,6 @@ async function main(): Promise<number> {
       return 0;
     }
 
-    await requireParityTableOwner(target);
     // G2 performs its own fresh census and source recheck in the write transaction.
     const result = await writeCurrentParityProof(neon, target, tenant!, args.expectedTargetGeneration);
     if (!generationMatches(result.census, args.expectedTargetGeneration))
