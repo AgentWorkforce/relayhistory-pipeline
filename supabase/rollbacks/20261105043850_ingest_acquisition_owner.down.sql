@@ -14,7 +14,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105043850_ingest_acquisition_owner.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043850_ingest_acquisition_owner.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'e2101f9540531ae0e0afbe3c28dbd01cf19fd59e24c0f55e9f933d4b58880cba'
+ IF NOT FOUND OR v_sha<>'ef07dd8d94f965afdeb8ff6059daeff79913c5f564de8e4a173c070514a00d63'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: own applied checksum required';END IF;
  LOCK TABLE sessions.ingest_acquisition_switch,sessions.ingest_acquisition_hooks_switch,
   sessions.ingest_acquisition_enrollment_gate,sessions.ingest_acquisition_enrollment,
@@ -899,6 +899,6 @@ ALTER TABLE sessions.ingest_publication_heads DROP COLUMN acquisition_epoch;
 ALTER TABLE sessions.ingest_claim_attempts DROP COLUMN acquisition;
 -- The schema USAGE this migration granted the control role goes with it (the role itself is kept).
 REVOKE USAGE ON SCHEMA sessions FROM bulls96_acquisition_installer;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043850_ingest_acquisition_owner.sql' AND sha256='e2101f9540531ae0e0afbe3c28dbd01cf19fd59e24c0f55e9f933d4b58880cba';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043850_ingest_acquisition_owner.sql' AND sha256='ef07dd8d94f965afdeb8ff6059daeff79913c5f564de8e4a173c070514a00d63';
 -- The NOLOGIN role bulls96_acquisition_installer is KEPT, as every lane keeps its cluster roles (033000).
 COMMIT;

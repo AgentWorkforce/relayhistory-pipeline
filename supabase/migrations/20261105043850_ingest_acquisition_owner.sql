@@ -46,14 +46,27 @@ END $acquisition_creator$;
 -- The control role (supabase/bootstrap/session_ingest_roles.sql, NOLOGIN; LOGIN only by the operator step
 -- acquisition_installer_role.sql, which may run before or after this migration). Fail closed if the bootstrap has
 -- not provisioned it (42704) or it exists elevated or as a member of another role (55000).
+-- Both membership directions are refused before any grant: another login that is a member OF the installer
+-- could SET ROLE to it and call the SECURITY DEFINER RPCs directly (sessions.ingest_require_role accepts the
+-- SET ROLE identity). The only tolerated member is Supabase's PG16+ creator edge (postgres, granted by superuser
+-- supabase_admin, ADMIN TRUE, INHERIT FALSE, SET FALSE: acquisition_installer_verify.sql's predicate). This file
+-- has no mode notion, so that exact edge shape is accepted in any mode, as in 20261104022000's role check; it is
+-- safe because SET FALSE/INHERIT FALSE give the member neither SET ROLE nor the grants. Before PG16 every member is refused.
 DO $acquisition_role$
-DECLARE r pg_roles%ROWTYPE;
+DECLARE r pg_roles%ROWTYPE; m record;
 BEGIN
  SELECT * INTO r FROM pg_roles WHERE rolname='bulls96_acquisition_installer';
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='42704',MESSAGE='acquisition: role bulls96_acquisition_installer absent; run the role bootstrap first';END IF;
  IF r.rolsuper OR r.rolbypassrls OR r.rolinherit OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication
   OR EXISTS(SELECT 1 FROM pg_auth_members WHERE member=r.oid) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: role bulls96_acquisition_installer exists elevated or is a member';END IF;
+ IF current_setting('server_version_num')::int>=160000 THEN
+  FOR m IN EXECUTE 'SELECT u.rolname,g.rolname AS grantor,g.rolsuper AS grantor_super,a.admin_option,a.inherit_option,a.set_option FROM pg_auth_members a JOIN pg_roles u ON u.oid=a.member JOIN pg_roles g ON g.oid=a.grantor WHERE a.roleid=$1' USING r.oid LOOP
+   IF m.rolname='postgres' AND m.grantor='supabase_admin' AND m.grantor_super AND m.admin_option AND NOT m.inherit_option AND NOT m.set_option THEN NULL;
+   ELSE RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: role bulls96_acquisition_installer has an unexpected member';END IF;
+  END LOOP;
+ ELSIF EXISTS(SELECT 1 FROM pg_auth_members WHERE roleid=r.oid) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='acquisition: role bulls96_acquisition_installer has an unexpected member';END IF;
 END $acquisition_role$;
 
 -- §3 data model, verbatim from the design.

@@ -724,3 +724,54 @@ describe.skipIf(!url)("enrolled source through the actual hooks (edge 409 refusa
   expect((await f.pool.query("SELECT count(*)::int n FROM sessions.session_index WHERE harness='kiro'")).rows[0].n).toBe(0);
  },30000);
 });
+
+// dogpatch P1: a login that is a member OF the installer can SET ROLE to it and call the SECURITY DEFINER RPCs directly
+// (sessions.ingest_require_role accepts the SET ROLE identity). The attacker is a real, separate LOGIN connection (never
+// SET ROLE from a superuser session, whose permission checks would use session_user and witness nothing). Roles are
+// cluster-wide, so the attacker is dropped before the block ends.
+describe.skipIf(!url)("inbound installer membership is refused by the role bootstrap and the 043850 admission block",()=>{
+ const ATTACKER="acq_attacker_"+uuid().replaceAll("-","").slice(0,12);
+ const drop=async()=>{await admin?.query("DROP ROLE IF EXISTS "+ATTACKER);};
+ afterAll(drop);
+ const connectAs=async(d:Db)=>{const u=new URL(url!);u.username=ATTACKER;u.pathname="/"+d.name;const c=new pg.Client({connectionString:u.href});await c.connect();return c;};
+ const members=async(pool:pg.Pool)=>(await pool.query(`SELECT pg_get_userbyid(member)::text m FROM pg_auth_members WHERE roleid=$1::regrole ORDER BY 1`,[INSTALLER])).rows.map(r=>r.m);
+ const installerGrants=async(pool:pg.Pool)=>(await pool.query(`SELECT count(*)::int n FROM pg_proc p,aclexplode(p.proacl) a WHERE a.grantee=$1::regrole AND a.privilege_type='EXECUTE'`,[INSTALLER])).rows[0].n;
+
+ test("an attacker LOGIN granted the installer can SET ROLE to it (the pre-fix catalog shape); the bootstrap then refuses 55000",async()=>{
+  const d=await database("acq_inbound_boot");
+  expect(await members(d.pool)).toEqual([]);
+  await admin!.query(`CREATE ROLE ${ATTACKER} LOGIN;GRANT ${INSTALLER} TO ${ATTACKER}`);
+  try{
+   expect(await members(d.pool)).toEqual([ATTACKER]);
+   // The witness: from its own login, the attacker becomes the installer and reaches an installer-only RPC.
+   const c=await connectAs(d);
+   try{
+    expect((await c.query("SELECT session_user::text s,current_user::text u")).rows[0]).toEqual({s:ATTACKER,u:ATTACKER});
+    await expect(c.query("SELECT sessions.ingest_acquisition_status('{}'::jsonb)")).rejects.toMatchObject({code:"42501"});
+    await c.query("SET ROLE "+INSTALLER);
+    expect((await c.query("SELECT current_user::text u")).rows[0].u).toBe(INSTALLER);
+    expect((await c.query("SELECT has_function_privilege(current_user,'sessions.ingest_acquisition_revoke(jsonb)','EXECUTE') x")).rows[0].x).toBe(true);
+    await c.query("SELECT sessions.ingest_acquisition_status($1::jsonb)",[JSON.stringify({orgId:"org_test",workspaceId:"ws_test",source:"droid",sessionIds:["x"]})]);
+   }finally{await c.end();}
+   // The fix: that catalog shape fails the role bootstrap, and nothing is changed.
+   await expect(d.pool.query(read("supabase/bootstrap/session_ingest_roles.sql")))
+    .rejects.toMatchObject({code:"55000",message:`bootstrap ${INSTALLER}: the role has an unexpected member ${ATTACKER}`});
+   expect(await members(d.pool)).toEqual([ATTACKER]);
+  }finally{await drop();}
+  expect(await members(d.pool)).toEqual([]);
+  await d.pool.query(read("supabase/bootstrap/session_ingest_roles.sql"));
+ },180000);
+
+ test("the same membership when 043850 runs: the admission block refuses 55000 before any RPC grant or table",async()=>{
+  const d=await database("acq_inbound_mig",false);
+  expect(await installerGrants(d.pool)).toBe(0);
+  await admin!.query(`CREATE ROLE ${ATTACKER} LOGIN;GRANT ${INSTALLER} TO ${ATTACKER}`);
+  try{
+   expect(await members(d.pool)).toEqual([ATTACKER]);
+   await expect(d.pool.query(read("supabase/migrations/"+MIGRATION)))
+    .rejects.toMatchObject({code:"55000",message:`acquisition: role ${INSTALLER} has an unexpected member`});
+   expect(await installerGrants(d.pool)).toBe(0);
+   expect((await d.pool.query("SELECT to_regclass('sessions.ingest_acquisition_owners')::text r")).rows[0].r).toBeNull();
+  }finally{await drop();}
+ },180000);
+});

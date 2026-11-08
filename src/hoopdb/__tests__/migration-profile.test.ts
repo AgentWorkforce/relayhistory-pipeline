@@ -1370,6 +1370,86 @@ describe("per-step catalog sentinels", () => {
       expect(error?.message).toContain(`(${name})`);
       expect(await snapshot(hidden)).toEqual(before);
     });
+
+  // dogpatch P1: a login that is a member OF bulls96_acquisition_installer could SET ROLE to it and call the
+  // SECURITY DEFINER acquisition RPCs directly. Both the role bootstrap and the 043850 admission block refuse
+  // any inbound member except Supabase's PG16+ creator edge (postgres, granted by superuser supabase_admin,
+  // ADMIN TRUE, INHERIT FALSE, SET FALSE). PGlite is PostgreSQL 16+, so the edge itself is exercised here.
+  const ACQ = "upstream:20261105043850_ingest_acquisition_owner.sql";
+  const INSTALLER = "bulls96_acquisition_installer";
+  // PGlite's bootstrap superuser is postgres, and PG16+ records every superuser grant as made by the bootstrap
+  // superuser, so the Supabase catalog shape (grantor supabase_admin, Supabase's bootstrap superuser) is forged
+  // by a superuser catalog UPDATE of the grantor. Test fixture only.
+  const creatorEdge = (opts: string, grantorSuper = true) =>
+    `CREATE ROLE supabase_admin SUPERUSER NOLOGIN; SET ROLE supabase_admin; GRANT ${INSTALLER} TO postgres WITH ${opts}; RESET ROLE;
+     UPDATE pg_auth_members SET grantor = 'supabase_admin'::regrole WHERE roleid = '${INSTALLER}'::regrole AND member = 'postgres'::regrole;` +
+    (grantorSuper ? "" : " ALTER ROLE supabase_admin NOSUPERUSER;");
+  const SUPABASE_EDGE = creatorEdge("ADMIN TRUE, INHERIT FALSE, SET FALSE");
+  const INBOUND: [string, string][] = [
+    ["a LOGIN member", `CREATE ROLE g6_attacker LOGIN; GRANT ${INSTALLER} TO g6_attacker`],
+    ["a NOLOGIN member", `CREATE ROLE g6_attacker NOLOGIN; GRANT ${INSTALLER} TO g6_attacker WITH INHERIT FALSE, SET TRUE`],
+    ["the creator-edge shape with SET TRUE", creatorEdge("ADMIN TRUE, INHERIT FALSE, SET TRUE")],
+    ["the creator-edge shape with INHERIT TRUE", creatorEdge("ADMIN TRUE, INHERIT TRUE, SET FALSE")],
+    ["the creator-edge shape without ADMIN", creatorEdge("ADMIN FALSE, INHERIT FALSE, SET FALSE")],
+    ["the creator-edge shape granted by a non-superuser supabase_admin", creatorEdge("ADMIN TRUE, INHERIT FALSE, SET FALSE", false)],
+    ["the creator edge plus a LOGIN member", `${SUPABASE_EDGE} CREATE ROLE g6_attacker LOGIN; GRANT ${INSTALLER} TO g6_attacker`],
+  ];
+  const acquisitionPrefix = async () => {
+    const steps = (await plan(LOCAL)).filter(
+      (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+    );
+    const i = steps.findIndex((st) => st.name === ACQ);
+    expect(i).toBeGreaterThan(0);
+    return { db: await prefix(i - 1, i), path: steps[i]!.path };
+  };
+  const applyAcquisition = async (db: PGlite, path: string) => {
+    await db.exec("BEGIN");
+    try { await db.exec(readFileSync(path, "utf8")); await db.exec("COMMIT"); }
+    catch (error) { await db.exec("ROLLBACK"); throw error; }
+  };
+  const installerGrants = async (db: PGlite) =>
+    (await db.query<{ n: number }>(
+      "SELECT count(*)::int n FROM pg_proc p, aclexplode(p.proacl) a WHERE a.grantee = $1::regrole AND a.privilege_type = 'EXECUTE'",
+      [INSTALLER],
+    )).rows[0]!.n;
+  const BOOTSTRAP = join(root, "supabase/bootstrap/session_ingest_roles.sql");
+
+  for (const [label, sql] of INBOUND) {
+    test(`installer inbound membership (${label}): the role bootstrap refuses 55000`, async () => {
+      const { db } = await acquisitionPrefix();
+      await db.exec(sql);
+      const error = await failure(db.exec(readFileSync(BOOTSTRAP, "utf8")));
+      expect(error?.code).toBe("55000");
+      expect(error?.message).toContain(`bootstrap ${INSTALLER}: the role has an unexpected member`);
+    });
+
+    test(`installer inbound membership (${label}): the 043850 admission block refuses 55000 before any RPC grant`, async () => {
+      const { db, path } = await acquisitionPrefix();
+      await db.exec(sql);
+      const error = await failure(applyAcquisition(db, path));
+      expect(error?.code).toBe("55000");
+      expect(error?.message).toBe(`acquisition: role ${INSTALLER} has an unexpected member`);
+      expect(await installerGrants(db)).toBe(0);
+      expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.ingest_acquisition_owners')::text r")).rows[0]!.r).toBeNull();
+    });
+  }
+
+  test("installer inbound membership: the exact Supabase PG16+ creator edge is accepted by the bootstrap and the 043850 admission block", async () => {
+    const { db, path } = await acquisitionPrefix();
+    await db.exec(SUPABASE_EDGE);
+    expect(await failure(db.exec(readFileSync(BOOTSTRAP, "utf8")))).toBeNull();
+    expect(await failure(applyAcquisition(db, path))).toBeNull();
+    expect(await installerGrants(db)).toBe(4);
+  });
+
+  test("installer inbound membership: with no member, the bootstrap and the 043850 admission block pass; adding a member afterwards makes the bootstrap refuse", async () => {
+    const { db, path } = await acquisitionPrefix();
+    expect(await failure(db.exec(readFileSync(BOOTSTRAP, "utf8")))).toBeNull();
+    expect(await failure(applyAcquisition(db, path))).toBeNull();
+    expect(await installerGrants(db)).toBe(4);
+    await db.exec(INBOUND[0]![1]);
+    expect((await failure(db.exec(readFileSync(BOOTSTRAP, "utf8"))))?.code).toBe("55000");
+  });
 });
 
 test("the runbook's sentinel table documents every schema step", async () => {
