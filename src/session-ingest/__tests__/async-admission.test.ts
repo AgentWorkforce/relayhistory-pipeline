@@ -7,11 +7,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { zstdDecompressSync } from "node:zlib";
 import { objectKey, readAll } from "../../shared/vendor.ts";
-import { createIngestApp, SYNC_SCOPE } from "../app.ts";
+import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
 import { admitMessage, backoffSeconds } from "../admission-consumer.ts";
 import {
-  ADMISSION_ACCEPT_HEADER, ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, assertNoLaterPrivacyControl, asyncAdmissionMode, decodeInbox, encodeInbox,
-  enqueueAdmission, inboxKey, journalKey, raisePrivacyWatermark, type AdmissionMessage,
+  ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, PENDING_TTL_MS, abortPrivacyControl, assertNoLaterPrivacyControl, asyncAdmissionMode, beginPrivacyControl,
+  completePrivacyControl, decodeInbox, encodeInbox, enqueueAdmission, inboxKey, journalKey, witnessPrivacyJournal, type AdmissionMessage,
 } from "../async-admission.ts";
 import { LedgerUnavailableError, type Ledger } from "../ledger.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
@@ -58,8 +58,9 @@ describe("INGEST_ASYNC_ADMISSION", () => {
 
 describe("request path", () => {
   const app = (s = store(), enqueue: (m: AdmissionMessage) => Promise<void> = async () => {}, ledger: Ledger = new MemoryLedger()) =>
-    createIngestApp({ identify: () => identity, log: () => {}, deliver: { ledger, acceptanceMode: "buffered", target: { store: s, keyRoot: "96bulls" } }, asyncAdmission: { mode: "on", enqueue, nowMs: () => T0 } });
-  const post = async (a: ReturnType<typeof app>, b: unknown, headers: Record<string, string> = { [ADMISSION_ACCEPT_HEADER]: ADMISSION_ACCEPT_VALUE }) =>
+    createIngestApp({ identify: (req) => bindingIdentity(req), log: () => {}, deliver: { ledger, acceptanceMode: "buffered", target: { store: s, keyRoot: "96bulls" } }, asyncAdmission: { mode: "on", enqueue, nowMs: () => T0 } });
+  const optIn = { [IDENTITY_HEADER]: encodeIdentity({ ...identity, admission: ADMISSION_ACCEPT_VALUE }) };
+  const post = async (a: ReturnType<typeof app>, b: unknown, headers: Record<string, string> = optIn) =>
     a.request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify({ protocolVersion: 1, batch: b }) });
 
   test("the receipt body is byte-identical to the synchronous receipt (Desktop compatibility)", async () => {
@@ -92,9 +93,27 @@ describe("request path", () => {
 
   test("a private custody envelope never takes the async path", async () => {
     const sent: AdmissionMessage[] = [];
-    const res = await post(app(store(), async (m) => { sent.push(m); }), await batch([record({ record_id: "r1" })]), { [ADMISSION_ACCEPT_HEADER]: ADMISSION_ACCEPT_VALUE, "content-type": CURRENT_CUSTODY_CONTENT_TYPE });
+    const res = await post(app(store(), async (m) => { sent.push(m); }), await batch([record({ record_id: "r1" })]), { ...optIn, "content-type": CURRENT_CUSTODY_CONTENT_TYPE });
     expect(res.status).not.toBe(200);
     expect(sent).toHaveLength(0);
+  });
+
+  test("the opt-in outside the signed identity (a loose header) is ignored: synchronous path", async () => {
+    const sent: AdmissionMessage[] = [];
+    const ledger = new MemoryLedger();
+    await post(app(store(), async (m) => { sent.push(m); }, ledger), await batch([record({ record_id: "r1" })]), { [IDENTITY_HEADER]: encodeIdentity(identity), "x-relay-ingest-admission": ADMISSION_ACCEPT_VALUE });
+    expect(sent).toHaveLength(0);
+    expect(ledger.claims).toHaveLength(1);
+  });
+
+  test("a journal witness failure falls back to the synchronous path, never a refusal", async () => {
+    const s = store();
+    const broken = { ...s, getObject: async () => { throw Object.assign(new Error("s3 down"), { code: "transient" }); } } as typeof s;
+    const sent: AdmissionMessage[] = [];
+    const ledger = new MemoryLedger();
+    await post(app(broken, async (m) => { sent.push(m); }, ledger), await batch([record({ record_id: "r1" })]));
+    expect(sent).toHaveLength(0);
+    expect(ledger.claims).toHaveLength(1);
   });
 
   test("a journal failure refuses the reset (fail closed) before the ledger sees it", async () => {
@@ -105,7 +124,7 @@ describe("request path", () => {
     const broken = { ...s, getObject: async () => { throw Object.assign(new Error("s3 down"), { code: "transient" }); } } as typeof s;
     const a = app(broken, async () => {}, ledger);
     const { deliveryAccount } = await import("../vendor/delivery/prepare.ts");
-    const res = await a.request("/v1/delivery/sessions/reset", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ account_id: await deliveryAccount(TENANT), request_id: "r", confirmation: "DELETE ALL SESSIONS" }) });
+    const res = await a.request("/v1/delivery/sessions/reset", { method: "POST", headers: { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity(identity) }, body: JSON.stringify({ account_id: await deliveryAccount(TENANT), request_id: "r", confirmation: "DELETE ALL SESSIONS" }) });
     expect(res.status).toBe(503);
     expect(resets).toBe(0);
   });
@@ -116,7 +135,7 @@ describe("inbox object", () => {
     const s = store();
     const b = await batch([record({ record_id: "r1", payload: { text: "export AWS_SECRET_ACCESS_KEY=abcdEFGHijklMNOPqrstUVWXyz0123456789abcd", ts_ms: 1_761_955_200_000 } })]);
     const prepared = await prepareDelivery(TENANT, b);
-    const key = await enqueueAdmission({ store: s, keyRoot: "96bulls", enqueue: async () => {}, nonce: () => "0123456789abcdef" }, TENANT, prepared, T0);
+    const key = await enqueueAdmission({ store: s, keyRoot: "96bulls", enqueue: async () => {}, nonce: () => "0123456789abcdef" }, TENANT, prepared, T0, 3);
     expect(key).toBe(inboxKey("96bulls", TENANT, "origin-1", prepared.receipt.receiptId, T0, "0123456789abcdef"));
     expect(key.startsWith("96bulls/.admission-inbox/org-a/v1/ws=ws-a/m=srv_")).toBe(true);
     const raw = await text(s, key);
@@ -125,6 +144,7 @@ describe("inbox object", () => {
     const decoded = await decodeInbox("96bulls", key, bytes);
     expect(decoded?.tenant).toEqual(TENANT);
     expect(decoded?.receivedAtMs).toBe(T0);
+    expect(decoded?.journalSeq).toBe(3);
     expect(decoded?.prepared.records.map((r) => [r.record_id, r.digest])).toEqual(prepared.records.map((r) => [r.record_id, r.digest]));
     // Another user's key for the same bytes, a changed upload time, or another batch's header: refused.
     await expect(decodeInbox("96bulls", inboxKey("96bulls", { ...TENANT, userId: "user-2" }, "origin-1", prepared.receipt.receiptId, T0, "0123456789abcdef"), bytes)).rejects.toThrow();
@@ -141,7 +161,7 @@ describe("inbox object", () => {
     expect(new TextDecoder().decode(scrubRecords(new TextEncoder().encode(JSON.stringify({ record_id: id }) + "\n")).scrubbed)).not.toContain(id);
     const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: id })]));
     const key = inboxKey("96bulls", TENANT, "origin-1", prepared.receipt.receiptId, T0, "0123456789abcdef");
-    const decoded = await decodeInbox("96bulls", key, zstd(encodeInbox(TENANT, prepared, T0)));
+    const decoded = await decodeInbox("96bulls", key, zstd(encodeInbox(TENANT, prepared, T0, 0)));
     expect(decoded?.prepared.records.map((r) => [r.record_id, r.revision_id, r.revision, r.digest, r.source, r.session_id, r.kind, r.operation]))
       .toEqual(prepared.records.map((r) => [r.record_id, r.revision_id, r.revision, r.digest, r.source, r.session_id, r.kind, r.operation]));
   });
@@ -158,28 +178,74 @@ describe("inbox object", () => {
     const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: "t1", kind: "trajectory" as never })]));
     expect(prepared.records).toHaveLength(0);
     const key = inboxKey("96bulls", TENANT, "origin-1", prepared.receipt.receiptId, T0, "0123456789abcdef");
-    expect((await decodeInbox("96bulls", key, zstd(encodeInbox(TENANT, prepared, T0))))?.prepared.records).toHaveLength(0);
+    expect((await decodeInbox("96bulls", key, zstd(encodeInbox(TENANT, prepared, T0, 0))))?.prepared.records).toHaveLength(0);
   });
 });
 
 describe("privacy journal", () => {
-  test("is a monotonic max under concurrent raises, and refuses exactly the uploads that started before it", async () => {
+  const j = async (s: ReturnType<typeof store>) => JSON.parse(new TextDecoder().decode(await readAll((await s.getObject(objectKey(journalKey("96bulls", TENANT)))).body)));
+  const reset = (requestId: string) => ({ kind: "reset" as const, requestId });
+
+  test("seq advances only on completion; replays and aborts change nothing; per user", async () => {
     const s = store();
-    await Promise.all([5, 3, 9, 1, 7].map((n) => raisePrivacyWatermark(s, "96bulls", TENANT, T0 + n)));
-    const j = JSON.parse(new TextDecoder().decode(await readAll((await s.getObject(objectKey(journalKey("96bulls", TENANT)))).body)));
-    expect(j).toEqual({ v: 1, watermarkMs: T0 + 9 });
-    await raisePrivacyWatermark(s, "96bulls", TENANT, T0 + 2);
-    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, T0 + 9)).rejects.toMatchObject({ code: "delivery_privacy_superseded" });
-    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, T0 + 10)).resolves.toBeUndefined();
-    // Per user: another user of the same workspace is unaffected.
-    await expect(assertNoLaterPrivacyControl(s, "96bulls", { ...TENANT, userId: "user-2" }, T0)).resolves.toBeUndefined();
+    expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(0);
+    expect(await beginPrivacyControl(s, "96bulls", TENANT, reset("a"), T0)).toBe("new");
+    expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(0);
+    expect(await beginPrivacyControl(s, "96bulls", TENANT, reset("a"), T0 + 1)).toBe("unfinished");
+    await completePrivacyControl(s, "96bulls", TENANT, reset("a"));
+    expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(1);
+    // The same request id again: SQL replays it, the journal does not move.
+    expect(await beginPrivacyControl(s, "96bulls", TENANT, reset("a"), T0 + 2)).toBe("done");
+    await completePrivacyControl(s, "96bulls", TENANT, reset("a"));
+    expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(1);
+    // A definite refusal: pending dropped, seq unchanged.
+    expect(await beginPrivacyControl(s, "96bulls", TENANT, reset("b"), T0)).toBe("new");
+    await abortPrivacyControl(s, "96bulls", TENANT, reset("b"));
+    expect((await j(s)).pending).toEqual([]);
+    expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(1);
+    expect(await witnessPrivacyJournal(s, "96bulls", { ...TENANT, userId: "user-2" })).toBe(0);
+  });
+
+  test("ordered controls: a version at or below the completed maximum is a replay (or stale), never an advance", async () => {
+    const s = store();
+    const o = (version: string) => ({ kind: "ordered" as const, epoch: "e".repeat(64), version });
+    expect(await beginPrivacyControl(s, "96bulls", TENANT, o("5"), T0)).toBe("new");
+    await completePrivacyControl(s, "96bulls", TENANT, o("5"));
+    for (const v of ["5", "4"]) expect(await beginPrivacyControl(s, "96bulls", TENANT, o(v), T0)).toBe("done");
+    expect(await beginPrivacyControl(s, "96bulls", TENANT, o("6"), T0)).toBe("new");
+    await completePrivacyControl(s, "96bulls", TENANT, o("6"));
+    expect(await witnessPrivacyJournal(s, "96bulls", TENANT)).toBe(2);
+  });
+
+  test("concurrent completions each count (CAS), and the gate refuses exactly witnesses taken before them", async () => {
+    const s = store();
+    for (const id of ["1", "2", "3", "4", "5"]) await beginPrivacyControl(s, "96bulls", TENANT, reset(id), T0);
+    await Promise.all(["1", "2", "3", "4", "5"].map((id) => completePrivacyControl(s, "96bulls", TENANT, reset(id))));
+    expect((await j(s)).seq).toBe(5);
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 4, T0)).rejects.toMatchObject({ code: "delivery_privacy_superseded" });
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 5, T0)).resolves.toBeUndefined();
+  });
+
+  test("the gate waits on a fresh pending control and completes a stale one conservatively", async () => {
+    const s = store();
+    await beginPrivacyControl(s, "96bulls", TENANT, reset("x"), T0);
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 0, T0 + 1000)).rejects.toMatchObject({ code: "privacy_control_pending" });
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 0, T0 + PENDING_TTL_MS + 1)).rejects.toMatchObject({ code: "delivery_privacy_superseded" });
+    expect((await j(s))).toMatchObject({ seq: 1, pending: [] });
+  });
+
+  test("an unreadable journal fails closed (never read as seq 0)", async () => {
+    const s = store();
+    await s.put(objectKey(journalKey("96bulls", TENANT)), new TextEncoder().encode("{}"), { contentType: "application/json" });
+    await expect(witnessPrivacyJournal(s, "96bulls", TENANT)).rejects.toThrow("privacy_journal_invalid");
+    await expect(assertNoLaterPrivacyControl(s, "96bulls", TENANT, 0, T0)).rejects.toThrow("privacy_journal_invalid");
   });
 });
 
 describe("consumer", () => {
   async function queued(s = store(), b?: Awaited<ReturnType<typeof batch>>) {
     const prepared = await prepareDelivery(TENANT, b ?? await batch([record({ record_id: "r1" })]));
-    const key = await enqueueAdmission({ store: s, keyRoot: "96bulls", enqueue: async () => {} }, TENANT, prepared, T0);
+    const key = await enqueueAdmission({ store: s, keyRoot: "96bulls", enqueue: async () => {} }, TENANT, prepared, T0, 0);
     return { s, prepared, message: { v: 1, kind: "ingest-admission", key } as AdmissionMessage };
   }
   const deps = (s: ReturnType<typeof store>, ledger: Ledger, custodySource: "relayhistory" | "frozen-supabase" = "relayhistory") =>
@@ -236,11 +302,12 @@ describe("consumer", () => {
     expect(ledger.claims).toHaveLength(0);
   });
 
-  test("an inbox past the admission window is refused, not admitted", async () => {
+  test("a pending privacy control is a retry with a short delay, never a refusal or an admission", async () => {
     const q = await queued();
     const ledger = new MemoryLedger();
-    expect(await admitMessage({ ...deps(q.s, ledger), nowMs: () => T0 + 7 * 24 * 3600 * 1000 }, q.message, 1)).toMatchObject({ action: "ack", outcome: "refused", code: "admission_expired" });
-    expect(ledger.claims).toHaveLength(0);
+    await beginPrivacyControl(q.s, "96bulls", TENANT, { kind: "reset", requestId: "p" }, T0 + 5000);
+    ledger.prepareBufferStage = async () => { throw new Error("must not be reached"); };
+    expect(await admitMessage(deps(q.s, ledger), q.message, 1)).toMatchObject({ action: "retry", code: "privacy_control_pending", delaySeconds: 15 });
   });
 });
 
@@ -249,7 +316,7 @@ describe("Worker queue dispatch", () => {
     const { admitQueueBatch } = await import("../worker.ts");
     const s = store();
     const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: "r1" })]));
-    const key = await enqueueAdmission({ store: s, keyRoot: "96bulls", enqueue: async () => {} }, TENANT, prepared, Date.now());
+    const key = await enqueueAdmission({ store: s, keyRoot: "96bulls", enqueue: async () => {} }, TENANT, prepared, Date.now(), 0);
     const results: string[] = [];
     const msg = (body: unknown) => ({ body, attempts: 1, ack: () => results.push("ack"), retry: (o?: { delaySeconds?: number }) => results.push(`retry:${o?.delaySeconds}`) });
     const settings = { bucket: "b", region: "us-east-1", keyRoot: "96bulls", kmsKeyArn: "a", accessKeyId: "k", secretAccessKey: "s", signingKey: "x", maxPerUser: 4, maxPerOrg: 32, inlineMaxSessions: 0, replicaMode: "off" as const, acceptanceMode: "buffered" as const, expectedGeneration: "a".repeat(64), asyncAdmission: "on" as const };

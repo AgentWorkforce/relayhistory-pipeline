@@ -38,7 +38,7 @@ import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { assertWithinBudget, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
 import { assertTenantSegment } from "./writer.ts";
-import { ADMISSION_ACCEPT_HEADER, ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_QUEUED, admissionStatus, enqueueAdmission, raisePrivacyWatermark, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
+import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, completePrivacyControl, enqueueAdmission, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode, type PrivacyControlId } from "./async-admission.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
@@ -47,7 +47,8 @@ import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protoc
 import { parseTurnBatch } from "./turns.ts";
 import { heartbeatProgress, ProgressError, readConnection, recordHeartbeat, type Run as OnboardingRun } from "../history-db/onboarding.ts";
 
-export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl};
+/** `admission`: relayhistory's SIGNED opt-in to the queued ACK (async-admission.ts); absent: synchronous. */
+export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl;admission?:typeof ADMISSION_ACCEPT_VALUE};
 
 export const SYNC_SCOPE = "rth:sync";
 export type ContentEncoding = "zstd" | "gzip";
@@ -106,7 +107,9 @@ export function bindingIdentity(request: Request): IngestIdentity {
     throw new AuthError(401, "invalid_token", "invalid or expired token");
   let control:OrderedControl|undefined;
   if("control" in v){try{control=orderedControl(v.control)}catch{throw new AuthError(401,"invalid_token","invalid or expired token")}}
-  return { userId: v.userId!, orgId: v.orgId!, workspaceId: v.workspaceId, scopes: v.scopes,...(control?{control}:{}) };
+  // The async opt-in travels inside the signed identity, never as a loose header.
+  if("admission" in v&&v.admission!==ADMISSION_ACCEPT_VALUE)throw new AuthError(401,"invalid_token","invalid or expired token");
+  return { userId: v.userId!, orgId: v.orgId!, workspaceId: v.workspaceId, scopes: v.scopes,...(control?{control}:{}),...(v.admission?{admission:v.admission}:{}) };
 }
 
 export function encodeIdentity(identity: IngestIdentity): string {
@@ -146,7 +149,7 @@ export interface IngestAppDeps {
   asyncAdmission?: { mode: AsyncAdmissionMode; enqueue: (message: AdmissionMessage) => Promise<void>; nowMs?: () => number };
 }
 
-type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined } };
+type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined; journalWitness: { tenant: string; seq: number } | undefined } };
 
 /** Node 24 always has zstd; published most preferred first, as relayhistory. */
 export function contentEncodings(): ContentEncoding[] {
@@ -339,14 +342,35 @@ export function createIngestApp(deps: IngestAppDeps) {
   const asyncMode: AsyncAdmissionMode = deps.asyncAdmission?.mode ?? "off";
   if (asyncMode !== "off" && deps.deliver.acceptanceMode !== "buffered") throw new Error("session ingest: async admission requires buffered acceptance");
   const nowMs = deps.asyncAdmission?.nowMs ?? Date.now;
-  /** Before a reset or a re-enable reaches SQL (async-admission.ts privacy journal). Fail closed: no journal, no control. */
-  const raiseJournal = async (tenant: { orgId: string; workspaceId: string; userId: string }) => {
-    if (asyncMode === "off") return;
+  /**
+   * A reset or re-enable, bracketed by the privacy journal (async-admission.ts) while async admission
+   * may have uploads in flight (on / drain): pending BEFORE the SQL (fail closed: no journal, no
+   * control), completed (seq + 1) after it applied, aborted when it definitely did not. A replay of a
+   * control the journal already completed changes nothing. `applied` reads the SQL answer.
+   */
+  const journaled = async <T>(tenant: { orgId: string; workspaceId: string; userId: string }, id: PrivacyControlId, run: () => Promise<T>, applied: (r: T) => boolean = () => true): Promise<T> => {
+    if (asyncMode === "off") return run();
+    const { store, keyRoot } = deps.deliver.target;
+    let begun;
+    try { begun = await beginPrivacyControl(store, keyRoot, tenant, id, nowMs()); } catch { throw new IngestUnavailable("privacy_journal", "privacy_journal_unavailable"); }
+    let result: T;
     try {
-      await raisePrivacyWatermark(deps.deliver.target.store, deps.deliver.target.keyRoot, tenant, nowMs());
-    } catch {
-      throw new IngestUnavailable("privacy_journal", "privacy_journal_unavailable");
+      result = await run();
+    } catch (error) {
+      // A typed refusal (4xx) never applied; anything else may have: leave it pending (TTL, then conservative).
+      if (begun === "new" && error instanceof DeliveryError && error.status < 500) await abortPrivacyControl(store, keyRoot, tenant, id).catch(() => {});
+      throw error;
     }
+    if (begun !== "done") {
+      try {
+        if (applied(result)) await completePrivacyControl(store, keyRoot, tenant, id);
+        else await abortPrivacyControl(store, keyRoot, tenant, id);
+      } catch {
+        // Applied but not completed: answer 503 so the caller retries (SQL replays; completion runs again).
+        throw new IngestUnavailable("privacy_journal", "privacy_journal_completion");
+      }
+    }
+    return result;
   };
   const privacyAuthority = deps.privacyAuthority ?? "neon";
   if (privacyAuthority !== "neon" && (privacyAuthority !== "supabase" || custodyMode !== "frozen-supabase"))
@@ -388,6 +412,22 @@ export function createIngestApp(deps: IngestAppDeps) {
   // Identity for /v1, relayhistory's codes: 401 missing_authorization / invalid_token, 403 forbidden.
   const identify = deps.identify ?? signedBindingIdentity(deps.signingKey);
   app.use("/v1/*", async (c, next) => {
+    // Async admission fence: witness the claimed user's privacy journal BEFORE any body IO, so a reset /
+    // re-enable that completes while this upload is still streaming is after the witness. The identity is
+    // not verified yet; the witness is kept only if the verified identity names the same tenant.
+    c.set("journalWitness", undefined);
+    const path = new URL(c.req.url).pathname;
+    if (asyncMode === "on" && c.req.method === "POST" && (path === "/v1/delivery/batches" || path === "/v1/turns/batches")) {
+      try {
+        const claimed = bindingIdentity(c.req.raw);
+        if (claimed.admission === ADMISSION_ACCEPT_VALUE) {
+          const tenant = { orgId: claimed.orgId, workspaceId: claimed.workspaceId, userId: claimed.userId };
+          c.set("journalWitness", { tenant: JSON.stringify(tenant), seq: await witnessPrivacyJournal(deps.deliver.target.store, deps.deliver.target.keyRoot, tenant) });
+        }
+      } catch {
+        // No witness: this request takes the synchronous path.
+      }
+    }
     // The body is read once, bounded by the wire cap, so the signature covers exactly what is parsed.
     let body: Uint8Array;
     try {
@@ -403,6 +443,8 @@ export function createIngestApp(deps: IngestAppDeps) {
     c.set("body", body);
     try {
       c.set("identity", await identify(c.req.raw, body));
+      const id = c.get("identity"), witness = c.get("journalWitness");
+      if (witness && witness.tenant !== JSON.stringify({ orgId: id.orgId, workspaceId: id.workspaceId, userId: id.userId })) c.set("journalWitness", undefined);
     } catch (error) {
       if (error instanceof AuthError) return c.json(errorBody(c, error.code, error.message), error.status);
       emit({ route: "auth", outcome: "error", error_code: "identity_failed" });
@@ -464,14 +506,16 @@ export function createIngestApp(deps: IngestAppDeps) {
     try {
       const batch = parse(await jsonOf(c, read), identity);
       const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
-      // Async admission: no Supabase call. Only for a caller that accepts the queued ACK, and never for a
-      // relayhistory-built custody envelope (whose ACK header must come from the claim).
-      if (asyncMode === "on" && !c.get("custody") && c.req.header(ADMISSION_ACCEPT_HEADER)?.trim() === ADMISSION_ACCEPT_VALUE) {
+      // Async admission: no Supabase call. Only for a caller whose SIGNED identity accepts the queued ACK,
+      // with a pre-body journal witness, and never for a relayhistory-built custody envelope (whose ACK
+      // header must come from the claim).
+      const witness = c.get("journalWitness");
+      if (asyncMode === "on" && witness && identity.admission === ADMISSION_ACCEPT_VALUE && !c.get("custody")) {
         const prepared = await prepareDelivery({ orgId: tenant.orgId, workspaceId: tenant.workspaceId }, batch);
         try { assertTenantSegment(deps.deliver.target.keyRoot, tenant.orgId); } catch { throw new IngestUnavailable("precheck", "tenant_not_a_segment"); }
         assertWithinBudget(deps.deliver, prepared.records, new Date(receivedAtMs));
         try {
-          await enqueueAdmission({ store: deps.deliver.target.store, keyRoot: deps.deliver.target.keyRoot, enqueue: deps.asyncAdmission!.enqueue }, tenant, prepared, receivedAtMs);
+          await enqueueAdmission({ store: deps.deliver.target.store, keyRoot: deps.deliver.target.keyRoot, enqueue: deps.asyncAdmission!.enqueue }, tenant, prepared, receivedAtMs, witness.seq);
         } catch (error) {
           if (error instanceof DeliveryError) throw error;
           throw new IngestUnavailable("admission_enqueue", "admission_enqueue_failed");
@@ -554,18 +598,20 @@ export function createIngestApp(deps: IngestAppDeps) {
         enabled: input.enabled,
       };
       let controlAck;
-      // A re-enable lifts a tombstone: an upload that started before it must not be admitted after it.
+      // A re-enable lifts a tombstone: an upload that began before it must not be admitted after it.
       // (A disable needs no journal: the consumer's claim already filters a deleted session.)
-      if (input.enabled) await raiseJournal(selection.tenant);
+      const journal = <T>(run: () => Promise<T>, applied?: (r: T) => boolean) => !input.enabled ? run()
+        : journaled(selection.tenant, identity.control ? { kind: "ordered", epoch: identity.control.epoch, version: identity.control.version } : { kind: "enable", nonce: crypto.randomUUID() }, run, applied);
       {const t={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
        if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("selection",t,input.origin_id)));
        else if(identity.control&&c.get("custody"))await shadow("delivery.sessions.selection",c.get("custody")!,()=>controlWitnessInput("selection",t,input.origin_id));}
       const custody=c.get("custody");if(custody&&!identity.control)throw new IngestUnavailable("fence","control_unavailable");
       if(identity.control){
         if(identity.control.kind!=="selection"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
-        const result=orderedControlResult(await deps.deliver.ledger.applyOrderedControl({...selection,control:{...identity.control,kind:"selection"},...(custody?{custody}:{})}),identity.control);
+        const control=identity.control;
+        const result=await journal(async()=>orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...selection,control:{...control,kind:"selection"},...(custody?{custody}:{})}),control),(r)=>r.control.outcome!=="stale");
         controlAck=result.control;custodyHeader(c,result.custodyAck);
-      }else await deps.deliver.ledger.setSessionUploads(selection);
+      }else await journal(()=>deps.deliver.ledger.setSessionUploads(selection));
       emit({ route: "delivery.sessions.selection", outcome: controlAck?"control_"+controlAck.outcome:input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
       return c.json({ updated: true,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
@@ -580,16 +626,18 @@ export function createIngestApp(deps: IngestAppDeps) {
       await requireDeliveryAccount(identity, input.account_id);
       const tenant={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
       let deleted:number,controlAck;
-      await raiseJournal(tenant);
+      const journal = <T>(run: () => Promise<T>, applied?: (r: T) => boolean) =>
+        journaled(tenant, identity.control ? { kind: "ordered", epoch: identity.control.epoch, version: identity.control.version } : { kind: "reset", requestId: input.request_id }, run, applied);
       {const t={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
        if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("reset",t,null)));
        else if(identity.control&&c.get("custody"))await shadow("delivery.sessions.reset",c.get("custody")!,()=>controlWitnessInput("reset",t,null));}
       const custody=c.get("custody");if(custody&&!identity.control)throw new IngestUnavailable("fence","control_unavailable");
       if(identity.control){
         if(identity.control.kind!=="reset"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
-        const result=orderedControlResult(await deps.deliver.ledger.applyOrderedControl({tenant,requestId:input.request_id,control:{...identity.control,kind:"reset"},...(custody?{custody}:{})}),identity.control);
+        const control=identity.control;
+        const result=await journal(async()=>orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({tenant,requestId:input.request_id,control:{...control,kind:"reset"},...(custody?{custody}:{})}),control),(r)=>r.control.outcome!=="stale");
         deleted=result.deleted!;controlAck=result.control;custodyHeader(c,result.custodyAck);
-      }else deleted=await deps.deliver.ledger.resetUploadedSessions(tenant,input.request_id);
+      }else deleted=await journal(()=>deps.deliver.ledger.resetUploadedSessions(tenant,input.request_id));
       emit({ route: "delivery.sessions.reset", outcome: controlAck?"control_"+controlAck.outcome:"reset", org_id: identity.orgId, deleted });
       return c.json({ reset: true, deleted,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {

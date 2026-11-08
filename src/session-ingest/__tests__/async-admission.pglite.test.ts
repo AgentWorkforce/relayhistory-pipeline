@@ -12,9 +12,9 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import { sqlLedger } from "../ledger-sql.ts";
-import { createIngestApp, SYNC_SCOPE } from "../app.ts";
+import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
 import { admitMessage } from "../admission-consumer.ts";
-import { ADMISSION_ACCEPT_HEADER, ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, type AdmissionMessage, type AsyncAdmissionMode } from "../async-admission.ts";
+import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, PENDING_TTL_MS, beginPrivacyControl, completePrivacyControl, type AdmissionMessage, type AsyncAdmissionMode } from "../async-admission.ts";
 import type { Ledger } from "../ledger.ts";
 import { deliveryAccount } from "../vendor/delivery/prepare.ts";
 import { orderedFixtureLedger, initializeFixtureSeatClock } from "./ordered-support.ts";
@@ -49,14 +49,17 @@ async function fixture(mode: AsyncAdmissionMode = "on") {
   const deliver = { ledger, acceptanceMode: "buffered" as const, target };
   const queue: AdmissionMessage[] = [];
   let clock = 1_800_000_000_000;
-  const app = createIngestApp({ identify: () => identity, deliver, log: () => {}, asyncAdmission: { mode, enqueue: async (m) => { queue.push(m); }, nowMs: () => clock } });
-  const post = async (b: unknown, accept = true) => app.request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json", ...(accept ? { [ADMISSION_ACCEPT_HEADER]: ADMISSION_ACCEPT_VALUE } : {}) }, body: JSON.stringify({ protocolVersion: 1, batch: b }) });
-  const control = async (path: string, body: unknown) => app.request(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  // The signature is the unit suite's concern; here the identity header is parsed as the Worker parses it.
+  const app = createIngestApp({ identify: (req) => bindingIdentity(req), deliver, log: () => {}, asyncAdmission: { mode, enqueue: async (m) => { queue.push(m); }, nowMs: () => clock } });
+  const id = (accept: boolean) => ({ [IDENTITY_HEADER]: encodeIdentity({ ...identity, ...(accept ? { admission: ADMISSION_ACCEPT_VALUE } : {}) }) });
+  const post = async (b: unknown, accept = true, body?: BodyInit) => app.request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json", ...id(accept) }, body: body ?? JSON.stringify({ protocolVersion: 1, batch: b }), ...(body ? { duplex: "half" } : {}) } as RequestInit);
+  const control = async (path: string, body: unknown) => app.request(path, { method: "POST", headers: { "content-type": "application/json", ...id(false) }, body: JSON.stringify(body) });
   const consume = async (m: AdmissionMessage, attempts = 1, consumerMode: AsyncAdmissionMode = mode) =>
     admitMessage({ mode: consumerMode, deliver, custodySource: "relayhistory", decompress: zstd, nowMs: () => clock }, m, attempts);
   const outbox = async (batchId: string) => (await db.query("SELECT o.active_stage_token FROM sessions.ingest_buffer_outbox o WHERE o.batch_id=$1", [batchId])).rows[0]?.active_stage_token as string | undefined;
-  const status = async (originId: string, receiptId: string) => (await app.request(`/v1/delivery/admission?originId=${originId}&receiptId=${receiptId}`)).json() as Promise<{ state: string; code?: string }>;
-  return { db, app, post, control, consume, queue, outbox, status, ledgerCalls: () => ledgerCalls, tick: (ms: number) => { clock += ms; }, target };
+  const status = async (originId: string, receiptId: string) => (await app.request(`/v1/delivery/admission?originId=${originId}&receiptId=${receiptId}`, { headers: id(false) })).json() as Promise<{ state: string; code?: string }>;
+  const reset = async (requestId: string) => control("/v1/delivery/sessions/reset", { account_id: await deliveryAccount(TENANT), request_id: requestId, confirmation: "DELETE ALL SESSIONS" });
+  return { db, app, post, control, reset, consume, queue, outbox, status, ledgerCalls: () => ledgerCalls, tick: (ms: number) => { clock += ms; }, now: () => clock, target, deliver };
 }
 
 test("ACK needs no ledger call; the consumer admits through the real buffered path; a retry replays", async () => {
@@ -163,4 +166,79 @@ test("a stale generation is transient (retried), never a refusal", async () => {
   const r = await admitMessage({ mode: "on", deliver: { ledger: stale, acceptanceMode: "buffered", target: f.target }, custodySource: "relayhistory", decompress: zstd }, f.queue[0]!, 3);
   expect(r.action).toBe("retry");
   expect(await f.outbox("gen-1")).toBeUndefined();
+});
+
+test("P0 causal: an upload whose body is still streaming while a reset completes is refused", async () => {
+  const f = await fixture();
+  const bytes = new TextEncoder().encode(JSON.stringify({ protocolVersion: 1, batch: await batch([record({ record_id: "slow" })], { batch_id: "slow-1" }) }));
+  let started!: () => void, release!: () => void;
+  const reading = new Promise<void>((r) => { started = r; }), gate = new Promise<void>((r) => { release = r; });
+  const body = new ReadableStream<Uint8Array>({ async pull(c) { started(); await gate; c.enqueue(bytes); c.close(); } });
+  const pending = f.post(null, true, body);
+  await reading; // the witness was taken before the first body byte was asked for
+  // The reset runs and completes entirely while the upload is latched inside its body read; the
+  // upload then finishes with a LATER wall clock than the reset.
+  expect((await f.reset("reset-during-stream")).status).toBe(200);
+  f.tick(5000);
+  release();
+  expect((await pending).status).toBe(200);
+  expect(await f.consume(f.queue[0]!)).toMatchObject({ action: "ack", outcome: "refused", code: "delivery_privacy_superseded" });
+  expect(await f.outbox("slow-1")).toBeUndefined();
+});
+
+test("P1-b: an idempotent reset replay never refuses an upload taken after the original reset", async () => {
+  const f = await fixture();
+  expect((await f.reset("r-1")).status).toBe(200);
+  f.tick(1000);
+  await f.post(await batch([record({ record_id: "between" })], { batch_id: "between-1" }));
+  f.tick(1000);
+  expect((await f.reset("r-1")).status).toBe(200); // the same request id: SQL replays it
+  expect(await f.consume(f.queue[0]!)).toMatchObject({ action: "ack", outcome: "admitted" });
+  expect(await f.outbox("between-1")).toBeString();
+  // A NEW reset still refuses what was uploaded before it.
+  // A session the reset never owned, so the claim alone would admit it: only the journal refuses it.
+  await f.post(await batch([record({ record_id: "before-r2", session_id: "fresh-r2" })], { batch_id: "before-r2" }));
+  expect((await f.reset("r-2")).status).toBe(200);
+  expect(await f.consume(f.queue[1]!)).toMatchObject({ action: "ack", outcome: "refused", code: "delivery_privacy_superseded" });
+});
+
+test("a control in flight makes the consumer wait; a stale pending one (its Worker died) completes conservatively", async () => {
+  const f = await fixture();
+  await f.post(await batch([record({ record_id: "w1" })], { batch_id: "wait-1" }));
+  expect(await beginPrivacyControl(f.target.store, f.target.keyRoot, TENANT, { kind: "reset", requestId: "in-flight" }, f.now())).toBe("new");
+  expect(await f.consume(f.queue[0]!)).toMatchObject({ action: "retry", code: "privacy_control_pending" });
+  expect(await f.outbox("wait-1")).toBeUndefined();
+  // Its Worker died between SQL and completion: past the TTL the consumer completes it itself, and refuses.
+  f.tick(PENDING_TTL_MS + 1);
+  expect(await f.consume(f.queue[0]!, 2)).toMatchObject({ action: "ack", outcome: "refused", code: "delivery_privacy_superseded" });
+  // A control that does complete: the next upload (witnessed after it) is admitted.
+  await completePrivacyControl(f.target.store, f.target.keyRoot, TENANT, { kind: "reset", requestId: "in-flight" });
+  await f.post(await batch([record({ record_id: "w2" })], { batch_id: "wait-2" }));
+  expect(await f.consume(f.queue[1]!)).toMatchObject({ action: "ack", outcome: "admitted" });
+});
+
+test("P1-a causal: 200, twenty transient failures, eight days later a redrive still admits the bytes", async () => {
+  const f = await fixture();
+  const res = await f.post(await batch([record({ record_id: "late", payload: { text: "kept", ts_ms: 1_761_955_200_000 } })], { batch_id: "late-1" }));
+  expect(res.status).toBe(200);
+  const down = { ...f.deliver, ledger: { ...f.deliver.ledger, claim: async () => { throw Object.assign(new Error("lock"), { code: "55P03" }); } } } as typeof f.deliver;
+  for (let attempt = 1; attempt <= 20; attempt++) {
+    const r = await admitMessage({ mode: "on", deliver: down, custodySource: "relayhistory", decompress: zstd, nowMs: f.now }, f.queue[0]!, attempt);
+    expect(r.action).toBe("retry");
+  }
+  // max_retries reached: the message sits in the DLQ; no code path expires or deletes pending inbox bytes.
+  f.tick(8 * 24 * 3600 * 1000);
+  expect(await f.consume(f.queue[0]!, 1)).toMatchObject({ action: "ack", outcome: "admitted" });
+  expect(await f.outbox("late-1")).toBeString();
+});
+
+test("P2: the opt-in is honoured only inside the identity; a sibling caller without it gets the synchronous path", async () => {
+  const f = await fixture();
+  const before = f.ledgerCalls();
+  expect((await f.post(await batch([record({ record_id: "s1" })], { batch_id: "sync-1" }), false)).status).toBe(200);
+  expect(f.queue).toHaveLength(0);
+  expect(f.ledgerCalls()).toBeGreaterThan(before);
+  // An identity carrying any other admission value is refused outright (it is signed input).
+  const bad = await f.app.request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json", [IDENTITY_HEADER]: encodeIdentity({ ...identity, admission: "queued-v2" } as never) }, body: "{}" });
+  expect(bad.status).toBe(401);
 });

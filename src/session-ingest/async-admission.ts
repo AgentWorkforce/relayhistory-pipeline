@@ -14,12 +14,13 @@
  * any session read path: no SQL pointer names it, and every reader resolves objects only
  * through SQL (buffered outbox) or canonical manifests.
  *
- * The privacy journal closes the one gap the claim alone cannot: a reset, or a re-enable of
- * a disabled session, that STARTED after an upload but is applied before its admission.
- * Every such control first raises the user's journal watermark (S3 CAS, before its SQL
- * call); the consumer reads it AFTER its claim and refuses an upload that started before
- * the watermark. A control applied after the claim is caught by the existing ACK recheck
- * (original epochs and reset count), and one applied after the ACK erases as today.
+ * The privacy journal closes the one gap the claim alone cannot: a reset, or a re-enable of a
+ * disabled session, that completes after an upload began but before its admission. The upload
+ * witnesses the user's journal seq BEFORE its body is read; every such control marks itself
+ * pending before its SQL and advances seq after it; the consumer, AFTER its claim, waits while a
+ * control is pending and refuses when seq grew past the witness. A control applied after the
+ * claim is caught by the existing ACK recheck (original epochs and reset count), and one applied
+ * after the ACK erases as today.
  */
 import { createHash } from "node:crypto";
 import { rawZstdFrame, scrubRecords } from "@rhc/lib/pipeline/raw-chunks.ts";
@@ -43,8 +44,11 @@ export function asyncAdmissionMode(raw: string | undefined): AsyncAdmissionMode 
   throw new Error("session ingest: INGEST_ASYNC_ADMISSION must be off, on or drain");
 }
 
-/** relayhistory opts in per request: it then accepts ADMISSION_HEADER instead of a custody ACK. */
-export const ADMISSION_ACCEPT_HEADER = "x-relay-ingest-admission";
+/**
+ * relayhistory opts in per request INSIDE the signed identity (`admission`, app.ts bindingIdentity),
+ * never as a loose header; it then accepts ADMISSION_HEADER instead of a custody ACK, and only for a
+ * request it opted in itself.
+ */
 export const ADMISSION_ACCEPT_VALUE = "queued-v1";
 /** On an async 2xx: exactly this JSON, and never a custody ACK header. */
 export const ADMISSION_HEADER = "x-relay-admission";
@@ -53,12 +57,9 @@ export const ADMISSION_QUEUED = JSON.stringify({ version: 1, state: "queued" });
 /**
  * A leading `.` keeps the inbox disjoint from every tenant prefix `<keyRoot>/<org>/`: no org id
  * may start with `.` (writer.ts assertTenantSegment, stacks/aws/tenants.ts ORG_RE), so the
- * prefix lifecycle rule on `<keyRoot>/.admission-inbox/` can never match tenant data.
+ * inbox namespace can never overlap (or be confused with) any tenant data.
  */
 export const INBOX_NAMESPACE = ".admission-inbox";
-/** An inbox older than this is refused (`admission_expired`) rather than admitted: the
- * prefix lifecycle (7 days) must never expire a journal an unadmitted upload still needs. */
-export const INBOX_MAX_AGE_MS = 6 * 24 * 3600 * 1000;
 const INBOX_KIND = "ingest-admission-inbox";
 /** Same framing as an inbox (one zstd frame), so a re-read decodes it as terminal. */
 const TOMBSTONE = rawZstdFrame(new TextEncoder().encode(JSON.stringify({ v: 1, kind: "ingest-admission-tombstone" }) + "\n"));
@@ -76,7 +77,7 @@ const HEX64 = /^[0-9a-f]{64}$/;
 
 /** A consumer-side terminal refusal: written as the batch's refused outcome, never retried. */
 export class AdmissionRefused extends DeliveryError {
-  constructor(code: "delivery_privacy_superseded" | "admission_expired" | "admission_invalid", message: string) {
+  constructor(code: "delivery_privacy_superseded" | "admission_invalid", message: string) {
     super(code, 409, message);
   }
 }
@@ -114,6 +115,8 @@ interface InboxHeader {
   v: 1;
   kind: typeof INBOX_KIND;
   receivedAtMs: number;
+  /** The privacy journal seq witnessed before the request body was read (the admission fence). */
+  journalSeq: number;
   tenant: LedgerTenant;
   originId: string;
   batchId: string;
@@ -128,8 +131,9 @@ interface InboxHeader {
 }
 
 /** Header line (ids only) + one scrubbed payload line per prepared record, as one zstd frame. */
-export function encodeInbox(tenant: LedgerTenant, prepared: PreparedDelivery, receivedAtMs: number): Uint8Array {
-  const header: InboxHeader = { v: 1, kind: INBOX_KIND, receivedAtMs, tenant: { orgId: tenant.orgId, workspaceId: tenant.workspaceId, userId: tenant.userId },
+export function encodeInbox(tenant: LedgerTenant, prepared: PreparedDelivery, receivedAtMs: number, journalSeq: number): Uint8Array {
+  if (!Number.isSafeInteger(journalSeq) || journalSeq < 0) throw new Error("admission_witness_invalid");
+  const header: InboxHeader = { v: 1, kind: INBOX_KIND, receivedAtMs, journalSeq, tenant: { orgId: tenant.orgId, workspaceId: tenant.workspaceId, userId: tenant.userId },
     originId: prepared.originId, batchId: prepared.batchId, batchDigest: prepared.batchDigest, receipt: prepared.receipt,
     records: prepared.records.map((r) => [r.record_id, r.revision_id, r.revision, r.digest, r.kind, r.source, r.session_id ?? null, r.operation]) };
   // Payloads are already the service form (servicePayload); the pipeline scrubber runs once more so
@@ -160,7 +164,7 @@ function inboxRecord(id: unknown, line: unknown, originId: string): PreparedDeli
   return fitForScrub(record);
 }
 
-export interface DecodedInbox { tenant: LedgerTenant; prepared: PreparedDelivery; receivedAtMs: number }
+export interface DecodedInbox { tenant: LedgerTenant; prepared: PreparedDelivery; receivedAtMs: number; journalSeq: number }
 
 /** Decode and bind an inbox object to the key it was read from. `null`: tombstoned (already terminal). */
 export async function decodeInbox(keyRoot: string, key: string, raw: Uint8Array): Promise<DecodedInbox | null> {
@@ -172,7 +176,7 @@ export async function decodeInbox(keyRoot: string, key: string, raw: Uint8Array)
   try { header = JSON.parse(text.slice(0, newline)); } catch { return bad(); }
   if (isObject(header) && (header as unknown as Record<string, unknown>).kind === "ingest-admission-tombstone") return null;
   const h = header as unknown as Record<string, unknown>;
-  if (!isObject(h) || h.v !== 1 || h.kind !== INBOX_KIND || !Number.isSafeInteger(h.receivedAtMs) || !isObject(h.tenant) || !isObject(h.receipt) ||
+  if (!isObject(h) || h.v !== 1 || h.kind !== INBOX_KIND || !Number.isSafeInteger(h.receivedAtMs) || !Number.isSafeInteger(h.journalSeq) || (h.journalSeq as number) < 0 || !isObject(h.tenant) || !isObject(h.receipt) ||
       !ident(h.originId) || !ident(h.batchId) || typeof h.batchDigest !== "string" || !HEX64.test(h.batchDigest) ||
       !Array.isArray(h.records) || (h.records as unknown[]).length > MAX_DELIVERY_RECORDS) bad();
   const t = h.tenant as Record<string, unknown>;
@@ -195,7 +199,7 @@ export async function decodeInbox(keyRoot: string, key: string, raw: Uint8Array)
   if (new Set(records.map((r) => r.revision_id)).size !== records.length) bad();
   const accepted = new Set(receipt.acceptedRevisionIds as unknown[]);
   if (records.some((r) => !accepted.has(r.revision_id))) bad();
-  return { tenant, receivedAtMs: h.receivedAtMs as number,
+  return { tenant, receivedAtMs: h.receivedAtMs as number, journalSeq: h.journalSeq as number,
     prepared: { originId: h.originId as string, batchId: h.batchId as string, batchDigest: h.batchDigest as string, receipt: receipt as unknown as PreparedDelivery["receipt"], records } };
 }
 
@@ -212,15 +216,15 @@ export interface AsyncAdmissionTarget {
  * The request path: durable inbox PUT, then the queue send. Either failing is a retryable 503
  * (nothing was acknowledged; a retry writes a new attempt object and the claim dedupes).
  */
-export async function enqueueAdmission(target: AsyncAdmissionTarget, tenant: LedgerTenant, prepared: PreparedDelivery, receivedAtMs: number): Promise<string> {
+export async function enqueueAdmission(target: AsyncAdmissionTarget, tenant: LedgerTenant, prepared: PreparedDelivery, receivedAtMs: number, journalSeq: number): Promise<string> {
   assertInboxTenant(target.keyRoot, tenant.orgId);
   const nonce = (target.nonce ?? (() => crypto.randomUUID().replace(/-/g, "").slice(0, 16)))();
   const key = inboxKey(target.keyRoot, tenant, prepared.originId, prepared.receipt.receiptId, receivedAtMs, nonce);
-  await target.store.put(objectKey(key), encodeInbox(tenant, prepared, receivedAtMs), { ifNoneMatch: true, contentType: "application/zstd" });
+  await target.store.put(objectKey(key), encodeInbox(tenant, prepared, receivedAtMs, journalSeq), { ifNoneMatch: true, contentType: "application/zstd" });
   try {
     await target.enqueue({ v: 1, kind: "ingest-admission", key });
   } catch (error) {
-    // Unacknowledged: retire the content now (best effort; the prefix lifecycle is the backstop).
+    // Unacknowledged: retire the content now (best effort; a 503 means the client retries with a new attempt).
     await target.store.put(objectKey(key), TOMBSTONE, { contentType: "application/zstd" }).catch(() => {});
     throw error;
   }
@@ -228,37 +232,55 @@ export async function enqueueAdmission(target: AsyncAdmissionTarget, tenant: Led
 }
 
 // ---- privacy journal ----
+//
+// One object per (org, workspace, user). `seq` only ever grows; it counts the user's COMPLETED
+// resets and re-enables. A control first records itself `pending` (before its SQL), then, after its
+// SQL, completes: pending removed, seq + 1, id remembered in `done`. An upload witnesses `seq`
+// BEFORE its body is read; the consumer, after its claim, refuses it when `seq` has grown since
+// (a control completed after the upload began) and waits while any control is pending. A replayed
+// control (its id already done) changes nothing, so it never refuses later uploads.
 
-interface Journal { v: 1; watermarkMs: number }
-const JOURNAL_ATTEMPTS = 6;
+export const PENDING_TTL_MS = 120_000;
+const DONE_IDS = 256;
+interface PendingControl { id: string; startMs: number }
+interface Journal { v: 2; seq: number; pending: PendingControl[]; done: string[]; ordered?: { epoch: string; maxVersion: string } }
+const JOURNAL_ATTEMPTS = 8;
+const emptyJournal = (): Journal => ({ v: 2, seq: 0, pending: [], done: [] });
 
-async function readJournal(store: ObjectStore, key: string): Promise<{ journal: Journal | null; version?: string }> {
+function validJournal(v: unknown): v is Journal {
+  if (!isObject(v) || v.v !== 2 || !Number.isSafeInteger(v.seq) || (v.seq as number) < 0 || !Array.isArray(v.pending) || !Array.isArray(v.done)) return false;
+  if (!(v.pending as unknown[]).every((p) => isObject(p) && typeof p.id === "string" && Number.isSafeInteger(p.startMs))) return false;
+  if (!(v.done as unknown[]).every((d) => typeof d === "string")) return false;
+  const o = v.ordered as Record<string, unknown> | undefined;
+  return o === undefined || (isObject(o) && typeof o.epoch === "string" && typeof o.maxVersion === "string" && /^[0-9]{1,19}$/.test(o.maxVersion));
+}
+
+async function readJournal(store: ObjectStore, key: string): Promise<{ journal: Journal; version?: string }> {
   let got;
   try {
     got = await store.getObject(objectKey(key));
   } catch (error) {
-    if (isObjectStoreError(error, "not_found")) return { journal: null };
+    if (isObjectStoreError(error, "not_found")) return { journal: emptyJournal() };
     throw error;
   }
-  const value = JSON.parse(decoder.decode(await readAll(got.body))) as Journal;
-  if (!isObject(value) || value.v !== 1 || !Number.isSafeInteger(value.watermarkMs)) throw new Error("privacy_journal_invalid");
+  const value = JSON.parse(decoder.decode(await readAll(got.body)));
+  // Fail closed: an unreadable journal stops controls (503) and admissions (retry), never resets seq.
+  if (!validJournal(value)) throw new Error("privacy_journal_invalid");
   return { journal: value, version: got.meta.version as unknown as string };
 }
 
-/**
- * Raise the user's watermark to `startedAtMs` (monotonic max, compare-and-swap). Called BEFORE a
- * reset or a re-enable reaches SQL; a failure must refuse the control (fail closed).
- */
-export async function raisePrivacyWatermark(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, startedAtMs: number): Promise<void> {
+/** Compare-and-swap edit; `edit` returns null for "no change". */
+async function editJournal<T>(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, edit: (j: Journal) => { next: Journal | null; result: T }): Promise<T> {
   assertInboxTenant(keyRoot, tenant.orgId);
   const key = journalKey(keyRoot, tenant);
   for (let attempt = 0; attempt < JOURNAL_ATTEMPTS; attempt++) {
     const { journal, version } = await readJournal(store, key);
-    if (journal && journal.watermarkMs >= startedAtMs) return;
-    const body = encoder.encode(JSON.stringify({ v: 1, watermarkMs: startedAtMs } satisfies Journal));
+    const { next, result } = edit(structuredClone(journal));
+    if (!next) return result;
+    if (next.seq < journal.seq) throw new Error("privacy_journal_regression");
     try {
-      await store.put(objectKey(key), body, version ? { ifMatch: version as never, contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" });
-      return;
+      await store.put(objectKey(key), encoder.encode(JSON.stringify(next)), version ? { ifMatch: version as never, contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" });
+      return result;
     } catch (error) {
       if (!isObjectStoreError(error, "precondition_failed") && !isObjectStoreError(error, "already_exists")) throw error;
     }
@@ -266,11 +288,84 @@ export async function raisePrivacyWatermark(store: ObjectStore, keyRoot: string,
   throw new Error("privacy_journal_contended");
 }
 
-/** The consumer's post-claim gate: refuse an upload that started before the user's latest reset / re-enable began. */
-export async function assertNoLaterPrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, receivedAtMs: number): Promise<void> {
-  const { journal } = await readJournal(store, journalKey(keyRoot, tenant));
-  if (journal && journal.watermarkMs >= receivedAtMs)
-    throw new AdmissionRefused("delivery_privacy_superseded", "A session reset or re-enable started after this upload; it was not admitted");
+/** The upload's witness: the journal seq BEFORE its body is read. */
+export async function witnessPrivacyJournal(store: ObjectStore, keyRoot: string, tenant: LedgerTenant): Promise<number> {
+  assertInboxTenant(keyRoot, tenant.orgId);
+  return (await readJournal(store, journalKey(keyRoot, tenant))).journal.seq;
+}
+
+/**
+ * A privacy control's logical identity: an ordered control's (epoch, version); a legacy reset's
+ * request id (SQL-idempotent forever); a legacy re-enable has no idempotency key, so every one is new.
+ */
+export type PrivacyControlId =
+  | { kind: "ordered"; epoch: string; version: string }
+  | { kind: "reset"; requestId: string }
+  | { kind: "enable"; nonce: string };
+const idOf = (c: PrivacyControlId) => c.kind === "ordered" ? `o:${c.epoch}:${c.version}` : c.kind === "reset" ? `r:${c.requestId}` : `e:${c.nonce}`;
+
+/** begin: "done" (a replay: change nothing), "unfinished" (an earlier attempt is still pending), or "new" (now pending). */
+export type ControlBegin = "done" | "unfinished" | "new";
+
+/** BEFORE the control's SQL. Fail closed: a failure must refuse the control. */
+export async function beginPrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, control: PrivacyControlId, nowMs: number): Promise<ControlBegin> {
+  const id = idOf(control);
+  return editJournal<ControlBegin>(store, keyRoot, tenant, (j) => {
+    if (j.done.includes(id)) return { next: null, result: "done" };
+    if (control.kind === "ordered" && j.ordered?.epoch === control.epoch && BigInt(control.version) <= BigInt(j.ordered.maxVersion)) return { next: null, result: "done" };
+    if (j.pending.some((p) => p.id === id)) return { next: null, result: "unfinished" };
+    j.pending.push({ id, startMs: nowMs });
+    return { next: j, result: "new" };
+  });
+}
+
+/** AFTER the control's SQL applied (or answered replay for an attempt this journal had pending): seq + 1. */
+export async function completePrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, control: PrivacyControlId): Promise<void> {
+  const id = idOf(control);
+  await editJournal(store, keyRoot, tenant, (j) => {
+    if (j.done.includes(id) && !j.pending.some((p) => p.id === id)) return { next: null, result: undefined };
+    j.pending = j.pending.filter((p) => p.id !== id);
+    j.seq += 1;
+    j.done = [...j.done.filter((d) => d !== id), id].slice(-DONE_IDS);
+    if (control.kind === "ordered" && (j.ordered?.epoch !== control.epoch || BigInt(control.version) > BigInt(j.ordered.maxVersion)))
+      j.ordered = { epoch: control.epoch, maxVersion: control.version };
+    return { next: j, result: undefined };
+  });
+}
+
+/** The control definitely did not apply (a typed refusal, or SQL answered stale): drop its pending mark, seq unchanged. */
+export async function abortPrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, control: PrivacyControlId): Promise<void> {
+  const id = idOf(control);
+  await editJournal(store, keyRoot, tenant, (j) => {
+    if (!j.pending.some((p) => p.id === id)) return { next: null, result: undefined };
+    j.pending = j.pending.filter((p) => p.id !== id);
+    return { next: j, result: undefined };
+  });
+}
+
+/**
+ * The consumer's post-claim gate. A fresh pending control: wait (retry). A pending control older
+ * than PENDING_TTL_MS (its Worker died between SQL and completion): completed conservatively here
+ * (seq + 1), because it may have applied. Then refuse iff seq grew since the upload's witness.
+ */
+export async function assertNoLaterPrivacyControl(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, witnessSeq: number, nowMs: number): Promise<void> {
+  const seq = await editJournal<number | "pending">(store, keyRoot, tenant, (j) => {
+    const stale = j.pending.filter((p) => nowMs - p.startMs > PENDING_TTL_MS);
+    if (j.pending.length > stale.length) return { next: null, result: "pending" };
+    if (stale.length === 0) return { next: null, result: j.seq };
+    j.pending = [];
+    j.seq += 1;
+    j.done = [...j.done.filter((d) => !stale.some((p) => p.id === d)), ...stale.map((p) => p.id)].slice(-DONE_IDS);
+    return { next: j, result: j.seq };
+  });
+  if (seq === "pending") throw new PrivacyControlPending();
+  if (seq > witnessSeq)
+    throw new AdmissionRefused("delivery_privacy_superseded", "A session reset or re-enable completed after this upload began; it was not admitted");
+}
+
+/** Retryable: a reset / re-enable is in flight for this user. */
+export class PrivacyControlPending extends Error {
+  readonly code = "privacy_control_pending";
 }
 
 // ---- outcomes ----

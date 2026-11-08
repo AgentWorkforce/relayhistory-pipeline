@@ -16,9 +16,8 @@ import { LedgerUnavailableError, type FrozenWitnessInput, type LedgerTenant } fr
 import { DeliveryBusyError, DeliveryError } from "./vendor/delivery/delivery-contracts.ts";
 import type { PreparedDelivery } from "./vendor/delivery/prepare.ts";
 import {
-  AdmissionRefused,
-  INBOX_MAX_AGE_MS,
   INBOX_NAMESPACE,
+  PrivacyControlPending,
   assertNoLaterPrivacyControl,
   decodeInbox,
   readInbox,
@@ -53,6 +52,8 @@ function witnessInput(tenant: LedgerTenant, p: PreparedDelivery): FrozenWitnessI
 }
 
 function classify(error: unknown, attempts: number): AdmissionAction | { terminal: string } {
+  // A reset / re-enable is in flight for this user: wait for it (never admit across it).
+  if (error instanceof IngestUnavailable && error.cause_code === new PrivacyControlPending().code) return { action: "retry", delaySeconds: 15, code: "privacy_control_pending", stage: error.stage, error };
   if (error instanceof DeliveryBusyError) return { action: "retry", delaySeconds: error.retryAfterSeconds, code: error.code, error };
   if (error instanceof IngestUnavailable) return { action: "retry", delaySeconds: backoffSeconds(attempts), code: error.cause_code, stage: error.stage, error };
   // 403 (another user's record), 409 (batch id / revision conflict, privacy superseded), 413/422 (budget), 400: the same answer forever.
@@ -84,7 +85,7 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
     return { action: "retry", delaySeconds: 300, code: "admission_invalid" };
   }
   if (!decoded) return { action: "ack", outcome: "already_terminal", code: "tombstoned" };
-  const { tenant, prepared, receivedAtMs } = decoded;
+  const { tenant, prepared, receivedAtMs, journalSeq } = decoded;
   const now = (deps.nowMs ?? Date.now)();
   const lagMs = Math.max(0, now - receivedAtMs);
   const dir = receiptDir(keyRoot, tenant, prepared.originId, prepared.receipt.receiptId);
@@ -99,7 +100,8 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
     return { action: "ack", outcome: state, code, lagMs };
   };
   try {
-    if (lagMs > INBOX_MAX_AGE_MS) throw new AdmissionRefused("admission_expired", "The upload was not admitted within the admission window");
+    // No age limit: an acknowledged upload stays admissible for as long as its message (or an
+    // operator's redrive) exists; only an outcome retires its bytes.
     const ledger = deps.deliver.ledger;
     let custody;
     if (deps.custodySource === "frozen-supabase") {
@@ -116,7 +118,7 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
     const result = await deliverPrepared({
       ...deps.deliver,
       ...(custody ? { custody } : {}),
-      admissionGate: () => assertNoLaterPrivacyControl(store, keyRoot, tenant, receivedAtMs),
+      admissionGate: () => assertNoLaterPrivacyControl(store, keyRoot, tenant, journalSeq, (deps.nowMs ?? Date.now)()),
     }, tenant, prepared);
     return finish("admitted", result.outcome);
   } catch (error) {
