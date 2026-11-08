@@ -18,6 +18,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { readdirSync, readFileSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
 import pg from "pg";
@@ -67,6 +69,12 @@ let s3: Stub;
 let introspect: Stub;
 let jwks: Stub;
 let gcsToken: Stub;
+/** EKS Pod Identity agent stand-in: answers container credentials for POD_TOKEN only, with `podExpiresInMs`. */
+let podCreds: Stub;
+const POD_TOKEN = "synthetic-pod-identity-token";
+let podExpiresInMs = 6 * 60 * 60 * 1000;
+let podIssued = 0;
+let podTokenDir = "";
 const GCS_ACCESS_TOKEN = "synthetic-gcs-access-token";
 /** The Authorization header of every object request (S3 SigV4 or the GCS bearer). */
 const objectAuth: string[] = [];
@@ -226,6 +234,13 @@ beforeAll(async () => {
     answer(body, res);
   });
   jwks = await listen((_req, res) => json(res, 200, { keys: [] }));
+  podCreds = await listen((req, res) => {
+    if (req.headers.authorization !== POD_TOKEN) return json(res, 403, {});
+    podIssued++;
+    json(res, 200, { AccessKeyId: `ASIAPOD${podIssued}`, SecretAccessKey: `synthetic-secret-${podIssued}`, Token: `synthetic-session-${podIssued}`, Expiration: new Date(Date.now() + podExpiresInMs).toISOString() });
+  });
+  podTokenDir = await mkdtemp(join(tmpdir(), "pod-identity-"));
+  await writeFile(join(podTokenDir, "token"), `${POD_TOKEN}\n`);
   gcsToken = await listen((req, res) => {
     if (req.headers["metadata-flavor"] !== "Google") return json(res, 403, {});
     json(res, 200, { access_token: GCS_ACCESS_TOKEN, expires_in: 3600, token_type: "Bearer" });
@@ -242,8 +257,9 @@ beforeAll(async () => {
 afterAll(async () => {
   pg.Pool = RealPool;
   globalThis.fetch = realFetch;
-  for (const stub of [s3, introspect, jwks, gcsToken]) stub?.server.closeAllConnections?.();
-  await Promise.all([s3, introspect, jwks, gcsToken].map((stub) => stub && new Promise<void>((r) => stub.server.close(() => r()))));
+  for (const stub of [s3, introspect, jwks, gcsToken, podCreds]) stub?.server.closeAllConnections?.();
+  await Promise.all([s3, introspect, jwks, gcsToken, podCreds].map((stub) => stub && new Promise<void>((r) => stub.server.close(() => r()))));
+  if (podTokenDir) await rm(podTokenDir, { recursive: true, force: true });
   await supa?.close();
 });
 
@@ -478,12 +494,16 @@ describe("startup and wiring rules", () => {
     [{ RELAYCONTROL_INTROSPECT_SECRET: " " }, "needs RELAYCONTROL_INTROSPECT_SECRET"],
     [{ READ_API_ORIGIN: undefined }, "needs READ_API_ORIGIN"],
     [{ RELAYCONTROL_INTROSPECT_URL: "http://relaycontrol.example.com" }, "RELAYCONTROL_INTROSPECT_URL"],
-    [{ LOCKER_ACCESS_KEY_ID: undefined }, "LOCKER_BUCKET is set but LOCKER_* does not configure a readable store"],
+    [{ LOCKER_ACCESS_KEY_ID: undefined }, "no Locker credentials"],
+    [{ LOCKER_ACCESS_KEY_ID: undefined, LOCKER_SECRET_ACCESS_KEY: undefined, AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://169.254.169.254/latest/creds" }, "not a trusted credentials endpoint"],
+    [{ LOCKER_ACCESS_KEY_ID: undefined, LOCKER_SECRET_ACCESS_KEY: undefined, AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://creds.example.com/v1" }, "not a trusted credentials endpoint"],
+    [{ LOCKER_PROVIDER: "minio" }, "LOCKER_PROVIDER must be s3 or gcs"],
   ] as Array<[Record<string, string | undefined>, string]>)("%p refuses startup", async (over, message) => {
     const before = PglitePool.created;
     await expect(startReadApiService(baseEnv(over), { host: "127.0.0.1", port: 0 })).rejects.toThrow(message);
     // Auth settings refuse before the read pool is opened.
-    if (!("LOCKER_ACCESS_KEY_ID" in over)) expect(PglitePool.created).toBe(before);
+    if (!Object.keys(over).some((k) => k.startsWith("LOCKER_"))) expect(PglitePool.created).toBe(before);
+    expect(podCreds.hits).toEqual([]);
   });
 
   test("an empty RELAYAUTH_* value is not a setting (relaycontrol_only still starts)", async () => {
@@ -515,6 +535,52 @@ describe("startup and wiring rules", () => {
       expect(introspect.hits).toEqual([]);
     },
   );
+
+  /** EKS Pod Identity: no static keys, the agent's URI and token file only. */
+  const podEnv = () => baseEnv({
+    LOCKER_ACCESS_KEY_ID: undefined,
+    LOCKER_SECRET_ACCESS_KEY: undefined,
+    AWS_CONTAINER_CREDENTIALS_FULL_URI: `http://127.0.0.1:${podCreds.port}/v1/credentials`,
+    AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: join(podTokenDir, "token"),
+  });
+  const accessKeys = () => objectAuth.map((a) => /Credential=([^/]+)\//u.exec(a)?.[1]);
+
+  test("EKS Pod Identity (no static keys) starts and serves all four routes; credentials are fetched once and cached", async () => {
+    podIssued = 0;
+    podExpiresInMs = 6 * 60 * 60 * 1000;
+    const token = "sh_at_synthetic-pod";
+    answers.set(token, (_b, res) => json(res, 200, active()));
+    const get = await start(podEnv());
+    // Startup validates the source but fetches nothing.
+    expect(podIssued).toBe(0);
+    for (const path of ROUTES) {
+      const r = await get(path, token);
+      expect([path, r.status]).toEqual([path, 200]);
+    }
+    // One credentials fetch for the whole process, sent the token file's token (the stub refuses otherwise).
+    expect(podCreds.hits).toEqual(["GET /v1/credentials"]);
+    expect(accessKeys().length).toBeGreaterThan(0);
+    for (const key of accessKeys()) expect(key).toBe("ASIAPOD1");
+    const allowed = new Set([`http://127.0.0.1:${introspect.port}`, `http://127.0.0.1:${s3.port}`, `http://127.0.0.1:${podCreds.port}`]);
+    for (const url of outbound) expect([url, allowed.has(new URL(url).origin)]).toEqual([url, true]);
+  }, 60_000);
+
+  test("EKS Pod Identity credentials near expiry are refreshed before the next object read", async () => {
+    podIssued = 0;
+    // Inside the 5-minute refresh window: every read must fetch fresh credentials.
+    podExpiresInMs = 60_000;
+    const token = "sh_at_synthetic-pod-refresh";
+    answers.set(token, (_b, res) => json(res, 200, active()));
+    const get = await start(podEnv());
+    expect((await get(ROUTES[0]!, token)).status).toBe(200);
+    const first = new Set(accessKeys());
+    objectAuth.length = 0;
+    expect((await get(ROUTES[3]!, token)).status).toBe(200);
+    const second = new Set(accessKeys());
+    expect(podIssued).toBeGreaterThanOrEqual(2);
+    expect([...first].some((k) => second.has(k))).toBe(false); // the later read signed with the refreshed key
+    podExpiresInMs = 6 * 60 * 60 * 1000;
+  }, 60_000);
 
   test("GCS Locker: every object read and token fetch goes only to the configured loopback endpoints", async () => {
     const token = "sh_at_synthetic-gcs";

@@ -281,7 +281,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // The self-host service only: canonical S3 (LOCKER_*) behind timing, turns,
   // metadata and catalog. The hosted Lambda never builds it (those routes keep
   // their 501 `*_not_configured` there).
-  const canonical = entry === "service" ? serviceCanonicalDeps(env, poolTenantRunner(pool as never)) : undefined;
+  const canonical = entry === "service" ? await serviceCanonicalDeps(env, poolTenantRunner(pool as never)) : undefined;
   const deps: Omit<ReadApiDeps, "verify"> = {
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness: sqlLiveness(poolTenantRunner(pool as never)),

@@ -16,15 +16,25 @@
  *   LOCKER_PROVIDER           s3 (default; MinIO, AWS S3) | gcs (Workload Identity, no HMAC keys)
  *   LOCKER_ENDPOINT           s3: e.g. http://minio:9000 (path-style); gcs: the official API or a loopback emulator
  *   LOCKER_REGION             s3: default us-east-1
- *   LOCKER_ACCESS_KEY_ID / LOCKER_SECRET_ACCESS_KEY   s3 only, from the secret store
+ *   LOCKER_ACCESS_KEY_ID / LOCKER_SECRET_ACCESS_KEY   s3 static keys (MinIO), from the secret store; unset:
+ *                             EKS Pod Identity (AWS_CONTAINER_CREDENTIALS_FULL_URI + _AUTHORIZATION_TOKEN_FILE),
+ *                             short-lived credentials refreshed before expiry
  *   LOCKER_GCS_TOKEN_URI      gcs only: the GKE metadata server (default) or a loopback stand-in
  *   PIPELINE_ORG_FROM_PREFIX  must be exactly "true" (startup refuses otherwise): see below
  *   PIPELINE_KEY_PREFIX       the base of the org-derived key layout the ingest writes
  *   READ_API_TIMING_ASSUME_NO_TURNS                   as on the Worker (exactly "true")
  *
- * LOCKER_BUCKET set but no usable store (an S3 selection without keys, an
- * unknown provider, GCS behind the S3 client): startup fails, naming the
- * variable only. Pointer rows are the authorization boundary: an object is read
+ * The store is built by src/shared/locker.ts buildLockerStore, the builder
+ * every other service uses, so credentials, provider selection and egress rules
+ * are the same: static keys or Pod Identity (the credentials token goes only to
+ * the trusted agent hosts, loopback or https), GCS Workload Identity with the
+ * configured LOCKER_ENDPOINT / LOCKER_GCS_TOKEN_URI (official API or loopback;
+ * metadata server or loopback). One credentials provider and one GCS token
+ * source serve the whole process (cached, refreshed before expiry); each
+ * request gets its own store over a fetch that carries the route's abort
+ * signal. LOCKER_BUCKET set but no usable store (no S3 credentials source, an
+ * untrusted credentials URI, an unknown provider, GCS behind the S3 client, HMAC
+ * keys on GCS): startup fails, naming the variable only. Pointer rows are the authorization boundary: an object is read
  * only through a live pointer the tenant-bound read role returned, and
  * canonicalSnapshot rechecks tenant, bucket, provider, digest and key prefix.
  *
@@ -37,9 +47,8 @@
  * LOCKER_BUCKET is set, and the reader always runs with it on.
  */
 import { zstdDecompressSync } from "node:zlib";
-import { rawStoreFromEnv } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
-import { assertLockerSelection, lockerProvider } from "../shared/locker-selection.ts";
-import { canonicalSnapshot, CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
+import { cachedProvider } from "../../packages/object-store/src/core.ts";
+import { canonicalSnapshot, type CanonicalIdentity } from "./canonical.ts";
 import type { TenantRunner } from "./liveness.ts";
 import { sqlCanonicalPointers, type CanonicalRows } from "./session-timing-source.ts";
 import { sqlSessionHarnesses } from "./session-turns-source.ts";
@@ -52,32 +61,6 @@ export interface ServiceCanonicalDeps {
   catalog: CatalogDeps;
 }
 
-type RawEnv = Parameters<typeof rawStoreFromEnv>[0];
-
-/** LOCKER_* onto the raw-store names, exactly as vendorBindings maps them for the other services. */
-function lockerRawEnv(env: NodeJS.ProcessEnv): RawEnv {
-  assertLockerSelection(env);
-  const provider = lockerProvider(env);
-  const bucket = env.LOCKER_BUCKET?.trim();
-  return {
-    PIPELINE_RAW_PROVIDER: provider,
-    PIPELINE_RAW_S3_BUCKET: bucket,
-    ...(provider === "s3"
-      ? {
-          PIPELINE_RAW_S3_ENDPOINT: env.LOCKER_ENDPOINT || undefined,
-          PIPELINE_RAW_S3_REGION: env.LOCKER_REGION || "us-east-1",
-          PIPELINE_RAW_S3_ACCESS_KEY_ID: env.LOCKER_ACCESS_KEY_ID || undefined,
-          PIPELINE_RAW_S3_SECRET_ACCESS_KEY: env.LOCKER_SECRET_ACCESS_KEY || undefined,
-        }
-      : {
-          // GCS: the configured API endpoint (e.g. a loopback emulator) and token source.
-          // Unmapped, the adapter falls back to storage.googleapis.com and 169.254.169.254.
-          PIPELINE_RAW_S3_ENDPOINT: env.LOCKER_ENDPOINT || undefined,
-          PIPELINE_RAW_GCS_TOKEN_URI: env.LOCKER_GCS_TOKEN_URI?.trim() || undefined,
-        }),
-  } as RawEnv;
-}
-
 /** zstd under the projection's output bound; any failure is the projection's `chunk_decompress_failed` refusal. */
 const decompress = (bytes: Uint8Array, max: number): Uint8Array => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: max }));
 
@@ -86,24 +69,32 @@ const decompress = (bytes: Uint8Array, max: number): Uint8Array => new Uint8Arra
  * (the routes then answer 501 `*_not_configured`, unchanged). Throws at startup
  * on a selection that names a bucket but cannot build a store.
  */
-export function serviceCanonicalDeps(
+export async function serviceCanonicalDeps(
   env: NodeJS.ProcessEnv,
   run: TenantRunner,
   fetcher: typeof fetch = (input, init) => fetch(input, init),
-): ServiceCanonicalDeps | undefined {
+): Promise<ServiceCanonicalDeps | undefined> {
   if (!env.LOCKER_BUCKET?.trim()) return undefined;
   if (env.PIPELINE_ORG_FROM_PREFIX !== "true")
     throw new Error("session read api: LOCKER_BUCKET needs PIPELINE_ORG_FROM_PREFIX=true (the org-prefix layout binds each object to its org)");
-  const rawEnv = lockerRawEnv(env);
-  if (!rawStoreFromEnv(rawEnv, fetcher))
-    throw new Error("session read api: LOCKER_BUCKET is set but LOCKER_* does not configure a readable store");
+  // Loaded only here, so the hosted Lambda (which never calls this) never evaluates the Locker client.
+  const { buildLockerStore, credentialSource, gcsMetadataToken, lockerCredentials, trustedCredentialsUri } = await import("../shared/locker.ts");
+  const { lockerProvider } = await import("../shared/locker-selection.ts");
+  // Startup validation: provider selection and endpoint/token-URI trust (assertLockerSelection), and
+  // for S3 a credentials source (static keys, or Pod Identity whose token goes only to a trusted host).
+  buildLockerStore(env);
+  const gcs = lockerProvider(env) === "gcs";
+  if (!gcs && credentialSource(env) === "pod-identity" && !trustedCredentialsUri(env.AWS_CONTAINER_CREDENTIALS_FULL_URI!))
+    throw new Error("session read api: AWS_CONTAINER_CREDENTIALS_FULL_URI is not a trusted credentials endpoint");
+  // One process-wide credentials provider (or GCS token source), cached and refreshed before expiry.
+  const credentials = gcs ? undefined : cachedProvider(lockerCredentials(env));
+  const gcsToken = gcs ? cachedProvider(() => gcsMetadataToken(env)) : undefined;
   const prefix = { PIPELINE_KEY_PREFIX: env.PIPELINE_KEY_PREFIX || undefined, PIPELINE_ORG_FROM_PREFIX: "true" };
   const pointers = sqlCanonicalPointers(run);
   async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows> {
     // Every object read of this request is aborted at the route's deadline.
     const bounded: typeof fetch = (input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal });
-    const raw = rawStoreFromEnv(rawEnv, bounded);
-    if (!raw) throw new CanonicalReadError("not_configured");
+    const raw = buildLockerStore(env, { fetch: bounded, ...(credentials ? { credentials } : {}), ...(gcsToken ? { gcsToken } : {}) });
     const snapshot = await canonicalSnapshot(
       { store: raw.store, provider: raw.provider, bucket: raw.bucket, prefix, pointers: pointers.pointers, decompress },
       identity,
