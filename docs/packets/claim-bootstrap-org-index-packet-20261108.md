@@ -260,7 +260,7 @@ any build until it finishes.
 
 ## Order of operations
 
-0. Do not start until the claim timeout-relief change's 30-minute post-change monitor has finished; one production change at a time (pipeline lead).
+0. One production change at a time (pipeline lead). The claim timeout-relief trial that this step waited on ended and was rolled back at 2026-11-08 23:41Z (pipeline lead, 245334193840164864), so the only remaining gate is Khaliq's own word in the operator's session.
 1. Measure: run M0-M5 and record counts and sizes only. Confirm that M0's
    uncovered set matches the ten tables. Stop and re-plan if it does not.
 2. Pick a low-traffic window. Confirm M3 shows no long transactions.
