@@ -31,8 +31,9 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * (docs/session-desktop-catalog.md, Activation blockers).
  * INGEST_BUFFERED_SEARCH_FEED=on (only the literal "on"; default "off", anything else refuses)
  * feeds accepted buffered stages into transcript_events (buffered-search-feed.ts); it is refused
- * unless READ_API_BUFFERED_SEARCH_GATE=on is declared too (the read Worker deploys with the gate
- * first), and needs SEARCH_INDEX_ENABLED=1 on the ClickHouse backend, the draft RPCs and the
+ * unless BUFFERED_SEARCH_FEED_GATE_DECLARED equals the read gate's contract id
+ * (BUFFERED_SEARCH_GATE_CONTRACT, "buffered-search-gate/v1"; the read Worker deploys with
+ * READ_API_BUFFERED_SEARCH_GATE=on first), and needs SEARCH_INDEX_ENABLED=1 on the ClickHouse backend, the draft RPCs and the
  * origin columns (docs/proposals/buffered-search-feed*.draft.sql) applied.
  */
 import pg from "pg";
@@ -56,7 +57,7 @@ import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { searchIndexLimits } from "./search-index.ts";
-import { BufferedFeedError, bufferedFeedConfig, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
+import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
@@ -614,6 +615,12 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
   if (event?.bufferedSearchFeed === true) {
     // Default off before secret lookup, connection pools or object access.
     if (process.env.INGEST_BUFFERED_SEARCH_FEED !== "on") return { ok: true };
+    // The ordering guard, also before any secret or connection: no declared read gate, no run.
+    const refusal = bufferedFeedGateRefusal(process.env);
+    if (refusal) {
+      log.error("buffered search feed refused", { stage: "buffered-search-feed", reason: refusal });
+      return { ok: false };
+    }
     const started = Date.now();
     try {
       const rt = await ready();

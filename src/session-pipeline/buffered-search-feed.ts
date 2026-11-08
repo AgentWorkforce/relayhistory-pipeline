@@ -27,8 +27,11 @@
  * rewrites them once with its newer `version` (origin back to canonical).
  *
  * Arming. INGEST_BUFFERED_SEARCH_FEED=on is refused unless the deployment also declares
- * READ_API_BUFFERED_SEARCH_GATE=on: buffered rows served by a reader without the gate would
- * bypass the per-hit privacy check, so the read Worker must be deployed with the gate first.
+ * BUFFERED_SEARCH_FEED_GATE_DECLARED equal to the read gate's contract id
+ * (BUFFERED_SEARCH_GATE_CONTRACT, #338 buffered-search-gate.ts; exact match, default unset):
+ * buffered rows served by a reader without the gate would bypass the per-hit privacy check, so
+ * the read Worker must be deployed with READ_API_BUFFERED_SEARCH_GATE=on first. A missing or
+ * stale declaration is a logged refusal (reason code only) and the feed does nothing.
  *
  * Idempotency. The row identity is ClickHouse's sort key (org, workspace, ts, session, source,
  * machine, kind, event_id), all derived from the record; `version` is the stage's
@@ -66,6 +69,7 @@ import { rowBytes, toIndexRow, tsMillis, type IndexRow } from "./vendor/search-i
 import { EVENTS_TABLE } from "./vendor/search-index/schema.ts";
 import { windowStart } from "./vendor/search-index/reconcile.ts";
 import type { SessionScope } from "./pointer.ts";
+import { BUFFERED_SEARCH_GATE_CONTRACT } from "../session-read-api/buffered-search-gate.ts";
 
 /** Fingerprint prefix of every buffered-origin row (`s3` canonical S3, bare md5 Neon tail). */
 export const BUFFERED_FINGERPRINT_PREFIX = "bf";
@@ -101,17 +105,28 @@ export interface BufferedFeedConfig {
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
 
-/** The read gate's own parse (#338 parseBufferedSearchGate): exactly "on", trimmed, any case. */
-export const readGateDeclared = (raw: string | undefined) => (raw ?? "").trim().toLowerCase() === "on";
+export { BUFFERED_SEARCH_GATE_CONTRACT };
+
+/**
+ * The ordering guard: why the feed must not run, or null when the deployment declares the read
+ * gate's exact contract id in BUFFERED_SEARCH_FEED_GATE_DECLARED. `gate_not_declared` when unset
+ * or empty, `gate_contract_mismatch` for any other value (a stale or mistyped declaration).
+ */
+export function bufferedFeedGateRefusal(env: NodeJS.ProcessEnv): "gate_not_declared" | "gate_contract_mismatch" | null {
+  const declared = env.BUFFERED_SEARCH_FEED_GATE_DECLARED;
+  if (declared === undefined || declared === "") return "gate_not_declared";
+  return declared === BUFFERED_SEARCH_GATE_CONTRACT ? null : "gate_contract_mismatch";
+}
 
 /**
  * Only the literals `off` (default) and `on`; every other value refuses, so a typo never arms it.
- * `on` is refused unless READ_API_BUFFERED_SEARCH_GATE=on is declared for the deployment too.
+ * `on` is refused unless BUFFERED_SEARCH_FEED_GATE_DECLARED declares the read gate's contract.
  */
 export function bufferedFeedConfig(env: NodeJS.ProcessEnv): BufferedFeedConfig {
   const flag = env.INGEST_BUFFERED_SEARCH_FEED ?? "off";
   if (flag !== "off" && flag !== "on") throw new BufferedFeedError("config_flag_invalid");
-  if (flag === "on" && !readGateDeclared(env.READ_API_BUFFERED_SEARCH_GATE)) throw new BufferedFeedError("read_gate_not_declared");
+  const refusal = flag === "on" ? bufferedFeedGateRefusal(env) : null;
+  if (refusal) throw new BufferedFeedError(refusal);
   const int = (name: string, fallback: number, min: number, max: number) => {
     const raw = env[name];
     if (raw === undefined || raw === "") return fallback;

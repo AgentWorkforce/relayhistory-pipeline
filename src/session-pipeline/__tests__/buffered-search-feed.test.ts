@@ -12,11 +12,13 @@ import type { IndexRow } from "../vendor/search-index/rows.ts";
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
 import { indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
 import { processBatch } from "../consumer.ts";
-import { lambdaEnv } from "../lambda.ts";
+import { createPipelineLambdaHandler, lambdaEnv } from "../lambda.ts";
+import { BUFFERED_SEARCH_GATE_CONTRACT } from "../../session-read-api/buffered-search-gate.ts";
 import type { SessionScope } from "../pointer.ts";
 import {
   BUFFERED_FEED_DEFAULT_SINCE,
   bufferedFeedConfig,
+  bufferedFeedGateRefusal,
   feedBufferedStageByKey,
   projectBufferedStage,
   runBufferedFeed,
@@ -386,8 +388,11 @@ describe("buffered-stage search feed", () => {
   test("lambda env: a malformed feed setting disarms only the feed, never the shared runtime", () => {
     const base = { AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "bucket", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs" };
     expect(lambdaEnv(base).bufferedSearchFeed).toMatchObject({ enabled: false });
-    const gate = { READ_API_BUFFERED_SEARCH_GATE: "on" };
+    const gate = { BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT };
     expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toMatchObject({ enabled: true });
+    // The old read-flag declaration alone no longer arms it; only the contract id does.
+    expect(lambdaEnv({ ...base, READ_API_BUFFERED_SEARCH_GATE: "on", INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toBeUndefined();
+    expect(lambdaEnv({ ...base, BUFFERED_SEARCH_FEED_GATE_DECLARED: "buffered-search-gate/v0", INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toBeUndefined();
     // Without the read gate declared the feed is refused, and the shared runtime still builds.
     expect(lambdaEnv({ ...base, INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toBeUndefined();
     expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "1" }).bufferedSearchFeed).toBeUndefined();
@@ -410,17 +415,56 @@ describe("buffered-stage search feed", () => {
 
   test("config: default off; only the literal 'on' arms it; bounds refuse", () => {
     expect(bufferedFeedConfig({})).toMatchObject({ enabled: false, pageSize: 50, stagesPerSecond: 5, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "backfill-20261105" });
-    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", READ_API_BUFFERED_SEARCH_GATE: "on" }).enabled).toBe(true);
-    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", READ_API_BUFFERED_SEARCH_GATE: " ON " }).enabled).toBe(true);
-    // Coupled to the read-side gate: buffered rows must never be served without it.
-    for (const gate of [undefined, "", "off", "1", "true"])
-      expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", READ_API_BUFFERED_SEARCH_GATE: gate })).toThrow(expect.objectContaining({ code: "read_gate_not_declared" }));
-    expect(bufferedFeedConfig({ READ_API_BUFFERED_SEARCH_GATE: "off" }).enabled).toBe(false);
-    for (const v of ["1", "true", "ON", "yes"]) expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: v, READ_API_BUFFERED_SEARCH_GATE: "on" })).toThrow(expect.objectContaining({ code: "config_flag_invalid" }));
+    const declared = { BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT };
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", ...declared }).enabled).toBe(true);
+    // The declaration alone never arms it: the feed's own flag stays the switch.
+    expect(bufferedFeedConfig(declared).enabled).toBe(false);
+    for (const v of ["1", "true", "ON", "yes"]) expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: v, ...declared })).toThrow(expect.objectContaining({ code: "config_flag_invalid" }));
     expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_PAGE: "500" })).toThrow();
     expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_RATE: "0" })).toThrow();
     expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SINCE: "yesterday" })).toThrow();
     expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_CURSOR: "../x" })).toThrow();
+  });
+
+  test("ordering guard: refuses unless the read gate's exact contract id is declared", async () => {
+    expect(BUFFERED_SEARCH_GATE_CONTRACT).toBe("buffered-search-gate/v1");
+    // Undeclared (unset or empty), even with the old read flag set.
+    for (const env of [{}, { BUFFERED_SEARCH_FEED_GATE_DECLARED: "" }, { READ_API_BUFFERED_SEARCH_GATE: "on" }]) {
+      expect(bufferedFeedGateRefusal(env)).toBe("gate_not_declared");
+      expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", ...env })).toThrow(expect.objectContaining({ code: "gate_not_declared" }));
+    }
+    // Declared, but not this contract: stale, other version, case or whitespace variants.
+    for (const v of ["on", "true", "buffered-search-gate/v0", "buffered-search-gate/v2", "BUFFERED-SEARCH-GATE/V1", ` ${BUFFERED_SEARCH_GATE_CONTRACT}`, `${BUFFERED_SEARCH_GATE_CONTRACT}\n`]) {
+      expect(bufferedFeedGateRefusal({ BUFFERED_SEARCH_FEED_GATE_DECLARED: v })).toBe("gate_contract_mismatch");
+      expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", BUFFERED_SEARCH_FEED_GATE_DECLARED: v })).toThrow(expect.objectContaining({ code: "gate_contract_mismatch" }));
+    }
+    // Both set: armed.
+    expect(bufferedFeedGateRefusal({ BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT })).toBeNull();
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT }).enabled).toBe(true);
+
+    // The scheduled run: refused before any runtime load (no secret, pool or object access).
+    const keys = ["INGEST_BUFFERED_SEARCH_FEED", "BUFFERED_SEARCH_FEED_GATE_DECLARED"] as const;
+    const saved = keys.map((k) => process.env[k]);
+    let loaded = 0;
+    const handler = createPipelineLambdaHandler({ loadRuntime: async () => { loaded++; throw new Error("synthetic runtime unavailable"); } });
+    try {
+      process.env.INGEST_BUFFERED_SEARCH_FEED = "on";
+      delete process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED;
+      expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: false });
+      process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED = "buffered-search-gate/v0";
+      expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: false });
+      expect(loaded).toBe(0);
+      // Declared: the run proceeds to load the runtime (which this test makes fail).
+      process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED = BUFFERED_SEARCH_GATE_CONTRACT;
+      expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: false });
+      expect(loaded).toBe(1);
+      // The feed's own flag off: nothing at all, whatever is declared.
+      process.env.INGEST_BUFFERED_SEARCH_FEED = "off";
+      expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: true });
+      expect(loaded).toBe(1);
+    } finally {
+      keys.forEach((k, i) => { if (saved[i] === undefined) delete process.env[k]; else process.env[k] = saved[i]; });
+    }
   });
 
   test("SQL source refuses malformed RPC results and classifies transient SQL errors", async () => {
