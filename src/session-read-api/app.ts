@@ -473,15 +473,16 @@ export function createReadApi(deps: ReadApiDeps) {
 
   /**
    * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED): the deps when the flag is on,
-   * the token carries a user, and the token's workspace is on READ_API_DIRECTORY_WORKSPACES
-   * ("*" or listing it; unset/empty = none). Otherwise undefined and the caller's route runs
-   * exactly as without the flag.
+   * the token carries a user, and the token's workspace is on both READ_API_DIRECTORY_WORKSPACES
+   * and the owner-buffered canary allowlist READ_API_OWNER_BUFFERED_WORKSPACES (each "*" or
+   * listing it; unset/empty = none). Otherwise undefined and the caller's route runs exactly as
+   * without the flag.
    */
   function ownerBufferedFor(identity: VerifiedIdentity): OwnerBufferedDeps | undefined {
     const ob = deps.ownerBuffered;
     if (!ob || ob.enabled !== true || !identity.userId) return undefined;
-    const allowed = deps.directoryWorkspaces;
-    if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) return undefined;
+    const listed = (allowed: ReadonlySet<string> | "*" | undefined) => !!allowed && (allowed === "*" || allowed.has(identity.workspaceId));
+    if (!listed(deps.directoryWorkspaces) || !listed(ob.workspaces)) return undefined;
     return ob;
   }
   const bufferedScope = (identity: VerifiedIdentity): BufferedScope => ({ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId });

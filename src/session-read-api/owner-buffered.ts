@@ -410,6 +410,12 @@ export interface OwnerBufferedReads {
 /** The app's dependency: `enabled` is the flag; the worker wires the rest only when it is on. */
 export interface OwnerBufferedDeps {
   enabled: boolean;
+  /**
+   * READ_API_OWNER_BUFFERED_WORKSPACES (parseDirectoryWorkspaces syntax): the owner-buffered
+   * canary allowlist, on top of READ_API_DIRECTORY_WORKSPACES (a workspace must be on both).
+   * Unset/empty = none, so the flag alone serves no buffered read.
+   */
+  workspaces: ReadonlySet<string> | "*";
   reads: OwnerBufferedReads;
   /** The privacy authority (HISTORY_CONTROL_HEAD); required, there is no ungated read. */
   gate: ControlHeadGate;

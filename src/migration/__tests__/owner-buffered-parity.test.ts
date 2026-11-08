@@ -208,6 +208,33 @@ describe("pipeline-lead G2 write ruling", () => {
     expect(targetStatements.at(-1)).toBe("ROLLBACK");
   });
 
+  test("G2 generation pin is checked inside the transaction before any proof write", async () => {
+    const statements: string[] = [];
+    const sourceRow = {
+      cutover_status: "active", control_epoch: H("1"), privacy_baseline_sha256: H("2"),
+      head: { epoch: H("1"), version: "7", digest: H("3"), kind: "selection", pending: false },
+      deletion_count: "0", deletion_set_sha256: H("5"), reset_count: "0", reset_set_sha256: H("6"),
+    };
+    const targetRow = {
+      control_epoch: H("1"), privacy_baseline_sha256: H("2"), target_generation: H("4"), receipts_contiguous: true,
+      latest_receipt: { epoch: H("1"), version: "7", digest: H("3"), kind: "selection" },
+      target_lineage_digest: H("7"), deletion_set_sha256: H("5"), reset_set_sha256: H("6"),
+    };
+    const neon: Queryable = { async query<T>(sql: string) {
+      return { rows: (sql.includes("delivery_cutover_status") ? [sourceRow] : []) as T[] };
+    } };
+    const target: Queryable = { async query<T>(sql: string) {
+      statements.push(sql);
+      if (sql.includes("WITH policy")) return { rows: [targetRow] as T[] };
+      return { rows: [] as T[] };
+    } };
+    await expect(writeCurrentParityProof(neon, target, BASE.tenant, H("8")))
+      .rejects.toThrow("target_generation_mismatch");
+    expect(statements.some((sql) => sql.includes("INSERT INTO sessions.owner_buffered_parity"))).toBeFalse();
+    expect(statements.some((sql) => sql.includes("UPDATE sessions.owner_buffered_parity"))).toBeFalse();
+    expect(statements.at(-1)).toBe("ROLLBACK");
+  });
+
   test("real 043700 helper matches the Neon census bytes and accepts insert/CAS update", async () => {
     const target = new PGlite({ extensions: { btree_gin, pg_trgm } });
     const neon = new PGlite();
