@@ -21,6 +21,20 @@ services, same env contract, same migrations.
 | `96b-telemetry-init` | alpine | one-shot: opens the telemetry volume for the collector's uid |
 | `96b-otel-collector` | otel/opentelemetry-collector-contrib | OTLP in; spans to `/telemetry/spans.jsonl` (port 14318) |
 
+The services image also carries `SERVICE=session-read-api` (the session read
+API over HTTP, `src/session-read-api/server.ts`). The local stack does not run
+it, and it is default-off (`RELAYHISTORY_SELFHOST_READ_API`). Dormant, it
+answers `/healthz` only. Enabled, it needs no ClickHouse: search is selected
+by `SEARCH_INDEX_BACKEND` (default `postgres`; `clickhouse` keeps the hosted
+binding; anything else fails startup), and it also requires
+`SEARCH_INDEX_POSTGRES_BACKEND_ID` (with `postgres`) and an explicit
+`SESSION_POSTGRES_TLS_PROFILE` (env table below). With `postgres`, search answers
+503 `backend_unavailable` until the search schema owner bootstrap and the read
+role's grants have run. The read login must be `NOSUPERUSER NOBYPASSRLS` (both
+search tables have forced tenant row-level security); the service checks this
+at startup and refuses otherwise. See "Postgres search prerequisites" under
+"Self-host SERVICE" in `docs/session-read-api-design.md`.
+
 Every worker blocks at start until HoopDb answers and the migration ledger is
 complete, so apply order does not matter (the same rule the Kubernetes chart
 uses via `/readyz`).
@@ -87,6 +101,9 @@ keep their path unchanged either way.
 | `RELAYCONTROL_INTROSPECT_URL` | same | Relaycontrol's base URL, configuration only. Same transport rule as every destination: https, loopback, or `http` to an in-cluster Service name with `ALLOW_IN_CLUSTER_HTTP=true` (the Worker: https or loopback only). |
 | `RELAYCONTROL_INTROSPECT_SECRET` | same | The dedicated service secret, sent as `Authorization: Bearer`. From the secret store only, never a file. |
 | `RELAYHISTORY_SELFHOST_READ_API` | read API | Exactly `true` adds `POST /v1/cli/login` (pass-through `sh_at_` exchange through the introspection above, no refresh) and `GET /v1/sessions/:id/catalog`; unset/`""`/`false` off; anything else fails startup. See docs/session-read-api-design.md §2a. |
+| `SEARCH_INDEX_BACKEND` | session-read-api (enabled) | `postgres` (default; no ClickHouse, any known `PIPELINE_RUNTIME`) or `clickhouse` (hosted binding; needs the secret's `clickhouse` block). Anything else, including a name with no implementation in this build (`opensearch`), fails startup; the error names the variable, never the value. |
+| `SEARCH_INDEX_POSTGRES_BACKEND_ID` | session-read-api (enabled, `postgres`) | Required, `[a-zA-Z0-9._-]{1,128}`: the projection-state backend id the search writer records under. Coverage is `READ_API_COMPLETE_SINCE`. Not a credential. |
+| `SESSION_POSTGRES_TLS_PROFILE` | session-read-api (enabled) | Required explicitly (the Lambda's implicit `supabase` default does not apply): `supabase`, or `custom-ca` with `SESSION_POSTGRES_CA_FILE` and `SESSION_POSTGRES_CA_SHA256` (docs/portable-lambda-runtime.md). The pool gets discrete host/port/database/user/password from the secret's URL; URL `sslmode`/`options` never reach pg, and a URL without user, password or database fails startup. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to

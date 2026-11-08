@@ -26,16 +26,16 @@ import { log } from "../shared/log.ts";
 import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
-import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
+import { PIPELINE_RUNTIMES, validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
-import { createReadApi, parseDirectoryWorkspaces } from "./app.ts";
+import { createReadApi, parseDirectoryWorkspaces, type ReadApiDeps } from "./app.ts";
 import { sqlDirectory } from "./directory.ts";
 import { sqlBriefTitles } from "./brief-titles.ts";
 import { readApiVerifier, relaycontrolLogin, type AuthConfig } from "./auth.ts";
 import { parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
-import { poolTenantRunner, sqlLiveness } from "./liveness.ts";
+import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
 
 export interface ReadApiSecret {
   clickhouse?: { url: string; user: string; password: string; database: string };
@@ -84,8 +84,91 @@ export function readApiAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthCon
 
 type App = ReturnType<typeof createReadApi>;
 
-function searchBackend(env: NodeJS.ProcessEnv, composition?: SearchComposition) {
-  return validateAdapterEnv(env, { runtime: ["lambda"], runtimeDefault: "lambda", search: ["clickhouse", ...(composition?.registry.registered().filter(name => name !== "clickhouse") ?? [])], searchDefault: "clickhouse" }).search;
+/**
+ * Which entry assembles the app. "lambda" (the default, hosted): PIPELINE_RUNTIME
+ * must be lambda, SEARCH_INDEX_BACKEND defaults to clickhouse, and the read role's
+ * URL reaches pg as a sanitized connectionString. "service" (the self-host
+ * SERVICE, server.ts): PIPELINE_RUNTIME is not this process's concern (any known
+ * value), SEARCH_INDEX_BACKEND defaults to postgres, SESSION_POSTGRES_TLS_PROFILE
+ * must be set explicitly, and the pool gets discrete host/port/database/user/
+ * password fields, so nothing in the URL's query string reaches pg.
+ */
+export type ReadAppEntry = "lambda" | "service";
+export interface ReadAppOptions { entry?: ReadAppEntry }
+
+function searchBackend(env: NodeJS.ProcessEnv, composition?: SearchComposition, entry: ReadAppEntry = "lambda") {
+  const search = ["clickhouse" as const, ...(composition?.registry.registered().filter(name => name !== "clickhouse") ?? [])];
+  if (entry === "service")
+    return validateAdapterEnv(env, { runtime: PIPELINE_RUNTIMES, runtimeDefault: "workers", search, searchDefault: "postgres" }).search;
+  return validateAdapterEnv(env, { runtime: ["lambda"], runtimeDefault: "lambda", search, searchDefault: "clickhouse" }).search;
+}
+
+/**
+ * The self-host service's search selection before any composition exists:
+ * SEARCH_INDEX_BACKEND unset or "" is postgres; otherwise exactly a name this
+ * entry can run (postgres, clickhouse). Anything else is an AdapterConfigError
+ * that names the variable and the allowed names, never the value.
+ */
+export function serviceSearchBackend(env: NodeJS.ProcessEnv): "postgres" | "clickhouse" {
+  return validateAdapterEnv(env, { runtime: PIPELINE_RUNTIMES, runtimeDefault: "workers", search: ["postgres", "clickhouse"], searchDefault: "postgres" }).search as "postgres" | "clickhouse";
+}
+
+/**
+ * The read role's pool target. Lambda: the existing sanitized connectionString
+ * (TLS/options/target overrides removed by postgresConnectionString). Service:
+ * discrete fields from the same sanitized URL; its query string is never
+ * applied, and a missing user, password or database refuses startup (pg would
+ * otherwise fall back to PG* env or a .pgpass file). Never echoes a value.
+ */
+function readerPoolTarget(url: string, entry: ReadAppEntry): pg.PoolConfig {
+  const target = new URL(postgresConnectionString(url));
+  if (entry === "service") {
+    let user: string, password: string, database: string;
+    try {
+      user = decodeURIComponent(target.username);
+      password = decodeURIComponent(target.password);
+      database = decodeURIComponent(target.pathname.replace(/^\//u, ""));
+    } catch { throw new Error("session read api secret supabase_url is invalid"); }
+    if (!user || !password || !database || database.includes("/") || target.hash)
+      throw new Error("session read api secret supabase_url needs a user, password and database");
+    return { host: target.hostname.replace(/^\[(.*)\]$/u, "$1"), port: target.port ? Number(target.port) : 5432, user, password, database };
+  }
+  // pg lets URL parameters override pool configuration. A client-side query
+  // timer does not cancel SQL, and neither URL nor ambient PGOPTIONS may
+  // disable this reader's server-side bound. TLS/target sanitization stays in
+  // postgresConnectionString; options from the URL are already removed there.
+  for (const key of [...target.searchParams.keys()])
+    if (["statement_timeout", "query_timeout"].includes(key.toLowerCase())) target.searchParams.delete(key);
+  return { connectionString: target.toString() };
+}
+
+/** Closed refusal codes for a read login that row-level security would not bind. */
+export type ReaderRoleRefusal = "reader_role_unknown" | "reader_role_superuser" | "reader_role_bypassrls";
+
+/** Names the role and the failed property only; never the URL or a credential. */
+export class ReaderRoleError extends Error {
+  constructor(readonly code: ReaderRoleRefusal, role?: string) {
+    super(`session read api: ${code}${role ? ` (role ${JSON.stringify(role.slice(0, 63))})` : ""}`);
+    this.name = "ReaderRoleError";
+  }
+}
+
+/**
+ * Self-host reader admission. Tenant isolation on search_index.projection_state
+ * and transcript_events is forced row-level security (bulls96_read.* settings,
+ * `tenant_only`), which a superuser or BYPASSRLS login skips without any error:
+ * every tenant's rows would become visible. Refuse such a login at startup
+ * rather than serve with isolation resting on WHERE clauses alone. Any failure
+ * to read the role (no row, a query error) also refuses.
+ */
+export async function assertReaderRole(sql: SqlQuery): Promise<void> {
+  const { rows } = await sql.query<{ role: unknown; rolsuper: unknown; rolbypassrls: unknown }>(
+    "SELECT current_user AS role, r.rolsuper, r.rolbypassrls FROM pg_roles r WHERE r.rolname = current_user",
+  );
+  const me = rows[0];
+  if (rows.length !== 1 || !me || typeof me.role !== "string") throw new ReaderRoleError("reader_role_unknown");
+  if (me.rolsuper !== false) throw new ReaderRoleError("reader_role_superuser", me.role);
+  if (me.rolbypassrls !== false) throw new ReaderRoleError("reader_role_bypassrls", me.role);
 }
 
 async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition): Promise<App> {
@@ -107,23 +190,23 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
   return (await readAppFromSecret(SecretString, env, composition)).app;
 }
 
-/** The same service assembly used by the Lambda loader, without credential
- * discovery. A reviewed artifact composition can provide registered adapters. */
-export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition): Promise<{ app: App; close(): Promise<void> }> {
-  const backend = searchBackend(env, composition);
+/** The read API's dependencies except its verifier: the read-role pool, the
+ * selected search binding (the ClickHouse client or the composition's adapter,
+ * never both), directory/liveness SQL and the self-host login. `close` releases
+ * the pool. readAppFromSecret adds the verifier from `authConfig`. */
+export async function readApiDepsFromSecret(secretText: string, env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition, options: ReadAppOptions = {}): Promise<{ deps: Omit<ReadApiDeps, "verify">; authConfig: AuthConfig; close(): Promise<void> }> {
+  const entry = options.entry ?? "lambda";
+  const backend = searchBackend(env, composition, entry);
   const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   const selfhostReadApi = parseSelfhostReadApi(env);
+  // The self-host service never inherits the hosted Supabase pin by omission.
+  if (entry === "service" && !env.SESSION_POSTGRES_TLS_PROFILE)
+    throw new Error("session read api: the self-host service needs SESSION_POSTGRES_TLS_PROFILE set explicitly");
   const tls = postgresTlsOptions(env);
   const secret = parseReadApiSecret(secretText, backend === "clickhouse");
-  const connectionString = new URL(postgresConnectionString(secret.supabase_url));
-  // pg lets URL parameters override pool configuration. A client-side query
-  // timer does not cancel SQL, and neither URL nor ambient PGOPTIONS may
-  // disable this reader's server-side bound. TLS/target sanitization stays in
-  // postgresConnectionString; options from the URL are already removed there.
-  for (const key of [...connectionString.searchParams.keys()])
-    if (["statement_timeout", "query_timeout"].includes(key.toLowerCase())) connectionString.searchParams.delete(key);
+  const target = readerPoolTarget(secret.supabase_url, entry);
   const pool = new pg.Pool({
-    connectionString: connectionString.toString(),
+    ...target,
     max: 2,
     application_name: "96bulls-session-read-api",
     ssl: tls,
@@ -137,11 +220,15 @@ export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessE
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   try {
+  // Directory, liveness and Postgres search isolation is forced RLS. Checked on
+  // the service always and on any portable (Postgres) search binding; the hosted
+  // ClickHouse Lambda's read role is verified by its own bootstrap
+  // (supabase/bootstrap/session_read_api_role_verify.sql).
+  if (entry === "service" || backend !== "clickhouse") await assertReaderRole(pool);
   const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", poolTenantRunner(pool as never));
   if (adapter && await adapter.state.fromMs(new Date()) > completeSinceMs) throw new Error("read history floor is below search coverage");
   const authConfig = readApiAuthConfig(env);
-  const app = createReadApi({
-    verify: readApiVerifier(authConfig),
+  const deps: Omit<ReadApiDeps, "verify"> = {
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
     directory: sqlDirectory(poolTenantRunner(pool as never)),
@@ -151,9 +238,19 @@ export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessE
     completeSinceMs,
     ...(selfhostReadApi ? { selfhost: { login: relaycontrolLogin(authConfig) } } : {}),
     log: (fields) => log.info("session read", fields),
-  });
-  return { app, close: () => pool.end() };
+  };
+  return { deps, authConfig, close: () => pool.end() };
   } catch (error) { await pool.end(); throw error; }
+}
+
+/** The same service assembly used by the Lambda loader, without credential
+ * discovery. A reviewed artifact composition can provide registered adapters;
+ * `options.entry` selects the self-host service's rules (see ReadAppEntry). */
+export async function readAppFromSecret(secretText: string, env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition, options: ReadAppOptions = {}): Promise<{ app: App; close(): Promise<void> }> {
+  const { deps, authConfig, close } = await readApiDepsFromSecret(secretText, env, composition, options);
+  try {
+    return { app: createReadApi({ verify: readApiVerifier(authConfig), ...deps }), close };
+  } catch (error) { await close(); throw error; }
 }
 
 export interface FunctionUrlEvent {
