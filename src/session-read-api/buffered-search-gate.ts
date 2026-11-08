@@ -79,6 +79,16 @@ export const MAX_GATE_OWNERS = 16;
 /** The head is a few hundred bytes; anything far larger is not the head. */
 const MAX_HEAD_BYTES = 8 * 1024;
 
+/**
+ * The gate's contract id: what this module guarantees about every `origin = 'buffered'` row it
+ * serves (rules 1-5 above, fail closed; event pages serve canonical rows only where the gate is
+ * not wired). The buffered-stage feeder (src/session-pipeline/buffered-search-feed.ts) refuses to
+ * write buffered rows unless its deployment declares exactly this value in
+ * BUFFERED_SEARCH_FEED_GATE_DECLARED, i.e. an operator asserts the read side runs this gate.
+ * Bump it whenever a rule above weakens or changes meaning, so a stale declaration refuses.
+ */
+export const BUFFERED_SEARCH_GATE_CONTRACT = "buffered-search-gate/v1";
+
 export const ORIGIN_CANONICAL = "canonical";
 export const ORIGIN_BUFFERED = "buffered";
 

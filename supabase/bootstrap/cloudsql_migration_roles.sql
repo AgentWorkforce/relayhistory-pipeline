@@ -56,7 +56,8 @@ BEGIN
     'bulls96_project_events'::name,
     'bulls96_privacy_eraser'::name,
     'bulls96_babysitter_retention'::name,
-    'bulls96_acquisition_installer'::name
+    'bulls96_acquisition_installer'::name,
+    'buffered_search_feed_runtime'::name
   ] LOOP
     SELECT * INTO v_row FROM pg_roles WHERE rolname = v_role;
     IF NOT FOUND THEN
@@ -157,6 +158,10 @@ BEGIN
       CREATE ROLE bulls96_acquisition_installer
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'buffered_search_feed_runtime') THEN
+      CREATE ROLE buffered_search_feed_runtime
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
     RESET ROLE;
     DROP ROLE bulls96_cloudsql_role_seed;
   END IF;
@@ -173,7 +178,8 @@ BEGIN
        'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events',
        'bulls96_privacy_eraser',
        'bulls96_babysitter_retention',
-       'bulls96_acquisition_installer'
+       'bulls96_acquisition_installer',
+       'buffered_search_feed_runtime'
      )
   ) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',

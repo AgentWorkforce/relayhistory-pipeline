@@ -22,11 +22,16 @@
 --             bulls96_acquisition_installer  the Factory acquisition installer: USAGE on sessions and
 --                                            EXECUTE on install/revoke/rebind/status only (20261105043850;
 --                                            made LOGIN by acquisition_installer_role.sql)
+--             buffered_search_feed_runtime   the session pipeline's buffered search feeder: USAGE on
+--                                            sessions and EXECUTE on the three buffered_search_feed_*
+--                                            RPCs only (20261105043870; made LOGIN by
+--                                            buffered_search_feed_runtime_role.sql)
 --   attrs     NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
---   members   member of none. bulls96_acquisition_installer additionally has NO members (no login may
---             SET ROLE to it); the one tolerated inbound edge is Supabase's PG16+ creator edge
---             (postgres, granted by superuser supabase_admin, ADMIN TRUE, INHERIT FALSE, SET FALSE), the
---             exact predicate of acquisition_installer_verify.sql. The other roles keep their own member
+--   members   member of none. bulls96_acquisition_installer and buffered_search_feed_runtime additionally
+--             have NO members (no login may SET ROLE to them); the one tolerated inbound edge is Supabase's
+--             PG16+ creator edge (postgres, granted by superuser supabase_admin, ADMIN TRUE, INHERIT FALSE,
+--             SET FALSE), the exact predicate of acquisition_installer_verify.sql and
+--             buffered_search_feed_runtime_verify.sql. The other roles keep their own member
 --             contracts in their verifiers (the seeder is granted to an operator login by design).
 --   run as    a superuser (CNPG `postgres`); a CREATEROLE role on PostgreSQL 15 and
 --             older (Cloud SQL's migration_owner); or Supabase's `postgres` on 16+.
@@ -34,7 +39,7 @@
 --             where the migrator may; on Supabase the runbook runs it as `postgres`).
 --   exit      success: both roles exist (created now or already) and are not elevated.
 --             failure: 42501 (caller may not create them) or 55000 (an existing role is
---             elevated or a member of a role, or the installer has a member; nothing is changed). It never alters an
+--             elevated or a member of a role, or the installer or feed runtime role has a member; nothing is changed). It never alters an
 --             existing role, so it is safe after session_ingest_role.sql made one LOGIN.
 --
 -- Idempotent and atomic (one DO block). Roles are cluster-wide.
@@ -47,7 +52,7 @@ DECLARE
   v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
   v_version int := current_setting('server_version_num')::int;
 BEGIN
-  FOREACH v_name IN ARRAY ARRAY['bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'bulls96_acquisition_installer'] LOOP
+  FOREACH v_name IN ARRAY ARRAY['bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'bulls96_acquisition_installer', 'buffered_search_feed_runtime'] LOOP
     SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
     IF NOT FOUND THEN
       SELECT rolsuper, rolcreaterole INTO v_me FROM pg_roles WHERE rolname = current_user;
@@ -74,13 +79,13 @@ BEGIN
         MESSAGE = format('bootstrap %s: the role is a member of another role', v_name),
         HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
     END IF;
-    -- Inbound direction, installer only (dogpatch P1): a login that is a member OF the installer can
-    -- SET ROLE to it and call the SECURITY DEFINER acquisition RPCs directly. Only Supabase's PG16+
+    -- Inbound direction, installer and feed runtime role only (dogpatch P1): a login that is a member OF
+    -- either can SET ROLE to it and call its SECURITY DEFINER RPCs directly. Only Supabase's PG16+
     -- creator edge is tolerated, and only where this file itself would have admitted Supabase's postgres
     -- as the creator: it is SET FALSE and INHERIT FALSE, so it can neither SET ROLE nor inherit the
     -- grants. Before PG16 (no inherit_option/set_option) every member is refused. Both paths name the
     -- member in the 55000 message.
-    IF v_name = 'bulls96_acquisition_installer' THEN
+    IF v_name IN ('bulls96_acquisition_installer', 'buffered_search_feed_runtime') THEN
       IF v_version >= 160000 THEN
         FOR v_member IN EXECUTE 'SELECT u.rolname, g.rolname AS grantor, g.rolsuper AS grantor_super, a.admin_option, a.inherit_option, a.set_option
             FROM pg_auth_members a JOIN pg_roles u ON u.oid = a.member JOIN pg_roles g ON g.oid = a.grantor
@@ -92,7 +97,7 @@ BEGIN
           ELSE
             RAISE EXCEPTION USING ERRCODE = '55000',
               MESSAGE = format('bootstrap %s: the role has an unexpected member %I', v_name, v_member.rolname),
-              HINT = 'Nothing was changed. Revoke the membership by hand (no login may be a member of the installer), then rerun.';
+              HINT = 'Nothing was changed. Revoke the membership by hand (no login may be a member of this role), then rerun.';
           END IF;
         END LOOP;
       ELSE
@@ -106,7 +111,7 @@ BEGIN
         IF FOUND THEN
           RAISE EXCEPTION USING ERRCODE = '55000',
             MESSAGE = format('bootstrap %s: the role has an unexpected member %I', v_name, v_member.rolname),
-            HINT = 'Nothing was changed. Revoke the membership by hand (no login may be a member of the installer), then rerun.';
+            HINT = 'Nothing was changed. Revoke the membership by hand (no login may be a member of this role), then rerun.';
         END IF;
       END IF;
     END IF;

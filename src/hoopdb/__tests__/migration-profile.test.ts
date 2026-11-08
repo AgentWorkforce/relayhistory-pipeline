@@ -1513,12 +1513,15 @@ describe("per-step catalog sentinels", () => {
   // INHERIT FALSE, SET TRUE: the member gains nothing implicitly but can SET ROLE to the installer.
   const SET_ONLY_MEMBER = `CREATE ROLE g6_attacker LOGIN; GRANT ${INSTALLER} TO g6_attacker WITH INHERIT FALSE, SET TRUE`;
 
-  test("acquisition installer verifier: wired as the last phase 2 step of every verifying plan, absent with verify off", async () => {
+  const FEED_VERIFY = "verify:buffered_search_feed_runtime";
+  test("acquisition installer verifier: wired in phase 2 of every verifying plan, just before the buffered feed runtime verifier (last); absent with verify off", async () => {
     for (const profile of [LOCAL, { ...LOCAL, bootstrap: false }, { ...LOCAL, mode: "selfhosted" as const, shim: false, bootstrap: false }]) {
       const verify = (await plan(profile)).filter((st) => st.name.startsWith("verify:")).map((st) => st.name);
-      expect(verify.at(-1)).toBe(ACQ_VERIFY);
+      expect(verify.slice(-2)).toEqual([ACQ_VERIFY, FEED_VERIFY]);
       expect(verify.filter((n) => n === ACQ_VERIFY)).toHaveLength(1);
+      expect(verify.filter((n) => n === FEED_VERIFY)).toHaveLength(1);
       expect((await plan(profile)).find((st) => st.name === ACQ_VERIFY)?.path).toBe(VERIFIER);
+      expect((await plan(profile)).find((st) => st.name === FEED_VERIFY)?.path).toBe(join(root, "supabase/bootstrap/buffered_search_feed_runtime_verify.sql"));
     }
     expect((await plan({ ...LOCAL, verify: false })).some((st) => st.name.startsWith("verify:"))).toBe(false);
   });
@@ -1546,10 +1549,37 @@ describe("per-step catalog sentinels", () => {
     }));
     expect(verifierOnly?.code).toBe("55000");
     expect(verifierOnly?.message).toBe("acquisition installer has an unexpected member");
-    expect(seen.length).toBe((await plan(LOCAL)).filter((st) => st.name.startsWith("verify:")).length);
+    // Phase 2 stops at the acquisition verifier: every verifier up to and including it ran (the buffered feed
+    // runtime verifier, after it, did not).
+    const verifyNames = (await plan(LOCAL)).filter((st) => st.name.startsWith("verify:")).map((st) => st.name);
+    expect(seen.length).toBe(verifyNames.indexOf("verify:acquisition_installer") + 1);
     expect(await marker(db)).toBe("pending");
     expect(await installerGrants(db)).toBe(grants);
     await db.exec("DROP ROLE g6_attacker");
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await marker(db)).toBe("pass");
+  });
+
+  test("buffered feed runtime verifier, full migrate path: a SET-only LOGIN member is refused 55000 by the bootstrap, then by the last verifier with the bootstrap off; removing it passes", async () => {
+    const FEED = "buffered_search_feed_runtime";
+    const db = await fresh();
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await marker(db)).toBe("pass");
+    await db.exec(`CREATE ROLE g6_feed_attacker LOGIN; GRANT ${FEED} TO g6_feed_attacker WITH INHERIT FALSE, SET TRUE`);
+    const boot = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(boot?.code).toBe("55000");
+    expect(boot?.message).toBe(`bootstrap ${FEED}: the role has an unexpected member g6_feed_attacker`);
+    expect(await marker(db)).toBe("pending");
+    const seen: string[] = [];
+    const verifierOnly = await failure(runMigrations(client(db), {
+      profile: { ...LOCAL, bootstrap: false },
+      beforeVerify: async () => { seen.push("verify"); },
+    }));
+    expect(verifierOnly?.code).toBe("55000");
+    expect(verifierOnly?.message).toBe("buffered search feed runtime has an unexpected member");
+    expect(seen.length).toBe((await plan(LOCAL)).filter((st) => st.name.startsWith("verify:")).length);
+    expect(await marker(db)).toBe("pending");
+    await db.exec("DROP ROLE g6_feed_attacker");
     expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
     expect(await marker(db)).toBe("pass");
   });
@@ -1935,19 +1965,20 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const O = "upstream:20261105043700_owner_buffered_read.sql";
     const Q = "upstream:20261105043800_lazy_ack_clock_no_key_update.sql";
     const W = "upstream:20261105043860_buffered_search_gate.sql";
+    const X = "upstream:20261105043870_buffered_search_feed_cursor.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
@@ -1983,7 +2014,24 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 043860 (buffered search gate reader) is the latest: 043800 and 043700 refuse (55000) while it is applied;
+    // 043870 (buffered search feed cursor) is the latest: 043860 and 043850 refuse (55000) while it is applied;
+    // its own down drops only the three feed functions, the cursor table and its ledger row (the validation stays as it was).
+    const feedFns = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE oid IN (to_regprocedure('sessions.buffered_search_feed_page(jsonb)'), to_regprocedure('sessions.buffered_search_feed_stage(jsonb)'), to_regprocedure('sessions.buffered_search_feed_advance(jsonb)'))")).rows[0]!.n;
+    expect(await names()).toContain(X);
+    expect(await feedFns()).toBe(3);
+    expect(await relation("sessions.buffered_search_feed_cursors")).toBe("sessions.buffered_search_feed_cursors");
+    expect((await failure(rollback("20261105043860_buffered_search_gate.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105043850_ingest_acquisition_owner.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([W, "upstream:20261105043850_ingest_acquisition_owner.sql"]));
+    await rollback("20261105043870_buffered_search_feed_cursor.down.sql");
+    expect(await names()).not.toContain(X);
+    expect(await feedFns()).toBe(0);
+    expect(await relation("sessions.buffered_search_feed_cursors")).toBeNull();
+    // The down revokes the runtime role's schema USAGE and keeps the role itself.
+    expect((await db.query<{ u: boolean | null }>("SELECT (SELECT has_schema_privilege(r.oid, 'sessions', 'USAGE') FROM pg_roles r WHERE r.rolname = 'buffered_search_feed_runtime') AS u")).rows[0]!.u).toBe(false);
+    expect(await passed()).toBe(true);
+    // 043860 (buffered search gate reader) is then the latest: 043800 and 043700 refuse (55000) while it is applied;
     // its own down drops only the one function and its ledger row (the validation stays as it was).
     const gateFn = async () =>
       (await db.query<{ r: string | null }>("SELECT to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)')::text r")).rows[0]?.r ?? null;
@@ -2162,15 +2210,17 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // exact-ACL check finds no drift.
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
     // Up again: 041000's exact source-table list is back in both lazy functions, 043500's lazy claim
-    // narrowing is back, 043700's four functions and parity table, 043800's staged-ACK NO KEY UPDATE and
-    // 043860's gate reader.
+    // narrowing is back, 043700's four functions and parity table, 043800's staged-ACK NO KEY UPDATE,
+    // 043860's gate reader and 043870's feed functions and cursor table.
     expect(await lazyRecords()).toContain("lazy-native-origin-v1");
     expect(await gateFn()).not.toBeNull();
+    expect(await feedFns()).toBe(3);
+    expect(await relation("sessions.buffered_search_feed_cursors")).toBe("sessions.buffered_search_feed_cursors");
     expect(await lazyAck()).toContain("WHERE singleton FOR NO KEY UPDATE;");
     expect(await ownerReadFns()).toBe(4);
     expect(await parityTable()).toBe("sessions.owner_buffered_parity");
     expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
@@ -2332,10 +2382,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'bulls96_acquisition_installer')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'bulls96_acquisition_installer', 'buffered_search_feed_runtime')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(13);
+    expect(targets.rows).toHaveLength(14);
     expect(targets.rows.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
     const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
     const prerequisites = new Set(["anon", ...Object.values(manifest).flat().map(grant => grant.split(":")[0]!).filter(role => role !== "<owner>")]);
