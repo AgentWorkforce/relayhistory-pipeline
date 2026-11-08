@@ -21,6 +21,7 @@ import {
   projectTombstone,
 } from "./canonical-image.ts";
 import { DOCUMENT_FEATURES_TABLE } from "./document-schema.ts";
+import { featureRetirementCommands } from "./feature-retirement.ts";
 import {
   produceDocumentFeatures,
   type CanonicalDocumentRow,
@@ -224,11 +225,21 @@ export async function copyCanonicalEntry(
     // CH/ACK effects even if the blocked promise releases afterward.
     if (signal?.aborted)
       return { kind: "refused" as const, reason: "aborted" };
-    await ch.insert(
-      kind === "event" ? EVENT_FEATURES_TABLE
-        : kind === "brief" ? BRIEF_FEATURES_TABLE
-        : DOCUMENT_FEATURES_TABLE,
-      produced.rows);
+    const table = kind === "event" ? EVENT_FEATURES_TABLE
+      : kind === "brief" ? BRIEF_FEATURES_TABLE : DOCUMENT_FEATURES_TABLE;
+    await ch.insert(table, produced.rows);
+    // A tombstone is not read erasure. Match the legacy publisher's exact-key,
+    // strictly older-version cleanup BEFORE acknowledging this page. A failed
+    // delete leaves the page unacknowledged so restart repeats the cleanup.
+    for (const command of featureRetirementCommands(table, produced.rows)) {
+      if (signal?.aborted)
+        return { kind: "refused" as const, reason: "aborted" };
+      if (guards?.beforeWrite && !(await guards.beforeWrite()))
+        return { kind: "refused" as const, reason: "lease_lost" };
+      if (signal?.aborted)
+        return { kind: "refused" as const, reason: "aborted" };
+      await ch.command(command.query, command.options);
+    }
     if (signal?.aborted)
       return { kind: "refused" as const, reason: "aborted" };
     await acks.ackPage({

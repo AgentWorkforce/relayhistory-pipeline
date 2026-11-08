@@ -49,6 +49,10 @@
     // 501 directory_workspace_not_enabled (Cloud keeps its current path); "*" = all;
     // else comma-separated workspace ids. The deploy workflow sets it from
     // vars.SESSION_READ_DIRECTORY_WORKSPACES (unset = empty).
-    "READ_API_DIRECTORY_WORKSPACES": ""
+    "READ_API_DIRECTORY_WORKSPACES": "",
+    // The brief-titles allowlist (F2, GET /v1/sessions/titles). Empty = every workspace gets
+    // 501 brief_titles_workspace_not_enabled; "*" = all; else comma-separated workspace ids.
+    // The deploy workflow sets it from vars.SESSION_READ_BRIEF_TITLES_WORKSPACES (unset = empty).
+    "READ_API_BRIEF_TITLES_WORKSPACES": ""
   }
 }

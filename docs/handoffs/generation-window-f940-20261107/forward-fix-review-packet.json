@@ -1,0 +1,14 @@
+{
+  "kind": "g2_current_pending_state_forward_apply_review_packet",
+  "sourceCommit": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "guardSha256": "c3bf3d6c45ef6e9c3136251bac8ced5fbe5472554ca2ed201229ed189b77ebb9",
+  "credentialDriverSha256": "b554cadbc0bce65861eb0c49cde49b41d14428dffaed6ea2a660b263f13b3aaf",
+  "nativePlan": "36fa30b0ad611f622b70ff15c7065cbb59985d5d21abaecb0a40dda44ba97d91",
+  "nativeDetailedPlan": "2350c486ef07fa7d02786fc56622e89ff2ceb398780cf3dd5c649760f940429c",
+  "provenance": "6e2fb9a20a9fd7403267688938e161415231b67d4597aa85cbbb5f78bf0e9a4d",
+  "nativePlanReceiptSha256": "82c2e0ec7421c574b3e1f9cde9db5388d7d63a3aeee2493045c123085a13ea8e",
+  "diffExplanation": "Only generation binding action update -> noop and detailed properties -> no declared property changes. Worker still update;15 app bindings noop; fanout queue/consumer/DLQ noop. Pendingstate already records desiredG2 generation;actualCFWorker stillG1.",
+  "sourceMapEquivalenceProofSha256": "4fc9bd57773ec1d1bb1e76b74da061894dfa6decdc31a7aee33be9515eebede7",
+  "appStateProjectionSha256": "a80a6f9df6c1a5431d05e4f08db917e08b409e2f060befe33503182d7d3cefb5",
+  "applyPerformed": false
+}

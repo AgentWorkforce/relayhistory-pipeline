@@ -1,0 +1,215 @@
+{
+  "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "files": [
+    {
+      "path": "src/hoopdb/owner-operator-apply.ts",
+      "bytes": 19018,
+      "sha256": "a6a3535d25a0efc62270768df183d4821faee8598948bf6d190513d8ed305e69"
+    },
+    {
+      "path": "scripts/schema-release-owner-apply.ts",
+      "bytes": 6420,
+      "sha256": "906e63b9ee120218188c97905c1041c2fd7b12ef4fa9a433eeaefab37723c8fa"
+    },
+    {
+      "path": "scripts/schema-release-owner-operator-plan.ts",
+      "bytes": 5024,
+      "sha256": "0d424a2b46d46d978ff892b18ebd33839b469f8c4416f0d5c2a651d778b24b71"
+    },
+    {
+      "path": "src/hoopdb/migrate.ts",
+      "bytes": 40026,
+      "sha256": "546b91453f6bff177bb7d0c4359bd4e4f7371a8728df35229c961c966de0b9d9"
+    },
+    {
+      "path": "scripts/ingest-generation-rebind.ts",
+      "bytes": 2227,
+      "sha256": "4dc3cca0e0b893e6689bbcb97b613ec12d514bb7de2ec7147d037efea0f30516"
+    },
+    {
+      "path": "src/hoopdb/ingest-generation-rebind.ts",
+      "bytes": 4465,
+      "sha256": "5e3adcde71f2ad34e50b10c9c1531c4225f71b2647083a199d7e0bbab948aa93"
+    },
+    {
+      "path": "docs/private-ingest-operator.md",
+      "bytes": 7277,
+      "sha256": "da5324222ab231a87eb41951a04e9eaa322dfc5ed7b8d27d0d692d6627eec424"
+    },
+    {
+      "path": "stacks/cloudflare/session-ingest.ts",
+      "bytes": 26951,
+      "sha256": "8589682d2a4ff49accba7bfddfc239f643e52cc397f49ca4f2b332b23604cca5"
+    },
+    {
+      "path": "src/session-ingest/worker.ts",
+      "bytes": 18713,
+      "sha256": "9a139be4fab414c9973e1bcfa971e48550324987f7abd6c10c9e9cda0f4d89fa"
+    },
+    {
+      "path": "scripts/build-buffered-gc.ts",
+      "bytes": 2572,
+      "sha256": "def4ed386507540417f2cf2dc31e29a7a754f83594fb3ec1099f53c19090eecb"
+    },
+    {
+      "path": "stacks/aws/buffered-gc.template.json",
+      "bytes": 12150,
+      "sha256": "1cc115091b443e31bc8c98bd2d213b163cfa5a95b19dfe49d73446c88c7e2150"
+    },
+    {
+      "path": "src/session-ingest/buffered-gc-job.ts",
+      "bytes": 9248,
+      "sha256": "7a21388d592b7983a08bc3f2093a0cb8efb0c7404361526cfee34c4911d88bcd"
+    },
+    {
+      "path": "scripts/build-canonical-publication.ts",
+      "bytes": 2541,
+      "sha256": "125c6181c692b1876fafa96eebd437f80b834a57a82a66b3c11d0121ce30a09a"
+    },
+    {
+      "path": "src/session-ingest/publication-main.ts",
+      "bytes": 2027,
+      "sha256": "2eca153f6379c4f4d89ffdc1f23ad0f97d1e4fa5e8b63d47ef16c27ead0b729f"
+    },
+    {
+      "path": "src/session-ingest/publication-runtime.ts",
+      "bytes": 9112,
+      "sha256": "5fb4be5e500b36ffd186fc746135cc3f8bb0009ca0c5830cda08b99687991a71"
+    },
+    {
+      "path": "runbooks/buffered-canonical-drain.md",
+      "bytes": 11909,
+      "sha256": "00c9efd7b629c55e7194e1b8b0fc5bafe32b06db4dea098dd930c1e7b8544330"
+    },
+    {
+      "path": "src/hoopdb/indexer.ts",
+      "bytes": 4060,
+      "sha256": "16233e9c1a75bd48b0b7084b981aa55b3d376a0a0b942006cb18b0878acaffc7"
+    },
+    {
+      "path": "src/session-pipeline/lambda.ts",
+      "bytes": 33427,
+      "sha256": "7fa77426d85cbd7bb512739187507a0815ecc6ade7a3b564a7db11cbef9c434a"
+    },
+    {
+      "path": "supabase/bootstrap/session_ingest_roles.sql",
+      "bytes": 4771,
+      "sha256": "c957ae416d707d471b576bea93dee07f2035fb8b930bacaff4207d63ffc0b478"
+    },
+    {
+      "path": "supabase/bootstrap/session_read_api_roles.sql",
+      "bytes": 3768,
+      "sha256": "e38dedf541d889a808d1706bbc217a6ac1e22cc9ea3fa809f13595faf09704ec"
+    },
+    {
+      "path": "supabase/bootstrap/canonical_project_events_verify.sql",
+      "bytes": 4655,
+      "sha256": "af9f4447389b568d2f01ae4db63102866c40e99f73a9f4bcb8a3d867086c9911"
+    },
+    {
+      "path": "supabase/migrations/20261105020000_session_replay_pages.sql",
+      "bytes": 17463,
+      "sha256": "4d0d73a489a84f806728705365491514fea9dcb99cf80f323f0f289f4f63028e"
+    },
+    {
+      "path": "supabase/migrations/20261105021000_session_large_read_jobs.sql",
+      "bytes": 15314,
+      "sha256": "a28d34b83e22747ed54933cce5287671b0f5568e832bbcb981ad34a8f36461df"
+    },
+    {
+      "path": "supabase/migrations/20261105022000_session_desktop_catalog.sql",
+      "bytes": 7472,
+      "sha256": "60166b2531f22bc64e661f070cf8ead0103b3dc32eb051b5f29a9846bb6b60f3"
+    },
+    {
+      "path": "supabase/migrations/20261105023000_session_analysis_publications.sql",
+      "bytes": 20718,
+      "sha256": "029b7dc6e393046728bfbb17118c4c3339158f419ed69a941e7bfc1fb6df083d"
+    },
+    {
+      "path": "supabase/migrations/20261105024000_session_brief_documents.sql",
+      "bytes": 18978,
+      "sha256": "bf5ed120b9410d541b2852ebc6967603817bd9d9185031061b55190162eeb04a"
+    },
+    {
+      "path": "supabase/migrations/20261105025000_canonical_feature_journal.sql",
+      "bytes": 11580,
+      "sha256": "4c170bf8fb03c67f386a333bc12a174bcc3f21519d577fd15c79849513606ff7"
+    },
+    {
+      "path": "supabase/migrations/20261105026000_canonical_history_lineage.sql",
+      "bytes": 181815,
+      "sha256": "bb7edc217d3428216ef210d11149876de61cdfe9f29fac754f64e3ba74ba5b55"
+    },
+    {
+      "path": "supabase/migrations/20261105030000_canonical_feature_consumer_acks.sql",
+      "bytes": 8751,
+      "sha256": "9c39df54716dfa3dc87c67cd87fb062815883dbc3d5d316ece7dd9848a893730"
+    },
+    {
+      "path": "supabase/migrations/20261105031000_desktop_catalog_forget_reproject.sql",
+      "bytes": 18566,
+      "sha256": "256a2037505b274ee3e3f4d5ac18375b2acc104ca7166afe1e22cb511fe4542d"
+    },
+    {
+      "path": "supabase/migrations/20261105032000_session_large_read_routing_fixes.sql",
+      "bytes": 12214,
+      "sha256": "3e452992cde70c9e74a72969d797ea4d0b0a8b306face6b6144c4a2ca24422f6"
+    },
+    {
+      "path": "supabase/migrations/20261105033000_canonical_project_events.sql",
+      "bytes": 15942,
+      "sha256": "c7a7149c838f1f4c9b8408446c96e536d0226774879ef75ba5536fc66aea5572"
+    },
+    {
+      "path": "supabase/migrations/20261105034000_session_directory_read_api.sql",
+      "bytes": 18888,
+      "sha256": "b30397f45f0dbe006b906bf458115f9ffda4a1c93f2b196f674c4a5cfb97419a"
+    },
+    {
+      "path": "supabase/migrations/20261105035000_semantic_copy_state.sql",
+      "bytes": 16041,
+      "sha256": "ccec7c704348551559d1288e1d28c8e2b7fd9aed3bf18a56921b02b88bd955ee"
+    },
+    {
+      "path": "supabase/migrations/20261105036000_canonical_consumer_lease.sql",
+      "bytes": 3215,
+      "sha256": "80cff7d75c0fbff33ae47e6ecef81259c5484f86678c52abeec2bc4c621b27e0"
+    },
+    {
+      "path": "supabase/migrations/20261105037000_session_directory_document_pool.sql",
+      "bytes": 3945,
+      "sha256": "ece2086aac0040e16ddc62dc441b18acfee82ebbe9248359c1e211b1bc404234"
+    },
+    {
+      "path": "supabase/migrations/20261105038000_claim_attempt_records_retirement.sql",
+      "bytes": 13356,
+      "sha256": "0ec8db8d908f86a585d84badd3a9fc59b8a94217d88e11506f321392ee644f13"
+    },
+    {
+      "path": "supabase/migrations/20261105039000_buffered_gc_single_candidate.sql",
+      "bytes": 9715,
+      "sha256": "eb04d062b0b612978ffa9da4dc42b63f4d6e2a1c1b0223f3ef7c903b3f1b0cde"
+    },
+    {
+      "path": "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql",
+      "bytes": 18315,
+      "sha256": "4dfa078533721cc6b36f69b7e56c7aa6072284c21e6de825e982bfc961affd3d"
+    },
+    {
+      "path": "supabase/migrations/20261105041000_ingest_privacy_authority.sql",
+      "bytes": 78386,
+      "sha256": "ea95cde07d67ed91abccbaef50de1d4ce503310d2f4d523c58e02833d87d8557"
+    },
+    {
+      "path": "supabase/migrations/20261105042000_babysitter_evidence_retention.sql",
+      "bytes": 70421,
+      "sha256": "2d3d04b3fd48c72ecf3ddcc6da7a54d30e9d72234d27241feab8b3e4499db29f"
+    },
+    {
+      "path": "supabase/migrations/20261105043000_brief_titles.sql",
+      "bytes": 16996,
+      "sha256": "ee4ae115582962c5c1b99a747812ef015abf2049e6837ff8a0e7f57c48228336"
+    }
+  ]
+}

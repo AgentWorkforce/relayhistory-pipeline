@@ -13,11 +13,12 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { MAX_SCRUB_CHARS, scrubJson, scrubText } from "../src/lib/scrub.js";
+import { scrubRecords } from "../src/lib/pipeline/raw-chunks.js";
+import { MAX_SCRUB_CHARS, scrubJson, scrubRecord, scrubText } from "../src/lib/scrub.js";
 
 /** sha256 of the corpus. Update in both repos together when the corpus changes. */
 const CORPUS_SHA256 =
-  "9a80b081d2ab1a2be7a9f36e73bcf6f27861b7096418a372ce12b567be52a860";
+  "d4589b4d008ef9bc1fdfc385f4aa209aef8044c9e3cd5abc14114544faa6ca49";
 
 const CORPUS_PATH = fileURLToPath(
   new URL("./fixtures/scrub-secret-corpus.json", import.meta.url).href,
@@ -34,6 +35,10 @@ interface Case {
   id: string;
   input: string;
   expected: string;
+  /** Also a stored record: `input` is one JSON line, run through the record path too. */
+  record?: boolean;
+  /** The record path's output (`JSON.stringify(scrubJson(JSON.parse(input)))`); default `expected`. */
+  expectedRecord?: string;
 }
 interface Corpus {
   generators: Record<string, Generator>;
@@ -79,7 +84,10 @@ function generate(g: Generator): string {
   return `${g.prefix ?? ""}${body}${g.suffix ?? ""}`;
 }
 
-/** Fill every placeholder in `input` and `expected` with one fresh value per name. */
+/**
+ * Fill every placeholder in `input` and `expected` with one fresh value per name. A
+ * record case's values are JSON-escaped, so its input stays one valid JSON line.
+ */
 function instantiate(c: Case) {
   const values = new Map<string, string>();
   const fill = (s: string) =>
@@ -87,15 +95,20 @@ function instantiate(c: Case) {
       const g = corpus.generators[name];
       if (!g) throw new Error(`${c.id}: unknown placeholder ${name}`);
       if (!values.has(name)) values.set(name, generate(g));
-      return values.get(name) as string;
+      const value = values.get(name) as string;
+      return c.record ? JSON.stringify(value).slice(1, -1) : value;
     });
   const input = fill(c.input);
   const expected = fill(c.expected);
+  const expectedRecord = fill(c.expectedRecord ?? c.expected);
   const secrets = [...values]
     .filter(([name]) => corpus.secrets.includes(name))
     .map(([, v]) => v);
-  return { input, expected, secrets };
+  return { input, expected, expectedRecord, secrets };
 }
+
+/** Sentinel words corpus inputs place where a value must not survive. */
+const SENTINEL = "SECRETTAIL";
 
 /** Every 12-character window of a secret; none may survive scrubbing. */
 function fragments(secret: string): string[] {
@@ -126,15 +139,46 @@ describe("shared secret-scrubbing corpus", () => {
   for (const c of corpus.cases) {
     it(c.id, () => {
       for (let round = 0; round < 5; round++) {
-        const { input, expected, secrets } = instantiate(c);
+        const { input, expected, expectedRecord, secrets } = instantiate(c);
         const once = scrubText(input);
         expect(once, c.id).toBe(expected);
-        for (const secret of secrets)
-          for (const f of fragments(secret))
-            expect(once.includes(f), `${c.id} leaked ${f.length} chars`).toBe(
-              false,
-            );
+        const outputs = [once];
+        if (!expected.includes(SENTINEL))
+          expect(once.includes(SENTINEL), `${c.id} kept a sentinel`).toBe(false);
         expect(scrubText(once), `${c.id} is not idempotent`).toBe(once);
+        if (c.record) {
+          // The record path: the parsed object through scrubJson and scrubRecord.
+          const parsed = JSON.parse(input) as Record<string, unknown>;
+          const viaJson = JSON.stringify(scrubJson(parsed));
+          expect(viaJson, `${c.id} (record path)`).toBe(expectedRecord);
+          const viaRecord = JSON.stringify(scrubRecord(parsed));
+          outputs.push(viaJson, viaRecord);
+          for (const out of [viaJson, viaRecord])
+            expect(out.includes(SENTINEL), `${c.id} kept a sentinel on the record path`).toBe(false);
+          expect(JSON.stringify(scrubJson(JSON.parse(viaJson))), `${c.id} record path is not idempotent`).toBe(viaJson);
+          expect(scrubText(viaJson), `${c.id} record output rescanned`).toBe(viaJson);
+          // The record-line path: stored through scrubRecords (rule set 5), one line.
+          const enc = new TextEncoder();
+          const dec = new TextDecoder();
+          const line = scrubRecords(enc.encode(`${input}\n`)).scrubbed;
+          const viaLine = dec.decode(line).replace(/\n$/, "");
+          outputs.push(viaLine);
+          expect(viaLine.includes(SENTINEL), `${c.id} kept a sentinel on the record-line path`).toBe(false);
+          // The tokenizer keeps input formatting: compare only canonical compact JSON.
+          if (JSON.stringify(parsed) === input) {
+            expect(viaLine, `${c.id} (record-line path)`).toBe(expectedRecord);
+          }
+          expect(
+            Array.from(scrubRecords(line).scrubbed),
+            `${c.id} record-line path is not idempotent`,
+          ).toEqual(Array.from(line));
+        }
+        for (const out of outputs)
+          for (const secret of secrets)
+            for (const f of fragments(secret))
+              expect(out.includes(f), `${c.id} leaked ${f.length} chars`).toBe(
+                false,
+              );
       }
     });
   }

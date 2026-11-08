@@ -2,3 +2,4 @@
 export * from "./contracts.js";
 export * from "./reconcile.js";
 export * from "./postgres.js";
+export * from "./opensearch.js";

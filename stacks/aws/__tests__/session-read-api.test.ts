@@ -206,15 +206,18 @@ describe("session read api: Function URL (public by design, application auth)", 
     const routes = [...src.matchAll(/app\.(get|post|put|patch|delete|all)\("([^"]+)"/g)].map((m) => m[2]);
     expect(routes.sort()).toEqual([
       "/health",
+      "/v1/delivery/records",
       "/v1/digest/daily",
       "/v1/events",
       "/v1/sessions",
+      "/v1/sessions/:sessionId/catalog",
       "/v1/sessions/:sessionId/events",
       "/v1/sessions/:sessionId/metadata",
       "/v1/sessions/:sessionId/timing",
       "/v1/sessions/:sessionId/turns",
       "/v1/sessions/activity",
       "/v1/sessions/output",
+      "/v1/sessions/titles",
     ]);
     expect(src).toContain('app.use("/v1/*", async (c, next) => {');
     expect(src).toMatch(/if \(!m\) return c\.json\(\{ error: \{ code: "missing_authorization"/);

@@ -175,13 +175,13 @@ never infers anything from the hostname. An invalid profile writes nothing anywh
 
 | Variable                        | Contract                                                                                                                                                                                                                                                                                                          |
 | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `HOOPDB_DB_MODE`                | required, no default: `local` (Docker stack), `selfhosted` (operator-controlled Postgres), `cloudsql` (Google Cloud SQL) or `supabase`. Anything else: `db_mode_invalid`.                                                                                                                                         |
-| `HOOPDB_SUPABASE_SHIM`          | `local`, `selfhosted` and `cloudsql`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase`: only unset or `false`. `true` is refused (`shim_forbidden`), because `supabase_shim.sql` must never run on a Supabase project.                                                            |
-| `HOOPDB_ROLE_BOOTSTRAP`         | defaults to the shim choice. In `supabase` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                                                                                                      |
+| `HOOPDB_DB_MODE`                | required, no default: `local` (Docker stack), `selfhosted` (operator-controlled Postgres), `cloudsql` (Google Cloud SQL), `supabase` or `rds` (Amazon RDS for PostgreSQL, not Aurora). Anything else: `db_mode_invalid`.                                                                                                                                         |
+| `HOOPDB_SUPABASE_SHIM`          | `local`, `selfhosted` and `cloudsql`: must be set explicitly to `true` or `false` (`shim_unset` otherwise). `supabase` and `rds`: only unset or `false`. `true` is refused (`shim_forbidden`): `supabase_shim.sql` must never run on a Supabase project, and on RDS it cannot (BYPASSRLS).                                                            |
+| `HOOPDB_ROLE_BOOTSTRAP`         | defaults to the shim choice. In `supabase` and `rds` mode it is refused if forced on (`bootstrap_forbidden`); the bootstrap is an operator step there.                                                                                                                                                                      |
 | `HOOPDB_RUNTIME_ROLE`           | required (`runtime_role_unset`): the role the services connect as.                                                                                                                                                                                                                                                |
-| `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql` and `supabase` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                                                            |
-| `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION).                                                                                                                                                                                                                         |
-| `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted`, `cloudsql` and `supabase`: `global-default-revoke`, or `event-trigger` (supabase only; refused elsewhere with `function_boundary_mode_unsupported`). The catalog must prove the selected control, see "Function boundary". The old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
+| `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql`, `supabase` and `rds` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                                                            |
+| `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION). Refused in `rds` (`db_profile_invalid`): its grantor would be the non-superuser master.                                                                                                                                                                                                                         |
+| `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted`, `cloudsql`, `supabase` and `rds`: `global-default-revoke`, or `event-trigger` (supabase only; refused elsewhere with `function_boundary_mode_unsupported`). The catalog must prove the selected control, see "Function boundary". The old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
 
 **Runtime role: dedicated, exact least privilege.** It is checked under the migrator's
 advisory lock before any write (before the ledger and marker tables are created, before
@@ -190,7 +190,7 @@ phase 2 can mark PASS.
 
 - **Missing role:** `runtime_role_missing`.
 - **The migrator itself (owner-as-runtime):** accepted only in `local` (the Docker
-  stack, where one superuser runs everything). Refused in `selfhosted`, `cloudsql` and `supabase`
+  stack, where one superuser runs everything). Refused in `selfhosted`, `cloudsql`, `supabase` and `rds`
   (`runtime_role_unsafe`).
 - **Who creates the dedicated role:**
   - `selfhosted` (CNPG): the privileged
@@ -208,6 +208,12 @@ phase 2 can mark PASS.
     migrator then verifies the resulting LOGIN-only role and its exact
     database/schema/object privileges. Its password and URL are stored in 1Password and
     supplied only through the runtime Secret.
+  - `rds`: `supabase/bootstrap/hoopdb_runtime_role_rds.sql`, run as the master with an
+    explicit `-v migration_owner=`. The master creates the LOGIN role directly so it can
+    still set and rotate its password; on PG16+ the exact unavoidable creator edge
+    (member = the connected migration owner, grantor = SUPERUSER `rdsadmin`, ADMIN true,
+    INHERIT and SET false) is accepted only in `rds` mode (`isRdsCreatorEdge`). See
+    "Amazon RDS for PostgreSQL".
   - `supabase`: pre-provisioned by an operator and verified by the migrator. On PG16+
     the exact unavoidable `postgres` creator edge is accepted only when its grantor is
     the frozen superuser `supabase_admin`, ADMIN is true, INHERIT and SET are false, no
@@ -231,7 +237,7 @@ violation is named:
 - **TEMPORARY is refused**, except for one Supabase-only platform baseline: effective
   TEMPORARY must come solely from PUBLIC, the role must have no direct TEMPORARY ACL or
   PUBLIC GRANT OPTION. A configured workload does not change this database-wide PUBLIC
-  baseline. Local, selfhosted and cloudsql still refuse every effective TEMPORARY grant.
+  baseline. Local, selfhosted, cloudsql and rds still refuse every effective TEMPORARY grant.
   This is compatibility, not a
   service requirement: no service creates temporary objects or relies on runtime
   `search_path` (the runtime temp-usage audit is not kept in the repository).
@@ -380,11 +386,44 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |
 | `upstream:20261105038000_claim_attempt_records_retirement.sql` | column sessions.ingest_claim_attempts.records_retired_at |
 | `upstream:20261105039000_buffered_gc_single_candidate.sql` | replacement: GC claim contains its single-candidate advisory admission domain |
+| `upstream:20261105040000_ingest_lazy_source_tables.sql` | replacement: lazy-current adoption checks exclude the source-side tables |
+| `upstream:20261105041000_ingest_privacy_authority.sql` | table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix) |
+| `upstream:20261105042000_babysitter_evidence_retention.sql` | table sessions.babysitter_retention_objects |
+| `upstream:20261105043000_brief_titles.sql` | column sessions.session_briefs.origin |
+| `upstream:20261105043500_lazy_claim_clock_narrowing.sql` | replacement: lazy claim reads the seat clock under KEY SHARE with one advisory lock per (org, workspace, origin) |
+| `upstream:20261105043700_owner_buffered_read.sql` | function sessions.buffered_sessions_for |
+| `upstream:20261105043800_lazy_ack_clock_no_key_update.sql` | replacement: staged ACK locks the seat clock FOR NO KEY UPDATE (claims' KEY SHARE no longer queues behind it), then the bounded origin advisory lock before any slot |
+| `upstream:20261105043850_ingest_acquisition_owner.sql` | table sessions.ingest_acquisition_owners |
+| `upstream:20261105043860_buffered_search_gate.sql` | function sessions.buffered_search_gate_for |
+| `upstream:20261105043870_buffered_search_feed_cursor.sql` | table sessions.buffered_search_feed_cursors (needs the `buffered_search_feed_runtime` role from the role bootstrap: absent fails closed `42704`, elevated/member/unexpected member `55000`) |
+| `upstream:20261105043880_ingest_bookkeeping_cleanup.sql` | table sessions.ingest_bookkeeping_retired_claims + Babysitter register carries the retirement interlock |
+| `upstream:20261105043890_buffered_search_gate_retired_witness.sql` | replacement: buffered_search_gate_for hides claims with an ingest_bookkeeping_retired_claims tombstone (drop reason retired) |
+| `upstream:20261105043900_session_consumer_function_grants.sql` | twelve search_consumer_runtime EXECUTEs (composed writer path) |
+| `upstream:20261105043910_selfhost_session_selection_erase.sql` | function sessions.ingest_selfhost_set_session_uploads |
+| `upstream:20261105044000_read_api_tokens.sql` | table sessions.read_api_tokens |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
 | `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |
 | `96bulls:0004_summary_pointers.sql`                            | DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)                                          |
+
+**Buffered search feed role (`20261105043870`).** `buffered_search_feed_runtime` is created
+`NOLOGIN NOINHERIT` by `supabase/bootstrap/session_ingest_roles.sql` and its RDS and Cloud SQL
+variants (reserved in `hoopdb_runtime_role_rds.sql`), exactly like `bulls96_acquisition_installer`.
+The migration gives it `USAGE` on `sessions` and `EXECUTE` on the three feed RPCs only (no table
+right); each RPC admits only the genuine login (`session_user` is the role, role setting `none`).
+`hoopdb-migrate` runs the generated `supabase/bootstrap/buffered_search_feed_runtime_verify.sql` as
+the last phase 2 verifier. `supabase/bootstrap/buffered_search_feed_runtime_role.sql` grants LOGIN
+with the 5s/2s/10s timeout profile; run the verifier before and after it.
+`supabase/bootstrap/buffered_search_feed_runtime_role_nologin.sql` reverts it (NOLOGIN, password cleared,
+timeouts reset; same Khaliq OK, feeder flag off and credential dropped first; the verifier accepts the
+resulting bare profile). NOLOGIN and the cleared password stop new authentication only; pooled
+connections already open keep working, so treat the revert as runtime disarm only once the feeder
+flag is off and in-flight feed invocations have finished. The rollback revokes the
+schema `USAGE` and keeps the role. Applying the migration, the LOGIN step and provisioning the
+feeder's credential (secret fields `buffered_search_feed_database_url` /
+`buffered_search_feed_database_ca_pem`, password from 1Password, never on disk) each need Khaliq's
+separate, explicit OK; no deploy workflow sets them, and without them the feeder stays off.
 
 For each ALTER or replacement step (`20261025000300`, `20261030000000`,
 `20261102010000`, `20261102020000`, `0003`, `0004`),
@@ -507,9 +546,18 @@ config fails closed.
     the catalog gate. `cloudsql_migration_roles.sql` uses and drops a disposable
     CREATEROLE trampoline; dropping it removes PostgreSQL 16+ automatic creator
     memberships and leaves `anon`, `authenticated`, `service_role`, and the NOLOGIN
-    Worker membership-free. The Cloud SQL `service_role` is NOBYPASSRLS and exists only
+    Worker membership-free. The consumer role is not trampolined: the migration
+    owner provisions it with `session_consumer_roles.sql` and keeps the ADMIN
+    creator edge (N1). The Cloud SQL `service_role` is NOBYPASSRLS and exists only
     to satisfy shared migration grants; the GCP runtime never connects as it. The
     canonical verifier then proves the Worker role and grants.
+  - **Amazon RDS for PostgreSQL (`rds` mode):** the same shape with AWS's internal
+    `rdsadmin` as the trust root (`RDS_PLATFORM_SUPERUSERS`, exactly `rdsadmin`, only
+    while SUPERUSER, never the owner). The master runs
+    `rds_owner_function_default_revoke.sql`, which sets the exact default for itself and
+    for `rds_superuser` (NOLOGIN, not SUPERUSER, and CREATE-capable on `sessions`, so not
+    excluded). Every other CREATE-capable role, any second superuser and any other
+    `rds_superuser` member stay covered. Aurora is not covered.
 - **Exact default ACL:** the migration owner's `pg_default_acl` row with
   `defaclnamespace = 0` and `defaclobjtype = 'f'` must normalize to EXACTLY
   `{<self>:EXECUTE}`: owner EXECUTE, no grant option, no other grantee. Merely "PUBLIC
@@ -523,7 +571,7 @@ config fails closed.
   on PG15 and PG17). Separately, every existing `sessions` function must be owned by the
   owner (`sessions_functions_owned_by_owner`).
 - **Run-time exact manifest (every non-local mode: `global-default-revoke` in
-  `selfhosted` and `cloudsql`, `event-trigger` in `supabase`):** after the last
+  `selfhosted`, `cloudsql` and `rds`, `event-trigger` in `supabase`):** after the last
   migration, inside the validation transaction with phase 2 and the PASS write, every
   `sessions` function's ACL must equal `src/hoopdb/sessions-function-acl.json` plus
   `<runtime role>:EXECUTE` on `RUNTIME_APPLICATION_FUNCTIONS` (#116)
@@ -555,7 +603,7 @@ config fails closed.
   (`sessions_schema_function_defaults` must be empty; tested on PG15 and PG17).
 - **`event-trigger` (supabase only):** a reviewed `ddl_command_end` event trigger scoped
   to `sessions`, with no project-wide `ALTER DEFAULT PRIVILEGES`. Accepted only with
-  `HOOPDB_DB_MODE=supabase`; `selfhosted`, `cloudsql` and `local` refuse it
+  `HOOPDB_DB_MODE=supabase`; `selfhosted`, `cloudsql`, `rds` and `local` refuse it
   (`function_boundary_mode_unsupported`) and keep `global-default-revoke`.
   - **Install:** `supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql`, run
     as `postgres` after the runtime-role and Worker bootstraps and before migrate
@@ -685,6 +733,119 @@ global default revoke has no blast radius outside HoopDb. That needs an ownershi
 of live objects, so it is out of scope for #99. The schema-specific event trigger above is
 the reviewed alternative for Supabase. Tracked in #98.
 
+## Amazon RDS for PostgreSQL (`rds` mode)
+
+This is a self-host/customer profile. Production remains Supabase + S3 under
+ADR 0001; enabling this profile does not authorize a production database change.
+`HOOPDB_DB_MODE=rds` is now accepted (previously it was `db_mode_invalid`), and it
+refuses a server without the required RDS catalog shape before any migration write.
+
+RDS for PostgreSQL 16+ only (CI emulates PostgreSQL 16 and 17). **Aurora is a
+separate variant and is NOT covered** (`aurora` is `db_mode_invalid`). The master user is a
+CREATEROLE/CREATEDB member of `rds_superuser`, not a superuser; the only superuser is AWS's
+internal `rdsadmin`, the bootstrap superuser. The generic bootstraps refuse that master
+(42501), the shim cannot create its BYPASSRLS `service_role`, the master cannot alter
+`rdsadmin`'s default privileges, and the Cloud SQL files refuse the missing Cloud SQL roles.
+
+**Contract.** The migration owner is the master (or another CREATEROLE `rds_superuser`
+member, used consistently), owns the HoopDb database, and is the connection of every step
+below and of the migrator. In rds mode the migrator refuses before any write unless the
+catalog shows that shape (`rds_profile_unproven`).
+
+**Order, as the migration owner, connected to the HoopDb database:**
+
+1. `rds_owner_function_default_revoke.sql`: the exact global function default for the
+   owner and for `rds_superuser`, set together or not at all.
+2. `rds_migration_roles.sql`: the fixed NOLOGIN roles (the Cloud SQL set
+   minus the consumer role below, including `bulls96_privacy_eraser` and
+   `bulls96_babysitter_retention` required by
+   041000 and 042000) through a disposable CREATEROLE
+   trampoline, so they are membership-free (by design, afterwards only `rdsadmin` can alter
+   or drop them).
+3. `session_consumer_roles.sql`: the session-pipeline consumer's bare NOLOGIN
+   role, created directly by the migration owner (same pattern as the runtime
+   role in step 4), keeping the owner's unavoidable PG16+ ADMIN creator edge
+   so the owner can promote it to LOGIN after migrate. The trampoline
+   deliberately never provisions it: a trampoline copy would leave the owner
+   unable to promote it (42501), and the membership recheck would refuse the
+   edge.
+4. `hoopdb_runtime_role_rds.sql -v migration_owner=<owner> -v runtime_role=<role>
+   -v runtime_login=true`: the runtime LOGIN role, PUBLIC TEMPORARY revoked, CONNECT
+   granted, in one transaction. Then set its password from 1Password (never on
+   disk).
+5. The phase 1 files `session_directory_search_worker.sql`,
+   `session_token_verifier.sql`, `session_ingest_roles.sql`, `session_read_api_roles.sql`
+   (here they only verify the existing roles) and the `session_consumer_roles.sql`
+   re-run (converges on the step-3 role).
+6. The migrator: `HOOPDB_DB_MODE=rds`, `HOOPDB_SUPABASE_SHIM=false` (or unset),
+   `HOOPDB_ROLE_BOOTSTRAP` unset, `HOOPDB_RUNTIME_ROLE=<role>`,
+   `HOOPDB_RUNTIME_ROLE_LOGIN=true`, `HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke`.
+   Generation, ledger, sequence, checksum, exact-ACL and phase 2 checks are unchanged.
+
+**Existing installs must re-apply step 1 once (#389).** Before this change the file set
+only the master's default. On a real instance `rds_superuser` has effective CREATE on
+`sessions` once the schema exists, so the first migrate passed and every later migrate
+fails `function_boundary_unproven`. As the master, connected to the HoopDb database,
+either re-run the idempotent file (it refuses, changing nothing, on a poisoned existing
+default) or run this one statement:
+
+```sql
+ALTER DEFAULT PRIVILEGES FOR ROLE rds_superuser REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+```
+
+The default is per database, so a new HoopDb database needs it too. Afterwards
+`pg_default_acl` shows `{rds_superuser:EXECUTE:false}` for that role (global, functions)
+and the migrator completes with nothing pending. The log line carries only the error
+code (the log allowlist forbids free text); to see which role the gate names, run the
+migrator once with `DEBUG=1`, which prints the catalog evidence (role names and booleans,
+no credentials) to stderr. Do not exclude `rds_superuser` from the gate: the default is
+the control.
+
+**Proof:** `scripts/pg-proof/rds-profile-proof.ts` (CI job `rds-emulated-postgres`), against
+disposable PostgreSQL 16/17 servers whose bootstrap superuser is named `rdsadmin`.
+The proof verifies the actual Git checkout against the requested head and refuses
+tracked source changes before connecting; each CI matrix job records the checkout
+and uploads its own version-specific receipt. Emulation limits:
+no `rds.*` parameters or parameter groups, no RDS extension allow-list, no IAM
+authentication, no RDS-specific catalog hooks, and vanilla PostgreSQL refuses
+`CREATE EVENT TRIGGER` to `rds_superuser` members where RDS allows it (irrelevant here: rds
+mode uses `global-default-revoke`). `rds_superuser`'s effective CREATE on `sessions` is a
+direct schema grant in the proof, because vanilla PostgreSQL cannot reproduce how RDS
+provides it (a membership would be a cycle with the master); the proof shows the catalog
+result and a second migrate, not AWS's mechanism.
+
+**Live RDS gates still needed (the emulation claims none of them):**
+
+- `SELECT oid, rolname, rolsuper FROM pg_roles WHERE oid = 10` is `rdsadmin`, SUPERUSER,
+  and `rdsadmin` is the recorded grantor of the master's PG16+ creator edges.
+- The master's attributes and memberships (`rds_superuser`, no SUPERUSER, CREATEROLE), that
+  the master owns the customer-provisioned database, and that `rdsadmin` is the only SUPERUSER.
+- `rds_superuser` is NOLOGIN and not SUPERUSER, and a second migrate on the same database
+  passes.
+- Steps 1-6 pass on the target engine version and parameter group, and the canonical
+  readiness gate passes as the runtime role over TLS.
+- Rotating the runtime password as the master through the approved operator path,
+  with 1Password as the system of record, keeps the exact creator edge. No rotation
+  tool or live rotation proof is supplied here. IAM database authentication is NOT supported: it
+  needs `rds_iam` membership, which the allowlist refuses.
+- `pg_trgm` and `btree_gin` are creatable by the master on the target version.
+- Snapshot restore and major-version upgrade keep the role graph so steps 1-6 rerun clean.
+- Post-migrate activation scripts that `ALTER ROLE` a fixed role to LOGIN
+  (`session_ingest_role.sql`, `session_read_api_role.sql`,
+  `canonical_project_events_role.sql`, `privacy_eraser_role.sql`,
+  `babysitter_retention_role.sql`) cannot run as the master on trampoline-created
+  roles (no ADMIN; 42501). Those LOGIN roles need a reviewed RDS path before activation
+  (same structural question as Cloud SQL); migrate and readiness do not depend on them.
+  The consumer's `session_consumer_role.sql` is the exception: the owner created the
+  role in step 3, so the promotion runs as the master.
+
+**RDS activation needs its own reviewed path.** With this bootstrap's membership-free
+fixed-role graph, the customer migration owner has no ADMIN path to alter or drop
+those roles; only the provider's `rdsadmin` can. The migration/PASS emulation does not
+activate ingest, read API, project events, privacy erasure or babysitter retention,
+and makes no application-activation claim. Do not run their LOGIN activation scripts
+as the customer master or treat migration readiness as full application readiness.
+
 ## CNPG (self-hosted HoopDb)
 
 - **Selfhosted bootstraps, every deploy, before migrate, as the CNPG superuser, in the HoopDb
@@ -805,3 +966,15 @@ bootstraps before its sorted migration files.
 and effective inherited-vs-switch privileges on disposable PG15/16/17. It refuses
 existing verifier/authenticator/directory roles and requires explicit disposable
 cluster opt-in. The new proof runs before the general role proof in CI.
+
+
+### Non-superuser consumer credential check
+
+Before the first `SERVICE=session-pipeline-consumer-bootstrap` promotion by a
+non-superuser owner, follow
+[`selfhost-consumer-credential-probe.md`](../docs/selfhost-consumer-credential-probe.md).
+PostgreSQL masks even an absent password in `pg_roles`; a separate privileged
+operator installs the narrowly scoped fixed-role presence probe. This does not
+replace the owner's explicit CREATEROLE/creator-ADMIN prerequisite or grant
+catalog access. Missing helpers and unsupported managed-provider authority fail
+closed; never clear a credential or change ownership to bypass the gate.

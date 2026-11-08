@@ -169,7 +169,7 @@ jobs:
           const e = process.env;
           if (!/^[0-9a-f]{40}$/.test(e.SOURCE_SHA) || !/^[0-9a-f]{40}$/.test(e.WORKFLOW_SHA) ||
               !/^sha256:[0-9a-f]{64}$/.test(e.IMAGE_DIGEST) || !/^[1-9][0-9]*$/.test(e.SOURCE_CI_RUN)) throw Error('Invalid receipt fields');
-          const receipt = { repository: 'https://github.com/AgentWorkforce/sessions-pipeline',
+          const receipt = { repository: 'https://github.com/AgentWorkforce/relayhistory-pipeline',
             image: `ghcr.io/agentworkforce/96bulls-services@${e.IMAGE_DIGEST}`,
             source_sha: e.SOURCE_SHA, workflow_sha: e.WORKFLOW_SHA, source_ref: 'refs/heads/main',
             attestation_backend: 'sigstore', ci_run_id: e.SOURCE_CI_RUN, publish_run_id: e.GITHUB_RUN_ID, publish_run_attempt: e.GITHUB_RUN_ATTEMPT };

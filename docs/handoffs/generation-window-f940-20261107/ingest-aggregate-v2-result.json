@@ -1,0 +1,68 @@
+{
+  "version": 2,
+  "kind": "brian_ingest_aggregate_readonly",
+  "startedAt": "2026-11-07T19:48:46.458Z",
+  "sqlSha256": "8930e4cfc0497aa4eb56b20add752f8eaa60fadd6c00ee53068a38ee1b4ae3cf",
+  "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "project": "pyamkrhoyszgzirqqffq",
+  "executionRole": "current_user postgres / session_user cli_login_postgres, SET LOCAL reasserted per phase",
+  "phasePreflights": [
+    {
+      "phase": "preflight",
+      "observedAt": "2026-11-07T19:48:47.491Z",
+      "rows": [
+        {
+          "expected_owner_role": true,
+          "stats_visible": true,
+          "slots_select": true,
+          "slots_rls_active": false
+        }
+      ],
+      "identityReadOnlyTargetQualified": true
+    },
+    {
+      "phase": "aggregate_preflight",
+      "observedAt": "2026-11-07T19:48:47.928Z",
+      "rows": [
+        {
+          "expected_owner_role": true,
+          "stats_visible": true,
+          "slots_select": true,
+          "slots_rls_active": false
+        }
+      ],
+      "identityReadOnlyTargetQualified": true
+    }
+  ],
+  "productionWrites": false,
+  "status": "observed_aggregates",
+  "aggregateBlockExecuted": true,
+  "aggregateStartedAt": "2026-11-07T19:48:47.928Z",
+  "aggregateCompletedAt": "2026-11-07T19:48:48.025Z",
+  "activityRows": [
+    {
+      "state_bucket": "idle",
+      "wait_bucket": "Client",
+      "backend_age_bucket": "ge300s",
+      "xact_age_bucket": "none_or_masked",
+      "backend_count": 19
+    }
+  ],
+  "slotRows": [
+    {
+      "lease_state": "active",
+      "lease_age_bucket": "60to90s",
+      "remaining_bucket": "10to60s",
+      "holder_rows": 1,
+      "overflow_counts_are_partial": false
+    },
+    {
+      "lease_state": "expired",
+      "lease_age_bucket": "ge90s",
+      "remaining_bucket": "expired",
+      "holder_rows": 2,
+      "overflow_counts_are_partial": false
+    }
+  ],
+  "completedAt": "2026-11-07T19:48:48.117Z"
+}

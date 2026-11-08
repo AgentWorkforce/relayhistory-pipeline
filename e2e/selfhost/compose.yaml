@@ -1,0 +1,180 @@
+# The self-contained self-host stack the end-to-end test runs against
+# (`bun run e2e:selfhost`, docs/local-stack.md "End-to-end acceptance test").
+# Everything here is a real service from this repository's image, except
+# `control-stub`, which stands in for Control's token introspection endpoint.
+# All credentials are generated per run by run.ts and passed in the environment.
+name: rh-e2e
+x-services-image: &services-image
+  image: 96bulls/services:e2e
+x-common-env: &common-env
+  SESSION_POSTGRES_TLS_PROFILE: custom-ca
+  SESSION_POSTGRES_CA_FILE: /certs/ca.crt
+  SESSION_POSTGRES_CA_SHA256: ${E2E_CA_SHA256:?run through e2e/selfhost/run.ts}
+  ALLOW_IN_CLUSTER_HTTP: "true"
+  LOCKER_BUCKET: transcripts
+  LOCKER_PROVIDER: s3
+  LOCKER_ENDPOINT: http://minio:9000
+  LOCKER_REGION: us-east-1
+  LOCKER_ACCESS_KEY_ID: ${E2E_MINIO_USER:?}
+  LOCKER_SECRET_ACCESS_KEY: ${E2E_MINIO_PASSWORD:?}
+  READ_API_COMPLETE_SINCE: epoch
+  SEARCH_INDEX_BACKEND: postgres
+  SEARCH_INDEX_POSTGRES_BACKEND_ID: e2e-postgres
+  PIPELINE_KEY_PREFIX: 96bulls
+  PIPELINE_ORG_FROM_PREFIX: "true"
+x-owner-env: &owner-env
+  HOOPDB_URL: postgresql://postgres:${E2E_PG_PASSWORD:?}@db:5432/postgres
+x-control-env: &control-env
+  RELAYCONTROL_INTROSPECT_URL: http://control.e2e.svc:8090
+  RELAYCONTROL_INTROSPECT_SECRET: ${E2E_INTROSPECT_SECRET:?}
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_PASSWORD: ${E2E_PG_PASSWORD:?}
+    # The key is bind-mounted from the host user; Postgres refuses a key it does not own.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        install -o postgres -g postgres -m 0600 /certs/server.key /var/lib/postgresql/server.key &&
+        install -o postgres -g postgres -m 0644 /certs/server.crt /var/lib/postgresql/server.crt &&
+        exec docker-entrypoint.sh postgres -c ssl=on
+        -c ssl_cert_file=/var/lib/postgresql/server.crt
+        -c ssl_key_file=/var/lib/postgresql/server.key
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ${E2E_CERTS_DIR:?}:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7
+    command: ["server", "/data", "--address", ":9000"]
+    environment:
+      MINIO_ROOT_USER: ${E2E_MINIO_USER:?}
+      MINIO_ROOT_PASSWORD: ${E2E_MINIO_PASSWORD:?}
+    volumes:
+      - miniodata:/data
+  locker-init:
+    <<: *services-image
+    environment:
+      <<: *common-env
+      SERVICE: locker-init
+    depends_on: [minio]
+    restart: "no"
+  migrate:
+    <<: *services-image
+    environment:
+      <<: [*common-env, *owner-env]
+      SERVICE: hoopdb-migrate
+      HOOPDB_DB_MODE: local
+      HOOPDB_SUPABASE_SHIM: "true"
+      HOOPDB_RUNTIME_ROLE: postgres
+    volumes:
+      - ${E2E_CERTS_DIR:?}:/certs:ro
+    depends_on:
+      db: { condition: service_healthy }
+    restart: "no"
+  consumer-bootstrap:
+    <<: *services-image
+    environment:
+      <<: [*common-env, *owner-env]
+      SERVICE: session-pipeline-consumer-bootstrap
+      RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER: "true"
+      RELAYHISTORY_PIPELINE_CONSUMER_SECRET: '{"hoopdb_url":"postgresql://postgres:${E2E_PG_PASSWORD:?}@db:5432/postgres"}'
+    volumes:
+      - ${E2E_CERTS_DIR:?}:/certs:ro
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    restart: "no"
+  # Service logins: what an operator does after migrate (docs/selfhost-composition.md section 4).
+  roles:
+    image: pgvector/pgvector:pg17
+    entrypoint: ["sh", "/e2e/roles.sh"]
+    environment:
+      PGHOST: db
+      PGUSER: postgres
+      PGDATABASE: postgres
+      PGPASSWORD: ${E2E_PG_PASSWORD:?}
+      PGSSLMODE: require
+      E2E_READ_PASSWORD: ${E2E_READ_PASSWORD:?}
+      E2E_INGEST_PASSWORD: ${E2E_INGEST_PASSWORD:?}
+      E2E_CONSUMER_PASSWORD: ${E2E_CONSUMER_PASSWORD:?}
+    volumes:
+      - ./:/e2e:ro
+      - ../../supabase/bootstrap:/bootstrap:ro
+    depends_on:
+      consumer-bootstrap: { condition: service_completed_successfully }
+    restart: "no"
+  # The one external dependency: Control's POST /internal/v1/auth/introspect.
+  control-stub:
+    <<: *services-image
+    entrypoint: ["bun", "run", "/e2e/control-stub.ts"]
+    environment:
+      E2E_INTROSPECT_SECRET: ${E2E_INTROSPECT_SECRET:?}
+      E2E_TOKENS: ${E2E_TOKENS:?}
+    volumes:
+      - ./:/e2e:ro
+    networks:
+      default:
+        aliases: [control.e2e.svc]
+  session-ingest:
+    <<: *services-image
+    environment:
+      <<: [*common-env, *control-env]
+      SERVICE: session-ingest
+      RELAYHISTORY_SELFHOST_INGEST: "true"
+      RELAYHISTORY_SELFHOST_SESSION_SELECTION: "true"
+      RELAYHISTORY_INGEST_PORT: "8081"
+      RELAYHISTORY_INGEST_ORIGIN: https://history.e2e.test
+      RELAYHISTORY_INGEST_DATABASE_URL: postgresql://bulls96_session_ingest:${E2E_INGEST_PASSWORD:?}@db:5432/postgres
+    volumes:
+      - ${E2E_CERTS_DIR:?}:/certs:ro
+    ports: ["127.0.0.1::8081"]
+    depends_on:
+      roles: { condition: service_completed_successfully }
+      control-stub: { condition: service_started }
+    restart: on-failure:5
+  session-pipeline-consumer:
+    <<: *services-image
+    environment:
+      <<: *common-env
+      SERVICE: session-pipeline-consumer
+      RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER: "true"
+      RELAYHISTORY_PIPELINE_CONSUMER_SECRET: '{"hoopdb_url":"postgresql://search_consumer_runtime:${E2E_CONSUMER_PASSWORD:?}@db:5432/postgres"}'
+      CONSUMER_RECONCILE_EVERY_MINUTES: "1"
+      PIPELINE_RECONCILE_LOOKBACK_MINUTES: "30"
+      WORKER_HEALTH_PORT: "8081"
+    volumes:
+      - ${E2E_CERTS_DIR:?}:/certs:ro
+    depends_on:
+      roles: { condition: service_completed_successfully }
+    restart: on-failure:5
+  session-read-api:
+    <<: *services-image
+    environment:
+      <<: [*common-env, *control-env]
+      SERVICE: session-read-api
+      RELAYHISTORY_SELFHOST_READ_API: "true"
+      RELAYHISTORY_READ_API_PORT: "8080"
+      RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS: "true"
+      READ_API_AUTH_MODE: relaycontrol_only
+      READ_API_ORIGIN: https://history.e2e.test
+      READ_API_DIRECTORY_WORKSPACES: "*"
+      READ_API_TIMING_ASSUME_NO_TURNS: "true"
+      READ_API_TURNS_ASSUME_NO_LEGACY: "true"
+      READ_API_INTROSPECT_POSITIVE_TTL_MS: "0"
+      RELAYHISTORY_READ_API_SECRET: '{"supabase_url":"postgresql://bulls96_read_api:${E2E_READ_PASSWORD:?}@db:5432/postgres"}'
+    volumes:
+      - ${E2E_CERTS_DIR:?}:/certs:ro
+    ports: ["127.0.0.1::8080"]
+    depends_on:
+      roles: { condition: service_completed_successfully }
+      control-stub: { condition: service_started }
+    restart: on-failure:5
+volumes:
+  pgdata:
+  miniodata:
