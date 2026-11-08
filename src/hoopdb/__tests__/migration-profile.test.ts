@@ -1924,19 +1924,20 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const X = "upstream:20261105043870_buffered_search_feed_cursor.sql";
     const CG = "upstream:20261105043900_session_consumer_function_grants.sql";
     const BK = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
+    const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, CG]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, CG]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
@@ -1979,12 +1980,27 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'")).rows[0]!.n;
     expect(await names()).toContain(CG);
     expect(await writerGrants()).toBe(12);
-    expect((await failure(rollback("20261105043800_lazy_ack_clock_no_key_update.down.sql")))?.code).toBe("55000");
-    expect(await names()).toContain(Q);
+    expect((await failure(rollback("20261105043890_buffered_search_gate_retired_witness.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(GR);
     await rollback("20261105043900_session_consumer_function_grants.down.sql");
     expect(await names()).not.toContain(CG);
     expect(await writerGrants()).toBe(0);
     expect(await passed()).toBe(false);
+    // 043890 (gate retired witness) is then the latest: 043880 refuses (55000) while it is applied, so it
+    // rolls back next; its down restores 043860's exact gate (no retired witness), owner and ACL unchanged.
+    const gateSrc = async () =>
+      (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)')")).rows[0]?.s ?? null;
+    const gateGrantees = async () =>
+      (await db.query<{ g: string[] }>("SELECT array(SELECT r.rolname::text FROM pg_proc p CROSS JOIN LATERAL aclexplode(p.proacl) a JOIN pg_roles r ON r.oid=a.grantee WHERE p.oid=to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)') AND a.privilege_type='EXECUTE' AND a.grantee<>p.proowner ORDER BY 1) g")).rows[0]!.g;
+    expect(await names()).toContain(GR);
+    expect(await gateSrc()).toContain("ingest_bookkeeping_retired_claims");
+    expect(await gateGrantees()).toEqual(["bulls96_read_api"]);
+    expect((await failure(rollback("20261105043880_ingest_bookkeeping_cleanup.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(BK);
+    await rollback("20261105043890_buffered_search_gate_retired_witness.down.sql");
+    expect(await names()).not.toContain(GR);
+    expect(await gateSrc()).not.toContain("ingest_bookkeeping_retired_claims");
+    expect(await gateGrantees()).toEqual(["bulls96_read_api"]);
     // 043880 (ingest bookkeeping cleanup, Phase A) is then the latest: 043870 refuses (55000) while it is
     // applied, so it rolls back next; its down restores 042000's exact Babysitter register.
     expect(await names()).toContain(BK);
@@ -2193,16 +2209,18 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
     // Up again: 041000's exact source-table list is back in both lazy functions, 043500's lazy claim
     // narrowing is back, 043700's four functions and parity table, 043800's staged-ACK NO KEY UPDATE,
-    // 043860's gate reader and 043870's feed functions and cursor table.
+    // 043860's gate reader (with 043890's retired witness) and 043870's feed functions and cursor table.
     expect(await lazyRecords()).toContain("lazy-native-origin-v1");
     expect(await gateFn()).not.toBeNull();
+    expect(await gateSrc()).toContain("ingest_bookkeeping_retired_claims");
+    expect(await gateGrantees()).toEqual(["bulls96_read_api"]);
     expect(await feedFns()).toBe(3);
     expect(await relation("sessions.buffered_search_feed_cursors")).toBe("sessions.buffered_search_feed_cursors");
     expect(await lazyAck()).toContain("WHERE singleton FOR NO KEY UPDATE;");
     expect(await ownerReadFns()).toBe(4);
     expect(await parityTable()).toBe("sessions.owner_buffered_parity");
     expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, CG]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
