@@ -25,7 +25,7 @@ if(url){const u=new URL(url);
   ||u.password||u.pathname!=="/postgres"||u.search||u.hash)throw Error("owned_loopback_fixture_required");}
 const GEN="a".repeat(64);
 const root=join(import.meta.dir,"../../..");
-const MIGRATION="20261105052000_ingest_acquisition_owner.sql";
+const MIGRATION="20261105043850_ingest_acquisition_owner.sql";
 const read=(p:string)=>readFileSync(join(root,p),"utf8").split("\n").filter(l=>!l.startsWith("\\")).join("\n");
 const US="\x1f";
 const sha=(s:string|Buffer)=>createHash("sha256").update(s).digest("hex");

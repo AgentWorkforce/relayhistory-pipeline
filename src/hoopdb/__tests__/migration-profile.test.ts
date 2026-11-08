@@ -1682,12 +1682,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // Later lanes roll back first and remove their own ledger rows; only then
-    // 052000 (acquisition owner, dormant) is the latest: 043000 refuses while it is applied.
-    const AQ = "upstream:20261105052000_ingest_acquisition_owner.sql";
+    // 043850 (acquisition owner, dormant) is the latest: 043000 refuses while it is applied.
+    const AQ = "upstream:20261105043850_ingest_acquisition_owner.sql";
     expect(await names()).toContain(AQ);
     expect((await failure(rollback("20261105043000_brief_titles.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(H);
-    await rollback("20261105052000_ingest_acquisition_owner.down.sql");
+    await rollback("20261105043850_ingest_acquisition_owner.down.sql");
     expect(await names()).not.toContain(AQ);
     expect(await relation("sessions.ingest_acquisition_owners")).toBeNull();
     // 043800 (staged-ACK clock NO KEY UPDATE) is the latest: 043700 and 043500 refuse (55000) while it is

@@ -65,7 +65,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105042000_babysitter_evidence_retention.down.sql",
       "supabase/rollbacks/20261105043500_lazy_claim_clock_narrowing.down.sql",
       "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql",
-      "supabase/rollbacks/20261105052000_ingest_acquisition_owner.down.sql",
+      "supabase/rollbacks/20261105043850_ingest_acquisition_owner.down.sql",
     ]);
   });
 

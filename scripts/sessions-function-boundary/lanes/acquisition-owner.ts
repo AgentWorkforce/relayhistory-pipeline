@@ -1,5 +1,5 @@
 /**
- * Lane: Factory acquisition owner contract (provisional slot 052000; docs/factory-acquisition-owner-design.md).
+ * Lane: Factory acquisition owner contract (slot 043850; docs/factory-acquisition-owner-design.md).
  * SQL authority: the migration below. install/revoke/rebind/status are the ONLY functions granted, to the control
  * role bulls96_acquisition_installer (design §6); enroll_begin/enroll_complete are SECURITY DEFINER and granted to
  * no role (owner-run), as is set_hooks, the owner-only setter of the default-off hooks flag; every helper is
@@ -10,7 +10,7 @@
 import { createHash } from "node:crypto";
 import type { LaneContext, LaneManifest } from "../types.ts";
 
-const MIGRATION = "supabase/migrations/20261105052000_ingest_acquisition_owner.sql";
+const MIGRATION = "supabase/migrations/20261105043850_ingest_acquisition_owner.sql";
 const ROLLBACK = MIGRATION.replace("/migrations/", "/rollbacks/").replace(/\.sql$/, ".down.sql");
 const NAME = "upstream:" + MIGRATION.slice(MIGRATION.lastIndexOf("/") + 1);
 const CUSTODY = "supabase/migrations/20261104055000_lazy_current_custody.sql";
@@ -105,7 +105,7 @@ const INSTALLER = ["bulls96_acquisition_installer"] as const;
 
 export const acquisitionOwner: LaneManifest = {
   lane: "acquisition-owner",
-  owner: "feat/ingest-acquisition-owner-20261107 (design PR #314 @458cba5d; provisional slot 052000)",
+  owner: "feat/ingest-acquisition-owner-20261107 (design PR #314 @458cba5d; slot 043850)",
   migration: MIGRATION,
   prefixes: ["sessions.ingest_acquisition_"],
   grantSources: [{ path: MIGRATION, roles: [...INSTALLER] }],

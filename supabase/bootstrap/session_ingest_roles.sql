@@ -20,7 +20,7 @@
 --                                            retention claim/fence/complete RPCs only (20261105042000;
 --                                            made LOGIN by babysitter_retention_role.sql)
 --             bulls96_acquisition_installer  the Factory acquisition installer: USAGE on sessions and
---                                            EXECUTE on install/revoke/rebind/status only (20261105052000;
+--                                            EXECUTE on install/revoke/rebind/status only (20261105043850;
 --                                            made LOGIN by acquisition_installer_role.sql)
 --   attrs     NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
 --   members   member of none.

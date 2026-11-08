@@ -1,4 +1,4 @@
--- Operator-only phase after migrations (20261105052000): make the Factory acquisition installer's login
+-- Operator-only phase after migrations (20261105043850): make the Factory acquisition installer's login
 -- able to log in. Run only under an explicit apply OK from the owner; the migration leaves the switch
 -- disabled and enrolls no source, so a login alone admits nothing. The password is set separately from
 -- 1Password in memory; never place it here or in a connection file. Run acquisition_installer_verify.sql

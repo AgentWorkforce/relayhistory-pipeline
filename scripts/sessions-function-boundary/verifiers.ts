@@ -54,7 +54,7 @@ export const VERIFIERS: readonly VerifierTarget[] = [
     transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_babysitter_retention").replaceAll("session ingest", "babysitter retention"),
   },
   {
-    // The Factory acquisition control role (provisional slot 052000): only install/revoke/rebind/status.
+    // The Factory acquisition control role (slot 043850): only install/revoke/rebind/status.
     role: "bulls96_acquisition_installer",
     path: "supabase/bootstrap/acquisition_installer_verify.sql",
     template: "supabase/bootstrap/session_ingest_verify.sql",
