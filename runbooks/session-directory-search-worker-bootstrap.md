@@ -914,6 +914,11 @@ Both hashes, the migration name and the fact that this is the sole alias are pin
 test. Any third checksum or any other migration name fails closed. The alias is emitted
 in migration logs and `--activation-check`; generation remains based on the current file.
 
+Renamed migrations are adopted only through `MIGRATION_RENAME_ALIASES` (`migrate-guards.ts`),
+never by editing `sessions.__96bulls_migrations`: an original-name row is read as its release
+name in memory, only when both pinned shas match, logged and shown in the release plan and
+`--activation-check`; any other original name or sha still refuses as `ledger_unknown_step`.
+
 ### Auth verifier append-only upgrade and membership
 
 The vendored auth source filenames are preserved in their provenance comments.

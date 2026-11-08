@@ -41,6 +41,40 @@ export const MIGRATION_CHECKSUM_ALIASES = [
   },
 ] as const;
 
+// Two migrations were renamed append-only on 2026-11-03 (09666e18) to sort after the
+// upstream steps that were released before them. An existing self-host HoopDb that
+// applied them under their original names would otherwise stop at
+// ledger_unknown_step. Each original ledger row is adopted in memory (never written) as
+// its release name only when all four values match: the original name with its last
+// released sha, and the release file with exactly this sha. Bodies are statement-for-
+// statement equal apart from the provenance header, except that the original ingest
+// ledger also granted the seed RPCs to bulls96_session_ingest_seeder, which
+// 20261104040000_ingest_s3_proof_seed (always on this image, after both) REVOKEs ALL,
+// so the end schema is identical. Earlier drafts of the original file (other shas) are
+// not adopted, and any future edit of a release file fails closed.
+export const MIGRATION_RENAME_ALIASES = [
+  {
+    ledger_name: "upstream:20261103010000_session_directory_event_metadata.sql",
+    ledger_sha:
+      "fe07b2ef2b3e18634b024f35f4272bee9100ea39d0383ce33e8c6d969b77a476",
+    migration: "upstream:20261104021000_session_directory_event_metadata.sql",
+    accepted_as_alias_of:
+      "4fb1337524c8335dd5bd507f60ea896a41a031ace0c7a2da8a8f7dedc1245e01",
+  },
+  {
+    ledger_name: "upstream:20261102010000_session_ingest_ledger.sql",
+    ledger_sha:
+      "21a0be7dc69afa7d3b1d1b27e31fee9778c1a6a0c3b20246e3029fa2f1356fa6",
+    migration: "upstream:20261104022000_session_ingest_ledger.sql",
+    accepted_as_alias_of:
+      "69f4157ea3a615344aa1b383fc6af7405c1ff9f1568e7c8ab97e58fbc78fe1b5",
+  },
+] as const;
+
+export type MigrationAlias =
+  | (typeof MIGRATION_CHECKSUM_ALIASES)[number]
+  | (typeof MIGRATION_RENAME_ALIASES)[number];
+
 export function migrationChecksumMatches(
   name: string,
   recorded: string,
@@ -48,12 +82,7 @@ export function migrationChecksumMatches(
 ): boolean {
   return (
     recorded === actual ||
-    MIGRATION_CHECKSUM_ALIASES.some(
-      (a) =>
-        a.migration === name &&
-        a.ledger_sha === recorded &&
-        a.accepted_as_alias_of === actual,
-    )
+    migrationChecksumAlias(name, recorded, actual) !== undefined
   );
 }
 
@@ -61,13 +90,38 @@ export function migrationChecksumAlias(
   name: string,
   recorded: string,
   actual: string,
-): (typeof MIGRATION_CHECKSUM_ALIASES)[number] | undefined {
-  return MIGRATION_CHECKSUM_ALIASES.find(
+): MigrationAlias | undefined {
+  return [...MIGRATION_CHECKSUM_ALIASES, ...MIGRATION_RENAME_ALIASES].find(
     (a) =>
       a.migration === name &&
       a.ledger_sha === recorded &&
       a.accepted_as_alias_of === actual,
   );
+}
+
+/**
+ * Adopts, in `ledger` only, each MIGRATION_RENAME_ALIASES row whose four values all
+ * match and whose release name is not already recorded: the original key is replaced
+ * by the release name, keeping the recorded sha. Anything else is left untouched for
+ * sequencePreflight to refuse (ledger_unknown_step / migration_changed). Never writes.
+ */
+export function adoptRenamedLedgerRows(
+  ledger: Map<string, string>,
+  fileSha: (name: string) => string | undefined,
+): (typeof MIGRATION_RENAME_ALIASES)[number][] {
+  const adopted: (typeof MIGRATION_RENAME_ALIASES)[number][] = [];
+  for (const a of MIGRATION_RENAME_ALIASES) {
+    if (
+      ledger.get(a.ledger_name) !== a.ledger_sha ||
+      ledger.has(a.migration) ||
+      fileSha(a.migration) !== a.accepted_as_alias_of
+    )
+      continue;
+    ledger.delete(a.ledger_name);
+    ledger.set(a.migration, a.ledger_sha);
+    adopted.push(a);
+  }
+  return adopted;
 }
 
 // ---------------------------------------------------------------------------

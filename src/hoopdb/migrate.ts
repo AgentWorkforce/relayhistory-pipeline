@@ -12,6 +12,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  adoptRenamedLedgerRows,
   functionBoundaryEvidence,
   migrationChecksumAlias,
   migrationChecksumMatches,
@@ -390,6 +391,15 @@ export interface RunOptions {
 /** Shared read-only preflight: release planning and apply enforce the same guards. */
 async function migrationPreflight(client: MigrationClient, profile: MigrationProfile, schema: Step[]) {
   const ledger = await readLedger(client);
+  const stepShas = await stepSha256s(schema);
+  // The release binding covers the rows exactly as stored, before any in-memory adoption.
+  const ledgerSha256 = migrationLedgerSha256(ledger);
+  // Once, before every guard and reader below: original-name rows of append-only
+  // renamed migrations become their release names in memory only when every checksum
+  // matches (MIGRATION_RENAME_ALIASES). Anything else stays for sequencePreflight to refuse.
+  const renameAliases = adoptRenamedLedgerRows(ledger, (name) => stepShas.get(name));
+  for (const alias of renameAliases)
+    log.info("adopted renamed migration ledger row", alias);
   // A HoopDb built from the old vendored pin cannot be moved forward in place:
   // upstream changed 20261025000600 after it was applied there. Say so plainly.
   if ([...ledger.keys()].some((n) => n.startsWith("vendor:"))) {
@@ -421,7 +431,17 @@ async function migrationPreflight(client: MigrationClient, profile: MigrationPro
   }
   await cliHistoryPreflight(client, schema);
   await sequencePreflight(client, schema, ledger);
-  return { ledger, runtime };
+  return { ledger, ledgerSha256, renameAliases, runtime };
+}
+/** Each step's file sha256, by step name. */
+async function stepSha256s(steps: Step[]): Promise<Map<string, string>> {
+  const shas = new Map<string, string>();
+  for (const step of steps)
+    shas.set(
+      step.name,
+      createHash("sha256").update(await readFile(step.path, "utf8")).digest("hex"),
+    );
+  return shas;
 }
 export function migrationLedgerSha256(ledger: Map<string, string>): string {
   return createHash("sha256").update(JSON.stringify([...ledger].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest("hex");
@@ -431,7 +451,7 @@ export async function inspectMigrations(client: MigrationClient, profile: Migrat
   if (profile.mode !== "supabase" || profile.shim || profile.bootstrap || !profile.verify)
     throw profileError("release_profile", "release inspection requires Supabase, verifier enabled, shim/bootstrap disabled");
   const steps = await schemaSteps();
-  const { ledger } = await migrationPreflight(client, profile, steps);
+  const { ledger, ledgerSha256, renameAliases } = await migrationPreflight(client, profile, steps);
   const acl = await sessionsFunctionAclPreview(client, profile.runtimeRole, steps.some(s => !ledger.has(s.name)));
   if (acl.function_acl_drift_extra.length || acl.function_acl_missing_refused.length)
     throw profileError("function_acl_drift", "release inspection refused ACL drift");
@@ -472,7 +492,7 @@ export async function inspectMigrations(client: MigrationClient, profile: Migrat
     sha256: createHash("sha256").update(await readFile(step.path, "utf8")).digest("hex"),
     pending: !ledger.has(step.name),
   });
-  return { generation: await generation(), ledgerSha256: migrationLedgerSha256(ledger), inventory, acl };
+  return { generation: await generation(), ledgerSha256, inventory, acl, migrationRenameAliases: renameAliases };
 }
 
 /**
@@ -500,9 +520,9 @@ export async function runMigrations(
       (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
     );
     // Read-only preflight, all under the lock: nothing below writes until every check passes.
-    const { ledger, runtime } = await migrationPreflight(client, profile, schema);
+    const { ledger, ledgerSha256, runtime } = await migrationPreflight(client, profile, schema);
     if (opts.expectedLedgerSha256 !== undefined &&
-        migrationLedgerSha256(ledger) !== opts.expectedLedgerSha256)
+        ledgerSha256 !== opts.expectedLedgerSha256)
       throw profileError("release_ledger_changed", "database ledger changed since the approved read-only plan");
     if (opts.beforeWrite) await opts.beforeWrite();
     await client.query("CREATE SCHEMA IF NOT EXISTS sessions");
@@ -929,14 +949,16 @@ async function pendingMigrationsExist(
     `SELECT to_regclass('${MIGRATION_LEDGER}')::text AS t`,
   );
   if (!has.rows[0]?.t) return true;
-  const done = new Set(
+  const done = new Map(
     (
-      await client.query<{ name: string }>(
-        `SELECT name FROM ${MIGRATION_LEDGER}`,
+      await client.query<{ name: string; sha256: string }>(
+        `SELECT name, sha256 FROM ${MIGRATION_LEDGER}`,
       )
-    ).rows.map((r) => r.name),
+    ).rows.map((r) => [r.name, r.sha256]),
   );
-  return (await expectedMigrationNames()).some((n) => !done.has(n));
+  const shas = await stepSha256s(await schemaSteps());
+  adoptRenamedLedgerRows(done, (name) => shas.get(name));
+  return [...shas.keys()].some((n) => !done.has(n));
 }
 
 function migrationProfileMode(): FunctionBoundaryMode | undefined {
@@ -958,6 +980,7 @@ export async function migrate(): Promise<{ applied: number; skipped: number }> {
   }
 }
 
+/** Read-only: the checksum aliases and the rename adoptions the migrator would accept. */
 async function checksumAliasEvidence(client: MigrationClient) {
   const there = (
     await client.query<{ r: string | null }>(
@@ -965,29 +988,27 @@ async function checksumAliasEvidence(client: MigrationClient) {
       [MIGRATION_LEDGER],
     )
   ).rows[0]?.r;
-  if (!there) return [];
+  if (!there) return { checksum: [], rename: [] };
   const rows = (
     await client.query<{ name: string; sha256: string }>(
       `SELECT name, sha256 FROM ${MIGRATION_LEDGER}`,
     )
   ).rows;
-  const steps = await schemaSteps();
-  const actual = new Map<string, string>();
-  for (const step of steps)
-    actual.set(
-      step.name,
-      createHash("sha256")
-        .update(await readFile(step.path, "utf8"))
-        .digest("hex"),
-    );
-  return rows.flatMap((row) => {
-    const alias = migrationChecksumAlias(
-      row.name,
-      row.sha256,
-      actual.get(row.name) ?? "",
-    );
-    return alias ? [alias] : [];
-  });
+  const actual = await stepSha256s(await schemaSteps());
+  return {
+    checksum: rows.flatMap((row) => {
+      const alias = migrationChecksumAlias(
+        row.name,
+        row.sha256,
+        actual.get(row.name) ?? "",
+      );
+      return alias ? [alias] : [];
+    }),
+    rename: adoptRenamedLedgerRows(
+      new Map(rows.map((r) => [r.name, r.sha256])),
+      (name) => actual.get(name),
+    ),
+  };
 }
 
 if (import.meta.main) {
@@ -1029,7 +1050,7 @@ if (import.meta.main) {
             ),
           ),
     ])
-      .then(async ([e, migration_checksum_aliases, acl]) => {
+      .then(async ([e, aliases, acl]) => {
         const satisfied =
           e.satisfied &&
           (acl?.function_acl_drift_extra.length ?? 0) === 0 &&
@@ -1037,7 +1058,8 @@ if (import.meta.main) {
         console.log(
           JSON.stringify({
             ...e,
-            migration_checksum_aliases,
+            migration_checksum_aliases: aliases.checksum,
+            migration_rename_aliases: aliases.rename,
             function_acl_preview:
               dbMode === "local"
                 ? "not_applicable_local"
