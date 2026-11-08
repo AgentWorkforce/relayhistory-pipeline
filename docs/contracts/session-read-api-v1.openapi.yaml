@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Session Read API
-  version: 1.0.0
+  version: 1.1.0
   license:
     name: Apache-2.0
     identifier: Apache-2.0
@@ -14,71 +14,77 @@ info:
     ## Tenancy
 
     Every credential is bound to exactly one user, org and workspace, stored
-    with the token. Org and workspace come only from the verified credential,
-    never from a request field. Every read route requires `workspace=` equal to
-    the credential's workspace, or answers 403 `forbidden`; there is no org-wide
-    or cross-org credential and no route that widens one.
+    with the token. Org, workspace and user come only from the verified token
+    row, never from a request field. Every read route requires `workspace=`
+    equal to the credential's workspace, or answers 403 `forbidden`. There is no
+    org-wide or cross-org credential.
 
     ## Token model (`READ_API_AUTH_MODE=self_issued`)
 
-    Opaque random tokens, stored only as the SHA-256 hash of the full token
-    string, checked against this service's own database on every request, so
-    revocation is immediate. Control is not called on a read.
+    Opaque tokens with 256 bits of CSPRNG entropy, stored only as the SHA-256
+    hash of the full token string. The service checks its own database on every
+    request; a lookup failure or timeout denies with 503 and serves nothing.
+    There is no signing key. Issuer and audience are stored on the token row;
+    the row's audience must be this service's origin.
 
-    | Prefix    | What                                   | Lifetime                                        |
-    | --------- | -------------------------------------- | ----------------------------------------------- |
-    | `rth_at_` | user access token, sent as the bearer  | 1 hour by default (`READ_API_ACCESS_TOKEN_TTL_SECONDS`) |
-    | `rth_rt_` | user refresh token, rotated on use     | 90 days                                         |
-    | `rth_st_` | operator service token (no refresh)    | 90 days by default, 365 at most                 |
+    | Prefix         | What                                  | Lifetime                                                |
+    | -------------- | ------------------------------------- | ------------------------------------------------------- |
+    | `rth_at_read_` | user access token, sent as the bearer | 5 minutes by default (`READ_API_ACCESS_TOKEN_TTL_SECONDS`, 60 to 3600) |
+    | `rth_rt_read_` | user refresh token, rotated on use    | 90 days                                                 |
+    | `rth_st_read_` | operator service token (no refresh)   | 90 days by default, 365 at most                         |
 
-    The only scope is `rth:read`. `READ_API_AUTH_MODE=relaycontrol_only` stays
-    available as a temporary mode: the bearer is the Control `sh_at_` token and
-    each read is introspected.
+    The prefixes extend `rth_at_` and `rth_rt_`, with at least 43 base64url
+    characters of entropy after them. The only scope is `rth:read`. Read API
+    tokens are refused by ingest, Control and Relaycast, and the read API
+    refuses theirs; the only crossing is the Control handoff below.
+    `READ_API_AUTH_MODE=relaycontrol_only` stays available as a temporary mode:
+    the bearer is the Control `sh_at_` token and each read is introspected.
 
-    Control is consulted at two points only: login, and every refresh. A member
-    removed from the org or workspace therefore loses access when their current
-    access token expires. A Control outage affects only login and refresh: reads
-    with an unexpired access token keep working, and a refresh that Control
-    cannot confirm fails closed with 503 and rotates nothing.
+    ## Control handoff
+
+    Control checks membership; the read API owns the tokens and never calls
+    Control. Control serves `POST /api/v1/workspaces/:ws/session-read/session`
+    and `POST /api/v1/workspaces/:ws/session-read/refresh`, requiring a current
+    user access token, workspace membership and `rth:read`, then calls the
+    internal routes below with `Authorization: Bearer <SESSION_READ_API_SECRET>`.
+    A member removed from the workspace loses access when their current access
+    token expires, because every refresh goes through that check. A Control
+    outage affects only login and refresh, never a read with a valid access
+    token. Control validates identity, audience, read-only scope, token prefixes
+    and expiry before returning, and returns its configured public base URL.
 
     ## The three clients
 
-    - **relay-desktop**: holds the access and refresh token pair and refreshes
-      directly with `POST /v1/auth/token/refresh`.
-    - **agent-relay MCP**: reads on behalf of one specific user. It gets that
-      user's `rth_at_`/`rth_rt_` pair through the Control handoff. It must never
-      hold an `rth_st_` service token or the bootstrap secret, and no broader
-      credential exists for it to hold.
-    - **relay-webapp (browser)**: page scripts receive only an `rth_at_` access
-      token and call the GET read routes directly, with the deployment's origin
-      on the CORS allowlist. The refresh token stays server side (Control or the
-      webapp backend performs the refresh and hands the page a new access
-      token). Login, refresh and revoke answer no CORS headers, so page scripts
-      cannot call them. Credentials are bearer headers only; CORS never allows
+    - **relay-desktop** and **agent-relay MCP** are bearer clients: they receive
+      the access and refresh pair from Control and refresh through Control. The
+      MCP reads on behalf of one specific user with that user's pair. It must
+      never hold an `rth_st_read_` service token or the internal secret, and no
+      broader credential exists for it to hold.
+    - **relay-webapp (browser)**: a cookie-authenticated Control session call
+      returns an access token only, and the page calls it again every 5 minutes,
+      which re-checks membership. There is no server-side refresh custody and no
+      refresh token ever reaches page scripts. The page calls the GET read routes
+      directly, with its origin on the deployment's CORS allowlist
+      (`READ_API_CORS_ALLOWED_ORIGINS`, exact origins). Token routes answer no
+      CORS headers. Credentials are bearer headers only; CORS never allows
       cookies.
 
-    ## What Control provides
+    ## Revocation
 
-    Control owns the membership decision and the handoff; the read API owns the
-    tokens.
+    Tokens are looked up on every request, so deleting the row is immediate and
+    ends the access token and the refresh family together. For offboarding and
+    erasure, Control or an operator calls `/internal/v1/session-read/revoke` with
+    the org and optionally the user, workspace or token id. A token holder can
+    end its own session with `/v1/auth/token/revoke`.
 
-    1. **Handoff.** After checking membership, Control calls
-       `POST /v1/cli/login` with the user's `sh_at_` token, whose audience is the
-       read API origin, and returns to the client:
-       `{ readApiBaseUrl, accessToken, accessTokenExpiresAt, refreshToken?,
-       refreshTokenExpiresAt?, tokenType, scopes, orgId, workspaceId }`. For a
-       browser client it withholds `refreshToken` and `refreshTokenExpiresAt` and
-       keeps them server side.
-    2. **Membership confirmation on refresh.** Control implements the route in
-       `x-control-membership` below, authenticated with the same
-       `RELAYCONTROL_INTROSPECT_SECRET` used for introspection. Until it exists,
-       the read API answers every refresh 503 `relaycontrol_unavailable`.
+    ## Internal secret and operator bootstrap
 
-    ## Operator bootstrap (standalone, no Control)
-
-    `POST /internal/tokens`, authenticated with `READ_API_BOOTSTRAP_SECRET`,
-    mints an `rth_st_` service token for one org and workspace. `/internal/*`
-    must not be exposed outside the cluster or operator network.
+    `/internal/*` authenticates with `READ_API_INTERNAL_SECRET`, injected from a
+    secret manager or mounted Secret and never committed.
+    `READ_API_INTERNAL_SECRET_PREVIOUS` is accepted alongside it during a
+    rotation overlap. `/internal/*` must not be exposed outside the cluster or
+    operator network. For standalone testing with no Control running, an operator
+    mints an `rth_st_read_` token with `/internal/v1/session-read/service-tokens`.
 
     ## Compatibility
 
@@ -86,27 +92,6 @@ info:
     A 501 `unsupported_by_backend` means this backend cannot answer that request
     exactly; `reason` names why. A client with a fallback backend uses it; one
     without shows the data as unavailable.
-x-control-membership:
-  description: >-
-    The route Control implements so the read API can confirm membership on every
-    refresh. Authenticated with `Authorization: Bearer
-    <RELAYCONTROL_INTROSPECT_SECRET>`. It carries no user token, because a
-    refresh presents only the refresh token.
-  request:
-    method: POST
-    url: "{RELAYCONTROL_INTROSPECT_URL}/internal/v1/auth/membership"
-    body:
-      sub: The user id recorded at login (introspection `sub`).
-      org: The org id recorded at login.
-      workspace: The workspace id recorded at login.
-      aud: The read API origin (READ_API_ORIGIN).
-  responses:
-    "200 active": "{ active: true, sub, org, workspace, scopes: [..., 'rth:read'], aud }; sub, org, workspace and aud must echo the request exactly, and scopes must include rth:read"
-    "200 inactive": "{ active: false, reason }; the read API revokes the session and answers 401 token_revoked"
-    otherwise: >-
-      Any other status, a 3xx, a timeout, a body over 16 KiB or a body that is
-      not this shape is unavailable: the read API answers 503
-      relaycontrol_unavailable, retryable, and rotates nothing.
 servers:
   - url: "{readApiBaseUrl}"
     variables:
@@ -296,11 +281,11 @@ paths:
     post:
       tags: [auth]
       operationId: login
-      summary: Exchange a Control `sh_at_` token for a session.
+      summary: "`relaycontrol_only` mode only: exchange a Control `sh_at_` token."
       description: >-
-        The token is introspected once, with the read API origin as audience. In
-        `relaycontrol_only` mode the reply echoes the presented token (nothing is
-        minted); in `self_issued` mode it is a new `rth_at_`/`rth_rt_` pair.
+        The token is introspected, with the read API origin as audience, and the
+        reply echoes it (nothing is minted). Not registered in `self_issued`
+        mode; Control issues sessions through the internal routes instead.
       security: []
       requestBody:
         required: true
@@ -316,33 +301,11 @@ paths:
       responses:
         "200": {$ref: "#/components/responses/TokenPair"}
         default: {$ref: "#/components/responses/Error"}
-  /v1/auth/token/refresh:
-    post:
-      tags: [auth]
-      operationId: refresh
-      summary: Rotate a refresh token (`self_issued` mode). Control confirms membership first.
-      description: >-
-        The presented refresh token stops working on success. 401 means sign in
-        again; 503 is retryable, and the refresh token stays valid.
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [refreshToken]
-              properties:
-                refreshToken: {type: string, maxLength: 4096}
-      responses:
-        "200": {$ref: "#/components/responses/TokenPair"}
-        default: {$ref: "#/components/responses/Error"}
   /v1/auth/token/revoke:
     post:
       tags: [auth]
       operationId: revoke
-      summary: Revoke the session a token belongs to (`self_issued` mode).
+      summary: Delete the session a token belongs to (`self_issued` mode).
       description: Takes the token in the body or as the bearer. Revokes access and refresh together.
       security: []
       requestBody:
@@ -364,14 +327,54 @@ paths:
                 properties:
                   revoked: {type: boolean}
         default: {$ref: "#/components/responses/Error"}
-  /internal/tokens:
+  /internal/v1/session-read/sessions:
+    post:
+      tags: [internal]
+      operationId: issueSession
+      summary: Issue a user session. Called by Control after it has verified membership.
+      security:
+        - internal: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/IssueRequest"}
+      responses:
+        "201": {$ref: "#/components/responses/Session"}
+        default: {$ref: "#/components/responses/Error"}
+  /internal/v1/session-read/sessions/refresh:
+    post:
+      tags: [internal]
+      operationId: refreshSession
+      summary: Rotate a refresh token. Called by Control on every refresh.
+      description: >-
+        One atomic compare-and-set bound to the exact user, org, workspace and
+        audience on the token row. The presented refresh token stops working on
+        success. 401 means sign in again.
+      security:
+        - internal: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: "#/components/schemas/IssueRequest"}
+                - type: object
+                  required: [refreshToken]
+                  properties:
+                    refreshToken: {type: string, maxLength: 4096}
+      responses:
+        "200": {$ref: "#/components/responses/Session"}
+        default: {$ref: "#/components/responses/Error"}
+  /internal/v1/session-read/service-tokens:
     post:
       tags: [internal]
       operationId: mintServiceToken
-      summary: Mint an `rth_st_` service token for one org and workspace.
+      summary: Mint an `rth_st_read_` service token for one org and workspace.
       description: The token is returned once. Not refreshable.
       security:
-        - bootstrap: []
+        - internal: []
       requestBody:
         required: true
         content:
@@ -379,11 +382,13 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [orgId, workspaceId, label]
+              required: [orgId, workspaceId, audience, scopes, label]
               properties:
                 orgId: {type: string}
                 workspaceId: {type: string}
                 userId: {type: string, description: Recorded as the token's user. Defaults to read-api-service.}
+                audience: {type: string, description: This service's origin.}
+                scopes: {type: array, const: ["rth:read"]}
                 label: {type: string, maxLength: 128}
                 expiresInDays: {type: integer, minimum: 1, maximum: 365, default: 90}
       responses:
@@ -393,24 +398,27 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [id, token, label, scopes, orgId, workspaceId, expiresAt, tokenType]
+                required: [id, token, label, userId, orgId, workspaceId, audience, scopes, expiresAt, tokenType]
                 properties:
                   id: {type: string}
                   token: {type: string}
                   label: {type: string}
-                  scopes: {type: array, items: {type: string}}
+                  userId: {type: string}
                   orgId: {type: string}
                   workspaceId: {type: string}
+                  audience: {type: string}
+                  scopes: {type: array, items: {type: string}}
                   expiresAt: {type: string, format: date-time}
                   tokenType: {type: string, enum: [Bearer]}
         default: {$ref: "#/components/responses/Error"}
-  /internal/tokens/revoke:
+  /internal/v1/session-read/revoke:
     post:
       tags: [internal]
-      operationId: revokeOrgTokens
-      summary: Revoke one token by id, or every token of an org.
+      operationId: revokeTokens
+      summary: Delete tokens for offboarding or erasure, immediately.
+      description: Narrow by id, userId or workspaceId; with only orgId, every token of the org.
       security:
-        - bootstrap: []
+        - internal: []
       requestBody:
         required: true
         content:
@@ -421,10 +429,12 @@ paths:
               required: [orgId]
               properties:
                 orgId: {type: string}
-                id: {type: string, description: Omit to revoke every token of the org.}
+                id: {type: string}
+                userId: {type: string}
+                workspaceId: {type: string}
       responses:
         "200":
-          description: How many sessions were revoked.
+          description: How many sessions were deleted.
           content:
             application/json:
               schema:
@@ -438,11 +448,11 @@ components:
     bearer:
       type: http
       scheme: bearer
-      description: "`rth_at_` or `rth_st_` in `self_issued` mode; `sh_at_` in `relaycontrol_only` mode."
-    bootstrap:
+      description: "`rth_at_read_` or `rth_st_read_` in `self_issued` mode; `sh_at_` in `relaycontrol_only` mode."
+    internal:
       type: http
       scheme: bearer
-      description: The deployment's READ_API_BOOTSTRAP_SECRET.
+      description: The deployment's READ_API_INTERNAL_SECRET, or READ_API_INTERNAL_SECRET_PREVIOUS during a rotation.
   parameters:
     workspace:
       name: workspace
@@ -462,28 +472,44 @@ components:
       schema: {type: string}
   responses:
     TokenPair:
-      description: A session. Scopes contain `rth:read`.
+      description: The relaycontrol_only login reply. Scopes contain `rth:read`.
       content:
         application/json:
           schema:
             type: object
             required: [accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType, scopes]
             properties:
-              sessionId: {type: string, description: Present in self_issued mode.}
               accessToken: {type: string}
               accessTokenExpiresAt: {type: string, format: date-time}
               refreshToken: {type: string}
               refreshTokenExpiresAt: {type: string, format: date-time}
               tokenType: {type: string, enum: [Bearer]}
               scopes: {type: array, items: {type: string}}
-              orgId: {type: string, description: Present in self_issued mode.}
-              workspaceId: {type: string, description: Present in self_issued mode.}
+    Session:
+      description: A new session; the frozen engine reply to Control.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [sessionId, userId, orgId, workspaceId, audience, scopes, accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType]
+            properties:
+              sessionId: {type: string}
+              userId: {type: string}
+              orgId: {type: string}
+              workspaceId: {type: string}
+              audience: {type: string}
+              scopes: {type: array, const: ["rth:read"]}
+              accessToken: {type: string}
+              accessTokenExpiresAt: {type: string, format: date-time}
+              refreshToken: {type: string}
+              refreshTokenExpiresAt: {type: string, format: date-time}
+              tokenType: {type: string, enum: [Bearer]}
     Error:
       description: >-
-        401 missing_authorization, invalid_token, token_revoked; 403 forbidden
-        (wrong workspace or no rth:read); 400 bad_request; 501
-        unsupported_by_backend with a reason; 503 backend_unavailable,
-        token_store_unavailable or relaycontrol_unavailable (retryable).
+        401 missing_authorization or invalid_token; 403 forbidden (wrong
+        workspace or no rth:read) or audience_mismatch; 400 bad_request; 501
+        unsupported_by_backend with a reason; 503 backend_unavailable or
+        token_store_unavailable (retryable).
       content:
         application/json:
           schema:
@@ -499,6 +525,16 @@ components:
                   reason: {type: string}
               correlationId: {type: string}
   schemas:
+    IssueRequest:
+      type: object
+      required: [userId, orgId, workspaceId, audience, scopes]
+      properties:
+        userId: {type: string}
+        orgId: {type: string}
+        workspaceId: {type: string}
+        audience: {type: string, description: Must normalize to this service's origin, else 403 audience_mismatch.}
+        scopes: {type: array, const: ["rth:read"]}
+        label: {type: string, maxLength: 128}
     SessionSummary:
       type: object
       required: [sessionId, source, userIds, machineIds, firstTs, lastTs, eventCount, models]
