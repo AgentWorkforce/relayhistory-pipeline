@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import pg from "pg";
 import { createSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
 import type { SearchEventDocument } from "@rhc/search-index/contracts.ts";
+import { TENANT_SETTINGS_SQL } from "@rhc/search-index/postgres.ts";
 import { lambdaEnv, runtimeFromSecret } from "../lambda.ts";
 import { indexSearchScope } from "../search-index.ts";
 
@@ -37,9 +38,14 @@ class BoundedPool {
           await this.barrier;
         }
         await Promise.resolve(); // Interleave concurrent passes across awaits.
-        if (this.failErase && text.startsWith('DELETE FROM "search_index".')) throw Object.assign(new Error("synthetic index failure"), { code: "XX000" });
+        if (this.failErase && isErase(text)) throw Object.assign(new Error("synthetic index failure"), { code: "XX000" });
+        // Tenant-bound fixtures: the settings check holds, deletes saw and
+        // removed one row, and no scope row is left after an erase.
         const rows = text.includes("pg_try_advisory_xact_lock") ? [{ ok: true }]
-          : text.startsWith("WITH input AS") || text.startsWith("WITH gone AS") ? [{ n: 1 }]
+          : text.startsWith("WITH input AS") ? [{ n: 1 }]
+          : text.startsWith("WITH present AS") ? [{ bound: true, present: 1, deleted: 1 }]
+          : text.startsWith("SELECT (current_setting(") && text.includes("AS bound, count(*)") ? [{ bound: true, n: 0 }]
+          : text.startsWith("SELECT (current_setting(") ? [{ bound: true }]
           : text.includes("to_regclass") ? [{ present: true }] : [];
         return { rows };
       },
@@ -70,6 +76,8 @@ class BoundedPool {
 }
 
 const RealPool = pg.Pool;
+/** The adapter's scope erase: one statement that counts, deletes and reports its binding. */
+const isErase = (text: string) => text.startsWith("WITH present AS") && text.includes('DELETE FROM "search_index"."transcript_events" WHERE');
 afterEach(() => { pg.Pool = RealPool; BoundedPool.instances.length = 0; });
 const scope = (i: number) => ({ orgId: `org-${i}`, workspaceId: `ws-${i}`, harness: "codex", sessionId: `session-${i}` });
 function runtime(capacity: number) {
@@ -106,9 +114,19 @@ for (const capacity of [1, 2]) {
       expect(results.every(result => result.complete && result.reasons[0] === "erased")).toBe(true);
       expect(complete.sort()).toEqual(Array.from({ length: capacity }, (_, i) => scope(i).orgId));
       expect(pool.poolQueries).toBe(0); expect(pool.peakWaiting).toBe(0);
-      for (const query of pool.queries.filter(query => query.text.startsWith('DELETE FROM "search_index".'))) {
+      const erases = pool.queries.filter(query => isErase(query.text));
+      expect(erases).toHaveLength(capacity);
+      for (const query of erases) {
         const metadata = pool.queries.find(other => other.client === query.client && other.text.includes("SELECT p.manifest_key"))!;
         expect(query.params![0]).toBe(metadata.params![0]); expect(query.params![1]).toBe(metadata.params![1]);
+        // Forced RLS: on the same connection, right before it, this pass's
+        // tenant is bound and checked, so concurrent passes never share one.
+        const own = pool.queries.filter(other => other.client === query.client);
+        const at = own.indexOf(query), tenant = [metadata.params![0], metadata.params![1]];
+        expect(own[at - 2]).toEqual({ client: query.client, text: TENANT_SETTINGS_SQL, params: tenant });
+        expect(own[at - 1]!.text).toStartWith("SELECT (current_setting('bulls96_read.org_id', true)"); expect(own[at - 1]!.params).toEqual(tenant);
+        expect(query.params!.slice(0, 2)).toEqual(tenant);
+        expect(own[at + 1]!.text).toContain("AS bound, count(*) AS n FROM"); // nothing of the scope is left
       }
       expect(pool.queries.filter(query => query.text === "COMMIT")).toHaveLength(capacity);
       expect(pool.queries.filter(query => query.text === "ROLLBACK")).toHaveLength(0);

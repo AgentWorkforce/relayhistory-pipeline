@@ -54,6 +54,35 @@ export interface SourcePin {
   sha: string;
   generation: string;
 }
+/** Nonsecret, derived from the validated native inputs; never supplied by the executor. */
+export type OwnerPreparedContext = Readonly<{
+  sourceSha: string;
+  generation: string;
+  expectedLedgerSha256: string;
+  planSha256: string;
+  captureSha256: string;
+  approvalSha256: string;
+  wrapperSha256: string;
+}>;
+/** Internal integration for a separately reviewed fixed entry, not a stock CLI selector. */
+export type OwnerApplyIntegration = Readonly<{
+  beforeWrite: (context: OwnerPreparedContext) => Promise<void>;
+}>;
+export function validateOwnerIntegration(integration?: OwnerApplyIntegration): void {
+  if (integration !== undefined &&
+      (!obj(integration) || Object.keys(integration).length !== 1 ||
+       !Object.hasOwn(integration, "beforeWrite") || typeof integration.beforeWrite !== "function"))
+    ownerApplyRefuse("owner_integration_shape");
+}
+export type OwnerReleaseInputs = Readonly<{
+  pin: SourcePin;
+  planText: string;
+  captureText: string;
+  approvalText: string;
+  wrapper: WrapperSource;
+  recheckSource: () => Promise<void>;
+  integration?: OwnerApplyIntegration;
+}>;
 export interface OwnerIdentity {
   owner: string;
   login: string;
@@ -497,18 +526,37 @@ export async function refreshOwnerWrapper(
   }
   await ownerIdentity(client, pid, false);
 }
-export async function applyOwnerRelease(
-  client: MigrationClient,
-  pid: number,
-  args: {
-    pin: SourcePin;
-    planText: string;
-    captureText: string;
-    approvalText: string;
-    wrapper: WrapperSource;
-    recheckSource: () => Promise<void>;
-  },
-) {
+/** Called under the migrator advisory lock, outside a transaction, before wrapper refresh.
+ * The integration owns its bounded transport wait. Refusal propagates to the canonical
+ * rollback/unlock/connection-close path; no wrapper or readiness-marker write has run.
+ */
+export async function prepareOwnerWrite(client: MigrationClient, pid: number, args: OwnerReleaseInputs) {
+  validateOwnerIntegration(args.integration);
+  const revalidate = async () => {
+    validateOwnerApply(args.planText, args.captureText, args.approvalText, args.pin, args.wrapper);
+    await args.recheckSource();
+    await ownerIdentity(client, pid, false);
+  };
+  await revalidate();
+  if (args.integration !== undefined) {
+    const context: OwnerPreparedContext = Object.freeze({
+      sourceSha: args.pin.sha,
+      generation: args.pin.generation,
+      expectedLedgerSha256: OWNER_APPLY.ledger,
+      planSha256: digest(args.planText),
+      captureSha256: digest(args.captureText),
+      approvalSha256: digest(args.approvalText),
+      wrapperSha256: args.wrapper.sha256,
+    });
+    await args.integration.beforeWrite(context);
+    // A successful release cannot extend stale approval, source or session authority.
+    await revalidate();
+    // The source/identity rechecks themselves may consume the last validity margin.
+    validateOwnerApply(args.planText, args.captureText, args.approvalText, args.pin, args.wrapper);
+  }
+}
+export async function applyOwnerRelease(client: MigrationClient, pid: number, args: OwnerReleaseInputs) {
+  validateOwnerIntegration(args.integration);
   const expectedWrapper = await wrapperSource();
   if (
     args.wrapper.sql !== expectedWrapper.sql ||
@@ -542,15 +590,7 @@ export async function applyOwnerRelease(
       profile: ownerProfile(),
       expectedLedgerSha256: OWNER_APPLY.ledger,
       beforeWrite: async () => {
-        validateOwnerApply(
-          args.planText,
-          args.captureText,
-          args.approvalText,
-          args.pin,
-          args.wrapper,
-        );
-        await args.recheckSource();
-        await ownerIdentity(client, pid, false);
+        await prepareOwnerWrite(client, pid, args);
         await refreshOwnerWrapper(client, pid, args.wrapper);
       },
     });
