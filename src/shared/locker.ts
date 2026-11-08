@@ -101,8 +101,20 @@ export async function gcsMetadataToken(env: NodeJS.ProcessEnv = process.env, fet
   return { accessToken: body.access_token, ...(expiresAt ? { expiresAt } : {}) };
 }
 
+/**
+ * Optional overrides for buildLockerStore; omitted, the store is exactly as before.
+ *   fetch        the object requests' fetch (e.g. one that carries a request's abort signal)
+ *   credentials  the S3 credentials (e.g. one process-wide cached provider shared by short-lived stores)
+ *   gcsToken     the GCS token source (likewise)
+ */
+export interface LockerStoreOptions {
+  fetch?: typeof fetch;
+  credentials?: AwsCredentials | (() => Promise<AwsCredentials>);
+  gcsToken?: () => Promise<GcsToken>;
+}
+
 /** Build the store described by env. Does not cache and does not read process.env unless env is omitted. */
-export function buildLockerStore(env: NodeJS.ProcessEnv = process.env): RawStore {
+export function buildLockerStore(env: NodeJS.ProcessEnv = process.env, options: LockerStoreOptions = {}): RawStore {
   assertLockerSelection(env);
   const provider = lockerProvider(env);
   const bucket = env.LOCKER_BUCKET;
@@ -114,7 +126,8 @@ export function buildLockerStore(env: NodeJS.ProcessEnv = process.env): RawStore
       store: createGcsStore({
         bucket,
         ...(env.LOCKER_ENDPOINT ? { baseUrl: env.LOCKER_ENDPOINT } : {}),
-        token: () => gcsMetadataToken(env),
+        token: options.gcsToken ?? (() => gcsMetadataToken(env)),
+        ...(options.fetch ? { fetch: options.fetch } : {}),
       }),
     };
   }
@@ -125,7 +138,8 @@ export function buildLockerStore(env: NodeJS.ProcessEnv = process.env): RawStore
       bucket,
       region: env.LOCKER_REGION || "us-east-1",
       ...(env.LOCKER_ENDPOINT ? { endpoint: env.LOCKER_ENDPOINT } : {}),
-      credentials: lockerCredentials(env),
+      credentials: options.credentials ?? lockerCredentials(env),
+      ...(options.fetch ? { fetch: options.fetch } : {}),
     }),
   };
 }
