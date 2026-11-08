@@ -94,6 +94,14 @@ export interface DeliverDeps {
    * failures alike. Unset (the default): no line, no behaviour change.
    */
   stageLatency?: StageLatencyObserver;
+  /**
+   * Async admission only (async-admission.ts): runs AFTER a `claimed`/`resume` claim and BEFORE
+   * any slot, S3 write or receipt, and throws to refuse. The consumer uses it for the
+   * upload-time privacy fence (a reset or re-enable that started after the upload refuses
+   * the batch). Never set on the request path. A replay / replay_fast claim never calls it:
+   * those admit nothing new.
+   */
+  admissionGate?: () => Promise<void>;
 }
 
 /** Whether this deployment routes Babysitter upserts to retention buckets (see `DeliverDeps.babysitterRetention`). */
@@ -291,6 +299,7 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
   if (claim.kind === "replay_fast")
     return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
 
+  if (deps.admissionGate) await stage("admission_gate", deps.admissionGate);
   // The deletion filter (records of sessions the user deleted from this origin are
   // acknowledged, not stored) and the replay fast path (records already stored at or
   // above their revision are acknowledged, not written again).
