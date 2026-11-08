@@ -8,6 +8,7 @@
  * user's claim (KEY SHARE) no longer queues behind it, while FOR SHARE / FOR UPDATE holders still exclude the ACK.
  * D1 (043800): the staged ACK takes the same origin advisory lock as the claim before any slot (fence -> clock ->
  * origin -> slot), so an ACK and a same-origin claim of another user over reversed slot order never deadlock (40P01).
+ * D1n: the causal negative -- the intermediate e79ee9f4 ACK (clock NO KEY UPDATE, no origin lock) deadlocks (40P01) there.
  * Every test that reinstalls older bodies restores 043500 AND THEN 043800 and asserts the 043800 ACK at the restore.
  * Claim/commit payloads are captured from the real deliverBatch -> sqlLedger path and replayed on held connections.
  */
@@ -464,6 +465,68 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
       } finally { for (const c of blockers) await release(c); }
     }
   }, 120000);
+
+  // D1n (e79 negative): the causal counterpart of D1. The intermediate e79ee9f4 ACK (043800 text minus the origin lock:
+  // clock FOR NO KEY UPDATE, then stage row and slots) under D1's schedule. The claim passes the clock (KEY SHARE vs NO
+  // KEY UPDATE) and the free origin lock and queues on B (holding B's tuple lock) BEFORE A is released; the ACK then
+  // takes A and queues on B behind the claim. Releasing B grants B to the claim, which then requests A (held by the
+  // ACK) while the ACK waits on the claim's xid for B: a cycle, and the detector aborts exactly one with 40P01.
+  test("D1n (e79 negative): with the clock at NO KEY UPDATE but no origin lock in the ACK, the reversed-two-slot schedule deadlocks (40P01)", async () => {
+    const shipped = text(ackMigrationPath);
+    expect(shipped.split(ACK_ORIGIN_LINE).length - 1).toBe(1);
+    const e79 = shipped.replace(ACK_ORIGIN_LINE, "");
+    expect(e79).toContain(ACK_CLOCK_LINE);
+    expect(e79).not.toContain(ACK_ORIGIN_LINE);
+    const slotLock = "SELECT 1 FROM sessions.ingest_lazy_native_slots WHERE org_id=$1 AND workspace_id=$2 AND origin_id=$3 AND record_id=$4 FOR UPDATE";
+    const fast = "SET LOCAL statement_timeout=20000;SET LOCAL deadlock_timeout='200ms'"; // superuser GUC: set before SET ROLE
+    const u1 = tenant("d1nu1"), u2 = tenant("d1nu2"), origin = `d1n-o-${serial}`, a = `d1n-${serial}-a`, b = `d1n-${serial}-b`;
+    await warm(u1, u2);
+    // Captured under the shipped bodies: U1's claim (initializing A and B, owner NULL) and stage are committed.
+    const pAck = await capture("ingest_commit_buffered_batch", u1, `d1nu1-${serial}`, [a, b], { origin });
+    const pClaim = await capture("ingest_claim_buffered_batch", u2, `d1nu2-${serial}`, [b, a], { origin });
+    for (const rid of [a, b]) expect(await slots(rid)).toEqual([{ current_owner: null }]);
+    const blockers: PoolClient[] = [];
+    try {
+      await pool.query(e79);
+      const ackSrc = await prosrc("sessions.ingest_lazy_ack_batch(jsonb)");
+      expect(ackSrc).toContain(ACK_CLOCK_LINE);
+      expect(ackSrc).not.toContain("lazy-native-origin-v1");
+      expect(await prosrc("sessions.ingest_lazy_records(jsonb)")).toContain("lazy-native-origin-v1"); // the claim still takes it
+      for (const rid of [a, b]) {
+        const c = await connect(); blockers.push(c);
+        await c.query("BEGIN");
+        expect((await c.query(slotLock, [u1.orgId, u1.workspaceId, origin, rid])).rowCount).toBe(1);
+      }
+      const [bA, bB] = blockers as [PoolClient, PoolClient];
+      const pidOf = async (c: PoolClient) => (await c.query("SELECT pg_backend_pid() AS pid")).rows[0].pid as number;
+      const [pidA, pidB] = [await pidOf(bA), await pidOf(bB)];
+      const hAck = await hold(COMMIT, pAck, fast);
+      await waitBlockedBy(hAck.pid, pidA); // the ACK is at slot A (its first rank)
+      expect(await advisory([hAck.pid])).toEqual([]); // e79: no origin lock
+      const hClaim = await hold(CLAIM, pClaim, fast);
+      await waitBlockedBy(hClaim.pid, pidB); // passed the clock and the free origin lock; queued on B first
+      expect((await pool.query("SELECT pg_blocking_pids($1::int) AS p", [hClaim.pid])).rows[0].p).toEqual([pidB]);
+      const want = await originLock(origin);
+      expect(await advisory([hClaim.pid])).toEqual([{ pid: hClaim.pid, classid: want.classid, objid: want.objid, objsubid: 1, mode: "ExclusiveLock", granted: true }]);
+      blockers.shift(); await release(bA); // release A: the ACK takes A, then queues on B behind the claim
+      await waitBlockedBy(hAck.pid, hClaim.pid);
+      await waitBlockedBy(hAck.pid, pidB);
+      expect(await settled(hClaim.done, 200)).toBe(false);
+      blockers.shift(); await release(bB); // release B: granted to the claim, which then waits on A held by the ACK
+      const [ack, claim] = await Promise.all([hAck.done, hClaim.done]);
+      // Exactly one victim; the cycle is then broken and the survivor's statement completes.
+      expect([ack, claim].filter((r) => !r.ok).map((r) => (r.ok ? "ok" : r.code))).toEqual(["40P01"]);
+      await finish(hAck, ack.ok ? "COMMIT" : "ROLLBACK");
+      await finish(hClaim, claim.ok ? "COMMIT" : "ROLLBACK");
+      const owner = ack.ok ? u1.userId : null;
+      for (const rid of [a, b]) expect(await slots(rid)).toEqual([{ current_owner: owner }]);
+      for (const rid of [a, b]) for (const s of await slots(rid)) expect(s.current_owner).not.toBe(u2.userId);
+    } finally {
+      for (const c of blockers) await release(c);
+      await restoreShipped(); // 043500 then 043800: no later test sees the e79 body
+    }
+    await expectAck043800();
+  }, 60000);
 
   test("C2 (043800): a FOR SHARE or FOR UPDATE holder of the clock (custody/GC/policy, quiesce) still excludes a staged ACK (55P03 under lock_timeout)", async () => {
     for (const mode of ["FOR SHARE", "FOR UPDATE"]) {
