@@ -36,9 +36,9 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
-import { assertWithinBudget, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { assertWithinBudget, batchIdConflict, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
 import { assertTenantSegment } from "./writer.ts";
-import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, enqueueAdmission, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
+import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, enqueueAdmission, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode, type SyncAdmissionFrozenReceiptMode } from "./async-admission.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
@@ -148,6 +148,15 @@ export interface IngestAppDeps {
    * journal is still raised (the consumer is still admitting). Buffered acceptance only.
    */
   asyncAdmission?: { mode: AsyncAdmissionMode; enqueue: (message: AdmissionMessage) => Promise<void>; nowMs?: () => number };
+  /**
+   * INGEST_SYNC_ADMISSION_FROZEN_RECEIPT (async-admission.ts). Absent or "off": nothing changes. "on":
+   * under frozen-supabase custody, a batch whose SIGNED identity carries `admission: queued-v1` but did
+   * not take the queued path first reads the frozen legacy receipt, exactly as the admission consumer
+   * does: a stored receipt answers legacy_replay (same digest; ADMISSION_LEGACY_REPLAY header) or
+   * delivery_conflict (other digest) with no witness, claim or delivery. relayhistory skips its own
+   * pre-forward read for such a caller.
+   */
+  syncAdmissionFrozenReceipt?: SyncAdmissionFrozenReceiptMode;
 }
 
 type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined; journalWitness: { tenant: string; seq: number } | undefined } };
@@ -358,6 +367,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   const asyncMode: AsyncAdmissionMode = deps.asyncAdmission?.mode ?? "off";
   if (asyncMode !== "off" && deps.deliver.acceptanceMode !== "buffered") throw new Error("session ingest: async admission requires buffered acceptance");
   const nowMs = deps.asyncAdmission?.nowMs ?? Date.now;
+  const syncFrozenReceipt = deps.syncAdmissionFrozenReceipt === "on";
   /**
    * A reset or re-enable, bracketed by the privacy journal (async-admission.ts) while async admission
    * may have uploads in flight (on / drain). Only ORDERED controls: buffered SQL refuses any other
@@ -541,6 +551,20 @@ export function createIngestApp(deps: IngestAppDeps) {
         emit({ ...fields, outcome: "accepted_queued", count: prepared.records.length, duration_ms: Date.now() - started, bytes_raw: read.bytes });
         c.header(ADMISSION_HEADER, ADMISSION_QUEUED);
         return c.json({ ...prepared.receipt, limits: { ...DELIVERY_LIMITS, contentEncodings: contentEncodings() } });
+      }
+      // INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: a queued-v1 caller's relayhistory skipped its pre-forward legacy-receipt
+      // read, so a batch that fell back here gets the consumer's read first (admission-consumer.ts), before any claim.
+      if (syncFrozenReceipt && identity.admission === ADMISSION_ACCEPT_VALUE && custodyMode === "frozen-supabase") {
+        if (!deps.deliver.ledger.frozenReceipt) throw new IngestUnavailable("fence", "custody_source_unavailable");
+        const prepared = await prepareDelivery({ orgId: tenant.orgId, workspaceId: tenant.workspaceId }, batch);
+        const stored = await deps.deliver.ledger.frozenReceipt({ tenant, originId: prepared.originId, batchId: prepared.batchId });
+        if (stored) {
+          if (stored.digest !== prepared.batchDigest) throw batchIdConflict(prepared, stored.digest);
+          // No claim, so no custody ACK header; the admission header names the legacy replay instead.
+          emit({ ...fields, outcome: "legacy_replay", count: prepared.records.length, duration_ms: Date.now() - started, bytes_raw: read.bytes });
+          c.header(ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY);
+          return c.json({ ...stored.receipt, limits: { ...DELIVERY_LIMITS, contentEncodings: contentEncodings() } });
+        }
       }
       if (!c.get("custody") && custodyMode === "frozen-supabase") c.set("custody", await frozenWitness(await batchWitnessInput(tenant, batch)));
       else if (c.get("custody")) await shadow(route, c.get("custody")!, () => batchWitnessInput(tenant, batch));

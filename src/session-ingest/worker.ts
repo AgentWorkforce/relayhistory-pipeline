@@ -31,6 +31,9 @@
  *   INGEST_ASYNC_ADMISSION     unset/off (default) | on | drain: S3-first async admission
  *                              (async-admission.ts, docs/design/s3-first-async-ingest.md); on/drain need
  *                              buffered acceptance and the INGEST_ADMISSION queue (producer + consumer)
+ *   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT  unset/off (default) | on: under frozen-supabase custody, a queued-v1
+ *                              caller on the synchronous path reads the frozen legacy receipt before any claim
+ *                              (app.ts acceptBatch, as the admission consumer does)
  *   SESSIONS_NEON_EXIT         unset/false (default) | true: refuse every Neon edge at startup
  *                              (replica, NEON_REPLICA binding, a custody source other than
  *                              frozen-supabase in buffered mode); docs/neon-exit-edge-map.md
@@ -52,7 +55,7 @@ import { fanout, type FanoutMessage } from "./staging.ts";
 import type { StageLatencyFields } from "./deliver.ts";
 import type { WriteTarget } from "./writer.ts";
 import { routingFlag } from "./babysitter-retention.ts";
-import { asyncAdmissionMode, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
+import { asyncAdmissionMode, syncAdmissionFrozenReceiptMode, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
 import { admitMessage, type AdmissionAction } from "./admission-consumer.ts";
 import { lockAlertFields } from "./app.ts";
 import type { DeliverDeps } from "./deliver.ts";
@@ -69,6 +72,8 @@ export interface IngestWorkerEnv {
   INGEST_ADMISSION?: QueueLike<AdmissionMessage>;
   /** off (default) | on | drain (async-admission.ts). */
   INGEST_ASYNC_ADMISSION?: string;
+  /** off (default) | on (async-admission.ts syncAdmissionFrozenReceiptMode). */
+  INGEST_SYNC_ADMISSION_FROZEN_RECEIPT?: string;
   NEON_REPLICA?: QueueLike<NeonReplicaMessage>;
   /** Secrets Store bindings (a plain string in tests). */
   S3_ACCESS_KEY_ID?: SecretBinding | string;
@@ -158,6 +163,8 @@ export interface IngestSettings {
   stageLatencyLog?: true;
   /** INGEST_ASYNC_ADMISSION: absent = off (the default). */
   asyncAdmission?: Exclude<AsyncAdmissionMode, "off">;
+  /** INGEST_SYNC_ADMISSION_FROZEN_RECEIPT=on. Absent (the default): off. */
+  syncAdmissionFrozenReceipt?: true;
 }
 
 /** The settings, or null while any required one is missing (every request is then 503 not_configured). */
@@ -190,6 +197,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   if (asyncMode !== "off" && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ASYNC_ADMISSION needs buffered acceptance");
   // Async admission without its queue would refuse every opted-in batch: not configured.
   if (asyncMode !== "off" && !env.INGEST_ADMISSION) return null;
+  const syncFrozenReceipt = syncAdmissionFrozenReceiptMode(env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT);
   return {
     bucket,
     region: env.INGEST_S3_REGION ?? "us-east-1",
@@ -211,6 +219,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(/^[0-9a-f]{64}$/.test(env.INGEST_EXPECT_GENERATION ?? "") ? { retentionGeneration: env.INGEST_EXPECT_GENERATION! } : {}),
     ...(routingFlag(env.INGEST_STAGE_LATENCY_LOG) ? { stageLatencyLog: true as const } : {}),
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
+    ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
   };
 }
 
@@ -295,6 +304,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     ...(settings.asyncAdmission && env.INGEST_ADMISSION
       ? { asyncAdmission: { mode: settings.asyncAdmission, enqueue: (message: AdmissionMessage) => env.INGEST_ADMISSION!.send(message) } }
       : {}),
+    ...(settings.syncAdmissionFrozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
   });
 }
 
