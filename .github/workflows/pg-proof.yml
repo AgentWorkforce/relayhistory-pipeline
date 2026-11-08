@@ -170,7 +170,7 @@ jobs:
           EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           jq -e --arg head "$EXPECTED" --argjson major ${{ matrix.pg }} \
-            '.head == $head and .tracked_tree_clean == true and .pg_major == $major and .bootstrap_superuser == "rdsadmin" and .failed == 0 and .passed >= 21 and (.cases | all(.pass))' rds-profile-proof.json
+            '.head == $head and .tracked_tree_clean == true and .pg_major == $major and .bootstrap_superuser == "rdsadmin" and .failed == 0 and .passed >= 26 and (.cases | all(.pass))' rds-profile-proof.json
           jq -r '"\(.passed) passed, \(.failed) failed on PostgreSQL \(.pg_version) (rds emulation) at \(.head)"' rds-profile-proof.json | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
