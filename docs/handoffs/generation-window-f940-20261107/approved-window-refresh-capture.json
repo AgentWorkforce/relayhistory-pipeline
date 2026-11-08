@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "kind": "owner-schema-apply-v1",
+  "at": "2026-11-07T22:04:06.494Z",
+  "source": {
+    "sha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+    "generation": "e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce"
+  },
+  "project": "pyamkrhoyszgzirqqffq",
+  "planSha256": "95d9012c2183758fd4a81a05f887a8b395c4287e1b9ef37f7d9e7f55a3c7554e",
+  "ledgerSha256": "3173f2df7f749fd79c340286f3284d91d8f5a8b988b7f1b1a11e01c3a3307641",
+  "inventorySha256": "05bb85393c0792a938d8283f773433695e3dc6d4a814f09c6fe83b593466ce24",
+  "aclSha256": "d953e10c3e9c519e559d2728c0665de946ba223c952da1dd9c1ba3e28a3b7aad",
+  "existingBoundary": {
+    "name": "hoopdb_sessions_function_boundary",
+    "present": true,
+    "event": "ddl_command_end",
+    "tags": [
+      "ALTER AGGREGATE",
+      "ALTER DEFAULT PRIVILEGES",
+      "ALTER EXTENSION",
+      "ALTER FUNCTION",
+      "ALTER PROCEDURE",
+      "ALTER ROUTINE",
+      "ALTER SCHEMA",
+      "CREATE AGGREGATE",
+      "CREATE EXTENSION",
+      "CREATE FUNCTION",
+      "CREATE PROCEDURE",
+      "CREATE TYPE",
+      "GRANT",
+      "REVOKE"
+    ],
+    "tags_exact": true,
+    "enabled": "A",
+    "enabled_ok": true,
+    "owner": "postgres",
+    "owner_is_migration_owner": true,
+    "function": "hoopdb_boundary.sessions_function_boundary()",
+    "function_is_reviewed": true,
+    "function_owner": "postgres",
+    "function_owner_is_migration_owner": true,
+    "schema_owner_is_migration_owner": true,
+    "prosrc_sha256": "94d0aa84f59f014b682608e9b651ce0fd0864c3f8dfaa30e5fc55d98944501fc",
+    "prosrc_exact": false,
+    "proconfig": [
+      "search_path=pg_catalog, pg_temp"
+    ],
+    "proconfig_exact": true,
+    "security_definer": false,
+    "volatility": "v",
+    "language": "plpgsql",
+    "returns": "event_trigger",
+    "function_acl": [
+      "<owner>:EXECUTE"
+    ],
+    "function_public_execute": false,
+    "runtime_role_setting": "bulls96_runtime",
+    "runtime_role_setting_matches": true,
+    "schema_private": true,
+    "verified": false
+  },
+  "existingBoundarySha256": "074c3574cd1ca2a20abceb728c0cd6395ff5314b7c145a3b4f0ee2ae55931d4a",
+  "wrapperSha256": "09b1d7804612f38fc121106004752348d56d8781930b66e840e1ef71391c4808",
+  "wrapperProsrcSha256": "8061b2c51d99613e3fd606bc4b2d639107638171e77122e0abb59a628f90fda0",
+  "ownerRoleRestorationVerified": true,
+  "captureGeneration": "c9bc7700eaf8b9aeacf15bca9c0a7a781c30ceccbffc5b3286c602623b1b7042"
+}

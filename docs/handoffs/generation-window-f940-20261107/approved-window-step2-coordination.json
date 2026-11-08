@@ -1,0 +1,27 @@
+{
+  "recordedAt": "2026-11-07T22:25:00.531712+00:00",
+  "source": "direct user: trigger aws access again",
+  "awsRetryReceiptSha256": "9816ec74e6ee3a494ea073182364b2c94d4e8410b96064c8138a60eef9998508",
+  "authenticatedAccount": "941433935742",
+  "authenticatedArn": "arn:aws:sts::941433935742:assumed-role/AWSReservedSSO_AdministratorAccess_267543ee54f72723/khaliq@agentrelay.com",
+  "gcObservedMetadata": {
+    "CodeSha256": "Q0Wjh9qijm2wAoZOacdK+vDST2XXMJisEdmC6IJGNaI=",
+    "RevisionId": "99bf8dce-c792-4c1d-ad10-f563d431a698",
+    "State": "Active",
+    "LastUpdateStatus": "Successful",
+    "Runtime": "nodejs24.x",
+    "Handler": "index.handler",
+    "Role": "arn:aws:iam::941433935742:role/96bulls-sessions-prod-buffered-gc"
+  },
+  "gcEnablementHealthAndEnvironmentNotQualified": true,
+  "credentialFilesWritten": false,
+  "sessionClosed": true,
+  "lambdaUpdateRequested": false,
+  "gcWindowDisposition": "DEFERRED_BY_LEAD_244948358983348224",
+  "gcFailClosedBasis": "ingest_buffer_gc_claim calls ingest_require_generation before candidate/lease work; bufferedGcTick claims before S3 collection. Not a claim that an existing G1 runtime fails the compiled-vs-config equality check when both are G1.",
+  "schemaStep2": "RUNNING_CANONICAL_OWNER_APPLY",
+  "workerReadyPacketSha256": "31b55088d5925dd6491f05ccd7ebc3c66c511ca2722d9ad9c9469f0b4e18906b",
+  "workerReadyCheckSha256": "014f189ee2e8d57b49fb848eb835f6a7fd5ca5c9cc8c15d10c9b03bfc5498254",
+  "preapplyG1ReceiptSha256": "8331d453a51543b0e75aa57492996bea8761024349caa941d2147c2b0c6a7894",
+  "preapplyAdmissions": 1031
+}

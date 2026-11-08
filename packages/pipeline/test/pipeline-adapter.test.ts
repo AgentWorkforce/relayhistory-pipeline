@@ -557,13 +557,25 @@ describe("scrubbing raw chunks before object storage", () => {
       "[REDACTED] (2)": { "[REDACTED]": 2, x: [{ "[REDACTED]": 3 }] },
       "[REDACTED] (3)": 4,
     });
-    // A key the source itself repeated stays exactly as the source had it.
+    // A key the source itself repeated is written again under its first written
+    // name: a key no rule touches stays exactly as the source had it.
     const dup = '{"k":1,"k":2}\n';
     expect(
       new TextDecoder().decode(
         scrubRecords(new TextEncoder().encode(dup)).scrubbed,
       ),
     ).toBe(dup);
+  });
+
+  it("writes a repeated source key under its first written name, never another key's", () => {
+    // The repeated key's last value wins for it, as in the source; it must not
+    // land on "[REDACTED]", the first key's written name.
+    const line = '{"a@example.com":1,"b@example.com":2,"b@example.com":3}\n';
+    const out = new TextDecoder().decode(
+      scrubRecords(new TextEncoder().encode(line)).scrubbed,
+    );
+    expect(out).toBe('{"[REDACTED]":1,"[REDACTED] (2)":2,"[REDACTED] (2)":3}\n');
+    expect(JSON.parse(out)).toEqual({ "[REDACTED]": 1, "[REDACTED] (2)": 3 });
   });
 
   it("finds a secret behind a JSON escape, on a string line or inside a record", () => {
@@ -680,6 +692,35 @@ describe("scrubbing raw chunks before object storage", () => {
     expect(() =>
       scrubRecords(new TextEncoder().encode(`${lines.join("\n")}\n`)),
     ).toThrow(/cannot be split/);
+  });
+
+  it("keeps the secret context through objects and arrays under a secret key (rule set 5)", () => {
+    // Synthetic values; SECRETTAIL marks the bytes that must not be stored.
+    const record = {
+      type: "tool_use",
+      password: { value: "SECRETTAIL one" },
+      auth: { value: "SECRETTAIL two" },
+      token: { nested: { deeper: "SECRETTAIL three" } },
+      credentials: [{ value: "SECRETTAIL four", n: 1, ok: true, z: null }],
+      client_secret: { label: "SECRETTAIL five", r: "[REDACTED]", o: "op://vault/item/field" },
+      settings: { mode: "visible words", count: 2 },
+    };
+    const line = JSON.stringify(record);
+    const out = new TextDecoder().decode(
+      scrubRecords(new TextEncoder().encode(`${line}\n`)).scrubbed,
+    );
+    expect(out).not.toContain("SECRETTAIL");
+    const expected = {
+      type: "tool_use",
+      password: { value: "[REDACTED]" },
+      auth: { value: "[REDACTED]" },
+      token: { nested: { deeper: "[REDACTED]" } },
+      credentials: [{ value: "[REDACTED]", n: 1, ok: true, z: null }],
+      client_secret: { label: "[REDACTED]", r: "[REDACTED]", o: "op://vault/item/field" },
+      settings: { mode: "visible words", count: 2 },
+    };
+    expect(out).toBe(`${JSON.stringify(expected)}\n`);
+    expect(JSON.parse(out)).toEqual(scrubJson(record));
   });
 
   it("stores a line or string past the scrub limit whole (version 2), and refuses one it cannot segment", () => {

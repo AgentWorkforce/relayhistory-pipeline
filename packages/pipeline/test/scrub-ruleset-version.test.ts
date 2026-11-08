@@ -35,6 +35,38 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Then the glued-prefix pass tries the relay_ rule first (its body may hold a `.`), so
   // `build-relay_…-sk-….tail` is no longer split at the `.` by the `sk-` rule.
   3: "e7607073a3afca3db6b015945f0b5fab256202f355b740f515987ec162bf3076",
+  // A quoted secret value past the quoted rule's 4096-unit scan bound is redacted whole
+  // (to its matching closing quote or the end of input; no line break ends it), not cut at
+  // the bound with the rest stored; a generated unquoted value after a quoted key likewise.
+  // The segmenter never cuts between such a value's key and its end (longCut, safeCut, and
+  // a run open in one keeps its next record or key line). Values within the bound scrub
+  // byte-identically to version 3.
+  // Updated before release (N1 delta review: longCut finds those values past the segment
+  // bound too, so a key just below the bound is protected; the unquoted over-bound value
+  // gets a span. N2: the line-confined narrowing is withdrawn, over-bound values run across
+  // line breaks. N3: the bound caps the value's total length to its matching close across
+  // lines, not its key line's, and a run or cut window ending inside an undecided secret
+  // value fails closed). Version 4 has sealed no chunk: it is only on this unmerged branch.
+  4: "429200e870dea6b5602f6ffa6b7a577cf2016b27aa9d99e6a3e61b55e5ec612c",
+  // An over-cap quoted secret value is classified and redacted on the original text, by a
+  // pre-pass ahead of every other rule (version 4 measured it after the token rules had
+  // shrunk it under the bound and stored its later lines). The record path keeps key
+  // context: a non-empty string under a secret key is redacted at any depth, through
+  // arrays, in scrubJson/scrubRecord and the record-line tokenizer. From version 5 the
+  // segmenter markers also enclose scrubRecordLine, so the digest covers the record path.
+  // Output with no secret-keyed record value, no over-cap quoted value and no quoted
+  // secret value left unclosed or open across a line break is byte-identical to version 4.
+  // Updated before release (repeated source keys: scrubRecordLine writes a key the source
+  // repeats under its first written name, never another key's). Version 5 has sealed no chunk.
+  // Updated before release (PASS gate blockers 1 and 2: multi-line or unclosed quoted
+  // secret values within the bound are redacted whole and never cut inside; secret context
+  // runs through composite values, objects as well as arrays).
+  // Updated before release (exact-head review of ff5fc268: a value starting `op://` is kept
+  // only when the whole value is a strict one-line reference, OP_REFERENCE; one holding an
+  // escaped line separator, a backslash, a quote, a tab or a double space is redacted whole).
+  // Updated before release (exact-head review of 0f9b2416: an op:// reference has exactly three
+  // or four segments; two, or five or more, are redacted whole).
+  5: "ed8d5c35bfddbcdbe03416c03e08b3d0a0bbcf7c276bc08fe12f14d8756ee933",
 };
 
 const read = (rel: string) =>

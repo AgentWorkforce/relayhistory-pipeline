@@ -67,11 +67,34 @@ import {
   DIRECTORY_LIST_MAX_LIMIT,
   DirectoryError,
   activityDays,
+  decodeCompositeListCursor,
   decodeListCursor,
   directoryPage,
+  encodeCompositeListCursor,
+  sessionFromDirectoryRow,
+  type BufferedListCursor,
+  type DirectoryCursor,
   type Directory,
   type DirectoryListArgs,
+  type DirectoryListRow,
 } from "./directory.ts";
+import type { BufferedSearchGate } from "./buffered-search-gate.ts";
+import {
+  BUFFERED_HEADER,
+  BUFFERED_IDS_HEADER,
+  BUFFERED_LIST_MAX_LIMIT,
+  BufferedFenced,
+  BufferedTooLarge,
+  bufferedIdsHeader,
+  bufferedSessionSummary,
+  cursorTsKey,
+  mergeListPage,
+  readOwnerBufferedList,
+  readOwnerBufferedTurns,
+  type BufferedScope,
+  type BufferedSessionRow,
+  type OwnerBufferedDeps,
+} from "./owner-buffered.ts";
 import { BRIEF_TITLES_MAX_KEYS, BriefTitlesError, briefTitleEntries, type BriefTitleKey, type BriefTitles } from "./brief-titles.ts";
 import {
   CatalogInputError,
@@ -136,6 +159,20 @@ export interface ReadApiDeps {
   turns?: TurnsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
   babysitter?: EvidenceDeps;
+  /**
+   * READ_API_BUFFERED_SEARCH_GATE=on: the per-hit R2 privacy gate (buffered-search-gate.ts) on
+   * every ClickHouse event page. Absent (the default, and always on the Lambda) = event pages
+   * serve canonical rows only (`origin = 'canonical'`; queries.ts OriginMode), never a buffered row.
+   * Requires the ClickHouse binding.
+   */
+  bufferedSearchGate?: BufferedSearchGate;
+  /**
+   * Owner-only buffered reads (owner-buffered.ts), RELAYHISTORY_READ_OWNER_BUFFERED. Consulted
+   * only when `enabled === true`; otherwise every route behaves exactly as without it. Every
+   * buffered response passes the HISTORY_CONTROL_HEAD authority gate; no request header is
+   * ever an authority.
+   */
+  ownerBuffered?: OwnerBufferedDeps;
   /**
    * RELAYHISTORY_SELFHOST_READ_API=true only (selfhost.ts): registers POST /v1/cli/login and
    * GET /v1/sessions/:id/catalog. Absent = neither route exists and nothing else changes.
@@ -285,6 +322,7 @@ function attestWorkspace(c: Context, identity: VerifiedIdentity): void {
 
 export function createReadApi(deps: ReadApiDeps) {
   if (Boolean(deps.ch) === Boolean(deps.adapter)) throw new Error("read API requires exactly one search service binding");
+  if (deps.bufferedSearchGate && !deps.ch) throw new Error("buffered search gate requires the ClickHouse binding");
   const app = new Hono<{ Variables: { identity: VerifiedIdentity; correlationId: string } }>();
   const log = deps.log ?? (() => {});
 
@@ -398,6 +436,10 @@ export function createReadApi(deps: ReadApiDeps) {
     const correlationId = c.get("correlationId") as string;
     const identity = c.get("identity") as VerifiedIdentity | undefined;
     if (error instanceof HttpError) {
+      if (error.code === "buffered_fenced") {
+        c.header("Retry-After", "1");
+        log({ route: c.req.routePath, reason: "buffered_fenced", status: 503, correlation_id: correlationId });
+      }
       if (error.status === 501) log({ route: c.req.routePath, reason: error.reason, status: 501, correlation_id: correlationId });
       return c.json({ error: { code: error.code, message: error.message, ...(error.reason ? { reason: error.reason } : {}) }, correlationId }, error.status as never);
     }
@@ -420,7 +462,15 @@ export function createReadApi(deps: ReadApiDeps) {
     return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId }, 503);
   };
 
-  const pageDeps = () => ({ ch: deps.ch, adapter: deps.adapter, completeSinceMs: deps.completeSinceMs, liveness: deps.liveness, timeoutMs: deps.timeoutMs });
+  const pageDeps = () => ({ ch: deps.ch, adapter: deps.adapter, completeSinceMs: deps.completeSinceMs, liveness: deps.liveness, timeoutMs: deps.timeoutMs, bufferedGate: deps.bufferedSearchGate });
+
+  /** Gate telemetry: counts and closed-enum reasons only, never ids or content. */
+  async function gatedPage(c: Context, input: EventQuery) {
+    const page = await readEventPage(pageDeps(), input);
+    if (page.buffered && page.buffered.checked > 0)
+      log({ route: c.req.routePath, reason: "buffered_gate", buffered_checked: page.buffered.checked, buffered_dropped: page.buffered.dropped, correlation_id: c.get("correlationId") });
+    return page;
+  }
 
   /**
    * Session reads: erased → empty page; history older than the floor → 501;
@@ -438,6 +488,54 @@ export function createReadApi(deps: ReadApiDeps) {
     return "ok";
   }
 
+  /**
+   * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED): the deps when the flag is on,
+   * the token carries a user, and the token's workspace is on both READ_API_DIRECTORY_WORKSPACES
+   * and the owner-buffered canary allowlist READ_API_OWNER_BUFFERED_WORKSPACES (each "*" or
+   * listing it; unset/empty = none). Otherwise undefined and the caller's route runs exactly as
+   * without the flag.
+   */
+  function ownerBufferedFor(identity: VerifiedIdentity): OwnerBufferedDeps | undefined {
+    const ob = deps.ownerBuffered;
+    if (!ob || ob.enabled !== true || !identity.userId) return undefined;
+    const listed = (allowed: ReadonlySet<string> | "*" | undefined) => !!allowed && (allowed === "*" || allowed.has(identity.workspaceId));
+    if (!listed(deps.directoryWorkspaces) || !listed(ob.workspaces)) return undefined;
+    return ob;
+  }
+  const bufferedScope = (identity: VerifiedIdentity): BufferedScope => ({ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId });
+  const bufferedFenced = () => new HttpError(503, "buffered_fenced", "buffered read fenced; retry", "buffered_fenced");
+
+  /**
+   * The caller's buffered turn rows of one session for a detail route, through the gated path
+   * (readOwnerBufferedTurns: authority observed before the RPCs and again after every S3 read,
+   * before any byte). Authority unavailable before any buffered candidate was found: logged,
+   * null (the route's existing 501, exactly as without the flag). Fenced once a candidate was
+   * found: 503 buffered_fenced. Over the byte bounds: logged `buffered_too_large`, null. A
+   * tenant mismatch is a 500; any other failure is logged and answers null.
+   */
+  async function bufferedTurns(c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string) {
+    try {
+      const served = await readOwnerBufferedTurns(ob, bufferedScope(identity), source, sessionId);
+      if (served && "unverifiedBeforeCandidate" in served) {
+        log({ route: c.req.routePath, reason: "buffered_unverified", gate: served.unverifiedBeforeCandidate, correlation_id: c.get("correlationId") });
+        return null;
+      }
+      return served;
+    } catch (error) {
+      if (error instanceof BufferedTooLarge) {
+        log({ route: c.req.routePath, reason: "buffered_too_large", correlation_id: c.get("correlationId") });
+        return null;
+      }
+      if (error instanceof BufferedFenced) {
+        log({ route: c.req.routePath, reason: "buffered_fenced", gate: error.reason, correlation_id: c.get("correlationId") });
+        throw bufferedFenced();
+      }
+      if (error instanceof TenantMismatchError || error instanceof HttpError) throw error;
+      log({ route: c.req.routePath, reason: "buffered_detail_error", error_code: (error as { name?: string })?.name ?? "error", correlation_id: c.get("correlationId") });
+      return null;
+    }
+  }
+
   app.get("/v1/sessions/:sessionId/events", async (c) => {
     try {
       const identity = c.get("identity");
@@ -453,8 +551,8 @@ export function createReadApi(deps: ReadApiDeps) {
       const cursor = decodeCursor(single(c, "cursor"));
       if ((await sessionGate(identity, sessionId, source, cursor !== undefined)) === "empty")
         return c.json({ sessionId, events: [], nextCursor: null, correlationId: c.get("correlationId") });
-      const page = await readEventPage(
-        pageDeps(),
+      const page = await gatedPage(
+        c,
         { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, order, limit, maxContent, cursor },
       );
       return c.json({ sessionId, events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
@@ -488,7 +586,7 @@ export function createReadApi(deps: ReadApiDeps) {
         base.limit = clampLimit(single(c, "limit"), EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT);
         if ((await sessionGate(identity, sessionId, source, cursor !== undefined)) === "empty")
           return c.json({ events: [], nextCursor: null, correlationId: c.get("correlationId") });
-        const page = await readEventPage(pageDeps(), base);
+        const page = await gatedPage(c, base);
         return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
       }
 
@@ -511,7 +609,7 @@ export function createReadApi(deps: ReadApiDeps) {
         if (partials.overflow) throw unsupported("session_partial_unbounded");
         if (partials.sessions.length > 0) throw unsupported("session_partial");
       }
-      const page = await readEventPage(pageDeps(), base);
+      const page = await gatedPage(c, base);
       if (belowFloor && page.nextCursor === null) {
         // First page: nothing was issued yet, so the whole read falls back.
         if (cursor === undefined) throw unsupported("history_floor");
@@ -559,6 +657,79 @@ export function createReadApi(deps: ReadApiDeps) {
   /** Repeated values, deduplicated and empty values dropped (relayhistory readSessionListFilters). */
   const repeated = (c: Context, name: string) => [...new Set((c.req.queries(name) ?? []).filter(Boolean))];
 
+  /**
+   * The list page as canonical rows UNION the caller's buffered sessions (owner-buffered.ts),
+   * newest first, canonical first on equal timestamps; a buffered session whose id has a
+   * live canonical pointer (any harness) or is on the canonical page is never shown
+   * ("canonical wins"; pointers decide nothing else). The cursor carries both positions.
+   * Buffered rows come only through readOwnerBufferedList (authority observed before the RPC
+   * and again after the RPC and the live-pointer await, immediately before emit); a row whose admission fails the final head advances the buffered position but is
+   * never shown. Fenced: the canonical page alone with X-Relayhistory-Buffered: fenced. Any
+   * other buffered failure: the canonical page alone, logged `buffered_list_error`. A row of
+   * another user is a 500.
+   */
+  async function bufferedListPage(
+    c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps,
+    canonicalRows: Array<DirectoryListRow & { cursor_ts?: string }>,
+    q: { limit: number; sources: string[]; notSources: string[]; bounds: Record<"lastTsAfter" | "lastTsBefore" | "firstTsAfter" | "firstTsBefore", Date | undefined> },
+  ) {
+    directoryPage(canonicalRows, identity, q.limit); // tenant and shape checks, as the canonical-only page
+    const canonical = canonicalRows.map((r) => {
+      if (typeof r.cursor_ts !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/u.test(r.cursor_ts)) throw new DirectoryError("parse");
+      return r as DirectoryListRow & { cursor_ts: string };
+    });
+    const incoming = decodeCompositeListCursor(single(c, "cursor"));
+    const inCursor = incoming === undefined || typeof incoming === "string" ? {} : incoming;
+    const bLimit = Math.min(q.limit + 1, BUFFERED_LIST_MAX_LIMIT);
+    let buffered: BufferedSessionRow[] = [];
+    let consulted = false;
+    let fenced = false;
+    const shown = new Set<string>();
+    // No buffered position yet: start at the canonical position, ties included.
+    const cursor: BufferedListCursor | undefined = inCursor.buffered ??
+      (inCursor.canonical ? { ts: cursorTsKey(inCursor.canonical.lastActivityAt), sessionId: "", source: "" } : undefined);
+    try {
+      // The live-pointer await runs inside the gated read, before its final authority check;
+      // from here to the response nothing awaits.
+      const rows = await readOwnerBufferedList(ob, bufferedScope(identity), { cursor, limit: bLimit }, (ids) =>
+        deps.liveness.livePointerSessions(identity.orgId, identity.workspaceId, ids));
+      const onPage = new Set(canonical.map((r) => `${r.harness}\u0000${r.session_id}`));
+      for (const r of rows) if (r.visible && !r.live && !onPage.has(`${r.source}\u0000${r.session_id}`)) shown.add(`${r.source}\u0000${r.session_id}`);
+      buffered = rows;
+      consulted = true;
+    } catch (error) {
+      if (error instanceof TenantMismatchError) throw error;
+      if (error instanceof BufferedFenced) {
+        fenced = true;
+        log({ route: c.req.routePath, reason: "buffered_fenced", gate: error.reason, correlation_id: c.get("correlationId") });
+      } else log({ route: c.req.routePath, reason: "buffered_list_error", error_code: (error as { name?: string })?.name ?? "error", correlation_id: c.get("correlationId") });
+    }
+    const { sources, notSources, bounds } = q;
+    const eligible = (r: BufferedSessionRow) => {
+      if (!shown.has(`${r.source}\u0000${r.session_id}`)) return false;
+      if (sources.length && !sources.includes(r.source)) return false;
+      if (notSources.includes(r.source)) return false;
+      const first = Date.parse(r.first_ts);
+      const last = Date.parse(r.last_ts);
+      if (bounds.lastTsAfter && last < bounds.lastTsAfter.getTime()) return false;
+      if (bounds.lastTsBefore && last >= bounds.lastTsBefore.getTime()) return false;
+      if (bounds.firstTsAfter && first < bounds.firstTsAfter.getTime()) return false;
+      if (bounds.firstTsBefore && first >= bounds.firstTsBefore.getTime()) return false;
+      return true;
+    };
+    const merged = mergeListPage({ canonical, buffered, bufferedFull: consulted && buffered.length >= bLimit, eligible, limit: q.limit });
+    const canonicalPos: DirectoryCursor | undefined = merged.lastCanonical ?? inCursor.canonical;
+    const bufferedPos: BufferedListCursor | undefined = merged.lastBuffered ?? inCursor.buffered;
+    const nextCursor = merged.hasMore && (canonicalPos || bufferedPos) ? encodeCompositeListCursor(canonicalPos, bufferedPos) : null;
+    const bufferedItems = merged.items.flatMap((i) => (i.kind === "buffered" ? [i.row] : []));
+    if (fenced) c.header(BUFFERED_HEADER, "fenced");
+    if (bufferedItems.length) c.header(BUFFERED_IDS_HEADER, bufferedIdsHeader(bufferedItems));
+    return {
+      sessions: merged.items.map((i) => (i.kind === "canonical" ? sessionFromDirectoryRow(i.row) : bufferedSessionSummary(i.row, identity.userId))),
+      nextCursor,
+    };
+  }
+
   app.get("/v1/sessions", async (c) => {
     try {
       const identity = c.get("identity");
@@ -595,7 +766,12 @@ export function createReadApi(deps: ReadApiDeps) {
       if (limit > DIRECTORY_LIST_MAX_LIMIT) throw unsupported("limit");
       if ([...sources, ...notSources].some((v) => !HARNESS_NAME.test(v))) throw unsupported("source_format");
       if (projectContains !== undefined && projectContains.trim() === "") throw unsupported("project_contains");
-      const cursor = decodeListCursor(single(c, "cursor"));
+      // Buffered rows: only the caller's own; agent/projectContains are not derivable without S3.
+      const ob = ownerBufferedFor(identity);
+      const withBuffered = ob !== undefined && !agent && !projectContains && (users.length === 0 || users.includes(identity.userId));
+      // The composite cursor exists only on the buffered path; otherwise main's decoder, exactly.
+      const composite = withBuffered ? decodeCompositeListCursor(single(c, "cursor")) : undefined;
+      const cursor = withBuffered ? (typeof composite === "object" ? composite.canonical : composite) : decodeListCursor(single(c, "cursor"));
       if (cursor === "foreign") throw new CursorError("foreign_cursor");
       if (cursor === "invalid") throw new CursorError("invalid_cursor");
       if (sources.length) args.sources = sources;
@@ -607,6 +783,10 @@ export function createReadApi(deps: ReadApiDeps) {
       if (cursor) args.cursor = cursor;
       const rows = await directory.list(identity.orgId, identity.workspaceId, args);
       if (rows === null) throw unsupported("directory_not_migrated");
+      if (withBuffered) {
+        const union = await bufferedListPage(c, identity, ob, rows, { limit, sources, notSources, bounds });
+        return c.json({ sessions: union.sessions, nextCursor: union.nextCursor, correlationId: c.get("correlationId") });
+      }
       const page = directoryPage(rows, identity, limit);
       return c.json({ sessions: page.sessions, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
@@ -774,9 +954,18 @@ export function createReadApi(deps: ReadApiDeps) {
     const states = await turns.harnesses(scope);
     if (states.length > MAX_TURN_HARNESSES) throw unsupported("turns_harness_bound");
     const selected = source === undefined ? states : states.filter((h) => h.harness === source);
-    if (!selected.some((h) => h.pointers > 0)) throw unsupported("turns_no_pointers");
+    if (!selected.some((h) => h.pointers > 0)) {
+      // Owner-only buffered (flag on): the caller's own kept buffered stages, `source` required.
+      const ob = ownerBufferedFor(identity);
+      if (ob && source !== undefined) {
+        const served = await bufferedTurns(c, identity, ob, sessionId, source);
+        // Stages that project to no turn: the existing answer (Cloud falls back).
+        if (served && (served.erased || served.rows.length > 0)) return { ...served, buffered: true };
+      }
+      throw unsupported("turns_no_pointers");
+    }
     const live = selected.filter((h) => h.live > 0);
-    if (live.length === 0) return { rows: [] as Record<string, unknown>[], erased: true };
+    if (live.length === 0) return { rows: [] as Record<string, unknown>[], erased: true, buffered: false };
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -789,7 +978,7 @@ export function createReadApi(deps: ReadApiDeps) {
           }, turns.deadlineMs ?? 3000);
         }),
       ]);
-      return { rows: turnRows(scope, snapshots, source), erased: false };
+      return { rows: turnRows(scope, snapshots, source), erased: false, buffered: false };
     } finally {
       clearTimeout(timer);
     }
@@ -805,7 +994,8 @@ export function createReadApi(deps: ReadApiDeps) {
   app.get("/v1/sessions/:sessionId/turns", async (c) => {
     try {
       const identity = c.get("identity");
-      const { rows, erased } = await sessionTurns(c, identity);
+      const { rows, erased, buffered } = await sessionTurns(c, identity);
+      if (buffered) c.header(BUFFERED_HEADER, "1");
       const body = { sessionId: c.req.param("sessionId"), turns: turnsResponse(rows), correlationId: c.get("correlationId") };
       log({ route: c.req.routePath, reason: erased ? "turns_erased" : "turns_served", turns: body.turns.length, correlation_id: c.get("correlationId") });
       return c.json(body);
@@ -818,7 +1008,8 @@ export function createReadApi(deps: ReadApiDeps) {
     try {
       const identity = c.get("identity");
       const sessionId = c.req.param("sessionId");
-      const { rows, erased } = await sessionTurns(c, identity);
+      const { rows, erased, buffered } = await sessionTurns(c, identity);
+      if (buffered) c.header(BUFFERED_HEADER, "1");
       const metadata = metadataResponse(rows);
       log({ route: c.req.routePath, reason: erased ? "metadata_erased" : metadata ? "metadata_served" : "metadata_none", correlation_id: c.get("correlationId") });
       if (!metadata)
