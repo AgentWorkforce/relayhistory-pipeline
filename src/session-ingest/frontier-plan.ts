@@ -293,6 +293,11 @@ export function frontierScanItems(kind: FrontierScanKind, value: CanonicalFronti
 export function frontierScanItemsSha256(kind: FrontierScanKind, value: CanonicalFrontierCapture | FrontierOriginCapture): string {
   return frontierSha256(frontierScanItems(kind, value));
 }
+/** Stable evidence digest; pagination order is independently defined by the reader. */
+export function frontierReceiptDecisionsSha256(decisions: FrontierReceiptDecision[]): string {
+  return frontierSha256(sorted(decisions, decisionOrder));
+}
+
 function frontierScanItemCount(kind: FrontierScanKind, value: CanonicalFrontierCapture | FrontierOriginCapture): number {
   if (kind === "privacy-controls" && "privacyRowCount" in value) return value.privacyRowCount ?? -1;
   const items = frontierScanItems(kind, value);
