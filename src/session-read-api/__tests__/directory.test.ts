@@ -60,6 +60,16 @@ function stubDirectory(init: { rows?: Array<DirectoryListRow & { cursor_ts?: str
       if (init.fail) throw init.fail;
       return init.activity === undefined ? [] : init.activity;
     },
+    async query(orgId, workspaceId, args) {
+      calls.push({ fn: "query", orgId, workspaceId, args });
+      if (init.fail) throw init.fail;
+      return init.rows === undefined ? [dirRow()] : init.rows;
+    },
+    async queryActivity(orgId, workspaceId, since, until, args) {
+      calls.push({ fn: "queryActivity", orgId, workspaceId, args: { since, until, ...args } });
+      if (init.fail) throw init.fail;
+      return init.activity === undefined ? [] : init.activity;
+    },
   };
   return { directory, calls };
 }

@@ -4,7 +4,10 @@
 -- schema USAGE as its effective privileges in schema sessions, EXECUTE on no sessions
 -- SECURITY DEFINER function but the two tenant-setting directory reads of
 -- 20261105034000 (sessions.list_session_directory_for, session_directory_activity_for;
--- allowed, not required, so this also passes before that migration), and the
+-- allowed, not required, so this also passes before that migration), the two q-filtered
+-- directory reads of 20261105046010 (sessions.query_session_directory_for,
+-- query_session_directory_activity_for; likewise allowed, not required), the other
+-- allow-listed read API functions below, and the
 -- tenant-bound RLS policy on session_index.
 --
 -- Inbound membership: any role granted bulls96_read_api could SET ROLE to it and call the
@@ -122,6 +125,8 @@ BEGIN
          'sessions.output_facts_coverage_for(text,timestamp with time zone,timestamp with time zone)',
          'sessions.output_facts_events_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
          'sessions.output_facts_outputs_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
+         'sessions.query_session_directory_activity_for(text,timestamp with time zone,timestamp with time zone,text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],boolean,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone)',
+         'sessions.query_session_directory_for(text,text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],boolean,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text,text,integer)',
          'sessions.read_api_token_delete_by_hash(text,text)',
          'sessions.read_api_token_delete_for(text,text,text,text)',
          'sessions.read_api_token_issue(text,text,text,text,text,text,text,text,timestamp with time zone,text,timestamp with time zone,text,timestamp with time zone)',

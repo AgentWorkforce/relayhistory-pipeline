@@ -26,7 +26,10 @@ import { sqlBriefSummary } from "./brief-summary.ts";
  * exactly "relaycontrol_only" = no RelayAuth verifier at all, see
  * readApiAuthConfig). READ_API_INTROSPECT_POSITIVE_TTL_MS (unset = 60000; an
  * integer 0..60000, 0 = introspect every request; anything else fails startup,
- * see readApiIntrospectPositiveTtlMs).
+ * see readApiIntrospectPositiveTtlMs). READ_API_SESSION_QUERY (exactly "true" serves
+ * `q` on GET /v1/sessions and /v1/sessions/activity from the directory's query functions,
+ * migration 20261105046010; unset/""/"false" off = 501 `param_q` as before; anything else
+ * fails startup, see sessionQueryEnabled).
  *
  * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED, owner-buffered.ts) are
  * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
@@ -124,6 +127,20 @@ export function eventMessageIdDeps<T>(env: NodeJS.ProcessEnv, canonicalTurns: T 
   if (raw === undefined || raw === "" || raw === "false") return {};
   if (raw !== "true") throw new Error(`session read api: ${READ_API_EVENT_MESSAGE_IDS_VAR} must be unset, "", "true" or "false"`);
   return canonicalTurns ? { eventMessageIds: canonicalTurns } : {};
+}
+
+export const READ_API_SESSION_QUERY_VAR = "READ_API_SESSION_QUERY";
+
+/**
+ * READ_API_SESSION_QUERY (default off): exactly "true" serves the session list/activity `q`
+ * (list-query.ts). Unset, "" or "false" leaves both routes' 501 `param_q`; anything else refuses
+ * startup, naming the variable and never its value.
+ */
+export function sessionQueryEnabled(env: NodeJS.ProcessEnv): boolean {
+  const raw = env[READ_API_SESSION_QUERY_VAR];
+  if (raw === undefined || raw === "" || raw === "false") return false;
+  if (raw !== "true") throw new Error(`session read api: ${READ_API_SESSION_QUERY_VAR} must be unset, "", "true" or "false"`);
+  return true;
 }
 
 function internalSecret(env: NodeJS.ProcessEnv, name: string): string | undefined {
@@ -495,6 +512,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const backend = searchBackend(env, composition, entry);
   const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   const selfhostReadApi = parseSelfhostReadApi(env);
+  const sessionQuery = sessionQueryEnabled(env);
   const loginSync = parseSelfhostLoginSync(env);
   const facts = factsBackends(env, entry);
   // The self-host service never inherits the hosted Supabase pin by omission.
@@ -574,6 +592,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     completeSinceMs,
     ...(canonical ? { timing: canonical.timing, turns: canonical.turns, canonicalEvents: canonical.events } : {}),
     ...eventMessageIdDeps(env, canonical?.turns),
+    ...(sessionQuery ? { sessionQuery: true } : {}),
     ...outputDeps,
     ...digestDeps,
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),

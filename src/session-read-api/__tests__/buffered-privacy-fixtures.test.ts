@@ -147,7 +147,7 @@ async function request(c: CausalCase, path: string, opts: { events?: boolean } =
       liveness: memoryLiveness().liveness,
       completeSinceMs: 0,
       directoryWorkspaces: new Set([SCOPE.workspaceId]),
-      directory: { async list() { return []; }, async activity() { return []; } },
+      directory: { async list() { return []; }, async activity() { return []; }, async query() { return []; }, async queryActivity() { return []; } },
       turns: { async harnesses() { return []; }, async source() { throw new Error("canonical source must not run"); } },
       ownerBuffered,
     });

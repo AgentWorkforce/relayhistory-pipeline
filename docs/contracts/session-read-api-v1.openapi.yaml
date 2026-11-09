@@ -126,6 +126,8 @@ paths:
         - {name: lastTsBefore, in: query, schema: {type: string, format: date-time}}
         - {name: firstTsAfter, in: query, schema: {type: string, format: date-time}}
         - {name: firstTsBefore, in: query, schema: {type: string, format: date-time}}
+        - $ref: "#/components/parameters/q"
+        - $ref: "#/components/parameters/search"
       responses:
         "200":
           description: One page of sessions.
@@ -148,6 +150,8 @@ paths:
         - $ref: "#/components/parameters/workspace"
         - {name: since, in: query, required: true, schema: {type: string, format: date-time}}
         - {name: until, in: query, required: true, description: At most 92 UTC days after since., schema: {type: string, format: date-time}}
+        - $ref: "#/components/parameters/q"
+        - {name: search, in: query, description: "Only `metadata`, and only with `q` (`READ_API_SESSION_QUERY=true`); any other value with `q` is 501 `param_search`. Without `q` it is ignored, as before.", schema: {type: string, enum: [metadata]}}
       responses:
         "200":
           description: One entry per UTC day in the range.
@@ -471,6 +475,31 @@ components:
       in: query
       description: The `nextCursor` of the previous page, passed back unchanged.
       schema: {type: string}
+    q:
+      name: q
+      in: query
+      description: >-
+        Dashboard session query, self-host SERVICE only behind `READ_API_SESSION_QUERY=true`
+        (default off; off, any non-empty `q` is 501 `param_q`, as before). At most 500 characters,
+        16 terms, 200 characters per value; an empty `q` is no `q`. Terms are space separated
+        (double quotes group), AND-ed, and `-` negates one: a free word (at least 3 characters)
+        matches the session's search text (title, task title, agent name, project id, git repo and
+        branch, model, scrubbed short summary; never transcript content); `title:`, `project:`,
+        `harness:`/`source:` (a harness name), `agent:` or `@name`, `id:` (session id substring),
+        `is:active`/`is:inactive`, and the last-activity dates `updated:`/`after:`/`before:`
+        (`2026-10-01`, `>=2026-10-01`, `2026-10-01..2026-10-11`, UTC; intersected with
+        `lastTsAfter`/`lastTsBefore`). Values of one field are OR-ed. Explicit 501s, never a silent
+        drop: `path:` (`q_filter_path`), `upload:` (`q_filter_upload`), `is:on-relay`/`is:off-relay`
+        (`q_filter_is_on-relay`/`q_filter_is_off-relay`), a negated date (`q_filter_date_exclusion`),
+        `q` with owner-buffered reads (`q_with_buffered`), and 501 `directory_not_migrated` before
+        migration 046010. A malformed query is 400. A page's `nextCursor` (`b96q1:`) is bound to the
+        query and filters: reuse it with another `q` or filter, or across `q`/no `q`, and it is 400.
+      schema: {type: string, maxLength: 500}
+    search:
+      name: search
+      in: query
+      description: "Only `metadata`, and only with `q` (`READ_API_SESSION_QUERY=true`); anything else is 501 `param_search`."
+      schema: {type: string, enum: [metadata]}
   responses:
     TokenPair:
       description: The relaycontrol_only login reply. Scopes contain `rth:read`.

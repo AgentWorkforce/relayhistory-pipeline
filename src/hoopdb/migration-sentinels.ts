@@ -340,6 +340,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105033000_canonical_project_events.sql": { evidence: "table sessions.canonical_project_events", sql: relation("sessions.canonical_project_events") },
   "upstream:20261105045000_digest_narrative_cache.sql": { evidence: "table sessions.daily_digest_narratives", sql: relation("sessions.daily_digest_narratives") },
   "upstream:20261105045040_selfhost_output_facts.sql": { evidence: "table sessions.session_output_facts", sql: relation("sessions.session_output_facts") },
+  "upstream:20261105046010_session_directory_read_api_query.sql": { evidence: "function sessions.query_session_directory_for", sql: fn("sessions", "query_session_directory_for") },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

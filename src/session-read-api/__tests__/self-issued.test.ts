@@ -62,6 +62,8 @@ function api(over: Partial<ReadApiDeps> & { secrets?: string[] } = {}) {
   const directory = {
     async list(orgId: string, workspaceId: string) { seen.push({ route: "list", orgId, workspaceId }); return []; },
     async activity(orgId: string, workspaceId: string) { seen.push({ route: "activity", orgId, workspaceId }); return []; },
+    async query(orgId: string, workspaceId: string) { seen.push({ route: "query", orgId, workspaceId }); return []; },
+    async queryActivity(orgId: string, workspaceId: string) { seen.push({ route: "queryActivity", orgId, workspaceId }); return []; },
   } as unknown as ReadApiDeps["directory"];
   const app = createReadApi({
     verify: selfIssuedVerifier(mem.store, ORIGIN),

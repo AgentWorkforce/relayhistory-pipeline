@@ -138,6 +138,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105045030_session_consumer_project_text_grant.sql",
       // Self-host output facts tables and their writer/read functions only; no ingest path touches them.
       "20261105045040_selfhost_output_facts.sql",
+      // Two read-role-only SECURITY DEFINER list/activity query functions and three owner-only helpers; no ingest path touches them.
+      "20261105046010_session_directory_read_api_query.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

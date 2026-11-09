@@ -93,6 +93,12 @@ function api(h: Harness = {}) {
     async activity() {
       return [];
     },
+    async query() {
+      return [];
+    },
+    async queryActivity() {
+      return [];
+    },
   };
   const turns: TurnsDeps = {
     harnesses: async () => h.pointers ?? [],

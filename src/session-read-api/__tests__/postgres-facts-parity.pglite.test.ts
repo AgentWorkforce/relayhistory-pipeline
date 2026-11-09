@@ -40,7 +40,7 @@ const MIGRATION = "supabase/migrations/20261105045040_selfhost_output_facts.sql"
 const SCOPE = OUTPUT_FIXTURE_SCOPE;
 const ORG = SCOPE.orgId, WS = SCOPE.workspaceId;
 const FACTS = outputFactsFromScope(SCOPE, outputFixture(), 1);
-const directory: Directory = { list: async () => [], activity: async () => [] };
+const directory: Directory = { list: async () => [], activity: async () => [], query: async () => [], queryActivity: async () => [] };
 const live: Liveness = { erased: async () => new Set() } as unknown as Liveness;
 
 const d = (iso: string) => new Date(iso);

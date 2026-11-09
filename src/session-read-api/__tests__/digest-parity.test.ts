@@ -103,7 +103,7 @@ suite("digest parity: relayhistory SQL on Postgres == buildDailyDigest on ClickH
   let db: pg.Client, admin: ClickHouseClient, ch: ClickHouseClient;
   const schema = `f4d_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
   const database = `digest_parity_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
-  const directory: Directory = { list: async () => [], activity: async () => [] };
+  const directory: Directory = { list: async () => [], activity: async () => [], query: async () => [], queryActivity: async () => [] };
   const q = (text: string, params: unknown[]) => db.query(text.replaceAll("S.", `${schema}.`), params);
 
   beforeAll(async () => {

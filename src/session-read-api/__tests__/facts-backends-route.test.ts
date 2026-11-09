@@ -27,7 +27,7 @@ const recordingCh = (rows: Record<string, unknown>[] = []): ClickHouseClient => 
   async insert() { throw new Error("no insert"); },
   async select<T>(sql: string) { selects.push(sql); return rows as T[]; },
 });
-const directory: Directory = { list: async () => [], activity: async () => [] };
+const directory: Directory = { list: async () => [], activity: async () => [], query: async () => [], queryActivity: async () => [] };
 const OUTPUT: SessionOutput = { agentMessages: 3, commits: 2, linesAdded: 7, linesRemoved: 1, commitsWithoutLineCounts: 0 };
 const DIGEST: DailyDigest = {
   stats: {

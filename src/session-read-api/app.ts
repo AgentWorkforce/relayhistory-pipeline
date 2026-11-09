@@ -86,8 +86,11 @@ import {
   activityDays,
   decodeCompositeListCursor,
   decodeListCursor,
+  decodeQueryCursor,
   directoryPage,
   encodeCompositeListCursor,
+  LIST_CURSOR_PREFIX,
+  QUERY_CURSOR_PREFIX,
   sessionFromDirectoryRow,
   type BufferedListCursor,
   type DirectoryCursor,
@@ -96,6 +99,7 @@ import {
   type DirectoryListRow,
 } from "./directory.ts";
 import { droppedTotal, type BufferedSearchGate } from "./buffered-search-gate.ts";
+import { parseSessionQuery, queryFingerprint, type SessionQueryTerms } from "./list-query.ts";
 import {
   BUFFERED_HEADER,
   BUFFERED_IDS_HEADER,
@@ -234,6 +238,12 @@ export interface ReadApiDeps {
    * session's canonical objects. Absent: the parameter keeps its 501, so the Lambda and Worker are unchanged.
    */
   eventMessageIds?: Pick<TurnsDeps, "source" | "deadlineMs">;
+  /**
+   * READ_API_SESSION_QUERY=true: `q` (and `search=metadata` with it) on GET /v1/sessions and
+   * GET /v1/sessions/activity, parsed by list-query.ts and answered from the directory's query
+   * functions (migration 20261105046010). Absent/false: both keep their 501 `param_q`, unchanged.
+   */
+  sessionQuery?: boolean;
   /** READ_API_CORS_ALLOWED_ORIGINS, service entry only: exact origins GET read routes answer CORS for. Absent/empty = no CORS. */
   corsAllowedOrigins?: ReadonlySet<string>;
 }
@@ -1018,13 +1028,44 @@ export function createReadApi(deps: ReadApiDeps) {
     };
   }
 
+  /**
+   * READ_API_SESSION_QUERY=true only: the route's `q` as directory terms, or undefined without
+   * one (an empty `q=` is no q, as the activity route has always read it). `search` is accepted
+   * only as `search=metadata` alongside q (the directory has no other search mode); any other
+   * value with q is 501 `param_search`. Without q, the list keeps its 501 `param_search` and
+   * the activity route keeps ignoring `search`, as today. Malformed q = 400; a term this backend
+   * cannot answer (path:, upload:, is:on-relay/off-relay, an excluded date) = 501 naming it.
+   */
+  function sessionQueryTerms(c: Context, route: "list" | "activity"): SessionQueryTerms | undefined {
+    const raw = single(c, "q");
+    const q = raw === "" ? undefined : raw;
+    const search = route === "list" || q !== undefined ? single(c, "search") : undefined;
+    if (search !== undefined && (search !== "metadata" || q === undefined)) throw unsupported("param_search");
+    if (q === undefined) return undefined;
+    if (q.length > MAX_Q_CHARS) throw bad(`q must be ${MAX_Q_CHARS} characters or fewer`);
+    const parsed = parseSessionQuery(q);
+    if (parsed.kind === "bad") throw bad(parsed.reason);
+    if (parsed.kind === "unsupported") throw unsupported(parsed.reason);
+    return parsed.terms;
+  }
+
+  /** The q terms' date window intersected into the lastTs* bounds; an empty intersection is a 400. */
+  function intersectQueryDates(terms: SessionQueryTerms, bounds: { lastTsAfter?: Date; lastTsBefore?: Date }) {
+    if (terms.lastTsAfter && (!bounds.lastTsAfter || terms.lastTsAfter > bounds.lastTsAfter)) bounds.lastTsAfter = terms.lastTsAfter;
+    if (terms.lastTsBefore && (!bounds.lastTsBefore || terms.lastTsBefore < bounds.lastTsBefore)) bounds.lastTsBefore = terms.lastTsBefore;
+    if ((terms.lastTsAfter || terms.lastTsBefore) && bounds.lastTsAfter && bounds.lastTsBefore && bounds.lastTsAfter >= bounds.lastTsBefore)
+      throw bad("the q date terms do not overlap the requested time window");
+  }
+
   app.get("/v1/sessions", async (c) => {
     try {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
       // A workspace off the canary allowlist always falls back, whatever it asked.
       const directory = directoryFor(identity);
-      for (const p of LIST_UNSUPPORTED_PARAMS) if (c.req.queries(p)?.length) throw unsupported(`param_${p}`);
+      const queryOn = deps.sessionQuery === true;
+      for (const p of LIST_UNSUPPORTED_PARAMS) if (!(queryOn && (p === "q" || p === "search")) && c.req.queries(p)?.length) throw unsupported(`param_${p}`);
+      const terms = queryOn ? sessionQueryTerms(c, "list") : undefined;
       const limit = clampLimit(single(c, "limit"), SESSIONS_DEFAULT_LIMIT, SESSIONS_MAX_LIMIT);
       const args: DirectoryListArgs = { limit };
       const sources = repeated(c, "source");
@@ -1047,6 +1088,7 @@ export function createReadApi(deps: ReadApiDeps) {
         const t = parseTime(single(c, field), field);
         if (t !== undefined) bounds[field] = new Date(t);
       }
+      if (terms) intersectQueryDates(terms, bounds);
       if ((bounds.lastTsAfter && bounds.lastTsBefore && bounds.lastTsAfter > bounds.lastTsBefore) ||
           (bounds.firstTsAfter && bounds.firstTsBefore && bounds.firstTsAfter > bounds.firstTsBefore))
         throw bad("an *After bound must not be later than its *Before bound");
@@ -1056,18 +1098,35 @@ export function createReadApi(deps: ReadApiDeps) {
       if (projectContains !== undefined && projectContains.trim() === "") throw unsupported("project_contains");
       // Buffered rows: only the caller's own; agent/projectContains are not derivable without S3.
       const ob = ownerBufferedFor(identity);
+      // Buffered rows have no search document: a q read never drops them silently.
+      if (terms && ob !== undefined) throw unsupported("q_with_buffered");
       const withBuffered = ob !== undefined && !agent && !projectContains && (users.length === 0 || users.includes(identity.userId));
-      // The composite cursor exists only on the buffered path; otherwise main's decoder, exactly.
-      const composite = withBuffered ? decodeCompositeListCursor(single(c, "cursor")) : undefined;
-      const cursor = withBuffered ? (typeof composite === "object" ? composite.canonical : composite) : decodeListCursor(single(c, "cursor"));
-      if (cursor === "foreign") throw new CursorError("foreign_cursor");
-      if (cursor === "invalid") throw new CursorError("invalid_cursor");
       if (sources.length) args.sources = sources;
       if (notSources.length) args.notSources = notSources;
       if (users.length) args.userIds = users;
       if (agent) args.agent = agent;
       if (projectContains) args.projectContains = projectContains;
       for (const [k, v] of Object.entries(bounds)) if (v) args[k as keyof typeof bounds] = v;
+      if (terms) {
+        // A q page continues only from a `b96q1:` cursor of the same query and filters.
+        const fingerprint = queryFingerprint(terms, args);
+        const qCursor = decodeQueryCursor(single(c, "cursor"));
+        if (qCursor === "foreign" && single(c, "cursor")?.startsWith(LIST_CURSOR_PREFIX)) throw new CursorError("invalid_cursor");
+        if (qCursor === "foreign") throw new CursorError("foreign_cursor");
+        if (qCursor === "invalid" || (qCursor && qCursor.fingerprint !== fingerprint)) throw new CursorError("invalid_cursor");
+        if (qCursor) args.cursor = { lastActivityAt: qCursor.lastActivityAt, sessionId: qCursor.sessionId, harness: qCursor.harness };
+        const rows = await directory.query(identity.orgId, identity.workspaceId, { ...args, terms });
+        if (rows === null) throw unsupported("directory_not_migrated");
+        const page = directoryPage(rows, identity, limit, fingerprint);
+        return c.json({ sessions: page.sessions, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+      }
+      // With q on, a `b96q1:` cursor belongs to a q read only.
+      if (queryOn && single(c, "cursor")?.startsWith(QUERY_CURSOR_PREFIX)) throw new CursorError("invalid_cursor");
+      // The composite cursor exists only on the buffered path; otherwise main's decoder, exactly.
+      const composite = withBuffered ? decodeCompositeListCursor(single(c, "cursor")) : undefined;
+      const cursor = withBuffered ? (typeof composite === "object" ? composite.canonical : composite) : decodeListCursor(single(c, "cursor"));
+      if (cursor === "foreign") throw new CursorError("foreign_cursor");
+      if (cursor === "invalid") throw new CursorError("invalid_cursor");
       if (cursor) args.cursor = cursor;
       const rows = await directory.list(identity.orgId, identity.workspaceId, args);
       if (rows === null) throw unsupported("directory_not_migrated");
@@ -1097,9 +1156,20 @@ export function createReadApi(deps: ReadApiDeps) {
       const until = new Date(untilMs);
       const days = Math.round((Date.UTC(until.getUTCFullYear(), until.getUTCMonth(), until.getUTCDate()) - Date.UTC(since.getUTCFullYear(), since.getUTCMonth(), since.getUTCDate())) / 86_400_000) + 1;
       if (days > MAX_SESSION_ACTIVITY_DAYS) throw bad(`since and until may span at most ${MAX_SESSION_ACTIVITY_DAYS} UTC days`);
-      const q = single(c, "q");
-      if (q && q.length > MAX_Q_CHARS) throw bad(`q must be ${MAX_Q_CHARS} characters or fewer`);
-      if (q) throw unsupported("param_q");
+      if (deps.sessionQuery === true) {
+        const terms = sessionQueryTerms(c, "activity");
+        if (terms) {
+          const bounds: { lastTsAfter?: Date; lastTsBefore?: Date } = {};
+          intersectQueryDates(terms, bounds);
+          const rows = await directory.queryActivity(identity.orgId, identity.workspaceId, since, until, { terms, ...bounds });
+          if (rows === null) throw unsupported("directory_not_migrated");
+          return c.json({ since: since.toISOString(), until: until.toISOString(), days: activityDays(rows, since, until), correlationId: c.get("correlationId") });
+        }
+      } else {
+        const q = single(c, "q");
+        if (q && q.length > MAX_Q_CHARS) throw bad(`q must be ${MAX_Q_CHARS} characters or fewer`);
+        if (q) throw unsupported("param_q");
+      }
       const rows = await directory.activity(identity.orgId, identity.workspaceId, since, until);
       if (rows === null) throw unsupported("directory_not_migrated");
       return c.json({ since: since.toISOString(), until: until.toISOString(), days: activityDays(rows, since, until), correlationId: c.get("correlationId") });
