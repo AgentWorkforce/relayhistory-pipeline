@@ -116,10 +116,37 @@ export interface BufferedScope {
  * is for logs only.
  */
 export class BufferedFenced extends Error {
-  constructor(readonly reason: string = "fenced") {
+  /** For logs only: the SQLSTATE class (two chars) of an RPC failure, never the message or full code. */
+  readonly sqlstateClass?: string;
+  constructor(readonly reason: string = "fenced", sqlstateClass?: unknown) {
     super("buffered read fenced");
     this.name = "BufferedFenced";
+    const cls = sqlstateClassOf(sqlstateClass);
+    if (cls !== undefined) this.sqlstateClass = cls;
   }
+}
+
+/** The first two chars of a SQLSTATE-shaped code when they are [0-9A-Z]{2}; anything else is undefined. */
+function sqlstateClassOf(code: unknown): string | undefined {
+  if (typeof code !== "string") return undefined;
+  const cls = code.slice(0, 2);
+  return /^[0-9A-Z]{2}$/.test(cls) ? cls : undefined;
+}
+
+/**
+ * Every reason this module fences with (plus the default). Logs carry a fence reason only
+ * through fenceSubtype, so a reason outside this closed set can never reach a log line.
+ */
+export const FENCE_SUBTYPES: readonly string[] = Object.freeze([
+  "fenced",
+  "rpc_fenced", "rpc_timeout", "rpc_error",
+  "gate_unbound", "gate_identity", "gate_status", "gate_cache", "gate_shape", "gate_timeout", "gate_error",
+  "gate_echo", "gate_pending", "gate_epoch", "gate_moved",
+]);
+
+/** A fence reason for logs: the reason when it is a known subtype, else "fence_other". */
+export function fenceSubtype(reason: unknown): string {
+  return typeof reason === "string" && FENCE_SUBTYPES.includes(reason) ? reason : "fence_other";
 }
 
 /** The RPC's explicit refusal (SQLSTATE 55006 or its message). */
@@ -141,9 +168,10 @@ export function isBufferedTimeoutError(error: unknown): boolean {
  */
 function rethrowBuffered(error: unknown): never {
   if (error instanceof BufferedFenced) throw error;
-  if (isBufferedFencedError(error)) throw new BufferedFenced("rpc_fenced");
-  if (isBufferedTimeoutError(error)) throw new BufferedFenced("rpc_timeout");
-  throw new BufferedFenced("rpc_error");
+  const code = error !== null && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  if (isBufferedFencedError(error)) throw new BufferedFenced("rpc_fenced", code);
+  if (isBufferedTimeoutError(error)) throw new BufferedFenced("rpc_timeout", code);
+  throw new BufferedFenced("rpc_error", code);
 }
 
 // ---------------------------------------------------------------------------------------------

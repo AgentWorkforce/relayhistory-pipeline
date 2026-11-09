@@ -13,6 +13,7 @@ import { AuthError, createReadApi, type TurnsDeps, type VerifiedIdentity } from 
 import { decodeCompositeListCursor, encodeCompositeListCursor, type Directory, type DirectoryListRow } from "../directory.ts";
 import { BUFFERED_USER_SQL, BufferedFenced, serviceBindingControlHead, sqlOwnerBufferedReads, type ControlHeadGate, type OwnerBufferedDeps, type OwnerBufferedReads } from "../owner-buffered.ts";
 import { memoryLiveness } from "./support.ts";
+import { logLine } from "../../shared/log.ts";
 import { BUFFERED_STAGE_MAX_BYTES } from "../owner-buffered.ts";
 import { encodeBufferedCursor, encodeCursor } from "../cursor.ts";
 import { deliveryMachine } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
@@ -174,7 +175,7 @@ describe("GET /v1/sessions with owner buffered rows", () => {
     expect(r.headers.get("x-relayhistory-buffered-ids")).toBeNull();
     expect((await json(r)).sessions.map((s: any) => s.sessionId)).toEqual(["s-1"]);
     expect(calls).toHaveLength(0);
-    expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", gate: "gate_timeout" }));
+    expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", error_code: "gate_timeout" }));
   });
 
   test("gate moves between observations: fenced header, buffered rows dropped", async () => {
@@ -226,7 +227,7 @@ describe("GET /v1/sessions with owner buffered rows", () => {
         const body = await json(r);
         expect(body.sessions.map((s: any) => s.sessionId)).toEqual(["s-1"]);
         expect(JSON.stringify(body)).not.toContain(SESSION);
-        expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", gate: gateReason }));
+        expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", error_code: gateReason }));
       });
     test("mirror: nothing changes while liveness is blocked: the buffered row is emitted", async () => {
       const { r, observed } = await interleaved(null)();
@@ -325,14 +326,16 @@ describe("GET /v1/sessions with owner buffered rows", () => {
   });
 
   test("RPC timeout (57014) or any RPC error is fenced, never a 500: canonical page with the fenced header", async () => {
-    for (const [err, gate] of [[Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }), "rpc_timeout"], [new Error("connection terminated"), "rpc_error"]] as const) {
+    for (const [err, subtype, sqlstate] of [[Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }), "rpc_timeout", "57"], [new Error("connection terminated"), "rpc_error", undefined]] as const) {
       const run = (async (_o: string, _w: string, work: (q: unknown) => Promise<unknown>) =>
         work({ async query(sql: string) { if (sql.includes("buffered_sessions_for")) throw err; return { rows: [] }; } })) as never;
       const { get, logs } = api({ reads: sqlOwnerBufferedReads(run) });
       const r = await get(L);
       expect(r.status).toBe(200);
       expect(r.headers.get("x-relayhistory-buffered")).toBe("fenced");
-      expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", gate }));
+      const fenced = logs.find((l) => l.reason === "buffered_fenced");
+      expect(fenced).toMatchObject({ error_code: subtype });
+      expect(fenced?.sqlstate).toBe(sqlstate);
     }
   });
 
@@ -381,6 +384,66 @@ describe("GET /v1/sessions with owner buffered rows", () => {
 
 const T = `/v1/sessions/${SESSION}/turns?workspace=ws-a&source=claude`;
 const M = `/v1/sessions/${SESSION}/metadata?workspace=ws-a&source=claude`;
+describe("buffered fence logs: closed subtype as error_code, SQLSTATE class only, through the real log filter", () => {
+  const SECRET = "sk-live-FENCESECRET0123456789abcdef";
+  const line = (fields: Record<string, unknown>) => JSON.parse(logLine("info", "read api", fields)) as Record<string, unknown>;
+  const fencedLine = (logs: Record<string, unknown>[]) => {
+    const fields = logs.find((l) => l.reason === "buffered_fenced");
+    expect(fields).toBeDefined();
+    return { fields: fields!, text: logLine("info", "read api", fields!) };
+  };
+  const rpcFailing = (err: unknown) =>
+    sqlOwnerBufferedReads((async (_o: string, _w: string, work: (q: unknown) => Promise<unknown>) =>
+      work({ async query(sql: string) { if (sql.includes("buffered_sessions_for")) throw err; return { rows: [] }; } })) as never);
+
+  test("a known gate subtype survives the log filter as error_code; no gate field", async () => {
+    const { get, logs } = api({ gate: fencedGate("gate_status"), reads: scriptedReads({ list: [bufferedRow()] }).reads });
+    expect((await get(L)).headers.get("x-relayhistory-buffered")).toBe("fenced");
+    const { fields, text } = fencedLine(logs);
+    expect(line(fields)).toMatchObject({ reason: "buffered_fenced", error_code: "gate_status" });
+    expect("gate" in line(fields)).toBe(false);
+    expect("sqlstate" in line(fields)).toBe(false);
+    expect(text).not.toContain('"gate"');
+  });
+
+  test("an unknown reason (long, secret-looking) is logged as fence_other and never appears", async () => {
+    const unknown = `gate_${SECRET}_${"x".repeat(300)}`;
+    const { get, logs } = api({ gate: fencedGate(unknown), reads: scriptedReads({ list: [bufferedRow()] }).reads });
+    expect((await get(L)).headers.get("x-relayhistory-buffered")).toBe("fenced");
+    const { fields, text } = fencedLine(logs);
+    expect(line(fields)).toMatchObject({ reason: "buffered_fenced", error_code: "fence_other" });
+    expect(text).not.toContain("FENCESECRET");
+    expect(text).not.toContain("xxxxxxxxxx");
+    expect(JSON.stringify(logs)).not.toContain("FENCESECRET");
+  });
+
+  test("rpc_error from a Postgres error 42501: error_code rpc_error, sqlstate 42, no message or full code", async () => {
+    const err = Object.assign(new Error(`permission denied for function buffered_sessions_for ${SECRET}`), { code: "42501", detail: SECRET });
+    const { get, logs } = api({ reads: rpcFailing(err) });
+    const r = await get(L);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("x-relayhistory-buffered")).toBe("fenced");
+    const { fields, text } = fencedLine(logs);
+    expect(line(fields)).toMatchObject({ reason: "buffered_fenced", error_code: "rpc_error", sqlstate: "42" });
+    expect(text).not.toContain("FENCESECRET");
+    expect(text).not.toContain("permission denied");
+    expect(text).not.toContain("42501");
+    expect(JSON.stringify(logs)).not.toContain("FENCESECRET");
+  });
+
+  test("a malformed code yields no sqlstate field", async () => {
+    for (const code of ["x", "4", "ab501", " 42", 42501, null, { toString: () => "42501" }]) {
+      const { get, logs } = api({ reads: rpcFailing(Object.assign(new Error("boom"), { code })) });
+      expect((await get(L)).headers.get("x-relayhistory-buffered")).toBe("fenced");
+      const { fields, text } = fencedLine(logs);
+      expect("sqlstate" in fields).toBe(false);
+      expect(line(fields)).toMatchObject({ error_code: "rpc_error" });
+      expect("sqlstate" in line(fields)).toBe(false);
+      expect(text).not.toContain("boom");
+    }
+  });
+});
+
 describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => {
   test("no canonical pointer, own kept stages: served with X-Relayhistory-Buffered: 1", async () => {
     const s = store();
@@ -404,11 +467,11 @@ describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => 
     for (const path of [T, M]) {
       const main = await api({ enabled: false }).get(path);
       const mainBody = strip(await json(main));
-      for (const gateOf of [() => fencedGate("gate_unbound"), () => fencedGate("gate_timeout"), () => fencedGate("gate_shape")]) {
+      for (const subtype of ["gate_unbound", "gate_timeout", "gate_shape"]) {
         // A caller with no buffered stages, and one with stages: the gate failing first answers like main either way.
         for (const stages of [[[]], [[st.row]]] as const) {
           const { reads, calls } = scriptedReads({ stages: stages as never });
-          const { get, logs } = api({ store: s, gate: gateOf(), reads });
+          const { get, logs } = api({ store: s, gate: fencedGate(subtype), reads });
           const r = await get(path);
           expect(r.status).toBe(main.status);
           expect(r.status).toBe(501);
@@ -419,6 +482,7 @@ describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => 
           expect(text).not.toContain("UNVERIFIED-CONTENT");
           expect(calls).toHaveLength(0);
           expect(logs.some((l) => l.reason === "buffered_unverified")).toBe(true);
+          expect(logs.find((l) => l.reason === "buffered_unverified")).toMatchObject({ error_code: subtype });
         }
       }
     }

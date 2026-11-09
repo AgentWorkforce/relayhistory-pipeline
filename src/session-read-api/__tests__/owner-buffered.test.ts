@@ -777,3 +777,52 @@ describe("scrubBufferedText (v4 over-cap rule, wrapping scrub.ts)", () => {
     expect(out).toContain("kept tail");
   });
 });
+
+describe("fence subtypes for logs (fenceSubtype, BufferedFenced.sqlstateClass)", () => {
+  test("FENCE_SUBTYPES is frozen and holds every reason literal the module fences with, plus the default", () => {
+    const src = readFileSync(join(import.meta.dir, "..", "owner-buffered.ts"), "utf8");
+    const literals = new Set([...src.matchAll(/(?:new BufferedFenced|\bfail)\("([^"]+)"/g)].map((m) => m[1]!));
+    expect(literals.size).toBeGreaterThan(10);
+    for (const r of literals) expect(ownerBuffered.FENCE_SUBTYPES).toContain(r);
+    expect(ownerBuffered.FENCE_SUBTYPES).toContain("fenced");
+    expect(Object.isFrozen(ownerBuffered.FENCE_SUBTYPES)).toBe(true);
+    for (const r of ownerBuffered.FENCE_SUBTYPES) expect(ownerBuffered.fenceSubtype(r)).toBe(r);
+    expect(ownerBuffered.fenceSubtype(new BufferedFenced().reason)).toBe("fenced");
+  });
+
+  test("anything outside the set is fence_other", () => {
+    for (const r of ["", "gate_", "GATE_SHAPE", "gate_shape ", "fixture_timeout", `rpc_error${"x".repeat(300)}`, undefined, null, 42, {}, ["gate_shape"]])
+      expect(ownerBuffered.fenceSubtype(r)).toBe("fence_other");
+  });
+
+  test("RPC failures carry only a validated two-char SQLSTATE class", async () => {
+    const reason = async (err: unknown) => {
+      const run = (async (_o: string, _w: string, work: (q: unknown) => Promise<unknown>) =>
+        work({ async query() { throw err; } })) as never;
+      try {
+        await sqlOwnerBufferedReads(run).list(SCOPE, authority("7"), { limit: 1 });
+      } catch (e) {
+        return e;
+      }
+      throw new Error("expected a fence");
+    };
+    const cases: Array<[unknown, string, string | undefined]> = [
+      [Object.assign(new Error("m"), { code: "55006" }), "rpc_fenced", "55"],
+      [Object.assign(new Error("m"), { code: "57014" }), "rpc_timeout", "57"],
+      [Object.assign(new Error("secret message"), { code: "42501" }), "rpc_error", "42"],
+      [Object.assign(new Error("m"), { code: "x" }), "rpc_error", undefined],
+      [Object.assign(new Error("m"), { code: "a1234" }), "rpc_error", undefined],
+      [Object.assign(new Error("m"), { code: 42501 }), "rpc_error", undefined],
+      [new Error("connection terminated"), "rpc_error", undefined],
+      ["thrown string", "rpc_error", undefined],
+    ];
+    for (const [err, r, cls] of cases) {
+      const e = await reason(err);
+      expect(e).toBeInstanceOf(BufferedFenced);
+      expect((e as BufferedFenced).reason).toBe(r);
+      expect((e as BufferedFenced).sqlstateClass).toBe(cls);
+      expect(JSON.stringify({ ...(e as object) })).not.toContain("secret message");
+    }
+    expect(new BufferedFenced("gate_shape").sqlstateClass).toBeUndefined();
+  });
+});

@@ -84,6 +84,7 @@ import {
   BUFFERED_IDS_HEADER,
   BUFFERED_LIST_MAX_LIMIT,
   BufferedFenced,
+  fenceSubtype,
   BufferedTooLarge,
   bufferedIdsHeader,
   bufferedSessionSummary,
@@ -577,7 +578,7 @@ export function createReadApi(deps: ReadApiDeps) {
     try {
       const served = await read();
       if (served && "unverifiedBeforeCandidate" in served) {
-        log({ route: c.req.routePath, reason: "buffered_unverified", gate: served.unverifiedBeforeCandidate, correlation_id: c.get("correlationId") });
+        log({ route: c.req.routePath, reason: "buffered_unverified", error_code: fenceSubtype(served.unverifiedBeforeCandidate), correlation_id: c.get("correlationId") });
         return null;
       }
       return served as T | null;
@@ -587,7 +588,7 @@ export function createReadApi(deps: ReadApiDeps) {
         return null;
       }
       if (error instanceof BufferedFenced) {
-        log({ route: c.req.routePath, reason: "buffered_fenced", gate: error.reason, correlation_id: c.get("correlationId") });
+        log({ route: c.req.routePath, reason: "buffered_fenced", error_code: fenceSubtype(error.reason), ...(error.sqlstateClass ? { sqlstate: error.sqlstateClass } : {}), correlation_id: c.get("correlationId") });
         throw bufferedFenced();
       }
       if (error instanceof TenantMismatchError || error instanceof HttpError) throw error;
@@ -844,7 +845,7 @@ export function createReadApi(deps: ReadApiDeps) {
       if (error instanceof TenantMismatchError) throw error;
       if (error instanceof BufferedFenced) {
         fenced = true;
-        log({ route: c.req.routePath, reason: "buffered_fenced", gate: error.reason, correlation_id: c.get("correlationId") });
+        log({ route: c.req.routePath, reason: "buffered_fenced", error_code: fenceSubtype(error.reason), ...(error.sqlstateClass ? { sqlstate: error.sqlstateClass } : {}), correlation_id: c.get("correlationId") });
       } else log({ route: c.req.routePath, reason: "buffered_list_error", error_code: (error as { name?: string })?.name ?? "error", correlation_id: c.get("correlationId") });
     }
     const { sources, notSources, bounds } = q;
