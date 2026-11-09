@@ -129,6 +129,15 @@ test("managed-provider bootstrap fixed-role inventories stay equal", () => {
   );
 });
 
+/** Upstream plan steps ordered after 20261105044020 (a database "before 044020" must hold none: that is a ledger gap). */
+const CB_STEP = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+const laterUpstream = (steps: Array<{ name: string }>) => steps.filter((s) => s.name.startsWith("upstream:") && s.name > CB_STEP);
+/** Roll back every upstream step after 044020, newest first, so 044020 is the newest applied step again. */
+async function rollbackLaterThan044020(db: PGlite, profile: MigrationProfile) {
+  for (const { name } of laterUpstream(await plan(profile)).reverse())
+    await db.exec(readFileSync(join(root, "supabase/rollbacks", `${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`), "utf8"));
+}
+
 describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
   const base = {
     HOOPDB_RUNTIME_ROLE: "hoop_runtime",
@@ -2341,6 +2350,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toContain(SL);
     expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBe("sessions.ingest_seed_captures_org_id_idx");
+    await rollbackLaterThan044020(db, SUPA_ET);
     await rollback("20261105044020_claim_bootstrap_org_indexes.down.sql");
     expect(await names()).not.toContain(CB);
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBeNull();
@@ -2768,6 +2778,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await db.exec(ET_BOOT);
       await runMigrations(client(db), { profile: SUPA_ET });
       expect(await holds(db)).toBe(true);
+      await rollbackLaterThan044020(db, SUPA_ET);
       expect(await failure(db.exec(orgIndexesDown))).toBeNull();
       await db.exec(lockDown);
       expect(await failure(db.exec(readTokensDown))).toBeNull();
@@ -2784,6 +2795,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await runMigrations(client(db), { profile: SUPA_ET });
       await db.exec(`DROP OWNED BY search_consumer_runtime`);
       await db.exec(`DROP ROLE search_consumer_runtime`);
+      await rollbackLaterThan044020(db, SUPA_ET);
       expect(await failure(db.exec(orgIndexesDown))).toBeNull();
       await db.exec(lockDown);
       expect(await failure(db.exec(readTokensDown))).toBeNull();
@@ -3251,8 +3263,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await db.exec(ET_BOOT);
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
     const LAZY = "ingest_lazy_native_slots_org_id_idx";
-    // The previous release: everything but 044020, validated (marker 'pass').
-    const steps = (await plan(SUPA_ET)).filter((s) => s.name !== CB);
+    // The previous release: everything but 044020 (and no later upstream step: that would be a ledger gap), validated (marker 'pass').
+    const full = await plan(SUPA_ET);
+    const later = laterUpstream(full).map((s) => s.name);
+    const steps = full.filter((s) => s.name !== CB && !later.includes(s.name));
     expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
     // Production shape: seven prebuilt CONCURRENTLY, the lazy-slot one held, its table populated.
     for (const x of ADOPTABLE_INDEXES[CB]!) if (x.name !== LAZY) await db.exec(x.def);
@@ -3279,7 +3293,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     const report = await inspectMigrations(client(db), SUPA_ET);
     await db.exec("ROLLBACK");
-    expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([CB]);
+    expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([CB, ...later]);
     expect(await failure(runMigrations(client(db), { profile: SUPA_ET, expectedLedgerSha256: report.ledgerSha256 }))).toBeNull();
     expect(((await snapshot(db)).marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
   });
