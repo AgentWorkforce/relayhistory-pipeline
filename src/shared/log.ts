@@ -38,6 +38,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // Search index failures (searchIndexErrorDetail): the adapter's bounded detail code only
   // (e.g. `http_429:bulk_items_812:bulk_bytes_4190000`), never backend text or a reason.
   "error_detail",
+  // Canonical projection reason codes (src/session-read-api/canonical.ts canonicalReasonCodeFields):
+  // snake_case codes joined by `,`, never ids, keys or values.
+  "reason_codes",
   // Analytics export counters (src/shared/analytics-config.ts analyticsCounterFields): bounded counts only.
   ...ANALYTICS_COUNTER_FIELDS,
 ]);

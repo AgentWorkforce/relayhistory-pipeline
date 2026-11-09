@@ -6,13 +6,35 @@ import type { HoopDb } from "../shared/db.ts";
 import type { SessionDirectoryKey } from "../hoopdb/session-directory-summary.ts";
 import { poolTenantRunner } from "../session-read-api/liveness.ts";
 import { serviceCanonicalDeps, type ServiceCanonicalDeps } from "../session-read-api/service-canonical.ts";
-import { CanonicalReadError } from "../session-read-api/canonical.ts";
+import { CanonicalReadError, canonicalReasonCodeFields } from "../session-read-api/canonical.ts";
+import { log } from "../shared/log.ts";
 import { briefInputFromEvents, eventFromConvergenceRow, eventFromTranscriptRecord, type BriefInput, type BriefPointer } from "./input.ts";
 import { SESSION_SUMMARY_SOURCES } from "./engine/summary-contract.ts";
 import { briefWorkspaceIds } from "./config.ts";
 import type { TenantRunner } from "../session-read-api/liveness.ts";
 import type { CanonicalTranscript } from "../session-read-api/canonical-transcript.ts";
 import type { CanonicalRows } from "../session-read-api/session-timing-source.ts";
+
+/**
+ * A CanonicalReadError from the canonical object reader: quarantine an explicitly
+ * unscrubbed manifest, otherwise the controlled input-refusal code (retryable on 503). The
+ * PipelineError carries only its code, so the canonical reason and its projection
+ * reason codes (codes only, never ids or values) are logged for the operator.
+ */
+export function canonicalInputRefusal(error: CanonicalReadError, pointers: readonly BriefPointer[], code: "canonical_input_refused" | "canonical_jsonl_input_refused" = "canonical_input_refused"): BriefInput {
+  // Match the legacy input's quarantine outcome: never retain derived
+  // text when the current authoritative manifest is explicitly unscrubbed.
+  if (error.details.includes("manifest_unscrubbed")) return {
+    kind: "quarantined", error: "session_quarantined",
+    sourceRevisions: Object.fromEntries(pointers.map(p => [p.machineId, p.revision])),
+  };
+  const retryable = error.status === 503;
+  log.warn("canonical brief input refused", {
+    stage: "session-brief", error_code: code, retryable,
+    reason: error.reason, ...canonicalReasonCodeFields(error.details),
+  });
+  throw new PipelineError(code, "canonical input refused", retryable);
+}
 
 export type CanonicalBriefInput = (db: HoopDb, key: SessionDirectoryKey, pointers: readonly BriefPointer[]) => Promise<BriefInput>;
 
@@ -98,17 +120,7 @@ export function canonicalBriefInputFromEnv(env: NodeJS.ProcessEnv = process.env)
       }
       return { ...briefInputFromCanonical(logicalKey, pointers, snapshot!), canonicalSessionId: logicalKey.sessionId };
     } catch (error) {
-      if (error instanceof CanonicalReadError) {
-        // Match the legacy input's quarantine outcome: never retain derived
-        // text when the current authoritative manifest is explicitly unscrubbed.
-        if (error.details.includes("manifest_unscrubbed")) return {
-          kind: "quarantined", error: "session_quarantined",
-          sourceRevisions: Object.fromEntries(pointers.map(p => [p.machineId, p.revision])),
-        };
-        // A failed JSONL recovery must not match the historical ndjson-only
-        // refusal again. The sweep admits that old failure only once.
-        throw new PipelineError(readingTranscript ? "canonical_jsonl_input_refused" : "canonical_input_refused", "canonical input refused", error.status === 503);
-      }
+      if (error instanceof CanonicalReadError) return canonicalInputRefusal(error, pointers, readingTranscript ? "canonical_jsonl_input_refused" : "canonical_input_refused");
       throw error;
     }
   };

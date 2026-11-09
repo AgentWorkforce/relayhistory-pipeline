@@ -1,11 +1,12 @@
-import { expect, test } from "bun:test";
-import { briefInputFromCanonical, canonicalBriefInputFromEnv, canonicalBriefScope } from "../canonical-input.ts";
+import { expect, spyOn, test } from "bun:test";
+import { briefInputFromCanonical, canonicalBriefInputFromEnv, canonicalBriefScope, canonicalInputRefusal } from "../canonical-input.ts";
 import { briefSession } from "../worker.ts";
 import { armWakeup, claimWakeups, sweepUnbriefed, recordBrief } from "../store.ts";
 import { database, hoopDb, pointer, KEY, FakeModel, testConfig } from "./harness.ts";
 import { poolTenantRunner } from "../../session-read-api/liveness.ts";
 import { sqlCanonicalPointers } from "../../session-read-api/session-timing-source.ts";
-import { canonicalSnapshot } from "../../session-read-api/canonical.ts";
+import { CanonicalReadError, canonicalSnapshot } from "../../session-read-api/canonical.ts";
+import { PipelineError } from "../../shared/vendor.ts";
 import { objectKey, manifestKey } from "../../../packages/object-store/src/index.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { recordStream, tempStore, loc } from "./harness.ts";
@@ -36,6 +37,33 @@ test("missing, foreign and malformed canonical input cannot reach the model", ()
     const s = snapshot();s.rows[0]!.row = { ...s.rows[0]!.row, ...changed };
     expect(() => briefInputFromCanonical(scope, pointers, s)).toThrow("canonical input scope refused");
   }
+});
+
+test("a canonical refusal logs its reason and projection reason codes (codes only), quarantine unchanged", () => {
+  const lines: string[] = [];
+  const spy = spyOn(process.stderr, "write").mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as never);
+  try {
+    let thrown: unknown;
+    try { canonicalInputRefusal(new CanonicalReadError("canonical_projection_incomplete", 503, ["scope_too_large", "sess:1/manifest.json"]), pointers); } catch (e) { thrown = e; }
+    expect(thrown).toBeInstanceOf(PipelineError);
+    expect(thrown).toMatchObject({ code: "canonical_input_refused", message: "canonical input refused", retryable: true });
+    expect(() => canonicalInputRefusal(new CanonicalReadError("forbidden", 403), pointers)).toThrow("canonical input refused");
+    const logged = lines.map(l => JSON.parse(l) as Record<string, unknown>).filter(l => l.error_code === "canonical_input_refused");
+    expect(logged).toHaveLength(2);
+    expect(logged[0]).toMatchObject({ level: "warn", stage: "session-brief", reason: "canonical_projection_incomplete", reason_codes: "scope_too_large", retryable: true });
+    expect(JSON.stringify(logged[0])).not.toContain("manifest.json");
+    expect(logged[1]).toMatchObject({ reason: "forbidden", retryable: false });
+    expect(logged[1]).not.toHaveProperty("reason_codes");
+    let jsonlThrown: unknown;
+    try { canonicalInputRefusal(new CanonicalReadError("transcript_json_invalid", 501, ["bad/key"]), pointers, "canonical_jsonl_input_refused"); } catch (e) { jsonlThrown = e; }
+    expect(jsonlThrown).toMatchObject({ code: "canonical_jsonl_input_refused", retryable: false });
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ error_code: "canonical_jsonl_input_refused", reason: "transcript_json_invalid", retryable: false });
+    expect(lines.at(-1)).not.toContain("bad/key");
+    lines.length = 0;
+    expect(canonicalInputRefusal(new CanonicalReadError("canonical_projection_incomplete", 503, ["manifest_unscrubbed"]), pointers))
+      .toEqual({ kind: "quarantined", error: "session_quarantined", sourceRevisions: { "m-1": 1 } });
+    expect(lines).toHaveLength(0);
+  } finally { spy.mockRestore(); }
 });
 
 test("canonical source selection is explicit, strict and refuses incomplete configuration", () => {
