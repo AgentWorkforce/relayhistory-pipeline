@@ -2267,13 +2267,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const SE = "upstream:20261105043910_selfhost_session_selection_erase.sql";
     const BK = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
+    const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, CB]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -2315,7 +2316,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105044000 (read API tokens) applies last: its own down drops the table first.
+    // 20261105044020 (claim-bootstrap org_id indexes) applies last: 044000's down refuses (55000) while
+    // it is applied; its own down drops the eight indexes first.
+    expect((await failure(rollback("20261105044000_read_api_tokens.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
+    expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBe("sessions.ingest_seed_captures_org_id_idx");
+    await rollback("20261105044020_claim_bootstrap_org_indexes.down.sql");
+    expect(await names()).not.toContain(CB);
+    expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBeNull();
+    // 20261105044000 (read API tokens) is then the latest: its own down drops the table.
     expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
     await rollback("20261105044000_read_api_tokens.down.sql");
     expect(await relation("sessions.read_api_tokens")).toBeNull();
@@ -2705,7 +2714,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
 
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
-    // The read API tokens migration applies after the grants, so it rolls back first.
+    // The read API tokens and claim-bootstrap index migrations apply after the grants, so they roll back first (newest first).
+    const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105044000_read_api_tokens.down.sql"), "utf8");
     // 043910 is newer, so 043900's down refuses until it is rolled back.
     const newerDown = readFileSync(join(root, "supabase/rollbacks/20261105043910_selfhost_session_selection_erase.down.sql"), "utf8");
@@ -2728,6 +2738,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await db.exec(ET_BOOT);
       await runMigrations(client(db), { profile: SUPA_ET });
       expect(await holds(db)).toBe(true);
+      expect(await failure(db.exec(orgIndexesDown))).toBeNull();
       expect(await failure(db.exec(readTokensDown))).toBeNull();
       await db.exec(newerDown);
       expect(await failure(db.exec(down))).toBeNull();
@@ -2742,6 +2753,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await runMigrations(client(db), { profile: SUPA_ET });
       await db.exec(`DROP OWNED BY search_consumer_runtime`);
       await db.exec(`DROP ROLE search_consumer_runtime`);
+      expect(await failure(db.exec(orgIndexesDown))).toBeNull();
       expect(await failure(db.exec(readTokensDown))).toBeNull();
       await db.exec(newerDown);
       expect(await failure(db.exec(down))).toBeNull();
