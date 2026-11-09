@@ -4,6 +4,8 @@ Status: code only. Nothing here has been applied to any database. Applying
 migration 044080, enabling the writer, or running the backfill against any real
 database needs Khaliq's separate, explicit OK in his own words.
 
+Production order, apply path, bounds and stop rules: [list-fix operator packet](../ingest-claim-sessions-list-fix-20261109/operator-packet.md).
+
 ## What the migration adds (inert)
 
 `supabase/migrations/20261105044080_ingest_claim_sessions.sql`:
@@ -127,4 +129,103 @@ tenant ids, session ids or records.
 - `accepted_at` is NULL for rows the trigger writes (the claim precedes the batch
   commit) and is filled by the backfill only. It is a sort hint, not authority: readers
   must still join `sessions.ingest_batches` (`state='committed'`), or PR 2 adds a
-  commit-time refresh.
+  commit-time refresh. PR 2 (slot 044090, below) adds that refresh; the readers still
+  join `sessions.ingest_batches` and judge every stage as before.
+
+## PR 2 / enabling the reader (slot 044090)
+
+Status: code only, like PR 1. Applying 044090 or setting `read_enabled` against any
+real database needs Khaliq's separate, explicit OK in his own words.
+
+`supabase/migrations/20261105044090_claim_sessions_reader.sql` adds:
+
+- `sessions.ingest_claim_sessions_policy.read_enabled boolean NOT NULL DEFAULT false`,
+  with CHECK `ingest_claim_sessions_policy_read_check`: `read_enabled` only while
+  `write_enabled` is true and `backfill_complete_at` is set. Any `write_enabled`
+  change now clears `read_enabled` too (with the cursor and completion).
+- Trigger `ingest_batch_claim_sessions_refresh`, `AFTER UPDATE OF state, committed_at`
+  on `sessions.ingest_batches`: when a batch commits, sets its side rows' `accepted_at`
+  to the batch's `committed_at`, only while `write_enabled`. While the writer is off
+  it is one policy read (no subtransaction). While it is on, the side-table update
+  runs in a subtransaction that never waits on a row lock (rows are taken
+  `FOR UPDATE SKIP LOCKED`, so rows the backfill or another writer holds are skipped)
+  and waits at most 100ms for any other lock (a transaction-local `lock_timeout`,
+  restored to the caller's value afterwards). Every error it raises there (lock
+  timeout 55P03, deadlock, anything `WHEN OTHERS` catches) is swallowed and the batch
+  commit goes on. What it does not swallow: a cancel or the caller's own
+  `statement_timeout` (57014), which cancels the commit statement as it would without
+  the trigger, and a wait on DDL holding the policy table, which any statement would
+  wait on too. A skipped or failed refresh leaves the row NULL (or whatever the
+  backfill writes); the reader evaluates every NULL `accepted_at` under a committed
+  batch, so it costs time, never a row. Nothing repairs it automatically once the
+  backfill is complete; the `null_accepted` count below tracks it.
+- `sessions.buffered_sessions_for` and `sessions.buffered_session_stages_for` replaced
+  (signature, owner, SECURITY DEFINER and ACL unchanged). While the gate
+  (`read_enabled AND write_enabled AND backfill_complete_at IS NOT NULL`) is off they
+  run 044040's query unchanged. While it is on they find candidate sessions and the
+  session's claims through `sessions.ingest_claim_sessions` instead of scanning the
+  user's whole outbox / the records GIN, and judge each stage with the same
+  predicates. The results are the same rows, order and cursor, provided the side
+  table is complete (which the gate requires). No index is added.
+
+Applying 044090 changes no runtime behaviour: `read_enabled` starts false.
+
+1. Apply 044090 with the normal migrator (ledger
+   `upstream:20261105044090_claim_sessions_reader.sql`). Confirm:
+
+   ```sql
+   SELECT write_enabled, read_enabled, backfill_complete_at IS NOT NULL AS complete
+     FROM sessions.ingest_claim_sessions_policy;   -- expect: read_enabled = false
+   ```
+
+2. Complete PR 1 steps 3 to 5 (writer on, backfill to completion, verification). The
+   CHECK refuses step 3 below until then (SQLSTATE 23514).
+
+3. Enable the reader (a single-row update; no table lock beyond the policy row):
+
+   ```sql
+   BEGIN;
+   SET LOCAL lock_timeout = '5s';
+   UPDATE sessions.ingest_claim_sessions_policy SET read_enabled = true;
+   COMMIT;
+   ```
+
+4. Verify, counts only (never select or log tokens, tenant ids or session ids):
+
+   ```sql
+   BEGIN READ ONLY;
+   SET LOCAL statement_timeout = '60s';
+   SELECT write_enabled, read_enabled, backfill_complete_at IS NOT NULL AS complete
+     FROM sessions.ingest_claim_sessions_policy;   -- expect: true, true, true
+   -- Side rows under committed batches with no accepted_at (refreshes skipped on a
+   -- locked row or failed; the reader handles them, but a growing number means the
+   -- refresh is failing).
+   SELECT count(*) AS null_accepted
+     FROM sessions.ingest_claim_sessions s
+     JOIN sessions.ingest_batches b USING (org_id, workspace_id, origin_id, batch_id)
+    WHERE b.state = 'committed' AND s.accepted_at IS NULL;
+   -- Side rows whose accepted_at differs from the batch's committed_at (expect 0).
+   SELECT count(*) AS drifted
+     FROM sessions.ingest_claim_sessions s
+     JOIN sessions.ingest_batches b USING (org_id, workspace_id, origin_id, batch_id)
+    WHERE s.accepted_at IS NOT NULL AND s.accepted_at IS DISTINCT FROM b.committed_at;
+   COMMIT;
+   ```
+
+   Re-run PR 1 step 5's pair counts as well; `expected_pairs` must still equal
+   `side_rows`. If they ever diverge, disable the reader (below) first.
+
+5. Disable the reader (a single-row update; both readers go back to 044040's query at once):
+
+   ```sql
+   UPDATE sessions.ingest_claim_sessions_policy SET read_enabled = false;
+   ```
+
+   Turning the writer off also turns the reader off. Re-enabling needs a completed
+   backfill again (PR 1 steps 3 to 5) and then step 3 above.
+
+- Remove PR 2: `supabase/rollbacks/20261105044090_claim_sessions_reader.down.sql`
+  restores 044040's readers and 044080's guard, drops the refresh trigger and function,
+  the CHECK and the column, and deletes its ledger row. It refuses (55000) unless 044090
+  is applied with its exact checksum, and while any later upstream migration is applied.
+  044080's own down refuses while 044090 is applied.
