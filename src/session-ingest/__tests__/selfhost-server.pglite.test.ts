@@ -15,6 +15,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
+import { SESSION_DIRECTORY_SEARCH_RPC } from "../../hoopdb/search-index-contract.ts";
 import { objectKey, type ObjectStore } from "../../shared/vendor.ts";
 import { IDENTITY_HEADER, contentEncodings, encodeIdentity } from "../app.ts";
 import { DELIVERY_LIMITS } from "../vendor/delivery/delivery-contracts.ts";
@@ -523,6 +524,96 @@ describe("per-session erase (RELAYHISTORY_SELFHOST_SESSION_SELECTION=true)", () 
     expect((await db.query(
       "SELECT deleted_at, short_summary, short_summary_scrub_ruleset, short_summary_scrub_version, short_summary_source, short_summary_generated_at FROM sessions.session_directory WHERE session_id = 'sess-1'",
     )).rows).toEqual([{ deleted_at: null, short_summary: null, short_summary_scrub_ruleset: null, short_summary_scrub_version: null, short_summary_source: null, short_summary_generated_at: null }]);
+  });
+
+  // 044070: the erased summary must also leave search_text, which the tenant search path matches (ILIKE). A row that
+  // keeps another live pointer is not tombstoned, so the tombstone trigger does not empty search_text for it.
+  const PHRASE = "zephyrquokka ledger";
+  const TITLE = "Refactor billing gateway";
+  const searchable = async (db: PGlite) => {
+    await db.query(
+      `UPDATE sessions.session_directory SET title = $1, agent_name = 'agent-a', project_id = 'proj-a', git_repo = 'org/repo',
+         git_branch = 'main', model = 'model-a', short_summary = 'notes about the ' || $2 || ' cleanup', short_summary_scrub_ruleset = 'relayhistory-scrub',
+         short_summary_scrub_version = 1, short_summary_source = 'bob-costas/extractive/v1', short_summary_generated_at = now()
+       WHERE session_id = 'sess-1'`, [TITLE, PHRASE]);
+    await db.query(
+      `UPDATE sessions.session_directory SET search_text = sessions.session_directory_search_text(title, task_title, agent_name, project_id,
+         git_repo, git_branch, model, short_summary) WHERE session_id = 'sess-1'`);
+    await db.query("INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+      ["https://issuer.test/session-directory", SESSION_DIRECTORY_SEARCH_RPC.audience]);
+  };
+  /** The tenant search path (sessions.search_session_directory with p_query) as the Worker role sees it. */
+  const search = async (db: PGlite, query: string) => {
+    const iat = Math.floor(Date.now() / 1000);
+    await db.query("SELECT set_config('request.jwt.claims', $1, false)", [JSON.stringify({
+      role: SESSION_DIRECTORY_SEARCH_RPC.workerRole, iss: "https://issuer.test/session-directory", aud: SESSION_DIRECTORY_SEARCH_RPC.audience,
+      iat, exp: iat + 60, app_metadata: { org_id: TENANT.orgId, workspace_ids: [TENANT.workspaceId] } })]);
+    await db.exec(`SET ROLE ${SESSION_DIRECTORY_SEARCH_RPC.workerRole}`);
+    try {
+      return (await db.query<{ session_id: string }>("SELECT session_id FROM sessions.search_session_directory(p_workspace_id => $1, p_query => $2)",
+        [TENANT.workspaceId, query])).rows.map((r) => r.session_id);
+    } finally {
+      await db.exec("RESET ROLE");
+      await db.query("SELECT set_config('request.jwt.claims', '', false)");
+    }
+  };
+  /** After the clear: no summary, no provenance, not tombstoned, search_text is the metadata-only document. */
+  const expectMetadataOnly = async (db: PGlite) => {
+    expect((await db.query(
+      `SELECT deleted_at, short_summary, short_summary_scrub_ruleset, short_summary_scrub_version, short_summary_source, short_summary_generated_at,
+         search_text = sessions.session_directory_search_text(title, task_title, agent_name, project_id, git_repo, git_branch, model, NULL) AS rebuilt,
+         strpos(search_text, $1) = 0 AS phrase_gone, strpos(search_text, $2) > 0 AS title_kept
+       FROM sessions.session_directory WHERE session_id = 'sess-1'`, [PHRASE, TITLE])).rows).toEqual([{
+      deleted_at: null, short_summary: null, short_summary_scrub_ruleset: null, short_summary_scrub_version: null, short_summary_source: null,
+      short_summary_generated_at: null, rebuilt: true, phrase_gone: true, title_kept: true }]);
+    expect(await search(db, PHRASE)).toEqual([]);
+    expect(await search(db, "zephyrquokka")).toEqual([]);
+    expect(await search(db, TITLE)).toEqual(["sess-1"]);
+  };
+
+  test("the erase rebuilds search_text without the summary: an erased summary is no longer searchable on a live row (044070)", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", machine);
+    await pointer(db, "sess-1", "srv_other-machine");
+    await directory(db, "sess-1");
+    await searchable(db);
+    expect(await search(db, PHRASE)).toEqual(["sess-1"]);
+    expect(await search(db, TITLE)).toEqual(["sess-1"]);
+    // Another machine's copy is still live, so the row stays untombstoned: before 044070 the summary stayed in
+    // search_text and the phrase still matched.
+    const res = await post(url(SELECTION), await selection());
+    expect(res.status).toBe(200);
+    expect((await row(db, "sess-1", machine)).deleted_at).not.toBeNull();
+    expect((await row(db, "sess-1", "srv_other-machine")).deleted_at).toBeNull();
+    await expectMetadataOnly(db);
+  });
+
+  test("the managed-head retire trigger rebuilds search_text without the summary: no longer searchable on a live row (044070)", async () => {
+    const { db } = await database();
+    await pointer(db, "sess-1", machine);
+    await pointer(db, "sess-1", "srv_other-machine");
+    await directory(db, "sess-1");
+    await searchable(db);
+    expect(await search(db, PHRASE)).toEqual(["sess-1"]);
+    const generation = "7a2d3b5f-4c6e-4d8f-9a01-b2c3d4e5f607";
+    await db.query(
+      `INSERT INTO sessions.ingest_publication_heads (org_id, workspace_id, user_id, origin_id, source, session_id, physical_workspace,
+         physical_source, physical_session, machine_id, generation, fence_epoch, reset_epoch, pointer_revision, current_key, state)
+       VALUES ($1, $2, $3, $4, 'claude', 'sess-1', $2, 'claude', 'sess-1', $5, $6, 1, 0, 1, 'k/sess-1' || $5, 'live')`,
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId, ORIGIN_ID, machine, generation]);
+    await db.query(
+      `INSERT INTO sessions.ingest_publication_generations (generation, prefix, org_id, workspace_id, user_id, origin_id, source, session_id,
+         fence_epoch, reset_epoch, state, target_bucket, target_region, key_root)
+       VALUES ($5::uuid, 'p/' || $5, $1, $2, $3, $4, 'claude', 'sess-1', 1, 0, 'live', 'bucket', 'us-east-1', '96bulls')`,
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId, ORIGIN_ID, generation]);
+    // A user reset retires the head (ingest_publication_retire_reset); the other machine's copy keeps the row live.
+    await db.query("INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id) VALUES ($1, $2, $3, 'r-1')",
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
+    expect((await db.query("SELECT state FROM sessions.ingest_publication_heads")).rows).toEqual([{ state: "retired" }]);
+    expect((await row(db, "sess-1", machine)).deleted_at).not.toBeNull();
+    expect((await row(db, "sess-1", "srv_other-machine")).deleted_at).toBeNull();
+    await expectMetadataOnly(db);
   });
 
   test("one selection erases every origin of the caller's session, relay turns included; another user's copy stays", async () => {

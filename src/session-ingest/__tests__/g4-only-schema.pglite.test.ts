@@ -118,6 +118,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Replaces the self-host erase and the G4 retire trigger function ingest_publication_retire_fence (in
       // OBJECTS.replacedFunctions below); both now clear the short_summary provenance columns with the summary.
       "20261105044050_selfhost_erase_short_summary_provenance.sql",
+      // Replaces the same two functions again (already in OBJECTS.replacedFunctions); both now rebuild search_text
+      // without the summary when they clear it.
+      "20261105044070_selfhost_erase_search_text_rebuild.sql",
       // The digest narrative cache table, its purge function and read API functions only; no ingest path touches them.
       "20261105045000_digest_narrative_cache.sql",
     ]);
