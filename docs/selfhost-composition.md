@@ -633,3 +633,39 @@ Until the flip, `BOB_COSTAS_MODEL` stays `off` on the hosted worker.
 That flip and its deploy are a separate production change and need Khaliq's
 own explicit approval. Nothing in this repository changes the hosted or local
 value; the local stack (`alchemy.run.ts`) stays at `BOB_COSTAS_MODEL: "off"`.
+
+## 7. Output facts bootstrap
+
+`SERVICE=session-pipeline-output-facts-bootstrap`
+(`src/session-pipeline/output-facts-bootstrap.ts`) is a one-shot Job that backfills
+output facts for sessions ingested before `RELAYHISTORY_SELFHOST_OUTPUT_FACTS` was
+turned on, then records each fully covered workspace in
+`sessions.output_facts_workspace_state`. The operator steps are in
+`runbooks/selfhost-output-facts-bootstrap.md`.
+
+- **Gate:** the consumer's env (`RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER=true`,
+  `RELAYHISTORY_PIPELINE_CONSUMER_SECRET`, `SEARCH_INDEX_BACKEND`,
+  `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `PIPELINE_KEY_PREFIX`,
+  `SESSION_POSTGRES_TLS_PROFILE`), with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS`
+  exactly `true`. The secret's `hoopdb_url` must be the **owner** identity, the
+  same one `session-pipeline-consumer-bootstrap` uses, not the consumer's runtime
+  role. The ledger must record migration `045040` with this image's checksum.
+- **Phase A (reprojection):** this phase writes no facts itself. It queues the manifest
+  of every live session that owes facts into `sessions.search_consumer_pending`, the
+  running consumer's retry queue. The consumer (`SERVICE=session-pipeline-consumer`,
+  with the facts flag on) then reprojects each one through the normal search-index
+  pass and the `045040` writers. The job polls until nothing is owed, the queue for
+  its backend is empty, or
+  `RELAYHISTORY_SELFHOST_OUTPUT_FACTS_BOOTSTRAP_DEADLINE_SECONDS` runs out
+  (default 7200, range 1..86400).
+- **Phase B (watermark):** in one transaction under an advisory lock, every
+  workspace whose live sessions are all complete and current gets
+  `complete_since` = the earliest `min_ts` of those sessions, or `now()` when it has
+  none, with `marked_by = 'bootstrap'`. An existing row is never changed, so a
+  watermark is never lowered. An incomplete workspace is never marked.
+- **Exit codes:** 0 done; 1 failed; 2 refused (gate, ledger or identity); 3 some
+  workspaces are still incomplete. Set
+  `RELAYHISTORY_SELFHOST_OUTPUT_FACTS_BOOTSTRAP_ALLOW_PARTIAL=true` to turn 3 into
+  0. The marks are the same either way.
+
+Nothing runs the Job by default. The e2e compose does not include it.
