@@ -16,7 +16,11 @@ Private ancestry fetch authenticates only that process; no checkout credential
 is saved to git configuration. CI is rechecked after environment approval,
 before signing, before registry copy, and after registry verification.
 
-Only sha-<source_sha> is published to ghcr.io/agentworkforce/96bulls-services.
+Only sha-<source_sha> is published. The same signed OCI index (one digest) is
+copied to ghcr.io/agentworkforce/sessions-pipeline (primary; matches the Helm
+chart name) and to ghcr.io/agentworkforce/96bulls-services (kept while dev
+installs and chart defaults still pin it). Each copy is read back and must match
+the signed digest.
 The publisher never moves main or latest. The single-line, non-sensitive approval
 reference becomes image metadata. Preserve this repository's existing package
 Actions access; a denied push is a permission failure to resolve with its owner.
@@ -39,6 +43,14 @@ checks its bytes/platforms, and signs two in-toto statements before registry wri
   source dependency and publication invocation.
 - https://agentrelay.com/attestations/reviewed-image-source/v1 binds the exact
   source, workflow, main ref, successful source CI run and image digest.
+
+Both statements name the primary repository in `image` and the exact ordered
+list of every repository the index is published to in `images`
+(sessions-pipeline, then 96bulls-services). Verification requires that exact
+list. Releases signed before the dual publish name only 96bulls-services and
+carry no `images` claim; verify those with `IMAGE_LAYOUT=legacyOnly` and the
+96bulls-services image reference. The receipt's `image`/`images` select the
+same layout for the Amp copy path.
 
 Both bundles must pass Cosign verification of the exact GitHub issuer, workflow
 identity, repository, main ref, workflow SHA, manual trigger and subject digest.
@@ -77,7 +89,7 @@ promotion:
 set -euo pipefail
 export ARTIFACT_DIR="$receipt_dir"
 export IMAGE_DIGEST="${image##*@}"
-test "$image" = "ghcr.io/agentworkforce/96bulls-services@$IMAGE_DIGEST"
+test "$image" = "ghcr.io/agentworkforce/sessions-pipeline@$IMAGE_DIGEST"
 export SOURCE_SHA="$source_sha" WORKFLOW_SHA="$workflow_sha" SOURCE_CI_RUN="$ci_run_id"
 export PUBLISH_RUN_ID="$publish_run_id" PUBLISH_RUN_ATTEMPT="$publish_run_attempt"
 node scripts/image-release-provenance.mjs verify
