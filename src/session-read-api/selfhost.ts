@@ -62,7 +62,8 @@ export interface CatalogDeps {
 }
 
 export interface SelfhostDeps {
-  login: LoginExchange;
+  /** Absent (READ_API_AUTH_MODE=self_issued): POST /v1/cli/login is not registered; Control issues sessions instead. */
+  login?: LoginExchange;
   /** Absent: the catalog route answers 501 `catalog_not_configured`. */
   catalog?: CatalogDeps;
   /** Epoch ms; tests pin it. */

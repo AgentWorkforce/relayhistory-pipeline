@@ -200,9 +200,17 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
       "DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)",
     sql: column("sessions.session_summaries", "object_key"),
   },
+  "upstream:20261105043910_selfhost_session_selection_erase.sql": {
+    evidence: "CREATE FUNCTION: sessions.ingest_selfhost_set_session_uploads(jsonb) (self-host per-session erase)",
+    sql: "SELECT to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') IS NOT NULL AS applied",
+  },
   "upstream:20261105043900_session_consumer_function_grants.sql": {
     evidence: "twelve search_consumer_runtime EXECUTEs (composed writer path)",
     sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'",
+  },
+  "upstream:20261105044000_read_api_tokens.sql": {
+    evidence: "table sessions.read_api_tokens",
+    sql: relation("sessions.read_api_tokens"),
   },
 };
 

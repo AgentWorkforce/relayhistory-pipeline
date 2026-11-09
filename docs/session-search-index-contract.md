@@ -253,7 +253,7 @@ applies, and `session-directory-precedence.test.ts` pins:
   the pointer title returns on the next projection. With briefs off no row exists and
   this rule changes nothing.
 - **Short summary producers:** `writeShortSummary` never lets a non-brief producer
-  (Bob Costas's extractive summary) replace a `session-brief/*` summary; the brief
+  (Bob Costas's summary, extractive or model-written with `BOB_COSTAS_MODEL`) replace a `session-brief/*` summary; the brief
   replaces any summary not newer than it. Clearing (deletion, quarantine) still clears it.
 - **Deterministic ties:** latest `last_activity_at`, then highest `revision`, then
   highest `machine_id`.
