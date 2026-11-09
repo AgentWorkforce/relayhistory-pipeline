@@ -53,6 +53,7 @@ import {
 import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
+import { ANALYTICS_OFF, ANALYTICS_SINK_VAR, analyticsConfig, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
 import { serviceCanonicalDeps } from "./service-canonical.ts";
 import { digestEnabled, digestNarrativeModel, selfhostNarrativeFromEnv } from "./digest-narrative-selfhost.ts";
@@ -490,6 +491,12 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   if (authConfig.mode === "self_issued" && entry !== "service")
     throw new Error("session read api: READ_API_AUTH_MODE=self_issued is served only by the self-host service");
   const corsAllowedOrigins = entry === "service" ? readApiCorsOrigins(env) : undefined;
+  // Analytics (src/shared/analytics-config.ts), before the pool opens: the service takes the self-host
+  // profile (noop or collector, never PostHog). The Lambda has no analytics wiring, so a selection there
+  // is refused rather than silently ignored.
+  const analyticsSelection = entry === "service" ? analyticsConfig(env, "selfhost") : ANALYTICS_OFF;
+  if (entry !== "service" && !["", "noop", "none"].includes(env[ANALYTICS_SINK_VAR] ?? ""))
+    throw new Error(`session read api: ${ANALYTICS_SINK_VAR} is served only by the self-host service`);
   // Env only, before any pool opens: with READ_API_DIGEST_ENABLED=1 an invalid narrative model
   // id refuses the service. With the flag off no narrative variable is read.
   if (entry === "service" && digestEnabled(env)) digestNarrativeModel(env);
@@ -543,10 +550,18 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),
     log: (fields) => log.info("session read", fields),
   };
+  const analytics = createAnalyticsSink(analyticsSelection, "session-read-api", "service", {
+    report: (counters) => log.warn("analytics export degraded", analyticsCounterFields(analyticsSelection.sink, counters)),
+  });
+  if (analyticsSelection.sink !== "noop") deps.analytics = analytics;
   const writer = narrative;
   return {
     deps, authConfig,
-    close: writer ? async () => { await Promise.all([pool.end(), writer.close()]); } : () => pool.end(),
+    // The analytics shutdown flush first (bounded), then the pool and the narrative writer.
+    close: async () => {
+      await analytics.shutdown();
+      await (writer ? Promise.all([pool.end(), writer.close()]) : pool.end());
+    },
     ...(writer ? { digestNarrative: writer.deps } : {}),
   };
   } catch (error) { await narrative?.close().catch(() => {}); await pool.end(); throw error; }

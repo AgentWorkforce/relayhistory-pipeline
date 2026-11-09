@@ -82,6 +82,8 @@ import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
 import { SELFHOST_INGEST_ROLE, selfhostIngestConfig, type SelfhostIngestSettings } from "./selfhost-config.ts";
 import { isSessionErasePath } from "./session-erase.ts";
+import type { AnalyticsPort } from "../shared/analytics.ts";
+import { ANALYTICS_OFF, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 
 type FetchApp = { fetch(req: Request): Response | Promise<Response> };
 
@@ -166,6 +168,8 @@ export interface RuntimeParts {
   verify: (authorization: string | undefined) => Promise<IngestIdentity>;
   ready: () => Promise<boolean>;
   close: () => Promise<void>;
+  /** ANALYTICS_SINK=collector: the batch-completed events' port (closed by `close`). Absent: none. */
+  analytics?: AnalyticsPort;
 }
 
 /** Test seams for the async consumer; production passes none. */
@@ -197,6 +201,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   };
   // SESSION_ERASE_API_ENABLED (session-erase.ts): the same operator route in every admission mode.
   const sessionErase = settings.sessionErase ? { sessionErase: settings.sessionErase } : {};
+  // ANALYTICS_SINK=collector: the same port in every admission mode.
+  const analytics = parts.analytics ? { analytics: parts.analytics } : {};
   const routes: Readonly<Record<string, "GET" | "POST">> = sessionSelection || settings.heartbeatAccept === true
     ? Object.freeze({
       ...SELFHOST_INGEST_ROUTES,
@@ -207,7 +213,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const admission = settings.admission;
   if (!admission) {
     // SELFHOST_INGEST_ADMISSION=sync (the default): exactly the app this file always built.
-    const app = withSelfhostCapabilities(createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields), ...sessionErase }));
+    const app = withSelfhostCapabilities(createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields), ...sessionErase, ...analytics }));
     return { app, routes, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close, admissionMode: "sync" };
   }
   const mode = admission.mode === "async" ? "on" as const : "drain" as const;
@@ -232,6 +238,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
       selfhost: { identityOf: (request) => verified.get(request), reEnableRefusedByLedger: sessionSelection },
     },
     ...sessionErase,
+    ...analytics,
   }));
   if (options.startConsumer !== false) consumer.start();
   return {
@@ -425,6 +432,9 @@ export const productionRuntime: RuntimeBuilder = async (settings, env) => {
     // backend honours them, or refuse to start. Never run for sync (the default).
     await admissionStartupGate(settings, store);
     const verify = relaycontrolIngestIdentity(settings, selfhostIntrospector(settings, env));
+    const analytics = createAnalyticsSink(settings.analytics ?? ANALYTICS_OFF, "session-ingest", "service", {
+      report: (counters) => log.warn("analytics export degraded", analyticsCounterFields(analytics.destination, counters)),
+    });
     return selfhostIngestRuntime(settings, {
       run,
       store,
@@ -437,7 +447,9 @@ export const productionRuntime: RuntimeBuilder = async (settings, env) => {
           return false;
         }
       },
-      close: () => pool.end(),
+      // Shutdown flush first (bounded by SERVICE_LIMITS.shutdownMs, inside serve()'s 10 s exit), then the pool.
+      close: async () => { await analytics.shutdown(); await pool.end(); },
+      ...(analytics.destination !== "noop" ? { analytics } : {}),
     });
   } catch (error) {
     await pool.end().catch(() => {});
