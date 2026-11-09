@@ -1072,3 +1072,106 @@ test('independent: erased stale physical alias must preserve live canonical sibl
  await indexSearchScope({...scope,sessionId:'alias_a'},searchDeps(ch.ch,sb.transact));
  expect(ch.final().map(r=>r.content)).toContain('source B');
 });
+
+// SEARCH_INDEX_OUTPUT_FACTS: the same pass writes the Output facts; erasure removes them.
+const OUTPUT_CH_URL = process.env.READ_API_TEST_CLICKHOUSE_URL;
+(OUTPUT_CH_URL ? describe : describe.skip)("search index with outputFacts on a real ClickHouse", () => {
+  test("facts follow the pass (insert once, idempotent re-pass) and erasure; off writes none", async () => {
+    const { freshClickHouse } = await import("../../session-read-api/__tests__/support.ts");
+    const { outputFactsSchemaStatements, OUTPUT_FACTS_TABLE, EVENT_FACTS_TABLE } = await import("../output-facts-schema.ts");
+    const { readSessionOutput } = await import("../../session-read-api/output-query.ts");
+    const ch = await freshClickHouse();
+    try {
+      for (const s of outputFactsSchemaStatements()) await ch.command(s);
+      const count = async (t: string) => Number((await ch.select<{ n: string }>(`SELECT count() AS n FROM ${t} FINAL`))[0]!.n);
+      let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "first answer"), event("r2", "1", Date.parse(AT) + 1000, "second answer")])];
+      const sb = fakeSupabase(() => keys);
+      // Off: transcript_events only.
+      expect(await indexSearchScope(scope, searchDeps(ch, sb.transact))).toMatchObject({ complete: true, inserted: 2 });
+      expect(await count(EVENT_FACTS_TABLE) + await count(OUTPUT_FACTS_TABLE)).toBe(0);
+      const on = { ...searchDeps(ch, sb.transact), outputFacts: true };
+      const first = await indexSearchScope(scope, on);
+      expect(first).toMatchObject({ complete: true, outputFacts: { inserted: 4, deleted: 0 } });
+      expect(await indexSearchScope(scope, on)).toMatchObject({ complete: true, outputFacts: { inserted: 0, deleted: 0 } });
+      expect(await readSessionOutput(ch, { orgId: scope.orgId, workspaceIds: [scope.workspaceId] })).toMatchObject({ agentMessages: 2, commits: 0 });
+      const facts = async () => (await ch.select<{ complete: number }>("SELECT complete FROM output_facts_session_state FINAL")).map((r) => Number(r.complete));
+      expect(await facts()).toEqual([1]);
+      // A partial read records the facts as owed, separately from search's needs_full.
+      expect(await indexSearchScope(scope, { ...on, limits: { maxScopeEvents: 1 } })).toMatchObject({ complete: false, partial: true });
+      expect(await facts()).toEqual([0]);
+      expect(await indexSearchScope(scope, on)).toMatchObject({ complete: true, outputFacts: { complete: true } });
+      expect(await facts()).toEqual([1]);
+      keys = [];
+      expect(await indexSearchScope(scope, on)).toMatchObject({ complete: true, reasons: ["erased"] });
+      expect(await count(EVENT_FACTS_TABLE) + await count(OUTPUT_FACTS_TABLE)).toBe(0);
+    } finally {
+      await ch.drop();
+    }
+  }, 120_000);
+
+  test("P1-e: erasure purges existing fact tables even with the flag OFF", async () => {
+    const { freshClickHouse } = await import("../../session-read-api/__tests__/support.ts");
+    const { outputFactsSchemaStatements, OUTPUT_FACTS_TABLE, EVENT_FACTS_TABLE } = await import("../output-facts-schema.ts");
+    const ch = await freshClickHouse();
+    try {
+      for (const st of outputFactsSchemaStatements()) await ch.command(st);
+      const count = async (t: string) => Number((await ch.select<{ n: string }>(`SELECT count() AS n FROM ${t} FINAL`))[0]!.n);
+      let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "answer")])];
+      const sb = fakeSupabase(() => keys);
+      await indexSearchScope(scope, { ...searchDeps(ch, sb.transact), outputFacts: true });
+      expect(await count(EVENT_FACTS_TABLE) + await count(OUTPUT_FACTS_TABLE)).toBeGreaterThan(0);
+      keys = [];
+      expect(await indexSearchScope(scope, searchDeps(ch, sb.transact))).toMatchObject({ complete: true, reasons: ["erased"] });
+      expect(await count(EVENT_FACTS_TABLE) + await count(OUTPUT_FACTS_TABLE)).toBe(0);
+    } finally {
+      await ch.drop();
+    }
+  }, 120_000);
+
+  test("P1-d: a pass that dies between its fact writes and its final state leaves the scope incomplete", async () => {
+    const { freshClickHouse } = await import("../../session-read-api/__tests__/support.ts");
+    const { outputFactsSchemaStatements, OUTPUT_FACTS_TABLE } = await import("../output-facts-schema.ts");
+    const ch = await freshClickHouse();
+    try {
+      for (const st of outputFactsSchemaStatements()) await ch.command(st);
+      const keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "answer")])];
+      const sb = fakeSupabase(() => keys);
+      const torn: ClickHouseClient = {
+        database: ch.database,
+        command: (q, o) => ch.command(q, o),
+        select: (q, o) => ch.select(q, o),
+        insert: async (table, rows, o) => {
+          if (table === OUTPUT_FACTS_TABLE) throw new Error("crash after event facts were written");
+          return ch.insert(table, rows, o);
+        },
+      };
+      await expect(indexSearchScope(scope, { ...searchDeps(torn, sb.transact), outputFacts: true })).rejects.toThrow("crash");
+      const state = await ch.select<{ complete: number }>("SELECT complete FROM output_facts_session_state FINAL");
+      expect(state.map((r) => Number(r.complete))).toEqual([0]);
+      // The next good pass makes it complete again.
+      expect(await indexSearchScope(scope, { ...searchDeps(ch, sb.transact), outputFacts: true })).toMatchObject({ outputFacts: { complete: true } });
+      expect((await ch.select<{ complete: number }>("SELECT complete FROM output_facts_session_state FINAL")).map((r) => Number(r.complete))).toEqual([1]);
+      // P3: every pass here runs at the same fixed `now`; versions still strictly increase.
+      const v1 = Number((await ch.select<{ v: string }>("SELECT max(version) AS v FROM output_facts_session_state"))[0]!.v);
+      await indexSearchScope(scope, { ...searchDeps(ch, sb.transact), outputFacts: true });
+      const v2 = Number((await ch.select<{ v: string }>("SELECT max(version) AS v FROM output_facts_session_state"))[0]!.v);
+      expect(v2).toBeGreaterThan(v1);
+    } finally {
+      await ch.drop();
+    }
+  }, 120_000);
+
+  test("flag on before the DDL: no fact write, a clear reason, and search is unaffected", async () => {
+    const { freshClickHouse } = await import("../../session-read-api/__tests__/support.ts");
+    const ch = await freshClickHouse();
+    try {
+      const keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "answer")])];
+      const sb = fakeSupabase(() => keys);
+      expect(await indexSearchScope(scope, { ...searchDeps(ch, sb.transact), outputFacts: true })).toMatchObject({
+        complete: true, inserted: 1, outputFacts: { inserted: 0, complete: false, reasons: ["output_facts_schema_missing"] },
+      });
+    } finally {
+      await ch.drop();
+    }
+  }, 120_000);
+});

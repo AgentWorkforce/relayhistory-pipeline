@@ -2368,25 +2368,28 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const BK = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
     const V = "upstream:20261105044030_ingest_generation_overlap.sql";
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
+    const TK = "upstream:20261105044000_read_api_tokens.sql";
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
     const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
     const SP = "upstream:20261105044050_selfhost_erase_short_summary_provenance.sql";
     const ST = "upstream:20261105044070_selfhost_erase_search_text_rebuild.sql";
     const CS = "upstream:20261105044080_ingest_claim_sessions.sql";
     const CR = "upstream:20261105044090_claim_sessions_reader.sql";
+    const DG = "upstream:20261105045000_digest_narrative_cache.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, TK, CB, V, SF, SP, ST, CS, CR, DG]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, V]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, TK, V, DG]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
@@ -2422,10 +2425,18 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
+    // 20261105045000 (digest narrative cache) is the newest: its own down drops the table first, with assertions.
+    // (044090/044100 roll back next via the successor helper below; DG is excluded there since it is already gone.)
+    expect(await names()).toContain(DG);
+    expect(await relation("sessions.daily_digest_narratives")).toBe("sessions.daily_digest_narratives");
+    await rollback("20261105045000_digest_narrative_cache.down.sql");
+    expect(await names()).not.toContain(DG);
+    expect(await relation("sessions.daily_digest_narratives")).toBeNull();
     // A successor such as the read-only summary RPC must roll back first.
     // Preserve an explicit out-of-order refusal before using every successor's
     // guarded down script, so newer additive lanes need no fixture rewrites.
-    const newerThanClaimReaders = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > CR).reverse();
+    // (DG is already rolled back with assertions above, so it is excluded here.)
+    const newerThanClaimReaders = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > CR && s.name !== DG).reverse();
     if (newerThanClaimReaders.length)
       expect((await failure(rollback("20261105044090_claim_sessions_reader.down.sql")))?.code).toBe("55000");
     for (const { name } of newerThanClaimReaders)
@@ -2574,7 +2585,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toContain(SL);
     expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBe("sessions.ingest_seed_captures_org_id_idx");
-    // Every later upstream step is already rolled back here (including 044030 and its successors above).
+    // Every later upstream step is already rolled back here (045000, 044100, 044090, 044040 and 044030, explicitly above), so no helper call.
     const laterNames = (await plan(SUPA_ET)).filter((s) => s.name.startsWith("upstream:") && s.name > CB).map((s) => s.name);
     expect((await names()).filter((n) => laterNames.includes(n))).toEqual([]);
     await rollback("20261105044020_claim_bootstrap_org_indexes.down.sql");
@@ -2775,6 +2786,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await passed()).toBe(false);
     expect((await failure(rollback("20261105038000_claim_attempt_records_retirement.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(T);
+    // 045000 (lane F4 digest narratives) was already rolled back newest-first at the
+    // top of this test via rollbackLaterThan044020 (it was the latest lane); its table stays gone.
+    expect(await names()).not.toContain(DG);
+    expect(await relation("sessions.daily_digest_narratives")).toBeNull();
+    // 039000 (buffered GC) is now the latest lane: it rolls back directly.
+    expect(await names()).toContain(G);
     await rollback("20261105039000_buffered_gc_single_candidate.down.sql");
     expect(await names()).not.toContain(G);
     expect(await passed()).toBe(false);
@@ -2982,8 +2999,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
 
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
-    // Newer than 043900, so its down refuses until they are rolled back, newest first: every upstream step after
-    // 044020 (rollbackLaterThan044020: 044090, 044080, 044070, 044050, 044040, 044030), then 044020, 044010, 044000, 043910.
+    // Newer than 043900, so the grants' down refuses until they are rolled back,
+    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 045000, 044100, 044090, 044080, 044070, 044050, 044040, 044030),
+    // then 044020 (claim-bootstrap indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
     const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105044000_read_api_tokens.down.sql"), "utf8");
@@ -3190,12 +3208,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'search_consumer_runtime', 'bulls96_acquisition_installer', 'buffered_search_feed_runtime')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_digest_narrative', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'search_consumer_runtime', 'bulls96_acquisition_installer', 'buffered_search_feed_runtime')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(15);
+    expect(targets.rows).toHaveLength(16);
     const trampolined = targets.rows.filter(r => r.rolname !== "search_consumer_runtime");
-    expect(trampolined).toHaveLength(14);
+    expect(trampolined).toHaveLength(15);
     expect(trampolined.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
     // The owner-created consumer carries exactly the creator edge: the owner
     // as member WITH ADMIN, neither INHERIT nor SET.
@@ -4572,7 +4590,9 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
     VALUES('org-title','ws-title','codex','session-title','machine-title','user-title',now(),now(),'fs','bucket','manifest/title',
     decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18',1,'Pointer retained')`);
   const preserved=async()=>expect((await db.query<{title:string}>("SELECT title FROM sessions.session_index WHERE session_id='session-title'")).rows).toEqual([{title:"Pointer retained"}]);
-  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(1);
+  // Newer additive lanes on this branch (045000 digest) also apply on a full upgrade;
+  // expect exactly the pending steps, which is 1 where 044100 is newest.
+  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(full.length - previous.steps.length);
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);await preserved();
   const acl=await db.query<{secdef:boolean;acl:string[]}>(`SELECT p.prosecdef AS secdef,
     ARRAY(SELECT CASE WHEN a.grantee=p.proowner THEN '<owner>' ELSE coalesce(r.rolname,'PUBLIC') END||':'||a.privilege_type
@@ -4583,10 +4603,16 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
   const ledgerBefore=await ledgerHash();
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(0);
   expect(await ledgerHash()).toBe(ledgerBefore);await preserved();
+  // Branches with lanes newer than 044100 (045000 digest here) roll back newest-first:
+  // the 044100 down script refuses while a later migration is applied.
+  // (Literal name, not the DG const: this test lives outside that const's describe.)
+  if (full.some((s) => s.name === "upstream:20261105045000_digest_narrative_cache.sql")) await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105045000_digest_narrative_cache.down.sql"),"utf8"));
   await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105044100_session_brief_summary_read.down.sql"),"utf8"));
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(false);await preserved();
   expect((await db.query("SELECT name FROM sessions.__96bulls_migrations WHERE name=$1",[name])).rows).toEqual([]);
-  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(1);await preserved();
+  // Re-applies exactly what was rolled back above (044100 alone where it is newest,
+  // 044100 + 045000 on branches with newer lanes).
+  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(full.length - previous.steps.length);await preserved();
   const freshDb=await supabaseLike();await freshDb.exec(ET_BOOT);
   expect(await failure(runMigrations(client(freshDb),{profile:SUPA_ET,steps:full}))).toBeNull();
   expect((await freshDb.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);

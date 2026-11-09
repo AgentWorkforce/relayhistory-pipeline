@@ -130,6 +130,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Read-role-only summary RPC, recorded-title metadata column and invoker trigger;
       // no ingest RPC is replaced or calls them.
       "20261105044100_session_brief_summary_read.sql",
+      // The digest narrative cache table, its purge function and read API functions only; no ingest path touches them.
+      "20261105045000_digest_narrative_cache.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
@@ -151,7 +153,14 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
     const bodies = (await f.db.query<{ proname: string; prosrc: string }>("SELECT p.proname, p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema')")).rows;
     const names = [...OBJECTS.newFunctions, ...OBJECTS.newTables, "acquisition_epoch"];
     const hits = bodies.flatMap((b) => names.filter((x) => new RegExp(`\\b${x}\\b`, "i").test(b.prosrc)).map((x) => `${b.proname} -> ${x}`));
-    expect(hits).toEqual([]);
+    // 041000's derived purge names the digest objects only through its guarded integration
+    // (to_regprocedure/to_regclass presence checks, ABI-mismatch on partial presence, no-op when
+    // absent): not a swallowed 42883. Everything else must stay clean.
+    const guarded = new Set([
+      "ingest_privacy_authority_purge_derived -> purge_daily_digest_narratives",
+      "ingest_privacy_authority_purge_derived -> daily_digest_narratives",
+    ]);
+    expect(hits.filter((h) => !guarded.has(h))).toEqual([]);
     expectClean(f.undefinedObjects);
   });
 

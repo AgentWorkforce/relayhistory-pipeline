@@ -17,6 +17,7 @@ import { sessionDirectoryDocumentPool } from "./session-directory-document-pool.
 import { claimRecordsRetirement } from "./claim-records-retirement.ts";
 import { canonicalProjectEvents } from "./canonical-project-events.ts";
 import { desktopCatalog } from "./desktop-catalog.ts";
+import { digestNarratives } from "./digest-narratives.ts";
 import { ingestHistory } from "./ingest-history.ts";
 import { readApi } from "./read-api.ts";
 import { readApiTokens } from "./read-api-tokens.ts";
@@ -33,4 +34,4 @@ import { ingestClaimSessions } from "./ingest-claim-sessions.ts";
 import { ingestClaimSessionsReader } from "./ingest-claim-sessions-reader.ts";
 
 /** Every lane the unified generator composes. Order does not affect the output. */
-export const LANES: readonly LaneManifest[] = [briefSummary, briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, ingestGenerationOverlap, bufferedStagesSessionFirst, selfhostEraseShortSummaryProvenance, selfhostEraseSearchTextRebuild, ingestClaimSessions, ingestClaimSessionsReader];
+export const LANES: readonly LaneManifest[] = [briefSummary, briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, ingestGenerationOverlap, bufferedStagesSessionFirst, selfhostEraseShortSummaryProvenance, selfhostEraseSearchTextRebuild, ingestClaimSessions, ingestClaimSessionsReader, digestNarratives];

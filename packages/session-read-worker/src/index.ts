@@ -17,8 +17,13 @@
  * Worker's own origin, the only audience accepted; unset = every /v1 request
  * 401), READ_API_COMPLETE_SINCE (ISO timestamp or "epoch"; missing = 503),
  * CLICKHOUSE_DATABASE, READ_API_DIRECTORY_WORKSPACES (the directory list/activity
- * and timing canary allowlist; unset = none), READ_API_BRIEF_TITLES_WORKSPACES (the
- * brief-titles allowlist; unset = none), READ_API_TIMING_ASSUME_NO_TURNS, and
+ * and timing canary allowlist; unset = none), READ_API_TIMING_ASSUME_NO_TURNS,
+ * READ_API_OUTPUT_ENABLED ("1" only: GET /v1/sessions/output from the ClickHouse facts,
+ * which needs the owner-applied output-facts DDL; default off = 501),
+ * READ_API_DIGEST_ENABLED ("1" only: GET /v1/digest/daily; its narrative needs migration
+ * 20261105045000 and the DIGEST_NARRATIVE service binding, without which every miss is
+ * `provider_not_configured`; default off = 501),
+ * READ_API_BRIEF_TITLES_WORKSPACES (the brief-titles allowlist; unset = none), and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve), and
  * RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS with RELAYCONTROL_INTROSPECT_URL /
@@ -75,6 +80,7 @@ import { logLine, type Level } from "../../../src/shared/log.ts";
 import { createClickHouseClient, type ClickHouseClient, type RequestOptions } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-read-api/app.ts";
 import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
+import { serviceNarrativeGenerator, sqlNarrativeCache } from "../../../src/session-read-api/digest-narrative.ts";
 import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
@@ -118,6 +124,12 @@ export interface Env extends CanonicalEnv {
   READ_API_BRIEF_TITLES_WORKSPACES?: string;
   /** "true": time a session without legacy turn evidence as having none (session-timing-source.ts). */
   READ_API_TIMING_ASSUME_NO_TURNS?: string;
+  /** "1": serve GET /v1/sessions/output from the ClickHouse facts; anything else = 501 output_not_configured. */
+  READ_API_OUTPUT_ENABLED?: string;
+  /** "1": serve GET /v1/digest/daily; anything else = 501 digest_not_configured. */
+  READ_API_DIGEST_ENABLED?: string;
+  /** The digest narrative Worker (wrangler.digest-narrative.jsonc), bound at activation only. */
+  DIGEST_NARRATIVE?: Fetcher;
   /** Babysitter evidence reader (GET /v1/delivery/records for its kinds): only "on" enables; default off. */
   READ_API_BABYSITTER_EVIDENCE?: string;
   /** The ingest key root the retention buckets live under (default 96bulls). */
@@ -394,6 +406,10 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     liveness: sqlLiveness(tenant.run),
     directory: sqlDirectory(tenant.run),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
+    ...(env.READ_API_OUTPUT_ENABLED?.trim() === "1" ? { output: { enabled: true as const } } : {}),
+    ...(env.READ_API_DIGEST_ENABLED?.trim() === "1"
+      ? { digest: { cache: sqlNarrativeCache(tenant.run), ...(env.DIGEST_NARRATIVE ? { generator: serviceNarrativeGenerator(env.DIGEST_NARRATIVE) } : {}) } }
+      : {}),
     briefTitles: sqlBriefTitles(tenant.run),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,

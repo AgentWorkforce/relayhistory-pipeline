@@ -50,6 +50,7 @@ import { chNow, deleteRows, windowStart, type PendingDelete } from "./vendor/sea
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
 import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
+import { eraseOutputFacts, outputFactsFromScope, outputFactsSchema, passVersion, previousOutputFactsState, reconcileOutputFacts, recordOutputFactsState, type OutputFactsScope } from "./output-facts.ts";
 import { adapterProjectionIo, type SearchProjectionIo, type SearchServiceBinding } from "./search-adapter.ts";
 /** Kept in sync with buffered-search-feed.ts (not imported: that module pulls in the ingest stage reader). */
 const BUFFERED_FINGERPRINT_PREFIX = "bf";
@@ -79,6 +80,16 @@ export interface SearchIndexDeps {
   /** Test seam (replaces the writer `desktopCatalog` selects); production writes the catalog in the same Supabase transaction. */
   writeCatalog?: typeof writeDirectoryCatalog;
   writeEvents?: typeof writeDirectoryEvents;
+  /**
+   * SEARCH_INDEX_OUTPUT_FACTS=1 only: also reconcile `transcript_event_facts` and
+   * `session_output_facts` (output-facts.ts) in this pass, under the same lock.
+   * Needs the owner-applied output-facts DDL. Every pass records the scope's facts
+   * state (complete or not) in `output_facts_session_state`, separate from the search
+   * state, so the Output route answers 501 for an inexact scope rather than a stale
+   * count, and a facts problem never marks the session `needs_full` for search.
+   * Absent or false: no fact table is touched.
+   */
+  outputFacts?: boolean;
 }
 
 export interface SearchIndexLimits {
@@ -133,6 +144,8 @@ export interface SearchIndexResult {
   busy?: boolean;
   /** Too large to index whole: no rows written, its index state marked partial. */
   partial?: boolean;
+  /** Present only with `outputFacts`: fact rows inserted and deleted, and whether they are exact. */
+  outputFacts?: { inserted: number; deleted: number; complete: boolean; reasons: string[] };
 }
 
 interface ScopeIdentity {
@@ -247,6 +260,8 @@ async function livePointerSnapshot(tx: SqlExecutor, scope: SessionScope): Promis
 
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
   if (Boolean(deps.ch) === Boolean(deps.adapter)) throw new Error("search requires exactly one service binding");
+  // The Output/digest facts are ClickHouse tables: a portable adapter has no home for them.
+  if (deps.outputFacts && !deps.ch) throw new Error("output facts require the ClickHouse search binding");
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
   return deps.transact(async (tx) => {
@@ -284,6 +299,19 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       // out of the window. One predicate delete, no listing, so no size can
       // truncate it. It throws on failure and the message retries.
       await io.erase(scope,pointerSnapshot.canonicalId);
+      // Erasure purges the fact tables whenever they exist, flag or not: turning the producer
+      // off must never leave an erased session's facts behind.
+      if (deps.ch) {
+        const schema = await outputFactsSchema(deps.ch);
+        if (schema.present) {
+          const fScope = factsScope(scope, pointerSnapshot.canonicalId);
+          await eraseOutputFacts(deps.ch, fScope);
+          if (schema.ready) {
+            const prior = await previousOutputFactsState(deps.ch, fScope);
+            await recordOutputFactsState(deps.ch, fScope, true, at, null, "final", passVersion(at, prior.version));
+          }
+        }
+      }
       await io.record(scope,0,0,true,at,pointerSnapshot.canonicalId);
       await completeErasedDirectoryEvents(tx,scope);
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
@@ -293,6 +321,13 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
       await invalidateDirectoryEvents(tx,scope);
       await io.record(scope,s3.revision,0,false,at,pointerSnapshot.canonicalId);
+      // The facts are not rewritten from a partial read: they now owe a pass too (over the
+      // span they last covered, so only windows that span overlaps are refused).
+      if (deps.outputFacts && (await outputFactsSchema(deps.ch!)).ready) {
+        const fScope = factsScope(scope, pointerSnapshot.canonicalId);
+        const prior = await previousOutputFactsState(deps.ch!, fScope);
+        await recordOutputFactsState(deps.ch!, fScope, false, at, prior.range, "final", passVersion(at, prior.version));
+      }
       return {manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]};
     }
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
@@ -346,6 +381,34 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       if(written.written)await (deps.writeCatalog??directoryCatalogWriter(deps.desktopCatalog===true))(tx,directoryKey,s3.catalog,{expectedEpoch:pointerSnapshot.epoch,sourceSessionId:scope.sessionId});
       else {complete=false;s3.reasons.push("directory_event_sources_changed");await invalidateDirectoryEvents(tx,scope);}
     }
+    let outputFacts: SearchIndexResult["outputFacts"];
+    if (deps.outputFacts) {
+      // The whole scope (not the transcript window), from the same validated read. An
+      // incomplete pass inserts what it read and deletes nothing.
+      // Every session id this pass saw (scope, canonical, and any owner/alias id a projected event
+      // carries): the facts are all written under the canonical id, and the state rows, the delete
+      // filter and the route's readiness join all use this same set.
+      const fScope = factsScope(scope, pointerSnapshot.canonicalId, s3.projectionRows);
+      if (!(await outputFactsSchema(deps.ch!)).ready) {
+        // Flag on before the owner applied the DDL (or an older skeleton): write nothing, say why.
+        // Search is unaffected; the Output route has no state rows and refuses.
+        outputFacts = { inserted: 0, deleted: 0, complete: false, reasons: ["output_facts_schema_missing"] };
+      } else {
+        // Strictly increasing per scope, even for two passes in one ms (fact rows and state alike).
+        const prev = await previousOutputFactsState(deps.ch!, fScope);
+        const base = passVersion(at, prev.version);
+        const facts = outputFactsFromScope(fScope, { projectionRows: s3.projectionRows, records: s3.records, complete }, base);
+        const range = facts.range ?? null;
+        // Pending first: the ClickHouse inserts and deletes are not transactional, so a pass that
+        // dies mid-reconcile must leave the scope incomplete, never complete over torn facts.
+        const prior = prev.range;
+        const span = prior && range ? { min: prior.min < range.min ? prior.min : range.min, max: prior.max > range.max ? prior.max : range.max } : (range ?? prior);
+        await recordOutputFactsState(deps.ch!, fScope, false, at, span, "pending", base);
+        const r = await reconcileOutputFacts(deps.ch!, fScope, facts, { maxRows: limits.maxRows, insertBatch: limits.insertBatch });
+        outputFacts = { inserted: r.inserted, deleted: r.deleted, complete: r.complete, reasons: r.reasons };
+        await recordOutputFactsState(deps.ch!, fScope, r.complete, at, r.complete ? range : span, "final", base);
+      }
+    }
     // Only a complete pass makes the session current; any other leaves it owing one.
     await io.record(scope, s3.revision, inWindow.length, complete, at, pointerSnapshot.canonicalId);
     return {
@@ -355,8 +418,20 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       deleted: deletedCount,
       complete,
       reasons: [...s3.reasons, ...(truncated ? [deps.adapter ? "search_index_truncated" : "clickhouse_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
+      ...(outputFacts ? { outputFacts } : {}),
     };
   });
+}
+
+function factsScope(scope: SessionScope, canonicalId: string, projectionRows: Array<{ table: string; row: Record<string, unknown> }> = []): OutputFactsScope {
+  const seen = projectionRows.filter((r) => r.table === "convergence_events" && typeof r.row.session_id === "string").map((r) => r.row.session_id as string);
+  return {
+    orgId: scope.orgId,
+    workspaceId: scope.workspaceId,
+    harness: scope.harness,
+    sessionIds: [...new Set([scope.sessionId, canonicalId, ...seen])],
+    canonicalId,
+  };
 }
 
 /** Preserve the existing SQL, retention and state behavior for an unselected
