@@ -229,6 +229,43 @@ describe("entry and configuration", () => {
     }
   });
 
+  test("READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY and _PHASE_LOG: default off leaves the deps unchanged; 2..32 and exactly \"1\" set them; a bad concurrency is a 503", async () => {
+    const run = (async () => {
+      throw new Error("no database in this test");
+    }) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "ws-a", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    const keysOf = (d: object | undefined) => Object.keys(d ?? {}).sort();
+    const base = ownerBufferedDeps({ ...E, ...keys } as Env, run);
+    expect("stageConcurrency" in base!).toBe(false);
+    expect("phaseLog" in base!).toBe(false);
+    for (const flag of [undefined, "", "0", "1"]) {
+      const d = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY: flag } as Env, run);
+      expect(keysOf(d), String(flag)).toEqual(keysOf(base));
+    }
+    for (const flag of [undefined, "", "0", "true", "on", " 1"]) {
+      const d = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_PHASE_LOG: flag } as Env, run);
+      expect(keysOf(d), String(flag)).toEqual(keysOf(base));
+    }
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY: "2" } as Env, run)?.stageConcurrency).toBe(2);
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY: "32" } as Env, run)?.stageConcurrency).toBe(32);
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_PHASE_LOG: "1" } as Env, run)?.phaseLog).toBe(true);
+    // Neither flag enables owner-buffered reads on its own.
+    expect(ownerBufferedDeps({ ...E, ...keys, RELAYHISTORY_READ_OWNER_BUFFERED: undefined, READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY: "8", READ_API_OWNER_BUFFERED_PHASE_LOG: "1" } as Env, run)).toBeUndefined();
+
+    const t = tenant();
+    const call = async (over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions/s-x/events?workspace=${t.ws}&source=claude`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    for (const bad of ["33", "02", "-2", "2.0", " 4", "on", "true"]) {
+      const r = await call({ READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY: bad });
+      expect(r.status, bad).toBe(503);
+      expect((await body(r)).error.code).toBe("backend_unavailable");
+    }
+  });
+
   test("all-workspaces mode without the HISTORY_CONTROL_HEAD binding is the same 503; bound, it is not refused", async () => {
     const t = tenant();
     const call = async (over: Partial<Env>) => {
