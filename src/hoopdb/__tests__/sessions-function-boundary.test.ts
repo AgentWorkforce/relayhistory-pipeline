@@ -19,6 +19,7 @@ import { bufferedSearchGateRetiredWitness, originalGateBody } from "../../../scr
 import { createHash } from "node:crypto";
 import { ingestGenerationOverlap, originalBodies as originalOverlapBodies } from "../../../scripts/sessions-function-boundary/lanes/ingest-generation-overlap.ts";
 import { ingestClaimSessions } from "../../../scripts/sessions-function-boundary/lanes/ingest-claim-sessions.ts";
+import { ingestClaimSessionsReader } from "../../../scripts/sessions-function-boundary/lanes/ingest-claim-sessions-reader.ts";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
 import { run } from "../../../scripts/sync-sessions-function-boundary.ts";
@@ -80,6 +81,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105044050_selfhost_erase_short_summary_provenance.down.sql",
       "supabase/rollbacks/20261105044070_selfhost_erase_search_text_rebuild.down.sql",
       "supabase/rollbacks/20261105044080_ingest_claim_sessions.down.sql",
+      "supabase/rollbacks/20261105044090_claim_sessions_reader.down.sql",
     ]);
   });
 
@@ -96,6 +98,28 @@ describe("unified sessions function-boundary generator", () => {
     expect(down).toContain(createHash("sha256").update(readFileSync(join(root, ingestClaimSessions.migration!), "utf8")).digest("hex"));
     expect(down.indexOf("own applied checksum required")).toBeLessThan(down.indexOf("DROP TRIGGER ingest_claim_sessions_sync ON sessions.ingest_claim_attempts;"));
     expect(down).toContain("a later migration is applied");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 044090 claim sessions reader lane adds one owner-only trigger function, keeps the replaced ACLs, grants nothing, and derives its guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== ingestClaimSessionsReader), VERIFIERS);
+    expect(withLane.summary.lanes["ingest-claim-sessions-reader"]).toEqual({ functions: 1, replaces: 3, grants: 0 });
+    for (const v of VERIFIERS) expect(withLane.outputs[v.path]).toBe(without.outputs[v.path]);
+    const acl = JSON.parse(withLane.outputs["src/hoopdb/sessions-function-acl.json"]!).functions as Record<string, string[]>;
+    const before = JSON.parse(without.outputs["src/hoopdb/sessions-function-acl.json"]!).functions as Record<string, string[]>;
+    const mine = Object.keys(acl).filter((k) => k.startsWith("sessions.ingest_batch_claim_sessions_")).sort();
+    expect(mine).toEqual(["sessions.ingest_batch_claim_sessions_refresh()"]);
+    expect(acl["sessions.ingest_batch_claim_sessions_refresh()"]).toEqual(["<owner>:EXECUTE"]);
+    // The replaced readers and guard keep exactly their prior ACLs (CREATE OR REPLACE, no GRANT).
+    for (const k of Object.keys(ingestClaimSessionsReader.replaces)) expect([k, acl[k]]).toEqual([k, before[k]]);
+    const down = withLane.outputs["supabase/rollbacks/20261105044090_claim_sessions_reader.down.sql"]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, ingestClaimSessionsReader.migration!), "utf8")).digest("hex"));
+    expect(down.indexOf("own applied checksum required")).toBeLessThan(down.indexOf("CREATE OR REPLACE FUNCTION sessions.buffered_sessions_for("));
+    expect(down.indexOf("CREATE OR REPLACE FUNCTION sessions.ingest_claim_sessions_policy_guard()")).toBeLessThan(down.indexOf("DROP COLUMN read_enabled"));
+    expect(down).toContain("DROP TRIGGER ingest_batch_claim_sessions_refresh ON sessions.ingest_batches;");
+    expect(down).toContain("a later migration is applied");
+    expect(down).not.toContain("read_enabled:=false");
     expect(down.trim().endsWith("COMMIT;")).toBe(true);
   });
 

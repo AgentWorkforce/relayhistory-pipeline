@@ -101,8 +101,9 @@ test("enabled: exactly the distinct (source, session_id) pairs; duplicates colla
  const c=await f.claim(records);
  expect(await f.pairs(c.token)).toEqual([["claude","s-1"],["claude","s-2"],["codex","s-1"]]);
  const row=(await f.db.query<any>("SELECT org_id,workspace_id,user_id,origin_id,batch_id,digest,reset_epoch::int AS reset_epoch,accepted_at FROM sessions.ingest_claim_sessions WHERE claim_token=$1 LIMIT 1",[c.token])).rows[0];
- // The claim is written before its batch commits, so the trigger finds no committed batch: accepted_at NULL.
- expect(row).toEqual({org_id:T.orgId,workspace_id:T.workspaceId,user_id:T.userId,origin_id:origin,batch_id:c.batch,digest:hash(c.batch),reset_epoch:7,accepted_at:null});
+ // The claim is written before its batch commits, so the writer trigger finds no committed batch (NULL); since
+ // 044090 the commit-time refresh on ingest_batches then sets accepted_at to the batch's committed_at.
+ expect(row).toEqual({org_id:T.orgId,workspace_id:T.workspaceId,user_id:T.userId,origin_id:origin,batch_id:c.batch,digest:hash(c.batch),reset_epoch:7,accepted_at:new Date("2026-11-05T10:00:00Z")});
  // Empty and NULL records write nothing.
  const empty=await f.claim([]),none=await f.claim(null);
  expect(await f.pairs(empty.token)).toEqual([]);expect(await f.pairs(none.token)).toEqual([]);
@@ -203,7 +204,8 @@ test("backfill reconciles: stale rows of a claim retired while the writer was of
  expect(await f.pairs(a.token)).toEqual([["claude","s-1"]]); // writer off: stale
  await f.enable(true);
  const r=await f.backfill();
- expect(r).toMatchObject({claimsScanned:2,rowsInserted:0,rowsRefreshed:1,rowsDeleted:1,completionMarked:true});
+ // rowsRefreshed 0: b's accepted_at was already set by 044090's commit-time refresh (the writer was on at commit).
+ expect(r).toMatchObject({claimsScanned:2,rowsInserted:0,rowsRefreshed:0,rowsDeleted:1,completionMarked:true});
  expect(await f.pairs(a.token)).toEqual([]);
  expect(await f.pairs(b.token)).toEqual([["claude","s-2"]]);
  expect((await f.db.query<{a:string}>("SELECT accepted_at::text a FROM sessions.ingest_claim_sessions WHERE claim_token=$1",[b.token])).rows[0]!.a).toBe("2026-11-05 10:00:00+00");
