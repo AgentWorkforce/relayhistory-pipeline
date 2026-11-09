@@ -6,6 +6,7 @@ import { join } from "node:path";
 // Minimal SQL-only mask builder (history-mask-v1): leaves sorted by sha256(recordId); a 16-way
 // root node above 500 records. Mirrors ingest_history_mask_register's own validation.
 import { createHash } from "node:crypto";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 const shaHex = (s: string) => createHash("sha256").update(s).digest("hex");
 async function registerMask(reg: (doc: unknown) => Promise<any>, orgId: string, workspaceId: string, recordIds: string[]) {
   const sorted = [...recordIds].sort((a, b) => (shaHex(a) < shaHex(b) ? -1 : 1));
@@ -28,7 +29,7 @@ beforeAll(async () => {
   await admin.query("CREATE DATABASE " + name); const u = new URL(url); u.pathname = "/" + name;
   pool = new pg.Pool({ connectionString: u.href, max: 16 });
   await pool.query(read("supabase/tests/supabase_shim.sql")); await pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");
-  for (const f of ["session_directory_search_worker.sql", "session_token_verifier.sql", "session_ingest_roles.sql"]) await pool.query(read("supabase/bootstrap/" + f));
+  for (const f of SESSION_BOOTSTRAP_FILES) await pool.query(read(f));
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await pool.query(read("supabase/migrations/" + f));
   await pool.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now())");
   await pool.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status)VALUES('session_directory_search_worker',$1,'pass')", [gen]);

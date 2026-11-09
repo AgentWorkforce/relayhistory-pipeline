@@ -33,9 +33,12 @@ import {
   pgClass,
   searchRpcRequest,
 } from "../search-query.ts";
+import { runMigrations } from "../migrate.ts";
+import { replayDatabase } from "../../session-pipeline/__tests__/replay-fixture.ts";
 import type { HoopDb } from "../../shared/db.ts";
 import { hoopDbSessionIndex } from "../index.ts";
 import { projectSessionDirectory } from "../session-directory-projector.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 import {
   SESSION_DIRECTORY_SEARCH_BOUNDARY,
   SESSION_DIRECTORY_SEARCH_RPC,
@@ -103,9 +106,7 @@ async function database(prelude = ""): Promise<PGlite> {
   const db = new PGlite({ extensions: { auto_explain, btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
-  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
-  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   if (prelude) await db.exec(prelude);
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
@@ -2304,7 +2305,14 @@ describe("short_summary end to end through the pipeline", () => {
 
 describe("short_summary rollback", () => {
   test("down removes every summary column, copy and the RPC, keeps the bootstrapped role at its spec, and up applies again", async () => {
-    const db = await database();
+    // Guarded downs require the real migrator ledger and validation marker.
+    const fixture = await replayDatabase();
+    const db = fixture.pg;
+    open.push(db);
+    const ledger = async () => (await db.query<{ name: string; sha256: string }>(
+      'SELECT name,sha256 FROM sessions.__96bulls_migrations ORDER BY name COLLATE "C"',
+    )).rows;
+    const beforeLedger = await ledger();
     await insertRow(db);
     await summarize(db, KEY, "pelican rollback check");
     // Reverse dependency order: event metadata also depends on G6 and the list/catalog phases.
@@ -2356,7 +2364,15 @@ describe("short_summary rollback", () => {
     await db.exec(BRIEFS_UP);
     await db.exec(BRIEF_STATE_UP);
     await db.exec(EVENTS_UP);
-    for(const file of LATER_PHASES)await db.exec(read(`supabase/migrations/${file.replace(/\.down\.sql$/,".sql")}`));
+    // Older downs retain their ledger rows; replay only that legacy prefix.
+    // Recreating an unrecorded suffix first would correctly trip the migrator's
+    // dirty-schema guard. The migrator owns both SQL and ledger for that suffix.
+    const stillRecorded = new Set((await ledger()).map(({ name }) => name));
+    const legacyPhases = LATER_PHASES.filter(file => stillRecorded.has(`upstream:${file.replace(/\.down\.sql$/, ".sql")}`));
+    expect(legacyPhases).toEqual(LATER_PHASES.slice(0, legacyPhases.length));
+    for(const file of legacyPhases)await db.exec(read(`supabase/migrations/${file.replace(/\.down\.sql$/,".sql")}`));
+    await runMigrations(fixture.db, { profile: { mode: "local", shim: true, bootstrap: true, verify: true, runtimeRole: "postgres" } });
+    expect(await ledger()).toEqual(beforeLedger);
     await db.query(
       "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
       [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],

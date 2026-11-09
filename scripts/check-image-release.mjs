@@ -2,7 +2,9 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-export const REPOSITORY = "AgentWorkforce/sessions-pipeline";
+export const REPOSITORY = "AgentWorkforce/relayhistory-pipeline";
+// GitHub repository id; unchanged by the 2026-11-07 rename from sessions-pipeline.
+export const REPOSITORY_ID = 1437714333;
 const SHA = /^[0-9a-f]{40}$/;
 const refuse = (reason) => { throw new Error(`Image release refused: ${reason}`); };
 

@@ -1,0 +1,27 @@
+{
+  "status": "STAGED_NOT_EXECUTED_AWAIT_LEAD_WORKER_G2_READBACK",
+  "sourceSha": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "host": "sf-frame",
+  "cwd": "/home/khaliqgant/Projects/AgentWorkforce/sessions-pipeline-worktrees/root-readonly-release-f9409ccb-20261107",
+  "bun": "/home/khaliqgant/.local/share/mise/installs/bun/1.4.2/bin/bun",
+  "env": {
+    "SUPABASE_PROJECT_REF": "pyamkrhoyszgzirqqffq"
+  },
+  "sourceFileSha256": {
+    "scripts/ingest-generation-rebind.ts": "4dc3cca0e0b893e6689bbcb97b613ec12d514bb7de2ec7147d037efea0f30516",
+    "src/hoopdb/ingest-generation-rebind.ts": "5e3adcde71f2ad34e50b10c9c1531c4225f71b2647083a199d7e0bbab948aa93"
+  },
+  "dryRunArgv": [
+    "scripts/ingest-generation-rebind.ts",
+    "--from",
+    "78c7b28e5ebce7f5f534a1f3f41a55845251e950b6c4c49f676f2bda358c91d6",
+    "--to",
+    "e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce"
+  ],
+  "executeAdds": [
+    "--execute"
+  ],
+  "noAutomaticRetry": true,
+  "dryRunRollsBackTransaction": true,
+  "stageTime": "2026-11-07T22:51:20.050205+00:00"
+}

@@ -20,7 +20,10 @@ import {
   ownerCapture,
   applyOwnerRelease,
   auditCanonicalOwnerSql,
+  validateOwnerIntegration,
+  type OwnerApplyIntegration,
 } from "../src/hoopdb/owner-operator-apply.ts";
+export type { OwnerApplyIntegration, OwnerPreparedContext } from "../src/hoopdb/owner-operator-apply.ts";
 const CLI = "/home/khaliqgant/.local/bin/supabase";
 const INPUT = ".96bulls/owner-apply/readonly-plan.json",
   CAPTURE = "docs/plans/supabase-owner-apply.capture.json",
@@ -64,8 +67,10 @@ async function text(path: string) {
     return no("owner_artifact_utf8");
   }
 }
-export async function ownerApplyMain(argv = process.argv.slice(2)) {
+export async function ownerApplyMain(argv = process.argv.slice(2), integration?: OwnerApplyIntegration) {
   const input = ownerApplyArgs(argv);
+  validateOwnerIntegration(integration);
+  if (integration !== undefined && input.mode !== "apply") no("owner_integration_apply_only");
   const childEnv = Object.fromEntries(
     [
       "PATH",
@@ -176,6 +181,7 @@ export async function ownerApplyMain(argv = process.argv.slice(2)) {
       approvalText,
       wrapper,
       recheckSource,
+      integration,
     });
   });
 }

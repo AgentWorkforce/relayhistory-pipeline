@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import sys
+import subprocess
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -64,6 +65,17 @@ class ImageCopyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "signed digest"):
             module.copy_image(self.env, lambda *args, **kwargs: SimpleNamespace(stdout=b"changed"), self.auth)
 
+    def test_failing_registry_client_keeps_capability_url_out_of_inherited_logs(self):
+        sensitive="https://registry.example/upload?credential=fixture-private-upload-capability"
+        def failed(args,**options):
+            self.assertEqual(options.get("stdout"),subprocess.PIPE)
+            self.assertEqual(options.get("stderr"),subprocess.PIPE)
+            return subprocess.run([sys.executable,"-c","import sys; print("+repr(sensitive)+"); print("+repr(sensitive)+",file=sys.stderr); sys.exit(17)"],
+                                  check=True,stdout=options.get("stdout"),stderr=options.get("stderr"),env=options["env"])
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            module.copy_image(self.env,failed,self.auth)
+        self.assertIn(sensitive.encode(),caught.exception.stdout)
+        self.assertIn(sensitive.encode(),caught.exception.stderr)
     @unittest.skipUnless(hasattr(os, "memfd_create"), "requires the Linux publisher kernel")
     def test_actual_memory_auth_is_sealed_rereadable_and_closed(self):
         import fcntl

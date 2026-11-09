@@ -51,6 +51,7 @@ import {
   courierMigrationLedger,
   createCourierManifestRoutes,
 } from "../manifests.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const ORG = "org_test";
 const WORKSPACE = "ws_test";
@@ -74,24 +75,10 @@ beforeAll(async () => {
   await db.exec(
     await readFile(join(SUPABASE, "tests/supabase_shim.sql"), "utf8"),
   );
-  await db.exec(
-    await readFile(
-      join(SUPABASE, "bootstrap/session_directory_search_worker.sql"),
-      "utf8",
-    ),
-  );
-  await db.exec(
-    await readFile(
-      join(SUPABASE, "bootstrap/session_token_verifier.sql"),
-      "utf8",
-    ),
-  );
-  await db.exec(
-    await readFile(
-      join(SUPABASE, "bootstrap/session_ingest_roles.sql"),
-      "utf8",
-    ),
-  );
+  // Single-sourced bootstrap chain: the grant migration FAILs closed
+  // without the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES)
+    await db.exec(await readFile(join(SUPABASE, "..", f), "utf8"));
   for (const file of (await readdir(join(SUPABASE, "migrations")))
     .filter((f) => f.endsWith(".sql"))
     .sort())

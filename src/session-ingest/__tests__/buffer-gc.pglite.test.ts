@@ -7,6 +7,7 @@ import {PGlite} from "@electric-sql/pglite";
 import {btree_gin} from "@electric-sql/pglite/contrib/btree_gin";
 import {pg_trgm} from "@electric-sql/pglite/contrib/pg_trgm";
 import {sqlLedger} from "../ledger-sql.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 setDefaultTimeout(30000);
 const root=join(import.meta.dir,"../../.."),open:PGlite[]=[];
 afterEach(async()=>{for(const db of open.splice(0))await db.close()});
@@ -17,8 +18,8 @@ async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(db);
  const read=(path:string)=>readFileSync(join(root,path),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const name of ["session_directory_search_worker","session_token_verifier","session_ingest_roles"])
-  await db.exec(read("supabase/bootstrap/"+name+".sql"));
+ for(const name of SESSION_BOOTSTRAP_FILES)
+  await db.exec(read(name));
  for(const name of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())
   await db.exec(read("supabase/migrations/"+name));
  await db.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now());INSERT INTO sessions.__96bulls_role_validation(name,generation,status) VALUES('session_directory_search_worker','"+generation+"','pass') ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,status=excluded.status");
@@ -33,6 +34,10 @@ async function fixture(){
  const ledger=orderedFixtureLedger(sqlLedger(((s:string,p:unknown[])=>as("bulls96_session_ingest",s,p)) as never,{acceptanceMode:"buffered",expectedGeneration:generation}),db as never);
  let serial=0;
  async function stage(opts:{ack?:boolean;groups?:number[][];expired?:boolean}={}){
+  // Real producer admission establishes the authoritative user fence before
+  // registering a stage. GC039 correctly refuses a missing fence; this manual
+  // owner fixture must not depend on GC implicitly creating its producer state.
+  await db.query("SELECT sessions.ingest_lock_fences($1,$2,$3)",[tenant.orgId,tenant.workspaceId,tenant.userId]);
   const batch="batch-"+(++serial),claim=randomUUID(),token=randomUUID(),digest=hash(batch),sha=hash(token);
   const keyFor=(bodySha:string)=>"96bulls/org-a/buffered-batches/v1/ws=ws-a/m=fixture/b="+hash(digest).slice(0,32)+"-"+bodySha.slice(0,16)+"-"+hash(claim).slice(0,32)+".staged.ndjson.zst";
   const groups=opts.groups??[[0],[1],[2]];
@@ -97,11 +102,13 @@ test("expired or fenced unacknowledged intent is durably retired without ACK",as
  expect((await f.db.query("SELECT cleanup_state,receipt_state FROM sessions.ingest_stage_intents WHERE stage_token=$1",[s.token])).rows[0]).toEqual({cleanup_state:"retired",receipt_state:"preparing"});
  expect(await f.rpc("finish",{...lease(t),barrierVersionId:"barrier-before-late-put"})).toEqual({finished:true});
 });
-test("healthy first candidates do not starve later erasure and child reset epochs never refresh",async()=>{
+test("quiescent healthy first candidates rotate before later erasure and child reset epochs never refresh",async()=>{
  const f=await fixture();
  for(let i=0;i<5;i++)await f.stage({groups:[[1]]});
  const s=await f.stage();await f.disable();
- expect((await f.rpc("claim",{limit:1})).tickets).toEqual([]);
+ // One healthy object per committed claim under039, not four. Preserve the
+ // later erasure/reset assertion after every earlier object has rotated.
+ for(let i=0;i<5;i++)expect((await f.rpc("claim",{limit:1})).tickets).toEqual([]);
  const t=(await f.rpc("claim",{limit:1})).tickets[0];expect(t.stageToken).toBe(s.token);
  const sha=hash("child");
  const child=await f.rpc("prepare",{...lease(t),key:s.keyFor(sha),sha256:sha,bytes:8,groupOrdinals:[[1],[2]]});
@@ -198,6 +205,10 @@ test("two expired parent copies retain the same deterministic prospective child 
  const t1=(await f.rpc("claim",{limit:1})).tickets[0];expect(t1.stageToken).toBe(s.token);
  expect((await f.rpc("prepare",{...lease(t1),...spec})).replacementStageToken).toBe(child.replacementStageToken);
  await f.db.query("UPDATE sessions.ingest_stage_intents SET gc_lease_until=clock_timestamp()-interval '1 second' WHERE stage_token=$1",[s.token]);
+ // Since the previous parent rotation, its older prospective child is now
+ // first. Its protected healthy check commits separately before the parent.
+ expect((await f.rpc("claim",{limit:1})).tickets).toEqual([]);
+ expect((await f.db.query("SELECT cleanup_state,receipt_state FROM sessions.ingest_stage_intents WHERE stage_token=$1",[child.replacementStageToken])).rows[0]).toEqual({cleanup_state:"live",receipt_state:"preparing"});
  const tickets=(await f.rpc("claim",{limit:1})).tickets;
  expect(tickets.map((t:any)=>t.stageToken)).toEqual([s.token]);
  const t2=tickets[0];

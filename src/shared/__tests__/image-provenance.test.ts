@@ -4,8 +4,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUILD_TYPE, IMAGE, SOURCE_TYPE, predicates, releaseParams, verifyRelease } from "../../../scripts/image-release-provenance.mjs";
+const REPO = "AgentWorkforce/relayhistory-pipeline", LEGACY = "AgentWorkforce/sessions-pipeline";
 
-function fixture() {
+function fixture(signer?: string) {
   const directory = mkdtempSync(join(tmpdir(), "image-provenance-"));
   const index = JSON.stringify({ schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json", manifests: [
     { platform: { os: "linux", architecture: "amd64" } },
@@ -15,7 +16,7 @@ function fixture() {
   const env = { SOURCE_SHA: "a".repeat(40), WORKFLOW_SHA: "b".repeat(40), SOURCE_CI_RUN: "123",
     PUBLISH_RUN_ID: "456", PUBLISH_RUN_ATTEMPT: "2",
     IMAGE_DIGEST: `sha256:${createHash("sha256").update(index).digest("hex")}` };
-  const values = predicates(env);
+  const values = predicates(env, signer);
   writeFileSync(join(directory, "services-index.json"), index);
   for (const [file, type, predicate] of [
     ["build-provenance.sigstore.json", BUILD_TYPE, values.build],
@@ -40,26 +41,47 @@ function change(directory: string, file: string, mutate: (value: any) => void) {
   writeFileSync(path, JSON.stringify(bundle));
 }
 
-test("verifies both signatures with exact workflow identity before accepting their claims", () => {
-  const f = fixture(); const calls: string[][] = [];
+for (const [label, signer, name] of [["new-name", undefined, REPO], ["pre-rename", LEGACY, LEGACY]] as const)
+test(`verifies both ${label} signatures with exact workflow identity before accepting their claims`, () => {
+  const f = fixture(signer); const calls: string[][] = [];
   try {
+    expect(predicates(f.env, signer).source.repository).toBe(`https://github.com/${name}`);
     const receipt = verifyRelease(f.env, f.directory, (command: string, args: string[]) => {
       expect(command).toBe("cosign"); calls.push(args);
       for (const [flag, value] of [
-        ["--certificate-identity", "https://github.com/AgentWorkforce/sessions-pipeline/.github/workflows/publish-image.yml@refs/heads/main"],
+        ["--certificate-identity", `https://github.com/${name}/.github/workflows/publish-image.yml@refs/heads/main`],
         ["--certificate-oidc-issuer", "https://token.actions.githubusercontent.com"],
         ["--certificate-github-workflow-sha", f.env.WORKFLOW_SHA],
-        ["--certificate-github-workflow-repository", "AgentWorkforce/sessions-pipeline"],
+        ["--certificate-github-workflow-repository", name],
         ["--certificate-github-workflow-ref", "refs/heads/main"],
         ["--certificate-github-workflow-trigger", "workflow_dispatch"],
         ["--digest", f.env.IMAGE_DIGEST.slice(7)], ["--digestAlg", "sha256"],
       ]) expect(args[args.indexOf(flag) + 1]).toBe(value);
-    });
+    }, signer);
     expect(calls).toHaveLength(2);
     expect(calls.map(args => args[args.indexOf("--type") + 1])).toEqual([BUILD_TYPE, SOURCE_TYPE]);
     expect(receipt.image).toBe(`${IMAGE}@${f.env.IMAGE_DIGEST}`);
   } finally { f.cleanup(); }
 });
+
+for (const signer of ["AgentWorkforce/sessions-pipeline-oss", "AgentWorkforce/sessions-pipeline-cloud", "fork/relayhistory-pipeline",
+  "agentworkforce/relayhistory-pipeline", `${REPO} `, `${REPO}/`, "AgentWorkforce/relayhistory", "", null])
+  test(`an unrelated signer repository ${JSON.stringify(signer)} is refused before any crypto command`, () => {
+    const f = fixture(); let calls = 0;
+    try {
+      expect(() => verifyRelease(f.env, f.directory, () => { calls++; }, signer as any)).toThrow("unknown signer repository");
+      expect(() => predicates(f.env, signer as any)).toThrow("unknown signer repository");
+      expect(calls).toBe(0);
+    } finally { f.cleanup(); }
+  });
+
+for (const [claimed, verifiedAs] of [[LEGACY, REPO], [REPO, LEGACY]] as const)
+  test(`claims made under ${claimed} cannot be accepted while verifying as ${verifiedAs}`, () => {
+    const f = fixture(claimed);
+    try {
+      expect(() => verifyRelease(f.env, f.directory, () => {}, verifiedAs)).toThrow("does not match");
+    } finally { f.cleanup(); }
+  });
 
 for (const failingCall of [1, 2]) test(`crypto failure ${failingCall} stops acceptance and hides diagnostics`, () => {
   const f = fixture(); let calls = 0;

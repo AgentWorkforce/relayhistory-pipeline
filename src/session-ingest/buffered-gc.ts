@@ -14,6 +14,23 @@ const obj = (v: unknown): v is Record<string, any> => v !== null && typeof v ===
 export class BufferedGcError extends Error {
   constructor(readonly code: string) { super('buffer gc refused: ' + code); }
 }
+const GC_PHASES = Object.freeze(['unknown', 'config', 'assets', 'secret', 'pool', 'role_check', 'readiness', 'store_setup', 'tick', 'claim', 'collect', 'prepare', 'swap', 'finish', 'cleanup'] as const);
+export type BufferedGcPhase = typeof GC_PHASES[number];
+const GC_SQL_PHASE: Readonly<Record<string, BufferedGcPhase>> = Object.freeze({
+  ingest_buffer_gc_claim: 'claim', ingest_buffer_gc_prepare: 'prepare', ingest_buffer_gc_swap: 'swap', ingest_buffer_gc_finish: 'finish',
+});
+/** Invocation-owned diagnostics only. Never inspect error fields or change the thrown value. */
+export class BufferedGcDiagnostics {
+  #current: BufferedGcPhase = 'unknown';
+  readonly #failures = new Map<unknown, BufferedGcPhase>();
+  phase(value: unknown): void {
+    this.#current = typeof value === 'string' && (GC_PHASES as readonly string[]).includes(value) ? value as BufferedGcPhase : 'unknown';
+  }
+  capture(error: unknown): void {
+    if (!this.#failures.has(error)) this.#failures.set(error, this.#current);
+  }
+  failurePhase(error: unknown): BufferedGcPhase { return this.#failures.get(error) ?? 'unknown'; }
+}
 function no(code: string): never { throw new BufferedGcError(code); }
 export function assertBufferedSpec(v: unknown): asserts v is BufferedStageSpec {
   if (!obj(v) || typeof v.key !== 'string' || !/^96bulls\/[A-Za-z0-9._-]{1,128}\/buffered-batches\/v1\/ws=[^/]+\/m=srv_[0-9a-f]{32}\/b=[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{32}\.staged\.ndjson\.zst$/.test(v.key) || v.key.split('/').some((s: string) => s === '.' || s === '..') || !/^[0-9a-f]{64}$/.test(v.sha256) || !Number.isSafeInteger(v.bytes) || v.bytes < 1 || v.bytes > BUFFER_STAGE_MAX_BYTES || !Array.isArray(v.groupOrdinals) || !v.groupOrdinals.length || v.groupOrdinals.length > 500) no('stage_spec');
@@ -45,9 +62,10 @@ export interface BufferedGcLedger {
   swap(ticket: BufferedGcTicket, replacementStageToken: string | null): Promise<boolean>;
   finish(ticket: BufferedGcTicket, barrierVersionId: string): Promise<boolean>;
 }
-export function sqlBufferedGcLedger(db: BufferedGcSql,expectedGeneration:string): BufferedGcLedger {
+export function sqlBufferedGcLedger(db: BufferedGcSql,expectedGeneration:string,diagnostics?:BufferedGcDiagnostics): BufferedGcLedger {
   if(!/^[a-f0-9]{64}$/.test(expectedGeneration))no("generation_required");
   const call = async (name: string, p: unknown): Promise<Record<string, any>> => {
+    diagnostics?.phase(GC_SQL_PHASE[name]);
     let value: unknown;
     try { value = (await db.query(`SELECT sessions.${name}($1::jsonb) AS result`, [JSON.stringify(p)])).rows[0]?.result; }
     catch (e) { const code = (e as { code?: unknown })?.code; return no(typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? 'sql_' + code : 'sql_failed'); }
@@ -119,8 +137,9 @@ export async function ensureBufferedBarrier(store: ObjectStore, t: BufferedGcTic
   }
   return no('barrier_contended');
 }
-export interface BufferedGcDeps { ledger: BufferedGcLedger; store: ObjectStore; eraser: PreservedVersionEraser; keyRoot: '96bulls' }
+export interface BufferedGcDeps { ledger: BufferedGcLedger; store: ObjectStore; eraser: PreservedVersionEraser; keyRoot: '96bulls'; diagnostics?: BufferedGcDiagnostics }
 export async function collectBufferedTicket(t: BufferedGcTicket, deps: BufferedGcDeps): Promise<'finished' | 'deferred'> {
+  deps.diagnostics?.phase('collect');
   assertBufferedTicket(t);
   let cleanup = t;
   if (t.phase === 'plan') {
@@ -130,29 +149,29 @@ export async function collectBufferedTicket(t: BufferedGcTicket, deps: BufferedG
       const prepared = prepareBufferedReplacement(deps.keyRoot, t, decoded);
       assertBufferedSpec(prepared.spec);
       replacement = await deps.ledger.prepare(t, prepared.spec); // Intent BEFORE object IO.
+      deps.diagnostics?.phase('collect');
       await putBufferedStage(deps.store, prepared);
     }
     if (!await deps.ledger.swap(t, replacement)) return 'deferred'; // Current pointer must move BEFORE old cleanup.
+    deps.diagnostics?.phase('collect');
     cleanup = { ...t, phase: 'cleanup', cleanupState: 'retired', keepOrdinals: [], keepGroupIndexes: [], replacement: undefined };
   }
   const version = await ensureBufferedBarrier(deps.store, cleanup);
   await deps.eraser.eraseObjectExcept(t.key, version);
   return await deps.ledger.finish(t, version) ? 'finished' : 'deferred';
 }
-/** One SQL claim RPC per ticket. ingest_buffer_gc_claim scans up to 4*limit
- * candidates and does per-candidate retention work (original-record
- * normalization, ACK-decision/native-slot joins) inside ONE statement that the
- * job bounds with its per-operation statement_timeout. A claim(limit) that times
- * out rolls back every candidate's gc_checked_at rotation, so the same heavy
- * head of the queue is re-scanned, and times out, on every run. claim(1) scans
- * at most four candidates and commits its rotation, so every run makes durable
- * progress. Per-tick candidate coverage (4*limit) and the ticket bound (limit)
- * are unchanged. A failed claim still fails the tick: no claim error is
- * swallowed, and collect errors keep their existing deferral rules. */
+/** One SQL claim RPC per loop iteration; each successful RPC commits separately.
+ * The current 039 claim fully evaluates at most one candidate and returns at
+ * most one ticket, after up to four nonblocking acquisition probes. Healthy
+ * candidates also end that claim after their durable checked rotation. Thus a
+ * five-call tick checks at most five healthy objects; persistent busy heads can
+ * prevent progress. Claim failures still fail the tick, preserving earlier RPC
+ * commits; collection errors keep their existing deferral rules. */
 export async function bufferedGcTick(deps: BufferedGcDeps, limit = 10) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) no('claim_limit');
   let examined = 0, finished = 0, deferred = 0;
   for (let call = 0; call < limit; call++) {
+    deps.diagnostics?.phase('claim');
     const tickets = await deps.ledger.claim(1);
     examined += tickets.length;
     for (const t of tickets) {

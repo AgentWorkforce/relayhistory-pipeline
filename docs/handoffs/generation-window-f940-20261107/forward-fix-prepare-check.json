@@ -1,0 +1,19 @@
+{
+  "kind": "g2_pinned_upload_transport",
+  "at": "2026-11-07T22:48:56.280Z",
+  "mode": "--check",
+  "sourceSha256": "c3bf3d6c45ef6e9c3136251bac8ced5fbe5472554ca2ed201229ed189b77ebb9",
+  "sourceCommit": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "workerPutAttempts": 0,
+  "statePutAttempts": 0,
+  "privateUrlCalls": 0,
+  "observabilityCalls": 0,
+  "writeStatusCounts": {},
+  "outcome": "CAPTURE_AND_LIVE_STATE_AUTHORITY_QUALIFIED_NOT_APPLIED",
+  "rawEventsOrCredentialsPersisted": false,
+  "stateAuthority": {
+    "stateVersion": 7,
+    "controlStateSha256": "42b573e101616c6e1459e4e118507e1833db9574f7ac434843626d531b33b1eb"
+  },
+  "finishedAt": "2026-11-07T22:48:57.252Z"
+}

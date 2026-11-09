@@ -224,8 +224,12 @@ controls them:
   `openai_api_key: ($key | rtrimstr("\n"))` to its output object. Do not use
   `--arg key "$(op read …)"`; command substitution would expose the key in
   `jq`'s argv.
-- Historical sessions are not enqueued: `SESSION_BRIEF_SWEEP_SECONDS` stays 0.
-  A backfill needs its own approval and budget.
+- Historical sessions are not enqueued unless `briefs.sweepSeconds` is set: it emits
+  `SESSION_BRIEF_SWEEP_SECONDS` (an integer 0-86400; absent = not emitted, so the worker
+  default 0, off). Each sweep queues up to 100 indexed sessions that have no brief row at
+  all, under the same budgets. Setting it is a budgeted backfill and needs its own
+  approval. Sessions holding a Neon-backfilled title (docs/brief-titles.md) have a brief
+  row, so the sweep never re-briefs them; new evidence does.
 
 **Turning them on (each step needs Khaliq's OK):**
 
@@ -250,6 +254,19 @@ controls them:
 update). For an immediate stop, run
 `aws events disable-rule --name 96bulls-aws-sessions-prod-session-brief`.
 Then reconcile the inputs, since the next capture would show the drift.
+
+## Buffered search feed
+
+The stack defines a one-minute EventBridge rule for the buffered search feed. It stays DISABLED, and neither
+feed variable is set, until `transcriptStore.sessionPipeline.bufferedSearchFeed` is
+`{ enabled: true, gateDeclared: "buffered-search-gate/v1" }` with `searchIndex: true`. `gateDeclared` is an
+operator's assertion that the read Worker is already deployed and verified with the gate on; the deployment
+does not prove it. No credential is wired here: the feeder reads `buffered_search_feed_database_url` and
+`buffered_search_feed_database_ca_pem` from the pipeline secret and stays off without a valid login.
+
+Rolling out this rule alone creates only the DISABLED schedule and its permission. Arming it is a production
+step that needs Khaliq's explicit OK and follows the buffered search activation order: ClickHouse columns,
+read gate verified, then feeder. Do not arm it before the later-erasure delete lane for ClickHouse exists.
 
 ## Repo tag rename (one time, before the read API rollout)
 

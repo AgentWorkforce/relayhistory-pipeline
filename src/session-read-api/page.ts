@@ -8,15 +8,23 @@
  * fewer rows survived the newest-version recheck. A page can therefore be short
  * (or empty) with a cursor; it is never short without one while rows remain.
  */
-import type { ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
-import { encodeCursor, type EventPosition } from "./cursor.ts";
+import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
+import { SearchIndexError, assertPosition, comparePositions, type SearchHit, type SearchPosition } from "@rhc/search-index/contracts.ts";
+import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
+import { encodeBufferedCursor, encodeCursor, type EventPosition } from "./cursor.ts";
+import type { BufferedSearchGate, DropReason } from "./buffered-search-gate.ts";
 import {
   READ_SETTINGS,
   buildCandidateQuery,
   buildNewestQuery,
+  buildOriginColumnProbe,
   buildPartialSessionsQuery,
+  MISSING_COLUMN_CODES,
+  type OriginMode,
   buildWorkspacePartialSessionsQuery,
   PARTIAL_SESSIONS_CAP,
+  PAGE_BYTE_BUDGET,
+  ROW_OVERHEAD_BYTES,
   candidatePosition,
   type CandidateRow,
   type EventQuery,
@@ -82,6 +90,8 @@ export interface EventPage {
   nextCursor: string | null;
   /** Rows dropped because their session is erased (telemetry only). */
   erasedDropped: number;
+  /** Buffered-origin rows checked and dropped by the buffered search gate (telemetry only; absent when off). */
+  buffered?: { checked: number; dropped: Partial<Record<DropReason, number>> };
 }
 
 const nullable = (v: string | null | undefined) => (v === undefined || v === null || v === "" ? null : v);
@@ -138,20 +148,63 @@ const rowPosition = (r: EventRow): EventPosition => ({
 });
 
 export interface PageDeps {
-  ch: ClickHouseClient;
+  ch?: ClickHouseClient;
+  adapter?: SearchServiceBinding;
+  completeSinceMs?: number;
   liveness: Liveness;
   timeoutMs?: number;
+  /** READ_API_BUFFERED_SEARCH_GATE on: every buffered-origin row passes the R2 privacy gate (ClickHouse binding only). */
+  bufferedGate?: BufferedSearchGate;
 }
 
 export async function readEventPage(deps: PageDeps, input: EventQuery): Promise<EventPage> {
-  const options = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
-  const c = buildCandidateQuery(deps.ch.database, input);
-  const candidateRows = await deps.ch.select<CandidateRow>(c.query, { ...options, params: c.params });
-  const candidates = candidateRows.map(candidatePosition);
-  if (candidates.length === 0) return { events: [], nextCursor: null, erasedDropped: 0 };
+  if (deps.adapter) {
+    // The portable hit carries no origin marker, so buffered rows cannot be told apart.
+    if (deps.bufferedGate) throw new Error("buffered search gate requires the ClickHouse binding");
+    return readAdapterPage(deps, input);
+  }
+  if (!deps.ch) throw new Error("read search binding missing");
+  const ch = deps.ch;
+  const options: ReadOptions = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
+  if (deps.bufferedGate) return finishPage(deps, input, await selectPage(ch, input, "gate", options));
+  // No gate in this runtime (the Lambda, or the gate off): canonical rows only. A table
+  // without the origin column fails that query; the read is then answered unfiltered only
+  // if the column is STILL absent after the unfiltered read (columns are only ever added,
+  // and the feeder writes no row before they exist), so a buffered row is never served.
+  let selected: Selected;
+  try {
+    selected = await selectPage(ch, input, "canonical", options);
+  } catch (error) {
+    if (!(error instanceof ClickHouseError) || !error.code || !MISSING_COLUMN_CODES.has(error.code)) throw error;
+    selected = await selectPage(ch, input, "legacy", options);
+    const probe = buildOriginColumnProbe(ch.database);
+    const [found] = await ch.select<{ n: number | string }>(probe.query, { ...options, params: probe.params });
+    if (found === undefined || Number(found.n) !== 0) throw new ClickHouseError(503, null, "origin_column_changed");
+  }
+  return finishPage(deps, input, selected);
+}
 
-  const n = buildNewestQuery(deps.ch.database, input, candidates);
-  const rows = await deps.ch.select<EventRow>(n.query, { ...options, params: n.params });
+interface Selected {
+  candidates: EventPosition[];
+  rows: EventRow[];
+}
+
+type ReadOptions = { settings: Record<string, string | number>; timeoutMs: number };
+
+async function selectPage(ch: ClickHouseClient, input: EventQuery, origin: OriginMode, options: ReadOptions): Promise<Selected> {
+  const c = buildCandidateQuery(ch.database, input, origin);
+  const candidateRows = await ch.select<CandidateRow>(c.query, { ...options, params: c.params });
+  const candidates = candidateRows.map(candidatePosition);
+  if (candidates.length === 0) return { candidates, rows: [] };
+  const n = buildNewestQuery(ch.database, input, candidates, origin);
+  const rows = await ch.select<EventRow>(n.query, { ...options, params: n.params });
+  // Defense in depth, as the tenant recheck: canonical mode never passes on a row the SQL
+  // should have excluded, nor one without the marker.
+  return { candidates, rows: origin === "canonical" ? rows.filter((r) => r.origin === "canonical") : rows };
+}
+
+async function finishPage(deps: PageDeps, input: EventQuery, { candidates, rows }: Selected): Promise<EventPage> {
+  if (candidates.length === 0) return { events: [], nextCursor: null, erasedDropped: 0 };
 
   // Defense in depth: every row must belong to the verified tenant and the
   // requested session/source, whatever the SQL said.
@@ -175,10 +228,16 @@ export async function readEventPage(deps: PageDeps, input: EventQuery): Promise<
   for (const r of kept) distinct.set(keyOf({ source: r.source, sessionId: r.session_id }), { source: r.source, sessionId: r.session_id });
   const erased = distinct.size ? await deps.liveness.erased(input.orgId, input.workspaceId, [...distinct.values()]) : new Set<string>();
   const live = kept.filter((r) => !erased.has(keyOf({ source: r.source, sessionId: r.session_id })));
+  // The buffered gate only removes rows; nextCursor above is the unfiltered page's.
+  if (!deps.bufferedGate) {
+    return { events: live.map((r) => shapeRow(r, input.maxContent)), nextCursor, erasedDropped: kept.length - live.length };
+  }
+  const gated = await deps.bufferedGate.filter(input.orgId, input.workspaceId, live);
   return {
-    events: live.map((r) => shapeRow(r, input.maxContent)),
+    events: gated.kept.map((r) => shapeRow(r, input.maxContent)),
     nextCursor,
     erasedDropped: kept.length - live.length,
+    buffered: { checked: gated.buffered, dropped: gated.dropped },
   };
 }
 
@@ -186,7 +245,15 @@ export async function readEventPage(deps: PageDeps, input: EventQuery): Promise<
  * Partial sessions (`needs_full = 1`, queries.ts buildPartialSessionsQuery):
  * the one session when `sessionId` is given, else any of the org's, capped.
  */
-export async function partialSessions(deps: PageDeps, orgId: string, sessionId?: string): Promise<string[]> {
+export async function partialSessions(deps: PageDeps, orgId: string, sessionId?: string, workspaceId?: string): Promise<string[]> {
+  if (deps.adapter) {
+    if (!workspaceId) throw new Error("verified workspace required");
+    const result = await adapterPartials(deps, orgId, workspaceId, sessionId);
+    // A truncated check can never admit a session as complete.
+    if (result.overflow) throw new SearchIndexError("unavailable", true);
+    return [...result.sessions];
+  }
+  if (!deps.ch) throw new Error("read search binding missing");
   const q = buildPartialSessionsQuery(deps.ch.database, orgId, sessionId);
   const rows = await deps.ch.select<{ session_id: string }>(q.query, {
     settings: { ...READ_SETTINGS },
@@ -224,6 +291,11 @@ export interface WorkspacePartials {
  * asking Supabase.
  */
 export async function partialSessionsInWorkspace(deps: PageDeps, orgId: string, workspaceId: string): Promise<WorkspacePartials> {
+  if (deps.adapter) {
+    const result = await adapterPartials(deps, orgId, workspaceId);
+    return { sessions: [...result.sessions], overflow: result.overflow };
+  }
+  if (!deps.ch) throw new Error("read search binding missing");
   const q = buildWorkspacePartialSessionsQuery(deps.ch.database, orgId, workspaceId);
   const rows = await deps.ch.select<{ session_id: string; in_workspace: number | string }>(q.query, {
     settings: { ...READ_SETTINGS },
@@ -236,4 +308,112 @@ export async function partialSessionsInWorkspace(deps: PageDeps, orgId: string, 
   if (rows.length === 0) return { sessions: [], overflow: false };
   const pointed = await deps.liveness.livePointerSessions(orgId, workspaceId, rows.map((r) => r.session_id));
   return { sessions: rows.map((r) => r.session_id).filter((id) => pointed.has(id)), overflow: false };
+}
+
+async function deadline<T>(deps: PageDeps, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work(controller.signal), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => { controller.abort(); reject(new SearchIndexError("unavailable", true, "timeout")); }, deps.timeoutMs ?? 3000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+async function adapterPartials(deps: PageDeps, orgId: string, workspaceId: string, sessionId?: string) {
+  await assertCoverage(deps);
+  const result = await deadline(deps, () => deps.adapter!.state.partials({ orgId, workspaceId }, { sessionId, limit: PARTIAL_SESSIONS_CAP }));
+  if (!result || !Array.isArray(result.sessions) || typeof result.overflow !== "boolean" || result.sessions.some(s => typeof s !== "string" || !s) || result.sessions.length > PARTIAL_SESSIONS_CAP && !result.overflow) throw new SearchIndexError("unavailable", true);
+  return result;
+}
+
+function eventRow(hit: SearchHit): EventRow {
+  return {
+    org_id: hit.orgId, workspace_id: hit.workspaceId, ts_ms: hit.tsMs, session_id: hit.sessionId,
+    source: hit.source, machine_id: hit.machineId, kind: hit.kind, event_id: hit.eventId,
+    type: hit.type, user_id: hit.userId, actor_name: hit.actorName, actor_role: hit.actorRole,
+    subagent_id: hit.subagentId, project_id: hit.projectId, task_title: hit.taskTitle,
+    task_ref: hit.taskRef, tags: [...hit.tags], files_touched: [...hit.filesTouched],
+    tool_name: hit.toolName, tool_status: hit.toolStatus, content: hit.content, in_budget: 1,
+  };
+}
+
+/** Portable query results use the same public shaping, byte-budget, erasure
+ * and cursor rules. No SQL emulation and no fallback to another backend. */
+async function readAdapterPage(deps: PageDeps, input: EventQuery): Promise<EventPage> {
+  await assertCoverage(deps);
+  const page = await deadline(deps, signal => deps.adapter!.index.query({
+    tenant: { orgId: input.orgId, workspaceId: input.workspaceId }, sessionId: input.sessionId,
+    source: input.source, kind: input.kind, projectId: input.projectId, q: input.q,
+    sinceMs: input.sinceMs, untilMs: input.untilMs, order: input.order, cursor: input.cursor,
+    limit: input.limit, ...(input.maxContent === undefined ? {} : { maxContentChars: input.maxContent + 1 }),
+  }, { signal }));
+  if (!page || !Array.isArray(page.hits) || page.hits.length > input.limit) throw new SearchIndexError("unavailable", true);
+  const advances = (a: SearchPosition, b: SearchPosition) => input.order === "asc" ? comparePositions(a, b) > 0 : comparePositions(a, b) < 0;
+  let previous: SearchPosition | undefined = input.cursor;
+  for (const hit of page.hits) {
+    assertPosition(hit);
+    if (hit.orgId !== input.orgId || hit.workspaceId !== input.workspaceId || input.sessionId !== undefined && hit.sessionId !== input.sessionId || input.source !== undefined && hit.source !== input.source) throw new TenantMismatchError();
+    if (input.kind !== undefined && hit.kind !== input.kind || input.projectId !== undefined && hit.projectId !== input.projectId || input.sinceMs !== undefined && hit.tsMs < input.sinceMs || input.untilMs !== undefined && hit.tsMs > input.untilMs || previous && !advances(hit, previous)) throw new SearchIndexError("unavailable", true);
+    previous = hit;
+  }
+  if (page.next) {
+    assertPosition(page.next);
+    if (input.cursor && !advances(page.next, input.cursor) || previous && comparePositions(page.next, previous) !== 0 && !advances(page.next, previous)) throw new SearchIndexError("unavailable", true);
+  }
+  const rows = page.hits.map(eventRow);
+  const cut = budgetCut(rows);
+  const kept = rows.slice(0, cut);
+  const nextCursor = cut < rows.length ? encodeCursor(rowPosition(kept[kept.length - 1]!)) : page.next ? encodeCursor(page.next) : null;
+  const distinct = new Map<string, SessionKey>();
+  for (const row of kept) distinct.set(keyOf({ source: row.source, sessionId: row.session_id }), { source: row.source, sessionId: row.session_id });
+  const erased = distinct.size ? await deps.liveness.erased(input.orgId, input.workspaceId, [...distinct.values()]) : new Set<string>();
+  const live = kept.filter(row => !erased.has(keyOf({ source: row.source, sessionId: row.session_id })));
+  return { events: live.map(row => shapeRow(row, input.maxContent)), nextCursor, erasedDropped: kept.length - live.length };
+}
+
+async function assertCoverage(deps: PageDeps): Promise<void> {
+  const fromMs = await deadline(deps, () => deps.adapter!.state.fromMs(new Date()));
+  if (!Number.isSafeInteger(fromMs) || fromMs < 0 || fromMs > (deps.completeSinceMs ?? 0)) throw new SearchIndexError("unavailable", true, "coverage_changed");
+}
+
+/**
+ * The page byte budget's cut (readAdapterPage and readBufferedEventPage): the index of the first
+ * row not kept. The first row is always kept; a later row is cut once the kept rows' content
+ * bytes plus ROW_OVERHEAD_BYTES each exceed PAGE_BYTE_BUDGET.
+ */
+export function budgetCut(rows: readonly EventRow[]): number {
+  let bytes = 0;
+  for (let i = 0; i < rows.length; i++) {
+    if (i > 0 && bytes > PAGE_BYTE_BUDGET) return i;
+    bytes += Buffer.byteLength(rows[i]!.content, "utf8") + ROW_OVERHEAD_BYTES;
+  }
+  return rows.length;
+}
+
+/**
+ * One page of an owner-buffered session's projected rows (owner-buffered.ts
+ * readOwnerBufferedEvents; every row is already gated, scrubbed and tenant-checked). The same
+ * full sort key and order as the canonical page (comparePositions: ts in ms, then session,
+ * source, machine, kind, event id by code point, the ClickHouse/portable index order), rows
+ * strictly after the cursor, `limit` rows, then the same byte-budget cut as readAdapterPage.
+ * A page that the limit or the budget cuts carries a buffered cursor (encodeBufferedCursor) at
+ * its last kept row; the last page carries none. Erasure is the buffered gate's, not Supabase
+ * liveness: nothing here asks liveness.
+ */
+export function readBufferedEventPage(rows: readonly EventRow[], input: Pick<EventQuery, "order" | "limit" | "maxContent" | "cursor">): EventPage {
+  const sign = input.order === "desc" ? -1 : 1;
+  const cursor = input.cursor;
+  const sorted = rows
+    .filter((row) => !cursor || sign * comparePositions(rowPosition(row), cursor) > 0)
+    .sort((a, b) => sign * comparePositions(rowPosition(a), rowPosition(b)));
+  const limited = sorted.slice(0, input.limit);
+  const cut = budgetCut(limited);
+  const kept = limited.slice(0, cut);
+  const more = cut < limited.length || sorted.length > limited.length;
+  return {
+    events: kept.map((row) => shapeRow(row, input.maxContent)),
+    nextCursor: more && kept.length > 0 ? encodeBufferedCursor(rowPosition(kept[kept.length - 1]!)) : null,
+    erasedDropped: 0,
+  };
 }

@@ -67,6 +67,7 @@ import { mintTenantToken } from "../../proof/aws/ingest.ts";
 import { DatabaseSync } from "node:sqlite";
 import { writeFile } from "node:fs/promises";
 import { indexerReconcileRoot } from "../../hoopdb/reconcile-root.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import {
   objectKey,
   prefixAllowed,
@@ -226,24 +227,10 @@ beforeAll(async () => {
   await db.exec(
     await readFile(join(ROOT_DIR, "supabase/tests/supabase_shim.sql"), "utf8"),
   );
-  await db.exec(
-    await readFile(
-      join(ROOT_DIR, "supabase/bootstrap/session_directory_search_worker.sql"),
-      "utf8",
-    ),
-  );
-  await db.exec(
-    await readFile(
-      join(ROOT_DIR, "supabase/bootstrap/session_token_verifier.sql"),
-      "utf8",
-    ),
-  );
-  await db.exec(
-    await readFile(
-      join(ROOT_DIR, "supabase/bootstrap/session_ingest_roles.sql"),
-      "utf8",
-    ),
-  );
+  // Single-sourced bootstrap chain: the grant migration FAILs closed
+  // without the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES)
+    await db.exec(await readFile(join(ROOT_DIR, f), "utf8"));
   for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
     for (const file of (await readdir(join(ROOT_DIR, dir)))
       .filter((f) => f.endsWith(".sql"))

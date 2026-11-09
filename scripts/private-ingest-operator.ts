@@ -43,13 +43,17 @@ import {
   assertSessionIngestPlanContract,
   assertPrivateWorker,
   assertNoSecretLiterals,
-  SESSION_INGEST_RESOURCES,
   sessionIngestVars,
   sessionIngestStage,
   SESSION_INGEST_STAGE,
   SESSION_INGEST_WORKER,
   FANOUT_QUEUE,
   FANOUT_DLQ,
+  ADMISSION_QUEUE,
+  ADMISSION_DLQ,
+  ADMISSION_RETENTION_SECONDS,
+  sessionIngestResources,
+  admissionConsumerSettings,
   S3_ACCESS_KEY_SECRET,
   S3_SECRET_KEY_SECRET,
   SIGNING_KEY_SECRET,
@@ -218,6 +222,7 @@ export function operatorSafePlans(
       assertSessionIngestPlanContract(
         resourcePlanView(result.planText, bindings),
         resourcePlanView(result.detailedText, bindings),
+        bindings.some((b) => b.sid === "INGEST_ADMISSION"),
       );
     } catch {
       refuse("original_plan_contract");
@@ -354,9 +359,16 @@ export function guardOperatorFetch(
   mode: "plan" | "deploy",
   base: typeof fetch,
   acceptanceMode: "canonical" | "buffered" = "canonical",
+  asyncAdmission = false,
 ): typeof fetch {
+  // Admission queues exist only for a buffered capture that declared asyncAdmission.
+  if (asyncAdmission && acceptanceMode !== "buffered") refuse("admission_scope");
   const state = operatorStateUrl(secrets.stateUrl),
-    queueIds = new Map<string, string>();
+    queueIds = new Map<string, string>(),
+    resources = sessionIngestResources(asyncAdmission),
+    ownedQueues = asyncAdmission
+      ? [FANOUT_QUEUE, FANOUT_DLQ, ADMISSION_QUEUE, ADMISSION_DLQ]
+      : [FANOUT_QUEUE, FANOUT_DLQ];
   const observe = async (response: Response) => {
     if (!response.ok) return response;
     const b = await operatorMetadata(response.clone()),
@@ -364,7 +376,7 @@ export function guardOperatorFetch(
     for (const r of rows)
       if (
         r &&
-        [FANOUT_QUEUE, FANOUT_DLQ].includes(r.queue_name) &&
+        ownedQueues.includes(r.queue_name) &&
         typeof r.queue_id === "string" &&
         /^[0-9a-f]{32}$/u.test(r.queue_id)
       )
@@ -409,12 +421,12 @@ export function guardOperatorFetch(
             root + "/replaced-resources",
             root + "/output",
           ].includes(url.pathname) ||
-          SESSION_INGEST_RESOURCES.includes(key as never));
+          resources.includes(key));
       const write =
         mode === "deploy" &&
         method === "PUT" &&
         (url.pathname === root + "/output" ||
-          SESSION_INGEST_RESOURCES.includes(key as never));
+          resources.includes(key));
       if (!read && !write) refuse("state_scope");
       return send();
     }
@@ -455,7 +467,7 @@ export function guardOperatorFetch(
     }
     if (path === "queues" && method === "POST") {
       const b = await new Response(init?.body).json();
-      if (!object(b) || ![FANOUT_QUEUE, FANOUT_DLQ].includes(b.queue_name))
+      if (!object(b) || !ownedQueues.includes(b.queue_name))
         refuse("queue_scope");
       return observe(await send());
     }
@@ -466,14 +478,37 @@ export function guardOperatorFetch(
       const b = await new Response(init?.body).json();
       if (!object(b)) refuse("queue_scope");
       if (path.includes("/consumers")) {
+        const queue = queueIds.get(q[1]!);
+        const dlq =
+          queue === FANOUT_QUEUE
+            ? FANOUT_DLQ
+            : queue === ADMISSION_QUEUE
+              ? ADMISSION_DLQ
+              : undefined;
         if (
-          queueIds.get(q[1]!) !== FANOUT_QUEUE ||
+          !dlq ||
           b.script_name !== SESSION_INGEST_WORKER ||
-          b.dead_letter_queue !== FANOUT_DLQ
+          b.dead_letter_queue !== dlq
         )
           refuse("consumer_scope");
+      } else if (
+        method === "PATCH" &&
+        asyncAdmission &&
+        [ADMISSION_QUEUE, ADMISSION_DLQ].includes(queueIds.get(q[1]!)!)
+      ) {
+        // Admission queues: only the pinned retention, byte-exact. Never a pause, never anything else.
+        if (
+          JSON.stringify(b) !==
+          JSON.stringify({
+            settings: { message_retention_period: ADMISSION_RETENTION_SECONDS },
+          })
+        )
+          refuse("queue_retention_scope");
       } else if (method === "PATCH") {
         if (acceptanceMode !== "buffered") refuse("queue_pause_scope");
+        // Only the fanout queues are ever paused; an admission queue is never paused.
+        if (![FANOUT_QUEUE, FANOUT_DLQ].includes(queueIds.get(q[1]!)!))
+          refuse("queue_pause_scope");
         if (
           Object.keys(b).some((k) => k !== "settings") ||
           !object(b.settings) ||
@@ -593,8 +628,21 @@ export function assertOperatorSnapshot(
     "session-ingest": "Cloudflare.Worker",
     "session-ingest-fanout-consumer": "Cloudflare.Queues.Consumer",
   };
+  // Async admission (buffered only): exactly three more resources, all or none.
+  const withAdmission = input.sessionIngest.asyncAdmission !== undefined;
+  if (withAdmission) {
+    if (input.sessionIngest.acceptanceMode !== "buffered") refuse("native_admission_mode");
+    expected["session-ingest-admission-dlq"] = "Cloudflare.Queues.Queue";
+    expected["session-ingest-admission"] = "Cloudflare.Queues.Queue";
+    expected["session-ingest-admission-consumer"] = "Cloudflare.Queues.Consumer";
+  }
+  /** Owned queue bindings: binding name -> its queue resource and physical name. */
+  const queueBindings: Record<string, { logicalId: string; queueName: string }> = {
+    INGEST_FANOUT: { logicalId: "session-ingest-fanout", queueName: FANOUT_QUEUE },
+    ...(withAdmission ? { INGEST_ADMISSION: { logicalId: "session-ingest-admission", queueName: ADMISSION_QUEUE } } : {}),
+  };
   if (
-    rows.length !== 4 ||
+    rows.length !== Object.keys(expected).length ||
     Object.keys(snapshot.native.deletions ?? {}).length ||
     Object.keys(snapshot.native.actions ?? {}).length ||
     Object.keys(snapshot.native.actionDeletions ?? {}).length
@@ -636,7 +684,8 @@ export function assertOperatorSnapshot(
         name: "HYPERDRIVE",
         id: input.sessionIngest.hyperdriveId,
       };
-      expected.INGEST_FANOUT = { type: "queue", name: "INGEST_FANOUT" };
+      for (const name of Object.keys(queueBindings))
+        expected[name] = { type: "queue", name };
       for (const [name, secretName] of Object.entries({
         S3_ACCESS_KEY_ID: S3_ACCESS_KEY_SECRET,
         S3_SECRET_ACCESS_KEY: S3_SECRET_KEY_SECRET,
@@ -681,23 +730,24 @@ export function assertOperatorSnapshot(
           refuse("native_binding_inventory");
         found.add(b.sid);
         const value = { ...actual[0] };
-        if (b.sid === "INGEST_FANOUT") {
-          const ref = row.resource.Props.env.INGEST_FANOUT;
+        const owned = Object.hasOwn(queueBindings, b.sid) ? queueBindings[b.sid]! : undefined;
+        if (owned) {
+          const ref = row.resource.Props.env[b.sid];
           if (
-            ref.Type !== "Cloudflare.Queues.Queue" ||
-            ref.LogicalId !== "session-ingest-fanout" ||
+            ref?.Type !== "Cloudflare.Queues.Queue" ||
+            ref.LogicalId !== owned.logicalId ||
             (value.queue_name !== undefined &&
-              value.queue_name !== FANOUT_QUEUE)
+              value.queue_name !== owned.queueName)
           )
             refuse("native_binding_target");
           // Existing no-op Queue bindings retain Alchemy's internal
           // camelCase queue identity rather than upload API queue_name.
           // Bind it to this plan's owned queue before normalizing it.
           if (b.action === "noop") {
-            const attr = snapshot.native.resources["session-ingest-fanout"]?.state?.attr;
-            if (value.queueName !== FANOUT_QUEUE ||
+            const attr = snapshot.native.resources[owned.logicalId]?.state?.attr;
+            if (value.queueName !== owned.queueName ||
               typeof value.queueId !== "string" || !/^[0-9a-f]{32}$/u.test(value.queueId) ||
-              attr?.queueId !== value.queueId || attr?.queueName !== FANOUT_QUEUE ||
+              attr?.queueId !== value.queueId || attr?.queueName !== owned.queueName ||
               attr?.accountId !== input.sessionIngest.accountId)
               refuse("native_binding_target");
             delete value.queueName;
@@ -713,14 +763,13 @@ export function assertOperatorSnapshot(
         inventory.push({
           sid: b.sid,
           action: b.action,
-          target:
-            b.sid === "INGEST_FANOUT"
-              ? {
-                  ...wanted,
-                  queue_name: FANOUT_QUEUE,
-                  logicalId: "session-ingest-fanout",
-                }
-              : wanted,
+          target: owned
+            ? {
+                ...wanted,
+                queue_name: owned.queueName,
+                logicalId: owned.logicalId,
+              }
+            : wanted,
         });
       }
     }
@@ -734,13 +783,26 @@ export function assertOperatorSnapshot(
       refuse("native_binding_inventory");
     if (
       (id === "session-ingest-fanout" && props.name !== FANOUT_QUEUE) ||
-      (id === "session-ingest-fanout-dlq" && props.name !== FANOUT_DLQ)
+      (id === "session-ingest-fanout-dlq" && props.name !== FANOUT_DLQ) ||
+      (id === "session-ingest-admission" && props.name !== ADMISSION_QUEUE) ||
+      (id === "session-ingest-admission-dlq" && props.name !== ADMISSION_DLQ)
     )
       refuse("native_queue_identity");
+    // Admission queues are never paused (nor carry a pause prop at all).
+    if (
+      ["session-ingest-admission", "session-ingest-admission-dlq"].includes(id) &&
+      props.deliveryPaused !== undefined
+    )
+      refuse("native_queue_pause");
+    if (
+      id === "session-ingest-admission-consumer" &&
+      JSON.stringify(props.settings) !== JSON.stringify(admissionConsumerSettings())
+    )
+      refuse("native_admission_consumer");
   }
   if (
     [...seen].sort().join(",") !==
-    [...SESSION_INGEST_RESOURCES].sort().join(",")
+    [...sessionIngestResources(withAdmission)].sort().join(",")
   )
     refuse("native_resource_inventory");
   return inventory.sort((a, b) => a.sid.localeCompare(b.sid));
@@ -921,6 +983,7 @@ export async function retainedOperatorPlan(
               mode,
               runtime.fetcher,
               input.sessionIngest.acceptanceMode,
+              input.sessionIngest.asyncAdmission !== undefined,
             ),
             mode,
           ),

@@ -4,6 +4,7 @@ import {execFileSync} from "node:child_process";
 import {readFileSync,readdirSync,mkdirSync,writeFileSync} from "node:fs";
 import {join} from "node:path";
 import {generation as schemaGeneration} from "../src/hoopdb/migrate.ts";
+import {SESSION_BOOTSTRAP_FILES} from "../src/hoopdb/session-bootstrap-chain.ts";
 import {createHash,randomUUID} from "node:crypto";
 const out=process.env.BUFFER_GC_PROOF_OUT??"";
 if(process.env.BUFFER_GC_DISPOSABLE!=="1"||!out.startsWith("/home/khaliqgant/relay-briefs/buffer-gc-real-"))throw new Error("disposable_only");
@@ -46,7 +47,8 @@ async function fixture(){
 async function waitLock(){for(let i=0;i<100;i++){if((await monitor.query("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='buffer-gc-proof-actor' AND wait_event_type='Lock') AS yes")).rows[0].yes)return;await sleep(10)}throw new Error("no_actual_blocker")}
 try{
  await db.query(readFileSync(join(root,"supabase/tests/supabase_shim.sql"),"utf8"));
- for(const name of ["session_directory_search_worker","session_token_verifier","session_ingest_roles"])await db.query(readFileSync(join(root,"supabase/bootstrap/"+name+".sql"),"utf8"));
+ // Single-sourced bootstrap chain: the grant migration FAILs closed without the bare consumer grantee.
+ for(const f of SESSION_BOOTSTRAP_FILES)await db.query(readFileSync(join(root,f),"utf8"));
  for(const name of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.query(readFileSync(join(root,"supabase/migrations/"+name),"utf8"));
  await db.query("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now())");
  await db.query("INSERT INTO sessions.__96bulls_role_validation(name,generation,status) VALUES('session_directory_search_worker',$1,'pass') ON CONFLICT(name) DO UPDATE SET generation=excluded.generation,status=excluded.status",[generation]);

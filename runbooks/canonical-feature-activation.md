@@ -29,12 +29,12 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 | F2 | **REQUIRED** | Correct owner-only 610 ABI: explicit seed above drained legacy high-water; initial publish; atomic exact prior retirement then replacement publish; no raw pointer arrays in the journal | migration-completeness + supporter-cloud + 620 creator agent | Fresh and replacement transaction tests; missing-seed refusal; rollback emits no row; restricted-role ACL/rollback/sentinel checks |
 | F3 | **REQUIRED** | Publish new buffered uploads into ready canonical scopes and directory/replay authorities; drain only the bounded post-cutover catch-up for the canary scope | 620 creator agent (scope-build driver); bulls-migrator as production operator | Captured cutover high-water; zero unpublished/dirty rows for the selected scope; exact read hydration succeeds |
 | F4 | **REQUIRED** | Run a durable leased journal consumer with bounded 184 materialization, per-page ACKs, two-pool terminal finish CAS, retry/DLQ and metrics | migration-completeness + supporter-cloud | Restart/stale-worker tests; zero selected-scope journal backlog; immutable worker build identity; runtime in `src/search-features/canonical-consumer{,-runner}.ts` on lease/checkpoint/dead-letter tables from `20261105036000` |
-| F5 | **REQUIRED** | Install event, brief, directory-document, authority and profile tables with separate least-privilege writer/reader roles and existing secret bindings | migration-completeness + supporter-cloud; bulls-migrator as operator | Reviewed DDL/grants; endpoint/database/schema hashes; live restricted-role probes |
+| F5 | **REQUIRED** | Install event, brief, directory-document, authority and profile tables with separate least-privilege writer/reader roles and existing secret bindings | migration-completeness + supporter-cloud; bulls-migrator as operator | Reviewed DDL/grants including table-scoped writer `ALTER DELETE` for managed feature pools; endpoint/database/schema hashes; restricted-role retirement/ACK probes |
 | F6 | **REQUIRED** | Complete only the selected scope's directory-document baseline and journal catch-up; never expose partial workspace results | migration-completeness; bulls-migrator as production operator | Event, brief and directory pools at the same captured revision; readiness clean |
 | F7 | **REQUIRED** | Serve the uploaded session from Supabase-backed list/detail/summary reads. The API path gates first visibility; the broad Cloud UI rollout does not | bulls-migrator read-path lane + Cloud UI lane | Buffered upload visible in directory and exact session hydration; tenant/auth negative tests; rollback flag recorded |
 | F8 | **REQUIRED** | Land canonical reader/visibility stack #179+ and route the canary scope only after readiness succeeds | canonical #179+ owner + migration-completeness | Legacy-filter parity, cursor stability, exact hydration authority and fail-closed dirty-state tests |
 | F9 | **REQUIRED subset** | First-visible proof: upload, read, keyword search, latency and rollback. Semantic search when a stored vector exists, replacement and delete/tombstone remain required for the full Friday canary but do not gate the first visible session | bulls-migrator coordinates; all owners provide evidence | Timestamped upload/read/keyword results, FINAL rows, no dirty/backlog and rollback rehearsal; then the remaining full-canary evidence |
-| F10 | **LATER than first visibility; REQUIRED Friday** | In reserved post-620 migration `20261105027000_canonical_project_events.sql`, replace the Neon-trigger project feeds with durable canonical-publication events in Cloud's current queue ABI: brief completion `{eventId}` and session revision `{kind:"session.revised",eventId,generation}` with decimal-string generation | F10 owner (`codex-96bullsessions-offer-assistance`) + migration-completeness + P5b/Cloud project-events owner | Outbox commits with publication; Cloud resolves trusted event metadata from the new authority, admits once under duplicate delivery, generation-fences acknowledgements, recovers failed sends, and refreshes the canary project summary |
+| F10 | **LATER than first visibility; REQUIRED Friday** | In reserved post-620 migration `20261105033000_canonical_project_events.sql`, replace the Neon-trigger project feeds with durable canonical-publication events in Cloud's current queue ABI: brief completion `{eventId}` and session revision `{kind:"session.revised",eventId,generation}` with decimal-string generation | F10 owner (`codex-96bullsessions-offer-assistance`) + migration-completeness + P5b/Cloud project-events owner | Outbox commits with publication; Cloud resolves trusted event metadata from the new authority, admits once under duplicate delivery, generation-fences acknowledgements, recovers failed sends, and refreshes the canary project summary |
 
 ### Required later for broad migration
 
@@ -119,7 +119,30 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
 - Create the reviewed event, semantic-brief, directory-document, authority and
   profile tables in the selected ClickHouse database. Grant separate least-
   privilege writer and reader identities; bind the normalized endpoint,
-  database and schema hashes as the target identity.
+  database and schema hashes as the target identity. In addition to its reviewed
+  `SELECT`/`INSERT` rights, the canonical writer requires ClickHouse
+  `ALTER DELETE` on exactly `session_event_features` and
+  `session_brief_features` in that database, and on
+  `session_document_features` only when the document pool is enabled. Grant no
+  database-wide `ALTER`; give the reader no deletion privilege. An
+  `INSERT`/`SELECT`-only writer cannot finish a retirement page: deletion fails,
+  the page remains unACKed, and readiness must stay held. These are operator
+  prerequisites, not grants performed by the application or this runbook edit.
+  See [ClickHouse DELETE permissions](https://clickhouse.com/docs/reference/statements/delete#delete-permissions).
+- The restricted-role activation probe must exercise the real bounded
+  retirement commands as the configured writer, not as an administrator. In an
+  explicitly owned synthetic namespace with the reviewed table schemas and
+  background merges controlled by its fixture owner, insert
+  an older row, an equal-version tombstone, a newer row and a different routing
+  key in each enabled feature pool. Await the production command settings
+  (`lightweight_deletes_sync=2`), then use ordinary `SELECT` without `FINAL` to
+  prove only the older exact-key row is hidden and the other rows survive,
+  before recording the page ACK. A negative writer with `SELECT`/`INSERT` but
+  no `ALTER DELETE` must fail the delete and leave the page unACKed; the reader
+  must also be unable to delete. Retain the restricted identities, table-scoped
+  grants, command/readback results and ACK outcome in the activation evidence.
+  No probe against existing production rows is implied; provisioning, grants
+  and any managed execution still need the separate approval named above.
 - Publish and verify the exact source case-fold profile. Both event and brief
   pools must be complete, fresh, at the same observed revision and paired to
   the same source/target/profile identity before serving.
@@ -137,6 +160,31 @@ summaries, semantic coverage, replacement/erasure acceptance or broad traffic.
   pass; schema presence is never the feature flag.
 
 ## Backfill, retention and acceptance
+
+- Canonical event and brief retirement must await the same exact-key,
+  strictly older-version ClickHouse deletion as the legacy copier before
+  acknowledging each page. The optional directory-document pool extends that
+  cleanup to documents; the legacy copier has no document deletion path. Test
+  ordinary `SELECT`
+  without `FINAL`; a blank tombstone alone is not proof that old text is hidden.
+  The synchronous lightweight delete establishes query visibility, not physical
+  purge of inactive parts, backups, S3 sources, or a defense against a writer
+  that is still allowed to replay retired data.
+- Stop and drain old writers and verify the existing ownership/version fences
+  before retirement acceptance. A stale INSERT after a successful delete can
+  otherwise make old rows visible again; this cleanup is not a write barrier.
+- Before activating an upgraded consumer, inventory whether the old
+  tombstone-only path ever wrote or acknowledged retirements in the target.
+  Already-complete entries and already-ACKed pages are skipped by durable
+  resume. Installing the fixed code does not repair those historical rows.
+  If any exist, keep readiness/traffic held and obtain a separately reviewed,
+  authorized reconciliation or target rebuild with non-`FINAL` read checks.
+  Do not reset checkpoints or discard ACKs as an incidental upgrade.
+- Run the local regression with
+  `node --experimental-transform-types --test src/search-features/__tests__/canonical-retirement.test.ts`.
+  An explicitly owned ClickHouse fixture at `http://127.0.0.1:32771` can opt in
+  with `CANONICAL_RETIREMENT_CH_PROOF=1`; the proof creates and removes a uniquely
+  named synthetic database. The default test run skips that integration proof.
 
 - Run bounded historical publication, live catch-up and directory-document
   backfill; prove zero dirty/outbox/journal backlog at a captured high-water.

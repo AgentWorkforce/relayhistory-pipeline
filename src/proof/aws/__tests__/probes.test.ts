@@ -2,7 +2,7 @@
  * The proof's HoopDb probe must see the V1 search RPC exactly when it is
  * deployed. In-process PGlite only.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 // The root workspace has no PGlite dependency; use the pipeline package's copy (as manifests-migration.test.ts does).
@@ -10,12 +10,17 @@ import { PGlite } from "../../../../packages/pipeline/node_modules/@electric-sql
 import { btree_gin } from "../../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
 import { pg_trgm } from "../../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import { indexStateSql } from "../probes.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../../hoopdb/session-bootstrap-chain.ts";
 
 const root = join(import.meta.dir, "../../../..");
 const read = (p: string) => readFileSync(join(root, p), "utf8");
 const ids = ["01a18f4a-e978-7d04-b07c-4aa8dc28dc65"];
 // Each PGlite instance takes about a second on CI; bun's 5 s default is too tight for several per test.
 const PGLITE_MS = 60_000;
+const open: PGlite[] = [];
+afterEach(async () => {
+  await Promise.all(open.splice(0).map((db) => db.close()));
+});
 
 async function state(db: PGlite) {
   const r = await db.query<{
@@ -29,6 +34,7 @@ async function state(db: PGlite) {
 
 async function bare(fn?: string) {
   const db = new PGlite();
+  open.push(db);
   await db.exec(
     "CREATE SCHEMA sessions; CREATE TABLE sessions.session_index (org_id text, workspace_id text, session_id text);",
   );
@@ -113,10 +119,9 @@ describe("after every supabase migration", () => {
   );
   test(`the probe reports the RPC exactly when a migration defines it (defined here: ${defined})`, async () => {
     const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+    open.push(db);
     await db.exec(read("supabase/tests/supabase_shim.sql"));
-    await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
-    await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
-    await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
+    for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
     for (const f of files) await db.exec(read(`supabase/migrations/${f}`));
     const s = await state(db);
     expect(s.search_rpc_present).toBe(defined);

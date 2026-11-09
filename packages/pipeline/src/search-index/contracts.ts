@@ -180,6 +180,8 @@ export type SearchIndexErrorCode =
   | "unsupported"
   | "unavailable"
   | "schema_missing"
+  /** The schema exists but a setting the adapter relies on differs; never auto-corrected. */
+  | "schema_mismatch"
   | "aborted";
 
 /** Messages never contain content, credentials or backend error text. */

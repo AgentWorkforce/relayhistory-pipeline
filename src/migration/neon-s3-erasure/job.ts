@@ -12,13 +12,15 @@
  *  - what the exporter queued: objects a rewritten manifest no longer
  *    references, and session prefixes it no longer produces.
  *
- * It reads Neon (read-only) and the shared watermark, never object content.
+ * It reads the privacy authority (read-only) and the shared watermark, never object content. The
+ * authority is Neon today, or Supabase once C3 activated it (`./authority.ts`, S3X_PRIVACY_AUTHORITY).
  * A session prefix is leased while it is erased, so the exporter never reuses
  * a chunk the eraser is deleting.
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import { orgPrefix } from "../neon-s3-sync/export-session.ts";
-import { activityPage, catalogPage, fencedGroups, fencedLivePage, groupExistsInNeon, lockWaiters, type LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
+import type { LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
+import { isErasureAuthority, neonAuthority, type ErasureAuthority, type ErasurePresence } from "./authority.ts";
 import { liveObjectPrefix, livePointerPrefix, liveSessionsIn, liveStagedPrefix, liveTargets } from "./live.ts";
 
 /** Clock-skew margin between this host and S3 `LastModified`. */
@@ -35,7 +37,17 @@ export const STAGED_ERASE_AFTER_MS = 48 * 60 * 60 * 1000;
 const DOT_SEGMENT = /(^|\/)\.{1,2}(\/|$)/;
 import type { SyncState } from "../neon-s3-sync/state.ts";
 import { errorCode, type Log } from "../neon-s3-sync/sync.ts";
-import type { Eraser } from "./eraser.ts";
+import { inSessionAnyDate, type EraseCheckpoint, type Eraser, type ListedVersion, type PagedEraser } from "./eraser.ts";
+import { terminalInvocations } from "./write-obligation.ts";
+import { createHash } from "node:crypto";
+
+/** Per-item budget for one bounded erase step (the shared primitive also caps versions at 10k and pages at 100). */
+export const ERASE_STEP_DEADLINE_MS = 60_000;
+/** A durable scope for the shared paged eraser's checkpoint: operation + authority + tenant/session (or queued item). */
+export function eraseScope(parts: readonly (string | number)[]): string {
+  return createHash("sha256").update(JSON.stringify(["e3-erase-scope-v1", ...parts])).digest("hex");
+}
+const refusal = (code: string) => Object.assign(new Error(code), { code });
 
 export interface ErasureConfig {
   keyRoot: string;
@@ -50,6 +62,12 @@ export interface ErasureConfig {
    * exporter's `S3X_INCLUDE_LEGACY_SOURCES`.
    */
   recognizeLegacy: boolean;
+  /**
+   * TEST SEAM ONLY (never set by main.ts): whether exporter obligations may be treated as settled. Production has NO
+   * value for it, so an exporter prefix or object is never marked erased (every genesis is unattested; there is no
+   * unlock until a separately reviewed recovery contract exists). Tests of the completion path opt in explicitly.
+   */
+  obligationsSettled?: () => boolean;
 }
 
 export const DEFAULT_ERASURE_CONFIG: ErasureConfig = {
@@ -72,21 +90,231 @@ export function sessionPrefixOf(keyRoot: string, orgId: string, key: string): st
   return m && SESSION_PREFIX.test(m[1]!) ? m[1] : undefined;
 }
 
+/** One obligation-gated paged erasure's outcome (see ErasureJob#erasePaged). */
+export type PagedOutcome = "incomplete" | "erased" | "unverified" | "unresolved" | "refused";
+
 export class ErasureJob {
-  readonly counters = { swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0 };
+  readonly counters = { doneRefused: 0, unresolved: 0, reservationsRefused: 0, swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0, resumable: 0, unverified: 0 };
   #lastSweep = 0;
   #lastProgress = 0;
+  readonly authority: ErasureAuthority;
 
   constructor(
-    readonly db: Queryable,
+    /** A Neon connection (today's authority) or an explicit `ErasureAuthority`. */
+    db: Queryable | ErasureAuthority,
     readonly state: SyncState,
-    readonly eraser: Eraser,
+    readonly eraser: Eraser & PagedEraser,
     readonly log: Log,
     readonly cfg: ErasureConfig = DEFAULT_ERASURE_CONFIG,
     readonly now: () => number = Date.now,
     readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
     readonly stopped: () => boolean = () => false,
-  ) {}
+  ) {
+    this.authority = isErasureAuthority(db) ? db : neonAuthority(db);
+  }
+
+  /**
+   * One bounded, resumable, obligation-gated erasure of `prefix` through the shared strict paged eraser
+   * (eraser.ts) and the shared unresolved-write model (write-obligation.ts v3), over SyncState:
+   *  - resumes from the durable checkpoint bound to `scope` (a foreign scope restarts from the start);
+   *  - `authorize` (the caller's still-fenced / queued / lease / authority re-check) runs before every page's deletes;
+   *  - before ANY version is deleted, EVERY doomed version of the page is reserved atomically (compare-and-set on the
+   *    prefix's revision, under the lock the exporter's publish takes): a writer change or an owned version refuses
+   *    the page (nothing in it deleted), and a publish after the reservation is refused;
+   *  - "erased" only after a fresh strict zero inventory AND no unresolved write invocation under the prefix: a
+   *    dispatched PUT (unknown outcome) is never resolved by time, a zero inventory or a matching listed version;
+   *    an acked one only when its exact version is absent from that complete inventory.
+   */
+  async #erasePaged(prefix: string, scope: string, select: ((v: ListedVersion) => boolean) | undefined, authorize: () => Promise<void>,
+    keyFilter: (key: string) => boolean = () => true, exporterWritten = false, exactKey?: string,
+    lease?: { prefix: string; holder: string; gen: string }): Promise<{ status: PagedOutcome; deleted: number; remaining: number; rev: number; proofReason?: string }> {
+    const exact = exactKey !== undefined ? { exactKey } : {};
+    // S3X_OBLIGATIONS off: the SAME strict canonical paged eraser (no permissive fallback), without the obligation
+    // protocol (no reservations, invocations, retirement or genesis gate): done = a fresh strict zero inventory.
+    const ob = this.state.obligations;
+    if (!ob) {
+      // The cross-process mode interlock, before ANY external effect and before every page's deletes.
+      const inner = authorize;
+      authorize = async () => {
+        this.state.assertModeAllowed();
+        await inner();
+        // ... and AGAIN after the awaited authorization, immediately before this page's deletes.
+        this.state.assertModeAllowed();
+      };
+      this.state.assertModeAllowed();
+    }
+    let rev = ob ? this.state.obligationRev(prefix) : 0;
+    let lost = false;
+    const budget = () => ({ deadlineAt: this.now() + ERASE_STEP_DEADLINE_MS });
+    const beforeDelete = async (doomed: readonly ListedVersion[]) => {
+      if (!doomed.length || !ob) return;
+      const r = this.state.reserveErase(prefix, rev, scope, doomed.map((v) => ({ key: v.key, versionId: v.versionId })));
+      if (!r.ok) {
+        lost = true;
+        throw refusal("erasure_reservation_refused");
+      }
+      rev = r.rev;
+    };
+    // Legacy migration: a checkpoint persisted under this scope in the OTHER mode (directory vs exact-key, e.g. written
+    // before the exact-key wiring) is not resumable; restart the traversal from the start instead of being refused.
+    // Progress only: invocations, reservations and the terminal / erased history are untouched.
+    let checkpoint = this.state.eraseCheckpoint(scope) as (EraseCheckpoint & { exactKey?: string }) | null;
+    if (checkpoint && (checkpoint.scope !== scope || checkpoint.prefix !== prefix || (checkpoint.exactKey ?? null) !== (exactKey ?? null))) {
+      this.state.clearEraseCheckpoint(scope);
+      checkpoint = null;
+    }
+    const run = (cp: EraseCheckpoint | null) => this.eraser.eraseStep(prefix, {
+      scope, checkpoint: cp, ...(select ? { select } : {}), authorize, beforeDelete, budget: budget(), now: this.now, ...exact,
+    });
+    let step;
+    try {
+      try {
+        step = await run(checkpoint);
+      } catch (error) {
+        // A stale / foreign stored checkpoint (e.g. another bucket) is ignored and the traversal restarted, never a stall.
+        if (!checkpoint || errorCode(error) !== "erasure_checkpoint_scope") throw error;
+        this.state.clearEraseCheckpoint(scope);
+        step = await run(null);
+      }
+    } catch (error) {
+      if (lost) {
+        this.counters.reservationsRefused += 1;
+        return { status: "refused", deleted: 0, remaining: -1, rev };
+      }
+      throw error;
+    }
+    if (step.status === "incomplete") {
+      this.state.setEraseCheckpoint(scope, step.checkpoint, this.now());
+      this.counters.resumable += 1;
+      return { status: "incomplete", deleted: step.deleted, remaining: -1, rev };
+    }
+    this.state.clearEraseCheckpoint(scope);
+    if (!ob) {
+      const proof = await this.eraser.verifyErased(prefix, { ...(select ? { select } : {}), authorize, budget: budget(), now: this.now, ...exact });
+      if (proof.status !== "erased") {
+        this.counters.unverified += 1;
+        return { status: "unverified", deleted: step.deleted, remaining: -1, rev, proofReason: proof.reason };
+      }
+      return { status: "erased", deleted: step.deleted, remaining: 0, rev };
+    }
+    // The reservation generation the proof below covers: captured BEFORE the inventory, so every reservation it can
+    // retire existed when the inventory was taken (one added later stays reserved).
+    const proofSeq = this.state.reservationHighWater(prefix);
+    // A fresh strict COMPLETE inventory: which exact versions are present per key.
+    // `present`: object versions (the invocation evidence); `listed`: EVERY listed entry INCLUDING delete markers (the
+    // absence proof: a marker still listed is present, never "erased").
+    const present = new Map<string, Set<string>>();
+    const listed = new Map<string, Set<string>>();
+    const proof = await this.eraser.verifyErased(prefix, {
+      select: (v) => {
+        if (keyFilter(v.key)) {
+          (listed.get(v.key) ?? listed.set(v.key, new Set()).get(v.key)!).add(v.versionId);
+          if (!v.deleteMarker) (present.get(v.key) ?? present.set(v.key, new Set()).get(v.key)!).add(v.versionId);
+        }
+        return select ? select(v) : true;
+      },
+      authorize, budget: budget(), now: this.now, ...exact,
+    });
+    let remaining = 0;
+    for (const vs of present.values()) remaining += vs.size;
+    if (this.state.obligationRev(prefix) !== rev) return { status: "refused", deleted: step.deleted, remaining, rev };
+    // The obligations the subset depends on: those at its keys under the prefix, plus prefix-level ones covering the
+    // prefix itself (an ancestor or equal: legacy imports, nonterminal), deduplicated.
+    const seen = new Set<string>();
+    const invocations = [...this.state.unresolvedWrites(prefix).filter((i) => keyFilter(i.key)), ...this.state.coveringWrites(prefix)].filter((i) => !seen.has(i.id) && !!seen.add(i.id));
+    const owned = new Map<string, Set<string>>();
+    for (const o of this.state.publishedUnder(prefix)) (owned.get(o.key) ?? owned.set(o.key, new Set()).get(o.key)!).add(o.versionId);
+    const byKey = new Map<string, typeof invocations>();
+    for (const i of invocations) (byKey.get(i.key) ?? byKey.set(i.key, []).get(i.key)!).push(i);
+    const done: string[] = [];
+    for (const [key, list] of byKey)
+      done.push(...terminalInvocations(list, owned.get(key) ?? new Set(), proof.status === "erased" ? (present.get(key) ?? new Set()) : null));
+    if (done.length) {
+      const r = this.state.resolveWrites(prefix, rev, done);
+      if (!r.ok) return { status: "refused", deleted: step.deleted, remaining, rev };
+      rev = r.rev;
+    }
+    if (proof.status !== "erased") {
+      this.counters.unverified += 1;
+      return { status: "unverified", deleted: step.deleted, remaining, rev, proofReason: proof.reason };
+    }
+    // Retire EXACTLY the reserved versions this complete inventory shows absent (within keyFilter); every other
+    // reservation (kept siblings, successors, other subsets) stays.
+    // Bounded, resumable retirement of THIS scope's reservations proven absent (SQL-filtered by scope and exact key /
+    // prefix; <= 1000 rows per transaction; durable cursor). Terminal completion only once every page is retired; at
+    // the step deadline it stays incomplete and resumes from the cursor on the next run.
+    const absent = (key: string, versionId: string) => keyFilter(key) && !(listed.get(key)?.has(versionId) ?? false);
+    // The workset identity this retirement (and its durable cursor) is bound to: prefix, exact key, the reservation
+    // generation and the COMPLETE listing it was proven against. Any change discards a saved cursor (restart).
+    const proofId = createHash("sha256").update(JSON.stringify(["retire-v1", prefix, exactKey ?? null, proofSeq,
+      [...listed].map(([k, vs]) => [k, [...vs].sort()]).sort((a, b) => (a[0]! < b[0]! ? -1 : a[0]! > b[0]! ? 1 : 0))])).digest("hex");
+    const deadline = this.now() + ERASE_STEP_DEADLINE_MS;
+    for (;;) {
+      // Authority re-checked before EVERY page (async, outside the page's transaction; no network await inside it).
+      await authorize();
+      const page = this.state.retireReservationsPage(prefix, scope, exactKey, absent, 1000, proofSeq, proofId, rev, lease);
+      // A write that landed during the awaited authority check (or since the proof) refuses the page: no done claim;
+      // the next run takes a fresh proof, and the new pending effect is kept.
+      if (!page.ok) {
+        this.counters.reservationsRefused += 1;
+        return { status: "refused", deleted: step.deleted, remaining, rev: page.rev };
+      }
+      rev = page.rev;
+      if (page.done) break;
+      if (this.now() >= deadline) {
+        this.counters.resumable += 1;
+        return { status: "incomplete", deleted: step.deleted, remaining, rev };
+      }
+    }
+    // M1 recovery: this scope's reservations for versions the proof still LISTS were never deleted: release them (the
+    // next run re-reserves what it deletes), so the exporter's claim / re-export is not wedged behind them.
+    for (;;) {
+      await authorize();
+      const rel = this.state.releasePresentPage(prefix, scope, exactKey, (key, versionId) => keyFilter(key) && (listed.get(key)?.has(versionId) ?? false), proofSeq, lease, rev, 1000, proofId);
+      if (!rel.ok) {
+        this.counters.reservationsRefused += 1;
+        return { status: "refused", deleted: step.deleted, remaining, rev: rel.rev };
+      }
+      rev = rel.rev;
+      if (rel.done) break;
+      if (this.now() >= deadline) return { status: "incomplete", deleted: step.deleted, remaining, rev };
+    }
+    // M1: the proven-absent reservations above are retired EVEN when completion is impossible (an unresolved PUT, or
+    // the unsettled production genesis), so a writer's claim / cancel is never wedged behind reservations nobody will
+    // retire. Only the done claim is gated here.
+    // A prefix the exporter writes is never done while its obligations may be incomplete: an unattested genesis (a
+    // lost / recreated state file) may have forgotten outstanding PUTs, so it fails closed.
+    if (invocations.length - done.length > 0 || (exporterWritten && !(this.cfg.obligationsSettled?.() ?? false))) {
+      this.counters.unresolved += 1;
+      return { status: "unresolved", deleted: step.deleted, remaining, rev };
+    }
+    // Final assertion under the CURRENT proof: no eligible (proof-absent) reservation of this scope remains (bounded,
+    // read-only pages within the same deadline). Anything left, or no time to check: incomplete, never done.
+    for (let after: [string, string] | null = null, first = true; first || after !== null; first = false) {
+      if (this.now() >= deadline) {
+        this.counters.resumable += 1;
+        return { status: "incomplete", deleted: step.deleted, remaining, rev };
+      }
+      const pg = this.state.eligibleRemainingPage(prefix, scope, exactKey, absent, proofSeq, after);
+      if (pg.eligible > 0) return { status: "incomplete", deleted: step.deleted, remaining, rev };
+      after = pg.next;
+    }
+    return { status: "erased", deleted: step.deleted, remaining, rev };
+  }
+
+  /**
+   * The same gate for ONE object key (every version at exactly `key` that `select` accepts): listed under the key's
+   * directory, reserved before delete, done only after a strict empty inventory of the selected versions and no
+   * unresolved PUT at exactly that key. `remaining`: versions still at the key (e.g. successors kept by `select`).
+   */
+  #eraseKey(key: string, scope: string, select: (v: ListedVersion) => boolean, authorize: () => Promise<void>, exporterWritten = false,
+    lease?: { prefix: string; holder: string; gen: string }) {
+    const dir = key.slice(0, key.lastIndexOf("/") + 1);
+    if (!dir || dir === key) throw refusal("erasure_refused_shape");
+    // The shared primitive's exact-key mode: listing and verification cover exactly this key (cut at the first other
+    // key), so unrelated siblings never count against the budget.
+    return this.#erasePaged(dir, scope, (v) => v.key === key && select(v), authorize, (k) => k === key, exporterWritten, key, lease);
+  }
 
   /** Queue the session prefixes of `keys` (manifest keys) and drop them from the group's watermark. */
   #queueGroup(org: string, session: string, keys: string[], reason: string) {
@@ -97,10 +325,19 @@ export class ErasureJob {
     this.state.forgetKeys(org, session, keys);
   }
 
-  /** With `dryRun`, reports what it would erase and changes nothing. */
+  /** With `dryRun`, reports what it would erase; deletes nothing and marks nothing done. */
   async sweep(opts: { dryRun?: boolean } = {}) {
     const startedAt = this.now();
-    const waiters = await lockWaiters(this.db);
+    const authority = this.authority;
+    try {
+      await authority.ready();
+    } catch (error) {
+      // Not the authority right now: erase nothing at all (a stale fence could destroy a re-enabled session).
+      this.counters.fenceSweepFailed += 1;
+      this.log({ message: "sweep refused: privacy authority not ready", authority: authority.kind, error_code: errorCode(error) });
+      return;
+    }
+    const waiters = await authority.lockWaiters();
     if (waiters.nonAdvisory > 3 || waiters.total > 25) {
       this.log({ message: "sweep deferred: lock waiters", lock_waiters: waiters.total });
       return;
@@ -113,45 +350,19 @@ export class ErasureJob {
       this.log({ message: "live fence sweep failed", error_code: errorCode(error) });
       return { groups: 0, versions: 0 };
     });
-    const id = Number(this.state.meta("erasure_sweep_done") ?? 0) + 1;
-    let after: { org_id: string; session_id: string } | null = null;
+    // Neon only: groups whose rollups and catalog rows vanished from Neon. Under the Supabase authority every
+    // deletion is a fence row (a reset fences each owned session), so there is no presence sweep.
+    let id = Number(this.state.meta("erasure_sweep_done") ?? 0);
     let seen = 0;
-    for (;;) {
-      const rows = await activityPage(this.db, after);
-      // A dry run marks under a sweep id no real sweep uses (and the next real sweep clears).
-      this.state.seeForErasure(opts.dryRun ? -id : id, rows);
-      seen += rows.length;
-      if (rows.length === 0 || this.stopped()) break;
-      after = rows.at(-1)!;
-    }
-    // Catalog sessions count as present too: the exporter exports them.
-    let cat: Parameters<typeof catalogPage>[1] = null;
-    for (;;) {
-      if (this.stopped()) break;
-      const rows = await catalogPage(this.db, cat);
-      this.state.seeForErasure(opts.dryRun ? -id : id, rows);
-      seen += rows.length;
-      if (rows.length === 0) break;
-      cat = rows.at(-1)!;
-    }
-    if (this.stopped()) return;
-    // A sweep that saw nothing at all is a broken read, not an empty Neon: never erase on it.
-    if (seen === 0) {
-      this.log({ message: "sweep saw no rollups; nothing erased" });
-      return;
-    }
-    if (!opts.dryRun) this.state.setMeta("erasure_sweep_done", String(id));
     let gone = 0;
-    for (const g of this.state.vanishedExports(opts.dryRun ? -id : id, startedAt, !opts.dryRun)) {
-      // Confirm on Neon right before erasing: no rollup and no catalog row now
-      // (and, with recognizeLegacy, no legacy turn, link or outcome row).
-      if (await groupExistsInNeon(this.db, g.org_id, g.session_id, this.cfg.recognizeLegacy)) continue;
-      gone += 1;
-      if (!opts.dryRun) this.#queueGroup(g.org_id, g.session_id, g.keys, "gone_from_neon");
+    if (authority.presence) {
+      const r = await this.#presenceSweep(authority.presence, startedAt, opts.dryRun ?? false);
+      if (!r) return;
+      ({ id, seen, gone } = r);
     }
     let fenced = 0;
     try {
-      for (const g of await fencedGroups(this.db)) {
+      for (const g of await authority.fencedGroups()) {
         const row = this.state.exported(g.org_id, g.session_id);
         if (row?.keys.length) {
           if (!opts.dryRun) this.#queueGroup(g.org_id, g.session_id, row.keys, "fenced");
@@ -164,7 +375,48 @@ export class ErasureJob {
     }
     this.counters.swept += 1;
     if (!opts.dryRun) this.state.setMeta("erasure_sweep_at", String(this.now()));
-    this.log({ message: opts.dryRun ? "erasure sweep (dry run)" : "erasure sweep", sweep: id, count: seen, gone, fenced, live_fenced: live.groups, live_versions: live.versions });
+    this.log({ message: opts.dryRun ? "erasure sweep (dry run)" : "erasure sweep", authority: authority.kind, sweep: id, count: seen, gone, fenced, live_fenced: live.groups, live_versions: live.versions });
+  }
+
+  /** The Neon presence sweep. Undefined: stopped, or a broken read (saw nothing); nothing is erased then. */
+  async #presenceSweep(presence: ErasurePresence, startedAt: number, dryRun: boolean): Promise<{ id: number; seen: number; gone: number } | undefined> {
+    const id = Number(this.state.meta("erasure_sweep_done") ?? 0) + 1;
+    let after: { org_id: string; session_id: string } | null = null;
+    let seen = 0;
+    for (;;) {
+      const rows = await presence.activityPage(after);
+      // A dry run marks under a sweep id no real sweep uses (and the next real sweep clears).
+      this.state.seeForErasure(dryRun ? -id : id, rows);
+      seen += rows.length;
+      if (rows.length === 0 || this.stopped()) break;
+      after = rows.at(-1)!;
+    }
+    // Catalog sessions count as present too: the exporter exports them.
+    let cat: Parameters<ErasurePresence["catalogPage"]>[0] = null;
+    for (;;) {
+      if (this.stopped()) break;
+      const rows = await presence.catalogPage(cat);
+      this.state.seeForErasure(dryRun ? -id : id, rows);
+      seen += rows.length;
+      if (rows.length === 0) break;
+      cat = rows.at(-1)!;
+    }
+    if (this.stopped()) return undefined;
+    // A sweep that saw nothing at all is a broken read, not an empty Neon: never erase on it.
+    if (seen === 0) {
+      this.log({ message: "sweep saw no rollups; nothing erased" });
+      return undefined;
+    }
+    if (!dryRun) this.state.setMeta("erasure_sweep_done", String(id));
+    let gone = 0;
+    for (const g of this.state.vanishedExports(dryRun ? -id : id, startedAt, !dryRun)) {
+      // Confirm on Neon right before erasing: no rollup and no catalog row now
+      // (and, with recognizeLegacy, no legacy turn, link or outcome row).
+      if (await presence.groupExists(g.org_id, g.session_id, this.cfg.recognizeLegacy)) continue;
+      gone += 1;
+      if (!dryRun) this.#queueGroup(g.org_id, g.session_id, g.keys, "gone_from_neon");
+    }
+    return { id, seen, gone };
   }
 
   /**
@@ -185,6 +437,9 @@ export class ErasureJob {
    * kept, and so is the pointer while anything is kept, so the next sweep
    * finds the session again.
    */
+  // UNQUALIFIED dependency: the live writer (relayhistory-api) and the ingest's staged batches are REMOTE writers
+  // outside this local obligation ledger, so their unknown PUT outcomes are never settled here. Their tombstones are
+  // re-swept every pass and never retired or reported complete; their own lanes must qualify their interlock.
   async #eraseLiveFenced(dryRun: boolean): Promise<{ groups: number; versions: number }> {
     let groups = 0;
     let versions = 0;
@@ -193,7 +448,7 @@ export class ErasureJob {
       if (this.stopped()) break;
       let rows: LiveFencedGroup[];
       try {
-        rows = await fencedLivePage(this.db, after);
+        rows = await this.authority.fencedLivePage(after);
       } catch (error) {
         this.counters.liveFenceFailed += 1;
         this.log({ message: "live fence sweep failed", error_code: errorCode(error) });
@@ -205,7 +460,18 @@ export class ErasureJob {
       // directories that hold any object, and the pointers. A tombstone is
       // visited while either remains, so neither a directory left by a
       // re-upload nor an orphaned pointer is ever skipped for good.
-      const listed = new Map<string, { dirs: Set<string>; pointers: Set<string>; staged: string[] } | null>();
+      // A machine prefix with more versions than one strict listing allows (the shared primitive's 10k bound) is
+      // "unknown" (null) rather than a failure: its tombstones are then always visited, and the paged eraser below
+      // works through it across runs.
+      const listed = new Map<string, { dirs: Set<string> | null; pointers: Set<string> | null; staged: string[] | null; stagedDone?: boolean } | null>();
+      const bounded = async (prefix: string): Promise<string[] | null> => {
+        try {
+          return await this.eraser.listKeys(prefix);
+        } catch (error) {
+          if (errorCode(error) === "erasure_inventory") return null;
+          throw error;
+        }
+      };
       for (const g of rows) {
         if (this.stopped()) break;
         let t;
@@ -226,11 +492,12 @@ export class ErasureJob {
         let seen = listed.get(objects);
         try {
           if (!seen) {
+            const dirs = await bounded(objects), pointers = await bounded(pointerRoot), staged = await bounded(liveStagedPrefix(this.cfg.keyRoot, g));
             seen = {
-              dirs: liveSessionsIn(objects, await this.eraser.listKeys(objects)),
-              pointers: new Set(await this.eraser.listKeys(pointerRoot)),
+              dirs: dirs === null ? null : liveSessionsIn(objects, dirs),
+              pointers: pointers === null ? null : new Set(pointers),
               // The session ingest's staged batches: a tombstone is revisited while any remain.
-              staged: (await this.eraser.listKeys(liveStagedPrefix(this.cfg.keyRoot, g))).filter((k) => k.endsWith(".staged.ndjson.zst")),
+              staged: staged === null ? null : staged.filter((k) => k.endsWith(".staged.ndjson.zst")),
             };
             listed.set(objects, seen);
           }
@@ -241,37 +508,79 @@ export class ErasureJob {
           continue;
         }
         const dirKey = `${t.base.slice(objects.length).replace(/\/$/, "")}/${t.sessionSegment}`;
-        if (!seen.dirs.has(dirKey) && !seen.pointers.has(t.pointerKey) && seen.staged.length === 0) continue;
+        if (seen.dirs !== null && seen.pointers !== null && seen.staged !== null
+          && !seen.dirs.has(dirKey) && !seen.pointers.has(t.pointerKey) && seen.staged.length === 0) continue;
         groups += 1;
         if (dryRun) continue;
         try {
           const checkedAt = this.now();
-          const { rows: still } = await this.db.query(
-            `SELECT 1 FROM sessions.deleted_upload_sessions
-              WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3 AND origin_id = $4 AND source = $5 AND session_id = $6`,
-            [g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id],
-          );
-          if (still.length === 0) continue; // re-enabled since the page was read
+          if (!(await this.authority.stillFenced(g))) continue; // re-enabled since the page was read
           const before = new Date(checkedAt - LIVE_SKEW_MS);
           // The session ingest's staged copies of this (workspace, user, origin)'s batches,
           // once past the fan-out redrive window. Shared by the group's tombstones: once a page.
           const stagedBefore = new Date(checkedAt - STAGED_ERASE_AFTER_MS);
-          const stagedLeft: string[] = [];
-          for (const key of seen.staged) {
-            const st = await this.eraser.eraseObjectBefore(key, stagedBefore);
+          if (seen.staged !== null) {
+            const stagedLeft: string[] = [];
+            for (const key of seen.staged) {
+              // Per staged object, through the gate (reserve before delete, strict empty, no unresolved PUT).
+              const st = await this.#eraseKey(key, eraseScope(["live-staged-object", this.authority.kind, g.org_id, g.workspace_id, g.user_id, g.origin_id, key]),
+                (v) => v.lastModified !== undefined && v.lastModified < stagedBefore.getTime(),
+                async () => {
+                  if (!(await this.authority.stillFenced(g))) throw refusal("erasure_reenabled");
+                  await this.authority.ready();
+                });
+              versions += st.deleted;
+              this.counters.liveVersionsDeleted += st.deleted;
+              if (st.status !== "erased" || st.remaining > 0) stagedLeft.push(key);
+            }
+            seen.staged = stagedLeft;
+          } else if (!seen.stagedDone) {
+            // Too many staged versions for one listing: the same retention through the paged eraser, resumable.
+            seen.stagedDone = true;
+            const stagedPrefix = liveStagedPrefix(this.cfg.keyRoot, g);
+            const scope = eraseScope(["live-staged", this.authority.kind, g.org_id, g.workspace_id, g.user_id, g.origin_id]);
+            // Same obligation-gated paged erasure (every doomed version reserved first); retention, so its outcome
+            // only decides whether the next sweep resumes (incomplete) or traverses again.
+            const st = await this.#erasePaged(stagedPrefix, scope,
+              (v) => v.key.endsWith(".staged.ndjson.zst") && v.lastModified !== undefined && v.lastModified < stagedBefore.getTime(),
+              async () => {
+                if (!(await this.authority.stillFenced(g))) throw refusal("erasure_reenabled");
+                await this.authority.ready();
+              });
             versions += st.deleted;
             this.counters.liveVersionsDeleted += st.deleted;
-            if (st.kept > 0) stagedLeft.push(key);
           }
-          seen.staged = stagedLeft;
-          const dir = await this.eraser.eraseSessionAnyDate(t.base, t.sessionSegment, before);
-          versions += dir.deleted;
-          this.counters.liveVersionsDeleted += dir.deleted;
-          if (dir.kept > 0) continue; // the next sweep comes back for the rest
-          const ptr = await this.eraser.eraseObjectBefore(t.pointerKey, before);
+          // The session's directory under the (workspace, user, origin) machine prefix, every date, through the shared
+          // strict paged eraser: bounded per run, resumable from a durable checkpoint scoped to this group and the
+          // authority, authority (still fenced) re-checked before every page's deletes, versions newer than the
+          // re-read kept (successors), and done only after a fresh strict zero inventory.
+          const scope = eraseScope(["live-session", this.authority.kind, g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id]);
+          // Successors (newer than the re-read, less clock skew) are kept; a version without a timestamp is never
+          // deleted (S3 listings always carry LastModified).
+          const select = (v: ListedVersion) => inSessionAnyDate(t.base, t.sessionSegment, v.key) && v.lastModified !== undefined && v.lastModified < before.getTime();
+          const authorize = async () => {
+            if (!(await this.authority.stillFenced(g))) throw refusal("erasure_reenabled");
+            await this.authority.ready();
+          };
+          const r = await this.#erasePaged(t.base, scope, select, authorize);
+          versions += r.deleted;
+          this.counters.liveVersionsDeleted += r.deleted;
+          // incomplete: resumes from the checkpoint; unverified / unresolved / refused: the next sweep traverses again.
+          if (r.status === "unverified")
+            // Observability only (NOT a completion, NOT a waiver): the session is NOT complete; its pointer waits for a
+            // fresh strict proof. `reason` is the primitive's own pending reason: "budget" (the verification budget ran
+            // out, e.g. > 10k kept versions share the machine prefix) or "remaining" (selected versions are still listed).
+            this.log({ message: "live erasure unverified", error_code: "erasure_verify_pending", reason: r.proofReason ?? "unknown",
+              org_id: g.org_id, workspace_id: g.workspace_id, user_id: g.user_id, origin_id: g.origin_id, source: g.source, session_id: g.session_id });
+          if (r.status !== "erased") continue;
+          // The pointer last, through the same gate (versions newer than the re-read kept).
+          const ptr = await this.#eraseKey(t.pointerKey, eraseScope(["live-pointer", this.authority.kind, g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id]),
+            (v) => v.lastModified !== undefined && v.lastModified < before.getTime(), authorize);
           versions += ptr.deleted;
           this.counters.liveVersionsDeleted += ptr.deleted;
         } catch (error) {
+          // A re-enable during the run stops before any further delete; nothing to retry for it.
+          if (errorCode(error) === "erasure_reenabled") continue;
           this.counters.liveFenceFailed += 1;
           this.log({ message: "live erasure failed", error_code: errorCode(error) });
         }
@@ -311,12 +620,62 @@ export class ErasureJob {
       try {
         // The exporter may have cancelled it before we took the lease.
         if (!this.state.erasureQueued(item.key, item.enqueued_at)) continue;
-        const n = item.kind === "prefix" ? await this.eraser.erasePrefix(item.key) : await this.eraser.eraseObject(item.key);
-        this.counters.versionsDeleted += n;
-        if (item.kind === "prefix") this.counters.prefixesErased += 1;
-        else this.counters.objectsErased += 1;
-        this.state.erasureDone(item.key, item.enqueued_at);
+        // The lease generation this eraser acquired: every retirement page and the done claim re-validate it.
+        const itemLease = { prefix, holder: LEASE_HOLDER, gen: this.state.leaseGen(prefix) ?? "" };
+        if (item.kind === "object") {
+          // One queued object, through the SAME gate as a prefix: reserve every version before its delete, done only
+          // after a strict empty inventory of the key and no unresolved PUT at exactly that key.
+          const objScope = eraseScope(["queued-object", this.authority.kind, item.org_id, item.key, item.reason, item.enqueued_at, "lease:" + prefix]);
+          const r = await this.#eraseKey(item.key, objScope, () => true, async () => {
+            if (!this.state.erasureQueued(item.key, item.enqueued_at)) throw refusal("erasure_item_cancelled");
+            if (!this.state.renewLease(prefix, LEASE_HOLDER, this.now())) throw refusal("erasure_lease_lost");
+            await this.authority.ready();
+          }, true, itemLease);
+          this.counters.versionsDeleted += r.deleted;
+          handled += 1;
+          if (r.status === "unresolved") {
+            this.state.erasureFailed(item.key, (this.cfg.obligationsSettled?.() ?? false) ? "erasure_write_unresolved" : "erasure_obligations_unattested", this.now());
+            continue;
+          }
+          if (r.status !== "erased") continue;
+          // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
+          if (this.state.obligations ? !this.state.completeErasure(item.key, item.enqueued_at, item.key.slice(0, item.key.lastIndexOf("/") + 1), r.rev, itemLease) : (this.state.erasureDone(item.key, item.enqueued_at), false)) {
+            this.counters.doneRefused += 1;
+            this.state.erasureFailed(item.key, "erasure_done_refused", this.now());
+            this.log({ message: "erasure done refused", error_code: "erasure_done_refused", kind: item.kind });
+            continue;
+          }
+          this.counters.objectsErased += 1;
+          continue;
+        }
+        // A session prefix: the shared strict paged eraser, resumable across runs from a durable checkpoint bound to
+        // this queued item (key + enqueue time), the authority and the operation. Before every page's deletes the
+        // item must still be queued, this process must still hold its lease, and the authority must still be ready.
+        // Scope: operation, authority, tenant + queued item (its enqueue time is the item's generation) and the leased resource.
+        const scope = eraseScope(["queued-prefix", this.authority.kind, item.org_id, item.key, item.reason, item.enqueued_at, "lease:" + prefix]);
+        const authorize = async () => {
+          if (!this.state.erasureQueued(item.key, item.enqueued_at)) throw refusal("erasure_item_cancelled");
+          if (!this.state.renewLease(prefix, LEASE_HOLDER, this.now())) throw refusal("erasure_lease_lost");
+          await this.authority.ready();
+        };
+        const r = await this.#erasePaged(item.key, scope, undefined, authorize, undefined, true, undefined, itemLease);
+        this.counters.versionsDeleted += r.deleted;
         handled += 1;
+        // Still queued unless proven: incomplete resumes from the checkpoint; unverified / refused retry on the next
+        // drain; an unresolved write (a PUT whose outcome is unknown) keeps it queued, re-swept on the bounded backoff.
+        if (r.status === "unresolved") {
+          this.state.erasureFailed(item.key, (this.cfg.obligationsSettled?.() ?? false) ? "erasure_write_unresolved" : "erasure_obligations_unattested", this.now());
+          continue;
+        }
+        if (r.status !== "erased") continue;
+        // The done claim re-validates the revision in the SAME transaction as the queue-row removal.
+        if (this.state.obligations ? !this.state.completeErasure(item.key, item.enqueued_at, item.key, r.rev, itemLease) : (this.state.erasureDone(item.key, item.enqueued_at), false)) {
+          this.counters.doneRefused += 1;
+          this.state.erasureFailed(item.key, "erasure_done_refused", this.now());
+          this.log({ message: "erasure done refused", error_code: "erasure_done_refused", kind: item.kind });
+          continue;
+        }
+        this.counters.prefixesErased += 1;
       } catch (error) {
         this.counters.failed += 1;
         this.state.erasureFailed(item.key, errorCode(error), this.now());

@@ -19,6 +19,7 @@ import {
 } from "./neon-reader.ts";
 import type { SyncState, WorkItem } from "./state.ts";
 import type { Throttle } from "./throttle.ts";
+import { manifestClaim, obligatedStore } from "./obligated-store.ts";
 
 export interface LockGuard {
   maxNonAdvisory: number;
@@ -259,6 +260,13 @@ export class Syncer {
     const touched = new Set<string>();
     const leased: string[] = [];
     const referenced = new Set<string>();
+    // Every PUT of this group as an unresolved-write invocation (obligated-store.ts); the acked versions.
+    const acked = new Map<string, string>();
+    // The lease generation of each prefix this group leased (the publication proof).
+    const gens: Record<string, string> = {};
+    // S3X_OBLIGATIONS off: today's behaviour (no invocation recording, no claims, no publication).
+    const ob = this.state.obligations;
+    const store = ob ? obligatedStore(this.target.store, this.state, LEASE_HOLDER, acked) : this.target.store;
     try {
       const keys: string[] = [];
       const truncations: { key: string; strings: number; maxChars: number }[] = [];
@@ -271,6 +279,7 @@ export class Syncer {
       for (const unit of units) {
         const target = {
           ...this.target,
+          ...(ob ? { store } : {}),
           renew: (k: string) => this.state.renewLease(k.slice(0, -"manifest.json".length), LEASE_HOLDER),
         };
         const r = await exportUnit(target, unit, lane.source, {
@@ -281,11 +290,16 @@ export class Syncer {
             if (!this.state.acquireLease(prefix, LEASE_HOLDER))
               throw Object.assign(new Error("the erasure job holds this session"), { code: "prefix_busy" });
             leased.push(prefix);
+            const gen = ob ? this.state.leaseGen(prefix) : undefined;
+            if (gen) gens[prefix] = gen;
           },
           onKey: (k) => {
             touched.add(k);
             this.state.recordPendingKey(work.org_id, work.session_id, k);
           },
+          // Claim every object the manifest will reference BEFORE it is visible: this run's acked versions exactly,
+          // reused / unchanged ones at the key level. Refused (the group fails, no manifest) if any is reserved.
+          ...(ob ? { onPublish: manifestClaim(this.state, acked, LEASE_HOLDER, gens) } : {}),
         });
         if (r.fenced) this.counters.fenced += 1;
         for (const m of r.manifests) {
@@ -311,6 +325,9 @@ export class Syncer {
         if (await erasableByExporter(this.target, work.org_id, key, work.session_id))
           erase.push({ key: key.slice(0, -"manifest.json".length), kind: "prefix", org_id: work.org_id, reason: "stale_prefix" });
       }
+      // Publish (own) the versions this group references, under the eraser's reservation lock: refused,
+      // and the group failed, if the erasure job reserved any of them for deletion meanwhile.
+      if (ob) this.state.publishWrites([...acked].filter(([k]) => referenced.has(k) || keep.has(k)).map(([key, versionId]) => ({ key, versionId })), { holder: LEASE_HOLDER, gens });
       this.state.enqueueErasure(erase);
       // Under the lease: nothing this group now references, or writes under, stays queued.
       this.state.cancelErasures([...referenced, ...keys.map((k) => k.slice(0, -"manifest.json".length))]);

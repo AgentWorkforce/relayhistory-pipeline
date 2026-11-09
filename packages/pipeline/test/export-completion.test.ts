@@ -11,6 +11,7 @@ import {
   recordExportDeferred,
   resolveExportDeferred,
 } from "../src/lib/pipeline/session-split.js";
+import { SESSION_BOOTSTRAP_FILES } from "../../../src/hoopdb/session-bootstrap-chain.js";
 
 const supabase = (path: string) =>
   fileURLToPath(new URL(`../../../supabase/${path}`, import.meta.url).href);
@@ -28,24 +29,10 @@ const scope = { orgId: "o" };
 beforeAll(async () => {
   pg = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await pg.exec(readFileSync(supabase("tests/supabase_shim.sql"), "utf8"));
-  await pg.exec(
-    readFileSync(
-      supabase("bootstrap/session_directory_search_worker.sql"),
-      "utf8",
-    ),
-  );
-  await pg.exec(
-    readFileSync(
-      supabase("bootstrap/session_token_verifier.sql"),
-      "utf8",
-    ),
-  );
-  await pg.exec(
-    readFileSync(
-      supabase("bootstrap/session_ingest_roles.sql"),
-      "utf8",
-    ),
-  );
+  // Single-sourced bootstrap chain (session-bootstrap-chain.ts): the grant
+  // migration FAILs closed without the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES)
+    await pg.exec(readFileSync(supabase(f.replace(/^supabase\//, '')), "utf8"));
   for (const file of readdirSync(supabase("migrations/")).sort())
     await pg.exec(readFileSync(supabase(`migrations/${file}`), "utf8"));
 });

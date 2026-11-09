@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { Hono } from "hono";
-import { createPipelineRoutes, type AppEnv } from "../../shared/vendor.ts";
+import { createPipelineRoutes, manifestKey, type AppEnv } from "../../shared/vendor.ts";
 import { createCourierManifestRoutes } from "../manifests.ts";
 import { PUBLIC_INGEST_PATHS, mountIngestApi } from "../routes.ts";
+import { resetSharedRelaycontrolIntrospectors } from "@rhc/auth/relaycontrol.ts";
 
 /**
  * The public ALB contract (docs/aws-stage.md "Ingest exposure"): only health
@@ -98,5 +99,134 @@ describe("multi-tenant ingest", () => {
     expect(allow).toBeGreaterThan(auth);
     const ingest = require("node:fs").readFileSync(new URL("../ingest.ts", import.meta.url), "utf8") as string;
     expect(ingest).toContain("allowedOrgIds: allowedOrgIdsFromEnv(process.env.TENANT_ORG_IDS)");
+  });
+});
+
+/**
+ * Relaycontrol user access tokens (`sh_at_`, RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true),
+ * contract v1.1 machine verification. The caller's X-Machine-Id is forwarded
+ * to relaycontrol as `machine`; the machine claim the unchanged live-write
+ * machine gate reads comes only from relaycontrol's verified `machine_id`.
+ * Relaycontrol is a stub fetch; synthetic values only.
+ */
+describe("relaycontrol tokens at the ingest", () => {
+  const ORIGIN = "https://history.example.test";
+  const INTROSPECT = "http://relaycontrol.test/internal/v1/auth/introspect";
+  const rcEnv = {
+    RELAYHISTORY_ORIGIN: ORIGIN,
+    RELAYAUTH_JWKS_URL: "http://127.0.0.1:9/.well-known/jwks.json",
+    RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS: "true",
+    RELAYCONTROL_INTROSPECT_URL: "http://relaycontrol.test",
+    RELAYCONTROL_INTROSPECT_SECRET: "synthetic-secret",
+    PIPELINE_OPS_SECRET: "ops-secret-for-test",
+  };
+  const a = new Hono<AppEnv>();
+  mountIngestApi(a, { courierManifests: createCourierManifestRoutes(deps), pipeline: createPipelineRoutes(deps) }, new Hono<AppEnv>(), { relayhistoryOrigin: ORIGIN });
+  const v1Routes = a.routes.filter((r) => r.method !== "ALL" && r.path.startsWith("/v1/") && !r.path.startsWith("/v1/internal/"));
+  const writes = v1Routes.filter((r) => r.method !== "GET" && r.method !== "HEAD");
+  const reads = v1Routes.filter((r) => r.method === "GET");
+  type Body = { token: string; aud: string; workspace?: string; machine?: string };
+  const verified = (over: Record<string, unknown> = {}) => (body: Body) => {
+    const now = Math.floor(Date.now() / 1000);
+    return Response.json({ active: true, sub: "u-1", email: "a@example.test", principal_type: "desktop-user", org: "org-a", workspace: "ws-a", scopes: ["rth:read", "rth:sync"], machine_id: body.machine ?? null, aud: ORIGIN, iat: now, exp: now + 600, token_id: "tokid_1", ...over });
+  };
+  const call = async (
+    r: { method: string; path: string },
+    opts: { relaycontrol?: (body: Body) => Response; machine?: string; query?: string; body?: unknown } = {},
+  ) => {
+    resetSharedRelaycontrolIntrospectors();
+    const original = globalThis.fetch;
+    const bodies: Body[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      if (String(input) !== INTROSPECT) throw new Error(`unexpected fetch ${String(input)}`);
+      const body = JSON.parse(String(init.body)) as Body;
+      bodies.push(body);
+      return (opts.relaycontrol ?? verified())(body);
+    }) as typeof fetch;
+    try {
+      const write = r.method !== "GET" && r.method !== "HEAD";
+      const headers: Record<string, string> = { authorization: "Bearer sh_at_synthetic", "x-relayhistory-workspace-id": "ws-a", "content-type": "application/json" };
+      if (opts.machine !== undefined) headers["x-machine-id"] = opts.machine;
+      const res = await a.request(`${concrete(r.path)}${opts.query ?? ""}`, { method: r.method, headers, body: write ? JSON.stringify(opts.body ?? { machineId: opts.machine ?? "mach-1" }) : undefined }, rcEnv);
+      const text = await res.text();
+      let code: string | undefined;
+      try { code = (JSON.parse(text) as { error?: { code?: string } }).error?.code; } catch { code = undefined; }
+      return { text, status: res.status, code, bodies };
+    } finally {
+      globalThis.fetch = original;
+    }
+  };
+  const route = (method: string, path: string) => {
+    const found = v1Routes.find((r) => r.method === method && r.path === path);
+    if (!found) throw new Error(`${method} ${path} is not mounted`);
+    return found;
+  };
+  const authCodes = ["missing_authorization", "unauthorized", "auth_not_configured", "invalid_token", "relaycontrol_unavailable", "forbidden", "machine_claim_refused", "origin_bound_assertion_required"];
+
+  test("the chunk, event and manifest writes are all mounted", () => {
+    for (const path of ["/v1/pipeline/chunks", "/v1/pipeline/events", "/v1/pipeline/manifests"]) expect(writes.some((r) => r.path === path)).toBe(true);
+  });
+
+  test("no X-Machine-Id: every write (chunk, event, manifest) is refused 403 machine_claim_refused, and no machine is sent", async () => {
+    for (const r of writes) {
+      const { status, code, bodies } = await call(r, { body: { machineId: "mach-1" }, query: "?machine=mach-1" });
+      expect({ route: `${r.method} ${r.path}`, status, code }).toEqual({ route: `${r.method} ${r.path}`, status: 403, code: "machine_claim_refused" });
+      expect(bodies.length).toBeLessThanOrEqual(1);
+      for (const b of bodies) expect(b).not.toHaveProperty("machine");
+    }
+  });
+
+  test("X-Machine-Id present but relaycontrol answers machine_id null: every write is refused", async () => {
+    for (const r of writes) {
+      const { status, code, bodies } = await call(r, { machine: "mach-1", query: "?machine=mach-1", relaycontrol: verified({ machine_id: null }) });
+      expect({ route: `${r.method} ${r.path}`, status, code }).toEqual({ route: `${r.method} ${r.path}`, status: 403, code: "machine_claim_refused" });
+      for (const b of bodies) expect(b.machine).toBe("mach-1");
+    }
+  });
+
+  test("machine owned by another user, unclaimed, or in another workspace: 401 with a generic code", async () => {
+    for (const reason of ["machine_not_owned", "machine_unclaimed", "machine_workspace_mismatch"]) {
+      for (const r of writes) {
+        const { text, status, code } = await call(r, { machine: "mach-1", query: "?machine=mach-1", relaycontrol: () => Response.json({ active: false, reason }) });
+        expect({ reason, route: `${r.method} ${r.path}`, status, code }).toEqual({ reason, route: `${r.method} ${r.path}`, status: 401, code: "unauthorized" });
+        expect(text).not.toContain(reason);
+      }
+    }
+  });
+
+  test("a verified machine passes the gate only where the request names that machine", async () => {
+    const chunks = route("POST", "/v1/pipeline/chunks");
+    const events = route("POST", "/v1/pipeline/events");
+    // Verified and matching: past the gate and the scope (the throwing deps answer, never an auth refusal).
+    for (const [r, opts] of [[chunks, { query: "?machine=mach-1" }], [events, { body: { machineId: "mach-1" } }]] as const) {
+      const { status, code, bodies } = await call(r, { machine: "mach-1", ...opts });
+      expect({ route: r.path, status, authRefused: authCodes.includes(code ?? "") }).toMatchObject({ route: r.path, authRefused: false });
+      expect(status).not.toBe(401);
+      expect(bodies).toEqual([{ token: "sh_at_synthetic", aud: ORIGIN, workspace: "ws-a", machine: "mach-1" }]);
+    }
+    // Verified, but the chunk or event names another machine: refused by the unchanged gate.
+    expect((await call(chunks, { machine: "mach-1", query: "?machine=mach-2" })).code).toBe("machine_claim_refused");
+    expect((await call(events, { machine: "mach-1", body: { machineId: "mach-2" } })).code).toBe("machine_claim_refused");
+  });
+
+  test("a verified machine with rth:read only cannot write", async () => {
+    // A manifest body the courier route reads as far as its scope check.
+    const key = manifestKey({ workspaceId: "ws-a", machineId: "mach-1", harness: "claude", sessionId: "s-1", startDate: "2026-11-07" });
+    for (const r of writes) {
+      const body = r.path === "/v1/pipeline/manifests" ? { key, manifest: {} } : { machineId: "mach-1" };
+      const { status, code } = await call(r, { machine: "mach-1", query: "?machine=mach-1", body, relaycontrol: verified({ scopes: ["rth:read"] }) });
+      expect({ route: `${r.method} ${r.path}`, status, code }).toEqual({ route: `${r.method} ${r.path}`, status: 403, code: "forbidden" });
+    }
+  });
+
+  test("reads with no machine pass authentication with rth:read only (they reach the dependencies)", async () => {
+    expect(reads.length).toBeGreaterThan(0);
+    for (const r of reads) {
+      const { status, code, bodies } = await call(r, { relaycontrol: verified({ scopes: ["rth:read"] }) });
+      // Past auth the throwing dependency (or the route's own default-off gate)
+      // answers; never an authentication, scope or machine refusal.
+      expect({ route: `${r.method} ${r.path}`, status: status === 401 ? 401 : "not 401", authRefused: authCodes.includes(code ?? "") }).toEqual({ route: `${r.method} ${r.path}`, status: "not 401", authRefused: false });
+      for (const b of bodies) expect(b).not.toHaveProperty("machine");
+    }
   });
 });
