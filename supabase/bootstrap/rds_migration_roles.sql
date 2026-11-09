@@ -1,6 +1,11 @@
 -- Amazon RDS for PostgreSQL 16+ migration compatibility roles (HOOPDB_DB_MODE=rds;
 -- RDS for PostgreSQL only, NOT Aurora). Same contract as cloudsql_migration_roles.sql.
 --
+-- MASTER-OWNER LAYOUT ONLY. Do not run this file for the infra #107 separate-database
+-- layout: there rds-activation/v1 (src/hoopdb/rds-activation.ts) creates the complete
+-- role set in its one transaction. It still reads this file's role inventory below to
+-- generate that set, so this file is part of its artifact identity.
+--
 -- RDS exposes no customer SUPERUSER: the master is a CREATEROLE member of rds_superuser.
 -- PostgreSQL 16+ records an automatic ADMIN membership, granted by the bootstrap
 -- superuser (rdsadmin on RDS), when a non-superuser CREATEROLE user creates a role, and

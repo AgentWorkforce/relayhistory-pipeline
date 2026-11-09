@@ -35,9 +35,11 @@ import {
   SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS,
   SUPABASE_PLATFORM_SUPERUSERS,
 } from "../migrate-guards.ts";
+import * as migrateGuards from "../migrate-guards.ts";
 import { gateOpen, workerTick } from "../../shared/worker.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 import {
+  ADOPTABLE_INDEXES,
   MIGRATION_SENTINELS,
   NON_CREATE_STEPS,
 } from "../migration-sentinels.ts";
@@ -127,6 +129,15 @@ test("managed-provider bootstrap fixed-role inventories stay equal", () => {
     declaredRoles("cloudsql_migration_roles.sql"),
   );
 });
+
+/** Upstream plan steps ordered after 20261105044020 (a database "before 044020" must hold none: that is a ledger gap). */
+const CB_STEP = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+const laterUpstream = (steps: Array<{ name: string }>) => steps.filter((s) => s.name.startsWith("upstream:") && s.name > CB_STEP);
+/** Roll back every upstream step after 044020, newest first, so 044020 is the newest applied step again. */
+async function rollbackLaterThan044020(db: PGlite, profile: MigrationProfile) {
+  for (const { name } of laterUpstream(await plan(profile)).reverse())
+    await db.exec(readFileSync(join(root, "supabase/rollbacks", `${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`), "utf8"));
+}
 
 describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
   const base = {
@@ -274,6 +285,8 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
         runtimeRole: "hoop_runtime",
         runtimeLogin: true,
         functionBoundary: "global-default-revoke",
+        // Unset HOOPDB_RDS_LAYOUT keeps today's master-owner contract.
+        rdsLayout: "master-owner",
       });
   });
 
@@ -2333,10 +2346,11 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105045000 (digest narrative cache) applies last: its own down drops the table first.
+    // Everything later than 044020 rolls back newest first (here: 045000 digest narrative
+    // cache): its own down drops the table first.
     expect(await names()).toContain(DG);
     expect(await relation("sessions.daily_digest_narratives")).toBe("sessions.daily_digest_narratives");
-    await rollback("20261105045000_digest_narrative_cache.down.sql");
+    await rollbackLaterThan044020(db, SUPA_ET);
     expect(await names()).not.toContain(DG);
     expect(await relation("sessions.daily_digest_narratives")).toBeNull();
     // 20261105044020 (claim-bootstrap org_id indexes) applies next: 044010's and 044000's downs refuse (55000)
@@ -2544,8 +2558,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await passed()).toBe(false);
     expect((await failure(rollback("20261105038000_claim_attempt_records_retirement.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(T);
-    // 045000 (lane F4 digest narratives) was already rolled back first at the
-    // top of this test (it was the latest lane); its table stays gone.
+    // 045000 (lane F4 digest narratives) was already rolled back newest-first at the
+    // top of this test via rollbackLaterThan044020 (it was the latest lane); its table stays gone.
     expect(await names()).not.toContain(DG);
     expect(await relation("sessions.daily_digest_narratives")).toBeNull();
     // 039000 (buffered GC) is now the latest lane: it rolls back directly.
@@ -2756,8 +2770,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so the grants' down refuses until they are rolled back,
-    // newest first: 045000 (digest), 044020 (claim-bootstrap indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
-    const digestDown = readFileSync(join(root, "supabase/rollbacks/20261105045000_digest_narrative_cache.down.sql"), "utf8");
+    // newest first: everything later than 044020 (via rollbackLaterThan044020), then 044020
+    // (claim-bootstrap indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
     const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105044000_read_api_tokens.down.sql"), "utf8");
@@ -2781,7 +2795,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await db.exec(ET_BOOT);
       await runMigrations(client(db), { profile: SUPA_ET });
       expect(await holds(db)).toBe(true);
-      expect(await failure(db.exec(digestDown))).toBeNull();
+      await rollbackLaterThan044020(db, SUPA_ET);
       expect(await failure(db.exec(orgIndexesDown))).toBeNull();
       await db.exec(lockDown);
       expect(await failure(db.exec(readTokensDown))).toBeNull();
@@ -2798,7 +2812,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await runMigrations(client(db), { profile: SUPA_ET });
       await db.exec(`DROP OWNED BY search_consumer_runtime`);
       await db.exec(`DROP ROLE search_consumer_runtime`);
-      expect(await failure(db.exec(digestDown))).toBeNull();
+      await rollbackLaterThan044020(db, SUPA_ET);
       expect(await failure(db.exec(orgIndexesDown))).toBeNull();
       await db.exec(lockDown);
       expect(await failure(db.exec(readTokensDown))).toBeNull();
@@ -3259,6 +3273,60 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const error = await failure(inspectMigrations(client(db), SUPA_ET));
     await db.exec("ROLLBACK");
     expect(error?.code).toBe("migration_changed");
+  });
+
+  test("release read-only plan goes red on 20261105044020 when a claim-bootstrap index is absent on a populated table; the apply refuses before the pending marker", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+    const LAZY = "ingest_lazy_native_slots_org_id_idx";
+    // The previous release: everything but 044020 (and no later upstream step: that would be a ledger gap), validated (marker 'pass').
+    const full = await plan(SUPA_ET);
+    const laterSteps = laterUpstream(full) as typeof full;
+    const later = laterSteps.map((s) => s.name);
+    const steps = full.filter((s) => s.name !== CB && !later.includes(s.name));
+    // That release's binary shipped the function ACL manifest of its day, which could not yet list a
+    // function a later step creates; the current manifest does, so the non-local exact-ACL check would
+    // refuse (function_acl_drift) a database without them. Validate against the previous manifest:
+    // the current one minus the functions later steps CREATE. No later step: the current manifest, unmocked.
+    const laterFns = new Set(laterSteps.flatMap((s) =>
+      [...readFileSync(s.path, "utf8").matchAll(/\bCREATE\s+FUNCTION\s+(sessions\.\w+)\s*\(/gi)].map((m) => m[1]!.toLowerCase())));
+    const manifest = await migrateGuards.sessionsFunctionAclManifest();
+    const previousManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
+    const previousRelease = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
+    try {
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
+    } finally {
+      previousRelease?.mockRestore();
+    }
+    // Production shape: seven prebuilt CONCURRENTLY, the lazy-slot one held, its table populated.
+    for (const x of ADOPTABLE_INDEXES[CB]!) if (x.name !== LAZY) await db.exec(x.def);
+    await db.query(
+      `INSERT INTO sessions.ingest_lazy_native_slots(key_sha256,key_material,org_id,workspace_id,origin_id,record_id,
+         source_identity_sha256,control_epoch,initialized_witness_sha256) VALUES ($1,'{}','org-probe','ws-probe','o','r',$1,$1,$1)`,
+      ["a".repeat(64)],
+    );
+    const before = await snapshot(db);
+    expect((before.marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
+    // Plan mode (read-only): red, naming the index and the packet.
+    await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const planned = await failure(inspectMigrations(client(db), SUPA_ET));
+    await db.exec("ROLLBACK");
+    expect(planned?.code).toBe("index_prebuild_required");
+    expect(planned?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${CB}) is absent and table sessions.ingest_lazy_native_slots is not empty`);
+    expect(planned?.message).toContain("claim-bootstrap index packet");
+    // Apply: the same refusal, before anything is written; the marker stays 'pass'.
+    const applied = await failure(runMigrations(client(db), { profile: SUPA_ET }));
+    expect(applied?.code).toBe("index_prebuild_required");
+    expect(await snapshot(db)).toEqual(before);
+    // After the operator's CONCURRENTLY build: the plan is green with 044020 pending, the apply adopts it.
+    await db.exec(`CREATE INDEX CONCURRENTLY ${LAZY} ON sessions.ingest_lazy_native_slots USING btree (org_id)`);
+    await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const report = await inspectMigrations(client(db), SUPA_ET);
+    await db.exec("ROLLBACK");
+    expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([CB, ...later]);
+    expect(await failure(runMigrations(client(db), { profile: SUPA_ET, expectedLedgerSha256: report.ledgerSha256 }))).toBeNull();
+    expect(((await snapshot(db)).marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
   });
 
   test("release read-only plan shows rename adoptions, nothing pending, and binds the ledger as stored", async () => {

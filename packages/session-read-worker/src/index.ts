@@ -49,7 +49,11 @@
  * render accepts only with READ_API_DIRECTORY_WORKSPACES="*" and which never bypasses the per-user
  * privacy gate). READ_API_OWNER_BUFFERED_EVENTS=on (default off; any value but unset/empty/"on" answers
  * 503) adds owner-buffered session events on GET /v1/sessions/:sessionId/events with `source`; it
- * has no effect without the owner-buffered flag and allowlists. Flag, allowlist, bucket and binding are
+ * has no effect without the owner-buffered flag and allowlists. READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY
+ * (default unset = the serial stage fetch; "0"/"1" the same; "2".."32" = that many stage GetObjects
+ * in flight per buffered events read; any other value answers 503) and READ_API_OWNER_BUFFERED_PHASE_LOG
+ * (default off; exactly "1" adds per-phase *_ms fields to the request log line) apply to the
+ * owner-buffered events read only. Flag, allowlist, bucket and binding are
  * all unset in wrangler.jsonc; only the deploy workflow's owner_buffered=on render
  * (scripts/render-deploy-config.ts) adds them.
  */
@@ -83,7 +87,7 @@ import {
   type ServiceBinding,
 } from "../../../src/session-read-api/buffered-search-gate.ts";
 import { createS3Store } from "../../../src/shared/vendor.ts";
-import { boundedStreamDecompress, ownerBufferedEnabled, ownerBufferedEventsEnabled, serviceBindingControlHead, sqlOwnerBufferedReads, type OwnerBufferedDeps } from "../../../src/session-read-api/owner-buffered.ts";
+import { boundedStreamDecompress, ownerBufferedEnabled, ownerBufferedEventsEnabled, ownerBufferedPhaseLogEnabled, ownerBufferedStageConcurrency, serviceBindingControlHead, sqlOwnerBufferedReads, type OwnerBufferedDeps } from "../../../src/session-read-api/owner-buffered.ts";
 
 export interface Env extends CanonicalEnv {
   SUPABASE: Hyperdrive;
@@ -136,6 +140,17 @@ export interface Env extends CanonicalEnv {
    * RELAYHISTORY_READ_OWNER_BUFFERED is on and the workspace is on both allowlists.
    */
   READ_API_OWNER_BUFFERED_EVENTS?: string;
+  /**
+   * Owner-buffered events read: the most S3 stage GetObjects in flight. Unset, empty, "0" or "1"
+   * = the serial fetch (default); an integer "2".."32" = bounded concurrency; any other value
+   * refuses every request (503, logged missing_READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY).
+   */
+  READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY?: string;
+  /**
+   * Owner-buffered events read: exactly "1" adds the per-phase fields (session_start_ms ..
+   * fold_ms, s3_stage_count, aborted_phase) to the request log line; anything else is off (default).
+   */
+  READ_API_OWNER_BUFFERED_PHASE_LOG?: string;
   /** The owner-buffered canary allowlist (parseDirectoryWorkspaces syntax); unset/empty = none. */
   READ_API_OWNER_BUFFERED_WORKSPACES?: string;
   /** The ingest bucket holding buffered-batches/ stage objects (owner-buffered reads only). */
@@ -320,6 +335,12 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     } catch {
       throw new ConfigError("READ_API_OWNER_BUFFERED_EVENTS");
     }
+    // The stage concurrency accepts only unset/empty, "0", "1" or "2".."32"; anything else is a misconfigured deploy.
+    try {
+      ownerBufferedStageConcurrency(env.READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY);
+    } catch {
+      throw new ConfigError("READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY");
+    }
   } catch (error) {
     // Configuration errors name a field, never a value.
     log("error", "read worker not configured", { error_code: error instanceof ConfigError ? `missing_${error.field}` : (error as { name?: string })?.name ?? "config" });
@@ -448,7 +469,20 @@ export function ownerBufferedDeps(env: Env, run: TenantRunner, fetcher: typeof f
     decompress: boundedStreamDecompress(Decompress) /* stops at the bound; fzstd's one-shot form with a fixed buffer silently truncates */,
     // Session events from buffered stages only with READ_API_OWNER_BUFFERED_EVENTS=on (handle() refused any other value).
     ...(ownerBufferedEventsFlag(env) ? { events: true } : {}),
+    // Bounded-concurrency stage fetch only with READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY=2..32; otherwise serial.
+    ...(ownerBufferedStageConcurrencyFlag(env) > 1 ? { stageConcurrency: ownerBufferedStageConcurrencyFlag(env) } : {}),
+    // Per-phase log fields only with READ_API_OWNER_BUFFERED_PHASE_LOG=1.
+    ...(ownerBufferedPhaseLogEnabled(env.READ_API_OWNER_BUFFERED_PHASE_LOG) ? { phaseLog: true } : {}),
   };
+}
+
+/** READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY as a number; a refused value is 1, serial (handle() already answered 503 for it). */
+function ownerBufferedStageConcurrencyFlag(env: Env): number {
+  try {
+    return ownerBufferedStageConcurrency(env.READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY);
+  } catch {
+    return 1;
+  }
 }
 
 /** READ_API_OWNER_BUFFERED_EVENTS as a boolean; a refused value is off here (handle() already answered 503 for it). */

@@ -3,6 +3,7 @@ import {decodeCustodyEnvelope} from "./custody-wire.ts";
 import {validatedCustodyAck} from "./custody-ack.ts";
 import {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER,PRIVATE_CUSTODY_BYTES,type CurrentCustodyPacket} from "./custody-protocol.ts";
 import {orderedControl,orderedControlResult,type OrderedControl} from "./control-protocol.ts";
+import { registerSessionEraseRoutes, SESSION_ERASE_DISABLED, type SessionEraseConfig } from "./session-erase.ts";
 /**
  * The 96Bulls session ingest: relayhistory's delivery write contract
  * (relayhistory-cloud packages/relayhistory/src/routes/delivery.ts), served
@@ -12,6 +13,8 @@ import {orderedControl,orderedControlResult,type OrderedControl} from "./control
  *   GET  /v1/delivery/limits    rth:sync   DELIVERY_LIMITS + contentEncodings
  *   POST /v1/turns/batches      rth:sync   relay session turns as records (turns.ts), same receipt
  *   GET  /healthz                          liveness only
+ *   POST|GET /internal/v1/session-erase/... operator per-session erase (session-erase.ts; default
+ *                                          off: 501 not_implemented, and still 501 when enabled)
  *
  * Every other route is `501 unsupported_by_backend`. Selection, reset and
  * reads stay on relayhistory until their own cutover.
@@ -158,6 +161,11 @@ export interface IngestAppDeps {
    * pre-forward read for such a caller.
    */
   syncAdmissionFrozenReceipt?: SyncAdmissionFrozenReceiptMode;
+  /**
+   * Operator per-session erase (session-erase.ts, docs/operator-session-erase-contract.md). Absent: the
+   * disabled config, so /internal/v1/session-erase/* answers 501 not_implemented and reads nothing.
+   */
+  sessionErase?: SessionEraseConfig;
 }
 
 /**
@@ -462,6 +470,9 @@ export function createIngestApp(deps: IngestAppDeps) {
   });
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+
+  // Outside /v1, so neither the identity middleware below nor the /v1/* fallback sees it.
+  registerSessionEraseRoutes(app, deps.sessionErase ?? SESSION_ERASE_DISABLED, emit);
 
   // Identity for /v1, relayhistory's codes: 401 missing_authorization / invalid_token, 403 forbidden.
   const identify = deps.identify ?? signedBindingIdentity(deps.signingKey);
