@@ -50,19 +50,20 @@ export async function armWakeup(
 }
 
 /** Drop never-claimed wakeups with no evidence for `maxAgeHours` (relayhistory prune_stale_session_wakeups_v1). */
-export async function pruneStaleWakeups(db: SqlExecutor, maxAgeHours: number, limit = 5_000): Promise<number> {
+export async function pruneStaleWakeups(db: SqlExecutor, maxAgeHours: number, limit = 5_000, workspaceIds?: readonly string[]): Promise<number> {
   const { rows } = await db.query<{ n: number }>(
     `WITH gone AS (
        DELETE FROM sessions.session_brief_wakeups AS w
         USING (SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups
                 WHERE evidence_at < now() - make_interval(hours => $1::integer)
+                  AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))
                   AND (lease_expires_at IS NULL OR lease_expires_at < now())
                 ORDER BY evidence_at LIMIT $2 FOR UPDATE SKIP LOCKED) AS s
         WHERE w.org_id = s.org_id AND w.workspace_id = s.workspace_id
           AND w.harness = s.harness AND w.session_id = s.session_id
         RETURNING 1)
      SELECT count(*)::int AS n FROM gone`,
-    [maxAgeHours, limit],
+    [maxAgeHours, limit, workspaceIds ?? null],
   );
   return rows[0]?.n ?? 0;
 }
@@ -75,7 +76,7 @@ export interface ClaimedWakeup extends SessionDirectoryKey {
 }
 
 /** Claim up to `batch` due wakeups under a lease (SKIP LOCKED, so any number of workers may poll). */
-export async function claimWakeups(db: SqlExecutor, batch: number, leaseSeconds: number): Promise<ClaimedWakeup[]> {
+export async function claimWakeups(db: SqlExecutor, batch: number, leaseSeconds: number, workspaceIds?: readonly string[]): Promise<ClaimedWakeup[]> {
   const { rows } = await db.query<{
     org_id: string;
     workspace_id: string;
@@ -89,6 +90,7 @@ export async function claimWakeups(db: SqlExecutor, batch: number, leaseSeconds:
     `WITH due AS (
        SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups
         WHERE due_at <= now() AND (lease_expires_at IS NULL OR lease_expires_at < now())
+          AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))
         ORDER BY due_at, org_id, workspace_id, harness, session_id
         LIMIT $1 FOR UPDATE SKIP LOCKED)
      UPDATE sessions.session_brief_wakeups AS w
@@ -99,7 +101,7 @@ export async function claimWakeups(db: SqlExecutor, batch: number, leaseSeconds:
         AND w.harness = due.harness AND w.session_id = due.session_id
       RETURNING w.org_id, w.workspace_id, w.harness, w.session_id, w.admission,
                 w.generation::text AS generation, w.attempts, w.lease_id::text AS lease_id`,
-    [batch, leaseSeconds],
+    [batch, leaseSeconds, workspaceIds ?? null],
   );
   return rows.map((r) => ({
     orgId: r.org_id,
@@ -268,9 +270,10 @@ export async function admit(
 }
 
 /** Admission rows are only needed for today; keep yesterday's for the day boundary. */
-export async function pruneAttempts(db: SqlExecutor): Promise<void> {
+export async function pruneAttempts(db: SqlExecutor, workspaceIds?: readonly string[]): Promise<void> {
   await db.query(
-    `DELETE FROM sessions.session_brief_attempts WHERE day < (now() AT TIME ZONE 'UTC')::date - 1`,
+    `DELETE FROM sessions.session_brief_attempts WHERE day < (now() AT TIME ZONE 'UTC')::date - 1
+       AND ($1::text[] IS NULL OR workspace_id=ANY($1::text[]))`, [workspaceIds ?? null],
   );
 }
 
@@ -366,6 +369,7 @@ export async function recordBrief(
   key: SessionDirectoryKey,
   sourceRevisions: Record<string, number>,
   outcome: BriefOutcome,
+  options: { canonicalSessionId?: string } = {},
 ): Promise<{ written: boolean }> {
   const revision = Math.max(0, ...Object.values(sourceRevisions));
   const client = await db.pool.connect();
@@ -398,6 +402,16 @@ export async function recordBrief(
     if (!sameSourceSet(live.rows.filter((r) => r.manifest_key), sourceRevisions)) {
       await client.query("ROLLBACK");
       return { written: false };
+    }
+    if (options.canonicalSessionId !== undefined) {
+      const group = await client.query<{ session_id: string }>(`SELECT session_id FROM sessions.session_index
+        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4
+          AND deleted_at IS NULL AND manifest_key IS NOT NULL LIMIT 64 FOR SHARE`,
+        [key.orgId,key.workspaceId,key.harness,options.canonicalSessionId]);
+      // Publish only the same single physical source admitted before model IO.
+      if (!group.rows.length || group.rows.length >= 64 || group.rows.length !== live.rows.filter(r => r.manifest_key).length || group.rows.some(r => r.session_id !== key.sessionId)) {
+        await client.query("ROLLBACK"); return { written: false };
+      }
     }
     const revisions = JSON.stringify(sourceRevisions);
     let reusedText: { title: string; description: string; model: string } | null = null;
@@ -592,7 +606,7 @@ async function projectBriefTitle(db: SqlExecutor, key: SessionDirectoryKey, titl
 }
 
 /** Sweep: arm indexed sessions that have neither a brief nor a wakeup (backfill after enabling). */
-export async function sweepUnbriefed(db: SqlExecutor, limit: number): Promise<number> {
+export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { includeChanged?: boolean; workspaceIds?: readonly string[] } = {}): Promise<number> {
   const { rows } = await db.query<{ n: number }>(
     `WITH missing AS (
        SELECT d.org_id, d.workspace_id, d.harness, physical.session_id
@@ -607,9 +621,16 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number): Promise<nu
             ORDER BY p.last_activity_at DESC, p.revision DESC, p.machine_id DESC LIMIT 1
          ) AS physical
         WHERE d.deleted_at IS NULL
+          AND ($3::text[] IS NULL OR d.workspace_id=ANY($3::text[]))
           AND NOT EXISTS (SELECT 1 FROM sessions.session_briefs AS b
                            WHERE b.org_id = d.org_id AND b.workspace_id = d.workspace_id
-                             AND b.harness = d.harness AND b.session_id = physical.session_id)
+                             AND b.harness = d.harness AND b.session_id = physical.session_id
+                             AND (NOT $2::boolean OR b.source_revisions IS NOT DISTINCT FROM (
+                               SELECT jsonb_object_agg(p.machine_id, p.revision)
+                                 FROM sessions.session_index AS p
+                                WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+                                  AND p.harness = d.harness AND p.session_id = physical.session_id
+                                  AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL)))
           AND NOT EXISTS (SELECT 1 FROM sessions.session_brief_wakeups AS w
                            WHERE w.org_id = d.org_id AND w.workspace_id = d.workspace_id
                              AND w.harness = d.harness AND w.session_id = physical.session_id)
@@ -620,7 +641,7 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number): Promise<nu
        SELECT org_id, workspace_id, harness, session_id, 'sweep', now() FROM missing
        ON CONFLICT DO NOTHING RETURNING 1)
      SELECT count(*)::int AS n FROM armed`,
-    [limit],
+    [limit, options.includeChanged === true, options.workspaceIds ?? null],
   );
   return rows[0]?.n ?? 0;
 }

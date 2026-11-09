@@ -118,6 +118,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Replaces the self-host erase and the G4 retire trigger function ingest_publication_retire_fence (in
       // OBJECTS.replacedFunctions below); both now clear the short_summary provenance columns with the summary.
       "20261105044050_selfhost_erase_short_summary_provenance.sql",
+      // Read-role-only summary RPC and EXECUTE; no ingest RPC is replaced or calls it.
+      "20261105044060_session_brief_summary_read.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
