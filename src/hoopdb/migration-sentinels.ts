@@ -350,6 +350,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
       "DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)",
     sql: column("sessions.session_summaries", "object_key"),
   },
+  "upstream:20261105044080_ingest_claim_sessions.sql": {
+    evidence: "table sessions.ingest_claim_sessions",
+    sql: relation("sessions.ingest_claim_sessions"),
+  },
   "upstream:20261105044070_selfhost_erase_search_text_rebuild.sql": {
     evidence: "replacement: ingest_selfhost_set_session_uploads and ingest_publication_retire_fence rebuild search_text without the summary when they clear it",
     sql: "SELECT (SELECT count(*) FROM pg_proc WHERE oid IN(to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)'),to_regprocedure('sessions.ingest_publication_retire_fence()')) AND prosecdef AND prosrc LIKE '%session_directory_search_text(%')=2 AS applied",
