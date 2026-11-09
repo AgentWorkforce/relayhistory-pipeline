@@ -1,6 +1,15 @@
 # Output and the daily digest off Neon (design, P4)
 
-Status: design plus a dormant DDL skeleton (`src/session-pipeline/output-facts-schema.ts`). Nothing here is applied, deployed or wired: no producer writes the tables, and the read Worker still answers both routes 501 (`output_not_migrated`, `digest_not_migrated`, registered in `src/session-read-api/app.ts`).
+Status (lane F4, 2026-11-06):
+- **Output is implemented and default-off.** The producer is `src/session-pipeline/output-facts.ts`, which `indexSearchScope` calls only with Lambda `SEARCH_INDEX_OUTPUT_FACTS=1`. The query module is `src/session-read-api/output-query.ts`. The route `GET /v1/sessions/output` is served by the read Worker only with `READ_API_OUTPUT_ENABLED=1`.
+- The DDL (`output-facts-schema.ts`, schema version 2) is **not applied**. Applying it is an owner step that needs Khaliq's OK.
+- Parity: `src/session-pipeline/__tests__/output-facts-parity.test.ts` runs relayhistory's own `getSessionOutput` SQL on Postgres against the facts on ClickHouse, for every window and filter shape.
+- **The digest is implemented and default-off (lane F4 PR B).**
+  - `GET /v1/digest/daily` is served by the read Worker with `READ_API_DIGEST_ENABLED=1`.
+  - The deterministic half is in `src/session-read-api/digest-query.ts`. The window is `day-window.ts`, ported verbatim with relayhistory's DST tests.
+  - The narrative is in `digest-narrative.ts`. Its cache is Supabase `sessions.daily_digest_narratives` (migration `20261105045000`, not applied). Generation runs in the service-bound narrative Worker (`packages/session-read-worker/wrangler.digest-narrative.jsonc`, not deployed).
+  - `stats.outcomes.reverted` is **omitted**, per Khaliq: "drop and rebuild". It is sent as 0, because the strict 0.2.0 contract requires the key, and declared in `X-Sessions-Digest-Omitted: outcomes.reverted`, which Cloud hides. `committed`/`unknown` keep relayhistory's rules over the frozen legacy outcomes.
+  - Follow-up F4-R: a sessions-pipeline session-outcomes producer, to rebuild `reverted`.
 
 Sources read: relayhistory-cloud `c7de2163` (`lib/session-output.ts`, `lib/digest.ts`, `lib/narrative.ts`, `lib/rollups.ts`, `lib/ingest.ts`, migrations 0003/0018/0021/0073); sessions-pipeline main (`vendor/search-index/schema.ts`, `session-pipeline/search-index.ts`, `packages/pipeline/.../relayhistory-projection.ts`, `session-read-api`); Cloud trunk (`packages/web/lib/sessions-read-96bulls.ts`, `app/api/v1/workspaces/[workspaceId]/sessions/output/route.ts`, `dashboard/_components/session-output.tsx`, `lib/skip/history.ts`).
 
@@ -111,29 +120,55 @@ SELECT count(), sum(added), sum(removed), countIf(added IS NULL OR removed IS NU
 - The digest aggregates are straight `GROUP BY`s over `transcript_event_facts FINAL` with the day's half-open window. `count(distinct coalesce(project_id, chr(1)))` becomes `uniqExact(ifNull(project_id, '\x01'))`, and likewise for the `\x02` pair.
 - Outcomes: the day's (source, session) set from event facts, then `outcome` facts grouped by session with `max(reverted)`.
 
-## 3. Producer (the next PR, not this one)
+## 3. Producer (implemented: `output-facts.ts`)
 `session-pipeline/search-index.ts` already reconciles one session scope from S3 into `transcript_events` under the Supabase advisory lock. The plan is to extend that same pass, so the three tables can never disagree about a scope:
 1. From the projected events, emit one `transcript_event_facts` row per event. The fields come from `projectRelayhistorySession` (model, provider, tokens, cost, project, task_ref, files_touched), and `branch` is derived exactly as `branchSql`.
 2. Emit `message` facts with the qualification and the COALESCE id. Emit `commit` facts from the projection's `session_commit_links` rows and from tool results: port the regex and the call-uniqueness check from `session-output.ts`, using the scope's tool calls.
 3. From the scope's `legacy_session_outcome` records (PR 2 export), emit `outcome` facts and `origin='outcome'` commit facts. From `legacy_conversation_turn` records and PR 1 live turn records, emit `legacy_turn_message` facts.
 4. Reconcile by fingerprint as for transcript_events: insert what's new or changed, delete what S3 no longer has, and on erasure delete the whole scope. An incomplete read never deletes.
 
+As built:
+- Identity deletes go by `row_id`, the sha256 of the identity.
+- `session_output_facts.scope_source` carries the harness, so that a legacy turn whose stored `source` differs is still erased with its scope.
+- Facts cover the whole scope, not the transcript_events window.
+- **Facts state.** Every pass with the flag on records the scope in `output_facts_session_state`, complete or not, with the facts' time span. The table is separate from the search `needs_full`, so a facts problem never degrades transcript search.
+  - The state is written **pending (complete=0) before** the ClickHouse insert/delete, and final after. A pass that dies mid-reconcile therefore leaves the scope incomplete, never complete over torn facts. Version = 2 × pass ms + phase.
+  - A malformed legacy record or timestamp marks the facts inexact; it never throws out of the pass.
+- **Route readiness** (`outputWindowReadiness`) is positive and window-scoped:
+  - `output_backfill_incomplete`: no watermark row.
+  - `output_before_watermark`: `since` is earlier than `complete_since`.
+  - `output_session_partial`: an inexact session whose span overlaps the window. An unknown span overlaps every window.
+  - `output_session_unindexed`: a session with transcript events in the window but no complete facts-state row. A missing row is never read as complete.
+  - Sessions entirely outside the window never block it.
+- **Erasure** purges the fact tables whenever they exist, **independent of the flag**, so turning the producer off never leaves an erased session's facts behind. The S3 tombstone → `indexSearchScope` erasure pass covers the upload-erase path too: C3/#289 tombstones the pointers, and this pass purges ClickHouse.
+- **One key.** Every fact kind (event, message, tool-result commit, commit link, outcome, legacy turn) is stored under the scope's **canonical session id + harness**. The event's own ids stay in the identity for dedup; a legacy turn keeps its stored `source` for relayhistory's NOT EXISTS. The facts scope lists every session id the pass saw (the scope's, the canonical, and any owner/alias id on a projected event). That one set is used by the state rows, the existing-row read, the delete and erase filters, and the route's readiness join.
+- **Versions** are strictly increasing per scope: base = max(2 × ms, previous + 1), rounded up to even; pending = base, final = base + 1. Fingerprints are the full sha256.
+- **DDL upgrades.** `outputFactsUpgradeStatements()` (`ALTER … ADD COLUMN IF NOT EXISTS`) upgrades a table created by an older copy; apply it after `outputFactsSchemaStatements()`. A missing table or column on the read path is 501 `output_schema_missing` / `digest_schema_missing`.
+- **Parity oracle.** It stays relayhistory's SQL transcribed into the test. `getSessionOutput` is drizzle TypeScript, and no vendored Neon function exists to run. `scripts/output-digest-parity.ts` is the live dual-run once both URLs are set.
+- **Schema guard.** With the flag on but the DDL absent, or an older skeleton (which `CREATE TABLE IF NOT EXISTS` never alters), nothing is written. The pass reports `output_facts_schema_missing`, and search is unaffected.
+- **Residual.** A session that has no transcript rows in the window (e.g. older than the transcript window) and no facts at all is invisible to the readiness check. The backfill watermark covers it: the backfill marks a workspace only after every live scope has a state row.
+
 `session_outcomes` dedup across exported copies: the Neon key is `(org, workspace, source, session, commit_sha)`, and the export carries the row as it stands (strongest method already applied), so the indexer needs no merge rule. `row_key` = the sha.
 
 ## 4. Read Worker routes
 The dormant stubs keep their 501s until each condition holds. Both routes stay behind `READ_API_DIRECTORY_WORKSPACES` (501 `*_workspace_not_enabled` off the allowlist) with the P3b workspace attestation and strict-contract response.
 
-- **`/v1/sessions/output`**:
-  - 501 `output_not_configured` without ClickHouse;
-  - 501 `output_backfill_incomplete` until the workspace's facts are marked complete (a `search_ingest_state`-style watermark per workspace, written by the backfill);
+- **`/v1/sessions/output`** (implemented):
+  - 501 `output_workspace_not_enabled` off `READ_API_DIRECTORY_WORKSPACES` (`*` = all);
+  - 501 `output_not_configured` without `READ_API_OUTPUT_ENABLED=1`;
+  - 501 `output_backfill_incomplete` until the workspace has a row in `output_facts_workspace_state`. The operator backfill writes that row once every scope of the workspace has been re-read with the flag on; the read path never writes it;
   - 501 `output_session_partial` if any in-range session is `needs_full`;
   - then the two queries in 2.4;
   - same 400s as relayhistory: `workspace is required`, `since and until are required exactly once`, `Invalid output date range`.
-- **`/v1/digest/daily`**:
+- **`/v1/digest/daily`** (implemented; the bullets below were the original plan, superseded where noted):
+  - As built:
+    - Gates: 501 `digest_workspace_not_enabled`, `digest_not_configured`, `digest_backfill_incomplete` and `digest_session_partial`, as for Output.
+    - `sessions`: window aggregates from `transcript_event_facts` (new v3 columns `task_ref_json`, `task_title`, `user_id`). Title, workState and catalog come from the directory row (`list_session_directory_for` by session key). `summary` has no first-user-turn fallback yet.
+    - Narrative: a cache hit is served. On a miss, a stale hash or `refresh=true`, the narrative Worker is called with a 3 s deadline, below Cloud's 4 s read timeout. Every narrative failure is a 200 with `narrative.unavailable`, never a 501 (no fallback after GA).
   - deterministic parts from facts plus the P3b directory list;
   - 400s copied from `resolveDayWindow` (port it verbatim, with its DST tests);
   - the narrative is served only from a cache keyed like `daily_digests` whose `stats_hash` equals the recomputed hash. A miss is 501 `digest_narrative_uncached`, so Cloud falls back to relayhistory, which generates and caches in Neon. That stays until the cache and the model call move (see 6). `no_activity` needs no cache and is served directly;
-  - `refresh=true` never reaches 96Bulls (Cloud's classifier already keeps it on relayhistory).
+  - `refresh=true` never reaches 96Bulls (Cloud's classifier already keeps it on relayhistory). *Superseded:* the read API serves `refresh=true` by regenerating through the narrative Worker. Cloud routes it only with `SESSIONS_READ_96BULLS_DIGEST_REFRESH=on`.
 - **Cloud**: no code change. `sessions-read-96bulls.ts` already classifies `sessions_output` and `digest_daily`, parses `sessions_output` with the dashboard's `sessionOutputSchema` and the digest with cloud-client 0.2.0, and supports `shadow` then `on`, with every 501 falling back.
 
 ## 5. Backfill and parity

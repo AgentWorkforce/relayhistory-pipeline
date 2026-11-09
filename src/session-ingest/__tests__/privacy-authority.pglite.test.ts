@@ -413,7 +413,10 @@ test("reset coverage: a disable removes the session's owned identity (as Neon de
  * fixture). Without 045000 the guarded call is a no-op.
  */
 async function withNarratives(f: F) {
-  await f.db.exec(await Bun.file(new URL("./fixtures/digest-narrative-cache-045000.sql", import.meta.url)).text());
+  // 045000 is in the tree, so the fixture copy (the same table and purge function) would collide;
+  // the in-tree migration is the real function under test.
+  const landed = (await f.db.query<{ r: string | null }>("SELECT to_regclass('sessions.daily_digest_narratives')::text AS r")).rows[0]?.r;
+  if (landed === null) await f.db.exec(await Bun.file(new URL("./fixtures/digest-narrative-cache-045000.sql", import.meta.url)).text());
   const add = (ws: string) =>
     f.db.query("INSERT INTO sessions.daily_digest_narratives(org_id,workspace_id,day,tz,scope_key,stats_hash,narrative_text,narrative_generated_at) VALUES($1,$2,'2026-11-05','UTC',$3,$4,'cached text',now())",
       [TENANT.orgId, ws, "workspace:" + JSON.stringify([ws, null]), "a".repeat(64)]);
@@ -672,7 +675,9 @@ test("digest ABI fail-closed: 045000's table present without purge_daily_digest_
   const n = await fakeNeon();
   open.push(n.close);
   await activateFrom(f, n);
-  await f.db.exec("CREATE TABLE sessions.daily_digest_narratives(org_id text, workspace_id text)");
+  // 045000 is in the tree, so the table is already present; remove the purge function to
+  // simulate the table-without-function footprint.
+  await f.db.exec("DROP FUNCTION IF EXISTS sessions.purge_daily_digest_narratives(text, text)");
   const e = await f.rpc("ingest_privacy_authority_begin", { epoch, tenant: TENANT, kind: "reset", payload: { request_id: "digest-abi" } }).then(() => null, (x: any) => x);
   expect([e?.code, e?.message]).toEqual(["55000", "frozen source: digest narrative purge ABI mismatch"]);
 });

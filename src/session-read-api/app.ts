@@ -36,16 +36,18 @@ import { BriefSummaryError, briefSummaryResponse, type BriefSummary } from "./br
  *                                   (session-timing-source.ts, timing.ts), same allowlist.
  *   GET /v1/sessions/:id/turns      the relay session journal from canonical S3 (legacy
  *   GET /v1/sessions/:id/metadata   export + live turns: session-turns-source.ts), same allowlist.
+ *   GET /v1/sessions/output         Output from the ClickHouse facts (output-query.ts), off unless
+ *                                   READ_API_OUTPUT_ENABLED=1 (deps.output), same allowlist; 501
+ *                                   until the workspace's backfill watermark exists.
+ *   GET /v1/digest/daily            the daily digest from the ClickHouse facts + the directory,
+ *                                   narrative from the Supabase cache / narrative Worker
+ *                                   (digest-query.ts, digest-narrative.ts), off unless
+ *                                   READ_API_DIGEST_ENABLED=1 (deps.digest), same allowlist.
  *   GET /v1/sessions/titles         cached brief titles of up to 100 `key=<source>:<sessionId>`
  *                                   keys, from Supabase session_briefs (brief-titles.ts). Its
  *                                   own allowlist, READ_API_BRIEF_TITLES_WORKSPACES (unset = none,
  *                                   "*" = all): 501 `brief_titles_workspace_not_enabled`, and 501
  *                                   `brief_titles_not_migrated` until 20261105043000 is applied.
- *   GET /v1/sessions/output and /v1/digest/daily are registered and answer 501 with a
- *   reason naming the store they still need: their relayhistory semantics read tables
- *   that neither ClickHouse, S3 nor the directory holds yet (per-message and commit
- *   facts, session_outcomes, the digest narrative cache), and this backend never
- *   answers approximately.
  *
  * Self-host routes (RELAYHISTORY_SELFHOST_READ_API=true only; selfhost.ts; unregistered when off):
  *   POST /v1/cli/login              relaycontrol `sh_at_` token in the body, introspected; answers
@@ -69,6 +71,11 @@ import { timingFromCanonical, type CanonicalRows } from "./session-timing-source
 import { TimingInputError } from "./timing.ts";
 import { EvidenceRequestError, readBabysitterEvidence, type EvidenceDeps } from "./babysitter-evidence.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
+import { isOutputSchemaShort, outputWindowReadiness, readSessionOutput } from "./output-query.ts";
+import { READ_SETTINGS } from "./queries.ts";
+import { DigestInputError, resolveDayWindow } from "./day-window.ts";
+import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, buildDailyDigest, computeStatsHash } from "./digest-query.ts";
+import { resolveDigestNarrative, type DigestNarrativeDeps } from "./digest-narrative.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
   DirectoryError,
@@ -174,6 +181,17 @@ export interface ReadApiDeps {
   timing?: TimingDeps;
   /** Relay session turns and metadata from canonical S3 (session-turns-source.ts); absent = 501 `turns_not_configured`. */
   turns?: TurnsDeps;
+  /**
+   * READ_API_OUTPUT_ENABLED=1: serve GET /v1/sessions/output from the ClickHouse facts
+   * (output-query.ts) with `ch`. Absent = 501 `output_not_configured`.
+   */
+  output?: { enabled: true };
+  /**
+   * READ_API_DIGEST_ENABLED=1: serve GET /v1/digest/daily (digest-query.ts) with `ch` and
+   * `directory`; the narrative from `cache` and the service-bound `generator`. Absent = 501
+   * `digest_not_configured`.
+   */
+  digest?: DigestNarrativeDeps;
   /** Service-only verified canonical object reads for exact sessions outside search retention. */
   canonicalEvents?: CanonicalEventsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
@@ -862,7 +880,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "catalog" | "login" | "summary"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "output" | "digest" | "catalog" | "login" | "summary"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -1119,15 +1137,55 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   });
 
-  // Registered so their 501 names what they still need; see the header comment.
-  const notMigrated = (reason: string) => async (c: Context) => {
+  /**
+   * GET /v1/sessions/output (relayhistory routes/recall.ts + lib/session-output.ts): the
+   * workspace's agent messages and unique commits in [since, until] (inclusive), from the
+   * ClickHouse facts (output-query.ts), never Neon. The 400s are relayhistory's, in its
+   * order. Then the canary allowlist, and a 501 for every case not answerable exactly:
+   *   output_not_configured      READ_API_OUTPUT_ENABLED is off
+   *   output_backfill_incomplete no backfill watermark for the workspace yet
+   *   output_before_watermark    `since` is earlier than the watermark's complete_since
+   *   output_session_partial     a session whose facts are inexact and whose span overlaps the window
+   *   output_session_unindexed   a session with transcript events in the window and no complete
+   *                              facts state (output-query.ts outputWindowReadiness)
+   *   output_schema_missing      the output-facts DDL (or one of its columns) is not applied
+   */
+  app.get("/v1/sessions/output", async (c) => {
     try {
-      attestWorkspace(c, c.get("identity") as VerifiedIdentity);
-      throw unsupported(reason);
+      const identity = c.get("identity");
+      if (!c.req.queries("workspace")?.length) throw bad("workspace is required");
+      attestWorkspace(c, identity);
+      const rawSince = c.req.query("since");
+      const rawUntil = c.req.query("until");
+      if (!rawSince || !rawUntil || c.req.queries("since")?.length !== 1 || c.req.queries("until")?.length !== 1)
+        throw bad("since and until are required exactly once");
+      const since = new Date(rawSince);
+      const until = new Date(rawUntil);
+      const day = 86_400_000;
+      if (!Number.isFinite(since.getTime()) || !Number.isFinite(until.getTime()) || until < since ||
+          Math.max(0, Math.floor(until.getTime() / day) - Math.floor(since.getTime() / day) + 1) > 366)
+        throw bad("Invalid output date range");
+      requireCanary(identity, "output");
+      // The facts are ClickHouse tables: a portable search adapter cannot serve Output.
+      const ch = deps.ch;
+      if (!deps.output || !ch) throw unsupported("output_not_configured");
+      const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
+      let output;
+      try {
+        const readiness = await outputWindowReadiness(ch, identity.orgId, identity.workspaceId, since, until, opts);
+        if (readiness !== "ready") throw unsupported(`output_${readiness}`);
+        output = await readSessionOutput(ch, { orgId: identity.orgId, workspaceIds: [identity.workspaceId] }, { since, until }, opts);
+      } catch (error) {
+        // The fact tables are owner-applied DDL: a missing table or column is a 501, not a 500.
+        if (isOutputSchemaShort(error)) throw unsupported("output_schema_missing");
+        throw error;
+      }
+      log({ route: c.req.routePath, reason: "output_served", correlation_id: c.get("correlationId") });
+      return c.json({ since: since.toISOString(), until: until.toISOString(), output, correlationId: c.get("correlationId") });
     } catch (error) {
       return fail(c, error);
     }
-  };
+  });
   /**
    * Cached brief titles for the session list (feature F2): `workspace=<the token's>` and 1 to
    * 100 repeated `key=<source>:<sessionId>` (the source is a harness name, which has no
@@ -1161,6 +1219,8 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   });
 
+  // 044100 (brief summary): the real /v1/sessions/output route is registered above (this branch);
+  // main's notMigrated output placeholder is dropped to avoid a duplicate registration.
   app.get("/v1/sessions/:sessionId/summary", async (c) => {
     try {
       const identity=c.get("identity");
@@ -1184,8 +1244,6 @@ export function createReadApi(deps: ReadApiDeps) {
       return fail(c,error);
     }
   });
-
-  app.get("/v1/sessions/output", notMigrated("output_not_migrated"));
 
   /**
    * GET /v1/sessions/:id/turns and /metadata (relayhistory routes/turns.ts): the relay
@@ -1279,7 +1337,75 @@ export function createReadApi(deps: ReadApiDeps) {
       return turnsFail(c, error);
     }
   });
-  app.get("/v1/digest/daily", notMigrated("digest_not_migrated"));
+  /**
+   * GET /v1/digest/daily (relayhistory routes/digest.ts): one civil day's rollup from the
+   * ClickHouse facts and the directory, plus the cached model narrative, never Neon. The 400s
+   * are resolveDayWindow's (ported verbatim). A workspace off the allowlist, or a backend not
+   * ready, is a 501 naming why:
+   *   digest_not_configured       READ_API_DIGEST_ENABLED is off
+   *   digest_backfill_incomplete  no output-facts watermark for the workspace yet
+   *   digest_before_watermark     the day starts before the watermark's complete_since
+   *   digest_session_partial      an inexact session whose facts span overlaps the day
+   *   digest_session_unindexed    a session with transcript events in the day and no complete facts state
+   *   digest_schema_missing       the output-facts DDL (or a v4 column) is not applied
+   *   digest_directory_unavailable the day has sessions and the directory cannot list them
+   * Once served, every narrative outcome is a 200 (`narrative.unavailable`), including a
+   * miss the Worker could not fill within the deadline. `refresh=true` regenerates.
+   * stats.outcomes.reverted is omitted (0, declared in X-Sessions-Digest-Omitted).
+   */
+  app.get("/v1/digest/daily", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      let window;
+      try {
+        window = resolveDayWindow(c.req.query("date"), c.req.query("tz"));
+      } catch (error) {
+        if (error instanceof DigestInputError) throw bad(error.message);
+        throw error;
+      }
+      const projectId = c.req.query("project")?.trim() || null;
+      const refresh = c.req.query("refresh") === "true";
+      requireCanary(identity, "digest");
+      // The digest reads the ClickHouse facts: a portable search adapter cannot serve it.
+      const ch = deps.ch;
+      if (!deps.digest || !ch) throw unsupported("digest_not_configured");
+      const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
+      let digest;
+      try {
+        // Exactly the stats window, half-open [since, until), so no event the stats count escapes
+        // the readiness check (an event at until - 0.5 ms is in both).
+        const readiness = await outputWindowReadiness(ch, identity.orgId, identity.workspaceId, window.since, window.until, { ...opts, untilExclusive: true });
+        if (readiness !== "ready") throw unsupported(`digest_${readiness}`);
+        digest = await buildDailyDigest(ch, deps.directory, { orgId: identity.orgId, workspaceId: identity.workspaceId, since: window.since, until: window.until, projectId }, opts);
+      } catch (error) {
+        if (isOutputSchemaShort(error)) throw unsupported("digest_schema_missing");
+        throw error;
+      }
+      const statsHash = await computeStatsHash(digest, identity.workspaceId);
+      const narrative = await resolveDigestNarrative(deps.digest, {
+        orgId: identity.orgId, workspaceId: identity.workspaceId, day: window.date, tz: window.tz, projectId, statsHash, refresh,
+      }, digest);
+      c.header("X-Sessions-Digest-Omitted", DIGEST_OMITTED_FIELDS.join(","));
+      log({ route: c.req.routePath, reason: "digest_served", narrative: narrative.unavailable ?? (narrative.cached ? "cached" : "generated"), correlation_id: c.get("correlationId") });
+      return c.json({
+        date: window.date,
+        tz: window.tz,
+        window: { since: window.since.toISOString(), until: window.until.toISOString() },
+        scope: { projectId },
+        stats: digest.stats,
+        projects: digest.projects,
+        epics: digest.epics,
+        sessions: digest.sessions,
+        narrative,
+        correlationId: c.get("correlationId"),
+      });
+    } catch (error) {
+      if (error instanceof DigestDirectoryUnavailable) return fail(c, unsupported("digest_directory_unavailable"));
+      if (error instanceof DirectoryError) return directoryFail(c, error);
+      return fail(c, error);
+    }
+  });
 
   // Babysitter evidence (Neon GET /v1/delivery/records parity for session_lineage /
   // turn_receipt; babysitter-evidence.ts). Tenant from the verified identity, as Neon's

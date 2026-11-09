@@ -29,6 +29,9 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * search stage from the pre-#182 catalog writer to the complete desktop catalog writer
  * (migration 20261105022000 columns); SEARCH_INDEX_ENABLED alone never does
  * (docs/session-desktop-catalog.md, Activation blockers).
+ * SEARCH_INDEX_OUTPUT_FACTS=1 (only the literal "1"; default off; needs
+ * SEARCH_INDEX_ENABLED=1) also reconciles the Output/digest fact tables in the same
+ * pass (output-facts.ts); it needs the owner-applied output-facts DDL first.
  * INGEST_BUFFERED_SEARCH_FEED=on (only the literal "on"; default "off", anything else refuses)
  * feeds accepted buffered stages into transcript_events (buffered-search-feed.ts); it is refused
  * unless BUFFERED_SEARCH_FEED_GATE_DECLARED equals the read gate's contract id
@@ -117,6 +120,8 @@ export interface LambdaEnv {
   analysisCacheEnabled: boolean;
   /** SESSION_DESKTOP_CATALOG_ENABLED=1: the search stage writes the complete desktop catalog; off (default): the pre-#182 writer. */
   desktopCatalogEnabled: boolean;
+  /** SEARCH_INDEX_OUTPUT_FACTS=1: the search stage also writes the Output/digest facts. */
+  outputFactsEnabled?: boolean;
   semanticCopyEnabled?: boolean;
   semanticSourceId?: string;
   /** SESSIONS_NEON_EXIT=true: the legacy readonly source (analysis_source_readonly_url) is never carried or built. */
@@ -160,6 +165,11 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     "SESSION_ANALYSIS_CACHE_ENABLED=1": env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
     "SESSION_SEMANTIC_COPY_ENABLED=1": env.SESSION_SEMANTIC_COPY_ENABLED === "1",
   });
+  if (env.SEARCH_INDEX_OUTPUT_FACTS === "1" && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_OUTPUT_FACTS=1 needs SEARCH_INDEX_ENABLED=1");
+  // The fact tables are ClickHouse DDL: a portable search backend has nowhere to put them.
+  if (env.SEARCH_INDEX_OUTPUT_FACTS === "1" && selected.search !== "clickhouse")
+    throw new Error("session pipeline: SEARCH_INDEX_OUTPUT_FACTS=1 needs the clickhouse search backend");
   return {
     searchBackend: selected.search,
     adapterEnv: Object.freeze(Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith("SEARCH_INDEX_") || ["PIPELINE_RUNTIME", "AWS_REGION", "READ_API_COMPLETE_SINCE"].includes(key)))),
@@ -175,6 +185,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     largeScopeHandoffEnabled: env.SESSION_LARGE_READ_HANDOFF_ENABLED === "1",
     analysisCacheEnabled: env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
     desktopCatalogEnabled: env.SESSION_DESKTOP_CATALOG_ENABLED === "1",
+    outputFactsEnabled: env.SEARCH_INDEX_OUTPUT_FACTS === "1",
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
     ...(neonExit.enabled ? { neonExit: true } : {}),
@@ -398,6 +409,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       // Default off and separate from SEARCH_INDEX_ENABLED: off keeps the pre-#182 catalog
       // writer; the desktop catalog writer waits on migration 20261105031000 (docs/session-desktop-catalog.md).
       ...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}),
+      // Default off; the fact tables are owner-applied DDL (output-facts-schema.ts).
+      ...(env.outputFactsEnabled ? { outputFacts: true as const } : {}),
     };
   }
   if (env.bufferedSearchFeed?.enabled) {
