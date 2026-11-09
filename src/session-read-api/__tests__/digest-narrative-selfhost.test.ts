@@ -313,7 +313,7 @@ describe("read API service wiring", () => {
 
   test("fully configured: the writer pool is separate (max 1, TLS, timeout) and is the only pool that sees the upsert", async () => {
     const built = await build({ ...ENV, ...NARRATIVE_ENV });
-    expect(built.deps).not.toHaveProperty("digest"); // the route itself is not wired on this entry yet
+    expect(built.deps).not.toHaveProperty("digest"); // no digest backend selected (READ_API_DIGEST_BACKEND unset)
     expect(pools).toHaveLength(2);
     const [reader, writer] = pools;
     expect(writer!.config).toMatchObject({ host: "db.selfhost.internal", user: "bulls96_digest_narrative", password: "wpw", database: "history", max: 1, statement_timeout: 5000, options: "-c statement_timeout=5000" });
@@ -343,6 +343,24 @@ describe("read API service wiring", () => {
     expect(readSql.some((t) => t.includes("digest_narrative_upsert"))).toBe(false);
     await built.close();
     expect(pools.every((p) => p.ended)).toBe(true);
+  });
+
+  test("with READ_API_DIGEST_BACKEND=postgres the digest route gets these narrative deps (the generator included)", async () => {
+    const built = await build({ ...ENV, ...NARRATIVE_ENV, READ_API_DIGEST_BACKEND: "postgres" });
+    expect(built.deps.digest?.backend?.kind).toBe("postgres");
+    expect(built.deps.digest?.generator).toBeDefined();
+    expect(built.deps.digest?.generator).toBe(built.digestNarrative?.generator);
+    expect(built.deps.digest?.cache).toBe(built.digestNarrative?.cache);
+    expect(pools).toHaveLength(2);
+    await built.close();
+    expect(pools.every((p) => p.ended)).toBe(true);
+    // No model: the route's narrative is the cache only (a miss is provider_not_configured).
+    pools = [];
+    const cacheOnly = await build({ ...ENV, READ_API_DIGEST_ENABLED: "1", READ_API_DIGEST_BACKEND: "postgres" });
+    expect(cacheOnly.deps.digest?.cache).toBeDefined();
+    expect(cacheOnly.deps.digest?.generator).toBeUndefined();
+    expect(pools).toHaveLength(1);
+    await cacheOnly.close();
   });
 
   test("a writer login that is not the narrative role refuses startup and closes both pools", async () => {

@@ -334,6 +334,61 @@ when it runs as `search_consumer_runtime` (`CONSUMER_RUNTIME_FUNCTIONS` in
 `src/hoopdb/migrate-guards.ts`); any other role that can execute them, or
 PUBLIC, still closes the gate.
 
+`READ_API_OUTPUT_BACKEND` and `READ_API_DIGEST_BACKEND` (`session-read-api`)
+select where `GET /v1/sessions/output` and `GET /v1/digest/daily` read from:
+unset, empty or `clickhouse` (the default; the routes stay exactly as before,
+which on the service means not configured, since it has no ClickHouse) or
+`postgres`. Any other value fails startup, naming the flag and never echoing
+the value. `postgres` is accepted only by the self-host service; the hosted
+Lambda refuses it at startup, and the hosted read Worker does not read these
+flags. Each route is still served only with its own `READ_API_OUTPUT_ENABLED`
+/ `READ_API_DIGEST_ENABLED` set to exactly `1` (unchanged semantics: anything
+else answers 501 `output_not_configured` / `digest_not_configured`), and only
+for workspaces in `READ_API_DIRECTORY_WORKSPACES` (unchanged allowlist). With
+`postgres` the route reads the Postgres output facts on the read pool, as
+`bulls96_read_api`, through the migration `045040` readers only
+(`sessions.output_facts_events_for`, `_outputs_for`, `_coverage_for`), in one
+READ ONLY tenant transaction, with erased sessions dropped through the session
+liveness check before any aggregation. No ClickHouse block or client is needed.
+
+Serving from `postgres` needs, in order:
+
+1. migration `045040` applied (otherwise 501 `output_schema_missing` /
+   `digest_schema_missing`);
+2. `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` on the pipeline consumer, so new
+   passes write facts;
+3. the output facts bootstrap (a later PR), which backfills the sessions
+   ingested before the flag and only then writes the workspace watermark
+   (`sessions.output_facts_workspace_state.complete_since`). Until the
+   watermark exists every window answers 501 `output_backfill_incomplete` /
+   `digest_backfill_incomplete`; a window starting before it answers
+   `*_before_watermark`.
+
+Readiness keeps the ClickHouse codes and order (`backfill_incomplete`,
+`before_watermark` with a microsecond compare, `session_partial`,
+`session_unindexed`, then ready). `session_unindexed` is narrower than on
+ClickHouse: it fires when the window's event facts name more sessions than
+the state rows overlapping the window. ClickHouse compares against raw
+transcript events; `045040` exposes no per-session state to the read role,
+and a session never processed with the facts flag on has no facts row at all.
+That gap is what the bootstrap closes before it writes the watermark. The
+count also treats every state row as one session, so a session recorded under
+alias ids can mask another session's missing state row; a later reader (for
+example `sessions.output_facts_unindexed_for`) can make the check exact.
+Output and the digest read every output fact of the workspace (commit
+candidates are unwindowed, as on ClickHouse) and aggregate in the service, so
+the read cost grows with the workspace's history; the deadline bounds it. A read pages the facts (at most 10000 rows a page) under a 3 second
+deadline checked before each page; past it the route answers 503
+`backend_unavailable`, never a partial answer. A Postgres permission error is
+also a 503. The digest narrative on the postgres digest backend comes from the
+self-host narrative deps (section 6, "Daily digest narrative on the read API
+service"): the cache (`sessions.digest_narrative_read` through the read role)
+always, and in-process generation only when the model, key and writer URL are
+all set. Without them a cache hit whose stats hash matches is served and a miss
+answers `narrative.unavailable = provider_not_configured`; a cache error is
+`provider_error`, always within a 200.
+Defaults are unchanged: with neither flag set nothing new is wired.
+
 ### session-ingest admission mode (config contract)
 
 `SELFHOST_INGEST_ADMISSION` is `sync` (the default; unset or empty is the same),
@@ -593,9 +648,10 @@ aggregates plus up to 15 session summaries, project ids and branches. It is
 scrubbed before it is sent, and the narrative is scrubbed before it is cached.
 Logs carry outcome codes only.
 
-This entry does not serve `GET /v1/digest/daily` yet: the route needs a digest
-backend on this service. Until that wiring passes these deps to the route, it
-answers 501 `digest_not_configured` whatever these variables say.
+These deps reach `GET /v1/digest/daily` only through the Postgres digest
+backend (`READ_API_DIGEST_BACKEND=postgres`, section 5). With the default
+(`clickhouse`) the service has no digest backend and the route answers 501
+`digest_not_configured` whatever these variables say.
 
 ### Follow-up: native Bedrock provider (scope only, no code now)
 
