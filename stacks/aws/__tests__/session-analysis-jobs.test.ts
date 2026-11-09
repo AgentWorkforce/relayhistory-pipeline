@@ -116,4 +116,11 @@ describe("P0-a: the FINAL aggregate bucket policy lets the analysis worker erase
     const deny = transcriptBucketPolicy({ bucketArn, keyArn: "k", eraserArn }).find((s: any) => s.Sid === "OnlyTheEraserDeletes") as any;
     expect(deny.Resource).toEqual([`${bucketArn}/*`]);
   });
+  test("on: the results-root eraser deny keeps its exact principal exemption", () => {
+    const deny = transcriptBucketPolicy({ bucketArn, keyArn: "k", eraserArn, analysisDeleterArn: roleArn }).find(
+      (s: any) => s.Sid === "OnlyTheEraserDeletes" && s.NotResource,
+    ) as any;
+    expect(deny.NotResource).toEqual([`${bucketArn}/96bulls/*/v1/*/normalized/session-analysis-v2/*`]);
+    expect(deny.Condition).toEqual({ ArnNotEquals: { "aws:PrincipalArn": eraserArn } });
+  });
 });

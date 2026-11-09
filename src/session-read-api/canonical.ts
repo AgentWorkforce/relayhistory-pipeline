@@ -146,6 +146,7 @@ async function snapshotWithLimits(
       generation: version,
       exists: false,
       legacyCoverage: null,
+      neonDerived: false,
       rows: [] as Array<{ table: string; row: Record<string, unknown> }>,
     };
   const byKey = new Map(pointers.map((p) => [p.manifest_key, p]));
@@ -231,8 +232,8 @@ async function snapshotWithLimits(
     exists: true,
     legacyCoverage: legacy.coverage,
     rows: [...result.projectionRows, ...mergeTurnRows(legacy.rows, live)],
-    // Present only for a Neon export/backfill scope, so every other snapshot is byte-identical.
-    ...(neonDerived ? { neonDerived: true as const } : {}),
+    // Always present: the never-in-Neon objects half fails closed on absence (evidence.ts).
+    neonDerived,
     /** Bounded directory_display_* code when display rows were omitted (raw read only). */
     ...(result.displayOmitted ? { displayOmitted: result.displayOmitted } : {}),
   };

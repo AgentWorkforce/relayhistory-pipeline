@@ -162,9 +162,11 @@ export interface CanonicalScopeRows {
   /**
    * The objects half of the never-in-Neon proof, from THIS snapshot's own manifest reads (each
    * bound to its pointer's etag): true when any manifest carries a Neon export marker or a
-   * backfill epoch. Never re-derived from a second, unbound manifest read.
+   * backfill epoch. Always present (false when nothing is derived): an absent objects half
+   * refuses, it never counts as not-derived. Never re-derived from a second, unbound
+   * manifest read.
    */
-  neonDerived?: boolean;
+  neonDerived: boolean;
   /** canonicalSourceGeneration: pointer set identity, recorded as the job's source revision. */
   generation: string;
   rows: Array<{ table: string; row: RecordValue }>;
@@ -586,7 +588,7 @@ export async function loadSessionSource(
   if (
     !snapshot.legacyCoverage &&
     options.assumeNoLegacyTurns !== true &&
-    !(deps.neonFree && snapshot.neonDerived !== true && (await deps.neonFree({ ...scope, source: harness })))
+    !(deps.neonFree && snapshot.neonDerived === false && (await deps.neonFree({ ...scope, source: harness })))
   )
     throw new SessionSourceIncompleteError("RelayHistory legacy evidence coverage is unknown");
   const budget = new EvidenceBudget();

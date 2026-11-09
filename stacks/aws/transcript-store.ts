@@ -1167,6 +1167,9 @@ export function trailLifecycleRules() {
  */
 export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; analysisDeleterArn?: string }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId ?? "");
+  // The eraser+GC principal list is shared by the analysis-on and analysis-off variants of
+  // the eraser-only deny below: a single control point, covered by the hardening mutations.
+  const eraserAndGcPrincipals = i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn;
   return [
     ...denyInsecureTransport(i.bucketArn),
     {
@@ -1187,7 +1190,7 @@ export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; e
           Principal: "*",
           Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
           NotResource: [`${i.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`],
-          Condition: { ArnNotEquals: { "aws:PrincipalArn": i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn } },
+          Condition: { ArnNotEquals: { "aws:PrincipalArn": eraserAndGcPrincipals } },
         }
       : {
           Sid: "OnlyTheEraserDeletes",
@@ -1195,7 +1198,7 @@ export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; e
           Principal: "*",
           Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
           Resource: [`${i.bucketArn}/*`],
-          Condition: { ArnNotEquals: { "aws:PrincipalArn": i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn } },
+          Condition: { ArnNotEquals: { "aws:PrincipalArn": eraserAndGcPrincipals } },
         },
     ...(i.analysisDeleterArn
       ? [{

@@ -107,7 +107,7 @@ sees a migrator that set the marker to `'pending'` while phase 2 was running. Un
 - **Its own role:** it runs as the role the service connects as (`HOOPDB_URL`). That
   role needs SELECT on the ledger and the marker table. Phase 2 reads only PUBLIC-readable
   catalogs: `pg_roles`, `pg_auth_members`, `pg_db_role_setting`, `pg_shdepend`,
-  `pg_namespace`, `pg_proc`, `pg_database` and `pg_default_acl`.
+  `pg_namespace`, `pg_proc` and `pg_database`.
 - **Fails closed:** any error closes the gate, is logged with its SQLSTATE and stage
   (`live role validation gate closed`) and makes the reader not ready. That covers a
   violation (`55000`), an unreadable catalog (`42501`), a timeout (`57014`) and a lost

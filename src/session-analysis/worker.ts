@@ -95,7 +95,7 @@ export function canonicalEvidenceDeps(
         exists: snap.exists,
         generation: snap.generation,
         legacyCoverage: snap.legacyCoverage,
-        ...(snap.neonDerived ? { neonDerived: true } : {}),
+        neonDerived: snap.neonDerived,
         rows: snap.rows,
       };
     },

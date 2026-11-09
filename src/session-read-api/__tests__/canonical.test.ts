@@ -809,8 +809,9 @@ test("display values are lazy: a raw snapshot without the request is the pre-#18
   // The opt-in read really projects display values for this fixture...
   expect(requested.rows.some((r) => r.table === "session_directory_event_values")).toBe(true);
   // ...and the default read is exactly the opt-in read minus that table: no new table key,
-  // no displayOmitted key, same generation, same rows in the same order.
-  expect(Object.keys(plain).sort()).toEqual(["exists", "generation", "legacyCoverage", "rows"]);
+  // no displayOmitted key, same generation, same rows in the same order. (neonDerived is
+  // always present since the never-in-Neon objects half fails closed on absence.)
+  expect(Object.keys(plain).sort()).toEqual(["exists", "generation", "legacyCoverage", "neonDerived", "rows"]);
   expect(plain.rows.some((r) => r.table === "session_directory_event_values")).toBe(false);
   expect(JSON.stringify(plain)).toBe(JSON.stringify({ ...requested, rows: requested.rows.filter((r) => r.table !== "session_directory_event_values") }));
   // Raw route: other tables never carry display rows; the display table is served on request.

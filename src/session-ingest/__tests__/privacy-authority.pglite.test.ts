@@ -610,6 +610,7 @@ test("analysis purge (real #292 function): the ingest role cannot call it outsid
 /** 046000 present in any form, but without BOTH exact workspace-scoped signatures (e.g. #292's older f7f49308 ABI). */
 async function staleAnalysisAbi(f: F, variant: "old-signatures" | "table-only" | "reset-form-only" | "no-grant") {
   // 046000 is landed, so stale states are built by removing from the real footprint.
+  // (The jobs tables are always present: "table-only" means the jobs table with nothing else.)
   const dropAll = `DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text,jsonb);
     DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text);
     DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text);`;
@@ -659,11 +660,12 @@ test("analysis ABI: the begin's refusal is the ABI mismatch itself (55000), call
   expect([e?.code, e?.message]).toEqual(["55000", "frozen source: analysis purge ABI mismatch"]);
 });
 
-/** Issue #310 (relayhistory-pipeline): each 046000 footprint clause in isolation (and the no-grant variant) refuses
- * with exactly 55000 at begin, for a RESET and for a DISABLE. */
+/** Issue #310 (relayhistory-pipeline): each 046000 purge/grant clause missing or wrong in isolation refuses
+ * with exactly 55000 at begin, for a RESET and for a DISABLE. (The analysis jobs tables are always
+ * present in setup, so "table only" means both tables with no functions.) */
 for (const [name, ddl] of [
   ["no-grant (both purges, no grant helper)", "DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text)"],
-  ["purge-authority table only", `DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text,jsonb);
+  ["tables only, no functions", `DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text,jsonb);
     DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text);
     DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text)`],
   ["grant-name only (another overload)", `DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text);
