@@ -47,13 +47,13 @@ async function database(): Promise<Db> {
   return { db, run: as("bulls96_session_ingest"), as };
 }
 
-/** A real direct-mode claim + commit through the ledger: ownership and stored revisions for `user`. */
-async function land(d: Db, user: string, origin: string, sessions: [string, string][], batchId: string) {
-  const tokens = new Map<string, string>();
+/** A real direct-mode claim through the ledger (commit separately). */
+async function claim(d: Db, user: string, origin: string, sessions: [string, string][], batchId: string) {
+  let token: string | undefined;
   const ledger = sqlLedger(async (text, params) => {
     const out = await d.run(text, params);
-    const token = (out.rows[0]?.result as { claimToken?: string } | undefined)?.claimToken;
-    if (text.includes("ingest_claim_batch") && token) tokens.set(batchId, token);
+    const t = (out.rows[0]?.result as { claimToken?: string } | undefined)?.claimToken;
+    if (text.includes("ingest_claim_batch") && t) token = t;
     return out;
   });
   const records: LedgerRecord[] = sessions.map(([source, sessionId], i) => ({
@@ -62,9 +62,20 @@ async function land(d: Db, user: string, origin: string, sessions: [string, stri
   const c: ClaimInput = { tenant: { orgId: ORG, workspaceId: WS, userId: user }, originId: origin, batchId, batchDigest: hex("a"),
     receiptId: `rhr_${hex("e")}`, sessions, records };
   const r = await ledger.claim(c);
+  /** Commit like deliver.ts: the records and sessions of the claim's deleted pairs are dropped first. */
+  const commit = (deleted: [string, string][] = "deleted" in r ? r.deleted : []) => {
+    const gone = new Set(deleted.map(([s, id]) => `${s}\u0000${id}`));
+    const keep = (s: string, id: string | null) => id === null || !gone.has(`${s}\u0000${id}`);
+    return ledger.commit({ tenant: c.tenant, originId: origin, batchId, batchDigest: c.batchDigest, claimToken: token!,
+      sessions: sessions.filter(([s, id]) => keep(s, id)), records: records.filter((x) => keep(x.source, x.sessionId)), machineId: `srv_${"ab".repeat(16)}` });
+  };
+  return { r, commit };
+}
+/** A real direct-mode claim + commit through the ledger: ownership and stored revisions for `user`. */
+async function land(d: Db, user: string, origin: string, sessions: [string, string][], batchId: string) {
+  const { r, commit } = await claim(d, user, origin, sessions, batchId);
   if (r.kind !== "claimed" && r.kind !== "resume") throw new Error(`expected a claim, got ${r.kind}`);
-  await ledger.commit({ tenant: c.tenant, originId: origin, batchId, batchDigest: c.batchDigest, claimToken: tokens.get(batchId)!,
-    sessions, records, machineId: `srv_${"ab".repeat(16)}` });
+  await commit();
 }
 async function pointer(d: Db, user: string, session: string, machine: string, canonical: string | null = null, ws = WS) {
   await d.db.query(
@@ -306,5 +317,95 @@ describe("050000 operator per-session erase", () => {
     expect(await code(d.run("SELECT 1 FROM sessions.session_erasure_receipts", []))).toBe("42501");
     // The role verifier accepts the new grants.
     await d.db.exec(sql("supabase/bootstrap/session_ingest_verify.sql"));
+  });
+});
+
+describe("050010 fence check in claim, commit and upsert_session_index", () => {
+  const fence = (d: Db, session = SID) =>
+    d.db.query("INSERT INTO sessions.session_erasure_fences(org_id,workspace_id,source,session_id) VALUES($1,$2,$3,$4)", [ORG, WS, SRC, session]);
+  const owned = async (d: Db, session: string) =>
+    (await rows<{ user_id: string }>(d, "SELECT user_id FROM sessions.ingest_session_ownership WHERE session_id=$1 ORDER BY 1", [session])).map((x) => x.user_id);
+
+  test("a new user or origin claiming an erased session gets it back as deleted: deselected, no ownership; other sessions untouched", async () => {
+    const d = await database();
+    await land(d, "u-1", "origin-1", [[SRC, SID]], "b0");
+    await erase(d);
+    const { r, commit } = await claim(d, "u-new", "origin-9", [[SRC, SID], [SRC, "s-free"]], "b1");
+    expect(r.kind).toBe("claimed");
+    expect("deleted" in r && r.deleted).toEqual([[SRC, SID]]);
+    expect(await rows(d, "SELECT user_id,origin_id,source,session_id FROM sessions.upload_deletions WHERE user_id='u-new'"))
+      .toEqual([{ user_id: "u-new", origin_id: "origin-9", source: SRC, session_id: SID }]);
+    expect(await rows(d, "SELECT 1 FROM sessions.ingest_fence_versions WHERE user_id='u-new' AND origin_id='origin-9' AND session_id=$1", [SID])).toHaveLength(1);
+    expect(await commit()).toEqual({ rearmed: 0 });
+    expect(await owned(d, SID)).toEqual([]);
+    expect(await owned(d, "s-free")).toEqual(["u-new"]);
+    expect(await rows(d, "SELECT session_id FROM sessions.ingest_record_revisions WHERE user_id='u-new' ORDER BY 1")).toEqual([{ session_id: "s-free" }]);
+    // The same user and origin again: already deselected, so no second epoch bump.
+    const epochs = await rows(d, "SELECT user_id,origin_id,session_id,epoch FROM sessions.ingest_fence_versions ORDER BY 1,2,3");
+    const again = await claim(d, "u-new", "origin-9", [[SRC, SID]], "b2");
+    expect(again.r.kind === "claimed" || again.r.kind === "replay_fast").toBe(true);
+    expect("deleted" in again.r && again.r.deleted).toEqual([[SRC, SID]]);
+    expect(await rows(d, "SELECT user_id,origin_id,session_id,epoch FROM sessions.ingest_fence_versions ORDER BY 1,2,3")).toEqual(epochs);
+  });
+
+  test("a fence that lands between claim and commit: the commit deselects, rearms and stores no revision for it", async () => {
+    const d = await database();
+    const { r, commit } = await claim(d, "u-1", "origin-1", [[SRC, SID], [SRC, "s-free"]], "b1");
+    expect(r.kind === "claimed" && r.deleted).toEqual([]);
+    await fence(d);                                       // erase's owner read missed this claim's ownership
+    const out = await commit([]);                        // the client already wrote both sessions
+    expect(out.rearmed).toBeGreaterThan(0);
+    expect(await rows(d, "SELECT session_id FROM sessions.ingest_record_revisions ORDER BY 1")).toEqual([{ session_id: "s-free" }]);
+    expect(await rows(d, "SELECT session_id FROM sessions.upload_erasure_rearm WHERE session_id=$1", [SID])).toHaveLength(1);
+    expect(await owned(d, SID)).toEqual([]);
+    expect(await owned(d, "s-free")).toEqual(["u-1"]);
+  });
+
+  test("upsert_session_index: a live pointer for a fenced id or canonical id is skipped; tombstones and other sessions pass", async () => {
+    const d = await database();
+    await fence(d);
+    await pointer(d, "u-1", SID, "m-1");
+    await pointer(d, "u-1", "s-alias", "m-2", SID);
+    await pointer(d, "u-1", "s-free", "m-1");
+    await d.db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,deleted_at,
+        storage_provider,bucket,manifest_key,content_sha256,raw_format,trace_id,revision)
+      VALUES($1,$2,$3,$4,'m-3','u-1',now(),now(),now(),'s3','bucket','k/t',decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18',3)`, [...KEY]);
+    expect(await rows(d, "SELECT session_id,machine_id,deleted_at IS NOT NULL dead FROM sessions.session_index ORDER BY 1,2"))
+      .toEqual([{ session_id: SID, machine_id: "m-3", dead: true }, { session_id: "s-free", machine_id: "m-1", dead: false }]);
+    // Another workspace with the same session id is not fenced.
+    await pointer(d, "u-1", SID, "m-1", null, "ws-b");
+    expect(await rows(d, "SELECT 1 FROM sessions.session_index WHERE workspace_id='ws-b'")).toHaveLength(1);
+  });
+
+  test("ordered org: a fenced session that still needs deselection fails the claim with RH012", async () => {
+    const d = await database();
+    await erase(d);
+    await d.db.query(`INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,schema_generation,valid_until,control_epoch)
+      VALUES($1,$2,$2,$2,now()+interval '1 day',$2)`, [ORG, hex("a")]);
+    // A canonical (direct) claim in this org is already refused before the fence check (existing 55000).
+    expect(await code(claim(d, "u-new", "origin-9", [[SRC, SID]], "b1"))).toBe("ledger_sqlstate_55000");
+    // The buffered claim and commits reach the same helper; its ordered-org branch refuses instead of deselecting.
+    const extend = (pairs: unknown) => d.db.query("SELECT sessions.ingest_erase_fence_extend($1,$2,'u-new','origin-9',$3::jsonb)", [ORG, WS, JSON.stringify(pairs)]);
+    expect(await code(extend([[SRC, SID], [SRC, "s-free"]]))).toBe("RH012");
+    expect((await extend([[SRC, "s-free"]])).rows).toEqual([{ ingest_erase_fence_extend: 0 }]);   // no fence hit: no ordered check, no write
+    expect(await rows(d, "SELECT 1 FROM sessions.upload_deletions WHERE user_id='u-new'")).toEqual([]);
+    expect(await owned(d, SID)).toEqual([]);
+  });
+
+  test("the lookup is one PK probe on session_erasure_fences (EXPLAIN)", async () => {
+    const d = await database();
+    const plan = async (q: string) => (await rows<{ "QUERY PLAN": string }>(d, `EXPLAIN ${q}`)).map((x) => x["QUERY PLAN"]).join("\n");
+    const point = await plan(`SELECT EXISTS(SELECT 1 FROM sessions.session_erasure_fences f
+      WHERE f.org_id='org-a' AND f.workspace_id='ws-a' AND f.source='claude' AND f.session_id='s-1')`);
+    // The batch statement exactly as in ingest_erase_fence_extend (LATERAL ... LIMIT 1 keeps it a per-pair probe on all four columns).
+    const body = (await rows<{ s: string }>(d, "SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_erase_fence_extend(text,text,text,text,jsonb)'::regprocedure"))[0]!.s;
+    const probe = /IF NOT EXISTS\((SELECT 1 FROM jsonb_array_elements\(p_pairs\)[\s\S]*?LIMIT 1\) AS h)\) THEN/.exec(body)![1]!;
+    const batch = await plan(`SELECT EXISTS(${probe.replace("p_pairs", `'[["claude","s-1"],["claude","s-2"]]'::jsonb`).replaceAll("p_org", "'org-a'").replaceAll("p_ws", "'ws-a'")})`);
+    console.log(`EXPLAIN point lookup:\n${point}\n\nEXPLAIN batch lookup (extend's first statement):\n${batch}`);
+    for (const p of [point, batch]) {
+      expect(p).toMatch(/Index (Only )?Scan using session_erasure_fences_pkey on session_erasure_fences/);
+      expect(p).not.toMatch(/Seq Scan on session_erasure_fences/);
+      expect(p).toMatch(/Index Cond: \(\(org_id = 'org-a'::text\) AND \(workspace_id = 'ws-a'::text\) AND \(source = .+\) AND \(session_id = .+\)\)/);
+    }
   });
 });
