@@ -212,6 +212,24 @@ test("backfill reconciles: stale rows of a claim retired while the writer was of
  await expect(backfillClaimSessions({sql:{query:async()=>({rows:[]})},batchSize:0,statementTimeoutMs:30000,dryRun:true})).rejects.toMatchObject({code:"batch_size_invalid"});
 });
 
+test("backfill repairs accepted_at: a NULL (missed refresh) and a wrong value become the batch's committed_at; a pending batch stays NULL",async()=>{
+ const f=await fixture();
+ await f.enable(true);
+ const x=await f.claim([f.rec("claude","s-1")]),y=await f.claim([f.rec("claude","s-2"),f.rec("codex","s-2",1)]),z=await f.claim([f.rec("claude","s-3")]);
+ const p=await f.claim([f.rec("claude","s-4")],{committed:false});
+ const acc=async(token:string)=>(await f.db.query<{a:string|null}>("SELECT accepted_at::text a FROM sessions.ingest_claim_sessions WHERE claim_token=$1 ORDER BY source,session_id",[token])).rows.map(r=>r.a);
+ const at="2026-11-05 10:00:00+00";
+ // The commit-time refresh (044090) set the committed batches; break x (missed refresh) and y (drifted).
+ expect([await acc(x.token),await acc(y.token),await acc(z.token),await acc(p.token)]).toEqual([[at],[at,at],[at],[null]]);
+ await f.db.query("UPDATE sessions.ingest_claim_sessions SET accepted_at=NULL WHERE claim_token=$1",[x.token]);
+ await f.db.query("UPDATE sessions.ingest_claim_sessions SET accepted_at=timestamptz '2000-01-01 00:00:00+00' WHERE claim_token=$1",[y.token]);
+ const r=await f.backfill({batchSize:2});
+ // Three side rows repaired by ON CONFLICT DO UPDATE (x's one, y's two); z already right and p's NULL (no committed batch) untouched.
+ expect(r).toMatchObject({claimsScanned:4,rowsInserted:0,rowsRefreshed:3,rowsDeleted:0,completionMarked:true});
+ expect([await acc(x.token),await acc(y.token),await acc(z.token),await acc(p.token)]).toEqual([[at],[at,at],[at],[null]]);
+ expect((await f.db.query<{n:number}>("SELECT count(*)::int n FROM sessions.ingest_claim_sessions s JOIN sessions.ingest_batches b USING(org_id,workspace_id,origin_id,batch_id) WHERE b.state='committed' AND s.accepted_at IS DISTINCT FROM b.committed_at")).rows[0]!.n).toBe(0);
+});
+
 test("real buffered upload as bulls96_session_ingest: writer off writes nothing, writer on writes one row per session",async()=>{
  const generation="4".repeat(64),epoch="1".repeat(64),identity="c".repeat(64),baseline="a".repeat(64);
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());

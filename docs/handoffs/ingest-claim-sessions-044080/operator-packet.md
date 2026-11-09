@@ -143,9 +143,20 @@ real database needs Khaliq's separate, explicit OK in his own words.
   change now clears `read_enabled` too (with the cursor and completion).
 - Trigger `ingest_batch_claim_sessions_refresh`, `AFTER UPDATE OF state, committed_at`
   on `sessions.ingest_batches`: when a batch commits, sets its side rows' `accepted_at`
-  to the batch's `committed_at`, only while `write_enabled`. An error inside it is
-  swallowed (the commit never fails because of it; the row stays NULL, which the
-  reader handles).
+  to the batch's `committed_at`, only while `write_enabled`. While the writer is off
+  it is one policy read (no subtransaction). While it is on, the side-table update
+  runs in a subtransaction that never waits on a row lock (rows are taken
+  `FOR UPDATE SKIP LOCKED`, so rows the backfill or another writer holds are skipped)
+  and waits at most 100ms for any other lock (a transaction-local `lock_timeout`,
+  restored to the caller's value afterwards). Every error it raises there (lock
+  timeout 55P03, deadlock, anything `WHEN OTHERS` catches) is swallowed and the batch
+  commit goes on. What it does not swallow: a cancel or the caller's own
+  `statement_timeout` (57014), which cancels the commit statement as it would without
+  the trigger, and a wait on DDL holding the policy table, which any statement would
+  wait on too. A skipped or failed refresh leaves the row NULL (or whatever the
+  backfill writes); the reader evaluates every NULL `accepted_at` under a committed
+  batch, so it costs time, never a row. Nothing repairs it automatically once the
+  backfill is complete; the `null_accepted` count below tracks it.
 - `sessions.buffered_sessions_for` and `sessions.buffered_session_stages_for` replaced
   (signature, owner, SECURITY DEFINER and ACL unchanged). While the gate
   (`read_enabled AND write_enabled AND backfill_complete_at IS NOT NULL`) is off they
@@ -184,8 +195,9 @@ Applying 044090 changes no runtime behaviour: `read_enabled` starts false.
    SET LOCAL statement_timeout = '60s';
    SELECT write_enabled, read_enabled, backfill_complete_at IS NOT NULL AS complete
      FROM sessions.ingest_claim_sessions_policy;   -- expect: true, true, true
-   -- Side rows under committed batches with no accepted_at (missed refreshes; the
-   -- reader handles them, but a growing number means the refresh is failing).
+   -- Side rows under committed batches with no accepted_at (refreshes skipped on a
+   -- locked row or failed; the reader handles them, but a growing number means the
+   -- refresh is failing).
    SELECT count(*) AS null_accepted
      FROM sessions.ingest_claim_sessions s
      JOIN sessions.ingest_batches b USING (org_id, workspace_id, origin_id, batch_id)

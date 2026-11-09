@@ -4,7 +4,8 @@
  * (default false, CHECK: only with write_enabled and a completed backfill) and owns one OWNER-ONLY trigger function
  * (no runtime grant, not SECURITY DEFINER):
  *   ingest_batch_claim_sessions_refresh  AFTER UPDATE OF state, committed_at on ingest_batches: at a batch's commit
- *                                        sets its side rows' accepted_at, only while write_enabled; never raises
+ *                                        sets its side rows' accepted_at, only while write_enabled; skips locked
+ *                                        side rows, bounds other lock waits at 100ms, swallows its errors
  * It replaces, by CREATE OR REPLACE (owner, SECURITY DEFINER and ACL unchanged):
  *   buffered_sessions_for / buffered_session_stages_for  (044040's) gate off: 044040's query verbatim; gate on
  *                                        (read_enabled AND write_enabled AND completion): the side-table driven v2

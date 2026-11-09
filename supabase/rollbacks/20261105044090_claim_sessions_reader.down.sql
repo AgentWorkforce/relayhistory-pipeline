@@ -16,7 +16,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105044090_claim_sessions_reader.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='claim sessions reader: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044090_claim_sessions_reader.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM '7172adbc903cda5a3d50ca3f9bb4929e4de361fc075d26178a0b0296a2e8c790'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM '047846f6cd640752537e66e074a00d87f0e2d9a6dc4c4c741c86468aad85f35a'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='claim sessions reader: own applied checksum required';END IF;
 END $rollback_guard$;
 SET LOCAL lock_timeout='5s';
@@ -484,5 +484,5 @@ END $claim_sessions_policy$;
 DROP TRIGGER ingest_batch_claim_sessions_refresh ON sessions.ingest_batches;
 DROP FUNCTION sessions.ingest_batch_claim_sessions_refresh();
 ALTER TABLE sessions.ingest_claim_sessions_policy DROP CONSTRAINT ingest_claim_sessions_policy_read_check, DROP COLUMN read_enabled;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044090_claim_sessions_reader.sql' AND sha256='7172adbc903cda5a3d50ca3f9bb4929e4de361fc075d26178a0b0296a2e8c790';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044090_claim_sessions_reader.sql' AND sha256='047846f6cd640752537e66e074a00d87f0e2d9a6dc4c4c741c86468aad85f35a';
 COMMIT;
