@@ -26,6 +26,7 @@
  * never a key, a session id or any other identifier.
  */
 import { createHash } from "node:crypto";
+import { parseUploadGenerationPrefix } from "../../packages/object-store/src/layout.ts";
 import type { EraseCheckpoint, ListedVersion, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 import { layoutComponent } from "../shared/layout-component.ts";
 
@@ -42,6 +43,7 @@ const MAX_DATES = 32;
 /** The operator erase key (canonical, pre-layout-encoding source ids). */
 export interface SessionEraseKey {
   orgId: string;
+  /** The canonical workspace id, as stored on publication rows (`tenant.workspaceId`). */
   workspaceId: string;
   /** The harness/source, e.g. `claude-code`. */
   source: string;
@@ -50,9 +52,15 @@ export interface SessionEraseKey {
 
 /**
  * One `session_index` row's storage coordinates. `workspaceId`, `machineId`, `harness` and
- * `sessionId` are the PHYSICAL (layout-encoded) values stored in the row; they must equal
- * `layoutComponent` of the erase key's ids. At least one date source is required: the row's
- * `manifestKey` (authoritative: it fixes `d=`) and/or explicit `dates` (`yyyy-mm-dd`).
+ * `sessionId` are the row's values; each must equal `layoutComponent` of the erase key's id
+ * (the physical path segment). Rows store the canonical workspace id; a layout-safe id is
+ * identical to its physical value, and any other id is refused (`location_not_this_session`,
+ * fail closed). Through `layoutComponent` two raw ids (e.g. `a:b` and `a_b`) can share one
+ * physical directory, and erasing one erases that shared directory. At least one date source
+ * is required: the row's `manifestKey` (authoritative: it fixes `d=`; required unless the row
+ * has none) and/or explicit `dates` (`yyyy-mm-dd`). A `manifestKey` under the upload-generation
+ * layout (`{keyRoot}/{org}/upload-generations/g=<uuid>/…`) is a publication generation, which
+ * this eraser does not cover: it is refused with `location_publication_generation`.
  */
 export interface SessionEraseLocation {
   workspaceId: string;
@@ -104,6 +112,11 @@ export interface SessionEraseBytesResult {
   stagedPendingVersions: number;
   /** Targets whose bounded runs ended before a full traversal. */
   incompleteTargets: number;
+  /**
+   * Live pointer targets left in place this run because another target was incomplete or had
+   * staged versions still inside the redrive window (always 0 on a dry run).
+   */
+  deferredPointerTargets: number;
   /** True only when a fresh listing found nothing left under every target (always false on a dry run). */
   verified: boolean;
 }
@@ -185,6 +198,7 @@ export function planTargets(req: SessionEraseBytesRequest, opts: Pick<SessionEra
     }
     if (loc.manifestKey != null) {
       const mk = String(loc.manifestKey);
+      if (isPublicationGenerationManifest(mk, org, lws, m, h, s)) refuse("location_publication_generation");
       if (!mk.startsWith(machineBase)) refuse("manifest_key_mismatch");
       const m2 = /^d=(\d{4})\/(\d{2})\/(\d{2})\/s=([^/]+)\/manifest\.json$/.exec(mk.slice(machineBase.length));
       if (!m2 || m2[4] !== s) refuse("manifest_key_mismatch");
@@ -209,6 +223,23 @@ export function planTargets(req: SessionEraseBytesRequest, opts: Pick<SessionEra
 }
 
 /**
+ * True when `mk` is this location's session manifest under the upload-generation layout
+ * (`{org}/upload-generations/g=<uuid>/v1/ws=…/m=…/h=…/d=…/s=<sid>/publications/<uuid>/manifest.json`).
+ * Those bytes are a publication generation, a separate erase step: the row is refused with a
+ * distinct code so lane D can track it as not erased (a row of another session stays
+ * `manifest_key_mismatch`).
+ */
+function isPublicationGenerationManifest(mk: string, org: string, ws: string, m: string, h: string, s: string): boolean {
+  const marker = `${org}/upload-generations/g=`;
+  if (!mk.startsWith(marker)) return false;
+  const end = mk.indexOf("/", marker.length);
+  if (end < 0 || parseUploadGenerationPrefix(mk.slice(0, end))?.base !== org) return false;
+  const rest = mk.slice(end + 1);
+  const at = /^v1\/ws=([^/]+)\/m=([^/]+)\/h=([^/]+)\/d=\d{4}\/\d{2}\/\d{2}\/s=([^/]+)\/publications\/[^/]+\/manifest\.json$/.exec(rest);
+  return !!at && at[1] === ws && at[2] === m && at[3] === h && at[4] === s;
+}
+
+/**
  * The eraser's own guard (in addition to the primitive's per-page prefix check): every key
  * must lie inside a transcript dir of the plan or BE one of the plan's exact keys. Throws
  * `session_erase_key_outside_allowed_prefixes` (no key in the message).
@@ -225,12 +256,28 @@ function scopeOf(key: SessionEraseKey, t: EraseTarget): string {
   return "session_erase_bytes:" + createHash("sha256").update(JSON.stringify([key.orgId, key.workspaceId, key.source, key.sessionId, t.prefix, t.exactKey ?? null])).digest("hex");
 }
 
-async function pool<T>(items: readonly T[], width: number, fn: (item: T) => Promise<void>): Promise<void> {
-  let next = 0;
+/**
+ * Runs `fn` over `items`, at most `width` at once. The first failure sets a shared `stopped`
+ * flag: no lane takes another item, `fn` can poll `stopped()` between its own steps, and the
+ * pool waits for every lane to settle before rethrowing that first error (so no lane keeps
+ * deleting after the call has failed).
+ */
+async function pool<T>(items: readonly T[], width: number, fn: (item: T, stopped: () => boolean) => Promise<void>): Promise<void> {
+  let next = 0, stopped = false;
+  let first: { error: unknown } | undefined;
+  const isStopped = () => stopped;
   const lanes = Array.from({ length: Math.min(width, items.length) }, async () => {
-    while (next < items.length) await fn(items[next++]!);
+    while (!stopped && next < items.length) {
+      try {
+        await fn(items[next++]!, isStopped);
+      } catch (error) {
+        if (!first) first = { error };
+        stopped = true;
+      }
+    }
   });
-  await Promise.all(lanes);
+  await Promise.allSettled(lanes);
+  if (first) throw first.error;
 }
 
 /** Erase (or, dry run, count) one session's bytes, then verify by listing again. */
@@ -249,12 +296,18 @@ export async function eraseSessionBytes(eraser: PagedEraser, req: SessionEraseBy
   const keys: Record<TargetKind, Set<string>> = { transcript: new Set(), pointer: new Set(), staged: new Set() };
   // Dry run: a page boundary inside one key relists that key's versions, so count each once.
   const seen = new Set<string>();
-  let versions = 0, stagedPending = 0, incomplete = 0;
+  let versions = 0, stagedPending = 0, incomplete = 0, stagedKept = false;
   const cutoff = now() - minAge;
   const stagedOld = (v: ListedVersion) => v.lastModified !== undefined && v.lastModified < cutoff;
 
-  const run = async (t: EraseTarget) => {
-    const keep = t.kind === "staged" ? stagedOld : () => true;
+  const run = async (t: EraseTarget, stopped: () => boolean) => {
+    const keep = t.kind === "staged"
+      ? (v: ListedVersion) => {
+          if (stagedOld(v)) return true;
+          if (t.exactKey === undefined || v.key === t.exactKey) stagedKept = true;
+          return false;
+        }
+      : () => true;
     const select = dryRun
       ? (v: ListedVersion) => {
           assertAllowed(targets, [v.key]);
@@ -268,6 +321,7 @@ export async function eraseSessionBytes(eraser: PagedEraser, req: SessionEraseBy
       : keep;
     let checkpoint: EraseCheckpoint | null = null;
     for (let r = 0; r < maxRuns; r++) {
+      if (stopped()) return; // a sibling lane failed: the pool rethrows its error
       const res = await eraser.eraseStep(t.prefix, {
         scope: scopeOf(req.key, t), checkpoint, select, authorize, now,
         ...(t.exactKey !== undefined ? { exactKey: t.exactKey } : {}),
@@ -283,12 +337,18 @@ export async function eraseSessionBytes(eraser: PagedEraser, req: SessionEraseBy
     incomplete++;
   };
 
-  // Staged batches and transcript dirs first; the live pointer last, so a writer that still
-  // finds its pointer never re-creates a dir that was already erased behind it.
-  // A pointer is only erased once every other target was fully traversed (as the cloud eraser
-  // erases it only after the session dir); otherwise it stays for the rerun.
+  // Staged batches and transcript dirs first; the live pointer last. Keeping the pointer does
+  // not stop a writer re-creating bytes (a writer that finds it writes into the `d=` dir it
+  // names), but it means any such re-creation lands in a PLANNED dir that verify catches,
+  // instead of a fresh pointer and a new `d=` dir outside the plan.
+  // A pointer is only erased once every other target was fully traversed and no staged
+  // version is still pending inside the redrive window (as the cloud eraser erases it only
+  // after the session dir); otherwise it stays for the rerun.
+  const pointers = targets.filter((t) => t.kind === "pointer");
   await pool(targets.filter((t) => t.kind !== "pointer"), width, run);
-  if (incomplete === 0 || dryRun) await pool(targets.filter((t) => t.kind === "pointer"), width, run);
+  const deferPointers = !dryRun && (incomplete > 0 || stagedKept);
+  if (!deferPointers) await pool(pointers, width, run);
+  const deferredPointers = deferPointers ? pointers.length : 0;
 
   let remaining = 0, pendingBudget = 0;
   if (!dryRun) {
@@ -309,12 +369,14 @@ export async function eraseSessionBytes(eraser: PagedEraser, req: SessionEraseBy
     versionsDeleted: versions,
     stagedPendingVersions: stagedPending,
     incompleteTargets: incomplete,
-    verified: !dryRun && remaining === 0 && pendingBudget === 0 && incomplete === 0,
+    deferredPointerTargets: deferredPointers,
+    verified: !dryRun && remaining === 0 && pendingBudget === 0 && incomplete === 0 && deferredPointers === 0,
   };
   log({
     event: "session_erase_bytes", dry_run: dryRun, targets: targets.length, transcript_objects: result.transcriptObjects,
     pointer_objects: result.pointerObjects, staged_objects: result.stagedObjects, versions: result.versionsDeleted,
-    staged_pending_versions: stagedPending, incomplete_targets: incomplete, remaining_versions: remaining,
+    staged_pending_versions: stagedPending, incomplete_targets: incomplete,
+    deferred_pointer_targets: deferredPointers, remaining_versions: remaining,
     verify_budget_exhausted: pendingBudget, verified: result.verified,
   });
   return result;

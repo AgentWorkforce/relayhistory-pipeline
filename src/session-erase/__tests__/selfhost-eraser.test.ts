@@ -10,7 +10,7 @@ import { STAGED_ERASE_AFTER_MS } from "../../migration/neon-s3-erasure/job.ts";
 import { liveMachineId } from "../../session-ingest/writer.ts";
 import { stagedKey } from "../../session-ingest/staging.ts";
 import { assertAllowed, eraseSessionBytes, planTargets, STAGED_MIN_AGE_MS, SessionEraseRefused, type SessionEraseBytesRequest } from "../selfhost-eraser.ts";
-import { runSessionEraseBytes, sessionEraseBytesEnabled } from "../selfhost-eraser-main.ts";
+import { exitCodeForError, exitCodeForResult, requestPathFrom, runSessionEraseBytes, sessionEraseBytesEnabled } from "../selfhost-eraser-main.ts";
 
 const ROOT = "96bulls", ORG = "org-a", WS = "ws-1", SRC = "claude-code", SID = "sess:one/a";
 const SEG = "sess_one_a"; // layoutComponent(SID)
@@ -73,7 +73,7 @@ describe("self-host session byte eraser", () => {
     const r = await eraseSessionBytes(s.eraser(), request(), opts());
     expect(r).toEqual({
       dryRun: false, transcriptObjects: 3 * 5 + 2, pointerObjects: 1, stagedObjects: 2,
-      versionsDeleted: before, stagedPendingVersions: 0, incompleteTargets: 0, verified: true,
+      versionsDeleted: before, stagedPendingVersions: 0, incompleteTargets: 0, deferredPointerTargets: 0, verified: true,
     });
     for (const p of [DIR, DIR2, DIR_EXPORT, POINTER, S1, S2]) expect(s.count(p)).toBe(0);
     expect(survivors(s)).toBe(true);
@@ -96,10 +96,13 @@ describe("self-host session byte eraser", () => {
     const r = await eraseSessionBytes(s.eraser(), request(), opts());
     expect(s.count(S1)).toBe(0);
     expect(s.count(S2)).toBe(1);
-    expect(r).toMatchObject({ stagedObjects: 2, stagedPendingVersions: 1, verified: false });
-    // After the window passes a rerun finishes the job.
+    expect(r).toMatchObject({ stagedObjects: 2, stagedPendingVersions: 1, incompleteTargets: 0, deferredPointerTargets: 2, verified: false });
+    // The live pointer is kept while a young staged version is pending.
+    expect(s.count(POINTER)).toBe(3);
+    // After the window passes a rerun finishes the job, the pointer included.
     const later = await eraseSessionBytes(s.eraser(), request(), opts({ now: () => NOW + STAGED_MIN_AGE_MS }));
-    expect(later).toMatchObject({ stagedObjects: 1, versionsDeleted: 1, verified: true });
+    expect(later).toMatchObject({ stagedObjects: 1, pointerObjects: 1, versionsDeleted: 1 + 3, deferredPointerTargets: 0, verified: true });
+    expect(s.count(POINTER)).toBe(0);
   });
 
   test("a late write between delete and verify makes verification fail (verified=false)", async () => {
@@ -119,7 +122,7 @@ describe("self-host session byte eraser", () => {
     await eraseSessionBytes(s.eraser(), request(), opts());
     const deletes = s.deletes.length;
     const r = await eraseSessionBytes(s.eraser(), request(), opts());
-    expect(r).toEqual({ dryRun: false, transcriptObjects: 0, pointerObjects: 0, stagedObjects: 0, versionsDeleted: 0, stagedPendingVersions: 0, incompleteTargets: 0, verified: true });
+    expect(r).toEqual({ dryRun: false, transcriptObjects: 0, pointerObjects: 0, stagedObjects: 0, versionsDeleted: 0, stagedPendingVersions: 0, incompleteTargets: 0, deferredPointerTargets: 0, verified: true });
     expect(s.deletes.length).toBe(deletes);
   });
 
@@ -138,7 +141,7 @@ describe("self-host session byte eraser", () => {
     for (let i = 0; i < 300; i++) s.put(`${DIR}raw/x${String(i).padStart(4, "0")}.ndjson.zst`, OLD);
     s.pageSize = 2; // 100 pages per run x 2 < 300 keys
     const r = await eraseSessionBytes(s.eraser(), request(), opts({ maxRunsPerTarget: 1 }));
-    expect(r).toMatchObject({ incompleteTargets: 1, verified: false });
+    expect(r).toMatchObject({ incompleteTargets: 1, deferredPointerTargets: 2, verified: false });
     expect(s.count(DIR)).toBeGreaterThan(0);
     expect(s.count(POINTER)).toBe(3); // the pointer waits for a fully traversed dir
     expect(await eraseSessionBytes(s.eraser(), request(), opts())).toMatchObject({ incompleteTargets: 0, verified: true });
@@ -160,6 +163,33 @@ describe("self-host session byte eraser", () => {
     expect(await eraseSessionBytes(counted, request(), opts({ concurrency: 2 }))).toMatchObject({ verified: true });
     expect(peak).toBe(2);
     for (const c of [0, 17, 1.5]) await expect(eraseSessionBytes(s.eraser(), request(), opts({ concurrency: c }))).rejects.toThrow("session_erase_concurrency_invalid");
+  });
+
+  test("a failure in one lane stops the other lanes from taking more targets, and the first error is rethrown", async () => {
+    const s = seed();
+    const inner = s.eraser();
+    const started: string[] = [];
+    let failed = false, afterFailure = 0;
+    const failing = {
+      ...inner,
+      eraseStep: async (...a: Parameters<typeof inner.eraseStep>) => {
+        if (failed) afterFailure++;
+        started.push(a[0]);
+        if (started.length === 1) {
+          await new Promise((r) => setTimeout(r, 1));
+          failed = true;
+          throw Object.assign(new Error("boom"), { code: "s3_503" });
+        }
+        await new Promise((r) => setTimeout(r, 10));
+        return inner.eraseStep(...a);
+      },
+    };
+    await expect(eraseSessionBytes(failing, request(), opts({ concurrency: 2 }))).rejects.toThrow("boom");
+    await new Promise((r) => setTimeout(r, 50));
+    // Only the failing target and the one already in flight in the sibling lane were started.
+    expect(started.length).toBe(2);
+    expect(afterFailure).toBe(0);
+    expect(s.count(POINTER)).toBe(3);
   });
 
   test("logs carry counts only: no key, session id, org, workspace or machine", async () => {
@@ -203,6 +233,19 @@ describe("never deletes outside the computed prefixes", () => {
     await refusedWithoutTouching(request({ locations: [{ ...base, manifestKey: null, dates: [] }] }), "date_required");
     await refusedWithoutTouching(request({ locations: [{ ...base, dates: ["2026-02-30"] }] }), "date_invalid");
     await refusedWithoutTouching(request({ key: { orgId: "../x", workspaceId: WS, source: SRC, sessionId: SID } }), "org_invalid");
+  });
+
+  test("a publication-generation row gets its own refusal code (lane D excludes it and tracks it as not erased)", async () => {
+    const base = request().locations[0]!;
+    const gen = "0123abcd-0000-4000-8000-00000000abcd", pub = "fedc0000-1111-4222-8333-444455556666";
+    const genKey = (sid: string) => `${ROOT}/${ORG}/upload-generations/g=${gen}/v1/ws=${WS}/m=${M}/h=${SRC}/d=2026/11/01/s=${sid}/publications/${pub}/manifest.json`;
+    await refusedWithoutTouching(request({ locations: [{ ...base, manifestKey: genKey(SEG) }] }), "location_publication_generation");
+    // The whole request is refused even when other rows are fine.
+    await refusedWithoutTouching(request({ locations: [request().locations[1]!, { ...base, manifestKey: genKey(SEG) }] }), "location_publication_generation");
+    // Another session's generation row, another org's or a malformed generation stays a mismatch.
+    await refusedWithoutTouching(request({ locations: [{ ...base, manifestKey: genKey("other") }] }), "manifest_key_mismatch");
+    await refusedWithoutTouching(request({ locations: [{ ...base, manifestKey: genKey(SEG).replace(`/${ORG}/`, "/org-b/") }] }), "manifest_key_mismatch");
+    await refusedWithoutTouching(request({ locations: [{ ...base, manifestKey: genKey(SEG).replace(`g=${gen}`, "g=not-a-uuid") }] }), "manifest_key_mismatch");
   });
 
   test("assertAllowed refuses any key outside the plan (sibling session, prefix-sharing id, dot segments, other pointer)", () => {
@@ -260,6 +303,30 @@ describe("process entry (default off)", () => {
       eraser: (cfg) => { expect(cfg).toMatchObject({ bucket: "bkt", endpoint: "http://127.0.0.1:9000" }); return s.eraser(); }, now: () => NOW, log: () => {},
     });
     expect(r).toMatchObject({ enabled: true, verified: true, stagedObjects: 2, pointerObjects: 1 });
+  });
+
+  test("exit codes: 2 only for refusals and config errors; any other error is 4 (may be partial, rerun)", () => {
+    const result = { dryRun: false, transcriptObjects: 0, pointerObjects: 0, stagedObjects: 0, versionsDeleted: 0, stagedPendingVersions: 0, incompleteTargets: 0, deferredPointerTargets: 0 };
+    expect(exitCodeForResult({ enabled: false })).toBe(0);
+    expect(exitCodeForResult({ enabled: true, ...result, verified: true })).toBe(0);
+    expect(exitCodeForResult({ enabled: true, ...result, dryRun: true, verified: false })).toBe(0);
+    expect(exitCodeForResult({ enabled: true, ...result, verified: false })).toBe(3);
+    expect(exitCodeForError(new SessionEraseRefused("config_invalid"))).toBe(2);
+    expect(exitCodeForError(new SessionEraseRefused("manifest_key_mismatch"))).toBe(2);
+    for (const e of [
+      Object.assign(new Error("s3"), { code: "s3_503" }),
+      Object.assign(new Error("lock"), { code: "s3_403" }),
+      Object.assign(new Error("inv"), { code: "erasure_foreign_key" }),
+      new TypeError("fetch failed"),
+      "not an error",
+    ]) expect(exitCodeForError(e)).toBe(4);
+  });
+
+  test("--request with no value is refused; otherwise the flag, then the env file, then stdin", () => {
+    for (const argv of [["--request"], ["--request", ""], ["--request", "--dry"]]) expect(() => requestPathFrom(argv, {})).toThrow("session_erase_request_invalid");
+    expect(requestPathFrom(["--request", "/r.json"], { SESSION_ERASE_REQUEST_FILE: "/e.json" })).toBe("/r.json");
+    expect(requestPathFrom([], { SESSION_ERASE_REQUEST_FILE: "/e.json" })).toBe("/e.json");
+    expect(requestPathFrom([], {})).toBeUndefined();
   });
 
   test("config refusals carry codes, never values", async () => {

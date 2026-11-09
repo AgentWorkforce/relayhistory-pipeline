@@ -26,7 +26,7 @@ whole table.
 | `session-read-api` | Deployment (HTTP) | `src/session-read-api/server.ts` | `RELAYHISTORY_READ_API_PORT`, default 8080 | `GET /healthz` (200 `{"ok":true,"enabled":false\|true}`) |
 | `session-publication` | Deployment (worker) | `src/session-ingest/publication-service.ts --continuous` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz` (below) |
 | `session-ingest` | Deployment (HTTP) | `src/session-ingest/selfhost-server.ts` | `RELAYHISTORY_INGEST_PORT`, default 8081 | `GET /healthz` (200 `{"ok":true,"enabled":false\|true}`), `GET /readyz` (section 3) |
-| `session-erase-bytes` | Job (one-shot, operator-run, default off) | `src/session-erase/selfhost-eraser-main.ts` | none | exit code (0 verified / disabled / dry run, 3 not verified, 2 refused) |
+| `session-erase-bytes` | Job (one-shot, operator-run, default off) | `src/session-erase/selfhost-eraser-main.ts` | none | exit code (0 verified / disabled / dry run, 3 not verified (rerun), 2 refused or misconfigured (do not retry unchanged), 4 failed, may be partial (rerun)) |
 
 The worker port serves probes only. It must never be reachable from outside
 the cluster.

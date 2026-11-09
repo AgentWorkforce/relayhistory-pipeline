@@ -40,11 +40,22 @@ Every version and every delete marker, by version id, of:
 | Staged batch objects supplied by the caller | `{keyRoot}/{org}/live-batches/v1/ws={ws}/m=srv_…/b=….staged.ndjson.zst` | exact key |
 
 `ws`, `harness` and `sid` are `layoutComponent` of the erase key's ids
-(`src/shared/layout-component.ts`). Order: staged objects and transcript
-directories first, then the pointers, then the verification listing. Deleting
-the pointer last means a writer that can still find it does not re-create a
-directory behind the eraser. Pointers are erased only when every other target
-was fully traversed in the same run; otherwise they stay for the rerun.
+(`src/shared/layout-component.ts`). Through `layoutComponent` two raw ids can
+share one physical directory (for example `a:b` and `a_b` both map to `a_b`).
+Erasing one of them erases that shared directory. This is inherent to the
+storage layout.
+
+Order: staged objects and transcript directories first, then the pointers, then
+the verification listing. Keeping the pointer until last does **not** stop a
+writer from re-creating bytes: a writer that finds its pointer writes into the
+`d=` directory the pointer names. The benefit is where a re-creation lands. With
+the pointer still present, it lands in a planned directory, so verify catches it
+(`verified: false`) and a rerun erases it. Without the pointer, a writer would
+create a fresh pointer and a directory at a new `d=` that may be outside the
+plan. Pointers are erased only when every other target was fully traversed in
+the same run **and** no staged version is still pending inside the redrive
+window. Otherwise they stay for the rerun and are counted in
+`deferredPointerTargets`.
 
 It never deletes anything else:
 
@@ -66,13 +77,16 @@ It never deletes anything else:
 eraseSessionBytes(eraser: PagedEraser, request: SessionEraseBytesRequest, options)
 
 SessionEraseBytesRequest = {
-  key: { orgId, workspaceId, source, sessionId },   // canonical (pre-encoding) ids
+  key: { orgId, workspaceId, source, sessionId },   // canonical (pre-encoding) ids;
+                                                    // workspaceId as stored on publication rows
   locations: SessionEraseLocation[],                // 1..64, one per session_index row
   stagedKeys?: string[],                            // 0..1000, attributed by the caller
 }
 SessionEraseLocation = {                            // a session_index row's columns
-  workspaceId, machineId, harness, sessionId,       // PHYSICAL (layout-encoded) values
-  manifestKey?: string | null,                      // row.manifest_key: fixes d=
+  workspaceId, machineId, harness, sessionId,       // the row's values; each must equal
+                                                    // layoutComponent of the key's id
+  manifestKey?: string | null,                      // row.manifest_key: fixes d= (required
+                                                    // unless the row has none)
   dates?: string[],                                 // yyyy-mm-dd, extra dates to cover
   storageProvider?: string | null,                  // row.storage_provider: s3 | r2 only
   bucket?: string | null,                           // row.bucket: must equal the eraser's
@@ -82,10 +96,36 @@ options = { keyRoot, bucket, dryRun?, concurrency? (1..16, default 4),
             authorize?, now?, log? }
 ```
 
+Rows store the canonical workspace id (`tenant.workspaceId`). For a
+layout-safe id (`[A-Za-z0-9._-]`, not starting with `.`) the canonical and
+physical values are identical. Any other id does not match its layout-encoded
+form and is refused (`location_not_this_session`), which fails closed.
+
+**Lane D must have fenced the session (lane B) before it starts the Job.** The
+process entry does not re-check lane B's tombstone or fence before each page
+(`authorize` is not wired), so a write that is not fenced can land after the
+verification listing.
+
 Pass every `session_index` row of the session, for every machine and every
-user, including tombstoned ones (`deleted_at` set). A row not passed is not
-erased. Each location needs at least one date source: `manifestKey` (preferred,
-it is the row's own key) or `dates`.
+user, including tombstoned ones (`deleted_at` set), **except** rows in the
+upload-generation layout (below). A row not passed is not erased. Each location
+needs at least one date source. `manifestKey` is required unless the row has
+none: it is the row's own key, and it binds the key root and org (a wrong
+`SESSION_ERASE_KEY_ROOT` or org is refused as `manifest_key_mismatch`). A
+location with only `dates` skips that cross-check, so a wrong key root, org or
+date finds nothing and still reports `verified: true`.
+
+**Publication-generation rows are excluded.** A `session_index` row written by
+the self-host `session-publication` service has a `manifest_key` under the
+upload-generation layout:
+`{keyRoot}/{org}/upload-generations/g=<uuid>/v1/ws=…/m=…/h=…/d=…/s={sid}/publications/<uuid>/manifest.json`.
+This eraser does not erase publication generations, which are a separate step.
+Such a row is refused with `location_publication_generation`, and the whole
+request is refused with it. Lane D must exclude these rows from this eraser's
+request and track that session's publication-generation bytes as **not
+erased**. The result's `verified: true` covers only the targets planned from
+the request. It says nothing about rows that were not passed, and that includes
+publication generations.
 
 **Staged keys come from the orchestrator.** A staged key carries no session id.
 Attributing a staged object to a session needs either the DB ledger or a read
@@ -97,14 +137,31 @@ resolve and pass the list.
 
 ```ts
 { dryRun, transcriptObjects, pointerObjects, stagedObjects, versionsDeleted,
-  stagedPendingVersions, incompleteTargets, verified }
+  stagedPendingVersions, incompleteTargets, deferredPointerTargets, verified }
 ```
 
 Object counts are distinct keys, and `versionsDeleted` counts versions plus
-delete markers. In a dry run the same fields count what would be deleted, and
-`verified` is always false. The process entry prints this as one JSON line
-(`enabled: true` added). Exit codes: 0 when verified, disabled or a dry run; 3
-when not verified (rerun); 2 when refused or misconfigured.
+delete markers. `deferredPointerTargets` counts the live pointers left in place
+because a target was incomplete or a staged version is still pending. Any
+deferred pointer makes `verified` false. In a dry run the same fields count
+what would be deleted, `deferredPointerTargets` is 0, and `verified` is always
+false. `verified: true` covers only the targets planned from this request (see
+Inputs). The process entry prints this as one JSON line (`enabled: true`
+added).
+
+Exit codes (`exitCodeForResult` / `exitCodeForError` in the entry):
+
+| Code | Meaning | Orchestrator action |
+| --- | --- | --- |
+| 0 | verified, disabled, or a dry run | done (verified only on `verified: true`) |
+| 3 | ran to the end, not verified | rerun later |
+| 2 | refused or misconfigured (`SessionEraseRefused`; stderr `error` is `session_erase_<code>`) | do not retry unchanged; fix the request or config |
+| 4 | failed with any other error: S3 5xx or 403 (`s3_<status>`, e.g. object lock or legal hold), network, `erasure_*` inventory errors | the run may have deleted part of the session; rerun it |
+
+Planning refusals happen before any listing or delete. The one refusal that can
+follow deletes is the eraser's own guard (`key_outside_allowed_prefixes`),
+which means a listing returned a key outside the plan. It needs a human, not a
+blind retry.
 
 ## Verification
 
@@ -151,7 +208,8 @@ break its barrier.
   and needs explicit owner approval. Nothing here creates it.
 - **Not covered:** a row not passed (another user's copy, an exporter machine
   whose row is missing); a date not given by `manifestKey` or `dates`;
-  publication and derived copies (search index, publication generations);
+  publication and derived copies (search index, publication generations,
+  whose rows are refused with `location_publication_generation`);
   replica batch descriptors under `live-batches/v1/ws=…/o=…/`, which are a
   cloud transition artifact; anything written after the erase and not fenced
   by lane B.

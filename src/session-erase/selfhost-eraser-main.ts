@@ -14,9 +14,12 @@
  *   SESSION_ERASE_DRY_RUN                    "1": list and count only
  *   SESSION_ERASE_CONCURRENCY                1..16, default 4
  *   SESSION_ERASE_REQUEST_FILE               absolute path of the request JSON (or `--request <path>`;
- *                                            otherwise stdin)
+ *                                            otherwise stdin). `--request` with no value is refused
  *
- * Exit codes: 0 verified (or disabled, or a dry run), 3 not verified (rerun), 2 refused / config.
+ * Exit codes (`exitCodeForResult` / `exitCodeForError`): 0 verified (or disabled, or a dry run);
+ * 3 not verified (rerun); 2 refused or misconfigured (SessionEraseRefused only: do not retry
+ * unchanged); 4 failed with any other error (S3 5xx / 403, network, inventory): the run may have
+ * deleted part of the session, rerun it.
  * Output: one JSON result line with counts only. Refusal codes never carry a value.
  * See docs/operator-session-erase-selfhost-eraser.md.
  */
@@ -139,6 +142,29 @@ export async function runSessionEraseBytes(
   return { enabled: true, ...result };
 }
 
+/** Exit code of a completed run: 0 verified, disabled or dry run; 3 not verified (rerun). */
+export function exitCodeForResult(r: { enabled: false } | ({ enabled: true } & SessionEraseBytesResult)): 0 | 3 {
+  return !r.enabled || r.dryRun || r.verified ? 0 : 3;
+}
+
+/**
+ * Exit code of a failed run: 2 only for a refusal or a config error (every one is a
+ * SessionEraseRefused); 4 for anything else (an S3 error, a network error, an inventory
+ * error), which may follow partial deletes and must be rerun, never treated as permanent.
+ */
+export function exitCodeForError(e: unknown): 2 | 4 {
+  return e instanceof SessionEraseRefused ? 2 : 4;
+}
+
+/** The request file: `--request <path>` (a missing value is refused), else SESSION_ERASE_REQUEST_FILE, else stdin (undefined). */
+export function requestPathFrom(argv: readonly string[], env: NodeJS.ProcessEnv): string | undefined {
+  const at = argv.indexOf("--request");
+  if (at < 0) return env.SESSION_ERASE_REQUEST_FILE || undefined;
+  const value = argv[at + 1];
+  if (!value || value.startsWith("--")) refuse("request_invalid");
+  return value;
+}
+
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -153,17 +179,19 @@ async function readStdin(): Promise<string> {
 }
 
 if (import.meta.main) {
-  const argv = process.argv.slice(2);
-  const at = argv.indexOf("--request");
-  const path = at >= 0 ? argv[at + 1] : process.env.SESSION_ERASE_REQUEST_FILE;
-  runSessionEraseBytes(process.env, () => (path ? readBounded(path, MAX_FILE) : readStdin()))
+  // The path is resolved inside the request thunk, so with the flag off nothing is parsed.
+  const request = () => {
+    const path = requestPathFrom(process.argv.slice(2), process.env);
+    return path ? readBounded(path, MAX_FILE) : readStdin();
+  };
+  runSessionEraseBytes(process.env, request)
     .then((r) => {
       console.log(JSON.stringify(r));
-      process.exit(!r.enabled || r.dryRun || r.verified ? 0 : 3);
+      process.exit(exitCodeForResult(r));
     })
     .catch((e) => {
       const code = e instanceof SessionEraseRefused ? e.message : typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : "session_erase_failed";
       console.error(JSON.stringify({ event: "session_erase_bytes", error: code }));
-      process.exit(2);
+      process.exit(exitCodeForError(e));
     });
 }
