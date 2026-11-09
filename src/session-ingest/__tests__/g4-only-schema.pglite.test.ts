@@ -134,10 +134,10 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105045000_digest_narrative_cache.sql",
       // Replaces the feed's stage RPC (043870, post-G4) to add the sameSecond sibling counts; no ingest RPC changes.
       "20261105045010_buffered_search_feed_same_second.sql",
-      // Self-host output facts tables and their writer/read functions only; no ingest path touches them.
-      "20261105045020_selfhost_output_facts.sql",
       // One EXECUTE grant to the self-host consumer on the 20261101050000 project-text index helper; no new object, no ingest change.
       "20261105045030_session_consumer_project_text_grant.sql",
+      // Self-host output facts tables and their writer/read functions only; no ingest path touches them.
+      "20261105045040_selfhost_output_facts.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

@@ -346,7 +346,7 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
  */
 /**
  * RELAYHISTORY_SELFHOST_OUTPUT_FACTS (default off): output facts go to the Postgres store
- * (migration 045020) on the search pass's own transaction. Off: the key is absent and
+ * (migration 045040) on the search pass's own transaction. Off: the key is absent and
  * indexSearchScope calls no output facts function.
  */
 export function outputFactsDeps(config: { outputFacts: boolean }): Pick<SearchIndexDeps, "outputFactsStore"> {

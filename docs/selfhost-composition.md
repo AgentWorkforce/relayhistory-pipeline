@@ -316,12 +316,12 @@ any other value is off (default off), never a startup error. When on, every
 search-index pass also builds the session's output facts with the shared
 builder and writes them through the Postgres facts store
 (`sessions.session_event_facts`, `sessions.session_output_facts` and
-`sessions.output_facts_session_state`, migration `045020`) inside the same
+`sessions.output_facts_session_state`, migration `045040`) inside the same
 transaction as the directory events; a pass older than the stored source
 version is a no-op, and the erase path deletes the session's facts. Default
 off; sessions ingested before the flag have no facts (bootstrap is a later PR).
 Sessions erased while the flag is off keep any facts written earlier.
-Migration `045020` grants the four writers to `search_consumer_runtime` whatever
+Migration `045040` grants the four writers to `search_consumer_runtime` whatever
 the flag says, so turning the flag on needs no extra grants. The consumer's live
 sessions-function gate (`SESSIONS_FUNCTION_GATE_SQL`) accepts those writers only
 when it runs as `search_consumer_runtime` (`CONSUMER_RUNTIME_FUNCTIONS` in

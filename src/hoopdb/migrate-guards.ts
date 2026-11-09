@@ -383,7 +383,7 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
 ] as const;
 
 /**
- * Self-host output-facts writers (migration 045020) granted EXECUTE to the consumer login
+ * Self-host output-facts writers (migration 045040) granted EXECUTE to the consumer login
  * `search_consumer_runtime` only. The live sessions-function gate (db.ts
  * SESSIONS_FUNCTION_GATE_SQL) accepts them when, and only when, current_user is that role.
  * Deliberately NOT part of RUNTIME_APPLICATION_FUNCTIONS: that list feeds

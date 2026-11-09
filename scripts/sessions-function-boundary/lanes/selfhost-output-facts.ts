@@ -1,17 +1,17 @@
 /**
- * Lane: selfhost-output-facts (PR1 of the self-host digest/output plan; slot 045020).
- * supabase/migrations/20261105045020_selfhost_output_facts.sql owns nine functions:
+ * Lane: selfhost-output-facts (PR1 of the self-host digest/output plan; slot 045040).
+ * supabase/migrations/20261105045040_selfhost_output_facts.sql owns nine functions:
  *   output_facts_writer_scope / output_facts_stored_version   helpers; not SECURITY DEFINER; owner-only
  *   output_facts_state / _reconcile / _record_state / _erase  SECURITY DEFINER; EXECUTE to search_consumer_runtime
  *   output_facts_events_for / _outputs_for / _coverage_for    SECURITY DEFINER; EXECUTE to bulls96_read_api
  */
 import type { LaneManifest } from "../types.ts";
 
-const MIGRATION = "supabase/migrations/20261105045020_selfhost_output_facts.sql";
+const MIGRATION = "supabase/migrations/20261105045040_selfhost_output_facts.sql";
 
 export const selfhostOutputFacts: LaneManifest = {
   lane: "selfhost-output-facts",
-  owner: "self-host digest/output PR1 (feat/selfhost-output-facts-store-045020)",
+  owner: "self-host digest/output PR1, feat/selfhost-output-facts-store-045020 (slot 045040)",
   migration: MIGRATION,
   prefixes: ["sessions.output_facts_"],
   grantSources: [{ path: MIGRATION, roles: ["search_consumer_runtime", "bulls96_read_api"] }],

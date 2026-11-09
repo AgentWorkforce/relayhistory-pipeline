@@ -1,5 +1,5 @@
 /**
- * Migration 20261105045020 (self-host output facts in Postgres) on PGlite with every migration:
+ * Migration 20261105045040 (self-host output facts in Postgres) on PGlite with every migration:
  * the fail-closed role check, RLS on with no table grants, the writer functions as
  * search_consumer_runtime only (driven through postgresOutputFactsStore with the shared
  * builder's rows), the upsert, the stale-version rejection, the erase, the state rows, the
@@ -21,8 +21,8 @@ import { OUTPUT_FIXTURE_SCOPE, outputFixture } from "../../session-pipeline/__te
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 const sqlFile = (path: string) => read(path).split("\n").filter((l) => !l.startsWith("\\")).join("\n");
-const MIGRATION = "supabase/migrations/20261105045020_selfhost_output_facts.sql";
-const DOWN = "supabase/rollbacks/20261105045020_selfhost_output_facts.down.sql";
+const MIGRATION = "supabase/migrations/20261105045040_selfhost_output_facts.sql";
+const DOWN = "supabase/rollbacks/20261105045040_selfhost_output_facts.down.sql";
 const TABLES = ["session_event_facts", "session_output_facts", "output_facts_session_state", "output_facts_workspace_state"];
 const WRITERS = ["output_facts_state", "output_facts_reconcile", "output_facts_record_state", "output_facts_erase"];
 const READERS = ["output_facts_events_for", "output_facts_outputs_for", "output_facts_coverage_for"];
@@ -100,7 +100,7 @@ const count = async (db: PGlite, table: string, where = "true") =>
   Number((await db.query<{ n: number | string }>(`SELECT count(*) AS n FROM sessions.${table} WHERE ${where}`)).rows[0]!.n);
 const WINDOW = ["2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z"];
 
-describe("20261105045020 self-host output facts", () => {
+describe("20261105045040 self-host output facts", () => {
   test("fails closed (55000) when the consumer runtime role exists elevated", async () => {
     const db = await fresh();
     expect((await migrate(db, () => db.exec("ALTER ROLE search_consumer_runtime INHERIT")))?.code).toBe("55000");

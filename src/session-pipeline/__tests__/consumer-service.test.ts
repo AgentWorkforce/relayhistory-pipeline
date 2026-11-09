@@ -936,7 +936,7 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
       await pg.exec(stripPsqlMeta(readFileSync(VERIFY_SQL, "utf8")));
       expect(CONSUMER_RUNTIME_FUNCTIONS_ROLE).toBe(CONSUMER_RUNTIME_ROLE);
-      // The consumer really holds EXECUTE on all four writers (the 045020 grants), and the gate passes.
+      // The consumer really holds EXECUTE on all four writers (the 045040 grants), and the gate passes.
       for (const fn of CONSUMER_RUNTIME_FUNCTIONS) {
         const r = await pg.query<{ ok: boolean }>(`SELECT has_function_privilege('search_consumer_runtime', $1::regprocedure, 'EXECUTE') AS ok`, [fn]);
         expect(r.rows[0]?.ok, fn).toBe(true);

@@ -54,7 +54,7 @@
  *   RELAYHISTORY_SELFHOST_OUTPUT_FACTS        enabled only: exactly "true" (no trimming,
  *                                   case-sensitive) also writes output facts
  *                                   (sessions.session_event_facts /
- *                                   session_output_facts, migration 045020) through the
+ *                                   session_output_facts, migration 045040) through the
  *                                   Postgres facts store inside the same transaction as
  *                                   the directory events; unset or any other value is
  *                                   off (default off, never a startup error). Sessions

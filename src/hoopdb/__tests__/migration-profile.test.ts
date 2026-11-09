@@ -2434,13 +2434,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105045020 (self-host output facts) is the newest step: it refuses nothing below it, so it rolls back first
+    // 20261105045040 (self-host output facts) is the newest step: it refuses nothing below it, so it rolls back first
     // with assertions (its down drops its four tables and nine functions and its ledger row).
-    const OF = "upstream:20261105045020_selfhost_output_facts.sql";
+    const OF = "upstream:20261105045040_selfhost_output_facts.sql";
     expect(await names()).toContain(OF);
     expect((await failure(rollback("20261105045000_digest_narrative_cache.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_output_facts")).toBe("sessions.session_output_facts");
-    await rollback("20261105045020_selfhost_output_facts.down.sql");
+    await rollback("20261105045040_selfhost_output_facts.down.sql");
     expect(await names()).not.toContain(OF);
     for (const t of ["session_event_facts", "session_output_facts", "output_facts_session_state", "output_facts_workspace_state"])
       expect(await relation(`sessions.${t}`)).toBeNull();
@@ -3027,7 +3027,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so the grants' down refuses until they are rolled back,
-    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 045030, 045010, 045000, 044100, 044090, 044080, 044070, 044050, 044040, 044030),
+    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 045040, 045030, 045010, 045000, 044100, 044090, 044080, 044070, 044050, 044040, 044030),
     // then 044020 (claim-bootstrap indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
@@ -4439,14 +4439,26 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
     const ledgered = await sessionsFunctionAclPreview(client(db), "g6_rt", await pendingMigrationSql(client(db)));
     expect(ledgered.function_acl_missing_refused).toEqual([`${PT}: search_consumer_runtime:EXECUTE`]);
     expect((await failure(runMigrations(client(db), { profile })))?.code).toBe("function_acl_drift");
-    // The previous-release shape: 045030 not yet ledgered. Its GRANT re-adds the grant,
-    // so the preview reports it pending-added (the release plan stays green).
+    // The previous-release shape: 045030 not yet ledgered, so no later upstream step is either
+    // (the sequence guard refuses a gap): roll every later step (045040 output facts, ...) back
+    // first, newest first, through its own down. 045030's GRANT then re-adds the grant, so the
+    // preview reports it pending-added (the release plan stays green).
+    const later = (await db.query<{ name: string }>(
+      `SELECT name FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C" > $1 ORDER BY name COLLATE "C" DESC`,
+      [STEP],
+    )).rows.map((r) => r.name);
+    for (const name of later)
+      await db.exec(readFileSync(join(root, "supabase/rollbacks", `${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`), "utf8"));
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1", [STEP]);
     const pendingSql = await pendingMigrationSql(client(db));
-    expect(pendingSql.length).toBe(1);
+    expect(pendingSql.length).toBe(1 + later.length);
     const pending = await sessionsFunctionAclPreview(client(db), "g6_rt", pendingSql);
     expect(pending.function_acl_missing_refused).toEqual([]);
-    expect(pending.function_acl_missing).toEqual([`${PT}: search_consumer_runtime:EXECUTE`]);
+    // The rolled-back later steps' functions are pending-created ("<function>"), never refused;
+    // the only missing grant is 045030's.
+    const pendingCreated = pending.function_acl_missing.filter((e) => e.endsWith(": <function>"));
+    if (!later.length) expect(pendingCreated).toEqual([]);
+    expect(pending.function_acl_missing.filter((e) => !pendingCreated.includes(e))).toEqual([`${PT}: search_consumer_runtime:EXECUTE`]);
     expect(pending.function_acl_drift_extra).toEqual([]);
     // A flag-only caller (no pending SQL) does not credit grants: refused.
     expect((await sessionsFunctionAclPreview(client(db), "g6_rt", true)).function_acl_missing_refused)
@@ -4736,7 +4748,7 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
     VALUES('org-title','ws-title','codex','session-title','machine-title','user-title',now(),now(),'fs','bucket','manifest/title',
     decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18',1,'Pointer retained')`);
   const preserved=async()=>expect((await db.query<{title:string}>("SELECT title FROM sessions.session_index WHERE session_id='session-title'")).rows).toEqual([{title:"Pointer retained"}]);
-  // Newer lanes (045000 digest, 045010 same-second, 045030 consumer grant, 045020 output facts) also apply on a full upgrade;
+  // Newer lanes (045000 digest, 045010 same-second, 045030 consumer grant, 045040 output facts) also apply on a full upgrade;
   // expect exactly the pending steps, which is 1 where 044100 is newest.
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(full.length - previous.steps.length);
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);await preserved();
@@ -4749,7 +4761,7 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
   const ledgerBefore=await ledgerHash();
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(0);
   expect(await ledgerHash()).toBe(ledgerBefore);await preserved();
-  // Lanes newer than 044100 (045000 digest, 045010 same-second, 045030 consumer grant, 045020 output facts) roll back newest first:
+  // Lanes newer than 044100 (045000 digest, 045010 same-second, 045030 consumer grant, 045040 output facts) roll back newest first:
   // the 044100 down script refuses while a later migration is applied.
   for (const later of [...previous.later].reverse())
     await db.exec(readFileSync(join(root,"supabase/rollbacks",`${later.slice("upstream:".length).replace(/\.sql$/,"")}.down.sql`),"utf8"));

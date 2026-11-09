@@ -219,7 +219,7 @@ BEGIN
         ('sessions.session_directory_search_text(text,text,text,text,text,text,text,text)', 'EXECUTE'),
         -- 20261105045030: the project-text index helper.
         ('sessions.session_directory_project_text(text,text,text)', 'EXECUTE'),
-        -- 20261105045020: the self-host output facts writers (SECURITY DEFINER, each checks the caller).
+        -- 20261105045040: the self-host output facts writers (SECURITY DEFINER, each checks the caller).
         ('sessions.output_facts_state(text,text,text,text[],text)', 'EXECUTE'),
         ('sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)', 'EXECUTE'),
         ('sessions.output_facts_record_state(text,text,text,text[],text,boolean,timestamp with time zone,timestamp with time zone,bigint,timestamp with time zone)', 'EXECUTE'),
@@ -265,7 +265,7 @@ BEGIN
   -- publication guard and its lock are SECURITY DEFINER and the writer must
   -- call both (every pointer upsert runs through withPublicationAuthority),
   -- so they are allowlisted exactly, as are the four self-host output facts
-  -- writers (20261105045020; each checks its caller is this role); no other
+  -- writers (20261105045040; each checks its caller is this role); no other
   -- SECURITY DEFINER function may execute.
   FOR v_bad IN
     SELECT p.oid::regprocedure::text FROM pg_proc p
