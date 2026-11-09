@@ -3368,6 +3368,89 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(((await snapshot(db)).marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
   });
 
+  describe("20261105044040 exact-body adoption: an out-of-band apply of the step's own reader bodies", () => {
+    const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
+    const SF_SQL = readFileSync(join(root, "supabase/migrations/20261105044040_buffered_stages_session_first.sql"), "utf8");
+    /** The standalone CREATE OR REPLACE statement for one reader, exactly as the file has it (packet A's extraction). */
+    const statement = (fn: string, tag: string) => {
+      const start = SF_SQL.indexOf(`CREATE OR REPLACE FUNCTION sessions.${fn}(`);
+      const close = `$${tag}$;`;
+      const end = SF_SQL.indexOf(close, start);
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      return SF_SQL.slice(start, end + close.length);
+    };
+    const LIST = () => statement("buffered_sessions_for", "buffered_sessions");
+    const STAGES = () => statement("buffered_session_stages_for", "buffered_stages");
+    const SENTINEL = () => MIGRATION_SENTINELS[SF]!.sql;
+    /** The previous release (everything before 044040, no later upstream step), validated, on the supabase/ET shape. */
+    const previousRelease = async () => {
+      const db = await supabaseLike();
+      await db.exec(ET_BOOT);
+      const full = await plan(SUPA_ET);
+      const later = full.filter((s) => s.name.startsWith("upstream:") && s.name > SF).map((s) => s.name);
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps: full.filter((s) => s.name !== SF && !later.includes(s.name)) }))).toBeNull();
+      return db;
+    };
+    const ledgered = async (db: PGlite) =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name = $1", [SF])).rows[0]!.n === 1;
+    const sentinel = async (db: PGlite) => (await db.query<{ applied: boolean }>(SENTINEL())).rows[0]!.applied;
+
+    test("the declared tags parse to exactly the file's two bodies", () => {
+      for (const tag of ["buffered_sessions", "buffered_stages"]) {
+        const body = migrateGuards.dollarQuotedBody(SF_SQL, tag);
+        expect(body).not.toBeNull();
+        expect(body!.startsWith("\n")).toBe(true);
+        expect(body!.trimEnd().endsWith("END")).toBe(true);
+      }
+      expect(migrateGuards.dollarQuotedBody(SF_SQL, "no_such_tag")).toBeNull();
+      expect(migrateGuards.dollarQuotedBody(`${SF_SQL}\n-- $buffered_stages$`, "buffered_stages")).toBeNull();
+    });
+
+    test("both bodies pre-applied byte-identical: the migrator adopts them, applies the step and ledgers it", async () => {
+      const db = await previousRelease();
+      await db.exec(LIST());
+      await db.exec(STAGES());
+      expect(await sentinel(db)).toBe(true);
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET }))).toBeNull();
+      expect(await ledgered(db)).toBe(true);
+      expect(await sentinel(db)).toBe(true);
+    });
+
+    test("one body differs by a single byte: refused (unledgered_schema) before any write", async () => {
+      const db = await previousRelease();
+      await db.exec(LIST());
+      const stages = STAGES();
+      const tweaked = stages.replace("$buffered_stages$\n", "$buffered_stages$\n ");
+      expect(tweaked).not.toBe(stages);
+      await db.exec(tweaked);
+      expect(await sentinel(db)).toBe(true);
+      const error = await failure(runMigrations(client(db), { profile: SUPA_ET }));
+      expect(error?.code).toBe("unledgered_schema");
+      expect(error?.message).toContain(`(${SF})`);
+      expect(await ledgered(db)).toBe(false);
+    });
+
+    test("both bodies byte-identical but an attribute differs (volatility): refused", async () => {
+      const db = await previousRelease();
+      await db.exec(LIST());
+      await db.exec(STAGES());
+      await db.exec("ALTER FUNCTION sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text) VOLATILE");
+      const error = await failure(runMigrations(client(db), { profile: SUPA_ET }));
+      expect(error?.code).toBe("unledgered_schema");
+      expect(await ledgered(db)).toBe(false);
+    });
+
+    test("only stages pre-applied (packet A): the sentinel does not fire and the migrator applies normally", async () => {
+      const db = await previousRelease();
+      await db.exec(STAGES());
+      expect(await sentinel(db)).toBe(false);
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET }))).toBeNull();
+      expect(await ledgered(db)).toBe(true);
+      expect(await sentinel(db)).toBe(true);
+    });
+  });
+
   test("release read-only plan goes red on 20261105044020 when a claim-bootstrap index is absent on a populated table; the apply refuses before the pending marker", async () => {
     const db = await supabaseLike();
     await db.exec(ET_BOOT);

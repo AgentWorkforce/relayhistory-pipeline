@@ -12,6 +12,7 @@ import {
   ADOPTABLE_INDEX_STEPS,
   ADOPTABLE_INDEXES,
   type AdoptableIndex,
+  type ExactBody,
   MIGRATION_SENTINELS,
 } from "./migration-sentinels.ts";
 
@@ -1309,7 +1310,9 @@ async function tablePopulated(client: GuardClient, table: string): Promise<boole
  *   unledgered_schema     an object that an unledgered step creates already exists.
  * The one exception is ADOPTABLE_INDEXES: a declared index built out of band, exact,
  * valid and ready, is accepted for its step (the step adopts it). A step that also
- * replaces functions (ADOPTABLE_INDEX_STEPS) keeps its body sentinel.
+ * replaces functions (ADOPTABLE_INDEX_STEPS) keeps its body sentinel; that sentinel is only
+ * set aside when the step declares exactBodies and every one is live byte-identical to the
+ * step file's own body with the declared attributes (exactBodiesLive).
  * Nothing is ever imported into, or marked in, the ledger.
  */
 export async function sequencePreflight(
@@ -1412,7 +1415,8 @@ export async function sequencePreflight(
       applied = true; // can't look: fail closed, as if the step had run
     }
     // An index-only adoptable step's sentinel is its declared indexes: accepted only when every one
-    // is adoptable. A step that also replaces functions has a body sentinel, never overridden.
+    // is adoptable. A step that also replaces functions has a body sentinel, never overridden by
+    // index adoption; only its exactBodies (byte-identical to the file, declared attributes) set it aside.
     const declared = ADOPTABLE_INDEXES[names[i]!];
     const replacesFunctions = (ADOPTABLE_INDEX_STEPS[names[i]!]?.replaces.length ?? 0) > 0;
     if (applied && declared?.length && !replacesFunctions) {
@@ -1422,6 +1426,9 @@ export async function sequencePreflight(
         if (!(await adoptableIndex(client, names[i]!, inventory, d.name))) all = false;
       if (all) applied = false;
     }
+    const exact = ADOPTABLE_INDEX_STEPS[names[i]!]?.exactBodies;
+    if (applied && replacesFunctions && exact?.length && (await exactBodiesLive(client, sql[i]!, exact)))
+      applied = false;
     if (applied) found.push(`sentinel ${sentinel.evidence} (${names[i]})`);
   }
   if (found.length)
@@ -1429,6 +1436,49 @@ export async function sequencePreflight(
       "unledgered_schema",
       `objects of unrecorded migrations already exist: ${found.slice(0, 5).join("; ")}${found.length > 5 ? `; and ${found.length - 5} more` : ""}. Nothing is imported or marked, see the runbook decision point`,
     );
+}
+
+/**
+ * The text between a step file's `AS $tag$` and the closing `$tag$`, exactly as PostgreSQL stores it in
+ * prosrc; null unless the tag occurs exactly twice and the first is `AS $tag$`.
+ */
+export function dollarQuotedBody(sql: string, tag: string): string | null {
+  const quote = `$${tag}$`;
+  const parts = sql.split(quote);
+  if (parts.length !== 3 || !/\bAS\s+$/.test(parts[0]!)) return null;
+  return parts[1]!;
+}
+
+/**
+ * Exact-body adoption (ADOPTABLE_INDEX_STEPS[step].exactBodies): true only when every declared function
+ * is live with the step file's own body, byte for byte, and the declared attributes. Any error, missing
+ * function or unparsable body is false (the caller keeps refusing).
+ */
+export async function exactBodiesLive(
+  client: GuardClient,
+  stepSql: string,
+  bodies: readonly ExactBody[],
+): Promise<boolean> {
+  for (const b of bodies) {
+    const body = dollarQuotedBody(stepSql, b.tag);
+    if (body === null) return false;
+    try {
+      const ok = (
+        await client.query<{ ok: boolean }>(
+          `SELECT (p.prosrc = $2 AND p.prosecdef AND p.provolatile = 's'
+                   AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
+                   AND p.proconfig IS NOT DISTINCT FROM ARRAY[$3::text]
+                   AND p.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS ok
+             FROM pg_proc p WHERE p.oid = to_regprocedure($1)`,
+          [b.fn, body, b.config],
+        )
+      ).rows[0]?.ok;
+      if (ok !== true) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

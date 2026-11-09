@@ -96,6 +96,26 @@ export interface AdoptableIndexStep {
    * A step that replaces anything never has its sentinel overridden by index adoptability.
    */
   replaces: readonly string[];
+  /**
+   * Exact-body adoption, for replaced functions only. When the body sentinel fires, the step is still
+   * treated as not applied (so it runs normally and writes its ledger row) if, and only if, EVERY entry
+   * here is live with prosrc byte-identical to the step file's own `AS $tag$ ... $tag$` body (parsed from
+   * the file at guard time), plpgsql, SECURITY DEFINER, STABLE, proconfig exactly [config], and owned by
+   * the migrating role. Anything else keeps the unledgered_schema refusal. The step's CREATE OR REPLACE
+   * re-applies the file's bytes either way; the ACL (which CREATE OR REPLACE keeps) is left to the
+   * run-time exact-manifest check.
+   */
+  exactBodies?: readonly ExactBody[];
+}
+
+/** One replaced function whose out-of-band, byte-identical apply an adoptable step accepts. */
+export interface ExactBody {
+  /** to_regprocedure() input, schema-qualified. */
+  fn: string;
+  /** The dollar-quote tag of the body in the step file (`AS $tag$`). */
+  tag: string;
+  /** The single expected proconfig entry. */
+  config: string;
 }
 
 /** One entry per ADOPTABLE_INDEXES step (a test keeps the key sets equal). */
@@ -107,6 +127,20 @@ export const ADOPTABLE_INDEX_STEPS: Readonly<Record<string, AdoptableIndexStep>>
   [BUFFERED_STAGES_SESSION_FIRST_STEP]: {
     packet: "buffered-stages session-first operator packet docs/handoffs/buffered-stages-session-first-044040/operator-packet.md",
     replaces: ["sessions.buffered_sessions_for", "sessions.buffered_session_stages_for"],
+    // Packet A's out-of-band apply is stages only (the sentinel needs both, so it never fires); a
+    // byte-identical apply of both is adopted here instead of refused.
+    exactBodies: [
+      {
+        fn: "sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)",
+        tag: "buffered_sessions",
+        config: "search_path=pg_catalog, sessions, pg_temp",
+      },
+      {
+        fn: "sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)",
+        tag: "buffered_stages",
+        config: "search_path=pg_catalog, sessions, pg_temp",
+      },
+    ],
   },
 };
 
