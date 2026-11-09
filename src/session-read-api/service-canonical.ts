@@ -34,8 +34,8 @@
  *                             Unset: any manifest/pointer difference is refused, exactly as before.
  *   READ_API_CANONICAL_SCOPE_BYTES                    raw-byte budget of one canonical snapshot (sum over the
  *                             session's chunks of max(bytes, stored_raw_bytes)), a plain positive integer or an
- *                             integer with a MiB / GiB suffix; default 64 MiB for this self-host SERVICE (mirrors the search
- *                             indexer's maxScopeBytes), accepted 16 MiB..2 GiB; 16 MiB remains the hosted Worker/Lambda
+ *                             integer with a MiB / GiB suffix; default 32 MiB for this self-host SERVICE (raising it needs a
+ *                             matching pod memory limit), accepted 16 MiB..2 GiB; 16 MiB remains the hosted Worker/Lambda
  *                             budget, which this knob never touches. A session past
  *                             the budget is 501 `*_canonical_canonical_projection_incomplete` (reason `scope_too_large`). Read only here,
  *                             so never on the hosted Lambda; artifact and producer reads keep their own budgets.
@@ -90,11 +90,13 @@ const MiB = 1024 * 1024;
 export const SCOPE_BYTES_MIN = CANONICAL_SCOPE_BYTES, SCOPE_BYTES_MAX = 2 * 1024 * MiB;
 /** READ_API_CANONICAL_SCOPE_EVENTS bounds: the canonical.ts default up to 4,000,000 records. */
 /**
- * The self-host default byte budget when READ_API_CANONICAL_SCOPE_BYTES is unset or empty. Mirrors
- * SEARCH_INDEX_DEFAULT_LIMITS.maxScopeBytes (src/session-pipeline/search-index.ts), so a self-host install does
- * not 501 scope_too_large on sessions the indexer already handles. The Worker/Lambda default stays 16 MiB.
+ * The self-host default byte budget when READ_API_CANONICAL_SCOPE_BYTES is unset or empty. Sized for the chart's read
+ * API pod limits (512Mi dev/standalone, 1Gi umbrella): a raw scope is held several times over per request. Half the
+ * search indexer's 64 MiB SEARCH_INDEX_DEFAULT_LIMITS.maxScopeBytes, so a session the indexer handles between 32 and
+ * 64 MiB raw still needs READ_API_CANONICAL_SCOPE_BYTES raised together with the pod memory limit. The Worker/Lambda
+ * default stays 16 MiB (CANONICAL_SCOPE_BYTES).
  */
-export const SELFHOST_CANONICAL_SCOPE_BYTES = 64 * MiB;
+export const SELFHOST_CANONICAL_SCOPE_BYTES = 32 * MiB;
 export const SCOPE_EVENTS_MIN = CANONICAL_SCOPE_EVENTS, SCOPE_EVENTS_MAX = 4_000_000;
 
 /**
@@ -146,7 +148,7 @@ export async function serviceCanonicalDeps(
   const pointers = sqlCanonicalPointers(run);
   // Self-host only, default off: see READ_API_CANONICAL_PIN_LAGGING_POINTER in the header.
   const pinLaggingPointer = env.READ_API_CANONICAL_PIN_LAGGING_POINTER?.trim() === "true";
-  // Self-host only, bytes default 64 MiB, events default unchanged: see READ_API_CANONICAL_SCOPE_BYTES / _EVENTS in the header.
+  // Self-host only, bytes default 32 MiB, events default unchanged: see READ_API_CANONICAL_SCOPE_BYTES / _EVENTS in the header.
   const scope = canonicalScopeBudget(env);
   async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows & { generation: string; exists: boolean }> {
     // Every object read of this request is aborted at the route's deadline.

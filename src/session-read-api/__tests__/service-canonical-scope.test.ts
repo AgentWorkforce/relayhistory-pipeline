@@ -9,18 +9,19 @@ const bytes = (v: string | undefined) => canonicalScopeBudget(v === undefined ? 
 const events = (v: string | undefined) => canonicalScopeBudget(v === undefined ? {} : { READ_API_CANONICAL_SCOPE_EVENTS: v });
 
 describe("canonicalScopeBudget", () => {
-  test("unset or empty: bytes default to the self-host 64 MiB, events stay unset (canonicalSnapshot default 100000)", () => {
+  test("unset or empty: bytes default to the self-host 32 MiB, events stay unset (canonicalSnapshot default 100000)", () => {
     expect(CANONICAL_SCOPE_BYTES).toBe(16 * MiB);
     expect(CANONICAL_SCOPE_EVENTS).toBe(100000);
-    expect(SELFHOST_CANONICAL_SCOPE_BYTES).toBe(64 * MiB);
-    expect(canonicalScopeBudget({})).toEqual({ scopeBytes: 64 * MiB });
+    expect(SELFHOST_CANONICAL_SCOPE_BYTES).toBe(32 * 1024 * 1024);
+    expect(canonicalScopeBudget({})).toEqual({ scopeBytes: 32 * MiB });
     expect(canonicalScopeBudget({ READ_API_CANONICAL_SCOPE_BYTES: "", READ_API_CANONICAL_SCOPE_EVENTS: "" })).toEqual({ scopeBytes: SELFHOST_CANONICAL_SCOPE_BYTES });
     expect(Object.keys(canonicalScopeBudget({}))).toEqual(["scopeBytes"]);
     expect("scopeEvents" in canonicalScopeBudget({})).toBe(false);
   });
 
-  test("the self-host defaults match the search indexer's", () => {
-    expect(SELFHOST_CANONICAL_SCOPE_BYTES).toBe(SEARCH_INDEX_DEFAULT_LIMITS.maxScopeBytes);
+  test("the self-host byte default sits between the Worker budget and the search indexer's, events match", () => {
+    expect(SELFHOST_CANONICAL_SCOPE_BYTES).toBeGreaterThanOrEqual(CANONICAL_SCOPE_BYTES);
+    expect(SELFHOST_CANONICAL_SCOPE_BYTES).toBeLessThanOrEqual(SEARCH_INDEX_DEFAULT_LIMITS.maxScopeBytes);
     expect(CANONICAL_SCOPE_EVENTS).toBe(SEARCH_INDEX_DEFAULT_LIMITS.maxScopeEvents);
   });
 
@@ -38,7 +39,7 @@ describe("canonicalScopeBudget", () => {
   });
 
   test.each([["100000", 100000], ["250000", 250000], ["4000000", 4_000_000]])("events %p is accepted", (raw, want) => {
-    expect(events(raw)).toEqual({ scopeBytes: 64 * MiB, scopeEvents: want });
+    expect(events(raw)).toEqual({ scopeBytes: 32 * MiB, scopeEvents: want });
   });
 
   test("both set together", () => {
