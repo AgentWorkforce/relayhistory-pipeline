@@ -247,6 +247,9 @@ describe("entry and configuration", () => {
       const d = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: flag } as Env, run);
       await d!.reads.list(scope, head, { limit: 1 });
       expect(seen[0], String(flag)).toBe(`SET LOCAL statement_timeout = ${want}`);
+      seen.length = 0;
+      await d!.reads.stages(scope, head, "claude", "s-x");
+      expect(seen[0], `stages ${String(flag)}`).toBe(`SET LOCAL statement_timeout = ${want}`);
     }
 
     const t = tenant();

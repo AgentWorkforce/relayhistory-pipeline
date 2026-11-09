@@ -802,9 +802,10 @@ export const BUFFERED_LIST_MAX_LIMIT = 100;
 export const BUFFERED_STATEMENT_TIMEOUT_MS = 2000;
 export const OWNER_BUFFERED_STATEMENT_TIMEOUT_FLAG = "READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS";
 /**
- * The largest READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS accepted. A detail read runs the stages
- * RPC twice (initial and recheck) plus two control-head calls and the S3 fetch, all inside the
- * caller's 15 s budget, so one RPC may take at most 6 s.
+ * The largest READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS accepted: a ceiling, not a budget
+ * guarantee. A detail read runs the stages RPC at least twice (initial and recheck; a stage 404
+ * adds a refresh) plus two control-head calls and the S3 fetch, inside the caller's 15 s budget,
+ * so the value deployed must come from the measured whole-path latency with margin.
  */
 export const OWNER_BUFFERED_STATEMENT_TIMEOUT_MAX_MS = 6000;
 
