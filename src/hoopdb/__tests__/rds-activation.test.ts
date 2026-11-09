@@ -91,6 +91,7 @@ describe("role spec: generated from the repository's role SQL", () => {
     const by = Object.fromEntries(SPEC.map((r) => [r.name, r]));
     expect(by.session_directory_search_worker).toEqual({ name: "session_directory_search_worker", login: false, settings: ["statement_timeout=2s"] });
     expect(by.bulls96_read_api).toEqual({ name: "bulls96_read_api", login: true, settings: ["default_transaction_read_only=on", "statement_timeout=2s"] });
+    expect(by.bulls96_analysis_admit).toEqual({ name: "bulls96_analysis_admit", login: true, settings: ["default_transaction_read_only=off", "statement_timeout=2s"] });
     expect(by.search_consumer_runtime).toEqual({ name: "search_consumer_runtime", login: true, settings: ["statement_timeout=60s"] });
     expect(by.bulls96_session_ingest!.settings).toEqual(["idle_in_transaction_session_timeout=10s", "lock_timeout=2s", "statement_timeout=5s"]);
     for (const r of ["anon", "authenticated", "service_role", "session_token_verifier", "bulls96_session_ingest_seeder", "bulls96_canonical_feature_producer"])
@@ -348,9 +349,10 @@ describe("migrator: HOOPDB_RDS_LAYOUT=separate-database", () => {
 });
 
 describe("role counts (v1)", () => {
-  test("17 roles, 9 LOGIN: babysitter retention deferred, not 10", () => {
-    expect(SPEC.length).toBe(17);
-    expect(LOGINS.length).toBe(9);
+  test("18 roles, 10 LOGIN: analysis admit worker login; babysitter retention still deferred", () => {
+    expect(SPEC.length).toBe(18);
+    expect(LOGINS.length).toBe(10);
+    expect(LOGINS).toContain("bulls96_analysis_admit");
     expect(LOGINS).not.toContain("bulls96_babysitter_retention");
   });
 });
