@@ -122,6 +122,11 @@ test("readiness and the migrator agree on every rename-alias ledger state (one s
         sql: [["DELETE FROM sessions.__96bulls_migrations WHERE name=$1", [a.ledger_name]], insertRelease(a.ledger_sha)],
         code: "migration_changed",
       },
+      {
+        name: `${a.migration} new-name-with-unknown-sha`,
+        sql: [["DELETE FROM sessions.__96bulls_migrations WHERE name=$1", [a.ledger_name]], insertRelease("0".repeat(64))],
+        code: "migration_changed",
+      },
     );
   }
   cases.push({ name: "repair-missing", sql: [], code: "ledger_alias_repair_missing", steps: repairSteps, readiness: repairExpected });
