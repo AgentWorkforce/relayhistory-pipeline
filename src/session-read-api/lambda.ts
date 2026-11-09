@@ -51,7 +51,7 @@ import {
 } from "./auth.ts";
 import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
-import { parseCompleteSince } from "./config.ts";
+import { agentMatchDeps, parseCompleteSince } from "./config.ts";
 import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
 import { serviceCanonicalDeps } from "./service-canonical.ts";
 import {
@@ -524,6 +524,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     completeSinceMs,
     ...(canonical ? { timing: canonical.timing, turns: canonical.turns } : {}),
     ...eventMessageIdDeps(env, canonical?.turns),
+    ...agentMatchDeps(env),
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),
     ...(corsAllowedOrigins?.size ? { corsAllowedOrigins } : {}),
     ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),

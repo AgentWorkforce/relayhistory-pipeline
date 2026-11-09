@@ -120,7 +120,8 @@ paths:
         - {name: source, in: query, description: Harness to include; repeat for several., schema: {type: string}}
         - {name: notSource, in: query, description: Harness to exclude; repeat for several., schema: {type: string}}
         - {name: user, in: query, description: User id; repeat for several (at most 20)., schema: {type: string}}
-        - {name: agent, in: query, schema: {type: string, maxLength: 200}}
+        - {name: agent, in: query, description: "Agent name, matched case-insensitively against every agent of the session. Single-valued; repeating it is 400. Buffered sessions are excluded whenever it is set. With READ_API_AGENT_MATCH=true a trailing * is stripped and means agentMatch=prefix; with the flag off a trailing * is 501 unsupported_by_backend reason param_agentMatch.", schema: {type: string, maxLength: 200}}
+        - {name: agentMatch, in: query, description: "exact (default) or prefix; needs agent. Self-host with READ_API_AGENT_MATCH=true only; otherwise 501 unsupported_by_backend reason param_agentMatch. Any other value is 400. A prefix needs at least 3 meaningful characters (else 400); a prefix matching more than 5000 agent rows is 400 agent_prefix_too_broad; before migration 20261105050020 is applied a prefix is 501 agent_match_not_migrated.", schema: {type: string, enum: [exact, prefix]}}
         - {name: projectContains, in: query, schema: {type: string, maxLength: 200}}
         - {name: lastTsAfter, in: query, schema: {type: string, format: date-time}}
         - {name: lastTsBefore, in: query, schema: {type: string, format: date-time}}
@@ -128,7 +129,11 @@ paths:
         - {name: firstTsBefore, in: query, schema: {type: string, format: date-time}}
       responses:
         "200":
-          description: One page of sessions.
+          description: "One page of sessions. A client that asked for prefix must treat a missing X-Sessions-Read-Agent-Match header as an older backend (which matches agent literally) and discard the page."
+          headers:
+            X-Sessions-Read-Agent-Match:
+              description: exact or prefix. Present only when READ_API_AGENT_MATCH=true and an agent filter applied.
+              schema: {type: string, enum: [exact, prefix]}
           content:
             application/json:
               schema:

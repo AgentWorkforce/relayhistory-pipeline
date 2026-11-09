@@ -63,6 +63,7 @@ import { timingFromCanonical, type CanonicalRows } from "./session-timing-source
 import { TimingInputError } from "./timing.ts";
 import { EvidenceRequestError, readBabysitterEvidence, type EvidenceDeps } from "./babysitter-evidence.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
+import { MIN_AGENT_PREFIX_CHARS } from "../hoopdb/search-index-contract.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
   DirectoryError,
@@ -190,6 +191,13 @@ export interface ReadApiDeps {
    * session's canonical objects. Absent: the parameter keeps its 501, so the Lambda and Worker are unchanged.
    */
   eventMessageIds?: Pick<TurnsDeps, "source" | "deadlineMs">;
+  /**
+   * READ_API_AGENT_MATCH=true: GET /v1/sessions takes `agentMatch=exact|prefix` and a trailing `*`
+   * on `agent` (prefix, 20261105050020), and answers `X-Sessions-Read-Agent-Match` whenever an agent
+   * filter applied. Absent/false: the list is unchanged, and `agentMatch` or a trailing `*` answers
+   * 501 `param_agentMatch`.
+   */
+  agentMatch?: boolean;
   /** READ_API_CORS_ALLOWED_ORIGINS, service entry only: exact origins GET read routes answer CORS for. Absent/empty = no CORS. */
   corsAllowedOrigins?: ReadonlySet<string>;
 }
@@ -446,7 +454,7 @@ export function createReadApi(deps: ReadApiDeps) {
       c.header("Vary", "Origin");
       if (allowed) {
         c.header("Access-Control-Allow-Origin", origin);
-        c.header("Access-Control-Expose-Headers", "X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation");
+        c.header("Access-Control-Expose-Headers", "X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation, X-Sessions-Read-Agent-Match");
       }
       if (c.req.method === "OPTIONS") {
         if (allowed) {
@@ -785,6 +793,9 @@ export function createReadApi(deps: ReadApiDeps) {
   const directoryFail = (c: Context, error: unknown) => {
     if (error instanceof DirectoryError) {
       if (error.reason === "agent_filter_not_ready") return fail(c, unsupported("agent_filter_not_ready"));
+      if (error.reason === "agent_prefix_too_broad")
+        return fail(c, new HttpError(400, "agent_prefix_too_broad", "this agent prefix matches more than 5000 agent rows; use a longer prefix or an exact agent"));
+      if (error.reason === "agent_prefix_too_short") return fail(c, bad(`an agent prefix needs at least ${MIN_AGENT_PREFIX_CHARS} characters`));
       if (error.reason === "tenant_mismatch") return fail(c, new TenantMismatchError());
       // A row outside the cloud-client contract (e.g. a title over 90 characters): a first
       // page falls back whole, as relayhistory's directory backend does; a cursor page
@@ -891,7 +902,25 @@ export function createReadApi(deps: ReadApiDeps) {
       const users = repeated(c, "user");
       if (users.length > MAX_LIST_USERS) throw bad(`user accepts at most ${MAX_LIST_USERS} values`);
       if (users.some((u) => u.length > MAX_LIST_ID_LENGTH)) throw bad(`user must be ${MAX_LIST_ID_LENGTH} characters or fewer`);
-      const agent = single(c, "agent")?.trim();
+      let agent = single(c, "agent")?.trim();
+      // READ_API_AGENT_MATCH: `agentMatch=exact|prefix`, or one trailing `*` on agent for prefix.
+      const rawMatch = c.req.queries("agentMatch");
+      const star = agent?.endsWith("*") ?? false;
+      let agentMatch: "exact" | "prefix" | undefined;
+      if (!deps.agentMatch) {
+        if (rawMatch?.length || star) throw unsupported("param_agentMatch");
+      } else {
+        const m = single(c, "agentMatch");
+        if (m !== undefined && m !== "exact" && m !== "prefix") throw bad("agentMatch must be exact or prefix");
+        if (star) {
+          if (m === "exact") throw bad("agentMatch=exact contradicts a trailing * on agent");
+          agent = agent!.slice(0, -1).trim();
+        }
+        agentMatch = star ? "prefix" : (m as "exact" | "prefix" | undefined);
+        if (agentMatch && !agent) throw bad("agentMatch needs an agent");
+        if (agentMatch === "prefix" && agent!.replace(/\s+/gu, "").length < MIN_AGENT_PREFIX_CHARS)
+          throw bad(`an agent prefix needs at least ${MIN_AGENT_PREFIX_CHARS} characters`);
+      }
       if (agent && agent.length > MAX_AGENT_LENGTH) throw bad(`agent must be ${MAX_AGENT_LENGTH} characters or fewer`);
       const projectContains = single(c, "projectContains") || undefined;
       if (projectContains && projectContains.trim().length > 200) throw bad("projectContains must be 200 characters or fewer");
@@ -921,11 +950,14 @@ export function createReadApi(deps: ReadApiDeps) {
       if (notSources.length) args.notSources = notSources;
       if (users.length) args.userIds = users;
       if (agent) args.agent = agent;
+      if (agent && agentMatch === "prefix") args.agentMatch = "prefix";
       if (projectContains) args.projectContains = projectContains;
       for (const [k, v] of Object.entries(bounds)) if (v) args[k as keyof typeof bounds] = v;
       if (cursor) args.cursor = cursor;
       const rows = await directory.list(identity.orgId, identity.workspaceId, args);
-      if (rows === null) throw unsupported("directory_not_migrated");
+      if (rows === null) throw unsupported(args.agentMatch === "prefix" ? "agent_match_not_migrated" : "directory_not_migrated");
+      // Capability echo: only a backend with the flag on names the match it applied.
+      if (deps.agentMatch && agent) c.header("X-Sessions-Read-Agent-Match", args.agentMatch ?? "exact");
       if (withBuffered) {
         const union = await bufferedListPage(c, identity, ob, rows, { limit, sources, notSources, bounds });
         return c.json({ sessions: union.sessions, nextCursor: union.nextCursor, correlationId: c.get("correlationId") });

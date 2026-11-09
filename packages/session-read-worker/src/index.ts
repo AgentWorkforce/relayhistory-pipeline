@@ -67,7 +67,7 @@ import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
-import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
+import { agentMatchDeps, agentMatchEnabled, parseCompleteSince } from "../../../src/session-read-api/config.ts";
 import {
   createBufferedSearchGate,
   parseBufferedSearchGate,
@@ -109,6 +109,12 @@ export interface Env extends CanonicalEnv {
    * `BEGIN READ ONLY` at READ COMMITTED (see requestTenantRunner).
    */
   READ_API_REPEATABLE_READ?: string;
+  /**
+   * Agent-name prefix matching on GET /v1/sessions (`agentMatch`, trailing `*`; migration 20261105050020):
+   * exactly "true" enables; unset, "" or "false" = off (default); any other value refuses every request
+   * (503, logged missing_READ_API_AGENT_MATCH).
+   */
+  READ_API_AGENT_MATCH?: string;
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;
   /** Exactly "true" also accepts relaycontrol `sh_at_` tokens; default off. */
@@ -308,6 +314,11 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     } catch {
       throw new ConfigError("READ_API_OWNER_BUFFERED_EVENTS");
     }
+    try {
+      agentMatchEnabled(env.READ_API_AGENT_MATCH);
+    } catch {
+      throw new ConfigError("READ_API_AGENT_MATCH");
+    }
   } catch (error) {
     // Configuration errors name a field, never a value.
     log("error", "read worker not configured", { error_code: error instanceof ConfigError ? `missing_${error.field}` : (error as { name?: string })?.name ?? "config" });
@@ -326,6 +337,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     liveness: sqlLiveness(tenant.run),
     directory: sqlDirectory(tenant.run),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
+    ...agentMatchDeps(env),
     briefTitles: sqlBriefTitles(tenant.run),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,

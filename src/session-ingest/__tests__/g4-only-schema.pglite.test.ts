@@ -104,10 +104,14 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // A new table and read API functions only; no ingest path touches them.
       "20261105044000_read_api_tokens.sql",
       "20261105044010_selfhost_erase_lock_fences.sql",
+      // A read API function overload and an index on session_directory_agents; no ingest path touches them.
+      "20261105050020_session_directory_agent_match.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
-    expect(OBJECTS.replacedFunctions).toEqual(["ingest_babysitter_retention_register", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish"]);
+    expect(OBJECTS.replacedFunctions).toEqual(["ingest_babysitter_retention_register", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish",
+      // 050020 adds an overload; the G4 form is 034000's 16-argument read API function.
+      "list_session_directory_for"]);
   });
 
   test("no new table, function or column exists; the replaced RPCs exist in their prior form; no G4 body names a post-G4 object", async () => {

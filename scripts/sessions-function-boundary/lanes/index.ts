@@ -18,6 +18,7 @@ import { canonicalProjectEvents } from "./canonical-project-events.ts";
 import { desktopCatalog } from "./desktop-catalog.ts";
 import { ingestHistory } from "./ingest-history.ts";
 import { readApi } from "./read-api.ts";
+import { readApiAgentMatch } from "./read-api-agent-match.ts";
 import { readApiTokens } from "./read-api-tokens.ts";
 import { semanticCopy } from "./semantic-copy.ts";
 import { ingestBookkeepingCleanup } from "./ingest-bookkeeping-cleanup.ts";
@@ -26,4 +27,4 @@ import { selfhostSessionSelectionErase } from "./selfhost-session-selection-eras
 import { selfhostEraseLockFences } from "./selfhost-erase-lock-fences.ts";
 
 /** Every lane the unified generator composes. Order does not affect the output. */
-export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences];
+export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, readApiAgentMatch];

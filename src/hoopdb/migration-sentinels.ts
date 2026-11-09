@@ -212,6 +212,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "twelve search_consumer_runtime EXECUTEs (composed writer path)",
     sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'",
   },
+  "upstream:20261105050020_session_directory_agent_match.sql": {
+    evidence: "CREATE FUNCTION: sessions.list_session_directory_for(..., integer, text) (agent_match overload)",
+    sql: "SELECT to_regprocedure('sessions.list_session_directory_for(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer, text)') IS NOT NULL AS applied",
+  },
   "upstream:20261105044000_read_api_tokens.sql": {
     evidence: "table sessions.read_api_tokens",
     sql: relation("sessions.read_api_tokens"),

@@ -67,6 +67,11 @@ export interface DirectoryListArgs {
   projectContains?: string;
   userIds?: string[];
   agent?: string;
+  /**
+   * READ_API_AGENT_MATCH only. "prefix" calls 20261105050020's overload (agent_name_normalized
+   * LIKE agent || '%'). Absent or "exact" calls 034000's function, exactly as before.
+   */
+  agentMatch?: "exact" | "prefix";
   lastTsAfter?: Date;
   lastTsBefore?: Date;
   firstTsAfter?: Date;
@@ -83,7 +88,10 @@ export interface DirectoryCursor {
   harness: string;
 }
 
-/** Null: the functions are not installed (the migration has not been applied). */
+/**
+ * Null: the functions are not installed (the migration has not been applied). For an
+ * agentMatch "prefix" list: 20261105050020's overload is not installed.
+ */
 export interface Directory {
   list(orgId: string, workspaceId: string, args: DirectoryListArgs): Promise<DirectoryListRow[] | null>;
   activity(orgId: string, workspaceId: string, since: Date, until: Date): Promise<DirectoryActivityRow[] | null>;
@@ -91,7 +99,7 @@ export interface Directory {
 
 /** Postgres refused for a reason the caller can name (0A000, 22023), never quoting values. */
 export class DirectoryError extends Error {
-  constructor(readonly reason: "agent_filter_not_ready" | "invalid_argument" | "tenant_mismatch" | "parse" | "refused") {
+  constructor(readonly reason: "agent_filter_not_ready" | "agent_prefix_too_broad" | "agent_prefix_too_short" | "invalid_argument" | "tenant_mismatch" | "parse" | "refused") {
     super(`session directory: ${reason}`);
     this.name = "DirectoryError";
   }
@@ -99,6 +107,9 @@ export class DirectoryError extends Error {
 
 export const LIST_FOR_SIGNATURE =
   "sessions.list_session_directory_for(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer)";
+/** 20261105050020's overload: the same arguments plus p_agent_match ('exact' | 'prefix'). */
+export const LIST_FOR_MATCH_SIGNATURE =
+  "sessions.list_session_directory_for(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer, text)";
 export const ACTIVITY_FOR_SIGNATURE = "sessions.session_directory_activity_for(text, timestamptz, timestamptz)";
 
 /** The directory list page bound (the function's p_limit 1..200). */
@@ -119,6 +130,17 @@ export const DIRECTORY_LIST_SQL = `SELECT org_id, workspace_id, harness, session
     p_cursor_last_activity_at => $11, p_cursor_session_id => $12, p_cursor_harness => $13,
     p_limit => $14)`;
 
+/**
+ * The prefix list: DIRECTORY_LIST_SQL plus p_agent_match, which resolves to the 17-argument
+ * overload only. That overload has no argument defaults, so the two this API never sets are
+ * named as NULL.
+ */
+export const DIRECTORY_LIST_MATCH_SQL = DIRECTORY_LIST_SQL.replace(
+  "p_limit => $14)",
+  "p_session_harnesses => NULL, p_session_ids => NULL, p_limit => $14, p_agent_match => $15)",
+);
+if (DIRECTORY_LIST_MATCH_SQL === DIRECTORY_LIST_SQL) throw new Error("DIRECTORY_LIST_MATCH_SQL: p_limit anchor not found");
+
 export const DIRECTORY_ACTIVITY_SQL = `SELECT to_char(day, 'YYYY-MM-DD') AS day, harness, sessions
   FROM sessions.session_directory_activity_for($1, $2, $3)`;
 
@@ -128,6 +150,8 @@ function mapPgError(error: unknown): never {
   const code = (error as { code?: string })?.code;
   const message = (error as { message?: string })?.message ?? "";
   if (code === "0A000" && message.includes("agent_filter_not_ready")) throw new DirectoryError("agent_filter_not_ready");
+  if (code === "54000" && message.includes("agent_prefix_too_broad")) throw new DirectoryError("agent_prefix_too_broad");
+  if (code === "22023" && message.includes("agent prefix needs")) throw new DirectoryError("agent_prefix_too_short");
   if (code === "22023") throw new DirectoryError("invalid_argument");
   if (code === "42501") throw new DirectoryError("refused");
   throw error;
@@ -138,11 +162,12 @@ export function sqlDirectory(run: TenantRunner): Directory {
   return {
     async list(orgId, workspaceId, a) {
       return run(orgId, workspaceId, async (q) => {
-        const installed = await q.query<{ installed: boolean }>(DIRECTORY_INSTALLED_SQL, [LIST_FOR_SIGNATURE]);
+        const prefix = a.agentMatch === "prefix";
+        const installed = await q.query<{ installed: boolean }>(DIRECTORY_INSTALLED_SQL, [prefix ? LIST_FOR_MATCH_SIGNATURE : LIST_FOR_SIGNATURE]);
         if (!installed.rows[0]?.installed) return null;
         const iso = (d: Date | undefined) => (d ? d.toISOString() : null);
         const r = await q
-          .query<DirectoryListRow>(DIRECTORY_LIST_SQL, [
+          .query<DirectoryListRow>(prefix ? DIRECTORY_LIST_MATCH_SQL : DIRECTORY_LIST_SQL, [
             workspaceId,
             a.sources?.length ? a.sources : null,
             a.notSources?.length ? a.notSources : null,
@@ -157,6 +182,7 @@ export function sqlDirectory(run: TenantRunner): Directory {
             a.cursor?.sessionId ?? null,
             a.cursor?.harness ?? null,
             a.limit,
+            ...(prefix ? ["prefix"] : []),
           ])
           .catch(mapPgError);
         return r.rows;
