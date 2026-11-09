@@ -15,6 +15,22 @@
  * `user_id`). The parity test writes the same group through `writeGroups` and compares with
  * `indexSearchScope`'s rows.
  *
+ * Settle holdback (INGEST_BUFFERED_SEARCH_FEED_SETTLE_S, seconds, 180-3600, default 300). The
+ * page RPC lists acknowledged stages in (created_at, stage_token) order behind a server-held,
+ * forward-only cursor, and created_at is the intent's insert time, not its ack time. A stage
+ * still in flight when the cursor passed its position would be acknowledged behind the cursor
+ * and never listed (a late-ack skip). So each page only processes stages created at least the
+ * holdback before the run's clock; at the first younger one the page stops and the cursor waits
+ * before it. A fresh upload's ack is refused once its intent expires (created_at + 120 s), so
+ * nothing can be acknowledged behind a position older than that; the remainder of the default
+ * margin covers the commit tail and Lambda-vs-database clock skew. Nothing is re-scanned or
+ * re-emitted: the cursor never rewinds and every stage is still processed once. The tail lags
+ * by the holdback; the per-object keep-up path is unaffected. Residual: a GC replacement child
+ * keeps its own created_at and can be adopted and acknowledged by a later GC claim; its rows are
+ * its active parent's retained rows (same fingerprint and version), which the parent already
+ * wrote, so a skip there loses no content. A re-scan horizon is not used: the cursor cannot be
+ * rewound through the 043870 RPCs, and the page exposes no ack time.
+ *
  * Provenance marker. Every row written here has `origin = 'buffered'` and
  * `origin_claim_token` = the stage's ORIGINAL claim token (a GC replacement keeps it), the two
  * columns the read-side gate (#338, buffered-search-gate.ts) reads; every other writer leaves
@@ -135,6 +151,8 @@ export interface BufferedFeedConfig {
   cursor: string;
   /** Wall budget of one invocation; stays under the one-minute schedule so runs do not overlap. */
   budgetMs: number;
+  /** Only stages created at least this long before the run's clock are processed (late-ack guard). 180-3600 s, default 300. */
+  settleMs: number;
 }
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
@@ -178,6 +196,7 @@ export function bufferedFeedConfig(env: NodeJS.ProcessEnv): BufferedFeedConfig {
     since,
     cursor,
     budgetMs: int("INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS", 50_000, 5_000, 240_000),
+    settleMs: int("INGEST_BUFFERED_SEARCH_FEED_SETTLE_S", 300, 180, 3_600) * 1_000,
   };
 }
 
@@ -507,7 +526,7 @@ export interface BackfillSummary {
   skipped: number;
   rows: number;
   deleted: number;
-  /** The cursor reached the newest accepted stage. */
+  /** The cursor reached the newest accepted stage past the settle holdback. */
   caughtUp: boolean;
   /** A stage could not be decided yet (GC in flight, privacy fenced): the cursor waits before it. */
   blocked?: string;
@@ -519,7 +538,7 @@ export interface BackfillSummary {
  * past stages that were indexed (and re-checked) or are terminally not indexable, and only after
  * the ClickHouse writes, so a crash replays at most one page (idempotent).
  */
-export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<BufferedFeedConfig, "pageSize" | "stagesPerSecond" | "since" | "cursor" | "budgetMs">): Promise<BackfillSummary> {
+export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<BufferedFeedConfig, "pageSize" | "stagesPerSecond" | "since" | "cursor" | "budgetMs"> & { settleMs?: number }): Promise<BackfillSummary> {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + config.budgetMs;
@@ -528,7 +547,10 @@ export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<Buffe
   const count = (reason: string) => (summary.reasons[reason] = (summary.reasons[reason] ?? 0) + 1);
   const fromMs = Date.parse(await windowStart(deps.ch, new Date(now())));
   let next = now();
+  let settling = false;
   while (now() < deadline) {
+    // Taken before the page is read: every stage listed at or before it is past its ack window.
+    const horizon = now() - (config.settleMs ?? 300_000);
     const page = await deps.source.page(config.cursor, config.since, config.pageSize);
     summary.pages += 1;
     let loaded: Loaded[] = [];
@@ -545,6 +567,8 @@ export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<Buffe
     let indexed = 0, skipped = 0;
     for (const candidate of page.stages) {
       if (now() >= deadline) break;
+      // Too young to be settled (or unparseable): stop here; the cursor waits before it.
+      if (!(Date.parse(candidate.createdAt) <= horizon)) { settling = true; break; }
       const wait = next - now();
       if (wait > 0) await sleep(wait);
       next = Math.max(next, now()) + interval;
@@ -570,6 +594,8 @@ export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<Buffe
     summary.indexed += indexed;
     summary.skipped += skipped;
     if (summary.blocked) break;
+    // Caught up to the settle horizon; the younger stages are listed again on a later run.
+    if (settling) { summary.caughtUp = true; break; }
     if (page.stages.length < config.pageSize && (page.stages.length === 0 || last === page.stages.at(-1))) { summary.caughtUp = true; break; }
   }
   return summary;

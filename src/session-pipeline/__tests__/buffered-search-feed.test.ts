@@ -572,4 +572,86 @@ describe("buffered-stage search feed", () => {
     await expect(sqlBufferedFeedSource(failing("40001")).stage({ stageToken: randomUUID() })).rejects.toMatchObject({ code: "sql_40001", retryable: true });
     await expect(sqlBufferedFeedSource(failing("42501")).stage({ stageToken: randomUUID() })).rejects.toMatchObject({ code: "sql_42501", retryable: false });
   });
+
+  /** Stages at fixed offsets (ms) before NOW; `listed` decides which the page RPC returns (acknowledged). */
+  async function settleStages(store: ObjectStore, ages: number[]) {
+    const out = [];
+    for (let n = 0; n < ages.length; n++) {
+      const { prepared } = await stageBatch(store, batchRecords(`-settle-${n}`));
+      const candidate: StageCandidate = { stageToken: `00000000-0000-4000-8000-00000000002${n}`, createdAt: new Date(NOW - ages[n]!).toISOString().replace("Z", "000Z"), tenant: { orgId: ORG, workspaceId: WS, userId: USER }, originId: ORIGIN, batchId: `s${n}` };
+      out.push({ candidate, state: () => liveState(prepared, candidate.stageToken, candidate.createdAt) });
+    }
+    return out;
+  }
+  const clockDeps = (source: BufferedFeedSource, store: ObjectStore, ch: ClickHouseClient, clock: { t: number }): BufferedFeedDeps => ({ ...feedDeps(source, store, ch), now: () => clock.t });
+  const settleCfg = { pageSize: 10, stagesPerSecond: 50, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "settle-test", budgetMs: 60_000 };
+
+  test("late ack: a stage acknowledged after a younger stage was listed is still indexed on the next run", async () => {
+    const store = newStore();
+    // 0: settled; 1: created 4 min ago, acknowledged only after the first run; 2: created 2 min ago, acknowledged.
+    const [old, late, young] = await settleStages(store, [600_000, 240_000, 120_000]);
+    const run = async (settleMs?: number) => {
+      const ch = fakeClickHouse(), clock = { t: NOW };
+      const listed = [old!, young!];
+      const mem = memorySource(listed);
+      const first = await runBufferedFeed(clockDeps(mem.source, store, ch.ch, clock), settleMs === undefined ? settleCfg : { ...settleCfg, settleMs });
+      const afterFirst = mem.cursor.after?.stageToken;
+      listed.push(late!);
+      clock.t = NOW + 600_000;
+      const second = await runBufferedFeed(clockDeps(mem.source, store, ch.ch, clock), settleMs === undefined ? settleCfg : { ...settleCfg, settleMs });
+      const stagesWritten = new Set(ch.rows.map((r) => (r as { origin_claim_token?: string }).origin_claim_token));
+      return { first, second, mem, afterFirst, stagesWritten };
+    };
+    const claimOf = (s: typeof old) => claims.get(s!.state().stage!.key)!;
+    // Default holdback (300 s): the first run stops before the young stage without checking it.
+    const held = await run();
+    expect(held.first).toMatchObject({ indexed: 1, stages: 1, caughtUp: true });
+    expect(held.afterFirst).toBe(old!.candidate.stageToken);
+    expect(held.second).toMatchObject({ indexed: 2, stages: 2, caughtUp: true });
+    expect(held.mem.cursor).toMatchObject({ after: { stageToken: young!.candidate.stageToken }, indexed: 3, skipped: 0 });
+    expect(held.stagesWritten).toEqual(new Set([claimOf(old), claimOf(late), claimOf(young)]));
+    // Control, the defect: without a holdback the cursor passes the young stage first and the late one is never listed.
+    const unguarded = await run(0);
+    expect(unguarded.first).toMatchObject({ indexed: 2 });
+    expect(unguarded.afterFirst).toBe(young!.candidate.stageToken);
+    expect(unguarded.second).toMatchObject({ indexed: 0, caughtUp: true });
+    expect(unguarded.stagesWritten.has(claimOf(late))).toBe(false);
+  });
+
+  test("settle holdback: stopping and resuming neither duplicates nor alters rows", async () => {
+    const store = newStore();
+    const stages = await settleStages(store, [900_000, 700_000, 200_000, 100_000]);
+    const canonicalOrder = (rows: IndexRow[]) => rows.map((r) => JSON.stringify(r)).sort();
+    // Reference: one run long after every stage settled.
+    const once = fakeClickHouse();
+    await runBufferedFeed(clockDeps(memorySource(stages).source, store, once.ch, { t: NOW + 3_600_000 }), settleCfg);
+    // Held: the first run stops at stage 2, later runs resume as the clock moves; then one more run past the end.
+    const held = fakeClickHouse(), clock = { t: NOW };
+    const mem = memorySource(stages);
+    let inserts = 0;
+    const original = held.ch.insert.bind(held.ch);
+    held.ch.insert = async (table, rows, o) => { if (table === EVENTS_TABLE) inserts += rows.length; return original(table, rows, o); };
+    const summaries = [];
+    for (const t of [NOW, NOW + 150_000, NOW + 3_600_000, NOW + 7_200_000]) { clock.t = t; summaries.push(await runBufferedFeed(clockDeps(mem.source, store, held.ch, clock), settleCfg)); }
+    expect(summaries.map((s) => s.indexed)).toEqual([2, 1, 1, 0]);
+    expect(summaries.every((s) => s.caughtUp)).toBe(true);
+    // Every stage written exactly once, and byte-identical (fingerprint and version included) to the one-shot run.
+    expect(inserts).toBe(once.rows.length);
+    expect(canonicalOrder(held.rows)).toEqual(canonicalOrder(once.rows));
+    expect(new Set(held.rows.map((r) => `${r.fingerprint}|${r.version}`))).toEqual(new Set(once.rows.map((r) => `${r.fingerprint}|${r.version}`)));
+    expect(mem.cursor).toMatchObject({ after: { stageToken: stages[3]!.candidate.stageToken }, indexed: 4, skipped: 0 });
+    // A createdAt the clock cannot place is held, never processed.
+    const odd = memorySource([{ ...stages[0]!, candidate: { ...stages[0]!.candidate, createdAt: "not-a-time" } }]);
+    expect(await runBufferedFeed(clockDeps(odd.source, store, fakeClickHouse().ch, { t: NOW + 3_600_000 }), settleCfg)).toMatchObject({ stages: 0, indexed: 0, caughtUp: true });
+    expect(odd.cursor.after).toBeNull();
+  });
+
+  test("config: the settle holdback defaults to 300 s and refuses values outside 180-3600 s", () => {
+    expect(bufferedFeedConfig({}).settleMs).toBe(300_000);
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SETTLE_S: "" }).settleMs).toBe(300_000);
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SETTLE_S: "180" }).settleMs).toBe(180_000);
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SETTLE_S: "3600" }).settleMs).toBe(3_600_000);
+    for (const v of ["0", "179", "3601", "1000000", "-300", "300.5", " 300", "5m", "3e2"])
+      expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SETTLE_S: v })).toThrow(expect.objectContaining({ code: "config_settle_s_invalid" }));
+  });
 });
