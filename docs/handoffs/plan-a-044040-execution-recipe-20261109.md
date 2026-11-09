@@ -1,20 +1,30 @@
-<!-- Operator execution recipe for Khaliq's plan A (one paused migrator run 044020+044030+044040 with
-     HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true) and the prefix-first variant (044020+044030 at b254b615, GIN later).
+<!-- Operator execution recipe for Khaliq's plan A (one paused migrator run through 044040, twelve pending steps
+     from 043850, with HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true) and the prefix-first variant (044020+044030 at b254b615, GIN later).
      Written 2026-11-09 by layered-sessions-pipeline for Brian (sole production actor) at pipeline-lead's request.
      Source-only: nothing here was run against any database. Every write, deploy, dispatch and flag flip in this
      document needs Khaliq's explicit word. Production identifiers are placeholders. Durations are untested estimates.
-     Items marked UNVERIFIED were not confirmed in code and must be checked by the operator before use. -->
-# Operator recipe: plan A, one paused migrator run 044020 + 044030 + 044040 (96Bulls)
+     Items marked UNVERIFIED were not confirmed in code and must be checked by the operator before use.
+     Corrected 2026-11-09 after the production step-3 run failed with 42501 at the first pending step. -->
+# Operator recipe: plan A, one paused migrator run through 044040, twelve pending steps from 043850 (96Bulls)
+
+> **Correction 2026-11-09.** Step 3 ran in production at ~18:39:50Z and failed within 1 s at the first pending
+> migration with SQLSTATE 42501. Three errors in the first version are fixed here:
+> (a) the production ledger tail is **043800**, not 044010, so one invocation applies **twelve** steps
+> (043850 ... 044040, §4); (b) the owner must **re-run the sessions function-boundary bootstrap from 3d0b4191
+> before the migrator** (new §2a; this was the cause of the 42501); (c) after a failed run the marker reads
+> (pending, G_new), and G_cur PASS is restored **only by the canonical migrator from the G_cur source pin**,
+> never by mark_pass (§8, new first bullet).
 
 Run order (summary):
-1. Verify the source pin 3d0b4191 in a clean scratch clone, compute G_new, and capture G_cur, the ledger tail (044010) and the marker. Read-only.
+1. Verify the source pin 3d0b4191 in a clean scratch clone, compute G_new, and capture G_cur, the ledger tail (043800; corrected from 044010) and the marker. Read-only.
 2. Khaliq gives his word; Brian deploys the ingest Worker with expectedGeneration=G_cur and overlapGeneration=G_new (zero-503 §3.1). Brian also opens the owner direct connection from 1Password.
+   - 2a (added 2026-11-09). As postgres, re-run the sessions function-boundary bootstrap from the 3d0b4191 checkout (§2a). Production DDL: exclusive DB slot, Khaliq's own word.
 3. Brian runs ONE CLI migrator invocation from the pin with HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true. The pending marker is the de facto ingest pause (generation fence, 55000/503).
 4. Verify indexes, ledger, RPC and PASS for G_new, then run the rebind G_cur->G_new (dry run, then --execute). Uploads resume here.
 5. Run the G2 bulk parity re-proof, a canary by natural traffic, and a later Worker deploy with expectedGeneration=G_new. Roll forward; no down-migrations on real databases.
 
 Authority: every write, deploy and dispatch below needs Khaliq's explicit word, and Brian's hands carry it out (AGENTS.md "Deploys ... migrations to any real database still need Khaliq's separate, explicit OK"; operator-packet.md:3-4).
-Citations are `path:line` at pin 3d0b4191. The cited files are byte-identical at main 14523d33, except src/hoopdb/migrate-guards.ts, which has a 1-line change.
+Citations are `path:line` at pin 3d0b4191. The cited files are byte-identical at main 14523d33, except src/hoopdb/migrate-guards.ts, which has a 1-line change. Citations added by the 2026-11-09 correction were checked at 3d0b4191 only.
 
 ## Plan A conflicts with the runbook. Khaliq must acknowledge this before the run
 - runbooks/session-directory-search-worker-bootstrap.md:185 says HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: **"Never set it on production"**. Both the release workflow profile and the owner apply profile (`ownerProfile`, src/hoopdb/owner-operator-apply.ts:100-110) cannot opt in. Only the CLI `bun src/hoopdb/migrate.ts` reads it from the environment.
@@ -42,6 +52,9 @@ git status --porcelain     # expect: empty (the parity operator refuses a dirty 
 bun install --frozen-lockfile
 ```
 I verified the first-parent check, the tail, the empty diff and the three sha256 values against the local repo.
+The run applies all twelve pending files (§4), not only these three. List them with `ls supabase/migrations/ | sed -n '/20261105043850/,/20261105044040/p'` in the pinned clone and record `sha256sum` of each for the ledger check in §4.
+
+Capture G_cur (correction 2026-11-09). Read G_cur from the marker row (`generation` where status is pass) before the run, and match it to a source pin whose `bun src/hoopdb/migrate.ts --generation` yields that value. For the 043800 ledger tail, G_cur = `49734d6fa88cbc228f54903895abe8c32c49765b2bcbb013b9eac8492b54f23e`, produced by `8bb18be50fa54b2f994cc921703abdfcc75c2f65` (every first-parent main commit from d13308a8 through 67d1786d whose migrations tree ends at 043800 yields the same digest). Keep that pin; it is the only supported way to restore G_cur PASS after a failed run (§8). G_new at 3d0b4191 = `387f83b04f4bf5bc842cf6ddc21e475934d708922f079e7dcd3f08dd45499eff`.
 
 Ways to invoke the migrator:
 - Image: docker/entrypoint.sh:6 runs `bun run /app/src/hoopdb/migrate.ts` when `SERVICE=hoopdb-migrate`. migrate.ts:1-9 describes it as a one-shot container. The image tag convention for a pin is UNVERIFIED. package.json has no `migrate` script.
@@ -80,6 +93,31 @@ Behaviour of the run:
 - It applies **every pending step in one invocation**, each in its own BEGIN (:724), ledger INSERT (:729) and COMMIT (:732). A failure rolls back that step (:734) and stops the run.
 - Verify steps then flip the marker to pass (~:669-710; 40P01 retried 3x).
 - Unlock happens at :763.
+- The migrator sets no role and no boundary GUC: bindDbMode (:641-645) sets only `hoopdb.db_mode` and `hoopdb.allow_blocking_index_build`. A hand-built client therefore has nothing extra to replicate; the function-boundary event trigger body is what decides (§2a).
+
+### 2a. Sessions function-boundary re-bootstrap before the migrator (added 2026-11-09; required)
+Why. The event trigger function `hoopdb_boundary.sessions_function_boundary()` embeds, at bootstrap time, a **frozen** copy of src/hoopdb/sessions-function-acl.json (`v_manifest`, supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql:106) and a frozen SECURITY DEFINER allowlist (`v_secdef` :107-151). At ddl_command_end it raises 42501 "sessions function boundary: ..." (:441-442) for any touched sessions routine that is SECURITY DEFINER outside that list (:427-428), has an ACL outside the manifest (:408-426), or is not owned by the trigger function's owner (:361-364, :404-406). 043850's first `CREATE FUNCTION sessions.ingest_acquisition_set_hooks(boolean) ... SECURITY DEFINER` (migration :215-216) is refused by a trigger bootstrapped before the acquisition lane. That is the 2026-11-09 failure.
+- The preflight in `HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke` (§2; migrate-guards.ts:1759 functionBoundaryEvidence) proves only per-creator default ACLs and never checks the trigger body, so it passed and the pending marker (migrate.ts:600) was written before the refusal.
+- Rule: runbooks/session-directory-search-worker-bootstrap.md:647-650 (install as postgres, after the runtime-role bootstrap, before migrate) and :659-663 (a migration that adds or changes a sessions function must update the manifest, the embedded trigger lists and the prosrc sha); docs/session-desktop-catalog.md:47.
+
+Read-only check before (expect `false`, `bulls96_runtime`) and after (expect `true`, `bulls96_runtime`):
+```sql
+SELECT position('ingest_acquisition_install(jsonb)' IN p.prosrc) > 0 AS has_043850_fns
+  FROM pg_proc p WHERE p.oid = 'hoopdb_boundary.sessions_function_boundary()'::regprocedure;
+SELECT substring(p.prosrc from 'v_runtime text := ''([a-z0-9_]+)''') AS runtime_role
+  FROM pg_proc p WHERE p.oid = 'hoopdb_boundary.sessions_function_boundary()'::regprocedure;
+```
+Run as postgres, from the clean 3d0b4191 checkout (production DDL: exclusive DB slot, Khaliq's own word, the DB actor's hands):
+```sh
+psql -v ON_ERROR_STOP=1 -X -v runtime_role=bulls96_runtime -d <the HoopDb database> \
+  -f supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql
+```
+Script behaviour:
+- Idempotent. `CREATE OR REPLACE` refreshes the function body (:447-449). The trigger is left untouched when event, tags and enabled state match (:473-482).
+- Refuses 55000 if `runtime_role` differs from the role literal the installed trigger already names (:82-93), or if `hoopdb_boundary` is not owned by current_user (:73-74).
+- Refuses 55000 "exists with another definition; an operator must decide" if the installed trigger's tag set differs from the pin's (:452-470). `DROP EVENT TRIGGER` and a re-run is then an explicit operator decision under Khaliq's word; do not improvise it.
+
+Evidence after the bootstrap: the normalized prosrc sha256 (runtime literal replaced by `__RUNTIME_ROLE__`, migrate-guards.ts normalizeEventTriggerBody) must equal SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 at 3d0b4191, `42ee52a7463d60fb6c6d939260ed78f6f23aa0f965121d4933713bf2e812af59`. Optionally run the preflight once with `HOOPDB_FUNCTION_BOUNDARY_MODE=event-trigger bun src/hoopdb/migrate.ts --activation-check` and expect `prosrc_exact=true`. Then run §2 with the profile unchanged.
 
 ## 3. Pausing ingest writes, and the reverse
 The ingest Worker has **no maintenance or pause flag**. A grep of src/session-ingest for MAINTENANCE/PAUSE found none; worker.ts has only INGEST_EXPECT_GENERATION and INGEST_ACCEPT_GENERATIONS (:31-34, :105-107).
@@ -89,8 +127,25 @@ The ingest Worker has **no maintenance or pause flag**. A grep of src/session-in
 - Consumers and readers: schemaVerdict (src/shared/db.ts:197-260) returns schema_pending or validation_pending, and waitForSchema (:262) waits. Each consumer's exact behaviour during the window is UNVERIFIED. Record a pre-window 503 baseline separately from intentional refusals (generation-window.md :51).
 
 ## 4. Expected steps, outputs, ledger, verification and monitoring
-Steps applied: `upstream:20261105044020_...`, `upstream:20261105044030_...`, `upstream:20261105044040_...` (schemaSteps ~:296-307), then the verify steps.
-Expected log (JSON lines): "role validation pending", then "migration applied" {reason: step name} x3, "role validation passed", and "hoopdb migrations complete" {count, skipped}.
+Steps applied (corrected 2026-11-09; production ledger tail is `upstream:20261105043800_lazy_ack_clock_no_key_update.sql`), in order (schemaSteps ~:296-307), then the verify steps:
+
+| step | file (`upstream:` + name) | sha256 at 3d0b4191 |
+|---|---|---|
+| 043850 | 20261105043850_ingest_acquisition_owner.sql | 7d8447681465ae87c54b61e6d4aa615b4f97af98c489a9f13d18b934c03b6275 |
+| 043860 | 20261105043860_buffered_search_gate.sql | 0b7cb6bcb1c5858cd4134417e6b7f570582a8ebcb9d40c0b494a12c69313b369 |
+| 043870 | 20261105043870_buffered_search_feed_cursor.sql | fa59ee8b6661c6594c3d1e673c1fe1f85308db151cba6db9ac60ebfc94241eeb |
+| 043880 | 20261105043880_ingest_bookkeeping_cleanup.sql | 038f1e1c8f26a2d8a4ff5e272ff34160e102c60e5554dd3af64879adf06e995f |
+| 043890 | 20261105043890_buffered_search_gate_retired_witness.sql | 7dbf32e496267f5c0df94015ff4c252fd6f16b219025c44a307b3974faffef62 |
+| 043900 | 20261105043900_session_consumer_function_grants.sql | 337e225afaaadc83232cf2a61539ebc0eb76a6214c83d74db50e84407fa7c06c |
+| 043910 | 20261105043910_selfhost_session_selection_erase.sql | 546c344a9b938037cf349e8ef0917e0af7a6826775bb1b908e2f9db0e712adb2 |
+| 044000 | 20261105044000_read_api_tokens.sql | 33a2ae8f07a8ebe3574ce673a7b58a17e640bc7007002a01be29ad4a66ccf3f4 |
+| 044010 | 20261105044010_selfhost_erase_lock_fences.sql | 49e427581f60e2000c158d16360790cfc6359fbf6a10dca014c1dac2c7fcc9db |
+| 044020 | 20261105044020_claim_bootstrap_org_indexes.sql | as §1 |
+| 044030 | 20261105044030_ingest_generation_overlap.sql | as §1 |
+| 044040 | 20261105044040_buffered_stages_session_first.sql | as §1 |
+
+Each step is its own transaction (migrate.ts:721-739: BEGIN, bindDbMode, sql, ledger INSERT, COMMIT). A failure rolls back only that step; the ledger stays at the last committed step.
+Expected log (JSON lines): "role validation pending", then "migration applied" {reason: step name} **x12**, "role validation passed", and "hoopdb migrations complete" {count, skipped}.
 - The migrations raise no NOTICE, so adopt x7 and build x1 are not logged individually. 044020 specs :50-66 and checks :104-112 (42P07 or 55000 on a mismatch).
 - On a failure the log shows "migration failed" {reason, error_code} (:734).
 Ledger: `sessions.__96bulls_migrations(name text PK, sha256 text, applied_at timestamptz DEFAULT now())` (~:79, :578-582).
@@ -101,11 +156,12 @@ SELECT pid, state, wait_event_type, wait_event, now()-query_start AS age, left(q
 SELECT pid, phase, blocks_done, blocks_total, tuples_done, tuples_total
   FROM pg_stat_progress_create_index;                      -- operator-packet.md:77
 ```
-Rough durations (UNTESTED, 4 vCPU / 16 GB): 044020 btree on 21.3M rows / 24.6 GB takes 10-30 min, 044030 seconds, and the 044040 GIN on 12.7 GB 15-45 min. The SHARE lock blocks writes to each table until that step's COMMIT.
+Rough durations (UNTESTED, 4 vCPU / 16 GB): 044020 btree on 21.3M rows / 24.6 GB takes 10-30 min, 044030 seconds, and the 044040 GIN on 12.7 GB 15-45 min. 043850 ... 044010 are small (functions, grants, tables); the long steps remain 044020 and 044040. The SHARE lock blocks writes to each table until that step's COMMIT.
 Verification after the run:
 ```sql
 SELECT name, sha256, applied_at FROM sessions.__96bulls_migrations
- WHERE name LIKE 'upstream:20261105044%' ORDER BY name;      -- expect 044020/044030/044040, sha as §1
+ WHERE name > 'upstream:20261105043800' AND name LIKE 'upstream:2026110504%' ORDER BY name;
+ -- expect exactly 12 rows, 043850 ... 044040, sha as the table above
 SELECT c.relname, i.indisvalid, i.indisready FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
  WHERE c.relname IN ('ingest_lazy_native_slots_org_id_idx','ingest_claim_attempts_records_gin_idx');
 SELECT generation, status FROM <role-validation-table> WHERE name = <marker-name>;  -- expect G_new, pass
@@ -164,6 +220,10 @@ Header and usage are at scripts/owner-buffered-parity-operator.ts:1-40, with all
 ## 8. Rollback at each step
 **Rule: no down-migrations on real databases.** Rollback files exist in supabase/rollbacks/ (044020/044030/044040). A re-apply after one would need the ledger row removed under a separate OK (operator-packet.md:192-194). The guarded runbook forbids erasing migration history or manual PASS. **A failed migration transaction leaves its ledger row unwritten.** Earlier steps stay committed and the marker stays pending, so uploads keep getting 503 (guarded-session-schema-release.md:36).
 - Before the run: nothing is applied. Kill the session to release the lock if needed, or redeploy the previous Worker inputs.
+- First pending step fails after the marker is written (added 2026-11-09; this is what happened at 043850 with 42501). The ledger is unchanged, but the marker now reads (pending, G_new), because the migrator upserts `generation = EXCLUDED.generation, status = 'pending'` (migrate.ts:403-404, :600). Uploads keep getting 503.
+  - **Never** run supabase/bootstrap/session_directory_search_worker_mark_pass.sql here. With G_cur it updates 0 rows (55000 "no pending role validation for generation"); with G_new it would mark PASS for a schema that is not applied.
+  - Either fix the cause (§2a) and rerun §2 from 3d0b4191, or restore G_cur PASS with the **canonical migrator from the G_cur source pin** (§1): from a clean checkout of `8bb18be50fa54b2f994cc921703abdfcc75c2f65`, run `bun src/hoopdb/migrate.ts` with the production profile env (§2, `HOOPDB_ROLE_VERIFY=true`) and **without** HOOPDB_ALLOW_BLOCKING_INDEX_BUILD. It preflights, rewrites the marker to (pending, G_cur) (:600), skips every ledgered step (:710-716), runs hardenAndCheck and the verify steps, and writes PASS for G_cur (:676-677). Same authority as any production run.
+  - This restore is for a failure at the **first** pending step (ledger still at 043800). If later steps committed first, the ledger is ahead of the G_cur pin; how the G_cur migrator behaves then is UNVERIFIED, so fix forward to G_new.
 - 044020 fails (for example 57014 statement_timeout during the blocking build, or a lock wait): the step rolls back, so no index is adopted, no ledger row is written and no partial index remains. Fix the cause and rerun the same command, or fall back to a CIC prebuild (a separate plan that needs Khaliq). The marker stays pending until a successful run.
 - After 044020 only (044030 failed): the indexes are additive, so leave them. A rerun resumes at 044030.
 - After 044030: it is additive. Overlap tables are added, and ingest_require_generation and ingest_lazy_guard are replaced (:294, :312). With no window open the behaviour is as strict as before (:43). The down file (:53-54) exists, but do not run it; fix forward.

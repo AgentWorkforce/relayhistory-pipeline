@@ -63,6 +63,15 @@ is held in a sealed Linux anonymous-memory descriptor, inherited by Skopeo. No
 registry credential file or credential argument is created; no disk fallback
 is available when the memory descriptor is unsupported.
 
+The two registry copies are sequential (sessions-pipeline first). A run that
+fails after the first copy, for example at the second copy or its read-back
+check, ends with no release receipt, but the `sessions-pipeline:sha-<source>`
+tag may already exist in the registry. Never use a tag from a failed run or
+from a run without a release receipt: a later dispatch rebuilds the image and
+can move that tag to a different digest. Only the digest named in a verified
+release receipt is a release. Pin that digest for every deployment and copy;
+never pin a tag.
+
 ## Verify a release
 
 After successful signing, registry verification and final CI, the release-receipt
@@ -94,6 +103,23 @@ export SOURCE_SHA="$source_sha" WORKFLOW_SHA="$workflow_sha" SOURCE_CI_RUN="$ci_
 export PUBLISH_RUN_ID="$publish_run_id" PUBLISH_RUN_ATTEMPT="$publish_run_attempt"
 node scripts/image-release-provenance.mjs verify
 ```
+
+Releases signed before the dual publish name only 96bulls-services and carry
+no `images` claim. Verify those with the legacy layout and the 96bulls-services
+image reference instead; the other variables are the same:
+
+```bash
+set -euo pipefail
+export ARTIFACT_DIR="$receipt_dir"
+export IMAGE_DIGEST="${image##*@}"
+test "$image" = "ghcr.io/agentworkforce/96bulls-services@$IMAGE_DIGEST"
+export IMAGE_LAYOUT=legacyOnly
+export SOURCE_SHA="$source_sha" WORKFLOW_SHA="$workflow_sha" SOURCE_CI_RUN="$ci_run_id"
+export PUBLISH_RUN_ID="$publish_run_id" PUBLISH_RUN_ATTEMPT="$publish_run_attempt"
+node scripts/image-release-provenance.mjs verify
+```
+
+A release of either kind cannot be verified with the other layout.
 
 This verifies the actual index and both signed bundles without private-package
 pull credentials. Independently inspect both platform manifests/SBOMs, verify

@@ -51,6 +51,15 @@
  *                                   failures force an exit (for a compose
  *                                   healthcheck or watcher); default
  *                                   /tmp/session-pipeline-consumer.unhealthy
+ *   RELAYHISTORY_SELFHOST_OUTPUT_FACTS        enabled only: exactly "true" (no trimming,
+ *                                   case-sensitive) also writes output facts
+ *                                   (sessions.session_event_facts /
+ *                                   session_output_facts, migration 045040) through the
+ *                                   Postgres facts store inside the same transaction as
+ *                                   the directory events; unset or any other value is
+ *                                   off (default off, never a startup error). Sessions
+ *                                   ingested before the flag have no facts (bootstrap
+ *                                   is a later PR)
  *   HOOPDB_URL                                runWorker (health/readiness gates) opens its
  *                                   own pool from this variable. It must equal the
  *                                   secret's hoopdb_url (same role, same database);
@@ -78,6 +87,7 @@ export const CONSUMER_BACKEND_VAR = "SEARCH_INDEX_BACKEND";
 export const CONSUMER_BACKEND_ID_VAR = "SEARCH_INDEX_POSTGRES_BACKEND_ID";
 export const CONSUMER_KEY_PREFIX_VAR = "PIPELINE_KEY_PREFIX";
 export const CONSUMER_TLS_PROFILE_VAR = "SESSION_POSTGRES_TLS_PROFILE";
+export const CONSUMER_OUTPUT_FACTS_VAR = "RELAYHISTORY_SELFHOST_OUTPUT_FACTS";
 
 export interface ConsumerSecret {
   hoopdb_url: string;
@@ -100,6 +110,8 @@ export type ConsumerServiceConfig =
       everyMinutes: number;
       fanout: "off";
       unhealthyFile: string;
+      /** RELAYHISTORY_SELFHOST_OUTPUT_FACTS is exactly "true" (default off). */
+      outputFacts: boolean;
       /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
       analytics?: AnalyticsConfig;
     };
@@ -171,6 +183,7 @@ export function consumerServiceConfig(env: NodeJS.ProcessEnv = process.env): Con
   const analytics = analyticsConfig(env, "selfhost");
   return {
     enabled: true, secret: parseConsumerSecret(secretText), searchBackend: backend, backendId, floorMs, keyPrefix, lookbackMinutes, everyMinutes, fanout, unhealthyFile,
+    outputFacts: env[CONSUMER_OUTPUT_FACTS_VAR] === "true",
     ...(analytics.sink !== "noop" ? { analytics } : {}),
   };
 }

@@ -297,15 +297,42 @@ off; anything else, `true` included, fails startup).
 
 | SERVICE | Flag | Required when enabled | Secret material (from the secret store, never on disk) |
 | --- | --- | --- | --- |
-| `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT`, `READ_API_CANONICAL_PIN_LAGGING_POINTER` (recommended `true` with `SELFHOST_INGEST_ADMISSION=async`; default off; any value other than `true` is off, see `docs/selfhost-async-admission.md`) | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
+| `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT`, `READ_API_CANONICAL_PIN_LAGGING_POINTER` (recommended `true` with `SELFHOST_INGEST_ADMISSION=async`; default off; any value other than `true` is off, see `docs/selfhost-async-admission.md`), `READ_API_CANONICAL_SCOPE_BYTES` / `READ_API_CANONICAL_SCOPE_EVENTS` (canonical snapshot budget; defaults 32 MiB / 100000 (raise bytes only with the pod memory limit), bytes accepted 16 MiB..2 GiB, events up to 4000000; out of range fails startup, see `docs/local-stack.md`) | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
 | `session-publication` | `INGEST_PUBLISH_ENABLED` | `INGEST_PUBLISH_{BUCKET,EXPECT_GENERATION,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,INSTANCE_ID,SECRET_ARN,KMS_KEY_ARN,INSTANCE_PROFILE_ARN,ROLE_NAME}`, `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, optional `INGEST_PUBLISH_BUDGET_MS`, `INGEST_PUBLISH_BATCH_LIMIT`, `WORKER_HEALTH_PORT` | none in env: IMDSv2 plus Secrets Manager (see the caveat in section 1) |
 | `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS`, `SESSION_ERASE_API_ENABLED` (`1`; default off), `RELAYHISTORY_SELFHOST_SESSION_SELECTION`, `RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT` (both `true`; default off) | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys, `SESSION_ERASE_API_SECRET` (+ `_PREVIOUS` during a rotation; at least 32 characters; only read when the erase flag is on) |
 | `session-erase-bytes` (Job) | `SESSION_ERASE_BYTES_ENABLED` (exactly `1`; see below) | `SESSION_ERASE_S3_BUCKET`, `SESSION_ERASE_S3_REGION`, `SESSION_ERASE_REQUEST_FILE`, optional `SESSION_ERASE_S3_ENDPOINT` (bare origin; https, loopback, or a Service name with `ALLOW_IN_CLUSTER_HTTP`), `SESSION_ERASE_KEY_ROOT` (default `96bulls`, must equal `INGEST_KEY_ROOT`), `SESSION_ERASE_DRY_RUN` (`1` = list and count only), `SESSION_ERASE_CONCURRENCY` (1..16, default 4) | `SESSION_ERASE_S3_ACCESS_KEY_ID[_FILE]`, `SESSION_ERASE_S3_SECRET_ACCESS_KEY[_FILE]`: a separate eraser key (ListBucketVersions + DeleteObjectVersion on the key root), not the ingest writer's key |
 | workers | per service (`docs/local-stack.md`) | `HOOPDB_URL`, `WORKER_HEALTH_PORT` | `HOOPDB_URL` password |
 
+Installs with bigger sessions must raise the read API container memory limit and
+`READ_API_CANONICAL_SCOPE_BYTES` together, because a raw scope is held several times over per request. The shipped
+pairing is the 32 MiB default against the charts' 512Mi read API limit (umbrella chart 1Gi), so keep roughly that
+ratio when raising the budget (for example 64 MiB needs at least 1Gi, and a 1.5Gi limit is the pairing used for a
+64 MiB dev budget). The hosted Worker budget stays 16 MiB and is not affected.
+
 `SESSION_ERASE_BYTES_ENABLED` is the one exception to the `true` rule above:
 the operator-erase contract fixes the literal `1`. `true` is not accepted; it
 fails startup like any other unknown value, so it is never silently off.
+
+`RELAYHISTORY_SELFHOST_OUTPUT_FACTS` (pipeline consumer,
+`SERVICE=session-pipeline-consumer`, next to `SEARCH_INDEX_BACKEND` and
+`RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER`; documented in
+`src/session-pipeline/consumer-config.ts`) is an optional behaviour flag like
+`READ_API_CANONICAL_PIN_LAGGING_POINTER`: exactly `true` enables it; unset or
+any other value is off (default off), never a startup error. When on, every
+search-index pass also builds the session's output facts with the shared
+builder and writes them through the Postgres facts store
+(`sessions.session_event_facts`, `sessions.session_output_facts` and
+`sessions.output_facts_session_state`, migration `045040`) inside the same
+transaction as the directory events; a pass older than the stored source
+version is a no-op, and the erase path deletes the session's facts. Default
+off; sessions ingested before the flag have no facts (bootstrap is a later PR).
+Sessions erased while the flag is off keep any facts written earlier.
+Migration `045040` grants the four writers to `search_consumer_runtime` whatever
+the flag says, so turning the flag on needs no extra grants. The consumer's live
+sessions-function gate (`SESSIONS_FUNCTION_GATE_SQL`) accepts those writers only
+when it runs as `search_consumer_runtime` (`CONSUMER_RUNTIME_FUNCTIONS` in
+`src/hoopdb/migrate-guards.ts`); any other role that can execute them, or
+PUBLIC, still closes the gate.
 
 ### session-ingest admission mode (config contract)
 
