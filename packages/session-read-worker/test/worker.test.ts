@@ -232,18 +232,20 @@ describe("entry and configuration", () => {
 
   test("READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: unset keeps 2000; 2000..6000 is passed to the buffered RPCs; a bad value is a 503", async () => {
     const seen: string[] = [];
-    const run = (async (_org: string, _ws: string, work: (q: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>) => Promise<unknown>) =>
-      work(async (sql: string) => {
-        seen.push(sql);
-        return { rows: [] };
+    const run = (async (_org: string, _ws: string, work: (q: { query(sql: string, params?: unknown[]): Promise<{ rows: unknown[] }> }) => Promise<unknown>) =>
+      work({
+        async query(sql: string) {
+          seen.push(sql);
+          return { rows: [] };
+        },
       })) as never;
     const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "ws-a", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
-    const head = { cutoverEpoch: "1".repeat(64), privacyBaselineSha256: "4".repeat(64), head: null } as never;
+    const head = { cutoverEpoch: "1".repeat(64), privacyBaselineSha256: "4".repeat(64), head: { epoch: "1".repeat(64), version: "7", digest: "3".repeat(64), kind: "selection", pending: false } } as never;
     const scope = { orgId: "org-a", workspaceId: "ws-a", userId: "u-1" };
     for (const [flag, want] of [[undefined, 2000], ["", 2000], ["2000", 2000], ["5000", 5000], ["6000", 6000]] as const) {
       seen.length = 0;
       const d = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: flag } as Env, run);
-      await d!.reads.list(scope, head, { limit: 1 }).catch(() => undefined);
+      await d!.reads.list(scope, head, { limit: 1 });
       expect(seen[0], String(flag)).toBe(`SET LOCAL statement_timeout = ${want}`);
     }
 
