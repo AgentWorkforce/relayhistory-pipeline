@@ -53,6 +53,7 @@ import {
 import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince } from "./config.ts";
+import { ANALYTICS_OFF, ANALYTICS_SINK_VAR, analyticsConfig, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
 import { serviceCanonicalDeps } from "./service-canonical.ts";
 import {
@@ -488,6 +489,12 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   if (authConfig.mode === "self_issued" && entry !== "service")
     throw new Error("session read api: READ_API_AUTH_MODE=self_issued is served only by the self-host service");
   const corsAllowedOrigins = entry === "service" ? readApiCorsOrigins(env) : undefined;
+  // Analytics (src/shared/analytics-config.ts), before the pool opens: the service takes the self-host
+  // profile (noop or collector, never PostHog). The Lambda has no analytics wiring, so a selection there
+  // is refused rather than silently ignored.
+  const analyticsSelection = entry === "service" ? analyticsConfig(env, "selfhost") : ANALYTICS_OFF;
+  if (entry !== "service" && !["", "noop", "none"].includes(env[ANALYTICS_SINK_VAR] ?? ""))
+    throw new Error(`session read api: ${ANALYTICS_SINK_VAR} is served only by the self-host service`);
   const pool = new pg.Pool({
     ...target,
     max: 2,
@@ -531,7 +538,12 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),
     log: (fields) => log.info("session read", fields),
   };
-  return { deps, authConfig, close: () => pool.end() };
+  const analytics = createAnalyticsSink(analyticsSelection, "session-read-api", "service", {
+    report: (counters) => log.warn("analytics export degraded", analyticsCounterFields(analyticsSelection.sink, counters)),
+  });
+  if (analyticsSelection.sink !== "noop") deps.analytics = analytics;
+  // Shutdown flush first (bounded), then the pool.
+  return { deps, authConfig, close: async () => { await analytics.shutdown(); await pool.end(); } };
   } catch (error) { await pool.end(); throw error; }
 }
 

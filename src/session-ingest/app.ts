@@ -38,6 +38,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
+import { captureSafely, ingestOutcome, type AnalyticsPort } from "../shared/analytics.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { assertWithinBudget, batchIdConflict, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
 import { assertTenantSegment } from "./writer.ts";
@@ -130,6 +131,12 @@ export interface IngestAppDeps {
   /** P5b G2: the onboarding heartbeat on history.probe_connections. Unset: those routes answer 503. */
   onboarding?: { run: OnboardingRun };
   log?: (fields: Record<string, unknown>) => void;
+  /**
+   * Product analytics (src/shared/analytics.ts): one `session_ingest.batch_completed` per batch on
+   * POST /v1/delivery/batches and /v1/turns/batches (route, outcome class, record count, latency bucket,
+   * the verified org/workspace). Absent = none. A sink can never change or fail the answer.
+   */
+  analytics?: AnalyticsPort;
   /**
    * P1 custody source (INGEST_CUSTODY_SOURCE). "relayhistory" (default): only the signed Neon witness
    * relayhistory sends. "shadow": additionally build the Supabase frozen-source witness and log
@@ -584,6 +591,11 @@ export function createIngestApp(deps: IngestAppDeps) {
     const identity = c.get("identity");
     const read: BodyRead = { bytes: 0, wireBytes: 0, encoding: "identity" };
     const fields: Record<string, unknown> = { route, org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") };
+    // Counts and the outcome class only: never a batch, record or session id, and never content.
+    const completed = (native: { outcome?: string; status?: number }, records: number) => captureSafely(deps.analytics, {
+      kind: "session_ingest.batch_completed", traceId: c.get("correlationId"), orgId: identity.orgId, workspaceId: identity.workspaceId,
+      route: route === "turns.batches" ? "turns" : "delivery", outcome: ingestOutcome(native), records, durationMs: Date.now() - started,
+    });
     try {
       const batch = parse(await jsonOf(c, read), identity);
       const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
@@ -602,6 +614,7 @@ export function createIngestApp(deps: IngestAppDeps) {
           throw new IngestUnavailable("admission_enqueue", "admission_enqueue_failed");
         }
         emit({ ...fields, outcome: "accepted_queued", count: prepared.records.length, duration_ms: Date.now() - started, bytes_raw: read.bytes });
+        completed({ outcome: "accepted_queued" }, prepared.records.length);
         c.header(ADMISSION_HEADER, ADMISSION_QUEUED);
         return c.json({ ...prepared.receipt, limits: { ...DELIVERY_LIMITS, contentEncodings: contentEncodings() } });
       }
@@ -617,6 +630,7 @@ export function createIngestApp(deps: IngestAppDeps) {
           if (stored.digest !== prepared.batchDigest) throw batchIdConflict(prepared, stored.digest);
           // No claim, so no custody ACK header; the admission header names the legacy replay instead.
           emit({ ...fields, outcome: "legacy_replay", count: prepared.records.length, duration_ms: Date.now() - started, bytes_raw: read.bytes });
+          completed({ outcome: "legacy_replay" }, prepared.records.length);
           c.header(ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY);
           // receiptId is supplied explicitly: a stored receipt without a string one falls back to the prepared receipt's id.
           return c.json({ ...stored.receipt, receiptId: typeof stored.receipt.receiptId === "string" ? stored.receipt.receiptId : prepared.receipt.receiptId, limits: { ...DELIVERY_LIMITS, contentEncodings: contentEncodings() } });
@@ -628,6 +642,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       if(custody&&custody.witness.originalRecordCount!==batch.records.length)throw new IngestUnavailable("fence","custody_record_count");
       const result = await deliverBatch({...deps.deliver,...(custody?{custody}:{})}, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, batch);
       emit({ ...fields, outcome: result.outcome, count: result.stats.records, manifests: result.stats.manifests_written, deleted: result.stats.deleted_sessions, state: result.stats.replica, duration_ms: Date.now() - started, bytes_raw: read.bytes });
+      completed({ outcome: result.outcome }, result.stats.records);
       custodyHeader(c,result.custodyAck);
       return c.json({ ...result.receipt, limits: { ...result.receipt.limits, contentEncodings: contentEncodings() } });
     } catch (error) {
@@ -640,6 +655,8 @@ export function createIngestApp(deps: IngestAppDeps) {
         duration_ms: Date.now() - started,
         bytes_raw: read.bytes,
       });
+      // failure() answers 409 for an acquisition refusal and the error's own status otherwise (503 when untyped).
+      completed({ status: error instanceof AcquisitionRefusedError ? 409 : error instanceof DeliveryError ? error.status : 503 }, 0);
       const lockAlert = lockAlertFields(error, deps.deliver.acceptanceMode);
       if (lockAlert) emit(lockAlert);
       return failure(c, error);
