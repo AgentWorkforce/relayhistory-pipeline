@@ -36,7 +36,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
-import { assertWithinBudget, batchIdConflict, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { assertWithinBudget, batchIdConflict, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
 import { assertTenantSegment } from "./writer.ts";
 import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, enqueueAdmission, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode, type SyncAdmissionFrozenReceiptMode } from "./async-admission.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
@@ -243,7 +243,7 @@ function errorBody(c: Context<Env>, code: string, message: string, extra: Record
  * error that reached the route outside a delivery stage is reported the same way.
  * Diagnostic only. */
 function unavailableFields(error: unknown): Record<string, unknown> {
-  if (error instanceof IngestUnavailable) return { stage: error.stage, error_code: error.cause_code, ...dbFields(error.db) };
+  if (error instanceof IngestUnavailable || error instanceof ClaimLockBusy) return { stage: error.stage, error_code: error.cause_code, ...dbFields(error.db) };
   if (error instanceof LedgerUnavailableError) return { error_code: error.code, ...dbFields(error.db) };
   return {};
 }
@@ -259,9 +259,11 @@ export type LockAlertStage = "lazy_claim" | "staged_ack" | "staged_intent" | "se
 const LOCK_ALERT_SQLSTATES = new Set(["55P03", "57014"]);
 
 /** The one alert line for a 55P03 (lock_not_available) / 57014 (query_canceled) ledger failure on a
- * lock-alert stage: `{ route, stage, sqlstate }` and nothing else (no tenant data, no ids). Diagnostic only. */
+ * lock-alert stage: `{ route, stage, sqlstate }` and nothing else (no tenant data, no ids). Diagnostic only.
+ * A claim lock wait refused as 429 (ClaimLockBusy, INGEST_CLAIM_LOCK_BUSY=on) still alerts for 55P03
+ * (a 40P01 alerts in neither flag state). */
 export function lockAlertFields(error: unknown, acceptanceMode: string | undefined): { route: "ingest.lock_alert"; stage: LockAlertStage; sqlstate: string } | undefined {
-  if (!(error instanceof IngestUnavailable)) return undefined;
+  if (!(error instanceof IngestUnavailable || error instanceof ClaimLockBusy)) return undefined;
   const sqlstate = error.db?.db_error_code;
   if (sqlstate === undefined || !LOCK_ALERT_SQLSTATES.has(sqlstate)) return undefined;
   const stage: LockAlertStage | undefined =
