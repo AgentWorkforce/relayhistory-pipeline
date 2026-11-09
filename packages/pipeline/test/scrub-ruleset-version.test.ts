@@ -87,6 +87,9 @@ const SCRUB_RULESETS: Record<number, string> = {
   // leaves the rest of that credential, glued to the footer, without its label; the run is
   // redacted with the footer, or to the end of the input when it holds a quote.
   6: "28edb23b9ff94299d530213a04026210eb848399475b740e026ecc85980b3a11",
+  // Version 7: only the exact public idempotency_key assignment is exempt.
+  // Version 6 is immutable in fixtures/scrub-ruleset-6.ts.
+  7: "887dd7184c757f5840b6a363fec8e9ea93819a5b917659985b56bc32a33f2fd8",
 };
 
 const read = (rel: string) =>
