@@ -385,7 +385,13 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     // Narrowed to the twelve named functions when 045020 granted search_consumer_runtime four
     // more EXECUTEs: an unnamed count would turn false on every later step.
     evidence: "twelve search_consumer_runtime EXECUTEs (composed writer path)",
+    // The named list also leaves out session_directory_project_text (045030's grant), so the count stays
+    // exactly twelve whether or not 045030 or 045020 has run.
     sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE' AND p.proname IN ('upsert_session_index', 'session_index_batch', 'session_publication_is_managed', 'session_publication_lock', 'applied_repo_evidence', 'canonical_remote', 'clean_root_commit', 'lock_repo_catalog', 'resolve_repo', 'repo_live', 'legacy_remote', 'session_directory_search_text')",
+  },
+  "upstream:20261105045030_session_consumer_project_text_grant.sql": {
+    evidence: "search_consumer_runtime EXECUTE on sessions.session_directory_project_text (project-text index expression)",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc p, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE p.oid = to_regprocedure('sessions.session_directory_project_text(text,text,text)') AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE') AS applied",
   },
   "upstream:20261105044000_read_api_tokens.sql": {
     evidence: "table sessions.read_api_tokens",
@@ -416,4 +422,5 @@ export const NON_CREATE_STEPS = [
   "96bulls:0003_fanout_ledger.sql",
   "96bulls:0004_summary_pointers.sql",
   "upstream:20261105043900_session_consumer_function_grants.sql",
+  "upstream:20261105045030_session_consumer_project_text_grant.sql",
 ] as const;

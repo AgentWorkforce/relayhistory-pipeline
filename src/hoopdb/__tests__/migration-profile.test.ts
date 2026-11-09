@@ -30,6 +30,7 @@ import {
   RUNTIME_APPLICATION_FUNCTIONS,
   sessionsFunctionAcl,
   sessionsFunctionAclPreview,
+  pendingExecuteGrants,
   SESSIONS_FUNCTION_EVENT_TRIGGER,
   SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256,
   SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS,
@@ -50,6 +51,7 @@ import {
   migrationLedgerSha256,
   migrate,
   migrationProfile,
+  pendingMigrationSql,
   plan,
   runMigrations,
   type MigrationClient,
@@ -163,7 +165,14 @@ function previousReleaseAcl(laterSteps: ReadonlyArray<{ path: string }>, manifes
     [...readFileSync(s.path, "utf8").matchAll(
       /\bCREATE\s+(?:(?:UNLOGGED|TEMP|TEMPORARY)\s+)?(?:TABLE|SEQUENCE)\s+(?:IF\s+NOT\s+EXISTS\s+)?(sessions\.\w+)/gi,
     )].map((m) => m[1]!.toLowerCase())));
-  const previousManifest: FunctionAclManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
+  // Grant-only later steps (043900, 045030: no CREATE FUNCTION at all) add EXECUTE grants on functions an earlier
+  // step created; that release's manifest could not list them yet, so they are dropped from the surviving entries.
+  const laterGrants = pendingExecuteGrants(laterSteps
+    .map((s) => readFileSync(s.path, "utf8"))
+    .filter((sql) => !/\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\b/i.test(sql)));
+  const previousManifest: FunctionAclManifest = Object.fromEntries(Object.entries(manifest)
+    .filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("("))))
+    .map(([fn, entries]) => [fn, entries.filter((e) => !laterGrants.has(`${fn} ${e}`))]));
   const previousCatalog: RuntimeAclCatalog = {
     tables: Object.fromEntries(Object.entries(catalog.tables).filter(([rel]) => !laterRels.has(rel))),
     sequences: catalog.sequences.filter((rel) => !laterRels.has(rel) && ![...laterRels].some((t) => rel.startsWith(`${t}_`) && rel.endsWith("_seq"))),
@@ -2436,7 +2445,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     for (const t of ["session_event_facts", "session_output_facts", "output_facts_session_state", "output_facts_workspace_state"])
       expect(await relation(`sessions.${t}`)).toBeNull();
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'output\\_facts\\_%'")).rows[0]!.n).toBe(0);
-    // Other lanes newer than 20261105045000 (045010 same-second feed) roll back next, newest first: 045000's down
+    // Other lanes newer than 20261105045000 (045010 same-second feed, 045030 consumer project-text grant) roll back next, newest first: 045000's down
     // refuses (55000) while any of them is applied.
     const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name !== OF).reverse();
     if (newerThanDigest.length)
@@ -3018,7 +3027,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so the grants' down refuses until they are rolled back,
-    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 045000, 044100, 044090, 044080, 044070, 044050, 044040, 044030),
+    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 045030, 045010, 045000, 044100, 044090, 044080, 044070, 044050, 044040, 044030),
     // then 044020 (claim-bootstrap indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
@@ -4335,6 +4344,125 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
     ).toEqual(["sessions.jwt_org_id(): g6_rt:EXECUTE"]);
   });
 
+  test("pendingExecuteGrants: literal EXECUTE grants in manifest spelling; comments, GRANT OPTION, other schemas and dynamic SQL are not credited", () => {
+    expect([...pendingExecuteGrants([`
+      -- GRANT EXECUTE ON FUNCTION sessions.commented(text) TO search_consumer_runtime;
+      /* GRANT EXECUTE ON FUNCTION sessions.blocked(text) TO search_consumer_runtime; */
+      DO $g$ BEGIN
+        GRANT EXECUTE ON FUNCTION sessions.resolve_repo(text, text, text, timestamptz) TO search_consumer_runtime;
+      END $g$;
+      grant execute on function "sessions"."two"(p_a int4, in p_b varchar[], double precision) to role_a, "role_b";
+      GRANT EXECUTE ON FUNCTION sessions.f1(jsonb), sessions.f2() TO role_c;
+      GRANT EXECUTE ON FUNCTION sessions.opt(text) TO role_d WITH GRANT OPTION;
+      GRANT EXECUTE ON FUNCTION public.other(text) TO role_e;
+      GRANT EXECUTE ON FUNCTION sessions.noargs TO role_f;
+      GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions TO role_g;
+      EXECUTE format('GRANT EXECUTE ON FUNCTION sessions.dyn(text) TO %I', v_role);
+    `])].sort()).toEqual([
+      "sessions.f1(jsonb) role_c:EXECUTE",
+      "sessions.f2() role_c:EXECUTE",
+      "sessions.resolve_repo(text,text,text,timestamp with time zone) search_consumer_runtime:EXECUTE",
+      "sessions.two(integer,character varying[],double precision) role_a:EXECUTE",
+      "sessions.two(integer,character varying[],double precision) role_b:EXECUTE",
+    ]);
+    // Every literal EXECUTE grant in a landed migration resolves to a manifest key.
+    const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
+    const keys = new Set(Object.entries(manifest).flatMap(([fn, es]) => es.map((e) => `${fn} ${e}`)));
+    const dir = join(root, "supabase/migrations");
+    const parsed = readdirSync(dir).filter((f) => f.endsWith(".sql")).flatMap((f) => [...pendingExecuteGrants([readFileSync(join(dir, f), "utf8")])]);
+    expect(parsed.length).toBeGreaterThan(100);
+    expect(parsed.filter((g) => !keys.has(g))).toEqual([]);
+  });
+
+  test("read-only ACL preview: at a checkpoint before 043900 is ledgered its twelve grants are pending-added (not red); a missing grant no pending step adds stays refused", async () => {
+    const db = await fresh();
+    await db.exec(
+      `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+    );
+    const profile: MigrationProfile = {
+      ...LOCAL,
+      mode: "selfhosted",
+      runtimeRole: "g6_rt",
+      runtimeLogin: false,
+      functionBoundary: "global-default-revoke",
+    };
+    expect(await failure(runMigrations(client(db), { profile }))).toBeNull();
+    const B2 = "upstream:20261105043900_session_consumer_function_grants.sql";
+    const b2Grants = [...pendingExecuteGrants([readFileSync(join(root, "supabase/migrations", B2.slice("upstream:".length)), "utf8")])];
+    expect(b2Grants.length).toBe(12);
+    expect(b2Grants.every((g) => g.endsWith(" search_consumer_runtime:EXECUTE"))).toBe(true);
+    // The checkpoint: 043900 and every later upstream step unledgered, 043900's grants absent.
+    await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name >= $1 AND name LIKE 'upstream:%'", [B2]);
+    for (const g of b2Grants)
+      await db.exec(`REVOKE EXECUTE ON FUNCTION ${g.slice(0, g.lastIndexOf(" "))} FROM search_consumer_runtime`);
+    const pendingSql = await pendingMigrationSql(client(db));
+    expect(pendingSql.length).toBeGreaterThan(0);
+    const asEntry = (g: string) => `${g.slice(0, g.lastIndexOf(" "))}: ${g.slice(g.lastIndexOf(" ") + 1)}`;
+    const atCheckpoint = await sessionsFunctionAclPreview(client(db), "g6_rt", pendingSql);
+    expect(atCheckpoint.function_acl_missing_refused).toEqual([]);
+    expect(atCheckpoint.function_acl_drift_extra).toEqual([]);
+    expect([...atCheckpoint.function_acl_missing].sort()).toEqual(b2Grants.map(asEntry).sort());
+    // Only pending steps count: a flag-only caller, or a caller whose pending SQL lacks 043900, refuses them.
+    expect([...(await sessionsFunctionAclPreview(client(db), "g6_rt", true)).function_acl_missing_refused].sort())
+      .toEqual(b2Grants.map(asEntry).sort());
+    const without = pendingSql.filter((sql) => !sql.includes("GRANT EXECUTE ON FUNCTION sessions.upsert_session_index(jsonb) TO search_consumer_runtime;"));
+    expect(without.length).toBe(pendingSql.length - 1);
+    expect((await sessionsFunctionAclPreview(client(db), "g6_rt", without)).function_acl_missing_refused.length).toBe(12);
+    // Role matched exactly: the same grants to another role are not credited.
+    const otherRole = pendingSql.map((sql) => sql.replaceAll(" TO search_consumer_runtime;", " TO someone_else;"));
+    expect((await sessionsFunctionAclPreview(client(db), "g6_rt", otherRole)).function_acl_missing_refused.length).toBe(12);
+    // A missing manifest grant that no pending step grants stays refused, next to the credited ones.
+    await db.exec("REVOKE EXECUTE ON FUNCTION sessions.repo_backfill_report() FROM service_role");
+    const mixed = await sessionsFunctionAclPreview(client(db), "g6_rt", pendingSql);
+    expect(mixed.function_acl_missing_refused).toEqual(["sessions.repo_backfill_report(): service_role:EXECUTE"]);
+    expect(mixed.function_acl_missing.length).toBe(12);
+  });
+
+  test("read-only ACL preview: 045030's project_text grant is pending-added only while 045030 is unledgered; the apply then installs it", async () => {
+    const db = await fresh();
+    await db.exec(
+      `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+    );
+    const profile: MigrationProfile = {
+      ...LOCAL,
+      mode: "selfhosted",
+      runtimeRole: "g6_rt",
+      runtimeLogin: false,
+      functionBoundary: "global-default-revoke",
+    };
+    expect(await failure(runMigrations(client(db), { profile }))).toBeNull();
+    const PT = "sessions.session_directory_project_text(text,text,text)";
+    const STEP = "upstream:20261105045030_session_consumer_project_text_grant.sql";
+    await db.exec(`REVOKE EXECUTE ON FUNCTION ${PT} FROM search_consumer_runtime`);
+    // Ledgered: no pending step re-adds the grant, so it is refused.
+    expect(await pendingMigrationSql(client(db))).toEqual([]);
+    const ledgered = await sessionsFunctionAclPreview(client(db), "g6_rt", await pendingMigrationSql(client(db)));
+    expect(ledgered.function_acl_missing_refused).toEqual([`${PT}: search_consumer_runtime:EXECUTE`]);
+    expect((await failure(runMigrations(client(db), { profile })))?.code).toBe("function_acl_drift");
+    // The previous-release shape: 045030 not yet ledgered. Its GRANT re-adds the grant,
+    // so the preview reports it pending-added (the release plan stays green).
+    await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1", [STEP]);
+    const pendingSql = await pendingMigrationSql(client(db));
+    expect(pendingSql.length).toBe(1);
+    const pending = await sessionsFunctionAclPreview(client(db), "g6_rt", pendingSql);
+    expect(pending.function_acl_missing_refused).toEqual([]);
+    expect(pending.function_acl_missing).toEqual([`${PT}: search_consumer_runtime:EXECUTE`]);
+    expect(pending.function_acl_drift_extra).toEqual([]);
+    // A flag-only caller (no pending SQL) does not credit grants: refused.
+    expect((await sessionsFunctionAclPreview(client(db), "g6_rt", true)).function_acl_missing_refused)
+      .toEqual([`${PT}: search_consumer_runtime:EXECUTE`]);
+    // The apply runs 045030, re-ledgers it, and the exact check is clean.
+    expect(await failure(runMigrations(client(db), { profile }))).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1", [STEP])).rows[0]!.n).toBe(1);
+    expect(await sessionsFunctionAclPreview(client(db), "g6_rt", await pendingMigrationSql(client(db)))).toEqual({
+      runtime_role: "g6_rt",
+      function_acl_drift_extra: [],
+      function_acl_missing: [],
+      function_acl_missing_refused: [],
+      function_acl_public_revoked: [],
+    });
+  });
+
   test("read-only ACL preview agrees with the migrator: a missing non-runtime manifest grant and a duplicate-grantor surplus are refused by both", async () => {
     const db = await fresh();
     await db.exec(
@@ -4608,7 +4736,7 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
     VALUES('org-title','ws-title','codex','session-title','machine-title','user-title',now(),now(),'fs','bucket','manifest/title',
     decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18',1,'Pointer retained')`);
   const preserved=async()=>expect((await db.query<{title:string}>("SELECT title FROM sessions.session_index WHERE session_id='session-title'")).rows).toEqual([{title:"Pointer retained"}]);
-  // Newer lanes (045000 digest, 045010 same-second, 045020 output facts) also apply on a full upgrade;
+  // Newer lanes (045000 digest, 045010 same-second, 045030 consumer grant, 045020 output facts) also apply on a full upgrade;
   // expect exactly the pending steps, which is 1 where 044100 is newest.
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(full.length - previous.steps.length);
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);await preserved();
@@ -4621,7 +4749,7 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
   const ledgerBefore=await ledgerHash();
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(0);
   expect(await ledgerHash()).toBe(ledgerBefore);await preserved();
-  // Lanes newer than 044100 (045000 digest, 045010 same-second, 045020 output facts) roll back newest first:
+  // Lanes newer than 044100 (045000 digest, 045010 same-second, 045030 consumer grant, 045020 output facts) roll back newest first:
   // the 044100 down script refuses while a later migration is applied.
   for (const later of [...previous.later].reverse())
     await db.exec(readFileSync(join(root,"supabase/rollbacks",`${later.slice("upstream:".length).replace(/\.sql$/,"")}.down.sql`),"utf8"));

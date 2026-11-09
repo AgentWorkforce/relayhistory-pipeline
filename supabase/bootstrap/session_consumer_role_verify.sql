@@ -217,6 +217,8 @@ BEGIN
         ('sessions.repo_live(text,uuid)', 'EXECUTE'),
         ('sessions.legacy_remote(text)', 'EXECUTE'),
         ('sessions.session_directory_search_text(text,text,text,text,text,text,text,text)', 'EXECUTE'),
+        -- 20261105045030: the project-text index helper.
+        ('sessions.session_directory_project_text(text,text,text)', 'EXECUTE'),
         -- 20261105045020: the self-host output facts writers (SECURITY DEFINER, each checks the caller).
         ('sessions.output_facts_state(text,text,text,text[],text)', 'EXECUTE'),
         ('sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)', 'EXECUTE'),
@@ -270,7 +272,7 @@ BEGIN
     WHERE p.pronamespace = to_regnamespace('sessions')
       AND p.proname IN ('session_index_batch', 'session_publication_is_managed', 'session_publication_lock', 'upsert_session_index',
         'applied_repo_evidence', 'canonical_remote', 'clean_root_commit', 'lock_repo_catalog', 'resolve_repo', 'session_directory_search_text',
-        'repo_live', 'legacy_remote')
+        'repo_live', 'legacy_remote', 'session_directory_project_text')
       AND NOT has_function_privilege(v_role, p.oid, 'EXECUTE')
   LOOP
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: missing EXECUTE on %s', v_role, v_bad);
