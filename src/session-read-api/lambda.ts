@@ -56,6 +56,8 @@ import { parseCompleteSince } from "./config.ts";
 import { ANALYTICS_OFF, ANALYTICS_SINK_VAR, analyticsConfig, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
 import { serviceCanonicalDeps } from "./service-canonical.ts";
+import { digestEnabled, digestNarrativeModel, selfhostNarrativeFromEnv } from "./digest-narrative-selfhost.ts";
+import type { DigestNarrativeDeps } from "./digest-narrative.ts";
 import {
   ACCESS_TTL_SECONDS_DEFAULT,
   ACCESS_TTL_SECONDS_MAX,
@@ -471,7 +473,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
  * selected search binding (the ClickHouse client or the composition's adapter,
  * never both), directory/liveness SQL and the self-host login. `close` releases
  * the pool. readAppFromSecret adds the verifier from `authConfig`. */
-export async function readApiDepsFromSecret(secretText: string, env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition, options: ReadAppOptions = {}): Promise<{ deps: Omit<ReadApiDeps, "verify">; authConfig: AuthConfig; close(): Promise<void> }> {
+export async function readApiDepsFromSecret(secretText: string, env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition, options: ReadAppOptions = {}): Promise<{ deps: Omit<ReadApiDeps, "verify">; authConfig: AuthConfig; close(): Promise<void>; digestNarrative?: DigestNarrativeDeps }> {
   const entry = options.entry ?? "lambda";
   const backend = searchBackend(env, composition, entry);
   const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
@@ -495,6 +497,9 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const analyticsSelection = entry === "service" ? analyticsConfig(env, "selfhost") : ANALYTICS_OFF;
   if (entry !== "service" && !["", "noop", "none"].includes(env[ANALYTICS_SINK_VAR] ?? ""))
     throw new Error(`session read api: ${ANALYTICS_SINK_VAR} is served only by the self-host service`);
+  // Env only, before any pool opens: with READ_API_DIGEST_ENABLED=1 an invalid narrative model
+  // id refuses the service. With the flag off no narrative variable is read.
+  if (entry === "service" && digestEnabled(env)) digestNarrativeModel(env);
   const pool = new pg.Pool({
     ...target,
     max: 2,
@@ -509,6 +514,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     options: "-c statement_timeout=2000", // Nonempty: pg otherwise uses PGOPTIONS.
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
+  let narrative: Awaited<ReturnType<typeof selfhostNarrativeFromEnv>>;
   try {
   // Directory, liveness and Postgres search isolation is forced RLS. Checked on
   // the service always and on any portable (Postgres) search binding; the hosted
@@ -522,6 +528,12 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // metadata and catalog. The hosted Lambda never builds it (those routes keep
   // their 501 `*_not_configured` there).
   const canonical = entry === "service" ? await serviceCanonicalDeps(env, poolTenantRunner(pool as never)) : undefined;
+  // The self-host service only, READ_API_DIGEST_ENABLED=1 (digest-narrative-selfhost.ts): the
+  // narrative cache on this read pool and, with a model, key and READ_API_DIGEST_NARRATIVE_DB_URL,
+  // in-process generation through a separate writer pool. Returned beside `deps`, not in it:
+  // this entry does not serve GET /v1/digest/daily yet, and the route stays 501 until the digest
+  // backend wiring passes this as `deps.digest`.
+  narrative = entry === "service" ? await selfhostNarrativeFromEnv(env, poolTenantRunner(pool as never)) : undefined;
   const deps: Omit<ReadApiDeps, "verify"> = {
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
@@ -542,9 +554,17 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     report: (counters) => log.warn("analytics export degraded", analyticsCounterFields(analyticsSelection.sink, counters)),
   });
   if (analyticsSelection.sink !== "noop") deps.analytics = analytics;
-  // Shutdown flush first (bounded), then the pool.
-  return { deps, authConfig, close: async () => { await analytics.shutdown(); await pool.end(); } };
-  } catch (error) { await pool.end(); throw error; }
+  const writer = narrative;
+  return {
+    deps, authConfig,
+    // The analytics shutdown flush first (bounded), then the pool and the narrative writer.
+    close: async () => {
+      await analytics.shutdown();
+      await (writer ? Promise.all([pool.end(), writer.close()]) : pool.end());
+    },
+    ...(writer ? { digestNarrative: writer.deps } : {}),
+  };
+  } catch (error) { await narrative?.close().catch(() => {}); await pool.end(); throw error; }
 }
 
 /** The same service assembly used by the Lambda loader, without credential

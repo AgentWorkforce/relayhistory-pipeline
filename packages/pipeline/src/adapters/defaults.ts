@@ -89,6 +89,10 @@ export function openSearchConfigFromInput(input: SearchFactoryInput): OpenSearch
   if (timeout !== undefined && (!/^[1-9][0-9]{0,5}$/.test(timeout) || Number(timeout) > MAX_OPENSEARCH_TIMEOUT_MS)) {
     throw new Error(`SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS must be an integer from 1 to ${MAX_OPENSEARCH_TIMEOUT_MS} (ms)`);
   }
+  // Lenient by design: a missing, zero or malformed value means the default
+  // bound, never an unbounded or failing writer.
+  const bulkBytes = value("BULK_MAX_BYTES");
+  const bulkMaxBytes = bulkBytes !== undefined && /^[1-9][0-9]{0,14}$/.test(bulkBytes) ? Number(bulkBytes) : undefined;
   const authKind = value("AUTH") ?? "none";
   let auth: OpenSearchSearchIndexConfig["auth"];
   if (authKind === "none") auth = { kind: "none" };
@@ -123,6 +127,7 @@ export function openSearchConfigFromInput(input: SearchFactoryInput): OpenSearch
     auth,
     ...(value("INDEX_PREFIX") ? { indexPrefix: value("INDEX_PREFIX") } : {}),
     ...(timeout !== undefined ? { requestTimeoutMs: Number(timeout) } : {}),
+    ...(bulkMaxBytes !== undefined ? { bulkMaxBytes } : {}),
     ...(ca !== undefined ? { ca } : {}),
     ...(typeof fetch === "function" ? { fetch } : {}),
   };

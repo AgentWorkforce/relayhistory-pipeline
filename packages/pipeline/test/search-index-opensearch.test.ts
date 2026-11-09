@@ -3,6 +3,7 @@ import { createOpenSearchCapableSearchIndexRegistry, openSearchConfigFromInput }
 import { syntheticDoc } from "../src/search-index/conformance.js";
 import { SearchIndexError, matchesQuery } from "../src/search-index/contracts.js";
 import {
+  DEFAULT_OPENSEARCH_BULK_MAX_BYTES,
   OPENSEARCH_MAPPINGS,
   Q_CONTAINS_SCRIPT,
   WILDCARD_MAX_LITERAL_BYTES,
@@ -134,8 +135,11 @@ describe("opensearch adapter request shapes", () => {
 
   it("raises bounded errors for failed bulk items, retryable for 429/5xx", async () => {
     const items = (status: number) => () => json(200, { errors: true, items: [{ index: { status, error: { type: "x", reason: "secret content" } } }] });
-    await rejects(createOpenSearchSearchIndex({ url: BASE, fetch: fake(items(400)).fetch }).upsert([syntheticDoc({ orgId: "o" })]), "unavailable", "bulk_item_400");
-    const e = await rejects(createOpenSearchSearchIndex({ url: BASE, fetch: fake(items(429)).fetch }).upsert([syntheticDoc({ orgId: "o" })]), "unavailable", "bulk_item_429");
+    const e400 = await rejects(createOpenSearchSearchIndex({ url: BASE, fetch: fake(items(400)).fetch }).upsert([syntheticDoc({ orgId: "o" })]), "unavailable");
+    expect(e400.detail).toMatch(/^bulk_item_400:x:bulk_failed_1:bulk_items_1:bulk_bytes_\d+$/);
+    expect(e400.retryable).toBe(false);
+    const e = await rejects(createOpenSearchSearchIndex({ url: BASE, fetch: fake(items(429)).fetch }).upsert([syntheticDoc({ orgId: "o" })]), "unavailable");
+    expect(e.detail).toMatch(/^bulk_item_429:x:bulk_failed_1:/);
     expect(e.retryable).toBe(true);
     expect(e.message).not.toContain("secret");
   });
@@ -304,6 +308,136 @@ describe("opensearch adapter request shapes", () => {
   });
 });
 
+describe("opensearch bulk batching and bulk errors", () => {
+  /** A _bulk responder that answers 201 for every action in the body, recording each body. */
+  function bulkOk() {
+    const bodies: string[] = [];
+    const f = fake((c) => {
+      bodies.push(c.body!);
+      const actions = c.body!.trimEnd().split("\n").length / 2;
+      return json(200, { errors: false, items: Array.from({ length: actions }, () => ({ index: { status: 201 } })) });
+    });
+    return { ...f, bodies };
+  }
+  const bytes = (s: string) => new TextEncoder().encode(s).length;
+  // Equal-length event ids and contents give equal-size NDJSON entries.
+  const docs = (n: number, content = "x".repeat(100)) =>
+    Array.from({ length: n }, (_, i) => syntheticDoc({ orgId: "org-a", eventId: `ev-${String(i).padStart(4, "0")}`, content }));
+
+  it("defaults the bulk body bound to 4 MiB", () => {
+    expect(DEFAULT_OPENSEARCH_BULK_MAX_BYTES).toBe(4 * 1024 * 1024);
+  });
+
+  it("splits by the byte bound exactly at the boundary: a body may equal the bound, never exceed it", async () => {
+    const one = bulkOk();
+    await createOpenSearchSearchIndex({ url: BASE, fetch: one.fetch }).upsert(docs(1));
+    const entry = bytes(one.bodies[0]!);
+    for (const body of (await (async () => {
+      const probe = bulkOk();
+      await createOpenSearchSearchIndex({ url: BASE, fetch: probe.fetch }).upsert(docs(7));
+      return probe.bodies;
+    })())) expect(bytes(body)).toBe(7 * entry); // one request under the default bound; entries are all `entry` bytes
+
+    // Bound == 3 entries: 3 + 3 + 1, each full body exactly at the bound.
+    const at = bulkOk();
+    expect(await createOpenSearchSearchIndex({ url: BASE, fetch: at.fetch, bulkMaxBytes: 3 * entry }).upsert(docs(7))).toEqual({ written: 7 });
+    expect(at.bodies.map(bytes)).toEqual([3 * entry, 3 * entry, entry]);
+    // One byte less: the third entry no longer fits, 2 + 2 + 2 + 1.
+    const under = bulkOk();
+    expect(await createOpenSearchSearchIndex({ url: BASE, fetch: under.fetch, bulkMaxBytes: 3 * entry - 1 }).upsert(docs(7))).toEqual({ written: 7 });
+    expect(under.bodies.map(bytes)).toEqual([2 * entry, 2 * entry, 2 * entry, entry]);
+    // Every document is sent exactly once, in order.
+    const ids = under.bodies.flatMap((b) => b.trimEnd().split("\n").filter((_, i) => i % 2 === 1).map((l) => JSON.parse(l).event_id));
+    expect(ids).toEqual(docs(7).map((d) => d.eventId));
+  });
+
+  it("sends a document larger than the bound alone, once, between normal batches", async () => {
+    const small = docs(4);
+    const big = syntheticDoc({ orgId: "org-a", eventId: "ev-big0", content: "y".repeat(5000) });
+    const one = bulkOk();
+    await createOpenSearchSearchIndex({ url: BASE, fetch: one.fetch }).upsert([small[0]!]);
+    const entry = bytes(one.bodies[0]!);
+    const f = bulkOk();
+    const result = await createOpenSearchSearchIndex({ url: BASE, fetch: f.fetch, bulkMaxBytes: 2 * entry }).upsert([small[0]!, small[1]!, big, small[2]!, small[3]!]);
+    expect(result).toEqual({ written: 5 });
+    expect(f.bodies).toHaveLength(3);
+    expect(f.bodies.map((b) => b.trimEnd().split("\n").length / 2)).toEqual([2, 1, 2]);
+    expect(bytes(f.bodies[1]!)).toBeGreaterThan(2 * entry);
+    expect(f.bodies[1]).toContain("ev-big0");
+    // A bound below every entry: one request per document, no loop, nothing dropped.
+    const tiny = bulkOk();
+    expect(await createOpenSearchSearchIndex({ url: BASE, fetch: tiny.fetch, bulkMaxBytes: 1 }).upsert(docs(3))).toEqual({ written: 3 });
+    expect(tiny.calls).toHaveLength(3);
+  });
+
+  it("refuses a non-positive or non-integer bulkMaxBytes at construction", () => {
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => createOpenSearchSearchIndex({ url: BASE, bulkMaxBytes: bad }), String(bad)).toThrow(/bulk_max_bytes/);
+    }
+  });
+
+  it("parses SEARCH_INDEX_OPENSEARCH_BULK_MAX_BYTES; invalid or zero means the default", async () => {
+    const parse = (raw: string | undefined) =>
+      openSearchConfigFromInput({ env: { SEARCH_INDEX_OPENSEARCH_URL: BASE, ...(raw !== undefined ? { SEARCH_INDEX_OPENSEARCH_BULK_MAX_BYTES: raw } : {}) } });
+    expect(parse("1048576").bulkMaxBytes).toBe(1048576);
+    expect(parse(" 2000000 ").bulkMaxBytes).toBe(2000000);
+    expect(parse("1").bulkMaxBytes).toBe(1);
+    for (const bad of [undefined, "", " ", "0", "00", "-5", "abc", "1.5", "1e6", "4MiB", "0x100", "9999999999999999999"]) {
+      const config = parse(bad);
+      expect("bulkMaxBytes" in config, String(bad)).toBe(false);
+      expect(() => createOpenSearchSearchIndex(config)).not.toThrow();
+    }
+    // The parsed value reaches the writer.
+    const f = bulkOk();
+    await createOpenSearchSearchIndex({ ...parse("1"), fetch: f.fetch }).upsert(docs(2));
+    expect(f.calls).toHaveLength(2);
+  });
+
+  it("a 429 on _bulk is retryable and names its status, item count and body bytes, never content", async () => {
+    const d = docs(3, "secret transcript text");
+    const { calls, fetch } = fake(() => json(429, { error: { type: "es_rejected_execution_exception", reason: "rejected: secret transcript text" }, status: 429 }));
+    const e = await rejects(createOpenSearchSearchIndex({ url: BASE, fetch }).upsert(d), "unavailable");
+    expect(e.retryable).toBe(true);
+    expect(e.detail).toBe(`http_429:es_rejected_execution_exception:bulk_items_3:bulk_bytes_${bytes(calls[0]!.body!)}`);
+    expect(e.message).toContain("http_429");
+    expect(e.message).not.toMatch(/secret|transcript|rejected:/);
+    // A gateway 502 with a non-JSON body: still retryable, still sized.
+    const gw = fake(() => new Response("<html>Bad Gateway</html>", { status: 502 }));
+    const e502 = await rejects(createOpenSearchSearchIndex({ url: BASE, fetch: gw.fetch }).upsert(d), "unavailable");
+    expect(e502.retryable).toBe(true);
+    expect(e502.detail).toBe(`http_502:bulk_items_3:bulk_bytes_${bytes(gw.calls[0]!.body!)}`);
+    // A 413 is not retryable (the same body would fail again).
+    const big = fake(() => json(413, {}));
+    expect((await rejects(createOpenSearchSearchIndex({ url: BASE, fetch: big.fetch }).upsert(d), "unavailable")).retryable).toBe(false);
+  });
+
+  it("a 200 with errors:true surfaces the first failing item's status and type names, the failed count, never the reason", async () => {
+    const d = docs(4, "secret transcript text");
+    const { calls, fetch } = fake(() =>
+      json(200, {
+        errors: true,
+        items: [
+          { index: { status: 201 } },
+          { index: { status: 400, error: { type: "mapper_parsing_exception", reason: "failed to parse field [content]: secret transcript text", caused_by: { type: "illegal_argument_exception", reason: "secret" } } } },
+          { index: { status: 400, error: { type: "document_parsing_exception", reason: "secret" } } },
+          { index: { status: 201 } },
+        ],
+      }),
+    );
+    const e = await rejects(createOpenSearchSearchIndex({ url: BASE, fetch }).upsert(d), "unavailable");
+    expect(e.retryable).toBe(false);
+    expect(e.detail).toBe(`bulk_item_400:mapper_parsing_exception:illegal_argument_exception:bulk_failed_2:bulk_items_4:bulk_bytes_${bytes(calls[0]!.body!)}`);
+    expect(e.message).not.toMatch(/secret|transcript|failed to parse/);
+    // A retryable item makes the whole call retryable and is the one named; odd type names are dropped.
+    const mixed = fake(() =>
+      json(200, { errors: true, items: [{ index: { status: 400, error: { type: "x" } } }, { index: { status: 429, error: { type: "Has spaces: secret" } } }] }),
+    );
+    const e2 = await rejects(createOpenSearchSearchIndex({ url: BASE, fetch: mixed.fetch }).upsert(docs(2)), "unavailable");
+    expect(e2.retryable).toBe(true);
+    expect(e2.detail).toMatch(/^bulk_item_429:bulk_failed_2:bulk_items_2:bulk_bytes_\d+$/);
+  });
+});
+
 describe("opensearch adapter transport errors", () => {
   const doc = syntheticDoc({ orgId: "org-a" });
 
@@ -346,7 +480,8 @@ describe("opensearch adapter transport errors", () => {
 
   it("maps network failure, timeout and caller abort", async () => {
     const down = createOpenSearchSearchIndex({ url: BASE, fetch: async () => { throw new TypeError("connect ECONNREFUSED 10.0.0.1"); } });
-    const e = await rejects(down.upsert([doc]), "unavailable", "network");
+    const e = await rejects(down.upsert([doc]), "unavailable");
+    expect(e.detail).toMatch(/^network:bulk_items_1:bulk_bytes_\d+$/); // a bulk failure is sized
     expect(e.retryable).toBe(true);
     expect(e.message).not.toContain("10.0.0.1");
     const hang: FetchLike = (_url, init) =>

@@ -17,6 +17,14 @@
  *   SEARCH_INDEX_BACKEND                      enabled only: postgres | opensearch (managed
  *                                   AWS index, SEARCH_INDEX_OPENSEARCH_*; projection state
  *                                   stays in Postgres); anything else fails startup
+ *   SEARCH_INDEX_OPENSEARCH_BULK_MAX_BYTES    opensearch only: upper bound of one _bulk
+ *                                   request body in bytes, default 4194304 (4 MiB;
+ *                                   Amazon OpenSearch caps a request at 10 MiB on
+ *                                   small instance types). A positive integer; unset,
+ *                                   zero or malformed means the default. A larger
+ *                                   single document is sent alone. Read by the
+ *                                   adapter (openSearchConfigFromInput), passed
+ *                                   through with the other SEARCH_INDEX_OPENSEARCH_*
  *   SEARCH_INDEX_POSTGRES_BACKEND_ID          enabled only: the projection-state backend id
  *                                   the search writer records under (required;
  *                                   not a credential). Format is validated by the

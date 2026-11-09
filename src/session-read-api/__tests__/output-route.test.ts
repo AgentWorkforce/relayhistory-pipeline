@@ -160,3 +160,27 @@ suite("output route on ClickHouse", () => {
     }
   }, 60_000);
 });
+
+(CH_URL ? describe : describe.skip)("output readiness with the origin column (buffered search feed)", () => {
+  test("buffered-only sessions never block; a buffered row republished as canonical does", async () => {
+    const { outputWindowReadiness } = await import("../output-query.ts");
+    const ch = await freshClickHouse();
+    try {
+      for (const s of outputFactsSchemaStatements()) await ch.command(s);
+      // The feeder's DDL (docs/proposals/buffered-search-feed.clickhouse.draft.sql).
+      await ch.command("ALTER TABLE transcript_events ADD COLUMN IF NOT EXISTS origin LowCardinality(String) DEFAULT 'canonical'");
+      await ch.command("ALTER TABLE transcript_events ADD COLUMN IF NOT EXISTS origin_claim_token String DEFAULT ''");
+      await ch.insert(OUTPUT_FACTS_STATE_TABLE, [{ org_id: ID.orgId, workspace_id: WS, complete_since: "2026-11-01 00:00:00.000000", marked_at: "2026-11-06 00:00:00.000", marked_by: "test", version: 1 }]);
+      const event = (session: string, origin: string, version: number) =>
+        ch.insert(EVENTS_TABLE, [{ org_id: ID.orgId, workspace_id: WS, session_id: session, source: "codex", machine_id: "m1", kind: "session_event", event_id: `x-${session}`, ts: "2026-11-05 10:00:00.000", fingerprint: origin === "buffered" ? "bf" : "s3", version, origin, origin_claim_token: origin === "buffered" ? "11111111-2222-4333-8444-555555555555" : "" }]);
+      const since = new Date("2026-11-05T00:00:00Z"), until = new Date("2026-11-05T23:59:59.999Z");
+      await event("s-buffered", "buffered", 1);
+      expect(await outputWindowReadiness(ch, ID.orgId, WS, since, until)).toBe("ready");
+      // The canonical pass rewrites the same event with a newer version: now it needs facts.
+      await event("s-buffered", "canonical", 2);
+      expect(await outputWindowReadiness(ch, ID.orgId, WS, since, until)).toBe("session_unindexed");
+    } finally {
+      await ch.drop();
+    }
+  }, 60_000);
+});

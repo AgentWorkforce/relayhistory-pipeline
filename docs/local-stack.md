@@ -262,8 +262,9 @@ configured with `SEARCH_INDEX_BACKEND=opensearch`, `SEARCH_INDEX_OPENSEARCH_URL`
 (required), `SEARCH_INDEX_OPENSEARCH_DIALECT` (`opensearch` or `elasticsearch`),
 `SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX`, `SEARCH_INDEX_OPENSEARCH_AUTH` (`none`,
 `basic`, or `sigv4` with EKS Pod Identity and `SEARCH_INDEX_OPENSEARCH_AWS_REGION`), `SEARCH_INDEX_OPENSEARCH_USERNAME`, the
-`SEARCH_INDEX_OPENSEARCH_PASSWORD` secret, `SEARCH_INDEX_OPENSEARCH_CA_FILE` and
-`SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS` (see
+`SEARCH_INDEX_OPENSEARCH_PASSWORD` secret, `SEARCH_INDEX_OPENSEARCH_CA_FILE`,
+`SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS` and
+`SEARCH_INDEX_OPENSEARCH_BULK_MAX_BYTES` (`_bulk` body bound, default 4 MiB) (see
 `docs/search-and-runtime-adapters.md`). `basic` is accepted only when
 `SEARCH_INDEX_OPENSEARCH_URL` is https or a loopback host; a plain-http service
 hostname (for example a compose service name) fails at startup with
