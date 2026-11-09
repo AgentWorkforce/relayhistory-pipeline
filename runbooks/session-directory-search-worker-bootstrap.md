@@ -437,6 +437,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105044000_read_api_tokens.sql` | table sessions.read_api_tokens |
 | `upstream:20261105044010_selfhost_erase_lock_fences.sql` | replacement: ingest_selfhost_set_session_uploads takes the user's fence lock before reading ownership |
 | `upstream:20261105044020_claim_bootstrap_org_indexes.sql` | the eight claim-bootstrap `<table>_org_id_idx` indexes, exact definition, valid and ready, backing no constraint (an operator-built exact, valid set is adopted, not refused: `ADOPTABLE_INDEXES`; an absent one on a populated table is `index_prebuild_required`) |
+| `upstream:20261105044030_ingest_generation_overlap.sql` | table sessions.ingest_generation_overlap_windows (slot 044030, zero-503 schema windows; owner-only, no role prerequisite) |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
